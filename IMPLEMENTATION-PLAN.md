@@ -290,39 +290,31 @@ Handshake, getheaders/getdata, BlockCache, 2-/3-node tests + periodic mesh scrip
 
 ---
 
-### Phase 4 — Reconstruct serve + multi-peer IBD foundation (4–6 weeks)
+### Phase 4 — Reconstruct serve + multi-peer IBD foundation (4–6 weeks) — **in progress**
 
 **Goal:** Serve history without block files after cold start; perform IBD from real networks at signet (and mainnet-experimental) quality.
 
-**Workstreams (can land as ordered PRs)**
+**Workstreams**
 
-1. **Reconstruct core**
-   - `Query::reconstruct_block(hash|height) -> bitcoin::Block` from header + ordered `TxRecord.raw`.
-   - High-level: store → flush → reopen → reconstruct equals original block (witness).
-2. **Store-backed P2P serve**
-   - getheaders locator over **confirmed** headers (not only RAM cache).
-   - getdata: tip wire ring / RAM LRU → else reconstruct.
-   - Multi-node: **restart seeder** (empty RAM) → peer still full-syncs (**prove G1/G2/G3/B6**).
-3. **Service flags + protocol**
-   - Advertise `NETWORK|WITNESS` only after (2) is green.
-   - Prefer WITNESS peers; consider raising advertised version beyond 70001 where messages we implement require it.
-4. **Discovery + multi-peer IBD**
-   - DNS + fixed seeds + basic addrman; multi-outbound; download window; stall/score.
-   - Header tree + most-work (not linear-only RAM chain).
-5. **Mainnet consensus completeness**
-   - Difficulty, MTP, maturity, subsidy, witness commitment, deployments; checkpoints + default milestone.
-6. **Long-running node**
-   - `rbitcoin-node` process loop: bind P2P, drive sync state machine, graceful shutdown (not smoke-only).
-7. **Integration**
-   - Sync from public signet peer; optional mainnet experimental behind flag.
+| # | Workstream | Status |
+|---|------------|--------|
+| 1 | **Reconstruct core** — `reconstruct_block_{at_height,by_hash}` + round-trip tests | ✅ |
+| 2 | **Store-backed P2P serve** — getheaders/getdata from store; restart seeder proof | ✅ |
+| 3 | **Service flags** — `NETWORK\|WITNESS` | ✅ |
+| 4a | **Discovery** — DNS/fixed seed lists + `AddrMan`; multi-peer try list | ✅ foundation |
+| 4b | Concurrent download window, stall/score, header tree / most-work | ⬜ remaining |
+| 5a | **Consensus** — MTP, nBits/retarget, maturity, subsidy, witness commitment, checkpoints | ✅ |
+| 5b | BIP9/taproot deployment windows, testnet min-diff edge cases | ⬜ remaining |
+| 6 | **Long-running node** — `run_p2p`, `--listen`/`--connect`/`--smoke` | ✅ |
+| 7 | Public signet IBD lab run | ⬜ remaining |
 
-**Exit**
+**Exit (full Phase 4)**
 
-- Reconstruct round-trips green; multi-node serve after **process restart** without historical block files.
-- Signet IBD to tip (or N of tip) under milestone on lab hardware.
-- §1.1 A2–A8, B1–B4, B6 materially done.
+- Reconstruct round-trips green; multi-node serve after **process restart** without historical block files. ✅
+- Signet IBD to tip (or N of tip) under milestone on lab hardware. ⬜
+- §1.1 A2–A8, B1–B4, B6 materially done (A3 concurrent window / A4 most-work still open).
 
-**Tests to prefer:** reconstruct + restart-serve multi-node; drop docs/tests that imply RAM-cache-only serve is enough.
+**Tests to prefer:** reconstruct + restart-serve multi-node; multi-peer try list; short `run_p2p`.
 
 ---
 
@@ -473,9 +465,9 @@ Handshake, getheaders/getdata, BlockCache, 2-/3-node tests + periodic mesh scrip
 
 | Window | Focus |
 |--------|--------|
-| **Next** | **Phase 4.1–4.2:** `reconstruct_block` + store-backed getheaders/getdata + multi-node **restart** serve proof |
-| Then | Phase 4.3–4.7: WITNESS flags, seeds/multi-peer, mainnet consensus, long-running node, signet IBD |
-| Then | Phase 5 tip follow |
+| **Done (Phase 4 core)** | Reconstruct + store-backed restart serve; `NETWORK\|WITNESS`; MTP/bits/maturity/subsidy/witness commitment/checkpoints; seeds/AddrMan; multi-peer try list; long-running `run_p2p` |
+| **Remaining Phase 4** | Concurrent multi-peer download window + stall/score; header tree / most-work (not linear tip-only); public signet IBD lab run; richer mainnet deployments (BIP9/taproot windows) |
+| **Next phase** | Phase 5 tip follow / block relay |
 | Then | Phase 6 durability + scripthash index |
 | Then | Phase 7 Electrum |
 | Then | Phase 8 network-ready sign-off |

@@ -1,0 +1,14 @@
+/target/
+**/*.rs.bk
+Cargo.lock
+.coverage/
+coverage/
+lcov.info
+*.profraw
+*.profdata
+.idea/
+.vscode/
+*.swp
+.DS_Store
+/datadir/
+/tmp/

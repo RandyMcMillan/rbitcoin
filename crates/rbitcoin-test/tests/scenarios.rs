@@ -112,6 +112,22 @@ fn cli_and_node_entrypoints() {
         node_cli_main(["rbitcoin-node", "--network", "nope"]),
         ExitCode::SUCCESS
     );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--listen"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--listen", "not-an-addr"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--connect"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--connect", "bad"]),
+        ExitCode::SUCCESS
+    );
     assert_ne!(cli_cli_main(["rbitcoin-cli", "a", "b"]), ExitCode::SUCCESS);
 
     std::env::set_var("RBITCOIN_TEST_DROP_STORE", "1");
@@ -169,6 +185,17 @@ fn placeholder_surfaces() {
     assert_eq!(net_crate_name(), "rbitcoin-net");
     assert_eq!(node_rpc_path(), "/");
     let _ = rbitcoin_net::local_service_flags();
+    assert_eq!(rbitcoin_net::default_port(Network::Mainnet), 8333);
+    assert_eq!(rbitcoin_net::default_port(Network::Regtest), 18444);
+    assert!(rbitcoin_net::dns_seeds(Network::Mainnet).len() >= 3);
+    assert!(rbitcoin_net::dns_seeds(Network::Regtest).is_empty());
+    assert!(!rbitcoin_net::fixed_seed_hosts(Network::Mainnet).is_empty());
+    let mut am = rbitcoin_net::AddrMan::with_seeds(Network::Regtest);
+    assert!(am.is_empty());
+    am.add("127.0.0.1:18444".parse().unwrap());
+    assert_eq!(am.len(), 1);
+    assert_eq!(am.take_outbound(10).len(), 1);
+    let _ = rbitcoin_net::resolve_fixed_seeds(Network::Regtest);
 }
 
 // ─── Store: keep only corrupt/error paths not hit by consensus chain tests ──
@@ -461,24 +488,34 @@ fn consensus_spend_and_reject_double_spend() {
     let genesis = regtest_genesis();
     accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
 
-    // Block 1: empty extra
+    // Block 1: coinbase we will spend after maturity
     let b1 = mine_regtest_block(genesis.block_hash(), genesis.header.time + 600, 1, vec![]);
     let cb1_txid = b1.txdata[0].compute_txid();
     accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
 
-    // Block 2: spend coinbase from b1 (maturity not enforced yet — Phase 2 simplified)
+    // Pad to maturity (100 confirmations of b1 → spendable at height 101)
+    let mut tip = b1.block_hash();
+    let mut tip_time = b1.header.time;
+    for h in 2..=101u32 {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+
+    // Height 102: spend coinbase from b1
     let spend = spend_anyone_can_spend(cb1_txid, 0, Amount::from_sat(49_0000_0000));
-    let b2 = mine_regtest_block(b1.block_hash(), b1.header.time + 600, 2, vec![spend.clone()]);
-    accept_and_connect_block(&q, &params, Height(2), &b2, ms).unwrap();
+    let b_spend = mine_regtest_block(tip, tip_time + 600, 102, vec![spend]);
+    accept_and_connect_block(&q, &params, Height(102), &b_spend, ms).unwrap();
     assert_eq!(
         q.spenders(cb1_txid.as_byte_array(), 0).unwrap().len(),
         1
     );
 
-    // Block 3 attempting second spend of same outpoint must fail connect validation
+    // Second spend of same outpoint must fail
     let spend2 = spend_anyone_can_spend(cb1_txid, 0, Amount::from_sat(48_0000_0000));
-    let b3 = mine_regtest_block(b2.block_hash(), b2.header.time + 600, 3, vec![spend2]);
-    let err = accept_and_connect_block(&q, &params, Height(3), &b3, ms);
+    let b_bad = mine_regtest_block(b_spend.block_hash(), b_spend.header.time + 600, 103, vec![spend2]);
+    let err = accept_and_connect_block(&q, &params, Height(103), &b_bad, ms);
     assert!(
         matches!(
             err,
@@ -486,7 +523,7 @@ fn consensus_spend_and_reject_double_spend() {
         ),
         "got {err:?}"
     );
-    assert_eq!(q.tip_height(), Some(Height(2)));
+    assert_eq!(q.tip_height(), Some(Height(102)));
 }
 
 #[test]
@@ -517,6 +554,14 @@ fn consensus_params_networks() {
         let g = rbitcoin_consensus::genesis_block(&p);
         assert_eq!(g.block_hash(), p.genesis_hash);
     }
+    let main = ChainParams::mainnet();
+    assert!(!main.checkpoints.is_empty());
+    assert_eq!(main.checkpoint_at(Height(0)).unwrap(), main.genesis_hash);
+    assert!(main.difficulty_adjustment_interval() == 2016);
+    assert!(!main.no_pow_retargeting());
+    assert!(ChainParams::regtest().no_pow_retargeting());
+    assert_eq!(rbitcoin_consensus::block_subsidy(0, &main), 50_0000_0000);
+    assert_eq!(rbitcoin_consensus::block_subsidy(210_000, &main), 25_0000_0000);
 }
 
 // ─── Phase 4: reconstruct from archive ──────────────────────────────────────
@@ -538,9 +583,9 @@ fn reconstruct_block_roundtrip_after_reopen() {
     let mut tip = genesis.block_hash();
     let mut tip_time = genesis.header.time;
     let mut originals = vec![genesis.clone()];
-    for h in 1..=12u32 {
-        // Mix in a spend path on later blocks for multi-tx reconstruct
-        let extra = if h == 5 {
+    // Build past coinbase maturity so a multi-tx block can spend block-1 coinbase.
+    for h in 1..=105u32 {
+        let extra = if h == 105 {
             let prev_cb = originals[1].txdata[0].compute_txid();
             vec![spend_anyone_can_spend(
                 prev_cb,
@@ -561,7 +606,7 @@ fn reconstruct_block_roundtrip_after_reopen() {
 
     // Reopen empty of any RAM cache — reconstruct only from store.
     let q = Query::open_or_create(td.store_path()).unwrap();
-    assert_eq!(q.tip_height(), Some(Height(12)));
+    assert_eq!(q.tip_height(), Some(Height(105)));
 
     for (h, original) in originals.iter().enumerate() {
         let recon = q
@@ -588,7 +633,7 @@ fn reconstruct_block_roundtrip_after_reopen() {
         .reconstruct_block_by_hash(&[0xab; 32])
         .unwrap()
         .is_none());
-    assert!(q.reconstruct_block_at_height(Height(99)).is_err());
+    assert!(q.reconstruct_block_at_height(Height(999)).is_err());
 
     // Locator / headers API for store-backed serve
     let loc = q.locator_hashes().unwrap();

@@ -31,7 +31,7 @@ On Nix, prefer `cargo-llvm-cov` from nixpkgs when available, or install into a u
 All workspace members that contain production code:
 
 - `rbitcoin-primitives`, `rbitcoin-store`, `rbitcoin-query`, `rbitcoin-wire-cache`
-- `rbitcoin-consensus`, `rbitcoin-net`, `rbitcoin-mempool`, `rbitcoin-wallet`
+- `rbitcoin-consensus`, `rbitcoin-net`
 - `rbitcoin-rpc`, `rbitcoin-cli`, `rbitcoin-node`
 
 **Excluded by default:** nothing. Third-party dependencies are not attributed to us.

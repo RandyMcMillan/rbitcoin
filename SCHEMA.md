@@ -22,9 +22,7 @@ Endianness: **little-endian** for all multi-byte integers.
     strong_tx.body          # Class C
     confirmed.body          # height -> header fk (best chain)
     archive_epoch           # durable finalize record (Phase 5+)
-  wire/                     # tip wire ring (Phase 5+); absent during IBD
-  wallets/                  # descriptor wallet DBs (Phase 8+)
-  mempool.dat               # optional (Phase 6+)
+  wire/                     # tip wire ring (post-IBD); absent during IBD
 ```
 
 ## Common file header (16 bytes)

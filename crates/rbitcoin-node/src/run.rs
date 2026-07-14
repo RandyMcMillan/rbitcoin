@@ -1,6 +1,5 @@
 use crate::config::NodeConfig;
 use crate::error::NodeError;
-use rbitcoin_mempool::MempoolConfig;
 use rbitcoin_query::Query;
 use rbitcoin_wire_cache::WireRing;
 
@@ -9,7 +8,6 @@ pub struct NodeHandle {
     pub config: NodeConfig,
     pub query: Query,
     pub wire: WireRing,
-    pub mempool_config: MempoolConfig,
 }
 
 impl std::fmt::Debug for NodeHandle {
@@ -32,26 +30,14 @@ impl NodeHandle {
     }
 }
 
-/// Start the node with default mempool settings.
+/// Start the node: ensure datadir, open store, prepare placeholders.
 pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
-    run_node_with_mempool(config, MempoolConfig::default())
-}
-
-/// Start the node with an explicit mempool config (tests / injectors).
-pub fn run_node_with_mempool(
-    config: NodeConfig,
-    mempool_config: MempoolConfig,
-) -> Result<NodeHandle, NodeError> {
     config.ensure_datadir()?;
-    if !mempool_config.is_sane() {
-        return Err(NodeError::Config("mempool config insane".into()));
-    }
     let query = Query::open_or_create(config.store_path())?;
     let wire = WireRing::new(config.wire_depth_blocks);
     Ok(NodeHandle {
         config,
         query,
         wire,
-        mempool_config,
     })
 }

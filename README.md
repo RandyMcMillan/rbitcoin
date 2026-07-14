@@ -1,29 +1,27 @@
 # rbitcoin
 
-Production-oriented Bitcoin full node in Rust:
+Bitcoin full node in Rust (active track: **consensus + IBD + block relay**):
 
-- **rust-bitcoin** types and protocol primitives at the edges
+- **rust-bitcoin** types and protocol primitives at the edges (integrating next)
 - **libbitcoin-class** concurrent relational mmap archive for chain storage
 - **Post-IBD durability** (epoch finalize + tip wire ring) per [`libbitcoin-durable-archive-variant.md`](./libbitcoin-durable-archive-variant.md)
-- **Descriptor wallets** with Bitcoin Core–compatible RPC/CLI (no legacy BDB wallets)
 - **No pruning, no GUI**
-- **100% line and branch coverage**, driven by high-level functional/integration tests
+- **Deferred:** mempool, transaction relay, fee estimation, wallets
+- **100% executable line coverage** via high-level functional/integration tests
 
-See [`IMPLEMENTATION-PLAN.md`](./IMPLEMENTATION-PLAN.md) for the full roadmap.
+See [`IMPLEMENTATION-PLAN.md`](./IMPLEMENTATION-PLAN.md) for the roadmap and code review of the current tree.
 
 ## Status
 
-Phase 0 / early Phase 1: workspace, documentation, node lifecycle, and store primitives.
+Phase 0 complete / Phase 1 next: store chain ops (confirmed, strong_tx, growable indexes), then consensus + P2P IBD.
 
 ## Build
-
-This environment uses Nix for the toolchain:
 
 ```bash
 nix-shell
 cargo build --workspace
 cargo test --workspace
-./scripts/coverage.sh   # requires cargo-llvm-cov; enforces 100% line+branch
+./scripts/coverage.sh
 ```
 
 ## Crate map
@@ -35,10 +33,8 @@ cargo test --workspace
 | `rbitcoin-query` | Domain query API over the store |
 | `rbitcoin-wire-cache` | Tip wire-format block ring |
 | `rbitcoin-consensus` | Validation / confirmability |
-| `rbitcoin-net` | P2P |
-| `rbitcoin-mempool` | Policy mempool |
-| `rbitcoin-wallet` | Descriptor wallets |
-| `rbitcoin-rpc` | JSON-RPC |
+| `rbitcoin-net` | P2P (headers + blocks) |
+| `rbitcoin-rpc` | Node JSON-RPC (later; no wallet) |
 | `rbitcoin-cli` | CLI client |
 | `rbitcoin-node` | Node binary |
 | `rbitcoin-test` | High-level test harness |

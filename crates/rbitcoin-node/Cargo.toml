@@ -17,8 +17,6 @@ rbitcoin-store = { workspace = true }
 rbitcoin-wire-cache = { workspace = true }
 rbitcoin-consensus = { workspace = true }
 rbitcoin-net = { workspace = true }
-rbitcoin-mempool = { workspace = true }
-rbitcoin-wallet = { workspace = true }
 rbitcoin-rpc = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

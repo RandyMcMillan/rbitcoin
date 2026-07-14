@@ -7,8 +7,6 @@ members = [
     "crates/rbitcoin-wire-cache",
     "crates/rbitcoin-consensus",
     "crates/rbitcoin-net",
-    "crates/rbitcoin-mempool",
-    "crates/rbitcoin-wallet",
     "crates/rbitcoin-rpc",
     "crates/rbitcoin-cli",
     "crates/rbitcoin-node",
@@ -30,8 +28,6 @@ rbitcoin-query = { path = "crates/rbitcoin-query" }
 rbitcoin-wire-cache = { path = "crates/rbitcoin-wire-cache" }
 rbitcoin-consensus = { path = "crates/rbitcoin-consensus" }
 rbitcoin-net = { path = "crates/rbitcoin-net" }
-rbitcoin-mempool = { path = "crates/rbitcoin-mempool" }
-rbitcoin-wallet = { path = "crates/rbitcoin-wallet" }
 rbitcoin-rpc = { path = "crates/rbitcoin-rpc" }
 rbitcoin-cli = { path = "crates/rbitcoin-cli" }
 rbitcoin-node = { path = "crates/rbitcoin-node" }
@@ -39,7 +35,6 @@ rbitcoin-test = { path = "crates/rbitcoin-test" }
 
 thiserror = "2"
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

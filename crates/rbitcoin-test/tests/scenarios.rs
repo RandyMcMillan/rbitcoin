@@ -4,15 +4,13 @@
 
 use rbitcoin_cli::cli_main as cli_cli_main;
 use rbitcoin_consensus::Milestone;
-use rbitcoin_mempool::MempoolConfig;
 use rbitcoin_net::outbound_for_ibd;
-use rbitcoin_node::{cli_main as node_cli_main, run_node, run_node_with_mempool, NodeConfig};
+use rbitcoin_node::{cli_main as node_cli_main, run_node, NodeConfig};
 use rbitcoin_primitives::{Fk, Height, Network, TableKind, VERSION};
 use rbitcoin_query::Query;
-use rbitcoin_rpc::wallet_rpc_path;
+use rbitcoin_rpc::node_rpc_path;
 use rbitcoin_store::{HeaderRecord, OutputRecord, Store, StoreError, TxRecord};
 use rbitcoin_test::{smoke_crate_names, TestDatadir};
-use rbitcoin_wallet::{WalletError, WalletKind};
 use rbitcoin_wire_cache::WireRing;
 use std::process::{Command, ExitCode};
 
@@ -598,10 +596,6 @@ fn cli_invalid_flag_stderr_path() {
     let code = node_cli_main(["rbitcoin-node", "--not-a-real-option"]);
     assert_ne!(code, ExitCode::SUCCESS);
     assert_ne!(
-        cli_cli_main(["rbitcoin-cli", "--rpcwallet"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
         node_cli_main(["rbitcoin-node", "--datadir"]),
         ExitCode::SUCCESS
     );
@@ -725,37 +719,7 @@ fn placeholder_surfaces() {
     assert_eq!(outbound_for_ibd(true), 100);
     assert_eq!(outbound_for_ibd(false), 8);
 
-    let mc = MempoolConfig::default();
-    assert!(mc.is_sane());
-    let bad = MempoolConfig {
-        max_size_bytes: 0,
-        min_relay_fee_rate: 1,
-    };
-    assert!(!bad.is_sane());
-    let bad2 = MempoolConfig {
-        max_size_bytes: 1,
-        min_relay_fee_rate: 0,
-    };
-    assert!(!bad2.is_sane());
-
-    assert!(WalletKind::Descriptor.is_supported());
-    assert_eq!(
-        WalletKind::from_descriptors_flag(true).unwrap(),
-        WalletKind::Descriptor
-    );
-    assert_eq!(
-        WalletKind::from_descriptors_flag(false).unwrap_err(),
-        WalletError::LegacyNotSupported
-    );
-    assert!(WalletError::LegacyNotSupported
-        .to_string()
-        .contains("legacy"));
-
-    assert_eq!(wallet_rpc_path(""), "/");
-    assert_eq!(wallet_rpc_path("w1"), "/wallet/w1");
-    assert_eq!(rbitcoin_cli::rpc_wallet_path(None), "/");
-    assert_eq!(rbitcoin_cli::rpc_wallet_path(Some("")), "/");
-    assert_eq!(rbitcoin_cli::rpc_wallet_path(Some("abc")), "/wallet/abc");
+    assert_eq!(node_rpc_path(), "/");
 }
 
 fn workspace_bin(name: &str) -> std::path::PathBuf {
@@ -803,10 +767,7 @@ fn cli_and_node_entrypoints() {
 
     assert_eq!(cli_cli_main(["rbitcoin-cli", "help"]), ExitCode::SUCCESS);
     assert_ne!(cli_cli_main(["rbitcoin-cli"]), ExitCode::SUCCESS);
-    assert_ne!(
-        cli_cli_main(["rbitcoin-cli", "--rpcwallet", "w", "getbalance"]),
-        ExitCode::SUCCESS
-    );
+    assert_ne!(cli_cli_main(["rbitcoin-cli", "getblockchaininfo"]), ExitCode::SUCCESS);
 
     // Datadir is a file -> run_node error path in CLI
     let blocked = td.path().join("blocked-datadir");
@@ -856,20 +817,13 @@ fn node_open_or_create_twice() {
 }
 
 #[test]
-fn node_mempool_insane_and_wire_depth_zero() {
+fn node_wire_depth_zero() {
     let td = TestDatadir::new().unwrap();
     let cfg = NodeConfig {
         wire_depth_blocks: 0,
         archive_durability: true,
         ..NodeConfig::default().with_datadir(td.path())
     };
-    let bad_mp = MempoolConfig {
-        max_size_bytes: 0,
-        min_relay_fee_rate: 1,
-    };
-    let err = run_node_with_mempool(cfg.clone(), bad_mp).unwrap_err();
-    assert!(err.to_string().contains("mempool"));
-
     let h = run_node(cfg).unwrap();
     assert_eq!(h.wire.depth(), 0);
     h.shutdown().unwrap();

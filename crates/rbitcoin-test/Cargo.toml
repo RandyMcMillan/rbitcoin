@@ -14,8 +14,6 @@ rbitcoin-query = { workspace = true }
 rbitcoin-wire-cache = { workspace = true }
 rbitcoin-consensus = { workspace = true }
 rbitcoin-net = { workspace = true }
-rbitcoin-mempool = { workspace = true }
-rbitcoin-wallet = { workspace = true }
 rbitcoin-rpc = { workspace = true }
 rbitcoin-cli = { workspace = true }
 rbitcoin-node = { workspace = true }

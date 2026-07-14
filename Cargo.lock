@@ -133,10 +133,6 @@ name = "rbitcoin-consensus"
 version = "0.1.0"
 
 [[package]]
-name = "rbitcoin-mempool"
-version = "0.1.0"
-
-[[package]]
 name = "rbitcoin-net"
 version = "0.1.0"
 
@@ -145,13 +141,11 @@ name = "rbitcoin-node"
 version = "0.1.0"
 dependencies = [
  "rbitcoin-consensus",
- "rbitcoin-mempool",
  "rbitcoin-net",
  "rbitcoin-primitives",
  "rbitcoin-query",
  "rbitcoin-rpc",
  "rbitcoin-store",
- "rbitcoin-wallet",
  "rbitcoin-wire-cache",
  "serde",
  "thiserror",
@@ -194,21 +188,15 @@ version = "0.1.0"
 dependencies = [
  "rbitcoin-cli",
  "rbitcoin-consensus",
- "rbitcoin-mempool",
  "rbitcoin-net",
  "rbitcoin-node",
  "rbitcoin-primitives",
  "rbitcoin-query",
  "rbitcoin-rpc",
  "rbitcoin-store",
- "rbitcoin-wallet",
  "rbitcoin-wire-cache",
  "tempfile",
 ]
-
-[[package]]
-name = "rbitcoin-wallet"
-version = "0.1.0"
 
 [[package]]
 name = "rbitcoin-wire-cache"

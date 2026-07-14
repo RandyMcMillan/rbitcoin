@@ -3,7 +3,7 @@
 ## Preference order
 
 1. **Multi-process / full node** — binary + datadir + RPC/CLI/P2P
-2. **Subsystem integration** — store+query, wallet+chain notifications, net pipeline
+2. **Subsystem integration** — store+query+consensus; net harness with mock peers
 3. **Fault injection** through public APIs / `integration-testing` features
 4. **Unit tests** — last resort only
 

@@ -44,5 +44,5 @@ memmap2 = "0.9"
 parking_lot = "0.12"
 bitcoin = { version = "0.32.101", default-features = true, features = ["bitcoinconsensus"] }
 hex = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "rt"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "rt", "signal"] }
 bytes = "1"

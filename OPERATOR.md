@@ -126,9 +126,21 @@ Time-boxed signet run in this environment:
 
 **Next lab:** re-run with longer `--max-run-secs` (e.g. 3600), watch `ibd: progress` / tip rate, fix next stall (headers window, peer timeout, store write path).
 
+## Signals / clean shutdown
+
+`rbitcoin-node` installs handlers for **SIGTERM** and **SIGINT** (Ctrl+C):
+
+```bash
+kill <pid>            # SIGTERM — clean flush + exit
+kill -TERM <pid>
+kill -INT <pid>       # same as Ctrl+C
+```
+
+On signal the process interrupts IBD/follow, flushes the store, aborts peer tasks, and exits 0. Prefer this over `kill -9` so the archive is consistent for resume.
+
 ## Known limitations
 
-- **Parallel IBD** (`parallel_ibd`): shared window default **1024** in-flight, **16/peer**, stall reassign ~15s; used by default in `run_p2p`.
+- **Parallel IBD** (`parallel_ibd`): shared window default **1024** in-flight, **16/peer**, stall reassign ~5s; used by default in `run_p2p`.
 - Sequential `sync_from_peers` is fallback only if parallel fails.
 - Protocol version 70001; compact blocks → full getdata.
 - Scripthash index grows with every output (disk) — costs IBD CPU/IO.

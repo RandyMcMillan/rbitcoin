@@ -91,6 +91,14 @@ struct PeerSlot {
     task: JoinHandle<()>,
 }
 
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        // Ensure peer IO tasks die when IBD is cancelled (e.g. signal shutdown).
+        let _ = self.cmd_tx.send(PeerCmd::Shutdown);
+        self.task.abort();
+    }
+}
+
 /// Run parallel IBD against `peers` until no more headers/blocks, or all peers die.
 ///
 /// Returns approximate number of blocks accepted this run.

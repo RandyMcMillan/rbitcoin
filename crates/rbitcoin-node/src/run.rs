@@ -6,9 +6,10 @@ use rbitcoin_net::{default_port, AddrMan, IbdConfig, P2PNode};
 use rbitcoin_query::Query;
 use rbitcoin_wire_cache::WireRing;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 
 /// Running node state (store open; optional P2P).
 pub struct NodeHandle {
@@ -37,6 +38,81 @@ impl NodeHandle {
     }
 }
 
+/// Cooperative shutdown flag shared across the process lifetime.
+#[derive(Debug)]
+pub struct Shutdown {
+    flag: AtomicBool,
+    notify: Notify,
+}
+
+impl Shutdown {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            flag: AtomicBool::new(false),
+            notify: Notify::new(),
+        })
+    }
+
+    pub fn request(&self) {
+        if !self.flag.swap(true, Ordering::SeqCst) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    pub fn requested(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Completes when shutdown has been requested.
+    pub async fn cancelled(&self) {
+        if self.requested() {
+            return;
+        }
+        self.notify.notified().await;
+        // Re-check in case of lost wakeup race.
+        while !self.requested() {
+            self.notify.notified().await;
+        }
+    }
+}
+
+/// Install SIGTERM / SIGINT (and Ctrl+C) handlers that trip `shutdown`.
+fn spawn_signal_handler(shutdown: Arc<Shutdown>) {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("signal: failed to install SIGTERM handler: {e}");
+                    return;
+                }
+            };
+            let mut sigint = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("signal: failed to install SIGINT handler: {e}");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = sigterm.recv() => eprintln!("signal: received SIGTERM"),
+                _ = sigint.recv() => eprintln!("signal: received SIGINT"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                eprintln!("signal: ctrl_c error: {e}");
+                return;
+            }
+            eprintln!("signal: received Ctrl+C");
+        }
+        shutdown.request();
+    });
+}
+
 /// Start the node: ensure datadir, open store, prepare tip wire ring.
 pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
     config.ensure_datadir()?;
@@ -52,6 +128,9 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
 }
 
 /// Long-running P2P (+ optional Electrum): seed resolve, catch-up, persistent follow, progress logs.
+///
+/// Cleanly exits on **SIGTERM** / **SIGINT** (`kill <pid>` or Ctrl+C): flushes the store
+/// and aborts peer tasks.
 pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let handle = run_node(config.clone())?;
     let params = ChainParams::for_network(config.network);
@@ -91,12 +170,18 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         config.network.as_str()
     );
 
+    let shutdown = Shutdown::new();
+    spawn_signal_handler(shutdown.clone());
+
     let mut addrman = AddrMan::new();
     for c in &config.connect {
         addrman.add(*c);
     }
     if config.use_seeds && config.connect.is_empty() {
-        eprintln!("ibd: resolving DNS/fixed seeds for {}…", config.network.as_str());
+        eprintln!(
+            "ibd: resolving DNS/fixed seeds for {}…",
+            config.network.as_str()
+        );
         addrman = AddrMan::with_seeds(config.network);
         eprintln!("ibd: {} seed addresses resolved", addrman.len());
     }
@@ -109,13 +194,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     };
 
     // Catch-up: concurrent multi-peer download window (libbitcoin-class).
-    // Prefer more peers for the window (up to max_outbound, not just 3).
     let ibd_targets = if !config.connect.is_empty() {
         config.connect.clone()
     } else {
         addrman.take_outbound(max_out.min(32))
     };
-    if !ibd_targets.is_empty() {
+    if !ibd_targets.is_empty() && !shutdown.requested() {
         let ibd_cfg = IbdConfig {
             window: 1024,
             per_peer: 16,
@@ -128,66 +212,115 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             ibd_cfg.window,
             ibd_cfg.per_peer
         );
-        match node.parallel_sync(&ibd_targets, ibd_cfg).await {
-            Ok(n) => eprintln!(
-                "ibd: parallel catch-up accepted≈{n} tip={:?}",
-                node.tip_height()
-            ),
-            Err(e) => {
-                eprintln!("ibd: parallel catch-up warning: {e}; falling back sequential");
-                match node.sync_from_peers(&ibd_targets).await {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                eprintln!("signal: interrupting parallel IBD…");
+            }
+            result = node.parallel_sync(&ibd_targets, ibd_cfg) => {
+                match result {
                     Ok(n) => eprintln!(
-                        "ibd: sequential fallback downloaded≈{n} tip={:?}",
+                        "ibd: parallel catch-up accepted≈{n} tip={:?}",
                         node.tip_height()
                     ),
-                    Err(e2) => eprintln!("ibd: sequential also failed: {e2}"),
+                    Err(e) => {
+                        if shutdown.requested() {
+                            eprintln!("signal: parallel IBD cancelled ({e})");
+                        } else {
+                            eprintln!(
+                                "ibd: parallel catch-up warning: {e}; falling back sequential"
+                            );
+                            if !shutdown.requested() {
+                                tokio::select! {
+                                    biased;
+                                    _ = shutdown.cancelled() => {
+                                        eprintln!("signal: interrupting sequential fallback…");
+                                    }
+                                    result = node.sync_from_peers(&ibd_targets) => {
+                                        match result {
+                                            Ok(n) => eprintln!(
+                                                "ibd: sequential fallback downloaded≈{n} tip={:?}",
+                                                node.tip_height()
+                                            ),
+                                            Err(e2) => eprintln!("ibd: sequential also failed: {e2}"),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
-    } else {
+    } else if ibd_targets.is_empty() {
         eprintln!("ibd: no outbound peers; serving only (use --connect or seeds)");
     }
 
     // Persistent follow: stay connected for tip relay after catch-up.
-    let follow_n = targets.len().min(max_out.min(3));
-    for (i, peer) in targets.iter().take(follow_n).enumerate() {
-        match node.follow_from(*peer).await {
-            Ok(()) => eprintln!("ibd: following peer[{i}] {peer}"),
-            Err(e) => eprintln!("ibd: follow {peer} failed: {e}"),
+    if !shutdown.requested() {
+        let follow_n = targets.len().min(max_out.min(3));
+        for (i, peer) in targets.iter().take(follow_n).enumerate() {
+            if shutdown.requested() {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    eprintln!("signal: skip remaining follow connects");
+                    break;
+                }
+                result = node.follow_from(*peer) => {
+                    match result {
+                        Ok(()) => eprintln!("ibd: following peer[{i}] {peer}"),
+                        Err(e) => eprintln!("ibd: follow {peer} failed: {e}"),
+                    }
+                }
+            }
         }
     }
 
     let (tip_tx, _) = broadcast::channel(16);
     let mut electrum = None;
     if let Some(addr) = config.electrum_listen {
-        let ecfg = ElectrumConfig::for_params(addr, &params);
-        let q = Arc::new(Query::open_or_create(config.store_path()).map_err(NodeError::from)?);
-        match run_electrum(ecfg, q, params.clone(), tip_tx.clone()).await {
-            Ok(h) => {
-                eprintln!("electrum listening on {}", h.local_addr);
-                electrum = Some(h);
+        if !shutdown.requested() {
+            let ecfg = ElectrumConfig::for_params(addr, &params);
+            let q =
+                Arc::new(Query::open_or_create(config.store_path()).map_err(NodeError::from)?);
+            match run_electrum(ecfg, q, params.clone(), tip_tx.clone()).await {
+                Ok(h) => {
+                    eprintln!("electrum listening on {}", h.local_addr);
+                    electrum = Some(h);
+                }
+                Err(e) => eprintln!("electrum start warning: {e}"),
             }
-            Err(e) => eprintln!("electrum start warning: {e}"),
         }
     }
 
-    // Progress + optional re-seed loop until max_run (`Some(0)` = exit after catch-up).
-    if config.max_run_secs != Some(0) {
+    // Progress + optional re-seed loop until max_run (`Some(0)` = exit after catch-up)
+    // or until a shutdown signal.
+    if config.max_run_secs != Some(0) && !shutdown.requested() {
         let deadline = config
             .max_run_secs
             .map(|s| Instant::now() + Duration::from_secs(s));
         let mut last_tip = node.tip_height().unwrap_or(0);
-        let mut seed_offset = follow_n;
+        let mut seed_offset = targets.len().min(max_out.min(3));
         let started = Instant::now();
 
         loop {
+            if shutdown.requested() {
+                break;
+            }
             if let Some(d) = deadline {
                 if Instant::now() >= d {
                     break;
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+            }
 
             let tip = node.tip_height().unwrap_or(0);
             let elapsed = started.elapsed().as_secs().max(1);
@@ -207,17 +340,27 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 && config.connect.is_empty()
                 && config.use_seeds
                 && !addrman.is_empty()
+                && !shutdown.requested()
             {
                 let extra = addrman.take_outbound_offset(1, seed_offset);
                 seed_offset = seed_offset.saturating_add(1);
                 for peer in extra {
+                    if shutdown.requested() {
+                        break;
+                    }
                     eprintln!("ibd: retry catch-up from {peer}");
-                    match node.sync_from(peer).await {
-                        Ok(n) if n > 0 => {
-                            eprintln!("ibd: retry got {n} tip={:?}", node.tip_height());
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => break,
+                        result = node.sync_from(peer) => {
+                            match result {
+                                Ok(n) if n > 0 => {
+                                    eprintln!("ibd: retry got {n} tip={:?}", node.tip_height());
+                                }
+                                Ok(_) => {}
+                                Err(e) => eprintln!("ibd: retry {peer}: {e}"),
+                            }
                         }
-                        Ok(_) => {}
-                        Err(e) => eprintln!("ibd: retry {peer}: {e}"),
                     }
                 }
             }
@@ -233,7 +376,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if let Some(e) = electrum {
         e.shutdown().await;
     }
-    let _ = node.hub.query.flush();
+    if let Err(e) = node.hub.query.flush() {
+        eprintln!("ibd: flush warning: {e}");
+    } else {
+        eprintln!("ibd: store flushed");
+    }
     node.shutdown().await;
+    eprintln!("ibd: clean exit");
     Ok(())
 }

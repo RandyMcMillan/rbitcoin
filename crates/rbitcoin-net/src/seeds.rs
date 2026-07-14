@@ -134,6 +134,12 @@ impl AddrMan {
     }
 
     pub fn take_outbound(&self, max: usize) -> Vec<SocketAddr> {
+        // Prefer IPv4: many environments have no IPv6 route, and v6 seeds only
+        // consume parallel-dial timeout slots during IBD.
+        let v4: Vec<SocketAddr> = self.peers.iter().copied().filter(|a| a.is_ipv4()).collect();
+        if !v4.is_empty() {
+            return v4.into_iter().take(max).collect();
+        }
         self.take_outbound_offset(max, 0)
     }
 

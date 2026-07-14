@@ -195,8 +195,8 @@ impl MessageStream {
 }
 
 fn command_bytes_ok(cmd12: &[u8]) -> bool {
-    // Core: command is ASCII, null-padded; first byte non-null for known msgs.
-    // Allow empty? No — reject all-null and non-printable.
+    // Core: command is ASCII letters, null-padded. Reject binary garbage so we
+    // fail fast on mid-stream desync / non-v1 transports (e.g. raw BIP324).
     if cmd12.len() != 12 {
         return false;
     }
@@ -208,11 +208,10 @@ fn command_bytes_ok(cmd12: &[u8]) -> bool {
             continue;
         }
         if seen_null {
-            // Non-zero after null padding
-            return false;
+            return false; // non-zero after null padding
         }
-        // Printable ASCII (Core uses lowercase letters/digits)
-        if !b.is_ascii_graphic() {
+        // Core uses lowercase a-z only for command names.
+        if !b.is_ascii_lowercase() {
             return false;
         }
         any = true;

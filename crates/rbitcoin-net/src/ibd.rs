@@ -156,8 +156,10 @@ pub async fn parallel_ibd(
     let mut ordered_set: HashSet<BlockHash> = HashSet::new();
     // hash → when requested + peer id
     let mut inflight: HashMap<BlockHash, (usize, Instant)> = HashMap::new();
-    // Received but not yet connected
+    // Received but not yet connected (hash → block)
     let mut pool: HashMap<BlockHash, Block> = HashMap::new();
+    // prev_hash → child block hash in pool (tip extension is O(1))
+    let mut pool_by_prev: HashMap<BlockHash, BlockHash> = HashMap::new();
     // Known header hashes on the download path (for linkage)
     let mut known_headers: HashSet<BlockHash> = HashSet::new();
     if let Some(h) = hub.tip_hash() {
@@ -175,8 +177,12 @@ pub async fn parallel_ibd(
     // How far ahead of connected tip we may download.
     let window = cfg.window;
 
-    // Kick header sync on first alive peer.
-    request_headers(&slots, &hub, &mut header_req_seq)?;
+    // Kick header sync — try a few peers (channel may close if handshake race).
+    for _ in 0..slots.len().min(4) {
+        if request_headers(&slots, &hub, &mut header_req_seq).unwrap_or(false) {
+            break;
+        }
+    }
 
     loop {
         // Drop already-connected prefixes from the ordered queue.
@@ -197,7 +203,7 @@ pub async fn parallel_ibd(
         let ahead = pool.len() + inflight.len();
 
         // Pipeline headers only while backlog is thin (avoid multi-k orphan pool).
-        if !headers_done && backlog < window {
+        if !headers_done && backlog < window && pool.len() < window / 2 {
             let _ = request_headers(&slots, &hub, &mut header_req_seq);
         }
 
@@ -232,7 +238,15 @@ pub async fn parallel_ibd(
 
         // Exit if nothing left and no inflight
         if headers_done && ordered.is_empty() && inflight.is_empty() {
-            drain_connect(&hub, &mut pool, &mut ordered, &mut ordered_set, &accepted, start_tip)?;
+            drain_connect(
+                &hub,
+                &mut pool,
+                &mut pool_by_prev,
+                &mut ordered,
+                &mut ordered_set,
+                &accepted,
+                start_tip,
+            )?;
             if pool.is_empty() {
                 break;
             }
@@ -242,6 +256,7 @@ pub async fn parallel_ibd(
                     pool.len()
                 );
                 pool.clear();
+                pool_by_prev.clear();
                 break;
             }
         }
@@ -313,11 +328,14 @@ pub async fn parallel_ibd(
                 }
                 let hash = block.block_hash();
                 inflight.remove(&hash);
+                let prev = block.header.prev_blockhash;
+                pool_by_prev.insert(prev, hash);
                 pool.insert(hash, block);
                 last_progress = Instant::now();
                 drain_connect(
                     &hub,
                     &mut pool,
+                    &mut pool_by_prev,
                     &mut ordered,
                     &mut ordered_set,
                     &accepted,
@@ -339,6 +357,7 @@ pub async fn parallel_ibd(
                 drain_connect(
                     &hub,
                     &mut pool,
+                    &mut pool_by_prev,
                     &mut ordered,
                     &mut ordered_set,
                     &accepted,
@@ -361,6 +380,7 @@ pub async fn parallel_ibd(
     drain_connect(
         &hub,
         &mut pool,
+        &mut pool_by_prev,
         &mut ordered,
         &mut ordered_set,
         &accepted,
@@ -541,9 +561,9 @@ fn request_headers_from(
         .query
         .locator_hashes()
         .map_err(|e| NetError::Consensus(e.to_string()))?;
-    s.cmd_tx
-        .send(PeerCmd::GetHeaders { locator })
-        .map_err(|_| NetError::Protocol("peer cmd channel closed"))?;
+    if s.cmd_tx.send(PeerCmd::GetHeaders { locator }).is_err() {
+        return Ok(false);
+    }
     Ok(true)
 }
 
@@ -576,10 +596,15 @@ fn assign_work_ordered(
     }
 
     // Candidates: ordered hashes not yet downloaded / requested, nearest tip first.
-    // When the pool is already large, only fill the contiguous tip gap (first
-    // missing hashes) so we don't dig the hole deeper.
-    let pool_full = pool.len() >= window / 2;
-    let take_n = if pool_full { 32 } else { window };
+    // When the pool is already large, only fill the contiguous tip gap so we
+    // don't dig the hole deeper with far-ahead getdata.
+    let take_n = if pool.len() >= window {
+        8
+    } else if pool.len() >= window / 4 {
+        32
+    } else {
+        window
+    };
     let mut candidates: VecDeque<BlockHash> = ordered
         .iter()
         .copied()
@@ -588,6 +613,10 @@ fn assign_work_ordered(
         .collect();
     if candidates.is_empty() {
         return;
+    }
+    // Cap total in-flight when pool is bloated (focus bandwidth on the gap).
+    if pool.len() >= window / 4 {
+        room = room.min(take_n.saturating_sub(inflight.len()).max(4));
     }
 
     let mut peer_i = 0usize;
@@ -684,14 +713,13 @@ fn remove_from_ordered(
 fn drain_connect(
     hub: &ChainHub,
     pool: &mut HashMap<BlockHash, Block>,
+    pool_by_prev: &mut HashMap<BlockHash, BlockHash>,
     ordered: &mut VecDeque<BlockHash>,
     ordered_set: &mut HashSet<BlockHash>,
     accepted: &AtomicU32,
     start_tip: u32,
 ) -> Result<(), NetError> {
-    let mut progress = true;
-    while progress {
-        progress = false;
+    loop {
         // Drop any ordered prefix already in the store.
         while let Some(&front) = ordered.front() {
             if hub.has_block(&front) {
@@ -701,29 +729,23 @@ fn drain_connect(
             }
         }
 
-        let tip = hub.tip_hash();
-        // Scan pool for the unique tip-extension (at most one prev==tip).
-        let mut extend: Option<BlockHash> = None;
-        for (h, b) in pool.iter() {
-            let prev = b.header.prev_blockhash;
-            let connects = match tip {
-                None => prev.to_byte_array() == [0u8; 32],
-                Some(t) => prev == t,
-            };
-            if connects {
-                extend = Some(*h);
-                break;
-            }
-        }
-        let Some(h) = extend else {
+        // Parent key for the next connectable block: tip hash, or null for genesis.
+        let prev_key = hub
+            .tip_hash()
+            .unwrap_or_else(|| BlockHash::from_byte_array([0u8; 32]));
+
+        let Some(h) = pool_by_prev.remove(&prev_key) else {
             break;
         };
-        let b = pool.remove(&h).unwrap();
+        let Some(b) = pool.remove(&h) else {
+            // Stale index entry; keep draining.
+            continue;
+        };
+
         match hub.accept_block(b) {
             Ok(AcceptOutcome::Accepted { .. }) | Ok(AcceptOutcome::AlreadyHave) => {
                 remove_from_ordered(ordered, ordered_set, h);
                 let n = accepted.fetch_add(1, Ordering::SeqCst) + 1;
-                progress = true;
                 if n == 1 || n % 100 == 0 {
                     eprintln!(
                         "ibd: progress tip={:?} (+{n} parallel, started {start_tip})",
@@ -734,11 +756,11 @@ fn drain_connect(
             }
             Ok(AcceptOutcome::IgnoredWeaker) => {
                 remove_from_ordered(ordered, ordered_set, h);
-                progress = true;
             }
             Err(e) => {
                 eprintln!("ibd: reject block {h}: {e}");
                 // Keep hash in ordered for re-request; body discarded.
+                break;
             }
         }
     }

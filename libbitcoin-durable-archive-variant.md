@@ -130,7 +130,7 @@ On each accepted/confirmed block (or batch of *k* blocks):
 
 ### 4.3 Non-requirement
 
-- Do **not** retain full historical wire for the entire chain unless optionally configured later. Sealed relational archive is the buried source of truth for query/validation navigation; wire is a **hot tip cache**.
+- Do **not** retain full historical wire for the entire chain. Sealed relational archive is the buried source of truth for query/validation navigation **and for reconstructing wire-format blocks to serve IBD**. Wire is a **hot tip cache** only (crash recovery / soft zone for non-finalized heights)—not a second full block archive.
 
 ---
 

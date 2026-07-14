@@ -151,6 +151,47 @@ async fn three_node_relay_path() {
     leaf.shutdown().await;
 }
 
+/// Parallel IBD: two seeder peers, client downloads with shared window.
+#[tokio::test]
+async fn parallel_ibd_two_peers() {
+    use rbitcoin_net::IbdConfig;
+
+    let seed_dir = TempDir::new().unwrap();
+    let mid_dir = TempDir::new().unwrap();
+    let peer_dir = TempDir::new().unwrap();
+
+    let seed = start_node(&seed_dir).await;
+    seed_chain(&seed, 48).await;
+
+    // Second server: hop-sync then both serve the client.
+    let mid = start_node(&mid_dir).await;
+    mid.sync_from(seed.local_addr).await.unwrap();
+    mid.wait_height(48, Duration::from_secs(15)).await.unwrap();
+
+    let client = start_node(&peer_dir).await;
+    let n = client
+        .parallel_sync(
+            &[seed.local_addr, mid.local_addr],
+            IbdConfig::for_test(),
+        )
+        .await
+        .expect("parallel ibd");
+    assert!(n >= 40, "accepted {n}");
+    client
+        .wait_height(48, Duration::from_secs(15))
+        .await
+        .expect("tip");
+    assert_eq!(client.query.tip_height(), Some(Height(48)));
+    assert_eq!(
+        client.hub.tip_hash().unwrap(),
+        seed.hub.tip_hash().unwrap()
+    );
+
+    seed.shutdown().await;
+    mid.shutdown().await;
+    client.shutdown().await;
+}
+
 /// Multi-peer sync API: second address fails, first succeeds.
 #[tokio::test]
 async fn sync_from_peers_tries_list() {

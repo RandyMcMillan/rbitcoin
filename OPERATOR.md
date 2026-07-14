@@ -113,7 +113,8 @@ Time-boxed signet run in this environment:
 
 ## Known limitations
 
-- Sequential peer try-list for bulk download (slow on mainnet).
+- **Parallel IBD** (`parallel_ibd`): shared window default **1024** in-flight, **16/peer**, stall reassign ~30s; used by default in `run_p2p`.
+- Sequential `sync_from_peers` is fallback only if parallel fails.
 - Protocol version 70001; compact blocks → full getdata.
 - Scripthash index grows with every output (disk) — costs IBD CPU/IO.
 - Electrum: no TLS; mempool empty; broadcast incomplete.

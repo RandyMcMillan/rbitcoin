@@ -2,7 +2,7 @@ use crate::config::NodeConfig;
 use crate::error::NodeError;
 use rbitcoin_consensus::ChainParams;
 use rbitcoin_electrum::{run_electrum, ElectrumConfig};
-use rbitcoin_net::{default_port, AddrMan, P2PNode};
+use rbitcoin_net::{default_port, AddrMan, IbdConfig, P2PNode};
 use rbitcoin_query::Query;
 use rbitcoin_wire_cache::WireRing;
 use std::net::SocketAddr;
@@ -102,15 +102,34 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         addrman.take_outbound(max_out)
     };
 
-    // Catch-up phase: try several peers (sequential) with progress logs.
+    // Catch-up: concurrent multi-peer download window (libbitcoin-class).
     if !targets.is_empty() {
-        eprintln!("ibd: catch-up from up to {} peers…", targets.len());
-        match node.sync_from_peers(&targets).await {
+        let ibd_cfg = IbdConfig {
+            window: 1024,
+            per_peer: 16,
+            ..IbdConfig::default()
+        };
+        eprintln!(
+            "ibd: parallel catch-up from {} peers (window={}, per_peer={})…",
+            targets.len(),
+            ibd_cfg.window,
+            ibd_cfg.per_peer
+        );
+        match node.parallel_sync(&targets, ibd_cfg).await {
             Ok(n) => eprintln!(
-                "ibd: initial catch-up downloaded≈{n} tip={:?}",
+                "ibd: parallel catch-up accepted≈{n} tip={:?}",
                 node.tip_height()
             ),
-            Err(e) => eprintln!("ibd: catch-up warning: {e} (will still try follow)"),
+            Err(e) => {
+                eprintln!("ibd: parallel catch-up warning: {e}; falling back sequential");
+                match node.sync_from_peers(&targets).await {
+                    Ok(n) => eprintln!(
+                        "ibd: sequential fallback downloaded≈{n} tip={:?}",
+                        node.tip_height()
+                    ),
+                    Err(e2) => eprintln!("ibd: sequential also failed: {e2}"),
+                }
+            }
         }
     } else {
         eprintln!("ibd: no outbound peers; serving only (use --connect or seeds)");

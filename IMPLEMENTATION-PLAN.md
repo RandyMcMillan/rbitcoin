@@ -302,7 +302,7 @@ Handshake, getheaders/getdata, BlockCache, 2-/3-node tests + periodic mesh scrip
 | 2 | **Store-backed P2P serve** — getheaders/getdata from store; restart seeder proof | ✅ |
 | 3 | **Service flags** — `NETWORK\|WITNESS` | ✅ |
 | 4a | **Discovery** — DNS/fixed seed lists + `AddrMan`; multi-peer try list | ✅ foundation |
-| 4b | Concurrent download window, stall/score | ⬜ later hardening |
+| 4b | Concurrent download window, stall/score | ✅ `parallel_ibd` (window 1024, 16/peer, stall reassign) |
 | 5a | **Consensus** — MTP, nBits/retarget, maturity, subsidy, witness commitment, checkpoints | ✅ |
 | 6 | **Long-running node** — `run_p2p`, `--listen`/`--connect`/`--smoke` | ✅ |
 | 7 | Public signet IBD lab run | ⬜ ops — see OPERATOR.md (readiness ladder) |

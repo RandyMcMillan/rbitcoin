@@ -51,7 +51,8 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `two_node_header_and_block_sync` | P2P | Seeder → peer |
 | `serve_after_restart_via_reconstruct` | P2P | Cold serve via reconstruct |
 | `three_node_relay_path` | P2P | Hop serve |
-| `sync_from_peers_tries_list` | P2P | Multi-peer try list |
+| `sync_from_peers_tries_list` | P2P | Multi-peer try list (fallback) |
+| `parallel_ibd_two_peers` | P2P | Concurrent windowed download from 2 peers |
 | `tip_follow_after_ibd` | P2P | Tip announce follow |
 | `reorg_to_longer_branch` | P2P/chain | Most-work reorg |
 | `node_run_p2p_short` | Node | Long-running entry short run |

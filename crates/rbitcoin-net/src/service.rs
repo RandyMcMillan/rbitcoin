@@ -3,6 +3,7 @@
 use crate::cache::BlockCache;
 use crate::chain::{AcceptOutcome, ChainHub};
 use crate::error::NetError;
+use crate::ibd::{parallel_ibd, IbdConfig};
 use crate::peer::{handshake, peer_session, sync_from_peer};
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::Magic;
@@ -135,7 +136,7 @@ impl P2PNode {
         }
     }
 
-    /// Try multiple peers in order until one yields blocks (or all fail).
+    /// Sequential try-list (legacy). Prefer [`Self::parallel_sync`] for IBD.
     pub async fn sync_from_peers(&self, peers: &[SocketAddr]) -> Result<u32, NetError> {
         if peers.is_empty() {
             return Err(NetError::Protocol("no peers to sync from"));
@@ -158,6 +159,27 @@ impl P2PNode {
         } else {
             Err(last_err)
         }
+    }
+
+    /// Concurrent multi-peer IBD: shared download window across peers (libbitcoin-class).
+    pub async fn parallel_sync(
+        &self,
+        peers: &[SocketAddr],
+        cfg: IbdConfig,
+    ) -> Result<u32, NetError> {
+        parallel_ibd(
+            self.hub.clone(),
+            self.magic,
+            self.local_addr,
+            peers,
+            cfg,
+        )
+        .await
+    }
+
+    /// Parallel sync with default window (1024 in-flight, 16/peer).
+    pub async fn parallel_sync_default(&self, peers: &[SocketAddr]) -> Result<u32, NetError> {
+        self.parallel_sync(peers, IbdConfig::default()).await
     }
 
     /// Connect outbound, catch up via getheaders, then return (connection closed).

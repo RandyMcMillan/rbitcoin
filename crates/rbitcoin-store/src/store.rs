@@ -1,8 +1,9 @@
+use crate::chain::{BlockTxsTable, ConfirmedTable, StrongTxTable};
 use crate::error::StoreError;
 use crate::header_table::{HeaderRecord, HeaderTable};
 use crate::point_table::PointTable;
-use crate::tx_table::{OutputRecord, OutputTable, TxRecord, TxTable};
-use rbitcoin_primitives::{Fk, SCHEMA_VERSION, STORE_MAGIC};
+use crate::tx_table::{InputRecord, InputTable, OutputRecord, OutputTable, TxRecord, TxTable};
+use rbitcoin_primitives::{Fk, Height, SCHEMA_VERSION, STORE_MAGIC};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -12,8 +13,12 @@ pub struct Store {
     path: PathBuf,
     pub headers: HeaderTable,
     pub txs: TxTable,
+    pub inputs: InputTable,
     pub outputs: OutputTable,
     pub points: PointTable,
+    pub confirmed: ConfirmedTable,
+    pub strong_tx: StrongTxTable,
+    pub block_txs: BlockTxsTable,
 }
 
 impl Store {
@@ -27,16 +32,16 @@ impl Store {
             std::fs::create_dir_all(&path).map_err(|e| StoreError::io(&path, e))?;
         }
         write_meta(&path)?;
-        let headers = HeaderTable::create(&path)?;
-        let txs = TxTable::create(&path)?;
-        let outputs = OutputTable::create(&path)?;
-        let points = PointTable::create(&path)?;
         Ok(Self {
+            headers: HeaderTable::create(&path)?,
+            txs: TxTable::create(&path)?,
+            inputs: InputTable::create(&path)?,
+            outputs: OutputTable::create(&path)?,
+            points: PointTable::create(&path)?,
+            confirmed: ConfirmedTable::create(&path)?,
+            strong_tx: StrongTxTable::create(&path)?,
+            block_txs: BlockTxsTable::create(&path)?,
             path,
-            headers,
-            txs,
-            outputs,
-            points,
         })
     }
 
@@ -46,20 +51,19 @@ impl Store {
             return Err(StoreError::NotDirectory(path));
         }
         check_meta(&path)?;
-        let headers = HeaderTable::open(&path)?;
-        let txs = TxTable::open(&path)?;
-        let outputs = OutputTable::open(&path)?;
-        let points = PointTable::open(&path)?;
         Ok(Self {
+            headers: HeaderTable::open(&path)?,
+            txs: TxTable::open(&path)?,
+            inputs: InputTable::open(&path)?,
+            outputs: OutputTable::open(&path)?,
+            points: PointTable::open(&path)?,
+            confirmed: ConfirmedTable::open(&path)?,
+            strong_tx: StrongTxTable::open(&path)?,
+            block_txs: BlockTxsTable::open(&path)?,
             path,
-            headers,
-            txs,
-            outputs,
-            points,
         })
     }
 
-    /// Open existing store or create if missing.
     pub fn open_or_create(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let path = path.into();
         if path.join("meta").exists() {
@@ -71,6 +75,10 @@ impl Store {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn tip_height(&self) -> Option<Height> {
+        self.confirmed.tip_height()
     }
 
     pub fn put_header(&self, rec: &HeaderRecord) -> Result<Fk, StoreError> {
@@ -100,6 +108,14 @@ impl Store {
         self.txs.get_by_txid(txid)
     }
 
+    pub fn put_input(&self, rec: &InputRecord) -> Result<Fk, StoreError> {
+        self.inputs.put(rec)
+    }
+
+    pub fn get_input(&self, fk: Fk) -> Result<InputRecord, StoreError> {
+        self.inputs.get(fk)
+    }
+
     pub fn put_output(&self, rec: &OutputRecord) -> Result<Fk, StoreError> {
         self.outputs.put(rec)
     }
@@ -119,7 +135,24 @@ impl Store {
             .put_spend(out_txid, out_index, spending_tx_fk, spending_input_index)
     }
 
+    /// Spenders whose spending transaction is currently strong (confirmed on best chain).
     pub fn spenders(
+        &self,
+        out_txid: &[u8; 32],
+        out_index: u32,
+    ) -> Result<Vec<crate::point_table::PointRecord>, StoreError> {
+        let all = self.points.spenders(out_txid, out_index)?;
+        let mut out = Vec::new();
+        for p in all {
+            if self.strong_tx.is_strong(p.spending_tx_fk)? {
+                out.push(p);
+            }
+        }
+        Ok(out)
+    }
+
+    /// All point rows including unconfirmed historical spends (raw multimap).
+    pub fn spenders_raw(
         &self,
         out_txid: &[u8; 32],
         out_index: u32,
@@ -130,8 +163,12 @@ impl Store {
     pub fn flush(&self) -> Result<(), StoreError> {
         self.headers.flush()?;
         self.txs.flush()?;
+        self.inputs.flush()?;
         self.outputs.flush()?;
         self.points.flush()?;
+        self.confirmed.flush()?;
+        self.strong_tx.flush()?;
+        self.block_txs.flush()?;
         Ok(())
     }
 }

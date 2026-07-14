@@ -1,0 +1,105 @@
+//! Growable variable-length record table.
+//!
+//! Layout:
+//! - `{stem}.body` — file header + append-only framed payloads
+//! - `{stem}.idx`  — file header + dense u64 absolute offsets into body (1-based fk *i* at slot *i-1*)
+
+use crate::error::StoreError;
+use crate::file::{TableFile, FILE_HEADER_LEN};
+use rbitcoin_primitives::{Fk, TableKind};
+use std::path::{Path, PathBuf};
+
+pub struct VarTable {
+    body: TableFile,
+    idx: TableFile,
+    count: parking_lot::Mutex<u64>,
+}
+
+impl VarTable {
+    pub fn create(dir: &Path, stem: &str, body_kind: TableKind) -> Result<Self, StoreError> {
+        let body = TableFile::create(Self::body_path(dir, stem), body_kind)?;
+        let idx = TableFile::create(Self::idx_path(dir, stem), TableKind::ArrayLink)?;
+        Ok(Self {
+            body,
+            idx,
+            count: parking_lot::Mutex::new(0),
+        })
+    }
+
+    pub fn open(dir: &Path, stem: &str, body_kind: TableKind) -> Result<Self, StoreError> {
+        let body = TableFile::open(Self::body_path(dir, stem), body_kind)?;
+        let idx = TableFile::open(Self::idx_path(dir, stem), TableKind::ArrayLink)?;
+        let idx_body = idx.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
+        if idx_body % 8 != 0 {
+            return Err(StoreError::Corrupt("var idx size"));
+        }
+        let count = idx_body / 8;
+        Ok(Self {
+            body,
+            idx,
+            count: parking_lot::Mutex::new(count),
+        })
+    }
+
+    fn body_path(dir: &Path, stem: &str) -> PathBuf {
+        dir.join(format!("{stem}.body"))
+    }
+
+    fn idx_path(dir: &Path, stem: &str) -> PathBuf {
+        dir.join(format!("{stem}.idx"))
+    }
+
+    pub fn count(&self) -> u64 {
+        *self.count.lock()
+    }
+
+    pub fn put(&self, payload: &[u8]) -> Result<Fk, StoreError> {
+        let mut count = self.count.lock();
+        let fk = Fk(*count + 1);
+        let start = self
+            .body
+            .logical_len()
+            .max(FILE_HEADER_LEN as u64);
+        self.body.write_at(start, payload)?;
+        let off_pos = FILE_HEADER_LEN as u64 + (*count) * 8;
+        self.idx.write_at(off_pos, &start.to_le_bytes())?;
+        *count += 1;
+        Ok(fk)
+    }
+
+    pub fn get_raw(&self, fk: Fk) -> Result<Vec<u8>, StoreError> {
+        let id = fk.get().ok_or(StoreError::InvalidFk)?;
+        let count = *self.count.lock();
+        if id == 0 || id > count {
+            return Err(StoreError::NotFound);
+        }
+        let mut off_buf = [0u8; 8];
+        self.idx
+            .read_at(FILE_HEADER_LEN as u64 + (id - 1) * 8, &mut off_buf)?;
+        let start = u64::from_le_bytes(off_buf);
+        let mut len_buf = [0u8; 4];
+        self.body.read_at(start, &mut len_buf)?;
+        let total = u32::from_le_bytes(len_buf) as usize;
+        if total < 4 {
+            return Err(StoreError::Corrupt("var record len"));
+        }
+        let mut buf = vec![0u8; total];
+        self.body.read_at(start, &mut buf)?;
+        Ok(buf)
+    }
+
+    pub fn flush(&self) -> Result<(), StoreError> {
+        self.body.flush()?;
+        self.idx.flush()?;
+        Ok(())
+    }
+}
+
+/// Prefix payload with u32 total length (including the 4-byte prefix).
+pub fn framed(payload: &[u8]) -> Vec<u8> {
+    let total = (4 + payload.len()) as u32;
+    let mut out = Vec::with_capacity(total as usize);
+    out.extend_from_slice(&total.to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}

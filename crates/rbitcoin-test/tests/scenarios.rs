@@ -9,7 +9,8 @@ use rbitcoin_node::{cli_main as node_cli_main, run_node, NodeConfig};
 use rbitcoin_primitives::{Fk, Height, Network, TableKind, VERSION};
 use rbitcoin_query::Query;
 use rbitcoin_rpc::node_rpc_path;
-use rbitcoin_store::{HeaderRecord, OutputRecord, Store, StoreError, TxRecord};
+use rbitcoin_query::TxApply;
+use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, Store, StoreError, TxRecord};
 use rbitcoin_test::{smoke_crate_names, TestDatadir};
 use rbitcoin_wire_cache::WireRing;
 use std::process::{Command, ExitCode};
@@ -178,9 +179,11 @@ fn store_put_tx_outputs_point() {
     };
     let spend_fk = q.put_tx(&spend_tx).unwrap();
     q.put_spend(&txid, 0, spend_fk, 0).unwrap();
-    let spenders = q.spenders(&txid, 0).unwrap();
-    assert_eq!(spenders.len(), 1);
-    assert_eq!(spenders[0].spending_tx_fk, spend_fk);
+    // Without strong_tx, filtered spenders are empty; raw multimap still has the row.
+    assert!(q.spenders(&txid, 0).unwrap().is_empty());
+    let raw = q.spenders_raw(&txid, 0).unwrap();
+    assert_eq!(raw.len(), 1);
+    assert_eq!(raw[0].spending_tx_fk, spend_fk);
     assert!(q.spenders(&txid, 1).unwrap().is_empty());
     q.flush().unwrap();
 }
@@ -324,8 +327,8 @@ fn store_point_chain_and_large_write() {
         .unwrap();
     q.put_spend(&txid, 0, s1, 0).unwrap();
     q.put_spend(&txid, 0, s2, 1).unwrap();
-    let spenders = q.spenders(&txid, 0).unwrap();
-    assert_eq!(spenders.len(), 2);
+    assert_eq!(q.spenders_raw(&txid, 0).unwrap().len(), 2);
+    assert!(q.spenders(&txid, 0).unwrap().is_empty());
     q.flush().unwrap();
 }
 
@@ -382,11 +385,11 @@ fn store_table_file_header_errors() {
 }
 
 #[test]
-fn store_hash_head_full_and_corrupt() {
+fn store_hash_head_grows_and_corrupt_body() {
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
-    // Fill all hash slots with unique header hashes.
-    for i in 0..64u64 {
+    // Beyond default 64 slots — head must rehash rather than fail.
+    for i in 0..200u64 {
         let mut hash = [0u8; 32];
         hash[0..8].copy_from_slice(&i.to_le_bytes());
         q.put_header(&HeaderRecord {
@@ -400,28 +403,16 @@ fn store_hash_head_full_and_corrupt() {
         })
         .unwrap();
     }
-    // 17th unique key should fail (hash head full).
-    let mut hash = [0u8; 32];
-    hash[0] = 0xff;
-    let err = q.put_header(&HeaderRecord {
-        prev_fk: Fk::NULL,
-        version: 1,
-        timestamp: 99,
-        bits: 1,
-        nonce: 1,
-        merkle_root: [0u8; 32],
-        hash,
-    });
-    assert!(err.is_err(), "expected hash head full");
+    let mut want = [0u8; 32];
+    want[0..8].copy_from_slice(&199u64.to_le_bytes());
+    let (fk, _) = q.get_header_by_hash(&want).unwrap().unwrap();
+    assert_eq!(fk, Fk(200));
 
-    // Corrupt header.body size (not multiple of record len) on reopen.
     q.flush().unwrap();
     drop(q);
     let body = td.store_path().join("header.body");
     let mut bytes = std::fs::read(&body).unwrap();
-    // Extend one byte past a clean multiple without updating logical correctly:
-    // set logical length field to a non-multiple.
-    let bad_len = 16u64 + 10; // header + 10
+    let bad_len = 16u64 + 10;
     bytes[8..16].copy_from_slice(&bad_len.to_le_bytes());
     std::fs::write(&body, &bytes).unwrap();
     match Store::open(td.store_path()) {
@@ -464,10 +455,11 @@ fn store_open_or_create_fresh() {
 }
 
 #[test]
-fn store_tx_capacity_and_hash_get_full() {
+fn store_tx_and_hash_grow() {
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
-    for i in 0..32u64 {
+    // Var table and hash head must grow past former fixed limits.
+    for i in 0..300u64 {
         let mut txid = [0u8; 32];
         txid[0..8].copy_from_slice(&i.to_le_bytes());
         q.put_tx(&TxRecord {
@@ -482,36 +474,11 @@ fn store_tx_capacity_and_hash_get_full() {
         })
         .unwrap();
     }
-    let err = q.put_tx(&TxRecord {
-        txid: [0xff; 32],
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 0,
-        output_start_fk: Fk::NULL,
-        output_count: 0,
-        raw: vec![0],
-    });
-    assert!(err.is_err());
-
-    // Fill header hash head then get a missing key (full probe path).
-    let td2 = TestDatadir::new().unwrap();
-    let q2 = Query::open_or_create(td2.store_path()).unwrap();
-    for i in 0..64u64 {
-        let mut hash = [0u8; 32];
-        hash[0..8].copy_from_slice(&i.to_le_bytes());
-        q2.put_header(&HeaderRecord {
-            prev_fk: Fk::NULL,
-            version: 1,
-            timestamp: 0,
-            bits: 1,
-            nonce: 0,
-            merkle_root: [0u8; 32],
-            hash,
-        })
-        .unwrap();
-    }
-    assert!(q2.get_header_by_hash(&[0xee; 32]).is_err());
+    let mut want = [0u8; 32];
+    want[0..8].copy_from_slice(&299u64.to_le_bytes());
+    let (fk, _) = q.get_tx_by_txid(&want).unwrap().unwrap();
+    assert_eq!(fk, Fk(300));
+    assert!(q.get_tx_by_txid(&[0xee; 32]).unwrap().is_none());
 }
 
 #[test]
@@ -633,11 +600,13 @@ fn store_corrupt_framed_record() {
     q.flush().unwrap();
     drop(q);
 
-    // Overwrite payload with invalid frame (len < 4).
+    // idx file: first offset at FILE_HEADER (16)
+    let idx = td.store_path().join("tx.idx");
+    let idx_bytes = std::fs::read(&idx).unwrap();
+    let start =
+        u64::from_le_bytes(idx_bytes[16..24].try_into().unwrap()) as usize;
     let body = td.store_path().join("tx.body");
     let mut bytes = std::fs::read(&body).unwrap();
-    let off_pos = 16 + 8; // VAR_OFFSETS_START
-    let start = u64::from_le_bytes(bytes[off_pos..off_pos + 8].try_into().unwrap()) as usize;
     if start + 4 <= bytes.len() {
         bytes[start..start + 4].copy_from_slice(&2u32.to_le_bytes());
         std::fs::write(&body, &bytes).unwrap();
@@ -664,18 +633,18 @@ fn store_read_past_end_via_bad_offset() {
         .unwrap();
     q.flush().unwrap();
     drop(q);
-    let body = td.store_path().join("tx.body");
-    let mut bytes = std::fs::read(&body).unwrap();
-    let off_pos = 16 + 8;
-    // Point first record at near EOF with huge length
-    let start = bytes.len() as u64 - 4;
-    bytes[off_pos..off_pos + 8].copy_from_slice(&start.to_le_bytes());
-    let huge = 1_000_000u32;
+    let body_path = td.store_path().join("tx.body");
+    let body = std::fs::read(&body_path).unwrap();
+    let start = body.len() as u64 - 4;
+    let mut idx = std::fs::read(td.store_path().join("tx.idx")).unwrap();
+    idx[16..24].copy_from_slice(&start.to_le_bytes());
+    std::fs::write(td.store_path().join("tx.idx"), &idx).unwrap();
+    let mut body = body;
     let s = start as usize;
-    if s + 4 <= bytes.len() {
-        bytes[s..s + 4].copy_from_slice(&huge.to_le_bytes());
+    if s + 4 <= body.len() {
+        body[s..s + 4].copy_from_slice(&1_000_000u32.to_le_bytes());
+        std::fs::write(&body_path, &body).unwrap();
     }
-    std::fs::write(&body, &bytes).unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
     assert!(q.get_tx(fk).is_err());
 }
@@ -837,4 +806,173 @@ fn node_datadir_is_file_errors() {
     let cfg = NodeConfig::default().with_datadir(file);
     let err = run_node(cfg).unwrap_err();
     let _ = err.to_string();
+}
+
+fn synth_header(prev_fk: Fk, height: u32) -> HeaderRecord {
+    let mut hash = [0u8; 32];
+    hash[0..4].copy_from_slice(&height.to_le_bytes());
+    hash[4] = 0xaa;
+    let mut merkle = [0u8; 32];
+    merkle[0..4].copy_from_slice(&height.to_le_bytes());
+    HeaderRecord {
+        prev_fk,
+        version: 1,
+        timestamp: 1_700_000_000 + height,
+        bits: 0x1d00ffff,
+        nonce: height,
+        merkle_root: merkle,
+        hash,
+    }
+}
+
+fn coinbase_tx(height: u32) -> TxApply {
+    let mut txid = [0u8; 32];
+    txid[0..4].copy_from_slice(&height.to_le_bytes());
+    txid[31] = 0xcb;
+    TxApply {
+        tx: TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk::NULL,
+            output_count: 0,
+            raw: vec![height as u8],
+        },
+        inputs: vec![InputRecord {
+            parent_tx_fk: Fk::NULL,
+            index: 0,
+            prev_txid: [0u8; 32],
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![0x00],
+        }],
+        outputs: vec![OutputRecord {
+            parent_tx_fk: Fk::NULL,
+            index: 0,
+            value: 50_0000_0000,
+            script: vec![0x51],
+        }],
+    }
+}
+
+fn spend_tx(height: u32, prev_txid: [u8; 32]) -> TxApply {
+    let mut txid = [0u8; 32];
+    txid[0..4].copy_from_slice(&height.to_le_bytes());
+    txid[31] = 0x5e;
+    TxApply {
+        tx: TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk::NULL,
+            output_count: 0,
+            raw: vec![0x5e, height as u8],
+        },
+        inputs: vec![InputRecord {
+            parent_tx_fk: Fk::NULL,
+            index: 0,
+            prev_txid,
+            prev_index: 0,
+            sequence: 0xffff_fffe,
+            script_sig: vec![0x51],
+        }],
+        outputs: vec![OutputRecord {
+            parent_tx_fk: Fk::NULL,
+            index: 0,
+            value: 49_0000_0000,
+            script: vec![0x51],
+        }],
+    }
+}
+
+#[test]
+fn chain_connect_100_blocks_and_reopen() {
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    let mut prev = Fk::NULL;
+    for h in 0..100u32 {
+        let header = synth_header(prev, h);
+        let txs = vec![coinbase_tx(h)];
+        let hk = q
+            .connect_block(Height(h), &header, &txs)
+            .expect("connect");
+        prev = hk;
+    }
+    assert_eq!(q.tip_height(), Some(Height(99)));
+    let (_fk, tip) = q.header_at_height(Height(99)).unwrap().unwrap();
+    assert_eq!(tip.nonce, 99);
+    assert_eq!(q.block_tx_fks(Height(50)).unwrap().len(), 1);
+    q.flush().unwrap();
+    drop(q);
+
+    let q2 = Query::open_or_create(td.store_path()).unwrap();
+    assert_eq!(q2.tip_height(), Some(Height(99)));
+    let (_fk, h0) = q2.header_at_height(Height::GENESIS).unwrap().unwrap();
+    assert_eq!(h0.nonce, 0);
+}
+
+#[test]
+fn chain_reorg_tip_clears_strong_spenders() {
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+
+    // Genesis coinbase
+    let g_header = synth_header(Fk::NULL, 0);
+    let g_cb = coinbase_tx(0);
+    let g_txid = g_cb.tx.txid;
+    let g_fk = q
+        .connect_block(Height::GENESIS, &g_header, &[g_cb])
+        .unwrap();
+
+    // Block 1 spends genesis coinbase
+    let h1 = synth_header(g_fk, 1);
+    let sp = spend_tx(1, g_txid);
+    let spend_txid = sp.tx.txid;
+    q.connect_block(Height(1), &h1, &[coinbase_tx(1), sp])
+        .unwrap();
+    assert_eq!(q.tip_height(), Some(Height(1)));
+    assert_eq!(q.spenders(&g_txid, 0).unwrap().len(), 1);
+    assert_eq!(q.spenders_raw(&g_txid, 0).unwrap().len(), 1);
+
+    // Disconnect tip — strong spenders cleared; raw multimap keeps history
+    q.disconnect_tip().unwrap();
+    assert_eq!(q.tip_height(), Some(Height::GENESIS));
+    assert!(q.spenders(&g_txid, 0).unwrap().is_empty());
+    assert_eq!(q.spenders_raw(&g_txid, 0).unwrap().len(), 1);
+
+    // Reconnect alternate tip at height 1 without spending g_txid
+    let h1b = synth_header(g_fk, 1);
+    // different hash
+    let mut h1b = h1b;
+    h1b.hash[30] = 0xbb;
+    q.connect_block(Height(1), &h1b, &[coinbase_tx(1)])
+        .unwrap();
+    assert_eq!(q.tip_height(), Some(Height(1)));
+    assert!(q.spenders(&g_txid, 0).unwrap().is_empty());
+    // spend tx no longer strong
+    assert!(q.get_tx_by_txid(&spend_txid).unwrap().is_some());
+
+    q.flush().unwrap();
+    let q2 = Query::open_or_create(td.store_path()).unwrap();
+    assert_eq!(q2.tip_height(), Some(Height(1)));
+    assert!(q2.spenders(&g_txid, 0).unwrap().is_empty());
+}
+
+#[test]
+fn chain_connect_rejects_bad_height() {
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    let err = q.connect_block(Height(1), &synth_header(Fk::NULL, 1), &[]);
+    assert!(err.is_err());
+    q.connect_block(Height::GENESIS, &synth_header(Fk::NULL, 0), &[coinbase_tx(0)])
+        .unwrap();
+    let err = q.connect_block(Height(5), &synth_header(Fk(1), 5), &[]);
+    assert!(err.is_err());
+    q.disconnect_tip().unwrap();
+    assert!(q.tip_height().is_none());
+    assert!(q.disconnect_tip().is_err());
 }

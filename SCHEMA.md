@@ -1,4 +1,4 @@
-# On-disk schema (v0 draft)
+# On-disk schema (v0)
 
 Versioned layouts for the chain store. **Format is unstable until 1.0.** Magic bytes and a schema version live in each file header.
 
@@ -8,115 +8,103 @@ Endianness: **little-endian** for all multi-byte integers.
 
 ```text
 <datadir>/
-  node.conf                 # optional generated snapshot of effective config
   store/
-    meta                    # store magic, schema version, flags
-    header.body             # Class A: block headers
-    header.head             # hash head for header-by-hash
-    tx.body
-    tx.head
-    input.body
-    output.body
-    point.body              # Class B: spend multimap body
-    point.head
-    strong_tx.body          # Class C
-    confirmed.body          # height -> header fk (best chain)
-    archive_epoch           # durable finalize record (Phase 5+)
-  wire/                     # tip wire ring (post-IBD); absent during IBD
+    meta                         # store magic + schema version
+    header.body / header.head    # Class A headers + hash index
+    tx.body / tx.idx / tx.head   # Class A txs (growable idx + hash head)
+    input.body / input.idx
+    output.body / output.idx
+    point.body / point.head      # Class B spend multimap
+    confirmed.body               # Class C: height → header fk
+    strong_tx.body               # Class C: (tx_fk-1) → header fk (0 = unstrong)
+    block_txs.body / block_txs.idx
+    block_txs_height.body        # height → block_txs list fk
+    archive_epoch                # Phase 6+
+  wire/                          # tip wire ring (post-IBD)
 ```
 
 ## Common file header (16 bytes)
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0 | 4 | Magic `RBT1` (0x52 0x42 0x54 0x31) |
-| 4 | 2 | Schema version (u16) — current **0** |
-| 6 | 2 | Table kind (u16), see below |
-| 8 | 8 | Reserved / flags |
+| 0 | 4 | Magic `RBT1` |
+| 4 | 2 | Schema version (u16) — **0** |
+| 6 | 2 | Table kind (u16) |
+| 8 | 8 | Logical length of file (bytes), including this header |
 
 ## Table kinds
 
-| Kind | Name | Class |
-|------|------|-------|
-| 1 | `meta` | — |
-| 2 | `header` | A |
-| 3 | `tx` | A |
-| 4 | `input` | A |
-| 5 | `output` | A |
-| 6 | `point` | B |
-| 7 | `strong_tx` | C |
-| 8 | `confirmed` | C |
-| 9 | `array_link` | A (generic dense array) |
-| 10 | `hash_head` | head file |
+| Kind | Name |
+|------|------|
+| 1 | meta |
+| 2 | header |
+| 3 | tx |
+| 4 | input |
+| 5 | output |
+| 6 | point |
+| 7 | strong_tx |
+| 8 | confirmed |
+| 9 | array_link (idx files, block lists, dense u64 arrays) |
+| 10 | hash_head |
 
-## Record layouts (v0)
+## Growable var records (`*.body` + `*.idx`)
 
-### Header body record
+- **body**: append-only framed payloads (`u32 total_len` including the 4-byte prefix + bytes).
+- **idx**: dense `u64` absolute offsets into body; count = `(logical_len - 16) / 8`.
+- FK is **1-based** index into idx.
 
-Fixed 88 bytes after file header region:
+## Hash head (`*.head`)
 
-| Field | Type | Notes |
-|-------|------|-------|
-| prev_fk | u64 | FK to previous header (0 = genesis sentinel) |
-| version | i32 | Block version |
-| timestamp | u32 | |
-| bits | u32 | |
-| nonce | u32 | |
-| merkle_root | [u8; 32] | |
-| hash | [u8; 32] | Block hash (double-SHA256 of header) |
+- Slot = 32-byte key + 8-byte fk; power-of-two slot count; linear probe.
+- **Rehashes (doubles slots)** when insert finds no free/equal slot — no silent fixed capacity.
 
-### Tx body record (variable)
+## Dense u64 arrays (`confirmed`, `strong_tx`, `block_txs_height`)
+
+- After file header: packed `u64` values.
+- Confirmed: index = height; length = tip_height+1 when chain non-empty.
+- Strong_tx: index = tx_fk - 1; value = header_fk or 0.
+
+## Record layouts
+
+### Header (fixed 88 bytes)
 
 | Field | Type |
 |-------|------|
-| txid | [u8; 32] |
+| prev_fk | u64 |
 | version | i32 |
-| locktime | u32 |
-| input_start_fk | u64 |
-| input_count | u32 |
-| output_start_fk | u64 |
-| output_count | u32 |
-| raw_len | u32 |
-| raw | [u8; raw_len] | Full consensus serialization (witness included when present) |
+| timestamp | u32 |
+| bits | u32 |
+| nonce | u32 |
+| merkle_root | [u8; 32] |
+| hash | [u8; 32] |
 
-### Output body record
+### Tx (variable, framed)
 
-| Field | Type |
-|-------|------|
-| parent_tx_fk | u64 |
-| index | u32 |
-| value | i64 | sats |
-| script_len | u32 |
-| script | [u8; script_len] |
+txid, version, locktime, input_start_fk, input_count, output_start_fk, output_count, raw_len, raw.
 
-**No spender field** (Class A write-once).
+### Input (variable, framed)
 
-### Point multimap entry (Class B)
+parent_tx_fk, index, prev_txid, prev_index, sequence, script_sig_len, script_sig.
 
-| Field | Type |
-|-------|------|
-| out_txid | [u8; 32] |
-| out_index | u32 |
-| spending_tx_fk | u64 |
-| spending_input_index | u32 |
-| next | u64 | Next entry fk in bucket chain (0 = end) |
+### Output (variable, framed)
 
-Heads file: open-addressed or chained hash slots → first entry fk. Publish via allocate-then-CAS.
+parent_tx_fk, index, value, script_len, script. **No spender field.**
 
-### Confirmed (height index)
+### Point multimap entry (fixed 56)
 
-Dense array: height `u32` → header `fk u64`.
+out_txid, out_index, spending_tx_fk, spending_input_index, next.
+
+### Block tx list (variable, framed)
+
+u32 count, then count × u64 tx_fk.
+
+## Chain ops (query layer)
+
+- `connect_block(height, header, txs)` — archive write + point spends + set strong + confirmed + block_txs.
+- `disconnect_tip()` — clear strong for tip txs, clear confirmed tip (Class A/B rows remain).
+- `spenders(outpoint)` — **only strong** spending txs; `spenders_raw` for full multimap history.
 
 ## Identity
 
-- **FK**: 1-based index into a table body (0 = null).
-- Hash keys: full 32-byte txid/block hash in heads (v0; may truncate later with care).
-
-## Epoch file (reserved)
-
-See durable-archive variant. Not written until `archive_mode` path lands.
-
-## Evolution
-
-- Bump schema version on incompatible changes.
-- Until 1.0, reindex-only migrations are acceptable.
+- FK 0 = null; otherwise 1-based.
+- Until 1.0, incompatible layout changes are reindex-only.

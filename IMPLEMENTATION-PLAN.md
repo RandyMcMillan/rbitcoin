@@ -189,21 +189,18 @@ Each phase is independently mergeable, has explicit exit criteria, and must keep
 
 ---
 
-### Phase 1 — Chain-capable store + query (1–2 weeks)
+### Phase 1 — Chain-capable store + query ✅
 
-**Goal:** Regtest-sized synthetic chains persist with linkage and reorg-friendly Class C.
+**Done:**
 
-**Work**
+1. Schema: inputs; growable `tx`/`input`/`output` (body+idx); `confirmed`, `strong_tx`, `block_txs` (SCHEMA.md).
+2. Hash heads **rehash** on full; var tables grow via separate idx files (no fixed capacity footgun).
+3. Query: `connect_block` / `disconnect_tip`, tip/header-at-height, strong-filtered `spenders` + `spenders_raw`.
+4. Scenarios: 100-block chain reopen; tip reorg clears strong spenders; grow past 200+ headers / 300+ txs.
 
-1. Schema: inputs, linkage arrays, `confirmed`, `strong_tx` (v0 layouts in SCHEMA.md).
-2. Grow hash heads and var tables (or document interim limits + fail loudly before corruption).
-3. Query APIs: `connect_block` / `disconnect_block` (or set_strong/unstrong + height index).
-4. Property/scenario tests: build 100–1000 block synthetic chain, reorg tip, spenders correct.
+**Exit met:** reopen after reorg; spenders correct for strong chain; heads/tables grow.
 
-**Exit**
-
-- Reopen datadir after “reorg” and query confirmed tip + spenders.
-- No fixed 64-slot head as a silent mainnet footgun (grow or hard error with clear message).
+---
 
 ---
 

@@ -1,7 +1,8 @@
 use crate::error::StoreError;
-use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::hashhead::HashHead;
+use crate::var_table::{framed, VarTable};
 use rbitcoin_primitives::{Fk, TableKind};
+use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxRecord {
@@ -98,128 +99,52 @@ impl OutputRecord {
     }
 }
 
-/// Index of variable records: count + offset table + payloads in one body file.
-///
-/// Layout after file header:
-/// - u64 count
-/// - count × u64 absolute offsets into this file for each record (1-based index i at slot i-1)
-/// - payloads appended after the offset table growth region
-///
-/// v0 simplification: offsets table is pre-reserved for `capacity` entries; payloads append.
-struct VarTable {
-    body: TableFile,
-    count: parking_lot::Mutex<u64>,
-    capacity: u64,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputRecord {
+    pub parent_tx_fk: Fk,
+    pub index: u32,
+    pub prev_txid: [u8; 32],
+    pub prev_index: u32,
+    pub sequence: u32,
+    pub script_sig: Vec<u8>,
 }
 
-const VAR_COUNT_OFFSET: u64 = FILE_HEADER_LEN as u64;
-const VAR_OFFSETS_START: u64 = VAR_COUNT_OFFSET + 8;
-
-impl VarTable {
-    fn offsets_bytes(capacity: u64) -> u64 {
-        capacity * 8
+impl InputRecord {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + 4 + 32 + 4 + 4 + 4 + self.script_sig.len());
+        out.extend_from_slice(&self.parent_tx_fk.0.to_le_bytes());
+        out.extend_from_slice(&self.index.to_le_bytes());
+        out.extend_from_slice(&self.prev_txid);
+        out.extend_from_slice(&self.prev_index.to_le_bytes());
+        out.extend_from_slice(&self.sequence.to_le_bytes());
+        out.extend_from_slice(&(self.script_sig.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.script_sig);
+        out
     }
 
-    fn payload_start(capacity: u64) -> u64 {
-        VAR_OFFSETS_START + Self::offsets_bytes(capacity)
-    }
-
-    pub fn create(
-        path: impl Into<std::path::PathBuf>,
-        kind: TableKind,
-        capacity: u64,
-    ) -> Result<Self, StoreError> {
-        let body = TableFile::create(path, kind)?;
-        // count = 0
-        body.write_at(VAR_COUNT_OFFSET, &0u64.to_le_bytes())?;
-        let zeros = vec![0u8; Self::offsets_bytes(capacity) as usize];
-        body.write_at(VAR_OFFSETS_START, &zeros)?;
-        // Offset table write leaves logical_len at payload_start.
-        debug_assert!(body.logical_len() >= Self::payload_start(capacity));
+    pub fn decode(buf: &[u8]) -> Result<Self, StoreError> {
+        if buf.len() < 8 + 4 + 32 + 4 + 4 + 4 {
+            return Err(StoreError::Corrupt("short input record"));
+        }
+        let parent_tx_fk = Fk(u64::from_le_bytes(buf[0..8].try_into().unwrap()));
+        let index = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let prev_txid: [u8; 32] = buf[12..44].try_into().unwrap();
+        let prev_index = u32::from_le_bytes(buf[44..48].try_into().unwrap());
+        let sequence = u32::from_le_bytes(buf[48..52].try_into().unwrap());
+        let script_len = u32::from_le_bytes(buf[52..56].try_into().unwrap()) as usize;
+        if buf.len() < 56 + script_len {
+            return Err(StoreError::Corrupt("input script truncated"));
+        }
         Ok(Self {
-            body,
-            count: parking_lot::Mutex::new(0),
-            capacity,
+            parent_tx_fk,
+            index,
+            prev_txid,
+            prev_index,
+            sequence,
+            script_sig: buf[56..56 + script_len].to_vec(),
         })
     }
-
-    pub fn open(
-        path: impl Into<std::path::PathBuf>,
-        kind: TableKind,
-        capacity: u64,
-    ) -> Result<Self, StoreError> {
-        let body = TableFile::open(path, kind)?;
-        let mut count_buf = [0u8; 8];
-        body.read_at(VAR_COUNT_OFFSET, &mut count_buf)?;
-        let count = u64::from_le_bytes(count_buf);
-        Ok(Self {
-            body,
-            count: parking_lot::Mutex::new(count),
-            capacity,
-        })
-    }
-
-    pub fn put(&self, payload: &[u8]) -> Result<Fk, StoreError> {
-        let mut count = self.count.lock();
-        if *count >= self.capacity {
-            return Err(StoreError::Corrupt("var table capacity exhausted"));
-        }
-        let fk = Fk(*count + 1);
-        // Append payload at end of logical file (at least payload_start).
-        let start = self
-            .body
-            .logical_len()
-            .max(Self::payload_start(self.capacity));
-        self.body.write_at(start, payload)?;
-        // Length-prefix each record for decode: u32 len + bytes already in payload encoding.
-        // We store raw encoded record only; readers use length from encoding.
-        // For get we need to know length — encode stores self-describing records.
-        // Write offset for this fk.
-        let off_pos = VAR_OFFSETS_START + (*count) * 8;
-        self.body.write_at(off_pos, &start.to_le_bytes())?;
-        *count += 1;
-        self.body.write_at(VAR_COUNT_OFFSET, &count.to_le_bytes())?;
-        Ok(fk)
-    }
-
-    pub fn get_raw(&self, fk: Fk) -> Result<Vec<u8>, StoreError> {
-        let id = fk.get().ok_or(StoreError::InvalidFk)?;
-        let count = *self.count.lock();
-        if id == 0 || id > count {
-            return Err(StoreError::NotFound);
-        }
-        let mut off_buf = [0u8; 8];
-        self.body
-            .read_at(VAR_OFFSETS_START + (id - 1) * 8, &mut off_buf)?;
-        let start = u64::from_le_bytes(off_buf);
-        // Peek length: for tx/output encodings, length is embedded. Read a generous chunk
-        // by scanning: we store u32 total_len prefix for var records in this helper.
-        let mut len_buf = [0u8; 4];
-        self.body.read_at(start, &mut len_buf)?;
-        let total = u32::from_le_bytes(len_buf) as usize;
-        if total < 4 {
-            return Err(StoreError::Corrupt("var record len"));
-        }
-        let mut buf = vec![0u8; total];
-        self.body.read_at(start, &mut buf)?;
-        Ok(buf)
-    }
-
-    pub fn flush(&self) -> Result<(), StoreError> {
-        self.body.flush()
-    }
 }
-
-/// Prefix payload with u32 total length (including the 4-byte prefix).
-fn framed(payload: &[u8]) -> Vec<u8> {
-    let total = (4 + payload.len()) as u32;
-    let mut out = Vec::with_capacity(total as usize);
-    out.extend_from_slice(&total.to_le_bytes());
-    out.extend_from_slice(payload);
-    out
-}
-
-const TX_CAPACITY: u64 = 32;
 
 pub struct TxTable {
     body: VarTable,
@@ -227,16 +152,16 @@ pub struct TxTable {
 }
 
 impl TxTable {
-    pub fn create(dir: &std::path::Path) -> Result<Self, StoreError> {
+    pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
-            body: VarTable::create(dir.join("tx.body"), TableKind::Tx, TX_CAPACITY)?,
+            body: VarTable::create(dir, "tx", TableKind::Tx)?,
             head: HashHead::create(dir.join("tx.head"))?,
         })
     }
 
-    pub fn open(dir: &std::path::Path) -> Result<Self, StoreError> {
+    pub fn open(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
-            body: VarTable::open(dir.join("tx.body"), TableKind::Tx, TX_CAPACITY)?,
+            body: VarTable::open(dir, "tx", TableKind::Tx)?,
             head: HashHead::open(dir.join("tx.head"))?,
         })
     }
@@ -250,7 +175,6 @@ impl TxTable {
 
     pub fn get(&self, fk: Fk) -> Result<TxRecord, StoreError> {
         let raw = self.body.get_raw(fk)?;
-        // get_raw returns a framed buffer with total >= 4.
         TxRecord::decode(&raw[4..])
     }
 
@@ -268,23 +192,25 @@ impl TxTable {
     }
 }
 
-const OUTPUT_CAPACITY: u64 = 64;
-
 pub struct OutputTable {
     body: VarTable,
 }
 
 impl OutputTable {
-    pub fn create(dir: &std::path::Path) -> Result<Self, StoreError> {
+    pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
-            body: VarTable::create(dir.join("output.body"), TableKind::Output, OUTPUT_CAPACITY)?,
+            body: VarTable::create(dir, "output", TableKind::Output)?,
         })
     }
 
-    pub fn open(dir: &std::path::Path) -> Result<Self, StoreError> {
+    pub fn open(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
-            body: VarTable::open(dir.join("output.body"), TableKind::Output, OUTPUT_CAPACITY)?,
+            body: VarTable::open(dir, "output", TableKind::Output)?,
         })
+    }
+
+    pub fn count(&self) -> u64 {
+        self.body.count()
     }
 
     pub fn put(&self, rec: &OutputRecord) -> Result<Fk, StoreError> {
@@ -295,6 +221,42 @@ impl OutputTable {
     pub fn get(&self, fk: Fk) -> Result<OutputRecord, StoreError> {
         let raw = self.body.get_raw(fk)?;
         OutputRecord::decode(&raw[4..])
+    }
+
+    pub fn flush(&self) -> Result<(), StoreError> {
+        self.body.flush()
+    }
+}
+
+pub struct InputTable {
+    body: VarTable,
+}
+
+impl InputTable {
+    pub fn create(dir: &Path) -> Result<Self, StoreError> {
+        Ok(Self {
+            body: VarTable::create(dir, "input", TableKind::Input)?,
+        })
+    }
+
+    pub fn open(dir: &Path) -> Result<Self, StoreError> {
+        Ok(Self {
+            body: VarTable::open(dir, "input", TableKind::Input)?,
+        })
+    }
+
+    pub fn count(&self) -> u64 {
+        self.body.count()
+    }
+
+    pub fn put(&self, rec: &InputRecord) -> Result<Fk, StoreError> {
+        let payload = framed(&rec.encode());
+        self.body.put(&payload)
+    }
+
+    pub fn get(&self, fk: Fk) -> Result<InputRecord, StoreError> {
+        let raw = self.body.get_raw(fk)?;
+        InputRecord::decode(&raw[4..])
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {

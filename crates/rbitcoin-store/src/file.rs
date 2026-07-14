@@ -104,6 +104,18 @@ impl TableFile {
         *self.len.lock()
     }
 
+    /// Shrink or set logical length (must be ≥ header size). Does not zero freed bytes.
+    pub fn set_logical_len(&self, logical: u64) -> Result<(), StoreError> {
+        if logical < FILE_HEADER_LEN as u64 {
+            return Err(StoreError::Corrupt("logical length below header"));
+        }
+        self.ensure_capacity(logical)?;
+        let mut len = self.len.lock();
+        *len = logical;
+        self.persist_logical_len(logical)?;
+        Ok(())
+    }
+
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
         let end = offset.saturating_add(buf.len() as u64);
         let len = *self.len.lock();

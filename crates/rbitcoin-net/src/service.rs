@@ -3,7 +3,7 @@
 use crate::cache::BlockCache;
 use crate::chain::{AcceptOutcome, ChainHub};
 use crate::error::NetError;
-use crate::ibd::{parallel_ibd, IbdConfig};
+use crate::ibd::IbdConfig;
 use crate::peer::{handshake, peer_session, sync_from_peer};
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::Magic;
@@ -168,12 +168,23 @@ impl P2PNode {
         peers: &[SocketAddr],
         cfg: IbdConfig,
     ) -> Result<u32, NetError> {
-        parallel_ibd(
+        self.parallel_sync_cancellable(peers, cfg, None).await
+    }
+
+    /// Parallel IBD with optional cooperative cancel flag (SIGTERM path).
+    pub async fn parallel_sync_cancellable(
+        &self,
+        peers: &[SocketAddr],
+        cfg: IbdConfig,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<u32, NetError> {
+        crate::ibd::parallel_ibd_cancellable(
             self.hub.clone(),
             self.magic,
             self.local_addr,
             peers,
             cfg,
+            cancel,
         )
         .await
     }

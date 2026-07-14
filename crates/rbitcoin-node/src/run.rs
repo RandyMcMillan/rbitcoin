@@ -41,14 +41,15 @@ impl NodeHandle {
 /// Cooperative shutdown flag shared across the process lifetime.
 #[derive(Debug)]
 pub struct Shutdown {
-    flag: AtomicBool,
+    /// Polled by IBD / long loops for cooperative cancel.
+    pub flag: Arc<AtomicBool>,
     notify: Notify,
 }
 
 impl Shutdown {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            flag: AtomicBool::new(false),
+            flag: Arc::new(AtomicBool::new(false)),
             notify: Notify::new(),
         })
     }
@@ -69,7 +70,6 @@ impl Shutdown {
             return;
         }
         self.notify.notified().await;
-        // Re-check in case of lost wakeup race.
         while !self.requested() {
             self.notify.notified().await;
         }
@@ -212,17 +212,28 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             ibd_cfg.window,
             ibd_cfg.per_peer
         );
+        // Cooperative cancel: IBD polls the same AtomicBool the signal handler sets.
+        let cancel = Some(Arc::clone(&shutdown.flag));
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
                 eprintln!("signal: interrupting parallel IBD…");
             }
-            result = node.parallel_sync(&ibd_targets, ibd_cfg) => {
+            result = node.parallel_sync_cancellable(&ibd_targets, ibd_cfg, cancel) => {
                 match result {
-                    Ok(n) => eprintln!(
-                        "ibd: parallel catch-up accepted≈{n} tip={:?}",
-                        node.tip_height()
-                    ),
+                    Ok(n) => {
+                        if shutdown.requested() {
+                            eprintln!(
+                                "ibd: parallel catch-up interrupted accepted≈{n} tip={:?}",
+                                node.tip_height()
+                            );
+                        } else {
+                            eprintln!(
+                                "ibd: parallel catch-up accepted≈{n} tip={:?}",
+                                node.tip_height()
+                            );
+                        }
+                    }
                     Err(e) => {
                         if shutdown.requested() {
                             eprintln!("signal: parallel IBD cancelled ({e})");

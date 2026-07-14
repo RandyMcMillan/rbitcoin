@@ -101,6 +101,9 @@ impl Drop for PeerSlot {
 
 /// Run parallel IBD against `peers` until no more headers/blocks, or all peers die.
 ///
+/// If `cancel` is set, the loop exits cooperatively at the next iteration (used by
+/// SIGTERM/SIGINT handling so we can flush before process exit).
+///
 /// Returns approximate number of blocks accepted this run.
 pub async fn parallel_ibd(
     hub: Arc<ChainHub>,
@@ -109,9 +112,27 @@ pub async fn parallel_ibd(
     peers: &[SocketAddr],
     cfg: IbdConfig,
 ) -> Result<u32, NetError> {
+    parallel_ibd_cancellable(hub, magic, local_addr, peers, cfg, None).await
+}
+
+/// Like [`parallel_ibd`], with an optional cancel flag polled each loop turn.
+pub async fn parallel_ibd_cancellable(
+    hub: Arc<ChainHub>,
+    magic: Magic,
+    local_addr: SocketAddr,
+    peers: &[SocketAddr],
+    cfg: IbdConfig,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<u32, NetError> {
     if peers.is_empty() {
         return Err(NetError::Protocol("no peers for parallel ibd"));
     }
+    let cancelled = || {
+        cancel
+            .as_ref()
+            .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(false)
+    };
 
     // Genesis must exist so getheaders locator is real and blocks link to tip.
     hub.ensure_genesis()?;
@@ -179,6 +200,13 @@ pub async fn parallel_ibd(
     }
 
     loop {
+        if cancelled() {
+            eprintln!("ibd: cancel requested — stopping parallel IBD");
+            break;
+        }
+        // Yield so a concurrent shutdown select/task can run promptly.
+        tokio::task::yield_now().await;
+
         // Drop already-connected prefixes from the ordered queue.
         while let Some(&front) = ordered.front() {
             if hub.has_block(&front) {

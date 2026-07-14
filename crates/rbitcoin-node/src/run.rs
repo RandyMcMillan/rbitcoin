@@ -62,6 +62,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             milestone.height
         );
     }
+    // Fast IBD: skip scripthash unless operator keeps it on without milestone.
+    let scripthash = config.scripthash_index && milestone.height == 0;
+    handle.query.set_scripthash_index(scripthash);
+    if !scripthash {
+        eprintln!("ibd: scripthash index OFF during catch-up (re-enable after tip for Electrum)");
+    }
 
     let listen = config
         .p2p_listen
@@ -103,26 +109,33 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     };
 
     // Catch-up: concurrent multi-peer download window (libbitcoin-class).
-    if !targets.is_empty() {
+    // Prefer more peers for the window (up to max_outbound, not just 3).
+    let ibd_targets = if !config.connect.is_empty() {
+        config.connect.clone()
+    } else {
+        addrman.take_outbound(max_out.min(32))
+    };
+    if !ibd_targets.is_empty() {
         let ibd_cfg = IbdConfig {
             window: 1024,
             per_peer: 16,
+            stall: std::time::Duration::from_secs(15),
             ..IbdConfig::default()
         };
         eprintln!(
             "ibd: parallel catch-up from {} peers (window={}, per_peer={})…",
-            targets.len(),
+            ibd_targets.len(),
             ibd_cfg.window,
             ibd_cfg.per_peer
         );
-        match node.parallel_sync(&targets, ibd_cfg).await {
+        match node.parallel_sync(&ibd_targets, ibd_cfg).await {
             Ok(n) => eprintln!(
                 "ibd: parallel catch-up accepted≈{n} tip={:?}",
                 node.tip_height()
             ),
             Err(e) => {
                 eprintln!("ibd: parallel catch-up warning: {e}; falling back sequential");
-                match node.sync_from_peers(&targets).await {
+                match node.sync_from_peers(&ibd_targets).await {
                     Ok(n) => eprintln!(
                         "ibd: sequential fallback downloaded≈{n} tip={:?}",
                         node.tip_height()

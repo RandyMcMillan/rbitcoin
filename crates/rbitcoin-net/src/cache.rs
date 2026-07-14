@@ -131,7 +131,7 @@ impl BlockCache {
         out
     }
 
-    /// Headers after the best common locator hash, up to 2000.
+    /// Headers after the best common locator hash, up to Core `MAX_HEADERS_RESULTS` (2000).
     pub fn headers_after_locator(&self, locator: &[BlockHash], stop: BlockHash) -> Vec<Header> {
         let g = self.inner.read();
         if g.chain.is_empty() {
@@ -151,7 +151,7 @@ impl BlockCache {
             }
         }
         let mut out = Vec::new();
-        for h in g.chain.iter().skip(start).take(2000) {
+        for h in g.chain.iter().skip(start).take(crate::codec::MAX_HEADERS_RESULTS) {
             if let Some(b) = g.by_hash.get(h) {
                 out.push(b.header);
                 if *h == stop && stop.to_byte_array() != [0u8; 32] {

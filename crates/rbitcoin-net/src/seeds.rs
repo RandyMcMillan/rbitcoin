@@ -107,6 +107,9 @@ impl AddrMan {
                 self.peers.push(a);
             }
         }
+        // Prefer IPv4 first — many lab hosts have no IPv6 route, and IPv6
+        // seeds only burn connect-timeout slots during parallel IBD dial.
+        self.peers.sort_by_key(|a| a.is_ipv6());
     }
 
     pub fn add(&mut self, addr: SocketAddr) {

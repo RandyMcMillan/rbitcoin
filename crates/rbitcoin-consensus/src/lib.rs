@@ -10,7 +10,8 @@ mod milestone;
 mod params;
 
 pub use block::{
-    block_subsidy, validate_block_connect, validate_block_structure, ValidationContext,
+    bip34_height_script, block_subsidy, validate_block_connect, validate_block_structure,
+    ValidationContext,
 };
 pub use convert::{block_to_apply, header_to_record};
 pub use error::ConsensusError;

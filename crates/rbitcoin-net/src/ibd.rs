@@ -8,7 +8,7 @@
 //! - Stall timeout reassigns in-flight hashes to other peers
 
 use crate::chain::{AcceptOutcome, ChainHub};
-use crate::codec::{read_msg, write_msg};
+use crate::codec::{write_msg, MessageStream, MAX_HEADERS_RESULTS, MAX_INV_SIZE};
 use crate::error::NetError;
 use crate::peer::handshake;
 use bitcoin::block::Header;
@@ -37,6 +37,8 @@ pub struct IbdConfig {
     pub stall: Duration,
     /// Max headers to request per getheaders round-trip.
     pub headers_batch: usize,
+    /// TCP connect + handshake timeout per peer.
+    pub connect_timeout: Duration,
 }
 
 impl Default for IbdConfig {
@@ -44,8 +46,9 @@ impl Default for IbdConfig {
         Self {
             window: 1024,
             per_peer: 16,
-            stall: Duration::from_secs(30),
-            headers_batch: 2000,
+            stall: Duration::from_secs(5),
+            headers_batch: MAX_HEADERS_RESULTS,
+            connect_timeout: Duration::from_secs(8),
         }
     }
 }
@@ -57,7 +60,8 @@ impl IbdConfig {
             window: 32,
             per_peer: 8,
             stall: Duration::from_secs(10),
-            headers_batch: 2000,
+            headers_batch: MAX_HEADERS_RESULTS,
+            connect_timeout: Duration::from_secs(3),
         }
     }
 }
@@ -101,26 +105,55 @@ pub async fn parallel_ibd(
         return Err(NetError::Protocol("no peers for parallel ibd"));
     }
 
-    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<PeerEvent>();
-    let mut slots: Vec<PeerSlot> = Vec::new();
+    // Genesis must exist so getheaders locator is real and blocks link to tip.
+    hub.ensure_genesis()?;
 
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<PeerEvent>();
+
+    // Connect all peers concurrently with a hard timeout (sequential connect
+    // hangs forever on blackholed seeds and blocks the whole IBD).
+    let tip_h = hub.tip_height();
+    let mut join_set = tokio::task::JoinSet::new();
     for (id, &addr) in peers.iter().enumerate() {
-        match spawn_peer(id, addr, magic, local_addr, hub.tip_height(), ev_tx.clone()).await {
-            Ok(slot) => {
-                eprintln!("ibd: parallel peer[{id}] connected {addr}");
+        let ev = ev_tx.clone();
+        let timeout = cfg.connect_timeout;
+        join_set.spawn(async move {
+            let fut = spawn_peer(id, addr, magic, local_addr, tip_h, ev);
+            match tokio::time::timeout(timeout, fut).await {
+                Ok(Ok(slot)) => Ok(slot),
+                Ok(Err(e)) => Err((id, addr, e.to_string())),
+                Err(_) => Err((id, addr, format!("connect timeout ({timeout:?})"))),
+            }
+        });
+    }
+    let mut slots: Vec<PeerSlot> = Vec::new();
+    while let Some(joined) = join_set.join_next().await {
+        match joined {
+            Ok(Ok(slot)) => {
+                eprintln!("ibd: parallel peer[{}] connected", slot.id);
                 slots.push(slot);
             }
+            Ok(Err((id, addr, reason))) => {
+                eprintln!("ibd: parallel peer[{id}] {addr} failed: {reason}");
+            }
             Err(e) => {
-                eprintln!("ibd: parallel peer[{id}] {addr} failed: {e}");
+                eprintln!("ibd: peer connect task panicked: {e}");
             }
         }
     }
+    slots.sort_by_key(|s| s.id);
     if slots.is_empty() {
         return Err(NetError::Protocol("no parallel peers connected"));
     }
+    eprintln!(
+        "ibd: {} / {} peers ready",
+        slots.len(),
+        peers.len()
+    );
 
-    // Ordered hashes we still need (height not stored; chain order from headers).
-    let mut want: VecDeque<BlockHash> = VecDeque::new();
+    // Ordered download path (chain order after local tip). Front = next to connect.
+    let mut ordered: VecDeque<BlockHash> = VecDeque::new();
+    let mut ordered_set: HashSet<BlockHash> = HashSet::new();
     // hash → when requested + peer id
     let mut inflight: HashMap<BlockHash, (usize, Instant)> = HashMap::new();
     // Received but not yet connected
@@ -135,33 +168,84 @@ pub async fn parallel_ibd(
     let start_tip = hub.tip_height().unwrap_or(0);
     let mut headers_done = false;
     let mut last_progress = Instant::now();
-    // Consecutive empty/useless header replies across peers.
+    let mut last_status = Instant::now();
+    // Consecutive empty/useless header replies.
     let mut empty_header_streak = 0u32;
     let mut header_req_seq = 0u32;
+    // How far ahead of connected tip we may download.
+    let window = cfg.window;
 
     // Kick header sync on first alive peer.
     request_headers(&slots, &hub, &mut header_req_seq)?;
 
     loop {
-        // Assign work to free peer slots.
-        assign_work(&mut slots, &mut want, &mut inflight, &cfg);
+        // Drop already-connected prefixes from the ordered queue.
+        while let Some(&front) = ordered.front() {
+            if hub.has_block(&front) {
+                ordered.pop_front();
+                ordered_set.remove(&front);
+            } else {
+                break;
+            }
+        }
 
-        // Stall reassignment
+        // How many hashes still needed beyond tip (ordered not yet in pool).
+        let backlog = ordered
+            .iter()
+            .filter(|h| !pool.contains_key(*h) && !hub.has_block(h))
+            .count();
+        let ahead = pool.len() + inflight.len();
+
+        // Pipeline headers only while backlog is thin (avoid multi-k orphan pool).
+        if !headers_done && backlog < window {
+            let _ = request_headers(&slots, &hub, &mut header_req_seq);
+        }
+
+        // Assign work: only hashes within the download window from ordered front.
+        assign_work_ordered(
+            &mut slots,
+            &ordered,
+            &mut inflight,
+            &pool,
+            hub.as_ref(),
+            &cfg,
+            window,
+        );
+
+        // Stall reassignment (re-request; ordered path still owns the hashes).
         let now = Instant::now();
-        reassign_stalled(&mut slots, &mut inflight, &mut want, &cfg, now);
+        reassign_stalled(&mut slots, &mut inflight, &cfg, now);
+
+        // Status line (helps lab debugging; line-buffered-ish)
+        if last_status.elapsed() > Duration::from_secs(5) {
+            eprintln!(
+                "ibd: status tip={:?} ordered={} inflight={} pool={} ahead={ahead} headers_done={headers_done} peers={}",
+                hub.tip_height(),
+                ordered.len(),
+                inflight.len(),
+                pool.len(),
+                slots.iter().filter(|s| s.alive).count(),
+            );
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            last_status = Instant::now();
+        }
 
         // Exit if nothing left and no inflight
-        if headers_done && want.is_empty() && inflight.is_empty() {
-            break;
+        if headers_done && ordered.is_empty() && inflight.is_empty() {
+            drain_connect(&hub, &mut pool, &mut ordered, &mut ordered_set, &accepted, start_tip)?;
+            if pool.is_empty() {
+                break;
+            }
+            if last_progress.elapsed() > cfg.stall {
+                eprintln!(
+                    "ibd: dropping {} orphan pool blocks after stall",
+                    pool.len()
+                );
+                pool.clear();
+                break;
+            }
         }
-        // Idle with nothing to do
-        if want.is_empty()
-            && inflight.is_empty()
-            && pool.is_empty()
-            && last_progress.elapsed() > Duration::from_secs(5)
-            && empty_header_streak >= 2
-        {
-            headers_done = true;
+        if ordered.is_empty() && inflight.is_empty() && pool.is_empty() && headers_done {
             break;
         }
         // All peers dead
@@ -173,7 +257,7 @@ pub async fn parallel_ibd(
         }
 
         // Wait for events with timeout so we can reassign stalls.
-        let wait = tokio::time::timeout(Duration::from_millis(500), ev_rx.recv()).await;
+        let wait = tokio::time::timeout(Duration::from_millis(100), ev_rx.recv()).await;
         match wait {
             Ok(Some(PeerEvent::Headers { peer, headers })) => {
                 if let Some(s) = slots.iter_mut().find(|s| s.id == peer) {
@@ -183,10 +267,7 @@ pub async fn parallel_ibd(
                 let mut added = 0usize;
                 for hdr in headers {
                     let hash = hdr.block_hash();
-                    if hub.has_block(&hash)
-                        || want.iter().any(|h| h == &hash)
-                        || inflight.contains_key(&hash)
-                        || pool.contains_key(&hash)
+                    if hub.has_block(&hash) || ordered_set.contains(&hash) || pool.contains_key(&hash)
                     {
                         known_headers.insert(hash);
                         continue;
@@ -200,25 +281,28 @@ pub async fn parallel_ibd(
                         continue;
                     }
                     known_headers.insert(hash);
-                    if !hub.has_block(&hash) {
-                        want.push_back(hash);
-                        added += 1;
-                    }
+                    ordered.push_back(hash);
+                    ordered_set.insert(hash);
+                    added += 1;
                 }
                 if added > 0 {
                     last_progress = Instant::now();
                     empty_header_streak = 0;
-                    // Full batch → ask same peer for more headers
-                    if batch_len >= 2000 {
+                    // Full batch and backlog thin → pipeline more headers
+                    if batch_len >= MAX_HEADERS_RESULTS && ordered.len() < window * 2 {
                         let _ = request_headers_from(&slots, peer, &hub, &mut header_req_seq);
                     }
-                } else {
+                } else if batch_len == 0 {
                     empty_header_streak = empty_header_streak.saturating_add(1);
-                    if empty_header_streak >= slots.len() as u32 {
+                    if empty_header_streak >= (slots.len() as u32).max(2)
+                        && ordered.is_empty()
+                        && inflight.is_empty()
+                    {
                         headers_done = true;
-                    } else {
-                        // Ask a different peer once
+                    } else if empty_header_streak < 8 && ordered.len() < window {
                         let _ = request_headers(&slots, &hub, &mut header_req_seq);
+                    } else if empty_header_streak >= 8 {
+                        headers_done = true;
                     }
                 }
             }
@@ -231,7 +315,14 @@ pub async fn parallel_ibd(
                 inflight.remove(&hash);
                 pool.insert(hash, block);
                 last_progress = Instant::now();
-                drain_connect(&hub, &mut pool, &accepted, start_tip)?;
+                drain_connect(
+                    &hub,
+                    &mut pool,
+                    &mut ordered,
+                    &mut ordered_set,
+                    &accepted,
+                    start_tip,
+                )?;
             }
             Ok(Some(PeerEvent::Dead { peer, reason })) => {
                 eprintln!("ibd: peer[{peer}] dead: {reason}");
@@ -239,16 +330,27 @@ pub async fn parallel_ibd(
                     s.alive = false;
                     for h in s.in_flight.drain() {
                         inflight.remove(&h);
-                        if !hub.has_block(&h) && !pool.contains_key(&h) {
-                            want.push_front(h);
-                        }
                     }
                 }
             }
             Ok(None) => break,
             Err(_) => {
-                if last_progress.elapsed() > cfg.stall && want.is_empty() && inflight.is_empty() {
+                // timeout tick — try connect + gap re-request of ordered front
+                drain_connect(
+                    &hub,
+                    &mut pool,
+                    &mut ordered,
+                    &mut ordered_set,
+                    &accepted,
+                    start_tip,
+                )?;
+                if last_progress.elapsed() > cfg.stall
+                    && ordered.is_empty()
+                    && inflight.is_empty()
+                    && pool.is_empty()
+                {
                     headers_done = true;
+                    let _ = headers_done; // used for exit conditions above
                     break;
                 }
             }
@@ -256,7 +358,14 @@ pub async fn parallel_ibd(
     }
 
     // Final drain
-    drain_connect(&hub, &mut pool, &accepted, start_tip)?;
+    drain_connect(
+        &hub,
+        &mut pool,
+        &mut ordered,
+        &mut ordered_set,
+        &accepted,
+        start_tip,
+    )?;
 
     for s in &slots {
         let _ = s.cmd_tx.send(PeerCmd::Shutdown);
@@ -292,11 +401,18 @@ async fn spawn_peer(
 
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<PeerCmd>();
     let task = tokio::spawn(async move {
+        // Cancellation-safe framer: select! must not desync partial header reads.
+        let mut framer = MessageStream::new();
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(PeerCmd::GetHeaders { locator }) => {
+                            let locator = if locator.len() > crate::codec::MAX_LOCATOR_SZ {
+                                locator[..crate::codec::MAX_LOCATOR_SZ].to_vec()
+                            } else {
+                                locator
+                            };
                             let gh = GetHeadersMessage::new(
                                 locator,
                                 BlockHash::from_byte_array([0u8; 32]),
@@ -313,38 +429,45 @@ async fn spawn_peer(
                             }
                         }
                         Some(PeerCmd::GetData { hashes }) => {
-                            let inv: Vec<_> = hashes
-                                .into_iter()
-                                .map(Inventory::WitnessBlock)
-                                .collect();
-                            if inv.is_empty() {
-                                continue;
-                            }
-                            if write_msg(&mut stream, magic, NetworkMessage::GetData(inv))
-                                .await
-                                .is_err()
-                            {
-                                let _ = ev_tx.send(PeerEvent::Dead {
-                                    peer: id,
-                                    reason: "write getdata failed".into(),
-                                });
-                                break;
+                            // Cap each getdata to Core MAX_INV_SZ (we also
+                            // assign small per-peer batches; this is a hard stop).
+                            for chunk in hashes.chunks(MAX_INV_SIZE) {
+                                let inv: Vec<_> = chunk
+                                    .iter()
+                                    .copied()
+                                    .map(Inventory::WitnessBlock)
+                                    .collect();
+                                if inv.is_empty() {
+                                    continue;
+                                }
+                                if write_msg(&mut stream, magic, NetworkMessage::GetData(inv))
+                                    .await
+                                    .is_err()
+                                {
+                                    let _ = ev_tx.send(PeerEvent::Dead {
+                                        peer: id,
+                                        reason: "write getdata failed".into(),
+                                    });
+                                    return;
+                                }
                             }
                         }
                         Some(PeerCmd::Shutdown) | None => break,
                     }
                 }
-                msg = read_msg(&mut stream) => {
+                msg = framer.read_msg(&mut stream, Some(magic)) => {
                     match msg {
                         Ok(m) => {
-                            if m.magic() != &magic {
-                                continue;
-                            }
                             match m.payload() {
                                 NetworkMessage::Headers(h) => {
+                                    let headers = if h.len() > MAX_HEADERS_RESULTS {
+                                        h[..MAX_HEADERS_RESULTS].to_vec()
+                                    } else {
+                                        h.clone()
+                                    };
                                     let _ = ev_tx.send(PeerEvent::Headers {
                                         peer: id,
-                                        headers: h.clone(),
+                                        headers,
                                     });
                                 }
                                 NetworkMessage::Block(b) => {
@@ -424,18 +547,25 @@ fn request_headers_from(
     Ok(true)
 }
 
-fn assign_work(
+/// Assign getdata for missing hashes in chain order (nearest tip first).
+///
+/// Always prioritizes the tip-extension gap even if the orphan pool is large —
+/// otherwise a full pool of future blocks freezes IBD forever.
+fn assign_work_ordered(
     slots: &mut [PeerSlot],
-    want: &mut VecDeque<BlockHash>,
+    ordered: &VecDeque<BlockHash>,
     inflight: &mut HashMap<BlockHash, (usize, Instant)>,
+    pool: &HashMap<BlockHash, Block>,
+    hub: &ChainHub,
     cfg: &IbdConfig,
+    window: usize,
 ) {
     let total_inflight = inflight.len();
-    if total_inflight >= cfg.window || want.is_empty() {
+    if total_inflight >= window {
         return;
     }
-    let mut room = cfg.window - total_inflight;
-    // Round-robin over alive peers with free slots.
+    let mut room = window - total_inflight;
+
     let alive_ids: Vec<usize> = slots
         .iter()
         .filter(|s| s.alive)
@@ -444,8 +574,24 @@ fn assign_work(
     if alive_ids.is_empty() {
         return;
     }
+
+    // Candidates: ordered hashes not yet downloaded / requested, nearest tip first.
+    // When the pool is already large, only fill the contiguous tip gap (first
+    // missing hashes) so we don't dig the hole deeper.
+    let pool_full = pool.len() >= window / 2;
+    let take_n = if pool_full { 32 } else { window };
+    let mut candidates: VecDeque<BlockHash> = ordered
+        .iter()
+        .copied()
+        .filter(|h| !hub.has_block(h) && !pool.contains_key(h) && !inflight.contains_key(h))
+        .take(take_n)
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+
     let mut peer_i = 0usize;
-    while room > 0 && !want.is_empty() {
+    while room > 0 && !candidates.is_empty() {
         let mut assigned_any = false;
         for _ in 0..alive_ids.len() {
             let pid = alive_ids[peer_i % alive_ids.len()];
@@ -454,24 +600,33 @@ fn assign_work(
                 Some(s) if s.alive => s,
                 _ => continue,
             };
-            let free = cfg.per_peer.saturating_sub(slot.in_flight.len());
+            let peer_cap = if alive_ids.len() <= 2 {
+                cfg.per_peer.max(128)
+            } else if alive_ids.len() <= 4 {
+                cfg.per_peer.max(64)
+            } else {
+                cfg.per_peer
+            };
+            let free = peer_cap.saturating_sub(slot.in_flight.len());
             if free == 0 {
                 continue;
             }
-            let take = free.min(room).min(want.len());
+            let batch_cap = if alive_ids.len() <= 2 { 64 } else { 16 };
+            let take = free.min(room).min(candidates.len()).min(batch_cap);
             if take == 0 {
                 continue;
             }
             let mut batch = Vec::with_capacity(take);
-            for _ in 0..take {
-                if let Some(h) = want.pop_front() {
-                    if inflight.contains_key(&h) {
-                        continue;
-                    }
-                    batch.push(h);
-                    slot.in_flight.insert(h);
-                    inflight.insert(h, (pid, Instant::now()));
+            while batch.len() < take {
+                let Some(h) = candidates.pop_front() else {
+                    break;
+                };
+                if hub.has_block(&h) || pool.contains_key(&h) || inflight.contains_key(&h) {
+                    continue;
                 }
+                batch.push(h);
+                slot.in_flight.insert(h);
+                inflight.insert(h, (pid, Instant::now()));
             }
             if !batch.is_empty() {
                 room = room.saturating_sub(batch.len());
@@ -491,63 +646,99 @@ fn assign_work(
 fn reassign_stalled(
     slots: &mut [PeerSlot],
     inflight: &mut HashMap<BlockHash, (usize, Instant)>,
-    want: &mut VecDeque<BlockHash>,
     cfg: &IbdConfig,
     now: Instant,
 ) {
-    let stalled: Vec<BlockHash> = inflight
+    let stalled: Vec<(BlockHash, usize)> = inflight
         .iter()
         .filter(|(_, (_, t))| now.duration_since(*t) > cfg.stall)
-        .map(|(h, _)| *h)
+        .map(|(h, (pid, _))| (*h, *pid))
         .collect();
-    for h in stalled {
-        if let Some((pid, _)) = inflight.remove(&h) {
+    if stalled.is_empty() {
+        return;
+    }
+    // Clear stall state so assign_work_ordered will re-issue getdata.
+    let mut n = 0usize;
+    for (h, pid) in stalled {
+        if let Some(_) = inflight.remove(&h) {
             if let Some(s) = slots.iter_mut().find(|s| s.id == pid) {
                 s.in_flight.remove(&h);
             }
-            want.push_front(h);
-            eprintln!("ibd: reassign stalled block from peer[{pid}]");
+            n += 1;
         }
     }
+    if n > 0 {
+        eprintln!("ibd: reassign {n} stalled block(s)");
+    }
+}
+
+fn remove_from_ordered(
+    ordered: &mut VecDeque<BlockHash>,
+    ordered_set: &mut HashSet<BlockHash>,
+    h: BlockHash,
+) {
+    ordered_set.remove(&h);
+    ordered.retain(|x| *x != h);
 }
 
 fn drain_connect(
     hub: &ChainHub,
     pool: &mut HashMap<BlockHash, Block>,
+    ordered: &mut VecDeque<BlockHash>,
+    ordered_set: &mut HashSet<BlockHash>,
     accepted: &AtomicU32,
     start_tip: u32,
 ) -> Result<(), NetError> {
     let mut progress = true;
     while progress {
         progress = false;
+        // Drop any ordered prefix already in the store.
+        while let Some(&front) = ordered.front() {
+            if hub.has_block(&front) {
+                remove_from_ordered(ordered, ordered_set, front);
+            } else {
+                break;
+            }
+        }
+
         let tip = hub.tip_hash();
-        let keys: Vec<BlockHash> = pool.keys().copied().collect();
-        for h in keys {
-            let Some(b) = pool.get(&h) else {
-                continue;
-            };
+        // Scan pool for the unique tip-extension (at most one prev==tip).
+        let mut extend: Option<BlockHash> = None;
+        for (h, b) in pool.iter() {
             let prev = b.header.prev_blockhash;
             let connects = match tip {
                 None => prev.to_byte_array() == [0u8; 32],
                 Some(t) => prev == t,
             };
-            if !connects {
-                continue;
+            if connects {
+                extend = Some(*h);
+                break;
             }
-            let b = pool.remove(&h).unwrap();
-            match hub.accept_block(b)? {
-                AcceptOutcome::Accepted { .. } | AcceptOutcome::AlreadyHave => {
-                    let n = accepted.fetch_add(1, Ordering::SeqCst) + 1;
-                    progress = true;
-                    if n == 1 || n % 100 == 0 {
-                        eprintln!(
-                            "ibd: progress tip={:?} (+{n} parallel, started {start_tip})",
-                            hub.tip_height()
-                        );
-                        let _ = std::io::Write::flush(&mut std::io::stderr());
-                    }
+        }
+        let Some(h) = extend else {
+            break;
+        };
+        let b = pool.remove(&h).unwrap();
+        match hub.accept_block(b) {
+            Ok(AcceptOutcome::Accepted { .. }) | Ok(AcceptOutcome::AlreadyHave) => {
+                remove_from_ordered(ordered, ordered_set, h);
+                let n = accepted.fetch_add(1, Ordering::SeqCst) + 1;
+                progress = true;
+                if n == 1 || n % 100 == 0 {
+                    eprintln!(
+                        "ibd: progress tip={:?} (+{n} parallel, started {start_tip})",
+                        hub.tip_height()
+                    );
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
                 }
-                AcceptOutcome::IgnoredWeaker => {}
+            }
+            Ok(AcceptOutcome::IgnoredWeaker) => {
+                remove_from_ordered(ordered, ordered_set, h);
+                progress = true;
+            }
+            Err(e) => {
+                eprintln!("ibd: reject block {h}: {e}");
+                // Keep hash in ordered for re-request; body discarded.
             }
         }
     }

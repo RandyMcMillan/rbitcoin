@@ -106,14 +106,29 @@ Time-boxed signet run in this environment:
 | TCP connect to public peers | **Yes** |
 | Message parse against real peers | **Fixed** (lenient codec on extra-byte payloads) |
 | Ordered block connect (out-of-order getdata) | **Fixed** (pending buffer) |
-| Blocks applied to store | **Yes** (confirmed grew past genesis; lab saw tip≈7 before stall/timeout) |
-| Full signet tip | **Not yet** — still too slow / needs longer run + further tuning |
+| P2P framing / multi-GB "message too large" | **Fixed** — cancel-safe `MessageStream` + Core payload cap |
+| BIP34 coinbase height (OP_1..OP_16) | **Fixed** — match Core `CScript << int` |
+| Hash-head full at ~2k blocks | **Fixed** — load-factor rehash (50%) |
+| Parallel IBD (multi-peer window) | **Working** — lab: ~40k blocks / 35s, 4 peers, no desync |
+| Blocks applied to store | **Yes** |
+| Full signet tip | **In progress** — rate good; continue longer runs |
+
+**P2P limits (Bitcoin Core–aligned):**
+
+| Constant | Value | Core name |
+|----------|------:|-----------|
+| Max message payload | 4_000_000 | `MAX_PROTOCOL_MESSAGE_LENGTH` |
+| Max inv/getdata items | 50_000 | `MAX_INV_SZ` |
+| Max headers per message | 2_000 | `MAX_HEADERS_RESULTS` |
+| Max locator hashes | 101 | `MAX_LOCATOR_SZ` |
+
+(rust-bitcoin's `MAX_MSG_SIZE` is 5MB; we intentionally use Core's 4MB.)
 
 **Next lab:** re-run with longer `--max-run-secs` (e.g. 3600), watch `ibd: progress` / tip rate, fix next stall (headers window, peer timeout, store write path).
 
 ## Known limitations
 
-- **Parallel IBD** (`parallel_ibd`): shared window default **1024** in-flight, **16/peer**, stall reassign ~30s; used by default in `run_p2p`.
+- **Parallel IBD** (`parallel_ibd`): shared window default **1024** in-flight, **16/peer**, stall reassign ~15s; used by default in `run_p2p`.
 - Sequential `sync_from_peers` is fallback only if parallel fails.
 - Protocol version 70001; compact blocks → full getdata.
 - Scripthash index grows with every output (disk) — costs IBD CPU/IO.

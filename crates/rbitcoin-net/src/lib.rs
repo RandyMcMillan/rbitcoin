@@ -18,6 +18,9 @@ pub use seeds::{
     default_port, dns_seeds, fixed_seed_hosts, resolve_all_seeds, resolve_dns_seeds,
     resolve_fixed_seeds, AddrMan,
 };
+pub use codec::{
+    MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR_SZ, MAX_PROTOCOL_MESSAGE_LENGTH,
+};
 pub use service::{magic_for, NetConfig, P2PHandle, P2PNode};
 
 pub fn crate_name() -> &'static str {

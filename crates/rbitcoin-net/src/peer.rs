@@ -2,7 +2,9 @@
 
 use crate::cache::BlockCache;
 use crate::chain::{AcceptOutcome, ChainHub};
-use crate::codec::{read_msg, write_msg};
+use crate::codec::{
+    read_msg, write_msg, MessageStream, MAX_HEADERS_RESULTS, MAX_INV_SIZE,
+};
 use crate::error::NetError;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::address::Address;
@@ -65,6 +67,9 @@ pub async fn handshake(
                 if matches!(other, NetworkMessage::Verack) {
                     return Err(NetError::Protocol("verack before version"));
                 }
+                // Ignore wtxidrelay / sendaddrv2 / etc. that may arrive before
+                // verack on modern peers (we still require version first).
+                let _ = other;
             }
         }
     };
@@ -84,6 +89,7 @@ pub async fn handshake(
             NetworkMessage::Ping(n) => {
                 write_msg(stream, magic, NetworkMessage::Pong(*n)).await?;
             }
+            // Core may pipeline sendaddrv2 / wtxidrelay / sendcmpct before verack.
             _ => {}
         }
     }
@@ -132,6 +138,8 @@ pub async fn peer_session(
     let mut pending_headers: HashMap<BlockHash, bitcoin::block::Header> = HashMap::new();
     // Blocks waiting for in-order accept (hash → block).
     let mut pending_blocks: HashMap<BlockHash, bitcoin::Block> = HashMap::new();
+    // Cancellation-safe framer: partial reads survive select! branch cancel.
+    let mut framer = MessageStream::new();
 
     loop {
         tokio::select! {
@@ -145,7 +153,7 @@ pub async fn peer_session(
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
-            msg = read_msg(&mut stream) => {
+            msg = framer.read_msg(&mut stream, Some(magic)) => {
                 let msg = match msg {
                     Ok(m) => m,
                     Err(NetError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -153,9 +161,6 @@ pub async fn peer_session(
                     }
                     Err(e) => return Err(e),
                 };
-                if msg.magic() != &magic {
-                    return Err(NetError::BadMagic);
-                }
                 match msg.payload() {
                     NetworkMessage::Ping(n) => {
                         write_msg(&mut stream, magic, NetworkMessage::Pong(*n)).await?;
@@ -172,7 +177,7 @@ pub async fn peer_session(
                         write_msg(&mut stream, magic, NetworkMessage::Headers(headers)).await?;
                     }
                     NetworkMessage::GetData(inv) => {
-                        for item in inv {
+                        for item in inv.iter().take(MAX_INV_SIZE) {
                             match item {
                                 Inventory::Block(h) | Inventory::WitnessBlock(h) => {
                                     if let Some(block) =
@@ -191,7 +196,7 @@ pub async fn peer_session(
                     }
                     NetworkMessage::Inv(items) => {
                         let mut want = Vec::new();
-                        for item in items {
+                        for item in items.iter().take(MAX_INV_SIZE) {
                             match item {
                                 Inventory::Block(h) | Inventory::WitnessBlock(h) => {
                                     if !hub.has_block(h) {
@@ -202,12 +207,13 @@ pub async fn peer_session(
                             }
                         }
                         if !want.is_empty() {
+                            // Chunk getdata to Core MAX_INV_SZ (already bounded).
                             write_msg(&mut stream, magic, NetworkMessage::GetData(want)).await?;
                         }
                     }
                     NetworkMessage::Headers(headers) => {
                         let mut want = Vec::new();
-                        for hdr in headers {
+                        for hdr in headers.iter().take(MAX_HEADERS_RESULTS) {
                             let hash = hdr.block_hash();
                             pending_headers.insert(hash, *hdr);
                             if !hub.has_block(&hash) {
@@ -450,7 +456,7 @@ fn headers_for_peer(
     query: &Query,
     gh: &bitcoin::p2p::message_blockdata::GetHeadersMessage,
 ) -> Result<Vec<bitcoin::block::Header>, NetError> {
-    match query.headers_after_locator(&gh.locator_hashes, gh.stop_hash, 2000) {
+    match query.headers_after_locator(&gh.locator_hashes, gh.stop_hash, MAX_HEADERS_RESULTS) {
         Ok(h) if !h.is_empty() || query.tip_height().is_some() => Ok(h),
         Ok(_) => Ok(cache.headers_after_locator(&gh.locator_hashes, gh.stop_hash)),
         Err(e) => Err(NetError::Consensus(e.to_string())),
@@ -512,41 +518,44 @@ pub async fn sync_from_peer(
             }
         }
         if inv.is_empty() {
-            if headers.len() < 2000 {
+            if headers.len() < MAX_HEADERS_RESULTS {
                 break;
             }
             locator = vec![headers.last().unwrap().block_hash()];
             continue;
         }
 
-        write_msg(stream, magic, NetworkMessage::GetData(inv.clone())).await?;
+        // Honour Core MAX_INV_SZ when requesting (chunk if needed).
+        for chunk in inv.chunks(MAX_INV_SIZE) {
+            write_msg(stream, magic, NetworkMessage::GetData(chunk.to_vec())).await?;
 
-        let need = inv.len();
-        let mut got = 0;
-        while got < need {
-            let msg = read_msg(stream).await?;
-            if msg.magic() != &magic {
-                return Err(NetError::BadMagic);
-            }
-            match msg.payload() {
-                NetworkMessage::Block(block) => {
-                    on_block(0, block.clone())?;
-                    got += 1;
-                    downloaded += 1;
+            let need = chunk.len();
+            let mut got = 0;
+            while got < need {
+                let msg = read_msg(stream).await?;
+                if msg.magic() != &magic {
+                    return Err(NetError::BadMagic);
                 }
-                NetworkMessage::Ping(n) => {
-                    write_msg(stream, magic, NetworkMessage::Pong(*n)).await?;
+                match msg.payload() {
+                    NetworkMessage::Block(block) => {
+                        on_block(0, block.clone())?;
+                        got += 1;
+                        downloaded += 1;
+                    }
+                    NetworkMessage::Ping(n) => {
+                        write_msg(stream, magic, NetworkMessage::Pong(*n)).await?;
+                    }
+                    NetworkMessage::NotFound(_) => {
+                        return Err(NetError::Protocol("block not found"));
+                    }
+                    NetworkMessage::SendHeaders | NetworkMessage::SendCmpct(_) => {}
+                    _ => {}
                 }
-                NetworkMessage::NotFound(_) => {
-                    return Err(NetError::Protocol("block not found"));
-                }
-                NetworkMessage::SendHeaders | NetworkMessage::SendCmpct(_) => {}
-                _ => {}
             }
         }
 
         locator = vec![headers.last().unwrap().block_hash()];
-        if headers.len() < 2000 {
+        if headers.len() < MAX_HEADERS_RESULTS {
             break;
         }
     }

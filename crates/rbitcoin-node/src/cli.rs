@@ -24,13 +24,14 @@ where
     let mut milestone_height = 0u32;
     let mut max_outbound = 8u32;
     let mut max_run_secs: Option<u64> = None;
+    let mut scripthash_index = true;
 
     while i < args.len() {
         let a = args[i].to_string_lossy();
         match a.as_ref() {
             "--help" | "-h" => {
                 eprintln!(
-                    "rbitcoin-node {} — usage:\n  rbitcoin-node [--datadir PATH] [--network NET] \\\n    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n    [--milestone HEIGHT] [--max-outbound N] [--max-run-secs N] \\\n    [--no-seeds] [--smoke]\n\nNetworks: mainnet|testnet|signet|regtest\nMilestone: skip script/prevout checks for blocks <= HEIGHT (IBD speed)",
+                    "rbitcoin-node {} — usage:\n  rbitcoin-node [--datadir PATH] [--network NET] \\\n    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n    [--milestone HEIGHT] [--max-outbound N] [--max-run-secs N] \\\n    [--no-scripthash-index] [--no-seeds] [--smoke]\n\nNetworks: mainnet|testnet|signet|regtest\nMilestone: skip script/prevout at/below HEIGHT (IBD). Implies no scripthash index.\nParallel IBD: multi-peer windowed getdata (default 1024 in-flight).",
                     env!("CARGO_PKG_VERSION")
                 );
                 return ExitCode::SUCCESS;
@@ -45,6 +46,10 @@ where
             }
             "--no-seeds" => {
                 use_seeds = false;
+                i += 1;
+            }
+            "--no-scripthash-index" => {
+                scripthash_index = false;
                 i += 1;
             }
             "--datadir" => {
@@ -182,6 +187,7 @@ where
     config.use_seeds = use_seeds;
     config.milestone_height = milestone_height;
     config.max_outbound = max_outbound;
+    config.scripthash_index = scripthash_index;
     if max_run_secs.is_some() {
         config.max_run_secs = max_run_secs;
     }

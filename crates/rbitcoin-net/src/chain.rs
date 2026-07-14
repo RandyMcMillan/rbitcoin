@@ -5,7 +5,7 @@ use crate::error::NetError;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, Work};
-use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+use rbitcoin_consensus::{accept_and_connect_block, genesis_block, ChainParams, Milestone};
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use std::sync::Arc;
@@ -54,6 +54,22 @@ impl ChainHub {
 
     pub fn subscribe_tips(&self) -> broadcast::Receiver<TipEvent> {
         self.tip_tx.subscribe()
+    }
+
+    /// Ensure the genesis block is in the store (required before IBD getheaders).
+    ///
+    /// Peers never re-serve genesis via `getheaders` after the common ancestor;
+    /// an empty store must start with height 0 locally.
+    pub fn ensure_genesis(&self) -> Result<(), NetError> {
+        if self.tip_height().is_some() {
+            return Ok(());
+        }
+        let genesis = genesis_block(&self.params);
+        if genesis.block_hash() != self.params.genesis_hash {
+            return Err(NetError::Protocol("genesis hash mismatch with params"));
+        }
+        self.connect_at(0, genesis)?;
+        Ok(())
     }
 
     pub fn tip_height(&self) -> Option<u32> {

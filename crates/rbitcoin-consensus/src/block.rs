@@ -153,24 +153,62 @@ fn merkle_root_bytes(leaves: &[[u8; 32]]) -> [u8; 32] {
     layer[0]
 }
 
+/// BIP34: coinbase scriptSig must start with the block height, encoded as Bitcoin
+/// Core's `CScript << int64` push (not raw CScriptNum for small values).
+///
+/// Core `CScript::push_int64`:
+/// - 0 → `OP_0` (0x00)
+/// - 1..=16 → `OP_1`..=`OP_16` (0x51..=0x60)
+/// - else → minimal CScriptNum (`len || little-endian bytes`, sign-aware)
 fn check_bip34_coinbase(coinbase: &Transaction, height: u32) -> Result<(), ConsensusError> {
     let script = &coinbase.input[0].script_sig;
     let bytes = script.as_bytes();
     if bytes.is_empty() {
         return Err(ConsensusError::BadBlock("bip34 coinbase script empty"));
     }
-    let len = bytes[0] as usize;
-    if len == 0 || len > 4 || bytes.len() < 1 + len {
+    let expected = bip34_height_script(height);
+    if bytes.len() < expected.len() || &bytes[..expected.len()] != expected.as_slice() {
         return Err(ConsensusError::BadBlock("bip34 height encoding"));
     }
-    let mut h = 0u32;
-    for (i, b) in bytes[1..1 + len].iter().enumerate() {
-        h |= u32::from(*b) << (8 * i);
-    }
-    if h != height {
-        return Err(ConsensusError::BadBlock("bip34 height mismatch"));
-    }
     Ok(())
+}
+
+/// Serialize `height` the same way Core pushes it into the coinbase scriptSig.
+#[must_use]
+pub fn bip34_height_script(height: u32) -> Vec<u8> {
+    let n = height as i64;
+    if n == 0 {
+        return vec![0x00]; // OP_0
+    }
+    if (1..=16).contains(&n) {
+        // OP_1 = 0x51 … OP_16 = 0x60
+        return vec![0x50 + n as u8];
+    }
+    // CScriptNum::serialize (minimal signed little-endian) + push length prefix.
+    let mut num = Vec::new();
+    let mut abs = n;
+    let neg = abs < 0;
+    if neg {
+        abs = -abs;
+    }
+    while abs > 0 {
+        num.push((abs & 0xff) as u8);
+        abs >>= 8;
+    }
+    if let Some(last) = num.last() {
+        if last & 0x80 != 0 {
+            num.push(if neg { 0x80 } else { 0x00 });
+        } else if neg {
+            let i = num.len() - 1;
+            num[i] |= 0x80;
+        }
+    } else {
+        num.push(0);
+    }
+    let mut out = Vec::with_capacity(1 + num.len());
+    out.push(num.len() as u8);
+    out.extend_from_slice(&num);
+    out
 }
 
 /// Connect checks: prevouts exist, unspent on best chain, maturity, scripts, values, subsidy.
@@ -351,4 +389,28 @@ fn verify_scripts(tx: &Transaction, prevouts: &[TxOut]) -> Result<(), ConsensusE
 fn is_anyone_can_spend(script: &Script) -> bool {
     let b = script.as_bytes();
     b.is_empty() || b == [0x51] // OP_TRUE
+}
+
+
+#[cfg(test)]
+mod bip34_tests {
+    use super::bip34_height_script;
+
+    #[test]
+    fn small_heights_use_op_n() {
+        assert_eq!(bip34_height_script(0), vec![0x00]);
+        assert_eq!(bip34_height_script(1), vec![0x51]); // OP_1 — signet block 1
+        assert_eq!(bip34_height_script(16), vec![0x60]);
+    }
+
+    #[test]
+    fn height_17_uses_push() {
+        assert_eq!(bip34_height_script(17), vec![0x01, 0x11]);
+    }
+
+    #[test]
+    fn height_128_sign_byte() {
+        // 128 = 0x80 needs trailing 0x00 so it is not negative
+        assert_eq!(bip34_height_script(128), vec![0x02, 0x80, 0x00]);
+    }
 }

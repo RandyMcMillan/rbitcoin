@@ -28,6 +28,8 @@ pub struct NodeConfig {
     pub milestone_height: u32,
     /// How many outbound peers to follow for IBD/tip (default 8).
     pub max_outbound: u32,
+    /// Write scripthash index on connect (disable for faster IBD; backfill later).
+    pub scripthash_index: bool,
 }
 
 impl Default for NodeConfig {
@@ -45,6 +47,7 @@ impl Default for NodeConfig {
             electrum_listen: None,
             milestone_height: 0,
             max_outbound: 8,
+            scripthash_index: true,
         }
     }
 }

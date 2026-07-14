@@ -10,25 +10,9 @@ use bitcoin::{
     Witness,
 };
 
-/// BIP34 height encoding in coinbase scriptSig (minimal CScriptNum push).
+/// BIP34 height encoding in coinbase scriptSig (Core `CScript << height`).
 pub fn bip34_script(height: u32) -> ScriptBuf {
-    let mut num = height;
-    let mut bytes = Vec::new();
-    loop {
-        bytes.push((num & 0xff) as u8);
-        num >>= 8;
-        if num == 0 {
-            break;
-        }
-    }
-    // High bit set would be negative in CScriptNum — add zero padding if needed.
-    if bytes.last().copied().unwrap_or(0) & 0x80 != 0 {
-        bytes.push(0);
-    }
-    let mut out = Vec::with_capacity(1 + bytes.len());
-    out.push(bytes.len() as u8);
-    out.extend_from_slice(&bytes);
-    ScriptBuf::from_bytes(out)
+    ScriptBuf::from_bytes(rbitcoin_consensus::bip34_height_script(height))
 }
 
 pub fn coinbase_tx(height: u32, value: Amount) -> Transaction {

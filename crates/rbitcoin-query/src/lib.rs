@@ -25,17 +25,31 @@ pub struct TxApply {
 /// Domain query facade used by higher layers (consensus, net, RPC).
 pub struct Query {
     store: Store,
+    /// When false, connect/disconnect skip scripthash multimap (IBD fast path).
+    scripthash_index: std::sync::atomic::AtomicBool,
 }
 
 impl Query {
     pub fn open_or_create(store_path: impl AsRef<Path>) -> Result<Self, QueryError> {
         Ok(Self {
             store: Store::open_or_create(store_path.as_ref())?,
+            scripthash_index: std::sync::atomic::AtomicBool::new(true),
         })
     }
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Enable/disable Electrum scripthash index writes (default on). Off during IBD for speed.
+    pub fn set_scripthash_index(&self, enabled: bool) {
+        self.scripthash_index
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn scripthash_index_enabled(&self) -> bool {
+        self.scripthash_index
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn tip_height(&self) -> Option<Height> {
@@ -175,16 +189,18 @@ impl Query {
                 if rec.prev_txid != [0u8; 32] {
                     self.store
                         .put_spend(&rec.prev_txid, rec.prev_index, tx_fk, rec.index)?;
-                    // Scripthash: mark prior output spent when we can resolve its script.
-                    if let Some(sh) = self.script_hash_for_outpoint(&rec.prev_txid, rec.prev_index)?
-                    {
-                        let _ = self.store.scripthash.mark_spent(
-                            &sh,
-                            &rec.prev_txid,
-                            rec.prev_index,
-                            height.0,
-                            tx_fk,
-                        )?;
+                    if self.scripthash_index_enabled() {
+                        if let Some(sh) =
+                            self.script_hash_for_outpoint(&rec.prev_txid, rec.prev_index)?
+                        {
+                            let _ = self.store.scripthash.mark_spent(
+                                &sh,
+                                &rec.prev_txid,
+                                rec.prev_index,
+                                height.0,
+                                tx_fk,
+                            )?;
+                        }
                     }
                 }
             }
@@ -193,18 +209,20 @@ impl Query {
                 rec.parent_tx_fk = tx_fk;
                 rec.index = i as u32;
                 self.store.put_output(&rec)?;
-                let sh = script_hash(&rec.script);
-                self.store.scripthash.put_create(&ScriptHashRecord {
-                    scripthash: sh,
-                    txid: ta.tx.txid,
-                    vout: i as u32,
-                    value: rec.value,
-                    create_height: height.0,
-                    create_tx_fk: tx_fk,
-                    spend_height: UNSPENT,
-                    spend_tx_fk: Fk::NULL,
-                    next: Fk::NULL,
-                })?;
+                if self.scripthash_index_enabled() {
+                    let sh = script_hash(&rec.script);
+                    self.store.scripthash.put_create(&ScriptHashRecord {
+                        scripthash: sh,
+                        txid: ta.tx.txid,
+                        vout: i as u32,
+                        value: rec.value,
+                        create_height: height.0,
+                        create_tx_fk: tx_fk,
+                        spend_height: UNSPENT,
+                        spend_tx_fk: Fk::NULL,
+                        next: Fk::NULL,
+                    })?;
+                }
             }
 
             self.store.strong_tx.set_strong(tx_fk, header_fk)?;
@@ -226,7 +244,7 @@ impl Query {
         // Clear spends recorded at this height; creates become unstrong with their txs.
         for &tx_fk in &tx_fks {
             let tx = self.store.get_tx(tx_fk)?;
-            if tx.input_count > 0 {
+            if self.scripthash_index_enabled() && tx.input_count > 0 {
                 let start = tx.input_start_fk.get().ok_or(StoreError::InvalidFk)?;
                 for i in 0..tx.input_count {
                     let inp = self.store.get_input(Fk(start + u64::from(i)))?;

@@ -1,6 +1,7 @@
 //! Growable hash head: key (32 bytes) → first record fk (u64).
 //!
-//! Linear probing over a power-of-two slot table. Rehashes (doubles slots) when full.
+//! Linear probing over a power-of-two slot table. Rehashes (doubles slots) when
+//! load factor exceeds [`MAX_LOAD_NUM`]/[`MAX_LOAD_DEN`].
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
@@ -9,10 +10,20 @@ use rbitcoin_primitives::{Fk, TableKind};
 
 const SLOT_SIZE: usize = 40; // 32 key + 8 fk
 const DEFAULT_SLOTS: u64 = 64;
+/// Rehash when occupied/slots > 1/2 (keeps linear probe short; avoids "full on get").
+const MAX_LOAD_NUM: u64 = 1;
+const MAX_LOAD_DEN: u64 = 2;
 
 pub struct HashHead {
     file: TableFile,
-    slots: Mutex<u64>,
+    /// (slot count, occupied count)
+    state: Mutex<HashState>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HashState {
+    slots: u64,
+    occupied: u64,
 }
 
 impl HashHead {
@@ -23,7 +34,10 @@ impl HashHead {
         file.write_at(FILE_HEADER_LEN as u64, &zeros)?;
         Ok(Self {
             file,
-            slots: Mutex::new(DEFAULT_SLOTS),
+            state: Mutex::new(HashState {
+                slots: DEFAULT_SLOTS,
+                occupied: 0,
+            }),
         })
     }
 
@@ -37,10 +51,20 @@ impl HashHead {
         if !slots.is_power_of_two() {
             return Err(StoreError::Corrupt("hash head slots not power of two"));
         }
-        Ok(Self {
+        // Count occupied for load-factor tracking.
+        let mut occupied = 0u64;
+        let tmp = Self {
             file,
-            slots: Mutex::new(slots),
-        })
+            state: Mutex::new(HashState { slots, occupied: 0 }),
+        };
+        for slot in 0..slots {
+            let (k, fk) = tmp.read_slot(slot)?;
+            if !is_empty_slot(&k, fk) {
+                occupied += 1;
+            }
+        }
+        *tmp.state.lock() = HashState { slots, occupied };
+        Ok(tmp)
     }
 
     fn slot_offset(slot: u64) -> u64 {
@@ -72,11 +96,13 @@ impl HashHead {
     }
 
     pub fn get(&self, key: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
-        let slots = *self.slots.lock();
+        // Hold state lock for the full probe so we never observe a mid-rehash table.
+        let state = self.state.lock();
+        let slots = state.slots;
         let mut slot = Self::hash_slot(key, slots);
         for _ in 0..slots {
             let (k, fk) = self.read_slot(slot)?;
-            if fk == 0 && k == [0u8; 32] {
+            if is_empty_slot(&k, fk) {
                 return Ok(None);
             }
             if &k == key {
@@ -84,33 +110,51 @@ impl HashHead {
             }
             slot = (slot + 1) & (slots - 1);
         }
-        // Table full of non-matching keys — should not happen if we rehash on insert.
-        Err(StoreError::Corrupt("hash head full on get"))
+        // Table at capacity without an empty probe slot — key is not present.
+        Ok(None)
     }
 
-    /// Insert or replace mapping. Grows the table when full.
+    /// Insert or replace mapping. Grows the table when load factor is high.
     pub fn insert(&self, key: &[u8; 32], fk: Fk) -> Result<Option<Fk>, StoreError> {
         debug_assert!(!fk.is_null());
         loop {
-            match self.try_insert(key, fk)? {
+            // Hold state lock across probe+write so concurrent get sees a consistent
+            // slots count for the file region we write into.
+            let mut state = self.state.lock();
+            if state.occupied.saturating_mul(MAX_LOAD_DEN)
+                >= state.slots.saturating_mul(MAX_LOAD_NUM)
+            {
+                drop(state);
+                self.rehash()?;
+                continue;
+            }
+            match self.try_insert_locked(&mut state, key, fk)? {
                 InsertResult::Done(prev) => return Ok(prev),
-                InsertResult::NeedRehash => self.rehash()?,
+                InsertResult::NeedRehash => {
+                    drop(state);
+                    self.rehash()?;
+                }
             }
         }
     }
 
-    fn try_insert(&self, key: &[u8; 32], fk: Fk) -> Result<InsertResult, StoreError> {
-        let slots = *self.slots.lock();
+    fn try_insert_locked(
+        &self,
+        state: &mut HashState,
+        key: &[u8; 32],
+        fk: Fk,
+    ) -> Result<InsertResult, StoreError> {
+        let slots = state.slots;
         let mut slot = Self::hash_slot(key, slots);
         for _ in 0..slots {
-            let off_slot = slot;
-            let (k, old_fk) = self.read_slot(off_slot)?;
-            if old_fk == 0 && k == [0u8; 32] {
-                self.write_slot(off_slot, key, fk.0)?;
+            let (k, old_fk) = self.read_slot(slot)?;
+            if is_empty_slot(&k, old_fk) {
+                self.write_slot(slot, key, fk.0)?;
+                state.occupied = state.occupied.saturating_add(1);
                 return Ok(InsertResult::Done(None));
             }
             if &k == key {
-                self.write_slot(off_slot, key, fk.0)?;
+                self.write_slot(slot, key, fk.0)?;
                 return Ok(InsertResult::Done(Fk::new(old_fk)));
             }
             slot = (slot + 1) & (slots - 1);
@@ -119,14 +163,14 @@ impl HashHead {
     }
 
     fn rehash(&self) -> Result<(), StoreError> {
-        let mut slots_guard = self.slots.lock();
-        let old_slots = *slots_guard;
+        let mut state = self.state.lock();
+        let old_slots = state.slots;
         let new_slots = old_slots.saturating_mul(2).max(2);
         // Collect live entries.
         let mut entries: Vec<([u8; 32], u64)> = Vec::new();
         for slot in 0..old_slots {
             let (k, fk) = self.read_slot(slot)?;
-            if fk != 0 || k != [0u8; 32] {
+            if !is_empty_slot(&k, fk) {
                 entries.push((k, fk));
             }
         }
@@ -136,11 +180,11 @@ impl HashHead {
         self.file.write_at(FILE_HEADER_LEN as u64, &zeros)?;
         self.file
             .set_logical_len(FILE_HEADER_LEN as u64 + new_bytes)?;
-        *slots_guard = new_slots;
-        drop(slots_guard);
-        // Reinsert without recursive rehash (new table is empty and large enough).
+        state.slots = new_slots;
+        state.occupied = 0;
+        // Reinsert under the same lock (new table empty; load is low).
         for (k, fk) in entries {
-            match self.try_insert(&k, Fk(fk))? {
+            match self.try_insert_locked(&mut state, &k, Fk(fk))? {
                 InsertResult::Done(_) => {}
                 InsertResult::NeedRehash => {
                     return Err(StoreError::Corrupt("hash rehash failed"));
@@ -153,6 +197,10 @@ impl HashHead {
     pub fn flush(&self) -> Result<(), StoreError> {
         self.file.flush()
     }
+}
+
+fn is_empty_slot(k: &[u8; 32], fk: u64) -> bool {
+    fk == 0 && *k == [0u8; 32]
 }
 
 enum InsertResult {

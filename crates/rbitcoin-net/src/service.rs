@@ -65,6 +65,7 @@ impl P2PNode {
     ) -> Result<Self, NetError> {
         let magic = Magic::from(params.network);
         let hub = Arc::new(ChainHub::new(query, params, milestone));
+        hub.ensure_genesis()?;
         let cache = hub.cache.clone();
         let query = hub.query.clone();
         let listener = TcpListener::bind(listen).await?;

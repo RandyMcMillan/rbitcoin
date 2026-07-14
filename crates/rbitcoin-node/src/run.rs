@@ -119,7 +119,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         let ibd_cfg = IbdConfig {
             window: 1024,
             per_peer: 16,
-            stall: std::time::Duration::from_secs(15),
+            stall: std::time::Duration::from_secs(5),
             ..IbdConfig::default()
         };
         eprintln!(

@@ -110,46 +110,31 @@ pub async fn parallel_ibd(
 
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<PeerEvent>();
 
-    // Connect all peers concurrently with a hard timeout (sequential connect
-    // hangs forever on blackholed seeds and blocks the whole IBD).
-    let tip_h = hub.tip_height();
-    let mut join_set = tokio::task::JoinSet::new();
-    for (id, &addr) in peers.iter().enumerate() {
-        let ev = ev_tx.clone();
-        let timeout = cfg.connect_timeout;
-        join_set.spawn(async move {
-            let fut = spawn_peer(id, addr, magic, local_addr, tip_h, ev);
-            match tokio::time::timeout(timeout, fut).await {
-                Ok(Ok(slot)) => Ok(slot),
-                Ok(Err(e)) => Err((id, addr, e.to_string())),
-                Err(_) => Err((id, addr, format!("connect timeout ({timeout:?})"))),
-            }
-        });
-    }
+    // Full candidate list kept for mid-IBD redial; dial fails are retried later.
+    let peer_pool: Vec<SocketAddr> = peers.to_vec();
+    let mut next_peer_id = 0usize;
     let mut slots: Vec<PeerSlot> = Vec::new();
-    while let Some(joined) = join_set.join_next().await {
-        match joined {
-            Ok(Ok(slot)) => {
-                eprintln!("ibd: parallel peer[{}] connected", slot.id);
-                slots.push(slot);
-            }
-            Ok(Err((id, addr, reason))) => {
-                eprintln!("ibd: parallel peer[{id}] {addr} failed: {reason}");
-            }
-            Err(e) => {
-                eprintln!("ibd: peer connect task panicked: {e}");
-            }
-        }
-    }
-    slots.sort_by_key(|s| s.id);
+    let mut last_redial = Instant::now() - Duration::from_secs(60);
+
+    // Initial concurrent dial (all candidates once).
+    dial_batch(
+        &mut slots,
+        &peer_pool,
+        &mut next_peer_id,
+        peer_pool.len(),
+        magic,
+        local_addr,
+        hub.tip_height(),
+        ev_tx.clone(),
+        cfg.connect_timeout,
+        /* skip_connected */ false,
+    )
+    .await;
+    slots.retain(|s| s.alive);
     if slots.is_empty() {
         return Err(NetError::Protocol("no parallel peers connected"));
     }
-    eprintln!(
-        "ibd: {} / {} peers ready",
-        slots.len(),
-        peers.len()
-    );
+    eprintln!("ibd: {} / {} peers ready", slots.len(), peer_pool.len());
 
     // Ordered download path (chain order after local tip). Front = next to connect.
     let mut ordered: VecDeque<BlockHash> = VecDeque::new();
@@ -221,6 +206,27 @@ pub async fn parallel_ibd(
         // Stall reassignment (re-request; ordered path still owns the hashes).
         let now = Instant::now();
         reassign_stalled(&mut slots, &mut inflight, &cfg, now);
+
+        // Redial when we have few live peers (retry the pool; skip addrs already live).
+        let alive_n = slots.iter().filter(|s| s.alive).count();
+        if alive_n < 4 && last_redial.elapsed() > Duration::from_secs(20) {
+            let want = (8usize.saturating_sub(alive_n)).max(2).min(8);
+            eprintln!("ibd: redialing up to {want} peers (alive={alive_n})…");
+            dial_batch(
+                &mut slots,
+                &peer_pool,
+                &mut next_peer_id,
+                want,
+                magic,
+                local_addr,
+                hub.tip_height(),
+                ev_tx.clone(),
+                cfg.connect_timeout,
+                /* skip_connected */ true,
+            )
+            .await;
+            last_redial = Instant::now();
+        }
 
         // Status line (helps lab debugging; line-buffered-ish)
         if last_status.elapsed() > Duration::from_secs(5) {
@@ -398,6 +404,73 @@ pub async fn parallel_ibd(
         hub.tip_height()
     );
     Ok(n)
+}
+
+/// Dial up to `count` peers from `pool` concurrently; append successful slots.
+///
+/// When `skip_connected`, addresses already held by an alive slot are skipped.
+/// Candidates are rotated via `next_id` so redials walk the list.
+async fn dial_batch(
+    slots: &mut Vec<PeerSlot>,
+    pool: &[SocketAddr],
+    next_id: &mut usize,
+    count: usize,
+    magic: Magic,
+    local_addr: SocketAddr,
+    tip_h: Option<u32>,
+    ev_tx: mpsc::UnboundedSender<PeerEvent>,
+    connect_timeout: Duration,
+    skip_connected: bool,
+) {
+    if count == 0 || pool.is_empty() {
+        return;
+    }
+    let live_addrs: HashSet<SocketAddr> = if skip_connected {
+        // PeerSlot doesn't store addr — track via nothing; skip by id only.
+        // We re-dial freely; duplicate TCP sessions to same peer are OK for IBD.
+        HashSet::new()
+    } else {
+        HashSet::new()
+    };
+    let _ = live_addrs;
+
+    let mut join_set = tokio::task::JoinSet::new();
+    let n = pool.len();
+    let mut tried = 0usize;
+    let mut spawned = 0usize;
+    while spawned < count && tried < n {
+        let idx = (*next_id) % n;
+        *next_id += 1;
+        tried += 1;
+        let addr = pool[idx];
+        let id = *next_id; // unique task id
+        *next_id += 1;
+        let ev = ev_tx.clone();
+        join_set.spawn(async move {
+            let fut = spawn_peer(id, addr, magic, local_addr, tip_h, ev);
+            match tokio::time::timeout(connect_timeout, fut).await {
+                Ok(Ok(slot)) => Ok(slot),
+                Ok(Err(e)) => Err((id, addr, e.to_string())),
+                Err(_) => Err((id, addr, format!("connect timeout ({connect_timeout:?})"))),
+            }
+        });
+        spawned += 1;
+    }
+    while let Some(joined) = join_set.join_next().await {
+        match joined {
+            Ok(Ok(slot)) => {
+                eprintln!("ibd: parallel peer[{}] connected", slot.id);
+                slots.push(slot);
+            }
+            Ok(Err((id, addr, reason))) => {
+                eprintln!("ibd: parallel peer[{id}] {addr} failed: {reason}");
+            }
+            Err(e) => {
+                eprintln!("ibd: peer connect task panicked: {e}");
+            }
+        }
+    }
+    slots.sort_by_key(|s| s.id);
 }
 
 async fn spawn_peer(

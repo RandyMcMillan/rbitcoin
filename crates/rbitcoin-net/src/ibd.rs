@@ -156,6 +156,7 @@ pub async fn parallel_ibd(
     let mut headers_done = false;
     let mut last_progress = Instant::now();
     let mut last_status = Instant::now();
+    let mut last_gap_recovery = Instant::now() - Duration::from_secs(60);
     // Consecutive empty/useless header replies.
     let mut empty_header_streak = 0u32;
     let mut header_req_seq = 0u32;
@@ -223,10 +224,11 @@ pub async fn parallel_ibd(
             }
         }
 
-        // Tip-gap recovery: if we have a deep orphan pool but tip is not
-        // extending, the tip-next hash is missing — cancel far inflight and
-        // re-request only the tip gap from every live peer.
-        if pool.len() > 256 && last_progress.elapsed() > Duration::from_secs(2) {
+        // Tip-gap recovery (rate-limited): deep orphan pool + missing tip-next.
+        if pool.len() > 256
+            && last_progress.elapsed() > Duration::from_secs(2)
+            && last_gap_recovery.elapsed() > Duration::from_secs(3)
+        {
             if let Some(&need) = ordered.front() {
                 if !pool.contains_key(&need) && !hub.has_block(&need) {
                     eprintln!(
@@ -234,7 +236,7 @@ pub async fn parallel_ibd(
                         pool.len(),
                         inflight.len()
                     );
-                    // Drop far-ahead inflight so peers focus on the gap.
+                    last_gap_recovery = Instant::now();
                     let far: Vec<BlockHash> = inflight
                         .keys()
                         .copied()
@@ -247,15 +249,12 @@ pub async fn parallel_ibd(
                             }
                         }
                     }
-                    // Ask every live peer for the tip-next block.
                     for s in slots.iter().filter(|s| s.alive) {
                         let _ = s.cmd_tx.send(PeerCmd::GetData {
                             hashes: vec![need],
                         });
                         inflight.insert(need, (s.id, Instant::now()));
                     }
-                    // Do NOT reset last_progress — peers may never deliver this
-                    // hash; path-reset below must still be able to fire.
                 }
             }
         }

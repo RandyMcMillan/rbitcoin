@@ -187,9 +187,35 @@ pub async fn parallel_ibd(
             .count();
         let ahead = pool.len() + inflight.len();
 
-        // Pipeline headers only while backlog is thin (avoid multi-k orphan pool).
-        if !headers_done && backlog < window && pool.len() < window / 2 {
+        // Pipeline headers when the ordered queue is thin. Always request when
+        // ordered is empty (even if the orphan pool is large) — otherwise we
+        // can deadlock: no work + pool of non-connecting blocks + no getheaders.
+        if !headers_done && (ordered.is_empty() || (backlog < window && pool.len() < window)) {
             let _ = request_headers(&slots, &hub, &mut header_req_seq);
+        }
+
+        // Drop unconnectable orphan pool if tip is stalled and ordered is empty.
+        if ordered.is_empty()
+            && !pool.is_empty()
+            && last_progress.elapsed() > cfg.stall
+        {
+            let tip = hub.tip_hash();
+            let can_connect = tip
+                .map(|t| pool_by_prev.contains_key(&t))
+                .unwrap_or_else(|| {
+                    pool_by_prev.contains_key(&BlockHash::from_byte_array([0u8; 32]))
+                });
+            if !can_connect {
+                eprintln!(
+                    "ibd: clearing {} orphan pool blocks (no tip extension)",
+                    pool.len()
+                );
+                pool.clear();
+                pool_by_prev.clear();
+                // Force a fresh header fetch from the current tip.
+                let _ = request_headers(&slots, &hub, &mut header_req_seq);
+                last_progress = Instant::now();
+            }
         }
 
         // Tip-gap recovery: if we have a deep orphan pool but tip is not

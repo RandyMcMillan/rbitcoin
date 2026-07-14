@@ -94,7 +94,11 @@ fn node_cli_and_surface_smoke() {
     am.add("127.0.0.1:18444".parse().unwrap());
     assert_eq!(am.len(), 1);
     assert_eq!(am.take_outbound(10).len(), 1);
+    assert_eq!(am.take_outbound_offset(1, 0).len(), 1);
     let _ = rbitcoin_net::resolve_fixed_seeds(Network::Regtest);
+    let _ = rbitcoin_net::resolve_dns_seeds(Network::Regtest);
+    let _ = rbitcoin_net::resolve_all_seeds(Network::Regtest);
+    assert!(!rbitcoin_net::dns_seeds(Network::Signet).is_empty());
 
     // Chain params (no mining)
     for net in [
@@ -172,6 +176,18 @@ fn node_cli_and_surface_smoke() {
         node_cli_main(["rbitcoin-node", "--connect", "bad"]),
         ExitCode::SUCCESS
     );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--milestone", "x"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--max-outbound", "0"]),
+        ExitCode::SUCCESS
+    );
+    let _ = node_cli_main([
+        "rbitcoin-node",
+        "--help",
+    ]);
     assert_ne!(cli_cli_main(["rbitcoin-cli", "a", "b"]), ExitCode::SUCCESS);
 
     std::env::set_var("RBITCOIN_TEST_DROP_STORE", "1");

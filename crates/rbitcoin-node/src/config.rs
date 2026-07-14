@@ -1,4 +1,5 @@
 use crate::error::NodeError;
+use rbitcoin_consensus::Milestone;
 use rbitcoin_primitives::Network;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -22,6 +23,11 @@ pub struct NodeConfig {
     pub max_run_secs: Option<u64>,
     /// Electrum TCP listen (`None` = disabled).
     pub electrum_listen: Option<SocketAddr>,
+    /// Skip script/prevout checks for blocks at or below this height (0 = off).
+    /// Analogous to a coarse assumevalid / milestone for IBD speed.
+    pub milestone_height: u32,
+    /// How many outbound peers to follow for IBD/tip (default 8).
+    pub max_outbound: u32,
 }
 
 impl Default for NodeConfig {
@@ -37,6 +43,8 @@ impl Default for NodeConfig {
             smoke: false,
             max_run_secs: None,
             electrum_listen: None,
+            milestone_height: 0,
+            max_outbound: 8,
         }
     }
 }
@@ -59,6 +67,16 @@ impl NodeConfig {
 
     pub fn store_path(&self) -> PathBuf {
         self.datadir.join("store")
+    }
+
+    pub fn milestone(&self) -> Milestone {
+        if self.milestone_height == 0 {
+            Milestone::NONE
+        } else {
+            Milestone {
+                height: self.milestone_height,
+            }
+        }
     }
 
     pub fn validate(&self) -> Result<(), NodeError> {

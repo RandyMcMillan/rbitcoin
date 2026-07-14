@@ -188,14 +188,86 @@ impl P2PNode {
             locator
         };
 
+        let hub_has = hub.clone();
+        let hub_acc = hub.clone();
+        let start_h = hub.tip_height().unwrap_or(0);
+        // Shared buffer for out-of-order getdata responses (two closures).
+        let pending: Arc<std::sync::Mutex<std::collections::HashMap<BlockHash, Block>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let pending_has = pending.clone();
+        let pending_acc = pending.clone();
+        let accepted = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let accepted_c = accepted.clone();
         let n = sync_from_peer(
             &mut stream,
             self.magic,
             locator,
-            |hash| hub.has_block(hash),
-            |_, block| hub.accept_block(block).map(|_| ()),
+            move |hash| {
+                hub_has.has_block(hash)
+                    || pending_has
+                        .lock()
+                        .map(|g| g.contains_key(hash))
+                        .unwrap_or(false)
+            },
+            move |_, block| {
+                {
+                    pending_acc.lock().unwrap().insert(block.block_hash(), block);
+                }
+                // Drain all blocks that currently connect to tip.
+                let mut progress = true;
+                while progress {
+                    progress = false;
+                    let tip = hub_acc.tip_hash();
+                    let keys: Vec<BlockHash> = pending_acc
+                        .lock()
+                        .unwrap()
+                        .keys()
+                        .copied()
+                        .collect();
+                    for h in keys {
+                        let connects = {
+                            let g = pending_acc.lock().unwrap();
+                            let Some(b) = g.get(&h) else {
+                                continue;
+                            };
+                            let prev = b.header.prev_blockhash;
+                            match tip {
+                                None => prev.to_byte_array() == [0u8; 32],
+                                Some(t) => prev == t,
+                            }
+                        };
+                        if !connects {
+                            continue;
+                        }
+                        let b = pending_acc.lock().unwrap().remove(&h).unwrap();
+                        match hub_acc.accept_block(b) {
+                            Ok(crate::chain::AcceptOutcome::Accepted { .. })
+                            | Ok(crate::chain::AcceptOutcome::AlreadyHave) => {
+                                let n = accepted_c.fetch_add(1, Ordering::SeqCst) + 1;
+                                progress = true;
+                                if n == 1 || n % 100 == 0 {
+                                    eprintln!(
+                                        "ibd: progress tip={:?} (+{n} this peer, started at {start_h})",
+                                        hub_acc.tip_height(),
+                                    );
+                                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                                }
+                            }
+                            Ok(crate::chain::AcceptOutcome::IgnoredWeaker) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+                Ok(())
+            },
         )
         .await?;
+        if n > 0 {
+            eprintln!(
+                "ibd: peer {peer} done downloaded≈{n} tip={:?}",
+                self.tip_height()
+            );
+        }
         Ok(n)
     }
 

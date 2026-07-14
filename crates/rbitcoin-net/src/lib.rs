@@ -13,7 +13,8 @@ pub use chain::{AcceptOutcome, ChainHub, TipEvent};
 pub use error::NetError;
 pub use peer::local_service_flags;
 pub use seeds::{
-    default_port, dns_seeds, fixed_seed_hosts, resolve_fixed_seeds, AddrMan,
+    default_port, dns_seeds, fixed_seed_hosts, resolve_all_seeds, resolve_dns_seeds,
+    resolve_fixed_seeds, AddrMan,
 };
 pub use service::{magic_for, NetConfig, P2PHandle, P2PNode};
 

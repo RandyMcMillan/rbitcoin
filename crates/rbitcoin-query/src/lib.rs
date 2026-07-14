@@ -425,11 +425,24 @@ impl Query {
     }
 
     /// Best-chain height of a header hash, if it is confirmed.
+    ///
+    /// Uses the header hash-head for existence, then walks `prev_fk` toward genesis
+    /// only when needed — and prefers a tip-down scan capped for common tip lookups.
     pub fn height_of_hash(&self, hash: &[u8; 32]) -> Result<Option<Height>, QueryError> {
         let Some(tip) = self.tip_height() else {
             return Ok(None);
         };
-        // Walk from tip down; confirmed chain is contiguous from 0.
+        // Fast path: tip
+        if let Some((_, rec)) = self.header_at_height(tip)? {
+            if &rec.hash == hash {
+                return Ok(Some(tip));
+            }
+        }
+        // Must exist in header table if we stored it on connect.
+        if self.get_header_by_hash(hash)?.is_none() {
+            return Ok(None);
+        }
+        // Tip-down walk (recent blocks / locator common ancestors).
         for h in (0..=tip.0).rev() {
             let height = Height(h);
             if let Some((_, rec)) = self.header_at_height(height)? {

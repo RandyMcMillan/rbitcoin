@@ -80,8 +80,9 @@ impl ChainHub {
         if self.cache.get_block(hash).is_some() {
             return true;
         }
+        // O(1) header hash-head lookup (avoids full confirmed scan during IBD).
         self.query
-            .height_of_hash(&hash.to_byte_array())
+            .get_header_by_hash(&hash.to_byte_array())
             .ok()
             .flatten()
             .is_some()

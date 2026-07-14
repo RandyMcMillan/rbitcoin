@@ -305,7 +305,7 @@ Handshake, getheaders/getdata, BlockCache, 2-/3-node tests + periodic mesh scrip
 | 4b | Concurrent download window, stall/score | ⬜ later hardening |
 | 5a | **Consensus** — MTP, nBits/retarget, maturity, subsidy, witness commitment, checkpoints | ✅ |
 | 6 | **Long-running node** — `run_p2p`, `--listen`/`--connect`/`--smoke` | ✅ |
-| 7 | Public signet IBD lab run | ⬜ ops / later |
+| 7 | Public signet IBD lab run | ⬜ ops — see OPERATOR.md (readiness ladder) |
 
 See **§3.1 Consensus gaps** for deployment-window policy (not a separate “5b” workstream).
 
@@ -483,7 +483,8 @@ Policy: **do not implement BIP9 / version-bits “deployment windows” as a sep
 | **Done Phase 6 core** | Wire ring (multi-tip), archive epoch, scripthash index |
 | **Done Phase 7 core** | Electrum TCP server + protocol fixtures |
 | **Documented gaps** | §3.1; Electrum TLS + live broadcast deferred |
-| **Next** | **Phase 8** hardening + node RPC + network-ready |
+| **IBD ladder** | OPERATOR.md: signet lab → fix → mainnet experimental → full |
+| **Next** | Signet lab gate, then Phase 8 hardening |
 
 ---
 

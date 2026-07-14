@@ -21,13 +21,16 @@ where
     let mut electrum_listen: Option<SocketAddr> = None;
     let mut connect: Vec<SocketAddr> = Vec::new();
     let mut use_seeds = true;
+    let mut milestone_height = 0u32;
+    let mut max_outbound = 8u32;
+    let mut max_run_secs: Option<u64> = None;
 
     while i < args.len() {
         let a = args[i].to_string_lossy();
         match a.as_ref() {
             "--help" | "-h" => {
                 eprintln!(
-                    "rbitcoin-node {} — usage: rbitcoin-node [--datadir PATH] [--network NET] \\\n  [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] [--no-seeds] [--smoke]",
+                    "rbitcoin-node {} — usage:\n  rbitcoin-node [--datadir PATH] [--network NET] \\\n    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n    [--milestone HEIGHT] [--max-outbound N] [--max-run-secs N] \\\n    [--no-seeds] [--smoke]\n\nNetworks: mainnet|testnet|signet|regtest\nMilestone: skip script/prevout checks for blocks <= HEIGHT (IBD speed)",
                     env!("CARGO_PKG_VERSION")
                 );
                 return ExitCode::SUCCESS;
@@ -113,6 +116,55 @@ where
                 }
                 i += 1;
             }
+            "--milestone" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --milestone requires a height");
+                    return ExitCode::from(2);
+                }
+                match args[i].to_string_lossy().parse::<u32>() {
+                    Ok(h) => milestone_height = h,
+                    Err(e) => {
+                        eprintln!("error: bad --milestone: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--max-outbound" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --max-outbound requires a number");
+                    return ExitCode::from(2);
+                }
+                match args[i].to_string_lossy().parse::<u32>() {
+                    Ok(n) if n > 0 => max_outbound = n,
+                    Ok(_) => {
+                        eprintln!("error: --max-outbound must be >= 1");
+                        return ExitCode::from(2);
+                    }
+                    Err(e) => {
+                        eprintln!("error: bad --max-outbound: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--max-run-secs" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --max-run-secs requires a number");
+                    return ExitCode::from(2);
+                }
+                match args[i].to_string_lossy().parse::<u64>() {
+                    Ok(n) => max_run_secs = Some(n),
+                    Err(e) => {
+                        eprintln!("error: bad --max-run-secs: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
             other => {
                 eprintln!("error: unknown argument `{other}`");
                 return ExitCode::from(2);
@@ -128,6 +180,11 @@ where
     config.electrum_listen = electrum_listen;
     config.connect = connect;
     config.use_seeds = use_seeds;
+    config.milestone_height = milestone_height;
+    config.max_outbound = max_outbound;
+    if max_run_secs.is_some() {
+        config.max_run_secs = max_run_secs;
+    }
 
     if smoke {
         match run_node(config) {
@@ -155,7 +212,6 @@ where
             }
         }
     } else {
-        // Long-running P2P process.
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {

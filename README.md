@@ -15,9 +15,16 @@ See [`IMPLEMENTATION-PLAN.md`](./IMPLEMENTATION-PLAN.md) for the re-audited road
 
 ## Status
 
-**Phases 0–3 complete** (store chain ops, regtest consensus, multi-node P2P headers/blocks).
+**Phases 0–7 core complete** (store, consensus, P2P, tip follow, durability, scripthash, Electrum TCP).
 
-**Next: Phase 4** — `reconstruct_block`, store-backed serve after restart, multi-peer IBD, mainnet consensus depth, long-running node. Then tip follow → durability + scripthash index → Electrum server → hardening.
+**Public-chain IBD:** not production-ready for full mainnet. Follow the ladder in [`OPERATOR.md`](./OPERATOR.md): **signet lab first**, then mainnet experimental.
+
+```bash
+# Signet lab (time-boxed)
+cargo build -p rbitcoin-node --release
+./target/release/rbitcoin-node --datadir ./datadir-signet --network signet \
+  --listen 127.0.0.1:38333 --milestone 200000 --max-run-secs 120
+```
 
 ## Build
 

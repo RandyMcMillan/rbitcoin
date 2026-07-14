@@ -2,7 +2,14 @@
 
 **Codename (working):** `rbitcoin-node`
 
-**Near-term goal:** A fully **consensus-compatible** Bitcoin full node in Rust that can complete **IBD** and participate in **block relay**, using a libbitcoin-class relational mmap archive and the durability model in [`libbitcoin-durable-archive-variant.md`](./libbitcoin-durable-archive-variant.md).
+**Near-term goal:** A fully **consensus-compatible** Bitcoin full node in Rust that can:
+
+1. **Connect to Bitcoin mainnet** and stay connected to diverse Core (and other) peers in **blocks-only** mode (`relay=false`, no mempool).
+2. **Perform IBD** from the public network (headers-first, multi-peer block download, full or milestone-accelerated validation).
+3. **Serve IBD** to other peers (advertise full archival node services; answer `getheaders` / `getdata` for any historical block including witness data).
+4. **Follow the tip** and participate in **block relay** after sync.
+
+Storage remains a libbitcoin-class relational mmap archive plus durability from [`libbitcoin-durable-archive-variant.md`](./libbitcoin-durable-archive-variant.md).
 
 **Deferred (explicitly out of the active roadmap):**
 
@@ -12,6 +19,8 @@
 - Full Core RPC/ZMQ surface beyond what ops need to run and verify IBD
 
 Those deferred areas may return in a later product track. **Crates `rbitcoin-mempool` and `rbitcoin-wallet` are removed from the workspace.**
+
+**Blocks-only is intentional and compatible:** Bitcoin Core’s `-blocksonly` / `relay=false` is a supported interop mode. Peers still exchange headers and blocks. We must not break block-path interop by advertising incomplete services or failing to serve witness blocks.
 
 ---
 
@@ -63,6 +72,78 @@ Those deferred areas may return in a later product track. **Crates `rbitcoin-mem
 | Durability (steady state) | Durable-archive epochs + tip wire ring after catch-up (may land immediately after IBD green) |
 | Coverage | 100% executable line coverage via high-level tests (CI gate); branch coverage on nightly when available |
 | Non-goals this track | Mempool, tx relay, wallets, fee estimation, GUI, prune |
+| Mainnet interop (blocks-only) | See **§1.1** — hard gate before calling the node “network ready” |
+
+### 1.1 Mainnet blocks-only interoperability checklist
+
+This is the acceptance bar for “works with the existing Bitcoin network.” Items are **required** unless marked optional. Status is as of after Phase 3.
+
+#### A. Connect and stay online on mainnet
+
+| # | Requirement | Why | Status | Phase |
+|---|-------------|-----|--------|-------|
+| A1 | Correct mainnet magic + genesis | Else immediate disconnect | Partial (params exist; node process not wired to long-running net) | 4–5 |
+| A2 | Modern `version` (≥70015/70016 class) | Headers, compact blocks, witness norms | **Gap** — currently `PROTOCOL_VERSION` 70001 | 4 |
+| A3 | Advertise `NODE_NETWORK \| NODE_WITNESS` (and not claim prune) | Core uses services to select IBD peers; without `NETWORK`+`WITNESS` peers may avoid us or send non-witness data | **Gap** — currently `NETWORK` only | 4 |
+| A4 | `relay=false` in version | Blocks-only / no tx relay | Done (handshake) | 3 ✅ |
+| A5 | DNS seeds + fixed seeds + `addr`/`getaddr` (basic addrman) | Cannot dial the network with only manual peers | **Gap** | 4 |
+| A6 | Many outbound peers; inbound listen; feeler optional | IBD bandwidth + eclipse resistance | **Gap** (single-peer `sync_from` only) | 4 |
+| A7 | Ping/pong keepalive, idle timeout, stall disconnect | Survive real peers | Partial | 4 |
+| A8 | Message size limits; ignore/rate-limit tx inv without banning for `relay=false` | DoS + blocks-only | Partial | 4–7 |
+| A9 | Optional BIP324 (v2 transport) | Increasing mainnet share; not strictly required day one if v1 still works | Optional later | 7+ |
+
+#### B. Perform IBD (download chain from peers)
+
+| # | Requirement | Why | Status | Phase |
+|---|-------------|-----|--------|-------|
+| B1 | Headers-first sync with locator | Core primary path | Partial (single-peer loop) | 3–4 |
+| B2 | Multi-peer concurrent block download | Mainnet IBD time / robustness | **Gap** | 4 |
+| B3 | Header tree + **most-work** selection (not only linear parent link) | Reorgs / competing tips during sync | **Gap** | 4 |
+| B4 | Request `MSG_WITNESS_BLOCK` (or equivalent) and prefer WITNESS peers | SegWit+ history is invalid without witness | Partial (we request witness inv; peer selection missing) | 3–4 |
+| B5 | Full mainnet consensus: difficulty adjustment, MTP, coinbase maturity, witness commitment, deployment/activation | Else we accept invalid tips or reject valid blocks | **Gap** (simplified Phase 2 rules) | 4–5 |
+| B6 | Mainnet checkpoints + default milestone/assumevalid | Safety + IBD speed | **Gap** (empty checkpoint list) | 4 |
+| B7 | Persist progress; resume after restart without full re-download | Operator requirement | Partial (store persists; header/block pipeline not durable mid-window) | 4–6 |
+| B8 | Validate (or milestone-skip) then connect in order | Chainstate integrity | Partial (regtest) | 2–4 |
+| B9 | Signet/mainnet lab IBD exit | Proof | Not yet | 4–5 |
+
+#### C. Serve IBD (upload chain to other nodes)
+
+| # | Requirement | Why | Status | Phase |
+|---|-------------|-----|--------|-------|
+| C1 | `NODE_NETWORK` (+ `WITNESS`) while archival | Core only IBD-syncs from peers advertising full service | **Gap** (flags) | 4 |
+| C2 | Answer `getheaders` from genesis→tip in ≤2000 batches | Standard IBD | Partial (in-memory cache only) | 3–4 |
+| C3 | Answer `getdata` for **any** historical block hash with **full witness** serialization | Serving IBD / reorg / wallet rescans of peers | **Gap** — `BlockCache` is RAM-only; relational store cannot yet reconstruct wire blocks; process restart loses serve ability | **4 (must)** |
+| C4 | Persistent historical wire blocks (or bit-exact reconstruct from archive) | C3 after restart / under memory pressure | **Gap** — plan wire ring is tip-only; need **archival block blob index** or proven reconstruct | 4–6 |
+| C5 | Handle `getblocks` (optional but useful) | Older clients | Optional | 5 |
+| C6 | Not pruned; never serve empty for deep history | Archival product | Intentional non-prune | ✅ product |
+| C7 | Inbound connection limits / resource caps | DoS when serving IBD | **Gap** | 7 |
+
+#### D. Steady-state tip (after IBD)
+
+| # | Requirement | Why | Status | Phase |
+|---|-------------|-----|--------|-------|
+| D1 | `headers` / block `inv` → fetch → validate → connect | Tip follow | **Gap** | 5 |
+| D2 | Announce new tip to peers (`inv` or `headers` via sendheaders) | Help the network | **Gap** | 5 |
+| D3 | Compact blocks (BIP152) | Mainnet efficiency | Preferred | 5 |
+| D4 | Reorg to most-work within policy | Safety | Partial store disconnect only | 5 |
+
+#### E. Explicit non-requirements for this track (still interop-safe)
+
+| Item | Notes |
+|------|--------|
+| Tx relay / mempool | `relay=false`; ignore tx messages — Core interops fine |
+| Addr gossip quality | Minimal addrman is enough to find peers; need not match Core |
+| BIP324 day-one | Nice-to-have |
+| Wallet / fee / GBT | Out of scope |
+
+### 1.2 Verdict before Phase 4
+
+| Question | Answer |
+|----------|--------|
+| Does the **plan direction** end in mainnet blocks-only interop with perform+serve IBD? | **Yes, if Phase 4–7 absorb the gaps in §1.1** (especially **C3/C4 historical wire storage**, **B5 consensus completeness**, **A3 service flags**, **A5–A6 peer discovery/multi-peer**). |
+| Are we there now (post Phase 3)? | **No.** Proven only on **regtest multi-node** with in-memory block cache. |
+| Single biggest missing piece for *serving* IBD? | **Persistent full-block (witness) retrieval for arbitrary height** — relational archive alone is not enough unless we implement bit-exact reconstruction *and* prove it. Prefer **append-only block blob files + hash index** (Core-like) alongside the relational archive. |
+| Single biggest missing piece for *performing* mainnet IBD? | **Mainnet consensus (difficulty/MTP/activation) + multi-peer download + peer discovery.** |
 
 ---
 
@@ -82,9 +163,10 @@ Those deferred areas may return in a later product track. **Crates `rbitcoin-mem
 │         │         └──────────────────────┬─────────────────────────┘  │
 │         │                                │                            │
 │  ┌──────▼──────┐  ┌──────────────────────▼─────────────────────────┐  │
-│  │ Block serve │  │ Store (mmap Class A/B/C) + wire ring + epochs  │  │
-│  │ (getdata)   │  │ archive_mode gate (IBD vs steady state)        │  │
-│  └─────────────┘  └────────────────────────────────────────────────┘  │
+│  │ Block serve │  │ Relational mmap archive (query/validate)       │  │
+│  │ (getdata)   │  │ + archival wire block blobs (serve IBD)        │  │
+│  └─────────────┘  │ + tip wire ring / epochs (durability)          │  │
+│                   └────────────────────────────────────────────────┘  │
 │  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────────────┐  │
 │  │ Node RPC*   │  │ CLI          │  │ Metrics / logs               │  │
 │  └─────────────┘  └──────────────┘  └──────────────────────────────┘  │
@@ -148,11 +230,24 @@ Those deferred areas may return in a later product track. **Crates `rbitcoin-mem
 | Prune / GUI | Permanent non-goals |
 | Mining RPC | Deferred |
 
-### 4.3 Network policy for “no tx relay”
+### 4.3 Network policy for “blocks-only” (mainnet-compatible)
 
-- Advertise and request **blocks/headers** only as needed for IBD and tip.
-- Ignore or drop unsolicited tx inventory without building a mempool (document DoS stance: rate-limit / disconnect abusers).
-- Do not claim Core tx-relay parity.
+- Set `relay=false` in `version` (done in Phase 3).
+- Advertise **`NODE_NETWORK | NODE_WITNESS`** once we can serve full historical witness blocks (required for Core to treat us as a full archival peer).
+- Prefer outbound peers with `NODE_NETWORK | NODE_WITNESS` when performing IBD.
+- Request blocks as witness inventory (`Inventory::WitnessBlock`).
+- Ignore tx `inv` / `tx` / `mempool` without disconnecting solely for offering txs (rate-limit floods).
+- Do not claim Core tx-relay parity; do claim **block-path interop** for headers + blocks.
+
+### 4.4 Dual storage for interop (decision)
+
+| Layer | Purpose |
+|-------|---------|
+| Relational mmap archive | Fast structural query, confirmability, indexes (libbitcoin-class) |
+| **Archival wire block blobs** (hash → flat files / blob table) | **Serve IBD and getdata** with bit-exact witness serialization; survive restart |
+| Tip wire ring | Hot cache + durability soft zone (durable-archive variant) |
+
+Serving IBD from reconstruction alone is allowed only with a **proven bit-exact** round-trip against mainnet blocks; until then, **store wire bytes at connect time** (same moment as relational write).
 
 ---
 
@@ -160,22 +255,20 @@ Those deferred areas may return in a later product track. **Crates `rbitcoin-mem
 
 ### 5.1 Schema completion
 
-- `input` table + `ins`/`outs`/`txs` linkage (SCHEMA.md).
-- Dense `confirmed` (height → header fk) and `strong_tx`.
-- Growable hash heads (rehash or multi-level) — **blocking for mainnet**.
-- Growable var-table capacity — **blocking for mainnet**.
-- Optional: store wire bytes only in wire ring, not full history.
+- Inputs / confirmed / strong_tx / growable tables — largely Phase 1 ✅.
+- **Archival block blob index** (hash → file offset/length; full `Block` consensus encoding) — **blocking for serve-IBD (C3/C4)**.
+- Header index sufficient for locator + getheaders without full RAM `BlockCache`.
 
 ### 5.2 Chain operations API (`query`)
 
 - Apply header, apply block body (txs/ins/outs/points).
 - Set/unset strong + confirmed for a height (reorg).
-- Prevout lookup for confirmability via outputs + `point` (no spender on output rows).
-- Reconstruct serialized block for P2P serve (from relational data or wire ring).
+- Prevout lookup for confirmability via outputs + `point`.
+- **`get_wire_block(hash|height)`** from blob store (not only RAM cache).
 
 ### 5.3 Durability (after IBD path exists)
 
-Implement durable-archive §3–5: `archive_mode`, bulk/incremental finalize, wire ring, recovery.
+Implement durable-archive §3–5: `archive_mode`, bulk/incremental finalize, tip wire ring, recovery. Archival blobs follow the same finalize policy as Class A (rebuildable during IBD; epoch-sealed in steady state).
 
 ---
 
@@ -236,77 +329,80 @@ Each phase is independently mergeable, has explicit exit criteria, and must keep
 
 ---
 
-### Phase 4 — Concurrent IBD pipeline (3–5 weeks)
+### Phase 4 — Mainnet-capable IBD (perform + serve foundation) (4–6 weeks)
 
-**Goal:** Libbitcoin-style concurrent IBD with milestone; mainnet IBD experimental.
+**Goal:** Close §1.1 gaps so the node can **perform IBD from public peers** and **serve historical blocks** after restart—not only regtest RAM cache.
 
-**Work**
+**Work (ordered)**
 
-1. Stages: download ∥ store ∥ validation ∥ confirmability (ordered).
-2. Bounded height window (e.g. tens of thousands) for locality.
-3. Milestone skips validation+confirmability below height (still commitment/malleation checks as required).
-4. Progress metrics and `getblockchaininfo`-style logging.
-5. No wire ring / epoch fsync on IBD path.
+1. **Archival wire block blobs** at connect time (`get_wire_block`); serve `getdata` from blobs, not only `BlockCache` (**C3/C4**).
+2. **Service flags** `NETWORK | WITNESS`; bump protocol version toward modern Core; prefer WITNESS peers (**A2/A3/B4**).
+3. **Peer discovery:** DNS seeds + fixed seeds + basic `addr`/`getaddr` addrman; multi-outbound (**A5/A6**).
+4. **Header tree + most-work**; multi-peer concurrent download window; stall/score/evict (**B2/B3**).
+5. **Consensus completeness for mainnet connect:** difficulty retarget, MTP, coinbase maturity, witness commitment, script flags by deployment/height (**B5**); mainnet checkpoints + default milestone (**B6**).
+6. Pipeline: download ∥ store(blob+relational) ∥ validate ∥ confirmability; no per-block epoch fsync in IBD.
+7. Progress metrics; resume after restart from stored tip + blobs.
+8. Integration: sync from a real Core/signet peer in lab; multi-node serve IBD after process restart.
 
 **Exit**
 
-- Mainnet IBD under milestone reaches network tip (or within N blocks) on lab hardware.
-- Crash mid-IBD: process restarts and continues without full wipe (best-effort; Core-class durability still off).
-- Benchmark numbers recorded vs Core (and libbitcoin if available).
+- Signet (then mainnet experimental) IBD under milestone reaches network tip (or within N blocks).
+- Second process (or Core peer) can **IBD from us** for a non-trivial height range after **restart** (proves blob serve).
+- Crash mid-IBD: continue without full wipe (best-effort).
 
 ---
 
 ### Phase 5 — Block relay + tip following (2–3 weeks)
 
-**Goal:** Steady-state block propagation without mempool.
+**Goal:** Steady-state blocks-only participation on mainnet/signet.
 
 **Work**
 
-1. Announce new tip blocks to peers; serve `getdata` for blocks (reconstruct or wire ring).
-2. Compact blocks (BIP152) high-bandwidth mode — preferred once basic inv/getdata works.
-3. Tip connect path optimized (small batch validation, not full IBD window).
-4. Reorg handling within reasonable depth.
+1. Unsolicited `headers` / block `inv` → fetch → validate → connect (**D1**).
+2. Announce new tip (`inv` / `sendheaders`) (**D2**).
+3. Compact blocks (BIP152) high-bandwidth (**D3**).
+4. Reorg to most-work within policy (**D4**); deep reorg vs wire/blob policy documented.
+5. Soak: follow tip ≥ days with diverse peers.
 
 **Exit**
 
-- Node follows signet/mainnet tip for soak period with peers; serves blocks to a second peer/node.
-- No tx relay required for this exit.
+- Mainnet/signet tip follow soak; we announce and receive new blocks; still `relay=false`.
 
 ---
 
-### Phase 6 — Durable archive + wire ring (2–3 weeks)
+### Phase 6 — Durable archive + tip wire ring (2–3 weeks)
 
-**Goal:** Post-IBD durability per durable-archive spec.
+**Goal:** Post-IBD durability per durable-archive spec (epochs + tip ring), without breaking serve-IBD blobs.
 
 **Work**
 
-1. `archive_mode` gate; bulk finalize on first enable.
-2. Wire ring append/prune; recovery from epoch + wire/peers.
-3. Incremental finalize batching; crash tests from durable-archive §9.
+1. `archive_mode` gate; bulk finalize on first enable (includes relational + blob HWMs).
+2. Tip wire ring append/prune; recovery from epoch + ring/peers.
+3. Incremental finalize; crash tests from durable-archive §9.
+4. Confirm: getdata for ancient heights still works from **blobs** after finalize.
 
 **Exit**
 
-- Durable-archive acceptance criteria automated.
-- IBD path still free of per-block fsync when `archive_mode == false`.
+- Durable-archive §9 automated; IBD path still free of mandatory per-block fsync when `archive_mode == false`.
 
 ---
 
-### Phase 7 — Hardening + minimal node RPC (2–3 weeks)
+### Phase 7 — Hardening + minimal node RPC + “network ready” gate (2–3 weeks)
 
-**Goal:** Operable consensus node for lab and early operators.
+**Goal:** Operable mainnet blocks-only node for lab and early operators.
 
 **Work**
 
 1. Minimal RPC: chain info, getblock/getblockhash, peers, stop.
-2. Config file, logging, metrics.
-3. Peer DoS review, connection limits, Tor/proxy optional.
-4. Docs: OPERATOR.md, PERF.md, COMPAT.md (honest about no mempool/wallet).
-5. Release checklist for “consensus+IBD+block-relay” milestone (not full Core parity).
+2. Config file, logging, metrics; inbound limits (**C7**).
+3. Peer DoS review; Tor/proxy optional; optional BIP324 note.
+4. Docs: OPERATOR.md (how to IBD, how others IBD from you), PERF.md, COMPAT.md.
+5. **§1.1 checklist sign-off** — every required row Done or explicitly waived with reason.
+6. Release checklist: “mainnet blocks-only: perform IBD + serve IBD + tip follow”.
 
 **Exit**
 
-- Documented mainnet IBD + tip-follow runbook.
-- CI + coverage green; soak test notes.
+- Documented mainnet runbook; §1.1 required items complete; CI + coverage green.
 
 ---
 
@@ -395,7 +491,7 @@ Until then, do not re-add wallet/mempool crates “for convenience.”
 
 ## 13. North star (this track)
 
-**Ship a Rust validating full node that stores the chain in a concurrent libbitcoin-style mmap archive, completes IBD with Core-compatible consensus, and relays blocks — without a mempool or wallet — then add post-IBD archive durability.**
+**Ship a Rust validating full node that speaks Bitcoin’s block protocol on mainnet in blocks-only mode: discovers peers, performs IBD, serves historical witness blocks to others, follows the tip, stores a relational mmap archive for query/validate plus archival wire blobs for serve — without a mempool or wallet — then hardens post-IBD durability.**
 
 ---
 
@@ -403,7 +499,7 @@ Until then, do not re-add wallet/mempool crates “for convenience.”
 
 | Item | Value |
 |------|-------|
-| Status | Active roadmap (consensus / IBD / block relay) |
-| Supersedes | Earlier plan sections that treated wallet/mempool as v1.0-critical |
+| Status | Active roadmap (mainnet blocks-only interop) |
+| Supersedes | Wallet/mempool-as-v1.0 plans; post–Phase 3 gap analysis added §1.1 |
 | Depends on | `libbitcoin-durable-archive-variant.md` |
-| Next action | Phase 1 store/query chain ops |
+| Next action | Phase 4 — archival blobs + multi-peer IBD + mainnet consensus completeness |

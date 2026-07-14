@@ -1,0 +1,12 @@
+[package]
+name = "rbitcoin-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Query API over the rbitcoin store"
+
+[dependencies]
+rbitcoin-primitives = { workspace = true }
+rbitcoin-store = { workspace = true }
+thiserror = { workspace = true }

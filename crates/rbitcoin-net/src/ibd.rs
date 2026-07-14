@@ -194,23 +194,25 @@ pub async fn parallel_ibd(
             let _ = request_headers(&slots, &hub, &mut header_req_seq);
         }
 
-        // Repair: if tip has no extension in pool and we're stalled, rebuild the
-        // download path from the current tip (ordered can desync after gaps).
-        if last_progress.elapsed() > cfg.stall {
+        // Repair only after a longer stall, and only if tip-next is not already
+        // in-flight (normal gap wait). Clearing too early drops a useful pool.
+        if last_progress.elapsed() > cfg.stall.saturating_mul(3) {
             let tip = hub.tip_hash();
             let can_connect = tip
                 .map(|t| pool_by_prev.contains_key(&t))
                 .unwrap_or_else(|| {
                     pool_by_prev.contains_key(&BlockHash::from_byte_array([0u8; 32]))
                 });
-            if !can_connect {
-                // If ordered front is not a tip child (when present in pool), drop it.
+            let tip_next_inflight = ordered
+                .front()
+                .map(|h| inflight.contains_key(h) || pool.contains_key(h))
+                .unwrap_or(false);
+            if !can_connect && !tip_next_inflight {
                 if let (Some(t), Some(front)) = (tip, ordered.front().copied()) {
                     if let Some(b) = pool.get(&front) {
                         if b.header.prev_blockhash != t {
                             eprintln!(
-                                "ibd: ordered desync front={} not child of tip; resetting path",
-                                front
+                                "ibd: ordered desync front={front} not child of tip; resetting path"
                             );
                             ordered.clear();
                             ordered_set.clear();
@@ -224,10 +226,6 @@ pub async fn parallel_ibd(
                     );
                     pool.clear();
                     pool_by_prev.clear();
-                }
-                inflight.clear();
-                for s in slots.iter_mut() {
-                    s.in_flight.clear();
                 }
                 let _ = request_headers(&slots, &hub, &mut header_req_seq);
                 last_progress = Instant::now();

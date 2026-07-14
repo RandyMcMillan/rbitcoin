@@ -10,7 +10,7 @@ use rbitcoin_consensus::{
     accept_and_connect_block, validate_block_structure, ChainParams, ConsensusError, Milestone,
     ValidationContext,
 };
-use rbitcoin_net::outbound_for_ibd;
+use rbitcoin_net::{outbound_for_ibd, crate_name as net_crate_name};
 use rbitcoin_node::{cli_main as node_cli_main, run_node, NodeConfig};
 use rbitcoin_primitives::{Fk, Height, Network, TableKind, VERSION};
 use rbitcoin_query::Query;
@@ -165,6 +165,8 @@ fn placeholder_surfaces() {
     assert!(!Milestone::NONE.skips_at(0));
     assert!(Milestone { height: 10 }.skips_at(5));
     assert_eq!(outbound_for_ibd(true), 100);
+    assert_eq!(outbound_for_ibd(false), 8);
+    assert_eq!(net_crate_name(), "rbitcoin-net");
     assert_eq!(node_rpc_path(), "/");
 }
 

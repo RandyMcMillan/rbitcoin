@@ -220,22 +220,19 @@ Each phase is independently mergeable, has explicit exit criteria, and must keep
 
 ---
 
-### Phase 3 — Header sync + block download P2P (2–4 weeks)
+### Phase 3 — Header sync + block download P2P ✅
 
-**Goal:** Talk to the network (or signet) enough to fetch headers and blocks; no tx relay.
+**Done:**
 
-**Work**
+1. Tokio P2P: version/verack handshake, ping/pong, listen + dial (`rbitcoin-net`).
+2. Headers sync (`getheaders` / `headers`) + ordered block download (`getdata` / `block` with witness inventory).
+3. `BlockCache` for wire serve + locator; integrate with `accept_and_connect_block` on ingest/sync.
+4. No tx relay: ignore `tx` / mempool / tx inv; `relay=false` in version.
+5. Multi-node integration tests (always-on 2- and 3-node meshes) + periodic ignored mesh (`scripts/integration.sh`).
 
-1. Async peer manager (tokio): outbound connect, version/verack, ping/pong.
-2. Headers sync (getheaders / headers); maintain header tree + most-work tip candidate.
-3. Block download window: `getdata` / `block`; peer scoring by download rate; stall drop.
-4. Basic addr handling optional; fixed seed peers + DNS seeds per network.
-5. DoS basics: message size limits, ignore tx inv or disconnect on flood.
+**Exit met (regtest multi-node):** peer syncs headers+blocks from seeder; second hop serve-after-sync works.
 
-**Exit**
-
-- Signet or regtest P2P: headers to tip, download a contiguous range of blocks into the store **without** full validation pipeline (or with contextual-free checks only).
-- Scenarios with mock peers for handshake + one block fetch.
+**Follow-ups (Phase 4+):** peer scoring/stall eviction, DNS seeds, concurrent IBD pipeline, compact blocks.
 
 ---
 

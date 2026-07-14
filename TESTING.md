@@ -31,6 +31,20 @@ Prefer **one high-level scenario** per behavior. Delete lower-level tests when a
 | `consensus_reject_bad_pow_and_merkle` | Consensus | Invalid block rejection |
 | `consensus_spend_and_reject_double_spend` | Consensus | Prevout spend + double-spend |
 | `consensus_milestone_skips_connect_checks` | Consensus | Milestone path |
+| `two_node_header_and_block_sync` | P2P integration | Seeder → peer headers+blocks |
+| `three_node_relay_path` | P2P integration | Sync via intermediate peer |
+| `multinode_mesh_periodic` | P2P integration (ignored) | Larger mesh; `scripts/integration.sh` |
+
+### Integration / multi-node
+
+Default CI runs `integration_multinode` without `--ignored`.
+
+Periodic / holistic suite:
+
+```bash
+./scripts/integration.sh
+# or: cargo test -p rbitcoin-test --test integration_multinode -- --ignored --nocapture
+```
 
 New features: add a high-level scenario; remove obsolete lower-level tests in the same PR.
 

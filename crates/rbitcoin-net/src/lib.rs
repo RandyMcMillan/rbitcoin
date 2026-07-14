@@ -1,4 +1,14 @@
-//! P2P networking (Phase 4). Placeholder surface for workspace wiring.
+//! Bitcoin P2P: handshake, headers sync, block download/serve (no tx relay).
+
+mod cache;
+mod codec;
+mod error;
+mod peer;
+mod service;
+
+pub use cache::BlockCache;
+pub use error::NetError;
+pub use service::{magic_for, NetConfig, P2PHandle, P2PNode};
 
 pub fn crate_name() -> &'static str {
     "rbitcoin-net"

@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Bitcoin P2P networking"
+description = "Bitcoin P2P networking (headers + block download/serve)"
 
 [dependencies]
+rbitcoin-primitives = { workspace = true }
+rbitcoin-consensus = { workspace = true }
+rbitcoin-query = { workspace = true }
+bitcoin = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+bytes = { workspace = true }

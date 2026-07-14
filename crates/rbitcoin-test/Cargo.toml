@@ -20,7 +20,12 @@ rbitcoin-node = { workspace = true }
 tempfile = { workspace = true }
 bitcoin = { workspace = true }
 hex = { workspace = true }
+tokio = { workspace = true }
 
 [[test]]
 name = "scenarios"
 path = "tests/scenarios.rs"
+
+[[test]]
+name = "integration_multinode"
+path = "tests/integration_multinode.rs"

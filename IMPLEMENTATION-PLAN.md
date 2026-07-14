@@ -374,25 +374,25 @@ Policy: **do not implement BIP9 / version-bits “deployment windows” as a sep
 
 ---
 
-### Phase 7 — Electrum protocol server (3–5 weeks)
+### Phase 7 — Electrum protocol server — **core done**
 
 **Goal:** Stock Electrum clients can use this node as their server (**confirmed-chain** UX).
 
-**Work**
-
-1. New crate `rbitcoin-electrum`: TCP + TLS listeners, line-delimited JSON-RPC, protocol negotiation.
-2. Implement E2–E12 (§1.2); mempool methods empty; broadcast = peer push without mempool admission (documented).
-3. Merkle proofs from `block_txs` + txids.
-4. Subscriptions: scripthash + headers (hook tip events from Phase 5).
-5. Wire into `rbitcoin-node` config: ports, SSL certs, banner, optional donation address.
-6. Minimal net path: `broadcast_tx(raw)` → send `tx` to connected peers (may land late Phase 4/5 if useful earlier).
-7. Integration fixtures: protocol-level tests; optional `electrum` CLI / small Rust client against local node.
-8. Extend `scripts/integration.sh` with electrum soak when practical.
+| # | Work | Status |
+|---|------|--------|
+| 1 | `rbitcoin-electrum` TCP line-delimited JSON-RPC 1.4 | ✅ |
+| 2 | server.* + scripthash history/balance/listunspent/subscribe; mempool empty | ✅ |
+| 3 | transaction.get / get_merkle / id_from_pos; estimatefee stub | ✅ |
+| 4 | headers.subscribe (tip bus ready; push when tip_tx fed) | ✅ foundation |
+| 5 | `--electrum-listen` on node | ✅ |
+| 6 | Protocol fixture test | ✅ |
+| 7 | TLS listener | ⬜ later |
+| 8 | Live peer broadcast for transaction.broadcast | ⬜ returns txid only for now |
 
 **Exit**
 
-- Electrum wallet can sync receive history and broadcast send on regtest/signet against this server.
-- COMPAT.md / OPERATOR notes: differences vs ElectrumX (no mempool history, fee stubs).
+- Confirmed Electrum API works against local chain. ✅
+- Wallet smoke on signet / TLS / peer broadcast: Phase 8 polish.
 
 ---
 
@@ -480,10 +480,10 @@ Policy: **do not implement BIP9 / version-bits “deployment windows” as a sep
 |--------|--------|
 | **Done Phase 4 core** | Reconstruct + store-backed restart serve; WITNESS; consensus depth; seeds; long-running node |
 | **Done Phase 5 core** | Tip follow (`follow_from` + announce); cmpct→getdata; most-work reorg foundation |
-| **Done Phase 6 core** | Wire ring, archive epoch, scripthash index + Electrum query helpers |
-| **Documented gaps** | §3.1 — no separate BIP9 window workstream; concurrent IBD window optional |
-| **Next** | **Phase 7** Electrum protocol server |
-| Then | Phase 8 network-ready sign-off |
+| **Done Phase 6 core** | Wire ring (multi-tip), archive epoch, scripthash index |
+| **Done Phase 7 core** | Electrum TCP server + protocol fixtures |
+| **Documented gaps** | §3.1; Electrum TLS + live broadcast deferred |
+| **Next** | **Phase 8** hardening + node RPC + network-ready |
 
 ---
 
@@ -510,7 +510,7 @@ Policy: **do not implement BIP9 / version-bits “deployment windows” as a sep
 
 | Item | Value |
 |------|-------|
-| Status | Living plan — Phase 0–6 **core done**; Electrum = Phase 7 |
+| Status | Living plan — Phase 0–7 **core done** |
 | Depends on | [`libbitcoin-durable-archive-variant.md`](./libbitcoin-durable-archive-variant.md), [`SCHEMA.md`](./SCHEMA.md) |
-| Next action | Phase 7 — Electrum TCP/SSL JSON-RPC server |
+| Next action | Phase 8 — hardening, minimal RPC, operator docs |
 | Gaps policy | §3.1 — deployment windows only as needed for historical block rules |

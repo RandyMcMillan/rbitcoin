@@ -34,7 +34,8 @@ method_name | status (done/partial/absent) | notes
 |------------------|--------|-------|
 | process start/stop | partial | Lifecycle / smoke |
 | Core-like JSON-RPC | absent | Phase 8 of active plan |
-| Electrum TCP/SSL | absent | Phase 7; scripthash index Phase 6 |
+| Electrum TCP | partial | Confirmed history/balance; no TLS yet; broadcast returns txid only |
+| Electrum scripthash index | done | Built on connect (Phase 6) |
 
 ### Deferred surfaces
 

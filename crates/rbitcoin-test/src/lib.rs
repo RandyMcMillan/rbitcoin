@@ -42,6 +42,7 @@ pub fn smoke_crate_names() -> Vec<&'static str> {
         rbitcoin_consensus::crate_name(),
         rbitcoin_net::crate_name(),
         rbitcoin_rpc::crate_name(),
+        rbitcoin_electrum::crate_name(),
         rbitcoin_cli::crate_name(),
         rbitcoin_node::crate_name(),
     ]

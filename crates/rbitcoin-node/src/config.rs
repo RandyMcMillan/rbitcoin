@@ -20,6 +20,8 @@ pub struct NodeConfig {
     pub smoke: bool,
     /// Cap how long `run_p2p` idles after sync (None = forever). Used by tests.
     pub max_run_secs: Option<u64>,
+    /// Electrum TCP listen (`None` = disabled).
+    pub electrum_listen: Option<SocketAddr>,
 }
 
 impl Default for NodeConfig {
@@ -34,6 +36,7 @@ impl Default for NodeConfig {
             use_seeds: true,
             smoke: false,
             max_run_secs: None,
+            electrum_listen: None,
         }
     }
 }

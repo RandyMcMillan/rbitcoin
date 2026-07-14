@@ -1,24 +1,20 @@
 [package]
-name = "rbitcoin-node"
+name = "rbitcoin-electrum"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "rbitcoin full node binary and lifecycle"
-
-[[bin]]
-name = "rbitcoin-node"
-path = "src/main.rs"
+description = "Electrum protocol server (scripthash JSON-RPC over TCP)"
 
 [dependencies]
 rbitcoin-primitives = { workspace = true }
 rbitcoin-query = { workspace = true }
 rbitcoin-store = { workspace = true }
-rbitcoin-wire-cache = { workspace = true }
 rbitcoin-consensus = { workspace = true }
-rbitcoin-net = { workspace = true }
-rbitcoin-rpc = { workspace = true }
-rbitcoin-electrum = { workspace = true }
-thiserror = { workspace = true }
+bitcoin = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
+hex = { workspace = true }
+parking_lot = { workspace = true }

@@ -359,6 +359,57 @@ impl Query {
         self.store.epoch()
     }
 
+    /// Merkle proof for `txid` in the confirmed block at `height` (Electrum get_merkle).
+    pub fn merkle_proof(
+        &self,
+        height: Height,
+        txid: &[u8; 32],
+    ) -> Result<MerkleProof, QueryError> {
+        use bitcoin::hashes::{sha256d, Hash as _};
+
+        let fks = self.block_tx_fks(height)?;
+        let mut txids = Vec::with_capacity(fks.len());
+        let mut pos = None;
+        for (i, fk) in fks.iter().enumerate() {
+            let tx = self.get_tx(*fk)?;
+            if &tx.txid == txid {
+                pos = Some(i);
+            }
+            txids.push(tx.txid);
+        }
+        let pos = pos.ok_or(StoreError::NotFound)?;
+        let mut branch = Vec::new();
+        let mut idx = pos;
+        let mut layer: Vec<[u8; 32]> = txids;
+        while layer.len() > 1 {
+            if layer.len() % 2 == 1 {
+                layer.push(*layer.last().unwrap());
+            }
+            let sibling = if idx % 2 == 0 {
+                layer[idx + 1]
+            } else {
+                layer[idx - 1]
+            };
+            branch.push(sibling);
+            let mut next = Vec::with_capacity(layer.len() / 2);
+            let mut i = 0;
+            while i < layer.len() {
+                let mut buf = [0u8; 64];
+                buf[0..32].copy_from_slice(&layer[i]);
+                buf[32..64].copy_from_slice(&layer[i + 1]);
+                next.push(sha256d::Hash::hash(&buf).to_byte_array());
+                i += 2;
+            }
+            layer = next;
+            idx /= 2;
+        }
+        Ok(MerkleProof {
+            block_height: height.0,
+            pos,
+            merkle: branch,
+        })
+    }
+
     pub fn block_tx_fks(&self, height: Height) -> Result<Vec<Fk>, QueryError> {
         self.store.block_txs.get_list(height)
     }
@@ -551,6 +602,13 @@ pub struct ScriptHashUtxo {
     pub tx_pos: u32,
     pub height: u32,
     pub value: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MerkleProof {
+    pub block_height: u32,
+    pub pos: usize,
+    pub merkle: Vec<[u8; 32]>,
 }
 
 pub fn crate_name() -> &'static str {

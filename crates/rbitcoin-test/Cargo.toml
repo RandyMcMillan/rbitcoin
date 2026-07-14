@@ -15,12 +15,14 @@ rbitcoin-wire-cache = { workspace = true }
 rbitcoin-consensus = { workspace = true }
 rbitcoin-net = { workspace = true }
 rbitcoin-rpc = { workspace = true }
+rbitcoin-electrum = { workspace = true }
 rbitcoin-cli = { workspace = true }
 rbitcoin-node = { workspace = true }
 tempfile = { workspace = true }
 bitcoin = { workspace = true }
 hex = { workspace = true }
 tokio = { workspace = true }
+serde_json = { workspace = true }
 
 [[test]]
 name = "scenarios"
@@ -29,3 +31,7 @@ path = "tests/scenarios.rs"
 [[test]]
 name = "integration_multinode"
 path = "tests/integration_multinode.rs"
+
+[[test]]
+name = "electrum_protocol"
+path = "tests/electrum_protocol.rs"

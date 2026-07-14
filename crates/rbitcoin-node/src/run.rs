@@ -1,11 +1,14 @@
 use crate::config::NodeConfig;
 use crate::error::NodeError;
 use rbitcoin_consensus::{ChainParams, Milestone};
+use rbitcoin_electrum::{run_electrum, ElectrumConfig};
 use rbitcoin_net::{default_port, AddrMan, P2PNode};
 use rbitcoin_query::Query;
 use rbitcoin_wire_cache::WireRing;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::broadcast;
 
 /// Running node state (store open; optional P2P).
 pub struct NodeHandle {
@@ -62,7 +65,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     });
 
     let query = handle.query;
-    let node = P2PNode::start(listen, query, params, milestone)
+    let node = P2PNode::start(listen, query, params.clone(), milestone)
         .await
         .map_err(|e| NodeError::Config(format!("p2p start: {e}")))?;
 
@@ -95,6 +98,20 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         eprintln!("no outbound peers configured; serving only");
     }
 
+    let (tip_tx, _) = broadcast::channel(16);
+    let mut electrum = None;
+    if let Some(addr) = config.electrum_listen {
+        let ecfg = ElectrumConfig::for_params(addr, &params);
+        let q = Arc::new(Query::open_or_create(config.store_path()).map_err(NodeError::from)?);
+        match run_electrum(ecfg, q, params.clone(), tip_tx.clone()).await {
+            Ok(h) => {
+                eprintln!("electrum listening on {}", h.local_addr);
+                electrum = Some(h);
+            }
+            Err(e) => eprintln!("electrum start warning: {e}"),
+        }
+    }
+
     // Idle: keep accept loop alive until max_run or process kill.
     match config.max_run_secs {
         Some(0) => {}
@@ -106,6 +123,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         },
     }
 
+    if let Some(e) = electrum {
+        e.shutdown().await;
+    }
     node.shutdown().await;
     Ok(())
 }

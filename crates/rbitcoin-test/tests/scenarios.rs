@@ -598,36 +598,60 @@ fn wire_ring_and_archive_epoch() {
         accept_and_connect_block(&q, &params, Height(h), &b, Milestone::NONE).unwrap();
         let mut wire = Vec::new();
         b.consensus_encode(&mut wire).unwrap();
-        ring.push(h, b.block_hash().to_byte_array(), wire, h)
+        let prev = b.header.prev_blockhash.to_byte_array();
+        ring.push_tip(h, b.block_hash().to_byte_array(), prev, wire)
             .unwrap();
         tip = b.block_hash();
         tip_time = b.header.time;
         blocks.push(b);
     }
-    // depth 3 → keep heights 3,4,5 (tip-2..=tip)
+    // depth 3 → keep heights 3,4,5 (max_height-2..=max)
     assert!(!ring.contains_height(1));
     assert!(ring.contains_height(5));
-    assert!(ring.get_by_hash(&blocks[5].block_hash().to_byte_array()).is_some());
+    assert!(ring
+        .get_by_hash(&blocks[5].block_hash().to_byte_array())
+        .is_some());
 
-    // Finalize through height 4 → drop wire ≤ 4
+    // Competing tip at height 5 (same parent as block 5) — both retained.
+    let fork = mine_regtest_block(
+        blocks[4].block_hash(),
+        blocks[4].header.time + 601,
+        5,
+        vec![],
+    );
+    assert_ne!(fork.block_hash(), blocks[5].block_hash());
+    let mut fork_wire = Vec::new();
+    fork.consensus_encode(&mut fork_wire).unwrap();
+    ring.push(
+        5,
+        fork.block_hash().to_byte_array(),
+        fork.header.prev_blockhash.to_byte_array(),
+        fork_wire,
+        true,
+    )
+    .unwrap();
+    let at5 = ring.get_all_at_height(5);
+    assert_eq!(at5.len(), 2, "both fork tips at height 5 must be held");
+    assert!(ring.contains_hash(&fork.block_hash().to_byte_array()));
+    assert!(ring.contains_hash(&blocks[5].block_hash().to_byte_array()));
+
+    // Finalize through height 4 → drop wire ≤ 4 (both tips at 5 remain)
     q.set_archive_mode(true).unwrap();
     q.finalize_through(4).unwrap();
     ring.drop_through(4).unwrap();
     assert!(!ring.contains_height(4));
-    assert!(ring.contains_height(5));
+    assert_eq!(ring.get_all_at_height(5).len(), 2);
     let ep = q.archive_epoch();
     assert!(ep.archive_mode);
     assert_eq!(ep.finalized_height, Some(4));
     assert!(ep.is_soft_zone(5));
     assert!(!ep.is_soft_zone(4));
 
-    // Reopen epoch from disk
     let q2 = Query::open_or_create(td.store_path()).unwrap();
     assert_eq!(q2.archive_epoch().finalized_height, Some(4));
 
-    // Wire ring reloads from disk
     let ring2 = WireRing::with_dir(3, &wire_dir).unwrap();
-    assert!(ring2.contains_height(5));
+    assert_eq!(ring2.get_all_at_height(5).len(), 2);
 }
 
 #[test]

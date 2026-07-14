@@ -18,6 +18,7 @@ where
     let mut network = Network::Mainnet;
     let mut smoke = false;
     let mut listen: Option<SocketAddr> = None;
+    let mut electrum_listen: Option<SocketAddr> = None;
     let mut connect: Vec<SocketAddr> = Vec::new();
     let mut use_seeds = true;
 
@@ -26,7 +27,7 @@ where
         match a.as_ref() {
             "--help" | "-h" => {
                 eprintln!(
-                    "rbitcoin-node {} — usage: rbitcoin-node [--datadir PATH] [--network NET] \\\n  [--listen ADDR] [--connect ADDR]... [--no-seeds] [--smoke]",
+                    "rbitcoin-node {} — usage: rbitcoin-node [--datadir PATH] [--network NET] \\\n  [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] [--no-seeds] [--smoke]",
                     env!("CARGO_PKG_VERSION")
                 );
                 return ExitCode::SUCCESS;
@@ -97,6 +98,21 @@ where
                 }
                 i += 1;
             }
+            "--electrum-listen" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --electrum-listen requires a value");
+                    return ExitCode::from(2);
+                }
+                match args[i].to_string_lossy().parse::<SocketAddr>() {
+                    Ok(a) => electrum_listen = Some(a),
+                    Err(e) => {
+                        eprintln!("error: bad --electrum-listen: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
             other => {
                 eprintln!("error: unknown argument `{other}`");
                 return ExitCode::from(2);
@@ -109,6 +125,7 @@ where
         .with_network(network);
     config.smoke = smoke;
     config.p2p_listen = listen;
+    config.electrum_listen = electrum_listen;
     config.connect = connect;
     config.use_seeds = use_seeds;
 

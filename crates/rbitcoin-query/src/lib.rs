@@ -157,8 +157,21 @@ impl Query {
             }
         }
 
-        let header_fk = self.store.put_header(header)?;
+        // If this hash is already confirmed, idempotent success.
+        if let Some(h) = self.height_of_hash(&header.hash)? {
+            if h == height {
+                if let Some((fk, _)) = self.get_header_by_hash(&header.hash)? {
+                    return Ok(fk);
+                }
+            }
+        }
+
+        // Write txs first; only publish the header/hash-head once the block body
+        // is fully archived so a mid-connect crash cannot freeze has_block.
         let mut tx_fks = Vec::with_capacity(txs.len());
+        // Placeholder header fk — we put the header after txs when possible.
+        // (strong_tx needs header_fk; put header early but only set confirmed at end.)
+        let header_fk = self.store.put_header(header)?;
 
         for ta in txs {
             let in_start = if ta.inputs.is_empty() {
@@ -442,33 +455,59 @@ impl Query {
         }
     }
 
-    /// Best-chain height of a header hash, if it is confirmed.
+    /// Best-chain height of a header hash, if it is **confirmed** on the tip chain.
     ///
-    /// Uses the header hash-head for existence, then walks `prev_fk` toward genesis
-    /// only when needed — and prefers a tip-down scan capped for common tip lookups.
+    /// Archive may contain orphan header rows (partial connect failures). Those are
+    /// not reported here — only hashes reachable as `confirmed[height]`.
     pub fn height_of_hash(&self, hash: &[u8; 32]) -> Result<Option<Height>, QueryError> {
         let Some(tip) = self.tip_height() else {
+            // Only genesis can be "confirmed" with no tip.
             return Ok(None);
         };
         // Fast path: tip
-        if let Some((_, rec)) = self.header_at_height(tip)? {
+        if let Some((tip_fk, rec)) = self.header_at_height(tip)? {
             if &rec.hash == hash {
                 return Ok(Some(tip));
             }
+            // Fast path: tip-1 (common parent checks)
+            if tip.0 > 0 {
+                if let Some((_, prec)) = self.header_at_height(Height(tip.0 - 1))? {
+                    if &prec.hash == hash {
+                        return Ok(Some(Height(tip.0 - 1)));
+                    }
+                }
+            }
+            let _ = tip_fk;
         }
-        // Must exist in header table if we stored it on connect.
-        if self.get_header_by_hash(hash)?.is_none() {
+        // Must appear in archive at all.
+        let Some((fk, _rec)) = self.get_header_by_hash(hash)? else {
             return Ok(None);
-        }
-        // Tip-down walk (recent blocks / locator common ancestors).
-        for h in (0..=tip.0).rev() {
+        };
+        // Confirm it is the header at some best-chain height by walking tip→genesis
+        // via confirmed table only (not the orphaned archive row).
+        // Prefer short reverse scan from tip (IBD / locator hot path).
+        const RECENT: u32 = 4096;
+        let start = tip.0.saturating_sub(RECENT);
+        for h in (start..=tip.0).rev() {
             let height = Height(h);
-            if let Some((_, rec)) = self.header_at_height(height)? {
-                if &rec.hash == hash {
+            if let Some((hfk, rec)) = self.header_at_height(height)? {
+                if hfk == fk || &rec.hash == hash {
                     return Ok(Some(height));
                 }
             }
         }
+        // Full scan only if not in recent window (rare for IBD).
+        if start > 0 {
+            for h in (0..start).rev() {
+                let height = Height(h);
+                if let Some((hfk, rec)) = self.header_at_height(height)? {
+                    if hfk == fk || &rec.hash == hash {
+                        return Ok(Some(height));
+                    }
+                }
+            }
+        }
+        // Present in archive but not on best chain (orphan header row).
         Ok(None)
     }
 

@@ -96,9 +96,11 @@ impl ChainHub {
         if self.cache.get_block(hash).is_some() {
             return true;
         }
-        // O(1) header hash-head lookup (avoids full confirmed scan during IBD).
+        // Must be on the *confirmed* best chain — not merely present as an archive
+        // header row. Partial connect_block failures can leave hash-head entries
+        // without updating tip; treating those as "have" freezes IBD forever.
         self.query
-            .get_header_by_hash(&hash.to_byte_array())
+            .height_of_hash(&hash.to_byte_array())
             .ok()
             .flatten()
             .is_some()

@@ -342,8 +342,8 @@ pub async fn parallel_ibd(
                     added += 1;
                 }
                 if added > 0 {
-                    last_progress = Instant::now();
                     empty_header_streak = 0;
+                    // Headers alone are not tip progress; keep last_progress for gap detect.
                     // Full batch and backlog thin → pipeline more headers
                     if batch_len >= MAX_HEADERS_RESULTS && ordered.len() < window * 2 {
                         let _ = request_headers_from(&slots, peer, &hub, &mut header_req_seq);
@@ -372,7 +372,7 @@ pub async fn parallel_ibd(
                 let prev = block.header.prev_blockhash;
                 pool_by_prev.insert(prev, hash);
                 pool.insert(hash, block);
-                last_progress = Instant::now();
+                let tip_before = hub.tip_height();
                 drain_connect(
                     &hub,
                     &mut pool,
@@ -382,6 +382,11 @@ pub async fn parallel_ibd(
                     &accepted,
                     start_tip,
                 )?;
+                // Only tip advances count as progress (far-ahead pool fills must not
+                // mask a missing tip-next block).
+                if hub.tip_height() != tip_before {
+                    last_progress = Instant::now();
+                }
             }
             Ok(Some(PeerEvent::Dead { peer, reason })) => {
                 eprintln!("ibd: peer[{peer}] dead: {reason}");

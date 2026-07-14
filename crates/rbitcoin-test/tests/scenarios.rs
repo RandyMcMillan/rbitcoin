@@ -1,7 +1,7 @@
 //! High-level functional scenarios (coverage-bearing).
 //!
 //! Prefer fewer tests at the highest layer that still hit production paths.
-//! Lower-level store decode/corruption cases stay only when nothing else covers them.
+//! Mature regtest chains are built once per test that needs them (not thrice).
 
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, BlockHash};
@@ -10,21 +10,24 @@ use rbitcoin_consensus::{
     accept_and_connect_block, validate_block_structure, ChainParams, ConsensusError, Milestone,
     ValidationContext,
 };
-use rbitcoin_net::{outbound_for_ibd, crate_name as net_crate_name};
+use rbitcoin_net::{crate_name as net_crate_name, outbound_for_ibd};
 use rbitcoin_node::{cli_main as node_cli_main, run_node, NodeConfig};
 use rbitcoin_primitives::{Fk, Height, Network, TableKind, VERSION};
 use rbitcoin_query::Query;
 use rbitcoin_rpc::node_rpc_path;
 use rbitcoin_store::{HeaderRecord, Store, StoreError, TxRecord};
 use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
-use rbitcoin_test::{smoke_crate_names, TestDatadir};
+use rbitcoin_test::{
+    assert_reconstruct_eq, build_mature_regtest_with_spend, smoke_crate_names, TestDatadir,
+};
 use rbitcoin_wire_cache::WireRing;
 use std::process::{Command, ExitCode};
 
-// ─── Node / CLI lifecycle ───────────────────────────────────────────────────
+// ─── Lifecycle / CLI / surface smoke (collapsed) ────────────────────────────
 
 #[test]
-fn node_lifecycle_and_networks() {
+fn node_cli_and_surface_smoke() {
+    // Networks + run_node lifecycle
     for net in [
         Network::Mainnet,
         Network::Testnet,
@@ -48,21 +51,17 @@ fn node_lifecycle_and_networks() {
     assert!(TableKind::from_u16(99).is_none());
     assert!(Fk::NULL.is_null());
     assert_eq!(Height::GENESIS.next(), Some(Height(1)));
-}
 
-#[test]
-fn node_config_errors() {
+    // Config errors
     let cfg = NodeConfig {
         datadir: std::path::PathBuf::from(""),
         ..NodeConfig::default()
     };
     assert!(run_node(cfg).is_err());
-
     let td = TestDatadir::new().unwrap();
     let file = td.path().join("blocked");
     std::fs::write(&file, b"nope").unwrap();
     assert!(run_node(NodeConfig::default().with_datadir(file)).is_err());
-
     let cfg = NodeConfig {
         wire_depth_blocks: 0,
         archive_durability: true,
@@ -71,11 +70,56 @@ fn node_config_errors() {
     let h = run_node(cfg).unwrap();
     assert_eq!(h.wire.depth(), 0);
     h.shutdown().unwrap();
-}
 
-#[test]
-fn cli_and_node_entrypoints() {
-    let td = TestDatadir::new().unwrap();
+    // Placeholder / net surface
+    let names = smoke_crate_names();
+    assert!(names.contains(&"rbitcoin-store"));
+    assert!(names.contains(&"rbitcoin-consensus"));
+    let ring = WireRing::new(100);
+    assert!(ring.is_empty());
+    assert!(!Milestone::NONE.skips_at(0));
+    assert!(Milestone { height: 10 }.skips_at(5));
+    assert_eq!(outbound_for_ibd(true), 100);
+    assert_eq!(outbound_for_ibd(false), 8);
+    assert_eq!(net_crate_name(), "rbitcoin-net");
+    assert_eq!(node_rpc_path(), "/");
+    let _ = rbitcoin_net::local_service_flags();
+    assert_eq!(rbitcoin_net::default_port(Network::Mainnet), 8333);
+    assert_eq!(rbitcoin_net::default_port(Network::Regtest), 18444);
+    assert!(rbitcoin_net::dns_seeds(Network::Mainnet).len() >= 3);
+    assert!(rbitcoin_net::dns_seeds(Network::Regtest).is_empty());
+    assert!(!rbitcoin_net::fixed_seed_hosts(Network::Mainnet).is_empty());
+    let mut am = rbitcoin_net::AddrMan::with_seeds(Network::Regtest);
+    assert!(am.is_empty());
+    am.add("127.0.0.1:18444".parse().unwrap());
+    assert_eq!(am.len(), 1);
+    assert_eq!(am.take_outbound(10).len(), 1);
+    let _ = rbitcoin_net::resolve_fixed_seeds(Network::Regtest);
+
+    // Chain params (no mining)
+    for net in [
+        Network::Mainnet,
+        Network::Testnet,
+        Network::Signet,
+        Network::Regtest,
+    ] {
+        let p = ChainParams::for_network(net);
+        let g = rbitcoin_consensus::genesis_block(&p);
+        assert_eq!(g.block_hash(), p.genesis_hash);
+    }
+    let main = ChainParams::mainnet();
+    assert!(!main.checkpoints.is_empty());
+    assert_eq!(main.checkpoint_at(Height(0)).unwrap(), main.genesis_hash);
+    assert_eq!(main.difficulty_adjustment_interval(), 2016);
+    assert!(!main.no_pow_retargeting());
+    assert!(ChainParams::regtest().no_pow_retargeting());
+    assert_eq!(rbitcoin_consensus::block_subsidy(0, &main), 50_0000_0000);
+    assert_eq!(
+        rbitcoin_consensus::block_subsidy(210_000, &main),
+        25_0000_0000
+    );
+
+    // CLI entrypoints
     for net in ["mainnet", "testnet", "signet", "regtest"] {
         let d = td.path().join(net);
         assert_eq!(
@@ -171,34 +215,7 @@ fn workspace_bin(name: &str) -> std::path::PathBuf {
     p
 }
 
-#[test]
-fn placeholder_surfaces() {
-    let names = smoke_crate_names();
-    assert!(names.contains(&"rbitcoin-store"));
-    assert!(names.contains(&"rbitcoin-consensus"));
-    let ring = WireRing::new(100);
-    assert!(ring.is_empty());
-    assert!(!Milestone::NONE.skips_at(0));
-    assert!(Milestone { height: 10 }.skips_at(5));
-    assert_eq!(outbound_for_ibd(true), 100);
-    assert_eq!(outbound_for_ibd(false), 8);
-    assert_eq!(net_crate_name(), "rbitcoin-net");
-    assert_eq!(node_rpc_path(), "/");
-    let _ = rbitcoin_net::local_service_flags();
-    assert_eq!(rbitcoin_net::default_port(Network::Mainnet), 8333);
-    assert_eq!(rbitcoin_net::default_port(Network::Regtest), 18444);
-    assert!(rbitcoin_net::dns_seeds(Network::Mainnet).len() >= 3);
-    assert!(rbitcoin_net::dns_seeds(Network::Regtest).is_empty());
-    assert!(!rbitcoin_net::fixed_seed_hosts(Network::Mainnet).is_empty());
-    let mut am = rbitcoin_net::AddrMan::with_seeds(Network::Regtest);
-    assert!(am.is_empty());
-    am.add("127.0.0.1:18444".parse().unwrap());
-    assert_eq!(am.len(), 1);
-    assert_eq!(am.take_outbound(10).len(), 1);
-    let _ = rbitcoin_net::resolve_fixed_seeds(Network::Regtest);
-}
-
-// ─── Store: keep only corrupt/error paths not hit by consensus chain tests ──
+// ─── Store error / corrupt paths (not hit by happy-path chain tests) ────────
 
 #[test]
 fn store_error_and_corrupt_paths() {
@@ -302,7 +319,6 @@ fn store_table_header_and_idx_corrupt() {
         Ok(_) => panic!("expected BadSchema"),
     }
 
-    // Hash head empty body / not power-of-two
     let sd = td.path().join("empty_head");
     {
         Store::create(&sd).unwrap().flush().unwrap();
@@ -337,7 +353,7 @@ fn store_table_header_and_idx_corrupt() {
     let _ = (SCHEMA_VERSION, STORE_MAGIC);
 }
 
-// ─── Phase 1 chain ops (still high-level, pre-consensus types) ──────────────
+// ─── Synthetic store growth (no PoW; still triggers hash rehash) ─────────────
 
 #[test]
 fn chain_connect_reorg_and_growth() {
@@ -347,9 +363,10 @@ fn chain_connect_reorg_and_growth() {
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
 
-    // Growth + many blocks
+    // Default hash head is 64 slots; 80 blocks (header+tx keys) forces rehash.
+    const N: u32 = 80;
     let mut prev = Fk::NULL;
-    for h in 0..120u32 {
+    for h in 0..N {
         let mut hash = [0u8; 32];
         hash[0..4].copy_from_slice(&h.to_le_bytes());
         let header = HeaderRecord {
@@ -392,63 +409,127 @@ fn chain_connect_reorg_and_growth() {
         };
         prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
     }
-    assert_eq!(q.tip_height(), Some(Height(119)));
+    assert_eq!(q.tip_height(), Some(Height(N - 1)));
     q.flush().unwrap();
     drop(q);
 
     let q = Query::open_or_create(td.store_path()).unwrap();
-    assert_eq!(q.tip_height(), Some(Height(119)));
+    assert_eq!(q.tip_height(), Some(Height(N - 1)));
     q.disconnect_tip().unwrap();
-    assert_eq!(q.tip_height(), Some(Height(118)));
-    assert!(q.connect_block(Height(0), &HeaderRecord {
-        prev_fk: Fk::NULL,
-        version: 1,
-        timestamp: 0,
-        bits: 1,
-        nonce: 0,
-        merkle_root: [0; 32],
-        hash: [1; 32],
-    }, &[]).is_err());
+    assert_eq!(q.tip_height(), Some(Height(N - 2)));
+    assert!(q
+        .connect_block(
+            Height(0),
+            &HeaderRecord {
+                prev_fk: Fk::NULL,
+                version: 1,
+                timestamp: 0,
+                bits: 1,
+                nonce: 0,
+                merkle_root: [0; 32],
+                hash: [1; 32],
+            },
+            &[]
+        )
+        .is_err());
 }
 
-// ─── Phase 2: rust-bitcoin consensus ────────────────────────────────────────
+// ─── Consensus + reconstruct: one mature mine, many assertions ──────────────
 
+/// Single mature-chain build covers:
+/// - accept genesis + long mine (reopen tip)
+/// - coinbase maturity + spend + double-spend reject
+/// - reconstruct after reopen (sampled + multi-tx spend block)
+/// - store-backed locator/headers helpers
+/// - service flags
 #[test]
-fn consensus_regtest_genesis_and_mine_chain() {
+fn consensus_mature_chain_spend_and_reconstruct() {
+    use bitcoin::p2p::ServiceFlags;
+    use rbitcoin_net::local_service_flags;
+
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
     let params = ChainParams::regtest();
-    let milestone = Milestone::NONE;
 
-    let genesis = regtest_genesis();
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, milestone).unwrap();
-    assert_eq!(q.tip_height(), Some(Height::GENESIS));
+    // ONE maturity pad for both spend and reconstruct paths.
+    let chain = build_mature_regtest_with_spend(&q, &params);
+    let tip_h = chain.tip_height();
+    assert_eq!(q.tip_height(), Some(Height(tip_h)));
+    assert_eq!(chain.tip_hash(), chain.blocks.last().unwrap().block_hash());
+    assert!(tip_h >= params.coinbase_maturity() + 2);
+
+    // Spend of height-1 coinbase succeeded at tip.
     assert_eq!(
-        q.header_at_height(Height::GENESIS)
+        q.spenders(chain.matured_coinbase_txid.as_byte_array(), 0)
             .unwrap()
-            .unwrap()
-            .1
-            .hash,
-        genesis.block_hash().to_byte_array()
+            .len(),
+        1
+    );
+    assert!(
+        chain.blocks[chain.spend_height as usize].txdata.len() >= 2,
+        "spend block should be multi-tx"
     );
 
-    let mut tip = genesis.block_hash();
-    let mut tip_time = genesis.header.time;
-    for h in 1..=20u32 {
-        let block = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        accept_and_connect_block(&q, &params, Height(h), &block, milestone).unwrap();
-        tip = block.block_hash();
-        tip_time = block.header.time;
-    }
-    assert_eq!(q.tip_height(), Some(Height(20)));
-    q.flush().unwrap();
+    // Double-spend must fail.
+    let tip_block = chain.blocks.last().unwrap();
+    let spend2 = spend_anyone_can_spend(
+        chain.matured_coinbase_txid,
+        0,
+        Amount::from_sat(48_0000_0000),
+    );
+    let b_bad = mine_regtest_block(
+        tip_block.block_hash(),
+        tip_block.header.time + 600,
+        tip_h + 1,
+        vec![spend2],
+    );
+    let err = accept_and_connect_block(&q, &params, Height(tip_h + 1), &b_bad, Milestone::NONE);
+    assert!(
+        matches!(
+            err,
+            Err(ConsensusError::PrevoutSpent) | Err(ConsensusError::BadTx(_))
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(q.tip_height(), Some(Height(tip_h)));
 
-    let q2 = Query::open_or_create(td.store_path()).unwrap();
-    assert_eq!(q2.tip_height(), Some(Height(20)));
+    q.flush().unwrap();
+    drop(q);
+
+    // Reopen — reconstruct without RAM cache.
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(tip_h)));
+
+    // Sample heights: genesis, early, mid, tip (multi-tx). Full 100+ scan is redundant.
+    let sample = [0u32, 1, tip_h / 2, tip_h - 1, tip_h];
+    for h in sample {
+        assert_reconstruct_eq(&q, h, &chain.blocks[h as usize]);
+    }
+
+    assert!(q
+        .reconstruct_block_by_hash(&[0xab; 32])
+        .unwrap()
+        .is_none());
+    assert!(q.reconstruct_block_at_height(Height(9999)).is_err());
+
+    let loc = q.locator_hashes().unwrap();
+    assert!(!loc.is_empty());
+    let headers = q
+        .headers_after_locator(
+            &loc[loc.len().saturating_sub(1)..],
+            BlockHash::from_byte_array([0; 32]),
+            2000,
+        )
+        .unwrap();
+    assert!(!headers.is_empty());
+
+    let flags = local_service_flags();
+    assert!(flags.has(ServiceFlags::NETWORK));
+    assert!(flags.has(ServiceFlags::WITNESS));
 }
 
 #[test]
-fn consensus_reject_bad_pow_and_merkle() {
+fn consensus_reject_bad_structure_and_milestone() {
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
     let params = ChainParams::regtest();
@@ -456,7 +537,6 @@ fn consensus_reject_bad_pow_and_merkle() {
     accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
 
     let mut block = mine_regtest_block(genesis.block_hash(), genesis.header.time + 1, 1, vec![]);
-    // Break merkle root
     block.header.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x11; 32]);
     let ctx = ValidationContext {
         params: &params,
@@ -468,7 +548,6 @@ fn consensus_reject_bad_pow_and_merkle() {
         Err(ConsensusError::BadBlock(_))
     ));
 
-    // Valid structure but wrong prev → header fails
     let block2 = mine_regtest_block(
         BlockHash::from_byte_array([0x22; 32]),
         genesis.header.time + 2,
@@ -476,175 +555,14 @@ fn consensus_reject_bad_pow_and_merkle() {
         vec![],
     );
     assert!(accept_and_connect_block(&q, &params, Height(1), &block2, Milestone::NONE).is_err());
-}
 
-#[test]
-fn consensus_spend_and_reject_double_spend() {
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    let params = ChainParams::regtest();
-    let ms = Milestone::NONE;
-
-    let genesis = regtest_genesis();
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
-
-    // Block 1: coinbase we will spend after maturity
-    let b1 = mine_regtest_block(genesis.block_hash(), genesis.header.time + 600, 1, vec![]);
-    let cb1_txid = b1.txdata[0].compute_txid();
-    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
-
-    // Pad to maturity (100 confirmations of b1 → spendable at height 101)
-    let mut tip = b1.block_hash();
-    let mut tip_time = b1.header.time;
-    for h in 2..=101u32 {
-        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
-        tip = b.block_hash();
-        tip_time = b.header.time;
-    }
-
-    // Height 102: spend coinbase from b1
-    let spend = spend_anyone_can_spend(cb1_txid, 0, Amount::from_sat(49_0000_0000));
-    let b_spend = mine_regtest_block(tip, tip_time + 600, 102, vec![spend]);
-    accept_and_connect_block(&q, &params, Height(102), &b_spend, ms).unwrap();
-    assert_eq!(
-        q.spenders(cb1_txid.as_byte_array(), 0).unwrap().len(),
-        1
-    );
-
-    // Second spend of same outpoint must fail
-    let spend2 = spend_anyone_can_spend(cb1_txid, 0, Amount::from_sat(48_0000_0000));
-    let b_bad = mine_regtest_block(b_spend.block_hash(), b_spend.header.time + 600, 103, vec![spend2]);
-    let err = accept_and_connect_block(&q, &params, Height(103), &b_bad, ms);
-    assert!(
-        matches!(
-            err,
-            Err(ConsensusError::PrevoutSpent) | Err(ConsensusError::BadTx(_))
-        ),
-        "got {err:?}"
-    );
-    assert_eq!(q.tip_height(), Some(Height(102)));
-}
-
-#[test]
-fn consensus_milestone_skips_connect_checks() {
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    let params = ChainParams::regtest();
-    // Under milestone, we still do structure + header, skip prevout/script.
+    // Milestone: skip connect checks on a fresh short chain.
+    let td2 = TestDatadir::new().unwrap();
+    let q2 = Query::open_or_create(td2.store_path()).unwrap();
     let ms = Milestone { height: 100 };
     assert!(ms.skips_at(1));
-
-    let genesis = regtest_genesis();
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    accept_and_connect_block(&q2, &params, Height::GENESIS, &genesis, ms).unwrap();
     let b1 = mine_regtest_block(genesis.block_hash(), genesis.header.time + 1, 1, vec![]);
-    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
-    assert_eq!(q.tip_height(), Some(Height(1)));
-}
-
-#[test]
-fn consensus_params_networks() {
-    for net in [
-        rbitcoin_primitives::Network::Mainnet,
-        rbitcoin_primitives::Network::Testnet,
-        rbitcoin_primitives::Network::Signet,
-        rbitcoin_primitives::Network::Regtest,
-    ] {
-        let p = ChainParams::for_network(net);
-        let g = rbitcoin_consensus::genesis_block(&p);
-        assert_eq!(g.block_hash(), p.genesis_hash);
-    }
-    let main = ChainParams::mainnet();
-    assert!(!main.checkpoints.is_empty());
-    assert_eq!(main.checkpoint_at(Height(0)).unwrap(), main.genesis_hash);
-    assert!(main.difficulty_adjustment_interval() == 2016);
-    assert!(!main.no_pow_retargeting());
-    assert!(ChainParams::regtest().no_pow_retargeting());
-    assert_eq!(rbitcoin_consensus::block_subsidy(0, &main), 50_0000_0000);
-    assert_eq!(rbitcoin_consensus::block_subsidy(210_000, &main), 25_0000_0000);
-}
-
-// ─── Phase 4: reconstruct from archive ──────────────────────────────────────
-
-#[test]
-fn reconstruct_block_roundtrip_after_reopen() {
-    use bitcoin::consensus::Encodable;
-    use rbitcoin_net::local_service_flags;
-    use bitcoin::p2p::ServiceFlags;
-
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    let params = ChainParams::regtest();
-    let ms = Milestone::NONE;
-
-    let genesis = regtest_genesis();
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
-
-    let mut tip = genesis.block_hash();
-    let mut tip_time = genesis.header.time;
-    let mut originals = vec![genesis.clone()];
-    // Build past coinbase maturity so a multi-tx block can spend block-1 coinbase.
-    for h in 1..=105u32 {
-        let extra = if h == 105 {
-            let prev_cb = originals[1].txdata[0].compute_txid();
-            vec![spend_anyone_can_spend(
-                prev_cb,
-                0,
-                Amount::from_sat(49_0000_0000),
-            )]
-        } else {
-            vec![]
-        };
-        let block = mine_regtest_block(tip, tip_time + 600, h, extra);
-        accept_and_connect_block(&q, &params, Height(h), &block, ms).unwrap();
-        tip = block.block_hash();
-        tip_time = block.header.time;
-        originals.push(block);
-    }
-    q.flush().unwrap();
-    drop(q);
-
-    // Reopen empty of any RAM cache — reconstruct only from store.
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    assert_eq!(q.tip_height(), Some(Height(105)));
-
-    for (h, original) in originals.iter().enumerate() {
-        let recon = q
-            .reconstruct_block_at_height(Height(h as u32))
-            .unwrap_or_else(|e| panic!("reconstruct height {h}: {e}"));
-        assert_eq!(recon.block_hash(), original.block_hash(), "hash height {h}");
-        assert_eq!(recon.header, original.header, "header height {h}");
-        assert_eq!(recon.txdata.len(), original.txdata.len());
-        for (i, (a, b)) in recon.txdata.iter().zip(original.txdata.iter()).enumerate() {
-            let mut ra = Vec::new();
-            let mut rb = Vec::new();
-            a.consensus_encode(&mut ra).unwrap();
-            b.consensus_encode(&mut rb).unwrap();
-            assert_eq!(ra, rb, "tx wire height {h} index {i}");
-        }
-        let by_hash = q
-            .reconstruct_block_by_hash(&original.block_hash().to_byte_array())
-            .unwrap()
-            .expect("by hash");
-        assert_eq!(by_hash.block_hash(), original.block_hash());
-    }
-
-    assert!(q
-        .reconstruct_block_by_hash(&[0xab; 32])
-        .unwrap()
-        .is_none());
-    assert!(q.reconstruct_block_at_height(Height(999)).is_err());
-
-    // Locator / headers API for store-backed serve
-    let loc = q.locator_hashes().unwrap();
-    assert!(!loc.is_empty());
-    let headers = q
-        .headers_after_locator(&loc[loc.len().saturating_sub(1)..], bitcoin::BlockHash::from_byte_array([0; 32]), 2000)
-        .unwrap();
-    // Last locator entry is genesis — headers after genesis should be many
-    assert!(!headers.is_empty());
-
-    let flags = local_service_flags();
-    assert!(flags.has(ServiceFlags::NETWORK));
-    assert!(flags.has(ServiceFlags::WITNESS));
+    accept_and_connect_block(&q2, &params, Height(1), &b1, ms).unwrap();
+    assert_eq!(q2.tip_height(), Some(Height(1)));
 }

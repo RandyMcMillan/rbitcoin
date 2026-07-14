@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Enforce 100% line and branch coverage on first-party crates.
+# Enforce 100% line coverage on first-party crates (HTML uncovered-line = 0).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,9 +27,15 @@ fi
 IGNORE='(/\.cargo/|/rustc-|/nix/store/|library/std/|/src/main\.rs$)'
 
 if command -v cargo-llvm-cov >/dev/null 2>&1 || cargo llvm-cov --version >/dev/null 2>&1; then
-  cargo llvm-cov clean --workspace
+  # Default: do NOT clean instrumented artifacts. Incremental llvm-cov rebuilds
+  # are much faster for iterative work and still re-run all tests with coverage.
+  # Force a full clean when debugging stale counters: COVERAGE_CLEAN=1 ./scripts/coverage.sh
+  if [[ "${COVERAGE_CLEAN:-0}" == "1" ]]; then
+    echo "COVERAGE_CLEAN=1: wiping llvm-cov workspace artifacts"
+    cargo llvm-cov clean --workspace
+  fi
+
   # Branch coverage requires nightly on many toolchains; always enforce 100% lines.
-  # When --branch is supported, also enforce 100% branches.
   EXTRA=()
   if cargo llvm-cov test --help 2>&1 | grep -q -- '--fail-under-branches'; then
     if rustc -vV 2>/dev/null | grep -q nightly; then
@@ -65,6 +71,7 @@ if command -v cargo-llvm-cov >/dev/null 2>&1 || cargo llvm-cov --version >/dev/n
     --lcov --output-path "$ROOT/coverage/lcov.info" || true
   echo "Coverage OK: 0 uncovered executable lines (see coverage/index.html)"
   echo "Note: full branch coverage requires nightly; region-partial lines may still appear in text report."
+  echo "Tip: set COVERAGE_CLEAN=1 only when you need a cold instrumented rebuild."
   exit 0
 fi
 

@@ -2,7 +2,12 @@
 //!
 //! Prefer writing scenarios in `tests/` that exercise public crate APIs.
 
+pub mod chain_fixture;
 pub mod mine;
+
+pub use chain_fixture::{
+    assert_reconstruct_eq, build_mature_regtest_with_spend, MatureRegtestChain,
+};
 
 use std::path::PathBuf;
 use tempfile::TempDir;

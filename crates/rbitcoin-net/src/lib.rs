@@ -8,6 +8,7 @@ mod service;
 
 pub use cache::BlockCache;
 pub use error::NetError;
+pub use peer::local_service_flags;
 pub use service::{magic_for, NetConfig, P2PHandle, P2PNode};
 
 pub fn crate_name() -> &'static str {

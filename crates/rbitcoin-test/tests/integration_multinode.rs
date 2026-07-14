@@ -4,6 +4,7 @@
 //! Heavier topology checks are `#[ignore]` and run via `scripts/integration.sh`
 //! (periodic / CI nightly).
 
+use bitcoin::hashes::Hash;
 use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_net::P2PNode;
 use rbitcoin_primitives::Height;
@@ -61,6 +62,62 @@ async fn two_node_header_and_block_sync() {
         peer.cache.tip_hash().unwrap(),
         seed.cache.tip_hash().unwrap()
     );
+
+    seed.shutdown().await;
+    peer.shutdown().await;
+}
+
+/// Phase 4: seeder shuts down and restarts with empty RAM cache; peer still IBD-syncs
+/// via store-backed getheaders + reconstruct getdata.
+#[tokio::test]
+async fn serve_after_restart_via_reconstruct() {
+    let seed_dir = TempDir::new().unwrap();
+    let peer_dir = TempDir::new().unwrap();
+
+    let seed = start_node(&seed_dir).await;
+    seed_chain(&seed, 10).await;
+    let tip_hash = seed.cache.tip_hash().unwrap();
+    seed.shutdown().await;
+
+    // Restart seeder on same store — cache is empty; serve must use reconstruct.
+    let seed = start_node(&seed_dir).await;
+    assert!(
+        seed.cache.is_empty(),
+        "restarted seeder must not rely on warm RAM cache"
+    );
+    assert_eq!(seed.query.tip_height(), Some(Height(10)));
+
+    let peer = start_node(&peer_dir).await;
+    let n = peer.sync_from(seed.local_addr).await.expect("sync after restart");
+    assert!(n >= 10, "downloaded {n}");
+    peer.wait_height(10, Duration::from_secs(10))
+        .await
+        .expect("tip");
+
+    assert_eq!(peer.query.tip_height(), Some(Height(10)));
+    let peer_tip = peer
+        .query
+        .header_at_height(Height(10))
+        .unwrap()
+        .unwrap()
+        .1
+        .hash;
+    assert_eq!(peer_tip, tip_hash.to_byte_array());
+
+    // Peer can reconstruct every height from its own store.
+    for h in 0..=10u32 {
+        let b = peer
+            .query
+            .reconstruct_block_at_height(Height(h))
+            .expect("peer reconstruct");
+        assert_eq!(b.header.block_hash().to_byte_array(), peer
+            .query
+            .header_at_height(Height(h))
+            .unwrap()
+            .unwrap()
+            .1
+            .hash);
+    }
 
     seed.shutdown().await;
     peer.shutdown().await;

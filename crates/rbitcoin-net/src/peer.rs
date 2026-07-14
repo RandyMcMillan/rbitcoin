@@ -10,10 +10,16 @@ use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Magic, ServiceFlags, PROTOCOL_VERSION};
 use bitcoin::BlockHash;
+use rbitcoin_query::Query;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
+
+/// Services we advertise once store-backed reconstruct serve is available.
+pub fn local_service_flags() -> ServiceFlags {
+    ServiceFlags::NETWORK | ServiceFlags::WITNESS
+}
 
 pub async fn handshake(
     stream: &mut TcpStream,
@@ -23,7 +29,7 @@ pub async fn handshake(
     start_height: i32,
     inbound: bool,
 ) -> Result<VersionMessage, NetError> {
-    let services = ServiceFlags::NETWORK;
+    let services = local_service_flags();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -93,11 +99,12 @@ fn rand_nonce() -> u64 {
     h.finish()
 }
 
-/// Serve peer: respond to getheaders/getdata/ping; ignore tx inv.
+/// Serve peer: respond to getheaders/getdata/ping from store (reconstruct) + optional RAM cache.
 pub async fn serve_peer_loop(
     mut stream: TcpStream,
     magic: Magic,
     cache: Arc<BlockCache>,
+    query: Arc<Query>,
 ) -> Result<(), NetError> {
     loop {
         let msg = match read_msg(&mut stream).await {
@@ -115,14 +122,14 @@ pub async fn serve_peer_loop(
                 write_msg(&mut stream, magic, NetworkMessage::Pong(*n)).await?;
             }
             NetworkMessage::GetHeaders(gh) => {
-                let headers = cache.headers_after_locator(&gh.locator_hashes, gh.stop_hash);
+                let headers = headers_for_peer(cache.as_ref(), query.as_ref(), gh)?;
                 write_msg(&mut stream, magic, NetworkMessage::Headers(headers)).await?;
             }
             NetworkMessage::GetData(inv) => {
                 for item in inv {
                     match item {
                         Inventory::Block(h) | Inventory::WitnessBlock(h) => {
-                            if let Some(block) = cache.get_block(h) {
+                            if let Some(block) = block_for_peer(cache.as_ref(), query.as_ref(), h)? {
                                 write_msg(&mut stream, magic, NetworkMessage::Block(block))
                                     .await?;
                             }
@@ -151,18 +158,48 @@ pub async fn serve_peer_loop(
     }
 }
 
+fn headers_for_peer(
+    cache: &BlockCache,
+    query: &Query,
+    gh: &bitcoin::p2p::message_blockdata::GetHeadersMessage,
+) -> Result<Vec<bitcoin::block::Header>, NetError> {
+    // Prefer store-backed headers (works after restart). Fall back to RAM cache.
+    match query.headers_after_locator(&gh.locator_hashes, gh.stop_hash, 2000) {
+        Ok(h) if !h.is_empty() || query.tip_height().is_some() => Ok(h),
+        Ok(_) => Ok(cache.headers_after_locator(&gh.locator_hashes, gh.stop_hash)),
+        Err(e) => Err(NetError::Consensus(e.to_string())),
+    }
+}
+
+fn block_for_peer(
+    cache: &BlockCache,
+    query: &Query,
+    hash: &BlockHash,
+) -> Result<Option<bitcoin::Block>, NetError> {
+    if let Some(block) = cache.get_block(hash) {
+        return Ok(Some(block));
+    }
+    match query.reconstruct_block_by_hash(&hash.to_byte_array()) {
+        Ok(b) => Ok(b),
+        Err(e) => Err(NetError::Consensus(e.to_string())),
+    }
+}
+
 /// Outbound sync: getheaders until caught up, then getdata for missing blocks in order.
 /// Calls `on_block` for each downloaded block (height, block).
+///
+/// `local_tip_height` / `local_has` / `local_locator` come from store or cache so restart sync works.
 pub async fn sync_from_peer(
     stream: &mut TcpStream,
     magic: Magic,
-    local_cache: &BlockCache,
+    local_locator: Vec<BlockHash>,
+    mut local_has: impl FnMut(&BlockHash) -> bool,
     mut on_block: impl FnMut(u32, bitcoin::Block) -> Result<(), NetError>,
 ) -> Result<u32, NetError> {
     let mut downloaded = 0u32;
+    let mut locator = local_locator;
     loop {
-        let locator = local_cache.locator();
-        let gh = GetHeadersMessage::new(locator, BlockHash::from_byte_array([0u8; 32]));
+        let gh = GetHeadersMessage::new(locator.clone(), BlockHash::from_byte_array([0u8; 32]));
         write_msg(stream, magic, NetworkMessage::GetHeaders(gh)).await?;
 
         let headers = loop {
@@ -187,15 +224,17 @@ pub async fn sync_from_peer(
         let mut inv = Vec::new();
         for hdr in &headers {
             let hash = hdr.block_hash();
-            if local_cache.get_block(&hash).is_none() {
+            if !local_has(&hash) {
                 inv.push(Inventory::WitnessBlock(hash));
             }
         }
         if inv.is_empty() {
-            // Peer sent headers we already have — stop
+            // Peer sent headers we already have — stop if short batch
             if headers.len() < 2000 {
                 break;
             }
+            // Advance locator from last header
+            locator = vec![headers.last().unwrap().block_hash()];
             continue;
         }
 
@@ -210,9 +249,8 @@ pub async fn sync_from_peer(
             }
             match msg.payload() {
                 NetworkMessage::Block(block) => {
-                    let height = local_cache.tip_height().map(|h| h + 1).unwrap_or(0);
-                    on_block(height, block.clone())?;
-                    // Caller is responsible for updating local_cache via on_block
+                    // Height is assigned by the accept callback's store tip+1
+                    on_block(0, block.clone())?;
                     got += 1;
                     downloaded += 1;
                 }
@@ -226,6 +264,8 @@ pub async fn sync_from_peer(
             }
         }
 
+        // Update locator for next round from last header in batch
+        locator = vec![headers.last().unwrap().block_hash()];
         if headers.len() < 2000 {
             break;
         }

@@ -168,6 +168,7 @@ fn placeholder_surfaces() {
     assert_eq!(outbound_for_ibd(false), 8);
     assert_eq!(net_crate_name(), "rbitcoin-net");
     assert_eq!(node_rpc_path(), "/");
+    let _ = rbitcoin_net::local_service_flags();
 }
 
 // ─── Store: keep only corrupt/error paths not hit by consensus chain tests ──
@@ -516,4 +517,89 @@ fn consensus_params_networks() {
         let g = rbitcoin_consensus::genesis_block(&p);
         assert_eq!(g.block_hash(), p.genesis_hash);
     }
+}
+
+// ─── Phase 4: reconstruct from archive ──────────────────────────────────────
+
+#[test]
+fn reconstruct_block_roundtrip_after_reopen() {
+    use bitcoin::consensus::Encodable;
+    use rbitcoin_net::local_service_flags;
+    use bitcoin::p2p::ServiceFlags;
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    let mut originals = vec![genesis.clone()];
+    for h in 1..=12u32 {
+        // Mix in a spend path on later blocks for multi-tx reconstruct
+        let extra = if h == 5 {
+            let prev_cb = originals[1].txdata[0].compute_txid();
+            vec![spend_anyone_can_spend(
+                prev_cb,
+                0,
+                Amount::from_sat(49_0000_0000),
+            )]
+        } else {
+            vec![]
+        };
+        let block = mine_regtest_block(tip, tip_time + 600, h, extra);
+        accept_and_connect_block(&q, &params, Height(h), &block, ms).unwrap();
+        tip = block.block_hash();
+        tip_time = block.header.time;
+        originals.push(block);
+    }
+    q.flush().unwrap();
+    drop(q);
+
+    // Reopen empty of any RAM cache — reconstruct only from store.
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(12)));
+
+    for (h, original) in originals.iter().enumerate() {
+        let recon = q
+            .reconstruct_block_at_height(Height(h as u32))
+            .unwrap_or_else(|e| panic!("reconstruct height {h}: {e}"));
+        assert_eq!(recon.block_hash(), original.block_hash(), "hash height {h}");
+        assert_eq!(recon.header, original.header, "header height {h}");
+        assert_eq!(recon.txdata.len(), original.txdata.len());
+        for (i, (a, b)) in recon.txdata.iter().zip(original.txdata.iter()).enumerate() {
+            let mut ra = Vec::new();
+            let mut rb = Vec::new();
+            a.consensus_encode(&mut ra).unwrap();
+            b.consensus_encode(&mut rb).unwrap();
+            assert_eq!(ra, rb, "tx wire height {h} index {i}");
+        }
+        let by_hash = q
+            .reconstruct_block_by_hash(&original.block_hash().to_byte_array())
+            .unwrap()
+            .expect("by hash");
+        assert_eq!(by_hash.block_hash(), original.block_hash());
+    }
+
+    assert!(q
+        .reconstruct_block_by_hash(&[0xab; 32])
+        .unwrap()
+        .is_none());
+    assert!(q.reconstruct_block_at_height(Height(99)).is_err());
+
+    // Locator / headers API for store-backed serve
+    let loc = q.locator_hashes().unwrap();
+    assert!(!loc.is_empty());
+    let headers = q
+        .headers_after_locator(&loc[loc.len().saturating_sub(1)..], bitcoin::BlockHash::from_byte_array([0; 32]), 2000)
+        .unwrap();
+    // Last locator entry is genesis — headers after genesis should be many
+    assert!(!headers.is_empty());
+
+    let flags = local_service_flags();
+    assert!(flags.has(ServiceFlags::NETWORK));
+    assert!(flags.has(ServiceFlags::WITNESS));
 }

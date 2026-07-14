@@ -1,5 +1,9 @@
 //! Domain query layer over [`rbitcoin_store::Store`].
 
+use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};
+use bitcoin::consensus::Decodable;
+use bitcoin::hashes::Hash;
+use bitcoin::{Block, BlockHash, CompactTarget, Transaction, TxMerkleNode};
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_store::{
     HeaderRecord, InputRecord, OutputRecord, PointRecord, Store, StoreError, TxRecord,
@@ -215,12 +219,163 @@ impl Query {
         }
     }
 
+    /// Best-chain height of a header hash, if it is confirmed.
+    pub fn height_of_hash(&self, hash: &[u8; 32]) -> Result<Option<Height>, QueryError> {
+        let Some(tip) = self.tip_height() else {
+            return Ok(None);
+        };
+        // Walk from tip down; confirmed chain is contiguous from 0.
+        for h in (0..=tip.0).rev() {
+            let height = Height(h);
+            if let Some((_, rec)) = self.header_at_height(height)? {
+                if &rec.hash == hash {
+                    return Ok(Some(height));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Wire header for a confirmed height (resolves prev hash from archive).
+    pub fn wire_header_at_height(&self, height: Height) -> Result<BlockHeader, QueryError> {
+        let (_fk, rec) = self
+            .header_at_height(height)?
+            .ok_or(StoreError::NotFound)?;
+        self.wire_header_from_record(&rec)
+    }
+
+    fn wire_header_from_record(&self, rec: &HeaderRecord) -> Result<BlockHeader, QueryError> {
+        let prev_blockhash = if rec.prev_fk.is_null() {
+            BlockHash::from_byte_array([0u8; 32])
+        } else {
+            let prev = self.store.get_header(rec.prev_fk)?;
+            BlockHash::from_byte_array(prev.hash)
+        };
+        Ok(wire_header(rec, prev_blockhash))
+    }
+
+    /// Reconstruct a full wire block at a confirmed height from the relational archive.
+    ///
+    /// Uses header fields + ordered `TxRecord.raw` (full witness consensus encoding).
+    pub fn reconstruct_block_at_height(&self, height: Height) -> Result<Block, QueryError> {
+        let header = self.wire_header_at_height(height)?;
+        let tx_fks = self.block_tx_fks(height)?;
+        if tx_fks.is_empty() {
+            return Err(StoreError::Corrupt("block has no transactions"));
+        }
+        let mut txdata = Vec::with_capacity(tx_fks.len());
+        for fk in tx_fks {
+            let rec = self.get_tx(fk)?;
+            let tx = decode_tx_raw(&rec.raw)?;
+            txdata.push(tx);
+        }
+        let block = Block { header, txdata };
+        // Integrity: reconstructed hash must match stored header hash.
+        let (_fk, stored) = self
+            .header_at_height(height)?
+            .ok_or(StoreError::NotFound)?;
+        if block.block_hash().to_byte_array() != stored.hash {
+            return Err(StoreError::Corrupt("reconstruct hash mismatch"));
+        }
+        Ok(block)
+    }
+
+    /// Reconstruct by block hash if the hash is on the best (confirmed) chain.
+    pub fn reconstruct_block_by_hash(&self, hash: &[u8; 32]) -> Result<Option<Block>, QueryError> {
+        match self.height_of_hash(hash)? {
+            None => Ok(None),
+            Some(h) => Ok(Some(self.reconstruct_block_at_height(h)?)),
+        }
+    }
+
+    /// Locator hashes newest-first for P2P `getheaders` (from confirmed chain).
+    pub fn locator_hashes(&self) -> Result<Vec<BlockHash>, QueryError> {
+        let Some(tip) = self.tip_height() else {
+            return Ok(vec![BlockHash::from_byte_array([0u8; 32])]);
+        };
+        let mut out = Vec::new();
+        let mut h = tip.0 as i64;
+        let mut step = 1i64;
+        while h >= 0 {
+            let (_fk, rec) = self
+                .header_at_height(Height(h as u32))?
+                .ok_or(StoreError::NotFound)?;
+            out.push(BlockHash::from_byte_array(rec.hash));
+            if out.len() >= 10 {
+                step *= 2;
+            }
+            h -= step;
+        }
+        // Always include genesis.
+        if let Some((_fk, rec)) = self.header_at_height(Height::GENESIS)? {
+            let g = BlockHash::from_byte_array(rec.hash);
+            if out.last() != Some(&g) {
+                out.push(g);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Headers on the best chain after the first matching locator entry, up to `limit` (max 2000).
+    pub fn headers_after_locator(
+        &self,
+        locator: &[BlockHash],
+        stop: BlockHash,
+        limit: usize,
+    ) -> Result<Vec<BlockHeader>, QueryError> {
+        let Some(tip) = self.tip_height() else {
+            return Ok(Vec::new());
+        };
+        let limit = limit.min(2000);
+        let mut start = 0u32;
+        'outer: for loc in locator {
+            if loc.to_byte_array() == [0u8; 32] {
+                start = 0;
+                break;
+            }
+            // Find height of locator on our chain.
+            if let Some(h) = self.height_of_hash(&loc.to_byte_array())? {
+                start = h.0.saturating_add(1);
+                break 'outer;
+            }
+        }
+        // If no locator matched, Bitcoin peers typically start from genesis; we start at 0.
+        let mut out = Vec::new();
+        let mut h = start;
+        while h <= tip.0 && out.len() < limit {
+            let hdr = self.wire_header_at_height(Height(h))?;
+            let hash = hdr.block_hash();
+            out.push(hdr);
+            if hash == stop && stop.to_byte_array() != [0u8; 32] {
+                break;
+            }
+            h += 1;
+        }
+        Ok(out)
+    }
+
     pub fn flush(&self) -> Result<(), QueryError> {
         if !self.store.path().exists() {
             return Err(StoreError::NotDirectory(self.store.path().to_path_buf()));
         }
         self.store.flush()
     }
+}
+
+fn wire_header(rec: &HeaderRecord, prev_blockhash: BlockHash) -> BlockHeader {
+    BlockHeader {
+        version: BlockVersion::from_consensus(rec.version),
+        prev_blockhash,
+        merkle_root: TxMerkleNode::from_byte_array(rec.merkle_root),
+        time: rec.timestamp,
+        bits: CompactTarget::from_consensus(rec.bits),
+        nonce: rec.nonce,
+    }
+}
+
+fn decode_tx_raw(raw: &[u8]) -> Result<Transaction, QueryError> {
+    let mut cursor = raw;
+    Transaction::consensus_decode(&mut cursor).map_err(|_| StoreError::Corrupt("tx raw decode"))
 }
 
 pub fn crate_name() -> &'static str {

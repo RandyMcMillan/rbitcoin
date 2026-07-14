@@ -3,8 +3,10 @@
 use crate::cache::BlockCache;
 use crate::error::NetError;
 use crate::peer::{handshake, serve_peer_loop, sync_from_peer};
+use bitcoin::hashes::Hash;
 use bitcoin::p2p::Magic;
 use bitcoin::Block;
+use bitcoin::BlockHash;
 use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
 use rbitcoin_primitives::{Height, Network as RNetwork};
 use rbitcoin_query::Query;
@@ -53,7 +55,7 @@ pub struct P2PHandle {
 }
 
 impl P2PNode {
-    /// Bind listener and optionally preload nothing. `query` is the chain store facade.
+    /// Bind listener. Serves getheaders/getdata from the store (reconstruct) plus RAM cache.
     pub async fn start(
         listen: SocketAddr,
         query: Query,
@@ -69,6 +71,7 @@ impl P2PNode {
         let notify = Arc::new(Notify::new());
 
         let cache_c = cache.clone();
+        let query_c = query.clone();
         let shutdown_c = shutdown.clone();
         let magic_c = magic;
         let accept_task = tokio::spawn(async move {
@@ -76,12 +79,18 @@ impl P2PNode {
                 if shutdown_c.load(Ordering::SeqCst) {
                     break;
                 }
-                let accept = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+                let accept =
+                    tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
                 match accept {
                     Ok(Ok((mut stream, peer_addr))) => {
                         let our = local_addr;
                         let cache = cache_c.clone();
-                        let height = cache.tip_height().map(|h| h as i32).unwrap_or(0);
+                        let query = query_c.clone();
+                        let height = query
+                            .tip_height()
+                            .map(|h| h.0 as i32)
+                            .or_else(|| cache.tip_height().map(|h| h as i32))
+                            .unwrap_or(0);
                         tokio::spawn(async move {
                             if handshake(&mut stream, magic_c, our, peer_addr, height, true)
                                 .await
@@ -89,7 +98,7 @@ impl P2PNode {
                             {
                                 return;
                             }
-                            let _ = serve_peer_loop(stream, magic_c, cache).await;
+                            let _ = serve_peer_loop(stream, magic_c, cache, query).await;
                         });
                     }
                     Ok(Err(_)) => break,
@@ -119,6 +128,14 @@ impl P2PNode {
         }
     }
 
+    /// Best known tip height (store preferred).
+    pub fn tip_height(&self) -> Option<u32> {
+        self.query
+            .tip_height()
+            .map(|h| h.0)
+            .or_else(|| self.cache.tip_height())
+    }
+
     /// Push a validated block into cache + store (must extend best chain).
     pub fn ingest_block(&self, height: u32, block: Block) -> Result<(), NetError> {
         accept_and_connect_block(
@@ -136,10 +153,10 @@ impl P2PNode {
         Ok(())
     }
 
-    /// Connect outbound and sync headers/blocks until peer has no more, or local tip >= target.
+    /// Connect outbound and sync headers/blocks until peer has no more.
     pub async fn sync_from(&self, peer: SocketAddr) -> Result<u32, NetError> {
         let mut stream = TcpStream::connect(peer).await?;
-        let height = self.cache.tip_height().map(|h| h as i32).unwrap_or(0);
+        let height = self.tip_height().map(|h| h as i32).unwrap_or(0);
         handshake(
             &mut stream,
             self.magic,
@@ -151,25 +168,59 @@ impl P2PNode {
         .await?;
 
         let cache = self.cache.clone();
-        let cache_ref = self.cache.clone();
         let query = self.query.clone();
         let params = self.params.clone();
         let milestone = self.milestone;
         let notify = self.notify.clone();
 
+        let locator = query
+            .locator_hashes()
+            .map_err(|e| NetError::Consensus(e.to_string()))?;
+        // If store empty, use cache locator
+        let locator = if locator.len() == 1
+            && locator[0].to_byte_array() == [0u8; 32]
+            && !cache.is_empty()
+        {
+            cache.locator()
+        } else {
+            locator
+        };
+
+        let query_has = query.clone();
+        let cache_has = cache.clone();
         let n = sync_from_peer(
             &mut stream,
             self.magic,
-            cache_ref.as_ref(),
-            move |height, block| {
-                if let Some(tip) = cache.tip_hash() {
-                    if block.header.prev_blockhash != tip {
+            locator,
+            move |hash| {
+                if cache_has.get_block(hash).is_some() {
+                    return true;
+                }
+                query_has
+                    .height_of_hash(&hash.to_byte_array())
+                    .ok()
+                    .flatten()
+                    .is_some()
+            },
+            move |_ignored_height, block| {
+                let height = match query.tip_height() {
+                    None => 0,
+                    Some(t) => t.0.saturating_add(1),
+                };
+                if let Some(tip_hash) = query
+                    .tip_height()
+                    .and_then(|h| query.header_at_height(h).ok().flatten())
+                    .map(|(_, rec)| BlockHash::from_byte_array(rec.hash))
+                {
+                    if block.header.prev_blockhash != tip_hash {
                         return Err(NetError::Protocol("block does not connect to tip"));
                     }
+                } else if height != 0 {
+                    return Err(NetError::Protocol("missing tip for non-genesis"));
                 }
                 accept_and_connect_block(&query, &params, Height(height), &block, milestone)
                     .map_err(|e| NetError::Consensus(e.to_string()))?;
-                cache.push_best(block).map_err(NetError::Protocol)?;
+                let _ = cache.push_best(block);
                 notify.notify_waiters();
                 Ok(())
             },
@@ -181,9 +232,7 @@ impl P2PNode {
     pub async fn wait_height(&self, height: u32, timeout: Duration) -> Result<(), NetError> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if self.cache.tip_height().unwrap_or(0) >= height
-                || self.query.tip_height().map(|h| h.0).unwrap_or(0) >= height
-            {
+            if self.tip_height().unwrap_or(0) >= height {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {

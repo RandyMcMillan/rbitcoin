@@ -194,11 +194,9 @@ pub async fn parallel_ibd(
             let _ = request_headers(&slots, &hub, &mut header_req_seq);
         }
 
-        // Drop unconnectable orphan pool if tip is stalled and ordered is empty.
-        if ordered.is_empty()
-            && !pool.is_empty()
-            && last_progress.elapsed() > cfg.stall
-        {
+        // Repair: if tip has no extension in pool and we're stalled, rebuild the
+        // download path from the current tip (ordered can desync after gaps).
+        if last_progress.elapsed() > cfg.stall {
             let tip = hub.tip_hash();
             let can_connect = tip
                 .map(|t| pool_by_prev.contains_key(&t))
@@ -206,13 +204,31 @@ pub async fn parallel_ibd(
                     pool_by_prev.contains_key(&BlockHash::from_byte_array([0u8; 32]))
                 });
             if !can_connect {
-                eprintln!(
-                    "ibd: clearing {} orphan pool blocks (no tip extension)",
-                    pool.len()
-                );
-                pool.clear();
-                pool_by_prev.clear();
-                // Force a fresh header fetch from the current tip.
+                // If ordered front is not a tip child (when present in pool), drop it.
+                if let (Some(t), Some(front)) = (tip, ordered.front().copied()) {
+                    if let Some(b) = pool.get(&front) {
+                        if b.header.prev_blockhash != t {
+                            eprintln!(
+                                "ibd: ordered desync front={} not child of tip; resetting path",
+                                front
+                            );
+                            ordered.clear();
+                            ordered_set.clear();
+                        }
+                    }
+                }
+                if !pool.is_empty() {
+                    eprintln!(
+                        "ibd: clearing {} orphan pool blocks (no tip extension)",
+                        pool.len()
+                    );
+                    pool.clear();
+                    pool_by_prev.clear();
+                }
+                inflight.clear();
+                for s in slots.iter_mut() {
+                    s.in_flight.clear();
+                }
                 let _ = request_headers(&slots, &hub, &mut header_req_seq);
                 last_progress = Instant::now();
             }

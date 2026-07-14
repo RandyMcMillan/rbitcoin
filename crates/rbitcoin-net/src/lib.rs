@@ -1,6 +1,7 @@
-//! Bitcoin P2P: handshake, headers sync, block download/serve (no tx relay).
+//! Bitcoin P2P: handshake, headers sync, block download/serve, tip follow (no tx relay).
 
 mod cache;
+mod chain;
 mod codec;
 mod error;
 mod peer;
@@ -8,6 +9,7 @@ mod seeds;
 mod service;
 
 pub use cache::BlockCache;
+pub use chain::{AcceptOutcome, ChainHub, TipEvent};
 pub use error::NetError;
 pub use peer::local_service_flags;
 pub use seeds::{

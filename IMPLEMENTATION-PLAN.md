@@ -290,7 +290,7 @@ Handshake, getheaders/getdata, BlockCache, 2-/3-node tests + periodic mesh scrip
 
 ---
 
-### Phase 4 — Reconstruct serve + multi-peer IBD foundation (4–6 weeks) — **in progress**
+### Phase 4 — Reconstruct serve + multi-peer IBD foundation — **core done**
 
 **Goal:** Serve history without block files after cold start; perform IBD from real networks at signet (and mainnet-experimental) quality.
 
@@ -302,37 +302,54 @@ Handshake, getheaders/getdata, BlockCache, 2-/3-node tests + periodic mesh scrip
 | 2 | **Store-backed P2P serve** — getheaders/getdata from store; restart seeder proof | ✅ |
 | 3 | **Service flags** — `NETWORK\|WITNESS` | ✅ |
 | 4a | **Discovery** — DNS/fixed seed lists + `AddrMan`; multi-peer try list | ✅ foundation |
-| 4b | Concurrent download window, stall/score, header tree / most-work | ⬜ remaining |
+| 4b | Concurrent download window, stall/score | ⬜ later hardening |
 | 5a | **Consensus** — MTP, nBits/retarget, maturity, subsidy, witness commitment, checkpoints | ✅ |
-| 5b | BIP9/taproot deployment windows, testnet min-diff edge cases | ⬜ remaining |
 | 6 | **Long-running node** — `run_p2p`, `--listen`/`--connect`/`--smoke` | ✅ |
-| 7 | Public signet IBD lab run | ⬜ remaining |
+| 7 | Public signet IBD lab run | ⬜ ops / later |
 
-**Exit (full Phase 4)**
+See **§3.1 Consensus gaps** for deployment-window policy (not a separate “5b” workstream).
+
+**Exit (core)**
 
 - Reconstruct round-trips green; multi-node serve after **process restart** without historical block files. ✅
-- Signet IBD to tip (or N of tip) under milestone on lab hardware. ⬜
-- §1.1 A2–A8, B1–B4, B6 materially done (A3 concurrent window / A4 most-work still open).
-
-**Tests to prefer:** reconstruct + restart-serve multi-node; multi-peer try list; short `run_p2p`.
+- Signet IBD lab + concurrent multi-peer polish: optional follow-ups, not blockers for Phase 5.
 
 ---
 
-### Phase 5 — Tip follow + block relay (2–3 weeks)
+### 3.1 Consensus gaps (documented; not a Phase 5 dependency)
 
-**Goal:** Steady-state blocks-only on signet/mainnet; enable Electrum header notifications later.
+Policy: **do not implement BIP9 / version-bits “deployment windows” as a separate feature** beyond what is required so each historical block is accepted or rejected under the same rules Core would apply at that height. Prefer height/time-based activation already implied by the chain and `bitcoinconsensus` flags over a full deployment-state machine.
 
-**Work**
+| Gap | Risk if missing | Mitigation / when |
+|-----|-----------------|-------------------|
+| Explicit BIP9 state machine (CSV, segwit, taproot start/timeout/lockin) | Wrong accept/reject near activation boundaries | Enforce via height/time rules and script flags consistent with mainnet history; expand only if differential vs bitcoind fails on real blocks |
+| Testnet min-difficulty / special retarget edges | Testnet IBD stalls or rejects | Add when dogfooding testnet; regtest/signet covered by `Params` |
+| Full sigops / legacy limits parity | Rare historical edge blocks | Add when differential testing shows need |
+| Assumevalid / dense checkpoint set | IBD speed / skip script range | Milestone exists; populate denser checkpoints as ops need |
+| Header tree index beyond best-chain linear confirmed | Complex reorgs / multi-peer header races | Phase 5 adds most-work reorg on received branches; full parallel header tree later if needed |
+| Concurrent multi-peer block download window | Slower IBD | Phase 4 foundation is sequential try-list; parallel window is performance polish |
 
-1. Unsolicited headers / block inv → download → accept.
-2. Announce tip (`inv` / `sendheaders`).
-3. Compact blocks (BIP152).
-4. Reorg to most-work; soft zone may use tip wire ring when Phase 6 lands.
-5. Soak tests (hours-scale tip follow).
+**Not gaps for product v1:** fee estimation, mempool policy, BIP9 UI/RPC reporting.
+
+---
+
+### Phase 5 — Tip follow + block relay — **core done**
+
+**Goal:** Steady-state blocks-only tip follow and block announce; enable Electrum header notifications later.
+
+| # | Work | Status |
+|---|------|--------|
+| 1 | Unsolicited headers / block inv → download → accept (`peer_session`, `follow_from`) | ✅ |
+| 2 | Announce tip (`inv` or `headers` after peer `sendheaders`) via `TipEvent` bus | ✅ |
+| 3 | Compact blocks: send/recv `sendcmpct`; `cmpctblock` → full `getdata` (no mempool short-ids) | ✅ v1 |
+| 4 | Most-work reorg (`accept_branch` / competing tip by work) | ✅ foundation |
+| 5 | High-level tests: `tip_follow_after_ibd`, `reorg_to_longer_branch` | ✅ |
+| 6 | Hours-scale soak / multi-peer tip race polish | ⬜ periodic later |
 
 **Exit**
 
-- Tip follow soak green; C1–C3 done; Electrum `headers.subscribe` unblocked.
+- Tip extension via inv/headers announce green; reorg foundation green; C1–C3 materially done. ✅
+- Electrum `headers.subscribe` unblocked (hook = `ChainHub` / `TipEvent` bus). ✅
 
 ---
 
@@ -465,10 +482,10 @@ Handshake, getheaders/getdata, BlockCache, 2-/3-node tests + periodic mesh scrip
 
 | Window | Focus |
 |--------|--------|
-| **Done (Phase 4 core)** | Reconstruct + store-backed restart serve; `NETWORK\|WITNESS`; MTP/bits/maturity/subsidy/witness commitment/checkpoints; seeds/AddrMan; multi-peer try list; long-running `run_p2p` |
-| **Remaining Phase 4** | Concurrent multi-peer download window + stall/score; header tree / most-work (not linear tip-only); public signet IBD lab run; richer mainnet deployments (BIP9/taproot windows) |
-| **Next phase** | Phase 5 tip follow / block relay |
-| Then | Phase 6 durability + scripthash index |
+| **Done Phase 4 core** | Reconstruct + store-backed restart serve; WITNESS; consensus depth; seeds; long-running node |
+| **Done Phase 5 core** | Tip follow (`follow_from` + announce); cmpct→getdata; most-work reorg foundation |
+| **Documented gaps** | §3.1 — no separate BIP9 window workstream; concurrent IBD window optional |
+| **Next** | **Phase 6** durability + scripthash index |
 | Then | Phase 7 Electrum |
 | Then | Phase 8 network-ready sign-off |
 
@@ -497,7 +514,7 @@ Handshake, getheaders/getdata, BlockCache, 2-/3-node tests + periodic mesh scrip
 
 | Item | Value |
 |------|-------|
-| Status | Living plan — **re-audited post Phase 3** with code-level gaps; **Electrum** is a first-class requirement (Phases 6–7) |
+| Status | Living plan — Phase 0–5 **core done**; Electrum still Phases 6–7 |
 | Depends on | [`libbitcoin-durable-archive-variant.md`](./libbitcoin-durable-archive-variant.md), [`SCHEMA.md`](./SCHEMA.md) |
-| Next action | Phase 4 — reconstruct + store-backed serve + multi-peer IBD + mainnet consensus |
-| Audit note | ~3.6k prod LOC; serve is RAM-only today; `TxRecord.raw` already full witness; no scripthash/Electrum crates yet |
+| Next action | Phase 6 — durable-archive tip wire ring + scripthash index |
+| Gaps policy | §3.1 — deployment windows only as needed for historical block rules |

@@ -5,6 +5,7 @@
 //! (periodic / CI nightly).
 
 use bitcoin::hashes::Hash;
+use bitcoin::BlockHash;
 use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_net::P2PNode;
 use rbitcoin_primitives::Height;
@@ -172,6 +173,97 @@ async fn sync_from_peers_tries_list() {
 
     seed.shutdown().await;
     peer.shutdown().await;
+}
+
+/// Phase 5: after IBD, seed announces a new tip; follower picks it up via inv/headers.
+#[tokio::test]
+async fn tip_follow_after_ibd() {
+    let seed_dir = TempDir::new().unwrap();
+    let peer_dir = TempDir::new().unwrap();
+
+    let seed = start_node(&seed_dir).await;
+    seed_chain(&seed, 5).await;
+
+    let mut peer = start_node(&peer_dir).await;
+    // Persistent follow: catch-up + stay connected for tip announce.
+    peer.follow_from(seed.local_addr).await.expect("follow");
+    peer.wait_height(5, Duration::from_secs(10))
+        .await
+        .expect("ibd via follow");
+
+    // Seed mines block 6 — inbound peer_session should announce to follower.
+    let tip = seed.cache.tip_hash().unwrap();
+    let tip_time = seed
+        .query
+        .header_at_height(Height(5))
+        .unwrap()
+        .unwrap()
+        .1
+        .timestamp;
+    let b6 = mine_regtest_block(tip, tip_time + 600, 6, vec![]);
+    let h6 = b6.block_hash();
+    seed.ingest_block(6, b6).unwrap();
+
+    peer.wait_tip_hash(h6, Duration::from_secs(10))
+        .await
+        .expect("tip follow");
+    assert_eq!(peer.query.tip_height(), Some(Height(6)));
+
+    seed.shutdown().await;
+    peer.shutdown().await;
+}
+
+/// Phase 5: most-work reorg — longer branch wins after disconnect/connect.
+#[tokio::test]
+async fn reorg_to_longer_branch() {
+    use rbitcoin_net::{AcceptOutcome, ChainHub};
+    use rbitcoin_consensus::{ChainParams, Milestone};
+
+    let dir = TempDir::new().unwrap();
+    let q = Query::open_or_create(dir.path().join("store")).unwrap();
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+
+    let genesis = regtest_genesis();
+    hub.accept_block(genesis.clone()).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut time = genesis.header.time;
+    for h in 1..=4u32 {
+        let b = mine_regtest_block(tip, time + 600, h, vec![]);
+        tip = b.block_hash();
+        time = b.header.time;
+        hub.accept_block(b).unwrap();
+    }
+    assert_eq!(hub.tip_height(), Some(4));
+
+    // Fork from height 2: build longer branch 3',4',5',6'
+    let fork_parent = hub
+        .query
+        .header_at_height(Height(2))
+        .unwrap()
+        .unwrap()
+        .1
+        .hash;
+    let mut branch = Vec::new();
+    let mut p = BlockHash::from_byte_array(fork_parent);
+    let mut t = hub
+        .query
+        .header_at_height(Height(2))
+        .unwrap()
+        .unwrap()
+        .1
+        .timestamp;
+    for h in 3..=6u32 {
+        // Distinct nonces via time offset so hashes differ from original chain
+        let b = mine_regtest_block(p, t + 601, h, vec![]);
+        p = b.block_hash();
+        t = b.header.time;
+        branch.push(b);
+    }
+
+    let outcome = hub.accept_branch(&branch).unwrap();
+    assert!(matches!(outcome, AcceptOutcome::Accepted { height: 6 }));
+    assert_eq!(hub.tip_height(), Some(6));
+    assert_eq!(hub.tip_hash().unwrap(), branch.last().unwrap().block_hash());
 }
 
 /// Long-running node entry: listen briefly, connect to seeder, exit via max_run_secs.

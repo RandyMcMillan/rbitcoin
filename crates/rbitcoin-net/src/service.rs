@@ -1,21 +1,21 @@
-//! Listen / dial / sync orchestration.
+//! Listen / dial / sync / tip-follow orchestration.
 
 use crate::cache::BlockCache;
+use crate::chain::{AcceptOutcome, ChainHub};
 use crate::error::NetError;
-use crate::peer::{handshake, serve_peer_loop, sync_from_peer};
+use crate::peer::{handshake, peer_session, sync_from_peer};
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::Magic;
 use bitcoin::Block;
 use bitcoin::BlockHash;
-use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-use rbitcoin_primitives::{Height, Network as RNetwork};
+use rbitcoin_consensus::{ChainParams, Milestone};
+use rbitcoin_primitives::Network as RNetwork;
 use rbitcoin_query::Query;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 #[derive(Clone, Debug)]
@@ -35,16 +35,16 @@ impl NetConfig {
     }
 }
 
-/// Running P2P node handle (listen + optional outbound sync).
+/// Running P2P node handle (listen + optional outbound sync / tip follow).
 pub struct P2PNode {
+    /// Shared RAM cache (also on hub).
     pub cache: Arc<BlockCache>,
+    /// Shared query store (also on hub).
     pub query: Arc<Query>,
-    pub params: ChainParams,
-    pub milestone: Milestone,
+    pub hub: Arc<ChainHub>,
     pub local_addr: SocketAddr,
     magic: Magic,
     shutdown: Arc<AtomicBool>,
-    notify: Arc<Notify>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -55,7 +55,7 @@ pub struct P2PHandle {
 }
 
 impl P2PNode {
-    /// Bind listener. Serves getheaders/getdata from the store (reconstruct) plus RAM cache.
+    /// Bind listener. Serves getheaders/getdata and participates in tip announce/follow.
     pub async fn start(
         listen: SocketAddr,
         query: Query,
@@ -63,15 +63,14 @@ impl P2PNode {
         milestone: Milestone,
     ) -> Result<Self, NetError> {
         let magic = Magic::from(params.network);
-        let cache = Arc::new(BlockCache::new());
-        let query = Arc::new(query);
+        let hub = Arc::new(ChainHub::new(query, params, milestone));
+        let cache = hub.cache.clone();
+        let query = hub.query.clone();
         let listener = TcpListener::bind(listen).await?;
         let local_addr = listener.local_addr()?;
         let shutdown = Arc::new(AtomicBool::new(false));
-        let notify = Arc::new(Notify::new());
 
-        let cache_c = cache.clone();
-        let query_c = query.clone();
+        let hub_c = hub.clone();
         let shutdown_c = shutdown.clone();
         let magic_c = magic;
         let accept_task = tokio::spawn(async move {
@@ -84,13 +83,9 @@ impl P2PNode {
                 match accept {
                     Ok(Ok((mut stream, peer_addr))) => {
                         let our = local_addr;
-                        let cache = cache_c.clone();
-                        let query = query_c.clone();
-                        let height = query
-                            .tip_height()
-                            .map(|h| h.0 as i32)
-                            .or_else(|| cache.tip_height().map(|h| h as i32))
-                            .unwrap_or(0);
+                        let hub = hub_c.clone();
+                        let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
+                        let tip_rx = hub.subscribe_tips();
                         tokio::spawn(async move {
                             if handshake(&mut stream, magic_c, our, peer_addr, height, true)
                                 .await
@@ -98,11 +93,12 @@ impl P2PNode {
                             {
                                 return;
                             }
-                            let _ = serve_peer_loop(stream, magic_c, cache, query).await;
+                            // Inbound: do not catch_up (avoids getheaders deadlock with dialer).
+                            let _ = peer_session(stream, magic_c, hub, tip_rx, false).await;
                         });
                     }
                     Ok(Err(_)) => break,
-                    Err(_) => continue, // timeout — recheck shutdown
+                    Err(_) => continue,
                 }
             }
         });
@@ -110,12 +106,10 @@ impl P2PNode {
         Ok(Self {
             cache,
             query,
-            params,
-            milestone,
+            hub,
             local_addr,
             magic,
             shutdown,
-            notify,
             tasks: vec![accept_task],
         })
     }
@@ -128,29 +122,17 @@ impl P2PNode {
         }
     }
 
-    /// Best known tip height (store preferred).
     pub fn tip_height(&self) -> Option<u32> {
-        self.query
-            .tip_height()
-            .map(|h| h.0)
-            .or_else(|| self.cache.tip_height())
+        self.hub.tip_height()
     }
 
-    /// Push a validated block into cache + store (must extend best chain).
+    /// Push a validated block into cache + store.
     pub fn ingest_block(&self, height: u32, block: Block) -> Result<(), NetError> {
-        accept_and_connect_block(
-            &self.query,
-            &self.params,
-            Height(height),
-            &block,
-            self.milestone,
-        )
-        .map_err(|e| NetError::Consensus(e.to_string()))?;
-        self.cache
-            .push_best(block)
-            .map_err(NetError::Protocol)?;
-        self.notify.notify_waiters();
-        Ok(())
+        let _ = height;
+        match self.hub.accept_block(block)? {
+            AcceptOutcome::Accepted { .. } | AcceptOutcome::AlreadyHave => Ok(()),
+            AcceptOutcome::IgnoredWeaker => Err(NetError::Protocol("weaker tip ignored")),
+        }
     }
 
     /// Try multiple peers in order until one yields blocks (or all fail).
@@ -164,13 +146,8 @@ impl P2PNode {
             match self.sync_from(*peer).await {
                 Ok(n) => {
                     total = total.saturating_add(n);
-                    if self.tip_height().is_some() {
-                        // Keep going across peers for more headers if useful;
-                        // for foundation, one successful sync path is enough when n>0
-                        // or we already match peer tip after a full empty download.
-                        if n > 0 {
-                            return Ok(total);
-                        }
+                    if n > 0 {
+                        return Ok(total);
                     }
                 }
                 Err(e) => last_err = e,
@@ -183,7 +160,7 @@ impl P2PNode {
         }
     }
 
-    /// Connect outbound and sync headers/blocks until peer has no more.
+    /// Connect outbound, catch up via getheaders, then return (connection closed).
     pub async fn sync_from(&self, peer: SocketAddr) -> Result<u32, NetError> {
         let mut stream = TcpStream::connect(peer).await?;
         let height = self.tip_height().map(|h| h as i32).unwrap_or(0);
@@ -197,66 +174,52 @@ impl P2PNode {
         )
         .await?;
 
-        let cache = self.cache.clone();
-        let query = self.query.clone();
-        let params = self.params.clone();
-        let milestone = self.milestone;
-        let notify = self.notify.clone();
-
-        let locator = query
+        let hub = self.hub.clone();
+        let locator = hub
+            .query
             .locator_hashes()
             .map_err(|e| NetError::Consensus(e.to_string()))?;
-        // If store empty, use cache locator
         let locator = if locator.len() == 1
             && locator[0].to_byte_array() == [0u8; 32]
-            && !cache.is_empty()
+            && !hub.cache.is_empty()
         {
-            cache.locator()
+            hub.cache.locator()
         } else {
             locator
         };
 
-        let query_has = query.clone();
-        let cache_has = cache.clone();
         let n = sync_from_peer(
             &mut stream,
             self.magic,
             locator,
-            move |hash| {
-                if cache_has.get_block(hash).is_some() {
-                    return true;
-                }
-                query_has
-                    .height_of_hash(&hash.to_byte_array())
-                    .ok()
-                    .flatten()
-                    .is_some()
-            },
-            move |_ignored_height, block| {
-                let height = match query.tip_height() {
-                    None => 0,
-                    Some(t) => t.0.saturating_add(1),
-                };
-                if let Some(tip_hash) = query
-                    .tip_height()
-                    .and_then(|h| query.header_at_height(h).ok().flatten())
-                    .map(|(_, rec)| BlockHash::from_byte_array(rec.hash))
-                {
-                    if block.header.prev_blockhash != tip_hash {
-                        return Err(NetError::Protocol("block does not connect to tip"));
-                    }
-                } else if height != 0 {
-                    return Err(NetError::Protocol("missing tip for non-genesis"));
-                }
-                accept_and_connect_block(&query, &params, Height(height), &block, milestone)
-                    .map_err(|e| NetError::Consensus(e.to_string()))?;
-                let _ = cache.push_best(block);
-                notify.notify_waiters();
-                Ok(())
-            },
+            |hash| hub.has_block(hash),
+            |_, block| hub.accept_block(block).map(|_| ()),
         )
         .await?;
         Ok(n)
+    }
+
+    /// Persistent outbound peer: catch up, then tip-follow + announce for the session lifetime.
+    pub async fn follow_from(&mut self, peer: SocketAddr) -> Result<(), NetError> {
+        let mut stream = TcpStream::connect(peer).await?;
+        let height = self.tip_height().map(|h| h as i32).unwrap_or(0);
+        handshake(
+            &mut stream,
+            self.magic,
+            self.local_addr,
+            peer,
+            height,
+            false,
+        )
+        .await?;
+        let hub = self.hub.clone();
+        let tip_rx = hub.subscribe_tips();
+        let magic = self.magic;
+        let task = tokio::spawn(async move {
+            let _ = peer_session(stream, magic, hub, tip_rx, true).await;
+        });
+        self.tasks.push(task);
+        Ok(())
     }
 
     pub async fn wait_height(&self, height: u32, timeout: Duration) -> Result<(), NetError> {
@@ -269,7 +232,27 @@ impl P2PNode {
                 return Err(NetError::Timeout);
             }
             tokio::select! {
-                _ = self.notify.notified() => {}
+                _ = self.hub.notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    }
+
+    pub async fn wait_tip_hash(
+        &self,
+        hash: BlockHash,
+        timeout: Duration,
+    ) -> Result<(), NetError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.hub.tip_hash() == Some(hash) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(NetError::Timeout);
+            }
+            tokio::select! {
+                _ = self.hub.notify.notified() => {}
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {}
             }
         }
@@ -280,7 +263,7 @@ impl P2PNode {
         for t in self.tasks.drain(..) {
             t.abort();
         }
-        let _ = self.query.flush();
+        let _ = self.hub.query.flush();
     }
 }
 

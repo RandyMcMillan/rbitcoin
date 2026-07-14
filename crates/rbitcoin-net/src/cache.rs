@@ -62,6 +62,27 @@ impl BlockCache {
         g.by_hash.get(h).map(|b| b.header)
     }
 
+    /// Drop all blocks above `height` (keep 0..=height). No-op if cache shorter.
+    pub fn truncate_to_height(&self, height: u32) {
+        let mut g = self.inner.write();
+        let keep = (height as usize).saturating_add(1);
+        if g.chain.len() <= keep {
+            return;
+        }
+        let remove: Vec<BlockHash> = g.chain[keep..].to_vec();
+        g.chain.truncate(keep);
+        for h in remove {
+            g.by_hash.remove(&h);
+        }
+    }
+
+    /// Clear entire cache (e.g. after full reorg from genesis).
+    pub fn clear(&self) {
+        let mut g = self.inner.write();
+        g.by_hash.clear();
+        g.chain.clear();
+    }
+
     /// Append a block that extends the best chain (or becomes genesis at height 0).
     pub fn push_best(&self, block: Block) -> Result<(), &'static str> {
         let hash = block.block_hash();

@@ -17,21 +17,22 @@ cargo test --workspace
 ./scripts/coverage.sh
 ```
 
-## Scenario catalog (initial)
+## Scenario catalog
+
+Prefer **one high-level scenario** per behavior. Delete lower-level tests when a newer scenario covers the same production paths.
 
 | ID | Layer | Description |
 |----|-------|-------------|
-| `node_lifecycle_default` | Config / lifecycle | Default config, start, clean shutdown |
-| `node_lifecycle_custom_datadir` | Config / lifecycle | Custom datadir path |
-| `node_lifecycle_invalid_datadir` | Config / lifecycle | Unwritable/missing parent fails clearly |
-| `node_config_network` | Config | Mainnet/testnet/signet/regtest selection |
-| `store_open_create` | Store | Create store in empty dir, reopen |
-| `store_put_get_header` | Store/query | Put header row, read back after reopen |
-| `store_put_tx_outputs_point` | Store/query | Put tx/outs and point spend link |
-| `store_allocate_publish_visibility` | Store | Readers only see published records |
-| `cli_help_version` | CLI | `--help` / `--version` exit paths |
+| `node_lifecycle_and_networks` | Lifecycle | Networks + primitives smoke |
+| `cli_and_node_entrypoints` | CLI | Flags, smoke, fault injector |
+| `store_error_and_corrupt_paths` | Store | Error/corrupt surfaces (coverage) |
+| `chain_connect_reorg_and_growth` | Query | Synthetic chain + disconnect |
+| `consensus_regtest_genesis_and_mine_chain` | Consensus | rust-bitcoin mine + accept + reopen |
+| `consensus_reject_bad_pow_and_merkle` | Consensus | Invalid block rejection |
+| `consensus_spend_and_reject_double_spend` | Consensus | Prevout spend + double-spend |
+| `consensus_milestone_skips_connect_checks` | Consensus | Milestone path |
 
-New features must add rows here (or in a linked scenario index) when they land.
+New features: add a high-level scenario; remove obsolete lower-level tests in the same PR.
 
 ## Core differential
 

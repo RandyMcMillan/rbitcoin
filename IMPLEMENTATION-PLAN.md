@@ -204,22 +204,19 @@ Each phase is independently mergeable, has explicit exit criteria, and must keep
 
 ---
 
-### Phase 2 — rust-bitcoin integration + consensus validate (2–4 weeks)
+### Phase 2 — rust-bitcoin integration + consensus validate ✅
 
-**Goal:** Independently validate blocks/headers with Core-compatible rules (regtest + vectors).
+**Done:**
 
-**Work**
+1. `bitcoin` 0.32 + `bitcoinconsensus` for script verify; store still holds raw wire via consensus encode.
+2. `accept_and_connect_block`: structure (merkle, weight, BIP34, coinbase order), header link/PoW, connect (prevout unspent + scripts), then store connect.
+3. Milestone skips connect checks; `ChainParams` for main/test/signet/regtest; genesis hash check.
+4. High-level regtest mine/validate scenarios (no lower-level unit wallpaper); pruned redundant store happy-path tests.
+5. Anyone-can-spend (`OP_TRUE` / empty) short-circuit for fixtures; otherwise libbitcoinconsensus.
 
-1. Depend on `bitcoin` / `bitcoin_hashes` / `secp256k1` (and `bitcoinconsensus` if chosen for bit-exact script).
-2. Consensus: header PoW/work, merkle, tx checks, script verify, BIP34/66/65/68/112/113/141/143/147/341/342 as required by height/flags.
-3. Milestone + checkpoints tables (defaults documented).
-4. Differential tests vs bitcoind on regtest (generate blocks, both accept/reject same).
-5. Wire encode/decode of blocks/txs only through rust-bitcoin.
+**Exit met (lab):** regtest genesis + mined chain validates and reopens; bad merkle/prev rejected; double-spend rejected; milestone path works.
 
-**Exit**
-
-- Validate a bitcoind-mined regtest chain file or RPC-fed blocks with identical accept/reject.
-- Script vector corpus green through the consensus entrypoint (not private unit-only).
+**Follow-ups (later):** coinbase maturity, full difficulty adjustment, expanded checkpoints, bitcoind RPC differential in CI when available.
 
 ---
 

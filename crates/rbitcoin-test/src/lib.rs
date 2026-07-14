@@ -2,6 +2,8 @@
 //!
 //! Prefer writing scenarios in `tests/` that exercise public crate APIs.
 
+pub mod mine;
+
 use std::path::PathBuf;
 use tempfile::TempDir;
 

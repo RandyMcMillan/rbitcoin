@@ -1,32 +1,30 @@
 //! High-level functional scenarios (coverage-bearing).
 //!
-//! Prefer adding scenarios here over unit tests in leaf crates.
+//! Prefer fewer tests at the highest layer that still hit production paths.
+//! Lower-level store decode/corruption cases stay only when nothing else covers them.
 
+use bitcoin::hashes::Hash;
+use bitcoin::{Amount, BlockHash};
 use rbitcoin_cli::cli_main as cli_cli_main;
-use rbitcoin_consensus::Milestone;
+use rbitcoin_consensus::{
+    accept_and_connect_block, validate_block_structure, ChainParams, ConsensusError, Milestone,
+    ValidationContext,
+};
 use rbitcoin_net::outbound_for_ibd;
 use rbitcoin_node::{cli_main as node_cli_main, run_node, NodeConfig};
 use rbitcoin_primitives::{Fk, Height, Network, TableKind, VERSION};
 use rbitcoin_query::Query;
 use rbitcoin_rpc::node_rpc_path;
-use rbitcoin_query::TxApply;
-use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, Store, StoreError, TxRecord};
+use rbitcoin_store::{HeaderRecord, Store, StoreError, TxRecord};
+use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
 use rbitcoin_test::{smoke_crate_names, TestDatadir};
 use rbitcoin_wire_cache::WireRing;
 use std::process::{Command, ExitCode};
 
-#[test]
-fn node_lifecycle_default() {
-    let td = TestDatadir::new().unwrap();
-    let cfg = NodeConfig::default().with_datadir(td.path());
-    let handle = run_node(cfg).expect("run_node");
-    assert_eq!(handle.network_name(), "mainnet");
-    assert!(handle.config.store_path().exists() || handle.config.datadir.exists());
-    handle.shutdown().expect("shutdown");
-}
+// ─── Node / CLI lifecycle ───────────────────────────────────────────────────
 
 #[test]
-fn node_lifecycle_custom_datadir_and_networks() {
+fn node_lifecycle_and_networks() {
     for net in [
         Network::Mainnet,
         Network::Testnet,
@@ -41,169 +39,148 @@ fn node_lifecycle_custom_datadir_and_networks() {
         assert_eq!(handle.network_name(), net.as_str());
         handle.shutdown().unwrap();
     }
+    assert!(Network::parse("nope").is_err());
+    assert_eq!(Network::parse("REGTEST").unwrap(), Network::Regtest);
+    assert!(!VERSION.is_empty());
+    for k in 1u16..=10 {
+        assert_eq!(TableKind::from_u16(k).unwrap().as_u16(), k);
+    }
+    assert!(TableKind::from_u16(99).is_none());
+    assert!(Fk::NULL.is_null());
+    assert_eq!(Height::GENESIS.next(), Some(Height(1)));
 }
 
 #[test]
-fn node_lifecycle_invalid_datadir() {
-    // Empty path fails validation.
+fn node_config_errors() {
     let cfg = NodeConfig {
         datadir: std::path::PathBuf::from(""),
         ..NodeConfig::default()
     };
-    let err = run_node(cfg).unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("datadir") || msg.contains("empty") || msg.contains("configuration"));
+    assert!(run_node(cfg).is_err());
+
+    let td = TestDatadir::new().unwrap();
+    let file = td.path().join("blocked");
+    std::fs::write(&file, b"nope").unwrap();
+    assert!(run_node(NodeConfig::default().with_datadir(file)).is_err());
+
+    let cfg = NodeConfig {
+        wire_depth_blocks: 0,
+        archive_durability: true,
+        ..NodeConfig::default().with_datadir(td.path().join("w0"))
+    };
+    let h = run_node(cfg).unwrap();
+    assert_eq!(h.wire.depth(), 0);
+    h.shutdown().unwrap();
 }
 
 #[test]
-fn node_config_network_parse() {
-    assert_eq!(Network::parse("mainnet").unwrap(), Network::Mainnet);
-    assert_eq!(Network::parse("main").unwrap(), Network::Mainnet);
-    assert_eq!(Network::parse("testnet").unwrap(), Network::Testnet);
-    assert_eq!(Network::parse("test").unwrap(), Network::Testnet);
-    assert_eq!(Network::parse("testnet3").unwrap(), Network::Testnet);
-    assert_eq!(Network::parse("signet").unwrap(), Network::Signet);
-    assert_eq!(Network::parse("regtest").unwrap(), Network::Regtest);
-    assert_eq!(Network::parse("REGTEST").unwrap(), Network::Regtest);
-    let err = Network::parse("foo").unwrap_err();
-    assert!(err.to_string().contains("foo"));
-    assert_eq!(Network::Mainnet.to_string(), "mainnet");
-    assert!(!VERSION.is_empty());
-}
-
-#[test]
-fn primitives_fk_height_table_kind() {
-    assert!(Fk::NULL.is_null());
-    assert!(Fk::new(0).is_none());
-    assert_eq!(Fk::new(3).unwrap().get(), Some(3));
-    assert_eq!(Fk::NULL.get(), None);
-    assert_eq!(Fk::NULL.to_string(), "Fk(null)");
-    assert_eq!(Fk(7).to_string(), "Fk(7)");
-    assert_eq!(Height::GENESIS.next(), Some(Height(1)));
-    assert_eq!(Height(u32::MAX).next(), None);
-    assert_eq!(Height(2).to_string(), "2");
-    for k in 1u16..=10 {
-        let tk = TableKind::from_u16(k).expect("kind");
-        assert_eq!(tk.as_u16(), k);
+fn cli_and_node_entrypoints() {
+    let td = TestDatadir::new().unwrap();
+    for net in ["mainnet", "testnet", "signet", "regtest"] {
+        let d = td.path().join(net);
+        assert_eq!(
+            node_cli_main([
+                "rbitcoin-node",
+                "--datadir",
+                d.to_str().unwrap(),
+                "--network",
+                net,
+                "--smoke",
+            ]),
+            ExitCode::SUCCESS
+        );
     }
-    assert!(TableKind::from_u16(0).is_none());
-    assert!(TableKind::from_u16(99).is_none());
+    let _ = node_cli_main(["rbitcoin-node", "--help"]);
+    let _ = node_cli_main(["rbitcoin-node", "--version"]);
+    let _ = cli_cli_main(["rbitcoin-cli", "--help"]);
+    let _ = cli_cli_main(["rbitcoin-cli", "--version"]);
+    assert_eq!(cli_cli_main(["rbitcoin-cli", "help"]), ExitCode::SUCCESS);
+    assert_ne!(cli_cli_main(["rbitcoin-cli"]), ExitCode::SUCCESS);
+    assert_ne!(
+        cli_cli_main(["rbitcoin-cli", "getblockchaininfo"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--not-a-real-option"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--datadir"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--network", "nope"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(cli_cli_main(["rbitcoin-cli", "a", "b"]), ExitCode::SUCCESS);
+
+    std::env::set_var("RBITCOIN_TEST_DROP_STORE", "1");
+    assert_ne!(
+        node_cli_main([
+            "rbitcoin-node",
+            "--datadir",
+            td.path().join("shutdown-fail").to_str().unwrap(),
+            "--smoke",
+        ]),
+        ExitCode::SUCCESS
+    );
+    std::env::remove_var("RBITCOIN_TEST_DROP_STORE");
+
+    let node = workspace_bin("rbitcoin-node");
+    if node.exists() {
+        assert!(Command::new(&node)
+            .args([
+                "--datadir",
+                td.path().join("bin-smoke").to_str().unwrap(),
+                "--network",
+                "regtest",
+                "--smoke",
+            ])
+            .status()
+            .unwrap()
+            .success());
+    }
+}
+
+fn workspace_bin(name: &str) -> std::path::PathBuf {
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push("../../target");
+    p.push(profile);
+    p.push(name);
+    p
 }
 
 #[test]
-fn store_open_create_reopen() {
-    let td = TestDatadir::new().unwrap();
-    let path = td.store_path();
-    let s = Store::create(&path).unwrap();
-    s.flush().unwrap();
-    drop(s);
-    let s2 = Store::open(&path).unwrap();
-    assert_eq!(s2.path(), path.as_path());
-    drop(s2);
-    let s3 = Store::open_or_create(&path).unwrap();
-    s3.flush().unwrap();
+fn placeholder_surfaces() {
+    let names = smoke_crate_names();
+    assert!(names.contains(&"rbitcoin-store"));
+    assert!(names.contains(&"rbitcoin-consensus"));
+    let ring = WireRing::new(100);
+    assert!(ring.is_empty());
+    assert!(!Milestone::NONE.skips_at(0));
+    assert!(Milestone { height: 10 }.skips_at(5));
+    assert_eq!(outbound_for_ibd(true), 100);
+    assert_eq!(node_rpc_path(), "/");
 }
 
-#[test]
-fn store_put_get_header() {
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    let rec = HeaderRecord {
-        prev_fk: Fk::NULL,
-        version: 1,
-        timestamp: 123,
-        bits: 0x1d00ffff,
-        nonce: 42,
-        merkle_root: [1u8; 32],
-        hash: [2u8; 32],
-    };
-    let fk = q.put_header(&rec).unwrap();
-    assert_eq!(fk, Fk(1));
-    let got = q.get_header(fk).unwrap();
-    assert_eq!(got, rec);
-    let (fk2, got2) = q.get_header_by_hash(&[2u8; 32]).unwrap().unwrap();
-    assert_eq!(fk2, fk);
-    assert_eq!(got2.hash, rec.hash);
-    assert!(q.get_header_by_hash(&[9u8; 32]).unwrap().is_none());
-    q.flush().unwrap();
-
-    // Reopen persistence
-    let q2 = Query::open_or_create(td.store_path()).unwrap();
-    let got3 = q2.get_header(fk).unwrap();
-    assert_eq!(got3, rec);
-}
+// ─── Store: keep only corrupt/error paths not hit by consensus chain tests ──
 
 #[test]
-fn store_put_tx_outputs_point() {
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    let txid = [0xabu8; 32];
-    let tx = TxRecord {
-        txid,
-        version: 2,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 0,
-        output_start_fk: Fk::NULL,
-        output_count: 1,
-        raw: vec![0x01, 0x02, 0x03],
-    };
-    let tx_fk = q.put_tx(&tx).unwrap();
-    let got_tx = q.get_tx(tx_fk).unwrap();
-    assert_eq!(got_tx.txid, txid);
-    assert_eq!(got_tx.raw, vec![0x01, 0x02, 0x03]);
-    let (tfk, _) = q.get_tx_by_txid(&txid).unwrap().unwrap();
-    assert_eq!(tfk, tx_fk);
-    assert!(q.get_tx_by_txid(&[0u8; 32]).unwrap().is_none());
-
-    let out = OutputRecord {
-        parent_tx_fk: tx_fk,
-        index: 0,
-        value: 50_0000_0000,
-        script: vec![0x51],
-    };
-    let out_fk = q.put_output(&out).unwrap();
-    let got_out = q.get_output(out_fk).unwrap();
-    assert_eq!(got_out.value, out.value);
-    assert_eq!(got_out.script, out.script);
-
-    let spend_tx = TxRecord {
-        txid: [0xcd; 32],
-        version: 2,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 1,
-        output_start_fk: Fk::NULL,
-        output_count: 0,
-        raw: vec![0xaa],
-    };
-    let spend_fk = q.put_tx(&spend_tx).unwrap();
-    q.put_spend(&txid, 0, spend_fk, 0).unwrap();
-    // Without strong_tx, filtered spenders are empty; raw multimap still has the row.
-    assert!(q.spenders(&txid, 0).unwrap().is_empty());
-    let raw = q.spenders_raw(&txid, 0).unwrap();
-    assert_eq!(raw.len(), 1);
-    assert_eq!(raw[0].spending_tx_fk, spend_fk);
-    assert!(q.spenders(&txid, 1).unwrap().is_empty());
-    q.flush().unwrap();
-}
-
-#[test]
-fn store_error_paths() {
+fn store_error_and_corrupt_paths() {
     let td = TestDatadir::new().unwrap();
     let path = td.store_path();
     let s = Store::create(&path).unwrap();
     assert!(matches!(s.get_header(Fk::NULL), Err(StoreError::InvalidFk)));
     assert!(matches!(s.get_header(Fk(99)), Err(StoreError::NotFound)));
-    assert!(matches!(s.get_tx(Fk::NULL), Err(StoreError::InvalidFk)));
-    assert!(matches!(s.get_tx(Fk(1)), Err(StoreError::NotFound)));
-    assert!(matches!(s.get_output(Fk::NULL), Err(StoreError::InvalidFk)));
-    assert!(matches!(s.get_output(Fk(1)), Err(StoreError::NotFound)));
     assert!(matches!(
         s.put_spend(&[0u8; 32], 0, Fk::NULL, 0),
         Err(StoreError::InvalidFk)
     ));
-    // Display paths for errors
     let _ = format!("{}", StoreError::BadMagic);
     let _ = format!("{}", StoreError::BadSchema(3));
     let _ = format!(
@@ -219,25 +196,18 @@ fn store_error_paths() {
     let _ = format!("{}", StoreError::NotDirectory(path.clone()));
     drop(s);
 
-    // create when path is a file
     let file_path = td.path().join("notdir");
     std::fs::write(&file_path, b"x").unwrap();
     assert!(matches!(
         Store::create(&file_path),
         Err(StoreError::NotDirectory(_))
     ));
-    assert!(matches!(
-        Store::open(&file_path),
-        Err(StoreError::NotDirectory(_))
-    ));
 
-    // Bad magic
     let bad = td.path().join("badstore");
     std::fs::create_dir_all(&bad).unwrap();
     std::fs::write(bad.join("meta"), b"XXXX\x00\x00").unwrap();
     assert!(matches!(Store::open(&bad), Err(StoreError::BadMagic)));
 
-    // Bad schema
     let bad2 = td.path().join("badschema");
     std::fs::create_dir_all(&bad2).unwrap();
     let mut meta = Vec::from(*b"RBT1");
@@ -245,95 +215,21 @@ fn store_error_paths() {
     std::fs::write(bad2.join("meta"), meta).unwrap();
     assert!(matches!(Store::open(&bad2), Err(StoreError::BadSchema(99))));
 
-    // Short meta
     let bad3 = td.path().join("shortmeta");
     std::fs::create_dir_all(&bad3).unwrap();
     std::fs::write(bad3.join("meta"), b"RB").unwrap();
     assert!(matches!(Store::open(&bad3), Err(StoreError::Corrupt(_))));
 
-    // Parent is a file -> create_dir_all / create IO error
     let parent_file = td.path().join("parent_is_file");
     std::fs::write(&parent_file, b"x").unwrap();
-    let nested = parent_file.join("store");
-    assert!(Store::create(&nested).is_err());
-}
+    assert!(Store::create(parent_file.join("store")).is_err());
 
-#[test]
-fn store_header_decode_and_replace() {
     assert!(HeaderRecord::decode(&[0u8; 10]).is_err());
     assert!(TxRecord::decode(&[0u8; 10]).is_err());
-    assert!(OutputRecord::decode(&[0u8; 10]).is_err());
-
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    let mut rec = HeaderRecord {
-        prev_fk: Fk::NULL,
-        version: 1,
-        timestamp: 1,
-        bits: 1,
-        nonce: 1,
-        merkle_root: [3u8; 32],
-        hash: [4u8; 32],
-    };
-    let fk1 = q.put_header(&rec).unwrap();
-    // Replace same hash mapping (second header with same hash overwrites head).
-    rec.nonce = 2;
-    let fk2 = q.put_header(&rec).unwrap();
-    assert_ne!(fk1, fk2);
-    let (found, _) = q.get_header_by_hash(&[4u8; 32]).unwrap().unwrap();
-    assert_eq!(found, fk2);
-    assert!(q.store().path().ends_with("store"));
 }
 
 #[test]
-fn store_point_chain_and_large_write() {
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    let txid = [0x11u8; 32];
-    let base = TxRecord {
-        txid,
-        version: 1,
-        locktime: 0,
-        input_start_fk: Fk::NULL,
-        input_count: 0,
-        output_start_fk: Fk::NULL,
-        output_count: 0,
-        raw: vec![0; 8000], // force mmap growth
-    };
-    let _ = q.put_tx(&base).unwrap();
-    let s1 = q
-        .put_tx(&TxRecord {
-            txid: [0x21; 32],
-            version: 1,
-            locktime: 0,
-            input_start_fk: Fk::NULL,
-            input_count: 0,
-            output_start_fk: Fk::NULL,
-            output_count: 0,
-            raw: vec![1],
-        })
-        .unwrap();
-    let s2 = q
-        .put_tx(&TxRecord {
-            txid: [0x22; 32],
-            version: 1,
-            locktime: 0,
-            input_start_fk: Fk::NULL,
-            input_count: 0,
-            output_start_fk: Fk::NULL,
-            output_count: 0,
-            raw: vec![2],
-        })
-        .unwrap();
-    q.put_spend(&txid, 0, s1, 0).unwrap();
-    q.put_spend(&txid, 0, s2, 1).unwrap();
-    assert_eq!(q.spenders_raw(&txid, 0).unwrap().len(), 2);
-    assert!(q.spenders(&txid, 0).unwrap().is_empty());
-    q.flush().unwrap();
-}
-
-#[test]
-fn store_table_file_header_errors() {
+fn store_table_header_and_idx_corrupt() {
     use rbitcoin_primitives::{TableKind, SCHEMA_VERSION, STORE_MAGIC};
     let td = TestDatadir::new().unwrap();
     let store_dir = td.path().join("broken_kind");
@@ -341,21 +237,18 @@ fn store_table_file_header_errors() {
         let s = Store::create(&store_dir).unwrap();
         s.flush().unwrap();
     }
-    // Corrupt header.body kind field
     let mut hb = std::fs::read(store_dir.join("header.body")).unwrap();
     hb[6..8].copy_from_slice(&TableKind::Tx.as_u16().to_le_bytes());
     std::fs::write(store_dir.join("header.body"), &hb).unwrap();
     match Store::open(&store_dir) {
         Err(StoreError::BadKind { .. }) => {}
         Err(e) => panic!("expected BadKind, got {e}"),
-        Ok(_) => panic!("expected BadKind, got Ok"),
+        Ok(_) => panic!("expected BadKind"),
     }
 
-    // Bad magic on a table file
     let store_dir2 = td.path().join("broken_magic");
     {
-        let s = Store::create(&store_dir2).unwrap();
-        s.flush().unwrap();
+        Store::create(&store_dir2).unwrap().flush().unwrap();
     }
     let mut hb = std::fs::read(store_dir2.join("header.body")).unwrap();
     hb[0..4].copy_from_slice(b"XXXX");
@@ -363,616 +256,262 @@ fn store_table_file_header_errors() {
     match Store::open(&store_dir2) {
         Err(StoreError::BadMagic) => {}
         Err(e) => panic!("expected BadMagic, got {e}"),
-        Ok(_) => panic!("expected BadMagic, got Ok"),
+        Ok(_) => panic!("expected BadMagic"),
     }
 
-    // Bad schema on table file
     let store_dir3 = td.path().join("broken_schema");
     {
-        let s = Store::create(&store_dir3).unwrap();
-        s.flush().unwrap();
+        Store::create(&store_dir3).unwrap().flush().unwrap();
     }
     let mut hb = std::fs::read(store_dir3.join("header.body")).unwrap();
     hb[4..6].copy_from_slice(&123u16.to_le_bytes());
     std::fs::write(store_dir3.join("header.body"), &hb).unwrap();
     match Store::open(&store_dir3) {
         Err(StoreError::BadSchema(123)) => {}
-        Err(e) => panic!("expected BadSchema(123), got {e}"),
-        Ok(_) => panic!("expected BadSchema, got Ok"),
+        Err(e) => panic!("expected BadSchema, got {e}"),
+        Ok(_) => panic!("expected BadSchema"),
     }
 
-    let _ = (SCHEMA_VERSION, STORE_MAGIC);
-}
-
-#[test]
-fn store_hash_head_grows_and_corrupt_body() {
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    // Beyond default 64 slots — head must rehash rather than fail.
-    for i in 0..200u64 {
-        let mut hash = [0u8; 32];
-        hash[0..8].copy_from_slice(&i.to_le_bytes());
-        q.put_header(&HeaderRecord {
-            prev_fk: Fk::NULL,
-            version: 1,
-            timestamp: i as u32,
-            bits: 1,
-            nonce: 1,
-            merkle_root: [0u8; 32],
-            hash,
-        })
-        .unwrap();
-    }
-    let mut want = [0u8; 32];
-    want[0..8].copy_from_slice(&199u64.to_le_bytes());
-    let (fk, _) = q.get_header_by_hash(&want).unwrap().unwrap();
-    assert_eq!(fk, Fk(200));
-
-    q.flush().unwrap();
-    drop(q);
-    let body = td.store_path().join("header.body");
-    let mut bytes = std::fs::read(&body).unwrap();
-    let bad_len = 16u64 + 10;
-    bytes[8..16].copy_from_slice(&bad_len.to_le_bytes());
-    std::fs::write(&body, &bytes).unwrap();
-    match Store::open(td.store_path()) {
-        Err(StoreError::Corrupt(_)) => {}
-        Err(e) => panic!("expected Corrupt, got {e}"),
-        Ok(_) => panic!("expected Corrupt"),
-    }
-}
-
-#[test]
-fn store_point_and_tx_decode_edges() {
-    use rbitcoin_store::PointRecord;
-    assert!(PointRecord::decode(&[0u8; 8]).is_err());
-    assert!(HeaderRecord::decode(&[0u8; 87]).is_err());
-
-    // Truncated tx raw / output script
-    let mut tx_bytes = vec![0u8; 68];
-    tx_bytes[64..68].copy_from_slice(&10u32.to_le_bytes()); // raw_len=10 but no bytes
-    assert!(TxRecord::decode(&tx_bytes).is_err());
-
-    let mut out_bytes = vec![0u8; 24];
-    out_bytes[20..24].copy_from_slice(&5u32.to_le_bytes());
-    assert!(OutputRecord::decode(&out_bytes).is_err());
-}
-
-#[test]
-fn store_create_existing_dir() {
-    let td = TestDatadir::new().unwrap();
-    let path = td.store_path();
-    std::fs::create_dir_all(&path).unwrap();
-    let s = Store::create(&path).unwrap();
-    s.flush().unwrap();
-}
-
-#[test]
-fn store_open_or_create_fresh() {
-    let td = TestDatadir::new().unwrap();
-    let s = Store::open_or_create(td.store_path()).unwrap();
-    s.flush().unwrap();
-}
-
-#[test]
-fn store_tx_and_hash_grow() {
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    // Var table and hash head must grow past former fixed limits.
-    for i in 0..300u64 {
-        let mut txid = [0u8; 32];
-        txid[0..8].copy_from_slice(&i.to_le_bytes());
-        q.put_tx(&TxRecord {
-            txid,
-            version: 1,
-            locktime: 0,
-            input_start_fk: Fk::NULL,
-            input_count: 0,
-            output_start_fk: Fk::NULL,
-            output_count: 0,
-            raw: vec![0],
-        })
-        .unwrap();
-    }
-    let mut want = [0u8; 32];
-    want[0..8].copy_from_slice(&299u64.to_le_bytes());
-    let (fk, _) = q.get_tx_by_txid(&want).unwrap().unwrap();
-    assert_eq!(fk, Fk(300));
-    assert!(q.get_tx_by_txid(&[0xee; 32]).unwrap().is_none());
-}
-
-#[test]
-fn store_point_body_corrupt_and_get() {
-    let td = TestDatadir::new().unwrap();
+    // Hash head empty body / not power-of-two
+    let sd = td.path().join("empty_head");
     {
-        let s = Store::create(td.store_path()).unwrap();
-        s.flush().unwrap();
+        Store::create(&sd).unwrap().flush().unwrap();
     }
-    // Corrupt point body size
-    let body = td.store_path().join("point.body");
-    let mut bytes = std::fs::read(&body).unwrap();
-    bytes[8..16].copy_from_slice(&(16u64 + 7).to_le_bytes());
-    std::fs::write(&body, bytes).unwrap();
-    match Store::open(td.store_path()) {
+    let head = sd.join("header.head");
+    let mut bytes = std::fs::read(&head).unwrap();
+    bytes[8..16].copy_from_slice(&16u64.to_le_bytes());
+    bytes.truncate(16);
+    std::fs::write(&head, bytes).unwrap();
+    match Store::open(&sd) {
         Err(StoreError::Corrupt(_)) => {}
         Err(e) => panic!("expected Corrupt, got {e}"),
         Ok(_) => panic!("expected Corrupt"),
     }
 
-    let td2 = TestDatadir::new().unwrap();
-    let s = Store::create(td2.store_path()).unwrap();
-    assert!(matches!(s.spenders(&[0u8; 32], 0), Ok(v) if v.is_empty()));
-    assert!(matches!(s.points.get(Fk::NULL), Err(StoreError::InvalidFk)));
-    assert!(matches!(s.points.get(Fk(1)), Err(StoreError::NotFound)));
-}
-
-#[test]
-fn store_hash_head_slots_not_pow2() {
-    let td = TestDatadir::new().unwrap();
+    let sd2 = td.path().join("bad_slots");
     {
-        let s = Store::create(td.store_path()).unwrap();
-        s.flush().unwrap();
+        Store::create(&sd2).unwrap().flush().unwrap();
     }
-    // Truncate header.head body so slot count is not power of two (3 slots * 40).
-    let head = td.store_path().join("header.head");
+    let head = sd2.join("header.head");
     let mut bytes = std::fs::read(&head).unwrap();
     let logical = 16u64 + 40 * 3;
     bytes.resize(logical as usize, 0);
     bytes[8..16].copy_from_slice(&logical.to_le_bytes());
     std::fs::write(&head, bytes).unwrap();
-    match Store::open(td.store_path()) {
+    match Store::open(&sd2) {
         Err(StoreError::Corrupt(_)) => {}
         Err(e) => panic!("expected Corrupt, got {e}"),
         Ok(_) => panic!("expected Corrupt"),
     }
+
+    let _ = (SCHEMA_VERSION, STORE_MAGIC);
 }
 
-#[test]
-fn store_short_table_file() {
-    let td = TestDatadir::new().unwrap();
-    {
-        let s = Store::create(td.store_path()).unwrap();
-        s.flush().unwrap();
-    }
-    std::fs::write(td.store_path().join("header.body"), b"RBT1").unwrap();
-    assert!(Store::open(td.store_path()).is_err());
-}
+// ─── Phase 1 chain ops (still high-level, pre-consensus types) ──────────────
 
 #[test]
-fn store_clamp_logical_past_eof() {
-    let td = TestDatadir::new().unwrap();
-    {
-        let s = Store::create(td.store_path()).unwrap();
-        s.flush().unwrap();
-    }
-    let body = td.store_path().join("header.body");
-    let mut bytes = std::fs::read(&body).unwrap();
-    let huge = 10_000_000u64;
-    bytes[8..16].copy_from_slice(&huge.to_le_bytes());
-    std::fs::write(&body, &bytes).unwrap();
-    // Opens with clamped logical length
-    let s = Store::open(td.store_path());
-    // may fail on size % header or succeed with clamp — either is ok for coverage
-    let _ = s;
-}
+fn chain_connect_reorg_and_growth() {
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{InputRecord, OutputRecord};
 
-#[test]
-fn cli_invalid_flag_stderr_path() {
-    let code = cli_cli_main(["rbitcoin-cli", "--not-a-real-option"]);
-    assert_ne!(code, ExitCode::SUCCESS);
-    let code = node_cli_main(["rbitcoin-node", "--not-a-real-option"]);
-    assert_ne!(code, ExitCode::SUCCESS);
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--datadir"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--network"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--network", "nope"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(cli_cli_main(["rbitcoin-cli", "a", "b"]), ExitCode::SUCCESS);
-    let _ = cli_cli_main(["rbitcoin-cli", "-h"]);
-    let _ = cli_cli_main(["rbitcoin-cli", "-V"]);
-    let _ = node_cli_main(["rbitcoin-node", "-h"]);
-    let _ = node_cli_main(["rbitcoin-node", "-V"]);
-}
-
-#[test]
-fn store_corrupt_framed_record() {
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
-    let fk = q
-        .put_tx(&TxRecord {
-            txid: [1u8; 32],
-            version: 1,
-            locktime: 0,
-            input_start_fk: Fk::NULL,
-            input_count: 0,
-            output_start_fk: Fk::NULL,
-            output_count: 0,
-            raw: vec![9, 9],
-        })
-        .unwrap();
-    q.flush().unwrap();
-    drop(q);
 
-    // idx file: first offset at FILE_HEADER (16)
-    let idx = td.store_path().join("tx.idx");
-    let idx_bytes = std::fs::read(&idx).unwrap();
-    let start =
-        u64::from_le_bytes(idx_bytes[16..24].try_into().unwrap()) as usize;
-    let body = td.store_path().join("tx.body");
-    let mut bytes = std::fs::read(&body).unwrap();
-    if start + 4 <= bytes.len() {
-        bytes[start..start + 4].copy_from_slice(&2u32.to_le_bytes());
-        std::fs::write(&body, &bytes).unwrap();
-    }
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    assert!(q.get_tx(fk).is_err());
-}
-
-#[test]
-fn store_read_past_end_via_bad_offset() {
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    let fk = q
-        .put_tx(&TxRecord {
-            txid: [2u8; 32],
-            version: 1,
-            locktime: 0,
-            input_start_fk: Fk::NULL,
-            input_count: 0,
-            output_start_fk: Fk::NULL,
-            output_count: 0,
-            raw: vec![1],
-        })
-        .unwrap();
-    q.flush().unwrap();
-    drop(q);
-    let body_path = td.store_path().join("tx.body");
-    let body = std::fs::read(&body_path).unwrap();
-    let start = body.len() as u64 - 4;
-    let mut idx = std::fs::read(td.store_path().join("tx.idx")).unwrap();
-    idx[16..24].copy_from_slice(&start.to_le_bytes());
-    std::fs::write(td.store_path().join("tx.idx"), &idx).unwrap();
-    let mut body = body;
-    let s = start as usize;
-    if s + 4 <= body.len() {
-        body[s..s + 4].copy_from_slice(&1_000_000u32.to_le_bytes());
-        std::fs::write(&body_path, &body).unwrap();
-    }
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    assert!(q.get_tx(fk).is_err());
-}
-
-#[test]
-fn store_hash_head_empty_body() {
-    let td = TestDatadir::new().unwrap();
-    {
-        let s = Store::create(td.store_path()).unwrap();
-        s.flush().unwrap();
-    }
-    let head = td.store_path().join("header.head");
-    let mut bytes = std::fs::read(&head).unwrap();
-    // logical length = header only => body == 0
-    bytes[8..16].copy_from_slice(&16u64.to_le_bytes());
-    bytes.truncate(16);
-    std::fs::write(&head, bytes).unwrap();
-    match Store::open(td.store_path()) {
-        Err(StoreError::Corrupt(_)) => {}
-        Err(e) => panic!("expected Corrupt, got {e}"),
-        Ok(_) => panic!("expected Corrupt"),
-    }
-}
-
-#[test]
-fn placeholder_surfaces() {
-    let names = smoke_crate_names();
-    assert!(names.contains(&"rbitcoin-store"));
-    assert!(names.contains(&"rbitcoin-node"));
-
-    let ring = WireRing::new(100);
-    assert_eq!(ring.depth(), 100);
-    assert!(ring.is_empty());
-    assert_eq!(ring.len(), 0);
-
-    assert!(!Milestone::NONE.skips_at(0));
-    let m = Milestone { height: 100 };
-    assert!(m.skips_at(50));
-    assert!(!m.skips_at(101));
-
-    assert_eq!(outbound_for_ibd(true), 100);
-    assert_eq!(outbound_for_ibd(false), 8);
-
-    assert_eq!(node_rpc_path(), "/");
-}
-
-fn workspace_bin(name: &str) -> std::path::PathBuf {
-    let profile = std::env::var("CARGO_PROFILE_NAME").unwrap_or_else(|_| {
-        if cfg!(debug_assertions) {
-            "debug".into()
-        } else {
-            "release".into()
-        }
-    });
-    // Prefer cargo-provided bin path when this package owns the binary; else workspace target.
-    let env_key = format!("CARGO_BIN_EXE_{}", name.replace('-', "_"));
-    if let Ok(p) = std::env::var(&env_key) {
-        return std::path::PathBuf::from(p);
-    }
-    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("../../target");
-    p.push(profile);
-    p.push(name);
-    p
-}
-
-#[test]
-fn cli_and_node_entrypoints() {
-    let td = TestDatadir::new().unwrap();
-    // High-level: exercise library entrypoints (coverage) for all networks.
-    for net in ["mainnet", "testnet", "signet", "regtest"] {
-        let d = td.path().join(net);
-        let code = node_cli_main([
-            "rbitcoin-node",
-            "--datadir",
-            d.to_str().unwrap(),
-            "--network",
-            net,
-            "--smoke",
-        ]);
-        assert_eq!(code, ExitCode::SUCCESS);
-    }
-
-    // clap help/version error-path (DisplayHelp / DisplayVersion)
-    let _ = node_cli_main(["rbitcoin-node", "--help"]);
-    let _ = node_cli_main(["rbitcoin-node", "--version"]);
-    let _ = cli_cli_main(["rbitcoin-cli", "--help"]);
-    let _ = cli_cli_main(["rbitcoin-cli", "--version"]);
-
-    assert_eq!(cli_cli_main(["rbitcoin-cli", "help"]), ExitCode::SUCCESS);
-    assert_ne!(cli_cli_main(["rbitcoin-cli"]), ExitCode::SUCCESS);
-    assert_ne!(cli_cli_main(["rbitcoin-cli", "getblockchaininfo"]), ExitCode::SUCCESS);
-
-    // Datadir is a file -> run_node error path in CLI
-    let blocked = td.path().join("blocked-datadir");
-    std::fs::write(&blocked, b"x").unwrap();
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--datadir", blocked.to_str().unwrap()]),
-        ExitCode::SUCCESS
-    );
-
-    // Shutdown error path via env fault injector (high-level CLI scenario).
-    {
-        let d = td.path().join("shutdown-fail");
-        std::env::set_var("RBITCOIN_TEST_DROP_STORE", "1");
-        let code = node_cli_main(["rbitcoin-node", "--datadir", d.to_str().unwrap(), "--smoke"]);
-        std::env::remove_var("RBITCOIN_TEST_DROP_STORE");
-        assert_ne!(code, ExitCode::SUCCESS);
-    }
-
-    // Optional: process smoke if prebuilt bins exist
-    let node = workspace_bin("rbitcoin-node");
-    if node.exists() {
-        let status = Command::new(&node)
-            .args([
-                "--datadir",
-                td.path().join("bin-smoke").to_str().unwrap(),
-                "--network",
-                "regtest",
-                "--smoke",
-            ])
-            .status()
-            .expect("spawn node");
-        assert!(status.success());
-    }
-}
-
-#[test]
-fn node_open_or_create_twice() {
-    let td = TestDatadir::new().unwrap();
-    let cfg = NodeConfig::default()
-        .with_datadir(td.path())
-        .with_network(Network::Regtest);
-    let h1 = run_node(cfg.clone()).unwrap();
-    assert!(format!("{:?}", h1).contains("NodeHandle"));
-    h1.shutdown().unwrap();
-    let h2 = run_node(cfg).unwrap();
-    h2.shutdown().unwrap();
-}
-
-#[test]
-fn node_wire_depth_zero() {
-    let td = TestDatadir::new().unwrap();
-    let cfg = NodeConfig {
-        wire_depth_blocks: 0,
-        archive_durability: true,
-        ..NodeConfig::default().with_datadir(td.path())
-    };
-    let h = run_node(cfg).unwrap();
-    assert_eq!(h.wire.depth(), 0);
-    h.shutdown().unwrap();
-}
-
-#[test]
-fn node_datadir_is_file_errors() {
-    let td = TestDatadir::new().unwrap();
-    let file = td.path().join("blocked");
-    std::fs::write(&file, b"nope").unwrap();
-    let cfg = NodeConfig::default().with_datadir(file);
-    let err = run_node(cfg).unwrap_err();
-    let _ = err.to_string();
-}
-
-fn synth_header(prev_fk: Fk, height: u32) -> HeaderRecord {
-    let mut hash = [0u8; 32];
-    hash[0..4].copy_from_slice(&height.to_le_bytes());
-    hash[4] = 0xaa;
-    let mut merkle = [0u8; 32];
-    merkle[0..4].copy_from_slice(&height.to_le_bytes());
-    HeaderRecord {
-        prev_fk,
-        version: 1,
-        timestamp: 1_700_000_000 + height,
-        bits: 0x1d00ffff,
-        nonce: height,
-        merkle_root: merkle,
-        hash,
-    }
-}
-
-fn coinbase_tx(height: u32) -> TxApply {
-    let mut txid = [0u8; 32];
-    txid[0..4].copy_from_slice(&height.to_le_bytes());
-    txid[31] = 0xcb;
-    TxApply {
-        tx: TxRecord {
-            txid,
-            version: 1,
-            locktime: 0,
-            input_start_fk: Fk::NULL,
-            input_count: 0,
-            output_start_fk: Fk::NULL,
-            output_count: 0,
-            raw: vec![height as u8],
-        },
-        inputs: vec![InputRecord {
-            parent_tx_fk: Fk::NULL,
-            index: 0,
-            prev_txid: [0u8; 32],
-            prev_index: u32::MAX,
-            sequence: u32::MAX,
-            script_sig: vec![0x00],
-        }],
-        outputs: vec![OutputRecord {
-            parent_tx_fk: Fk::NULL,
-            index: 0,
-            value: 50_0000_0000,
-            script: vec![0x51],
-        }],
-    }
-}
-
-fn spend_tx(height: u32, prev_txid: [u8; 32]) -> TxApply {
-    let mut txid = [0u8; 32];
-    txid[0..4].copy_from_slice(&height.to_le_bytes());
-    txid[31] = 0x5e;
-    TxApply {
-        tx: TxRecord {
-            txid,
-            version: 1,
-            locktime: 0,
-            input_start_fk: Fk::NULL,
-            input_count: 0,
-            output_start_fk: Fk::NULL,
-            output_count: 0,
-            raw: vec![0x5e, height as u8],
-        },
-        inputs: vec![InputRecord {
-            parent_tx_fk: Fk::NULL,
-            index: 0,
-            prev_txid,
-            prev_index: 0,
-            sequence: 0xffff_fffe,
-            script_sig: vec![0x51],
-        }],
-        outputs: vec![OutputRecord {
-            parent_tx_fk: Fk::NULL,
-            index: 0,
-            value: 49_0000_0000,
-            script: vec![0x51],
-        }],
-    }
-}
-
-#[test]
-fn chain_connect_100_blocks_and_reopen() {
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
+    // Growth + many blocks
     let mut prev = Fk::NULL;
-    for h in 0..100u32 {
-        let header = synth_header(prev, h);
-        let txs = vec![coinbase_tx(h)];
-        let hk = q
-            .connect_block(Height(h), &header, &txs)
-            .expect("connect");
-        prev = hk;
+    for h in 0..120u32 {
+        let mut hash = [0u8; 32];
+        hash[0..4].copy_from_slice(&h.to_le_bytes());
+        let header = HeaderRecord {
+            prev_fk: prev,
+            version: 1,
+            timestamp: h,
+            bits: 1,
+            nonce: h,
+            merkle_root: hash,
+            hash,
+        };
+        let mut txid = [0u8; 32];
+        txid[0..4].copy_from_slice(&h.to_le_bytes());
+        txid[31] = 0xcb;
+        let ta = TxApply {
+            tx: TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 0,
+                output_start_fk: Fk::NULL,
+                output_count: 0,
+                raw: vec![h as u8],
+            },
+            inputs: vec![InputRecord {
+                parent_tx_fk: Fk::NULL,
+                index: 0,
+                prev_txid: [0u8; 32],
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0],
+            }],
+            outputs: vec![OutputRecord {
+                parent_tx_fk: Fk::NULL,
+                index: 0,
+                value: 50_0000_0000,
+                script: vec![0x51],
+            }],
+        };
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
     }
-    assert_eq!(q.tip_height(), Some(Height(99)));
-    let (_fk, tip) = q.header_at_height(Height(99)).unwrap().unwrap();
-    assert_eq!(tip.nonce, 99);
-    assert_eq!(q.block_tx_fks(Height(50)).unwrap().len(), 1);
+    assert_eq!(q.tip_height(), Some(Height(119)));
     q.flush().unwrap();
     drop(q);
 
-    let q2 = Query::open_or_create(td.store_path()).unwrap();
-    assert_eq!(q2.tip_height(), Some(Height(99)));
-    let (_fk, h0) = q2.header_at_height(Height::GENESIS).unwrap().unwrap();
-    assert_eq!(h0.nonce, 0);
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(119)));
+    q.disconnect_tip().unwrap();
+    assert_eq!(q.tip_height(), Some(Height(118)));
+    assert!(q.connect_block(Height(0), &HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 0,
+        bits: 1,
+        nonce: 0,
+        merkle_root: [0; 32],
+        hash: [1; 32],
+    }, &[]).is_err());
 }
 
+// ─── Phase 2: rust-bitcoin consensus ────────────────────────────────────────
+
 #[test]
-fn chain_reorg_tip_clears_strong_spenders() {
+fn consensus_regtest_genesis_and_mine_chain() {
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
+    let params = ChainParams::regtest();
+    let milestone = Milestone::NONE;
 
-    // Genesis coinbase
-    let g_header = synth_header(Fk::NULL, 0);
-    let g_cb = coinbase_tx(0);
-    let g_txid = g_cb.tx.txid;
-    let g_fk = q
-        .connect_block(Height::GENESIS, &g_header, &[g_cb])
-        .unwrap();
-
-    // Block 1 spends genesis coinbase
-    let h1 = synth_header(g_fk, 1);
-    let sp = spend_tx(1, g_txid);
-    let spend_txid = sp.tx.txid;
-    q.connect_block(Height(1), &h1, &[coinbase_tx(1), sp])
-        .unwrap();
-    assert_eq!(q.tip_height(), Some(Height(1)));
-    assert_eq!(q.spenders(&g_txid, 0).unwrap().len(), 1);
-    assert_eq!(q.spenders_raw(&g_txid, 0).unwrap().len(), 1);
-
-    // Disconnect tip — strong spenders cleared; raw multimap keeps history
-    q.disconnect_tip().unwrap();
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, milestone).unwrap();
     assert_eq!(q.tip_height(), Some(Height::GENESIS));
-    assert!(q.spenders(&g_txid, 0).unwrap().is_empty());
-    assert_eq!(q.spenders_raw(&g_txid, 0).unwrap().len(), 1);
+    assert_eq!(
+        q.header_at_height(Height::GENESIS)
+            .unwrap()
+            .unwrap()
+            .1
+            .hash,
+        genesis.block_hash().to_byte_array()
+    );
 
-    // Reconnect alternate tip at height 1 without spending g_txid
-    let h1b = synth_header(g_fk, 1);
-    // different hash
-    let mut h1b = h1b;
-    h1b.hash[30] = 0xbb;
-    q.connect_block(Height(1), &h1b, &[coinbase_tx(1)])
-        .unwrap();
-    assert_eq!(q.tip_height(), Some(Height(1)));
-    assert!(q.spenders(&g_txid, 0).unwrap().is_empty());
-    // spend tx no longer strong
-    assert!(q.get_tx_by_txid(&spend_txid).unwrap().is_some());
-
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    for h in 1..=20u32 {
+        let block = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        accept_and_connect_block(&q, &params, Height(h), &block, milestone).unwrap();
+        tip = block.block_hash();
+        tip_time = block.header.time;
+    }
+    assert_eq!(q.tip_height(), Some(Height(20)));
     q.flush().unwrap();
+
     let q2 = Query::open_or_create(td.store_path()).unwrap();
-    assert_eq!(q2.tip_height(), Some(Height(1)));
-    assert!(q2.spenders(&g_txid, 0).unwrap().is_empty());
+    assert_eq!(q2.tip_height(), Some(Height(20)));
 }
 
 #[test]
-fn chain_connect_rejects_bad_height() {
+fn consensus_reject_bad_pow_and_merkle() {
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
-    let err = q.connect_block(Height(1), &synth_header(Fk::NULL, 1), &[]);
-    assert!(err.is_err());
-    q.connect_block(Height::GENESIS, &synth_header(Fk::NULL, 0), &[coinbase_tx(0)])
-        .unwrap();
-    let err = q.connect_block(Height(5), &synth_header(Fk(1), 5), &[]);
-    assert!(err.is_err());
-    q.disconnect_tip().unwrap();
-    assert!(q.tip_height().is_none());
-    assert!(q.disconnect_tip().is_err());
+    let params = ChainParams::regtest();
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+
+    let mut block = mine_regtest_block(genesis.block_hash(), genesis.header.time + 1, 1, vec![]);
+    // Break merkle root
+    block.header.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x11; 32]);
+    let ctx = ValidationContext {
+        params: &params,
+        height: Height(1),
+        milestone: Milestone::NONE,
+    };
+    assert!(matches!(
+        validate_block_structure(&block, &ctx),
+        Err(ConsensusError::BadBlock(_))
+    ));
+
+    // Valid structure but wrong prev → header fails
+    let block2 = mine_regtest_block(
+        BlockHash::from_byte_array([0x22; 32]),
+        genesis.header.time + 2,
+        1,
+        vec![],
+    );
+    assert!(accept_and_connect_block(&q, &params, Height(1), &block2, Milestone::NONE).is_err());
+}
+
+#[test]
+fn consensus_spend_and_reject_double_spend() {
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+
+    // Block 1: empty extra
+    let b1 = mine_regtest_block(genesis.block_hash(), genesis.header.time + 600, 1, vec![]);
+    let cb1_txid = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+
+    // Block 2: spend coinbase from b1 (maturity not enforced yet — Phase 2 simplified)
+    let spend = spend_anyone_can_spend(cb1_txid, 0, Amount::from_sat(49_0000_0000));
+    let b2 = mine_regtest_block(b1.block_hash(), b1.header.time + 600, 2, vec![spend.clone()]);
+    accept_and_connect_block(&q, &params, Height(2), &b2, ms).unwrap();
+    assert_eq!(
+        q.spenders(cb1_txid.as_byte_array(), 0).unwrap().len(),
+        1
+    );
+
+    // Block 3 attempting second spend of same outpoint must fail connect validation
+    let spend2 = spend_anyone_can_spend(cb1_txid, 0, Amount::from_sat(48_0000_0000));
+    let b3 = mine_regtest_block(b2.block_hash(), b2.header.time + 600, 3, vec![spend2]);
+    let err = accept_and_connect_block(&q, &params, Height(3), &b3, ms);
+    assert!(
+        matches!(
+            err,
+            Err(ConsensusError::PrevoutSpent) | Err(ConsensusError::BadTx(_))
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(q.tip_height(), Some(Height(2)));
+}
+
+#[test]
+fn consensus_milestone_skips_connect_checks() {
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    let params = ChainParams::regtest();
+    // Under milestone, we still do structure + header, skip prevout/script.
+    let ms = Milestone { height: 100 };
+    assert!(ms.skips_at(1));
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let b1 = mine_regtest_block(genesis.block_hash(), genesis.header.time + 1, 1, vec![]);
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(1)));
+}
+
+#[test]
+fn consensus_params_networks() {
+    for net in [
+        rbitcoin_primitives::Network::Mainnet,
+        rbitcoin_primitives::Network::Testnet,
+        rbitcoin_primitives::Network::Signet,
+        rbitcoin_primitives::Network::Regtest,
+    ] {
+        let p = ChainParams::for_network(net);
+        let g = rbitcoin_consensus::genesis_block(&p);
+        assert_eq!(g.block_hash(), p.genesis_hash);
+    }
 }

@@ -18,6 +18,8 @@ rbitcoin-rpc = { workspace = true }
 rbitcoin-cli = { workspace = true }
 rbitcoin-node = { workspace = true }
 tempfile = { workspace = true }
+bitcoin = { workspace = true }
+hex = { workspace = true }
 
 [[test]]
 name = "scenarios"

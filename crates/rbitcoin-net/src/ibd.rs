@@ -194,38 +194,29 @@ pub async fn parallel_ibd(
             let _ = request_headers(&slots, &hub, &mut header_req_seq);
         }
 
-        // Repair only after a longer stall, and only if tip-next is not already
-        // in-flight (normal gap wait). Clearing too early drops a useful pool.
-        if last_progress.elapsed() > cfg.stall.saturating_mul(3) {
+        // Hard path reset after a long stall with no tip advance: peers may be
+        // unable to serve the tip-next hash (pruned / wrong chain view).
+        if last_progress.elapsed() > cfg.stall.saturating_mul(4) {
             let tip = hub.tip_hash();
             let can_connect = tip
                 .map(|t| pool_by_prev.contains_key(&t))
                 .unwrap_or_else(|| {
                     pool_by_prev.contains_key(&BlockHash::from_byte_array([0u8; 32]))
                 });
-            let tip_next_inflight = ordered
-                .front()
-                .map(|h| inflight.contains_key(h) || pool.contains_key(h))
-                .unwrap_or(false);
-            if !can_connect && !tip_next_inflight {
-                if let (Some(t), Some(front)) = (tip, ordered.front().copied()) {
-                    if let Some(b) = pool.get(&front) {
-                        if b.header.prev_blockhash != t {
-                            eprintln!(
-                                "ibd: ordered desync front={front} not child of tip; resetting path"
-                            );
-                            ordered.clear();
-                            ordered_set.clear();
-                        }
-                    }
-                }
-                if !pool.is_empty() {
-                    eprintln!(
-                        "ibd: clearing {} orphan pool blocks (no tip extension)",
-                        pool.len()
-                    );
-                    pool.clear();
-                    pool_by_prev.clear();
+            if !can_connect {
+                eprintln!(
+                    "ibd: hard path reset (stall {:?}, pool={}, ordered={})",
+                    last_progress.elapsed(),
+                    pool.len(),
+                    ordered.len()
+                );
+                ordered.clear();
+                ordered_set.clear();
+                pool.clear();
+                pool_by_prev.clear();
+                inflight.clear();
+                for s in slots.iter_mut() {
+                    s.in_flight.clear();
                 }
                 let _ = request_headers(&slots, &hub, &mut header_req_seq);
                 last_progress = Instant::now();
@@ -263,7 +254,8 @@ pub async fn parallel_ibd(
                         });
                         inflight.insert(need, (s.id, Instant::now()));
                     }
-                    last_progress = Instant::now(); // avoid spamming recovery
+                    // Do NOT reset last_progress — peers may never deliver this
+                    // hash; path-reset below must still be able to fire.
                 }
             }
         }

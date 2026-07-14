@@ -45,7 +45,7 @@ fn node_cli_and_surface_smoke() {
     assert!(Network::parse("nope").is_err());
     assert_eq!(Network::parse("REGTEST").unwrap(), Network::Regtest);
     assert!(!VERSION.is_empty());
-    for k in 1u16..=10 {
+    for k in 1u16..=11 {
         assert_eq!(TableKind::from_u16(k).unwrap().as_u16(), k);
     }
     assert!(TableKind::from_u16(99).is_none());
@@ -526,6 +526,108 @@ fn consensus_mature_chain_spend_and_reconstruct() {
     let flags = local_service_flags();
     assert!(flags.has(ServiceFlags::NETWORK));
     assert!(flags.has(ServiceFlags::WITNESS));
+}
+
+// ─── Phase 6: scripthash index + wire ring + archive epoch ──────────────────
+
+#[test]
+fn scripthash_index_history_balance_and_reorg() {
+    use rbitcoin_store::script_hash;
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    let params = ChainParams::regtest();
+
+    // Build mature chain with a spend of OP_TRUE coinbase (script [0x51]).
+    let chain = build_mature_regtest_with_spend(&q, &params);
+    let sh = script_hash(&[0x51]);
+
+    let history = q.scripthash_history(&sh).unwrap();
+    assert!(
+        !history.is_empty(),
+        "OP_TRUE outputs should appear in history"
+    );
+    // Coinbase h1 and spend tx both touch this script.
+    assert!(history.len() >= 2);
+
+    let bal = q.scripthash_balance(&sh).unwrap();
+    // Many coinbases still unspent; balance should be positive.
+    assert!(bal.confirmed > 0, "confirmed={}", bal.confirmed);
+    assert_eq!(bal.unconfirmed, 0);
+
+    let utxos = q.scripthash_listunspent(&sh).unwrap();
+    assert!(!utxos.is_empty());
+    // Spent coinbase from h1 must not be listed.
+    assert!(
+        !utxos
+            .iter()
+            .any(|u| u.tx_hash == chain.matured_coinbase_txid.to_byte_array() && u.tx_pos == 0)
+    );
+
+    // Reorg: disconnect tip (spend block) → coinbase UTXO returns, history drops spend.
+    q.disconnect_tip().unwrap();
+    let utxos2 = q.scripthash_listunspent(&sh).unwrap();
+    assert!(
+        utxos2
+            .iter()
+            .any(|u| u.tx_hash == chain.matured_coinbase_txid.to_byte_array() && u.tx_pos == 0),
+        "after disconnect, matured coinbase should be unspent again"
+    );
+}
+
+#[test]
+fn wire_ring_and_archive_epoch() {
+    use bitcoin::consensus::Encodable;
+    use rbitcoin_wire_cache::WireRing;
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    let params = ChainParams::regtest();
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+
+    let wire_dir = td.path().join("wire");
+    let ring = WireRing::with_dir(3, &wire_dir).unwrap();
+    assert!(ring.is_empty());
+
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    let mut blocks = vec![genesis.clone()];
+    for h in 1..=5u32 {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        accept_and_connect_block(&q, &params, Height(h), &b, Milestone::NONE).unwrap();
+        let mut wire = Vec::new();
+        b.consensus_encode(&mut wire).unwrap();
+        ring.push(h, b.block_hash().to_byte_array(), wire, h)
+            .unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+        blocks.push(b);
+    }
+    // depth 3 → keep heights 3,4,5 (tip-2..=tip)
+    assert!(!ring.contains_height(1));
+    assert!(ring.contains_height(5));
+    assert!(ring.get_by_hash(&blocks[5].block_hash().to_byte_array()).is_some());
+
+    // Finalize through height 4 → drop wire ≤ 4
+    q.set_archive_mode(true).unwrap();
+    q.finalize_through(4).unwrap();
+    ring.drop_through(4).unwrap();
+    assert!(!ring.contains_height(4));
+    assert!(ring.contains_height(5));
+    let ep = q.archive_epoch();
+    assert!(ep.archive_mode);
+    assert_eq!(ep.finalized_height, Some(4));
+    assert!(ep.is_soft_zone(5));
+    assert!(!ep.is_soft_zone(4));
+
+    // Reopen epoch from disk
+    let q2 = Query::open_or_create(td.store_path()).unwrap();
+    assert_eq!(q2.archive_epoch().finalized_height, Some(4));
+
+    // Wire ring reloads from disk
+    let ring2 = WireRing::with_dir(3, &wire_dir).unwrap();
+    assert!(ring2.contains_height(5));
 }
 
 #[test]

@@ -34,11 +34,13 @@ impl NodeHandle {
     }
 }
 
-/// Start the node: ensure datadir, open store, prepare placeholders.
+/// Start the node: ensure datadir, open store, prepare tip wire ring.
 pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
     config.ensure_datadir()?;
     let query = Query::open_or_create(config.store_path())?;
-    let wire = WireRing::new(config.wire_depth_blocks);
+    let wire_dir = config.datadir.join("wire");
+    let wire = WireRing::with_dir(config.wire_depth_blocks, wire_dir)
+        .map_err(|e| NodeError::Config(format!("wire ring: {e}")))?;
     Ok(NodeHandle {
         config,
         query,

@@ -353,28 +353,24 @@ Policy: **do not implement BIP9 / version-bits “deployment windows” as a sep
 
 ---
 
-### Phase 6 — Durability + scripthash index (2–4 weeks)
+### Phase 6 — Durability + scripthash index — **core done**
 
 **Goal:** Durable-archive soft/hard zones; **script hash index** required by Electrum (and generally useful).
 
-**Work**
-
-1. `archive_mode`, epoch finalize, tip wire ring (non-finalized only); recovery rules per durable-archive doc §9.
-2. Crash tests; getdata for finalized heights still **reconstruct only**.
-3. **Scripthash index (Class B multimap):**
-   - Key = `SHA256(scriptPubKey)` (Electrum byte order: binary hash of script, then usually reversed hex for API).
-   - Values: outpoint, value, create height/txid, spend height/txid when **strong**.
-4. Update index on `connect_block` / `disconnect_tip` (strong-aware; reorg-safe).
-5. Optional backfill tool for existing stores.
-6. Query helpers: history, balance, listunspent for one scripthash.
-7. High-level tests: connect chain → query history; reorg updates index; no historical full-block file growth.
+| # | Work | Status |
+|---|------|--------|
+| 1 | `archive_mode` + `archive_epoch` finalize_through + reopen | ✅ |
+| 2 | Tip `WireRing` (RAM + datadir/wire files, depth eviction, drop_through) | ✅ |
+| 3 | Scripthash Class B multimap + connect/disconnect updates | ✅ |
+| 4 | Query: history / balance / listunspent (strong-filtered) | ✅ |
+| 5 | High-level tests (history+reorg, wire+epoch) | ✅ |
+| 6 | Optional full backfill tool / crash soak | ⬜ later |
+| 7 | Auto wire push on every tip accept in net path | ⬜ polish |
 
 **Exit**
 
-- Durability acceptance; scripthash confirmed history correct across reorg.
-- SCHEMA.md updated for new tables.
-
-**Note:** Index **writes** can start as soon as connect is stable; shipping the index before Electrum wire (Phase 7) is intentional so IBD builds history once.
+- Durability acceptance; scripthash confirmed history correct across reorg. ✅
+- SCHEMA.md updated. ✅
 
 ---
 
@@ -484,9 +480,9 @@ Policy: **do not implement BIP9 / version-bits “deployment windows” as a sep
 |--------|--------|
 | **Done Phase 4 core** | Reconstruct + store-backed restart serve; WITNESS; consensus depth; seeds; long-running node |
 | **Done Phase 5 core** | Tip follow (`follow_from` + announce); cmpct→getdata; most-work reorg foundation |
+| **Done Phase 6 core** | Wire ring, archive epoch, scripthash index + Electrum query helpers |
 | **Documented gaps** | §3.1 — no separate BIP9 window workstream; concurrent IBD window optional |
-| **Next** | **Phase 6** durability + scripthash index |
-| Then | Phase 7 Electrum |
+| **Next** | **Phase 7** Electrum protocol server |
 | Then | Phase 8 network-ready sign-off |
 
 ---
@@ -514,7 +510,7 @@ Policy: **do not implement BIP9 / version-bits “deployment windows” as a sep
 
 | Item | Value |
 |------|-------|
-| Status | Living plan — Phase 0–5 **core done**; Electrum still Phases 6–7 |
+| Status | Living plan — Phase 0–6 **core done**; Electrum = Phase 7 |
 | Depends on | [`libbitcoin-durable-archive-variant.md`](./libbitcoin-durable-archive-variant.md), [`SCHEMA.md`](./SCHEMA.md) |
-| Next action | Phase 6 — durable-archive tip wire ring + scripthash index |
+| Next action | Phase 7 — Electrum TCP/SSL JSON-RPC server |
 | Gaps policy | §3.1 — deployment windows only as needed for historical block rules |

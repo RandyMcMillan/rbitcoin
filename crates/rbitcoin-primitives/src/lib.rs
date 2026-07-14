@@ -133,6 +133,8 @@ pub enum TableKind {
     Confirmed = 8,
     ArrayLink = 9,
     HashHead = 10,
+    /// Electrum scripthash multimap (SHA256(scriptPubKey)).
+    ScriptHash = 11,
 }
 
 impl TableKind {
@@ -148,6 +150,7 @@ impl TableKind {
             8 => Some(TableKind::Confirmed),
             9 => Some(TableKind::ArrayLink),
             10 => Some(TableKind::HashHead),
+            11 => Some(TableKind::ScriptHash),
             _ => None,
         }
     }

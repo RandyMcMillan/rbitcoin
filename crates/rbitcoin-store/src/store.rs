@@ -1,12 +1,15 @@
 use crate::chain::{BlockTxsTable, ConfirmedTable, StrongTxTable};
+use crate::epoch::ArchiveEpoch;
 use crate::error::StoreError;
 use crate::header_table::{HeaderRecord, HeaderTable};
 use crate::point_table::PointTable;
+use crate::scripthash::ScriptHashTable;
 use crate::tx_table::{InputRecord, InputTable, OutputRecord, OutputTable, TxRecord, TxTable};
 use rbitcoin_primitives::{Fk, Height, SCHEMA_VERSION, STORE_MAGIC};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Top-level store handle for a datadir `store/` directory.
 pub struct Store {
@@ -16,9 +19,11 @@ pub struct Store {
     pub inputs: InputTable,
     pub outputs: OutputTable,
     pub points: PointTable,
+    pub scripthash: ScriptHashTable,
     pub confirmed: ConfirmedTable,
     pub strong_tx: StrongTxTable,
     pub block_txs: BlockTxsTable,
+    epoch: Mutex<ArchiveEpoch>,
 }
 
 impl Store {
@@ -32,15 +37,19 @@ impl Store {
             std::fs::create_dir_all(&path).map_err(|e| StoreError::io(&path, e))?;
         }
         write_meta(&path)?;
+        let epoch = ArchiveEpoch::default();
+        epoch.store(&path)?;
         Ok(Self {
             headers: HeaderTable::create(&path)?,
             txs: TxTable::create(&path)?,
             inputs: InputTable::create(&path)?,
             outputs: OutputTable::create(&path)?,
             points: PointTable::create(&path)?,
+            scripthash: ScriptHashTable::create(&path)?,
             confirmed: ConfirmedTable::create(&path)?,
             strong_tx: StrongTxTable::create(&path)?,
             block_txs: BlockTxsTable::create(&path)?,
+            epoch: Mutex::new(epoch),
             path,
         })
     }
@@ -51,15 +60,24 @@ impl Store {
             return Err(StoreError::NotDirectory(path));
         }
         check_meta(&path)?;
+        let epoch = ArchiveEpoch::load(&path)?;
+        // Scripthash table is new in Phase 6 — create if missing (upgrade path).
+        let scripthash = if path.join("scripthash.body").exists() {
+            ScriptHashTable::open(&path)?
+        } else {
+            ScriptHashTable::create(&path)?
+        };
         Ok(Self {
             headers: HeaderTable::open(&path)?,
             txs: TxTable::open(&path)?,
             inputs: InputTable::open(&path)?,
             outputs: OutputTable::open(&path)?,
             points: PointTable::open(&path)?,
+            scripthash,
             confirmed: ConfirmedTable::open(&path)?,
             strong_tx: StrongTxTable::open(&path)?,
             block_txs: BlockTxsTable::open(&path)?,
+            epoch: Mutex::new(epoch),
             path,
         })
     }
@@ -166,10 +184,33 @@ impl Store {
         self.inputs.flush()?;
         self.outputs.flush()?;
         self.points.flush()?;
+        self.scripthash.flush()?;
         self.confirmed.flush()?;
         self.strong_tx.flush()?;
         self.block_txs.flush()?;
         Ok(())
+    }
+
+    pub fn epoch(&self) -> ArchiveEpoch {
+        self.epoch.lock().unwrap().clone()
+    }
+
+    pub fn set_archive_mode(&self, enabled: bool) -> Result<(), StoreError> {
+        let mut ep = self.epoch.lock().unwrap();
+        ep.archive_mode = enabled;
+        ep.store(&self.path)
+    }
+
+    /// Finalize (seal) archive through `height` (inclusive). Soft zone is above this height.
+    ///
+    /// Flushes all tables and persists the epoch. Caller should drop wire entries ≤ height.
+    pub fn finalize_through(&self, height: u32) -> Result<(), StoreError> {
+        self.flush()?;
+        // Best-effort fsync of store directory files is via table flush; epoch syncs itself.
+        let mut ep = self.epoch.lock().unwrap();
+        ep.archive_mode = true;
+        ep.finalized_height = Some(height);
+        ep.store(&self.path)
     }
 }
 

@@ -19,8 +19,9 @@ Endianness: **little-endian** for all multi-byte integers.
     strong_tx.body               # Class C: (tx_fk-1) → header fk (0 = unstrong)
     block_txs.body / block_txs.idx
     block_txs_height.body        # height → block_txs list fk
-    archive_epoch                # Phase 6+
-  wire/                          # tip wire ring (post-IBD)
+    scripthash.body / scripthash.head  # Class B Electrum scripthash multimap
+    archive_epoch                # finalize + archive_mode
+  wire/                          # tip wire ring (soft zone only)
 ```
 
 ## Common file header (16 bytes)
@@ -46,6 +47,7 @@ Endianness: **little-endian** for all multi-byte integers.
 | 8 | confirmed |
 | 9 | array_link (idx files, block lists, dense u64 arrays) |
 | 10 | hash_head |
+| 11 | scripthash (Electrum script hash multimap) |
 
 ## Growable var records (`*.body` + `*.idx`)
 
@@ -98,11 +100,30 @@ out_txid, out_index, spending_tx_fk, spending_input_index, next.
 
 u32 count, then count × u64 tx_fk.
 
+### Scripthash entry (fixed 108 bytes)
+
+| Field | Type |
+|-------|------|
+| scripthash | [u8; 32] SHA256(scriptPubKey) |
+| txid | [u8; 32] |
+| vout | u32 |
+| value | i64 |
+| create_height | u32 |
+| create_tx_fk | u64 |
+| spend_height | u32 (`u32::MAX` = unspent) |
+| spend_tx_fk | u64 |
+| next | u64 (multimap chain) |
+
+### Archive epoch (`archive_epoch`, 32 bytes)
+
+magic, schema version, archive_mode flag, optional finalized_height, wire_depth.
+
 ## Chain ops (query layer)
 
-- `connect_block(height, header, txs)` — archive write + point spends + set strong + confirmed + block_txs.
-- `disconnect_tip()` — clear strong for tip txs, clear confirmed tip (Class A/B rows remain).
+- `connect_block(height, header, txs)` — archive write + point spends + **scripthash create/spend** + set strong + confirmed + block_txs.
+- `disconnect_tip()` — clear strong for tip txs, clear scripthash spends at tip, clear confirmed tip (Class A rows remain).
 - `spenders(outpoint)` — **only strong** spending txs; `spenders_raw` for full multimap history.
+- `scripthash_history` / `scripthash_balance` / `scripthash_listunspent` — strong-filtered Electrum helpers.
 
 ## Identity
 

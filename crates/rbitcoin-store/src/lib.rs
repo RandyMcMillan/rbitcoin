@@ -2,22 +2,26 @@
 //!
 //! Class A bodies are append-oriented. Class B multimaps use mutable hash heads.
 //! Class C (confirmed / strong_tx) is tip-mutable for reorgs.
-//! Durability epochs land in a later phase; v0 is crash-rebuildable best-effort.
+//! Archive epochs + tip wire ring: durable-archive soft/hard zones.
 
 mod array_table;
 mod chain;
+mod epoch;
 mod error;
 mod file;
 mod hashhead;
 mod header_table;
 mod point_table;
+mod scripthash;
 mod store;
 mod tx_table;
 mod var_table;
 
+pub use epoch::ArchiveEpoch;
 pub use error::StoreError;
 pub use header_table::HeaderRecord;
 pub use point_table::PointRecord;
+pub use scripthash::{script_hash, ScriptHashRecord, ScriptHashTable, UNSPENT};
 pub use store::Store;
 pub use tx_table::{InputRecord, OutputRecord, TxRecord};
 

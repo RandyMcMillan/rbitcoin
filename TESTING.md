@@ -45,6 +45,8 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `chain_connect_reorg_and_growth` | Query | Synthetic growth + disconnect (rehash) |
 | `consensus_mature_chain_spend_and_reconstruct` | Consensus+query | **One** mature mine: spend, double-spend, reopen reconstruct |
 | `consensus_reject_bad_structure_and_milestone` | Consensus | Bad merkle/prev + milestone skip |
+| `scripthash_index_history_balance_and_reorg` | Query | Electrum index + reorg spend clear |
+| `wire_ring_and_archive_epoch` | Wire/epoch | Tip ring depth + finalize soft zone |
 | `two_node_header_and_block_sync` | P2P | Seeder → peer |
 | `serve_after_restart_via_reconstruct` | P2P | Cold serve via reconstruct |
 | `three_node_relay_path` | P2P | Hop serve |

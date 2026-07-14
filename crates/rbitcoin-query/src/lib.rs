@@ -6,8 +6,10 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, CompactTarget, Transaction, TxMerkleNode};
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_store::{
-    HeaderRecord, InputRecord, OutputRecord, PointRecord, Store, StoreError, TxRecord,
+    script_hash, HeaderRecord, InputRecord, OutputRecord, PointRecord, ScriptHashRecord, Store,
+    StoreError, TxRecord, UNSPENT,
 };
+use std::collections::BTreeMap;
 use std::path::Path;
 
 pub type QueryError = StoreError;
@@ -173,6 +175,17 @@ impl Query {
                 if rec.prev_txid != [0u8; 32] {
                     self.store
                         .put_spend(&rec.prev_txid, rec.prev_index, tx_fk, rec.index)?;
+                    // Scripthash: mark prior output spent when we can resolve its script.
+                    if let Some(sh) = self.script_hash_for_outpoint(&rec.prev_txid, rec.prev_index)?
+                    {
+                        let _ = self.store.scripthash.mark_spent(
+                            &sh,
+                            &rec.prev_txid,
+                            rec.prev_index,
+                            height.0,
+                            tx_fk,
+                        )?;
+                    }
                 }
             }
             for (i, out) in ta.outputs.iter().enumerate() {
@@ -180,6 +193,18 @@ impl Query {
                 rec.parent_tx_fk = tx_fk;
                 rec.index = i as u32;
                 self.store.put_output(&rec)?;
+                let sh = script_hash(&rec.script);
+                self.store.scripthash.put_create(&ScriptHashRecord {
+                    scripthash: sh,
+                    txid: ta.tx.txid,
+                    vout: i as u32,
+                    value: rec.value,
+                    create_height: height.0,
+                    create_tx_fk: tx_fk,
+                    spend_height: UNSPENT,
+                    spend_tx_fk: Fk::NULL,
+                    next: Fk::NULL,
+                })?;
             }
 
             self.store.strong_tx.set_strong(tx_fk, header_fk)?;
@@ -191,18 +216,147 @@ impl Query {
         Ok(header_fk)
     }
 
-    /// Disconnect the current tip (Class C only; archive rows remain).
+    /// Disconnect the current tip (Class C + scripthash spend clear; archive rows remain).
     pub fn disconnect_tip(&self) -> Result<(), QueryError> {
         let height = self
             .tip_height()
             .ok_or(StoreError::Corrupt("no tip to disconnect"))?;
         let tx_fks = self.store.block_txs.get_list(height)?;
-        for fk in &tx_fks {
-            self.store.strong_tx.set_unstrong(*fk)?;
+
+        // Clear spends recorded at this height; creates become unstrong with their txs.
+        for &tx_fk in &tx_fks {
+            let tx = self.store.get_tx(tx_fk)?;
+            if tx.input_count > 0 {
+                let start = tx.input_start_fk.get().ok_or(StoreError::InvalidFk)?;
+                for i in 0..tx.input_count {
+                    let inp = self.store.get_input(Fk(start + u64::from(i)))?;
+                    if inp.prev_txid != [0u8; 32] {
+                        if let Some(sh) =
+                            self.script_hash_for_outpoint(&inp.prev_txid, inp.prev_index)?
+                        {
+                            self.store.scripthash.clear_spend_at_height(
+                                &sh,
+                                &inp.prev_txid,
+                                inp.prev_index,
+                                height.0,
+                            )?;
+                        }
+                    }
+                }
+            }
+            self.store.strong_tx.set_unstrong(tx_fk)?;
         }
         self.store.block_txs.clear_height(height)?;
         self.store.confirmed.disconnect_tip(height)?;
         Ok(())
+    }
+
+    fn script_hash_for_outpoint(
+        &self,
+        txid: &[u8; 32],
+        vout: u32,
+    ) -> Result<Option<[u8; 32]>, QueryError> {
+        let Some((_fk, prev)) = self.store.get_tx_by_txid(txid)? else {
+            return Ok(None);
+        };
+        if vout >= prev.output_count {
+            return Ok(None);
+        }
+        let start = match prev.output_start_fk.get() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let out = self.store.get_output(Fk(start + u64::from(vout)))?;
+        Ok(Some(script_hash(&out.script)))
+    }
+
+    /// Confirmed Electrum-style history for a scripthash: (height, txid) pairs, height order.
+    pub fn scripthash_history(
+        &self,
+        scripthash: &[u8; 32],
+    ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
+        let entries = self.store.scripthash.entries(scripthash)?;
+        let mut by_txid: BTreeMap<[u8; 32], i64> = BTreeMap::new();
+        for (_fk, rec) in entries {
+            if !self.store.strong_tx.is_strong(rec.create_tx_fk)? {
+                continue;
+            }
+            // Funding tx
+            by_txid
+                .entry(rec.txid)
+                .and_modify(|h| *h = (*h).min(i64::from(rec.create_height)))
+                .or_insert(i64::from(rec.create_height));
+            // Spending tx if spent on best chain
+            if !rec.is_unspent() {
+                if let Some(sfk) = rec.spend_tx_fk.get() {
+                    if self.store.strong_tx.is_strong(Fk(sfk))? {
+                        let spend_tx = self.store.get_tx(Fk(sfk))?;
+                        by_txid
+                            .entry(spend_tx.txid)
+                            .and_modify(|h| *h = (*h).min(i64::from(rec.spend_height)))
+                            .or_insert(i64::from(rec.spend_height));
+                    }
+                }
+            }
+        }
+        let mut items: Vec<ScriptHashHistoryItem> = by_txid
+            .into_iter()
+            .map(|(txid, height)| ScriptHashHistoryItem { height, txid })
+            .collect();
+        items.sort_by_key(|i| i.height);
+        Ok(items)
+    }
+
+    /// Confirmed balance (confirmed funded − confirmed spent) for a scripthash.
+    pub fn scripthash_balance(&self, scripthash: &[u8; 32]) -> Result<ScriptHashBalance, QueryError> {
+        let mut confirmed = 0i64;
+        for (_fk, rec) in self.store.scripthash.entries(scripthash)? {
+            if !self.store.strong_tx.is_strong(rec.create_tx_fk)? {
+                continue;
+            }
+            if rec.is_unspent() {
+                confirmed = confirmed.saturating_add(rec.value);
+            }
+        }
+        Ok(ScriptHashBalance {
+            confirmed,
+            unconfirmed: 0,
+        })
+    }
+
+    /// Confirmed UTXOs for a scripthash.
+    pub fn scripthash_listunspent(
+        &self,
+        scripthash: &[u8; 32],
+    ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
+        let mut out = Vec::new();
+        for (_fk, rec) in self.store.scripthash.entries(scripthash)? {
+            if !self.store.strong_tx.is_strong(rec.create_tx_fk)? {
+                continue;
+            }
+            if rec.is_unspent() {
+                out.push(ScriptHashUtxo {
+                    tx_hash: rec.txid,
+                    tx_pos: rec.vout,
+                    height: rec.create_height,
+                    value: rec.value,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.height.cmp(&b.height).then(a.tx_pos.cmp(&b.tx_pos)));
+        Ok(out)
+    }
+
+    pub fn set_archive_mode(&self, enabled: bool) -> Result<(), QueryError> {
+        self.store.set_archive_mode(enabled)
+    }
+
+    pub fn finalize_through(&self, height: u32) -> Result<(), QueryError> {
+        self.store.finalize_through(height)
+    }
+
+    pub fn archive_epoch(&self) -> rbitcoin_store::ArchiveEpoch {
+        self.store.epoch()
     }
 
     pub fn block_tx_fks(&self, height: Height) -> Result<Vec<Fk>, QueryError> {
@@ -376,6 +530,27 @@ fn wire_header(rec: &HeaderRecord, prev_blockhash: BlockHash) -> BlockHeader {
 fn decode_tx_raw(raw: &[u8]) -> Result<Transaction, QueryError> {
     let mut cursor = raw;
     Transaction::consensus_decode(&mut cursor).map_err(|_| StoreError::Corrupt("tx raw decode"))
+}
+
+/// Electrum `blockchain.scripthash.get_history` row (confirmed only in v1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptHashHistoryItem {
+    pub height: i64,
+    pub txid: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptHashBalance {
+    pub confirmed: i64,
+    pub unconfirmed: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptHashUtxo {
+    pub tx_hash: [u8; 32],
+    pub tx_pos: u32,
+    pub height: u32,
+    pub value: i64,
 }
 
 pub fn crate_name() -> &'static str {

@@ -192,6 +192,42 @@ pub async fn parallel_ibd(
             let _ = request_headers(&slots, &hub, &mut header_req_seq);
         }
 
+        // Tip-gap recovery: if we have a deep orphan pool but tip is not
+        // extending, the tip-next hash is missing — cancel far inflight and
+        // re-request only the tip gap from every live peer.
+        if pool.len() > 256 && last_progress.elapsed() > Duration::from_secs(2) {
+            if let Some(&need) = ordered.front() {
+                if !pool.contains_key(&need) && !hub.has_block(&need) {
+                    eprintln!(
+                        "ibd: tip-gap recovery need={need} pool={} inflight={}",
+                        pool.len(),
+                        inflight.len()
+                    );
+                    // Drop far-ahead inflight so peers focus on the gap.
+                    let far: Vec<BlockHash> = inflight
+                        .keys()
+                        .copied()
+                        .filter(|h| *h != need)
+                        .collect();
+                    for h in far {
+                        if let Some((pid, _)) = inflight.remove(&h) {
+                            if let Some(s) = slots.iter_mut().find(|s| s.id == pid) {
+                                s.in_flight.remove(&h);
+                            }
+                        }
+                    }
+                    // Ask every live peer for the tip-next block.
+                    for s in slots.iter().filter(|s| s.alive) {
+                        let _ = s.cmd_tx.send(PeerCmd::GetData {
+                            hashes: vec![need],
+                        });
+                        inflight.insert(need, (s.id, Instant::now()));
+                    }
+                    last_progress = Instant::now(); // avoid spamming recovery
+                }
+            }
+        }
+
         // Assign work: only hashes within the download window from ordered front.
         assign_work_ordered(
             &mut slots,

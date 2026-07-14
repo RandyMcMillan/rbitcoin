@@ -1,5 +1,6 @@
 use crate::error::NodeError;
 use rbitcoin_primitives::Network;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// Node process configuration (CLI / conf file surface grows over time).
@@ -9,6 +10,16 @@ pub struct NodeConfig {
     pub network: Network,
     pub archive_durability: bool,
     pub wire_depth_blocks: u32,
+    /// Bind address for P2P listen (`None` = do not listen).
+    pub p2p_listen: Option<SocketAddr>,
+    /// Explicit outbound peers (`--connect`).
+    pub connect: Vec<SocketAddr>,
+    /// Inject fixed/DNS seeds into addrman when connecting without `--connect`.
+    pub use_seeds: bool,
+    /// When true, open store and exit (CI / smoke).
+    pub smoke: bool,
+    /// Cap how long `run_p2p` idles after sync (None = forever). Used by tests.
+    pub max_run_secs: Option<u64>,
 }
 
 impl Default for NodeConfig {
@@ -18,6 +29,11 @@ impl Default for NodeConfig {
             network: Network::Mainnet,
             archive_durability: true,
             wire_depth_blocks: 100,
+            p2p_listen: None,
+            connect: Vec::new(),
+            use_seeds: true,
+            smoke: false,
+            max_run_secs: None,
         }
     }
 }
@@ -33,6 +49,11 @@ impl NodeConfig {
         self
     }
 
+    pub fn with_p2p_listen(mut self, addr: SocketAddr) -> Self {
+        self.p2p_listen = Some(addr);
+        self
+    }
+
     pub fn store_path(&self) -> PathBuf {
         self.datadir.join("store")
     }
@@ -41,7 +62,6 @@ impl NodeConfig {
         if self.datadir.as_os_str().is_empty() {
             return Err(NodeError::Config("datadir must not be empty".into()));
         }
-        // wire_depth 0 is allowed (epoch-only durability later).
         let _ = (self.wire_depth_blocks, self.archive_durability);
         Ok(())
     }

@@ -4,11 +4,15 @@ mod cache;
 mod codec;
 mod error;
 mod peer;
+mod seeds;
 mod service;
 
 pub use cache::BlockCache;
 pub use error::NetError;
 pub use peer::local_service_flags;
+pub use seeds::{
+    default_port, dns_seeds, fixed_seed_hosts, resolve_fixed_seeds, AddrMan,
+};
 pub use service::{magic_for, NetConfig, P2PHandle, P2PNode};
 
 pub fn crate_name() -> &'static str {

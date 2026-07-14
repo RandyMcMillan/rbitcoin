@@ -20,3 +20,4 @@ rbitcoin-net = { workspace = true }
 rbitcoin-rpc = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+tokio = { workspace = true }

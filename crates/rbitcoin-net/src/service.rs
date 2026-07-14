@@ -153,6 +153,36 @@ impl P2PNode {
         Ok(())
     }
 
+    /// Try multiple peers in order until one yields blocks (or all fail).
+    pub async fn sync_from_peers(&self, peers: &[SocketAddr]) -> Result<u32, NetError> {
+        if peers.is_empty() {
+            return Err(NetError::Protocol("no peers to sync from"));
+        }
+        let mut last_err = NetError::Protocol("all peers failed");
+        let mut total = 0u32;
+        for peer in peers {
+            match self.sync_from(*peer).await {
+                Ok(n) => {
+                    total = total.saturating_add(n);
+                    if self.tip_height().is_some() {
+                        // Keep going across peers for more headers if useful;
+                        // for foundation, one successful sync path is enough when n>0
+                        // or we already match peer tip after a full empty download.
+                        if n > 0 {
+                            return Ok(total);
+                        }
+                    }
+                }
+                Err(e) => last_err = e,
+            }
+        }
+        if total > 0 {
+            Ok(total)
+        } else {
+            Err(last_err)
+        }
+    }
+
     /// Connect outbound and sync headers/blocks until peer has no more.
     pub async fn sync_from(&self, peer: SocketAddr) -> Result<u32, NetError> {
         let mut stream = TcpStream::connect(peer).await?;

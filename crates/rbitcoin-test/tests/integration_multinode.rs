@@ -150,6 +150,60 @@ async fn three_node_relay_path() {
     leaf.shutdown().await;
 }
 
+/// Multi-peer sync API: second address fails, first succeeds.
+#[tokio::test]
+async fn sync_from_peers_tries_list() {
+    let seed_dir = TempDir::new().unwrap();
+    let peer_dir = TempDir::new().unwrap();
+
+    let seed = start_node(&seed_dir).await;
+    seed_chain(&seed, 4).await;
+
+    let peer = start_node(&peer_dir).await;
+    let bad: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let n = peer
+        .sync_from_peers(&[bad, seed.local_addr])
+        .await
+        .expect("multi-peer sync");
+    assert!(n >= 4, "downloaded {n}");
+    peer.wait_height(4, Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    seed.shutdown().await;
+    peer.shutdown().await;
+}
+
+/// Long-running node entry: listen briefly, connect to seeder, exit via max_run_secs.
+#[tokio::test]
+async fn node_run_p2p_short() {
+    use rbitcoin_node::{run_p2p, NodeConfig};
+    use rbitcoin_primitives::Network;
+
+    let seed_dir = TempDir::new().unwrap();
+    let node_dir = TempDir::new().unwrap();
+
+    let seed = start_node(&seed_dir).await;
+    seed_chain(&seed, 3).await;
+    let seed_addr = seed.local_addr;
+
+    let mut cfg = NodeConfig::default()
+        .with_datadir(node_dir.path())
+        .with_network(Network::Regtest)
+        .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+    cfg.connect = vec![seed_addr];
+    cfg.use_seeds = false;
+    cfg.max_run_secs = Some(0); // sync then exit immediately
+
+    run_p2p(cfg).await.expect("run_p2p");
+
+    // Reopen store — should have synced chain
+    let q = Query::open_or_create(node_dir.path().join("store")).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(3)));
+
+    seed.shutdown().await;
+}
+
 /// Periodic / holistic mesh: larger chain, multi-hop, concurrent peers.
 /// Run: `cargo test -p rbitcoin-test --test integration_multinode -- --ignored --nocapture`
 #[tokio::test]

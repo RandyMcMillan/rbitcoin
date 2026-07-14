@@ -330,6 +330,7 @@ dependencies = [
  "rbitcoin-wire-cache",
  "serde",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

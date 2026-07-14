@@ -8,9 +8,14 @@ pkgs.mkShell {
     clippy
     llvmPackages.bintools
     llvmPackages.llvm
+    cargo-llvm-cov
     pkg-config
     openssl
   ];
 
   RUST_BACKTRACE = "1";
+  shellHook = ''
+    export LLVM_COV="${pkgs.llvmPackages.llvm}/bin/llvm-cov"
+    export LLVM_PROFDATA="${pkgs.llvmPackages.llvm}/bin/llvm-profdata"
+  '';
 }

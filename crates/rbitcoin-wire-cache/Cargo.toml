@@ -1,0 +1,9 @@
+[package]
+name = "rbitcoin-wire-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Tip wire-format block ring (node layer)"
+
+[dependencies]

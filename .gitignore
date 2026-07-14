@@ -1,6 +1,5 @@
 /target/
 **/*.rs.bk
-Cargo.lock
 .coverage/
 coverage/
 lcov.info

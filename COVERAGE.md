@@ -4,10 +4,12 @@
 
 | Metric | Required |
 |--------|----------|
-| Line coverage | **100%** of first-party Rust code in the workspace |
-| Branch coverage | **100%** of first-party Rust code in the workspace |
+| Line coverage | **100%** — every executable first-party line runs at least once (HTML `uncovered-line` count must be **0**) |
+| Branch coverage | **100%** when measured on nightly with `--branch`; on stable, region-partial lines in the text report may remain — still close gaps via scenarios |
 
-CI fails if either metric is below 100% on the measured set.
+CI fails if any executable line is uncovered on the measured set.
+
+**Note:** `cargo llvm-cov`'s text “Missed Lines” column can count *partial regions within a line* (for example match or-patterns) even when the line executed. The gate uses the HTML report’s uncovered-line markers as the line source of truth.
 
 ## Tooling
 

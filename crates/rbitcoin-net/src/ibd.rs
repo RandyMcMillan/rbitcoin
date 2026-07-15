@@ -27,18 +27,19 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-/// Default download / archive horizon after the connected tip.
-/// Larger windows pipeline more peer bandwidth (bodies still archive to disk).
+/// Default download / archive horizon after the connected tip (Core
+/// `BLOCK_DOWNLOAD_WINDOW`-class: how far ahead we may request overall).
 pub const DEFAULT_IBD_WINDOW: usize = 1024;
+
+/// Max blocks in flight to a single peer (Core `MAX_BLOCKS_IN_TRANSIT_PER_PEER`).
+pub const DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 
 /// Tunables for parallel IBD (defaults lean libbitcoin/Core-ish).
 #[derive(Clone, Debug)]
 pub struct IbdConfig {
-    /// Max blocks in-flight across all peers; also the assignable header horizon
-    /// after the connected tip (`ordered[0..window]` only). Class A archive holds
-    /// bodies on disk; this mainly bounds concurrent getdata / peer buffers.
+    /// Global tip-ahead horizon (`ordered[0..window]`); not per-peer load.
     pub window: usize,
-    /// Max in-flight getdata per peer.
+    /// Hard cap on outstanding block getdata to one peer (Core = 16).
     pub per_peer: usize,
     /// Reassign getdata if no progress for this long.
     pub stall: Duration,
@@ -52,7 +53,7 @@ impl Default for IbdConfig {
     fn default() -> Self {
         Self {
             window: DEFAULT_IBD_WINDOW,
-            per_peer: 16,
+            per_peer: DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER,
             stall: Duration::from_secs(5),
             headers_batch: MAX_HEADERS_RESULTS,
             connect_timeout: Duration::from_secs(8),
@@ -804,16 +805,14 @@ fn assign_work_ordered(
                 Some(s) if s.alive => s,
                 _ => continue,
             };
-            // Spread the global window across live peers so window=1024 is
-            // actually reachable (peers * per_peer alone capped us ~112).
-            let peer_cap = (cfg.window / alive_ids.len().max(1))
-                .max(cfg.per_peer)
-                .min(256);
+            // Core-style: hard per-peer in-transit cap (not window/n).
+            let peer_cap = cfg.per_peer;
             let free = peer_cap.saturating_sub(slot.in_flight.len());
             if free == 0 {
                 continue;
             }
-            let batch_cap = if alive_ids.len() <= 4 { 64 } else { 32 };
+            // One getdata batch stays within remaining peer + global room.
+            let batch_cap = cfg.per_peer;
             let take = free.min(room).min(candidates.len()).min(batch_cap);
             if take == 0 {
                 continue;

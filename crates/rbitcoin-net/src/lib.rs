@@ -12,7 +12,10 @@ mod service;
 pub use cache::BlockCache;
 pub use chain::{AcceptOutcome, ChainHub, TipEvent};
 pub use error::NetError;
-pub use ibd::{parallel_ibd, parallel_ibd_cancellable, IbdConfig, DEFAULT_IBD_WINDOW};
+pub use ibd::{
+    parallel_ibd, parallel_ibd_cancellable, IbdConfig, DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER,
+    DEFAULT_IBD_WINDOW,
+};
 pub use peer::local_service_flags;
 pub use seeds::{
     default_port, dns_seeds, fixed_seed_hosts, resolve_all_seeds, resolve_dns_seeds,

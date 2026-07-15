@@ -207,9 +207,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     };
     if !ibd_targets.is_empty() && !shutdown.requested() {
         let ibd_cfg = IbdConfig {
-            // Tip-ahead getdata horizon; archive-to-disk holds reordered bodies.
+            // Global horizon 1024; per-peer in-transit 16 (Bitcoin Core-class).
             window: rbitcoin_net::DEFAULT_IBD_WINDOW,
-            per_peer: 16,
+            per_peer: rbitcoin_net::DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER,
             stall: std::time::Duration::from_secs(5),
             ..IbdConfig::default()
         };

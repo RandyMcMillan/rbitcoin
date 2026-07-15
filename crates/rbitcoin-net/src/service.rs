@@ -189,7 +189,7 @@ impl P2PNode {
         .await
     }
 
-    /// Parallel sync with default window (1024 in-flight, 16/peer).
+    /// Parallel sync with default window (1024 tip-ahead, 16 in-transit/peer).
     pub async fn parallel_sync_default(&self, peers: &[SocketAddr]) -> Result<u32, NetError> {
         self.parallel_sync(peers, IbdConfig::default()).await
     }

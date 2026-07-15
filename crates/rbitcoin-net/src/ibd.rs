@@ -62,7 +62,9 @@ impl Default for IbdConfig {
             window: DEFAULT_IBD_WINDOW,
             per_peer: DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER,
             target_peers: 16,
-            stall: Duration::from_secs(5),
+            // 5s was too aggressive: reassign storms re-hit the same first peers
+            // and never waited for slow/archival responses on tip-next holes.
+            stall: Duration::from_secs(30),
             headers_batch: MAX_HEADERS_RESULTS,
             connect_timeout: Duration::from_secs(8),
         }
@@ -92,6 +94,8 @@ enum PeerCmd {
 enum PeerEvent {
     Headers { peer: usize, headers: Vec<Header> },
     Block { peer: usize, block: Block },
+    /// Peer answered `notfound` for these block hashes (does not have them).
+    NotFound { peer: usize, hashes: Vec<BlockHash> },
     /// Peer failed or closed.
     Dead { peer: usize, reason: String },
 }
@@ -210,6 +214,9 @@ pub async fn parallel_ibd_cancellable(
     // Background redial — never .await dial on the IBD event loop (that stalled tip).
     let mut last_redial = Instant::now() - Duration::from_secs(15);
     let mut redial_handle: Option<JoinHandle<Vec<PeerSlot>>> = None;
+    // Rotate which peer is offered first work so reassigns diversify (was always
+    // peer 0..N and tip-next holes could stick on the same pruned peers forever).
+    let mut assign_rot: usize = 0;
 
     // Ordered download path (chain order after local tip). Front = next to confirm.
     let mut ordered: VecDeque<BlockHash> = VecDeque::new();
@@ -338,14 +345,19 @@ pub async fn parallel_ibd_cancellable(
                 hub.as_ref(),
                 &cfg,
                 horizon,
+                &mut assign_rot,
             );
         }
 
         // Stall reassignment — skip while tip is advancing (connect may hold the
         // loop longer than stall at high height; reassign storms made it worse).
         let now = Instant::now();
-        if last_progress.elapsed() > cfg.stall {
-            reassign_stalled(&mut slots, &mut inflight, &cfg, now);
+        // Tip-next holes: reassign sooner than far-horizon stalls so height+1
+        // does not wait behind a full 30s window of useless peers.
+        let tip_stall = cfg.stall.min(Duration::from_secs(8));
+        let stall_due = last_progress.elapsed() > tip_stall;
+        if stall_due {
+            reassign_stalled(&mut slots, &mut inflight, &cfg, now, tip_stall);
         }
 
         // Collect finished background dials without blocking the event loop.
@@ -416,8 +428,19 @@ pub async fn parallel_ibd_cancellable(
 
         // Status line (helps lab debugging; line-buffered-ish)
         if last_status.elapsed() > Duration::from_secs(5) {
+            // Contiguous unarchived run at ordered front (= tip cannot advance).
+            let mut tip_hole = 0usize;
+            for h in ordered.iter() {
+                if hub.has_block(h) {
+                    continue;
+                }
+                if hub.is_archived(h) {
+                    break;
+                }
+                tip_hole += 1;
+            }
             info!(
-                "ibd: status tip={:?} ordered={} inflight={} arch_q={arch_q} archived_ahead={archived_ahead} ahead={ahead} headers_done={headers_done} peers={}",
+                "ibd: status tip={:?} ordered={} inflight={} arch_q={arch_q} archived_ahead={archived_ahead} tip_hole={tip_hole} ahead={ahead} headers_done={headers_done} peers={}",
                 hub.tip_height(),
                 ordered.len(),
                 inflight.len(),
@@ -550,6 +573,18 @@ pub async fn parallel_ibd_cancellable(
                     warn!("ibd: archive pipeline closed; drop {hash}");
                 }
                 // Confirm on archive-done / tick only — frees this core for IO/assign.
+            }
+            Some(PeerEvent::NotFound { peer, hashes }) => {
+                if let Some(s) = slots.iter_mut().find(|s| s.id == peer) {
+                    s.last_activity = Instant::now();
+                    for h in &hashes {
+                        s.in_flight.remove(h);
+                        // Free for another peer only if this peer was the tracked owner.
+                        if inflight.get(h).map(|(pid, _)| *pid == peer).unwrap_or(false) {
+                            inflight.remove(h);
+                        }
+                    }
+                }
             }
             Some(PeerEvent::Dead { peer, reason }) => {
                 warn!("ibd: peer[{peer}] dead: {reason}");
@@ -816,8 +851,22 @@ async fn spawn_peer(
                                     )
                                     .await;
                                 }
-                                NetworkMessage::NotFound(_) => {
-                                    // treat as soft fail — peer just empty
+                                NetworkMessage::NotFound(inv) => {
+                                    let hashes: Vec<BlockHash> = inv
+                                        .iter()
+                                        .filter_map(|i| match i {
+                                            Inventory::Block(h) | Inventory::WitnessBlock(h) => {
+                                                Some(*h)
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    if !hashes.is_empty() {
+                                        let _ = ev_tx.send(PeerEvent::NotFound {
+                                            peer: id,
+                                            hashes,
+                                        });
+                                    }
                                 }
                                 _ => {}
                             }
@@ -1026,6 +1075,10 @@ fn spawn_archive_pipeline(
 /// Far-ahead thrash is prevented by **horizon only**: solely
 /// `ordered[0..horizon]` may be requested. Bodies are archived on arrival;
 /// the tip confirm path is separate and does not block further downloads.
+///
+/// `assign_rot` advances so successive calls start at different peers — without
+/// this, reassigns always re-hit peer[0..k] and tip-next holes can stick forever
+/// on the same pruned/non-serving peers.
 fn assign_work_ordered(
     slots: &mut [PeerSlot],
     ordered: &VecDeque<BlockHash>,
@@ -1033,12 +1086,8 @@ fn assign_work_ordered(
     hub: &ChainHub,
     cfg: &IbdConfig,
     horizon: usize,
+    assign_rot: &mut usize,
 ) {
-    let mut room = cfg.window.saturating_sub(inflight.len());
-    if room == 0 {
-        return;
-    }
-
     let alive_ids: Vec<usize> = slots
         .iter()
         .filter(|s| s.alive)
@@ -1048,21 +1097,62 @@ fn assign_work_ordered(
         return;
     }
 
-    // Holes: not confirmed, not archived, not inflight.
-    let mut candidates: VecDeque<BlockHash> = ordered
-        .iter()
-        .take(horizon)
-        .copied()
-        .filter(|h| {
-            !hub.has_block(h) && !hub.is_archived(h) && !inflight.contains_key(h)
-        })
-        .collect();
-    if candidates.is_empty() {
+    // Tip-proximal holes first. Fan these to many peers (multi-request OK).
+    let tip_fanout = cfg.per_peer.max(4).min(32);
+    let mut tip_holes: Vec<BlockHash> = Vec::new();
+    let mut rest: VecDeque<BlockHash> = VecDeque::new();
+    for h in ordered.iter().take(horizon).copied() {
+        if hub.has_block(&h) || hub.is_archived(&h) {
+            continue;
+        }
+        if tip_holes.len() < tip_fanout {
+            tip_holes.push(h);
+        } else if !inflight.contains_key(&h) {
+            rest.push_back(h);
+        }
+    }
+
+    if !tip_holes.is_empty() {
+        let start = *assign_rot % alive_ids.len();
+        *assign_rot = assign_rot.wrapping_add(1);
+        for (i, &pid) in alive_ids.iter().enumerate() {
+            let slot = match slots.iter_mut().find(|s| s.id == pid) {
+                Some(s) if s.alive => s,
+                _ => continue,
+            };
+            let free = cfg.per_peer.saturating_sub(slot.in_flight.len());
+            if free == 0 {
+                continue;
+            }
+            let mut batch = Vec::new();
+            let n = tip_holes.len();
+            for k in 0..n {
+                if batch.len() >= free {
+                    break;
+                }
+                let h = tip_holes[(start + i + k) % n];
+                if slot.in_flight.contains(&h) {
+                    continue;
+                }
+                batch.push(h);
+                slot.in_flight.insert(h);
+                // One stall owner; other peers still get a getdata copy.
+                inflight.entry(h).or_insert((pid, Instant::now()));
+            }
+            if !batch.is_empty() {
+                let _ = slot.cmd_tx.send(PeerCmd::GetData { hashes: batch });
+            }
+        }
+    }
+
+    let mut room = cfg.window.saturating_sub(inflight.len());
+    if room == 0 || rest.is_empty() {
         return;
     }
 
-    let mut peer_i = 0usize;
-    while room > 0 && !candidates.is_empty() {
+    let mut peer_i = *assign_rot;
+    *assign_rot = assign_rot.wrapping_add(1);
+    while room > 0 && !rest.is_empty() {
         let mut assigned_any = false;
         for _ in 0..alive_ids.len() {
             let pid = alive_ids[peer_i % alive_ids.len()];
@@ -1071,27 +1161,20 @@ fn assign_work_ordered(
                 Some(s) if s.alive => s,
                 _ => continue,
             };
-            // Core-style: hard per-peer in-transit cap (not window/n).
-            let peer_cap = cfg.per_peer;
-            let free = peer_cap.saturating_sub(slot.in_flight.len());
+            let free = cfg.per_peer.saturating_sub(slot.in_flight.len());
             if free == 0 {
                 continue;
             }
-            // One getdata batch stays within remaining peer + global room.
-            let batch_cap = cfg.per_peer;
-            let take = free.min(room).min(candidates.len()).min(batch_cap);
+            let take = free.min(room).min(rest.len()).min(cfg.per_peer);
             if take == 0 {
                 continue;
             }
             let mut batch = Vec::with_capacity(take);
             while batch.len() < take {
-                let Some(h) = candidates.pop_front() else {
+                let Some(h) = rest.pop_front() else {
                     break;
                 };
-                if hub.has_block(&h)
-                    || hub.is_archived(&h)
-                    || inflight.contains_key(&h)
-                {
+                if hub.has_block(&h) || hub.is_archived(&h) || inflight.contains_key(&h) {
                     continue;
                 }
                 batch.push(h);
@@ -1118,30 +1201,31 @@ fn reassign_stalled(
     inflight: &mut HashMap<BlockHash, (usize, Instant)>,
     cfg: &IbdConfig,
     now: Instant,
+    stall: Duration,
 ) {
-    let stalled: Vec<(BlockHash, usize)> = inflight
+    let stalled: Vec<BlockHash> = inflight
         .iter()
-        .filter(|(_, (_, t))| now.duration_since(*t) > cfg.stall)
-        .map(|(h, (pid, _))| (*h, *pid))
+        .filter(|(_, (_, t))| now.duration_since(*t) > stall)
+        .map(|(h, _)| *h)
         .collect();
     if stalled.is_empty() {
         return;
     }
-    // Clear stall state so assign_work_ordered will re-issue getdata
-    // (tip-next is re-prioritized there).
+    // Clear stall state so assign_work_ordered re-issues getdata. Drop hash from
+    // every peer's in_flight so multi-peer tip fanout can retry cleanly.
     let mut n = 0usize;
-    for (h, pid) in stalled {
-        if inflight.remove(&h).is_some() {
-            if let Some(s) = slots.iter_mut().find(|s| s.id == pid) {
-                s.in_flight.remove(&h);
-            }
+    for h in &stalled {
+        if inflight.remove(h).is_some() {
             n += 1;
         }
+        for s in slots.iter_mut() {
+            s.in_flight.remove(h);
+        }
     }
-    // Avoid log spam (lab25 had hundreds of reassign lines drowning signal).
-    if n > 0 && n >= 8 {
-        warn!("ibd: reassign {n} stalled block(s)");
+    if n > 0 && n >= 4 {
+        warn!("ibd: reassign {n} stalled block(s) (timeout {stall:?})");
     }
+    let _ = cfg;
 }
 
 /// Max tip confirms per event-loop turn (Class C is sequential; keep peers busy).

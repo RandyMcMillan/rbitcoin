@@ -188,96 +188,159 @@ impl Query {
         header: &HeaderRecord,
         txs: &[TxApply],
     ) -> Result<Fk, QueryError> {
-        if let Some((fk, _)) = self.get_header_by_hash(&header.hash)? {
-            if self.store.header_txs.has_body(fk)? {
-                return Ok(fk);
-            }
-            // Header-only row from ensure_header — attach body below using existing fk.
-            return self.archive_body_for_header(fk, txs);
-        }
-
-        let header_fk = self.store.put_header(header)?;
-        self.archive_body_for_header(header_fk, txs)
+        let mut out = self.archive_prepared_batch(&[(header, txs)])?;
+        Ok(out.pop().expect("one archive result"))
     }
 
-    fn archive_body_for_header(&self, header_fk: Fk, txs: &[TxApply]) -> Result<Fk, QueryError> {
-        if self.store.header_txs.has_body(header_fk)? {
-            return Ok(header_fk);
+    /// Archive many prepared blocks in one Class A mega-batch.
+    ///
+    /// Plans contiguous tx/input/output FK ranges across the whole batch, then
+    /// does one `put_batch` per table (inputs ∥ outputs via `rayon::join`). Much
+    /// faster than N independent [`archive_block`] calls on the writer thread.
+    ///
+    /// Returns one header fk per input item (same order). Idempotent for bodies
+    /// already archived.
+    pub fn archive_prepared_batch(
+        &self,
+        items: &[(&HeaderRecord, &[TxApply])],
+    ) -> Result<Vec<Fk>, QueryError> {
+        if items.is_empty() {
+            return Ok(Vec::new());
         }
 
-        let mut tx_fks = Vec::with_capacity(txs.len());
-        // Cache table counts — avoid re-locking on every tx.
+        // Resolve / create headers; skip bodies already on disk.
+        let mut header_fks = Vec::with_capacity(items.len());
+        let mut need: Vec<(Fk, &[TxApply])> = Vec::new();
+        for (header, txs) in items {
+            let fk = if let Some((fk, _)) = self.get_header_by_hash(&header.hash)? {
+                fk
+            } else {
+                self.store.put_header(header)?
+            };
+            header_fks.push(fk);
+            if !self.store.header_txs.has_body(fk)? {
+                need.push((fk, txs));
+            }
+        }
+
+        if need.is_empty() {
+            return Ok(header_fks);
+        }
+
+        self.archive_bodies_mega(&need)?;
+        Ok(header_fks)
+    }
+
+    /// Mega-batch Class A body rows for headers that do not yet have bodies.
+    fn archive_bodies_mega(&self, need: &[(Fk, &[TxApply])]) -> Result<(), QueryError> {
+        // Single snapshot of table counters — writer thread is exclusive.
+        let mut next_tx = self.store.txs.count() + 1;
         let mut next_in = self.store.inputs.count() + 1;
         let mut next_out = self.store.outputs.count() + 1;
 
-        for ta in txs {
-            let n_in = ta.inputs.len() as u32;
-            let n_out = ta.outputs.len() as u32;
-            let in_start = if n_in == 0 {
-                Fk::NULL
-            } else {
-                Fk(next_in)
-            };
-            let out_start = if n_out == 0 {
-                Fk::NULL
-            } else {
-                Fk(next_out)
-            };
+        let mut all_txs: Vec<TxRecord> = Vec::new();
+        let mut all_inputs: Vec<InputRecord> = Vec::new();
+        let mut all_outputs: Vec<OutputRecord> = Vec::new();
+        // Per-header planned tx fk lists (for header_txs).
+        let mut per_header_tx_fks: Vec<(Fk, Vec<Fk>)> = Vec::with_capacity(need.len());
+        // Spend index work deferred until tx fks are known (same as planned).
+        let mut spends: Vec<([u8; 32], u32, Fk, u32)> = Vec::new();
+        let spend_on = self.spend_index_enabled();
 
-            let tx = TxRecord {
-                txid: ta.tx.txid,
-                version: ta.tx.version,
-                locktime: ta.tx.locktime,
-                input_start_fk: in_start,
-                input_count: n_in,
-                output_start_fk: out_start,
-                output_count: n_out,
-                raw: ta.tx.raw.clone(),
-            };
-            let tx_fk = self.store.put_tx(&tx)?;
+        for &(header_fk, txs) in need {
+            let mut tx_fks = Vec::with_capacity(txs.len());
+            for ta in txs {
+                let n_in = ta.inputs.len() as u32;
+                let n_out = ta.outputs.len() as u32;
+                let tx_fk = Fk(next_tx);
+                next_tx += 1;
+                let in_start = if n_in == 0 {
+                    Fk::NULL
+                } else {
+                    Fk(next_in)
+                };
+                let out_start = if n_out == 0 {
+                    Fk::NULL
+                } else {
+                    Fk(next_out)
+                };
 
-            if n_in > 0 {
-                let mut recs = Vec::with_capacity(n_in as usize);
+                all_txs.push(TxRecord {
+                    txid: ta.tx.txid,
+                    version: ta.tx.version,
+                    locktime: ta.tx.locktime,
+                    input_start_fk: in_start,
+                    input_count: n_in,
+                    output_start_fk: out_start,
+                    output_count: n_out,
+                    raw: ta.tx.raw.clone(),
+                });
+
                 for (i, inp) in ta.inputs.iter().enumerate() {
-                    let rec = InputRecord {
+                    let idx = i as u32;
+                    if spend_on && inp.prev_txid != [0u8; 32] {
+                        spends.push((inp.prev_txid, inp.prev_index, tx_fk, idx));
+                    }
+                    all_inputs.push(InputRecord {
                         parent_tx_fk: tx_fk,
-                        index: i as u32,
+                        index: idx,
                         prev_txid: inp.prev_txid,
                         prev_index: inp.prev_index,
                         sequence: inp.sequence,
                         script_sig: inp.script_sig.clone(),
-                    };
-                    if rec.prev_txid != [0u8; 32] && self.spend_index_enabled() {
-                        self.store.put_spend(
-                            &rec.prev_txid,
-                            rec.prev_index,
-                            tx_fk,
-                            rec.index,
-                        )?;
-                    }
-                    recs.push(rec);
+                    });
                 }
-                self.store.inputs.put_batch(&recs)?;
                 next_in += u64::from(n_in);
-            }
-            if n_out > 0 {
-                let mut recs = Vec::with_capacity(n_out as usize);
+
                 for (i, out) in ta.outputs.iter().enumerate() {
-                    recs.push(OutputRecord {
+                    all_outputs.push(OutputRecord {
                         parent_tx_fk: tx_fk,
                         index: i as u32,
                         value: out.value,
                         script: out.script.clone(),
                     });
                 }
-                self.store.outputs.put_batch(&recs)?;
                 next_out += u64::from(n_out);
+
+                tx_fks.push(tx_fk);
             }
-            tx_fks.push(tx_fk);
+            per_header_tx_fks.push((header_fk, tx_fks));
         }
 
-        self.store.header_txs.put_list(header_fk, &tx_fks)?;
-        Ok(header_fk)
+        // One body write for all txs, then hash heads. Planned FKs must match
+        // append order (exclusive writer thread owns these tables).
+        let got_tx_fks = self.store.txs.put_batch(&all_txs)?;
+        if got_tx_fks.len() != all_txs.len() {
+            return Err(StoreError::Corrupt("tx put_batch length"));
+        }
+        if let Some(&planned0) = per_header_tx_fks
+            .first()
+            .and_then(|(_, v)| v.first())
+        {
+            if got_tx_fks.first().copied() != Some(planned0) {
+                return Err(StoreError::Corrupt("tx put_batch fk mismatch"));
+            }
+        }
+
+        // Inputs and outputs are independent tables — encode+write in parallel.
+        let (in_res, out_res) = rayon::join(
+            || self.store.inputs.put_batch(&all_inputs),
+            || self.store.outputs.put_batch(&all_outputs),
+        );
+        in_res?;
+        out_res?;
+
+        if spend_on {
+            for (prev_txid, prev_index, tx_fk, idx) in &spends {
+                self.store
+                    .put_spend(prev_txid, *prev_index, *tx_fk, *idx)?;
+            }
+        }
+
+        for (header_fk, tx_fks) in &per_header_tx_fks {
+            self.store.header_txs.put_list(*header_fk, tx_fks)?;
+        }
+        Ok(())
     }
 
     /// Confirm an already-archived block at `height` (genesis or tip+1).

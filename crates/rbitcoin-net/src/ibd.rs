@@ -912,17 +912,39 @@ fn spawn_archive_pipeline(
                             break;
                         }
                     }
-                    for prep in batch {
-                        let hash = prep.hash;
-                        let out = match write_hub.query.archive_block(&prep.header, &prep.txs) {
-                            Ok(_fk) => ArchiveResult::Ok { hash },
-                            Err(e) => ArchiveResult::Err {
-                                hash,
-                                err: e.to_string(),
-                            },
-                        };
-                        if write_result.send(out).is_err() {
-                            return;
+                    // Multi-block Class A mega-batch: one plan + put_batch per
+                    // table across up to 32 prepared bodies (inputs ∥ outputs).
+                    let refs: Vec<_> = batch
+                        .iter()
+                        .map(|p| (&p.header, p.txs.as_slice()))
+                        .collect();
+                    match write_hub.query.archive_prepared_batch(&refs) {
+                        Ok(fks) => {
+                            for (prep, _fk) in batch.into_iter().zip(fks) {
+                                if write_result
+                                    .send(ArchiveResult::Ok { hash: prep.hash })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // Do not retry one-by-one: a mid-batch failure may have
+                            // already appended txs/I/O without header_txs (no has_body
+                            // yet); re-archiving would double-append Class A rows.
+                            let err = e.to_string();
+                            for prep in batch {
+                                if write_result
+                                    .send(ArchiveResult::Err {
+                                        hash: prep.hash,
+                                        err: err.clone(),
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
                         }
                     }
                 }

@@ -1,6 +1,7 @@
 use crate::error::StoreError;
 use crate::hashhead::HashHead;
 use crate::var_table::{framed, VarTable};
+use rayon::prelude::*;
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::Path;
 
@@ -166,11 +167,30 @@ impl TxTable {
         })
     }
 
+    pub fn count(&self) -> u64 {
+        self.body.count()
+    }
+
     pub fn put(&self, rec: &TxRecord) -> Result<Fk, StoreError> {
-        let payload = framed(&rec.encode());
-        let fk = self.body.put(&payload)?;
-        self.head.insert(&rec.txid, fk)?;
-        Ok(fk)
+        let mut fks = self.put_batch(std::slice::from_ref(rec))?;
+        Ok(fks.pop().expect("one tx"))
+    }
+
+    /// Append many tx rows (one body write) then publish hash heads.
+    pub fn put_batch(&self, recs: &[TxRecord]) -> Result<Vec<Fk>, StoreError> {
+        if recs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let owned: Vec<Vec<u8>> = recs
+            .par_iter()
+            .map(|r| framed(&r.encode()))
+            .collect();
+        let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
+        let fks = self.body.put_batch(&refs)?;
+        for (rec, fk) in recs.iter().zip(fks.iter()) {
+            self.head.insert(&rec.txid, *fk)?;
+        }
+        Ok(fks)
     }
 
     pub fn get(&self, fk: Fk) -> Result<TxRecord, StoreError> {
@@ -223,7 +243,10 @@ impl OutputTable {
         if recs.is_empty() {
             return Ok(Vec::new());
         }
-        let owned: Vec<Vec<u8>> = recs.iter().map(|r| framed(&r.encode())).collect();
+        let owned: Vec<Vec<u8>> = recs
+            .par_iter()
+            .map(|r| framed(&r.encode()))
+            .collect();
         let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
         self.body.put_batch(&refs)
     }
@@ -269,7 +292,10 @@ impl InputTable {
         if recs.is_empty() {
             return Ok(Vec::new());
         }
-        let owned: Vec<Vec<u8>> = recs.iter().map(|r| framed(&r.encode())).collect();
+        let owned: Vec<Vec<u8>> = recs
+            .par_iter()
+            .map(|r| framed(&r.encode()))
+            .collect();
         let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
         self.body.put_batch(&refs)
     }

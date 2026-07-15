@@ -229,14 +229,16 @@ pub async fn parallel_ibd_cancellable(
         }
     }
 
-    // P0/P1: archive pipeline (parallel prep + single Class A writer).
+    // Multi-core archive: rayon prep pool + dedicated OS writer thread.
     let archive_queued = Arc::new(AtomicUsize::new(0));
     let (arch_job_tx, arch_job_rx) = mpsc::unbounded_channel::<ArchiveJob>();
     let (arch_res_tx, mut arch_res_rx) = mpsc::unbounded_channel::<ArchiveResult>();
-    let n_prep = std::thread::available_parallelism()
-        .map(|n| n.get().clamp(2, 4))
-        .unwrap_or(2);
-    eprintln!("ibd: archive pipeline prep_workers={n_prep} (single writer)");
+    let n_cpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    // Leave 1 core for async IO / confirm; rest for prep (writer is extra OS thread).
+    let n_prep = n_cpu.saturating_sub(1).max(2);
+    eprintln!("ibd: archive pipeline prep_threads={n_prep} cpus={n_cpu} (dedicated writer thread)");
     let pipeline = spawn_archive_pipeline(hub.clone(), arch_job_rx, arch_res_tx, n_prep);
 
     loop {
@@ -481,26 +483,11 @@ pub async fn parallel_ibd_cancellable(
                 // Parent header for prev_fk; body goes to async archive pipeline.
                 let _ = hub.ensure_header(&block.header);
                 archive_queued.fetch_add(1, Ordering::Relaxed);
-                if arch_job_tx
-                    .send(ArchiveJob { block })
-                    .is_err()
-                {
+                if arch_job_tx.send(ArchiveJob { block }).is_err() {
                     archive_queued.fetch_sub(1, Ordering::Relaxed);
                     eprintln!("ibd: archive pipeline closed; drop {hash}");
                 }
-                // Opportunistic confirm while prep/write run elsewhere.
-                let n = confirm_run(
-                    hub.as_ref(),
-                    &mut ordered,
-                    &mut ordered_set,
-                    &hash_height,
-                    &accepted,
-                    start_tip,
-                    CONNECT_BATCH,
-                )?;
-                if n > 0 {
-                    last_progress = Instant::now();
-                }
+                // Confirm on archive-done / tick only — frees this core for IO/assign.
             }
             Some(PeerEvent::Dead { peer, reason }) => {
                 eprintln!("ibd: peer[{peer}] dead: {reason}");
@@ -826,9 +813,9 @@ fn request_headers_from(
     Ok(true)
 }
 
-/// Parallel prep (`spawn_blocking`) + single Class A writer.
+/// Rayon prep pool (multi-core CPU) + dedicated OS thread for Class A mmap writes.
 ///
-/// Prep does structure/PoW/`TxApply` encoding; writer serializes mmap puts.
+/// Tokio only bridges job/result channels so the async IBD loop stays free.
 fn spawn_archive_pipeline(
     hub: Arc<ChainHub>,
     mut job_rx: mpsc::UnboundedReceiver<ArchiveJob>,
@@ -836,36 +823,42 @@ fn spawn_archive_pipeline(
     n_prep: usize,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let (write_tx, mut write_rx) = mpsc::channel::<PreparedArchive>(n_prep.saturating_mul(4).max(8));
+        let n_prep = n_prep.max(2);
+        let (write_tx, write_rx) =
+            std::sync::mpsc::sync_channel::<PreparedArchive>(n_prep.saturating_mul(8).max(16));
         let write_hub = hub.clone();
         let write_result = result_tx.clone();
-        let writer = tokio::spawn(async move {
-            while let Some(prep) = write_rx.recv().await {
-                let hash = prep.hash;
-                let hub = write_hub.clone();
-                let res = tokio::task::spawn_blocking(move || {
-                    hub.query
-                        .archive_block(&prep.header, &prep.txs)
-                        .map(|_| ())
-                        .map_err(|e| e.to_string())
-                })
-                .await;
-                let out = match res {
-                    Ok(Ok(())) => ArchiveResult::Ok { hash },
-                    Ok(Err(err)) => ArchiveResult::Err { hash, err },
-                    Err(e) => ArchiveResult::Err {
-                        hash,
-                        err: format!("writer join: {e}"),
-                    },
-                };
-                if write_result.send(out).is_err() {
-                    break;
-                }
-            }
-        });
 
-        let sem = Arc::new(Semaphore::new(n_prep.max(1)));
-        let mut prep_handles = Vec::new();
+        // Dedicated writer OS thread — never shares tokio blocking pool with prep.
+        let writer = std::thread::Builder::new()
+            .name("ibd-archive-writer".into())
+            .spawn(move || {
+                while let Ok(prep) = write_rx.recv() {
+                    let hash = prep.hash;
+                    let out = match write_hub.query.archive_block(&prep.header, &prep.txs) {
+                        Ok(_fk) => ArchiveResult::Ok { hash },
+                        Err(e) => ArchiveResult::Err {
+                            hash,
+                            err: e.to_string(),
+                        },
+                    };
+                    if write_result.send(out).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn archive writer");
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(n_prep)
+            .thread_name(|i| format!("ibd-archive-prep-{i}"))
+            .build()
+            .expect("archive prep pool");
+
+        // In-flight prep permits so we do not unboundedly queue rayon tasks.
+        let sem = Arc::new(Semaphore::new(n_prep.saturating_mul(2).max(4)));
+        let mut inflight = Vec::new();
+
         while let Some(job) = job_rx.recv().await {
             let permit = match sem.clone().acquire_owned().await {
                 Ok(p) => p,
@@ -874,48 +867,54 @@ fn spawn_archive_pipeline(
             let hub = hub.clone();
             let write_tx = write_tx.clone();
             let result_tx = result_tx.clone();
-            prep_handles.push(tokio::spawn(async move {
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+            inflight.push(done_rx);
+
+            pool.spawn(move || {
                 let _permit = permit;
                 let hash = job.block.block_hash();
-                let block = job.block;
-                let hub_c = hub.clone();
-                let prep = tokio::task::spawn_blocking(move || {
-                    prepare_block_for_archive(&hub_c.query, &hub_c.params, &block)
-                })
-                .await;
-                match prep {
-                    Ok(Ok((header, txs))) => {
-                        let prepared = PreparedArchive { hash, header, txs };
-                        if write_tx.send(prepared).await.is_err() {
+                match prepare_block_for_archive(&hub.query, &hub.params, &job.block) {
+                    Ok((header, txs)) => {
+                        if write_tx
+                            .send(PreparedArchive { hash, header, txs })
+                            .is_err()
+                        {
                             let _ = result_tx.send(ArchiveResult::Err {
                                 hash,
                                 err: "writer closed".into(),
                             });
                         }
                     }
-                    Ok(Err(e)) => {
+                    Err(e) => {
                         let _ = result_tx.send(ArchiveResult::Err {
                             hash,
                             err: e.to_string(),
                         });
                     }
-                    Err(e) => {
-                        let _ = result_tx.send(ArchiveResult::Err {
-                            hash,
-                            err: format!("prep join: {e}"),
-                        });
+                }
+                let _ = done_tx.send(());
+            });
+
+            // Reap completed oneshots without blocking the intake loop.
+            let mut i = 0;
+            while i < inflight.len() {
+                match inflight[i].try_recv() {
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => i += 1,
+                    _ => {
+                        inflight.swap_remove(i);
                     }
                 }
-            }));
-            // Reap finished prep tasks so the vec does not grow unbounded.
-            prep_handles.retain(|h| !h.is_finished());
+            }
         }
-        // Wait for in-flight prep, then close writer.
-        for h in prep_handles {
-            let _ = h.await;
+
+        // Wait for remaining prep tasks.
+        for rx in inflight {
+            let _ = rx.await;
         }
         drop(write_tx);
-        let _ = writer.await;
+        // Dropping pool waits for spawned prep jobs.
+        drop(pool);
+        let _ = writer.join();
     })
 }
 

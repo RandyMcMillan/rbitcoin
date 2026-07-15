@@ -7,6 +7,7 @@ use bitcoin::Transaction;
 use rbitcoin_primitives::Fk;
 use rbitcoin_query::{Query, TxApply};
 use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+use rayon::prelude::*;
 
 pub fn header_to_record(prev_fk: Fk, header: &Header) -> HeaderRecord {
     HeaderRecord {
@@ -34,6 +35,12 @@ pub fn block_to_apply(
             .ok_or(ConsensusError::BadPrev)?
     };
     let header_rec = header_to_record(prev_fk, header);
+    // Parallel encode/hash txs — main multi-core win on large blocks.
+    if txs.len() >= 8 {
+        let out: Result<Vec<TxApply>, ConsensusError> =
+            txs.par_iter().map(|tx| tx_to_apply(tx)).collect();
+        return Ok((header_rec, out?));
+    }
     let mut out = Vec::with_capacity(txs.len());
     for tx in txs {
         out.push(tx_to_apply(tx)?);

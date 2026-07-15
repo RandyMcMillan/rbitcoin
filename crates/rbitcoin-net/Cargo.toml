@@ -16,3 +16,4 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
+rayon = { workspace = true }

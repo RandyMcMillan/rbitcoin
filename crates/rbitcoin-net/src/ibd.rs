@@ -4,8 +4,8 @@
 //! - N outbound peer workers (each: own TCP stream, command + event channels)
 //! - Shared ordered work queue of block hashes after the local tip
 //! - Download **window**: up to `window` blocks in-flight, at most `per_peer` per peer
-//! - Bodies are **archived** to Class A as they arrive (any order)
-//! - Tip **confirm** walks contiguous archived runs (Class C) separately
+//! - Archive pipeline: parallel **prep** (CPU) → single **writer** (Class A mmap)
+//! - Tip **confirm** walks contiguous archived runs (Class C) on the IBD task
 //! - Stall timeout reassigns in-flight hashes to other peers
 
 use crate::chain::{AcceptOutcome, ChainHub};
@@ -18,13 +18,16 @@ use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 use bitcoin::p2p::Magic;
 use bitcoin::{Block, BlockHash};
+use rbitcoin_consensus::prepare_block_for_archive;
+use rbitcoin_query::TxApply;
+use rbitcoin_store::HeaderRecord;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 
 /// Default download / archive horizon after the connected tip (Core
@@ -85,6 +88,25 @@ enum PeerEvent {
     Block { peer: usize, block: Block },
     /// Peer failed or closed.
     Dead { peer: usize, reason: String },
+}
+
+/// Wire block queued for archive prep (P0/P1 pipeline).
+struct ArchiveJob {
+    block: Block,
+}
+
+struct PreparedArchive {
+    hash: BlockHash,
+    header: HeaderRecord,
+    txs: Vec<TxApply>,
+}
+
+enum ArchiveResult {
+    Ok {
+        #[allow(dead_code)]
+        hash: BlockHash,
+    },
+    Err { hash: BlockHash, err: String },
 }
 
 struct PeerSlot {
@@ -207,6 +229,16 @@ pub async fn parallel_ibd_cancellable(
         }
     }
 
+    // P0/P1: archive pipeline (parallel prep + single Class A writer).
+    let archive_queued = Arc::new(AtomicUsize::new(0));
+    let (arch_job_tx, arch_job_rx) = mpsc::unbounded_channel::<ArchiveJob>();
+    let (arch_res_tx, mut arch_res_rx) = mpsc::unbounded_channel::<ArchiveResult>();
+    let n_prep = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 4))
+        .unwrap_or(2);
+    eprintln!("ibd: archive pipeline prep_workers={n_prep} (single writer)");
+    let pipeline = spawn_archive_pipeline(hub.clone(), arch_job_rx, arch_res_tx, n_prep);
+
     loop {
         if cancelled() {
             eprintln!("ibd: cancel requested — stopping parallel IBD");
@@ -278,18 +310,18 @@ pub async fn parallel_ibd_cancellable(
             last_progress = Instant::now();
         }
 
-        // Assign getdata for non-archived holes in the tip horizon.
-        // Tip-next is always first in the candidate list; with archive-before-confirm
-        // we do not cancel far-ahead inflight when tip-next is late — confirm simply
-        // waits until that body is archived (stall reassign still re-requests holes).
-        assign_work_ordered(
-            &mut slots,
-            &ordered,
-            &mut inflight,
-            hub.as_ref(),
-            &cfg,
-            horizon,
-        );
+        // Backpressure: if archive queue is deep, stop issuing new getdata.
+        let arch_q = archive_queued.load(Ordering::Relaxed);
+        if arch_q < cfg.window.saturating_mul(2) {
+            assign_work_ordered(
+                &mut slots,
+                &ordered,
+                &mut inflight,
+                hub.as_ref(),
+                &cfg,
+                horizon,
+            );
+        }
 
         // Stall reassignment — skip while tip is advancing (connect may hold the
         // loop longer than stall at high height; reassign storms made it worse).
@@ -321,7 +353,7 @@ pub async fn parallel_ibd_cancellable(
         // Status line (helps lab debugging; line-buffered-ish)
         if last_status.elapsed() > Duration::from_secs(5) {
             eprintln!(
-                "ibd: status tip={:?} ordered={} inflight={} archived_ahead={archived_ahead} ahead={ahead} headers_done={headers_done} peers={}",
+                "ibd: status tip={:?} ordered={} inflight={} arch_q={arch_q} archived_ahead={archived_ahead} ahead={ahead} headers_done={headers_done} peers={}",
                 hub.tip_height(),
                 ordered.len(),
                 inflight.len(),
@@ -360,10 +392,12 @@ pub async fn parallel_ibd_cancellable(
             return Err(NetError::Protocol("all parallel peers dead"));
         }
 
-        // Wait for events with timeout so we can reassign stalls.
-        let wait = tokio::time::timeout(Duration::from_millis(100), ev_rx.recv()).await;
-        match wait {
-            Ok(Some(PeerEvent::Headers { peer, headers })) => {
+        // Peer events, archive completions, or timeout (stall reassign / confirm).
+        let tick = tokio::time::sleep(Duration::from_millis(100));
+        tokio::pin!(tick);
+        tokio::select! {
+            peer_ev = ev_rx.recv() => match peer_ev {
+            Some(PeerEvent::Headers { peer, headers }) => {
                 if let Some(s) = slots.iter_mut().find(|s| s.id == peer) {
                     s.last_activity = Instant::now();
                 }
@@ -437,29 +471,24 @@ pub async fn parallel_ibd_cancellable(
                     }
                 }
             }
-            Ok(Some(PeerEvent::Block { peer, block })) => {
+            Some(PeerEvent::Block { peer, block }) => {
                 if let Some(s) = slots.iter_mut().find(|s| s.id == peer) {
                     s.last_activity = Instant::now();
                     s.in_flight.remove(&block.block_hash());
                 }
                 let hash = block.block_hash();
                 inflight.remove(&hash);
-                // Ensure header linkage then archive Class A immediately (any order).
+                // Parent header for prev_fk; body goes to async archive pipeline.
                 let _ = hub.ensure_header(&block.header);
-                let height = hash_height.get(&hash).copied().unwrap_or_else(|| {
-                    hub.tip_height().unwrap_or(0).saturating_add(1)
-                });
-                if let Err(e) = tokio::task::block_in_place(|| hub.archive_block(height, block)) {
-                    // Rate-limit: a storm of rejects usually means one root cause
-                    // (e.g. wrong validation at archive). Log sample + count.
-                    static REJECTS: std::sync::atomic::AtomicU32 =
-                        std::sync::atomic::AtomicU32::new(0);
-                    let n = REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if n <= 5 || n % 100 == 0 {
-                        eprintln!("ibd: archive reject {hash}: {e} (count={n})");
-                    }
+                archive_queued.fetch_add(1, Ordering::Relaxed);
+                if arch_job_tx
+                    .send(ArchiveJob { block })
+                    .is_err()
+                {
+                    archive_queued.fetch_sub(1, Ordering::Relaxed);
+                    eprintln!("ibd: archive pipeline closed; drop {hash}");
                 }
-                // Confirm contiguous archived prefix at tip.
+                // Opportunistic confirm while prep/write run elsewhere.
                 let n = confirm_run(
                     hub.as_ref(),
                     &mut ordered,
@@ -473,7 +502,7 @@ pub async fn parallel_ibd_cancellable(
                     last_progress = Instant::now();
                 }
             }
-            Ok(Some(PeerEvent::Dead { peer, reason })) => {
+            Some(PeerEvent::Dead { peer, reason }) => {
                 eprintln!("ibd: peer[{peer}] dead: {reason}");
                 if let Some(s) = slots.iter_mut().find(|s| s.id == peer) {
                     s.alive = false;
@@ -482,8 +511,40 @@ pub async fn parallel_ibd_cancellable(
                     }
                 }
             }
-            Ok(None) => break,
-            Err(_) => {
+            None => break,
+            },
+            arch = arch_res_rx.recv() => match arch {
+                Some(ArchiveResult::Ok { hash: _ }) => {
+                    archive_queued.fetch_sub(1, Ordering::Relaxed);
+                    let n = confirm_run(
+                        hub.as_ref(),
+                        &mut ordered,
+                        &mut ordered_set,
+                        &hash_height,
+                        &accepted,
+                        start_tip,
+                        CONNECT_BATCH,
+                    )?;
+                    if n > 0 {
+                        last_progress = Instant::now();
+                    }
+                }
+                Some(ArchiveResult::Err { hash, err }) => {
+                    archive_queued.fetch_sub(1, Ordering::Relaxed);
+                    static REJECTS: AtomicU32 = AtomicU32::new(0);
+                    let n = REJECTS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 5 || n % 100 == 0 {
+                        eprintln!("ibd: archive reject {hash}: {err} (count={n})");
+                    }
+                }
+                None => {
+                    // Pipeline exited unexpectedly.
+                    if !cancelled() {
+                        eprintln!("ibd: archive pipeline ended");
+                    }
+                }
+            },
+            _ = &mut tick => {
                 // timeout tick — keep confirming archived runs
                 let n = confirm_run(
                     hub.as_ref(),
@@ -500,16 +561,26 @@ pub async fn parallel_ibd_cancellable(
                 if last_progress.elapsed() > cfg.stall
                     && ordered.is_empty()
                     && inflight.is_empty()
+                    && archive_queued.load(Ordering::Relaxed) == 0
                 {
                     headers_done = true;
-                    let _ = headers_done; // used for exit conditions above
+                    let _ = headers_done;
                     break;
                 }
             }
         }
     }
 
-    // Final confirm
+    // Drain archive pipeline then final confirm.
+    drop(arch_job_tx);
+    while let Some(r) = arch_res_rx.recv().await {
+        archive_queued.fetch_sub(1, Ordering::Relaxed);
+        if let ArchiveResult::Err { hash, err } = r {
+            eprintln!("ibd: archive reject {hash}: {err}");
+        }
+    }
+    let _ = pipeline.await;
+
     while confirm_run(
         hub.as_ref(),
         &mut ordered,
@@ -753,6 +824,99 @@ fn request_headers_from(
         return Ok(false);
     }
     Ok(true)
+}
+
+/// Parallel prep (`spawn_blocking`) + single Class A writer.
+///
+/// Prep does structure/PoW/`TxApply` encoding; writer serializes mmap puts.
+fn spawn_archive_pipeline(
+    hub: Arc<ChainHub>,
+    mut job_rx: mpsc::UnboundedReceiver<ArchiveJob>,
+    result_tx: mpsc::UnboundedSender<ArchiveResult>,
+    n_prep: usize,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let (write_tx, mut write_rx) = mpsc::channel::<PreparedArchive>(n_prep.saturating_mul(4).max(8));
+        let write_hub = hub.clone();
+        let write_result = result_tx.clone();
+        let writer = tokio::spawn(async move {
+            while let Some(prep) = write_rx.recv().await {
+                let hash = prep.hash;
+                let hub = write_hub.clone();
+                let res = tokio::task::spawn_blocking(move || {
+                    hub.query
+                        .archive_block(&prep.header, &prep.txs)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+                let out = match res {
+                    Ok(Ok(())) => ArchiveResult::Ok { hash },
+                    Ok(Err(err)) => ArchiveResult::Err { hash, err },
+                    Err(e) => ArchiveResult::Err {
+                        hash,
+                        err: format!("writer join: {e}"),
+                    },
+                };
+                if write_result.send(out).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let sem = Arc::new(Semaphore::new(n_prep.max(1)));
+        let mut prep_handles = Vec::new();
+        while let Some(job) = job_rx.recv().await {
+            let permit = match sem.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            let hub = hub.clone();
+            let write_tx = write_tx.clone();
+            let result_tx = result_tx.clone();
+            prep_handles.push(tokio::spawn(async move {
+                let _permit = permit;
+                let hash = job.block.block_hash();
+                let block = job.block;
+                let hub_c = hub.clone();
+                let prep = tokio::task::spawn_blocking(move || {
+                    prepare_block_for_archive(&hub_c.query, &hub_c.params, &block)
+                })
+                .await;
+                match prep {
+                    Ok(Ok((header, txs))) => {
+                        let prepared = PreparedArchive { hash, header, txs };
+                        if write_tx.send(prepared).await.is_err() {
+                            let _ = result_tx.send(ArchiveResult::Err {
+                                hash,
+                                err: "writer closed".into(),
+                            });
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        let _ = result_tx.send(ArchiveResult::Err {
+                            hash,
+                            err: e.to_string(),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = result_tx.send(ArchiveResult::Err {
+                            hash,
+                            err: format!("prep join: {e}"),
+                        });
+                    }
+                }
+            }));
+            // Reap finished prep tasks so the vec does not grow unbounded.
+            prep_handles.retain(|h| !h.is_finished());
+        }
+        // Wait for in-flight prep, then close writer.
+        for h in prep_handles {
+            let _ = h.await;
+        }
+        drop(write_tx);
+        let _ = writer.await;
+    })
 }
 
 /// Assign getdata for missing (not yet **archived**) hashes in chain order.

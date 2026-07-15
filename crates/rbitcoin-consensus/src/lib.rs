@@ -27,8 +27,8 @@ use bitcoin::block::Block;
 use bitcoin::hashes::Hash;
 use bitcoin::Target;
 use rbitcoin_primitives::Height;
-use rbitcoin_query::Query;
-use rbitcoin_store::StoreError;
+use rbitcoin_query::{Query, TxApply};
+use rbitcoin_store::{HeaderRecord, StoreError};
 
 /// Full accept path: structure + header link/PoW + connect checks (prevouts/scripts),
 /// then store connect. Returns header FK.
@@ -56,45 +56,33 @@ pub fn accept_and_connect_block(
     Ok(fk)
 }
 
-/// Archive a block body into Class A **without** requiring tip+1 / Class C.
+/// CPU-side prep for Class A archive: structure, PoW, parent link, `TxApply` encode.
 ///
-/// Used by parallel IBD: download order ≠ connect order. Parent **header** must
-/// already be in the store (`ensure_header` / prior archive).
+/// No Class A body writes. Safe to run on multiple `spawn_blocking` workers
+/// (store reads only for parent header / idempotent archived check).
 ///
-/// **Never** runs tip-ordered checks here (`validate_header` / `validate_block_connect`
-/// need a confirmed parent and UTXO view). Those run only in [`confirm_archived_at`].
-/// Light checks: structure (BIP34 at `height`), PoW vs claimed bits, pow limit.
-pub fn accept_and_archive_block(
+/// BIP34 is deferred to confirm (height only reliable tip-ordered).
+pub fn prepare_block_for_archive(
     query: &Query,
     params: &ChainParams,
-    height: Height,
     block: &Block,
-    milestone: Milestone,
-) -> Result<rbitcoin_primitives::Fk, ConsensusError> {
-    let _ = milestone; // connect/script policy applied at confirm only
+) -> Result<(HeaderRecord, Vec<TxApply>), ConsensusError> {
     let hash = block.block_hash().to_byte_array();
     if query
         .is_block_archived(&hash)
         .map_err(ConsensusError::Store)?
     {
-        return query
-            .get_header_by_hash(&hash)
-            .map_err(ConsensusError::Store)?
-            .map(|(fk, _)| fk)
-            .ok_or(ConsensusError::Store(StoreError::NotFound));
+        // Idempotent: re-derive records for writer (writer will no-op put).
+        return block_to_apply(query, &block.header, &block.txdata);
     }
 
-    // Structure without BIP34: height is only authoritative at confirm (tip order).
-    // Passing GENESIS skips BIP34; merkle/weight/witness still checked.
-    let _ = height;
     let ctx = ValidationContext {
         params,
-        height: Height::GENESIS,
+        height: Height::GENESIS, // skip BIP34; merkle/weight/witness still checked
         milestone: Milestone::NONE,
     };
     validate_block_structure(block, &ctx)?;
 
-    // PoW against claimed bits (always). Difficulty *correctness* is checked at confirm.
     let target = Target::from_compact(block.header.bits);
     if target > params.pow_limit {
         return Err(ConsensusError::BadHeader("target above pow limit"));
@@ -104,7 +92,6 @@ pub fn accept_and_archive_block(
         .validate_pow(target)
         .map_err(|_| ConsensusError::InvalidPow)?;
 
-    // Parent header must exist so prev_fk links (header-first IBD / ensure_header).
     let prev = block.header.prev_blockhash;
     if prev.to_byte_array() != [0u8; 32]
         && query
@@ -115,7 +102,22 @@ pub fn accept_and_archive_block(
         return Err(ConsensusError::BadPrev);
     }
 
-    let (header_rec, txs) = block_to_apply(query, &block.header, &block.txdata)?;
+    block_to_apply(query, &block.header, &block.txdata)
+}
+
+/// Archive a block body into Class A **without** requiring tip+1 / Class C.
+///
+/// Prep + single-threaded write. Prefer [`prepare_block_for_archive`] +
+/// [`Query::archive_block`] on an archive pipeline for parallel prep.
+pub fn accept_and_archive_block(
+    query: &Query,
+    params: &ChainParams,
+    height: Height,
+    block: &Block,
+    milestone: Milestone,
+) -> Result<rbitcoin_primitives::Fk, ConsensusError> {
+    let _ = (height, milestone);
+    let (header_rec, txs) = prepare_block_for_archive(query, params, block)?;
     query
         .archive_block(&header_rec, &txs)
         .map_err(ConsensusError::Store)

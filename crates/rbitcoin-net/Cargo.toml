@@ -10,6 +10,7 @@ description = "Bitcoin P2P networking (headers + block download/serve)"
 rbitcoin-primitives = { workspace = true }
 rbitcoin-consensus = { workspace = true }
 rbitcoin-query = { workspace = true }
+rbitcoin-store = { workspace = true }
 bitcoin = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

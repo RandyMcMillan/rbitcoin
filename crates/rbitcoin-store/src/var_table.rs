@@ -85,9 +85,10 @@ impl VarTable {
     }
 
     /// Encode `n` records into one body blob (length-prefix each) then one write.
-    /// Avoids `Vec<Vec<u8>>` intermediate frames (libbitcoin put_ref style).
     ///
-    /// `encode(i, buf)` must append the **unframed** payload for record `i`.
+    /// Encoding runs **outside** the count lock (caller is the exclusive writer);
+    /// only the short append+idx update is locked. `encode(i, buf)` appends the
+    /// **unframed** payload for record `i`.
     pub fn put_batch_encode(
         &self,
         n: usize,
@@ -97,23 +98,65 @@ impl VarTable {
         if n == 0 {
             return Ok(Vec::new());
         }
-        let mut count = self.count.lock();
-        let start = self.body.logical_len().max(FILE_HEADER_LEN as u64);
+        // Snapshot placement under lock, then encode without holding it.
+        let (start, base_count) = {
+            let count = self.count.lock();
+            (
+                self.body.logical_len().max(FILE_HEADER_LEN as u64),
+                *count,
+            )
+        };
         let mut body_blob = Vec::with_capacity(estimate_bytes.saturating_add(n * 4));
         let mut idx_blob = Vec::with_capacity(n * 8);
         let mut fks = Vec::with_capacity(n);
         let mut cursor = start;
         for i in 0..n {
-            fks.push(Fk(*count + 1 + i as u64));
+            fks.push(Fk(base_count + 1 + i as u64));
             idx_blob.extend_from_slice(&cursor.to_le_bytes());
             let frame_at = body_blob.len();
-            body_blob.extend_from_slice(&0u32.to_le_bytes()); // placeholder total len
+            body_blob.extend_from_slice(&0u32.to_le_bytes());
             encode(i, &mut body_blob);
             let total = (body_blob.len() - frame_at) as u32;
             body_blob[frame_at..frame_at + 4].copy_from_slice(&total.to_le_bytes());
             cursor += u64::from(total);
         }
+        let mut count = self.count.lock();
+        // Exclusive writer: no concurrent put may advance count.
+        debug_assert_eq!(*count, base_count);
+        if *count != base_count {
+            return Err(StoreError::Corrupt("var put_batch_encode race"));
+        }
         self.body.write_at(start, &body_blob)?;
+        let off_pos = FILE_HEADER_LEN as u64 + (*count) * 8;
+        self.idx.write_at(off_pos, &idx_blob)?;
+        *count += n as u64;
+        Ok(fks)
+    }
+
+    /// Append a pre-built body blob + idx offsets (relative to `start` already
+    /// applied in idx values as absolute body offsets). Used when encode was
+    /// parallelized outside this table.
+    pub fn put_batch_prebuilt(
+        &self,
+        body_blob: &[u8],
+        idx_abs_offsets: &[u64],
+    ) -> Result<Vec<Fk>, StoreError> {
+        if idx_abs_offsets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = idx_abs_offsets.len();
+        let mut count = self.count.lock();
+        let start = self.body.logical_len().max(FILE_HEADER_LEN as u64);
+        if idx_abs_offsets[0] != start {
+            return Err(StoreError::Corrupt("prebuilt idx start mismatch"));
+        }
+        let mut fks = Vec::with_capacity(n);
+        let mut idx_blob = Vec::with_capacity(n * 8);
+        for (i, off) in idx_abs_offsets.iter().enumerate() {
+            fks.push(Fk(*count + 1 + i as u64));
+            idx_blob.extend_from_slice(&off.to_le_bytes());
+        }
+        self.body.write_at(start, body_blob)?;
         let off_pos = FILE_HEADER_LEN as u64 + (*count) * 8;
         self.idx.write_at(off_pos, &idx_blob)?;
         *count += n as u64;

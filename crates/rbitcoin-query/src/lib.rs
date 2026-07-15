@@ -31,6 +31,10 @@ pub struct Query {
     /// Double-spend checks via `spenders` require this on; keep on unless milestone
     /// skips connect validation for the heights being ingested.
     spend_index: std::sync::atomic::AtomicBool,
+    /// When false, archive skips `tx.head` inserts (txid → fk). IBD under milestone
+    /// does not need by-txid lookup; heads are the main single-thread archive cost.
+    /// Re-enable / reindex before anything that resolves txs by txid.
+    tx_index: std::sync::atomic::AtomicBool,
 }
 
 impl Query {
@@ -39,6 +43,7 @@ impl Query {
             store: Store::open_or_create(store_path.as_ref())?,
             scripthash_index: std::sync::atomic::AtomicBool::new(true),
             spend_index: std::sync::atomic::AtomicBool::new(true),
+            tx_index: std::sync::atomic::AtomicBool::new(true),
         })
     }
 
@@ -66,6 +71,18 @@ impl Query {
 
     pub fn spend_index_enabled(&self) -> bool {
         self.spend_index
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Enable/disable txid hash-head inserts on archive (default on). Off under
+    /// milestone IBD; Class A bodies remain complete via header_txs fk lists.
+    pub fn set_tx_index(&self, enabled: bool) {
+        self.tx_index
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn tx_index_enabled(&self) -> bool {
+        self.tx_index
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -297,7 +314,26 @@ impl Query {
             per_header_tx_fks.push((*header_fk, tx_fks));
         }
 
-        let got_tx_fks = self.store.txs.put_batch(&all_txs)?;
+        // Three independent tables → encode+write in parallel (writer was
+        // single-core bound; this is the main multi-core lever without changing
+        // FK exclusivity — plan already assigned all FKs).
+        let index_tx = self.tx_index_enabled();
+        let (tx_res, in_res, out_res) = {
+            let (tx_res, io_res) = rayon::join(
+                || self.store.txs.put_batch_indexed(&all_txs, index_tx),
+                || {
+                    rayon::join(
+                        || self.store.inputs.put_batch(&all_inputs),
+                        || self.store.outputs.put_batch(&all_outputs),
+                    )
+                },
+            );
+            let (in_res, out_res) = io_res;
+            (tx_res, in_res, out_res)
+        };
+        let got_tx_fks = tx_res?;
+        in_res?;
+        out_res?;
         if got_tx_fks.len() != all_txs.len() {
             return Err(StoreError::Corrupt("tx put_batch length"));
         }
@@ -307,20 +343,6 @@ impl Query {
             }
         }
 
-        // Parallel only when both sides are large enough (rayon tax on early
-        // mainnet 1-tx blocks dominated wall time).
-        if all_inputs.len() >= 64 && all_outputs.len() >= 64 {
-            let (in_res, out_res) = rayon::join(
-                || self.store.inputs.put_batch(&all_inputs),
-                || self.store.outputs.put_batch(&all_outputs),
-            );
-            in_res?;
-            out_res?;
-        } else {
-            self.store.inputs.put_batch(&all_inputs)?;
-            self.store.outputs.put_batch(&all_outputs)?;
-        }
-
         if spend_on {
             for (prev_txid, prev_index, tx_fk, idx) in &spends {
                 self.store
@@ -328,9 +350,11 @@ impl Query {
             }
         }
 
-        for (header_fk, tx_fks) in &per_header_tx_fks {
-            self.store.header_txs.put_list(*header_fk, tx_fks)?;
-        }
+        let list_refs: Vec<(Fk, &[Fk])> = per_header_tx_fks
+            .iter()
+            .map(|(h, t)| (*h, t.as_slice()))
+            .collect();
+        self.store.header_txs.put_lists_batch(&list_refs)?;
         Ok(())
     }
 

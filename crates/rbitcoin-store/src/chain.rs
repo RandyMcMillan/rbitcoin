@@ -238,6 +238,32 @@ impl HeaderTxsTable {
         Ok(())
     }
 
+    /// Batch-append many header→tx-list rows (one lists body write + per-row array sets).
+    pub fn put_lists_batch(&self, items: &[(Fk, &[Fk])]) -> Result<(), StoreError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        if items.len() == 1 {
+            return self.put_list(items[0].0, items[0].1);
+        }
+        let est: usize = items
+            .iter()
+            .map(|(_, t)| 8 + t.len() * 8)
+            .sum();
+        let list_fks = self.lists.put_batch_encode(items.len(), est, |i, buf| {
+            let tx_fks = items[i].1;
+            buf.extend_from_slice(&(tx_fks.len() as u32).to_le_bytes());
+            for fk in tx_fks {
+                buf.extend_from_slice(&fk.0.to_le_bytes());
+            }
+        })?;
+        for ((header_fk, _), list_fk) in items.iter().zip(list_fks.iter()) {
+            let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
+            self.by_header.set(id - 1, list_fk.0)?;
+        }
+        Ok(())
+    }
+
     pub fn get_list(&self, header_fk: Fk) -> Result<Option<Vec<Fk>>, StoreError> {
         let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
         if id > self.by_header.len() {

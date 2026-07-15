@@ -1,7 +1,6 @@
 use crate::error::StoreError;
 use crate::hashhead::HashHead;
 use crate::var_table::{framed, VarTable};
-use rayon::prelude::*;
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::Path;
 
@@ -18,8 +17,8 @@ pub struct TxRecord {
 }
 
 impl TxRecord {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(32 + 4 + 4 + 8 + 4 + 8 + 4 + 4 + self.raw.len());
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        out.reserve(32 + 4 + 4 + 8 + 4 + 8 + 4 + 4 + self.raw.len());
         out.extend_from_slice(&self.txid);
         out.extend_from_slice(&self.version.to_le_bytes());
         out.extend_from_slice(&self.locktime.to_le_bytes());
@@ -29,6 +28,11 @@ impl TxRecord {
         out.extend_from_slice(&self.output_count.to_le_bytes());
         out.extend_from_slice(&(self.raw.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.raw);
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + 4 + 4 + 8 + 4 + 8 + 4 + 4 + self.raw.len());
+        self.encode_into(&mut out);
         out
     }
 
@@ -70,13 +74,18 @@ pub struct OutputRecord {
 }
 
 impl OutputRecord {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + 4 + 8 + 4 + self.script.len());
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        out.reserve(8 + 4 + 8 + 4 + self.script.len());
         out.extend_from_slice(&self.parent_tx_fk.0.to_le_bytes());
         out.extend_from_slice(&self.index.to_le_bytes());
         out.extend_from_slice(&self.value.to_le_bytes());
         out.extend_from_slice(&(self.script.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.script);
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + 4 + 8 + 4 + self.script.len());
+        self.encode_into(&mut out);
         out
     }
 
@@ -111,8 +120,8 @@ pub struct InputRecord {
 }
 
 impl InputRecord {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + 4 + 32 + 4 + 4 + 4 + self.script_sig.len());
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        out.reserve(8 + 4 + 32 + 4 + 4 + 4 + self.script_sig.len());
         out.extend_from_slice(&self.parent_tx_fk.0.to_le_bytes());
         out.extend_from_slice(&self.index.to_le_bytes());
         out.extend_from_slice(&self.prev_txid);
@@ -120,6 +129,11 @@ impl InputRecord {
         out.extend_from_slice(&self.sequence.to_le_bytes());
         out.extend_from_slice(&(self.script_sig.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.script_sig);
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + 4 + 32 + 4 + 4 + 4 + self.script_sig.len());
+        self.encode_into(&mut out);
         out
     }
 
@@ -176,29 +190,32 @@ impl TxTable {
         Ok(fks.pop().expect("one tx"))
     }
 
-    /// Append many tx rows (one body write) then publish hash heads.
+    /// Append many tx rows (one body write). When `index` is true, also publish
+    /// txid hash heads (skip during milestone IBD — biggest single-thread cost).
     pub fn put_batch(&self, recs: &[TxRecord]) -> Result<Vec<Fk>, StoreError> {
+        self.put_batch_indexed(recs, true)
+    }
+
+    pub fn put_batch_indexed(
+        &self,
+        recs: &[TxRecord],
+        index: bool,
+    ) -> Result<Vec<Fk>, StoreError> {
         if recs.is_empty() {
             return Ok(Vec::new());
         }
-        // Small batches: sequential encode into one blob (early mainnet = 1 tx/block;
-        // rayon spawn tax dominated). Large: parallel frame then one write.
-        let fks = if recs.len() < 64 {
-            let est: usize = recs.iter().map(|r| 80 + r.raw.len()).sum();
-            self.body.put_batch_encode(recs.len(), est, |i, buf| {
-                buf.extend_from_slice(&recs[i].encode());
-            })?
-        } else {
-            let owned: Vec<Vec<u8>> = recs.par_iter().map(|r| framed(&r.encode())).collect();
-            let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
-            self.body.put_batch(&refs)?
-        };
-        let heads: Vec<([u8; 32], Fk)> = recs
-            .iter()
-            .zip(fks.iter())
-            .map(|(r, fk)| (r.txid, *fk))
-            .collect();
-        self.head.insert_many(&heads)?;
+        let est: usize = recs.iter().map(|r| 80 + r.raw.len()).sum();
+        let fks = self.body.put_batch_encode(recs.len(), est, |i, buf| {
+            recs[i].encode_into(buf);
+        })?;
+        if index {
+            let heads: Vec<([u8; 32], Fk)> = recs
+                .iter()
+                .zip(fks.iter())
+                .map(|(r, fk)| (r.txid, *fk))
+                .collect();
+            self.head.insert_many(&heads)?;
+        }
         Ok(fks)
     }
 
@@ -252,15 +269,10 @@ impl OutputTable {
         if recs.is_empty() {
             return Ok(Vec::new());
         }
-        if recs.len() < 64 {
-            let est: usize = recs.iter().map(|r| 32 + r.script.len()).sum();
-            return self.body.put_batch_encode(recs.len(), est, |i, buf| {
-                buf.extend_from_slice(&recs[i].encode());
-            });
-        }
-        let owned: Vec<Vec<u8>> = recs.par_iter().map(|r| framed(&r.encode())).collect();
-        let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
-        self.body.put_batch(&refs)
+        let est: usize = recs.iter().map(|r| 32 + r.script.len()).sum();
+        self.body.put_batch_encode(recs.len(), est, |i, buf| {
+            recs[i].encode_into(buf);
+        })
     }
 
     pub fn get(&self, fk: Fk) -> Result<OutputRecord, StoreError> {
@@ -304,15 +316,10 @@ impl InputTable {
         if recs.is_empty() {
             return Ok(Vec::new());
         }
-        if recs.len() < 64 {
-            let est: usize = recs.iter().map(|r| 64 + r.script_sig.len()).sum();
-            return self.body.put_batch_encode(recs.len(), est, |i, buf| {
-                buf.extend_from_slice(&recs[i].encode());
-            });
-        }
-        let owned: Vec<Vec<u8>> = recs.par_iter().map(|r| framed(&r.encode())).collect();
-        let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
-        self.body.put_batch(&refs)
+        let est: usize = recs.iter().map(|r| 64 + r.script_sig.len()).sum();
+        self.body.put_batch_encode(recs.len(), est, |i, buf| {
+            recs[i].encode_into(buf);
+        })
     }
 
     pub fn get(&self, fk: Fk) -> Result<InputRecord, StoreError> {

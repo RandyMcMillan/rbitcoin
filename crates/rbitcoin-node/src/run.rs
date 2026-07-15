@@ -142,8 +142,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             milestone.height
         );
     }
-    // Fast IBD: skip scripthash / spend indexes under milestone (connect checks
-    // are also skipped there). Re-enable / reindex before full validation or Electrum.
+    // Fast IBD: skip scripthash / spend / txid indexes under milestone (connect
+    // checks are also skipped there). Re-enable / reindex before full validation
+    // or Electrum. tx.head inserts were the main single-thread archive bottleneck.
     let scripthash = config.scripthash_index && milestone.height == 0;
     handle.query.set_scripthash_index(scripthash);
     if !scripthash {
@@ -153,6 +154,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     handle.query.set_spend_index(spend_index);
     if !spend_index {
         info!("ibd: spend index OFF during catch-up under milestone (reindex before full validation)");
+    }
+    let tx_index = milestone.height == 0;
+    handle.query.set_tx_index(tx_index);
+    if !tx_index {
+        info!("ibd: txid hash-head OFF during catch-up under milestone (bodies still complete via header_txs)");
     }
 
     let listen = config

@@ -500,7 +500,6 @@ version = "0.1.0"
 dependencies = [
  "memmap2",
  "parking_lot",
- "rayon",
  "rbitcoin-primitives",
  "sha2",
  "thiserror",

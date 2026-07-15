@@ -84,6 +84,42 @@ impl VarTable {
         Ok(fks)
     }
 
+    /// Encode `n` records into one body blob (length-prefix each) then one write.
+    /// Avoids `Vec<Vec<u8>>` intermediate frames (libbitcoin put_ref style).
+    ///
+    /// `encode(i, buf)` must append the **unframed** payload for record `i`.
+    pub fn put_batch_encode(
+        &self,
+        n: usize,
+        estimate_bytes: usize,
+        mut encode: impl FnMut(usize, &mut Vec<u8>),
+    ) -> Result<Vec<Fk>, StoreError> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut count = self.count.lock();
+        let start = self.body.logical_len().max(FILE_HEADER_LEN as u64);
+        let mut body_blob = Vec::with_capacity(estimate_bytes.saturating_add(n * 4));
+        let mut idx_blob = Vec::with_capacity(n * 8);
+        let mut fks = Vec::with_capacity(n);
+        let mut cursor = start;
+        for i in 0..n {
+            fks.push(Fk(*count + 1 + i as u64));
+            idx_blob.extend_from_slice(&cursor.to_le_bytes());
+            let frame_at = body_blob.len();
+            body_blob.extend_from_slice(&0u32.to_le_bytes()); // placeholder total len
+            encode(i, &mut body_blob);
+            let total = (body_blob.len() - frame_at) as u32;
+            body_blob[frame_at..frame_at + 4].copy_from_slice(&total.to_le_bytes());
+            cursor += u64::from(total);
+        }
+        self.body.write_at(start, &body_blob)?;
+        let off_pos = FILE_HEADER_LEN as u64 + (*count) * 8;
+        self.idx.write_at(off_pos, &idx_blob)?;
+        *count += n as u64;
+        Ok(fks)
+    }
+
     pub fn get_raw(&self, fk: Fk) -> Result<Vec<u8>, StoreError> {
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
         let count = *self.count.lock();

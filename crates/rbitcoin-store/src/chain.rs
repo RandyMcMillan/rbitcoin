@@ -94,6 +94,25 @@ impl StrongTxTable {
         self.arr.set(id - 1, header_fk.0)
     }
 
+    /// Mark many consecutive tx fks strong for the same header (one array write).
+    pub fn set_strong_range(
+        &self,
+        first_tx_fk: Fk,
+        count: u32,
+        header_fk: Fk,
+    ) -> Result<(), StoreError> {
+        let id = first_tx_fk.get().ok_or(StoreError::InvalidFk)?;
+        if header_fk.is_null() || count == 0 {
+            return if count == 0 {
+                Ok(())
+            } else {
+                Err(StoreError::InvalidFk)
+            };
+        }
+        self.arr
+            .fill_range(id - 1, u64::from(count), header_fk.0)
+    }
+
     pub fn set_unstrong(&self, tx_fk: Fk) -> Result<(), StoreError> {
         let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
         if id > self.arr.len() {

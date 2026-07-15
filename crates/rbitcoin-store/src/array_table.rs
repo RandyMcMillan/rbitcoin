@@ -71,6 +71,32 @@ impl ArrayTable {
         Ok(())
     }
 
+    /// Fill `count` consecutive slots starting at `start` with the same `value`
+    /// (one grow + one body write). Used for strong_tx under milestone confirm.
+    pub fn fill_range(&self, start: u64, count: u64, value: u64) -> Result<(), StoreError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let end = start.saturating_add(count); // exclusive
+        let mut len = self.len.lock();
+        if end > *len {
+            // Zero-fill gap before start if any.
+            if start > *len {
+                for i in *len..start {
+                    self.file.write_at(Self::offset(i), &0u64.to_le_bytes())?;
+                }
+            }
+            *len = end;
+        }
+        let mut blob = Vec::with_capacity((count as usize).saturating_mul(8));
+        let v = value.to_le_bytes();
+        for _ in 0..count {
+            blob.extend_from_slice(&v);
+        }
+        self.file.write_at(Self::offset(start), &blob)?;
+        Ok(())
+    }
+
     /// Shrink to `new_len` slots (tip disconnect).
     pub fn truncate(&self, new_len: u64) -> Result<(), StoreError> {
         let mut len = self.len.lock();

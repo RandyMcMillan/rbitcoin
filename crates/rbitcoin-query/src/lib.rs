@@ -188,38 +188,39 @@ impl Query {
         header: &HeaderRecord,
         txs: &[TxApply],
     ) -> Result<Fk, QueryError> {
-        let mut out = self.archive_prepared_batch(&[(header, txs)])?;
+        // Single-block path: one clone into owned mega-batch.
+        let mut items = vec![(header.clone(), txs.to_vec())];
+        let mut out = self.archive_prepared_owned(&mut items)?;
         Ok(out.pop().expect("one archive result"))
     }
 
-    /// Archive many prepared blocks in one Class A mega-batch.
+    /// Archive many prepared blocks, **moving** `TxApply` payloads (no re-clone).
     ///
-    /// Plans contiguous tx/input/output FK ranges across the whole batch, then
-    /// does one `put_batch` per table (inputs ∥ outputs via `rayon::join`). Much
-    /// faster than N independent [`archive_block`] calls on the writer thread.
+    /// Libbitcoin-style: plan FKs, contiguous put of txs/ins/outs, bulk hash
+    /// heads. Prefer this from the IBD writer over N×[`archive_block`].
     ///
-    /// Returns one header fk per input item (same order). Idempotent for bodies
-    /// already archived.
-    pub fn archive_prepared_batch(
+    /// `items[i].1` is drained (empty on success). Returns header fk per item.
+    pub fn archive_prepared_owned(
         &self,
-        items: &[(&HeaderRecord, &[TxApply])],
+        items: &mut [(HeaderRecord, Vec<TxApply>)],
     ) -> Result<Vec<Fk>, QueryError> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Resolve / create headers; skip bodies already on disk.
         let mut header_fks = Vec::with_capacity(items.len());
-        let mut need: Vec<(Fk, &[TxApply])> = Vec::new();
-        for (header, txs) in items {
+        let mut need: Vec<(Fk, Vec<TxApply>)> = Vec::new();
+        for (header, txs) in items.iter_mut() {
             let fk = if let Some((fk, _)) = self.get_header_by_hash(&header.hash)? {
                 fk
             } else {
                 self.store.put_header(header)?
             };
             header_fks.push(fk);
-            if !self.store.header_txs.has_body(fk)? {
-                need.push((fk, txs));
+            if self.store.header_txs.has_body(fk)? {
+                txs.clear();
+            } else {
+                need.push((fk, std::mem::take(txs)));
             }
         }
 
@@ -227,13 +228,15 @@ impl Query {
             return Ok(header_fks);
         }
 
-        self.archive_bodies_mega(&need)?;
+        self.archive_bodies_mega_owned(&mut need)?;
         Ok(header_fks)
     }
 
-    /// Mega-batch Class A body rows for headers that do not yet have bodies.
-    fn archive_bodies_mega(&self, need: &[(Fk, &[TxApply])]) -> Result<(), QueryError> {
-        // Single snapshot of table counters — writer thread is exclusive.
+    /// Mega-batch Class A: move records in place, one put_batch per table.
+    fn archive_bodies_mega_owned(
+        &self,
+        need: &mut [(Fk, Vec<TxApply>)],
+    ) -> Result<(), QueryError> {
         let mut next_tx = self.store.txs.count() + 1;
         let mut next_in = self.store.inputs.count() + 1;
         let mut next_out = self.store.outputs.count() + 1;
@@ -241,15 +244,13 @@ impl Query {
         let mut all_txs: Vec<TxRecord> = Vec::new();
         let mut all_inputs: Vec<InputRecord> = Vec::new();
         let mut all_outputs: Vec<OutputRecord> = Vec::new();
-        // Per-header planned tx fk lists (for header_txs).
         let mut per_header_tx_fks: Vec<(Fk, Vec<Fk>)> = Vec::with_capacity(need.len());
-        // Spend index work deferred until tx fks are known (same as planned).
         let mut spends: Vec<([u8; 32], u32, Fk, u32)> = Vec::new();
         let spend_on = self.spend_index_enabled();
 
-        for &(header_fk, txs) in need {
+        for (header_fk, txs) in need.iter_mut() {
             let mut tx_fks = Vec::with_capacity(txs.len());
-            for ta in txs {
+            for ta in txs.drain(..) {
                 let n_in = ta.inputs.len() as u32;
                 let n_out = ta.outputs.len() as u32;
                 let tx_fk = Fk(next_tx);
@@ -265,70 +266,60 @@ impl Query {
                     Fk(next_out)
                 };
 
-                all_txs.push(TxRecord {
-                    txid: ta.tx.txid,
-                    version: ta.tx.version,
-                    locktime: ta.tx.locktime,
-                    input_start_fk: in_start,
-                    input_count: n_in,
-                    output_start_fk: out_start,
-                    output_count: n_out,
-                    raw: ta.tx.raw.clone(),
-                });
+                // Move raw + scripts — no re-clone (prep already allocated).
+                let mut tx = ta.tx;
+                tx.input_start_fk = in_start;
+                tx.input_count = n_in;
+                tx.output_start_fk = out_start;
+                tx.output_count = n_out;
+                all_txs.push(tx);
 
-                for (i, inp) in ta.inputs.iter().enumerate() {
+                for (i, mut inp) in ta.inputs.into_iter().enumerate() {
                     let idx = i as u32;
                     if spend_on && inp.prev_txid != [0u8; 32] {
                         spends.push((inp.prev_txid, inp.prev_index, tx_fk, idx));
                     }
-                    all_inputs.push(InputRecord {
-                        parent_tx_fk: tx_fk,
-                        index: idx,
-                        prev_txid: inp.prev_txid,
-                        prev_index: inp.prev_index,
-                        sequence: inp.sequence,
-                        script_sig: inp.script_sig.clone(),
-                    });
+                    inp.parent_tx_fk = tx_fk;
+                    inp.index = idx;
+                    all_inputs.push(inp);
                 }
                 next_in += u64::from(n_in);
 
-                for (i, out) in ta.outputs.iter().enumerate() {
-                    all_outputs.push(OutputRecord {
-                        parent_tx_fk: tx_fk,
-                        index: i as u32,
-                        value: out.value,
-                        script: out.script.clone(),
-                    });
+                for (i, mut out) in ta.outputs.into_iter().enumerate() {
+                    out.parent_tx_fk = tx_fk;
+                    out.index = i as u32;
+                    all_outputs.push(out);
                 }
                 next_out += u64::from(n_out);
 
                 tx_fks.push(tx_fk);
             }
-            per_header_tx_fks.push((header_fk, tx_fks));
+            per_header_tx_fks.push((*header_fk, tx_fks));
         }
 
-        // One body write for all txs, then hash heads. Planned FKs must match
-        // append order (exclusive writer thread owns these tables).
         let got_tx_fks = self.store.txs.put_batch(&all_txs)?;
         if got_tx_fks.len() != all_txs.len() {
             return Err(StoreError::Corrupt("tx put_batch length"));
         }
-        if let Some(&planned0) = per_header_tx_fks
-            .first()
-            .and_then(|(_, v)| v.first())
-        {
+        if let Some(&planned0) = per_header_tx_fks.first().and_then(|(_, v)| v.first()) {
             if got_tx_fks.first().copied() != Some(planned0) {
                 return Err(StoreError::Corrupt("tx put_batch fk mismatch"));
             }
         }
 
-        // Inputs and outputs are independent tables — encode+write in parallel.
-        let (in_res, out_res) = rayon::join(
-            || self.store.inputs.put_batch(&all_inputs),
-            || self.store.outputs.put_batch(&all_outputs),
-        );
-        in_res?;
-        out_res?;
+        // Parallel only when both sides are large enough (rayon tax on early
+        // mainnet 1-tx blocks dominated wall time).
+        if all_inputs.len() >= 64 && all_outputs.len() >= 64 {
+            let (in_res, out_res) = rayon::join(
+                || self.store.inputs.put_batch(&all_inputs),
+                || self.store.outputs.put_batch(&all_outputs),
+            );
+            in_res?;
+            out_res?;
+        } else {
+            self.store.inputs.put_batch(&all_inputs)?;
+            self.store.outputs.put_batch(&all_outputs)?;
+        }
 
         if spend_on {
             for (prev_txid, prev_index, tx_fk, idx) in &spends {
@@ -380,10 +371,25 @@ impl Query {
             .get_list(header_fk)?
             .ok_or(StoreError::Corrupt("confirm without archived body"))?;
 
-        for &tx_fk in &tx_fks {
-            self.store.strong_tx.set_strong(tx_fk, header_fk)?;
-            if self.scripthash_index_enabled() {
-                self.apply_scripthash_for_tx(height, tx_fk)?;
+        let script_on = self.scripthash_index_enabled();
+        // Contiguous tx fk range (always true for our archive plan) → one write.
+        let contiguous = tx_fks
+            .windows(2)
+            .all(|w| w[1].0 == w[0].0.saturating_add(1));
+        if !script_on && contiguous {
+            if let Some(&first) = tx_fks.first() {
+                self.store.strong_tx.set_strong_range(
+                    first,
+                    tx_fks.len() as u32,
+                    header_fk,
+                )?;
+            }
+        } else {
+            for &tx_fk in &tx_fks {
+                self.store.strong_tx.set_strong(tx_fk, header_fk)?;
+                if script_on {
+                    self.apply_scripthash_for_tx(height, tx_fk)?;
+                }
             }
         }
 

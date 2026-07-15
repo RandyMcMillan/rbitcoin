@@ -181,15 +181,24 @@ impl TxTable {
         if recs.is_empty() {
             return Ok(Vec::new());
         }
-        let owned: Vec<Vec<u8>> = recs
-            .par_iter()
-            .map(|r| framed(&r.encode()))
+        // Small batches: sequential encode into one blob (early mainnet = 1 tx/block;
+        // rayon spawn tax dominated). Large: parallel frame then one write.
+        let fks = if recs.len() < 64 {
+            let est: usize = recs.iter().map(|r| 80 + r.raw.len()).sum();
+            self.body.put_batch_encode(recs.len(), est, |i, buf| {
+                buf.extend_from_slice(&recs[i].encode());
+            })?
+        } else {
+            let owned: Vec<Vec<u8>> = recs.par_iter().map(|r| framed(&r.encode())).collect();
+            let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
+            self.body.put_batch(&refs)?
+        };
+        let heads: Vec<([u8; 32], Fk)> = recs
+            .iter()
+            .zip(fks.iter())
+            .map(|(r, fk)| (r.txid, *fk))
             .collect();
-        let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
-        let fks = self.body.put_batch(&refs)?;
-        for (rec, fk) in recs.iter().zip(fks.iter()) {
-            self.head.insert(&rec.txid, *fk)?;
-        }
+        self.head.insert_many(&heads)?;
         Ok(fks)
     }
 
@@ -243,10 +252,13 @@ impl OutputTable {
         if recs.is_empty() {
             return Ok(Vec::new());
         }
-        let owned: Vec<Vec<u8>> = recs
-            .par_iter()
-            .map(|r| framed(&r.encode()))
-            .collect();
+        if recs.len() < 64 {
+            let est: usize = recs.iter().map(|r| 32 + r.script.len()).sum();
+            return self.body.put_batch_encode(recs.len(), est, |i, buf| {
+                buf.extend_from_slice(&recs[i].encode());
+            });
+        }
+        let owned: Vec<Vec<u8>> = recs.par_iter().map(|r| framed(&r.encode())).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
         self.body.put_batch(&refs)
     }
@@ -292,10 +304,13 @@ impl InputTable {
         if recs.is_empty() {
             return Ok(Vec::new());
         }
-        let owned: Vec<Vec<u8>> = recs
-            .par_iter()
-            .map(|r| framed(&r.encode()))
-            .collect();
+        if recs.len() < 64 {
+            let est: usize = recs.iter().map(|r| 64 + r.script_sig.len()).sum();
+            return self.body.put_batch_encode(recs.len(), est, |i, buf| {
+                buf.extend_from_slice(&recs[i].encode());
+            });
+        }
+        let owned: Vec<Vec<u8>> = recs.par_iter().map(|r| framed(&r.encode())).collect();
         let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
         self.body.put_batch(&refs)
     }

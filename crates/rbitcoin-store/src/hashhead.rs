@@ -117,25 +117,60 @@ impl HashHead {
     /// Insert or replace mapping. Grows the table when load factor is high.
     pub fn insert(&self, key: &[u8; 32], fk: Fk) -> Result<Option<Fk>, StoreError> {
         debug_assert!(!fk.is_null());
-        loop {
-            // Hold state lock across probe+write so concurrent get sees a consistent
-            // slots count for the file region we write into.
-            let mut state = self.state.lock();
-            if state.occupied.saturating_mul(MAX_LOAD_DEN)
-                >= state.slots.saturating_mul(MAX_LOAD_NUM)
-            {
+        let mut prev = None;
+        self.insert_many_with(&[( *key, fk )], |p| prev = p)?;
+        Ok(prev)
+    }
+
+    /// Insert many mappings, rehashing as needed. Prefer this over N×[`insert`]
+    /// during multi-tx archive (one capacity plan, fewer lock churn).
+    pub fn insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
+        self.insert_many_with(entries, |_| {})
+    }
+
+    fn insert_many_with(
+        &self,
+        entries: &[([u8; 32], Fk)],
+        mut on_prev: impl FnMut(Option<Fk>),
+    ) -> Result<(), StoreError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut i = 0usize;
+        while i < entries.len() {
+            // Grow until remaining entries fit load factor (worst case all new).
+            loop {
+                let state = self.state.lock();
+                let remaining = (entries.len() - i) as u64;
+                if state
+                    .occupied
+                    .saturating_add(remaining)
+                    .saturating_mul(MAX_LOAD_DEN)
+                    < state.slots.saturating_mul(MAX_LOAD_NUM)
+                {
+                    break;
+                }
                 drop(state);
                 self.rehash()?;
-                continue;
             }
-            match self.try_insert_locked(&mut state, key, fk)? {
-                InsertResult::Done(prev) => return Ok(prev),
-                InsertResult::NeedRehash => {
-                    drop(state);
-                    self.rehash()?;
+            let mut state = self.state.lock();
+            while i < entries.len() {
+                let (key, fk) = &entries[i];
+                debug_assert!(!fk.is_null());
+                match self.try_insert_locked(&mut state, key, *fk)? {
+                    InsertResult::Done(prev) => {
+                        on_prev(prev);
+                        i += 1;
+                    }
+                    InsertResult::NeedRehash => {
+                        drop(state);
+                        self.rehash()?;
+                        break;
+                    }
                 }
             }
         }
+        Ok(())
     }
 
     fn try_insert_locked(

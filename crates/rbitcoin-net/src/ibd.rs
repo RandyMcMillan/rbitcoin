@@ -940,8 +940,9 @@ fn spawn_archive_pipeline(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let n_prep = n_prep.max(2);
+        // Deep write queue so prep never blocks while writer drains mega-batches.
         let (write_tx, write_rx) =
-            std::sync::mpsc::sync_channel::<PreparedArchive>(n_prep.saturating_mul(8).max(16));
+            std::sync::mpsc::sync_channel::<PreparedArchive>(n_prep.saturating_mul(64).max(256));
         let write_hub = hub.clone();
         let write_result = result_tx.clone();
 
@@ -950,6 +951,8 @@ fn spawn_archive_pipeline(
             .name("ibd-archive-writer".into())
             .spawn(move || {
                 // Tight drain loop: process all ready jobs before blocking again.
+                // Large mega-batches amortize FK plan + mmap puts (libbitcoin-class).
+                const MAX_MEGA: usize = 256;
                 loop {
                     let first = match write_rx.recv() {
                         Ok(p) => p,
@@ -958,23 +961,19 @@ fn spawn_archive_pipeline(
                     let mut batch = vec![first];
                     while let Ok(p) = write_rx.try_recv() {
                         batch.push(p);
-                        if batch.len() >= 32 {
+                        if batch.len() >= MAX_MEGA {
                             break;
                         }
                     }
-                    // Multi-block Class A mega-batch: one plan + put_batch per
-                    // table across up to 32 prepared bodies (inputs ∥ outputs).
-                    let refs: Vec<_> = batch
-                        .iter()
-                        .map(|p| (&p.header, p.txs.as_slice()))
+                    let hashes: Vec<_> = batch.iter().map(|p| p.hash).collect();
+                    let mut owned: Vec<_> = batch
+                        .into_iter()
+                        .map(|p| (p.header, p.txs))
                         .collect();
-                    match write_hub.query.archive_prepared_batch(&refs) {
-                        Ok(fks) => {
-                            for (prep, _fk) in batch.into_iter().zip(fks) {
-                                if write_result
-                                    .send(ArchiveResult::Ok { hash: prep.hash })
-                                    .is_err()
-                                {
+                    match write_hub.query.archive_prepared_owned(&mut owned) {
+                        Ok(_fks) => {
+                            for hash in hashes {
+                                if write_result.send(ArchiveResult::Ok { hash }).is_err() {
                                     return;
                                 }
                             }
@@ -984,10 +983,10 @@ fn spawn_archive_pipeline(
                             // already appended txs/I/O without header_txs (no has_body
                             // yet); re-archiving would double-append Class A rows.
                             let err = e.to_string();
-                            for prep in batch {
+                            for hash in hashes {
                                 if write_result
                                     .send(ArchiveResult::Err {
-                                        hash: prep.hash,
+                                        hash,
                                         err: err.clone(),
                                     })
                                     .is_err()
@@ -1229,7 +1228,8 @@ fn reassign_stalled(
 }
 
 /// Max tip confirms per event-loop turn (Class C is sequential; keep peers busy).
-const CONNECT_BATCH: usize = 128;
+/// Under milestone this is cheap (strong_tx + height maps only) — batch big.
+const CONNECT_BATCH: usize = 512;
 
 /// Mark `h` done in the ordered set. Prefer O(1) front pop; otherwise leave a
 /// stale ordered entry (front-trim via `has_block` / set membership skips it).

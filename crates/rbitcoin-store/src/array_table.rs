@@ -80,11 +80,11 @@ impl ArrayTable {
         let end = start.saturating_add(count); // exclusive
         let mut len = self.len.lock();
         if end > *len {
-            // Zero-fill gap before start if any.
+            // Zero-fill gap before start if any (single blob, not per-slot).
             if start > *len {
-                for i in *len..start {
-                    self.file.write_at(Self::offset(i), &0u64.to_le_bytes())?;
-                }
+                let gap = start - *len;
+                let zeros = vec![0u8; (gap as usize).saturating_mul(8)];
+                self.file.write_at(Self::offset(*len), &zeros)?;
             }
             *len = end;
         }
@@ -94,6 +94,38 @@ impl ArrayTable {
             blob.extend_from_slice(&v);
         }
         self.file.write_at(Self::offset(start), &blob)?;
+        Ok(())
+    }
+
+    /// Set many (index, value) pairs. Grows once to max index (blob zero-fill),
+    /// then writes each value — avoids O(gap) per-slot grow in a loop.
+    pub fn set_many(&self, pairs: &[(u64, u64)]) -> Result<(), StoreError> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let max_idx = pairs.iter().map(|(i, _)| *i).max().unwrap();
+        let mut len = self.len.lock();
+        if max_idx >= *len {
+            let new_len = max_idx + 1;
+            let gap = new_len - *len;
+            // One zero blob for the extension (may be large on first use).
+            const CHUNK: usize = 1024 * 1024; // 1 MiB of zeros = 128k slots
+            let mut offset = Self::offset(*len);
+            let mut remaining = gap * ELEM;
+            let zeros = vec![0u8; CHUNK];
+            while remaining > 0 {
+                let n = remaining.min(zeros.len() as u64) as usize;
+                self.file.write_at(offset, &zeros[..n])?;
+                offset += n as u64;
+                remaining -= n as u64;
+            }
+            *len = new_len;
+        }
+        drop(len);
+        for &(index, value) in pairs {
+            self.file
+                .write_at(Self::offset(index), &value.to_le_bytes())?;
+        }
         Ok(())
     }
 

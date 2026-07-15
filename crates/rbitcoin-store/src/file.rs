@@ -147,14 +147,21 @@ impl TableFile {
         Ok(())
     }
 
-    fn ensure_capacity(&self, need: u64) -> Result<(), StoreError> {
+    /// Ensure the mmap covers at least `need` bytes (pre-grow for mega-batches).
+    pub fn ensure_capacity(&self, need: u64) -> Result<(), StoreError> {
         let mut map = self.map.lock();
         if need <= map.len() as u64 {
             return Ok(());
         }
+        // Grow more aggressively for IBD mega-batches (fewer remap pauses).
         let mut new_cap = (map.len() as u64).max(64);
         while new_cap < need {
             new_cap = new_cap.saturating_mul(2).max(need);
+        }
+        // Round up toward 64 MiB steps once large.
+        if new_cap > 64 * 1024 * 1024 {
+            let step = 64 * 1024 * 1024u64;
+            new_cap = new_cap.div_ceil(step).saturating_mul(step);
         }
         let file = self.file.lock();
         file.set_len(new_cap)

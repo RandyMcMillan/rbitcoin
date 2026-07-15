@@ -185,6 +185,10 @@ impl TxTable {
         self.body.count()
     }
 
+    pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {
+        self.body.reserve_append(body_bytes, n_records)
+    }
+
     pub fn put(&self, rec: &TxRecord) -> Result<Fk, StoreError> {
         let mut fks = self.put_batch(std::slice::from_ref(rec))?;
         Ok(fks.pop().expect("one tx"))
@@ -259,6 +263,10 @@ impl OutputTable {
         self.body.count()
     }
 
+    pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {
+        self.body.reserve_append(body_bytes, n_records)
+    }
+
     pub fn put(&self, rec: &OutputRecord) -> Result<Fk, StoreError> {
         let payload = framed(&rec.encode());
         self.body.put(&payload)
@@ -304,6 +312,10 @@ impl InputTable {
 
     pub fn count(&self) -> u64 {
         self.body.count()
+    }
+
+    pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {
+        self.body.reserve_append(body_bytes, n_records)
     }
 
     pub fn put(&self, rec: &InputRecord) -> Result<Fk, StoreError> {

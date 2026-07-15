@@ -238,7 +238,7 @@ impl HeaderTxsTable {
         Ok(())
     }
 
-    /// Batch-append many header→tx-list rows (one lists body write + per-row array sets).
+    /// Batch-append many header→tx-list rows (one lists body write + batch array sets).
     pub fn put_lists_batch(&self, items: &[(Fk, &[Fk])]) -> Result<(), StoreError> {
         if items.is_empty() {
             return Ok(());
@@ -257,10 +257,12 @@ impl HeaderTxsTable {
                 buf.extend_from_slice(&fk.0.to_le_bytes());
             }
         })?;
+        let mut pairs = Vec::with_capacity(items.len());
         for ((header_fk, _), list_fk) in items.iter().zip(list_fks.iter()) {
             let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
-            self.by_header.set(id - 1, list_fk.0)?;
+            pairs.push((id - 1, list_fk.0));
         }
+        self.by_header.set_many(&pairs)?;
         Ok(())
     }
 

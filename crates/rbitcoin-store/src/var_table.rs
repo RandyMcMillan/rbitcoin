@@ -53,6 +53,16 @@ impl VarTable {
         *self.count.lock()
     }
 
+    /// Pre-grow body (+ idx) capacity so a following mega `put_batch` does not
+    /// remap mid-write.
+    pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {
+        let body_need = self.body.logical_len().saturating_add(body_bytes);
+        self.body.ensure_capacity(body_need)?;
+        let idx_need = FILE_HEADER_LEN as u64 + (self.count() + n_records) * 8;
+        self.idx.ensure_capacity(idx_need)?;
+        Ok(())
+    }
+
     pub fn put(&self, payload: &[u8]) -> Result<Fk, StoreError> {
         let mut fks = self.put_batch(std::slice::from_ref(&payload))?;
         Ok(fks.pop().expect("one payload"))
@@ -127,36 +137,6 @@ impl VarTable {
             return Err(StoreError::Corrupt("var put_batch_encode race"));
         }
         self.body.write_at(start, &body_blob)?;
-        let off_pos = FILE_HEADER_LEN as u64 + (*count) * 8;
-        self.idx.write_at(off_pos, &idx_blob)?;
-        *count += n as u64;
-        Ok(fks)
-    }
-
-    /// Append a pre-built body blob + idx offsets (relative to `start` already
-    /// applied in idx values as absolute body offsets). Used when encode was
-    /// parallelized outside this table.
-    pub fn put_batch_prebuilt(
-        &self,
-        body_blob: &[u8],
-        idx_abs_offsets: &[u64],
-    ) -> Result<Vec<Fk>, StoreError> {
-        if idx_abs_offsets.is_empty() {
-            return Ok(Vec::new());
-        }
-        let n = idx_abs_offsets.len();
-        let mut count = self.count.lock();
-        let start = self.body.logical_len().max(FILE_HEADER_LEN as u64);
-        if idx_abs_offsets[0] != start {
-            return Err(StoreError::Corrupt("prebuilt idx start mismatch"));
-        }
-        let mut fks = Vec::with_capacity(n);
-        let mut idx_blob = Vec::with_capacity(n * 8);
-        for (i, off) in idx_abs_offsets.iter().enumerate() {
-            fks.push(Fk(*count + 1 + i as u64));
-            idx_blob.extend_from_slice(&off.to_le_bytes());
-        }
-        self.body.write_at(start, body_blob)?;
         let off_pos = FILE_HEADER_LEN as u64 + (*count) * 8;
         self.idx.write_at(off_pos, &idx_blob)?;
         *count += n as u64;

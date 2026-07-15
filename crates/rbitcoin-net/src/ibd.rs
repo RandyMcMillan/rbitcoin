@@ -103,12 +103,15 @@ enum PeerEvent {
 /// Wire block queued for archive prep (P0/P1 pipeline).
 struct ArchiveJob {
     block: Block,
+    /// Header row fk from ensure_header (writer skips hash-head re-lookup).
+    header_fk: rbitcoin_primitives::Fk,
 }
 
 struct PreparedArchive {
     hash: BlockHash,
     header: HeaderRecord,
     txs: Vec<TxApply>,
+    header_fk: rbitcoin_primitives::Fk,
 }
 
 enum ArchiveResult {
@@ -336,8 +339,11 @@ pub async fn parallel_ibd_cancellable(
         }
 
         // Backpressure: if archive queue is deep, stop issuing new getdata.
+        // Cap is intentionally deep so the writer can form large mega-batches
+        // (2×window kept the queue glued to the ceiling and underran mega-batch).
         let arch_q = archive_queued.load(Ordering::Relaxed);
-        if arch_q < cfg.window.saturating_mul(2) {
+        let arch_cap = cfg.window.saturating_mul(8).max(4096);
+        if arch_q < arch_cap {
             assign_work_ordered(
                 &mut slots,
                 &ordered,
@@ -565,10 +571,20 @@ pub async fn parallel_ibd_cancellable(
                 }
                 let hash = block.block_hash();
                 inflight.remove(&hash);
-                // Parent header for prev_fk; body goes to async archive pipeline.
-                let _ = hub.ensure_header(&block.header);
+                // Parent header for prev_fk; pass fk into pipeline so writer
+                // does not re-probe header.head on every block.
+                let header_fk = match hub.ensure_header_fk(&block.header) {
+                    Ok(fk) => fk,
+                    Err(e) => {
+                        warn!("ibd: ensure_header {hash}: {e}");
+                        continue;
+                    }
+                };
                 archive_queued.fetch_add(1, Ordering::Relaxed);
-                if arch_job_tx.send(ArchiveJob { block }).is_err() {
+                if arch_job_tx
+                    .send(ArchiveJob { block, header_fk })
+                    .is_err()
+                {
                     archive_queued.fetch_sub(1, Ordering::Relaxed);
                     warn!("ibd: archive pipeline closed; drop {hash}");
                 }
@@ -940,9 +956,9 @@ fn spawn_archive_pipeline(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let n_prep = n_prep.max(2);
-        // Deep write queue so prep never blocks while writer drains mega-batches.
+        // Deep write queue: holds many prepared bodies so mega-batches stay full.
         let (write_tx, write_rx) =
-            std::sync::mpsc::sync_channel::<PreparedArchive>(n_prep.saturating_mul(64).max(256));
+            std::sync::mpsc::sync_channel::<PreparedArchive>(n_prep.saturating_mul(256).max(2048));
         let write_hub = hub.clone();
         let write_result = result_tx.clone();
 
@@ -950,9 +966,8 @@ fn spawn_archive_pipeline(
         let writer = std::thread::Builder::new()
             .name("ibd-archive-writer".into())
             .spawn(move || {
-                // Tight drain loop: process all ready jobs before blocking again.
-                // Large mega-batches amortize FK plan + mmap puts (libbitcoin-class).
-                const MAX_MEGA: usize = 256;
+                // Large mega-batches amortize FK plan + mmap capacity growth.
+                const MAX_MEGA: usize = 1024;
                 loop {
                     let first = match write_rx.recv() {
                         Ok(p) => p,
@@ -968,9 +983,9 @@ fn spawn_archive_pipeline(
                     let hashes: Vec<_> = batch.iter().map(|p| p.hash).collect();
                     let mut owned: Vec<_> = batch
                         .into_iter()
-                        .map(|p| (p.header, p.txs))
+                        .map(|p| (p.header_fk, p.header, p.txs))
                         .collect();
-                    match write_hub.query.archive_prepared_owned(&mut owned) {
+                    match write_hub.query.archive_prepared_with_fks(&mut owned) {
                         Ok(_fks) => {
                             for hash in hashes {
                                 if write_result.send(ArchiveResult::Ok { hash }).is_err() {
@@ -1006,8 +1021,8 @@ fn spawn_archive_pipeline(
             .build()
             .expect("archive prep pool");
 
-        // In-flight prep permits so we do not unboundedly queue rayon tasks.
-        let sem = Arc::new(Semaphore::new(n_prep.saturating_mul(2).max(4)));
+        // Deep prep permits: keep writer fed without unbounded RAM.
+        let sem = Arc::new(Semaphore::new(n_prep.saturating_mul(16).max(64)));
         let mut inflight = Vec::new();
 
         while let Some(job) = job_rx.recv().await {
@@ -1024,10 +1039,16 @@ fn spawn_archive_pipeline(
             pool.spawn(move || {
                 let _permit = permit;
                 let hash = job.block.block_hash();
+                let header_fk = job.header_fk;
                 match prepare_block_for_archive(&hub.query, &hub.params, &job.block) {
                     Ok((header, txs)) => {
                         if write_tx
-                            .send(PreparedArchive { hash, header, txs })
+                            .send(PreparedArchive {
+                                hash,
+                                header,
+                                txs,
+                                header_fk,
+                            })
                             .is_err()
                         {
                             let _ = result_tx.send(ArchiveResult::Err {

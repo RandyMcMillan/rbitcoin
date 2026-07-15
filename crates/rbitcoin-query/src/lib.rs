@@ -224,28 +224,39 @@ impl Query {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-
-        let mut header_fks = Vec::with_capacity(items.len());
-        let mut need: Vec<(Fk, Vec<TxApply>)> = Vec::new();
+        let mut with_fk: Vec<(Fk, HeaderRecord, Vec<TxApply>)> = Vec::with_capacity(items.len());
         for (header, txs) in items.iter_mut() {
             let fk = if let Some((fk, _)) = self.get_header_by_hash(&header.hash)? {
                 fk
             } else {
                 self.store.put_header(header)?
             };
-            header_fks.push(fk);
-            if self.store.header_txs.has_body(fk)? {
-                txs.clear();
-            } else {
-                need.push((fk, std::mem::take(txs)));
+            with_fk.push((fk, header.clone(), std::mem::take(txs)));
+        }
+        self.archive_prepared_with_fks(&mut with_fk)
+    }
+
+    /// Hot IBD path: header fk already known (from ensure_header) — no hash-head
+    /// re-probe, no has_body check (body just arrived).
+    pub fn archive_prepared_with_fks(
+        &self,
+        items: &mut [(Fk, HeaderRecord, Vec<TxApply>)],
+    ) -> Result<Vec<Fk>, QueryError> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut header_fks = Vec::with_capacity(items.len());
+        let mut need: Vec<(Fk, Vec<TxApply>)> = Vec::with_capacity(items.len());
+        for (fk, _header, txs) in items.iter_mut() {
+            header_fks.push(*fk);
+            // Pipeline only enqueues missing bodies; skip expensive has_body.
+            if !txs.is_empty() {
+                need.push((*fk, std::mem::take(txs)));
             }
         }
-
-        if need.is_empty() {
-            return Ok(header_fks);
+        if !need.is_empty() {
+            self.archive_bodies_mega_owned(&mut need)?;
         }
-
-        self.archive_bodies_mega_owned(&mut need)?;
         Ok(header_fks)
     }
 
@@ -314,9 +325,30 @@ impl Query {
             per_header_tx_fks.push((*header_fk, tx_fks));
         }
 
-        // Three independent tables → encode+write in parallel (writer was
-        // single-core bound; this is the main multi-core lever without changing
-        // FK exclusivity — plan already assigned all FKs).
+        // Pre-grow mmaps once (avoids mid-batch remap pauses on all 3 tables).
+        let tx_est: u64 = all_txs.iter().map(|t| (80 + t.raw.len()) as u64).sum();
+        let in_est: u64 = all_inputs
+            .iter()
+            .map(|r| (64 + r.script_sig.len()) as u64)
+            .sum();
+        let out_est: u64 = all_outputs
+            .iter()
+            .map(|r| (32 + r.script.len()) as u64)
+            .sum();
+        self.store.txs.reserve_append(
+            tx_est.saturating_add(all_txs.len() as u64 * 4),
+            all_txs.len() as u64,
+        )?;
+        self.store.inputs.reserve_append(
+            in_est.saturating_add(all_inputs.len() as u64 * 4),
+            all_inputs.len() as u64,
+        )?;
+        self.store.outputs.reserve_append(
+            out_est.saturating_add(all_outputs.len() as u64 * 4),
+            all_outputs.len() as u64,
+        )?;
+
+        // Three independent tables → encode+write in parallel.
         let index_tx = self.tx_index_enabled();
         let (tx_res, in_res, out_res) = {
             let (tx_res, io_res) = rayon::join(

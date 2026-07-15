@@ -133,6 +133,13 @@ impl ChainHub {
 
     /// Persist a header row only (for header-sync → out-of-order body archive).
     pub fn ensure_header(&self, header: &Header) -> Result<(), NetError> {
+        let _ = self.ensure_header_fk(header)?;
+        Ok(())
+    }
+
+    /// Like [`ensure_header`], but returns the header fk for the archive writer
+    /// (avoids a second hash-head probe on the hot write path).
+    pub fn ensure_header_fk(&self, header: &Header) -> Result<Fk, NetError> {
         let prev_fk = if header.prev_blockhash.to_byte_array() == [0u8; 32] {
             Fk::NULL
         } else {
@@ -145,8 +152,7 @@ impl ChainHub {
         let rec = header_to_record(prev_fk, header);
         self.query
             .ensure_header(&rec)
-            .map_err(|e| NetError::Consensus(e.to_string()))?;
-        Ok(())
+            .map_err(|e| NetError::Consensus(e.to_string()))
     }
 
     /// Archive Class A body without requiring tip order (parallel IBD path).

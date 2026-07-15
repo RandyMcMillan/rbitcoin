@@ -193,7 +193,6 @@ pub async fn parallel_ibd_cancellable(
     let mut headers_done = false;
     let mut last_progress = Instant::now();
     let mut last_status = Instant::now();
-    let mut last_gap_recovery = Instant::now() - Duration::from_secs(60);
     // Consecutive empty/useless header replies.
     let mut empty_header_streak = 0u32;
     let mut header_req_seq = 0u32;
@@ -278,41 +277,10 @@ pub async fn parallel_ibd_cancellable(
             last_progress = Instant::now();
         }
 
-        // Tip-gap: tip-next not archived while later blocks are — focus getdata.
-        if archived_ahead > 64
-            && last_progress.elapsed() > Duration::from_secs(2)
-            && last_gap_recovery.elapsed() > Duration::from_secs(3)
-        {
-            if let Some(&need) = ordered.front() {
-                if !hub.is_archived(&need) && !hub.has_block(&need) {
-                    eprintln!(
-                        "ibd: tip-gap recovery need={need} archived_ahead={archived_ahead} inflight={}",
-                        inflight.len()
-                    );
-                    last_gap_recovery = Instant::now();
-                    let far: Vec<BlockHash> = inflight
-                        .keys()
-                        .copied()
-                        .filter(|h| *h != need)
-                        .collect();
-                    for h in far {
-                        if let Some((pid, _)) = inflight.remove(&h) {
-                            if let Some(s) = slots.iter_mut().find(|s| s.id == pid) {
-                                s.in_flight.remove(&h);
-                            }
-                        }
-                    }
-                    for s in slots.iter().filter(|s| s.alive) {
-                        let _ = s.cmd_tx.send(PeerCmd::GetData {
-                            hashes: vec![need],
-                        });
-                        inflight.insert(need, (s.id, Instant::now()));
-                    }
-                }
-            }
-        }
-
         // Assign getdata for non-archived holes in the tip horizon.
+        // Tip-next is always first in the candidate list; with archive-before-confirm
+        // we do not cancel far-ahead inflight when tip-next is late — confirm simply
+        // waits until that body is archived (stall reassign still re-requests holes).
         assign_work_ordered(
             &mut slots,
             &ordered,

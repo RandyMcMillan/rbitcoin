@@ -474,7 +474,14 @@ pub async fn parallel_ibd_cancellable(
                     hub.tip_height().unwrap_or(0).saturating_add(1)
                 });
                 if let Err(e) = tokio::task::block_in_place(|| hub.archive_block(height, block)) {
-                    eprintln!("ibd: archive reject {hash}: {e}");
+                    // Rate-limit: a storm of rejects usually means one root cause
+                    // (e.g. wrong validation at archive). Log sample + count.
+                    static REJECTS: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let n = REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n <= 5 || n % 100 == 0 {
+                        eprintln!("ibd: archive reject {hash}: {e} (count={n})");
+                    }
                 }
                 // Confirm contiguous archived prefix at tip.
                 let n = confirm_run(

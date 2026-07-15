@@ -33,7 +33,7 @@ where
         match a.as_ref() {
             "--help" | "-h" => {
                 eprintln!(
-                    "rbitcoin-node {} — usage:\n  rbitcoin-node [--datadir PATH] [--network NET] \\\n    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n    [--milestone HEIGHT] [--max-outbound N] [--max-run-secs N] \\\n    [--no-scripthash-index] [--no-seeds] [--smoke]\n\nNetworks: mainnet|testnet|signet|regtest\nMilestone: skip script/prevout at/below HEIGHT (IBD assumevalid-style).\n  Default when omitted: mainnet 840000, signet 300000, testnet 2500000, regtest 0.\n  Use --milestone 0 for full validation. Disables scripthash index under milestone.\nParallel IBD: multi-peer windowed getdata (default 144 in-flight / tip-ahead).",
+                    "rbitcoin-node {} — usage:\n  rbitcoin-node [--datadir PATH] [--network NET] \\\n    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n    [--milestone HEIGHT] [--max-outbound N] [--max-run-secs N] \\\n    [--no-scripthash-index] [--no-seeds] [--smoke]\n\nNetworks: mainnet|testnet|signet|regtest\nMilestone: skip script/prevout at/below HEIGHT (IBD assumevalid-style).\n  Default when omitted: mainnet 840000, signet 2000000, testnet 2500000, regtest 0.\n  Use --milestone 0 for full validation. Disables scripthash index under milestone.\nParallel IBD: multi-peer windowed getdata (default 144 in-flight / tip-ahead).",
                     env!("CARGO_PKG_VERSION")
                 );
                 return ExitCode::SUCCESS;

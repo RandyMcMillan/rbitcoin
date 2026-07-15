@@ -58,9 +58,12 @@ pub fn accept_and_connect_block(
 
 /// Archive a block body into Class A **without** requiring tip+1 / Class C.
 ///
-/// Used by parallel IBD: download order ≠ connect order. Parent header must
-/// already be in the store (`ensure_header` / prior archive). Under milestone,
-/// skips full header-chain difficulty checks (PoW on claimed bits still applied).
+/// Used by parallel IBD: download order ≠ connect order. Parent **header** must
+/// already be in the store (`ensure_header` / prior archive).
+///
+/// **Never** runs tip-ordered checks here (`validate_header` / `validate_block_connect`
+/// need a confirmed parent and UTXO view). Those run only in [`confirm_archived_at`].
+/// Light checks: structure (BIP34 at `height`), PoW vs claimed bits, pow limit.
 pub fn accept_and_archive_block(
     query: &Query,
     params: &ChainParams,
@@ -68,6 +71,7 @@ pub fn accept_and_archive_block(
     block: &Block,
     milestone: Milestone,
 ) -> Result<rbitcoin_primitives::Fk, ConsensusError> {
+    let _ = milestone; // connect/script policy applied at confirm only
     let hash = block.block_hash().to_byte_array();
     if query
         .is_block_archived(&hash)
@@ -83,11 +87,11 @@ pub fn accept_and_archive_block(
     let ctx = ValidationContext {
         params,
         height,
-        milestone,
+        milestone: Milestone::NONE, // structure only; milestone does not change BIP34
     };
     validate_block_structure(block, &ctx)?;
 
-    // PoW against claimed bits (always).
+    // PoW against claimed bits (always). Difficulty *correctness* is checked at confirm.
     let target = Target::from_compact(block.header.bits);
     if target > params.pow_limit {
         return Err(ConsensusError::BadHeader("target above pow limit"));
@@ -97,10 +101,15 @@ pub fn accept_and_archive_block(
         .validate_pow(target)
         .map_err(|_| ConsensusError::InvalidPow)?;
 
-    if !milestone.skips_at(height.0) {
-        // Full header linkage/difficulty only when not under milestone IBD.
-        validate_header(query, params, height, &block.header)?;
-        validate_block_connect(query, block, &ctx)?;
+    // Parent header must exist so prev_fk links (header-first IBD / ensure_header).
+    let prev = block.header.prev_blockhash;
+    if prev.to_byte_array() != [0u8; 32]
+        && query
+            .get_header_by_hash(prev.as_byte_array())
+            .map_err(ConsensusError::Store)?
+            .is_none()
+    {
+        return Err(ConsensusError::BadPrev);
     }
 
     let (header_rec, txs) = block_to_apply(query, &block.header, &block.txdata)?;
@@ -110,6 +119,9 @@ pub fn accept_and_archive_block(
 }
 
 /// Confirm the next tip block if its body is already archived.
+///
+/// Full header + connect validation run here (when not under milestone), where
+/// the parent is the confirmed tip and prevouts are on the best chain.
 pub fn confirm_archived_at(
     query: &Query,
     params: &ChainParams,
@@ -118,7 +130,6 @@ pub fn confirm_archived_at(
     milestone: Milestone,
 ) -> Result<rbitcoin_primitives::Fk, ConsensusError> {
     if !milestone.skips_at(height.0) {
-        // Full connect validation needs the wire block — reconstruct from archive.
         let block = query
             .reconstruct_archived_block(block_hash)
             .map_err(ConsensusError::Store)?

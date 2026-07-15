@@ -183,7 +183,9 @@ pub fn default_milestone_height(network: rbitcoin_primitives::Network) -> u32 {
         // Scripts skipped through a deeply buried height for experimental mainnet IBD.
         rbitcoin_primitives::Network::Mainnet => 840_000,
         rbitcoin_primitives::Network::Testnet => 2_500_000,
-        rbitcoin_primitives::Network::Signet => 300_000,
+        // Signet tip moves; keep default above typical tip so catch-up stays under
+        // milestone until operators opt into full validation (`--milestone 0`).
+        rbitcoin_primitives::Network::Signet => 2_000_000,
         rbitcoin_primitives::Network::Regtest => 0,
     }
 }

@@ -54,17 +54,34 @@ impl VarTable {
     }
 
     pub fn put(&self, payload: &[u8]) -> Result<Fk, StoreError> {
+        let mut fks = self.put_batch(std::slice::from_ref(&payload))?;
+        Ok(fks.pop().expect("one payload"))
+    }
+
+    /// Append many framed payloads under one count lock with a single body
+    /// write and a single idx write — major win when archiving multi-input txs.
+    pub fn put_batch(&self, payloads: &[&[u8]]) -> Result<Vec<Fk>, StoreError> {
+        if payloads.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut count = self.count.lock();
-        let fk = Fk(*count + 1);
-        let start = self
-            .body
-            .logical_len()
-            .max(FILE_HEADER_LEN as u64);
-        self.body.write_at(start, payload)?;
+        let start = self.body.logical_len().max(FILE_HEADER_LEN as u64);
+        let total: usize = payloads.iter().map(|p| p.len()).sum();
+        let mut body_blob = Vec::with_capacity(total);
+        let mut idx_blob = Vec::with_capacity(payloads.len() * 8);
+        let mut fks = Vec::with_capacity(payloads.len());
+        let mut cursor = start;
+        for (i, p) in payloads.iter().enumerate() {
+            fks.push(Fk(*count + 1 + i as u64));
+            idx_blob.extend_from_slice(&cursor.to_le_bytes());
+            body_blob.extend_from_slice(p);
+            cursor += p.len() as u64;
+        }
+        self.body.write_at(start, &body_blob)?;
         let off_pos = FILE_HEADER_LEN as u64 + (*count) * 8;
-        self.idx.write_at(off_pos, &start.to_le_bytes())?;
-        *count += 1;
-        Ok(fk)
+        self.idx.write_at(off_pos, &idx_blob)?;
+        *count += payloads.len() as u64;
+        Ok(fks)
     }
 
     pub fn get_raw(&self, fk: Fk) -> Result<Vec<u8>, StoreError> {

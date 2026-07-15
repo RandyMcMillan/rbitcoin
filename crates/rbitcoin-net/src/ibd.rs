@@ -899,17 +899,31 @@ fn spawn_archive_pipeline(
         let writer = std::thread::Builder::new()
             .name("ibd-archive-writer".into())
             .spawn(move || {
-                while let Ok(prep) = write_rx.recv() {
-                    let hash = prep.hash;
-                    let out = match write_hub.query.archive_block(&prep.header, &prep.txs) {
-                        Ok(_fk) => ArchiveResult::Ok { hash },
-                        Err(e) => ArchiveResult::Err {
-                            hash,
-                            err: e.to_string(),
-                        },
+                // Tight drain loop: process all ready jobs before blocking again.
+                loop {
+                    let first = match write_rx.recv() {
+                        Ok(p) => p,
+                        Err(_) => break,
                     };
-                    if write_result.send(out).is_err() {
-                        break;
+                    let mut batch = vec![first];
+                    while let Ok(p) = write_rx.try_recv() {
+                        batch.push(p);
+                        if batch.len() >= 32 {
+                            break;
+                        }
+                    }
+                    for prep in batch {
+                        let hash = prep.hash;
+                        let out = match write_hub.query.archive_block(&prep.header, &prep.txs) {
+                            Ok(_fk) => ArchiveResult::Ok { hash },
+                            Err(e) => ArchiveResult::Err {
+                                hash,
+                                err: e.to_string(),
+                            },
+                        };
+                        if write_result.send(out).is_err() {
+                            return;
+                        }
                     }
                 }
             })

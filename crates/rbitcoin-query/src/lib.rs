@@ -206,40 +206,72 @@ impl Query {
         }
 
         let mut tx_fks = Vec::with_capacity(txs.len());
+        // Cache table counts — avoid re-locking on every tx.
+        let mut next_in = self.store.inputs.count() + 1;
+        let mut next_out = self.store.outputs.count() + 1;
+
         for ta in txs {
-            let in_start = if ta.inputs.is_empty() {
+            let n_in = ta.inputs.len() as u32;
+            let n_out = ta.outputs.len() as u32;
+            let in_start = if n_in == 0 {
                 Fk::NULL
             } else {
-                Fk(self.store.inputs.count() + 1)
+                Fk(next_in)
             };
-            let out_start = if ta.outputs.is_empty() {
+            let out_start = if n_out == 0 {
                 Fk::NULL
             } else {
-                Fk(self.store.outputs.count() + 1)
+                Fk(next_out)
             };
 
-            let mut tx = ta.tx.clone();
-            tx.input_start_fk = in_start;
-            tx.input_count = ta.inputs.len() as u32;
-            tx.output_start_fk = out_start;
-            tx.output_count = ta.outputs.len() as u32;
+            let tx = TxRecord {
+                txid: ta.tx.txid,
+                version: ta.tx.version,
+                locktime: ta.tx.locktime,
+                input_start_fk: in_start,
+                input_count: n_in,
+                output_start_fk: out_start,
+                output_count: n_out,
+                raw: ta.tx.raw.clone(),
+            };
             let tx_fk = self.store.put_tx(&tx)?;
 
-            for (i, inp) in ta.inputs.iter().enumerate() {
-                let mut rec = inp.clone();
-                rec.parent_tx_fk = tx_fk;
-                rec.index = i as u32;
-                self.store.put_input(&rec)?;
-                if rec.prev_txid != [0u8; 32] && self.spend_index_enabled() {
-                    self.store
-                        .put_spend(&rec.prev_txid, rec.prev_index, tx_fk, rec.index)?;
+            if n_in > 0 {
+                let mut recs = Vec::with_capacity(n_in as usize);
+                for (i, inp) in ta.inputs.iter().enumerate() {
+                    let rec = InputRecord {
+                        parent_tx_fk: tx_fk,
+                        index: i as u32,
+                        prev_txid: inp.prev_txid,
+                        prev_index: inp.prev_index,
+                        sequence: inp.sequence,
+                        script_sig: inp.script_sig.clone(),
+                    };
+                    if rec.prev_txid != [0u8; 32] && self.spend_index_enabled() {
+                        self.store.put_spend(
+                            &rec.prev_txid,
+                            rec.prev_index,
+                            tx_fk,
+                            rec.index,
+                        )?;
+                    }
+                    recs.push(rec);
                 }
+                self.store.inputs.put_batch(&recs)?;
+                next_in += u64::from(n_in);
             }
-            for (i, out) in ta.outputs.iter().enumerate() {
-                let mut rec = out.clone();
-                rec.parent_tx_fk = tx_fk;
-                rec.index = i as u32;
-                self.store.put_output(&rec)?;
+            if n_out > 0 {
+                let mut recs = Vec::with_capacity(n_out as usize);
+                for (i, out) in ta.outputs.iter().enumerate() {
+                    recs.push(OutputRecord {
+                        parent_tx_fk: tx_fk,
+                        index: i as u32,
+                        value: out.value,
+                        script: out.script.clone(),
+                    });
+                }
+                self.store.outputs.put_batch(&recs)?;
+                next_out += u64::from(n_out);
             }
             tx_fks.push(tx_fk);
         }

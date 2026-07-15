@@ -140,9 +140,9 @@ impl TableFile {
         let mut len = self.len.lock();
         if end > *len {
             *len = end;
-            // Defer durable HWM write to flush — connect_block does many extends
-            // per block and a seek+write per extend dominates IBD I/O.
-            self.write_hwm_mmap(*len);
+            drop(len);
+            // Defer durable HWM seek to flush; only update mapped header.
+            self.write_hwm_mmap(end);
         }
         Ok(())
     }

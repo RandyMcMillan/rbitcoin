@@ -218,6 +218,16 @@ impl OutputTable {
         self.body.put(&payload)
     }
 
+    /// Batch-append output records (one body write + one idx write).
+    pub fn put_batch(&self, recs: &[OutputRecord]) -> Result<Vec<Fk>, StoreError> {
+        if recs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let owned: Vec<Vec<u8>> = recs.iter().map(|r| framed(&r.encode())).collect();
+        let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
+        self.body.put_batch(&refs)
+    }
+
     pub fn get(&self, fk: Fk) -> Result<OutputRecord, StoreError> {
         let raw = self.body.get_raw(fk)?;
         OutputRecord::decode(&raw[4..])
@@ -252,6 +262,16 @@ impl InputTable {
     pub fn put(&self, rec: &InputRecord) -> Result<Fk, StoreError> {
         let payload = framed(&rec.encode());
         self.body.put(&payload)
+    }
+
+    /// Batch-append input records (one body write + one idx write).
+    pub fn put_batch(&self, recs: &[InputRecord]) -> Result<Vec<Fk>, StoreError> {
+        if recs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let owned: Vec<Vec<u8>> = recs.iter().map(|r| framed(&r.encode())).collect();
+        let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
+        self.body.put_batch(&refs)
     }
 
     pub fn get(&self, fk: Fk) -> Result<InputRecord, StoreError> {

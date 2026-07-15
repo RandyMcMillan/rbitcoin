@@ -193,6 +193,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
 
     let max_out = config.max_outbound.max(1) as usize;
+    // Candidate pool larger than target so dials can fail and still hit target_peers.
+    let candidate_n = max_out.saturating_mul(2).clamp(16, 48);
     let targets = if !config.connect.is_empty() {
         config.connect.clone()
     } else {
@@ -203,19 +205,23 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let ibd_targets = if !config.connect.is_empty() {
         config.connect.clone()
     } else {
-        addrman.take_outbound(max_out.min(32))
+        // Prefer a wide seed sample (IPv4-first) for parallel dial / redial.
+        addrman.take_outbound(candidate_n)
     };
     if !ibd_targets.is_empty() && !shutdown.requested() {
+        let target_peers = max_out.clamp(8, 32);
         let ibd_cfg = IbdConfig {
             // Global horizon 1024; per-peer in-transit 16 (Bitcoin Core-class).
             window: rbitcoin_net::DEFAULT_IBD_WINDOW,
             per_peer: rbitcoin_net::DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER,
+            target_peers,
             stall: std::time::Duration::from_secs(5),
             ..IbdConfig::default()
         };
         eprintln!(
-            "ibd: parallel catch-up from {} peers (window={}, per_peer={})…",
+            "ibd: parallel catch-up candidates={} target_peers={} (window={}, per_peer={})…",
             ibd_targets.len(),
+            ibd_cfg.target_peers,
             ibd_cfg.window,
             ibd_cfg.per_peer
         );

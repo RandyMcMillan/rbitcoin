@@ -24,7 +24,7 @@ where
     let mut use_seeds = true;
     let mut milestone_height = 0u32;
     let mut milestone_set = false;
-    let mut max_outbound = 8u32;
+    let mut max_outbound = 16u32;
     let mut max_run_secs: Option<u64> = None;
     let mut scripthash_index = true;
 

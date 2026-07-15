@@ -46,7 +46,8 @@ impl Default for NodeConfig {
             max_run_secs: None,
             electrum_listen: None,
             milestone_height: 0,
-            max_outbound: 8,
+            // Core-ish outbound budget; IBD redials toward this many live peers.
+            max_outbound: 16,
             scripthash_index: true,
         }
     }

@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
+use rbitcoin_log::info;
 
 #[derive(Clone, Debug)]
 pub struct NetConfig {
@@ -280,7 +281,7 @@ impl P2PNode {
                                 let n = accepted_c.fetch_add(1, Ordering::SeqCst) + 1;
                                 progress = true;
                                 if n == 1 || n % 100 == 0 {
-                                    eprintln!(
+                                    info!(
                                         "ibd: progress tip={:?} (+{n} this peer, started at {start_h})",
                                         hub_acc.tip_height(),
                                     );
@@ -297,7 +298,7 @@ impl P2PNode {
         )
         .await?;
         if n > 0 {
-            eprintln!(
+            info!(
                 "ibd: peer {peer} done downloaded≈{n} tip={:?}",
                 self.tip_height()
             );

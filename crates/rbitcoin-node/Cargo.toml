@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 rbitcoin-primitives = { workspace = true }
+rbitcoin-log = { workspace = true }
 rbitcoin-query = { workspace = true }
 rbitcoin-store = { workspace = true }
 rbitcoin-wire-cache = { workspace = true }

@@ -8,6 +8,7 @@ description = "Bitcoin P2P networking (headers + block download/serve)"
 
 [dependencies]
 rbitcoin-primitives = { workspace = true }
+rbitcoin-log = { workspace = true }
 rbitcoin-consensus = { workspace = true }
 rbitcoin-query = { workspace = true }
 rbitcoin-store = { workspace = true }

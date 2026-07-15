@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
+use rbitcoin_log::{debug, error, info, warn};
 
 /// Default download / archive horizon after the connected tip (Core
 /// `BLOCK_DOWNLOAD_WINDOW`-class: how far ahead we may request overall).
@@ -200,7 +201,7 @@ pub async fn parallel_ibd_cancellable(
     if slots.is_empty() {
         return Err(NetError::Protocol("no parallel peers connected"));
     }
-    eprintln!(
+    info!(
         "ibd: {} / {} peers ready (target={})",
         slots.len(),
         peer_pool.len(),
@@ -253,12 +254,12 @@ pub async fn parallel_ibd_cancellable(
         .unwrap_or(4);
     // Leave 1 core for async IO / confirm; rest for prep (writer is extra OS thread).
     let n_prep = n_cpu.saturating_sub(1).max(2);
-    eprintln!("ibd: archive pipeline prep_threads={n_prep} cpus={n_cpu} (dedicated writer thread)");
+    debug!("ibd: archive pipeline prep_threads={n_prep} cpus={n_cpu} (dedicated writer thread)");
     let pipeline = spawn_archive_pipeline(hub.clone(), arch_job_rx, arch_res_tx, n_prep);
 
     loop {
         if cancelled() {
-            eprintln!("ibd: cancel requested — stopping parallel IBD");
+            warn!("ibd: cancel requested — stopping parallel IBD");
             break;
         }
         // Yield so a concurrent shutdown select/task can run promptly.
@@ -319,7 +320,7 @@ pub async fn parallel_ibd_cancellable(
             && ordered.is_empty()
             && inflight.is_empty()
         {
-            eprintln!(
+            info!(
                 "ibd: hard path reset (stall {:?}, ordered empty)",
                 last_progress.elapsed()
             );
@@ -358,18 +359,18 @@ pub async fn parallel_ibd_cancellable(
                     Ok(fresh) => {
                         let n = fresh.len();
                         for s in fresh {
-                            eprintln!("ibd: parallel peer[{}] {} connected", s.id, s.addr);
+                            info!("ibd: parallel peer[{}] {} connected", s.id, s.addr);
                             slots.push(s);
                         }
                         if n > 0 {
                             slots.sort_by_key(|s| s.id);
-                            eprintln!(
+                            info!(
                                 "ibd: redial added {n} peer(s); live={}",
                                 slots.iter().filter(|s| s.alive).count()
                             );
                         }
                     }
-                    Err(e) => eprintln!("ibd: redial task failed: {e}"),
+                    Err(e) => warn!("ibd: redial task failed: {e}"),
                 }
             }
         }
@@ -387,7 +388,7 @@ pub async fn parallel_ibd_cancellable(
                 .filter(|s| s.alive)
                 .map(|s| s.addr)
                 .collect();
-            eprintln!(
+            info!(
                 "ibd: redialing up to {want} peers (alive={alive_n}/{target}, pool={})…",
                 peer_pool.len()
             );
@@ -415,7 +416,7 @@ pub async fn parallel_ibd_cancellable(
 
         // Status line (helps lab debugging; line-buffered-ish)
         if last_status.elapsed() > Duration::from_secs(5) {
-            eprintln!(
+            info!(
                 "ibd: status tip={:?} ordered={} inflight={} arch_q={arch_q} archived_ahead={archived_ahead} ahead={ahead} headers_done={headers_done} peers={}",
                 hub.tip_height(),
                 ordered.len(),
@@ -546,12 +547,12 @@ pub async fn parallel_ibd_cancellable(
                 archive_queued.fetch_add(1, Ordering::Relaxed);
                 if arch_job_tx.send(ArchiveJob { block }).is_err() {
                     archive_queued.fetch_sub(1, Ordering::Relaxed);
-                    eprintln!("ibd: archive pipeline closed; drop {hash}");
+                    warn!("ibd: archive pipeline closed; drop {hash}");
                 }
                 // Confirm on archive-done / tick only — frees this core for IO/assign.
             }
             Some(PeerEvent::Dead { peer, reason }) => {
-                eprintln!("ibd: peer[{peer}] dead: {reason}");
+                warn!("ibd: peer[{peer}] dead: {reason}");
                 if let Some(s) = slots.iter_mut().find(|s| s.id == peer) {
                     s.alive = false;
                     for h in s.in_flight.drain() {
@@ -582,13 +583,13 @@ pub async fn parallel_ibd_cancellable(
                     static REJECTS: AtomicU32 = AtomicU32::new(0);
                     let n = REJECTS.fetch_add(1, Ordering::Relaxed) + 1;
                     if n <= 5 || n % 100 == 0 {
-                        eprintln!("ibd: archive reject {hash}: {err} (count={n})");
+                        warn!("ibd: archive reject {hash}: {err} (count={n})");
                     }
                 }
                 None => {
                     // Pipeline exited unexpectedly.
                     if !cancelled() {
-                        eprintln!("ibd: archive pipeline ended");
+                        warn!("ibd: archive pipeline ended");
                     }
                 }
             },
@@ -624,7 +625,7 @@ pub async fn parallel_ibd_cancellable(
     while let Some(r) = arch_res_rx.recv().await {
         archive_queued.fetch_sub(1, Ordering::Relaxed);
         if let ArchiveResult::Err { hash, err } = r {
-            eprintln!("ibd: archive reject {hash}: {err}");
+            warn!("ibd: archive reject {hash}: {err}");
         }
     }
     let _ = pipeline.await;
@@ -646,7 +647,7 @@ pub async fn parallel_ibd_cancellable(
     }
 
     let n = accepted.load(Ordering::SeqCst);
-    eprintln!(
+    info!(
         "ibd: parallel done accepted={n} tip={:?} (started {start_tip})",
         hub.tip_height()
     );
@@ -700,10 +701,10 @@ async fn dial_batch(
         match joined {
             Ok(Ok(slot)) => out.push(slot),
             Ok(Err((id, addr, reason))) => {
-                eprintln!("ibd: parallel peer[{id}] {addr} failed: {reason}");
+                warn!("ibd: parallel peer[{id}] {addr} failed: {reason}");
             }
             Err(e) => {
-                eprintln!("ibd: peer connect task panicked: {e}");
+                error!("ibd: peer connect task panicked: {e}");
             }
         }
     }
@@ -1139,7 +1140,7 @@ fn reassign_stalled(
     }
     // Avoid log spam (lab25 had hundreds of reassign lines drowning signal).
     if n > 0 && n >= 8 {
-        eprintln!("ibd: reassign {n} stalled block(s)");
+        warn!("ibd: reassign {n} stalled block(s)");
     }
 }
 
@@ -1228,7 +1229,7 @@ fn confirm_run_sync(
                 connected += 1;
                 let n = accepted.fetch_add(1, Ordering::SeqCst) + 1;
                 if n == 1 || n % 100 == 0 {
-                    eprintln!(
+                    info!(
                         "ibd: progress tip={:?} (+{n} parallel, started {start_tip})",
                         hub.tip_height()
                     );
@@ -1239,7 +1240,7 @@ fn confirm_run_sync(
                 remove_from_ordered(ordered, ordered_set, need);
             }
             Err(e) => {
-                eprintln!("ibd: confirm reject {need} @ {expect}: {e}");
+                warn!("ibd: confirm reject {need} @ {expect}: {e}");
                 break;
             }
         }

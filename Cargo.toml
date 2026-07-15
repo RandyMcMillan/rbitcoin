@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/rbitcoin-primitives",
+    "crates/rbitcoin-log",
     "crates/rbitcoin-store",
     "crates/rbitcoin-query",
     "crates/rbitcoin-wire-cache",
@@ -24,6 +25,7 @@ rust-version = "1.74"
 
 [workspace.dependencies]
 rbitcoin-primitives = { path = "crates/rbitcoin-primitives" }
+rbitcoin-log = { path = "crates/rbitcoin-log" }
 rbitcoin-store = { path = "crates/rbitcoin-store" }
 rbitcoin-query = { path = "crates/rbitcoin-query" }
 rbitcoin-wire-cache = { path = "crates/rbitcoin-wire-cache" }

@@ -1,6 +1,7 @@
 use crate::config::NodeConfig;
 use crate::run::{run_node, run_p2p};
 use rbitcoin_consensus::default_milestone_height;
+use rbitcoin_log::{self, error, info, Level};
 use rbitcoin_primitives::Network;
 use std::ffi::OsString;
 use std::net::SocketAddr;
@@ -27,13 +28,15 @@ where
     let mut max_outbound = 16u32;
     let mut max_run_secs: Option<u64> = None;
     let mut scripthash_index = true;
+    // None = env/default; Some(None) = off; Some(Some(level)) = explicit level.
+    let mut log_level_cli: Option<Option<Level>> = None;
 
     while i < args.len() {
         let a = args[i].to_string_lossy();
         match a.as_ref() {
             "--help" | "-h" => {
                 eprintln!(
-                    "rbitcoin-node {} — usage:\n  rbitcoin-node [--datadir PATH] [--network NET] \\\n    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n    [--milestone HEIGHT] [--max-outbound N] [--max-run-secs N] \\\n    [--no-scripthash-index] [--no-seeds] [--smoke]\n\nNetworks: mainnet|testnet|signet|regtest\nMilestone: skip script/prevout at/below HEIGHT (IBD assumevalid-style).\n  Default when omitted: mainnet 840000, signet 2000000, testnet 2500000, regtest 0.\n  Use --milestone 0 for full validation. Disables scripthash index under milestone.\nParallel IBD: tip-ahead window 1024, max 16 blocks in transit per peer (Core-like).",
+                    "rbitcoin-node {} — usage:\n  rbitcoin-node [--datadir PATH] [--network NET] \\\n    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n    [--milestone HEIGHT] [--max-outbound N] [--max-run-secs N] \\\n    [--log-level LEVEL] [--no-scripthash-index] [--no-seeds] [--smoke]\n\nNetworks: mainnet|testnet|signet|regtest\nLog level: error|warn|info|debug|trace (default info; or RBITCOIN_LOG / RUST_LOG).\nMilestone: skip script/prevout at/below HEIGHT (IBD assumevalid-style).\n  Default when omitted: mainnet 840000, signet 2000000, testnet 2500000, regtest 0.\n  Use --milestone 0 for full validation. Disables scripthash index under milestone.\nParallel IBD: tip-ahead window 1024, max 16 blocks in transit per peer (Core-like).",
                     env!("CARGO_PKG_VERSION")
                 );
                 return ExitCode::SUCCESS;
@@ -175,9 +178,41 @@ where
                 }
                 i += 1;
             }
+            "--log-level" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!(
+                        "error: --log-level requires a value (error|warn|info|debug|trace|off)"
+                    );
+                    return ExitCode::from(2);
+                }
+                let raw = args[i].to_string_lossy();
+                if raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") {
+                    log_level_cli = Some(None);
+                } else if let Some(l) = Level::parse(&raw) {
+                    log_level_cli = Some(Some(l));
+                } else {
+                    eprintln!(
+                        "error: bad --log-level `{raw}` (use error|warn|info|debug|trace|off)"
+                    );
+                    return ExitCode::from(2);
+                }
+                i += 1;
+            }
             other => {
                 eprintln!("error: unknown argument `{other}`");
                 return ExitCode::from(2);
+            }
+        }
+    }
+
+    // Logging: CLI --log-level wins; else RBITCOIN_LOG / RUST_LOG; else Info.
+    match log_level_cli {
+        Some(Some(level)) => rbitcoin_log::init(level),
+        Some(None) => rbitcoin_log::init_off(),
+        None => {
+            if !rbitcoin_log::init_from_env() {
+                rbitcoin_log::init(Level::Info);
             }
         }
     }
@@ -205,7 +240,7 @@ where
     if smoke {
         match run_node(config) {
             Ok(handle) => {
-                eprintln!(
+                info!(
                     "rbitcoin-node {} on {} datadir={}",
                     env!("CARGO_PKG_VERSION"),
                     handle.network_name(),
@@ -217,13 +252,13 @@ where
                 match handle.shutdown() {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => {
-                        eprintln!("shutdown error: {e}");
+                        error!("shutdown error: {e}");
                         ExitCode::FAILURE
                     }
                 }
             }
             Err(e) => {
-                eprintln!("error: {e}");
+                error!("{e}");
                 ExitCode::FAILURE
             }
         }
@@ -231,14 +266,14 @@ where
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {
-                eprintln!("error: runtime: {e}");
+                error!("runtime: {e}");
                 return ExitCode::FAILURE;
             }
         };
         match rt.block_on(run_p2p(config)) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("error: {e}");
+                error!("{e}");
                 ExitCode::FAILURE
             }
         }

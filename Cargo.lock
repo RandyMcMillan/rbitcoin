@@ -433,6 +433,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rbitcoin-log"
+version = "0.1.0"
+
+[[package]]
 name = "rbitcoin-net"
 version = "0.1.0"
 dependencies = [
@@ -441,6 +445,7 @@ dependencies = [
  "parking_lot",
  "rayon",
  "rbitcoin-consensus",
+ "rbitcoin-log",
  "rbitcoin-primitives",
  "rbitcoin-query",
  "rbitcoin-store",
@@ -454,6 +459,7 @@ version = "0.1.0"
 dependencies = [
  "rbitcoin-consensus",
  "rbitcoin-electrum",
+ "rbitcoin-log",
  "rbitcoin-net",
  "rbitcoin-primitives",
  "rbitcoin-query",

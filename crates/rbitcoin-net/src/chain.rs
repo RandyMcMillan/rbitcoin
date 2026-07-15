@@ -10,6 +10,7 @@ use rbitcoin_consensus::{
     accept_and_archive_block, accept_and_connect_block, confirm_archived_at, genesis_block,
     header_to_record, ChainParams, Milestone,
 };
+use rbitcoin_log::info;
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
 use std::collections::HashSet;
@@ -457,7 +458,7 @@ fn spawn_confirmed_seed(query: Arc<Query>, confirmed: Arc<RwLock<HashSet<BlockHa
                     }
                 }
             }
-            eprintln!(
+            info!(
                 "ibd: confirmed-set seed complete tip={} in {:?}",
                 tip.0,
                 t0.elapsed()

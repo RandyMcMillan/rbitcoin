@@ -1,4 +1,8 @@
 //! In-memory wire block cache for P2P serve and ordered sync.
+//!
+//! Full block bodies are kept only for a recent tip window (default
+//! [`DEFAULT_BODY_DEPTH`]). Best-chain **hashes** are retained for locator
+//! construction without holding the entire IBD history in RAM.
 
 use bitcoin::block::{Block, Header};
 use bitcoin::hashes::Hash;
@@ -6,9 +10,15 @@ use bitcoin::BlockHash;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 
-#[derive(Debug, Default)]
+/// How many recent full block bodies to retain (matches IBD horizon; hash chain
+/// is kept without bodies for locators).
+pub const DEFAULT_BODY_DEPTH: usize = 144;
+
+#[derive(Debug)]
 pub struct BlockCache {
     inner: RwLock<Inner>,
+    /// Max full bodies in `by_hash` (hashes in `chain` are always kept).
+    body_depth: usize,
 }
 
 #[derive(Debug, Default)]
@@ -18,9 +28,22 @@ struct Inner {
     chain: Vec<BlockHash>,
 }
 
+impl Default for BlockCache {
+    fn default() -> Self {
+        Self::with_body_depth(DEFAULT_BODY_DEPTH)
+    }
+}
+
 impl BlockCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_body_depth(body_depth: usize) -> Self {
+        Self {
+            inner: RwLock::new(Inner::default()),
+            body_depth: body_depth.max(1),
+        }
     }
 
     pub fn tip_height(&self) -> Option<u32> {
@@ -84,15 +107,12 @@ impl BlockCache {
     }
 
     /// Append a block that extends the best chain (or becomes genesis at height 0).
+    ///
+    /// Evicts full bodies older than `body_depth` while keeping the hash chain.
     pub fn push_best(&self, block: Block) -> Result<(), &'static str> {
         let hash = block.block_hash();
         let mut g = self.inner.write();
         if g.chain.is_empty() {
-            if block.header.prev_blockhash != BlockHash::from_byte_array([0u8; 32])
-                && block.header.prev_blockhash.to_byte_array() != [0u8; 32]
-            {
-                // regtest genesis has zero prev — ok
-            }
             g.by_hash.insert(hash, block);
             g.chain.push(hash);
             return Ok(());
@@ -103,6 +123,15 @@ impl BlockCache {
         }
         g.by_hash.insert(hash, block);
         g.chain.push(hash);
+        // Drop full bodies outside the tip window (keep hash chain for locators).
+        let depth = self.body_depth;
+        if g.chain.len() > depth {
+            let drop_to = g.chain.len() - depth;
+            let stale: Vec<BlockHash> = g.chain[..drop_to].to_vec();
+            for h in stale {
+                g.by_hash.remove(&h);
+            }
+        }
         Ok(())
     }
 
@@ -132,6 +161,9 @@ impl BlockCache {
     }
 
     /// Headers after the best common locator hash, up to Core `MAX_HEADERS_RESULTS` (2000).
+    ///
+    /// Only returns headers still present as full bodies in the tip window; callers
+    /// that need deeper history should use the store reconstruct path.
     pub fn headers_after_locator(&self, locator: &[BlockHash], stop: BlockHash) -> Vec<Header> {
         let g = self.inner.read();
         if g.chain.is_empty() {

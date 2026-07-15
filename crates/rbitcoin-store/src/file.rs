@@ -105,6 +105,9 @@ impl TableFile {
     }
 
     /// Shrink or set logical length (must be ≥ header size). Does not zero freed bytes.
+    ///
+    /// Updates the in-memory HWM and mmap header immediately; durable file HWM
+    /// is written on [`flush`] (avoids seek+write per append during IBD).
     pub fn set_logical_len(&self, logical: u64) -> Result<(), StoreError> {
         if logical < FILE_HEADER_LEN as u64 {
             return Err(StoreError::Corrupt("logical length below header"));
@@ -112,7 +115,7 @@ impl TableFile {
         self.ensure_capacity(logical)?;
         let mut len = self.len.lock();
         *len = logical;
-        self.persist_logical_len(logical)?;
+        self.write_hwm_mmap(logical);
         Ok(())
     }
 
@@ -137,7 +140,9 @@ impl TableFile {
         let mut len = self.len.lock();
         if end > *len {
             *len = end;
-            self.persist_logical_len(*len)?;
+            // Defer durable HWM write to flush — connect_block does many extends
+            // per block and a seek+write per extend dominates IBD I/O.
+            self.write_hwm_mmap(*len);
         }
         Ok(())
     }
@@ -161,22 +166,29 @@ impl TableFile {
         Ok(())
     }
 
+    /// Update logical length in the mapped header only (no file seek).
+    fn write_hwm_mmap(&self, logical: u64) {
+        let mut map = self.map.lock();
+        if map.len() >= 16 {
+            map[8..16].copy_from_slice(&logical.to_le_bytes());
+        }
+    }
+
+    /// Write durable logical length into the file header (bytes 8..16).
     fn persist_logical_len(&self, logical: u64) -> Result<(), StoreError> {
+        self.write_hwm_mmap(logical);
         let mut file = self.file.lock();
         file.seek(SeekFrom::Start(8))
             .map_err(|e| StoreError::io(&self.path, e))?;
         file.write_all(&logical.to_le_bytes())
             .map_err(|e| StoreError::io(&self.path, e))?;
-        {
-            let mut map = self.map.lock();
-            if map.len() >= 16 {
-                map[8..16].copy_from_slice(&logical.to_le_bytes());
-            }
-        }
         Ok(())
     }
 
+    /// Persist HWM to the file header, flush dirty mmap pages, and `sync_data`.
     pub fn flush(&self) -> Result<(), StoreError> {
+        let logical = *self.len.lock();
+        self.persist_logical_len(logical)?;
         self.map
             .lock()
             .flush()

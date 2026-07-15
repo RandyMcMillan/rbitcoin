@@ -27,6 +27,10 @@ pub struct Query {
     store: Store,
     /// When false, connect/disconnect skip scripthash multimap (IBD fast path).
     scripthash_index: std::sync::atomic::AtomicBool,
+    /// When false, connect skips Class B point (spend) multimap writes (IBD fast path).
+    /// Double-spend checks via `spenders` require this on; keep on unless milestone
+    /// skips connect validation for the heights being ingested.
+    spend_index: std::sync::atomic::AtomicBool,
 }
 
 impl Query {
@@ -34,6 +38,7 @@ impl Query {
         Ok(Self {
             store: Store::open_or_create(store_path.as_ref())?,
             scripthash_index: std::sync::atomic::AtomicBool::new(true),
+            spend_index: std::sync::atomic::AtomicBool::new(true),
         })
     }
 
@@ -49,6 +54,18 @@ impl Query {
 
     pub fn scripthash_index_enabled(&self) -> bool {
         self.scripthash_index
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Enable/disable point (spend) multimap writes (default on). Off during IBD under
+    /// milestone for speed; re-enable (or reindex) before full connect validation.
+    pub fn set_spend_index(&self, enabled: bool) {
+        self.spend_index
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn spend_index_enabled(&self) -> bool {
+        self.spend_index
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -134,45 +151,61 @@ impl Query {
         self.store.spenders_raw(out_txid, out_index)
     }
 
-    /// Connect a block at `height` (genesis or tip+1).
+    /// True if this header hash has a Class A row (may not be confirmed on tip).
+    pub fn is_header_archived(&self, hash: &[u8; 32]) -> Result<bool, QueryError> {
+        Ok(self.get_header_by_hash(hash)?.is_some())
+    }
+
+    /// True if the full block body is in Class A (`header_txs` present).
     ///
-    /// Writes Class A rows and point spends, then Class C confirmation.
-    pub fn connect_block(
+    /// Does **not** walk the confirmed chain (that was O(tip) per call and froze
+    /// IBD when thousands of header-only rows existed). Callers that need
+    /// "confirmed or archived" should check the confirmed set / tip first.
+    pub fn is_block_archived(&self, hash: &[u8; 32]) -> Result<bool, QueryError> {
+        let Some((fk, _)) = self.get_header_by_hash(hash)? else {
+            return Ok(false);
+        };
+        Ok(self.store.header_txs.has_body(fk)?)
+    }
+
+    /// Ensure a header row exists (no txs). Idempotent by hash.
+    ///
+    /// Used to pipeline header sync into the store so out-of-order bodies can
+    /// resolve `prev_fk` without waiting for tip confirm.
+    pub fn ensure_header(&self, header: &HeaderRecord) -> Result<Fk, QueryError> {
+        if let Some((fk, _)) = self.get_header_by_hash(&header.hash)? {
+            return Ok(fk);
+        }
+        Ok(self.store.put_header(header)?)
+    }
+
+    /// Archive Class A rows for a block body (header + txs + I/O). **No** tip /
+    /// Class C updates — order-independent relative to connected tip.
+    ///
+    /// Idempotent if the body is already archived under this header hash.
+    pub fn archive_block(
         &self,
-        height: Height,
         header: &HeaderRecord,
         txs: &[TxApply],
     ) -> Result<Fk, QueryError> {
-        match self.tip_height() {
-            None => {
-                if height != Height::GENESIS {
-                    return Err(StoreError::Corrupt("first block must be genesis height"));
-                }
+        if let Some((fk, _)) = self.get_header_by_hash(&header.hash)? {
+            if self.store.header_txs.has_body(fk)? {
+                return Ok(fk);
             }
-            Some(tip) => {
-                let expect = tip.next().ok_or(StoreError::Corrupt("height overflow"))?;
-                if height != expect {
-                    return Err(StoreError::Corrupt("connect height not tip+1"));
-                }
-            }
+            // Header-only row from ensure_header — attach body below using existing fk.
+            return self.archive_body_for_header(fk, txs);
         }
 
-        // If this hash is already confirmed, idempotent success.
-        if let Some(h) = self.height_of_hash(&header.hash)? {
-            if h == height {
-                if let Some((fk, _)) = self.get_header_by_hash(&header.hash)? {
-                    return Ok(fk);
-                }
-            }
-        }
-
-        // Write txs first; only publish the header/hash-head once the block body
-        // is fully archived so a mid-connect crash cannot freeze has_block.
-        let mut tx_fks = Vec::with_capacity(txs.len());
-        // Placeholder header fk — we put the header after txs when possible.
-        // (strong_tx needs header_fk; put header early but only set confirmed at end.)
         let header_fk = self.store.put_header(header)?;
+        self.archive_body_for_header(header_fk, txs)
+    }
 
+    fn archive_body_for_header(&self, header_fk: Fk, txs: &[TxApply]) -> Result<Fk, QueryError> {
+        if self.store.header_txs.has_body(header_fk)? {
+            return Ok(header_fk);
+        }
+
+        let mut tx_fks = Vec::with_capacity(txs.len());
         for ta in txs {
             let in_start = if ta.inputs.is_empty() {
                 Fk::NULL
@@ -190,8 +223,6 @@ impl Query {
             tx.input_count = ta.inputs.len() as u32;
             tx.output_start_fk = out_start;
             tx.output_count = ta.outputs.len() as u32;
-            // Put I/O first so parent_tx_fk can be set — need tx_fk first though.
-            // Order: put tx (with correct starts for upcoming I/O fks), then I/O with parent.
             let tx_fk = self.store.put_tx(&tx)?;
 
             for (i, inp) in ta.inputs.iter().enumerate() {
@@ -199,22 +230,9 @@ impl Query {
                 rec.parent_tx_fk = tx_fk;
                 rec.index = i as u32;
                 self.store.put_input(&rec)?;
-                if rec.prev_txid != [0u8; 32] {
+                if rec.prev_txid != [0u8; 32] && self.spend_index_enabled() {
                     self.store
                         .put_spend(&rec.prev_txid, rec.prev_index, tx_fk, rec.index)?;
-                    if self.scripthash_index_enabled() {
-                        if let Some(sh) =
-                            self.script_hash_for_outpoint(&rec.prev_txid, rec.prev_index)?
-                        {
-                            let _ = self.store.scripthash.mark_spent(
-                                &sh,
-                                &rec.prev_txid,
-                                rec.prev_index,
-                                height.0,
-                                tx_fk,
-                            )?;
-                        }
-                    }
                 }
             }
             for (i, out) in ta.outputs.iter().enumerate() {
@@ -222,29 +240,116 @@ impl Query {
                 rec.parent_tx_fk = tx_fk;
                 rec.index = i as u32;
                 self.store.put_output(&rec)?;
-                if self.scripthash_index_enabled() {
-                    let sh = script_hash(&rec.script);
-                    self.store.scripthash.put_create(&ScriptHashRecord {
-                        scripthash: sh,
-                        txid: ta.tx.txid,
-                        vout: i as u32,
-                        value: rec.value,
-                        create_height: height.0,
-                        create_tx_fk: tx_fk,
-                        spend_height: UNSPENT,
-                        spend_tx_fk: Fk::NULL,
-                        next: Fk::NULL,
-                    })?;
+            }
+            tx_fks.push(tx_fk);
+        }
+
+        self.store.header_txs.put_list(header_fk, &tx_fks)?;
+        Ok(header_fk)
+    }
+
+    /// Confirm an already-archived block at `height` (genesis or tip+1).
+    ///
+    /// Writes Class C (`confirmed`, `strong_tx`, height `block_txs`) and optional
+    /// height-dependent indexes (scripthash). Does not re-write Class A bodies.
+    pub fn confirm_block(&self, height: Height, header_hash: &[u8; 32]) -> Result<Fk, QueryError> {
+        match self.tip_height() {
+            None => {
+                if height != Height::GENESIS {
+                    return Err(StoreError::Corrupt("first block must be genesis height"));
                 }
             }
+            Some(tip) => {
+                let expect = tip.next().ok_or(StoreError::Corrupt("height overflow"))?;
+                if height != expect {
+                    return Err(StoreError::Corrupt("connect height not tip+1"));
+                }
+            }
+        }
 
+        // Idempotent if already confirmed at this height.
+        if let Some(h) = self.height_of_hash(header_hash)? {
+            if h == height {
+                if let Some((fk, _)) = self.get_header_by_hash(header_hash)? {
+                    return Ok(fk);
+                }
+            }
+        }
+
+        let (header_fk, _rec) = self
+            .get_header_by_hash(header_hash)?
+            .ok_or(StoreError::NotFound)?;
+        let tx_fks = self
+            .store
+            .header_txs
+            .get_list(header_fk)?
+            .ok_or(StoreError::Corrupt("confirm without archived body"))?;
+
+        for &tx_fk in &tx_fks {
             self.store.strong_tx.set_strong(tx_fk, header_fk)?;
-            tx_fks.push(tx_fk);
+            if self.scripthash_index_enabled() {
+                self.apply_scripthash_for_tx(height, tx_fk)?;
+            }
         }
 
         self.store.block_txs.put_list(height, &tx_fks)?;
         self.store.confirmed.set(height, header_fk)?;
         Ok(header_fk)
+    }
+
+    fn apply_scripthash_for_tx(&self, height: Height, tx_fk: Fk) -> Result<(), QueryError> {
+        let tx = self.store.get_tx(tx_fk)?;
+        if tx.input_count > 0 {
+            let start = tx.input_start_fk.get().ok_or(StoreError::InvalidFk)?;
+            for i in 0..tx.input_count {
+                let inp = self.store.get_input(Fk(start + u64::from(i)))?;
+                if inp.prev_txid != [0u8; 32] {
+                    if let Some(sh) =
+                        self.script_hash_for_outpoint(&inp.prev_txid, inp.prev_index)?
+                    {
+                        let _ = self.store.scripthash.mark_spent(
+                            &sh,
+                            &inp.prev_txid,
+                            inp.prev_index,
+                            height.0,
+                            tx_fk,
+                        )?;
+                    }
+                }
+            }
+        }
+        if tx.output_count > 0 {
+            let start = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
+            for i in 0..tx.output_count {
+                let out = self.store.get_output(Fk(start + u64::from(i)))?;
+                let sh = script_hash(&out.script);
+                self.store.scripthash.put_create(&ScriptHashRecord {
+                    scripthash: sh,
+                    txid: tx.txid,
+                    vout: i,
+                    value: out.value,
+                    create_height: height.0,
+                    create_tx_fk: tx_fk,
+                    spend_height: UNSPENT,
+                    spend_tx_fk: Fk::NULL,
+                    next: Fk::NULL,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Connect a block at `height` (genesis or tip+1): archive Class A then confirm Class C.
+    ///
+    /// Back-compat wrapper around [`archive_block`] + [`confirm_block`].
+    pub fn connect_block(
+        &self,
+        height: Height,
+        header: &HeaderRecord,
+        txs: &[TxApply],
+    ) -> Result<Fk, QueryError> {
+        self.archive_block(header, txs)?;
+        self.confirm_block(height, &header.hash)
     }
 
     /// Disconnect the current tip (Class C + scripthash spend clear; archive rows remain).
@@ -527,6 +632,34 @@ impl Query {
             BlockHash::from_byte_array(prev.hash)
         };
         Ok(wire_header(rec, prev_blockhash))
+    }
+
+    /// Reconstruct a full wire block from Class A archive by header hash
+    /// (confirmed or not). Requires `header_txs` body.
+    pub fn reconstruct_archived_block(
+        &self,
+        hash: &[u8; 32],
+    ) -> Result<Option<Block>, QueryError> {
+        let Some((header_fk, rec)) = self.get_header_by_hash(hash)? else {
+            return Ok(None);
+        };
+        let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
+            return Ok(None);
+        };
+        if tx_fks.is_empty() {
+            return Err(StoreError::Corrupt("block has no transactions"));
+        }
+        let header = self.wire_header_from_record(&rec)?;
+        let mut txdata = Vec::with_capacity(tx_fks.len());
+        for fk in tx_fks {
+            let trec = self.get_tx(fk)?;
+            txdata.push(decode_tx_raw(&trec.raw)?);
+        }
+        let block = Block { header, txdata };
+        if block.block_hash().to_byte_array() != rec.hash {
+            return Err(StoreError::Corrupt("reconstruct hash mismatch"));
+        }
+        Ok(Some(block))
     }
 
     /// Reconstruct a full wire block at a confirmed height from the relational archive.

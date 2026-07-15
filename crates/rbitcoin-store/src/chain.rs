@@ -182,3 +182,77 @@ impl BlockTxsTable {
         Ok(())
     }
 }
+
+/// Per-header list of tx fks (Class A body association, independent of tip height).
+///
+/// Index = `header_fk - 1` → list record fk. Enables archive-before-confirm IBD:
+/// bodies are stored as soon as downloaded; Class C height maps are set later.
+pub struct HeaderTxsTable {
+    lists: VarTable,
+    by_header: ArrayTable,
+}
+
+impl HeaderTxsTable {
+    pub fn create(dir: &Path) -> Result<Self, StoreError> {
+        Ok(Self {
+            lists: VarTable::create(dir, "header_txs", TableKind::ArrayLink)?,
+            by_header: ArrayTable::create(dir.join("header_txs_fk.body"), TableKind::ArrayLink)?,
+        })
+    }
+
+    pub fn open(dir: &Path) -> Result<Self, StoreError> {
+        Ok(Self {
+            lists: VarTable::open(dir, "header_txs", TableKind::ArrayLink)?,
+            by_header: ArrayTable::open(dir.join("header_txs_fk.body"), TableKind::ArrayLink)?,
+        })
+    }
+
+    pub fn put_list(&self, header_fk: Fk, tx_fks: &[Fk]) -> Result<(), StoreError> {
+        let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
+        let mut payload = Vec::with_capacity(4 + tx_fks.len() * 8);
+        payload.extend_from_slice(&(tx_fks.len() as u32).to_le_bytes());
+        for fk in tx_fks {
+            payload.extend_from_slice(&fk.0.to_le_bytes());
+        }
+        let list_fk = self.lists.put(&framed(&payload))?;
+        self.by_header.set(id - 1, list_fk.0)?;
+        Ok(())
+    }
+
+    pub fn get_list(&self, header_fk: Fk) -> Result<Option<Vec<Fk>>, StoreError> {
+        let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
+        if id > self.by_header.len() {
+            return Ok(None);
+        }
+        let list_fk_raw = self.by_header.get(id - 1)?;
+        let Some(list_fk) = Fk::new(list_fk_raw) else {
+            return Ok(None);
+        };
+        let raw = self.lists.get_raw(list_fk)?;
+        let payload = &raw[4..];
+        if payload.len() < 4 {
+            return Err(StoreError::Corrupt("short header tx list"));
+        }
+        let n = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+        if payload.len() < 4 + n * 8 {
+            return Err(StoreError::Corrupt("header tx list truncated"));
+        }
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let o = 4 + i * 8;
+            let v = u64::from_le_bytes(payload[o..o + 8].try_into().unwrap());
+            out.push(Fk(v));
+        }
+        Ok(Some(out))
+    }
+
+    pub fn has_body(&self, header_fk: Fk) -> Result<bool, StoreError> {
+        Ok(self.get_list(header_fk)?.is_some())
+    }
+
+    pub fn flush(&self) -> Result<(), StoreError> {
+        self.lists.flush()?;
+        self.by_header.flush()?;
+        Ok(())
+    }
+}

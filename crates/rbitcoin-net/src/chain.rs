@@ -5,9 +5,14 @@ use crate::error::NetError;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, Work};
-use rbitcoin_consensus::{accept_and_connect_block, genesis_block, ChainParams, Milestone};
-use rbitcoin_primitives::Height;
+use parking_lot::RwLock;
+use rbitcoin_consensus::{
+    accept_and_archive_block, accept_and_connect_block, confirm_archived_at, genesis_block,
+    header_to_record, ChainParams, Milestone,
+};
+use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Notify};
 
@@ -37,18 +42,23 @@ pub struct ChainHub {
     pub milestone: Milestone,
     pub notify: Arc<Notify>,
     tip_tx: broadcast::Sender<TipEvent>,
+    /// Best-chain confirmed block hashes (O(1) `has_block` for IBD hot path).
+    confirmed: RwLock<HashSet<BlockHash>>,
 }
 
 impl ChainHub {
     pub fn new(query: Query, params: ChainParams, milestone: Milestone) -> Self {
         let (tip_tx, _) = broadcast::channel(64);
+        let query = Arc::new(query);
+        let confirmed = seed_confirmed_hashes(&query);
         Self {
-            query: Arc::new(query),
+            query,
             cache: Arc::new(BlockCache::new()),
             params,
             milestone,
             notify: Arc::new(Notify::new()),
             tip_tx,
+            confirmed: RwLock::new(confirmed),
         }
     }
 
@@ -80,11 +90,14 @@ impl ChainHub {
     }
 
     pub fn tip_hash(&self) -> Option<BlockHash> {
+        // Prefer RAM paths (cache / confirmed set is membership-only — use cache chain).
+        if let Some(h) = self.cache.tip_hash() {
+            return Some(h);
+        }
         self.query
             .tip_height()
             .and_then(|h| self.query.header_at_height(h).ok().flatten())
             .map(|(_, rec)| BlockHash::from_byte_array(rec.hash))
-            .or_else(|| self.cache.tip_hash())
     }
 
     pub fn tip_header(&self) -> Option<Header> {
@@ -92,18 +105,98 @@ impl ChainHub {
         self.query.wire_header_at_height(Height(h)).ok()
     }
 
+    /// True if `hash` is on the confirmed best chain (or in the RAM tip cache).
+    ///
+    /// Uses an in-memory set maintained on connect/disconnect — no mmap walk on
+    /// the IBD hot path. Must not treat orphan archive header rows as "have".
     pub fn has_block(&self, hash: &BlockHash) -> bool {
         if self.cache.get_block(hash).is_some() {
             return true;
         }
-        // Must be on the *confirmed* best chain — not merely present as an archive
-        // header row. Partial connect_block failures can leave hash-head entries
-        // without updating tip; treating those as "have" freezes IBD forever.
+        self.confirmed.read().contains(hash)
+    }
+
+    /// True if the full block body is in Class A (may not be confirmed yet).
+    pub fn is_archived(&self, hash: &BlockHash) -> bool {
+        if self.has_block(hash) {
+            return true;
+        }
         self.query
-            .height_of_hash(&hash.to_byte_array())
-            .ok()
-            .flatten()
-            .is_some()
+            .is_block_archived(&hash.to_byte_array())
+            .unwrap_or(false)
+    }
+
+    /// Persist a header row only (for header-sync → out-of-order body archive).
+    pub fn ensure_header(&self, header: &Header) -> Result<(), NetError> {
+        let prev_fk = if header.prev_blockhash.to_byte_array() == [0u8; 32] {
+            Fk::NULL
+        } else {
+            self.query
+                .get_header_by_hash(header.prev_blockhash.as_byte_array())
+                .map_err(|e| NetError::Consensus(e.to_string()))?
+                .map(|(fk, _)| fk)
+                .unwrap_or(Fk::NULL)
+        };
+        let rec = header_to_record(prev_fk, header);
+        self.query
+            .ensure_header(&rec)
+            .map_err(|e| NetError::Consensus(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Archive Class A body without requiring tip order (parallel IBD path).
+    pub fn archive_block(&self, height: u32, block: Block) -> Result<(), NetError> {
+        let hash = block.block_hash();
+        if self.is_archived(&hash) {
+            return Ok(());
+        }
+        accept_and_archive_block(
+            &self.query,
+            &self.params,
+            Height(height),
+            &block,
+            self.milestone,
+        )
+        .map_err(|e| NetError::Consensus(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Confirm `hash` at tip+1 if its body is archived.
+    pub fn confirm_hash(&self, height: u32, hash: BlockHash) -> Result<AcceptOutcome, NetError> {
+        if self.has_block(&hash) {
+            return Ok(AcceptOutcome::AlreadyHave);
+        }
+        if !self.is_archived(&hash) {
+            return Err(NetError::Protocol("confirm without archive"));
+        }
+        confirm_archived_at(
+            &self.query,
+            &self.params,
+            Height(height),
+            &hash.to_byte_array(),
+            self.milestone,
+        )
+        .map_err(|e| NetError::Consensus(e.to_string()))?;
+        self.confirmed.write().insert(hash);
+        // Best-effort tip cache (reconstruct is heavy — skip full body).
+        if let Ok(Some(block)) = self.query.reconstruct_archived_block(&hash.to_byte_array()) {
+            let _ = self.cache.push_best(block.clone());
+            let event = TipEvent {
+                height,
+                hash,
+                header: block.header,
+            };
+            let _ = self.tip_tx.send(event);
+        } else if let Ok(hdr) = self.query.wire_header_at_height(Height(height)) {
+            let event = TipEvent {
+                height,
+                hash,
+                header: hdr,
+            };
+            let _ = self.tip_tx.send(event);
+        }
+        self.notify.notify_waiters();
+        Ok(AcceptOutcome::Accepted { height })
     }
 
     /// Accept a block that extends the tip, or reorg to a stronger competing tip / branch.
@@ -227,11 +320,15 @@ impl ChainHub {
             self.disconnect_to(fh)?;
         } else {
             while self.query.tip_height().is_some() {
+                if let Some(th) = self.tip_hash() {
+                    self.confirmed.write().remove(&th);
+                }
                 self.query
                     .disconnect_tip()
                     .map_err(|e| NetError::Consensus(e.to_string()))?;
             }
             self.cache.clear();
+            self.confirmed.write().clear();
         }
 
         let base = fork_height.map(|h| h + 1).unwrap_or(0);
@@ -243,6 +340,8 @@ impl ChainHub {
     }
 
     fn connect_at(&self, height: u32, block: Block) -> Result<(), NetError> {
+        let hash = block.block_hash();
+        let header = block.header;
         accept_and_connect_block(
             &self.query,
             &self.params,
@@ -251,11 +350,13 @@ impl ChainHub {
             self.milestone,
         )
         .map_err(|e| NetError::Consensus(e.to_string()))?;
-        let _ = self.cache.push_best(block.clone());
+        self.confirmed.write().insert(hash);
+        // Move block into tip-window cache (no full-history clone).
+        let _ = self.cache.push_best(block);
         let event = TipEvent {
             height,
-            hash: block.block_hash(),
-            header: block.header,
+            hash,
+            header,
         };
         let _ = self.tip_tx.send(event);
         self.notify.notify_waiters();
@@ -270,6 +371,9 @@ impl ChainHub {
             };
             if tip <= keep_height {
                 break;
+            }
+            if let Some(th) = self.tip_hash() {
+                self.confirmed.write().remove(&th);
             }
             self.query
                 .disconnect_tip()
@@ -309,6 +413,21 @@ impl ChainHub {
         }
         Ok(sum_work(works.into_iter()))
     }
+}
+
+/// Load confirmed best-chain hashes into an O(1) membership set.
+fn seed_confirmed_hashes(query: &Query) -> HashSet<BlockHash> {
+    let mut set = HashSet::new();
+    let Some(tip) = query.tip_height() else {
+        return set;
+    };
+    set.reserve(tip.0 as usize + 1);
+    for h in 0..=tip.0 {
+        if let Ok(Some((_, rec))) = query.header_at_height(Height(h)) {
+            set.insert(BlockHash::from_byte_array(rec.hash));
+        }
+    }
+    set
 }
 
 fn sum_work(iter: impl Iterator<Item = Work>) -> Work {

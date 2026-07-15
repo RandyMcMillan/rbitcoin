@@ -1,4 +1,4 @@
-use crate::chain::{BlockTxsTable, ConfirmedTable, StrongTxTable};
+use crate::chain::{BlockTxsTable, ConfirmedTable, HeaderTxsTable, StrongTxTable};
 use crate::epoch::ArchiveEpoch;
 use crate::error::StoreError;
 use crate::header_table::{HeaderRecord, HeaderTable};
@@ -23,6 +23,8 @@ pub struct Store {
     pub confirmed: ConfirmedTable,
     pub strong_tx: StrongTxTable,
     pub block_txs: BlockTxsTable,
+    /// Class A: header_fk → tx list (archive before tip confirm).
+    pub header_txs: HeaderTxsTable,
     epoch: Mutex<ArchiveEpoch>,
 }
 
@@ -49,6 +51,7 @@ impl Store {
             confirmed: ConfirmedTable::create(&path)?,
             strong_tx: StrongTxTable::create(&path)?,
             block_txs: BlockTxsTable::create(&path)?,
+            header_txs: HeaderTxsTable::create(&path)?,
             epoch: Mutex::new(epoch),
             path,
         })
@@ -67,6 +70,12 @@ impl Store {
         } else {
             ScriptHashTable::create(&path)?
         };
+        // header_txs: archive-before-confirm (upgrade path for older datadirs).
+        let header_txs = if path.join("header_txs_fk.body").exists() {
+            HeaderTxsTable::open(&path)?
+        } else {
+            HeaderTxsTable::create(&path)?
+        };
         Ok(Self {
             headers: HeaderTable::open(&path)?,
             txs: TxTable::open(&path)?,
@@ -77,6 +86,7 @@ impl Store {
             confirmed: ConfirmedTable::open(&path)?,
             strong_tx: StrongTxTable::open(&path)?,
             block_txs: BlockTxsTable::open(&path)?,
+            header_txs,
             epoch: Mutex::new(epoch),
             path,
         })
@@ -188,6 +198,7 @@ impl Store {
         self.confirmed.flush()?;
         self.strong_tx.flush()?;
         self.block_txs.flush()?;
+        self.header_txs.flush()?;
         Ok(())
     }
 

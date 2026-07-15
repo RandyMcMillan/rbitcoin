@@ -4,7 +4,8 @@
 //! - N outbound peer workers (each: own TCP stream, command + event channels)
 //! - Shared ordered work queue of block hashes after the local tip
 //! - Download **window**: up to `window` blocks in-flight, at most `per_peer` per peer
-//! - Blocks may arrive out of order; connect when parent is tip
+//! - Bodies are **archived** to Class A as they arrive (any order)
+//! - Tip **confirm** walks contiguous archived runs (Class C) separately
 //! - Stall timeout reassigns in-flight hashes to other peers
 
 use crate::chain::{AcceptOutcome, ChainHub};
@@ -26,10 +27,17 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+/// Default download / archive horizon after the connected tip (~1 day of
+/// mainnet blocks). Caps concurrent getdata + peer decode RAM; bodies are
+/// archived to disk so a larger window is not needed for reordering.
+pub const DEFAULT_IBD_WINDOW: usize = 144;
+
 /// Tunables for parallel IBD (defaults lean libbitcoin/Core-ish).
 #[derive(Clone, Debug)]
 pub struct IbdConfig {
-    /// Max blocks in-flight across all peers.
+    /// Max blocks in-flight across all peers; also the assignable header horizon
+    /// after the connected tip (`ordered[0..window]` only). Prefer ~100–144 to
+    /// bound peer-side RAM; Class A archive holds the rest on disk.
     pub window: usize,
     /// Max in-flight getdata per peer.
     pub per_peer: usize,
@@ -44,7 +52,7 @@ pub struct IbdConfig {
 impl Default for IbdConfig {
     fn default() -> Self {
         Self {
-            window: 1024,
+            window: DEFAULT_IBD_WINDOW,
             per_peer: 16,
             stall: Duration::from_secs(5),
             headers_batch: MAX_HEADERS_RESULTS,
@@ -165,19 +173,20 @@ pub async fn parallel_ibd_cancellable(
     // Don't redial until we've been downloading for a bit.
     let mut last_redial = Instant::now();
 
-    // Ordered download path (chain order after local tip). Front = next to connect.
+    // Ordered download path (chain order after local tip). Front = next to confirm.
     let mut ordered: VecDeque<BlockHash> = VecDeque::new();
     let mut ordered_set: HashSet<BlockHash> = HashSet::new();
+    // Absolute heights for archive validation / confirm.
+    let mut hash_height: HashMap<BlockHash, u32> = HashMap::new();
     // hash → when requested + peer id
     let mut inflight: HashMap<BlockHash, (usize, Instant)> = HashMap::new();
-    // Received but not yet connected (hash → block)
-    let mut pool: HashMap<BlockHash, Block> = HashMap::new();
-    // prev_hash → child block hash in pool (tip extension is O(1))
-    let mut pool_by_prev: HashMap<BlockHash, BlockHash> = HashMap::new();
     // Known header hashes on the download path (for linkage)
     let mut known_headers: HashSet<BlockHash> = HashSet::new();
     if let Some(h) = hub.tip_hash() {
         known_headers.insert(h);
+        if let Some(th) = hub.tip_height() {
+            hash_height.insert(h, th);
+        }
     }
 
     let accepted = AtomicU32::new(0);
@@ -207,7 +216,7 @@ pub async fn parallel_ibd_cancellable(
         // Yield so a concurrent shutdown select/task can run promptly.
         tokio::task::yield_now().await;
 
-        // Drop already-connected prefixes from the ordered queue.
+        // Drop already-confirmed prefixes from the ordered queue.
         while let Some(&front) = ordered.front() {
             if hub.has_block(&front) {
                 ordered.pop_front();
@@ -217,59 +226,68 @@ pub async fn parallel_ibd_cancellable(
             }
         }
 
-        // How many hashes still needed beyond tip (ordered not yet in pool).
-        let backlog = ordered
-            .iter()
-            .filter(|h| !pool.contains_key(*h) && !hub.has_block(h))
-            .count();
-        let ahead = pool.len() + inflight.len();
+        // Confirm any contiguous archived run at tip (bodies already on disk).
+        let confirmed_n = confirm_run(
+            hub.as_ref(),
+            &mut ordered,
+            &mut ordered_set,
+            &hash_height,
+            &accepted,
+            start_tip,
+            CONNECT_BATCH,
+        )?;
+        if confirmed_n > 0 {
+            last_progress = Instant::now();
+        }
 
-        // Pipeline headers when the ordered queue is thin. Always request when
-        // ordered is empty (even if the orphan pool is large) — otherwise we
-        // can deadlock: no work + pool of non-connecting blocks + no getheaders.
-        if !headers_done && (ordered.is_empty() || (backlog < window && pool.len() < window)) {
+        // Horizon = next `window` hashes after tip. Download holes = not archived.
+        let horizon = window;
+        let holes = ordered
+            .iter()
+            .take(horizon)
+            .filter(|h| {
+                !hub.has_block(h)
+                    && !hub.is_archived(h)
+                    && !inflight.contains_key(*h)
+            })
+            .count();
+        let archived_ahead = ordered
+            .iter()
+            .take(horizon)
+            .filter(|h| hub.is_archived(h) && !hub.has_block(h))
+            .count();
+        let ahead = archived_ahead + inflight.len();
+
+        // Pipeline headers when the ordered queue is thin.
+        if !headers_done
+            && (ordered.is_empty() || (holes < horizon / 4 && ordered.len() < horizon * 2))
+        {
             let _ = request_headers(&slots, &hub, &mut header_req_seq);
         }
 
-        // Hard path reset after a long stall with no tip advance: peers may be
-        // unable to serve the tip-next hash (pruned / wrong chain view).
-        if last_progress.elapsed() > cfg.stall.saturating_mul(4) {
-            let tip = hub.tip_hash();
-            let can_connect = tip
-                .map(|t| pool_by_prev.contains_key(&t))
-                .unwrap_or_else(|| {
-                    pool_by_prev.contains_key(&BlockHash::from_byte_array([0u8; 32]))
-                });
-            if !can_connect {
-                eprintln!(
-                    "ibd: hard path reset (stall {:?}, pool={}, ordered={})",
-                    last_progress.elapsed(),
-                    pool.len(),
-                    ordered.len()
-                );
-                ordered.clear();
-                ordered_set.clear();
-                pool.clear();
-                pool_by_prev.clear();
-                inflight.clear();
-                for s in slots.iter_mut() {
-                    s.in_flight.clear();
-                }
-                let _ = request_headers(&slots, &hub, &mut header_req_seq);
-                last_progress = Instant::now();
-            }
+        // Hard path reset after a long stall with no tip advance.
+        // Do not clear a full ordered queue that simply has not finished getdata yet.
+        if last_progress.elapsed() > cfg.stall.saturating_mul(6)
+            && ordered.is_empty()
+            && inflight.is_empty()
+        {
+            eprintln!(
+                "ibd: hard path reset (stall {:?}, ordered empty)",
+                last_progress.elapsed()
+            );
+            let _ = request_headers(&slots, &hub, &mut header_req_seq);
+            last_progress = Instant::now();
         }
 
-        // Tip-gap recovery (rate-limited): deep orphan pool + missing tip-next.
-        if pool.len() > 256
+        // Tip-gap: tip-next not archived while later blocks are — focus getdata.
+        if archived_ahead > 64
             && last_progress.elapsed() > Duration::from_secs(2)
             && last_gap_recovery.elapsed() > Duration::from_secs(3)
         {
             if let Some(&need) = ordered.front() {
-                if !pool.contains_key(&need) && !hub.has_block(&need) {
+                if !hub.is_archived(&need) && !hub.has_block(&need) {
                     eprintln!(
-                        "ibd: tip-gap recovery need={need} pool={} inflight={}",
-                        pool.len(),
+                        "ibd: tip-gap recovery need={need} archived_ahead={archived_ahead} inflight={}",
                         inflight.len()
                     );
                     last_gap_recovery = Instant::now();
@@ -295,20 +313,22 @@ pub async fn parallel_ibd_cancellable(
             }
         }
 
-        // Assign work: only hashes within the download window from ordered front.
+        // Assign getdata for non-archived holes in the tip horizon.
         assign_work_ordered(
             &mut slots,
             &ordered,
             &mut inflight,
-            &pool,
             hub.as_ref(),
             &cfg,
-            window,
+            horizon,
         );
 
-        // Stall reassignment (re-request; ordered path still owns the hashes).
+        // Stall reassignment — skip while tip is advancing (connect may hold the
+        // loop longer than stall at high height; reassign storms made it worse).
         let now = Instant::now();
-        reassign_stalled(&mut slots, &mut inflight, &cfg, now);
+        if last_progress.elapsed() > cfg.stall {
+            reassign_stalled(&mut slots, &mut inflight, &cfg, now);
+        }
 
         // Redial when we have few live peers (non-blocking-ish: at most every 30s).
         let alive_n = slots.iter().filter(|s| s.alive).count();
@@ -333,11 +353,10 @@ pub async fn parallel_ibd_cancellable(
         // Status line (helps lab debugging; line-buffered-ish)
         if last_status.elapsed() > Duration::from_secs(5) {
             eprintln!(
-                "ibd: status tip={:?} ordered={} inflight={} pool={} ahead={ahead} headers_done={headers_done} peers={}",
+                "ibd: status tip={:?} ordered={} inflight={} archived_ahead={archived_ahead} ahead={ahead} headers_done={headers_done} peers={}",
                 hub.tip_height(),
                 ordered.len(),
                 inflight.len(),
-                pool.len(),
                 slots.iter().filter(|s| s.alive).count(),
             );
             let _ = std::io::Write::flush(&mut std::io::stderr());
@@ -346,29 +365,23 @@ pub async fn parallel_ibd_cancellable(
 
         // Exit if nothing left and no inflight
         if headers_done && ordered.is_empty() && inflight.is_empty() {
-            drain_connect(
-                &hub,
-                &mut pool,
-                &mut pool_by_prev,
+            let _ = confirm_run(
+                hub.as_ref(),
                 &mut ordered,
                 &mut ordered_set,
+                &hash_height,
                 &accepted,
                 start_tip,
+                CONNECT_BATCH,
             )?;
-            if pool.is_empty() {
+            if ordered.is_empty() {
                 break;
             }
             if last_progress.elapsed() > cfg.stall {
-                eprintln!(
-                    "ibd: dropping {} orphan pool blocks after stall",
-                    pool.len()
-                );
-                pool.clear();
-                pool_by_prev.clear();
                 break;
             }
         }
-        if ordered.is_empty() && inflight.is_empty() && pool.is_empty() && headers_done {
+        if ordered.is_empty() && inflight.is_empty() && headers_done {
             break;
         }
         // All peers dead
@@ -390,9 +403,11 @@ pub async fn parallel_ibd_cancellable(
                 let mut added = 0usize;
                 for hdr in headers {
                     let hash = hdr.block_hash();
-                    if hub.has_block(&hash) || ordered_set.contains(&hash) || pool.contains_key(&hash)
+                    if hub.has_block(&hash) || ordered_set.contains(&hash) || hub.is_archived(&hash)
                     {
                         known_headers.insert(hash);
+                        // Still ensure header row for archive prev_fk linkage.
+                        let _ = hub.ensure_header(&hdr);
                         continue;
                     }
                     let prev = hdr.prev_blockhash;
@@ -403,6 +418,23 @@ pub async fn parallel_ibd_cancellable(
                     if !prev_ok && hub.tip_height().is_some() && !known_headers.is_empty() {
                         continue;
                     }
+                    // Height for archive BIP34 / confirm.
+                    let h = if let Some(&ph) = hash_height.get(&prev) {
+                        ph.saturating_add(1)
+                    } else if hub.tip_hash() == Some(prev) {
+                        hub.tip_height().unwrap_or(0).saturating_add(1)
+                    } else if prev.to_byte_array() == [0u8; 32] {
+                        0
+                    } else {
+                        // Best-effort: append after last known ordered height.
+                        ordered
+                            .back()
+                            .and_then(|b| hash_height.get(b).copied())
+                            .map(|x| x.saturating_add(1))
+                            .unwrap_or_else(|| hub.tip_height().unwrap_or(0).saturating_add(1))
+                    };
+                    hash_height.insert(hash, h);
+                    let _ = hub.ensure_header(&hdr);
                     known_headers.insert(hash);
                     ordered.push_back(hash);
                     ordered_set.insert(hash);
@@ -436,22 +468,25 @@ pub async fn parallel_ibd_cancellable(
                 }
                 let hash = block.block_hash();
                 inflight.remove(&hash);
-                let prev = block.header.prev_blockhash;
-                pool_by_prev.insert(prev, hash);
-                pool.insert(hash, block);
-                let tip_before = hub.tip_height();
-                drain_connect(
-                    &hub,
-                    &mut pool,
-                    &mut pool_by_prev,
+                // Ensure header linkage then archive Class A immediately (any order).
+                let _ = hub.ensure_header(&block.header);
+                let height = hash_height.get(&hash).copied().unwrap_or_else(|| {
+                    hub.tip_height().unwrap_or(0).saturating_add(1)
+                });
+                if let Err(e) = tokio::task::block_in_place(|| hub.archive_block(height, block)) {
+                    eprintln!("ibd: archive reject {hash}: {e}");
+                }
+                // Confirm contiguous archived prefix at tip.
+                let n = confirm_run(
+                    hub.as_ref(),
                     &mut ordered,
                     &mut ordered_set,
+                    &hash_height,
                     &accepted,
                     start_tip,
+                    CONNECT_BATCH,
                 )?;
-                // Only tip advances count as progress (far-ahead pool fills must not
-                // mask a missing tip-next block).
-                if hub.tip_height() != tip_before {
+                if n > 0 {
                     last_progress = Instant::now();
                 }
             }
@@ -466,20 +501,22 @@ pub async fn parallel_ibd_cancellable(
             }
             Ok(None) => break,
             Err(_) => {
-                // timeout tick — try connect + gap re-request of ordered front
-                drain_connect(
-                    &hub,
-                    &mut pool,
-                    &mut pool_by_prev,
+                // timeout tick — keep confirming archived runs
+                let n = confirm_run(
+                    hub.as_ref(),
                     &mut ordered,
                     &mut ordered_set,
+                    &hash_height,
                     &accepted,
                     start_tip,
+                    CONNECT_BATCH,
                 )?;
+                if n > 0 {
+                    last_progress = Instant::now();
+                }
                 if last_progress.elapsed() > cfg.stall
                     && ordered.is_empty()
                     && inflight.is_empty()
-                    && pool.is_empty()
                 {
                     headers_done = true;
                     let _ = headers_done; // used for exit conditions above
@@ -489,16 +526,17 @@ pub async fn parallel_ibd_cancellable(
         }
     }
 
-    // Final drain
-    drain_connect(
-        &hub,
-        &mut pool,
-        &mut pool_by_prev,
+    // Final confirm
+    while confirm_run(
+        hub.as_ref(),
         &mut ordered,
         &mut ordered_set,
+        &hash_height,
         &accepted,
         start_tip,
-    )?;
+        CONNECT_BATCH,
+    )? > 0
+    {}
 
     for s in &slots {
         let _ = s.cmd_tx.send(PeerCmd::Shutdown);
@@ -734,24 +772,23 @@ fn request_headers_from(
     Ok(true)
 }
 
-/// Assign getdata for missing hashes in chain order (nearest tip first).
+/// Assign getdata for missing (not yet **archived**) hashes in chain order.
 ///
-/// Always prioritizes the tip-extension gap even if the orphan pool is large —
-/// otherwise a full pool of future blocks freezes IBD forever.
+/// Far-ahead thrash is prevented by **horizon only**: solely
+/// `ordered[0..horizon]` may be requested. Bodies are archived on arrival;
+/// the tip confirm path is separate and does not block further downloads.
 fn assign_work_ordered(
     slots: &mut [PeerSlot],
     ordered: &VecDeque<BlockHash>,
     inflight: &mut HashMap<BlockHash, (usize, Instant)>,
-    pool: &HashMap<BlockHash, Block>,
     hub: &ChainHub,
     cfg: &IbdConfig,
-    window: usize,
+    horizon: usize,
 ) {
-    let total_inflight = inflight.len();
-    if total_inflight >= window {
+    let mut room = cfg.window.saturating_sub(inflight.len());
+    if room == 0 {
         return;
     }
-    let mut room = window - total_inflight;
 
     let alive_ids: Vec<usize> = slots
         .iter()
@@ -762,28 +799,17 @@ fn assign_work_ordered(
         return;
     }
 
-    // Candidates: ordered hashes not yet downloaded / requested, nearest tip first.
-    // When the pool is already large, only fill the contiguous tip gap so we
-    // don't dig the hole deeper with far-ahead getdata.
-    let take_n = if pool.len() >= window {
-        8
-    } else if pool.len() >= window / 4 {
-        32
-    } else {
-        window
-    };
+    // Holes: not confirmed, not archived, not inflight.
     let mut candidates: VecDeque<BlockHash> = ordered
         .iter()
+        .take(horizon)
         .copied()
-        .filter(|h| !hub.has_block(h) && !pool.contains_key(h) && !inflight.contains_key(h))
-        .take(take_n)
+        .filter(|h| {
+            !hub.has_block(h) && !hub.is_archived(h) && !inflight.contains_key(h)
+        })
         .collect();
     if candidates.is_empty() {
         return;
-    }
-    // Cap total in-flight when pool is bloated (focus bandwidth on the gap).
-    if pool.len() >= window / 4 {
-        room = room.min(take_n.saturating_sub(inflight.len()).max(4));
     }
 
     let mut peer_i = 0usize;
@@ -817,7 +843,10 @@ fn assign_work_ordered(
                 let Some(h) = candidates.pop_front() else {
                     break;
                 };
-                if hub.has_block(&h) || pool.contains_key(&h) || inflight.contains_key(&h) {
+                if hub.has_block(&h)
+                    || hub.is_archived(&h)
+                    || inflight.contains_key(&h)
+                {
                     continue;
                 }
                 batch.push(h);
@@ -853,65 +882,106 @@ fn reassign_stalled(
     if stalled.is_empty() {
         return;
     }
-    // Clear stall state so assign_work_ordered will re-issue getdata.
+    // Clear stall state so assign_work_ordered will re-issue getdata
+    // (tip-next is re-prioritized there).
     let mut n = 0usize;
     for (h, pid) in stalled {
-        if let Some(_) = inflight.remove(&h) {
+        if inflight.remove(&h).is_some() {
             if let Some(s) = slots.iter_mut().find(|s| s.id == pid) {
                 s.in_flight.remove(&h);
             }
             n += 1;
         }
     }
-    if n > 0 {
+    // Avoid log spam (lab25 had hundreds of reassign lines drowning signal).
+    if n > 0 && n >= 8 {
         eprintln!("ibd: reassign {n} stalled block(s)");
     }
 }
 
+/// Max tip confirms per event-loop turn (Class C is sequential; keep peers busy).
+const CONNECT_BATCH: usize = 128;
+
+/// Mark `h` done in the ordered set. Prefer O(1) front pop; otherwise leave a
+/// stale ordered entry (front-trim via `has_block` / set membership skips it).
 fn remove_from_ordered(
     ordered: &mut VecDeque<BlockHash>,
     ordered_set: &mut HashSet<BlockHash>,
     h: BlockHash,
 ) {
     ordered_set.remove(&h);
-    ordered.retain(|x| *x != h);
+    if ordered.front() == Some(&h) {
+        ordered.pop_front();
+    }
+    while let Some(&front) = ordered.front() {
+        if ordered_set.contains(&front) {
+            break;
+        }
+        ordered.pop_front();
+    }
 }
 
-fn drain_connect(
+/// Confirm up to `budget` tip-extending blocks whose bodies are already archived.
+fn confirm_run(
     hub: &ChainHub,
-    pool: &mut HashMap<BlockHash, Block>,
-    pool_by_prev: &mut HashMap<BlockHash, BlockHash>,
     ordered: &mut VecDeque<BlockHash>,
     ordered_set: &mut HashSet<BlockHash>,
+    hash_height: &HashMap<BlockHash, u32>,
     accepted: &AtomicU32,
     start_tip: u32,
-) -> Result<(), NetError> {
-    loop {
-        // Drop any ordered prefix already in the store.
+    budget: usize,
+) -> Result<usize, NetError> {
+    if budget == 0 {
+        return Ok(0);
+    }
+    tokio::task::block_in_place(|| {
+        confirm_run_sync(
+            hub,
+            ordered,
+            ordered_set,
+            hash_height,
+            accepted,
+            start_tip,
+            budget,
+        )
+    })
+}
+
+fn confirm_run_sync(
+    hub: &ChainHub,
+    ordered: &mut VecDeque<BlockHash>,
+    ordered_set: &mut HashSet<BlockHash>,
+    hash_height: &HashMap<BlockHash, u32>,
+    accepted: &AtomicU32,
+    start_tip: u32,
+    budget: usize,
+) -> Result<usize, NetError> {
+    let mut connected = 0usize;
+    while connected < budget {
         while let Some(&front) = ordered.front() {
-            if hub.has_block(&front) {
-                remove_from_ordered(ordered, ordered_set, front);
+            if hub.has_block(&front) || !ordered_set.contains(&front) {
+                ordered.pop_front();
+                ordered_set.remove(&front);
             } else {
                 break;
             }
         }
-
-        // Parent key for the next connectable block: tip hash, or null for genesis.
-        let prev_key = hub
-            .tip_hash()
-            .unwrap_or_else(|| BlockHash::from_byte_array([0u8; 32]));
-
-        let Some(h) = pool_by_prev.remove(&prev_key) else {
+        let Some(&need) = ordered.front() else {
             break;
         };
-        let Some(b) = pool.remove(&h) else {
-            // Stale index entry; keep draining.
-            continue;
-        };
-
-        match hub.accept_block(b) {
+        if !hub.is_archived(&need) {
+            break;
+        }
+        let expect = hub.tip_height().map(|t| t.saturating_add(1)).unwrap_or(0);
+        let height = hash_height.get(&need).copied().unwrap_or(expect);
+        if height != expect {
+            // Prefer tip-linked height; map can drift after reorg/reset.
+            // Still confirm at expect if archive has the body.
+        }
+        match hub.confirm_hash(expect, need) {
             Ok(AcceptOutcome::Accepted { .. }) | Ok(AcceptOutcome::AlreadyHave) => {
-                remove_from_ordered(ordered, ordered_set, h);
+                remove_from_ordered(ordered, ordered_set, need);
+                connected += 1;
                 let n = accepted.fetch_add(1, Ordering::SeqCst) + 1;
                 if n == 1 || n % 100 == 0 {
                     eprintln!(
@@ -922,14 +992,13 @@ fn drain_connect(
                 }
             }
             Ok(AcceptOutcome::IgnoredWeaker) => {
-                remove_from_ordered(ordered, ordered_set, h);
+                remove_from_ordered(ordered, ordered_set, need);
             }
             Err(e) => {
-                eprintln!("ibd: reject block {h}: {e}");
-                // Keep hash in ordered for re-request; body discarded.
+                eprintln!("ibd: confirm reject {need} @ {expect}: {e}");
                 break;
             }
         }
     }
-    Ok(())
+    Ok(connected)
 }

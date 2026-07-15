@@ -141,11 +141,17 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             milestone.height
         );
     }
-    // Fast IBD: skip scripthash unless operator keeps it on without milestone.
+    // Fast IBD: skip scripthash / spend indexes under milestone (connect checks
+    // are also skipped there). Re-enable / reindex before full validation or Electrum.
     let scripthash = config.scripthash_index && milestone.height == 0;
     handle.query.set_scripthash_index(scripthash);
     if !scripthash {
         eprintln!("ibd: scripthash index OFF during catch-up (re-enable after tip for Electrum)");
+    }
+    let spend_index = milestone.height == 0;
+    handle.query.set_spend_index(spend_index);
+    if !spend_index {
+        eprintln!("ibd: spend index OFF during catch-up under milestone (reindex before full validation)");
     }
 
     let listen = config
@@ -201,7 +207,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     };
     if !ibd_targets.is_empty() && !shutdown.requested() {
         let ibd_cfg = IbdConfig {
-            window: 1024,
+            // ~144 ahead: bounds peer decode RAM; archive-to-disk holds the rest.
+            window: rbitcoin_net::DEFAULT_IBD_WINDOW,
             per_peer: 16,
             stall: std::time::Duration::from_secs(5),
             ..IbdConfig::default()

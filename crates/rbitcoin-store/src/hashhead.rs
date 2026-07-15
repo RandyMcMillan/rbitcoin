@@ -174,10 +174,23 @@ impl HashHead {
                 entries.push((k, fk));
             }
         }
-        // Resize file region to new slot table (zeroed).
+        // Resize file region to new slot table (zeroed in chunks — a single
+        // multi-hundred-MB `vec![0; n]` during IBD was a major pause / OOM risk
+        // once tx.head grew past a few hundred MB).
         let new_bytes = SLOT_SIZE as u64 * new_slots;
-        let zeros = vec![0u8; new_bytes as usize];
-        self.file.write_at(FILE_HEADER_LEN as u64, &zeros)?;
+        const CHUNK: usize = 1024 * 1024;
+        let mut offset = FILE_HEADER_LEN as u64;
+        let mut remaining = new_bytes;
+        let mut zeros = vec![0u8; CHUNK.min(new_bytes as usize).max(1)];
+        while remaining > 0 {
+            let n = remaining.min(zeros.len() as u64) as usize;
+            if zeros.len() != n {
+                zeros.resize(n, 0);
+            }
+            self.file.write_at(offset, &zeros[..n])?;
+            offset += n as u64;
+            remaining -= n as u64;
+        }
         self.file
             .set_logical_len(FILE_HEADER_LEN as u64 + new_bytes)?;
         state.slots = new_slots;

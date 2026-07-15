@@ -31,7 +31,7 @@ where
         match a.as_ref() {
             "--help" | "-h" => {
                 eprintln!(
-                    "rbitcoin-node {} — usage:\n  rbitcoin-node [--datadir PATH] [--network NET] \\\n    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n    [--milestone HEIGHT] [--max-outbound N] [--max-run-secs N] \\\n    [--no-scripthash-index] [--no-seeds] [--smoke]\n\nNetworks: mainnet|testnet|signet|regtest\nMilestone: skip script/prevout at/below HEIGHT (IBD). Implies no scripthash index.\nParallel IBD: multi-peer windowed getdata (default 1024 in-flight).",
+                    "rbitcoin-node {} — usage:\n  rbitcoin-node [--datadir PATH] [--network NET] \\\n    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n    [--milestone HEIGHT] [--max-outbound N] [--max-run-secs N] \\\n    [--no-scripthash-index] [--no-seeds] [--smoke]\n\nNetworks: mainnet|testnet|signet|regtest\nMilestone: skip script/prevout at/below HEIGHT (IBD). Implies no scripthash index.\nParallel IBD: multi-peer windowed getdata (default 144 in-flight / tip-ahead).",
                     env!("CARGO_PKG_VERSION")
                 );
                 return ExitCode::SUCCESS;

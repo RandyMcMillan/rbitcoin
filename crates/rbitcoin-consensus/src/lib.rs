@@ -84,10 +84,13 @@ pub fn accept_and_archive_block(
             .ok_or(ConsensusError::Store(StoreError::NotFound));
     }
 
+    // Structure without BIP34: height is only authoritative at confirm (tip order).
+    // Passing GENESIS skips BIP34; merkle/weight/witness still checked.
+    let _ = height;
     let ctx = ValidationContext {
         params,
-        height,
-        milestone: Milestone::NONE, // structure only; milestone does not change BIP34
+        height: Height::GENESIS,
+        milestone: Milestone::NONE,
     };
     validate_block_structure(block, &ctx)?;
 

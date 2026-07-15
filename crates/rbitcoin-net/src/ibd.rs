@@ -27,17 +27,16 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-/// Default download / archive horizon after the connected tip (~1 day of
-/// mainnet blocks). Caps concurrent getdata + peer decode RAM; bodies are
-/// archived to disk so a larger window is not needed for reordering.
-pub const DEFAULT_IBD_WINDOW: usize = 144;
+/// Default download / archive horizon after the connected tip.
+/// Larger windows pipeline more peer bandwidth (bodies still archive to disk).
+pub const DEFAULT_IBD_WINDOW: usize = 1024;
 
 /// Tunables for parallel IBD (defaults lean libbitcoin/Core-ish).
 #[derive(Clone, Debug)]
 pub struct IbdConfig {
     /// Max blocks in-flight across all peers; also the assignable header horizon
-    /// after the connected tip (`ordered[0..window]` only). Prefer ~100–144 to
-    /// bound peer-side RAM; Class A archive holds the rest on disk.
+    /// after the connected tip (`ordered[0..window]` only). Class A archive holds
+    /// bodies on disk; this mainly bounds concurrent getdata / peer buffers.
     pub window: usize,
     /// Max in-flight getdata per peer.
     pub per_peer: usize,
@@ -403,14 +402,38 @@ pub async fn parallel_ibd_cancellable(
                 let mut added = 0usize;
                 for hdr in headers {
                     let hash = hdr.block_hash();
+                    let prev = hdr.prev_blockhash;
+                    // Always track height along the header path (even if already known).
+                    let h = if let Some(&ph) = hash_height.get(&prev) {
+                        ph.saturating_add(1)
+                    } else if hub.tip_hash() == Some(prev) || hub.has_block(&prev) {
+                        // Parent on confirmed tip chain: only correct if parent is tip
+                        // for linear extension; prefer tip+1 when prev is tip.
+                        if hub.tip_hash() == Some(prev) {
+                            hub.tip_height().unwrap_or(0).saturating_add(1)
+                        } else {
+                            hash_height
+                                .get(&prev)
+                                .copied()
+                                .unwrap_or_else(|| hub.tip_height().unwrap_or(0).saturating_add(1))
+                        }
+                    } else if prev.to_byte_array() == [0u8; 32] {
+                        0
+                    } else {
+                        ordered
+                            .back()
+                            .and_then(|b| hash_height.get(b).copied())
+                            .map(|x| x.saturating_add(1))
+                            .unwrap_or_else(|| hub.tip_height().unwrap_or(0).saturating_add(1))
+                    };
+                    hash_height.entry(hash).or_insert(h);
+
                     if hub.has_block(&hash) || ordered_set.contains(&hash) || hub.is_archived(&hash)
                     {
                         known_headers.insert(hash);
-                        // Still ensure header row for archive prev_fk linkage.
                         let _ = hub.ensure_header(&hdr);
                         continue;
                     }
-                    let prev = hdr.prev_blockhash;
                     let prev_ok = known_headers.contains(&prev)
                         || hub.has_block(&prev)
                         || prev.to_byte_array() == [0u8; 32]
@@ -418,22 +441,6 @@ pub async fn parallel_ibd_cancellable(
                     if !prev_ok && hub.tip_height().is_some() && !known_headers.is_empty() {
                         continue;
                     }
-                    // Height for archive BIP34 / confirm.
-                    let h = if let Some(&ph) = hash_height.get(&prev) {
-                        ph.saturating_add(1)
-                    } else if hub.tip_hash() == Some(prev) {
-                        hub.tip_height().unwrap_or(0).saturating_add(1)
-                    } else if prev.to_byte_array() == [0u8; 32] {
-                        0
-                    } else {
-                        // Best-effort: append after last known ordered height.
-                        ordered
-                            .back()
-                            .and_then(|b| hash_height.get(b).copied())
-                            .map(|x| x.saturating_add(1))
-                            .unwrap_or_else(|| hub.tip_height().unwrap_or(0).saturating_add(1))
-                    };
-                    hash_height.insert(hash, h);
                     let _ = hub.ensure_header(&hdr);
                     known_headers.insert(hash);
                     ordered.push_back(hash);
@@ -829,18 +836,16 @@ fn assign_work_ordered(
                 Some(s) if s.alive => s,
                 _ => continue,
             };
-            let peer_cap = if alive_ids.len() <= 2 {
-                cfg.per_peer.max(128)
-            } else if alive_ids.len() <= 4 {
-                cfg.per_peer.max(64)
-            } else {
-                cfg.per_peer
-            };
+            // Spread the global window across live peers so window=1024 is
+            // actually reachable (peers * per_peer alone capped us ~112).
+            let peer_cap = (cfg.window / alive_ids.len().max(1))
+                .max(cfg.per_peer)
+                .min(256);
             let free = peer_cap.saturating_sub(slot.in_flight.len());
             if free == 0 {
                 continue;
             }
-            let batch_cap = if alive_ids.len() <= 2 { 64 } else { 16 };
+            let batch_cap = if alive_ids.len() <= 4 { 64 } else { 32 };
             let take = free.min(room).min(candidates.len()).min(batch_cap);
             if take == 0 {
                 continue;

@@ -207,7 +207,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     };
     if !ibd_targets.is_empty() && !shutdown.requested() {
         let ibd_cfg = IbdConfig {
-            // ~144 ahead: bounds peer decode RAM; archive-to-disk holds the rest.
+            // Tip-ahead getdata horizon; archive-to-disk holds reordered bodies.
             window: rbitcoin_net::DEFAULT_IBD_WINDOW,
             per_peer: 16,
             stall: std::time::Duration::from_secs(5),

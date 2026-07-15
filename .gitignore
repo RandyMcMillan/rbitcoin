@@ -10,4 +10,5 @@ lcov.info
 *.swp
 .DS_Store
 /datadir/
+/datadir-*/
 /tmp/

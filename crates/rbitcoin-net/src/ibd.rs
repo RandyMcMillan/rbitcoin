@@ -177,29 +177,38 @@ pub async fn parallel_ibd_cancellable(
 
     // Full candidate list kept for mid-IBD redial; dial fails are retried later.
     let peer_pool: Vec<SocketAddr> = peers.to_vec();
-    let mut next_peer_id = 0usize;
+    let next_peer_id = Arc::new(AtomicUsize::new(0));
     let mut slots: Vec<PeerSlot> = Vec::new();
 
-    // Initial concurrent dial (all candidates once).
-    dial_batch(
-        &mut slots,
-        &peer_pool,
-        &mut next_peer_id,
-        peer_pool.len(),
-        magic,
-        local_addr,
-        hub.tip_height(),
-        ev_tx.clone(),
-        cfg.connect_timeout,
-    )
-    .await;
+    // Initial concurrent dial (all candidates once) — OK to await before loop starts.
+    {
+        let fresh = dial_batch(
+            &peer_pool,
+            &next_peer_id,
+            peer_pool.len(),
+            HashSet::new(),
+            magic,
+            local_addr,
+            hub.tip_height(),
+            ev_tx.clone(),
+            cfg.connect_timeout,
+        )
+        .await;
+        slots.extend(fresh);
+    }
     slots.retain(|s| s.alive);
     if slots.is_empty() {
         return Err(NetError::Protocol("no parallel peers connected"));
     }
-    eprintln!("ibd: {} / {} peers ready (target={})", slots.len(), peer_pool.len(), cfg.target_peers);
-    // Allow an immediate fill-up redial if the first pass left us under target.
+    eprintln!(
+        "ibd: {} / {} peers ready (target={})",
+        slots.len(),
+        peer_pool.len(),
+        cfg.target_peers
+    );
+    // Background redial — never .await dial on the IBD event loop (that stalled tip).
     let mut last_redial = Instant::now() - Duration::from_secs(15);
+    let mut redial_handle: Option<JoinHandle<Vec<PeerSlot>>> = None;
 
     // Ordered download path (chain order after local tip). Front = next to confirm.
     let mut ordered: VecDeque<BlockHash> = VecDeque::new();
@@ -338,27 +347,69 @@ pub async fn parallel_ibd_cancellable(
             reassign_stalled(&mut slots, &mut inflight, &cfg, now);
         }
 
-        // Keep filling toward target_peers (not only when nearly peerless).
+        // Collect finished background dials without blocking the event loop.
+        if redial_handle
+            .as_ref()
+            .map(|h| h.is_finished())
+            .unwrap_or(false)
+        {
+            if let Some(h) = redial_handle.take() {
+                match h.await {
+                    Ok(fresh) => {
+                        let n = fresh.len();
+                        for s in fresh {
+                            eprintln!("ibd: parallel peer[{}] {} connected", s.id, s.addr);
+                            slots.push(s);
+                        }
+                        if n > 0 {
+                            slots.sort_by_key(|s| s.id);
+                            eprintln!(
+                                "ibd: redial added {n} peer(s); live={}",
+                                slots.iter().filter(|s| s.alive).count()
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("ibd: redial task failed: {e}"),
+                }
+            }
+        }
+
+        // Kick a non-blocking redial if under target and none in flight.
         let alive_n = slots.iter().filter(|s| s.alive).count();
         let target = cfg.target_peers.min(peer_pool.len()).max(1);
-        if alive_n < target && last_redial.elapsed() > Duration::from_secs(15) {
+        if redial_handle.is_none()
+            && alive_n < target
+            && last_redial.elapsed() > Duration::from_secs(15)
+        {
             let want = (target - alive_n).min(8).max(1);
+            let already: HashSet<SocketAddr> = slots
+                .iter()
+                .filter(|s| s.alive)
+                .map(|s| s.addr)
+                .collect();
             eprintln!(
                 "ibd: redialing up to {want} peers (alive={alive_n}/{target}, pool={})…",
                 peer_pool.len()
             );
-            dial_batch(
-                &mut slots,
-                &peer_pool,
-                &mut next_peer_id,
-                want,
-                magic,
-                local_addr,
-                hub.tip_height(),
-                ev_tx.clone(),
-                cfg.connect_timeout,
-            )
-            .await;
+            let pool = peer_pool.clone();
+            let next_id = next_peer_id.clone();
+            let tip_h = hub.tip_height();
+            let ev = ev_tx.clone();
+            let cto = cfg.connect_timeout;
+            redial_handle = Some(tokio::spawn(async move {
+                dial_batch(
+                    &pool,
+                    &next_id,
+                    want,
+                    already,
+                    magic,
+                    local_addr,
+                    tip_h,
+                    ev,
+                    cto,
+                )
+                .await
+            }));
             last_redial = Instant::now();
         }
 
@@ -602,45 +653,38 @@ pub async fn parallel_ibd_cancellable(
     Ok(n)
 }
 
-/// Dial up to `count` peers from `pool` concurrently; append successful slots.
-/// Candidates rotate via `next_id` so redials walk the list. Skips addrs already
-/// connected (live slots).
+/// Dial up to `count` peers from `pool` concurrently; return successful slots.
+///
+/// Safe to run on a background task — does not touch the IBD event loop.
+/// Candidates rotate via `next_id`. Skips `already` live addrs.
 async fn dial_batch(
-    slots: &mut Vec<PeerSlot>,
     pool: &[SocketAddr],
-    next_id: &mut usize,
+    next_id: &AtomicUsize,
     count: usize,
+    already: HashSet<SocketAddr>,
     magic: Magic,
     local_addr: SocketAddr,
     tip_h: Option<u32>,
     ev_tx: mpsc::UnboundedSender<PeerEvent>,
     connect_timeout: Duration,
-) {
+) -> Vec<PeerSlot> {
+    let mut out = Vec::new();
     if count == 0 || pool.is_empty() {
-        return;
+        return out;
     }
-
-    let already: HashSet<SocketAddr> = slots
-        .iter()
-        .filter(|s| s.alive)
-        .map(|s| s.addr)
-        .collect();
 
     let mut join_set = tokio::task::JoinSet::new();
     let n = pool.len();
     let mut spawned = 0usize;
     let mut attempts = 0usize;
-    // Walk the pool at most once per dial_batch.
     while spawned < count && attempts < n {
         attempts += 1;
-        let idx = (*next_id) % n;
-        *next_id = next_id.saturating_add(1);
+        let idx = next_id.fetch_add(1, Ordering::Relaxed) % n;
         let addr = pool[idx];
         if already.contains(&addr) {
             continue;
         }
-        let id = *next_id;
-        *next_id = next_id.saturating_add(1);
+        let id = next_id.fetch_add(1, Ordering::Relaxed);
         let ev = ev_tx.clone();
         join_set.spawn(async move {
             let fut = spawn_peer(id, addr, magic, local_addr, tip_h, ev);
@@ -654,10 +698,7 @@ async fn dial_batch(
     }
     while let Some(joined) = join_set.join_next().await {
         match joined {
-            Ok(Ok(slot)) => {
-                eprintln!("ibd: parallel peer[{}] {} connected", slot.id, slot.addr);
-                slots.push(slot);
-            }
+            Ok(Ok(slot)) => out.push(slot),
             Ok(Err((id, addr, reason))) => {
                 eprintln!("ibd: parallel peer[{id}] {addr} failed: {reason}");
             }
@@ -666,7 +707,8 @@ async fn dial_batch(
             }
         }
     }
-    slots.sort_by_key(|s| s.id);
+    out.sort_by_key(|s| s.id);
+    out
 }
 
 async fn spawn_peer(

@@ -17,7 +17,7 @@ pub use convert::{block_to_apply, header_to_record};
 pub use error::ConsensusError;
 pub use header::validate_header;
 pub use milestone::Milestone;
-pub use params::{genesis_block, ChainParams, Checkpoint};
+pub use params::{default_milestone_height, genesis_block, ChainParams, Checkpoint};
 
 pub fn crate_name() -> &'static str {
     "rbitcoin-consensus"

@@ -43,14 +43,17 @@ pub struct ChainHub {
     pub notify: Arc<Notify>,
     tip_tx: broadcast::Sender<TipEvent>,
     /// Best-chain confirmed block hashes (O(1) `has_block` for IBD hot path).
-    confirmed: RwLock<HashSet<BlockHash>>,
+    confirmed: Arc<RwLock<HashSet<BlockHash>>>,
 }
 
 impl ChainHub {
     pub fn new(query: Query, params: ChainParams, milestone: Milestone) -> Self {
         let (tip_tx, _) = broadcast::channel(64);
         let query = Arc::new(query);
-        let confirmed = seed_confirmed_hashes(&query);
+        let confirmed = Arc::new(RwLock::new(seed_confirmed_tip(&query)));
+        // Full confirmed-set fill in background (mainnet-scale tips make a
+        // synchronous walk multi-minute). Tip/genesis are seeded immediately.
+        spawn_confirmed_seed(query.clone(), confirmed.clone());
         Self {
             query,
             cache: Arc::new(BlockCache::new()),
@@ -58,7 +61,7 @@ impl ChainHub {
             milestone,
             notify: Arc::new(Notify::new()),
             tip_tx,
-            confirmed: RwLock::new(confirmed),
+            confirmed,
         }
     }
 
@@ -107,8 +110,9 @@ impl ChainHub {
 
     /// True if `hash` is on the confirmed best chain (or in the RAM tip cache).
     ///
-    /// Uses an in-memory set maintained on connect/disconnect — no mmap walk on
-    /// the IBD hot path. Must not treat orphan archive header rows as "have".
+    /// Uses an in-memory set (tip seeded immediately; full chain filled in the
+    /// background on connect). Must **not** fall back to `height_of_hash` here —
+    /// header-only archive rows would force multi-thousand-height scans per call.
     pub fn has_block(&self, hash: &BlockHash) -> bool {
         if self.cache.get_block(hash).is_some() {
             return true;
@@ -415,19 +419,51 @@ impl ChainHub {
     }
 }
 
-/// Load confirmed best-chain hashes into an O(1) membership set.
-fn seed_confirmed_hashes(query: &Query) -> HashSet<BlockHash> {
+/// Immediate seed: genesis + tip (and tip-1) so open is O(1) at mainnet scale.
+fn seed_confirmed_tip(query: &Query) -> HashSet<BlockHash> {
     let mut set = HashSet::new();
     let Some(tip) = query.tip_height() else {
         return set;
     };
-    set.reserve(tip.0 as usize + 1);
-    for h in 0..=tip.0 {
+    for h in [0u32, tip.0.saturating_sub(1), tip.0] {
         if let Ok(Some((_, rec))) = query.header_at_height(Height(h)) {
             set.insert(BlockHash::from_byte_array(rec.hash));
         }
     }
     set
+}
+
+/// Fill the rest of the confirmed set without blocking P2P start.
+fn spawn_confirmed_seed(query: Arc<Query>, confirmed: Arc<RwLock<HashSet<BlockHash>>>) {
+    let Some(tip) = query.tip_height() else {
+        return;
+    };
+    if tip.0 <= 2 {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("confirmed-seed".into())
+        .spawn(move || {
+            let t0 = std::time::Instant::now();
+            let mut batch = Vec::with_capacity(4096);
+            for h in 0..=tip.0 {
+                if let Ok(Some((_, rec))) = query.header_at_height(Height(h)) {
+                    batch.push(BlockHash::from_byte_array(rec.hash));
+                }
+                if batch.len() >= 4096 || h == tip.0 {
+                    let mut g = confirmed.write();
+                    for hash in batch.drain(..) {
+                        g.insert(hash);
+                    }
+                }
+            }
+            eprintln!(
+                "ibd: confirmed-set seed complete tip={} in {:?}",
+                tip.0,
+                t0.elapsed()
+            );
+        })
+        .ok();
 }
 
 fn sum_work(iter: impl Iterator<Item = Work>) -> Work {

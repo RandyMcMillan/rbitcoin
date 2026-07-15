@@ -1,5 +1,6 @@
 use crate::config::NodeConfig;
 use crate::run::{run_node, run_p2p};
+use rbitcoin_consensus::default_milestone_height;
 use rbitcoin_primitives::Network;
 use std::ffi::OsString;
 use std::net::SocketAddr;
@@ -22,6 +23,7 @@ where
     let mut connect: Vec<SocketAddr> = Vec::new();
     let mut use_seeds = true;
     let mut milestone_height = 0u32;
+    let mut milestone_set = false;
     let mut max_outbound = 8u32;
     let mut max_run_secs: Option<u64> = None;
     let mut scripthash_index = true;
@@ -31,7 +33,7 @@ where
         match a.as_ref() {
             "--help" | "-h" => {
                 eprintln!(
-                    "rbitcoin-node {} — usage:\n  rbitcoin-node [--datadir PATH] [--network NET] \\\n    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n    [--milestone HEIGHT] [--max-outbound N] [--max-run-secs N] \\\n    [--no-scripthash-index] [--no-seeds] [--smoke]\n\nNetworks: mainnet|testnet|signet|regtest\nMilestone: skip script/prevout at/below HEIGHT (IBD). Implies no scripthash index.\nParallel IBD: multi-peer windowed getdata (default 144 in-flight / tip-ahead).",
+                    "rbitcoin-node {} — usage:\n  rbitcoin-node [--datadir PATH] [--network NET] \\\n    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n    [--milestone HEIGHT] [--max-outbound N] [--max-run-secs N] \\\n    [--no-scripthash-index] [--no-seeds] [--smoke]\n\nNetworks: mainnet|testnet|signet|regtest\nMilestone: skip script/prevout at/below HEIGHT (IBD assumevalid-style).\n  Default when omitted: mainnet 840000, signet 300000, testnet 2500000, regtest 0.\n  Use --milestone 0 for full validation. Disables scripthash index under milestone.\nParallel IBD: multi-peer windowed getdata (default 144 in-flight / tip-ahead).",
                     env!("CARGO_PKG_VERSION")
                 );
                 return ExitCode::SUCCESS;
@@ -128,7 +130,10 @@ where
                     return ExitCode::from(2);
                 }
                 match args[i].to_string_lossy().parse::<u32>() {
-                    Ok(h) => milestone_height = h,
+                    Ok(h) => {
+                        milestone_height = h;
+                        milestone_set = true;
+                    }
                     Err(e) => {
                         eprintln!("error: bad --milestone: {e}");
                         return ExitCode::from(2);
@@ -185,7 +190,12 @@ where
     config.electrum_listen = electrum_listen;
     config.connect = connect;
     config.use_seeds = use_seeds;
-    config.milestone_height = milestone_height;
+    // Network default assumevalid-style milestone unless operator set --milestone.
+    config.milestone_height = if milestone_set {
+        milestone_height
+    } else {
+        default_milestone_height(network)
+    };
     config.max_outbound = max_outbound;
     config.scripthash_index = scripthash_index;
     if max_run_secs.is_some() {

@@ -15,6 +15,7 @@ mod header_table;
 mod point_table;
 mod scripthash;
 mod sharded_hashhead;
+mod sorted_run;
 mod store;
 mod tx_table;
 mod var_table;
@@ -34,6 +35,9 @@ pub use sharded_hashhead::{
 pub use header_table::HeaderRecord;
 pub use point_table::PointRecord;
 pub use scripthash::{script_hash, ScriptHashRecord, ScriptHashTable};
+pub use sorted_run::{
+    list_runs, merge_runs, next_run_path, open_run, read_run_body, write_sorted_run, SortedRunPath,
+};
 pub use store::Store;
 pub use tx_table::{InputRecord, OutputRecord, TxRecord};
 

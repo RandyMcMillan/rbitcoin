@@ -6,6 +6,7 @@ mod class_a_cache;
 mod connect;
 mod reconstruct;
 mod scripthash;
+mod sh_builder;
 mod tip_prevout_cache;
 mod wave_prevout;
 
@@ -210,6 +211,8 @@ pub struct Query {
     /// Tip-window create txs + outputs filled **as we confirm** (and when
     /// resolving parents during connect). FIFO; independent of archive lead.
     tip_prevout_cache: tip_prevout_cache::TipPrevoutCache,
+    /// Catch-up SH: memtable → sorted runs (no durable head on confirm).
+    sh_run: sh_builder::ShRunBuilder,
 }
 
 impl Query {
@@ -224,6 +227,7 @@ impl Query {
                 "rbitcoin: repaired {repaired} Class C tx rows above confirmed tip (partial confirm / kill -9)"
             );
         }
+        let store_path = store.path().to_path_buf();
         let q = Self {
             store,
             spend_index: std::sync::atomic::AtomicBool::new(true),
@@ -235,10 +239,26 @@ impl Query {
             sh_tx_indexed_warmed: std::sync::atomic::AtomicBool::new(false),
             class_a_cache: class_a_cache::ClassACache::from_env(),
             tip_prevout_cache: tip_prevout_cache::TipPrevoutCache::from_env(),
+            sh_run: sh_builder::ShRunBuilder::new(&store_path),
         };
         // Warm cache from durable head if present (resume with index on).
         // Full body scan is not done here; fresh genesis IBD fills cache as it archives.
         Ok(q)
+    }
+
+    /// Catch-up: SH creates go to sorted runs (background flush/merge), not
+    /// durable `scripthash.head` RMW on the confirm path.
+    pub fn enable_sh_run_mode(&self) {
+        self.sh_run.enable();
+    }
+
+    pub fn sh_run_mode(&self) -> bool {
+        self.sh_run.is_enabled()
+    }
+
+    /// Flush/compact SH runs and bulk-load durable scripthash tables (tip mode).
+    pub fn finalize_sh_runs(&self) -> Result<u64, QueryError> {
+        self.sh_run.finalize_and_materialize(&self.store)
     }
 
     fn remember_txid(&self, txid: [u8; 32], fk: Fk) {

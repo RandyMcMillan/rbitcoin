@@ -391,19 +391,13 @@ pub(crate) fn connect_block_prevouts(
         Option<u32>,
     > = std::collections::HashMap::with_capacity(64);
 
-    // Spent checks:
+    // Spent checks (hybrid, same order as wave_fill / is_outpoint_spent):
     // - pending_spent: this confirm run
-    // - spent_local: process set when durable points are off (hold one lock)
-    // - wave / tip_prevout live slot: write-through unspent (no disk)
-    // - else durable has_confirmed_strong_spender (cold path only)
-    // wave_fill uses hybrid local-then-durable separately; connect keeps the
-    // durable-on path disk-backed so a stale local entry cannot mask a live UTXO.
+    // - spent_local: always recorded after successful Class C
+    // - durable has_confirmed_strong_spender when spend_index on
+    // Tip/wave "live" only skips durable when neither local nor durable marks spent.
     let spend_index_on = query.spend_index_enabled();
-    let spent_local = if spend_index_on {
-        None
-    } else {
-        Some(query.lock_spent_local())
-    };
+    let spent_local = query.lock_spent_local();
 
     for (ti, tx) in block.txdata.iter().enumerate() {
         let spend_fk = archived_tx_fks.map(|fks| fks[ti]);
@@ -464,10 +458,8 @@ pub(crate) fn connect_block_prevouts(
                 if pending_spent.contains(&key) {
                     return Err(ConsensusError::PrevoutSpent);
                 }
-                if let Some(ref local) = spent_local {
-                    if local.contains(&key) {
-                        return Err(ConsensusError::PrevoutSpent);
-                    }
+                if spent_local.contains(&key) {
+                    return Err(ConsensusError::PrevoutSpent);
                 }
                 let prev_fk = thin
                     .as_ref()
@@ -480,9 +472,10 @@ pub(crate) fn connect_block_prevouts(
                             .and_then(|inp| inp.prev_tx_fk.get())
                             .map(rbitcoin_primitives::Fk)
                     });
-                // Durable spent probe only when outpoint is **not** cached as live.
-                // Key by **wire txid** so a wrong prev_tx_fk cannot skip the check
-                // via a different parent's live slot in the wave map.
+                // Durable spent probe (spend_index on). Tip/wave live is a
+                // performance hint only after local miss — still verify durable
+                // when not tip-live (cold parents). When tip-live, write-through
+                // retirement after Class C keeps the slot absent if spent.
                 if spend_index_on {
                     let cached_live = wave_prevouts
                         .map(|w| w.has_live_output_txid(op.txid.as_byte_array(), op.vout))

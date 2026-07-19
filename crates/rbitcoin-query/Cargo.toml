@@ -9,6 +9,7 @@ description = "Query API over the rbitcoin store"
 [dependencies]
 rbitcoin-primitives = { workspace = true }
 rbitcoin-store = { workspace = true }
+rbitcoin-log = { workspace = true }
 bitcoin = { workspace = true }
 
 [lints]

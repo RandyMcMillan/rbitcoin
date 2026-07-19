@@ -191,15 +191,21 @@ impl Query {
                 );
 
                 if !sh_creates.is_empty() {
-                    let mut heads = self.sh_heads.lock().unwrap();
-                    let (_fks, timing) = self
-                        .store
-                        .scripthash
-                        .put_create_batch_append(&sh_creates, &mut heads)?;
-                    add_sh_part(&sh_stats::SH_SORT_NS, timing.sort_ns);
-                    add_sh_part(&sh_stats::SH_SEED_NS, timing.seed_ns);
-                    add_sh_part(&sh_stats::SH_BODY_NS, timing.body_ns);
-                    add_sh_part(&sh_stats::SH_HEAD_NS, timing.head_ns);
+                    if self.sh_run.is_enabled() {
+                        // Catch-up: enqueue only (sequential runs + low-prio worker).
+                        // No durable scripthash.head seed/head RMW on confirm.
+                        self.sh_run.enqueue(&sh_creates);
+                    } else {
+                        let mut heads = self.sh_heads.lock().unwrap();
+                        let (_fks, timing) = self
+                            .store
+                            .scripthash
+                            .put_create_batch_append(&sh_creates, &mut heads)?;
+                        add_sh_part(&sh_stats::SH_SORT_NS, timing.sort_ns);
+                        add_sh_part(&sh_stats::SH_SEED_NS, timing.seed_ns);
+                        add_sh_part(&sh_stats::SH_BODY_NS, timing.body_ns);
+                        add_sh_part(&sh_stats::SH_HEAD_NS, timing.head_ns);
+                    }
                 }
                 if !sh_new_txs.is_empty() {
                     let t_idx = std::time::Instant::now();

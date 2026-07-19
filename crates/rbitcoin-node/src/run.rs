@@ -156,11 +156,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             milestone.height
         );
     }
-    // Thin scripthash creates (outpoint pointers) always written on Class C.
-    // Spentness is joined from points + Class C at Electrum query time — no
-    // per-spend scripthash RMW (that used to stall confirm).
-    // Direct head writes (no overlay); SH runs in parallel with strong/height.
-    info!("ibd: thin scripthash creates always ON (confirm path; direct head writes)");
+    // Thin scripthash creates: during catch-up, enqueue to sorted runs (background
+    // low-prio flush/merge) instead of durable scripthash.head RMW on confirm.
+    // Materialized into serve tables in enter_tip_mode before Electrum.
+    handle.query.enable_sh_run_mode();
+    info!(
+        "ibd: thin scripthash catch-up via sorted runs (no durable SH head on confirm; materialize at tip mode)"
+    );
     // Point spends: durable multimap off under milestone (archive + confirm). Confirm
     // still tracks spends process-locally for double-spend checks; durable points
     // are backfilled in enter_tip_mode before Electrum starts.
@@ -761,9 +763,12 @@ pub(crate) fn enter_tip_mode(query: &Query) {
         );
     }
 
-    // Scripthash is always maintained on confirm (thin creates). No tip-mode
-    // rebuild: corrupt/missing index ⇒ reindex like any other table. Rows for
-    // unstrong creates are invisible via is_confirmed_strong (kill -9 / reorg).
+    // Materialize catch-up SH runs into durable scripthash tables (one-time).
+    // Tip-follow after this uses durable put_create_batch_append again.
+    match query.finalize_sh_runs() {
+        Ok(n) => info!("node: scripthash run materialize inserted≈{n}"),
+        Err(e) => warn!("node: scripthash run materialize failed: {e}"),
+    }
     info!(
         "node: scripthash rows={} (thin creates; spentness via points)",
         query.scripthash_entry_count()

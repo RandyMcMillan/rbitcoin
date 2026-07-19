@@ -257,6 +257,11 @@ impl PointTable {
         self.head.spill_write_behind()
     }
 
+    /// Single-apply spill for process exit.
+    pub fn spill_head_fast(&self) -> Result<(), StoreError> {
+        self.head.spill_write_behind_fast()
+    }
+
     /// Budgeted spill: at most `max_entries` keys (archive interleave / background).
     pub fn spill_head_budget(&self, max_entries: usize) -> Result<usize, StoreError> {
         self.head.spill_write_behind_budget(max_entries)
@@ -286,6 +291,13 @@ impl PointTable {
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.body.flush_async()?;
         self.head.flush_async()?;
+        Ok(())
+    }
+
+    /// Body + head files MS_ASYNC after a prior fast spill (no second spill storm).
+    pub fn flush_async_no_spill(&self) -> Result<(), StoreError> {
+        self.body.flush_async()?;
+        self.head.flush_async_no_spill()?;
         Ok(())
     }
 }

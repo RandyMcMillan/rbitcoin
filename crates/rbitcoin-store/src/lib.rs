@@ -22,7 +22,8 @@ mod var_table;
 pub use epoch::ArchiveEpoch;
 pub use error::StoreError;
 pub use file::{
-    ensure_nofile_budget, ensure_nofile_budget_at_least, try_set_io_idle, NOFILE_SOFT_TARGET,
+    ensure_nofile_budget, ensure_nofile_budget_at_least, try_set_io_best_effort, try_set_io_idle,
+    NOFILE_SOFT_TARGET,
 };
 pub use hashhead::{
     initial_slots_for, HeadRole, HeadScale, DEFAULT_WRITE_BEHIND_CAP,

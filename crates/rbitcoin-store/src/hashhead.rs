@@ -632,8 +632,13 @@ impl HashHead {
         self.file.flush()
     }
 
+    #[allow(dead_code)] // used via ShardedHashHead facade / tests
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.spill_write_behind()?;
+        self.flush_async_no_spill()
+    }
+
+    pub fn flush_async_no_spill(&self) -> Result<(), StoreError> {
         self.file.flush_async()
     }
 }

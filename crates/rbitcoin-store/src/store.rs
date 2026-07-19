@@ -244,6 +244,10 @@ impl Store {
         self.points.spill_head()
     }
 
+    pub fn spill_point_head_fast(&self) -> Result<(), StoreError> {
+        self.points.spill_head_fast()
+    }
+
     pub fn spill_point_head_budget(&self, max_entries: usize) -> Result<usize, StoreError> {
         self.points.spill_head_budget(max_entries)
     }
@@ -269,6 +273,10 @@ impl Store {
 
     pub fn spill_tx_head(&self) -> Result<(), StoreError> {
         self.txs.spill_head()
+    }
+
+    pub fn spill_tx_head_fast(&self) -> Result<(), StoreError> {
+        self.txs.spill_head_fast()
     }
 
     pub fn spill_tx_head_budget(&self, max_entries: usize) -> Result<usize, StoreError> {
@@ -477,23 +485,26 @@ impl Store {
         Ok(())
     }
 
-    /// Host-friendly process-exit flush (IBD / SIGTERM).
+    /// Process-exit flush (IBD / SIGTERM). Target: seconds, not minutes.
     ///
-    /// 1. Spill remaining `point.head` / `tx.head` write-behind (chunked + logged).
-    /// 2. Fully fsync **small/critical** tip tables (headers, Class C, header_txs).
-    /// 3. `MS_ASYNC` only on multi‑GiB Class A bodies/heads — dirty pages write back
-    ///    as the process exits without multi-minute UI freezes.
+    /// 1. **Fast** spill of head overlays (single apply each — not 32k chunks).
+    /// 2. Fsync tip / Class C tables only.
+    /// 3. MS_ASYNC Class A bodies **without** a second head spill.
+    ///
+    /// Caller must stop the archive writer first so it does not refill overlays
+    /// mid-spill (that caused a second ~3 min point spill on the old path).
     pub fn flush_for_shutdown(&self) -> Result<(), StoreError> {
+        crate::file::try_set_io_best_effort();
         let t0 = std::time::Instant::now();
+        let pp = self.points.head_write_behind_len();
+        let tp = self.txs.head_write_behind_len();
         rbitcoin_log::info!(
-            "store: shutdown flush — spilling head overlays (point pending≈{} tx pending≈{})…",
-            self.points.head_write_behind_len(),
-            self.txs.head_write_behind_len()
+            "store: shutdown flush — FAST spill heads (point pending≈{pp} tx pending≈{tp})…"
         );
-        self.points.spill_head()?;
-        self.txs.spill_head()?;
+        self.points.spill_head_fast()?;
+        self.txs.spill_head_fast()?;
         rbitcoin_log::info!(
-            "store: shutdown flush — fsync tip tables (headers/Class C)… elapsed={:?}",
+            "store: shutdown flush — fsync tip tables… elapsed={:?}",
             t0.elapsed()
         );
         self.headers.flush()?;
@@ -502,13 +513,15 @@ impl Store {
         self.tx_height.flush()?;
         self.header_txs.flush()?;
         rbitcoin_log::info!(
-            "store: shutdown flush — async Class A tables… elapsed={:?}",
+            "store: shutdown flush — async Class A (no re-spill)… elapsed={:?}",
             t0.elapsed()
         );
-        self.txs.flush_async()?;
+        // Bodies only + head files already spilled — never call flush_async on
+        // points/txs (that re-spilled the whole overlay again).
+        self.txs.flush_async_no_spill()?;
         self.inputs.flush_async()?;
         self.outputs.flush_async()?;
-        self.points.flush_async()?;
+        self.points.flush_async_no_spill()?;
         self.scripthash.flush_async()?;
         rbitcoin_log::info!(
             "store: shutdown flush done elapsed={:?}",

@@ -262,38 +262,53 @@ impl ShardedHashHead {
 
     /// Spill **all** pending overlay entries (chunked + yield between chunks).
     ///
-    /// Used by disable / process-exit flush. Prefer [`Self::spill_write_behind_budget`]
-    /// on the IBD hot path. Yields longer than 1 ms so host UI can breathe.
+    /// Runtime / disable path. Prefer [`Self::spill_write_behind_fast`] on process
+    /// exit — chunked+sleep was multi‑minute mid-IBD (hundreds of k keys).
     pub fn spill_write_behind(&self) -> Result<(), StoreError> {
         let chunk = spill_chunk_size();
-        let mut total = 0u64;
-        let t0 = Instant::now();
         loop {
-            let n = self.spill_write_behind_budget(chunk)?;
-            if n == 0 {
+            if self.spill_write_behind_budget(chunk)? == 0 {
                 break;
             }
-            total = total.saturating_add(n as u64);
-            // Host-friendly: give the page cache / compositor a turn.
             std::thread::sleep(Duration::from_millis(10));
-            if total > 0 && total.is_multiple_of(chunk as u64 * 4) {
-                rbitcoin_log::info!(
-                    "store: head spill progress path={} spilled={} remain={} elapsed={:?}",
-                    self.path.display(),
-                    total,
-                    self.write_behind_len(),
-                    t0.elapsed()
-                );
+        }
+        Ok(())
+    }
+
+    /// Drain the entire overlay in **one** disk apply (no sleeps).
+    ///
+    /// Used on process exit: one rehash/apply beats hundreds of 32k chunks with
+    /// yields (logs showed ~7 min for ~1.5M keys under chunked spill).
+    pub fn spill_write_behind_fast(&self) -> Result<(), StoreError> {
+        let batch = {
+            let mut guard = self.overlay.lock().unwrap();
+            let Some(ov) = guard.as_mut() else {
+                return Ok(());
+            };
+            if ov.map.is_empty() {
+                return Ok(());
             }
+            let batch: Vec<([u8; 32], Fk)> = ov.map.drain().collect();
+            batch
+        };
+        if batch.is_empty() {
+            return Ok(());
         }
-        if total > 0 {
-            rbitcoin_log::info!(
-                "store: head spill done path={} spilled={} elapsed={:?}",
-                self.path.display(),
-                total,
-                t0.elapsed()
-            );
-        }
+        let n = batch.len();
+        let t0 = Instant::now();
+        rbitcoin_log::info!(
+            "store: head spill FAST path={} entries={} (single apply)",
+            self.path.display(),
+            n
+        );
+        self.insert_many_disk(&batch)?;
+        self.note_spill(n);
+        rbitcoin_log::info!(
+            "store: head spill FAST done path={} entries={} elapsed={:?}",
+            self.path.display(),
+            n,
+            t0.elapsed()
+        );
         Ok(())
     }
 
@@ -514,8 +529,13 @@ impl ShardedHashHead {
     /// Spill remaining overlay + MS_ASYNC each shard (no fdatasync).
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.spill_write_behind()?;
+        self.flush_async_no_spill()
+    }
+
+    /// MS_ASYNC shard files only — **no** overlay spill (caller already spilled).
+    pub fn flush_async_no_spill(&self) -> Result<(), StoreError> {
         for s in &self.shards {
-            s.flush_async()?;
+            s.flush_async_no_spill()?;
         }
         Ok(())
     }
@@ -618,6 +638,20 @@ mod tests {
         key[0] = (i % 256) as u8;
         key[8..16].copy_from_slice(&i.to_le_bytes());
         key
+    }
+
+    #[test]
+    fn fast_spill_drains_entire_overlay_in_one_shot() {
+        let dir = tmp_dir();
+        let h = ShardedHashHead::create_sharded(dir.join("head"), 16, 64).unwrap();
+        h.enable_write_behind(10_000).unwrap();
+        let batch: Vec<_> = (0u64..400).map(|i| (key_i(i), Fk(i + 1))).collect();
+        h.insert_many(&batch).unwrap();
+        assert_eq!(h.write_behind_len(), 400);
+        h.spill_write_behind_fast().unwrap();
+        assert_eq!(h.write_behind_len(), 0);
+        assert_eq!(h.occupied(), 400);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

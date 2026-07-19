@@ -1231,9 +1231,17 @@ pub async fn parallel_ibd_cancellable(
         h.abort();
     }
 
-    // Close archive ingress; abort pipeline task (prep/writer exit on channel close).
+    // Close archive ingress and **await** the pipeline so prep+writer OS threads
+    // join. `abort()` used to kill the task before that join — writer kept
+    // inserting heads during shutdown flush (second multi-minute point spill).
     drop(arch_job_tx);
-    pipeline.abort();
+    match tokio::time::timeout(Duration::from_secs(90), pipeline).await {
+        Ok(Ok(())) => info!("ibd: archive pipeline stopped cleanly"),
+        Ok(Err(e)) => warn!("ibd: archive pipeline join: {e}"),
+        Err(_) => warn!(
+            "ibd: archive pipeline still running after 90s — shutdown flush may race writer"
+        ),
+    }
     // Best-effort drain of results already in the channel (non-blocking).
     while let Ok(r) = arch_res_rx.try_recv() {
         match r {

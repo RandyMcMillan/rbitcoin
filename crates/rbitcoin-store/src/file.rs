@@ -316,6 +316,21 @@ pub fn try_set_io_idle() {
     }
 }
 
+/// Best-effort: best-effort I/O class, highest priority within class (shutdown spill).
+pub fn try_set_io_best_effort() {
+    #[cfg(target_os = "linux")]
+    {
+        const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+        const IOPRIO_CLASS_BE: libc::c_int = 2;
+        // class BE, level 0 (highest within BE)
+        let prio = (IOPRIO_CLASS_BE << 13) as libc::c_int;
+        let rc = unsafe { libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, prio) };
+        if rc == 0 {
+            rbitcoin_log::debug!("store: set IOPRIO_CLASS_BE (high) on thread");
+        }
+    }
+}
+
 /// Soft floor for process open-file limit with 256-way sharded hash heads.
 ///
 /// Four heads × 256 shards = 1024 FDs before bodies, wire, peers, etc.

@@ -284,9 +284,8 @@ pub fn validate_block_connect(
     if check_scripts && !script_jobs.is_empty() {
         verify_scripts_pool(&script_jobs)?;
     }
-    if !query.spend_index_enabled() {
-        query.note_outpoints_spent_local(&spends);
-    }
+    // Always note local spends after success (hybrid wave_fill / is_outpoint_spent).
+    query.note_outpoints_spent_local(&spends);
     Ok(())
 }
 
@@ -394,9 +393,11 @@ pub(crate) fn connect_block_prevouts(
 
     // Spent checks:
     // - pending_spent: this confirm run
-    // - spent_local: process set when durable points are off
+    // - spent_local: process set when durable points are off (hold one lock)
     // - wave / tip_prevout live slot: write-through unspent (no disk)
     // - else durable has_confirmed_strong_spender (cold path only)
+    // wave_fill uses hybrid local-then-durable separately; connect keeps the
+    // durable-on path disk-backed so a stale local entry cannot mask a live UTXO.
     let spend_index_on = query.spend_index_enabled();
     let spent_local = if spend_index_on {
         None

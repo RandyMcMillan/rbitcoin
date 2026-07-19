@@ -184,7 +184,8 @@ pub struct ResumeWorkEntry {
 pub struct Query {
     store: Store,
     /// When false, archive **and** confirm skip durable Class B point (spend) writes.
-    /// Confirm still tracks spends in [`Self::spent_local`] for double-spend checks.
+    /// Confirm always tracks spends in [`Self::spent_local`] (hybrid wave_fill /
+    /// double-spend checks); durable probes run only on local miss when this is on.
     /// Re-enable + [`Self::backfill_point_spends`] after catch-up (before Electrum).
     spend_index: std::sync::atomic::AtomicBool,
     /// When false, archive skips durable `tx.head` inserts (main archive cost).
@@ -479,17 +480,21 @@ impl Query {
 }
 
 impl Query {
-    /// True if this outpoint is spent on the **best chain** (durable strong
-    /// points and/or process-local set used while durable index is off during IBD).
+    /// True if this outpoint is spent on the **best chain** (process-local set
+    /// and/or durable strong points).
+    ///
+    /// **Hybrid order:** local set first (no disk), then durable `point.head`
+    /// when the spend index is enabled. Confirm always records local spends
+    /// after successful Class C so wave_fill can short-circuit known spends.
     ///
     /// Does **not** treat archive-only point rows as spent: Class A may write
     /// edges before Class C; those spenders are not strong yet.
     pub fn is_outpoint_spent(&self, txid: &[u8; 32], vout: u32) -> Result<bool, QueryError> {
-        // Local set first (IBD hot path) — avoid multimap probes when empty.
+        // Local set first (IBD hot path) — avoid multimap probes on known spends.
         if self.spent_local.lock().unwrap().contains(&(*txid, vout)) {
             return Ok(true);
         }
-        // When durable index is off (milestone catch-up), do not touch point.head.
+        // When durable index is off (milestone catch-up), local is authoritative.
         if !self.spend_index_enabled() {
             return Ok(false);
         }
@@ -507,7 +512,8 @@ impl Query {
         self.spent_local.lock().unwrap()
     }
 
-    /// Record a spend in the process-local set (IBD / spend_index off).
+    /// Record a spend in the process-local set (always, including when durable
+    /// points are on — enables hybrid local-then-durable wave_fill probes).
     pub fn note_outpoint_spent_local(&self, txid: [u8; 32], vout: u32) {
         self.spent_local.lock().unwrap().insert((txid, vout));
     }

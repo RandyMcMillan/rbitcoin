@@ -53,7 +53,8 @@ impl Query {
     /// Cold-start correctness (vs earlier wave_fill experiments):
     /// - Tip short-circuit only when **every** needed vout is already live in tip
     /// - External parents are **sorted by fk** and bulk-warmed (tx + outs) then
-    ///   spent-filtered; missing unspent outs re-load from store (no holes)
+    ///   spent-filtered (**local then durable**); missing unspent outs re-load
+    ///   from store (no holes)
     /// - Live slots are promoted into tip_prevout for the next wave only after
     ///   spent filter (merge never clears existing lives; refuses txid mismatch)
     ///
@@ -148,42 +149,53 @@ impl Query {
         }
         let mut works: Vec<ParentWork> = Vec::with_capacity(parents.len());
 
+        // One local-spent lock for tip short-circuit + hybrid filter (not held
+        // across Class A loads).
+        let local_spent = self.spent_local.lock().unwrap();
+
         for (pid, needed_vouts) in &parents {
             let fk = Fk(*pid);
 
-            // Tip short-circuit only when **complete** (all needed live).
+            // Tip short-circuit only when **complete** (all needed live) and none
+            // are process-local spent (local wins over a stale tip live slot).
             let tip_complete = !needed_vouts.is_empty()
                 && needed_vouts
                     .iter()
                     .all(|&v| self.tip_prevout_cache.has_live_output(fk, v));
             if tip_complete {
                 if let Some(tx) = self.tip_prevout_cache.get_tx(fk) {
-                    let n = tx.output_count as usize;
-                    let mut slots: Vec<Option<OutputRecord>> = vec![None; n];
-                    let mut ok = true;
-                    for &v in needed_vouts {
-                        match self.tip_prevout_cache.get_output_at(fk, v) {
-                            Some(o) if (v as usize) < slots.len() => {
-                                slots[v as usize] = Some(o);
-                            }
-                            _ => {
-                                ok = false;
-                                break;
+                    let local_blocks = needed_vouts
+                        .iter()
+                        .any(|&v| local_spent.contains(&(tx.txid, v)));
+                    if !local_blocks {
+                        let n = tx.output_count as usize;
+                        let mut slots: Vec<Option<OutputRecord>> = vec![None; n];
+                        let mut ok = true;
+                        for &v in needed_vouts {
+                            match self.tip_prevout_cache.get_output_at(fk, v) {
+                                Some(o) if (v as usize) < slots.len() => {
+                                    slots[v as usize] = Some(o);
+                                }
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
                             }
                         }
-                    }
-                    if ok {
-                        let t_cb = Instant::now();
-                        let cb_h = self.coinbase_height_for_tx(fk, &tx)?;
-                        wf_add(&wf::CB_HEIGHT_NS, t_cb.elapsed().as_nanos() as u64);
-                        wave.insert_parent_slots(fk, tx, slots, Some(cb_h));
-                        noted += 1;
-                        continue;
+                        if ok {
+                            let t_cb = Instant::now();
+                            let cb_h = self.coinbase_height_for_tx(fk, &tx)?;
+                            wf_add(&wf::CB_HEIGHT_NS, t_cb.elapsed().as_nanos() as u64);
+                            wave.insert_parent_slots(fk, tx, slots, Some(cb_h));
+                            noted += 1;
+                            continue;
+                        }
                     }
                 }
             }
 
             // Bulk warm: tx then outs (sorted parent loop ⇒ sequential-ish store).
+            // Confirm is a single OS thread; spent_local is not contended here.
             let t_tx = Instant::now();
             let tx = self.get_tx_class_a(fk)?;
             wf_add(&wf::PARENT_TX_NS, t_tx.elapsed().as_nanos() as u64);
@@ -221,12 +233,17 @@ impl Query {
             }
             wf_add(&wf::PARENT_OUT_NS, t_out.elapsed().as_nanos() as u64);
 
-            // Partial tip cover: live tip slots skip durable spent (write-through).
+            // Partial tip cover: live tip slots skip durable spent (write-through)
+            // unless process-local already marked spent.
             let mut slots: Vec<Option<OutputRecord>> = vec![None; n];
             let mut need_spent = Vec::with_capacity(needed_vouts.len());
             for &v in needed_vouts {
                 let vi = v as usize;
                 if vi >= n {
+                    continue;
+                }
+                if local_spent.contains(&(tx.txid, v)) {
+                    // Spent locally — leave slot None; no durable probe.
                     continue;
                 }
                 if self.tip_prevout_cache.has_live_output(fk, v) {
@@ -249,34 +266,36 @@ impl Query {
             });
         }
 
-        // Batch spent probes sorted by point.head key (shard then slot locality).
-        // (work_idx, vout, outpoint_key)
-        let mut probes: Vec<(usize, u32, [u8; 32])> = Vec::new();
+        // Spent filter for remaining need_spent (local already applied above for
+        // known spends; only durable remains when spend_index is on).
+
+        // Durable probes only for need_spent (local spends already omitted above).
+        // Sorted by outpoint key for point.head shard locality.
+        let t_sp_all = Instant::now();
+        let mut spent_flags: HashMap<(usize, u32), bool> =
+            HashMap::with_capacity(works.iter().map(|w| w.need_spent.len()).sum());
+        let mut durable_probes: Vec<(usize, u32, [u8; 32])> = Vec::new();
         for (wi, w) in works.iter().enumerate() {
             for &v in &w.need_spent {
-                let key = rbitcoin_store::PointRecord::outpoint_key(&w.tx.txid, v);
-                probes.push((wi, v, key));
+                // Belt-and-suspenders: local may have been updated (shouldn't).
+                if local_spent.contains(&(w.tx.txid, v)) {
+                    spent_flags.insert((wi, v), true);
+                } else if spend_index_on {
+                    let key = rbitcoin_store::PointRecord::outpoint_key(&w.tx.txid, v);
+                    durable_probes.push((wi, v, key));
+                } else {
+                    spent_flags.insert((wi, v), false);
+                }
             }
         }
-        probes.sort_unstable_by(|a, b| a.2.cmp(&b.2));
-
-        let t_sp_all = Instant::now();
-        // Results: (work_idx, vout) → spent
-        let mut spent_flags: HashMap<(usize, u32), bool> =
-            HashMap::with_capacity(probes.len());
-        if spend_index_on {
+        drop(local_spent);
+        if !durable_probes.is_empty() {
+            durable_probes.sort_unstable_by(|a, b| a.2.cmp(&b.2));
             // One tip snapshot for the whole batch (was re-read per outpoint).
             let tip = self.store.confirmed.tip_height().map(|t| t.0);
-            for &(wi, v, ref key) in &probes {
+            for &(wi, v, ref key) in &durable_probes {
                 let spent = self.store.has_confirmed_strong_spender_key(key, tip)?;
                 spent_flags.insert((wi, v), spent);
-            }
-        } else {
-            let local = self.spent_local.lock().unwrap();
-            for (wi, w) in works.iter().enumerate() {
-                for &v in &w.need_spent {
-                    spent_flags.insert((wi, v), local.contains(&(w.tx.txid, v)));
-                }
             }
         }
         wf_add(&wf::SPENT_NS, t_sp_all.elapsed().as_nanos() as u64);

@@ -438,12 +438,13 @@ pub fn confirm_archived_run(
         all_spends.extend_from_slice(&p.spends);
     }
 
-    if !query.spend_index_enabled() {
-        let t_spent = Instant::now();
-        query.note_outpoints_spent_local(&all_spends);
-        confirm_phase_stats::SPENT_LOCAL_NS
-            .fetch_add(t_spent.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    }
+    // Always record process-local spends after successful Class C — even when
+    // durable points are on — so wave_fill / is_outpoint_spent can skip
+    // point.head probes on local hits (hybrid local-then-durable).
+    let t_spent = Instant::now();
+    query.note_outpoints_spent_local(&all_spends);
+    confirm_phase_stats::SPENT_LOCAL_NS
+        .fetch_add(t_spent.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
     // Only after successful Class C: drop spent vouts from tip_prevout so the
     // FIFO budget holds unspent creates / parents, not dead shells.

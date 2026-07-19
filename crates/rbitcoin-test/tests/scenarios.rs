@@ -950,6 +950,93 @@ fn resume_head_off_warms_cache_for_external_prev() {
     }
 }
 
+/// wave_fill hybrid: process-local spent short-circuits durable point.head probes.
+///
+/// Archive may already have a point edge for a not-yet-confirmed spend (not
+/// strong). Local spent must still suppress the parent live slot so recon
+/// does not treat the outpoint as unspent.
+#[test]
+fn wave_fill_hybrid_local_spent_before_durable() {
+    use rbitcoin_consensus::{
+        accept_and_archive_block, accept_and_connect_block, ChainParams, Milestone,
+    };
+    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.set_spend_index(true);
+    q.set_tx_index(true);
+    let ms = Milestone::NONE;
+    let params = ChainParams::regtest();
+    let maturity = params.coinbase_maturity();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+    let cb1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+
+    let last_pad = maturity + 1;
+    for h in 2..=last_pad {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+
+    let spend_h = last_pad + 1;
+    let spend = spend_anyone_can_spend(cb1, 0, bitcoin::Amount::from_sat(49_0000_0000));
+    let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
+    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
+    let spend_hash = b_spend.block_hash().to_byte_array();
+
+    // Archive wrote a point edge, but spender is not strong yet → durable says unspent.
+    assert!(
+        !q.store()
+            .has_confirmed_strong_spender(cb1.as_byte_array(), 0)
+            .unwrap(),
+        "pre-confirm archive edge must not count as confirmed-strong spent"
+    );
+
+    q.prefetch_class_a_for_block_hashes(&[spend_hash]).unwrap();
+
+    // Without local: wave_fill should expose the parent as live.
+    let (_n, wave_live) = q
+        .prefetch_tip_prevouts_for_block_hashes(&[spend_hash])
+        .unwrap();
+    assert!(
+        wave_live.has_live_output_txid(cb1.as_byte_array(), 0),
+        "unspent parent must be live before local spent is noted"
+    );
+
+    // Hybrid A: local spent wins even while tip_prevout still has a live slot
+    // (stale tip vs process-local — local is authoritative).
+    q.note_outpoint_spent_local(cb1.to_byte_array(), 0);
+    assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
+    let (_n, wave_stale_tip) = q
+        .prefetch_tip_prevouts_for_block_hashes(&[spend_hash])
+        .unwrap();
+    assert!(
+        !wave_stale_tip.has_live_output_txid(cb1.as_byte_array(), 0),
+        "local spent must beat stale tip-live short-circuit"
+    );
+
+    // Hybrid B: need_spent path after tip retirement (confirm pairs note+retire).
+    q.retire_tip_prevout_spends(&[(cb1.to_byte_array(), 0)]);
+    let (_n, wave_spent) = q
+        .prefetch_tip_prevouts_for_block_hashes(&[spend_hash])
+        .unwrap();
+    assert!(
+        !wave_spent.has_live_output_txid(cb1.as_byte_array(), 0),
+        "local spent must suppress parent live slot without durable strong"
+    );
+}
+
 /// Sequential confirm_archived_run + failed confirm must not poison spent_local.
 #[test]
 fn confirm_run_sequential_and_failed_no_spend_poison() {

@@ -229,7 +229,7 @@ pub(crate) fn spawn_archive_pipeline(
     stats: Arc<ArchivePipelineStats>,
     archive_queued: Arc<ArchiveQueueBudget>,
     confirm_lag: Arc<AtomicU32>,
-    /// Cooperative stop (SIGINT): exit after current write batch; drop queue.
+    // Cooperative stop (SIGINT): exit after current write batch; drop queue.
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {

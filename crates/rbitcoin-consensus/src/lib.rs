@@ -221,6 +221,10 @@ pub fn confirm_archived_run(
     if blocks.is_empty() {
         return Ok(Vec::new());
     }
+    // Core double-spend: local-only oracle must be complete before any confirm.
+    query
+        .ensure_spent_oracle_ready()
+        .map_err(ConsensusError::Store)?;
     for w in blocks.windows(2) {
         if w[1].0 .0 != w[0].0 .0.saturating_add(1) {
             return Err(ConsensusError::BadBlock("confirm run not contiguous"));

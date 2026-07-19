@@ -6,8 +6,10 @@ mod class_a_cache;
 mod connect;
 mod reconstruct;
 mod scripthash;
+mod point_run_builder;
 mod sh_builder;
 mod tip_prevout_cache;
+mod tx_run_builder;
 mod wave_prevout;
 
 use bitcoin::absolute::LockTime;
@@ -195,9 +197,13 @@ pub struct Query {
     /// Process-local txid → fk for all txs archived this process (and warmed from head).
     /// Enables prevout resolution when durable `tx.head` is off (milestone IBD).
     txid_to_fk: Mutex<HashMap<[u8; 32], Fk>>,
-    /// Process-local spent outpoints when durable point index is off (IBD confirm path).
-    /// Key: (prev_txid, prev_vout). Cleared after [`Self::backfill_point_spends`].
+    /// Process-local spent outpoints for best-chain tip (Core spentness when
+    /// durable `point.head` probes are off). Key: (prev_txid, prev_vout).
+    /// Must be **complete** for heights 0..=tip before any confirm when
+    /// [`Self::spend_index_enabled`] is false — see [`Self::spent_local_ready`].
     spent_local: Mutex<HashSet<([u8; 32], u32)>>,
+    /// When false and spend index is off, confirm is hard-blocked (no double-spend hole).
+    spent_local_ready: std::sync::atomic::AtomicBool,
     /// Process-local scripthash → body head fk (confirm append path; avoids durable chain walks).
     sh_heads: Mutex<HashMap<[u8; 32], Fk>>,
     /// Create txs with durable thin SH rows (skip re-put). Warmed once from body after open
@@ -213,6 +219,10 @@ pub struct Query {
     tip_prevout_cache: tip_prevout_cache::TipPrevoutCache,
     /// Catch-up SH: memtable → sorted runs (no durable head on confirm).
     sh_run: sh_builder::ShRunBuilder,
+    /// Catch-up tx.head via sorted runs.
+    tx_run: tx_run_builder::TxRunBuilder,
+    /// Catch-up point edges via sorted runs.
+    point_run: point_run_builder::PointRunBuilder,
 }
 
 impl Query {
@@ -228,37 +238,134 @@ impl Query {
             );
         }
         let store_path = store.path().to_path_buf();
+        // Empty tip → local is vacuously complete. Non-empty tip needs rebuild
+        // before local-only spentness (spend_index off) may confirm.
+        let tip_empty = store.tip_height().is_none();
         let q = Self {
             store,
             spend_index: std::sync::atomic::AtomicBool::new(true),
             tx_index: std::sync::atomic::AtomicBool::new(true),
             txid_to_fk: Mutex::new(HashMap::new()),
             spent_local: Mutex::new(HashSet::new()),
+            spent_local_ready: std::sync::atomic::AtomicBool::new(tip_empty),
             sh_heads: Mutex::new(HashMap::new()),
             sh_tx_indexed: Mutex::new(HashSet::new()),
             sh_tx_indexed_warmed: std::sync::atomic::AtomicBool::new(false),
             class_a_cache: class_a_cache::ClassACache::from_env(),
             tip_prevout_cache: tip_prevout_cache::TipPrevoutCache::from_env(),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
+            tx_run: tx_run_builder::TxRunBuilder::new(&store_path),
+            point_run: point_run_builder::PointRunBuilder::new(&store_path),
         };
         // Warm cache from durable head if present (resume with index on).
         // Full body scan is not done here; fresh genesis IBD fills cache as it archives.
         Ok(q)
     }
 
-    /// Catch-up: SH creates go to sorted runs (background flush/merge), not
-    /// durable `scripthash.head` RMW on the confirm path.
-    pub fn enable_sh_run_mode(&self) {
-        self.sh_run.enable();
+    /// True when process-local spent set may be used as the sole spentness oracle
+    /// (spend index off). Always true for genesis-empty tip after open.
+    pub fn spent_local_ready(&self) -> bool {
+        self.spent_local_ready
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    pub fn sh_run_mode(&self) -> bool {
-        self.sh_run.is_enabled()
+    /// Hard-block confirm when durable points are off and local is incomplete.
+    pub fn ensure_spent_oracle_ready(&self) -> Result<(), QueryError> {
+        if !self.spend_index_enabled() && !self.spent_local_ready() {
+            return Err(StoreError::Corrupt(
+                "spent_local not ready for local-only spentness; call rebuild_spent_local_to_tip",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Rebuild `spent_local` from **confirmed** chain heights 0..=tip (Class A).
+    ///
+    /// Core-safe: only confirmed inputs count. Must run after open/resume before
+    /// any confirm with spend index off. Sets [`Self::spent_local_ready`].
+    pub fn rebuild_spent_local_to_tip(&self) -> Result<u64, QueryError> {
+        self.spent_local_ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        let mut set = HashSet::new();
+        let Some(tip) = self.tip_height() else {
+            self.spent_local.lock().unwrap().clear();
+            self.spent_local_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Ok(0);
+        };
+        let mut n = 0u64;
+        for h in 0..=tip.0 {
+            let fks = match self.block_tx_fks(Height(h)) {
+                Ok(f) => f,
+                Err(StoreError::NotFound) => continue,
+                Err(e) => return Err(e),
+            };
+            for fk in fks {
+                let tx = self.store.get_tx(fk)?;
+                if tx.input_count == 0 {
+                    continue;
+                }
+                let inputs = self.tx_input_run(&tx)?;
+                for inp in &inputs {
+                    if inp.is_coinbase() {
+                        continue;
+                    }
+                    let prev_txid = self.resolve_prev_txid(inp)?;
+                    set.insert((prev_txid, inp.prev_index));
+                    n += 1;
+                }
+            }
+        }
+        *self.spent_local.lock().unwrap() = set;
+        self.spent_local_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(n)
+    }
+
+    /// Mark local spent set ready (e.g. empty chain after tests). Prefer
+    /// [`Self::rebuild_spent_local_to_tip`] after resume.
+    pub fn mark_spent_local_ready(&self) {
+        self.spent_local_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Catch-up: SH / tx / point durable open-hash off; sequential runs + local oracle.
+    pub fn enable_index_run_mode(&self) {
+        self.sh_run.enable();
+        self.tx_run.enable();
+        self.point_run.enable();
     }
 
     /// Flush/compact SH runs and bulk-load durable scripthash tables (tip mode).
     pub fn finalize_sh_runs(&self) -> Result<u64, QueryError> {
         self.sh_run.finalize_and_materialize(&self.store)
+    }
+
+    pub fn finalize_tx_runs(&self) -> Result<u64, QueryError> {
+        self.tx_run.finalize_and_materialize(&self.store)
+    }
+
+    pub fn finalize_point_runs(&self) -> Result<u64, QueryError> {
+        self.point_run.finalize_and_materialize(&self.store)
+    }
+
+    pub(crate) fn tx_run_enabled(&self) -> bool {
+        self.tx_run.is_enabled()
+    }
+
+    pub(crate) fn point_run_enabled(&self) -> bool {
+        self.point_run.is_enabled()
+    }
+
+    pub(crate) fn enqueue_tx_run(&self, txid: [u8; 32], fk: Fk) {
+        self.tx_run.enqueue(txid, fk);
+    }
+
+    pub(crate) fn enqueue_point_run_edges(
+        &self,
+        edges: &[( [u8; 32], u32, Fk, u32, u32)],
+    ) {
+        self.point_run.enqueue_batch(edges);
     }
 
     fn remember_txid(&self, txid: [u8; 32], fk: Fk) {
@@ -425,11 +532,20 @@ impl Query {
     }
 
     /// Enable/disable durable point (spend) multimap writes on archive **and** confirm
-    /// (default on). Off during milestone IBD for speed; re-enable and
-    /// [`Self::backfill_point_spends`] before Electrum / after catch-up.
+    /// (default on). Off during catch-up for speed; re-enable and materialize /
+    /// [`Self::backfill_point_spends`] before Electrum.
+    ///
+    /// Turning **off** with a non-empty tip clears [`Self::spent_local_ready`] so
+    /// confirm cannot proceed until [`Self::rebuild_spent_local_to_tip`].
+    /// Empty tip stays ready (vacuous spent set).
     pub fn set_spend_index(&self, enabled: bool) {
         self.spend_index
             .store(enabled, std::sync::atomic::Ordering::SeqCst);
+        if !enabled {
+            let ready = self.tip_height().is_none();
+            self.spent_local_ready
+                .store(ready, std::sync::atomic::Ordering::Release);
+        }
     }
 
     pub fn spend_index_enabled(&self) -> bool {
@@ -546,6 +662,17 @@ impl Query {
         let mut g = self.spent_local.lock().unwrap();
         for &s in spends {
             g.insert(s);
+        }
+    }
+
+    /// Remove process-local spends (disconnect / reorg).
+    pub fn unnote_outpoints_spent_local(&self, spends: &[([u8; 32], u32)]) {
+        if spends.is_empty() {
+            return;
+        }
+        let mut g = self.spent_local.lock().unwrap();
+        for s in spends {
+            g.remove(s);
         }
     }
 

@@ -69,6 +69,7 @@ impl Query {
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        self.ensure_spent_oracle_ready()?;
         for w in items.windows(2) {
             if w[1].height.0 != w[0].height.0.saturating_add(1) {
                 return Err(StoreError::Corrupt("confirm run not contiguous heights"));
@@ -441,11 +442,32 @@ impl Query {
     }
 
     /// Disconnect the current tip (Class C + scripthash create unlink; archive remains).
+    ///
+    /// Also removes this tip’s spends from [`Self::spent_local`] so reorg cannot
+    /// leave false double-spend blocks under local-only spentness.
     pub fn disconnect_tip(&self) -> Result<(), QueryError> {
         let height = self
             .tip_height()
             .ok_or(StoreError::Corrupt("no tip to disconnect"))?;
         let tx_fks = self.block_tx_fks(height)?;
+
+        // Unspend process-local set before dropping Class C (Core reorg).
+        let mut unspends: Vec<([u8; 32], u32)> = Vec::new();
+        for &tx_fk in &tx_fks {
+            let tx = self.store.get_tx(tx_fk)?;
+            if tx.input_count == 0 {
+                continue;
+            }
+            let inputs = self.tx_input_run(&tx)?;
+            for inp in &inputs {
+                if inp.is_coinbase() {
+                    continue;
+                }
+                let prev_txid = self.resolve_prev_txid(inp)?;
+                unspends.push((prev_txid, inp.prev_index));
+            }
+        }
+        self.unnote_outpoints_spent_local(&unspends);
 
         let mut touched_sh: Vec<[u8; 32]> = Vec::new();
         for &tx_fk in &tx_fks {

@@ -1037,6 +1037,94 @@ fn wave_fill_hybrid_local_spent_before_durable() {
     );
 }
 
+/// Local-only spentness: double-spend reject, disconnect unspend, rebuild gate.
+#[test]
+fn spent_local_core_double_spend_and_disconnect() {
+    use rbitcoin_consensus::{
+        accept_and_connect_block, ChainParams, ConsensusError, Milestone,
+    };
+    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.set_spend_index(false);
+    q.set_tx_index(false);
+    assert!(q.spent_local_ready(), "empty tip must be ready");
+    let ms = Milestone::NONE;
+    let params = ChainParams::regtest();
+    let maturity = params.coinbase_maturity();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+    let cb1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+
+    let last_pad = maturity + 1;
+    for h in 2..=last_pad {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+
+    let spend_h = last_pad + 1;
+    let spend = spend_anyone_can_spend(cb1, 0, bitcoin::Amount::from_sat(49_0000_0000));
+    let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
+    accept_and_connect_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
+    assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
+
+    // Double-spend must fail (local oracle).
+    let spend2 = spend_anyone_can_spend(cb1, 0, bitcoin::Amount::from_sat(48_0000_0000));
+    let b_bad = mine_regtest_block(
+        b_spend.block_hash(),
+        b_spend.header.time + 600,
+        spend_h + 1,
+        vec![spend2],
+    );
+    let err = accept_and_connect_block(&q, &params, Height(spend_h + 1), &b_bad, ms);
+    assert!(
+        matches!(err, Err(ConsensusError::PrevoutSpent)),
+        "double-spend must be PrevoutSpent, got {err:?}"
+    );
+
+    // Disconnect tip unspends local.
+    q.disconnect_tip().unwrap();
+    assert_eq!(q.tip_height(), Some(Height(spend_h - 1)));
+    assert!(
+        !q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
+        "disconnect must clear local spend"
+    );
+
+    // Re-confirm original spend after disconnect.
+    accept_and_connect_block(&q, &params, Height(spend_h), &b_spend, ms)
+        .expect("re-confirm spend after disconnect");
+    assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
+
+    // Turning spend index off with non-empty tip clears ready → confirm blocked.
+    q.set_spend_index(true);
+    q.set_spend_index(false);
+    assert!(!q.spent_local_ready());
+    let blocked = accept_and_connect_block(&q, &params, Height(spend_h + 1), &b_bad, ms);
+    assert!(blocked.is_err(), "confirm blocked until rebuild");
+    q.rebuild_spent_local_to_tip().unwrap();
+    assert!(q.spent_local_ready());
+    assert!(
+        q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
+        "rebuild must restore spends from confirmed chain"
+    );
+    let err2 = accept_and_connect_block(&q, &params, Height(spend_h + 1), &b_bad, ms);
+    assert!(
+        matches!(err2, Err(ConsensusError::PrevoutSpent)),
+        "after rebuild double-spend still rejected, got {err2:?}"
+    );
+}
+
 /// Sequential confirm_archived_run + failed confirm must not poison spent_local.
 #[test]
 fn confirm_run_sequential_and_failed_no_spend_poison() {

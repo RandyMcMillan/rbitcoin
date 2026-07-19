@@ -485,6 +485,15 @@ impl TxTable {
         self.head.occupied()
     }
 
+    /// Bulk-insert head entries (sorted-run materialize / backfill helper).
+    pub fn head_insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.head.reserve_additional(entries.len() as u64)?;
+        self.head.insert_many(entries)
+    }
+
     /// Enable process-local write-behind on `tx.head` (optional IBD path).
     pub fn enable_head_write_behind(&self, max_entries: usize) -> Result<(), StoreError> {
         self.head.enable_write_behind(max_entries)

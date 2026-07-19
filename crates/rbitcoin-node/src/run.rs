@@ -152,69 +152,43 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let milestone = config.milestone();
     if milestone.height > 0 {
         info!(
-            "ibd: milestone height={} (script/sig checks skipped at/below; prevouts always; durable points deferred until tip mode)",
+            "ibd: milestone height={} (script/sig checks skipped at/below; prevouts always)",
             milestone.height
         );
     }
-    // Thin scripthash creates: during catch-up, enqueue to sorted runs (background
-    // low-prio flush/merge) instead of durable scripthash.head RMW on confirm.
-    // Materialized into serve tables in enter_tip_mode before Electrum.
-    handle.query.enable_sh_run_mode();
+    // Catch-up index mode (even with full validation / milestone 0):
+    // - durable open-hash tx/point/SH off on the hot path
+    // - sequential sorted runs + spent_local (complete oracle) + process txid cache
+    // - materialize open-hash at enter_tip_mode before Electrum
+    handle.query.set_spend_index(false);
+    handle.query.set_tx_index(false);
+    handle.query.enable_index_run_mode();
     info!(
-        "ibd: thin scripthash catch-up via sorted runs (no durable SH head on confirm; materialize at tip mode)"
+        "ibd: index catch-up mode (tx/point/SH sorted runs; spent_local for double-spend; materialize at tip mode)"
     );
-    // Point spends: durable multimap off under milestone (archive + confirm). Confirm
-    // still tracks spends process-locally for double-spend checks; durable points
-    // are backfilled in enter_tip_mode before Electrum starts.
-    let spend_index = milestone.height == 0;
-    handle.query.set_spend_index(spend_index);
-    if !spend_index {
-        info!(
-            "ibd: durable point/spend index OFF during catch-up (local spent-set only; backfill before Electrum)"
-        );
-    } else {
-        // Full validation: point.head is multi‑GiB random RMW. Buffer upserts in RAM
-        // and spill slot-sorted/page-buffered batches (default 512k keys ≈ tens of MiB).
-        let cap = std::env::var("RBITCOIN_POINT_HEAD_OVERLAY")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(rbitcoin_store::DEFAULT_WRITE_BEHIND_CAP);
-        handle
-            .query
-            .enable_point_head_write_behind(cap)
-            .map_err(|e| NodeError::Config(format!("point head write-behind: {e}")))?;
-        info!(
-            "ibd: point.head write-behind ON (cap={cap}; budgeted spill chunk≈{}; RBITCOIN_POINT_HEAD_OVERLAY / RBITCOIN_HEAD_SPILL_CHUNK)",
-            rbitcoin_store::spill_chunk_size()
-        );
-    }
-    // tx.head: optional under milestone for archive speed; connect uses prev_tx_fk
-    // + process txid→fk cache. On resume with head off, warm that cache from Class A
-    // so external-prev inputs (out-of-order archive) still resolve.
-    let tx_index = milestone.height == 0;
-    handle.query.set_tx_index(tx_index);
-    if !tx_index {
+    // Warm process txid→fk from Class A (resume / cold start with bodies).
+    {
         let t0 = Instant::now();
         let n = handle
             .query
             .warm_txid_cache_from_bodies()
             .map_err(|e| NodeError::Config(format!("warm txid cache: {e}")))?;
         info!(
-            "ibd: txid hash-head OFF during catch-up (prevouts via prev_tx_fk + process cache; warmed {n} Class A txs in {:?})",
+            "ibd: txid process cache warmed {n} Class A txs in {:?}",
             t0.elapsed()
         );
-    } else {
-        let cap = std::env::var("RBITCOIN_TX_HEAD_OVERLAY")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(rbitcoin_store::DEFAULT_WRITE_BEHIND_CAP);
-        handle
+    }
+    // Core-safe spent oracle before any confirm when durable points are off.
+    {
+        let t0 = Instant::now();
+        let n = handle
             .query
-            .enable_tx_head_write_behind(cap)
-            .map_err(|e| NodeError::Config(format!("tx head write-behind: {e}")))?;
+            .rebuild_spent_local_to_tip()
+            .map_err(|e| NodeError::Config(format!("rebuild spent_local: {e}")))?;
         info!(
-            "ibd: tx.head write-behind ON (cap={cap}; budgeted spill chunk≈{}; RBITCOIN_TX_HEAD_OVERLAY / RBITCOIN_HEAD_SPILL_CHUNK)",
-            rbitcoin_store::spill_chunk_size()
+            "ibd: spent_local rebuilt entries≈{n} ready={} in {:?}",
+            handle.query.spent_local_ready(),
+            t0.elapsed()
         );
     }
 
@@ -702,21 +676,15 @@ pub(crate) fn enter_tip_mode(query: &Query) {
     if let Err(e) = query.disable_tx_head_write_behind() {
         warn!("node: disable tx head write-behind: {e}");
     }
-    // Always on at tip: point spends + txid head (prevout / maturity / reorg).
-    query.set_spend_index(true);
-    query.set_tx_index(true);
-    info!("node: tip mode indexes spend=on tx_head=on scripthash=always");
-
-    let tip = query.tip_height().map(|h| h.0).unwrap_or(0);
-
-    // 1) tx.head first: scripthash spend joins need get_tx_by_txid when prev_tx_fk is null.
+    // Materialize catch-up runs into durable open-hash tables (one-time).
+    match query.finalize_tx_runs() {
+        Ok(n) => info!("node: tx.head run materialize inserted≈{n}"),
+        Err(e) => warn!("node: tx.head run materialize failed: {e}"),
+    }
     let bodies = query.tx_body_count();
-    let head_before = query.tx_head_occupied();
-    // Heuristic: head much smaller than bodies ⇒ archive ran with index off.
-    if bodies > 0 && head_before.saturating_mul(2) < bodies {
-        info!(
-            "node: backfill tx.head starting (bodies={bodies}, head_before={head_before})…"
-        );
+    let head_after = query.tx_head_occupied();
+    if bodies > 0 && head_after.saturating_mul(2) < bodies {
+        info!("node: tx.head still sparse after runs — Class A backfill…");
         let t0 = Instant::now();
         match query.backfill_tx_index(|done, total, inserted| {
             info!(
@@ -731,17 +699,18 @@ pub(crate) fn enter_tip_mode(query: &Query) {
             Err(e) => warn!("node: backfill tx.head failed: {e}"),
         }
     } else if bodies > 0 {
-        // Still warm process cache; head may already be complete.
         let _ = query.warm_txid_cache_from_bodies();
     }
 
-    // 2) Durable point/spend edges (confirm skipped these during milestone IBD).
+    match query.finalize_point_runs() {
+        Ok(n) => info!("node: point run materialize edges≈{n}"),
+        Err(e) => warn!("node: point run materialize failed: {e}"),
+    }
+    let tip = query.tip_height().map(|h| h.0).unwrap_or(0);
     let point_before = query.point_edge_count();
-    // Empty or sparse points while we confirmed a real tip ⇒ rebuild.
-    let need_points = tip > 0 && point_before < tip as u64;
-    if need_points {
+    if tip > 0 && point_before < tip as u64 {
         info!(
-            "node: backfill point spends starting (tip={tip}, edges_before={point_before})…"
+            "node: points still sparse after runs — Class A backfill (tip={tip}, edges={point_before})…"
         );
         let t0 = Instant::now();
         match query.backfill_point_spends(|h, tip_h, txs, edges| {
@@ -757,18 +726,18 @@ pub(crate) fn enter_tip_mode(query: &Query) {
             ),
             Err(e) => warn!("node: backfill point spends failed: {e}"),
         }
-    } else {
-        info!(
-            "node: point spend index present (edges={point_before}, tip={tip}) — skip backfill"
-        );
     }
 
-    // Materialize catch-up SH runs into durable scripthash tables (one-time).
-    // Tip-follow after this uses durable put_create_batch_append again.
     match query.finalize_sh_runs() {
         Ok(n) => info!("node: scripthash run materialize inserted≈{n}"),
         Err(e) => warn!("node: scripthash run materialize failed: {e}"),
     }
+
+    // Tip-follow: durable indexes on (write-through; low rate).
+    query.set_spend_index(true);
+    query.set_tx_index(true);
+    query.mark_spent_local_ready();
+    info!("node: tip mode indexes spend=on tx_head=on scripthash=on");
     info!(
         "node: scripthash rows={} (thin creates; spentness via points)",
         query.scripthash_entry_count()

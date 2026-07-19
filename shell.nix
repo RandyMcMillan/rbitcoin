@@ -14,6 +14,8 @@ pkgs.mkShell {
   ];
 
   RUST_BACKTRACE = "1";
+  # Deny rustc warnings for first-party crates (also via workspace.lints).
+  RUSTFLAGS = "-Dwarnings";
   shellHook = ''
     export LLVM_COV="${pkgs.llvmPackages.llvm}/bin/llvm-cov"
     export LLVM_PROFDATA="${pkgs.llvmPackages.llvm}/bin/llvm-profdata"

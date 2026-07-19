@@ -23,13 +23,22 @@ pub struct NodeConfig {
     pub max_run_secs: Option<u64>,
     /// Electrum TCP listen (`None` = disabled).
     pub electrum_listen: Option<SocketAddr>,
+    /// Electrum TLS listen (`None` = disabled). Requires cert + key paths.
+    pub electrum_tls_listen: Option<SocketAddr>,
+    /// PEM certificate for Electrum TLS.
+    pub electrum_tls_cert: Option<PathBuf>,
+    /// PEM private key for Electrum TLS.
+    pub electrum_tls_key: Option<PathBuf>,
     /// Skip script/prevout checks for blocks at or below this height (0 = off).
     /// Analogous to a coarse assumevalid / milestone for IBD speed.
     pub milestone_height: u32,
-    /// How many outbound peers to follow for IBD/tip (default 8).
+    /// How many **live** download peers to keep during IBD / tip follow
+    /// (default 16 = `DEFAULT_IBD_TARGET_PEERS`). Seed resolution may use a
+    /// larger candidate pool; this is the concurrent live target, not seed count.
     pub max_outbound: u32,
-    /// Write scripthash index on connect (disable for faster IBD; backfill later).
-    pub scripthash_index: bool,
+    /// Mempool weight budget in **WU** (default ~300M WU ≈ plan 300 MiB class).
+    /// Used for worst-chunk eviction. Override with `--mempool-size-mb`.
+    pub mempool_max_weight: u64,
 }
 
 impl Default for NodeConfig {
@@ -45,10 +54,14 @@ impl Default for NodeConfig {
             smoke: false,
             max_run_secs: None,
             electrum_listen: None,
+            electrum_tls_listen: None,
+            electrum_tls_cert: None,
+            electrum_tls_key: None,
             milestone_height: 0,
             // Core-ish outbound budget; IBD redials toward this many live peers.
             max_outbound: 16,
-            scripthash_index: true,
+            // ~300e6 weight units — see rbitcoin_mempool::DEFAULT_MAX_MEMPOOL_WEIGHT.
+            mempool_max_weight: 300_000_000,
         }
     }
 }
@@ -71,6 +84,11 @@ impl NodeConfig {
 
     pub fn store_path(&self) -> PathBuf {
         self.datadir.join("store")
+    }
+
+    /// Durable mempool directory (`{datadir}/mempool/`).
+    pub fn mempool_path(&self) -> PathBuf {
+        self.datadir.join("mempool")
     }
 
     pub fn milestone(&self) -> Milestone {

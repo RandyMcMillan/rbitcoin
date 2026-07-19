@@ -7,7 +7,7 @@
 use bitcoin::block::{Block, Header};
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
-use parking_lot::RwLock;
+use std::sync::RwLock;
 use std::collections::HashMap;
 
 /// How many recent full block bodies to retain (matches IBD horizon; hash chain
@@ -47,7 +47,7 @@ impl BlockCache {
     }
 
     pub fn tip_height(&self) -> Option<u32> {
-        let g = self.inner.read();
+        let g = self.inner.read().unwrap();
         if g.chain.is_empty() {
             None
         } else {
@@ -56,38 +56,38 @@ impl BlockCache {
     }
 
     pub fn tip_hash(&self) -> Option<BlockHash> {
-        self.inner.read().chain.last().copied()
+        self.inner.read().unwrap().chain.last().copied()
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().chain.len()
+        self.inner.read().unwrap().chain.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.read().chain.is_empty()
+        self.inner.read().unwrap().chain.is_empty()
     }
 
     pub fn get_block(&self, hash: &BlockHash) -> Option<Block> {
-        self.inner.read().by_hash.get(hash).cloned()
+        self.inner.read().unwrap().by_hash.get(hash).cloned()
     }
 
     pub fn get_header(&self, hash: &BlockHash) -> Option<Header> {
-        self.inner.read().by_hash.get(hash).map(|b| b.header)
+        self.inner.read().unwrap().by_hash.get(hash).map(|b| b.header)
     }
 
     pub fn hash_at_height(&self, height: u32) -> Option<BlockHash> {
-        self.inner.read().chain.get(height as usize).copied()
+        self.inner.read().unwrap().chain.get(height as usize).copied()
     }
 
     pub fn header_at_height(&self, height: u32) -> Option<Header> {
-        let g = self.inner.read();
+        let g = self.inner.read().unwrap();
         let h = g.chain.get(height as usize)?;
         g.by_hash.get(h).map(|b| b.header)
     }
 
     /// Drop all blocks above `height` (keep 0..=height). No-op if cache shorter.
     pub fn truncate_to_height(&self, height: u32) {
-        let mut g = self.inner.write();
+        let mut g = self.inner.write().unwrap();
         let keep = (height as usize).saturating_add(1);
         if g.chain.len() <= keep {
             return;
@@ -101,7 +101,7 @@ impl BlockCache {
 
     /// Clear entire cache (e.g. after full reorg from genesis).
     pub fn clear(&self) {
-        let mut g = self.inner.write();
+        let mut g = self.inner.write().unwrap();
         g.by_hash.clear();
         g.chain.clear();
     }
@@ -111,7 +111,7 @@ impl BlockCache {
     /// Evicts full bodies older than `body_depth` while keeping the hash chain.
     pub fn push_best(&self, block: Block) -> Result<(), &'static str> {
         let hash = block.block_hash();
-        let mut g = self.inner.write();
+        let mut g = self.inner.write().unwrap();
         if g.chain.is_empty() {
             g.by_hash.insert(hash, block);
             g.chain.push(hash);
@@ -137,7 +137,7 @@ impl BlockCache {
 
     /// Locator hashes newest-first for getheaders.
     pub fn locator(&self) -> Vec<BlockHash> {
-        let g = self.inner.read();
+        let g = self.inner.read().unwrap();
         if g.chain.is_empty() {
             return vec![BlockHash::from_byte_array([0u8; 32])];
         }
@@ -165,7 +165,7 @@ impl BlockCache {
     /// Only returns headers still present as full bodies in the tip window; callers
     /// that need deeper history should use the store reconstruct path.
     pub fn headers_after_locator(&self, locator: &[BlockHash], stop: BlockHash) -> Vec<Header> {
-        let g = self.inner.read();
+        let g = self.inner.read().unwrap();
         if g.chain.is_empty() {
             return Vec::new();
         }

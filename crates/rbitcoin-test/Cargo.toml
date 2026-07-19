@@ -18,9 +18,7 @@ rbitcoin-rpc = { workspace = true }
 rbitcoin-electrum = { workspace = true }
 rbitcoin-cli = { workspace = true }
 rbitcoin-node = { workspace = true }
-tempfile = { workspace = true }
 bitcoin = { workspace = true }
-hex = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 
@@ -35,3 +33,10 @@ path = "tests/integration_multinode.rs"
 [[test]]
 name = "electrum_protocol"
 path = "tests/electrum_protocol.rs"
+
+[[test]]
+name = "consensus_rules"
+path = "tests/consensus_rules.rs"
+
+[lints]
+workspace = true

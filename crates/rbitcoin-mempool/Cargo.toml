@@ -1,0 +1,18 @@
+[package]
+name = "rbitcoin-mempool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Cluster mempool with durable mmap layout under datadir/mempool/"
+
+[dependencies]
+rbitcoin-log = { workspace = true }
+rbitcoin-consensus = { workspace = true }
+bitcoin = { workspace = true }
+memmap2 = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

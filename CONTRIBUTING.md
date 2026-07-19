@@ -13,6 +13,8 @@
 ```bash
 nix-shell
 cargo fmt --all
+# rustc warnings are denied via workspace.lints + RUSTFLAGS=-Dwarnings (shell.nix)
+cargo build --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ./scripts/coverage.sh

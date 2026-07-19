@@ -1,0 +1,40 @@
+//! Cluster mempool with durable mmap layout under `{datadir}/mempool/`.
+//!
+//! # Layout
+//!
+//! | File | Role |
+//! |------|------|
+//! | `meta` | Magic, schema, commit generation **G**, slot capacity, live count |
+//! | `slots` | Fixed-size slot records (status + body range + txid) |
+//! | `tx.body` | Append-only payloads: `fee(8)‖weight(8)‖raw_tx` per LIVE slot |
+//!
+//! **Commit model:** body complete → slot LIVE → RAM indexes → no fsync per tx.
+//! Batched msync + bump `G` on [`ActiveMempool::flush`]. Kill loses at most the
+//! last uncommitted batch; never claim incomplete bodies.
+//!
+//! **Memory rule:** indexes stay proportional to the live set; files stay mmap.
+//!
+//! # Phases (plan.md)
+//!
+//! - **P1:** open / flush / reopen empty skeleton  
+//! - **P2:** TxGraph + linearization + Libre single-tx accept + durable commit  
+//! - **P3:** package accept (CPFP), durable remove, block/reorg hooks  
+//! - **P5:** full RBF + package RBF fee rules + worst-chunk eviction  
+
+mod accept;
+mod error;
+mod graph;
+mod store;
+
+pub use accept::{
+    rbf_pays_for_replacement, AcceptError, AcceptResult, ActiveMempool, MapUtxoProvider,
+    UtxoProvider, DEFAULT_MAX_MEMPOOL_WEIGHT, INCREMENTAL_RELAY_FEE_RATE_SAT_PER_KVB,
+    MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT,
+};
+pub use error::MempoolError;
+pub use graph::{Chunk, Cluster, TxEntry, TxGraph, MAX_CLUSTER_COUNT, MAX_CLUSTER_WEIGHT};
+pub use store::{Mempool, MempoolMeta, MEM_MAGIC, MEM_SCHEMA};
+
+pub fn crate_name() -> &'static str {
+    "rbitcoin-mempool"
+}

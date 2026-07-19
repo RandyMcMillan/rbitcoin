@@ -1,8 +1,7 @@
-//! Class C tip/confirmation tables and per-height block tx lists.
+//! Class C tip/confirmation tables and Class A header→tx ranges.
 
 use crate::array_table::ArrayTable;
 use crate::error::StoreError;
-use crate::var_table::{framed, VarTable};
 use rbitcoin_primitives::{Fk, Height, TableKind};
 use std::path::Path;
 
@@ -45,6 +44,23 @@ impl ConfirmedTable {
         self.arr.set(u64::from(height.0), header_fk.0)
     }
 
+    /// Set many height→header_fk pairs (one grow for max height, then bulk writes).
+    ///
+    /// Used by multi-block Class C confirm so tip extension is not N separate grows.
+    pub fn set_many(&self, pairs: &[(Height, Fk)]) -> Result<(), StoreError> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let mut raw = Vec::with_capacity(pairs.len());
+        for &(h, fk) in pairs {
+            if fk.is_null() {
+                return Err(StoreError::InvalidFk);
+            }
+            raw.push((u64::from(h.0), fk.0));
+        }
+        self.arr.set_many(&raw)
+    }
+
     /// Disconnect tip: height must be current tip.
     pub fn disconnect_tip(&self, height: Height) -> Result<(), StoreError> {
         match self.tip_height() {
@@ -62,28 +78,189 @@ impl ConfirmedTable {
     }
 }
 
-/// Per-tx confirmation: index = tx_fk - 1 → header_fk (0 = not strong).
-pub struct StrongTxTable {
+/// Class C: per-tx create height for coinbase maturity (not a UTXO set).
+///
+/// Index = `tx_fk - 1`; stored value = `height + 1` (0 = unset so height 0 is representable).
+pub struct TxHeightTable {
     arr: ArrayTable,
 }
 
-impl StrongTxTable {
+impl TxHeightTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
-            arr: ArrayTable::create(dir.join("strong_tx.body"), TableKind::StrongTx)?,
+            arr: ArrayTable::create(dir.join("tx_height.body"), TableKind::TxHeight)?,
         })
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
-            arr: ArrayTable::open(dir.join("strong_tx.body"), TableKind::StrongTx)?,
+            arr: ArrayTable::open(dir.join("tx_height.body"), TableKind::TxHeight)?,
         })
     }
 
-    pub fn get(&self, tx_fk: Fk) -> Result<Option<Fk>, StoreError> {
+    pub fn get(&self, tx_fk: Fk) -> Result<Option<u32>, StoreError> {
         let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
         let v = self.arr.get(id - 1)?;
-        Ok(Fk::new(v))
+        if v == 0 {
+            Ok(None)
+        } else {
+            Ok(Some((v - 1) as u32))
+        }
+    }
+
+    pub fn set(&self, tx_fk: Fk, height: Height) -> Result<(), StoreError> {
+        let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
+        self.arr.set(id - 1, u64::from(height.0) + 1)
+    }
+
+    /// Set the same height for a contiguous tx_fk range.
+    pub fn set_range(&self, first_tx_fk: Fk, count: u32, height: Height) -> Result<(), StoreError> {
+        let id = first_tx_fk.get().ok_or(StoreError::InvalidFk)?;
+        if count == 0 {
+            return Ok(());
+        }
+        let v = u64::from(height.0) + 1;
+        self.arr.fill_range(id - 1, u64::from(count), v)
+    }
+
+    pub fn clear(&self, tx_fk: Fk) -> Result<(), StoreError> {
+        let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
+        if id > self.arr.len() {
+            return Ok(());
+        }
+        self.arr.set(id - 1, 0)
+    }
+
+    /// Number of allocated slots (covers tx fks `1..=len`).
+    pub fn len(&self) -> u64 {
+        self.arr.len()
+    }
+
+    /// Zero `count` consecutive height slots starting at `first_tx_fk` (disconnect/repair).
+    pub fn clear_range(&self, first_tx_fk: Fk, count: u32) -> Result<(), StoreError> {
+        let id = first_tx_fk.get().ok_or(StoreError::InvalidFk)?;
+        if count == 0 {
+            return Ok(());
+        }
+        let start = id - 1;
+        let n = self.arr.len();
+        if start >= n {
+            return Ok(());
+        }
+        let take = u64::from(count).min(n - start);
+        self.arr.fill_range(start, take, 0)
+    }
+
+    /// Bulk-scan set heights; `visit(tx_fk, height)` for each allocated non-zero slot.
+    pub fn for_each_set<F>(&self, mut visit: F) -> Result<(), StoreError>
+    where
+        F: FnMut(Fk, u32) -> Result<(), StoreError>,
+    {
+        let n = self.arr.len();
+        const CHUNK: u64 = 8192;
+        let mut buf = vec![0u8; (CHUNK as usize) * 8];
+        let mut i = 0u64;
+        while i < n {
+            let take = (n - i).min(CHUNK);
+            self.arr.read_range(i, take, &mut buf)?;
+            for j in 0..take as usize {
+                let off = j * 8;
+                let v = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+                if v != 0 {
+                    let tx_fk = Fk(i + j as u64 + 1);
+                    visit(tx_fk, (v - 1) as u32)?;
+                }
+            }
+            i += take;
+        }
+        Ok(())
+    }
+
+    pub fn flush(&self) -> Result<(), StoreError> {
+        self.arr.flush()
+    }
+}
+
+/// Per-tx strong bit (schema v3): bit `(tx_fk - 1)` set ⇒ strong on best chain.
+///
+/// ~64× smaller than u64-per-tx; call sites only need `is_strong`. Header fk is
+/// not stored (derived from confirmed range when needed).
+pub struct StrongTxTable {
+    bits: crate::file::TableFile,
+    /// Number of bits allocated (covers tx fks 1..=n_bits).
+    n_bits: std::sync::Mutex<u64>,
+}
+
+impl StrongTxTable {
+    pub fn create(dir: &Path) -> Result<Self, StoreError> {
+        Ok(Self {
+            bits: crate::file::TableFile::create(dir.join("strong_tx.body"), TableKind::StrongTx)?,
+            n_bits: std::sync::Mutex::new(0),
+        })
+    }
+
+    pub fn open(dir: &Path) -> Result<Self, StoreError> {
+        let bits = crate::file::TableFile::open(dir.join("strong_tx.body"), TableKind::StrongTx)?;
+        let body = bits
+            .logical_len()
+            .saturating_sub(crate::file::FILE_HEADER_LEN as u64);
+        Ok(Self {
+            bits,
+            n_bits: std::sync::Mutex::new(body.saturating_mul(8)),
+        })
+    }
+
+    fn byte_off(bit: u64) -> u64 {
+        crate::file::FILE_HEADER_LEN as u64 + bit / 8
+    }
+
+    fn ensure_bits(&self, need_bits: u64) -> Result<(), StoreError> {
+        let mut n = self.n_bits.lock().unwrap();
+        if need_bits <= *n {
+            return Ok(());
+        }
+        let need_bytes = (need_bits + 7) / 8;
+        let cur_bytes = (*n + 7) / 8;
+        if need_bytes > cur_bytes {
+            let zeros = vec![0u8; (need_bytes - cur_bytes) as usize];
+            self.bits.write_at(
+                crate::file::FILE_HEADER_LEN as u64 + cur_bytes,
+                &zeros,
+            )?;
+        }
+        *n = need_bits;
+        Ok(())
+    }
+
+    fn get_bit(&self, bit: u64) -> Result<bool, StoreError> {
+        let n = *self.n_bits.lock().unwrap();
+        if bit >= n {
+            return Ok(false);
+        }
+        let mut b = [0u8; 1];
+        self.bits.read_at(Self::byte_off(bit), &mut b)?;
+        Ok((b[0] >> (bit % 8)) & 1 != 0)
+    }
+
+    fn set_bit(&self, bit: u64, on: bool) -> Result<(), StoreError> {
+        self.ensure_bits(bit + 1)?;
+        let mut b = [0u8; 1];
+        self.bits.read_at(Self::byte_off(bit), &mut b)?;
+        if on {
+            b[0] |= 1 << (bit % 8);
+        } else {
+            b[0] &= !(1 << (bit % 8));
+        }
+        self.bits.write_at(Self::byte_off(bit), &b)
+    }
+
+    /// Compatibility: Some(dummy nonzero) if strong, else None.
+    pub fn get(&self, tx_fk: Fk) -> Result<Option<Fk>, StoreError> {
+        if self.is_strong(tx_fk)? {
+            Ok(Some(Fk(1)))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn set_strong(&self, tx_fk: Fk, header_fk: Fk) -> Result<(), StoreError> {
@@ -91,10 +268,10 @@ impl StrongTxTable {
         if header_fk.is_null() {
             return Err(StoreError::InvalidFk);
         }
-        self.arr.set(id - 1, header_fk.0)
+        self.set_bit(id - 1, true)
     }
 
-    /// Mark many consecutive tx fks strong for the same header (one array write).
+    /// Mark many consecutive tx fks strong (one ensure + bulk byte writes).
     pub fn set_strong_range(
         &self,
         first_tx_fk: Fk,
@@ -109,197 +286,291 @@ impl StrongTxTable {
                 Err(StoreError::InvalidFk)
             };
         }
-        self.arr
-            .fill_range(id - 1, u64::from(count), header_fk.0)
+        let start = id - 1;
+        let end = start + u64::from(count); // exclusive
+        self.set_bits_range(start, end, true)
+    }
+
+    /// Set bits in half-open `[start, end)` (bit indices). Bulk-writes full bytes.
+    fn set_bits_range(&self, start: u64, end: u64, on: bool) -> Result<(), StoreError> {
+        if end <= start {
+            return Ok(());
+        }
+        self.ensure_bits(end)?;
+        let mut bit = start;
+        // Partial first byte.
+        if bit % 8 != 0 {
+            let byte_end = (bit + 8) & !7;
+            let stop = end.min(byte_end);
+            while bit < stop {
+                // ensure_bits already done; inline RMW without re-ensure.
+                let mut b = [0u8; 1];
+                self.bits.read_at(Self::byte_off(bit), &mut b)?;
+                if on {
+                    b[0] |= 1 << (bit % 8);
+                } else {
+                    b[0] &= !(1 << (bit % 8));
+                }
+                self.bits.write_at(Self::byte_off(bit), &b)?;
+                bit += 1;
+            }
+        }
+        // Full middle bytes.
+        if bit + 8 <= end {
+            let full_start = bit / 8;
+            let full_end = end / 8; // exclusive byte index
+            if full_end > full_start {
+                let n = (full_end - full_start) as usize;
+                let fill = if on { 0xffu8 } else { 0u8 };
+                let blob = vec![fill; n];
+                self.bits.write_at(
+                    crate::file::FILE_HEADER_LEN as u64 + full_start,
+                    &blob,
+                )?;
+                bit = full_end * 8;
+            }
+        }
+        // Partial last byte.
+        while bit < end {
+            let mut b = [0u8; 1];
+            self.bits.read_at(Self::byte_off(bit), &mut b)?;
+            if on {
+                b[0] |= 1 << (bit % 8);
+            } else {
+                b[0] &= !(1 << (bit % 8));
+            }
+            self.bits.write_at(Self::byte_off(bit), &b)?;
+            bit += 1;
+        }
+        Ok(())
     }
 
     pub fn set_unstrong(&self, tx_fk: Fk) -> Result<(), StoreError> {
         let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
-        if id > self.arr.len() {
+        let n = *self.n_bits.lock().unwrap();
+        if id - 1 >= n {
             return Ok(());
         }
-        self.arr.set(id - 1, 0)
+        self.set_bit(id - 1, false)
+    }
+
+    /// Clear many consecutive strong bits (Class C repair / disconnect ranges).
+    pub fn set_unstrong_range(&self, first_tx_fk: Fk, count: u32) -> Result<(), StoreError> {
+        let id = first_tx_fk.get().ok_or(StoreError::InvalidFk)?;
+        if count == 0 {
+            return Ok(());
+        }
+        let start = id - 1;
+        let end = start + u64::from(count);
+        let n = *self.n_bits.lock().unwrap();
+        if start >= n {
+            return Ok(());
+        }
+        let end = end.min(n);
+        self.set_bits_range(start, end, false)
     }
 
     pub fn is_strong(&self, tx_fk: Fk) -> Result<bool, StoreError> {
-        Ok(self.get(tx_fk)?.is_some())
+        let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
+        self.get_bit(id - 1)
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.arr.flush()
+        self.bits.flush()
     }
 }
 
-/// Per-height list of tx fks for connect/disconnect.
-pub struct BlockTxsTable {
-    lists: VarTable,
-    /// height → list record fk
-    by_height: ArrayTable,
-}
+#[cfg(test)]
+mod strong_tests {
+    use super::*;
 
-impl BlockTxsTable {
-    pub fn create(dir: &Path) -> Result<Self, StoreError> {
-        Ok(Self {
-            lists: VarTable::create(dir, "block_txs", TableKind::ArrayLink)?,
-            by_height: ArrayTable::create(dir.join("block_txs_height.body"), TableKind::ArrayLink)?,
-        })
+    fn tmp() -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "rbitcoin-strong-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
     }
 
-    pub fn open(dir: &Path) -> Result<Self, StoreError> {
-        Ok(Self {
-            lists: VarTable::open(dir, "block_txs", TableKind::ArrayLink)?,
-            by_height: ArrayTable::open(dir.join("block_txs_height.body"), TableKind::ArrayLink)?,
-        })
-    }
-
-    pub fn put_list(&self, height: Height, tx_fks: &[Fk]) -> Result<(), StoreError> {
-        let mut payload = Vec::with_capacity(4 + tx_fks.len() * 8);
-        payload.extend_from_slice(&(tx_fks.len() as u32).to_le_bytes());
-        for fk in tx_fks {
-            payload.extend_from_slice(&fk.0.to_le_bytes());
+    #[test]
+    fn strong_bitset_range_and_clear() {
+        let dir = tmp();
+        let t = StrongTxTable::create(&dir).unwrap();
+        t.set_strong_range(Fk(1), 10, Fk(99)).unwrap();
+        for i in 1..=10 {
+            assert!(t.is_strong(Fk(i)).unwrap());
         }
-        let list_fk = self.lists.put(&framed(&payload))?;
-        self.by_height.set(u64::from(height.0), list_fk.0)?;
-        Ok(())
-    }
-
-    pub fn get_list(&self, height: Height) -> Result<Vec<Fk>, StoreError> {
-        let list_fk_raw = self.by_height.get(u64::from(height.0))?;
-        let list_fk = Fk::new(list_fk_raw).ok_or(StoreError::NotFound)?;
-        let raw = self.lists.get_raw(list_fk)?;
-        let payload = &raw[4..];
-        if payload.len() < 4 {
-            return Err(StoreError::Corrupt("short block tx list"));
-        }
-        let n = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
-        if payload.len() < 4 + n * 8 {
-            return Err(StoreError::Corrupt("block tx list truncated"));
-        }
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let o = 4 + i * 8;
-            let v = u64::from_le_bytes(payload[o..o + 8].try_into().unwrap());
-            out.push(Fk(v));
-        }
-        Ok(out)
-    }
-
-    pub fn clear_height(&self, height: Height) -> Result<(), StoreError> {
-        // Leave list body orphaned; clear index. Truncate height array if tip.
-        let h = u64::from(height.0);
-        if h + 1 == self.by_height.len() {
-            self.by_height.truncate(h)?;
-        } else if h < self.by_height.len() {
-            self.by_height.set(h, 0)?;
-        }
-        Ok(())
-    }
-
-    pub fn flush(&self) -> Result<(), StoreError> {
-        self.lists.flush()?;
-        self.by_height.flush()?;
-        Ok(())
+        assert!(!t.is_strong(Fk(11)).unwrap());
+        t.set_unstrong(Fk(5)).unwrap();
+        assert!(!t.is_strong(Fk(5)).unwrap());
+        assert!(t.is_strong(Fk(4)).unwrap());
+        assert!(t.get(Fk(1)).unwrap().is_some());
+        assert!(t.get(Fk(5)).unwrap().is_none());
+        t.flush().unwrap();
+        drop(t);
+        let t = StrongTxTable::open(&dir).unwrap();
+        assert!(t.is_strong(Fk(1)).unwrap());
+        assert!(!t.is_strong(Fk(5)).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
-/// Per-header list of tx fks (Class A body association, independent of tip height).
+/// Per-header **contiguous** tx_fk range (Class A archive body association).
 ///
-/// Index = `header_fk - 1` → list record fk. Enables archive-before-confirm IBD:
-/// bodies are stored as soon as downloaded; Class C height maps are set later.
+/// Schema v2 stores `(first_tx_fk, count)` only — not a u64 fk vector.
+/// Writer must assign contiguous FKs per block (archive plan does).
+///
+/// - `first.body[header_fk-1]` = first_tx_fk (0 = no body)
+/// - `count.body[header_fk-1]` = n txs (0 = no body)
 pub struct HeaderTxsTable {
-    lists: VarTable,
-    by_header: ArrayTable,
+    first: ArrayTable,
+    count: ArrayTable,
 }
 
 impl HeaderTxsTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
-            lists: VarTable::create(dir, "header_txs", TableKind::ArrayLink)?,
-            by_header: ArrayTable::create(dir.join("header_txs_fk.body"), TableKind::ArrayLink)?,
+            first: ArrayTable::create(dir.join("header_txs_first.body"), TableKind::ArrayLink)?,
+            count: ArrayTable::create(dir.join("header_txs_count.body"), TableKind::ArrayLink)?,
         })
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
-            lists: VarTable::open(dir, "header_txs", TableKind::ArrayLink)?,
-            by_header: ArrayTable::open(dir.join("header_txs_fk.body"), TableKind::ArrayLink)?,
+            first: ArrayTable::open(dir.join("header_txs_first.body"), TableKind::ArrayLink)?,
+            count: ArrayTable::open(dir.join("header_txs_count.body"), TableKind::ArrayLink)?,
         })
     }
 
+    /// Store a contiguous range. `tx_fks` must be non-empty and contiguous.
     pub fn put_list(&self, header_fk: Fk, tx_fks: &[Fk]) -> Result<(), StoreError> {
-        let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
-        let mut payload = Vec::with_capacity(4 + tx_fks.len() * 8);
-        payload.extend_from_slice(&(tx_fks.len() as u32).to_le_bytes());
-        for fk in tx_fks {
-            payload.extend_from_slice(&fk.0.to_le_bytes());
+        if tx_fks.is_empty() {
+            return Err(StoreError::Corrupt("empty header tx list"));
         }
-        let list_fk = self.lists.put(&framed(&payload))?;
-        self.by_header.set(id - 1, list_fk.0)?;
+        debug_assert!(
+            tx_fks.windows(2).all(|w| w[1].0 == w[0].0.saturating_add(1)),
+            "header_txs must be contiguous"
+        );
+        if !tx_fks
+            .windows(2)
+            .all(|w| w[1].0 == w[0].0.saturating_add(1))
+        {
+            return Err(StoreError::Corrupt("header_txs not contiguous"));
+        }
+        self.put_range(header_fk, tx_fks[0], tx_fks.len() as u32)
+    }
+
+    pub fn put_range(&self, header_fk: Fk, first_tx_fk: Fk, n: u32) -> Result<(), StoreError> {
+        let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
+        if first_tx_fk.is_null() || n == 0 {
+            return Err(StoreError::InvalidFk);
+        }
+        self.first.set(id - 1, first_tx_fk.0)?;
+        self.count.set(id - 1, u64::from(n))?;
         Ok(())
     }
 
-    /// Batch-append many header→tx-list rows (one lists body write + batch array sets).
+    /// Batch-append many header→tx ranges.
     pub fn put_lists_batch(&self, items: &[(Fk, &[Fk])]) -> Result<(), StoreError> {
         if items.is_empty() {
             return Ok(());
         }
-        if items.len() == 1 {
-            return self.put_list(items[0].0, items[0].1);
-        }
-        let est: usize = items
-            .iter()
-            .map(|(_, t)| 8 + t.len() * 8)
-            .sum();
-        let list_fks = self.lists.put_batch_encode(items.len(), est, |i, buf| {
-            let tx_fks = items[i].1;
-            buf.extend_from_slice(&(tx_fks.len() as u32).to_le_bytes());
-            for fk in tx_fks {
-                buf.extend_from_slice(&fk.0.to_le_bytes());
+        let mut first_pairs = Vec::with_capacity(items.len());
+        let mut count_pairs = Vec::with_capacity(items.len());
+        for (header_fk, tx_fks) in items {
+            if tx_fks.is_empty() {
+                return Err(StoreError::Corrupt("empty header tx list"));
             }
-        })?;
-        let mut pairs = Vec::with_capacity(items.len());
-        for ((header_fk, _), list_fk) in items.iter().zip(list_fks.iter()) {
+            if !tx_fks
+                .windows(2)
+                .all(|w| w[1].0 == w[0].0.saturating_add(1))
+            {
+                return Err(StoreError::Corrupt("header_txs not contiguous"));
+            }
             let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
-            pairs.push((id - 1, list_fk.0));
+            first_pairs.push((id - 1, tx_fks[0].0));
+            count_pairs.push((id - 1, tx_fks.len() as u64));
         }
-        self.by_header.set_many(&pairs)?;
+        self.first.set_many(&first_pairs)?;
+        self.count.set_many(&count_pairs)?;
         Ok(())
     }
 
-    pub fn get_list(&self, header_fk: Fk) -> Result<Option<Vec<Fk>>, StoreError> {
+    /// Batch store ranges without expanding fk vectors.
+    pub fn put_ranges_batch(&self, items: &[(Fk, Fk, u32)]) -> Result<(), StoreError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut first_pairs = Vec::with_capacity(items.len());
+        let mut count_pairs = Vec::with_capacity(items.len());
+        for &(header_fk, first_tx_fk, n) in items {
+            let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
+            if first_tx_fk.is_null() || n == 0 {
+                return Err(StoreError::InvalidFk);
+            }
+            first_pairs.push((id - 1, first_tx_fk.0));
+            count_pairs.push((id - 1, u64::from(n)));
+        }
+        self.first.set_many(&first_pairs)?;
+        self.count.set_many(&count_pairs)?;
+        Ok(())
+    }
+
+    pub fn get_range(&self, header_fk: Fk) -> Result<Option<(Fk, u32)>, StoreError> {
         let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
-        if id > self.by_header.len() {
+        if id > self.first.len() {
             return Ok(None);
         }
-        let list_fk_raw = self.by_header.get(id - 1)?;
-        let Some(list_fk) = Fk::new(list_fk_raw) else {
+        let first_raw = self.first.get(id - 1)?;
+        let Some(first) = Fk::new(first_raw) else {
             return Ok(None);
         };
-        let raw = self.lists.get_raw(list_fk)?;
-        let payload = &raw[4..];
-        if payload.len() < 4 {
-            return Err(StoreError::Corrupt("short header tx list"));
+        let n = self.count.get(id - 1)?;
+        if n == 0 || n > u64::from(u32::MAX) {
+            return Ok(None);
         }
-        let n = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
-        if payload.len() < 4 + n * 8 {
-            return Err(StoreError::Corrupt("header tx list truncated"));
-        }
-        let mut out = Vec::with_capacity(n);
+        Ok(Some((first, n as u32)))
+    }
+
+    /// Expand range to a vec of fks (convenience for existing call sites).
+    pub fn get_list(&self, header_fk: Fk) -> Result<Option<Vec<Fk>>, StoreError> {
+        let Some((first, n)) = self.get_range(header_fk)? else {
+            return Ok(None);
+        };
+        let mut out = Vec::with_capacity(n as usize);
         for i in 0..n {
-            let o = 4 + i * 8;
-            let v = u64::from_le_bytes(payload[o..o + 8].try_into().unwrap());
-            out.push(Fk(v));
+            out.push(Fk(first.0 + u64::from(i)));
         }
         Ok(Some(out))
     }
 
     pub fn has_body(&self, header_fk: Fk) -> Result<bool, StoreError> {
-        Ok(self.get_list(header_fk)?.is_some())
+        Ok(self.get_range(header_fk)?.is_some())
+    }
+
+    /// Number of headers that currently have a Class A body (`count > 0`).
+    ///
+    /// Scans the dense count array once (startup / resume accounting).
+    pub fn count_bodies(&self) -> Result<u64, StoreError> {
+        let n = self.count.len();
+        let mut total = 0u64;
+        for i in 0..n {
+            let c = self.count.get(i)?;
+            if c > 0 {
+                total += 1;
+            }
+        }
+        Ok(total)
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.lists.flush()?;
-        self.by_header.flush()?;
+        self.first.flush()?;
+        self.count.flush()?;
         Ok(())
     }
 }

@@ -11,10 +11,14 @@ rbitcoin-primitives = { workspace = true }
 rbitcoin-query = { workspace = true }
 rbitcoin-store = { workspace = true }
 rbitcoin-consensus = { workspace = true }
+rbitcoin-net = { workspace = true }
 bitcoin = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
-hex = { workspace = true }
-parking_lot = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -4,7 +4,7 @@ use crate::cache::BlockCache;
 use crate::chain::{AcceptOutcome, ChainHub};
 use crate::error::NetError;
 use crate::ibd::IbdConfig;
-use crate::peer::{handshake, peer_session, sync_from_peer};
+use crate::peer::{connect_and_handshake, peer_session, sync_from_peer};
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::Magic;
 use bitcoin::Block;
@@ -84,20 +84,35 @@ impl P2PNode {
                 let accept =
                     tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
                 match accept {
-                    Ok(Ok((mut stream, peer_addr))) => {
+                    Ok(Ok((stream, peer_addr))) => {
                         let our = local_addr;
                         let hub = hub_c.clone();
                         let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
                         let tip_rx = hub.subscribe_tips();
                         tokio::spawn(async move {
-                            if handshake(&mut stream, magic_c, our, peer_addr, height, true)
-                                .await
-                                .is_err()
+                            let (_ver, reader, writer) = match connect_and_handshake(
+                                stream,
+                                magic_c,
+                                our,
+                                peer_addr,
+                                height,
+                                true,
+                            )
+                            .await
                             {
-                                return;
-                            }
+                                Ok(x) => x,
+                                Err(e) => {
+                                    // V1-only peers fail BIP324; log once-style message.
+                                    eprintln!("ibd: inbound handshake {peer_addr} failed: {e}");
+                                    return;
+                                }
+                            };
                             // Inbound: do not catch_up (avoids getheaders deadlock with dialer).
-                            let _ = peer_session(stream, magic_c, hub, tip_rx, false).await;
+                            if let Err(e) =
+                                peer_session(reader, writer, magic_c, hub, tip_rx, false).await
+                            {
+                                eprintln!("ibd: inbound session {peer_addr} ended: {e}");
+                            }
                         });
                     }
                     Ok(Err(_)) => break,
@@ -190,17 +205,17 @@ impl P2PNode {
         .await
     }
 
-    /// Parallel sync with default window (1024 tip-ahead, 16 in-transit/peer).
+    /// Parallel sync with default window (1024 concurrent getdata, 16/peer).
     pub async fn parallel_sync_default(&self, peers: &[SocketAddr]) -> Result<u32, NetError> {
         self.parallel_sync(peers, IbdConfig::default()).await
     }
 
     /// Connect outbound, catch up via getheaders, then return (connection closed).
     pub async fn sync_from(&self, peer: SocketAddr) -> Result<u32, NetError> {
-        let mut stream = TcpStream::connect(peer).await?;
+        let stream = TcpStream::connect(peer).await?;
         let height = self.tip_height().map(|h| h as i32).unwrap_or(0);
-        handshake(
-            &mut stream,
+        let (_ver, mut reader, mut writer) = connect_and_handshake(
+            stream,
             self.magic,
             self.local_addr,
             peer,
@@ -234,15 +249,13 @@ impl P2PNode {
         let accepted = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let accepted_c = accepted.clone();
         let n = sync_from_peer(
-            &mut stream,
+            &mut reader,
+            &mut writer,
             self.magic,
             locator,
             move |hash| {
                 hub_has.has_block(hash)
-                    || pending_has
-                        .lock()
-                        .map(|g| g.contains_key(hash))
-                        .unwrap_or(false)
+                    || pending_has.lock().unwrap().contains_key(hash)
             },
             move |_, block| {
                 {
@@ -254,8 +267,7 @@ impl P2PNode {
                     progress = false;
                     let tip = hub_acc.tip_hash();
                     let keys: Vec<BlockHash> = pending_acc
-                        .lock()
-                        .unwrap()
+                        .lock().unwrap()
                         .keys()
                         .copied()
                         .collect();
@@ -308,10 +320,10 @@ impl P2PNode {
 
     /// Persistent outbound peer: catch up, then tip-follow + announce for the session lifetime.
     pub async fn follow_from(&mut self, peer: SocketAddr) -> Result<(), NetError> {
-        let mut stream = TcpStream::connect(peer).await?;
+        let stream = TcpStream::connect(peer).await?;
         let height = self.tip_height().map(|h| h as i32).unwrap_or(0);
-        handshake(
-            &mut stream,
+        let (_ver, reader, writer) = connect_and_handshake(
+            stream,
             self.magic,
             self.local_addr,
             peer,
@@ -323,7 +335,7 @@ impl P2PNode {
         let tip_rx = hub.subscribe_tips();
         let magic = self.magic;
         let task = tokio::spawn(async move {
-            let _ = peer_session(stream, magic, hub, tip_rx, true).await;
+            let _ = peer_session(reader, writer, magic, hub, tip_rx, true).await;
         });
         self.tasks.push(task);
         Ok(())

@@ -12,9 +12,10 @@ rbitcoin-log = { workspace = true }
 rbitcoin-consensus = { workspace = true }
 rbitcoin-query = { workspace = true }
 rbitcoin-store = { workspace = true }
+rbitcoin-mempool = { workspace = true }
 bitcoin = { workspace = true }
-thiserror = { workspace = true }
+bip324 = { workspace = true }
 tokio = { workspace = true }
-parking_lot = { workspace = true }
-bytes = { workspace = true }
-rayon = { workspace = true }
+
+[lints]
+workspace = true

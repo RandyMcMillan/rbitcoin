@@ -10,5 +10,6 @@ description = "Query API over the rbitcoin store"
 rbitcoin-primitives = { workspace = true }
 rbitcoin-store = { workspace = true }
 bitcoin = { workspace = true }
-rayon = { workspace = true }
-thiserror = { workspace = true }
+
+[lints]
+workspace = true

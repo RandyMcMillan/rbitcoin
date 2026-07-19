@@ -7,5 +7,7 @@ rust-version.workspace = true
 description = "Tip wire-format block ring (node layer)"
 
 [dependencies]
-parking_lot = { workspace = true }
-hex = { workspace = true }
+rbitcoin-primitives = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,2142 @@
+//! Concurrent multi-peer block download (libbitcoin-class windowed IBD).
+//!
+//! Architecture:
+//! - N outbound peer workers (each: own TCP stream, command + event channels)
+//! - Shared ordered work queue of block hashes after the local tip
+//! - **In-flight cap** (`window`): max concurrent unique getdata; **not** a tip-distance
+//!   limit — any unarchived hash on the known header path may be requested so archive
+//!   can race to the end of headers while tip waits on holes
+//! - At most `per_peer` outstanding blocks per peer (Core = 16)
+//! - Archive pipeline: dedicated OS **prep** thread → dedicated OS **writer** thread
+//! - Tip **confirm** walks contiguous archived runs (Class C) on a dedicated thread
+//! - Peer IO: concurrent read/write halves; **frame-only** on socket tasks, block
+//!   decode on Tokio blocking pool (never multi-MB deserialize on async workers)
+//! - Stall: 30s with no block-download progress on a peer → disconnect + cooldown
+
+mod archive;
+mod assign_plan;
+mod body;
+mod coalesce;
+mod confirm;
+mod dial;
+mod peer_io;
+mod progress;
+mod state;
+
+#[cfg(test)]
+mod freeze_benches;
+
+use archive::{
+    spawn_archive_pipeline, ArchiveJob, ArchivePipelineStats, ArchiveQueueBudget, ArchiveResult,
+};
+use assign_plan::{classify_height, far_slots_per_peer, remove_from_ordered, want_headers_beyond_soft_cap, WorkClass};
+// compact_ordered used via IbdWorkState::hygiene
+use confirm::{offer_confirm_ready, spawn_confirm_engine, ConfirmEvent, ConfirmFeed};
+use dial::{
+    dial_batch, dial_blocked_addrs, disconnect_stalled_block_peers, expire_addr_cooldown,
+    release_peer_block_work, request_headers, request_headers_from,
+};
+use peer_io::{
+    note_block_progress, touch_block_progress, PeerCmd, PeerEvent, PeerEventSinks, PeerSlot,
+};
+use progress::{ibd_pct, work_chain_progress};
+use state::IbdWorkState;
+
+use crate::chain::ChainHub;
+use crate::codec::MAX_HEADERS_RESULTS;
+use crate::error::NetError;
+use bitcoin::hashes::Hash;
+use bitcoin::p2p::Magic;
+use bitcoin::BlockHash;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use rbitcoin_log::{debug, enabled, info, warn, Level};
+
+/// Main-loop hot-path timers (atomics; reset every status sample).
+///
+/// Used to see whether the pegged core is Class C confirm, getdata assign,
+/// event drain, or the status scan itself.
+///
+/// **Live confirm:** `confirm_ns` only accrues when a batch **finishes**. During a
+/// multi-second `confirm_run`, [`Self::confirm_live`] is set so status can show
+/// in-progress wall + phase counters (which *do* tick mid-batch).
+pub(crate) struct LoopStats {
+    /// Wall time in confirm engine (`hub.confirm_hash`) for **completed** batches.
+    pub(crate) confirm_ns: AtomicU64,
+    /// Successful tip accepts this window.
+    pub(crate) confirm_blocks: AtomicU64,
+    /// Times confirm stopped on a non-skippable reject.
+    pub(crate) confirm_reject_stops: AtomicU64,
+    /// Wall time in `assign_work_ordered`.
+    pub(crate) assign_ns: AtomicU64,
+    /// Unique hashes put into getdata this window.
+    pub(crate) assign_issued: AtomicU64,
+    /// Wall time draining peer/archive channels.
+    pub(crate) drain_ns: AtomicU64,
+    /// Peer + archive events applied this window.
+    pub(crate) drain_events: AtomicU64,
+    /// Wall time building the status `work_chain_progress` snapshot.
+    pub(crate) status_scan_ns: AtomicU64,
+    /// Class A bodies published this run (any height; cumulative).
+    /// Includes gap-fills below the archive high-water mark — not just HWM rises.
+    pub(crate) archived_bodies: AtomicU64,
+    /// In-flight confirm batch (set by confirm OS thread).
+    confirm_live: Mutex<Option<ConfirmLive>>,
+    /// Fast flag for archive far-lane yield (mirrors confirm_live).
+    pub(crate) confirm_active: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConfirmLive {
+    first_height: u32,
+    batch_n: u32,
+    started: Instant,
+}
+
+impl Default for LoopStats {
+    fn default() -> Self {
+        Self {
+            confirm_ns: AtomicU64::new(0),
+            confirm_blocks: AtomicU64::new(0),
+            confirm_reject_stops: AtomicU64::new(0),
+            assign_ns: AtomicU64::new(0),
+            assign_issued: AtomicU64::new(0),
+            drain_ns: AtomicU64::new(0),
+            drain_events: AtomicU64::new(0),
+            status_scan_ns: AtomicU64::new(0),
+            archived_bodies: AtomicU64::new(0),
+            confirm_live: Mutex::new(None),
+            confirm_active: AtomicBool::new(false),
+        }
+    }
+}
+
+impl LoopStats {
+    pub(crate) fn confirm_begin(&self, first_height: u32, batch_n: u32) {
+        *self.confirm_live.lock().unwrap() = Some(ConfirmLive {
+            first_height,
+            batch_n,
+            started: Instant::now(),
+        });
+        self.confirm_active.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn confirm_end(&self) {
+        *self.confirm_live.lock().unwrap() = None;
+        self.confirm_active.store(false, Ordering::Relaxed);
+    }
+
+    /// `(first_height, batch_n, elapsed_ms)` if a confirm batch is running.
+    pub(crate) fn confirm_live_snap(&self) -> Option<(u32, u32, u64)> {
+        self.confirm_live.lock().unwrap().as_ref().map(|l| {
+            (
+                l.first_height,
+                l.batch_n,
+                l.started.elapsed().as_millis() as u64,
+            )
+        })
+    }
+
+    fn sample_and_reset(&self) -> LoopSample {
+        LoopSample {
+            confirm_ns: self.confirm_ns.swap(0, Ordering::Relaxed),
+            confirm_blocks: self.confirm_blocks.swap(0, Ordering::Relaxed),
+            confirm_reject_stops: self.confirm_reject_stops.swap(0, Ordering::Relaxed),
+            assign_ns: self.assign_ns.swap(0, Ordering::Relaxed),
+            assign_issued: self.assign_issued.swap(0, Ordering::Relaxed),
+            drain_ns: self.drain_ns.swap(0, Ordering::Relaxed),
+            drain_events: self.drain_events.swap(0, Ordering::Relaxed),
+            status_scan_ns: self.status_scan_ns.swap(0, Ordering::Relaxed),
+            confirm_live: self.confirm_live_snap(),
+        }
+    }
+}
+
+struct LoopSample {
+    confirm_ns: u64,
+    confirm_blocks: u64,
+    confirm_reject_stops: u64,
+    assign_ns: u64,
+    assign_issued: u64,
+    drain_ns: u64,
+    drain_events: u64,
+    status_scan_ns: u64,
+    /// Live batch if confirm engine is mid-`confirm_run`.
+    confirm_live: Option<(u32, u32, u64)>,
+}
+
+impl LoopSample {
+    fn ms(ns: u64) -> u64 {
+        ns / 1_000_000
+    }
+    fn confirm_ms(&self) -> u64 {
+        Self::ms(self.confirm_ns)
+    }
+    fn assign_ms(&self) -> u64 {
+        Self::ms(self.assign_ns)
+    }
+    fn drain_ms(&self) -> u64 {
+        Self::ms(self.drain_ns)
+    }
+    fn status_scan_ms(&self) -> u64 {
+        Self::ms(self.status_scan_ns)
+    }
+    fn confirm_us_per_block(&self) -> u64 {
+        if self.confirm_blocks == 0 {
+            0
+        } else {
+            (self.confirm_ns / self.confirm_blocks) / 1000
+        }
+    }
+    /// Which phase dominated wall time this window (for one-glance diagnosis).
+    fn dominant(&self) -> &'static str {
+        // Completed-batch timer is 0 while a batch is still running — treat live as confirm.
+        if self.confirm_live.is_some() && self.confirm_ns == 0 {
+            return "confirm";
+        }
+        let c = self.confirm_ns;
+        let a = self.assign_ns;
+        let d = self.drain_ns;
+        let s = self.status_scan_ns;
+        let m = c.max(a).max(d).max(s);
+        if m == 0 {
+            "idle"
+        } else if m == c {
+            "confirm"
+        } else if m == a {
+            "assign"
+        } else if m == d {
+            "drain"
+        } else {
+            "status_scan"
+        }
+    }
+}
+
+/// Default max **concurrent** unique block downloads (in-flight getdata).
+///
+/// Not a tip-distance ceiling: archive may run to the end of the known header
+/// path; this only limits how many bodies we pull at once (backpressure + RAM).
+pub const DEFAULT_IBD_WINDOW: usize = 1024;
+
+/// Soft cap on `ordered` length while still requesting more headers.
+/// Keeps header sync from unbounded growth if peers never signal done; large
+/// enough for full signet / long mainnet catch-up in one run.
+/// Hard ceiling on the ordered work path (memory / hygiene bound).
+const MAX_ORDERED_HEADERS: usize = 500_000;
+/// Soft cap: stop **requesting** more headers once we have this many on the path.
+/// Multi-peer getheaders while `ordered` was 100k–500k flooded the main loop with
+/// expensive Headers events (drain livelock → multi-minute freezes, getdata starved).
+/// ~64k is ample runway for window=1024 archive race + tip holes.
+const ORDERED_HEADERS_SOFT_CAP: usize = 64_000;
+
+/// Max blocks in flight to a single peer (Core `MAX_BLOCKS_IN_TRANSIT_PER_PEER`).
+///
+/// Keeping this at 16 avoids overloading peers with large getdata batches; total
+/// concurrency scales with peer count (`peers × 16`), not by piling work on few hosts.
+pub const DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
+
+/// Near band: tip+1 ..= tip+N (confirm runway + bulk near assign).
+const NEAR_DEPTH: u32 = 4096;
+/// Max contiguous tip+1.. holes to cover per assign.
+const TIP_HOLE_MAX: usize = 32;
+/// Pending (framed, not Class A) longer than this → re-getdata.
+const PENDING_STALE: Duration = Duration::from_secs(45);
+/// Max hashes per far getdata batch.
+const FAR_BATCH_MAX: usize = 16;
+/// Cap height scan for far candidates per assign tick.
+const FAR_SCAN_BUDGET: usize = 16_384;
+
+/// Tunables for parallel IBD (defaults lean libbitcoin/Core-ish).
+#[derive(Clone, Debug)]
+pub struct IbdConfig {
+    /// Max concurrent unique block getdata (in-flight). Not tip-distance.
+    pub window: usize,
+    /// Hard cap on outstanding block getdata to one peer (Core = 16).
+    pub per_peer: usize,
+    /// Desired number of live download peers; we keep redialing until we reach this
+    /// (or exhaust the candidate pool).
+    pub target_peers: usize,
+    /// Disconnect a peer (and reassign its getdata) if it has outstanding block
+    /// requests and no block-download progress for this long.
+    pub stall: Duration,
+    /// Max headers to request per getheaders round-trip.
+    pub headers_batch: usize,
+    /// TCP connect + handshake timeout per peer.
+    pub connect_timeout: Duration,
+}
+
+impl Default for IbdConfig {
+    fn default() -> Self {
+        Self {
+            window: DEFAULT_IBD_WINDOW,
+            per_peer: DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER,
+            target_peers: crate::DEFAULT_IBD_TARGET_PEERS as usize,
+            stall: Duration::from_secs(30),
+            headers_batch: MAX_HEADERS_RESULTS,
+            connect_timeout: Duration::from_secs(8),
+        }
+    }
+}
+
+impl IbdConfig {
+    /// Smaller window for tests.
+    pub fn for_test() -> Self {
+        Self {
+            window: 32,
+            per_peer: 8,
+            target_peers: 4,
+            stall: Duration::from_secs(10),
+            headers_batch: MAX_HEADERS_RESULTS,
+            connect_timeout: Duration::from_secs(3),
+        }
+    }
+}
+
+
+pub async fn parallel_ibd(
+    hub: Arc<ChainHub>,
+    magic: Magic,
+    local_addr: SocketAddr,
+    peers: &[SocketAddr],
+    cfg: IbdConfig,
+) -> Result<u32, NetError> {
+    parallel_ibd_cancellable(hub, magic, local_addr, peers, cfg, None).await
+}
+
+/// Like [`parallel_ibd`], with an optional cancel flag polled each loop turn.
+pub async fn parallel_ibd_cancellable(
+    hub: Arc<ChainHub>,
+    magic: Magic,
+    local_addr: SocketAddr,
+    peers: &[SocketAddr],
+    cfg: IbdConfig,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<u32, NetError> {
+    if peers.is_empty() {
+        return Err(NetError::Protocol("no peers for parallel ibd"));
+    }
+    let cancelled = || {
+        cancel
+            .as_ref()
+            .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(false)
+    };
+
+    // Genesis must exist so getheaders locator is real and blocks link to tip.
+    hub.ensure_genesis()?;
+
+    // Dual channels: body path (framed/decoded blocks) never waits behind Headers.
+    let (body_tx, mut body_rx) = mpsc::unbounded_channel::<PeerEvent>();
+    let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<PeerEvent>();
+    let sinks = PeerEventSinks {
+        body: body_tx,
+        ctrl: ctrl_tx,
+    };
+
+    // Peer TCP tasks share the node multi-thread runtime. Heavy CPU (block
+    // deserialize, archive prep, confirm scripts) runs off those workers
+    // (blocking pool / dedicated OS threads) so socket tasks stay schedulable.
+    // A second nested `ibd-net` runtime was removed: it **panicked on SIGINT**
+    // when the outer select dropped this future (`Cannot drop a runtime in an
+    // async context`).
+    {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        info!(
+            "ibd: tokio worker threads≈{workers} (peer decode: blocking pool; archive: 1 OS prep + 1 OS writer; confirm: 1 OS thread)"
+        );
+    }
+    let peer_pool: Vec<SocketAddr> = peers.to_vec();
+    let next_peer_id = Arc::new(AtomicUsize::new(0));
+
+    // Initial concurrent dial (all candidates once) — OK to await before loop starts.
+    // Abort early if cancel already set mid-dial.
+    let mut initial_slots = dial_batch(
+        &peer_pool,
+        &next_peer_id,
+        peer_pool.len(),
+        HashSet::new(),
+        magic,
+        local_addr,
+        hub.tip_height(),
+        sinks.clone(),
+        cfg.connect_timeout,
+        cancel.as_ref().map(Arc::clone),
+    )
+    .await;
+    if cancelled() {
+        warn!("ibd: cancel during initial dial — stopping");
+        for s in &initial_slots {
+            let _ = s.cmd_tx.send(PeerCmd::Shutdown);
+            s.task.abort();
+        }
+        return Ok(0);
+    }
+    initial_slots.retain(|s| s.alive);
+    if initial_slots.is_empty() {
+        return Err(NetError::Protocol("no parallel peers connected"));
+    }
+    let init_peer_tip = initial_slots.iter().map(|s| s.peer_height).max().unwrap_or(0);
+    info!(
+        "ibd: {} / {} peers ready (target={}, max_peer_height={})",
+        initial_slots.len(),
+        peer_pool.len(),
+        cfg.target_peers,
+        init_peer_tip
+    );
+    // Background redial — never .await dial on the IBD event loop (that stalled tip).
+    let mut last_redial = Instant::now() - Duration::from_secs(15);
+    let mut redial_handle: Option<JoinHandle<Vec<PeerSlot>>> = None;
+
+    let accepted = Arc::new(AtomicU32::new(0));
+    let start_tip = hub.tip_height().unwrap_or(0);
+    let max_archived_shared = Arc::new(AtomicU32::new(start_tip));
+    let confirm_lag = Arc::new(AtomicU32::new(0));
+    let mut last_progress = Instant::now();
+    let mut last_status = Instant::now();
+    let mut last_progress_log = Instant::now() - Duration::from_secs(2);
+    // Last tip we emitted on an INFO progress line.
+    let mut last_logged_tip = start_tip;
+    // Max concurrent unique downloads (not tip-distance).
+    let window = cfg.window;
+
+    let mut st = IbdWorkState::new(initial_slots, hub.tip_hash(), hub.tip_height());
+    // Reload post-tip headers + Class A from disk so restart does not re-getdata
+    // bodies that are already archived (ordered path was process-local only).
+    seed_work_path_from_store(&mut st, hub.as_ref());
+
+    // Kick header sync — try a few peers (channel may close if handshake race).
+    for _ in 0..st.slots.len().min(4) {
+        let tips = work_path_tips(&st);
+        if request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips).unwrap_or(false) {
+            break;
+        }
+    }
+
+    // Archive pipeline: multi-core prep + exclusive writer (mmap Class A).
+    // Byte budget (~1 GiB default via RBITCOIN_ARCHIVE_QUEUE_MB) caps decoded
+    // blocks waiting for archive; getdata pauses when full (no drop).
+    let archive_queued = ArchiveQueueBudget::from_env();
+    info!(
+        "ibd: archive queue budget={} MiB (RBITCOIN_ARCHIVE_QUEUE_MB)",
+        archive_queued.budget_bytes() / (1024 * 1024)
+    );
+    let pipe_stats = Arc::new(ArchivePipelineStats::default());
+    let loop_stats = Arc::new(LoopStats::default());
+    // Seed arch_total from durable Class A on disk (not zero at restart).
+    let store_arch_total = hub.query.archived_block_count().unwrap_or(0);
+    loop_stats
+        .archived_bodies
+        .store(store_arch_total, Ordering::Relaxed);
+    let mut last_logged_arch_total = store_arch_total;
+    if store_arch_total > 0 {
+        info!("ibd: store has {store_arch_total} Class A bodies (arch_total seed)");
+    }
+    let (arch_job_tx, arch_job_rx) = mpsc::unbounded_channel::<ArchiveJob>();
+    let (arch_res_tx, mut arch_res_rx) = mpsc::unbounded_channel::<ArchiveResult>();
+    let pipeline = spawn_archive_pipeline(
+        hub.clone(),
+        arch_job_rx,
+        arch_res_tx,
+        Arc::clone(&pipe_stats),
+        Arc::clone(&archive_queued),
+        Arc::clone(&confirm_lag),
+        Arc::clone(&loop_stats),
+    );
+
+    // Dedicated confirm path — never blocks the network/archive event loop.
+    let confirm_feed = Arc::new(ConfirmFeed::new());
+    // Unbounded: SyncSender(512) deadlocked the confirm OS thread when the main
+    // loop lagged on header drain (send blocks → tip frozen, hole=0, confirm_blks=0).
+    let (confirm_ev_tx, confirm_ev_rx) = std::sync::mpsc::channel::<ConfirmEvent>();
+    let confirm_engine = spawn_confirm_engine(
+        hub.clone(),
+        Arc::clone(&confirm_feed),
+        confirm_ev_tx,
+        Arc::clone(&accepted),
+        Arc::clone(&loop_stats),
+    );
+    // Seed engine with any bodies already on disk for the work path.
+    offer_confirm_ready(
+        &confirm_feed,
+        &st.height_to_hash,
+        &mut st.body,
+        hub.as_ref(),
+        &mut st.max_archived_height,
+        &max_archived_shared,
+    );
+    update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_archived_height);
+
+    let mut loop_n = 0u32;
+    loop {
+        if cancelled() {
+            warn!("ibd: cancel requested — stopping parallel IBD");
+            break;
+        }
+        // Yield occasionally so shutdown can run; every-tick yield_now burned
+        // scheduler time while confirm already saturates cores.
+        loop_n = loop_n.wrapping_add(1);
+        if loop_n % 8 == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        // Confirm results first — keep tip moving even when peer header floods
+        // dominate drain budget (and free ordered front for the next offer).
+        while let Ok(ev) = confirm_ev_rx.try_recv() {
+            match ev {
+                ConfirmEvent::Accepted { hash, .. } => {
+                    last_progress = Instant::now();
+                    remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
+                    st.body.mark_archived(hash);
+                }
+                ConfirmEvent::Reject { hash, err, .. } => {
+                    apply_confirm_reject(&mut st, hash, &err);
+                }
+            }
+        }
+
+        // Drain all ready peer/archive events **before** stall checks.
+        if !drain_ready_peer_and_archive_events(
+            &mut st,
+            hub.as_ref(),
+            &mut body_rx,
+            &mut ctrl_rx,
+            &mut arch_res_rx,
+            &arch_job_tx,
+            &archive_queued,
+            &loop_stats,
+        )? {
+            break;
+        }
+
+        // Drop already-confirmed / past-tip prefixes from the ordered queue.
+        let tip_now = hub.tip_height().unwrap_or(0);
+        while let Some(&front) = st.ordered.front() {
+            let past = hub.has_block(&front)
+                || st
+                    .hash_height
+                    .get(&front)
+                    .is_some_and(|&ht| ht <= tip_now);
+            if past {
+                st.ordered.pop_front();
+                st.ordered_set.remove(&front);
+            } else {
+                break;
+            }
+        }
+        // Compact ghosts + bound hash_height / header_fks (see IbdWorkState::hygiene).
+        st.hygiene();
+
+        // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
+        // Confirm used to run here first and left free peer st.slots idle while we
+        // walked tip (bad bandwidth utilization with arch_q≈0).
+        // Pause new getdata when decoded bodies waiting for archive hit the
+        // byte budget — backpressure without dropping unique delivered bytes.
+        let arch_bytes = archive_queued.bytes();
+        if archive_queued.has_room() {
+            assign_work_ordered(
+                &mut st,
+                hub.as_ref(),
+                &cfg,
+                &loop_stats,
+                arch_bytes,
+                archive_queued.budget_bytes(),
+            );
+        }
+
+        // Offer archived bodies to the dedicated confirm engine (non-blocking).
+        offer_confirm_ready(
+            &confirm_feed,
+            &st.height_to_hash,
+            &mut st.body,
+            hub.as_ref(),
+            &mut st.max_archived_height,
+            &max_archived_shared,
+        );
+        update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_archived_height);
+        // Apply confirm results without doing Class C on this task.
+        while let Ok(ev) = confirm_ev_rx.try_recv() {
+            match ev {
+                ConfirmEvent::Accepted { hash, .. } => {
+                    last_progress = Instant::now();
+                    remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
+                    st.body.mark_archived(hash);
+                }
+                ConfirmEvent::Reject { hash, err, .. } => {
+                    apply_confirm_reject(&mut st, hash, &err);
+                }
+            }
+        }
+        // Progress may have arrived (peer IO is concurrent).
+        if !drain_ready_peer_and_archive_events(
+            &mut st,
+            hub.as_ref(),
+            &mut body_rx,
+            &mut ctrl_rx,
+            &mut arch_res_rx,
+            &arch_job_tx,
+            &archive_queued,
+            &loop_stats,
+        )? {
+            break;
+        }
+        // Immediate re-top-up after Block events freed st.inflight during confirm.
+        let arch_bytes2 = archive_queued.bytes();
+        if archive_queued.has_room() {
+            assign_work_ordered(
+                &mut st,
+                hub.as_ref(),
+                &cfg,
+                &loop_stats,
+                arch_bytes2,
+                archive_queued.budget_bytes(),
+            );
+        }
+
+        // Header sync: soft-cap live work (`ordered_set`), not deque len (ghosts).
+        //
+        // Sparse far-only archives used to push max_archived ≈ max_ordered while
+        // most bodies were still missing. That made `arch_runway` look empty and
+        // **bypassed the soft cap forever** → header floods, drain livelock,
+        // arch_q=0 / writer idle, ~5–10 unique Class A bodies/s despite high BW.
+        // Only bypass soft cap when the ordered path is **mostly archived** (dense).
+        {
+            let live = st.ordered_set.len();
+            let known_arch = st.body.known_len();
+            let arch_runway = st
+                .max_ordered_height
+                .saturating_sub(st.max_archived_height);
+            let need_arch_runway = want_headers_beyond_soft_cap(
+                live,
+                known_arch,
+                arch_runway,
+                (window as u32).saturating_mul(4).max(2048),
+            );
+            let under_hard = live < MAX_ORDERED_HEADERS;
+            let under_soft = live < ORDERED_HEADERS_SOFT_CAP;
+            if !st.headers_done && under_hard && (under_soft || need_arch_runway) {
+                let tip_h = hub.tip_height().unwrap_or(0);
+                let min_runway = window.saturating_mul(8).max(4096);
+                let want_more = live == 0
+                    || live < min_runway
+                    || header_lag_behind_peers(&st, tip_h) > 0
+                    || need_arch_runway;
+                if want_more {
+                    let tips = work_path_tips(&st);
+                    let _ = request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
+                }
+            }
+        }
+
+        // Hard path reset after a long stall with no tip advance.
+        // Do not clear a full st.ordered queue that simply has not finished getdata yet.
+        if last_progress.elapsed() > cfg.stall.saturating_mul(6)
+            && st.ordered.is_empty()
+            && st.inflight.is_empty()
+        {
+            info!(
+                "ibd: hard path reset (stall {:?}, st.ordered empty)",
+                last_progress.elapsed()
+            );
+            st.headers_done = false;
+            let tips = work_path_tips(&st);
+            let _ = request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
+            last_progress = Instant::now();
+        }
+
+        // Stall only after progress events are applied.
+        let now = Instant::now();
+        disconnect_stalled_block_peers(
+            &mut st.slots,
+            &mut st.inflight,
+            &mut st.addr_cooldown,
+            now,
+            cfg.stall,
+        );
+        // Drop dead st.slots so we do not keep ghost rows (Drop aborts IO if needed).
+        st.slots.retain(|s| s.alive);
+        expire_addr_cooldown(&mut st.addr_cooldown, now);
+
+        // Collect finished background dials without blocking the event loop.
+        if redial_handle
+            .as_ref()
+            .map(|h| h.is_finished())
+            .unwrap_or(false)
+        {
+            if let Some(h) = redial_handle.take() {
+                match h.await {
+                    Ok(fresh) => {
+                        let blocked = dial_blocked_addrs(&st.slots, &st.addr_cooldown, Instant::now());
+                        let mut n = 0usize;
+                        for s in fresh {
+                            // Race: same addr may have connected on another path.
+                            if blocked.contains(&s.addr)
+                                || st.slots.iter().any(|x| x.addr == s.addr)
+                            {
+                                warn!(
+                                    "ibd: drop duplicate/cooldown dial peer[{}] {}",
+                                    s.id, s.addr
+                                );
+                                continue;
+                            }
+                            st.max_peer_height = st.max_peer_height.max(s.peer_height);
+                            info!(
+                                "ibd: parallel peer[{}] {} connected (peer_height={})",
+                                s.id, s.addr, s.peer_height
+                            );
+                            st.slots.push(s);
+                            n += 1;
+                        }
+                        if n > 0 {
+                            st.slots.sort_by_key(|s| s.id);
+                            info!(
+                                "ibd: redial added {n} peer(s); live={}",
+                                st.slots.iter().filter(|s| s.alive).count()
+                            );
+                        }
+                    }
+                    Err(e) => warn!("ibd: redial task failed: {e}"),
+                }
+            }
+        }
+
+        // Kick a non-blocking redial if under target and none in flight.
+        let alive_n = st.slots.iter().filter(|s| s.alive).count();
+        let target = cfg.target_peers.min(peer_pool.len()).max(1);
+        if redial_handle.is_none()
+            && alive_n < target
+            && last_redial.elapsed() > Duration::from_secs(15)
+        {
+            let want = (target - alive_n).min(8).max(1);
+            let already = dial_blocked_addrs(&st.slots, &st.addr_cooldown, Instant::now());
+            info!(
+                "ibd: redialing up to {want} peers (alive={alive_n}/{target}, pool={}, blocked={})…",
+                peer_pool.len(),
+                already.len()
+            );
+            let pool = peer_pool.clone();
+            let next_id = next_peer_id.clone();
+            let tip_h = hub.tip_height();
+            let sinks_r = sinks.clone();
+            let cto = cfg.connect_timeout;
+            let cancel_c = cancel.as_ref().map(Arc::clone);
+            redial_handle = Some(tokio::spawn(async move {
+                dial_batch(
+                    &pool,
+                    &next_id,
+                    want,
+                    already,
+                    magic,
+                    local_addr,
+                    tip_h,
+                    sinks_r,
+                    cto,
+                    cancel_c,
+                )
+                .await
+            }));
+            last_redial = Instant::now();
+        }
+
+        // Single INFO progress path (~1/s when tip or archived advanced).
+        // Status every 5s is pipeline health only (no second progress line).
+        if last_progress_log.elapsed() >= Duration::from_secs(1) {
+            let prog = work_chain_progress(
+                hub.as_ref(),
+                &st.ordered,
+                &st.ordered_set,
+                &mut st.body,
+                st.max_peer_height,
+                st.max_archived_height,
+            );
+            let tip_delta = prog.tip.saturating_sub(last_logged_tip);
+            // Cumulative Class-A body count (any height); +arch is the interval delta.
+            let arch_total = loop_stats.archived_bodies.load(Ordering::Relaxed);
+            let arch_delta = arch_total.saturating_sub(last_logged_arch_total);
+            if tip_delta > 0 || arch_delta > 0 {
+                let pct = ibd_pct(prog.tip, prog.headers);
+                info!(
+                    "ibd: progress {pct}% tip={} arch_hwm={} arch_total={arch_total} horizon={} hole={} (+tip={tip_delta} +arch={arch_delta})",
+                    prog.tip,
+                    prog.archived,
+                    prog.headers,
+                    prog.tip_hole,
+                );
+                last_logged_tip = prog.tip;
+                last_logged_arch_total = arch_total;
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+            }
+            last_progress_log = Instant::now();
+        }
+        if last_status.elapsed() > Duration::from_secs(5) {
+            let scan_t0 = Instant::now();
+            let prog = work_chain_progress(
+                hub.as_ref(),
+                &st.ordered,
+                &st.ordered_set,
+                &mut st.body,
+                st.max_peer_height,
+                st.max_archived_height,
+            );
+            loop_stats
+                .status_scan_ns
+                .fetch_add(scan_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let peers_n = st.slots.iter().filter(|s| s.alive).count();
+            // st.inflight cap = min(window, peers×per_peer); fill by adding peers, not per_peer.
+            let peer_cap = peers_n.saturating_mul(cfg.per_peer);
+            let inflight_cap = cfg.window.min(peer_cap).max(1);
+            let hot = loop_stats.sample_and_reset();
+            // Height lead (not O(path) body count): Class A high-water − tip + inflight.
+            let ahead = prog
+                .archived
+                .saturating_sub(prog.tip)
+                .saturating_add(st.inflight.len() as u32);
+            // Pipeline snapshot — chain heights live on `progress` lines above.
+            let arch_mb = archive_queued.bytes() / (1024 * 1024);
+            let arch_budget_mb = archive_queued.budget_bytes() / (1024 * 1024);
+            let arch_q_now = archive_queued.count();
+            let pending_n = st.body.pending_len();
+            let known_arch_n = st.body.known_len();
+            info!(
+                "ibd: status inflight={}/{} arch_q={arch_q_now} arch={arch_mb}/{arch_budget_mb}MiB pending={pending_n} known_arch={known_arch_n} ordered={} ahead={ahead} hole={} headers_done={} peers={peers_n}",
+                st.inflight.len(),
+                inflight_cap,
+                st.ordered.len(),
+                prog.tip_hole,
+                st.headers_done,
+            );
+            // Stall watchdog: archive-complete + tip frozen is a confirm-path bug.
+            if last_progress.elapsed() > Duration::from_secs(15)
+                && prog.tip_hole == 0
+                && st.inflight.is_empty()
+                && arch_q_now == 0
+                && prog.archived > prog.tip.saturating_add(1)
+            {
+                let expect = prog.tip.saturating_add(1);
+                let hth = st.height_to_hash.get(&expect).copied();
+                let ready = hth
+                    .map(|h| st.body.is_known_archived(&h) || hub.is_archived(&h))
+                    .unwrap_or(false);
+                let has = hth.map(|h| hub.has_block(&h)).unwrap_or(false);
+                let in_set = hth
+                    .map(|h| st.ordered_set.contains(&h))
+                    .unwrap_or(false);
+                let noted = offer_confirm_ready(
+                    &confirm_feed,
+                    &st.height_to_hash,
+                    &mut st.body,
+                    hub.as_ref(),
+                    &mut st.max_archived_height,
+                    &max_archived_shared,
+                );
+                update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_archived_height);
+                warn!(
+                    "ibd: tip stall tip={} expect={expect} hth={} ready={ready} has_block={has} in_ordered={in_set} offer_noted={noted} hwm={} ordered_len={} (idle {:?})",
+                    prog.tip,
+                    hth.is_some(),
+                    prog.archived,
+                    st.ordered.len(),
+                    last_progress.elapsed(),
+                );
+            }
+            // Phase counters tick mid-batch; confirm_ns only when a batch finishes.
+            let (
+                recon_ns,
+                prefetch_ns,
+                wave_fill_ns,
+                wire_ns,
+                connect_ns,
+                script_ns,
+                class_c_ns,
+                strong_ns,
+                sh_ns,
+                tip_ns,
+                spent_local_ns,
+                phase_blks,
+            ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
+            let (sh_warm, sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head, sh_index) =
+                rbitcoin_query::class_c_phase_stats::sample_sh_sub_and_reset();
+            // sh_ns is sum of substeps (same sample window) — no phantom other_ms.
+            let phase_any = recon_ns
+                + connect_ns
+                + script_ns
+                + class_c_ns
+                + strong_ns
+                + sh_ns
+                + tip_ns
+                + spent_local_ns
+                + phase_blks
+                > 0;
+            let recon_sub_any = prefetch_ns + wave_fill_ns + wire_ns > 0;
+            let sh_any = sh_warm
+                + sh_filter
+                + sh_collect
+                + sh_sort
+                + sh_seed
+                + sh_body
+                + sh_head
+                + sh_index
+                + sh_ns
+                > 0;
+
+            // INFO while confirm is live or phases moved — so time is not "hidden"
+            // between tip advances (progress lines only fire on tip/arch delta).
+            if let Some((first, n, elapsed_ms)) = hot.confirm_live {
+                info!(
+                    "ibd: confirm_live first={first} batch={n} elapsed_ms={elapsed_ms} recon_ms={} (prefetch={} wave={} wire={}) connect_ms={} script_ms={} class_c_ms={} strong_ms={} sh_ms={} (blks_done={} this window; wall accrues at batch end)",
+                    recon_ns / 1_000_000,
+                    prefetch_ns / 1_000_000,
+                    wave_fill_ns / 1_000_000,
+                    wire_ns / 1_000_000,
+                    connect_ns / 1_000_000,
+                    script_ns / 1_000_000,
+                    class_c_ns / 1_000_000,
+                    strong_ns / 1_000_000,
+                    sh_ns / 1_000_000,
+                    phase_blks,
+                );
+            } else if phase_any {
+                info!(
+                    "ibd: confirm_phases blks={} reconstruct_ms={} (prefetch={} wave={} wire={}) connect_ms={} script_ms={} class_c_ms={} strong_ms={} sh_ms={} tip_ms={}",
+                    phase_blks,
+                    recon_ns / 1_000_000,
+                    prefetch_ns / 1_000_000,
+                    wave_fill_ns / 1_000_000,
+                    wire_ns / 1_000_000,
+                    connect_ns / 1_000_000,
+                    script_ns / 1_000_000,
+                    class_c_ns / 1_000_000,
+                    strong_ns / 1_000_000,
+                    sh_ns / 1_000_000,
+                    tip_ns / 1_000_000,
+                );
+            }
+            if recon_sub_any {
+                info!(
+                    "ibd: recon_phases prefetch_ms={} wave_fill_ms={} wire_ms={} total_ms={}",
+                    prefetch_ns / 1_000_000,
+                    wave_fill_ns / 1_000_000,
+                    wire_ns / 1_000_000,
+                    recon_ns / 1_000_000,
+                );
+            }
+            if sh_any {
+                info!(
+                    "ibd: sh_phases warm_ms={} filter_ms={} collect_ms={} sort_ms={} seed_ms={} body_ms={} head_ms={} index_ms={} wall_ms={}",
+                    sh_warm / 1_000_000,
+                    sh_filter / 1_000_000,
+                    sh_collect / 1_000_000,
+                    sh_sort / 1_000_000,
+                    sh_seed / 1_000_000,
+                    sh_body / 1_000_000,
+                    sh_head / 1_000_000,
+                    sh_index / 1_000_000,
+                    sh_ns / 1_000_000,
+                );
+            }
+
+            let pipe_snap = if enabled(Level::Debug) {
+                Some(pipe_stats.sample_and_reset())
+            } else {
+                None
+            };
+            if enabled(Level::Debug) {
+                let denom = phase_blks.max(1);
+                debug!(
+                    "ibd: hot dominant={} confirm_ms={} confirm_blks={} confirm_us/blk={} reject_stops={} assign_ms={} getdata={} drain_ms={} events={} status_scan_ms={}",
+                    hot.dominant(),
+                    hot.confirm_ms(),
+                    hot.confirm_blocks,
+                    hot.confirm_us_per_block(),
+                    hot.confirm_reject_stops,
+                    hot.assign_ms(),
+                    hot.assign_issued,
+                    hot.drain_ms(),
+                    hot.drain_events,
+                    hot.status_scan_ms(),
+                );
+                // Detailed us/blk breakdown stays DEBUG (INFO has the live/phase summary).
+                if phase_any {
+                    debug!(
+                        "ibd: confirm_phases_detail us/blk recon={} prefetch={} wave={} wire={} connect={} script={} class_c={} strong={} sh={} tip={} spent_local={}",
+                        (recon_ns / denom) / 1000,
+                        (prefetch_ns / denom) / 1000,
+                        (wave_fill_ns / denom) / 1000,
+                        (wire_ns / denom) / 1000,
+                        (connect_ns / denom) / 1000,
+                        (script_ns / denom) / 1000,
+                        (class_c_ns / denom) / 1000,
+                        (strong_ns / denom) / 1000,
+                        (sh_ns / denom) / 1000,
+                        (tip_ns / denom) / 1000,
+                        (spent_local_ns / denom) / 1000,
+                    );
+                }
+                let (cah, cam, cae) = rbitcoin_query::class_a_cache_stats::sample_and_reset();
+                if cah + cam > 0 {
+                    let hit_pct = (100 * cah) / (cah + cam).max(1);
+                    debug!(
+                        "ibd: class_a_cache hit={} miss={} evict={} hit%={}",
+                        cah, cam, cae, hit_pct
+                    );
+                }
+                let (tph, tpm, tpe, tpn, tpr) =
+                    rbitcoin_query::tip_prevout_cache_stats::sample_and_reset();
+                if tph + tpm + tpn + tpr > 0 {
+                    let hit_pct = (100 * tph) / (tph + tpm).max(1);
+                    debug!(
+                        "ibd: tip_prevout_cache hit={} miss={} evict={} note={} retire={} hit%={}",
+                        tph, tpm, tpe, tpn, tpr, hit_pct
+                    );
+                }
+                let (pth, pwh, pca, psm) =
+                    rbitcoin_query::connect_prevout_stats::sample_and_reset();
+                if pth + pwh + pca + psm > 0 {
+                    let tot = pth + pwh + pca + psm;
+                    debug!(
+                        "ibd: connect_prevout tip_hit={} wave_hit={} class_a_hit={} store_miss={} tip%={} wave%={} class_a%={} store%={}",
+                        pth,
+                        pwh,
+                        pca,
+                        psm,
+                        (100 * pth) / tot.max(1),
+                        (100 * pwh) / tot.max(1),
+                        (100 * pca) / tot.max(1),
+                        (100 * psm) / tot.max(1),
+                    );
+                }
+                if let Some(s) = pipe_snap {
+                    let busy = s.write_busy_ms();
+                    let idle = s.write_idle_ms();
+                    let total_w = busy.saturating_add(idle).max(1);
+                    let writer_busy_pct = (100 * busy) / total_w;
+                    debug!(
+                        "ibd: pipe prep_us/blk={} prep_blks={} write_us/blk={} write_blks={} batch_avg={} writer_busy%={} idle_ms={} coalesce_ms={} prep_ms={}",
+                        s.prep_us_per_block(),
+                        s.prep_blocks,
+                        s.write_us_per_block(),
+                        s.write_blocks,
+                        s.avg_batch(),
+                        writer_busy_pct,
+                        s.write_idle_ms(),
+                        s.write_coalesce_ms(),
+                        s.prep_ms(),
+                    );
+                }
+            }
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            last_status = Instant::now();
+        }
+
+        // Exit only when the work path is drained **and** we are at (or past)
+        // peer-advertised height, or headers_done with no lag. Never exit solely
+        // on headers_done while max_peer_height still dwarfs our tip (signet:
+        // false headers_done at h≈2000 with peers at ~313k).
+        let tip_h = hub.tip_height().unwrap_or(0);
+        let lag = header_lag_behind_peers(&st, tip_h);
+        let peer_caught_up = tip_h > 0 && lag <= 2 && tip_h >= st.max_archived_height;
+        let path_drained = st.ordered.is_empty()
+            && st.inflight.is_empty()
+            && archive_queued.count() == 0;
+        if path_drained && (peer_caught_up || (st.headers_done && lag <= 2)) {
+            offer_confirm_ready(
+                &confirm_feed,
+                &st.height_to_hash,
+                &mut st.body,
+                hub.as_ref(),
+                &mut st.max_archived_height,
+                &max_archived_shared,
+            );
+            update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_archived_height);
+                let tip_h = hub.tip_height().unwrap_or(0);
+            let lag = header_lag_behind_peers(&st, tip_h);
+            let still_ok = lag <= 2
+                && st.ordered.is_empty()
+                && st.inflight.is_empty()
+                && archive_queued.count() == 0;
+            if still_ok && (st.headers_done || tip_h >= st.max_peer_height.saturating_sub(2)) {
+                info!(
+                    "ibd: catch-up complete tip={tip_h} max_peer_height={} max_archived={} headers_done={} — exiting parallel IBD",
+                    st.max_peer_height, st.max_archived_height, st.headers_done
+                );
+                break;
+            }
+            if lag > 2 {
+                // Path empty but peers still ahead — resume header sync.
+                st.headers_done = false;
+                let tips = work_path_tips(&st);
+                let _ = request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
+            }
+        }
+        // All peers dead
+        if st.slots.iter().all(|s| !s.alive) {
+            if accepted.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            return Err(NetError::Protocol("all parallel peers dead"));
+        }
+
+        // Wait for the next peer/archive event or a short tick.
+        // Prefer body path (blocks) over headers so delivered bytes are applied first.
+        let tick = tokio::time::sleep(Duration::from_millis(50));
+        tokio::pin!(tick);
+        tokio::select! {
+            biased;
+            peer_ev = body_rx.recv() => {
+                if cancelled() {
+                    warn!("ibd: cancel requested — stopping parallel IBD");
+                    break;
+                }
+                let Some(ev) = peer_ev else { break };
+                apply_peer_event(
+                    &mut st,
+                    hub.as_ref(),
+                    ev,
+                    &arch_job_tx,
+                    &archive_queued,
+                );
+            }
+            peer_ev = ctrl_rx.recv() => {
+                if cancelled() {
+                    warn!("ibd: cancel requested — stopping parallel IBD");
+                    break;
+                }
+                let Some(ev) = peer_ev else { break };
+                apply_peer_event(
+                    &mut st,
+                    hub.as_ref(),
+                    ev,
+                    &arch_job_tx,
+                    &archive_queued,
+                );
+            }
+            arch = arch_res_rx.recv() => {
+                if cancelled() {
+                    warn!("ibd: cancel requested — stopping parallel IBD");
+                    break;
+                }
+                let Some(r) = arch else {
+                    if !cancelled() {
+                        warn!("ibd: archive pipeline ended");
+                    }
+                    break;
+                };
+                apply_archive_result(&mut st, r, &archive_queued, &loop_stats);
+            }
+            _ = &mut tick => {
+                if cancelled() {
+                    warn!("ibd: cancel requested — stopping parallel IBD");
+                    break;
+                }
+                offer_confirm_ready(
+                    &confirm_feed,
+                    &st.height_to_hash,
+                    &mut st.body,
+                    hub.as_ref(),
+                    &mut st.max_archived_height,
+                    &max_archived_shared,
+                );
+                update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_archived_height);
+                        while let Ok(ev) = confirm_ev_rx.try_recv() {
+                    match ev {
+                        ConfirmEvent::Accepted { hash, .. } => {
+                            last_progress = Instant::now();
+                            remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
+                            st.body.mark_archived(hash);
+                        }
+                        ConfirmEvent::Reject { hash, err, .. } => {
+                            apply_confirm_reject(&mut st, hash, &err);
+                        }
+                    }
+                }
+                if last_progress.elapsed() > cfg.stall
+                    && st.ordered.is_empty()
+                    && st.inflight.is_empty()
+                    && archive_queued.count() == 0
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    let cancelled_exit = cancelled();
+
+    // Stop confirm engine first (may be mid-validate).
+    confirm_feed.request_stop();
+    let _ = confirm_engine.join();
+
+    // Tear down peers first so sockets stop filling archive/job channels.
+    for s in &st.slots {
+        let _ = s.cmd_tx.send(PeerCmd::Shutdown);
+        s.task.abort();
+    }
+    st.slots.clear();
+    if let Some(h) = redial_handle.take() {
+        h.abort();
+    }
+
+    // Close archive ingress; abort pipeline task (prep/writer exit on channel close).
+    drop(arch_job_tx);
+    pipeline.abort();
+    // Best-effort drain of results already in the channel (non-blocking).
+    while let Ok(r) = arch_res_rx.try_recv() {
+        match r {
+            ArchiveResult::Ok { hash, .. } => st.body.mark_archived(hash),
+            ArchiveResult::Err { hash, .. } => st.body.mark_missing(hash),
+        }
+    }
+
+    // Confirm engine already stopped; remaining tip catch-up is left to a later run
+    // (or happens before stop if st.ordered was offered).
+    let _ = cancelled_exit;
+
+    let n = accepted.load(Ordering::SeqCst);
+    info!(
+        "ibd: parallel done accepted={n} tip={:?} (started {start_tip}, cancelled={cancelled_exit})",
+        hub.tip_height()
+    );
+    Ok(n)
+}
+
+
+/// Header/control events per turn (anti-livelock under multi-peer header spam).
+const CTRL_DRAIN_EVENT_BUDGET: u64 = 512;
+const CTRL_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(5);
+/// Body path (framed/decoded blocks): process as much as possible so delivered
+/// bytes are not stranded behind headers. Soft wall so cancel/assign still run.
+const BODY_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(40);
+
+/// Non-blocking drain of archive results + peer events.
+///
+/// **Priority:** archive results → body (`BlockFramed`/`Block`/…) → headers.
+/// Delivered block bytes must not wait on header floods (single-FIFO waste).
+/// Headers remain budgeted so apply cannot livelock.
+fn drain_ready_peer_and_archive_events(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    body_rx: &mut mpsc::UnboundedReceiver<PeerEvent>,
+    ctrl_rx: &mut mpsc::UnboundedReceiver<PeerEvent>,
+    arch_res_rx: &mut mpsc::UnboundedReceiver<ArchiveResult>,
+    arch_job_tx: &mpsc::UnboundedSender<ArchiveJob>,
+    archive_queued: &ArchiveQueueBudget,
+    loop_stats: &LoopStats,
+) -> Result<bool, NetError> {
+    let t0 = Instant::now();
+    let mut events = 0u64;
+
+    // 1) Archive completions (free arch_q bookkeeping) — drain fully, cheap.
+    loop {
+        match arch_res_rx.try_recv() {
+            Ok(r) => {
+                events += 1;
+                apply_archive_result(st, r, archive_queued, loop_stats);
+            }
+            Err(_) => break,
+        }
+    }
+
+    // 2) Body path: framed/decoded blocks — drain until empty or soft time budget.
+    let body_t0 = Instant::now();
+    loop {
+        if body_t0.elapsed() >= BODY_DRAIN_TIME_BUDGET {
+            break;
+        }
+        match body_rx.try_recv() {
+            Ok(ev) => {
+                events += 1;
+                apply_peer_event(st, hub, ev, arch_job_tx, archive_queued);
+            }
+            Err(_) => break,
+        }
+    }
+
+    // 3) Headers / other control — budgeted (never drop; resume next turn).
+    let ctrl_t0 = Instant::now();
+    let mut ctrl_n = 0u64;
+    while ctrl_n < CTRL_DRAIN_EVENT_BUDGET && ctrl_t0.elapsed() < CTRL_DRAIN_TIME_BUDGET {
+        match ctrl_rx.try_recv() {
+            Ok(ev) => {
+                events += 1;
+                ctrl_n += 1;
+                apply_peer_event(st, hub, ev, arch_job_tx, archive_queued);
+            }
+            Err(_) => break,
+        }
+    }
+
+    loop_stats
+        .drain_ns
+        .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    loop_stats
+        .drain_events
+        .fetch_add(events, Ordering::Relaxed);
+    Ok(true)
+}
+
+fn apply_peer_event(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    ev: PeerEvent,
+    arch_job_tx: &mpsc::UnboundedSender<ArchiveJob>,
+    archive_queued: &ArchiveQueueBudget,
+) {
+    match ev {
+        PeerEvent::Headers { peer, headers } => {
+            let batch_len = headers.len();
+            let mut added = 0usize;
+            for hdr in headers {
+                let hash = hdr.block_hash();
+                // Multi-peer overlap re-sends the same 2000-header windows. Full
+                // ensure_header_fk (hash-head lookup + maybe put) on every repeat
+                // made drain cost climb from ~µs to ~ms per event and froze the
+                // main loop for tens of seconds with no status lines.
+                if st.known_headers.contains(&hash) && st.header_fks.contains_key(&hash) {
+                    if let Some(h) = parent_height(&st.hash_height, hub, hdr.prev_blockhash) {
+                        if !st.hash_height.contains_key(&hash) {
+                            st.record_height(hash, h);
+                        }
+                        st.max_ordered_height = st.max_ordered_height.max(h);
+                    }
+                    continue;
+                }
+                let prev = hdr.prev_blockhash;
+                if let Some(h) = parent_height(&st.hash_height, hub, prev) {
+                    if !st.hash_height.contains_key(&hash) {
+                        st.record_height(hash, h);
+                    }
+                    st.max_peer_height = st.max_peer_height.max(h);
+                    st.max_ordered_height = st.max_ordered_height.max(h);
+                }
+                // Persist header row once and cache fk — Block path must not re-hit store.
+                if !st.header_fks.contains_key(&hash) {
+                    if let Ok(fk) = hub.ensure_header_fk(&hdr) {
+                        st.header_fks.insert(hash, fk);
+                    }
+                }
+                if hub.has_block(&hash) {
+                    st.known_headers.insert(hash);
+                    continue;
+                }
+                // Confirm-rejected bodies stay blacklisted for this run.
+                if st.body.is_rejected(&hash) {
+                    continue;
+                }
+                let prev_ok = st.known_headers.contains(&prev)
+                    || hub.has_block(&prev)
+                    || prev.to_byte_array() == [0u8; 32]
+                    || hub.tip_hash() == Some(prev);
+                if !prev_ok && hub.tip_height().is_some() && !st.known_headers.is_empty() {
+                    continue;
+                }
+                st.known_headers.insert(hash);
+                // Refuse to put a hash on the confirm path without a height — offer
+                // needs ht==tip+1; unknown-height entries used to stall tip silently.
+                if !st.hash_height.contains_key(&hash) {
+                    continue;
+                }
+                if st.ordered.len() >= MAX_ORDERED_HEADERS {
+                    continue;
+                }
+                if st.ordered_set.insert(hash) {
+                    st.ordered.push_back(hash);
+                    added += 1;
+                }
+            }
+            if added > 0 {
+                st.empty_header_streak = 0;
+                st.headers_done = false;
+                let live = st.ordered_set.len();
+                let need_arch_runway = want_headers_beyond_soft_cap(
+                    live,
+                    st.body.known_len(),
+                    st.max_ordered_height.saturating_sub(st.max_archived_height),
+                    4096,
+                );
+                if batch_len >= MAX_HEADERS_RESULTS
+                    && live < MAX_ORDERED_HEADERS
+                    && (live < ORDERED_HEADERS_SOFT_CAP || need_arch_runway)
+                {
+                    let tips = work_path_tips(st);
+                    let _ = request_headers_from(
+                        &st.slots,
+                        peer,
+                        hub,
+                        &mut st.header_req_seq,
+                        &tips,
+                    );
+                }
+            } else if batch_len == 0 {
+                // True empty headers message only — not "already known" batches.
+                st.empty_header_streak = st.empty_header_streak.saturating_add(1);
+                let tip_h = hub.tip_height().unwrap_or(0);
+                let lag = header_lag_behind_peers(st, tip_h);
+                let path_idle = st.ordered.is_empty() && st.inflight.is_empty();
+                let peers_n = st.slots.iter().filter(|s| s.alive).count() as u32;
+                if st.empty_header_streak >= peers_n.max(2) && path_idle && lag <= 2 {
+                    st.headers_done = true;
+                } else if lag > 2 {
+                    // Peers advertise a higher tip than our work path — empty is a
+                    // false EOF (often locator stuck at confirmed tip while archive
+                    // leads). Keep requesting with work-path locator; never mark done.
+                    if st.empty_header_streak == 1 || st.empty_header_streak % 16 == 0 {
+                        warn!(
+                            "ibd: empty headers but lag={lag} behind max_peer_height={} (known≈{}, tip={tip_h}) — keep header sync",
+                            st.max_peer_height,
+                            st.max_archived_height
+                                .max(st.hash_height.values().copied().max().unwrap_or(0)),
+                        );
+                    }
+                    st.headers_done = false;
+                    if st.empty_header_streak >= 8 {
+                        st.empty_header_streak = 0;
+                    }
+                    let tips = work_path_tips(st);
+                    let _ = request_headers(&st.slots, hub, &mut st.header_req_seq, &tips);
+                } else if st.empty_header_streak < 8
+                    && st.ordered_set.len() < ORDERED_HEADERS_SOFT_CAP
+                {
+                    let tips = work_path_tips(st);
+                    let _ = request_headers(&st.slots, hub, &mut st.header_req_seq, &tips);
+                } else if st.empty_header_streak >= 8 && lag <= 2 {
+                    st.headers_done = true;
+                }
+            } else {
+                // Non-empty but all already known: advance locator off the work path
+                // (do **not** count toward headers_done — multi-peer overlap was
+                // marking done after one 2000-header window).
+                let live = st.ordered_set.len();
+                let need_arch_runway = want_headers_beyond_soft_cap(
+                    live,
+                    st.body.known_len(),
+                    st.max_ordered_height.saturating_sub(st.max_archived_height),
+                    4096,
+                );
+                if live < MAX_ORDERED_HEADERS
+                    && (live < ORDERED_HEADERS_SOFT_CAP || need_arch_runway)
+                    && (batch_len >= MAX_HEADERS_RESULTS
+                        || header_lag_behind_peers(st, hub.tip_height().unwrap_or(0)) > 2
+                        || need_arch_runway)
+                {
+                    let tips = work_path_tips(st);
+                    let _ = request_headers_from(
+                        &st.slots,
+                        peer,
+                        hub,
+                        &mut st.header_req_seq,
+                        &tips,
+                    );
+                }
+            }
+        }
+        PeerEvent::BlockFramed { peer, hash } => {
+            // Frame complete on the wire — free peer/window slots *now* so assign
+            // can top up getdata while deserialize still runs on the blocking pool.
+            note_block_progress(&mut st.slots, peer);
+            clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+            if st.body.is_rejected(&hash)
+                || st.body.is_known_archived(&hash)
+                || hub.has_block(&hash)
+            {
+                return;
+            }
+            // pending ⇒ skip re-getdata until archive-ok / Block / BlockDecodeFailed.
+            st.body.mark_pending(hash);
+        }
+        PeerEvent::BlockDecodeFailed { peer, hash } => {
+            note_block_progress(&mut st.slots, peer);
+            clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+            if st.body.is_pending(&hash) {
+                st.body.mark_missing(hash);
+            }
+        }
+        PeerEvent::Block { peer, block } => {
+            note_block_progress(&mut st.slots, peer);
+            let hash = block.block_hash();
+            // Idempotent: BlockFramed usually already cleared racers + marked pending.
+            clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+            if st.body.is_rejected(&hash)
+                || st.body.is_known_archived(&hash)
+                || hub.has_block(&hash)
+            {
+                return;
+            }
+            // Prefer RAM-cached fk from getheaders (no store lock on hot path).
+            let header_fk = if let Some(&fk) = st.header_fks.get(&hash) {
+                fk
+            } else {
+                match hub.ensure_header_fk(&block.header) {
+                    Ok(fk) => {
+                        st.header_fks.insert(hash, fk);
+                        fk
+                    }
+                    Err(e) => {
+                        warn!("ibd: ensure_header {hash}: {e}");
+                        // Allow re-getdata if we never archive this body.
+                        if st.body.is_pending(&hash) {
+                            st.body.mark_missing(hash);
+                        }
+                        return;
+                    }
+                }
+            };
+            // Prevent re-getdata while prep/writer owns this body.
+            st.body.mark_pending(hash);
+            let tip_h = hub.tip_height().unwrap_or(0);
+            let priority = st
+                .hash_height
+                .get(&hash)
+                .map(|&ht| ht <= tip_h.saturating_add(NEAR_DEPTH))
+                .unwrap_or(false);
+            // Approx wire size for RAM budget (already-decoded; never drop).
+            let wire_bytes = block.total_size();
+            archive_queued.charge(wire_bytes);
+            if arch_job_tx
+                .send(ArchiveJob {
+                    block,
+                    header_fk,
+                    priority,
+                    wire_bytes,
+                })
+                .is_err()
+            {
+                archive_queued.release(wire_bytes);
+                st.body.mark_missing(hash);
+                warn!("ibd: archive pipeline closed; drop {hash}");
+            }
+        }
+        PeerEvent::NotFound { peer, hashes } => {
+            note_block_progress(&mut st.slots, peer);
+            if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
+                for h in &hashes {
+                    s.in_flight.remove(h);
+                    if st.inflight.get(h).map(|e| e.peer == peer).unwrap_or(false) {
+                        st.inflight.remove(h);
+                    }
+                }
+            }
+        }
+        PeerEvent::Dead { peer, reason } => {
+            warn!("ibd: peer[{peer}] dead: {reason}");
+            release_peer_block_work(&mut st.slots, &mut st.inflight, peer);
+        }
+    }
+}
+
+fn apply_archive_result(
+    st: &mut IbdWorkState,
+    r: ArchiveResult,
+    archive_queued: &ArchiveQueueBudget,
+    loop_stats: &LoopStats,
+) {
+    match r {
+        ArchiveResult::Ok { hash, wire_bytes } => {
+            archive_queued.release(wire_bytes);
+            clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+            // Do **not** confirm here — confirm on the main loop after assign so
+            // free getdata slots are refilled before Class C burns the turn.
+            // Count only first time we learn Class A (skip multi-peer re-archive).
+            let first = !st.body.is_known_archived(&hash);
+            st.body.mark_archived(hash);
+            if first {
+                loop_stats
+                    .archived_bodies
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(&ht) = st.hash_height.get(&hash) {
+                st.max_archived_height = st.max_archived_height.max(ht);
+            }
+        }
+        ArchiveResult::Err {
+            hash,
+            err,
+            wire_bytes,
+        } => {
+            archive_queued.release(wire_bytes);
+            st.body.mark_missing(hash);
+            static REJECTS: AtomicU32 = AtomicU32::new(0);
+            let n = REJECTS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 5 || n % 100 == 0 {
+                warn!("ibd: archive reject {hash}: {err} (count={n})");
+            }
+        }
+    }
+}
+
+/// Permanent confirm failure: drop from the work path and never re-offer.
+///
+/// Without this, `offer_confirm_ready` re-noted ghost/re-queued hashes and the
+/// confirm engine spun on the same BadPrev / missing-prevout tip+1 (signet log:
+/// same hash every ~30s with tip frozen).
+fn update_confirm_lag(lag: &AtomicU32, tip: Option<u32>, max_archived: u32) {
+    let t = tip.unwrap_or(0);
+    lag.store(max_archived.saturating_sub(t), Ordering::Relaxed);
+}
+
+fn apply_confirm_reject(st: &mut IbdWorkState, hash: BlockHash, err: &str) {
+    st.body.mark_rejected(hash);
+    remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
+    clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+    // Rate-limit follow-up noise; the confirm engine already logged the reject.
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n % 50 == 0 {
+        warn!("ibd: confirm reject applied {hash}: {err} (blacklisted, count={n})");
+    }
+}
+
+
+/// Seed ordered path + body cache from durable Class A after process restart.
+///
+/// Headers and bodies persist in the store; only the IBD work queue was RAM-only.
+/// Without this, restart re-ran getheaders and looked like a full re-archive even
+/// when `getdata` eventually skipped known bodies.
+fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
+    let Some(tip_hash) = hub.tip_hash() else {
+        return;
+    };
+    let tip_h = hub.tip_height().unwrap_or(0);
+    let t0 = Instant::now();
+    let path = match hub.query.resume_work_path_after_tip(
+        tip_hash.to_byte_array(),
+        tip_h,
+        MAX_ORDERED_HEADERS,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("ibd: resume seed from store failed: {e}");
+            return;
+        }
+    };
+    if path.is_empty() {
+        return;
+    }
+    let mut with_body = 0u32;
+    let mut contiguous_arch = tip_h;
+    let mut arch_prefix = true;
+    for e in &path {
+        let hash = BlockHash::from_byte_array(e.hash);
+        st.known_headers.insert(hash);
+        st.record_height(hash, e.height);
+        st.header_fks.insert(hash, e.header_fk);
+        st.max_ordered_height = st.max_ordered_height.max(e.height);
+        if st.ordered_set.insert(hash) {
+            st.ordered.push_back(hash);
+        }
+        if e.has_body {
+            st.body.mark_archived(hash);
+            with_body = with_body.saturating_add(1);
+            if arch_prefix {
+                contiguous_arch = e.height;
+            }
+        } else {
+            arch_prefix = false;
+        }
+    }
+    st.max_archived_height = st.max_archived_height.max(contiguous_arch);
+    // Peers may still advertise a higher tip; keep header sync open.
+    st.headers_done = false;
+    info!(
+        "ibd: resume seed ordered={} archived_bodies={} archived_to={} (store walk {:?})",
+        st.ordered.len(),
+        with_body,
+        contiguous_arch,
+        t0.elapsed()
+    );
+}
+
+/// Highest hashes on the download path (newest first) for getheaders locators.
+fn work_path_tips(st: &IbdWorkState) -> Vec<BlockHash> {
+    let mut tips = Vec::with_capacity(8);
+    // ordered is tip→far; the back is the highest known header on the path.
+    for h in st.ordered.iter().rev().take(4) {
+        if st.ordered_set.contains(h) {
+            tips.push(*h);
+        }
+    }
+    // Also sample by max height in hash_height if ordered is empty/ghosty.
+    if tips.is_empty() {
+        if let Some((&h, _)) = st
+            .hash_height
+            .iter()
+            .max_by_key(|(_, &ht)| ht)
+        {
+            tips.push(h);
+        }
+    }
+    tips
+}
+
+fn header_lag_behind_peers(st: &IbdWorkState, tip_h: u32) -> u32 {
+    let known_hi = st
+        .max_archived_height
+        .max(st.hash_height.values().copied().max().unwrap_or(0))
+        .max(tip_h);
+    st.max_peer_height.saturating_sub(known_hi)
+}
+
+
+/// Drop `hash` from global inflight and every peer's in_flight set.
+///
+/// Used when the first body arrives (or archive/confirm settles the hash) so
+/// racing peers stop counting it as outstanding work. Late `Block` messages are
+/// ignored via [`BodyPresence::skip_download`].
+fn clear_hash_inflight(
+    slots: &mut [PeerSlot],
+    inflight: &mut HashMap<BlockHash, state::InflightReq>,
+    hash: BlockHash,
+) {
+    inflight.remove(&hash);
+    for s in slots.iter_mut() {
+        s.in_flight.remove(&hash);
+    }
+}
+
+/// Free peer/global slots for hashes already on the confirmed tip (RAM set).
+/// Archived-but-unconfirmed ghosts are cleared on Block / archive-ok via
+/// [`clear_hash_inflight`] — avoid `is_archived` store probes every assign.
+fn prune_satisfied_inflight(
+    slots: &mut [PeerSlot],
+    inflight: &mut HashMap<BlockHash, state::InflightReq>,
+    hub: &ChainHub,
+) {
+    inflight.retain(|h, _| !hub.has_block(h));
+    for s in slots.iter_mut() {
+        s.in_flight.retain(|h| !hub.has_block(h));
+    }
+}
+
+fn inflight_insert_first(
+    inflight: &mut HashMap<BlockHash, state::InflightReq>,
+    hash: BlockHash,
+    peer: usize,
+) {
+    inflight.insert(hash, state::InflightReq::new(peer, Instant::now()));
+}
+
+/// Assign getdata for bodies not yet Class A.
+///
+/// 1. Tip hole — one getdata each (stall disconnect recovers slow peers).
+/// 2. Near band — tip+1‥tip+[`NEAR_DEPTH`].
+/// 3. Far — forward densify past near (height-ascending).
+fn assign_work_ordered(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    cfg: &IbdConfig,
+    loop_stats: &LoopStats,
+    _arch_bytes: usize,
+    _arch_budget: usize,
+) {
+    let t0 = Instant::now();
+    let mut issued = 0u64;
+    let alive: Vec<usize> = st
+        .slots
+        .iter()
+        .filter(|s| s.alive)
+        .map(|s| s.id)
+        .collect();
+    if alive.is_empty() {
+        return;
+    }
+
+    prune_satisfied_inflight(&mut st.slots, &mut st.inflight, hub);
+
+    let expired = st.body.expire_stale_pending(PENDING_STALE);
+    for h in expired {
+        clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
+    }
+
+    let tip = hub.tip_height().unwrap_or(0);
+    let near_hi = tip.saturating_add(NEAR_DEPTH);
+    let tip_holes = contiguous_tip_holes(st, hub, TIP_HOLE_MAX);
+    let tip_hole = !tip_holes.is_empty();
+
+    issued += cover_tip_holes(st, hub, cfg, &alive, &tip_holes);
+
+    let mut room = cfg.window.saturating_sub(st.inflight.len());
+    if room == 0 {
+        finish_assign(loop_stats, t0, issued);
+        return;
+    }
+    if st.inflight.is_empty()
+        && !tip_hole
+        && st.max_archived_height > 0
+        && st.max_archived_height >= st.max_ordered_height
+    {
+        finish_assign(loop_stats, t0, issued);
+        return;
+    }
+
+    let far_cap = far_slots_per_peer(cfg.per_peer, tip_hole);
+    let far_window_reserve = alive
+        .len()
+        .saturating_mul(far_cap)
+        .min(room.saturating_mul(3) / 4)
+        .max(far_cap.min(room));
+    let near_window_cap = room.saturating_sub(far_window_reserve);
+
+    let (near_work, far_work) =
+        collect_need(st, hub, tip, near_hi, near_window_cap, room, far_cap > 0);
+    if near_work.is_empty() && far_work.is_empty() {
+        finish_assign(loop_stats, t0, issued);
+        return;
+    }
+
+    let mut peer_i = st.assign_rot;
+    st.assign_rot = st.assign_rot.wrapping_add(1);
+
+    let mut near = near_work;
+    while room > far_window_reserve && !near.is_empty() {
+        let mut any = false;
+        for _ in 0..alive.len() {
+            if room <= far_window_reserve || near.is_empty() {
+                break;
+            }
+            let pid = alive[peer_i % alive.len()];
+            peer_i += 1;
+            if !peer_can_take_near(st, pid, cfg.per_peer, far_cap, tip, near_hi) {
+                continue;
+            }
+            let Some(h) = pop_need(&mut near, st, hub) else {
+                break;
+            };
+            if issue_one(st, pid, h, &mut room, &mut issued) {
+                any = true;
+            }
+        }
+        if !any {
+            break;
+        }
+    }
+
+    let mut far = far_work;
+    while room > 0 && !far.is_empty() {
+        let mut any = false;
+        for _ in 0..alive.len() {
+            if room == 0 || far.is_empty() {
+                break;
+            }
+            let pid = alive[peer_i % alive.len()];
+            peer_i += 1;
+            let Some(n) = peer_far_free(st, pid, cfg.per_peer, far_cap, tip, near_hi) else {
+                continue;
+            };
+            let take = n.min(room).min(FAR_BATCH_MAX);
+            let mut batch = Vec::with_capacity(take);
+            while batch.len() < take {
+                let Some(h) = pop_need(&mut far, st, hub) else {
+                    break;
+                };
+                batch.push(h);
+            }
+            if batch.is_empty() {
+                continue;
+            }
+            if issue_batch(st, pid, batch, &mut room, &mut issued) {
+                any = true;
+            }
+        }
+        if !any {
+            break;
+        }
+    }
+
+    finish_assign(loop_stats, t0, issued);
+}
+
+fn finish_assign(loop_stats: &LoopStats, t0: Instant, issued: u64) {
+    loop_stats
+        .assign_ns
+        .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if issued > 0 {
+        loop_stats.assign_issued.fetch_add(issued, Ordering::Relaxed);
+    }
+}
+
+/// Collect (near, far) hashes that still need getdata.
+///
+/// Far is **forward-only** from `near_hi+1` (densify Class A behind tip).
+/// Does not update `max_archived_height` (that is archive-result / seed only).
+fn collect_need(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    tip: u32,
+    near_hi: u32,
+    near_cap: usize,
+    total_room: usize,
+    want_far: bool,
+) -> (VecDeque<BlockHash>, VecDeque<BlockHash>) {
+    let mut near = VecDeque::new();
+    let mut far = VecDeque::new();
+
+    for ht in tip.saturating_add(1)..=near_hi {
+        if near.len() >= near_cap {
+            break;
+        }
+        let Some(&h) = st.height_to_hash.get(&ht) else {
+            continue;
+        };
+        if !st.ordered_set.contains(&h) || st.inflight.contains_key(&h) {
+            continue;
+        }
+        if st.body.is_known_archived(&h) || st.body.is_pending(&h) {
+            continue;
+        }
+        if st.body.skip_download(hub, &h) {
+            continue;
+        }
+        near.push_back(h);
+    }
+
+    if !want_far {
+        return (near, far);
+    }
+
+    let far_room = total_room.saturating_sub(near.len()).max(
+        total_room.saturating_sub(near_cap),
+    );
+    if far_room == 0 {
+        return (near, far);
+    }
+
+    let mut inspected = 0usize;
+    let far_lo = near_hi.saturating_add(1);
+    let far_hi = st.max_ordered_height.max(far_lo);
+    for ht in far_lo..=far_hi {
+        if far.len() >= far_room || inspected >= FAR_SCAN_BUDGET {
+            break;
+        }
+        let Some(&h) = st.height_to_hash.get(&ht) else {
+            continue;
+        };
+        if !st.ordered_set.contains(&h) || st.inflight.contains_key(&h) {
+            continue;
+        }
+        if st.body.is_known_archived(&h) || st.body.is_pending(&h) {
+            continue;
+        }
+        inspected += 1;
+        if st.body.skip_download(hub, &h) {
+            continue;
+        }
+        far.push_back(h);
+    }
+
+    (near, far)
+}
+
+fn pop_need(
+    q: &mut VecDeque<BlockHash>,
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+) -> Option<BlockHash> {
+    while let Some(h) = q.pop_front() {
+        if st.body.skip_download(hub, &h) || st.inflight.contains_key(&h) {
+            continue;
+        }
+        return Some(h);
+    }
+    None
+}
+
+fn peer_can_take_near(
+    st: &IbdWorkState,
+    pid: usize,
+    per_peer: usize,
+    far_cap: usize,
+    tip: u32,
+    near_hi: u32,
+) -> bool {
+    let Some(s) = st.slots.iter().find(|s| s.id == pid && s.alive) else {
+        return false;
+    };
+    if s.in_flight.len() >= per_peer {
+        return false;
+    }
+    // Reserve far_cap slots on the peer for archive-ahead work so near cannot
+    // pin every in-flight slot (that froze Class A a few k ahead of tip).
+    if far_cap > 0 {
+        let (near_n, _far_n) = count_class(&s.in_flight, &st.hash_height, tip, near_hi);
+        let near_cap = per_peer.saturating_sub(far_cap);
+        if near_n >= near_cap {
+            return false;
+        }
+    }
+    true
+}
+
+fn peer_far_free(
+    st: &IbdWorkState,
+    pid: usize,
+    per_peer: usize,
+    far_cap: usize,
+    tip: u32,
+    near_hi: u32,
+) -> Option<usize> {
+    let s = st.slots.iter().find(|s| s.id == pid && s.alive)?;
+    let free_total = per_peer.saturating_sub(s.in_flight.len());
+    if free_total == 0 {
+        return None;
+    }
+    let far_n = count_class(&s.in_flight, &st.hash_height, tip, near_hi).1;
+    let free_far = far_cap.saturating_sub(far_n).min(free_total);
+    if free_far == 0 {
+        None
+    } else {
+        Some(free_far)
+    }
+}
+
+fn count_class(
+    in_flight: &HashSet<BlockHash>,
+    heights: &HashMap<BlockHash, u32>,
+    tip: u32,
+    near_hi: u32,
+) -> (usize, usize) {
+    let depth = near_hi.saturating_sub(tip);
+    let mut near = 0usize;
+    let mut far = 0usize;
+    for h in in_flight {
+        match classify_height(heights.get(h).copied(), tip, depth) {
+            WorkClass::Near => near += 1,
+            WorkClass::Far => far += 1,
+        }
+    }
+    (near, far)
+}
+
+fn issue_one(
+    st: &mut IbdWorkState,
+    pid: usize,
+    h: BlockHash,
+    room: &mut usize,
+    issued: &mut u64,
+) -> bool {
+    issue_batch(st, pid, vec![h], room, issued)
+}
+
+fn issue_batch(
+    st: &mut IbdWorkState,
+    pid: usize,
+    batch: Vec<BlockHash>,
+    room: &mut usize,
+    issued: &mut u64,
+) -> bool {
+    if batch.is_empty() {
+        return false;
+    }
+    let Some(idx) = st.slots.iter().position(|s| s.id == pid && s.alive) else {
+        return false;
+    };
+    let empty = st.slots[idx].in_flight.is_empty();
+    for &h in &batch {
+        st.slots[idx].in_flight.insert(h);
+    }
+    if empty {
+        touch_block_progress(&st.slots[idx].block_progress_ms);
+    }
+    let _ = st.slots[idx]
+        .cmd_tx
+        .send(PeerCmd::GetData { hashes: batch.clone() });
+    for &h in &batch {
+        inflight_insert_first(&mut st.inflight, h, pid);
+    }
+    *issued += batch.len() as u64;
+    *room = room.saturating_sub(batch.len());
+    true
+}
+
+/// Contiguous unready hashes at the ordered front (status `hole=`).
+fn contiguous_tip_holes(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    max: usize,
+) -> Vec<BlockHash> {
+    let mut holes = Vec::new();
+    for h in st.ordered.iter().copied() {
+        if !st.ordered_set.contains(&h) {
+            continue;
+        }
+        if st.body.is_rejected(&h) {
+            continue;
+        }
+        if hub.has_block(&h) || st.body.ready(hub, &h) {
+            break;
+        }
+        holes.push(h);
+        if holes.len() >= max {
+            break;
+        }
+    }
+    holes
+}
+
+/// Ensure each tip-hole hash has a single getdata (no multi-peer race).
+fn cover_tip_holes(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    cfg: &IbdConfig,
+    alive: &[usize],
+    holes: &[BlockHash],
+) -> u64 {
+    if holes.is_empty() || alive.is_empty() {
+        return 0;
+    }
+    let mut issued = 0u64;
+    let mut peer_i = st.assign_rot;
+
+    for &h in holes {
+        if hub.has_block(&h) || st.body.is_pending(&h) || st.body.ready(hub, &h) {
+            continue;
+        }
+        if st.inflight.contains_key(&h) {
+            continue;
+        }
+        let mut placed = false;
+        for _ in 0..alive.len() {
+            let pid = alive[peer_i % alive.len()];
+            peer_i += 1;
+            let Some(idx) = st.slots.iter().position(|s| s.id == pid && s.alive) else {
+                continue;
+            };
+            if st.slots[idx].in_flight.len() >= cfg.per_peer {
+                continue;
+            }
+            let mut room = 1usize;
+            if issue_one(st, pid, h, &mut room, &mut issued) {
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            break;
+        }
+    }
+    issued
+}
+
+/// Height of `child` = parent height + 1 when parent height is known.
+fn parent_height(
+    hash_height: &HashMap<BlockHash, u32>,
+    hub: &ChainHub,
+    prev: BlockHash,
+) -> Option<u32> {
+    if prev.to_byte_array() == [0u8; 32] {
+        return Some(0);
+    }
+    if let Some(&ph) = hash_height.get(&prev) {
+        return Some(ph.saturating_add(1));
+    }
+    if hub.tip_hash() == Some(prev) {
+        return Some(hub.tip_height().unwrap_or(0).saturating_add(1));
+    }
+    None
+}
+

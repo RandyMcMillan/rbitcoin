@@ -6,6 +6,7 @@
 
 mod array_table;
 mod chain;
+mod compact;
 mod epoch;
 mod error;
 mod file;
@@ -13,15 +14,21 @@ mod hashhead;
 mod header_table;
 mod point_table;
 mod scripthash;
+mod sharded_hashhead;
 mod store;
 mod tx_table;
 mod var_table;
 
 pub use epoch::ArchiveEpoch;
 pub use error::StoreError;
+pub use file::{ensure_nofile_budget, ensure_nofile_budget_at_least, NOFILE_SOFT_TARGET};
+pub use hashhead::{
+    initial_slots_for, HeadRole, HeadScale, DEFAULT_WRITE_BEHIND_CAP,
+};
+pub use sharded_hashhead::{shard_count_for_scale, SHARD_COUNT};
 pub use header_table::HeaderRecord;
 pub use point_table::PointRecord;
-pub use scripthash::{script_hash, ScriptHashRecord, ScriptHashTable, UNSPENT};
+pub use scripthash::{script_hash, ScriptHashRecord, ScriptHashTable};
 pub use store::Store;
 pub use tx_table::{InputRecord, OutputRecord, TxRecord};
 

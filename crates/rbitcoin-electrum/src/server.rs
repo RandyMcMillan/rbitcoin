@@ -1,19 +1,26 @@
 //! Line-delimited JSON-RPC Electrum server (TCP).
+//!
+//! Confirmed history from the store; unconfirmed + broadcast via optional
+//! [`MempoolHub`] (plan P6, libre-relay-class).
 
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use rbitcoin_consensus::ChainParams;
+use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use rbitcoin_store::script_hash;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Notify};
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 
 const PROTOCOL_MIN: &str = "1.4";
 const PROTOCOL_MAX: &str = "1.4.2";
@@ -36,9 +43,10 @@ impl ElectrumConfig {
         rev.reverse();
         Self {
             listen,
-            banner: "rbitcoin electrum (confirmed only)".into(),
+            banner: "rbitcoin electrum — libre-relay-class (0.1 sat/vB, no dust ban, full RBF)"
+                .into(),
             donation_address: String::new(),
-            genesis_hash_hex: hex::encode(rev),
+            genesis_hash_hex: rbitcoin_primitives::hex_encode(rev),
         }
     }
 }
@@ -66,12 +74,16 @@ pub struct TipNotify {
     pub header_hex: String,
 }
 
-/// Start Electrum TCP listener. `tip_rx` optional for header push (may lag).
+/// Start Electrum **plain TCP** listener.
+///
+/// `mempool` enables broadcast, unconfirmed history/balance, fee estimates, and
+/// `transaction.get` fallback. Without it, confirmed-only behaviour remains.
 pub async fn run_electrum(
     config: ElectrumConfig,
     query: Arc<Query>,
     params: ChainParams,
     tip_tx: broadcast::Sender<TipNotify>,
+    mempool: Option<Arc<MempoolHub>>,
 ) -> Result<ElectrumHandle, std::io::Error> {
     let listener = TcpListener::bind(config.listen).await?;
     let local_addr = listener.local_addr()?;
@@ -96,8 +108,9 @@ pub async fn run_electrum(
                     let cfg = config.clone();
                     let p = params.clone();
                     let tip_rx = tip_tx.subscribe();
+                    let mp = mempool.clone();
                     tokio::spawn(async move {
-                        let _ = handle_client(stream, q, cfg, p, tip_rx).await;
+                        let _ = handle_client(stream, q, cfg, p, tip_rx, mp).await;
                     });
                 }
                 Ok(Err(_)) => break,
@@ -113,18 +126,108 @@ pub async fn run_electrum(
     })
 }
 
-async fn handle_client(
-    stream: TcpStream,
+/// Start Electrum **TLS** listener (PEM cert + key).
+pub async fn run_electrum_tls(
+    config: ElectrumConfig,
+    query: Arc<Query>,
+    params: ChainParams,
+    tip_tx: broadcast::Sender<TipNotify>,
+    mempool: Option<Arc<MempoolHub>>,
+    cert_path: impl AsRef<Path>,
+    key_path: impl AsRef<Path>,
+) -> Result<ElectrumHandle, std::io::Error> {
+    let acceptor = load_tls_acceptor(cert_path.as_ref(), key_path.as_ref())?;
+    let listener = TcpListener::bind(config.listen).await?;
+    let local_addr = listener.local_addr()?;
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_c = shutdown.clone();
+    let config = Arc::new(config);
+    let params = Arc::new(params);
+    let acceptor = Arc::new(acceptor);
+
+    let task = tokio::spawn(async move {
+        loop {
+            if shutdown_c.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            let accept = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                listener.accept(),
+            )
+            .await;
+            match accept {
+                Ok(Ok((stream, _))) => {
+                    let q = query.clone();
+                    let cfg = config.clone();
+                    let p = params.clone();
+                    let tip_rx = tip_tx.subscribe();
+                    let mp = mempool.clone();
+                    let acc = acceptor.clone();
+                    tokio::spawn(async move {
+                        let tls = match acc.accept(stream).await {
+                            Ok(s) => s,
+                            Err(_) => return,
+                        };
+                        let _ = handle_client(tls, q, cfg, p, tip_rx, mp).await;
+                    });
+                }
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+    });
+
+    Ok(ElectrumHandle {
+        local_addr,
+        shutdown,
+        tasks: vec![task],
+    })
+}
+
+fn load_tls_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor, std::io::Error> {
+    let cert_pem = std::fs::read(cert_path)?;
+    let key_pem = std::fs::read(key_path)?;
+    let mut cert_reader = std::io::Cursor::new(cert_pem);
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if certs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "no certificates in PEM",
+        ));
+    }
+    let mut key_reader = std::io::Cursor::new(key_pem);
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "no private key in PEM")
+        })?;
+    let key = PrivateKeyDer::from(key);
+    let cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(TlsAcceptor::from(Arc::new(cfg)))
+}
+
+async fn handle_client<S>(
+    stream: S,
     query: Arc<Query>,
     config: Arc<ElectrumConfig>,
     params: Arc<ChainParams>,
     mut tip_rx: broadcast::Receiver<TipNotify>,
-) -> Result<(), std::io::Error> {
-    let (reader, mut writer) = stream.into_split();
+    mempool: Option<Arc<MempoolHub>>,
+) -> Result<(), std::io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
     let mut header_sub = false;
     let mut sh_subs: HashSet<[u8; 32]> = HashSet::new();
     let notify = Arc::new(Notify::new());
+    let mut mempool_rx = mempool.as_ref().map(|m| m.subscribe_announces());
 
     loop {
         tokio::select! {
@@ -142,6 +245,30 @@ async fn handle_client(
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            ann = async {
+                if let Some(rx) = mempool_rx.as_mut() {
+                    Some(rx.recv().await)
+                } else {
+                    std::future::pending::<()>().await;
+                    None
+                }
+            } => {
+                // Mempool change: push scripthash status for subscribed hashes.
+                if let Some(Ok(_txid)) = ann {
+                    if let Some(mp) = &mempool {
+                        for sh in sh_subs.iter() {
+                            if let Ok(status) = scripthash_status_full(&query, mp, sh) {
+                                let msg = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "blockchain.scripthash.subscribe",
+                                    "params": [hash_hex_rev(sh), status]
+                                });
+                                let _ = write_line(&mut writer, &msg).await;
+                            }
+                        }
+                    }
                 }
             }
             line = lines.next_line() => {
@@ -162,6 +289,7 @@ async fn handle_client(
                     &query,
                     &config,
                     &params,
+                    mempool.as_deref(),
                     &mut header_sub,
                     &mut sh_subs,
                 );
@@ -177,8 +305,8 @@ async fn handle_client(
     Ok(())
 }
 
-async fn write_line(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+async fn write_line<W: AsyncWrite + Unpin>(
+    writer: &mut W,
     msg: &Value,
 ) -> Result<(), std::io::Error> {
     let mut s = serde_json::to_string(msg).unwrap_or_else(|_| "{}".into());
@@ -194,6 +322,7 @@ fn dispatch(
     query: &Query,
     config: &ElectrumConfig,
     chain: &ChainParams,
+    mempool: Option<&MempoolHub>,
     header_sub: &mut bool,
     sh_subs: &mut HashSet<[u8; 32]>,
 ) -> Result<Value, String> {
@@ -240,7 +369,16 @@ fn dispatch(
         }
         "blockchain.scripthash.get_history" => {
             let sh = param_scripthash(params, 0)?;
-            let hist = query.scripthash_history(&sh).map_err(|e| e.to_string())?;
+            let mut hist = query.scripthash_history(&sh).map_err(|e| e.to_string())?;
+            if let Some(mp) = mempool {
+                for item in mp.scripthash_mempool(&sh) {
+                    hist.push(rbitcoin_query::ScriptHashHistoryItem {
+                        height: item.height,
+                        txid: item.txid,
+                    });
+                }
+            }
+            hist.sort_by_key(|i| i.height);
             let arr: Vec<Value> = hist
                 .iter()
                 .map(|i| {
@@ -254,13 +392,16 @@ fn dispatch(
         }
         "blockchain.scripthash.get_balance" => {
             let sh = param_scripthash(params, 0)?;
-            let b = query.scripthash_balance(&sh).map_err(|e| e.to_string())?;
+            let mut b = query.scripthash_balance(&sh).map_err(|e| e.to_string())?;
+            if let Some(mp) = mempool {
+                b.unconfirmed = mp.scripthash_unconfirmed_delta(&sh);
+            }
             Ok(json!({"confirmed": b.confirmed, "unconfirmed": b.unconfirmed}))
         }
         "blockchain.scripthash.listunspent" => {
             let sh = param_scripthash(params, 0)?;
             let u = query.scripthash_listunspent(&sh).map_err(|e| e.to_string())?;
-            let arr: Vec<Value> = u
+            let mut arr: Vec<Value> = u
                 .iter()
                 .map(|x| {
                     json!({
@@ -271,16 +412,52 @@ fn dispatch(
                     })
                 })
                 .collect();
+            // Mempool outputs matching scripthash (unconfirmed UTXOs).
+            if let Some(mp) = mempool {
+                for (txid, _fee, _w, tx) in mp.list_live() {
+                    for (vout, o) in tx.output.iter().enumerate() {
+                        if script_hash(o.script_pubkey.as_bytes()) != sh {
+                            continue;
+                        }
+                        arr.push(json!({
+                            "tx_hash": format!("{txid}"),
+                            "tx_pos": vout,
+                            "height": 0,
+                            "value": o.value.to_sat() as i64,
+                        }));
+                    }
+                }
+            }
             Ok(Value::Array(arr))
         }
         "blockchain.scripthash.subscribe" => {
             let sh = param_scripthash(params, 0)?;
             sh_subs.insert(sh);
-            // Status: hash of history status string — simplified empty or status hash
-            let hist = query.scripthash_history(&sh).map_err(|e| e.to_string())?;
-            Ok(json!(scripthash_status(&hist)))
+            let status = if let Some(mp) = mempool {
+                scripthash_status_full(query, mp, &sh)?
+            } else {
+                let hist = query.scripthash_history(&sh).map_err(|e| e.to_string())?;
+                scripthash_status(&hist)
+            };
+            Ok(json!(status))
         }
-        "blockchain.scripthash.get_mempool" => Ok(json!([])),
+        "blockchain.scripthash.get_mempool" => {
+            let sh = param_scripthash(params, 0)?;
+            let items = mempool
+                .map(|m| m.scripthash_mempool(&sh))
+                .unwrap_or_default();
+            let arr: Vec<Value> = items
+                .iter()
+                .map(|i| {
+                    json!({
+                        "height": i.height,
+                        "tx_hash": txid_hex(&i.txid),
+                        "fee": i.fee,
+                    })
+                })
+                .collect();
+            Ok(Value::Array(arr))
+        }
         "blockchain.transaction.get" => {
             let txid = param_txid(params, 0)?;
             let verbose = params
@@ -288,15 +465,33 @@ fn dispatch(
                 .and_then(|a| a.get(1))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let (_fk, rec) = query
-                .get_tx_by_txid(&txid)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "tx not found".to_string())?;
-            if verbose {
-                Ok(json!({"hex": hex::encode(&rec.raw), "txid": txid_hex(&txid)}))
-            } else {
-                Ok(json!(hex::encode(&rec.raw)))
+            // Confirmed first.
+            if let Some((fk, _rec)) = query.get_tx_by_txid(&txid).map_err(|e| e.to_string())? {
+                let raw = query.tx_wire_bytes(fk).map_err(|e| e.to_string())?;
+                if verbose {
+                    return Ok(json!({
+                        "hex": rbitcoin_primitives::hex_encode(&raw),
+                        "txid": txid_hex(&txid)
+                    }));
+                }
+                return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
             }
+            // Mempool fallback.
+            if let Some(mp) = mempool {
+                use bitcoin::hashes::Hash;
+                let tid = bitcoin::Txid::from_byte_array(txid);
+                if let Some(tx) = mp.get_tx(&tid) {
+                    let raw = bitcoin::consensus::serialize(&tx);
+                    if verbose {
+                        return Ok(json!({
+                            "hex": rbitcoin_primitives::hex_encode(&raw),
+                            "txid": txid_hex(&txid)
+                        }));
+                    }
+                    return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
+                }
+            }
+            Err("tx not found".into())
         }
         "blockchain.transaction.get_merkle" => {
             let txid = param_txid(params, 0)?;
@@ -312,15 +507,14 @@ fn dispatch(
             }))
         }
         "blockchain.transaction.broadcast" => {
-            // Best-effort: accept hex, return txid if we can decode; no mempool policy.
             let raw_hex = param_str(params, 0)?;
-            let raw = hex::decode(raw_hex).map_err(|e| e.to_string())?;
+            let raw = rbitcoin_primitives::hex_decode(raw_hex).map_err(|e| e.to_string())?;
             let tx: bitcoin::Transaction =
                 bitcoin::consensus::deserialize(&raw).map_err(|e| e.to_string())?;
-            let txid = tx.compute_txid();
-            // Documented: no peer push wired in this slice unless net exposes broadcast later.
+            let mp = mempool.ok_or_else(|| "mempool not available".to_string())?;
+            let r = mp.accept_tx(&tx).map_err(|e| format!("broadcast reject: {e}"))?;
             let _ = chain.network;
-            Ok(json!(format!("{txid}")))
+            Ok(json!(format!("{}", r.txid)))
         }
         "blockchain.transaction.id_from_pos" => {
             let height = param_u32(params, 0)?;
@@ -332,10 +526,28 @@ fn dispatch(
             let tx = query.get_tx(*fk).map_err(|e| e.to_string())?;
             Ok(json!(txid_hex(&tx.txid)))
         }
-        "blockchain.estimatefee" => Ok(json!(-1)),
-        "blockchain.relayfee" => Ok(json!(0.00001)),
-        "mempool.get_fee_histogram" => Ok(json!([])),
-        // Also accept server.peers.subscribe empty
+        "blockchain.estimatefee" => {
+            let target = param_u32(params, 0).unwrap_or(2);
+            let fee = mempool
+                .map(|m| m.estimate_fee_btc_per_kb(target))
+                .unwrap_or(-1.0);
+            Ok(json!(fee))
+        }
+        "blockchain.relayfee" => {
+            let fee = MempoolHub::relay_fee_btc_per_kb();
+            Ok(json!(fee))
+        }
+        "mempool.get_fee_histogram" => {
+            let hist = mempool.map(|m| m.fee_histogram()).unwrap_or_default();
+            // Electrum: array of [feerate, cumulative_vsize] with cumulative sizes.
+            let mut cum = 0u64;
+            let mut arr = Vec::new();
+            for (rate, vsize) in hist {
+                cum = cum.saturating_add(vsize);
+                arr.push(json!([rate, cum]));
+            }
+            Ok(Value::Array(arr))
+        }
         "server.peers.subscribe" => Ok(json!([])),
         other => Err(format!("unknown method: {other}")),
     }
@@ -357,7 +569,7 @@ fn tip_header_obj(query: &Query) -> Result<Value, String> {
 fn header_hex(hdr: &bitcoin::block::Header) -> String {
     let mut buf = Vec::new();
     hdr.consensus_encode(&mut buf).expect("header encode");
-    hex::encode(buf)
+    rbitcoin_primitives::hex_encode(buf)
 }
 
 fn param_u32(params: &Value, idx: usize) -> Result<u32, String> {
@@ -382,7 +594,7 @@ fn param_str(params: &Value, idx: usize) -> Result<&str, String> {
 
 fn param_scripthash(params: &Value, idx: usize) -> Result<[u8; 32], String> {
     let s = param_str(params, idx)?;
-    let mut bytes = hex::decode(s).map_err(|e| e.to_string())?;
+    let mut bytes = rbitcoin_primitives::hex_decode(s).map_err(|e| e.to_string())?;
     if bytes.len() != 32 {
         return Err("scripthash must be 32 bytes hex".into());
     }
@@ -395,7 +607,7 @@ fn param_scripthash(params: &Value, idx: usize) -> Result<[u8; 32], String> {
 
 fn param_txid(params: &Value, idx: usize) -> Result<[u8; 32], String> {
     let s = param_str(params, idx)?;
-    let mut bytes = hex::decode(s).map_err(|e| e.to_string())?;
+    let mut bytes = rbitcoin_primitives::hex_decode(s).map_err(|e| e.to_string())?;
     if bytes.len() != 32 {
         return Err("txid must be 32 bytes hex".into());
     }
@@ -412,21 +624,36 @@ fn txid_hex(txid: &[u8; 32]) -> String {
 fn hash_hex_rev(h: &[u8; 32]) -> String {
     let mut r = *h;
     r.reverse();
-    hex::encode(r)
+    rbitcoin_primitives::hex_encode(r)
 }
 
 fn scripthash_status(hist: &[rbitcoin_query::ScriptHashHistoryItem]) -> String {
     if hist.is_empty() {
         return String::new();
     }
-    // Electrum status = sha256 of concatenation of "txid:height:" lines
     use bitcoin::hashes::{sha256, Hash as _};
     let mut s = String::new();
     for i in hist {
         s.push_str(&format!("{}:{}:", txid_hex(&i.txid), i.height));
     }
     let hash = sha256::Hash::hash(s.as_bytes());
-    hex::encode(hash.to_byte_array())
+    rbitcoin_primitives::hex_encode(hash.to_byte_array())
+}
+
+fn scripthash_status_full(
+    query: &Query,
+    mp: &MempoolHub,
+    sh: &[u8; 32],
+) -> Result<String, String> {
+    let mut hist = query.scripthash_history(sh).map_err(|e| e.to_string())?;
+    for item in mp.scripthash_mempool(sh) {
+        hist.push(rbitcoin_query::ScriptHashHistoryItem {
+            height: item.height,
+            txid: item.txid,
+        });
+    }
+    hist.sort_by_key(|i| i.height);
+    Ok(scripthash_status(&hist))
 }
 
 /// Helper to compute electrum scripthash hex (reversed) from script bytes.

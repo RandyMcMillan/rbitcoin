@@ -12,7 +12,7 @@ use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
 use std::time::Duration;
-use tempfile::TempDir;
+use rbitcoin_test::TempDir;
 
 async fn start_node(dir: &TempDir) -> P2PNode {
     let q = Query::open_or_create(dir.path().join("store")).unwrap();
@@ -40,7 +40,7 @@ async fn seed_chain(node: &P2PNode, blocks: u32) {
 }
 
 /// Always-on: two nodes, seed has 8 blocks, peer syncs tip.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_node_header_and_block_sync() {
     let seed_dir = TempDir::new().unwrap();
     let peer_dir = TempDir::new().unwrap();
@@ -70,7 +70,7 @@ async fn two_node_header_and_block_sync() {
 
 /// Phase 4: seeder shuts down and restarts with empty RAM cache; peer still IBD-syncs
 /// via store-backed getheaders + reconstruct getdata.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serve_after_restart_via_reconstruct() {
     let seed_dir = TempDir::new().unwrap();
     let peer_dir = TempDir::new().unwrap();
@@ -125,7 +125,7 @@ async fn serve_after_restart_via_reconstruct() {
 }
 
 /// Always-on: peer serves after syncing — second peer can sync from first peer.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn three_node_relay_path() {
     let d0 = TempDir::new().unwrap();
     let d1 = TempDir::new().unwrap();
@@ -152,7 +152,7 @@ async fn three_node_relay_path() {
 }
 
 /// Parallel IBD: two seeder peers, client downloads with shared window.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parallel_ibd_two_peers() {
     use rbitcoin_net::IbdConfig;
 
@@ -193,7 +193,7 @@ async fn parallel_ibd_two_peers() {
 }
 
 /// Multi-peer sync API: second address fails, first succeeds.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sync_from_peers_tries_list() {
     let seed_dir = TempDir::new().unwrap();
     let peer_dir = TempDir::new().unwrap();
@@ -217,7 +217,7 @@ async fn sync_from_peers_tries_list() {
 }
 
 /// Phase 5: after IBD, seed announces a new tip; follower picks it up via inv/headers.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tip_follow_after_ibd() {
     let seed_dir = TempDir::new().unwrap();
     let peer_dir = TempDir::new().unwrap();
@@ -253,6 +253,84 @@ async fn tip_follow_after_ibd() {
     seed.shutdown().await;
     peer.shutdown().await;
 }
+
+/// Parallel IBD to seeder tip → long-lived follow → new tip via announce, and
+/// a third peer can download history from the client (block relay / serve).
+///
+/// Guards the post-IBD transition: once at peer tip we must leave parallel IBD
+/// and stay in tip-tracking + serve mode (not re-open sequential catch-up).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ibd_to_tip_tracking_and_block_relay() {
+    use rbitcoin_net::IbdConfig;
+
+    let seed_dir = TempDir::new().unwrap();
+    let client_dir = TempDir::new().unwrap();
+    let third_dir = TempDir::new().unwrap();
+
+    let seed = start_node(&seed_dir).await;
+    seed_chain(&seed, 20).await;
+    let seed_tip_hash = seed.hub.tip_hash().unwrap();
+
+    // 1) Parallel catch-up to the highest tip the seeder has.
+    let mut client = start_node(&client_dir).await;
+    let n = client
+        .parallel_sync(&[seed.local_addr], IbdConfig::for_test())
+        .await
+        .expect("parallel ibd");
+    assert!(n >= 20, "accepted {n}");
+    client
+        .wait_height(20, Duration::from_secs(15))
+        .await
+        .expect("client tip after ibd");
+    assert_eq!(client.query.tip_height(), Some(Height(20)));
+    assert_eq!(client.hub.tip_hash().unwrap(), seed_tip_hash);
+
+    // 2) Transition: persistent follow (tip tracking), not another parallel IBD.
+    client
+        .follow_from(seed.local_addr)
+        .await
+        .expect("follow after ibd");
+
+    // 3) Seeder extends tip — client must pick it up via inv/headers on the
+    //    follow session (steady-state path).
+    let tip = seed.hub.tip_hash().unwrap();
+    let tip_time = seed
+        .query
+        .header_at_height(Height(20))
+        .unwrap()
+        .unwrap()
+        .1
+        .timestamp;
+    let b21 = mine_regtest_block(tip, tip_time + 600, 21, vec![]);
+    let h21 = b21.block_hash();
+    seed.ingest_block(21, b21).unwrap();
+
+    client
+        .wait_tip_hash(h21, Duration::from_secs(15))
+        .await
+        .expect("tip tracking after ibd");
+    assert_eq!(client.query.tip_height(), Some(Height(21)));
+
+    // 4) Block relay / serve: a third node IBD-syncs **from the client** (not
+    //    the original seeder), proving post-IBD history serve works.
+    let third = start_node(&third_dir).await;
+    let n3 = third
+        .sync_from(client.local_addr)
+        .await
+        .expect("sync from client after ibd");
+    assert!(n3 >= 20, "third downloaded {n3}");
+    third
+        .wait_height(21, Duration::from_secs(15))
+        .await
+        .expect("third tip");
+    assert_eq!(third.hub.tip_hash().unwrap(), h21);
+
+    seed.shutdown().await;
+    client.shutdown().await;
+    third.shutdown().await;
+}
+
+
 
 /// Phase 5: most-work reorg — longer branch wins after disconnect/connect.
 #[tokio::test]
@@ -308,7 +386,7 @@ async fn reorg_to_longer_branch() {
 }
 
 /// Long-running node entry: listen briefly, connect to seeder, exit via max_run_secs.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn node_run_p2p_short() {
     use rbitcoin_node::{run_p2p, NodeConfig};
     use rbitcoin_primitives::Network;

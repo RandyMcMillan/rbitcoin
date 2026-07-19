@@ -1,18 +1,126 @@
 //! Domain query layer over [`rbitcoin_store::Store`].
 
+mod archive;
+mod chain_view;
+mod class_a_cache;
+mod connect;
+mod reconstruct;
+mod scripthash;
+mod tip_prevout_cache;
+mod wave_prevout;
+
+use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};
-use bitcoin::consensus::Decodable;
+use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
-use bitcoin::{Block, BlockHash, CompactTarget, Transaction, TxMerkleNode};
+use bitcoin::transaction::Version as TxVersion;
+use bitcoin::{
+    Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
+    TxMerkleNode, TxOut, Witness,
+};
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_store::{
     script_hash, HeaderRecord, InputRecord, OutputRecord, PointRecord, ScriptHashRecord, Store,
-    StoreError, TxRecord, UNSPENT,
+    StoreError, TxRecord,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Mutex;
 
 pub type QueryError = StoreError;
+
+pub use class_a_cache::stats as class_a_cache_stats;
+pub use connect::ConfirmPrepared;
+pub use tip_prevout_cache::stats as tip_prevout_cache_stats;
+pub use wave_prevout::WavePrevoutCache;
+
+/// Class C sub-phase wall times (nanoseconds; reset by the IBD sampler).
+///
+/// Split so logs can tell strong/height vs scripthash puts vs tip commit.
+/// Scripthash subtimers (`SH_*`) break down collect vs durable append steps.
+pub mod class_c_phase_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static STRONG_NS: AtomicU64 = AtomicU64::new(0);
+    /// Wall time of the SH worker (collect + append), not including wait for strong.
+    pub static SCRIPTHASH_NS: AtomicU64 = AtomicU64::new(0);
+    pub static TIP_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// SH: warm create-tx index (first confirm only; should be ~0 after).
+    pub static SH_WARM_NS: AtomicU64 = AtomicU64::new(0);
+    /// SH: filter which wave txs need create rows.
+    pub static SH_FILTER_NS: AtomicU64 = AtomicU64::new(0);
+    /// SH: load creates from Class A for new txs.
+    pub static SH_COLLECT_NS: AtomicU64 = AtomicU64::new(0);
+    /// SH: sort creates by scripthash.
+    pub static SH_SORT_NS: AtomicU64 = AtomicU64::new(0);
+    /// SH: seed process/durable heads for new scripthash keys.
+    pub static SH_SEED_NS: AtomicU64 = AtomicU64::new(0);
+    /// SH: encode + body `write_at`.
+    pub static SH_BODY_NS: AtomicU64 = AtomicU64::new(0);
+    /// SH: `scripthash.head` insert_many.
+    pub static SH_HEAD_NS: AtomicU64 = AtomicU64::new(0);
+    /// SH: mark create txs indexed (`sh_tx_indexed` inserts).
+    pub static SH_INDEX_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// `(strong, scripthash, tip)` nanoseconds.
+    ///
+    /// `scripthash` is the **sum of SH substeps** (not a separate end-to-end
+    /// timer), so status windows do not invent large `other_ms` when substeps
+    /// and wall are sampled on different ticks.
+    pub fn sample_and_reset() -> (u64, u64, u64) {
+        (
+            STRONG_NS.swap(0, Ordering::Relaxed),
+            SCRIPTHASH_NS.swap(0, Ordering::Relaxed),
+            TIP_NS.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    /// `(warm, filter, collect, sort, seed, body, head, index)` nanoseconds.
+    pub fn sample_sh_sub_and_reset() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+        (
+            SH_WARM_NS.swap(0, Ordering::Relaxed),
+            SH_FILTER_NS.swap(0, Ordering::Relaxed),
+            SH_COLLECT_NS.swap(0, Ordering::Relaxed),
+            SH_SORT_NS.swap(0, Ordering::Relaxed),
+            SH_SEED_NS.swap(0, Ordering::Relaxed),
+            SH_BODY_NS.swap(0, Ordering::Relaxed),
+            SH_HEAD_NS.swap(0, Ordering::Relaxed),
+            SH_INDEX_NS.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    /// Accrue a SH substep and the aggregate `SCRIPTHASH_NS` wall (same window).
+    #[inline]
+    pub(crate) fn add_sh_part(part: &AtomicU64, ns: u64) {
+        if ns == 0 {
+            return;
+        }
+        part.fetch_add(ns, Ordering::Relaxed);
+        SCRIPTHASH_NS.fetch_add(ns, Ordering::Relaxed);
+    }
+}
+
+/// Connect prevout resolution counters (reset by the IBD sampler).
+pub mod connect_prevout_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static TIP_HIT: AtomicU64 = AtomicU64::new(0);
+    pub static WAVE_HIT: AtomicU64 = AtomicU64::new(0);
+    pub static CLASS_A_HIT: AtomicU64 = AtomicU64::new(0);
+    pub static STORE_MISS: AtomicU64 = AtomicU64::new(0);
+
+    /// `(tip_hit, wave_hit, class_a_hit, store_miss)` then reset.
+    pub fn sample_and_reset() -> (u64, u64, u64, u64) {
+        (
+            TIP_HIT.swap(0, Ordering::Relaxed),
+            WAVE_HIT.swap(0, Ordering::Relaxed),
+            CLASS_A_HIT.swap(0, Ordering::Relaxed),
+            STORE_MISS.swap(0, Ordering::Relaxed),
+        )
+    }
+}
+
 
 /// One transaction to apply when connecting a block.
 #[derive(Clone, Debug)]
@@ -22,48 +130,242 @@ pub struct TxApply {
     pub outputs: Vec<OutputRecord>,
 }
 
+/// One header on the best store path after the confirmed tip (IBD resume).
+#[derive(Clone, Debug)]
+pub struct ResumeWorkEntry {
+    pub height: u32,
+    pub hash: [u8; 32],
+    pub header_fk: Fk,
+    /// True if `header_txs` has a body for this header (Class A ready).
+    pub has_body: bool,
+}
+
 /// Domain query facade used by higher layers (consensus, net, RPC).
 pub struct Query {
     store: Store,
-    /// When false, connect/disconnect skip scripthash multimap (IBD fast path).
-    scripthash_index: std::sync::atomic::AtomicBool,
-    /// When false, connect skips Class B point (spend) multimap writes (IBD fast path).
-    /// Double-spend checks via `spenders` require this on; keep on unless milestone
-    /// skips connect validation for the heights being ingested.
+    /// When false, archive **and** confirm skip durable Class B point (spend) writes.
+    /// Confirm still tracks spends in [`Self::spent_local`] for double-spend checks.
+    /// Re-enable + [`Self::backfill_point_spends`] after catch-up (before Electrum).
     spend_index: std::sync::atomic::AtomicBool,
-    /// When false, archive skips `tx.head` inserts (txid → fk). IBD under milestone
-    /// does not need by-txid lookup; heads are the main single-thread archive cost.
-    /// Re-enable / reindex before anything that resolves txs by txid.
+    /// When false, archive skips durable `tx.head` inserts (main archive cost).
+    /// Process-local [`Self::txid_to_fk`] still maps txid→fk for prev_tx_fk + confirm.
     tx_index: std::sync::atomic::AtomicBool,
+    /// Process-local txid → fk for all txs archived this process (and warmed from head).
+    /// Enables prevout resolution when durable `tx.head` is off (milestone IBD).
+    txid_to_fk: Mutex<HashMap<[u8; 32], Fk>>,
+    /// Process-local spent outpoints when durable point index is off (IBD confirm path).
+    /// Key: (prev_txid, prev_vout). Cleared after [`Self::backfill_point_spends`].
+    spent_local: Mutex<HashSet<([u8; 32], u32)>>,
+    /// Process-local scripthash → body head fk (confirm append path; avoids durable chain walks).
+    sh_heads: Mutex<HashMap<[u8; 32], Fk>>,
+    /// Create txs with durable thin SH rows (skip re-put). Warmed once from body after open
+    /// when non-empty; then maintained on confirm / disconnect.
+    sh_tx_indexed: Mutex<HashSet<u64>>,
+    /// True after [`Self::ensure_sh_tx_indexed_warmed`] has run (empty body counts as warm).
+    sh_tx_indexed_warmed: std::sync::atomic::AtomicBool,
+    /// Byte-capped Class A working set (tx + runs) for confirm connect / reconstruct.
+    /// Still filled on archive; likely demoted once tip_prevout proves out.
+    class_a_cache: class_a_cache::ClassACache,
+    /// Tip-window create txs + outputs filled **as we confirm** (and when
+    /// resolving parents during connect). FIFO; independent of archive lead.
+    tip_prevout_cache: tip_prevout_cache::TipPrevoutCache,
 }
 
 impl Query {
     pub fn open_or_create(store_path: impl AsRef<Path>) -> Result<Self, QueryError> {
-        Ok(Self {
-            store: Store::open_or_create(store_path.as_ref())?,
-            scripthash_index: std::sync::atomic::AtomicBool::new(true),
+        let store = Store::open_or_create(store_path.as_ref())?;
+        // Heal strong_tx / tx_height written above confirmed tip (kill -9 mid Class C).
+        // Tip-bound spenders already ignore those rows; this restores is_strong parity.
+        let repaired = store.repair_class_c_above_tip()?;
+        if repaired > 0 {
+            // Use eprintln so node logs still see it before rbitcoin_log is configured.
+            eprintln!(
+                "rbitcoin: repaired {repaired} Class C tx rows above confirmed tip (partial confirm / kill -9)"
+            );
+        }
+        let q = Self {
+            store,
             spend_index: std::sync::atomic::AtomicBool::new(true),
             tx_index: std::sync::atomic::AtomicBool::new(true),
-        })
+            txid_to_fk: Mutex::new(HashMap::new()),
+            spent_local: Mutex::new(HashSet::new()),
+            sh_heads: Mutex::new(HashMap::new()),
+            sh_tx_indexed: Mutex::new(HashSet::new()),
+            sh_tx_indexed_warmed: std::sync::atomic::AtomicBool::new(false),
+            class_a_cache: class_a_cache::ClassACache::from_env(),
+            tip_prevout_cache: tip_prevout_cache::TipPrevoutCache::from_env(),
+        };
+        // Warm cache from durable head if present (resume with index on).
+        // Full body scan is not done here; fresh genesis IBD fills cache as it archives.
+        Ok(q)
+    }
+
+    fn remember_txid(&self, txid: [u8; 32], fk: Fk) {
+        self.txid_to_fk.lock().unwrap().insert(txid, fk);
+    }
+
+    /// Resolve txid → fk via process cache, then durable `tx.head`.
+    fn lookup_tx_fk(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
+        if let Some(&fk) = self.txid_to_fk.lock().unwrap().get(txid) {
+            return Ok(Some(fk));
+        }
+        Ok(self.store.get_tx_by_txid(txid)?.map(|(fk, _)| fk))
+    }
+
+    /// Public resolve for consensus prevout path (process cache + durable head).
+    pub fn tx_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
+        self.lookup_tx_fk(txid)
+    }
+
+    /// Warm process txid→fk from an already-archived header body.
+    fn warm_txid_cache_for_header(&self, header_fk: Fk) -> Result<(), QueryError> {
+        let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
+            return Ok(());
+        };
+        for tfk in tx_fks {
+            let rec = self.store.get_tx(tfk)?;
+            self.remember_txid(rec.txid, tfk);
+        }
+        Ok(())
     }
 
     pub fn store(&self) -> &Store {
         &self.store
     }
 
-    /// Enable/disable Electrum scripthash index writes (default on). Off during IBD for speed.
-    pub fn set_scripthash_index(&self, enabled: bool) {
-        self.scripthash_index
-            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+    /// Class A working-set cache size `(entries, approx_bytes, budget_bytes)`.
+    pub fn class_a_cache_usage(&self) -> (usize, usize, usize) {
+        (
+            self.class_a_cache.len(),
+            self.class_a_cache.approx_bytes(),
+            self.class_a_cache.budget_bytes(),
+        )
     }
 
-    pub fn scripthash_index_enabled(&self) -> bool {
-        self.scripthash_index
-            .load(std::sync::atomic::Ordering::SeqCst)
+    pub fn tip_prevout_cache_usage(&self) -> (usize, usize, usize) {
+        (
+            self.tip_prevout_cache.len(),
+            self.tip_prevout_cache.approx_bytes(),
+            self.tip_prevout_cache.budget_bytes(),
+        )
     }
 
-    /// Enable/disable point (spend) multimap writes (default on). Off during IBD under
-    /// milestone for speed; re-enable (or reindex) before full connect validation.
+    /// Remember a create tx + outputs in the tip-window prevout cache.
+    pub(crate) fn tip_prevout_note(
+        &self,
+        fk: Fk,
+        tx: TxRecord,
+        outputs: Vec<OutputRecord>,
+    ) {
+        self.tip_prevout_cache.note(fk, tx, outputs);
+    }
+
+    /// Single-lock tip_prevout resolve for connect: `(tx, output)`.
+    pub fn tip_prevout_tx_and_output(
+        &self,
+        fk: Fk,
+        vout: u32,
+    ) -> Option<(TxRecord, OutputRecord)> {
+        self.tip_prevout_cache.get_tx_and_output_at(fk, vout)
+    }
+
+    /// Single-lock tip_prevout resolve by parent txid.
+    pub fn tip_prevout_tx_and_output_by_txid(
+        &self,
+        txid: &[u8; 32],
+        vout: u32,
+    ) -> Option<(Fk, TxRecord, OutputRecord)> {
+        self.tip_prevout_cache
+            .get_tx_and_output_by_txid(txid, vout)
+    }
+
+    /// After successful Class C: drop spent vouts from tip_prevout (budget reclaim).
+    pub fn retire_tip_prevout_spends(&self, spends: &[([u8; 32], u32)]) {
+        self.tip_prevout_cache.retire_spends(spends);
+    }
+
+    /// True if outpoint is cached as live unspent in tip_prevout (write-through).
+    pub fn tip_prevout_has_live(&self, txid: &[u8; 32], vout: u32) -> bool {
+        self.tip_prevout_cache.has_live_output_txid(txid, vout)
+    }
+
+    /// True if outpoint is cached as live unspent in tip_prevout by create fk.
+    pub fn tip_prevout_has_live_fk(&self, fk: Fk, vout: u32) -> bool {
+        self.tip_prevout_cache.has_live_output(fk, vout)
+    }
+
+    /// (D) When archive leads tip by more than this many bodies, skip bulk Class A
+    /// cache fill on archive. Confirm-wave **prefetch** (A) warms tip+1…N instead.
+    /// Tip-follow (small lead) fills from archive so tip+1 is warm at write time.
+    ///
+    /// Override with `RBITCOIN_CLASS_A_ARCHIVE_LEAD` (block count).
+    pub(crate) fn class_a_archive_fill_max_lead(&self) -> u64 {
+        std::env::var("RBITCOIN_CLASS_A_ARCHIVE_LEAD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512)
+    }
+
+    /// True when archive is near the confirmed tip (or tip not established).
+    pub(crate) fn should_fill_class_a_from_archive(&self) -> bool {
+        let max_lead = self.class_a_archive_fill_max_lead();
+        let tip = match self.tip_height() {
+            Some(h) => h.0 as u64,
+            // Pre-genesis confirm: archive may already race ahead — don't flood.
+            None => return false,
+        };
+        let bodies = self.store.archived_block_count().unwrap_or(0);
+        // bodies includes height 0..; tip is last confirmed height.
+        // lead ≈ archived heights above tip.
+        let lead = bodies.saturating_sub(tip.saturating_add(1));
+        lead <= max_lead
+    }
+
+    /// One sequential body scan into the process create-tx set so kill+restart
+    /// re-confirm does not append duplicate creates (no per-batch chain walks).
+    ///
+    /// Cheap when body is empty. Idempotent. Called automatically on confirm;
+    /// exposed for tests / explicit warm after open.
+    pub fn warm_scripthash_create_index(&self) -> Result<(), QueryError> {
+        self.ensure_sh_tx_indexed_warmed()
+    }
+
+    /// One sequential body scan into [`Self::sh_tx_indexed`] so kill+restart re-confirm
+    /// does not append duplicate creates — without per-batch linked-list walks.
+    ///
+    /// Cheap when body is empty. Idempotent. Safe to call from confirm before puts.
+    fn ensure_sh_tx_indexed_warmed(&self) -> Result<(), QueryError> {
+        if self
+            .sh_tx_indexed_warmed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        // Double-checked under set lock so concurrent confirm cannot double-scan.
+        let mut indexed = self.sh_tx_indexed.lock().unwrap();
+        if self
+            .sh_tx_indexed_warmed
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        let n = self.store.scripthash.entry_count();
+        if n > 0 {
+            indexed.reserve(n as usize);
+            self.store.scripthash.for_each_live_create(|create_tx_fk, _vout| {
+                if !create_tx_fk.is_null() {
+                    indexed.insert(create_tx_fk.0);
+                }
+            })?;
+        }
+        self.sh_tx_indexed_warmed
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Enable/disable durable point (spend) multimap writes on archive **and** confirm
+    /// (default on). Off during milestone IBD for speed; re-enable and
+    /// [`Self::backfill_point_spends`] before Electrum / after catch-up.
     pub fn set_spend_index(&self, enabled: bool) {
         self.spend_index
             .store(enabled, std::sync::atomic::Ordering::SeqCst);
@@ -72,6 +374,89 @@ impl Query {
     pub fn spend_index_enabled(&self) -> bool {
         self.spend_index
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Buffer `point.head` upserts in process RAM during full-validation IBD.
+    ///
+    /// Writes spill sorted/page-buffered when the map reaches `max_entries` or on
+    /// store flush. Cuts continuous random RMW on multi‑GiB `point.head`.
+    pub fn enable_point_head_write_behind(&self, max_entries: usize) -> Result<(), QueryError> {
+        self.store.enable_point_head_write_behind(max_entries)
+    }
+
+    pub fn disable_point_head_write_behind(&self) -> Result<(), QueryError> {
+        self.store.disable_point_head_write_behind()
+    }
+
+    pub fn spill_point_head(&self) -> Result<(), QueryError> {
+        self.store.spill_point_head()
+    }
+
+    /// Defer soft-cap point.head spills during confirm connect (partial spill on clear).
+    pub fn set_point_head_defer_spill(&self, defer: bool) -> Result<(), QueryError> {
+        self.store.set_point_head_defer_spill(defer)
+    }
+
+    /// Buffer `tx.head` upserts (optional; useful when durable tx index is on).
+    pub fn enable_tx_head_write_behind(&self, max_entries: usize) -> Result<(), QueryError> {
+        self.store.enable_tx_head_write_behind(max_entries)
+    }
+
+    pub fn disable_tx_head_write_behind(&self) -> Result<(), QueryError> {
+        self.store.disable_tx_head_write_behind()
+    }
+
+    pub fn spill_tx_head(&self) -> Result<(), QueryError> {
+        self.store.spill_tx_head()
+    }
+
+    /// Defer soft-cap tx.head spills during confirm (partial spill on clear).
+    pub fn set_tx_head_defer_spill(&self, defer: bool) -> Result<(), QueryError> {
+        self.store.set_tx_head_defer_spill(defer)
+    }
+
+    /// True if this outpoint is spent on the **best chain** (durable strong
+    /// points and/or process-local set used while durable index is off during IBD).
+    ///
+    /// Does **not** treat archive-only point rows as spent: Class A may write
+    /// edges before Class C; those spenders are not strong yet.
+    pub fn is_outpoint_spent(&self, txid: &[u8; 32], vout: u32) -> Result<bool, QueryError> {
+        // Local set first (IBD hot path) — avoid multimap probes when empty.
+        if self.spent_local.lock().unwrap().contains(&(*txid, vout)) {
+            return Ok(true);
+        }
+        // When durable index is off (milestone catch-up), do not touch point.head.
+        if !self.spend_index_enabled() {
+            return Ok(false);
+        }
+        self.store.has_confirmed_strong_spender(txid, vout)
+    }
+
+    /// Lock the process-local spent set for a multi-check connect pass.
+    ///
+    /// Confirm used to call [`Self::is_outpoint_spent`] per input (mutex × thousands)
+    /// while the set holds the whole chain. Hold this guard across one block's
+    /// connect checks instead.
+    pub fn lock_spent_local(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashSet<([u8; 32], u32)>> {
+        self.spent_local.lock().unwrap()
+    }
+
+    /// Record a spend in the process-local set (IBD / spend_index off).
+    pub fn note_outpoint_spent_local(&self, txid: [u8; 32], vout: u32) {
+        self.spent_local.lock().unwrap().insert((txid, vout));
+    }
+
+    /// Batch-insert process-local spends (one mutex acquisition).
+    pub fn note_outpoints_spent_local(&self, spends: &[([u8; 32], u32)]) {
+        if spends.is_empty() {
+            return;
+        }
+        let mut g = self.spent_local.lock().unwrap();
+        for &s in spends {
+            g.insert(s);
+        }
     }
 
     /// Enable/disable txid hash-head inserts on archive (default on). Off under
@@ -84,6 +469,141 @@ impl Query {
     pub fn tx_index_enabled(&self) -> bool {
         self.tx_index
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Fill process-local txid→fk from every Class A tx body.
+    ///
+    /// Required when durable `tx.head` is off and the process restarts: out-of-order
+    /// archive may have left spend inputs with external `prev_txid` and null
+    /// `prev_tx_fk`. Confirm resolves those via this cache (see signet tip stuck
+    /// on `missing prevout` after resume).
+    ///
+    /// Returns the number of txs loaded into the cache.
+    pub fn warm_txid_cache_from_bodies(&self) -> Result<u64, QueryError> {
+        let n = self.store.txs.count();
+        if n == 0 {
+            return Ok(0);
+        }
+        // Batch lock inserts without per-tx mutex churn.
+        let mut map = self.txid_to_fk.lock().unwrap();
+        map.reserve(n as usize);
+        for id in 1..=n {
+            let fk = Fk(id);
+            let rec = self.store.get_tx(fk)?;
+            map.insert(rec.txid, fk);
+        }
+        Ok(n)
+    }
+
+    /// Write durable `tx.head` for every Class A body missing from the hash head.
+    ///
+    /// After milestone IBD (`tx_index` off), Electrum and prevout-by-txid need this
+    /// before scripthash backfill / `transaction.get`. Idempotent. Returns inserts.
+    ///
+    /// `on_progress(done_bodies, total_bodies, inserted)` for operator logs.
+    pub fn backfill_tx_index(
+        &self,
+        on_progress: impl FnMut(u64, u64, u64),
+    ) -> Result<u64, QueryError> {
+        let n = self.store.txs.backfill_head(on_progress)?;
+        // Keep process cache coherent with the durable head.
+        if n > 0 {
+            let _ = self.warm_txid_cache_from_bodies()?;
+        }
+        Ok(n)
+    }
+
+    /// Class A tx body count (for backfill heuristics / logs).
+    pub fn tx_body_count(&self) -> u64 {
+        self.store.txs.count()
+    }
+
+    /// Durable `tx.head` occupied slots (for backfill heuristics / logs).
+    pub fn tx_head_occupied(&self) -> u64 {
+        self.store.txs.head_occupied()
+    }
+
+    /// Thin scripthash create row count (diagnostic / tip-mode logs).
+    pub fn scripthash_entry_count(&self) -> u64 {
+        self.store.scripthash.entry_count()
+    }
+
+    /// Durable point (spend-edge) count (for backfill heuristics / logs).
+    pub fn point_edge_count(&self) -> u64 {
+        self.store.points.edge_count()
+    }
+
+    /// Write durable point edges for every confirmed non-coinbase input.
+    ///
+    /// After milestone IBD (confirm skipped `put_spend`), Electrum and
+    /// `spenders()` need this. When the point table is empty, uses an append-only
+    /// bulk path (`put_spend_batch`, no `spenders_raw` probe). Otherwise probes
+    /// for idempotency. Clears the process-local spent set afterward.
+    ///
+    /// `on_progress(height, tip, txs_so_far, edges_so_far)`.
+    /// Returns `(heights_walked, txs_touched)`.
+    pub fn backfill_point_spends(
+        &self,
+        mut on_progress: impl FnMut(u32, u32, u64, u64),
+    ) -> Result<(u32, u64), QueryError> {
+        let Some(tip) = self.tip_height() else {
+            return Ok((0, 0));
+        };
+        // Empty index → bulk append. Sparse/partial → probe to avoid dups.
+        let probe = self.point_edge_count() > 0;
+        let mut txs = 0u64;
+        let mut edges_total = 0u64;
+        const EDGE_BATCH: usize = 8192;
+        const PROGRESS_EVERY: u32 = 10_000;
+        let mut edge_batch: Vec<([u8; 32], u32, Fk, u32)> = Vec::with_capacity(EDGE_BATCH);
+        let mut last_log = 0u32;
+
+        let flush_batch = |batch: &mut Vec<([u8; 32], u32, Fk, u32)>| -> Result<(), QueryError> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+            self.store.put_spend_batch(batch)?;
+            batch.clear();
+            Ok(())
+        };
+
+        for h in 0..=tip.0 {
+            let height = Height(h);
+            let fks = match self.block_tx_fks(height) {
+                Ok(f) => f,
+                Err(StoreError::NotFound) => continue,
+                Err(e) => return Err(e),
+            };
+            for fk in fks {
+                if probe {
+                    // Per-tx path with existence probe (partial reindex).
+                    self.mark_spends_for_tx(fk, true)?;
+                } else {
+                    let mut edges = self.collect_spend_edges(fk, false)?;
+                    edges_total += edges.len() as u64;
+                    if edge_batch.len() + edges.len() > EDGE_BATCH && !edge_batch.is_empty() {
+                        flush_batch(&mut edge_batch)?;
+                    }
+                    if edges.len() >= EDGE_BATCH {
+                        // Single fat tx: write on its own.
+                        self.store.put_spend_batch(&edges)?;
+                    } else {
+                        edge_batch.append(&mut edges);
+                        if edge_batch.len() >= EDGE_BATCH {
+                            flush_batch(&mut edge_batch)?;
+                        }
+                    }
+                }
+                txs += 1;
+            }
+            if h - last_log >= PROGRESS_EVERY || h == tip.0 {
+                on_progress(h, tip.0, txs, edges_total + edge_batch.len() as u64);
+                last_log = h;
+            }
+        }
+        flush_batch(&mut edge_batch)?;
+        self.spent_local.lock().unwrap().clear();
+        Ok((tip.0.saturating_add(1), txs))
     }
 
     pub fn tip_height(&self) -> Option<Height> {
@@ -113,31 +633,135 @@ impl Query {
     }
 
     pub fn put_tx(&self, rec: &TxRecord) -> Result<Fk, QueryError> {
-        self.store.put_tx(rec)
+        let fk = self.store.put_tx(rec)?;
+        self.remember_txid(rec.txid, fk);
+        Ok(fk)
     }
 
     pub fn get_tx(&self, fk: Fk) -> Result<TxRecord, QueryError> {
-        self.store.get_tx(fk)
+        // Tip-window first (confirm prevout locality), then archive-filled Class A.
+        if let Some(tx) = self.tip_prevout_cache.get_tx(fk) {
+            return Ok(tx);
+        }
+        self.get_tx_class_a(fk)
+    }
+
+    /// Class A → store only. Reconstruct / bulk Class C / connect cold path use
+    /// this so `tip_prevout` hit rates reflect intentional prevout probes.
+    pub fn get_tx_class_a(&self, fk: Fk) -> Result<TxRecord, QueryError> {
+        if let Some(tx) = self.class_a_cache.get_tx(fk) {
+            return Ok(tx);
+        }
+        let tx = self.store.get_tx(fk)?;
+        self.remember_txid(tx.txid, fk);
+        // Cache tx row only; runs filled on demand by tx_*_run / reconstruct.
+        self.class_a_cache.note(fk, tx.clone(), None, None);
+        Ok(tx)
     }
 
     pub fn get_tx_by_txid(&self, txid: &[u8; 32]) -> Result<Option<(Fk, TxRecord)>, QueryError> {
-        self.store.get_tx_by_txid(txid)
+        if let Some(fk) = self.lookup_tx_fk(txid)? {
+            return Ok(Some((fk, self.get_tx(fk)?)));
+        }
+        Ok(None)
     }
 
-    pub fn put_output(&self, rec: &OutputRecord) -> Result<Fk, QueryError> {
-        self.store.put_output(rec)
+    pub fn put_output_run(&self, recs: &[OutputRecord]) -> Result<Fk, QueryError> {
+        self.store.put_output_run(recs)
     }
 
-    pub fn get_output(&self, fk: Fk) -> Result<OutputRecord, QueryError> {
-        self.store.get_output(fk)
+    pub fn get_output_at(
+        &self,
+        run_fk: Fk,
+        count: u32,
+        index: u32,
+    ) -> Result<OutputRecord, QueryError> {
+        self.store.get_output_at(run_fk, count, index)
     }
 
-    pub fn put_input(&self, rec: &InputRecord) -> Result<Fk, QueryError> {
-        self.store.put_input(rec)
+    pub fn get_output_run(&self, run_fk: Fk, count: u32) -> Result<Vec<OutputRecord>, QueryError> {
+        self.store.get_output_run(run_fk, count)
     }
 
-    pub fn get_input(&self, fk: Fk) -> Result<InputRecord, QueryError> {
-        self.store.get_input(fk)
+    pub fn put_input_run(&self, recs: &[InputRecord]) -> Result<Fk, QueryError> {
+        self.store.put_input_run(recs)
+    }
+
+    pub fn get_input_at(
+        &self,
+        run_fk: Fk,
+        count: u32,
+        index: u32,
+    ) -> Result<InputRecord, QueryError> {
+        self.store.get_input_at(run_fk, count, index)
+    }
+
+    pub fn get_input_run(&self, run_fk: Fk, count: u32) -> Result<Vec<InputRecord>, QueryError> {
+        self.store.get_input_run(run_fk, count)
+    }
+
+    /// Input `i` of a tx row (run-addressed).
+    pub fn tx_input(&self, tx: &TxRecord, i: u32) -> Result<InputRecord, QueryError> {
+        if i >= tx.input_count {
+            return Err(StoreError::NotFound);
+        }
+        let run = tx.input_start_fk.get().ok_or(StoreError::InvalidFk)?;
+        self.get_input_at(Fk(run), tx.input_count, i)
+    }
+
+    /// Output `vout` of a tx row (run-addressed).
+    pub fn tx_output(&self, tx: &TxRecord, vout: u32) -> Result<OutputRecord, QueryError> {
+        self.tx_output_attributed(tx, vout, false)
+    }
+
+    /// Like [`Self::tx_output`] but records connect cold-path counters when
+    /// `count_connect` is true. When true, **skips tip_prevout probe** (caller
+    /// already tried the single-lock fast path) to avoid double MISS stats.
+    pub fn tx_output_attributed(
+        &self,
+        tx: &TxRecord,
+        vout: u32,
+        count_connect: bool,
+    ) -> Result<OutputRecord, QueryError> {
+        use std::sync::atomic::Ordering;
+        if vout >= tx.output_count {
+            return Err(StoreError::NotFound);
+        }
+        // Prefer full-run cache via fk when we know it (txid→fk process cache).
+        if let Some(fk) = self.lookup_tx_fk(&tx.txid)? {
+            if !count_connect {
+                if let Some(o) = self.tip_prevout_cache.get_output_at(fk, vout) {
+                    return Ok(o);
+                }
+            }
+            if let Some(o) = self.class_a_cache.get_output_at(fk, vout) {
+                if count_connect {
+                    connect_prevout_stats::CLASS_A_HIT.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(o);
+            }
+            // Load full run once into cache (connect often probes many vouts).
+            let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
+            let outs = self.get_output_run(Fk(run), tx.output_count)?;
+            let out = outs
+                .get(vout as usize)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            // Promote resolved creates into tip-window (prevout path).
+            self.tip_prevout_cache
+                .note(fk, tx.clone(), outs.clone());
+            self.class_a_cache.fill_outputs(fk, outs);
+            if count_connect {
+                connect_prevout_stats::STORE_MISS.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(out);
+        }
+        let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
+        let out = self.get_output_at(Fk(run), tx.output_count, vout)?;
+        if count_connect {
+            connect_prevout_stats::STORE_MISS.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(out)
     }
 
     pub fn put_spend(
@@ -185,6 +809,90 @@ impl Query {
         Ok(self.store.header_txs.has_body(fk)?)
     }
 
+    /// Total headers with a Class A body on disk (durable, any prior run).
+    pub fn archived_block_count(&self) -> Result<u64, QueryError> {
+        Ok(self.store.archived_block_count()?)
+    }
+
+    /// Rebuild the post-tip work path from durable headers + Class A bodies.
+    ///
+    /// Parallel IBD only remembered the ordered path in RAM. On restart it re-ran
+    /// getheaders/getdata even though Class A was already on disk. This walks
+    /// `header.body` once, builds a prev→children map, and follows the best
+    /// (prefer-archived) child chain from the confirmed tip.
+    ///
+    /// `max` caps how many headers are returned (IBD ordered cap).
+    pub fn resume_work_path_after_tip(
+        &self,
+        tip_hash: [u8; 32],
+        tip_height: u32,
+        max: usize,
+    ) -> Result<Vec<ResumeWorkEntry>, QueryError> {
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let Some((tip_fk, _)) = self.get_header_by_hash(&tip_hash)? else {
+            return Ok(Vec::new());
+        };
+        let n = self.store.header_count();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        // prev_fk → list of (child_fk, child_hash)
+        let mut children: HashMap<u64, Vec<(Fk, [u8; 32])>> = HashMap::new();
+        for id in 1..=n {
+            let fk = Fk(id);
+            let rec = self.store.get_header(fk)?;
+            let prev = rec.prev_fk.get().unwrap_or(0);
+            children.entry(prev).or_default().push((fk, rec.hash));
+        }
+
+        let mut out = Vec::with_capacity(max.min(4096));
+        let mut cur_fk = tip_fk;
+        let mut height = tip_height;
+        while out.len() < max {
+            let Some(kids) = children.get(&cur_fk.0) else {
+                break;
+            };
+            if kids.is_empty() {
+                break;
+            }
+            // Prefer a child that already has a Class A body; among ties, highest fk
+            // (later archive / main-chain append order).
+            let mut best: Option<(Fk, [u8; 32], bool)> = None;
+            for &(fk, hash) in kids {
+                let has_body = self.store.header_txs.has_body(fk)?;
+                let take = match best {
+                    None => true,
+                    Some((best_fk, _, best_body)) => {
+                        (has_body && !best_body) || (has_body == best_body && fk.0 > best_fk.0)
+                    }
+                };
+                if take {
+                    best = Some((fk, hash, has_body));
+                }
+            }
+            let Some((fk, hash, has_body)) = best else {
+                break;
+            };
+            height = height.saturating_add(1);
+            out.push(ResumeWorkEntry {
+                height,
+                hash,
+                header_fk: fk,
+                has_body,
+            });
+            cur_fk = fk;
+        }
+        Ok(out)
+    }
+
+    /// Flush header rows + Class A body associations (IBD writer durability).
+    pub fn flush_header_archive(&self) -> Result<(), QueryError> {
+        Ok(self.store.flush_header_archive()?)
+    }
+
     /// Ensure a header row exists (no txs). Idempotent by hash.
     ///
     /// Used to pipeline header sync into the store so out-of-order bodies can
@@ -194,729 +902,6 @@ impl Query {
             return Ok(fk);
         }
         Ok(self.store.put_header(header)?)
-    }
-
-    /// Archive Class A rows for a block body (header + txs + I/O). **No** tip /
-    /// Class C updates — order-independent relative to connected tip.
-    ///
-    /// Idempotent if the body is already archived under this header hash.
-    pub fn archive_block(
-        &self,
-        header: &HeaderRecord,
-        txs: &[TxApply],
-    ) -> Result<Fk, QueryError> {
-        // Single-block path: one clone into owned mega-batch.
-        let mut items = vec![(header.clone(), txs.to_vec())];
-        let mut out = self.archive_prepared_owned(&mut items)?;
-        Ok(out.pop().expect("one archive result"))
-    }
-
-    /// Archive many prepared blocks, **moving** `TxApply` payloads (no re-clone).
-    ///
-    /// Libbitcoin-style: plan FKs, contiguous put of txs/ins/outs, bulk hash
-    /// heads. Prefer this from the IBD writer over N×[`archive_block`].
-    ///
-    /// `items[i].1` is drained (empty on success). Returns header fk per item.
-    pub fn archive_prepared_owned(
-        &self,
-        items: &mut [(HeaderRecord, Vec<TxApply>)],
-    ) -> Result<Vec<Fk>, QueryError> {
-        if items.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut with_fk: Vec<(Fk, HeaderRecord, Vec<TxApply>)> = Vec::with_capacity(items.len());
-        for (header, txs) in items.iter_mut() {
-            let fk = if let Some((fk, _)) = self.get_header_by_hash(&header.hash)? {
-                fk
-            } else {
-                self.store.put_header(header)?
-            };
-            with_fk.push((fk, header.clone(), std::mem::take(txs)));
-        }
-        self.archive_prepared_with_fks(&mut with_fk)
-    }
-
-    /// Hot IBD path: header fk already known (from ensure_header) — no hash-head
-    /// re-probe, no has_body check (body just arrived).
-    pub fn archive_prepared_with_fks(
-        &self,
-        items: &mut [(Fk, HeaderRecord, Vec<TxApply>)],
-    ) -> Result<Vec<Fk>, QueryError> {
-        if items.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut header_fks = Vec::with_capacity(items.len());
-        let mut need: Vec<(Fk, Vec<TxApply>)> = Vec::with_capacity(items.len());
-        for (fk, _header, txs) in items.iter_mut() {
-            header_fks.push(*fk);
-            // Pipeline only enqueues missing bodies; skip expensive has_body.
-            if !txs.is_empty() {
-                need.push((*fk, std::mem::take(txs)));
-            }
-        }
-        if !need.is_empty() {
-            self.archive_bodies_mega_owned(&mut need)?;
-        }
-        Ok(header_fks)
-    }
-
-    /// Mega-batch Class A: move records in place, one put_batch per table.
-    fn archive_bodies_mega_owned(
-        &self,
-        need: &mut [(Fk, Vec<TxApply>)],
-    ) -> Result<(), QueryError> {
-        let mut next_tx = self.store.txs.count() + 1;
-        let mut next_in = self.store.inputs.count() + 1;
-        let mut next_out = self.store.outputs.count() + 1;
-
-        let mut all_txs: Vec<TxRecord> = Vec::new();
-        let mut all_inputs: Vec<InputRecord> = Vec::new();
-        let mut all_outputs: Vec<OutputRecord> = Vec::new();
-        let mut per_header_tx_fks: Vec<(Fk, Vec<Fk>)> = Vec::with_capacity(need.len());
-        let mut spends: Vec<([u8; 32], u32, Fk, u32)> = Vec::new();
-        let spend_on = self.spend_index_enabled();
-
-        for (header_fk, txs) in need.iter_mut() {
-            let mut tx_fks = Vec::with_capacity(txs.len());
-            for ta in txs.drain(..) {
-                let n_in = ta.inputs.len() as u32;
-                let n_out = ta.outputs.len() as u32;
-                let tx_fk = Fk(next_tx);
-                next_tx += 1;
-                let in_start = if n_in == 0 {
-                    Fk::NULL
-                } else {
-                    Fk(next_in)
-                };
-                let out_start = if n_out == 0 {
-                    Fk::NULL
-                } else {
-                    Fk(next_out)
-                };
-
-                // Move raw + scripts — no re-clone (prep already allocated).
-                let mut tx = ta.tx;
-                tx.input_start_fk = in_start;
-                tx.input_count = n_in;
-                tx.output_start_fk = out_start;
-                tx.output_count = n_out;
-                all_txs.push(tx);
-
-                for (i, mut inp) in ta.inputs.into_iter().enumerate() {
-                    let idx = i as u32;
-                    if spend_on && inp.prev_txid != [0u8; 32] {
-                        spends.push((inp.prev_txid, inp.prev_index, tx_fk, idx));
-                    }
-                    inp.parent_tx_fk = tx_fk;
-                    inp.index = idx;
-                    all_inputs.push(inp);
-                }
-                next_in += u64::from(n_in);
-
-                for (i, mut out) in ta.outputs.into_iter().enumerate() {
-                    out.parent_tx_fk = tx_fk;
-                    out.index = i as u32;
-                    all_outputs.push(out);
-                }
-                next_out += u64::from(n_out);
-
-                tx_fks.push(tx_fk);
-            }
-            per_header_tx_fks.push((*header_fk, tx_fks));
-        }
-
-        // Pre-grow mmaps once (avoids mid-batch remap pauses on all 3 tables).
-        let tx_est: u64 = all_txs.iter().map(|t| (80 + t.raw.len()) as u64).sum();
-        let in_est: u64 = all_inputs
-            .iter()
-            .map(|r| (64 + r.script_sig.len()) as u64)
-            .sum();
-        let out_est: u64 = all_outputs
-            .iter()
-            .map(|r| (32 + r.script.len()) as u64)
-            .sum();
-        self.store.txs.reserve_append(
-            tx_est.saturating_add(all_txs.len() as u64 * 4),
-            all_txs.len() as u64,
-        )?;
-        self.store.inputs.reserve_append(
-            in_est.saturating_add(all_inputs.len() as u64 * 4),
-            all_inputs.len() as u64,
-        )?;
-        self.store.outputs.reserve_append(
-            out_est.saturating_add(all_outputs.len() as u64 * 4),
-            all_outputs.len() as u64,
-        )?;
-
-        // Three independent tables → encode+write in parallel.
-        let index_tx = self.tx_index_enabled();
-        let (tx_res, in_res, out_res) = {
-            let (tx_res, io_res) = rayon::join(
-                || self.store.txs.put_batch_indexed(&all_txs, index_tx),
-                || {
-                    rayon::join(
-                        || self.store.inputs.put_batch(&all_inputs),
-                        || self.store.outputs.put_batch(&all_outputs),
-                    )
-                },
-            );
-            let (in_res, out_res) = io_res;
-            (tx_res, in_res, out_res)
-        };
-        let got_tx_fks = tx_res?;
-        in_res?;
-        out_res?;
-        if got_tx_fks.len() != all_txs.len() {
-            return Err(StoreError::Corrupt("tx put_batch length"));
-        }
-        if let Some(&planned0) = per_header_tx_fks.first().and_then(|(_, v)| v.first()) {
-            if got_tx_fks.first().copied() != Some(planned0) {
-                return Err(StoreError::Corrupt("tx put_batch fk mismatch"));
-            }
-        }
-
-        if spend_on {
-            for (prev_txid, prev_index, tx_fk, idx) in &spends {
-                self.store
-                    .put_spend(prev_txid, *prev_index, *tx_fk, *idx)?;
-            }
-        }
-
-        let list_refs: Vec<(Fk, &[Fk])> = per_header_tx_fks
-            .iter()
-            .map(|(h, t)| (*h, t.as_slice()))
-            .collect();
-        self.store.header_txs.put_lists_batch(&list_refs)?;
-        Ok(())
-    }
-
-    /// Confirm an already-archived block at `height` (genesis or tip+1).
-    ///
-    /// Writes Class C (`confirmed`, `strong_tx`, height `block_txs`) and optional
-    /// height-dependent indexes (scripthash). Does not re-write Class A bodies.
-    pub fn confirm_block(&self, height: Height, header_hash: &[u8; 32]) -> Result<Fk, QueryError> {
-        match self.tip_height() {
-            None => {
-                if height != Height::GENESIS {
-                    return Err(StoreError::Corrupt("first block must be genesis height"));
-                }
-            }
-            Some(tip) => {
-                let expect = tip.next().ok_or(StoreError::Corrupt("height overflow"))?;
-                if height != expect {
-                    return Err(StoreError::Corrupt("connect height not tip+1"));
-                }
-            }
-        }
-
-        // Idempotent if already confirmed at this height.
-        if let Some(h) = self.height_of_hash(header_hash)? {
-            if h == height {
-                if let Some((fk, _)) = self.get_header_by_hash(header_hash)? {
-                    return Ok(fk);
-                }
-            }
-        }
-
-        let (header_fk, _rec) = self
-            .get_header_by_hash(header_hash)?
-            .ok_or(StoreError::NotFound)?;
-        let tx_fks = self
-            .store
-            .header_txs
-            .get_list(header_fk)?
-            .ok_or(StoreError::Corrupt("confirm without archived body"))?;
-
-        let script_on = self.scripthash_index_enabled();
-        // Contiguous tx fk range (always true for our archive plan) → one write.
-        let contiguous = tx_fks
-            .windows(2)
-            .all(|w| w[1].0 == w[0].0.saturating_add(1));
-        if !script_on && contiguous {
-            if let Some(&first) = tx_fks.first() {
-                self.store.strong_tx.set_strong_range(
-                    first,
-                    tx_fks.len() as u32,
-                    header_fk,
-                )?;
-            }
-        } else {
-            for &tx_fk in &tx_fks {
-                self.store.strong_tx.set_strong(tx_fk, header_fk)?;
-                if script_on {
-                    self.apply_scripthash_for_tx(height, tx_fk)?;
-                }
-            }
-        }
-
-        self.store.block_txs.put_list(height, &tx_fks)?;
-        self.store.confirmed.set(height, header_fk)?;
-        Ok(header_fk)
-    }
-
-    fn apply_scripthash_for_tx(&self, height: Height, tx_fk: Fk) -> Result<(), QueryError> {
-        let tx = self.store.get_tx(tx_fk)?;
-        if tx.input_count > 0 {
-            let start = tx.input_start_fk.get().ok_or(StoreError::InvalidFk)?;
-            for i in 0..tx.input_count {
-                let inp = self.store.get_input(Fk(start + u64::from(i)))?;
-                if inp.prev_txid != [0u8; 32] {
-                    if let Some(sh) =
-                        self.script_hash_for_outpoint(&inp.prev_txid, inp.prev_index)?
-                    {
-                        let _ = self.store.scripthash.mark_spent(
-                            &sh,
-                            &inp.prev_txid,
-                            inp.prev_index,
-                            height.0,
-                            tx_fk,
-                        )?;
-                    }
-                }
-            }
-        }
-        if tx.output_count > 0 {
-            let start = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-            for i in 0..tx.output_count {
-                let out = self.store.get_output(Fk(start + u64::from(i)))?;
-                let sh = script_hash(&out.script);
-                self.store.scripthash.put_create(&ScriptHashRecord {
-                    scripthash: sh,
-                    txid: tx.txid,
-                    vout: i,
-                    value: out.value,
-                    create_height: height.0,
-                    create_tx_fk: tx_fk,
-                    spend_height: UNSPENT,
-                    spend_tx_fk: Fk::NULL,
-                    next: Fk::NULL,
-                })?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Connect a block at `height` (genesis or tip+1): archive Class A then confirm Class C.
-    ///
-    /// Back-compat wrapper around [`archive_block`] + [`confirm_block`].
-    pub fn connect_block(
-        &self,
-        height: Height,
-        header: &HeaderRecord,
-        txs: &[TxApply],
-    ) -> Result<Fk, QueryError> {
-        self.archive_block(header, txs)?;
-        self.confirm_block(height, &header.hash)
-    }
-
-    /// Disconnect the current tip (Class C + scripthash spend clear; archive rows remain).
-    pub fn disconnect_tip(&self) -> Result<(), QueryError> {
-        let height = self
-            .tip_height()
-            .ok_or(StoreError::Corrupt("no tip to disconnect"))?;
-        let tx_fks = self.store.block_txs.get_list(height)?;
-
-        // Clear spends recorded at this height; creates become unstrong with their txs.
-        for &tx_fk in &tx_fks {
-            let tx = self.store.get_tx(tx_fk)?;
-            if self.scripthash_index_enabled() && tx.input_count > 0 {
-                let start = tx.input_start_fk.get().ok_or(StoreError::InvalidFk)?;
-                for i in 0..tx.input_count {
-                    let inp = self.store.get_input(Fk(start + u64::from(i)))?;
-                    if inp.prev_txid != [0u8; 32] {
-                        if let Some(sh) =
-                            self.script_hash_for_outpoint(&inp.prev_txid, inp.prev_index)?
-                        {
-                            self.store.scripthash.clear_spend_at_height(
-                                &sh,
-                                &inp.prev_txid,
-                                inp.prev_index,
-                                height.0,
-                            )?;
-                        }
-                    }
-                }
-            }
-            self.store.strong_tx.set_unstrong(tx_fk)?;
-        }
-        self.store.block_txs.clear_height(height)?;
-        self.store.confirmed.disconnect_tip(height)?;
-        Ok(())
-    }
-
-    fn script_hash_for_outpoint(
-        &self,
-        txid: &[u8; 32],
-        vout: u32,
-    ) -> Result<Option<[u8; 32]>, QueryError> {
-        let Some((_fk, prev)) = self.store.get_tx_by_txid(txid)? else {
-            return Ok(None);
-        };
-        if vout >= prev.output_count {
-            return Ok(None);
-        }
-        let start = match prev.output_start_fk.get() {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-        let out = self.store.get_output(Fk(start + u64::from(vout)))?;
-        Ok(Some(script_hash(&out.script)))
-    }
-
-    /// Confirmed Electrum-style history for a scripthash: (height, txid) pairs, height order.
-    pub fn scripthash_history(
-        &self,
-        scripthash: &[u8; 32],
-    ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
-        let entries = self.store.scripthash.entries(scripthash)?;
-        let mut by_txid: BTreeMap<[u8; 32], i64> = BTreeMap::new();
-        for (_fk, rec) in entries {
-            if !self.store.strong_tx.is_strong(rec.create_tx_fk)? {
-                continue;
-            }
-            // Funding tx
-            by_txid
-                .entry(rec.txid)
-                .and_modify(|h| *h = (*h).min(i64::from(rec.create_height)))
-                .or_insert(i64::from(rec.create_height));
-            // Spending tx if spent on best chain
-            if !rec.is_unspent() {
-                if let Some(sfk) = rec.spend_tx_fk.get() {
-                    if self.store.strong_tx.is_strong(Fk(sfk))? {
-                        let spend_tx = self.store.get_tx(Fk(sfk))?;
-                        by_txid
-                            .entry(spend_tx.txid)
-                            .and_modify(|h| *h = (*h).min(i64::from(rec.spend_height)))
-                            .or_insert(i64::from(rec.spend_height));
-                    }
-                }
-            }
-        }
-        let mut items: Vec<ScriptHashHistoryItem> = by_txid
-            .into_iter()
-            .map(|(txid, height)| ScriptHashHistoryItem { height, txid })
-            .collect();
-        items.sort_by_key(|i| i.height);
-        Ok(items)
-    }
-
-    /// Confirmed balance (confirmed funded − confirmed spent) for a scripthash.
-    pub fn scripthash_balance(&self, scripthash: &[u8; 32]) -> Result<ScriptHashBalance, QueryError> {
-        let mut confirmed = 0i64;
-        for (_fk, rec) in self.store.scripthash.entries(scripthash)? {
-            if !self.store.strong_tx.is_strong(rec.create_tx_fk)? {
-                continue;
-            }
-            if rec.is_unspent() {
-                confirmed = confirmed.saturating_add(rec.value);
-            }
-        }
-        Ok(ScriptHashBalance {
-            confirmed,
-            unconfirmed: 0,
-        })
-    }
-
-    /// Confirmed UTXOs for a scripthash.
-    pub fn scripthash_listunspent(
-        &self,
-        scripthash: &[u8; 32],
-    ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
-        let mut out = Vec::new();
-        for (_fk, rec) in self.store.scripthash.entries(scripthash)? {
-            if !self.store.strong_tx.is_strong(rec.create_tx_fk)? {
-                continue;
-            }
-            if rec.is_unspent() {
-                out.push(ScriptHashUtxo {
-                    tx_hash: rec.txid,
-                    tx_pos: rec.vout,
-                    height: rec.create_height,
-                    value: rec.value,
-                });
-            }
-        }
-        out.sort_by(|a, b| a.height.cmp(&b.height).then(a.tx_pos.cmp(&b.tx_pos)));
-        Ok(out)
-    }
-
-    pub fn set_archive_mode(&self, enabled: bool) -> Result<(), QueryError> {
-        self.store.set_archive_mode(enabled)
-    }
-
-    pub fn finalize_through(&self, height: u32) -> Result<(), QueryError> {
-        self.store.finalize_through(height)
-    }
-
-    pub fn archive_epoch(&self) -> rbitcoin_store::ArchiveEpoch {
-        self.store.epoch()
-    }
-
-    /// Merkle proof for `txid` in the confirmed block at `height` (Electrum get_merkle).
-    pub fn merkle_proof(
-        &self,
-        height: Height,
-        txid: &[u8; 32],
-    ) -> Result<MerkleProof, QueryError> {
-        use bitcoin::hashes::{sha256d, Hash as _};
-
-        let fks = self.block_tx_fks(height)?;
-        let mut txids = Vec::with_capacity(fks.len());
-        let mut pos = None;
-        for (i, fk) in fks.iter().enumerate() {
-            let tx = self.get_tx(*fk)?;
-            if &tx.txid == txid {
-                pos = Some(i);
-            }
-            txids.push(tx.txid);
-        }
-        let pos = pos.ok_or(StoreError::NotFound)?;
-        let mut branch = Vec::new();
-        let mut idx = pos;
-        let mut layer: Vec<[u8; 32]> = txids;
-        while layer.len() > 1 {
-            if layer.len() % 2 == 1 {
-                layer.push(*layer.last().unwrap());
-            }
-            let sibling = if idx % 2 == 0 {
-                layer[idx + 1]
-            } else {
-                layer[idx - 1]
-            };
-            branch.push(sibling);
-            let mut next = Vec::with_capacity(layer.len() / 2);
-            let mut i = 0;
-            while i < layer.len() {
-                let mut buf = [0u8; 64];
-                buf[0..32].copy_from_slice(&layer[i]);
-                buf[32..64].copy_from_slice(&layer[i + 1]);
-                next.push(sha256d::Hash::hash(&buf).to_byte_array());
-                i += 2;
-            }
-            layer = next;
-            idx /= 2;
-        }
-        Ok(MerkleProof {
-            block_height: height.0,
-            pos,
-            merkle: branch,
-        })
-    }
-
-    pub fn block_tx_fks(&self, height: Height) -> Result<Vec<Fk>, QueryError> {
-        self.store.block_txs.get_list(height)
-    }
-
-    pub fn header_at_height(
-        &self,
-        height: Height,
-    ) -> Result<Option<(Fk, HeaderRecord)>, QueryError> {
-        match self.store.confirmed.get(height)? {
-            None => Ok(None),
-            Some(fk) => Ok(Some((fk, self.store.get_header(fk)?))),
-        }
-    }
-
-    /// Best-chain height of a header hash, if it is **confirmed** on the tip chain.
-    ///
-    /// Archive may contain orphan header rows (partial connect failures). Those are
-    /// not reported here — only hashes reachable as `confirmed[height]`.
-    pub fn height_of_hash(&self, hash: &[u8; 32]) -> Result<Option<Height>, QueryError> {
-        let Some(tip) = self.tip_height() else {
-            // Only genesis can be "confirmed" with no tip.
-            return Ok(None);
-        };
-        // Fast path: tip
-        if let Some((tip_fk, rec)) = self.header_at_height(tip)? {
-            if &rec.hash == hash {
-                return Ok(Some(tip));
-            }
-            // Fast path: tip-1 (common parent checks)
-            if tip.0 > 0 {
-                if let Some((_, prec)) = self.header_at_height(Height(tip.0 - 1))? {
-                    if &prec.hash == hash {
-                        return Ok(Some(Height(tip.0 - 1)));
-                    }
-                }
-            }
-            let _ = tip_fk;
-        }
-        // Must appear in archive at all.
-        let Some((fk, _rec)) = self.get_header_by_hash(hash)? else {
-            return Ok(None);
-        };
-        // Confirm it is the header at some best-chain height by walking tip→genesis
-        // via confirmed table only (not the orphaned archive row).
-        // Prefer short reverse scan from tip (IBD / locator hot path).
-        const RECENT: u32 = 4096;
-        let start = tip.0.saturating_sub(RECENT);
-        for h in (start..=tip.0).rev() {
-            let height = Height(h);
-            if let Some((hfk, rec)) = self.header_at_height(height)? {
-                if hfk == fk || &rec.hash == hash {
-                    return Ok(Some(height));
-                }
-            }
-        }
-        // Full scan only if not in recent window (rare for IBD).
-        if start > 0 {
-            for h in (0..start).rev() {
-                let height = Height(h);
-                if let Some((hfk, rec)) = self.header_at_height(height)? {
-                    if hfk == fk || &rec.hash == hash {
-                        return Ok(Some(height));
-                    }
-                }
-            }
-        }
-        // Present in archive but not on best chain (orphan header row).
-        Ok(None)
-    }
-
-    /// Wire header for a confirmed height (resolves prev hash from archive).
-    pub fn wire_header_at_height(&self, height: Height) -> Result<BlockHeader, QueryError> {
-        let (_fk, rec) = self
-            .header_at_height(height)?
-            .ok_or(StoreError::NotFound)?;
-        self.wire_header_from_record(&rec)
-    }
-
-    fn wire_header_from_record(&self, rec: &HeaderRecord) -> Result<BlockHeader, QueryError> {
-        let prev_blockhash = if rec.prev_fk.is_null() {
-            BlockHash::from_byte_array([0u8; 32])
-        } else {
-            let prev = self.store.get_header(rec.prev_fk)?;
-            BlockHash::from_byte_array(prev.hash)
-        };
-        Ok(wire_header(rec, prev_blockhash))
-    }
-
-    /// Reconstruct a full wire block from Class A archive by header hash
-    /// (confirmed or not). Requires `header_txs` body.
-    pub fn reconstruct_archived_block(
-        &self,
-        hash: &[u8; 32],
-    ) -> Result<Option<Block>, QueryError> {
-        let Some((header_fk, rec)) = self.get_header_by_hash(hash)? else {
-            return Ok(None);
-        };
-        let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
-            return Ok(None);
-        };
-        if tx_fks.is_empty() {
-            return Err(StoreError::Corrupt("block has no transactions"));
-        }
-        let header = self.wire_header_from_record(&rec)?;
-        let mut txdata = Vec::with_capacity(tx_fks.len());
-        for fk in tx_fks {
-            let trec = self.get_tx(fk)?;
-            txdata.push(decode_tx_raw(&trec.raw)?);
-        }
-        let block = Block { header, txdata };
-        if block.block_hash().to_byte_array() != rec.hash {
-            return Err(StoreError::Corrupt("reconstruct hash mismatch"));
-        }
-        Ok(Some(block))
-    }
-
-    /// Reconstruct a full wire block at a confirmed height from the relational archive.
-    ///
-    /// Uses header fields + ordered `TxRecord.raw` (full witness consensus encoding).
-    pub fn reconstruct_block_at_height(&self, height: Height) -> Result<Block, QueryError> {
-        let header = self.wire_header_at_height(height)?;
-        let tx_fks = self.block_tx_fks(height)?;
-        if tx_fks.is_empty() {
-            return Err(StoreError::Corrupt("block has no transactions"));
-        }
-        let mut txdata = Vec::with_capacity(tx_fks.len());
-        for fk in tx_fks {
-            let rec = self.get_tx(fk)?;
-            let tx = decode_tx_raw(&rec.raw)?;
-            txdata.push(tx);
-        }
-        let block = Block { header, txdata };
-        // Integrity: reconstructed hash must match stored header hash.
-        let (_fk, stored) = self
-            .header_at_height(height)?
-            .ok_or(StoreError::NotFound)?;
-        if block.block_hash().to_byte_array() != stored.hash {
-            return Err(StoreError::Corrupt("reconstruct hash mismatch"));
-        }
-        Ok(block)
-    }
-
-    /// Reconstruct by block hash if the hash is on the best (confirmed) chain.
-    pub fn reconstruct_block_by_hash(&self, hash: &[u8; 32]) -> Result<Option<Block>, QueryError> {
-        match self.height_of_hash(hash)? {
-            None => Ok(None),
-            Some(h) => Ok(Some(self.reconstruct_block_at_height(h)?)),
-        }
-    }
-
-    /// Locator hashes newest-first for P2P `getheaders` (from confirmed chain).
-    pub fn locator_hashes(&self) -> Result<Vec<BlockHash>, QueryError> {
-        let Some(tip) = self.tip_height() else {
-            return Ok(vec![BlockHash::from_byte_array([0u8; 32])]);
-        };
-        let mut out = Vec::new();
-        let mut h = tip.0 as i64;
-        let mut step = 1i64;
-        while h >= 0 {
-            let (_fk, rec) = self
-                .header_at_height(Height(h as u32))?
-                .ok_or(StoreError::NotFound)?;
-            out.push(BlockHash::from_byte_array(rec.hash));
-            if out.len() >= 10 {
-                step *= 2;
-            }
-            h -= step;
-        }
-        // Always include genesis.
-        if let Some((_fk, rec)) = self.header_at_height(Height::GENESIS)? {
-            let g = BlockHash::from_byte_array(rec.hash);
-            if out.last() != Some(&g) {
-                out.push(g);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Headers on the best chain after the first matching locator entry, up to `limit` (max 2000).
-    pub fn headers_after_locator(
-        &self,
-        locator: &[BlockHash],
-        stop: BlockHash,
-        limit: usize,
-    ) -> Result<Vec<BlockHeader>, QueryError> {
-        let Some(tip) = self.tip_height() else {
-            return Ok(Vec::new());
-        };
-        let limit = limit.min(2000);
-        let mut start = 0u32;
-        'outer: for loc in locator {
-            if loc.to_byte_array() == [0u8; 32] {
-                start = 0;
-                break;
-            }
-            // Find height of locator on our chain.
-            if let Some(h) = self.height_of_hash(&loc.to_byte_array())? {
-                start = h.0.saturating_add(1);
-                break 'outer;
-            }
-        }
-        // If no locator matched, Bitcoin peers typically start from genesis; we start at 0.
-        let mut out = Vec::new();
-        let mut h = start;
-        while h <= tip.0 && out.len() < limit {
-            let hdr = self.wire_header_at_height(Height(h))?;
-            let hash = hdr.block_hash();
-            out.push(hdr);
-            if hash == stop && stop.to_byte_array() != [0u8; 32] {
-                break;
-            }
-            h += 1;
-        }
-        Ok(out)
     }
 
     pub fn flush(&self) -> Result<(), QueryError> {
@@ -936,11 +921,6 @@ fn wire_header(rec: &HeaderRecord, prev_blockhash: BlockHash) -> BlockHeader {
         bits: CompactTarget::from_consensus(rec.bits),
         nonce: rec.nonce,
     }
-}
-
-fn decode_tx_raw(raw: &[u8]) -> Result<Transaction, QueryError> {
-    let mut cursor = raw;
-    Transaction::consensus_decode(&mut cursor).map_err(|_| StoreError::Corrupt("tx raw decode"))
 }
 
 /// Electrum `blockchain.scripthash.get_history` row (confirmed only in v1).

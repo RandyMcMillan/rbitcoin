@@ -7,6 +7,7 @@ members = [
     "crates/rbitcoin-query",
     "crates/rbitcoin-wire-cache",
     "crates/rbitcoin-consensus",
+    "crates/rbitcoin-mempool",
     "crates/rbitcoin-net",
     "crates/rbitcoin-rpc",
     "crates/rbitcoin-electrum",
@@ -30,6 +31,7 @@ rbitcoin-store = { path = "crates/rbitcoin-store" }
 rbitcoin-query = { path = "crates/rbitcoin-query" }
 rbitcoin-wire-cache = { path = "crates/rbitcoin-wire-cache" }
 rbitcoin-consensus = { path = "crates/rbitcoin-consensus" }
+rbitcoin-mempool = { path = "crates/rbitcoin-mempool" }
 rbitcoin-net = { path = "crates/rbitcoin-net" }
 rbitcoin-rpc = { path = "crates/rbitcoin-rpc" }
 rbitcoin-electrum = { path = "crates/rbitcoin-electrum" }
@@ -37,15 +39,23 @@ rbitcoin-cli = { path = "crates/rbitcoin-cli" }
 rbitcoin-node = { path = "crates/rbitcoin-node" }
 rbitcoin-test = { path = "crates/rbitcoin-test" }
 
-thiserror = "2"
-anyhow = "1"
+# JSON for Electrum (and tests). No other serde derives in core crates.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tempfile = "3"
+# mmap — no viable std alternative for the store layout.
 memmap2 = "0.9"
-parking_lot = "0.12"
-bitcoin = { version = "0.32.101", default-features = true, features = ["bitcoinconsensus"] }
-hex = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "rt", "signal"] }
-bytes = "1"
-rayon = "1.10"
+# rust-bitcoin stack
+# No `bitcoinconsensus` feature — we verify scripts in pure Rust (see rbitcoin-consensus::script).
+bitcoin = { version = "0.32.101", default-features = true }
+bitcoin_hashes = "0.14.101"
+# BIP324 v2 encrypted P2P transport (tokio async ProtocolReader/Writer).
+bip324 = { version = "0.11", default-features = true, features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "rt", "signal", "fs"] }
+# Electrum optional TLS (PEM cert/key).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+
+# Fail the build on rustc warnings (unused imports, dead code, …).
+[workspace.lints.rust]
+warnings = "deny"

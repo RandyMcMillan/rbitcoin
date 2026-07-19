@@ -11,7 +11,7 @@ const ELEM: u64 = 8;
 
 pub struct ArrayTable {
     file: TableFile,
-    len: parking_lot::Mutex<u64>,
+    len: std::sync::Mutex<u64>,
 }
 
 impl ArrayTable {
@@ -19,7 +19,7 @@ impl ArrayTable {
         let file = TableFile::create(path.as_ref(), kind)?;
         Ok(Self {
             file,
-            len: parking_lot::Mutex::new(0),
+            len: std::sync::Mutex::new(0),
         })
     }
 
@@ -31,12 +31,12 @@ impl ArrayTable {
         }
         Ok(Self {
             file,
-            len: parking_lot::Mutex::new(body / ELEM),
+            len: std::sync::Mutex::new(body / ELEM),
         })
     }
 
     pub fn len(&self) -> u64 {
-        *self.len.lock()
+        *self.len.lock().unwrap()
     }
 
     fn offset(index: u64) -> u64 {
@@ -44,7 +44,7 @@ impl ArrayTable {
     }
 
     pub fn get(&self, index: u64) -> Result<u64, StoreError> {
-        let len = *self.len.lock();
+        let len = *self.len.lock().unwrap();
         if index >= len {
             return Ok(0);
         }
@@ -53,9 +53,35 @@ impl ArrayTable {
         Ok(u64::from_le_bytes(buf))
     }
 
+    /// Read `count` consecutive u64 slots starting at `start` into `out` (little-endian).
+    ///
+    /// Slots past `len` are returned as zero. Used by Class C repair scans.
+    pub fn read_range(&self, start: u64, count: u64, out: &mut [u8]) -> Result<(), StoreError> {
+        let need = (count as usize).saturating_mul(8);
+        if out.len() < need {
+            return Err(StoreError::Corrupt("array read_range buffer"));
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let len = *self.len.lock().unwrap();
+        if start >= len {
+            out[..need].fill(0);
+            return Ok(());
+        }
+        let avail = (len - start).min(count);
+        let bytes = (avail as usize) * 8;
+        self.file
+            .read_at(Self::offset(start), &mut out[..bytes])?;
+        if avail < count {
+            out[bytes..need].fill(0);
+        }
+        Ok(())
+    }
+
     /// Set value at `index`, growing with zero-fill if needed.
     pub fn set(&self, index: u64, value: u64) -> Result<(), StoreError> {
-        let mut len = self.len.lock();
+        let mut len = self.len.lock().unwrap();
         if index >= *len {
             for i in *len..index {
                 self.file.write_at(Self::offset(i), &0u64.to_le_bytes())?;
@@ -72,13 +98,13 @@ impl ArrayTable {
     }
 
     /// Fill `count` consecutive slots starting at `start` with the same `value`
-    /// (one grow + one body write). Used for strong_tx under milestone confirm.
+    /// (one grow + one body write). Used for tx_height under confirm.
     pub fn fill_range(&self, start: u64, count: u64, value: u64) -> Result<(), StoreError> {
         if count == 0 {
             return Ok(());
         }
         let end = start.saturating_add(count); // exclusive
-        let mut len = self.len.lock();
+        let mut len = self.len.lock().unwrap();
         if end > *len {
             // Zero-fill gap before start if any (single blob, not per-slot).
             if start > *len {
@@ -104,7 +130,7 @@ impl ArrayTable {
             return Ok(());
         }
         let max_idx = pairs.iter().map(|(i, _)| *i).max().unwrap();
-        let mut len = self.len.lock();
+        let mut len = self.len.lock().unwrap();
         if max_idx >= *len {
             let new_len = max_idx + 1;
             let gap = new_len - *len;
@@ -131,7 +157,7 @@ impl ArrayTable {
 
     /// Shrink to `new_len` slots (tip disconnect).
     pub fn truncate(&self, new_len: u64) -> Result<(), StoreError> {
-        let mut len = self.len.lock();
+        let mut len = self.len.lock().unwrap();
         if new_len > *len {
             return Err(StoreError::Corrupt("array truncate grows"));
         }

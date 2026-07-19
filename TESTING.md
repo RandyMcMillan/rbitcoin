@@ -13,8 +13,13 @@ Shared helpers live in the `rbitcoin-test` crate (`mine`, `chain_fixture`).
 
 ```bash
 nix-shell
+# Warnings are errors (workspace.lints + RUSTFLAGS=-Dwarnings in shell.nix)
+cargo build --workspace --all-targets
 cargo test --workspace
 ./scripts/coverage.sh
+# Guard: no libbitcoinconsensus in the dependency graph
+cargo tree -i bitcoinconsensus 2>&1 | grep -q 'package ID specification' || \
+  (echo "FAIL: bitcoinconsensus still in dependency tree" && cargo tree -i bitcoinconsensus && exit 1)
 ```
 
 ### Coverage notes
@@ -43,8 +48,11 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `store_error_and_corrupt_paths` | Store | Error/corrupt surfaces |
 | `store_table_header_and_idx_corrupt` | Store | Table header/head corrupt open |
 | `chain_connect_reorg_and_growth` | Query | Synthetic growth + disconnect (rehash) |
-| `consensus_mature_chain_spend_and_reconstruct` | Consensus+query | **One** mature mine: spend, double-spend, reopen reconstruct |
+| `consensus_mature_chain_spend_and_reconstruct` | Consensus+query | **One** mature mine: spend, local prev_fk, double-spend, reopen reconstruct |
+| `ibd_parallel_archive_idempotent_confirm_without_tx_head` | Query+consensus | Out-of-order archive, re-archive idempotent, head-off prevout+maturity |
+| `resume_head_off_warms_cache_for_external_prev` | Query+consensus | Resume head-off: warm Class A cache fixes external-prev missing prevout |
 | `consensus_reject_bad_structure_and_milestone` | Consensus | Bad merkle/prev + milestone skip |
+| `consensus_rules` (test binary) | Consensus | Focused reject paths for structure/header/connect rules we own — see [`docs/consensus-tests.md`](./docs/consensus-tests.md) |
 | `scripthash_index_history_balance_and_reorg` | Query | Electrum index + reorg spend clear |
 | `wire_ring_and_archive_epoch` | Wire/epoch | Multi-tip ring + finalize soft zone |
 | `electrum_server_version_history_balance` | Electrum | Protocol fixture: version, history, balance, headers |
@@ -57,6 +65,10 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `reorg_to_longer_branch` | P2P/chain | Most-work reorg |
 | `node_run_p2p_short` | Node | Long-running entry short run |
 | `multinode_mesh_periodic` | P2P (ignored) | Larger mesh; `scripts/integration.sh` |
+
+Removed (covered by the rows above): `confirm_cross_block_prevout_without_tx_head`,
+`double_archive_keeps_tx_height_for_coinbase_maturity`, `mega_batch_duplicate_header_is_idempotent`,
+`archive_local_prev_fk_and_reconstruct`.
 
 ### Integration / multi-node
 

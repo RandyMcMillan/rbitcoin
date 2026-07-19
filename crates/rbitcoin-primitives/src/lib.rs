@@ -3,7 +3,10 @@
 //! Keep consensus-heavy types in rust-bitcoin once wired; this crate holds
 //! store and node newtypes that must stay stable across crates.
 
-use serde::{Deserialize, Serialize};
+mod hex;
+
+pub use hex::{decode as hex_decode, encode as hex_encode, HexError};
+
 use std::fmt;
 
 /// Workspace schema / API version string for diagnostics.
@@ -12,11 +15,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// File magic for store tables: ASCII `RBT1`.
 pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 
-/// Current on-disk schema version ([`SCHEMA.md`](../../SCHEMA.md)).
-pub const SCHEMA_VERSION: u16 = 0;
+/// Current on-disk schema version (see workspace `SCHEMA.md`).
+///
+/// v3: prev_tx_fk on inputs; thin point/scripthash; strong_tx bitset; denser
+/// hash heads. Builds on v2 (runs, length-from-idx, header ranges). Reindex-only.
+pub const SCHEMA_VERSION: u16 = 3;
 
 /// 1-based foreign key into a store table body. Zero means null / absent.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Fk(pub u64);
 
 impl Fk {
@@ -54,9 +60,7 @@ impl fmt::Display for Fk {
 }
 
 /// Block height (genesis = 0).
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Height(pub u32);
 
 impl Height {
@@ -74,8 +78,7 @@ impl fmt::Display for Height {
 }
 
 /// Bitcoin network selection for the node process.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Network {
     #[default]
     Mainnet,
@@ -113,11 +116,19 @@ impl fmt::Display for Network {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("unknown network `{input}`")]
+/// Unknown network name from CLI / config.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseNetworkError {
     pub input: String,
 }
+
+impl fmt::Display for ParseNetworkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unknown network `{}`", self.input)
+    }
+}
+
+impl std::error::Error for ParseNetworkError {}
 
 /// Table kind identifiers stored in file headers ([`SCHEMA.md`](../../SCHEMA.md)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,6 +146,8 @@ pub enum TableKind {
     HashHead = 10,
     /// Electrum scripthash multimap (SHA256(scriptPubKey)).
     ScriptHash = 11,
+    /// Class C: tx_fk-1 → create height+1 (0 = unset). Maturity without UTXO.
+    TxHeight = 12,
 }
 
 impl TableKind {
@@ -151,6 +164,7 @@ impl TableKind {
             9 => Some(TableKind::ArrayLink),
             10 => Some(TableKind::HashHead),
             11 => Some(TableKind::ScriptHash),
+            12 => Some(TableKind::TxHeight),
             _ => None,
         }
     }

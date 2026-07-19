@@ -5,9 +5,9 @@ use crate::error::NetError;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, Work};
-use parking_lot::RwLock;
+use std::sync::RwLock;
 use rbitcoin_consensus::{
-    accept_and_archive_block, accept_and_connect_block, confirm_archived_at, genesis_block,
+    accept_and_archive_block, accept_and_connect_block, confirm_archived_run, genesis_block,
     header_to_record, ChainParams, Milestone,
 };
 use rbitcoin_log::info;
@@ -45,6 +45,10 @@ pub struct ChainHub {
     tip_tx: broadcast::Sender<TipEvent>,
     /// Best-chain confirmed block hashes (O(1) `has_block` for IBD hot path).
     confirmed: Arc<RwLock<HashSet<BlockHash>>>,
+    /// Optional cluster mempool (tip-mode tx relay + confirm remove).
+    ///
+    /// Attached once via [`Self::attach_mempool`] after the hub is in an `Arc`.
+    mempool: std::sync::OnceLock<Arc<crate::tx_relay::MempoolHub>>,
 }
 
 impl ChainHub {
@@ -63,7 +67,20 @@ impl ChainHub {
             notify: Arc::new(Notify::new()),
             tip_tx,
             confirmed,
+            mempool: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Attach mempool once (same Query Arc as this hub).
+    pub fn attach_mempool(
+        &self,
+        mp: Arc<crate::tx_relay::MempoolHub>,
+    ) -> Result<(), Arc<crate::tx_relay::MempoolHub>> {
+        self.mempool.set(mp)
+    }
+
+    pub fn mempool(&self) -> Option<&Arc<crate::tx_relay::MempoolHub>> {
+        self.mempool.get()
     }
 
     pub fn subscribe_tips(&self) -> broadcast::Receiver<TipEvent> {
@@ -94,14 +111,23 @@ impl ChainHub {
     }
 
     pub fn tip_hash(&self) -> Option<BlockHash> {
-        // Prefer RAM paths (cache / confirmed set is membership-only — use cache chain).
-        if let Some(h) = self.cache.tip_hash() {
-            return Some(h);
+        // Store tip is authoritative after IBD/archive-confirm (cache may only
+        // hold genesis or a short tip window while Class C is far ahead). Prefer
+        // query when its height is at least the cache tip; otherwise fall back
+        // to the in-memory cache chain (pre-store / regtest cache-only paths).
+        let q_h = self.query.tip_height().map(|h| h.0);
+        let c_h = self.cache.tip_height();
+        match (q_h, c_h) {
+            (Some(qh), Some(ch)) if ch > qh => self.cache.tip_hash(),
+            (Some(qh), _) => self
+                .query
+                .header_at_height(rbitcoin_primitives::Height(qh))
+                .ok()
+                .flatten()
+                .map(|(_, rec)| BlockHash::from_byte_array(rec.hash)),
+            (None, Some(_)) => self.cache.tip_hash(),
+            (None, None) => None,
         }
-        self.query
-            .tip_height()
-            .and_then(|h| self.query.header_at_height(h).ok().flatten())
-            .map(|(_, rec)| BlockHash::from_byte_array(rec.hash))
     }
 
     pub fn tip_header(&self) -> Option<Header> {
@@ -118,7 +144,7 @@ impl ChainHub {
         if self.cache.get_block(hash).is_some() {
             return true;
         }
-        self.confirmed.read().contains(hash)
+        self.confirmed.read().unwrap().contains(hash)
     }
 
     /// True if the full block body is in Class A (may not be confirmed yet).
@@ -174,40 +200,83 @@ impl ChainHub {
 
     /// Confirm `hash` at tip+1 if its body is archived.
     pub fn confirm_hash(&self, height: u32, hash: BlockHash) -> Result<AcceptOutcome, NetError> {
-        if self.has_block(&hash) {
-            return Ok(AcceptOutcome::AlreadyHave);
+        let outcomes = self.confirm_run(&[(height, hash)])?;
+        Ok(outcomes
+            .into_iter()
+            .next()
+            .unwrap_or(AcceptOutcome::AlreadyHave))
+    }
+
+    /// Confirm a contiguous tip-extension run (multi-block script wave when len>1).
+    pub fn confirm_run(
+        &self,
+        blocks: &[(u32, BlockHash)],
+    ) -> Result<Vec<AcceptOutcome>, NetError> {
+        if blocks.is_empty() {
+            return Ok(Vec::new());
         }
-        if !self.is_archived(&hash) {
-            return Err(NetError::Protocol("confirm without archive"));
+        let mut need: Vec<(Height, [u8; 32])> = Vec::with_capacity(blocks.len());
+        let mut need_meta: Vec<(u32, BlockHash)> = Vec::with_capacity(blocks.len());
+        let mut already: HashSet<BlockHash> = HashSet::new();
+        for &(height, hash) in blocks {
+            if self.has_block(&hash) {
+                already.insert(hash);
+                continue;
+            }
+            if !self.is_archived(&hash) {
+                return Err(NetError::Protocol("confirm without archive"));
+            }
+            need.push((Height(height), hash.to_byte_array()));
+            need_meta.push((height, hash));
         }
-        confirm_archived_at(
-            &self.query,
-            &self.params,
-            Height(height),
-            &hash.to_byte_array(),
-            self.milestone,
-        )
-        .map_err(|e| NetError::Consensus(e.to_string()))?;
-        self.confirmed.write().insert(hash);
-        // Best-effort tip cache (reconstruct is heavy — skip full body).
-        if let Ok(Some(block)) = self.query.reconstruct_archived_block(&hash.to_byte_array()) {
-            let _ = self.cache.push_best(block.clone());
-            let event = TipEvent {
-                height,
-                hash,
-                header: block.header,
-            };
-            let _ = self.tip_tx.send(event);
-        } else if let Ok(hdr) = self.query.wire_header_at_height(Height(height)) {
-            let event = TipEvent {
-                height,
-                hash,
-                header: hdr,
-            };
-            let _ = self.tip_tx.send(event);
+        if !need.is_empty() {
+            confirm_archived_run(&self.query, &self.params, self.milestone, &need)
+                .map_err(|e| NetError::Consensus(e.to_string()))?;
+            // Drop confirmed txs from mempool (P3/P4 confirm hook).
+            if let Some(mp) = self.mempool() {
+                for &(_height, hash) in &need_meta {
+                    if let Ok(Some(block)) =
+                        self.query.reconstruct_block_by_hash(&hash.to_byte_array())
+                    {
+                        let ids: Vec<_> =
+                            block.txdata.iter().map(|t| t.compute_txid()).collect();
+                        let n = mp.remove_for_block(&ids);
+                        if n > 0 {
+                            rbitcoin_log::debug!(
+                                "mempool: removed {n} confirmed tx(s) @ {}",
+                                hash
+                            );
+                        }
+                    }
+                }
+            }
+            let mut confirmed = self.confirmed.write().unwrap();
+            for &(height, hash) in &need_meta {
+                confirmed.insert(hash);
+                if let Ok(hdr) = self.query.wire_header_at_height(Height(height)) {
+                    let _ = self.tip_tx.send(TipEvent {
+                        height,
+                        hash,
+                        header: hdr,
+                    });
+                }
+            }
+            drop(confirmed);
+            self.notify.notify_waiters();
         }
-        self.notify.notify_waiters();
-        Ok(AcceptOutcome::Accepted { height })
+        let done: HashSet<BlockHash> = need_meta.iter().map(|(_, h)| *h).collect();
+        Ok(blocks
+            .iter()
+            .map(|&(height, hash)| {
+                if already.contains(&hash) {
+                    AcceptOutcome::AlreadyHave
+                } else if done.contains(&hash) {
+                    AcceptOutcome::Accepted { height }
+                } else {
+                    AcceptOutcome::AlreadyHave
+                }
+            })
+            .collect())
     }
 
     /// Accept a block that extends the tip, or reorg to a stronger competing tip / branch.
@@ -332,14 +401,14 @@ impl ChainHub {
         } else {
             while self.query.tip_height().is_some() {
                 if let Some(th) = self.tip_hash() {
-                    self.confirmed.write().remove(&th);
+                    self.confirmed.write().unwrap().remove(&th);
                 }
                 self.query
                     .disconnect_tip()
                     .map_err(|e| NetError::Consensus(e.to_string()))?;
             }
             self.cache.clear();
-            self.confirmed.write().clear();
+            self.confirmed.write().unwrap().clear();
         }
 
         let base = fork_height.map(|h| h + 1).unwrap_or(0);
@@ -361,7 +430,14 @@ impl ChainHub {
             self.milestone,
         )
         .map_err(|e| NetError::Consensus(e.to_string()))?;
-        self.confirmed.write().insert(hash);
+        if let Some(mp) = self.mempool() {
+            let ids: Vec<_> = block.txdata.iter().map(|t| t.compute_txid()).collect();
+            let n = mp.remove_for_block(&ids);
+            if n > 0 {
+                rbitcoin_log::debug!("mempool: removed {n} confirmed tx(s) @ height {height}");
+            }
+        }
+        self.confirmed.write().unwrap().insert(hash);
         // Move block into tip-window cache (no full-history clone).
         let _ = self.cache.push_best(block);
         let event = TipEvent {
@@ -384,7 +460,7 @@ impl ChainHub {
                 break;
             }
             if let Some(th) = self.tip_hash() {
-                self.confirmed.write().remove(&th);
+                self.confirmed.write().unwrap().remove(&th);
             }
             self.query
                 .disconnect_tip()
@@ -448,29 +524,36 @@ fn spawn_confirmed_seed(query: Arc<Query>, confirmed: Arc<RwLock<HashSet<BlockHa
     if tip.0 <= 2 {
         return;
     }
-    std::thread::Builder::new()
-        .name("confirmed-seed".into())
-        .spawn(move || {
-            let t0 = std::time::Instant::now();
-            let mut batch = Vec::with_capacity(4096);
-            for h in 0..=tip.0 {
-                if let Ok(Some((_, rec))) = query.header_at_height(Height(h)) {
-                    batch.push(BlockHash::from_byte_array(rec.hash));
-                }
-                if batch.len() >= 4096 || h == tip.0 {
-                    let mut g = confirmed.write();
-                    for hash in batch.drain(..) {
-                        g.insert(hash);
-                    }
+    let run = move || {
+        let t0 = std::time::Instant::now();
+        let mut batch = Vec::with_capacity(4096);
+        for h in 0..=tip.0 {
+            if let Ok(Some((_, rec))) = query.header_at_height(Height(h)) {
+                batch.push(BlockHash::from_byte_array(rec.hash));
+            }
+            if batch.len() >= 4096 || h == tip.0 {
+                let mut g = confirmed.write().unwrap();
+                for hash in batch.drain(..) {
+                    g.insert(hash);
                 }
             }
-            info!(
-                "ibd: confirmed-set seed complete tip={} in {:?}",
-                tip.0,
-                t0.elapsed()
-            );
-        })
-        .ok();
+        }
+        info!(
+            "ibd: confirmed-set seed complete tip={} in {:?}",
+            tip.0,
+            t0.elapsed()
+        );
+    };
+    // Prefer the node runtime's blocking pool (no dedicated OS thread).
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn_blocking(run);
+    } else {
+        // Sync constructors / tests without a runtime.
+        std::thread::Builder::new()
+            .name("confirmed-seed".into())
+            .spawn(run)
+            .ok();
+    }
 }
 
 fn sum_work(iter: impl Iterator<Item = Work>) -> Work {

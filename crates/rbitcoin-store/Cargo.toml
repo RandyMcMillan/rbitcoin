@@ -8,7 +8,16 @@ description = "mmap relational archive store (libbitcoin-class)"
 
 [dependencies]
 rbitcoin-primitives = { workspace = true }
-thiserror = { workspace = true }
+rbitcoin-log = { workspace = true }
 memmap2 = { workspace = true }
-parking_lot = { workspace = true }
-sha2 = "0.10"
+# rust-bitcoin ecosystem (hashes only — not full bitcoin types in this crate)
+bitcoin_hashes = { workspace = true }
+# fallocate / punch-hole for multi‑GiB grows without zero-fill storms (Linux).
+libc = "0.2"
+
+[[bench]]
+name = "spend_batch"
+harness = false
+
+[lints]
+workspace = true

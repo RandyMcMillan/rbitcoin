@@ -1,11 +1,13 @@
-//! Peer handshake, serve, tip follow, and announce.
+//! Peer handshake, serve, tip follow, and announce (BIP324 v2 transport).
 
 use crate::cache::BlockCache;
 use crate::chain::{AcceptOutcome, ChainHub};
-use crate::codec::{
-    read_msg, write_msg, MessageStream, MAX_HEADERS_RESULTS, MAX_INV_SIZE,
-};
+use crate::codec::{FramedMessage, MAX_HEADERS_RESULTS, MAX_INV_SIZE};
 use crate::error::NetError;
+use crate::msg_decode::decode_framed_offload;
+use crate::v2::{
+    open_v2, read_v2_frame, write_v2_msg, write_v2_msg_offload, V2Reader, V2Writer,
+};
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::address::Address;
 use bitcoin::p2p::message::NetworkMessage;
@@ -20,15 +22,36 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 /// Services we advertise once store-backed reconstruct serve is available.
 pub fn local_service_flags() -> ServiceFlags {
-    ServiceFlags::NETWORK | ServiceFlags::WITNESS
+    ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2
 }
 
-pub async fn handshake(
-    stream: &mut TcpStream,
+/// Open BIP324 v2 transport + perform the version/verack exchange.
+///
+/// Returns the peer's version and the encrypted read/write halves. All further
+/// messages must use those halves — production has no v1 wire path.
+pub async fn connect_and_handshake(
+    stream: TcpStream,
+    magic: Magic,
+    our_addr: SocketAddr,
+    their_addr: SocketAddr,
+    start_height: i32,
+    inbound: bool,
+) -> Result<(VersionMessage, V2Reader, V2Writer), NetError> {
+    let (mut reader, mut writer) = open_v2(stream, magic, inbound).await?;
+    let their_version =
+        application_handshake(&mut reader, &mut writer, magic, our_addr, their_addr, start_height, inbound)
+            .await?;
+    Ok((their_version, reader, writer))
+}
+
+/// Perform the version/verack exchange over an established BIP324 session.
+async fn application_handshake(
+    reader: &mut V2Reader,
+    writer: &mut V2Writer,
     magic: Magic,
     our_addr: SocketAddr,
     their_addr: SocketAddr,
@@ -49,18 +72,18 @@ pub async fn handshake(
         nonce: rand_nonce(),
         user_agent: "/rbitcoin:0.1.0/".to_string(),
         start_height,
-        relay: false, // no tx relay
+        // Advertise willingness to receive tx inv when we have a mempool hub.
+        // Actual inv processing is gated on MempoolHub::relay_enabled (tip mode).
+        relay: true,
     };
 
     if !inbound {
-        write_msg(stream, magic, NetworkMessage::Version(version.clone())).await?;
+        write_v2_msg(writer, NetworkMessage::Version(version.clone())).await?;
     }
 
     let their_version = loop {
-        let msg = read_msg(stream).await?;
-        if msg.magic() != &magic {
-            return Err(NetError::BadMagic);
-        }
+        let frame = read_v2_frame(reader, magic).await?;
+        let msg = frame.decode();
         match msg.payload() {
             NetworkMessage::Version(v) => break v.clone(),
             other => {
@@ -75,21 +98,19 @@ pub async fn handshake(
     };
 
     if inbound {
-        write_msg(stream, magic, NetworkMessage::Version(version)).await?;
+        write_v2_msg(writer, NetworkMessage::Version(version)).await?;
     }
-    write_msg(stream, magic, NetworkMessage::Verack).await?;
+    write_v2_msg(writer, NetworkMessage::Verack).await?;
 
     loop {
-        let msg = read_msg(stream).await?;
-        if msg.magic() != &magic {
-            return Err(NetError::BadMagic);
-        }
+        let frame = read_v2_frame(reader, magic).await?;
+        let msg = frame.decode();
         match msg.payload() {
             NetworkMessage::Verack => break,
             NetworkMessage::Ping(n) => {
-                write_msg(stream, magic, NetworkMessage::Pong(*n)).await?;
+                write_v2_msg(writer, NetworkMessage::Pong(*n)).await?;
             }
-            // Core may pipeline sendaddrv2 / wtxidrelay / sendcmpct before verack.
+            // Core may pipeline sendaddrv2 / wtxidrelay / sendcmpct before/after verack.
             _ => {}
         }
     }
@@ -109,8 +130,12 @@ fn rand_nonce() -> u64 {
 ///
 /// `catch_up`: if true (outbound), run getheaders/getdata first. Inbound peers must
 /// pass false to avoid deadlock (both sides waiting on each other's getheaders).
+///
+/// After the sequential handshake / optional catch-up, a dedicated writer drains
+/// outbound messages while the reader keeps draining the encrypted channel.
 pub async fn peer_session(
-    mut stream: TcpStream,
+    mut reader: V2Reader,
+    mut writer: V2Writer,
     magic: Magic,
     hub: Arc<ChainHub>,
     mut tip_rx: broadcast::Receiver<crate::chain::TipEvent>,
@@ -118,160 +143,293 @@ pub async fn peer_session(
 ) -> Result<(), NetError> {
     // Prefer headers announcements from peer; we do not send compact by default
     // (no mempool short-ids). Advertise we understand cmpct v1/v2 but request full blocks.
-    let _ = write_msg(&mut stream, magic, NetworkMessage::SendHeaders).await;
-    let _ = write_msg(
-        &mut stream,
-        magic,
+    let _ = write_v2_msg(&mut writer, NetworkMessage::SendHeaders).await;
+    let _ = write_v2_msg(
+        &mut writer,
         NetworkMessage::SendCmpct(SendCmpct {
             send_compact: false,
             version: 2,
         }),
     )
     .await;
+    // Prefer wtxid inventory for txs when peers support it (BIP339).
+    let _ = write_v2_msg(&mut writer, NetworkMessage::WtxidRelay).await;
 
     if catch_up {
-        initial_sync(&mut stream, magic, hub.as_ref()).await?;
+        initial_sync(&mut reader, &mut writer, magic, hub.as_ref()).await?;
     }
+
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<NetworkMessage>();
+
+    let writer_task = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if write_v2_msg_offload(&mut writer, msg).await.is_err() {
+                break;
+            }
+        }
+    });
 
     let mut peer_wants_headers = false;
     // Headers received while assembling a potential reorg branch (hash → header).
     let mut pending_headers: HashMap<BlockHash, bitcoin::block::Header> = HashMap::new();
     // Blocks waiting for in-order accept (hash → block).
     let mut pending_blocks: HashMap<BlockHash, bitcoin::Block> = HashMap::new();
-    // Cancellation-safe framer: partial reads survive select! branch cancel.
-    let mut framer = MessageStream::new();
+    // Txids we received from this peer (origin exclusion for announce).
+    let mut from_this_peer: HashMap<bitcoin::Txid, ()> = HashMap::new();
+    let mut tx_announce_rx = hub.mempool().map(|m| m.subscribe_announces());
 
-    loop {
-        tokio::select! {
-            biased;
-            tip = tip_rx.recv() => {
-                match tip {
-                    Ok(ev) => {
-                        announce_tip(&mut stream, magic, &ev, peer_wants_headers).await?;
+    let result = async {
+        loop {
+            tokio::select! {
+                biased;
+                tip = tip_rx.recv() => {
+                    match tip {
+                        Ok(ev) => {
+                            queue_out(&out_tx, tip_announce_msg(&ev, peer_wants_headers))?;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+                ann = async {
+                    if let Some(rx) = tx_announce_rx.as_mut() {
+                        Some(rx.recv().await)
+                    } else {
+                        // No mempool — park this branch forever.
+                        std::future::pending::<()>().await;
+                        None
+                    }
+                } => {
+                    if let Some(ann) = ann {
+                        match ann {
+                            Ok(txid) => {
+                                // Origin exclusion: do not re-announce to the peer that sent it.
+                                if from_this_peer.contains_key(&txid) {
+                                    continue;
+                                }
+                                if hub
+                                    .mempool()
+                                    .map(|m| m.relay_enabled() && m.contains(&txid))
+                                    .unwrap_or(false)
+                                {
+                                    queue_out(
+                                        &out_tx,
+                                        NetworkMessage::Inv(vec![Inventory::Transaction(txid)]),
+                                    )?;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => {}
+                        }
+                    }
+                }
+                // Frame on this task; heavy payload decode is offloaded.
+                frame = read_v2_frame(&mut reader, magic) => {
+                    let frame = match frame {
+                        Ok(f) => f,
+                        Err(NetError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    // Ping: cheap 8-byte path — never leave the I/O task for decode.
+                    if frame.is_ping() {
+                        if let Some(n) = frame.ping_nonce() {
+                            queue_out(&out_tx, NetworkMessage::Pong(n))?;
+                        }
+                        continue;
+                    }
+                    handle_peer_frame(
+                        frame,
+                        hub.as_ref(),
+                        &out_tx,
+                        &mut peer_wants_headers,
+                        &mut pending_headers,
+                        &mut pending_blocks,
+                        &mut from_this_peer,
+                    )
+                    .await?;
                 }
             }
-            msg = framer.read_msg(&mut stream, Some(magic)) => {
-                let msg = match msg {
-                    Ok(m) => m,
-                    Err(NetError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        return Ok(());
+        }
+    }
+    .await;
+
+    drop(out_tx);
+    writer_task.abort();
+    let _ = writer_task.await;
+    result
+}
+
+async fn handle_peer_frame(
+    frame: FramedMessage,
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<NetworkMessage>,
+    peer_wants_headers: &mut bool,
+    pending_headers: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    pending_blocks: &mut HashMap<BlockHash, bitcoin::Block>,
+    from_this_peer: &mut HashMap<bitcoin::Txid, ()>,
+) -> Result<(), NetError> {
+    let msg = decode_framed_offload(frame).await?;
+    match msg.payload() {
+        NetworkMessage::Ping(n) => {
+            queue_out(out_tx, NetworkMessage::Pong(*n))?;
+        }
+        NetworkMessage::Pong(_) => {}
+        NetworkMessage::SendHeaders => {
+            *peer_wants_headers = true;
+        }
+        NetworkMessage::SendCmpct(_) => {
+            // Peer may send us compact blocks; we always fall back to getdata.
+        }
+        NetworkMessage::WtxidRelay => {
+            // We already advertise wtxidrelay; acknowledge by no-op.
+        }
+        NetworkMessage::GetHeaders(gh) => {
+            let headers = headers_for_peer(hub.cache.as_ref(), hub.query.as_ref(), gh)?;
+            queue_out(out_tx, NetworkMessage::Headers(headers))?;
+        }
+        NetworkMessage::GetData(inv) => {
+            for item in inv.iter().take(MAX_INV_SIZE) {
+                match item {
+                    Inventory::Block(h) | Inventory::WitnessBlock(h) => {
+                        if let Some(block) =
+                            block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), h)?
+                        {
+                            queue_out(out_tx, NetworkMessage::Block(block))?;
+                        }
                     }
-                    Err(e) => return Err(e),
-                };
-                match msg.payload() {
-                    NetworkMessage::Ping(n) => {
-                        write_msg(&mut stream, magic, NetworkMessage::Pong(*n)).await?;
-                    }
-                    NetworkMessage::Pong(_) => {}
-                    NetworkMessage::SendHeaders => {
-                        peer_wants_headers = true;
-                    }
-                    NetworkMessage::SendCmpct(_) => {
-                        // Peer may send us compact blocks; we always fall back to getdata.
-                    }
-                    NetworkMessage::GetHeaders(gh) => {
-                        let headers = headers_for_peer(hub.cache.as_ref(), hub.query.as_ref(), gh)?;
-                        write_msg(&mut stream, magic, NetworkMessage::Headers(headers)).await?;
-                    }
-                    NetworkMessage::GetData(inv) => {
-                        for item in inv.iter().take(MAX_INV_SIZE) {
-                            match item {
-                                Inventory::Block(h) | Inventory::WitnessBlock(h) => {
-                                    if let Some(block) =
-                                        block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), h)?
-                                    {
-                                        write_msg(&mut stream, magic, NetworkMessage::Block(block))
-                                            .await?;
-                                    }
-                                }
-                                Inventory::Transaction(_)
-                                | Inventory::WitnessTransaction(_)
-                                | Inventory::WTx(_) => {}
-                                _ => {}
+                    Inventory::Transaction(txid)
+                    | Inventory::WitnessTransaction(txid) => {
+                        if let Some(mp) = hub.mempool() {
+                            if let Some(tx) = mp.get_tx(txid) {
+                                queue_out(out_tx, NetworkMessage::Tx(tx))?;
                             }
                         }
                     }
-                    NetworkMessage::Inv(items) => {
-                        let mut want = Vec::new();
-                        for item in items.iter().take(MAX_INV_SIZE) {
-                            match item {
-                                Inventory::Block(h) | Inventory::WitnessBlock(h) => {
-                                    if !hub.has_block(h) {
-                                        want.push(Inventory::WitnessBlock(*h));
-                                    }
-                                }
-                                _ => {} // no tx relay
-                            }
-                        }
-                        if !want.is_empty() {
-                            // Chunk getdata to Core MAX_INV_SZ (already bounded).
-                            write_msg(&mut stream, magic, NetworkMessage::GetData(want)).await?;
-                        }
-                    }
-                    NetworkMessage::Headers(headers) => {
-                        let mut want = Vec::new();
-                        for hdr in headers.iter().take(MAX_HEADERS_RESULTS) {
-                            let hash = hdr.block_hash();
-                            pending_headers.insert(hash, *hdr);
-                            if !hub.has_block(&hash) {
-                                want.push(Inventory::WitnessBlock(hash));
-                            }
-                        }
-                        if !want.is_empty() {
-                            write_msg(&mut stream, magic, NetworkMessage::GetData(want)).await?;
-                        }
-                    }
-                    NetworkMessage::Block(block) => {
-                        pending_blocks.insert(block.block_hash(), block.clone());
-                        drain_pending(hub.as_ref(), &mut pending_blocks, &mut pending_headers)?;
-                    }
-                    NetworkMessage::CmpctBlock(cb) => {
-                        // No mempool short-id reconstruction — request full witness block.
-                        let hash = cb.compact_block.header.block_hash();
-                        if !hub.has_block(&hash) {
-                            write_msg(
-                                &mut stream,
-                                magic,
-                                NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-                            )
-                            .await?;
-                        }
-                    }
-                    NetworkMessage::Tx(_) | NetworkMessage::MemPool => {}
-                    NetworkMessage::GetAddr => {
-                        write_msg(&mut stream, magic, NetworkMessage::Addr(vec![])).await?;
+                    Inventory::WTx(_wtxid) => {
+                        // WTxid index lands with full wtxidrelay; peers can use txid inv.
                     }
                     _ => {}
                 }
             }
         }
+        NetworkMessage::Inv(items) => {
+            let mut want = Vec::new();
+            let relay = hub.mempool().map(|m| m.relay_enabled()).unwrap_or(false);
+            for item in items.iter().take(MAX_INV_SIZE) {
+                match item {
+                    Inventory::Block(h) | Inventory::WitnessBlock(h) => {
+                        if !hub.has_block(h) {
+                            want.push(Inventory::WitnessBlock(*h));
+                        }
+                    }
+                    Inventory::Transaction(txid)
+                    | Inventory::WitnessTransaction(txid) => {
+                        if relay {
+                            if let Some(mp) = hub.mempool() {
+                                if !mp.contains(txid) {
+                                    want.push(Inventory::WitnessTransaction(*txid));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !want.is_empty() {
+                queue_out(out_tx, NetworkMessage::GetData(want))?;
+            }
+        }
+        NetworkMessage::Headers(headers) => {
+            let mut want = Vec::new();
+            for hdr in headers.iter().take(MAX_HEADERS_RESULTS) {
+                let hash = hdr.block_hash();
+                pending_headers.insert(hash, *hdr);
+                if !hub.has_block(&hash) {
+                    want.push(Inventory::WitnessBlock(hash));
+                }
+            }
+            if !want.is_empty() {
+                queue_out(out_tx, NetworkMessage::GetData(want))?;
+            }
+        }
+        NetworkMessage::Block(block) => {
+            pending_blocks.insert(block.block_hash(), block.clone());
+            drain_pending(hub, pending_blocks, pending_headers)?;
+        }
+        NetworkMessage::CmpctBlock(cb) => {
+            // No mempool short-id reconstruction — request full witness block.
+            let hash = cb.compact_block.header.block_hash();
+            if !hub.has_block(&hash) {
+                queue_out(
+                    out_tx,
+                    NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+                )?;
+            }
+        }
+        NetworkMessage::Tx(tx) => {
+            if let Some(mp) = hub.mempool() {
+                if mp.relay_enabled() {
+                    let txid = tx.compute_txid();
+                    from_this_peer.insert(txid, ());
+                    match mp.accept_tx(tx) {
+                        Ok(_) => {}
+                        Err(rbitcoin_mempool::AcceptError::Duplicate(_)) => {}
+                        Err(e) => {
+                            rbitcoin_log::debug!("txrelay: reject {txid}: {e}");
+                        }
+                    }
+                }
+            }
+        }
+        NetworkMessage::MemPool => {
+            // Intentionally no bulk dump (DoS); Electrum is the query path.
+        }
+        NetworkMessage::GetAddr => {
+            queue_out(out_tx, NetworkMessage::Addr(vec![]))?;
+        }
+        NetworkMessage::Unknown { command, payload } => {
+            // BIP331 family not in rust-bitcoin 0.32 enum — accept len-prefixed package
+            // under experimental command "rbtpkg" for local/tests.
+            if command.to_string() == "rbtpkg" {
+                if let Some(mp) = hub.mempool() {
+                    if mp.relay_enabled() {
+                        if let Ok(txs) = crate::tx_relay::decode_len_prefixed_package(payload) {
+                            match mp.accept_package(&txs) {
+                                Ok(rs) => {
+                                    for r in rs {
+                                        from_this_peer.insert(r.txid, ());
+                                    }
+                                }
+                                Err(e) => {
+                                    rbitcoin_log::debug!("txrelay: package reject: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn tip_announce_msg(ev: &crate::chain::TipEvent, peer_wants_headers: bool) -> NetworkMessage {
+    if peer_wants_headers {
+        NetworkMessage::Headers(vec![ev.header])
+    } else {
+        NetworkMessage::Inv(vec![Inventory::WitnessBlock(ev.hash)])
     }
 }
 
-async fn announce_tip(
-    stream: &mut TcpStream,
-    magic: Magic,
-    ev: &crate::chain::TipEvent,
-    peer_wants_headers: bool,
+fn queue_out(
+    out: &mpsc::UnboundedSender<NetworkMessage>,
+    msg: NetworkMessage,
 ) -> Result<(), NetError> {
-    if peer_wants_headers {
-        write_msg(
-            stream,
-            magic,
-            NetworkMessage::Headers(vec![ev.header]),
-        )
-        .await
-    } else {
-        write_msg(
-            stream,
-            magic,
-            NetworkMessage::Inv(vec![Inventory::WitnessBlock(ev.hash)]),
-        )
-        .await
-    }
+    out.send(msg)
+        .map_err(|_| NetError::Protocol("peer write half closed"))
 }
 
 /// Try to accept pending blocks that connect to tip or form a better branch.
@@ -370,7 +528,8 @@ fn try_reorg_from_pending(
 }
 
 async fn initial_sync(
-    stream: &mut TcpStream,
+    reader: &mut V2Reader,
+    writer: &mut V2Writer,
     magic: Magic,
     hub: &ChainHub,
 ) -> Result<(), NetError> {
@@ -387,13 +546,12 @@ async fn initial_sync(
         locator
     };
     sync_from_peer(
-        stream,
+        reader,
+        writer,
         magic,
         locator,
         |hash| hub.has_block(hash),
-        |_, block| {
-            hub.accept_block(block).map(|_| ())
-        },
+        |_, block| hub.accept_block(block).map(|_| ()),
     )
     .await?;
     Ok(())
@@ -402,53 +560,76 @@ async fn initial_sync(
 /// Serve-only loop (no tip announce subscription). Prefer [`peer_session`].
 #[allow(dead_code)]
 pub async fn serve_peer_loop(
-    mut stream: TcpStream,
+    mut reader: V2Reader,
+    mut writer: V2Writer,
     magic: Magic,
     cache: Arc<BlockCache>,
     query: Arc<Query>,
 ) -> Result<(), NetError> {
-    loop {
-        let msg = match read_msg(&mut stream).await {
-            Ok(m) => m,
-            Err(NetError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(());
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<NetworkMessage>();
+    let writer_task = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if write_v2_msg_offload(&mut writer, msg).await.is_err() {
+                break;
             }
-            Err(e) => return Err(e),
-        };
-        if msg.magic() != &magic {
-            return Err(NetError::BadMagic);
         }
-        match msg.payload() {
-            NetworkMessage::Ping(n) => {
-                write_msg(&mut stream, magic, NetworkMessage::Pong(*n)).await?;
+    });
+
+    let result = async {
+        loop {
+            let frame = match read_v2_frame(&mut reader, magic).await {
+                Ok(f) => f,
+                Err(NetError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
+            if frame.is_ping() {
+                if let Some(n) = frame.ping_nonce() {
+                    queue_out(&out_tx, NetworkMessage::Pong(n))?;
+                }
+                continue;
             }
-            NetworkMessage::GetHeaders(gh) => {
-                let headers = headers_for_peer(cache.as_ref(), query.as_ref(), gh)?;
-                write_msg(&mut stream, magic, NetworkMessage::Headers(headers)).await?;
-            }
-            NetworkMessage::GetData(inv) => {
-                for item in inv {
-                    match item {
-                        Inventory::Block(h) | Inventory::WitnessBlock(h) => {
-                            if let Some(block) = block_for_peer(cache.as_ref(), query.as_ref(), h)? {
-                                write_msg(&mut stream, magic, NetworkMessage::Block(block))
-                                    .await?;
+            let msg = decode_framed_offload(frame).await?;
+            match msg.payload() {
+                NetworkMessage::Ping(n) => {
+                    queue_out(&out_tx, NetworkMessage::Pong(*n))?;
+                }
+                NetworkMessage::GetHeaders(gh) => {
+                    let headers = headers_for_peer(cache.as_ref(), query.as_ref(), gh)?;
+                    queue_out(&out_tx, NetworkMessage::Headers(headers))?;
+                }
+                NetworkMessage::GetData(inv) => {
+                    for item in inv {
+                        match item {
+                            Inventory::Block(h) | Inventory::WitnessBlock(h) => {
+                                if let Some(block) =
+                                    block_for_peer(cache.as_ref(), query.as_ref(), h)?
+                                {
+                                    queue_out(&out_tx, NetworkMessage::Block(block))?;
+                                }
                             }
+                            Inventory::Transaction(_)
+                            | Inventory::WitnessTransaction(_)
+                            | Inventory::WTx(_) => {}
+                            _ => {}
                         }
-                        Inventory::Transaction(_)
-                        | Inventory::WitnessTransaction(_)
-                        | Inventory::WTx(_) => {}
-                        _ => {}
                     }
                 }
+                NetworkMessage::Inv(_) | NetworkMessage::Tx(_) | NetworkMessage::MemPool => {}
+                NetworkMessage::GetAddr => {
+                    queue_out(&out_tx, NetworkMessage::Addr(vec![]))?;
+                }
+                _ => {}
             }
-            NetworkMessage::Inv(_) | NetworkMessage::Tx(_) | NetworkMessage::MemPool => {}
-            NetworkMessage::GetAddr => {
-                write_msg(&mut stream, magic, NetworkMessage::Addr(vec![])).await?;
-            }
-            _ => {}
         }
     }
+    .await;
+
+    drop(out_tx);
+    writer_task.abort();
+    let _ = writer_task.await;
+    result
 }
 
 fn headers_for_peer(
@@ -479,7 +660,8 @@ fn block_for_peer(
 
 /// Outbound sync: getheaders until caught up, then getdata for missing blocks in order.
 pub async fn sync_from_peer(
-    stream: &mut TcpStream,
+    reader: &mut V2Reader,
+    writer: &mut V2Writer,
     magic: Magic,
     local_locator: Vec<BlockHash>,
     mut local_has: impl FnMut(&BlockHash) -> bool,
@@ -489,19 +671,25 @@ pub async fn sync_from_peer(
     let mut locator = local_locator;
     loop {
         let gh = GetHeadersMessage::new(locator.clone(), BlockHash::from_byte_array([0u8; 32]));
-        write_msg(stream, magic, NetworkMessage::GetHeaders(gh)).await?;
+        write_v2_msg(writer, NetworkMessage::GetHeaders(gh)).await?;
 
         let headers = loop {
-            let msg = read_msg(stream).await?;
-            if msg.magic() != &magic {
-                return Err(NetError::BadMagic);
+            let frame = read_v2_frame(reader, magic).await?;
+            if frame.is_ping() {
+                if let Some(n) = frame.ping_nonce() {
+                    write_v2_msg(writer, NetworkMessage::Pong(n)).await?;
+                }
+                continue;
             }
+            let msg = decode_framed_offload(frame).await?;
             match msg.payload() {
                 NetworkMessage::Headers(h) => break h.clone(),
                 NetworkMessage::Ping(n) => {
-                    write_msg(stream, magic, NetworkMessage::Pong(*n)).await?;
+                    write_v2_msg(writer, NetworkMessage::Pong(*n)).await?;
                 }
-                NetworkMessage::SendHeaders | NetworkMessage::SendCmpct(_) | NetworkMessage::Verack => {}
+                NetworkMessage::SendHeaders
+                | NetworkMessage::SendCmpct(_)
+                | NetworkMessage::Verack => {}
                 _ => {}
             }
         };
@@ -527,15 +715,19 @@ pub async fn sync_from_peer(
 
         // Honour Core MAX_INV_SZ when requesting (chunk if needed).
         for chunk in inv.chunks(MAX_INV_SIZE) {
-            write_msg(stream, magic, NetworkMessage::GetData(chunk.to_vec())).await?;
+            write_v2_msg(writer, NetworkMessage::GetData(chunk.to_vec())).await?;
 
             let need = chunk.len();
             let mut got = 0;
             while got < need {
-                let msg = read_msg(stream).await?;
-                if msg.magic() != &magic {
-                    return Err(NetError::BadMagic);
+                let frame = read_v2_frame(reader, magic).await?;
+                if frame.is_ping() {
+                    if let Some(n) = frame.ping_nonce() {
+                        write_v2_msg(writer, NetworkMessage::Pong(n)).await?;
+                    }
+                    continue;
                 }
+                let msg = decode_framed_offload(frame).await?;
                 match msg.payload() {
                     NetworkMessage::Block(block) => {
                         on_block(0, block.clone())?;
@@ -543,7 +735,7 @@ pub async fn sync_from_peer(
                         downloaded += 1;
                     }
                     NetworkMessage::Ping(n) => {
-                        write_msg(stream, magic, NetworkMessage::Pong(*n)).await?;
+                        write_v2_msg(writer, NetworkMessage::Pong(*n)).await?;
                     }
                     NetworkMessage::NotFound(_) => {
                         return Err(NetError::Protocol("block not found"));

@@ -69,8 +69,15 @@ pub fn median_time_past(query: &Query, height: Height) -> Result<u32, ConsensusE
             .ok_or(ConsensusError::BadPrev)?;
         times.push(rec.timestamp);
     }
-    times.sort_unstable();
-    Ok(times[times.len() / 2])
+    Ok(median_time_past_times(&times))
+}
+
+/// Median of an already-collected timestamp window (unsorted OK).
+pub fn median_time_past_times(times: &[u32]) -> u32 {
+    debug_assert!(!times.is_empty());
+    let mut sorted = times.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
 }
 
 /// Expected `nBits` for a new header at `height`.
@@ -97,7 +104,6 @@ pub fn expected_next_bits(
     }
 
     // Retarget: timespan from first of period to last (height-1).
-    // Period starts at height - interval.
     let first_height = Height(height.0 - interval);
     let (_fk, first_rec) = query
         .header_at_height(first_height)?

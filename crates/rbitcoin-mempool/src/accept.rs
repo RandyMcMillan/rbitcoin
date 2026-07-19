@@ -1,0 +1,847 @@
+//! Single-tx accept: Libre policy + cluster limits + durable slot write.
+
+use crate::error::MempoolError;
+use crate::graph::{TxEntry, TxGraph, MAX_CLUSTER_COUNT, MAX_CLUSTER_WEIGHT};
+use crate::store::Mempool;
+use bitcoin::consensus::encode::serialize;
+use bitcoin::{OutPoint, Transaction, TxOut, Txid};
+use rbitcoin_consensus::policy::{self, PolicyResult};
+use std::collections::BTreeSet;
+
+/// Resolve prevouts for mempool acceptance (chain UTXO + in-mempool outputs).
+pub trait UtxoProvider {
+    fn get_txout(&self, op: &OutPoint) -> Option<TxOut>;
+}
+
+/// Map-backed provider for tests and simple callers.
+pub struct MapUtxoProvider {
+    pub map: std::collections::HashMap<OutPoint, TxOut>,
+}
+
+impl UtxoProvider for MapUtxoProvider {
+    fn get_txout(&self, op: &OutPoint) -> Option<TxOut> {
+        self.map.get(op).cloned()
+    }
+}
+
+/// Max txs in one ancestor package (Core-class package limit).
+pub const MAX_PACKAGE_COUNT: usize = 25;
+/// Max total weight (WU) of one package.
+pub const MAX_PACKAGE_WEIGHT: u64 = 404_000;
+/// Default mempool weight budget (WU) — ~75 MvB class; eviction by worst chunk.
+pub const DEFAULT_MAX_MEMPOOL_WEIGHT: u64 = 300_000_000;
+/// Incremental relay feerate for RBF (same as Libre min: 0.1 sat/vB = 100 sat/kvB).
+pub const INCREMENTAL_RELAY_FEE_RATE_SAT_PER_KVB: u64 = 100;
+
+/// Outcome of a successful accept.
+#[derive(Debug, Clone)]
+pub struct AcceptResult {
+    pub txid: Txid,
+    pub fee_sat: u64,
+    pub weight: u64,
+    pub slot: u32,
+}
+
+/// Why accept failed (policy / graph / durable).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptError {
+    Policy(&'static str),
+    MissingPrevout(OutPoint),
+    Duplicate(Txid),
+    ClusterTooLarge { count: usize, weight: u64 },
+    PackageTooLarge { count: usize, weight: u64 },
+    PackageEmpty,
+    PackageNotTopo,
+    /// Conflicting mempool txs exist and replacement does not pay enough.
+    RbfInsufficient,
+    Coinbase,
+    NotFound(Txid),
+    Durable(String),
+}
+
+impl std::fmt::Display for AcceptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AcceptError::Policy(s) => write!(f, "policy: {s}"),
+            AcceptError::MissingPrevout(op) => write!(f, "missing prevout {op}"),
+            AcceptError::Duplicate(t) => write!(f, "duplicate {t}"),
+            AcceptError::ClusterTooLarge { count, weight } => {
+                write!(f, "cluster too large count={count} weight={weight}")
+            }
+            AcceptError::PackageTooLarge { count, weight } => {
+                write!(f, "package too large count={count} weight={weight}")
+            }
+            AcceptError::PackageEmpty => f.write_str("package empty"),
+            AcceptError::PackageNotTopo => f.write_str("package not topologically ordered"),
+            AcceptError::RbfInsufficient => f.write_str("rbf insufficient fee"),
+            AcceptError::Coinbase => f.write_str("coinbase"),
+            AcceptError::NotFound(t) => write!(f, "not found {t}"),
+            AcceptError::Durable(s) => write!(f, "durable: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for AcceptError {}
+
+impl From<MempoolError> for AcceptError {
+    fn from(e: MempoolError) -> Self {
+        AcceptError::Durable(e.to_string())
+    }
+}
+
+/// Mempool with RAM TxGraph layered on durable store.
+pub struct ActiveMempool {
+    pub store: Mempool,
+    pub graph: TxGraph,
+    /// Cached tx bodies for graph rebuild / remove (live set only).
+    bodies: std::collections::HashMap<Txid, Transaction>,
+    /// Evict worst chunks when live weight exceeds this.
+    pub max_weight: u64,
+}
+
+impl ActiveMempool {
+    pub fn open_or_create(dir: impl Into<std::path::PathBuf>) -> Result<Self, MempoolError> {
+        Self::open_or_create_with_limit(dir, DEFAULT_MAX_MEMPOOL_WEIGHT)
+    }
+
+    pub fn open_or_create_with_limit(
+        dir: impl Into<std::path::PathBuf>,
+        max_weight: u64,
+    ) -> Result<Self, MempoolError> {
+        let mut store = Mempool::open_or_create(dir)?;
+        let loaded = store.load_live_txs()?;
+        let mut graph = TxGraph::new();
+        let mut bodies = std::collections::HashMap::new();
+        let mut items = Vec::with_capacity(loaded.len());
+        for (slot, fee_sat, weight, tx) in loaded {
+            let txid = tx.compute_txid();
+            let entry = TxEntry {
+                txid,
+                wtxid: tx.compute_wtxid(),
+                fee_sat,
+                weight,
+                slot,
+                parents: BTreeSet::new(),
+                children: BTreeSet::new(),
+            };
+            bodies.insert(txid, tx.clone());
+            items.push((entry, tx));
+        }
+        graph.rebuild_from(items);
+        // Keep live_count in sync with graph after rebuild.
+        store.set_live_count(graph.len() as u32);
+        Ok(Self {
+            store,
+            graph,
+            bodies,
+            max_weight,
+        })
+    }
+
+    pub fn live_count(&self) -> usize {
+        self.graph.len()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.store.generation()
+    }
+
+    pub fn flush(&mut self) -> Result<(), MempoolError> {
+        self.store.flush()
+    }
+
+    /// Compact durable storage (drop DEAD holes) and rebuild RAM graph.
+    pub fn compact(&mut self) -> Result<(u32, usize), MempoolError> {
+        let (live, body_len) = self.store.compact()?;
+        let loaded = self.store.load_live_txs()?;
+        let mut graph = TxGraph::new();
+        let mut bodies = std::collections::HashMap::new();
+        let mut items = Vec::with_capacity(loaded.len());
+        for (slot, fee_sat, weight, tx) in loaded {
+            let txid = tx.compute_txid();
+            let entry = TxEntry {
+                txid,
+                wtxid: tx.compute_wtxid(),
+                fee_sat,
+                weight,
+                slot,
+                parents: BTreeSet::new(),
+                children: BTreeSet::new(),
+            };
+            bodies.insert(txid, tx.clone());
+            items.push((entry, tx));
+        }
+        graph.rebuild_from(items);
+        self.graph = graph;
+        self.bodies = bodies;
+        self.store.set_live_count(live);
+        Ok((live, body_len))
+    }
+
+    /// Compact when DEAD slots are a large fraction of capacity (file growth bound).
+    pub fn maybe_compact(&mut self) -> Result<Option<(u32, usize)>, MempoolError> {
+        let (_free, live, dead) = self.store.slot_stats();
+        if dead == 0 {
+            return Ok(None);
+        }
+        // Compact if dead ≥ 25% of capacity or dead ≥ live (wasteful body).
+        let cap = self.store.meta().slot_cap;
+        if dead * 4 >= cap || (live > 0 && dead >= live) || (live == 0 && dead > 0) {
+            return Ok(Some(self.compact()?));
+        }
+        Ok(None)
+    }
+
+    /// Accept a single transaction under Libre policy + cluster limits.
+    ///
+    /// Durable order: write body → LIVE slot → RAM graph. Call [`flush`] to
+    /// bump generation so a crash keeps the batch.
+    pub fn accept_tx(
+        &mut self,
+        tx: &Transaction,
+        utxos: &impl UtxoProvider,
+    ) -> Result<AcceptResult, AcceptError> {
+        if tx.is_coinbase() {
+            return Err(AcceptError::Coinbase);
+        }
+        let txid = tx.compute_txid();
+        if self.graph.contains(&txid) {
+            return Err(AcceptError::Duplicate(txid));
+        }
+
+        // Resolve prevouts: in-mempool first, then provider (chain).
+        let mut prevouts: Vec<TxOut> = Vec::with_capacity(tx.input.len());
+        let mut parent_txids = BTreeSet::new();
+        let mut direct_conflicts: BTreeSet<Txid> = BTreeSet::new();
+        let mut input_value = 0u64;
+        for inp in &tx.input {
+            let op = inp.previous_output;
+            if let Some(c) = self.graph.conflict_txid(&op) {
+                if c != txid {
+                    direct_conflicts.insert(c);
+                }
+            }
+            let txout = if let Some(creator) = self.graph.creator(&op) {
+                if !self.graph.mempool_utxo(&op) {
+                    // Spent in-mempool — must RBF the conflict set.
+                    if let Some(c) = self.graph.conflict_txid(&op) {
+                        direct_conflicts.insert(c);
+                    } else {
+                        return Err(AcceptError::Policy("mempool double-spend"));
+                    }
+                    // Still need the value from the creator's output for fee calc.
+                }
+                parent_txids.insert(creator);
+                let parent_tx = self
+                    .bodies
+                    .get(&creator)
+                    .ok_or(AcceptError::Durable("parent body missing".into()))?;
+                parent_tx
+                    .output
+                    .get(op.vout as usize)
+                    .cloned()
+                    .ok_or(AcceptError::MissingPrevout(op))?
+            } else {
+                utxos
+                    .get_txout(&op)
+                    .ok_or(AcceptError::MissingPrevout(op))?
+            };
+            input_value = input_value.saturating_add(txout.value.to_sat());
+            prevouts.push(txout);
+        }
+        let _ = prevouts; // reserved for future script verify
+
+        let output_value: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        if output_value > input_value {
+            return Err(AcceptError::Policy("negative fee"));
+        }
+        let fee_sat = input_value - output_value;
+        let weight = tx.weight().to_wu();
+
+        match policy::check_libre_admission(tx, fee_sat, weight) {
+            PolicyResult::Standard => {}
+            PolicyResult::NonStandard(s) => return Err(AcceptError::Policy(s)),
+        }
+
+        // Full RBF (Libre): replace conflicts if replacement pays enough.
+        let conflict_set = if !direct_conflicts.is_empty() {
+            let direct: Vec<Txid> = direct_conflicts.into_iter().collect();
+            let set = self.graph.conflict_set(&direct);
+            let (old_fee, old_weight) = self.graph.set_fee_weight(&set);
+            if !rbf_pays_for_replacement(fee_sat, weight, old_fee, old_weight) {
+                return Err(AcceptError::RbfInsufficient);
+            }
+            set
+        } else {
+            BTreeSet::new()
+        };
+        // Parents that remain after RBF (not in conflict set).
+        let parent_txids: BTreeSet<Txid> = parent_txids
+            .into_iter()
+            .filter(|p| !conflict_set.contains(p))
+            .collect();
+
+        if self
+            .graph
+            .cluster_would_exceed(&parent_txids, 1, weight)
+        {
+            let mut members = BTreeSet::new();
+            for p in &parent_txids {
+                if let Some(c) = self.graph.cluster_of(p) {
+                    members.extend(c.members);
+                }
+            }
+            // Exclude conflicts that will be removed.
+            members.retain(|m| !conflict_set.contains(m));
+            let base_w: u64 = members
+                .iter()
+                .filter_map(|t| self.graph.get(t).map(|e| e.weight))
+                .sum();
+            return Err(AcceptError::ClusterTooLarge {
+                count: members.len() + 1,
+                weight: base_w.saturating_add(weight),
+            });
+        }
+
+        // Apply RBF removals first.
+        for c in conflict_set.iter().rev() {
+            // Descendants first not required if we remove all independently.
+            let _ = self.remove_txid(c);
+        }
+
+        // Durable write.
+        let raw = serialize(tx);
+        let slot = self.store.append_live_tx(&raw, &txid, fee_sat, weight)?;
+
+        let entry = TxEntry {
+            txid,
+            wtxid: tx.compute_wtxid(),
+            fee_sat,
+            weight,
+            slot,
+            parents: BTreeSet::new(),
+            children: BTreeSet::new(),
+        };
+        self.graph.insert(entry, tx);
+        self.bodies.insert(txid, tx.clone());
+
+        // Post-check (belt): cluster limits still hold.
+        if let Some(c) = self.graph.cluster_of(&txid) {
+            if c.members.len() > MAX_CLUSTER_COUNT || c.total_weight > MAX_CLUSTER_WEIGHT {
+                // Roll back RAM + mark slot dead (best-effort).
+                self.graph.remove(&txid, tx);
+                self.bodies.remove(&txid);
+                let _ = self.store.mark_slot_dead(slot);
+                return Err(AcceptError::ClusterTooLarge {
+                    count: c.members.len(),
+                    weight: c.total_weight,
+                });
+            }
+        }
+
+        // Evict worst chunks until under weight budget (never drop the new tx first).
+        self.evict_to_budget(Some(txid))?;
+
+        Ok(AcceptResult {
+            txid,
+            fee_sat,
+            weight,
+            slot,
+        })
+    }
+
+    /// Remove lowest-feerate chunks until `total_weight <= max_weight`.
+    ///
+    /// Prefer not to evict `protect` (the just-accepted tx). Returns how many removed.
+    pub fn evict_to_budget(&mut self, protect: Option<Txid>) -> Result<usize, AcceptError> {
+        let mut removed = 0usize;
+        while self.graph.total_weight() > self.max_weight {
+            let Some((_rep, chunk)) = self.graph.worst_chunk() else {
+                break;
+            };
+            // If the only remaining chunk is the protected tx, stop (over budget but keep it).
+            if chunk.txids.len() == 1 && protect == chunk.txids.first().copied() {
+                break;
+            }
+            // Evict entire worst chunk (mining order: lowest fee-rate diagram segment).
+            for t in &chunk.txids {
+                if protect == Some(*t) {
+                    continue;
+                }
+                if self.graph.contains(t) {
+                    self.remove_txid(t)?;
+                    removed += 1;
+                }
+            }
+            if removed == 0 {
+                break; // would only remove protected
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Accept an ancestor package (CPFP): txs must be parent-before-child.
+    ///
+    /// On any failure, already-accepted members of this package are rolled back.
+    pub fn accept_package(
+        &mut self,
+        txs: &[Transaction],
+        utxos: &impl UtxoProvider,
+    ) -> Result<Vec<AcceptResult>, AcceptError> {
+        if txs.is_empty() {
+            return Err(AcceptError::PackageEmpty);
+        }
+        let total_weight: u64 = txs.iter().map(|t| t.weight().to_wu()).sum();
+        if txs.len() > MAX_PACKAGE_COUNT || total_weight > MAX_PACKAGE_WEIGHT {
+            return Err(AcceptError::PackageTooLarge {
+                count: txs.len(),
+                weight: total_weight,
+            });
+        }
+        // Reject coinbase / duplicates inside package.
+        let mut seen = BTreeSet::new();
+        let mut pkg_ids = BTreeSet::new();
+        for tx in txs {
+            if tx.is_coinbase() {
+                return Err(AcceptError::Coinbase);
+            }
+            let id = tx.compute_txid();
+            if !seen.insert(id) {
+                return Err(AcceptError::Duplicate(id));
+            }
+            pkg_ids.insert(id);
+        }
+        // Topo check: every in-package parent must appear earlier.
+        for (i, tx) in txs.iter().enumerate() {
+            for inp in &tx.input {
+                let parent = inp.previous_output.txid;
+                if pkg_ids.contains(&parent) {
+                    let parent_pos = txs.iter().position(|t| t.compute_txid() == parent);
+                    match parent_pos {
+                        Some(p) if p < i => {}
+                        _ => return Err(AcceptError::PackageNotTopo),
+                    }
+                }
+            }
+        }
+
+        let mut accepted: Vec<AcceptResult> = Vec::with_capacity(txs.len());
+        for tx in txs {
+            match self.accept_tx(tx, utxos) {
+                Ok(r) => accepted.push(r),
+                Err(e) => {
+                    // Roll back this package's accepts (children first).
+                    for r in accepted.iter().rev() {
+                        let _ = self.remove_txid(&r.txid);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(accepted)
+    }
+
+    /// Durable remove one live tx (confirm / RBF / eviction).
+    pub fn remove_txid(&mut self, txid: &Txid) -> Result<(), AcceptError> {
+        let entry = self
+            .graph
+            .get(txid)
+            .ok_or(AcceptError::NotFound(*txid))?
+            .clone();
+        let tx = self
+            .bodies
+            .get(txid)
+            .cloned()
+            .ok_or(AcceptError::Durable("body missing".into()))?;
+        self.store.mark_slot_dead(entry.slot)?;
+        self.graph.remove(txid, &tx);
+        self.bodies.remove(txid);
+        Ok(())
+    }
+
+    /// Remove all txs that appear in a confirmed block (coinbase ignored if present).
+    ///
+    /// Missing mempool entries are skipped (already not in pool). Returns how many removed.
+    /// May trigger compaction when DEAD slots dominate.
+    pub fn remove_for_block(&mut self, block_txids: &[Txid]) -> Result<usize, AcceptError> {
+        let mut n = 0usize;
+        for txid in block_txids {
+            if self.graph.contains(txid) {
+                self.remove_txid(txid)?;
+                n += 1;
+            }
+        }
+        if n > 0 {
+            let _ = self.maybe_compact();
+        }
+        Ok(n)
+    }
+
+    /// Re-accept non-coinbase txs after a reorg disconnect (best-effort).
+    ///
+    /// Failures on individual txs are collected; successful accepts remain.
+    pub fn reorg_disconnect_reaccept(
+        &mut self,
+        txs: &[Transaction],
+        utxos: &impl UtxoProvider,
+    ) -> Vec<Result<AcceptResult, AcceptError>> {
+        txs.iter()
+            .filter(|t| !t.is_coinbase())
+            .map(|t| self.accept_tx(t, utxos))
+            .collect()
+    }
+
+    /// Lookup a live body (for tests / Electrum unconf).
+    pub fn get_tx(&self, txid: &Txid) -> Option<&Transaction> {
+        self.bodies.get(txid)
+    }
+}
+
+/// Full-RBF / package-RBF fee check (Libre: no BIP125 signaling).
+///
+/// Requires strictly higher absolute fee, higher feerate, and pays incremental
+/// relay fee on the **replacement** vsize.
+pub fn rbf_pays_for_replacement(
+    new_fee: u64,
+    new_weight: u64,
+    old_fee: u64,
+    old_weight: u64,
+) -> bool {
+    if new_fee <= old_fee {
+        return false;
+    }
+    let new_rate = policy::fee_rate_sat_per_kvb(new_fee, new_weight);
+    let old_rate = policy::fee_rate_sat_per_kvb(old_fee, old_weight);
+    if new_rate <= old_rate {
+        return false;
+    }
+    let vsize = policy::get_virtual_size(new_weight);
+    // ceil(vsize * rate / 1000)
+    let inc = vsize
+        .saturating_mul(INCREMENTAL_RELAY_FEE_RATE_SAT_PER_KVB)
+        .saturating_add(999)
+        / 1000;
+    new_fee.saturating_sub(old_fee) >= inc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::hashes::Hash;
+    use bitcoin::transaction::Version;
+    use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, Witness};
+    use std::collections::HashMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp_dir() -> std::path::PathBuf {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::path::PathBuf::from(format!("/tmp/rbitcoin-mempool-accept-{n}"));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    fn chain_utxo(value: u64) -> (OutPoint, TxOut, MapUtxoProvider) {
+        let op = OutPoint {
+            txid: Txid::from_byte_array([0xab; 32]),
+            vout: 0,
+        };
+        let txout = TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        };
+        let mut map = HashMap::new();
+        map.insert(op, txout.clone());
+        (op, txout, MapUtxoProvider { map })
+    }
+
+    fn spend_tx(op: OutPoint, out_value: u64) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(out_value),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    }
+
+    #[test]
+    fn accept_single_flush_reopen() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let tx = spend_tx(op, 99_000); // fee 1000
+        let txid = tx.compute_txid();
+        {
+            let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+            let r = mp.accept_tx(&tx, &utxos).expect("accept");
+            assert_eq!(r.txid, txid);
+            assert_eq!(r.fee_sat, 1000);
+            assert_eq!(mp.live_count(), 1);
+            mp.flush().unwrap();
+            assert!(mp.generation() >= 1);
+        }
+        {
+            let mp = ActiveMempool::open_or_create(&dir).unwrap();
+            assert_eq!(mp.live_count(), 1);
+            assert!(mp.graph.contains(&txid));
+            let e = mp.graph.get(&txid).unwrap();
+            assert_eq!(e.fee_sat, 1000);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reject_low_feerate() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        // fee 1 sat — below 0.1 sat/vB for any real tx weight
+        let tx = spend_tx(op, 99_999);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let err = mp.accept_tx(&tx, &utxos).unwrap_err();
+        assert!(matches!(err, AcceptError::Policy("min relay fee")));
+        assert_eq!(mp.live_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dust_and_op_true_allowed() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        // 1-sat output is dust under Core; Libre allows it.
+        let tx = spend_tx(op, 1);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(&tx, &utxos).expect("dust ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn child_spends_parent_cluster() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let parent = spend_tx(op, 90_000);
+        let pid = parent.compute_txid();
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(&parent, &utxos).unwrap();
+
+        let child = spend_tx(
+            OutPoint {
+                txid: pid,
+                vout: 0,
+            },
+            80_000,
+        );
+        mp.accept_tx(&child, &utxos).unwrap();
+        assert_eq!(mp.live_count(), 2);
+        let c = mp.graph.cluster_of(&pid).unwrap();
+        assert_eq!(c.members.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversize_cluster_rejected() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(10_000_000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        // Chain of MAX_CLUSTER_COUNT, then one more fails.
+        let mut prev_op = op;
+        for i in 0..MAX_CLUSTER_COUNT {
+            // Large fee so policy passes; leave enough for remaining.
+            let remain = 10_000_000u64 - (i as u64 + 1) * 1_000;
+            let tx = spend_tx(prev_op, remain);
+            let last_txid = tx.compute_txid();
+            mp.accept_tx(&tx, &utxos).unwrap_or_else(|e| panic!("i={i}: {e}"));
+            prev_op = OutPoint {
+                txid: last_txid,
+                vout: 0,
+            };
+        }
+        assert_eq!(mp.live_count(), MAX_CLUSTER_COUNT);
+        let remain = 10_000_000u64 - (MAX_CLUSTER_COUNT as u64 + 1) * 1_000;
+        let extra = spend_tx(prev_op, remain);
+        let err = mp.accept_tx(&extra, &utxos).unwrap_err();
+        assert!(matches!(err, AcceptError::ClusterTooLarge { .. }), "{err}");
+        assert_eq!(mp.live_count(), MAX_CLUSTER_COUNT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn annex_reject() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let mut tx = spend_tx(op, 90_000);
+        tx.input[0].witness = Witness::from_slice(&[vec![0x01], vec![0x50, 0x01]]);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let err = mp.accept_tx(&tx, &utxos).unwrap_err();
+        assert!(matches!(err, AcceptError::Policy("libre annex")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cpfp_package_accept() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        // Parent low fee still above min relay if weight small.
+        let parent = spend_tx(op, 99_000); // fee 1000
+        let pid = parent.compute_txid();
+        let child = spend_tx(
+            OutPoint {
+                txid: pid,
+                vout: 0,
+            },
+            90_000,
+        );
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let res = mp
+            .accept_package(&[parent.clone(), child.clone()], &utxos)
+            .expect("package");
+        assert_eq!(res.len(), 2);
+        assert_eq!(mp.live_count(), 2);
+        let c = mp.graph.cluster_of(&pid).unwrap();
+        assert_eq!(c.members.len(), 2);
+        // Wrong order rejected.
+        let mut mp2 = ActiveMempool::open_or_create(tmp_dir()).unwrap();
+        let err = mp2
+            .accept_package(&[child, parent], &utxos)
+            .unwrap_err();
+        assert!(matches!(err, AcceptError::PackageNotTopo));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mine_clears_mempool() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let tx = spend_tx(op, 90_000);
+        let txid = tx.compute_txid();
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(&tx, &utxos).unwrap();
+        assert_eq!(mp.live_count(), 1);
+        let n = mp.remove_for_block(&[txid]).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(mp.live_count(), 0);
+        mp.flush().unwrap();
+        let mp = ActiveMempool::open_or_create(&dir).unwrap();
+        assert_eq!(mp.live_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reorg_reaccept() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let tx = spend_tx(op, 90_000);
+        let txid = tx.compute_txid();
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(&tx, &utxos).unwrap();
+        mp.remove_for_block(&[txid]).unwrap();
+        assert_eq!(mp.live_count(), 0);
+        let results = mp.reorg_disconnect_reaccept(&[tx], &utxos);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
+        assert_eq!(mp.live_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_rbf_replaces_conflict() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let low = spend_tx(op, 99_000); // fee 1000
+        let high = spend_tx(op, 50_000); // fee 50000 — same input, full RBF
+        let low_id = low.compute_txid();
+        let high_id = high.compute_txid();
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(&low, &utxos).unwrap();
+        assert!(mp.graph.contains(&low_id));
+        mp.accept_tx(&high, &utxos).expect("rbf");
+        assert!(!mp.graph.contains(&low_id));
+        assert!(mp.graph.contains(&high_id));
+        assert_eq!(mp.live_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rbf_rejects_insufficient() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let high = spend_tx(op, 50_000); // fee 50000
+        let low = spend_tx(op, 99_000); // fee 1000 — cannot replace
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(&high, &utxos).unwrap();
+        let err = mp.accept_tx(&low, &utxos).unwrap_err();
+        assert!(matches!(err, AcceptError::RbfInsufficient), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chunk_eviction_under_weight_budget() {
+        let dir = tmp_dir();
+        // Tiny budget forces eviction after a few accepts.
+        let mut mp = ActiveMempool::open_or_create_with_limit(&dir, 800).unwrap();
+        // Distinct chain UTXOs so they are independent clusters.
+        for i in 0u8..8 {
+            let op = OutPoint {
+                txid: Txid::from_byte_array([i.wrapping_add(1); 32]),
+                vout: 0,
+            };
+            let txout = TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            };
+            let mut map = HashMap::new();
+            map.insert(op, txout);
+            let utxos = MapUtxoProvider { map };
+            // Vary fees so worst-chunk ordering is defined: low fee first.
+            let out = 99_000u64 - u64::from(i) * 100; // higher i → higher fee
+            let tx = spend_tx(op, out);
+            mp.accept_tx(&tx, &utxos).unwrap_or_else(|e| panic!("i={i}: {e}"));
+        }
+        assert!(mp.graph.total_weight() <= mp.max_weight + 500); // allow one protected overflow
+        assert!(mp.live_count() < 8, "some eviction expected");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rbf_pays_helper() {
+        assert!(rbf_pays_for_replacement(10_000, 4000, 1000, 4000));
+        assert!(!rbf_pays_for_replacement(1000, 4000, 10_000, 4000));
+        assert!(!rbf_pays_for_replacement(1000, 4000, 1000, 4000));
+    }
+
+    #[test]
+    fn compact_reclaims_dead_and_preserves_live() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let tx = spend_tx(op, 90_000);
+        let txid = tx.compute_txid();
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        mp.accept_tx(&tx, &utxos).unwrap();
+        let body_before = mp.store.body_logical_len().unwrap();
+        // Confirm-remove leaves a DEAD slot (body still holds the old payload).
+        mp.remove_for_block(&[txid]).unwrap();
+        // Re-accept so we have live + dead history in the body file.
+        mp.accept_tx(&tx, &utxos).unwrap();
+        let (_f, live, dead) = mp.store.slot_stats();
+        assert_eq!(live, 1);
+        // remove_for_block may already have auto-compacted; either way compact is safe.
+        let _ = dead;
+        let (live_after, body_after) = mp.compact().unwrap();
+        assert_eq!(live_after, 1);
+        assert!(body_after <= body_before + 256);
+        assert_eq!(mp.live_count(), 1);
+        mp.flush().unwrap();
+        let mp2 = ActiveMempool::open_or_create(&dir).unwrap();
+        assert_eq!(mp2.live_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

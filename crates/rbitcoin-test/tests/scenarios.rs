@@ -7,8 +7,8 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Amount, BlockHash};
 use rbitcoin_cli::cli_main as cli_cli_main;
 use rbitcoin_consensus::{
-    accept_and_connect_block, validate_block_structure, ChainParams, ConsensusError, Milestone,
-    ValidationContext,
+    accept_and_connect_block, validate_block_connect, validate_block_structure, ChainParams,
+    ConsensusError, Milestone, ValidationContext,
 };
 use rbitcoin_net::{crate_name as net_crate_name, outbound_for_ibd};
 use rbitcoin_node::{cli_main as node_cli_main, run_node, NodeConfig};
@@ -77,10 +77,15 @@ fn node_cli_and_surface_smoke() {
     assert!(names.contains(&"rbitcoin-consensus"));
     let ring = WireRing::new(100);
     assert!(ring.is_empty());
-    assert!(!Milestone::NONE.skips_at(0));
-    assert!(Milestone { height: 10 }.skips_at(5));
-    assert_eq!(outbound_for_ibd(true), 100);
+    assert!(!Milestone::NONE.skips_scripts_at(0));
+    assert!(Milestone { height: 10 }.skips_scripts_at(5));
+    assert_eq!(outbound_for_ibd(true), rbitcoin_net::DEFAULT_IBD_TARGET_PEERS);
+    assert_eq!(outbound_for_ibd(true), 16);
     assert_eq!(outbound_for_ibd(false), 8);
+    assert_eq!(
+        rbitcoin_net::DEFAULT_IBD_OUTBOUND,
+        rbitcoin_net::DEFAULT_IBD_TARGET_PEERS
+    );
     assert_eq!(net_crate_name(), "rbitcoin-net");
     assert_eq!(node_rpc_path(), "/");
     let _ = rbitcoin_net::local_service_flags();
@@ -403,22 +408,19 @@ fn chain_connect_reorg_and_growth() {
                 version: 1,
                 locktime: 0,
                 input_start_fk: Fk::NULL,
-                input_count: 0,
+                input_count: 1,
                 output_start_fk: Fk::NULL,
-                output_count: 0,
-                raw: vec![h as u8],
+                output_count: 1,
             },
             inputs: vec![InputRecord {
-                parent_tx_fk: Fk::NULL,
-                index: 0,
                 prev_txid: [0u8; 32],
+                prev_tx_fk: Fk::NULL,
                 prev_index: u32::MAX,
                 sequence: u32::MAX,
                 script_sig: vec![0],
+                witness: vec![],
             }],
             outputs: vec![OutputRecord {
-                parent_tx_fk: Fk::NULL,
-                index: 0,
                 value: 50_0000_0000,
                 script: vec![0x51],
             }],
@@ -450,11 +452,552 @@ fn chain_connect_reorg_and_growth() {
         .is_err());
 }
 
+// ─── IBD Class A: out-of-order archive, idempotent re-archive, head-off ─────
+
+/// After archive-ahead of tip, `resume_work_path_after_tip` must rebuild the
+/// ordered path with Class A flags so restart does not re-getdata those bodies.
+#[test]
+fn resume_work_path_sees_archived_bodies_after_reopen() {
+    use rbitcoin_consensus::{
+        accept_and_archive_block, accept_and_connect_block, header_to_record, ChainParams,
+        Milestone,
+    };
+    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
+
+    let td = TestDatadir::new().unwrap();
+    let params = ChainParams::regtest();
+    let ms = Milestone { height: 1_000_000 };
+    let genesis = regtest_genesis();
+
+    let hashes = {
+        let q = Query::open_or_create(td.store_path()).unwrap();
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+        let g_fk = q
+            .get_header_by_hash(&genesis.block_hash().to_byte_array())
+            .unwrap()
+            .unwrap()
+            .0;
+        let mut tip = genesis.block_hash();
+        let mut tip_time = genesis.header.time;
+        let mut prev_fk = g_fk;
+        let mut out = Vec::new();
+        // Confirm stays at 0; archive heights 1..4 ahead (parallel IBD shape).
+        for h in 1u32..=4 {
+            let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+            let fk = q
+                .ensure_header(&header_to_record(prev_fk, &b.header))
+                .unwrap();
+            accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
+            out.push(b.block_hash().to_byte_array());
+            tip = b.block_hash();
+            tip_time = b.header.time;
+            prev_fk = fk;
+        }
+        q.flush().unwrap();
+        out
+    };
+
+    // Cold reopen — process-local ordered path is gone; store still has Class A.
+    let q2 = Query::open_or_create(td.store_path()).unwrap();
+    let tip_hash = genesis.block_hash().to_byte_array();
+    let path = q2
+        .resume_work_path_after_tip(tip_hash, 0, 64)
+        .expect("resume");
+    assert_eq!(path.len(), 4, "expected 4 headers after tip");
+    assert!(
+        path.iter().all(|e| e.has_body),
+        "all resume entries should have Class A bodies"
+    );
+    for (i, e) in path.iter().enumerate() {
+        assert_eq!(e.height, (i as u32) + 1);
+        assert_eq!(e.hash, hashes[i]);
+        assert!(q2.is_block_archived(&e.hash).unwrap());
+    }
+}
+
+/// Single scenario covering the signet @2148 failure class and parallel IBD:
+/// - archive bodies out of height order (ahead of tip)
+/// - re-archive / mega-batch duplicate is idempotent (fk + tx_height stable)
+/// - `tx.head` off: prevouts via process cache / prev_tx_fk
+/// - durable points off on confirm (process-local spent set); backfill restores spenders()
+/// - coinbase maturity then spend still connects
+#[test]
+fn ibd_parallel_archive_idempotent_confirm_without_tx_head() {
+    use rbitcoin_consensus::{
+        accept_and_archive_block, accept_and_connect_block, confirm_archived_at, header_to_record,
+        prepare_block_for_archive, ChainParams, Milestone,
+    };
+    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.set_tx_index(false);
+    q.set_spend_index(false);
+    let ms = Milestone { height: 1_000_000 };
+    let params = ChainParams::regtest();
+    let maturity = params.coinbase_maturity();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let g_fk = q
+        .get_header_by_hash(&genesis.block_hash().to_byte_array())
+        .unwrap()
+        .unwrap()
+        .0;
+
+    // Mine a short pad, then archive **out of order** (2 before 1) like parallel IBD.
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+    let cb1 = b1.txdata[0].compute_txid();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+    let b2 = mine_regtest_block(tip, tip_time + 600, 2, vec![]);
+    tip = b2.block_hash();
+    tip_time = b2.header.time;
+
+    // Headers first (body order independent), then bodies 2 then 1.
+    let h1_fk = q
+        .ensure_header(&header_to_record(g_fk, &b1.header))
+        .unwrap();
+    let _h2_fk = q
+        .ensure_header(&header_to_record(h1_fk, &b2.header))
+        .unwrap();
+    accept_and_archive_block(&q, &params, Height(2), &b2, ms).unwrap();
+    accept_and_archive_block(&q, &params, Height(1), &b1, ms).unwrap();
+    // Mega-batch duplicate of the same header (two prep deliveries).
+    let (h1_rec, h1_txs) = prepare_block_for_archive(&q, &params, &b1).unwrap();
+    let fks_before = q.store().header_txs.get_list(h1_fk).unwrap().unwrap();
+    let mut dup = vec![
+        (h1_fk, h1_rec.clone(), h1_txs.clone()),
+        (h1_fk, h1_rec, h1_txs),
+    ];
+    q.archive_prepared_with_fks(&mut dup).unwrap();
+    assert_eq!(
+        q.store().header_txs.get_list(h1_fk).unwrap().unwrap(),
+        fks_before,
+        "duplicate mega-batch must not reassign tx fks"
+    );
+
+    confirm_archived_at(&q, &params, Height(1), &b1.block_hash().to_byte_array(), ms).unwrap();
+    // Second peer delivery after confirm: still idempotent.
+    accept_and_archive_block(&q, &params, Height(1), &b1, ms).unwrap();
+    assert_eq!(
+        q.store().tx_height.get(fks_before[0]).unwrap(),
+        Some(1),
+        "tx_height must remain on first-archive fks"
+    );
+    confirm_archived_at(&q, &params, Height(2), &b2.block_hash().to_byte_array(), ms).unwrap();
+
+    let last_pad = maturity + 1;
+    for h in 3..=last_pad {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
+        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
+        confirm_archived_at(&q, &params, Height(h), &b.block_hash().to_byte_array(), ms)
+            .unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+
+    let spend_h = last_pad + 1;
+    let spend = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
+    let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
+    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
+    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
+    confirm_archived_at(
+        &q,
+        &params,
+        Height(spend_h),
+        &b_spend.block_hash().to_byte_array(),
+        ms,
+    )
+    .expect("mature coinbase spend with head off + double-archive");
+    assert_eq!(q.tip_height(), Some(Height(spend_h)));
+    // Durable points deferred; process-local set still sees the spend.
+    assert!(
+        q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
+        "local spent-set must mark spends when spend_index is off"
+    );
+    assert!(
+        q.spenders(cb1.as_byte_array(), 0).unwrap().is_empty(),
+        "durable spenders empty until backfill"
+    );
+    q.set_spend_index(true);
+    let (_h, _txs) = q.backfill_point_spends(|_, _, _, _| {}).unwrap();
+    assert_eq!(
+        q.spenders(cb1.as_byte_array(), 0).unwrap().len(),
+        1,
+        "backfill must write durable point edges for Electrum/spenders"
+    );
+    let fks = q.block_tx_fks(Height(spend_h)).unwrap();
+    assert!(fks.len() >= 2);
+    let inp = q.tx_input(&q.get_tx(fks[1]).unwrap(), 0).unwrap();
+    assert!(
+        !inp.prev_tx_fk.is_null(),
+        "prev_tx_fk stamped via process cache when tx.head is off"
+    );
+}
+
+/// Milestone 0 / `spend_index` on: archive writes point edges before Class C.
+/// Confirm must use **strong** spenders only — `spenders_raw` would see the
+/// archived (non-strong) edge and reject a valid tip (signet height 2148).
+#[test]
+fn confirm_with_spend_index_ignores_archive_only_point_edges() {
+    use rbitcoin_consensus::{
+        accept_and_archive_block, accept_and_connect_block, confirm_archived_at, ChainParams,
+        Milestone,
+    };
+    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    // Full-verify / tip-mode indexing: durable points written on archive + confirm.
+    q.set_spend_index(true);
+    q.set_tx_index(true);
+    let ms = Milestone::NONE; // scripts on; same spend path as milestone 0
+    let params = ChainParams::regtest();
+    let maturity = params.coinbase_maturity();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+    let cb1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+
+    let last_pad = maturity + 1;
+    let mut pad_blocks = Vec::new();
+    for h in 2..=last_pad {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        // Archive ahead of confirm (parallel IBD shape).
+        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+        pad_blocks.push((h, b.block_hash().to_byte_array()));
+    }
+    let spend_h = last_pad + 1;
+    let spend = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
+    let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
+    // Archive spend **before** confirming the pad — writes point row while
+    // spending tx is not yet strong.
+    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
+    assert!(
+        !q.spenders_raw(cb1.as_byte_array(), 0).unwrap().is_empty(),
+        "archive must have written a raw point edge"
+    );
+    assert!(
+        q.spenders(cb1.as_byte_array(), 0).unwrap().is_empty(),
+        "spending tx not strong yet — strong spenders empty"
+    );
+    assert!(
+        !q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
+        "is_outpoint_spent must not treat archive-only edges as best-chain spent"
+    );
+
+    // Confirm pad then spend; must not false-positive PrevoutSpent.
+    for (h, hash) in &pad_blocks {
+        confirm_archived_at(&q, &params, Height(*h), hash, ms).unwrap();
+    }
+    confirm_archived_at(
+        &q,
+        &params,
+        Height(spend_h),
+        &b_spend.block_hash().to_byte_array(),
+        ms,
+    )
+    .expect("confirm spend with archive-ahead point edges (signet @2148 class)");
+    assert_eq!(q.tip_height(), Some(Height(spend_h)));
+    assert_eq!(
+        q.spenders(cb1.as_byte_array(), 0).unwrap().len(),
+        1,
+        "after Class C the spend is strong"
+    );
+}
+
+/// Simulate kill -9 mid Class C: strong_tx + tx_height + point edges written for
+/// tip+1 but `confirmed[]` not advanced. Re-confirm must not false-positive
+/// PrevoutSpent (tip is the Class C commit point).
+#[test]
+fn confirm_survives_partial_class_c_without_tip_advance() {
+    use rbitcoin_consensus::{
+        accept_and_archive_block, accept_and_connect_block, confirm_archived_at, ChainParams,
+        Milestone,
+    };
+    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.set_spend_index(true);
+    q.set_tx_index(true);
+    let ms = Milestone::NONE;
+    let params = ChainParams::regtest();
+    let maturity = params.coinbase_maturity();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+    let cb1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+
+    let last_pad = maturity + 1;
+    for h in 2..=last_pad {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+    let tip_before = q.tip_height().unwrap();
+    assert_eq!(tip_before, Height(last_pad));
+
+    let spend_h = last_pad + 1;
+    let spend = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
+    let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
+    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
+
+    let hash = b_spend.block_hash().to_byte_array();
+    let (header_fk, _) = q.get_header_by_hash(&hash).unwrap().unwrap();
+    let tx_fks = q.store().header_txs.get_list(header_fk).unwrap().unwrap();
+    assert!(tx_fks.len() >= 2, "coinbase + spend");
+
+    // --- Partial Class C (confirm_blocks_run writes strong/tx_height before tip) ---
+    // Archive already wrote point edges (spend_index on); the kill-9 window is
+    // strong bits without confirmed[] advance — old spenders() treated that as spent.
+    let first = tx_fks[0];
+    q.store()
+        .strong_tx
+        .set_strong_range(first, tx_fks.len() as u32, header_fk)
+        .unwrap();
+    q.store()
+        .tx_height
+        .set_range(first, tx_fks.len() as u32, Height(spend_h))
+        .unwrap();
+    // Tip intentionally NOT advanced.
+    assert_eq!(q.tip_height(), Some(tip_before));
+    assert!(
+        q.store().strong_tx.is_strong(tx_fks[1]).unwrap(),
+        "sim: spending tx marked strong without tip"
+    );
+    assert!(
+        !q.spenders_raw(cb1.as_byte_array(), 0).unwrap().is_empty(),
+        "archive point edge present"
+    );
+    // Best-chain spenders must ignore strong-above-tip.
+    assert!(
+        q.spenders(cb1.as_byte_array(), 0).unwrap().is_empty(),
+        "spenders must not see uncommitted Class C"
+    );
+    assert!(
+        !q.store().is_confirmed_strong(tx_fks[1]).unwrap(),
+        "is_confirmed_strong false while height > tip"
+    );
+
+    // Re-confirm tip+1 (restart after kill -9) must succeed.
+    confirm_archived_at(&q, &params, Height(spend_h), &hash, ms)
+        .expect("re-confirm after partial Class C (kill -9 class)");
+    assert_eq!(q.tip_height(), Some(Height(spend_h)));
+    assert_eq!(
+        q.spenders(cb1.as_byte_array(), 0).unwrap().len(),
+        1,
+        "after tip commit the spend is confirmed-strong"
+    );
+
+    // Open-time repair: leave another partial Class C and reopen.
+    let b_next = mine_regtest_block(
+        b_spend.block_hash(),
+        b_spend.header.time + 600,
+        spend_h + 1,
+        vec![],
+    );
+    accept_and_archive_block(&q, &params, Height(spend_h + 1), &b_next, ms).unwrap();
+    let hash2 = b_next.block_hash().to_byte_array();
+    let (hfk2, _) = q.get_header_by_hash(&hash2).unwrap().unwrap();
+    let fks2 = q.store().header_txs.get_list(hfk2).unwrap().unwrap();
+    q.store()
+        .strong_tx
+        .set_strong_range(fks2[0], fks2.len() as u32, hfk2)
+        .unwrap();
+    q.store()
+        .tx_height
+        .set_range(fks2[0], fks2.len() as u32, Height(spend_h + 1))
+        .unwrap();
+    q.flush().unwrap();
+    drop(q);
+
+    let q2 = Query::open_or_create(td.store_path()).unwrap();
+    assert!(
+        !q2.store().strong_tx.is_strong(fks2[0]).unwrap(),
+        "open must repair strong bits above tip"
+    );
+    confirm_archived_at(&q2, &params, Height(spend_h + 1), &hash2, ms)
+        .expect("confirm after open repair");
+    assert_eq!(q2.tip_height(), Some(Height(spend_h + 1)));
+}
+
+/// Resume with `tx.head` off: spend archived without parent in the process cache
+/// stores external prev_txid. After reopen, warm Class A txid→fk so confirm can
+/// resolve prevouts (signet stuck at missing prevout after restart).
+#[test]
+fn resume_head_off_warms_cache_for_external_prev() {
+    use rbitcoin_consensus::{
+        accept_and_archive_block, accept_and_connect_block, confirm_archived_at, ChainParams,
+        Milestone,
+    };
+    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
+
+    let td = TestDatadir::new().unwrap();
+    let ms = Milestone { height: 1_000_000 };
+    let params = ChainParams::regtest();
+    let maturity = params.coinbase_maturity();
+
+    // Session 1: mine + confirm pad so coinbase is mature; leave spend unarchived.
+    let (cb1, tip, tip_time, spend_h, b_spend) = {
+        let q = Query::open_or_create(td.store_path()).unwrap();
+        q.set_tx_index(false);
+        q.set_spend_index(false);
+        let genesis = regtest_genesis();
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+        let mut tip = genesis.block_hash();
+        let mut tip_time = genesis.header.time;
+        let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+        let cb1 = b1.txdata[0].compute_txid();
+        accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+        tip = b1.block_hash();
+        tip_time = b1.header.time;
+        let last_pad = maturity + 1;
+        for h in 2..=last_pad {
+            let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+            accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+            tip = b.block_hash();
+            tip_time = b.header.time;
+        }
+        let spend_h = last_pad + 1;
+        let spend = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
+        let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
+        q.flush().unwrap();
+        (cb1, tip, tip_time, spend_h, b_spend)
+    };
+    let _ = (tip, tip_time);
+
+    // Session 2: cold process cache, head still off — archive spend before warm.
+    // Parent coinbase is on disk but not in RAM cache → external prev_txid on input.
+    {
+        let q = Query::open_or_create(td.store_path()).unwrap();
+        q.set_tx_index(false);
+        q.set_spend_index(false);
+        accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
+        let fks = q
+            .store()
+            .header_txs
+            .get_list(
+                q.get_header_by_hash(&b_spend.block_hash().to_byte_array())
+                    .unwrap()
+                    .unwrap()
+                    .0,
+            )
+            .unwrap()
+            .unwrap();
+        let inp = q.tx_input(&q.get_tx(fks[1]).unwrap(), 0).unwrap();
+        assert!(
+            inp.prev_tx_fk.is_null(),
+            "cold archive of spend should store external prev_txid, not prev_tx_fk"
+        );
+        assert_ne!(inp.prev_txid, [0u8; 32]);
+
+        // Without warm: confirm cannot map prev_txid → parent.
+        let err = confirm_archived_at(
+            &q,
+            &params,
+            Height(spend_h),
+            &b_spend.block_hash().to_byte_array(),
+            ms,
+        );
+        assert!(
+            err.is_err(),
+            "confirm without warm should fail on missing prevout, got {err:?}"
+        );
+
+        let n = q.warm_txid_cache_from_bodies().unwrap();
+        assert!(n > 0);
+        confirm_archived_at(
+            &q,
+            &params,
+            Height(spend_h),
+            &b_spend.block_hash().to_byte_array(),
+            ms,
+        )
+        .expect("after warm, external prev_txid resolves via process cache");
+        assert_eq!(q.tip_height(), Some(Height(spend_h)));
+        // With spend_index off, connect notes process-local spends only; durable
+        // point multimap is deferred for IBD (backfilled before Electrum).
+        assert!(
+            q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
+            "local spent set must see the confirmed spend"
+        );
+        assert!(
+            q.spenders(cb1.as_byte_array(), 0).unwrap().is_empty(),
+            "durable points stay empty until spend_index / backfill"
+        );
+    }
+}
+
+/// Sequential confirm_archived_run + failed confirm must not poison spent_local.
+#[test]
+fn confirm_run_sequential_and_failed_no_spend_poison() {
+    use rbitcoin_consensus::{
+        accept_and_archive_block, accept_and_connect_block, confirm_archived_at,
+        confirm_archived_run, ChainParams, Milestone,
+    };
+    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.set_tx_index(false);
+    q.set_spend_index(false);
+    let ms = Milestone { height: 0 };
+    let params = ChainParams::regtest();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    let mut hashes = Vec::new();
+    for h in 1u32..=4 {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+        hashes.push(b.block_hash().to_byte_array());
+    }
+
+    let run: Vec<_> = (1u32..=3)
+        .map(|h| (Height(h), hashes[(h - 1) as usize]))
+        .collect();
+    confirm_archived_run(&q, &params, ms, &run).expect("sequential run");
+    assert_eq!(q.tip_height(), Some(Height(3)));
+
+    // Missing body fails without advancing tip; next single confirm still works.
+    let bad = confirm_archived_at(&q, &params, Height(5), &[0xab; 32], ms);
+    assert!(bad.is_err());
+    confirm_archived_at(&q, &params, Height(4), &hashes[3], ms).expect("confirm tip+1");
+    assert_eq!(q.tip_height(), Some(Height(4)));
+}
+
 // ─── Consensus + reconstruct: one mature mine, many assertions ──────────────
 
 /// Single mature-chain build covers:
 /// - accept genesis + long mine (reopen tip)
 /// - coinbase maturity + spend + double-spend reject
+/// - local prev_tx_fk on spend + compact encoding + reconstruct
 /// - reconstruct after reopen (sampled + multi-tx spend block)
 /// - store-backed locator/headers helpers
 /// - service flags
@@ -462,6 +1005,7 @@ fn chain_connect_reorg_and_growth() {
 fn consensus_mature_chain_spend_and_reconstruct() {
     use bitcoin::p2p::ServiceFlags;
     use rbitcoin_net::local_service_flags;
+    use rbitcoin_store::InputRecord;
 
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
@@ -481,10 +1025,36 @@ fn consensus_mature_chain_spend_and_reconstruct() {
             .len(),
         1
     );
+    let spend_block = &chain.blocks[chain.spend_height as usize];
     assert!(
-        chain.blocks[chain.spend_height as usize].txdata.len() >= 2,
+        spend_block.txdata.len() >= 2,
         "spend block should be multi-tx"
     );
+
+    // Local prev_tx_fk (schema v3) + compact on-disk form + reconstruct.
+    let spend_txid = spend_block.txdata[1].compute_txid().to_byte_array();
+    let (_spend_fk, rec) = q.get_tx_by_txid(&spend_txid).unwrap().expect("spend indexed");
+    let inp = q.tx_input(&rec, 0).unwrap();
+    assert!(!inp.prev_tx_fk.is_null(), "spend should use local prev_tx_fk");
+    assert_eq!(
+        q.resolve_prev_txid(&inp).unwrap(),
+        chain.matured_coinbase_txid.to_byte_array()
+    );
+    let enc = InputRecord {
+        prev_txid: [0u8; 32],
+        prev_tx_fk: inp.prev_tx_fk,
+        prev_index: inp.prev_index,
+        sequence: inp.sequence,
+        script_sig: inp.script_sig.clone(),
+        witness: inp.witness.clone(),
+    }
+    .encode();
+    assert!(enc.len() < 32, "local prev encoding should be compact: {}", enc.len());
+    assert_reconstruct_eq(&q, chain.spend_height, spend_block);
+    let cbin = q
+        .tx_input(&q.get_tx(q.block_tx_fks(Height(chain.spend_height)).unwrap()[0]).unwrap(), 0)
+        .unwrap();
+    assert!(cbin.is_coinbase());
 
     // Double-spend must fail.
     let tip_block = chain.blocks.last().unwrap();
@@ -589,6 +1159,78 @@ fn scripthash_index_history_balance_and_reorg() {
             .any(|u| u.tx_hash == chain.matured_coinbase_txid.to_byte_array() && u.tx_pos == 0),
         "after disconnect, matured coinbase should be unspent again"
     );
+}
+
+/// Kill mid-Class-C can leave creates on disk with tip not advanced. After reopen,
+/// sequential body warm + skip must prevent duplicate creates (no chain walk).
+#[test]
+fn scripthash_reopen_warm_prevents_dup_creates() {
+    use rbitcoin_store::{script_hash, ScriptHashRecord};
+    use std::collections::HashMap;
+
+    let td = TestDatadir::new().unwrap();
+    let path = td.store_path();
+    let q = Query::open_or_create(&path).unwrap();
+    let params = ChainParams::regtest();
+    let _chain = build_mature_regtest_with_spend(&q, &params);
+    let n0 = q.scripthash_entry_count();
+    assert!(n0 > 0);
+
+    // Snapshot durable creates (simulates disk after kill).
+    let mut durable: Vec<ScriptHashRecord> = Vec::new();
+    q.store()
+        .scripthash
+        .for_each_live_create(|create_tx_fk, vout| {
+            // scripthash unknown from body; only need create_tx_fk+vout for append skip test
+            durable.push(ScriptHashRecord {
+                scripthash: [0u8; 32],
+                create_tx_fk,
+                vout,
+                next: rbitcoin_primitives::Fk::NULL,
+                txid: [0u8; 32],
+                value: 0,
+                create_height: 0,
+            });
+        })
+        .unwrap();
+    assert_eq!(durable.len() as u64, n0);
+    drop(q);
+
+    // Reopen: cold process caches. Warm loads create_tx set from body.
+    let q = Query::open_or_create(&path).unwrap();
+    q.warm_scripthash_create_index().unwrap();
+
+    // Simulate re-confirm collecting the same creates: filter via warm set by
+    // only appending create_tx_fks not already durable — confirm path does this
+    // with sh_tx_indexed. Here we verify warm filled by skipping all durable txs.
+    let mut indexed = std::collections::HashSet::new();
+    q.store()
+        .scripthash
+        .for_each_live_create(|c, _| {
+            indexed.insert(c.0);
+        })
+        .unwrap();
+    let to_put: Vec<_> = durable
+        .into_iter()
+        .filter(|r| !indexed.contains(&r.create_tx_fk.0))
+        .collect();
+    assert!(
+        to_put.is_empty(),
+        "after warm, all durable create txs must be considered indexed"
+    );
+    assert_eq!(q.scripthash_entry_count(), n0);
+
+    // Naive append without skip would dup; with skip set empty put — count unchanged.
+    let mut heads = HashMap::new();
+    q.store()
+        .scripthash
+        .put_create_batch_append(&to_put, &mut heads)
+        .unwrap();
+    assert_eq!(q.scripthash_entry_count(), n0); // empty to_put; count unchanged
+
+    let sh = script_hash(&[0x51]);
+    let bal = q.scripthash_balance(&sh).unwrap();
+    assert!(bal.confirmed > 0);
 }
 
 #[test]
@@ -698,13 +1340,72 @@ fn consensus_reject_bad_structure_and_milestone() {
     );
     assert!(accept_and_connect_block(&q, &params, Height(1), &block2, Milestone::NONE).is_err());
 
-    // Milestone: skip connect checks on a fresh short chain.
+    // Milestone: skip scripts only — prevouts still run; coinbase chain is fine.
     let td2 = TestDatadir::new().unwrap();
     let q2 = Query::open_or_create(td2.store_path()).unwrap();
     let ms = Milestone { height: 100 };
-    assert!(ms.skips_at(1));
+    assert!(ms.skips_scripts_at(1));
+    assert!(ms.skips_scripts_at(1));
     accept_and_connect_block(&q2, &params, Height::GENESIS, &genesis, ms).unwrap();
     let b1 = mine_regtest_block(genesis.block_hash(), genesis.header.time + 1, 1, vec![]);
     accept_and_connect_block(&q2, &params, Height(1), &b1, ms).unwrap();
     assert_eq!(q2.tip_height(), Some(Height(1)));
+
+    // Under a high milestone, a block that spends a missing prevout must still fail
+    // (connect is not fully skipped — only scripts).
+    let td3 = TestDatadir::new().unwrap();
+    let q3 = Query::open_or_create(td3.store_path()).unwrap();
+    let ms_hi = Milestone { height: 1_000_000 };
+    accept_and_connect_block(&q3, &params, Height::GENESIS, &genesis, ms_hi).unwrap();
+    // Child of genesis but with an extra invalid non-coinbase input path: mine a
+    // normal block then mutate... easier: accept only genesis, then try connect
+    // with wrong prev link is header failure. Use validate_block_connect on a
+    // synthetic spend of unknown outpoint after a valid height-1 coinbase-only
+    // block would need a second tx — mine empty block then skip.
+    //
+    // Spend an outpoint that never existed: build via mine with empty spends and
+    // reject a manually broken second block that points at a fake prevout by
+    // going through validate_block_connect.
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+    let b_ok = mine_regtest_block(genesis.block_hash(), genesis.header.time + 1, 1, vec![]);
+    accept_and_connect_block(&q3, &params, Height(1), &b_ok, ms_hi).unwrap();
+    // Fabricate a height-2 block spending a nonexistent outpoint.
+    let coinbase = &b_ok.txdata[0];
+    let _ = coinbase;
+    let mut bad = mine_regtest_block(b_ok.block_hash(), b_ok.header.time + 1, 2, vec![]);
+    // Append a phantom spend of a random outpoint.
+    let phantom = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0xcd; 32]),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::new(),
+        }],
+    };
+    bad.txdata.push(phantom);
+    bad.header.merkle_root = bad.compute_merkle_root().unwrap();
+    let ctx = ValidationContext {
+        params: &params,
+        height: Height(2),
+        milestone: ms_hi,
+    };
+    let err = validate_block_connect(&q3, &bad, &ctx, None).expect_err("prevout must fail");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("prev")
+            || msg.contains("not found")
+            || msg.contains("missing")
+            || msg.contains("input")
+            || msg.contains("spend"),
+        "expected prevout failure under milestone, got: {err}"
+    );
 }

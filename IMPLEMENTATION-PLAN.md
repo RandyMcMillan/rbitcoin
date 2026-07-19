@@ -25,79 +25,55 @@ A production Bitcoin full node in Rust that:
 
 ---
 
-## 0. Code audit (2026-07-14, post Phase 3)
+## 0. Code status (2026-07-16, post parallel-IBD refactor)
 
-### 0.1 Inventory
+Living snapshot. Older Phase-3 gap tables are historical; see phase checklists below for what shipped.
+
+### 0.1 Inventory (approx)
 
 | Item | Value |
 |------|--------|
-| Workspace | 10 crates; mempool/wallet **removed** |
-| Production-ish LOC | ~3.6k (excluding `rbitcoin-test`) |
-| Tests | ~650 lines scenarios + multi-node; HTML uncovered-line = 0 gate |
-| HEAD (at audit) | Phase 0–3 landed; plan rewrite uncommitted vs `501794b` |
+| Workspace | store, query, consensus, net, node, electrum, wire-cache, rpc (stub), cli, test, log, primitives |
+| Hot path | Parallel multi-peer IBD: archive-before-confirm, dedicated confirm + archive writer threads |
+| Net IBD layout | `rbitcoin-net/src/ibd/` modularized (peer_io, archive, dial, confirm, state, assign_plan, …) |
+| Query layout | `archive` / `connect` / `reconstruct` / `chain_view` / `scripthash` submodules |
+| Tests | Unit + scenarios + multi-node integration; signet lab operator path |
 
-| Crate | LOC (approx) | Role today |
-|-------|--------------|------------|
-| `rbitcoin-store` | ~1.4k | mmap tables, growable heads/var, Class A/B/C chain tables |
-| `rbitcoin-query` | ~230 | `connect_block` / `disconnect_tip`, tip/header/tx accessors |
-| `rbitcoin-consensus` | ~530 | regtest-grade accept path + `block_to_apply` (stores full witness raw) |
-| `rbitcoin-net` | ~680 | regtest multi-node P2P; RAM `BlockCache`; single-peer `sync_from` |
-| `rbitcoin-node` | ~240 | open store + CLI smoke; **no** long-running P2P loop |
-| `rbitcoin-wire-cache` | ~30 | `WireRing` depth placeholder only |
-| `rbitcoin-rpc` | ~12 | stub |
-| `rbitcoin-cli` / `primitives` / `test` | remainder | CLI, types, mine helpers, scenarios |
+| Crate | Role today |
+|-------|------------|
+| `rbitcoin-store` | mmap Class A/B/C tables, epoch finalize |
+| `rbitcoin-query` | Domain API: archive mega-batch, confirm, reconstruct, Electrum joins |
+| `rbitcoin-consensus` | Structure/header/connect; milestone = **scripts only** |
+| `rbitcoin-net` | P2P handshake, parallel IBD, split-stream peer serve/tip, seeds/addrman |
+| `rbitcoin-node` | Long-running node: IBD → tip follow, Electrum optional, cooperative SIGINT |
+| `rbitcoin-electrum` | In-process Electrum TCP server |
+| `rbitcoin-wire-cache` | Tip wire ring (soft zone) |
+| `rbitcoin-rpc` | Minimal stub (ops later) |
 
-### 0.2 What works (verified in code)
+### 0.2 What works
 
-**Store / query**
+- Parallel IBD with windowed getdata, per-peer 16, archive lead vs tip confirm
+- Store-backed reconstruct for getdata / Electrum after restart
+- DNS/fixed seeds, multi-peer dial/redial, stall disconnect + cooldown
+- Milestone assumevalid-style: **prevouts always**, scripts skipped ≤ height
+- Split-stream peer IO (IBD download peers + post-IBD `peer_session`)
+- Signet lab path documented in [`OPERATOR.md`](./OPERATOR.md)
 
-- Datadir mmap files: headers, tx/in/out, point multimap, `confirmed`, `strong_tx`, `block_txs` ([`SCHEMA.md`](./SCHEMA.md)).
-- Growable hash heads (rehash) and var body+idx tables.
-- `Query::connect_block` / `disconnect_tip`: tip-only linear connect; Class A/B rows remain on disconnect; strong filter for UTXO-style `spenders`.
-- `TxRecord.raw` is full `consensus_encode` of the transaction (**includes witness**) via `block_to_apply` — **prerequisite for reconstruct is already on the write path**.
+### 0.3 Remaining gaps (honest)
 
-**Consensus (regtest-grade)**
+| ID | Gap | Severity |
+|----|-----|----------|
+| G7 | Mainnet consensus parity (retarget edge cases, full policy) | experimental mainnet |
+| G13 | Electrum tx broadcast / mempool product | deferred |
+| G16 | Full node JSON-RPC surface | stub |
+| — | Production-hardening, adversarial P2P, long soak | ongoing |
 
-- Structure: non-empty, coinbase first, weight ≤ 4M WU, merkle root, duplicate txids, BIP34 height.
-- Header: prev link on confirmed chain, empty checkpoint list hook, PoW vs `pow_limit` (not retarget).
-- Connect: prevouts exist, strong-spend double-spend check, value in≥out, scripts via `bitcoinconsensus` (OP_TRUE skipped for fixtures).
-- Milestone can skip connect validation for fast IBD later.
+Concurrency write roles: [`docs/concurrency.md`](./docs/concurrency.md).
 
-**Net (regtest)**
+### 0.4 Consensus completeness (mainnet)
 
-- Handshake: `ServiceFlags::NETWORK` only, `relay: false`, `PROTOCOL_VERSION` = **70001** (rust-bitcoin constant).
-- Serve: getheaders/getdata/ping from **in-RAM** `BlockCache` only; silently drop tx inv/mempool.
-- Outbound: single-peer `sync_from` (getheaders → getdata WitnessBlock → `accept_and_connect_block` + cache).
-- Integration: 2-node sync, 3-node hop serve (while process still holds RAM cache); optional ignored mesh.
+Core structure/connect/scripts path exists; treat public mainnet as **experimental** until retarget/MTP/subsidy parity is operator-validated. Historical checklist:
 
-**Node**
-
-- `run_node`: ensure datadir, open `Query`, construct empty `WireRing` — process exits after smoke.
-
-### 0.3 Gaps vs product goal
-
-Legend: **blocker** for that product face.
-
-| ID | Gap | Perform IBD | Serve IBD | Tip | Electrum |
-|----|-----|-------------|-----------|-----|----------|
-| G1 | No `reconstruct_block` / store-backed getdata | — | **blocker** | — | **blocker** (tx get, merkle) |
-| G2 | Serve path uses **only** RAM `BlockCache`; not reloaded from store | — | **blocker** after restart | — | — |
-| G3 | getheaders locator walk not store-backed | — | **blocker** after restart | weak | headers API |
-| G4 | `WITNESS` not in service flags; proto stuck at 70001 | weak | weak | weak | — |
-| G5 | No DNS seeds / fixed seeds / addrman | **blocker** | — | — | — |
-| G6 | No multi-peer concurrent download / most-work header tree | **blocker** | — | **blocker** | — |
-| G7 | Mainnet consensus incomplete (see §0.4) | **blocker** | — | **blocker** | correct history |
-| G8 | No tip inv/headers announce / compact blocks | — | — | **blocker** | header subscribe |
-| G9 | No long-running node binary (P2P + optional Electrum loop) | **blocker** | **blocker** | **blocker** | **blocker** |
-| G10 | No scripthash (scriptPubKey hash) index | — | — | — | **blocker** |
-| G11 | No Electrum TCP/SSL JSON-RPC server | — | — | — | **blocker** |
-| G12 | Tip wire ring not implemented (durable soft zone) | soft recovery | soft zone | soft | — |
-| G13 | No minimal tx broadcast path for Electrum | — | — | — | send UX |
-| G14 | `disconnect_tip` leaves point rows; Electrum must use **strong** semantics | — | — | reorg | history correctness |
-| G15 | Checkpoints empty; no default mainnet milestone set | **blocker** quality | — | — | — |
-| G16 | Node RPC almost absent | ops | ops | ops | optional |
-
-### 0.4 Consensus completeness (mainnet blockers)
 
 Present today vs needed for public-chain accept:
 
@@ -303,7 +279,7 @@ Handshake, getheaders/getdata, BlockCache, 2-/3-node tests + periodic mesh scrip
 | 3 | **Service flags** — `NETWORK\|WITNESS` | ✅ |
 | 4a | **Discovery** — DNS/fixed seed lists + `AddrMan`; multi-peer try list | ✅ foundation |
 | 4b | Concurrent download window, stall/score | ✅ `parallel_ibd` (window 1024, 16/peer, stall reassign) |
-| 5a | **Consensus** — MTP, nBits/retarget, maturity, subsidy, witness commitment, checkpoints | ✅ |
+| 5a | **Consensus** — MTP, nBits/retarget, maturity, subsidy, witness commitment, checkpoints; reject-path coverage in `docs/consensus-tests.md` | ✅ |
 | 6 | **Long-running node** — `run_p2p`, `--listen`/`--connect`/`--smoke` | ✅ |
 | 7 | Public signet IBD lab run | ⬜ ops — see OPERATOR.md (readiness ladder) |
 
@@ -318,7 +294,7 @@ See **§3.1 Consensus gaps** for deployment-window policy (not a separate “5b�
 
 ### 3.1 Consensus gaps (documented; not a Phase 5 dependency)
 
-Policy: **do not implement BIP9 / version-bits “deployment windows” as a separate feature** beyond what is required so each historical block is accepted or rejected under the same rules Core would apply at that height. Prefer height/time-based activation already implied by the chain and `bitcoinconsensus` flags over a full deployment-state machine.
+Policy: **do not implement BIP9 / version-bits “deployment windows” as a separate feature** beyond what is required so each historical block is accepted or rejected under the same rules Core would apply at that height. Prefer height/time-based activation already implied by the chain and script-rule flags over a full deployment-state machine.
 
 | Gap | Risk if missing | Mitigation / when |
 |-----|-----------------|-------------------|
@@ -364,7 +340,7 @@ Policy: **do not implement BIP9 / version-bits “deployment windows” as a sep
 | 3 | Scripthash Class B multimap + connect/disconnect updates | ✅ |
 | 4 | Query: history / balance / listunspent (strong-filtered) | ✅ |
 | 5 | High-level tests (history+reorg, wire+epoch) | ✅ |
-| 6 | Optional full backfill tool / crash soak | ⬜ later |
+| 6 | Optional full backfill tool / crash soak | ❌ SH always-on (no backfill); crash soak later |
 | 7 | Auto wire push on every tip accept in net path | ⬜ polish |
 
 **Exit**
@@ -453,7 +429,7 @@ Policy: **do not implement BIP9 / version-bits “deployment windows” as a sep
 | Tx relay product | Deferred; Electrum broadcast = minimal peer push |
 | Electrum | In-process server; confirmed history first-class |
 | Fee estimation | Stub/config until mempool track |
-| Script backend | bitcoinconsensus for parity; milestone for IBD speed |
+| Script backend | pure Rust in `rbitcoin-consensus::script` (no libbitcoinconsensus); milestone for IBD speed |
 | Indexing | Scripthash always-on (or config flag) like libbitcoin address index |
 
 ---

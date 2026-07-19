@@ -1,6 +1,6 @@
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
-use crate::hashhead::HashHead;
+use crate::sharded_hashhead::ShardedHashHead;
 use rbitcoin_primitives::{Fk, TableKind};
 
 /// Fixed-size header body record (88 bytes). See SCHEMA.md.
@@ -48,24 +48,30 @@ impl HeaderRecord {
 
 pub struct HeaderTable {
     body: TableFile,
-    head: HashHead,
-    count: parking_lot::Mutex<u64>,
+    head: ShardedHashHead,
+    count: std::sync::Mutex<u64>,
 }
 
 impl HeaderTable {
     pub fn create(dir: &std::path::Path) -> Result<Self, StoreError> {
         let body = TableFile::create(dir.join("header.body"), TableKind::Header)?;
-        let head = HashHead::create(dir.join("header.head"))?;
+        let head = ShardedHashHead::create_for_role(
+            dir.join("header.head"),
+            crate::hashhead::HeadRole::Header,
+        )?;
         Ok(Self {
             body,
             head,
-            count: parking_lot::Mutex::new(0),
+            count: std::sync::Mutex::new(0),
         })
     }
 
     pub fn open(dir: &std::path::Path) -> Result<Self, StoreError> {
         let body = TableFile::open(dir.join("header.body"), TableKind::Header)?;
-        let head = HashHead::open(dir.join("header.head"))?;
+        let head = ShardedHashHead::open_for_role(
+            dir.join("header.head"),
+            crate::hashhead::HeadRole::Header,
+        )?;
         let body_len = body.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
         if body_len % HEADER_RECORD_LEN as u64 != 0 {
             return Err(StoreError::Corrupt("header body size"));
@@ -74,13 +80,13 @@ impl HeaderTable {
         Ok(Self {
             body,
             head,
-            count: parking_lot::Mutex::new(count),
+            count: std::sync::Mutex::new(count),
         })
     }
 
     /// Append header and publish into the hash head. Returns new FK.
     pub fn put(&self, rec: &HeaderRecord) -> Result<Fk, StoreError> {
-        let mut count = self.count.lock();
+        let mut count = self.count.lock().unwrap();
         let fk = Fk(*count + 1);
         let offset = FILE_HEADER_LEN as u64 + (*count) * HEADER_RECORD_LEN as u64;
         let bytes = rec.encode();
@@ -94,7 +100,7 @@ impl HeaderTable {
 
     pub fn get(&self, fk: Fk) -> Result<HeaderRecord, StoreError> {
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
-        let count = *self.count.lock();
+        let count = *self.count.lock().unwrap();
         if id == 0 || id > count {
             return Err(StoreError::NotFound);
         }
@@ -109,6 +115,11 @@ impl HeaderTable {
             None => Ok(None),
             Some(fk) => Ok(Some((fk, self.get(fk)?))),
         }
+    }
+
+    /// Number of header rows currently stored (highest fk = this value).
+    pub fn count(&self) -> u64 {
+        *self.count.lock().unwrap()
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {

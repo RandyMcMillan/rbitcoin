@@ -21,13 +21,16 @@ where
     let mut smoke = false;
     let mut listen: Option<SocketAddr> = None;
     let mut electrum_listen: Option<SocketAddr> = None;
+    let mut electrum_tls_listen: Option<SocketAddr> = None;
+    let mut electrum_tls_cert: Option<PathBuf> = None;
+    let mut electrum_tls_key: Option<PathBuf> = None;
     let mut connect: Vec<SocketAddr> = Vec::new();
     let mut use_seeds = true;
     let mut milestone_height = 0u32;
     let mut milestone_set = false;
     let mut max_outbound = 16u32;
     let mut max_run_secs: Option<u64> = None;
-    let mut scripthash_index = true;
+    let mut mempool_size_mb: Option<u64> = None;
     // None = env/default; Some(None) = off; Some(Some(level)) = explicit level.
     let mut log_level_cli: Option<Option<Level>> = None;
 
@@ -36,7 +39,7 @@ where
         match a.as_ref() {
             "--help" | "-h" => {
                 eprintln!(
-                    "rbitcoin-node {} — usage:\n  rbitcoin-node [--datadir PATH] [--network NET] \\\n    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n    [--milestone HEIGHT] [--max-outbound N] [--max-run-secs N] \\\n    [--log-level LEVEL] [--no-scripthash-index] [--no-seeds] [--smoke]\n\nNetworks: mainnet|testnet|signet|regtest\nLog level: error|warn|info|debug|trace (default info; or RBITCOIN_LOG / RUST_LOG).\nMilestone: skip script/prevout at/below HEIGHT (IBD assumevalid-style).\n  Default when omitted: mainnet 840000, signet 2000000, testnet 2500000, regtest 0.\n  Use --milestone 0 for full validation. Disables scripthash index under milestone.\nParallel IBD: tip-ahead window 1024, max 16 blocks in transit per peer (Core-like).",
+                    "rbitcoin-node {} — usage:\n  rbitcoin-node [--datadir PATH] [--network NET] \\\n    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n    [--electrum-tls-listen ADDR --electrum-tls-cert PEM --electrum-tls-key PEM] \\\n    [--milestone HEIGHT] [--max-outbound N] [--mempool-size-mb N] \\\n    [--max-run-secs N] [--log-level LEVEL] [--no-seeds] [--smoke]\n\nNetworks: mainnet|testnet|signet|regtest\nLog level: error|warn|info|debug|trace (default info; or RBITCOIN_LOG / RUST_LOG).\nMilestone: skip script/sig checks at/below HEIGHT (assumevalid-style).\n  Default when omitted: mainnet 840000, signet 2000000, testnet 2500000, regtest 0.\n  Use --milestone 0 for full script validation.\nMempool: --mempool-size-mb sets weight budget (default ~300; eviction by worst chunk).\n  Libre-relay-class: 0.1 sat/vB min, no dust ban, full RBF. See OPERATOR.md.\nElectrum: TCP and/or TLS; banner states libre-relay-class. Memory envs:\n  RBITCOIN_ARCHIVE_QUEUE_MB, RBITCOIN_CLASS_A_CACHE_MB (default 256 each).\nParallel IBD: up to 1024 concurrent block downloads, max 16 in transit per peer.",
                     env!("CARGO_PKG_VERSION")
                 );
                 return ExitCode::SUCCESS;
@@ -51,10 +54,6 @@ where
             }
             "--no-seeds" => {
                 use_seeds = false;
-                i += 1;
-            }
-            "--no-scripthash-index" => {
-                scripthash_index = false;
                 i += 1;
             }
             "--datadir" => {
@@ -121,6 +120,58 @@ where
                     Ok(a) => electrum_listen = Some(a),
                     Err(e) => {
                         eprintln!("error: bad --electrum-listen: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--electrum-tls-listen" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --electrum-tls-listen requires a value");
+                    return ExitCode::from(2);
+                }
+                match args[i].to_string_lossy().parse::<SocketAddr>() {
+                    Ok(a) => electrum_tls_listen = Some(a),
+                    Err(e) => {
+                        eprintln!("error: bad --electrum-tls-listen: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1;
+            }
+            "--electrum-tls-cert" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --electrum-tls-cert requires a path");
+                    return ExitCode::from(2);
+                }
+                electrum_tls_cert = Some(PathBuf::from(&args[i]));
+                i += 1;
+            }
+            "--electrum-tls-key" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --electrum-tls-key requires a path");
+                    return ExitCode::from(2);
+                }
+                electrum_tls_key = Some(PathBuf::from(&args[i]));
+                i += 1;
+            }
+            "--mempool-size-mb" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --mempool-size-mb requires a number");
+                    return ExitCode::from(2);
+                }
+                match args[i].to_string_lossy().parse::<u64>() {
+                    Ok(n) if n > 0 => mempool_size_mb = Some(n),
+                    Ok(_) => {
+                        eprintln!("error: --mempool-size-mb must be >= 1");
+                        return ExitCode::from(2);
+                    }
+                    Err(e) => {
+                        eprintln!("error: bad --mempool-size-mb: {e}");
                         return ExitCode::from(2);
                     }
                 }
@@ -217,12 +268,21 @@ where
         }
     }
 
+    // 256-way sharded heads need 1k+ FDs; raise soft NOFILE before store open.
+    let (soft, hard) = rbitcoin_store::ensure_nofile_budget();
+    if soft > 0 {
+        rbitcoin_log::debug!("node: RLIMIT_NOFILE soft={soft} hard={hard}");
+    }
+
     let mut config = NodeConfig::default()
         .with_datadir(datadir)
         .with_network(network);
     config.smoke = smoke;
     config.p2p_listen = listen;
     config.electrum_listen = electrum_listen;
+    config.electrum_tls_listen = electrum_tls_listen;
+    config.electrum_tls_cert = electrum_tls_cert;
+    config.electrum_tls_key = electrum_tls_key;
     config.connect = connect;
     config.use_seeds = use_seeds;
     // Network default assumevalid-style milestone unless operator set --milestone.
@@ -232,7 +292,16 @@ where
         default_milestone_height(network)
     };
     config.max_outbound = max_outbound;
-    config.scripthash_index = scripthash_index;
+    // Map MiB → weight units (1 MiB ≈ 1e6 WU for budget purposes).
+    if let Some(mb) = mempool_size_mb {
+        config.mempool_max_weight = mb.saturating_mul(1_000_000);
+    }
+    if config.electrum_tls_listen.is_some()
+        && (config.electrum_tls_cert.is_none() || config.electrum_tls_key.is_none())
+    {
+        eprintln!("error: --electrum-tls-listen requires --electrum-tls-cert and --electrum-tls-key");
+        return ExitCode::from(2);
+    }
     if max_run_secs.is_some() {
         config.max_run_secs = max_run_secs;
     }

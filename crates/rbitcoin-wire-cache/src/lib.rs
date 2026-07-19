@@ -3,7 +3,7 @@
 //! Indexed by **block hash** so competing tips and side branches at the same height
 //! are retained until they age out of the recent window (max tip height − depth).
 
-use parking_lot::RwLock;
+use std::sync::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -72,7 +72,7 @@ impl WireRing {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().by_hash.len()
+        self.inner.read().unwrap().by_hash.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -91,7 +91,7 @@ impl WireRing {
         is_tip: bool,
     ) -> std::io::Result<()> {
         {
-            let mut g = self.inner.write();
+            let mut g = self.inner.write().unwrap();
             g.by_hash.insert(
                 hash,
                 WireEntry {
@@ -137,18 +137,18 @@ impl WireRing {
 
     /// Register a candidate tip hash already present (or about to be pushed).
     pub fn mark_tip(&self, hash: [u8; 32]) {
-        let mut g = self.inner.write();
+        let mut g = self.inner.write().unwrap();
         g.tips.insert(hash);
     }
 
     /// Clear tip marker (e.g. after reorg abandoned a branch tip). Entry remains until aged out.
     pub fn unmark_tip(&self, hash: &[u8; 32]) {
-        self.inner.write().tips.remove(hash);
+        self.inner.write().unwrap().tips.remove(hash);
     }
 
     /// Drop all entries with height ≤ `height` (archive finalize). Affects every branch.
     pub fn drop_through(&self, height: u32) -> std::io::Result<()> {
-        let mut g = self.inner.write();
+        let mut g = self.inner.write().unwrap();
         let remove: Vec<[u8; 32]> = g
             .by_hash
             .iter()
@@ -169,20 +169,20 @@ impl WireRing {
 
     pub fn get_by_hash(&self, hash: &[u8; 32]) -> Option<Vec<u8>> {
         self.inner
-            .read()
+            .read().unwrap()
             .by_hash
             .get(hash)
             .map(|e| e.wire.clone())
     }
 
     pub fn entry(&self, hash: &[u8; 32]) -> Option<WireEntry> {
-        self.inner.read().by_hash.get(hash).cloned()
+        self.inner.read().unwrap().by_hash.get(hash).cloned()
     }
 
     /// All wire blocks at a given height (forks / competing tips).
     pub fn get_all_at_height(&self, height: u32) -> Vec<WireEntry> {
         self.inner
-            .read()
+            .read().unwrap()
             .by_hash
             .values()
             .filter(|e| e.height == height)
@@ -192,7 +192,7 @@ impl WireRing {
 
     /// Best-effort single block at height (prefer marked tip if unique at that height).
     pub fn get_by_height(&self, height: u32) -> Option<Vec<u8>> {
-        let g = self.inner.read();
+        let g = self.inner.read().unwrap();
         let at: Vec<_> = g.by_hash.values().filter(|e| e.height == height).collect();
         if at.is_empty() {
             return None;
@@ -210,12 +210,12 @@ impl WireRing {
     }
 
     pub fn contains_hash(&self, hash: &[u8; 32]) -> bool {
-        self.inner.read().by_hash.contains_key(hash)
+        self.inner.read().unwrap().by_hash.contains_key(hash)
     }
 
     pub fn contains_height(&self, height: u32) -> bool {
         self.inner
-            .read()
+            .read().unwrap()
             .by_hash
             .values()
             .any(|e| e.height == height)
@@ -223,26 +223,26 @@ impl WireRing {
 
     /// Hashes currently marked as tips (candidates).
     pub fn tip_hashes(&self) -> Vec<[u8; 32]> {
-        self.inner.read().tips.iter().copied().collect()
+        self.inner.read().unwrap().tips.iter().copied().collect()
     }
 
     pub fn max_height(&self) -> u32 {
-        self.inner.read().max_height
+        self.inner.read().unwrap().max_height
     }
 
     /// Lowest height retained given current max height and depth.
     pub fn window_floor(&self) -> u32 {
-        let g = self.inner.read();
+        let g = self.inner.read().unwrap();
         window_floor(g.max_height, self.depth)
     }
 
     fn evict_old(&self) -> std::io::Result<()> {
         if self.depth == 0 {
-            let max = self.inner.read().max_height;
+            let max = self.inner.read().unwrap().max_height;
             return self.drop_through(max);
         }
         let floor = {
-            let g = self.inner.read();
+            let g = self.inner.read().unwrap();
             window_floor(g.max_height, self.depth)
         };
         if floor == 0 {
@@ -259,7 +259,7 @@ impl WireRing {
         let Some(dir) = self.dir.clone() else {
             return Ok(());
         };
-        let mut g = self.inner.write();
+        let mut g = self.inner.write().unwrap();
         for ent in fs::read_dir(&dir)? {
             let ent = ent?;
             let name = ent.file_name();
@@ -322,5 +322,5 @@ fn window_floor(max_height: u32, depth: u32) -> u32 {
 }
 
 fn wire_path(dir: &Path, hash: &[u8; 32]) -> PathBuf {
-    dir.join(format!("{}.bin", hex::encode(hash)))
+    dir.join(format!("{}.bin", rbitcoin_primitives::hex_encode(hash)))
 }

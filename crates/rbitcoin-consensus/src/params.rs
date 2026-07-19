@@ -1,6 +1,7 @@
 use bitcoin::blockdata::constants;
 use bitcoin::consensus::Params as BtcParams;
 use bitcoin::hashes::Hash;
+use bitcoin::script::ScriptBuf;
 use bitcoin::{BlockHash, CompactTarget, Network, Target};
 use rbitcoin_primitives::Height;
 
@@ -13,6 +14,8 @@ pub struct ChainParams {
     pub checkpoints: Vec<Checkpoint>,
     /// rust-bitcoin consensus params (retarget spacing, no_pow_retargeting, …).
     pub btc: BtcParams,
+    /// BIP325 signet challenge script (`None` = not a signet).
+    pub signet_challenge: Option<ScriptBuf>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +42,7 @@ impl ChainParams {
             pow_limit: Target::MAX_ATTAINABLE_REGTEST,
             checkpoints: vec![],
             btc: BtcParams::new(Network::Regtest),
+            signet_challenge: None,
         }
     }
 
@@ -50,6 +54,7 @@ impl ChainParams {
             pow_limit: Target::MAX_ATTAINABLE_MAINNET,
             checkpoints: mainnet_checkpoints(genesis.block_hash()),
             btc: BtcParams::new(Network::Bitcoin),
+            signet_challenge: None,
         }
     }
 
@@ -61,6 +66,7 @@ impl ChainParams {
             pow_limit: Target::MAX_ATTAINABLE_TESTNET,
             checkpoints: vec![],
             btc: BtcParams::new(Network::Testnet),
+            signet_challenge: None,
         }
     }
 
@@ -72,6 +78,7 @@ impl ChainParams {
             pow_limit: Target::MAX_ATTAINABLE_SIGNET,
             checkpoints: vec![],
             btc: BtcParams::new(Network::Signet),
+            signet_challenge: Some(crate::signet::default_signet_challenge()),
         }
     }
 
@@ -98,6 +105,80 @@ impl ChainParams {
     pub fn coinbase_maturity(&self) -> u32 {
         100
     }
+
+    /// BIP34 coinbase-height push required at this height?
+    #[inline]
+    pub fn bip34_active_at(&self, height: u32) -> bool {
+        height >= self.btc.bip34_height
+    }
+
+    /// BIP65 CLTV active?
+    #[inline]
+    pub fn bip65_active_at(&self, height: u32) -> bool {
+        height >= self.btc.bip65_height
+    }
+
+    /// BIP66 strict DER encoding required?
+    #[inline]
+    pub fn bip66_active_at(&self, height: u32) -> bool {
+        height >= self.btc.bip66_height
+    }
+
+    /// BIP112 CHECKSEQUENCEVERIFY active?
+    ///
+    /// Buried CSV package heights (Core `DeploymentPos::DEPLOYMENT_CSV`):
+    /// mainnet 419328, testnet3 770112, signet/regtest 1 (signet) / 432 (regtest historical).
+    /// We pin Core's buried values; regtest uses 1 so our tests and local mining
+    /// match modern Core regtest defaults for soft-forks.
+    #[inline]
+    pub fn csv_active_at(&self, height: u32) -> bool {
+        height >= self.csv_height()
+    }
+
+    /// Buried height for BIP68/112/113 (CSV package).
+    pub fn csv_height(&self) -> u32 {
+        match self.network {
+            Network::Bitcoin => 419_328,
+            Network::Testnet => 770_112,
+            // Signet / testnet4 / regtest: soft-forks from genesis-adjacent heights.
+            Network::Signet | Network::Testnet4 => 1,
+            // Core regtest CSV height is 432 in some versions; use 1 for always-on
+            // modern regtest soft-forks (matches how we treat BIP34 as optional).
+            Network::Regtest => 1,
+        }
+    }
+
+    /// BIP141/143/147 segwit consensus active?
+    ///
+    /// Buried: mainnet 481824, testnet3 834624, signet 1, regtest 0 (always).
+    #[inline]
+    pub fn segwit_active_at(&self, height: u32) -> bool {
+        height >= self.segwit_height()
+    }
+
+    pub fn segwit_height(&self) -> u32 {
+        match self.network {
+            Network::Bitcoin => 481_824,
+            Network::Testnet => 834_624,
+            Network::Signet | Network::Testnet4 => 1,
+            Network::Regtest => 0,
+        }
+    }
+
+    /// BIP341/342 taproot active? Mainnet buried 709632; signet/regtest 1/0.
+    #[inline]
+    pub fn taproot_active_at(&self, height: u32) -> bool {
+        height >= self.taproot_height()
+    }
+
+    pub fn taproot_height(&self) -> u32 {
+        match self.network {
+            Network::Bitcoin => 709_632,
+            Network::Testnet => 2_400_000, // approximate / not heavily used here
+            Network::Signet | Network::Testnet4 => 1,
+            Network::Regtest => 0,
+        }
+    }
 }
 
 /// Sparse mainnet checkpoints from historical Bitcoin Core `mapCheckpoints`
@@ -106,7 +187,7 @@ impl ChainParams {
 /// checkpoints (Core itself stopped extending this list).
 fn mainnet_checkpoints(genesis: BlockHash) -> Vec<Checkpoint> {
     fn h(hex: &str) -> BlockHash {
-        let bytes = hex::decode(hex).expect("checkpoint hex");
+        let bytes = rbitcoin_primitives::hex_decode(hex).expect("checkpoint hex");
         let arr: [u8; 32] = bytes.try_into().expect("32 bytes");
         // Bitcoin displays hashes internal-byte-order reversed in hex.
         let mut rev = arr;
@@ -173,7 +254,8 @@ fn mainnet_checkpoints(genesis: BlockHash) -> Vec<Checkpoint> {
     ]
 }
 
-/// Default IBD milestone (coarse assumevalid): skip script/prevout at/below height.
+/// Default IBD milestone (coarse assumevalid): skip **script/sig** checks
+/// at/below height. Prevouts, double-spend, maturity, and fees still run.
 ///
 /// `0` means full validation. Operators override with `--milestone HEIGHT`
 /// or disable with `--milestone 0` after CLI applies network defaults.

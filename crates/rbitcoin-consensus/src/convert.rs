@@ -1,13 +1,10 @@
 use crate::error::ConsensusError;
 use bitcoin::block::Header;
-use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use bitcoin::Transaction;
-// Hash trait for Txid/BlockHash byte conversion
 use rbitcoin_primitives::Fk;
 use rbitcoin_query::{Query, TxApply};
 use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
-use rayon::prelude::*;
 
 pub fn header_to_record(prev_fk: Fk, header: &Header) -> HeaderRecord {
     HeaderRecord {
@@ -26,6 +23,23 @@ pub fn block_to_apply(
     header: &Header,
     txs: &[Transaction],
 ) -> Result<(HeaderRecord, Vec<TxApply>), ConsensusError> {
+    let txids: Vec<[u8; 32]> = txs.iter().map(|t| t.compute_txid().to_byte_array()).collect();
+    block_to_apply_with_txids(query, header, txs, &txids)
+}
+
+/// Build archive records using **precomputed** txids (from structure validation).
+///
+/// Avoids a second `compute_txid` pass over every transaction — the hot path for
+/// multi-worker IBD prep on large blocks.
+pub fn block_to_apply_with_txids(
+    query: &Query,
+    header: &Header,
+    txs: &[Transaction],
+    txids: &[[u8; 32]],
+) -> Result<(HeaderRecord, Vec<TxApply>), ConsensusError> {
+    if txs.len() != txids.len() {
+        return Err(ConsensusError::BadBlock("txid count mismatch"));
+    }
     let prev_fk = if header.prev_blockhash.to_byte_array() == [0u8; 32] {
         Fk::NULL
     } else {
@@ -34,47 +48,46 @@ pub fn block_to_apply(
             .map(|(fk, _)| fk)
             .ok_or(ConsensusError::BadPrev)?
     };
-    let header_rec = header_to_record(prev_fk, header);
-    // Parallel encode/hash txs — main multi-core win on large blocks.
-    if txs.len() >= 8 {
-        let out: Result<Vec<TxApply>, ConsensusError> =
-            txs.par_iter().map(|tx| tx_to_apply(tx)).collect();
-        return Ok((header_rec, out?));
+    block_to_apply_with_txids_prev(prev_fk, header, txs, txids)
+}
+
+/// Like [`block_to_apply_with_txids`] but **no store access** — caller supplies
+/// `prev_fk` (use [`Fk::NULL`] on the IBD path where the header row already exists).
+pub fn block_to_apply_with_txids_prev(
+    prev_fk: Fk,
+    header: &Header,
+    txs: &[Transaction],
+    txids: &[[u8; 32]],
+) -> Result<(HeaderRecord, Vec<TxApply>), ConsensusError> {
+    if txs.len() != txids.len() {
+        return Err(ConsensusError::BadBlock("txid count mismatch"));
     }
+    let header_rec = header_to_record(prev_fk, header);
     let mut out = Vec::with_capacity(txs.len());
-    for tx in txs {
-        out.push(tx_to_apply(tx)?);
+    for (tx, txid) in txs.iter().zip(txids.iter()) {
+        out.push(tx_to_apply(tx, *txid)?);
     }
     Ok((header_rec, out))
 }
 
-fn tx_to_apply(tx: &Transaction) -> Result<TxApply, ConsensusError> {
-    let mut raw = Vec::new();
-    tx.consensus_encode(&mut raw)
-        .map_err(|_| ConsensusError::BadTx("encode"))?;
-    let txid = tx.compute_txid().to_byte_array();
-
+fn tx_to_apply(tx: &Transaction, txid: [u8; 32]) -> Result<TxApply, ConsensusError> {
     let inputs: Vec<InputRecord> = tx
         .input
         .iter()
-        .enumerate()
-        .map(|(i, inp)| InputRecord {
-            parent_tx_fk: Fk::NULL,
-            index: i as u32,
+        .map(|inp| InputRecord {
             prev_txid: inp.previous_output.txid.to_byte_array(),
+            prev_tx_fk: Fk::NULL, // resolved to local fk at archive time when possible
             prev_index: inp.previous_output.vout,
             sequence: inp.sequence.to_consensus_u32(),
             script_sig: inp.script_sig.to_bytes(),
+            witness: inp.witness.to_vec(),
         })
         .collect();
 
     let outputs: Vec<OutputRecord> = tx
         .output
         .iter()
-        .enumerate()
-        .map(|(i, o)| OutputRecord {
-            parent_tx_fk: Fk::NULL,
-            index: i as u32,
+        .map(|o| OutputRecord {
             value: o.value.to_sat() as i64,
             script: o.script_pubkey.to_bytes(),
         })
@@ -89,9 +102,41 @@ fn tx_to_apply(tx: &Transaction) -> Result<TxApply, ConsensusError> {
             input_count: inputs.len() as u32,
             output_start_fk: Fk::NULL,
             output_count: outputs.len() as u32,
-            raw,
         },
         inputs,
         outputs,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+    };
+
+    #[test]
+    fn apply_with_precomputed_txid_matches_fresh_hash() {
+        let tx = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x01]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let want = tx.compute_txid().to_byte_array();
+        let apply = tx_to_apply(&tx, want).unwrap();
+        assert_eq!(apply.tx.txid, want);
+        assert_eq!(apply.inputs.len(), 1);
+        assert_eq!(apply.outputs[0].value, 50_0000_0000);
+    }
 }

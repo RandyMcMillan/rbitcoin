@@ -382,7 +382,9 @@ impl P2PNode {
         for t in self.tasks.drain(..) {
             t.abort();
         }
-        let _ = self.hub.query.flush();
+        // Do **not** full-flush here: `run.rs` already calls `flush_for_shutdown`
+        // (or callers that need durability flush explicitly). Double multi‑GiB
+        // msync/fdatasync was a multi-minute host freeze on exit.
     }
 }
 

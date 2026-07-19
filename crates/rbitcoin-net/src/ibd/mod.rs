@@ -446,11 +446,11 @@ pub async fn parallel_ibd_cancellable(
         Arc::clone(&confirm_lag),
     );
 
-    // A.4: background budgeted head-spill (short slices + yield). No-op work
-    // when write-behind is off (milestone catch-up with indexes disabled).
-    let _head_spill_worker = head_spill::HeadSpillWorker::spawn(Arc::clone(&hub.query));
+    // A.4: background budgeted head-spill (quiet threshold + idle IO prio).
+    let mut head_spill_worker =
+        Some(head_spill::HeadSpillWorker::spawn(Arc::clone(&hub.query)));
     info!(
-        "ibd: head spill worker on (chunk≈{}; RBITCOIN_HEAD_SPILL_CHUNK)",
+        "ibd: head spill worker on (chunk≈{}; quiet; RBITCOIN_HEAD_SPILL_CHUNK)",
         rbitcoin_store::spill_chunk_size()
     );
 
@@ -1204,6 +1204,12 @@ pub async fn parallel_ibd_cancellable(
     }
 
     let cancelled_exit = cancelled();
+
+    // Stop head-spill first so it does not compete with teardown flush later.
+    if let Some(w) = head_spill_worker.take() {
+        w.request_stop();
+        drop(w); // join
+    }
 
     // Stop confirm engine first (may be mid-validate).
     confirm_feed.request_stop();

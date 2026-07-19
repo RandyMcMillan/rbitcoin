@@ -187,4 +187,11 @@ impl VarTable {
         self.idx.flush()?;
         Ok(())
     }
+
+    /// HWM + MS_ASYNC (no fdatasync) — host-friendly process exit.
+    pub fn flush_async(&self) -> Result<(), StoreError> {
+        self.body.flush_async()?;
+        self.idx.flush_async()?;
+        Ok(())
+    }
 }

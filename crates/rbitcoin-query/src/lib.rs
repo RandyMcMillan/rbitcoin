@@ -471,6 +471,11 @@ impl Query {
     pub fn spill_heads_step_if_needed(&self) -> Result<(usize, usize), QueryError> {
         self.store.spill_heads_step_if_needed()
     }
+
+    /// Host-friendly process-exit flush (see [`rbitcoin_store::Store::flush_for_shutdown`]).
+    pub fn flush_for_shutdown(&self) -> Result<(), QueryError> {
+        self.store.flush_for_shutdown()
+    }
 }
 
 impl Query {

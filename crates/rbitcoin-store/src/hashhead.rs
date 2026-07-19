@@ -631,6 +631,11 @@ impl HashHead {
         self.spill_write_behind()?;
         self.file.flush()
     }
+
+    pub fn flush_async(&self) -> Result<(), StoreError> {
+        self.spill_write_behind()?;
+        self.file.flush_async()
+    }
 }
 
 /// Chunk-buffered slot RMW for a fixed `slots` generation.

@@ -656,10 +656,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         h.abort();
         let _ = h.await;
     }
-    if let Err(e) = node.hub.query.flush() {
+    // Host-friendly: spill head overlays + fsync tip tables; MS_ASYNC Class A.
+    // Full multi‑GiB fdatasync froze the desktop for 1–2+ minutes on exit.
+    if let Err(e) = node.hub.query.flush_for_shutdown() {
         warn!("node: flush warning: {e}");
     } else {
-        info!("node: store flushed");
+        info!("node: store flushed (shutdown-friendly)");
     }
     if let Err(e) = mempool.flush() {
         warn!("node: mempool flush warning: {e}");

@@ -26,13 +26,11 @@ pub const SHARD_COUNT: usize = 256;
 /// Aggregate spill chatter at DEBUG this often; per-event is TRACE.
 const SPILL_DEBUG_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Default max keys applied to disk per spill step (~100k).
+/// Default max keys applied to disk per spill step (~32k).
 ///
-/// Soft/hard caps used to dump entire excess (0.5–1M+) in one storm and freeze
-/// confirm for minutes. Budgeted chunks interleave with Class A mega-batches and
-/// a background worker so page cache can recover. Override:
-/// `RBITCOIN_HEAD_SPILL_CHUNK`.
-pub const DEFAULT_SPILL_CHUNK: usize = 100_000;
+/// Smaller than early 100k trials: each chunk is a shorter page-cache storm so
+/// the desktop stays interactive under ionice. Override: `RBITCOIN_HEAD_SPILL_CHUNK`.
+pub const DEFAULT_SPILL_CHUNK: usize = 32_000;
 
 /// Resolved spill chunk (env override, min 1k, max 1M).
 pub fn spill_chunk_size() -> usize {
@@ -262,19 +260,39 @@ impl ShardedHashHead {
         Ok(())
     }
 
-    /// Spill **all** pending overlay entries (chunked + short yield between chunks).
+    /// Spill **all** pending overlay entries (chunked + yield between chunks).
     ///
-    /// Used by disable / full flush. Prefer [`Self::spill_write_behind_budget`] on
-    /// the IBD hot path so confirm can interleave page faults.
+    /// Used by disable / process-exit flush. Prefer [`Self::spill_write_behind_budget`]
+    /// on the IBD hot path. Yields longer than 1 ms so host UI can breathe.
     pub fn spill_write_behind(&self) -> Result<(), StoreError> {
         let chunk = spill_chunk_size();
+        let mut total = 0u64;
+        let t0 = Instant::now();
         loop {
             let n = self.spill_write_behind_budget(chunk)?;
             if n == 0 {
                 break;
             }
-            // Yield so confirm can fault Class A pages between chunks.
-            std::thread::sleep(Duration::from_millis(1));
+            total = total.saturating_add(n as u64);
+            // Host-friendly: give the page cache / compositor a turn.
+            std::thread::sleep(Duration::from_millis(10));
+            if total > 0 && total.is_multiple_of(chunk as u64 * 4) {
+                rbitcoin_log::info!(
+                    "store: head spill progress path={} spilled={} remain={} elapsed={:?}",
+                    self.path.display(),
+                    total,
+                    self.write_behind_len(),
+                    t0.elapsed()
+                );
+            }
+        }
+        if total > 0 {
+            rbitcoin_log::info!(
+                "store: head spill done path={} spilled={} elapsed={:?}",
+                self.path.display(),
+                total,
+                t0.elapsed()
+            );
         }
         Ok(())
     }
@@ -434,8 +452,11 @@ impl ShardedHashHead {
         Ok(())
     }
 
-    /// One background / archive-interleave step when the overlay is past soft/2
-    /// (or any pending when not deferred). Returns entries spilled.
+    /// One background / archive-interleave step when the overlay is "full enough".
+    ///
+    /// Quiet policy (host UI): keep a large RAM buffer so we are not constantly
+    /// writing heads. Under confirm (`defer`), only step at/above soft cap.
+    /// Between waves, step only above soft/2 (leave half buffer for locality).
     pub fn spill_write_behind_step_if_needed(&self) -> Result<usize, StoreError> {
         let (len, max, defer) = {
             let guard = self.overlay.lock().unwrap();
@@ -451,10 +472,14 @@ impl ShardedHashHead {
         if len == 0 {
             return Ok(0);
         }
-        // Under confirm: only drain when past soft/2 (keep recent keys in RAM).
-        // Between waves: drain whenever anything is pending.
-        let threshold = if defer { max / 2 } else { 0 };
-        if len <= threshold {
+        // Under confirm: stay quiet until at/above soft cap (hard still in insert_many).
+        // Off-wave: only drain when above half soft — continuous drain-to-zero thrash.
+        let needs = if defer {
+            len >= max
+        } else {
+            len > max / 2
+        };
+        if !needs {
             return Ok(0);
         }
         self.spill_write_behind_budget(spill_chunk_size())
@@ -482,6 +507,15 @@ impl ShardedHashHead {
         self.spill_write_behind()?;
         for s in &self.shards {
             s.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Spill remaining overlay + MS_ASYNC each shard (no fdatasync).
+    pub fn flush_async(&self) -> Result<(), StoreError> {
+        self.spill_write_behind()?;
+        for s in &self.shards {
+            s.flush_async()?;
         }
         Ok(())
     }
@@ -647,15 +681,15 @@ mod tests {
         let h = ShardedHashHead::create_sharded(dir.join("head"), 16, 64).unwrap();
         h.enable_write_behind(200).unwrap();
         h.set_defer_spill(true).unwrap();
-        // Under soft/2 while deferred → no step.
+        // Under soft while deferred → no step.
         let batch: Vec<_> = (0u64..50).map(|i| (key_i(i), Fk(i + 1))).collect();
         h.insert_many(&batch).unwrap();
         assert_eq!(h.spill_write_behind_step_if_needed().unwrap(), 0);
         assert_eq!(h.write_behind_len(), 50);
-        // Past soft/2 while deferred → budgeted step.
-        let more: Vec<_> = (50u64..150).map(|i| (key_i(i), Fk(i + 1))).collect();
+        // At/above soft while deferred → budgeted step.
+        let more: Vec<_> = (50u64..200).map(|i| (key_i(i), Fk(i + 1))).collect();
         h.insert_many(&more).unwrap();
-        assert!(h.write_behind_len() > 100);
+        assert!(h.write_behind_len() >= 200);
         let n = h.spill_write_behind_step_if_needed().unwrap();
         assert!(n > 0);
         let _ = std::fs::remove_dir_all(&dir);

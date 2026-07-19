@@ -170,4 +170,8 @@ impl ArrayTable {
     pub fn flush(&self) -> Result<(), StoreError> {
         self.file.flush()
     }
+
+    pub fn flush_async(&self) -> Result<(), StoreError> {
+        self.file.flush_async()
+    }
 }

@@ -76,6 +76,10 @@ impl ConfirmedTable {
     pub fn flush(&self) -> Result<(), StoreError> {
         self.arr.flush()
     }
+
+    pub fn flush_async(&self) -> Result<(), StoreError> {
+        self.arr.flush_async()
+    }
 }
 
 /// Class C: per-tx create height for coinbase maturity (not a UTXO set).
@@ -178,6 +182,10 @@ impl TxHeightTable {
 
     pub fn flush(&self) -> Result<(), StoreError> {
         self.arr.flush()
+    }
+
+    pub fn flush_async(&self) -> Result<(), StoreError> {
+        self.arr.flush_async()
     }
 }
 
@@ -378,6 +386,10 @@ impl StrongTxTable {
     pub fn flush(&self) -> Result<(), StoreError> {
         self.bits.flush()
     }
+
+    pub fn flush_async(&self) -> Result<(), StoreError> {
+        self.bits.flush_async()
+    }
 }
 
 #[cfg(test)]
@@ -571,6 +583,12 @@ impl HeaderTxsTable {
     pub fn flush(&self) -> Result<(), StoreError> {
         self.first.flush()?;
         self.count.flush()?;
+        Ok(())
+    }
+
+    pub fn flush_async(&self) -> Result<(), StoreError> {
+        self.first.flush_async()?;
+        self.count.flush_async()?;
         Ok(())
     }
 }

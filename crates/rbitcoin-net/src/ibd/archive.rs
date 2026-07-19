@@ -250,6 +250,7 @@ pub(crate) fn spawn_archive_pipeline(
         let writer = std::thread::Builder::new()
             .name("ibd-archive-writer".into())
             .spawn(move || {
+                rbitcoin_store::try_set_io_idle();
                 // Larger mega-batches → more keys per shard per writer cycle
                 // (sharded hash heads group insert_many by key[0]).
                 const MAX_MEGA: usize = 1024;
@@ -393,11 +394,9 @@ pub(crate) fn spawn_archive_pipeline(
                                     return;
                                 }
                             }
-                            // A.1: interleave one budgeted head-spill chunk after each
-                            // Class A mega-batch so overlays drain without multi-min storms.
-                            let chunk = rbitcoin_store::spill_chunk_size();
-                            let _ = write_hub.query.spill_point_head_budget(chunk);
-                            let _ = write_hub.query.spill_tx_head_budget(chunk);
+                            // A.1: only spill when overlay is past quiet threshold
+                            // (soft/2), not every batch — continuous head writes thrash UI.
+                            let _ = write_hub.query.spill_heads_step_if_needed();
                             blocks_since_flush =
                                 blocks_since_flush.saturating_add(n_blocks);
                             if blocks_since_flush >= FLUSH_EVERY_BLOCKS {

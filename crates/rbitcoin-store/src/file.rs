@@ -280,6 +280,40 @@ impl TableFile {
             .map_err(|e| StoreError::io(&self.path, e))?;
         Ok(())
     }
+
+    /// Persist HWM + `msync(MS_ASYNC)` — schedules writeback without waiting.
+    ///
+    /// Prefer this (or HWM-only) on multi‑GiB Class A tables at process exit so the
+    /// host UI is not frozen by multi-minute `MS_SYNC`/`fdatasync` storms.
+    pub fn flush_async(&self) -> Result<(), StoreError> {
+        let logical = *self.len.lock().unwrap();
+        self.persist_logical_len(logical)?;
+        self.map
+            .lock()
+            .unwrap()
+            .flush_async()
+            .map_err(|e| StoreError::io(&self.path, e))?;
+        Ok(())
+    }
+}
+
+/// Best-effort: set calling thread to Linux I/O priority idle (like `ionice -c3`).
+///
+/// No-op on non-Linux or if the syscall fails. Reduces desktop UI freezes when the
+/// process runs as default niceness but still hammers the page cache.
+pub fn try_set_io_idle() {
+    #[cfg(target_os = "linux")]
+    {
+        // IOPRIO_WHO_PROCESS = 1, IOPRIO_CLASS_IDLE = 3, class shift 13.
+        const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+        const IOPRIO_CLASS_IDLE: libc::c_int = 3;
+        let prio = (IOPRIO_CLASS_IDLE << 13) as libc::c_int;
+        // SAFETY: ioprio_set is a Linux syscall; args are integers.
+        let rc = unsafe { libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, prio) };
+        if rc == 0 {
+            rbitcoin_log::debug!("store: set IOPRIO_CLASS_IDLE on thread");
+        }
+    }
 }
 
 /// Soft floor for process open-file limit with 256-way sharded hash heads.

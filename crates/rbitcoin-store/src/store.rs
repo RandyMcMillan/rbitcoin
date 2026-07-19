@@ -448,6 +448,10 @@ impl Store {
         Ok(cleared)
     }
 
+    /// Full durable flush: spill head overlays, `msync(MS_SYNC)` + `fdatasync` every table.
+    ///
+    /// **Host-hostile on multi‑GiB Class A** — use [`Self::flush_for_shutdown`] for
+    /// process exit during IBD.
     pub fn flush(&self) -> Result<(), StoreError> {
         self.headers.flush()?;
         self.txs.flush()?;
@@ -459,6 +463,46 @@ impl Store {
         self.strong_tx.flush()?;
         self.tx_height.flush()?;
         self.header_txs.flush()?;
+        Ok(())
+    }
+
+    /// Host-friendly process-exit flush (IBD / SIGTERM).
+    ///
+    /// 1. Spill remaining `point.head` / `tx.head` write-behind (chunked + logged).
+    /// 2. Fully fsync **small/critical** tip tables (headers, Class C, header_txs).
+    /// 3. `MS_ASYNC` only on multi‑GiB Class A bodies/heads — dirty pages write back
+    ///    as the process exits without multi-minute UI freezes.
+    pub fn flush_for_shutdown(&self) -> Result<(), StoreError> {
+        let t0 = std::time::Instant::now();
+        rbitcoin_log::info!(
+            "store: shutdown flush — spilling head overlays (point pending≈{} tx pending≈{})…",
+            self.points.head_write_behind_len(),
+            self.txs.head_write_behind_len()
+        );
+        self.points.spill_head()?;
+        self.txs.spill_head()?;
+        rbitcoin_log::info!(
+            "store: shutdown flush — fsync tip tables (headers/Class C)… elapsed={:?}",
+            t0.elapsed()
+        );
+        self.headers.flush()?;
+        self.confirmed.flush()?;
+        self.strong_tx.flush()?;
+        self.tx_height.flush()?;
+        self.header_txs.flush()?;
+        rbitcoin_log::info!(
+            "store: shutdown flush — async Class A tables… elapsed={:?}",
+            t0.elapsed()
+        );
+        self.txs.flush_async()?;
+        self.inputs.flush_async()?;
+        self.outputs.flush_async()?;
+        self.points.flush_async()?;
+        self.scripthash.flush_async()?;
+        rbitcoin_log::info!(
+            "store: shutdown flush done elapsed={:?}",
+            t0.elapsed()
+        );
         Ok(())
     }
 

@@ -127,4 +127,10 @@ impl HeaderTable {
         self.head.flush()?;
         Ok(())
     }
+
+    pub fn flush_async(&self) -> Result<(), StoreError> {
+        self.body.flush_async()?;
+        self.head.flush_async()?;
+        Ok(())
+    }
 }

@@ -1,16 +1,21 @@
 //! Background budgeted head-overlay spill (A.4).
 //!
-//! One short disk slice on `point.head` / `tx.head`, then sleep so confirm can
-//! fault Class A pages. Soft-cap auto-spill is skipped mid-confirm; this worker
-//! still drains past soft/2 under defer so RAM stays bounded without multi-min
-//! storms on the archive writer.
+//! Quiet by default: only steps when the overlay is past soft/2 (or soft under
+//! confirm), with long sleeps so page-cache storms do not freeze the desktop.
+//! Thread is set to Linux IOPRIO_CLASS_IDLE when available.
 
 use rbitcoin_log::{debug, warn};
 use rbitcoin_query::Query;
+use rbitcoin_store::try_set_io_idle;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+/// Sleep after a productive spill slice (host UI / confirm breathe).
+const AFTER_SPILL: Duration = Duration::from_millis(80);
+/// Sleep when nothing to do.
+const IDLE: Duration = Duration::from_millis(250);
 
 /// RAII handle: drop signals stop and joins the worker.
 pub struct HeadSpillWorker {
@@ -25,8 +30,9 @@ impl HeadSpillWorker {
         let join = std::thread::Builder::new()
             .name("ibd-head-spill".into())
             .spawn(move || {
+                try_set_io_idle();
                 debug!(
-                    "ibd: head spill worker started (chunk≈{}; RBITCOIN_HEAD_SPILL_CHUNK)",
+                    "ibd: head spill worker started (chunk≈{}; RBITCOIN_HEAD_SPILL_CHUNK; idle IO prio)",
                     rbitcoin_store::spill_chunk_size()
                 );
                 while !stop_t.load(Ordering::Relaxed) {
@@ -34,15 +40,14 @@ impl HeadSpillWorker {
                         Ok(v) => v,
                         Err(e) => {
                             warn!("ibd: head spill worker: {e}");
-                            std::thread::sleep(Duration::from_millis(100));
+                            std::thread::sleep(Duration::from_millis(200));
                             continue;
                         }
                     };
                     if p + t > 0 {
-                        // Yield disk/page cache to confirm between slices.
-                        std::thread::sleep(Duration::from_millis(5));
+                        std::thread::sleep(AFTER_SPILL);
                     } else {
-                        std::thread::sleep(Duration::from_millis(50));
+                        std::thread::sleep(IDLE);
                     }
                 }
                 debug!("ibd: head spill worker stopped");
@@ -52,6 +57,11 @@ impl HeadSpillWorker {
             stop,
             join: Some(join),
         }
+    }
+
+    /// Signal stop without joining (caller will drop / join later).
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 

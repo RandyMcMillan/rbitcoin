@@ -525,6 +525,12 @@ impl TxTable {
         self.head.flush()?;
         Ok(())
     }
+
+    pub fn flush_async(&self) -> Result<(), StoreError> {
+        self.body.flush_async()?;
+        self.head.flush_async()?;
+        Ok(())
+    }
 }
 
 /// Per-tx output **runs**: one var record = all outputs of one tx.
@@ -590,6 +596,10 @@ impl OutputTable {
     pub fn flush(&self) -> Result<(), StoreError> {
         self.body.flush()
     }
+
+    pub fn flush_async(&self) -> Result<(), StoreError> {
+        self.body.flush_async()
+    }
 }
 
 /// Per-tx input **runs**: one var record = all inputs of one tx.
@@ -651,6 +661,10 @@ impl InputTable {
 
     pub fn flush(&self) -> Result<(), StoreError> {
         self.body.flush()
+    }
+
+    pub fn flush_async(&self) -> Result<(), StoreError> {
+        self.body.flush_async()
     }
 }
 

@@ -1,6 +1,6 @@
 //! Archive prep + writer pipeline for parallel IBD.
 
-use super::coalesce::{coalesce_wait, min_batch_for_lag};
+use super::coalesce::{coalesce_wait, max_batch_for_lag, min_batch_for_lag};
 use crate::chain::ChainHub;
 use bitcoin::{Block, BlockHash};
 use rbitcoin_consensus::prepare_block_for_archive_ibd;
@@ -255,9 +255,9 @@ pub(crate) fn spawn_archive_pipeline(
             .name("ibd-archive-writer".into())
             .spawn(move || {
                 rbitcoin_store::try_set_io_idle();
-                // Larger mega-batches → more keys per shard per writer cycle
-                // (sharded hash heads group insert_many by key[0]).
-                const MAX_MEGA: usize = 1024;
+                // Batch size is lag-aware (see coalesce::max_batch_for_lag): when
+                // Class A leads tip deeply, use **small** quanta so confirm can
+                // interleave instead of multi-minute 300–1024 block dumps.
                 const FLUSH_EVERY_BLOCKS: u64 = 8192;
                 let mut blocks_since_flush = 0u64;
                 let mut pri_open = true;
@@ -316,11 +316,16 @@ pub(crate) fn spawn_archive_pipeline(
                         .write_idle_ns
                         .fetch_add(idle_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+                    let lag = write_lag.load(Ordering::Relaxed);
+                    let max_mega = max_batch_for_lag(lag);
+                    // Tip-near priority: always small so confirm runway lands fast.
+                    let pri_cap = 32usize.min(max_mega);
+
                     let coal_t0 = Instant::now();
-                    let mut batch = Vec::with_capacity(if is_pri { 64 } else { 256 });
+                    let mut batch = Vec::with_capacity(if is_pri { pri_cap } else { max_mega });
                     batch.push(first);
                     if is_pri {
-                        while batch.len() < 128 {
+                        while batch.len() < pri_cap {
                             match pri_write_rx.try_recv() {
                                 Ok(p) => {
                                     write_q_dec(&write_depth);
@@ -330,9 +335,9 @@ pub(crate) fn spawn_archive_pipeline(
                             }
                         }
                     } else {
-                        let lag = write_lag.load(Ordering::Relaxed);
                         let min_batch = min_batch_for_lag(lag);
-                        while batch.len() < MAX_MEGA {
+                        while batch.len() < max_mega {
+                            // Tip-near always wins mid far-pack.
                             if let Ok(p) = pri_write_rx.try_recv() {
                                 write_q_dec(&write_depth);
                                 batch.insert(0, p);
@@ -355,7 +360,7 @@ pub(crate) fn spawn_archive_pipeline(
                             );
                             if !wait.is_zero() {
                                 let deadline = Instant::now() + wait;
-                                while batch.len() < MAX_MEGA {
+                                while batch.len() < max_mega {
                                     if Instant::now() >= deadline {
                                         break;
                                     }

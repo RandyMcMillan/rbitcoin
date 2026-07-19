@@ -376,6 +376,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
     fn write_behind_head_keeps_spenders_coherent() {
         let dir = tmp();
         let t = PointTable::create(&dir).unwrap();

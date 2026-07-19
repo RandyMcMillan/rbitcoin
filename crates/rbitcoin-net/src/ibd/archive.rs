@@ -217,6 +217,10 @@ pub(crate) enum ArchiveResult {
 }
 
 /// Dual-lane prep + writer: tip-near priority jumps far FIFO.
+///
+/// Archive never stalls for confirm: long `confirm_live` waves used to starve the
+/// far lane, fill `arch_q`, freeze getdata (`inflight=0`), then false peer stall
+/// disconnects. Priority still wins when both lanes have work.
 pub(crate) fn spawn_archive_pipeline(
     hub: Arc<ChainHub>,
     mut job_rx: mpsc::UnboundedReceiver<ArchiveJob>,
@@ -224,8 +228,6 @@ pub(crate) fn spawn_archive_pipeline(
     stats: Arc<ArchivePipelineStats>,
     archive_queued: Arc<ArchiveQueueBudget>,
     confirm_lag: Arc<AtomicU32>,
-    // Far-lane yields after mega-batches when confirm is mid-wave.
-    loop_stats: Arc<super::LoopStats>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         const WRITE_Q: usize = 4096;
@@ -244,7 +246,6 @@ pub(crate) fn spawn_archive_pipeline(
         let write_arch_q = Arc::clone(&archive_queued);
         let write_depth = Arc::clone(&write_q_depth);
         let write_lag = Arc::clone(&confirm_lag);
-        let write_loop_stats = Arc::clone(&loop_stats);
 
         let writer = std::thread::Builder::new()
             .name("ibd-archive-writer".into())
@@ -261,56 +262,35 @@ pub(crate) fn spawn_archive_pipeline(
                         break;
                     }
                     let idle_t0 = Instant::now();
-                    // While confirm is mid-wave, starve the **far** archive lane so
-                    // Class A / head IO does not fight recon+wave-fill page faults.
-                    // Priority (tip-near) still drains so the confirm feed stays warm.
-                    let confirm_busy =
-                        write_loop_stats.confirm_active.load(Ordering::Relaxed);
-                    let (first, is_pri) = if confirm_busy {
-                        match pri_write_rx.try_recv() {
-                            Ok(p) => (p, true),
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                pri_open = false;
-                                // No priority path left — brief yield then recheck.
-                                // Do **not** pull far while confirm is live.
-                                std::thread::sleep(Duration::from_millis(5));
-                                continue;
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                // Yield disk to confirm; do not block on far.recv.
-                                std::thread::sleep(Duration::from_millis(5));
-                                continue;
+                    // Priority first; otherwise drain far. Never idle while either
+                    // lane has work (confirm runs on a separate OS thread).
+                    let (first, is_pri) = match pri_write_rx.try_recv() {
+                        Ok(p) => (p, true),
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            pri_open = false;
+                            match far_write_rx.recv() {
+                                Ok(p) => (p, false),
+                                Err(_) => break,
                             }
                         }
-                    } else {
-                        match pri_write_rx.try_recv() {
-                            Ok(p) => (p, true),
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                pri_open = false;
-                                match far_write_rx.recv() {
-                                    Ok(p) => (p, false),
-                                    Err(_) => break,
-                                }
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                match far_write_rx.recv_timeout(Duration::from_millis(2)) {
-                                    Ok(p) => (p, false),
-                                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                        match pri_write_rx.try_recv() {
-                                            Ok(p) => (p, true),
-                                            Err(std::sync::mpsc::TryRecvError::Empty) => continue,
-                                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                                pri_open = false;
-                                                continue;
-                                            }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            match far_write_rx.recv_timeout(Duration::from_millis(2)) {
+                                Ok(p) => (p, false),
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                    match pri_write_rx.try_recv() {
+                                        Ok(p) => (p, true),
+                                        Err(std::sync::mpsc::TryRecvError::Empty) => continue,
+                                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                            pri_open = false;
+                                            continue;
                                         }
                                     }
-                                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                        far_open = false;
-                                        match pri_write_rx.recv() {
-                                            Ok(p) => (p, true),
-                                            Err(_) => break,
-                                        }
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    far_open = false;
+                                    match pri_write_rx.recv() {
+                                        Ok(p) => (p, true),
+                                        Err(_) => break,
                                     }
                                 }
                             }
@@ -422,13 +402,6 @@ pub(crate) fn spawn_archive_pipeline(
                                     );
                                 }
                                 blocks_since_flush = 0;
-                            }
-                            // Far lane: long yield if confirm became live mid-batch
-                            // (primary starve is at receive; this is a safety net).
-                            if !is_pri
-                                && write_loop_stats.confirm_active.load(Ordering::Relaxed)
-                            {
-                                std::thread::sleep(Duration::from_millis(50));
                             }
                         }
                         Err(e) => {

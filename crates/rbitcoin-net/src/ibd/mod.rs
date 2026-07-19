@@ -50,7 +50,7 @@ use bitcoin::p2p::Magic;
 use bitcoin::BlockHash;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -85,10 +85,8 @@ pub(crate) struct LoopStats {
     /// Class A bodies published this run (any height; cumulative).
     /// Includes gap-fills below the archive high-water mark — not just HWM rises.
     pub(crate) archived_bodies: AtomicU64,
-    /// In-flight confirm batch (set by confirm OS thread).
+    /// In-flight confirm batch (set by confirm OS thread; status only).
     confirm_live: Mutex<Option<ConfirmLive>>,
-    /// Fast flag for archive far-lane yield (mirrors confirm_live).
-    pub(crate) confirm_active: AtomicBool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -111,7 +109,6 @@ impl Default for LoopStats {
             status_scan_ns: AtomicU64::new(0),
             archived_bodies: AtomicU64::new(0),
             confirm_live: Mutex::new(None),
-            confirm_active: AtomicBool::new(false),
         }
     }
 }
@@ -123,12 +120,10 @@ impl LoopStats {
             batch_n,
             started: Instant::now(),
         });
-        self.confirm_active.store(true, Ordering::Relaxed);
     }
 
     pub(crate) fn confirm_end(&self) {
         *self.confirm_live.lock().unwrap() = None;
-        self.confirm_active.store(false, Ordering::Relaxed);
     }
 
     /// `(first_height, batch_n, elapsed_ms)` if a confirm batch is running.
@@ -448,7 +443,6 @@ pub async fn parallel_ibd_cancellable(
         Arc::clone(&pipe_stats),
         Arc::clone(&archive_queued),
         Arc::clone(&confirm_lag),
-        Arc::clone(&loop_stats),
     );
 
     // Dedicated confirm path — never blocks the network/archive event loop.

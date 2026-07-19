@@ -21,6 +21,7 @@ mod confirm;
 mod dial;
 mod head_spill;
 mod peer_io;
+mod perf_log;
 mod progress;
 mod state;
 
@@ -56,7 +57,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use rbitcoin_log::{debug, enabled, info, warn, Level};
+use rbitcoin_log::{info, warn};
 
 /// Main-loop hot-path timers (atomics; reset every status sample).
 ///
@@ -138,7 +139,7 @@ impl LoopStats {
         })
     }
 
-    fn sample_and_reset(&self) -> LoopSample {
+    pub(crate) fn sample_and_reset(&self) -> LoopSample {
         LoopSample {
             confirm_ns: self.confirm_ns.swap(0, Ordering::Relaxed),
             confirm_blocks: self.confirm_blocks.swap(0, Ordering::Relaxed),
@@ -153,36 +154,36 @@ impl LoopStats {
     }
 }
 
-struct LoopSample {
-    confirm_ns: u64,
-    confirm_blocks: u64,
-    confirm_reject_stops: u64,
-    assign_ns: u64,
-    assign_issued: u64,
-    drain_ns: u64,
-    drain_events: u64,
-    status_scan_ns: u64,
+pub(crate) struct LoopSample {
+    pub(crate) confirm_ns: u64,
+    pub(crate) confirm_blocks: u64,
+    pub(crate) confirm_reject_stops: u64,
+    pub(crate) assign_ns: u64,
+    pub(crate) assign_issued: u64,
+    pub(crate) drain_ns: u64,
+    pub(crate) drain_events: u64,
+    pub(crate) status_scan_ns: u64,
     /// Live batch if confirm engine is mid-`confirm_run`.
-    confirm_live: Option<(u32, u32, u64)>,
+    pub(crate) confirm_live: Option<(u32, u32, u64)>,
 }
 
 impl LoopSample {
     fn ms(ns: u64) -> u64 {
         ns / 1_000_000
     }
-    fn confirm_ms(&self) -> u64 {
+    pub(crate) fn confirm_ms(&self) -> u64 {
         Self::ms(self.confirm_ns)
     }
-    fn assign_ms(&self) -> u64 {
+    pub(crate) fn assign_ms(&self) -> u64 {
         Self::ms(self.assign_ns)
     }
-    fn drain_ms(&self) -> u64 {
+    pub(crate) fn drain_ms(&self) -> u64 {
         Self::ms(self.drain_ns)
     }
-    fn status_scan_ms(&self) -> u64 {
+    pub(crate) fn status_scan_ms(&self) -> u64 {
         Self::ms(self.status_scan_ns)
     }
-    fn confirm_us_per_block(&self) -> u64 {
+    pub(crate) fn confirm_us_per_block(&self) -> u64 {
         if self.confirm_blocks == 0 {
             0
         } else {
@@ -190,7 +191,7 @@ impl LoopSample {
         }
     }
     /// Which phase dominated wall time this window (for one-glance diagnosis).
-    fn dominant(&self) -> &'static str {
+    pub(crate) fn dominant(&self) -> &'static str {
         // Completed-batch timer is 0 while a batch is still running — treat live as confirm.
         if self.confirm_live.is_some() && self.confirm_ns == 0 {
             return "confirm";
@@ -798,29 +799,35 @@ pub async fn parallel_ibd_cancellable(
                 .status_scan_ns
                 .fetch_add(scan_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let peers_n = st.slots.iter().filter(|s| s.alive).count();
-            // st.inflight cap = min(window, peers×per_peer); fill by adding peers, not per_peer.
             let peer_cap = peers_n.saturating_mul(cfg.per_peer);
             let inflight_cap = cfg.window.min(peer_cap).max(1);
-            let hot = loop_stats.sample_and_reset();
-            // Height lead (not O(path) body count): Class A high-water − tip + inflight.
             let ahead = prog
                 .archived
                 .saturating_sub(prog.tip)
                 .saturating_add(st.inflight.len() as u32);
-            // Pipeline snapshot — chain heights live on `progress` lines above.
             let arch_mb = archive_queued.bytes() / (1024 * 1024);
             let arch_budget_mb = archive_queued.budget_bytes() / (1024 * 1024);
             let arch_q_now = archive_queued.count();
-            let pending_n = st.body.pending_len();
-            let known_arch_n = st.body.known_len();
-            info!(
-                "ibd: status inflight={}/{} arch_q={arch_q_now} arch={arch_mb}/{arch_budget_mb}MiB pending={pending_n} known_arch={known_arch_n} ordered={} ahead={ahead} hole={} headers_done={} peers={peers_n}",
+
+            // One sample/reset, then INFO `ibd: perf` (+ DEBUG `ibd: perf_dbg`).
+            let perf = perf_log::sample(
+                &loop_stats,
+                &pipe_stats,
                 st.inflight.len(),
                 inflight_cap,
+                arch_q_now,
+                arch_mb,
+                arch_budget_mb,
+                st.body.pending_len(),
+                st.body.known_len(),
                 st.ordered.len(),
+                ahead,
                 prog.tip_hole,
+                peers_n,
                 st.headers_done,
             );
+            perf_log::log_sample(&perf);
+
             // Stall watchdog: archive-complete + tip frozen is a confirm-path bug.
             if last_progress.elapsed() > Duration::from_secs(15)
                 && prog.tip_hole == 0
@@ -855,225 +862,6 @@ pub async fn parallel_ibd_cancellable(
                     last_progress.elapsed(),
                 );
             }
-            // Phase counters tick mid-batch; confirm_ns only when a batch finishes.
-            let (
-                recon_ns,
-                prefetch_ns,
-                wave_fill_ns,
-                wire_ns,
-                connect_ns,
-                script_ns,
-                class_c_ns,
-                strong_ns,
-                sh_ns,
-                tip_ns,
-                spent_local_ns,
-                phase_blks,
-            ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
-            let (sh_warm, sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head, sh_index) =
-                rbitcoin_query::class_c_phase_stats::sample_sh_sub_and_reset();
-            let (
-                wf_body_ns,
-                wf_parent_tx_ns,
-                wf_parent_out_ns,
-                wf_spent_ns,
-                wf_cb_ns,
-                wf_tip_note_ns,
-            ) = rbitcoin_query::wave_fill_stats::sample_and_reset();
-            // sh_ns is sum of substeps (same sample window) — no phantom other_ms.
-            let phase_any = recon_ns
-                + connect_ns
-                + script_ns
-                + class_c_ns
-                + strong_ns
-                + sh_ns
-                + tip_ns
-                + spent_local_ns
-                + phase_blks
-                > 0;
-            let recon_sub_any = prefetch_ns + wave_fill_ns + wire_ns > 0;
-            let wave_fill_sub_any = wf_body_ns
-                + wf_parent_tx_ns
-                + wf_parent_out_ns
-                + wf_spent_ns
-                + wf_cb_ns
-                + wf_tip_note_ns
-                > 0;
-            let sh_any = sh_warm
-                + sh_filter
-                + sh_collect
-                + sh_sort
-                + sh_seed
-                + sh_body
-                + sh_head
-                + sh_index
-                + sh_ns
-                > 0;
-
-            // INFO while confirm is live or phases moved — so time is not "hidden"
-            // between tip advances (progress lines only fire on tip/arch delta).
-            if let Some((first, n, elapsed_ms)) = hot.confirm_live {
-                info!(
-                    "ibd: confirm_live first={first} batch={n} elapsed_ms={elapsed_ms} recon_ms={} (prefetch={} wave={} wire={}) connect_ms={} script_ms={} class_c_ms={} strong_ms={} sh_ms={} (blks_done={} this window; wall accrues at batch end)",
-                    recon_ns / 1_000_000,
-                    prefetch_ns / 1_000_000,
-                    wave_fill_ns / 1_000_000,
-                    wire_ns / 1_000_000,
-                    connect_ns / 1_000_000,
-                    script_ns / 1_000_000,
-                    class_c_ns / 1_000_000,
-                    strong_ns / 1_000_000,
-                    sh_ns / 1_000_000,
-                    phase_blks,
-                );
-            } else if phase_any {
-                info!(
-                    "ibd: confirm_phases blks={} reconstruct_ms={} (prefetch={} wave={} wire={}) connect_ms={} script_ms={} class_c_ms={} strong_ms={} sh_ms={} tip_ms={}",
-                    phase_blks,
-                    recon_ns / 1_000_000,
-                    prefetch_ns / 1_000_000,
-                    wave_fill_ns / 1_000_000,
-                    wire_ns / 1_000_000,
-                    connect_ns / 1_000_000,
-                    script_ns / 1_000_000,
-                    class_c_ns / 1_000_000,
-                    strong_ns / 1_000_000,
-                    sh_ns / 1_000_000,
-                    tip_ns / 1_000_000,
-                );
-            }
-            if recon_sub_any {
-                info!(
-                    "ibd: recon_phases prefetch_ms={} wave_fill_ms={} wire_ms={} total_ms={}",
-                    prefetch_ns / 1_000_000,
-                    wave_fill_ns / 1_000_000,
-                    wire_ns / 1_000_000,
-                    recon_ns / 1_000_000,
-                );
-            }
-            if wave_fill_sub_any {
-                info!(
-                    "ibd: wave_fill_phases body_ms={} parent_tx_ms={} parent_out_ms={} spent_ms={} cb_ms={} tip_note_ms={} (sum_ms={})",
-                    wf_body_ns / 1_000_000,
-                    wf_parent_tx_ns / 1_000_000,
-                    wf_parent_out_ns / 1_000_000,
-                    wf_spent_ns / 1_000_000,
-                    wf_cb_ns / 1_000_000,
-                    wf_tip_note_ns / 1_000_000,
-                    (wf_body_ns
-                        + wf_parent_tx_ns
-                        + wf_parent_out_ns
-                        + wf_spent_ns
-                        + wf_cb_ns
-                        + wf_tip_note_ns)
-                        / 1_000_000,
-                );
-            }
-            if sh_any {
-                info!(
-                    "ibd: sh_phases warm_ms={} filter_ms={} collect_ms={} sort_ms={} seed_ms={} body_ms={} head_ms={} index_ms={} wall_ms={}",
-                    sh_warm / 1_000_000,
-                    sh_filter / 1_000_000,
-                    sh_collect / 1_000_000,
-                    sh_sort / 1_000_000,
-                    sh_seed / 1_000_000,
-                    sh_body / 1_000_000,
-                    sh_head / 1_000_000,
-                    sh_index / 1_000_000,
-                    sh_ns / 1_000_000,
-                );
-            }
-
-            let pipe_snap = if enabled(Level::Debug) {
-                Some(pipe_stats.sample_and_reset())
-            } else {
-                None
-            };
-            if enabled(Level::Debug) {
-                let denom = phase_blks.max(1);
-                debug!(
-                    "ibd: hot dominant={} confirm_ms={} confirm_blks={} confirm_us/blk={} reject_stops={} assign_ms={} getdata={} drain_ms={} events={} status_scan_ms={}",
-                    hot.dominant(),
-                    hot.confirm_ms(),
-                    hot.confirm_blocks,
-                    hot.confirm_us_per_block(),
-                    hot.confirm_reject_stops,
-                    hot.assign_ms(),
-                    hot.assign_issued,
-                    hot.drain_ms(),
-                    hot.drain_events,
-                    hot.status_scan_ms(),
-                );
-                // Detailed us/blk breakdown stays DEBUG (INFO has the live/phase summary).
-                if phase_any {
-                    debug!(
-                        "ibd: confirm_phases_detail us/blk recon={} prefetch={} wave={} wire={} connect={} script={} class_c={} strong={} sh={} tip={} spent_local={}",
-                        (recon_ns / denom) / 1000,
-                        (prefetch_ns / denom) / 1000,
-                        (wave_fill_ns / denom) / 1000,
-                        (wire_ns / denom) / 1000,
-                        (connect_ns / denom) / 1000,
-                        (script_ns / denom) / 1000,
-                        (class_c_ns / denom) / 1000,
-                        (strong_ns / denom) / 1000,
-                        (sh_ns / denom) / 1000,
-                        (tip_ns / denom) / 1000,
-                        (spent_local_ns / denom) / 1000,
-                    );
-                }
-                let (cah, cam, cae) = rbitcoin_query::class_a_cache_stats::sample_and_reset();
-                if cah + cam > 0 {
-                    let hit_pct = (100 * cah) / (cah + cam).max(1);
-                    debug!(
-                        "ibd: class_a_cache hit={} miss={} evict={} hit%={}",
-                        cah, cam, cae, hit_pct
-                    );
-                }
-                let (tph, tpm, tpe, tpn, tpr) =
-                    rbitcoin_query::tip_prevout_cache_stats::sample_and_reset();
-                if tph + tpm + tpn + tpr > 0 {
-                    let hit_pct = (100 * tph) / (tph + tpm).max(1);
-                    debug!(
-                        "ibd: tip_prevout_cache hit={} miss={} evict={} note={} retire={} hit%={}",
-                        tph, tpm, tpe, tpn, tpr, hit_pct
-                    );
-                }
-                let (pth, pwh, pca, psm) =
-                    rbitcoin_query::connect_prevout_stats::sample_and_reset();
-                if pth + pwh + pca + psm > 0 {
-                    let tot = pth + pwh + pca + psm;
-                    debug!(
-                        "ibd: connect_prevout tip_hit={} wave_hit={} class_a_hit={} store_miss={} tip%={} wave%={} class_a%={} store%={}",
-                        pth,
-                        pwh,
-                        pca,
-                        psm,
-                        (100 * pth) / tot.max(1),
-                        (100 * pwh) / tot.max(1),
-                        (100 * pca) / tot.max(1),
-                        (100 * psm) / tot.max(1),
-                    );
-                }
-                if let Some(s) = pipe_snap {
-                    let busy = s.write_busy_ms();
-                    let idle = s.write_idle_ms();
-                    let total_w = busy.saturating_add(idle).max(1);
-                    let writer_busy_pct = (100 * busy) / total_w;
-                    debug!(
-                        "ibd: pipe prep_us/blk={} prep_blks={} write_us/blk={} write_blks={} batch_avg={} writer_busy%={} idle_ms={} coalesce_ms={} prep_ms={}",
-                        s.prep_us_per_block(),
-                        s.prep_blocks,
-                        s.write_us_per_block(),
-                        s.write_blocks,
-                        s.avg_batch(),
-                        writer_busy_pct,
-                        s.write_idle_ms(),
-                        s.write_coalesce_ms(),
-                        s.prep_ms(),
-                    );
-                }
-            }
-            let _ = std::io::Write::flush(&mut std::io::stderr());
             last_status = Instant::now();
         }
 

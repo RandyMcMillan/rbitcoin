@@ -50,6 +50,7 @@ impl ArchivePipelineStats {
     }
 }
 
+#[derive(Clone, Debug, Default)]
 pub(crate) struct ArchivePipelineSample {
     pub(crate) prep_ns: u64,
     pub(crate) prep_blocks: u64,

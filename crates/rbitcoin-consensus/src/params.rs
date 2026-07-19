@@ -247,9 +247,10 @@ fn mainnet_checkpoints(genesis: BlockHash) -> Vec<Checkpoint> {
             height: 279_000,
             hash: h("0000000000000001ae8c72a0b0c301f67e3afca10e819efa9041e458e9bd7e40"),
         },
+        // Core mapCheckpoints last entry — must match mainnet (IBD tip stall @ 294999).
         Checkpoint {
             height: 295_000,
-            hash: h("00000000000000004d9b4ef50f0f9d826646340508c915db44e3d2c91f49c78a"),
+            hash: h("00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983"),
         },
     ]
 }
@@ -279,4 +280,55 @@ pub fn check_genesis_hash(params: &ChainParams, hash: BlockHash) -> bool {
 
 pub fn genesis_block(params: &ChainParams) -> bitcoin::block::Block {
     constants::genesis_block(params.network)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::hashes::Hash;
+
+    fn display_hash(hex: &str) -> BlockHash {
+        let bytes = rbitcoin_primitives::hex_decode(hex).expect("hex");
+        let arr: [u8; 32] = bytes.try_into().expect("32");
+        let mut rev = arr;
+        rev.reverse();
+        BlockHash::from_byte_array(rev)
+    }
+
+    /// Regression: wrong invented hash at 295000 blacklisted the real mainnet tip
+    /// block (`checkpoint mismatch`) and froze confirm at tip 294999.
+    #[test]
+    fn mainnet_checkpoints_match_core_chain() {
+        let p = ChainParams::mainnet();
+        let expected: &[(u32, &str)] = &[
+            (0, "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"),
+            (11_111, "0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d"),
+            (33_333, "000000002dd5588a74784eaa7ab0507a18ad16a236e7b1ce69f00d7ddfb5d0a6"),
+            (74_000, "0000000000573993a3c9e41ce34471c079dcf5f52a0e824a81e7f953b8661a20"),
+            (105_000, "00000000000291ce28027faea320c8d2b054b2e0fe44a773f3eefb151d6bdc97"),
+            (134_444, "00000000000005b12ffd4cd315cd34ffd4a594f430ac814c91184a0d42d2b0fe"),
+            (168_000, "000000000000099e61ea72015e79632f216fe6cb33d7899acb35b75c8303b763"),
+            (193_000, "000000000000059f452a5f7340de6682a977387c17010ff6e6c3bd83ca8b1317"),
+            (210_000, "000000000000048b95347e83192f69cf0366076336c639f9b7228e9ba171342e"),
+            (216_116, "00000000000001b4f4b433e81ee46494af945cf96014816a4e2370f11b23df4e"),
+            (225_430, "00000000000001c108384350f74090433e7fcf79a606b8e797f065b130575932"),
+            (250_000, "000000000000003887df1f29024b06fc2200b55f8af8f35453d7be294df2d214"),
+            (279_000, "0000000000000001ae8c72a0b0c301f67e3afca10e819efa9041e458e9bd7e40"),
+            (295_000, "00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983"),
+        ];
+        assert_eq!(p.checkpoints.len(), expected.len());
+        for (i, (h, hex)) in expected.iter().enumerate() {
+            assert_eq!(p.checkpoints[i].height, *h, "height order");
+            assert_eq!(
+                p.checkpoint_at(Height(*h)).unwrap(),
+                display_hash(hex),
+                "checkpoint {h}"
+            );
+        }
+        // Explicit pin for the IBD stall case.
+        assert_eq!(
+            p.checkpoint_at(Height(295_000)).unwrap().to_string(),
+            "00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983"
+        );
+    }
 }

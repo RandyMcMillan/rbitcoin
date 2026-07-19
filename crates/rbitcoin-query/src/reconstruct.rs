@@ -131,15 +131,27 @@ impl Query {
         wf_add(&wf::BODY_NS, t_body.elapsed().as_nanos() as u64);
 
         // Pass 3: external parents, sorted by fk for Class A / body locality.
+        // Spent checks are deferred and sorted by point.head key for shard locality
+        // (mid-IBD logs: spent_ms ≫ parent_tx/out).
         let mut parents: Vec<(u64, HashSet<u32>)> = parent_needed.into_iter().collect();
         parents.sort_unstable_by_key(|(pid, _)| *pid);
         let spend_index_on = self.spend_index_enabled();
+
+        struct ParentWork {
+            fk: Fk,
+            tx: TxRecord,
+            /// Slots partially filled (tip-live / pending spent probe).
+            slots: Vec<Option<OutputRecord>>,
+            outs_map: HashMap<u32, OutputRecord>,
+            /// Vouts that still need durable / local spent filter.
+            need_spent: Vec<u32>,
+        }
+        let mut works: Vec<ParentWork> = Vec::with_capacity(parents.len());
 
         for (pid, needed_vouts) in &parents {
             let fk = Fk(*pid);
 
             // Tip short-circuit only when **complete** (all needed live).
-            // Partial tip cover used to `continue` with holes → wrong/missing prevouts.
             let tip_complete = !needed_vouts.is_empty()
                 && needed_vouts
                     .iter()
@@ -209,40 +221,97 @@ impl Query {
             }
             wf_add(&wf::PARENT_OUT_NS, t_out.elapsed().as_nanos() as u64);
 
-            // Assemble: spent-filter; never leave a hole for an unspent needed vout.
+            // Partial tip cover: live tip slots skip durable spent (write-through).
             let mut slots: Vec<Option<OutputRecord>> = vec![None; n];
+            let mut need_spent = Vec::with_capacity(needed_vouts.len());
             for &v in needed_vouts {
                 let vi = v as usize;
                 if vi >= n {
                     continue;
                 }
-                let t_sp = Instant::now();
-                let spent = self.outpoint_spent_for_wave_fill(&tx.txid, v, spend_index_on)?;
-                wf_add(&wf::SPENT_NS, t_sp.elapsed().as_nanos() as u64);
-                if spent {
+                if self.tip_prevout_cache.has_live_output(fk, v) {
+                    if let Some(o) = self.tip_prevout_cache.get_output_at(fk, v) {
+                        slots[vi] = Some(o);
+                    } else if let Some(o) = outs_map.remove(&v) {
+                        slots[vi] = Some(o);
+                    }
                     continue;
                 }
-                if let Some(o) = outs_map.remove(&v) {
-                    slots[vi] = Some(o);
+                need_spent.push(v);
+            }
+
+            works.push(ParentWork {
+                fk,
+                tx,
+                slots,
+                outs_map,
+                need_spent,
+            });
+        }
+
+        // Batch spent probes sorted by point.head key (shard then slot locality).
+        // (work_idx, vout, outpoint_key)
+        let mut probes: Vec<(usize, u32, [u8; 32])> = Vec::new();
+        for (wi, w) in works.iter().enumerate() {
+            for &v in &w.need_spent {
+                let key = rbitcoin_store::PointRecord::outpoint_key(&w.tx.txid, v);
+                probes.push((wi, v, key));
+            }
+        }
+        probes.sort_unstable_by(|a, b| a.2.cmp(&b.2));
+
+        let t_sp_all = Instant::now();
+        // Results: (work_idx, vout) → spent
+        let mut spent_flags: HashMap<(usize, u32), bool> =
+            HashMap::with_capacity(probes.len());
+        if spend_index_on {
+            // One tip snapshot for the whole batch (was re-read per outpoint).
+            let tip = self.store.confirmed.tip_height().map(|t| t.0);
+            for &(wi, v, ref key) in &probes {
+                let spent = self.store.has_confirmed_strong_spender_key(key, tip)?;
+                spent_flags.insert((wi, v), spent);
+            }
+        } else {
+            let local = self.spent_local.lock().unwrap();
+            for (wi, w) in works.iter().enumerate() {
+                for &v in &w.need_spent {
+                    spent_flags.insert((wi, v), local.contains(&(w.tx.txid, v)));
+                }
+            }
+        }
+        wf_add(&wf::SPENT_NS, t_sp_all.elapsed().as_nanos() as u64);
+
+        // Assemble live slots, promote, insert wave.
+        for (wi, mut w) in works.into_iter().enumerate() {
+            for &v in &w.need_spent {
+                let vi = v as usize;
+                if vi >= w.slots.len() {
                     continue;
                 }
-                // Defensive reload (warm miss / eviction) — never insert incomplete live.
-                let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-                let o = self.store.get_output_at(Fk(run), tx.output_count, v)?;
-                slots[vi] = Some(o);
+                if spent_flags.get(&(wi, v)).copied().unwrap_or(true) {
+                    continue;
+                }
+                if let Some(o) = w.outs_map.remove(&v) {
+                    w.slots[vi] = Some(o);
+                    continue;
+                }
+                let run = w.tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
+                let o = self
+                    .store
+                    .get_output_at(Fk(run), w.tx.output_count, v)?;
+                w.slots[vi] = Some(o);
             }
 
             let t_cb = Instant::now();
-            let cb_h = self.coinbase_height_for_tx(fk, &tx)?;
+            let cb_h = self.coinbase_height_for_tx(w.fk, &w.tx)?;
             wf_add(&wf::CB_HEIGHT_NS, t_cb.elapsed().as_nanos() as u64);
 
-            // Promote live slots for the next wave (cold start builds tip from here).
             let t_tip = Instant::now();
             self.tip_prevout_cache
-                .note_live_slots(fk, tx.clone(), &slots);
+                .note_live_slots(w.fk, w.tx.clone(), &w.slots);
             wf_add(&wf::TIP_NOTE_NS, t_tip.elapsed().as_nanos() as u64);
 
-            wave.insert_parent_slots(fk, tx, slots, Some(cb_h));
+            wave.insert_parent_slots(w.fk, w.tx, w.slots, Some(cb_h));
             noted += 1;
         }
         Ok((noted, wave))
@@ -290,23 +359,6 @@ impl Query {
             self.tx_input_run(&tx)?
         };
         Ok((tx, outs, inputs))
-    }
-
-    fn outpoint_spent_for_wave_fill(
-        &self,
-        txid: &[u8; 32],
-        vout: u32,
-        spend_index_on: bool,
-    ) -> Result<bool, QueryError> {
-        if spend_index_on {
-            Ok(self.store.has_confirmed_strong_spender(txid, vout)?)
-        } else {
-            Ok(self
-                .spent_local
-                .lock()
-                .unwrap()
-                .contains(&(*txid, vout)))
-        }
     }
 
     /// `(is_coinbase → create height)`: `None` = not coinbase; `Some(h)` = coinbase.

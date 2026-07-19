@@ -190,13 +190,25 @@ impl PointTable {
         &self,
         out_txid: &[u8; 32],
         out_index: u32,
-        mut visit: F,
+        visit: F,
     ) -> Result<(), StoreError>
     where
         F: FnMut(Fk, u32) -> Result<bool, StoreError>,
     {
         let key = PointRecord::outpoint_key(out_txid, out_index);
-        let mut cur = self.head.get(&key)?;
+        self.for_each_spender_key(&key, visit)
+    }
+
+    /// Walk by precomputed outpoint key (wave_fill batch-sorted probes).
+    pub fn for_each_spender_key<F>(
+        &self,
+        outpoint_key: &[u8; 32],
+        mut visit: F,
+    ) -> Result<(), StoreError>
+    where
+        F: FnMut(Fk, u32) -> Result<bool, StoreError>,
+    {
+        let mut cur = self.head.get(outpoint_key)?;
         while let Some(fk) = cur {
             let (spending_tx_fk, spending_input_index, next) = self.get(fk)?;
             if !visit(spending_tx_fk, spending_input_index)? {
@@ -338,6 +350,32 @@ mod tests {
     }
 
     #[test]
+    fn for_each_spender_key_matches_txid_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-point-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let t = PointTable::create(&dir).unwrap();
+        let txid = [7u8; 32];
+        t.put_spend(&txid, 3, Fk(99), 1).unwrap();
+        let key = PointRecord::outpoint_key(&txid, 3);
+        let mut n = 0u32;
+        t.for_each_spender_key(&key, |sp, idx| {
+            assert_eq!(sp, Fk(99));
+            assert_eq!(idx, 1);
+            n += 1;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(n, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn write_behind_head_keeps_spenders_coherent() {
         let dir = tmp();
         let t = PointTable::create(&dir).unwrap();

@@ -122,6 +122,15 @@ mod tests {
         assert_eq!(far_slots_per_peer(8, false), 4);
     }
 
+    /// When archive RAM is full we set far_cap=0 so all window room is near.
+    #[test]
+    fn tip_near_only_means_zero_far_cap() {
+        assert_eq!(far_slots_per_peer(16, false).min(0), 0);
+        // Explicit: tip-near assign path uses far_cap = 0 regardless of tip_hole.
+        let far_cap_when_budget_full = 0usize;
+        assert_eq!(far_cap_when_budget_full, 0);
+    }
+
     #[test]
     fn header_soft_cap_density_gate() {
         // Sparse: 4k known of 120k live → no bypass

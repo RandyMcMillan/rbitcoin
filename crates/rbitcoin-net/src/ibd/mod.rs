@@ -538,21 +538,23 @@ pub async fn parallel_ibd_cancellable(
         st.hygiene();
 
         // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
-        // Confirm used to run here first and left free peer st.slots idle while we
-        // walked tip (bad bandwidth utilization with arch_q≈0).
-        // Pause new getdata when decoded bodies waiting for archive hit the
-        // byte budget — backpressure without dropping unique delivered bytes.
+        // When arch RAM budget is full, still densify **tip-near** so confirm has
+        // runway (mid-sync was inflight=0 while arch_q sat at cap).
         let arch_bytes = archive_queued.bytes();
-        if archive_queued.has_room() {
-            assign_work_ordered(
-                &mut st,
-                hub.as_ref(),
-                &cfg,
-                &loop_stats,
-                arch_bytes,
-                archive_queued.budget_bytes(),
-            );
-        }
+        let scope = if archive_queued.has_room() {
+            AssignScope::Full
+        } else {
+            AssignScope::TipNearOnly
+        };
+        assign_work_ordered(
+            &mut st,
+            hub.as_ref(),
+            &cfg,
+            &loop_stats,
+            arch_bytes,
+            archive_queued.budget_bytes(),
+            scope,
+        );
 
         // Offer archived bodies to the dedicated confirm engine (non-blocking).
         offer_confirm_ready(
@@ -592,16 +594,20 @@ pub async fn parallel_ibd_cancellable(
         }
         // Immediate re-top-up after Block events freed st.inflight during confirm.
         let arch_bytes2 = archive_queued.bytes();
-        if archive_queued.has_room() {
-            assign_work_ordered(
-                &mut st,
-                hub.as_ref(),
-                &cfg,
-                &loop_stats,
-                arch_bytes2,
-                archive_queued.budget_bytes(),
-            );
-        }
+        let scope2 = if archive_queued.has_room() {
+            AssignScope::Full
+        } else {
+            AssignScope::TipNearOnly
+        };
+        assign_work_ordered(
+            &mut st,
+            hub.as_ref(),
+            &cfg,
+            &loop_stats,
+            arch_bytes2,
+            archive_queued.budget_bytes(),
+            scope2,
+        );
 
         // Header sync: soft-cap live work (`ordered_set`), not deque len (ghosts).
         //
@@ -1763,11 +1769,22 @@ fn inflight_insert_first(
     inflight.insert(hash, state::InflightReq::new(peer, Instant::now()));
 }
 
+/// Getdata assign scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssignScope {
+    /// Tip hole + near + far densify.
+    Full,
+    /// Only tip hole + near band — when archive RAM budget is full so peers are
+    /// not left `inflight=0` while confirm crawls on already-archived lag.
+    TipNearOnly,
+}
+
 /// Assign getdata for bodies not yet Class A.
 ///
 /// 1. Tip hole — one getdata each (stall disconnect recovers slow peers).
 /// 2. Near band — tip+1‥tip+[`NEAR_DEPTH`].
-/// 3. Far — forward densify past near (height-ascending).
+/// 3. Far — forward densify past near (height-ascending); skipped in
+///    [`AssignScope::TipNearOnly`].
 fn assign_work_ordered(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -1775,6 +1792,7 @@ fn assign_work_ordered(
     loop_stats: &LoopStats,
     _arch_bytes: usize,
     _arch_budget: usize,
+    scope: AssignScope,
 ) {
     let t0 = Instant::now();
     let mut issued = 0u64;
@@ -1816,16 +1834,26 @@ fn assign_work_ordered(
         return;
     }
 
-    let far_cap = far_slots_per_peer(cfg.per_peer, tip_hole);
-    let far_window_reserve = alive
-        .len()
-        .saturating_mul(far_cap)
-        .min(room.saturating_mul(3) / 4)
-        .max(far_cap.min(room));
+    // TipNearOnly: give the whole window to tip runway (no far reserve).
+    let want_far = matches!(scope, AssignScope::Full);
+    let far_cap = if want_far {
+        far_slots_per_peer(cfg.per_peer, tip_hole)
+    } else {
+        0
+    };
+    let far_window_reserve = if want_far {
+        alive
+            .len()
+            .saturating_mul(far_cap)
+            .min(room.saturating_mul(3) / 4)
+            .max(far_cap.min(room))
+    } else {
+        0
+    };
     let near_window_cap = room.saturating_sub(far_window_reserve);
 
     let (near_work, far_work) =
-        collect_need(st, hub, tip, near_hi, near_window_cap, room, far_cap > 0);
+        collect_need(st, hub, tip, near_hi, near_window_cap, room, want_far && far_cap > 0);
     if near_work.is_empty() && far_work.is_empty() {
         finish_assign(loop_stats, t0, issued);
         return;

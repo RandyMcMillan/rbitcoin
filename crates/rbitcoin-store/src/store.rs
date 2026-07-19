@@ -333,9 +333,20 @@ impl Store {
         out_index: u32,
     ) -> Result<bool, StoreError> {
         let tip = self.confirmed.tip_height().map(|t| t.0);
+        let key = crate::point_table::PointRecord::outpoint_key(out_txid, out_index);
+        self.has_confirmed_strong_spender_key(&key, tip)
+    }
+
+    /// Like [`Self::has_confirmed_strong_spender`] with a precomputed outpoint key
+    /// and tip snapshot — used for wave_fill batch probes sorted by head key.
+    pub fn has_confirmed_strong_spender_key(
+        &self,
+        outpoint_key: &[u8; 32],
+        tip: Option<u32>,
+    ) -> Result<bool, StoreError> {
         let mut found = false;
         self.points
-            .for_each_spender(out_txid, out_index, |spending_tx_fk, _in_idx| {
+            .for_each_spender_key(outpoint_key, |spending_tx_fk, _in_idx| {
                 if self.is_confirmed_strong_at(spending_tx_fk, tip)? {
                     found = true;
                     return Ok(false); // stop

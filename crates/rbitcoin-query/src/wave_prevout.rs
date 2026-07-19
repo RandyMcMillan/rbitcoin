@@ -165,3 +165,70 @@ impl WavePrevoutCache {
         Some((p.fk, &p.tx, o))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rbitcoin_store::{OutputRecord, TxRecord};
+
+    fn tx(id: u8, n_out: u32) -> TxRecord {
+        let mut txid = [0u8; 32];
+        txid[0] = id;
+        TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk(1),
+            output_count: n_out,
+        }
+    }
+
+    fn out(v: i64) -> OutputRecord {
+        OutputRecord {
+            value: v,
+            script: vec![0x51, v as u8],
+        }
+    }
+
+    /// Regression: wrong prev_tx_fk must not be preferred over wire txid.
+    ///
+    /// Connect resolves by **txid first**; if only get_by_fk were used, a stale
+    /// fk could return another wave parent's scriptPubKey (script false).
+    #[test]
+    fn get_by_txid_not_confused_by_wrong_fk_live_slot() {
+        let mut w = WavePrevoutCache::with_capacity(2, 0);
+        // Wave-body create at fk=10 (all outs live).
+        w.insert_parent_live(Fk(10), tx(10, 2), vec![out(1), out(2)], Some(None));
+        // External parent at fk=20 that the spend actually wants.
+        w.insert_parent_slots(
+            Fk(20),
+            tx(20, 2),
+            vec![None, Some(out(99))],
+            Some(None),
+        );
+
+        let want_txid = tx(20, 2).txid;
+        // Wrong fk (wave body) has a live vout=1, but different txid.
+        let wrong = w.get_by_fk(Fk(10), 1).unwrap();
+        assert_ne!(wrong.1.txid, want_txid);
+        assert_eq!(wrong.2.value, 2);
+
+        // Authoritative path: by wire txid → correct parent + output.
+        let (fk, rec, o) = w.get_by_txid(&want_txid, 1).unwrap();
+        assert_eq!(fk, Fk(20));
+        assert_eq!(rec.txid, want_txid);
+        assert_eq!(o.value, 99);
+
+        // Production filter: only accept fk hit when txid matches.
+        let filtered = w
+            .get_by_fk(Fk(10), 1)
+            .filter(|(_, rec, _)| rec.txid == want_txid);
+        assert!(filtered.is_none());
+        let ok = w
+            .get_by_fk(Fk(20), 1)
+            .filter(|(_, rec, _)| rec.txid == want_txid);
+        assert!(ok.is_some());
+    }
+}

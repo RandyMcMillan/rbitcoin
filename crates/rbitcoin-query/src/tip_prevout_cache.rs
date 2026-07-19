@@ -100,6 +100,7 @@ impl TipPrevoutCache {
     }
 
     /// True if `fk` is present with every output slot live (no stats bump).
+    #[allow(dead_code)] // available for tip-complete shortcuts / tests
     pub fn has_full_outputs(&self, fk: Fk) -> bool {
         let id = match fk.get() {
             Some(i) => i,
@@ -114,12 +115,86 @@ impl TipPrevoutCache {
 
     /// Insert or refresh a create tx + full output run (confirm or resolved parent).
     pub fn note(&self, fk: Fk, tx: TxRecord, outputs: Vec<OutputRecord>) {
+        let slots: Vec<Option<OutputRecord>> = outputs.into_iter().map(Some).collect();
+        self.note_slots_replace(fk, tx, slots);
+    }
+
+    /// Merge **live** parent slots into the tip window (wave-fill promote).
+    ///
+    /// Cold-start safe:
+    /// - Only `Some` slots are written; `None` is a hole, **not** a spent marker
+    ///   (never clears an existing live slot).
+    /// - Refuses to merge if an existing entry's `tx.txid` disagrees (fk collision).
+    /// - Touches MRU so the next wave prefers tip hits.
+    pub fn note_live_slots(&self, fk: Fk, tx: TxRecord, slots: &[Option<OutputRecord>]) {
+        if slots.iter().all(|s| s.is_none()) {
+            return;
+        }
         let id = match fk.get() {
             Some(i) => i,
             None => return,
         };
-        let live = outputs.len() as u32;
-        let slots: Vec<Option<OutputRecord>> = outputs.into_iter().map(Some).collect();
+        let mut g = self.inner.lock().unwrap();
+        if let Some(e) = g.map.get_mut(&id) {
+            if e.tx.txid != tx.txid {
+                // Do not poison: replace only via full `note` / note_slots_replace.
+                return;
+            }
+            let mut grew = 0usize;
+            if slots.len() > e.outputs.len() {
+                e.outputs.resize(slots.len(), None);
+            }
+            for (i, s) in slots.iter().enumerate() {
+                let Some(o) = s else {
+                    continue;
+                };
+                match e.outputs.get_mut(i) {
+                    Some(slot @ None) => {
+                        let add = 32 + o.script.len();
+                        *slot = Some(o.clone());
+                        e.live = e.live.saturating_add(1);
+                        e.bytes = e.bytes.saturating_add(add);
+                        grew = grew.saturating_add(add);
+                    }
+                    Some(Some(_)) => {} // keep existing live
+                    None => unreachable!("resized above"),
+                }
+            }
+            g.bytes = g.bytes.saturating_add(grew);
+            if let Some(pos) = g.order.iter().position(|&x| x == id) {
+                g.order.remove(pos);
+            }
+            g.order.push_back(id);
+            stats::NOTE.fetch_add(1, Ordering::Relaxed);
+            g.evict_to_budget(self.budget);
+            return;
+        }
+        // Fresh partial entry (cold start / first sight of parent).
+        let slots_owned = slots.to_vec();
+        let live = slots_owned.iter().filter(|s| s.is_some()).count() as u32;
+        let bytes = entry_bytes(&tx, &slots_owned);
+        g.by_txid.insert(tx.txid, id);
+        g.map.insert(
+            id,
+            Entry {
+                tx,
+                outputs: slots_owned,
+                bytes,
+                live,
+            },
+        );
+        g.order.push_back(id);
+        g.bytes = g.bytes.saturating_add(bytes);
+        stats::NOTE.fetch_add(1, Ordering::Relaxed);
+        g.evict_to_budget(self.budget);
+    }
+
+    fn note_slots_replace(&self, fk: Fk, tx: TxRecord, slots: Vec<Option<OutputRecord>>) {
+        let id = match fk.get() {
+            Some(i) => i,
+            None => return,
+        };
+        let live = slots.iter().filter(|s| s.is_some()).count() as u32;
         let bytes = entry_bytes(&tx, &slots);
         let mut g = self.inner.lock().unwrap();
         if let Some(old) = g.map.remove(&id) {
@@ -415,5 +490,56 @@ mod tests {
         assert_eq!(c.len(), 0);
         let (_h, _m, _e, _n, r) = stats::sample_and_reset();
         assert!(r >= 2);
+    }
+
+    /// Cold-start promote: first sight of a parent is partial live slots only.
+    #[test]
+    fn note_live_slots_cold_partial_then_fill_hole() {
+        let c = TipPrevoutCache::new(1024 * 1024);
+        let t = tx(7);
+        // Only vout 0 live (wave needed just that out).
+        let slots = vec![Some(out(100)), None];
+        c.note_live_slots(Fk(7), t.clone(), &slots);
+        assert_eq!(c.get_output_at(Fk(7), 0).unwrap().value, 100);
+        assert!(c.get_output_at(Fk(7), 1).is_none());
+        assert!(!c.has_live_output(Fk(7), 1));
+        // Later wave needs vout 1: merge fills the hole, does not clear vout 0.
+        let slots2 = vec![None, Some(out(200))];
+        c.note_live_slots(Fk(7), t, &slots2);
+        assert_eq!(c.get_output_at(Fk(7), 0).unwrap().value, 100);
+        assert_eq!(c.get_output_at(Fk(7), 1).unwrap().value, 200);
+        // None in a later note must not wipe an existing live.
+        c.note_live_slots(Fk(7), tx(7), &[None, None]);
+        assert_eq!(c.get_output_at(Fk(7), 0).unwrap().value, 100);
+        assert_eq!(c.get_output_at(Fk(7), 1).unwrap().value, 200);
+    }
+
+    /// Refuse to merge slots when txid disagrees (fk collision / poison guard).
+    #[test]
+    fn note_live_slots_refuses_txid_mismatch() {
+        let c = TipPrevoutCache::new(1024 * 1024);
+        c.note_live_slots(Fk(3), tx(3), &[Some(out(1)), None]);
+        // Same fk, different txid — must not overwrite.
+        c.note_live_slots(Fk(3), tx(9), &[Some(out(999)), Some(out(888))]);
+        assert_eq!(c.get_output_at(Fk(3), 0).unwrap().value, 1);
+        assert!(c.get_output_at(Fk(3), 1).is_none());
+        assert_eq!(c.get_tx(Fk(3)).unwrap().txid[0], 3);
+    }
+
+    /// tip_complete short-circuit requires every needed vout live (partial cover fails).
+    #[test]
+    fn partial_tip_does_not_cover_all_needed() {
+        let c = TipPrevoutCache::new(1024 * 1024);
+        c.note_live_slots(Fk(1), tx(1), &[Some(out(10)), None]);
+        let needed = [0u32, 1u32];
+        let tip_complete = needed
+            .iter()
+            .all(|&v| c.has_live_output(Fk(1), v));
+        assert!(
+            !tip_complete,
+            "partial tip must not count as complete cover for needed vouts"
+        );
+        assert!(c.has_live_output(Fk(1), 0));
+        assert!(!c.has_live_output(Fk(1), 1));
     }
 }

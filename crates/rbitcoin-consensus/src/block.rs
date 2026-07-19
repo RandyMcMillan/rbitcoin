@@ -480,21 +480,13 @@ pub(crate) fn connect_block_prevouts(
                             .map(rbitcoin_primitives::Fk)
                     });
                 // Durable spent probe only when outpoint is **not** cached as live.
+                // Key by **wire txid** so a wrong prev_tx_fk cannot skip the check
+                // via a different parent's live slot in the wave map.
                 if spend_index_on {
-                    let cached_live = match prev_fk {
-                        Some(fk) => {
-                            wave_prevouts
-                                .map(|w| w.has_live_output_fk(fk, op.vout))
-                                .unwrap_or(false)
-                                || query.tip_prevout_has_live_fk(fk, op.vout)
-                        }
-                        None => {
-                            wave_prevouts
-                                .map(|w| w.has_live_output_txid(op.txid.as_byte_array(), op.vout))
-                                .unwrap_or(false)
-                                || query.tip_prevout_has_live(op.txid.as_byte_array(), op.vout)
-                        }
-                    };
+                    let cached_live = wave_prevouts
+                        .map(|w| w.has_live_output_txid(op.txid.as_byte_array(), op.vout))
+                        .unwrap_or(false)
+                        || query.tip_prevout_has_live(op.txid.as_byte_array(), op.vout);
                     if !cached_live
                         && query
                             .store()
@@ -724,10 +716,18 @@ fn resolve_prevout(
     });
 
     // Wave-local map first (no mutex; built during parent prefetch).
+    //
+    // **Wire `prev_txid` is authoritative.** Prefer by-txid; only accept an fk
+    // hit when the cached parent's txid matches. Otherwise a wrong `prev_tx_fk`
+    // can hit another wave entry (every wave-body create is a live parent) and
+    // feed the wrong scriptPubKey into script checks.
     if let Some(wave) = wave_prevouts {
-        let wave_hit = prev_fk
-            .and_then(|fk| wave.get_by_fk(fk, op.vout))
-            .or_else(|| wave.get_by_txid(&prev_txid, op.vout));
+        let wave_hit = wave.get_by_txid(&prev_txid, op.vout).or_else(|| {
+            prev_fk.and_then(|fk| {
+                wave.get_by_fk(fk, op.vout)
+                    .filter(|(_, rec, _)| rec.txid == prev_txid)
+            })
+        });
         if let Some((prev_fk, prev_rec, out)) = wave_hit {
             connect_prevout_stats::WAVE_HIT.fetch_add(1, Ordering::Relaxed);
             let (is_cb, cb_h) =
@@ -744,16 +744,16 @@ fn resolve_prevout(
         }
     }
 
-    // Fast path: tip_prevout single-lock.
-    let tip_hit = prev_fk
-        .and_then(|fk| {
-            query
-                .tip_prevout_tx_and_output(fk, op.vout)
-                .map(|(rec, out)| (fk, rec, out))
-        })
+    // Fast path: tip_prevout (txid-authoritative, same as wave).
+    let tip_hit = query
+        .tip_prevout_tx_and_output_by_txid(&prev_txid, op.vout)
         .or_else(|| {
-            query
-                .tip_prevout_tx_and_output_by_txid(&prev_txid, op.vout)
+            prev_fk.and_then(|fk| {
+                query
+                    .tip_prevout_tx_and_output(fk, op.vout)
+                    .filter(|(rec, _)| rec.txid == prev_txid)
+                    .map(|(rec, out)| (fk, rec, out))
+            })
         });
     if let Some((prev_fk, prev_rec, out)) = tip_hit {
         connect_prevout_stats::TIP_HIT.fetch_add(1, Ordering::Relaxed);
@@ -770,20 +770,27 @@ fn resolve_prevout(
         }
     }
 
-    // Cold path: Class A / store.
+    // Cold path: Class A / store (fk only when txid matches wire outpoint).
     if let Some(prev_fk) = prev_fk {
         if let Ok(prev_rec) = query.get_tx_class_a(prev_fk) {
-            if let Ok(out) = find_output(query, &prev_rec, op.vout) {
-                let (is_cb, cb_h) =
-                    coinbase_info(query, prev_fk, &prev_rec, wave_prevouts, coinbase_height_cache)?;
-                if !is_cb || cb_h.is_some() {
-                    return Ok(ResolvedPrevout {
-                        txout: TxOut {
-                            value: Amount::from_sat(out.value as u64),
-                            script_pubkey: ScriptBuf::from_bytes(out.script),
-                        },
-                        coinbase_height: cb_h,
-                    });
+            if prev_rec.txid == prev_txid {
+                if let Ok(out) = find_output(query, &prev_rec, op.vout) {
+                    let (is_cb, cb_h) = coinbase_info(
+                        query,
+                        prev_fk,
+                        &prev_rec,
+                        wave_prevouts,
+                        coinbase_height_cache,
+                    )?;
+                    if !is_cb || cb_h.is_some() {
+                        return Ok(ResolvedPrevout {
+                            txout: TxOut {
+                                value: Amount::from_sat(out.value as u64),
+                                script_pubkey: ScriptBuf::from_bytes(out.script),
+                            },
+                            coinbase_height: cb_h,
+                        });
+                    }
                 }
             }
         }

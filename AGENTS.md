@@ -15,6 +15,12 @@ Do the release build even if tests already ran in debug — the operator typical
 
 If you cannot commit (hooks, secrets, user said not to), still rebuild release and say explicitly that the tree was **not** committed.
 
+## Tests required for code changes
+
+- **Always ship test coverage with behavioral code changes.** Prefer unit tests next to the code (`#[cfg(test)]` in the same crate) or focused integration tests in `rbitcoin-test` / crate `tests/`. Pure docs/comments need no tests.
+- **Bug fixes must include a regression test** that fails without the fix and passes with it. Do not land a “fix” that only re-describes production logs; encode the failing case (fixture block, synthetic store, prevout/script edge) so it cannot silently come back.
+- Run the new/related tests before commit (e.g. `cargo test -p <crate> …` or the scenario that covers the change). If a full-store mainnet case cannot run in this VM (see datadir notes), still add a synthetic/unit regression that pins the logic.
+
 ## Datadir / store on this workspace (do not open in the agent VM)
 
 The workspace is mounted into the agent VM as **9p** (`workspace` on `/home/agent/workspace`, `trans=virtio`). On this mount:

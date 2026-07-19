@@ -863,6 +863,14 @@ pub async fn parallel_ibd_cancellable(
             ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
             let (sh_warm, sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head, sh_index) =
                 rbitcoin_query::class_c_phase_stats::sample_sh_sub_and_reset();
+            let (
+                wf_body_ns,
+                wf_parent_tx_ns,
+                wf_parent_out_ns,
+                wf_spent_ns,
+                wf_cb_ns,
+                wf_tip_note_ns,
+            ) = rbitcoin_query::wave_fill_stats::sample_and_reset();
             // sh_ns is sum of substeps (same sample window) — no phantom other_ms.
             let phase_any = recon_ns
                 + connect_ns
@@ -875,6 +883,13 @@ pub async fn parallel_ibd_cancellable(
                 + phase_blks
                 > 0;
             let recon_sub_any = prefetch_ns + wave_fill_ns + wire_ns > 0;
+            let wave_fill_sub_any = wf_body_ns
+                + wf_parent_tx_ns
+                + wf_parent_out_ns
+                + wf_spent_ns
+                + wf_cb_ns
+                + wf_tip_note_ns
+                > 0;
             let sh_any = sh_warm
                 + sh_filter
                 + sh_collect
@@ -925,6 +940,24 @@ pub async fn parallel_ibd_cancellable(
                     wave_fill_ns / 1_000_000,
                     wire_ns / 1_000_000,
                     recon_ns / 1_000_000,
+                );
+            }
+            if wave_fill_sub_any {
+                info!(
+                    "ibd: wave_fill_phases body_ms={} parent_tx_ms={} parent_out_ms={} spent_ms={} cb_ms={} tip_note_ms={} (sum_ms={})",
+                    wf_body_ns / 1_000_000,
+                    wf_parent_tx_ns / 1_000_000,
+                    wf_parent_out_ns / 1_000_000,
+                    wf_spent_ns / 1_000_000,
+                    wf_cb_ns / 1_000_000,
+                    wf_tip_note_ns / 1_000_000,
+                    (wf_body_ns
+                        + wf_parent_tx_ns
+                        + wf_parent_out_ns
+                        + wf_spent_ns
+                        + wf_cb_ns
+                        + wf_tip_note_ns)
+                        / 1_000_000,
                 );
             }
             if sh_any {

@@ -49,17 +49,25 @@ impl Query {
     /// Prefetch parents + wave-body creates into [`WavePrevoutCache`].
     ///
     /// Call after [`Self::prefetch_class_a_for_block_hashes`] so body runs are warm.
-    /// Wave-body rows are taken from Class A **without** re-reading the store when
-    /// reconstruct-ready (avoids double Class A IO). External parents load **only
-    /// needed vouts** (sparse `get_output_at`), not full output runs.
+    ///
+    /// Cold-start correctness (vs earlier wave_fill experiments):
+    /// - Tip short-circuit only when **every** needed vout is already live in tip
+    /// - External parents are **sorted by fk** and bulk-warmed (tx + outs) then
+    ///   spent-filtered; missing unspent outs re-load from store (no holes)
+    /// - Live slots are promoted into tip_prevout for the next wave only after
+    ///   spent filter (merge never clears existing lives; refuses txid mismatch)
+    ///
+    /// Sub-timers: [`crate::wave_fill_stats`].
     ///
     /// Returns `(entries_loaded, wave_map)`.
     pub fn prefetch_tip_prevouts_for_block_hashes(
         &self,
         hashes: &[[u8; 32]],
     ) -> Result<(usize, crate::WavePrevoutCache), QueryError> {
+        use crate::wave_fill_stats::{self as wf, add as wf_add};
         use crate::wave_prevout::ThinInput;
         use std::collections::{HashMap, HashSet};
+        use std::time::Instant;
 
         // Pass 1: wave body fks.
         let mut wave_fks: HashSet<u64> = HashSet::new();
@@ -84,6 +92,7 @@ impl Query {
         let mut noted = 0usize;
 
         // Pass 2: wave bodies from Class A (prefetched) — one cache hit each, no store.
+        let t_body = Instant::now();
         let mut parent_needed: HashMap<u64, HashSet<u32>> = HashMap::new();
         for &fk in &wave_tx_fks {
             let (tx, outs, inputs) = self.wave_body_from_class_a(fk)?;
@@ -119,31 +128,42 @@ impl Query {
             }
             wave.insert_thin_inputs(fk, edges);
         }
+        wf_add(&wf::BODY_NS, t_body.elapsed().as_nanos() as u64);
 
-        // Pass 3: external parents — sparse needed vouts only (no full run).
+        // Pass 3: external parents, sorted by fk for Class A / body locality.
+        let mut parents: Vec<(u64, HashSet<u32>)> = parent_needed.into_iter().collect();
+        parents.sort_unstable_by_key(|(pid, _)| *pid);
         let spend_index_on = self.spend_index_enabled();
-        for (pid, needed_vouts) in parent_needed {
-            let fk = Fk(pid);
-            // Prefer tip_prevout live slots (write-through unspent).
-            if needed_vouts
-                .iter()
-                .any(|&v| self.tip_prevout_cache.has_live_output(fk, v))
-                || self.tip_prevout_cache.has_full_outputs(fk)
-            {
+
+        for (pid, needed_vouts) in &parents {
+            let fk = Fk(*pid);
+
+            // Tip short-circuit only when **complete** (all needed live).
+            // Partial tip cover used to `continue` with holes → wrong/missing prevouts.
+            let tip_complete = !needed_vouts.is_empty()
+                && needed_vouts
+                    .iter()
+                    .all(|&v| self.tip_prevout_cache.has_live_output(fk, v));
+            if tip_complete {
                 if let Some(tx) = self.tip_prevout_cache.get_tx(fk) {
                     let n = tx.output_count as usize;
                     let mut slots: Vec<Option<OutputRecord>> = vec![None; n];
-                    let mut any = false;
-                    for &v in &needed_vouts {
-                        if let Some(o) = self.tip_prevout_cache.get_output_at(fk, v) {
-                            if (v as usize) < slots.len() {
+                    let mut ok = true;
+                    for &v in needed_vouts {
+                        match self.tip_prevout_cache.get_output_at(fk, v) {
+                            Some(o) if (v as usize) < slots.len() => {
                                 slots[v as usize] = Some(o);
-                                any = true;
+                            }
+                            _ => {
+                                ok = false;
+                                break;
                             }
                         }
                     }
-                    if any {
+                    if ok {
+                        let t_cb = Instant::now();
                         let cb_h = self.coinbase_height_for_tx(fk, &tx)?;
+                        wf_add(&wf::CB_HEIGHT_NS, t_cb.elapsed().as_nanos() as u64);
                         wave.insert_parent_slots(fk, tx, slots, Some(cb_h));
                         noted += 1;
                         continue;
@@ -151,10 +171,77 @@ impl Query {
                 }
             }
 
+            // Bulk warm: tx then outs (sorted parent loop ⇒ sequential-ish store).
+            let t_tx = Instant::now();
             let tx = self.get_tx_class_a(fk)?;
-            let slots =
-                self.parent_needed_output_slots(fk, &tx, &needed_vouts, spend_index_on)?;
+            wf_add(&wf::PARENT_TX_NS, t_tx.elapsed().as_nanos() as u64);
+
+            let t_out = Instant::now();
+            let mut outs_map: HashMap<u32, OutputRecord> =
+                HashMap::with_capacity(needed_vouts.len());
+            let n = tx.output_count as usize;
+            let need_n = needed_vouts.len();
+            let use_full =
+                n > 0 && (need_n >= 8 || need_n.saturating_mul(4) >= n.max(1) || n <= 64);
+            if use_full && n > 0 {
+                let raw = self.tx_output_run_class_a(&tx)?;
+                for &v in needed_vouts {
+                    let vi = v as usize;
+                    if vi < raw.len() {
+                        outs_map.insert(v, raw[vi].clone());
+                    }
+                }
+            } else if n > 0 {
+                let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
+                let mut vouts: Vec<u32> = needed_vouts.iter().copied().collect();
+                vouts.sort_unstable();
+                for v in vouts {
+                    if (v as usize) >= n {
+                        continue;
+                    }
+                    if let Some(o) = self.class_a_cache.get_output_at(fk, v) {
+                        outs_map.insert(v, o);
+                        continue;
+                    }
+                    let o = self.store.get_output_at(Fk(run), tx.output_count, v)?;
+                    outs_map.insert(v, o);
+                }
+            }
+            wf_add(&wf::PARENT_OUT_NS, t_out.elapsed().as_nanos() as u64);
+
+            // Assemble: spent-filter; never leave a hole for an unspent needed vout.
+            let mut slots: Vec<Option<OutputRecord>> = vec![None; n];
+            for &v in needed_vouts {
+                let vi = v as usize;
+                if vi >= n {
+                    continue;
+                }
+                let t_sp = Instant::now();
+                let spent = self.outpoint_spent_for_wave_fill(&tx.txid, v, spend_index_on)?;
+                wf_add(&wf::SPENT_NS, t_sp.elapsed().as_nanos() as u64);
+                if spent {
+                    continue;
+                }
+                if let Some(o) = outs_map.remove(&v) {
+                    slots[vi] = Some(o);
+                    continue;
+                }
+                // Defensive reload (warm miss / eviction) — never insert incomplete live.
+                let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
+                let o = self.store.get_output_at(Fk(run), tx.output_count, v)?;
+                slots[vi] = Some(o);
+            }
+
+            let t_cb = Instant::now();
             let cb_h = self.coinbase_height_for_tx(fk, &tx)?;
+            wf_add(&wf::CB_HEIGHT_NS, t_cb.elapsed().as_nanos() as u64);
+
+            // Promote live slots for the next wave (cold start builds tip from here).
+            let t_tip = Instant::now();
+            self.tip_prevout_cache
+                .note_live_slots(fk, tx.clone(), &slots);
+            wf_add(&wf::TIP_NOTE_NS, t_tip.elapsed().as_nanos() as u64);
+
             wave.insert_parent_slots(fk, tx, slots, Some(cb_h));
             noted += 1;
         }
@@ -203,78 +290,6 @@ impl Query {
             self.tx_input_run(&tx)?
         };
         Ok((tx, outs, inputs))
-    }
-
-    /// Load only **needed** parent vouts (sparse). Avoids full `get_output_run` when
-    /// the parent has many outputs but only a few are spent in this wave.
-    ///
-    /// Strategy:
-    /// 1. Class A per-vout if the full run is already cached
-    /// 2. Else if many vouts needed relative to count → one full run (sequential)
-    /// 3. Else per-vout `get_output_at` (random, small)
-    fn parent_needed_output_slots(
-        &self,
-        fk: Fk,
-        tx: &TxRecord,
-        needed_vouts: &std::collections::HashSet<u32>,
-        spend_index_on: bool,
-    ) -> Result<Vec<Option<OutputRecord>>, QueryError> {
-        let n = tx.output_count as usize;
-        let mut slots: Vec<Option<OutputRecord>> = vec![None; n];
-        if n == 0 || needed_vouts.is_empty() {
-            return Ok(slots);
-        }
-
-        // Prefer already-cached full run (no extra IO).
-        if let Some(raw) = self.class_a_cache.get_outputs(fk) {
-            for &v in needed_vouts {
-                let vi = v as usize;
-                if vi >= raw.len() {
-                    continue;
-                }
-                if !self.outpoint_spent_for_wave_fill(&tx.txid, v, spend_index_on)? {
-                    slots[vi] = Some(raw[vi].clone());
-                }
-            }
-            return Ok(slots);
-        }
-
-        let need_n = needed_vouts.len();
-        // Full run when densish: avoids N random probes for large needed sets.
-        let use_full = need_n >= 8 || need_n.saturating_mul(4) >= n.max(1);
-        if use_full {
-            let raw = self.tx_output_run_class_a(tx)?;
-            for &v in needed_vouts {
-                let vi = v as usize;
-                if vi >= raw.len() {
-                    continue;
-                }
-                if !self.outpoint_spent_for_wave_fill(&tx.txid, v, spend_index_on)? {
-                    slots[vi] = Some(raw[vi].clone());
-                }
-            }
-            return Ok(slots);
-        }
-
-        // Sparse: one random read per needed vout — do **not** fill class_a with full run.
-        let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-        for &v in needed_vouts {
-            let vi = v as usize;
-            if vi >= n {
-                continue;
-            }
-            if self.outpoint_spent_for_wave_fill(&tx.txid, v, spend_index_on)? {
-                continue;
-            }
-            // class_a single-slot hit first
-            if let Some(o) = self.class_a_cache.get_output_at(fk, v) {
-                slots[vi] = Some(o);
-                continue;
-            }
-            let o = self.store.get_output_at(Fk(run), tx.output_count, v)?;
-            slots[vi] = Some(o);
-        }
-        Ok(slots)
     }
 
     fn outpoint_spent_for_wave_fill(

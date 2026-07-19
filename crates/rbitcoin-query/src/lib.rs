@@ -121,6 +121,46 @@ pub mod connect_prevout_stats {
     }
 }
 
+/// Wave-fill sub-phase wall times (nanoseconds; reset by the IBD sampler).
+///
+/// Breaks down the dominant `wave_fill` recon cost: body vs parent warm vs spent
+/// vs coinbase height vs tip_prevout promote.
+pub mod wave_fill_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Wave-body txs from Class A → wave map + parent_needed collect.
+    pub static BODY_NS: AtomicU64 = AtomicU64::new(0);
+    /// External parent `get_tx` (sorted-by-fk warm).
+    pub static PARENT_TX_NS: AtomicU64 = AtomicU64::new(0);
+    /// External parent output loads (sorted fk; full run or sparse).
+    pub static PARENT_OUT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Durable / local spent filter on needed parent vouts.
+    pub static SPENT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Coinbase create-height for parents.
+    pub static CB_HEIGHT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Promote live parent slots into tip_prevout.
+    pub static TIP_NOTE_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// `(body, parent_tx, parent_out, spent, cb_height, tip_note)` nanoseconds.
+    pub fn sample_and_reset() -> (u64, u64, u64, u64, u64, u64) {
+        (
+            BODY_NS.swap(0, Ordering::Relaxed),
+            PARENT_TX_NS.swap(0, Ordering::Relaxed),
+            PARENT_OUT_NS.swap(0, Ordering::Relaxed),
+            SPENT_NS.swap(0, Ordering::Relaxed),
+            CB_HEIGHT_NS.swap(0, Ordering::Relaxed),
+            TIP_NOTE_NS.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    #[inline]
+    pub(crate) fn add(part: &AtomicU64, ns: u64) {
+        if ns > 0 {
+            part.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+}
+
 
 /// One transaction to apply when connecting a block.
 #[derive(Clone, Debug)]

@@ -221,6 +221,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], default_port(config.network))));
 
     let start_tip = handle.query.tip_height().map(|h| h.0).unwrap_or(0);
+    let run_started = Instant::now();
     info!(
         "rbitcoin-node starting network={} datadir={} tip={start_tip}",
         config.network.as_str(),
@@ -643,11 +644,17 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
 
-    info!(
-        "node: shutting down tip={:?} (+{} blocks this run)",
-        node.tip_height(),
-        node.tip_height().unwrap_or(0).saturating_sub(start_tip)
-    );
+    {
+        let end_tip = node.tip_height().unwrap_or(0);
+        let blocks_this_run = end_tip.saturating_sub(start_tip);
+        let uptime = run_started.elapsed();
+        let uptime_secs = uptime.as_secs_f64().max(1e-9);
+        let blocks_per_hour = (blocks_this_run as f64) * 3600.0 / uptime_secs;
+        info!(
+            "node: shutting down tip={end_tip:?} (+{blocks_this_run} blocks this run, \
+             uptime={uptime:?}, ~{blocks_per_hour:.1} blk/h)"
+        );
+    }
 
     for e in electrum_handles {
         e.shutdown().await;

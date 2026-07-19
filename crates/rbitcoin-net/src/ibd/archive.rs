@@ -8,7 +8,7 @@ use rbitcoin_log::debug;
 use rbitcoin_primitives::Fk;
 use rbitcoin_query::TxApply;
 use rbitcoin_store::HeaderRecord;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -229,6 +229,8 @@ pub(crate) fn spawn_archive_pipeline(
     stats: Arc<ArchivePipelineStats>,
     archive_queued: Arc<ArchiveQueueBudget>,
     confirm_lag: Arc<AtomicU32>,
+    /// Cooperative stop (SIGINT): exit after current write batch; drop queue.
+    stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         const WRITE_Q: usize = 4096;
@@ -247,6 +249,7 @@ pub(crate) fn spawn_archive_pipeline(
         let write_arch_q = Arc::clone(&archive_queued);
         let write_depth = Arc::clone(&write_q_depth);
         let write_lag = Arc::clone(&confirm_lag);
+        let write_stop = Arc::clone(&stop);
 
         let writer = std::thread::Builder::new()
             .name("ibd-archive-writer".into())
@@ -260,6 +263,16 @@ pub(crate) fn spawn_archive_pipeline(
                 let mut pri_open = true;
                 let mut far_open = true;
                 loop {
+                    if write_stop.load(Ordering::Relaxed) {
+                        // Drop queued prepared work so prep can exit; skip writes.
+                        while pri_write_rx.try_recv().is_ok() {
+                            write_q_dec(&write_depth);
+                        }
+                        while far_write_rx.try_recv().is_ok() {
+                            write_q_dec(&write_depth);
+                        }
+                        break;
+                    }
                     if !pri_open && !far_open {
                         break;
                     }
@@ -435,6 +448,7 @@ pub(crate) fn spawn_archive_pipeline(
         let prep_stats = Arc::clone(&stats);
         let prep_result_tx = result_tx.clone();
         let prep_depth = Arc::clone(&write_q_depth);
+        let prep_stop = Arc::clone(&stop);
 
         let prep_thread = std::thread::Builder::new()
             .name("ibd-archive-prep".into())
@@ -442,6 +456,11 @@ pub(crate) fn spawn_archive_pipeline(
                 let mut pri_open = true;
                 let mut far_open = true;
                 loop {
+                    if prep_stop.load(Ordering::Relaxed) {
+                        while pri_prep_rx.try_recv().is_ok() {}
+                        while far_prep_rx.try_recv().is_ok() {}
+                        break;
+                    }
                     if !pri_open && !far_open {
                         break;
                     }
@@ -516,9 +535,21 @@ pub(crate) fn spawn_archive_pipeline(
             })
             .expect("spawn ibd-archive-prep");
 
-        while let Some(mut job) = job_rx.recv().await {
+        while !stop.load(Ordering::Relaxed) {
+            let mut job = match tokio::time::timeout(Duration::from_millis(50), job_rx.recv()).await
+            {
+                Ok(Some(j)) => j,
+                Ok(None) => break, // channel closed
+                Err(_) => continue, // poll stop
+            };
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             let priority = job.priority;
             loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 let tx = if priority {
                     &pri_prep_tx
                 } else {
@@ -546,6 +577,7 @@ pub(crate) fn spawn_archive_pipeline(
                 }
             }
         }
+        stop.store(true, Ordering::Relaxed);
         drop(pri_prep_tx);
         drop(far_prep_tx);
         let _ = tokio::task::spawn_blocking(move || {

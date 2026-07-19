@@ -52,7 +52,7 @@ use bitcoin::p2p::Magic;
 use bitcoin::BlockHash;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -438,13 +438,15 @@ pub async fn parallel_ibd_cancellable(
     }
     let (arch_job_tx, arch_job_rx) = mpsc::unbounded_channel::<ArchiveJob>();
     let (arch_res_tx, mut arch_res_rx) = mpsc::unbounded_channel::<ArchiveResult>();
-    let pipeline = spawn_archive_pipeline(
+    let archive_stop = Arc::new(AtomicBool::new(false));
+    let mut pipeline = spawn_archive_pipeline(
         hub.clone(),
         arch_job_rx,
         arch_res_tx,
         Arc::clone(&pipe_stats),
         Arc::clone(&archive_queued),
         Arc::clone(&confirm_lag),
+        Arc::clone(&archive_stop),
     );
 
     // A.4: background budgeted head-spill (quiet threshold + idle IO prio).
@@ -998,39 +1000,59 @@ pub async fn parallel_ibd_cancellable(
     }
 
     let cancelled_exit = cancelled();
+    let t_teardown = Instant::now();
 
-    // Stop head-spill first so it does not compete with teardown flush later.
-    if let Some(w) = head_spill_worker.take() {
-        w.request_stop();
-        drop(w); // join
-    }
-
-    // Stop confirm engine first (may be mid-validate).
-    confirm_feed.request_stop();
-    let _ = confirm_engine.join();
-
-    // Tear down peers first so sockets stop filling archive/job channels.
-    for s in &st.slots {
-        let _ = s.cmd_tx.send(PeerCmd::Shutdown);
-        s.task.abort();
-    }
-    st.slots.clear();
+    // 1) Network first: stop downloads + disconnect every peer immediately.
+    //    Do this before waiting on confirm/archive so SIGINT is responsive.
+    disconnect_all_peers(&mut st);
     if let Some(h) = redial_handle.take() {
         h.abort();
     }
+    info!(
+        "ibd: peers disconnected in {:?}",
+        t_teardown.elapsed()
+    );
 
-    // Close archive ingress and **await** the pipeline so prep+writer OS threads
-    // join. `abort()` used to kill the task before that join — writer kept
-    // inserting heads during shutdown flush (second multi-minute point spill).
+    // 2) Signal cooperative stops (confirm mid-batch may still finish current wave).
+    confirm_feed.request_stop();
+    archive_stop.store(true, Ordering::Relaxed);
+    if let Some(w) = head_spill_worker.take() {
+        w.request_stop();
+        drop(w);
+    }
+
+    // 3) Stop feeding the archive queue; prep/writer exit on stop + closed channels.
     drop(arch_job_tx);
-    match tokio::time::timeout(Duration::from_secs(90), pipeline).await {
-        Ok(Ok(())) => info!("ibd: archive pipeline stopped cleanly"),
-        Ok(Err(e)) => warn!("ibd: archive pipeline join: {e}"),
+
+    // Confirm join (bounded): do not block shutdown for multi-minute waves.
+    let confirm_join = tokio::task::spawn_blocking(move || {
+        let _ = confirm_engine.join();
+    });
+    match tokio::time::timeout(Duration::from_secs(20), confirm_join).await {
+        Ok(Ok(())) => info!("ibd: confirm engine stopped ({:?})", t_teardown.elapsed()),
+        Ok(Err(e)) => warn!("ibd: confirm join task: {e}"),
         Err(_) => warn!(
-            "ibd: archive pipeline still running after 90s — shutdown flush may race writer"
+            "ibd: confirm engine still running after 20s — continuing teardown ({:?})",
+            t_teardown.elapsed()
         ),
     }
-    // Best-effort drain of results already in the channel (non-blocking).
+
+    // Archive pipeline: short wait, then abort the tokio task (OS threads check stop).
+    match tokio::time::timeout(Duration::from_secs(15), &mut pipeline).await {
+        Ok(Ok(())) => info!(
+            "ibd: archive pipeline stopped cleanly ({:?})",
+            t_teardown.elapsed()
+        ),
+        Ok(Err(e)) => warn!("ibd: archive pipeline join: {e}"),
+        Err(_) => {
+            warn!(
+                "ibd: archive pipeline slow after 15s — aborting ({:?})",
+                t_teardown.elapsed()
+            );
+            pipeline.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(5), pipeline).await;
+        }
+    }
     while let Ok(r) = arch_res_rx.try_recv() {
         match r {
             ArchiveResult::Ok { hash, .. } => st.body.mark_archived(hash),
@@ -1038,16 +1060,32 @@ pub async fn parallel_ibd_cancellable(
         }
     }
 
-    // Confirm engine already stopped; remaining tip catch-up is left to a later run
-    // (or happens before stop if st.ordered was offered).
-    let _ = cancelled_exit;
-
     let n = accepted.load(Ordering::SeqCst);
     info!(
-        "ibd: parallel done accepted={n} tip={:?} (started {start_tip}, cancelled={cancelled_exit})",
-        hub.tip_height()
+        "ibd: parallel done accepted={n} tip={:?} (started {start_tip}, cancelled={cancelled_exit}, teardown={:?})",
+        hub.tip_height(),
+        t_teardown.elapsed()
     );
     Ok(n)
+}
+
+/// Immediately stop getdata and disconnect every peer (SIGINT / IBD exit).
+fn disconnect_all_peers(st: &mut IbdWorkState) {
+    let n = st.slots.len();
+    if n == 0 {
+        return;
+    }
+    for s in &st.slots {
+        let _ = s.cmd_tx.send(PeerCmd::Shutdown);
+        s.task.abort();
+    }
+    st.inflight.clear();
+    for s in &mut st.slots {
+        s.in_flight.clear();
+        s.alive = false;
+    }
+    st.slots.clear();
+    info!("ibd: disconnected {n} peer(s)");
 }
 
 

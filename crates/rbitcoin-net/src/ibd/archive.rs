@@ -393,6 +393,11 @@ pub(crate) fn spawn_archive_pipeline(
                                     return;
                                 }
                             }
+                            // A.1: interleave one budgeted head-spill chunk after each
+                            // Class A mega-batch so overlays drain without multi-min storms.
+                            let chunk = rbitcoin_store::spill_chunk_size();
+                            let _ = write_hub.query.spill_point_head_budget(chunk);
+                            let _ = write_hub.query.spill_tx_head_budget(chunk);
                             blocks_since_flush =
                                 blocks_since_flush.saturating_add(n_blocks);
                             if blocks_since_flush >= FLUSH_EVERY_BLOCKS {

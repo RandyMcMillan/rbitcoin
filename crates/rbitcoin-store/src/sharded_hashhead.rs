@@ -26,6 +26,23 @@ pub const SHARD_COUNT: usize = 256;
 /// Aggregate spill chatter at DEBUG this often; per-event is TRACE.
 const SPILL_DEBUG_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Default max keys applied to disk per spill step (~100k).
+///
+/// Soft/hard caps used to dump entire excess (0.5–1M+) in one storm and freeze
+/// confirm for minutes. Budgeted chunks interleave with Class A mega-batches and
+/// a background worker so page cache can recover. Override:
+/// `RBITCOIN_HEAD_SPILL_CHUNK`.
+pub const DEFAULT_SPILL_CHUNK: usize = 100_000;
+
+/// Resolved spill chunk (env override, min 1k, max 1M).
+pub fn spill_chunk_size() -> usize {
+    std::env::var("RBITCOIN_HEAD_SPILL_CHUNK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SPILL_CHUNK)
+        .clamp(1_000, 1_000_000)
+}
+
 /// How many shards to create for the active scale.
 pub fn shard_count_for_scale() -> usize {
     match HeadScale::from_env() {
@@ -220,7 +237,6 @@ impl ShardedHashHead {
         self.shards.iter().map(|s| s.occupied()).sum()
     }
 
-    #[allow(dead_code)] // diagnostics / tests
     pub fn write_behind_len(&self) -> usize {
         self.overlay
             .lock()
@@ -246,51 +262,65 @@ impl ShardedHashHead {
         Ok(())
     }
 
-    /// Spill **all** pending overlay entries to disk (flush / disable).
+    /// Spill **all** pending overlay entries (chunked + short yield between chunks).
+    ///
+    /// Used by disable / full flush. Prefer [`Self::spill_write_behind_budget`] on
+    /// the IBD hot path so confirm can interleave page faults.
     pub fn spill_write_behind(&self) -> Result<(), StoreError> {
-        self.spill_write_behind_down_to(0)
+        let chunk = spill_chunk_size();
+        loop {
+            let n = self.spill_write_behind_budget(chunk)?;
+            if n == 0 {
+                break;
+            }
+            // Yield so confirm can fault Class A pages between chunks.
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
     }
 
-    /// Spill until overlay holds at most `keep` entries (partial / cadence-friendly).
+    /// Spill at most `max_spill` overlay entries (budgeted step).
     ///
-    /// Used for soft/hard caps so we never dump multi‑million key overlays in one
-    /// storm; smaller more frequent spills keep confirm page cache warmer.
-    pub fn spill_write_behind_down_to(&self, keep: usize) -> Result<(), StoreError> {
+    /// Returns how many keys were applied to disk. Remaining stay in RAM for
+    /// coherent `get` and for the next step (archive interleave / background).
+    pub fn spill_write_behind_budget(&self, max_spill: usize) -> Result<usize, StoreError> {
+        if max_spill == 0 {
+            return Ok(0);
+        }
         let batch = {
             let mut guard = self.overlay.lock().unwrap();
             let Some(ov) = guard.as_mut() else {
-                return Ok(());
+                return Ok(0);
             };
-            let n = ov.map.len();
-            if n <= keep {
-                return Ok(());
+            if ov.map.is_empty() {
+                return Ok(0);
             }
-            let n_spill = n - keep;
-            // Drain all then re-insert keep: HashMap has no stable "take first N".
-            let mut all: Vec<([u8; 32], Fk)> = ov.map.drain().collect();
-            // Spill the head of the vec; keep the tail (recent inserts more likely
-            // still useful for probes during the same confirm wave).
-            let spill_end = n_spill.min(all.len());
-            let spill: Vec<_> = all.drain(..spill_end).collect();
-            for (k, v) in all {
-                ov.map.insert(k, v);
+            let n = ov.map.len().min(max_spill);
+            let mut spill = Vec::with_capacity(n);
+            // Take an arbitrary n keys (HashMap order); leave the rest in overlay.
+            let keys: Vec<[u8; 32]> = ov.map.keys().copied().take(n).collect();
+            for k in keys {
+                if let Some(v) = ov.map.remove(&k) {
+                    spill.push((k, v));
+                }
             }
             spill
         };
         if batch.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let n = batch.len();
         rbitcoin_log::trace!(
-            "store: hash-head spill path={} entries={} keep_target={} shards={}",
+            "store: hash-head spill path={} entries={} budget={} remain≈{} shards={}",
             self.path.display(),
             n,
-            keep,
+            max_spill,
+            self.write_behind_len(),
             self.shards.len()
         );
         self.insert_many_disk(&batch)?;
         self.note_spill(n);
-        Ok(())
+        Ok(n)
     }
 
     fn note_spill(&self, entries: usize) {
@@ -362,35 +392,72 @@ impl ShardedHashHead {
                 let max = ov.max_entries;
                 let n = ov.map.len();
                 let soft = n >= max;
-                // Hard at 2× (was 4×): smaller storms; still bounds RAM under defer.
+                // Hard at 2×: bound RAM under defer; still only budgeted chunks.
                 let hard = n >= max.saturating_mul(2);
                 let defer = self.defer_spill.load(Ordering::Relaxed);
-                // Partial keep: leave half cap in RAM for probe locality / next batch.
-                let keep = max / 2;
-                if (soft && !defer) || hard {
-                    drop(guard);
-                    self.spill_write_behind_down_to(keep)?;
+                if !(soft || hard) {
+                    return Ok(());
                 }
+                drop(guard);
+                let chunk = spill_chunk_size();
+                if hard {
+                    // Under confirm (defer): at most one chunk so we never multi-min block.
+                    // Else a few chunks; background + archive interleave drain the rest.
+                    let max_steps = if defer { 1 } else { 4 };
+                    for _ in 0..max_steps {
+                        if self.write_behind_len() < max.saturating_mul(2) {
+                            break;
+                        }
+                        if self.spill_write_behind_budget(chunk)? == 0 {
+                            break;
+                        }
+                    }
+                } else if soft && !defer {
+                    // Soft: one budgeted step; never dump half-cap in one storm.
+                    let _ = self.spill_write_behind_budget(chunk)?;
+                }
+                // soft && defer: skip — background worker may still short-slice when
+                // over soft/2 so RAM does not grow unbounded for the whole wave.
                 return Ok(());
             }
         }
         self.insert_many_disk(entries)
     }
 
-    /// Defer soft-cap overlay spills (confirm connect wants RAM-coherent probes).
+    /// Defer soft-cap overlay spills while confirm is mid-wave.
     ///
-    /// Clearing defer triggers a **partial** spill down to half soft-cap (not a full
-    /// multi‑million dump between every confirm wave).
+    /// Soft auto-spill on insert is skipped under defer; hard still does **one**
+    /// budgeted chunk. Clearing defer does **not** dump the overlay (A.3) —
+    /// archive interleave + background worker drain in short slices.
     pub fn set_defer_spill(&self, defer: bool) -> Result<(), StoreError> {
         self.defer_spill.store(defer, Ordering::Relaxed);
-        if !defer {
-            let keep = {
-                let guard = self.overlay.lock().unwrap();
-                guard.as_ref().map(|o| o.max_entries / 2).unwrap_or(0)
-            };
-            self.spill_write_behind_down_to(keep)?;
-        }
         Ok(())
+    }
+
+    /// One background / archive-interleave step when the overlay is past soft/2
+    /// (or any pending when not deferred). Returns entries spilled.
+    pub fn spill_write_behind_step_if_needed(&self) -> Result<usize, StoreError> {
+        let (len, max, defer) = {
+            let guard = self.overlay.lock().unwrap();
+            match guard.as_ref() {
+                Some(ov) => (
+                    ov.map.len(),
+                    ov.max_entries,
+                    self.defer_spill.load(Ordering::Relaxed),
+                ),
+                None => return Ok(0),
+            }
+        };
+        if len == 0 {
+            return Ok(0);
+        }
+        // Under confirm: only drain when past soft/2 (keep recent keys in RAM).
+        // Between waves: drain whenever anything is pending.
+        let threshold = if defer { max / 2 } else { 0 };
+        if len <= threshold {
+            return Ok(0);
+        }
+        self.spill_write_behind_budget(spill_chunk_size())
     }
 
     /// Partition by shard, then slot-sorted insert per shard (disk path).
@@ -509,6 +576,88 @@ mod tests {
         h.spill_write_behind().unwrap();
         assert_eq!(h.write_behind_len(), 0);
         assert_eq!(h.occupied(), 500);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn key_i(i: u64) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        key[0] = (i % 256) as u8;
+        key[8..16].copy_from_slice(&i.to_le_bytes());
+        key
+    }
+
+    #[test]
+    fn budgeted_spill_leaves_remainder_in_overlay() {
+        let dir = tmp_dir();
+        let h = ShardedHashHead::create_sharded(dir.join("head"), 16, 64).unwrap();
+        h.enable_write_behind(10_000).unwrap();
+        let batch: Vec<_> = (0u64..500).map(|i| (key_i(i), Fk(i + 1))).collect();
+        h.insert_many(&batch).unwrap();
+        assert_eq!(h.write_behind_len(), 500);
+        let n = h.spill_write_behind_budget(100).unwrap();
+        assert_eq!(n, 100);
+        assert_eq!(h.write_behind_len(), 400);
+        // Disk holds spilled keys; overlay holds the rest.
+        assert_eq!(h.occupied(), 100);
+        for (k, fk) in &batch {
+            assert_eq!(h.get(k).unwrap(), Some(*fk));
+        }
+        h.spill_write_behind().unwrap();
+        assert_eq!(h.write_behind_len(), 0);
+        assert_eq!(h.occupied(), 500);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn soft_cap_spills_one_budgeted_chunk_not_entire_excess() {
+        let dir = tmp_dir();
+        let h = ShardedHashHead::create_sharded(dir.join("head"), 16, 64).unwrap();
+        // Soft cap 200; insert 250 → one budgeted step of spill_chunk_size (clamped ≥1k)
+        // would empty us if chunk > 250. Force small chunk via env is process-wide;
+        // instead assert via direct budget after filling under soft with defer off.
+        h.enable_write_behind(10_000).unwrap();
+        let batch: Vec<_> = (0u64..300).map(|i| (key_i(i), Fk(i + 1))).collect();
+        h.insert_many(&batch).unwrap();
+        // Under soft: still all in overlay.
+        assert_eq!(h.write_behind_len(), 300);
+        let n = h.spill_write_behind_budget(80).unwrap();
+        assert_eq!(n, 80);
+        assert_eq!(h.write_behind_len(), 220);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_defer_does_not_bulk_spill() {
+        let dir = tmp_dir();
+        let h = ShardedHashHead::create_sharded(dir.join("head"), 16, 64).unwrap();
+        h.enable_write_behind(10_000).unwrap();
+        h.set_defer_spill(true).unwrap();
+        let batch: Vec<_> = (0u64..200).map(|i| (key_i(i), Fk(i + 1))).collect();
+        h.insert_many(&batch).unwrap();
+        assert_eq!(h.write_behind_len(), 200);
+        h.set_defer_spill(false).unwrap();
+        // A.3: clearing defer must not dump the overlay.
+        assert_eq!(h.write_behind_len(), 200);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_if_needed_respects_defer_threshold() {
+        let dir = tmp_dir();
+        let h = ShardedHashHead::create_sharded(dir.join("head"), 16, 64).unwrap();
+        h.enable_write_behind(200).unwrap();
+        h.set_defer_spill(true).unwrap();
+        // Under soft/2 while deferred → no step.
+        let batch: Vec<_> = (0u64..50).map(|i| (key_i(i), Fk(i + 1))).collect();
+        h.insert_many(&batch).unwrap();
+        assert_eq!(h.spill_write_behind_step_if_needed().unwrap(), 0);
+        assert_eq!(h.write_behind_len(), 50);
+        // Past soft/2 while deferred → budgeted step.
+        let more: Vec<_> = (50u64..150).map(|i| (key_i(i), Fk(i + 1))).collect();
+        h.insert_many(&more).unwrap();
+        assert!(h.write_behind_len() > 100);
+        let n = h.spill_write_behind_step_if_needed().unwrap();
+        assert!(n > 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

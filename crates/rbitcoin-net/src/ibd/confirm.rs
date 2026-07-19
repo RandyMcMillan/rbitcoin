@@ -155,8 +155,9 @@ pub(crate) fn spawn_confirm_engine(
 
                 let t0 = Instant::now();
                 let expect_h = batch[0].0;
-                // Live status + head spill deferral for connect affinity.
-                // Point + tx overlays partial-spill on clear (not multi‑M dumps).
+                // Live status + head spill deferral for connect affinity (A.3).
+                // Soft auto-spill skipped mid-wave; hard/background only budgeted
+                // chunks. Clearing defer does **not** bulk-dump the overlay.
                 struct LiveGuard<'a> {
                     stats: &'a LoopStats,
                     query: &'a rbitcoin_query::Query,
@@ -164,7 +165,7 @@ pub(crate) fn spawn_confirm_engine(
                 impl Drop for LiveGuard<'_> {
                     fn drop(&mut self) {
                         self.stats.confirm_end();
-                        // Partial spill deferred heads between waves (connect done).
+                        // Re-enable soft-cap steps; archive + bg worker drain.
                         let _ = self.query.set_point_head_defer_spill(false);
                         let _ = self.query.set_tx_head_defer_spill(false);
                     }

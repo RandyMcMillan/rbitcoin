@@ -19,6 +19,7 @@ mod body;
 mod coalesce;
 mod confirm;
 mod dial;
+mod head_spill;
 mod peer_io;
 mod progress;
 mod state;
@@ -443,6 +444,14 @@ pub async fn parallel_ibd_cancellable(
         Arc::clone(&pipe_stats),
         Arc::clone(&archive_queued),
         Arc::clone(&confirm_lag),
+    );
+
+    // A.4: background budgeted head-spill (short slices + yield). No-op work
+    // when write-behind is off (milestone catch-up with indexes disabled).
+    let _head_spill_worker = head_spill::HeadSpillWorker::spawn(Arc::clone(&hub.query));
+    info!(
+        "ibd: head spill worker on (chunk≈{}; RBITCOIN_HEAD_SPILL_CHUNK)",
+        rbitcoin_store::spill_chunk_size()
     );
 
     // Dedicated confirm path — never blocks the network/archive event loop.

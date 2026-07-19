@@ -182,7 +182,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             .enable_point_head_write_behind(cap)
             .map_err(|e| NodeError::Config(format!("point head write-behind: {e}")))?;
         info!(
-            "ibd: point.head write-behind ON (cap={cap}; spill on cap/flush; RBITCOIN_POINT_HEAD_OVERLAY)"
+            "ibd: point.head write-behind ON (cap={cap}; budgeted spill chunk≈{}; RBITCOIN_POINT_HEAD_OVERLAY / RBITCOIN_HEAD_SPILL_CHUNK)",
+            rbitcoin_store::spill_chunk_size()
         );
     }
     // tx.head: optional under milestone for archive speed; connect uses prev_tx_fk
@@ -210,7 +211,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             .enable_tx_head_write_behind(cap)
             .map_err(|e| NodeError::Config(format!("tx head write-behind: {e}")))?;
         info!(
-            "ibd: tx.head write-behind ON (cap={cap}; spill on cap/flush; RBITCOIN_TX_HEAD_OVERLAY)"
+            "ibd: tx.head write-behind ON (cap={cap}; budgeted spill chunk≈{}; RBITCOIN_TX_HEAD_OVERLAY / RBITCOIN_HEAD_SPILL_CHUNK)",
+            rbitcoin_store::spill_chunk_size()
         );
     }
 

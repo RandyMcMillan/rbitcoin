@@ -25,7 +25,9 @@ pub use file::{ensure_nofile_budget, ensure_nofile_budget_at_least, NOFILE_SOFT_
 pub use hashhead::{
     initial_slots_for, HeadRole, HeadScale, DEFAULT_WRITE_BEHIND_CAP,
 };
-pub use sharded_hashhead::{shard_count_for_scale, SHARD_COUNT};
+pub use sharded_hashhead::{
+    shard_count_for_scale, spill_chunk_size, DEFAULT_SPILL_CHUNK, SHARD_COUNT,
+};
 pub use header_table::HeaderRecord;
 pub use point_table::PointRecord;
 pub use scripthash::{script_hash, ScriptHashRecord, ScriptHashTable};

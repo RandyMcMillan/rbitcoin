@@ -432,7 +432,13 @@ impl Query {
         self.store.spill_point_head()
     }
 
-    /// Defer soft-cap point.head spills during confirm connect (partial spill on clear).
+    /// Budgeted spill of `point.head` overlay (≤ `max_entries` keys).
+    pub fn spill_point_head_budget(&self, max_entries: usize) -> Result<usize, QueryError> {
+        self.store.spill_point_head_budget(max_entries)
+    }
+
+    /// Defer soft-cap point.head spills during confirm connect.
+    /// Clearing defer does not bulk-spill (background + archive drain).
     pub fn set_point_head_defer_spill(&self, defer: bool) -> Result<(), QueryError> {
         self.store.set_point_head_defer_spill(defer)
     }
@@ -450,11 +456,24 @@ impl Query {
         self.store.spill_tx_head()
     }
 
-    /// Defer soft-cap tx.head spills during confirm (partial spill on clear).
+    /// Budgeted spill of `tx.head` overlay (≤ `max_entries` keys).
+    pub fn spill_tx_head_budget(&self, max_entries: usize) -> Result<usize, QueryError> {
+        self.store.spill_tx_head_budget(max_entries)
+    }
+
+    /// Defer soft-cap tx.head spills during confirm.
+    /// Clearing defer does not bulk-spill (background + archive drain).
     pub fn set_tx_head_defer_spill(&self, defer: bool) -> Result<(), QueryError> {
         self.store.set_tx_head_defer_spill(defer)
     }
 
+    /// One short-slice step on both head overlays (background worker / archive).
+    pub fn spill_heads_step_if_needed(&self) -> Result<(usize, usize), QueryError> {
+        self.store.spill_heads_step_if_needed()
+    }
+}
+
+impl Query {
     /// True if this outpoint is spent on the **best chain** (durable strong
     /// points and/or process-local set used while durable index is off during IBD).
     ///

@@ -240,12 +240,27 @@ impl PointTable {
         self.head.disable_write_behind()
     }
 
-    /// Spill pending `point.head` write-behind entries without fsync.
+    /// Spill pending `point.head` write-behind entries without fsync (chunked).
     pub fn spill_head(&self) -> Result<(), StoreError> {
         self.head.spill_write_behind()
     }
 
+    /// Budgeted spill: at most `max_entries` keys (archive interleave / background).
+    pub fn spill_head_budget(&self, max_entries: usize) -> Result<usize, StoreError> {
+        self.head.spill_write_behind_budget(max_entries)
+    }
+
+    /// One short-slice step when the overlay needs draining.
+    pub fn spill_head_step_if_needed(&self) -> Result<usize, StoreError> {
+        self.head.spill_write_behind_step_if_needed()
+    }
+
+    pub fn head_write_behind_len(&self) -> usize {
+        self.head.write_behind_len()
+    }
+
     /// Defer soft-cap point.head spills during confirm (probe from RAM overlay).
+    /// Clearing defer does not bulk-spill — background / archive steps drain.
     pub fn set_head_defer_spill(&self, defer: bool) -> Result<(), StoreError> {
         self.head.set_defer_spill(defer)
     }

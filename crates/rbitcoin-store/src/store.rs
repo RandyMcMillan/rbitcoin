@@ -149,16 +149,22 @@ impl Store {
     /// Used by the IBD archive writer so Class A survives unclean restarts without
     /// fsyncing every mega-batch of txs/ins/outs.
     ///
-    /// Also **spills** any `point.head` / `tx.head` write-behind overlays into the
-    /// mmap tables (no full msync of multi‑GiB bodies) so head links do not lag
-    /// Class A by more than one archive flush interval.
+    /// Also **budget-spills** a few chunks of `point.head` / `tx.head` write-behind
+    /// (not a full multi‑M dump) so head links advance without multi-minute storms.
+    /// Remaining overlay drains via archive interleave + background worker.
     pub fn flush_header_archive(&self) -> Result<(), StoreError> {
         self.headers.flush()?;
         self.header_txs.flush()?;
-        // Spill head overlays only (cheap vs full points/txs flush).
-        self.points.spill_head()?;
-        self.txs.spill_head()?;
-        // scripthash.head is Class C (confirm), not archive — not spilled here.
+        let chunk = crate::sharded_hashhead::spill_chunk_size();
+        // Cap work: up to 8 chunks each (~800k keys max) with yields between.
+        for _ in 0..8 {
+            let a = self.points.spill_head_budget(chunk)?;
+            let b = self.txs.spill_head_budget(chunk)?;
+            if a + b == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         Ok(())
     }
 
@@ -238,7 +244,16 @@ impl Store {
         self.points.spill_head()
     }
 
+    pub fn spill_point_head_budget(&self, max_entries: usize) -> Result<usize, StoreError> {
+        self.points.spill_head_budget(max_entries)
+    }
+
+    pub fn spill_point_head_step_if_needed(&self) -> Result<usize, StoreError> {
+        self.points.spill_head_step_if_needed()
+    }
+
     /// Defer soft-cap `point.head` spills while confirm is live (connect affinity).
+    /// Clearing defer does not bulk-spill.
     pub fn set_point_head_defer_spill(&self, defer: bool) -> Result<(), StoreError> {
         self.points.set_head_defer_spill(defer)
     }
@@ -256,9 +271,25 @@ impl Store {
         self.txs.spill_head()
     }
 
+    pub fn spill_tx_head_budget(&self, max_entries: usize) -> Result<usize, StoreError> {
+        self.txs.spill_head_budget(max_entries)
+    }
+
+    pub fn spill_tx_head_step_if_needed(&self) -> Result<usize, StoreError> {
+        self.txs.spill_head_step_if_needed()
+    }
+
     /// Defer soft-cap `tx.head` spills while confirm is live (archive fight).
+    /// Clearing defer does not bulk-spill.
     pub fn set_tx_head_defer_spill(&self, defer: bool) -> Result<(), StoreError> {
         self.txs.set_head_defer_spill(defer)
+    }
+
+    /// One short-slice step on both head overlays (background worker / archive).
+    pub fn spill_heads_step_if_needed(&self) -> Result<(usize, usize), StoreError> {
+        let p = self.spill_point_head_step_if_needed()?;
+        let t = self.spill_tx_head_step_if_needed()?;
+        Ok((p, t))
     }
 
     /// True if `tx_fk` is strong **and** its create height is on the confirmed tip.

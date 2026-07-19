@@ -785,7 +785,7 @@ fn op_checksig(
     if ctx.sig_version == SigVersion::TapScript {
         return op_checksig_tapscript(stack, &sig, &pubkey, ctx, verify);
     }
-    let ok = checksig_legacy(&sig, &pubkey, ctx)?;
+    let ok = checksig_legacy(&sig, &pubkey, ctx, None)?;
     if verify {
         if !ok {
             return Err(ConsensusError::Script("CHECKSIGVERIFY".into()));
@@ -885,6 +885,7 @@ fn op_checkmultisig(
     verify: bool,
     op_count: &mut usize,
 ) -> Result<(), ConsensusError> {
+    // Pop order matches Core: n, n keys (top=last), m, m sigs (top=last), dummy.
     let n = scriptnum_decode(&pop(stack)?)?;
     if n < 0 || n > MAX_PUBKEYS_PER_MULTISIG {
         return Err(ConsensusError::Script("multisig n".into()));
@@ -897,6 +898,8 @@ fn op_checkmultisig(
     for _ in 0..n {
         pubkeys.push(pop(stack)?);
     }
+    // Reverse so index 0 is deepest (first pushed) — Core match order.
+    pubkeys.reverse();
     let m = scriptnum_decode(&pop(stack)?)?;
     if m < 0 || m > n {
         return Err(ConsensusError::Script("multisig m".into()));
@@ -905,43 +908,141 @@ fn op_checkmultisig(
     for _ in 0..m {
         sigs.push(pop(stack)?);
     }
-    // Dummy element (Bug compatibility)
+    sigs.reverse();
     let _dummy = pop(stack)?;
 
-    let mut ok = true;
-    let mut pk_i = 0usize;
-    for sig in &sigs {
-        let mut matched = false;
-        while pk_i < pubkeys.len() {
-            let pk = &pubkeys[pk_i];
-            pk_i += 1;
-            if checksig(sig, pk, ctx)? {
-                matched = true;
-                break;
-            }
+    // Core Base: FindAndDelete **all** sigs from scriptCode before the loop.
+    let script_code_owned: Option<Vec<u8>> = if ctx.sig_version == SigVersion::Base {
+        let mut sc = script_code_bytes(ctx).to_vec();
+        for sig in &sigs {
+            sc = find_and_delete(&sc, sig);
         }
-        if !matched {
-            ok = false;
-            break;
+        Some(sc)
+    } else {
+        None
+    };
+    let script_override = script_code_owned.as_deref();
+
+    // Core: while (fSuccess && nSigsCount > 0) { try sigs[isig] vs pubs[ikey] }
+    let mut f_success = true;
+    let mut n_sigs = sigs.len();
+    let mut n_keys = pubkeys.len();
+    let mut isig = 0usize;
+    let mut ikey = 0usize;
+    while f_success && n_sigs > 0 {
+        let f_ok = checksig_legacy(&sigs[isig], &pubkeys[ikey], ctx, script_override)?;
+        if f_ok {
+            isig += 1;
+            n_sigs -= 1;
+        }
+        ikey += 1;
+        n_keys -= 1;
+        if n_sigs > n_keys {
+            f_success = false;
         }
     }
-    // Remaining pubkeys must be enough — already handled by loop.
 
     if verify {
-        if !ok {
+        if !f_success {
             return Err(ConsensusError::Script("CHECKMULTISIGVERIFY".into()));
         }
     } else {
-        push(stack, bool_encode(ok))?;
+        push(stack, bool_encode(f_success))?;
     }
     Ok(())
 }
 
+/// Core `FindAndDelete`: remove every occurrence of a data-push of `data` from `script`.
+///
+/// Used for legacy (Base) CHECKSIG / CHECKMULTISIG so a signature cannot sign itself
+/// when it appears inside scriptCode (mainnet block 290329: P2SH redeem embeds a sig).
+pub(crate) fn find_and_delete(script: &[u8], data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        return script.to_vec();
+    }
+    let mut needle = Vec::with_capacity(data.len() + 3);
+    if data.len() < 0x4c {
+        needle.push(data.len() as u8);
+    } else if data.len() <= 0xff {
+        needle.push(0x4c);
+        needle.push(data.len() as u8);
+    } else if data.len() <= 0xffff {
+        needle.push(0x4d);
+        needle.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    } else {
+        needle.push(0x4e);
+        needle.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    }
+    needle.extend_from_slice(data);
+
+    let mut out = Vec::with_capacity(script.len());
+    let mut i = 0usize;
+    while i < script.len() {
+        if i + needle.len() <= script.len() && script[i..i + needle.len()] == needle[..] {
+            i += needle.len();
+            continue;
+        }
+        let op = script[i];
+        out.push(op);
+        i += 1;
+        let n = if (1..=75).contains(&op) {
+            op as usize
+        } else if op == 0x4c {
+            if i >= script.len() {
+                break;
+            }
+            let n = script[i] as usize;
+            out.push(script[i]);
+            i += 1;
+            n
+        } else if op == 0x4d {
+            if i + 1 >= script.len() {
+                break;
+            }
+            let n = u16::from_le_bytes([script[i], script[i + 1]]) as usize;
+            out.extend_from_slice(&script[i..i + 2]);
+            i += 2;
+            n
+        } else if op == 0x4e {
+            if i + 3 >= script.len() {
+                break;
+            }
+            let n = u32::from_le_bytes([script[i], script[i + 1], script[i + 2], script[i + 3]])
+                as usize;
+            out.extend_from_slice(&script[i..i + 4]);
+            i += 4;
+            n
+        } else {
+            0
+        };
+        if n > 0 {
+            let end = (i + n).min(script.len());
+            out.extend_from_slice(&script[i..end]);
+            i = end;
+        }
+    }
+    out
+}
+
+/// Script bytes used as Base/WitnessV0 scriptCode (after OP_CODESEPARATOR).
+fn script_code_bytes<'a>(ctx: &'a EvalContext<'_>) -> &'a [u8] {
+    let full = ctx.script_code.as_bytes();
+    match ctx.codeseparator_script_off.get() {
+        Some(off) if off <= full.len() => &full[off..],
+        _ => full,
+    }
+}
+
 /// Legacy / witness-v0 CHECKSIG: empty or bad sig → false (does not hard-fail).
+///
+/// `script_code_override`: when `Some`, use these bytes as scriptCode for sighash
+/// (CHECKMULTISIG pre-deletes **all** stack sigs). When `None`, Base path applies
+/// FindAndDelete of **this** signature only (Core EvalChecksigPreTapscript).
 fn checksig_legacy(
     sig: &[u8],
     pubkey: &[u8],
     ctx: &EvalContext<'_>,
+    script_code_override: Option<&[u8]>,
 ) -> Result<bool, ConsensusError> {
     if sig.is_empty() {
         return Ok(false);
@@ -954,22 +1055,23 @@ fn checksig_legacy(
         Ok(p) => p,
         Err(_) => return Ok(false),
     };
-    let sighash = match sighash_for(ctx, sighash_ty) {
+    let owned: Vec<u8>;
+    let script_bytes: &[u8] = if let Some(sc) = script_code_override {
+        sc
+    } else {
+        let base = script_code_bytes(ctx);
+        if ctx.sig_version == SigVersion::Base {
+            owned = find_and_delete(base, sig);
+            owned.as_slice()
+        } else {
+            base
+        }
+    };
+    let sighash = match sighash_for_script(ctx, sighash_ty, script_bytes) {
         Ok(h) => h,
         Err(_) => return Ok(false),
     };
     Ok(crypto::verify_ecdsa(sighash, &ecdsa_sig, &pk))
-}
-
-/// Multisig path still uses a simple bool (legacy only — tapscript disables multisig).
-fn checksig(sig: &[u8], pubkey: &[u8], ctx: &EvalContext<'_>) -> Result<bool, ConsensusError> {
-    match ctx.sig_version {
-        SigVersion::TapScript => match tapscript_sig_result(sig, pubkey, ctx)? {
-            TapSigResult::EmptySig => Ok(false),
-            TapSigResult::Valid => Ok(true),
-        },
-        SigVersion::Base | SigVersion::WitnessV0 => checksig_legacy(sig, pubkey, ctx),
-    }
 }
 
 /// BIP340 Schnorr verify for a 32-byte x-only pubkey in tapscript (leaf sighash).
@@ -1021,14 +1123,12 @@ fn checksig_schnorr(
     Ok(crypto::SECP.with(|secp| secp.verify_schnorr(&schnorr, &msg, &xonly).is_ok()))
 }
 
-fn sighash_for(ctx: &EvalContext<'_>, ty_raw: u32) -> Result<[u8; 32], ConsensusError> {
+fn sighash_for_script(
+    ctx: &EvalContext<'_>,
+    ty_raw: u32,
+    script_bytes: &[u8],
+) -> Result<[u8; 32], ConsensusError> {
     let mut cache = ctx.cache.borrow_mut();
-    // After OP_CODESEPARATOR, Base/WitnessV0 scriptCode is the suffix only.
-    let full = ctx.script_code.as_bytes();
-    let script_bytes = match ctx.codeseparator_script_off.get() {
-        Some(off) if off <= full.len() => &full[off..],
-        _ => full,
-    };
     let script_code = Script::from_bytes(script_bytes);
     match ctx.sig_version {
         SigVersion::Base => {

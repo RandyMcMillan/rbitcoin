@@ -391,6 +391,8 @@ pub async fn parallel_ibd_cancellable(
     // Background redial — never .await dial on the IBD event loop (that stalled tip).
     let mut last_redial = Instant::now() - Duration::from_secs(15);
     let mut redial_handle: Option<JoinHandle<Vec<PeerSlot>>> = None;
+    // Consecutive redial batches that added zero peers (network-down / pool dead).
+    let mut dark_redial_empty: u32 = 0;
 
     let accepted = Arc::new(AtomicU32::new(0));
     let start_tip = hub.tip_height().unwrap_or(0);
@@ -712,6 +714,12 @@ pub async fn parallel_ibd_cancellable(
                                 "ibd: redial added {n} peer(s); live={}",
                                 st.slots.iter().filter(|s| s.alive).count()
                             );
+                            dark_redial_empty = 0;
+                        } else {
+                            dark_redial_empty = dark_redial_empty.saturating_add(1);
+                            warn!(
+                                "ibd: redial returned 0 peers (empty_rounds={dark_redial_empty})"
+                            );
                         }
                     }
                     Err(e) => warn!("ibd: redial task failed: {e}"),
@@ -720,11 +728,18 @@ pub async fn parallel_ibd_cancellable(
         }
 
         // Kick a non-blocking redial if under target and none in flight.
+        // When *all* peers are dead (network blip), do not wait for the 15s
+        // interval — redial immediately so we never race the exit check.
         let alive_n = st.slots.iter().filter(|s| s.alive).count();
         let target = cfg.target_peers.min(peer_pool.len()).max(1);
+        let redial_interval = if alive_n == 0 {
+            Duration::from_secs(0)
+        } else {
+            Duration::from_secs(15)
+        };
         if redial_handle.is_none()
             && alive_n < target
-            && last_redial.elapsed() > Duration::from_secs(15)
+            && last_redial.elapsed() >= redial_interval
         {
             let want = (target - alive_n).min(8).max(1);
             let already = dial_blocked_addrs(&st.slots, &st.addr_cooldown, Instant::now());
@@ -909,12 +924,43 @@ pub async fn parallel_ibd_cancellable(
                 let _ = request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
             }
         }
-        // All peers dead
+        // All peers dead — never treat mid-chain peer death as catch-up complete.
+        // Mainnet bug: network blip stalled every peer; accepted>0 caused a success
+        // exit at tip≈161k while max_peer≈958k, then node entered tip mode.
         if st.slots.iter().all(|s| !s.alive) {
-            if accepted.load(Ordering::SeqCst) > 0 {
+            let tip_h = hub.tip_height().unwrap_or(0);
+            let lag = header_lag_behind_peers(&st, tip_h);
+            let path_drained = st.ordered.is_empty()
+                && st.inflight.is_empty()
+                && archive_queued.count() == 0;
+            let caught_up = path_drained
+                && tip_h > 0
+                && lag <= 2
+                && (st.headers_done || tip_h >= st.max_peer_height.saturating_sub(2));
+            if caught_up {
+                info!(
+                    "ibd: catch-up complete (no live peers) tip={tip_h} max_peer_height={} max_archived={} — exiting parallel IBD",
+                    st.max_peer_height, st.max_archived_height
+                );
                 break;
             }
-            return Err(NetError::Protocol("all parallel peers dead"));
+            // Mid-chain: wait for redial (kicked above with zero interval when dark).
+            // Give up after several empty redials, or if we cannot start one, so the
+            // node does **not** set catch_up_complete / enter_tip_mode.
+            const MAX_DARK_EMPTY_REDIALS: u32 = 4;
+            if redial_handle.is_none() || dark_redial_empty >= MAX_DARK_EMPTY_REDIALS {
+                warn!(
+                    "ibd: all peers dead mid catch-up tip={tip_h} max_peer_height={} lag={} accepted={} empty_redials={} — giving up (not tip mode)",
+                    st.max_peer_height,
+                    lag,
+                    accepted.load(Ordering::SeqCst),
+                    dark_redial_empty
+                );
+                return Err(NetError::Protocol(
+                    "all parallel peers dead mid catch-up (not complete)",
+                ));
+            }
+            // Redial in flight: fall through to select! and wait.
         }
 
         // Wait for the next peer/archive event or a short tick.

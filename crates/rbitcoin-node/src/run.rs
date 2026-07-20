@@ -287,6 +287,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         node.tip_height()
                     );
                 } else {
+                    // parallel_ibd only Ok-exits on true catch-up (or cancel). Mid-chain
+                    // peer death returns Err so we never materialize tip indexes early.
                     info!(
                         "ibd: parallel catch-up accepted≈{n} tip={:?}",
                         node.tip_height()
@@ -297,6 +299,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             Err(e) => {
                 if shutdown.requested() {
                     warn!("signal: parallel IBD cancelled ({e})");
+                } else if e.to_string().contains("mid catch-up") {
+                    // Network blip / all peers dead while tip << peer height.
+                    // Do **not** enter tip mode or thrash sequential fallback.
+                    warn!(
+                        "ibd: parallel incomplete: {e}; tip={:?} — keeping catch-up indexes (no tip mode)",
+                        node.tip_height()
+                    );
                 } else {
                     warn!("ibd: parallel catch-up warning: {e}; falling back sequential");
                     if !shutdown.requested() {
@@ -332,6 +341,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     // long-lived follow peers (inv/headers + announce), and stop thrashing
     // sequential re-IBD every progress tick (signet log: "retry catch-up"
     // every 10s forever while already at peer tip).
+    //
+    // Only when catch_up_complete: mid-chain peer death must leave catch-up
+    // indexes (mmap UTXO / runs) so a restart can resume IBD without a false
+    // tip-mode materialize (mainnet log @161249 / horizon ~958k).
     if catch_up_complete && !shutdown.requested() {
         enter_tip_mode(&node.hub.query);
         // Tip mode: enable inv/tx accept + announce (P4). Off during IBD by default.
@@ -340,6 +353,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             "node: catch-up complete tip={:?} — tip tracking + block/tx relay (mempool live={})",
             node.tip_height(),
             mempool.live_count()
+        );
+    } else if !catch_up_complete && !shutdown.requested() {
+        warn!(
+            "node: catch-up not complete tip={:?} — skip tip mode / Electrum materialize; restart to resume IBD",
+            node.tip_height()
         );
     }
 
@@ -581,7 +599,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         }
                     }
                 } else {
-                    // Catch-up never finished cleanly — full seed re-sync.
+                    // Catch-up never finished cleanly — try sequential blocks, but
+                    // never enter tip mode from a partial download (mainnet bug:
+                    // mid-chain peer death must not materialize durable indexes).
                     info!("ibd: retry catch-up from {peer} (tip stagnant, catch-up incomplete)");
                     tokio::select! {
                         biased;
@@ -589,10 +609,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         result = node.sync_from(peer) => {
                             match result {
                                 Ok(n) if n > 0 => {
-                                    info!("ibd: retry got {n} tip={:?}", node.tip_height());
-                                    catch_up_complete = true;
-                                    enter_tip_mode(&node.hub.query);
-                                    mempool.set_relay_enabled(true);
+                                    info!(
+                                        "ibd: retry got {n} tip={:?} — still catch-up (no tip mode until full parallel catch-up)",
+                                        node.tip_height()
+                                    );
                                 }
                                 Ok(_) => {}
                                 Err(e) => info!("ibd: retry {peer}: {e}"),

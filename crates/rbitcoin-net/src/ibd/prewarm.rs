@@ -4,10 +4,9 @@
 //! readiness (see `confirm_run::wait_for_prewarm`); it only last-miles after a
 //! grace if this worker has not marked the tip batch ready.
 //!
-//! Best-effort IO priority. UTXO / durable parents load from store; runway
-//! creates register full outs (bodies-first). Confirm hard-waits only for the
-//! batch to be scanned; headroom is soft so a slow warmer cannot freeze tip
-//! advance and starve peer downloads.
+//! Normal I/O priority (not best-effort): when tip is hard on the runway the
+//! warmer must not lose the disk to archive. UTXO / durable parents load from
+//! store; runway creates register full outs (bodies-first).
 
 use rbitcoin_log::{debug, info};
 use rbitcoin_query::{
@@ -55,7 +54,9 @@ pub(crate) fn spawn_parent_prewarm(
     std::thread::Builder::new()
         .name("ibd-parent-prewarm".into())
         .spawn(move || {
-            rbitcoin_store::try_set_io_best_effort();
+            // Intentionally **not** IOPRIO best-effort: prewarm must keep pace
+            // with tip. Archive already writes continuously; starving the warmer
+            // forces confirm last-mile and kills tip rate.
             let depth = prewarm_depth_from_env();
             let batch = prewarm_batch_from_env();
             let headroom = prewarm_headroom_from_env();
@@ -64,7 +65,6 @@ pub(crate) fn spawn_parent_prewarm(
             );
             let mut cursor: usize = 0;
             let mut last_tip = u32::MAX;
-            // Start "fresh" so we do not INFO-idle immediately at tip=0/runway=0.
             let mut last_info = std::time::Instant::now();
             let mut ever_worked = false;
             while !ctrl.stop.load(Ordering::Relaxed) {
@@ -76,7 +76,6 @@ pub(crate) fn spawn_parent_prewarm(
                 }
                 let runway = ctrl.runway.lock().unwrap().clone();
                 if runway.is_empty() || cursor >= runway.len() {
-                    // Idle INFO only after we have done real work (avoids tip=0 noise).
                     if ever_worked && last_info.elapsed() >= Duration::from_secs(30) {
                         let (through, ahead, parents, bodies, plans, d) =
                             query.parent_prewarm_perf_snapshot();
@@ -86,10 +85,18 @@ pub(crate) fn spawn_parent_prewarm(
                         );
                         last_info = std::time::Instant::now();
                     }
-                    std::thread::sleep(Duration::from_millis(40));
+                    std::thread::sleep(Duration::from_millis(20));
                     continue;
                 }
-                let end = (cursor + batch as usize).min(runway.len());
+                // When behind tip, take a larger bite (up to 2× configured batch).
+                let through = query.parent_prewarm_ready_through();
+                let ahead = through.saturating_sub(tip);
+                let bite = if ahead < headroom.max(16) {
+                    (batch as usize).saturating_mul(2).min(256)
+                } else {
+                    batch as usize
+                };
+                let end = (cursor + bite).min(runway.len());
                 let slice = &runway[cursor..end];
                 let h0 = slice.first().map(|x| x.0).unwrap_or(0);
                 let h1 = slice.last().map(|x| x.0).unwrap_or(0);
@@ -101,7 +108,6 @@ pub(crate) fn spawn_parent_prewarm(
                         let through = query.parent_prewarm_ready_through();
                         let ahead = through.saturating_sub(tip);
                         let ms = t0.elapsed().as_millis();
-                        // Per-slice detail only at trace (debug was multi-Hz spam).
                         if st.blocks > 0
                             || st.utxo_parents > 0
                             || st.creates_registered > 0
@@ -117,7 +123,6 @@ pub(crate) fn spawn_parent_prewarm(
                                 st.already_ready,
                             );
                         }
-                        // Periodic INFO: cursor is *after* this slice.
                         if last_info.elapsed() >= Duration::from_secs(10) {
                             let (_, _, parents, bodies, plans, d) =
                                 query.parent_prewarm_perf_snapshot();
@@ -130,18 +135,20 @@ pub(crate) fn spawn_parent_prewarm(
                             );
                             last_info = std::time::Instant::now();
                         }
+                        // Stay hot when still behind; only yield when we have lead.
+                        if cursor < runway.len() && ahead < headroom.max(16) {
+                            // no sleep — tip is chewing the runway
+                        } else if cursor < runway.len() {
+                            std::thread::sleep(Duration::from_millis(1));
+                        } else {
+                            std::thread::sleep(Duration::from_millis(8));
+                        }
                     }
                     Err(e) => {
                         cursor = end;
                         debug!("ibd: prewarm error: {e}");
+                        std::thread::sleep(Duration::from_millis(5));
                     }
-                }
-                // Yield briefly so confirm/archive can run, but stay hot when
-                // the runway is non-empty (tip must not outrun us).
-                if cursor < runway.len() {
-                    std::thread::sleep(Duration::from_millis(1));
-                } else {
-                    std::thread::sleep(Duration::from_millis(10));
                 }
             }
             info!("ibd: parent prewarm worker stopped");

@@ -28,11 +28,10 @@ use std::sync::Mutex;
 pub const DEFAULT_PREWARM_DEPTH: u32 = 256;
 pub const MIN_PREWARM_DEPTH: u32 = 32;
 pub const MAX_PREWARM_DEPTH: u32 = 4096;
-/// Blocks processed per background tick.
-pub const DEFAULT_PREWARM_BATCH: u32 = 32;
+/// Blocks processed per background tick (larger = less overhead / better lead).
+pub const DEFAULT_PREWARM_BATCH: u32 = 64;
 /// Confirm waits until warmer is this many blocks past `batch_end` (when
-/// those heights exist on the runway). Default = 2× batch so confirm and
-/// prewarm can overlap without thrashing last-mile IO on the confirm thread.
+/// those heights exist on the runway). Default matches one prewarm batch.
 pub const DEFAULT_PREWARM_HEADROOM: u32 = 64;
 
 pub fn prewarm_depth_from_env() -> u32 {
@@ -48,7 +47,7 @@ pub fn prewarm_batch_from_env() -> u32 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_PREWARM_BATCH)
-        .clamp(8, 256)
+        .clamp(8, 512)
 }
 
 pub fn prewarm_headroom_from_env() -> u32 {
@@ -242,6 +241,63 @@ impl ConfirmParentCache {
         );
     }
 
+    /// Phase-1 hot path: body + full create outs under **one** lock (no ready recompute).
+    pub fn put_body_and_creates(
+        &self,
+        fk: Fk,
+        height: u32,
+        tx: TxRecord,
+        outputs: Vec<OutputRecord>,
+        inputs: Vec<InputRecord>,
+    ) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        let mut g = self.inner.lock().unwrap();
+        let txid = tx.txid;
+        g.by_txid.insert(txid, id);
+        {
+            let e = g.by_fk.entry(id).or_insert_with(|| ParentEntry {
+                tx: tx.clone(),
+                outs: HashMap::new(),
+                create_height: Some(height),
+            });
+            e.tx = tx.clone();
+            e.create_height = Some(height);
+            e.outs.clear();
+            for (v, o) in outputs.iter().enumerate() {
+                e.outs.insert(
+                    v as u32,
+                    ParentOut {
+                        output: o.clone(),
+                    },
+                );
+            }
+        }
+        // Legacy reserve waiters (rare).
+        for v in 0..outputs.len() as u32 {
+            let key = (txid, v);
+            if let Some(waiters) = g.reserve_waiters.remove(&key) {
+                for h in waiters {
+                    if let Some(plan) = g.plans.get_mut(&h) {
+                        plan.reserved.remove(&key);
+                        plan.need_fk.insert((id, v));
+                    }
+                }
+            }
+        }
+        g.by_body.insert(
+            id,
+            BodyEntry {
+                height,
+                tx,
+                outputs,
+                inputs,
+                thin_inputs: None,
+            },
+        );
+    }
+
     pub fn get_body(
         &self,
         fk: Fk,
@@ -275,6 +331,9 @@ impl ConfirmParentCache {
     }
 
     /// Ensure a height plan exists for `hash`.
+    ///
+    /// Does not recompute `ready_through` (plan is unscanned). Caller finishes
+    /// with [`Self::mark_scanned`] / [`Self::mark_scanned_many`].
     pub fn ensure_plan(&self, height: u32, hash: [u8; 32]) {
         let mut g = self.inner.lock().unwrap();
         if height <= g.tip {
@@ -292,10 +351,29 @@ impl ConfirmParentCache {
         if let Some(p) = g.plans.get_mut(&height) {
             p.hash = hash;
         }
-        // New plan may break contiguity if inserted inside a gap — recompute.
-        g.recompute_ready_through();
-        self.ready_through
-            .store(g.ready_through, Ordering::Relaxed);
+    }
+
+    /// Seed many plans under one lock (IBD runway publish).
+    pub fn ensure_plans(&self, items: &[(u32, [u8; 32])]) {
+        if items.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        let max_h = g.tip.saturating_add(g.depth);
+        for &(height, hash) in items {
+            if height <= g.tip || height > max_h {
+                continue;
+            }
+            g.plans.entry(height).or_insert_with(|| HeightPlan {
+                hash,
+                scanned: false,
+                need_fk: HashSet::new(),
+                reserved: HashSet::new(),
+            });
+            if let Some(p) = g.plans.get_mut(&height) {
+                p.hash = hash;
+            }
+        }
     }
 
     /// True if height was scanned (open reservations do not block).
@@ -354,9 +432,19 @@ impl ConfirmParentCache {
 
     /// Mark body scan complete for `height` (after registering needs/fills).
     pub fn mark_scanned(&self, height: u32) {
+        self.mark_scanned_many(&[height]);
+    }
+
+    /// Mark many heights scanned and recompute ready watermark once.
+    pub fn mark_scanned_many(&self, heights: &[u32]) {
+        if heights.is_empty() {
+            return;
+        }
         let mut g = self.inner.lock().unwrap();
-        if let Some(p) = g.plans.get_mut(&height) {
-            p.scanned = true;
+        for &height in heights {
+            if let Some(p) = g.plans.get_mut(&height) {
+                p.scanned = true;
+            }
         }
         g.recompute_ready_through();
         self.ready_through
@@ -364,6 +452,9 @@ impl ConfirmParentCache {
     }
 
     /// Register a UTXO-backed parent out for `height`.
+    ///
+    /// Does not recompute ready watermark (plan is still unscanned until
+    /// [`Self::mark_scanned`]).
     pub fn put_utxo_parent(
         &self,
         height: u32,
@@ -376,34 +467,37 @@ impl ConfirmParentCache {
             return;
         };
         let mut g = self.inner.lock().unwrap();
-        g.by_txid.insert(tx.txid, id);
-        let txid = tx.txid;
-        {
-            let e = g.by_fk.entry(id).or_insert_with(|| ParentEntry {
-                tx: tx.clone(),
-                outs: HashMap::new(),
-                create_height: None,
-            });
-            e.tx = tx;
-            e.outs.insert(vout, ParentOut { output });
-            // UTXO loads leave create_height as-is (None, or keep runway height).
+        g.put_utxo_parent_inner(height, id, tx, vout, output);
+    }
+
+    /// Batch parent outs under one lock (prewarm phase-2 finish).
+    pub fn put_utxo_parents_batch(&self, items: &[(u32, Fk, TxRecord, u32, OutputRecord)]) {
+        if items.is_empty() {
+            return;
         }
-        if let Some(plan) = g.plans.get_mut(&height) {
-            plan.need_fk.insert((id, vout));
-            plan.reserved.remove(&(txid, vout));
+        let mut g = self.inner.lock().unwrap();
+        for &(height, fk, ref tx, vout, ref output) in items {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            g.put_utxo_parent_inner(height, id, tx.clone(), vout, output.clone());
         }
-        let key = (txid, vout);
-        if let Some(waiters) = g.reserve_waiters.remove(&key) {
-            for h in waiters {
-                if let Some(plan) = g.plans.get_mut(&h) {
-                    plan.reserved.remove(&key);
-                    plan.need_fk.insert((id, vout));
-                }
+    }
+
+    /// Batch thin edges under one lock.
+    pub fn put_thin_inputs_batch(&self, items: &[(Fk, Vec<StashedThinInput>)]) {
+        if items.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        for (fk, edges) in items {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            if let Some(e) = g.by_body.get_mut(&id) {
+                e.thin_inputs = Some(edges.clone());
             }
         }
-        g.recompute_ready_through();
-        self.ready_through
-            .store(g.ready_through, Ordering::Relaxed);
     }
 
     /// Reserve a hole for a prevout not in UTXO (create is still on the runway).
@@ -440,6 +534,7 @@ impl ConfirmParentCache {
     ///
     /// Phase-1 prewarm loads full blocks first so later spends in the same
     /// batch resolve creates without UTXO or reservations.
+    /// Prefer [`Self::put_body_and_creates`] on the hot path (one lock).
     pub fn register_runway_creates(
         &self,
         create_fk: Fk,
@@ -482,9 +577,7 @@ impl ConfirmParentCache {
                 }
             }
         }
-        g.recompute_ready_through();
-        self.ready_through
-            .store(g.ready_through, Ordering::Relaxed);
+        // ready_through unchanged until mark_scanned.
     }
 
     /// Look up a populated parent out (for wave fill / connect).
@@ -567,6 +660,40 @@ impl ConfirmParentCache {
 }
 
 impl Inner {
+    fn put_utxo_parent_inner(
+        &mut self,
+        height: u32,
+        id: u64,
+        tx: TxRecord,
+        vout: u32,
+        output: OutputRecord,
+    ) {
+        self.by_txid.insert(tx.txid, id);
+        let txid = tx.txid;
+        {
+            let e = self.by_fk.entry(id).or_insert_with(|| ParentEntry {
+                tx: tx.clone(),
+                outs: HashMap::new(),
+                create_height: None,
+            });
+            e.tx = tx;
+            e.outs.insert(vout, ParentOut { output });
+        }
+        if let Some(plan) = self.plans.get_mut(&height) {
+            plan.need_fk.insert((id, vout));
+            plan.reserved.remove(&(txid, vout));
+        }
+        let key = (txid, vout);
+        if let Some(waiters) = self.reserve_waiters.remove(&key) {
+            for h in waiters {
+                if let Some(plan) = self.plans.get_mut(&h) {
+                    plan.reserved.remove(&key);
+                    plan.need_fk.insert((id, vout));
+                }
+            }
+        }
+    }
+
     fn retire_spend_id(&mut self, id: u64, vout: u32) {
         if let Some(e) = self.by_fk.get_mut(&id) {
             e.outs.remove(&vout);

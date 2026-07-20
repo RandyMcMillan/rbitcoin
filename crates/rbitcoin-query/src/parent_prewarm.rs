@@ -66,9 +66,7 @@ impl Query {
     }
 
     pub fn seed_parent_runway(&self, items: &[(u32, [u8; 32])]) {
-        for &(height, hash) in items {
-            self.confirm_parents.ensure_plan(height, hash);
-        }
+        self.confirm_parents.ensure_plans(items);
     }
 
     pub fn is_prewarm_ready(&self, heights: &[u32]) -> bool {
@@ -136,6 +134,8 @@ impl Query {
     ///
     /// `items` must be height-ascending. No reservations: same-batch creates are
     /// registered in phase 1; external parents load in phase 2 from UTXO/store.
+    ///
+    /// Does **not** run tip GC (caller / confirm owns `advance_parent_runway_tip`).
     pub fn prewarm_parents_for_heights(
         &self,
         items: &[(u32, [u8; 32])],
@@ -146,7 +146,6 @@ impl Query {
             return Ok(st);
         }
         let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
-        self.confirm_parents.advance_tip(tip);
 
         // Work list: heights still needing scan.
         let mut work: Vec<(u32, [u8; 32])> = Vec::new();
@@ -162,13 +161,13 @@ impl Query {
                 st.already_ready = st.already_ready.saturating_add(1);
                 continue;
             }
-            self.confirm_parents.ensure_plan(height, hash);
             work.push((height, hash));
         }
         if work.is_empty() {
             crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
             return Ok(st);
         }
+        self.confirm_parents.ensure_plans(&work);
 
         // ── Phase 1: full block bodies (creates available without UTXO) ─────
         // Per-height: list of (fk, tx, outs, inputs) for phase 2 spend scan.
@@ -192,12 +191,14 @@ impl Query {
                 let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
                 st.body_tx_reads = st.body_tx_reads.saturating_add(1);
                 st.full_tx_reads = st.full_tx_reads.saturating_add(1);
-                // Full body for zero-read confirm wave/wire.
-                self.confirm_parents
-                    .put_body(fk, height, tx.clone(), outs.clone(), inputs.clone());
-                // All outs so later heights / same batch spend without reserve.
-                self.confirm_parents
-                    .register_runway_creates(fk, &tx, &outs, height);
+                // One lock: body cache + full create outs for later spends.
+                self.confirm_parents.put_body_and_creates(
+                    fk,
+                    height,
+                    tx.clone(),
+                    outs.clone(),
+                    inputs.clone(),
+                );
                 st.creates_registered = st.creates_registered.saturating_add(1);
                 bodies.push((fk, tx, outs, inputs));
             }
@@ -205,10 +206,9 @@ impl Query {
         }
 
         // ── Phase 2: external parents + stash thin edges for wave_fill ──────
-        // (create_fk_id, vout) need store load; put after dedup.
         let mut need_load: Vec<(u64, u32)> = Vec::new();
         let mut need_put: Vec<(u32, Fk, u32)> = Vec::new();
-        // spending_fk_id → thin edges (built while resolving create fks).
+        let mut parent_puts: Vec<(u32, Fk, TxRecord, u32, OutputRecord)> = Vec::new();
         let mut thin_by_spend: HashMap<u64, Vec<StashedThinInput>> = HashMap::new();
 
         for (height, bodies) in &phase1 {
@@ -226,30 +226,17 @@ impl Query {
                         });
                         continue;
                     }
-                    // Same-block create (from phase 1 body).
+                    // Same-block create: outs already in by_fk via put_body_and_creates.
                     if let Some(&cfk) = local.get(&inp.prev_txid) {
                         edges.push(StashedThinInput {
                             create_fk: cfk.get(),
                             prev_index: inp.prev_index,
                         });
-                        if let Some((_, ptx, bouts, _)) =
-                            bodies.iter().find(|(f, _, _, _)| *f == cfk)
-                        {
-                            if let Some(o) = bouts.get(inp.prev_index as usize) {
-                                self.confirm_parents.put_utxo_parent(
-                                    *height,
-                                    cfk,
-                                    ptx.clone(),
-                                    inp.prev_index,
-                                    o.clone(),
-                                );
-                                st.utxo_parents = st.utxo_parents.saturating_add(1);
-                                st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
-                            }
-                        }
+                        st.utxo_parents = st.utxo_parents.saturating_add(1);
+                        st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                         continue;
                     }
-                    // Runway create from earlier prewarmed height / phase 1 of this batch.
+                    // Runway create from earlier prewarmed height / this batch.
                     if let Some(cfk) = self.confirm_parents.get_by_txid(&inp.prev_txid) {
                         if let Some((ptx, o)) =
                             self.confirm_parents.get_parent_out(cfk, inp.prev_index)
@@ -258,19 +245,13 @@ impl Query {
                                 create_fk: cfk.get(),
                                 prev_index: inp.prev_index,
                             });
-                            self.confirm_parents.put_utxo_parent(
-                                *height,
-                                cfk,
-                                ptx,
-                                inp.prev_index,
-                                o,
-                            );
+                            parent_puts.push((*height, cfk, ptx, inp.prev_index, o));
                             st.utxo_parents = st.utxo_parents.saturating_add(1);
                             st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                             continue;
                         }
                     }
-                    // Confirmed parent: runway by_txid → light UTXO → durable head.
+                    // Confirmed parent: light UTXO → durable head.
                     let create_fk = self
                         .confirm_parents
                         .get_by_txid(&inp.prev_txid)
@@ -286,13 +267,7 @@ impl Query {
                             if let Some((ptx, o)) =
                                 self.confirm_parents.get_parent_out(create_fk, inp.prev_index)
                             {
-                                self.confirm_parents.put_utxo_parent(
-                                    *height,
-                                    create_fk,
-                                    ptx,
-                                    inp.prev_index,
-                                    o,
-                                );
+                                parent_puts.push((*height, create_fk, ptx, inp.prev_index, o));
                                 st.utxo_parents = st.utxo_parents.saturating_add(1);
                                 st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                                 continue;
@@ -307,8 +282,6 @@ impl Query {
                                 create_fk: None,
                                 prev_index: inp.prev_index,
                             });
-                            // Should not happen after phase-1 full-out register for
-                            // runway creates; count for diagnostics (no reserve).
                             st.missing_parents = st.missing_parents.saturating_add(1);
                         }
                     }
@@ -336,6 +309,8 @@ impl Query {
             let fk = Fk(fk_id);
             let (ptx, _ins, outs) = self.store.get_tx_full(fk)?;
             st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+            // parent_io counter: full_tx_reads already includes bodies; track
+            // external parent loads via parent_unique + this loop only in stats.
             loaded.insert(fk_id, (ptx, outs));
         }
 
@@ -349,25 +324,21 @@ impl Query {
             let Some(o) = outs.get(vout as usize) else {
                 return Err(StoreError::NotFound);
             };
-            self.confirm_parents.put_utxo_parent(
-                height,
-                create_fk,
-                ptx.clone(),
-                vout,
-                o.clone(),
-            );
+            parent_puts.push((height, create_fk, ptx.clone(), vout, o.clone()));
             st.utxo_parents = st.utxo_parents.saturating_add(1);
         }
 
-        // Attach thin edges to runway bodies for wave_fill.
-        for (id, edges) in thin_by_spend {
-            self.confirm_parents.put_thin_inputs(Fk(id), edges);
-        }
+        self.confirm_parents.put_utxo_parents_batch(&parent_puts);
 
-        // ── Phase 3: mark scanned ───────────────────────────────────────────
-        for &(height, _) in &work {
-            self.confirm_parents.mark_scanned(height);
-        }
+        let thin_items: Vec<(Fk, Vec<StashedThinInput>)> = thin_by_spend
+            .into_iter()
+            .map(|(id, edges)| (Fk(id), edges))
+            .collect();
+        self.confirm_parents.put_thin_inputs_batch(&thin_items);
+
+        // ── Phase 3: mark scanned (one ready_through recompute) ─────────────
+        let scanned: Vec<u32> = work.iter().map(|(h, _)| *h).collect();
+        self.confirm_parents.mark_scanned_many(&scanned);
 
         crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
         Ok(st)

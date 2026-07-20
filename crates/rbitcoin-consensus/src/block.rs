@@ -642,13 +642,12 @@ pub fn verify_scripts_pool(jobs: &[ScriptCheckJob]) -> Result<(), ConsensusError
 
 /// Parallel script/sig checks across jobs (possibly from multiple blocks).
 ///
-/// Uses the **rayon global pool**. One job = one non-coinbase tx (shared
-/// [`bitcoin::sighash::SighashCache`] across its inputs).
+/// Uses the **rayon global pool** when `jobs.len() >= 3`. One job = one
+/// non-coinbase tx (shared [`bitcoin::sighash::SighashCache`] across inputs).
 ///
-/// **Granularity:** per-tx fine-grained `par_iter`. Median benches on real
-/// Schnorr/ECDSA (~30 µs/job, 4 cores) show this beats coarse `par_chunks` /
-/// large `with_min_len` by ~15–40% — load balance wins over steal amortization
-/// at this job size. Multi-block confirm runs already enlarge the wave.
+/// **When parallel pays:** `rayon_audit` (4 cores, real P2TR/P2WPKH): n=1–2
+/// sequential; n≥4 ≈1.7–3× wall speedup (~50–75% of ideal). Wire rebuild does
+/// **not** use rayon (sequential reconstruct is faster — see confirm_run).
 pub fn verify_scripts_pool_jobs(jobs: &[&ScriptCheckJob]) -> Result<(), ConsensusError> {
     verify_script_job_refs(jobs)
 }
@@ -663,12 +662,15 @@ fn job_needs_script_check(job: &ScriptCheckJob) -> bool {
 fn verify_script_jobs(jobs: &[ScriptCheckJob]) -> Result<(), ConsensusError> {
     match jobs.len() {
         0 => Ok(()),
-        1 => {
-            if job_needs_script_check(&jobs[0]) {
-                verify_job_all_inputs(&jobs[0])
-            } else {
-                Ok(())
+        // `rayon_audit`: n=2 is *slower* than sequential on 4 cores (~0.8×);
+        // rayon wins from n≥4 (≈1.7–2.5×). Keep small waves sequential.
+        1 | 2 => {
+            for job in jobs {
+                if job_needs_script_check(job) {
+                    verify_job_all_inputs(job)?;
+                }
             }
+            Ok(())
         }
         _ => {
             use rayon::prelude::*;
@@ -688,12 +690,13 @@ fn verify_script_jobs(jobs: &[ScriptCheckJob]) -> Result<(), ConsensusError> {
 fn verify_script_job_refs(jobs: &[&ScriptCheckJob]) -> Result<(), ConsensusError> {
     match jobs.len() {
         0 => Ok(()),
-        1 => {
-            if job_needs_script_check(jobs[0]) {
-                verify_job_all_inputs(jobs[0])
-            } else {
-                Ok(())
+        1 | 2 => {
+            for job in jobs {
+                if job_needs_script_check(job) {
+                    verify_job_all_inputs(job)?;
+                }
             }
+            Ok(())
         }
         _ => {
             use rayon::prelude::*;

@@ -240,17 +240,19 @@ fn wave_fill(
 }
 
 fn wire_rebuild(query: &Query, metas: &[BodyMeta]) -> Result<Vec<Block>, ConsensusError> {
-    use rayon::prelude::*;
+    // Sequential by design: `rayon_audit` benches show par_iter reconstruct is
+    // *slower* than sequential for 1–128 blocks (store mmap + encode work units
+    // are too small / cache-bound; pool schedule + clone dominates). Script
+    // verify is the real multi-core win (`verify_scripts_pool`).
     let t0 = Instant::now();
-    let blks: Result<Vec<_>, ConsensusError> = metas
-        .par_iter()
-        .map(|m| {
+    let mut blks = Vec::with_capacity(metas.len());
+    for m in metas {
+        blks.push(
             query
                 .reconstruct_archived_block_from_parts(m.header_rec.clone(), m.tx_fks.clone())
-                .map_err(ConsensusError::Store)
-        })
-        .collect();
-    let blks = blks?;
+                .map_err(ConsensusError::Store)?,
+        );
+    }
     let ns = t0.elapsed().as_nanos() as u64;
     confirm_phase_stats::RECONSTRUCT_WIRE_NS.fetch_add(ns, Ordering::Relaxed);
     confirm_phase_stats::RECONSTRUCT_NS.fetch_add(ns, Ordering::Relaxed);

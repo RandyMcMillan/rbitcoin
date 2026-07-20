@@ -11,9 +11,12 @@
 //!   can fill even if the create height was prewarmed before any reserve
 //!   (create-before-reserve). Entries are kept until tip passes the create
 //!   height or the outs are retired.
-//! - A height is **ready** only when every needed prevout is populated (not
-//!   merely reserved). Confirm must not start until ready, and should stay
-//!   behind the warmer by a headroom of ~1–2 prewarm batches.
+//! - A height is **ready** once its body has been **scanned**. Open
+//!   **reservations do not block readiness**: a multi-block confirm batch may
+//!   create a parent at height C and spend it at S in the same run; S reserves
+//!   (create not in UTXO yet) and wave/connect resolve the prevout from the
+//!   same-wave body or runway cache. Requiring `reserved.is_empty()` would
+//!   deadlock tip advance whenever a batch creates and consumes a parent.
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};
@@ -76,17 +79,20 @@ pub struct ParentEntry {
 #[derive(Debug, Default)]
 struct HeightPlan {
     hash: [u8; 32],
-    /// Prewarm finished scanning this body (may still wait on reserved fills).
+    /// Prewarm finished scanning this body (may still have open reserves).
     scanned: bool,
-    /// (create_fk, vout) fully populated.
+    /// (create_fk, vout) fully populated in cache.
     need_fk: HashSet<(u64, u32)>,
-    /// (prev_txid, vout) waiting for a runway create (not yet in UTXO).
+    /// (prev_txid, vout) not in UTXO at prewarm — expect runway / same-wave create.
+    /// Does **not** block [`HeightPlan::is_ready`].
     reserved: HashSet<([u8; 32], u32)>,
 }
 
 impl HeightPlan {
+    /// Ready for confirm once scanned. Open reservations are OK: same-batch
+    /// create→spend resolves in the wave; filled cache is best-effort.
     fn is_ready(&self) -> bool {
-        self.scanned && self.reserved.is_empty()
+        self.scanned
     }
 }
 
@@ -210,13 +216,21 @@ impl ConfirmParentCache {
             .store(g.ready_through, Ordering::Relaxed);
     }
 
-    /// True if height was scanned and all reserved holes filled.
+    /// True if height was scanned (open reservations do not block).
     pub fn is_ready(&self, height: u32) -> bool {
         let g = self.inner.lock().unwrap();
         g.plans.get(&height).map(|p| p.is_ready()).unwrap_or(false)
     }
 
-    /// All heights in `heights` ready.
+    /// True if height still has open reserved holes (debug / tests).
+    pub fn has_open_reserves(&self, height: u32) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.plans
+            .get(&height)
+            .is_some_and(|p| !p.reserved.is_empty())
+    }
+
+    /// All heights in `heights` ready (scanned).
     pub fn all_ready(&self, heights: &[u32]) -> bool {
         let g = self.inner.lock().unwrap();
         heights.iter().all(|h| {
@@ -569,11 +583,38 @@ mod tests {
         // Spend of 5:0 not in UTXO yet.
         c.reserve(2, t.txid, 0);
         c.mark_scanned(2);
-        assert!(!c.is_ready(2));
-        // Create appears from height 1 body.
+        // Open reserve must NOT block readiness (batch may create+spend).
+        assert!(c.is_ready(2));
+        assert!(c.has_open_reserves(2));
+        // Create appears from height 1 body — fills cache for wave/connect.
         c.register_runway_creates(Fk(50), &t, &[out(42), out(43)], 1);
         assert!(c.is_ready(2));
+        assert!(!c.has_open_reserves(2));
         assert_eq!(c.get_parent_out(Fk(50), 0).unwrap().1.value, 42);
+    }
+
+    #[test]
+    fn open_reserves_do_not_block_ready_or_watermark() {
+        // Simulate batch create@1 + spend@2: spend reserves before create is
+        // filled; confirm must still see both heights ready after scan.
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(0);
+        c.ensure_plan(1, [1u8; 32]);
+        c.mark_scanned(1);
+        c.ensure_plan(2, [2u8; 32]);
+        let t = tx(9);
+        c.reserve(2, t.txid, 0);
+        c.mark_scanned(2);
+        assert!(c.is_ready(1));
+        assert!(c.is_ready(2));
+        assert!(c.has_open_reserves(2));
+        assert!(c.all_ready(&[1, 2]));
+        assert_eq!(c.ready_through(), 2);
+        assert!(c.headroom_ready(2, 0));
+        // Create later fills reserve (best-effort); readiness unchanged.
+        c.register_runway_creates(Fk(90), &t, &[out(1)], 1);
+        assert!(!c.has_open_reserves(2));
+        assert_eq!(c.ready_through(), 2);
     }
 
     #[test]

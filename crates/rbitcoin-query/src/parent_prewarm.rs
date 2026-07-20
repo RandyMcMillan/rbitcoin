@@ -6,8 +6,10 @@
 //! prewarm of earlier heights (or immediately if the create was registered
 //! first with full outs — create-before-reserve).
 //!
-//! Confirm must not start until the batch heights are ready **and** the warmer
-//! holds the configured headroom (default 2 prewarm batches) past `batch_end`.
+//! Confirm must not start until the batch heights are **scanned** (ready) **and**
+//! the warmer holds the configured headroom past `batch_end`. Open reservations
+//! do not block readiness: a batch may create a parent and spend it in a later
+//! height of the same run (wave resolves same-wave / runway creates).
 
 use super::*;
 use crate::confirm_parent_cache::prewarm_headroom_from_env;
@@ -51,12 +53,13 @@ impl Query {
         self.confirm_parents.parent_count() + self.confirm_parents.reserved_count()
     }
 
-    /// True when every height in the list is prewarm-complete (no open reserves).
+    /// True when every height in the list is prewarm-scanned.
+    /// Open reservations do not make a height unready.
     pub fn is_prewarm_ready(&self, heights: &[u32]) -> bool {
         self.confirm_parents.all_ready(heights)
     }
 
-    /// Block until all `heights` are ready or `timeout` elapses.
+    /// Block until all `heights` are scanned (ready) or `timeout` elapses.
     pub fn wait_prewarm_ready(
         &self,
         heights: &[u32],
@@ -79,9 +82,10 @@ impl Query {
         }
     }
 
-    /// Wait until batch heights are ready **and** the warmer is `headroom`
+    /// Wait until batch heights are scanned **and** the warmer is `headroom`
     /// blocks past `batch_end` (or the published runway ends).
     ///
+    /// Open reservations never block this wait (same-batch create→spend).
     /// `headroom == None` uses [`prewarm_headroom_from_env`] (default 2× batch).
     pub fn wait_prewarm_ready_with_headroom(
         &self,
@@ -226,9 +230,35 @@ impl Query {
                     continue;
                 }
 
-                // Only prewarm from light UTXO (confirmed creates).
-                match self.ibd_utxo_create_fk(&inp.prev_txid, inp.prev_index)? {
+                // Resolve create: light UTXO first (IBD catch-up), then durable
+                // tx index / runway cache (Tip mode, or UTXO miss with known body).
+                // Only reserve when the create is not findable yet (later runway).
+                let create_fk = self
+                    .ibd_utxo_create_fk(&inp.prev_txid, inp.prev_index)?
+                    .or_else(|| self.confirm_parents.get_by_txid(&inp.prev_txid))
+                    .or_else(|| {
+                        self.tip_prevout_cache
+                            .get_tx_and_output_by_txid(&inp.prev_txid, inp.prev_index)
+                            .map(|(fk, _, _)| fk)
+                    })
+                    .or(self.tx_fk_by_txid(&inp.prev_txid).ok().flatten());
+
+                match create_fk {
                     Some(create_fk) => {
+                        // Prefer already-cached runway/UTXO outs (no re-read).
+                        if let Some((ptx, o)) =
+                            self.confirm_parents.get_parent_out(create_fk, inp.prev_index)
+                        {
+                            self.confirm_parents.put_utxo_parent(
+                                height,
+                                create_fk,
+                                ptx,
+                                inp.prev_index,
+                                o,
+                            );
+                            st.utxo_parents = st.utxo_parents.saturating_add(1);
+                            continue;
+                        }
                         let ptx = self.store.get_tx(create_fk)?;
                         let run = ptx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
                         let all = self.store.get_output_run(Fk(run), ptx.output_count)?;
@@ -259,7 +289,7 @@ impl Query {
                         st.utxo_parents = st.utxo_parents.saturating_add(1);
                     }
                     None => {
-                        // Not confirmed yet — reserve for runway create.
+                        // Create body not yet known — reserve for runway register.
                         self.confirm_parents.reserve(
                             height,
                             inp.prev_txid,

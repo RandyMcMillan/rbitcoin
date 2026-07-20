@@ -1212,6 +1212,84 @@ fn ibd_utxo_multi_block_run_keeps_creates() {
     );
 }
 
+/// Multi-block confirm batch that **creates** a non-coinbase parent and
+/// **spends** it in a later height of the same run. Prewarm reserves that
+/// parent (not in UTXO yet); readiness must not require the reserve to fill
+/// or tip would never advance.
+#[test]
+fn confirm_batch_create_and_spend_parent_same_run() {
+    use rbitcoin_consensus::{
+        accept_and_archive_block, accept_and_connect_block, confirm_archived_run, ChainParams,
+        Milestone,
+    };
+    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.set_spend_index(false);
+    q.set_tx_index(false);
+    q.enable_ibd_utxo().unwrap();
+    let ms = Milestone::NONE;
+    let params = ChainParams::regtest();
+    let maturity = params.coinbase_maturity();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+    let cb1 = b1.txdata[0].compute_txid();
+    accept_and_archive_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+
+    let last_pad = maturity + 1;
+    let mut run: Vec<(Height, [u8; 32])> = vec![(Height(1), b1.block_hash().to_byte_array())];
+    for h in 2..=last_pad {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+        run.push((Height(h), b.block_hash().to_byte_array()));
+    }
+
+    // Height create_h: spend mature coinbase → new parent out (not yet in UTXO).
+    let create_h = last_pad + 1;
+    let mk_parent = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
+    let b_create = mine_regtest_block(tip, tip_time + 600, create_h, vec![mk_parent]);
+    let parent_txid = b_create.txdata[1].compute_txid();
+    accept_and_archive_block(&q, &params, Height(create_h), &b_create, ms).unwrap();
+    tip = b_create.block_hash();
+    tip_time = b_create.header.time;
+    run.push((Height(create_h), b_create.block_hash().to_byte_array()));
+
+    // Height spend_h: spend that same-batch parent (prewarm will reserve it).
+    let spend_h = create_h + 1;
+    let spend_parent = spend_anyone_can_spend(parent_txid, 0, Amount::from_sat(48_0000_0000));
+    let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend_parent]);
+    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
+    run.push((Height(spend_h), b_spend.block_hash().to_byte_array()));
+
+    // Prewarm the run: spend height may still hold an open reserve for the
+    // in-batch create; that must not make the height unready.
+    let items: Vec<(u32, [u8; 32])> = run.iter().map(|(h, hash)| (h.0, *hash)).collect();
+    q.prewarm_parents_for_heights(&items).unwrap();
+    let heights: Vec<u32> = items.iter().map(|(h, _)| *h).collect();
+    assert!(
+        q.is_prewarm_ready(&heights),
+        "scanned batch must be ready even if spend reserved the create height parent"
+    );
+
+    confirm_archived_run(&q, &params, ms, &run)
+        .expect("same-run create then spend must confirm (open reserve not a deadlock)");
+    assert_eq!(q.tip_height(), Some(Height(spend_h)));
+    assert!(
+        q.catchup_is_spent(parent_txid.as_byte_array(), 0).unwrap(),
+        "in-batch parent must be spent after multi-block run"
+    );
+}
+
 /// Mainnet @546 shape:
 /// - height H: 1-in / 2-out parent
 /// - height H+1: tx spends both parent vouts (2-in/2-out), then same-block chain

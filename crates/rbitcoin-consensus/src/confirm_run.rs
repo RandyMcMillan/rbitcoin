@@ -83,10 +83,10 @@ pub fn confirm_archived_run(
     // ── 1. resolve_bodies ───────────────────────────────────────────────────
     let metas = resolve_body_metas(query, blocks)?;
 
-    // ── 1b. wait for parent prewarm (UTXO parents + filled reserves) ────────
-    // Confirm does not start until every height's parent plan is fully populated
-    // *and* the warmer holds headroom past batch_end (default 2 prewarm batches)
-    // so the next confirm wave is already warm while this one runs.
+    // ── 1b. wait for parent prewarm (scanned + headroom) ───────────────────
+    // Confirm waits until batch heights are *scanned* (open reserves OK — a
+    // batch may create a parent and spend it later in the same run) *and* the
+    // warmer holds headroom past batch_end (default 2 prewarm batches).
     let heights: Vec<u32> = metas.iter().map(|m| m.height.0).collect();
     let items: Vec<(u32, [u8; 32])> = metas.iter().map(|m| (m.height.0, m.hash)).collect();
     let batch_end = heights.last().copied().unwrap_or(0);

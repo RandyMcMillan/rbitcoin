@@ -1228,6 +1228,81 @@ fn ibd_utxo_multi_block_run_keeps_creates() {
     );
 }
 
+/// Mainnet @546 shape: single-input parent with 2 outs, next height spends both
+/// in one tx. Regression for coinbase_info cache treating `None` + `input_count==1`
+/// as coinbase → MissingPrevout on the second prevout of the same parent.
+#[test]
+fn confirm_spend_both_vouts_of_one_input_parent() {
+    use rbitcoin_consensus::{
+        accept_and_archive_block, accept_and_connect_block, confirm_archived_at, ChainParams,
+        Milestone,
+    };
+    use rbitcoin_test::mine::{
+        mine_regtest_block, regtest_genesis, spend_many_anyone_can_spend, split_anyone_can_spend,
+    };
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.set_spend_index(false);
+    q.set_tx_index(false);
+    q.enable_ibd_utxo().unwrap();
+    let ms = Milestone::NONE;
+    let params = ChainParams::regtest();
+    let maturity = params.coinbase_maturity();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+    let cb1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+
+    let last_pad = maturity + 1;
+    for h in 2..=last_pad {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+
+    // Height H: 1-in / 2-out parent (anyone-can-spend).
+    let split_h = last_pad + 1;
+    let split = split_anyone_can_spend(
+        cb1,
+        0,
+        &[Amount::from_sat(20_0000_0000), Amount::from_sat(29_0000_0000)],
+    );
+    let b_split = mine_regtest_block(tip, tip_time + 600, split_h, vec![split]);
+    let parent_txid = b_split.txdata[1].compute_txid();
+    accept_and_connect_block(&q, &params, Height(split_h), &b_split, ms).unwrap();
+    tip = b_split.block_hash();
+    tip_time = b_split.header.time;
+
+    // Height H+1: one tx spends both vouts of that parent.
+    let merge_h = split_h + 1;
+    let merge = spend_many_anyone_can_spend(
+        &[(parent_txid, 0), (parent_txid, 1)],
+        Amount::from_sat(48_0000_0000),
+    );
+    let b_merge = mine_regtest_block(tip, tip_time + 600, merge_h, vec![merge]);
+    accept_and_archive_block(&q, &params, Height(merge_h), &b_merge, ms).unwrap();
+    confirm_archived_at(
+        &q,
+        &params,
+        Height(merge_h),
+        &b_merge.block_hash().to_byte_array(),
+        ms,
+    )
+    .expect("spending both vouts of a 1-in parent must not MissingPrevout");
+    assert_eq!(q.tip_height(), Some(Height(merge_h)));
+    assert!(q.catchup_is_spent(parent_txid.as_byte_array(), 0).unwrap());
+    assert!(q.catchup_is_spent(parent_txid.as_byte_array(), 1).unwrap());
+}
+
 /// Sequential confirm_archived_run + failed confirm must not poison spent_local.
 #[test]
 fn confirm_run_sequential_and_failed_no_spend_poison() {

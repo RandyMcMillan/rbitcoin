@@ -60,6 +60,61 @@ pub fn spend_anyone_can_spend(prev_txid: bitcoin::Txid, vout: u32, value: Amount
     }
 }
 
+/// One-input, multi-output anyone-can-spend create (for multi-vout parent tests).
+pub fn split_anyone_can_spend(
+    prev_txid: bitcoin::Txid,
+    vout: u32,
+    values: &[Amount],
+) -> Transaction {
+    Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: prev_txid,
+                vout,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: values
+            .iter()
+            .map(|value| TxOut {
+                value: *value,
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            })
+            .collect(),
+    }
+}
+
+/// Spend several OP_TRUE prevouts in one tx (one output).
+pub fn spend_many_anyone_can_spend(
+    prevs: &[(bitcoin::Txid, u32)],
+    value: Amount,
+) -> Transaction {
+    Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: prevs
+            .iter()
+            .map(|(txid, vout)| TxIn {
+                previous_output: OutPoint {
+                    txid: *txid,
+                    vout: *vout,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            })
+            .collect(),
+        output: vec![TxOut {
+            value,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    }
+}
+
 /// Mine a regtest block on top of `prev_hash` (or genesis prev null).
 pub fn mine_regtest_block(
     prev_hash: BlockHash,

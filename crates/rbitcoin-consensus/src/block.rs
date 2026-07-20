@@ -849,7 +849,13 @@ fn coinbase_info(
     cache: &mut std::collections::HashMap<rbitcoin_primitives::Fk, Option<u32>>,
 ) -> Result<(bool, Option<u32>), ConsensusError> {
     if let Some(&h) = cache.get(&prev_fk) {
-        return Ok((h.is_some() || prev_rec.input_count == 1, h));
+        // Cache value is coinbase create height only: `Some(h)` ⇒ coinbase,
+        // `None` ⇒ not a coinbase. Do **not** re-derive is_cb from
+        // `input_count == 1` — single-input non-coinbases also cache `None`,
+        // and that wrong is_cb made resolve fall through (MissingPrevout) on
+        // the second spend of the same parent (mainnet @546: two vouts of one
+        // 1-in parent in one spending tx).
+        return Ok((h.is_some(), h));
     }
     // Wave-prefetched coinbase height (no tx_height / input-run disk).
     if let Some(wave) = wave_prevouts {

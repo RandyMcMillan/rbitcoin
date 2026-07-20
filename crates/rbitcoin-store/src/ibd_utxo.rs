@@ -300,14 +300,22 @@ impl IbdUtxo {
     }
 
     /// Create-tx Class A fk for an unspent outpoint, if present.
+    ///
+    /// Slot keys are 12-byte txid prefix + vout (birthday collision on full
+    /// txid is negligible at chain UTXO scale). Overflow holds full-txid
+    /// extras when a compressed key is already live.
     pub fn get_create_fk(&self, txid: &[u8; 32], vout: u32) -> Result<Option<Fk>, StoreError> {
         Self::ensure_vout(vout)?;
         let prefix = prefix_of(txid);
         if let Some(list) = self.overflow.get(&(prefix, vout)) {
-            return Ok(list
+            if let Some(fk) = list
                 .iter()
                 .find(|(t, _)| t == txid)
-                .and_then(|(_, raw)| Fk::new(*raw)));
+                .and_then(|(_, raw)| Fk::new(*raw))
+            {
+                return Ok(Some(fk));
+            }
+            // Miss on overflow: first occupant may still live in the slot.
         }
         let mask = self.num_slots - 1;
         let mut i = hash0(&prefix, vout) & mask;
@@ -348,6 +356,18 @@ impl IbdUtxo {
             self.grow()?;
         }
         let prefix = prefix_of(txid);
+        // Exact full-txid already in overflow → idempotent.
+        if let Some(list) = self.overflow.get(&(prefix, vout)) {
+            if list.iter().any(|(t, _)| t == txid) {
+                return Ok(());
+            }
+        }
+        // Compressed key already live (slot and/or other overflow entries).
+        // New full txid → overflow. Same first occupant re-insert (prefix-only
+        // slot, no full id): `contains` below is true via slot → idempotent.
+        // Distinct full txid with same prefix: `contains` is also true via
+        // slot (prefix match) — birthday on 12 bytes is treated as negligible;
+        // forced collisions need a future full-txid slot layout.
         if self.contains(txid, vout)? {
             return Ok(());
         }
@@ -359,9 +379,6 @@ impl IbdUtxo {
             if !list.iter().any(|(t, _)| t == txid) {
                 list.push((*txid, create_fk.0));
             }
-            // First occupant stays in slot; extras only in overflow.
-            // If slot empty of this key's first — ensure LIVE slot exists.
-            // When collision: slot already LIVE for another full txid.
             return Ok(());
         }
         let mask = self.num_slots - 1;
@@ -422,11 +439,12 @@ impl IbdUtxo {
                 list.swap_remove(pos);
                 if list.is_empty() {
                     self.overflow.remove(&(prefix, vout));
-                    let _ = self.tombstone_compressed(&prefix, vout)?;
+                    // First occupant may still be live in the slot — do not
+                    // tombstone just because overflow drained.
                 }
                 return Ok(true);
             }
-            return Ok(false);
+            // Not in overflow: fall through (slot may hold the first occupant).
         }
         let mask = self.num_slots - 1;
         let mut i = hash0(&prefix, vout) & mask;
@@ -440,37 +458,6 @@ impl IbdUtxo {
                         self.num_slots,
                         i,
                         &prefix,
-                        STATE_TOMB,
-                        vout,
-                        0,
-                    );
-                    self.live = self.live.saturating_sub(1);
-                    return Ok(true);
-                }
-                STATE_LIVE | STATE_TOMB => i = (i + step + 1) & mask,
-                _ => return Err(StoreError::Corrupt("ibd utxo bad state")),
-            }
-        }
-        Ok(false)
-    }
-
-    fn tombstone_compressed(
-        &mut self,
-        prefix: &[u8; PREFIX_LEN],
-        vout: u32,
-    ) -> Result<bool, StoreError> {
-        let mask = self.num_slots - 1;
-        let mut i = hash0(prefix, vout) & mask;
-        for step in 0..self.num_slots {
-            let (sp, state, sv, _) = Self::read_slot(&self.map, self.num_slots, i);
-            match state {
-                STATE_EMPTY => return Ok(false),
-                STATE_LIVE if sp == *prefix && sv == vout => {
-                    Self::write_slot(
-                        &mut self.map,
-                        self.num_slots,
-                        i,
-                        prefix,
                         STATE_TOMB,
                         vout,
                         0,
@@ -618,6 +605,29 @@ mod tests {
         assert!(u.take_spend(&t, 0).unwrap());
         assert!(u.get_create_fk(&t, 0).unwrap().is_none());
         assert!(!u.take_spend(&t, 0).unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Overflow miss must not hide the first (slot) occupant after a later
+    /// full-txid was recorded under the same compressed key.
+    #[test]
+    fn overflow_miss_still_returns_slot_occupant() {
+        let path = tmp();
+        let mut u = IbdUtxo::create(&path, 1024).unwrap();
+        let mut a = [0u8; 32];
+        a[0..12].copy_from_slice(&[1u8; 12]);
+        a[31] = 1;
+        let mut b = a;
+        b[31] = 2;
+        u.insert_create(&a, 0, Fk(10)).unwrap();
+        // Force overflow entry without going through insert's prefix-only
+        // contains short-circuit (birthday path is not fully precise).
+        u.overflow
+            .entry((prefix_of(&a), 0))
+            .or_default()
+            .push((b, 20));
+        assert_eq!(u.get_create_fk(&a, 0).unwrap(), Some(Fk(10)));
+        assert_eq!(u.get_create_fk(&b, 0).unwrap(), Some(Fk(20)));
         let _ = std::fs::remove_file(&path);
     }
 

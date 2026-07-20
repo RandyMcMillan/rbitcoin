@@ -138,7 +138,11 @@ impl FramedMessage {
     }
 }
 
-/// Core: command is ASCII letters, null-padded.
+/// Core `CMessageHeader::IsCommandValid`: printable ASCII (0x20–0x7E), null-padded.
+///
+/// Digits are required — long-form commands include `sendaddrv2` (and short-id
+/// names like `addrv2` when encoded long). Restricting to a–z rejected those
+/// and killed post-handshake IBD peers that send `sendaddrv2`.
 pub(crate) fn command_bytes_ok(cmd12: &[u8]) -> bool {
     if cmd12.len() != 12 {
         return false;
@@ -153,8 +157,8 @@ pub(crate) fn command_bytes_ok(cmd12: &[u8]) -> bool {
         if seen_null {
             return false; // non-zero after null padding
         }
-        // Core uses lowercase a-z only for command names.
-        if !b.is_ascii_lowercase() {
+        // Match Core: printable ASCII, not control bytes.
+        if !b.is_ascii_graphic() && b != b' ' {
             return false;
         }
         any = true;
@@ -225,8 +229,12 @@ mod tests {
     fn command_bytes_ok_accepts_null_padded() {
         assert!(command_bytes_ok(b"version\0\0\0\0\0"));
         assert!(command_bytes_ok(b"ping\0\0\0\0\0\0\0\0"));
+        // Digits: BIP155 sendaddrv2 / addrv2 (long form).
+        assert!(command_bytes_ok(b"sendaddrv2\0\0"));
+        assert!(command_bytes_ok(b"addrv2\0\0\0\0\0\0"));
         assert!(!command_bytes_ok(b"\xff\xfe\0\0\0\0\0\0\0\0\0\0"));
         assert!(!command_bytes_ok(b"ping\0x\0\0\0\0\0\0\0")); // non-zero after null
+        assert!(!command_bytes_ok(b"\x01ping\0\0\0\0\0\0\0")); // control char
     }
 
     #[test]

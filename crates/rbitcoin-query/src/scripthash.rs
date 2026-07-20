@@ -14,7 +14,8 @@ impl Query {
         let create = self.store.get_tx(rec.create_tx_fk)?;
         rec.txid = create.txid;
         if rec.vout < create.output_count {
-            if let Ok(out) = self.tx_output(&create, rec.vout) {
+            // Create fk is authoritative (packed body works without `tx.head`).
+            if let Ok(out) = self.tx_output_at_fk(rec.create_tx_fk, &create, rec.vout) {
                 rec.value = out.value;
             }
         }

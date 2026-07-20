@@ -255,7 +255,7 @@ impl Query {
         // ~20–40k notes / 5s) FIFO-evicted those parents, then `retire_spends`
         // dropped many of the same creates — pure thrash. Next wave reloads
         // parents from warm Class A. Connect still miss-fills tip_prevout on
-        // cold path via `tx_output_run`.
+        // cold path via `tx_output_run_class_a` / `tx_output_at_fk_*`.
 
         Ok(out)
     }
@@ -289,7 +289,8 @@ impl Query {
         if tx.input_count == 0 {
             return Ok(Vec::new());
         }
-        let inputs = self.tx_input_run(&tx)?;
+        // Always key packed body by `tx_fk` (catch-up has no durable `tx.head`).
+        let inputs = self.tx_input_run_class_a(tx_fk, &tx)?;
         let mut edges = Vec::with_capacity(inputs.len());
         for (i, inp) in inputs.iter().enumerate() {
             if inp.is_coinbase() {
@@ -345,8 +346,9 @@ impl Query {
 
     /// Load all inputs for a Class A tx.
     ///
-    /// Packed rows (`input_start_fk` null): one `get_tx_full` by txid/fk.
-    /// Legacy: split input-run table.
+    /// Packed rows (`input_start_fk` null): one `get_tx_full` by txid→fk (needs
+    /// head/runs). Prefer [`Self::tx_input_run_class_a`] when the create fk is known
+    /// (catch-up with `tx.head` off).
     pub fn tx_input_run(&self, tx: &TxRecord) -> Result<Vec<InputRecord>, QueryError> {
         if tx.input_count == 0 {
             return Ok(Vec::new());
@@ -357,38 +359,30 @@ impl Query {
         let fk = self
             .lookup_tx_fk(&tx.txid)?
             .ok_or(StoreError::NotFound)?;
-        let (_, inputs, _) = self.store.get_tx_full(fk)?;
+        self.tx_input_run_class_a(fk, tx)
+    }
+
+    /// Input run keyed by known create fk (packed body works without `tx.head`).
+    pub fn tx_input_run_class_a(
+        &self,
+        create_fk: Fk,
+        tx: &TxRecord,
+    ) -> Result<Vec<InputRecord>, QueryError> {
+        if tx.input_count == 0 {
+            return Ok(Vec::new());
+        }
+        if let Some(run) = tx.input_start_fk.get() {
+            return self.get_input_run(Fk(run), tx.input_count);
+        }
+        // Packed Class A — one body IO.
+        let (_, inputs, _) = self.store.get_tx_full(create_fk)?;
         Ok(inputs)
     }
 
-    /// Output run: tip_prevout → store (connect prevout path).
-    ///
-    /// Miss-fill notes into **tip_prevout**. Reconstruct uses
-    /// [`Self::tx_output_run_class_a`] instead.
-    pub(crate) fn tx_output_run(&self, tx: &TxRecord) -> Result<Vec<OutputRecord>, QueryError> {
-        if tx.output_count == 0 {
-            return Ok(Vec::new());
-        }
-        if let Some(fk) = self.lookup_tx_fk(&tx.txid)? {
-            if let Some(outputs) = self.tip_prevout_cache.get_outputs(fk) {
-                return Ok(outputs);
-            }
-            let outputs = if let Some(run) = tx.output_start_fk.get() {
-                self.get_output_run(Fk(run), tx.output_count)?
-            } else {
-                let (_, _, outs) = self.store.get_tx_full(fk)?;
-                outs
-            };
-            self.tip_prevout_cache
-                .note(fk, tx.clone(), outputs.clone());
-            return Ok(outputs);
-        }
-        // No fk: legacy only.
-        let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-        self.get_output_run(Fk(run), tx.output_count)
-    }
-
     /// Output run from store (keyed by known create fk — no txid lookup).
+    ///
+    /// Preferred for packed Class A (works with `tx.head` off). Callers that only
+    /// have a [`TxRecord`] must resolve create fk first (UTXO / head / scan).
     pub(crate) fn tx_output_run_class_a(
         &self,
         create_fk: Fk,
@@ -396,6 +390,9 @@ impl Query {
     ) -> Result<Vec<OutputRecord>, QueryError> {
         if tx.output_count == 0 {
             return Ok(Vec::new());
+        }
+        if let Some(outputs) = self.tip_prevout_cache.get_outputs(create_fk) {
+            return Ok(outputs);
         }
         if let Some(run) = tx.output_start_fk.get() {
             return self.get_output_run(Fk(run), tx.output_count);
@@ -440,7 +437,7 @@ impl Query {
                 if tx.input_count == 0 {
                     continue;
                 }
-                let inputs = self.tx_input_run(&tx)?;
+                let inputs = self.tx_input_run_class_a(tx_fk, &tx)?;
                 for inp in &inputs {
                     if inp.is_coinbase() {
                         continue;
@@ -475,7 +472,7 @@ impl Query {
             let tx = self.store.get_tx(tx_fk)?;
             // Unlink thin scripthash creates for this block's outputs.
             if tx.output_count > 0 {
-                let outputs = self.tx_output_run(&tx)?;
+                let outputs = self.tx_output_run_class_a(tx_fk, &tx)?;
                 for (i, o) in outputs.iter().enumerate() {
                     let sh = script_hash(&o.script);
                     let _ = self.store.scripthash.unlink_create(&sh, tx_fk, i as u32)?;

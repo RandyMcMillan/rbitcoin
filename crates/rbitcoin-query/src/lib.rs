@@ -812,7 +812,10 @@ impl Query {
         self.store.get_input_run(run_fk, count)
     }
 
-    /// Input `i` of a tx row (run-addressed or packed full body).
+    /// Input `i` of a tx row (run-addressed or packed full body via txid→fk).
+    ///
+    /// Prefer [`Self::tx_input_at_fk`] when the create fk is known (packed Class A
+    /// with `tx.head` off).
     pub fn tx_input(&self, tx: &TxRecord, i: u32) -> Result<InputRecord, QueryError> {
         if i >= tx.input_count {
             return Err(StoreError::NotFound);
@@ -823,7 +826,23 @@ impl Query {
         let fk = self
             .lookup_tx_fk(&tx.txid)?
             .ok_or(StoreError::NotFound)?;
-        let (_, inputs, _) = self.store.get_tx_full(fk)?;
+        self.tx_input_at_fk(fk, tx, i)
+    }
+
+    /// Input `i` keyed by known create fk (packed body, no head required).
+    pub fn tx_input_at_fk(
+        &self,
+        create_fk: Fk,
+        tx: &TxRecord,
+        i: u32,
+    ) -> Result<InputRecord, QueryError> {
+        if i >= tx.input_count {
+            return Err(StoreError::NotFound);
+        }
+        if let Some(run) = tx.input_start_fk.get() {
+            return self.get_input_at(Fk(run), tx.input_count, i);
+        }
+        let (_, inputs, _) = self.store.get_tx_full(create_fk)?;
         inputs
             .get(i as usize)
             .cloned()
@@ -835,9 +854,21 @@ impl Query {
         self.tx_output_attributed(tx, vout, false)
     }
 
+    /// Output at `vout` for a known create fk (packed Class A works without head).
+    pub fn tx_output_at_fk(
+        &self,
+        create_fk: Fk,
+        tx: &TxRecord,
+        vout: u32,
+    ) -> Result<OutputRecord, QueryError> {
+        self.tx_output_at_fk_attributed(create_fk, tx, vout, false)
+    }
+
     /// Like [`Self::tx_output`] but records connect cold-path counters when
     /// `count_connect` is true. When true, **skips tip_prevout probe** (caller
     /// already tried the single-lock fast path) to avoid double MISS stats.
+    ///
+    /// Packed rows without `tx.head` need [`Self::tx_output_at_fk_attributed`].
     pub fn tx_output_attributed(
         &self,
         tx: &TxRecord,
@@ -850,34 +881,7 @@ impl Query {
         }
         // Prefer full-run cache via fk when we know it (txid→fk process cache).
         if let Some(fk) = self.lookup_tx_fk(&tx.txid)? {
-            if !count_connect {
-                if let Some(o) = self.tip_prevout_cache.get_output_at(fk, vout) {
-                    return Ok(o);
-                }
-            }
-            if let Some((_, o)) = self.confirm_parents.get_parent_out(fk, vout) {
-                if count_connect {
-                    connect_prevout_stats::CLASS_A_HIT.fetch_add(1, Ordering::Relaxed);
-                }
-                return Ok(o);
-            }
-            // Load full outs (packed = one body IO); promote into tip-window.
-            let outs = if let Some(run) = tx.output_start_fk.get() {
-                self.get_output_run(Fk(run), tx.output_count)?
-            } else {
-                let (_, _, o) = self.store.get_tx_full(fk)?;
-                o
-            };
-            let out = outs
-                .get(vout as usize)
-                .cloned()
-                .ok_or(StoreError::NotFound)?;
-            self.tip_prevout_cache
-                .note(fk, tx.clone(), outs);
-            if count_connect {
-                connect_prevout_stats::STORE_MISS.fetch_add(1, Ordering::Relaxed);
-            }
-            return Ok(out);
+            return self.tx_output_at_fk_attributed(fk, tx, vout, count_connect);
         }
         if let Some(run) = tx.output_start_fk.get() {
             let out = self.get_output_at(Fk(run), tx.output_count, vout)?;
@@ -887,6 +891,47 @@ impl Query {
             return Ok(out);
         }
         Err(StoreError::NotFound)
+    }
+
+    /// Packed/legacy output load by known create fk + optional connect counters.
+    pub fn tx_output_at_fk_attributed(
+        &self,
+        create_fk: Fk,
+        tx: &TxRecord,
+        vout: u32,
+        count_connect: bool,
+    ) -> Result<OutputRecord, QueryError> {
+        use std::sync::atomic::Ordering;
+        if vout >= tx.output_count {
+            return Err(StoreError::NotFound);
+        }
+        if !count_connect {
+            if let Some(o) = self.tip_prevout_cache.get_output_at(create_fk, vout) {
+                return Ok(o);
+            }
+        }
+        if let Some((_, o)) = self.confirm_parents.get_parent_out(create_fk, vout) {
+            if count_connect {
+                connect_prevout_stats::CLASS_A_HIT.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(o);
+        }
+        // Load full outs (packed = one body IO); promote into tip-window.
+        let outs = if let Some(run) = tx.output_start_fk.get() {
+            self.get_output_run(Fk(run), tx.output_count)?
+        } else {
+            let (_, _, o) = self.store.get_tx_full(create_fk)?;
+            o
+        };
+        let out = outs
+            .get(vout as usize)
+            .cloned()
+            .ok_or(StoreError::NotFound)?;
+        self.tip_prevout_cache.note(create_fk, tx.clone(), outs);
+        if count_connect {
+            connect_prevout_stats::STORE_MISS.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(out)
     }
 
     pub fn put_spend(

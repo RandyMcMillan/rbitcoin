@@ -632,7 +632,9 @@ fn ibd_parallel_archive_idempotent_confirm_without_tx_head() {
     );
     let fks = q.block_tx_fks(Height(spend_h)).unwrap();
     assert!(fks.len() >= 2);
-    let inp = q.tx_input(&q.get_tx(fks[1]).unwrap(), 0).unwrap();
+    // Packed Class A + head off: address body by create fk.
+    let rec = q.get_tx(fks[1]).unwrap();
+    let inp = q.tx_input_at_fk(fks[1], &rec, 0).unwrap();
     // Class A always external prev_txid; confirm used UTXO create_fk.
     assert_ne!(inp.prev_txid, [0u8; 32]);
     assert_eq!(inp.prev_index, 0);
@@ -911,7 +913,8 @@ fn resume_head_off_utxo_resolves_external_prev() {
             )
             .unwrap()
             .unwrap();
-        let inp = q.tx_input(&q.get_tx(fks[1]).unwrap(), 0).unwrap();
+        let rec = q.get_tx(fks[1]).unwrap();
+        let inp = q.tx_input_at_fk(fks[1], &rec, 0).unwrap();
         assert_ne!(
             inp.prev_txid, [0u8; 32],
             "Class A stores external prev_txid (no prev_tx_fk field)"

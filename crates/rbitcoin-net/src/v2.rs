@@ -327,6 +327,19 @@ mod tests {
         assert!(matches!(frame.decode().payload(), NetworkMessage::Verack));
     }
 
+    /// Regression: `sendaddrv2` contains a digit — long-form parse must accept it
+    /// (Core IsCommandValid allows printable ASCII). Rejecting digits killed
+    /// post-handshake IBD peers that advertise BIP155.
+    #[test]
+    fn encode_parse_sendaddrv2_long_form_with_digit() {
+        let magic = signet_magic();
+        let contents = encode_v2_contents(NetworkMessage::SendAddrV2).unwrap();
+        assert_eq!(contents[0], 0); // long form
+        assert_eq!(&contents[1..11], b"sendaddrv2");
+        let frame = parse_v2_contents(magic, &contents).expect("digit in command ok");
+        assert!(matches!(frame.decode().payload(), NetworkMessage::SendAddrV2));
+    }
+
     #[test]
     fn encode_parse_ping_short_id() {
         let magic = signet_magic();

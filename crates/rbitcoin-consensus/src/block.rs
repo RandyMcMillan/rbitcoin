@@ -826,7 +826,7 @@ fn resolve_prevout(
         if prev_rec.txid != prev_txid {
             continue;
         }
-        let out = match find_output(query, &prev_rec, op.vout) {
+        let out = match find_output(query, prev_fk, &prev_rec, op.vout) {
             Ok(o) => o,
             Err(ConsensusError::MissingPrevout) => continue,
             Err(e) => return Err(e),
@@ -905,7 +905,7 @@ fn coinbase_info(
         cache.insert(prev_fk, None);
         return Ok((false, None));
     }
-    let is_cb = is_coinbase_tx_record(query, prev_rec)?;
+    let is_cb = is_coinbase_tx_record(query, prev_fk, prev_rec)?;
     let h = if is_cb {
         query
             .store()
@@ -923,28 +923,31 @@ fn coinbase_info(
 
 fn is_coinbase_tx_record(
     query: &Query,
+    prev_fk: rbitcoin_primitives::Fk,
     rec: &rbitcoin_store::TxRecord,
 ) -> Result<bool, ConsensusError> {
     if rec.input_count != 1 {
         return Ok(false);
     }
+    // Key by create fk so packed Class A works with `tx.head` off (catch-up).
     let inp = query
-        .tx_input(rec, 0)
+        .tx_input_at_fk(prev_fk, rec, 0)
         .map_err(ConsensusError::Store)?;
     Ok(inp.is_coinbase() || (inp.prev_txid == [0u8; 32] && inp.prev_index == 0xffff_ffff))
 }
 
 fn find_output(
     query: &Query,
+    prev_fk: rbitcoin_primitives::Fk,
     prev_rec: &rbitcoin_store::TxRecord,
     vout: u32,
 ) -> Result<rbitcoin_store::OutputRecord, ConsensusError> {
     if vout >= prev_rec.output_count {
         return Err(ConsensusError::MissingPrevout);
     }
-    // Cold path after tip_prevout fast-path miss; attribute class_a vs store.
+    // Cold path: always use create fk (packed body + head-off catch-up).
     query
-        .tx_output_attributed(prev_rec, vout, true)
+        .tx_output_at_fk_attributed(prev_fk, prev_rec, vout, true)
         .map_err(ConsensusError::Store)
 }
 

@@ -251,7 +251,8 @@ impl Query {
             for fk in fks {
                 let tx = self.store.get_tx(fk)?;
                 if tx.input_count > 0 {
-                    let inputs = self.tx_input_run(&tx)?;
+                    // Packed Class A: key body by create fk (no `tx.head` in catch-up).
+                    let inputs = self.tx_input_run_class_a(fk, &tx)?;
                     for inp in &inputs {
                         if inp.is_coinbase() {
                             continue;

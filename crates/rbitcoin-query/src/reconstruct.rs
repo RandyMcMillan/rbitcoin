@@ -211,7 +211,7 @@ impl Query {
         if tx.input_count != 1 {
             return Ok(None);
         }
-        let inp = self.tx_input(tx, 0)?;
+        let inp = self.tx_input_at_fk(fk, tx, 0)?;
         self.coinbase_height_for_tx_with_input0(fk, tx, Some(&inp))
     }
 
@@ -227,7 +227,7 @@ impl Query {
         let inp = match input0 {
             Some(i) => i,
             None => {
-                let i = self.tx_input(tx, 0)?;
+                let i = self.tx_input_at_fk(fk, tx, 0)?;
                 return self.coinbase_height_for_tx_with_input0(fk, tx, Some(&i));
             }
         };

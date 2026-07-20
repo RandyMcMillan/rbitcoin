@@ -4,9 +4,10 @@
 use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
-    list_runs, merge_runs, next_run_path, read_run_body, try_set_io_idle, write_sorted_run, Store,
-    StoreError, SortedRunPath,
+    list_runs, lookup_key, merge_runs, next_run_path, read_run_body, try_set_io_idle,
+    write_sorted_run, Store, StoreError, SortedRunPath,
 };
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -37,6 +38,8 @@ fn encode(txid: &[u8; 32], fk: Fk) -> [u8; REC_LEN as usize] {
 
 struct Inner {
     pending: Vec<([u8; 32], Fk)>,
+    /// Sidecar for O(1) lookup of not-yet-flushed entries.
+    pending_map: HashMap<[u8; 32], Fk>,
     runs_dir: PathBuf,
     next_seq: u64,
     stop: bool,
@@ -70,6 +73,7 @@ impl TxRunBuilder {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 pending: Vec::new(),
+                pending_map: HashMap::new(),
                 runs_dir,
                 next_seq,
                 stop: false,
@@ -131,10 +135,40 @@ impl TxRunBuilder {
                 .0;
         }
         g.pending.push((txid, fk));
+        g.pending_map.insert(txid, fk);
         self.enqueued.fetch_add(1, Ordering::Relaxed);
         if g.pending.len() >= soft {
             self.cv.notify_all();
         }
+    }
+
+    /// Resolve txid → fk from pending memtable + on-disk sorted runs.
+    ///
+    /// Newest run wins if duplicates exist. Used when the process txid cache misses.
+    pub fn lookup(&self, txid: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
+        if !self.is_enabled() {
+            return Ok(None);
+        }
+        let g = self.inner.lock().unwrap();
+        if let Some(&fk) = g.pending_map.get(txid) {
+            return Ok(Some(fk));
+        }
+        let runs_dir = g.runs_dir.clone();
+        drop(g);
+        let mut runs = list_runs(&runs_dir)?;
+        // Prefer later runs (higher seq / path sort) for last-wins.
+        runs.sort_by(|a, b| b.path.cmp(&a.path));
+        for run in &runs {
+            if let Some(rec) = lookup_key(run, txid)? {
+                if rec.len() >= REC_LEN as usize {
+                    let fk = Fk(u64::from_le_bytes(rec[32..40].try_into().unwrap()));
+                    if !fk.is_null() {
+                        return Ok(Some(fk));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub fn finalize_and_materialize(&self, store: &Store) -> Result<u64, StoreError> {
@@ -262,6 +296,7 @@ fn flush_pending(g: &mut Inner) -> Result<u64, StoreError> {
         return Ok(0);
     }
     let mut recs = std::mem::take(&mut g.pending);
+    g.pending_map.clear();
     recs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut body = Vec::with_capacity(recs.len() * REC_LEN as usize);
     for (txid, fk) in &recs {

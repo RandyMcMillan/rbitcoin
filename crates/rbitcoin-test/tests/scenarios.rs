@@ -1487,9 +1487,8 @@ fn scripthash_reopen_warm_prevents_dup_creates() {
     let q = Query::open_or_create(&path).unwrap();
     q.warm_scripthash_create_index().unwrap();
 
-    // Simulate re-confirm collecting the same creates: filter via warm set by
-    // only appending create_tx_fks not already durable — confirm path does this
-    // with sh_tx_indexed. Here we verify warm filled by skipping all durable txs.
+    // Simulate re-confirm: only append create_tx_fks not already durable.
+    // Confirm path uses a height watermark; this checks durable body coverage.
     let mut indexed = std::collections::HashSet::new();
     q.store()
         .scripthash

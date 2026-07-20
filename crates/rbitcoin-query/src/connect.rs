@@ -155,23 +155,19 @@ impl Query {
             let sh_slot = scope.spawn(|| -> Result<(), QueryError> {
                 use crate::class_c_phase_stats::{self as sh_stats, add_sh_part};
 
-                // Warm once; skip already-indexed create txs.
-                let t_warm = std::time::Instant::now();
-                self.ensure_sh_tx_indexed_warmed()?;
-                add_sh_part(&sh_stats::SH_WARM_NS, t_warm.elapsed().as_nanos() as u64);
-
+                // Height watermark: skip heights already SH-indexed after prior tip commit.
+                // (Replaces unbounded sh_tx_indexed HashSet.)
                 let t_filter = std::time::Instant::now();
+                let through = self.sh_indexed_through_height();
                 let mut sh_new_txs: Vec<u64> = Vec::new();
                 let wave_tx_n: usize = items.iter().map(|i| i.tx_fks.len()).sum();
                 sh_new_txs.reserve(wave_tx_n);
-                {
-                    let indexed = self.sh_tx_indexed.lock().unwrap();
-                    for item in items {
-                        for &tx_fk in &item.tx_fks {
-                            if !indexed.contains(&tx_fk.0) {
-                                sh_new_txs.push(tx_fk.0);
-                            }
-                        }
+                for item in items {
+                    if through.map(|t| item.height.0 <= t).unwrap_or(false) {
+                        continue;
+                    }
+                    for &tx_fk in &item.tx_fks {
+                        sh_new_txs.push(tx_fk.0);
                     }
                 }
                 add_sh_part(
@@ -208,19 +204,7 @@ impl Query {
                         add_sh_part(&sh_stats::SH_HEAD_NS, timing.head_ns);
                     }
                 }
-                if !sh_new_txs.is_empty() {
-                    let t_idx = std::time::Instant::now();
-                    let mut indexed = self.sh_tx_indexed.lock().unwrap();
-                    // Avoid multi-second rehash on a multi‑M entry set.
-                    indexed.reserve(sh_new_txs.len());
-                    for id in sh_new_txs {
-                        indexed.insert(id);
-                    }
-                    add_sh_part(
-                        &sh_stats::SH_INDEX_NS,
-                        t_idx.elapsed().as_nanos() as u64,
-                    );
-                }
+                // Watermark advances only after tip commit (below).
                 Ok(())
             });
 
@@ -253,6 +237,10 @@ impl Query {
         // Tip is the commit point (after strong + SH both finished).
         let t_tip = std::time::Instant::now();
         self.store.confirmed.set_many(&confirmed_pairs)?;
+        // SH height watermark only after tip — failed tip must re-enqueue SH.
+        if let Some(last) = items.last() {
+            self.set_sh_indexed_through_height(Some(last.height.0));
+        }
         crate::class_c_phase_stats::TIP_NS.fetch_add(
             t_tip.elapsed().as_nanos() as u64,
             Ordering::Relaxed,
@@ -502,8 +490,6 @@ impl Query {
             }
             self.store.strong_tx.set_unstrong(tx_fk)?;
             self.store.tx_height.clear(tx_fk)?;
-            // Process-local SH caches: allow re-index if this tip is re-confirmed.
-            self.sh_tx_indexed.lock().unwrap().remove(&tx_fk.0);
         }
         // Refresh process heads for unlinked scripts (may now be NULL / older fk).
         if !touched_sh.is_empty() {
@@ -519,6 +505,8 @@ impl Query {
         }
         // Class A header_txs list remains with the header; only tip Class C moves.
         self.store.confirmed.disconnect_tip(height)?;
+        // SH watermark tracks confirmed tip (re-confirm will re-enqueue this height).
+        self.set_sh_indexed_through_height(self.tip_height().map(|h| h.0));
         // Tip-window cache may hold creates from this tip; drop rather than partial unlink.
         self.tip_prevout_cache.clear();
         Ok(())

@@ -169,16 +169,20 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     info!(
         "ibd: index catch-up mode (tx/point/SH runs + mmap UTXO; materialize heads at tip mode)"
     );
-    // Warm process txid→fk from Class A (resume / cold start with bodies).
+    // Seed a **capped** recent slice of Class A into the txid FIFO (not full body).
+    // Misses resolve via tx.runs (catch-up) / durable head (tip mode).
     {
         let t0 = Instant::now();
         let n = handle
             .query
             .warm_txid_cache_from_bodies()
             .map_err(|e| NodeError::Config(format!("warm txid cache: {e}")))?;
+        let (entries, bytes, budget) = handle.query.txid_fk_cache_usage();
         info!(
-            "ibd: txid process cache warmed {n} Class A txs in {:?}",
-            t0.elapsed()
+            "ibd: txid cache seeded {n} recent Class A txs in {:?} (entries={entries} ~{:.0}MiB / budget {:.0}MiB; miss→tx.runs)",
+            t0.elapsed(),
+            bytes as f64 / (1024.0 * 1024.0),
+            budget as f64 / (1024.0 * 1024.0),
         );
     }
     // Ensure spentness oracle ready (mmap UTXO may already match tip).

@@ -120,6 +120,54 @@ pub fn read_run_body(run: &SortedRunPath) -> Result<Vec<u8>, StoreError> {
     Ok(buf)
 }
 
+/// Binary-search a sorted run for `key` (first `key_len` bytes of each record).
+///
+/// Returns the full record bytes on hit. Equal keys: first match in file order.
+/// Does **not** load the whole run into RAM (O(log n) seeks + reads).
+pub fn lookup_key(run: &SortedRunPath, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+    if key.len() < run.key_len as usize {
+        return Err(StoreError::Corrupt("sorted run: lookup key short"));
+    }
+    if run.count == 0 {
+        return Ok(None);
+    }
+    let key = &key[..run.key_len as usize];
+    let rec_len = run.rec_len as u64;
+    let mut f = File::open(&run.path).map_err(|e| io_err(&run.path, e))?;
+    let mut lo = 0u64;
+    let mut hi = run.count;
+    let mut rec = vec![0u8; run.rec_len as usize];
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let off = HEADER_LEN as u64 + mid * rec_len;
+        f.seek(SeekFrom::Start(off))
+            .map_err(|e| io_err(&run.path, e))?;
+        f.read_exact(&mut rec).map_err(|e| io_err(&run.path, e))?;
+        match rec[..run.key_len as usize].cmp(key) {
+            Ordering::Less => lo = mid + 1,
+            Ordering::Greater => hi = mid,
+            Ordering::Equal => {
+                // Walk left to first equal (stable first).
+                let mut i = mid;
+                while i > 0 {
+                    let poff = HEADER_LEN as u64 + (i - 1) * rec_len;
+                    f.seek(SeekFrom::Start(poff))
+                        .map_err(|e| io_err(&run.path, e))?;
+                    let mut prev = vec![0u8; run.rec_len as usize];
+                    f.read_exact(&mut prev).map_err(|e| io_err(&run.path, e))?;
+                    if &prev[..run.key_len as usize] != key {
+                        break;
+                    }
+                    rec = prev;
+                    i -= 1;
+                }
+                return Ok(Some(rec));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Streaming cursor over a run (for merge).
 struct RunCursor {
     file: File,
@@ -353,6 +401,22 @@ mod tests {
         fs::write(d.join("meta"), b"x").unwrap();
         let runs = list_runs(&d).unwrap();
         assert_eq!(runs.len(), 1);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn lookup_key_finds_record() {
+        let d = tmp_dir();
+        let path = d.join("lk.run");
+        let mut body = Vec::new();
+        for i in [1u8, 3, 5, 7, 9] {
+            body.extend_from_slice(&rec(i, i.wrapping_mul(10)));
+        }
+        let run = write_sorted_run(&path, 32, 44, &body).unwrap();
+        let hit = lookup_key(&run, &rec(5, 0)[..32]).unwrap().unwrap();
+        // rec packs tag in byte 32 as u8 for this test helper.
+        assert_eq!(hit[32], 50);
+        assert!(lookup_key(&run, &rec(4, 0)[..32]).unwrap().is_none());
         let _ = fs::remove_dir_all(&d);
     }
 }

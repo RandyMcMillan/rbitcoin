@@ -44,10 +44,14 @@ Default: **info**. CLI wins over env.
 | Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` (`0` = full scripts) |
 | Archive queue RAM | **256 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
+| Tip prevout cache | **128 MiB** | `RBITCOIN_TIP_PREVOUT_CACHE_MB` |
+| Txid→fk process cache (FIFO) | **2048 MiB** (max 4096) | `RBITCOIN_TXID_CACHE_MB` |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 
-**Memory rule:** hash heads and mempool indexes stay mmap + live-set sized. Do not
-raise Class A / archive queues without watching RSS.
+**Memory rule:** During IBD, durable open-hash heads are off; `txid→fk` is a
+**byte-capped FIFO** (not unbounded). Misses hit sorted `tx.runs`. SH create
+dedupe is an **O(1) height watermark**, not a HashSet of every create. Do not
+raise Class A / archive / txid caches without watching RSS vs page cache.
 
 ## Libre-relay-class policy (mempool + Electrum broadcast)
 

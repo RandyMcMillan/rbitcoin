@@ -10,6 +10,7 @@ mod point_run_builder;
 mod sh_builder;
 mod tip_prevout_cache;
 mod tx_run_builder;
+mod txid_fk_cache;
 mod wave_prevout;
 
 use bitcoin::absolute::LockTime;
@@ -28,6 +29,7 @@ use rbitcoin_store::{
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 
 pub type QueryError = StoreError;
@@ -35,6 +37,7 @@ pub type QueryError = StoreError;
 pub use class_a_cache::stats as class_a_cache_stats;
 pub use connect::ConfirmPrepared;
 pub use tip_prevout_cache::stats as tip_prevout_cache_stats;
+pub use txid_fk_cache::stats as txid_fk_cache_stats;
 pub use wave_prevout::WavePrevoutCache;
 
 /// Class C sub-phase wall times (nanoseconds; reset by the IBD sampler).
@@ -63,7 +66,7 @@ pub mod class_c_phase_stats {
     pub static SH_BODY_NS: AtomicU64 = AtomicU64::new(0);
     /// SH: `scripthash.head` insert_many.
     pub static SH_HEAD_NS: AtomicU64 = AtomicU64::new(0);
-    /// SH: mark create txs indexed (`sh_tx_indexed` inserts).
+    /// SH: advance height watermark (was set inserts; now near-zero).
     pub static SH_INDEX_NS: AtomicU64 = AtomicU64::new(0);
 
     /// `(strong, scripthash, tip)` nanoseconds.
@@ -192,11 +195,10 @@ pub struct Query {
     /// Re-enable + [`Self::backfill_point_spends`] after catch-up (before Electrum).
     spend_index: std::sync::atomic::AtomicBool,
     /// When false, archive skips durable `tx.head` inserts (main archive cost).
-    /// Process-local [`Self::txid_to_fk`] still maps txid→fk for prev_tx_fk + confirm.
+    /// Process-local [`Self::txid_fk_cache`] + `tx.runs` resolve txid→fk for confirm.
     tx_index: std::sync::atomic::AtomicBool,
-    /// Process-local txid → fk for all txs archived this process (and warmed from head).
-    /// Enables prevout resolution when durable `tx.head` is off (milestone IBD).
-    txid_to_fk: Mutex<HashMap<[u8; 32], Fk>>,
+    /// Byte-capped FIFO txid → fk (IBD; miss path is tx.runs then durable head).
+    txid_fk_cache: txid_fk_cache::TxidFkCache,
     /// Process-local spent outpoints for best-chain tip (Core spentness when
     /// durable `point.head` probes are off). Key: (prev_txid, prev_vout).
     /// Must be **complete** for heights 0..=tip before any confirm when
@@ -206,11 +208,9 @@ pub struct Query {
     spent_local_ready: std::sync::atomic::AtomicBool,
     /// Process-local scripthash → body head fk (confirm append path; avoids durable chain walks).
     sh_heads: Mutex<HashMap<[u8; 32], Fk>>,
-    /// Create txs with durable thin SH rows (skip re-put). Warmed once from body after open
-    /// when non-empty; then maintained on confirm / disconnect.
-    sh_tx_indexed: Mutex<HashSet<u64>>,
-    /// True after [`Self::ensure_sh_tx_indexed_warmed`] has run (empty body counts as warm).
-    sh_tx_indexed_warmed: std::sync::atomic::AtomicBool,
+    /// Last height whose SH creates were enqueued/written **after tip commit**.
+    /// `u64::MAX` = none. Replaces unbounded `sh_tx_indexed` HashSet.
+    sh_indexed_through: AtomicU64,
     /// Byte-capped Class A working set (tx + runs) for confirm connect / reconstruct.
     /// Still filled on archive; likely demoted once tip_prevout proves out.
     class_a_cache: class_a_cache::ClassACache,
@@ -243,16 +243,20 @@ impl Query {
         // Empty tip → local is vacuously complete. Non-empty tip needs rebuild
         // before local-only spentness (spend_index off) may confirm.
         let tip_empty = store.tip_height().is_none();
+        // SH watermark: on resume, assume 0..=tip already had SH work committed with tip.
+        let sh_through = store
+            .tip_height()
+            .map(|h| h.0 as u64)
+            .unwrap_or(u64::MAX);
         let q = Self {
             store,
             spend_index: std::sync::atomic::AtomicBool::new(true),
             tx_index: std::sync::atomic::AtomicBool::new(true),
-            txid_to_fk: Mutex::new(HashMap::new()),
+            txid_fk_cache: txid_fk_cache::TxidFkCache::from_env(),
             spent_local: Mutex::new(HashSet::new()),
             spent_local_ready: std::sync::atomic::AtomicBool::new(tip_empty),
             sh_heads: Mutex::new(HashMap::new()),
-            sh_tx_indexed: Mutex::new(HashSet::new()),
-            sh_tx_indexed_warmed: std::sync::atomic::AtomicBool::new(false),
+            sh_indexed_through: AtomicU64::new(sh_through),
             class_a_cache: class_a_cache::ClassACache::from_env(),
             tip_prevout_cache: tip_prevout_cache::TipPrevoutCache::from_env(),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
@@ -263,6 +267,23 @@ impl Query {
         // Warm cache from durable head if present (resume with index on).
         // Full body scan is not done here; fresh genesis IBD fills cache as it archives.
         Ok(q)
+    }
+
+    /// Last height with SH creates committed (after tip). `None` if empty chain.
+    pub(crate) fn sh_indexed_through_height(&self) -> Option<u32> {
+        let v = self.sh_indexed_through.load(AtomicOrdering::Acquire);
+        if v == u64::MAX {
+            None
+        } else {
+            Some(v as u32)
+        }
+    }
+
+    /// Advance SH watermark only after Class C tip commit.
+    pub(crate) fn set_sh_indexed_through_height(&self, height: Option<u32>) {
+        let v = height.map(|h| h as u64).unwrap_or(u64::MAX);
+        self.sh_indexed_through
+            .store(v, AtomicOrdering::Release);
     }
 
     /// Open/create mmap IBD UTXO under the store dir. Aligns with store tip via
@@ -550,20 +571,42 @@ impl Query {
     }
 
     fn remember_txid(&self, txid: [u8; 32], fk: Fk) {
-        self.txid_to_fk.lock().unwrap().insert(txid, fk);
+        self.txid_fk_cache.insert(txid, fk);
     }
 
-    /// Resolve txid → fk via process cache, then durable `tx.head`.
+    /// Resolve txid → fk: process cache → tx.runs (catch-up) → durable `tx.head`.
     fn lookup_tx_fk(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
-        if let Some(&fk) = self.txid_to_fk.lock().unwrap().get(txid) {
+        if let Some(fk) = self.txid_fk_cache.get(txid) {
             return Ok(Some(fk));
         }
-        Ok(self.store.get_tx_by_txid(txid)?.map(|(fk, _)| fk))
+        if self.tx_run_enabled() {
+            if let Some(fk) = self.tx_run.lookup(txid)? {
+                // Read-through: keep cold parent hot for subsequent inputs.
+                self.txid_fk_cache.insert(*txid, fk);
+                return Ok(Some(fk));
+            }
+        }
+        if self.tx_index_enabled() {
+            if let Some((fk, _)) = self.store.get_tx_by_txid(txid)? {
+                self.txid_fk_cache.insert(*txid, fk);
+                return Ok(Some(fk));
+            }
+        }
+        Ok(None)
     }
 
-    /// Public resolve for consensus prevout path (process cache + durable head).
+    /// Public resolve for consensus prevout path (cache + runs + durable head).
     pub fn tx_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
         self.lookup_tx_fk(txid)
+    }
+
+    /// `(entries, approx_bytes, budget_bytes)` for the process txid→fk FIFO.
+    pub fn txid_fk_cache_usage(&self) -> (usize, usize, usize) {
+        (
+            self.txid_fk_cache.len(),
+            self.txid_fk_cache.approx_bytes(),
+            self.txid_fk_cache.budget_bytes(),
+        )
     }
 
     /// Warm process txid→fk from an already-archived header body.
@@ -670,45 +713,15 @@ impl Query {
         lead <= max_lead
     }
 
-    /// One sequential body scan into the process create-tx set so kill+restart
-    /// re-confirm does not append duplicate creates (no per-batch chain walks).
-    ///
-    /// Cheap when body is empty. Idempotent. Called automatically on confirm;
-    /// exposed for tests / explicit warm after open.
+    /// No-op compatibility: SH dedupe is a height watermark (`sh_indexed_through`),
+    /// not a HashSet warm from durable body.
     pub fn warm_scripthash_create_index(&self) -> Result<(), QueryError> {
-        self.ensure_sh_tx_indexed_warmed()
-    }
-
-    /// One sequential body scan into [`Self::sh_tx_indexed`] so kill+restart re-confirm
-    /// does not append duplicate creates — without per-batch linked-list walks.
-    ///
-    /// Cheap when body is empty. Idempotent. Safe to call from confirm before puts.
-    fn ensure_sh_tx_indexed_warmed(&self) -> Result<(), QueryError> {
-        if self
-            .sh_tx_indexed_warmed
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Ok(());
+        // Align watermark with tip if durable SH exists (tip mode resume).
+        if let Some(tip) = self.tip_height() {
+            if self.sh_indexed_through_height().is_none() {
+                self.set_sh_indexed_through_height(Some(tip.0));
+            }
         }
-        // Double-checked under set lock so concurrent confirm cannot double-scan.
-        let mut indexed = self.sh_tx_indexed.lock().unwrap();
-        if self
-            .sh_tx_indexed_warmed
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return Ok(());
-        }
-        let n = self.store.scripthash.entry_count();
-        if n > 0 {
-            indexed.reserve(n as usize);
-            self.store.scripthash.for_each_live_create(|create_tx_fk, _vout| {
-                if !create_tx_fk.is_null() {
-                    indexed.insert(create_tx_fk.0);
-                }
-            })?;
-        }
-        self.sh_tx_indexed_warmed
-            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -868,28 +881,37 @@ impl Query {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Fill process-local txid→fk from every Class A tx body.
+    /// Optionally warm a **capped** recent slice of Class A into the process cache.
     ///
-    /// Required when durable `tx.head` is off and the process restarts: out-of-order
-    /// archive may have left spend inputs with external `prev_txid` and null
-    /// `prev_tx_fk`. Confirm resolves those via this cache (see signet tip stuck
-    /// on `missing prevout` after resume).
+    /// Full-chain warm was multi‑GiB and fought page cache during IBD. Catch-up
+    /// miss path is `tx.runs` lookup; this only seeds the last `max_entries`
+    /// txs (by fk order) for resume locality. Pass `0` to skip.
     ///
-    /// Returns the number of txs loaded into the cache.
+    /// Returns the number of txs loaded.
     pub fn warm_txid_cache_from_bodies(&self) -> Result<u64, QueryError> {
+        // Default: warm up to ~budget/96 entries or 2M, whichever smaller.
+        let max_entries = (self.txid_fk_cache.budget_bytes() / 96).min(2_000_000);
+        self.warm_txid_cache_recent(max_entries)
+    }
+
+    /// Warm the highest `max_entries` Class A fks into the FIFO cache.
+    pub fn warm_txid_cache_recent(&self, max_entries: usize) -> Result<u64, QueryError> {
+        if max_entries == 0 {
+            return Ok(0);
+        }
         let n = self.store.txs.count();
         if n == 0 {
             return Ok(0);
         }
-        // Batch lock inserts without per-tx mutex churn.
-        let mut map = self.txid_to_fk.lock().unwrap();
-        map.reserve(n as usize);
-        for id in 1..=n {
+        let start = n.saturating_sub(max_entries as u64).saturating_add(1).max(1);
+        let mut loaded = 0u64;
+        for id in start..=n {
             let fk = Fk(id);
             let rec = self.store.get_tx(fk)?;
-            map.insert(rec.txid, fk);
+            self.txid_fk_cache.insert(rec.txid, fk);
+            loaded += 1;
         }
-        Ok(n)
+        Ok(loaded)
     }
 
     /// Write durable `tx.head` for every Class A body missing from the hash head.

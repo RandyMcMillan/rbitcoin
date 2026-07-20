@@ -66,6 +66,7 @@ impl RunMemtable for Inner {
         }
         let path = next_run_path(&self.ctrl.runs_dir, self.ctrl.next_seq);
         self.ctrl.next_seq += 1;
+        let _io = self.ctrl.runs_io.lock().unwrap();
         write_sorted_run(&path, KEY_LEN, FULL, &body)?;
         Ok(recs.len() as u64)
     }

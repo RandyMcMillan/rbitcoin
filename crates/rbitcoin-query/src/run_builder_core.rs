@@ -29,6 +29,12 @@ pub struct RunControl {
     pub next_seq: u64,
     pub stop: bool,
     pub finalize: bool,
+    /// Serializes run file list / write / merge / delete.
+    ///
+    /// Lookups and compact used to race: `list_runs` saw a path, merge deleted
+    /// it, `open_run` failed and was mis-logged as "corrupt sorted run", and
+    /// keys could be missed mid-merge. Hold this for the whole file op set.
+    pub runs_io: Arc<Mutex<()>>,
 }
 
 impl RunControl {
@@ -53,6 +59,7 @@ impl RunControl {
             next_seq,
             stop: false,
             finalize: false,
+            runs_io: Arc::new(Mutex::new(())),
         }
     }
 
@@ -122,7 +129,17 @@ pub fn worker_loop<T: RunMemtable + 'static>(
         let need_flush =
             g.pending_len() >= soft_cap || (g.control().finalize && g.pending_len() > 0);
         let runs_dir = g.control().runs_dir.clone();
-        let run_count = list_runs(&runs_dir).map(|r| r.len()).unwrap_or(0);
+        let runs_io = Arc::clone(&g.control().runs_io);
+        // Count under runs_io so we don't race compact deletes.
+        let run_count = {
+            drop(g);
+            let _io = runs_io.lock().unwrap();
+            list_runs(&runs_dir).map(|r| r.len()).unwrap_or(0)
+        };
+        g = inner.lock().unwrap();
+        if g.control().stop {
+            break;
+        }
         let need_merge =
             run_count >= MAX_RUNS || (g.control().finalize && run_count > 1 && !need_flush);
 
@@ -155,26 +172,30 @@ pub fn worker_loop<T: RunMemtable + 'static>(
         }
 
         if need_merge {
-            let g = inner.lock().unwrap();
-            let runs_dir = g.control().runs_dir.clone();
-            let mut seq = g.control().next_seq;
-            drop(g);
+            // Lock order: never take Inner while holding runs_io (flush holds
+            // Inner then runs_io). Reserve output seq under Inner first.
+            let (runs_dir, out_seq, runs_io) = {
+                let mut g = inner.lock().unwrap();
+                let runs_dir = g.control().runs_dir.clone();
+                let runs_io = Arc::clone(&g.control().runs_io);
+                let out_seq = g.control().next_seq;
+                g.control_mut().next_seq = out_seq.saturating_add(1);
+                (runs_dir, out_seq, runs_io)
+            };
+            let _io = runs_io.lock().unwrap();
             let mut runs = list_runs(&runs_dir).unwrap_or_default();
             if runs.len() >= 2 {
                 runs.sort_by_key(|r| r.count);
                 let n = runs.len().min(4).max(2);
                 let batch: Vec<SortedRunPath> = runs.drain(..n).collect();
-                let out = next_run_path(&runs_dir, seq);
-                seq += 1;
-                match merge_runs(&batch, &out) {
-                    Ok(_) => {
-                        let mut g = inner.lock().unwrap();
-                        g.control_mut().next_seq = g.control().next_seq.max(seq);
-                    }
-                    Err(e) => warn!("ibd: {log_tag} run compact failed: {e}"),
+                let out = next_run_path(&runs_dir, out_seq);
+                if let Err(e) = merge_runs(&batch, &out) {
+                    warn!("ibd: {log_tag} run compact failed: {e}");
                 }
+                drop(_io);
                 std::thread::sleep(AFTER_WORK);
             }
+            // If <2 runs, seq is a harmless hole (race with concurrent finalize).
         }
     }
 }
@@ -218,22 +239,33 @@ pub fn finalize_wait_join<T: RunMemtable>(
 pub fn compact_all_to_one<T: RunMemtable>(
     inner: &Mutex<T>,
 ) -> Result<Option<SortedRunPath>, StoreError> {
-    let runs_dir = inner.lock().unwrap().control().runs_dir.clone();
-    let mut runs = list_runs(&runs_dir)?;
-    while runs.len() > 1 {
+    let (runs_dir, runs_io) = {
+        let g = inner.lock().unwrap();
+        (g.control().runs_dir.clone(), Arc::clone(&g.control().runs_io))
+    };
+    loop {
+        let mut runs = {
+            let _io = runs_io.lock().unwrap();
+            list_runs(&runs_dir)?
+        };
+        if runs.len() <= 1 {
+            return Ok(runs.into_iter().next());
+        }
         let n = runs.len().min(8);
         let batch: Vec<SortedRunPath> = runs.drain(..n).collect();
         let seq = {
             let mut g = inner.lock().unwrap();
             let s = g.control().next_seq;
-            g.control_mut().next_seq += 1;
+            g.control_mut().next_seq = s.saturating_add(1);
             s
         };
         let out = next_run_path(&runs_dir, seq);
-        runs.push(merge_runs(&batch, &out)?);
-        runs.sort_by(|a, b| a.path.cmp(&b.path));
+        let _io = runs_io.lock().unwrap();
+        let merged = merge_runs(&batch, &out)?;
+        drop(_io);
+        // Loop re-lists under the gate (other runs may still exist).
+        let _ = merged;
     }
-    Ok(runs.into_iter().next())
 }
 
 /// Delete all files under the runs directory after materialize.

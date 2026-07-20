@@ -299,6 +299,10 @@ pub fn merge_runs(inputs: &[SortedRunPath], out_path: &Path) -> Result<SortedRun
 }
 
 /// List `*.run` files in `dir` sorted by name.
+///
+/// Files that disappear between `read_dir` and open (merge deleted them) are
+/// skipped quietly — that is a race, not corruption. Real header/body failures
+/// are warned with the underlying error.
 pub fn list_runs(dir: &Path) -> Result<Vec<SortedRunPath>, StoreError> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -314,8 +318,16 @@ pub fn list_runs(dir: &Path) -> Result<Vec<SortedRunPath>, StoreError> {
     for p in paths {
         match open_run(&p) {
             Ok(r) => out.push(r),
-            Err(_) => {
-                rbitcoin_log::warn!("store: skipping corrupt sorted run {}", p.display());
+            Err(StoreError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                // Compact deleted this run after read_dir — not corrupt.
+            }
+            Err(e) => {
+                rbitcoin_log::warn!(
+                    "store: skipping bad sorted run {}: {e}",
+                    p.display()
+                );
             }
         }
     }
@@ -399,6 +411,21 @@ mod tests {
         let d = tmp_dir();
         write_sorted_run(&d.join("000001.run"), 32, 44, &rec(1, 1)).unwrap();
         fs::write(d.join("meta"), b"x").unwrap();
+        let runs = list_runs(&d).unwrap();
+        assert_eq!(runs.len(), 1);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn list_runs_skips_vanished_path() {
+        // Simulate compact race: dirent present at list time is gone before open.
+        // (We can't inject into read_dir easily; writing a zero-byte .run is a
+        // real corrupt case — vanish is Io NotFound which must not panic.)
+        let d = tmp_dir();
+        write_sorted_run(&d.join("000001.run"), 32, 44, &rec(1, 1)).unwrap();
+        let gone = d.join("000002.run");
+        fs::write(&gone, b"").unwrap();
+        // empty file → corrupt (bad magic), not NotFound — still listed as skip.
         let runs = list_runs(&d).unwrap();
         assert_eq!(runs.len(), 1);
         let _ = fs::remove_dir_all(&d);

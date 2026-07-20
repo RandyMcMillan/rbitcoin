@@ -59,6 +59,7 @@ impl RunMemtable for Inner {
         }
         let path = next_run_path(&self.ctrl.runs_dir, self.ctrl.next_seq);
         self.ctrl.next_seq += 1;
+        let _io = self.ctrl.runs_io.lock().unwrap();
         write_sorted_run(&path, KEY_LEN, REC_LEN, &body)?;
         Ok(recs.len() as u64)
     }
@@ -145,12 +146,18 @@ impl TxRunBuilder {
         if !self.is_enabled() {
             return Ok(None);
         }
-        let g = self.inner.lock().unwrap();
-        if let Some(&fk) = g.pending_map.get(txid) {
-            return Ok(Some(fk));
-        }
-        let runs_dir = g.ctrl.runs_dir.clone();
-        drop(g);
+        let (runs_dir, runs_io) = {
+            let g = self.inner.lock().unwrap();
+            if let Some(&fk) = g.pending_map.get(txid) {
+                return Ok(Some(fk));
+            }
+            (
+                g.ctrl.runs_dir.clone(),
+                std::sync::Arc::clone(&g.ctrl.runs_io),
+            )
+        };
+        // Hold runs_io for list+probe so compact cannot delete mid-lookup.
+        let _io = runs_io.lock().unwrap();
         let mut runs = list_runs(&runs_dir)?;
         runs.sort_by(|a, b| b.path.cmp(&a.path));
         for run in &runs {

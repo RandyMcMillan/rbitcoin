@@ -737,7 +737,20 @@ pub async fn ibd_cancellable(
                     || need_arch_runway;
                 if want_more {
                     let tips = work_path_tips(&st);
-                    let _ = request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
+                    // Cold start / empty path: fan getheaders to several peers so a
+                    // single silent zombie cannot stall ordered=0 forever.
+                    let fan = if live == 0 {
+                        st.slots.iter().filter(|s| s.alive).count().min(4).max(1)
+                    } else {
+                        1
+                    };
+                    for _ in 0..fan {
+                        if !request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips)
+                            .unwrap_or(false)
+                        {
+                            break;
+                        }
+                    }
                 }
             }
         }

@@ -198,8 +198,159 @@ pub(crate) async fn spawn_peer(
             }
         }
 
+        // Reader first: Core pipelines sendheaders/sendcmpct/… right after verack.
+        // July 18 cold-start worked with **no** post-handshake getaddr/sendaddrv2
+        // before getheaders; those writes raced Core's pipeline and peers closed
+        // (ordered=0 / inflight=0 / never archive).
+        let mut reader = reader;
+        let sinks_r = sinks.clone();
+        let reader_task = tokio::spawn(async move {
+            let mut prog_mark = 0usize;
+            loop {
+                let frame = read_v2_frame_with_progress(&mut reader, magic, |buffered| {
+                    const STEP: usize = 64 * 1024;
+                    if buffered >= prog_mark + STEP || buffered <= STEP {
+                        prog_mark = buffered;
+                        touch_block_progress(&progress_io);
+                    }
+                })
+                .await;
+                prog_mark = 0;
+                match frame {
+                    Ok(frame) => {
+                        if frame.is_ping() {
+                            if let Some(n) = frame.ping_nonce() {
+                                let _ = out_tx.send(NetworkMessage::Pong(n));
+                            }
+                            continue;
+                        }
+
+                        if frame.is_block() || frame.is_notfound() {
+                            touch_block_progress(&progress_io);
+                        }
+
+                        let framed_block_hash = if frame.is_block() {
+                            frame.block_hash_from_header()
+                        } else {
+                            None
+                        };
+                        if let Some(hash) = framed_block_hash {
+                            sinks_r.send_body(PeerEvent::BlockFramed {
+                                peer: id,
+                                hash,
+                                wire_bytes: frame.payload.len(),
+                            });
+                        }
+
+                        let progress = Arc::clone(&progress_io);
+                        let sinks_d = sinks_r.clone();
+                        let sinks_err = sinks_r.clone();
+                        let framed_err_hash = framed_block_hash;
+                        spawn_decode_then_with_err(
+                            frame,
+                            move |msg| {
+                                match msg.into_payload() {
+                                    NetworkMessage::Headers(h) => {
+                                        let headers = if h.len() > MAX_HEADERS_RESULTS {
+                                            h[..MAX_HEADERS_RESULTS].to_vec()
+                                        } else {
+                                            h
+                                        };
+                                        sinks_d.send_ctrl(PeerEvent::Headers {
+                                            peer: id,
+                                            headers,
+                                        });
+                                    }
+                                    NetworkMessage::Block(b) => {
+                                        touch_block_progress(&progress);
+                                        sinks_d.send_body(PeerEvent::Block {
+                                            peer: id,
+                                            block: b,
+                                        });
+                                    }
+                                    NetworkMessage::NotFound(inv) => {
+                                        touch_block_progress(&progress);
+                                        let hashes: Vec<BlockHash> = inv
+                                            .iter()
+                                            .filter_map(|i| match i {
+                                                Inventory::Block(h)
+                                                | Inventory::WitnessBlock(h) => Some(*h),
+                                                _ => None,
+                                            })
+                                            .collect();
+                                        if !hashes.is_empty() {
+                                            sinks_d.send_body(PeerEvent::NotFound {
+                                                peer: id,
+                                                hashes,
+                                            });
+                                        }
+                                    }
+                                    NetworkMessage::Addr(list) => {
+                                        let addrs = socket_addrs_from_addr(&list);
+                                        if !addrs.is_empty() {
+                                            sinks_d.send_ctrl(PeerEvent::Addrs {
+                                                peer: id,
+                                                addrs,
+                                            });
+                                        }
+                                    }
+                                    NetworkMessage::AddrV2(list) => {
+                                        let addrs = socket_addrs_from_addrv2(&list);
+                                        if !addrs.is_empty() {
+                                            sinks_d.send_ctrl(PeerEvent::Addrs {
+                                                peer: id,
+                                                addrs,
+                                            });
+                                        }
+                                    }
+                                    NetworkMessage::SendAddrV2 => {}
+                                    other => {
+                                        if let Some(hash) = framed_err_hash {
+                                            let _ = other;
+                                            sinks_d.send_body(PeerEvent::BlockDecodeFailed {
+                                                peer: id,
+                                                hash,
+                                            });
+                                        }
+                                    }
+                                }
+                            },
+                            move || {
+                                if let Some(hash) = framed_err_hash {
+                                    sinks_err.send_body(PeerEvent::BlockDecodeFailed {
+                                        peer: id,
+                                        hash,
+                                    });
+                                }
+                            },
+                        );
+                    }
+                    Err(NetError::Io(e))
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof
+                            || e.kind() == std::io::ErrorKind::ConnectionReset =>
+                    {
+                        sinks_r.send_body(PeerEvent::Dead {
+                            peer: id,
+                            reason: format!("eof: {e}"),
+                        });
+                        break;
+                    }
+                    Err(e) => {
+                        sinks_r.send_body(PeerEvent::Dead {
+                            peer: id,
+                            reason: e.to_string(),
+                        });
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Let the reader poll once before we accept write work (getheaders).
+        tokio::task::yield_now().await;
+
         let mut writer = writer;
-        let sinks_w = sinks.clone();
+        let sinks_w = sinks;
         let writer_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -275,177 +426,10 @@ pub(crate) async fn spawn_peer(
             }
         });
 
-        // Reader: decrypt frame only + cheap ping. Block/headers/notfound
-        // decode runs on the blocking pool (fire-and-forget) so this task returns
-        // to `read` immediately.
-        //
-        // Body events (framed/decoded blocks) go on `sinks.body` so the IBD loop
-        // can drain them ahead of header floods on `sinks.ctrl`.
-        let mut reader = reader;
-        let out_tx_reader = out_tx.clone();
-        let reader_task = tokio::spawn(async move {
-            let mut prog_mark = 0usize;
-            loop {
-                let frame = read_v2_frame_with_progress(&mut reader, magic, |buffered| {
-                    // Atomic stall clock only — do not flood IBD event channel.
-                    const STEP: usize = 64 * 1024;
-                    if buffered >= prog_mark + STEP || buffered <= STEP {
-                        prog_mark = buffered;
-                        touch_block_progress(&progress_io);
-                    }
-                })
-                .await;
-                prog_mark = 0;
-                match frame {
-                    Ok(frame) => {
-                        // Ping: 8-byte nonce — handle inline, never leave the I/O task.
-                        if frame.is_ping() {
-                            if let Some(n) = frame.ping_nonce() {
-                                let _ = out_tx_reader.send(NetworkMessage::Pong(n));
-                            }
-                            continue;
-                        }
-
-                        // Touch stall clock as soon as a block frame is complete
-                        // (decode may finish later on another thread).
-                        if frame.is_block() || frame.is_notfound() {
-                            touch_block_progress(&progress_io);
-                        }
-
-                        // Free getdata *before* blocking-pool decode. Body channel
-                        // is drained first so this is not stuck behind Headers.
-                        let framed_block_hash = if frame.is_block() {
-                            frame.block_hash_from_header()
-                        } else {
-                            None
-                        };
-                        if let Some(hash) = framed_block_hash {
-                            sinks.send_body(PeerEvent::BlockFramed {
-                                peer: id,
-                                hash,
-                                wire_bytes: frame.payload.len(),
-                            });
-                        }
-
-                        let progress = Arc::clone(&progress_io);
-                        let sinks_d = sinks.clone();
-                        let sinks_err = sinks.clone();
-                        let framed_err_hash = framed_block_hash;
-                        spawn_decode_then_with_err(
-                            frame,
-                            move |msg| {
-                                match msg.into_payload() {
-                                    NetworkMessage::Headers(h) => {
-                                        let headers = if h.len() > MAX_HEADERS_RESULTS {
-                                            h[..MAX_HEADERS_RESULTS].to_vec()
-                                        } else {
-                                            h
-                                        };
-                                        sinks_d.send_ctrl(PeerEvent::Headers {
-                                            peer: id,
-                                            headers,
-                                        });
-                                    }
-                                    NetworkMessage::Block(b) => {
-                                        touch_block_progress(&progress);
-                                        sinks_d.send_body(PeerEvent::Block {
-                                            peer: id,
-                                            block: b,
-                                        });
-                                    }
-                                    NetworkMessage::NotFound(inv) => {
-                                        touch_block_progress(&progress);
-                                        let hashes: Vec<BlockHash> = inv
-                                            .iter()
-                                            .filter_map(|i| match i {
-                                                Inventory::Block(h)
-                                                | Inventory::WitnessBlock(h) => Some(*h),
-                                                _ => None,
-                                            })
-                                            .collect();
-                                        if !hashes.is_empty() {
-                                            sinks_d.send_body(PeerEvent::NotFound {
-                                                peer: id,
-                                                hashes,
-                                            });
-                                        }
-                                    }
-                                    NetworkMessage::Addr(list) => {
-                                        let addrs = socket_addrs_from_addr(&list);
-                                        if !addrs.is_empty() {
-                                            sinks_d.send_ctrl(PeerEvent::Addrs {
-                                                peer: id,
-                                                addrs,
-                                            });
-                                        }
-                                    }
-                                    NetworkMessage::AddrV2(list) => {
-                                        let addrs = socket_addrs_from_addrv2(&list);
-                                        if !addrs.is_empty() {
-                                            sinks_d.send_ctrl(PeerEvent::Addrs {
-                                                peer: id,
-                                                addrs,
-                                            });
-                                        }
-                                    }
-                                    NetworkMessage::SendAddrV2 => {
-                                        // Peer prefers addrv2; we already sent GetAddr.
-                                    }
-                                    other => {
-                                        // Framed as block but decode did not yield Block.
-                                        if let Some(hash) = framed_err_hash {
-                                            let _ = other;
-                                            sinks_d.send_body(PeerEvent::BlockDecodeFailed {
-                                                peer: id,
-                                                hash,
-                                            });
-                                        }
-                                    }
-                                }
-                            },
-                            move || {
-                                if let Some(hash) = framed_err_hash {
-                                    sinks_err.send_body(PeerEvent::BlockDecodeFailed {
-                                        peer: id,
-                                        hash,
-                                    });
-                                }
-                            },
-                        );
-                    }
-                    Err(NetError::Io(e))
-                        if e.kind() == std::io::ErrorKind::UnexpectedEof
-                            || e.kind() == std::io::ErrorKind::ConnectionReset =>
-                    {
-                        sinks.send_body(PeerEvent::Dead {
-                            peer: id,
-                            reason: format!("eof: {e}"),
-                        });
-                        break;
-                    }
-                    Err(e) => {
-                        sinks.send_body(PeerEvent::Dead {
-                            peer: id,
-                            reason: e.to_string(),
-                        });
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Prefer addrv2 + grow the book **after** reader+writer are live.
-        // Writing these on the handshake task (before any read poll) raced Core's
-        // post-verack pipeline; peers closed immediately and tip=0 never got
-        // headers (inflight=0, ordered=0). July 18 cold-start worked without this.
-        let _ = out_tx.send(NetworkMessage::SendAddrV2);
-        let _ = out_tx.send(NetworkMessage::GetAddr);
-
         let mut guard = PeerIoTasks {
             reader: reader_task,
             writer: writer_task,
         };
-        // Wait until either half ends; Drop aborts the other.
         tokio::select! {
             _ = &mut guard.reader => {}
             _ = &mut guard.writer => {}

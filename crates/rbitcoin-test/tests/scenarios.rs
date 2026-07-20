@@ -1126,6 +1126,76 @@ fn spent_local_core_double_spend_and_disconnect() {
     );
 }
 
+/// Multi-block `confirm_archived_run` must insert UTXO creates (tx_fks live on
+/// Class C items after mem::take). Regression for mainnet tip=169 reject @170
+/// PrevoutSpent: empty creates left the first real spend as a false miss.
+#[test]
+fn ibd_utxo_multi_block_run_keeps_creates() {
+    use rbitcoin_consensus::{
+        accept_and_archive_block, accept_and_connect_block, confirm_archived_run, ChainParams,
+        Milestone,
+    };
+    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.set_spend_index(false);
+    q.set_tx_index(false);
+    q.enable_ibd_utxo().unwrap();
+    let ms = Milestone::NONE;
+    let params = ChainParams::regtest();
+    let maturity = params.coinbase_maturity();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+    let cb1 = b1.txdata[0].compute_txid();
+    accept_and_archive_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+
+    let last_pad = maturity + 1;
+    let mut run: Vec<(Height, [u8; 32])> = vec![(Height(1), b1.block_hash().to_byte_array())];
+    for h in 2..=last_pad {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+        run.push((Height(h), b.block_hash().to_byte_array()));
+    }
+    let spend_h = last_pad + 1;
+    let spend = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
+    let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
+    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
+    run.push((
+        Height(spend_h),
+        b_spend.block_hash().to_byte_array(),
+    ));
+
+    // One multi-height confirm (IBD path): must apply creates from every height
+    // so the spend of cb1@0 in the last block does not false-positive as spent.
+    confirm_archived_run(&q, &params, ms, &run)
+        .expect("multi-block UTXO run must confirm pad+spend");
+    assert_eq!(q.tip_height(), Some(Height(spend_h)));
+    assert!(
+        q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
+        "cb1 coinbase must be spent after multi-block run"
+    );
+    assert!(
+        q.catchup_is_spent(cb1.as_byte_array(), 0).unwrap(),
+        "UTXO oracle must mark spent prevout"
+    );
+    // Spend creates a new unspent outpoint — must be present in UTXO.
+    let spend_txid = b_spend.txdata[1].compute_txid();
+    assert!(
+        !q.catchup_is_spent(spend_txid.as_byte_array(), 0).unwrap(),
+        "spend output must be unspent in mmap UTXO after multi-block apply"
+    );
+}
+
 /// Sequential confirm_archived_run + failed confirm must not poison spent_local.
 #[test]
 fn confirm_run_sequential_and_failed_no_spend_poison() {

@@ -279,8 +279,16 @@ pub fn validate_block_connect(
     let check_scripts = !ctx.milestone.skips_scripts_at(ctx.height.0);
     // Pending until connect+scripts succeed — do not poison spent_local on failure.
     let mut pending = std::collections::HashSet::new();
-    let (script_jobs, spends) =
-        connect_block_prevouts(query, block, ctx, archived_tx_fks, None, &mut pending)?;
+    let mut pending_creates = std::collections::HashSet::new();
+    let (script_jobs, spends) = connect_block_prevouts(
+        query,
+        block,
+        ctx,
+        archived_tx_fks,
+        None,
+        &mut pending,
+        &mut pending_creates,
+    )?;
     if check_scripts && !script_jobs.is_empty() {
         verify_scripts_pool(&script_jobs)?;
     }
@@ -360,6 +368,11 @@ pub struct ScriptCheckJob {
 ///
 /// Spent outpoints go into `pending_spent` (not `spent_local`) so a failed
 /// script check can drop them without poisoning the next attempt.
+///
+/// `pending_creates` holds outpoints created earlier in this confirm run
+/// (same-block or prior heights in a multi-block run). Required for mmap UTXO
+/// spentness: the unspent set is only updated after Class C, so same-run
+/// creates would otherwise false-positive as spent (`!contains`).
 pub(crate) fn connect_block_prevouts(
     query: &Query,
     block: &Block,
@@ -367,6 +380,7 @@ pub(crate) fn connect_block_prevouts(
     archived_tx_fks: Option<&[rbitcoin_primitives::Fk]>,
     wave_prevouts: Option<&rbitcoin_query::WavePrevoutCache>,
     pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
+    pending_creates: &mut std::collections::HashSet<([u8; 32], u32)>,
 ) -> Result<(Vec<ScriptCheckJob>, Vec<([u8; 32], u32)>), ConsensusError> {
     if let Some(fks) = archived_tx_fks {
         if fks.len() != block.txdata.len() {
@@ -482,11 +496,12 @@ pub(crate) fn connect_block_prevouts(
                     if local.contains(&key) {
                         return Err(ConsensusError::PrevoutSpent);
                     }
-                } else if query
-                    .catchup_is_spent(op.txid.as_byte_array(), op.vout)
-                    .map_err(ConsensusError::Store)?
+                } else if !pending_creates.contains(&key)
+                    && query
+                        .catchup_is_spent(op.txid.as_byte_array(), op.vout)
+                        .map_err(ConsensusError::Store)?
                 {
-                    // mmap UTXO miss or spent_local hit — treat as spent/missing.
+                    // mmap UTXO miss (and not a same-run create) or spent_local hit.
                     return Err(ConsensusError::PrevoutSpent);
                 }
                 let prev_fk = thin
@@ -581,11 +596,12 @@ pub(crate) fn connect_block_prevouts(
             tx.compute_txid().to_byte_array()
         };
         let mut outs = Vec::with_capacity(tx.output.len());
-        for o in &tx.output {
+        for (v, o) in tx.output.iter().enumerate() {
             outs.push(TxOut {
                 value: o.value,
                 script_pubkey: o.script_pubkey.clone(),
             });
+            pending_creates.insert((txid, v as u32));
         }
         same_block.insert(txid, outs);
     }

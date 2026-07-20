@@ -245,6 +245,8 @@ pub fn confirm_archived_run(
     }
 
     let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
+    // Same-run creates (overlay for mmap UTXO until Class C apply).
+    let mut pending_creates: HashSet<([u8; 32], u32)> = HashSet::new();
     let mut time_window: Vec<u32> = Vec::with_capacity(11);
     let mut prepared: Vec<Prepared> = Vec::with_capacity(blocks.len());
 
@@ -364,6 +366,7 @@ pub fn confirm_archived_run(
             Some(&tx_fks),
             Some(&wave_prevouts),
             &mut pending_spent,
+            &mut pending_creates,
         )?;
         confirm_phase_stats::CONNECT_NS
             .fetch_add(t_connect.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -437,6 +440,7 @@ pub fn confirm_archived_run(
         .fetch_add(t_class_c.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
     // Collect spends once (spent_local + tip_prevout retirement).
+    // Note: `p.tx_fks` was moved into `items` for Class C — do not read it here.
     let mut all_spends: Vec<([u8; 32], u32)> = Vec::new();
     for p in &prepared {
         all_spends.extend_from_slice(&p.spends);
@@ -444,23 +448,25 @@ pub fn confirm_archived_run(
 
     // Update catch-up spentness oracle + tip_prevout after Class C success.
     let t_spent = Instant::now();
-    // Collect creates (txid, vout) for mmap UTXO inserts.
-    let mut all_creates: Vec<([u8; 32], u32)> = Vec::new();
-    for p in &prepared {
-        for &fk in &p.tx_fks {
-            let tx = query
-                .get_tx_class_a(fk)
-                .map_err(ConsensusError::Store)?;
-            for v in 0..tx.output_count {
-                all_creates.push((tx.txid, v));
-            }
-        }
-    }
     if query.ibd_utxo_enabled() {
-        let tip_h = prepared.last().map(|p| p.height.0).unwrap_or(0);
-        query
-            .apply_ibd_utxo_block(&all_spends, &all_creates, tip_h)
-            .map_err(ConsensusError::Store)?;
+        // Per-height apply: spends then creates. Critical for multi-block runs
+        // where height H+1 spends a create from height H in the same batch.
+        // Creates come from `items` (tx_fks after mem::take), not emptied prepared.
+        for (p, item) in prepared.iter().zip(items.iter()) {
+            let mut creates =
+                Vec::with_capacity(item.tx_fks.len().saturating_mul(2));
+            for &fk in &item.tx_fks {
+                let tx = query
+                    .get_tx_class_a(fk)
+                    .map_err(ConsensusError::Store)?;
+                for v in 0..tx.output_count {
+                    creates.push((tx.txid, v));
+                }
+            }
+            query
+                .apply_ibd_utxo_block(&p.spends, &creates, item.height.0)
+                .map_err(ConsensusError::Store)?;
+        }
     } else {
         query.note_outpoints_spent_local(&all_spends);
     }

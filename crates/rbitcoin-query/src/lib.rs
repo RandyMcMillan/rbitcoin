@@ -274,13 +274,24 @@ impl Query {
         }
         let mut u = IbdUtxo::open_or_create(self.store.path())?;
         let store_tip = self.tip_height().map(|h| h.0);
-        match (u.tip(), store_tip) {
-            (t, s) if t == s => {
+        // Empty live with a non-genesis tip is impossible (every height creates
+        // ≥1 coinbase outpoint). Catches the pre-fix bug where multi-block
+        // confirm advanced tip meta without inserting creates.
+        let empty_poisoned = u.live_count() == 0 && u.tip().is_some();
+        match (u.tip(), store_tip, empty_poisoned) {
+            (_, _, true) => {
+                u.clear()?;
+                *g = Some(u);
+                drop(g);
+                self.rebuild_ibd_utxo_to_tip()?;
+                return Ok(());
+            }
+            (t, s, _) if t == s => {
                 // Consistent — ready without rebuild.
                 self.spent_local_ready
                     .store(true, std::sync::atomic::Ordering::Release);
             }
-            (Some(ut), Some(st)) if ut < st => {
+            (Some(ut), Some(st), _) if ut < st => {
                 // Short replay below after unlock — mark not ready until done.
                 self.spent_local_ready
                     .store(false, std::sync::atomic::Ordering::Release);
@@ -289,7 +300,7 @@ impl Query {
                 self.replay_ibd_utxo(ut + 1, st)?;
                 return Ok(());
             }
-            (None, Some(_)) => {
+            (None, Some(_), _) => {
                 *g = Some(u);
                 drop(g);
                 self.rebuild_ibd_utxo_to_tip()?;

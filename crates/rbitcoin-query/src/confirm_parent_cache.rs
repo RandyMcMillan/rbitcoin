@@ -216,6 +216,9 @@ impl ConfirmParentCache {
 
     /// Store a full runway block body (phase-1 prewarm). Confirm/wave should
     /// prefer this over Class A store reads.
+    ///
+    /// Inserts `txid → fk` so later spends resolve via [`Self::get_by_txid`] +
+    /// [`Self::get_parent_out`] (body outs, no dual `by_fk` copy of every script).
     pub fn put_body(
         &self,
         fk: Fk,
@@ -228,20 +231,32 @@ impl ConfirmParentCache {
             return;
         };
         let mut g = self.inner.lock().unwrap();
-        g.by_txid.insert(tx.txid, id);
-        g.by_body.insert(
-            id,
-            BodyEntry {
-                height,
-                tx,
-                outputs,
-                inputs,
-                thin_inputs: None,
-            },
-        );
+        g.insert_body(id, height, tx, outputs, inputs);
     }
 
-    /// Phase-1 hot path: body + full create outs under **one** lock (no ready recompute).
+    /// Many bodies under **one** lock (prewarm phase-1 finish). Moves ownership.
+    pub fn put_bodies_batch(
+        &self,
+        items: Vec<(Fk, u32, TxRecord, Vec<OutputRecord>, Vec<InputRecord>)>,
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        for (fk, height, tx, outputs, inputs) in items {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            g.insert_body(id, height, tx, outputs, inputs);
+        }
+    }
+
+    /// Phase-1 hot path: body + `by_txid` (creates are the body outs).
+    ///
+    /// Does **not** clone every output into `by_fk` — that doubled RAM/CPU on
+    /// mainnet (~all scripts twice). Wave/prewarm resolve runway creates via
+    /// [`Self::get_parent_out`] body fallback. Sparse `by_fk` is only for
+    /// external UTXO parents and legacy reserve waiters.
     pub fn put_body_and_creates(
         &self,
         fk: Fk,
@@ -255,47 +270,9 @@ impl ConfirmParentCache {
         };
         let mut g = self.inner.lock().unwrap();
         let txid = tx.txid;
-        g.by_txid.insert(txid, id);
-        {
-            let e = g.by_fk.entry(id).or_insert_with(|| ParentEntry {
-                tx: tx.clone(),
-                outs: HashMap::new(),
-                create_height: Some(height),
-            });
-            e.tx = tx.clone();
-            e.create_height = Some(height);
-            e.outs.clear();
-            for (v, o) in outputs.iter().enumerate() {
-                e.outs.insert(
-                    v as u32,
-                    ParentOut {
-                        output: o.clone(),
-                    },
-                );
-            }
-        }
-        // Legacy reserve waiters (rare).
-        for v in 0..outputs.len() as u32 {
-            let key = (txid, v);
-            if let Some(waiters) = g.reserve_waiters.remove(&key) {
-                for h in waiters {
-                    if let Some(plan) = g.plans.get_mut(&h) {
-                        plan.reserved.remove(&key);
-                        plan.need_fk.insert((id, v));
-                    }
-                }
-            }
-        }
-        g.by_body.insert(
-            id,
-            BodyEntry {
-                height,
-                tx,
-                outputs,
-                inputs,
-                thin_inputs: None,
-            },
-        );
+        // Rare reserve waiters: copy only waited-for outs into by_fk.
+        g.fill_reserve_waiters_from_body(id, txid, height, &tx, &outputs);
+        g.insert_body(id, height, tx, outputs, inputs);
     }
 
     pub fn get_body(
@@ -484,8 +461,8 @@ impl ConfirmParentCache {
         }
     }
 
-    /// Batch thin edges under one lock.
-    pub fn put_thin_inputs_batch(&self, items: &[(Fk, Vec<StashedThinInput>)]) {
+    /// Batch thin edges under one lock (moves ownership — no edge clone).
+    pub fn put_thin_inputs_batch(&self, items: Vec<(Fk, Vec<StashedThinInput>)>) {
         if items.is_empty() {
             return;
         }
@@ -495,7 +472,7 @@ impl ConfirmParentCache {
                 continue;
             };
             if let Some(e) = g.by_body.get_mut(&id) {
-                e.thin_inputs = Some(edges.clone());
+                e.thin_inputs = Some(edges);
             }
         }
     }
@@ -581,6 +558,9 @@ impl ConfirmParentCache {
     }
 
     /// Look up a populated parent out (for wave fill / connect).
+    ///
+    /// Prefers sparse external-parent `by_fk`, then runway **body** outs
+    /// (bodies-first prewarm no longer dual-copies every create into `by_fk`).
     pub fn get_parent_out(
         &self,
         fk: Fk,
@@ -588,14 +568,58 @@ impl ConfirmParentCache {
     ) -> Option<(TxRecord, OutputRecord)> {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
-        let e = g.by_fk.get(&id)?;
-        let o = e.outs.get(&vout)?;
-        Some((e.tx.clone(), o.output.clone()))
+        if let Some(e) = g.by_fk.get(&id) {
+            if let Some(o) = e.outs.get(&vout) {
+                return Some((e.tx.clone(), o.output.clone()));
+            }
+        }
+        if let Some(b) = g.by_body.get(&id) {
+            let o = b.outputs.get(vout as usize)?;
+            return Some((b.tx.clone(), o.clone()));
+        }
+        None
+    }
+
+    /// True if vout is present (by_fk sparse or body) — no record clone.
+    pub fn has_parent_out(&self, fk: Fk, vout: u32) -> bool {
+        let Some(id) = fk.get() else {
+            return false;
+        };
+        let g = self.inner.lock().unwrap();
+        Self::out_present_locked(&g, id, vout)
+    }
+
+    /// One-lock runway hit: `txid` known and `vout` present (body or sparse parent).
+    pub fn get_by_txid_if_out(&self, txid: &[u8; 32], vout: u32) -> Option<Fk> {
+        let g = self.inner.lock().unwrap();
+        let &id = g.by_txid.get(txid)?;
+        if Self::out_present_locked(&g, id, vout) {
+            Some(Fk(id))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn out_present_locked(g: &Inner, id: u64, vout: u32) -> bool {
+        if g.by_fk
+            .get(&id)
+            .is_some_and(|e| e.outs.contains_key(&vout))
+        {
+            return true;
+        }
+        g.by_body
+            .get(&id)
+            .is_some_and(|b| (vout as usize) < b.outputs.len())
     }
 
     pub fn get_parent_tx(&self, fk: Fk) -> Option<TxRecord> {
         let id = fk.get()?;
-        self.inner.lock().unwrap().by_fk.get(&id).map(|e| e.tx.clone())
+        let g = self.inner.lock().unwrap();
+        if let Some(e) = g.by_fk.get(&id) {
+            return Some(e.tx.clone());
+        }
+        g.by_body.get(&id).map(|b| b.tx.clone())
     }
 
     pub fn get_by_txid(&self, txid: &[u8; 32]) -> Option<Fk> {
@@ -608,16 +632,31 @@ impl ConfirmParentCache {
     }
 
     /// Full output map for a parent when present (subset or all vouts).
+    ///
+    /// Sparse `by_fk` first; else all outs from runway body.
     pub fn get_parent_outs(&self, fk: Fk) -> Option<(TxRecord, HashMap<u32, OutputRecord>)> {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
-        let e = g.by_fk.get(&id)?;
-        let outs: HashMap<u32, OutputRecord> = e
-            .outs
-            .iter()
-            .map(|(v, o)| (*v, o.output.clone()))
-            .collect();
-        Some((e.tx.clone(), outs))
+        if let Some(e) = g.by_fk.get(&id) {
+            if !e.outs.is_empty() {
+                let outs: HashMap<u32, OutputRecord> = e
+                    .outs
+                    .iter()
+                    .map(|(v, o)| (*v, o.output.clone()))
+                    .collect();
+                return Some((e.tx.clone(), outs));
+            }
+        }
+        if let Some(b) = g.by_body.get(&id) {
+            let outs: HashMap<u32, OutputRecord> = b
+                .outputs
+                .iter()
+                .enumerate()
+                .map(|(v, o)| (v as u32, o.clone()))
+                .collect();
+            return Some((b.tx.clone(), outs));
+        }
+        None
     }
 
     pub fn plan_count(&self) -> usize {
@@ -660,6 +699,69 @@ impl ConfirmParentCache {
 }
 
 impl Inner {
+    fn insert_body(
+        &mut self,
+        id: u64,
+        height: u32,
+        tx: TxRecord,
+        outputs: Vec<OutputRecord>,
+        inputs: Vec<InputRecord>,
+    ) {
+        self.by_txid.insert(tx.txid, id);
+        self.by_body.insert(
+            id,
+            BodyEntry {
+                height,
+                tx,
+                outputs,
+                inputs,
+                thin_inputs: None,
+            },
+        );
+    }
+
+    /// Legacy reserve path only: copy waited-for outs into sparse `by_fk`.
+    fn fill_reserve_waiters_from_body(
+        &mut self,
+        id: u64,
+        txid: [u8; 32],
+        height: u32,
+        tx: &TxRecord,
+        outputs: &[OutputRecord],
+    ) {
+        if self.reserve_waiters.is_empty() {
+            return;
+        }
+        for v in 0..outputs.len() as u32 {
+            let key = (txid, v);
+            let Some(waiters) = self.reserve_waiters.remove(&key) else {
+                continue;
+            };
+            let o = &outputs[v as usize];
+            {
+                let e = self.by_fk.entry(id).or_insert_with(|| ParentEntry {
+                    tx: tx.clone(),
+                    outs: HashMap::new(),
+                    create_height: Some(height),
+                });
+                e.tx = tx.clone();
+                e.create_height = Some(height);
+                e.outs.insert(
+                    v,
+                    ParentOut {
+                        output: o.clone(),
+                    },
+                );
+            }
+            for h in waiters {
+                if let Some(plan) = self.plans.get_mut(&h) {
+                    plan.reserved.remove(&key);
+                    plan.need_fk.insert((id, v));
+                }
+            }
+        }
+    }
+
     fn put_utxo_parent_inner(
         &mut self,
         height: u32,
@@ -700,7 +802,8 @@ impl Inner {
             if e.outs.is_empty() {
                 let txid = e.tx.txid;
                 self.by_fk.remove(&id);
-                if self.by_txid.get(&txid) == Some(&id) {
+                // Keep by_txid if this create is still a live runway body.
+                if !self.by_body.contains_key(&id) && self.by_txid.get(&txid) == Some(&id) {
                     self.by_txid.remove(&txid);
                 }
             }
@@ -879,6 +982,29 @@ mod tests {
         assert!(c.get_body(Fk(50)).is_some());
         c.advance_tip(1);
         assert!(c.get_body(Fk(50)).is_none());
+    }
+
+    #[test]
+    fn body_create_resolves_without_by_fk_dual_copy() {
+        // Bodies-first: put_body only; get_parent_out/has_parent_out use body outs.
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(0);
+        let t = tx(7);
+        c.put_bodies_batch(vec![(
+            Fk(70),
+            1,
+            t.clone(),
+            vec![out(10), out(20)],
+            vec![],
+        )]);
+        assert_eq!(c.get_by_txid(&t.txid), Some(Fk(70)));
+        assert!(c.has_parent_out(Fk(70), 1));
+        assert_eq!(c.get_parent_out(Fk(70), 1).unwrap().1.value, 20);
+        // Sparse external path still works alongside body.
+        c.put_utxo_parent(2, Fk(99), tx(9), 0, out(5));
+        assert_eq!(c.get_parent_out(Fk(99), 0).unwrap().1.value, 5);
+        // parent_count is sparse externals only (not every body create).
+        assert_eq!(c.parent_count(), 1);
     }
 
     #[test]

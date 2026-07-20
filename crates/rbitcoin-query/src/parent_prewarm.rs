@@ -26,7 +26,8 @@ pub struct PrewarmStats {
     pub parent_cache_hits: u32,
     /// `get_tx_full` calls for **block bodies** (phase 1).
     pub body_tx_reads: u32,
-    /// `get_tx_full` calls for **external parents** (phase 2).
+    /// Store parent loads (`get_tx_meta_and_outputs`) in phase 2 only.
+    /// (Historically double-counted body reads as `full_tx_reads` — fixed.)
     pub full_tx_reads: u32,
     /// External parents that could not be resolved (should be 0 after phase 1).
     pub missing_parents: u32,
@@ -195,6 +196,7 @@ impl Query {
 
         all_body_fks.sort_unstable();
         all_body_fks.dedup();
+        // Load once; walk phase-2 from this map (no clone), then move into cache.
         let mut body_by_fk: HashMap<u64, (TxRecord, Vec<OutputRecord>, Vec<InputRecord>)> =
             HashMap::with_capacity(all_body_fks.len());
         for id in all_body_fks {
@@ -204,48 +206,37 @@ impl Query {
             }
             let (tx, inputs, outs) = self.store.get_tx_full(Fk(id))?;
             st.body_tx_reads = st.body_tx_reads.saturating_add(1);
-            st.full_tx_reads = st.full_tx_reads.saturating_add(1);
             body_by_fk.insert(id, (tx, outs, inputs));
         }
 
-        let mut phase1: Vec<(u32, Vec<(Fk, TxRecord, Vec<OutputRecord>, Vec<InputRecord>)>)> =
-            Vec::with_capacity(height_tx_fks.len());
-        for (height, tx_fks) in height_tx_fks {
-            let mut bodies = Vec::with_capacity(tx_fks.len());
-            for fk in tx_fks {
-                let Some(id) = fk.get() else {
-                    continue;
-                };
-                let Some((tx, outs, inputs)) = body_by_fk.get(&id) else {
-                    continue;
-                };
-                self.confirm_parents.put_body_and_creates(
-                    fk,
-                    height,
-                    tx.clone(),
-                    outs.clone(),
-                    inputs.clone(),
-                );
-                st.creates_registered = st.creates_registered.saturating_add(1);
-                bodies.push((fk, tx.clone(), outs.clone(), inputs.clone()));
-            }
-            phase1.push((height, bodies));
-        }
-        drop(body_by_fk);
-
-        // ── Phase 2: external parents + stash thin edges for wave_fill ──────
+        // ── Phase 2 (before put): thin edges + parent needs from loaded bodies ─
+        // Avoids triple-cloning every script into cache intermediate Vecs.
         let mut need_load: Vec<(u64, u32)> = Vec::new();
         let mut need_put: Vec<(u32, Fk, u32)> = Vec::new();
         let mut parent_puts: Vec<(u32, Fk, TxRecord, u32, OutputRecord)> = Vec::new();
         let mut thin_by_spend: HashMap<u64, Vec<StashedThinInput>> = HashMap::new();
         let catchup = self.ibd_utxo_enabled();
 
-        for (height, bodies) in &phase1 {
-            let mut local: HashMap<[u8; 32], Fk> = HashMap::with_capacity(bodies.len());
-            for (fk, tx, _, _) in bodies {
-                local.insert(tx.txid, *fk);
+        // Same-batch creates accumulate as we scan heights ascending.
+        let mut batch_creates: HashMap<[u8; 32], Fk> = HashMap::new();
+
+        for (height, tx_fks) in &height_tx_fks {
+            // Register this block's creates for later spends in the bite.
+            for fk in tx_fks {
+                let Some(id) = fk.get() else {
+                    continue;
+                };
+                if let Some((tx, _, _)) = body_by_fk.get(&id) {
+                    batch_creates.insert(tx.txid, *fk);
+                }
             }
-            for (spend_fk, _tx, _outs, inputs) in bodies {
+            for fk in tx_fks {
+                let Some(id) = fk.get() else {
+                    continue;
+                };
+                let Some((_tx, _outs, inputs)) = body_by_fk.get(&id) else {
+                    continue;
+                };
                 let mut edges: Vec<StashedThinInput> = Vec::with_capacity(inputs.len());
                 for inp in inputs {
                     if inp.is_coinbase() {
@@ -255,8 +246,8 @@ impl Query {
                         });
                         continue;
                     }
-                    // Same-block create: outs already in by_fk via put_body_and_creates.
-                    if let Some(&cfk) = local.get(&inp.prev_txid) {
+                    // Same-bite create (this or earlier height in batch).
+                    if let Some(&cfk) = batch_creates.get(&inp.prev_txid) {
                         edges.push(StashedThinInput {
                             create_fk: cfk.get(),
                             prev_index: inp.prev_index,
@@ -265,68 +256,56 @@ impl Query {
                         st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                         continue;
                     }
-                    // Runway create: outs already cached — thin edge only (no put).
-                    if let Some(cfk) = self.confirm_parents.get_by_txid(&inp.prev_txid) {
-                        if self
-                            .confirm_parents
-                            .get_parent_out(cfk, inp.prev_index)
-                            .is_some()
-                        {
-                            edges.push(StashedThinInput {
-                                create_fk: cfk.get(),
-                                prev_index: inp.prev_index,
-                            });
+                    // Earlier runway body / sparse external parent (one lock).
+                    if let Some(cfk) = self
+                        .confirm_parents
+                        .get_by_txid_if_out(&inp.prev_txid, inp.prev_index)
+                    {
+                        edges.push(StashedThinInput {
+                            create_fk: cfk.get(),
+                            prev_index: inp.prev_index,
+                        });
+                        st.utxo_parents = st.utxo_parents.saturating_add(1);
+                        st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
+                        continue;
+                    }
+                    // Live UTXO parent (create_fk present ⇒ unspent). No spent check.
+                    if let Some(create_fk) =
+                        self.ibd_utxo_create_fk(&inp.prev_txid, inp.prev_index)?
+                    {
+                        edges.push(StashedThinInput {
+                            create_fk: create_fk.get(),
+                            prev_index: inp.prev_index,
+                        });
+                        if let Some(id) = create_fk.get() {
+                            need_load.push((id, inp.prev_index));
+                            need_put.push((*height, create_fk, inp.prev_index));
+                        }
+                        continue;
+                    }
+                    // Durable head: may be spent — skip Class A load when spent.
+                    if let Some(create_fk) = self.tx_fk_by_txid(&inp.prev_txid).ok().flatten() {
+                        edges.push(StashedThinInput {
+                            create_fk: create_fk.get(),
+                            prev_index: inp.prev_index,
+                        });
+                        if catchup && self.catchup_is_spent(&inp.prev_txid, inp.prev_index)? {
                             st.utxo_parents = st.utxo_parents.saturating_add(1);
-                            st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                             continue;
                         }
-                    }
-                    // Confirmed parent: light UTXO → durable head.
-                    let create_fk = self
-                        .confirm_parents
-                        .get_by_txid(&inp.prev_txid)
-                        .or(self.ibd_utxo_create_fk(&inp.prev_txid, inp.prev_index)?)
-                        .or(self.tx_fk_by_txid(&inp.prev_txid).ok().flatten());
-
-                    match create_fk {
-                        Some(create_fk) => {
-                            edges.push(StashedThinInput {
-                                create_fk: create_fk.get(),
-                                prev_index: inp.prev_index,
-                            });
-                            if let Some((ptx, o)) =
-                                self.confirm_parents.get_parent_out(create_fk, inp.prev_index)
-                            {
-                                // Rare: partial parent entry — put this vout only.
-                                parent_puts.push((*height, create_fk, ptx, inp.prev_index, o));
-                                st.utxo_parents = st.utxo_parents.saturating_add(1);
-                                st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
-                                continue;
-                            }
-                            // Already spent: wave will drop the slot; skip parent body IO.
-                            if catchup
-                                && self.catchup_is_spent(&inp.prev_txid, inp.prev_index)?
-                            {
-                                st.utxo_parents = st.utxo_parents.saturating_add(1);
-                                continue;
-                            }
-                            if let Some(id) = create_fk.get() {
-                                need_load.push((id, inp.prev_index));
-                                need_put.push((*height, create_fk, inp.prev_index));
-                            }
+                        if let Some(id) = create_fk.get() {
+                            need_load.push((id, inp.prev_index));
+                            need_put.push((*height, create_fk, inp.prev_index));
                         }
-                        None => {
-                            edges.push(StashedThinInput {
-                                create_fk: None,
-                                prev_index: inp.prev_index,
-                            });
-                            st.missing_parents = st.missing_parents.saturating_add(1);
-                        }
+                        continue;
                     }
+                    edges.push(StashedThinInput {
+                        create_fk: None,
+                        prev_index: inp.prev_index,
+                    });
+                    st.missing_parents = st.missing_parents.saturating_add(1);
                 }
-                if let Some(id) = spend_fk.get() {
-                    thin_by_spend.insert(id, edges);
-                }
+                thin_by_spend.insert(id, edges);
             }
         }
 
@@ -337,9 +316,7 @@ impl Query {
         uniq_fks.dedup();
         st.parent_unique = st.parent_unique.saturating_add(uniq_fks.len() as u32);
 
-        // Sequential parent meta+outs loads (sorted fks for locality).
-        // Parallel rayon loads hurt under archive writer pressure (random mmap
-        // thrash + global pool contention with script verify) — keep serial.
+        // Sequential parent meta+outs (sorted fks). No rayon — mmap thrash under writer.
         let mut loaded: HashMap<u64, (TxRecord, Vec<OutputRecord>)> =
             HashMap::with_capacity(uniq_fks.len());
         for fk_id in uniq_fks {
@@ -366,13 +343,30 @@ impl Query {
             st.utxo_parents = st.utxo_parents.saturating_add(1);
         }
 
+        // ── Phase 1 finish: move bodies into runway (one lock) ──────────────
+        let mut body_puts: Vec<(Fk, u32, TxRecord, Vec<OutputRecord>, Vec<InputRecord>)> =
+            Vec::with_capacity(body_by_fk.len());
+        for (height, tx_fks) in height_tx_fks {
+            for fk in tx_fks {
+                let Some(id) = fk.get() else {
+                    continue;
+                };
+                let Some((tx, outs, inputs)) = body_by_fk.remove(&id) else {
+                    continue;
+                };
+                body_puts.push((fk, height, tx, outs, inputs));
+                st.creates_registered = st.creates_registered.saturating_add(1);
+            }
+        }
+        self.confirm_parents.put_bodies_batch(body_puts);
+
         self.confirm_parents.put_utxo_parents_batch(&parent_puts);
 
         let thin_items: Vec<(Fk, Vec<StashedThinInput>)> = thin_by_spend
             .into_iter()
             .map(|(id, edges)| (Fk(id), edges))
             .collect();
-        self.confirm_parents.put_thin_inputs_batch(&thin_items);
+        self.confirm_parents.put_thin_inputs_batch(thin_items);
 
         // ── Phase 3: mark scanned (one ready_through recompute) ─────────────
         let scanned: Vec<u32> = work.iter().map(|(h, _)| *h).collect();

@@ -72,7 +72,7 @@ pub mod parent_prewarm_stats {
     pub static PARENT_UNIQUE: AtomicU64 = AtomicU64::new(0);
     /// Parent outs from cache (no store).
     pub static PARENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-    /// Phase-2 parent `get_tx_full` store calls.
+    /// Phase-2 parent store loads (`get_tx_meta_and_outputs` only; not bodies).
     pub static FULL_TX_READS: AtomicU64 = AtomicU64::new(0);
     /// Phase-1 body `get_tx_full` loads.
     pub static BODY_TX_READS: AtomicU64 = AtomicU64::new(0);

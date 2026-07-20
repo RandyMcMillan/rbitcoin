@@ -23,8 +23,8 @@ use bitcoin::{
 };
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_store::{
-    script_hash, HeaderRecord, InputRecord, OutputRecord, PointRecord, ScriptHashRecord, Store,
-    StoreError, TxRecord,
+    script_hash, HeaderRecord, IbdUtxo, InputRecord, OutputRecord, PointRecord, ScriptHashRecord,
+    Store, StoreError, TxRecord,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -223,6 +223,8 @@ pub struct Query {
     tx_run: tx_run_builder::TxRunBuilder,
     /// Catch-up point edges via sorted runs.
     point_run: point_run_builder::PointRunBuilder,
+    /// mmap unspent-outpoint set for catch-up spentness (replaces huge spent_local).
+    ibd_utxo: Mutex<Option<IbdUtxo>>,
 }
 
 impl Query {
@@ -256,10 +258,159 @@ impl Query {
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
             tx_run: tx_run_builder::TxRunBuilder::new(&store_path),
             point_run: point_run_builder::PointRunBuilder::new(&store_path),
+            ibd_utxo: Mutex::new(None),
         };
         // Warm cache from durable head if present (resume with index on).
         // Full body scan is not done here; fresh genesis IBD fills cache as it archives.
         Ok(q)
+    }
+
+    /// Open/create mmap IBD UTXO under the store dir. Aligns with store tip via
+    /// replay/rebuild so resume skips a full chain walk when meta matches.
+    pub fn enable_ibd_utxo(&self) -> Result<(), QueryError> {
+        let mut g = self.ibd_utxo.lock().unwrap();
+        if g.is_some() {
+            return Ok(());
+        }
+        let mut u = IbdUtxo::open_or_create(self.store.path())?;
+        let store_tip = self.tip_height().map(|h| h.0);
+        match (u.tip(), store_tip) {
+            (t, s) if t == s => {
+                // Consistent — ready without rebuild.
+                self.spent_local_ready
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            (Some(ut), Some(st)) if ut < st => {
+                // Short replay below after unlock — mark not ready until done.
+                self.spent_local_ready
+                    .store(false, std::sync::atomic::Ordering::Release);
+                *g = Some(u);
+                drop(g);
+                self.replay_ibd_utxo(ut + 1, st)?;
+                return Ok(());
+            }
+            (None, Some(_)) => {
+                *g = Some(u);
+                drop(g);
+                self.rebuild_ibd_utxo_to_tip()?;
+                return Ok(());
+            }
+            _ => {
+                // meta ahead or mismatch — full rebuild
+                u.clear()?;
+                *g = Some(u);
+                drop(g);
+                self.rebuild_ibd_utxo_to_tip()?;
+                return Ok(());
+            }
+        }
+        *g = Some(u);
+        Ok(())
+    }
+
+    pub fn ibd_utxo_enabled(&self) -> bool {
+        self.ibd_utxo.lock().unwrap().is_some()
+    }
+
+    /// True if outpoint is spent on the **catch-up** oracle (spend_index off).
+    /// mmap UTXO: not in unspent set ⇒ spent/missing. Else spent_local HashSet.
+    pub fn catchup_is_spent(&self, txid: &[u8; 32], vout: u32) -> Result<bool, QueryError> {
+        if self.spend_index_enabled() {
+            return Ok(false); // durable path handles spentness
+        }
+        if let Some(ref u) = *self.ibd_utxo.lock().unwrap() {
+            // Unspent set: not present ⇒ spent or never created.
+            return Ok(!u.contains(txid, vout)?);
+        }
+        Ok(self
+            .spent_local
+            .lock()
+            .unwrap()
+            .contains(&(*txid, vout)))
+    }
+
+    /// After successful Class C: take spends, insert creates, commit tip.
+    pub fn apply_ibd_utxo_block(
+        &self,
+        spends: &[([u8; 32], u32)],
+        creates: &[([u8; 32], u32)],
+        tip: u32,
+    ) -> Result<(), QueryError> {
+        let mut g = self.ibd_utxo.lock().unwrap();
+        let Some(ref mut u) = *g else {
+            return Ok(());
+        };
+        for &(txid, vout) in spends {
+            if !u.take_spend(&txid, vout)? {
+                return Err(StoreError::Corrupt("ibd utxo take missed spend"));
+            }
+        }
+        for &(txid, vout) in creates {
+            u.insert_create(&txid, vout)?;
+        }
+        u.commit_tip(Some(tip))?;
+        Ok(())
+    }
+
+    /// Rebuild mmap UTXO by replaying confirmed chain (creates then spends per height).
+    pub fn rebuild_ibd_utxo_to_tip(&self) -> Result<u64, QueryError> {
+        self.spent_local_ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        let mut g = self.ibd_utxo.lock().unwrap();
+        let u = g.get_or_insert_with(|| {
+            IbdUtxo::open_or_create(self.store.path()).expect("ibd utxo open")
+        });
+        u.clear()?;
+        let Some(tip) = self.tip_height() else {
+            u.commit_tip(None)?;
+            self.spent_local_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Ok(0);
+        };
+        drop(g);
+        self.replay_ibd_utxo(0, tip.0)?;
+        Ok(self
+            .ibd_utxo
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|u| u.live_count())
+            .unwrap_or(0))
+    }
+
+    fn replay_ibd_utxo(&self, from_h: u32, to_h: u32) -> Result<(), QueryError> {
+        for h in from_h..=to_h {
+            let fks = match self.block_tx_fks(Height(h)) {
+                Ok(f) => f,
+                Err(StoreError::NotFound) => continue,
+                Err(e) => return Err(e),
+            };
+            let mut g = self.ibd_utxo.lock().unwrap();
+            let u = g.as_mut().ok_or(StoreError::Corrupt("ibd utxo missing"))?;
+            // Per-tx order: spends then creates (same-block chain of custody).
+            for fk in fks {
+                let tx = self.store.get_tx(fk)?;
+                if tx.input_count > 0 {
+                    let inputs = self.tx_input_run(&tx)?;
+                    for inp in &inputs {
+                        if inp.is_coinbase() {
+                            continue;
+                        }
+                        let prev = self.resolve_prev_txid(inp)?;
+                        if !u.take_spend(&prev, inp.prev_index)? {
+                            return Err(StoreError::Corrupt("ibd utxo rebuild take failed"));
+                        }
+                    }
+                }
+                for v in 0..tx.output_count {
+                    u.insert_create(&tx.txid, v)?;
+                }
+            }
+            u.commit_tip(Some(h))?;
+        }
+        self.spent_local_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     /// True when process-local spent set may be used as the sole spentness oracle
@@ -279,11 +430,11 @@ impl Query {
         Ok(())
     }
 
-    /// Rebuild `spent_local` from **confirmed** chain heights 0..=tip (Class A).
-    ///
-    /// Core-safe: only confirmed inputs count. Must run after open/resume before
-    /// any confirm with spend index off. Sets [`Self::spent_local_ready`].
+    /// Rebuild catch-up spentness oracle to tip (mmap UTXO preferred; else spent_local).
     pub fn rebuild_spent_local_to_tip(&self) -> Result<u64, QueryError> {
+        if self.ibd_utxo_enabled() {
+            return self.rebuild_ibd_utxo_to_tip();
+        }
         self.spent_local_ready
             .store(false, std::sync::atomic::Ordering::Release);
         let mut set = HashSet::new();
@@ -329,11 +480,13 @@ impl Query {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Catch-up: SH / tx / point durable open-hash off; sequential runs + local oracle.
-    pub fn enable_index_run_mode(&self) {
+    /// Catch-up: SH / tx / point durable open-hash off; sequential runs + mmap UTXO.
+    pub fn enable_index_run_mode(&self) -> Result<(), QueryError> {
         self.sh_run.enable();
         self.tx_run.enable();
         self.point_run.enable();
+        self.enable_ibd_utxo()?;
+        Ok(())
     }
 
     /// Flush/compact SH runs and bulk-load durable scripthash tables (tip mode).
@@ -626,13 +779,12 @@ impl Query {
     /// Does **not** treat archive-only point rows as spent: Class A may write
     /// edges before Class C; those spenders are not strong yet.
     pub fn is_outpoint_spent(&self, txid: &[u8; 32], vout: u32) -> Result<bool, QueryError> {
-        // Local set first (IBD hot path) — avoid multimap probes on known spends.
+        if !self.spend_index_enabled() {
+            // Catch-up: mmap UTXO (unspent set) or spent_local HashSet.
+            return self.catchup_is_spent(txid, vout);
+        }
         if self.spent_local.lock().unwrap().contains(&(*txid, vout)) {
             return Ok(true);
-        }
-        // When durable index is off (milestone catch-up), local is authoritative.
-        if !self.spend_index_enabled() {
-            return Ok(false);
         }
         self.store.has_confirmed_strong_spender(txid, vout)
     }

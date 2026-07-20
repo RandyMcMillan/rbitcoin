@@ -451,10 +451,14 @@ impl Query {
             .ok_or(StoreError::Corrupt("no tip to disconnect"))?;
         let tx_fks = self.block_tx_fks(height)?;
 
-        // Unspend process-local set before dropping Class C (Core reorg).
+        // Undo catch-up spentness oracle for this tip (Core reorg).
         let mut unspends: Vec<([u8; 32], u32)> = Vec::new();
+        let mut uncreates: Vec<([u8; 32], u32)> = Vec::new();
         for &tx_fk in &tx_fks {
             let tx = self.store.get_tx(tx_fk)?;
+            for v in 0..tx.output_count {
+                uncreates.push((tx.txid, v));
+            }
             if tx.input_count == 0 {
                 continue;
             }
@@ -467,7 +471,22 @@ impl Query {
                 unspends.push((prev_txid, inp.prev_index));
             }
         }
-        self.unnote_outpoints_spent_local(&unspends);
+        if self.ibd_utxo_enabled() {
+            // Reverse of apply: remove creates, re-insert spends.
+            let mut g = self.ibd_utxo.lock().unwrap();
+            if let Some(ref mut u) = *g {
+                for &(txid, vout) in &uncreates {
+                    let _ = u.take_spend(&txid, vout)?; // remove created outs
+                }
+                for &(txid, vout) in &unspends {
+                    u.insert_create(&txid, vout)?; // restore prevouts
+                }
+                let new_tip = height.0.checked_sub(1);
+                u.commit_tip(new_tip)?;
+            }
+        } else {
+            self.unnote_outpoints_spent_local(&unspends);
+        }
 
         let mut touched_sh: Vec<[u8; 32]> = Vec::new();
         for &tx_fk in &tx_fks {

@@ -284,8 +284,22 @@ pub fn validate_block_connect(
     if check_scripts && !script_jobs.is_empty() {
         verify_scripts_pool(&script_jobs)?;
     }
-    // Always note local spends after success (hybrid wave_fill / is_outpoint_spent).
-    query.note_outpoints_spent_local(&spends);
+    // Update catch-up oracle after single-block connect success.
+    if query.ibd_utxo_enabled() {
+        let mut creates = Vec::new();
+        for tx in &block.txdata {
+            let tid = tx.compute_txid().to_byte_array();
+            for (v, _) in tx.output.iter().enumerate() {
+                creates.push((tid, v as u32));
+            }
+        }
+        let tip_h = ctx.height.0;
+        query
+            .apply_ibd_utxo_block(&spends, &creates, tip_h)
+            .map_err(ConsensusError::Store)?;
+    } else {
+        query.note_outpoints_spent_local(&spends);
+    }
     Ok(())
 }
 
@@ -397,7 +411,13 @@ pub(crate) fn connect_block_prevouts(
     // - durable has_confirmed_strong_spender when spend_index on
     // Tip/wave "live" only skips durable when neither local nor durable marks spent.
     let spend_index_on = query.spend_index_enabled();
-    let spent_local = query.lock_spent_local();
+    // When spend_index off, catch-up oracle is mmap UTXO / spent_local (via
+    // catchup_is_spent). When on, hold spent_local for hybrid short-circuit.
+    let spent_local = if spend_index_on {
+        Some(query.lock_spent_local())
+    } else {
+        None
+    };
 
     for (ti, tx) in block.txdata.iter().enumerate() {
         let spend_fk = archived_tx_fks.map(|fks| fks[ti]);
@@ -458,7 +478,15 @@ pub(crate) fn connect_block_prevouts(
                 if pending_spent.contains(&key) {
                     return Err(ConsensusError::PrevoutSpent);
                 }
-                if spent_local.contains(&key) {
+                if let Some(ref local) = spent_local {
+                    if local.contains(&key) {
+                        return Err(ConsensusError::PrevoutSpent);
+                    }
+                } else if query
+                    .catchup_is_spent(op.txid.as_byte_array(), op.vout)
+                    .map_err(ConsensusError::Store)?
+                {
+                    // mmap UTXO miss or spent_local hit — treat as spent/missing.
                     return Err(ConsensusError::PrevoutSpent);
                 }
                 let prev_fk = thin
@@ -561,7 +589,7 @@ pub(crate) fn connect_block_prevouts(
         }
         same_block.insert(txid, outs);
     }
-    drop(spent_local);
+    drop(spent_local); // release before return
 
     let subsidy = block_subsidy(ctx.height.0, ctx.params);
     let mut coinbase_out = 0i64;

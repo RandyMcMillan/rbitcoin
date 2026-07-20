@@ -162,9 +162,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     // - materialize open-hash at enter_tip_mode before Electrum
     handle.query.set_spend_index(false);
     handle.query.set_tx_index(false);
-    handle.query.enable_index_run_mode();
+    handle
+        .query
+        .enable_index_run_mode()
+        .map_err(|e| NodeError::Config(format!("index run mode: {e}")))?;
     info!(
-        "ibd: index catch-up mode (tx/point/SH sorted runs; spent_local for double-spend; materialize at tip mode)"
+        "ibd: index catch-up mode (tx/point/SH runs + mmap UTXO; materialize heads at tip mode)"
     );
     // Warm process txid→fk from Class A (resume / cold start with bodies).
     {
@@ -178,17 +181,21 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             t0.elapsed()
         );
     }
-    // Core-safe spent oracle before any confirm when durable points are off.
-    {
+    // Ensure spentness oracle ready (mmap UTXO may already match tip).
+    if !handle.query.spent_local_ready() {
         let t0 = Instant::now();
         let n = handle
             .query
             .rebuild_spent_local_to_tip()
-            .map_err(|e| NodeError::Config(format!("rebuild spent_local: {e}")))?;
+            .map_err(|e| NodeError::Config(format!("rebuild spent oracle: {e}")))?;
         info!(
-            "ibd: spent_local rebuilt entries≈{n} ready={} in {:?}",
+            "ibd: spent oracle rebuilt live/entries≈{n} ready={} in {:?}",
             handle.query.spent_local_ready(),
             t0.elapsed()
+        );
+    } else {
+        info!(
+            "ibd: spent oracle ready (mmap UTXO tip aligned, no full rebuild)"
         );
     }
 

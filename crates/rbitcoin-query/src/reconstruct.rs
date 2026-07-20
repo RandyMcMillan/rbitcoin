@@ -149,25 +149,25 @@ impl Query {
         }
         let mut works: Vec<ParentWork> = Vec::with_capacity(parents.len());
 
-        // One local-spent lock for tip short-circuit + hybrid filter (not held
-        // across Class A loads).
-        let local_spent = self.spent_local.lock().unwrap();
-
         for (pid, needed_vouts) in &parents {
             let fk = Fk(*pid);
 
             // Tip short-circuit only when **complete** (all needed live) and none
-            // are process-local spent (local wins over a stale tip live slot).
+            // are catch-up spent (UTXO miss / spent_local).
             let tip_complete = !needed_vouts.is_empty()
                 && needed_vouts
                     .iter()
                     .all(|&v| self.tip_prevout_cache.has_live_output(fk, v));
             if tip_complete {
                 if let Some(tx) = self.tip_prevout_cache.get_tx(fk) {
-                    let local_blocks = needed_vouts
-                        .iter()
-                        .any(|&v| local_spent.contains(&(tx.txid, v)));
-                    if !local_blocks {
+                    let mut blocked = false;
+                    for &v in needed_vouts {
+                        if self.catchup_is_spent(&tx.txid, v)? {
+                            blocked = true;
+                            break;
+                        }
+                    }
+                    if !blocked {
                         let n = tx.output_count as usize;
                         let mut slots: Vec<Option<OutputRecord>> = vec![None; n];
                         let mut ok = true;
@@ -234,7 +234,7 @@ impl Query {
             wf_add(&wf::PARENT_OUT_NS, t_out.elapsed().as_nanos() as u64);
 
             // Partial tip cover: live tip slots skip durable spent (write-through)
-            // unless process-local already marked spent.
+            // unless catch-up oracle already marks spent.
             let mut slots: Vec<Option<OutputRecord>> = vec![None; n];
             let mut need_spent = Vec::with_capacity(needed_vouts.len());
             for &v in needed_vouts {
@@ -242,8 +242,8 @@ impl Query {
                 if vi >= n {
                     continue;
                 }
-                if local_spent.contains(&(tx.txid, v)) {
-                    // Spent locally — leave slot None; no durable probe.
+                if self.catchup_is_spent(&tx.txid, v)? {
+                    // Spent — leave slot None; no durable probe.
                     continue;
                 }
                 if self.tip_prevout_cache.has_live_output(fk, v) {
@@ -266,32 +266,26 @@ impl Query {
             });
         }
 
-        // Spent filter for remaining need_spent (local already applied above for
-        // known spends; only durable remains when spend_index is on).
-
-        // Durable probes only for need_spent (local spends already omitted above).
-        // Sorted by outpoint key for point.head shard locality.
+        // Spent filter for remaining need_spent.
         let t_sp_all = Instant::now();
         let mut spent_flags: HashMap<(usize, u32), bool> =
             HashMap::with_capacity(works.iter().map(|w| w.need_spent.len()).sum());
         let mut durable_probes: Vec<(usize, u32, [u8; 32])> = Vec::new();
         for (wi, w) in works.iter().enumerate() {
             for &v in &w.need_spent {
-                // Belt-and-suspenders: local may have been updated (shouldn't).
-                if local_spent.contains(&(w.tx.txid, v)) {
+                if self.catchup_is_spent(&w.tx.txid, v)? {
                     spent_flags.insert((wi, v), true);
                 } else if spend_index_on {
                     let key = rbitcoin_store::PointRecord::outpoint_key(&w.tx.txid, v);
                     durable_probes.push((wi, v, key));
                 } else {
+                    // Catch-up UTXO: not spent ⇒ live candidate.
                     spent_flags.insert((wi, v), false);
                 }
             }
         }
-        drop(local_spent);
         if !durable_probes.is_empty() {
             durable_probes.sort_unstable_by(|a, b| a.2.cmp(&b.2));
-            // One tip snapshot for the whole batch (was re-read per outpoint).
             let tip = self.store.confirmed.tip_height().map(|t| t.0);
             for &(wi, v, ref key) in &durable_probes {
                 let spent = self.store.has_confirmed_strong_spender_key(key, tip)?;

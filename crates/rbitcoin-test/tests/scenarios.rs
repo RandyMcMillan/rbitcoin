@@ -1037,7 +1037,7 @@ fn wave_fill_hybrid_local_spent_before_durable() {
     );
 }
 
-/// Local-only spentness: double-spend reject, disconnect unspend, rebuild gate.
+/// mmap IBD UTXO: double-spend reject, disconnect undo, rebuild gate.
 #[test]
 fn spent_local_core_double_spend_and_disconnect() {
     use rbitcoin_consensus::{
@@ -1049,6 +1049,7 @@ fn spent_local_core_double_spend_and_disconnect() {
     let q = Query::open_or_create(td.store_path()).unwrap();
     q.set_spend_index(false);
     q.set_tx_index(false);
+    q.enable_ibd_utxo().unwrap();
     assert!(q.spent_local_ready(), "empty tip must be ready");
     let ms = Milestone::NONE;
     let params = ChainParams::regtest();

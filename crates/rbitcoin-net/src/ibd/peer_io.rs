@@ -162,7 +162,7 @@ pub(crate) async fn spawn_peer(
     sinks: PeerEventSinks,
 ) -> Result<PeerSlot, NetError> {
     let stream = TcpStream::connect(addr).await?;
-    let (ver, reader, mut writer) = connect_and_handshake(
+    let (ver, reader, writer) = connect_and_handshake(
         stream,
         magic,
         local,
@@ -174,10 +174,6 @@ pub(crate) async fn spawn_peer(
     // Peer's advertised chain height — used as IBD progress horizon when our
     // local header path has not yet reached the network tip.
     let peer_height = u32::try_from(ver.start_height).unwrap_or(0);
-
-    // Prefer addrv2 + request peer book so IBD redial is not stuck on seeds only.
-    let _ = write_v2_msg_offload(&mut writer, NetworkMessage::SendAddrV2).await;
-    let _ = write_v2_msg_offload(&mut writer, NetworkMessage::GetAddr).await;
 
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<PeerCmd>();
     // Reader → writer for pongs (must not write on the read task — that would
@@ -286,6 +282,7 @@ pub(crate) async fn spawn_peer(
         // Body events (framed/decoded blocks) go on `sinks.body` so the IBD loop
         // can drain them ahead of header floods on `sinks.ctrl`.
         let mut reader = reader;
+        let out_tx_reader = out_tx.clone();
         let reader_task = tokio::spawn(async move {
             let mut prog_mark = 0usize;
             loop {
@@ -304,7 +301,7 @@ pub(crate) async fn spawn_peer(
                         // Ping: 8-byte nonce — handle inline, never leave the I/O task.
                         if frame.is_ping() {
                             if let Some(n) = frame.ping_nonce() {
-                                let _ = out_tx.send(NetworkMessage::Pong(n));
+                                let _ = out_tx_reader.send(NetworkMessage::Pong(n));
                             }
                             continue;
                         }
@@ -436,6 +433,13 @@ pub(crate) async fn spawn_peer(
                 }
             }
         });
+
+        // Prefer addrv2 + grow the book **after** reader+writer are live.
+        // Writing these on the handshake task (before any read poll) raced Core's
+        // post-verack pipeline; peers closed immediately and tip=0 never got
+        // headers (inflight=0, ordered=0). July 18 cold-start worked without this.
+        let _ = out_tx.send(NetworkMessage::SendAddrV2);
+        let _ = out_tx.send(NetworkMessage::GetAddr);
 
         let mut guard = PeerIoTasks {
             reader: reader_task,

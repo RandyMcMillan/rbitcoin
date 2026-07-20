@@ -119,11 +119,18 @@ async fn application_handshake(
 }
 
 fn rand_nonce() -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash as _, Hasher};
-    let mut h = DefaultHasher::new();
-    SystemTime::now().hash(&mut h);
-    h.finish()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Concurrent dials often share the same wall-clock instant; a counter keeps
+    // version nonces unique (Core self-connect / loop detection uses nonce).
+    static N: AtomicU64 = AtomicU64::new(1);
+    let seq = N.fetch_add(1, Ordering::Relaxed);
+    let tick = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    tick
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(seq.wrapping_mul(0xBF58_476D_1CE4_E5B9))
 }
 
 /// Bidirectional peer session: serve history, follow tip, announce our tip.

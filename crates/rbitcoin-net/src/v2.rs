@@ -206,7 +206,19 @@ pub fn parse_v2_contents(magic: Magic, contents: &[u8]) -> Result<FramedMessage,
 
 fn map_protocol_error(e: ProtocolError) -> NetError {
     match e {
-        ProtocolError::Io(_, ProtocolFailureSuggestion::RetryV1) => NetError::V1Peer,
+        // bip324 suggests RetryV1 on many hard closes — including peers that
+        // completed v2 then dropped us. Prefer the IO detail when present so
+        // logs are not all "does not speak BIP324 v2".
+        ProtocolError::Io(io, ProtocolFailureSuggestion::RetryV1) => {
+            if io.kind() == std::io::ErrorKind::UnexpectedEof
+                || io.kind() == std::io::ErrorKind::ConnectionReset
+                || io.kind() == std::io::ErrorKind::BrokenPipe
+            {
+                NetError::Io(io)
+            } else {
+                NetError::V1Peer
+            }
+        }
         ProtocolError::Io(io, _) => NetError::Io(io),
         ProtocolError::Internal(Bip324Error::V1Protocol) => NetError::V1Peer,
         ProtocolError::Internal(inner) => NetError::Bip324(inner.to_string()),

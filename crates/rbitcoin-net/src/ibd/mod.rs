@@ -1481,6 +1481,13 @@ fn apply_peer_event(
                 }
             }
             if added > 0 {
+                if st.ordered_set.len() == added {
+                    // First headers of this run (tip=0 cold start).
+                    info!(
+                        "ibd: first headers from peer[{peer}] batch={batch_len} added={added} ordered={}",
+                        st.ordered_set.len()
+                    );
+                }
                 st.empty_header_streak = 0;
                 st.headers_done = false;
                 let live = st.ordered_set.len();

@@ -6,6 +6,7 @@
 //! - **In-flight cap** (`window`): max concurrent unique getdata; **not** a tip-distance
 //!   limit — any unarchived hash on the known header path may be requested so archive
 //!   can race to the end of headers while tip waits on holes
+//! - Tip-hole hashes may race up to 3 peers; near/far densify stay single-peer
 //! - At most `per_peer` outstanding blocks per peer (Core = 16)
 //! - Archive pipeline: dedicated OS **prep** thread → dedicated OS **writer** thread
 //! - Tip **confirm** walks contiguous archived runs (Class C) on a dedicated thread
@@ -247,6 +248,8 @@ pub const DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 const NEAR_DEPTH: u32 = 4096;
 /// Max contiguous tip+1.. holes to cover per assign.
 const TIP_HOLE_MAX: usize = 32;
+/// Max concurrent getdata peers for one tip-hole hash (race slow peers).
+pub(crate) const TIP_HOLE_MAX_PEERS: usize = 3;
 /// Pending (framed, not Class A) longer than this → re-getdata.
 const PENDING_STALE: Duration = Duration::from_secs(45);
 /// Max hashes per far getdata batch.
@@ -1444,7 +1447,12 @@ fn apply_peer_event(
             if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
                 for h in &hashes {
                     s.in_flight.remove(h);
-                    if st.inflight.get(h).map(|e| e.peer == peer).unwrap_or(false) {
+                    let empty = st
+                        .inflight
+                        .get_mut(h)
+                        .map(|e| e.remove_peer(peer))
+                        .unwrap_or(false);
+                    if empty {
                         st.inflight.remove(h);
                     }
                 }
@@ -1633,12 +1641,16 @@ fn prune_satisfied_inflight(
     }
 }
 
-fn inflight_insert_first(
+/// Record `peer` as requesting `hash` (tip-hole may accumulate multiple peers).
+fn inflight_add_peer(
     inflight: &mut HashMap<BlockHash, state::InflightReq>,
     hash: BlockHash,
     peer: usize,
 ) {
-    inflight.insert(hash, state::InflightReq::new(peer, Instant::now()));
+    inflight
+        .entry(hash)
+        .or_insert_with(|| state::InflightReq::new(peer))
+        .add_peer(peer);
 }
 
 /// Getdata assign scope.
@@ -1653,8 +1665,9 @@ enum AssignScope {
 
 /// Assign getdata for bodies not yet Class A.
 ///
-/// 1. Tip hole — one getdata each (stall disconnect recovers slow peers).
-/// 2. Near band — tip+1‥tip+[`NEAR_DEPTH`].
+/// 1. Tip hole — up to [`TIP_HOLE_MAX_PEERS`] getdata peers per hole hash
+///    (race slow peers without waiting for stall disconnect).
+/// 2. Near band — tip+1‥tip+[`NEAR_DEPTH`] (single peer per hash).
 /// 3. Far — forward densify past near (height-ascending); skipped in
 ///    [`AssignScope::TipNearOnly`].
 fn assign_work_ordered(
@@ -1977,6 +1990,14 @@ fn issue_batch(
     let Some(idx) = st.slots.iter().position(|s| s.id == pid && s.alive) else {
         return false;
     };
+    // Skip hashes this peer already has outstanding (tip-hole re-cover).
+    let batch: Vec<BlockHash> = batch
+        .into_iter()
+        .filter(|h| !st.slots[idx].in_flight.contains(h))
+        .collect();
+    if batch.is_empty() {
+        return false;
+    }
     let empty = st.slots[idx].in_flight.is_empty();
     for &h in &batch {
         st.slots[idx].in_flight.insert(h);
@@ -1988,10 +2009,15 @@ fn issue_batch(
         .cmd_tx
         .send(PeerCmd::GetData { hashes: batch.clone() });
     for &h in &batch {
-        inflight_insert_first(&mut st.inflight, h, pid);
+        inflight_add_peer(&mut st.inflight, h, pid);
     }
     *issued += batch.len() as u64;
-    *room = room.saturating_sub(batch.len());
+    // Window counts unique hashes: only charge hashes that were not already inflight.
+    let new_unique = batch
+        .iter()
+        .filter(|h| st.inflight.get(*h).map(|e| e.len() == 1).unwrap_or(false))
+        .count();
+    *room = room.saturating_sub(new_unique);
     true
 }
 
@@ -2020,7 +2046,8 @@ fn contiguous_tip_holes(
     holes
 }
 
-/// Ensure each tip-hole hash has a single getdata (no multi-peer race).
+/// Cover each tip-hole hash with up to [`TIP_HOLE_MAX_PEERS`] concurrent getdata
+/// peers. First delivery clears all racers via [`clear_hash_inflight`].
 fn cover_tip_holes(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -2038,26 +2065,43 @@ fn cover_tip_holes(
         if hub.has_block(&h) || st.body.is_pending(&h) || st.body.ready(hub, &h) {
             continue;
         }
-        if st.inflight.contains_key(&h) {
+        let already = st.inflight.get(&h).map(|e| e.len()).unwrap_or(0);
+        if already >= TIP_HOLE_MAX_PEERS {
             continue;
         }
-        let mut placed = false;
+        let mut need = TIP_HOLE_MAX_PEERS - already;
+        let mut placed_any = false;
         for _ in 0..alive.len() {
+            if need == 0 {
+                break;
+            }
             let pid = alive[peer_i % alive.len()];
             peer_i += 1;
             let Some(idx) = st.slots.iter().position(|s| s.id == pid && s.alive) else {
                 continue;
             };
+            if st.slots[idx].in_flight.contains(&h) {
+                continue;
+            }
+            if st
+                .inflight
+                .get(&h)
+                .map(|e| e.contains_peer(pid))
+                .unwrap_or(false)
+            {
+                continue;
+            }
             if st.slots[idx].in_flight.len() >= cfg.per_peer {
                 continue;
             }
             let mut room = 1usize;
             if issue_one(st, pid, h, &mut room, &mut issued) {
-                placed = true;
-                break;
+                placed_any = true;
+                need = need.saturating_sub(1);
             }
         }
-        if !placed {
+        // No free peer slots for a hole with zero coverage — later holes wait.
+        if already == 0 && !placed_any {
             break;
         }
     }

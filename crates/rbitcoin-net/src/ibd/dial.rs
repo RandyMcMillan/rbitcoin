@@ -171,7 +171,11 @@ pub(crate) fn release_peer_block_work(
     if let Some(s) = slots.iter_mut().find(|s| s.id == peer) {
         s.alive = false;
         for h in s.in_flight.drain() {
-            if inflight.get(&h).map(|e| e.peer == peer).unwrap_or(false) {
+            let empty = inflight
+                .get_mut(&h)
+                .map(|e| e.remove_peer(peer))
+                .unwrap_or(false);
+            if empty {
                 inflight.remove(&h);
             }
         }

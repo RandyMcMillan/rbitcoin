@@ -18,22 +18,50 @@ use std::time::Instant;
 
 use super::peer_io::PeerSlot;
 
-/// One unique block hash currently requested from a single peer.
-#[derive(Debug, Clone)]
+/// Outstanding getdata for one block hash (one or more peers).
+///
+/// Near/far densify use a single peer. Tip-hole hashes may race up to
+/// [`super::TIP_HOLE_MAX_PEERS`] peers so a slow peer cannot freeze the tip.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct InflightReq {
-    pub peer: usize,
+    pub peers: HashSet<usize>,
 }
 
 impl InflightReq {
-    pub(crate) fn new(peer: usize, _at: Instant) -> Self {
-        Self { peer }
+    pub(crate) fn new(peer: usize) -> Self {
+        let mut peers = HashSet::with_capacity(1);
+        peers.insert(peer);
+        Self { peers }
+    }
+
+    pub(crate) fn contains_peer(&self, peer: usize) -> bool {
+        self.peers.contains(&peer)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.peers.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.peers.is_empty()
+    }
+
+    /// Returns true if `peer` was newly added.
+    pub(crate) fn add_peer(&mut self, peer: usize) -> bool {
+        self.peers.insert(peer)
+    }
+
+    /// Remove `peer`. Returns true if no peers remain (caller should drop the hash).
+    pub(crate) fn remove_peer(&mut self, peer: usize) -> bool {
+        self.peers.remove(&peer);
+        self.peers.is_empty()
     }
 }
 
 /// Core mutable state for the parallel IBD event loop.
 pub(crate) struct IbdWorkState {
     pub slots: Vec<PeerSlot>,
-    /// Unique hashes with outstanding getdata (one peer each).
+    /// Unique hashes with outstanding getdata (1 peer normally; tip-hole races ≤3).
     pub inflight: HashMap<BlockHash, InflightReq>,
     /// Chain-order download path after local tip (front ≈ next to confirm).
     pub ordered: VecDeque<BlockHash>,
@@ -149,5 +177,24 @@ impl IbdWorkState {
         // Bound body presence cache to live work (rejected never pruned).
         self.body
             .hygiene_retain(|h| live.contains(h) || inflight.contains_key(h));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inflight_req_multi_peer_add_remove() {
+        let mut r = InflightReq::new(1);
+        assert_eq!(r.len(), 1);
+        assert!(r.contains_peer(1));
+        assert!(r.add_peer(2));
+        assert!(!r.add_peer(2)); // already present
+        assert_eq!(r.len(), 2);
+        assert!(!r.remove_peer(1));
+        assert_eq!(r.len(), 1);
+        assert!(r.remove_peer(2));
+        assert!(r.is_empty());
     }
 }

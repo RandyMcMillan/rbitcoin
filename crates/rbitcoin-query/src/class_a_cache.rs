@@ -94,7 +94,7 @@ impl ClassACache {
         self.inner.lock().unwrap().map.len()
     }
 
-    /// Insert or refresh a tx after archive (or after a store miss fill).
+    /// Insert or refresh a tx after archive / confirm prefetch (may evict FIFO).
     pub fn note(
         &self,
         fk: Fk,
@@ -102,15 +102,44 @@ impl ClassACache {
         outputs: Option<Vec<OutputRecord>>,
         inputs: Option<Vec<InputRecord>>,
     ) {
+        self.note_inner(fk, tx, outputs, inputs, true);
+    }
+
+    /// Cold miss-fill: insert only if there is free budget — **never** evict.
+    ///
+    /// Wave parent loads used to `note` every cold parent and FIFO-evict the
+    /// confirm-prefetched bodies (mainnet ~220k: 50–95s wave with archive
+    /// 400k ahead). Prefer leaving parents uncached over thrashing the wave set.
+    pub fn note_no_evict(
+        &self,
+        fk: Fk,
+        tx: TxRecord,
+        outputs: Option<Vec<OutputRecord>>,
+        inputs: Option<Vec<InputRecord>>,
+    ) -> bool {
+        self.note_inner(fk, tx, outputs, inputs, false)
+    }
+
+    fn note_inner(
+        &self,
+        fk: Fk,
+        tx: TxRecord,
+        outputs: Option<Vec<OutputRecord>>,
+        inputs: Option<Vec<InputRecord>>,
+        allow_evict: bool,
+    ) -> bool {
         let id = match fk.get() {
             Some(i) => i,
-            None => return,
+            None => return false,
         };
         let bytes = approx_entry_bytes(&tx, outputs.as_deref(), inputs.as_deref());
         let mut g = self.inner.lock().unwrap();
+        let replacing = g.map.contains_key(&id);
+        if !replacing && !allow_evict && g.bytes.saturating_add(bytes) > self.budget {
+            return false;
+        }
         if let Some(old) = g.map.remove(&id) {
             g.bytes = g.bytes.saturating_sub(old.bytes);
-            // drop from order (linear; ok — archive batches are bulk)
             if let Some(pos) = g.order.iter().position(|&x| x == id) {
                 g.order.remove(pos);
             }
@@ -126,7 +155,10 @@ impl ClassACache {
         );
         g.order.push_back(id);
         g.bytes = g.bytes.saturating_add(bytes);
-        g.evict_to_budget(self.budget);
+        if allow_evict {
+            g.evict_to_budget(self.budget);
+        }
+        true
     }
 
     pub fn get_tx(&self, fk: Fk) -> Option<TxRecord> {
@@ -246,23 +278,27 @@ impl ClassACache {
     }
 
     /// Merge outputs into an existing entry (or no-op if absent).
+    ///
+    /// Does not FIFO-evict other entries (see [`Self::note_no_evict`]).
     pub fn fill_outputs(&self, fk: Fk, outputs: Vec<OutputRecord>) {
         let id = match fk.get() {
             Some(i) => i,
             None => return,
         };
+        let add = outputs.iter().map(output_bytes).sum::<usize>() + 24;
         let mut g = self.inner.lock().unwrap();
+        if g.bytes.saturating_add(add) > self.budget {
+            return; // keep entry thin rather than thrashing the wave set
+        }
         let Some(e) = g.map.get_mut(&id) else {
             return;
         };
         if e.outputs.is_some() {
             return;
         }
-        let add = outputs.iter().map(output_bytes).sum::<usize>() + 24;
         e.outputs = Some(outputs);
         e.bytes = e.bytes.saturating_add(add);
         g.bytes = g.bytes.saturating_add(add);
-        g.evict_to_budget(self.budget);
     }
 
     pub fn fill_inputs(&self, fk: Fk, inputs: Vec<InputRecord>) {
@@ -270,18 +306,20 @@ impl ClassACache {
             Some(i) => i,
             None => return,
         };
+        let add = inputs.iter().map(input_bytes).sum::<usize>() + 24;
         let mut g = self.inner.lock().unwrap();
+        if g.bytes.saturating_add(add) > self.budget {
+            return;
+        }
         let Some(e) = g.map.get_mut(&id) else {
             return;
         };
         if e.inputs.is_some() {
             return;
         }
-        let add = inputs.iter().map(input_bytes).sum::<usize>() + 24;
         e.inputs = Some(inputs);
         e.bytes = e.bytes.saturating_add(add);
         g.bytes = g.bytes.saturating_add(add);
-        g.evict_to_budget(self.budget);
     }
 }
 

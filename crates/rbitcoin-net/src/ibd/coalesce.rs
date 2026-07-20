@@ -15,7 +15,12 @@ use std::time::Duration;
 /// Logs showed ~300-block batches with `writer_busy%=100` and multi-minute tip
 /// freezes; 32–64 block quanta keep arch draining without multi-minute locks.
 pub(crate) fn max_batch_for_lag(confirm_lag: u32) -> usize {
-    if confirm_lag >= 8192 {
+    // Extreme lag (mainnet tip freeze logs: 400k+ lead): tiny quanta + writer yield.
+    if confirm_lag >= 65_536 {
+        8
+    } else if confirm_lag >= 16_384 {
+        16
+    } else if confirm_lag >= 8192 {
         32
     } else if confirm_lag >= 2048 {
         48
@@ -35,8 +40,10 @@ pub(crate) fn max_batch_for_lag(confirm_lag: u32) -> usize {
 /// Deep lag: low min so we do **not** wait to pack a huge batch (tip needs
 /// interleaving). Near tip: slightly higher still OK for syscall amortization.
 pub(crate) fn min_batch_for_lag(confirm_lag: u32) -> usize {
-    if confirm_lag >= 512 {
-        8
+    if confirm_lag >= 16_384 {
+        1
+    } else if confirm_lag >= 512 {
+        4
     } else if confirm_lag >= 128 {
         16
     } else if confirm_lag >= 32 {
@@ -101,8 +108,9 @@ mod tests {
     fn deep_lag_prefers_small_quanta() {
         // Far ahead of tip: small max, small min — not 256/1024 mega-dumps.
         assert!(max_batch_for_lag(10_000) <= 32);
+        assert!(max_batch_for_lag(100_000) <= 8);
         assert!(max_batch_for_lag(600) <= 64);
-        assert!(min_batch_for_lag(600) <= 8);
+        assert!(min_batch_for_lag(600) <= 4);
         assert!(max_batch_for_lag(0) >= max_batch_for_lag(600));
         assert!(min_batch_for_lag(0) >= min_batch_for_lag(600));
     }
@@ -112,10 +120,12 @@ mod tests {
         assert_eq!(min_batch_for_lag(0), 16);
         assert_eq!(min_batch_for_lag(32), 24);
         assert_eq!(min_batch_for_lag(128), 16);
-        assert_eq!(min_batch_for_lag(512), 8);
+        assert_eq!(min_batch_for_lag(512), 4);
+        assert_eq!(min_batch_for_lag(20_000), 1);
         assert_eq!(max_batch_for_lag(0), 256);
         assert_eq!(max_batch_for_lag(512), 64);
         assert_eq!(max_batch_for_lag(8192), 32);
+        assert_eq!(max_batch_for_lag(65_536), 8);
     }
 
     #[test]

@@ -673,8 +673,12 @@ impl Query {
             return Ok(tx);
         }
         let tx = self.store.get_tx(fk)?;
-        // Cache tx row only; runs filled on demand by tx_*_run / reconstruct.
-        self.class_a_cache.note(fk, tx.clone(), None, None);
+        // Cache tx row only when free capacity remains. Do **not** FIFO-evict the
+        // confirm-prefetched wave bodies for random parent miss-fills (mainnet
+        // tip freeze: wave 50–95s while archive lead ≫ 100k).
+        let _ = self
+            .class_a_cache
+            .note_no_evict(fk, tx.clone(), None, None);
         Ok(tx)
     }
 

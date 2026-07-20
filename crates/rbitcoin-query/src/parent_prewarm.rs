@@ -337,21 +337,20 @@ impl Query {
         uniq_fks.dedup();
         st.parent_unique = st.parent_unique.saturating_add(uniq_fks.len() as u32);
 
-        // Parallel parent meta+outs loads (sorted fks; mmap reads are concurrent-safe).
-        let loaded: HashMap<u64, (TxRecord, Vec<OutputRecord>)> = {
-            use rayon::prelude::*;
-            let store = self.store();
-            let rows: Result<Vec<_>, QueryError> = uniq_fks
-                .par_iter()
-                .map(|&fk_id| {
-                    let (ptx, outs) = store.get_tx_meta_and_outputs(Fk(fk_id))?;
-                    Ok((fk_id, (ptx, outs)))
-                })
-                .collect();
-            let rows = rows?;
-            st.full_tx_reads = st.full_tx_reads.saturating_add(rows.len() as u32);
-            rows.into_iter().collect()
-        };
+        // Sequential parent meta+outs loads (sorted fks for locality).
+        // Parallel rayon loads hurt under archive writer pressure (random mmap
+        // thrash + global pool contention with script verify) — keep serial.
+        let mut loaded: HashMap<u64, (TxRecord, Vec<OutputRecord>)> =
+            HashMap::with_capacity(uniq_fks.len());
+        for fk_id in uniq_fks {
+            if self.confirm_cancelled() {
+                crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                return Err(StoreError::Corrupt("confirm cancelled"));
+            }
+            let (ptx, outs) = self.store.get_tx_meta_and_outputs(Fk(fk_id))?;
+            st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+            loaded.insert(fk_id, (ptx, outs));
+        }
 
         for &(height, create_fk, vout) in &need_put {
             let Some(id) = create_fk.get() else {

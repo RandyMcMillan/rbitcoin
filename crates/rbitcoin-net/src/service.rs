@@ -32,7 +32,7 @@ impl NetConfig {
         Self {
             magic: Magic::REGTEST,
             listen,
-            user_agent: "/rbitcoin:0.1.0/".into(),
+            user_agent: "/rbitcoin:0.1.0-vibes/".into(),
         }
     }
 }

@@ -155,7 +155,7 @@ Head key = `SHA256(scriptPubKey)`. Body does **not** store the scripthash.
 
 **Body** = RBT1 header + 4 KiB alloc page (`SHAL` magic, live_count, bump, per-class freelist heads) + geometric slabs (cap 4, 8, 16, …). Free slabs embed freelist next in the first 8 bytes. On overflow, promote to next class, copy, free old slab.
 
-**Upgrade:** v3 linked list (20 B rows with `next`) migrates once via `migrate_scripthash` / `Store::open` (`scripthash.head` + `.body` only; `scripthash.runs` untouched). Heights, spend state, txid, and value are still **joined** at query time from Class A / points / Class C.
+Heights, spend state, txid, and value are still **joined** at query time from Class A / points / Class C. Pre-v4 linked-list SH is not supported (reindex).
 
 ### Archive epoch (`archive_epoch`, 32 bytes)
 

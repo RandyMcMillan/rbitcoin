@@ -193,25 +193,7 @@ impl ShardedHashHead {
         path: impl Into<PathBuf>,
         _role: HeadRole,
     ) -> Result<Self, StoreError> {
-        Self::open_path(path, None)
-    }
-
-    /// Open with an explicit schema version on each shard file (v3→v4 migrate).
-    pub fn open_with_schema(
-        path: impl Into<PathBuf>,
-        schema: u16,
-    ) -> Result<Self, StoreError> {
-        Self::open_path(path, Some(schema))
-    }
-
-    fn open_path(path: impl Into<PathBuf>, schema: Option<u16>) -> Result<Self, StoreError> {
         let path = path.into();
-        let open_one = |p: PathBuf| -> Result<HashHead, StoreError> {
-            match schema {
-                Some(s) => HashHead::open_with_schema(p, s),
-                None => HashHead::open(p),
-            }
-        };
         if path.is_dir() {
             let mut names: Vec<String> = std::fs::read_dir(&path)
                 .map_err(|e| StoreError::io(&path, e))?
@@ -235,7 +217,7 @@ impl ShardedHashHead {
                         ));
                     }
                 }
-                shards.push(open_one(path.join(name))?);
+                shards.push(HashHead::open(path.join(name))?);
             }
             return Ok(Self {
                 shards,
@@ -246,7 +228,7 @@ impl ShardedHashHead {
             });
         }
         if path.is_file() {
-            let h = open_one(path.clone())?;
+            let h = HashHead::open(&path)?;
             return Ok(Self {
                 shards: vec![h],
                 path,
@@ -261,16 +243,6 @@ impl ShardedHashHead {
         ))
     }
 
-    /// Visit each occupied (key, fk) across all shards (file-backed only).
-    pub fn for_each_occupied_fk(
-        &self,
-        mut f: impl FnMut([u8; 32], Fk) -> Result<(), StoreError>,
-    ) -> Result<(), StoreError> {
-        for shard in &self.shards {
-            shard.for_each_occupied(&mut f)?;
-        }
-        Ok(())
-    }
 
     #[inline]
     fn shard_of(&self, key: &[u8; 32]) -> usize {

@@ -57,12 +57,6 @@ impl ScriptHashHead {
         Self::from_file(file)
     }
 
-    /// Open with an explicit schema version (migration of v3 stores).
-    pub fn open_with_schema(path: impl Into<PathBuf>, schema: u16) -> Result<Self, StoreError> {
-        let file = TableFile::open_with_schema(path, TableKind::HashHead, schema)?;
-        Self::from_file(file)
-    }
-
     fn from_file(file: TableFile) -> Result<Self, StoreError> {
         let body = file.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
         if body % SH_HEAD_SLOT_SIZE as u64 != 0 || body == 0 {
@@ -97,6 +91,7 @@ impl ScriptHashHead {
         })
     }
 
+    #[allow(dead_code)]
     pub fn occupied(&self) -> u64 {
         self.state.lock().unwrap().occupied
     }
@@ -540,22 +535,7 @@ impl ShardedScriptHashHead {
     }
 
     pub fn open_for_role(path: impl Into<PathBuf>, _role: HeadRole) -> Result<Self, StoreError> {
-        Self::open_path(path, None)
-    }
-
-    #[allow(dead_code)]
-    pub fn open_with_schema(path: impl Into<PathBuf>, schema: u16) -> Result<Self, StoreError> {
-        Self::open_path(path, Some(schema))
-    }
-
-    fn open_path(path: impl Into<PathBuf>, schema: Option<u16>) -> Result<Self, StoreError> {
         let path = path.into();
-        let open_one = |p: PathBuf| -> Result<ScriptHashHead, StoreError> {
-            match schema {
-                Some(s) => ScriptHashHead::open_with_schema(p, s),
-                None => ScriptHashHead::open(p),
-            }
-        };
         if path.is_dir() {
             let mut names: Vec<String> = std::fs::read_dir(&path)
                 .map_err(|e| StoreError::io(&path, e))?
@@ -575,13 +555,13 @@ impl ShardedScriptHashHead {
                         "sharded scripthash head unexpected shard name",
                     ));
                 }
-                shards.push(open_one(path.join(name))?);
+                shards.push(ScriptHashHead::open(path.join(name))?);
             }
             return Ok(Self { shards, path });
         }
         if path.is_file() {
             return Ok(Self {
-                shards: vec![open_one(path.clone())?],
+                shards: vec![ScriptHashHead::open(path.clone())?],
                 path,
             });
         }
@@ -647,6 +627,7 @@ impl ShardedScriptHashHead {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn occupied(&self) -> u64 {
         self.shards.iter().map(|s| s.occupied()).sum()
     }

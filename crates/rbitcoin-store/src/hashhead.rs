@@ -18,7 +18,7 @@
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
-use rbitcoin_primitives::{Fk, TableKind, SCHEMA_VERSION};
+use rbitcoin_primitives::{Fk, TableKind};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -215,15 +215,7 @@ impl HashHead {
     }
 
     pub fn open(path: impl Into<std::path::PathBuf>) -> Result<Self, StoreError> {
-        Self::open_with_schema(path, SCHEMA_VERSION)
-    }
-
-    /// Open with an explicit RBT1 schema version (migration of older stores).
-    pub fn open_with_schema(
-        path: impl Into<std::path::PathBuf>,
-        schema: u16,
-    ) -> Result<Self, StoreError> {
-        let file = TableFile::open_with_schema(path, TableKind::HashHead, schema)?;
+        let file = TableFile::open(path, TableKind::HashHead)?;
         let body = file.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
         if body % SLOT_SIZE as u64 != 0 || body == 0 {
             return Err(StoreError::Corrupt("hash head size"));
@@ -257,32 +249,6 @@ impl HashHead {
             overlay: Mutex::new(None),
             spill_stats: Mutex::new(SpillStats::new()),
         })
-    }
-
-    /// Visit each occupied (key, fk) pair on disk (no overlay).
-    pub fn for_each_occupied(
-        &self,
-        mut f: impl FnMut([u8; 32], Fk) -> Result<(), StoreError>,
-    ) -> Result<(), StoreError> {
-        let slots = self.state.lock().unwrap().slots;
-        let mut buf = vec![0u8; SLOT_SIZE * 4096];
-        let mut slot = 0u64;
-        while slot < slots {
-            let n = ((slots - slot) as usize).min(4096);
-            let off = FILE_HEADER_LEN as u64 + slot * SLOT_SIZE as u64;
-            let bytes = n * SLOT_SIZE;
-            self.file.read_at(off, &mut buf[..bytes])?;
-            for i in 0..n {
-                let base = i * SLOT_SIZE;
-                let k: [u8; 32] = buf[base..base + 32].try_into().unwrap();
-                let fk = u64::from_le_bytes(buf[base + 32..base + 40].try_into().unwrap());
-                if !is_empty_slot(&k, fk) {
-                    f(k, Fk(fk))?;
-                }
-            }
-            slot += n as u64;
-        }
-        Ok(())
     }
 
     /// Current slot table size (power of two).

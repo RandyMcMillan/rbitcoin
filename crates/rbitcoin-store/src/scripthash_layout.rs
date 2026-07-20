@@ -28,9 +28,6 @@ pub const SH_ALLOC_VERSION: u16 = 1;
 /// Fixed alloc control page (includes freelist heads).
 pub const SH_ALLOC_HEADER_LEN: usize = 4096;
 
-/// Legacy v3 linked-list body row length (migrate only).
-pub const SH_V3_RECORD_LEN: usize = 20;
-
 #[inline]
 pub fn slab_cap(class: u8) -> u32 {
     SH_SLAB_BASE << class
@@ -56,11 +53,6 @@ pub fn class_for_count(n: u32) -> Option<u8> {
         c += 1;
     }
     None
-}
-
-/// Max creates storable in one slab under current [`SH_MAX_CLASS`].
-pub fn max_slab_entries() -> u32 {
-    slab_cap(SH_MAX_CLASS)
 }
 
 /// One thin create: `create_tx_fk` + `vout`.
@@ -247,8 +239,8 @@ mod tests {
         assert_eq!(class_for_count(100), Some(5)); // 4<<5 = 128
         assert_eq!(class_for_count(1_048_576), Some(18)); // 4<<18 = 2^20
         assert_eq!(class_for_count(1_048_577), Some(19));
-        assert_eq!(class_for_count(max_slab_entries()), Some(SH_MAX_CLASS));
-        assert!(class_for_count(max_slab_entries().saturating_add(1)).is_none());
+        assert_eq!(class_for_count(slab_cap(SH_MAX_CLASS)), Some(SH_MAX_CLASS));
+        assert!(class_for_count(slab_cap(SH_MAX_CLASS).saturating_add(1)).is_none());
         assert_eq!(slab_cap(0), 4);
         assert_eq!(slab_cap(1), 8);
         assert_eq!(slab_bytes(0), 48);

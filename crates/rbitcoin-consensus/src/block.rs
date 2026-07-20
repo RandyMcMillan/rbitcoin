@@ -642,17 +642,13 @@ pub fn verify_scripts_pool(jobs: &[ScriptCheckJob]) -> Result<(), ConsensusError
 
 /// Parallel script/sig checks across jobs (possibly from multiple blocks).
 ///
-/// Uses the **rayon global pool** for multi-tx waves. One job = one non-coinbase
-/// tx (shared [`bitcoin::sighash::SighashCache`] across its inputs).
+/// Uses the **rayon global pool** for all non-empty waves (including a single
+/// job — one code path). One job = one non-coinbase tx (shared
+/// [`bitcoin::sighash::SighashCache`] across its inputs).
 ///
 /// **Why rayon (not a custom tokio queue):** script verify is CPU-bound and
 /// runs on the confirm OS thread outside the async runtime; rayon’s work-stealing
-/// pool is built for that. A tokio blocking queue would add channel/join overhead
-/// without better load balance for ~30–50 µs crypto jobs. Wire rebuild stays
-/// sequential (see `confirm_run` + `rayon_audit`).
-///
-/// Single-job waves skip the pool. IBD always has many scripts per batch, so
-/// multi-job is the hot path.
+/// pool is built for that. Wire rebuild stays sequential (see `confirm_run`).
 pub fn verify_scripts_pool_jobs(jobs: &[&ScriptCheckJob]) -> Result<(), ConsensusError> {
     verify_script_job_refs(jobs)
 }
@@ -663,53 +659,33 @@ fn job_needs_script_check(job: &ScriptCheckJob) -> bool {
         .any(|p| !is_anyone_can_spend(p.script_pubkey.as_script()))
 }
 
-/// Direct slice path (no intermediate `Vec<&_>`).
+/// Direct slice path (no intermediate `Vec<&_>`). Always rayon when non-empty.
 fn verify_script_jobs(jobs: &[ScriptCheckJob]) -> Result<(), ConsensusError> {
-    match jobs.len() {
-        0 => Ok(()),
-        1 => {
-            if job_needs_script_check(&jobs[0]) {
-                verify_job_all_inputs(&jobs[0])
-            } else {
-                Ok(())
-            }
-        }
-        _ => {
-            use rayon::prelude::*;
-            // Fine-grained: one stealable unit per tx. Filter inside the task so
-            // we do not allocate a second pointer vector on the hot path.
-            jobs.par_iter().try_for_each(|job| {
-                if job_needs_script_check(job) {
-                    verify_job_all_inputs(job)
-                } else {
-                    Ok(())
-                }
-            })
-        }
+    if jobs.is_empty() {
+        return Ok(());
     }
+    use rayon::prelude::*;
+    jobs.par_iter().try_for_each(|job| {
+        if job_needs_script_check(job) {
+            verify_job_all_inputs(job)
+        } else {
+            Ok(())
+        }
+    })
 }
 
 fn verify_script_job_refs(jobs: &[&ScriptCheckJob]) -> Result<(), ConsensusError> {
-    match jobs.len() {
-        0 => Ok(()),
-        1 => {
-            if job_needs_script_check(jobs[0]) {
-                verify_job_all_inputs(jobs[0])
-            } else {
-                Ok(())
-            }
-        }
-        _ => {
-            use rayon::prelude::*;
-            jobs.par_iter().try_for_each(|job| {
-                if job_needs_script_check(job) {
-                    verify_job_all_inputs(job)
-                } else {
-                    Ok(())
-                }
-            })
-        }
+    if jobs.is_empty() {
+        return Ok(());
     }
+    use rayon::prelude::*;
+    jobs.par_iter().try_for_each(|job| {
+        if job_needs_script_check(job) {
+            verify_job_all_inputs(job)
+        } else {
+            Ok(())
+        }
+    })
 }
 
 fn verify_job_all_inputs(job: &ScriptCheckJob) -> Result<(), ConsensusError> {

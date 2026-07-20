@@ -386,6 +386,16 @@ impl Query {
         self.prewarm_parents_for_heights(&items)
     }
 
+    /// Drop spent outs from the confirm parent runway after Class C.
+    ///
+    /// **Catch-up (light UTXO on):** no-op. Spentness for the next wave is
+    /// decided by [`Query::catchup_is_spent`], not by zeroing cache slots.
+    /// Skipping avoids O(spends) UTXO/head probes that dominated confirm wall
+    /// (~50–60% in mainnet logs). Runway RAM stays bounded by tip advance
+    /// (drop plans/bodies + parent GC).
+    ///
+    /// **Tip-follow / index mode:** cheap path only — retire outs already
+    /// present in the runway (`by_txid`). No UTXO or durable-head lookup.
     pub fn unpin_spent_parent_outs(
         &self,
         spends: &[([u8; 32], u32)],
@@ -393,14 +403,15 @@ impl Query {
         if spends.is_empty() {
             return Ok(());
         }
-        // Resolve create fks (may hit UTXO / store) then one batch lock on the runway.
+        // IBD catch-up: wave_fill filters parent slots with catchup_is_spent;
+        // connect hits the wave. Cache hygiene is tip GC, not per-spend UTXO.
+        if self.ibd_utxo_enabled() {
+            return Ok(());
+        }
+        // Tip-follow: only touch parents already pinned on the runway.
         let mut resolved: Vec<(Fk, u32)> = Vec::with_capacity(spends.len());
         for &(txid, vout) in spends {
-            let create_fk = self
-                .ibd_utxo_create_fk(&txid, vout)?
-                .or_else(|| self.confirm_parents.get_by_txid(&txid))
-                .or(self.tx_fk_by_txid(&txid).ok().flatten());
-            if let Some(fk) = create_fk {
+            if let Some(fk) = self.confirm_parents.get_by_txid(&txid) {
                 resolved.push((fk, vout));
             }
         }

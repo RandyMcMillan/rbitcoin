@@ -31,14 +31,15 @@ pub use hashhead::{
     initial_slots_for, HeadRole, HeadScale, DEFAULT_WRITE_BEHIND_CAP,
 };
 pub use sharded_hashhead::{
-    shard_count_for_scale, spill_chunk_size, DEFAULT_SPILL_CHUNK, SHARD_COUNT,
+    shard_count_for_role, shard_count_for_scale, spill_chunk_size, DEFAULT_SPILL_CHUNK,
+    SHARD_COUNT, SHARD_COUNT_TX_SH,
 };
 pub use header_table::HeaderRecord;
 pub use point_table::PointRecord;
 pub use scripthash::{script_hash, ScriptHashRecord, ScriptHashTable};
 pub use ibd_utxo::{IbdUtxo, DEFAULT_NUM_SLOTS as IBD_UTXO_DEFAULT_SLOTS, VOUT_MAX as IBD_UTXO_VOUT_MAX};
 pub use sorted_run::{
-    crc32, list_runs, lookup_key, merge_runs, next_run_path, open_run, read_run_body,
+    crc32, list_runs, lookup_key, merge_runs, next_run_path, open_run, read_run_body, remove_run,
     verify_run_body, write_sorted_run, SortedRunPath,
 };
 pub use store::Store;

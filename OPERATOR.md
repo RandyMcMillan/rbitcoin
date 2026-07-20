@@ -68,16 +68,23 @@ spentness). After tip ≈ peer height, the node materializes heads and switches 
 **`IndexMode::Tip`** (durable points / `tx.head`). Mid-chain peer death must
 **not** enter Tip (restart resumes Catchup).
 
-**Lead-compact (catch-up runs):** while `arch − tip` is large and the archive
-prep queue is not hot, idle-IO run workers (`tx` / `point` / `SH`) keep merging
-toward one on-disk run per family so tip-enter materialize is cheap. Progress
-logs show `runs t=/p=/sh=` and `compact+lead/f=forced`. Env:
+**Catch-up runs → open-hash (hysteresis):** memtable spills **small sorted runs
+with no mid-IBD merge**. When `arch − tip ≥ 65536`, the archive **writer pauses**
+and an idle-IO worker materializes **one run at a time** into durable heads
+(point → tx → SH), with **at most one shard rehash at a time** and a short
+pause between shards. When lead falls below `32768`, archive resumes and
+materialize stops until lead rebuilds. When archive has caught the peer tip,
+materialize continues until runs are empty. Progress logs:
+`runs t=/p=/sh= mat=archive|materialize/pause_arch=… +runs=/keys=`. Env:
 
 | Env | Default | Meaning |
 |-----|---------|---------|
-| `RBITCOIN_RUN_COMPACT_LEAD` | `2048` | Min archive lead (blocks) to enable; `0` = off |
-| `RBITCOIN_RUN_COMPACT_TARGET` | `1` | Target run count under lead compact |
-| `RBITCOIN_RUN_COMPACT_ARCH_Q_HOT` | `256` | Archive queue depth that pauses optional compact |
+| `RBITCOIN_RUN_MATERIALIZE_START_LEAD` | `65536` | Enter materialize / pause archive; `0` = off |
+| `RBITCOIN_RUN_MATERIALIZE_STOP_LEAD` | `32768` | Resume archive / pause materialize |
+| `RBITCOIN_HEAD_SHARD_PACE_MS` | `25` | Sleep between shards during paced head insert |
+
+New stores: **point.head 256 shards**, **tx.head / scripthash 16 shards** (existing
+datadirs keep their on-disk shard layout).
 
 **Memory rule:** During Catchup, durable open-hash heads are off. Class A inputs
 always store **external** `prev_txid` (no `prev_tx_fk` field). Parent resolve

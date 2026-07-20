@@ -20,8 +20,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Mainnet / full-validation shard count (`key[0]`).
+/// Mainnet **point** shard count (`key[0]` → 256 files). Large tables need fine
+/// partitioning so each rehash stays local.
 pub const SHARD_COUNT: usize = 256;
+/// Mainnet **tx / scripthash** shard count (16 files). Enough to bound rehash
+/// size without the FD cost of 256-way for smaller heads.
+pub const SHARD_COUNT_TX_SH: usize = 16;
 
 /// Aggregate spill chatter at DEBUG this often; per-event is TRACE.
 const SPILL_DEBUG_INTERVAL: Duration = Duration::from_secs(30);
@@ -41,12 +45,32 @@ pub fn spill_chunk_size() -> usize {
         .clamp(1_000, 1_000_000)
 }
 
-/// How many shards to create for the active scale.
+/// Inter-shard pause after a paced insert (ms). Override `RBITCOIN_HEAD_SHARD_PACE_MS`.
+pub fn shard_pace_ms() -> u64 {
+    std::env::var("RBITCOIN_HEAD_SHARD_PACE_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(25)
+        .min(5_000)
+}
+
+/// How many shards to create for the active scale (legacy: same for all roles).
 pub fn shard_count_for_scale() -> usize {
+    shard_count_for_role(HeadRole::Point)
+}
+
+/// Shard count for a new head of `role` (existing dirs keep their layout on open).
+///
+/// - **Point:** 256 (rehash locality for huge spend index)
+/// - **Tx / ScriptHash:** 16 (smaller indexes; fewer FDs)
+/// - **Header:** 256 (same as historical mainnet create)
+pub fn shard_count_for_role(role: HeadRole) -> usize {
     match HeadScale::from_env() {
-        // Single file keeps unit/integration tests light.
         HeadScale::Tiny => 1,
-        HeadScale::Mainnet => SHARD_COUNT,
+        HeadScale::Mainnet => match role {
+            HeadRole::Point | HeadRole::Header => SHARD_COUNT,
+            HeadRole::Tx | HeadRole::ScriptHash => SHARD_COUNT_TX_SH,
+        },
     }
 }
 
@@ -106,7 +130,11 @@ impl ShardedHashHead {
         path: impl Into<PathBuf>,
         role: HeadRole,
     ) -> Result<Self, StoreError> {
-        Self::create_sharded(path, shard_count_for_scale(), initial_slots_per_shard(role))
+        Self::create_sharded(
+            path,
+            shard_count_for_role(role),
+            initial_slots_per_shard(role),
+        )
     }
 
     /// Create with explicit shard count and per-shard slot size (tests / tooling).
@@ -380,6 +408,9 @@ impl ShardedHashHead {
     }
 
     /// Reserve roughly `additional` new keys, spread across shards.
+    ///
+    /// Prefer paced inserts for IBD materialize (avoids multi-shard rehash).
+    #[allow(dead_code)] // public capacity helper; materialize uses insert_many_paced
     pub fn reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
         if additional == 0 {
             return Ok(());
@@ -502,6 +533,25 @@ impl ShardedHashHead {
 
     /// Partition by shard, then slot-sorted insert per shard (disk path).
     fn insert_many_disk(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
+        self.insert_many_disk_inner(entries, false)
+    }
+
+    /// IBD run-materialize path: insert one shard at a time and **pause between
+    /// shards** so a cascade of rehashes cannot stack. Rehashes themselves are
+    /// process-serialized in [`HashHead::rehash_to`]. Always write-through
+    /// (bypasses process-local write-behind).
+    pub fn insert_many_paced(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.insert_many_disk_inner(entries, true)
+    }
+
+    fn insert_many_disk_inner(
+        &self,
+        entries: &[([u8; 32], Fk)],
+        pace: bool,
+    ) -> Result<(), StoreError> {
         let n = self.shards.len();
         if n == 1 {
             return self.shards[0].insert_many(entries);
@@ -510,10 +560,17 @@ impl ShardedHashHead {
         for &(key, fk) in entries {
             buckets[self.shard_of(&key)].push((key, fk));
         }
+        let pace_ms = if pace { shard_pace_ms() } else { 0 };
+        let mut any = false;
         for (i, bucket) in buckets.into_iter().enumerate() {
-            if !bucket.is_empty() {
-                self.shards[i].insert_many(&bucket)?;
+            if bucket.is_empty() {
+                continue;
             }
+            if pace && any && pace_ms > 0 {
+                std::thread::sleep(Duration::from_millis(pace_ms));
+            }
+            self.shards[i].insert_many(&bucket)?;
+            any = true;
         }
         Ok(())
     }

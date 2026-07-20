@@ -2,14 +2,14 @@
 //! durable head is materialized at tip mode (catch-up parent resolve uses light UTXO).
 
 use super::run_builder_core::{
-    clear_runs_dir, compact_all_to_one, finalize_wait_join, memtable_cap, spawn_worker, worker_loop,
+    clear_runs_dir, finalize_wait_join, memtable_cap, spawn_worker, take_oldest_run, worker_loop,
     RunControl, RunMemtable, FAMILY_TX,
 };
 use rbitcoin_log::{debug, info};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
-    list_runs, lookup_key, next_run_path, read_run_body, write_sorted_run, Store, StoreError,
-    SortedRunPath,
+    list_runs, lookup_key, next_run_path, read_run_body, remove_run, write_sorted_run, Store,
+    StoreError, SortedRunPath,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -184,18 +184,34 @@ impl TxRunBuilder {
         list_runs(&runs_dir).map(|r| r.len()).unwrap_or(0)
     }
 
+    /// Materialize the oldest on-disk run into `tx.head` (paced). `Ok(None)` if empty.
+    pub fn materialize_oldest_run(&self, store: &Store) -> Result<Option<u64>, StoreError> {
+        let (runs_dir, runs_io) = {
+            let g = self.inner.lock().unwrap();
+            (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
+        };
+        let Some(run) = take_oldest_run(&runs_dir, &runs_io)? else {
+            return Ok(None);
+        };
+        let n = materialize(store, &run)?;
+        {
+            let _io = runs_io.lock().unwrap();
+            remove_run(&run)?;
+        }
+        Ok(Some(n))
+    }
+
     pub fn finalize_and_materialize(&self, store: &Store) -> Result<u64, StoreError> {
         finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
-        let run = compact_all_to_one(&self.inner)?;
         let mut inserted = 0u64;
-        if let Some(ref run) = run {
-            info!(
-                "node: materializing tx.head from run {} ({} entries)…",
-                run.path.display(),
-                run.count
-            );
-            inserted = materialize(store, run)?;
-            info!("node: tx.head materialize done inserted≈{inserted}");
+        loop {
+            match self.materialize_oldest_run(store)? {
+                Some(n) => {
+                    inserted = inserted.saturating_add(n);
+                    info!("node: tx.head materialize run keys≈{n} total≈{inserted}");
+                }
+                None => break,
+            }
         }
         let runs_dir = self.inner.lock().unwrap().ctrl.runs_dir.clone();
         clear_runs_dir(&runs_dir);

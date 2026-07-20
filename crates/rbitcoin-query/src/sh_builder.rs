@@ -5,13 +5,13 @@
 //! flushes and merges at idle IO priority **while confirm is live**.
 
 use super::run_builder_core::{
-    clear_runs_dir, compact_all_to_one, finalize_wait_join, memtable_cap, spawn_worker, worker_loop,
+    clear_runs_dir, finalize_wait_join, memtable_cap, spawn_worker, take_oldest_run, worker_loop,
     RunControl, RunMemtable, FAMILY_SH,
 };
 use rbitcoin_log::{debug, info};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
-    next_run_path, read_run_body, write_sorted_run, ScriptHashRecord, Store, StoreError,
+    next_run_path, read_run_body, remove_run, write_sorted_run, ScriptHashRecord, Store, StoreError,
     SortedRunPath,
 };
 use std::path::Path;
@@ -180,20 +180,37 @@ impl ShRunBuilder {
         }
     }
 
-    /// Stop enqueues, flush + compact remaining, materialize into store, join worker.
+    /// Materialize the oldest on-disk run into scripthash tables. `Ok(None)` if empty.
+    pub fn materialize_oldest_run(&self, store: &Store) -> Result<Option<u64>, StoreError> {
+        let (runs_dir, runs_io) = {
+            let g = self.inner.lock().unwrap();
+            (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
+        };
+        let Some(run) = take_oldest_run(&runs_dir, &runs_io)? else {
+            return Ok(None);
+        };
+        let n = materialize_run(store, &run)?;
+        {
+            let _io = runs_io.lock().unwrap();
+            remove_run(&run)?;
+        }
+        Ok(Some(n))
+    }
+
+    /// Stop enqueues, flush remaining, materialize each run (no merge), join worker.
     pub fn finalize_and_materialize(&self, store: &Store) -> Result<u64, StoreError> {
         finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
-        let run = compact_all_to_one(&self.inner)?;
         let mut inserted = 0u64;
-        if let Some(ref run) = run {
-            info!(
-                "node: materializing scripthash from run {} ({} creates)…",
-                run.path.display(),
-                run.count
-            );
-            inserted = materialize_run(store, run)?;
-            info!("node: scripthash materialize done inserted≈{inserted}");
-        } else {
+        loop {
+            match self.materialize_oldest_run(store)? {
+                Some(n) => {
+                    inserted = inserted.saturating_add(n);
+                    info!("node: scripthash materialize run keys≈{n} total≈{inserted}");
+                }
+                None => break,
+            }
+        }
+        if inserted == 0 {
             info!("node: scripthash run materialize: no runs");
         }
         let runs_dir = self.inner.lock().unwrap().ctrl.runs_dir.clone();

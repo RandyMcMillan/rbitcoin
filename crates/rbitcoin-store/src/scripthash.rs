@@ -334,9 +334,8 @@ impl ScriptHashTable {
             let offset = FILE_HEADER_LEN as u64 + start * SCRIPTHASH_RECORD_LEN as u64;
             self.body.write_at(offset, &body_blob)?;
             let pairs: Vec<([u8; 32], Fk)> = head_final.into_iter().collect();
-            // Pre-size head for new keys so insert_many rarely mid-batch rehashes.
-            self.head.reserve_additional(pairs.len() as u64)?;
-            self.head.insert_many(&pairs)?;
+            // Paced per-shard inserts (no multi-shard rehash burst).
+            self.head.insert_many_paced(&pairs)?;
         }
         Ok(out)
     }
@@ -493,8 +492,7 @@ impl ScriptHashTable {
             let t_head = std::time::Instant::now();
             let mut pairs: Vec<([u8; 32], Fk)> = head_final.into_iter().collect();
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
-            self.head.reserve_additional(pairs.len() as u64)?;
-            self.head.insert_many(&pairs)?;
+            self.head.insert_many_paced(&pairs)?;
             timing.head_ns = t_head.elapsed().as_nanos() as u64;
         }
         Ok((out, timing))

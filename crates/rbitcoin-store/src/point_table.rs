@@ -165,7 +165,8 @@ impl PointTable {
         self.body.write_at(start_offset, &body)?;
         // Final head per outpoint only (body chain already links older edges).
         let head_batch: Vec<([u8; 32], Fk)> = local_heads.into_iter().collect();
-        self.head.insert_many(&head_batch)?;
+        // Paced: materialize / large batches must not rehash many shards at once.
+        self.head.insert_many_paced(&head_batch)?;
         debug_assert_eq!(end_count, start + edges.len() as u64);
         Ok(fks)
     }

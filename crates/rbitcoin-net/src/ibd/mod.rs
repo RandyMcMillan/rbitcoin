@@ -27,6 +27,7 @@ mod peer_io;
 mod perf_log;
 mod prewarm;
 mod progress;
+mod run_materialize;
 mod state;
 
 #[cfg(test)]
@@ -537,6 +538,10 @@ pub async fn ibd_cancellable(
         rbitcoin_store::spill_chunk_size()
     );
 
+    // Catch-up runs → open-hash materialize under archive hysteresis (idle IO).
+    let mut run_materialize_worker =
+        Some(run_materialize::RunMaterializeWorker::spawn(Arc::clone(&hub.query)));
+
     // Fresh cancel state for this IBD session (may have been set on prior stop).
     hub.query.clear_confirm_cancel();
 
@@ -792,10 +797,14 @@ pub async fn ibd_cancellable(
             }
             hub.query.seed_parent_runway(&items);
             prewarm_ctrl.publish(tip, arch, items);
-            // Lead-compact catch-up runs while archive is far ahead of tip.
+            // Archive hysteresis: pause Class A / materialize runs when lead is huge.
             let arch_lead = arch.saturating_sub(tip);
+            let peer_h = st.max_peer_height;
+            let archive_at_tip = peer_h > 0
+                && arch.saturating_add(2) >= peer_h
+                && arch_lead < 128;
             hub.query
-                .publish_run_compact_pressure(arch_lead, archive_queued.count() as u32);
+                .publish_run_materialize_control(arch_lead, archive_at_tip);
         }
 
         // Stall only after progress events are applied.
@@ -947,10 +956,13 @@ pub async fn ibd_cancellable(
                 let (pw_through, pw_ahead, _pw_parents, _pw_bodies, _plans, _depth) =
                     hub.query.parent_prewarm_perf_snapshot();
                 let (tx_r, pt_r, sh_r) = hub.query.index_run_counts();
-                let (lead_m, forced_m) =
-                    rbitcoin_query::run_compact_pressure::sample_merges();
+                let (mat_runs, mat_keys) =
+                    rbitcoin_query::run_materialize_control::sample();
+                let mat_mode = rbitcoin_query::run_materialize_control::mode_label();
+                let pause_a =
+                    rbitcoin_query::run_materialize_control::should_pause_archive();
                 info!(
-                    "ibd: progress {pct}% tip={} ({tip_rate:.0}/s) arch_hwm={} ({arch_rate:.0}/s lead={arch_lead}) hole={} peers={peers_n} prewarm+{pw_ahead} thru={pw_through} runs t={tx_r}/p={pt_r}/sh={sh_r} compact+{lead_m}/f={forced_m} horizon={}",
+                    "ibd: progress {pct}% tip={} ({tip_rate:.0}/s) arch_hwm={} ({arch_rate:.0}/s lead={arch_lead}) hole={} peers={peers_n} prewarm+{pw_ahead} thru={pw_through} runs t={tx_r}/p={pt_r}/sh={sh_r} mat={mat_mode}/pause_arch={pause_a} +runs={mat_runs}/keys={mat_keys} horizon={}",
                     prog.tip,
                     prog.archived,
                     prog.tip_hole,
@@ -1253,6 +1265,10 @@ pub async fn ibd_cancellable(
         let _ = h.join();
     }
     if let Some(w) = head_spill_worker.take() {
+        w.request_stop();
+        drop(w);
+    }
+    if let Some(w) = run_materialize_worker.take() {
         w.request_stop();
         drop(w);
     }

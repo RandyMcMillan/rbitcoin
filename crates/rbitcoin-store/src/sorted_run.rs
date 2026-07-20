@@ -571,6 +571,20 @@ fn sift_up(heap: &mut [MergeHead], mut i: usize, key_len: usize) {
     }
 }
 
+/// Remove one run from the catalog and delete its file (after materialize).
+pub fn remove_run(run: &SortedRunPath) -> Result<(), StoreError> {
+    let Some(dir) = run.path.parent() else {
+        return Ok(());
+    };
+    if let Some(seq) = run.seq() {
+        let mut mf = load_manifest(dir)?.unwrap_or_default();
+        mf.entries.retain(|e| e.seq != seq);
+        save_manifest(dir, &mf)?;
+    }
+    let _ = fs::remove_file(&run.path);
+    Ok(())
+}
+
 /// K-way merge of sorted runs → new run at `out_path`. Deletes input files on success.
 ///
 /// Equal keys: all records are kept (multi-value multimap for SH creates).

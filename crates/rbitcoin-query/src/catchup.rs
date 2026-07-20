@@ -323,13 +323,12 @@ impl Query {
         self.point_run.finalize_and_materialize(&self.store)
     }
 
-    /// Drive idle lead-compact of catch-up sorted runs (`tx` / `point` / `SH`).
+    /// Drive archive↔materialize hysteresis for catch-up runs.
     ///
-    /// Call from the IBD loop with `arch_lead = arch_hwm - tip` and the archive
-    /// prep queue depth. When lead is high and the queue is not hot, workers
-    /// merge toward one run per family (see `RBITCOIN_RUN_COMPACT_*`).
-    pub fn publish_run_compact_pressure(&self, arch_lead: u32, arch_queue: u32) {
-        crate::run_builder_core::run_compact_pressure::publish(arch_lead, arch_queue);
+    /// `arch_lead = arch_hwm − tip`. `archive_at_tip` when archive has caught the
+    /// peer horizon (or tip≈arch) so remaining runs keep materializing.
+    pub fn publish_run_materialize_control(&self, arch_lead: u32, archive_at_tip: bool) {
+        crate::run_builder_core::run_materialize_control::publish(arch_lead, archive_at_tip);
     }
 
     /// On-disk run counts: `(tx, point, scripthash)`.
@@ -339,6 +338,23 @@ impl Query {
             self.point_run.on_disk_run_count(),
             self.sh_run.on_disk_run_count(),
         )
+    }
+
+    /// Materialize one oldest run (point → tx → SH). `Ok(0)` if nothing to do.
+    pub fn materialize_one_index_run(&self) -> Result<u64, QueryError> {
+        if let Some(n) = self.point_run.materialize_oldest_run(&self.store)? {
+            crate::run_builder_core::run_materialize_control::note_materialized(n);
+            return Ok(n);
+        }
+        if let Some(n) = self.tx_run.materialize_oldest_run(&self.store)? {
+            crate::run_builder_core::run_materialize_control::note_materialized(n);
+            return Ok(n);
+        }
+        if let Some(n) = self.sh_run.materialize_oldest_run(&self.store)? {
+            crate::run_builder_core::run_materialize_control::note_materialized(n);
+            return Ok(n);
+        }
+        Ok(0)
     }
 
     pub(crate) fn tx_run_enabled(&self) -> bool {

@@ -526,13 +526,25 @@ impl HashHead {
         Ok(())
     }
 
+    /// Process-wide: at most one hash-head shard rehash at a time (IBD materialize
+    /// must not stack multi-shard resizes into one host freeze).
+    fn rehash_gate() -> &'static std::sync::Mutex<()> {
+        static GATE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        GATE.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     /// Grow to `new_slots` (power of two) and reinsert only **occupied** entries.
     ///
     /// **Host freeze risk:** multi‑GiB heads (e.g. `point.head` ~10 GiB+) used to
     /// zero-fill the whole table with `write_at` — a multi‑second IO storm. We now
     /// punch a hole (or sparse-clear) then reinsert only live keys.
+    ///
+    /// Serialized process-wide so paced materialize never runs two rehashes at once.
     fn rehash_to(&self, new_slots: u64) -> Result<(), StoreError> {
         let new_slots = new_slots.max(2).next_power_of_two();
+        let _rehash_serial = Self::rehash_gate()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Overlay must be empty so the file is the source of truth.
         {
             let guard = self.overlay.lock().unwrap();

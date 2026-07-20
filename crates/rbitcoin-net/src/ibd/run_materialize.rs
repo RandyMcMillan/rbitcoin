@@ -1,8 +1,9 @@
 //! Idle-priority materialize of catch-up sorted runs into open-hash heads.
 //!
 //! Driven by [`rbitcoin_query::run_materialize_control`] hysteresis: when archive
-//! lead is large, archive pauses and this worker applies **one run at a time**
-//! (point → tx → SH) with paced per-shard head inserts.
+//! lead is large, **peer getdata stops**; once inflight is 0 this worker applies
+//! **one run at a time** (point → tx → SH) with paced per-shard head inserts.
+//! The archive writer is never paused.
 
 use rbitcoin_log::{debug, info, warn};
 use rbitcoin_query::{run_materialize_control, Query};
@@ -30,7 +31,7 @@ impl RunMaterializeWorker {
             .spawn(move || {
                 try_set_io_idle();
                 info!(
-                    "ibd: run materialize worker ON (start_lead={} stop_lead={}; env RBITCOIN_RUN_MATERIALIZE_*; idle IO)",
+                    "ibd: run materialize worker ON (start_lead={} stop_lead={}; pause peer fetch not writer; env RBITCOIN_RUN_MATERIALIZE_*; idle IO)",
                     run_materialize_control::start_lead_from_env(),
                     run_materialize_control::stop_lead_from_env(),
                 );
@@ -45,10 +46,11 @@ impl RunMaterializeWorker {
                         logged = true;
                         let (t, p, sh) = query.index_run_counts();
                         info!(
-                            "ibd: run materialize active lead={} mode={} runs t={t}/p={p}/sh={sh} pause_arch={}",
+                            "ibd: run materialize active lead={} mode={} inflight={} runs t={t}/p={p}/sh={sh} pause_fetch={}",
                             run_materialize_control::arch_lead(),
                             run_materialize_control::mode_label(),
-                            run_materialize_control::should_pause_archive(),
+                            run_materialize_control::peer_inflight(),
+                            run_materialize_control::should_pause_peer_fetch(),
                         );
                     }
                     match query.materialize_one_index_run() {

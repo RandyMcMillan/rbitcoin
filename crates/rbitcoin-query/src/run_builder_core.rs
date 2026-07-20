@@ -1,12 +1,14 @@
 //! Shared catch-up sorted-run machinery (tx / point / scripthash).
 //!
 //! Pipeline: **memtable → spill sorted run → (no mid-IBD merge) → paced
-//! materialize into open-hash heads** under archive hysteresis.
+//! materialize into open-hash heads** under fetch hysteresis.
 //!
-//! When archive lead is large, IBD **pauses the archive writer** and an idle-IO
-//! worker materializes one small run at a time into durable heads (one shard
-//! rehash at a time). When lead shrinks, archive resumes and materialize stops
-//! until lead rebuilds. At archive≈tip, materialize continues until runs empty.
+//! When archive lead is large, IBD **stops peer block fetches** (not the archive
+//! writer — that would leave prepared work in limbo). After **in-flight getdata
+//! drains to zero**, an idle-IO worker materializes one small run at a time into
+//! durable heads (one shard rehash at a time). When lead shrinks, fetches resume
+//! and materialize stops until lead rebuilds. At archive≈tip, materialize
+//! continues until runs empty (once inflight is clear).
 
 use rbitcoin_log::warn;
 use rbitcoin_store::{list_runs, try_set_io_idle, SortedRunPath, StoreError};
@@ -28,25 +30,29 @@ pub const FAMILY_POINT: u8 = 1;
 pub const FAMILY_TX: u8 = 2;
 pub const FAMILY_SH: u8 = 3;
 
-/// IBD hysteresis: pause archive / materialize catch-up runs into open-hash heads.
+/// IBD hysteresis: stop **peer fetches** / materialize catch-up runs into heads.
 ///
 /// | Lead (arch − tip) | Behavior |
 /// |-------------------|----------|
-/// | ≥ start (default 64k) | enter materialize; pause archive |
-/// | < stop (default 32k) | resume archive; pause materialize |
-/// | archive at tip | materialize remaining runs regardless of lead |
+/// | ≥ start (default 64k) | stop new getdata; after inflight=0 materialize |
+/// | < stop (default 32k) | resume fetches; pause materialize |
+/// | archive at tip | materialize remaining runs once inflight=0 |
+///
+/// The Class A **writer is never paused** — only peer downloads stop so the
+/// pipeline can drain cleanly instead of leaving prepared work limbo.
 pub mod run_materialize_control {
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-    /// 0 = archive mode, 1 = materialize mode.
+    /// 0 = fetch/archive mode, 1 = drain+materialize window.
     static MODE: AtomicU32 = AtomicU32::new(0);
     static ARCH_LEAD: AtomicU32 = AtomicU32::new(0);
+    static PEER_INFLIGHT: AtomicU32 = AtomicU32::new(0);
     static ARCHIVE_AT_TIP: AtomicBool = AtomicBool::new(false);
     static RUNS_MATERIALIZED: AtomicU64 = AtomicU64::new(0);
     static KEYS_MATERIALIZED: AtomicU64 = AtomicU64::new(0);
     static LAST_LOG_S: AtomicU64 = AtomicU64::new(0);
 
-    const MODE_ARCHIVE: u32 = 0;
+    const MODE_FETCH: u32 = 0;
     const MODE_MATERIALIZE: u32 = 1;
 
     pub fn start_lead_from_env() -> u32 {
@@ -63,38 +69,43 @@ pub mod run_materialize_control {
             .unwrap_or(32_768)
     }
 
-    /// `0` disables hysteresis materialize (archive never pauses for runs).
+    /// `0` disables hysteresis materialize.
     pub fn enabled() -> bool {
         start_lead_from_env() > 0
     }
 
-    /// Update lead and archive-caught-up; advance hysteresis state machine.
-    pub fn publish(arch_lead: u32, archive_at_tip: bool) {
+    /// Update lead, peer getdata inflight, and archive-caught-up; advance hysteresis.
+    pub fn publish(arch_lead: u32, archive_at_tip: bool, peer_inflight: u32) {
         ARCH_LEAD.store(arch_lead, Ordering::Relaxed);
         ARCHIVE_AT_TIP.store(archive_at_tip, Ordering::Relaxed);
+        PEER_INFLIGHT.store(peer_inflight, Ordering::Relaxed);
         if !enabled() {
-            MODE.store(MODE_ARCHIVE, Ordering::Relaxed);
+            MODE.store(MODE_FETCH, Ordering::Relaxed);
             return;
         }
         if archive_at_tip {
-            // Finish remaining runs while archive has nothing useful to do.
+            // Finish remaining runs; fetches can stay off near tip.
             MODE.store(MODE_MATERIALIZE, Ordering::Relaxed);
             return;
         }
         let start = start_lead_from_env();
         let stop = stop_lead_from_env().min(start.saturating_sub(1));
         let mode = MODE.load(Ordering::Relaxed);
-        if mode == MODE_ARCHIVE {
+        if mode == MODE_FETCH {
             if arch_lead >= start {
                 MODE.store(MODE_MATERIALIZE, Ordering::Relaxed);
             }
         } else if arch_lead < stop {
-            MODE.store(MODE_ARCHIVE, Ordering::Relaxed);
+            MODE.store(MODE_FETCH, Ordering::Relaxed);
         }
     }
 
     pub fn arch_lead() -> u32 {
         ARCH_LEAD.load(Ordering::Relaxed)
+    }
+
+    pub fn peer_inflight() -> u32 {
+        PEER_INFLIGHT.load(Ordering::Relaxed)
     }
 
     pub fn archive_at_tip() -> bool {
@@ -105,13 +116,19 @@ pub mod run_materialize_control {
         enabled() && MODE.load(Ordering::Relaxed) == MODE_MATERIALIZE
     }
 
-    /// Archive writer / far getdata should idle when true.
-    pub fn should_pause_archive() -> bool {
+    /// Stop new peer block getdata (writer keeps draining what it already has).
+    pub fn should_pause_peer_fetch() -> bool {
         in_materialize_mode() && !ARCHIVE_AT_TIP.load(Ordering::Relaxed)
     }
 
+    /// @deprecated name — use [`should_pause_peer_fetch`].
+    pub fn should_pause_archive() -> bool {
+        should_pause_peer_fetch()
+    }
+
+    /// Materialize only after peer downloads are quiet (pipeline can finish writing).
     pub fn should_materialize() -> bool {
-        in_materialize_mode()
+        in_materialize_mode() && PEER_INFLIGHT.load(Ordering::Relaxed) == 0
     }
 
     pub fn note_materialized(keys: u64) {
@@ -142,10 +159,12 @@ pub mod run_materialize_control {
     }
 
     pub fn mode_label() -> &'static str {
-        if in_materialize_mode() {
-            "materialize"
+        if !in_materialize_mode() {
+            "fetch"
+        } else if PEER_INFLIGHT.load(Ordering::Relaxed) > 0 {
+            "drain"
         } else {
-            "archive"
+            "materialize"
         }
     }
 }
@@ -342,28 +361,34 @@ mod tests {
     use super::run_materialize_control as ctl;
 
     #[test]
-    fn hysteresis_start_stop_and_tip() {
+    fn hysteresis_start_stop_drain_and_tip() {
         std::env::set_var("RBITCOIN_RUN_MATERIALIZE_START_LEAD", "1000");
         std::env::set_var("RBITCOIN_RUN_MATERIALIZE_STOP_LEAD", "500");
-        ctl::publish(100, false);
+        ctl::publish(100, false, 0);
         assert!(!ctl::should_materialize());
-        assert!(!ctl::should_pause_archive());
-        ctl::publish(1500, false);
-        assert!(ctl::should_materialize());
-        assert!(ctl::should_pause_archive());
-        // Stay materializing while between stop and start.
-        ctl::publish(700, false);
-        assert!(ctl::should_materialize());
-        assert!(ctl::should_pause_archive());
-        ctl::publish(400, false);
+        assert!(!ctl::should_pause_peer_fetch());
+        // Lead high but downloads still in flight: pause fetch, do not materialize yet.
+        ctl::publish(1500, false, 12);
+        assert!(ctl::should_pause_peer_fetch());
         assert!(!ctl::should_materialize());
-        assert!(!ctl::should_pause_archive());
-        // Archive at tip: materialize even with small lead; do not pause archive.
-        ctl::publish(10, true);
+        assert_eq!(ctl::mode_label(), "drain");
+        // Inflight clear → materialize.
+        ctl::publish(1500, false, 0);
         assert!(ctl::should_materialize());
-        assert!(!ctl::should_pause_archive());
+        assert!(ctl::should_pause_peer_fetch());
+        assert_eq!(ctl::mode_label(), "materialize");
+        // Stay in window while between stop and start.
+        ctl::publish(700, false, 0);
+        assert!(ctl::should_materialize());
+        ctl::publish(400, false, 0);
+        assert!(!ctl::should_materialize());
+        assert!(!ctl::should_pause_peer_fetch());
+        // Archive at tip: materialize with quiet peers; do not pause fetch for hysteresis.
+        ctl::publish(10, true, 0);
+        assert!(ctl::should_materialize());
+        assert!(!ctl::should_pause_peer_fetch());
         std::env::remove_var("RBITCOIN_RUN_MATERIALIZE_START_LEAD");
         std::env::remove_var("RBITCOIN_RUN_MATERIALIZE_STOP_LEAD");
-        ctl::publish(0, false);
+        ctl::publish(0, false, 0);
     }
 }

@@ -69,18 +69,19 @@ spentness). After tip ≈ peer height, the node materializes heads and switches 
 **not** enter Tip (restart resumes Catchup).
 
 **Catch-up runs → open-hash (hysteresis):** memtable spills **small sorted runs
-with no mid-IBD merge**. When `arch − tip ≥ 65536`, the archive **writer pauses**
-and an idle-IO worker materializes **one run at a time** into durable heads
-(point → tx → SH), with **at most one shard rehash at a time** and a short
-pause between shards. When lead falls below `32768`, archive resumes and
+with no mid-IBD merge**. When `arch − tip ≥ 65536`, **new peer getdata stops**
+(the Class A writer keeps draining already-queued work). After **inflight
+downloads hit 0**, an idle-IO worker materializes **one run at a time** into
+durable heads (point → tx → SH), with **at most one shard rehash at a time** and
+a short pause between shards. When lead falls below `32768`, fetches resume and
 materialize stops until lead rebuilds. When archive has caught the peer tip,
-materialize continues until runs are empty. Progress logs:
-`runs t=/p=/sh= mat=archive|materialize/pause_arch=… +runs=/keys=`. Env:
+materialize continues until runs are empty (once inflight is clear). Progress:
+`runs t=/p=/sh= mat=fetch|drain|materialize/pause_fetch=…`. Env:
 
 | Env | Default | Meaning |
 |-----|---------|---------|
-| `RBITCOIN_RUN_MATERIALIZE_START_LEAD` | `65536` | Enter materialize / pause archive; `0` = off |
-| `RBITCOIN_RUN_MATERIALIZE_STOP_LEAD` | `32768` | Resume archive / pause materialize |
+| `RBITCOIN_RUN_MATERIALIZE_START_LEAD` | `65536` | Stop peer fetch / arm materialize; `0` = off |
+| `RBITCOIN_RUN_MATERIALIZE_STOP_LEAD` | `32768` | Resume peer fetch / pause materialize |
 | `RBITCOIN_HEAD_SHARD_PACE_MS` | `25` | Sleep between shards during paced head insert |
 
 New stores: **point.head 256 shards**, **tx.head / scripthash 16 shards** (existing

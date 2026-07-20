@@ -641,8 +641,11 @@ pub async fn ibd_cancellable(
         // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
         // When arch RAM budget is full, still densify **tip-near** so confirm has
         // runway (mid-sync was inflight=0 while arch_q sat at cap).
+        // Hysteresis materialize: stop **new** peer fetches (writer keeps draining).
         let arch_bytes = archive_queued.bytes();
-        let scope = if archive_queued.has_room() {
+        let scope = if rbitcoin_query::run_materialize_control::should_pause_peer_fetch() {
+            AssignScope::None
+        } else if archive_queued.has_room() {
             AssignScope::Full
         } else {
             AssignScope::TipNearOnly
@@ -697,7 +700,9 @@ pub async fn ibd_cancellable(
         }
         // Immediate re-top-up after Block events freed st.inflight during confirm.
         let arch_bytes2 = archive_queued.bytes();
-        let scope2 = if archive_queued.has_room() {
+        let scope2 = if rbitcoin_query::run_materialize_control::should_pause_peer_fetch() {
+            AssignScope::None
+        } else if archive_queued.has_room() {
             AssignScope::Full
         } else {
             AssignScope::TipNearOnly
@@ -803,8 +808,11 @@ pub async fn ibd_cancellable(
             let archive_at_tip = peer_h > 0
                 && arch.saturating_add(2) >= peer_h
                 && arch_lead < 128;
-            hub.query
-                .publish_run_materialize_control(arch_lead, archive_at_tip);
+            hub.query.publish_run_materialize_control(
+                arch_lead,
+                archive_at_tip,
+                st.inflight.len() as u32,
+            );
         }
 
         // Stall only after progress events are applied.
@@ -959,10 +967,10 @@ pub async fn ibd_cancellable(
                 let (mat_runs, mat_keys) =
                     rbitcoin_query::run_materialize_control::sample();
                 let mat_mode = rbitcoin_query::run_materialize_control::mode_label();
-                let pause_a =
-                    rbitcoin_query::run_materialize_control::should_pause_archive();
+                let pause_fetch =
+                    rbitcoin_query::run_materialize_control::should_pause_peer_fetch();
                 info!(
-                    "ibd: progress {pct}% tip={} ({tip_rate:.0}/s) arch_hwm={} ({arch_rate:.0}/s lead={arch_lead}) hole={} peers={peers_n} prewarm+{pw_ahead} thru={pw_through} runs t={tx_r}/p={pt_r}/sh={sh_r} mat={mat_mode}/pause_arch={pause_a} +runs={mat_runs}/keys={mat_keys} horizon={}",
+                    "ibd: progress {pct}% tip={} ({tip_rate:.0}/s) arch_hwm={} ({arch_rate:.0}/s lead={arch_lead}) hole={} peers={peers_n} prewarm+{pw_ahead} thru={pw_through} runs t={tx_r}/p={pt_r}/sh={sh_r} mat={mat_mode}/pause_fetch={pause_fetch} +runs={mat_runs}/keys={mat_keys} horizon={}",
                     prog.tip,
                     prog.archived,
                     prog.tip_hole,
@@ -1956,6 +1964,9 @@ enum AssignScope {
     /// Only tip hole + near band — when archive RAM budget is full so peers are
     /// not left `inflight=0` while confirm crawls on already-archived lag.
     TipNearOnly,
+    /// No new getdata (run-materialize hysteresis): let inflight drain so
+    /// materialize can start; archive writer keeps writing what already arrived.
+    None,
 }
 
 /// Assign getdata for bodies not yet Class A.
@@ -1965,6 +1976,7 @@ enum AssignScope {
 /// 2. Near band — tip+1‥tip+[`NEAR_DEPTH`] (single peer per hash).
 /// 3. Far — forward densify past near (height-ascending); skipped in
 ///    [`AssignScope::TipNearOnly`].
+/// 4. [`AssignScope::None`] — prune only (no new requests).
 fn assign_work_ordered(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -1987,6 +1999,16 @@ fn assign_work_ordered(
     }
 
     prune_satisfied_inflight(&mut st.slots, &mut st.inflight, hub);
+
+    if matches!(scope, AssignScope::None) {
+        // Still expire stale pending so limbo getdata cannot block forever.
+        let expired = st.body.expire_stale_pending(PENDING_STALE);
+        for h in expired {
+            clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
+        }
+        finish_assign(loop_stats, t0, issued);
+        return;
+    }
 
     let expired = st.body.expire_stale_pending(PENDING_STALE);
     for h in expired {

@@ -272,11 +272,6 @@ pub(crate) fn spawn_archive_pipeline(
                         }
                         break;
                     }
-                    // Hysteresis: pause Class A while catch-up runs materialize into heads.
-                    if rbitcoin_query::run_materialize_control::should_pause_archive() {
-                        std::thread::sleep(Duration::from_millis(50));
-                        continue;
-                    }
                     if !pri_open && !far_open {
                         break;
                     }

@@ -323,12 +323,21 @@ impl Query {
         self.point_run.finalize_and_materialize(&self.store)
     }
 
-    /// Drive archive↔materialize hysteresis for catch-up runs.
+    /// Drive fetch↔materialize hysteresis for catch-up runs.
     ///
-    /// `arch_lead = arch_hwm − tip`. `archive_at_tip` when archive has caught the
-    /// peer horizon (or tip≈arch) so remaining runs keep materializing.
-    pub fn publish_run_materialize_control(&self, arch_lead: u32, archive_at_tip: bool) {
-        crate::run_builder_core::run_materialize_control::publish(arch_lead, archive_at_tip);
+    /// `arch_lead = arch_hwm − tip`. `peer_inflight` = unique getdata in flight.
+    /// Materialize starts only when lead hysteresis is active **and** inflight is 0.
+    pub fn publish_run_materialize_control(
+        &self,
+        arch_lead: u32,
+        archive_at_tip: bool,
+        peer_inflight: u32,
+    ) {
+        crate::run_builder_core::run_materialize_control::publish(
+            arch_lead,
+            archive_at_tip,
+            peer_inflight,
+        );
     }
 
     /// On-disk run counts: `(tx, point, scripthash)`.

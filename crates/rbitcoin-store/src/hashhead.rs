@@ -35,8 +35,11 @@ const SLOTS_PER_CHUNK: u64 = 128;
 const CHUNK_CACHE_MAX: usize = 256;
 /// Default write-behind cap when enabled without an explicit size.
 pub const DEFAULT_WRITE_BEHIND_CAP: usize = 512 * 1024;
-/// Aggregate spill chatter at DEBUG this often; per-event is TRACE.
+/// Aggregate spill / rehash chatter at DEBUG this often; per-event is TRACE.
 const SPILL_DEBUG_INTERVAL: Duration = Duration::from_secs(30);
+/// Single rehash still WARN if clear size or wall time exceeds these (host risk).
+const REHASH_WARN_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+const REHASH_WARN_MS: u128 = 500;
 
 /// Which hash-head file (drives mainnet pre-size).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,6 +147,29 @@ struct SpillStats {
     events: u64,
     entries: u64,
     window_start: Instant,
+}
+
+/// Process-wide rehash rollup (many small shard rehashes during IBD materialize).
+struct RehashStats {
+    events: u64,
+    keys: u64,
+    bytes_cleared: u64,
+    elapsed_ms: u64,
+    max_clear_bytes: u64,
+    window_start: Instant,
+}
+
+impl RehashStats {
+    fn new() -> Self {
+        Self {
+            events: 0,
+            keys: 0,
+            bytes_cleared: 0,
+            elapsed_ms: 0,
+            max_clear_bytes: 0,
+            window_start: Instant::now(),
+        }
+    }
 }
 
 impl HashHead {
@@ -533,6 +559,63 @@ impl HashHead {
         GATE.get_or_init(|| std::sync::Mutex::new(()))
     }
 
+    /// Process-wide rehash counters (sharded heads rehash many small files).
+    fn rehash_stats() -> &'static Mutex<RehashStats> {
+        static S: std::sync::OnceLock<Mutex<RehashStats>> = std::sync::OnceLock::new();
+        S.get_or_init(|| Mutex::new(RehashStats::new()))
+    }
+
+    /// Note one completed rehash; TRACE always, WARN only if large/slow, DEBUG rollup.
+    fn note_rehash(path: &std::path::Path, old_slots: u64, new_slots: u64, occupied: u64, elapsed: Duration) {
+        let new_bytes = SLOT_SIZE as u64 * new_slots;
+        let ms = elapsed.as_millis();
+        rbitcoin_log::trace!(
+            "store: hash-head rehash path={} {}→{} slots occupied={} clear≈{:.1} MiB elapsed={:?}",
+            path.display(),
+            old_slots,
+            new_slots,
+            occupied,
+            new_bytes as f64 / (1024.0 * 1024.0),
+            elapsed
+        );
+        if new_bytes >= REHASH_WARN_BYTES || ms >= REHASH_WARN_MS {
+            rbitcoin_log::warn!(
+                "store: hash-head rehash LARGE path={} {}→{} slots occupied={} (~{:.1} GiB) elapsed={:?}",
+                path.display(),
+                old_slots,
+                new_slots,
+                occupied,
+                new_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                elapsed
+            );
+        }
+        let mut s = Self::rehash_stats().lock().unwrap();
+        s.events = s.events.saturating_add(1);
+        s.keys = s.keys.saturating_add(occupied);
+        s.bytes_cleared = s.bytes_cleared.saturating_add(new_bytes);
+        s.elapsed_ms = s.elapsed_ms.saturating_add(ms as u64);
+        if new_bytes > s.max_clear_bytes {
+            s.max_clear_bytes = new_bytes;
+        }
+        if s.window_start.elapsed() < SPILL_DEBUG_INTERVAL {
+            return;
+        }
+        if s.events == 0 {
+            s.window_start = Instant::now();
+            return;
+        }
+        rbitcoin_log::debug!(
+            "store: hash-head rehash summary events={} keys={} clear≈{:.1} MiB max_clear≈{:.1} MiB wall_ms={} window={:?}",
+            s.events,
+            s.keys,
+            s.bytes_cleared as f64 / (1024.0 * 1024.0),
+            s.max_clear_bytes as f64 / (1024.0 * 1024.0),
+            s.elapsed_ms,
+            s.window_start.elapsed()
+        );
+        *s = RehashStats::new();
+    }
+
     /// Grow to `new_slots` (power of two) and reinsert only **occupied** entries.
     ///
     /// **Host freeze risk:** multi‑GiB heads (e.g. `point.head` ~10 GiB+) used to
@@ -540,6 +623,7 @@ impl HashHead {
     /// punch a hole (or sparse-clear) then reinsert only live keys.
     ///
     /// Serialized process-wide so paced materialize never runs two rehashes at once.
+    /// Per-shard chatter is TRACE + periodic DEBUG summary (WARN only if large/slow).
     fn rehash_to(&self, new_slots: u64) -> Result<(), StoreError> {
         let new_slots = new_slots.max(2).next_power_of_two();
         let _rehash_serial = Self::rehash_gate()
@@ -564,15 +648,7 @@ impl HashHead {
             return Ok(());
         }
         let new_bytes = SLOT_SIZE as u64 * new_slots;
-        let t0 = std::time::Instant::now();
-        rbitcoin_log::warn!(
-            "store: hash-head rehash start path={} old_slots={} occupied={} new_slots={} (~{:.1} GiB clear)",
-            self.file.path().display(),
-            old_slots,
-            occupied,
-            new_slots,
-            new_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-        );
+        let t0 = Instant::now();
 
         // Collect live entries only (~occupied × 40 B, not empty slots).
         let mut entries: Vec<([u8; 32], u64)> = Vec::new();
@@ -624,11 +700,12 @@ impl HashHead {
         }
         cache.flush()?;
         self.state.lock().unwrap().occupied = n_entries;
-        rbitcoin_log::warn!(
-            "store: hash-head rehash done path={} occupied={} elapsed={:?}",
-            self.file.path().display(),
+        Self::note_rehash(
+            self.file.path(),
+            old_slots,
+            new_slots,
             n_entries,
-            t0.elapsed()
+            t0.elapsed(),
         );
         Ok(())
     }

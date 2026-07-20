@@ -130,16 +130,30 @@ pub mod confirm_phase_stats {
     /// Post–Class C catch-up oracle apply: mmap UTXO spends/creates.
     /// Logged as `utxo_ms` / us/blk `utxo`.
     pub static UTXO_APPLY_NS: AtomicU64 = AtomicU64::new(0);
+    /// Header + body-fk resolve for the batch.
+    pub static RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Last-mile prewarm + wait_ready/headroom on the confirm thread.
+    pub static PREWARM_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Unpin spent outs from ConfirmParentCache after Class C.
+    pub static UNPIN_NS: AtomicU64 = AtomicU64::new(0);
+    /// `advance_parent_runway_tip` (drop bodies / GC parents).
+    pub static RUNWAY_TIP_NS: AtomicU64 = AtomicU64::new(0);
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
 
     /// Sample and reset all confirm phases.
     ///
     /// Returns
-    /// `(recon, prefetch, wave_fill, wire, connect, script, class_c, strong, scripthash, tip, utxo_apply, blocks)`.
+    /// `(recon, prefetch, wave_fill, wire, connect, script, class_c, strong, scripthash, tip,
+    ///   utxo_apply, blocks, resolve, prewarm_wait, unpin, runway_tip)`.
     /// `strong` / `scripthash` / `tip` come from [`rbitcoin_query::class_c_phase_stats`]
     /// (sub-phases inside Class C). `recon` is the sum of the three reconstruct sub-timers.
+    #[allow(clippy::type_complexity)]
     pub fn sample_and_reset()
     -> (
+        u64,
+        u64,
+        u64,
+        u64,
         u64,
         u64,
         u64,
@@ -180,6 +194,10 @@ pub mod confirm_phase_stats {
             tip,
             UTXO_APPLY_NS.swap(0, Ordering::Relaxed),
             BLOCKS.swap(0, Ordering::Relaxed),
+            RESOLVE_NS.swap(0, Ordering::Relaxed),
+            PREWARM_WAIT_NS.swap(0, Ordering::Relaxed),
+            UNPIN_NS.swap(0, Ordering::Relaxed),
+            RUNWAY_TIP_NS.swap(0, Ordering::Relaxed),
         )
     }
 }

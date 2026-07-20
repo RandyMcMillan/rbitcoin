@@ -390,15 +390,21 @@ impl Query {
         &self,
         spends: &[([u8; 32], u32)],
     ) -> Result<(), QueryError> {
+        if spends.is_empty() {
+            return Ok(());
+        }
+        // Resolve create fks (may hit UTXO / store) then one batch lock on the runway.
+        let mut resolved: Vec<(Fk, u32)> = Vec::with_capacity(spends.len());
         for &(txid, vout) in spends {
             let create_fk = self
                 .ibd_utxo_create_fk(&txid, vout)?
                 .or_else(|| self.confirm_parents.get_by_txid(&txid))
                 .or(self.tx_fk_by_txid(&txid).ok().flatten());
             if let Some(fk) = create_fk {
-                self.confirm_parents.retire_spend(fk, vout);
+                resolved.push((fk, vout));
             }
         }
+        self.confirm_parents.retire_spends(&resolved);
         Ok(())
     }
 }

@@ -62,6 +62,11 @@ pub(crate) struct IbdPerfSample {
     pub tip_ms: u64,
     /// Post–Class C light UTXO apply (catch-up only).
     pub utxo_ms: u64,
+    /// Formerly unaccounted confirm overhead (ms totals).
+    pub resolve_ms: u64,
+    pub prewarm_wait_ms: u64,
+    pub unpin_ms: u64,
+    pub runway_tip_ms: u64,
     // raw ns for us/blk
     pub recon_ns: u64,
     pub prefetch_ns: u64,
@@ -74,6 +79,10 @@ pub(crate) struct IbdPerfSample {
     pub sh_ns: u64,
     pub tip_ns: u64,
     pub utxo_apply_ns: u64,
+    pub resolve_ns: u64,
+    pub prewarm_wait_ns: u64,
+    pub unpin_ns: u64,
+    pub runway_tip_ns: u64,
 
     // Light UTXO snapshot (not phase timers)
     pub utxo_enabled: bool,
@@ -171,6 +180,10 @@ impl Default for IbdPerfSample {
             sh_ms: 0,
             tip_ms: 0,
             utxo_ms: 0,
+            resolve_ms: 0,
+            prewarm_wait_ms: 0,
+            unpin_ms: 0,
+            runway_tip_ms: 0,
             recon_ns: 0,
             prefetch_ns: 0,
             wave_ns: 0,
@@ -182,6 +195,10 @@ impl Default for IbdPerfSample {
             sh_ns: 0,
             tip_ns: 0,
             utxo_apply_ns: 0,
+            resolve_ns: 0,
+            prewarm_wait_ns: 0,
+            unpin_ns: 0,
+            runway_tip_ns: 0,
             utxo_enabled: false,
             utxo_live: 0,
             utxo_tip: None,
@@ -262,6 +279,10 @@ pub(crate) fn sample(
         tip_ns,
         utxo_apply_ns,
         phase_blks,
+        resolve_ns,
+        prewarm_wait_ns,
+        unpin_ns,
+        runway_tip_ns,
     ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
     let (sh_warm, sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head, sh_index) =
         rbitcoin_query::class_c_phase_stats::sample_sh_sub_and_reset();
@@ -321,6 +342,10 @@ pub(crate) fn sample(
         sh_ms: ns_ms(sh_ns),
         tip_ms: ns_ms(tip_ns),
         utxo_ms: ns_ms(utxo_apply_ns),
+        resolve_ms: ns_ms(resolve_ns),
+        prewarm_wait_ms: ns_ms(prewarm_wait_ns),
+        unpin_ms: ns_ms(unpin_ns),
+        runway_tip_ms: ns_ms(runway_tip_ns),
         recon_ns,
         prefetch_ns,
         wave_ns: wave_fill_ns,
@@ -332,6 +357,10 @@ pub(crate) fn sample(
         sh_ns,
         tip_ns,
         utxo_apply_ns,
+        resolve_ns,
+        prewarm_wait_ns,
+        unpin_ns,
+        runway_tip_ns,
         utxo_enabled,
         utxo_live,
         utxo_tip,
@@ -391,7 +420,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     );
     // Confirm cost this window (ms totals + block count).
     out.push_str(&format!(
-        " | conf blks={} recon={}ms(p={} w={} wire={}) connect={}ms script={}ms class_c={}ms strong={}ms sh={}ms tip={}ms utxo={}ms",
+        " | conf blks={} recon={}ms(p={} w={} wire={}) connect={}ms script={}ms class_c={}ms strong={}ms sh={}ms tip={}ms utxo={}ms | ovh resolve={}ms pw_wait={}ms unpin={}ms tip_gc={}ms",
         s.phase_blks,
         s.recon_ms,
         s.prefetch_ms,
@@ -404,6 +433,10 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.sh_ms,
         s.tip_ms,
         s.utxo_ms,
+        s.resolve_ms,
+        s.prewarm_wait_ms,
+        s.unpin_ms,
+        s.runway_tip_ms,
     ));
     out.push_str(&format!(
         " | loop {} conf={}ms assign={}ms getdata={} drain={}ms",
@@ -454,7 +487,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let denom = s.phase_blks.max(1);
     let us = |ns: u64| (ns / denom) / 1000;
     let mut out = format!(
-        "ibd: perf_dbg us/blk recon={} prefetch={} wave={} wire={} connect={} script={} class_c={} strong={} sh={} tip={} utxo={}",
+        "ibd: perf_dbg us/blk recon={} prefetch={} wave={} wire={} connect={} script={} class_c={} strong={} sh={} tip={} utxo={} | ovh resolve={} pw_wait={} unpin={} tip_gc={}",
         us(s.recon_ns),
         us(s.prefetch_ns),
         us(s.wave_ns),
@@ -466,6 +499,10 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         us(s.sh_ns),
         us(s.tip_ns),
         us(s.utxo_apply_ns),
+        us(s.resolve_ns),
+        us(s.prewarm_wait_ns),
+        us(s.unpin_ns),
+        us(s.runway_tip_ns),
     );
     out.push_str(&format!(
         " | wave body={} ptx={} pout={} spent={} cb={}",

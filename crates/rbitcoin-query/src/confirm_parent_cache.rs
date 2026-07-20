@@ -201,17 +201,14 @@ impl ConfirmParentCache {
                 }
             }
         }
-        // Drop full bodies at/below tip (confirmed — confirm no longer needs them).
-        g.by_body.retain(|_, b| b.height > tip);
-        // Drop parent entries with no remaining plan references.
-        g.gc_orphaned_parents();
         // Horizon: drop plans beyond tip+depth.
         let max_h = tip.saturating_add(g.depth);
         let far: Vec<u32> = g.plans.range((max_h + 1)..).map(|(h, _)| *h).collect();
         for h in far {
             g.plans.remove(&h);
         }
-        g.by_body.retain(|_, b| b.height <= max_h);
+        // One body retain + one parent GC (was double-scanned every batch).
+        g.by_body.retain(|_, b| b.height > tip && b.height <= max_h);
         g.gc_orphaned_parents();
         g.recompute_ready_through();
         self.ready_through
@@ -542,29 +539,47 @@ impl ConfirmParentCache {
         self.inner.lock().unwrap().reserve_waiters.len()
     }
 
-    /// Drop a spent out from cache (after Class C).
+    /// Drop a spent out from cache (after Class C). O(1) under the cache lock.
+    ///
+    /// Does **not** scan all height plans: stale `need_fk` entries are dropped
+    /// when the plan is removed on tip advance. Parent GC uses remaining plans.
     pub fn retire_spend(&self, create_fk: Fk, vout: u32) {
         let Some(id) = create_fk.get() else {
             return;
         };
         let mut g = self.inner.lock().unwrap();
-        if let Some(e) = g.by_fk.get_mut(&id) {
-            e.outs.remove(&vout);
-            if e.outs.is_empty() {
-                let txid = e.tx.txid;
-                g.by_fk.remove(&id);
-                if g.by_txid.get(&txid) == Some(&id) {
-                    g.by_txid.remove(&txid);
-                }
-            }
+        g.retire_spend_id(id, vout);
+    }
+
+    /// Batch retire after Class C (one lock for the whole spend list).
+    pub fn retire_spends(&self, spends: &[(Fk, u32)]) {
+        if spends.is_empty() {
+            return;
         }
-        for plan in g.plans.values_mut() {
-            plan.need_fk.remove(&(id, vout));
+        let mut g = self.inner.lock().unwrap();
+        for &(fk, vout) in spends {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            g.retire_spend_id(id, vout);
         }
     }
 }
 
 impl Inner {
+    fn retire_spend_id(&mut self, id: u64, vout: u32) {
+        if let Some(e) = self.by_fk.get_mut(&id) {
+            e.outs.remove(&vout);
+            if e.outs.is_empty() {
+                let txid = e.tx.txid;
+                self.by_fk.remove(&id);
+                if self.by_txid.get(&txid) == Some(&id) {
+                    self.by_txid.remove(&txid);
+                }
+            }
+        }
+    }
+
     /// Contiguous ready watermark from tip+1 upward.
     fn recompute_ready_through(&mut self) {
         let mut h = self.tip.saturating_add(1);
@@ -578,28 +593,29 @@ impl Inner {
     }
 
     fn gc_orphaned_parents(&mut self) {
+        // Parents still referenced by open plans.
         let live: HashSet<u64> = self
             .plans
             .values()
             .flat_map(|p| p.need_fk.iter().map(|(id, _)| *id))
             .collect();
         let tip = self.tip;
+        let has_waiters = !self.reserve_waiters.is_empty();
         let mut drop_ids: Vec<u64> = Vec::new();
         for (&id, e) in &self.by_fk {
             if live.contains(&id) {
                 continue;
             }
-            let txid = e.tx.txid;
-            let still_waiting = self
-                .reserve_waiters
-                .keys()
-                .any(|(t, _)| *t == txid);
-            if still_waiting {
-                continue;
-            }
-            // Thin runway identities (by_txid) live until tip passes create height.
+            // Runway creates: keep by_fk identity until tip passes create height
+            // so later prewarm get_by_txid still resolves same-batch parents.
             if let Some(ch) = e.create_height {
                 if ch > tip {
+                    continue;
+                }
+            }
+            if has_waiters {
+                let txid = e.tx.txid;
+                if self.reserve_waiters.keys().any(|(t, _)| *t == txid) {
                     continue;
                 }
             }

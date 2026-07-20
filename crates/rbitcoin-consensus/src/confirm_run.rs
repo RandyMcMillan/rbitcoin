@@ -81,7 +81,12 @@ pub fn confirm_archived_run(
     }
 
     // ── 1. resolve_bodies ───────────────────────────────────────────────────
+    let t_resolve = Instant::now();
     let metas = resolve_body_metas(query, blocks)?;
+    confirm_phase_stats::RESOLVE_NS.fetch_add(
+        t_resolve.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
+    );
 
     // ── 1b. wait for parent prewarm (batch scanned; headroom soft) ─────────
     // Hard-wait only for this batch's heights to be scanned. Headroom is
@@ -89,6 +94,7 @@ pub fn confirm_archived_run(
     let heights: Vec<u32> = metas.iter().map(|m| m.height.0).collect();
     let items: Vec<(u32, [u8; 32])> = metas.iter().map(|m| (m.height.0, m.hash)).collect();
     let batch_end = heights.last().copied().unwrap_or(0);
+    let t_pw = Instant::now();
     // Last-mile prewarm for *this* batch only if the background worker is behind.
     let _ = query.prewarm_parents_for_heights(&items);
     query
@@ -99,6 +105,10 @@ pub fn confirm_archived_run(
             std::time::Duration::from_secs(120),
         )
         .map_err(ConsensusError::Store)?;
+    confirm_phase_stats::PREWARM_WAIT_NS.fetch_add(
+        t_pw.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
+    );
 
     // ── 2. wave_fill (bodies + parents + thin edges from ConfirmParentCache) ─
     let hashes: Vec<[u8; 32]> = metas.iter().map(|m| m.hash).collect();
@@ -124,7 +134,7 @@ pub fn confirm_archived_run(
     let n_blocks = prepared.len();
     let out = class_c_commit(query, &mut prepared)?;
 
-    // ── 7. utxo_apply (catch-up) ─────────────────────────────────────────────
+    // ── 7. utxo_apply (catch-up) + runway unpin/tip GC ───────────────────────
     post_commit(query, &prepared)?;
 
     confirm_phase_stats::BLOCKS.fetch_add(n_blocks as u64, Ordering::Relaxed);
@@ -367,7 +377,12 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
     }
 
     // Unpin Class A parents **before** UTXO apply removes create_fk mappings.
+    let t_unpin = Instant::now();
     let _ = query.unpin_spent_parent_outs(&all_spends);
+    confirm_phase_stats::UNPIN_NS.fetch_add(
+        t_unpin.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
+    );
 
     let t_spent = Instant::now();
     if query.ibd_utxo_enabled() {
@@ -395,7 +410,12 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
 
     // Prune confirm-parent runway for heights at/below new tip.
     if let Some(tip) = prepared.last().map(|p| p.height.0) {
+        let t_tip = Instant::now();
         query.advance_parent_runway_tip(tip);
+        confirm_phase_stats::RUNWAY_TIP_NS.fetch_add(
+            t_tip.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
     }
     Ok(())
 }

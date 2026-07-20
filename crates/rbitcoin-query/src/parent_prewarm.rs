@@ -41,7 +41,11 @@ impl Query {
         self.confirm_parents.ready_through()
     }
 
-    /// Snapshot for IBD progress/perf: `(ready_through, ahead, parents, open_reserves, plans, depth)`.
+    /// Snapshot for IBD progress/perf:
+    /// `(ready_through, ahead, parents, bodies, plans, depth)`.
+    ///
+    /// Bodies = full Class A blocks cached for the runway (bodies-first prewarm).
+    /// Reservations are no longer used on the happy path.
     pub fn parent_prewarm_perf_snapshot(&self) -> (u32, u32, usize, usize, usize, u32) {
         let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
         let through = self.confirm_parents.ready_through();
@@ -50,7 +54,7 @@ impl Query {
             through,
             ahead,
             self.confirm_parents.parent_count(),
-            self.confirm_parents.reserved_count(),
+            self.confirm_parents.body_count(),
             self.confirm_parents.plan_count(),
             self.confirm_parents.depth(),
         )

@@ -4,10 +4,11 @@
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
-//! | INFO  | `ibd: perf …` | Pipeline health + coarse confirm + **prewarm ahead/through** + loop mix + live batch |
-//! | DEBUG | `ibd: perf_dbg …` | us/blk, wave/SH, tip_prevout, **prewarm window counters**, pipe, utxo, loop |
+//! | INFO  | `ibd: perf …` | Download queue, archive pressure, confirm cost, prewarm lead/IO, loop mix |
+//! | DEBUG | `ibd: perf_dbg …` | µs/blk phases, wave/SH subs, caches, pipe, utxo |
 //!
-//! `ibd: progress` stays separate (~1s on tip/arch delta; includes prewarm ahead). WARN/ERROR unchanged.
+//! `ibd: progress` (~1s on tip/arch delta) is the operator glance line: tip rate,
+//! archive lead, tip hole, peers, prewarm lead. WARN/ERROR unchanged.
 //!
 //! Sample **once** per tick and reset all atomics, then format INFO always and
 //! DEBUG only when enabled — so DEBUG never sees an empty window after INFO.
@@ -116,18 +117,22 @@ pub(crate) struct IbdPerfSample {
     pub pw_ms: u64,
     pub pw_blocks: u64,
     pub pw_utxo_parents: u64,
-    pub pw_reserved: u64,
     pub pw_creates: u64,
     pub pw_already_ready: u64,
     pub pw_parent_unique: u64,
     pub pw_cache_hits: u64,
-    pub pw_full_tx_reads: u64,
-    /// Contiguous scanned watermark height.
+    /// Phase-1 body Class A reads this window.
+    pub pw_body_tx_reads: u64,
+    /// Phase-2 external parent Class A reads this window.
+    pub pw_parent_tx_reads: u64,
+    pub pw_missing_parents: u64,
+    /// Contiguous ready watermark height.
     pub pw_ready_through: u32,
     /// `ready_through - tip` (blocks warmer is ahead of confirm tip).
     pub pw_ahead: u32,
     pub pw_parents: usize,
-    pub pw_open_reserves: usize,
+    /// Full bodies cached for the runway.
+    pub pw_bodies: usize,
     pub pw_plans: usize,
     pub pw_depth: u32,
 
@@ -214,16 +219,17 @@ impl Default for IbdPerfSample {
             pw_ms: 0,
             pw_blocks: 0,
             pw_utxo_parents: 0,
-            pw_reserved: 0,
             pw_creates: 0,
             pw_already_ready: 0,
             pw_parent_unique: 0,
             pw_cache_hits: 0,
-            pw_full_tx_reads: 0,
+            pw_body_tx_reads: 0,
+            pw_parent_tx_reads: 0,
+            pw_missing_parents: 0,
             pw_ready_through: 0,
             pw_ahead: 0,
             pw_parents: 0,
-            pw_open_reserves: 0,
+            pw_bodies: 0,
             pw_plans: 0,
             pw_depth: 0,
             pipe: ArchivePipelineSample::default(),
@@ -253,7 +259,7 @@ pub(crate) fn sample(
     headers_done: bool,
     // (enabled, live, tip, rebuilds) from Query::ibd_utxo_perf_snapshot.
     utxo: (bool, u64, Option<u32>, u64),
-    // (ready_through, ahead, parents, open_reserves, plans, depth).
+    // (ready_through, ahead, parents, bodies, plans, depth).
     prewarm: (u32, u32, usize, usize, usize, u32),
 ) -> IbdPerfSample {
     let hot = loop_stats.sample_and_reset();
@@ -282,16 +288,17 @@ pub(crate) fn sample(
         pw_ns,
         pw_blocks,
         pw_utxo,
-        pw_res,
         pw_creates,
         pw_ready,
         pw_parent_unique,
         pw_cache_hits,
-        pw_full_tx_reads,
+        pw_body_tx,
+        pw_parent_tx,
+        pw_missing,
     ) = rbitcoin_query::parent_prewarm_stats::sample_and_reset();
     let pipe = pipe_stats.sample_and_reset();
     let (utxo_enabled, utxo_live, utxo_tip, utxo_rebuilds) = utxo;
-    let (pw_ready_through, pw_ahead, pw_parents, pw_open_reserves, pw_plans, pw_depth) = prewarm;
+    let (pw_ready_through, pw_ahead, pw_parents, pw_bodies, pw_plans, pw_depth) = prewarm;
 
     IbdPerfSample {
         inflight,
@@ -370,16 +377,17 @@ pub(crate) fn sample(
         pw_ms: ns_ms(pw_ns),
         pw_blocks,
         pw_utxo_parents: pw_utxo,
-        pw_reserved: pw_res,
         pw_creates,
         pw_already_ready: pw_ready,
         pw_parent_unique,
         pw_cache_hits,
-        pw_full_tx_reads,
+        pw_body_tx_reads: pw_body_tx,
+        pw_parent_tx_reads: pw_parent_tx,
+        pw_missing_parents: pw_missing,
         pw_ready_through,
         pw_ahead,
         pw_parents,
-        pw_open_reserves,
+        pw_bodies,
         pw_plans,
         pw_depth,
         pipe,
@@ -388,8 +396,9 @@ pub(crate) fn sample(
 
 /// Stable INFO line for production grepping.
 pub(crate) fn format_info(s: &IbdPerfSample) -> String {
+    // Download / archive pressure (what blocks the tip).
     let mut out = format!(
-        "ibd: perf inflight={}/{} arch_q={} arch={}/{}MiB pending={} known_arch={} ordered={} ahead={} hole={} headers_done={} peers={}",
+        "ibd: perf inflight={}/{} arch_q={} arch={}/{}MiB pending={} known_arch={} ordered={} lead={} hole={} peers={}",
         s.inflight,
         s.inflight_cap,
         s.arch_q,
@@ -400,12 +409,11 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.ordered,
         s.ahead,
         s.hole,
-        s.headers_done,
         s.peers,
     );
-    // Coarse confirm: recon split + connect/script + class_c + SH/tip + UTXO apply.
+    // Confirm cost this window (ms totals + block count).
     out.push_str(&format!(
-        " | blks={} recon_ms={}(p={} w={} wire={}) connect_ms={} script_ms={} class_c_ms={} strong_ms={} sh_ms={} tip_ms={} utxo_ms={}",
+        " | conf blks={} recon={}ms(p={} w={} wire={}) connect={}ms script={}ms class_c={}ms strong={}ms sh={}ms tip={}ms utxo={}ms",
         s.phase_blks,
         s.recon_ms,
         s.prefetch_ms,
@@ -420,32 +428,46 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.utxo_ms,
     ));
     out.push_str(&format!(
-        " | dominant={} confirm_ms={} assign_ms={} getdata={} drain_ms={}",
+        " | loop {} conf={}ms assign={}ms getdata={} drain={}ms",
         s.dominant, s.confirm_ms, s.assign_ms, s.assign_issued, s.drain_ms,
     ));
     if s.confirm_reject_stops > 0 {
-        out.push_str(&format!(" reject_stops={}", s.confirm_reject_stops));
+        out.push_str(&format!(" reject={}", s.confirm_reject_stops));
     }
     if let Some((first, n, elapsed_ms)) = s.live {
-        out.push_str(&format!(
-            " | live first={first} batch={n} elapsed_ms={elapsed_ms}"
-        ));
+        out.push_str(&format!(" | live h={first} n={n} {elapsed_ms}ms"));
     }
-    // Parent prewarm: ahead-of-tip + work/IO this window.
+    // Prewarm: how far ahead of tip + Class A IO mix this window.
+    let cache_pct = {
+        let hits = s.pw_cache_hits;
+        let loads = s.pw_parent_unique;
+        let tot = hits.saturating_add(loads);
+        if tot > 0 {
+            (100 * hits) / tot
+        } else {
+            0
+        }
+    };
     out.push_str(&format!(
-        " | prewarm ahead={} through={} parents={} reserved={} plans={}/{} blks={} ms={} uniq_p={} cache_hit={} full_tx={}",
+        " | prewarm +{} thru={} parents={} bodies={} plans={}/{} blks={} body_io={} parent_io={} cache%={} {}ms",
         s.pw_ahead,
         s.pw_ready_through,
         s.pw_parents,
-        s.pw_open_reserves,
+        s.pw_bodies,
         s.pw_plans,
         s.pw_depth,
         s.pw_blocks,
+        s.pw_body_tx_reads,
+        s.pw_parent_tx_reads,
+        cache_pct,
         s.pw_ms,
-        s.pw_parent_unique,
-        s.pw_cache_hits,
-        s.pw_full_tx_reads,
     ));
+    if s.pw_missing_parents > 0 {
+        out.push_str(&format!(" miss_p={}", s.pw_missing_parents));
+    }
+    if s.headers_done {
+        out.push_str(" headers_done");
+    }
     out
 }
 
@@ -495,28 +517,28 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     };
     let cp_tot = s.cp_tip + s.cp_wave + s.cp_class_a + s.cp_store;
     out.push_str(&format!(
-        " | prewarm ahead={} through={} parents={} open_res={} plans={}/{} win_ms={} blks={} utxo_p={} reserved={} creates={} skip={} uniq_p={} cache_hit={} full_tx={} | tip_po hit={} miss={} evict={} note={} retire={} hit%={} connect tip%={} wave%={} parent%={} store%={}",
+        " | prewarm +{} thru={} parents={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} cache_hit={} body_io={} parent_io={} miss_p={} | tip_po hit={} miss={} hit%={} note={} retire={} | connect tip%={} wave%={} parent%={} store%={}",
         s.pw_ahead,
         s.pw_ready_through,
         s.pw_parents,
-        s.pw_open_reserves,
+        s.pw_bodies,
         s.pw_plans,
         s.pw_depth,
         s.pw_ms,
         s.pw_blocks,
         s.pw_utxo_parents,
-        s.pw_reserved,
         s.pw_creates,
         s.pw_already_ready,
         s.pw_parent_unique,
         s.pw_cache_hits,
-        s.pw_full_tx_reads,
+        s.pw_body_tx_reads,
+        s.pw_parent_tx_reads,
+        s.pw_missing_parents,
         s.tp_hit,
         s.tp_miss,
-        s.tp_evict,
-        s.tp_note,
-        s.tp_retire,
         tp_pct,
+        s.tp_note,
+        s.tp_retire + s.tp_evict, // retire+evict pressure
         if cp_tot > 0 {
             (100 * s.cp_tip) / cp_tot
         } else {
@@ -596,11 +618,12 @@ mod tests {
         s.inflight = 3;
         s.inflight_cap = 256;
         s.arch_q = 10;
+        s.ahead = 224;
+        s.hole = 0;
+        s.peers = 16;
         s.phase_blks = 32;
         s.recon_ms = 100;
-        s.prefetch_ms = 10;
-        s.wave_ms = 80;
-        s.wire_ms = 10;
+        s.script_ms = 20;
         s.class_c_ms = 40;
         s.utxo_ms = 25;
         s.dominant = "confirm";
@@ -610,29 +633,32 @@ mod tests {
         assert!(line.starts_with("ibd: perf "), "{line}");
         assert!(line.contains("inflight=3/256"), "{line}");
         assert!(line.contains("arch_q=10"), "{line}");
-        assert!(line.contains("blks=32"), "{line}");
-        assert!(line.contains("recon_ms=100(p=10 w=80 wire=10)"), "{line}");
-        assert!(line.contains("class_c_ms=40"), "{line}");
-        assert!(line.contains("utxo_ms=25"), "{line}");
-        assert!(line.contains("dominant=confirm"), "{line}");
-        assert!(line.contains("reject_stops=2"), "{line}");
-        assert!(line.contains("live first=100 batch=32 elapsed_ms=1500"), "{line}");
+        assert!(line.contains("lead=224"), "{line}");
+        assert!(line.contains("conf blks=32"), "{line}");
+        assert!(line.contains("recon=100ms"), "{line}");
+        assert!(line.contains("class_c=40ms"), "{line}");
+        assert!(line.contains("utxo=25ms"), "{line}");
+        assert!(line.contains("loop confirm"), "{line}");
+        assert!(line.contains("reject=2"), "{line}");
+        assert!(line.contains("live h=100 n=32 1500ms"), "{line}");
         s.pw_ahead = 64;
         s.pw_ready_through = 200;
         s.pw_parents = 12;
-        s.pw_open_reserves = 3;
+        s.pw_bodies = 48;
         s.pw_plans = 80;
         s.pw_depth = 256;
         s.pw_blocks = 32;
+        s.pw_body_tx_reads = 400;
+        s.pw_parent_tx_reads = 120;
+        s.pw_cache_hits = 80;
+        s.pw_parent_unique = 20;
         s.pw_ms = 40;
         let line = format_info(&s);
-        assert!(line.contains("prewarm ahead=64 through=200"), "{line}");
-        assert!(line.contains("parents=12 reserved=3 plans=80/256"), "{line}");
-        assert!(line.contains("blks=32 ms=40"), "{line}");
-        // No separate legacy prefixes.
-        assert!(!line.contains("confirm_phases"));
-        assert!(!line.contains("wave_fill_phases"));
-        assert!(!line.contains("spent_local"), "{line}");
+        assert!(line.contains("prewarm +64 thru=200"), "{line}");
+        assert!(line.contains("parents=12 bodies=48 plans=80/256"), "{line}");
+        assert!(line.contains("body_io=400 parent_io=120"), "{line}");
+        assert!(!line.contains("reserved"), "{line}");
+        assert!(!line.contains("confirm_phases"), "{line}");
     }
 
     #[test]
@@ -647,6 +673,8 @@ mod tests {
         s.pw_blocks = 16;
         s.pw_utxo_parents = 100;
         s.pw_creates = 50;
+        s.pw_body_tx_reads = 200;
+        s.pw_parent_tx_reads = 50;
         s.pipe.write_blocks = 5;
         s.pipe.write_ns = 5_000_000;
         s.utxo_enabled = true;
@@ -657,12 +685,13 @@ mod tests {
         assert!(line.starts_with("ibd: perf_dbg "), "{line}");
         assert!(line.contains("us/blk recon="), "{line}");
         assert!(line.contains("utxo=500"), "{line}"); // us/blk
-        assert!(!line.contains("spent_local"), "{line}");
         assert!(line.contains("wave body="), "{line}");
-        assert!(line.contains("spent=50"), "{line}"); // wave spent filter subtimer
-        assert!(line.contains("prewarm ahead=64 through=200"), "{line}");
+        assert!(line.contains("spent=50"), "{line}");
+        assert!(line.contains("prewarm +64 thru=200"), "{line}");
         assert!(line.contains("utxo_p=100"), "{line}");
         assert!(line.contains("creates=50"), "{line}");
+        assert!(line.contains("body_io=200 parent_io=50"), "{line}");
+        assert!(!line.contains("reserved"), "{line}");
         assert!(line.contains("pipe "), "{line}");
         assert!(line.contains("utxo live=12345 tip=100 rebuilds=0"), "{line}");
         assert!(line.contains("loop "), "{line}");

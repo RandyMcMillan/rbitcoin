@@ -918,7 +918,8 @@ pub async fn ibd_cancellable(
         }
 
         // Single INFO progress path (~1/s when tip or archived advanced).
-        // Status every 5s is pipeline health only (no second progress line).
+        // Glance line: tip rate, archive lead, tip-hole, peers, prewarm lead.
+        // Status every 5s is pipeline health only (`ibd: perf`).
         if last_progress_log.elapsed() >= Duration::from_secs(1) {
             let prog = work_chain_progress(
                 hub.as_ref(),
@@ -934,20 +935,27 @@ pub async fn ibd_cancellable(
             let arch_delta = arch_total.saturating_sub(last_logged_arch_total);
             if tip_delta > 0 || arch_delta > 0 {
                 let pct = ibd_pct(prog.tip, prog.headers);
-                let (pw_through, pw_ahead, pw_parents, pw_res, _plans, _depth) =
+                let secs = last_progress_log.elapsed().as_secs_f64().max(0.001);
+                let tip_rate = tip_delta as f64 / secs;
+                let arch_rate = arch_delta as f64 / secs;
+                let arch_lead = prog.archived.saturating_sub(prog.tip);
+                let peers_n = st.slots.iter().filter(|s| s.alive).count();
+                let (pw_through, pw_ahead, _pw_parents, _pw_bodies, _plans, _depth) =
                     hub.query.parent_prewarm_perf_snapshot();
                 info!(
-                    "ibd: progress {pct}% tip={} arch_hwm={} arch_total={arch_total} horizon={} hole={} prewarm_ahead={pw_ahead} prewarm_through={pw_through} parents={pw_parents} reserved={pw_res} (+tip={tip_delta} +arch={arch_delta})",
+                    "ibd: progress {pct}% tip={} ({tip_rate:.0}/s) arch_hwm={} ({arch_rate:.0}/s lead={arch_lead}) hole={} peers={peers_n} prewarm+{pw_ahead} thru={pw_through} horizon={}",
                     prog.tip,
                     prog.archived,
-                    prog.headers,
                     prog.tip_hole,
+                    prog.headers,
                 );
                 last_logged_tip = prog.tip;
                 last_logged_arch_total = arch_total;
+                last_progress_log = Instant::now();
                 let _ = std::io::Write::flush(&mut std::io::stderr());
+            } else {
+                last_progress_log = Instant::now();
             }
-            last_progress_log = Instant::now();
         }
         if last_status.elapsed() > Duration::from_secs(5) {
             let scan_t0 = Instant::now();

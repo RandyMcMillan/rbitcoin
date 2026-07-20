@@ -64,10 +64,8 @@ pub mod parent_prewarm_stats {
     pub static NS: AtomicU64 = AtomicU64::new(0);
     /// Heights whose body was scanned this window.
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
-    /// Parent outs loaded from UTXO / durable store.
+    /// Parent outs loaded via UTXO create_fk path.
     pub static UTXO_PARENTS: AtomicU64 = AtomicU64::new(0);
-    /// Outpoints reserved for runway creates.
-    pub static RESERVED: AtomicU64 = AtomicU64::new(0);
     /// Runway create txs registered (full outs).
     pub static CREATES: AtomicU64 = AtomicU64::new(0);
     /// Heights already ready (skipped).
@@ -76,25 +74,26 @@ pub mod parent_prewarm_stats {
     pub static PARENT_UNIQUE: AtomicU64 = AtomicU64::new(0);
     /// Parent outs from cache (no store).
     pub static PARENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-    /// `get_tx_full` store calls (bodies + parents).
+    /// Phase-2 parent `get_tx_full` store calls.
     pub static FULL_TX_READS: AtomicU64 = AtomicU64::new(0);
-    /// Phase-1 body loads only.
+    /// Phase-1 body `get_tx_full` loads.
     pub static BODY_TX_READS: AtomicU64 = AtomicU64::new(0);
     /// Unresolved external parents (should stay 0).
     pub static MISSING_PARENTS: AtomicU64 = AtomicU64::new(0);
 
-    /// `(ns, blocks, utxo_parents, reserved, creates, already_ready, parent_unique, cache_hits, full_tx_reads)`.
-    pub fn sample_and_reset() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+    /// `(ns, blocks, utxo_parents, creates, already_ready, parent_unique, cache_hits, body_tx, parent_tx, missing)`.
+    pub fn sample_and_reset() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
         (
             NS.swap(0, Ordering::Relaxed),
             BLOCKS.swap(0, Ordering::Relaxed),
             UTXO_PARENTS.swap(0, Ordering::Relaxed),
-            RESERVED.swap(0, Ordering::Relaxed),
             CREATES.swap(0, Ordering::Relaxed),
             ALREADY_READY.swap(0, Ordering::Relaxed),
             PARENT_UNIQUE.swap(0, Ordering::Relaxed),
             PARENT_CACHE_HITS.swap(0, Ordering::Relaxed),
+            BODY_TX_READS.swap(0, Ordering::Relaxed),
             FULL_TX_READS.swap(0, Ordering::Relaxed),
+            MISSING_PARENTS.swap(0, Ordering::Relaxed),
         )
     }
 
@@ -108,9 +107,6 @@ pub mod parent_prewarm_stats {
         }
         if st.utxo_parents > 0 {
             UTXO_PARENTS.fetch_add(st.utxo_parents as u64, Ordering::Relaxed);
-        }
-        if st.reserved > 0 {
-            RESERVED.fetch_add(st.reserved as u64, Ordering::Relaxed);
         }
         if st.creates_registered > 0 {
             CREATES.fetch_add(st.creates_registered as u64, Ordering::Relaxed);

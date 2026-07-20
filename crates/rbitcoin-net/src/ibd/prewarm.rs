@@ -74,10 +74,10 @@ pub(crate) fn spawn_parent_prewarm(
                 if runway.is_empty() || cursor >= runway.len() {
                     // Idle INFO only after we have done real work (avoids tip=0 noise).
                     if ever_worked && last_info.elapsed() >= Duration::from_secs(30) {
-                        let (through, ahead, parents, reserved, plans, d) =
+                        let (through, ahead, parents, bodies, plans, d) =
                             query.parent_prewarm_perf_snapshot();
                         info!(
-                            "ibd: prewarm idle tip={tip} through={through} ahead={ahead} parents={parents} reserved={reserved} plans={plans}/{d} runway={}",
+                            "ibd: prewarm idle tip={tip} +{ahead} thru={through} parents={parents} bodies={bodies} plans={plans}/{d} runway={}",
                             runway.len()
                         );
                         last_info = std::time::Instant::now();
@@ -100,26 +100,29 @@ pub(crate) fn spawn_parent_prewarm(
                         // Per-slice detail only at trace (debug was multi-Hz spam).
                         if st.blocks > 0
                             || st.utxo_parents > 0
-                            || st.reserved > 0
                             || st.creates_registered > 0
                         {
                             rbitcoin_log::trace!(
-                                "ibd: prewarm h={h0}..{h1} blocks={} utxo_parents={} reserved={} creates={} skip={} through={through} ahead={ahead} {ms}ms",
+                                "ibd: prewarm h={h0}..{h1} blocks={} parents={} creates={} body_io={} parent_io={} cache_hit={} skip={} +{ahead} thru={through} {ms}ms",
                                 st.blocks,
                                 st.utxo_parents,
-                                st.reserved,
                                 st.creates_registered,
+                                st.body_tx_reads,
+                                st.full_tx_reads,
+                                st.parent_cache_hits,
                                 st.already_ready,
                             );
                         }
                         // Periodic INFO: cursor is *after* this slice.
                         if last_info.elapsed() >= Duration::from_secs(10) {
-                            let (_, _, parents, reserved, plans, d) =
+                            let (_, _, parents, bodies, plans, d) =
                                 query.parent_prewarm_perf_snapshot();
                             info!(
-                                "ibd: prewarm tip={tip} through={through} ahead={ahead} parents={parents} reserved={reserved} plans={plans}/{d} cursor={cursor}/{} last_h={h0}..{h1} blks={} {ms}ms",
+                                "ibd: prewarm tip={tip} +{ahead} thru={through} parents={parents} bodies={bodies} plans={plans}/{d} cursor={cursor}/{} last_h={h0}..{h1} blks={} body_io={} parent_io={} {ms}ms",
                                 runway.len(),
                                 st.blocks,
+                                st.body_tx_reads,
+                                st.full_tx_reads,
                             );
                             last_info = std::time::Instant::now();
                         }

@@ -345,16 +345,6 @@ impl Query {
         )
     }
 
-    /// Remember a create tx + outputs in the tip-window prevout cache.
-    pub(crate) fn tip_prevout_note(
-        &self,
-        fk: Fk,
-        tx: TxRecord,
-        outputs: Vec<OutputRecord>,
-    ) {
-        self.tip_prevout_cache.note(fk, tx, outputs);
-    }
-
     /// Single-lock tip_prevout resolve for connect: `(tx, output)`.
     pub fn tip_prevout_tx_and_output(
         &self,

@@ -1,7 +1,8 @@
 //! Tip-window cache for **confirm connect prevouts**.
 //!
-//! Filled as blocks are **confirmed** (creates in the block + parents resolved
-//! during connect / wave parent prefetch), not as archive races ahead.
+//! Filled by **wave parent promote** (`note_live_slots`) and connect miss-fill
+//! (`note` / `tx_output_run`), not by dumping every confirmed create (that
+//! thrashed FIFO vs parent locality on fat catch-up batches).
 //! Byte-capped FIFO: newest tip work stays hot; oldest tip-window entries evict first.
 //!
 //! **Spend retirement:** after a successful Class C wave, spent vouts are dropped

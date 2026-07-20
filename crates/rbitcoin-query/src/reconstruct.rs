@@ -234,7 +234,7 @@ impl Query {
                         || n <= 128
                         || need_n.saturating_mul(3) >= n.max(1);
                     if use_full {
-                        let raw = self.tx_output_run_class_a(&tx)?;
+                        let raw = self.tx_output_run_class_a(fk, &tx)?;
                         for &v in needed_vouts {
                             let vi = v as usize;
                             if vi < raw.len() {
@@ -372,7 +372,7 @@ impl Query {
         let outs = if tx.output_count == 0 {
             Vec::new()
         } else {
-            self.tx_output_run_class_a(&tx)?
+            self.tx_output_run_class_a(fk, &tx)?
         };
         let inputs = if tx.input_count == 0 {
             Vec::new()
@@ -499,7 +499,7 @@ impl Query {
         }
         let rec = self.get_tx_class_a(tx_fk)?;
         let stored_inputs = self.tx_input_run(&rec)?;
-        let stored_outputs = self.tx_output_run_class_a(&rec)?;
+        let stored_outputs = self.tx_output_run_class_a(tx_fk, &rec)?;
         Ok(Self::transaction_from_class_a(
             rec,
             stored_outputs,

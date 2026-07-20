@@ -179,6 +179,9 @@ impl Query {
                 let mut sh_creates: Vec<ScriptHashRecord> = Vec::new();
                 // Rough upper bound: a few outputs per new tx (grows as needed).
                 sh_creates.reserve(sh_new_txs.len().saturating_mul(2));
+                // Use Class A by **create fk** (wave already filled outs). Never
+                // resolve via txid — catch-up has no durable head and tx_run.lookup
+                // walks sorted runs per tx (signet multi-second SH collect).
                 for &tx_id in &sh_new_txs {
                     self.collect_scripthash_creates(Fk(tx_id), &mut sh_creates)?;
                 }
@@ -246,26 +249,13 @@ impl Query {
             Ordering::Relaxed,
         );
 
-        // Tip-window prevout cache only (C): creates we just confirmed.
-        // Load via Class A (not tip_prevout probe) so we don't MISS-spam stats
-        // while seeding the cache from the wave we just confirmed.
-        for item in items {
-            for &tx_fk in &item.tx_fks {
-                let tx = match self.get_tx_class_a(tx_fk) {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                let outs = if tx.output_count == 0 {
-                    Vec::new()
-                } else {
-                    match self.tx_output_run_class_a(&tx) {
-                        Ok(o) => o,
-                        Err(_) => continue,
-                    }
-                };
-                self.tip_prevout_note(tx_fk, tx, outs);
-            }
-        }
+        // Do **not** seed tip_prevout with every confirmed create here.
+        // Wave already `note_live_slots`s external parents; same-batch creates
+        // live in WavePrevoutCache. Bulk create-note on fat batches (signet
+        // ~20–40k notes / 5s) FIFO-evicted those parents, then `retire_spends`
+        // dropped many of the same creates — pure thrash. Next wave reloads
+        // parents from warm Class A. Connect still miss-fills tip_prevout on
+        // cold path via `tx_output_run`.
 
         Ok(out)
     }
@@ -326,17 +316,19 @@ impl Query {
     }
 
     /// Collect thin scripthash create pointers for one tx's outputs (no spend marks).
+    ///
+    /// Always keys Class A by `tx_fk` (not txid lookup). Confirm waves already
+    /// prefetched outs under that fk; catch-up has no durable `tx.head`.
     pub(crate) fn collect_scripthash_creates(
         &self,
         tx_fk: Fk,
         out: &mut Vec<ScriptHashRecord>,
     ) -> Result<(), QueryError> {
-        // Class A only: creates in the confirm wave are not tip-prevout probes.
         let tx = self.get_tx_class_a(tx_fk)?;
         if tx.output_count == 0 {
             return Ok(());
         }
-        let outputs = self.tx_output_run_class_a(&tx)?;
+        let outputs = self.tx_output_run_class_a(tx_fk, &tx)?;
         for (i, o) in outputs.iter().enumerate() {
             out.push(ScriptHashRecord {
                 scripthash: script_hash(&o.script),
@@ -396,24 +388,25 @@ impl Query {
     }
 
     /// Output run via Class A → store only (no tip_prevout probe or miss-fill).
+    ///
+    /// `create_fk` is the Class A body fk (always known on confirm/reconstruct).
+    /// Do **not** resolve via txid first — that forces `tx_run.lookup` on every
+    /// catch-up SH collect when durable `tx.head` is off.
     pub(crate) fn tx_output_run_class_a(
         &self,
+        create_fk: Fk,
         tx: &TxRecord,
     ) -> Result<Vec<OutputRecord>, QueryError> {
         if tx.output_count == 0 {
             return Ok(Vec::new());
         }
-        if let Some(fk) = self.lookup_tx_fk(&tx.txid)? {
-            if let Some(outputs) = self.class_a_cache.get_outputs(fk) {
-                return Ok(outputs);
-            }
-            let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-            let outputs = self.get_output_run(Fk(run), tx.output_count)?;
-            self.class_a_cache.fill_outputs(fk, outputs.clone());
+        if let Some(outputs) = self.class_a_cache.get_outputs(create_fk) {
             return Ok(outputs);
         }
         let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-        self.get_output_run(Fk(run), tx.output_count)
+        let outputs = self.get_output_run(Fk(run), tx.output_count)?;
+        self.class_a_cache.fill_outputs(create_fk, outputs.clone());
+        Ok(outputs)
     }
 
     /// Connect a block at `height` (genesis or tip+1): archive Class A then confirm Class C.

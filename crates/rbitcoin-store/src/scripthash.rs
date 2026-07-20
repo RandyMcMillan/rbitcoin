@@ -466,7 +466,9 @@ impl ScriptHashTable {
             });
         }
 
-        let class = class_for_count(n).ok_or(StoreError::Corrupt("scripthash entry count too large"))?;
+        let class = class_for_count(n).ok_or_else(|| {
+            StoreError::Corrupt("scripthash entry count exceeds max slab class")
+        })?;
 
         // Reuse existing slab if same class and capacity sufficient.
         if let ShHeadValue::Slab {
@@ -659,8 +661,22 @@ impl ScriptHashBulkBuilder {
                 ShHeadValue::inline_two(entries[0], entries[1])
             }
         } else {
-            let class = class_for_count(n)
-                .ok_or(StoreError::Corrupt("scripthash migrate: entry count too large"))?;
+            let class = class_for_count(n).ok_or_else(|| {
+                rbitcoin_log::error!(
+                    "store: scripthash migrate chain len {} exceeds max slab capacity {} (raise SH_MAX_CLASS)",
+                    n,
+                    crate::scripthash_layout::max_slab_entries()
+                );
+                StoreError::Corrupt("scripthash migrate: entry count exceeds max slab class")
+            })?;
+            if class >= 18 {
+                rbitcoin_log::info!(
+                    "store: scripthash migrate large slab class={} used={} (~{:.1} MiB)",
+                    class,
+                    n,
+                    (n as u64 * SH_ENTRY_LEN as u64) as f64 / (1024.0 * 1024.0)
+                );
+            }
             let need = slab_bytes(class);
             let off = self.bump;
             // Reserve full class size (freelist-compatible); write only live bytes.

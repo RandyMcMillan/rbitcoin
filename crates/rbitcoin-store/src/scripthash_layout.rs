@@ -12,8 +12,12 @@ pub const SH_ENTRY_LEN: usize = 12;
 pub const SH_INLINE_CAP: usize = 2;
 /// Size class 0 capacity; class `c` has capacity `SH_SLAB_BASE << c`.
 pub const SH_SLAB_BASE: u32 = 4;
-/// Max size class: cap = 4 << 18 = 2^20 entries (~12 MiB / slab).
-pub const SH_MAX_CLASS: u8 = 18;
+/// Max size class: cap = 4 << c.
+///
+/// Class 18 = 2^20 entries (~12 MiB) is not enough for a few mainnet exchange
+/// deposit scripts (migrate hit “entry count too large” past ~16.7M keys).
+/// Class 24 = 2^26 entries (~805 MiB slab) covers pathological histories.
+pub const SH_MAX_CLASS: u8 = 24;
 /// Head value payload (tag + data); slot = key[32] + value[32] = 64 B.
 pub const SH_HEAD_VALUE_LEN: usize = 32;
 /// On-disk head slot size.
@@ -37,17 +41,26 @@ pub fn slab_bytes(class: u8) -> u64 {
     u64::from(slab_cap(class)) * SH_ENTRY_LEN as u64
 }
 
-/// Smallest size class with `slab_cap(c) >= n`, or `None` if `n <= INLINE_CAP`.
+/// Smallest size class with `slab_cap(c) >= n`, or `None` if `n <= INLINE_CAP`
+/// or `n` exceeds [`SH_MAX_CLASS`] capacity.
 pub fn class_for_count(n: u32) -> Option<u8> {
     if n <= SH_INLINE_CAP as u32 {
         return None;
     }
-    for c in 0..=SH_MAX_CLASS {
+    // 4 << c >= n  ⇒  c >= ceil(log2(n)) - 2
+    let mut c = 0u8;
+    while c <= SH_MAX_CLASS {
         if slab_cap(c) >= n {
             return Some(c);
         }
+        c += 1;
     }
     None
+}
+
+/// Max creates storable in one slab under current [`SH_MAX_CLASS`].
+pub fn max_slab_entries() -> u32 {
+    slab_cap(SH_MAX_CLASS)
 }
 
 /// One thin create: `create_tx_fk` + `vout`.
@@ -232,6 +245,10 @@ mod tests {
         assert_eq!(class_for_count(8), Some(1));
         assert_eq!(class_for_count(9), Some(2));
         assert_eq!(class_for_count(100), Some(5)); // 4<<5 = 128
+        assert_eq!(class_for_count(1_048_576), Some(18)); // 4<<18 = 2^20
+        assert_eq!(class_for_count(1_048_577), Some(19));
+        assert_eq!(class_for_count(max_slab_entries()), Some(SH_MAX_CLASS));
+        assert!(class_for_count(max_slab_entries().saturating_add(1)).is_none());
         assert_eq!(slab_cap(0), 4);
         assert_eq!(slab_cap(1), 8);
         assert_eq!(slab_bytes(0), 48);

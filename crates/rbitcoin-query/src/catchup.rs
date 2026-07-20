@@ -182,23 +182,34 @@ impl Query {
         let Some(ref mut u) = *g else {
             return Ok(());
         };
+        let t_probe = std::time::Instant::now();
         let mut last_tip = u.tip();
+        let mut any = false;
         for &(spends, creates, tip) in steps {
             if let Some(have) = last_tip {
                 if tip <= have {
                     continue;
                 }
             }
+            any = true;
             for &(txid, vout) in spends {
                 let _ = u.take_spend(&txid, vout)?;
             }
             for &(txid, vout, create_fk) in creates {
                 u.insert_create(&txid, vout, create_fk)?;
             }
+            // Header tip only (no msync); durable flush is separate below.
             u.set_tip(Some(tip));
             last_tip = Some(tip);
         }
-        u.flush()?;
+        let probe_ns = t_probe.elapsed().as_nanos() as u64;
+        ibd_utxo_stats::note_probe_ns(probe_ns);
+
+        if any {
+            let t_flush = std::time::Instant::now();
+            u.flush()?;
+            ibd_utxo_stats::note_flush_ns(t_flush.elapsed().as_nanos() as u64);
+        }
         Ok(())
     }
 

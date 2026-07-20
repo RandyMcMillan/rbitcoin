@@ -223,14 +223,37 @@ pub mod ibd_utxo_stats {
     /// Confirm heal: apply failed → full `rebuild_ibd_utxo_to_tip`.
     pub static REBUILD_COUNT: AtomicU64 = AtomicU64::new(0);
 
+    /// Wall time in open-address `take_spend` / `insert_create` (no msync).
+    pub static PROBE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Wall time in `IbdUtxo::flush` (`mmap.flush` + `file.flush`).
+    pub static FLUSH_NS: AtomicU64 = AtomicU64::new(0);
+
     /// Rebuilds in the last sample window (then reset).
     pub fn sample_rebuilds_and_reset() -> u64 {
         REBUILD_COUNT.swap(0, Ordering::Relaxed)
     }
 
+    /// Probe / flush nanoseconds this window (then reset).
+    pub fn sample_probe_flush_and_reset() -> (u64, u64) {
+        (
+            PROBE_NS.swap(0, Ordering::Relaxed),
+            FLUSH_NS.swap(0, Ordering::Relaxed),
+        )
+    }
+
     #[inline]
     pub fn note_rebuild() {
         REBUILD_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn note_probe_ns(ns: u64) {
+        PROBE_NS.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn note_flush_ns(ns: u64) {
+        FLUSH_NS.fetch_add(ns, Ordering::Relaxed);
     }
 }
 

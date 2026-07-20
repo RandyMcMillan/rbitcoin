@@ -6,8 +6,9 @@
 //! - **In-flight cap** (`window`): max concurrent unique getdata; **not** a tip-distance
 //!   limit — any unarchived hash on the known header path may be requested so archive
 //!   can race to the end of headers while tip waits on holes
-//! - Tip-hole hashes may race up to 3 peers; near/far densify stay single-peer
-//! - At most `per_peer` outstanding blocks per peer (Core = 16)
+//! - Tip-hole hashes race 2 peers immediately; a 3rd only after 10s without body
+//! - Near/far densify stay single-peer; at most `per_peer` blocks per peer (Core = 16)
+//! - Peers send `getaddr`; learned addrs grow the redial pool beyond seeds
 //! - Archive pipeline: dedicated OS **prep** thread → dedicated OS **writer** thread
 //! - Tip **confirm** walks contiguous archived runs (Class C) on a dedicated thread
 //! - Peer IO: concurrent read/write halves; **frame-only** on socket tasks, block
@@ -248,8 +249,14 @@ pub const DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 const NEAR_DEPTH: u32 = 4096;
 /// Max contiguous tip+1.. holes to cover per assign.
 const TIP_HOLE_MAX: usize = 32;
-/// Max concurrent getdata peers for one tip-hole hash (race slow peers).
+/// Max concurrent getdata peers for one tip-hole hash.
 pub(crate) const TIP_HOLE_MAX_PEERS: usize = 3;
+/// Immediate tip-hole race size (first + second peer).
+pub(crate) const TIP_HOLE_IMMEDIATE_PEERS: usize = 2;
+/// After the second tip-hole peer is issued, wait this long before a third.
+pub(crate) const TIP_HOLE_THIRD_PEER_AFTER: Duration = Duration::from_secs(10);
+/// Cap on IBD dial pool after getaddr learning (seeds + discovered).
+const MAX_PEER_POOL: usize = 256;
 /// Pending (framed, not Class A) longer than this → re-getdata.
 const PENDING_STALE: Duration = Duration::from_secs(45);
 /// Max hashes per far getdata batch.
@@ -358,7 +365,8 @@ pub async fn parallel_ibd_cancellable(
             "ibd: tokio worker threads≈{workers} (peer decode: blocking pool; archive: 1 OS prep + 1 OS writer; confirm: 1 OS thread)"
         );
     }
-    let peer_pool: Vec<SocketAddr> = peers.to_vec();
+    // Dial candidates: initial seeds/connect list, grown by peer `addr`/`addrv2`.
+    let mut peer_pool: Vec<SocketAddr> = peers.to_vec();
     let next_peer_id = Arc::new(AtomicUsize::new(0));
 
     // Initial concurrent dial (all candidates once) — OK to await before loop starts.
@@ -528,6 +536,8 @@ pub async fn parallel_ibd_cancellable(
             &arch_job_tx,
             &archive_queued,
             &loop_stats,
+            &mut peer_pool,
+            local_addr,
         )? {
             break;
         }
@@ -602,6 +612,8 @@ pub async fn parallel_ibd_cancellable(
             &arch_job_tx,
             &archive_queued,
             &loop_stats,
+            &mut peer_pool,
+            local_addr,
         )? {
             break;
         }
@@ -739,7 +751,9 @@ pub async fn parallel_ibd_cancellable(
         // When *all* peers are dead (network blip), do not wait for the 15s
         // interval — redial immediately so we never race the exit check.
         let alive_n = st.slots.iter().filter(|s| s.alive).count();
-        let target = cfg.target_peers.min(peer_pool.len()).max(1);
+        // Target live peers is independent of pool size; getaddr grows the pool
+        // so we can reach `target_peers` even when seeds alone were sparse.
+        let target = cfg.target_peers.max(1);
         let redial_interval = if alive_n == 0 {
             Duration::from_secs(0)
         } else {
@@ -747,6 +761,7 @@ pub async fn parallel_ibd_cancellable(
         };
         if redial_handle.is_none()
             && alive_n < target
+            && !peer_pool.is_empty()
             && last_redial.elapsed() >= redial_interval
         {
             let want = (target - alive_n).min(8).max(1);
@@ -981,6 +996,8 @@ pub async fn parallel_ibd_cancellable(
                     ev,
                     &arch_job_tx,
                     &archive_queued,
+                    &mut peer_pool,
+                    local_addr,
                 );
             }
             peer_ev = ctrl_rx.recv() => {
@@ -995,6 +1012,8 @@ pub async fn parallel_ibd_cancellable(
                     ev,
                     &arch_job_tx,
                     &archive_queued,
+                    &mut peer_pool,
+                    local_addr,
                 );
             }
             arch = arch_res_rx.recv() => {
@@ -1158,6 +1177,8 @@ fn drain_ready_peer_and_archive_events(
     arch_job_tx: &mpsc::UnboundedSender<ArchiveJob>,
     archive_queued: &ArchiveQueueBudget,
     loop_stats: &LoopStats,
+    peer_pool: &mut Vec<SocketAddr>,
+    local_addr: SocketAddr,
 ) -> Result<bool, NetError> {
     let t0 = Instant::now();
     let mut events = 0u64;
@@ -1182,7 +1203,15 @@ fn drain_ready_peer_and_archive_events(
         match body_rx.try_recv() {
             Ok(ev) => {
                 events += 1;
-                apply_peer_event(st, hub, ev, arch_job_tx, archive_queued);
+                apply_peer_event(
+                    st,
+                    hub,
+                    ev,
+                    arch_job_tx,
+                    archive_queued,
+                    peer_pool,
+                    local_addr,
+                );
             }
             Err(_) => break,
         }
@@ -1196,7 +1225,15 @@ fn drain_ready_peer_and_archive_events(
             Ok(ev) => {
                 events += 1;
                 ctrl_n += 1;
-                apply_peer_event(st, hub, ev, arch_job_tx, archive_queued);
+                apply_peer_event(
+                    st,
+                    hub,
+                    ev,
+                    arch_job_tx,
+                    archive_queued,
+                    peer_pool,
+                    local_addr,
+                );
             }
             Err(_) => break,
         }
@@ -1217,6 +1254,8 @@ fn apply_peer_event(
     ev: PeerEvent,
     arch_job_tx: &mpsc::UnboundedSender<ArchiveJob>,
     archive_queued: &ArchiveQueueBudget,
+    peer_pool: &mut Vec<SocketAddr>,
+    local_addr: SocketAddr,
 ) {
     match ev {
         PeerEvent::Headers { peer, headers } => {
@@ -1458,10 +1497,47 @@ fn apply_peer_event(
                 }
             }
         }
+        PeerEvent::Addrs { peer, addrs } => {
+            inject_learned_addrs(peer_pool, &addrs, local_addr, peer);
+        }
         PeerEvent::Dead { peer, reason } => {
             warn!("ibd: peer[{peer}] dead: {reason}");
             release_peer_block_work(&mut st.slots, &mut st.inflight, peer);
         }
+    }
+}
+
+/// Grow the IBD dial pool from peer-advertised addresses (getaddr responses).
+fn inject_learned_addrs(
+    pool: &mut Vec<SocketAddr>,
+    addrs: &[SocketAddr],
+    local_addr: SocketAddr,
+    from_peer: usize,
+) {
+    if addrs.is_empty() || pool.len() >= MAX_PEER_POOL {
+        return;
+    }
+    let mut added = 0usize;
+    for &a in addrs {
+        if pool.len() >= MAX_PEER_POOL {
+            break;
+        }
+        if a == local_addr || a.ip().is_unspecified() || a.port() == 0 {
+            continue;
+        }
+        if pool.iter().any(|p| *p == a) {
+            continue;
+        }
+        pool.push(a);
+        added += 1;
+    }
+    if added > 0 {
+        // Prefer IPv4 candidates first (same policy as AddrMan).
+        pool.sort_by_key(|a| a.is_ipv6());
+        rbitcoin_log::debug!(
+            "ibd: peer[{from_peer}] taught {added} addr(s); pool={}",
+            pool.len()
+        );
     }
 }
 
@@ -1665,8 +1741,8 @@ enum AssignScope {
 
 /// Assign getdata for bodies not yet Class A.
 ///
-/// 1. Tip hole — up to [`TIP_HOLE_MAX_PEERS`] getdata peers per hole hash
-///    (race slow peers without waiting for stall disconnect).
+/// 1. Tip hole — 2 peers immediately; 3rd after [`TIP_HOLE_THIRD_PEER_AFTER`]
+///    from when the second was attached (no stall disconnect required).
 /// 2. Near band — tip+1‥tip+[`NEAR_DEPTH`] (single peer per hash).
 /// 3. Far — forward densify past near (height-ascending); skipped in
 ///    [`AssignScope::TipNearOnly`].
@@ -2046,8 +2122,35 @@ fn contiguous_tip_holes(
     holes
 }
 
-/// Cover each tip-hole hash with up to [`TIP_HOLE_MAX_PEERS`] concurrent getdata
-/// peers. First delivery clears all racers via [`clear_hash_inflight`].
+/// Desired concurrent getdata peers for a tip-hole hash.
+///
+/// - 0–1 outstanding → aim for [`TIP_HOLE_IMMEDIATE_PEERS`] (2) immediately
+/// - 2 outstanding → hold until [`TIP_HOLE_THIRD_PEER_AFTER`] from second attach
+/// - then allow [`TIP_HOLE_MAX_PEERS`] (3)
+pub(crate) fn tip_hole_peer_target(
+    already: usize,
+    second_peer_at: Option<Instant>,
+    now: Instant,
+) -> usize {
+    if already >= TIP_HOLE_MAX_PEERS {
+        return TIP_HOLE_MAX_PEERS;
+    }
+    if already >= TIP_HOLE_IMMEDIATE_PEERS {
+        let ready_for_third = second_peer_at
+            .map(|t| now.duration_since(t) >= TIP_HOLE_THIRD_PEER_AFTER)
+            .unwrap_or(false);
+        if ready_for_third {
+            TIP_HOLE_MAX_PEERS
+        } else {
+            TIP_HOLE_IMMEDIATE_PEERS
+        }
+    } else {
+        TIP_HOLE_IMMEDIATE_PEERS
+    }
+}
+
+/// Cover each tip-hole hash with staged multi-peer getdata (2 now, 3 after 10s).
+/// First delivery clears all racers via [`clear_hash_inflight`].
 fn cover_tip_holes(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -2060,16 +2163,22 @@ fn cover_tip_holes(
     }
     let mut issued = 0u64;
     let mut peer_i = st.assign_rot;
+    let now = Instant::now();
 
     for &h in holes {
         if hub.has_block(&h) || st.body.is_pending(&h) || st.body.ready(hub, &h) {
             continue;
         }
-        let already = st.inflight.get(&h).map(|e| e.len()).unwrap_or(0);
-        if already >= TIP_HOLE_MAX_PEERS {
+        let (already, second_at) = st
+            .inflight
+            .get(&h)
+            .map(|e| (e.len(), e.second_peer_at))
+            .unwrap_or((0, None));
+        let want = tip_hole_peer_target(already, second_at, now);
+        if already >= want {
             continue;
         }
-        let mut need = TIP_HOLE_MAX_PEERS - already;
+        let mut need = want - already;
         let mut placed_any = false;
         for _ in 0..alive.len() {
             if need == 0 {
@@ -2106,6 +2215,32 @@ fn cover_tip_holes(
         }
     }
     issued
+}
+
+#[cfg(test)]
+mod tip_hole_race_tests {
+    use super::*;
+
+    #[test]
+    fn tip_hole_targets_two_immediately() {
+        let now = Instant::now();
+        assert_eq!(tip_hole_peer_target(0, None, now), 2);
+        assert_eq!(tip_hole_peer_target(1, None, now), 2);
+    }
+
+    #[test]
+    fn tip_hole_third_only_after_grace() {
+        let t0 = Instant::now();
+        assert_eq!(
+            tip_hole_peer_target(2, Some(t0), t0 + Duration::from_secs(9)),
+            2
+        );
+        assert_eq!(
+            tip_hole_peer_target(2, Some(t0), t0 + Duration::from_secs(10)),
+            3
+        );
+        assert_eq!(tip_hole_peer_target(3, Some(t0), t0 + Duration::from_secs(60)), 3);
+    }
 }
 
 /// Height of `child` = parent height + 1 when parent height is known.

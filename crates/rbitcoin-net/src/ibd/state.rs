@@ -20,18 +20,23 @@ use super::peer_io::PeerSlot;
 
 /// Outstanding getdata for one block hash (one or more peers).
 ///
-/// Near/far densify use a single peer. Tip-hole hashes may race up to
-/// [`super::TIP_HOLE_MAX_PEERS`] peers so a slow peer cannot freeze the tip.
+/// Near/far densify use a single peer. Tip-hole hashes race a second peer
+/// immediately and a third only after [`super::TIP_HOLE_THIRD_PEER_AFTER`].
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InflightReq {
     pub peers: HashSet<usize>,
+    /// When the second peer was first attached (tip-hole third-peer timer).
+    pub second_peer_at: Option<Instant>,
 }
 
 impl InflightReq {
     pub(crate) fn new(peer: usize) -> Self {
         let mut peers = HashSet::with_capacity(1);
         peers.insert(peer);
-        Self { peers }
+        Self {
+            peers,
+            second_peer_at: None,
+        }
     }
 
     pub(crate) fn contains_peer(&self, peer: usize) -> bool {
@@ -48,12 +53,21 @@ impl InflightReq {
 
     /// Returns true if `peer` was newly added.
     pub(crate) fn add_peer(&mut self, peer: usize) -> bool {
-        self.peers.insert(peer)
+        if !self.peers.insert(peer) {
+            return false;
+        }
+        if self.peers.len() == 2 {
+            self.second_peer_at.get_or_insert_with(Instant::now);
+        }
+        true
     }
 
     /// Remove `peer`. Returns true if no peers remain (caller should drop the hash).
     pub(crate) fn remove_peer(&mut self, peer: usize) -> bool {
         self.peers.remove(&peer);
+        if self.peers.len() < 2 {
+            self.second_peer_at = None;
+        }
         self.peers.is_empty()
     }
 }
@@ -189,11 +203,14 @@ mod tests {
         let mut r = InflightReq::new(1);
         assert_eq!(r.len(), 1);
         assert!(r.contains_peer(1));
+        assert!(r.second_peer_at.is_none());
         assert!(r.add_peer(2));
         assert!(!r.add_peer(2)); // already present
         assert_eq!(r.len(), 2);
+        assert!(r.second_peer_at.is_some());
         assert!(!r.remove_peer(1));
         assert_eq!(r.len(), 1);
+        assert!(r.second_peer_at.is_none());
         assert!(r.remove_peer(2));
         assert!(r.is_empty());
     }

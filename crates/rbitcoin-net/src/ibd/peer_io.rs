@@ -13,7 +13,7 @@ use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
-use bitcoin::p2p::Magic;
+use bitcoin::p2p::{Magic, ServiceFlags};
 use bitcoin::{Block, BlockHash};
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -40,6 +40,8 @@ pub(crate) enum PeerEvent {
     BlockDecodeFailed { peer: usize, hash: BlockHash },
     /// Peer answered `notfound` for these block hashes (does not have them).
     NotFound { peer: usize, hashes: Vec<BlockHash> },
+    /// Addresses learned from `addr` / `addrv2` (for IBD redial pool growth).
+    Addrs { peer: usize, addrs: Vec<SocketAddr> },
     /// Peer failed or closed.
     Dead { peer: usize, reason: String },
 }
@@ -109,7 +111,7 @@ pub(crate) async fn spawn_peer(
     sinks: PeerEventSinks,
 ) -> Result<PeerSlot, NetError> {
     let stream = TcpStream::connect(addr).await?;
-    let (ver, reader, writer) = connect_and_handshake(
+    let (ver, reader, mut writer) = connect_and_handshake(
         stream,
         magic,
         local,
@@ -121,6 +123,10 @@ pub(crate) async fn spawn_peer(
     // Peer's advertised chain height — used as IBD progress horizon when our
     // local header path has not yet reached the network tip.
     let peer_height = u32::try_from(ver.start_height).unwrap_or(0);
+
+    // Prefer addrv2 + request peer book so IBD redial is not stuck on seeds only.
+    let _ = write_v2_msg_offload(&mut writer, NetworkMessage::SendAddrV2).await;
+    let _ = write_v2_msg_offload(&mut writer, NetworkMessage::GetAddr).await;
 
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<PeerCmd>();
     // Reader → writer for pongs (must not write on the read task — that would
@@ -315,6 +321,27 @@ pub(crate) async fn spawn_peer(
                                             });
                                         }
                                     }
+                                    NetworkMessage::Addr(list) => {
+                                        let addrs = socket_addrs_from_addr(&list);
+                                        if !addrs.is_empty() {
+                                            sinks_d.send_ctrl(PeerEvent::Addrs {
+                                                peer: id,
+                                                addrs,
+                                            });
+                                        }
+                                    }
+                                    NetworkMessage::AddrV2(list) => {
+                                        let addrs = socket_addrs_from_addrv2(&list);
+                                        if !addrs.is_empty() {
+                                            sinks_d.send_ctrl(PeerEvent::Addrs {
+                                                peer: id,
+                                                addrs,
+                                            });
+                                        }
+                                    }
+                                    NetworkMessage::SendAddrV2 => {
+                                        // Peer prefers addrv2; we already sent GetAddr.
+                                    }
                                     other => {
                                         // Framed as block but decode did not yield Block.
                                         if let Some(hash) = framed_err_hash {
@@ -379,4 +406,56 @@ pub(crate) async fn spawn_peer(
         alive: true,
         task,
     })
+}
+
+/// IPv4/IPv6 sockets with full/limited network service from classic `addr`.
+fn socket_addrs_from_addr(list: &[(u32, bitcoin::p2p::address::Address)]) -> Vec<SocketAddr> {
+    let mut out = Vec::with_capacity(list.len().min(32));
+    for (_ts, a) in list {
+        if !services_useful_for_ibd(a.services) {
+            continue;
+        }
+        if let Ok(sa) = a.socket_addr() {
+            if usable_dial_addr(&sa) {
+                out.push(sa);
+            }
+        }
+    }
+    out
+}
+
+/// IPv4/IPv6 sockets with full/limited network service from `addrv2`.
+fn socket_addrs_from_addrv2(list: &[bitcoin::p2p::address::AddrV2Message]) -> Vec<SocketAddr> {
+    let mut out = Vec::with_capacity(list.len().min(32));
+    for a in list {
+        if !services_useful_for_ibd(a.services) {
+            continue;
+        }
+        if let Ok(sa) = a.socket_addr() {
+            if usable_dial_addr(&sa) {
+                out.push(sa);
+            }
+        }
+    }
+    out
+}
+
+fn services_useful_for_ibd(flags: ServiceFlags) -> bool {
+    flags.has(ServiceFlags::NETWORK) || flags.has(ServiceFlags::NETWORK_LIMITED)
+}
+
+fn usable_dial_addr(sa: &SocketAddr) -> bool {
+    if sa.port() == 0 {
+        return false;
+    }
+    match sa {
+        SocketAddr::V4(v4) => {
+            let ip = *v4.ip();
+            !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast()
+        }
+        SocketAddr::V6(v6) => {
+            let ip = *v6.ip();
+            !ip.is_unspecified() && !ip.is_multicast()
+        }
+    }
 }

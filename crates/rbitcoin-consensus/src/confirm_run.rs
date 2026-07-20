@@ -355,6 +355,9 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
         all_spends.extend_from_slice(&p.spends);
     }
 
+    // Unpin Class A parents **before** UTXO apply removes create_fk mappings.
+    let _ = query.unpin_spent_parent_outs(&all_spends);
+
     let t_spent = Instant::now();
     if query.ibd_utxo_enabled() {
         // Per-height order (spends then creates) so H+1 can spend H in the same

@@ -5,6 +5,7 @@ mod catchup;
 mod chain_view;
 mod class_a_cache;
 mod connect;
+mod parent_prewarm;
 mod reconstruct;
 mod run_builder_core;
 mod scripthash;
@@ -38,6 +39,7 @@ pub type QueryError = StoreError;
 pub use catchup::IndexMode;
 pub use class_a_cache::stats as class_a_cache_stats;
 pub use connect::ConfirmPrepared;
+pub use parent_prewarm::{PrewarmStats, PREWARM_BATCH, PREWARM_DEPTH};
 pub use tip_prevout_cache::stats as tip_prevout_cache_stats;
 pub use wave_prevout::WavePrevoutCache;
 

@@ -25,6 +25,7 @@ mod exit;
 mod head_spill;
 mod peer_io;
 mod perf_log;
+mod prewarm;
 mod progress;
 mod state;
 
@@ -50,6 +51,7 @@ use exit::{
     all_peers_dead_action, catchup_complete_after_drain, header_lag_behind_peers, path_drained,
     peer_caught_up, AllPeersDead,
 };
+use prewarm::{spawn_parent_prewarm, PrewarmControl};
 use progress::{ibd_pct, work_chain_progress};
 use state::IbdWorkState;
 
@@ -481,6 +483,14 @@ pub async fn parallel_ibd_cancellable(
         rbitcoin_store::spill_chunk_size()
     );
 
+    // Parent prewarm: high-prio runway worker loads/pins parents for tip+1…tip+1k
+    // so confirm wave-fill hits RAM instead of contending with archive I/O.
+    let prewarm_ctrl = Arc::new(PrewarmControl::new());
+    let mut prewarm_join = Some(spawn_parent_prewarm(
+        Arc::clone(&hub.query),
+        Arc::clone(&prewarm_ctrl),
+    ));
+
     // Dedicated confirm path — never blocks the network/archive event loop.
     let confirm_feed = Arc::new(ConfirmFeed::new());
     // Unbounded: SyncSender(512) deadlocked the confirm OS thread when the main
@@ -689,6 +699,25 @@ pub async fn parallel_ibd_cancellable(
             let tips = work_path_tips(&st);
             let _ = request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
             last_progress = Instant::now();
+        }
+
+        // Publish confirm runway for the parent-prewarm worker (tip+1 … tip+1k).
+        {
+            let tip = hub.tip_height().unwrap_or(0);
+            let arch = st.max_archived_height;
+            let end = tip.saturating_add(rbitcoin_query::PREWARM_DEPTH).min(arch);
+            let mut hashes = Vec::new();
+            if end > tip {
+                hashes.reserve((end - tip) as usize);
+                for h in (tip + 1)..=end {
+                    if let Some(&hash) = st.height_to_hash.get(&h) {
+                        hashes.push(hash.to_byte_array());
+                    } else {
+                        break; // keep contiguous
+                    }
+                }
+            }
+            prewarm_ctrl.publish(tip, arch, hashes);
         }
 
         // Stall only after progress events are applied.
@@ -1091,6 +1120,10 @@ pub async fn parallel_ibd_cancellable(
     // 2) Signal cooperative stops (confirm mid-batch may still finish current wave).
     confirm_feed.request_stop();
     archive_stop.store(true, Ordering::Relaxed);
+    prewarm_ctrl.request_stop();
+    if let Some(h) = prewarm_join.take() {
+        let _ = h.join();
+    }
     if let Some(w) = head_spill_worker.take() {
         w.request_stop();
         drop(w);

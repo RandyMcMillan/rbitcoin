@@ -3,16 +3,16 @@
 //! Holds decoded `TxRecord` + input/output runs.
 //!
 //! **Fill policy:**
-//! - **(A) Confirm-wave prefetch** — before a multi-block confirm, load tip+1…tip+N
-//!   bodies (with ins/outs) so reconstruct hits RAM.
+//! - **(A) Confirm-wave prefetch** — tip+1…tip+N bodies into RAM before connect.
+//! - **(B) Parent prewarm** — runway worker loads external parents for tip+1…tip+~1k
+//!   and **pins** them (per outpoint) until those outs are spent.
 //! - **(C) Not dual-filled on confirm creates** — tip_prevout owns prevout locality.
-//! - **(D) Archive bulk-fill only when lead is small** (tip-follow); off when archive
-//!   races far ahead (avoids FIFO thrash).
-//! - Miss path still notes on cold load.
+//! - **(D) Archive bulk-fill only when lead is small** (tip-follow).
+//! - Miss path notes without evicting when full.
 //!
-//! Prefer [`crate::tip_prevout_cache`] for confirm **prevouts** (outputs only).
-//! Reconstruct / `get_tx_class_a` / `tx_output_run_class_a` stay on this cache.
-//! Kill-safe: pure cache; byte-capped FIFO.
+//! **Eviction:** byte-capped FIFO, but **pinned** parent fks are never dropped.
+//! Prefer [`crate::tip_prevout_cache`] for confirm prevout short-circuit.
+//! Kill-safe: pure process cache.
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
@@ -20,19 +20,20 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// Default RAM budget (~256 MiB). Override with env `RBITCOIN_CLASS_A_CACHE_MB`.
+/// Default RAM budget (~512 MiB). Override with env `RBITCOIN_CLASS_A_CACHE_MB`.
 ///
-/// Was 1 GiB; under IBD with archive lead, thrashing that large a FIFO was worse
-/// than a tighter working set (see signet: hundreds of k evicts/5s).
-pub const DEFAULT_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+/// Sized for confirm runway + pinned parents under deep archive lead.
+pub const DEFAULT_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 pub mod stats {
     use super::*;
     pub static HIT: AtomicU64 = AtomicU64::new(0);
     pub static MISS: AtomicU64 = AtomicU64::new(0);
     pub static EVICT: AtomicU64 = AtomicU64::new(0);
+    pub static PIN: AtomicU64 = AtomicU64::new(0);
+    pub static UNPIN: AtomicU64 = AtomicU64::new(0);
 
-    /// `(hits, misses, evicts)` then reset.
+    /// `(hits, misses, evicts)` then reset (PIN/UNPIN left for diagnostics).
     pub fn sample_and_reset() -> (u64, u64, u64) {
         (
             HIT.swap(0, Ordering::Relaxed),
@@ -59,6 +60,10 @@ struct Inner {
     /// Oldest at front; newest at back.
     order: VecDeque<u64>,
     bytes: usize,
+    /// Pin refcount per `(fk_id, vout)`. Parent stays until all pins released.
+    out_pins: HashMap<(u64, u32), u32>,
+    /// Number of distinct pinned vouts per fk (fast non-evict check).
+    fk_pin_outs: HashMap<u64, u32>,
 }
 
 impl ClassACache {
@@ -68,6 +73,8 @@ impl ClassACache {
                 map: HashMap::new(),
                 order: VecDeque::new(),
                 bytes: 0,
+                out_pins: HashMap::new(),
+                fk_pin_outs: HashMap::new(),
             }),
             budget: budget.max(1024 * 1024), // at least 1 MiB
         }
@@ -287,7 +294,7 @@ impl ClassACache {
         };
         let add = outputs.iter().map(output_bytes).sum::<usize>() + 24;
         let mut g = self.inner.lock().unwrap();
-        if g.bytes.saturating_add(add) > self.budget {
+        if g.bytes.saturating_add(add) > self.budget && !g.is_pinned(id) {
             return; // keep entry thin rather than thrashing the wave set
         }
         let Some(e) = g.map.get_mut(&id) else {
@@ -308,7 +315,7 @@ impl ClassACache {
         };
         let add = inputs.iter().map(input_bytes).sum::<usize>() + 24;
         let mut g = self.inner.lock().unwrap();
-        if g.bytes.saturating_add(add) > self.budget {
+        if g.bytes.saturating_add(add) > self.budget && !g.is_pinned(id) {
             return;
         }
         let Some(e) = g.map.get_mut(&id) else {
@@ -321,17 +328,88 @@ impl ClassACache {
         e.bytes = e.bytes.saturating_add(add);
         g.bytes = g.bytes.saturating_add(add);
     }
+
+    /// Pin parent outpoint so FIFO eviction cannot drop the create tx body.
+    ///
+    /// Call once per future spend that needs this prevout (prewarm / wave).
+    pub fn pin_out(&self, fk: Fk, vout: u32) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        let mut g = self.inner.lock().unwrap();
+        g.pin_out(id, vout);
+        stats::PIN.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Release one pin for `(fk, vout)` after that outpoint is spent.
+    pub fn unpin_out(&self, fk: Fk, vout: u32) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        let mut g = self.inner.lock().unwrap();
+        if g.unpin_out(id, vout) {
+            stats::UNPIN.fetch_add(1, Ordering::Relaxed);
+            g.evict_to_budget(self.budget);
+        }
+    }
+
+    /// Number of distinct pinned parent outpoints (diagnostics).
+    pub fn pinned_out_count(&self) -> usize {
+        self.inner.lock().unwrap().out_pins.len()
+    }
 }
 
 impl Inner {
+    fn is_pinned(&self, id: u64) -> bool {
+        self.fk_pin_outs.get(&id).copied().unwrap_or(0) > 0
+    }
+
+    fn pin_out(&mut self, id: u64, vout: u32) {
+        let c = self.out_pins.entry((id, vout)).or_insert(0);
+        *c = c.saturating_add(1);
+        if *c == 1 {
+            *self.fk_pin_outs.entry(id).or_insert(0) += 1;
+        }
+    }
+
+    /// Returns true if a pin was released.
+    fn unpin_out(&mut self, id: u64, vout: u32) -> bool {
+        let Some(c) = self.out_pins.get_mut(&(id, vout)) else {
+            return false;
+        };
+        *c = c.saturating_sub(1);
+        if *c > 0 {
+            return true;
+        }
+        self.out_pins.remove(&(id, vout));
+        if let Some(n) = self.fk_pin_outs.get_mut(&id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.fk_pin_outs.remove(&id);
+            }
+        }
+        true
+    }
+
     fn evict_to_budget(&mut self, budget: usize) {
+        let mut skipped = 0usize;
+        let n = self.order.len();
         while self.bytes > budget {
+            if skipped >= n || self.order.is_empty() {
+                break; // only pinned entries remain (or empty)
+            }
             let Some(old_id) = self.order.pop_front() else {
                 break;
             };
+            if self.is_pinned(old_id) {
+                self.order.push_back(old_id);
+                skipped += 1;
+                continue;
+            }
             if let Some(e) = self.map.remove(&old_id) {
                 self.bytes = self.bytes.saturating_sub(e.bytes);
                 stats::EVICT.fetch_add(1, Ordering::Relaxed);
+                skipped = 0; // progress
             }
         }
     }
@@ -411,5 +489,26 @@ mod tests {
         assert!(c.approx_bytes() <= c.budget_bytes() + 2048);
         assert!(c.get_tx(Fk(8000)).is_some());
         assert!(c.len() < 8000);
+    }
+
+    #[test]
+    fn pin_protects_from_eviction() {
+        let c = ClassACache::new(1024 * 1024);
+        c.note(Fk(1), tx(1), Some(vec![out(1)]), None);
+        c.pin_out(Fk(1), 0);
+        assert_eq!(c.pinned_out_count(), 1);
+        for i in 2u64..=8000 {
+            let mut t = tx((i & 0xff) as u8);
+            t.txid[0..8].copy_from_slice(&i.to_le_bytes());
+            let o = OutputRecord {
+                value: 1,
+                script: vec![0x6a; 512],
+            };
+            c.note(Fk(i), t, Some(vec![o]), None);
+        }
+        // Pinned parent must survive the flood.
+        assert!(c.get_tx(Fk(1)).is_some());
+        c.unpin_out(Fk(1), 0);
+        assert_eq!(c.pinned_out_count(), 0);
     }
 }

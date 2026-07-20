@@ -348,6 +348,12 @@ impl Query {
             let t_tip = Instant::now();
             self.tip_prevout_cache
                 .note_live_slots(w.fk, w.tx.clone(), &w.slots);
+            // Pin live prevouts until the spending input is Class-C confirmed.
+            for (v, slot) in w.slots.iter().enumerate() {
+                if slot.is_some() {
+                    self.class_a_cache.pin_out(w.fk, v as u32);
+                }
+            }
             wf_add(&wf::TIP_NOTE_NS, t_tip.elapsed().as_nanos() as u64);
 
             wave.insert_parent_slots(w.fk, w.tx, w.slots, Some(cb_h));

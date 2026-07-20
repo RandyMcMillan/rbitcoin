@@ -125,6 +125,24 @@ pub mod connect_prevout_stats {
     }
 }
 
+/// Light UTXO diagnostics (reset by the IBD sampler).
+pub mod ibd_utxo_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Confirm heal: apply failed → full `rebuild_ibd_utxo_to_tip`.
+    pub static REBUILD_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    /// Rebuilds in the last sample window (then reset).
+    pub fn sample_rebuilds_and_reset() -> u64 {
+        REBUILD_COUNT.swap(0, Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn note_rebuild() {
+        REBUILD_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Wave-fill sub-phase wall times (nanoseconds; reset by the IBD sampler).
 ///
 /// Breaks down the dominant `wave_fill` recon cost: body vs parent warm vs spent
@@ -337,6 +355,23 @@ impl Query {
 
     pub fn ibd_utxo_enabled(&self) -> bool {
         self.ibd_utxo.lock().unwrap().is_some()
+    }
+
+    /// Snapshot for IBD perf: `(enabled, live_count, utxo_tip, rebuilds_this_window)`.
+    ///
+    /// `rebuilds_this_window` samples-and-resets [`ibd_utxo_stats::REBUILD_COUNT`].
+    pub fn ibd_utxo_perf_snapshot(&self) -> (bool, u64, Option<u32>, u64) {
+        let rebuilds = ibd_utxo_stats::sample_rebuilds_and_reset();
+        let g = self.ibd_utxo.lock().unwrap();
+        match *g {
+            Some(ref u) => (true, u.live_count(), u.tip(), rebuilds),
+            None => (false, 0, None, rebuilds),
+        }
+    }
+
+    /// Count a confirm-path UTXO heal (apply failed → rebuild).
+    pub fn note_ibd_utxo_rebuild(&self) {
+        ibd_utxo_stats::note_rebuild();
     }
 
     /// True if outpoint is spent on the **catch-up** oracle (spend_index off).

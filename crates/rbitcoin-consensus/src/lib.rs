@@ -126,14 +126,15 @@ pub mod confirm_phase_stats {
     pub static SCRIPT_NS: AtomicU64 = AtomicU64::new(0);
     /// Class C wall (`confirm_blocks_run` total).
     pub static CLASS_C_NS: AtomicU64 = AtomicU64::new(0);
-    /// Process-local spend set updates (when durable points are off).
-    pub static SPENT_LOCAL_NS: AtomicU64 = AtomicU64::new(0);
+    /// Post–Class C catch-up oracle apply: mmap UTXO spends/creates (or
+    /// `spent_local` HashSet when UTXO is off). Logged as `utxo_ms` / us/blk `utxo`.
+    pub static UTXO_APPLY_NS: AtomicU64 = AtomicU64::new(0);
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
 
     /// Sample and reset all confirm phases.
     ///
     /// Returns
-    /// `(recon, prefetch, wave_fill, wire, connect, script, class_c, strong, scripthash, tip, spent_local, blocks)`.
+    /// `(recon, prefetch, wave_fill, wire, connect, script, class_c, strong, scripthash, tip, utxo_apply, blocks)`.
     /// `strong` / `scripthash` / `tip` come from [`rbitcoin_query::class_c_phase_stats`]
     /// (sub-phases inside Class C). `recon` is the sum of the three reconstruct sub-timers.
     pub fn sample_and_reset()
@@ -176,7 +177,7 @@ pub mod confirm_phase_stats {
             strong,
             sh,
             tip,
-            SPENT_LOCAL_NS.swap(0, Ordering::Relaxed),
+            UTXO_APPLY_NS.swap(0, Ordering::Relaxed),
             BLOCKS.swap(0, Ordering::Relaxed),
         )
     }
@@ -473,6 +474,7 @@ pub fn confirm_archived_run(
             Ok(())
         })();
         if let Err(_e) = apply_res {
+            query.note_ibd_utxo_rebuild();
             query
                 .rebuild_ibd_utxo_to_tip()
                 .map_err(ConsensusError::Store)?;
@@ -480,7 +482,7 @@ pub fn confirm_archived_run(
     } else {
         query.note_outpoints_spent_local(&all_spends);
     }
-    confirm_phase_stats::SPENT_LOCAL_NS
+    confirm_phase_stats::UTXO_APPLY_NS
         .fetch_add(t_spent.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
     // Only after successful Class C: drop spent vouts from tip_prevout so the

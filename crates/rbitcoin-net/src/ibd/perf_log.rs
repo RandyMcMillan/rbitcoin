@@ -4,8 +4,8 @@
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
-//! | INFO  | `ibd: perf …` | Pipeline health + coarse confirm phases + loop mix + live batch |
-//! | DEBUG | `ibd: perf_dbg …` | us/blk, wave/SH subtimers, caches, pipe, loop extras |
+//! | INFO  | `ibd: perf …` | Pipeline health + coarse confirm (incl. `class_c_ms`, `utxo_ms`) + loop mix + live batch |
+//! | DEBUG | `ibd: perf_dbg …` | us/blk (incl. `utxo=`), wave/SH subtimers, caches, pipe, `utxo live/tip/rebuilds`, loop extras |
 //!
 //! `ibd: progress` stays separate (~1s on tip/arch delta). WARN/ERROR unchanged.
 //!
@@ -55,9 +55,12 @@ pub(crate) struct IbdPerfSample {
     pub wire_ms: u64,
     pub connect_ms: u64,
     pub script_ms: u64,
+    pub class_c_ms: u64,
     pub strong_ms: u64,
     pub sh_ms: u64,
     pub tip_ms: u64,
+    /// Post–Class C mmap UTXO apply (or spent_local HashSet when UTXO off).
+    pub utxo_ms: u64,
     // raw ns for us/blk
     pub recon_ns: u64,
     pub prefetch_ns: u64,
@@ -69,7 +72,15 @@ pub(crate) struct IbdPerfSample {
     pub strong_ns: u64,
     pub sh_ns: u64,
     pub tip_ns: u64,
-    pub spent_local_ns: u64,
+    pub utxo_apply_ns: u64,
+
+    // Light UTXO snapshot (not phase timers)
+    pub utxo_enabled: bool,
+    pub utxo_live: u64,
+    /// mmap UTXO tip height; `None` if empty/disabled.
+    pub utxo_tip: Option<u32>,
+    /// Confirm heals this window (apply failed → full rebuild).
+    pub utxo_rebuilds: u64,
 
     // Wave-fill sub
     pub wf_body_ms: u64,
@@ -140,9 +151,11 @@ impl Default for IbdPerfSample {
             wire_ms: 0,
             connect_ms: 0,
             script_ms: 0,
+            class_c_ms: 0,
             strong_ms: 0,
             sh_ms: 0,
             tip_ms: 0,
+            utxo_ms: 0,
             recon_ns: 0,
             prefetch_ns: 0,
             wave_ns: 0,
@@ -153,7 +166,11 @@ impl Default for IbdPerfSample {
             strong_ns: 0,
             sh_ns: 0,
             tip_ns: 0,
-            spent_local_ns: 0,
+            utxo_apply_ns: 0,
+            utxo_enabled: false,
+            utxo_live: 0,
+            utxo_tip: None,
+            utxo_rebuilds: 0,
             wf_body_ms: 0,
             wf_ptx_ms: 0,
             wf_pout_ms: 0,
@@ -205,6 +222,8 @@ pub(crate) fn sample(
     hole: usize,
     peers: usize,
     headers_done: bool,
+    // (enabled, live, tip, rebuilds) from Query::ibd_utxo_perf_snapshot.
+    utxo: (bool, u64, Option<u32>, u64),
 ) -> IbdPerfSample {
     let hot = loop_stats.sample_and_reset();
     let (
@@ -218,7 +237,7 @@ pub(crate) fn sample(
         strong_ns,
         sh_ns,
         tip_ns,
-        spent_local_ns,
+        utxo_apply_ns,
         phase_blks,
     ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
     let (sh_warm, sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head, sh_index) =
@@ -229,6 +248,7 @@ pub(crate) fn sample(
     let (tph, tpm, tpe, tpn, tpr) = rbitcoin_query::tip_prevout_cache_stats::sample_and_reset();
     let (pth, pwh, pca, psm) = rbitcoin_query::connect_prevout_stats::sample_and_reset();
     let pipe = pipe_stats.sample_and_reset();
+    let (utxo_enabled, utxo_live, utxo_tip, utxo_rebuilds) = utxo;
 
     IbdPerfSample {
         inflight,
@@ -261,9 +281,11 @@ pub(crate) fn sample(
         wire_ms: ns_ms(wire_ns),
         connect_ms: ns_ms(connect_ns),
         script_ms: ns_ms(script_ns),
+        class_c_ms: ns_ms(class_c_ns),
         strong_ms: ns_ms(strong_ns),
         sh_ms: ns_ms(sh_ns),
         tip_ms: ns_ms(tip_ns),
+        utxo_ms: ns_ms(utxo_apply_ns),
         recon_ns,
         prefetch_ns,
         wave_ns: wave_fill_ns,
@@ -274,7 +296,11 @@ pub(crate) fn sample(
         strong_ns,
         sh_ns,
         tip_ns,
-        spent_local_ns,
+        utxo_apply_ns,
+        utxo_enabled,
+        utxo_live,
+        utxo_tip,
+        utxo_rebuilds,
         wf_body_ms: ns_ms(wf_body),
         wf_ptx_ms: ns_ms(wf_ptx),
         wf_pout_ms: ns_ms(wf_pout),
@@ -322,9 +348,9 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.headers_done,
         s.peers,
     );
-    // Coarse confirm (strong/sh/tip — not duplicate class_c wall).
+    // Coarse confirm: recon split + connect/script + class_c + SH/tip + UTXO apply.
     out.push_str(&format!(
-        " | blks={} recon_ms={}(p={} w={} wire={}) connect_ms={} script_ms={} strong_ms={} sh_ms={} tip_ms={}",
+        " | blks={} recon_ms={}(p={} w={} wire={}) connect_ms={} script_ms={} class_c_ms={} strong_ms={} sh_ms={} tip_ms={} utxo_ms={}",
         s.phase_blks,
         s.recon_ms,
         s.prefetch_ms,
@@ -332,9 +358,11 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.wire_ms,
         s.connect_ms,
         s.script_ms,
+        s.class_c_ms,
         s.strong_ms,
         s.sh_ms,
         s.tip_ms,
+        s.utxo_ms,
     ));
     out.push_str(&format!(
         " | dominant={} confirm_ms={} assign_ms={} getdata={} drain_ms={}",
@@ -356,7 +384,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let denom = s.phase_blks.max(1);
     let us = |ns: u64| (ns / denom) / 1000;
     let mut out = format!(
-        "ibd: perf_dbg us/blk recon={} prefetch={} wave={} wire={} connect={} script={} class_c={} strong={} sh={} tip={} spent_local={}",
+        "ibd: perf_dbg us/blk recon={} prefetch={} wave={} wire={} connect={} script={} class_c={} strong={} sh={} tip={} utxo={}",
         us(s.recon_ns),
         us(s.prefetch_ns),
         us(s.wave_ns),
@@ -367,7 +395,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         us(s.strong_ns),
         us(s.sh_ns),
         us(s.tip_ns),
-        us(s.spent_local_ns),
+        us(s.utxo_apply_ns),
     );
     out.push_str(&format!(
         " | wave body={} ptx={} pout={} spent={} cb={} tip_note={}",
@@ -451,6 +479,18 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.pipe.write_coalesce_ms(),
         s.pipe.prep_ms(),
     ));
+    if s.utxo_enabled {
+        out.push_str(&format!(
+            " | utxo live={} tip={} rebuilds={}",
+            s.utxo_live,
+            s.utxo_tip
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "none".into()),
+            s.utxo_rebuilds,
+        ));
+    } else {
+        out.push_str(&format!(" | utxo off rebuilds={}", s.utxo_rebuilds));
+    }
     out.push_str(&format!(
         " | loop confirm_blks={} confirm_us/blk={} reject_stops={} events={} status_scan_ms={}",
         s.confirm_blocks,
@@ -486,6 +526,8 @@ mod tests {
         s.prefetch_ms = 10;
         s.wave_ms = 80;
         s.wire_ms = 10;
+        s.class_c_ms = 40;
+        s.utxo_ms = 25;
         s.dominant = "confirm";
         s.live = Some((100, 32, 1500));
         s.confirm_reject_stops = 2;
@@ -495,12 +537,15 @@ mod tests {
         assert!(line.contains("arch_q=10"), "{line}");
         assert!(line.contains("blks=32"), "{line}");
         assert!(line.contains("recon_ms=100(p=10 w=80 wire=10)"), "{line}");
+        assert!(line.contains("class_c_ms=40"), "{line}");
+        assert!(line.contains("utxo_ms=25"), "{line}");
         assert!(line.contains("dominant=confirm"), "{line}");
         assert!(line.contains("reject_stops=2"), "{line}");
         assert!(line.contains("live first=100 batch=32 elapsed_ms=1500"), "{line}");
         // No separate legacy prefixes.
         assert!(!line.contains("confirm_phases"));
         assert!(!line.contains("wave_fill_phases"));
+        assert!(!line.contains("spent_local"), "{line}");
     }
 
     #[test]
@@ -508,19 +553,27 @@ mod tests {
         let mut s = IbdPerfSample::default();
         s.phase_blks = 10;
         s.recon_ns = 10_000_000; // 1ms/blk → 1000 us/blk
+        s.utxo_apply_ns = 5_000_000; // 500 us/blk
         s.wf_spent_ms = 50;
         s.ca_hit = 90;
         s.ca_miss = 10;
         s.pipe.write_blocks = 5;
         s.pipe.write_ns = 5_000_000;
+        s.utxo_enabled = true;
+        s.utxo_live = 12_345;
+        s.utxo_tip = Some(100);
+        s.utxo_rebuilds = 0;
         let line = format_debug(&s);
         assert!(line.starts_with("ibd: perf_dbg "), "{line}");
         assert!(line.contains("us/blk recon="), "{line}");
+        assert!(line.contains("utxo=500"), "{line}"); // us/blk
+        assert!(!line.contains("spent_local"), "{line}");
         assert!(line.contains("wave body="), "{line}");
-        assert!(line.contains("spent=50"), "{line}");
+        assert!(line.contains("spent=50"), "{line}"); // wave spent filter subtimer
         assert!(line.contains("ca hit=90 miss=10"), "{line}");
         assert!(line.contains("hit%=90"), "{line}");
         assert!(line.contains("pipe "), "{line}");
+        assert!(line.contains("utxo live=12345 tip=100 rebuilds=0"), "{line}");
         assert!(line.contains("loop "), "{line}");
     }
 }

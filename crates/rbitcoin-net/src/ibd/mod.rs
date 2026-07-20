@@ -812,6 +812,7 @@ pub async fn parallel_ibd_cancellable(
             let arch_q_now = archive_queued.count();
 
             // One sample/reset, then INFO `ibd: perf` (+ DEBUG `ibd: perf_dbg`).
+            let utxo_snap = hub.query.ibd_utxo_perf_snapshot();
             let perf = perf_log::sample(
                 &loop_stats,
                 &pipe_stats,
@@ -827,6 +828,7 @@ pub async fn parallel_ibd_cancellable(
                 prog.tip_hole,
                 peers_n,
                 st.headers_done,
+                utxo_snap,
             );
             perf_log::log_sample(&perf);
 

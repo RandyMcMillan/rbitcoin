@@ -170,7 +170,7 @@ Present today vs needed for public-chain accept:
 
 ### 1.2 Electrum protocol checklist (product requirement)
 
-Target: **Electrum protocol 1.4+** (ElectrumX-style scripthash API). Transport: **TCP + TLS**.
+Target: **Electrum protocol 1.4+** (ElectrumX-style scripthash API). Transport: **plain TCP** (TLS via reverse proxy).
 
 | # | Requirement | Notes | Phase |
 |---|-------------|-------|-------|
@@ -362,13 +362,13 @@ Policy: **do not implement BIP9 / version-bits “deployment windows” as a sep
 | 4 | headers.subscribe (tip bus ready; push when tip_tx fed) | ✅ foundation |
 | 5 | `--electrum-listen` on node | ✅ |
 | 6 | Protocol fixture test | ✅ |
-| 7 | TLS listener | ⬜ later |
+| 7 | TLS listener | ✅ external (nginx/caddy; not in-process) |
 | 8 | Live peer broadcast for transaction.broadcast | ⬜ returns txid only for now |
 
 **Exit**
 
 - Confirmed Electrum API works against local chain. ✅
-- Wallet smoke on signet / TLS / peer broadcast: Phase 8 polish.
+- Wallet smoke on signet / peer broadcast: Phase 8 polish.
 
 ---
 
@@ -380,7 +380,7 @@ Policy: **do not implement BIP9 / version-bits “deployment windows” as a sep
 
 1. Minimal Core-like RPC: blockchain info, getblock (reconstruct), getrawtransaction, peers, stop.
 2. Inbound limits, DoS, logging, metrics, config polish.
-3. OPERATOR.md: IBD, serving peers, Electrum ports/TLS, reconstruct model, limitations.
+3. OPERATOR.md: IBD, serving peers, Electrum TCP (TLS external), reconstruct model, limitations.
 4. Sign-off §1.1 + §1.2 required rows; update COMPAT.md.
 5. Release label: **“mainnet blocks-only + Electrum (confirmed)”**.
 
@@ -458,7 +458,7 @@ Policy: **do not implement BIP9 / version-bits “deployment windows” as a sep
 | **Done Phase 5 core** | Tip follow (`follow_from` + announce); cmpct→getdata; most-work reorg foundation |
 | **Done Phase 6 core** | Wire ring (multi-tip), archive epoch, scripthash index |
 | **Done Phase 7 core** | Electrum TCP server + protocol fixtures |
-| **Documented gaps** | §3.1; Electrum TLS + live broadcast deferred |
+| **Documented gaps** | §3.1; Electrum TLS is external (proxy) |
 | **IBD ladder** | OPERATOR.md: signet lab → fix → mainnet experimental → full |
 | **Next** | Signet lab gate, then Phase 8 hardening |
 

@@ -59,7 +59,7 @@ pub(crate) struct IbdPerfSample {
     pub strong_ms: u64,
     pub sh_ms: u64,
     pub tip_ms: u64,
-    /// Post–Class C mmap UTXO apply (or spent_local HashSet when UTXO off).
+    /// Post–Class C light UTXO apply (catch-up only).
     pub utxo_ms: u64,
     // raw ns for us/blk
     pub recon_ns: u64,

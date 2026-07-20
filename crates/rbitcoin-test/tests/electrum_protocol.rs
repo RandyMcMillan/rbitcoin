@@ -152,8 +152,10 @@ fn backfill_tx_head_and_points_after_index_off() {
     let params = ChainParams::regtest();
 
     // Simulate milestone IBD: no durable tx.head / points; scripthash still on.
+    // Catch-up spentness is light UTXO only (required when spend_index off).
     q.set_tx_index(false);
     q.set_spend_index(false);
+    q.enable_ibd_utxo().unwrap();
 
     let g = regtest_genesis();
     accept_and_connect_block(&q, &params, Height::GENESIS, &g, Milestone::NONE).unwrap();
@@ -187,9 +189,11 @@ fn backfill_tx_head_and_points_after_index_off() {
 
     let inserted = q.backfill_tx_index(|_, _, _| {}).unwrap();
     assert!(inserted >= 6, "inserted {inserted}");
+    // Tip-mode: re-enable durable head lookups (matches enter_tip_mode).
+    q.set_tx_index(true);
     assert!(
         q.get_tx_by_txid(&cb_txid).unwrap().is_some(),
-        "txid resolves after tx.head backfill"
+        "txid resolves after tx.head backfill + tx_index on"
     );
 
     q.set_spend_index(true);

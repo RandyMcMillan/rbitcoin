@@ -105,7 +105,7 @@ threads. Can compete with the compositor. Usually less “hard freeze” than di
 | Lock | Risk |
 |------|------|
 | Per-`TableFile` map/file mutexes | Contended if confirm reads during Class A grow |
-| Light UTXO mutex / `spent_local` HashSet | Fine-grained; not multi-second |
+| Light UTXO mutex (`ibd_utxo.map`) | Fine-grained; not multi-second |
 | `ClassACache` mutex | Hot under confirm; stalls confirm, not usually whole host |
 | `ChainHub::confirmed` RwLock | Cheap |
 

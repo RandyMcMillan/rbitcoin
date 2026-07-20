@@ -168,7 +168,7 @@ impl Query {
             let fk = Fk(*pid);
 
             // Tip short-circuit only when **complete** (all needed live) and none
-            // are catch-up spent (UTXO miss / spent_local).
+            // are catch-up spent (UTXO miss).
             let tip_complete = !needed_vouts.is_empty()
                 && needed_vouts
                     .iter()

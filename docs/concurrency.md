@@ -25,7 +25,7 @@ Prep never holds store write locks. The writer is the sole Class A producer for 
 ## Locks
 
 - Store tables use fine-grained `Mutex`es per file/head (see `rbitcoin-store`).
-- `Query::txid_to_fk` is a process-local `Mutex<HashMap>` for prevout resolution when durable `tx.head` is off.
+- Catch-up spentness / parent create_fk: `Query` light UTXO (`ibd_utxo.map` mmap under a mutex). No process-local spent HashSet.
 - `ChainHub::confirmed` is `RwLock<HashSet>` for O(1) `has_block` during IBD.
 
 ## Practical rules

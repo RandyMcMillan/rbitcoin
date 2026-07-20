@@ -277,7 +277,7 @@ pub fn validate_block_connect(
     }
 
     let check_scripts = !ctx.milestone.skips_scripts_at(ctx.height.0);
-    // Pending until connect+scripts succeed — do not poison spent_local on failure.
+    // Pending until connect+scripts succeed — do not apply UTXO / points on failure.
     let mut pending = std::collections::HashSet::new();
     let mut pending_creates = std::collections::HashMap::new();
     let (script_jobs, spends, _creates) = connect_block_prevouts(
@@ -292,19 +292,7 @@ pub fn validate_block_connect(
     if check_scripts && !script_jobs.is_empty() {
         verify_scripts_pool(&script_jobs)?;
     }
-    // Catch-up spentness is applied only after Class C succeeds.
-    // Applying UTXO here (before `connect_block` / `confirm_blocks_run`) left the
-    // oracle ahead of tip when Class C failed, and the retry hit
-    // `ibd utxo duplicate create` (mainnet log @519).
-    //
-    // Single-block `accept_and_connect_block` applies after Class C below.
-    // Multi-block `confirm_archived_run` applies after its Class C batch.
-    // Hold spends for the caller when UTXO is off — still note local only after
-    // Class C in those paths. For this connect-only entry, note local spends
-    // only when UTXO is disabled (legacy single-step tests that never Class C).
-    if !query.ibd_utxo_enabled() {
-        query.note_outpoints_spent_local(&spends);
-    }
+    // Catch-up UTXO is applied only after Class C succeeds (see confirm path).
     let _ = spends;
     Ok(())
 }
@@ -364,7 +352,7 @@ pub struct ScriptCheckJob {
 
 /// Sequential connect: resolve prevouts and fee checks; build script jobs.
 ///
-/// Spent outpoints go into `pending_spent` (not `spent_local`) so a failed
+/// Spent outpoints go into `pending_spent` (run-local only) so a failed
 /// script check can drop them without poisoning the next attempt.
 ///
 /// `pending_creates` maps outpoints created earlier in this confirm run →
@@ -426,19 +414,12 @@ pub(crate) fn connect_block_prevouts(
         Option<u32>,
     > = std::collections::HashMap::with_capacity(64);
 
-    // Spent checks (hybrid, same order as wave_fill / is_outpoint_spent):
-    // - pending_spent: this confirm run
-    // - spent_local: always recorded after successful Class C
-    // - durable has_confirmed_strong_spender when spend_index on
-    // Tip/wave "live" only skips durable when neither local nor durable marks spent.
+    // Spent checks:
+    // - pending_spent: this confirm run (ephemeral)
+    // - catch-up: light UTXO via catchup_is_spent
+    // - tip: durable has_confirmed_strong_spender (source of truth; no tip-live
+    //   short-circuit — that needed spent_local as a safety net)
     let spend_index_on = query.spend_index_enabled();
-    // When spend_index off, catch-up oracle is mmap UTXO / spent_local (via
-    // catchup_is_spent). When on, hold spent_local for hybrid short-circuit.
-    let spent_local = if spend_index_on {
-        Some(query.lock_spent_local())
-    } else {
-        None
-    };
 
     for (ti, tx) in block.txdata.iter().enumerate() {
         let spend_fk = archived_tx_fks.map(|fks| fks[ti]);
@@ -486,8 +467,13 @@ pub(crate) fn connect_block_prevouts(
                 if pending_spent.contains(&key) {
                     return Err(ConsensusError::PrevoutSpent);
                 }
-                if let Some(ref local) = spent_local {
-                    if local.contains(&key) {
+                if spend_index_on {
+                    // Tip mode: durable confirmed-strong points only.
+                    if query
+                        .store()
+                        .has_confirmed_strong_spender(op.txid.as_byte_array(), op.vout)
+                        .map_err(ConsensusError::Store)?
+                    {
                         return Err(ConsensusError::PrevoutSpent);
                     }
                 } else if !pending_creates.contains_key(&key)
@@ -495,7 +481,7 @@ pub(crate) fn connect_block_prevouts(
                         .catchup_is_spent(op.txid.as_byte_array(), op.vout)
                         .map_err(ConsensusError::Store)?
                 {
-                    // mmap UTXO miss (and not a same-run create) or spent_local hit.
+                    // Catch-up: light UTXO miss (and not a same-run create).
                     return Err(ConsensusError::PrevoutSpent);
                 }
                 let prev_fk = thin
@@ -509,24 +495,6 @@ pub(crate) fn connect_block_prevouts(
                             .ok()
                             .flatten()
                     });
-                // Durable spent probe (spend_index on). Tip/wave live is a
-                // performance hint only after local miss — still verify durable
-                // when not tip-live (cold parents). When tip-live, write-through
-                // retirement after Class C keeps the slot absent if spent.
-                if spend_index_on {
-                    let cached_live = wave_prevouts
-                        .map(|w| w.has_live_output_txid(op.txid.as_byte_array(), op.vout))
-                        .unwrap_or(false)
-                        || query.tip_prevout_has_live(op.txid.as_byte_array(), op.vout);
-                    if !cached_live
-                        && query
-                            .store()
-                            .has_confirmed_strong_spender(op.txid.as_byte_array(), op.vout)
-                            .map_err(ConsensusError::Store)?
-                    {
-                        return Err(ConsensusError::PrevoutSpent);
-                    }
-                }
                 let prev_out = resolve_prevout(
                     query,
                     op,
@@ -601,7 +569,6 @@ pub(crate) fn connect_block_prevouts(
         }
         same_block.insert(txid, outs);
     }
-    drop(spent_local); // release before return
 
     let subsidy = block_subsidy(ctx.height.0, ctx.params);
     let mut coinbase_out = 0i64;

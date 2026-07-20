@@ -1,5 +1,5 @@
 //! Catch-up point (spend) edges via sorted runs. Confirm uses complete
-//! light UTXO / process-local spentness; durable multimap is materialized at tip mode.
+//! light UTXO spentness; durable multimap is materialized at tip mode.
 
 use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;

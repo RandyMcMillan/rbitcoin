@@ -126,8 +126,8 @@ pub mod confirm_phase_stats {
     pub static SCRIPT_NS: AtomicU64 = AtomicU64::new(0);
     /// Class C wall (`confirm_blocks_run` total).
     pub static CLASS_C_NS: AtomicU64 = AtomicU64::new(0);
-    /// Post–Class C catch-up oracle apply: mmap UTXO spends/creates (or
-    /// `spent_local` HashSet when UTXO is off). Logged as `utxo_ms` / us/blk `utxo`.
+    /// Post–Class C catch-up oracle apply: mmap UTXO spends/creates.
+    /// Logged as `utxo_ms` / us/blk `utxo`.
     pub static UTXO_APPLY_NS: AtomicU64 = AtomicU64::new(0);
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
 
@@ -198,7 +198,7 @@ pub fn confirm_archived_at(
 /// Confirm a contiguous tip-extension run of archived bodies.
 ///
 /// When archive leads tip (the post-milestone IBD case), a multi-height run:
-/// 1. Connects sequentially (pending spends — no `spent_local` poison on failure)
+/// 1. Connects sequentially (run-local pending spends — no UTXO poison on failure)
 /// 2. Runs **one** rayon script wave across **all** inputs in the run (fills cores
 ///    even when single blocks under-utilize workers)
 /// 3. Class C in height order
@@ -476,14 +476,14 @@ pub fn confirm_archived_run(
     confirm_phase_stats::CLASS_C_NS
         .fetch_add(t_class_c.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-    // Collect spends once (spent_local + tip_prevout retirement).
+    // Collect spends once (tip_prevout retirement).
     // Note: `p.tx_fks` was moved into `items` for Class C — do not read it here.
     let mut all_spends: Vec<([u8; 32], u32)> = Vec::new();
     for p in &prepared {
         all_spends.extend_from_slice(&p.spends);
     }
 
-    // Update catch-up spentness oracle + tip_prevout after Class C success.
+    // Catch-up: apply light UTXO after Class C success (tip mode uses durable points).
     let t_spent = Instant::now();
     if query.ibd_utxo_enabled() {
         // Per-height order (spends then creates) so H+1 can spend H in the same
@@ -512,8 +512,6 @@ pub fn confirm_archived_run(
                 .rebuild_ibd_utxo_to_tip()
                 .map_err(ConsensusError::Store)?;
         }
-    } else {
-        query.note_outpoints_spent_local(&all_spends);
     }
     confirm_phase_stats::UTXO_APPLY_NS
         .fetch_add(t_spent.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -585,16 +583,16 @@ pub fn accept_and_connect_block(
     let fk = query
         .connect_block(height, &header_rec, &txs)
         .map_err(ConsensusError::Store)?;
-    // mmap UTXO only after Class C (same order as `confirm_archived_run`).
-    if query.ibd_utxo_enabled() {
+    // Post Class C (same order as `confirm_archived_run`): UTXO apply + tip_prevout retire.
+    let mut spends = Vec::new();
+    let mut creates = Vec::new();
+    if query.ibd_utxo_enabled() || query.spend_index_enabled() {
         let tx_fks = query
             .store()
             .header_txs
             .get_list(fk)
             .map_err(ConsensusError::Store)?
             .ok_or(ConsensusError::Store(StoreError::NotFound))?;
-        let mut spends = Vec::new();
-        let mut creates = Vec::new();
         for (ti, tx) in block.txdata.iter().enumerate() {
             let tid = txids[ti];
             let create_fk = tx_fks.get(ti).copied().unwrap_or(rbitcoin_primitives::Fk::NULL);
@@ -604,13 +602,21 @@ pub fn accept_and_connect_block(
                     spends.push((op.txid.to_byte_array(), op.vout));
                 }
             }
-            for (v, _) in tx.output.iter().enumerate() {
-                creates.push((tid, v as u32, create_fk));
+            if query.ibd_utxo_enabled() {
+                for (v, _) in tx.output.iter().enumerate() {
+                    creates.push((tid, v as u32, create_fk));
+                }
             }
         }
+    }
+    if query.ibd_utxo_enabled() {
         query
             .apply_ibd_utxo_block(&spends, &creates, height.0)
             .map_err(ConsensusError::Store)?;
+    }
+    // Keep tip_prevout write-through accurate for tests / tip-follow connect.
+    if !spends.is_empty() {
+        query.retire_tip_prevout_spends(&spends);
     }
     Ok(fk)
 }

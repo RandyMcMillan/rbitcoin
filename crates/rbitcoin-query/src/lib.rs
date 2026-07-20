@@ -26,7 +26,7 @@ use rbitcoin_store::{
     script_hash, HeaderRecord, IbdUtxo, InputRecord, OutputRecord, PointRecord, ScriptHashRecord,
     Store, StoreError, TxRecord,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
@@ -206,27 +206,18 @@ pub struct ResumeWorkEntry {
 pub struct Query {
     store: Store,
     /// When false, archive **and** confirm skip durable Class B point (spend) writes.
-    /// Confirm always tracks spends in [`Self::spent_local`] (hybrid wave_fill /
-    /// double-spend checks); durable probes run only on local miss when this is on.
+    /// Catch-up spentness is light UTXO only; tip mode uses durable points + strong.
     /// Re-enable + [`Self::backfill_point_spends`] after catch-up (before Electrum).
     spend_index: std::sync::atomic::AtomicBool,
     /// When false, archive skips durable `tx.head` inserts (main archive cost).
     /// Parent resolve during catch-up uses light UTXO create_fk (not a txid map).
     tx_index: std::sync::atomic::AtomicBool,
-    /// Process-local spent outpoints for best-chain tip (Core spentness when
-    /// durable `point.head` probes are off). Key: (prev_txid, prev_vout).
-    /// Must be **complete** for heights 0..=tip before any confirm when
-    /// [`Self::spend_index_enabled`] is false — see [`Self::spent_local_ready`].
-    spent_local: Mutex<HashSet<([u8; 32], u32)>>,
-    /// When false and spend index is off, confirm is hard-blocked (no double-spend hole).
-    spent_local_ready: std::sync::atomic::AtomicBool,
     /// Process-local scripthash → body head fk (confirm append path; avoids durable chain walks).
     sh_heads: Mutex<HashMap<[u8; 32], Fk>>,
     /// Last height whose SH creates were enqueued/written **after tip commit**.
     /// `u64::MAX` = none. Replaces unbounded `sh_tx_indexed` HashSet.
     sh_indexed_through: AtomicU64,
     /// Byte-capped Class A working set (tx + runs) for confirm connect / reconstruct.
-    /// Still filled on archive; likely demoted once tip_prevout proves out.
     class_a_cache: class_a_cache::ClassACache,
     /// Tip-window create txs + outputs filled **as we confirm** (and when
     /// resolving parents during connect). FIFO; independent of archive lead.
@@ -237,7 +228,7 @@ pub struct Query {
     tx_run: tx_run_builder::TxRunBuilder,
     /// Catch-up point edges via sorted runs.
     point_run: point_run_builder::PointRunBuilder,
-    /// mmap unspent-outpoint set for catch-up spentness (replaces huge spent_local).
+    /// Catch-up spentness: mmap unspent outpoint → create Class A fk.
     ibd_utxo: Mutex<Option<IbdUtxo>>,
 }
 
@@ -254,9 +245,6 @@ impl Query {
             );
         }
         let store_path = store.path().to_path_buf();
-        // Empty tip → local is vacuously complete. Non-empty tip needs rebuild
-        // before local-only spentness (spend_index off) may confirm.
-        let tip_empty = store.tip_height().is_none();
         // SH watermark: on resume, assume 0..=tip already had SH work committed with tip.
         let sh_through = store
             .tip_height()
@@ -266,8 +254,6 @@ impl Query {
             store,
             spend_index: std::sync::atomic::AtomicBool::new(true),
             tx_index: std::sync::atomic::AtomicBool::new(true),
-            spent_local: Mutex::new(HashSet::new()),
-            spent_local_ready: std::sync::atomic::AtomicBool::new(tip_empty),
             sh_heads: Mutex::new(HashMap::new()),
             sh_indexed_through: AtomicU64::new(sh_through),
             class_a_cache: class_a_cache::ClassACache::from_env(),
@@ -322,13 +308,8 @@ impl Query {
             }
             (t, s, _) if t == s => {
                 // Consistent — ready without rebuild.
-                self.spent_local_ready
-                    .store(true, std::sync::atomic::Ordering::Release);
             }
             (Some(ut), Some(st), _) if ut < st => {
-                // Short replay below after unlock — mark not ready until done.
-                self.spent_local_ready
-                    .store(false, std::sync::atomic::Ordering::Release);
                 *g = Some(u);
                 drop(g);
                 self.replay_ibd_utxo(ut + 1, st)?;
@@ -375,20 +356,20 @@ impl Query {
     }
 
     /// True if outpoint is spent on the **catch-up** oracle (spend_index off).
-    /// mmap UTXO: not in unspent set ⇒ spent/missing. Else spent_local HashSet.
+    ///
+    /// Light UTXO unspent set: not present ⇒ spent or never created.
+    /// Tip mode (spend_index on) returns false so callers use durable points.
     pub fn catchup_is_spent(&self, txid: &[u8; 32], vout: u32) -> Result<bool, QueryError> {
         if self.spend_index_enabled() {
             return Ok(false); // durable path handles spentness
         }
-        if let Some(ref u) = *self.ibd_utxo.lock().unwrap() {
-            // Unspent set: not present ⇒ spent or never created.
-            return Ok(!u.contains(txid, vout)?);
-        }
-        Ok(self
-            .spent_local
-            .lock()
-            .unwrap()
-            .contains(&(*txid, vout)))
+        let g = self.ibd_utxo.lock().unwrap();
+        let Some(ref u) = *g else {
+            return Err(StoreError::Corrupt(
+                "catch-up spentness requires light UTXO; call enable_ibd_utxo / enable_index_run_mode",
+            ));
+        };
+        Ok(!u.contains(txid, vout)?)
     }
 
     /// After successful Class C: take spends, insert creates (with create fk), commit tip.
@@ -460,8 +441,6 @@ impl Query {
 
     /// Rebuild mmap UTXO by replaying confirmed chain (creates then spends per height).
     pub fn rebuild_ibd_utxo_to_tip(&self) -> Result<u64, QueryError> {
-        self.spent_local_ready
-            .store(false, std::sync::atomic::Ordering::Release);
         let mut g = self.ibd_utxo.lock().unwrap();
         let u = g.get_or_insert_with(|| {
             IbdUtxo::open_or_create(self.store.path()).expect("ibd utxo open")
@@ -469,8 +448,6 @@ impl Query {
         u.clear()?;
         let Some(tip) = self.tip_height() else {
             u.commit_tip(None)?;
-            self.spent_local_ready
-                .store(true, std::sync::atomic::Ordering::Release);
             return Ok(0);
         };
         drop(g);
@@ -514,76 +491,34 @@ impl Query {
             }
             u.commit_tip(Some(h))?;
         }
-        self.spent_local_ready
-            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
-    /// True when process-local spent set may be used as the sole spentness oracle
-    /// (spend index off). Always true for genesis-empty tip after open.
-    pub fn spent_local_ready(&self) -> bool {
-        self.spent_local_ready
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Hard-block confirm when durable points are off and local is incomplete.
+    /// Hard-block catch-up confirm unless light UTXO is enabled and tip-aligned.
+    ///
+    /// Tip mode (spend_index on) uses durable points only — always ready.
     pub fn ensure_spent_oracle_ready(&self) -> Result<(), QueryError> {
-        if !self.spend_index_enabled() && !self.spent_local_ready() {
+        if self.spend_index_enabled() {
+            return Ok(());
+        }
+        let chain_tip = self.tip_height().map(|h| h.0);
+        let g = self.ibd_utxo.lock().unwrap();
+        let Some(ref u) = *g else {
             return Err(StoreError::Corrupt(
-                "spent_local not ready for local-only spentness; call rebuild_spent_local_to_tip",
+                "catch-up requires light UTXO; call enable_ibd_utxo / enable_index_run_mode",
+            ));
+        };
+        if u.tip() != chain_tip {
+            return Err(StoreError::Corrupt(
+                "light UTXO tip not aligned with chain tip; call rebuild_ibd_utxo_to_tip",
             ));
         }
         Ok(())
     }
 
-    /// Rebuild catch-up spentness oracle to tip (mmap UTXO preferred; else spent_local).
-    pub fn rebuild_spent_local_to_tip(&self) -> Result<u64, QueryError> {
-        if self.ibd_utxo_enabled() {
-            return self.rebuild_ibd_utxo_to_tip();
-        }
-        self.spent_local_ready
-            .store(false, std::sync::atomic::Ordering::Release);
-        let mut set = HashSet::new();
-        let Some(tip) = self.tip_height() else {
-            self.spent_local.lock().unwrap().clear();
-            self.spent_local_ready
-                .store(true, std::sync::atomic::Ordering::Release);
-            return Ok(0);
-        };
-        let mut n = 0u64;
-        for h in 0..=tip.0 {
-            let fks = match self.block_tx_fks(Height(h)) {
-                Ok(f) => f,
-                Err(StoreError::NotFound) => continue,
-                Err(e) => return Err(e),
-            };
-            for fk in fks {
-                let tx = self.store.get_tx(fk)?;
-                if tx.input_count == 0 {
-                    continue;
-                }
-                let inputs = self.tx_input_run(&tx)?;
-                for inp in &inputs {
-                    if inp.is_coinbase() {
-                        continue;
-                    }
-                    let prev_txid = self.resolve_prev_txid(inp)?;
-                    set.insert((prev_txid, inp.prev_index));
-                    n += 1;
-                }
-            }
-        }
-        *self.spent_local.lock().unwrap() = set;
-        self.spent_local_ready
-            .store(true, std::sync::atomic::Ordering::Release);
-        Ok(n)
-    }
-
-    /// Mark local spent set ready (e.g. empty chain after tests). Prefer
-    /// [`Self::rebuild_spent_local_to_tip`] after resume.
-    pub fn mark_spent_local_ready(&self) {
-        self.spent_local_ready
-            .store(true, std::sync::atomic::Ordering::Release);
+    /// Rebuild catch-up spentness oracle to tip (light UTXO).
+    pub fn rebuild_spent_oracle_to_tip(&self) -> Result<u64, QueryError> {
+        self.rebuild_ibd_utxo_to_tip()
     }
 
     /// Catch-up: SH / tx / point durable open-hash off; sequential runs + mmap UTXO.
@@ -771,17 +706,11 @@ impl Query {
     /// (default on). Off during catch-up for speed; re-enable and materialize /
     /// [`Self::backfill_point_spends`] before Electrum.
     ///
-    /// Turning **off** with a non-empty tip clears [`Self::spent_local_ready`] so
-    /// confirm cannot proceed until [`Self::rebuild_spent_local_to_tip`].
-    /// Empty tip stays ready (vacuous spent set).
+    /// When turning **off**, catch-up confirm requires light UTXO
+    /// ([`Self::enable_ibd_utxo`] / [`Self::enable_index_run_mode`]).
     pub fn set_spend_index(&self, enabled: bool) {
         self.spend_index
             .store(enabled, std::sync::atomic::Ordering::SeqCst);
-        if !enabled {
-            let ready = self.tip_height().is_none();
-            self.spent_local_ready
-                .store(ready, std::sync::atomic::Ordering::Release);
-        }
     }
 
     pub fn spend_index_enabled(&self) -> bool {
@@ -852,63 +781,18 @@ impl Query {
 }
 
 impl Query {
-    /// True if this outpoint is spent on the **best chain** (process-local set
-    /// and/or durable strong points).
+    /// True if this outpoint is spent on the **best chain**.
     ///
-    /// **Hybrid order:** local set first (no disk), then durable `point.head`
-    /// when the spend index is enabled. Confirm always records local spends
-    /// after successful Class C so wave_fill can short-circuit known spends.
+    /// - **Catch-up** (`spend_index` off): light UTXO unspent set.
+    /// - **Tip** (`spend_index` on): durable confirmed-strong point edges only.
     ///
     /// Does **not** treat archive-only point rows as spent: Class A may write
     /// edges before Class C; those spenders are not strong yet.
     pub fn is_outpoint_spent(&self, txid: &[u8; 32], vout: u32) -> Result<bool, QueryError> {
         if !self.spend_index_enabled() {
-            // Catch-up: mmap UTXO (unspent set) or spent_local HashSet.
             return self.catchup_is_spent(txid, vout);
         }
-        if self.spent_local.lock().unwrap().contains(&(*txid, vout)) {
-            return Ok(true);
-        }
         self.store.has_confirmed_strong_spender(txid, vout)
-    }
-
-    /// Lock the process-local spent set for a multi-check connect pass.
-    ///
-    /// Confirm used to call [`Self::is_outpoint_spent`] per input (mutex × thousands)
-    /// while the set holds the whole chain. Hold this guard across one block's
-    /// connect checks instead.
-    pub fn lock_spent_local(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashSet<([u8; 32], u32)>> {
-        self.spent_local.lock().unwrap()
-    }
-
-    /// Record a spend in the process-local set (always, including when durable
-    /// points are on — enables hybrid local-then-durable wave_fill probes).
-    pub fn note_outpoint_spent_local(&self, txid: [u8; 32], vout: u32) {
-        self.spent_local.lock().unwrap().insert((txid, vout));
-    }
-
-    /// Batch-insert process-local spends (one mutex acquisition).
-    pub fn note_outpoints_spent_local(&self, spends: &[([u8; 32], u32)]) {
-        if spends.is_empty() {
-            return;
-        }
-        let mut g = self.spent_local.lock().unwrap();
-        for &s in spends {
-            g.insert(s);
-        }
-    }
-
-    /// Remove process-local spends (disconnect / reorg).
-    pub fn unnote_outpoints_spent_local(&self, spends: &[([u8; 32], u32)]) {
-        if spends.is_empty() {
-            return;
-        }
-        let mut g = self.spent_local.lock().unwrap();
-        for s in spends {
-            g.remove(s);
-        }
     }
 
     /// Enable/disable txid hash-head inserts on archive (default on). Off under
@@ -961,7 +845,7 @@ impl Query {
     /// After milestone IBD (confirm skipped `put_spend`), Electrum and
     /// `spenders()` need this. When the point table is empty, uses an append-only
     /// bulk path (`put_spend_batch`, no `spenders_raw` probe). Otherwise probes
-    /// for idempotency. Clears the process-local spent set afterward.
+    /// for idempotency.
     ///
     /// `on_progress(height, tip, txs_so_far, edges_so_far)`.
     /// Returns `(heights_walked, txs_touched)`.
@@ -1025,7 +909,6 @@ impl Query {
             }
         }
         flush_batch(&mut edge_batch)?;
-        self.spent_local.lock().unwrap().clear();
         Ok((tip.0.saturating_add(1), txs))
     }
 

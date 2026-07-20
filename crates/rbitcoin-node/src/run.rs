@@ -169,24 +169,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     info!(
         "ibd: index catch-up mode (tx/point/SH runs + mmap UTXO; materialize heads at tip mode)"
     );
-    // Parent resolve during catch-up: light UTXO create_fk (no process txid map).
-    // Ensure spentness oracle ready (mmap UTXO may already match tip).
-    if !handle.query.spent_local_ready() {
-        let t0 = Instant::now();
-        let n = handle
-            .query
-            .rebuild_spent_local_to_tip()
-            .map_err(|e| NodeError::Config(format!("rebuild spent oracle: {e}")))?;
-        info!(
-            "ibd: spent oracle rebuilt live/entries≈{n} ready={} in {:?}",
-            handle.query.spent_local_ready(),
-            t0.elapsed()
-        );
-    } else {
-        info!(
-            "ibd: spent oracle ready (mmap UTXO tip aligned, no full rebuild)"
-        );
-    }
+    // Parent resolve during catch-up: light UTXO only (required when spend_index off).
+    handle
+        .query
+        .ensure_spent_oracle_ready()
+        .map_err(|e| NodeError::Config(format!("spent oracle: {e}")))?;
+    info!("ibd: spent oracle ready (mmap UTXO tip aligned)");
 
     let listen = config
         .p2p_listen
@@ -727,10 +715,9 @@ pub(crate) fn enter_tip_mode(query: &Query) {
         Err(e) => warn!("node: scripthash run materialize failed: {e}"),
     }
 
-    // Tip-follow: durable indexes on (write-through; low rate).
+    // Tip-follow: durable indexes on (write-through; low rate). Spentness = points.
     query.set_spend_index(true);
     query.set_tx_index(true);
-    query.mark_spent_local_ready();
     info!("node: tip mode indexes spend=on tx_head=on scripthash=on");
     info!(
         "node: scripthash rows={} (thin creates; spentness via points)",

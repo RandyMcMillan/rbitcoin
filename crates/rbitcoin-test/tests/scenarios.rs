@@ -937,13 +937,9 @@ fn resume_head_off_utxo_resolves_external_prev() {
     }
 }
 
-/// wave_fill hybrid: process-local spent short-circuits durable point.head probes.
-///
-/// Archive may already have a point edge for a not-yet-confirmed spend (not
-/// strong). Local spent must still suppress the parent live slot so recon
-/// does not treat the outpoint as unspent.
+/// wave_fill: catch-up UTXO spentness suppresses parent live slots (no HashSet).
 #[test]
-fn wave_fill_hybrid_local_spent_before_durable() {
+fn wave_fill_utxo_spent_suppresses_parent_live() {
     use rbitcoin_consensus::{
         accept_and_archive_block, accept_and_connect_block, ChainParams, Milestone,
     };
@@ -951,8 +947,9 @@ fn wave_fill_hybrid_local_spent_before_durable() {
 
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
-    q.set_spend_index(true);
-    q.set_tx_index(true);
+    q.set_spend_index(false);
+    q.set_tx_index(false);
+    q.enable_ibd_utxo().unwrap();
     let ms = Milestone::NONE;
     let params = ChainParams::regtest();
     let maturity = params.coinbase_maturity();
@@ -979,54 +976,43 @@ fn wave_fill_hybrid_local_spent_before_durable() {
     let spend_h = last_pad + 1;
     let spend = spend_anyone_can_spend(cb1, 0, bitcoin::Amount::from_sat(49_0000_0000));
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
+    // Pre-confirm: parent still unspent → wave shows live.
     accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     let spend_hash = b_spend.block_hash().to_byte_array();
-
-    // Archive wrote a point edge, but spender is not strong yet → durable says unspent.
-    assert!(
-        !q.store()
-            .has_confirmed_strong_spender(cb1.as_byte_array(), 0)
-            .unwrap(),
-        "pre-confirm archive edge must not count as confirmed-strong spent"
-    );
-
     q.prefetch_class_a_for_block_hashes(&[spend_hash]).unwrap();
-
-    // Without local: wave_fill should expose the parent as live.
     let (_n, wave_live) = q
         .prefetch_tip_prevouts_for_block_hashes(&[spend_hash])
         .unwrap();
     assert!(
         wave_live.has_live_output_txid(cb1.as_byte_array(), 0),
-        "unspent parent must be live before local spent is noted"
+        "unspent parent must be live before confirm"
     );
 
-    // Hybrid A: local spent wins even while tip_prevout still has a live slot
-    // (stale tip vs process-local — local is authoritative).
-    q.note_outpoint_spent_local(cb1.to_byte_array(), 0);
+    // Confirm spend → UTXO take; wave for a next archive that re-spends must not show live.
+    accept_and_connect_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
-    let (_n, wave_stale_tip) = q
-        .prefetch_tip_prevouts_for_block_hashes(&[spend_hash])
-        .unwrap();
-    assert!(
-        !wave_stale_tip.has_live_output_txid(cb1.as_byte_array(), 0),
-        "local spent must beat stale tip-live short-circuit"
+    let spend2 = spend_anyone_can_spend(cb1, 0, bitcoin::Amount::from_sat(48_0000_0000));
+    let b_bad = mine_regtest_block(
+        b_spend.block_hash(),
+        b_spend.header.time + 600,
+        spend_h + 1,
+        vec![spend2],
     );
-
-    // Hybrid B: need_spent path after tip retirement (confirm pairs note+retire).
-    q.retire_tip_prevout_spends(&[(cb1.to_byte_array(), 0)]);
+    accept_and_archive_block(&q, &params, Height(spend_h + 1), &b_bad, ms).unwrap();
+    let bad_hash = b_bad.block_hash().to_byte_array();
+    q.prefetch_class_a_for_block_hashes(&[bad_hash]).unwrap();
     let (_n, wave_spent) = q
-        .prefetch_tip_prevouts_for_block_hashes(&[spend_hash])
+        .prefetch_tip_prevouts_for_block_hashes(&[bad_hash])
         .unwrap();
     assert!(
         !wave_spent.has_live_output_txid(cb1.as_byte_array(), 0),
-        "local spent must suppress parent live slot without durable strong"
+        "UTXO spent must suppress parent live slot in wave_fill"
     );
 }
 
-/// mmap IBD UTXO: double-spend reject, disconnect undo, rebuild gate.
+/// Light UTXO: double-spend reject, disconnect undo, rebuild after tip align.
 #[test]
-fn spent_local_core_double_spend_and_disconnect() {
+fn ibd_utxo_double_spend_and_disconnect() {
     use rbitcoin_consensus::{
         accept_and_connect_block, ChainParams, ConsensusError, Milestone,
     };
@@ -1037,7 +1023,7 @@ fn spent_local_core_double_spend_and_disconnect() {
     q.set_spend_index(false);
     q.set_tx_index(false);
     q.enable_ibd_utxo().unwrap();
-    assert!(q.spent_local_ready(), "empty tip must be ready");
+    q.ensure_spent_oracle_ready().unwrap();
     let ms = Milestone::NONE;
     let params = ChainParams::regtest();
     let maturity = params.coinbase_maturity();
@@ -1067,7 +1053,7 @@ fn spent_local_core_double_spend_and_disconnect() {
     accept_and_connect_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
 
-    // Double-spend must fail (local oracle).
+    // Double-spend must fail (UTXO oracle).
     let spend2 = spend_anyone_can_spend(cb1, 0, bitcoin::Amount::from_sat(48_0000_0000));
     let b_bad = mine_regtest_block(
         b_spend.block_hash(),
@@ -1081,12 +1067,12 @@ fn spent_local_core_double_spend_and_disconnect() {
         "double-spend must be PrevoutSpent, got {err:?}"
     );
 
-    // Disconnect tip unspends local.
+    // Disconnect tip unspends via UTXO reverse.
     q.disconnect_tip().unwrap();
     assert_eq!(q.tip_height(), Some(Height(spend_h - 1)));
     assert!(
         !q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
-        "disconnect must clear local spend"
+        "disconnect must restore UTXO create"
     );
 
     // Re-confirm original spend after disconnect.
@@ -1094,22 +1080,20 @@ fn spent_local_core_double_spend_and_disconnect() {
         .expect("re-confirm spend after disconnect");
     assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
 
-    // Turning spend index off with non-empty tip clears ready → confirm blocked.
+    // Catch-up without UTXO after tip-mode flip is illegal until enable/rebuild.
     q.set_spend_index(true);
     q.set_spend_index(false);
-    assert!(!q.spent_local_ready());
-    let blocked = accept_and_connect_block(&q, &params, Height(spend_h + 1), &b_bad, ms);
-    assert!(blocked.is_err(), "confirm blocked until rebuild");
-    q.rebuild_spent_local_to_tip().unwrap();
-    assert!(q.spent_local_ready());
-    assert!(
-        q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
-        "rebuild must restore spends from confirmed chain"
-    );
+    // UTXO still enabled and tip-aligned from prior enable — still ready.
+    q.ensure_spent_oracle_ready().unwrap();
     let err2 = accept_and_connect_block(&q, &params, Height(spend_h + 1), &b_bad, ms);
     assert!(
         matches!(err2, Err(ConsensusError::PrevoutSpent)),
-        "after rebuild double-spend still rejected, got {err2:?}"
+        "double-spend still rejected, got {err2:?}"
+    );
+    q.rebuild_spent_oracle_to_tip().unwrap();
+    assert!(
+        q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
+        "rebuild must restore spends from confirmed chain"
     );
 }
 
@@ -1371,7 +1355,7 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
     assert_eq!(q.tip_height(), Some(Height(next_h)));
 }
 
-/// Sequential confirm_archived_run + failed confirm must not poison spent_local.
+/// Sequential confirm_archived_run + failed confirm must not poison UTXO.
 #[test]
 fn confirm_run_sequential_and_failed_no_spend_poison() {
     use rbitcoin_consensus::{
@@ -1384,6 +1368,7 @@ fn confirm_run_sequential_and_failed_no_spend_poison() {
     let q = Query::open_or_create(td.store_path()).unwrap();
     q.set_tx_index(false);
     q.set_spend_index(false);
+    q.enable_ibd_utxo().unwrap();
     let ms = Milestone { height: 0 };
     let params = ChainParams::regtest();
 

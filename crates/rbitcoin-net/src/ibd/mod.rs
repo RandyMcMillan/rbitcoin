@@ -19,6 +19,7 @@ mod body;
 mod coalesce;
 mod confirm;
 mod dial;
+mod exit;
 mod head_spill;
 mod peer_io;
 mod perf_log;
@@ -40,6 +41,10 @@ use dial::{
 };
 use peer_io::{
     note_block_progress, touch_block_progress, PeerCmd, PeerEvent, PeerEventSinks, PeerSlot,
+};
+use exit::{
+    all_peers_dead_action, catchup_complete_after_drain, header_lag_behind_peers, path_drained,
+    peer_caught_up, AllPeersDead,
 };
 use progress::{ibd_pct, work_chain_progress};
 use state::IbdWorkState;
@@ -887,14 +892,13 @@ pub async fn parallel_ibd_cancellable(
         // Exit only when the work path is drained **and** we are at (or past)
         // peer-advertised height, or headers_done with no lag. Never exit solely
         // on headers_done while max_peer_height still dwarfs our tip (signet:
-        // false headers_done at h≈2000 with peers at ~313k).
+        // false headers_done at h≈2000 with peers at ~313k). See `exit` module.
         let tip_h = hub.tip_height().unwrap_or(0);
-        let lag = header_lag_behind_peers(&st, tip_h);
-        let peer_caught_up = tip_h > 0 && lag <= 2 && tip_h >= st.max_archived_height;
-        let path_drained = st.ordered.is_empty()
-            && st.inflight.is_empty()
-            && archive_queued.count() == 0;
-        if path_drained && (peer_caught_up || (st.headers_done && lag <= 2)) {
+        let arch_q = archive_queued.count();
+        if path_drained(&st, arch_q)
+            && (peer_caught_up(&st, tip_h)
+                || (st.headers_done && header_lag_behind_peers(&st, tip_h) <= 2))
+        {
             offer_confirm_ready(
                 &confirm_feed,
                 &st.height_to_hash,
@@ -904,20 +908,16 @@ pub async fn parallel_ibd_cancellable(
                 &max_archived_shared,
             );
             update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_archived_height);
-                let tip_h = hub.tip_height().unwrap_or(0);
-            let lag = header_lag_behind_peers(&st, tip_h);
-            let still_ok = lag <= 2
-                && st.ordered.is_empty()
-                && st.inflight.is_empty()
-                && archive_queued.count() == 0;
-            if still_ok && (st.headers_done || tip_h >= st.max_peer_height.saturating_sub(2)) {
+            let tip_h = hub.tip_height().unwrap_or(0);
+            let arch_q = archive_queued.count();
+            if catchup_complete_after_drain(&st, tip_h, arch_q) {
                 info!(
                     "ibd: catch-up complete tip={tip_h} max_peer_height={} max_archived={} headers_done={} — exiting parallel IBD",
                     st.max_peer_height, st.max_archived_height, st.headers_done
                 );
                 break;
             }
-            if lag > 2 {
+            if header_lag_behind_peers(&st, tip_h) > 2 {
                 // Path empty but peers still ahead — resume header sync.
                 st.headers_done = false;
                 let tips = work_path_tips(&st);
@@ -925,42 +925,39 @@ pub async fn parallel_ibd_cancellable(
             }
         }
         // All peers dead — never treat mid-chain peer death as catch-up complete.
-        // Mainnet bug: network blip stalled every peer; accepted>0 caused a success
-        // exit at tip≈161k while max_peer≈958k, then node entered tip mode.
         if st.slots.iter().all(|s| !s.alive) {
             let tip_h = hub.tip_height().unwrap_or(0);
-            let lag = header_lag_behind_peers(&st, tip_h);
-            let path_drained = st.ordered.is_empty()
-                && st.inflight.is_empty()
-                && archive_queued.count() == 0;
-            let caught_up = path_drained
-                && tip_h > 0
-                && lag <= 2
-                && (st.headers_done || tip_h >= st.max_peer_height.saturating_sub(2));
-            if caught_up {
-                info!(
-                    "ibd: catch-up complete (no live peers) tip={tip_h} max_peer_height={} max_archived={} — exiting parallel IBD",
-                    st.max_peer_height, st.max_archived_height
-                );
-                break;
+            let arch_q = archive_queued.count();
+            match all_peers_dead_action(
+                &st,
+                tip_h,
+                arch_q,
+                redial_handle.is_some(),
+                dark_redial_empty,
+            ) {
+                AllPeersDead::CatchupComplete => {
+                    info!(
+                        "ibd: catch-up complete (no live peers) tip={tip_h} max_peer_height={} max_archived={} — exiting parallel IBD",
+                        st.max_peer_height, st.max_archived_height
+                    );
+                    break;
+                }
+                AllPeersDead::GiveUpMidCatchup => {
+                    warn!(
+                        "ibd: all peers dead mid catch-up tip={tip_h} max_peer_height={} lag={} accepted={} empty_redials={} — giving up (not tip mode)",
+                        st.max_peer_height,
+                        header_lag_behind_peers(&st, tip_h),
+                        accepted.load(Ordering::SeqCst),
+                        dark_redial_empty
+                    );
+                    return Err(NetError::Protocol(
+                        "all parallel peers dead mid catch-up (not complete)",
+                    ));
+                }
+                AllPeersDead::WaitRedial => {
+                    // Redial in flight: fall through to select! and wait.
+                }
             }
-            // Mid-chain: wait for redial (kicked above with zero interval when dark).
-            // Give up after several empty redials, or if we cannot start one, so the
-            // node does **not** set catch_up_complete / enter_tip_mode.
-            const MAX_DARK_EMPTY_REDIALS: u32 = 4;
-            if redial_handle.is_none() || dark_redial_empty >= MAX_DARK_EMPTY_REDIALS {
-                warn!(
-                    "ibd: all peers dead mid catch-up tip={tip_h} max_peer_height={} lag={} accepted={} empty_redials={} — giving up (not tip mode)",
-                    st.max_peer_height,
-                    lag,
-                    accepted.load(Ordering::SeqCst),
-                    dark_redial_empty
-                );
-                return Err(NetError::Protocol(
-                    "all parallel peers dead mid catch-up (not complete)",
-                ));
-            }
-            // Redial in flight: fall through to select! and wait.
         }
 
         // Wait for the next peer/archive event or a short tick.
@@ -1603,15 +1600,6 @@ fn work_path_tips(st: &IbdWorkState) -> Vec<BlockHash> {
     }
     tips
 }
-
-fn header_lag_behind_peers(st: &IbdWorkState, tip_h: u32) -> u32 {
-    let known_hi = st
-        .max_archived_height
-        .max(st.hash_height.values().copied().max().unwrap_or(0))
-        .max(tip_h);
-    st.max_peer_height.saturating_sub(known_hi)
-}
-
 
 /// Drop `hash` from global inflight and every peer's in_flight set.
 ///

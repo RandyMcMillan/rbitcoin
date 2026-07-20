@@ -34,6 +34,24 @@ impl Query {
         self.confirm_parents.ready_through()
     }
 
+    /// Snapshot for IBD progress/perf: `(ready_through, ahead, parents, open_reserves, plans, depth)`.
+    ///
+    /// `ahead` = how many blocks past tip the warmer has fully scanned
+    /// (`ready_through.saturating_sub(tip)`).
+    pub fn parent_prewarm_perf_snapshot(&self) -> (u32, u32, usize, usize, usize, u32) {
+        let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
+        let through = self.confirm_parents.ready_through();
+        let ahead = through.saturating_sub(tip);
+        (
+            through,
+            ahead,
+            self.confirm_parents.parent_count(),
+            self.confirm_parents.reserved_count(),
+            self.confirm_parents.plan_count(),
+            self.confirm_parents.depth(),
+        )
+    }
+
     /// Drop runway plans at/below confirmed tip after Class C.
     pub fn advance_parent_runway_tip(&self, tip: u32) {
         self.confirm_parents.advance_tip(tip);
@@ -122,6 +140,7 @@ impl Query {
         &self,
         items: &[(u32, [u8; 32])],
     ) -> Result<PrewarmStats, QueryError> {
+        let t0 = std::time::Instant::now();
         let mut st = PrewarmStats::default();
         if items.is_empty() {
             return Ok(st);
@@ -140,6 +159,7 @@ impl Query {
             self.confirm_parents.ensure_plan(height, hash);
             self.prewarm_one_height(height, &hash, &mut st)?;
         }
+        crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
         Ok(st)
     }
 

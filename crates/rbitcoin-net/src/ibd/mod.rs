@@ -853,8 +853,10 @@ pub async fn parallel_ibd_cancellable(
             let arch_delta = arch_total.saturating_sub(last_logged_arch_total);
             if tip_delta > 0 || arch_delta > 0 {
                 let pct = ibd_pct(prog.tip, prog.headers);
+                let (pw_through, pw_ahead, pw_parents, pw_res, _plans, _depth) =
+                    hub.query.parent_prewarm_perf_snapshot();
                 info!(
-                    "ibd: progress {pct}% tip={} arch_hwm={} arch_total={arch_total} horizon={} hole={} (+tip={tip_delta} +arch={arch_delta})",
+                    "ibd: progress {pct}% tip={} arch_hwm={} arch_total={arch_total} horizon={} hole={} prewarm_ahead={pw_ahead} prewarm_through={pw_through} parents={pw_parents} reserved={pw_res} (+tip={tip_delta} +arch={arch_delta})",
                     prog.tip,
                     prog.archived,
                     prog.headers,
@@ -892,6 +894,7 @@ pub async fn parallel_ibd_cancellable(
 
             // One sample/reset, then INFO `ibd: perf` (+ DEBUG `ibd: perf_dbg`).
             let utxo_snap = hub.query.ibd_utxo_perf_snapshot();
+            let prewarm_snap = hub.query.parent_prewarm_perf_snapshot();
             let perf = perf_log::sample(
                 &loop_stats,
                 &pipe_stats,
@@ -908,6 +911,7 @@ pub async fn parallel_ibd_cancellable(
                 peers_n,
                 st.headers_done,
                 utxo_snap,
+                prewarm_snap,
             );
             perf_log::log_sample(&perf);
 

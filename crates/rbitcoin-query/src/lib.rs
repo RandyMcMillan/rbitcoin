@@ -46,10 +46,65 @@ pub use parent_prewarm::PrewarmStats;
 pub use tip_prevout_cache::stats as tip_prevout_cache_stats;
 pub use wave_prevout::WavePrevoutCache;
 
-/// Stub stats for IBD perf_log (Class A cache removed).
+/// Stub stats for IBD perf_log (Class A cache removed; use [`parent_prewarm_stats`]).
 pub mod class_a_cache_stats {
     pub fn sample_and_reset() -> (u64, u64, u64) {
         (0, 0, 0)
+    }
+}
+
+/// Parent-prewarm window counters (reset by the IBD ~5s sampler).
+///
+/// Background worker + last-mile confirm prewarm both contribute. Pair with
+/// [`Query::parent_prewarm_perf_snapshot`] for ahead-of-tip watermark / size.
+pub mod parent_prewarm_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Wall time in `prewarm_parents_for_heights`.
+    pub static NS: AtomicU64 = AtomicU64::new(0);
+    /// Heights whose body was scanned this window.
+    pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
+    /// Parent outs loaded from UTXO / durable store.
+    pub static UTXO_PARENTS: AtomicU64 = AtomicU64::new(0);
+    /// Outpoints reserved for runway creates.
+    pub static RESERVED: AtomicU64 = AtomicU64::new(0);
+    /// Runway create txs registered (full outs).
+    pub static CREATES: AtomicU64 = AtomicU64::new(0);
+    /// Heights already ready (skipped).
+    pub static ALREADY_READY: AtomicU64 = AtomicU64::new(0);
+
+    /// `(ns, blocks, utxo_parents, reserved, creates, already_ready)`.
+    pub fn sample_and_reset() -> (u64, u64, u64, u64, u64, u64) {
+        (
+            NS.swap(0, Ordering::Relaxed),
+            BLOCKS.swap(0, Ordering::Relaxed),
+            UTXO_PARENTS.swap(0, Ordering::Relaxed),
+            RESERVED.swap(0, Ordering::Relaxed),
+            CREATES.swap(0, Ordering::Relaxed),
+            ALREADY_READY.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    #[inline]
+    pub(crate) fn note(st: &crate::parent_prewarm::PrewarmStats, ns: u64) {
+        if ns > 0 {
+            NS.fetch_add(ns, Ordering::Relaxed);
+        }
+        if st.blocks > 0 {
+            BLOCKS.fetch_add(st.blocks as u64, Ordering::Relaxed);
+        }
+        if st.utxo_parents > 0 {
+            UTXO_PARENTS.fetch_add(st.utxo_parents as u64, Ordering::Relaxed);
+        }
+        if st.reserved > 0 {
+            RESERVED.fetch_add(st.reserved as u64, Ordering::Relaxed);
+        }
+        if st.creates_registered > 0 {
+            CREATES.fetch_add(st.creates_registered as u64, Ordering::Relaxed);
+        }
+        if st.already_ready > 0 {
+            ALREADY_READY.fetch_add(st.already_ready as u64, Ordering::Relaxed);
+        }
     }
 }
 

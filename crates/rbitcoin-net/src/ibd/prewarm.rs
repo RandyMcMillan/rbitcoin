@@ -60,6 +60,7 @@ pub(crate) fn spawn_parent_prewarm(
             );
             let mut cursor: usize = 0;
             let mut last_tip = u32::MAX;
+            let mut last_info = std::time::Instant::now() - Duration::from_secs(30);
             while !ctrl.stop.load(Ordering::Relaxed) {
                 let tip = ctrl.tip.load(Ordering::Relaxed);
                 if tip != last_tip {
@@ -69,6 +70,16 @@ pub(crate) fn spawn_parent_prewarm(
                 }
                 let runway = ctrl.runway.lock().unwrap().clone();
                 if runway.is_empty() || cursor >= runway.len() {
+                    // Idle: still emit a slow INFO so operators see ahead=0 vs caught up.
+                    if last_info.elapsed() >= Duration::from_secs(30) {
+                        let (through, ahead, parents, reserved, plans, depth) =
+                            query.parent_prewarm_perf_snapshot();
+                        info!(
+                            "ibd: prewarm idle tip={tip} through={through} ahead={ahead} parents={parents} reserved={reserved} plans={plans}/{depth} runway={}",
+                            runway.len()
+                        );
+                        last_info = std::time::Instant::now();
+                    }
                     std::thread::sleep(Duration::from_millis(40));
                     continue;
                 }
@@ -77,26 +88,47 @@ pub(crate) fn spawn_parent_prewarm(
                 // heights. Cursor still walks the full runway.
                 let end = (cursor + batch as usize).min(runway.len());
                 let slice = &runway[cursor..end];
+                let t0 = std::time::Instant::now();
                 match query.prewarm_parents_for_heights(slice) {
-                    Ok(st)
+                    Ok(st) => {
+                        let through = query.parent_prewarm_ready_through();
+                        let ahead = through.saturating_sub(tip);
+                        // Per-batch detail (debug only).
                         if st.blocks > 0
                             || st.utxo_parents > 0
                             || st.reserved > 0
-                            || st.creates_registered > 0 =>
-                    {
-                        debug!(
-                            "ibd: prewarm h={}..{} blocks={} utxo_parents={} reserved={} creates={} ready={} through={}",
-                            slice.first().map(|x| x.0).unwrap_or(0),
-                            slice.last().map(|x| x.0).unwrap_or(0),
-                            st.blocks,
-                            st.utxo_parents,
-                            st.reserved,
-                            st.creates_registered,
-                            st.already_ready,
-                            query.parent_prewarm_ready_through()
-                        );
+                            || st.creates_registered > 0
+                        {
+                            debug!(
+                                "ibd: prewarm h={}..{} blocks={} utxo_parents={} reserved={} creates={} skip={} through={} ahead={} {}ms",
+                                slice.first().map(|x| x.0).unwrap_or(0),
+                                slice.last().map(|x| x.0).unwrap_or(0),
+                                st.blocks,
+                                st.utxo_parents,
+                                st.reserved,
+                                st.creates_registered,
+                                st.already_ready,
+                                through,
+                                ahead,
+                                t0.elapsed().as_millis()
+                            );
+                        }
+                        // Periodic INFO progress (worker-local; complements 5s perf).
+                        if last_info.elapsed() >= Duration::from_secs(10) {
+                            let (_, _, parents, reserved, plans, depth) =
+                                query.parent_prewarm_perf_snapshot();
+                            info!(
+                                "ibd: prewarm tip={tip} through={through} ahead={ahead} parents={parents} reserved={reserved} plans={plans}/{depth} cursor={}/{} last_h={}..{} blks={} {}ms",
+                                cursor,
+                                runway.len(),
+                                slice.first().map(|x| x.0).unwrap_or(0),
+                                slice.last().map(|x| x.0).unwrap_or(0),
+                                st.blocks,
+                                t0.elapsed().as_millis()
+                            );
+                            last_info = std::time::Instant::now();
+                        }
                     }
-                    Ok(_) => {}
                     Err(e) => debug!("ibd: prewarm error: {e}"),
                 }
                 cursor = end;

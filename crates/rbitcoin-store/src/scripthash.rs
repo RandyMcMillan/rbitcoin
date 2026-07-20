@@ -592,6 +592,172 @@ impl ScriptHashTable {
 
 }
 
+/// Offline bulk writer for v3→v4 migration: no per-key durable probes or alloc-header RMW.
+pub(crate) struct ScriptHashBulkBuilder {
+    body: TableFile,
+    head: ShardedScriptHashHead,
+    bump: u64,
+    live_count: u64,
+    head_buf: Vec<([u8; 32], ShHeadValue)>,
+    /// Pending body bytes starting at `body_write_off`.
+    body_buf: Vec<u8>,
+    body_write_off: u64,
+}
+
+const MIGRATE_HEAD_FLUSH: usize = 65_536;
+const MIGRATE_BODY_FLUSH: usize = 16 * 1024 * 1024;
+
+impl ScriptHashBulkBuilder {
+    /// Create empty hybrid tables under `dir`, pre-sizing head for `expected_keys`.
+    pub(crate) fn create(
+        dir: &std::path::Path,
+        expected_keys: u64,
+    ) -> Result<Self, StoreError> {
+        std::fs::create_dir_all(dir).map_err(|e| StoreError::io(dir, e))?;
+        let body = TableFile::create(dir.join("scripthash.body"), TableKind::ScriptHash)?;
+        let payload0 = payload_start(FILE_HEADER_LEN);
+        body.ensure_capacity(payload0)?;
+        body.set_logical_len(payload0)?;
+        let state = AllocState {
+            live_count: 0,
+            bump: payload0,
+            free_head: [0; SH_MAX_CLASS as usize + 1],
+        };
+        write_alloc_header(&body, &state)?;
+
+        let n_shards = crate::sharded_hashhead::shard_count_for_role(HeadRole::ScriptHash);
+        let per = slots_per_shard_for_keys(expected_keys, n_shards);
+        let head = ShardedScriptHashHead::create_sharded(dir.join("scripthash.head"), n_shards, per)?;
+
+        Ok(Self {
+            body,
+            head,
+            bump: payload0,
+            live_count: 0,
+            head_buf: Vec::with_capacity(MIGRATE_HEAD_FLUSH.min(expected_keys as usize + 1)),
+            body_buf: Vec::with_capacity(MIGRATE_BODY_FLUSH),
+            body_write_off: payload0,
+        })
+    }
+
+    /// Pack one key's live creates (oldest→newest). Empty chains are skipped.
+    pub(crate) fn put_chain(
+        &mut self,
+        key: [u8; 32],
+        entries: &[ShEntry],
+    ) -> Result<(), StoreError> {
+        let n = entries.len() as u32;
+        if n == 0 {
+            return Ok(());
+        }
+        self.live_count = self.live_count.saturating_add(u64::from(n));
+
+        let val = if n <= SH_INLINE_CAP as u32 {
+            if n == 1 {
+                ShHeadValue::inline_one(entries[0])
+            } else {
+                ShHeadValue::inline_two(entries[0], entries[1])
+            }
+        } else {
+            let class = class_for_count(n)
+                .ok_or(StoreError::Corrupt("scripthash migrate: entry count too large"))?;
+            let need = slab_bytes(class);
+            let off = self.bump;
+            // Reserve full class size (freelist-compatible); write only live bytes.
+            self.bump = self.bump.saturating_add(need);
+            self.ensure_body_capacity(self.bump)?;
+            // Pad gap if body_buf is contiguous from body_write_off.
+            let pending_end = self.body_write_off + self.body_buf.len() as u64;
+            if pending_end < off {
+                // Should not happen with sequential bump alloc.
+                self.flush_body()?;
+            }
+            for e in entries {
+                self.body_buf.extend_from_slice(&e.encode());
+            }
+            // Zero-fill remainder of slab so freelist size classes stay aligned.
+            let live_bytes = entries.len() * SH_ENTRY_LEN;
+            let pad = need as usize - live_bytes;
+            if pad > 0 {
+                self.body_buf.resize(self.body_buf.len() + pad, 0);
+            }
+            if self.body_buf.len() >= MIGRATE_BODY_FLUSH {
+                self.flush_body()?;
+            }
+            ShHeadValue::Slab {
+                class,
+                used: n,
+                slab_off: off,
+            }
+        };
+
+        self.head_buf.push((key, val));
+        if self.head_buf.len() >= MIGRATE_HEAD_FLUSH {
+            self.flush_heads()?;
+        }
+        Ok(())
+    }
+
+    fn ensure_body_capacity(&self, need: u64) -> Result<(), StoreError> {
+        self.body.ensure_capacity(need)?;
+        if need > self.body.logical_len() {
+            self.body.set_logical_len(need)?;
+        }
+        Ok(())
+    }
+
+    fn flush_body(&mut self) -> Result<(), StoreError> {
+        if self.body_buf.is_empty() {
+            return Ok(());
+        }
+        let end = self.body_write_off + self.body_buf.len() as u64;
+        self.ensure_body_capacity(end)?;
+        self.body.write_at(self.body_write_off, &self.body_buf)?;
+        self.body_write_off = end;
+        self.body_buf.clear();
+        Ok(())
+    }
+
+    fn flush_heads(&mut self) -> Result<(), StoreError> {
+        if self.head_buf.is_empty() {
+            return Ok(());
+        }
+        self.head.insert_many(&self.head_buf)?;
+        self.head_buf.clear();
+        Ok(())
+    }
+
+    /// Flush body + heads + alloc header. Consumes the builder.
+    pub(crate) fn finish(mut self) -> Result<(u64, u64), StoreError> {
+        self.flush_body()?;
+        self.flush_heads()?;
+        // Align logical length to bump (includes slab padding).
+        if self.bump > self.body.logical_len() {
+            self.body.set_logical_len(self.bump)?;
+        }
+        let state = AllocState {
+            live_count: self.live_count,
+            bump: self.bump,
+            free_head: [0; SH_MAX_CLASS as usize + 1],
+        };
+        write_alloc_header(&self.body, &state)?;
+        self.body.flush()?;
+        self.head.flush()?;
+        Ok((self.live_count, self.head.occupied()))
+    }
+}
+
+fn slots_per_shard_for_keys(expected_keys: u64, n_shards: usize) -> u64 {
+    let n = n_shards.max(1) as u64;
+    let per_keys = expected_keys.div_ceil(n).saturating_add(1);
+    // Load factor 7/8, power of two, floor 64.
+    let min = per_keys
+        .saturating_mul(8)
+        .div_ceil(7)
+        .max(1);
+    min.next_power_of_two().max(64)
+}
+
 fn write_alloc_header(body: &TableFile, state: &AllocState) -> Result<(), StoreError> {
     let mut buf = vec![0u8; SH_ALLOC_HEADER_LEN];
     buf[0..4].copy_from_slice(&SH_ALLOC_MAGIC);

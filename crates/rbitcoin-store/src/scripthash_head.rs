@@ -97,7 +97,6 @@ impl ScriptHashHead {
         })
     }
 
-    #[allow(dead_code)]
     pub fn occupied(&self) -> u64 {
         self.state.lock().unwrap().occupied
     }
@@ -648,7 +647,6 @@ impl ShardedScriptHashHead {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn occupied(&self) -> u64 {
         self.shards.iter().map(|s| s.occupied()).sum()
     }

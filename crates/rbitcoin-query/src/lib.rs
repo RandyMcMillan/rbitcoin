@@ -6,6 +6,7 @@ mod chain_view;
 mod class_a_cache;
 mod connect;
 mod reconstruct;
+mod run_builder_core;
 mod scripthash;
 mod point_run_builder;
 mod sh_builder;

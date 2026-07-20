@@ -238,6 +238,8 @@ pub fn confirm_archived_run(
         tx_fks: Vec<rbitcoin_primitives::Fk>,
         jobs: Vec<ScriptCheckJob>,
         spends: Vec<([u8; 32], u32)>,
+        /// Outpoints created this height for light UTXO (from connect; no re-get).
+        creates: Vec<([u8; 32], u32, rbitcoin_primitives::Fk)>,
         check_scripts: bool,
         time: u32,
         bits: bitcoin::CompactTarget,
@@ -360,7 +362,7 @@ pub fn confirm_archived_run(
             )))?;
 
         let t_connect = Instant::now();
-        let (script_jobs, spends) = connect_block_prevouts(
+        let (script_jobs, spends, creates) = connect_block_prevouts(
             query,
             &block,
             &ctx,
@@ -384,6 +386,7 @@ pub fn confirm_archived_run(
             tx_fks,
             jobs: script_jobs,
             spends,
+            creates,
             check_scripts: !milestone.skips_scripts_at(height.0),
             time: block.header.time,
             bits: block.header.bits,
@@ -450,27 +453,24 @@ pub fn confirm_archived_run(
     // Update catch-up spentness oracle + tip_prevout after Class C success.
     let t_spent = Instant::now();
     if query.ibd_utxo_enabled() {
-        // Per-height apply: spends then creates. Critical for multi-block runs
-        // where height H+1 spends a create from height H in the same batch.
-        // Creates come from `items` (tx_fks after mem::take), not emptied prepared.
-        // Class C has already advanced tip — never surface UTXO apply as a confirm
-        // reject / blacklist (was `ibd utxo duplicate create` @519). Heal via rebuild.
+        // Per-height order (spends then creates) so H+1 can spend H in the same
+        // batch. Creates were collected at connect (no re-get_tx_class_a). One
+        // mmap flush for the whole run. Class C already advanced tip — heal via
+        // rebuild on apply failure (never blacklist).
         let apply_res = (|| -> Result<(), ConsensusError> {
-            for (p, item) in prepared.iter().zip(items.iter()) {
-                let mut creates =
-                    Vec::with_capacity(item.tx_fks.len().saturating_mul(2));
-                for &fk in &item.tx_fks {
-                    let tx = query
-                        .get_tx_class_a(fk)
-                        .map_err(ConsensusError::Store)?;
-                    for v in 0..tx.output_count {
-                        creates.push((tx.txid, v, fk));
-                    }
-                }
-                query
-                    .apply_ibd_utxo_block(&p.spends, &creates, item.height.0)
-                    .map_err(ConsensusError::Store)?;
-            }
+            let steps: Vec<_> = prepared
+                .iter()
+                .map(|p| {
+                    (
+                        p.spends.as_slice(),
+                        p.creates.as_slice(),
+                        p.height.0,
+                    )
+                })
+                .collect();
+            query
+                .apply_ibd_utxo_run(&steps)
+                .map_err(ConsensusError::Store)?;
             Ok(())
         })();
         if let Err(_e) = apply_res {

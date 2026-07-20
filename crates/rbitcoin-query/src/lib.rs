@@ -394,28 +394,53 @@ impl Query {
     /// After successful Class C: take spends, insert creates (with create fk), commit tip.
     ///
     /// Height-monotonic and idempotent: if `tip` is already reflected, no-op.
+    /// Flushes mmap once (single-height / tests). Prefer [`Self::apply_ibd_utxo_run`]
+    /// for multi-block confirm batches.
     pub fn apply_ibd_utxo_block(
         &self,
         spends: &[([u8; 32], u32)],
         creates: &[([u8; 32], u32, Fk)],
         tip: u32,
     ) -> Result<(), QueryError> {
+        self.apply_ibd_utxo_run(&[(spends, creates, tip)])
+    }
+
+    /// Apply several heights in order (spends then creates per height), **one flush**.
+    ///
+    /// Each item is `(spends, creates, tip_height)`. Skips heights already ≤ UTXO tip.
+    /// Critical for multi-block confirm: H creates must land before H+1 spends.
+    pub fn apply_ibd_utxo_run(
+        &self,
+        steps: &[(
+            & [([u8; 32], u32)],
+            & [([u8; 32], u32, Fk)],
+            u32,
+        )],
+    ) -> Result<(), QueryError> {
+        if steps.is_empty() {
+            return Ok(());
+        }
         let mut g = self.ibd_utxo.lock().unwrap();
         let Some(ref mut u) = *g else {
             return Ok(());
         };
-        if let Some(have) = u.tip() {
-            if tip <= have {
-                return Ok(());
+        let mut last_tip = u.tip();
+        for &(spends, creates, tip) in steps {
+            if let Some(have) = last_tip {
+                if tip <= have {
+                    continue;
+                }
             }
+            for &(txid, vout) in spends {
+                let _ = u.take_spend(&txid, vout)?;
+            }
+            for &(txid, vout, create_fk) in creates {
+                u.insert_create(&txid, vout, create_fk)?;
+            }
+            u.set_tip(Some(tip));
+            last_tip = Some(tip);
         }
-        for &(txid, vout) in spends {
-            let _ = u.take_spend(&txid, vout)?;
-        }
-        for &(txid, vout, create_fk) in creates {
-            u.insert_create(&txid, vout, create_fk)?;
-        }
-        u.commit_tip(Some(tip))?;
+        u.flush()?;
         Ok(())
     }
 

@@ -472,12 +472,24 @@ impl IbdUtxo {
         Ok(false)
     }
 
-    pub fn commit_tip(&mut self, tip: Option<u32>) -> Result<(), StoreError> {
+    /// Update tip + header in the mmap **without** fsync (confirm multi-block batch).
+    pub fn set_tip(&mut self, tip: Option<u32>) {
         self.tip = tip;
+        Self::write_header(&mut self.map, self.tip, self.num_slots, self.live);
+    }
+
+    /// Persist header + pages (`msync` + file flush).
+    pub fn flush(&mut self) -> Result<(), StoreError> {
         Self::write_header(&mut self.map, self.tip, self.num_slots, self.live);
         self.map.flush().map_err(|e| io(&self.path, e))?;
         self.file.flush().map_err(|e| io(&self.path, e))?;
         Ok(())
+    }
+
+    /// Set tip and flush (single-height / shutdown / rebuild).
+    pub fn commit_tip(&mut self, tip: Option<u32>) -> Result<(), StoreError> {
+        self.set_tip(tip);
+        self.flush()
     }
 
     pub fn grow(&mut self) -> Result<(), StoreError> {

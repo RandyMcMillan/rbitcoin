@@ -96,10 +96,10 @@ impl Query {
         let mut parent_needed: HashMap<u64, HashSet<u32>> = HashMap::new();
         for &fk in &wave_tx_fks {
             let (tx, outs, inputs) = self.wave_body_from_class_a(fk)?;
-            // Parent-as-create for same-run spends.
+            // Parent-as-create for same-run spends. One TxRecord move into
+            // parents (get_tx falls back to parents; skip redundant insert_tx).
             let cb_h = self.coinbase_height_for_tx_with_input0(fk, &tx, inputs.first())?;
-            wave.insert_parent_live(fk, tx.clone(), outs, Some(cb_h));
-            wave.insert_tx(fk, tx.clone());
+            wave.insert_parent_live(fk, tx, outs, Some(cb_h));
             noted += 1;
 
             if inputs.is_empty() {
@@ -210,7 +210,6 @@ impl Query {
             }
 
             // Bulk warm: tx then outs (sorted parent loop ⇒ sequential-ish store).
-            // Confirm is a single OS thread; spent_local is not contended here.
             let t_tx = Instant::now();
             let tx = self.get_tx_class_a(fk)?;
             wf_add(&wf::PARENT_TX_NS, t_tx.elapsed().as_nanos() as u64);
@@ -220,30 +219,44 @@ impl Query {
                 HashMap::with_capacity(needed_vouts.len());
             let n = tx.output_count as usize;
             let need_n = needed_vouts.len();
-            let use_full =
-                n > 0 && (need_n >= 8 || need_n.saturating_mul(4) >= n.max(1) || n <= 64);
-            if use_full && n > 0 {
-                let raw = self.tx_output_run_class_a(&tx)?;
-                for &v in needed_vouts {
-                    let vi = v as usize;
-                    if vi < raw.len() {
-                        outs_map.insert(v, raw[vi].clone());
+            // Prefer full run when Class A already holds it, for small txs, or
+            // when we need a non-trivial fraction of outs (sparse random I/O loses).
+            if n > 0 {
+                if let Some(raw) = self.class_a_cache.get_outputs(fk) {
+                    for &v in needed_vouts {
+                        let vi = v as usize;
+                        if vi < raw.len() {
+                            outs_map.insert(v, raw[vi].clone());
+                        }
                     }
-                }
-            } else if n > 0 {
-                let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-                let mut vouts: Vec<u32> = needed_vouts.iter().copied().collect();
-                vouts.sort_unstable();
-                for v in vouts {
-                    if (v as usize) >= n {
-                        continue;
+                } else {
+                    let use_full = need_n >= 2
+                        || n <= 128
+                        || need_n.saturating_mul(3) >= n.max(1);
+                    if use_full {
+                        let raw = self.tx_output_run_class_a(&tx)?;
+                        for &v in needed_vouts {
+                            let vi = v as usize;
+                            if vi < raw.len() {
+                                outs_map.insert(v, raw[vi].clone());
+                            }
+                        }
+                    } else {
+                        let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
+                        let mut vouts: Vec<u32> = needed_vouts.iter().copied().collect();
+                        vouts.sort_unstable();
+                        for v in vouts {
+                            if (v as usize) >= n {
+                                continue;
+                            }
+                            if let Some(o) = self.class_a_cache.get_output_at(fk, v) {
+                                outs_map.insert(v, o);
+                                continue;
+                            }
+                            let o = self.store.get_output_at(Fk(run), tx.output_count, v)?;
+                            outs_map.insert(v, o);
+                        }
                     }
-                    if let Some(o) = self.class_a_cache.get_output_at(fk, v) {
-                        outs_map.insert(v, o);
-                        continue;
-                    }
-                    let o = self.store.get_output_at(Fk(run), tx.output_count, v)?;
-                    outs_map.insert(v, o);
                 }
             }
             wf_add(&wf::PARENT_OUT_NS, t_out.elapsed().as_nanos() as u64);
@@ -282,19 +295,17 @@ impl Query {
         }
 
         // Spent filter for remaining need_spent.
+        // Catch-up path already dropped UTXO-spent vouts above — no second probe.
         let t_sp_all = Instant::now();
         let mut spent_flags: HashMap<(usize, u32), bool> =
             HashMap::with_capacity(works.iter().map(|w| w.need_spent.len()).sum());
         let mut durable_probes: Vec<(usize, u32, [u8; 32])> = Vec::new();
         for (wi, w) in works.iter().enumerate() {
             for &v in &w.need_spent {
-                if self.catchup_is_spent(&w.tx.txid, v)? {
-                    spent_flags.insert((wi, v), true);
-                } else if spend_index_on {
+                if spend_index_on {
                     let key = rbitcoin_store::PointRecord::outpoint_key(&w.tx.txid, v);
                     durable_probes.push((wi, v, key));
                 } else {
-                    // Catch-up UTXO: not spent ⇒ live candidate.
                     spent_flags.insert((wi, v), false);
                 }
             }

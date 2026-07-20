@@ -280,7 +280,7 @@ pub fn validate_block_connect(
     // Pending until connect+scripts succeed — do not poison spent_local on failure.
     let mut pending = std::collections::HashSet::new();
     let mut pending_creates = std::collections::HashMap::new();
-    let (script_jobs, spends) = connect_block_prevouts(
+    let (script_jobs, spends, _creates) = connect_block_prevouts(
         query,
         block,
         ctx,
@@ -378,7 +378,15 @@ pub(crate) fn connect_block_prevouts(
     wave_prevouts: Option<&rbitcoin_query::WavePrevoutCache>,
     pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
     pending_creates: &mut std::collections::HashMap<([u8; 32], u32), rbitcoin_primitives::Fk>,
-) -> Result<(Vec<ScriptCheckJob>, Vec<([u8; 32], u32)>), ConsensusError> {
+) -> Result<
+    (
+        Vec<ScriptCheckJob>,
+        Vec<([u8; 32], u32)>,
+        // Creates for light UTXO apply: (txid, vout, create_fk).
+        Vec<([u8; 32], u32, rbitcoin_primitives::Fk)>,
+    ),
+    ConsensusError,
+> {
     if let Some(fks) = archived_tx_fks {
         if fks.len() != block.txdata.len() {
             return Err(ConsensusError::BadBlock("archived tx fk count mismatch"));
@@ -410,6 +418,8 @@ pub(crate) fn connect_block_prevouts(
         Vec::new()
     };
     let mut spends: Vec<([u8; 32], u32)> = Vec::with_capacity(n_tx.saturating_mul(2));
+    let mut creates: Vec<([u8; 32], u32, rbitcoin_primitives::Fk)> =
+        Vec::with_capacity(n_tx.saturating_mul(2));
     // Coinbase height cache spans the whole block (was recreated per tx).
     let mut coinbase_height_cache: std::collections::HashMap<
         rbitcoin_primitives::Fk,
@@ -586,6 +596,7 @@ pub(crate) fn connect_block_prevouts(
             });
             if !create_fk.is_null() {
                 pending_creates.insert((txid, v as u32), create_fk);
+                creates.push((txid, v as u32, create_fk));
             }
         }
         same_block.insert(txid, outs);
@@ -607,7 +618,7 @@ pub(crate) fn connect_block_prevouts(
     }
 
     let _ = LockTime::ZERO;
-    Ok((script_jobs, spends))
+    Ok((script_jobs, spends, creates))
 }
 
 /// Parallel script checks for an owned job slice (preferred entry — no ref `Vec`).

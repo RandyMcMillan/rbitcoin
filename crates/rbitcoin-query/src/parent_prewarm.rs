@@ -1,15 +1,12 @@
-//! Confirm-runway parent prewarm against [`crate::confirm_parent_cache`].
+//! Confirm-runway prewarm: **bodies first, then parents**.
 //!
-//! Only loads parents present in the light UTXO (confirmed creates). Outpoints
-//! not in the UTXO are **reserved** for creates that live on not-yet-confirmed
-//! runway blocks; those fill when the creating body is registered during
-//! prewarm of earlier heights (or immediately if the create was registered
-//! first with full outs — create-before-reserve).
+//! For a batch of heights (ascending):
+//! 1. Load every full Class A body in the batch; register **all** creates so
+//!    same-batch / runway spends need no UTXO and no reservations.
+//! 2. Collect external parent needs; sort/dedup by create fk; load once each.
 //!
-//! Confirm must not start until the batch heights are **scanned** (ready) **and**
-//! the warmer holds the configured headroom past `batch_end`. Open reservations
-//! do not block readiness: a batch may create a parent and spend it in a later
-//! height of the same run (wave resolves same-wave / runway creates).
+//! After prewarm, confirm should only **write** (Class C, light UTXO, tip).
+//! Wave/wire rebuild prefer the body cache over store.
 
 use super::*;
 use crate::confirm_parent_cache::prewarm_headroom_from_env;
@@ -24,12 +21,14 @@ pub struct PrewarmStats {
     pub already_ready: u32,
     /// Unique parent create fks loaded from store this call (after dedup).
     pub parent_unique: u32,
-    /// Parent outs served from confirm_parents / tip_prevout (no store).
+    /// Parent outs served from confirm_parents / same-batch body (no store).
     pub parent_cache_hits: u32,
-    /// `get_tx_full` calls (prefer packed = 1 body IO).
-    pub full_tx_reads: u32,
-    /// Legacy split-table fallback reads (counted inside store path as full_tx).
+    /// `get_tx_full` calls for **block bodies** (phase 1).
     pub body_tx_reads: u32,
+    /// `get_tx_full` calls for **external parents** (phase 2).
+    pub full_tx_reads: u32,
+    /// External parents that could not be resolved (should be 0 after phase 1).
+    pub missing_parents: u32,
 }
 
 impl Query {
@@ -43,9 +42,6 @@ impl Query {
     }
 
     /// Snapshot for IBD progress/perf: `(ready_through, ahead, parents, open_reserves, plans, depth)`.
-    ///
-    /// `ahead` = how many blocks past tip the warmer has fully scanned
-    /// (`ready_through.saturating_sub(tip)`).
     pub fn parent_prewarm_perf_snapshot(&self) -> (u32, u32, usize, usize, usize, u32) {
         let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
         let through = self.confirm_parents.ready_through();
@@ -60,14 +56,10 @@ impl Query {
         )
     }
 
-    /// Drop runway plans at/below confirmed tip after Class C.
     pub fn advance_parent_runway_tip(&self, tip: u32) {
         self.confirm_parents.advance_tip(tip);
     }
 
-    /// Seed height plans for the published runway (no body scan). Lets confirm
-    /// headroom see unfinished heights instead of treating a short plan map as
-    /// "runway ended".
     pub fn seed_parent_runway(&self, items: &[(u32, [u8; 32])]) {
         for &(height, hash) in items {
             self.confirm_parents.ensure_plan(height, hash);
@@ -75,18 +67,15 @@ impl Query {
     }
 
     pub fn parent_pin_count(&self) -> usize {
-        // Compat name: reserved + stored parent outs.
-        self.confirm_parents.parent_count() + self.confirm_parents.reserved_count()
+        self.confirm_parents.parent_count()
+            + self.confirm_parents.reserved_count()
+            + self.confirm_parents.body_count()
     }
 
-    /// True when every height in the list is prewarm-scanned.
-    /// Open reservations do not make a height unready.
     pub fn is_prewarm_ready(&self, heights: &[u32]) -> bool {
         self.confirm_parents.all_ready(heights)
     }
 
-    /// Block until all `heights` are scanned (ready), `timeout` elapses, or
-    /// [`Query::confirm_cancelled`].
     pub fn wait_prewarm_ready(
         &self,
         heights: &[u32],
@@ -112,14 +101,6 @@ impl Query {
         }
     }
 
-    /// Wait until batch heights are **scanned** (hard). Then briefly prefer
-    /// warmer headroom past `batch_end`, but **never block confirm** on it —
-    /// mainnet showed hard headroom waits freezing tip for minutes while the
-    /// worker chewed runway IO, which stalled peers (no archive drain).
-    ///
-    /// Aborts promptly on [`Query::confirm_cancelled`] (IBD SIGINT).
-    /// Open reservations never block readiness (same-batch create→spend).
-    /// `headroom == None` uses [`prewarm_headroom_from_env`].
     pub fn wait_prewarm_ready_with_headroom(
         &self,
         heights: &[u32],
@@ -130,7 +111,6 @@ impl Query {
         if heights.is_empty() {
             return Ok(());
         }
-        // Hard: this batch must be scanned (or cancel).
         self.wait_prewarm_ready(heights, timeout)?;
         if self.confirm_cancelled() {
             return Err(StoreError::Corrupt("confirm cancelled"));
@@ -139,7 +119,6 @@ impl Query {
         if hr == 0 || self.confirm_parents.headroom_ready(batch_end, hr) {
             return Ok(());
         }
-        // Soft: give the worker a short moment to pull further ahead, then go.
         let soft = std::time::Duration::from_millis(50);
         let start = std::time::Instant::now();
         while start.elapsed() < soft {
@@ -154,10 +133,10 @@ impl Query {
         Ok(())
     }
 
-    /// Prewarm parents for archived runway blocks (height-ordered).
+    /// Prewarm a contiguous runway slice: **all bodies first**, then parents.
     ///
-    /// `items` are `(height, hash)` ascending. Only UTXO-backed parents are
-    /// loaded from store; others are reserved for runway creates.
+    /// `items` must be height-ascending. No reservations: same-batch creates are
+    /// registered in phase 1; external parents load in phase 2 from UTXO/store.
     pub fn prewarm_parents_for_heights(
         &self,
         items: &[(u32, [u8; 32])],
@@ -170,6 +149,8 @@ impl Query {
         let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
         self.confirm_parents.advance_tip(tip);
 
+        // Work list: heights still needing scan.
+        let mut work: Vec<(u32, [u8; 32])> = Vec::new();
         for &(height, hash) in items {
             if self.confirm_cancelled() {
                 crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
@@ -183,109 +164,115 @@ impl Query {
                 continue;
             }
             self.confirm_parents.ensure_plan(height, hash);
-            self.prewarm_one_height(height, &hash, &mut st)?;
+            work.push((height, hash));
         }
-        crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
-        Ok(st)
-    }
-
-    /// Back-compat: hashes only (height unknown — treat as unordered scan).
-    pub fn prewarm_parents_for_block_hashes(
-        &self,
-        hashes: &[[u8; 32]],
-    ) -> Result<PrewarmStats, QueryError> {
-        let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
-        let mut items = Vec::with_capacity(hashes.len());
-        for (i, hash) in hashes.iter().enumerate() {
-            // Caller (IBD) passes tip+1.. in order; recover height as tip+1+i.
-            let h = tip.saturating_add(1).saturating_add(i as u32);
-            items.push((h, *hash));
-        }
-        self.prewarm_parents_for_heights(&items)
-    }
-
-    fn prewarm_one_height(
-        &self,
-        height: u32,
-        hash: &[u8; 32],
-        st: &mut PrewarmStats,
-    ) -> Result<(), QueryError> {
-        let Some((header_fk, _)) = self.get_header_by_hash(hash)? else {
-            return Ok(());
-        };
-        let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
-            return Ok(());
-        };
-        st.blocks = st.blocks.saturating_add(1);
-
-        // Load this block's bodies (packed = 1 IO each). Register creates first.
-        let mut body_creates: Vec<(Fk, TxRecord, Vec<OutputRecord>, Vec<InputRecord>)> =
-            Vec::with_capacity(tx_fks.len());
-        let mut local: HashMap<[u8; 32], Fk> = HashMap::with_capacity(tx_fks.len());
-        for &fk in &tx_fks {
-            let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
-            st.full_tx_reads = st.full_tx_reads.saturating_add(1);
-            st.body_tx_reads = st.body_tx_reads.saturating_add(1);
-            self.confirm_parents
-                .register_runway_creates(fk, &tx, &outs, height);
-            st.creates_registered = st.creates_registered.saturating_add(1);
-            local.insert(tx.txid, fk);
-            body_creates.push((fk, tx, outs, inputs));
+        if work.is_empty() {
+            crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+            return Ok(st);
         }
 
-        // Collect external parent needs: resolve fk, then sort/dedup before store IO.
-        // (create_fk, vout) — only those not same-block and not already cached.
+        // ── Phase 1: full block bodies (creates available without UTXO) ─────
+        // Per-height: list of (fk, tx, outs, inputs) for phase 2 spend scan.
+        let mut phase1: Vec<(u32, Vec<(Fk, TxRecord, Vec<OutputRecord>, Vec<InputRecord>)>)> =
+            Vec::with_capacity(work.len());
+
+        for &(height, hash) in &work {
+            if self.confirm_cancelled() {
+                crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                return Err(StoreError::Corrupt("confirm cancelled"));
+            }
+            let Some((header_fk, _)) = self.get_header_by_hash(&hash)? else {
+                continue;
+            };
+            let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
+                continue;
+            };
+            st.blocks = st.blocks.saturating_add(1);
+            let mut bodies = Vec::with_capacity(tx_fks.len());
+            for &fk in &tx_fks {
+                let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
+                st.body_tx_reads = st.body_tx_reads.saturating_add(1);
+                st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+                // Full body for zero-read confirm wave/wire.
+                self.confirm_parents
+                    .put_body(fk, height, tx.clone(), outs.clone(), inputs.clone());
+                // All outs so later heights / same batch spend without reserve.
+                self.confirm_parents
+                    .register_runway_creates(fk, &tx, &outs, height);
+                st.creates_registered = st.creates_registered.saturating_add(1);
+                bodies.push((fk, tx, outs, inputs));
+            }
+            phase1.push((height, bodies));
+        }
+
+        // ── Phase 2: external parents (sort/dedup store loads) ──────────────
+        // (create_fk_id, vout) → need put for each (height, fk, vout)
         let mut need_load: Vec<(u64, u32)> = Vec::new();
-        let mut need_put: Vec<(u32, Fk, u32)> = Vec::new(); // (height, fk, vout) for cache hits path
+        let mut need_put: Vec<(u32, Fk, u32)> = Vec::new();
 
-        for (_fk, _tx, _outs, inputs) in &body_creates {
-            for inp in inputs {
-                if inp.is_coinbase() {
-                    continue;
-                }
-                // Same-block create: no store.
-                if let Some(&cfk) = local.get(&inp.prev_txid) {
-                    if let Some((_, ptx, outs, _)) =
-                        body_creates.iter().find(|(f, _, _, _)| *f == cfk)
-                    {
-                        if let Some(o) = outs.get(inp.prev_index as usize) {
+        for (height, bodies) in &phase1 {
+            let mut local: HashMap<[u8; 32], Fk> = HashMap::with_capacity(bodies.len());
+            for (fk, tx, _, _) in bodies {
+                local.insert(tx.txid, *fk);
+            }
+            for (_fk, _tx, _outs, inputs) in bodies {
+                for inp in inputs {
+                    if inp.is_coinbase() {
+                        continue;
+                    }
+                    // Same-block create (from phase 1 body).
+                    if let Some(&cfk) = local.get(&inp.prev_txid) {
+                        if let Some((_, ptx, bouts, _)) =
+                            bodies.iter().find(|(f, _, _, _)| *f == cfk)
+                        {
+                            if let Some(o) = bouts.get(inp.prev_index as usize) {
+                                self.confirm_parents.put_utxo_parent(
+                                    *height,
+                                    cfk,
+                                    ptx.clone(),
+                                    inp.prev_index,
+                                    o.clone(),
+                                );
+                                st.utxo_parents = st.utxo_parents.saturating_add(1);
+                                st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
+                            }
+                        }
+                        continue;
+                    }
+                    // Runway create from earlier prewarmed height / phase 1 of this batch.
+                    if let Some(cfk) = self.confirm_parents.get_by_txid(&inp.prev_txid) {
+                        if let Some((ptx, o)) =
+                            self.confirm_parents.get_parent_out(cfk, inp.prev_index)
+                        {
                             self.confirm_parents.put_utxo_parent(
-                                height,
+                                *height,
                                 cfk,
-                                ptx.clone(),
+                                ptx,
                                 inp.prev_index,
-                                o.clone(),
+                                o,
                             );
                             st.utxo_parents = st.utxo_parents.saturating_add(1);
                             st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
+                            continue;
                         }
                     }
-                    continue;
-                }
+                    // Confirmed parent: UTXO / tip_prevout / durable head.
+                    let create_fk = self
+                        .ibd_utxo_create_fk(&inp.prev_txid, inp.prev_index)?
+                        .or_else(|| {
+                            self.tip_prevout_cache
+                                .get_tx_and_output_by_txid(&inp.prev_txid, inp.prev_index)
+                                .map(|(fk, _, _)| fk)
+                        })
+                        .or(self.tx_fk_by_txid(&inp.prev_txid).ok().flatten());
 
-                let create_fk = self
-                    .ibd_utxo_create_fk(&inp.prev_txid, inp.prev_index)?
-                    .or_else(|| self.confirm_parents.get_by_txid(&inp.prev_txid))
-                    .or_else(|| {
-                        self.tip_prevout_cache
-                            .get_tx_and_output_by_txid(&inp.prev_txid, inp.prev_index)
-                            .map(|(fk, _, _)| fk)
-                    })
-                    .or(self.tx_fk_by_txid(&inp.prev_txid).ok().flatten());
-
-                match create_fk {
-                    Some(create_fk) => {
-                        if self
-                            .confirm_parents
-                            .get_parent_out(create_fk, inp.prev_index)
-                            .is_some()
-                        {
-                            // Already in runway cache — re-note for this height.
+                    match create_fk {
+                        Some(create_fk) => {
                             if let Some((ptx, o)) =
                                 self.confirm_parents.get_parent_out(create_fk, inp.prev_index)
                             {
                                 self.confirm_parents.put_utxo_parent(
-                                    height,
+                                    *height,
                                     create_fk,
                                     ptx,
                                     inp.prev_index,
@@ -293,27 +280,23 @@ impl Query {
                                 );
                                 st.utxo_parents = st.utxo_parents.saturating_add(1);
                                 st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
+                                continue;
                             }
-                            continue;
+                            if let Some(id) = create_fk.get() {
+                                need_load.push((id, inp.prev_index));
+                                need_put.push((*height, create_fk, inp.prev_index));
+                            }
                         }
-                        if let Some(fk_id) = create_fk.get() {
-                            need_load.push((fk_id, inp.prev_index));
-                            need_put.push((height, create_fk, inp.prev_index));
+                        None => {
+                            // Should not happen after phase-1 full-out register for
+                            // runway creates; count for diagnostics (no reserve).
+                            st.missing_parents = st.missing_parents.saturating_add(1);
                         }
-                    }
-                    None => {
-                        self.confirm_parents.reserve(
-                            height,
-                            inp.prev_txid,
-                            inp.prev_index,
-                        );
-                        st.reserved = st.reserved.saturating_add(1);
                     }
                 }
             }
         }
 
-        // Sort + dedup by (create_fk, vout); load once per unique create fk.
         need_load.sort_unstable();
         need_load.dedup();
         let mut uniq_fks: Vec<u64> = need_load.iter().map(|(f, _)| *f).collect();
@@ -321,19 +304,21 @@ impl Query {
         uniq_fks.dedup();
         st.parent_unique = st.parent_unique.saturating_add(uniq_fks.len() as u32);
 
-        // One get_tx_full per unique create fk (packed = 1 body IO).
         let mut loaded: HashMap<u64, (TxRecord, Vec<OutputRecord>)> =
             HashMap::with_capacity(uniq_fks.len());
         for fk_id in uniq_fks {
+            if self.confirm_cancelled() {
+                crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                return Err(StoreError::Corrupt("confirm cancelled"));
+            }
             let fk = Fk(fk_id);
             let (ptx, _ins, outs) = self.store.get_tx_full(fk)?;
             st.full_tx_reads = st.full_tx_reads.saturating_add(1);
             loaded.insert(fk_id, (ptx, outs));
         }
 
-        // Apply needed parent outs; seed tip_prevout once per unique create fk.
         let mut tip_seeded: HashMap<u64, ()> = HashMap::new();
-        for &(_h, create_fk, vout) in &need_put {
+        for &(height, create_fk, vout) in &need_put {
             let Some(id) = create_fk.get() else {
                 continue;
             };
@@ -364,11 +349,28 @@ impl Query {
             st.utxo_parents = st.utxo_parents.saturating_add(1);
         }
 
-        self.confirm_parents.mark_scanned(height);
-        Ok(())
+        // ── Phase 3: mark scanned ───────────────────────────────────────────
+        for &(height, _) in &work {
+            self.confirm_parents.mark_scanned(height);
+        }
+
+        crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+        Ok(st)
     }
 
-    /// Drop spent parent outs after Class C (resolve fk via UTXO / cache).
+    pub fn prewarm_parents_for_block_hashes(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> Result<PrewarmStats, QueryError> {
+        let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
+        let mut items = Vec::with_capacity(hashes.len());
+        for (i, hash) in hashes.iter().enumerate() {
+            let h = tip.saturating_add(1).saturating_add(i as u32);
+            items.push((h, *hash));
+        }
+        self.prewarm_parents_for_heights(&items)
+    }
+
     pub fn unpin_spent_parent_outs(
         &self,
         spends: &[([u8; 32], u32)],

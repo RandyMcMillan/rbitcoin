@@ -76,8 +76,12 @@ pub mod parent_prewarm_stats {
     pub static PARENT_UNIQUE: AtomicU64 = AtomicU64::new(0);
     /// Parent outs from cache (no store).
     pub static PARENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-    /// `get_tx_full` store calls.
+    /// `get_tx_full` store calls (bodies + parents).
     pub static FULL_TX_READS: AtomicU64 = AtomicU64::new(0);
+    /// Phase-1 body loads only.
+    pub static BODY_TX_READS: AtomicU64 = AtomicU64::new(0);
+    /// Unresolved external parents (should stay 0).
+    pub static MISSING_PARENTS: AtomicU64 = AtomicU64::new(0);
 
     /// `(ns, blocks, utxo_parents, reserved, creates, already_ready, parent_unique, cache_hits, full_tx_reads)`.
     pub fn sample_and_reset() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
@@ -122,6 +126,12 @@ pub mod parent_prewarm_stats {
         }
         if st.full_tx_reads > 0 {
             FULL_TX_READS.fetch_add(st.full_tx_reads as u64, Ordering::Relaxed);
+        }
+        if st.body_tx_reads > 0 {
+            BODY_TX_READS.fetch_add(st.body_tx_reads as u64, Ordering::Relaxed);
+        }
+        if st.missing_parents > 0 {
+            MISSING_PARENTS.fetch_add(st.missing_parents as u64, Ordering::Relaxed);
         }
     }
 }

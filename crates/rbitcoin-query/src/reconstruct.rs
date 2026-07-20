@@ -27,10 +27,10 @@ impl Query {
         Ok(n)
     }
 
-    /// Build wave prevout map. **Requires** parent prewarm ready for these blocks.
+    /// Build wave prevout map. **Requires** prewarm: bodies + parents in cache.
     ///
-    /// External parents are taken from [`crate::confirm_parent_cache`] only
-    /// (no cold store walk). Same-wave creates come from body loads.
+    /// Prefers [`crate::confirm_parent_cache`] for both block bodies and external
+    /// parents so confirm does not re-read Class A after a full prewarm.
     pub fn prefetch_tip_prevouts_for_block_hashes(
         &self,
         hashes: &[[u8; 32]],
@@ -59,11 +59,11 @@ impl Query {
             crate::WavePrevoutCache::with_capacity(wave_tx_fks.len(), wave_tx_fks.len());
         let mut noted = 0usize;
 
-        // Pass 2: wave bodies from store (sequential-ish by fk).
+        // Pass 2: wave bodies from prewarm body cache (store only if missing).
         let t_body = Instant::now();
         let mut parent_needed: HashMap<u64, HashSet<u32>> = HashMap::new();
         for &fk in &wave_tx_fks {
-            let (tx, outs, inputs) = self.load_body_from_store(fk)?;
+            let (tx, outs, inputs) = self.load_body_prewarmed(fk)?;
             let cb_h = self.coinbase_height_for_tx_with_input0(fk, &tx, inputs.first())?;
             wave.insert_parent_live(fk, tx, outs, Some(cb_h));
             noted += 1;
@@ -111,10 +111,9 @@ impl Query {
         }
         wf_add(&wf::BODY_NS, t_body.elapsed().as_nanos() as u64);
 
-        // Pass 3: external parents from ConfirmParentCache only.
+        // Pass 3: external parents from ConfirmParentCache only (prewarm filled).
         let mut parents: Vec<(u64, HashSet<u32>)> = parent_needed.into_iter().collect();
         parents.sort_unstable_by_key(|(pid, _)| *pid);
-        let spend_index_on = self.spend_index_enabled();
 
         let t_tx = Instant::now();
         for (pid, needed_vouts) in &parents {
@@ -122,8 +121,15 @@ impl Query {
             let (tx, outs_map) = if let Some((tx, outs)) = self.confirm_parents.get_parent_outs(fk)
             {
                 (tx, outs)
+            } else if let Some((tx, outs, _)) = self.confirm_parents.get_body(fk) {
+                let mut m = HashMap::new();
+                for &v in needed_vouts {
+                    if let Some(o) = outs.get(v as usize) {
+                        m.insert(v, o.clone());
+                    }
+                }
+                (tx, m)
             } else if let Some(tx) = self.tip_prevout_cache.get_tx(fk) {
-                // Tip short-circuit path.
                 let mut m = HashMap::new();
                 for &v in needed_vouts {
                     if let Some(o) = self.tip_prevout_cache.get_output_at(fk, v) {
@@ -132,7 +138,7 @@ impl Query {
                 }
                 (tx, m)
             } else {
-                // Prewarm should have populated; last-resort single-IO full body.
+                // Prewarm miss — should be rare; keep last-resort for safety.
                 let (tx, _, raw) = self.store.get_tx_full(fk)?;
                 let mut m = HashMap::new();
                 for &v in needed_vouts {
@@ -147,7 +153,6 @@ impl Query {
 
             let n = tx.output_count as usize;
             let mut slots: Vec<Option<OutputRecord>> = vec![None; n];
-            let mut need_spent = Vec::new();
             for &v in needed_vouts {
                 let vi = v as usize;
                 if vi >= n {
@@ -158,34 +163,9 @@ impl Query {
                 }
                 if let Some(o) = outs_map.get(&v) {
                     slots[vi] = Some(o.clone());
-                } else {
-                    need_spent.push(v);
                 }
             }
-
-            // Rare: missing vout — probe store once.
-            let t_sp = Instant::now();
-            for &v in &need_spent {
-                if spend_index_on {
-                    let tip = self.store.confirmed.tip_height().map(|t| t.0);
-                    let key = rbitcoin_store::PointRecord::outpoint_key(&tx.txid, v);
-                    if self.store.has_confirmed_strong_spender_key(&key, tip)? {
-                        continue;
-                    }
-                }
-                let o = if let Some(run) = tx.output_start_fk.get() {
-                    self.store.get_output_at(Fk(run), tx.output_count, v)?
-                } else {
-                    let (_, _, outs) = self.store.get_tx_full(fk)?;
-                    outs.get(v as usize)
-                        .cloned()
-                        .ok_or(StoreError::NotFound)?
-                };
-                if (v as usize) < slots.len() {
-                    slots[v as usize] = Some(o);
-                }
-            }
-            wf_add(&wf::SPENT_NS, t_sp.elapsed().as_nanos() as u64);
+            wf_add(&wf::SPENT_NS, 0);
 
             let t_cb = Instant::now();
             let cb_h = self.coinbase_height_for_tx(fk, &tx)?;
@@ -204,11 +184,21 @@ impl Query {
         Ok((noted, wave))
     }
 
+    /// Body for wave/wire: prewarm cache first, then store.
+    fn load_body_prewarmed(
+        &self,
+        fk: Fk,
+    ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>), QueryError> {
+        if let Some((tx, outs, inputs)) = self.confirm_parents.get_body(fk) {
+            return Ok((tx, outs, inputs));
+        }
+        self.load_body_from_store(fk)
+    }
+
     fn load_body_from_store(
         &self,
         fk: Fk,
     ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>), QueryError> {
-        // Packed Class A: one body IO; legacy: split tables.
         let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
         Ok((tx, outs, inputs))
     }
@@ -313,7 +303,7 @@ impl Query {
 
     /// Reconstruct a consensus `Transaction` from Class A rows (no stored raw).
     pub fn reconstruct_tx(&self, tx_fk: Fk) -> Result<Transaction, QueryError> {
-        let (rec, stored_outputs, stored_inputs) = self.load_body_from_store(tx_fk)?;
+        let (rec, stored_outputs, stored_inputs) = self.load_body_prewarmed(tx_fk)?;
         Ok(Self::transaction_from_class_a(
             rec,
             stored_outputs,

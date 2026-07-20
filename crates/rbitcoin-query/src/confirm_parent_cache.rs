@@ -19,7 +19,7 @@
 //!   deadlock tip advance whenever a batch creates and consumes a parent.
 
 use rbitcoin_primitives::Fk;
-use rbitcoin_store::{OutputRecord, TxRecord};
+use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -75,6 +75,15 @@ pub struct ParentEntry {
     pub create_height: Option<u32>,
 }
 
+/// Full Class A body for a runway height (confirm should not re-read store).
+#[derive(Debug, Clone)]
+pub struct BodyEntry {
+    pub height: u32,
+    pub tx: TxRecord,
+    pub outputs: Vec<OutputRecord>,
+    pub inputs: Vec<InputRecord>,
+}
+
 /// Per-height plan: what prevouts block `height` needs.
 #[derive(Debug, Default)]
 struct HeightPlan {
@@ -107,9 +116,11 @@ struct Inner {
     plans: BTreeMap<u32, HeightPlan>,
     /// Parent bodies keyed by create fk id.
     by_fk: HashMap<u64, ParentEntry>,
+    /// Full runway block bodies by tx fk (phase-1 prewarm).
+    by_body: HashMap<u64, BodyEntry>,
     /// create txid → fk (runway creates + loaded parents).
     by_txid: HashMap<[u8; 32], u64>,
-    /// Reserved (txid, vout) → set of heights waiting.
+    /// Reserved (txid, vout) → set of heights waiting (legacy; unused by new prewarm).
     reserve_waiters: HashMap<([u8; 32], u32), HashSet<u32>>,
 }
 
@@ -131,6 +142,7 @@ impl ConfirmParentCache {
                 ready_through: 0,
                 plans: BTreeMap::new(),
                 by_fk: HashMap::new(),
+                by_body: HashMap::new(),
                 by_txid: HashMap::new(),
                 reserve_waiters: HashMap::new(),
             }),
@@ -158,7 +170,7 @@ impl ConfirmParentCache {
         self.ready_through.load(Ordering::Relaxed)
     }
 
-    /// Advance tip: drop plans at/below tip; drop parents only needed there.
+    /// Advance tip: drop plans at/below tip; drop parents/bodies only needed there.
     pub fn advance_tip(&self, tip: u32) {
         let mut g = self.inner.lock().unwrap();
         g.tip = tip;
@@ -178,6 +190,8 @@ impl ConfirmParentCache {
                 }
             }
         }
+        // Drop full bodies at/below tip (confirmed — confirm no longer needs them).
+        g.by_body.retain(|_, b| b.height > tip);
         // Drop parent entries with no remaining plan references.
         g.gc_orphaned_parents();
         // Horizon: drop plans beyond tip+depth.
@@ -186,10 +200,51 @@ impl ConfirmParentCache {
         for h in far {
             g.plans.remove(&h);
         }
+        g.by_body.retain(|_, b| b.height <= max_h);
         g.gc_orphaned_parents();
         g.recompute_ready_through();
         self.ready_through
             .store(g.ready_through, Ordering::Relaxed);
+    }
+
+    /// Store a full runway block body (phase-1 prewarm). Confirm/wave should
+    /// prefer this over Class A store reads.
+    pub fn put_body(
+        &self,
+        fk: Fk,
+        height: u32,
+        tx: TxRecord,
+        outputs: Vec<OutputRecord>,
+        inputs: Vec<InputRecord>,
+    ) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        let mut g = self.inner.lock().unwrap();
+        g.by_txid.insert(tx.txid, id);
+        g.by_body.insert(
+            id,
+            BodyEntry {
+                height,
+                tx,
+                outputs,
+                inputs,
+            },
+        );
+    }
+
+    pub fn get_body(
+        &self,
+        fk: Fk,
+    ) -> Option<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>)> {
+        let id = fk.get()?;
+        let g = self.inner.lock().unwrap();
+        let e = g.by_body.get(&id)?;
+        Some((e.tx.clone(), e.outputs.clone(), e.inputs.clone()))
+    }
+
+    pub fn body_count(&self) -> usize {
+        self.inner.lock().unwrap().by_body.len()
     }
 
     /// Ensure a height plan exists for `hash`.
@@ -354,12 +409,10 @@ impl ConfirmParentCache {
             .insert(height);
     }
 
-    /// Register creates from a runway body.
+    /// Register creates from a runway body with **all** outputs.
     ///
-    /// Always records `txid → fk` so a later spend prewarm can resolve the
-    /// create without UTXO. Only **currently reserved** outs are stored from
-    /// `outputs` (plus any prior entry); we deliberately do not cache every
-    /// create out on the runway (mainnet: full-out register blocked IO).
+    /// Phase-1 prewarm loads full blocks first so later spends in the same
+    /// batch resolve creates without UTXO or reservations.
     pub fn register_runway_creates(
         &self,
         create_fk: Fk,
@@ -373,12 +426,6 @@ impl ConfirmParentCache {
         let mut g = self.inner.lock().unwrap();
         let txid = tx.txid;
         g.by_txid.insert(txid, id);
-        // Which outs already have waiters? (collect before mutating by_fk)
-        let fill_vouts: Vec<u32> = (0..outputs.len() as u32)
-            .filter(|v| g.reserve_waiters.contains_key(&(txid, *v)))
-            .collect();
-        // Thin entry: identity + create_height so GC can drop by_txid after tip
-        // advances (do not hold every create out — only fill open waiters).
         {
             let e = g.by_fk.entry(id).or_insert_with(|| ParentEntry {
                 tx: tx.clone(),
@@ -387,18 +434,17 @@ impl ConfirmParentCache {
             });
             e.tx = tx.clone();
             e.create_height = Some(create_height);
-            for v in &fill_vouts {
-                if let Some(o) = outputs.get(*v as usize) {
-                    e.outs.insert(
-                        *v,
-                        ParentOut {
-                            output: o.clone(),
-                        },
-                    );
-                }
+            for (v, o) in outputs.iter().enumerate() {
+                e.outs.insert(
+                    v as u32,
+                    ParentOut {
+                        output: o.clone(),
+                    },
+                );
             }
         }
-        for v in fill_vouts {
+        // Clear any legacy waiters for this create.
+        for v in 0..outputs.len() as u32 {
             let key = (txid, v);
             if let Some(waiters) = g.reserve_waiters.remove(&key) {
                 for h in waiters {
@@ -624,9 +670,8 @@ mod tests {
     }
 
     #[test]
-    fn create_before_reserve_keeps_txid_map() {
-        // Create registered first (no waiters): only by_txid, no full outs.
-        // Spend prewarm resolves via get_by_txid + store load (or put).
+    fn phase1_register_keeps_all_outs_for_later_spend() {
+        // Bodies first: create height registers all outs; spend height hits cache.
         let c = ConfirmParentCache::new(64);
         c.advance_tip(0);
         c.ensure_plan(1, [1u8; 32]);
@@ -635,33 +680,32 @@ mod tests {
         c.mark_scanned(1);
         assert!(c.is_ready(1));
         assert_eq!(c.get_by_txid(&t.txid), Some(Fk(50)));
-        // No longer cache every create out when nothing reserved yet.
-        assert!(c.get_parent_out(Fk(50), 1).is_none());
+        assert_eq!(c.get_parent_out(Fk(50), 1).unwrap().1.value, 43);
 
         c.ensure_plan(2, [2u8; 32]);
-        // Simulate prewarm spend path after by_txid hit + store load.
         c.put_utxo_parent(2, Fk(50), t.clone(), 1, out(43));
         c.mark_scanned(2);
         assert!(c.is_ready(2));
-        assert_eq!(c.get_parent_out(Fk(50), 1).unwrap().1.value, 43);
         assert_eq!(c.ready_through(), 2);
     }
 
     #[test]
-    fn create_before_reserve_txid_survives_gc() {
+    fn body_cache_survives_until_tip_advances() {
         let c = ConfirmParentCache::new(64);
         c.advance_tip(0);
-        c.ensure_plan(1, [1u8; 32]);
         let t = tx(5);
-        c.register_runway_creates(Fk(50), &t, &[out(42), out(43)], 1);
-        c.mark_scanned(1);
+        c.put_body(
+            Fk(50),
+            1,
+            t.clone(),
+            vec![out(42)],
+            vec![],
+        );
+        assert!(c.get_body(Fk(50)).is_some());
         c.advance_tip(0);
-        // by_txid must remain so later spend can resolve fk without UTXO.
-        assert_eq!(c.get_by_txid(&t.txid), Some(Fk(50)));
-        c.ensure_plan(2, [2u8; 32]);
-        c.put_utxo_parent(2, Fk(50), t, 0, out(42));
-        c.mark_scanned(2);
-        assert!(c.is_ready(2));
+        assert!(c.get_body(Fk(50)).is_some());
+        c.advance_tip(1);
+        assert!(c.get_body(Fk(50)).is_none());
     }
 
     #[test]

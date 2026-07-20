@@ -3,8 +3,7 @@
 mod server;
 
 pub use server::{
-    electrum_scripthash_hex, run_electrum, run_electrum_tls, ElectrumConfig, ElectrumHandle,
-    TipNotify,
+    electrum_scripthash_hex, run_electrum, ElectrumConfig, ElectrumHandle, TipNotify,
 };
 
 pub fn crate_name() -> &'static str {

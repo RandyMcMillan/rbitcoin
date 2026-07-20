@@ -10,17 +10,14 @@ use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use rbitcoin_store::script_hash;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Notify};
 use tokio::task::JoinHandle;
-use tokio_rustls::TlsAcceptor;
 
 const PROTOCOL_MIN: &str = "1.4";
 const PROTOCOL_MAX: &str = "1.4.2";
@@ -78,6 +75,9 @@ pub struct TipNotify {
 ///
 /// `mempool` enables broadcast, unconfirmed history/balance, fee estimates, and
 /// `transaction.get` fallback. Without it, confirmed-only behaviour remains.
+///
+/// TLS is intentionally not built in — terminate TLS at nginx/caddy/haproxy
+/// (or similar) and proxy to this TCP port.
 pub async fn run_electrum(
     config: ElectrumConfig,
     query: Arc<Query>,
@@ -124,91 +124,6 @@ pub async fn run_electrum(
         shutdown,
         tasks: vec![task],
     })
-}
-
-/// Start Electrum **TLS** listener (PEM cert + key).
-pub async fn run_electrum_tls(
-    config: ElectrumConfig,
-    query: Arc<Query>,
-    params: ChainParams,
-    tip_tx: broadcast::Sender<TipNotify>,
-    mempool: Option<Arc<MempoolHub>>,
-    cert_path: impl AsRef<Path>,
-    key_path: impl AsRef<Path>,
-) -> Result<ElectrumHandle, std::io::Error> {
-    let acceptor = load_tls_acceptor(cert_path.as_ref(), key_path.as_ref())?;
-    let listener = TcpListener::bind(config.listen).await?;
-    let local_addr = listener.local_addr()?;
-    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let shutdown_c = shutdown.clone();
-    let config = Arc::new(config);
-    let params = Arc::new(params);
-    let acceptor = Arc::new(acceptor);
-
-    let task = tokio::spawn(async move {
-        loop {
-            if shutdown_c.load(std::sync::atomic::Ordering::SeqCst) {
-                break;
-            }
-            let accept = tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                listener.accept(),
-            )
-            .await;
-            match accept {
-                Ok(Ok((stream, _))) => {
-                    let q = query.clone();
-                    let cfg = config.clone();
-                    let p = params.clone();
-                    let tip_rx = tip_tx.subscribe();
-                    let mp = mempool.clone();
-                    let acc = acceptor.clone();
-                    tokio::spawn(async move {
-                        let tls = match acc.accept(stream).await {
-                            Ok(s) => s,
-                            Err(_) => return,
-                        };
-                        let _ = handle_client(tls, q, cfg, p, tip_rx, mp).await;
-                    });
-                }
-                Ok(Err(_)) => break,
-                Err(_) => continue,
-            }
-        }
-    });
-
-    Ok(ElectrumHandle {
-        local_addr,
-        shutdown,
-        tasks: vec![task],
-    })
-}
-
-fn load_tls_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor, std::io::Error> {
-    let cert_pem = std::fs::read(cert_path)?;
-    let key_pem = std::fs::read(key_path)?;
-    let mut cert_reader = std::io::Cursor::new(cert_pem);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    if certs.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "no certificates in PEM",
-        ));
-    }
-    let mut key_reader = std::io::Cursor::new(key_pem);
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
-        .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "no private key in PEM")
-        })?;
-    let key = PrivateKeyDer::from(key);
-    let cfg = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    Ok(TlsAcceptor::from(Arc::new(cfg)))
 }
 
 async fn handle_client<S>(

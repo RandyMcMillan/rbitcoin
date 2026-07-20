@@ -21,14 +21,8 @@ pub struct NodeConfig {
     pub smoke: bool,
     /// Cap how long `run_p2p` idles after sync (None = forever). Used by tests.
     pub max_run_secs: Option<u64>,
-    /// Electrum TCP listen (`None` = disabled).
+    /// Electrum TCP listen (`None` = disabled). Terminate TLS externally if needed.
     pub electrum_listen: Option<SocketAddr>,
-    /// Electrum TLS listen (`None` = disabled). Requires cert + key paths.
-    pub electrum_tls_listen: Option<SocketAddr>,
-    /// PEM certificate for Electrum TLS.
-    pub electrum_tls_cert: Option<PathBuf>,
-    /// PEM private key for Electrum TLS.
-    pub electrum_tls_key: Option<PathBuf>,
     /// Skip script/prevout checks for blocks at or below this height (0 = off).
     /// Analogous to a coarse assumevalid / milestone for IBD speed.
     pub milestone_height: u32,
@@ -57,9 +51,6 @@ impl Default for NodeConfig {
             smoke: false,
             max_run_secs: None,
             electrum_listen: None,
-            electrum_tls_listen: None,
-            electrum_tls_cert: None,
-            electrum_tls_key: None,
             milestone_height: 0,
             // Core-ish outbound budget; IBD redials toward this many live peers.
             max_outbound: 16,

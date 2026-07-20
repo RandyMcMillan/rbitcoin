@@ -34,7 +34,7 @@ wallet / mining parity.
 | transaction.get / get_merkle | done | get falls back to mempool |
 | transaction.broadcast | done | Mempool accept + P2P inv |
 | relayfee / estimatefee / histogram | done | Libre min + live median |
-| TLS | done | `--electrum-tls-*` PEM |
+| TLS | external | terminate at reverse proxy; node is plain TCP |
 
 ## Deferred surfaces
 

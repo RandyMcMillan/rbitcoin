@@ -2,7 +2,7 @@ use crate::config::NodeConfig;
 use crate::error::NodeError;
 use bitcoin::consensus::Encodable;
 use rbitcoin_consensus::ChainParams;
-use rbitcoin_electrum::{run_electrum, run_electrum_tls, ElectrumConfig, TipNotify};
+use rbitcoin_electrum::{run_electrum, ElectrumConfig, TipNotify};
 use rbitcoin_net::{default_port, AddrMan, IbdConfig, MempoolHub, P2PNode, TipEvent};
 use rbitcoin_query::Query;
 use rbitcoin_wire_cache::WireRing;
@@ -429,79 +429,52 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     // Electrum: share Query + mempool; bridge ChainHub tip events → header push.
     let mut electrum_handles = Vec::new();
     let mut electrum_bridge = None;
-    let want_tcp = config.electrum_listen.is_some();
-    let want_tls = config.electrum_tls_listen.is_some();
-    if (want_tcp || want_tls) && !shutdown.requested() {
-        let q = node.hub.query.clone();
-        let (electrum_tip_tx, _) = broadcast::channel::<TipNotify>(64);
-        let mut hub_tips = node.hub.subscribe_tips();
-        let bridge_tx = electrum_tip_tx.clone();
-        let bridge_stop = Arc::clone(&shutdown.flag);
-        electrum_bridge = Some(tokio::spawn(async move {
-            loop {
-                if bridge_stop.load(Ordering::SeqCst) {
-                    break;
-                }
-                match hub_tips.recv().await {
-                    Ok(ev) => {
-                        let mut buf = Vec::with_capacity(80);
-                        if ev.header.consensus_encode(&mut buf).is_err() {
-                            continue;
-                        }
-                        let _ = bridge_tx.send(TipNotify {
-                            height: ev.height,
-                            header_hex: rbitcoin_primitives::hex_encode(buf),
-                        });
+    if let Some(addr) = config.electrum_listen {
+        if !shutdown.requested() {
+            let q = node.hub.query.clone();
+            let (electrum_tip_tx, _) = broadcast::channel::<TipNotify>(64);
+            let mut hub_tips = node.hub.subscribe_tips();
+            let bridge_tx = electrum_tip_tx.clone();
+            let bridge_stop = Arc::clone(&shutdown.flag);
+            electrum_bridge = Some(tokio::spawn(async move {
+                loop {
+                    if bridge_stop.load(Ordering::SeqCst) {
+                        break;
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    match hub_tips.recv().await {
+                        Ok(ev) => {
+                            let mut buf = Vec::with_capacity(80);
+                            if ev.header.consensus_encode(&mut buf).is_err() {
+                                continue;
+                            }
+                            let _ = bridge_tx.send(TipNotify {
+                                height: ev.height,
+                                header_hex: rbitcoin_primitives::hex_encode(buf),
+                            });
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
                 }
-            }
-        }));
-        if let Some(addr) = config.electrum_listen {
+            }));
             let ecfg = ElectrumConfig::for_params(addr, &params);
             match run_electrum(
                 ecfg,
-                q.clone(),
+                q,
                 params.clone(),
-                electrum_tip_tx.clone(),
+                electrum_tip_tx,
                 Some(mempool.clone()),
             )
             .await
             {
                 Ok(h) => {
                     info!(
-                        "electrum TCP on {} (Query + mempool broadcast/unconf/fees)",
+                        "electrum TCP on {} (Query + mempool; terminate TLS externally if needed)",
                         h.local_addr
                     );
                     electrum_handles.push(h);
                 }
                 Err(e) => warn!("electrum TCP start warning: {e}"),
-            }
-        }
-        if let Some(addr) = config.electrum_tls_listen {
-            let cert = config
-                .electrum_tls_cert
-                .clone()
-                .expect("validated in cli");
-            let key = config.electrum_tls_key.clone().expect("validated in cli");
-            let ecfg = ElectrumConfig::for_params(addr, &params);
-            match run_electrum_tls(
-                ecfg,
-                q,
-                params.clone(),
-                electrum_tip_tx,
-                Some(mempool.clone()),
-                cert,
-                key,
-            )
-            .await
-            {
-                Ok(h) => {
-                    info!("electrum TLS on {} (PEM cert/key)", h.local_addr);
-                    electrum_handles.push(h);
-                }
-                Err(e) => warn!("electrum TLS start warning: {e}"),
             }
         }
     }

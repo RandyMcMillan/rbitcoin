@@ -3,7 +3,7 @@
 ## Status
 
 **Plan P0–P7 complete** (BIP324 v2-only P2P, cluster mempool, Libre admission, Electrum
-confirmed + unconfirmed, optional TLS). Mainnet full validation (`--milestone 0`) is
+confirmed + unconfirmed; TLS via reverse proxy). Mainnet full validation (`--milestone 0`) is
 still **experimental**: exercise soak, reorgs, and disk headroom before production use.
 
 Architecture: **archive-before-confirm** — block bodies land in Class A as peers
@@ -125,17 +125,13 @@ Policy lives in `rbitcoin-consensus::policy` and is **never** applied on block c
   --log-level info
 ```
 
-TLS (PEM cert + key):
-
-```bash
-  --electrum-tls-listen 0.0.0.0:50002 \
-  --electrum-tls-cert /path/to/fullchain.pem \
-  --electrum-tls-key /path/to/privkey.pem
-```
+TLS is **not** built into the node. Terminate TLS at nginx, Caddy, HAProxy, etc.,
+and proxy plain TCP to `--electrum-listen` (e.g. `127.0.0.1:50001`).
 
 | Feature | Behavior |
 |---------|----------|
 | Banner | states **libre-relay-class** |
+| Transport | plain TCP only (external TLS termination) |
 | `transaction.broadcast` | mempool accept → P2P inv announce |
 | Unconfirmed history/balance/mempool | from cluster mempool |
 | `transaction.get` | chain then mempool fallback |
@@ -189,7 +185,7 @@ Full script validation (slow, used for consensus parity labs):
 - [ ] Post-milestone or `--milestone 0` script path exercised
 - [ ] Disk headroom for full Class A archive
 - [ ] Mempool file growth bounded under load (compaction + eviction)
-- [ ] Electrum TCP/TLS wallet smoke (subscribe, broadcast, fees)
+- [ ] Electrum TCP wallet smoke (subscribe, broadcast, fees; TLS via proxy if needed)
 - [ ] Peer diversity and reorg behavior under load
 
 ## 16 GiB RAM / sluggish disk (mainnet)

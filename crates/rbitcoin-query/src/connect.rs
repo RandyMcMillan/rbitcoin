@@ -440,7 +440,7 @@ impl Query {
         let tx_fks = self.block_tx_fks(height)?;
 
         // Undo catch-up spentness oracle for this tip (Core reorg).
-        let mut unspends: Vec<([u8; 32], u32)> = Vec::new();
+        let mut unspends: Vec<([u8; 32], u32, Fk)> = Vec::new();
         let mut uncreates: Vec<([u8; 32], u32)> = Vec::new();
         for &tx_fk in &tx_fks {
             let tx = self.store.get_tx(tx_fk)?;
@@ -456,24 +456,35 @@ impl Query {
                     continue;
                 }
                 let prev_txid = self.resolve_prev_txid(inp)?;
-                unspends.push((prev_txid, inp.prev_index));
+                // Prefer stamped local prev; else head/runs; rare linear Class A scan.
+                let parent_fk = inp
+                    .prev_tx_fk
+                    .get()
+                    .map(Fk)
+                    .or_else(|| self.tx_fk_by_txid(&prev_txid).ok().flatten())
+                    .or_else(|| self.find_tx_fk_by_txid_scan(&prev_txid).ok().flatten())
+                    .unwrap_or(Fk::NULL);
+                unspends.push((prev_txid, inp.prev_index, parent_fk));
             }
         }
         if self.ibd_utxo_enabled() {
-            // Reverse of apply: remove creates, re-insert spends.
+            // Reverse of apply: remove creates, re-insert spent prevouts with create fk.
             let mut g = self.ibd_utxo.lock().unwrap();
             if let Some(ref mut u) = *g {
                 for &(txid, vout) in &uncreates {
-                    let _ = u.take_spend(&txid, vout)?; // remove created outs
+                    let _ = u.take_spend(&txid, vout)?;
                 }
-                for &(txid, vout) in &unspends {
-                    u.insert_create(&txid, vout)?; // restore prevouts
+                for &(txid, vout, parent_fk) in &unspends {
+                    if !parent_fk.is_null() {
+                        u.insert_create(&txid, vout, parent_fk)?;
+                    }
                 }
                 let new_tip = height.0.checked_sub(1);
                 u.commit_tip(new_tip)?;
             }
         } else {
-            self.unnote_outpoints_spent_local(&unspends);
+            let spends_only: Vec<_> = unspends.iter().map(|&(t, v, _)| (t, v)).collect();
+            self.unnote_outpoints_spent_local(&spends_only);
         }
 
         let mut touched_sh: Vec<[u8; 32]> = Vec::new();

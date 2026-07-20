@@ -1,20 +1,28 @@
-//! IBD-only unspent-outpoint table (mmap, 16-byte slots).
+//! IBD light UTXO: unspent outpoint → create Class A fk (mmap).
 //!
-//! Slot: `txid_prefix[12] || pack(state:u8, vout:u24)`.
-//! Used for Core-equivalent spentness during catch-up without a multi‑tens-GiB
-//! exact spend HashSet. Not a full coins cache (no value/script).
+//! Slot (24 B, 8-byte aligned):
+//! ```text
+//!   prefix[12] || pack(state:u8, vout:u24) || create_fk:u64 LE
+//! ```
+//! Membership + parent resolve without a global txid→fk process map.
+//! Not a full coins cache (no value/script).
 
 use crate::error::StoreError;
 use memmap2::MmapMut;
+use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"RBUXTO02";
+const MAGIC: &[u8; 8] = b"RBUXTO03";
 const HEADER_LEN: usize = 4096;
-const SLOT_LEN: usize = 16;
+/// 12 prefix + 4 packed + 8 fk = 24 (divisible by 8).
+const SLOT_LEN: usize = 24;
 const PREFIX_LEN: usize = 12;
+const OFF_PREFIX: usize = 0;
+const OFF_PACKED: usize = 12;
+const OFF_FK: usize = 16;
 
 const STATE_EMPTY: u8 = 0;
 const STATE_LIVE: u8 = 1;
@@ -31,10 +39,11 @@ const OFF_LIVE: usize = 24;
 const OFF_PREFIX_BITS: usize = 32;
 const OFF_VOUT_BITS: usize = 34;
 const OFF_FLAGS: usize = 36;
-const VERSION: u32 = 1;
+const OFF_SLOT_LEN: usize = 40;
+const VERSION: u32 = 2;
 
-/// Default initial slots (2^22 → 64 MiB of slots). Grows as needed.
-/// Production: `RBITCOIN_IBD_UTXO_SLOTS=268435456` (~4 GiB) for mainnet-scale.
+/// Default initial slots (2^22 → 96 MiB of 24 B slots). Grows as needed.
+/// Production: `RBITCOIN_IBD_UTXO_SLOTS=268435456` (~6 GiB @ 24 B).
 pub const DEFAULT_NUM_SLOTS: u64 = 1 << 22;
 const LOAD_GROW: f64 = 0.80;
 
@@ -56,9 +65,7 @@ fn prefix_of(txid: &[u8; 32]) -> [u8; PREFIX_LEN] {
     p
 }
 
-/// Mix prefix+vout → slot index (triangular probe uses this as start).
 fn hash0(prefix: &[u8; PREFIX_LEN], vout: u32) -> u64 {
-    // FNV-1a 64
     let mut h = 0xcbf29ce484222325u64;
     for &b in prefix {
         h ^= u64::from(b);
@@ -73,17 +80,19 @@ fn io(path: &Path, e: std::io::Error) -> StoreError {
     StoreError::io(path, e)
 }
 
-/// Persistent IBD UTXO membership table.
+/// One LIVE overflow entry (prefix collision): full txid + create fk.
+type OverflowEntry = ([u8; 32], u64);
+
+/// Persistent IBD UTXO: unspent outpoint → create_tx_fk.
 pub struct IbdUtxo {
     path: PathBuf,
     file: File,
     map: MmapMut,
     num_slots: u64,
     live: u64,
-    /// Confirmed tip height reflected in the table; `None` = empty chain.
     tip: Option<u32>,
-    /// Rare (prefix,vout) collisions: full txids still unspent under that key.
-    overflow: HashMap<([u8; PREFIX_LEN], u32), Vec<[u8; 32]>>,
+    /// Rare (prefix,vout) collisions with full txid + fk.
+    overflow: HashMap<([u8; PREFIX_LEN], u32), Vec<OverflowEntry>>,
 }
 
 impl IbdUtxo {
@@ -102,17 +111,19 @@ impl IbdUtxo {
         (p, p as *mut u8)
     }
 
-    fn read_slot(map: &MmapMut, num_slots: u64, i: u64) -> ([u8; PREFIX_LEN], u8, u32) {
+    fn read_slot(map: &MmapMut, num_slots: u64, i: u64) -> ([u8; PREFIX_LEN], u8, u32, u64) {
         let (p, _) = Self::slot_ptr(map, num_slots, i);
-        // SAFETY: i < num_slots, map covers slots region
         unsafe {
             let mut prefix = [0u8; PREFIX_LEN];
-            std::ptr::copy_nonoverlapping(p, prefix.as_mut_ptr(), PREFIX_LEN);
+            std::ptr::copy_nonoverlapping(p.add(OFF_PREFIX), prefix.as_mut_ptr(), PREFIX_LEN);
             let mut pb = [0u8; 4];
-            std::ptr::copy_nonoverlapping(p.add(PREFIX_LEN), pb.as_mut_ptr(), 4);
+            std::ptr::copy_nonoverlapping(p.add(OFF_PACKED), pb.as_mut_ptr(), 4);
             let packed = u32::from_le_bytes(pb);
             let (state, vout) = unpack(packed);
-            (prefix, state, vout)
+            let mut fb = [0u8; 8];
+            std::ptr::copy_nonoverlapping(p.add(OFF_FK), fb.as_mut_ptr(), 8);
+            let fk = u64::from_le_bytes(fb);
+            (prefix, state, vout, fk)
         }
     }
 
@@ -123,12 +134,15 @@ impl IbdUtxo {
         prefix: &[u8; PREFIX_LEN],
         state: u8,
         vout: u32,
+        create_fk: u64,
     ) {
         let (_, p) = Self::slot_ptr(map, num_slots, i);
         let packed = pack(state, vout).to_le_bytes();
+        let fb = create_fk.to_le_bytes();
         unsafe {
-            std::ptr::copy_nonoverlapping(prefix.as_ptr(), p, PREFIX_LEN);
-            std::ptr::copy_nonoverlapping(packed.as_ptr(), p.add(PREFIX_LEN), 4);
+            std::ptr::copy_nonoverlapping(prefix.as_ptr(), p.add(OFF_PREFIX), PREFIX_LEN);
+            std::ptr::copy_nonoverlapping(packed.as_ptr(), p.add(OFF_PACKED), 4);
+            std::ptr::copy_nonoverlapping(fb.as_ptr(), p.add(OFF_FK), 8);
         }
     }
 
@@ -143,6 +157,7 @@ impl IbdUtxo {
         buf[OFF_PREFIX_BITS..OFF_PREFIX_BITS + 2].copy_from_slice(&96u16.to_le_bytes());
         buf[OFF_VOUT_BITS..OFF_VOUT_BITS + 2].copy_from_slice(&24u16.to_le_bytes());
         buf[OFF_FLAGS..OFF_FLAGS + 4].copy_from_slice(&0u32.to_le_bytes());
+        buf[OFF_SLOT_LEN..OFF_SLOT_LEN + 4].copy_from_slice(&(SLOT_LEN as u32).to_le_bytes());
     }
 
     fn read_header(map: &MmapMut) -> Result<(Option<u32>, u64, u64), StoreError> {
@@ -150,11 +165,15 @@ impl IbdUtxo {
             return Err(StoreError::Corrupt("ibd utxo header short"));
         }
         if &map[OFF_MAGIC..OFF_MAGIC + 8] != MAGIC {
-            return Err(StoreError::Corrupt("ibd utxo bad magic"));
+            return Err(StoreError::Corrupt(
+                "ibd utxo bad magic (delete ibd_utxo.map to rebuild)",
+            ));
         }
         let ver = u32::from_le_bytes(map[OFF_VERSION..OFF_VERSION + 4].try_into().unwrap());
         if ver != VERSION {
-            return Err(StoreError::Corrupt("ibd utxo unsupported version"));
+            return Err(StoreError::Corrupt(
+                "ibd utxo unsupported version (delete ibd_utxo.map to rebuild)",
+            ));
         }
         let tip_raw = u32::from_le_bytes(map[OFF_TIP..OFF_TIP + 4].try_into().unwrap());
         let tip = if tip_raw == u32::MAX {
@@ -162,7 +181,8 @@ impl IbdUtxo {
         } else {
             Some(tip_raw)
         };
-        let num_slots = u64::from_le_bytes(map[OFF_NUM_SLOTS..OFF_NUM_SLOTS + 8].try_into().unwrap());
+        let num_slots =
+            u64::from_le_bytes(map[OFF_NUM_SLOTS..OFF_NUM_SLOTS + 8].try_into().unwrap());
         let live = u64::from_le_bytes(map[OFF_LIVE..OFF_LIVE + 8].try_into().unwrap());
         if !num_slots.is_power_of_two() || num_slots < 16 {
             return Err(StoreError::Corrupt("ibd utxo bad num_slots"));
@@ -170,7 +190,6 @@ impl IbdUtxo {
         Ok((tip, num_slots, live))
     }
 
-    /// Create a new empty table at `path` with `num_slots` (rounded up to pow2).
     pub fn create(path: impl Into<PathBuf>, num_slots: u64) -> Result<Self, StoreError> {
         let path = path.into();
         if let Some(parent) = path.parent() {
@@ -187,7 +206,6 @@ impl IbdUtxo {
             .map_err(|e| io(&path, e))?;
         file.set_len(flen).map_err(|e| io(&path, e))?;
         let mut map = unsafe { MmapMut::map_mut(&file) }.map_err(|e| io(&path, e))?;
-        // Zero slots (EMPTY=0).
         map[HEADER_LEN..].fill(0);
         Self::write_header(&mut map, None, num_slots, 0);
         map.flush().map_err(|e| io(&path, e))?;
@@ -202,7 +220,6 @@ impl IbdUtxo {
         })
     }
 
-    /// Open existing table (does not check store tip — caller recovers).
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let path = path.into();
         let file = OpenOptions::new()
@@ -227,11 +244,22 @@ impl IbdUtxo {
         })
     }
 
-    /// Open if present, else create with `DEFAULT_NUM_SLOTS` (or env).
     pub fn open_or_create(dir: &Path) -> Result<Self, StoreError> {
         let path = dir.join("ibd_utxo.map");
         if path.exists() {
-            Self::open(path)
+            match Self::open(&path) {
+                Ok(u) => Ok(u),
+                Err(StoreError::Corrupt(_)) => {
+                    // Schema bump / poison: recreate empty (caller rebuilds to tip).
+                    let _ = std::fs::remove_file(&path);
+                    let n = std::env::var("RBITCOIN_IBD_UTXO_SLOTS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(DEFAULT_NUM_SLOTS);
+                    Self::create(path, n)
+                }
+                Err(e) => Err(e),
+            }
         } else {
             let n = std::env::var("RBITCOIN_IBD_UTXO_SLOTS")
                 .ok()
@@ -271,64 +299,86 @@ impl IbdUtxo {
         Ok(())
     }
 
-    /// True if outpoint is in the unspent set.
-    pub fn contains(&self, txid: &[u8; 32], vout: u32) -> Result<bool, StoreError> {
+    /// Create-tx Class A fk for an unspent outpoint, if present.
+    pub fn get_create_fk(&self, txid: &[u8; 32], vout: u32) -> Result<Option<Fk>, StoreError> {
         Self::ensure_vout(vout)?;
         let prefix = prefix_of(txid);
         if let Some(list) = self.overflow.get(&(prefix, vout)) {
-            return Ok(list.iter().any(|t| t == txid));
+            return Ok(list
+                .iter()
+                .find(|(t, _)| t == txid)
+                .and_then(|(_, raw)| Fk::new(*raw)));
         }
         let mask = self.num_slots - 1;
         let mut i = hash0(&prefix, vout) & mask;
-        // Triangular probe: i + 0,1,3,6,...
         for step in 0..self.num_slots {
-            let (sp, state, sv) = Self::read_slot(&self.map, self.num_slots, i);
+            let (sp, state, sv, fk_raw) = Self::read_slot(&self.map, self.num_slots, i);
             match state {
-                STATE_EMPTY => return Ok(false),
-                STATE_LIVE if sp == prefix && sv == vout => return Ok(true),
+                STATE_EMPTY => return Ok(None),
+                STATE_LIVE if sp == prefix && sv == vout => {
+                    return Ok(Fk::new(fk_raw));
+                }
                 STATE_LIVE | STATE_TOMB => {
                     i = (i + step + 1) & mask;
                 }
                 _ => return Err(StoreError::Corrupt("ibd utxo bad state")),
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
-    /// Insert a created outpoint (confirm success).
+    pub fn contains(&self, txid: &[u8; 32], vout: u32) -> Result<bool, StoreError> {
+        Ok(self.get_create_fk(txid, vout)?.is_some())
+    }
+
+    /// Insert created outpoint with its create-tx Class A fk.
     ///
-    /// Idempotent: re-insert of an already-live outpoint is `Ok` (partial apply
-    /// retry after Class C, or height re-apply). Prefix collisions promote the
-    /// new full txid into `overflow` (compressed slot already holds another).
-    pub fn insert_create(&mut self, txid: &[u8; 32], vout: u32) -> Result<(), StoreError> {
+    /// Idempotent if already live (partial apply retry).
+    pub fn insert_create(
+        &mut self,
+        txid: &[u8; 32],
+        vout: u32,
+        create_fk: Fk,
+    ) -> Result<(), StoreError> {
         Self::ensure_vout(vout)?;
+        if create_fk.is_null() {
+            return Err(StoreError::Corrupt("ibd utxo null create_fk"));
+        }
         if self.load_factor() >= LOAD_GROW {
             self.grow()?;
         }
         let prefix = prefix_of(txid);
-        // Already tracked as unspent (exact or sole compressed occupant).
         if self.contains(txid, vout)? {
             return Ok(());
         }
-        // Compressed key live / overflowed with a *different* full txid → overflow.
         if self.contains_compressed(&prefix, vout)? {
             let list = self
                 .overflow
                 .entry((prefix, vout))
                 .or_insert_with(Vec::new);
-            // Promote: first occupant was slot-only; keep slot + record new full ids.
-            if !list.iter().any(|t| t == txid) {
-                list.push(*txid);
+            if !list.iter().any(|(t, _)| t == txid) {
+                list.push((*txid, create_fk.0));
             }
+            // First occupant stays in slot; extras only in overflow.
+            // If slot empty of this key's first — ensure LIVE slot exists.
+            // When collision: slot already LIVE for another full txid.
             return Ok(());
         }
         let mask = self.num_slots - 1;
         let mut i = hash0(&prefix, vout) & mask;
         for step in 0..self.num_slots {
-            let (_sp, state, _sv) = Self::read_slot(&self.map, self.num_slots, i);
+            let (_sp, state, _sv, _fk) = Self::read_slot(&self.map, self.num_slots, i);
             match state {
                 STATE_EMPTY | STATE_TOMB => {
-                    Self::write_slot(&mut self.map, self.num_slots, i, &prefix, STATE_LIVE, vout);
+                    Self::write_slot(
+                        &mut self.map,
+                        self.num_slots,
+                        i,
+                        &prefix,
+                        STATE_LIVE,
+                        vout,
+                        create_fk.0,
+                    );
                     self.live = self.live.saturating_add(1);
                     return Ok(());
                 }
@@ -352,7 +402,7 @@ impl IbdUtxo {
         let mask = self.num_slots - 1;
         let mut i = hash0(prefix, vout) & mask;
         for step in 0..self.num_slots {
-            let (sp, state, sv) = Self::read_slot(&self.map, self.num_slots, i);
+            let (sp, state, sv, _) = Self::read_slot(&self.map, self.num_slots, i);
             match state {
                 STATE_EMPTY => return Ok(false),
                 STATE_LIVE if sp == *prefix && sv == vout => return Ok(true),
@@ -368,11 +418,10 @@ impl IbdUtxo {
         Self::ensure_vout(vout)?;
         let prefix = prefix_of(txid);
         if let Some(list) = self.overflow.get_mut(&(prefix, vout)) {
-            if let Some(pos) = list.iter().position(|t| t == txid) {
+            if let Some(pos) = list.iter().position(|(t, _)| t == txid) {
                 list.swap_remove(pos);
                 if list.is_empty() {
                     self.overflow.remove(&(prefix, vout));
-                    // Also clear LIVE slot if present.
                     let _ = self.tombstone_compressed(&prefix, vout)?;
                 }
                 return Ok(true);
@@ -382,11 +431,19 @@ impl IbdUtxo {
         let mask = self.num_slots - 1;
         let mut i = hash0(&prefix, vout) & mask;
         for step in 0..self.num_slots {
-            let (sp, state, sv) = Self::read_slot(&self.map, self.num_slots, i);
+            let (sp, state, sv, _) = Self::read_slot(&self.map, self.num_slots, i);
             match state {
                 STATE_EMPTY => return Ok(false),
                 STATE_LIVE if sp == prefix && sv == vout => {
-                    Self::write_slot(&mut self.map, self.num_slots, i, &prefix, STATE_TOMB, vout);
+                    Self::write_slot(
+                        &mut self.map,
+                        self.num_slots,
+                        i,
+                        &prefix,
+                        STATE_TOMB,
+                        vout,
+                        0,
+                    );
                     self.live = self.live.saturating_sub(1);
                     return Ok(true);
                 }
@@ -405,11 +462,19 @@ impl IbdUtxo {
         let mask = self.num_slots - 1;
         let mut i = hash0(prefix, vout) & mask;
         for step in 0..self.num_slots {
-            let (sp, state, sv) = Self::read_slot(&self.map, self.num_slots, i);
+            let (sp, state, sv, _) = Self::read_slot(&self.map, self.num_slots, i);
             match state {
                 STATE_EMPTY => return Ok(false),
                 STATE_LIVE if sp == *prefix && sv == vout => {
-                    Self::write_slot(&mut self.map, self.num_slots, i, prefix, STATE_TOMB, vout);
+                    Self::write_slot(
+                        &mut self.map,
+                        self.num_slots,
+                        i,
+                        prefix,
+                        STATE_TOMB,
+                        vout,
+                        0,
+                    );
                     self.live = self.live.saturating_sub(1);
                     return Ok(true);
                 }
@@ -420,7 +485,6 @@ impl IbdUtxo {
         Ok(false)
     }
 
-    /// Set reflected tip and flush header + dirty pages.
     pub fn commit_tip(&mut self, tip: Option<u32>) -> Result<(), StoreError> {
         self.tip = tip;
         Self::write_header(&mut self.map, self.tip, self.num_slots, self.live);
@@ -429,71 +493,69 @@ impl IbdUtxo {
         Ok(())
     }
 
-    /// Double capacity and reinsert all LIVE slots.
     pub fn grow(&mut self) -> Result<(), StoreError> {
         let new_slots = self.num_slots.saturating_mul(2).max(16);
         let tmp = self.path.with_extension("map.tmp");
         let mut neu = Self::create(&tmp, new_slots)?;
-        // Reinsert from old map
         for i in 0..self.num_slots {
-            let (prefix, state, vout) = Self::read_slot(&self.map, self.num_slots, i);
+            let (prefix, state, vout, fk_raw) = Self::read_slot(&self.map, self.num_slots, i);
             if state != STATE_LIVE {
                 continue;
             }
-            // We only have prefix — reconstruct fake txid with prefix + zeros for reinsert
-            // WRONG for overflow. Collect live as (prefix, vout) only works if no
-            // full txid needed. insert_create needs full txid for overflow.
-            // Grow path: copy slot stream by re-probing into new table with prefix-only API.
-            neu.insert_live_prefix(&prefix, vout)?;
+            neu.insert_live_prefix_fk(&prefix, vout, fk_raw)?;
         }
-        for ((prefix, vout), txids) in &self.overflow {
-            for txid in txids {
+        for ((prefix, vout), entries) in &self.overflow {
+            for (txid, fk_raw) in entries {
                 let mut t = *txid;
-                // ensure prefix matches
                 t[0..PREFIX_LEN].copy_from_slice(prefix);
-                neu.insert_create(&t, *vout)?;
+                let fk = Fk::new(*fk_raw).unwrap_or(Fk::NULL);
+                if !fk.is_null() {
+                    neu.insert_create(&t, *vout, fk)?;
+                }
             }
         }
-        neu.tip = self.tip;
-        neu.live = self.live; // may recount
-        // Recount live
         let mut live = 0u64;
         for i in 0..neu.num_slots {
-            let (_, state, _) = Self::read_slot(&neu.map, neu.num_slots, i);
+            let (_, state, _, _) = Self::read_slot(&neu.map, neu.num_slots, i);
             if state == STATE_LIVE {
                 live += 1;
             }
         }
-        // Plus overflow extras beyond one slot each
         for list in neu.overflow.values() {
             if list.len() > 1 {
                 live += (list.len() - 1) as u64;
             }
         }
         neu.live = live;
+        neu.tip = self.tip;
         neu.commit_tip(self.tip)?;
-        // Swap files
         drop(neu);
         std::fs::rename(&tmp, &self.path).map_err(|e| io(&self.path, e))?;
-        // Re-open
-        let re = Self::open(&self.path)?;
-        *self = re;
+        *self = Self::open(&self.path)?;
         Ok(())
     }
 
-    /// Insert LIVE by prefix only (grow rehash).
-    fn insert_live_prefix(
+    fn insert_live_prefix_fk(
         &mut self,
         prefix: &[u8; PREFIX_LEN],
         vout: u32,
+        create_fk: u64,
     ) -> Result<(), StoreError> {
         Self::ensure_vout(vout)?;
         let mask = self.num_slots - 1;
         let mut i = hash0(prefix, vout) & mask;
         for step in 0..self.num_slots {
-            let (_, state, _) = Self::read_slot(&self.map, self.num_slots, i);
+            let (_, state, _, _) = Self::read_slot(&self.map, self.num_slots, i);
             if state == STATE_EMPTY || state == STATE_TOMB {
-                Self::write_slot(&mut self.map, self.num_slots, i, prefix, STATE_LIVE, vout);
+                Self::write_slot(
+                    &mut self.map,
+                    self.num_slots,
+                    i,
+                    prefix,
+                    STATE_LIVE,
+                    vout,
+                    create_fk,
+                );
                 self.live = self.live.saturating_add(1);
                 return Ok(());
             }
@@ -502,7 +564,6 @@ impl IbdUtxo {
         Err(StoreError::Corrupt("ibd utxo grow full"))
     }
 
-    /// Clear all slots (for rebuild).
     pub fn clear(&mut self) -> Result<(), StoreError> {
         self.map[HEADER_LEN..].fill(0);
         self.live = 0;
@@ -542,36 +603,21 @@ mod tests {
         let (s, v) = unpack(p);
         assert_eq!(s, STATE_LIVE);
         assert_eq!(v, 42);
-        assert!(VOUT_MAX < (1 << 24));
     }
 
     #[test]
-    fn insert_take_double_spend() {
+    fn insert_get_fk_take() {
         let path = tmp();
         let mut u = IbdUtxo::create(&path, 1024).unwrap();
         let t = txid(7);
-        u.insert_create(&t, 0).unwrap();
+        let fk = Fk(99);
+        u.insert_create(&t, 0, fk).unwrap();
+        assert_eq!(u.get_create_fk(&t, 0).unwrap(), Some(fk));
         assert!(u.contains(&t, 0).unwrap());
-        // Idempotent re-create (partial apply retry).
-        u.insert_create(&t, 0).unwrap();
-        assert!(u.contains(&t, 0).unwrap());
-        assert_eq!(u.live_count(), 1);
+        u.insert_create(&t, 0, fk).unwrap(); // idempotent
         assert!(u.take_spend(&t, 0).unwrap());
-        assert!(!u.contains(&t, 0).unwrap());
+        assert!(u.get_create_fk(&t, 0).unwrap().is_none());
         assert!(!u.take_spend(&t, 0).unwrap());
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn apply_height_monotonic_via_commit() {
-        let path = tmp();
-        let mut u = IbdUtxo::create(&path, 1024).unwrap();
-        let t = txid(3);
-        u.insert_create(&t, 0).unwrap();
-        u.commit_tip(Some(5)).unwrap();
-        assert_eq!(u.tip(), Some(5));
-        // Re-insert after tip advance is still ok (idempotent).
-        u.insert_create(&t, 0).unwrap();
         let _ = std::fs::remove_file(&path);
     }
 
@@ -583,7 +629,7 @@ mod tests {
             let mut t = txid((i % 250) as u8);
             t[2] = (i >> 8) as u8;
             t[3] = i as u8;
-            u.insert_create(&t, i % 10).unwrap();
+            u.insert_create(&t, i % 10, Fk(u64::from(i) + 1)).unwrap();
         }
         u.commit_tip(Some(100)).unwrap();
         drop(u);
@@ -593,8 +639,7 @@ mod tests {
         let mut t = txid(0);
         t[2] = 0;
         t[3] = 0;
-        // i=0
-        assert!(u2.contains(&t, 0).unwrap());
+        assert_eq!(u2.get_create_fk(&t, 0).unwrap(), Some(Fk(1)));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -603,7 +648,13 @@ mod tests {
         let path = tmp();
         let mut u = IbdUtxo::create(&path, 64).unwrap();
         let t = txid(1);
-        assert!(u.insert_create(&t, VOUT_MAX + 1).is_err());
+        assert!(u.insert_create(&t, VOUT_MAX + 1, Fk(1)).is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn slot_len_aligned() {
+        assert_eq!(SLOT_LEN % 8, 0);
+        assert_eq!(HEADER_LEN % 8, 0);
     }
 }

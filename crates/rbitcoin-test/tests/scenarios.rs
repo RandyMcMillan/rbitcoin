@@ -518,8 +518,8 @@ fn resume_work_path_sees_archived_bodies_after_reopen() {
 /// Single scenario covering the signet @2148 failure class and parallel IBD:
 /// - archive bodies out of height order (ahead of tip)
 /// - re-archive / mega-batch duplicate is idempotent (fk + tx_height stable)
-/// - `tx.head` off: prevouts via process cache / prev_tx_fk
-/// - durable points off on confirm (process-local spent set); backfill restores spenders()
+/// - `tx.head` off: prevouts via light UTXO create_fk (external prev on Class A)
+/// - durable points off on confirm (process-local / UTXO); backfill restores spenders()
 /// - coinbase maturity then spend still connects
 #[test]
 fn ibd_parallel_archive_idempotent_confirm_without_tx_head() {
@@ -533,6 +533,7 @@ fn ibd_parallel_archive_idempotent_confirm_without_tx_head() {
     let q = Query::open_or_create(td.store_path()).unwrap();
     q.set_tx_index(false);
     q.set_spend_index(false);
+    q.enable_ibd_utxo().unwrap();
     let ms = Milestone { height: 1_000_000 };
     let params = ChainParams::regtest();
     let maturity = params.coinbase_maturity();
@@ -633,10 +634,12 @@ fn ibd_parallel_archive_idempotent_confirm_without_tx_head() {
     let fks = q.block_tx_fks(Height(spend_h)).unwrap();
     assert!(fks.len() >= 2);
     let inp = q.tx_input(&q.get_tx(fks[1]).unwrap(), 0).unwrap();
+    // Cross-batch parent: archive leaves external prev; confirm used UTXO create_fk.
     assert!(
-        !inp.prev_tx_fk.is_null(),
-        "prev_tx_fk stamped via process cache when tx.head is off"
+        inp.prev_tx_fk.is_null(),
+        "archive does not stamp cross-batch prev_tx_fk (UTXO holds create_fk)"
     );
+    assert_ne!(inp.prev_txid, [0u8; 32]);
 }
 
 /// Milestone 0 / `spend_index` on: archive writes point edges before Class C.
@@ -843,11 +846,10 @@ fn confirm_survives_partial_class_c_without_tip_advance() {
     assert_eq!(q2.tip_height(), Some(Height(spend_h + 1)));
 }
 
-/// Resume with `tx.head` off: spend archived without parent in the process cache
-/// stores external prev_txid. After reopen, warm Class A txid→fk so confirm can
-/// resolve prevouts (signet stuck at missing prevout after restart).
+/// Resume with `tx.head` off: spend archived with external prev_txid; confirm
+/// resolves parent via light UTXO create_fk (no process txid map / warm).
 #[test]
-fn resume_head_off_warms_cache_for_external_prev() {
+fn resume_head_off_utxo_resolves_external_prev() {
     use rbitcoin_consensus::{
         accept_and_archive_block, accept_and_connect_block, confirm_archived_at, ChainParams,
         Milestone,
@@ -864,6 +866,7 @@ fn resume_head_off_warms_cache_for_external_prev() {
         let q = Query::open_or_create(td.store_path()).unwrap();
         q.set_tx_index(false);
         q.set_spend_index(false);
+        q.enable_ibd_utxo().unwrap();
         let genesis = regtest_genesis();
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
         let mut tip = genesis.block_hash();
@@ -888,12 +891,18 @@ fn resume_head_off_warms_cache_for_external_prev() {
     };
     let _ = (tip, tip_time);
 
-    // Session 2: cold process cache, head still off — archive spend before warm.
-    // Parent coinbase is on disk but not in RAM cache → external prev_txid on input.
+    // Session 2: reopen UTXO (tip aligned), archive spend with external prev, confirm.
     {
         let q = Query::open_or_create(td.store_path()).unwrap();
         q.set_tx_index(false);
         q.set_spend_index(false);
+        q.enable_ibd_utxo().unwrap();
+        assert!(
+            q.ibd_utxo_create_fk(cb1.as_byte_array(), 0)
+                .unwrap()
+                .is_some(),
+            "light UTXO must retain mature coinbase create_fk across reopen"
+        );
         accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
         let fks = q
             .store()
@@ -913,21 +922,6 @@ fn resume_head_off_warms_cache_for_external_prev() {
         );
         assert_ne!(inp.prev_txid, [0u8; 32]);
 
-        // Without warm: confirm cannot map prev_txid → parent.
-        let err = confirm_archived_at(
-            &q,
-            &params,
-            Height(spend_h),
-            &b_spend.block_hash().to_byte_array(),
-            ms,
-        );
-        assert!(
-            err.is_err(),
-            "confirm without warm should fail on missing prevout, got {err:?}"
-        );
-
-        let n = q.warm_txid_cache_from_bodies().unwrap();
-        assert!(n > 0);
         confirm_archived_at(
             &q,
             &params,
@@ -935,13 +929,11 @@ fn resume_head_off_warms_cache_for_external_prev() {
             &b_spend.block_hash().to_byte_array(),
             ms,
         )
-        .expect("after warm, external prev_txid resolves via process cache");
+        .expect("external prev_txid resolves via light UTXO create_fk");
         assert_eq!(q.tip_height(), Some(Height(spend_h)));
-        // With spend_index off, connect notes process-local spends only; durable
-        // point multimap is deferred for IBD (backfilled before Electrum).
         assert!(
             q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
-            "local spent set must see the confirmed spend"
+            "UTXO must see the confirmed spend"
         );
         assert!(
             q.spenders(cb1.as_byte_array(), 0).unwrap().is_empty(),
@@ -1156,9 +1148,13 @@ fn ibd_utxo_reapply_same_height_is_idempotent() {
 
     // Simulate partial-apply retry: same creates at same tip height.
     let cb = b1.txdata[0].compute_txid().to_byte_array();
-    q.apply_ibd_utxo_block(&[], &[(cb, 0)], 1)
+    let cb_fk = q
+        .ibd_utxo_create_fk(&cb, 0)
+        .unwrap()
+        .expect("height 1 coinbase in UTXO");
+    q.apply_ibd_utxo_block(&[], &[(cb, 0, cb_fk)], 1)
         .expect("re-apply tip height must be no-op / idempotent");
-    q.apply_ibd_utxo_block(&[], &[(cb, 0)], 1)
+    q.apply_ibd_utxo_block(&[], &[(cb, 0, cb_fk)], 1)
         .expect("second re-apply still ok");
 
     let b2 = mine_regtest_block(tip, tip_time + 600, 2, vec![]);

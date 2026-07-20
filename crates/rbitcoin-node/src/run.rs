@@ -169,22 +169,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     info!(
         "ibd: index catch-up mode (tx/point/SH runs + mmap UTXO; materialize heads at tip mode)"
     );
-    // Seed a **capped** recent slice of Class A into the txid FIFO (not full body).
-    // Misses resolve via tx.runs (catch-up) / durable head (tip mode).
-    {
-        let t0 = Instant::now();
-        let n = handle
-            .query
-            .warm_txid_cache_from_bodies()
-            .map_err(|e| NodeError::Config(format!("warm txid cache: {e}")))?;
-        let (entries, bytes, budget) = handle.query.txid_fk_cache_usage();
-        info!(
-            "ibd: txid cache seeded {n} recent Class A txs in {:?} (entries={entries} ~{:.0}MiB / budget {:.0}MiB; miss→tx.runs)",
-            t0.elapsed(),
-            bytes as f64 / (1024.0 * 1024.0),
-            budget as f64 / (1024.0 * 1024.0),
-        );
-    }
+    // Parent resolve during catch-up: light UTXO create_fk (no process txid map).
     // Ensure spentness oracle ready (mmap UTXO may already match tip).
     if !handle.query.spent_local_ready() {
         let t0 = Instant::now();
@@ -709,8 +694,6 @@ pub(crate) fn enter_tip_mode(query: &Query) {
             ),
             Err(e) => warn!("node: backfill tx.head failed: {e}"),
         }
-    } else if bodies > 0 {
-        let _ = query.warm_txid_cache_from_bodies();
     }
 
     match query.finalize_point_runs() {

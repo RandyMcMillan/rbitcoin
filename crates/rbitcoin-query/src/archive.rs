@@ -64,7 +64,6 @@ impl Query {
             }
             if self.store.header_txs.has_body(*fk)? {
                 // Keep existing first_tx_fk / tx_height / strong alignment.
-                self.warm_txid_cache_for_header(*fk)?;
                 let _ = std::mem::take(txs);
                 continue;
             }
@@ -80,9 +79,8 @@ impl Query {
 
     /// Mega-batch Class A: one put_batch per table; I/O are **per-tx runs**.
     ///
-    /// Resolves `prev_tx_fk` for inputs when the prev tx is in this batch or
-    /// (if tx index on) already in the store — so disk stores compact local
-    /// prevs instead of 32-byte txids.
+    /// Same-batch spends may stamp local `prev_tx_fk`. Cross-batch parents stay
+    /// external (txid on wire); confirm resolves via light UTXO create_fk.
     fn archive_bodies_mega_owned(
         &self,
         need: &mut [(Fk, Vec<TxApply>)],
@@ -157,12 +155,9 @@ impl Query {
                     let mut inputs = ta.inputs;
                     for (i, inp) in inputs.iter_mut().enumerate() {
                         if !inp.is_coinbase() {
-                            // Prefer batch-local fk, then process cache / durable head.
-                            // Must stamp prev_tx_fk even when tx.head is off so tip
-                            // confirm can resolve prevouts without MissingPrevout.
+                            // Same mega-batch only — no global txid→fk lookup.
+                            // Cross-batch parents remain external; confirm uses UTXO fk.
                             if let Some(&fk) = batch_txid_fk.get(&inp.prev_txid) {
-                                inp.prev_tx_fk = fk;
-                            } else if let Some(fk) = self.lookup_tx_fk(&inp.prev_txid)? {
                                 inp.prev_tx_fk = fk;
                             }
                             if spend_on {
@@ -231,8 +226,6 @@ impl Query {
                 return Err(StoreError::Corrupt("tx put_batch fk mismatch"));
             }
         }
-        // Always remember txid→fk (even when durable head is off).
-        //
         // Class A cache: only bulk-fill from archive when we are tip-following
         // (small archive lead). Under IBD with a large lead, archive-newest FIFO
         // thrash fights confirm — tip_prevout_cache + miss-fill own that path.
@@ -241,7 +234,6 @@ impl Query {
             let mut in_i = 0usize;
             let mut out_i = 0usize;
             for (rec, fk) in all_txs.iter().zip(got_tx_fks.iter()) {
-                self.remember_txid(rec.txid, *fk);
                 if tx_runs {
                     self.enqueue_tx_run(rec.txid, *fk);
                 }

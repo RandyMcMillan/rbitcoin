@@ -214,7 +214,7 @@ pub fn confirm_archived_run(
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
     use crate::block::{connect_block_prevouts, ScriptCheckJob};
     use crate::header::median_time_past_times;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
@@ -245,8 +245,8 @@ pub fn confirm_archived_run(
     }
 
     let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
-    // Same-run creates (overlay for mmap UTXO until Class C apply).
-    let mut pending_creates: HashSet<([u8; 32], u32)> = HashSet::new();
+    // Same-run creates → create_fk (overlay until Class C UTXO apply).
+    let mut pending_creates: HashMap<([u8; 32], u32), rbitcoin_primitives::Fk> = HashMap::new();
     let mut time_window: Vec<u32> = Vec::with_capacity(11);
     let mut prepared: Vec<Prepared> = Vec::with_capacity(blocks.len());
 
@@ -463,7 +463,7 @@ pub fn confirm_archived_run(
                         .get_tx_class_a(fk)
                         .map_err(ConsensusError::Store)?;
                     for v in 0..tx.output_count {
-                        creates.push((tx.txid, v));
+                        creates.push((tx.txid, v, fk));
                     }
                 }
                 query
@@ -552,10 +552,17 @@ pub fn accept_and_connect_block(
         .map_err(ConsensusError::Store)?;
     // mmap UTXO only after Class C (same order as `confirm_archived_run`).
     if query.ibd_utxo_enabled() {
+        let tx_fks = query
+            .store()
+            .header_txs
+            .get_list(fk)
+            .map_err(ConsensusError::Store)?
+            .ok_or(ConsensusError::Store(StoreError::NotFound))?;
         let mut spends = Vec::new();
         let mut creates = Vec::new();
         for (ti, tx) in block.txdata.iter().enumerate() {
             let tid = txids[ti];
+            let create_fk = tx_fks.get(ti).copied().unwrap_or(rbitcoin_primitives::Fk::NULL);
             if ti > 0 {
                 for inp in &tx.input {
                     let op = inp.previous_output;
@@ -563,7 +570,7 @@ pub fn accept_and_connect_block(
                 }
             }
             for (v, _) in tx.output.iter().enumerate() {
-                creates.push((tid, v as u32));
+                creates.push((tid, v as u32, create_fk));
             }
         }
         query

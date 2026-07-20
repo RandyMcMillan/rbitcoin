@@ -45,13 +45,13 @@ Default: **info**. CLI wins over env.
 | Archive queue RAM | **256 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
 | Tip prevout cache | **128 MiB** | `RBITCOIN_TIP_PREVOUT_CACHE_MB` |
-| Txid→fk process cache (FIFO) | **2048 MiB** (max 4096) | `RBITCOIN_TXID_CACHE_MB` |
+| Light UTXO (mmap) | **~96 MiB start** (24 B slots; grows) | `RBITCOIN_IBD_UTXO_SLOTS` |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 
-**Memory rule:** During IBD, durable open-hash heads are off; `txid→fk` is a
-**byte-capped FIFO** (not unbounded). Misses hit sorted `tx.runs`. SH create
-dedupe is an **O(1) height watermark**, not a HashSet of every create. Do not
-raise Class A / archive / txid caches without watching RSS vs page cache.
+**Memory rule:** During IBD, durable open-hash heads are off. Parent resolve uses
+the **light UTXO** (`outpoint → create_fk`); archive does not stamp cross-batch
+`prev_tx_fk`. SH create dedupe is an **O(1) height watermark**. Do not raise
+Class A / archive queues without watching RSS vs page cache.
 
 ## Libre-relay-class policy (mempool + Electrum broadcast)
 

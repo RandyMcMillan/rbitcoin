@@ -26,7 +26,6 @@ impl Query {
                 }
                 // Bypass Query::get_tx so we don't thin-note or tip_prevout miss-spam.
                 let tx = self.store.get_tx(fk)?;
-                self.remember_txid(tx.txid, fk);
                 let inputs = if tx.input_count > 0 {
                     let run = tx.input_start_fk.get().ok_or(StoreError::InvalidFk)?;
                     Some(self.store.get_input_run(Fk(run), tx.input_count)?)

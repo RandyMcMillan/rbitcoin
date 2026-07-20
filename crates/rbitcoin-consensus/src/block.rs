@@ -279,7 +279,7 @@ pub fn validate_block_connect(
     let check_scripts = !ctx.milestone.skips_scripts_at(ctx.height.0);
     // Pending until connect+scripts succeed — do not poison spent_local on failure.
     let mut pending = std::collections::HashSet::new();
-    let mut pending_creates = std::collections::HashSet::new();
+    let mut pending_creates = std::collections::HashMap::new();
     let (script_jobs, spends) = connect_block_prevouts(
         query,
         block,
@@ -367,10 +367,9 @@ pub struct ScriptCheckJob {
 /// Spent outpoints go into `pending_spent` (not `spent_local`) so a failed
 /// script check can drop them without poisoning the next attempt.
 ///
-/// `pending_creates` holds outpoints created earlier in this confirm run
-/// (same-block or prior heights in a multi-block run). Required for mmap UTXO
-/// spentness: the unspent set is only updated after Class C, so same-run
-/// creates would otherwise false-positive as spent (`!contains`).
+/// `pending_creates` maps outpoints created earlier in this confirm run →
+/// create Class A fk. Required for mmap UTXO spentness + parent resolve until
+/// Class C applies UTXO.
 pub(crate) fn connect_block_prevouts(
     query: &Query,
     block: &Block,
@@ -378,7 +377,7 @@ pub(crate) fn connect_block_prevouts(
     archived_tx_fks: Option<&[rbitcoin_primitives::Fk]>,
     wave_prevouts: Option<&rbitcoin_query::WavePrevoutCache>,
     pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
-    pending_creates: &mut std::collections::HashSet<([u8; 32], u32)>,
+    pending_creates: &mut std::collections::HashMap<([u8; 32], u32), rbitcoin_primitives::Fk>,
 ) -> Result<(Vec<ScriptCheckJob>, Vec<([u8; 32], u32)>), ConsensusError> {
     if let Some(fks) = archived_tx_fks {
         if fks.len() != block.txdata.len() {
@@ -494,7 +493,7 @@ pub(crate) fn connect_block_prevouts(
                     if local.contains(&key) {
                         return Err(ConsensusError::PrevoutSpent);
                     }
-                } else if !pending_creates.contains(&key)
+                } else if !pending_creates.contains_key(&key)
                     && query
                         .catchup_is_spent(op.txid.as_byte_array(), op.vout)
                         .map_err(ConsensusError::Store)?
@@ -512,6 +511,13 @@ pub(crate) fn connect_block_prevouts(
                             .and_then(|ins| ins.get(ii))
                             .and_then(|inp| inp.prev_tx_fk.get())
                             .map(rbitcoin_primitives::Fk)
+                    })
+                    .or_else(|| pending_creates.get(&key).copied())
+                    .or_else(|| {
+                        query
+                            .ibd_utxo_create_fk(op.txid.as_byte_array(), op.vout)
+                            .ok()
+                            .flatten()
                     });
                 // Durable spent probe (spend_index on). Tip/wave live is a
                 // performance hint only after local miss — still verify durable
@@ -593,13 +599,16 @@ pub(crate) fn connect_block_prevouts(
         } else {
             tx.compute_txid().to_byte_array()
         };
+        let create_fk = spend_fk.unwrap_or(rbitcoin_primitives::Fk::NULL);
         let mut outs = Vec::with_capacity(tx.output.len());
         for (v, o) in tx.output.iter().enumerate() {
             outs.push(TxOut {
                 value: o.value,
                 script_pubkey: o.script_pubkey.clone(),
             });
-            pending_creates.insert((txid, v as u32));
+            if !create_fk.is_null() {
+                pending_creates.insert((txid, v as u32), create_fk);
+            }
         }
         same_block.insert(txid, outs);
     }
@@ -806,8 +815,16 @@ fn resolve_prevout(
         }
     }
 
-    // Cold path: Class A / store (fk only when txid matches wire outpoint).
-    if let Some(prev_fk) = prev_fk {
+    // Cold path: resolve create fk → Class A (txid must match wire outpoint).
+    // Order: stamped/thin prev_fk → light UTXO create_fk → durable head/runs.
+    let resolved_fk = prev_fk
+        .or(query
+            .ibd_utxo_create_fk(&prev_txid, op.vout)
+            .map_err(ConsensusError::Store)?)
+        .or(query
+            .tx_fk_by_txid(&prev_txid)
+            .map_err(ConsensusError::Store)?);
+    if let Some(prev_fk) = resolved_fk {
         if let Ok(prev_rec) = query.get_tx_class_a(prev_fk) {
             if prev_rec.txid == prev_txid {
                 if let Ok(out) = find_output(query, &prev_rec, op.vout) {
@@ -830,25 +847,6 @@ fn resolve_prevout(
                 }
             }
         }
-    }
-
-    if let Some(prev_fk) = query
-        .tx_fk_by_txid(&prev_txid)
-        .map_err(ConsensusError::Store)?
-    {
-        let prev_rec = query
-            .get_tx_class_a(prev_fk)
-            .map_err(ConsensusError::Store)?;
-        let out = find_output(query, &prev_rec, op.vout)?;
-        let (_is_cb, cb_h) =
-            coinbase_info(query, prev_fk, &prev_rec, wave_prevouts, coinbase_height_cache)?;
-        return Ok(ResolvedPrevout {
-            txout: TxOut {
-                value: Amount::from_sat(out.value as u64),
-                script_pubkey: ScriptBuf::from_bytes(out.script),
-            },
-            coinbase_height: cb_h,
-        });
     }
 
     Err(ConsensusError::MissingPrevout)

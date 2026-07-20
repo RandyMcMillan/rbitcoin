@@ -10,7 +10,6 @@ mod point_run_builder;
 mod sh_builder;
 mod tip_prevout_cache;
 mod tx_run_builder;
-mod txid_fk_cache;
 mod wave_prevout;
 
 use bitcoin::absolute::LockTime;
@@ -37,7 +36,6 @@ pub type QueryError = StoreError;
 pub use class_a_cache::stats as class_a_cache_stats;
 pub use connect::ConfirmPrepared;
 pub use tip_prevout_cache::stats as tip_prevout_cache_stats;
-pub use txid_fk_cache::stats as txid_fk_cache_stats;
 pub use wave_prevout::WavePrevoutCache;
 
 /// Class C sub-phase wall times (nanoseconds; reset by the IBD sampler).
@@ -195,10 +193,8 @@ pub struct Query {
     /// Re-enable + [`Self::backfill_point_spends`] after catch-up (before Electrum).
     spend_index: std::sync::atomic::AtomicBool,
     /// When false, archive skips durable `tx.head` inserts (main archive cost).
-    /// Process-local [`Self::txid_fk_cache`] + `tx.runs` resolve txid→fk for confirm.
+    /// Parent resolve during catch-up uses light UTXO create_fk (not a txid map).
     tx_index: std::sync::atomic::AtomicBool,
-    /// Byte-capped FIFO txid → fk (IBD; miss path is tx.runs then durable head).
-    txid_fk_cache: txid_fk_cache::TxidFkCache,
     /// Process-local spent outpoints for best-chain tip (Core spentness when
     /// durable `point.head` probes are off). Key: (prev_txid, prev_vout).
     /// Must be **complete** for heights 0..=tip before any confirm when
@@ -252,7 +248,6 @@ impl Query {
             store,
             spend_index: std::sync::atomic::AtomicBool::new(true),
             tx_index: std::sync::atomic::AtomicBool::new(true),
-            txid_fk_cache: txid_fk_cache::TxidFkCache::from_env(),
             spent_local: Mutex::new(HashSet::new()),
             spent_local_ready: std::sync::atomic::AtomicBool::new(tip_empty),
             sh_heads: Mutex::new(HashMap::new()),
@@ -361,15 +356,13 @@ impl Query {
             .contains(&(*txid, vout)))
     }
 
-    /// After successful Class C: take spends, insert creates, commit tip.
+    /// After successful Class C: take spends, insert creates (with create fk), commit tip.
     ///
     /// Height-monotonic and idempotent: if `tip` is already reflected, no-op.
-    /// Re-applying the same height (retry after partial write) must not
-    /// `Corrupt` on duplicate create / already-taken spend.
     pub fn apply_ibd_utxo_block(
         &self,
         spends: &[([u8; 32], u32)],
-        creates: &[([u8; 32], u32)],
+        creates: &[([u8; 32], u32, Fk)],
         tip: u32,
     ) -> Result<(), QueryError> {
         let mut g = self.ibd_utxo.lock().unwrap();
@@ -380,25 +373,29 @@ impl Query {
             if tip <= have {
                 return Ok(());
             }
-            // Only contiguous extension (or rebuild will heal gaps).
-            if tip > have.saturating_add(1) {
-                // Gap: still apply this height's delta then commit — caller should
-                // have replayed, but do not hard-fail confirm after Class C.
-            }
-        } else if tip != 0 {
-            // Empty UTXO with non-genesis tip — allow apply; resume rebuild is preferred.
         }
         for &(txid, vout) in spends {
-            // Already spent (retry) is fine; first-time miss is still a logic bug
-            // but must not abort after Class C (would leave tip/UTXO diverged and
-            // surface as store Corrupt / blacklist).
             let _ = u.take_spend(&txid, vout)?;
         }
-        for &(txid, vout) in creates {
-            u.insert_create(&txid, vout)?;
+        for &(txid, vout, create_fk) in creates {
+            u.insert_create(&txid, vout, create_fk)?;
         }
         u.commit_tip(Some(tip))?;
         Ok(())
+    }
+
+    /// Unspent outpoint → create Class A fk (light UTXO). `None` if spent/missing
+    /// or UTXO disabled.
+    pub fn ibd_utxo_create_fk(
+        &self,
+        txid: &[u8; 32],
+        vout: u32,
+    ) -> Result<Option<Fk>, QueryError> {
+        let g = self.ibd_utxo.lock().unwrap();
+        let Some(ref u) = *g else {
+            return Ok(None);
+        };
+        Ok(u.get_create_fk(txid, vout)?)
     }
 
     /// Rebuild mmap UTXO by replaying confirmed chain (creates then spends per height).
@@ -452,7 +449,7 @@ impl Query {
                     }
                 }
                 for v in 0..tx.output_count {
-                    u.insert_create(&tx.txid, v)?;
+                    u.insert_create(&tx.txid, v, fk)?;
                 }
             }
             u.commit_tip(Some(h))?;
@@ -570,55 +567,40 @@ impl Query {
         self.point_run.enqueue_batch(edges);
     }
 
-    fn remember_txid(&self, txid: [u8; 32], fk: Fk) {
-        self.txid_fk_cache.insert(txid, fk);
-    }
-
-    /// Resolve txid → fk: process cache → tx.runs (catch-up) → durable `tx.head`.
+    /// Resolve txid → fk: durable `tx.head` when index on; else `tx.runs` if enabled.
+    /// Catch-up parent resolve prefers light UTXO create_fk (outpoint), not this.
     fn lookup_tx_fk(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
-        if let Some(fk) = self.txid_fk_cache.get(txid) {
-            return Ok(Some(fk));
-        }
-        if self.tx_run_enabled() {
-            if let Some(fk) = self.tx_run.lookup(txid)? {
-                // Read-through: keep cold parent hot for subsequent inputs.
-                self.txid_fk_cache.insert(*txid, fk);
-                return Ok(Some(fk));
-            }
-        }
         if self.tx_index_enabled() {
             if let Some((fk, _)) = self.store.get_tx_by_txid(txid)? {
-                self.txid_fk_cache.insert(*txid, fk);
                 return Ok(Some(fk));
             }
+        }
+        if self.tx_run_enabled() {
+            return self.tx_run.lookup(txid);
         }
         Ok(None)
     }
 
-    /// Public resolve for consensus prevout path (cache + runs + durable head).
+    /// Public resolve by txid (durable head / runs). Prefer `ibd_utxo_create_fk` for unspent.
     pub fn tx_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
         self.lookup_tx_fk(txid)
     }
 
-    /// `(entries, approx_bytes, budget_bytes)` for the process txid→fk FIFO.
-    pub fn txid_fk_cache_usage(&self) -> (usize, usize, usize) {
-        (
-            self.txid_fk_cache.len(),
-            self.txid_fk_cache.approx_bytes(),
-            self.txid_fk_cache.budget_bytes(),
-        )
-    }
-
-    /// Warm process txid→fk from an already-archived header body.
-    fn warm_txid_cache_for_header(&self, header_fk: Fk) -> Result<(), QueryError> {
-        let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
-            return Ok(());
-        };
-        for tfk in tx_fks {
-            let rec = self.store.get_tx(tfk)?;
-            self.remember_txid(rec.txid, tfk);
+    /// Linear Class A body scan for txid → fk (disconnect undo without head/runs).
+    /// O(n) — rare reorg path only.
+    pub(crate) fn find_tx_fk_by_txid_scan(
+        &self,
+        txid: &[u8; 32],
+    ) -> Result<Option<Fk>, QueryError> {
+        let n = self.store.txs.count();
+        for id in 1..=n {
+            let fk = Fk(id);
+            let rec = self.store.get_tx(fk)?;
+            if &rec.txid == txid {
+                return Ok(Some(fk));
+            }
         }
-        Ok(())
+        Ok(None)
     }
 
     pub fn store(&self) -> &Store {
@@ -881,39 +863,6 @@ impl Query {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Optionally warm a **capped** recent slice of Class A into the process cache.
-    ///
-    /// Full-chain warm was multi‑GiB and fought page cache during IBD. Catch-up
-    /// miss path is `tx.runs` lookup; this only seeds the last `max_entries`
-    /// txs (by fk order) for resume locality. Pass `0` to skip.
-    ///
-    /// Returns the number of txs loaded.
-    pub fn warm_txid_cache_from_bodies(&self) -> Result<u64, QueryError> {
-        // Default: warm up to ~budget/96 entries or 2M, whichever smaller.
-        let max_entries = (self.txid_fk_cache.budget_bytes() / 96).min(2_000_000);
-        self.warm_txid_cache_recent(max_entries)
-    }
-
-    /// Warm the highest `max_entries` Class A fks into the FIFO cache.
-    pub fn warm_txid_cache_recent(&self, max_entries: usize) -> Result<u64, QueryError> {
-        if max_entries == 0 {
-            return Ok(0);
-        }
-        let n = self.store.txs.count();
-        if n == 0 {
-            return Ok(0);
-        }
-        let start = n.saturating_sub(max_entries as u64).saturating_add(1).max(1);
-        let mut loaded = 0u64;
-        for id in start..=n {
-            let fk = Fk(id);
-            let rec = self.store.get_tx(fk)?;
-            self.txid_fk_cache.insert(rec.txid, fk);
-            loaded += 1;
-        }
-        Ok(loaded)
-    }
-
     /// Write durable `tx.head` for every Class A body missing from the hash head.
     ///
     /// After milestone IBD (`tx_index` off), Electrum and prevout-by-txid need this
@@ -924,12 +873,7 @@ impl Query {
         &self,
         on_progress: impl FnMut(u64, u64, u64),
     ) -> Result<u64, QueryError> {
-        let n = self.store.txs.backfill_head(on_progress)?;
-        // Keep process cache coherent with the durable head.
-        if n > 0 {
-            let _ = self.warm_txid_cache_from_bodies()?;
-        }
-        Ok(n)
+        self.store.txs.backfill_head(on_progress)
     }
 
     /// Class A tx body count (for backfill heuristics / logs).
@@ -1052,9 +996,7 @@ impl Query {
     }
 
     pub fn put_tx(&self, rec: &TxRecord) -> Result<Fk, QueryError> {
-        let fk = self.store.put_tx(rec)?;
-        self.remember_txid(rec.txid, fk);
-        Ok(fk)
+        self.store.put_tx(rec)
     }
 
     pub fn get_tx(&self, fk: Fk) -> Result<TxRecord, QueryError> {
@@ -1072,7 +1014,6 @@ impl Query {
             return Ok(tx);
         }
         let tx = self.store.get_tx(fk)?;
-        self.remember_txid(tx.txid, fk);
         // Cache tx row only; runs filled on demand by tx_*_run / reconstruct.
         self.class_a_cache.note(fk, tx.clone(), None, None);
         Ok(tx)

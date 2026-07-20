@@ -48,10 +48,11 @@ Default: **info**. CLI wins over env.
 | Light UTXO (mmap) | **~96 MiB start** (24 B slots; grows) | `RBITCOIN_IBD_UTXO_SLOTS` |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 
-**Memory rule:** During IBD, durable open-hash heads are off. Parent resolve uses
-the **light UTXO** (`outpoint → create_fk`); archive does not stamp cross-batch
-`prev_tx_fk`. SH create dedupe is an **O(1) height watermark**. Do not raise
-Class A / archive queues without watching RSS vs page cache.
+**Memory rule:** During IBD, durable open-hash heads are off. Class A inputs
+always store **external** `prev_txid` (no `prev_tx_fk` field). Parent resolve
+uses light UTXO (`outpoint → create_fk`); tip mode uses points / `tx.head`.
+SH create dedupe is an **O(1) height watermark**. Do not raise Class A / archive
+queues without watching RSS vs page cache.
 
 ## Libre-relay-class policy (mempool + Electrum broadcast)
 

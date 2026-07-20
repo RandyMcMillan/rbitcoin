@@ -414,7 +414,6 @@ fn chain_connect_reorg_and_growth() {
             },
             inputs: vec![InputRecord {
                 prev_txid: [0u8; 32],
-                prev_tx_fk: Fk::NULL,
                 prev_index: u32::MAX,
                 sequence: u32::MAX,
                 script_sig: vec![0],
@@ -634,12 +633,9 @@ fn ibd_parallel_archive_idempotent_confirm_without_tx_head() {
     let fks = q.block_tx_fks(Height(spend_h)).unwrap();
     assert!(fks.len() >= 2);
     let inp = q.tx_input(&q.get_tx(fks[1]).unwrap(), 0).unwrap();
-    // Cross-batch parent: archive leaves external prev; confirm used UTXO create_fk.
-    assert!(
-        inp.prev_tx_fk.is_null(),
-        "archive does not stamp cross-batch prev_tx_fk (UTXO holds create_fk)"
-    );
+    // Class A always external prev_txid; confirm used UTXO create_fk.
     assert_ne!(inp.prev_txid, [0u8; 32]);
+    assert_eq!(inp.prev_index, 0);
 }
 
 /// Milestone 0 / `spend_index` on: archive writes point edges before Class C.
@@ -916,11 +912,10 @@ fn resume_head_off_utxo_resolves_external_prev() {
             .unwrap()
             .unwrap();
         let inp = q.tx_input(&q.get_tx(fks[1]).unwrap(), 0).unwrap();
-        assert!(
-            inp.prev_tx_fk.is_null(),
-            "cold archive of spend should store external prev_txid, not prev_tx_fk"
+        assert_ne!(
+            inp.prev_txid, [0u8; 32],
+            "Class A stores external prev_txid (no prev_tx_fk field)"
         );
-        assert_ne!(inp.prev_txid, [0u8; 32]);
 
         confirm_archived_at(
             &q,
@@ -1280,7 +1275,7 @@ fn confirm_run_sequential_and_failed_no_spend_poison() {
 /// Single mature-chain build covers:
 /// - accept genesis + long mine (reopen tip)
 /// - coinbase maturity + spend + double-spend reject
-/// - local prev_tx_fk on spend + compact encoding + reconstruct
+/// - external prev_txid on spend + reconstruct
 /// - reconstruct after reopen (sampled + multi-tx spend block)
 /// - store-backed locator/headers helpers
 /// - service flags
@@ -1314,25 +1309,23 @@ fn consensus_mature_chain_spend_and_reconstruct() {
         "spend block should be multi-tx"
     );
 
-    // Local prev_tx_fk (schema v3) + compact on-disk form + reconstruct.
+    // External prev_txid on Class A + reconstruct.
     let spend_txid = spend_block.txdata[1].compute_txid().to_byte_array();
     let (_spend_fk, rec) = q.get_tx_by_txid(&spend_txid).unwrap().expect("spend indexed");
     let inp = q.tx_input(&rec, 0).unwrap();
-    assert!(!inp.prev_tx_fk.is_null(), "spend should use local prev_tx_fk");
     assert_eq!(
         q.resolve_prev_txid(&inp).unwrap(),
         chain.matured_coinbase_txid.to_byte_array()
     );
     let enc = InputRecord {
-        prev_txid: [0u8; 32],
-        prev_tx_fk: inp.prev_tx_fk,
+        prev_txid: inp.prev_txid,
         prev_index: inp.prev_index,
         sequence: inp.sequence,
         script_sig: inp.script_sig.clone(),
         witness: inp.witness.clone(),
     }
     .encode();
-    assert!(enc.len() < 32, "local prev encoding should be compact: {}", enc.len());
+    assert!(enc.len() > 32, "external prev includes 32-byte txid: {}", enc.len());
     assert_reconstruct_eq(&q, chain.spend_height, spend_block);
     let cbin = q
         .tx_input(&q.get_tx(q.block_tx_fks(Height(chain.spend_height)).unwrap()[0]).unwrap(), 0)

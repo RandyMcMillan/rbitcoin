@@ -107,16 +107,32 @@ impl Query {
             }
             let mut edges = Vec::with_capacity(inputs.len());
             for inp in &inputs {
-                let prev_fk = inp.prev_tx_fk.get();
-                edges.push(ThinInput {
-                    prev_tx_fk: prev_fk,
-                    prev_index: inp.prev_index,
-                });
                 if inp.is_coinbase() {
+                    edges.push(ThinInput {
+                        create_fk: None,
+                        prev_index: inp.prev_index,
+                    });
                     continue;
                 }
-                let Some(pid) = prev_fk else {
+                // Resolve create fk: same-wave body → light UTXO → durable head/runs.
+                let create_fk = wave
+                    .get_by_txid(&inp.prev_txid, inp.prev_index)
+                    .map(|(pfk, _, _)| pfk)
+                    .or(self
+                        .ibd_utxo_create_fk(&inp.prev_txid, inp.prev_index)
+                        .ok()
+                        .flatten())
+                    .or(self.tx_fk_by_txid(&inp.prev_txid).ok().flatten());
+                edges.push(ThinInput {
+                    create_fk: create_fk.and_then(|f| f.get()),
+                    prev_index: inp.prev_index,
+                });
+                let Some(pfk) = create_fk else {
                     continue;
+                };
+                let pid = match pfk.get() {
+                    Some(id) => id,
+                    None => continue,
                 };
                 if wave_fks.contains(&pid) {
                     continue;
@@ -406,9 +422,7 @@ impl Query {
             }
         };
         let is_cb = inp.is_coinbase()
-            || (inp.prev_txid == [0u8; 32]
-                && inp.prev_tx_fk.is_null()
-                && inp.prev_index == 0xffff_ffff);
+            || (inp.prev_txid == [0u8; 32] && inp.prev_index == 0xffff_ffff);
         if !is_cb {
             return Ok(None);
         }

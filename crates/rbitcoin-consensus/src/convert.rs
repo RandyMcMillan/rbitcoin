@@ -76,7 +76,6 @@ fn tx_to_apply(tx: &Transaction, txid: [u8; 32]) -> Result<TxApply, ConsensusErr
         .iter()
         .map(|inp| InputRecord {
             prev_txid: inp.previous_output.txid.to_byte_array(),
-            prev_tx_fk: Fk::NULL, // resolved to local fk at archive time when possible
             prev_index: inp.previous_output.vout,
             sequence: inp.sequence.to_consensus_u32(),
             script_sig: inp.script_sig.to_bytes(),

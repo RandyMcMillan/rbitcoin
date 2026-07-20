@@ -2,7 +2,7 @@
 //!
 //! Holds:
 //! - **Parent creates** with live/spent output slots (write-through unspent)
-//! - **Spending txs** in the wave (`TxRecord` + thin prev_fk per input)
+//! - **Spending txs** in the wave (`TxRecord` + thin create-fk hints per input)
 //! - **Coinbase create height** for parents (maturity without `tx_height` re-read)
 //!
 //! Built during prefetch after Class A body warm.
@@ -20,10 +20,11 @@ struct Parent {
     coinbase_height: Option<Option<u32>>,
 }
 
-/// Thin input edge: prev create fk when known (coinbase / external hash → None).
+/// Thin input edge: create-tx Class A fk when known at wave fill (UTXO / same-wave).
+/// Coinbase / unknown → `create_fk = None`. Not stored on Class A disk.
 #[derive(Clone, Copy, Debug)]
 pub struct ThinInput {
-    pub prev_tx_fk: Option<u64>,
+    pub create_fk: Option<u64>,
     pub prev_index: u32,
 }
 
@@ -192,7 +193,7 @@ mod tests {
         }
     }
 
-    /// Regression: wrong prev_tx_fk must not be preferred over wire txid.
+    /// Regression: wrong create_fk must not be preferred over wire txid.
     ///
     /// Connect resolves by **txid first**; if only get_by_fk were used, a stale
     /// fk could return another wave parent's scriptPubKey (script false).

@@ -94,7 +94,7 @@ pub mod input_flags {
     pub const EMPTY_WITNESS: u8 = 1 << 2;
     /// Null prevout (coinbase): skip 32-byte txid + use prev_index = 0xffff_ffff
     pub const NULL_PREV: u8 = 1 << 3;
-    /// Local prev: CompactSize `prev_tx_fk` + CompactSize `prev_index` (no 32-byte txid)
+    /// Deprecated: was CompactSize prev_tx_fk + vout. Class A no longer uses this.
     pub const LOCAL_PREV: u8 = 1 << 4;
 }
 

@@ -79,14 +79,12 @@ impl Query {
 
     /// Mega-batch Class A: one put_batch per table; I/O are **per-tx runs**.
     ///
-    /// Same-batch spends may stamp local `prev_tx_fk`. Cross-batch parents stay
-    /// external (txid on wire); confirm resolves via light UTXO create_fk.
+    /// Non-coinbase inputs always store external `prev_txid` + vout (no Class A
+    /// `prev_tx_fk`). Confirm uses light UTXO create_fk; tip mode uses points/head.
     fn archive_bodies_mega_owned(
         &self,
         need: &mut [(Fk, Vec<TxApply>)],
     ) -> Result<(), QueryError> {
-        use std::collections::HashMap;
-
         let mut next_tx = self.store.txs.count() + 1;
         // One run FK per non-empty I/O side (not per individual input/output).
         let mut next_in_run = self.store.inputs.count() + 1;
@@ -103,18 +101,6 @@ impl Query {
         let point_runs = self.point_run_enabled();
         let index_tx = self.tx_index_enabled();
         let tx_runs = self.tx_run_enabled();
-
-        // Batch-local txid → planned fk (same-batch / same-block spends).
-        let mut batch_txid_fk: HashMap<[u8; 32], Fk> = HashMap::new();
-        {
-            let mut plan_tx = next_tx;
-            for (_h, txs) in need.iter() {
-                for ta in txs.iter() {
-                    batch_txid_fk.insert(ta.tx.txid, Fk(plan_tx));
-                    plan_tx += 1;
-                }
-            }
-        }
 
         for (header_fk, txs) in need.iter_mut() {
             if txs.is_empty() {
@@ -155,11 +141,6 @@ impl Query {
                     let mut inputs = ta.inputs;
                     for (i, inp) in inputs.iter_mut().enumerate() {
                         if !inp.is_coinbase() {
-                            // Same mega-batch only — no global txid→fk lookup.
-                            // Cross-batch parents remain external; confirm uses UTXO fk.
-                            if let Some(&fk) = batch_txid_fk.get(&inp.prev_txid) {
-                                inp.prev_tx_fk = fk;
-                            }
                             if spend_on {
                                 spends.push((inp.prev_txid, inp.prev_index, tx_fk, i as u32));
                             } else if point_runs {
@@ -277,9 +258,6 @@ impl Query {
     pub fn resolve_prev_txid(&self, inp: &InputRecord) -> Result<[u8; 32], QueryError> {
         if inp.is_coinbase() {
             return Ok([0u8; 32]);
-        }
-        if let Some(fk) = inp.prev_tx_fk.get() {
-            return Ok(self.get_tx_class_a(Fk(fk))?.txid);
         }
         Ok(inp.prev_txid)
     }

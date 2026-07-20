@@ -159,16 +159,13 @@ pub fn decode_output_run(buf: &[u8], count: u32) -> Result<Vec<OutputRecord>, St
 ///
 /// Prevout encoding (on disk):
 /// - coinbase: `NULL_PREV`
-/// - local: `LOCAL_PREV` + CompactSize `prev_tx_fk` + CompactSize `vout`
-/// - external: full `prev_txid[32]` + CompactSize `vout`
+/// - non-coinbase: full `prev_txid[32]` + CompactSize `vout`
 ///
-/// In memory, `prev_txid` may be zeros when only `prev_tx_fk` is known (resolve
-/// via `get_tx` before building wire OutPoints).
+/// No local `prev_tx_fk` on Class A: catch-up resolves create fk via light UTXO;
+/// tip mode uses durable points / `tx.head`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputRecord {
     pub prev_txid: [u8; 32],
-    /// When non-null, prev is a local Class A tx (preferred on-disk form).
-    pub prev_tx_fk: Fk,
     pub prev_index: u32,
     pub sequence: u32,
     pub script_sig: Vec<u8>,
@@ -178,14 +175,11 @@ pub struct InputRecord {
 
 impl InputRecord {
     pub fn is_coinbase(&self) -> bool {
-        self.prev_tx_fk.is_null()
-            && self.prev_txid == [0u8; 32]
-            && self.prev_index == u32::MAX
+        self.prev_txid == [0u8; 32] && self.prev_index == u32::MAX
     }
 
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         let null_prev = self.is_coinbase();
-        let local = !null_prev && !self.prev_tx_fk.is_null();
         let mut flags = 0u8;
         if self.sequence == u32::MAX {
             flags |= input_flags::SEQ_FINAL;
@@ -198,15 +192,10 @@ impl InputRecord {
         }
         if null_prev {
             flags |= input_flags::NULL_PREV;
-        } else if local {
-            flags |= input_flags::LOCAL_PREV;
         }
         out.push(flags);
         if null_prev {
             // nothing
-        } else if local {
-            write_compact_size(out, self.prev_tx_fk.0);
-            write_compact_size(out, u64::from(self.prev_index));
         } else {
             out.extend_from_slice(&self.prev_txid);
             write_compact_size(out, u64::from(self.prev_index));
@@ -240,20 +229,13 @@ impl InputRecord {
         }
         let flags = buf[0];
         let mut off = 1usize;
-        let (prev_txid, prev_tx_fk, prev_index) = if flags & input_flags::NULL_PREV != 0 {
-            ([0u8; 32], Fk::NULL, u32::MAX)
-        } else if flags & input_flags::LOCAL_PREV != 0 {
-            let (fk_raw, n) = read_compact_size(&buf[off..])?;
-            off += n;
-            let Some(prev_tx_fk) = Fk::new(fk_raw) else {
-                return Err(StoreError::Corrupt("local prev fk null"));
-            };
-            let (vout, n) = read_compact_size(&buf[off..])?;
-            off += n;
-            if vout > u64::from(u32::MAX) {
-                return Err(StoreError::Corrupt("prev_index too large"));
-            }
-            ([0u8; 32], prev_tx_fk, vout as u32)
+        if flags & input_flags::LOCAL_PREV != 0 {
+            return Err(StoreError::Corrupt(
+                "input LOCAL_PREV removed; re-archive Class A (use external prev_txid)",
+            ));
+        }
+        let (prev_txid, prev_index) = if flags & input_flags::NULL_PREV != 0 {
+            ([0u8; 32], u32::MAX)
         } else {
             if buf.len() < off + 32 {
                 return Err(StoreError::Corrupt("input prev_txid truncated"));
@@ -265,7 +247,7 @@ impl InputRecord {
             if vout > u64::from(u32::MAX) {
                 return Err(StoreError::Corrupt("prev_index too large"));
             }
-            (prev_txid, Fk::NULL, vout as u32)
+            (prev_txid, vout as u32)
         };
         let sequence = if flags & input_flags::SEQ_FINAL != 0 {
             u32::MAX
@@ -311,7 +293,6 @@ impl InputRecord {
         Ok((
             Self {
                 prev_txid,
-                prev_tx_fk,
                 prev_index,
                 sequence,
                 script_sig,
@@ -695,7 +676,6 @@ mod tests {
     fn input_witness_roundtrip() {
         let rec = InputRecord {
             prev_txid: [1u8; 32],
-            prev_tx_fk: Fk::NULL,
             prev_index: 2,
             sequence: 0xffff_fffe,
             script_sig: vec![0x00],
@@ -710,7 +690,6 @@ mod tests {
     fn input_flags_roundtrip() {
         let rec = InputRecord {
             prev_txid: [0u8; 32],
-            prev_tx_fk: Fk::NULL,
             prev_index: u32::MAX,
             sequence: u32::MAX,
             script_sig: vec![],
@@ -723,23 +702,17 @@ mod tests {
     }
 
     #[test]
-    fn input_local_prev_roundtrip() {
-        let rec = InputRecord {
-            prev_txid: [0u8; 32], // not stored when LOCAL_PREV
-            prev_tx_fk: Fk(42),
-            prev_index: 1,
-            sequence: u32::MAX,
-            script_sig: vec![],
-            witness: vec![],
-        };
-        let enc = rec.encode();
-        // flags + compact 42 + compact 1
-        assert!(enc.len() < 1 + 32);
-        let dec = InputRecord::decode(&enc).unwrap();
-        assert_eq!(dec.prev_tx_fk, Fk(42));
-        assert_eq!(dec.prev_index, 1);
-        assert_eq!(dec.prev_txid, [0u8; 32]);
-        assert!(dec.encoded_len() >= enc.len());
+    fn input_rejects_legacy_local_prev() {
+        use crate::compact::write_compact_size;
+        // flags: LOCAL_PREV | SEQ_FINAL | EMPTY_SCRIPT | EMPTY_WITNESS
+        let flags = input_flags::LOCAL_PREV
+            | input_flags::SEQ_FINAL
+            | input_flags::EMPTY_SCRIPT
+            | input_flags::EMPTY_WITNESS;
+        let mut enc = vec![flags];
+        write_compact_size(&mut enc, 42);
+        write_compact_size(&mut enc, 1);
+        assert!(InputRecord::decode(&enc).is_err());
     }
 
     #[test]
@@ -747,7 +720,6 @@ mod tests {
         let run = vec![
             InputRecord {
                 prev_txid: [0u8; 32],
-                prev_tx_fk: Fk::NULL,
                 prev_index: u32::MAX,
                 sequence: u32::MAX,
                 script_sig: vec![0x01],
@@ -755,15 +727,13 @@ mod tests {
             },
             InputRecord {
                 prev_txid: [2u8; 32],
-                prev_tx_fk: Fk::NULL,
                 prev_index: 0,
                 sequence: 1,
                 script_sig: vec![],
                 witness: vec![vec![0xab]],
             },
             InputRecord {
-                prev_txid: [0u8; 32],
-                prev_tx_fk: Fk(7),
+                prev_txid: [3u8; 32],
                 prev_index: 3,
                 sequence: u32::MAX,
                 script_sig: vec![],

@@ -504,14 +504,7 @@ pub(crate) fn connect_block_prevouts(
                 let prev_fk = thin
                     .as_ref()
                     .and_then(|t| t.get(ii))
-                    .and_then(|e| e.prev_tx_fk.map(rbitcoin_primitives::Fk))
-                    .or_else(|| {
-                        spend_inputs
-                            .as_ref()
-                            .and_then(|ins| ins.get(ii))
-                            .and_then(|inp| inp.prev_tx_fk.get())
-                            .map(rbitcoin_primitives::Fk)
-                    })
+                    .and_then(|e| e.create_fk.map(rbitcoin_primitives::Fk))
                     .or_else(|| pending_creates.get(&key).copied())
                     .or_else(|| {
                         query
@@ -727,11 +720,11 @@ struct ResolvedPrevout {
 fn resolve_prevout(
     query: &Query,
     op: OutPoint,
-    input_index: usize,
-    // Prefer thin prev_fk from wave (avoids full InputRecord).
+    _input_index: usize,
+    // Prefer thin create_fk from wave (avoids full InputRecord).
     prev_fk_hint: Option<rbitcoin_primitives::Fk>,
-    // Preloaded inputs of the spending tx (Class A), when thin edges missing.
-    spend_inputs: Option<&[rbitcoin_store::InputRecord]>,
+    // Preloaded inputs of the spending tx (Class A); unused after dropping prev_tx_fk.
+    _spend_inputs: Option<&[rbitcoin_store::InputRecord]>,
     same_block: &std::collections::HashMap<[u8; 32], Vec<TxOut>>,
     wave_prevouts: Option<&rbitcoin_query::WavePrevoutCache>,
     coinbase_height_cache: &mut std::collections::HashMap<rbitcoin_primitives::Fk, Option<u32>>,
@@ -753,12 +746,7 @@ fn resolve_prevout(
         });
     }
 
-    let prev_fk = prev_fk_hint.or_else(|| {
-        spend_inputs
-            .and_then(|ins| ins.get(input_index))
-            .and_then(|inp| inp.prev_tx_fk.get())
-            .map(rbitcoin_primitives::Fk)
-    });
+    let prev_fk = prev_fk_hint;
 
     // Wave-local map first (no mutex; built during parent prefetch).
     //
@@ -900,10 +888,7 @@ fn is_coinbase_tx_record(
     let inp = query
         .tx_input(rec, 0)
         .map_err(ConsensusError::Store)?;
-    Ok(inp.is_coinbase()
-        || (inp.prev_txid == [0u8; 32]
-            && inp.prev_tx_fk.is_null()
-            && inp.prev_index == 0xffff_ffff))
+    Ok(inp.is_coinbase() || (inp.prev_txid == [0u8; 32] && inp.prev_index == 0xffff_ffff))
 }
 
 fn find_output(

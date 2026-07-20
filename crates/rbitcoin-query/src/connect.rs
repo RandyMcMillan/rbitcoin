@@ -456,12 +456,12 @@ impl Query {
                     continue;
                 }
                 let prev_txid = self.resolve_prev_txid(inp)?;
-                // Prefer stamped local prev; else head/runs; rare linear Class A scan.
-                let parent_fk = inp
-                    .prev_tx_fk
-                    .get()
-                    .map(Fk)
-                    .or_else(|| self.tx_fk_by_txid(&prev_txid).ok().flatten())
+                // Light UTXO create_fk if still present (shouldn't for spent);
+                // else head/runs; rare linear Class A scan.
+                let parent_fk = self
+                    .tx_fk_by_txid(&prev_txid)
+                    .ok()
+                    .flatten()
                     .or_else(|| self.find_tx_fk_by_txid_scan(&prev_txid).ok().flatten())
                     .unwrap_or(Fk::NULL);
                 unspends.push((prev_txid, inp.prev_index, parent_fk));

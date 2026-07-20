@@ -99,20 +99,6 @@ impl TipPrevoutCache {
         self.inner.lock().unwrap().map.len()
     }
 
-    /// True if `fk` is present with every output slot live (no stats bump).
-    #[allow(dead_code)] // available for tip-complete shortcuts / tests
-    pub fn has_full_outputs(&self, fk: Fk) -> bool {
-        let id = match fk.get() {
-            Some(i) => i,
-            None => return false,
-        };
-        let g = self.inner.lock().unwrap();
-        let Some(e) = g.map.get(&id) else {
-            return false;
-        };
-        e.live as usize == e.outputs.len() && !e.outputs.is_empty()
-    }
-
     /// Insert or refresh a create tx + full output run (confirm or resolved parent).
     pub fn note(&self, fk: Fk, tx: TxRecord, outputs: Vec<OutputRecord>) {
         let slots: Vec<Option<OutputRecord>> = outputs.into_iter().map(Some).collect();

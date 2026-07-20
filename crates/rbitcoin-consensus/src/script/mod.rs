@@ -1,7 +1,8 @@
 //! Pure-Rust script / signature verification (no libbitcoinconsensus).
 //!
 //! Verification is a pure function of `(tx, input_index, prevout TxOut)`.
-//! Prevouts are resolved by connect (Class A / same-block / spent_local) — **not** a UTXO set.
+//! Prevouts are resolved by connect (wave / tip_prevout / light UTXO create_fk /
+//! same-block) — not a full coins cache.
 
 mod classify;
 pub(crate) mod interpreter;

@@ -4,13 +4,15 @@ Versioned layouts for the chain store. **Format is unstable until 1.0.** Magic b
 
 **Schema v3** (current): builds on v2 density (length-from-idx, per-tx I/O runs, header ranges, compact flags) and adds:
 
-- **Local prevouts** as `prev_tx_fk` + vout (not 32-byte txid) when the prev tx is in this store
+- **Class A inputs always external** `prev_txid[32]` + vout (no on-disk `prev_tx_fk` / local-prev mix)
 - **Thin point** body (spend edge only; outpoint is head key via SHA256)
 - **Thin scripthash** body (create_tx_fk + vout + next only; spentness via points + Class C)
 - **strong_tx bitset** (1 bit per tx_fk vs u64)
 - **Hash heads** rehash at ~7/8 load (was 1/2)
 
-Reindex-only from earlier versions.
+Catch-up also uses process-local **light UTXO** (`ibd_utxo.map`, magic `RBUXTO03`) — not part of the `RBT1` table set; rebuilt from confirmed chain if missing/corrupt.
+
+Reindex-only from earlier versions. Legacy input flag `LOCAL_PREV` (old local `prev_tx_fk`) is **rejected** on decode.
 
 Endianness: **little-endian** for all multi-byte integers.
 
@@ -31,6 +33,8 @@ Endianness: **little-endian** for all multi-byte integers.
     header_txs_count.body        # header_fk-1 → tx count
     scripthash.body / scripthash.head  # Class B Electrum scripthash (thin)
     archive_epoch                # finalize + archive_mode
+    ibd_utxo.map                 # catch-up light UTXO (RBUXTO03; optional rebuild)
+    tx.runs / point.runs / scripthash.runs  # catch-up sorted runs (when index_run mode)
   wire/                          # tip wire ring (soft zone only)
 ```
 
@@ -116,13 +120,13 @@ Each input:
 
 | Field | Encoding |
 |-------|----------|
-| flags | u8 — `SEQ_FINAL`, `EMPTY_SCRIPT`, `EMPTY_WITNESS`, `NULL_PREV`, `LOCAL_PREV` |
-| prev | `NULL_PREV`: none; `LOCAL_PREV`: CompactSize `prev_tx_fk` + CompactSize vout; else `prev_txid[32]` + CompactSize vout |
+| flags | u8 — `SEQ_FINAL`, `EMPTY_SCRIPT`, `EMPTY_WITNESS`, `NULL_PREV` (`LOCAL_PREV` bit reserved; **decode reject**) |
+| prev | `NULL_PREV`: coinbase (no payload); else `prev_txid[32]` + CompactSize vout |
 | sequence | omitted if `SEQ_FINAL`; else u32 LE |
 | script_sig | omitted if empty; else CompactSize len + bytes |
 | witness | omitted if empty; else CompactSize n + (CompactSize len + bytes)×n |
 
-Archive writer resolves local prev when prev tx is in the same mega-batch or (if `tx.head` on) already indexed.
+Catch-up parent resolve uses light UTXO (`outpoint → create Class A fk`) or tip/wave caches — not a Class A `prev_tx_fk` field. Tip mode uses points / `tx.head`.
 
 ### Output run (one var record per tx with outputs)
 
@@ -152,6 +156,21 @@ Heights, spend state, txid, and value are **joined** at query time from Class A 
 ### Archive epoch (`archive_epoch`, 32 bytes)
 
 magic, schema version, archive_mode flag, optional finalized_height, wire_depth.
+
+### Light UTXO (`ibd_utxo.map`, catch-up only)
+
+Separate file (not `RBT1`). Magic **`RBUXTO03`**, 4 KiB header + open-addressed slots.
+
+| Slot field (24 B) | Layout |
+|-------------------|--------|
+| prefix | first 12 bytes of txid |
+| pack | `state:u8` (empty/live/tomb) + `vout:u24` |
+| create_fk | u64 LE Class A fk of the creating tx |
+
+- Membership ≈ unspent; miss ⇒ spent or never created (when spend_index off).
+- Full-txid collisions (same prefix+vout) use a rare process-local overflow map.
+- Tip height in header must stay aligned with confirmed tip; corrupt/unsupported version → delete and rebuild from chain.
+- Slot count: power of two; default `1<<22`; override `RBITCOIN_IBD_UTXO_SLOTS`.
 
 ## Chain ops (query layer)
 

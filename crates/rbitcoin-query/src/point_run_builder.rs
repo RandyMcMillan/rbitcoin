@@ -1,5 +1,5 @@
 //! Catch-up point (spend) edges via sorted runs. Confirm uses complete
-//! `spent_local` only; durable multimap is materialized at tip mode.
+//! light UTXO / process-local spentness; durable multimap is materialized at tip mode.
 
 use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;
@@ -112,7 +112,7 @@ impl PointRunBuilder {
                 })
                 .expect("spawn ibd-point-index"),
         );
-        info!("ibd: point.head catch-up via sorted runs (spent_local for confirm)");
+        info!("ibd: point.head catch-up via sorted runs (mmap UTXO for confirm spentness)");
     }
 
     pub fn enqueue_batch(&self, edges: &[PointEdge]) {

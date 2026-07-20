@@ -158,7 +158,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
     // Catch-up index mode (even with full validation / milestone 0):
     // - durable open-hash tx/point/SH off on the hot path
-    // - sequential sorted runs + spent_local (complete oracle) + process txid cache
+    // - sequential sorted runs + light UTXO create_fk (catch-up spentness oracle)
     // - materialize open-hash at enter_tip_mode before Electrum
     handle.query.set_spend_index(false);
     handle.query.set_tx_index(false);

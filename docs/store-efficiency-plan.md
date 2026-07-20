@@ -152,9 +152,9 @@ Ship as OPERATOR “sluggish disk / 16 GiB” profile (checklist).
 **IBD slim mode (default for catch-up):**
 
 ```text
-Write: Class A (headers, tx, in, out) + Class C as today
+Write: Class A (headers, tx, in, out; always external prev_txid) + Class C as today
 Defer or batch: point.head updates, optional tx.head, dense Electrum
-Prevouts: process txid→fk cache + prev_tx_fk (already) until tip mode
+Prevouts (catch-up): light UTXO create_fk + wave/tip caches; tip mode: points / tx.head
 ```
 
 **Post-tip / serve build (one pass or streaming):**

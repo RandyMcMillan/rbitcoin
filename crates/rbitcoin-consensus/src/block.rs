@@ -261,8 +261,8 @@ pub fn bip34_height_script(height: u32) -> Vec<u8> {
 ///
 /// Class C tip updates (`confirm_block`) stay outside this function.
 ///
-/// `archived_tx_fks`: Class A fks for `block.txdata` (same order), used to read
-/// `prev_tx_fk` without `tx.head`.
+/// `archived_tx_fks`: Class A fks for `block.txdata` (same order) when confirming
+/// archived bodies (wave thin create_fk / Class A rows).
 pub fn validate_block_connect(
     query: &Query,
     block: &Block,
@@ -462,23 +462,10 @@ pub(crate) fn connect_block_prevouts(
             } else {
                 Vec::new()
             };
-            // Thin prev_fks from wave (no full input-run clone); cold path loads runs.
+            // Thin create_fk hints from wave (no full input-run clone).
             let thin = spend_fk.and_then(|fk| {
                 wave_prevouts.and_then(|w| w.thin_inputs(fk).map(|s| s.to_vec()))
             });
-            let spend_inputs = if thin.is_none() {
-                if let Some(ref rec) = archived_rec {
-                    Some(
-                        query
-                            .tx_input_run(rec)
-                            .map_err(ConsensusError::Store)?,
-                    )
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
 
             for (ii, input) in tx.input.iter().enumerate() {
                 let op = input.previous_output;
@@ -533,9 +520,7 @@ pub(crate) fn connect_block_prevouts(
                 let prev_out = resolve_prevout(
                     query,
                     op,
-                    ii,
                     prev_fk,
-                    spend_inputs.as_deref(),
                     &same_block,
                     wave_prevouts,
                     &mut coinbase_height_cache,
@@ -720,11 +705,8 @@ struct ResolvedPrevout {
 fn resolve_prevout(
     query: &Query,
     op: OutPoint,
-    _input_index: usize,
     // Prefer thin create_fk from wave (avoids full InputRecord).
     prev_fk_hint: Option<rbitcoin_primitives::Fk>,
-    // Preloaded inputs of the spending tx (Class A); unused after dropping prev_tx_fk.
-    _spend_inputs: Option<&[rbitcoin_store::InputRecord]>,
     same_block: &std::collections::HashMap<[u8; 32], Vec<TxOut>>,
     wave_prevouts: Option<&rbitcoin_query::WavePrevoutCache>,
     coinbase_height_cache: &mut std::collections::HashMap<rbitcoin_primitives::Fk, Option<u32>>,
@@ -751,9 +733,9 @@ fn resolve_prevout(
     // Wave-local map first (no mutex; built during parent prefetch).
     //
     // **Wire `prev_txid` is authoritative.** Prefer by-txid; only accept an fk
-    // hit when the cached parent's txid matches. Otherwise a wrong `prev_tx_fk`
-    // can hit another wave entry (every wave-body create is a live parent) and
-    // feed the wrong scriptPubKey into script checks.
+    // hit when the cached parent's txid matches. Otherwise a wrong create_fk
+    // hint can hit another wave entry (every wave-body create is a live parent)
+    // and feed the wrong scriptPubKey into script checks.
     if let Some(wave) = wave_prevouts {
         let wave_hit = wave.get_by_txid(&prev_txid, op.vout).or_else(|| {
             prev_fk.and_then(|fk| {

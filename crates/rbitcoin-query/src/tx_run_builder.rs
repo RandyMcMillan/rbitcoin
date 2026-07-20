@@ -1,5 +1,5 @@
 //! Catch-up `tx.head` via sorted runs (txid → fk). Confirm uses process cache +
-//! `prev_tx_fk`; durable head is materialized at tip mode.
+//! durable head is materialized at tip mode (catch-up parent resolve uses light UTXO).
 
 use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;

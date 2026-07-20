@@ -792,6 +792,10 @@ pub async fn ibd_cancellable(
             }
             hub.query.seed_parent_runway(&items);
             prewarm_ctrl.publish(tip, arch, items);
+            // Lead-compact catch-up runs while archive is far ahead of tip.
+            let arch_lead = arch.saturating_sub(tip);
+            hub.query
+                .publish_run_compact_pressure(arch_lead, archive_queued.count() as u32);
         }
 
         // Stall only after progress events are applied.
@@ -942,8 +946,11 @@ pub async fn ibd_cancellable(
                 let peers_n = st.slots.iter().filter(|s| s.alive).count();
                 let (pw_through, pw_ahead, _pw_parents, _pw_bodies, _plans, _depth) =
                     hub.query.parent_prewarm_perf_snapshot();
+                let (tx_r, pt_r, sh_r) = hub.query.index_run_counts();
+                let (lead_m, forced_m) =
+                    rbitcoin_query::run_compact_pressure::sample_merges();
                 info!(
-                    "ibd: progress {pct}% tip={} ({tip_rate:.0}/s) arch_hwm={} ({arch_rate:.0}/s lead={arch_lead}) hole={} peers={peers_n} prewarm+{pw_ahead} thru={pw_through} horizon={}",
+                    "ibd: progress {pct}% tip={} ({tip_rate:.0}/s) arch_hwm={} ({arch_rate:.0}/s lead={arch_lead}) hole={} peers={peers_n} prewarm+{pw_ahead} thru={pw_through} runs t={tx_r}/p={pt_r}/sh={sh_r} compact+{lead_m}/f={forced_m} horizon={}",
                     prog.tip,
                     prog.archived,
                     prog.tip_hole,

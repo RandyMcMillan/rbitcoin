@@ -40,6 +40,7 @@ pub use confirm_parent_cache::{
     DEFAULT_PREWARM_BATCH as PREWARM_BATCH, DEFAULT_PREWARM_DEPTH as PREWARM_DEPTH,
     DEFAULT_PREWARM_HEADROOM as PREWARM_HEADROOM, MAX_PREWARM_DEPTH, MIN_PREWARM_DEPTH,
 };
+pub use run_builder_core::run_compact_pressure;
 pub use connect::ConfirmPrepared;
 pub use parent_prewarm::PrewarmStats;
 pub use wave_prevout::WavePrevoutCache;

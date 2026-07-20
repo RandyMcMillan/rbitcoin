@@ -68,6 +68,17 @@ spentness). After tip ≈ peer height, the node materializes heads and switches 
 **`IndexMode::Tip`** (durable points / `tx.head`). Mid-chain peer death must
 **not** enter Tip (restart resumes Catchup).
 
+**Lead-compact (catch-up runs):** while `arch − tip` is large and the archive
+prep queue is not hot, idle-IO run workers (`tx` / `point` / `SH`) keep merging
+toward one on-disk run per family so tip-enter materialize is cheap. Progress
+logs show `runs t=/p=/sh=` and `compact+lead/f=forced`. Env:
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `RBITCOIN_RUN_COMPACT_LEAD` | `2048` | Min archive lead (blocks) to enable; `0` = off |
+| `RBITCOIN_RUN_COMPACT_TARGET` | `1` | Target run count under lead compact |
+| `RBITCOIN_RUN_COMPACT_ARCH_Q_HOT` | `256` | Archive queue depth that pauses optional compact |
+
 **Memory rule:** During Catchup, durable open-hash heads are off. Class A inputs
 always store **external** `prev_txid` (no `prev_tx_fk` field). Parent resolve
 uses light UTXO (`outpoint → create_fk`); Tip uses points / `tx.head`.

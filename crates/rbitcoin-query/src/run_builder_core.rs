@@ -3,8 +3,13 @@
 //! Pipeline: **memtable → spill sorted run → compact merge → materialize**.
 //! Each builder owns its record layout and materialize step; this module owns
 //! worker timing, merge policy, finalize wait, and runs-dir lifecycle.
+//!
+//! **Lead compact:** when archive is far ahead of tip and the archive queue is
+//! not backed up, idle-IO workers keep merging toward one run per family so
+//! tip-enter materialize is a single sequential scan (not a multi-GB multi-pass
+//! merge of ~16 peer runs).
 
-use rbitcoin_log::warn;
+use rbitcoin_log::{info, warn};
 use rbitcoin_store::{
     list_runs, merge_runs, next_run_path, try_set_io_idle, SortedRunPath, StoreError,
 };
@@ -16,12 +21,139 @@ use std::time::Duration;
 
 /// Sleep after a productive flush/compact so confirm keeps the disk.
 pub const AFTER_WORK: Duration = Duration::from_millis(40);
+/// Longer yield after optional lead-compacts (big sequential merges).
+pub const AFTER_WORK_LEAD: Duration = Duration::from_millis(120);
 /// Idle wait when neither flush nor merge is needed.
 pub const IDLE_POLL: Duration = Duration::from_millis(100);
 /// Merge when on-disk run count reaches this (or finalize with >1 run).
 pub const MAX_RUNS: usize = 16;
+/// When archive lead is high, keep merging until this many runs remain.
+pub const LEAD_TARGET_RUNS: usize = 1;
 /// Finalize wait: 10ms × this ≈ 60s budget for large memtables.
 pub const FINALIZE_POLL_MAX: u32 = 6000;
+
+/// Run-builder family id for merge scheduling (lower = higher priority).
+pub const FAMILY_POINT: u8 = 1;
+pub const FAMILY_TX: u8 = 2;
+pub const FAMILY_SH: u8 = 3;
+
+/// IBD → run-worker pressure: archive lead + pipeline heat.
+///
+/// Published by the IBD main loop. Workers use it only for **optional**
+/// lead-compacts (below [`MAX_RUNS`]); hard cap / finalize merges always run.
+pub mod run_compact_pressure {
+    use super::{LEAD_TARGET_RUNS, MAX_RUNS};
+    use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+
+    static ARCH_LEAD: AtomicU32 = AtomicU32::new(0);
+    static ARCH_QUEUE: AtomicU32 = AtomicU32::new(0);
+    /// Optional merges hold this (family id); 0 = free. Forced merges ignore it.
+    static MERGE_OWNER: AtomicU8 = AtomicU8::new(0);
+    static MERGES_LEAD: AtomicU64 = AtomicU64::new(0);
+    static MERGES_FORCED: AtomicU64 = AtomicU64::new(0);
+    static LAST_LOG_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// Default archive-lead blocks before aggressive compact. `0` disables.
+    pub fn lead_threshold_from_env() -> u32 {
+        std::env::var("RBITCOIN_RUN_COMPACT_LEAD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2_048)
+    }
+
+    /// Target run count under lead compact (default 1).
+    pub fn lead_target_from_env() -> usize {
+        std::env::var("RBITCOIN_RUN_COMPACT_TARGET")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(LEAD_TARGET_RUNS)
+            .clamp(1, MAX_RUNS)
+    }
+
+    /// Archive queue depth above which optional compact backs off.
+    pub fn arch_q_hot_from_env() -> u32 {
+        std::env::var("RBITCOIN_RUN_COMPACT_ARCH_Q_HOT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256)
+    }
+
+    pub fn publish(arch_lead: u32, arch_queue: u32) {
+        ARCH_LEAD.store(arch_lead, Ordering::Relaxed);
+        ARCH_QUEUE.store(arch_queue, Ordering::Relaxed);
+    }
+
+    pub fn arch_lead() -> u32 {
+        ARCH_LEAD.load(Ordering::Relaxed)
+    }
+
+    pub fn arch_queue() -> u32 {
+        ARCH_QUEUE.load(Ordering::Relaxed)
+    }
+
+    /// True when archive is far enough ahead and the archive prep queue is not hot.
+    pub fn aggressive() -> bool {
+        let thr = lead_threshold_from_env();
+        if thr == 0 {
+            return false;
+        }
+        if ARCH_LEAD.load(Ordering::Relaxed) < thr {
+            return false;
+        }
+        ARCH_QUEUE.load(Ordering::Relaxed) < arch_q_hot_from_env()
+    }
+
+    /// Desired max on-disk runs for optional compact (not the hard cap).
+    pub fn target_runs() -> usize {
+        if aggressive() {
+            lead_target_from_env()
+        } else {
+            MAX_RUNS
+        }
+    }
+
+    /// Try to claim the optional-merge slot. Forced merges must not call this.
+    pub fn try_begin_optional_merge(family: u8) -> bool {
+        MERGE_OWNER
+            .compare_exchange(0, family, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    pub fn end_optional_merge(family: u8) {
+        let _ = MERGE_OWNER.compare_exchange(family, 0, Ordering::AcqRel, Ordering::Relaxed);
+    }
+
+    pub fn note_merge(lead_optional: bool) {
+        if lead_optional {
+            MERGES_LEAD.fetch_add(1, Ordering::Relaxed);
+        } else {
+            MERGES_FORCED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `(lead_merges, forced_merges)` since last sample.
+    pub fn sample_merges() -> (u64, u64) {
+        (
+            MERGES_LEAD.swap(0, Ordering::Relaxed),
+            MERGES_FORCED.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    /// Rate-limit INFO about lead-compact mode (≈ every 30s).
+    pub fn should_log_mode() -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let prev = LAST_LOG_NS.load(Ordering::Relaxed);
+        if now.saturating_sub(prev) >= 30 {
+            LAST_LOG_NS.store(now, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// Control plane shared by every run builder's `Inner`.
 pub struct RunControl {
@@ -114,13 +246,20 @@ pub fn spawn_worker(
     );
 }
 
-/// Background loop: flush when soft-full or finalizing; compact when too many runs.
+/// Background loop: flush when soft-full or finalizing; compact under pressure.
+///
+/// - **Forced** merge: `runs ≥ MAX_RUNS` or finalize — always, no global gate.
+/// - **Lead** merge: archive far ahead + arch queue not hot → merge while
+///   `runs > target` (default 1). Single optional-merge slot so families do not
+///   thrash the disk together; [`FAMILY_POINT`] is preferred by shorter idle.
 pub fn worker_loop<T: RunMemtable + 'static>(
     soft_cap: usize,
     log_tag: &'static str,
+    family: u8,
     inner: Arc<Mutex<T>>,
     cv: Arc<Condvar>,
 ) {
+    let mut logged_lead = false;
     loop {
         let mut g = inner.lock().unwrap();
         if g.control().stop {
@@ -140,17 +279,42 @@ pub fn worker_loop<T: RunMemtable + 'static>(
         if g.control().stop {
             break;
         }
-        let need_merge =
-            run_count >= MAX_RUNS || (g.control().finalize && run_count > 1 && !need_flush);
+        let finalize = g.control().finalize;
+        let forced_merge =
+            run_count >= MAX_RUNS || (finalize && run_count > 1 && !need_flush);
+        let target = run_compact_pressure::target_runs();
+        let lead_mode = run_compact_pressure::aggressive();
+        let optional_merge = !forced_merge && lead_mode && run_count > target;
+        let need_merge = forced_merge || optional_merge;
+
+        if lead_mode && !logged_lead && run_compact_pressure::should_log_mode() {
+            logged_lead = true;
+            info!(
+                "ibd: {log_tag} run lead-compact ON lead={} arch_q={} runs={run_count} target={target} (RBITCOIN_RUN_COMPACT_LEAD)",
+                run_compact_pressure::arch_lead(),
+                run_compact_pressure::arch_queue(),
+            );
+        }
+        if !lead_mode {
+            logged_lead = false;
+        }
 
         if !need_flush && !need_merge {
-            if g.control().finalize && g.pending_len() == 0 {
+            if finalize && g.pending_len() == 0 {
                 // Leave final multi-run merge to finalize_and_materialize.
                 g.control_mut().stop = true;
                 cv.notify_all();
                 break;
             }
-            let (gg, _) = cv.wait_timeout(g, IDLE_POLL).unwrap();
+            // Point wakes more often under lead so it claims optional merges first.
+            let idle = if lead_mode && family == FAMILY_POINT {
+                Duration::from_millis(40)
+            } else if lead_mode {
+                Duration::from_millis(150)
+            } else {
+                IDLE_POLL
+            };
+            let (gg, _) = cv.wait_timeout(g, idle).unwrap();
             g = gg;
             if g.control().stop {
                 break;
@@ -172,6 +336,16 @@ pub fn worker_loop<T: RunMemtable + 'static>(
         }
 
         if need_merge {
+            let optional = optional_merge && !forced_merge;
+            if optional && !run_compact_pressure::try_begin_optional_merge(family) {
+                // Another family is lead-compacting; back off.
+                std::thread::sleep(if family == FAMILY_POINT {
+                    Duration::from_millis(30)
+                } else {
+                    Duration::from_millis(80)
+                });
+                continue;
+            }
             // Lock order: never take Inner while holding runs_io (flush holds
             // Inner then runs_io). Reserve output seq under Inner first.
             let (runs_dir, out_seq, runs_io) = {
@@ -184,16 +358,39 @@ pub fn worker_loop<T: RunMemtable + 'static>(
             };
             let _io = runs_io.lock().unwrap();
             let mut runs = list_runs(&runs_dir).unwrap_or_default();
-            if runs.len() >= 2 {
+            let merged_ok = if runs.len() >= 2 {
                 runs.sort_by_key(|r| r.count);
-                let n = runs.len().min(4).max(2);
+                // Lead: 2-way on huge peers (less write amp). Forced: up to 4.
+                let n = if optional {
+                    2
+                } else {
+                    runs.len().min(4).max(2)
+                };
                 let batch: Vec<SortedRunPath> = runs.drain(..n).collect();
                 let out = next_run_path(&runs_dir, out_seq);
-                if let Err(e) = merge_runs(&batch, &out) {
-                    warn!("ibd: {log_tag} run compact failed: {e}");
+                match merge_runs(&batch, &out) {
+                    Ok(_) => {
+                        run_compact_pressure::note_merge(optional);
+                        true
+                    }
+                    Err(e) => {
+                        warn!("ibd: {log_tag} run compact failed: {e}");
+                        false
+                    }
                 }
-                drop(_io);
-                std::thread::sleep(AFTER_WORK);
+            } else {
+                false
+            };
+            drop(_io);
+            if optional {
+                run_compact_pressure::end_optional_merge(family);
+            }
+            if merged_ok {
+                std::thread::sleep(if optional {
+                    AFTER_WORK_LEAD
+                } else {
+                    AFTER_WORK
+                });
             }
             // If <2 runs, seq is a harmless hole (race with concurrent finalize).
         }
@@ -274,5 +471,36 @@ pub fn clear_runs_dir(runs_dir: &Path) {
         for e in rd.flatten() {
             let _ = std::fs::remove_file(e.path());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_compact_pressure;
+
+    #[test]
+    fn lead_compact_aggressive_when_lead_high_and_queue_cool() {
+        // Isolate from process env defaults.
+        std::env::set_var("RBITCOIN_RUN_COMPACT_LEAD", "100");
+        std::env::set_var("RBITCOIN_RUN_COMPACT_ARCH_Q_HOT", "50");
+        std::env::set_var("RBITCOIN_RUN_COMPACT_TARGET", "1");
+        run_compact_pressure::publish(5_000, 10);
+        assert!(run_compact_pressure::aggressive());
+        assert_eq!(run_compact_pressure::target_runs(), 1);
+        run_compact_pressure::publish(5_000, 200);
+        assert!(!run_compact_pressure::aggressive());
+        assert_eq!(run_compact_pressure::target_runs(), super::MAX_RUNS);
+        run_compact_pressure::publish(50, 0);
+        assert!(!run_compact_pressure::aggressive());
+        // Optional merge token.
+        assert!(run_compact_pressure::try_begin_optional_merge(super::FAMILY_POINT));
+        assert!(!run_compact_pressure::try_begin_optional_merge(super::FAMILY_TX));
+        run_compact_pressure::end_optional_merge(super::FAMILY_POINT);
+        assert!(run_compact_pressure::try_begin_optional_merge(super::FAMILY_TX));
+        run_compact_pressure::end_optional_merge(super::FAMILY_TX);
+        std::env::remove_var("RBITCOIN_RUN_COMPACT_LEAD");
+        std::env::remove_var("RBITCOIN_RUN_COMPACT_ARCH_Q_HOT");
+        std::env::remove_var("RBITCOIN_RUN_COMPACT_TARGET");
+        run_compact_pressure::publish(0, 0);
     }
 }

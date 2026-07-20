@@ -323,6 +323,24 @@ impl Query {
         self.point_run.finalize_and_materialize(&self.store)
     }
 
+    /// Drive idle lead-compact of catch-up sorted runs (`tx` / `point` / `SH`).
+    ///
+    /// Call from the IBD loop with `arch_lead = arch_hwm - tip` and the archive
+    /// prep queue depth. When lead is high and the queue is not hot, workers
+    /// merge toward one run per family (see `RBITCOIN_RUN_COMPACT_*`).
+    pub fn publish_run_compact_pressure(&self, arch_lead: u32, arch_queue: u32) {
+        crate::run_builder_core::run_compact_pressure::publish(arch_lead, arch_queue);
+    }
+
+    /// On-disk run counts: `(tx, point, scripthash)`.
+    pub fn index_run_counts(&self) -> (usize, usize, usize) {
+        (
+            self.tx_run.on_disk_run_count(),
+            self.point_run.on_disk_run_count(),
+            self.sh_run.on_disk_run_count(),
+        )
+    }
+
     pub(crate) fn tx_run_enabled(&self) -> bool {
         self.tx_run.is_enabled()
     }

@@ -3,7 +3,7 @@
 
 use super::run_builder_core::{
     clear_runs_dir, compact_all_to_one, finalize_wait_join, memtable_cap, spawn_worker, worker_loop,
-    RunControl, RunMemtable,
+    RunControl, RunMemtable, FAMILY_TX,
 };
 use rbitcoin_log::{debug, info};
 use rbitcoin_primitives::Fk;
@@ -110,6 +110,7 @@ impl TxRunBuilder {
                 worker_loop(
                     memtable_cap("RBITCOIN_TX_MEMTABLE_CAP", DEFAULT_CAP),
                     "tx",
+                    FAMILY_TX,
                     inner_w,
                     cv_w,
                 );
@@ -171,6 +172,16 @@ impl TxRunBuilder {
             }
         }
         Ok(None)
+    }
+
+    /// On-disk sorted-run count (for IBD progress / lead-compact metrics).
+    pub fn on_disk_run_count(&self) -> usize {
+        let (runs_dir, runs_io) = {
+            let g = self.inner.lock().unwrap();
+            (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
+        };
+        let _io = runs_io.lock().unwrap();
+        list_runs(&runs_dir).map(|r| r.len()).unwrap_or(0)
     }
 
     pub fn finalize_and_materialize(&self, store: &Store) -> Result<u64, StoreError> {

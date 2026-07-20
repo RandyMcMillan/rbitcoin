@@ -503,6 +503,11 @@ pub(crate) fn connect_block_prevouts(
                 if pending_spent.contains(&key) {
                     return Err(ConsensusError::PrevoutSpent);
                 }
+                // Wave already filtered spent outs at fill time (same UTXO tip).
+                // Skip a second light-UTXO probe on the ~98% wave-hit path.
+                let wave_live = wave_prevouts
+                    .and_then(|w| w.get_by_txid(op.txid.as_byte_array(), op.vout))
+                    .is_some();
                 if spend_index_on {
                     // Tip mode: durable confirmed-strong points only.
                     if query
@@ -512,12 +517,13 @@ pub(crate) fn connect_block_prevouts(
                     {
                         return Err(ConsensusError::PrevoutSpent);
                     }
-                } else if !pending_creates.contains_key(&key)
+                } else if !wave_live
+                    && !pending_creates.contains_key(&key)
                     && query
                         .catchup_is_spent(op.txid.as_byte_array(), op.vout)
                         .map_err(ConsensusError::Store)?
                 {
-                    // Catch-up: light UTXO miss (and not a same-run create).
+                    // Catch-up cold path only: light UTXO miss (not same-run create).
                     return Err(ConsensusError::PrevoutSpent);
                 }
                 let prev_fk = thin
@@ -526,10 +532,15 @@ pub(crate) fn connect_block_prevouts(
                     .and_then(|e| e.create_fk.map(rbitcoin_primitives::Fk))
                     .or_else(|| pending_creates.get(&key).copied())
                     .or_else(|| {
-                        query
-                            .ibd_utxo_create_fk(op.txid.as_byte_array(), op.vout)
-                            .ok()
-                            .flatten()
+                        // Only probe UTXO for create_fk when wave/thin missed.
+                        if wave_live {
+                            None
+                        } else {
+                            query
+                                .ibd_utxo_create_fk(op.txid.as_byte_array(), op.vout)
+                                .ok()
+                                .flatten()
+                        }
                     });
                 let prev_out = resolve_prevout(
                     query,

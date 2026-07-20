@@ -631,32 +631,22 @@ impl ConfirmParentCache {
             .map(|&id| Fk(id))
     }
 
-    /// Full output map for a parent when present (subset or all vouts).
-    ///
-    /// Sparse `by_fk` first; else all outs from runway body.
+    /// Sparse external-parent outs only (`by_fk`). Does **not** expand runway
+    /// bodies — callers that need a subset of body outs should use
+    /// [`Self::get_body`] (avoids cloning every script of a multi-out create).
     pub fn get_parent_outs(&self, fk: Fk) -> Option<(TxRecord, HashMap<u32, OutputRecord>)> {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
-        if let Some(e) = g.by_fk.get(&id) {
-            if !e.outs.is_empty() {
-                let outs: HashMap<u32, OutputRecord> = e
-                    .outs
-                    .iter()
-                    .map(|(v, o)| (*v, o.output.clone()))
-                    .collect();
-                return Some((e.tx.clone(), outs));
-            }
+        let e = g.by_fk.get(&id)?;
+        if e.outs.is_empty() {
+            return None;
         }
-        if let Some(b) = g.by_body.get(&id) {
-            let outs: HashMap<u32, OutputRecord> = b
-                .outputs
-                .iter()
-                .enumerate()
-                .map(|(v, o)| (v as u32, o.clone()))
-                .collect();
-            return Some((b.tx.clone(), outs));
-        }
-        None
+        let outs: HashMap<u32, OutputRecord> = e
+            .outs
+            .iter()
+            .map(|(v, o)| (*v, o.output.clone()))
+            .collect();
+        Some((e.tx.clone(), outs))
     }
 
     pub fn plan_count(&self) -> usize {

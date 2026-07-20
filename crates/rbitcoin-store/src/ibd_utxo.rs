@@ -341,7 +341,9 @@ impl IbdUtxo {
 
     /// Insert created outpoint with its create-tx Class A fk.
     ///
-    /// Idempotent if already live (partial apply retry).
+    /// Idempotent if already live (partial apply retry). **Single** open-address
+    /// walk (no separate `contains` + insert probes — confirm UTXO apply was
+    /// paying 2–3 probes per create).
     pub fn insert_create(
         &mut self,
         txid: &[u8; 32],
@@ -361,17 +363,8 @@ impl IbdUtxo {
             if list.iter().any(|(t, _)| t == txid) {
                 return Ok(());
             }
-        }
-        // Compressed key already live (slot and/or other overflow entries).
-        // New full txid → overflow. Same first occupant re-insert (prefix-only
-        // slot, no full id): `contains` below is true via slot → idempotent.
-        // Distinct full txid with same prefix: `contains` is also true via
-        // slot (prefix match) — birthday on 12 bytes is treated as negligible;
-        // forced collisions need a future full-txid slot layout.
-        if self.contains(txid, vout)? {
-            return Ok(());
-        }
-        if self.contains_compressed(&prefix, vout)? {
+            // Prefix collision: another full txid occupies overflow. New create
+            // with same compressed key goes to overflow (birthday on 12 bytes).
             let list = self
                 .overflow
                 .entry((prefix, vout))
@@ -384,7 +377,7 @@ impl IbdUtxo {
         let mask = self.num_slots - 1;
         let mut i = hash0(&prefix, vout) & mask;
         for step in 0..self.num_slots {
-            let (_sp, state, _sv, _fk) = Self::read_slot(&self.map, self.num_slots, i);
+            let (sp, state, sv, _fk) = Self::read_slot(&self.map, self.num_slots, i);
             match state {
                 STATE_EMPTY | STATE_TOMB => {
                     Self::write_slot(
@@ -399,6 +392,13 @@ impl IbdUtxo {
                     self.live = self.live.saturating_add(1);
                     return Ok(());
                 }
+                STATE_LIVE if sp == prefix && sv == vout => {
+                    // Same compressed key already live (idempotent re-apply, or
+                    // 12-byte birthday). First occupant stays in the slot; a
+                    // distinct full txid would need overflow — treat birthday
+                    // as negligible (same as prior contains_compressed path).
+                    return Ok(());
+                }
                 STATE_LIVE => {
                     i = (i + step + 1) & mask;
                 }
@@ -406,28 +406,6 @@ impl IbdUtxo {
             }
         }
         Err(StoreError::Corrupt("ibd utxo table full"))
-    }
-
-    fn contains_compressed(
-        &self,
-        prefix: &[u8; PREFIX_LEN],
-        vout: u32,
-    ) -> Result<bool, StoreError> {
-        if self.overflow.contains_key(&(*prefix, vout)) {
-            return Ok(true);
-        }
-        let mask = self.num_slots - 1;
-        let mut i = hash0(prefix, vout) & mask;
-        for step in 0..self.num_slots {
-            let (sp, state, sv, _) = Self::read_slot(&self.map, self.num_slots, i);
-            match state {
-                STATE_EMPTY => return Ok(false),
-                STATE_LIVE if sp == *prefix && sv == vout => return Ok(true),
-                STATE_LIVE | STATE_TOMB => i = (i + step + 1) & mask,
-                _ => return Err(StoreError::Corrupt("ibd utxo bad state")),
-            }
-        }
-        Ok(false)
     }
 
     /// Remove a spent outpoint. Returns false if it was not unspent.

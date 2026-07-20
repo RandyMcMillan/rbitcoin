@@ -156,25 +156,23 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             milestone.height
         );
     }
-    // Catch-up index mode (even with full validation / milestone 0):
+    // Catch-up IndexMode (even with full validation / milestone 0):
     // - durable open-hash tx/point/SH off on the hot path
     // - sequential sorted runs + light UTXO create_fk (catch-up spentness oracle)
     // - materialize open-hash at enter_tip_mode before Electrum
-    handle.query.set_spend_index(false);
-    handle.query.set_tx_index(false);
     handle
         .query
-        .enable_index_run_mode()
-        .map_err(|e| NodeError::Config(format!("index run mode: {e}")))?;
+        .enter_catchup_mode()
+        .map_err(|e| NodeError::Config(format!("index catch-up mode: {e}")))?;
     info!(
-        "ibd: index catch-up mode (tx/point/SH runs + mmap UTXO; materialize heads at tip mode)"
+        "ibd: IndexMode::Catchup (tx/point/SH runs + mmap UTXO; materialize heads at Tip)"
     );
-    // Parent resolve during catch-up: light UTXO only (required when spend_index off).
+    // Parent resolve during catch-up: light UTXO only (required in Catchup).
     handle
         .query
         .ensure_spent_oracle_ready()
         .map_err(|e| NodeError::Config(format!("spent oracle: {e}")))?;
-    info!("ibd: spent oracle ready (mmap UTXO tip aligned)");
+    info!("ibd: spent oracle ready (mmap UTXO tip aligned, mode={:?})", handle.query.index_mode());
 
     let listen = config
         .p2p_listen
@@ -736,9 +734,11 @@ pub(crate) fn enter_tip_mode(query: &Query) {
     }
 
     // Tip-follow: durable indexes on (write-through; low rate). Spentness = points.
-    query.set_spend_index(true);
-    query.set_tx_index(true);
-    info!("node: tip mode indexes spend=on tx_head=on scripthash=on");
+    query.enter_tip_index_mode();
+    info!(
+        "node: IndexMode::Tip (spend=on tx_head=on scripthash=on) mode={:?}",
+        query.index_mode()
+    );
     info!(
         "node: scripthash rows={} (thin creates; spentness via points)",
         query.scripthash_entry_count()
@@ -754,6 +754,7 @@ mod tests {
 
     #[test]
     fn enter_tip_mode_reenables_indexes() {
+        use rbitcoin_query::IndexMode;
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -761,12 +762,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rbitcoin-tip-mode-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         let q = Query::open_or_create(dir.join("store")).unwrap();
-        q.set_spend_index(false);
-        q.set_tx_index(false);
+        q.enter_catchup_mode().unwrap();
+        assert_eq!(q.index_mode(), IndexMode::Catchup);
         assert!(!q.spend_index_enabled());
         assert!(!q.tx_index_enabled());
 
         enter_tip_mode(&q);
+        assert_eq!(q.index_mode(), IndexMode::Tip);
         assert!(q.spend_index_enabled());
         assert!(q.tx_index_enabled());
 

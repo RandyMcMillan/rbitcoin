@@ -48,9 +48,14 @@ Default: **info**. CLI wins over env.
 | Light UTXO (mmap) | **~96 MiB start** (24 B slots; grows) | `RBITCOIN_IBD_UTXO_SLOTS` |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 
-**Memory rule:** During IBD, durable open-hash heads are off. Class A inputs
+**Index modes:** IBD uses **`IndexMode::Catchup`** (sorted runs + light UTXO
+spentness). After tip ≈ peer height, the node materializes heads and switches to
+**`IndexMode::Tip`** (durable points / `tx.head`). Mid-chain peer death must
+**not** enter Tip (restart resumes Catchup).
+
+**Memory rule:** During Catchup, durable open-hash heads are off. Class A inputs
 always store **external** `prev_txid` (no `prev_tx_fk` field). Parent resolve
-uses light UTXO (`outpoint → create_fk`); tip mode uses points / `tx.head`.
+uses light UTXO (`outpoint → create_fk`); Tip uses points / `tx.head`.
 SH create dedupe is an **O(1) height watermark**. Do not raise Class A / archive
 queues without watching RSS vs page cache.
 

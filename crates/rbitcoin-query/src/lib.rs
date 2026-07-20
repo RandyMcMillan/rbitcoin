@@ -38,6 +38,32 @@ pub use connect::ConfirmPrepared;
 pub use tip_prevout_cache::stats as tip_prevout_cache_stats;
 pub use wave_prevout::WavePrevoutCache;
 
+/// First-class index / spentness mode for catch-up vs tip-follow.
+///
+/// | Mode | Durable `tx.head` / points | Spentness truth |
+/// |------|----------------------------|-----------------|
+/// | [`Catchup`](IndexMode::Catchup) | off (sorted runs) | light mmap UTXO |
+/// | [`Tip`](IndexMode::Tip) | on (open-hash) | confirmed-strong points |
+///
+/// Open defaults to [`Tip`] until the node calls [`Query::enter_catchup_mode`].
+/// After catch-up, materialize runs then [`Query::enter_tip_index_mode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexMode {
+    /// IBD / catch-up: runs + UTXO; durable open-hash heads off.
+    Catchup,
+    /// Steady-state / Electrum: durable points + `tx.head`.
+    Tip,
+}
+
+impl IndexMode {
+    pub fn is_catchup(self) -> bool {
+        matches!(self, Self::Catchup)
+    }
+    pub fn is_tip(self) -> bool {
+        matches!(self, Self::Tip)
+    }
+}
+
 /// Class C sub-phase wall times (nanoseconds; reset by the IBD sampler).
 ///
 /// Split so logs can tell strong/height vs scripthash puts vs tip commit.
@@ -206,8 +232,8 @@ pub struct ResumeWorkEntry {
 pub struct Query {
     store: Store,
     /// When false, archive **and** confirm skip durable Class B point (spend) writes.
+    /// Prefer [`Self::index_mode`] / [`Self::enter_catchup_mode`] over toggling alone.
     /// Catch-up spentness is light UTXO only; tip mode uses durable points + strong.
-    /// Re-enable + [`Self::backfill_point_spends`] after catch-up (before Electrum).
     spend_index: std::sync::atomic::AtomicBool,
     /// When false, archive skips durable `tx.head` inserts (main archive cost).
     /// Parent resolve during catch-up uses light UTXO create_fk (not a txid map).
@@ -355,18 +381,47 @@ impl Query {
         ibd_utxo_stats::note_rebuild();
     }
 
-    /// True if outpoint is spent on the **catch-up** oracle (spend_index off).
+    /// Current index / spentness mode ([`IndexMode`]).
+    ///
+    /// Derived from durable spend-index flag: off ⇒ Catchup, on ⇒ Tip.
+    #[inline]
+    pub fn index_mode(&self) -> IndexMode {
+        if self.spend_index_enabled() {
+            IndexMode::Tip
+        } else {
+            IndexMode::Catchup
+        }
+    }
+
+    /// Enter catch-up: durable heads off, sorted runs on, light UTXO required.
+    ///
+    /// Node IBD entry point. Prefer this over hand-toggling flags.
+    pub fn enter_catchup_mode(&self) -> Result<(), QueryError> {
+        self.set_spend_index(false);
+        self.set_tx_index(false);
+        self.enable_index_run_mode()
+    }
+
+    /// Flip durable index flags on for tip-follow (after run materialize / backfill).
+    ///
+    /// Does not materialize runs — the node `enter_tip_mode` path does that first.
+    pub fn enter_tip_index_mode(&self) {
+        self.set_spend_index(true);
+        self.set_tx_index(true);
+    }
+
+    /// True if outpoint is spent on the **catch-up** oracle ([`IndexMode::Catchup`]).
     ///
     /// Light UTXO unspent set: not present ⇒ spent or never created.
-    /// Tip mode (spend_index on) returns false so callers use durable points.
+    /// Tip mode returns false so callers use durable points.
     pub fn catchup_is_spent(&self, txid: &[u8; 32], vout: u32) -> Result<bool, QueryError> {
-        if self.spend_index_enabled() {
+        if self.index_mode().is_tip() {
             return Ok(false); // durable path handles spentness
         }
         let g = self.ibd_utxo.lock().unwrap();
         let Some(ref u) = *g else {
             return Err(StoreError::Corrupt(
-                "catch-up spentness requires light UTXO; call enable_ibd_utxo / enable_index_run_mode",
+                "catch-up spentness requires light UTXO; call enter_catchup_mode / enable_ibd_utxo",
             ));
         };
         Ok(!u.contains(txid, vout)?)
@@ -496,16 +551,16 @@ impl Query {
 
     /// Hard-block catch-up confirm unless light UTXO is enabled and tip-aligned.
     ///
-    /// Tip mode (spend_index on) uses durable points only — always ready.
+    /// [`IndexMode::Tip`] uses durable points only — always ready.
     pub fn ensure_spent_oracle_ready(&self) -> Result<(), QueryError> {
-        if self.spend_index_enabled() {
+        if self.index_mode().is_tip() {
             return Ok(());
         }
         let chain_tip = self.tip_height().map(|h| h.0);
         let g = self.ibd_utxo.lock().unwrap();
         let Some(ref u) = *g else {
             return Err(StoreError::Corrupt(
-                "catch-up requires light UTXO; call enable_ibd_utxo / enable_index_run_mode",
+                "catch-up requires light UTXO; call enter_catchup_mode / enable_ibd_utxo",
             ));
         };
         if u.tip() != chain_tip {
@@ -521,7 +576,9 @@ impl Query {
         self.rebuild_ibd_utxo_to_tip()
     }
 
-    /// Catch-up: SH / tx / point durable open-hash off; sequential runs + mmap UTXO.
+    /// Enable SH / tx / point sorted runs + mmap UTXO (flags already off).
+    ///
+    /// Prefer [`Self::enter_catchup_mode`] which also clears durable index flags.
     pub fn enable_index_run_mode(&self) -> Result<(), QueryError> {
         self.sh_run.enable();
         self.tx_run.enable();
@@ -783,16 +840,16 @@ impl Query {
 impl Query {
     /// True if this outpoint is spent on the **best chain**.
     ///
-    /// - **Catch-up** (`spend_index` off): light UTXO unspent set.
-    /// - **Tip** (`spend_index` on): durable confirmed-strong point edges only.
+    /// - [`IndexMode::Catchup`]: light UTXO unspent set.
+    /// - [`IndexMode::Tip`]: durable confirmed-strong point edges only.
     ///
     /// Does **not** treat archive-only point rows as spent: Class A may write
     /// edges before Class C; those spenders are not strong yet.
     pub fn is_outpoint_spent(&self, txid: &[u8; 32], vout: u32) -> Result<bool, QueryError> {
-        if !self.spend_index_enabled() {
-            return self.catchup_is_spent(txid, vout);
+        match self.index_mode() {
+            IndexMode::Catchup => self.catchup_is_spent(txid, vout),
+            IndexMode::Tip => self.store.has_confirmed_strong_spender(txid, vout),
         }
-        self.store.has_confirmed_strong_spender(txid, vout)
     }
 
     /// Enable/disable txid hash-head inserts on archive (default on). Off under

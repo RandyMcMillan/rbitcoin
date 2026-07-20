@@ -22,6 +22,15 @@ Prep never holds store write locks. The writer is the sole Class A producer for 
 | Electrum | Read-mostly; joins Class A + scripthash under `Query` |
 | Epoch finalize | Single-threaded control path; flushes mmap |
 
+## Index modes (`IndexMode`)
+
+| Mode | When | Spentness | Durable `tx.head` / points |
+|------|------|-----------|----------------------------|
+| **Catchup** | IBD (`Query::enter_catchup_mode`) | light mmap UTXO | off (sorted runs) |
+| **Tip** | after catch-up (`enter_tip_mode` / `enter_tip_index_mode`) | confirmed-strong points | on |
+
+Catch-up without UTXO is illegal (`ensure_spent_oracle_ready`). Do not enter Tip until tip ≈ peer height.
+
 ## Locks
 
 - Store tables use fine-grained `Mutex`es per file/head (see `rbitcoin-store`).

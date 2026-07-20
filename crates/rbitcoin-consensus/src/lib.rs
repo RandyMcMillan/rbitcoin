@@ -253,9 +253,39 @@ pub fn confirm_archived_run(
     let mut time_window: Vec<u32> = Vec::with_capacity(11);
     let mut prepared: Vec<Prepared> = Vec::with_capacity(blocks.len());
 
-    // (A) Wave prep: Class A warm (body) then parent/thin-input fill, then wire
-    // reconstruct. Sub-timers split so logs show where the IO sits.
-    let hashes: Vec<[u8; 32]> = blocks.iter().map(|(_, h)| *h).collect();
+    // Resolve header_fk + tx list once (shared by prefetch, wave, wire, connect).
+    struct BodyMeta {
+        height: Height,
+        hash: [u8; 32],
+        header_fk: rbitcoin_primitives::Fk,
+        header_rec: rbitcoin_store::HeaderRecord,
+        tx_fks: Vec<rbitcoin_primitives::Fk>,
+    }
+    let mut metas: Vec<BodyMeta> = Vec::with_capacity(blocks.len());
+    for &(height, hash) in blocks {
+        let (header_fk, header_rec) = query
+            .get_header_by_hash(&hash)
+            .map_err(ConsensusError::Store)?
+            .ok_or(ConsensusError::Store(StoreError::NotFound))?;
+        let tx_fks = query
+            .store()
+            .header_txs
+            .get_list(header_fk)
+            .map_err(ConsensusError::Store)?
+            .ok_or(ConsensusError::Store(StoreError::Corrupt(
+                "confirm without archived body",
+            )))?;
+        metas.push(BodyMeta {
+            height,
+            hash,
+            header_fk,
+            header_rec,
+            tx_fks,
+        });
+    }
+
+    // (A) Wave prep: Class A warm → parent/thin fill → parallel wire rebuild.
+    let hashes: Vec<[u8; 32]> = metas.iter().map(|m| m.hash).collect();
     let wave_prevouts = {
         let t0 = Instant::now();
         let _ = query
@@ -265,7 +295,6 @@ pub fn confirm_archived_run(
         confirm_phase_stats::PREFETCH_CLASS_A_NS.fetch_add(ns, Ordering::Relaxed);
         confirm_phase_stats::RECONSTRUCT_NS.fetch_add(ns, Ordering::Relaxed);
 
-        // Parent/wave map: reuses class_a for bodies; sparse parent outputs only.
         let t1 = Instant::now();
         let (_n, wave) = query
             .prefetch_tip_prevouts_for_block_hashes(&hashes)
@@ -276,15 +305,32 @@ pub fn confirm_archived_run(
         wave
     };
 
-    for (i, &(height, block_hash)) in blocks.iter().enumerate() {
+    // Parallel wire rebuild (warm Class A → CPU-bound Transaction materialization).
+    let wire_blocks = {
+        use rayon::prelude::*;
         let t0 = Instant::now();
-        let block = query
-            .reconstruct_archived_block(&block_hash)
-            .map_err(ConsensusError::Store)?
-            .ok_or(ConsensusError::Store(StoreError::NotFound))?;
+        let blks: Result<Vec<_>, ConsensusError> = metas
+            .par_iter()
+            .map(|m| {
+                query
+                    .reconstruct_archived_block_from_parts(
+                        m.header_rec.clone(),
+                        m.tx_fks.clone(),
+                    )
+                    .map_err(ConsensusError::Store)
+            })
+            .collect();
+        let blks = blks?;
         let ns = t0.elapsed().as_nanos() as u64;
         confirm_phase_stats::RECONSTRUCT_WIRE_NS.fetch_add(ns, Ordering::Relaxed);
         confirm_phase_stats::RECONSTRUCT_NS.fetch_add(ns, Ordering::Relaxed);
+        blks
+    };
+
+    for (i, meta) in metas.into_iter().enumerate() {
+        let block = &wire_blocks[i];
+        let height = meta.height;
+        let block_hash = meta.hash;
 
         let ctx = ValidationContext {
             params,
@@ -337,36 +383,23 @@ pub fn confirm_archived_run(
 
         // BIP34 buried activation (mainnet 227931 — not height 1).
         if params.bip34_active_at(height.0) {
-            check_bip34_at_height(&block, height.0)?;
+            check_bip34_at_height(block, height.0)?;
         }
 
         // BIP325: full signet challenge (CHECKMULTISIG) on tip confirm only —
         // never on archive structure (IBD prep hot path).
         if height.0 > 0 {
             if let Some(challenge) = params.signet_challenge.as_ref() {
-                crate::signet::validate_signet_block_solution(&block, challenge.as_script())?;
+                crate::signet::validate_signet_block_solution(block, challenge.as_script())?;
             }
         }
-
-        let (header_fk, _) = query
-            .get_header_by_hash(&block_hash)
-            .map_err(ConsensusError::Store)?
-            .ok_or(ConsensusError::Store(StoreError::NotFound))?;
-        let tx_fks = query
-            .store()
-            .header_txs
-            .get_list(header_fk)
-            .map_err(ConsensusError::Store)?
-            .ok_or(ConsensusError::Store(StoreError::Corrupt(
-                "confirm without archived body",
-            )))?;
 
         let t_connect = Instant::now();
         let (script_jobs, spends, creates) = connect_block_prevouts(
             query,
-            &block,
+            block,
             &ctx,
-            Some(&tx_fks),
+            Some(&meta.tx_fks),
             Some(&wave_prevouts),
             &mut pending_spent,
             &mut pending_creates,
@@ -382,8 +415,8 @@ pub fn confirm_archived_run(
 
         prepared.push(Prepared {
             height,
-            header_fk,
-            tx_fks,
+            header_fk: meta.header_fk,
+            tx_fks: meta.tx_fks,
             jobs: script_jobs,
             spends,
             creates,

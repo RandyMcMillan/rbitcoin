@@ -156,6 +156,37 @@ impl ClassACache {
         outs_ok && ins_ok
     }
 
+    /// One lock: clone tx + full I/O runs when reconstruct-ready.
+    ///
+    /// Prefer this over `get_tx` + `get_outputs` + `get_inputs` (3 mutex round-trips)
+    /// on the confirm reconstruct / wave-body hot path.
+    pub fn get_reconstruct_parts(
+        &self,
+        fk: Fk,
+    ) -> Option<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>)> {
+        let id = fk.get()?;
+        let g = self.inner.lock().unwrap();
+        let e = g.map.get(&id)?;
+        let outs_ok = e.tx.output_count == 0 || e.outputs.is_some();
+        let ins_ok = e.tx.input_count == 0 || e.inputs.is_some();
+        if !outs_ok || !ins_ok {
+            stats::MISS.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        stats::HIT.fetch_add(1, Ordering::Relaxed);
+        let outs = if e.tx.output_count == 0 {
+            Vec::new()
+        } else {
+            e.outputs.clone().unwrap_or_default()
+        };
+        let inputs = if e.tx.input_count == 0 {
+            Vec::new()
+        } else {
+            e.inputs.clone().unwrap_or_default()
+        };
+        Some((e.tx.clone(), outs, inputs))
+    }
+
     pub fn get_outputs(&self, fk: Fk) -> Option<Vec<OutputRecord>> {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();

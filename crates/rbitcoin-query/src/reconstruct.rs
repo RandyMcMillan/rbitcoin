@@ -363,27 +363,9 @@ impl Query {
         &self,
         fk: Fk,
     ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>), QueryError> {
-        // Fast path: reconstruct-ready entry — clone from cache only.
-        if self.class_a_cache.has_reconstruct_ready(fk) {
-            let tx = self
-                .class_a_cache
-                .get_tx(fk)
-                .ok_or(StoreError::Corrupt("class_a reconstruct-ready without tx"))?;
-            let outs = if tx.output_count == 0 {
-                Vec::new()
-            } else {
-                self.class_a_cache
-                    .get_outputs(fk)
-                    .ok_or(StoreError::Corrupt("class_a reconstruct-ready without outs"))?
-            };
-            let inputs = if tx.input_count == 0 {
-                Vec::new()
-            } else {
-                self.class_a_cache
-                    .get_inputs(fk)
-                    .ok_or(StoreError::Corrupt("class_a reconstruct-ready without ins"))?
-            };
-            return Ok((tx, outs, inputs));
+        // Fast path: one Class A mutex, full body.
+        if let Some(parts) = self.class_a_cache.get_reconstruct_parts(fk) {
+            return Ok(parts);
         }
         // Cold fallback: one store load, fill class_a, return owned.
         let tx = self.get_tx_class_a(fk)?;
@@ -512,11 +494,29 @@ impl Query {
     /// [`crate::tip_prevout_cache`] — that cache is for connect prevout locality;
     /// wave-body reconstruct would only generate MISSes and thrash the tip window.
     pub fn reconstruct_tx(&self, tx_fk: Fk) -> Result<Transaction, QueryError> {
+        if let Some((rec, outs, inputs)) = self.class_a_cache.get_reconstruct_parts(tx_fk) {
+            return Ok(Self::transaction_from_class_a(rec, outs, inputs));
+        }
         let rec = self.get_tx_class_a(tx_fk)?;
         let stored_inputs = self.tx_input_run(&rec)?;
+        let stored_outputs = self.tx_output_run_class_a(&rec)?;
+        Ok(Self::transaction_from_class_a(
+            rec,
+            stored_outputs,
+            stored_inputs,
+        ))
+    }
+
+    /// Build a wire [`Transaction`] from Class A rows (moves script bytes).
+    fn transaction_from_class_a(
+        rec: TxRecord,
+        stored_outputs: Vec<OutputRecord>,
+        stored_inputs: Vec<InputRecord>,
+    ) -> Transaction {
         let mut input = Vec::with_capacity(stored_inputs.len());
         for inp in stored_inputs {
-            let prev_txid = self.resolve_prev_txid(&inp)?;
+            // External prev only on Class A (LOCAL_PREV rejected at decode).
+            let prev_txid = inp.prev_txid;
             let witness = if inp.witness.is_empty() {
                 Witness::new()
             } else {
@@ -533,7 +533,6 @@ impl Query {
                 witness,
             });
         }
-        let stored_outputs = self.tx_output_run_class_a(&rec)?;
         let mut output = Vec::with_capacity(stored_outputs.len());
         for out in stored_outputs {
             output.push(TxOut {
@@ -541,12 +540,12 @@ impl Query {
                 script_pubkey: ScriptBuf::from_bytes(out.script),
             });
         }
-        Ok(Transaction {
+        Transaction {
             version: TxVersion(rec.version),
             lock_time: LockTime::from_consensus(rec.locktime),
             input,
             output,
-        })
+        }
     }
 
     /// Consensus-encoded wire bytes for a stored tx (Electrum / RPC).
@@ -568,6 +567,16 @@ impl Query {
         let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
             return Ok(None);
         };
+        self.reconstruct_archived_block_from_parts(rec, tx_fks)
+            .map(Some)
+    }
+
+    /// Wire rebuild when header row + tx fk list are already known (confirm batch).
+    pub fn reconstruct_archived_block_from_parts(
+        &self,
+        rec: HeaderRecord,
+        tx_fks: Vec<Fk>,
+    ) -> Result<Block, QueryError> {
         if tx_fks.is_empty() {
             return Err(StoreError::Corrupt("block has no transactions"));
         }
@@ -576,7 +585,7 @@ impl Query {
         for fk in tx_fks {
             txdata.push(self.reconstruct_tx(fk)?);
         }
-        Ok(Some(Block { header, txdata }))
+        Ok(Block { header, txdata })
     }
 
     /// Reconstruct a full wire block at a confirmed height from the relational archive.

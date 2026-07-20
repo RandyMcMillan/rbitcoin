@@ -1,4 +1,4 @@
-//! Archive prep + writer pipeline for parallel IBD.
+//! Archive prep + writer pipeline for IBD.
 
 use super::coalesce::{coalesce_wait, max_batch_for_lag, min_batch_for_lag};
 use crate::chain::ChainHub;

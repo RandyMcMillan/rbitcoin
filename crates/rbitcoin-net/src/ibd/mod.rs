@@ -268,7 +268,7 @@ const FAR_BATCH_MAX: usize = 16;
 /// Cap height scan for far candidates per assign tick.
 const FAR_SCAN_BUDGET: usize = 16_384;
 
-/// Tunables for parallel IBD (defaults lean libbitcoin/Core-ish).
+/// Tunables for IBD (defaults lean libbitcoin/Core-ish).
 #[derive(Clone, Debug)]
 pub struct IbdConfig {
     /// Max concurrent unique block getdata (in-flight). Not tip-distance.
@@ -363,18 +363,18 @@ impl Drop for PeerBookSession {
 }
 
 
-pub async fn parallel_ibd(
+pub async fn ibd(
     hub: Arc<ChainHub>,
     magic: Magic,
     local_addr: SocketAddr,
     peers: &[SocketAddr],
     cfg: IbdConfig,
 ) -> Result<u32, NetError> {
-    parallel_ibd_cancellable(hub, magic, local_addr, peers, cfg, None).await
+    ibd_cancellable(hub, magic, local_addr, peers, cfg, None).await
 }
 
-/// Like [`parallel_ibd`], with an optional cancel flag polled each loop turn.
-pub async fn parallel_ibd_cancellable(
+/// Like [`ibd`], with an optional cancel flag polled each loop turn.
+pub async fn ibd_cancellable(
     hub: Arc<ChainHub>,
     magic: Magic,
     local_addr: SocketAddr,
@@ -383,7 +383,7 @@ pub async fn parallel_ibd_cancellable(
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<u32, NetError> {
     if peers.is_empty() {
-        return Err(NetError::Protocol("no peers for parallel ibd"));
+        return Err(NetError::Protocol("no peers for ibd"));
     }
     let cancelled = || {
         cancel
@@ -455,7 +455,7 @@ pub async fn parallel_ibd_cancellable(
     }
     initial_slots.retain(|s| s.alive);
     if initial_slots.is_empty() {
-        return Err(NetError::Protocol("no parallel peers connected"));
+        return Err(NetError::Protocol("no peers connected"));
     }
     let init_peer_tip = initial_slots.iter().map(|s| s.peer_height).max().unwrap_or(0);
     info!(
@@ -574,7 +574,7 @@ pub async fn parallel_ibd_cancellable(
     let mut loop_n = 0u32;
     loop {
         if cancelled() {
-            warn!("ibd: cancel requested — stopping parallel IBD");
+            warn!("ibd: cancel requested — stopping IBD");
             break;
         }
         // Yield occasionally so shutdown can run; every-tick yield_now burned
@@ -820,7 +820,7 @@ pub async fn parallel_ibd_cancellable(
                             }
                             st.max_peer_height = st.max_peer_height.max(s.peer_height);
                             info!(
-                                "ibd: parallel peer[{}] {} connected (peer_height={})",
+                                "ibd: peer[{}] {} connected (peer_height={})",
                                 s.id, s.addr, s.peer_height
                             );
                             st.slots.push(s);
@@ -1043,7 +1043,7 @@ pub async fn parallel_ibd_cancellable(
             let arch_q = archive_queued.count();
             if catchup_complete_after_drain(&st, tip_h, arch_q) {
                 info!(
-                    "ibd: catch-up complete tip={tip_h} max_peer_height={} max_archived={} headers_done={} — exiting parallel IBD",
+                    "ibd: catch-up complete tip={tip_h} max_peer_height={} max_archived={} headers_done={} — exiting IBD",
                     st.max_peer_height, st.max_archived_height, st.headers_done
                 );
                 break;
@@ -1068,7 +1068,7 @@ pub async fn parallel_ibd_cancellable(
             ) {
                 AllPeersDead::CatchupComplete => {
                     info!(
-                        "ibd: catch-up complete (no live peers) tip={tip_h} max_peer_height={} max_archived={} — exiting parallel IBD",
+                        "ibd: catch-up complete (no live peers) tip={tip_h} max_peer_height={} max_archived={} — exiting IBD",
                         st.max_peer_height, st.max_archived_height
                     );
                     break;
@@ -1082,7 +1082,7 @@ pub async fn parallel_ibd_cancellable(
                         dark_redial_empty
                     );
                     return Err(NetError::Protocol(
-                        "all parallel peers dead mid catch-up (not complete)",
+                        "all peers dead mid catch-up (not complete)",
                     ));
                 }
                 AllPeersDead::WaitRedial => {
@@ -1099,7 +1099,7 @@ pub async fn parallel_ibd_cancellable(
             biased;
             peer_ev = body_rx.recv() => {
                 if cancelled() {
-                    warn!("ibd: cancel requested — stopping parallel IBD");
+                    warn!("ibd: cancel requested — stopping IBD");
                     break;
                 }
                 let Some(ev) = peer_ev else { break };
@@ -1115,7 +1115,7 @@ pub async fn parallel_ibd_cancellable(
             }
             peer_ev = ctrl_rx.recv() => {
                 if cancelled() {
-                    warn!("ibd: cancel requested — stopping parallel IBD");
+                    warn!("ibd: cancel requested — stopping IBD");
                     break;
                 }
                 let Some(ev) = peer_ev else { break };
@@ -1131,7 +1131,7 @@ pub async fn parallel_ibd_cancellable(
             }
             arch = arch_res_rx.recv() => {
                 if cancelled() {
-                    warn!("ibd: cancel requested — stopping parallel IBD");
+                    warn!("ibd: cancel requested — stopping IBD");
                     break;
                 }
                 let Some(r) = arch else {
@@ -1144,7 +1144,7 @@ pub async fn parallel_ibd_cancellable(
             }
             _ = &mut tick => {
                 if cancelled() {
-                    warn!("ibd: cancel requested — stopping parallel IBD");
+                    warn!("ibd: cancel requested — stopping IBD");
                     break;
                 }
                 offer_confirm_ready(
@@ -1179,7 +1179,7 @@ pub async fn parallel_ibd_cancellable(
                     let tip_h = hub.tip_height().unwrap_or(0);
                     if catchup_complete_after_drain(&st, tip_h, 0) {
                         info!(
-                            "ibd: catch-up complete (stall, path empty) tip={tip_h} max_peer_height={} — exiting parallel IBD",
+                            "ibd: catch-up complete (stall, path empty) tip={tip_h} max_peer_height={} — exiting IBD",
                             st.max_peer_height
                         );
                         break;
@@ -1290,7 +1290,7 @@ pub async fn parallel_ibd_cancellable(
 
     let n = accepted.load(Ordering::SeqCst);
     info!(
-        "ibd: parallel done accepted={n} tip={:?} (started {start_tip}, cancelled={cancelled_exit}, teardown={:?})",
+        "ibd: done accepted={n} tip={:?} (started {start_tip}, cancelled={cancelled_exit}, teardown={:?})",
         hub.tip_height(),
         t_teardown.elapsed()
     );

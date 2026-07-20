@@ -109,7 +109,7 @@ pub(crate) async fn dial_batch(
         match h.await {
             Ok(Ok(slot)) => out.slots.push(slot),
             Ok(Err((id, addr, kind, reason))) => {
-                warn!("ibd: parallel peer[{id}] {addr} failed: {reason}");
+                warn!("ibd: peer[{id}] {addr} failed: {reason}");
                 out.failed.push((addr, kind));
             }
             Err(e) => {

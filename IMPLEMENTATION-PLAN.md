@@ -44,7 +44,7 @@ Living snapshot. Older Phase-3 gap tables are historical; see phase checklists b
 | `rbitcoin-store` | mmap Class A/B/C tables, epoch finalize |
 | `rbitcoin-query` | Domain API: archive mega-batch, confirm, reconstruct, Electrum joins |
 | `rbitcoin-consensus` | Structure/header/connect; milestone = **scripts only** |
-| `rbitcoin-net` | P2P handshake, parallel IBD, split-stream peer serve/tip, seeds/addrman |
+| `rbitcoin-net` | P2P handshake, IBD, split-stream peer serve/tip, seeds/addrman |
 | `rbitcoin-node` | Long-running node: IBD → tip follow, Electrum optional, cooperative SIGINT |
 | `rbitcoin-electrum` | In-process Electrum TCP server |
 | `rbitcoin-wire-cache` | Tip wire ring (soft zone) |
@@ -52,7 +52,7 @@ Living snapshot. Older Phase-3 gap tables are historical; see phase checklists b
 
 ### 0.2 What works
 
-- Parallel IBD with windowed getdata, per-peer 16, archive lead vs tip confirm
+- IBD with windowed getdata, per-peer 16, archive lead vs tip confirm
 - Store-backed reconstruct for getdata / Electrum after restart
 - DNS/fixed seeds, multi-peer dial/redial, stall disconnect + cooldown
 - Milestone assumevalid-style: **prevouts always**, scripts skipped ≤ height
@@ -278,7 +278,7 @@ Handshake, getheaders/getdata, BlockCache, 2-/3-node tests + periodic mesh scrip
 | 2 | **Store-backed P2P serve** — getheaders/getdata from store; restart seeder proof | ✅ |
 | 3 | **Service flags** — `NETWORK\|WITNESS` | ✅ |
 | 4a | **Discovery** — DNS/fixed seed lists + `AddrMan`; multi-peer try list | ✅ foundation |
-| 4b | Concurrent download window, stall/score | ✅ `parallel_ibd` (window 1024, 16/peer, stall reassign) |
+| 4b | Concurrent download window, stall/score | ✅ `ibd` (window 1024, 16/peer, stall reassign) |
 | 5a | **Consensus** — MTP, nBits/retarget, maturity, subsidy, witness commitment, checkpoints; reject-path coverage in `docs/consensus-tests.md` | ✅ |
 | 6 | **Long-running node** — `run_p2p`, `--listen`/`--connect`/`--smoke` | ✅ |
 | 7 | Public signet IBD lab run | ⬜ ops — see OPERATOR.md (readiness ladder) |

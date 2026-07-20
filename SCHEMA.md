@@ -42,7 +42,7 @@ Confirmed height → txs: `confirmed[h]` → header_fk → `(first_tx_fk, count)
 
 ## Who writes what
 
-See [`docs/concurrency.md`](./docs/concurrency.md): during parallel IBD, one dedicated OS thread owns Class A writes; confirm owns Class C on another OS thread; peer IO does not write the store.
+See [`docs/concurrency.md`](./docs/concurrency.md): during IBD, one dedicated OS thread owns Class A writes; confirm owns Class C on another OS thread; peer IO does not write the store.
 
 ## Common file header (16 bytes)
 

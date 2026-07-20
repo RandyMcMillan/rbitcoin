@@ -274,8 +274,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         // Prefer a wide ranked sample (flag-aware, IPv4-first).
         addrman.take_outbound(candidate_n)
     };
-    // True only after parallel IBD reports true catch-up (or no peers to dial).
-    // Never set from a partial sequential download (mid-chain tip-mode bug class).
+    // True only after IBD reports true catch-up (or no peers to dial).
+    // Mid-chain peer death must not enter tip mode (materialize durable indexes).
     let mut catch_up_complete = ibd_targets.is_empty();
     if !ibd_targets.is_empty() && !shutdown.requested() {
         let target_peers = max_out.clamp(8, 32);
@@ -291,7 +291,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             ..IbdConfig::default()
         };
         info!(
-            "ibd: parallel catch-up candidates={} target_peers={} (window={}, per_peer={})…",
+            "ibd: catch-up candidates={} target_peers={} (window={}, per_peer={})…",
             ibd_targets.len(),
             ibd_cfg.target_peers,
             ibd_cfg.window,
@@ -303,29 +303,29 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         // (`Cannot drop a runtime in an async context`), making Ctrl+C slow/noisy.
         let cancel = Some(Arc::clone(&shutdown.flag));
         match node
-            .parallel_sync_cancellable(&ibd_targets, ibd_cfg, cancel)
+            .sync_cancellable(&ibd_targets, ibd_cfg, cancel)
             .await
         {
             Ok(n) => {
                 if shutdown.requested() {
                     warn!(
-                        "ibd: parallel catch-up interrupted accepted≈{n} tip={:?}",
+                        "ibd: catch-up interrupted accepted≈{n} tip={:?}",
                         node.tip_height()
                     );
                 } else {
-                    // parallel_ibd only Ok-exits on true catch-up (or cancel). Mid-chain
+                    // IBD only Ok-exits on true catch-up (or cancel). Mid-chain
                     // peer death returns Err so we never materialize tip indexes early.
                     // Defense: never claim complete at genesis tip with zero accepts
                     // (stall-exit regression used to enter tip mode at height 0).
                     let tip = node.tip_height().unwrap_or(0);
                     if tip == 0 && n == 0 {
                         warn!(
-                            "ibd: parallel returned ok with tip=0 accepted=0 — treating as incomplete (no tip mode)"
+                            "ibd: returned ok with tip=0 accepted=0 — treating as incomplete (no tip mode)"
                         );
                         catch_up_complete = false;
                     } else {
                         info!(
-                            "ibd: parallel catch-up accepted≈{n} tip={:?}",
+                            "ibd: catch-up accepted≈{n} tip={:?}",
                             node.tip_height()
                         );
                         catch_up_complete = true;
@@ -334,13 +334,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             }
             Err(e) => {
                 if shutdown.requested() {
-                    warn!("signal: parallel IBD cancelled ({e})");
+                    warn!("signal: IBD cancelled ({e})");
                 } else {
-                    // No sequential fallback: a partial `sync_from_peers` success used
-                    // to set catch_up_complete and enter tip mode mid-chain. Parallel
-                    // IBD is the only path that may claim complete; restart resumes.
+                    // No alternate sync path: restart resumes catch-up indexes.
                     warn!(
-                        "ibd: parallel incomplete: {e}; tip={:?} — keeping catch-up indexes (no tip mode; restart to resume)",
+                        "ibd: incomplete: {e}; tip={:?} — keeping catch-up indexes (no tip mode; restart to resume)",
                         node.tip_height()
                     );
                 }
@@ -391,7 +389,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 
     // Persistent follow: stay connected for tip relay after catch-up.
     // Bound each connect so a single dead seed cannot stall post-IBD for minutes
-    // (OS TCP timeouts are often 2+ min; parallel IBD already uses 8s).
+    // (OS TCP timeouts are often 2+ min; IBD dial already uses 8s).
     let mut follow_peers = 0usize;
     if !shutdown.requested() {
         let follow_n = targets.len().min(max_out.min(3));
@@ -627,18 +625,24 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         }
                     }
                 } else {
-                    // Catch-up never finished cleanly — try sequential blocks, but
-                    // never enter tip mode from a partial download (mainnet bug:
-                    // mid-chain peer death must not materialize durable indexes).
+                    // Catch-up never finished cleanly — re-run IBD against this peer
+                    // (never enter tip mode from a partial download).
                     info!("ibd: retry catch-up from {peer} (tip stagnant, catch-up incomplete)");
+                    let retry_cfg = IbdConfig {
+                        target_peers: 1,
+                        peers: Some(std::sync::Arc::clone(&shared_peers)),
+                        ..IbdConfig::for_test()
+                    };
+                    let cancel = Some(Arc::clone(&shutdown.flag));
+                    let retry_peers = [peer];
                     tokio::select! {
                         biased;
                         _ = shutdown.cancelled() => break,
-                        result = node.sync_from(peer) => {
+                        result = node.sync_cancellable(&retry_peers, retry_cfg, cancel) => {
                             match result {
                                 Ok(n) if n > 0 => {
                                     info!(
-                                        "ibd: retry got {n} tip={:?} — still catch-up (no tip mode until full parallel catch-up)",
+                                        "ibd: retry got {n} tip={:?} — still catch-up (no tip mode until full catch-up)",
                                         node.tip_height()
                                     );
                                 }

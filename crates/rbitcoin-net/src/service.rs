@@ -4,8 +4,7 @@ use crate::cache::BlockCache;
 use crate::chain::{AcceptOutcome, ChainHub};
 use crate::error::NetError;
 use crate::ibd::IbdConfig;
-use crate::peer::{connect_and_handshake, peer_session, sync_from_peer};
-use bitcoin::hashes::Hash;
+use crate::peer::{connect_and_handshake, peer_session};
 use bitcoin::p2p::Magic;
 use bitcoin::Block;
 use bitcoin::BlockHash;
@@ -18,7 +17,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
-use rbitcoin_log::info;
 
 #[derive(Clone, Debug)]
 pub struct NetConfig {
@@ -107,9 +105,8 @@ impl P2PNode {
                                     return;
                                 }
                             };
-                            // Inbound: do not catch_up (avoids getheaders deadlock with dialer).
-                            if let Err(e) =
-                                peer_session(reader, writer, magic_c, hub, tip_rx, false).await
+                            // Inbound: serve + tip announce only (no catch-up on this path).
+                            if let Err(e) = peer_session(reader, writer, magic_c, hub, tip_rx).await
                             {
                                 eprintln!("ibd: inbound session {peer_addr} ended: {e}");
                             }
@@ -153,51 +150,25 @@ impl P2PNode {
         }
     }
 
-    /// Sequential try-list (tests / tip-follow helpers).
+    /// IBD / catch-up: multi-peer download window across `peers` (libbitcoin-class).
     ///
-    /// **Not** used as IBD fallback: partial progress must not be treated as
-    /// catch-up complete. Production IBD uses [`Self::parallel_sync_cancellable`].
-    pub async fn sync_from_peers(&self, peers: &[SocketAddr]) -> Result<u32, NetError> {
-        if peers.is_empty() {
-            return Err(NetError::Protocol("no peers to sync from"));
-        }
-        let mut last_err = NetError::Protocol("all peers failed");
-        let mut total = 0u32;
-        for peer in peers {
-            match self.sync_from(*peer).await {
-                Ok(n) => {
-                    total = total.saturating_add(n);
-                    if n > 0 {
-                        return Ok(total);
-                    }
-                }
-                Err(e) => last_err = e,
-            }
-        }
-        if total > 0 {
-            Ok(total)
-        } else {
-            Err(last_err)
-        }
-    }
-
-    /// Concurrent multi-peer IBD: shared download window across peers (libbitcoin-class).
-    pub async fn parallel_sync(
+    /// This is the only history-sync path. Tip-follow is [`Self::follow_from`].
+    pub async fn sync(
         &self,
         peers: &[SocketAddr],
         cfg: IbdConfig,
     ) -> Result<u32, NetError> {
-        self.parallel_sync_cancellable(peers, cfg, None).await
+        self.sync_cancellable(peers, cfg, None).await
     }
 
-    /// Parallel IBD with optional cooperative cancel flag (SIGTERM path).
-    pub async fn parallel_sync_cancellable(
+    /// IBD with optional cooperative cancel flag (SIGINT / SIGTERM path).
+    pub async fn sync_cancellable(
         &self,
         peers: &[SocketAddr],
         cfg: IbdConfig,
         cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<u32, NetError> {
-        crate::ibd::parallel_ibd_cancellable(
+        crate::ibd::ibd_cancellable(
             self.hub.clone(),
             self.magic,
             self.local_addr,
@@ -208,120 +179,14 @@ impl P2PNode {
         .await
     }
 
-    /// Parallel sync with default window (1024 concurrent getdata, 16/peer).
-    pub async fn parallel_sync_default(&self, peers: &[SocketAddr]) -> Result<u32, NetError> {
-        self.parallel_sync(peers, IbdConfig::default()).await
+    /// IBD with default window (1024 concurrent getdata, 16/peer).
+    pub async fn sync_default(&self, peers: &[SocketAddr]) -> Result<u32, NetError> {
+        self.sync(peers, IbdConfig::default()).await
     }
 
-    /// Connect outbound, catch up via getheaders, then return (connection closed).
-    pub async fn sync_from(&self, peer: SocketAddr) -> Result<u32, NetError> {
-        let stream = TcpStream::connect(peer).await?;
-        let height = self.tip_height().map(|h| h as i32).unwrap_or(0);
-        let (_ver, mut reader, mut writer) = connect_and_handshake(
-            stream,
-            self.magic,
-            self.local_addr,
-            peer,
-            height,
-            false,
-        )
-        .await?;
-
-        let hub = self.hub.clone();
-        let locator = hub
-            .query
-            .locator_hashes()
-            .map_err(|e| NetError::Consensus(e.to_string()))?;
-        let locator = if locator.len() == 1
-            && locator[0].to_byte_array() == [0u8; 32]
-            && !hub.cache.is_empty()
-        {
-            hub.cache.locator()
-        } else {
-            locator
-        };
-
-        let hub_has = hub.clone();
-        let hub_acc = hub.clone();
-        let start_h = hub.tip_height().unwrap_or(0);
-        // Shared buffer for out-of-order getdata responses (two closures).
-        let pending: Arc<std::sync::Mutex<std::collections::HashMap<BlockHash, Block>>> =
-            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        let pending_has = pending.clone();
-        let pending_acc = pending.clone();
-        let accepted = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let accepted_c = accepted.clone();
-        let n = sync_from_peer(
-            &mut reader,
-            &mut writer,
-            self.magic,
-            locator,
-            move |hash| {
-                hub_has.has_block(hash)
-                    || pending_has.lock().unwrap().contains_key(hash)
-            },
-            move |_, block| {
-                {
-                    pending_acc.lock().unwrap().insert(block.block_hash(), block);
-                }
-                // Drain all blocks that currently connect to tip.
-                let mut progress = true;
-                while progress {
-                    progress = false;
-                    let tip = hub_acc.tip_hash();
-                    let keys: Vec<BlockHash> = pending_acc
-                        .lock().unwrap()
-                        .keys()
-                        .copied()
-                        .collect();
-                    for h in keys {
-                        let connects = {
-                            let g = pending_acc.lock().unwrap();
-                            let Some(b) = g.get(&h) else {
-                                continue;
-                            };
-                            let prev = b.header.prev_blockhash;
-                            match tip {
-                                None => prev.to_byte_array() == [0u8; 32],
-                                Some(t) => prev == t,
-                            }
-                        };
-                        if !connects {
-                            continue;
-                        }
-                        let b = pending_acc.lock().unwrap().remove(&h).unwrap();
-                        match hub_acc.accept_block(b) {
-                            Ok(crate::chain::AcceptOutcome::Accepted { .. })
-                            | Ok(crate::chain::AcceptOutcome::AlreadyHave) => {
-                                let n = accepted_c.fetch_add(1, Ordering::SeqCst) + 1;
-                                progress = true;
-                                if n == 1 || n % 100 == 0 {
-                                    info!(
-                                        "ibd: progress tip={:?} (+{n} this peer, started at {start_h})",
-                                        hub_acc.tip_height(),
-                                    );
-                                    let _ = std::io::Write::flush(&mut std::io::stderr());
-                                }
-                            }
-                            Ok(crate::chain::AcceptOutcome::IgnoredWeaker) => {}
-                            Err(e) => return Err(e),
-                        }
-                    }
-                }
-                Ok(())
-            },
-        )
-        .await?;
-        if n > 0 {
-            info!(
-                "ibd: peer {peer} done downloaded≈{n} tip={:?}",
-                self.tip_height()
-            );
-        }
-        Ok(n)
-    }
-
-    /// Persistent outbound peer: catch up, then tip-follow + announce for the session lifetime.
+    /// Persistent outbound peer: tip-follow + announce for the session lifetime.
+    ///
+    /// Does **not** download history — call [`Self::sync`] first when behind.
     pub async fn follow_from(&mut self, peer: SocketAddr) -> Result<(), NetError> {
         let stream = TcpStream::connect(peer).await?;
         let height = self.tip_height().map(|h| h as i32).unwrap_or(0);
@@ -338,7 +203,7 @@ impl P2PNode {
         let tip_rx = hub.subscribe_tips();
         let magic = self.magic;
         let task = tokio::spawn(async move {
-            let _ = peer_session(reader, writer, magic, hub, tip_rx, true).await;
+            let _ = peer_session(reader, writer, magic, hub, tip_rx).await;
         });
         self.tasks.push(task);
         Ok(())

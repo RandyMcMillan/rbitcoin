@@ -15,7 +15,7 @@ See [`IMPLEMENTATION-PLAN.md`](./IMPLEMENTATION-PLAN.md) for the roadmap and cur
 
 ## Status
 
-**Phases 0–7 core complete** (store, consensus, P2P parallel IBD, tip follow, durability, scripthash, Electrum TCP).
+**Phases 0–7 core complete** (store, consensus, P2P IBD, tip follow, durability, scripthash, Electrum TCP).
 
 **Public-chain IBD:** experimental — not production-ready for full mainnet. Follow the ladder in [`OPERATOR.md`](./OPERATOR.md): **signet lab first**, then mainnet experimental.
 
@@ -46,7 +46,7 @@ cargo test --workspace
 | `rbitcoin-query` | Domain API (archive, confirm, reconstruct, Electrum joins) |
 | `rbitcoin-wire-cache` | Tip wire-format block ring |
 | `rbitcoin-consensus` | Validation / confirm; milestone = scripts only |
-| `rbitcoin-net` | P2P + parallel IBD (modular `ibd/`), blocks-only |
+| `rbitcoin-net` | P2P + IBD (modular `ibd/`), blocks-only |
 | `rbitcoin-electrum` | Electrum TCP server |
 | `rbitcoin-rpc` | Minimal node JSON-RPC (stub) |
 | `rbitcoin-cli` | CLI client |

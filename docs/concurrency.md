@@ -2,7 +2,7 @@
 
 Short map of who may write which tables. **Format is unstable until 1.0.**
 
-## Roles during parallel IBD
+## Roles during IBD
 
 | Role | Threading | Store writes |
 |------|-----------|--------------|

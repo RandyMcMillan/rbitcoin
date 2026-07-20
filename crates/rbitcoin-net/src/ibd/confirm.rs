@@ -1,4 +1,4 @@
-//! Dedicated confirm engine (Class C tip walk) for parallel IBD.
+//! Dedicated confirm engine (Class C tip walk) for IBD.
 
 use super::body::BodyPresence;
 use super::LoopStats;

@@ -3,7 +3,7 @@
 //! Solution is embedded in the coinbase witness-commitment push after magic `ecc7daa2`.
 //!
 //! **When:** tip confirm / connect only — not Class A archive structure (ECDSA is too
-//! expensive for the parallel IBD prep path).
+//! expensive for the IBD prep path).
 
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::Encodable;

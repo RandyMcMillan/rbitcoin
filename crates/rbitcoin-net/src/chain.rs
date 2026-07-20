@@ -181,7 +181,7 @@ impl ChainHub {
             .map_err(|e| NetError::Consensus(e.to_string()))
     }
 
-    /// Archive Class A body without requiring tip order (parallel IBD path).
+    /// Archive Class A body without requiring tip order (IBD path).
     pub fn archive_block(&self, height: u32, block: Block) -> Result<(), NetError> {
         let hash = block.block_hash();
         if self.is_archived(&hash) {

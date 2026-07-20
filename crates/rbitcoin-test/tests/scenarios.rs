@@ -480,7 +480,7 @@ fn resume_work_path_sees_archived_bodies_after_reopen() {
         let mut tip_time = genesis.header.time;
         let mut prev_fk = g_fk;
         let mut out = Vec::new();
-        // Confirm stays at 0; archive heights 1..4 ahead (parallel IBD shape).
+        // Confirm stays at 0; archive heights 1..4 ahead (IBD shape).
         for h in 1u32..=4 {
             let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
             let fk = q
@@ -514,7 +514,7 @@ fn resume_work_path_sees_archived_bodies_after_reopen() {
     }
 }
 
-/// Single scenario covering the signet @2148 failure class and parallel IBD:
+/// Single scenario covering the signet @2148 failure class and IBD:
 /// - archive bodies out of height order (ahead of tip)
 /// - re-archive / mega-batch duplicate is idempotent (fk + tx_height stable)
 /// - `tx.head` off: prevouts via light UTXO create_fk (external prev on Class A)
@@ -545,7 +545,7 @@ fn ibd_parallel_archive_idempotent_confirm_without_tx_head() {
         .unwrap()
         .0;
 
-    // Mine a short pad, then archive **out of order** (2 before 1) like parallel IBD.
+    // Mine a short pad, then archive **out of order** (2 before 1) like IBD.
     let mut tip = genesis.block_hash();
     let mut tip_time = genesis.header.time;
     let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
@@ -675,7 +675,7 @@ fn confirm_with_spend_index_ignores_archive_only_point_edges() {
     let mut pad_blocks = Vec::new();
     for h in 2..=last_pad {
         let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        // Archive ahead of confirm (parallel IBD shape).
+        // Archive ahead of confirm (IBD shape).
         accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
         tip = b.block_hash();
         tip_time = b.header.time;

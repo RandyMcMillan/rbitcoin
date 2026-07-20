@@ -11,7 +11,7 @@ use crate::v2::{
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::address::Address;
 use bitcoin::p2p::message::NetworkMessage;
-use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
+use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_compact_blocks::SendCmpct;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Magic, ServiceFlags, PROTOCOL_VERSION};
@@ -135,18 +135,17 @@ fn rand_nonce() -> u64 {
 
 /// Bidirectional peer session: serve history, follow tip, announce our tip.
 ///
-/// `catch_up`: if true (outbound), run getheaders/getdata first. Inbound peers must
-/// pass false to avoid deadlock (both sides waiting on each other's getheaders).
+/// History catch-up is **not** done here — use [`crate::ibd`] / [`crate::service::P2PNode::sync`].
+/// This session only handles steady-state inv/headers/getdata serve + tip announce.
 ///
-/// After the sequential handshake / optional catch-up, a dedicated writer drains
-/// outbound messages while the reader keeps draining the encrypted channel.
+/// A dedicated writer drains outbound messages while the reader keeps draining
+/// the encrypted channel.
 pub async fn peer_session(
     mut reader: V2Reader,
     mut writer: V2Writer,
     magic: Magic,
     hub: Arc<ChainHub>,
     mut tip_rx: broadcast::Receiver<crate::chain::TipEvent>,
-    catch_up: bool,
 ) -> Result<(), NetError> {
     // Prefer headers announcements from peer; we do not send compact by default
     // (no mempool short-ids). Advertise we understand cmpct v1/v2 but request full blocks.
@@ -161,10 +160,6 @@ pub async fn peer_session(
     .await;
     // Prefer wtxid inventory for txs when peers support it (BIP339).
     let _ = write_v2_msg(&mut writer, NetworkMessage::WtxidRelay).await;
-
-    if catch_up {
-        initial_sync(&mut reader, &mut writer, magic, hub.as_ref()).await?;
-    }
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<NetworkMessage>();
 
@@ -534,36 +529,6 @@ fn try_reorg_from_pending(
     Ok(())
 }
 
-async fn initial_sync(
-    reader: &mut V2Reader,
-    writer: &mut V2Writer,
-    magic: Magic,
-    hub: &ChainHub,
-) -> Result<(), NetError> {
-    let locator = hub
-        .query
-        .locator_hashes()
-        .map_err(|e| NetError::Consensus(e.to_string()))?;
-    let locator = if locator.len() == 1
-        && locator[0].to_byte_array() == [0u8; 32]
-        && !hub.cache.is_empty()
-    {
-        hub.cache.locator()
-    } else {
-        locator
-    };
-    sync_from_peer(
-        reader,
-        writer,
-        magic,
-        locator,
-        |hash| hub.has_block(hash),
-        |_, block| hub.accept_block(block).map(|_| ()),
-    )
-    .await?;
-    Ok(())
-}
-
 fn headers_for_peer(
     cache: &BlockCache,
     query: &Query,
@@ -590,98 +555,4 @@ fn block_for_peer(
     }
 }
 
-/// Outbound sync: getheaders until caught up, then getdata for missing blocks in order.
-pub async fn sync_from_peer(
-    reader: &mut V2Reader,
-    writer: &mut V2Writer,
-    magic: Magic,
-    local_locator: Vec<BlockHash>,
-    mut local_has: impl FnMut(&BlockHash) -> bool,
-    mut on_block: impl FnMut(u32, bitcoin::Block) -> Result<(), NetError>,
-) -> Result<u32, NetError> {
-    let mut downloaded = 0u32;
-    let mut locator = local_locator;
-    loop {
-        let gh = GetHeadersMessage::new(locator.clone(), BlockHash::from_byte_array([0u8; 32]));
-        write_v2_msg(writer, NetworkMessage::GetHeaders(gh)).await?;
 
-        let headers = loop {
-            let frame = read_v2_frame(reader, magic).await?;
-            if frame.is_ping() {
-                if let Some(n) = frame.ping_nonce() {
-                    write_v2_msg(writer, NetworkMessage::Pong(n)).await?;
-                }
-                continue;
-            }
-            let msg = decode_framed_offload(frame).await?;
-            match msg.payload() {
-                NetworkMessage::Headers(h) => break h.clone(),
-                NetworkMessage::Ping(n) => {
-                    write_v2_msg(writer, NetworkMessage::Pong(*n)).await?;
-                }
-                NetworkMessage::SendHeaders
-                | NetworkMessage::SendCmpct(_)
-                | NetworkMessage::Verack => {}
-                _ => {}
-            }
-        };
-
-        if headers.is_empty() {
-            break;
-        }
-
-        let mut inv = Vec::new();
-        for hdr in &headers {
-            let hash = hdr.block_hash();
-            if !local_has(&hash) {
-                inv.push(Inventory::WitnessBlock(hash));
-            }
-        }
-        if inv.is_empty() {
-            if headers.len() < MAX_HEADERS_RESULTS {
-                break;
-            }
-            locator = vec![headers.last().unwrap().block_hash()];
-            continue;
-        }
-
-        // Honour Core MAX_INV_SZ when requesting (chunk if needed).
-        for chunk in inv.chunks(MAX_INV_SIZE) {
-            write_v2_msg(writer, NetworkMessage::GetData(chunk.to_vec())).await?;
-
-            let need = chunk.len();
-            let mut got = 0;
-            while got < need {
-                let frame = read_v2_frame(reader, magic).await?;
-                if frame.is_ping() {
-                    if let Some(n) = frame.ping_nonce() {
-                        write_v2_msg(writer, NetworkMessage::Pong(n)).await?;
-                    }
-                    continue;
-                }
-                let msg = decode_framed_offload(frame).await?;
-                match msg.payload() {
-                    NetworkMessage::Block(block) => {
-                        on_block(0, block.clone())?;
-                        got += 1;
-                        downloaded += 1;
-                    }
-                    NetworkMessage::Ping(n) => {
-                        write_v2_msg(writer, NetworkMessage::Pong(*n)).await?;
-                    }
-                    NetworkMessage::NotFound(_) => {
-                        return Err(NetError::Protocol("block not found"));
-                    }
-                    NetworkMessage::SendHeaders | NetworkMessage::SendCmpct(_) => {}
-                    _ => {}
-                }
-            }
-        }
-
-        locator = vec![headers.last().unwrap().block_hash()];
-        if headers.len() < MAX_HEADERS_RESULTS {
-            break;
-        }
-    }
-    Ok(downloaded)
-}

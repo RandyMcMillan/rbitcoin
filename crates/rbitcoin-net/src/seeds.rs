@@ -266,7 +266,7 @@ impl AddrMan {
 
     fn sort_order_ipv4_first(&mut self) {
         // Prefer IPv4: many lab hosts have no IPv6 route, and IPv6 seeds only
-        // burn connect-timeout slots during parallel IBD dial.
+        // burn connect-timeout slots during IBD dial.
         self.order.sort_by_key(|a| a.is_ipv6());
     }
 

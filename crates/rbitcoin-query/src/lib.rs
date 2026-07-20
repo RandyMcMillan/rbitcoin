@@ -986,7 +986,7 @@ impl Query {
 
     /// Rebuild the post-tip work path from durable headers + Class A bodies.
     ///
-    /// Parallel IBD only remembered the ordered path in RAM. On restart it re-ran
+    /// IBD only remembered the ordered path in RAM. On restart it re-ran
     /// getheaders/getdata even though Class A was already on disk. This walks
     /// `header.body` once, builds a prev→children map, and follows the best
     /// (prefer-archived) child chain from the confirmed tip.

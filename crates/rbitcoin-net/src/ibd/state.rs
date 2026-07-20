@@ -73,7 +73,7 @@ impl InflightReq {
     }
 }
 
-/// Core mutable state for the parallel IBD event loop.
+/// Core mutable state for the IBD event loop.
 pub(crate) struct IbdWorkState {
     pub slots: Vec<PeerSlot>,
     /// Unique hashes with outstanding getdata (1 peer normally; tip-hole races ≤3).

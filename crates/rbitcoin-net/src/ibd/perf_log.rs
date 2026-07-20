@@ -1,6 +1,6 @@
 //! Consolidated IBD performance sampling and logging.
 //!
-//! **Cadence:** one sample every ~5s status tick (see `parallel_ibd`).
+//! **Cadence:** one sample every ~5s status tick (see `ibd`).
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|

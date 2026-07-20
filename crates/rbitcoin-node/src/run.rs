@@ -315,11 +315,21 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 } else {
                     // parallel_ibd only Ok-exits on true catch-up (or cancel). Mid-chain
                     // peer death returns Err so we never materialize tip indexes early.
-                    info!(
-                        "ibd: parallel catch-up accepted≈{n} tip={:?}",
-                        node.tip_height()
-                    );
-                    catch_up_complete = true;
+                    // Defense: never claim complete at genesis tip with zero accepts
+                    // (stall-exit regression used to enter tip mode at height 0).
+                    let tip = node.tip_height().unwrap_or(0);
+                    if tip == 0 && n == 0 {
+                        warn!(
+                            "ibd: parallel returned ok with tip=0 accepted=0 — treating as incomplete (no tip mode)"
+                        );
+                        catch_up_complete = false;
+                    } else {
+                        info!(
+                            "ibd: parallel catch-up accepted≈{n} tip={:?}",
+                            node.tip_height()
+                        );
+                        catch_up_complete = true;
+                    }
                 }
             }
             Err(e) => {

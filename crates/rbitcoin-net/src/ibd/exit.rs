@@ -119,4 +119,18 @@ mod tests {
         st.max_peer_height = 2001;
         assert!(catchup_complete_after_drain(&st, 2000, 0));
     }
+
+    /// Regression (mainnet log): tip=0, empty path, peers at ~958k must **not**
+    /// look "complete" after a progress stall — that entered false tip mode.
+    #[test]
+    fn tip_zero_with_peer_horizon_is_not_complete() {
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(0));
+        st.max_peer_height = 958_900;
+        st.max_archived_height = 0;
+        st.headers_done = false;
+        assert!(!catchup_complete_after_drain(&st, 0, 0));
+        assert!(!peer_caught_up(&st, 0));
+        let a = all_peers_dead_action(&st, 0, 0, false, 0);
+        assert_eq!(a, AllPeersDead::GiveUpMidCatchup);
+    }
 }

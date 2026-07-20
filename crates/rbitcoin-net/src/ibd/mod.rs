@@ -421,12 +421,19 @@ pub async fn parallel_ibd_cancellable(
     let mut peer_sess = PeerBookSession::new(cfg.peers.clone(), peers);
     let next_peer_id = Arc::new(AtomicUsize::new(0));
 
-    // Initial concurrent dial (all candidates once) — OK to await before loop starts.
-    // Abort early if cancel already set mid-dial.
+    // Initial concurrent dial — cap to ~2× live target (never the whole book).
+    // With DNS/peers persistence the book can be 300+ addresses; dialing them all
+    // at once saturates FDs and yields 100+ "ready" slots that immediately die.
+    let initial_dial_n = cfg
+        .target_peers
+        .saturating_mul(2)
+        .max(peers.len())
+        .min(peer_sess.book().len())
+        .max(1);
     let initial = dial_batch(
         peer_sess.book(),
         &next_peer_id,
-        peer_sess.book().len(),
+        initial_dial_n,
         HashSet::new(),
         magic,
         local_addr,
@@ -826,6 +833,17 @@ pub async fn parallel_ibd_cancellable(
                                 st.slots.iter().filter(|s| s.alive).count()
                             );
                             dark_redial_empty = 0;
+                            // Fresh peers need getheaders when the work path is empty
+                            // (tip=0 / mid-chain peer death wiped slots before responses).
+                            if st.ordered.is_empty() && !st.headers_done {
+                                let tips = work_path_tips(&st);
+                                let _ = request_headers(
+                                    &st.slots,
+                                    &hub,
+                                    &mut st.header_req_seq,
+                                    &tips,
+                                );
+                            }
                         } else {
                             dark_redial_empty = dark_redial_empty.saturating_add(1);
                             warn!(
@@ -1150,12 +1168,33 @@ pub async fn parallel_ibd_cancellable(
                         }
                     }
                 }
+                // Stall with an empty work path: only Ok-exit when truly caught up.
+                // Previously this bare `break` treated "no progress for 30s at tip=0
+                // while peers die" as success → node entered tip mode at height 0.
                 if last_progress.elapsed() > cfg.stall
                     && st.ordered.is_empty()
                     && st.inflight.is_empty()
                     && archive_queued.count() == 0
                 {
-                    break;
+                    let tip_h = hub.tip_height().unwrap_or(0);
+                    if catchup_complete_after_drain(&st, tip_h, 0) {
+                        info!(
+                            "ibd: catch-up complete (stall, path empty) tip={tip_h} max_peer_height={} — exiting parallel IBD",
+                            st.max_peer_height
+                        );
+                        break;
+                    }
+                    // Mid catch-up: re-kick headers; never silent Ok-exit.
+                    warn!(
+                        "ibd: stall with empty path tip={tip_h} max_peer_height={} lag={} peers={} — re-request headers (not complete)",
+                        st.max_peer_height,
+                        header_lag_behind_peers(&st, tip_h),
+                        st.slots.iter().filter(|s| s.alive).count()
+                    );
+                    st.headers_done = false;
+                    let tips = work_path_tips(&st);
+                    let _ = request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
+                    last_progress = Instant::now();
                 }
             }
         }

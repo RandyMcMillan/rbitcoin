@@ -1,7 +1,8 @@
 use crate::config::NodeConfig;
+use crate::inhibit::SuspendInhibit;
 use crate::run::{run_node, run_p2p};
 use rbitcoin_consensus::default_milestone_height;
-use rbitcoin_log::{self, error, info, Level};
+use rbitcoin_log::{self, error, info, warn, Level};
 use rbitcoin_primitives::Network;
 use std::ffi::OsString;
 use std::net::SocketAddr;
@@ -31,6 +32,7 @@ where
     let mut max_outbound = 16u32;
     let mut max_run_secs: Option<u64> = None;
     let mut mempool_size_mb: Option<u64> = None;
+    let mut inhibit_suspend = false;
     // None = env/default; Some(None) = off; Some(Some(level)) = explicit level.
     let mut log_level_cli: Option<Option<Level>> = None;
 
@@ -39,7 +41,7 @@ where
         match a.as_ref() {
             "--help" | "-h" => {
                 eprintln!(
-                    "rbitcoin-node {} — usage:\n  rbitcoin-node [--datadir PATH] [--network NET] \\\n    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n    [--electrum-tls-listen ADDR --electrum-tls-cert PEM --electrum-tls-key PEM] \\\n    [--milestone HEIGHT] [--max-outbound N] [--mempool-size-mb N] \\\n    [--max-run-secs N] [--log-level LEVEL] [--no-seeds] [--smoke]\n\nNetworks: mainnet|testnet|signet|regtest\nLog level: error|warn|info|debug|trace (default info; or RBITCOIN_LOG / RUST_LOG).\nMilestone: skip script/sig checks at/below HEIGHT (assumevalid-style).\n  Default when omitted: mainnet 840000, signet 2000000, testnet 2500000, regtest 0.\n  Use --milestone 0 for full script validation.\nMempool: --mempool-size-mb sets weight budget (default ~300; eviction by worst chunk).\n  Libre-relay-class: 0.1 sat/vB min, no dust ban, full RBF. See OPERATOR.md.\nElectrum: TCP and/or TLS; banner states libre-relay-class. Memory envs:\n  RBITCOIN_ARCHIVE_QUEUE_MB, RBITCOIN_CLASS_A_CACHE_MB (default 256 each).\nParallel IBD: up to 1024 concurrent block downloads, max 16 in transit per peer.",
+                    "rbitcoin-node {} — usage:\n  rbitcoin-node [--datadir PATH] [--network NET] \\\n    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n    [--electrum-tls-listen ADDR --electrum-tls-cert PEM --electrum-tls-key PEM] \\\n    [--milestone HEIGHT] [--max-outbound N] [--mempool-size-mb N] \\\n    [--max-run-secs N] [--log-level LEVEL] [--no-seeds] [--smoke] \\\n    [--inhibit-suspend]\n\nNetworks: mainnet|testnet|signet|regtest\nLog level: error|warn|info|debug|trace (default info; or RBITCOIN_LOG / RUST_LOG).\nMilestone: skip script/sig checks at/below HEIGHT (assumevalid-style).\n  Default when omitted: mainnet 840000, signet 2000000, testnet 2500000, regtest 0.\n  Use --milestone 0 for full script validation.\nMempool: --mempool-size-mb sets weight budget (default ~300; eviction by worst chunk).\n  Libre-relay-class: 0.1 sat/vB min, no dust ban, full RBF. See OPERATOR.md.\n--inhibit-suspend: ask systemd to block auto sleep/idle while the node runs (off by default).\nElectrum: TCP and/or TLS; banner states libre-relay-class. Memory envs:\n  RBITCOIN_ARCHIVE_QUEUE_MB, RBITCOIN_CLASS_A_CACHE_MB (default 256 each).\nParallel IBD: up to 1024 concurrent block downloads, max 16 in transit per peer.",
                     env!("CARGO_PKG_VERSION")
                 );
                 return ExitCode::SUCCESS;
@@ -54,6 +56,10 @@ where
             }
             "--no-seeds" => {
                 use_seeds = false;
+                i += 1;
+            }
+            "--inhibit-suspend" => {
+                inhibit_suspend = true;
                 i += 1;
             }
             "--datadir" => {
@@ -292,10 +298,26 @@ where
         default_milestone_height(network)
     };
     config.max_outbound = max_outbound;
+    config.inhibit_suspend = inhibit_suspend;
     // Map MiB → weight units (1 MiB ≈ 1e6 WU for budget purposes).
     if let Some(mb) = mempool_size_mb {
         config.mempool_max_weight = mb.saturating_mul(1_000_000);
     }
+
+    // Hold for process lifetime; drop after run_node / run_p2p returns.
+    let _suspend_inhibit = if config.inhibit_suspend {
+        match SuspendInhibit::try_start("rbitcoin-node running (IBD / tip follow)") {
+            Some(g) => Some(g),
+            None => {
+                warn!(
+                    "node: --inhibit-suspend requested but systemd-inhibit unavailable; continuing without inhibit"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     if config.electrum_tls_listen.is_some()
         && (config.electrum_tls_cert.is_none() || config.electrum_tls_key.is_none())
     {
@@ -304,6 +326,12 @@ where
     }
     if max_run_secs.is_some() {
         config.max_run_secs = max_run_secs;
+    }
+
+    // Create --datadir (and store/mempool/wire) before opening the store.
+    if let Err(e) = config.ensure_datadir() {
+        error!("{e}");
+        return ExitCode::FAILURE;
     }
 
     if smoke {

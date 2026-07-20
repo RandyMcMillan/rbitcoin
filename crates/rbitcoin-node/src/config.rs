@@ -39,6 +39,9 @@ pub struct NodeConfig {
     /// Mempool weight budget in **WU** (default ~300M WU ≈ plan 300 MiB class).
     /// Used for worst-chunk eviction. Override with `--mempool-size-mb`.
     pub mempool_max_weight: u64,
+    /// When true, ask systemd (if available) to block automatic suspend/idle
+    /// while the node process is running. Off by default.
+    pub inhibit_suspend: bool,
 }
 
 impl Default for NodeConfig {
@@ -62,6 +65,7 @@ impl Default for NodeConfig {
             max_outbound: 16,
             // ~300e6 weight units — see rbitcoin_mempool::DEFAULT_MAX_MEMPOOL_WEIGHT.
             mempool_max_weight: 300_000_000,
+            inhibit_suspend: false,
         }
     }
 }
@@ -109,12 +113,33 @@ impl NodeConfig {
         Ok(())
     }
 
+    /// Create `{datadir}` and standard subdirs (`store`, `mempool`, `wire`) if missing.
     pub fn ensure_datadir(&self) -> Result<(), NodeError> {
         self.validate()?;
+        let created_root = !self.datadir.exists();
         std::fs::create_dir_all(&self.datadir).map_err(|source| NodeError::Datadir {
             path: self.datadir.clone(),
             source,
         })?;
+        if self.datadir.exists() && !self.datadir.is_dir() {
+            return Err(NodeError::Config(format!(
+                "datadir is not a directory: {}",
+                self.datadir.display()
+            )));
+        }
+        for sub in ["store", "mempool", "wire"] {
+            let p = self.datadir.join(sub);
+            std::fs::create_dir_all(&p).map_err(|source| NodeError::Datadir {
+                path: p,
+                source,
+            })?;
+        }
+        if created_root {
+            rbitcoin_log::info!(
+                "node: created datadir {}",
+                self.datadir.display()
+            );
+        }
         Ok(())
     }
 }

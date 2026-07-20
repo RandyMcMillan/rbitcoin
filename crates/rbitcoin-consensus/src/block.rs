@@ -369,9 +369,6 @@ fn bip16_active_for_block(
 /// Owns a [`Transaction`] clone so the reconstructed block can be dropped before the
 /// parallel script wave, without a wasteful encode→deserialize round-trip.
 pub struct ScriptCheckJob {
-    /// Index into `block.txdata` (debug / future per-tx hooks).
-    #[allow(dead_code)]
-    pub(crate) tx_index: usize,
     pub(crate) prevouts: Vec<TxOut>,
     pub(crate) tx: Transaction,
     /// BIP65 CLTV active (false → OP_CLTV is a no-op, matching pre-activation).
@@ -585,7 +582,6 @@ pub(crate) fn connect_block_prevouts(
 
             if build_script_jobs {
                 script_jobs.push(ScriptCheckJob {
-                    tx_index: ti,
                     prevouts,
                     // One deep clone beats encode-at-connect + deserialize-per-worker.
                     tx: tx.clone(),

@@ -200,7 +200,6 @@ mod bip341_tests {
             }],
         };
         let job = ScriptCheckJob {
-            tx_index: 1,
             prevouts: vec![prevout],
             tx: tx.clone(),
             bip65_active: true,
@@ -284,7 +283,6 @@ mod bip341_tests {
 
         let _ = internal; // used implicitly via tweak
         let job = ScriptCheckJob {
-            tx_index: 1,
             prevouts: vec![prevout],
             tx: tx.clone(),
             bip65_active: true,
@@ -339,7 +337,6 @@ mod bip341_tests {
             }],
         };
         let job = ScriptCheckJob {
-            tx_index: 1,
             prevouts: vec![prevout],
             tx: tx.clone(),
             bip65_active: true,
@@ -447,7 +444,6 @@ mod bip341_tests {
         ];
         tx.input[0].witness = Witness::from_slice(&wit_items);
         let job = ScriptCheckJob {
-            tx_index: 1,
             prevouts: vec![prevout],
             tx: tx.clone(),
             bip65_active: true,
@@ -486,7 +482,6 @@ mod bip341_tests {
             }],
         };
         let job = ScriptCheckJob {
-            tx_index: 1,
             prevouts: vec![prevout],
             tx: tx.clone(),
             bip65_active: true,

@@ -112,13 +112,36 @@ impl PointTable {
     ///
     /// Each edge is `(out_txid, out_index, spending_tx_fk, spending_input_index)`.
     /// Multiple spends of the same outpoint in one batch chain correctly; only
-    /// the final head key per outpoint is written to the hash head (via
-    /// [`HashHead::insert_many`]).
+    /// the final head key per outpoint is written to the hash head.
+    ///
+    /// Probes durable `point.head` for prior chain heads (tip / reindex path).
+    /// Prefer [`Self::put_spend_batch_cold`] for catch-up run materialize.
     ///
     /// Returns the assigned point fks in input order.
     pub fn put_spend_batch(
         &self,
         edges: &[([u8; 32], u32, Fk, u32)],
+    ) -> Result<Vec<Fk>, StoreError> {
+        self.put_spend_batch_inner(edges, true)
+    }
+
+    /// Catch-up run materialize: no durable head probes.
+    ///
+    /// On a valid chain each outpoint is spent at most once, so `next` is always
+    /// null for cross-batch links; same-batch multi-edge chains still use a local
+    /// map. Skips ~N head gets and pre-sizes the head for unique keys so cold
+    /// shards can bulk-fill (see [`crate::hashhead::HashHead`] empty path).
+    pub fn put_spend_batch_cold(
+        &self,
+        edges: &[([u8; 32], u32, Fk, u32)],
+    ) -> Result<Vec<Fk>, StoreError> {
+        self.put_spend_batch_inner(edges, false)
+    }
+
+    fn put_spend_batch_inner(
+        &self,
+        edges: &[([u8; 32], u32, Fk, u32)],
+        probe_head: bool,
     ) -> Result<Vec<Fk>, StoreError> {
         if edges.is_empty() {
             return Ok(Vec::new());
@@ -143,8 +166,10 @@ impl PointTable {
             let key = PointRecord::outpoint_key(&out_txid, out_index);
             let prev_head = if let Some(&h) = local_heads.get(&key) {
                 h
-            } else {
+            } else if probe_head {
                 self.head.get(&key)?.unwrap_or(Fk::NULL)
+            } else {
+                Fk::NULL
             };
             let fk = Fk(*count + 1);
             let rec = PointRecord {
@@ -164,8 +189,10 @@ impl PointTable {
 
         self.body.write_at(start_offset, &body)?;
         // Final head per outpoint only (body chain already links older edges).
+        let n_heads = local_heads.len() as u64;
+        // Pre-size before insert so empty shards bulk-fill; non-empty grow once.
+        self.head.reserve_additional(n_heads)?;
         let head_batch: Vec<([u8; 32], Fk)> = local_heads.into_iter().collect();
-        // Paced: materialize / large batches must not rehash many shards at once.
         self.head.insert_many_paced(&head_batch)?;
         debug_assert_eq!(end_count, start + edges.len() as u64);
         Ok(fks)
@@ -336,6 +363,30 @@ mod tests {
         t.put_spend(&txid, 1, Fk(11), 2).unwrap();
         assert_eq!(t.spenders(&txid, 1).unwrap().len(), 2);
         assert!(t.spenders(&[0u8; 32], 0).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn put_spend_batch_cold_skips_head_probe() {
+        let dir = tmp();
+        let t = PointTable::create(&dir).unwrap();
+        let mut edges = Vec::new();
+        for i in 0u32..5_000 {
+            let mut txid = [0u8; 32];
+            txid[0..4].copy_from_slice(&i.to_le_bytes());
+            edges.push((txid, 0u32, Fk(i as u64 + 1), 0u32));
+        }
+        let fks = t.put_spend_batch_cold(&edges).unwrap();
+        assert_eq!(fks.len(), 5_000);
+        assert_eq!(t.edge_count(), 5_000);
+        // First and last outpoints resolve.
+        assert_eq!(t.spenders(&edges[0].0, 0).unwrap().len(), 1);
+        assert_eq!(t.spenders(&edges[4999].0, 0).unwrap().len(), 1);
+        // Same-batch chain still works without durable probe.
+        let tx = [9u8; 32];
+        t.put_spend_batch_cold(&[(tx, 1, Fk(900), 0), (tx, 1, Fk(901), 1)])
+            .unwrap();
+        assert_eq!(t.spenders(&tx, 1).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

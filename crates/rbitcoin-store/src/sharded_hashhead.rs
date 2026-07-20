@@ -255,11 +255,6 @@ impl ShardedHashHead {
         }
     }
 
-    #[allow(dead_code)] // diagnostics / tests
-    pub fn shard_count(&self) -> usize {
-        self.shards.len()
-    }
-
     pub fn occupied(&self) -> u64 {
         self.shards.iter().map(|s| s.occupied()).sum()
     }
@@ -408,10 +403,10 @@ impl ShardedHashHead {
         s.window_start = Instant::now();
     }
 
-    /// Reserve roughly `additional` new keys, spread across shards.
+    /// Pre-size every shard for roughly `additional` new keys (spread evenly).
     ///
-    /// Prefer paced inserts for IBD materialize (avoids multi-shard rehash).
-    #[allow(dead_code)] // public capacity helper; materialize uses insert_many_paced
+    /// Call once before a large cold materialize so shards grow with **empty**
+    /// rehashes (cheap punch-hole) instead of a cascade of mid-insert copies.
     pub fn reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
         if additional == 0 {
             return Ok(());
@@ -561,7 +556,13 @@ impl ShardedHashHead {
         for &(key, fk) in entries {
             buckets[self.shard_of(&key)].push((key, fk));
         }
-        let pace_ms = if pace { shard_pace_ms() } else { 0 };
+        // Materialize window disables pace: fixed 25ms×N-shard sleeps dominate
+        // small batches and stall confirm/disk for no durability gain.
+        let pace_ms = if pace && crate::ibd_io_policy::shard_pace_enabled() {
+            shard_pace_ms()
+        } else {
+            0
+        };
         let mut any = false;
         for (i, bucket) in buckets.into_iter().enumerate() {
             if bucket.is_empty() {
@@ -623,7 +624,7 @@ mod tests {
         let path = dir.join("head");
         // 16 shards keeps the test light while exercising partition logic.
         let h = ShardedHashHead::create_sharded(&path, 16, 64).unwrap();
-        assert_eq!(h.shard_count(), 16);
+        assert_eq!(h.shards.len(), 16);
         assert!(path.is_dir());
 
         let mut batch = Vec::new();
@@ -648,7 +649,7 @@ mod tests {
         h_full.flush().unwrap();
         drop(h_full);
         let h2 = ShardedHashHead::open_for_role(&path2, HeadRole::Point).unwrap();
-        assert_eq!(h2.shard_count(), SHARD_COUNT);
+        assert_eq!(h2.shards.len(), SHARD_COUNT);
         assert_eq!(h2.occupied(), 1000);
         assert_eq!(h2.get(&batch[0].0).unwrap(), Some(batch[0].1));
         let _ = std::fs::remove_dir_all(&dir);
@@ -665,7 +666,7 @@ mod tests {
             h.flush().unwrap();
         }
         let h = ShardedHashHead::open_for_role(&path, HeadRole::Tx).unwrap();
-        assert_eq!(h.shard_count(), 1);
+        assert_eq!(h.shards.len(), 1);
         assert_eq!(h.get(&[9u8; 32]).unwrap(), Some(Fk(42)));
         let _ = std::fs::remove_file(&path);
     }

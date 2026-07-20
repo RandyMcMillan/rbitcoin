@@ -257,6 +257,14 @@ impl Store {
         self.points.put_spend_batch(edges)
     }
 
+    /// Catch-up run materialize: bulk point append without durable head probes.
+    pub fn put_spend_batch_cold(
+        &self,
+        edges: &[([u8; 32], u32, Fk, u32)],
+    ) -> Result<Vec<Fk>, StoreError> {
+        self.points.put_spend_batch_cold(edges)
+    }
+
     /// Buffer `point.head` upserts in RAM (IBD); spill at cap / flush.
     pub fn enable_point_head_write_behind(&self, max_entries: usize) -> Result<(), StoreError> {
         self.points.enable_head_write_behind(max_entries)
@@ -508,6 +516,19 @@ impl Store {
         self.strong_tx.flush()?;
         self.tx_height.flush()?;
         self.header_txs.flush()?;
+        Ok(())
+    }
+
+    /// Flush catch-up index tables only (point / tx head / scripthash).
+    ///
+    /// Used when leaving run-materialize mode so deferred msync lands before
+    /// peer fetch/archive resume.
+    pub fn flush_index_tables(&self) -> Result<(), StoreError> {
+        // Ensure deferred mode is off so these flushes are durable.
+        crate::ibd_io_policy::set_defer_durable_flush(false);
+        self.points.flush()?;
+        self.txs.flush()?;
+        self.scripthash.flush()?;
         Ok(())
     }
 

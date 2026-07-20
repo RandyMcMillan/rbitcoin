@@ -220,12 +220,12 @@ impl ShRunBuilder {
 }
 
 fn materialize_run(store: &Store, run: &SortedRunPath) -> Result<u64, StoreError> {
+    // Whole-run append: one seed/get pass over unique keys, one body+head apply.
+    // Heads are not used for Electrum reads until tip mode.
     let body = read_run_body(run)?;
     let rec_len = run.rec_len as usize;
-    let mut heads: std::collections::HashMap<[u8; 32], rbitcoin_store::ShHeadValue> =
-        std::collections::HashMap::new();
-    let mut batch: Vec<ScriptHashRecord> = Vec::with_capacity(8192);
-    let mut inserted = 0u64;
+    let n_rec = body.len() / rec_len.max(1);
+    let mut batch: Vec<ScriptHashRecord> = Vec::with_capacity(n_rec);
     let mut offset = 0usize;
     while offset + rec_len <= body.len() {
         let (sh, tx_fk, vout) = decode_rec(&body[offset..offset + rec_len])?;
@@ -242,21 +242,16 @@ fn materialize_run(store: &Store, run: &SortedRunPath) -> Result<u64, StoreError
             value: 0,
             create_height: 0,
         });
-        if batch.len() >= 8192 {
-            let (n, _) = store
-                .scripthash
-                .put_create_batch_append(&batch, &mut heads)?;
-            inserted += n as u64;
-            batch.clear();
-        }
     }
-    if !batch.is_empty() {
-        let (n, _) = store
-            .scripthash
-            .put_create_batch_append(&batch, &mut heads)?;
-        inserted += n as u64;
+    if batch.is_empty() {
+        return Ok(0);
     }
-    Ok(inserted)
+    let mut heads: std::collections::HashMap<[u8; 32], rbitcoin_store::ShHeadValue> =
+        std::collections::HashMap::new();
+    let (n, _) = store
+        .scripthash
+        .put_create_batch_append(&batch, &mut heads)?;
+    Ok(n as u64)
 }
 
 #[cfg(test)]

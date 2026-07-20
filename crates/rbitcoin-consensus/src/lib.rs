@@ -43,7 +43,6 @@ pub mod script_bench {
     pub fn verify_job(job: &JobBytes) -> Result<(), ConsensusError> {
         // Zero-copy view — mirrors production (`&ScriptCheckJob` from connect).
         let j = ScriptCheckJob {
-            tx_index: 0,
             prevouts: job.prevouts.clone(),
             tx: job.tx.clone(),
             bip65_active: true,
@@ -58,7 +57,6 @@ pub mod script_bench {
     pub fn owned_jobs(jobs: &[JobBytes]) -> Vec<ScriptCheckJob> {
         jobs.iter()
             .map(|j| ScriptCheckJob {
-                tx_index: 0,
                 prevouts: j.prevouts.clone(),
                 tx: j.tx.clone(),
                 bip65_active: true,

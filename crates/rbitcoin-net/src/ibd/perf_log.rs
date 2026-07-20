@@ -64,7 +64,7 @@ pub(crate) struct IbdPerfSample {
     pub utxo_ms: u64,
     /// Open-address insert/take only (no msync).
     pub utxo_probe_ms: u64,
-    /// `mmap.flush` + `file.flush` after apply.
+    /// Always 0: light UTXO no longer msyncs on apply.
     pub utxo_flush_ms: u64,
     /// Formerly unaccounted confirm overhead (ms totals).
     pub resolve_ms: u64,

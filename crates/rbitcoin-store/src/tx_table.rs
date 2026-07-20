@@ -656,10 +656,16 @@ impl TxTable {
         self.head.occupied()
     }
 
+    /// Pre-size `tx.head` shards for a following bulk insert (run materialize).
+    pub fn head_reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
+        self.head.reserve_additional(additional)
+    }
+
     /// Bulk-insert head entries (sorted-run materialize / backfill helper).
     ///
-    /// Uses **paced** per-shard inserts (no global multi-shard `reserve_additional`)
-    /// so IBD materialize never rehashes many shards in one burst.
+    /// Prefer [`Self::head_reserve_additional`] for the full run first so cold
+    /// shards bulk-fill in one sequential write. Inserts are paced only when
+    /// durable flush is not deferred (see `ibd_io_policy`).
     pub fn head_insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());

@@ -309,25 +309,28 @@ impl ScriptHashTable {
         timing.sort_ns = t_sort.elapsed().as_nanos() as u64;
 
         let t_seed = std::time::Instant::now();
-        let mut missing: Vec<[u8; 32]> = Vec::new();
-        {
-            let mut seen_miss = std::collections::HashSet::new();
-            for &i in &order {
-                let rec = &recs[i];
-                if rec.create_tx_fk.is_null() {
-                    continue;
-                }
-                if heads.contains_key(&rec.scripthash) {
-                    continue;
-                }
-                if seen_miss.insert(rec.scripthash) {
-                    missing.push(rec.scripthash);
+        // Cold body (no prior creates): skip N head gets — empty table probes.
+        if self.entry_count() > 0 {
+            let mut missing: Vec<[u8; 32]> = Vec::new();
+            {
+                let mut seen_miss = std::collections::HashSet::new();
+                for &i in &order {
+                    let rec = &recs[i];
+                    if rec.create_tx_fk.is_null() {
+                        continue;
+                    }
+                    if heads.contains_key(&rec.scripthash) {
+                        continue;
+                    }
+                    if seen_miss.insert(rec.scripthash) {
+                        missing.push(rec.scripthash);
+                    }
                 }
             }
-        }
-        for key in missing {
-            if let Some(v) = self.head.get(&key)? {
-                heads.insert(key, v);
+            for key in missing {
+                if let Some(v) = self.head.get(&key)? {
+                    heads.insert(key, v);
+                }
             }
         }
         timing.seed_ns = t_seed.elapsed().as_nanos() as u64;
@@ -396,6 +399,8 @@ impl ScriptHashTable {
         if !head_final.is_empty() {
             let t_head = std::time::Instant::now();
             head_final.sort_by(|a, b| a.0.cmp(&b.0));
+            // Pre-size so empty shards bulk-fill; one grow when non-empty.
+            self.head.reserve_additional(head_final.len() as u64)?;
             self.head.insert_many_paced(&head_final)?;
             timing.head_ns = t_head.elapsed().as_nanos() as u64;
         }

@@ -198,13 +198,16 @@ impl PointRunBuilder {
 }
 
 fn materialize(store: &Store, run: &SortedRunPath) -> Result<u64, StoreError> {
+    // Whole-run cold path: no point.head probes (valid chain = one spend per
+    // outpoint), one body write + pre-sized head insert. Heads are not read
+    // until tip mode / Electrum.
     let body = read_run_body(run)?;
     let rec_len = run.rec_len as usize;
     if rec_len != 84 {
         return Err(StoreError::Corrupt("point run unexpected rec_len"));
     }
-    let mut batch: Vec<([u8; 32], u32, Fk, u32)> = Vec::with_capacity(8192);
-    let mut inserted = 0u64;
+    let n_rec = body.len() / rec_len;
+    let mut batch: Vec<([u8; 32], u32, Fk, u32)> = Vec::with_capacity(n_rec);
     let mut off = 0usize;
     while off + rec_len <= body.len() {
         let mut out_txid = [0u8; 32];
@@ -216,15 +219,11 @@ fn materialize(store: &Store, run: &SortedRunPath) -> Result<u64, StoreError> {
         if !spend_fk.is_null() {
             batch.push((out_txid, out_index, spend_fk, in_idx));
         }
-        if batch.len() >= 8192 {
-            store.put_spend_batch(&batch)?;
-            inserted += batch.len() as u64;
-            batch.clear();
-        }
     }
-    if !batch.is_empty() {
-        store.put_spend_batch(&batch)?;
-        inserted += batch.len() as u64;
+    if batch.is_empty() {
+        return Ok(0);
     }
-    Ok(inserted)
+    let n = batch.len() as u64;
+    store.put_spend_batch_cold(&batch)?;
+    Ok(n)
 }

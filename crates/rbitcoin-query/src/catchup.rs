@@ -184,32 +184,25 @@ impl Query {
         };
         let t_probe = std::time::Instant::now();
         let mut last_tip = u.tip();
-        let mut any = false;
         for &(spends, creates, tip) in steps {
             if let Some(have) = last_tip {
                 if tip <= have {
                     continue;
                 }
             }
-            any = true;
             for &(txid, vout) in spends {
                 let _ = u.take_spend(&txid, vout)?;
             }
             for &(txid, vout, create_fk) in creates {
                 u.insert_create(&txid, vout, create_fk)?;
             }
-            // Header tip only (no msync); durable flush is separate below.
+            // In-map tip only — no msync (rebuildable catch-up cache).
             u.set_tip(Some(tip));
             last_tip = Some(tip);
         }
-        let probe_ns = t_probe.elapsed().as_nanos() as u64;
-        ibd_utxo_stats::note_probe_ns(probe_ns);
-
-        if any {
-            let t_flush = std::time::Instant::now();
-            u.flush()?;
-            ibd_utxo_stats::note_flush_ns(t_flush.elapsed().as_nanos() as u64);
-        }
+        ibd_utxo_stats::note_probe_ns(t_probe.elapsed().as_nanos() as u64);
+        // Flush counter kept for log shape; always 0 (no msync).
+        ibd_utxo_stats::note_flush_ns(0);
         Ok(())
     }
 
@@ -338,17 +331,30 @@ impl Query {
     ///
     /// `arch_lead = arch_hwm − tip`. `peer_inflight` = unique getdata in flight.
     /// Materialize starts only when lead hysteresis is active **and** inflight is 0.
+    ///
+    /// While materializing: defer `msync`/`fdatasync` on table flushes and skip
+    /// inter-shard insert pacing. On transition back to fetch mode, flush Class B
+    /// index tables so dirty pages land before archive/getdata resume.
     pub fn publish_run_materialize_control(
         &self,
         arch_lead: u32,
         archive_at_tip: bool,
         peer_inflight: u32,
     ) {
-        crate::run_builder_core::run_materialize_control::publish(
-            arch_lead,
-            archive_at_tip,
-            peer_inflight,
-        );
+        use crate::run_builder_core::run_materialize_control as ctl;
+        let was_mat = ctl::in_materialize_mode();
+        ctl::publish(arch_lead, archive_at_tip, peer_inflight);
+        let now_mat = ctl::in_materialize_mode();
+        rbitcoin_store::set_defer_durable_flush(now_mat);
+        if was_mat && !now_mat {
+            if let Err(e) = self.store.flush_index_tables() {
+                rbitcoin_log::warn!("store: flush index tables after materialize: {e}");
+            } else {
+                rbitcoin_log::info!(
+                    "store: flushed point/tx/scripthash after materialize → fetch (lead={arch_lead})"
+                );
+            }
+        }
     }
 
     /// On-disk run counts: `(tx, point, scripthash)`.

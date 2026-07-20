@@ -12,7 +12,6 @@ use memmap2::MmapMut;
 use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"RBUXTO03";
@@ -86,7 +85,8 @@ type OverflowEntry = ([u8; 32], u64);
 /// Persistent IBD UTXO: unspent outpoint → create_tx_fk.
 pub struct IbdUtxo {
     path: PathBuf,
-    file: File,
+    /// Kept open so the mmap stays valid for the table lifetime.
+    _file: File,
     map: MmapMut,
     num_slots: u64,
     live: u64,
@@ -211,7 +211,7 @@ impl IbdUtxo {
         map.flush().map_err(|e| io(&path, e))?;
         Ok(Self {
             path,
-            file,
+            _file: file,
             map,
             num_slots,
             live: 0,
@@ -235,7 +235,7 @@ impl IbdUtxo {
         }
         Ok(Self {
             path,
-            file,
+            _file: file,
             map,
             num_slots,
             live,
@@ -450,24 +450,26 @@ impl IbdUtxo {
         Ok(false)
     }
 
-    /// Update tip + header in the mmap **without** fsync (confirm multi-block batch).
+    /// Update tip + header in the mmap (process-local; no msync).
     pub fn set_tip(&mut self, tip: Option<u32>) {
         self.tip = tip;
         Self::write_header(&mut self.map, self.tip, self.num_slots, self.live);
     }
 
-    /// Persist header + pages (`msync` + file flush).
+    /// No-op durability: light UTXO is a rebuildable catch-up cache.
+    ///
+    /// Slot/header updates are visible in-process via the live mmap. We intentionally
+    /// skip `msync` / file flush on the confirm hot path (and everywhere else) — kill
+    /// may leave a torn or lagging map; open/heal rebuilds from Class A + tip.
     pub fn flush(&mut self) -> Result<(), StoreError> {
         Self::write_header(&mut self.map, self.tip, self.num_slots, self.live);
-        self.map.flush().map_err(|e| io(&self.path, e))?;
-        self.file.flush().map_err(|e| io(&self.path, e))?;
         Ok(())
     }
 
-    /// Set tip and flush (single-height / shutdown / rebuild).
+    /// Set tip in the mmap (no msync). Name kept for call sites / tests.
     pub fn commit_tip(&mut self, tip: Option<u32>) -> Result<(), StoreError> {
         self.set_tip(tip);
-        self.flush()
+        Ok(())
     }
 
     pub fn grow(&mut self) -> Result<(), StoreError> {

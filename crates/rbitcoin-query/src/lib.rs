@@ -225,7 +225,7 @@ pub mod ibd_utxo_stats {
 
     /// Wall time in open-address `take_spend` / `insert_create` (no msync).
     pub static PROBE_NS: AtomicU64 = AtomicU64::new(0);
-    /// Wall time in `IbdUtxo::flush` (`mmap.flush` + `file.flush`).
+    /// Formerly msync time; always 0 now (UTXO flush dropped — rebuildable cache).
     pub static FLUSH_NS: AtomicU64 = AtomicU64::new(0);
 
     /// Rebuilds in the last sample window (then reset).

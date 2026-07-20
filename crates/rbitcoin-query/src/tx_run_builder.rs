@@ -220,10 +220,13 @@ impl TxRunBuilder {
 }
 
 fn materialize(store: &Store, run: &SortedRunPath) -> Result<u64, StoreError> {
+    // Whole-run decode → one pre-size → paced insert. Cold empty shards bulk-fill
+    // in RAM + one sequential write (see HashHead::bulk_fill_empty); avoids the
+    // old 8k-batch rehash cascade while heads are not yet used for reads.
     let body = read_run_body(run)?;
     let rec_len = run.rec_len as usize;
-    let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(8192);
-    let mut inserted = 0u64;
+    let n_rec = body.len() / rec_len.max(1);
+    let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(n_rec);
     let mut off = 0usize;
     while off + rec_len <= body.len() {
         let mut txid = [0u8; 32];
@@ -233,15 +236,12 @@ fn materialize(store: &Store, run: &SortedRunPath) -> Result<u64, StoreError> {
         if !fk.is_null() {
             batch.push((txid, fk));
         }
-        if batch.len() >= 8192 {
-            store.txs.head_insert_many(&batch)?;
-            inserted += batch.len() as u64;
-            batch.clear();
-        }
     }
-    if !batch.is_empty() {
-        store.txs.head_insert_many(&batch)?;
-        inserted += batch.len() as u64;
+    if batch.is_empty() {
+        return Ok(0);
     }
-    Ok(inserted)
+    store.txs.head_reserve_additional(batch.len() as u64)?;
+    let n = batch.len() as u64;
+    store.txs.head_insert_many(&batch)?;
+    Ok(n)
 }

@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-const AFTER_RUN: Duration = Duration::from_millis(80);
+/// Brief yield after a run so confirm can run; keep small — durability is deferred.
+const AFTER_RUN: Duration = Duration::from_millis(5);
 const IDLE: Duration = Duration::from_millis(200);
 
 /// RAII: drop signals stop and joins.

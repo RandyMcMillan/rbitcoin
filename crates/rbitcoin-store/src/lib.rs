@@ -10,6 +10,7 @@ mod compact;
 mod epoch;
 mod error;
 mod file;
+mod ibd_io_policy;
 mod hashhead;
 mod header_table;
 mod point_table;
@@ -29,6 +30,7 @@ pub use file::{
     ensure_nofile_budget, ensure_nofile_budget_at_least, try_set_io_best_effort, try_set_io_idle,
     NOFILE_SOFT_TARGET,
 };
+pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush, shard_pace_enabled};
 pub use hashhead::{
     initial_slots_for, HeadRole, HeadScale, DEFAULT_WRITE_BEHIND_CAP,
 };

@@ -173,15 +173,6 @@ impl RehashStats {
 }
 
 impl HashHead {
-    /// Create pre-sized for a store role (single-file; prefer sharded facade).
-    #[allow(dead_code)]
-    pub fn create_for_role(
-        path: impl Into<std::path::PathBuf>,
-        role: HeadRole,
-    ) -> Result<Self, StoreError> {
-        Self::create_with_slots(path, initial_slots_for(role))
-    }
-
     /// Create with an explicit power-of-two slot count (sparse-allocated).
     pub fn create_with_slots(
         path: impl Into<std::path::PathBuf>,
@@ -251,12 +242,6 @@ impl HashHead {
         })
     }
 
-    /// Current slot table size (power of two).
-    #[allow(dead_code)] // diagnostics / tests
-    pub fn slots(&self) -> u64 {
-        self.state.lock().unwrap().slots
-    }
-
     fn hash_slot(key: &[u8; 32], slots: u64) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
         for b in key {
@@ -300,8 +285,10 @@ impl HashHead {
     /// spilled with slot-sorted page-buffered apply. `get` remains coherent.
     ///
     /// Spills any existing overlay first if re-enabled with a new cap.
-    /// Production tables use [`crate::sharded_hashhead::ShardedHashHead`]'s overlay.
-    #[allow(dead_code)]
+    ///
+    /// Production tables use [`crate::sharded_hashhead::ShardedHashHead`]'s overlay;
+    /// this path is exercised by unit tests of the single-shard head.
+    #[cfg(test)]
     pub fn enable_write_behind(&self, max_entries: usize) -> Result<(), StoreError> {
         let max_entries = max_entries.max(1);
         // Spill previous overlay so we never drop pending keys.
@@ -310,14 +297,6 @@ impl HashHead {
             map: HashMap::new(),
             max_entries,
         });
-        Ok(())
-    }
-
-    /// Disable write-behind after spilling all pending entries.
-    #[allow(dead_code)] // used via ShardedHashHead facade / tests
-    pub fn disable_write_behind(&self) -> Result<(), StoreError> {
-        self.spill_write_behind()?;
-        *self.overlay.lock().unwrap() = None;
         Ok(())
     }
 
@@ -444,7 +423,8 @@ impl HashHead {
         Ok(None)
     }
 
-    #[allow(dead_code)] // unit tests; production uses insert_many / ShardedHashHead
+    /// Single-key insert (unit tests; production uses [`Self::insert_many`]).
+    #[cfg(test)]
     pub fn insert(&self, key: &[u8; 32], fk: Fk) -> Result<Option<Fk>, StoreError> {
         debug_assert!(!fk.is_null());
         let mut prev = None;
@@ -491,6 +471,11 @@ impl HashHead {
     }
 
     /// Slot-sorted, page-buffered apply to the mmap table (no overlay).
+    ///
+    /// When the table is **empty** (first load / run materialize into a cold
+    /// shard), builds the open-addressing table in RAM and writes it in one
+    /// sequential pass — same idea as the offline SH bulk builder (no RMW of
+    /// zero pages, no growth rehash cascade mid-batch).
     fn insert_many_file(
         &self,
         entries: &[([u8; 32], Fk)],
@@ -500,6 +485,11 @@ impl HashHead {
             return Ok(());
         }
         self.reserve_additional(entries.len() as u64)?;
+
+        let occupied = self.state.lock().unwrap().occupied;
+        if occupied == 0 {
+            return self.bulk_fill_empty(entries, on_prev);
+        }
 
         // Sort by primary hash slot so linear probes walk nearby pages.
         let mut work: Vec<([u8; 32], Fk)> = entries.to_vec();
@@ -549,6 +539,58 @@ impl HashHead {
                 self.rehash_to(need)?;
             }
         }
+        Ok(())
+    }
+
+    /// Place `entries` into a currently-empty slot table (caller reserved capacity).
+    ///
+    /// Last write wins for duplicate keys in `entries`. Builds the full slot
+    /// image in RAM then one `write_at` — used for cold run→head materialize.
+    fn bulk_fill_empty(
+        &self,
+        entries: &[([u8; 32], Fk)],
+        mut on_prev: impl FnMut(Option<Fk>),
+    ) -> Result<(), StoreError> {
+        debug_assert_eq!(self.state.lock().unwrap().occupied, 0);
+        let slots = self.state.lock().unwrap().slots;
+        let nbytes = (slots as usize).saturating_mul(SLOT_SIZE);
+        let mut table = vec![0u8; nbytes];
+        let mut occupied = 0u64;
+
+        for &(key, fk) in entries {
+            debug_assert!(!fk.is_null());
+            let mut slot = Self::hash_slot(&key, slots);
+            let mut placed = false;
+            for _ in 0..slots {
+                let off = (slot as usize) * SLOT_SIZE;
+                let slot_key: [u8; 32] = table[off..off + 32].try_into().unwrap();
+                let slot_fk = u64::from_le_bytes(table[off + 32..off + 40].try_into().unwrap());
+                if is_empty_slot(&slot_key, slot_fk) {
+                    table[off..off + 32].copy_from_slice(&key);
+                    table[off + 32..off + 40].copy_from_slice(&fk.0.to_le_bytes());
+                    occupied = occupied.saturating_add(1);
+                    on_prev(None);
+                    placed = true;
+                    break;
+                }
+                if slot_key == key {
+                    // Overwrite existing placement of same key (last wins).
+                    table[off + 32..off + 40].copy_from_slice(&fk.0.to_le_bytes());
+                    on_prev(Fk::new(slot_fk));
+                    placed = true;
+                    break;
+                }
+                slot = (slot + 1) & (slots - 1);
+            }
+            if !placed {
+                // Should not happen after reserve_additional for unique-ish keys.
+                return Err(StoreError::Corrupt("hash head bulk_fill full"));
+            }
+        }
+
+        self.file
+            .write_at(FILE_HEADER_LEN as u64, &table)?;
+        self.state.lock().unwrap().occupied = occupied;
         Ok(())
     }
 
@@ -710,21 +752,9 @@ impl HashHead {
         Ok(())
     }
 
-    /// Spill write-behind (if any). Kept for API compatibility.
-    #[allow(dead_code)]
-    pub fn persist(&self) -> Result<(), StoreError> {
-        self.spill_write_behind()
-    }
-
     pub fn flush(&self) -> Result<(), StoreError> {
         self.spill_write_behind()?;
         self.file.flush()
-    }
-
-    #[allow(dead_code)] // used via ShardedHashHead facade / tests
-    pub fn flush_async(&self) -> Result<(), StoreError> {
-        self.spill_write_behind()?;
-        self.flush_async_no_spill()
     }
 
     pub fn flush_async_no_spill(&self) -> Result<(), StoreError> {
@@ -925,18 +955,51 @@ mod tests {
     }
 
     #[test]
+    fn bulk_fill_empty_roundtrip() {
+        // Cold materialize path: empty table + pre-size + one insert_many.
+        let path = tmp_path();
+        let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
+        let mut batch = Vec::new();
+        for i in 0u64..20_000 {
+            let mut key = [0u8; 32];
+            key[0..8].copy_from_slice(&i.to_le_bytes());
+            batch.push((key, Fk(i + 1)));
+        }
+        h.reserve_additional(batch.len() as u64).unwrap();
+        assert_eq!(h.occupied(), 0);
+        h.insert_many(&batch).unwrap();
+        assert_eq!(h.occupied(), 20_000);
+        for i in [0u64, 1, 9999, 19_999] {
+            let mut key = [0u8; 32];
+            key[0..8].copy_from_slice(&i.to_le_bytes());
+            assert_eq!(h.get(&key).unwrap(), Some(Fk(i + 1)));
+        }
+        // Second wave uses RMW path (non-empty).
+        let mut more = Vec::new();
+        for i in 20_000u64..21_000 {
+            let mut key = [0u8; 32];
+            key[0..8].copy_from_slice(&i.to_le_bytes());
+            more.push((key, Fk(i + 1)));
+        }
+        h.insert_many(&more).unwrap();
+        assert_eq!(h.occupied(), 21_000);
+        assert_eq!(h.get(&[0u8; 32]).unwrap(), Some(Fk(1)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn reserve_additional_jumps_to_target_slots() {
         // Formerly doubled in a loop (log₂ empty rehashes). One jump to capacity.
         let path = tmp_path();
         let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
-        assert_eq!(h.slots(), 64);
+        assert_eq!(h.state.lock().unwrap().slots, 64);
         h.reserve_additional(10_000).unwrap();
-        let slots = h.slots();
+        let slots = h.state.lock().unwrap().slots;
         // slots_for_keys(10000) = next_pow2(ceil(10000*8/7)) = next_pow2(11429) = 16384
         assert_eq!(slots, 16_384);
         // Second reserve for same size is a no-op (no smaller/equal grow).
         h.reserve_additional(10_000).unwrap();
-        assert_eq!(h.slots(), 16_384);
+        assert_eq!(h.state.lock().unwrap().slots, 16_384);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -944,7 +1007,7 @@ mod tests {
     fn create_with_slots_sparse_presize() {
         let path = tmp_path();
         let h = HashHead::create_with_slots(&path, 1024).unwrap();
-        assert_eq!(h.slots(), 1024);
+        assert_eq!(h.state.lock().unwrap().slots, 1024);
         assert_eq!(h.occupied(), 0);
         h.insert(&[1u8; 32], Fk(1)).unwrap();
         assert_eq!(h.get(&[1u8; 32]).unwrap(), Some(Fk(1)));

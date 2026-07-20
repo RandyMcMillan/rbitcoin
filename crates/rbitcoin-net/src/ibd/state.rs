@@ -47,11 +47,6 @@ impl InflightReq {
         self.peers.len()
     }
 
-    #[allow(dead_code)] // useful for tests / future multi-peer drain checks
-    pub(crate) fn is_empty(&self) -> bool {
-        self.peers.is_empty()
-    }
-
     /// Returns true if `peer` was newly added.
     pub(crate) fn add_peer(&mut self, peer: usize) -> bool {
         if !self.peers.insert(peer) {
@@ -213,6 +208,6 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert!(r.second_peer_at.is_none());
         assert!(r.remove_peer(2));
-        assert!(r.is_empty());
+        assert_eq!(r.len(), 0);
     }
 }

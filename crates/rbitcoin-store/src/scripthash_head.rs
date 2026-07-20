@@ -91,11 +91,6 @@ impl ScriptHashHead {
         })
     }
 
-    #[allow(dead_code)]
-    pub fn occupied(&self) -> u64 {
-        self.state.lock().unwrap().occupied
-    }
-
     fn hash_slot(key: &[u8; 32], slots: u64) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
         for b in key {
@@ -180,6 +175,10 @@ impl ScriptHashHead {
         }
         self.reserve_additional(upserts.len() as u64)?;
 
+        if self.state.lock().unwrap().occupied == 0 {
+            return self.bulk_fill_empty(&upserts);
+        }
+
         let mut work = upserts;
         let slots_now = self.state.lock().unwrap().slots;
         work.sort_unstable_by_key(|(k, _)| Self::hash_slot(k, slots_now));
@@ -224,10 +223,43 @@ impl ScriptHashHead {
         Ok(())
     }
 
-    /// Paced multi-insert (API parity with sharded Fk heads).
-    #[allow(dead_code)]
-    pub fn insert_many_paced(&self, entries: &[([u8; 32], ShHeadValue)]) -> Result<(), StoreError> {
-        self.insert_many(entries)
+    /// Cold first load: build open-addressing table in RAM, one sequential write.
+    fn bulk_fill_empty(&self, entries: &[([u8; 32], ShHeadValue)]) -> Result<(), StoreError> {
+        debug_assert_eq!(self.state.lock().unwrap().occupied, 0);
+        let slots = self.state.lock().unwrap().slots;
+        let nbytes = (slots as usize).saturating_mul(SH_HEAD_SLOT_SIZE);
+        let mut table = vec![0u8; nbytes];
+        let mut occupied = 0u64;
+        for (key, val) in entries {
+            let enc = val.encode();
+            let mut slot = Self::hash_slot(key, slots);
+            let mut placed = false;
+            for _ in 0..slots {
+                let off = (slot as usize) * SH_HEAD_SLOT_SIZE;
+                let slot_key: [u8; 32] = table[off..off + 32].try_into().unwrap();
+                let slot_v: [u8; SH_HEAD_VALUE_LEN] =
+                    table[off + 32..off + SH_HEAD_SLOT_SIZE].try_into().unwrap();
+                if is_empty_slot(&slot_key, &slot_v) {
+                    table[off..off + 32].copy_from_slice(key);
+                    table[off + 32..off + SH_HEAD_SLOT_SIZE].copy_from_slice(&enc);
+                    occupied = occupied.saturating_add(1);
+                    placed = true;
+                    break;
+                }
+                if &slot_key == key {
+                    table[off + 32..off + SH_HEAD_SLOT_SIZE].copy_from_slice(&enc);
+                    placed = true;
+                    break;
+                }
+                slot = (slot + 1) & (slots - 1);
+            }
+            if !placed {
+                return Err(StoreError::Corrupt("scripthash head bulk_fill full"));
+            }
+        }
+        self.file.write_at(FILE_HEADER_LEN as u64, &table)?;
+        self.state.lock().unwrap().occupied = occupied;
+        Ok(())
     }
 
     fn slots_for_keys(keys: u64) -> u64 {
@@ -485,8 +517,6 @@ impl<'a> SlotPageCache<'a> {
 /// Sharded facade (16-way mainnet) over [`ScriptHashHead`].
 pub struct ShardedScriptHashHead {
     shards: Vec<ScriptHashHead>,
-    #[allow(dead_code)]
-    path: PathBuf,
 }
 
 impl ShardedScriptHashHead {
@@ -509,10 +539,7 @@ impl ShardedScriptHashHead {
         let per = slots_each.max(2).next_power_of_two();
         if n == 1 {
             let h = ScriptHashHead::create_with_slots(&path, per)?;
-            return Ok(Self {
-                shards: vec![h],
-                path,
-            });
+            return Ok(Self { shards: vec![h] });
         }
         if path.exists() {
             return Err(StoreError::io(
@@ -531,7 +558,7 @@ impl ShardedScriptHashHead {
         }
         let _ = HeadScale::from_env(); // ensure env resolved for tests
         let _ = initial_slots_for(HeadRole::ScriptHash);
-        Ok(Self { shards, path })
+        Ok(Self { shards })
     }
 
     pub fn open_for_role(path: impl Into<PathBuf>, _role: HeadRole) -> Result<Self, StoreError> {
@@ -557,12 +584,11 @@ impl ShardedScriptHashHead {
                 }
                 shards.push(ScriptHashHead::open(path.join(name))?);
             }
-            return Ok(Self { shards, path });
+            return Ok(Self { shards });
         }
         if path.is_file() {
             return Ok(Self {
-                shards: vec![ScriptHashHead::open(path.clone())?],
-                path,
+                shards: vec![ScriptHashHead::open(path)?],
             });
         }
         Err(StoreError::io(
@@ -617,6 +643,19 @@ impl ShardedScriptHashHead {
         self.insert_many(entries)
     }
 
+    /// Pre-size shards for a following bulk head insert (run materialize).
+    pub fn reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
+        if additional == 0 {
+            return Ok(());
+        }
+        let n = self.shards.len() as u64;
+        let per = additional.div_ceil(n).max(1);
+        for s in &self.shards {
+            s.reserve_additional(per)?;
+        }
+        Ok(())
+    }
+
     pub fn for_each_occupied(
         &self,
         mut f: impl FnMut([u8; 32], ShHeadValue) -> Result<(), StoreError>,
@@ -625,11 +664,6 @@ impl ShardedScriptHashHead {
             shard.for_each_occupied(&mut f)?;
         }
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn occupied(&self) -> u64 {
-        self.shards.iter().map(|s| s.occupied()).sum()
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {

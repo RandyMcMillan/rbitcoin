@@ -177,19 +177,33 @@ pub(crate) fn spawn_confirm_engine(
                     stats: &loop_stats,
                     query: &hub.query,
                 };
+                // Abort before starting a wave if stop was requested while we
+                // held the feed lock / built the batch.
+                if feed.stopped() || hub.query.confirm_cancelled() {
+                    return;
+                }
                 let res = hub.confirm_run(&batch);
                 let res = match res {
                     Err(e) if batch.len() > 1 => {
                         let msg = e.to_string();
-                        if msg.contains("confirm without archive")
+                        if feed.stopped()
+                            || hub.query.confirm_cancelled()
+                            || msg.contains("confirm cancelled")
+                        {
+                            Err(e)
+                        } else if msg.contains("confirm without archive")
                             || msg.contains("NotFound")
                             || msg.contains("not found")
                         {
                             Err(e)
                         } else {
                             // Attribute failure: retry tip+1 alone.
-                            loop_stats.confirm_begin(expect_h, 1);
-                            hub.confirm_run(&batch[..1])
+                            if feed.stopped() || hub.query.confirm_cancelled() {
+                                Err(e)
+                            } else {
+                                loop_stats.confirm_begin(expect_h, 1);
+                                hub.confirm_run(&batch[..1])
+                            }
                         }
                     }
                     other => other,
@@ -199,6 +213,14 @@ pub(crate) fn spawn_confirm_engine(
                 loop_stats
                     .confirm_ns
                     .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+
+                // Shutdown: do not emit reject events or blacklist after stop.
+                if feed.stopped() || hub.query.confirm_cancelled() {
+                    if let Err(e) = &res {
+                        info!("ibd: confirm aborted after stop: {e}");
+                    }
+                    return;
+                }
 
                 match res {
                     Ok(outcomes) => {
@@ -226,6 +248,10 @@ pub(crate) fn spawn_confirm_engine(
                     Err(e) => {
                         let (expect, hash) = batch[0];
                         let msg = e.to_string();
+                        if msg.contains("confirm cancelled") {
+                            info!("ibd: confirm cancelled @ {expect}");
+                            return;
+                        }
                         if msg.contains("confirm without archive")
                             || msg.contains("NotFound")
                             || msg.contains("not found")

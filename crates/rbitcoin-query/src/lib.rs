@@ -300,6 +300,9 @@ pub struct Query {
     point_run: point_run_builder::PointRunBuilder,
     /// Catch-up spentness: mmap unspent outpoint → create Class A fk.
     ibd_utxo: Mutex<Option<IbdUtxo>>,
+    /// Cooperative cancel for in-flight confirm (prewarm waits). Set on IBD
+    /// SIGINT teardown so the confirm OS thread aborts waits before process exit.
+    confirm_cancel: std::sync::atomic::AtomicBool,
 }
 
 impl Query {
@@ -332,10 +335,29 @@ impl Query {
             tx_run: tx_run_builder::TxRunBuilder::new(&store_path),
             point_run: point_run_builder::PointRunBuilder::new(&store_path),
             ibd_utxo: Mutex::new(None),
+            confirm_cancel: std::sync::atomic::AtomicBool::new(false),
         };
         // Warm cache from durable head if present (resume with index on).
         // Full body scan is not done here; fresh genesis IBD fills cache as it archives.
         Ok(q)
+    }
+
+    /// Request in-flight confirm to abort cooperative waits (IBD SIGINT).
+    pub fn request_confirm_cancel(&self) {
+        self.confirm_cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Clear cancel before a new confirm/IBD session.
+    pub fn clear_confirm_cancel(&self) {
+        self.confirm_cancel
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// True after [`Self::request_confirm_cancel`] until cleared.
+    pub fn confirm_cancelled(&self) -> bool {
+        self.confirm_cancel
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Last height with SH creates committed (after tip). `None` if empty chain.

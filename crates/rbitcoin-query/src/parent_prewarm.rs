@@ -77,7 +77,8 @@ impl Query {
         self.confirm_parents.all_ready(heights)
     }
 
-    /// Block until all `heights` are scanned (ready) or `timeout` elapses.
+    /// Block until all `heights` are scanned (ready), `timeout` elapses, or
+    /// [`Query::confirm_cancelled`].
     pub fn wait_prewarm_ready(
         &self,
         heights: &[u32],
@@ -88,6 +89,9 @@ impl Query {
         }
         let start = std::time::Instant::now();
         loop {
+            if self.confirm_cancelled() {
+                return Err(StoreError::Corrupt("confirm cancelled"));
+            }
             if self.confirm_parents.all_ready(heights) {
                 return Ok(());
             }
@@ -100,11 +104,14 @@ impl Query {
         }
     }
 
-    /// Wait until batch heights are scanned **and** the warmer is `headroom`
-    /// blocks past `batch_end` (or the published runway ends).
+    /// Wait until batch heights are **scanned** (hard). Then briefly prefer
+    /// warmer headroom past `batch_end`, but **never block confirm** on it —
+    /// mainnet showed hard headroom waits freezing tip for minutes while the
+    /// worker chewed runway IO, which stalled peers (no archive drain).
     ///
-    /// Open reservations never block this wait (same-batch create→spend).
-    /// `headroom == None` uses [`prewarm_headroom_from_env`] (default 2× batch).
+    /// Aborts promptly on [`Query::confirm_cancelled`] (IBD SIGINT).
+    /// Open reservations never block readiness (same-batch create→spend).
+    /// `headroom == None` uses [`prewarm_headroom_from_env`].
     pub fn wait_prewarm_ready_with_headroom(
         &self,
         heights: &[u32],
@@ -115,21 +122,28 @@ impl Query {
         if heights.is_empty() {
             return Ok(());
         }
+        // Hard: this batch must be scanned (or cancel).
+        self.wait_prewarm_ready(heights, timeout)?;
+        if self.confirm_cancelled() {
+            return Err(StoreError::Corrupt("confirm cancelled"));
+        }
         let hr = headroom.unwrap_or_else(prewarm_headroom_from_env);
+        if hr == 0 || self.confirm_parents.headroom_ready(batch_end, hr) {
+            return Ok(());
+        }
+        // Soft: give the worker a short moment to pull further ahead, then go.
+        let soft = std::time::Duration::from_millis(50);
         let start = std::time::Instant::now();
-        loop {
-            if self.confirm_parents.all_ready(heights)
-                && self.confirm_parents.headroom_ready(batch_end, hr)
-            {
-                return Ok(());
+        while start.elapsed() < soft {
+            if self.confirm_cancelled() {
+                return Err(StoreError::Corrupt("confirm cancelled"));
             }
-            if start.elapsed() >= timeout {
-                return Err(StoreError::Corrupt(
-                    "confirm parent prewarm headroom not ready (timeout)",
-                ));
+            if self.confirm_parents.headroom_ready(batch_end, hr) {
+                return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+        Ok(())
     }
 
     /// Prewarm parents for archived runway blocks (height-ordered).
@@ -149,6 +163,10 @@ impl Query {
         self.confirm_parents.advance_tip(tip);
 
         for &(height, hash) in items {
+            if self.confirm_cancelled() {
+                crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                return Err(StoreError::Corrupt("confirm cancelled"));
+            }
             if height <= tip {
                 continue;
             }

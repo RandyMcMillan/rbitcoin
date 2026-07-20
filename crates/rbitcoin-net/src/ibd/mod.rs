@@ -483,6 +483,9 @@ pub async fn parallel_ibd_cancellable(
         rbitcoin_store::spill_chunk_size()
     );
 
+    // Fresh cancel state for this IBD session (may have been set on prior stop).
+    hub.query.clear_confirm_cancel();
+
     // Parent prewarm: high-prio runway worker loads/pins parents for tip+1…tip+1k
     // so confirm wave-fill hits RAM instead of contending with archive I/O.
     let prewarm_ctrl = Arc::new(PrewarmControl::new());
@@ -1125,8 +1128,11 @@ pub async fn parallel_ibd_cancellable(
         t_teardown.elapsed()
     );
 
-    // 2) Signal cooperative stops (confirm mid-batch may still finish current wave).
+    // 2) Signal cooperative stops. Confirm cancel aborts prewarm waits so the
+    //    engine can exit; we **always join** it before returning (no ghost rejects
+    //    minutes after "clean exit").
     confirm_feed.request_stop();
+    hub.query.request_confirm_cancel();
     archive_stop.store(true, Ordering::Relaxed);
     prewarm_ctrl.request_stop();
     if let Some(h) = prewarm_join.take() {
@@ -1140,17 +1146,37 @@ pub async fn parallel_ibd_cancellable(
     // 3) Stop feeding the archive queue; prep/writer exit on stop + closed channels.
     drop(arch_job_tx);
 
-    // Confirm join (bounded): do not block shutdown for multi-minute waves.
+    // Confirm join: wait until the OS thread exits. Cancel makes waits abort in
+    // milliseconds; a mid-wave script check may still take a bit — better that
+    // than logging rejects after "clean exit" from a leaked join.
+    info!(
+        "ibd: waiting for confirm engine to stop ({:?})…",
+        t_teardown.elapsed()
+    );
     let confirm_join = tokio::task::spawn_blocking(move || {
         let _ = confirm_engine.join();
     });
-    match tokio::time::timeout(Duration::from_secs(20), confirm_join).await {
-        Ok(Ok(())) => info!("ibd: confirm engine stopped ({:?})", t_teardown.elapsed()),
-        Ok(Err(e)) => warn!("ibd: confirm join task: {e}"),
-        Err(_) => warn!(
-            "ibd: confirm engine still running after 20s — continuing teardown ({:?})",
-            t_teardown.elapsed()
-        ),
+    let mut confirm_join = confirm_join;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), &mut confirm_join).await {
+            Ok(Ok(())) => {
+                info!(
+                    "ibd: confirm engine stopped ({:?})",
+                    t_teardown.elapsed()
+                );
+                break;
+            }
+            Ok(Err(e)) => {
+                warn!("ibd: confirm join task: {e}");
+                break;
+            }
+            Err(_) => {
+                warn!(
+                    "ibd: still waiting for confirm engine ({:?})…",
+                    t_teardown.elapsed()
+                );
+            }
+        }
     }
 
     // Archive pipeline: short wait, then abort the tokio task (OS threads check stop).

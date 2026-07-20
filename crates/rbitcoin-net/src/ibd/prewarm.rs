@@ -1,9 +1,9 @@
 //! Background confirm-runway parent prewarm (tip+1 … tip+depth).
 //!
-//! Best-effort IO priority. Only UTXO-backed parents are loaded from store;
-//! same-runway creates store full outs and fill reserved holes (including
-//! create-before-reserve). Confirm waits until each batch is ready **and**
-//! the warmer is ~2 prewarm batches ahead (`RBITCOIN_PARENT_PREWARM_HEADROOM`).
+//! Best-effort IO priority. UTXO / durable parents load from store; runway
+//! creates map txid→fk (outs only for open reserves). Confirm hard-waits only
+//! for the batch to be scanned; headroom is soft so a slow warmer cannot
+//! freeze tip advance and starve peer downloads.
 
 use rbitcoin_log::{debug, info};
 use rbitcoin_query::{
@@ -56,11 +56,13 @@ pub(crate) fn spawn_parent_prewarm(
             let batch = prewarm_batch_from_env();
             let headroom = prewarm_headroom_from_env();
             info!(
-                "ibd: parent prewarm worker ON (depth≤{depth}, batch≤{batch}, headroom={headroom}; env RBITCOIN_PARENT_PREWARM_*)"
+                "ibd: parent prewarm worker ON (depth≤{depth}, batch≤{batch}, headroom={headroom} soft; env RBITCOIN_PARENT_PREWARM_*)"
             );
             let mut cursor: usize = 0;
             let mut last_tip = u32::MAX;
-            let mut last_info = std::time::Instant::now() - Duration::from_secs(30);
+            // Start "fresh" so we do not INFO-idle immediately at tip=0/runway=0.
+            let mut last_info = std::time::Instant::now();
+            let mut ever_worked = false;
             while !ctrl.stop.load(Ordering::Relaxed) {
                 let tip = ctrl.tip.load(Ordering::Relaxed);
                 if tip != last_tip {
@@ -70,12 +72,12 @@ pub(crate) fn spawn_parent_prewarm(
                 }
                 let runway = ctrl.runway.lock().unwrap().clone();
                 if runway.is_empty() || cursor >= runway.len() {
-                    // Idle: still emit a slow INFO so operators see ahead=0 vs caught up.
-                    if last_info.elapsed() >= Duration::from_secs(30) {
-                        let (through, ahead, parents, reserved, plans, depth) =
+                    // Idle INFO only after we have done real work (avoids tip=0 noise).
+                    if ever_worked && last_info.elapsed() >= Duration::from_secs(30) {
+                        let (through, ahead, parents, reserved, plans, d) =
                             query.parent_prewarm_perf_snapshot();
                         info!(
-                            "ibd: prewarm idle tip={tip} through={through} ahead={ahead} parents={parents} reserved={reserved} plans={plans}/{depth} runway={}",
+                            "ibd: prewarm idle tip={tip} through={through} ahead={ahead} parents={parents} reserved={reserved} plans={plans}/{d} runway={}",
                             runway.len()
                         );
                         last_info = std::time::Instant::now();
@@ -83,55 +85,49 @@ pub(crate) fn spawn_parent_prewarm(
                     std::thread::sleep(Duration::from_millis(40));
                     continue;
                 }
-                // Prefer advancing the contiguous ready watermark so confirm
-                // headroom is satisfied before re-scanning far-ahead already-ready
-                // heights. Cursor still walks the full runway.
                 let end = (cursor + batch as usize).min(runway.len());
                 let slice = &runway[cursor..end];
+                let h0 = slice.first().map(|x| x.0).unwrap_or(0);
+                let h1 = slice.last().map(|x| x.0).unwrap_or(0);
                 let t0 = std::time::Instant::now();
                 match query.prewarm_parents_for_heights(slice) {
                     Ok(st) => {
+                        ever_worked = true;
+                        cursor = end;
                         let through = query.parent_prewarm_ready_through();
                         let ahead = through.saturating_sub(tip);
-                        // Per-batch detail (debug only).
+                        let ms = t0.elapsed().as_millis();
                         if st.blocks > 0
                             || st.utxo_parents > 0
                             || st.reserved > 0
                             || st.creates_registered > 0
                         {
                             debug!(
-                                "ibd: prewarm h={}..{} blocks={} utxo_parents={} reserved={} creates={} skip={} through={} ahead={} {}ms",
-                                slice.first().map(|x| x.0).unwrap_or(0),
-                                slice.last().map(|x| x.0).unwrap_or(0),
+                                "ibd: prewarm h={h0}..{h1} blocks={} utxo_parents={} reserved={} creates={} skip={} through={through} ahead={ahead} {ms}ms",
                                 st.blocks,
                                 st.utxo_parents,
                                 st.reserved,
                                 st.creates_registered,
                                 st.already_ready,
-                                through,
-                                ahead,
-                                t0.elapsed().as_millis()
                             );
                         }
-                        // Periodic INFO progress (worker-local; complements 5s perf).
+                        // Periodic INFO: cursor is *after* this slice.
                         if last_info.elapsed() >= Duration::from_secs(10) {
-                            let (_, _, parents, reserved, plans, depth) =
+                            let (_, _, parents, reserved, plans, d) =
                                 query.parent_prewarm_perf_snapshot();
                             info!(
-                                "ibd: prewarm tip={tip} through={through} ahead={ahead} parents={parents} reserved={reserved} plans={plans}/{depth} cursor={}/{} last_h={}..{} blks={} {}ms",
-                                cursor,
+                                "ibd: prewarm tip={tip} through={through} ahead={ahead} parents={parents} reserved={reserved} plans={plans}/{d} cursor={cursor}/{} last_h={h0}..{h1} blks={} {ms}ms",
                                 runway.len(),
-                                slice.first().map(|x| x.0).unwrap_or(0),
-                                slice.last().map(|x| x.0).unwrap_or(0),
                                 st.blocks,
-                                t0.elapsed().as_millis()
                             );
                             last_info = std::time::Instant::now();
                         }
                     }
-                    Err(e) => debug!("ibd: prewarm error: {e}"),
+                    Err(e) => {
+                        cursor = end;
+                        debug!("ibd: prewarm error: {e}");
+                    }
                 }
-                cursor = end;
                 std::thread::sleep(Duration::from_millis(5));
             }
             info!("ibd: parent prewarm worker stopped");

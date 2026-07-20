@@ -7,10 +7,10 @@
 //! - **UTXO-backed** parents are loaded from store during prewarm.
 //! - **Not-in-UTXO** parents get a **reserved** hole (create is in a not-yet-
 //!   confirmed runway block); filled when that block's creates are registered.
-//! - **Runway creates** store **all** outputs when registered so a later spend
-//!   can fill even if the create height was prewarmed before any reserve
-//!   (create-before-reserve). Entries are kept until tip passes the create
-//!   height or the outs are retired.
+//! - **Runway creates** register `txid → fk` and fill any **existing** reserve
+//!   waiters from the body outs we already hold. We do **not** cache every
+//!   output of every runway create (that thrashed disk/RAM on mainnet). Later
+//!   spends resolve via `by_txid` + one store load, or same-wave at confirm.
 //! - A height is **ready** once its body has been **scanned**. Open
 //!   **reservations do not block readiness**: a multi-block confirm batch may
 //!   create a parent at height C and spend it at S in the same run; S reserves
@@ -354,12 +354,12 @@ impl ConfirmParentCache {
             .insert(height);
     }
 
-    /// Register creates from a runway body so later reserved spends can fill.
+    /// Register creates from a runway body.
     ///
-    /// **Stores every output** (not only currently-wanted vouts). That way a
-    /// create height prewarmed before any spend reserves still supplies outs
-    /// when those spends arrive later in the runway — the main gap left by
-    /// dropping generic Class A.
+    /// Always records `txid → fk` so a later spend prewarm can resolve the
+    /// create without UTXO. Only **currently reserved** outs are stored from
+    /// `outputs` (plus any prior entry); we deliberately do not cache every
+    /// create out on the runway (mainnet: full-out register blocked IO).
     pub fn register_runway_creates(
         &self,
         create_fk: Fk,
@@ -373,6 +373,12 @@ impl ConfirmParentCache {
         let mut g = self.inner.lock().unwrap();
         let txid = tx.txid;
         g.by_txid.insert(txid, id);
+        // Which outs already have waiters? (collect before mutating by_fk)
+        let fill_vouts: Vec<u32> = (0..outputs.len() as u32)
+            .filter(|v| g.reserve_waiters.contains_key(&(txid, *v)))
+            .collect();
+        // Thin entry: identity + create_height so GC can drop by_txid after tip
+        // advances (do not hold every create out — only fill open waiters).
         {
             let e = g.by_fk.entry(id).or_insert_with(|| ParentEntry {
                 tx: tx.clone(),
@@ -381,17 +387,18 @@ impl ConfirmParentCache {
             });
             e.tx = tx.clone();
             e.create_height = Some(create_height);
-            for (v, o) in outputs.iter().enumerate() {
-                e.outs.insert(
-                    v as u32,
-                    ParentOut {
-                        output: o.clone(),
-                    },
-                );
+            for v in &fill_vouts {
+                if let Some(o) = outputs.get(*v as usize) {
+                    e.outs.insert(
+                        *v,
+                        ParentOut {
+                            output: o.clone(),
+                        },
+                    );
+                }
             }
         }
-        // Fill any waiters for this create's outs.
-        for v in 0..outputs.len() as u32 {
+        for v in fill_vouts {
             let key = (txid, v);
             if let Some(waiters) = g.reserve_waiters.remove(&key) {
                 for h in waiters {
@@ -514,10 +521,9 @@ impl Inner {
             if still_waiting {
                 continue;
             }
-            // Keep full runway creates until tip passes create height so a
-            // later spend prewarm can still fill from cache (no Class A).
+            // Thin runway identities (by_txid) live until tip passes create height.
             if let Some(ch) = e.create_height {
-                if ch > tip && !e.outs.is_empty() {
+                if ch > tip {
                     continue;
                 }
             }
@@ -618,8 +624,9 @@ mod tests {
     }
 
     #[test]
-    fn create_before_reserve_keeps_full_outs() {
-        // Prewarm create height first (no waiters), then spend reserves later.
+    fn create_before_reserve_keeps_txid_map() {
+        // Create registered first (no waiters): only by_txid, no full outs.
+        // Spend prewarm resolves via get_by_txid + store load (or put).
         let c = ConfirmParentCache::new(64);
         c.advance_tip(0);
         c.ensure_plan(1, [1u8; 32]);
@@ -627,11 +634,13 @@ mod tests {
         c.register_runway_creates(Fk(50), &t, &[out(42), out(43)], 1);
         c.mark_scanned(1);
         assert!(c.is_ready(1));
-        // Outs must still be present for a later reserve.
-        assert_eq!(c.get_parent_out(Fk(50), 1).unwrap().1.value, 43);
+        assert_eq!(c.get_by_txid(&t.txid), Some(Fk(50)));
+        // No longer cache every create out when nothing reserved yet.
+        assert!(c.get_parent_out(Fk(50), 1).is_none());
 
         c.ensure_plan(2, [2u8; 32]);
-        c.reserve(2, t.txid, 1);
+        // Simulate prewarm spend path after by_txid hit + store load.
+        c.put_utxo_parent(2, Fk(50), t.clone(), 1, out(43));
         c.mark_scanned(2);
         assert!(c.is_ready(2));
         assert_eq!(c.get_parent_out(Fk(50), 1).unwrap().1.value, 43);
@@ -639,18 +648,18 @@ mod tests {
     }
 
     #[test]
-    fn create_before_reserve_survives_gc() {
+    fn create_before_reserve_txid_survives_gc() {
         let c = ConfirmParentCache::new(64);
         c.advance_tip(0);
         c.ensure_plan(1, [1u8; 32]);
         let t = tx(5);
         c.register_runway_creates(Fk(50), &t, &[out(42), out(43)], 1);
         c.mark_scanned(1);
-        // advance_tip to same tip triggers GC; create height still > tip.
         c.advance_tip(0);
-        assert!(c.get_parent_out(Fk(50), 0).is_some());
+        // by_txid must remain so later spend can resolve fk without UTXO.
+        assert_eq!(c.get_by_txid(&t.txid), Some(Fk(50)));
         c.ensure_plan(2, [2u8; 32]);
-        c.reserve(2, t.txid, 0);
+        c.put_utxo_parent(2, Fk(50), t, 0, out(42));
         c.mark_scanned(2);
         assert!(c.is_ready(2));
     }

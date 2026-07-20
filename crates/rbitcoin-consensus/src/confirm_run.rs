@@ -83,15 +83,13 @@ pub fn confirm_archived_run(
     // ── 1. resolve_bodies ───────────────────────────────────────────────────
     let metas = resolve_body_metas(query, blocks)?;
 
-    // ── 1b. wait for parent prewarm (scanned + headroom) ───────────────────
-    // Confirm waits until batch heights are *scanned* (open reserves OK — a
-    // batch may create a parent and spend it later in the same run) *and* the
-    // warmer holds headroom past batch_end (default 2 prewarm batches).
+    // ── 1b. wait for parent prewarm (batch scanned; headroom soft) ─────────
+    // Hard-wait only for this batch's heights to be scanned. Headroom is
+    // best-effort (short soft wait) so a slow warmer cannot freeze tip/peers.
     let heights: Vec<u32> = metas.iter().map(|m| m.height.0).collect();
     let items: Vec<(u32, [u8; 32])> = metas.iter().map(|m| (m.height.0, m.hash)).collect();
     let batch_end = heights.last().copied().unwrap_or(0);
     // Last-mile prewarm for *this* batch only if the background worker is behind.
-    // Headroom beyond batch_end is the worker's job (we lack those hashes here).
     let _ = query.prewarm_parents_for_heights(&items);
     query
         .wait_prewarm_ready_with_headroom(

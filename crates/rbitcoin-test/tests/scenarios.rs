@@ -1126,6 +1126,47 @@ fn spent_local_core_double_spend_and_disconnect() {
     );
 }
 
+/// Re-confirm path must not surface `ibd utxo duplicate create` (mainnet @519).
+/// Class C can succeed while UTXO apply is retried; inserts are idempotent and
+/// height-monotonic.
+#[test]
+fn ibd_utxo_reapply_same_height_is_idempotent() {
+    use rbitcoin_consensus::{
+        accept_and_connect_block, ChainParams, Milestone,
+    };
+    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.set_spend_index(false);
+    q.set_tx_index(false);
+    q.enable_ibd_utxo().unwrap();
+    let ms = Milestone::NONE;
+    let params = ChainParams::regtest();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+
+    // Simulate partial-apply retry: same creates at same tip height.
+    let cb = b1.txdata[0].compute_txid().to_byte_array();
+    q.apply_ibd_utxo_block(&[], &[(cb, 0)], 1)
+        .expect("re-apply tip height must be no-op / idempotent");
+    q.apply_ibd_utxo_block(&[], &[(cb, 0)], 1)
+        .expect("second re-apply still ok");
+
+    let b2 = mine_regtest_block(tip, tip_time + 600, 2, vec![]);
+    accept_and_connect_block(&q, &params, Height(2), &b2, ms)
+        .expect("next height after re-apply must confirm");
+    assert_eq!(q.tip_height(), Some(Height(2)));
+}
+
 /// Multi-block `confirm_archived_run` must insert UTXO creates (tx_fks live on
 /// Class C items after mem::take). Regression for mainnet tip=169 reject @170
 /// PrevoutSpent: empty creates left the first real spend as a false miss.

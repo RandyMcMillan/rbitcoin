@@ -452,19 +452,29 @@ pub fn confirm_archived_run(
         // Per-height apply: spends then creates. Critical for multi-block runs
         // where height H+1 spends a create from height H in the same batch.
         // Creates come from `items` (tx_fks after mem::take), not emptied prepared.
-        for (p, item) in prepared.iter().zip(items.iter()) {
-            let mut creates =
-                Vec::with_capacity(item.tx_fks.len().saturating_mul(2));
-            for &fk in &item.tx_fks {
-                let tx = query
-                    .get_tx_class_a(fk)
-                    .map_err(ConsensusError::Store)?;
-                for v in 0..tx.output_count {
-                    creates.push((tx.txid, v));
+        // Class C has already advanced tip — never surface UTXO apply as a confirm
+        // reject / blacklist (was `ibd utxo duplicate create` @519). Heal via rebuild.
+        let apply_res = (|| -> Result<(), ConsensusError> {
+            for (p, item) in prepared.iter().zip(items.iter()) {
+                let mut creates =
+                    Vec::with_capacity(item.tx_fks.len().saturating_mul(2));
+                for &fk in &item.tx_fks {
+                    let tx = query
+                        .get_tx_class_a(fk)
+                        .map_err(ConsensusError::Store)?;
+                    for v in 0..tx.output_count {
+                        creates.push((tx.txid, v));
+                    }
                 }
+                query
+                    .apply_ibd_utxo_block(&p.spends, &creates, item.height.0)
+                    .map_err(ConsensusError::Store)?;
             }
+            Ok(())
+        })();
+        if let Err(_e) = apply_res {
             query
-                .apply_ibd_utxo_block(&p.spends, &creates, item.height.0)
+                .rebuild_ibd_utxo_to_tip()
                 .map_err(ConsensusError::Store)?;
         }
     } else {
@@ -540,6 +550,26 @@ pub fn accept_and_connect_block(
     let fk = query
         .connect_block(height, &header_rec, &txs)
         .map_err(ConsensusError::Store)?;
+    // mmap UTXO only after Class C (same order as `confirm_archived_run`).
+    if query.ibd_utxo_enabled() {
+        let mut spends = Vec::new();
+        let mut creates = Vec::new();
+        for (ti, tx) in block.txdata.iter().enumerate() {
+            let tid = txids[ti];
+            if ti > 0 {
+                for inp in &tx.input {
+                    let op = inp.previous_output;
+                    spends.push((op.txid.to_byte_array(), op.vout));
+                }
+            }
+            for (v, _) in tx.output.iter().enumerate() {
+                creates.push((tid, v as u32));
+            }
+        }
+        query
+            .apply_ibd_utxo_block(&spends, &creates, height.0)
+            .map_err(ConsensusError::Store)?;
+    }
     Ok(fk)
 }
 

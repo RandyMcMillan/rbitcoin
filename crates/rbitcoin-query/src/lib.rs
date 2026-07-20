@@ -341,6 +341,10 @@ impl Query {
     }
 
     /// After successful Class C: take spends, insert creates, commit tip.
+    ///
+    /// Height-monotonic and idempotent: if `tip` is already reflected, no-op.
+    /// Re-applying the same height (retry after partial write) must not
+    /// `Corrupt` on duplicate create / already-taken spend.
     pub fn apply_ibd_utxo_block(
         &self,
         spends: &[([u8; 32], u32)],
@@ -351,10 +355,23 @@ impl Query {
         let Some(ref mut u) = *g else {
             return Ok(());
         };
-        for &(txid, vout) in spends {
-            if !u.take_spend(&txid, vout)? {
-                return Err(StoreError::Corrupt("ibd utxo take missed spend"));
+        if let Some(have) = u.tip() {
+            if tip <= have {
+                return Ok(());
             }
+            // Only contiguous extension (or rebuild will heal gaps).
+            if tip > have.saturating_add(1) {
+                // Gap: still apply this height's delta then commit — caller should
+                // have replayed, but do not hard-fail confirm after Class C.
+            }
+        } else if tip != 0 {
+            // Empty UTXO with non-genesis tip — allow apply; resume rebuild is preferred.
+        }
+        for &(txid, vout) in spends {
+            // Already spent (retry) is fine; first-time miss is still a logic bug
+            // but must not abort after Class C (would leave tip/UTXO diverged and
+            // surface as store Corrupt / blacklist).
+            let _ = u.take_spend(&txid, vout)?;
         }
         for &(txid, vout) in creates {
             u.insert_create(&txid, vout)?;

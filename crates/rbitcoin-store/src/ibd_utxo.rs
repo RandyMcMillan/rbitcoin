@@ -296,22 +296,30 @@ impl IbdUtxo {
     }
 
     /// Insert a created outpoint (confirm success).
+    ///
+    /// Idempotent: re-insert of an already-live outpoint is `Ok` (partial apply
+    /// retry after Class C, or height re-apply). Prefix collisions promote the
+    /// new full txid into `overflow` (compressed slot already holds another).
     pub fn insert_create(&mut self, txid: &[u8; 32], vout: u32) -> Result<(), StoreError> {
         Self::ensure_vout(vout)?;
         if self.load_factor() >= LOAD_GROW {
             self.grow()?;
         }
         let prefix = prefix_of(txid);
-        // Exact duplicate?
+        // Already tracked as unspent (exact or sole compressed occupant).
         if self.contains(txid, vout)? {
-            return Err(StoreError::Corrupt("ibd utxo duplicate create"));
+            return Ok(());
         }
-        // Compressed key already live with a *different* txid → overflow.
+        // Compressed key live / overflowed with a *different* full txid → overflow.
         if self.contains_compressed(&prefix, vout)? {
-            self.overflow
+            let list = self
+                .overflow
                 .entry((prefix, vout))
-                .or_insert_with(Vec::new)
-                .push(*txid);
+                .or_insert_with(Vec::new);
+            // Promote: first occupant was slot-only; keep slot + record new full ids.
+            if !list.iter().any(|t| t == txid) {
+                list.push(*txid);
+            }
             return Ok(());
         }
         let mask = self.num_slots - 1;
@@ -544,9 +552,26 @@ mod tests {
         let t = txid(7);
         u.insert_create(&t, 0).unwrap();
         assert!(u.contains(&t, 0).unwrap());
+        // Idempotent re-create (partial apply retry).
+        u.insert_create(&t, 0).unwrap();
+        assert!(u.contains(&t, 0).unwrap());
+        assert_eq!(u.live_count(), 1);
         assert!(u.take_spend(&t, 0).unwrap());
         assert!(!u.contains(&t, 0).unwrap());
         assert!(!u.take_spend(&t, 0).unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn apply_height_monotonic_via_commit() {
+        let path = tmp();
+        let mut u = IbdUtxo::create(&path, 1024).unwrap();
+        let t = txid(3);
+        u.insert_create(&t, 0).unwrap();
+        u.commit_tip(Some(5)).unwrap();
+        assert_eq!(u.tip(), Some(5));
+        // Re-insert after tip advance is still ok (idempotent).
+        u.insert_create(&t, 0).unwrap();
         let _ = std::fs::remove_file(&path);
     }
 

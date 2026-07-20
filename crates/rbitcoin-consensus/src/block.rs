@@ -292,22 +292,20 @@ pub fn validate_block_connect(
     if check_scripts && !script_jobs.is_empty() {
         verify_scripts_pool(&script_jobs)?;
     }
-    // Update catch-up oracle after single-block connect success.
-    if query.ibd_utxo_enabled() {
-        let mut creates = Vec::new();
-        for tx in &block.txdata {
-            let tid = tx.compute_txid().to_byte_array();
-            for (v, _) in tx.output.iter().enumerate() {
-                creates.push((tid, v as u32));
-            }
-        }
-        let tip_h = ctx.height.0;
-        query
-            .apply_ibd_utxo_block(&spends, &creates, tip_h)
-            .map_err(ConsensusError::Store)?;
-    } else {
+    // Catch-up spentness is applied only after Class C succeeds.
+    // Applying UTXO here (before `connect_block` / `confirm_blocks_run`) left the
+    // oracle ahead of tip when Class C failed, and the retry hit
+    // `ibd utxo duplicate create` (mainnet log @519).
+    //
+    // Single-block `accept_and_connect_block` applies after Class C below.
+    // Multi-block `confirm_archived_run` applies after its Class C batch.
+    // Hold spends for the caller when UTXO is off — still note local only after
+    // Class C in those paths. For this connect-only entry, note local spends
+    // only when UTXO is disabled (legacy single-step tests that never Class C).
+    if !query.ibd_utxo_enabled() {
         query.note_outpoints_spent_local(&spends);
     }
+    let _ = spends;
     Ok(())
 }
 

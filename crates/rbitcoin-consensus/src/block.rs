@@ -642,12 +642,17 @@ pub fn verify_scripts_pool(jobs: &[ScriptCheckJob]) -> Result<(), ConsensusError
 
 /// Parallel script/sig checks across jobs (possibly from multiple blocks).
 ///
-/// Uses the **rayon global pool** when `jobs.len() >= 3`. One job = one
-/// non-coinbase tx (shared [`bitcoin::sighash::SighashCache`] across inputs).
+/// Uses the **rayon global pool** for multi-tx waves. One job = one non-coinbase
+/// tx (shared [`bitcoin::sighash::SighashCache`] across its inputs).
 ///
-/// **When parallel pays:** `rayon_audit` (4 cores, real P2TR/P2WPKH): n=1–2
-/// sequential; n≥4 ≈1.7–3× wall speedup (~50–75% of ideal). Wire rebuild does
-/// **not** use rayon (sequential reconstruct is faster — see confirm_run).
+/// **Why rayon (not a custom tokio queue):** script verify is CPU-bound and
+/// runs on the confirm OS thread outside the async runtime; rayon’s work-stealing
+/// pool is built for that. A tokio blocking queue would add channel/join overhead
+/// without better load balance for ~30–50 µs crypto jobs. Wire rebuild stays
+/// sequential (see `confirm_run` + `rayon_audit`).
+///
+/// Single-job waves skip the pool. IBD always has many scripts per batch, so
+/// multi-job is the hot path.
 pub fn verify_scripts_pool_jobs(jobs: &[&ScriptCheckJob]) -> Result<(), ConsensusError> {
     verify_script_job_refs(jobs)
 }
@@ -662,15 +667,12 @@ fn job_needs_script_check(job: &ScriptCheckJob) -> bool {
 fn verify_script_jobs(jobs: &[ScriptCheckJob]) -> Result<(), ConsensusError> {
     match jobs.len() {
         0 => Ok(()),
-        // `rayon_audit`: n=2 is *slower* than sequential on 4 cores (~0.8×);
-        // rayon wins from n≥4 (≈1.7–2.5×). Keep small waves sequential.
-        1 | 2 => {
-            for job in jobs {
-                if job_needs_script_check(job) {
-                    verify_job_all_inputs(job)?;
-                }
+        1 => {
+            if job_needs_script_check(&jobs[0]) {
+                verify_job_all_inputs(&jobs[0])
+            } else {
+                Ok(())
             }
-            Ok(())
         }
         _ => {
             use rayon::prelude::*;
@@ -690,13 +692,12 @@ fn verify_script_jobs(jobs: &[ScriptCheckJob]) -> Result<(), ConsensusError> {
 fn verify_script_job_refs(jobs: &[&ScriptCheckJob]) -> Result<(), ConsensusError> {
     match jobs.len() {
         0 => Ok(()),
-        1 | 2 => {
-            for job in jobs {
-                if job_needs_script_check(job) {
-                    verify_job_all_inputs(job)?;
-                }
+        1 => {
+            if job_needs_script_check(jobs[0]) {
+                verify_job_all_inputs(jobs[0])
+            } else {
+                Ok(())
             }
-            Ok(())
         }
         _ => {
             use rayon::prelude::*;

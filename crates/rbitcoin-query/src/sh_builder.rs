@@ -14,7 +14,7 @@ use rbitcoin_store::{
     next_run_path, read_run_body, write_sorted_run, ScriptHashRecord, Store, StoreError,
     SortedRunPath,
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -166,15 +166,6 @@ impl ShRunBuilder {
         }
     }
 
-    #[allow(dead_code)] // diagnostics / future perf_log
-    pub fn pending_len(&self) -> usize {
-        self.inner.lock().unwrap().pending.len()
-    }
-
-    fn runs_dir(&self) -> PathBuf {
-        self.inner.lock().unwrap().ctrl.runs_dir.clone()
-    }
-
     /// Stop enqueues, flush + compact remaining, materialize into store, join worker.
     pub fn finalize_and_materialize(&self, store: &Store) -> Result<u64, StoreError> {
         finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
@@ -191,23 +182,9 @@ impl ShRunBuilder {
         } else {
             info!("node: scripthash run materialize: no runs");
         }
-        clear_runs_dir(&self.runs_dir());
+        let runs_dir = self.inner.lock().unwrap().ctrl.runs_dir.clone();
+        clear_runs_dir(&runs_dir);
         Ok(inserted)
-    }
-
-    /// Disable without materialize (tests / abort).
-    #[allow(dead_code)]
-    pub fn shutdown(&self) {
-        self.enabled.store(false, Ordering::SeqCst);
-        {
-            let mut g = self.inner.lock().unwrap();
-            g.ctrl.stop = true;
-            g.pending.clear();
-            self.cv.notify_all();
-        }
-        if let Some(h) = self.join.lock().unwrap().take() {
-            let _ = h.join();
-        }
     }
 }
 

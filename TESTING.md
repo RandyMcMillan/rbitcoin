@@ -9,6 +9,23 @@
 
 Shared helpers live in the `rbitcoin-test` crate (`mine`, `chain_fixture`).
 
+## Diagnostic examples (ad-hoc, not CI)
+
+One-off script/script-failure probes live as **crate examples** (run with
+`cargo run -p CRATE --example NAME -- …`). Prefer these over pasting ad-hoc
+main files into the tree.
+
+| Example | Crate | Purpose |
+|---------|-------|---------|
+| `diag_tip182692` | `rbitcoin-test` | Signet tip stall / PrevoutSpent on a store path |
+| `diag_block_script` | `rbitcoin-consensus` | Which script fails in a wire block (signet API prevouts) |
+| `diag_mainnet_block` | `rbitcoin-consensus` | Mainnet block script probes (blockstream API) |
+| `diag_fail` / `diag_fail_tx` / `diag_sh` | `rbitcoin-consensus` | Historical script failure forensics |
+| `dump_wit` | `rbitcoin-consensus` | Dump witness stack from a local block bin |
+
+IBD progress/rejects belong in node logs (`ibd: confirm reject`, `ibd: archive reject`);
+do not re-home those into examples.
+
 ## Running tests
 
 ```bash

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Notify};
-use rbitcoin_log::{error, info, warn};
+use rbitcoin_log::{info, warn};
 
 /// Running node state (store open; optional P2P).
 pub struct NodeHandle {
@@ -247,8 +247,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         // Prefer a wide seed sample (IPv4-first) for parallel dial / redial.
         addrman.take_outbound(candidate_n)
     };
-    // True once parallel (or sequential fallback) catch-up finished without cancel.
-    // Steady-state tip follow must **not** keep opening sequential re-IBD sessions.
+    // True only after parallel IBD reports true catch-up (or no peers to dial).
+    // Never set from a partial sequential download (mid-chain tip-mode bug class).
     let mut catch_up_complete = ibd_targets.is_empty();
     if !ibd_targets.is_empty() && !shutdown.requested() {
         let target_peers = max_out.clamp(8, 32);
@@ -297,35 +297,14 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             Err(e) => {
                 if shutdown.requested() {
                     warn!("signal: parallel IBD cancelled ({e})");
-                } else if e.to_string().contains("mid catch-up") {
-                    // Network blip / all peers dead while tip << peer height.
-                    // Do **not** enter tip mode or thrash sequential fallback.
+                } else {
+                    // No sequential fallback: a partial `sync_from_peers` success used
+                    // to set catch_up_complete and enter tip mode mid-chain. Parallel
+                    // IBD is the only path that may claim complete; restart resumes.
                     warn!(
-                        "ibd: parallel incomplete: {e}; tip={:?} — keeping catch-up indexes (no tip mode)",
+                        "ibd: parallel incomplete: {e}; tip={:?} — keeping catch-up indexes (no tip mode; restart to resume)",
                         node.tip_height()
                     );
-                } else {
-                    warn!("ibd: parallel catch-up warning: {e}; falling back sequential");
-                    if !shutdown.requested() {
-                        tokio::select! {
-                            biased;
-                            _ = shutdown.cancelled() => {
-                                warn!("signal: interrupting sequential fallback…");
-                            }
-                            result = node.sync_from_peers(&ibd_targets) => {
-                                match result {
-                                    Ok(n) => {
-                                        info!(
-                                            "ibd: sequential fallback downloaded≈{n} tip={:?}",
-                                            node.tip_height()
-                                        );
-                                        catch_up_complete = true;
-                                    }
-                                    Err(e2) => error!("ibd: sequential also failed: {e2}"),
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }

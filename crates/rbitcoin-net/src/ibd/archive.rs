@@ -206,7 +206,6 @@ struct PreparedArchive {
 
 pub(crate) enum ArchiveResult {
     Ok {
-        #[allow(dead_code)]
         hash: BlockHash,
         wire_bytes: usize,
     },

@@ -43,13 +43,12 @@ impl ConfirmFeed {
 }
 
 pub(crate) enum ConfirmEvent {
+    /// Tip advanced; hash is the confirmed block.
     Accepted {
-        #[allow(dead_code)]
-        height: u32,
         hash: BlockHash,
     },
+    /// Height is the attempted confirm height (for operator logs).
     Reject {
-        #[allow(dead_code)]
         height: u32,
         hash: BlockHash,
         err: String,
@@ -211,7 +210,7 @@ pub(crate) fn spawn_confirm_engine(
                             loop_stats.confirm_blocks.fetch_add(1, Ordering::Relaxed);
                             accepted.fetch_add(1, Ordering::SeqCst);
                             if event_tx
-                                .send(ConfirmEvent::Accepted { height, hash })
+                                .send(ConfirmEvent::Accepted { hash })
                                 .is_err()
                             {
                                 return;

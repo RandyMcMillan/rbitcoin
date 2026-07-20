@@ -504,13 +504,13 @@ pub async fn parallel_ibd_cancellable(
         // dominate drain budget (and free ordered front for the next offer).
         while let Ok(ev) = confirm_ev_rx.try_recv() {
             match ev {
-                ConfirmEvent::Accepted { hash, .. } => {
+                ConfirmEvent::Accepted { hash } => {
                     last_progress = Instant::now();
                     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
                     st.body.mark_archived(hash);
                 }
-                ConfirmEvent::Reject { hash, err, .. } => {
-                    apply_confirm_reject(&mut st, hash, &err);
+                ConfirmEvent::Reject { height, hash, err } => {
+                    apply_confirm_reject(&mut st, height, hash, &err);
                 }
             }
         }
@@ -579,13 +579,13 @@ pub async fn parallel_ibd_cancellable(
         // Apply confirm results without doing Class C on this task.
         while let Ok(ev) = confirm_ev_rx.try_recv() {
             match ev {
-                ConfirmEvent::Accepted { hash, .. } => {
+                ConfirmEvent::Accepted { hash } => {
                     last_progress = Instant::now();
                     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
                     st.body.mark_archived(hash);
                 }
-                ConfirmEvent::Reject { hash, err, .. } => {
-                    apply_confirm_reject(&mut st, hash, &err);
+                ConfirmEvent::Reject { height, hash, err } => {
+                    apply_confirm_reject(&mut st, height, hash, &err);
                 }
             }
         }
@@ -1023,13 +1023,13 @@ pub async fn parallel_ibd_cancellable(
                 update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_archived_height);
                         while let Ok(ev) = confirm_ev_rx.try_recv() {
                     match ev {
-                        ConfirmEvent::Accepted { hash, .. } => {
+                        ConfirmEvent::Accepted { hash } => {
                             last_progress = Instant::now();
                             remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
                             st.body.mark_archived(hash);
                         }
-                        ConfirmEvent::Reject { hash, err, .. } => {
-                            apply_confirm_reject(&mut st, hash, &err);
+                        ConfirmEvent::Reject { height, hash, err } => {
+                            apply_confirm_reject(&mut st, height, hash, &err);
                         }
                     }
                 }
@@ -1507,7 +1507,7 @@ fn update_confirm_lag(lag: &AtomicU32, tip: Option<u32>, max_archived: u32) {
     lag.store(max_archived.saturating_sub(t), Ordering::Relaxed);
 }
 
-fn apply_confirm_reject(st: &mut IbdWorkState, hash: BlockHash, err: &str) {
+fn apply_confirm_reject(st: &mut IbdWorkState, height: u32, hash: BlockHash, err: &str) {
     st.body.mark_rejected(hash);
     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
@@ -1515,7 +1515,9 @@ fn apply_confirm_reject(st: &mut IbdWorkState, hash: BlockHash, err: &str) {
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 8 || n % 50 == 0 {
-        warn!("ibd: confirm reject applied {hash}: {err} (blacklisted, count={n})");
+        warn!(
+            "ibd: confirm reject applied {hash} @{height}: {err} (blacklisted, count={n})"
+        );
     }
 }
 

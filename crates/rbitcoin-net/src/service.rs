@@ -153,7 +153,10 @@ impl P2PNode {
         }
     }
 
-    /// Sequential try-list (legacy). Prefer [`Self::parallel_sync`] for IBD.
+    /// Sequential try-list (tests / tip-follow helpers).
+    ///
+    /// **Not** used as IBD fallback: partial progress must not be treated as
+    /// catch-up complete. Production IBD uses [`Self::parallel_sync_cancellable`].
     pub async fn sync_from_peers(&self, peers: &[SocketAddr]) -> Result<u32, NetError> {
         if peers.is_empty() {
             return Err(NetError::Protocol("no peers to sync from"));

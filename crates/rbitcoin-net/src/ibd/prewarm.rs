@@ -97,12 +97,13 @@ pub(crate) fn spawn_parent_prewarm(
                         let through = query.parent_prewarm_ready_through();
                         let ahead = through.saturating_sub(tip);
                         let ms = t0.elapsed().as_millis();
+                        // Per-slice detail only at trace (debug was multi-Hz spam).
                         if st.blocks > 0
                             || st.utxo_parents > 0
                             || st.reserved > 0
                             || st.creates_registered > 0
                         {
-                            debug!(
+                            rbitcoin_log::trace!(
                                 "ibd: prewarm h={h0}..{h1} blocks={} utxo_parents={} reserved={} creates={} skip={} through={through} ahead={ahead} {ms}ms",
                                 st.blocks,
                                 st.utxo_parents,

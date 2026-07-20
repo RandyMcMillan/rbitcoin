@@ -159,14 +159,7 @@ pub(crate) fn request_headers_from(
         return Ok(false);
     };
     let locator = ibd_header_locator(hub, work_tips)?;
-    if s.cmd_tx.send(PeerCmd::GetHeaders { locator }).is_err() {
-        return Ok(false);
-    }
-    rbitcoin_log::debug!(
-        "ibd: getheaders → peer[{peer}] {addr}",
-        addr = s.addr
-    );
-    Ok(true)
+    Ok(s.cmd_tx.send(PeerCmd::GetHeaders { locator }).is_ok())
 }
 
 /// Locator for IBD getheaders: prefer the **work-path tip** (highest ordered /

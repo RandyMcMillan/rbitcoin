@@ -53,6 +53,17 @@ impl TableFile {
     }
 
     pub fn open(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
+        Self::open_with_schema(path, kind, SCHEMA_VERSION)
+    }
+
+    /// Open a table file requiring an exact schema version in the RBT1 header.
+    ///
+    /// Used by migration to read v3 tables while the binary defaults to v4.
+    pub fn open_with_schema(
+        path: impl Into<PathBuf>,
+        kind: TableKind,
+        expected_schema: u16,
+    ) -> Result<Self, StoreError> {
         let path = path.into();
         let mut file = OpenOptions::new()
             .read(true)
@@ -67,7 +78,7 @@ impl TableFile {
             return Err(StoreError::BadMagic);
         }
         let ver = u16::from_le_bytes([header[4], header[5]]);
-        if ver != SCHEMA_VERSION {
+        if ver != expected_schema {
             return Err(StoreError::BadSchema(ver));
         }
         let got = u16::from_le_bytes([header[6], header[7]]);
@@ -98,6 +109,29 @@ impl TableFile {
             map: Mutex::new(map),
             len: Mutex::new(logical),
         })
+    }
+
+    /// Rewrite RBT1 schema version bytes (4..6) without changing table layout.
+    pub fn stamp_schema_on_path(path: impl AsRef<std::path::Path>, schema: u16) -> Result<(), StoreError> {
+        let path = path.as_ref();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| StoreError::io(path, e))?;
+        let mut header = [0u8; FILE_HEADER_LEN];
+        file.read_exact(&mut header)
+            .map_err(|e| StoreError::io(path, e))?;
+        if header[0..4] != STORE_MAGIC {
+            return Err(StoreError::BadMagic);
+        }
+        header[4..6].copy_from_slice(&schema.to_le_bytes());
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| StoreError::io(path, e))?;
+        file.write_all(&header)
+            .map_err(|e| StoreError::io(path, e))?;
+        file.flush().map_err(|e| StoreError::io(path, e))?;
+        Ok(())
     }
 
     pub fn logical_len(&self) -> u64 {

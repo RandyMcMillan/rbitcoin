@@ -67,6 +67,8 @@ impl Store {
         if !path.is_dir() {
             return Err(StoreError::NotDirectory(path));
         }
+        // v3→v4: hybrid scripthash migrate + stamp all RBT1 headers / meta.
+        crate::scripthash_migrate::ensure_scripthash_hybrid(&path)?;
         check_meta(&path)?;
         let epoch = ArchiveEpoch::load(&path)?;
         // Scripthash table is new in Phase 6 — create if missing (upgrade path).

@@ -1,18 +1,17 @@
-# On-disk schema (v3)
+# On-disk schema (v4)
 
 Versioned layouts for the chain store. **Format is unstable until 1.0.** Magic bytes and a schema version live in each file header.
 
-**Schema v3** (current): builds on v2 density (length-from-idx, per-tx I/O runs, header ranges, compact flags) and adds:
+**Schema v4** (current): hybrid scripthash (2-inline head or geometric body slab + size-class freelist). One-time migrate from v3 linked-list SH; other tables stamp schema only. Builds on v3:
 
 - **Class A inputs always external** `prev_txid[32]` + vout (no on-disk `prev_tx_fk` / local-prev mix)
 - **Thin point** body (spend edge only; outpoint is head key via SHA256)
-- **Thin scripthash** body (create_tx_fk + vout + next only; spentness via points + Class C)
 - **strong_tx bitset** (1 bit per tx_fk vs u64)
 - **Hash heads** rehash at ~7/8 load (was 1/2)
 
 Catch-up also uses process-local **light UTXO** (`ibd_utxo.map`, magic `RBUXTO03`) — not part of the `RBT1` table set; rebuilt from confirmed chain if missing/corrupt.
 
-Reindex-only from earlier versions. Legacy input flag `LOCAL_PREV` (old local `prev_tx_fk`) is **rejected** on decode.
+Legacy input flag `LOCAL_PREV` (old local `prev_tx_fk`) is **rejected** on decode.
 
 Endianness: **little-endian** for all multi-byte integers.
 
@@ -141,17 +140,22 @@ Head key = SHA256(out_txid \|\| vout_le). Outpoint filled from query args when w
 
 `header_txs_first[header_fk-1]` + `header_txs_count[header_fk-1]`. Contiguous assignment required.
 
-### Scripthash entry (fixed 20 bytes — thin outpoint pointer)
+### Scripthash (hybrid thin creates — schema v4)
 
 Head key = `SHA256(scriptPubKey)`. Body does **not** store the scripthash.
 
-| Field | Type |
-|-------|------|
-| create_tx_fk | u64 (`0` = tombstone / unlinked) |
-| vout | u32 |
-| next | u64 |
+**Create entry** = 12 B: `create_tx_fk:u64 | vout:u32` (no `next`).
 
-Heights, spend state, txid, and value are **joined** at query time from Class A / points / Class C (`tx_height`, `is_confirmed_strong`, `has_confirmed_strong_spender`). Older 68-byte layouts require reindex.
+**Head slot** = 64 B: `key[32] + value[32]`.
+
+| Head mode | When | Value payload |
+|-----------|------|----------------|
+| Inline | 1–2 creates | tag + used + up to two 12 B entries |
+| Slab | ≥3 creates | tag + size class + used + file-absolute slab offset |
+
+**Body** = RBT1 header + 4 KiB alloc page (`SHAL` magic, live_count, bump, per-class freelist heads) + geometric slabs (cap 4, 8, 16, …). Free slabs embed freelist next in the first 8 bytes. On overflow, promote to next class, copy, free old slab.
+
+**Upgrade:** v3 linked list (20 B rows with `next`) migrates once via `migrate_scripthash` / `Store::open` (`scripthash.head` + `.body` only; `scripthash.runs` untouched). Heights, spend state, txid, and value are still **joined** at query time from Class A / points / Class C.
 
 ### Archive epoch (`archive_epoch`, 32 bytes)
 

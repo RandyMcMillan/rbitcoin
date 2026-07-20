@@ -17,10 +17,12 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 
 /// Current on-disk schema version (see workspace `SCHEMA.md`).
 ///
-/// v3: thin point/scripthash; strong_tx bitset; denser hash heads; Class A inputs
-/// always external `prev_txid` (no local `prev_tx_fk`). Builds on v2 (runs,
-/// length-from-idx, header ranges). Reindex-only.
-pub const SCHEMA_VERSION: u16 = 3;
+/// v4: hybrid scripthash (2-inline head or geometric body slab + size-class freelist).
+/// One-time migrate from v3 linked-list SH; other tables stamp schema only.
+///
+/// v3: thin point/scripthash linked lists; strong_tx bitset; denser hash heads;
+/// Class A inputs always external `prev_txid`.
+pub const SCHEMA_VERSION: u16 = 4;
 
 /// 1-based foreign key into a store table body. Zero means null / absent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

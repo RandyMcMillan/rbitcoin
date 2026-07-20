@@ -222,7 +222,8 @@ impl ShRunBuilder {
 fn materialize_run(store: &Store, run: &SortedRunPath) -> Result<u64, StoreError> {
     let body = read_run_body(run)?;
     let rec_len = run.rec_len as usize;
-    let mut heads: std::collections::HashMap<[u8; 32], Fk> = std::collections::HashMap::new();
+    let mut heads: std::collections::HashMap<[u8; 32], rbitcoin_store::ShHeadValue> =
+        std::collections::HashMap::new();
     let mut batch: Vec<ScriptHashRecord> = Vec::with_capacity(8192);
     let mut inserted = 0u64;
     let mut offset = 0usize;
@@ -242,18 +243,18 @@ fn materialize_run(store: &Store, run: &SortedRunPath) -> Result<u64, StoreError
             create_height: 0,
         });
         if batch.len() >= 8192 {
-            let (fks, _) = store
+            let (n, _) = store
                 .scripthash
                 .put_create_batch_append(&batch, &mut heads)?;
-            inserted += fks.iter().filter(|f| !f.is_null()).count() as u64;
+            inserted += n as u64;
             batch.clear();
         }
     }
     if !batch.is_empty() {
-        let (fks, _) = store
+        let (n, _) = store
             .scripthash
             .put_create_batch_append(&batch, &mut heads)?;
-        inserted += fks.iter().filter(|f| !f.is_null()).count() as u64;
+        inserted += n as u64;
     }
     Ok(inserted)
 }

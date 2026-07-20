@@ -301,7 +301,7 @@ pub struct Query {
     /// Parent resolve during catch-up uses light UTXO create_fk (not a txid map).
     tx_index: std::sync::atomic::AtomicBool,
     /// Process-local scripthash → body head fk (confirm append path; avoids durable chain walks).
-    sh_heads: Mutex<HashMap<[u8; 32], Fk>>,
+    sh_heads: Mutex<HashMap<[u8; 32], rbitcoin_store::ShHeadValue>>,
     /// Last height whose SH creates were enqueued/written **after tip commit**.
     /// `u64::MAX` = none. Replaces unbounded `sh_tx_indexed` HashSet.
     sh_indexed_through: AtomicU64,

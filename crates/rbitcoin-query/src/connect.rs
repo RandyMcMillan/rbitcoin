@@ -197,7 +197,7 @@ impl Query {
                         self.sh_run.enqueue(&sh_creates);
                     } else {
                         let mut heads = self.sh_heads.lock().unwrap();
-                        let (_fks, timing) = self
+                        let (_n, timing) = self
                             .store
                             .scripthash
                             .put_create_batch_append(&sh_creates, &mut heads)?;
@@ -471,15 +471,17 @@ impl Query {
             self.store.strong_tx.set_unstrong(tx_fk)?;
             self.store.tx_height.clear(tx_fk)?;
         }
-        // Refresh process heads for unlinked scripts (may now be NULL / older fk).
+        // Refresh process heads for unlinked scripts.
         if !touched_sh.is_empty() {
             let mut heads = self.sh_heads.lock().unwrap();
             for sh in touched_sh {
-                let live = self.store.scripthash.live_head(&sh).unwrap_or(Fk::NULL);
-                if live.is_null() {
-                    heads.remove(&sh);
-                } else {
-                    heads.insert(sh, live);
+                match self.store.scripthash.head_value(&sh) {
+                    Ok(Some(v)) if !v.is_empty() => {
+                        heads.insert(sh, v);
+                    }
+                    _ => {
+                        heads.remove(&sh);
+                    }
                 }
             }
         }

@@ -3,7 +3,7 @@
 mod archive;
 mod catchup;
 mod chain_view;
-mod class_a_cache;
+mod confirm_parent_cache;
 mod connect;
 mod parent_prewarm;
 mod reconstruct;
@@ -17,7 +17,6 @@ mod wave_prevout;
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};
-use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use bitcoin::transaction::Version as TxVersion;
 use bitcoin::{
@@ -37,11 +36,22 @@ use std::sync::Mutex;
 pub type QueryError = StoreError;
 
 pub use catchup::IndexMode;
-pub use class_a_cache::stats as class_a_cache_stats;
+pub use confirm_parent_cache::{
+    prewarm_batch_from_env, prewarm_depth_from_env, prewarm_headroom_from_env,
+    DEFAULT_PREWARM_BATCH as PREWARM_BATCH, DEFAULT_PREWARM_DEPTH as PREWARM_DEPTH,
+    DEFAULT_PREWARM_HEADROOM as PREWARM_HEADROOM, MAX_PREWARM_DEPTH, MIN_PREWARM_DEPTH,
+};
 pub use connect::ConfirmPrepared;
-pub use parent_prewarm::{PrewarmStats, PREWARM_BATCH, PREWARM_DEPTH};
+pub use parent_prewarm::PrewarmStats;
 pub use tip_prevout_cache::stats as tip_prevout_cache_stats;
 pub use wave_prevout::WavePrevoutCache;
+
+/// Stub stats for IBD perf_log (Class A cache removed).
+pub mod class_a_cache_stats {
+    pub fn sample_and_reset() -> (u64, u64, u64) {
+        (0, 0, 0)
+    }
+}
 
 /// Class C sub-phase wall times (nanoseconds; reset by the IBD sampler).
 ///
@@ -222,8 +232,8 @@ pub struct Query {
     /// Last height whose SH creates were enqueued/written **after tip commit**.
     /// `u64::MAX` = none. Replaces unbounded `sh_tx_indexed` HashSet.
     sh_indexed_through: AtomicU64,
-    /// Byte-capped Class A working set (tx + runs) for confirm connect / reconstruct.
-    class_a_cache: class_a_cache::ClassACache,
+    /// Block-structured confirm parent runway (UTXO-backed + reserved holes).
+    confirm_parents: confirm_parent_cache::ConfirmParentCache,
     /// Tip-window create txs + outputs filled **as we confirm** (and when
     /// resolving parents during connect). FIFO; independent of archive lead.
     tip_prevout_cache: tip_prevout_cache::TipPrevoutCache,
@@ -261,7 +271,7 @@ impl Query {
             tx_index: std::sync::atomic::AtomicBool::new(true),
             sh_heads: Mutex::new(HashMap::new()),
             sh_indexed_through: AtomicU64::new(sh_through),
-            class_a_cache: class_a_cache::ClassACache::from_env(),
+            confirm_parents: confirm_parent_cache::ConfirmParentCache::from_env(),
             tip_prevout_cache: tip_prevout_cache::TipPrevoutCache::from_env(),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
             tx_run: tx_run_builder::TxRunBuilder::new(&store_path),
@@ -331,12 +341,17 @@ impl Query {
     }
 
     /// Class A working-set cache size `(entries, approx_bytes, budget_bytes)`.
+    /// `(parent_entries, reserved_holes, depth)` — replaces old Class A usage triple.
     pub fn class_a_cache_usage(&self) -> (usize, usize, usize) {
         (
-            self.class_a_cache.len(),
-            self.class_a_cache.approx_bytes(),
-            self.class_a_cache.budget_bytes(),
+            self.confirm_parents.parent_count(),
+            self.confirm_parents.reserved_count(),
+            self.confirm_parents.depth() as usize,
         )
+    }
+
+    pub fn confirm_parent_cache(&self) -> &confirm_parent_cache::ConfirmParentCache {
+        &self.confirm_parents
     }
 
     pub fn tip_prevout_cache_usage(&self) -> (usize, usize, usize) {
@@ -379,33 +394,6 @@ impl Query {
     /// True if outpoint is cached as live unspent in tip_prevout by create fk.
     pub fn tip_prevout_has_live_fk(&self, fk: Fk, vout: u32) -> bool {
         self.tip_prevout_cache.has_live_output(fk, vout)
-    }
-
-    /// (D) When archive leads tip by more than this many bodies, skip bulk Class A
-    /// cache fill on archive. Confirm-wave **prefetch** (A) warms tip+1…N instead.
-    /// Tip-follow (small lead) fills from archive so tip+1 is warm at write time.
-    ///
-    /// Override with `RBITCOIN_CLASS_A_ARCHIVE_LEAD` (block count).
-    pub(crate) fn class_a_archive_fill_max_lead(&self) -> u64 {
-        std::env::var("RBITCOIN_CLASS_A_ARCHIVE_LEAD")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(512)
-    }
-
-    /// True when archive is near the confirmed tip (or tip not established).
-    pub(crate) fn should_fill_class_a_from_archive(&self) -> bool {
-        let max_lead = self.class_a_archive_fill_max_lead();
-        let tip = match self.tip_height() {
-            Some(h) => h.0 as u64,
-            // Pre-genesis confirm: archive may already race ahead — don't flood.
-            None => return false,
-        };
-        let bodies = self.store.archived_block_count().unwrap_or(0);
-        // bodies includes height 0..; tip is last confirmed height.
-        // lead ≈ archived heights above tip.
-        let lead = bodies.saturating_sub(tip.saturating_add(1));
-        lead <= max_lead
     }
 
     /// No-op compatibility: SH dedupe is a height watermark (`sh_indexed_through`),
@@ -661,27 +649,21 @@ impl Query {
     }
 
     pub fn get_tx(&self, fk: Fk) -> Result<TxRecord, QueryError> {
-        // Tip-window first (confirm prevout locality), then archive-filled Class A.
         if let Some(tx) = self.tip_prevout_cache.get_tx(fk) {
+            return Ok(tx);
+        }
+        if let Some(tx) = self.confirm_parents.get_parent_tx(fk) {
             return Ok(tx);
         }
         self.get_tx_class_a(fk)
     }
 
-    /// Class A → store only. Reconstruct / bulk Class C / connect cold path use
-    /// this so `tip_prevout` hit rates reflect intentional prevout probes.
+    /// Load tx row: confirm-parent cache → store (no generic Class A cache).
     pub fn get_tx_class_a(&self, fk: Fk) -> Result<TxRecord, QueryError> {
-        if let Some(tx) = self.class_a_cache.get_tx(fk) {
+        if let Some(tx) = self.confirm_parents.get_parent_tx(fk) {
             return Ok(tx);
         }
-        let tx = self.store.get_tx(fk)?;
-        // Cache tx row only when free capacity remains. Do **not** FIFO-evict the
-        // confirm-prefetched wave bodies for random parent miss-fills (mainnet
-        // tip freeze: wave 50–95s while archive lead ≫ 100k).
-        let _ = self
-            .class_a_cache
-            .note_no_evict(fk, tx.clone(), None, None);
-        Ok(tx)
+        self.store.get_tx(fk)
     }
 
     pub fn get_tx_by_txid(&self, txid: &[u8; 32]) -> Result<Option<(Fk, TxRecord)>, QueryError> {
@@ -759,23 +741,21 @@ impl Query {
                     return Ok(o);
                 }
             }
-            if let Some(o) = self.class_a_cache.get_output_at(fk, vout) {
+            if let Some((_, o)) = self.confirm_parents.get_parent_out(fk, vout) {
                 if count_connect {
                     connect_prevout_stats::CLASS_A_HIT.fetch_add(1, Ordering::Relaxed);
                 }
                 return Ok(o);
             }
-            // Load full run once into cache (connect often probes many vouts).
+            // Load full run; promote into tip-window (prevout path).
             let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
             let outs = self.get_output_run(Fk(run), tx.output_count)?;
             let out = outs
                 .get(vout as usize)
                 .cloned()
                 .ok_or(StoreError::NotFound)?;
-            // Promote resolved creates into tip-window (prevout path).
             self.tip_prevout_cache
-                .note(fk, tx.clone(), outs.clone());
-            self.class_a_cache.fill_outputs(fk, outs);
+                .note(fk, tx.clone(), outs);
             if count_connect {
                 connect_prevout_stats::STORE_MISS.fetch_add(1, Ordering::Relaxed);
             }

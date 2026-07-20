@@ -701,23 +701,27 @@ pub async fn parallel_ibd_cancellable(
             last_progress = Instant::now();
         }
 
-        // Publish confirm runway for the parent-prewarm worker (tip+1 … tip+1k).
+        // Publish confirm runway for the parent-prewarm worker (tip+1 … tip+depth).
+        // Seed plans for the full runway so confirm headroom can wait on
+        // unfinished heights (not just the last-mile batch).
         {
             let tip = hub.tip_height().unwrap_or(0);
             let arch = st.max_archived_height;
-            let end = tip.saturating_add(rbitcoin_query::PREWARM_DEPTH).min(arch);
-            let mut hashes = Vec::new();
+            let depth = hub.query.parent_prewarm_depth();
+            let end = tip.saturating_add(depth).min(arch);
+            let mut items = Vec::new();
             if end > tip {
-                hashes.reserve((end - tip) as usize);
+                items.reserve((end - tip) as usize);
                 for h in (tip + 1)..=end {
                     if let Some(&hash) = st.height_to_hash.get(&h) {
-                        hashes.push(hash.to_byte_array());
+                        items.push((h, hash.to_byte_array()));
                     } else {
                         break; // keep contiguous
                     }
                 }
             }
-            prewarm_ctrl.publish(tip, arch, hashes);
+            hub.query.seed_parent_runway(&items);
+            prewarm_ctrl.publish(tip, arch, items);
         }
 
         // Stall only after progress events are applied.

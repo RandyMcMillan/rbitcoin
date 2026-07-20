@@ -83,7 +83,26 @@ pub fn confirm_archived_run(
     // ── 1. resolve_bodies ───────────────────────────────────────────────────
     let metas = resolve_body_metas(query, blocks)?;
 
-    // ── 2–3. prefetch_class_a + wave_fill ───────────────────────────────────
+    // ── 1b. wait for parent prewarm (UTXO parents + filled reserves) ────────
+    // Confirm does not start until every height's parent plan is fully populated
+    // *and* the warmer holds headroom past batch_end (default 2 prewarm batches)
+    // so the next confirm wave is already warm while this one runs.
+    let heights: Vec<u32> = metas.iter().map(|m| m.height.0).collect();
+    let items: Vec<(u32, [u8; 32])> = metas.iter().map(|m| (m.height.0, m.hash)).collect();
+    let batch_end = heights.last().copied().unwrap_or(0);
+    // Last-mile prewarm for *this* batch only if the background worker is behind.
+    // Headroom beyond batch_end is the worker's job (we lack those hashes here).
+    let _ = query.prewarm_parents_for_heights(&items);
+    query
+        .wait_prewarm_ready_with_headroom(
+            &heights,
+            batch_end,
+            None,
+            std::time::Duration::from_secs(120),
+        )
+        .map_err(ConsensusError::Store)?;
+
+    // ── 2–3. body load + wave_fill (parents from ConfirmParentCache) ────────
     let hashes: Vec<[u8; 32]> = metas.iter().map(|m| m.hash).collect();
     let wave_prevouts = prefetch_and_wave_fill(query, &hashes)?;
 
@@ -384,6 +403,11 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
 
     // Only after successful Class C: drop spent vouts from tip_prevout.
     query.retire_tip_prevout_spends(&all_spends);
+
+    // Prune confirm-parent runway for heights at/below new tip.
+    if let Some(tip) = prepared.last().map(|p| p.height.0) {
+        query.advance_parent_runway_tip(tip);
+    }
     Ok(())
 }
 

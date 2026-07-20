@@ -348,23 +348,14 @@ impl Query {
         if tx.input_count == 0 {
             return Ok(Vec::new());
         }
-        if let Some(fk) = self.lookup_tx_fk(&tx.txid)? {
-            if let Some(inputs) = self.class_a_cache.get_inputs(fk) {
-                return Ok(inputs);
-            }
-            let run = tx.input_start_fk.get().ok_or(StoreError::InvalidFk)?;
-            let inputs = self.get_input_run(Fk(run), tx.input_count)?;
-            self.class_a_cache.fill_inputs(fk, inputs.clone());
-            return Ok(inputs);
-        }
         let run = tx.input_start_fk.get().ok_or(StoreError::InvalidFk)?;
         self.get_input_run(Fk(run), tx.input_count)
     }
 
-    /// Output run: tip_prevout → Class A → store (connect prevout path).
+    /// Output run: tip_prevout → store (connect prevout path).
     ///
-    /// Miss-fill notes into **tip_prevout** (promote resolved parents). Reconstruct
-    /// must use [`Self::tx_output_run_class_a`] instead.
+    /// Miss-fill notes into **tip_prevout**. Reconstruct uses
+    /// [`Self::tx_output_run_class_a`] instead.
     pub(crate) fn tx_output_run(&self, tx: &TxRecord) -> Result<Vec<OutputRecord>, QueryError> {
         if tx.output_count == 0 {
             return Ok(Vec::new());
@@ -373,40 +364,27 @@ impl Query {
             if let Some(outputs) = self.tip_prevout_cache.get_outputs(fk) {
                 return Ok(outputs);
             }
-            if let Some(outputs) = self.class_a_cache.get_outputs(fk) {
-                return Ok(outputs);
-            }
             let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
             let outputs = self.get_output_run(Fk(run), tx.output_count)?;
             self.tip_prevout_cache
                 .note(fk, tx.clone(), outputs.clone());
-            self.class_a_cache.fill_outputs(fk, outputs.clone());
             return Ok(outputs);
         }
         let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
         self.get_output_run(Fk(run), tx.output_count)
     }
 
-    /// Output run via Class A → store only (no tip_prevout probe or miss-fill).
-    ///
-    /// `create_fk` is the Class A body fk (always known on confirm/reconstruct).
-    /// Do **not** resolve via txid first — that forces `tx_run.lookup` on every
-    /// catch-up SH collect when durable `tx.head` is off.
+    /// Output run from store (keyed by known create fk — no txid lookup).
     pub(crate) fn tx_output_run_class_a(
         &self,
-        create_fk: Fk,
+        _create_fk: Fk,
         tx: &TxRecord,
     ) -> Result<Vec<OutputRecord>, QueryError> {
         if tx.output_count == 0 {
             return Ok(Vec::new());
         }
-        if let Some(outputs) = self.class_a_cache.get_outputs(create_fk) {
-            return Ok(outputs);
-        }
         let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-        let outputs = self.get_output_run(Fk(run), tx.output_count)?;
-        self.class_a_cache.fill_outputs(create_fk, outputs.clone());
-        Ok(outputs)
+        self.get_output_run(Fk(run), tx.output_count)
     }
 
     /// Connect a block at `height` (genesis or tip+1): archive Class A then confirm Class C.

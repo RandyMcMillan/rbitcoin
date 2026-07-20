@@ -1,26 +1,26 @@
-//! Background confirm-runway parent prewarm (tip+1 … tip+PREWARM_DEPTH).
+//! Background confirm-runway parent prewarm (tip+1 … tip+depth).
 //!
-//! Runs on a dedicated OS thread with **best-effort** IO priority (above the
-//! idle archive writer). The main IBD loop pushes contiguous archived hashes
-//! for the runway; the worker loads Class A bodies + external parents and
-//! pins them until Class C spends those outs.
+//! Best-effort IO priority. Only UTXO-backed parents are loaded from store;
+//! same-runway creates store full outs and fill reserved holes (including
+//! create-before-reserve). Confirm waits until each batch is ready **and**
+//! the warmer is ~2 prewarm batches ahead (`RBITCOIN_PARENT_PREWARM_HEADROOM`).
 
 use rbitcoin_log::{debug, info};
-use rbitcoin_query::{Query, PREWARM_BATCH, PREWARM_DEPTH};
+use rbitcoin_query::{
+    prewarm_batch_from_env, prewarm_depth_from_env, prewarm_headroom_from_env, Query,
+};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// Shared runway state: main loop writes tip + ordered hashes; worker reads.
+/// Shared runway: main loop publishes tip/arch/hashes; worker prewarms.
 pub(crate) struct PrewarmControl {
     pub stop: AtomicBool,
-    /// Confirmed tip height.
     pub tip: AtomicU32,
-    /// Highest archived height known on the work path.
     pub arch: AtomicU32,
-    /// Contiguous hashes for heights tip+1, tip+2, … (may lag tip slightly).
-    pub runway: Mutex<Vec<[u8; 32]>>,
+    /// Contiguous (height, hash) for tip+1.. in order.
+    pub runway: Mutex<Vec<(u32, [u8; 32])>>,
 }
 
 impl PrewarmControl {
@@ -37,15 +37,13 @@ impl PrewarmControl {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    /// Publish tip/arch and the next runway hashes (height order, tip+1 first).
-    pub fn publish(&self, tip: u32, arch: u32, hashes: Vec<[u8; 32]>) {
+    pub fn publish(&self, tip: u32, arch: u32, items: Vec<(u32, [u8; 32])>) {
         self.tip.store(tip, Ordering::Relaxed);
         self.arch.store(arch, Ordering::Relaxed);
-        *self.runway.lock().unwrap() = hashes;
+        *self.runway.lock().unwrap() = items;
     }
 }
 
-/// Spawn the prewarm thread. Caller must `request_stop` + join on IBD exit.
 pub(crate) fn spawn_parent_prewarm(
     query: Arc<Query>,
     ctrl: Arc<PrewarmControl>,
@@ -54,56 +52,54 @@ pub(crate) fn spawn_parent_prewarm(
         .name("ibd-parent-prewarm".into())
         .spawn(move || {
             rbitcoin_store::try_set_io_best_effort();
+            let depth = prewarm_depth_from_env();
+            let batch = prewarm_batch_from_env();
+            let headroom = prewarm_headroom_from_env();
             info!(
-                "ibd: parent prewarm worker ON (depth≤{PREWARM_DEPTH}, batch≤{PREWARM_BATCH})"
+                "ibd: parent prewarm worker ON (depth≤{depth}, batch≤{batch}, headroom={headroom}; env RBITCOIN_PARENT_PREWARM_*)"
             );
-            let mut cursor: u32 = 0; // next height offset from tip already done
+            let mut cursor: usize = 0;
+            let mut last_tip = u32::MAX;
             while !ctrl.stop.load(Ordering::Relaxed) {
                 let tip = ctrl.tip.load(Ordering::Relaxed);
-                let arch = ctrl.arch.load(Ordering::Relaxed);
-                let target_end = tip.saturating_add(PREWARM_DEPTH).min(arch);
-                if target_end <= tip {
+                if tip != last_tip {
                     cursor = 0;
-                    std::thread::sleep(Duration::from_millis(80));
-                    continue;
-                }
-                // How far past tip we have already warmed this tip epoch.
-                if cursor > target_end.saturating_sub(tip) {
-                    cursor = 0;
+                    last_tip = tip;
+                    query.advance_parent_runway_tip(tip);
                 }
                 let runway = ctrl.runway.lock().unwrap().clone();
-                if runway.is_empty() {
+                if runway.is_empty() || cursor >= runway.len() {
                     std::thread::sleep(Duration::from_millis(40));
                     continue;
                 }
-                // runway[0] = tip+1 hash.
-                let start = cursor as usize;
-                if start >= runway.len() {
-                    std::thread::sleep(Duration::from_millis(40));
-                    continue;
-                }
-                let end = (start + PREWARM_BATCH as usize).min(runway.len());
-                let batch = &runway[start..end];
-                match query.prewarm_parents_for_block_hashes(batch) {
-                    Ok(st) if st.blocks > 0 || st.parents_loaded > 0 || st.outs_pinned > 0 => {
+                // Prefer advancing the contiguous ready watermark so confirm
+                // headroom is satisfied before re-scanning far-ahead already-ready
+                // heights. Cursor still walks the full runway.
+                let end = (cursor + batch as usize).min(runway.len());
+                let slice = &runway[cursor..end];
+                match query.prewarm_parents_for_heights(slice) {
+                    Ok(st)
+                        if st.blocks > 0
+                            || st.utxo_parents > 0
+                            || st.reserved > 0
+                            || st.creates_registered > 0 =>
+                    {
                         debug!(
-                            "ibd: prewarm tip+{}..+{} blocks={} bodies={} parents={} pins={} warm={}",
-                            start + 1,
-                            end,
+                            "ibd: prewarm h={}..{} blocks={} utxo_parents={} reserved={} creates={} ready={} through={}",
+                            slice.first().map(|x| x.0).unwrap_or(0),
+                            slice.last().map(|x| x.0).unwrap_or(0),
                             st.blocks,
-                            st.bodies_loaded,
-                            st.parents_loaded,
-                            st.outs_pinned,
-                            st.already_warm
+                            st.utxo_parents,
+                            st.reserved,
+                            st.creates_registered,
+                            st.already_ready,
+                            query.parent_prewarm_ready_through()
                         );
                     }
                     Ok(_) => {}
-                    Err(e) => {
-                        debug!("ibd: prewarm error: {e}");
-                    }
+                    Err(e) => debug!("ibd: prewarm error: {e}"),
                 }
-                cursor = end as u32;
-                // Brief yield so confirm/archive can use the disk.
+                cursor = end;
                 std::thread::sleep(Duration::from_millis(5));
             }
             info!("ibd: parent prewarm worker stopped");

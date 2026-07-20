@@ -207,36 +207,13 @@ impl Query {
                 return Err(StoreError::Corrupt("tx put_batch fk mismatch"));
             }
         }
-        // Class A cache: only bulk-fill from archive when we are tip-following
-        // (small archive lead). Under IBD with a large lead, archive-newest FIFO
-        // thrash fights confirm — tip_prevout_cache + miss-fill own that path.
-        let fill_class_a = self.should_fill_class_a_from_archive();
-        {
-            let mut in_i = 0usize;
-            let mut out_i = 0usize;
-            for (rec, fk) in all_txs.iter().zip(got_tx_fks.iter()) {
-                if tx_runs {
-                    self.enqueue_tx_run(rec.txid, *fk);
-                }
-                let inputs = if rec.input_count > 0 {
-                    let v = all_input_runs[in_i].clone();
-                    in_i += 1;
-                    Some(v)
-                } else {
-                    None
-                };
-                let outputs = if rec.output_count > 0 {
-                    let v = all_output_runs[out_i].clone();
-                    out_i += 1;
-                    Some(v)
-                } else {
-                    None
-                };
-                if fill_class_a {
-                    self.class_a_cache
-                        .note(*fk, rec.clone(), outputs, inputs);
-                }
+        // No generic Class A cache: confirm parents live in ConfirmParentCache
+        // (prewarm). Archive only enqueues catch-up index runs.
+        for (rec, fk) in all_txs.iter().zip(got_tx_fks.iter()) {
+            if tx_runs {
+                self.enqueue_tx_run(rec.txid, *fk);
             }
+            let _ = (rec, fk);
         }
 
         if spend_on && !spends.is_empty() {

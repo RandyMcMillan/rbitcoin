@@ -285,6 +285,9 @@ pub struct IbdConfig {
     pub headers_batch: usize,
     /// TCP connect + handshake timeout per peer.
     pub connect_timeout: Duration,
+    /// Optional shared peer book (discovered addrs + flags). Seeded at start and
+    /// written back on IBD exit so the node can persist across runs.
+    pub peers: Option<std::sync::Arc<std::sync::Mutex<crate::seeds::AddrMan>>>,
 }
 
 impl Default for IbdConfig {
@@ -296,6 +299,7 @@ impl Default for IbdConfig {
             stall: Duration::from_secs(30),
             headers_batch: MAX_HEADERS_RESULTS,
             connect_timeout: Duration::from_secs(8),
+            peers: None,
         }
     }
 }
@@ -310,7 +314,51 @@ impl IbdConfig {
             stall: Duration::from_secs(10),
             headers_batch: MAX_HEADERS_RESULTS,
             connect_timeout: Duration::from_secs(3),
+            peers: None,
         }
+    }
+}
+
+/// Local IBD peer book that flushes back into [`IbdConfig::peers`] on drop.
+struct PeerBookSession {
+    book: crate::seeds::AddrMan,
+    shared: Option<std::sync::Arc<std::sync::Mutex<crate::seeds::AddrMan>>>,
+}
+
+impl PeerBookSession {
+    fn new(
+        shared: Option<std::sync::Arc<std::sync::Mutex<crate::seeds::AddrMan>>>,
+        seed_peers: &[SocketAddr],
+    ) -> Self {
+        let mut book = if let Some(ref s) = shared {
+            s.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        } else {
+            crate::seeds::AddrMan::new()
+        };
+        book.inject(seed_peers.iter().copied());
+        Self { book, shared }
+    }
+
+    fn book(&self) -> &crate::seeds::AddrMan {
+        &self.book
+    }
+
+    fn book_mut(&mut self) -> &mut crate::seeds::AddrMan {
+        &mut self.book
+    }
+
+    fn flush(&self) {
+        if let Some(ref s) = self.shared {
+            if let Ok(mut g) = s.lock() {
+                *g = self.book.clone();
+            }
+        }
+    }
+}
+
+impl Drop for PeerBookSession {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -369,17 +417,16 @@ pub async fn parallel_ibd_cancellable(
             "ibd: tokio worker threads≈{workers} (peer decode: blocking pool; archive: 1 OS prep + 1 OS writer; confirm: 1 OS thread)"
         );
     }
-    // Dial book: seeds/connect list + learned addrs, ranked by PeerFlags.
-    let mut peer_book = AddrMan::new();
-    peer_book.inject(peers.iter().copied());
+    // Dial book: persisted peers (flags) + seeds/connect, ranked by PeerFlags.
+    let mut peer_sess = PeerBookSession::new(cfg.peers.clone(), peers);
     let next_peer_id = Arc::new(AtomicUsize::new(0));
 
     // Initial concurrent dial (all candidates once) — OK to await before loop starts.
     // Abort early if cancel already set mid-dial.
     let initial = dial_batch(
-        &peer_book,
+        peer_sess.book(),
         &next_peer_id,
-        peer_book.len(),
+        peer_sess.book().len(),
         HashSet::new(),
         magic,
         local_addr,
@@ -389,7 +436,7 @@ pub async fn parallel_ibd_cancellable(
         cancel.as_ref().map(Arc::clone),
     )
     .await;
-    apply_dial_result(&mut peer_book, &initial);
+    apply_dial_result(peer_sess.book_mut(), &initial);
     let mut initial_slots = initial.slots;
     if cancelled() {
         warn!("ibd: cancel during initial dial — stopping");
@@ -409,7 +456,7 @@ pub async fn parallel_ibd_cancellable(
         initial_slots.len(),
         peers.len(),
         cfg.target_peers,
-        peer_book.len(),
+        peer_sess.book().len(),
         init_peer_tip
     );
     // Background redial — never .await dial on the IBD event loop (that stalled tip).
@@ -555,7 +602,7 @@ pub async fn parallel_ibd_cancellable(
             &arch_job_tx,
             &archive_queued,
             &loop_stats,
-            &mut peer_book,
+            peer_sess.book_mut(),
             local_addr,
         )? {
             break;
@@ -631,7 +678,7 @@ pub async fn parallel_ibd_cancellable(
             &arch_job_tx,
             &archive_queued,
             &loop_stats,
-            &mut peer_book,
+            peer_sess.book_mut(),
             local_addr,
         )? {
             break;
@@ -749,7 +796,7 @@ pub async fn parallel_ibd_cancellable(
             if let Some(h) = redial_handle.take() {
                 match h.await {
                     Ok(result) => {
-                        apply_dial_result(&mut peer_book, &result);
+                        apply_dial_result(peer_sess.book_mut(), &result);
                         let blocked =
                             dial_blocked_addrs(&st.slots, &st.addr_cooldown, Instant::now());
                         let mut n = 0usize;
@@ -805,17 +852,17 @@ pub async fn parallel_ibd_cancellable(
         };
         if redial_handle.is_none()
             && alive_n < target
-            && !peer_book.is_empty()
+            && !peer_sess.book().is_empty()
             && last_redial.elapsed() >= redial_interval
         {
             let want = (target - alive_n).min(8).max(1);
             let already = dial_blocked_addrs(&st.slots, &st.addr_cooldown, Instant::now());
             info!(
                 "ibd: redialing up to {want} peers (alive={alive_n}/{target}, book={}, blocked={})…",
-                peer_book.len(),
+                peer_sess.book().len(),
                 already.len()
             );
-            let book = peer_book.clone();
+            let book = peer_sess.book().clone();
             let next_id = next_peer_id.clone();
             let tip_h = hub.tip_height();
             let sinks_r = sinks.clone();
@@ -1044,7 +1091,7 @@ pub async fn parallel_ibd_cancellable(
                     ev,
                     &arch_job_tx,
                     &archive_queued,
-                    &mut peer_book,
+                    peer_sess.book_mut(),
                     local_addr,
                 );
             }
@@ -1060,7 +1107,7 @@ pub async fn parallel_ibd_cancellable(
                     ev,
                     &arch_job_tx,
                     &archive_queued,
-                    &mut peer_book,
+                    peer_sess.book_mut(),
                     local_addr,
                 );
             }

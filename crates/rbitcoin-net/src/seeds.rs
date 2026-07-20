@@ -3,10 +3,15 @@
 //! Each remembered address carries a **byte of informational flags** used to
 //! rank dial candidates: prefer untried / known-good / fast peers; only fall
 //! back to incompatible or recently-failed hosts when the good set is empty.
+//!
+//! The book can be **persisted** under the datadir (`peers` file) so discovered
+//! addrs and flags survive restarts.
 
 use rbitcoin_primitives::Network;
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::Path;
 
 /// DNS seed hostnames (resolve at runtime with default port).
 pub fn dns_seeds(network: Network) -> &'static [&'static str] {
@@ -240,6 +245,25 @@ impl AddrMan {
         self.order.push(addr);
     }
 
+    /// Insert or keep existing; never clears known flags when already present.
+    pub fn add_with_flags(&mut self, addr: SocketAddr, flags: PeerFlags) {
+        if let Some(f) = self.by_addr.get_mut(&addr) {
+            // Union: remember the best information we have.
+            f.0 |= flags.0;
+            return;
+        }
+        self.by_addr.insert(addr, flags);
+        self.order.push(addr);
+    }
+
+    /// Merge another book into this one (flag bits OR'd for shared addrs).
+    pub fn merge_from(&mut self, other: &AddrMan) {
+        for e in other.entries() {
+            self.add_with_flags(e.addr, e.flags);
+        }
+        self.sort_order_ipv4_first();
+    }
+
     fn sort_order_ipv4_first(&mut self) {
         // Prefer IPv4: many lab hosts have no IPv6 route, and IPv6 seeds only
         // burn connect-timeout slots during parallel IBD dial.
@@ -358,6 +382,97 @@ impl AddrMan {
             .filter_map(|a| self.entry(a))
             .collect()
     }
+
+    // ── Persistence ─────────────────────────────────────────────────────────
+
+    /// On-disk format magic line (text, one peer per line).
+    pub const PEERS_FILE_MAGIC: &'static str = "rbitcoin-peers-v1";
+
+    /// Load peers + flags from `path`. Missing file → empty book (not an error).
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        if !path.exists() {
+            return Ok(Self::new());
+        }
+        let f = std::fs::File::open(path)?;
+        let reader = BufReader::new(f);
+        let mut am = Self::new();
+        let mut saw_magic = false;
+        for (lineno, line) in reader.lines().enumerate() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if !saw_magic {
+                if line != Self::PEERS_FILE_MAGIC {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "peers file {}:{}: expected magic `{}`",
+                            path.display(),
+                            lineno + 1,
+                            Self::PEERS_FILE_MAGIC
+                        ),
+                    ));
+                }
+                saw_magic = true;
+                continue;
+            }
+            // `addr flags` — flags as decimal or 0x-hex u8
+            let mut parts = line.split_whitespace();
+            let Some(addr_s) = parts.next() else {
+                continue;
+            };
+            let flags_s = parts.next().unwrap_or("0");
+            let addr: SocketAddr = addr_s.parse().map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("peers file {}:{}: bad addr: {e}", path.display(), lineno + 1),
+                )
+            })?;
+            let flags_u: u8 = if let Some(hex) = flags_s.strip_prefix("0x").or_else(|| flags_s.strip_prefix("0X")) {
+                u8::from_str_radix(hex, 16).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("peers file {}:{}: bad flags: {e}", path.display(), lineno + 1),
+                    )
+                })?
+            } else {
+                flags_s.parse().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("peers file {}:{}: bad flags: {e}", path.display(), lineno + 1),
+                    )
+                })?
+            };
+            am.add_with_flags(addr, PeerFlags(flags_u));
+        }
+        if !saw_magic && am.is_empty() {
+            // Empty or comment-only without magic — treat as empty book.
+            return Ok(Self::new());
+        }
+        am.sort_order_ipv4_first();
+        Ok(am)
+    }
+
+    /// Atomic save of peers + flags to `path` (`path.tmp` then rename).
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            writeln!(f, "{}", Self::PEERS_FILE_MAGIC)?;
+            writeln!(f, "# addr flags  (flags: bit0=connected bit1=fast bit2=slow bit3=incompat bit4=fail)")?;
+            for e in self.entries() {
+                writeln!(f, "{} 0x{:02x}", e.addr, e.flags.0)?;
+            }
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -437,5 +552,36 @@ mod tests {
         ex.insert(addr(1));
         let got = am.take_dial_candidates(10, &ex);
         assert_eq!(got, vec![addr(2)]);
+    }
+
+    #[test]
+    fn peers_file_roundtrip_preserves_flags() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-peers-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("peers");
+        let mut am = AddrMan::new();
+        let a = addr(10);
+        let b = addr(20);
+        am.add(a);
+        am.note_connected(a);
+        am.note_speed(a, 40, PeerFlags::FAST_BPS_MIN + 100);
+        am.add(b);
+        am.note_connect_failed(b, true);
+        am.save(&path).unwrap();
+
+        let loaded = AddrMan::load(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.flags(&a).has_connected());
+        assert!(loaded.flags(&a).is_fast());
+        assert!(loaded.flags(&b).is_incompatible());
+
+        // merge does not wipe flags when re-adding seed
+        let mut merged = loaded;
+        merged.add(a);
+        assert!(merged.flags(&a).is_fast());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

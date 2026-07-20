@@ -47,6 +47,20 @@ Default: **info**. CLI wins over env.
 | Tip prevout cache | **128 MiB** | `RBITCOIN_TIP_PREVOUT_CACHE_MB` |
 | Light UTXO (mmap) | **~96 MiB start** (24 B slots; grows) | `RBITCOIN_IBD_UTXO_SLOTS` |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
+| Inhibit auto-suspend | **off** | `--inhibit-suspend` (uses `systemd-inhibit` if available) |
+
+### Suspend inhibit
+
+Long IBD runs can be interrupted if the host auto-suspends. Pass
+`--inhibit-suspend` to request a systemd **block** inhibit for `sleep` and
+`idle` while the process runs (via `systemd-inhibit`). Default is off. If
+`systemd-inhibit` is missing or logind rejects the request, the node logs a
+warning and continues without inhibit.
+
+**Peers file:** `{datadir}/peers` stores discovered addresses and **PeerFlags**
+(connected / fast / slow / incompatible / last-fail) between runs. Loaded at
+start (before seeds), updated after IBD and on shutdown. Seeds are merged in
+without clearing known flags.
 
 **Index modes:** IBD uses **`IndexMode::Catchup`** (sorted runs + light UTXO
 spentness). After tip ≈ peer height, the node materializes heads and switches to

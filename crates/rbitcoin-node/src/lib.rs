@@ -3,6 +3,7 @@
 mod cli;
 mod config;
 mod error;
+mod inhibit;
 mod run;
 
 pub use cli::cli_main;

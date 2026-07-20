@@ -217,7 +217,27 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let shutdown = Shutdown::new();
     spawn_signal_handler(shutdown.clone());
 
-    let mut addrman = AddrMan::new();
+    // Persisted peer book (discovered addrs + PeerFlags) under datadir.
+    let peers_path = config.datadir.join("peers");
+    let mut addrman = match AddrMan::load(&peers_path) {
+        Ok(am) => {
+            if !am.is_empty() {
+                info!(
+                    "peers: loaded {} address(es) with flags from {}",
+                    am.len(),
+                    peers_path.display()
+                );
+            }
+            am
+        }
+        Err(e) => {
+            warn!(
+                "peers: load {}: {e} — starting empty book",
+                peers_path.display()
+            );
+            AddrMan::new()
+        }
+    };
     for c in &config.connect {
         addrman.add(*c);
     }
@@ -226,9 +246,16 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             "ibd: resolving DNS/fixed seeds for {}…",
             config.network.as_str()
         );
-        addrman = AddrMan::with_seeds(config.network);
-        info!("ibd: {} seed addresses resolved", addrman.len());
+        let n_before = addrman.len();
+        addrman.inject(rbitcoin_net::resolve_all_seeds(config.network));
+        info!(
+            "ibd: seeds resolved (+{} new, book={})",
+            addrman.len().saturating_sub(n_before),
+            addrman.len()
+        );
     }
+    // Shared with IBD so learned addrs/flags flush back on IBD exit.
+    let shared_peers = std::sync::Arc::new(std::sync::Mutex::new(addrman.clone()));
 
     let max_out = config.max_outbound.max(1) as usize;
     // Seed **candidates** (pool) vs live **target_peers** (max_out). Pool is
@@ -244,7 +271,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let ibd_targets = if !config.connect.is_empty() {
         config.connect.clone()
     } else {
-        // Prefer a wide seed sample (IPv4-first) for parallel dial / redial.
+        // Prefer a wide ranked sample (flag-aware, IPv4-first).
         addrman.take_outbound(candidate_n)
     };
     // True only after parallel IBD reports true catch-up (or no peers to dial).
@@ -260,6 +287,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             // 5s caused reassign storms (clearing 200+ inflight before peers
             // could deliver mid-chain blocks). Default 30s is enough.
             stall: std::time::Duration::from_secs(30),
+            peers: Some(std::sync::Arc::clone(&shared_peers)),
             ..IbdConfig::default()
         };
         info!(
@@ -307,6 +335,19 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     );
                 }
             }
+        }
+        // Pull learned peers/flags from IBD back into local book + disk.
+        if let Ok(g) = shared_peers.lock() {
+            addrman = g.clone();
+        }
+        if let Err(e) = addrman.save(&peers_path) {
+            warn!("peers: save {}: {e}", peers_path.display());
+        } else {
+            info!(
+                "peers: saved {} address(es) to {}",
+                addrman.len(),
+                peers_path.display()
+            );
         }
     } else if ibd_targets.is_empty() {
         info!("ibd: no outbound peers; serving only (use --connect or seeds)");
@@ -610,6 +651,20 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         info!(
             "node: shutting down tip={end_tip:?} (+{blocks_this_run} blocks this run, \
              uptime={uptime:?}, ~{blocks_per_hour:.1} blk/h)"
+        );
+    }
+
+    // Final peer book flush (tip-follow may have used stale clone; re-sync from shared).
+    if let Ok(g) = shared_peers.lock() {
+        addrman.merge_from(&g);
+    }
+    if let Err(e) = addrman.save(&peers_path) {
+        warn!("peers: final save {}: {e}", peers_path.display());
+    } else {
+        info!(
+            "peers: saved {} address(es) to {}",
+            addrman.len(),
+            peers_path.display()
         );
     }
 

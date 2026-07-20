@@ -298,11 +298,7 @@ fn c1_non_coinbase_empty_outputs_rejected() {
     };
     time += 600;
     let bad = mine_regtest_block(tip, time, h + 1, vec![empty_out]);
-    let ctx = ValidationContext {
-        params: &params,
-        height: Height(h + 1),
-        milestone: Milestone::NONE,
-    };
+    let ctx = ValidationContext::at(&params, Height(h + 1), Milestone::NONE);
     // Structure may pass; connect must reject.
     let err = validate_block_connect(&q, &bad, &ctx, None).unwrap_err();
     assert!(

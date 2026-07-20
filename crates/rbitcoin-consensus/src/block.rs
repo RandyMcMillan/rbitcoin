@@ -13,6 +13,39 @@ pub struct ValidationContext<'a> {
     pub params: &'a ChainParams,
     pub height: Height,
     pub milestone: Milestone,
+    /// When **false** (IBD Class A archive prep): skip height-gated soft-fork
+    /// checks that need a reliable tip height — BIP34 coinbase push and
+    /// “unexpected witness before segwit”.
+    ///
+    /// Archive intentionally used `height = GENESIS` as a BIP34 sentinel (resume
+    /// could not always trust ordered height). That made **signet** reject every
+    /// post-genesis block: Core/Inquisition `SegwitHeight = 1`, so height 0 looks
+    /// pre-segwit while BIP325 blocks always carry witness. Soft-fork timing is
+    /// enforced at **confirm** with the true height. Merkle / weight / witness
+    /// **commitment** still run here either way.
+    pub enforce_height_gates: bool,
+}
+
+impl<'a> ValidationContext<'a> {
+    /// Full structure + soft-fork gates at `height` (confirm / connect).
+    pub fn at(params: &'a ChainParams, height: Height, milestone: Milestone) -> Self {
+        Self {
+            params,
+            height,
+            milestone,
+            enforce_height_gates: true,
+        }
+    }
+
+    /// Archive prep: height-independent structure only (see [`Self::enforce_height_gates`]).
+    pub fn archive_structure(params: &'a ChainParams) -> Self {
+        Self {
+            params,
+            height: Height::GENESIS,
+            milestone: Milestone::NONE,
+            enforce_height_gates: false,
+        }
+    }
 }
 
 /// Context-free / structural block checks (no UTXO / prevout).
@@ -72,15 +105,16 @@ pub fn validate_block_structure_hashed(
     // network's buried activation height (mainnet 227931; signet/testnet4 1;
     // regtest effectively never — see `bitcoin::consensus::Params`).
     // Enforcing from height 1 rejects mainnet block 1 immediately.
-    if ctx.params.bip34_active_at(ctx.height.0) {
+    // Skipped on archive prep (`enforce_height_gates = false`); confirm re-checks.
+    if ctx.enforce_height_gates && ctx.params.bip34_active_at(ctx.height.0) {
         check_bip34_coinbase(&block.txdata[0], ctx.height.0)?;
     }
 
-    // Witness commitment: only consensus-required once segwit is active.
-    // Pre-segwit blocks never carry witness on the real chains; if they did
-    // without a commitment, require commitment only post-activation.
+    // Witness: commitment always required when any input has witness data.
+    // Pre-segwit ban only with reliable height (confirm / known height).
+    // Archive prep must not ban witness: signet SegwitHeight=1 + BIP325.
     if has_witness {
-        if !ctx.params.segwit_active_at(ctx.height.0) {
+        if ctx.enforce_height_gates && !ctx.params.segwit_active_at(ctx.height.0) {
             return Err(ConsensusError::BadBlock("unexpected witness before segwit"));
         }
         let mut non_cb = Vec::with_capacity(n.saturating_sub(1));
@@ -97,7 +131,9 @@ pub fn validate_block_structure_hashed(
     Ok(txids)
 }
 
-fn block_has_witness(block: &Block) -> bool {
+/// True if any input carries witness data.
+#[inline]
+pub fn block_has_witness(block: &Block) -> bool {
     block.txdata.iter().any(|tx| {
         tx.input
             .iter()
@@ -967,11 +1003,7 @@ mod structure_rule_tests {
     fn ctx_h(height: u32) -> ValidationContext<'static> {
         // Leak params for 'static test ctx simplicity.
         let p = Box::leak(Box::new(params()));
-        ValidationContext {
-            params: p,
-            height: Height(height),
-            milestone: Milestone::NONE,
-        }
+        ValidationContext::at(p, Height(height), Milestone::NONE)
     }
 
     fn coinbase(height: u32) -> Transaction {
@@ -1120,11 +1152,7 @@ mod structure_rule_tests {
     fn s7_rejects_bip34_missing_after_activation_signet() {
         // Signet activates BIP34 at height 1 (rust-bitcoin Params::SIGNET).
         let p = Box::leak(Box::new(ChainParams::signet()));
-        let ctx = ValidationContext {
-            params: p,
-            height: Height(1),
-            milestone: Milestone::NONE,
-        };
+        let ctx = ValidationContext::at(p, Height(1), Milestone::NONE);
         let mut cb = coinbase(1);
         cb.input[0].script_sig = ScriptBuf::new(); // strip BIP34
         let b = block_with(vec![cb]);
@@ -1138,11 +1166,7 @@ mod structure_rule_tests {
         // height push (block 1 has a free-form coinbase scriptSig).
         let p = Box::leak(Box::new(ChainParams::mainnet()));
         assert_eq!(p.btc.bip34_height, 227_931);
-        let ctx = ValidationContext {
-            params: p,
-            height: Height(1),
-            milestone: Milestone::NONE,
-        };
+        let ctx = ValidationContext::at(p, Height(1), Milestone::NONE);
         let mut cb = coinbase(1);
         // Mainnet-style early coinbase: no BIP34 height push.
         cb.input[0].script_sig = ScriptBuf::from_bytes(b"hello".to_vec());
@@ -1154,11 +1178,7 @@ mod structure_rule_tests {
     fn s7_bip34_required_at_mainnet_activation_height() {
         let p = Box::leak(Box::new(ChainParams::mainnet()));
         let h = p.btc.bip34_height;
-        let ctx = ValidationContext {
-            params: p,
-            height: Height(h),
-            milestone: Milestone::NONE,
-        };
+        let ctx = ValidationContext::at(p, Height(h), Milestone::NONE);
         let mut cb = coinbase(h);
         cb.input[0].script_sig = ScriptBuf::new();
         let b = block_with(vec![cb]);
@@ -1180,11 +1200,7 @@ mod structure_rule_tests {
         // blocks may still *include* a height push, but empty/missing is OK.
         let p = Box::leak(Box::new(ChainParams::regtest()));
         assert!(p.btc.bip34_height > 1_000_000);
-        let ctx = ValidationContext {
-            params: p,
-            height: Height(1),
-            milestone: Milestone::NONE,
-        };
+        let ctx = ValidationContext::at(p, Height(1), Milestone::NONE);
         let mut cb = coinbase(1);
         cb.input[0].script_sig = ScriptBuf::from_bytes(b"regtest".to_vec());
         let b = block_with(vec![cb]);
@@ -1218,6 +1234,82 @@ mod structure_rule_tests {
         let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
         assert!(
             matches!(err, ConsensusError::BadBlock(s) if s.contains("witness")),
+            "got {err:?}"
+        );
+    }
+
+    /// Mainnet height 1: witness banned (segwit @ 481824).
+    #[test]
+    fn s8_mainnet_rejects_witness_before_segwit() {
+        let p = Box::leak(Box::new(ChainParams::mainnet()));
+        let ctx = ValidationContext::at(p, Height(1), Milestone::NONE);
+        let mut spend = non_coinbase_spend(10);
+        spend.input[0].witness = Witness::from_slice(&[vec![0x01]]);
+        let mut cb = coinbase(1);
+        // Valid-looking commitment magic so we hit the pre-segwit ban first.
+        let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        spk.extend([0u8; 32]);
+        cb.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(spk),
+        });
+        let b = block_with(vec![cb, spend]);
+        let err = validate_block_structure(&b, &ctx).unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::BadBlock(s) if s.contains("before segwit")),
+            "got {err:?}"
+        );
+    }
+
+    /// Archive prep must accept signet-shaped witness blocks (BIP325).
+    /// Regression: GENESIS height + enforce gates rejected signet IBD entirely.
+    #[test]
+    fn archive_structure_allows_witness_when_gates_off() {
+        let p = Box::leak(Box::new(ChainParams::signet()));
+        let ctx = ValidationContext::archive_structure(p);
+        assert!(!ctx.enforce_height_gates);
+        let mut spend = non_coinbase_spend(10);
+        spend.input[0].witness = Witness::from_slice(&[vec![0x01]]);
+        let mut cb = coinbase(1);
+        let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        spk.extend([0u8; 32]);
+        cb.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(spk),
+        });
+        let b = block_with(vec![cb, spend]);
+        // Wrong commitment → still structure-checked (not pre-segwit ban).
+        let err = validate_block_structure(&b, &ctx).unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::BadBlock(s) if s.contains("witness")),
+            "archive must check commitment, not pre-segwit ban; got {err:?}"
+        );
+        assert!(
+            !matches!(err, ConsensusError::BadBlock(s) if s.contains("before segwit")),
+            "archive must not ban witness as pre-segwit: {err:?}"
+        );
+    }
+
+    /// Signet at true height 1: segwit active (Core/Inquisition SegwitHeight=1).
+    #[test]
+    fn signet_height_1_segwit_active_allows_witness_path() {
+        let p = Box::leak(Box::new(ChainParams::signet()));
+        assert!(p.segwit_active_at(1));
+        let ctx = ValidationContext::at(p, Height(1), Milestone::NONE);
+        let mut spend = non_coinbase_spend(10);
+        spend.input[0].witness = Witness::from_slice(&[vec![0x01]]);
+        let mut cb = coinbase(1);
+        let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        spk.extend([0u8; 32]);
+        cb.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(spk),
+        });
+        let b = block_with(vec![cb, spend]);
+        let err = validate_block_structure(&b, &ctx).unwrap_err();
+        // Fails commitment hash, not pre-segwit.
+        assert!(
+            !matches!(err, ConsensusError::BadBlock(s) if s.contains("before segwit")),
             "got {err:?}"
         );
     }

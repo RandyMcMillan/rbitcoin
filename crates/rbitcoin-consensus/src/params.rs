@@ -126,10 +126,9 @@ impl ChainParams {
 
     /// BIP112 CHECKSEQUENCEVERIFY active?
     ///
-    /// Buried CSV package heights (Core `DeploymentPos::DEPLOYMENT_CSV`):
-    /// mainnet 419328, testnet3 770112, signet/regtest 1 (signet) / 432 (regtest historical).
-    /// We pin Core's buried values; regtest uses 1 so our tests and local mining
-    /// match modern Core regtest defaults for soft-forks.
+    /// Buried heights match Bitcoin Core `CMainParams` / `SigNetParams` and
+    /// Bitcoin Inquisition (same buried CSV on mainnet/signet):
+    /// mainnet 419328, testnet3 770112, signet/testnet4 1, regtest 1.
     #[inline]
     pub fn csv_active_at(&self, height: u32) -> bool {
         height >= self.csv_height()
@@ -140,17 +139,17 @@ impl ChainParams {
         match self.network {
             Network::Bitcoin => 419_328,
             Network::Testnet => 770_112,
-            // Signet / testnet4 / regtest: soft-forks from genesis-adjacent heights.
             Network::Signet | Network::Testnet4 => 1,
-            // Core regtest CSV height is 432 in some versions; use 1 for always-on
-            // modern regtest soft-forks (matches how we treat BIP34 as optional).
+            // Core regtest historically 432; we use 1 (always-on for local mining).
             Network::Regtest => 1,
         }
     }
 
     /// BIP141/143/147 segwit consensus active?
     ///
-    /// Buried: mainnet 481824, testnet3 834624, signet 1, regtest 0 (always).
+    /// Core + Inquisition: mainnet 481824, testnet3 834624, signet 1, regtest 0
+    /// (always). Signet BIP325 blocks carry witness from height 1 — archive prep
+    /// must not apply this gate with a fake height 0 (see `ValidationContext`).
     #[inline]
     pub fn segwit_active_at(&self, height: u32) -> bool {
         height >= self.segwit_height()
@@ -165,7 +164,11 @@ impl ChainParams {
         }
     }
 
-    /// BIP341/342 taproot active? Mainnet buried 709632; signet/regtest 1/0.
+    /// BIP341/342 taproot active?
+    ///
+    /// Core mainnet buried 709632 (Inquisition same). Signet/testnet4: 1.
+    /// Testnet3: ~2011968 (Inquisition `TaprootHeight`; Core may still use
+    /// versionbits — we pin buried for script flags).
     #[inline]
     pub fn taproot_active_at(&self, height: u32) -> bool {
         height >= self.taproot_height()
@@ -174,7 +177,7 @@ impl ChainParams {
     pub fn taproot_height(&self) -> u32 {
         match self.network {
             Network::Bitcoin => 709_632,
-            Network::Testnet => 2_400_000, // approximate / not heavily used here
+            Network::Testnet => 2_011_968,
             Network::Signet | Network::Testnet4 => 1,
             Network::Regtest => 0,
         }
@@ -293,6 +296,33 @@ mod tests {
         let mut rev = arr;
         rev.reverse();
         BlockHash::from_byte_array(rev)
+    }
+
+    /// Core `SigNetParams` / Inquisition signet: soft forks at height 1 (not 0).
+    #[test]
+    fn signet_buried_deployments_match_core() {
+        let p = ChainParams::signet();
+        assert_eq!(p.btc.bip34_height, 1);
+        assert_eq!(p.btc.bip65_height, 1);
+        assert_eq!(p.btc.bip66_height, 1);
+        assert_eq!(p.csv_height(), 1);
+        assert_eq!(p.segwit_height(), 1);
+        assert_eq!(p.taproot_height(), 1);
+        assert!(!p.segwit_active_at(0));
+        assert!(p.segwit_active_at(1));
+        assert!(p.signet_challenge.is_some());
+    }
+
+    /// Mainnet buried heights (Core + Inquisition).
+    #[test]
+    fn mainnet_buried_deployments_match_core() {
+        let p = ChainParams::mainnet();
+        assert_eq!(p.btc.bip34_height, 227_931);
+        assert_eq!(p.csv_height(), 419_328);
+        assert_eq!(p.segwit_height(), 481_824);
+        assert_eq!(p.taproot_height(), 709_632);
+        assert!(!p.segwit_active_at(481_823));
+        assert!(p.segwit_active_at(481_824));
     }
 
     /// Regression: wrong invented hash at 295000 blacklisted the real mainnet tip

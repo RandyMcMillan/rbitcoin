@@ -332,11 +332,7 @@ pub fn confirm_archived_run(
         let height = meta.height;
         let block_hash = meta.hash;
 
-        let ctx = ValidationContext {
-            params,
-            height,
-            milestone,
-        };
+        let ctx = ValidationContext::at(params, height, milestone);
 
         if i == 0 {
             validate_header(query, params, height, &block.header)?;
@@ -381,9 +377,13 @@ pub fn confirm_archived_run(
                 .map_err(|_| ConsensusError::InvalidPow)?;
         }
 
-        // BIP34 buried activation (mainnet 227931 — not height 1).
+        // Height-gated structure soft forks (archive prep skipped these).
+        // Core/Inquisition: mainnet BIP34@227931 segwit@481824; signet both @1.
         if params.bip34_active_at(height.0) {
             check_bip34_at_height(block, height.0)?;
+        }
+        if crate::block::block_has_witness(block) && !params.segwit_active_at(height.0) {
+            return Err(ConsensusError::BadBlock("unexpected witness before segwit"));
         }
 
         // BIP325: full signet challenge (CHECKMULTISIG) on tip confirm only —
@@ -571,11 +571,7 @@ pub fn accept_and_connect_block(
     block: &Block,
     milestone: Milestone,
 ) -> Result<rbitcoin_primitives::Fk, ConsensusError> {
-    let ctx = ValidationContext {
-        params,
-        height,
-        milestone,
-    };
+    let ctx = ValidationContext::at(params, height, milestone);
     let txids = validate_block_structure_hashed(block, &ctx)?;
     validate_header(query, params, height, &block.header)?;
     validate_block_connect(query, block, &ctx, None)?;
@@ -658,11 +654,8 @@ pub fn prepare_block_for_archive_new(
     params: &ChainParams,
     block: &Block,
 ) -> Result<(HeaderRecord, Vec<TxApply>), ConsensusError> {
-    let ctx = ValidationContext {
-        params,
-        height: Height::GENESIS,
-        milestone: Milestone::NONE,
-    };
+    // Height-gated soft forks (BIP34 / pre-segwit witness ban) deferred to confirm.
+    let ctx = ValidationContext::archive_structure(params);
     let txids = validate_block_structure_hashed(block, &ctx)?;
     let target = Target::from_compact(block.header.bits);
     if target > params.pow_limit {
@@ -689,11 +682,8 @@ pub fn prepare_block_for_archive_ibd(
     params: &ChainParams,
     block: &Block,
 ) -> Result<(HeaderRecord, Vec<TxApply>), ConsensusError> {
-    let ctx = ValidationContext {
-        params,
-        height: Height::GENESIS,
-        milestone: Milestone::NONE,
-    };
+    // Soft-fork height gates at confirm (true height). See ValidationContext::archive_structure.
+    let ctx = ValidationContext::archive_structure(params);
     let txids = validate_block_structure_hashed(block, &ctx)?;
     let target = Target::from_compact(block.header.bits);
     if target > params.pow_limit {

@@ -1725,11 +1725,7 @@ fn consensus_reject_bad_structure_and_milestone() {
 
     let mut block = mine_regtest_block(genesis.block_hash(), genesis.header.time + 1, 1, vec![]);
     block.header.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x11; 32]);
-    let ctx = ValidationContext {
-        params: &params,
-        height: Height(1),
-        milestone: Milestone::NONE,
-    };
+    let ctx = ValidationContext::at(&params, Height(1), Milestone::NONE);
     assert!(matches!(
         validate_block_structure(&block, &ctx),
         Err(ConsensusError::BadBlock(_))
@@ -1796,11 +1792,7 @@ fn consensus_reject_bad_structure_and_milestone() {
     };
     bad.txdata.push(phantom);
     bad.header.merkle_root = bad.compute_merkle_root().unwrap();
-    let ctx = ValidationContext {
-        params: &params,
-        height: Height(2),
-        milestone: ms_hi,
-    };
+    let ctx = ValidationContext::at(&params, Height(2), ms_hi);
     let err = validate_block_connect(&q3, &bad, &ctx, None).expect_err("prevout must fail");
     let msg = err.to_string().to_lowercase();
     assert!(

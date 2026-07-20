@@ -763,17 +763,16 @@ fn resolve_prevout(
         });
         if let Some((prev_fk, prev_rec, out)) = wave_hit {
             connect_prevout_stats::WAVE_HIT.fetch_add(1, Ordering::Relaxed);
-            let (is_cb, cb_h) =
-                coinbase_info(query, prev_fk, prev_rec, wave_prevouts, coinbase_height_cache)?;
-            if !is_cb || cb_h.is_some() {
-                return Ok(ResolvedPrevout {
-                    txout: TxOut {
-                        value: Amount::from_sat(out.value as u64),
-                        script_pubkey: ScriptBuf::from_bytes(out.script.clone()),
-                    },
-                    coinbase_height: cb_h,
-                });
-            }
+            let cb_h =
+                coinbase_height_for_maturity(query, prev_fk, prev_rec, wave_prevouts, coinbase_height_cache)?;
+            // Found a live parent out with matching wire txid — never MissingPrevout.
+            return Ok(ResolvedPrevout {
+                txout: TxOut {
+                    value: Amount::from_sat(out.value as u64),
+                    script_pubkey: ScriptBuf::from_bytes(out.script.clone()),
+                },
+                coinbase_height: cb_h,
+            });
         }
     }
 
@@ -790,54 +789,96 @@ fn resolve_prevout(
         });
     if let Some((prev_fk, prev_rec, out)) = tip_hit {
         connect_prevout_stats::TIP_HIT.fetch_add(1, Ordering::Relaxed);
-        let (is_cb, cb_h) =
-            coinbase_info(query, prev_fk, &prev_rec, wave_prevouts, coinbase_height_cache)?;
-        if !is_cb || cb_h.is_some() {
-            return Ok(ResolvedPrevout {
-                txout: TxOut {
-                    value: Amount::from_sat(out.value as u64),
-                    script_pubkey: ScriptBuf::from_bytes(out.script),
-                },
-                coinbase_height: cb_h,
-            });
-        }
+        let cb_h =
+            coinbase_height_for_maturity(query, prev_fk, &prev_rec, wave_prevouts, coinbase_height_cache)?;
+        return Ok(ResolvedPrevout {
+            txout: TxOut {
+                value: Amount::from_sat(out.value as u64),
+                script_pubkey: ScriptBuf::from_bytes(out.script),
+            },
+            coinbase_height: cb_h,
+        });
     }
 
-    // Cold path: resolve create fk → Class A (txid must match wire outpoint).
-    // Order: stamped/thin prev_fk → light UTXO create_fk → durable head/runs.
-    let resolved_fk = prev_fk
-        .or(query
-            .ibd_utxo_create_fk(&prev_txid, op.vout)
-            .map_err(ConsensusError::Store)?)
-        .or(query
-            .tx_fk_by_txid(&prev_txid)
-            .map_err(ConsensusError::Store)?);
-    if let Some(prev_fk) = resolved_fk {
-        if let Ok(prev_rec) = query.get_tx_class_a(prev_fk) {
-            if prev_rec.txid == prev_txid {
-                if let Ok(out) = find_output(query, &prev_rec, op.vout) {
-                    let (is_cb, cb_h) = coinbase_info(
-                        query,
-                        prev_fk,
-                        &prev_rec,
-                        wave_prevouts,
-                        coinbase_height_cache,
-                    )?;
-                    if !is_cb || cb_h.is_some() {
-                        return Ok(ResolvedPrevout {
-                            txout: TxOut {
-                                value: Amount::from_sat(out.value as u64),
-                                script_pubkey: ScriptBuf::from_bytes(out.script),
-                            },
-                            coinbase_height: cb_h,
-                        });
-                    }
-                }
-            }
+    // Cold path: try every create-fk candidate (thin → UTXO → durable head/runs).
+    // Wrong thin hints must not block UTXO / head after a txid mismatch.
+    let utxo_fk = query
+        .ibd_utxo_create_fk(&prev_txid, op.vout)
+        .map_err(ConsensusError::Store)?;
+    let head_fk = query
+        .tx_fk_by_txid(&prev_txid)
+        .map_err(ConsensusError::Store)?;
+    let candidates = [prev_fk, utxo_fk, head_fk];
+    let mut seen: [u64; 3] = [0; 3];
+    let mut n_seen = 0usize;
+    for prev_fk in candidates.into_iter().flatten() {
+        if prev_fk.is_null() {
+            continue;
         }
+        let id = prev_fk.0;
+        if seen[..n_seen].contains(&id) {
+            continue;
+        }
+        if n_seen < 3 {
+            seen[n_seen] = id;
+            n_seen += 1;
+        }
+        let prev_rec = match query.get_tx_class_a(prev_fk) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if prev_rec.txid != prev_txid {
+            continue;
+        }
+        let out = match find_output(query, &prev_rec, op.vout) {
+            Ok(o) => o,
+            Err(ConsensusError::MissingPrevout) => continue,
+            Err(e) => return Err(e),
+        };
+        let cb_h = coinbase_height_for_maturity(
+            query,
+            prev_fk,
+            &prev_rec,
+            wave_prevouts,
+            coinbase_height_cache,
+        )?;
+        return Ok(ResolvedPrevout {
+            txout: TxOut {
+                value: Amount::from_sat(out.value as u64),
+                script_pubkey: ScriptBuf::from_bytes(out.script),
+            },
+            coinbase_height: cb_h,
+        });
     }
 
     Err(ConsensusError::MissingPrevout)
+}
+
+/// Coinbase create height for maturity, or `None` if not a coinbase / unknown.
+///
+/// Unlike the old `!is_cb || cb_h.is_some()` gate, a missing height never
+/// discards an already-located parent output (that became MissingPrevout).
+fn coinbase_height_for_maturity(
+    query: &Query,
+    prev_fk: rbitcoin_primitives::Fk,
+    prev_rec: &rbitcoin_store::TxRecord,
+    wave_prevouts: Option<&rbitcoin_query::WavePrevoutCache>,
+    coinbase_height_cache: &mut std::collections::HashMap<rbitcoin_primitives::Fk, Option<u32>>,
+) -> Result<Option<u32>, ConsensusError> {
+    let (is_cb, cb_h) =
+        coinbase_info(query, prev_fk, prev_rec, wave_prevouts, coinbase_height_cache)?;
+    if !is_cb {
+        return Ok(None);
+    }
+    if cb_h.is_some() {
+        return Ok(cb_h);
+    }
+    // Last resort: durable tx_height (wave may have been filled pre-Class-C).
+    Ok(query
+        .store()
+        .tx_height
+        .get(prev_fk)
+        .map_err(ConsensusError::Store)?)
 }
 
 /// `(is_coinbase, create_height if coinbase and confirmed)`.

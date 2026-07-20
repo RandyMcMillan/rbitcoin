@@ -1228,14 +1228,18 @@ fn ibd_utxo_multi_block_run_keeps_creates() {
     );
 }
 
-/// Mainnet @546 shape: single-input parent with 2 outs, next height spends both
-/// in one tx. Regression for coinbase_info cache treating `None` + `input_count==1`
-/// as coinbase → MissingPrevout on the second prevout of the same parent.
+/// Mainnet @546 shape:
+/// - height H: 1-in / 2-out parent
+/// - height H+1: tx spends both parent vouts (2-in/2-out), then same-block chain
+/// IBD multi-block `confirm_archived_run` (wave + light UTXO), no durable indexes.
 #[test]
 fn confirm_spend_both_vouts_of_one_input_parent() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
     use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, confirm_archived_at, ChainParams,
-        Milestone,
+        accept_and_archive_block, accept_and_connect_block, confirm_archived_at,
+        confirm_archived_run, ChainParams, Milestone,
     };
     use rbitcoin_test::mine::{
         mine_regtest_block, regtest_genesis, spend_many_anyone_can_spend, split_anyone_can_spend,
@@ -1269,7 +1273,7 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
         tip_time = b.header.time;
     }
 
-    // Height H: 1-in / 2-out parent (anyone-can-spend).
+    // Height H: 1-in / 2-out parent — archive only (confirm with spend in one run).
     let split_h = last_pad + 1;
     let split = split_anyone_can_spend(
         cb1,
@@ -1278,29 +1282,93 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
     );
     let b_split = mine_regtest_block(tip, tip_time + 600, split_h, vec![split]);
     let parent_txid = b_split.txdata[1].compute_txid();
-    accept_and_connect_block(&q, &params, Height(split_h), &b_split, ms).unwrap();
+    accept_and_archive_block(&q, &params, Height(split_h), &b_split, ms).unwrap();
     tip = b_split.block_hash();
     tip_time = b_split.header.time;
 
-    // Height H+1: one tx spends both vouts of that parent.
+    // Height H+1: 546-like chain — dual-vout spend of parent, then same-block hops.
     let merge_h = split_h + 1;
-    let merge = spend_many_anyone_can_spend(
-        &[(parent_txid, 0), (parent_txid, 1)],
-        Amount::from_sat(48_0000_0000),
+    let t1 = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![
+            TxIn {
+                previous_output: OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            },
+            TxIn {
+                previous_output: OutPoint {
+                    txid: parent_txid,
+                    vout: 1,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            },
+        ],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(20_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+            TxOut {
+                value: Amount::from_sat(28_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+        ],
+    };
+    let t1_txid = t1.compute_txid();
+    let t2 = spend_many_anyone_can_spend(
+        &[(t1_txid, 0), (t1_txid, 1)],
+        Amount::from_sat(47_0000_0000),
     );
-    let b_merge = mine_regtest_block(tip, tip_time + 600, merge_h, vec![merge]);
+    let t2_txid = t2.compute_txid();
+    let t3 = spend_many_anyone_can_spend(
+        &[(t2_txid, 0)],
+        Amount::from_sat(46_0000_0000),
+    );
+    let b_merge = mine_regtest_block(tip, tip_time + 600, merge_h, vec![t1, t2, t3]);
     accept_and_archive_block(&q, &params, Height(merge_h), &b_merge, ms).unwrap();
-    confirm_archived_at(
+
+    confirm_archived_run(
         &q,
         &params,
-        Height(merge_h),
-        &b_merge.block_hash().to_byte_array(),
         ms,
+        &[
+            (Height(split_h), b_split.block_hash().to_byte_array()),
+            (Height(merge_h), b_merge.block_hash().to_byte_array()),
+        ],
     )
-    .expect("spending both vouts of a 1-in parent must not MissingPrevout");
+    .expect("mainnet-546-shaped multi-block confirm must not MissingPrevout");
     assert_eq!(q.tip_height(), Some(Height(merge_h)));
     assert!(q.catchup_is_spent(parent_txid.as_byte_array(), 0).unwrap());
     assert!(q.catchup_is_spent(parent_txid.as_byte_array(), 1).unwrap());
+
+    // Cross-batch: next height spends t3 via UTXO create_fk only (no pending_creates).
+    tip = b_merge.block_hash();
+    tip_time = b_merge.header.time;
+    let t3_txid = b_merge.txdata[3].compute_txid();
+    let next_h = merge_h + 1;
+    let spend = spend_many_anyone_can_spend(
+        &[(t3_txid, 0)],
+        Amount::from_sat(45_0000_0000),
+    );
+    let b_next = mine_regtest_block(tip, tip_time + 600, next_h, vec![spend]);
+    accept_and_archive_block(&q, &params, Height(next_h), &b_next, ms).unwrap();
+    confirm_archived_at(
+        &q,
+        &params,
+        Height(next_h),
+        &b_next.block_hash().to_byte_array(),
+        ms,
+    )
+    .expect("cross-batch UTXO create_fk resolve must work");
+    assert_eq!(q.tip_height(), Some(Height(next_h)));
 }
 
 /// Sequential confirm_archived_run + failed confirm must not poison spent_local.

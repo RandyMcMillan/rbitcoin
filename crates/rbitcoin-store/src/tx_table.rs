@@ -142,6 +142,18 @@ pub fn encode_output_run(recs: &[OutputRecord], out: &mut Vec<u8>) {
 }
 
 pub fn decode_output_run(buf: &[u8], count: u32) -> Result<Vec<OutputRecord>, StoreError> {
+    let (out, used) = decode_output_run_prefix(buf, count)?;
+    if used != buf.len() {
+        return Err(StoreError::Corrupt("output run trailing bytes"));
+    }
+    Ok(out)
+}
+
+/// Decode `count` outputs; returns records + bytes consumed (allows trailing data).
+pub fn decode_output_run_prefix(
+    buf: &[u8],
+    count: u32,
+) -> Result<(Vec<OutputRecord>, usize), StoreError> {
     let mut out = Vec::with_capacity(count as usize);
     let mut off = 0;
     for _ in 0..count {
@@ -149,10 +161,7 @@ pub fn decode_output_run(buf: &[u8], count: u32) -> Result<Vec<OutputRecord>, St
         off += used;
         out.push(rec);
     }
-    if off != buf.len() {
-        return Err(StoreError::Corrupt("output run trailing bytes"));
-    }
-    Ok(out)
+    Ok((out, off))
 }
 
 /// Class A input + BIP141 witness (addressed via `tx.input_start_fk` run + local i).
@@ -325,6 +334,18 @@ pub fn encode_input_run(recs: &[InputRecord], out: &mut Vec<u8>) {
 }
 
 pub fn decode_input_run(buf: &[u8], count: u32) -> Result<Vec<InputRecord>, StoreError> {
+    let (out, used) = decode_input_run_prefix(buf, count)?;
+    if used != buf.len() {
+        return Err(StoreError::Corrupt("input run trailing bytes"));
+    }
+    Ok(out)
+}
+
+/// Decode `count` inputs; returns records + bytes consumed (allows trailing data).
+pub fn decode_input_run_prefix(
+    buf: &[u8],
+    count: u32,
+) -> Result<(Vec<InputRecord>, usize), StoreError> {
     let mut out = Vec::with_capacity(count as usize);
     let mut off = 0;
     for _ in 0..count {
@@ -332,10 +353,63 @@ pub fn decode_input_run(buf: &[u8], count: u32) -> Result<Vec<InputRecord>, Stor
         off += used;
         out.push(rec);
     }
-    if off != buf.len() {
-        return Err(StoreError::Corrupt("input run trailing bytes"));
+    Ok((out, off))
+}
+
+/// Packed Class A payload tag (first byte of `tx.body` record).
+///
+/// Layout: `PACKED_V1 || TxRecord(64) || input_run || output_run`
+/// so one `get_raw(fk)` returns the full transaction body (single body IO).
+/// Legacy records are exactly [`TxRecord::ENCODED_LEN`] bytes with no tag.
+pub const PACKED_TX_V1: u8 = 0x01;
+
+/// Encode a full Class A tx as one var payload.
+pub fn encode_packed_tx(
+    tx: &TxRecord,
+    inputs: &[InputRecord],
+    outputs: &[OutputRecord],
+    out: &mut Vec<u8>,
+) {
+    debug_assert_eq!(inputs.len() as u32, tx.input_count);
+    debug_assert_eq!(outputs.len() as u32, tx.output_count);
+    out.push(PACKED_TX_V1);
+    // I/O fks are unused for packed rows (body is self-contained).
+    let mut meta = tx.clone();
+    meta.input_start_fk = Fk::NULL;
+    meta.output_start_fk = Fk::NULL;
+    meta.encode_into(out);
+    encode_input_run(inputs, out);
+    encode_output_run(outputs, out);
+}
+
+/// Decode packed Class A; `raw` is the full var payload including tag.
+pub fn decode_packed_tx(
+    raw: &[u8],
+) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>), StoreError> {
+    if raw.first().copied() != Some(PACKED_TX_V1) {
+        return Err(StoreError::Corrupt("not a packed Class A tx"));
     }
-    Ok(out)
+    if raw.len() < 1 + TxRecord::ENCODED_LEN {
+        return Err(StoreError::Corrupt("short packed Class A tx"));
+    }
+    let meta = TxRecord::decode(&raw[1..1 + TxRecord::ENCODED_LEN])?;
+    let mut off = 1 + TxRecord::ENCODED_LEN;
+    let (inputs, in_used) = decode_input_run_prefix(&raw[off..], meta.input_count)?;
+    off += in_used;
+    let (outputs, out_used) = decode_output_run_prefix(&raw[off..], meta.output_count)?;
+    off += out_used;
+    if off != raw.len() {
+        return Err(StoreError::Corrupt("packed Class A trailing bytes"));
+    }
+    if inputs.len() as u32 != meta.input_count || outputs.len() as u32 != meta.output_count {
+        return Err(StoreError::Corrupt("packed Class A count mismatch"));
+    }
+    Ok((meta, inputs, outputs))
+}
+
+#[inline]
+pub fn is_packed_tx_payload(raw: &[u8]) -> bool {
+    raw.len() > TxRecord::ENCODED_LEN && raw.first().copied() == Some(PACKED_TX_V1)
 }
 
 pub struct TxTable {
@@ -406,7 +480,72 @@ impl TxTable {
 
     pub fn get(&self, fk: Fk) -> Result<TxRecord, StoreError> {
         let raw = self.body.get_raw(fk)?;
-        TxRecord::decode(&raw)
+        if is_packed_tx_payload(&raw) {
+            let (tx, _, _) = decode_packed_tx(&raw)?;
+            Ok(tx)
+        } else {
+            TxRecord::decode(&raw)
+        }
+    }
+
+    /// Full tx body in **one** `tx.body` read (packed), or legacy 3-table path.
+    pub fn get_full(
+        &self,
+        fk: Fk,
+        inputs: &InputTable,
+        outputs: &OutputTable,
+    ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>), StoreError> {
+        let raw = self.body.get_raw(fk)?;
+        if is_packed_tx_payload(&raw) {
+            return decode_packed_tx(&raw);
+        }
+        // Legacy split tables (pre-packed Class A).
+        let tx = TxRecord::decode(&raw)?;
+        let ins = if tx.input_count == 0 {
+            Vec::new()
+        } else {
+            let run = tx.input_start_fk.get().ok_or(StoreError::InvalidFk)?;
+            inputs.get_run(Fk(run), tx.input_count)?
+        };
+        let outs = if tx.output_count == 0 {
+            Vec::new()
+        } else {
+            let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
+            outputs.get_run(Fk(run), tx.output_count)?
+        };
+        Ok((tx, ins, outs))
+    }
+
+    /// Append packed full-tx records (one var payload per tx = one body IO on read).
+    pub fn put_full_batch_indexed(
+        &self,
+        items: &[(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)],
+        index: bool,
+    ) -> Result<Vec<Fk>, StoreError> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let est: usize = items
+            .iter()
+            .map(|(_tx, ins, outs)| {
+                1 + TxRecord::ENCODED_LEN
+                    + ins.iter().map(|i| i.encoded_len()).sum::<usize>()
+                    + outs.iter().map(|o| o.encoded_len()).sum::<usize>()
+            })
+            .sum();
+        let fks = self.body.put_batch_encode(items.len(), est, |i, buf| {
+            let (tx, ins, outs) = &items[i];
+            encode_packed_tx(tx, ins, outs, buf);
+        })?;
+        if index {
+            let heads: Vec<([u8; 32], Fk)> = items
+                .iter()
+                .zip(fks.iter())
+                .map(|((tx, _, _), fk)| (tx.txid, *fk))
+                .collect();
+            self.head.insert_many(&heads)?;
+        }
+        Ok(fks)
     }
 
     pub fn get_by_txid(&self, txid: &[u8; 32]) -> Result<Option<(Fk, TxRecord)>, StoreError> {
@@ -784,5 +923,45 @@ mod tests {
         let enc = rec.encode();
         assert_eq!(enc.len(), TxRecord::ENCODED_LEN);
         assert_eq!(TxRecord::decode(&enc).unwrap(), rec);
+    }
+
+    #[test]
+    fn packed_tx_roundtrip() {
+        let tx = TxRecord {
+            txid: [7u8; 32],
+            version: 2,
+            locktime: 0,
+            input_start_fk: Fk(99), // ignored in packed
+            input_count: 1,
+            output_start_fk: Fk(88),
+            output_count: 2,
+        };
+        let inputs = vec![InputRecord {
+            prev_txid: [0u8; 32],
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![0x01, 0x00],
+            witness: vec![],
+        }];
+        let outputs = vec![
+            OutputRecord {
+                value: 50_0000_0000,
+                script: vec![0x51],
+            },
+            OutputRecord {
+                value: 1,
+                script: vec![0x00, 0x14],
+            },
+        ];
+        let mut enc = Vec::new();
+        encode_packed_tx(&tx, &inputs, &outputs, &mut enc);
+        assert!(is_packed_tx_payload(&enc));
+        let (dtx, dins, douts) = decode_packed_tx(&enc).unwrap();
+        assert_eq!(dtx.txid, tx.txid);
+        assert_eq!(dtx.input_count, 1);
+        assert_eq!(dtx.output_count, 2);
+        assert!(dtx.input_start_fk.get().is_none());
+        assert_eq!(dins, inputs);
+        assert_eq!(douts, outputs);
     }
 }

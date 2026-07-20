@@ -77,7 +77,9 @@ impl Query {
         Ok(header_fks)
     }
 
-    /// Mega-batch Class A: one put_batch per table; I/O are **per-tx runs**.
+    /// Mega-batch Class A: **packed full-tx** rows (one `tx.body` payload per
+    /// tx → single IO on `get_tx_full`). Split input/output tables are no longer
+    /// written for new archives (legacy rows remain readable).
     ///
     /// Non-coinbase inputs always store external `prev_txid` + vout (no Class A
     /// `prev_tx_fk`). Confirm uses light UTXO create_fk; tip mode uses points/head.
@@ -86,13 +88,8 @@ impl Query {
         need: &mut [(Fk, Vec<TxApply>)],
     ) -> Result<(), QueryError> {
         let mut next_tx = self.store.txs.count() + 1;
-        // One run FK per non-empty I/O side (not per individual input/output).
-        let mut next_in_run = self.store.inputs.count() + 1;
-        let mut next_out_run = self.store.outputs.count() + 1;
 
-        let mut all_txs: Vec<TxRecord> = Vec::new();
-        let mut all_input_runs: Vec<Vec<InputRecord>> = Vec::new();
-        let mut all_output_runs: Vec<Vec<OutputRecord>> = Vec::new();
+        let mut packed: Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> = Vec::new();
         let mut per_header_ranges: Vec<(Fk, Fk, u32)> = Vec::with_capacity(need.len());
         let mut spends: Vec<([u8; 32], u32, Fk, u32)> = Vec::new();
         // (out_txid, out_idx, spend_fk, in_idx, height) for point runs
@@ -115,105 +112,62 @@ impl Query {
                 let n_out = ta.outputs.len() as u32;
                 let tx_fk = Fk(next_tx);
                 next_tx += 1;
-                let in_start = if n_in == 0 {
-                    Fk::NULL
-                } else {
-                    let fk = Fk(next_in_run);
-                    next_in_run += 1;
-                    fk
-                };
-                let out_start = if n_out == 0 {
-                    Fk::NULL
-                } else {
-                    let fk = Fk(next_out_run);
-                    next_out_run += 1;
-                    fk
-                };
 
                 let mut tx = ta.tx;
-                tx.input_start_fk = in_start;
+                // Packed rows are self-contained; I/O fks stay NULL.
+                tx.input_start_fk = Fk::NULL;
                 tx.input_count = n_in;
-                tx.output_start_fk = out_start;
+                tx.output_start_fk = Fk::NULL;
                 tx.output_count = n_out;
-                all_txs.push(tx);
 
-                if n_in > 0 {
-                    let mut inputs = ta.inputs;
-                    for (i, inp) in inputs.iter_mut().enumerate() {
-                        if !inp.is_coinbase() {
-                            if spend_on {
-                                spends.push((inp.prev_txid, inp.prev_index, tx_fk, i as u32));
-                            } else if point_runs {
-                                run_spends.push((
-                                    inp.prev_txid,
-                                    inp.prev_index,
-                                    tx_fk,
-                                    i as u32,
-                                    hdr_height,
-                                ));
-                            }
+                let mut inputs = ta.inputs;
+                for (i, inp) in inputs.iter_mut().enumerate() {
+                    if !inp.is_coinbase() {
+                        if spend_on {
+                            spends.push((inp.prev_txid, inp.prev_index, tx_fk, i as u32));
+                        } else if point_runs {
+                            run_spends.push((
+                                inp.prev_txid,
+                                inp.prev_index,
+                                tx_fk,
+                                i as u32,
+                                hdr_height,
+                            ));
                         }
                     }
-                    all_input_runs.push(inputs);
                 }
-
-                if n_out > 0 {
-                    all_output_runs.push(ta.outputs);
-                }
+                packed.push((tx, inputs, ta.outputs));
             }
             per_header_ranges.push((*header_fk, first_tx_fk, n_txs));
         }
 
-        let tx_est: u64 = (all_txs.len() * TxRecord::ENCODED_LEN) as u64;
-        let in_est: u64 = all_input_runs
+        let body_est: u64 = packed
             .iter()
-            .map(|r| r.iter().map(|x| x.encoded_len() as u64).sum::<u64>())
-            .sum();
-        let out_est: u64 = all_output_runs
-            .iter()
-            .map(|r| r.iter().map(|x| x.encoded_len() as u64).sum::<u64>())
+            .map(|(_tx, ins, outs)| {
+                (1 + TxRecord::ENCODED_LEN) as u64
+                    + ins.iter().map(|x| x.encoded_len() as u64).sum::<u64>()
+                    + outs.iter().map(|x| x.encoded_len() as u64).sum::<u64>()
+            })
             .sum();
         self.store
             .txs
-            .reserve_append(tx_est, all_txs.len() as u64)?;
-        self.store
-            .inputs
-            .reserve_append(in_est, all_input_runs.len() as u64)?;
-        self.store
-            .outputs
-            .reserve_append(out_est, all_output_runs.len() as u64)?;
+            .reserve_append(body_est, packed.len() as u64)?;
 
-        let in_refs: Vec<&[InputRecord]> = all_input_runs.iter().map(|r| r.as_slice()).collect();
-        let out_refs: Vec<&[OutputRecord]> =
-            all_output_runs.iter().map(|r| r.as_slice()).collect();
-        let (tx_res, in_res, out_res) = std::thread::scope(|scope| {
-            let tx_h = scope.spawn(|| self.store.txs.put_batch_indexed(&all_txs, index_tx));
-            let in_h = scope.spawn(|| self.store.inputs.put_runs(&in_refs));
-            let out_h = scope.spawn(|| self.store.outputs.put_runs(&out_refs));
-            (
-                tx_h.join().expect("txs put"),
-                in_h.join().expect("inputs put"),
-                out_h.join().expect("outputs put"),
-            )
-        });
-        let got_tx_fks = tx_res?;
-        in_res?;
-        out_res?;
-        if got_tx_fks.len() != all_txs.len() {
-            return Err(StoreError::Corrupt("tx put_batch length"));
+        let got_tx_fks = self.store.put_tx_full_batch_indexed(&packed, index_tx)?;
+        if got_tx_fks.len() != packed.len() {
+            return Err(StoreError::Corrupt("tx put_full_batch length"));
         }
         if let Some(&(_, first_tx, _)) = per_header_ranges.first() {
             if got_tx_fks.first().copied() != Some(first_tx) {
-                return Err(StoreError::Corrupt("tx put_batch fk mismatch"));
+                return Err(StoreError::Corrupt("tx put_full_batch fk mismatch"));
             }
         }
         // No generic Class A cache: confirm parents live in ConfirmParentCache
         // (prewarm). Archive only enqueues catch-up index runs.
-        for (rec, fk) in all_txs.iter().zip(got_tx_fks.iter()) {
+        for ((rec, _, _), fk) in packed.iter().zip(got_tx_fks.iter()) {
             if tx_runs {
                 self.enqueue_tx_run(rec.txid, *fk);
             }
-            let _ = (rec, fk);
         }
 
         if spend_on && !spends.is_empty() {

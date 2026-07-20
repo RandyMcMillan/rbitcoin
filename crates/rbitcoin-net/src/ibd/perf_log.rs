@@ -119,6 +119,9 @@ pub(crate) struct IbdPerfSample {
     pub pw_reserved: u64,
     pub pw_creates: u64,
     pub pw_already_ready: u64,
+    pub pw_parent_unique: u64,
+    pub pw_cache_hits: u64,
+    pub pw_full_tx_reads: u64,
     /// Contiguous scanned watermark height.
     pub pw_ready_through: u32,
     /// `ready_through - tip` (blocks warmer is ahead of confirm tip).
@@ -214,6 +217,9 @@ impl Default for IbdPerfSample {
             pw_reserved: 0,
             pw_creates: 0,
             pw_already_ready: 0,
+            pw_parent_unique: 0,
+            pw_cache_hits: 0,
+            pw_full_tx_reads: 0,
             pw_ready_through: 0,
             pw_ahead: 0,
             pw_parents: 0,
@@ -272,8 +278,17 @@ pub(crate) fn sample(
     let _ = rbitcoin_query::class_a_cache_stats::sample_and_reset();
     let (tph, tpm, tpe, tpn, tpr) = rbitcoin_query::tip_prevout_cache_stats::sample_and_reset();
     let (pth, pwh, pca, psm) = rbitcoin_query::connect_prevout_stats::sample_and_reset();
-    let (pw_ns, pw_blocks, pw_utxo, pw_res, pw_creates, pw_ready) =
-        rbitcoin_query::parent_prewarm_stats::sample_and_reset();
+    let (
+        pw_ns,
+        pw_blocks,
+        pw_utxo,
+        pw_res,
+        pw_creates,
+        pw_ready,
+        pw_parent_unique,
+        pw_cache_hits,
+        pw_full_tx_reads,
+    ) = rbitcoin_query::parent_prewarm_stats::sample_and_reset();
     let pipe = pipe_stats.sample_and_reset();
     let (utxo_enabled, utxo_live, utxo_tip, utxo_rebuilds) = utxo;
     let (pw_ready_through, pw_ahead, pw_parents, pw_open_reserves, pw_plans, pw_depth) = prewarm;
@@ -358,6 +373,9 @@ pub(crate) fn sample(
         pw_reserved: pw_res,
         pw_creates,
         pw_already_ready: pw_ready,
+        pw_parent_unique,
+        pw_cache_hits,
+        pw_full_tx_reads,
         pw_ready_through,
         pw_ahead,
         pw_parents,
@@ -413,9 +431,9 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             " | live first={first} batch={n} elapsed_ms={elapsed_ms}"
         ));
     }
-    // Parent prewarm: how far ahead of tip + work this window.
+    // Parent prewarm: ahead-of-tip + work/IO this window.
     out.push_str(&format!(
-        " | prewarm ahead={} through={} parents={} reserved={} plans={}/{} blks={} ms={}",
+        " | prewarm ahead={} through={} parents={} reserved={} plans={}/{} blks={} ms={} uniq_p={} cache_hit={} full_tx={}",
         s.pw_ahead,
         s.pw_ready_through,
         s.pw_parents,
@@ -424,6 +442,9 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.pw_depth,
         s.pw_blocks,
         s.pw_ms,
+        s.pw_parent_unique,
+        s.pw_cache_hits,
+        s.pw_full_tx_reads,
     ));
     out
 }
@@ -474,7 +495,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     };
     let cp_tot = s.cp_tip + s.cp_wave + s.cp_class_a + s.cp_store;
     out.push_str(&format!(
-        " | prewarm ahead={} through={} parents={} open_res={} plans={}/{} win_ms={} blks={} utxo_p={} reserved={} creates={} skip={} | tip_po hit={} miss={} evict={} note={} retire={} hit%={} connect tip%={} wave%={} parent%={} store%={}",
+        " | prewarm ahead={} through={} parents={} open_res={} plans={}/{} win_ms={} blks={} utxo_p={} reserved={} creates={} skip={} uniq_p={} cache_hit={} full_tx={} | tip_po hit={} miss={} evict={} note={} retire={} hit%={} connect tip%={} wave%={} parent%={} store%={}",
         s.pw_ahead,
         s.pw_ready_through,
         s.pw_parents,
@@ -487,6 +508,9 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.pw_reserved,
         s.pw_creates,
         s.pw_already_ready,
+        s.pw_parent_unique,
+        s.pw_cache_hits,
+        s.pw_full_tx_reads,
         s.tp_hit,
         s.tp_miss,
         s.tp_evict,

@@ -72,9 +72,15 @@ pub mod parent_prewarm_stats {
     pub static CREATES: AtomicU64 = AtomicU64::new(0);
     /// Heights already ready (skipped).
     pub static ALREADY_READY: AtomicU64 = AtomicU64::new(0);
+    /// Unique parent create fks loaded (after sort/dedup).
+    pub static PARENT_UNIQUE: AtomicU64 = AtomicU64::new(0);
+    /// Parent outs from cache (no store).
+    pub static PARENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+    /// `get_tx_full` store calls.
+    pub static FULL_TX_READS: AtomicU64 = AtomicU64::new(0);
 
-    /// `(ns, blocks, utxo_parents, reserved, creates, already_ready)`.
-    pub fn sample_and_reset() -> (u64, u64, u64, u64, u64, u64) {
+    /// `(ns, blocks, utxo_parents, reserved, creates, already_ready, parent_unique, cache_hits, full_tx_reads)`.
+    pub fn sample_and_reset() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
         (
             NS.swap(0, Ordering::Relaxed),
             BLOCKS.swap(0, Ordering::Relaxed),
@@ -82,6 +88,9 @@ pub mod parent_prewarm_stats {
             RESERVED.swap(0, Ordering::Relaxed),
             CREATES.swap(0, Ordering::Relaxed),
             ALREADY_READY.swap(0, Ordering::Relaxed),
+            PARENT_UNIQUE.swap(0, Ordering::Relaxed),
+            PARENT_CACHE_HITS.swap(0, Ordering::Relaxed),
+            FULL_TX_READS.swap(0, Ordering::Relaxed),
         )
     }
 
@@ -104,6 +113,15 @@ pub mod parent_prewarm_stats {
         }
         if st.already_ready > 0 {
             ALREADY_READY.fetch_add(st.already_ready as u64, Ordering::Relaxed);
+        }
+        if st.parent_unique > 0 {
+            PARENT_UNIQUE.fetch_add(st.parent_unique as u64, Ordering::Relaxed);
+        }
+        if st.parent_cache_hits > 0 {
+            PARENT_CACHE_HITS.fetch_add(st.parent_cache_hits as u64, Ordering::Relaxed);
+        }
+        if st.full_tx_reads > 0 {
+            FULL_TX_READS.fetch_add(st.full_tx_reads as u64, Ordering::Relaxed);
         }
     }
 }
@@ -784,13 +802,22 @@ impl Query {
         self.store.get_input_run(run_fk, count)
     }
 
-    /// Input `i` of a tx row (run-addressed).
+    /// Input `i` of a tx row (run-addressed or packed full body).
     pub fn tx_input(&self, tx: &TxRecord, i: u32) -> Result<InputRecord, QueryError> {
         if i >= tx.input_count {
             return Err(StoreError::NotFound);
         }
-        let run = tx.input_start_fk.get().ok_or(StoreError::InvalidFk)?;
-        self.get_input_at(Fk(run), tx.input_count, i)
+        if let Some(run) = tx.input_start_fk.get() {
+            return self.get_input_at(Fk(run), tx.input_count, i);
+        }
+        let fk = self
+            .lookup_tx_fk(&tx.txid)?
+            .ok_or(StoreError::NotFound)?;
+        let (_, inputs, _) = self.store.get_tx_full(fk)?;
+        inputs
+            .get(i as usize)
+            .cloned()
+            .ok_or(StoreError::NotFound)
     }
 
     /// Output `vout` of a tx row (run-addressed).
@@ -824,9 +851,13 @@ impl Query {
                 }
                 return Ok(o);
             }
-            // Load full run; promote into tip-window (prevout path).
-            let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-            let outs = self.get_output_run(Fk(run), tx.output_count)?;
+            // Load full outs (packed = one body IO); promote into tip-window.
+            let outs = if let Some(run) = tx.output_start_fk.get() {
+                self.get_output_run(Fk(run), tx.output_count)?
+            } else {
+                let (_, _, o) = self.store.get_tx_full(fk)?;
+                o
+            };
             let out = outs
                 .get(vout as usize)
                 .cloned()
@@ -838,12 +869,14 @@ impl Query {
             }
             return Ok(out);
         }
-        let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-        let out = self.get_output_at(Fk(run), tx.output_count, vout)?;
-        if count_connect {
-            connect_prevout_stats::STORE_MISS.fetch_add(1, Ordering::Relaxed);
+        if let Some(run) = tx.output_start_fk.get() {
+            let out = self.get_output_at(Fk(run), tx.output_count, vout)?;
+            if count_connect {
+                connect_prevout_stats::STORE_MISS.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(out);
         }
-        Ok(out)
+        Err(StoreError::NotFound)
     }
 
     pub fn put_spend(

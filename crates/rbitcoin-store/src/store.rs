@@ -176,6 +176,24 @@ impl Store {
         self.txs.get(fk)
     }
 
+    /// Full Class A body by fk: **one** `tx.body` read when packed; legacy
+    /// rows fall back to split input/output tables.
+    pub fn get_tx_full(
+        &self,
+        fk: Fk,
+    ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>), StoreError> {
+        self.txs.get_full(fk, &self.inputs, &self.outputs)
+    }
+
+    /// Append packed full-tx Class A rows (preferred archive path).
+    pub fn put_tx_full_batch_indexed(
+        &self,
+        items: &[(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)],
+        index: bool,
+    ) -> Result<Vec<Fk>, StoreError> {
+        self.txs.put_full_batch_indexed(items, index)
+    }
+
     pub fn get_tx_by_txid(&self, txid: &[u8; 32]) -> Result<Option<(Fk, TxRecord)>, StoreError> {
         self.txs.get_by_txid(txid)
     }

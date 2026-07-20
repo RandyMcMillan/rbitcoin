@@ -22,6 +22,14 @@ pub struct PrewarmStats {
     pub reserved: u32,
     pub creates_registered: u32,
     pub already_ready: u32,
+    /// Unique parent create fks loaded from store this call (after dedup).
+    pub parent_unique: u32,
+    /// Parent outs served from confirm_parents / tip_prevout (no store).
+    pub parent_cache_hits: u32,
+    /// `get_tx_full` calls (prefer packed = 1 body IO).
+    pub full_tx_reads: u32,
+    /// Legacy split-table fallback reads (counted inside store path as full_tx).
+    pub body_tx_reads: u32,
 }
 
 impl Query {
@@ -210,67 +218,51 @@ impl Query {
         };
         st.blocks = st.blocks.saturating_add(1);
 
-        // Index this block's creates first so later spends in the same block
-        // and later runway heights can resolve them without UTXO.
-        let mut body_creates: Vec<(Fk, TxRecord, Vec<OutputRecord>)> = Vec::new();
+        // Load this block's bodies (packed = 1 IO each). Register creates first.
+        let mut body_creates: Vec<(Fk, TxRecord, Vec<OutputRecord>, Vec<InputRecord>)> =
+            Vec::with_capacity(tx_fks.len());
+        let mut local: HashMap<[u8; 32], Fk> = HashMap::with_capacity(tx_fks.len());
         for &fk in &tx_fks {
-            let tx = self.store.get_tx(fk)?;
-            let outs = if tx.output_count > 0 {
-                let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-                self.store.get_output_run(Fk(run), tx.output_count)?
-            } else {
-                Vec::new()
-            };
+            let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
+            st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+            st.body_tx_reads = st.body_tx_reads.saturating_add(1);
             self.confirm_parents
                 .register_runway_creates(fk, &tx, &outs, height);
             st.creates_registered = st.creates_registered.saturating_add(1);
-            body_creates.push((fk, tx, outs));
+            local.insert(tx.txid, fk);
+            body_creates.push((fk, tx, outs, inputs));
         }
 
-        // Same-block txid → fk for in-block spends.
-        let mut local: HashMap<[u8; 32], Fk> = HashMap::new();
-        for (fk, tx, _) in &body_creates {
-            local.insert(tx.txid, *fk);
-        }
+        // Collect external parent needs: resolve fk, then sort/dedup before store IO.
+        // (create_fk, vout) — only those not same-block and not already cached.
+        let mut need_load: Vec<(u64, u32)> = Vec::new();
+        let mut need_put: Vec<(u32, Fk, u32)> = Vec::new(); // (height, fk, vout) for cache hits path
 
-        for (_fk, tx, _outs) in &body_creates {
-            let inputs = if tx.input_count > 0 {
-                let run = tx.input_start_fk.get().ok_or(StoreError::InvalidFk)?;
-                self.store.get_input_run(Fk(run), tx.input_count)?
-            } else {
-                continue;
-            };
-            for inp in &inputs {
+        for (_fk, _tx, _outs, inputs) in &body_creates {
+            for inp in inputs {
                 if inp.is_coinbase() {
                     continue;
                 }
-                // Same-block create: pull from body we just registered.
+                // Same-block create: no store.
                 if let Some(&cfk) = local.get(&inp.prev_txid) {
-                    if let Some((_, _, outs)) =
-                        body_creates.iter().find(|(f, _, _)| *f == cfk)
+                    if let Some((_, ptx, outs, _)) =
+                        body_creates.iter().find(|(f, _, _, _)| *f == cfk)
                     {
                         if let Some(o) = outs.get(inp.prev_index as usize) {
-                            let ptx = body_creates
-                                .iter()
-                                .find(|(f, _, _)| *f == cfk)
-                                .map(|(_, t, _)| t.clone())
-                                .unwrap();
                             self.confirm_parents.put_utxo_parent(
                                 height,
                                 cfk,
-                                ptx,
+                                ptx.clone(),
                                 inp.prev_index,
                                 o.clone(),
                             );
                             st.utxo_parents = st.utxo_parents.saturating_add(1);
+                            st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                         }
                     }
                     continue;
                 }
 
-                // Resolve create: light UTXO first (IBD catch-up), then durable
-                // tx index / runway cache (Tip mode, or UTXO miss with known body).
-                // Only reserve when the create is not findable yet (later runway).
                 let create_fk = self
                     .ibd_utxo_create_fk(&inp.prev_txid, inp.prev_index)?
                     .or_else(|| self.confirm_parents.get_by_txid(&inp.prev_txid))
@@ -283,51 +275,33 @@ impl Query {
 
                 match create_fk {
                     Some(create_fk) => {
-                        // Prefer already-cached runway/UTXO outs (no re-read).
-                        if let Some((ptx, o)) =
-                            self.confirm_parents.get_parent_out(create_fk, inp.prev_index)
+                        if self
+                            .confirm_parents
+                            .get_parent_out(create_fk, inp.prev_index)
+                            .is_some()
                         {
-                            self.confirm_parents.put_utxo_parent(
-                                height,
-                                create_fk,
-                                ptx,
-                                inp.prev_index,
-                                o,
-                            );
-                            st.utxo_parents = st.utxo_parents.saturating_add(1);
+                            // Already in runway cache — re-note for this height.
+                            if let Some((ptx, o)) =
+                                self.confirm_parents.get_parent_out(create_fk, inp.prev_index)
+                            {
+                                self.confirm_parents.put_utxo_parent(
+                                    height,
+                                    create_fk,
+                                    ptx,
+                                    inp.prev_index,
+                                    o,
+                                );
+                                st.utxo_parents = st.utxo_parents.saturating_add(1);
+                                st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
+                            }
                             continue;
                         }
-                        let ptx = self.store.get_tx(create_fk)?;
-                        let run = ptx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-                        let all = self.store.get_output_run(Fk(run), ptx.output_count)?;
-                        let o = all
-                            .get(inp.prev_index as usize)
-                            .cloned()
-                            .ok_or(StoreError::NotFound)?;
-                        self.confirm_parents.put_utxo_parent(
-                            height,
-                            create_fk,
-                            ptx,
-                            inp.prev_index,
-                            o,
-                        );
-                        // Also seed tip_prevout for connect short-circuit.
-                        if let Some((tx, outs_map)) =
-                            self.confirm_parents.get_parent_outs(create_fk)
-                        {
-                            let n = tx.output_count as usize;
-                            let mut slots = vec![None; n];
-                            for (v, o) in outs_map {
-                                if (v as usize) < n {
-                                    slots[v as usize] = Some(o);
-                                }
-                            }
-                            self.tip_prevout_cache.note_live_slots(create_fk, tx, &slots);
+                        if let Some(fk_id) = create_fk.get() {
+                            need_load.push((fk_id, inp.prev_index));
+                            need_put.push((height, create_fk, inp.prev_index));
                         }
-                        st.utxo_parents = st.utxo_parents.saturating_add(1);
                     }
                     None => {
-                        // Create body not yet known — reserve for runway register.
                         self.confirm_parents.reserve(
                             height,
                             inp.prev_txid,
@@ -337,6 +311,57 @@ impl Query {
                     }
                 }
             }
+        }
+
+        // Sort + dedup by (create_fk, vout); load once per unique create fk.
+        need_load.sort_unstable();
+        need_load.dedup();
+        let mut uniq_fks: Vec<u64> = need_load.iter().map(|(f, _)| *f).collect();
+        uniq_fks.sort_unstable();
+        uniq_fks.dedup();
+        st.parent_unique = st.parent_unique.saturating_add(uniq_fks.len() as u32);
+
+        // One get_tx_full per unique create fk (packed = 1 body IO).
+        let mut loaded: HashMap<u64, (TxRecord, Vec<OutputRecord>)> =
+            HashMap::with_capacity(uniq_fks.len());
+        for fk_id in uniq_fks {
+            let fk = Fk(fk_id);
+            let (ptx, _ins, outs) = self.store.get_tx_full(fk)?;
+            st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+            loaded.insert(fk_id, (ptx, outs));
+        }
+
+        // Apply needed parent outs; seed tip_prevout once per unique create fk.
+        let mut tip_seeded: HashMap<u64, ()> = HashMap::new();
+        for &(_h, create_fk, vout) in &need_put {
+            let Some(id) = create_fk.get() else {
+                continue;
+            };
+            let Some((ptx, outs)) = loaded.get(&id) else {
+                continue;
+            };
+            let Some(o) = outs.get(vout as usize) else {
+                return Err(StoreError::NotFound);
+            };
+            self.confirm_parents.put_utxo_parent(
+                height,
+                create_fk,
+                ptx.clone(),
+                vout,
+                o.clone(),
+            );
+            if tip_seeded.insert(id, ()).is_none() {
+                let n = ptx.output_count as usize;
+                let mut slots = vec![None; n];
+                for (v, o) in outs.iter().enumerate() {
+                    if v < n {
+                        slots[v] = Some(o.clone());
+                    }
+                }
+                self.tip_prevout_cache
+                    .note_live_slots(create_fk, ptx.clone(), &slots);
+            }
+            st.utxo_parents = st.utxo_parents.saturating_add(1);
         }
 
         self.confirm_parents.mark_scanned(height);

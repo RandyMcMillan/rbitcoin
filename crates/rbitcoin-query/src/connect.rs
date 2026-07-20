@@ -343,13 +343,22 @@ impl Query {
         Ok(())
     }
 
-    /// Load all inputs for a Class A tx (one run read).
+    /// Load all inputs for a Class A tx.
+    ///
+    /// Packed rows (`input_start_fk` null): one `get_tx_full` by txid/fk.
+    /// Legacy: split input-run table.
     pub fn tx_input_run(&self, tx: &TxRecord) -> Result<Vec<InputRecord>, QueryError> {
         if tx.input_count == 0 {
             return Ok(Vec::new());
         }
-        let run = tx.input_start_fk.get().ok_or(StoreError::InvalidFk)?;
-        self.get_input_run(Fk(run), tx.input_count)
+        if let Some(run) = tx.input_start_fk.get() {
+            return self.get_input_run(Fk(run), tx.input_count);
+        }
+        let fk = self
+            .lookup_tx_fk(&tx.txid)?
+            .ok_or(StoreError::NotFound)?;
+        let (_, inputs, _) = self.store.get_tx_full(fk)?;
+        Ok(inputs)
     }
 
     /// Output run: tip_prevout → store (connect prevout path).
@@ -364,12 +373,17 @@ impl Query {
             if let Some(outputs) = self.tip_prevout_cache.get_outputs(fk) {
                 return Ok(outputs);
             }
-            let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-            let outputs = self.get_output_run(Fk(run), tx.output_count)?;
+            let outputs = if let Some(run) = tx.output_start_fk.get() {
+                self.get_output_run(Fk(run), tx.output_count)?
+            } else {
+                let (_, _, outs) = self.store.get_tx_full(fk)?;
+                outs
+            };
             self.tip_prevout_cache
                 .note(fk, tx.clone(), outputs.clone());
             return Ok(outputs);
         }
+        // No fk: legacy only.
         let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
         self.get_output_run(Fk(run), tx.output_count)
     }
@@ -377,14 +391,18 @@ impl Query {
     /// Output run from store (keyed by known create fk — no txid lookup).
     pub(crate) fn tx_output_run_class_a(
         &self,
-        _create_fk: Fk,
+        create_fk: Fk,
         tx: &TxRecord,
     ) -> Result<Vec<OutputRecord>, QueryError> {
         if tx.output_count == 0 {
             return Ok(Vec::new());
         }
-        let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-        self.get_output_run(Fk(run), tx.output_count)
+        if let Some(run) = tx.output_start_fk.get() {
+            return self.get_output_run(Fk(run), tx.output_count);
+        }
+        // Packed Class A.
+        let (_, _, outs) = self.store.get_tx_full(create_fk)?;
+        Ok(outs)
     }
 
     /// Connect a block at `height` (genesis or tip+1): archive Class A then confirm Class C.

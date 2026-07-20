@@ -132,10 +132,8 @@ impl Query {
                 }
                 (tx, m)
             } else {
-                // Prewarm should have populated; last-resort store load.
-                let tx = self.store.get_tx(fk)?;
-                let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-                let raw = self.store.get_output_run(Fk(run), tx.output_count)?;
+                // Prewarm should have populated; last-resort single-IO full body.
+                let (tx, _, raw) = self.store.get_tx_full(fk)?;
                 let mut m = HashMap::new();
                 for &v in needed_vouts {
                     if let Some(o) = raw.get(v as usize) {
@@ -175,8 +173,14 @@ impl Query {
                         continue;
                     }
                 }
-                let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-                let o = self.store.get_output_at(Fk(run), tx.output_count, v)?;
+                let o = if let Some(run) = tx.output_start_fk.get() {
+                    self.store.get_output_at(Fk(run), tx.output_count, v)?
+                } else {
+                    let (_, _, outs) = self.store.get_tx_full(fk)?;
+                    outs.get(v as usize)
+                        .cloned()
+                        .ok_or(StoreError::NotFound)?
+                };
                 if (v as usize) < slots.len() {
                     slots[v as usize] = Some(o);
                 }
@@ -204,19 +208,8 @@ impl Query {
         &self,
         fk: Fk,
     ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>), QueryError> {
-        let tx = self.store.get_tx(fk)?;
-        let outs = if tx.output_count == 0 {
-            Vec::new()
-        } else {
-            let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-            self.store.get_output_run(Fk(run), tx.output_count)?
-        };
-        let inputs = if tx.input_count == 0 {
-            Vec::new()
-        } else {
-            let run = tx.input_start_fk.get().ok_or(StoreError::InvalidFk)?;
-            self.store.get_input_run(Fk(run), tx.input_count)?
-        };
+        // Packed Class A: one body IO; legacy: split tables.
+        let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
         Ok((tx, outs, inputs))
     }
 

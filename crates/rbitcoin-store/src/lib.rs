@@ -42,7 +42,9 @@ pub use sorted_run::{
     verify_run_body, write_sorted_run, SortedRunPath,
 };
 pub use store::Store;
-pub use tx_table::{InputRecord, OutputRecord, TxRecord};
+pub use tx_table::{
+    encode_packed_tx, is_packed_tx_payload, InputRecord, OutputRecord, TxRecord, PACKED_TX_V1,
+};
 
 /// Crate identity for diagnostics and coverage scenarios.
 pub fn crate_name() -> &'static str {

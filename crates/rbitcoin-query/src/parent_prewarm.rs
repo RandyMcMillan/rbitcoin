@@ -169,11 +169,10 @@ impl Query {
         }
         self.confirm_parents.ensure_plans(&work);
 
-        // ── Phase 1: full block bodies (creates available without UTXO) ─────
-        // Per-height: list of (fk, tx, outs, inputs) for phase 2 spend scan.
-        let mut phase1: Vec<(u32, Vec<(Fk, TxRecord, Vec<OutputRecord>, Vec<InputRecord>)>)> =
-            Vec::with_capacity(work.len());
-
+        // ── Phase 1: resolve header → tx fks, then load bodies by **sorted fk** ─
+        // Sorting improves sequential locality in packed `tx.body` under archive load.
+        let mut height_tx_fks: Vec<(u32, Vec<Fk>)> = Vec::with_capacity(work.len());
+        let mut all_body_fks: Vec<u64> = Vec::new();
         for &(height, hash) in &work {
             if self.confirm_cancelled() {
                 crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
@@ -186,12 +185,40 @@ impl Query {
                 continue;
             };
             st.blocks = st.blocks.saturating_add(1);
+            for fk in &tx_fks {
+                if let Some(id) = fk.get() {
+                    all_body_fks.push(id);
+                }
+            }
+            height_tx_fks.push((height, tx_fks));
+        }
+
+        all_body_fks.sort_unstable();
+        all_body_fks.dedup();
+        let mut body_by_fk: HashMap<u64, (TxRecord, Vec<OutputRecord>, Vec<InputRecord>)> =
+            HashMap::with_capacity(all_body_fks.len());
+        for id in all_body_fks {
+            if self.confirm_cancelled() {
+                crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                return Err(StoreError::Corrupt("confirm cancelled"));
+            }
+            let (tx, inputs, outs) = self.store.get_tx_full(Fk(id))?;
+            st.body_tx_reads = st.body_tx_reads.saturating_add(1);
+            st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+            body_by_fk.insert(id, (tx, outs, inputs));
+        }
+
+        let mut phase1: Vec<(u32, Vec<(Fk, TxRecord, Vec<OutputRecord>, Vec<InputRecord>)>)> =
+            Vec::with_capacity(height_tx_fks.len());
+        for (height, tx_fks) in height_tx_fks {
             let mut bodies = Vec::with_capacity(tx_fks.len());
-            for &fk in &tx_fks {
-                let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
-                st.body_tx_reads = st.body_tx_reads.saturating_add(1);
-                st.full_tx_reads = st.full_tx_reads.saturating_add(1);
-                // One lock: body cache + full create outs for later spends.
+            for fk in tx_fks {
+                let Some(id) = fk.get() else {
+                    continue;
+                };
+                let Some((tx, outs, inputs)) = body_by_fk.get(&id) else {
+                    continue;
+                };
                 self.confirm_parents.put_body_and_creates(
                     fk,
                     height,
@@ -200,16 +227,18 @@ impl Query {
                     inputs.clone(),
                 );
                 st.creates_registered = st.creates_registered.saturating_add(1);
-                bodies.push((fk, tx, outs, inputs));
+                bodies.push((fk, tx.clone(), outs.clone(), inputs.clone()));
             }
             phase1.push((height, bodies));
         }
+        drop(body_by_fk);
 
         // ── Phase 2: external parents + stash thin edges for wave_fill ──────
         let mut need_load: Vec<(u64, u32)> = Vec::new();
         let mut need_put: Vec<(u32, Fk, u32)> = Vec::new();
         let mut parent_puts: Vec<(u32, Fk, TxRecord, u32, OutputRecord)> = Vec::new();
         let mut thin_by_spend: HashMap<u64, Vec<StashedThinInput>> = HashMap::new();
+        let catchup = self.ibd_utxo_enabled();
 
         for (height, bodies) in &phase1 {
             let mut local: HashMap<[u8; 32], Fk> = HashMap::with_capacity(bodies.len());
@@ -236,16 +265,17 @@ impl Query {
                         st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                         continue;
                     }
-                    // Runway create from earlier prewarmed height / this batch.
+                    // Runway create: outs already cached — thin edge only (no put).
                     if let Some(cfk) = self.confirm_parents.get_by_txid(&inp.prev_txid) {
-                        if let Some((ptx, o)) =
-                            self.confirm_parents.get_parent_out(cfk, inp.prev_index)
+                        if self
+                            .confirm_parents
+                            .get_parent_out(cfk, inp.prev_index)
+                            .is_some()
                         {
                             edges.push(StashedThinInput {
                                 create_fk: cfk.get(),
                                 prev_index: inp.prev_index,
                             });
-                            parent_puts.push((*height, cfk, ptx, inp.prev_index, o));
                             st.utxo_parents = st.utxo_parents.saturating_add(1);
                             st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                             continue;
@@ -267,9 +297,17 @@ impl Query {
                             if let Some((ptx, o)) =
                                 self.confirm_parents.get_parent_out(create_fk, inp.prev_index)
                             {
+                                // Rare: partial parent entry — put this vout only.
                                 parent_puts.push((*height, create_fk, ptx, inp.prev_index, o));
                                 st.utxo_parents = st.utxo_parents.saturating_add(1);
                                 st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
+                                continue;
+                            }
+                            // Already spent: wave will drop the slot; skip parent body IO.
+                            if catchup
+                                && self.catchup_is_spent(&inp.prev_txid, inp.prev_index)?
+                            {
+                                st.utxo_parents = st.utxo_parents.saturating_add(1);
                                 continue;
                             }
                             if let Some(id) = create_fk.get() {
@@ -299,20 +337,21 @@ impl Query {
         uniq_fks.dedup();
         st.parent_unique = st.parent_unique.saturating_add(uniq_fks.len() as u32);
 
-        let mut loaded: HashMap<u64, (TxRecord, Vec<OutputRecord>)> =
-            HashMap::with_capacity(uniq_fks.len());
-        for fk_id in uniq_fks {
-            if self.confirm_cancelled() {
-                crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
-                return Err(StoreError::Corrupt("confirm cancelled"));
-            }
-            let fk = Fk(fk_id);
-            let (ptx, _ins, outs) = self.store.get_tx_full(fk)?;
-            st.full_tx_reads = st.full_tx_reads.saturating_add(1);
-            // parent_io counter: full_tx_reads already includes bodies; track
-            // external parent loads via parent_unique + this loop only in stats.
-            loaded.insert(fk_id, (ptx, outs));
-        }
+        // Parallel parent meta+outs loads (sorted fks; mmap reads are concurrent-safe).
+        let loaded: HashMap<u64, (TxRecord, Vec<OutputRecord>)> = {
+            use rayon::prelude::*;
+            let store = self.store();
+            let rows: Result<Vec<_>, QueryError> = uniq_fks
+                .par_iter()
+                .map(|&fk_id| {
+                    let (ptx, outs) = store.get_tx_meta_and_outputs(Fk(fk_id))?;
+                    Ok((fk_id, (ptx, outs)))
+                })
+                .collect();
+            let rows = rows?;
+            st.full_tx_reads = st.full_tx_reads.saturating_add(rows.len() as u32);
+            rows.into_iter().collect()
+        };
 
         for &(height, create_fk, vout) in &need_put {
             let Some(id) = create_fk.get() else {

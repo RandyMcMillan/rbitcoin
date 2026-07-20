@@ -11,6 +11,7 @@ rbitcoin-primitives = { workspace = true }
 rbitcoin-store = { workspace = true }
 rbitcoin-log = { workspace = true }
 bitcoin = { workspace = true }
+rayon = "1.10"
 
 [lints]
 workspace = true

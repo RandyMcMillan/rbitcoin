@@ -185,6 +185,14 @@ impl Store {
         self.txs.get_full(fk, &self.inputs, &self.outputs)
     }
 
+    /// Parent-prevout hot path: meta + outputs only (no input materialization).
+    pub fn get_tx_meta_and_outputs(
+        &self,
+        fk: Fk,
+    ) -> Result<(TxRecord, Vec<OutputRecord>), StoreError> {
+        self.txs.get_meta_and_outputs(fk, &self.outputs)
+    }
+
     /// Append packed full-tx Class A rows (preferred archive path).
     pub fn put_tx_full_batch_indexed(
         &self,

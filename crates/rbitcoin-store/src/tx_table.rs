@@ -407,6 +407,37 @@ pub fn decode_packed_tx(
     Ok((meta, inputs, outputs))
 }
 
+/// Decode packed Class A **meta + outputs only** (skip allocating parent inputs).
+///
+/// Same body IO as [`decode_packed_tx`]; cheaper CPU for prewarm parent loads
+/// that only need prevout script/value.
+pub fn decode_packed_tx_outs_only(
+    raw: &[u8],
+) -> Result<(TxRecord, Vec<OutputRecord>), StoreError> {
+    if raw.first().copied() != Some(PACKED_TX_V1) {
+        return Err(StoreError::Corrupt("not a packed Class A tx"));
+    }
+    if raw.len() < 1 + TxRecord::ENCODED_LEN {
+        return Err(StoreError::Corrupt("short packed Class A tx"));
+    }
+    let meta = TxRecord::decode(&raw[1..1 + TxRecord::ENCODED_LEN])?;
+    let mut off = 1 + TxRecord::ENCODED_LEN;
+    // Walk inputs without keeping records (witness can be large).
+    for _ in 0..meta.input_count {
+        let (_rec, used) = InputRecord::decode_at(&raw[off..])?;
+        off += used;
+    }
+    let (outputs, out_used) = decode_output_run_prefix(&raw[off..], meta.output_count)?;
+    off += out_used;
+    if off != raw.len() {
+        return Err(StoreError::Corrupt("packed Class A trailing bytes"));
+    }
+    if outputs.len() as u32 != meta.output_count {
+        return Err(StoreError::Corrupt("packed Class A count mismatch"));
+    }
+    Ok((meta, outputs))
+}
+
 #[inline]
 pub fn is_packed_tx_payload(raw: &[u8]) -> bool {
     raw.len() > TxRecord::ENCODED_LEN && raw.first().copied() == Some(PACKED_TX_V1)
@@ -514,6 +545,26 @@ impl TxTable {
             outputs.get_run(Fk(run), tx.output_count)?
         };
         Ok((tx, ins, outs))
+    }
+
+    /// Meta + outputs only (one body IO when packed; skips input materialization).
+    pub fn get_meta_and_outputs(
+        &self,
+        fk: Fk,
+        outputs: &OutputTable,
+    ) -> Result<(TxRecord, Vec<OutputRecord>), StoreError> {
+        let raw = self.body.get_raw(fk)?;
+        if is_packed_tx_payload(&raw) {
+            return decode_packed_tx_outs_only(&raw);
+        }
+        let tx = TxRecord::decode(&raw)?;
+        let outs = if tx.output_count == 0 {
+            Vec::new()
+        } else {
+            let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
+            outputs.get_run(Fk(run), tx.output_count)?
+        };
+        Ok((tx, outs))
     }
 
     /// Append packed full-tx records (one var payload per tx = one body IO on read).

@@ -7,6 +7,12 @@
 //!   → utxo_apply (catch-up only)
 //! ```
 //!
+//! **Prewarm ownership:** the IBD background worker loads Class A into
+//! [`ConfirmParentCache`]. Confirm **waits** for the batch to be ready; it does
+//! not compete for store IO on the hot path. A short grace lets the worker
+//! finish the tip batch; only if still not ready do we last-mile load once
+//! (unit tests without a worker / recovery if the worker stalls).
+//!
 //! Timers: [`crate::confirm_phase_stats`]. Multi-block order: sequential connect,
 //! one script wave, one Class C run, one UTXO flush.
 
@@ -88,23 +94,15 @@ pub fn confirm_archived_run(
         Ordering::Relaxed,
     );
 
-    // ── 1b. wait for parent prewarm (batch scanned; headroom soft) ─────────
-    // Hard-wait only for this batch's heights to be scanned. Headroom is
-    // best-effort (short soft wait) so a slow warmer cannot freeze tip/peers.
+    // ── 1b. wait for parent prewarm (worker owns Class A load) ─────────────
+    // Hard-wait for this batch's heights to be scanned. Headroom is soft so a
+    // slow warmer cannot freeze tip/peers. Confirm does not last-mile load
+    // while the worker is progressing (avoids dual Class A thrash on tip).
     let heights: Vec<u32> = metas.iter().map(|m| m.height.0).collect();
     let items: Vec<(u32, [u8; 32])> = metas.iter().map(|m| (m.height.0, m.hash)).collect();
     let batch_end = heights.last().copied().unwrap_or(0);
     let t_pw = Instant::now();
-    // Last-mile prewarm for *this* batch only if the background worker is behind.
-    let _ = query.prewarm_parents_for_heights(&items);
-    query
-        .wait_prewarm_ready_with_headroom(
-            &heights,
-            batch_end,
-            None,
-            std::time::Duration::from_secs(120),
-        )
-        .map_err(ConsensusError::Store)?;
+    wait_for_prewarm(query, &heights, &items, batch_end)?;
     confirm_phase_stats::PREWARM_WAIT_NS.fetch_add(
         t_pw.elapsed().as_nanos() as u64,
         Ordering::Relaxed,
@@ -142,6 +140,59 @@ pub fn confirm_archived_run(
 }
 
 // ─── phases ───────────────────────────────────────────────────────────────────
+
+/// Wait for the confirm batch to be prewarm-ready without stealing store IO
+/// from the background worker when it is already working the runway.
+///
+/// 1. Soft-wait [`prewarm_worker_grace`] for the worker to mark the batch ready.
+/// 2. If still not ready: **one** emergency `prewarm_parents_for_heights` (tests
+///    without a worker, or a stalled warmer) — then wait again.
+/// 3. Soft headroom wait (best-effort).
+fn wait_for_prewarm(
+    query: &Query,
+    heights: &[u32],
+    items: &[(u32, [u8; 32])],
+    batch_end: u32,
+) -> Result<(), ConsensusError> {
+    if heights.is_empty() {
+        return Ok(());
+    }
+    // Ensure plans exist so the worker (and emergency last-mile) know the hashes.
+    query.seed_parent_runway(items);
+
+    let grace = prewarm_worker_grace();
+    if !query.is_prewarm_ready(heights) && !grace.is_zero() {
+        let _ = query.wait_prewarm_ready(heights, grace);
+    }
+    if !query.is_prewarm_ready(heights) {
+        // Emergency only: worker behind / unit tests with no prewarm thread.
+        let _ = query
+            .prewarm_parents_for_heights(items)
+            .map_err(ConsensusError::Store)?;
+    }
+    query
+        .wait_prewarm_ready_with_headroom(
+            heights,
+            batch_end,
+            None,
+            std::time::Duration::from_secs(120),
+        )
+        .map_err(ConsensusError::Store)?;
+    Ok(())
+}
+
+/// How long confirm waits for the background prewarm worker before last-mile.
+///
+/// Override with `RBITCOIN_PREWARM_WORKER_GRACE_MS` (default **1500**). Set `0`
+/// to last-mile immediately when not ready (old behavior). Higher values give
+/// the worker exclusive Class A time when the runway is empty.
+fn prewarm_worker_grace() -> std::time::Duration {
+    let ms = std::env::var("RBITCOIN_PREWARM_WORKER_GRACE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(1500);
+    std::time::Duration::from_millis(ms.min(60_000))
+}
 
 fn resolve_body_metas(
     query: &Query,

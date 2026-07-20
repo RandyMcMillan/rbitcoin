@@ -1,9 +1,13 @@
 //! Background confirm-runway parent prewarm (tip+1 … tip+depth).
 //!
+//! **Owns Class A load** for the confirm runway. Confirm waits for batch
+//! readiness (see `confirm_run::wait_for_prewarm`); it only last-miles after a
+//! grace if this worker has not marked the tip batch ready.
+//!
 //! Best-effort IO priority. UTXO / durable parents load from store; runway
-//! creates map txid→fk (outs only for open reserves). Confirm hard-waits only
-//! for the batch to be scanned; headroom is soft so a slow warmer cannot
-//! freeze tip advance and starve peer downloads.
+//! creates register full outs (bodies-first). Confirm hard-waits only for the
+//! batch to be scanned; headroom is soft so a slow warmer cannot freeze tip
+//! advance and starve peer downloads.
 
 use rbitcoin_log::{debug, info};
 use rbitcoin_query::{
@@ -132,7 +136,13 @@ pub(crate) fn spawn_parent_prewarm(
                         debug!("ibd: prewarm error: {e}");
                     }
                 }
-                std::thread::sleep(Duration::from_millis(5));
+                // Yield briefly so confirm/archive can run, but stay hot when
+                // the runway is non-empty (tip must not outrun us).
+                if cursor < runway.len() {
+                    std::thread::sleep(Duration::from_millis(1));
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
             info!("ibd: parent prewarm worker stopped");
         })

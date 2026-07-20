@@ -38,12 +38,14 @@ use assign_plan::{classify_height, far_slots_per_peer, remove_from_ordered, want
 // compact_ordered used via IbdWorkState::hygiene
 use confirm::{offer_confirm_ready, spawn_confirm_engine, ConfirmEvent, ConfirmFeed};
 use dial::{
-    dial_batch, dial_blocked_addrs, disconnect_stalled_block_peers, expire_addr_cooldown,
-    release_peer_block_work, request_headers, request_headers_from,
+    apply_dial_result, dial_batch, dial_blocked_addrs, disconnect_stalled_block_peers,
+    expire_addr_cooldown, release_peer_block_work, request_headers, request_headers_from,
 };
 use peer_io::{
-    note_block_progress, touch_block_progress, PeerCmd, PeerEvent, PeerEventSinks, PeerSlot,
+    note_block_progress, note_block_rx, touch_block_progress, PeerCmd, PeerEvent, PeerEventSinks,
+    PeerSlot,
 };
+use crate::seeds::AddrMan;
 use exit::{
     all_peers_dead_action, catchup_complete_after_drain, header_lag_behind_peers, path_drained,
     peer_caught_up, AllPeersDead,
@@ -365,16 +367,17 @@ pub async fn parallel_ibd_cancellable(
             "ibd: tokio worker threads≈{workers} (peer decode: blocking pool; archive: 1 OS prep + 1 OS writer; confirm: 1 OS thread)"
         );
     }
-    // Dial candidates: initial seeds/connect list, grown by peer `addr`/`addrv2`.
-    let mut peer_pool: Vec<SocketAddr> = peers.to_vec();
+    // Dial book: seeds/connect list + learned addrs, ranked by PeerFlags.
+    let mut peer_book = AddrMan::new();
+    peer_book.inject(peers.iter().copied());
     let next_peer_id = Arc::new(AtomicUsize::new(0));
 
     // Initial concurrent dial (all candidates once) — OK to await before loop starts.
     // Abort early if cancel already set mid-dial.
-    let mut initial_slots = dial_batch(
-        &peer_pool,
+    let initial = dial_batch(
+        &peer_book,
         &next_peer_id,
-        peer_pool.len(),
+        peer_book.len(),
         HashSet::new(),
         magic,
         local_addr,
@@ -384,6 +387,8 @@ pub async fn parallel_ibd_cancellable(
         cancel.as_ref().map(Arc::clone),
     )
     .await;
+    apply_dial_result(&mut peer_book, &initial);
+    let mut initial_slots = initial.slots;
     if cancelled() {
         warn!("ibd: cancel during initial dial — stopping");
         for s in &initial_slots {
@@ -398,15 +403,16 @@ pub async fn parallel_ibd_cancellable(
     }
     let init_peer_tip = initial_slots.iter().map(|s| s.peer_height).max().unwrap_or(0);
     info!(
-        "ibd: {} / {} peers ready (target={}, max_peer_height={})",
+        "ibd: {} / {} peers ready (target={}, book={}, max_peer_height={})",
         initial_slots.len(),
-        peer_pool.len(),
+        peers.len(),
         cfg.target_peers,
+        peer_book.len(),
         init_peer_tip
     );
     // Background redial — never .await dial on the IBD event loop (that stalled tip).
     let mut last_redial = Instant::now() - Duration::from_secs(15);
-    let mut redial_handle: Option<JoinHandle<Vec<PeerSlot>>> = None;
+    let mut redial_handle: Option<JoinHandle<dial::DialBatchResult>> = None;
     // Consecutive redial batches that added zero peers (network-down / pool dead).
     let mut dark_redial_empty: u32 = 0;
 
@@ -536,7 +542,7 @@ pub async fn parallel_ibd_cancellable(
             &arch_job_tx,
             &archive_queued,
             &loop_stats,
-            &mut peer_pool,
+            &mut peer_book,
             local_addr,
         )? {
             break;
@@ -612,7 +618,7 @@ pub async fn parallel_ibd_cancellable(
             &arch_job_tx,
             &archive_queued,
             &loop_stats,
-            &mut peer_pool,
+            &mut peer_book,
             local_addr,
         )? {
             break;
@@ -706,10 +712,12 @@ pub async fn parallel_ibd_cancellable(
         {
             if let Some(h) = redial_handle.take() {
                 match h.await {
-                    Ok(fresh) => {
-                        let blocked = dial_blocked_addrs(&st.slots, &st.addr_cooldown, Instant::now());
+                    Ok(result) => {
+                        apply_dial_result(&mut peer_book, &result);
+                        let blocked =
+                            dial_blocked_addrs(&st.slots, &st.addr_cooldown, Instant::now());
                         let mut n = 0usize;
-                        for s in fresh {
+                        for s in result.slots {
                             // Race: same addr may have connected on another path.
                             if blocked.contains(&s.addr)
                                 || st.slots.iter().any(|x| x.addr == s.addr)
@@ -751,7 +759,7 @@ pub async fn parallel_ibd_cancellable(
         // When *all* peers are dead (network blip), do not wait for the 15s
         // interval — redial immediately so we never race the exit check.
         let alive_n = st.slots.iter().filter(|s| s.alive).count();
-        // Target live peers is independent of pool size; getaddr grows the pool
+        // Target live peers is independent of pool size; getaddr grows the book
         // so we can reach `target_peers` even when seeds alone were sparse.
         let target = cfg.target_peers.max(1);
         let redial_interval = if alive_n == 0 {
@@ -761,17 +769,17 @@ pub async fn parallel_ibd_cancellable(
         };
         if redial_handle.is_none()
             && alive_n < target
-            && !peer_pool.is_empty()
+            && !peer_book.is_empty()
             && last_redial.elapsed() >= redial_interval
         {
             let want = (target - alive_n).min(8).max(1);
             let already = dial_blocked_addrs(&st.slots, &st.addr_cooldown, Instant::now());
             info!(
-                "ibd: redialing up to {want} peers (alive={alive_n}/{target}, pool={}, blocked={})…",
-                peer_pool.len(),
+                "ibd: redialing up to {want} peers (alive={alive_n}/{target}, book={}, blocked={})…",
+                peer_book.len(),
                 already.len()
             );
-            let pool = peer_pool.clone();
+            let book = peer_book.clone();
             let next_id = next_peer_id.clone();
             let tip_h = hub.tip_height();
             let sinks_r = sinks.clone();
@@ -779,7 +787,7 @@ pub async fn parallel_ibd_cancellable(
             let cancel_c = cancel.as_ref().map(Arc::clone);
             redial_handle = Some(tokio::spawn(async move {
                 dial_batch(
-                    &pool,
+                    &book,
                     &next_id,
                     want,
                     already,
@@ -996,7 +1004,7 @@ pub async fn parallel_ibd_cancellable(
                     ev,
                     &arch_job_tx,
                     &archive_queued,
-                    &mut peer_pool,
+                    &mut peer_book,
                     local_addr,
                 );
             }
@@ -1012,7 +1020,7 @@ pub async fn parallel_ibd_cancellable(
                     ev,
                     &arch_job_tx,
                     &archive_queued,
-                    &mut peer_pool,
+                    &mut peer_book,
                     local_addr,
                 );
             }
@@ -1177,7 +1185,7 @@ fn drain_ready_peer_and_archive_events(
     arch_job_tx: &mpsc::UnboundedSender<ArchiveJob>,
     archive_queued: &ArchiveQueueBudget,
     loop_stats: &LoopStats,
-    peer_pool: &mut Vec<SocketAddr>,
+    peer_book: &mut AddrMan,
     local_addr: SocketAddr,
 ) -> Result<bool, NetError> {
     let t0 = Instant::now();
@@ -1209,7 +1217,7 @@ fn drain_ready_peer_and_archive_events(
                     ev,
                     arch_job_tx,
                     archive_queued,
-                    peer_pool,
+                    peer_book,
                     local_addr,
                 );
             }
@@ -1231,7 +1239,7 @@ fn drain_ready_peer_and_archive_events(
                     ev,
                     arch_job_tx,
                     archive_queued,
-                    peer_pool,
+                    peer_book,
                     local_addr,
                 );
             }
@@ -1254,7 +1262,7 @@ fn apply_peer_event(
     ev: PeerEvent,
     arch_job_tx: &mpsc::UnboundedSender<ArchiveJob>,
     archive_queued: &ArchiveQueueBudget,
-    peer_pool: &mut Vec<SocketAddr>,
+    peer_book: &mut AddrMan,
     local_addr: SocketAddr,
 ) {
     match ev {
@@ -1405,10 +1413,14 @@ fn apply_peer_event(
                 }
             }
         }
-        PeerEvent::BlockFramed { peer, hash } => {
+        PeerEvent::BlockFramed {
+            peer,
+            hash,
+            wire_bytes,
+        } => {
             // Frame complete on the wire — free peer/window slots *now* so assign
             // can top up getdata while deserialize still runs on the blocking pool.
-            note_block_progress(&mut st.slots, peer);
+            note_block_rx(&mut st.slots, peer, wire_bytes);
             clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
             if st.body.is_rejected(&hash)
                 || st.body.is_known_archived(&hash)
@@ -1498,45 +1510,48 @@ fn apply_peer_event(
             }
         }
         PeerEvent::Addrs { peer, addrs } => {
-            inject_learned_addrs(peer_pool, &addrs, local_addr, peer);
+            inject_learned_addrs(peer_book, &addrs, local_addr, peer);
         }
         PeerEvent::Dead { peer, reason } => {
             warn!("ibd: peer[{peer}] dead: {reason}");
+            if let Some(s) = st.slots.iter().find(|s| s.id == peer) {
+                if let Some((lat, bps)) = s.speed_sample() {
+                    peer_book.note_speed(s.addr, lat, bps);
+                }
+            }
             release_peer_block_work(&mut st.slots, &mut st.inflight, peer);
         }
     }
 }
 
-/// Grow the IBD dial pool from peer-advertised addresses (getaddr responses).
+/// Grow the IBD dial book from peer-advertised addresses (getaddr responses).
 fn inject_learned_addrs(
-    pool: &mut Vec<SocketAddr>,
+    book: &mut AddrMan,
     addrs: &[SocketAddr],
     local_addr: SocketAddr,
     from_peer: usize,
 ) {
-    if addrs.is_empty() || pool.len() >= MAX_PEER_POOL {
+    if addrs.is_empty() || book.len() >= MAX_PEER_POOL {
         return;
     }
     let mut added = 0usize;
     for &a in addrs {
-        if pool.len() >= MAX_PEER_POOL {
+        if book.len() >= MAX_PEER_POOL {
             break;
         }
         if a == local_addr || a.ip().is_unspecified() || a.port() == 0 {
             continue;
         }
-        if pool.iter().any(|p| *p == a) {
-            continue;
+        let before = book.len();
+        book.add(a);
+        if book.len() > before {
+            added += 1;
         }
-        pool.push(a);
-        added += 1;
     }
     if added > 0 {
-        // Prefer IPv4 candidates first (same policy as AddrMan).
-        pool.sort_by_key(|a| a.is_ipv6());
         rbitcoin_log::debug!(
-            "ibd: peer[{from_peer}] taught {added} addr(s); pool={}",
-            pool.len()
+            "ibd: peer[{from_peer}] taught {added} addr(s); book={}",
+            book.len()
         );
     }
 }

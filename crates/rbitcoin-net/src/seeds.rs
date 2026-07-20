@@ -1,6 +1,11 @@
-//! Fixed seeds and DNS seed names for peer discovery.
+//! Fixed seeds, DNS seed names, and the process peer book ([`AddrMan`]).
+//!
+//! Each remembered address carries a **byte of informational flags** used to
+//! rank dial candidates: prefer untried / known-good / fast peers; only fall
+//! back to incompatible or recently-failed hosts when the good set is empty.
 
 use rbitcoin_primitives::Network;
+use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs};
 
 /// DNS seed hostnames (resolve at runtime with default port).
@@ -83,10 +88,129 @@ pub fn resolve_all_seeds(network: Network) -> Vec<SocketAddr> {
     out
 }
 
-/// Simple address manager: remembered peers + seed inject.
+// ── Peer flags (1 byte) ─────────────────────────────────────────────────────
+
+/// Informational peer flags packed into one byte (more bits reserved for later).
+///
+/// | bit | name | meaning |
+/// |-----|------|---------|
+/// | 0 | `HAS_CONNECTED` | Successful BIP324 handshake at least once |
+/// | 1 | `FAST` | Observed <100 ms first-data latency and >10 Mbps |
+/// | 2 | `SLOW` | Observed >250 ms latency or <1 Mbps |
+/// | 3 | `INCOMPATIBLE` | No v2 transport (or similar protocol reject) |
+/// | 4 | `FAILED_LAST_CONNECT` | Last dial failed for network/timeout reasons |
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
+pub struct PeerFlags(pub u8);
+
+impl PeerFlags {
+    pub const HAS_CONNECTED: u8 = 1 << 0;
+    pub const FAST: u8 = 1 << 1;
+    pub const SLOW: u8 = 1 << 2;
+    pub const INCOMPATIBLE: u8 = 1 << 3;
+    pub const FAILED_LAST_CONNECT: u8 = 1 << 4;
+
+    /// Latency below this and throughput above [`Self::FAST_BPS_MIN`] → `FAST`.
+    pub const FAST_LATENCY_MS: u64 = 100;
+    /// Throughput floor for `FAST` (10 Mbps = 1.25 MB/s).
+    pub const FAST_BPS_MIN: u64 = 10_000_000 / 8;
+    /// Latency above this **or** throughput below [`Self::SLOW_BPS_MAX`] → `SLOW`.
+    pub const SLOW_LATENCY_MS: u64 = 250;
+    /// Throughput ceiling for `SLOW` (1 Mbps = 125 KB/s).
+    pub const SLOW_BPS_MAX: u64 = 1_000_000 / 8;
+
+    #[inline]
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    #[inline]
+    pub const fn contains(self, bit: u8) -> bool {
+        self.0 & bit != 0
+    }
+
+    #[inline]
+    pub fn insert(&mut self, bit: u8) {
+        self.0 |= bit;
+    }
+
+    #[inline]
+    pub fn remove(&mut self, bit: u8) {
+        self.0 &= !bit;
+    }
+
+    #[inline]
+    pub fn set(&mut self, bit: u8, on: bool) {
+        if on {
+            self.insert(bit);
+        } else {
+            self.remove(bit);
+        }
+    }
+
+    pub fn has_connected(self) -> bool {
+        self.contains(Self::HAS_CONNECTED)
+    }
+    pub fn is_fast(self) -> bool {
+        self.contains(Self::FAST)
+    }
+    pub fn is_slow(self) -> bool {
+        self.contains(Self::SLOW)
+    }
+    pub fn is_incompatible(self) -> bool {
+        self.contains(Self::INCOMPATIBLE)
+    }
+    pub fn failed_last_connect(self) -> bool {
+        self.contains(Self::FAILED_LAST_CONNECT)
+    }
+
+    /// Never dialed / no outcome recorded yet.
+    pub fn is_untried(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Dial preference tier: **0 = preferred**, **1 = ok**, **2 = last resort**.
+    ///
+    /// Preferred: untried, fast, or previously connected without failure/slow/incompat.
+    /// Last resort: incompatible or failed last connect.
+    pub fn dial_tier(self) -> u8 {
+        if self.is_incompatible() || self.failed_last_connect() {
+            return 2;
+        }
+        if self.is_slow() && !self.is_fast() {
+            return 1;
+        }
+        // Untried, fast, or has_connected (and not slow/failed/incompat).
+        0
+    }
+
+    /// Update `FAST` / `SLOW` from a measured sample. Clears the opposite bit.
+    pub fn apply_speed_sample(&mut self, latency_ms: u64, bytes_per_sec: u64) {
+        let fast = latency_ms < Self::FAST_LATENCY_MS && bytes_per_sec > Self::FAST_BPS_MIN;
+        let slow = latency_ms > Self::SLOW_LATENCY_MS || bytes_per_sec < Self::SLOW_BPS_MAX;
+        if fast {
+            self.insert(Self::FAST);
+            self.remove(Self::SLOW);
+        } else if slow {
+            self.insert(Self::SLOW);
+            self.remove(Self::FAST);
+        }
+        // else: mid-range — leave prior classification
+    }
+}
+
+/// One remembered peer address + flags.
+#[derive(Clone, Debug)]
+pub struct PeerEntry {
+    pub addr: SocketAddr,
+    pub flags: PeerFlags,
+}
+
+/// Peer book: seeds, learned addrs, and dial ranking.
 #[derive(Debug, Default, Clone)]
 pub struct AddrMan {
-    peers: Vec<SocketAddr>,
+    /// Insertion-order keys (IPv4 preferred on inject).
+    order: Vec<SocketAddr>,
+    by_addr: HashMap<SocketAddr, PeerFlags>,
 }
 
 impl AddrMan {
@@ -103,51 +227,215 @@ impl AddrMan {
 
     pub fn inject(&mut self, addrs: impl IntoIterator<Item = SocketAddr>) {
         for a in addrs {
-            if !self.peers.contains(&a) {
-                self.peers.push(a);
-            }
+            self.add(a);
         }
-        // Prefer IPv4 first — many lab hosts have no IPv6 route, and IPv6
-        // seeds only burn connect-timeout slots during parallel IBD dial.
-        self.peers.sort_by_key(|a| a.is_ipv6());
+        self.sort_order_ipv4_first();
     }
 
     pub fn add(&mut self, addr: SocketAddr) {
-        self.inject([addr]);
+        if self.by_addr.contains_key(&addr) {
+            return;
+        }
+        self.by_addr.insert(addr, PeerFlags::empty());
+        self.order.push(addr);
+    }
+
+    fn sort_order_ipv4_first(&mut self) {
+        // Prefer IPv4: many lab hosts have no IPv6 route, and IPv6 seeds only
+        // burn connect-timeout slots during parallel IBD dial.
+        self.order.sort_by_key(|a| a.is_ipv6());
     }
 
     pub fn peers(&self) -> &[SocketAddr] {
-        &self.peers
+        &self.order
     }
 
-    /// Round-robin-ish: take up to `max` peers starting at `offset`.
-    pub fn take_outbound_offset(&self, max: usize, offset: usize) -> Vec<SocketAddr> {
-        if self.peers.is_empty() || max == 0 {
+    pub fn flags(&self, addr: &SocketAddr) -> PeerFlags {
+        self.by_addr
+            .get(addr)
+            .copied()
+            .unwrap_or_else(PeerFlags::empty)
+    }
+
+    pub fn entry(&self, addr: &SocketAddr) -> Option<PeerEntry> {
+        self.by_addr.get(addr).map(|&flags| PeerEntry {
+            addr: *addr,
+            flags,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    /// Successful BIP324 handshake.
+    pub fn note_connected(&mut self, addr: SocketAddr) {
+        self.add(addr);
+        if let Some(f) = self.by_addr.get_mut(&addr) {
+            f.insert(PeerFlags::HAS_CONNECTED);
+            f.remove(PeerFlags::FAILED_LAST_CONNECT);
+            // Stay compatible if we just spoke v2.
+            f.remove(PeerFlags::INCOMPATIBLE);
+        }
+    }
+
+    /// Dial failed. `incompatible` = no v2 / protocol reject; else network/timeout.
+    pub fn note_connect_failed(&mut self, addr: SocketAddr, incompatible: bool) {
+        self.add(addr);
+        if let Some(f) = self.by_addr.get_mut(&addr) {
+            if incompatible {
+                f.insert(PeerFlags::INCOMPATIBLE);
+                f.remove(PeerFlags::FAILED_LAST_CONNECT);
+            } else {
+                f.insert(PeerFlags::FAILED_LAST_CONNECT);
+            }
+        }
+    }
+
+    /// Throughput / latency sample from an active session.
+    pub fn note_speed(&mut self, addr: SocketAddr, latency_ms: u64, bytes_per_sec: u64) {
+        self.add(addr);
+        if let Some(f) = self.by_addr.get_mut(&addr) {
+            f.insert(PeerFlags::HAS_CONNECTED);
+            f.apply_speed_sample(latency_ms, bytes_per_sec);
+        }
+    }
+
+    /// Ranked dial list: tier 0 first (untried / fast / good history), then slow,
+    /// then failed/incompatible. Within a tier, IPv4 before IPv6.
+    pub fn take_dial_candidates(
+        &self,
+        max: usize,
+        exclude: &HashSet<SocketAddr>,
+    ) -> Vec<SocketAddr> {
+        if max == 0 || self.order.is_empty() {
             return Vec::new();
         }
-        let n = self.peers.len();
+        let mut ranked: Vec<(u8, bool, SocketAddr)> = self
+            .order
+            .iter()
+            .filter(|a| !exclude.contains(*a))
+            .map(|&a| {
+                let f = self.flags(&a);
+                (f.dial_tier(), a.is_ipv6(), a)
+            })
+            .collect();
+        ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        ranked.into_iter().take(max).map(|(_, _, a)| a).collect()
+    }
+
+    /// Round-robin-ish: take up to `max` peers starting at `offset` (legacy helper).
+    /// Still prefers better dial tiers by walking a ranked list.
+    pub fn take_outbound_offset(&self, max: usize, offset: usize) -> Vec<SocketAddr> {
+        if self.order.is_empty() || max == 0 {
+            return Vec::new();
+        }
+        let ranked = self.take_dial_candidates(self.order.len(), &HashSet::new());
+        if ranked.is_empty() {
+            return Vec::new();
+        }
+        let n = ranked.len();
         let mut out = Vec::with_capacity(max.min(n));
         for i in 0..max.min(n) {
-            out.push(self.peers[(offset + i) % n]);
+            out.push(ranked[(offset + i) % n]);
         }
         out
     }
 
+    /// Best up-to-`max` outbound candidates (ranked).
     pub fn take_outbound(&self, max: usize) -> Vec<SocketAddr> {
-        // Prefer IPv4: many environments have no IPv6 route, and v6 seeds only
-        // consume parallel-dial timeout slots during IBD.
-        let v4: Vec<SocketAddr> = self.peers.iter().copied().filter(|a| a.is_ipv4()).collect();
-        if !v4.is_empty() {
-            return v4.into_iter().take(max).collect();
-        }
-        self.take_outbound_offset(max, 0)
+        self.take_dial_candidates(max, &HashSet::new())
     }
 
-    pub fn len(&self) -> usize {
-        self.peers.len()
+    /// Snapshot of all entries (for tests / diagnostics).
+    pub fn entries(&self) -> Vec<PeerEntry> {
+        self.order
+            .iter()
+            .filter_map(|a| self.entry(a))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn addr(o: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, o)), 8333)
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.peers.is_empty()
+    #[test]
+    fn dial_tier_preferred_vs_last_resort() {
+        assert_eq!(PeerFlags::empty().dial_tier(), 0); // untried
+        let mut f = PeerFlags::empty();
+        f.insert(PeerFlags::HAS_CONNECTED);
+        assert_eq!(f.dial_tier(), 0);
+        f.insert(PeerFlags::FAST);
+        assert_eq!(f.dial_tier(), 0);
+
+        let mut slow = PeerFlags::empty();
+        slow.insert(PeerFlags::HAS_CONNECTED);
+        slow.insert(PeerFlags::SLOW);
+        assert_eq!(slow.dial_tier(), 1);
+
+        let mut bad = PeerFlags::empty();
+        bad.insert(PeerFlags::FAILED_LAST_CONNECT);
+        assert_eq!(bad.dial_tier(), 2);
+        let mut inc = PeerFlags::empty();
+        inc.insert(PeerFlags::INCOMPATIBLE);
+        assert_eq!(inc.dial_tier(), 2);
+    }
+
+    #[test]
+    fn speed_sample_sets_fast_or_slow() {
+        let mut f = PeerFlags::empty();
+        f.apply_speed_sample(50, PeerFlags::FAST_BPS_MIN + 1);
+        assert!(f.is_fast());
+        assert!(!f.is_slow());
+        f.apply_speed_sample(300, 1000);
+        assert!(f.is_slow());
+        assert!(!f.is_fast());
+    }
+
+    #[test]
+    fn take_dial_prefers_untried_and_good_over_failed() {
+        let mut am = AddrMan::new();
+        let good = addr(1);
+        let untried = addr(2);
+        let failed = addr(3);
+        let incompat = addr(4);
+        am.add(failed);
+        am.add(incompat);
+        am.add(good);
+        am.add(untried);
+        am.note_connected(good);
+        am.note_connect_failed(failed, false);
+        am.note_connect_failed(incompat, true);
+
+        let got = am.take_dial_candidates(4, &HashSet::new());
+        assert_eq!(got.len(), 4);
+        // First two must be preferred tier (good + untried), last two last-resort.
+        let tiers: Vec<u8> = got.iter().map(|a| am.flags(a).dial_tier()).collect();
+        assert!(tiers[0] <= tiers[1]);
+        assert_eq!(tiers[0], 0);
+        assert_eq!(tiers[1], 0);
+        assert_eq!(tiers[2], 2);
+        assert_eq!(tiers[3], 2);
+    }
+
+    #[test]
+    fn exclude_skips_blocked() {
+        let mut am = AddrMan::new();
+        am.add(addr(1));
+        am.add(addr(2));
+        let mut ex = HashSet::new();
+        ex.insert(addr(1));
+        let got = am.take_dial_candidates(10, &ex);
+        assert_eq!(got, vec![addr(2)]);
     }
 }

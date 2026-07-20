@@ -34,7 +34,12 @@ pub(crate) enum PeerEvent {
     Headers { peer: usize, headers: Vec<Header> },
     /// Full `block` frame on the wire (hash from header only). Free getdata slots
     /// immediately — full deserialize still in flight on the blocking pool.
-    BlockFramed { peer: usize, hash: BlockHash },
+    BlockFramed {
+        peer: usize,
+        hash: BlockHash,
+        /// Payload size (for peer speed classification).
+        wire_bytes: usize,
+    },
     Block { peer: usize, block: Block },
     /// Framed as `block` but deserialize failed / unexpected command — re-request.
     BlockDecodeFailed { peer: usize, hash: BlockHash },
@@ -75,8 +80,47 @@ pub(crate) struct PeerSlot {
     pub block_progress_ms: Arc<AtomicU64>,
     /// Peer's `version.start_height` (best-effort network tip signal).
     pub peer_height: u32,
+    /// Mono ms when the slot became live (post-handshake).
+    pub connected_ms: u64,
+    /// First block-payload mono ms (0 = none yet).
+    pub first_data_ms: AtomicU64,
+    /// Cumulative block payload bytes (speed sample).
+    pub bytes_rx: AtomicU64,
     pub alive: bool,
     pub task: JoinHandle<()>,
+}
+
+impl PeerSlot {
+    /// Record received block payload bytes for FAST/SLOW classification.
+    pub fn note_rx_bytes(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let now = ibd_mono_ms();
+        let _ = self.first_data_ms.compare_exchange(
+            0,
+            now,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        self.bytes_rx.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// `(latency_ms, bytes_per_sec)` once we have ≥64 KiB of block data.
+    pub fn speed_sample(&self) -> Option<(u64, u64)> {
+        let first = self.first_data_ms.load(Ordering::Relaxed);
+        if first == 0 {
+            return None;
+        }
+        let bytes = self.bytes_rx.load(Ordering::Relaxed);
+        if bytes < 64 * 1024 {
+            return None;
+        }
+        let latency_ms = first.saturating_sub(self.connected_ms);
+        let elapsed_ms = ibd_mono_ms().saturating_sub(first).max(1);
+        let bps = bytes.saturating_mul(1000) / elapsed_ms;
+        Some((latency_ms, bps))
+    }
 }
 
 impl Drop for PeerSlot {
@@ -99,6 +143,13 @@ pub(crate) fn touch_block_progress(ms: &AtomicU64) {
 pub(crate) fn note_block_progress(slots: &mut [PeerSlot], peer: usize) {
     if let Some(s) = slots.iter_mut().find(|s| s.id == peer) {
         touch_block_progress(&s.block_progress_ms);
+    }
+}
+
+pub(crate) fn note_block_rx(slots: &mut [PeerSlot], peer: usize, wire_bytes: usize) {
+    if let Some(s) = slots.iter_mut().find(|s| s.id == peer) {
+        touch_block_progress(&s.block_progress_ms);
+        s.note_rx_bytes(wire_bytes as u64);
     }
 }
 
@@ -275,6 +326,7 @@ pub(crate) async fn spawn_peer(
                             sinks.send_body(PeerEvent::BlockFramed {
                                 peer: id,
                                 hash,
+                                wire_bytes: frame.payload.len(),
                             });
                         }
 
@@ -403,6 +455,9 @@ pub(crate) async fn spawn_peer(
         in_flight: HashSet::new(),
         block_progress_ms,
         peer_height,
+        connected_ms: ibd_mono_ms(),
+        first_data_ms: AtomicU64::new(0),
+        bytes_rx: AtomicU64::new(0),
         alive: true,
         task,
     })

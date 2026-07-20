@@ -47,6 +47,7 @@ impl InflightReq {
         self.peers.len()
     }
 
+    #[allow(dead_code)] // useful for tests / future multi-peer drain checks
     pub(crate) fn is_empty(&self) -> bool {
         self.peers.is_empty()
     }

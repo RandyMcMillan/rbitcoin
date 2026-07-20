@@ -3,6 +3,7 @@
 use super::peer_io::{ibd_mono_ms, spawn_peer, PeerCmd, PeerEventSinks, PeerSlot};
 use crate::chain::ChainHub;
 use crate::error::NetError;
+use crate::seeds::AddrMan;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::Magic;
 use bitcoin::BlockHash;
@@ -16,8 +17,34 @@ use std::time::{Duration, Instant};
 /// How long to avoid redialing an address after a stall disconnect.
 pub(crate) const STALL_ADDR_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 
+/// Classified dial failure for [`AddrMan`] flag updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DialFailKind {
+    /// TCP/timeout/IO — `FAILED_LAST_CONNECT`.
+    Network,
+    /// No BIP324 v2 — `INCOMPATIBLE`.
+    Incompatible,
+}
+
+fn classify_dial_err(e: &NetError) -> DialFailKind {
+    match e {
+        NetError::V1Peer | NetError::Bip324(_) => DialFailKind::Incompatible,
+        NetError::Protocol(s) if s.contains("v2") || s.contains("verack") || s.contains("version") => {
+            DialFailKind::Incompatible
+        }
+        _ => DialFailKind::Network,
+    }
+}
+
+/// Result of a dial batch: live slots + failures for the peer book.
+pub(crate) struct DialBatchResult {
+    pub slots: Vec<PeerSlot>,
+    pub failed: Vec<(SocketAddr, DialFailKind)>,
+}
+
+/// Dial up to `count` ranked candidates from `book` (excludes `already` + cooldown).
 pub(crate) async fn dial_batch(
-    pool: &[SocketAddr],
+    book: &AddrMan,
     next_id: &AtomicUsize,
     count: usize,
     mut already: HashSet<SocketAddr>,
@@ -27,9 +54,12 @@ pub(crate) async fn dial_batch(
     sinks: PeerEventSinks,
     connect_timeout: Duration,
     cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
-) -> Vec<PeerSlot> {
-    let mut out = Vec::new();
-    if count == 0 || pool.is_empty() {
+) -> DialBatchResult {
+    let mut out = DialBatchResult {
+        slots: Vec::new(),
+        failed: Vec::new(),
+    };
+    if count == 0 || book.is_empty() {
         return out;
     }
     let cancelled = || {
@@ -39,33 +69,37 @@ pub(crate) async fn dial_batch(
             .unwrap_or(false)
     };
 
+    // Prefer untried / fast / known-good; deprioritize failed/incompatible.
+    let candidates = book.take_dial_candidates(book.len().max(count), &already);
     let mut handles = Vec::new();
-    let n = pool.len();
-    let mut spawned = 0usize;
-    // Scan at most one full rotation of the pool.
-    for _ in 0..n {
+    for addr in candidates {
         if cancelled() {
             break;
         }
-        if spawned >= count {
+        if handles.len() >= count {
             break;
         }
-        let id = next_id.fetch_add(1, Ordering::Relaxed);
-        let addr = pool[id % n];
-        // One connection per addr per batch (and vs caller-provided already).
         if !already.insert(addr) {
             continue;
         }
+        let id = next_id.fetch_add(1, Ordering::Relaxed);
         let sinks = sinks.clone();
         handles.push(tokio::spawn(async move {
             let fut = spawn_peer(id, addr, magic, local_addr, tip_h, sinks);
             match tokio::time::timeout(connect_timeout, fut).await {
                 Ok(Ok(slot)) => Ok(slot),
-                Ok(Err(e)) => Err((id, addr, e.to_string())),
-                Err(_) => Err((id, addr, format!("connect timeout ({connect_timeout:?})"))),
+                Ok(Err(e)) => {
+                    let kind = classify_dial_err(&e);
+                    Err((id, addr, kind, e.to_string()))
+                }
+                Err(_) => Err((
+                    id,
+                    addr,
+                    DialFailKind::Network,
+                    format!("connect timeout ({connect_timeout:?})"),
+                )),
             }
         }));
-        spawned += 1;
     }
     for h in handles {
         if cancelled() {
@@ -73,17 +107,28 @@ pub(crate) async fn dial_batch(
             continue;
         }
         match h.await {
-            Ok(Ok(slot)) => out.push(slot),
-            Ok(Err((id, addr, reason))) => {
+            Ok(Ok(slot)) => out.slots.push(slot),
+            Ok(Err((id, addr, kind, reason))) => {
                 warn!("ibd: parallel peer[{id}] {addr} failed: {reason}");
+                out.failed.push((addr, kind));
             }
             Err(e) => {
                 error!("ibd: peer connect task panicked: {e}");
             }
         }
     }
-    out.sort_by_key(|s| s.id);
+    out.slots.sort_by_key(|s| s.id);
     out
+}
+
+/// Apply dial successes / failures to the peer book.
+pub(crate) fn apply_dial_result(book: &mut AddrMan, result: &DialBatchResult) {
+    for s in &result.slots {
+        book.note_connected(s.addr);
+    }
+    for &(addr, kind) in &result.failed {
+        book.note_connect_failed(addr, kind == DialFailKind::Incompatible);
+    }
 }
 
 pub(crate) fn request_headers(

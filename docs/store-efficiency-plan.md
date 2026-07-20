@@ -209,7 +209,7 @@ Open linear-probe tables of tens of GiB are hostile to sluggish disks.
 
 | Cache | Size | Content |
 |-------|------|---------|
-| Tip prevout / UTXO slab | 256–512 MiB | Recent outputs for confirm (not full set) |
+| Confirm parent prewarm + UTXO slab | 256–512 MiB | Runway parents + light UTXO (not full set) |
 | Class A FIFO | 128–256 MiB | Archive→confirm locality only |
 | Electrum hot scripthash | 64–128 MiB MRU of fat slabs | Wallet sessions |
 | Hash probe bloom (optional) | 32–64 MiB | Negative lookups on tx/point |

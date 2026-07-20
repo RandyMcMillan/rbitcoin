@@ -982,9 +982,8 @@ fn wave_fill_utxo_spent_suppresses_parent_live() {
     // Pre-confirm: parent still unspent → wave shows live.
     accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     let spend_hash = b_spend.block_hash().to_byte_array();
-    q.prefetch_class_a_for_block_hashes(&[spend_hash]).unwrap();
     let (_n, wave_live) = q
-        .prefetch_tip_prevouts_for_block_hashes(&[spend_hash])
+        .wave_fill_for_block_hashes(&[spend_hash])
         .unwrap();
     assert!(
         wave_live.has_live_output_txid(cb1.as_byte_array(), 0),
@@ -1003,9 +1002,8 @@ fn wave_fill_utxo_spent_suppresses_parent_live() {
     );
     accept_and_archive_block(&q, &params, Height(spend_h + 1), &b_bad, ms).unwrap();
     let bad_hash = b_bad.block_hash().to_byte_array();
-    q.prefetch_class_a_for_block_hashes(&[bad_hash]).unwrap();
     let (_n, wave_spent) = q
-        .prefetch_tip_prevouts_for_block_hashes(&[bad_hash])
+        .wave_fill_for_block_hashes(&[bad_hash])
         .unwrap();
     assert!(
         !wave_spent.has_live_output_txid(cb1.as_byte_array(), 0),

@@ -75,6 +75,14 @@ pub struct ParentEntry {
     pub create_height: Option<u32>,
 }
 
+/// Thin create-fk edge for one input (same layout as [`crate::wave_prevout::ThinInput`]).
+/// Stored on the runway body so wave_fill can skip re-walking inputs.
+#[derive(Debug, Clone, Copy)]
+pub struct StashedThinInput {
+    pub create_fk: Option<u64>,
+    pub prev_index: u32,
+}
+
 /// Full Class A body for a runway height (confirm should not re-read store).
 #[derive(Debug, Clone)]
 pub struct BodyEntry {
@@ -82,6 +90,9 @@ pub struct BodyEntry {
     pub tx: TxRecord,
     pub outputs: Vec<OutputRecord>,
     pub inputs: Vec<InputRecord>,
+    /// Per-input create-fk edges filled after prewarm phase-2 parent resolve.
+    /// `None` = not yet stashed (wave_fill falls back to walking `inputs`).
+    pub thin_inputs: Option<Vec<StashedThinInput>>,
 }
 
 /// Per-height plan: what prevouts block `height` needs.
@@ -229,6 +240,7 @@ impl ConfirmParentCache {
                 tx,
                 outputs,
                 inputs,
+                thin_inputs: None,
             },
         );
     }
@@ -241,6 +253,24 @@ impl ConfirmParentCache {
         let g = self.inner.lock().unwrap();
         let e = g.by_body.get(&id)?;
         Some((e.tx.clone(), e.outputs.clone(), e.inputs.clone()))
+    }
+
+    /// Attach prewarm-resolved thin edges to a runway body (wave_fill fast path).
+    pub fn put_thin_inputs(&self, fk: Fk, edges: Vec<StashedThinInput>) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        let mut g = self.inner.lock().unwrap();
+        if let Some(e) = g.by_body.get_mut(&id) {
+            e.thin_inputs = Some(edges);
+        }
+    }
+
+    /// Thin edges stashed during prewarm, if present.
+    pub fn get_thin_inputs(&self, fk: Fk) -> Option<Vec<StashedThinInput>> {
+        let id = fk.get()?;
+        let g = self.inner.lock().unwrap();
+        g.by_body.get(&id)?.thin_inputs.clone()
     }
 
     pub fn body_count(&self) -> usize {
@@ -706,6 +736,34 @@ mod tests {
         assert!(c.get_body(Fk(50)).is_some());
         c.advance_tip(1);
         assert!(c.get_body(Fk(50)).is_none());
+    }
+
+    #[test]
+    fn thin_inputs_stash_on_body() {
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(0);
+        c.put_body(Fk(10), 1, tx(1), vec![out(1)], vec![]);
+        assert!(c.get_thin_inputs(Fk(10)).is_none());
+        c.put_thin_inputs(
+            Fk(10),
+            vec![
+                StashedThinInput {
+                    create_fk: None,
+                    prev_index: 0xffff_ffff,
+                },
+                StashedThinInput {
+                    create_fk: Some(99),
+                    prev_index: 1,
+                },
+            ],
+        );
+        let edges = c.get_thin_inputs(Fk(10)).unwrap();
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[1].create_fk, Some(99));
+        assert_eq!(edges[1].prev_index, 1);
+        // Dropped with body when tip advances past create height.
+        c.advance_tip(1);
+        assert!(c.get_thin_inputs(Fk(10)).is_none());
     }
 
     #[test]

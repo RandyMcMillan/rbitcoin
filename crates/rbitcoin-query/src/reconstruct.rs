@@ -5,33 +5,11 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 impl Query {
-    /// Prefetch Class A bodies for confirm (store → local only; no global Class A).
-    ///
-    /// Kept for call-site compatibility; returns count of txs touched.
-    pub fn prefetch_class_a_for_block_hashes(
-        &self,
-        hashes: &[[u8; 32]],
-    ) -> Result<usize, QueryError> {
-        // Bodies are loaded on demand during wave fill / reconstruct from store.
-        // Parent prevouts come from ConfirmParentCache (must be prewarm-ready).
-        let mut n = 0usize;
-        for hash in hashes {
-            let Some((header_fk, _)) = self.get_header_by_hash(hash)? else {
-                continue;
-            };
-            let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
-                continue;
-            };
-            n += tx_fks.len();
-        }
-        Ok(n)
-    }
-
     /// Build wave prevout map. **Requires** prewarm: bodies + parents in cache.
     ///
-    /// Prefers [`crate::confirm_parent_cache`] for both block bodies and external
-    /// parents so confirm does not re-read Class A after a full prewarm.
-    pub fn prefetch_tip_prevouts_for_block_hashes(
+    /// Prefers stashed thin edges + [`crate::confirm_parent_cache`] so confirm
+    /// does not re-walk inputs or re-read Class A after a full prewarm.
+    pub fn wave_fill_for_block_hashes(
         &self,
         hashes: &[[u8; 32]],
     ) -> Result<(usize, crate::WavePrevoutCache), QueryError> {
@@ -60,6 +38,7 @@ impl Query {
         let mut noted = 0usize;
 
         // Pass 2: wave bodies from prewarm body cache (store only if missing).
+        // Prefer stashed thin edges from prewarm; fall back to walking inputs.
         let t_body = Instant::now();
         let mut parent_needed: HashMap<u64, HashSet<u32>> = HashMap::new();
         for &fk in &wave_tx_fks {
@@ -68,35 +47,27 @@ impl Query {
             wave.insert_parent_live(fk, tx, outs, Some(cb_h));
             noted += 1;
 
-            if inputs.is_empty() {
+            let edges: Vec<ThinInput> =
+                if let Some(stashed) = self.confirm_parents.get_thin_inputs(fk) {
+                    stashed
+                        .into_iter()
+                        .map(|e| ThinInput {
+                            create_fk: e.create_fk,
+                            prev_index: e.prev_index,
+                        })
+                        .collect()
+                } else if inputs.is_empty() {
+                    Vec::new()
+                } else {
+                    // Fallback: no prewarm thin edges (tests / last-mile miss).
+                    self.thin_edges_from_inputs(&inputs, &wave)?
+                };
+
+            if edges.is_empty() {
                 continue;
             }
-            let mut edges = Vec::with_capacity(inputs.len());
-            for inp in &inputs {
-                if inp.is_coinbase() {
-                    edges.push(ThinInput {
-                        create_fk: None,
-                        prev_index: inp.prev_index,
-                    });
-                    continue;
-                }
-                let create_fk = wave
-                    .get_by_txid(&inp.prev_txid, inp.prev_index)
-                    .map(|(pfk, _, _)| pfk)
-                    .or_else(|| self.confirm_parents.get_by_txid(&inp.prev_txid))
-                    .or(self
-                        .ibd_utxo_create_fk(&inp.prev_txid, inp.prev_index)
-                        .ok()
-                        .flatten())
-                    .or(self.tx_fk_by_txid(&inp.prev_txid).ok().flatten());
-                edges.push(ThinInput {
-                    create_fk: create_fk.and_then(|f| f.get()),
-                    prev_index: inp.prev_index,
-                });
-                let Some(pfk) = create_fk else {
-                    continue;
-                };
-                let Some(pid) = pfk.get() else {
+            for e in &edges {
+                let Some(pid) = e.create_fk else {
                     continue;
                 };
                 if wave_fks.contains(&pid) {
@@ -105,13 +76,13 @@ impl Query {
                 parent_needed
                     .entry(pid)
                     .or_default()
-                    .insert(inp.prev_index);
+                    .insert(e.prev_index);
             }
             wave.insert_thin_inputs(fk, edges);
         }
         wf_add(&wf::BODY_NS, t_body.elapsed().as_nanos() as u64);
 
-        // Pass 3: external parents from ConfirmParentCache only (prewarm filled).
+        // Pass 3: external parents from ConfirmParentCache (prewarm filled).
         let mut parents: Vec<(u64, HashSet<u32>)> = parent_needed.into_iter().collect();
         parents.sort_unstable_by_key(|(pid, _)| *pid);
 
@@ -126,14 +97,6 @@ impl Query {
                 for &v in needed_vouts {
                     if let Some(o) = outs.get(v as usize) {
                         m.insert(v, o.clone());
-                    }
-                }
-                (tx, m)
-            } else if let Some(tx) = self.tip_prevout_cache.get_tx(fk) {
-                let mut m = HashMap::new();
-                for &v in needed_vouts {
-                    if let Some(o) = self.tip_prevout_cache.get_output_at(fk, v) {
-                        m.insert(v, o);
                     }
                 }
                 (tx, m)
@@ -171,17 +134,45 @@ impl Query {
             let cb_h = self.coinbase_height_for_tx(fk, &tx)?;
             wf_add(&wf::CB_HEIGHT_NS, t_cb.elapsed().as_nanos() as u64);
 
-            let t_tip = Instant::now();
-            self.tip_prevout_cache
-                .note_live_slots(fk, tx.clone(), &slots);
-            wf_add(&wf::TIP_NOTE_NS, t_tip.elapsed().as_nanos() as u64);
-
             wave.insert_parent_slots(fk, tx, slots, Some(cb_h));
             noted += 1;
         }
         let _ = t_tx;
 
         Ok((noted, wave))
+    }
+
+    /// Build thin create-fk edges by walking inputs (wave_fill fallback).
+    fn thin_edges_from_inputs(
+        &self,
+        inputs: &[InputRecord],
+        wave: &crate::WavePrevoutCache,
+    ) -> Result<Vec<crate::wave_prevout::ThinInput>, QueryError> {
+        use crate::wave_prevout::ThinInput;
+        let mut edges = Vec::with_capacity(inputs.len());
+        for inp in inputs {
+            if inp.is_coinbase() {
+                edges.push(ThinInput {
+                    create_fk: None,
+                    prev_index: inp.prev_index,
+                });
+                continue;
+            }
+            let create_fk = wave
+                .get_by_txid(&inp.prev_txid, inp.prev_index)
+                .map(|(pfk, _, _)| pfk)
+                .or_else(|| self.confirm_parents.get_by_txid(&inp.prev_txid))
+                .or(self
+                    .ibd_utxo_create_fk(&inp.prev_txid, inp.prev_index)
+                    .ok()
+                    .flatten())
+                .or(self.tx_fk_by_txid(&inp.prev_txid).ok().flatten());
+            edges.push(ThinInput {
+                create_fk: create_fk.and_then(|f| f.get()),
+                prev_index: inp.prev_index,
+            });
+        }
+        Ok(edges)
     }
 
     /// Body for wave/wire: prewarm cache first, then store.
@@ -417,5 +408,3 @@ impl Query {
         }
     }
 }
-
-

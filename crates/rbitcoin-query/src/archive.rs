@@ -183,9 +183,7 @@ impl Query {
 
     /// Resolve prev outpoint txid for an input (local fk or stored external hash).
     ///
-    /// Uses Class A → store only (not tip_prevout): we only need the parent
-    /// **txid** field, not prevout outputs. Reconstruct and Class C spend edges
-    /// call this heavily; probing tip_prevout would only generate MISS noise.
+    /// Parent **txid** only (not prevout outs). Reconstruct / Class C spend edges.
     pub fn resolve_prev_txid(&self, inp: &InputRecord) -> Result<[u8; 32], QueryError> {
         if inp.is_coinbase() {
             return Ok([0u8; 32]);

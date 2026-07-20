@@ -89,7 +89,6 @@ pub(crate) struct IbdPerfSample {
     pub wf_pout_ms: u64,
     pub wf_spent_ms: u64,
     pub wf_cb_ms: u64,
-    pub wf_tip_note_ms: u64,
 
     // SH sub
     pub sh_warm_ms: u64,
@@ -101,13 +100,7 @@ pub(crate) struct IbdPerfSample {
     pub sh_head_ms: u64,
     pub sh_index_ms: u64,
 
-    // Caches / connect
-    pub tp_hit: u64,
-    pub tp_miss: u64,
-    pub tp_evict: u64,
-    pub tp_note: u64,
-    pub tp_retire: u64,
-    pub cp_tip: u64,
+    // Connect prevout resolve mix
     pub cp_wave: u64,
     pub cp_class_a: u64,
     pub cp_store: u64,
@@ -198,7 +191,6 @@ impl Default for IbdPerfSample {
             wf_pout_ms: 0,
             wf_spent_ms: 0,
             wf_cb_ms: 0,
-            wf_tip_note_ms: 0,
             sh_warm_ms: 0,
             sh_filter_ms: 0,
             sh_collect_ms: 0,
@@ -207,12 +199,6 @@ impl Default for IbdPerfSample {
             sh_body_ms: 0,
             sh_head_ms: 0,
             sh_index_ms: 0,
-            tp_hit: 0,
-            tp_miss: 0,
-            tp_evict: 0,
-            tp_note: 0,
-            tp_retire: 0,
-            cp_tip: 0,
             cp_wave: 0,
             cp_class_a: 0,
             cp_store: 0,
@@ -279,11 +265,10 @@ pub(crate) fn sample(
     ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
     let (sh_warm, sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head, sh_index) =
         rbitcoin_query::class_c_phase_stats::sample_sh_sub_and_reset();
-    let (wf_body, wf_ptx, wf_pout, wf_spent, wf_cb, wf_tip_note) =
+    let (wf_body, wf_ptx, wf_pout, wf_spent, wf_cb) =
         rbitcoin_query::wave_fill_stats::sample_and_reset();
     let _ = rbitcoin_query::class_a_cache_stats::sample_and_reset();
-    let (tph, tpm, tpe, tpn, tpr) = rbitcoin_query::tip_prevout_cache_stats::sample_and_reset();
-    let (pth, pwh, pca, psm) = rbitcoin_query::connect_prevout_stats::sample_and_reset();
+    let (pwh, pca, psm) = rbitcoin_query::connect_prevout_stats::sample_and_reset();
     let (
         pw_ns,
         pw_blocks,
@@ -356,7 +341,6 @@ pub(crate) fn sample(
         wf_pout_ms: ns_ms(wf_pout),
         wf_spent_ms: ns_ms(wf_spent),
         wf_cb_ms: ns_ms(wf_cb),
-        wf_tip_note_ms: ns_ms(wf_tip_note),
         sh_warm_ms: ns_ms(sh_warm),
         sh_filter_ms: ns_ms(sh_filter),
         sh_collect_ms: ns_ms(sh_collect),
@@ -365,12 +349,6 @@ pub(crate) fn sample(
         sh_body_ms: ns_ms(sh_body),
         sh_head_ms: ns_ms(sh_head),
         sh_index_ms: ns_ms(sh_index),
-        tp_hit: tph,
-        tp_miss: tpm,
-        tp_evict: tpe,
-        tp_note: tpn,
-        tp_retire: tpr,
-        cp_tip: pth,
         cp_wave: pwh,
         cp_class_a: pca,
         cp_store: psm,
@@ -490,13 +468,12 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         us(s.utxo_apply_ns),
     );
     out.push_str(&format!(
-        " | wave body={} ptx={} pout={} spent={} cb={} tip_note={}",
+        " | wave body={} ptx={} pout={} spent={} cb={}",
         s.wf_body_ms,
         s.wf_ptx_ms,
         s.wf_pout_ms,
         s.wf_spent_ms,
         s.wf_cb_ms,
-        s.wf_tip_note_ms,
     ));
     out.push_str(&format!(
         " | sh warm={} filter={} collect={} sort={} seed={} body={} head={} index={}",
@@ -509,15 +486,9 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.sh_head_ms,
         s.sh_index_ms,
     ));
-    let tp_tot = s.tp_hit + s.tp_miss;
-    let tp_pct = if tp_tot > 0 {
-        (100 * s.tp_hit) / tp_tot
-    } else {
-        0
-    };
-    let cp_tot = s.cp_tip + s.cp_wave + s.cp_class_a + s.cp_store;
+    let cp_tot = s.cp_wave + s.cp_class_a + s.cp_store;
     out.push_str(&format!(
-        " | prewarm +{} thru={} parents={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} cache_hit={} body_io={} parent_io={} miss_p={} | tip_po hit={} miss={} hit%={} note={} retire={} | connect tip%={} wave%={} parent%={} store%={}",
+        " | prewarm +{} thru={} parents={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} cache_hit={} body_io={} parent_io={} miss_p={} | connect wave%={} parent%={} store%={}",
         s.pw_ahead,
         s.pw_ready_through,
         s.pw_parents,
@@ -534,16 +505,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.pw_body_tx_reads,
         s.pw_parent_tx_reads,
         s.pw_missing_parents,
-        s.tp_hit,
-        s.tp_miss,
-        tp_pct,
-        s.tp_note,
-        s.tp_retire + s.tp_evict, // retire+evict pressure
-        if cp_tot > 0 {
-            (100 * s.cp_tip) / cp_tot
-        } else {
-            0
-        },
         if cp_tot > 0 {
             (100 * s.cp_wave) / cp_tot
         } else {

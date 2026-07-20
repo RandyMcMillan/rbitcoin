@@ -11,7 +11,6 @@ mod run_builder_core;
 mod scripthash;
 mod point_run_builder;
 mod sh_builder;
-mod tip_prevout_cache;
 mod tx_run_builder;
 mod wave_prevout;
 
@@ -43,7 +42,6 @@ pub use confirm_parent_cache::{
 };
 pub use connect::ConfirmPrepared;
 pub use parent_prewarm::PrewarmStats;
-pub use tip_prevout_cache::stats as tip_prevout_cache_stats;
 pub use wave_prevout::WavePrevoutCache;
 
 /// Stub stats for IBD perf_log (Class A cache removed; use [`parent_prewarm_stats`]).
@@ -203,15 +201,13 @@ pub mod class_c_phase_stats {
 pub mod connect_prevout_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    pub static TIP_HIT: AtomicU64 = AtomicU64::new(0);
     pub static WAVE_HIT: AtomicU64 = AtomicU64::new(0);
     pub static CLASS_A_HIT: AtomicU64 = AtomicU64::new(0);
     pub static STORE_MISS: AtomicU64 = AtomicU64::new(0);
 
-    /// `(tip_hit, wave_hit, class_a_hit, store_miss)` then reset.
-    pub fn sample_and_reset() -> (u64, u64, u64, u64) {
+    /// `(wave_hit, class_a_hit, store_miss)` then reset.
+    pub fn sample_and_reset() -> (u64, u64, u64) {
         (
-            TIP_HIT.swap(0, Ordering::Relaxed),
             WAVE_HIT.swap(0, Ordering::Relaxed),
             CLASS_A_HIT.swap(0, Ordering::Relaxed),
             STORE_MISS.swap(0, Ordering::Relaxed),
@@ -240,7 +236,7 @@ pub mod ibd_utxo_stats {
 /// Wave-fill sub-phase wall times (nanoseconds; reset by the IBD sampler).
 ///
 /// Breaks down the dominant `wave_fill` recon cost: body vs parent warm vs spent
-/// vs coinbase height vs tip_prevout promote.
+/// vs coinbase height.
 pub mod wave_fill_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -254,18 +250,15 @@ pub mod wave_fill_stats {
     pub static SPENT_NS: AtomicU64 = AtomicU64::new(0);
     /// Coinbase create-height for parents.
     pub static CB_HEIGHT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Promote live parent slots into tip_prevout.
-    pub static TIP_NOTE_NS: AtomicU64 = AtomicU64::new(0);
 
-    /// `(body, parent_tx, parent_out, spent, cb_height, tip_note)` nanoseconds.
-    pub fn sample_and_reset() -> (u64, u64, u64, u64, u64, u64) {
+    /// `(body, parent_tx, parent_out, spent, cb_height)` nanoseconds.
+    pub fn sample_and_reset() -> (u64, u64, u64, u64, u64) {
         (
             BODY_NS.swap(0, Ordering::Relaxed),
             PARENT_TX_NS.swap(0, Ordering::Relaxed),
             PARENT_OUT_NS.swap(0, Ordering::Relaxed),
             SPENT_NS.swap(0, Ordering::Relaxed),
             CB_HEIGHT_NS.swap(0, Ordering::Relaxed),
-            TIP_NOTE_NS.swap(0, Ordering::Relaxed),
         )
     }
 
@@ -313,9 +306,6 @@ pub struct Query {
     sh_indexed_through: AtomicU64,
     /// Block-structured confirm parent runway (UTXO-backed + reserved holes).
     confirm_parents: confirm_parent_cache::ConfirmParentCache,
-    /// Tip-window create txs + outputs filled **as we confirm** (and when
-    /// resolving parents during connect). FIFO; independent of archive lead.
-    tip_prevout_cache: tip_prevout_cache::TipPrevoutCache,
     /// Catch-up SH: memtable → sorted runs (no durable head on confirm).
     sh_run: sh_builder::ShRunBuilder,
     /// Catch-up tx.head via sorted runs.
@@ -354,7 +344,6 @@ impl Query {
             sh_heads: Mutex::new(HashMap::new()),
             sh_indexed_through: AtomicU64::new(sh_through),
             confirm_parents: confirm_parent_cache::ConfirmParentCache::from_env(),
-            tip_prevout_cache: tip_prevout_cache::TipPrevoutCache::from_env(),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
             tx_run: tx_run_builder::TxRunBuilder::new(&store_path),
             point_run: point_run_builder::PointRunBuilder::new(&store_path),
@@ -441,60 +430,8 @@ impl Query {
         &self.store
     }
 
-    /// Class A working-set cache size `(entries, approx_bytes, budget_bytes)`.
-    /// `(parent_entries, reserved_holes, depth)` — replaces old Class A usage triple.
-    pub fn class_a_cache_usage(&self) -> (usize, usize, usize) {
-        (
-            self.confirm_parents.parent_count(),
-            self.confirm_parents.reserved_count(),
-            self.confirm_parents.depth() as usize,
-        )
-    }
-
     pub fn confirm_parent_cache(&self) -> &confirm_parent_cache::ConfirmParentCache {
         &self.confirm_parents
-    }
-
-    pub fn tip_prevout_cache_usage(&self) -> (usize, usize, usize) {
-        (
-            self.tip_prevout_cache.len(),
-            self.tip_prevout_cache.approx_bytes(),
-            self.tip_prevout_cache.budget_bytes(),
-        )
-    }
-
-    /// Single-lock tip_prevout resolve for connect: `(tx, output)`.
-    pub fn tip_prevout_tx_and_output(
-        &self,
-        fk: Fk,
-        vout: u32,
-    ) -> Option<(TxRecord, OutputRecord)> {
-        self.tip_prevout_cache.get_tx_and_output_at(fk, vout)
-    }
-
-    /// Single-lock tip_prevout resolve by parent txid.
-    pub fn tip_prevout_tx_and_output_by_txid(
-        &self,
-        txid: &[u8; 32],
-        vout: u32,
-    ) -> Option<(Fk, TxRecord, OutputRecord)> {
-        self.tip_prevout_cache
-            .get_tx_and_output_by_txid(txid, vout)
-    }
-
-    /// After successful Class C: drop spent vouts from tip_prevout (budget reclaim).
-    pub fn retire_tip_prevout_spends(&self, spends: &[([u8; 32], u32)]) {
-        self.tip_prevout_cache.retire_spends(spends);
-    }
-
-    /// True if outpoint is cached as live unspent in tip_prevout (write-through).
-    pub fn tip_prevout_has_live(&self, txid: &[u8; 32], vout: u32) -> bool {
-        self.tip_prevout_cache.has_live_output_txid(txid, vout)
-    }
-
-    /// True if outpoint is cached as live unspent in tip_prevout by create fk.
-    pub fn tip_prevout_has_live_fk(&self, fk: Fk, vout: u32) -> bool {
-        self.tip_prevout_cache.has_live_output(fk, vout)
     }
 
     /// No-op compatibility: SH dedupe is a height watermark (`sh_indexed_through`),
@@ -750,12 +687,6 @@ impl Query {
     }
 
     pub fn get_tx(&self, fk: Fk) -> Result<TxRecord, QueryError> {
-        if let Some(tx) = self.tip_prevout_cache.get_tx(fk) {
-            return Ok(tx);
-        }
-        if let Some(tx) = self.confirm_parents.get_parent_tx(fk) {
-            return Ok(tx);
-        }
         self.get_tx_class_a(fk)
     }
 
@@ -861,8 +792,7 @@ impl Query {
     }
 
     /// Like [`Self::tx_output`] but records connect cold-path counters when
-    /// `count_connect` is true. When true, **skips tip_prevout probe** (caller
-    /// already tried the single-lock fast path) to avoid double MISS stats.
+    /// `count_connect` is true.
     ///
     /// Packed rows without `tx.head` need [`Self::tx_output_at_fk_attributed`].
     pub fn tx_output_attributed(
@@ -901,18 +831,13 @@ impl Query {
         if vout >= tx.output_count {
             return Err(StoreError::NotFound);
         }
-        if !count_connect {
-            if let Some(o) = self.tip_prevout_cache.get_output_at(create_fk, vout) {
-                return Ok(o);
-            }
-        }
         if let Some((_, o)) = self.confirm_parents.get_parent_out(create_fk, vout) {
             if count_connect {
                 connect_prevout_stats::CLASS_A_HIT.fetch_add(1, Ordering::Relaxed);
             }
             return Ok(o);
         }
-        // Load full outs (packed = one body IO); promote into tip-window.
+        // Load full outs (packed = one body IO).
         let outs = if let Some(run) = tx.output_start_fk.get() {
             self.get_output_run(Fk(run), tx.output_count)?
         } else {
@@ -923,7 +848,6 @@ impl Query {
             .get(vout as usize)
             .cloned()
             .ok_or(StoreError::NotFound)?;
-        self.tip_prevout_cache.note(create_fk, tx.clone(), outs);
         if count_connect {
             connect_prevout_stats::STORE_MISS.fetch_add(1, Ordering::Relaxed);
         }

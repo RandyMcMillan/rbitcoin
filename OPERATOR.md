@@ -44,7 +44,6 @@ Default: **info**. CLI wins over env.
 | Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` (`0` = full scripts) |
 | Archive queue RAM | **256 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
-| Tip prevout cache | **128 MiB** | `RBITCOIN_TIP_PREVOUT_CACHE_MB` |
 | Light UTXO (mmap) | **~96 MiB start** (24 B slots; grows) | `RBITCOIN_IBD_UTXO_SLOTS` |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 | Inhibit auto-suspend | **off** | `--inhibit-suspend` (uses `systemd-inhibit` if available) |

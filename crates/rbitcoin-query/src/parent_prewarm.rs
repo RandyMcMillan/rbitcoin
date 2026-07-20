@@ -4,12 +4,13 @@
 //! 1. Load every full Class A body in the batch; register **all** creates so
 //!    same-batch / runway spends need no UTXO and no reservations.
 //! 2. Collect external parent needs; sort/dedup by create fk; load once each.
+//!    Stash per-tx **thin create-fk edges** so wave_fill does not re-walk inputs.
 //!
-//! After prewarm, confirm should only **write** (Class C, light UTXO, tip).
-//! Wave/wire rebuild prefer the body cache over store.
+//! After prewarm, confirm should only **write** (Class C, light UTXO).
+//! Wave/wire rebuild prefer the body + thin-edge cache over store.
 
 use super::*;
-use crate::confirm_parent_cache::prewarm_headroom_from_env;
+use crate::confirm_parent_cache::{prewarm_headroom_from_env, StashedThinInput};
 use std::collections::HashMap;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -68,12 +69,6 @@ impl Query {
         for &(height, hash) in items {
             self.confirm_parents.ensure_plan(height, hash);
         }
-    }
-
-    pub fn parent_pin_count(&self) -> usize {
-        self.confirm_parents.parent_count()
-            + self.confirm_parents.reserved_count()
-            + self.confirm_parents.body_count()
     }
 
     pub fn is_prewarm_ready(&self, heights: &[u32]) -> bool {
@@ -209,23 +204,34 @@ impl Query {
             phase1.push((height, bodies));
         }
 
-        // ── Phase 2: external parents (sort/dedup store loads) ──────────────
-        // (create_fk_id, vout) → need put for each (height, fk, vout)
+        // ── Phase 2: external parents + stash thin edges for wave_fill ──────
+        // (create_fk_id, vout) need store load; put after dedup.
         let mut need_load: Vec<(u64, u32)> = Vec::new();
         let mut need_put: Vec<(u32, Fk, u32)> = Vec::new();
+        // spending_fk_id → thin edges (built while resolving create fks).
+        let mut thin_by_spend: HashMap<u64, Vec<StashedThinInput>> = HashMap::new();
 
         for (height, bodies) in &phase1 {
             let mut local: HashMap<[u8; 32], Fk> = HashMap::with_capacity(bodies.len());
             for (fk, tx, _, _) in bodies {
                 local.insert(tx.txid, *fk);
             }
-            for (_fk, _tx, _outs, inputs) in bodies {
+            for (spend_fk, _tx, _outs, inputs) in bodies {
+                let mut edges: Vec<StashedThinInput> = Vec::with_capacity(inputs.len());
                 for inp in inputs {
                     if inp.is_coinbase() {
+                        edges.push(StashedThinInput {
+                            create_fk: None,
+                            prev_index: inp.prev_index,
+                        });
                         continue;
                     }
                     // Same-block create (from phase 1 body).
                     if let Some(&cfk) = local.get(&inp.prev_txid) {
+                        edges.push(StashedThinInput {
+                            create_fk: cfk.get(),
+                            prev_index: inp.prev_index,
+                        });
                         if let Some((_, ptx, bouts, _)) =
                             bodies.iter().find(|(f, _, _, _)| *f == cfk)
                         {
@@ -248,6 +254,10 @@ impl Query {
                         if let Some((ptx, o)) =
                             self.confirm_parents.get_parent_out(cfk, inp.prev_index)
                         {
+                            edges.push(StashedThinInput {
+                                create_fk: cfk.get(),
+                                prev_index: inp.prev_index,
+                            });
                             self.confirm_parents.put_utxo_parent(
                                 *height,
                                 cfk,
@@ -260,18 +270,19 @@ impl Query {
                             continue;
                         }
                     }
-                    // Confirmed parent: UTXO / tip_prevout / durable head.
+                    // Confirmed parent: runway by_txid → light UTXO → durable head.
                     let create_fk = self
-                        .ibd_utxo_create_fk(&inp.prev_txid, inp.prev_index)?
-                        .or_else(|| {
-                            self.tip_prevout_cache
-                                .get_tx_and_output_by_txid(&inp.prev_txid, inp.prev_index)
-                                .map(|(fk, _, _)| fk)
-                        })
+                        .confirm_parents
+                        .get_by_txid(&inp.prev_txid)
+                        .or(self.ibd_utxo_create_fk(&inp.prev_txid, inp.prev_index)?)
                         .or(self.tx_fk_by_txid(&inp.prev_txid).ok().flatten());
 
                     match create_fk {
                         Some(create_fk) => {
+                            edges.push(StashedThinInput {
+                                create_fk: create_fk.get(),
+                                prev_index: inp.prev_index,
+                            });
                             if let Some((ptx, o)) =
                                 self.confirm_parents.get_parent_out(create_fk, inp.prev_index)
                             {
@@ -292,11 +303,18 @@ impl Query {
                             }
                         }
                         None => {
+                            edges.push(StashedThinInput {
+                                create_fk: None,
+                                prev_index: inp.prev_index,
+                            });
                             // Should not happen after phase-1 full-out register for
                             // runway creates; count for diagnostics (no reserve).
                             st.missing_parents = st.missing_parents.saturating_add(1);
                         }
                     }
+                }
+                if let Some(id) = spend_fk.get() {
+                    thin_by_spend.insert(id, edges);
                 }
             }
         }
@@ -321,7 +339,6 @@ impl Query {
             loaded.insert(fk_id, (ptx, outs));
         }
 
-        let mut tip_seeded: HashMap<u64, ()> = HashMap::new();
         for &(height, create_fk, vout) in &need_put {
             let Some(id) = create_fk.get() else {
                 continue;
@@ -339,18 +356,12 @@ impl Query {
                 vout,
                 o.clone(),
             );
-            if tip_seeded.insert(id, ()).is_none() {
-                let n = ptx.output_count as usize;
-                let mut slots = vec![None; n];
-                for (v, o) in outs.iter().enumerate() {
-                    if v < n {
-                        slots[v] = Some(o.clone());
-                    }
-                }
-                self.tip_prevout_cache
-                    .note_live_slots(create_fk, ptx.clone(), &slots);
-            }
             st.utxo_parents = st.utxo_parents.saturating_add(1);
+        }
+
+        // Attach thin edges to runway bodies for wave_fill.
+        for (id, edges) in thin_by_spend {
+            self.confirm_parents.put_thin_inputs(Fk(id), edges);
         }
 
         // ── Phase 3: mark scanned ───────────────────────────────────────────
@@ -383,11 +394,6 @@ impl Query {
             let create_fk = self
                 .ibd_utxo_create_fk(&txid, vout)?
                 .or_else(|| self.confirm_parents.get_by_txid(&txid))
-                .or_else(|| {
-                    self.tip_prevout_cache
-                        .get_tx_and_output_by_txid(&txid, vout)
-                        .map(|(fk, _, _)| fk)
-                })
                 .or(self.tx_fk_by_txid(&txid).ok().flatten());
             if let Some(fk) = create_fk {
                 self.confirm_parents.retire_spend(fk, vout);

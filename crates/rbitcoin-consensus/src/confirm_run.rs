@@ -2,9 +2,9 @@
 //!
 //! Pipeline (order is consensus-critical — do not reorder):
 //! ```text
-//! resolve_bodies → prefetch_class_a → wave_fill → wire_rebuild
+//! resolve_bodies → prewarm_wait → wave_fill → wire_rebuild
 //!   → connect (headers + prevouts) → scripts → class_c
-//!   → utxo_apply (catch-up only) → tip_prevout_retire
+//!   → utxo_apply (catch-up only)
 //! ```
 //!
 //! Timers: [`crate::confirm_phase_stats`]. Multi-block order: sequential connect,
@@ -100,14 +100,14 @@ pub fn confirm_archived_run(
         )
         .map_err(ConsensusError::Store)?;
 
-    // ── 2–3. body load + wave_fill (parents from ConfirmParentCache) ────────
+    // ── 2. wave_fill (bodies + parents + thin edges from ConfirmParentCache) ─
     let hashes: Vec<[u8; 32]> = metas.iter().map(|m| m.hash).collect();
-    let wave_prevouts = prefetch_and_wave_fill(query, &hashes)?;
+    let wave_prevouts = wave_fill(query, &hashes)?;
 
-    // ── 4. wire_rebuild ─────────────────────────────────────────────────────
+    // ── 3. wire_rebuild ─────────────────────────────────────────────────────
     let wire_blocks = wire_rebuild(query, &metas)?;
 
-    // ── 5. connect (headers + prevouts; run-local pending) ──────────────────
+    // ── 4. connect (headers + prevouts; run-local pending) ──────────────────
     let mut prepared = connect_run(
         query,
         params,
@@ -117,14 +117,14 @@ pub fn confirm_archived_run(
         &wave_prevouts,
     )?;
 
-    // ── 6. scripts (one wave for the whole run) ─────────────────────────────
+    // ── 5. scripts (one wave for the whole run) ─────────────────────────────
     script_wave(&prepared)?;
 
-    // ── 7. class_c ──────────────────────────────────────────────────────────
+    // ── 6. class_c ──────────────────────────────────────────────────────────
     let n_blocks = prepared.len();
     let out = class_c_commit(query, &mut prepared)?;
 
-    // ── 8. utxo_apply (catch-up) + tip_prevout_retire ────────────────────────
+    // ── 7. utxo_apply (catch-up) ─────────────────────────────────────────────
     post_commit(query, &prepared)?;
 
     confirm_phase_stats::BLOCKS.fetch_add(n_blocks as u64, Ordering::Relaxed);
@@ -162,23 +162,17 @@ fn resolve_body_metas(
     Ok(metas)
 }
 
-fn prefetch_and_wave_fill(
+fn wave_fill(
     query: &Query,
     hashes: &[[u8; 32]],
 ) -> Result<rbitcoin_query::WavePrevoutCache, ConsensusError> {
+    // Prefetch Class A is a no-op (bodies live in ConfirmParentCache). Leave
+    // PREFETCH_CLASS_A_NS at 0 so perf still shows p=0 cleanly.
     let t0 = Instant::now();
-    let _ = query
-        .prefetch_class_a_for_block_hashes(hashes)
+    let (_n, wave) = query
+        .wave_fill_for_block_hashes(hashes)
         .map_err(ConsensusError::Store)?;
     let ns = t0.elapsed().as_nanos() as u64;
-    confirm_phase_stats::PREFETCH_CLASS_A_NS.fetch_add(ns, Ordering::Relaxed);
-    confirm_phase_stats::RECONSTRUCT_NS.fetch_add(ns, Ordering::Relaxed);
-
-    let t1 = Instant::now();
-    let (_n, wave) = query
-        .prefetch_tip_prevouts_for_block_hashes(hashes)
-        .map_err(ConsensusError::Store)?;
-    let ns = t1.elapsed().as_nanos() as u64;
     confirm_phase_stats::WAVE_FILL_NS.fetch_add(ns, Ordering::Relaxed);
     confirm_phase_stats::RECONSTRUCT_NS.fetch_add(ns, Ordering::Relaxed);
     Ok(wave)
@@ -398,9 +392,6 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
     }
     confirm_phase_stats::UTXO_APPLY_NS
         .fetch_add(t_spent.elapsed().as_nanos() as u64, Ordering::Relaxed);
-
-    // Only after successful Class C: drop spent vouts from tip_prevout.
-    query.retire_tip_prevout_spends(&all_spends);
 
     // Prune confirm-parent runway for heights at/below new tip.
     if let Some(tip) = prepared.last().map(|p| p.height.0) {

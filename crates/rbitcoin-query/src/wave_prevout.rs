@@ -118,18 +118,6 @@ impl WavePrevoutCache {
         );
     }
 
-    pub fn has_live_output_fk(&self, fk: Fk, vout: u32) -> bool {
-        let Some(id) = fk.get() else {
-            return false;
-        };
-        matches!(
-            self.parents
-                .get(&id)
-                .and_then(|p| p.outputs.get(vout as usize)),
-            Some(Some(_))
-        )
-    }
-
     pub fn has_live_output_txid(&self, txid: &[u8; 32], vout: u32) -> bool {
         let Some(&id) = self.by_txid.get(txid) else {
             return false;

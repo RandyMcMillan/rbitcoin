@@ -218,7 +218,7 @@ pub fn accept_and_connect_block(
     let fk = query
         .connect_block(height, &header_rec, &txs)
         .map_err(ConsensusError::Store)?;
-    // Post Class C (same order as `confirm_archived_run`): UTXO apply + tip_prevout retire.
+    // Post Class C (same order as `confirm_archived_run`): UTXO apply.
     let mut spends = Vec::new();
     let mut creates = Vec::new();
     if query.ibd_utxo_enabled() || query.spend_index_enabled() {
@@ -248,10 +248,6 @@ pub fn accept_and_connect_block(
         query
             .apply_ibd_utxo_block(&spends, &creates, height.0)
             .map_err(ConsensusError::Store)?;
-    }
-    // Keep tip_prevout write-through accurate for tests / tip-follow connect.
-    if !spends.is_empty() {
-        query.retire_tip_prevout_spends(&spends);
     }
     Ok(fk)
 }

@@ -249,14 +249,6 @@ impl Query {
             Ordering::Relaxed,
         );
 
-        // Do **not** seed tip_prevout with every confirmed create here.
-        // Wave already `note_live_slots`s external parents; same-batch creates
-        // live in WavePrevoutCache. Bulk create-note on fat batches (signet
-        // ~20–40k notes / 5s) FIFO-evicted those parents, then `retire_spends`
-        // dropped many of the same creates — pure thrash. Next wave reloads
-        // parents from warm Class A. Connect still miss-fills tip_prevout on
-        // cold path via `tx_output_run_class_a` / `tx_output_at_fk_*`.
-
         Ok(out)
     }
 
@@ -391,9 +383,6 @@ impl Query {
         if tx.output_count == 0 {
             return Ok(Vec::new());
         }
-        if let Some(outputs) = self.tip_prevout_cache.get_outputs(create_fk) {
-            return Ok(outputs);
-        }
         if let Some(run) = tx.output_start_fk.get() {
             return self.get_output_run(Fk(run), tx.output_count);
         }
@@ -498,8 +487,6 @@ impl Query {
         self.store.confirmed.disconnect_tip(height)?;
         // SH watermark tracks confirmed tip (re-confirm will re-enqueue this height).
         self.set_sh_indexed_through_height(self.tip_height().map(|h| h.0));
-        // Tip-window cache may hold creates from this tip; drop rather than partial unlink.
-        self.tip_prevout_cache.clear();
         Ok(())
     }
 }

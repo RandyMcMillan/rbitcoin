@@ -772,31 +772,8 @@ fn resolve_prevout(
         }
     }
 
-    // Fast path: tip_prevout (txid-authoritative, same as wave).
-    let tip_hit = query
-        .tip_prevout_tx_and_output_by_txid(&prev_txid, op.vout)
-        .or_else(|| {
-            prev_fk.and_then(|fk| {
-                query
-                    .tip_prevout_tx_and_output(fk, op.vout)
-                    .filter(|(rec, _)| rec.txid == prev_txid)
-                    .map(|(rec, out)| (fk, rec, out))
-            })
-        });
-    if let Some((prev_fk, prev_rec, out)) = tip_hit {
-        connect_prevout_stats::TIP_HIT.fetch_add(1, Ordering::Relaxed);
-        let cb_h =
-            coinbase_height_for_maturity(query, prev_fk, &prev_rec, wave_prevouts, coinbase_height_cache)?;
-        return Ok(ResolvedPrevout {
-            txout: TxOut {
-                value: Amount::from_sat(out.value as u64),
-                script_pubkey: ScriptBuf::from_bytes(out.script),
-            },
-            coinbase_height: cb_h,
-        });
-    }
-
-    // Cold path: try every create-fk candidate (thin → UTXO → durable head/runs).
+    // Cold path: create-fk candidates (thin → UTXO → durable head / store).
+    // Tip-follow without a wave (or wave miss) uses this path.
     // Wrong thin hints must not block UTXO / head after a txid mismatch.
     let utxo_fk = query
         .ibd_utxo_create_fk(&prev_txid, op.vout)

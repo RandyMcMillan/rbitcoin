@@ -2,14 +2,14 @@
 //! durable head is materialized at tip mode (catch-up parent resolve uses light UTXO).
 
 use super::run_builder_core::{
-    clear_runs_dir, finalize_wait_join, memtable_cap, spawn_worker, take_oldest_run, worker_loop,
+    claim_oldest_run, clear_runs_dir, finalize_wait_join, memtable_cap, spawn_worker, worker_loop,
     RunControl, RunMemtable, FAMILY_TX,
 };
 use rbitcoin_log::{debug, info};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
-    list_runs, lookup_key, next_run_path, read_run_body, remove_run, write_sorted_run, Store,
-    StoreError, SortedRunPath,
+    list_runs, lookup_key, next_run_path, read_run_body, write_sorted_run, Store, StoreError,
+    SortedRunPath,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -190,15 +190,12 @@ impl TxRunBuilder {
             let g = self.inner.lock().unwrap();
             (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
         };
-        let Some(run) = take_oldest_run(&runs_dir, &runs_io)? else {
+        let Some(run) = claim_oldest_run(&runs_dir, &runs_io)? else {
             return Ok(None);
         };
         let t0 = std::time::Instant::now();
         let n = materialize(store, &run)?;
-        {
-            let _io = runs_io.lock().unwrap();
-            remove_run(&run)?;
-        }
+        let _ = std::fs::remove_file(&run.path);
         let elapsed = t0.elapsed();
         rbitcoin_log::debug!(
             "ibd: materialize store=tx.head keys≈{n} count={} elapsed={elapsed:?}",

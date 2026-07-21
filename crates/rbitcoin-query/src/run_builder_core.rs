@@ -14,7 +14,9 @@
 //! continues until runs empty (once inflight is clear).
 
 use rbitcoin_log::warn;
-use rbitcoin_store::{list_runs, try_set_io_idle, SortedRunPath, StoreError};
+use rbitcoin_store::{
+    claim_run_for_materialize, list_runs, try_set_io_idle, SortedRunPath, StoreError,
+};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -336,9 +338,13 @@ pub fn finalize_wait_join<T: RunMemtable>(
     Ok(())
 }
 
-/// Pop the oldest on-disk run (lowest seq) under `runs_io`. Caller materializes
-/// then [`rbitcoin_store::remove_run`].
-pub fn take_oldest_run(
+/// Claim the oldest run for materialize: rename `*.run` → `*.run.mat` and drop
+/// from MANIFEST under `runs_io`. Caller materializes then **deletes** `path`
+/// (do not [`rbitcoin_store::remove_run`] — seq is no longer cataloged).
+///
+/// Used for **point, tx, and scripthash** so concurrent `list_runs` orphan
+/// cleanup cannot wipe an in-flight body.
+pub fn claim_oldest_run(
     runs_dir: &Path,
     runs_io: &Mutex<()>,
 ) -> Result<Option<SortedRunPath>, StoreError> {
@@ -348,7 +354,8 @@ pub fn take_oldest_run(
         return Ok(None);
     }
     runs.sort_by_key(|r| r.seq().unwrap_or(u64::MAX));
-    Ok(runs.into_iter().next())
+    let run = runs.into_iter().next().unwrap();
+    Ok(Some(claim_run_for_materialize(&run)?))
 }
 
 pub fn clear_runs_dir(runs_dir: &Path) {

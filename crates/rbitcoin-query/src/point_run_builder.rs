@@ -4,13 +4,13 @@
 //! when light UTXO supplies create_fk; materialize patches create outputs.
 
 use super::run_builder_core::{
-    clear_runs_dir, finalize_wait_join, memtable_cap, spawn_worker, take_oldest_run, worker_loop,
+    claim_oldest_run, clear_runs_dir, finalize_wait_join, memtable_cap, spawn_worker, worker_loop,
     RunControl, RunMemtable, FAMILY_POINT,
 };
 use rbitcoin_log::{debug, info};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
-    next_run_path, read_run_body, remove_run, write_sorted_run, Store, StoreError, SortedRunPath,
+    next_run_path, read_run_body, write_sorted_run, Store, StoreError, SortedRunPath,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -119,10 +119,12 @@ impl PointRunBuilder {
     }
 
     pub fn on_disk_run_count(&self) -> usize {
-        let runs_dir = {
+        let (runs_dir, runs_io) = {
             let g = self.inner.lock().unwrap();
-            g.ctrl.runs_dir.clone()
+            (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
         };
+        // Hold runs_io so we never race merge write→MANIFEST (orphan killer).
+        let _io = runs_io.lock().unwrap();
         rbitcoin_store::list_runs(&runs_dir)
             .map(|r| r.len())
             .unwrap_or(0)
@@ -133,15 +135,12 @@ impl PointRunBuilder {
             let g = self.inner.lock().unwrap();
             (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
         };
-        let Some(run) = take_oldest_run(&runs_dir, &runs_io)? else {
+        let Some(run) = claim_oldest_run(&runs_dir, &runs_io)? else {
             return Ok(None);
         };
         let t0 = std::time::Instant::now();
         let n = materialize(store, &run)?;
-        {
-            let _io = runs_io.lock().unwrap();
-            remove_run(&run)?;
-        }
+        let _ = std::fs::remove_file(&run.path);
         let elapsed = t0.elapsed();
         rbitcoin_log::debug!(
             "ibd: materialize store=point edges≈{n} count={} elapsed={elapsed:?}",

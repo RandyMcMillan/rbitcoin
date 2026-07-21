@@ -578,10 +578,10 @@ pub fn remove_run(run: &SortedRunPath) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Drop a run from the MANIFEST but **leave the file** (claim for materialize).
+/// Drop a run from the MANIFEST but **leave the file**.
 ///
-/// After this, [`list_runs`] / merge will not see the run. Caller must materialize
-/// then delete the file (or [`remove_run`] if still cataloged).
+/// Prefer [`claim_run_for_materialize`] for materialize: a bare detach leaves a
+/// `.run` file that concurrent [`list_runs`] will **delete as an orphan**.
 pub fn detach_run(run: &SortedRunPath) -> Result<(), StoreError> {
     let Some(dir) = run.path.parent() else {
         return Ok(());
@@ -592,6 +592,31 @@ pub fn detach_run(run: &SortedRunPath) -> Result<(), StoreError> {
         save_manifest(dir, &mf)?;
     }
     Ok(())
+}
+
+/// Claim a cataloged run for materialize: rename `*.run` → `*.run.mat`, then
+/// drop it from the MANIFEST.
+///
+/// Call under the family's `runs_io` lock. The `.mat` suffix is **not** scanned
+/// by [`list_runs`] orphan cleanup (only `*.run`), so concurrent list/merge
+/// cannot delete the claimed body while materialize runs.
+///
+/// Caller must materialize `claimed.path` then delete that file.
+pub fn claim_run_for_materialize(run: &SortedRunPath) -> Result<SortedRunPath, StoreError> {
+    let mat_path = {
+        let mut s = run.path.as_os_str().to_os_string();
+        s.push(".mat");
+        PathBuf::from(s)
+    };
+    fs::rename(&run.path, &mat_path).map_err(|e| io_err(&run.path, e))?;
+    detach_run(run)?;
+    Ok(SortedRunPath {
+        path: mat_path,
+        count: run.count,
+        rec_len: run.rec_len,
+        key_len: run.key_len,
+        body_crc32: run.body_crc32,
+    })
 }
 
 /// K-way merge of sorted runs → new run at `out_path`. Deletes input files on success.
@@ -727,13 +752,16 @@ pub fn list_runs(dir: &Path) -> Result<Vec<SortedRunPath>, StoreError> {
                 }
             }
         }
-        // Orphan .run files not in the catalog — ignore and try to remove.
+        // Orphan `*.run` files not in the catalog (e.g. merge inputs left after a
+        // successful MANIFEST commit, or a crash between write and catalog).
+        // Safe only for true leftovers: claimed materialize files use `*.run.mat`
+        // and are not scanned here. Deleting an in-flight claim would drop data.
         for p in scan_run_paths(dir)? {
             let Some(seq) = seq_from_path(&p) else {
                 continue;
             };
             if !listed_seqs.contains(&seq) {
-                rbitcoin_log::warn!(
+                rbitcoin_log::debug!(
                     "store: removing orphan sorted run not in MANIFEST {}",
                     p.display()
                 );
@@ -883,6 +911,29 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].seq(), Some(1));
         assert!(!orphan.exists(), "orphan should be removed");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn claim_for_materialize_survives_list_runs_orphan_cleanup() {
+        let d = tmp_dir();
+        let path = d.join("000001.run");
+        let run = write_sorted_run(&path, 32, 44, &rec(1, 1)).unwrap();
+        let claimed = claim_run_for_materialize(&run).unwrap();
+        assert!(claimed.path.extension().and_then(|s| s.to_str()) == Some("mat")
+            || claimed.path.to_string_lossy().ends_with(".run.mat"));
+        assert!(!path.exists());
+        assert!(claimed.path.exists());
+        // Concurrent list_runs must not delete the claimed body.
+        let listed = list_runs(&d).unwrap();
+        assert!(listed.is_empty());
+        assert!(
+            claimed.path.exists(),
+            "claimed .run.mat must not be treated as orphan"
+        );
+        // Body still readable for materialize.
+        let body = read_run_body(&claimed).unwrap();
+        assert_eq!(body.len(), 44);
         let _ = fs::remove_dir_all(&d);
     }
 

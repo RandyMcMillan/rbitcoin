@@ -7,14 +7,14 @@
 //! oldest run (detaches from MANIFEST) so merge cannot touch it mid-apply.
 
 use super::run_builder_core::{
-    clear_runs_dir, finalize_wait_join, memtable_cap, spawn_worker, RunControl, RunMemtable,
-    FAMILY_SH, AFTER_WORK, IDLE_POLL,
+    claim_oldest_run, clear_runs_dir, finalize_wait_join, memtable_cap, spawn_worker, RunControl,
+    RunMemtable, FAMILY_SH, AFTER_WORK, IDLE_POLL,
 };
 use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
-    detach_run, list_runs, merge_runs, next_run_path, read_run_body, write_sorted_run,
-    ScriptHashRecord, Store, StoreError, SortedRunPath,
+    list_runs, merge_runs, next_run_path, read_run_body, write_sorted_run, ScriptHashRecord,
+    Store, StoreError, SortedRunPath,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -195,8 +195,8 @@ impl ShRunBuilder {
 
     /// Materialize the oldest on-disk run into scripthash tables. `Ok(None)` if empty.
     ///
-    /// Claims the run (MANIFEST detach) under `runs_io` so the background merger
-    /// cannot pick it, then applies body+head, then deletes the file.
+    /// Claims the oldest run under `runs_io` (rename to `*.run.mat` + MANIFEST
+    /// detach so merge/list cannot delete it), applies body+head, then deletes.
     pub fn materialize_oldest_run(&self, store: &Store) -> Result<Option<u64>, StoreError> {
         let (runs_dir, runs_io) = {
             let g = self.inner.lock().unwrap();
@@ -207,7 +207,7 @@ impl ShRunBuilder {
         };
         let t0 = Instant::now();
         let n = materialize_run(store, &run)?;
-        let _ = std::fs::remove_file(&run.path);
+        let _ = std::fs::remove_file(&run.path); // claimed `*.run.mat`
         let elapsed = t0.elapsed();
         debug!(
             "ibd: materialize store=scripthash keys≈{n} count={} elapsed={elapsed:?}",
@@ -371,22 +371,6 @@ fn try_merge_two_oldest(runs_dir: &Path, next_seq: &mut u64) -> Result<bool, Sto
         run_body_bytes(&merged)
     );
     Ok(true)
-}
-
-/// Detach oldest run from MANIFEST (file remains for materialize).
-fn claim_oldest_run(
-    runs_dir: &Path,
-    runs_io: &Mutex<()>,
-) -> Result<Option<SortedRunPath>, StoreError> {
-    let _io = runs_io.lock().unwrap();
-    let mut runs = list_runs(runs_dir)?;
-    if runs.is_empty() {
-        return Ok(None);
-    }
-    runs.sort_by_key(|r| r.seq().unwrap_or(u64::MAX));
-    let run = runs.into_iter().next().unwrap();
-    detach_run(&run)?;
-    Ok(Some(run))
 }
 
 fn materialize_run(store: &Store, run: &SortedRunPath) -> Result<u64, StoreError> {

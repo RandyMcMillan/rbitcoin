@@ -1,8 +1,8 @@
+use crate::address_head::AddressHead;
 use crate::compact::{
     input_flags, output_flags, read_compact_size, read_uleb128, write_compact_size, write_uleb128,
 };
 use crate::error::StoreError;
-use crate::sharded_hashhead::ShardedHashHead;
 use crate::var_table::VarTable;
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::Path;
@@ -478,27 +478,21 @@ pub fn is_packed_tx_payload(raw: &[u8]) -> bool {
 
 pub struct TxTable {
     body: VarTable,
-    head: ShardedHashHead,
+    head: AddressHead,
 }
 
 impl TxTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
             body: VarTable::create(dir, "tx", TableKind::Tx)?,
-            head: ShardedHashHead::create_for_role(
-                dir.join("tx.head"),
-                crate::hashhead::HeadRole::Tx,
-            )?,
+            head: AddressHead::create(dir.join("tx.head"))?,
         })
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
             body: VarTable::open(dir, "tx", TableKind::Tx)?,
-            head: ShardedHashHead::open_for_role(
-                dir.join("tx.head"),
-                crate::hashhead::HeadRole::Tx,
-            )?,
+            head: AddressHead::open(dir.join("tx.head"))?,
         })
     }
 
@@ -537,7 +531,7 @@ impl TxTable {
                 .zip(fks.iter())
                 .map(|(r, fk)| (r.txid, *fk))
                 .collect();
-            self.head.insert_many(&heads)?;
+            self.head_insert_many(&heads)?;
         }
         Ok(fks)
     }
@@ -546,6 +540,22 @@ impl TxTable {
         let raw = self.body.get_raw(fk)?;
         let (tx, _, _) = decode_packed_tx(&raw)?;
         Ok(tx)
+    }
+
+    /// Read Class A body txid only (packed prefix or bare TxRecord).
+    fn body_txid(&self, fk: Fk) -> Result<[u8; 32], StoreError> {
+        let raw = self.body.get_raw(fk)?;
+        if raw.first().copied() == Some(PACKED_TX_V1) {
+            if raw.len() < 1 + 32 {
+                return Err(StoreError::Corrupt("short packed tx for txid"));
+            }
+            return Ok(raw[1..33].try_into().unwrap());
+        }
+        // Bare meta (legacy test paths): TxRecord starts with txid[32].
+        if raw.len() < 32 {
+            return Err(StoreError::Corrupt("short tx record for txid"));
+        }
+        Ok(raw[0..32].try_into().unwrap())
     }
 
     /// Relative byte offset of output `vout`'s `spender_field` inside a packed tx payload.
@@ -668,15 +678,15 @@ impl TxTable {
                 .zip(fks.iter())
                 .map(|((tx, _, _), fk)| (tx.txid, *fk))
                 .collect();
-            self.head.insert_many(&heads)?;
+            self.head_insert_many(&heads)?;
         }
         Ok(fks)
     }
 
     pub fn get_by_txid(&self, txid: &[u8; 32]) -> Result<Option<(Fk, TxRecord)>, StoreError> {
-        // 16-byte head prefix (and rare BIP30 duplicate full txids) may map to
-        // multiple Class A rows — verify body txid and prefer newest match.
-        for fk in self.head.get_all(txid)? {
+        // Keyless address head: probe candidates, verify body; prefer first match
+        // (newest-first BIP30 insert places newest earliest on the probe chain).
+        for fk in self.head.probe_fks(txid)? {
             let rec = self.get(fk)?;
             if rec.txid == *txid {
                 return Ok(Some((fk, rec)));
@@ -688,7 +698,7 @@ impl TxTable {
     /// All Class A fks whose body txid equals `txid` (BIP30: more than one).
     pub fn get_all_by_txid(&self, txid: &[u8; 32]) -> Result<Vec<(Fk, TxRecord)>, StoreError> {
         let mut out = Vec::new();
-        for fk in self.head.get_all(txid)? {
+        for fk in self.head.probe_fks(txid)? {
             let rec = self.get(fk)?;
             if rec.txid == *txid {
                 out.push((fk, rec));
@@ -721,12 +731,12 @@ impl TxTable {
         for id in 1..=n {
             let fk = Fk(id);
             let rec = self.get(fk)?;
-            // Prefix multi-list: only skip if this exact Class A fk is already linked.
-            if !self.head.get_all(&rec.txid)?.contains(&fk) {
+            // Skip if this exact Class A fk is already on the probe chain.
+            if !self.head.probe_fks(&rec.txid)?.contains(&fk) {
                 batch.push((rec.txid, fk));
                 if batch.len() >= CHUNK {
                     inserted += batch.len() as u64;
-                    self.head.insert_many(&batch)?;
+                    self.head_insert_many(&batch)?;
                     batch.clear();
                 }
             }
@@ -737,7 +747,7 @@ impl TxTable {
         }
         if !batch.is_empty() {
             inserted += batch.len() as u64;
-            self.head.insert_many(&batch)?;
+            self.head_insert_many(&batch)?;
         }
         on_progress(n, n, inserted);
         Ok(inserted)
@@ -748,21 +758,19 @@ impl TxTable {
         self.head.occupied()
     }
 
-    /// Pre-size `tx.head` shards for a following bulk insert (run materialize).
+    /// Fixed address table — no growth rehash (capacity is `2^BITS` slots).
     pub fn head_reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
         self.head.reserve_additional(additional)
     }
 
-    /// Bulk-insert head entries (sorted-run materialize / backfill helper).
+    /// Bulk-insert head entries (archive / run materialize / backfill).
     ///
-    /// Prefer [`Self::head_reserve_additional`] for the full run first so cold
-    /// shards bulk-fill in one sequential write. Inserts are paced only when
-    /// durable flush is not deferred (see `ibd_io_policy`).
+    /// Body txids are loaded for collision / BIP30 decisions (keyless head).
     pub fn head_insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
         }
-        self.head.insert_many_paced(entries)
+        self.head.insert_many_paced(entries, |fk| self.body_txid(fk))
     }
 
 
@@ -1153,5 +1161,47 @@ mod tests {
             decode_packed_tx_outs_only(&raw),
             Err(StoreError::Corrupt(_))
         ));
+    }
+
+    #[test]
+    fn address_head_get_by_txid() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-addr-head-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Force tiny address width for the test process.
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        let t = TxTable::create(&dir).unwrap();
+        let tx = TxRecord {
+            txid: [0x42u8; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let inputs = vec![InputRecord {
+            prev_txid: [0u8; 32],
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }];
+        let outputs = vec![OutputRecord::unspent(50_0000_0000, vec![0x51])];
+        let fks = t
+            .put_full_batch_indexed(&[(tx.clone(), inputs, outputs)], true)
+            .unwrap();
+        assert_eq!(fks.len(), 1);
+        let (fk, rec) = t.get_by_txid(&tx.txid).unwrap().expect("found");
+        assert_eq!(fk, fks[0]);
+        assert_eq!(rec.txid, tx.txid);
+        assert!(t.get_by_txid(&[0x99u8; 32]).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

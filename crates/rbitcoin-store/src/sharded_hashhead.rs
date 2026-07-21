@@ -178,11 +178,14 @@ impl ShardedHashHead {
         }
     }
 
+    /// Occupied slots across shards (header diagnostics / tests).
+    #[allow(dead_code)]
     pub fn occupied(&self) -> u64 {
         self.shards.iter().map(|s| s.occupied()).sum()
     }
 
     /// Pre-size every shard for roughly `additional` new keys (spread evenly).
+    #[allow(dead_code)]
     pub fn reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
         if additional == 0 {
             return Ok(());
@@ -217,6 +220,9 @@ impl ShardedHashHead {
 
     /// IBD run-materialize path: insert one shard at a time and **pause between
     /// shards** when pacing is enabled so rehashes do not stack.
+    ///
+    /// Still used for header bulk paths / tests; tx head no longer calls this.
+    #[allow(dead_code)]
     pub fn insert_many_paced(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());

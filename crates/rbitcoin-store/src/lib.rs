@@ -4,6 +4,7 @@
 //! Class C (confirmed / strong_tx) is tip-mutable for reorgs.
 //! Archive epochs + tip wire ring: durable-archive soft/hard zones.
 
+mod address_head;
 mod array_table;
 mod chain;
 mod compact;
@@ -33,6 +34,7 @@ pub use file::{
     NOFILE_SOFT_TARGET,
 };
 pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush, shard_pace_enabled};
+pub use address_head::{bits_for_scale, AddressHead, MAINNET_BITS, TINY_BITS};
 pub use hashhead::{
     initial_slots_for, HeadRole, HeadScale,
 };

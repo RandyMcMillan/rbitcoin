@@ -46,7 +46,7 @@ Catch-up without UTXO is illegal (`ensure_spent_oracle_ready`). Do not enter Tip
 ## Host freezes / IO storms
 
 Single Class A writer is intentional. Multi‑GiB **mmap grow/remap** and **hash-head
-rehash** (especially large `tx.head` shards when materializing) can still stall the
+rehash** (especially large **header** / scripthash head shards when materializing) can still stall the
 **host** (page cache / disk). See **[ibd-io-audit.md](./ibd-io-audit.md)** for the
 audit history, mitigations, and operator levers (`ionice`, dedicated disk, rehash
 log lines). Spends no longer use a durable `point.head` (schema v5+).

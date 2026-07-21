@@ -17,6 +17,10 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 
 /// Current on-disk schema version (see workspace `SCHEMA.md`).
 ///
+/// v8: `tx.head` is a fixed keyless address table (`2^31` × 8 B entries, double-hash
+/// probe, HAS_NEXT bit; body verify). Header / scripthash heads still use v7-style
+/// 16 B key prefixes + optional `.mlt` multi-lists.
+///
 /// v7: hash heads (tx/header/…) use 16 B key prefixes + optional multi-fk list
 /// (`.mlt`) for prefix collisions and BIP30 duplicate txids; body verify on lookup.
 ///
@@ -29,7 +33,7 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 ///
 /// v3: thin point/scripthash linked lists; strong_tx bitset; denser hash heads;
 /// Class A inputs always external `prev_txid`.
-pub const SCHEMA_VERSION: u16 = 7;
+pub const SCHEMA_VERSION: u16 = 8;
 
 /// 1-based foreign key into a store table body. Zero means null / absent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

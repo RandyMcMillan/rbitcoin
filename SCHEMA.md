@@ -1,8 +1,10 @@
-# On-disk schema (v7)
+# On-disk schema (v8)
 
 Versioned layouts for the chain store. **Format is unstable until 1.0.** Magic bytes and a schema version live in each file header.
 
-**Schema v7** (current): hash heads (`tx.head`, `header.head`, …) use **16 B key prefixes** (24 B slots) plus optional multi-fk lists (`*.head.mlt` / shard `NN.mlt`) for prefix collisions and BIP30 duplicate full txids. Lookups verify the Class A body. Keeps v6 scripthash compression and v5 spends.
+**Schema v8** (current): **`tx.head` is a fixed keyless address table** — single file, `2^BITS` × **8 B** entries (mainnet `BITS=31` → **16 GiB** sparse), double-hash open-address probe, high bit `HAS_NEXT`, full `create_fk` in low 63 bits (0 = empty). No key material in the head; lookups verify Class A body txid. No shard directory / no `.mlt` for tx. **Header** and **scripthash** heads remain v7-style (16 B key prefixes + optional multi-lists). Fresh datadir / reindex required from v7.
+
+**Schema v7**: hash heads (`tx.head`, `header.head`, …) use **16 B key prefixes** (24 B slots) plus optional multi-fk lists (`*.head.mlt` / shard `NN.mlt`) for prefix collisions and BIP30 duplicate full txids. Lookups verify the Class A body. Keeps v6 scripthash compression and v5 spends.
 
 **Class A bodies are packed-only**: each `tx.body` record is `PACKED_TX_V1 || TxRecord || inputs || outputs` (one body IO for full reconstruct). Legacy 3-table rows (bare `TxRecord` + separate `input.body` / `output.body` runs addressed by `input_start_fk` / `output_start_fk`) are **rejected** on read. Standalone `input.body` / `output.body` files may still exist empty on create for layout stability; they are not the Class A read path.
 
@@ -30,7 +32,7 @@ Endianness: **little-endian** for all multi-byte integers.
   store/
     meta                         # store magic + schema version
     header.body / header.head    # Class A headers + hash index
-    tx.body / tx.idx / tx.head   # Class A txs (growable idx + hash head)
+    tx.body / tx.idx / tx.head   # Class A txs (growable idx + v8 keyless address head)
     input.body / input.idx       # per-tx input runs (+ BIP141 witness)
     output.body / output.idx     # per-tx output runs
     spenders.body                # multi-spender list nodes only (v5; sole spends on outputs)
@@ -83,13 +85,26 @@ See [`docs/concurrency.md`](./docs/concurrency.md): during IBD, one dedicated OS
 - Record length = `idx[i+1] - idx[i]` (last record: body logical end − start).
 - FK is **1-based** index into idx.
 
-## Hash head (`*.head`)
+## Hash head (`header.head`, `scripthash.head`, …)
 
 - Slot = **16-byte key prefix** + 8-byte packed value (24 B); power-of-two slot count; linear probe.
 - Packed value: sole `create_fk` (high bit clear), or multi-list head (`MULTI_BIT | list_fk`) pointing at a sibling multi-list file (`path.mlt` or sharded `NN.mlt`).
 - Multi-list record (16 B): `create_fk:u64 | next:u64` (prepended on insert; newest first). Used for 16-byte prefix collisions and BIP30 (identical full txid → multiple Class A rows).
-- Lookups that need exact identity (`get_by_txid`, `get_by_hash`) load candidate fks via `get_all` and **verify** the body hash/txid.
+- Lookups that need exact identity load candidate fks via `get_all` and **verify** the body hash/txid.
 - Rehashes when load would exceed **7/8**.
+
+## Tx address head (`tx.head`, schema v8)
+
+- **Single file** (not a shard directory). Fixed `2^BITS` slots × **8 B** (mainnet `BITS=31` → 16 GiB sparse; tests use tiny bits via `RBITCOIN_HEAD_SCALE=tiny` / `RBITCOIN_TX_HEAD_BITS`).
+- Entry = LE `u64`: low 63 bits = `create_fk` (1-based; **0 = empty**), bit 63 = **`HAS_NEXT`** (further probes may exist on this key’s sequence).
+- **No key bytes** in the head. Primary probe uses double hashing from the txid:
+  - `h1` = leading `BITS` of `txid[0..4]` (BE)
+  - `h2` = odd step from `txid[4..8]`
+  - `idx(d) = (h1 + d·h2) mod 2^BITS`, `d < MAX_PROBE` (128)
+- Foreign occupants (different body txid at a probe slot) are normal: body mismatch ⇒ continue until empty or `HAS_NEXT` clear.
+- BIP30 (duplicate full txid): newest `create_fk` at earliest probe slot; older fks pushed deeper on the same sequence.
+- Lookups (`get_by_txid`) probe candidates and **verify** packed Class A body txid.
+- **No growth rehash** (fixed table). Full-table rebuild only for a future width bump.
 
 ## Dense u64 arrays (`confirmed`, `header_txs_first`, `header_txs_count`)
 

@@ -420,9 +420,6 @@ pub(crate) fn spawn_archive_pipeline(
                                     return;
                                 }
                             }
-                            // A.1: only spill when overlay is past quiet threshold
-                            // (soft/2), not every batch — continuous head writes thrash UI.
-                            let _ = write_hub.query.spill_heads_step_if_needed();
                             blocks_since_flush =
                                 blocks_since_flush.saturating_add(n_blocks);
                             if blocks_since_flush >= FLUSH_EVERY_BLOCKS {

@@ -9,12 +9,12 @@
 //! packed value sets the high bit and points at a multi-list (`.mlt` sibling file):
 //! `create_fk:u64 | next:u64`.
 //!
-//! **IBD write path:** page-cache insert_many + optional write-behind overlay.
+//! **IBD write path:** page-cache insert_many (write-through).
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use rbitcoin_primitives::{Fk, TableKind};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -64,8 +64,6 @@ fn unpack_value(v: u64) -> (bool, Fk) {
 }
 /// Max chunks held in the insert cache (~1.25 MiB).
 const CHUNK_CACHE_MAX: usize = 256;
-/// Default write-behind cap when enabled without an explicit size.
-pub const DEFAULT_WRITE_BEHIND_CAP: usize = 512 * 1024;
 /// Aggregate spill / rehash chatter at DEBUG this often; per-event is TRACE.
 const SPILL_DEBUG_INTERVAL: Duration = Duration::from_secs(30);
 /// Single rehash still WARN if clear size or wall time exceeds these (host risk).
@@ -255,26 +253,11 @@ pub struct HashHead {
     file: TableFile,
     multi: MultiList,
     state: Mutex<HashState>,
-    /// Process-local write-behind (IBD). `None` = write-through (default).
-    overlay: Mutex<Option<WriteBehind>>,
-    /// Rolled-up spill counters for periodic DEBUG (per-event is TRACE).
-    spill_stats: Mutex<SpillStats>,
 }
 
 struct HashState {
     slots: u64,
     occupied: u64,
-}
-
-struct WriteBehind {
-    map: HashMap<[u8; 32], Fk>,
-    max_entries: usize,
-}
-
-struct SpillStats {
-    events: u64,
-    entries: u64,
-    window_start: Instant,
 }
 
 /// Process-wide rehash rollup (many small shard rehashes during IBD materialize).
@@ -330,8 +313,6 @@ impl HashHead {
                 slots,
                 occupied: 0,
             }),
-            overlay: Mutex::new(None),
-            spill_stats: Mutex::new(SpillStats::new()),
         })
     }
 
@@ -371,8 +352,6 @@ impl HashHead {
             file,
             multi,
             state: Mutex::new(HashState { slots, occupied }),
-            overlay: Mutex::new(None),
-            spill_stats: Mutex::new(SpillStats::new()),
         })
     }
 
@@ -399,27 +378,10 @@ impl HashHead {
 
     /// All Class A fks for this full 32-byte key's 16-byte prefix (sole or multi).
     ///
-    /// Order: multi-list is **newest first** (prepend on insert). Overlay hits for the
-    /// exact full key are moved to the front. Callers must verify body identity.
+    /// Newest-first; callers that need exact identity must verify the body.
     pub fn get_all(&self, full: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
         let key = head_key_prefix(full);
-        let mut out = self.get_all_prefix(&key)?;
-        {
-            let guard = self.overlay.lock().unwrap();
-            if let Some(ov) = guard.as_ref() {
-                for (k, fk) in ov.map.iter() {
-                    if head_key_prefix(k) == key && !out.contains(fk) {
-                        out.push(*fk);
-                    }
-                }
-                // Exact full key in overlay = most recent mapping for that identity.
-                if let Some(&fk) = ov.map.get(full) {
-                    out.retain(|f| *f != fk);
-                    out.insert(0, fk);
-                }
-            }
-        }
-        Ok(out)
+        self.get_all_prefix(&key)
     }
 
     fn get_all_prefix(&self, key: &HeadKey) -> Result<Vec<Fk>, StoreError> {
@@ -445,93 +407,9 @@ impl HashHead {
         Ok(Vec::new())
     }
 
-    /// Number of occupied hash slots on disk (excludes pure overlay inserts until spill).
+    /// Number of occupied hash slots.
     pub fn occupied(&self) -> u64 {
         self.state.lock().unwrap().occupied
-    }
-
-    /// Pending write-behind entries (0 if overlay disabled).
-    pub fn write_behind_len(&self) -> usize {
-        self.overlay
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|o| o.map.len())
-            .unwrap_or(0)
-    }
-
-    /// Enable process-local write-behind for upserts.
-    ///
-    /// Inserts accumulate in RAM; when the map reaches `max_entries` (or on
-    /// [`Self::spill_write_behind`] / [`Self::flush`] / rehash), entries are
-    /// spilled with slot-sorted page-buffered apply. `get` remains coherent.
-    ///
-    /// Spills any existing overlay first if re-enabled with a new cap.
-    ///
-    /// Production tables use [`crate::sharded_hashhead::ShardedHashHead`]'s overlay;
-    /// this path is exercised by unit tests of the single-shard head.
-    #[cfg(test)]
-    pub fn enable_write_behind(&self, max_entries: usize) -> Result<(), StoreError> {
-        let max_entries = max_entries.max(1);
-        // Spill previous overlay so we never drop pending keys.
-        self.spill_write_behind()?;
-        *self.overlay.lock().unwrap() = Some(WriteBehind {
-            map: HashMap::new(),
-            max_entries,
-        });
-        Ok(())
-    }
-
-    /// Spill overlay to the file-backed table (slot-sorted). No-op if empty/off.
-    pub fn spill_write_behind(&self) -> Result<(), StoreError> {
-        let batch = {
-            let mut guard = self.overlay.lock().unwrap();
-            let Some(ov) = guard.as_mut() else {
-                return Ok(());
-            };
-            if ov.map.is_empty() {
-                return Ok(());
-            }
-            let batch: Vec<([u8; 32], Fk)> = ov.map.drain().collect();
-            batch
-        };
-        if batch.is_empty() {
-            return Ok(());
-        }
-        let n = batch.len();
-        rbitcoin_log::trace!(
-            "store: hash-head spill path={} entries={}",
-            self.file.path().display(),
-            n
-        );
-        self.insert_many_file(&batch, |_| {})?;
-        self.note_spill(n);
-        Ok(())
-    }
-
-    /// Per-event TRACE already emitted; roll up a DEBUG line every
-    /// [`SPILL_DEBUG_INTERVAL`] so IBD DEBUG logs stay readable.
-    fn note_spill(&self, entries: usize) {
-        let mut s = self.spill_stats.lock().unwrap();
-        s.events = s.events.saturating_add(1);
-        s.entries = s.entries.saturating_add(entries as u64);
-        if s.window_start.elapsed() < SPILL_DEBUG_INTERVAL {
-            return;
-        }
-        if s.events == 0 {
-            s.window_start = Instant::now();
-            return;
-        }
-        rbitcoin_log::debug!(
-            "store: hash-head spill summary path={} events={} entries={} window={:?}",
-            self.file.path().display(),
-            s.events,
-            s.entries,
-            s.window_start.elapsed()
-        );
-        s.events = 0;
-        s.entries = 0;
-        s.window_start = Instant::now();
     }
 
     /// Minimum power-of-two slot count so `keys` stay under load factor 7/8.
@@ -549,30 +427,20 @@ impl HashHead {
 
     /// Ensure capacity for roughly `additional` new keys (load factor 7/8).
     ///
-    /// Counts pending overlay entries toward load. Grows to the **target** slot
-    /// count in a single rehash (not one double-at-a-time loop), so a large spill
-    /// does not re-copy the live table log₂(N) times.
+    /// Grows to the **target** slot count in a single rehash (not one
+    /// double-at-a-time loop).
     pub fn reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
         if additional == 0 {
             return Ok(());
         }
-        let overlay_len = self.write_behind_len() as u64;
         let (occupied, slots) = {
             let state = self.state.lock().unwrap();
             (state.occupied, state.slots)
         };
-        let target_keys = occupied
-            .saturating_add(overlay_len)
-            .saturating_add(additional);
+        let target_keys = occupied.saturating_add(additional);
         let need = Self::slots_for_keys(target_keys);
         if need <= slots {
             return Ok(());
-        }
-        // Rehash needs a clean file view of all keys.
-        if overlay_len > 0 {
-            self.spill_write_behind()?;
-            // Occupied now includes former overlay; only `additional` is still pending.
-            return self.reserve_additional(additional);
         }
         self.rehash_to(need)
     }
@@ -603,38 +471,16 @@ impl HashHead {
     fn insert_many_with(
         &self,
         entries: &[([u8; 32], Fk)],
-        mut on_prev: impl FnMut(Option<Fk>),
+        on_prev: impl FnMut(Option<Fk>),
     ) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
         }
 
-        // Overlay path: merge into RAM; spill when over cap. `on_prev` sees
-        // previous overlay/file value when known (file miss = None for new keys
-        // only if we probe; for hot IBD we skip file probe on pure upsert and
-        // report None when key was absent from overlay — callers that need
-        // true prev use get first).
-        {
-            let mut guard = self.overlay.lock().unwrap();
-            if let Some(ov) = guard.as_mut() {
-                for (key, fk) in entries {
-                    debug_assert!(!fk.is_null());
-                    let prev = ov.map.insert(*key, *fk);
-                    on_prev(prev);
-                }
-                let over = ov.map.len() >= ov.max_entries;
-                if over {
-                    drop(guard);
-                    self.spill_write_behind()?;
-                }
-                return Ok(());
-            }
-        }
-
         self.insert_many_file(entries, on_prev)
     }
 
-    /// Slot-sorted, page-buffered apply to the mmap table (no overlay).
+    /// Slot-sorted, page-buffered apply to the mmap table.
     ///
     /// When the table is **empty** (first load / run materialize into a cold
     /// shard), builds the open-addressing table in RAM and writes it in one
@@ -840,16 +686,6 @@ impl HashHead {
         let _rehash_serial = Self::rehash_gate()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // Overlay must be empty so the file is the source of truth.
-        {
-            let guard = self.overlay.lock().unwrap();
-            if let Some(ov) = guard.as_ref() {
-                if !ov.map.is_empty() {
-                    drop(guard);
-                    self.spill_write_behind()?;
-                }
-            }
-        }
 
         let (old_slots, occupied) = {
             let state = self.state.lock().unwrap();
@@ -925,12 +761,11 @@ impl HashHead {
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.spill_write_behind()?;
         self.multi.flush()?;
         self.file.flush()
     }
 
-    pub fn flush_async_no_spill(&self) -> Result<(), StoreError> {
+    pub fn flush_async(&self) -> Result<(), StoreError> {
         self.multi.flush_async()?;
         self.file.flush_async()
     }
@@ -1082,15 +917,6 @@ impl<'a> SlotPageCache<'a> {
     }
 }
 
-impl SpillStats {
-    fn new() -> Self {
-        Self {
-            events: 0,
-            entries: 0,
-            window_start: Instant::now(),
-        }
-    }
-}
 
 fn is_empty_slot(k: &HeadKey, packed: u64) -> bool {
     packed == 0 && *k == [0u8; HEAD_KEY_LEN]
@@ -1275,42 +1101,6 @@ mod tests {
         assert!(HeadScale::Mainnet.initial_slots(HeadRole::Point) >= 64);
     }
 
-    #[test]
-    fn large_spill_does_not_multi_rehash_existing() {
-        // Fill past first rehash, enable overlay, spill a large batch once.
-        let path = tmp_path();
-        let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
-        let mut batch = Vec::new();
-        for i in 0u64..200 {
-            let mut key = [0u8; 32];
-            key[0..8].copy_from_slice(&i.to_le_bytes());
-            batch.push((key, Fk(i + 1)));
-        }
-        h.insert_many(&batch).unwrap();
-        let slots_after_seed = h.state.lock().unwrap().slots;
-        h.enable_write_behind(50_000).unwrap();
-        let mut more = Vec::new();
-        for i in 200u64..20_200 {
-            let mut key = [0u8; 32];
-            key[0..8].copy_from_slice(&i.to_le_bytes());
-            more.push((key, Fk(i + 1)));
-        }
-        h.insert_many(&more).unwrap();
-        // Under cap — still in overlay.
-        assert!(h.write_behind_len() > 0);
-        h.spill_write_behind().unwrap();
-        assert_eq!(h.occupied(), 20_200);
-        let slots = h.state.lock().unwrap().slots;
-        // Capacity for 20200 keys: next_pow2(ceil(20200*8/7)) = next_pow2(23086) = 32768
-        assert!(slots >= 32_768, "slots={slots} seed_slots={slots_after_seed}");
-        // All keys visible.
-        for i in [0u64, 199, 200, 20_199] {
-            let mut key = [0u8; 32];
-            key[0..8].copy_from_slice(&i.to_le_bytes());
-            assert_eq!(h.get(&key).unwrap(), Some(Fk(i + 1)));
-        }
-        cleanup_hh(&path);
-    }
 
     #[test]
     fn open_does_not_require_full_ram_copy() {
@@ -1324,71 +1114,8 @@ mod tests {
         cleanup_hh(&path);
     }
 
-    #[test]
-    fn write_behind_get_coherent_until_spill() {
-        let path = tmp_path();
-        let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
-        h.enable_write_behind(10_000).unwrap();
-        let mut key = [0u8; 32];
-        key[0] = 7;
-        h.insert(&key, Fk(99)).unwrap();
-        assert_eq!(h.write_behind_len(), 1);
-        // Visible via get before spill; not yet counted as disk occupied.
-        assert_eq!(h.get(&key).unwrap(), Some(Fk(99)));
-        assert_eq!(h.occupied(), 0);
-        h.spill_write_behind().unwrap();
-        assert_eq!(h.write_behind_len(), 0);
-        assert_eq!(h.occupied(), 1);
-        assert_eq!(h.get(&key).unwrap(), Some(Fk(99)));
-        cleanup_hh(&path);
-    }
 
-    #[test]
-    fn write_behind_auto_spills_at_cap() {
-        let path = tmp_path();
-        let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
-        h.enable_write_behind(64).unwrap();
-        let mut batch = Vec::new();
-        for i in 0u64..64 {
-            let mut key = [0u8; 32];
-            key[0..8].copy_from_slice(&i.to_le_bytes());
-            batch.push((key, Fk(i + 1)));
-        }
-        h.insert_many(&batch).unwrap();
-        // Cap hit → spill; overlay empty, disk holds keys.
-        assert_eq!(h.write_behind_len(), 0);
-        assert_eq!(h.occupied(), 64);
-        for i in 0u64..64 {
-            let mut key = [0u8; 32];
-            key[0..8].copy_from_slice(&i.to_le_bytes());
-            assert_eq!(h.get(&key).unwrap(), Some(Fk(i + 1)));
-        }
-        cleanup_hh(&path);
-    }
 
-    #[test]
-    fn write_behind_flush_spills_and_survives_reopen() {
-        let path = tmp_path();
-        {
-            let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
-            h.enable_write_behind(DEFAULT_WRITE_BEHIND_CAP).unwrap();
-            for i in 0u64..200 {
-                let mut key = [0u8; 32];
-                key[0..8].copy_from_slice(&i.to_le_bytes());
-                h.insert(&key, Fk(i + 1)).unwrap();
-            }
-            assert!(h.write_behind_len() > 0);
-            h.flush().unwrap();
-        }
-        let h = HashHead::open(&path).unwrap();
-        assert_eq!(h.occupied(), 200);
-        for i in 0u64..200 {
-            let mut key = [0u8; 32];
-            key[0..8].copy_from_slice(&i.to_le_bytes());
-            assert_eq!(h.get(&key).unwrap(), Some(Fk(i + 1)));
-        }
-        cleanup_hh(&path);
-    }
 
     #[test]
     fn slot_sorted_batch_matches_sequential_inserts() {

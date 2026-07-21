@@ -33,11 +33,10 @@ pub use file::{
 };
 pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush, shard_pace_enabled};
 pub use hashhead::{
-    initial_slots_for, HeadRole, HeadScale, DEFAULT_WRITE_BEHIND_CAP,
+    initial_slots_for, HeadRole, HeadScale,
 };
 pub use sharded_hashhead::{
-    shard_count_for_role, shard_count_for_scale, spill_chunk_size, DEFAULT_SPILL_CHUNK,
-    SHARD_COUNT, SHARD_COUNT_TX_SH,
+    shard_count_for_role, shard_count_for_scale, SHARD_COUNT, SHARD_COUNT_TX_SH,
 };
 pub use header_table::HeaderRecord;
 pub use point_table::PointRecord;

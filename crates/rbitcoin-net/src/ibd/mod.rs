@@ -22,7 +22,6 @@ mod coalesce;
 mod confirm;
 mod dial;
 mod exit;
-mod head_spill;
 mod peer_io;
 mod perf_log;
 mod prewarm;
@@ -528,14 +527,6 @@ pub async fn ibd_cancellable(
         Arc::clone(&archive_queued),
         Arc::clone(&confirm_lag),
         Arc::clone(&archive_stop),
-    );
-
-    // A.4: background budgeted head-spill (quiet threshold + idle IO prio).
-    let mut head_spill_worker =
-        Some(head_spill::HeadSpillWorker::spawn(Arc::clone(&hub.query)));
-    info!(
-        "ibd: head spill worker on (chunk≈{}; quiet; RBITCOIN_HEAD_SPILL_CHUNK)",
-        rbitcoin_store::spill_chunk_size()
     );
 
     // Catch-up runs → open-hash materialize under archive hysteresis (idle IO).
@@ -1272,10 +1263,7 @@ pub async fn ibd_cancellable(
     if let Some(h) = prewarm_join.take() {
         let _ = h.join();
     }
-    if let Some(w) = head_spill_worker.take() {
-        w.request_stop();
-        drop(w);
-    }
+
     if let Some(w) = run_materialize_worker.take() {
         w.request_stop();
         drop(w);

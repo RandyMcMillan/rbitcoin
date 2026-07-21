@@ -151,19 +151,9 @@ impl Store {
     /// Used by the IBD archive writer so Class A survives unclean restarts without
     /// fsyncing every mega-batch of txs/ins/outs.
     ///
-    /// Also **budget-spills** a few chunks of `tx.head` write-behind (not a full
-    /// multi‑M dump). Remaining overlay drains via archive interleave + background.
     pub fn flush_header_archive(&self) -> Result<(), StoreError> {
         self.headers.flush()?;
         self.header_txs.flush()?;
-        let chunk = crate::sharded_hashhead::spill_chunk_size();
-        for _ in 0..8 {
-            let b = self.txs.spill_head_budget(chunk)?;
-            if b == 0 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
         Ok(())
     }
 
@@ -300,77 +290,25 @@ impl Store {
         Ok(())
     }
 
-    /// No-op: v5 has no point.head write-behind.
-    pub fn enable_point_head_write_behind(&self, _max_entries: usize) -> Result<(), StoreError> {
-        Ok(())
-    }
 
-    pub fn disable_point_head_write_behind(&self) -> Result<(), StoreError> {
-        Ok(())
-    }
 
-    pub fn spill_point_head(&self) -> Result<(), StoreError> {
-        Ok(())
-    }
 
-    pub fn spill_point_head_fast(&self) -> Result<(), StoreError> {
-        Ok(())
-    }
 
-    pub fn spill_point_head_budget(&self, _max_entries: usize) -> Result<usize, StoreError> {
-        Ok(0)
-    }
 
-    pub fn spill_point_head_step_if_needed(&self) -> Result<usize, StoreError> {
-        Ok(0)
-    }
 
-    pub fn set_point_head_defer_spill(&self, _defer: bool) -> Result<(), StoreError> {
-        Ok(())
-    }
 
     /// Multi-list node count only (sole spends do not allocate body rows).
     pub fn spender_list_count(&self) -> u64 {
         self.spenders.count()
     }
 
-    /// Buffer `tx.head` upserts in RAM (optional IBD); spill at cap / flush.
-    pub fn enable_tx_head_write_behind(&self, max_entries: usize) -> Result<(), StoreError> {
-        self.txs.enable_head_write_behind(max_entries)
-    }
 
-    pub fn disable_tx_head_write_behind(&self) -> Result<(), StoreError> {
-        self.txs.disable_head_write_behind()
-    }
 
-    pub fn spill_tx_head(&self) -> Result<(), StoreError> {
-        self.txs.spill_head()
-    }
 
-    pub fn spill_tx_head_fast(&self) -> Result<(), StoreError> {
-        self.txs.spill_head_fast()
-    }
 
-    pub fn spill_tx_head_budget(&self, max_entries: usize) -> Result<usize, StoreError> {
-        self.txs.spill_head_budget(max_entries)
-    }
 
-    pub fn spill_tx_head_step_if_needed(&self) -> Result<usize, StoreError> {
-        self.txs.spill_head_step_if_needed()
-    }
 
-    /// Defer soft-cap `tx.head` spills while confirm is live (archive fight).
-    /// Clearing defer does not bulk-spill.
-    pub fn set_tx_head_defer_spill(&self, defer: bool) -> Result<(), StoreError> {
-        self.txs.set_head_defer_spill(defer)
-    }
 
-    /// One short-slice step on both head overlays (background worker / archive).
-    pub fn spill_heads_step_if_needed(&self) -> Result<(usize, usize), StoreError> {
-        let p = self.spill_point_head_step_if_needed()?;
-        let t = self.spill_tx_head_step_if_needed()?;
-        Ok((p, t))
-    }
 
     /// True if `tx_fk` is strong **and** its create height is on the confirmed tip.
     ///
@@ -544,7 +482,7 @@ impl Store {
         Ok(cleared)
     }
 
-    /// Full durable flush: spill head overlays, `msync(MS_SYNC)` + `fdatasync` every table.
+    /// Full durable flush: `msync(MS_SYNC)` + `fdatasync` every table.
     ///
     /// **Host-hostile on multi‑GiB Class A** — use [`Self::flush_for_shutdown`] for
     /// process exit during IBD.
@@ -578,31 +516,22 @@ impl Store {
 
     /// Process-exit flush (IBD / SIGTERM). Target: seconds, not minutes.
     ///
-    /// 1. **Fast** spill of tx.head overlay (single apply).
-    /// 2. Fsync tip / Class C tables only.
-    /// 3. MS_ASYNC Class A bodies **without** a second head spill.
+    /// 1. Fsync tip / Class C tables only.
+    /// 2. MS_ASYNC Class A bodies.
     pub fn flush_for_shutdown(&self) -> Result<(), StoreError> {
         crate::file::try_set_io_best_effort();
         let t0 = std::time::Instant::now();
-        let tp = self.txs.head_write_behind_len();
-        rbitcoin_log::info!(
-            "store: shutdown flush — FAST spill heads (tx pending≈{tp})…"
-        );
-        self.txs.spill_head_fast()?;
-        rbitcoin_log::info!(
-            "store: shutdown flush — fsync tip tables… elapsed={:?}",
-            t0.elapsed()
-        );
+        rbitcoin_log::info!("store: shutdown flush — fsync tip tables…");
         self.headers.flush()?;
         self.confirmed.flush()?;
         self.strong_tx.flush()?;
         self.tx_height.flush()?;
         self.header_txs.flush()?;
         rbitcoin_log::info!(
-            "store: shutdown flush — async Class A (no re-spill)… elapsed={:?}",
+            "store: shutdown flush — async Class A… elapsed={:?}",
             t0.elapsed()
         );
-        self.txs.flush_async_no_spill()?;
+        self.txs.flush_async()?;
         self.inputs.flush_async()?;
         self.outputs.flush_async()?;
         self.spenders.flush_async()?;

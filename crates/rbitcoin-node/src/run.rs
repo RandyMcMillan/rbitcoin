@@ -662,7 +662,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         h.abort();
         let _ = h.await;
     }
-    // Host-friendly: spill head overlays + fsync tip tables; MS_ASYNC Class A.
+    // Host-friendly: fsync tip tables; MS_ASYNC Class A.
     // Full multi‑GiB fdatasync froze the desktop for 1–2+ minutes on exit.
     if let Err(e) = node.hub.query.flush_for_shutdown() {
         warn!("node: flush warning: {e}");
@@ -691,14 +691,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 /// Electrum binds**. Thin scripthash creates are always written on confirm;
 /// no tip-mode SH rebuild (corrupt index ⇒ reindex).
 pub(crate) fn enter_tip_mode(query: &Query) {
-    // Spill any IBD write-behind overlays and switch to write-through so tip
-    // follow is immediately durable (low write rate; no need to buffer).
-    if let Err(e) = query.disable_point_head_write_behind() {
-        warn!("node: disable point head write-behind: {e}");
-    }
-    if let Err(e) = query.disable_tx_head_write_behind() {
-        warn!("node: disable tx head write-behind: {e}");
-    }
     // Materialize catch-up runs into durable open-hash tables (one-time).
     match query.finalize_tx_runs() {
         Ok(n) => info!("node: tx.head run materialize inserted≈{n}"),

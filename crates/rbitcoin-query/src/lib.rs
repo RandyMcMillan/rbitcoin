@@ -489,59 +489,6 @@ impl Query {
     /// Buffer `point.head` upserts in process RAM during full-validation IBD.
     ///
     /// Writes spill sorted/page-buffered when the map reaches `max_entries` or on
-    /// store flush. Cuts continuous random RMW on multi‑GiB `point.head`.
-    pub fn enable_point_head_write_behind(&self, max_entries: usize) -> Result<(), QueryError> {
-        self.store.enable_point_head_write_behind(max_entries)
-    }
-
-    pub fn disable_point_head_write_behind(&self) -> Result<(), QueryError> {
-        self.store.disable_point_head_write_behind()
-    }
-
-    pub fn spill_point_head(&self) -> Result<(), QueryError> {
-        self.store.spill_point_head()
-    }
-
-    /// Budgeted spill of `point.head` overlay (≤ `max_entries` keys).
-    pub fn spill_point_head_budget(&self, max_entries: usize) -> Result<usize, QueryError> {
-        self.store.spill_point_head_budget(max_entries)
-    }
-
-    /// Defer soft-cap point.head spills during confirm connect.
-    /// Clearing defer does not bulk-spill (background + archive drain).
-    pub fn set_point_head_defer_spill(&self, defer: bool) -> Result<(), QueryError> {
-        self.store.set_point_head_defer_spill(defer)
-    }
-
-    /// Buffer `tx.head` upserts (optional; useful when durable tx index is on).
-    pub fn enable_tx_head_write_behind(&self, max_entries: usize) -> Result<(), QueryError> {
-        self.store.enable_tx_head_write_behind(max_entries)
-    }
-
-    pub fn disable_tx_head_write_behind(&self) -> Result<(), QueryError> {
-        self.store.disable_tx_head_write_behind()
-    }
-
-    pub fn spill_tx_head(&self) -> Result<(), QueryError> {
-        self.store.spill_tx_head()
-    }
-
-    /// Budgeted spill of `tx.head` overlay (≤ `max_entries` keys).
-    pub fn spill_tx_head_budget(&self, max_entries: usize) -> Result<usize, QueryError> {
-        self.store.spill_tx_head_budget(max_entries)
-    }
-
-    /// Defer soft-cap tx.head spills during confirm.
-    /// Clearing defer does not bulk-spill (background + archive drain).
-    pub fn set_tx_head_defer_spill(&self, defer: bool) -> Result<(), QueryError> {
-        self.store.set_tx_head_defer_spill(defer)
-    }
-
-    /// One short-slice step on both head overlays (background worker / archive).
-    pub fn spill_heads_step_if_needed(&self) -> Result<(usize, usize), QueryError> {
-        self.store.spill_heads_step_if_needed()
-    }
-
     /// Host-friendly process-exit flush (see [`rbitcoin_store::Store::flush_for_shutdown`]).
     pub fn flush_for_shutdown(&self) -> Result<(), QueryError> {
         self.store.flush_for_shutdown()

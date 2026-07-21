@@ -809,44 +809,13 @@ impl TxTable {
         self.head.insert_many_paced(entries)
     }
 
-    /// Enable process-local write-behind on `tx.head` (optional IBD path).
-    pub fn enable_head_write_behind(&self, max_entries: usize) -> Result<(), StoreError> {
-        self.head.enable_write_behind(max_entries)
-    }
 
-    /// Disable write-behind after spilling pending head updates.
-    pub fn disable_head_write_behind(&self) -> Result<(), StoreError> {
-        self.head.disable_write_behind()
-    }
 
-    /// Spill pending `tx.head` write-behind entries without fsync.
-    pub fn spill_head(&self) -> Result<(), StoreError> {
-        self.head.spill_write_behind()
-    }
 
-    pub fn spill_head_fast(&self) -> Result<(), StoreError> {
-        self.head.spill_write_behind_fast()
-    }
 
-    /// Budgeted spill: at most `max_entries` keys (archive interleave / background).
-    pub fn spill_head_budget(&self, max_entries: usize) -> Result<usize, StoreError> {
-        self.head.spill_write_behind_budget(max_entries)
-    }
 
-    /// One short-slice step when the overlay needs draining.
-    pub fn spill_head_step_if_needed(&self) -> Result<usize, StoreError> {
-        self.head.spill_write_behind_step_if_needed()
-    }
 
-    pub fn head_write_behind_len(&self) -> usize {
-        self.head.write_behind_len()
-    }
 
-    /// Defer soft-cap `tx.head` spills during confirm (same as point.head).
-    /// Clearing defer does not bulk-spill — background / archive steps drain.
-    pub fn set_head_defer_spill(&self, defer: bool) -> Result<(), StoreError> {
-        self.head.set_defer_spill(defer)
-    }
 
     pub fn flush(&self) -> Result<(), StoreError> {
         self.body.flush()?;
@@ -857,12 +826,6 @@ impl TxTable {
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.body.flush_async()?;
         self.head.flush_async()?;
-        Ok(())
-    }
-
-    pub fn flush_async_no_spill(&self) -> Result<(), StoreError> {
-        self.body.flush_async()?;
-        self.head.flush_async_no_spill()?;
         Ok(())
     }
 }

@@ -328,6 +328,10 @@ pub fn worker_loop<T: RunMemtable + 'static>(
 }
 
 /// Disable enqueues, signal finalize, wait for worker drain + join, flush leftovers.
+///
+/// If no worker was ever spawned (`join` is empty), skip the poll wait — otherwise
+/// [`FINALIZE_POLL_MAX`] × 10 ms (~60 s) per idle builder stacks to ~2 min at
+/// Direct-mode startup when point/tx runs were never enabled.
 pub fn finalize_wait_join<T: RunMemtable>(
     enabled: &AtomicBool,
     inner: &Mutex<T>,
@@ -335,6 +339,17 @@ pub fn finalize_wait_join<T: RunMemtable>(
     join: &Mutex<Option<JoinHandle<()>>>,
 ) -> Result<(), StoreError> {
     enabled.store(false, Ordering::SeqCst);
+    let has_worker = join.lock().unwrap().is_some();
+    if !has_worker {
+        // Never started (Direct IBD default for point/tx; or already joined).
+        let mut g = inner.lock().unwrap();
+        if g.pending_len() > 0 {
+            g.flush_pending()?;
+        }
+        g.control_mut().finalize = true;
+        g.control_mut().stop = true;
+        return Ok(());
+    }
     {
         let mut g = inner.lock().unwrap();
         g.control_mut().finalize = true;
@@ -439,7 +454,61 @@ pub fn clear_runs_dir(runs_dir: &Path) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use super::run_materialize_control as ctl;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    /// Minimal memtable for finalize path tests.
+    struct EmptyMem {
+        ctrl: RunControl,
+        pending: usize,
+    }
+
+    impl RunMemtable for EmptyMem {
+        fn pending_len(&self) -> usize {
+            self.pending
+        }
+        fn control(&self) -> &RunControl {
+            &self.ctrl
+        }
+        fn control_mut(&mut self) -> &mut RunControl {
+            &mut self.ctrl
+        }
+        fn flush_pending(&mut self) -> Result<u64, StoreError> {
+            self.pending = 0;
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn finalize_without_worker_skips_60s_poll() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-finalize-idle-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let enabled = AtomicBool::new(false);
+        let inner = Mutex::new(EmptyMem {
+            ctrl: RunControl::open(&dir, "idle.runs"),
+            pending: 0,
+        });
+        let cv = Condvar::new();
+        let join: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+        let t0 = Instant::now();
+        finalize_wait_join(&enabled, &inner, &cv, &join).unwrap();
+        let elapsed = t0.elapsed();
+        // Regression: used to burn FINALIZE_POLL_MAX × 10ms (~60s) when join was empty.
+        assert!(
+            elapsed.as_secs() < 2,
+            "idle finalize took {elapsed:?} (expected near-instant)"
+        );
+        assert!(inner.lock().unwrap().control().stop);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn hysteresis_start_stop_drain_and_tip() {

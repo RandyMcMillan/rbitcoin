@@ -156,7 +156,7 @@ impl Query {
     /// for multi-block confirm batches.
     pub fn apply_ibd_utxo_block(
         &self,
-        spends: &[([u8; 32], u32)],
+        spends: &[([u8; 32], u32, Fk)],
         creates: &[([u8; 32], u32, Fk)],
         tip: u32,
     ) -> Result<(), QueryError> {
@@ -165,12 +165,16 @@ impl Query {
 
     /// Apply several heights in order (spends then creates per height), **one flush**.
     ///
-    /// Each item is `(spends, creates, tip_height)`. Skips heights already ≤ UTXO tip.
+    /// Each item is `(spends, creates, tip_height)`. Spends are
+    /// `(prev_txid, vout, spending_tx_fk)`. Skips heights already ≤ UTXO tip.
     /// Critical for multi-block confirm: H creates must land before H+1 spends.
+    ///
+    /// When spend-runs are enabled, enqueues durable spend annotations using
+    /// create_fk from light UTXO **before** take_spend (confirm-time, like SH).
     pub fn apply_ibd_utxo_run(
         &self,
         steps: &[(
-            & [([u8; 32], u32)],
+            & [([u8; 32], u32, Fk)],
             & [([u8; 32], u32, Fk)],
             u32,
         )],
@@ -178,31 +182,43 @@ impl Query {
         if steps.is_empty() {
             return Ok(());
         }
-        let mut g = self.ibd_utxo.lock().unwrap();
-        let Some(ref mut u) = *g else {
-            return Ok(());
-        };
-        let t_probe = std::time::Instant::now();
-        let mut last_tip = u.tip();
-        for &(spends, creates, tip) in steps {
-            if let Some(have) = last_tip {
-                if tip <= have {
-                    continue;
+        let mut run_edges: Vec<(Fk, u32, Fk)> = Vec::new();
+        let enqueue_runs = self.point_run_enabled();
+        {
+            let mut g = self.ibd_utxo.lock().unwrap();
+            let Some(ref mut u) = *g else {
+                return Ok(());
+            };
+            let t_probe = std::time::Instant::now();
+            let mut last_tip = u.tip();
+            for &(spends, creates, tip) in steps {
+                if let Some(have) = last_tip {
+                    if tip <= have {
+                        continue;
+                    }
                 }
+                for &(txid, vout, spend_tx_fk) in spends {
+                    if enqueue_runs && !spend_tx_fk.is_null() {
+                        if let Some(create_fk) = u.get_create_fk(&txid, vout)? {
+                            run_edges.push((create_fk, vout, spend_tx_fk));
+                        }
+                    }
+                    let _ = u.take_spend(&txid, vout)?;
+                }
+                for &(txid, vout, create_fk) in creates {
+                    u.insert_create(&txid, vout, create_fk)?;
+                }
+                // In-map tip only — no msync (rebuildable catch-up cache).
+                u.set_tip(Some(tip));
+                last_tip = Some(tip);
             }
-            for &(txid, vout) in spends {
-                let _ = u.take_spend(&txid, vout)?;
-            }
-            for &(txid, vout, create_fk) in creates {
-                u.insert_create(&txid, vout, create_fk)?;
-            }
-            // In-map tip only — no msync (rebuildable catch-up cache).
-            u.set_tip(Some(tip));
-            last_tip = Some(tip);
+            ibd_utxo_stats::note_probe_ns(t_probe.elapsed().as_nanos() as u64);
+            // Flush counter kept for log shape; always 0 (no msync).
+            ibd_utxo_stats::note_flush_ns(0);
         }
-        ibd_utxo_stats::note_probe_ns(t_probe.elapsed().as_nanos() as u64);
-        // Flush counter kept for log shape; always 0 (no msync).
-        ibd_utxo_stats::note_flush_ns(0);
+        if !run_edges.is_empty() {
+            self.enqueue_spend_run_edges(&run_edges);
+        }
         Ok(())
     }
 
@@ -395,10 +411,8 @@ impl Query {
         self.tx_run.enqueue(txid, fk);
     }
 
-    pub(crate) fn enqueue_point_run_edges(
-        &self,
-        edges: &[( [u8; 32], u32, Fk, u32, u32)],
-    ) {
+    /// Confirm-time spend run enqueue: `(create_tx_fk, vout, spending_tx_fk)`.
+    pub(crate) fn enqueue_spend_run_edges(&self, edges: &[(Fk, u32, Fk)]) {
         self.point_run.enqueue_batch(edges);
     }
 }

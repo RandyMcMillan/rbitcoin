@@ -20,34 +20,32 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// Fixed run record: scripthash[32] | create_tx_fk:u64 | vout:u32 = 44 bytes.
-pub const SH_RUN_REC_LEN: u32 = 44;
+/// Fixed run record: scripthash[32] | create_tx_fk:u64 = 40 bytes (no vout).
+pub const SH_RUN_REC_LEN: u32 = 40;
 pub const SH_RUN_KEY_LEN: u32 = 32;
 
 const DEFAULT_MEMTABLE_CAP: usize = 256_000;
 const HARD_MEMTABLE_MUL: usize = 2;
 
-fn encode_rec(sh: &[u8; 32], tx_fk: Fk, vout: u32) -> [u8; SH_RUN_REC_LEN as usize] {
+fn encode_rec(sh: &[u8; 32], tx_fk: Fk) -> [u8; SH_RUN_REC_LEN as usize] {
     let mut r = [0u8; SH_RUN_REC_LEN as usize];
     r[0..32].copy_from_slice(sh);
     r[32..40].copy_from_slice(&tx_fk.0.to_le_bytes());
-    r[40..44].copy_from_slice(&vout.to_le_bytes());
     r
 }
 
-fn decode_rec(buf: &[u8]) -> Result<([u8; 32], Fk, u32), StoreError> {
+fn decode_rec(buf: &[u8]) -> Result<([u8; 32], Fk), StoreError> {
     if buf.len() < SH_RUN_REC_LEN as usize {
         return Err(StoreError::Corrupt("sh run short record"));
     }
     let mut sh = [0u8; 32];
     sh.copy_from_slice(&buf[0..32]);
     let tx_fk = Fk(u64::from_le_bytes(buf[32..40].try_into().unwrap()));
-    let vout = u32::from_le_bytes(buf[40..44].try_into().unwrap());
-    Ok((sh, tx_fk, vout))
+    Ok((sh, tx_fk))
 }
 
 struct Inner {
-    pending: Vec<([u8; 32], Fk, u32)>,
+    pending: Vec<([u8; 32], Fk)>,
     ctrl: RunControl,
 }
 
@@ -66,10 +64,12 @@ impl RunMemtable for Inner {
             return Ok(0);
         }
         let mut recs = std::mem::take(&mut self.pending);
-        recs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1 .0.cmp(&b.1 .0)).then(a.2.cmp(&b.2)));
+        // Dedup (sh, create_tx_fk) — multi-vout same tx collapses.
+        recs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1 .0.cmp(&b.1 .0)));
+        recs.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
         let mut body = Vec::with_capacity(recs.len() * SH_RUN_REC_LEN as usize);
-        for (sh, fk, vout) in &recs {
-            body.extend_from_slice(&encode_rec(sh, *fk, *vout));
+        for (sh, fk) in &recs {
+            body.extend_from_slice(&encode_rec(sh, *fk));
         }
         let path = next_run_path(&self.ctrl.runs_dir, self.ctrl.next_seq);
         self.ctrl.next_seq += 1;
@@ -171,8 +171,7 @@ impl ShRunBuilder {
                     .unwrap()
                     .0;
             }
-            g.pending
-                .push((rec.scripthash, rec.create_tx_fk, rec.vout));
+            g.pending.push((rec.scripthash, rec.create_tx_fk));
             self.enqueued.fetch_add(1, Ordering::Relaxed);
         }
         if g.pending.len() >= cap {
@@ -228,20 +227,12 @@ fn materialize_run(store: &Store, run: &SortedRunPath) -> Result<u64, StoreError
     let mut batch: Vec<ScriptHashRecord> = Vec::with_capacity(n_rec);
     let mut offset = 0usize;
     while offset + rec_len <= body.len() {
-        let (sh, tx_fk, vout) = decode_rec(&body[offset..offset + rec_len])?;
+        let (sh, tx_fk) = decode_rec(&body[offset..offset + rec_len])?;
         offset += rec_len;
         if tx_fk.is_null() {
             continue;
         }
-        batch.push(ScriptHashRecord {
-            scripthash: sh,
-            create_tx_fk: tx_fk,
-            vout,
-            next: Fk::NULL,
-            txid: [0u8; 32],
-            value: 0,
-            create_height: 0,
-        });
+        batch.push(ScriptHashRecord::from_fk(sh, tx_fk));
     }
     if batch.is_empty() {
         return Ok(0);

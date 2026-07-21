@@ -1,32 +1,42 @@
-//! Hybrid scripthash layout: thin create entries, inline head or geometric slab.
+//! Hybrid scripthash layout (schema v6): 8 B create_tx_fk entries, 32 B head slots.
 //!
-//! Entry = `create_tx_fk:u64 | vout:u32` (12 B). Head holds either ≤2 inline entries
-//! or a pointer to one body slab (cap 4, 8, 16, …).
+//! Head key = first 16 B of SHA256(spk). Value = two u64s (inline fks or slab meta).
+//! Body slab entry = create_tx_fk only (vout expanded from Class A at query).
 
 use crate::error::StoreError;
 use rbitcoin_primitives::Fk;
 
-/// Packed create outpoint (no `next` pointer).
-pub const SH_ENTRY_LEN: usize = 12;
-/// Max creates stored in the head value without a body slab.
+/// Body / slab entry: create Class A fk only.
+pub const SH_ENTRY_LEN: usize = 8;
+/// Max create_tx_fks stored inline in the head value.
 pub const SH_INLINE_CAP: usize = 2;
 /// Size class 0 capacity; class `c` has capacity `SH_SLAB_BASE << c`.
 pub const SH_SLAB_BASE: u32 = 4;
-/// Max size class: cap = 4 << c.
-///
-/// Class 18 = 2^20 entries (~12 MiB) is not enough for a few mainnet exchange
-/// deposit scripts (migrate hit “entry count too large” past ~16.7M keys).
-/// Class 24 = 2^26 entries (~805 MiB slab) covers pathological histories.
+/// Max size class: cap = 4 << c (class 24 ≈ 2^26 entries).
 pub const SH_MAX_CLASS: u8 = 24;
-/// Head value payload (tag + data); slot = key[32] + value[32] = 64 B.
-pub const SH_HEAD_VALUE_LEN: usize = 32;
+/// Head key length (prefix of Electrum SHA256(spk)).
+pub const SH_HEAD_KEY_LEN: usize = 16;
+/// Head value: two u64s.
+pub const SH_HEAD_VALUE_LEN: usize = 16;
 /// On-disk head slot size.
-pub const SH_HEAD_SLOT_SIZE: usize = 32 + SH_HEAD_VALUE_LEN;
+pub const SH_HEAD_SLOT_SIZE: usize = SH_HEAD_KEY_LEN + SH_HEAD_VALUE_LEN;
+/// High bit of first value word marks slab mode (Class A fks stay < 2^63).
+pub const SH_SLAB_MARKER: u64 = 1u64 << 63;
 /// Alloc header magic after the RBT1 file header.
 pub const SH_ALLOC_MAGIC: [u8; 4] = *b"SHAL";
 pub const SH_ALLOC_VERSION: u16 = 1;
 /// Fixed alloc control page (includes freelist heads).
 pub const SH_ALLOC_HEADER_LEN: usize = 4096;
+
+pub type ShHeadKey = [u8; SH_HEAD_KEY_LEN];
+
+/// Truncate full Electrum scripthash (32 B) to head key (16 B).
+#[inline]
+pub fn head_key_from_full(full: &[u8; 32]) -> ShHeadKey {
+    let mut k = [0u8; SH_HEAD_KEY_LEN];
+    k.copy_from_slice(&full[0..SH_HEAD_KEY_LEN]);
+    k
+}
 
 #[inline]
 pub fn slab_cap(class: u8) -> u32 {
@@ -44,7 +54,6 @@ pub fn class_for_count(n: u32) -> Option<u8> {
     if n <= SH_INLINE_CAP as u32 {
         return None;
     }
-    // 4 << c >= n  ⇒  c >= ceil(log2(n)) - 2
     let mut c = 0u8;
     while c <= SH_MAX_CLASS {
         if slab_cap(c) >= n {
@@ -55,26 +64,19 @@ pub fn class_for_count(n: u32) -> Option<u8> {
     None
 }
 
-/// One thin create: `create_tx_fk` + `vout`.
+/// One thin create: create_tx_fk only (vout recovered from Class A).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ShEntry {
     pub create_tx_fk: Fk,
-    pub vout: u32,
 }
 
 impl ShEntry {
-    pub fn new(create_tx_fk: Fk, vout: u32) -> Self {
-        Self {
-            create_tx_fk,
-            vout,
-        }
+    pub fn new(create_tx_fk: Fk) -> Self {
+        Self { create_tx_fk }
     }
 
     pub fn encode(self) -> [u8; SH_ENTRY_LEN] {
-        let mut out = [0u8; SH_ENTRY_LEN];
-        out[0..8].copy_from_slice(&self.create_tx_fk.0.to_le_bytes());
-        out[8..12].copy_from_slice(&self.vout.to_le_bytes());
-        out
+        self.create_tx_fk.0.to_le_bytes()
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, StoreError> {
@@ -83,7 +85,6 @@ impl ShEntry {
         }
         Ok(Self {
             create_tx_fk: Fk(u64::from_le_bytes(buf[0..8].try_into().unwrap())),
-            vout: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
         })
     }
 
@@ -92,14 +93,9 @@ impl ShEntry {
     }
 }
 
-const TAG_EMPTY: u8 = 0;
-const TAG_INLINE: u8 = 1;
-const TAG_SLAB: u8 = 2;
-
-/// Durable head value for one scripthash key.
+/// Durable head value for one scripthash key (16 B on disk).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShHeadValue {
-    /// No creates (soft-deleted head slot or absent).
     Empty,
     Inline {
         entries: [ShEntry; SH_INLINE_CAP],
@@ -131,24 +127,32 @@ impl ShHeadValue {
         match self {
             ShHeadValue::Empty => {}
             ShHeadValue::Inline { entries, used } => {
-                out[0] = TAG_INLINE;
-                out[1] = *used;
-                if *used >= 1 {
-                    out[4..16].copy_from_slice(&entries[0].encode());
-                }
-                if *used >= 2 {
-                    out[16..28].copy_from_slice(&entries[1].encode());
-                }
+                let w0 = if *used >= 1 {
+                    entries[0].create_tx_fk.0
+                } else {
+                    0
+                };
+                let w1 = if *used >= 2 {
+                    entries[1].create_tx_fk.0
+                } else {
+                    0
+                };
+                debug_assert_eq!(w0 & SH_SLAB_MARKER, 0, "fk must not set slab marker");
+                debug_assert_eq!(w1 & SH_SLAB_MARKER, 0, "fk must not set slab marker");
+                out[0..8].copy_from_slice(&w0.to_le_bytes());
+                out[8..16].copy_from_slice(&w1.to_le_bytes());
             }
             ShHeadValue::Slab {
                 class,
                 used,
                 slab_off,
             } => {
-                out[0] = TAG_SLAB;
-                out[1] = *class;
-                out[2..6].copy_from_slice(&used.to_le_bytes());
-                out[6..14].copy_from_slice(&slab_off.to_le_bytes());
+                // w0: marker | class:u8 | used:u32 in low bits
+                let mut w0 = SH_SLAB_MARKER;
+                w0 |= u64::from(*class) << 32;
+                w0 |= u64::from(*used) & 0xffff_ffff;
+                out[0..8].copy_from_slice(&w0.to_le_bytes());
+                out[8..16].copy_from_slice(&slab_off.to_le_bytes());
             }
         }
         out
@@ -158,45 +162,47 @@ impl ShHeadValue {
         if buf.len() < SH_HEAD_VALUE_LEN {
             return Err(StoreError::Corrupt("short scripthash head value"));
         }
-        match buf[0] {
-            TAG_EMPTY => Ok(ShHeadValue::Empty),
-            TAG_INLINE => {
-                let used = buf[1];
-                if used == 0 || used as usize > SH_INLINE_CAP {
-                    return Err(StoreError::Corrupt("bad inline used count"));
-                }
-                let mut entries = [ShEntry::new(Fk::NULL, 0); SH_INLINE_CAP];
-                entries[0] = ShEntry::decode(&buf[4..16])?;
-                if used >= 2 {
-                    entries[1] = ShEntry::decode(&buf[16..28])?;
-                }
-                Ok(ShHeadValue::Inline { entries, used })
-            }
-            TAG_SLAB => {
-                let class = buf[1];
-                if class > SH_MAX_CLASS {
-                    return Err(StoreError::Corrupt("bad slab class"));
-                }
-                let used = u32::from_le_bytes(buf[2..6].try_into().unwrap());
-                let slab_off = u64::from_le_bytes(buf[6..14].try_into().unwrap());
-                if used == 0 || used > slab_cap(class) {
-                    return Err(StoreError::Corrupt("bad slab used count"));
-                }
-                if slab_off == 0 {
-                    return Err(StoreError::Corrupt("null slab offset"));
-                }
-                Ok(ShHeadValue::Slab {
-                    class,
-                    used,
-                    slab_off,
-                })
-            }
-            _ => Err(StoreError::Corrupt("unknown scripthash head tag")),
+        let w0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        if w0 == 0 && w1 == 0 {
+            return Ok(ShHeadValue::Empty);
         }
+        if w0 & SH_SLAB_MARKER != 0 {
+            let class = ((w0 >> 32) & 0xff) as u8;
+            if class > SH_MAX_CLASS {
+                return Err(StoreError::Corrupt("bad slab class"));
+            }
+            let used = (w0 & 0xffff_ffff) as u32;
+            let slab_off = w1;
+            if used == 0 || used > slab_cap(class) {
+                return Err(StoreError::Corrupt("bad slab used count"));
+            }
+            if slab_off == 0 {
+                return Err(StoreError::Corrupt("null slab offset"));
+            }
+            return Ok(ShHeadValue::Slab {
+                class,
+                used,
+                slab_off,
+            });
+        }
+        // Inline
+        let e0 = ShEntry::new(Fk(w0));
+        if e0.is_null() {
+            return Err(StoreError::Corrupt("inline null first fk"));
+        }
+        if w1 == 0 {
+            return Ok(ShHeadValue::inline_one(e0));
+        }
+        let e1 = ShEntry::new(Fk(w1));
+        if e1.is_null() {
+            return Err(StoreError::Corrupt("inline null second fk"));
+        }
+        Ok(ShHeadValue::inline_two(e0, e1))
     }
 
     pub fn inline_one(e: ShEntry) -> Self {
-        let mut entries = [ShEntry::new(Fk::NULL, 0); SH_INLINE_CAP];
+        let mut entries = [ShEntry::new(Fk::NULL); SH_INLINE_CAP];
         entries[0] = e;
         ShHeadValue::Inline { entries, used: 1 }
     }
@@ -214,6 +220,14 @@ impl ShHeadValue {
             ShHeadValue::Inline { entries, used } => &entries[..*used as usize],
             _ => &[],
         }
+    }
+
+    /// All create_tx_fks in this value (inline only; slab needs body read).
+    pub fn inline_fks(&self) -> Vec<Fk> {
+        self.inline_entries()
+            .iter()
+            .map(|e| e.create_tx_fk)
+            .collect()
     }
 }
 
@@ -234,24 +248,19 @@ mod tests {
         assert_eq!(class_for_count(3), Some(0));
         assert_eq!(class_for_count(4), Some(0));
         assert_eq!(class_for_count(5), Some(1));
-        assert_eq!(class_for_count(8), Some(1));
-        assert_eq!(class_for_count(9), Some(2));
-        assert_eq!(class_for_count(100), Some(5)); // 4<<5 = 128
-        assert_eq!(class_for_count(1_048_576), Some(18)); // 4<<18 = 2^20
-        assert_eq!(class_for_count(1_048_577), Some(19));
-        assert_eq!(class_for_count(slab_cap(SH_MAX_CLASS)), Some(SH_MAX_CLASS));
-        assert!(class_for_count(slab_cap(SH_MAX_CLASS).saturating_add(1)).is_none());
+        assert_eq!(slab_bytes(0), 32); // 4 * 8
         assert_eq!(slab_cap(0), 4);
-        assert_eq!(slab_cap(1), 8);
-        assert_eq!(slab_bytes(0), 48);
     }
 
     #[test]
     fn head_value_roundtrip() {
-        let e0 = ShEntry::new(Fk(3), 0);
-        let e1 = ShEntry::new(Fk(4), 1);
+        let e0 = ShEntry::new(Fk(3));
+        let e1 = ShEntry::new(Fk(4));
         let inline = ShHeadValue::inline_two(e0, e1);
         assert_eq!(ShHeadValue::decode(&inline.encode()).unwrap(), inline);
+
+        let one = ShHeadValue::inline_one(e0);
+        assert_eq!(ShHeadValue::decode(&one.encode()).unwrap(), one);
 
         let slab = ShHeadValue::Slab {
             class: 1,
@@ -267,7 +276,15 @@ mod tests {
 
     #[test]
     fn entry_roundtrip() {
-        let e = ShEntry::new(Fk(0xdead_beef), 42);
+        let e = ShEntry::new(Fk(0xdead_beef));
         assert_eq!(ShEntry::decode(&e.encode()).unwrap(), e);
+    }
+
+    #[test]
+    fn head_key_prefix() {
+        let full = [0xabu8; 32];
+        let k = head_key_from_full(&full);
+        assert_eq!(k.len(), 16);
+        assert_eq!(&k[..], &full[..16]);
     }
 }

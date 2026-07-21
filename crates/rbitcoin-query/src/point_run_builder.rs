@@ -1,5 +1,7 @@
-//! Catch-up point (spend) edges via sorted runs. Confirm uses
-//! light UTXO spentness; durable multimap is materialized at tip mode.
+//! Catch-up spend annotations via sorted runs (confirm enqueue → materialize).
+//!
+//! Record: create_tx_fk | vout | spending_tx_fk (20 B). Enqueued at **confirm**
+//! when light UTXO supplies create_fk; materialize patches create outputs.
 
 use super::run_builder_core::{
     clear_runs_dir, finalize_wait_join, memtable_cap, spawn_worker, take_oldest_run, worker_loop,
@@ -8,29 +10,23 @@ use super::run_builder_core::{
 use rbitcoin_log::{debug, info};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
-    next_run_path, read_run_body, remove_run, write_sorted_run, PointRecord, Store, StoreError,
-    SortedRunPath,
+    next_run_path, read_run_body, remove_run, write_sorted_run, Store, StoreError, SortedRunPath,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
-/// on-disk: outpoint_key[32] | out_txid[32] | out_index | spend_fk | in_idx | height = 84
-const KEY_LEN: u32 = 32;
-const FULL: u32 = 84;
+/// create_tx_fk:u64 | vout:u32 | spending_tx_fk:u64 = 20
+const KEY_LEN: u32 = 8;
+const FULL: u32 = 20;
 const DEFAULT_CAP: usize = 512_000;
 
-/// (out_txid, out_index, spend_tx_fk, in_idx, height)
-pub type PointEdge = ([u8; 32], u32, Fk, u32, u32);
-
-fn sort_key(out_txid: &[u8; 32], out_index: u32) -> [u8; 32] {
-    PointRecord::outpoint_key(out_txid, out_index)
-}
+/// (create_tx_fk, vout, spending_tx_fk)
+pub type SpendEdge = (Fk, u32, Fk);
 
 struct Inner {
-    pending: Vec<PointEdge>,
+    pending: Vec<SpendEdge>,
     ctrl: RunControl,
 }
 
@@ -49,21 +45,12 @@ impl RunMemtable for Inner {
             return Ok(0);
         }
         let mut recs = std::mem::take(&mut self.pending);
-        recs.sort_unstable_by(|a, b| {
-            sort_key(&a.0, a.1)
-                .cmp(&sort_key(&b.0, b.1))
-                .then(a.2 .0.cmp(&b.2 .0))
-                .then(a.3.cmp(&b.3))
-        });
+        recs.sort_unstable_by(|a, b| a.0 .0.cmp(&b.0 .0).then(a.1.cmp(&b.1)).then(a.2 .0.cmp(&b.2 .0)));
         let mut body = Vec::with_capacity(recs.len() * FULL as usize);
-        for (out_txid, out_idx, spend_fk, in_idx, height) in &recs {
-            let key = sort_key(out_txid, *out_idx);
-            body.extend_from_slice(&key);
-            body.extend_from_slice(out_txid);
-            body.extend_from_slice(&out_idx.to_le_bytes());
+        for (create_fk, vout, spend_fk) in &recs {
+            body.extend_from_slice(&create_fk.0.to_le_bytes());
+            body.extend_from_slice(&vout.to_le_bytes());
             body.extend_from_slice(&spend_fk.0.to_le_bytes());
-            body.extend_from_slice(&in_idx.to_le_bytes());
-            body.extend_from_slice(&height.to_le_bytes());
         }
         let path = next_run_path(&self.ctrl.runs_dir, self.ctrl.next_seq);
         self.ctrl.next_seq += 1;
@@ -105,64 +92,42 @@ impl PointRunBuilder {
             let mut g = self.inner.lock().unwrap();
             g.ctrl.reset_for_enable();
         }
-        let inner_w = Arc::clone(&self.inner);
-        let cv_w = Arc::clone(&self.cv);
+        let soft = memtable_cap("RBITCOIN_POINT_MEMTABLE_CAP", DEFAULT_CAP);
+        let inner = Arc::clone(&self.inner);
+        let cv = Arc::clone(&self.cv);
         spawn_worker(
-            "ibd-point-index",
-            || info!("ibd: point.head catch-up via sorted runs (mmap UTXO for confirm spentness)"),
+            "ibd-point-runs",
+            || debug!("ibd: spend-run worker on (confirm enqueue → output spender_field)"),
             &self.enabled,
             &self.join,
-            move || {
-                debug!("ibd: point run worker started");
-                worker_loop(
-                    memtable_cap("RBITCOIN_POINT_MEMTABLE_CAP", DEFAULT_CAP),
-                    "point",
-                    FAMILY_POINT,
-                    inner_w,
-                    cv_w,
-                );
-                debug!("ibd: point run worker stopped");
-            },
+            move || worker_loop(soft, "point", FAMILY_POINT, inner, cv),
         );
     }
 
-    pub fn enqueue_batch(&self, edges: &[PointEdge]) {
-        if !self.is_enabled() || edges.is_empty() {
+    pub fn enqueue_batch(&self, edges: &[SpendEdge]) {
+        if edges.is_empty() || !self.is_enabled() {
             return;
         }
-        let soft = memtable_cap("RBITCOIN_POINT_MEMTABLE_CAP", DEFAULT_CAP);
-        let hard = soft.saturating_mul(2);
         let mut g = self.inner.lock().unwrap();
-        for &e in edges {
-            while g.pending.len() >= hard && !g.ctrl.stop {
-                self.cv.notify_all();
-                g = self
-                    .cv
-                    .wait_timeout(g, Duration::from_millis(50))
-                    .unwrap()
-                    .0;
-            }
-            g.pending.push(e);
-            self.enqueued.fetch_add(1, Ordering::Relaxed);
-        }
+        g.pending.extend_from_slice(edges);
+        self.enqueued
+            .fetch_add(edges.len() as u64, Ordering::Relaxed);
+        let soft = memtable_cap("RBITCOIN_POINT_MEMTABLE_CAP", DEFAULT_CAP);
         if g.pending.len() >= soft {
-            self.cv.notify_all();
+            self.cv.notify_one();
         }
     }
 
-    /// On-disk sorted-run count (for IBD progress / lead-compact metrics).
     pub fn on_disk_run_count(&self) -> usize {
-        let (runs_dir, runs_io) = {
+        let runs_dir = {
             let g = self.inner.lock().unwrap();
-            (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
+            g.ctrl.runs_dir.clone()
         };
-        let _io = runs_io.lock().unwrap();
         rbitcoin_store::list_runs(&runs_dir)
             .map(|r| r.len())
             .unwrap_or(0)
     }
 
-    /// Materialize the oldest on-disk run into point.head (paced). `Ok(None)` if empty.
     pub fn materialize_oldest_run(&self, store: &Store) -> Result<Option<u64>, StoreError> {
         let (runs_dir, runs_io) = {
             let g = self.inner.lock().unwrap();
@@ -186,7 +151,7 @@ impl PointRunBuilder {
             match self.materialize_oldest_run(store)? {
                 Some(n) => {
                     inserted = inserted.saturating_add(n);
-                    info!("node: point materialize run edges≈{n} total≈{inserted}");
+                    info!("node: spend materialize run edges≈{n} total≈{inserted}");
                 }
                 None => break,
             }
@@ -198,32 +163,28 @@ impl PointRunBuilder {
 }
 
 fn materialize(store: &Store, run: &SortedRunPath) -> Result<u64, StoreError> {
-    // Whole-run cold path: no point.head probes (valid chain = one spend per
-    // outpoint), one body write + pre-sized head insert. Heads are not read
-    // until tip mode / Electrum.
     let body = read_run_body(run)?;
     let rec_len = run.rec_len as usize;
-    if rec_len != 84 {
-        return Err(StoreError::Corrupt("point run unexpected rec_len"));
+    if rec_len != FULL as usize {
+        // Legacy v4 84-byte runs not supported after schema v5.
+        return Err(StoreError::Corrupt("spend run unexpected rec_len (need v5 20-byte)"));
     }
     let n_rec = body.len() / rec_len;
-    let mut batch: Vec<([u8; 32], u32, Fk, u32)> = Vec::with_capacity(n_rec);
+    let mut batch: Vec<(Fk, u32, Fk)> = Vec::with_capacity(n_rec);
     let mut off = 0usize;
     while off + rec_len <= body.len() {
-        let mut out_txid = [0u8; 32];
-        out_txid.copy_from_slice(&body[off + 32..off + 64]);
-        let out_index = u32::from_le_bytes(body[off + 64..off + 68].try_into().unwrap());
-        let spend_fk = Fk(u64::from_le_bytes(body[off + 68..off + 76].try_into().unwrap()));
-        let in_idx = u32::from_le_bytes(body[off + 76..off + 80].try_into().unwrap());
+        let create_fk = Fk(u64::from_le_bytes(body[off..off + 8].try_into().unwrap()));
+        let vout = u32::from_le_bytes(body[off + 8..off + 12].try_into().unwrap());
+        let spend_fk = Fk(u64::from_le_bytes(body[off + 12..off + 20].try_into().unwrap()));
         off += rec_len;
-        if !spend_fk.is_null() {
-            batch.push((out_txid, out_index, spend_fk, in_idx));
+        if !create_fk.is_null() && !spend_fk.is_null() {
+            batch.push((create_fk, vout, spend_fk));
         }
     }
     if batch.is_empty() {
         return Ok(0);
     }
     let n = batch.len() as u64;
-    store.put_spend_batch_cold(&batch)?;
+    store.put_spend_batch_by_create(&batch)?;
     Ok(n)
 }

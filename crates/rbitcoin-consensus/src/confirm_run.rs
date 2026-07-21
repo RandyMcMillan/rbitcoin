@@ -49,7 +49,7 @@ struct Prepared {
     header_fk: rbitcoin_primitives::Fk,
     tx_fks: Vec<rbitcoin_primitives::Fk>,
     jobs: Vec<ScriptCheckJob>,
-    spends: Vec<([u8; 32], u32)>,
+    spends: Vec<([u8; 32], u32, rbitcoin_primitives::Fk)>,
     /// Outpoints created this height for light UTXO (from connect; no re-get).
     creates: Vec<([u8; 32], u32, rbitcoin_primitives::Fk)>,
     check_scripts: bool,
@@ -424,11 +424,6 @@ fn class_c_commit(
 }
 
 fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusError> {
-    let mut all_spends: Vec<([u8; 32], u32)> = Vec::new();
-    for p in prepared {
-        all_spends.extend_from_slice(&p.spends);
-    }
-
     // Apply light UTXO first so the next wave's catchup_is_spent sees spends.
     // Catch-up unpin is a no-op (see Query::unpin_spent_parent_outs); tip-follow
     // does a cheap runway-only retire after apply.
@@ -457,6 +452,10 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
         .fetch_add(t_spent.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
     let t_unpin = Instant::now();
+    let all_spends: Vec<([u8; 32], u32)> = prepared
+        .iter()
+        .flat_map(|p| p.spends.iter().map(|(t, v, _)| (*t, *v)))
+        .collect();
     let _ = query.unpin_spent_parent_outs(&all_spends);
     confirm_phase_stats::UNPIN_NS.fetch_add(
         t_unpin.elapsed().as_nanos() as u64,

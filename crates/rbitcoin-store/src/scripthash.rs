@@ -1,8 +1,8 @@
 //! Class B scripthash multimap (Electrum: SHA256(scriptPubKey)).
 //!
-//! Hybrid layout: head holds up to 2 inline thin creates, or a pointer to one
-//! geometric body slab (cap 4 → 8 → 16 → …). Body is a size-class freelist heap.
-//! Spend state and heights come from Class A/B/C at query time.
+//! Hybrid layout (schema v6): head key = 16 B hash prefix; value = two u64s
+//! (≤2 inline create_tx_fks or slab meta). Body slabs pack 8 B create_tx_fks only;
+//! vouts are expanded from Class A at query.
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
@@ -24,14 +24,15 @@ pub fn script_hash(script: &[u8]) -> [u8; 32] {
 
 pub use crate::scripthash_layout::ShEntry as ScriptHashEntry;
 
-/// In-memory row. `scripthash` is filled from the head key when walking entries;
-/// `txid` / `value` / `create_height` are query joins (not stored).
+/// In-memory row. Index stores `create_tx_fk` only; `vout` / `txid` / `value` /
+/// `create_height` are query joins (not stored on SH body).
 ///
-/// `next` is unused in hybrid layout (always null); retained for API compatibility.
+/// `next` is unused (always null); retained for API compatibility.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScriptHashRecord {
     pub scripthash: [u8; 32],
     pub create_tx_fk: Fk,
+    /// Filled by query expand from Class A outputs (not indexed).
     pub vout: u32,
     pub next: Fk,
     /// Query join from create_tx_fk (not stored).
@@ -44,19 +45,23 @@ pub struct ScriptHashRecord {
 
 impl ScriptHashRecord {
     pub fn entry(&self) -> ShEntry {
-        ShEntry::new(self.create_tx_fk, self.vout)
+        ShEntry::new(self.create_tx_fk)
     }
 
     pub fn from_entry(scripthash: [u8; 32], e: ShEntry) -> Self {
         Self {
             scripthash,
             create_tx_fk: e.create_tx_fk,
-            vout: e.vout,
+            vout: 0,
             next: Fk::NULL,
             txid: [0u8; 32],
             value: 0,
             create_height: 0,
         }
+    }
+
+    pub fn from_fk(scripthash: [u8; 32], create_tx_fk: Fk) -> Self {
+        Self::from_entry(scripthash, ShEntry::new(create_tx_fk))
     }
 
     pub fn is_tombstone(&self) -> bool {
@@ -156,15 +161,12 @@ impl ScriptHashTable {
         self.head.get(scripthash)
     }
 
-    /// Visit every live create across all keys (head occupancy walk).
-    pub fn for_each_live_create(
-        &self,
-        mut f: impl FnMut(Fk, u32),
-    ) -> Result<(), StoreError> {
-        self.head.for_each_occupied(|key, val| {
-            let entries = self.collect_entries(&key, &val)?;
+    /// Visit every live create_tx_fk across all keys (head occupancy walk).
+    pub fn for_each_live_create(&self, mut f: impl FnMut(Fk)) -> Result<(), StoreError> {
+        self.head.for_each_occupied(|_key, val| {
+            let entries = self.collect_entries(&_key, &val)?;
             for e in entries {
-                f(e.create_tx_fk, e.vout);
+                f(e.create_tx_fk);
             }
             Ok(())
         })
@@ -219,10 +221,9 @@ impl ScriptHashTable {
         &self,
         scripthash: &[u8; 32],
         create_tx_fk: Fk,
-        vout: u32,
     ) -> Result<bool, StoreError> {
         for (_fk, rec) in self.entries(scripthash)? {
-            if rec.create_tx_fk == create_tx_fk && rec.vout == vout {
+            if rec.create_tx_fk == create_tx_fk {
                 return Ok(true);
             }
         }
@@ -237,12 +238,12 @@ impl ScriptHashTable {
         }
     }
 
-    /// Append a create (idempotent on create_tx_fk+vout).
+    /// Append a create (idempotent on create_tx_fk).
     pub fn put_create(&self, rec: &ScriptHashRecord) -> Result<(), StoreError> {
         if rec.create_tx_fk.is_null() {
             return Err(StoreError::InvalidFk);
         }
-        if self.contains_create(&rec.scripthash, rec.create_tx_fk, rec.vout)? {
+        if self.contains_create(&rec.scripthash, rec.create_tx_fk)? {
             return Ok(());
         }
         let mut heads = HashMap::new();
@@ -258,15 +259,15 @@ impl ScriptHashTable {
         if recs.is_empty() {
             return Ok(0);
         }
-        let mut known: HashMap<[u8; 32], Vec<(Fk, u32)>> = HashMap::new();
+        let mut known: HashMap<[u8; 32], Vec<Fk>> = HashMap::new();
         let mut heads: HashMap<[u8; 32], ShHeadValue> = HashMap::new();
         for rec in recs {
             if !known.contains_key(&rec.scripthash) {
-                let mut pairs = Vec::new();
+                let mut fks = Vec::new();
                 for (_fk, e) in self.entries(&rec.scripthash)? {
-                    pairs.push((e.create_tx_fk, e.vout));
+                    fks.push(e.create_tx_fk);
                 }
-                known.insert(rec.scripthash, pairs);
+                known.insert(rec.scripthash, fks);
                 if let Some(v) = self.head.get(&rec.scripthash)? {
                     heads.insert(rec.scripthash, v);
                 }
@@ -279,13 +280,10 @@ impl ScriptHashTable {
                     return false;
                 }
                 let durable = known.get(&rec.scripthash).map(|v| v.as_slice()).unwrap_or(&[]);
-                !durable
-                    .iter()
-                    .any(|&(c, v)| c == rec.create_tx_fk && v == rec.vout)
+                !durable.iter().any(|&c| c == rec.create_tx_fk)
             })
             .cloned()
             .collect();
-        // Also filter in-batch dups via append path
         let (n, _) = self.put_create_batch_append(&filtered, &mut heads)?;
         Ok(n)
     }
@@ -335,9 +333,9 @@ impl ScriptHashTable {
         }
         timing.seed_ns = t_seed.elapsed().as_nanos() as u64;
 
-        // Group new entries by key (order already sorted by key).
+        // Group new create_tx_fks by key (dedup by create_tx_fk, not vout).
         let t_body = std::time::Instant::now();
-        let mut batch_seen: HashMap<[u8; 32], Vec<(Fk, u32)>> = HashMap::new();
+        let mut batch_seen: HashMap<[u8; 32], Vec<Fk>> = HashMap::new();
         let mut per_key: HashMap<[u8; 32], Vec<ShEntry>> = HashMap::new();
         let mut written = 0usize;
 
@@ -348,17 +346,14 @@ impl ScriptHashTable {
             }
             let key = rec.scripthash;
             let seen = batch_seen.entry(key).or_default();
-            if seen
-                .iter()
-                .any(|&(c, v)| c == rec.create_tx_fk && v == rec.vout)
-            {
+            if seen.iter().any(|&c| c == rec.create_tx_fk) {
                 continue;
             }
-            seen.push((rec.create_tx_fk, rec.vout));
+            seen.push(rec.create_tx_fk);
             per_key
                 .entry(key)
                 .or_default()
-                .push(ShEntry::new(rec.create_tx_fk, rec.vout));
+                .push(ShEntry::new(rec.create_tx_fk));
             written += 1;
         }
 
@@ -368,22 +363,15 @@ impl ScriptHashTable {
         for (key, new_ents) in per_key {
             let cur = heads.get(&key).cloned().unwrap_or(ShHeadValue::Empty);
             let mut old_live = self.collect_entries_locked(&cur)?;
-            // Drop any durable dups already present (append path trusts watermark,
-            // but still skip if process map already has them from prior batch).
-            new_ents.iter().for_each(|_| {});
             let add: Vec<ShEntry> = new_ents
                 .into_iter()
                 .filter(|e| {
                     !old_live
                         .iter()
-                        .any(|o| o.create_tx_fk == e.create_tx_fk && o.vout == e.vout)
+                        .any(|o| o.create_tx_fk == e.create_tx_fk)
                 })
                 .collect();
             if add.is_empty() {
-                written = written.saturating_sub(
-                    // recount: we over-counted; fix by not double-counting — recompute later
-                    0,
-                );
                 continue;
             }
             old_live.extend(add);
@@ -530,21 +518,20 @@ impl ScriptHashTable {
         Ok(())
     }
 
-    /// Unlink one create (disconnect tip). Swap-remove; demote slab→inline when used≤2.
+    /// Unlink one create_tx_fk (disconnect tip). Caller should only remove the fk
+    /// when no remaining outputs of that tx still match this scripthash.
+    /// Swap-remove; demote slab→inline when used≤2.
     pub fn unlink_create(
         &self,
         scripthash: &[u8; 32],
         create_tx_fk: Fk,
-        vout: u32,
+        _vout: u32,
     ) -> Result<bool, StoreError> {
         let Some(val) = self.head.get(scripthash)? else {
             return Ok(false);
         };
         let mut live = self.collect_entries(scripthash, &val)?;
-        let Some(pos) = live
-            .iter()
-            .position(|e| e.create_tx_fk == create_tx_fk && e.vout == vout)
-        else {
+        let Some(pos) = live.iter().position(|e| e.create_tx_fk == create_tx_fk) else {
             return Ok(false);
         };
         live.swap_remove(pos);
@@ -823,9 +810,9 @@ mod tests {
         .unwrap();
         t.unlink_create(&sh, Fk(2), 0).unwrap();
         let mut seen = Vec::new();
-        t.for_each_live_create(|c, v| seen.push((c.0, v))).unwrap();
+        t.for_each_live_create(|c| seen.push(c.0)).unwrap();
         seen.sort_unstable();
-        assert_eq!(seen, vec![(1, 0), (3, 0)]);
+        assert_eq!(seen, vec![1, 3]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

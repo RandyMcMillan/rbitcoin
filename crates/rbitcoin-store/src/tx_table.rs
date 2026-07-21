@@ -64,15 +64,32 @@ impl TxRecord {
 pub struct OutputRecord {
     pub value: i64,
     pub script: Vec<u8>,
+    /// Schema v5: sole `spending_tx_fk` if !multi; else head fk into `spenders.body`.
+    pub spender_field: Fk,
+    /// When true, `spender_field` is a multi-list head (not a single spending_tx_fk).
+    pub multi_spender: bool,
 }
 
 impl OutputRecord {
+    pub fn unspent(value: i64, script: Vec<u8>) -> Self {
+        Self {
+            value,
+            script,
+            spender_field: Fk::NULL,
+            multi_spender: false,
+        }
+    }
+
     pub fn encode_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.spender_field.0.to_le_bytes());
         let mut flags = 0u8;
         if self.script.is_empty() {
             flags |= output_flags::EMPTY_SCRIPT;
         } else if self.script == [0x51] {
             flags |= output_flags::OP_TRUE;
+        }
+        if self.multi_spender {
+            flags |= output_flags::MULTI_SPENDER;
         }
         out.push(flags);
         // Non-negative sats as uleb128 (Bitcoin values are ≥ 0).
@@ -85,18 +102,20 @@ impl OutputRecord {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + 10 + self.script.len());
+        let mut out = Vec::with_capacity(8 + 1 + 10 + self.script.len());
         self.encode_into(&mut out);
         out
     }
 
     /// Decode one output; returns (record, bytes_consumed).
     pub fn decode_at(buf: &[u8]) -> Result<(Self, usize), StoreError> {
-        if buf.is_empty() {
+        if buf.len() < 9 {
             return Err(StoreError::Corrupt("short output record"));
         }
-        let flags = buf[0];
-        let mut off = 1usize;
+        let spender_field = Fk(u64::from_le_bytes(buf[0..8].try_into().unwrap()));
+        let flags = buf[8];
+        let multi_spender = flags & output_flags::MULTI_SPENDER != 0;
+        let mut off = 9usize;
         let (v, n) = read_uleb128(&buf[off..])?;
         off += n;
         if v > i64::MAX as u64 {
@@ -118,7 +137,15 @@ impl OutputRecord {
             off += slen;
             s
         };
-        Ok((Self { value, script }, off))
+        Ok((
+            Self {
+                value,
+                script,
+                spender_field,
+                multi_spender,
+            },
+            off,
+        ))
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, StoreError> {
@@ -130,7 +157,7 @@ impl OutputRecord {
     }
 
     pub fn encoded_len(&self) -> usize {
-        1 + 10 + 9 + self.script.len()
+        8 + 1 + 10 + 9 + self.script.len()
     }
 }
 
@@ -519,6 +546,97 @@ impl TxTable {
         }
     }
 
+    /// Relative byte offset of output `vout`'s `spender_field` inside a packed tx payload.
+    fn packed_output_spender_rel(raw: &[u8], vout: u32) -> Result<u64, StoreError> {
+        if raw.first().copied() != Some(PACKED_TX_V1) {
+            return Err(StoreError::Corrupt("not packed tx"));
+        }
+        if raw.len() < 1 + TxRecord::ENCODED_LEN {
+            return Err(StoreError::Corrupt("short packed tx"));
+        }
+        let meta = TxRecord::decode(&raw[1..1 + TxRecord::ENCODED_LEN])?;
+        if vout >= meta.output_count {
+            return Err(StoreError::NotFound);
+        }
+        let mut off = 1 + TxRecord::ENCODED_LEN;
+        for _ in 0..meta.input_count {
+            let (_rec, used) = InputRecord::decode_at(&raw[off..])?;
+            off += used;
+        }
+        for i in 0..=vout {
+            if off >= raw.len() {
+                return Err(StoreError::Corrupt("packed outputs short"));
+            }
+            if i == vout {
+                return Ok(off as u64);
+            }
+            let (_, used) = OutputRecord::decode_at(&raw[off..])?;
+            off += used;
+        }
+        Err(StoreError::NotFound)
+    }
+
+    /// Read multi + spender_field for create tx output (packed or split run).
+    pub fn get_output_spender_meta(
+        &self,
+        outputs: &OutputTable,
+        create_tx_fk: Fk,
+        vout: u32,
+    ) -> Result<(bool, Fk), StoreError> {
+        let raw = self.body.get_raw(create_tx_fk)?;
+        if is_packed_tx_payload(&raw) {
+            let rel = Self::packed_output_spender_rel(&raw, vout)? as usize;
+            if raw.len() < rel + 9 {
+                return Err(StoreError::Corrupt("packed spender meta short"));
+            }
+            let field = Fk(u64::from_le_bytes(raw[rel..rel + 8].try_into().unwrap()));
+            let multi = raw[rel + 8] & output_flags::MULTI_SPENDER != 0;
+            return Ok((multi, field));
+        }
+        let tx = TxRecord::decode(&raw)?;
+        if vout >= tx.output_count || tx.output_start_fk.is_null() {
+            return Err(StoreError::NotFound);
+        }
+        outputs.get_spender_meta(tx.output_start_fk, tx.output_count, vout)
+    }
+
+    /// Patch multi + spender_field on create tx output (packed or split run).
+    pub fn set_output_spender_meta(
+        &self,
+        outputs: &OutputTable,
+        create_tx_fk: Fk,
+        vout: u32,
+        multi: bool,
+        field: Fk,
+    ) -> Result<(), StoreError> {
+        let raw = self.body.get_raw(create_tx_fk)?;
+        if is_packed_tx_payload(&raw) {
+            let rel = Self::packed_output_spender_rel(&raw, vout)?;
+            self.body
+                .write_at_record(create_tx_fk, rel, &field.0.to_le_bytes())?;
+            let flag_rel = rel + 8;
+            let mut flags = [0u8; 1];
+            // re-read flags byte after possible remap — use original raw
+            let fo = flag_rel as usize;
+            if fo >= raw.len() {
+                return Err(StoreError::Corrupt("packed flags missing"));
+            }
+            flags[0] = raw[fo];
+            if multi {
+                flags[0] |= output_flags::MULTI_SPENDER;
+            } else {
+                flags[0] &= !output_flags::MULTI_SPENDER;
+            }
+            self.body.write_at_record(create_tx_fk, flag_rel, &flags)?;
+            return Ok(());
+        }
+        let tx = TxRecord::decode(&raw)?;
+        if vout >= tx.output_count || tx.output_start_fk.is_null() {
+            return Err(StoreError::NotFound);
+        }
+        outputs.set_spender_meta(tx.output_start_fk, tx.output_count, vout, multi, field)
+    }
+
     /// Full tx body in **one** `tx.body` read (packed), or legacy 3-table path.
     pub fn get_full(
         &self,
@@ -791,6 +909,73 @@ impl OutputTable {
         Ok(run.swap_remove(index as usize))
     }
 
+    /// Byte offset of output `vout` within the run payload (start of its spender_field).
+    pub fn output_rel_offset(&self, run_fk: Fk, count: u32, vout: u32) -> Result<u64, StoreError> {
+        if vout >= count {
+            return Err(StoreError::NotFound);
+        }
+        let raw = self.body.get_raw(run_fk)?;
+        let mut off = 0usize;
+        for i in 0..=vout {
+            if off >= raw.len() {
+                return Err(StoreError::Corrupt("output run short for vout"));
+            }
+            if i == vout {
+                return Ok(off as u64);
+            }
+            let (_, used) = OutputRecord::decode_at(&raw[off..])?;
+            off += used;
+        }
+        Err(StoreError::NotFound)
+    }
+
+    /// Read multi flag + spender_field for one output without full script decode of all.
+    pub fn get_spender_meta(
+        &self,
+        run_fk: Fk,
+        count: u32,
+        vout: u32,
+    ) -> Result<(bool, Fk), StoreError> {
+        let rel = self.output_rel_offset(run_fk, count, vout)?;
+        let raw = self.body.get_raw(run_fk)?;
+        let off = rel as usize;
+        if raw.len() < off + 9 {
+            return Err(StoreError::Corrupt("output spender meta short"));
+        }
+        let field = Fk(u64::from_le_bytes(raw[off..off + 8].try_into().unwrap()));
+        let multi = raw[off + 8] & output_flags::MULTI_SPENDER != 0;
+        Ok((multi, field))
+    }
+
+    /// In-place write of spender_field and MULTI_SPENDER flag bit (variable tail unchanged).
+    pub fn set_spender_meta(
+        &self,
+        run_fk: Fk,
+        count: u32,
+        vout: u32,
+        multi: bool,
+        field: Fk,
+    ) -> Result<(), StoreError> {
+        let rel = self.output_rel_offset(run_fk, count, vout)?;
+        self.body
+            .write_at_record(run_fk, rel, &field.0.to_le_bytes())?;
+        // Patch only MULTI bit in flags (byte after field).
+        let raw = self.body.get_raw(run_fk)?;
+        let flag_off = rel as usize + 8;
+        if raw.len() <= flag_off {
+            return Err(StoreError::Corrupt("output flags missing"));
+        }
+        let mut flags = raw[flag_off];
+        if multi {
+            flags |= output_flags::MULTI_SPENDER;
+        } else {
+            flags &= !output_flags::MULTI_SPENDER;
+        }
+        self.body
+            .write_at_record(run_fk, rel + 8, &[flags])?;
+        Ok(())
+    }
+
     pub fn flush(&self) -> Result<(), StoreError> {
         self.body.flush()
     }
@@ -946,26 +1131,17 @@ mod tests {
     #[test]
     fn output_run_roundtrip() {
         let run = vec![
-            OutputRecord {
-                value: 50_0000_0000,
-                script: vec![0x51],
-            },
-            OutputRecord {
-                value: 0,
-                script: vec![],
-            },
-            OutputRecord {
-                value: 12345,
-                script: vec![0x00, 0x14, 0xaa],
-            },
+            OutputRecord::unspent(50_0000_0000, vec![0x51]),
+            OutputRecord::unspent(0, vec![]),
+            OutputRecord::unspent(12345, vec![0x00, 0x14, 0xaa]),
         ];
         let mut enc = Vec::new();
         encode_output_run(&run, &mut enc);
         assert_eq!(decode_output_run(&enc, 3).unwrap(), run);
-        // OP_TRUE / empty should be tiny
+        // OP_TRUE + spender_field(8) + flags + uleb value
         let mut tiny = Vec::new();
         run[0].encode_into(&mut tiny);
-        assert!(tiny.len() < 12, "op_true+value should be compact: {}", tiny.len());
+        assert!(tiny.len() < 24, "op_true+value should be compact: {}", tiny.len());
     }
 
     #[test]
@@ -1003,14 +1179,8 @@ mod tests {
             witness: vec![],
         }];
         let outputs = vec![
-            OutputRecord {
-                value: 50_0000_0000,
-                script: vec![0x51],
-            },
-            OutputRecord {
-                value: 1,
-                script: vec![0x00, 0x14],
-            },
+            OutputRecord::unspent(50_0000_0000, vec![0x51]),
+            OutputRecord::unspent(1, vec![0x00, 0x14]),
         ];
         let mut enc = Vec::new();
         encode_packed_tx(&tx, &inputs, &outputs, &mut enc);

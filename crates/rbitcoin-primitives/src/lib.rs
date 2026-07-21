@@ -17,12 +17,16 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 
 /// Current on-disk schema version (see workspace `SCHEMA.md`).
 ///
+/// v6: scripthash head 16 B key prefix + 16 B value; body entry = create_tx_fk only.
+///
+/// v5: spend annotation on each output (`spender_field` + rare multi `spenders.body`);
+/// no `point.head` open-hash multimap.
+///
 /// v4: hybrid scripthash (2-inline head or geometric body slab + size-class freelist).
-/// One-time migrate from v3 linked-list SH; other tables stamp schema only.
 ///
 /// v3: thin point/scripthash linked lists; strong_tx bitset; denser hash heads;
 /// Class A inputs always external `prev_txid`.
-pub const SCHEMA_VERSION: u16 = 4;
+pub const SCHEMA_VERSION: u16 = 6;
 
 /// 1-based foreign key into a store table body. Zero means null / absent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -142,6 +146,7 @@ pub enum TableKind {
     Tx = 3,
     Input = 4,
     Output = 5,
+    /// Legacy id (v4 point multimap); new stores use [`TableKind::Spender`].
     Point = 6,
     StrongTx = 7,
     Confirmed = 8,
@@ -151,6 +156,8 @@ pub enum TableKind {
     ScriptHash = 11,
     /// Class C: tx_fk-1 → create height+1 (0 = unset). Maturity without UTXO.
     TxHeight = 12,
+    /// Multi-spender list nodes (16 B: spending_tx_fk | next).
+    Spender = 13,
 }
 
 impl TableKind {
@@ -168,6 +175,7 @@ impl TableKind {
             10 => Some(TableKind::HashHead),
             11 => Some(TableKind::ScriptHash),
             12 => Some(TableKind::TxHeight),
+            13 => Some(TableKind::Spender),
             _ => None,
         }
     }

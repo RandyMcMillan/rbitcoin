@@ -604,8 +604,9 @@ impl Query {
     }
 
     /// Durable point (spend-edge) count (for backfill heuristics / logs).
+    /// Multi-list node count only (v5 sole spends do not allocate body rows).
     pub fn point_edge_count(&self) -> u64 {
-        self.store.points.edge_count()
+        self.store.spender_list_count()
     }
 
     /// Write durable point edges for every confirmed non-coinbase input.

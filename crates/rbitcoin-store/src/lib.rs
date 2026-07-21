@@ -14,6 +14,7 @@ mod ibd_io_policy;
 mod hashhead;
 mod header_table;
 mod point_table;
+mod spender_table;
 mod scripthash;
 mod scripthash_head;
 mod scripthash_layout;

@@ -870,10 +870,7 @@ mod tests {
     }
 
     fn out(v: i64) -> OutputRecord {
-        OutputRecord {
-            value: v,
-            script: vec![0x51],
-        }
+        OutputRecord::unspent(v, vec![0x51])
     }
 
     #[test]

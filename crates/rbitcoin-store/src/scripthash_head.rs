@@ -1,13 +1,15 @@
-//! Open-addressed head for hybrid scripthash: key[32] → value[32] (64 B slots).
+//! Open-addressed head for hybrid scripthash: key[16] → value[16] (32 B slots).
 //!
-//! Same linear-probe / rehash policy as [`crate::hashhead::HashHead`], but values
-//! are full [`ShHeadValue`] encodings rather than a single `Fk`. No write-behind
-//! overlay (SH confirm path uses direct paced inserts).
+//! Key is the first 16 bytes of Electrum SHA256(spk). Public APIs take full 32 B
+//! hashes and truncate. Values are [`ShHeadValue`] encodings (two u64s).
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::hashhead::{initial_slots_for, HeadRole, HeadScale};
-use crate::scripthash_layout::{ShHeadValue, SH_HEAD_SLOT_SIZE, SH_HEAD_VALUE_LEN};
+use crate::scripthash_layout::{
+    head_key_from_full, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN, SH_HEAD_SLOT_SIZE,
+    SH_HEAD_VALUE_LEN,
+};
 use crate::sharded_hashhead::{initial_slots_per_shard, shard_count_for_role};
 use rbitcoin_primitives::TableKind;
 use std::collections::BTreeMap;
@@ -18,7 +20,7 @@ use std::time::Instant;
 const DEFAULT_SLOTS: u64 = 64;
 const MAX_LOAD_NUM: u64 = 7;
 const MAX_LOAD_DEN: u64 = 8;
-const SLOTS_PER_CHUNK: u64 = 64; // 64 × 64 B = 4 KiB
+const SLOTS_PER_CHUNK: u64 = 128; // 128 × 32 B = 4 KiB
 const CHUNK_CACHE_MAX: usize = 256;
 
 pub struct ScriptHashHead {
@@ -32,10 +34,7 @@ struct HashState {
 }
 
 impl ScriptHashHead {
-    pub fn create_with_slots(
-        path: impl Into<PathBuf>,
-        slots: u64,
-    ) -> Result<Self, StoreError> {
+    pub fn create_with_slots(path: impl Into<PathBuf>, slots: u64) -> Result<Self, StoreError> {
         let slots = slots.max(2).next_power_of_two();
         let file = TableFile::create(path, TableKind::HashHead)?;
         let body_bytes = SH_HEAD_SLOT_SIZE as u64 * slots;
@@ -64,7 +63,9 @@ impl ScriptHashHead {
         }
         let slots = body / SH_HEAD_SLOT_SIZE as u64;
         if !slots.is_power_of_two() {
-            return Err(StoreError::Corrupt("scripthash head slots not power of two"));
+            return Err(StoreError::Corrupt(
+                "scripthash head slots not power of two",
+            ));
         }
         let mut occupied = 0u64;
         let mut buf = vec![0u8; SH_HEAD_SLOT_SIZE * 1024];
@@ -76,9 +77,11 @@ impl ScriptHashHead {
             file.read_at(off, &mut buf[..bytes])?;
             for i in 0..n {
                 let base = i * SH_HEAD_SLOT_SIZE;
-                let k: [u8; 32] = buf[base..base + 32].try_into().unwrap();
-                let v: [u8; SH_HEAD_VALUE_LEN] =
-                    buf[base + 32..base + SH_HEAD_SLOT_SIZE].try_into().unwrap();
+                let k: ShHeadKey = buf[base..base + SH_HEAD_KEY_LEN].try_into().unwrap();
+                let v: [u8; SH_HEAD_VALUE_LEN] = buf
+                    [base + SH_HEAD_KEY_LEN..base + SH_HEAD_SLOT_SIZE]
+                    .try_into()
+                    .unwrap();
                 if !is_empty_slot(&k, &v) {
                     occupied += 1;
                 }
@@ -91,7 +94,7 @@ impl ScriptHashHead {
         })
     }
 
-    fn hash_slot(key: &[u8; 32], slots: u64) -> u64 {
+    fn hash_slot(key: &ShHeadKey, slots: u64) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
         for b in key {
             h ^= u64::from(*b);
@@ -104,15 +107,20 @@ impl ScriptHashHead {
         FILE_HEADER_LEN as u64 + slot * SH_HEAD_SLOT_SIZE as u64
     }
 
-    pub fn get(&self, key: &[u8; 32]) -> Result<Option<ShHeadValue>, StoreError> {
+    fn to_key(full: &[u8; 32]) -> ShHeadKey {
+        head_key_from_full(full)
+    }
+
+    pub fn get(&self, full: &[u8; 32]) -> Result<Option<ShHeadValue>, StoreError> {
+        let key = Self::to_key(full);
         let slots = self.state.lock().unwrap().slots;
-        let mut slot = Self::hash_slot(key, slots);
+        let mut slot = Self::hash_slot(&key, slots);
         for _ in 0..slots {
             let (k, v) = self.read_slot(slot)?;
             if is_empty_slot(&k, &v) {
                 return Ok(None);
             }
-            if &k == key {
+            if k == key {
                 let val = ShHeadValue::decode(&v)?;
                 if val.is_empty() {
                     return Ok(None);
@@ -124,31 +132,32 @@ impl ScriptHashHead {
         Ok(None)
     }
 
-    fn read_slot(&self, slot: u64) -> Result<([u8; 32], [u8; SH_HEAD_VALUE_LEN]), StoreError> {
+    fn read_slot(&self, slot: u64) -> Result<(ShHeadKey, [u8; SH_HEAD_VALUE_LEN]), StoreError> {
         let mut buf = [0u8; SH_HEAD_SLOT_SIZE];
         self.file.read_at(Self::slot_file_off(slot), &mut buf)?;
-        let k: [u8; 32] = buf[0..32].try_into().unwrap();
-        let v: [u8; SH_HEAD_VALUE_LEN] = buf[32..SH_HEAD_SLOT_SIZE].try_into().unwrap();
+        let k: ShHeadKey = buf[0..SH_HEAD_KEY_LEN].try_into().unwrap();
+        let v: [u8; SH_HEAD_VALUE_LEN] =
+            buf[SH_HEAD_KEY_LEN..SH_HEAD_SLOT_SIZE].try_into().unwrap();
         Ok((k, v))
     }
 
-    pub fn insert(&self, key: &[u8; 32], value: &ShHeadValue) -> Result<(), StoreError> {
-        self.insert_many(&[(*key, value.clone())])
+    pub fn insert(&self, full: &[u8; 32], value: &ShHeadValue) -> Result<(), StoreError> {
+        self.insert_many(&[(*full, value.clone())])
     }
 
-    /// Remove creates for `key` (soft-clear value; keeps probe chain).
-    pub fn clear_key(&self, key: &[u8; 32]) -> Result<bool, StoreError> {
+    /// Soft-clear value; keeps probe chain.
+    pub fn clear_key(&self, full: &[u8; 32]) -> Result<bool, StoreError> {
+        let key = Self::to_key(full);
         let slots = self.state.lock().unwrap().slots;
-        let mut slot = Self::hash_slot(key, slots);
+        let mut slot = Self::hash_slot(&key, slots);
         for _ in 0..slots {
             let (k, v) = self.read_slot(slot)?;
             if is_empty_slot(&k, &v) {
                 return Ok(false);
             }
-            if &k == key {
-                // Soft-delete: keep key, zero value so probe chains stay valid.
+            if k == key {
                 let mut buf = [0u8; SH_HEAD_SLOT_SIZE];
-                buf[0..32].copy_from_slice(key);
+                buf[0..SH_HEAD_KEY_LEN].copy_from_slice(&key);
                 self.file.write_at(Self::slot_file_off(slot), &buf)?;
                 return Ok(true);
             }
@@ -161,13 +170,13 @@ impl ScriptHashHead {
         if entries.is_empty() {
             return Ok(());
         }
-        // Filter empties → clear_key instead
-        let mut upserts = Vec::with_capacity(entries.len());
-        for (k, v) in entries {
+        let mut upserts: Vec<(ShHeadKey, ShHeadValue)> = Vec::with_capacity(entries.len());
+        for (full, v) in entries {
+            let key = Self::to_key(full);
             if v.is_empty() {
-                self.clear_key(k)?;
+                self.clear_key(full)?;
             } else {
-                upserts.push((*k, v.clone()));
+                upserts.push((key, v.clone()));
             }
         }
         if upserts.is_empty() {
@@ -223,8 +232,7 @@ impl ScriptHashHead {
         Ok(())
     }
 
-    /// Cold first load: build open-addressing table in RAM, one sequential write.
-    fn bulk_fill_empty(&self, entries: &[([u8; 32], ShHeadValue)]) -> Result<(), StoreError> {
+    fn bulk_fill_empty(&self, entries: &[(ShHeadKey, ShHeadValue)]) -> Result<(), StoreError> {
         debug_assert_eq!(self.state.lock().unwrap().occupied, 0);
         let slots = self.state.lock().unwrap().slots;
         let nbytes = (slots as usize).saturating_mul(SH_HEAD_SLOT_SIZE);
@@ -236,18 +244,20 @@ impl ScriptHashHead {
             let mut placed = false;
             for _ in 0..slots {
                 let off = (slot as usize) * SH_HEAD_SLOT_SIZE;
-                let slot_key: [u8; 32] = table[off..off + 32].try_into().unwrap();
-                let slot_v: [u8; SH_HEAD_VALUE_LEN] =
-                    table[off + 32..off + SH_HEAD_SLOT_SIZE].try_into().unwrap();
+                let slot_key: ShHeadKey = table[off..off + SH_HEAD_KEY_LEN].try_into().unwrap();
+                let slot_v: [u8; SH_HEAD_VALUE_LEN] = table
+                    [off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE]
+                    .try_into()
+                    .unwrap();
                 if is_empty_slot(&slot_key, &slot_v) {
-                    table[off..off + 32].copy_from_slice(key);
-                    table[off + 32..off + SH_HEAD_SLOT_SIZE].copy_from_slice(&enc);
+                    table[off..off + SH_HEAD_KEY_LEN].copy_from_slice(key);
+                    table[off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE].copy_from_slice(&enc);
                     occupied = occupied.saturating_add(1);
                     placed = true;
                     break;
                 }
                 if &slot_key == key {
-                    table[off + 32..off + SH_HEAD_SLOT_SIZE].copy_from_slice(&enc);
+                    table[off + SH_HEAD_KEY_LEN..off + SH_HEAD_SLOT_SIZE].copy_from_slice(&enc);
                     placed = true;
                     break;
                 }
@@ -300,7 +310,7 @@ impl ScriptHashHead {
         let new_bytes = SH_HEAD_SLOT_SIZE as u64 * new_slots;
         let t0 = Instant::now();
 
-        let mut entries: Vec<([u8; 32], [u8; SH_HEAD_VALUE_LEN])> = Vec::new();
+        let mut entries: Vec<(ShHeadKey, [u8; SH_HEAD_VALUE_LEN])> = Vec::new();
         entries
             .try_reserve_exact(occupied as usize)
             .map_err(|_| StoreError::Corrupt("scripthash head rehash OOM"))?;
@@ -313,9 +323,11 @@ impl ScriptHashHead {
             self.file.read_at(off, &mut buf[..bytes])?;
             for i in 0..n {
                 let base = i * SH_HEAD_SLOT_SIZE;
-                let k: [u8; 32] = buf[base..base + 32].try_into().unwrap();
-                let v: [u8; SH_HEAD_VALUE_LEN] =
-                    buf[base + 32..base + SH_HEAD_SLOT_SIZE].try_into().unwrap();
+                let k: ShHeadKey = buf[base..base + SH_HEAD_KEY_LEN].try_into().unwrap();
+                let v: [u8; SH_HEAD_VALUE_LEN] = buf
+                    [base + SH_HEAD_KEY_LEN..base + SH_HEAD_SLOT_SIZE]
+                    .try_into()
+                    .unwrap();
                 if !is_empty_slot(&k, &v) {
                     entries.push((k, v));
                 }
@@ -358,7 +370,7 @@ impl ScriptHashHead {
         Ok(())
     }
 
-    /// Visit every occupied non-empty head value.
+    /// Visit every occupied non-empty head value (key is zero-padded to 32 B for API).
     pub fn for_each_occupied(
         &self,
         mut f: impl FnMut([u8; 32], ShHeadValue) -> Result<(), StoreError>,
@@ -373,15 +385,19 @@ impl ScriptHashHead {
             self.file.read_at(off, &mut buf[..bytes])?;
             for i in 0..n {
                 let base = i * SH_HEAD_SLOT_SIZE;
-                let k: [u8; 32] = buf[base..base + 32].try_into().unwrap();
-                let v: [u8; SH_HEAD_VALUE_LEN] =
-                    buf[base + 32..base + SH_HEAD_SLOT_SIZE].try_into().unwrap();
+                let k: ShHeadKey = buf[base..base + SH_HEAD_KEY_LEN].try_into().unwrap();
+                let v: [u8; SH_HEAD_VALUE_LEN] = buf
+                    [base + SH_HEAD_KEY_LEN..base + SH_HEAD_SLOT_SIZE]
+                    .try_into()
+                    .unwrap();
                 if is_empty_slot(&k, &v) {
                     continue;
                 }
                 let val = ShHeadValue::decode(&v)?;
                 if !val.is_empty() {
-                    f(k, val)?;
+                    let mut full = [0u8; 32];
+                    full[0..SH_HEAD_KEY_LEN].copy_from_slice(&k);
+                    f(full, val)?;
                 }
             }
             slot += n as u64;
@@ -398,12 +414,11 @@ impl ScriptHashHead {
     }
 }
 
-fn is_empty_slot(k: &[u8; 32], v: &[u8; SH_HEAD_VALUE_LEN]) -> bool {
-    *k == [0u8; 32] && *v == [0u8; SH_HEAD_VALUE_LEN]
+fn is_empty_slot(k: &ShHeadKey, v: &[u8; SH_HEAD_VALUE_LEN]) -> bool {
+    *k == [0u8; SH_HEAD_KEY_LEN] && *v == [0u8; SH_HEAD_VALUE_LEN]
 }
 
 enum InsertResult {
-    /// `true` if the slot was previously empty (new key).
     Done(bool),
     NeedRehash,
 }
@@ -431,7 +446,7 @@ impl<'a> SlotPageCache<'a> {
 
     fn try_insert(
         &mut self,
-        key: &[u8; 32],
+        key: &ShHeadKey,
         value: &[u8; SH_HEAD_VALUE_LEN],
     ) -> Result<InsertResult, StoreError> {
         let mut slot = ScriptHashHead::hash_slot(key, self.slots);
@@ -450,14 +465,11 @@ impl<'a> SlotPageCache<'a> {
         Ok(InsertResult::NeedRehash)
     }
 
-    fn read_slot(
-        &mut self,
-        slot: u64,
-    ) -> Result<([u8; 32], [u8; SH_HEAD_VALUE_LEN]), StoreError> {
+    fn read_slot(&mut self, slot: u64) -> Result<(ShHeadKey, [u8; SH_HEAD_VALUE_LEN]), StoreError> {
         let chunk = self.ensure_chunk(slot)?;
         let rel = ((slot - chunk.base_slot) as usize) * SH_HEAD_SLOT_SIZE;
-        let k: [u8; 32] = chunk.data[rel..rel + 32].try_into().unwrap();
-        let v: [u8; SH_HEAD_VALUE_LEN] = chunk.data[rel + 32..rel + SH_HEAD_SLOT_SIZE]
+        let k: ShHeadKey = chunk.data[rel..rel + SH_HEAD_KEY_LEN].try_into().unwrap();
+        let v: [u8; SH_HEAD_VALUE_LEN] = chunk.data[rel + SH_HEAD_KEY_LEN..rel + SH_HEAD_SLOT_SIZE]
             .try_into()
             .unwrap();
         Ok((k, v))
@@ -466,13 +478,13 @@ impl<'a> SlotPageCache<'a> {
     fn write_slot(
         &mut self,
         slot: u64,
-        key: &[u8; 32],
+        key: &ShHeadKey,
         value: &[u8; SH_HEAD_VALUE_LEN],
     ) -> Result<(), StoreError> {
         let chunk = self.ensure_chunk(slot)?;
         let rel = ((slot - chunk.base_slot) as usize) * SH_HEAD_SLOT_SIZE;
-        chunk.data[rel..rel + 32].copy_from_slice(key);
-        chunk.data[rel + 32..rel + SH_HEAD_SLOT_SIZE].copy_from_slice(value);
+        chunk.data[rel..rel + SH_HEAD_KEY_LEN].copy_from_slice(key);
+        chunk.data[rel + SH_HEAD_KEY_LEN..rel + SH_HEAD_SLOT_SIZE].copy_from_slice(value);
         chunk.dirty = true;
         Ok(())
     }
@@ -556,7 +568,7 @@ impl ShardedScriptHashHead {
             let shard_path = path.join(format!("{i:02x}"));
             shards.push(ScriptHashHead::create_with_slots(shard_path, per)?);
         }
-        let _ = HeadScale::from_env(); // ensure env resolved for tests
+        let _ = HeadScale::from_env();
         let _ = initial_slots_for(HeadRole::ScriptHash);
         Ok(Self { shards })
     }
@@ -598,12 +610,12 @@ impl ShardedScriptHashHead {
     }
 
     #[inline]
-    fn shard_of(&self, key: &[u8; 32]) -> usize {
+    fn shard_of(&self, full: &[u8; 32]) -> usize {
         let n = self.shards.len();
         if n == 1 {
             0
         } else {
-            (key[0] as usize) % n
+            (full[0] as usize) % n
         }
     }
 
@@ -643,7 +655,6 @@ impl ShardedScriptHashHead {
         self.insert_many(entries)
     }
 
-    /// Pre-size shards for a following bulk head insert (run materialize).
     pub fn reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
         if additional == 0 {
             return Ok(());
@@ -687,27 +698,24 @@ mod tests {
     use crate::scripthash_layout::ShEntry;
     use rbitcoin_primitives::Fk;
 
-    fn tmp() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "rbitcoin-shh-{}-{}",
+    #[test]
+    fn head_insert_get_clear() {
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-shhead-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ))
-    }
-
-    #[test]
-    fn head_insert_get_clear() {
-        let path = tmp();
+        ));
+        let _ = std::fs::remove_file(&path);
         let h = ScriptHashHead::create_with_slots(&path, 64).unwrap();
         let mut key = [0u8; 32];
         key[0] = 7;
-        let v = ShHeadValue::inline_one(ShEntry::new(Fk(9), 1));
-        h.insert(&key, &v).unwrap();
-        assert_eq!(h.get(&key).unwrap().unwrap(), v);
-        h.clear_key(&key).unwrap();
+        let val = ShHeadValue::inline_one(ShEntry::new(Fk(42)));
+        h.insert(&key, &val).unwrap();
+        assert_eq!(h.get(&key).unwrap().unwrap(), val);
+        assert!(h.clear_key(&key).unwrap());
         assert!(h.get(&key).unwrap().is_none());
         let _ = std::fs::remove_file(&path);
     }

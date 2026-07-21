@@ -21,11 +21,13 @@ On open, `repair_class_c_above_tip` clears strong/height **above** tip (tip-rela
 - Append-oriented; re-archive is **idempotent** when `header_txs` already present.
 - Kill mid-archive without a complete body association ⇒ not treated as archived; re-getdata.
 
-## Points (spend multimap)
+## Spends (v5: annotation on create outputs)
 
-- Edges may exist for non-strong (archive-ahead) spenders.
-- Best-chain spentness: edge + `is_confirmed_strong(spender)`.
-- Kill-safe: extra edges do not false-positive if filter is applied.
+- Sole spender: `output.spender_field = spending_tx_fk`. Multi: `MULTI_SPENDER` + `spenders.body` list.
+- Annotations may remain after disconnect / for non-strong spenders.
+- Best-chain spentness: annotation + `is_confirmed_strong(spender)`.
+- Kill-safe: stale/non-strong fields do not false-positive if filter is applied.
+- No `point.head` (v4 open-hash multimap removed).
 
 ## Thin scripthash (Electrum outpoint pointers)
 

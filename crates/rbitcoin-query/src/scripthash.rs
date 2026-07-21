@@ -1,28 +1,57 @@
 //! Electrum scripthash history / balance / UTXO.
 //!
-//! Index rows are thin create pointers. Spendedness and heights are joined from
-//! Class A, points (`has_confirmed_strong_spender`), and Class C (`tx_height`).
+//! Index rows are create_tx_fk only. Expand to outpoints by loading Class A
+//! outputs and matching SHA256(spk). Spentness/heights from spends + Class C.
 
 use super::*;
+use rbitcoin_store::script_hash;
 
 impl Query {
-    /// Join Class A + tx_height onto a thin create row.
-    fn enrich_scripthash_create(
+    /// Expand one create_tx_fk into thin rows for each output matching `scripthash`.
+    fn expand_create_to_records(
         &self,
-        mut rec: ScriptHashRecord,
-    ) -> Result<ScriptHashRecord, QueryError> {
-        let create = self.store.get_tx(rec.create_tx_fk)?;
-        rec.txid = create.txid;
-        if rec.vout < create.output_count {
-            // Create fk is authoritative (packed body works without `tx.head`).
-            if let Ok(out) = self.tx_output_at_fk(rec.create_tx_fk, &create, rec.vout) {
-                rec.value = out.value;
+        scripthash: &[u8; 32],
+        create_tx_fk: rbitcoin_primitives::Fk,
+    ) -> Result<Vec<ScriptHashRecord>, QueryError> {
+        let create = self.store.get_tx(create_tx_fk)?;
+        let outs = if create.output_count == 0 {
+            Vec::new()
+        } else {
+            self.store.get_tx_meta_and_outputs(create_tx_fk)?.1
+        };
+        let height = self.store.tx_height.get(create_tx_fk)?.unwrap_or(0);
+        let mut out = Vec::new();
+        for (vout, o) in outs.into_iter().enumerate() {
+            if script_hash(&o.script) != *scripthash {
+                continue;
             }
+            out.push(ScriptHashRecord {
+                scripthash: *scripthash,
+                create_tx_fk,
+                vout: vout as u32,
+                next: rbitcoin_primitives::Fk::NULL,
+                txid: create.txid,
+                value: o.value,
+                create_height: height,
+            });
         }
-        if let Some(h) = self.store.tx_height.get(rec.create_tx_fk)? {
-            rec.create_height = h;
+        Ok(out)
+    }
+
+    /// All confirmed-strong create outpoints for a scripthash (expanded).
+    fn scripthash_create_outpoints(
+        &self,
+        scripthash: &[u8; 32],
+    ) -> Result<Vec<ScriptHashRecord>, QueryError> {
+        let entries = self.store.scripthash.entries(scripthash)?;
+        let mut out = Vec::new();
+        for (_fk, thin) in entries {
+            if !self.store.is_confirmed_strong(thin.create_tx_fk)? {
+                continue;
+            }
+            out.extend(self.expand_create_to_records(scripthash, thin.create_tx_fk)?);
         }
-        Ok(rec)
+        Ok(out)
     }
 
     /// Confirmed Electrum-style history for a scripthash: (height, txid) pairs.
@@ -30,19 +59,14 @@ impl Query {
         &self,
         scripthash: &[u8; 32],
     ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
-        let entries = self.store.scripthash.entries(scripthash)?;
+        let creates = self.scripthash_create_outpoints(scripthash)?;
         let mut by_txid: BTreeMap<[u8; 32], i64> = BTreeMap::new();
-        for (_fk, thin) in entries {
-            if !self.store.is_confirmed_strong(thin.create_tx_fk)? {
-                continue;
-            }
-            let rec = self.enrich_scripthash_create(thin)?;
+        for rec in creates {
             by_txid
                 .entry(rec.txid)
                 .and_modify(|h| *h = (*h).min(i64::from(rec.create_height)))
                 .or_insert(i64::from(rec.create_height));
 
-            // Spend tx via durable points (confirmed-strong only).
             if self.spend_index_enabled() {
                 let spenders = self.store.spenders(&rec.txid, rec.vout)?;
                 for p in spenders {
@@ -73,11 +97,7 @@ impl Query {
     /// Confirmed balance for a scripthash.
     pub fn scripthash_balance(&self, scripthash: &[u8; 32]) -> Result<ScriptHashBalance, QueryError> {
         let mut confirmed = 0i64;
-        for (_fk, thin) in self.store.scripthash.entries(scripthash)? {
-            if !self.store.is_confirmed_strong(thin.create_tx_fk)? {
-                continue;
-            }
-            let rec = self.enrich_scripthash_create(thin)?;
+        for rec in self.scripthash_create_outpoints(scripthash)? {
             let spent = if self.spend_index_enabled() {
                 self.store
                     .has_confirmed_strong_spender(&rec.txid, rec.vout)?
@@ -100,11 +120,7 @@ impl Query {
         scripthash: &[u8; 32],
     ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
         let mut out = Vec::new();
-        for (_fk, thin) in self.store.scripthash.entries(scripthash)? {
-            if !self.store.is_confirmed_strong(thin.create_tx_fk)? {
-                continue;
-            }
-            let rec = self.enrich_scripthash_create(thin)?;
+        for rec in self.scripthash_create_outpoints(scripthash)? {
             let spent = if self.spend_index_enabled() {
                 self.store
                     .has_confirmed_strong_spender(&rec.txid, rec.vout)?

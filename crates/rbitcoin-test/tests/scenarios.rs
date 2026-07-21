@@ -419,10 +419,7 @@ fn chain_connect_reorg_and_growth() {
                 script_sig: vec![0],
                 witness: vec![],
             }],
-            outputs: vec![OutputRecord {
-                value: 50_0000_0000,
-                script: vec![0x51],
-            }],
+            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
         };
         prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
     }
@@ -1663,12 +1660,11 @@ fn scripthash_reopen_warm_prevents_dup_creates() {
     let mut durable: Vec<ScriptHashRecord> = Vec::new();
     q.store()
         .scripthash
-        .for_each_live_create(|create_tx_fk, vout| {
-            // scripthash unknown from body; only need create_tx_fk+vout for append skip test
+        .for_each_live_create(|create_tx_fk| {
             durable.push(ScriptHashRecord {
                 scripthash: [0u8; 32],
                 create_tx_fk,
-                vout,
+                vout: 0,
                 next: rbitcoin_primitives::Fk::NULL,
                 txid: [0u8; 32],
                 value: 0,
@@ -1688,7 +1684,7 @@ fn scripthash_reopen_warm_prevents_dup_creates() {
     let mut indexed = std::collections::HashSet::new();
     q.store()
         .scripthash
-        .for_each_live_create(|c, _| {
+        .for_each_live_create(|c| {
             indexed.insert(c.0);
         })
         .unwrap();

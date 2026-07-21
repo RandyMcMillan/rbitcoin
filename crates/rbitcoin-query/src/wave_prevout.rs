@@ -175,10 +175,7 @@ mod tests {
     }
 
     fn out(v: i64) -> OutputRecord {
-        OutputRecord {
-            value: v,
-            script: vec![0x51, v as u8],
-        }
+        OutputRecord::unspent(v, vec![0x51, v as u8])
     }
 
     /// Regression: wrong create_fk must not be preferred over wire txid.

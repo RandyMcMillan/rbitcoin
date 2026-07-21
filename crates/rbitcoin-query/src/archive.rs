@@ -92,10 +92,7 @@ impl Query {
         let mut packed: Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> = Vec::new();
         let mut per_header_ranges: Vec<(Fk, Fk, u32)> = Vec::with_capacity(need.len());
         let mut spends: Vec<([u8; 32], u32, Fk, u32)> = Vec::new();
-        // (out_txid, out_idx, spend_fk, in_idx, height) for point runs
-        let mut run_spends: Vec<([u8; 32], u32, Fk, u32, u32)> = Vec::new();
         let spend_on = self.spend_index_enabled();
-        let point_runs = self.point_run_enabled();
         let index_tx = self.tx_index_enabled();
         let tx_runs = self.tx_run_enabled();
 
@@ -103,8 +100,6 @@ impl Query {
             if txs.is_empty() {
                 continue;
             }
-            // Height optional in point runs (0 if unknown); rebuild uses confirmed walk.
-            let hdr_height = 0u32;
             let first_tx_fk = Fk(next_tx);
             let n_txs = txs.len() as u32;
             for ta in txs.drain(..) {
@@ -122,18 +117,9 @@ impl Query {
 
                 let mut inputs = ta.inputs;
                 for (i, inp) in inputs.iter_mut().enumerate() {
-                    if !inp.is_coinbase() {
-                        if spend_on {
-                            spends.push((inp.prev_txid, inp.prev_index, tx_fk, i as u32));
-                        } else if point_runs {
-                            run_spends.push((
-                                inp.prev_txid,
-                                inp.prev_index,
-                                tx_fk,
-                                i as u32,
-                                hdr_height,
-                            ));
-                        }
+                    if !inp.is_coinbase() && spend_on {
+                        // Tip mode: durable spend on output (resolve create via tx.head).
+                        spends.push((inp.prev_txid, inp.prev_index, tx_fk, i as u32));
                     }
                 }
                 packed.push((tx, inputs, ta.outputs));
@@ -171,10 +157,8 @@ impl Query {
         }
 
         if spend_on && !spends.is_empty() {
-            // One body write + batched head inserts (not N× put_spend probes).
+            // Tip: annotate create outputs (tx.head resolve per prevout).
             self.store.put_spend_batch(&spends)?;
-        } else if point_runs && !run_spends.is_empty() {
-            self.enqueue_point_run_edges(&run_spends);
         }
 
         self.store.header_txs.put_ranges_batch(&per_header_ranges)?;

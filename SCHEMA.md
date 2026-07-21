@@ -1,11 +1,15 @@
-# On-disk schema (v4)
+# On-disk schema (v6)
 
 Versioned layouts for the chain store. **Format is unstable until 1.0.** Magic bytes and a schema version live in each file header.
 
-**Schema v4** (current): hybrid scripthash (2-inline head or geometric body slab + size-class freelist). One-time migrate from v3 linked-list SH; other tables stamp schema only. Builds on v3:
+**Schema v6** (current): scripthash head **16 B key prefix** + **16 B value** (32 B slots); body entries are **create_tx_fk only** (8 B). Plus v5 spends.
+
+**Schema v5**: spend annotations on each create **output** (`spender_field:u64` + `MULTI_SPENDER` flag); rare multi-spend lists in `spenders.body` (16 B: spending_tx_fk | next). **No `point.head` open-hash multimap.**
+
+**Schema v4**: hybrid scripthash (2-inline head or geometric body slab + size-class freelist). Builds on v3:
 
 - **Class A inputs always external** `prev_txid[32]` + vout (no on-disk `prev_tx_fk` / local-prev mix)
-- **Thin point** body (spend edge only; outpoint is head key via SHA256)
+- **Thin point** body (spend edge only; outpoint is head key via SHA256) — **removed in v5**
 - **strong_tx bitset** (1 bit per tx_fk vs u64)
 - **Hash heads** rehash at ~7/8 load (was 1/2)
 
@@ -25,7 +29,7 @@ Endianness: **little-endian** for all multi-byte integers.
     tx.body / tx.idx / tx.head   # Class A txs (growable idx + hash head)
     input.body / input.idx       # per-tx input runs (+ BIP141 witness)
     output.body / output.idx     # per-tx output runs
-    point.body / point.head      # Class B spend multimap (thin edges)
+    spenders.body                # multi-spender list nodes only (v5; sole spends on outputs)
     confirmed.body               # Class C: height → header fk
     strong_tx.body               # Class C: bitset, bit (tx_fk-1) = strong
     header_txs_first.body        # header_fk-1 → first_tx_fk (0 = no body)
@@ -127,35 +131,44 @@ Each input:
 
 Catch-up parent resolve uses light UTXO (`outpoint → create Class A fk`) or tip/wave caches — not a Class A `prev_tx_fk` field. Tip mode uses points / `tx.head`.
 
-### Output run (one var record per tx with outputs)
+### Output run (one var record per tx with outputs) — also embedded in packed Class A
 
-flags (empty / OP_TRUE) + uleb128 value + optional CompactSize script.
+```text
+spender_field:u64 LE | flags:u8 | uleb128 value | [script…]
+```
 
-### Point multimap entry (fixed 20)
+| `MULTI_SPENDER` (flags bit 2) | `spender_field` |
+|-------------------------------|-----------------|
+| 0 | 0 = unspent; else sole **spending_tx_fk** |
+| 1 | head fk into `spenders.body` list |
 
-spending_tx_fk u64, spending_input_index u32, next u64.  
-Head key = SHA256(out_txid \|\| vout_le). Outpoint filled from query args when walking spenders.
+Best-chain spentness still requires `is_confirmed_strong(spender)` (leave annotations on reorg).
+
+### Spenders body (multi only, fixed 16)
+
+`spending_tx_fk:u64 | next:u64`. Append-only; used only when an outpoint has ≥2 annotated spenders.
 
 ### Header tx range
 
 `header_txs_first[header_fk-1]` + `header_txs_count[header_fk-1]`. Contiguous assignment required.
 
-### Scripthash (hybrid thin creates — schema v4)
+### Scripthash (hybrid thin creates — schema v6)
 
-Head key = `SHA256(scriptPubKey)`. Body does **not** store the scripthash.
+Head key = first **16 B** of `SHA256(scriptPubKey)` (Electrum hash; wire still 32 B).
 
-**Create entry** = 12 B: `create_tx_fk:u64 | vout:u32` (no `next`).
+**Create entry** = 8 B: `create_tx_fk:u64` only. Vouts expanded at query by loading Class A outputs and matching full SHA256(spk).
 
-**Head slot** = 64 B: `key[32] + value[32]`.
+**Head slot** = **32 B**: `key[16] + value[16]` (two u64s).
 
-| Head mode | When | Value payload |
-|-----------|------|----------------|
-| Inline | 1–2 creates | tag + used + up to two 12 B entries |
-| Slab | ≥3 creates | tag + size class + used + file-absolute slab offset |
+| Head mode | When | Value (`w0`, `w1`) |
+|-----------|------|---------------------|
+| Empty | no creates | 0, 0 |
+| Inline 1–2 | ≤2 create_tx_fks | fk0, fk1 (0 = unused second) |
+| Slab | ≥3 | `w0` high bit set + class/used; `w1` = file-absolute slab_off |
 
-**Body** = RBT1 header + 4 KiB alloc page (`SHAL` magic, live_count, bump, per-class freelist heads) + geometric slabs (cap 4, 8, 16, …). Free slabs embed freelist next in the first 8 bytes. On overflow, promote to next class, copy, free old slab.
+**Body** = RBT1 header + 4 KiB alloc page (`SHAL`) + geometric slabs (cap 4, 8, 16, …; 8 B/entry). Freelist reuses free slabs.
 
-Heights, spend state, txid, and value are still **joined** at query time from Class A / points / Class C. Pre-v4 linked-list SH is not supported (reindex).
+Heights, value, spentness joined at query from Class A / spend annotations / Class C.
 
 ### Archive epoch (`archive_epoch`, 32 bytes)
 

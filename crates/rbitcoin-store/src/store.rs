@@ -2,8 +2,9 @@ use crate::chain::{ConfirmedTable, HeaderTxsTable, StrongTxTable, TxHeightTable}
 use crate::epoch::ArchiveEpoch;
 use crate::error::StoreError;
 use crate::header_table::{HeaderRecord, HeaderTable};
-use crate::point_table::PointTable;
+use crate::point_table::{self, PointRecord};
 use crate::scripthash::ScriptHashTable;
+use crate::spender_table::SpenderTable;
 use crate::tx_table::{InputRecord, InputTable, OutputRecord, OutputTable, TxRecord, TxTable};
 use rbitcoin_primitives::{Fk, Height, SCHEMA_VERSION, STORE_MAGIC};
 use std::fs::OpenOptions;
@@ -18,7 +19,8 @@ pub struct Store {
     pub txs: TxTable,
     pub inputs: InputTable,
     pub outputs: OutputTable,
-    pub points: PointTable,
+    /// Multi-spender list nodes only (sole spends live on create outputs).
+    pub spenders: SpenderTable,
     pub scripthash: ScriptHashTable,
     pub confirmed: ConfirmedTable,
     pub strong_tx: StrongTxTable,
@@ -50,7 +52,7 @@ impl Store {
             txs: TxTable::create(&path)?,
             inputs: InputTable::create(&path)?,
             outputs: OutputTable::create(&path)?,
-            points: PointTable::create(&path)?,
+            spenders: SpenderTable::create(&path)?,
             scripthash: ScriptHashTable::create(&path)?,
             confirmed: ConfirmedTable::create(&path)?,
             strong_tx: StrongTxTable::create(&path)?,
@@ -91,7 +93,7 @@ impl Store {
             txs: TxTable::open(&path)?,
             inputs: InputTable::open(&path)?,
             outputs: OutputTable::open(&path)?,
-            points: PointTable::open(&path)?,
+            spenders: SpenderTable::open(&path)?,
             scripthash,
             confirmed: ConfirmedTable::open(&path)?,
             strong_tx: StrongTxTable::open(&path)?,
@@ -149,18 +151,15 @@ impl Store {
     /// Used by the IBD archive writer so Class A survives unclean restarts without
     /// fsyncing every mega-batch of txs/ins/outs.
     ///
-    /// Also **budget-spills** a few chunks of `point.head` / `tx.head` write-behind
-    /// (not a full multi‑M dump) so head links advance without multi-minute storms.
-    /// Remaining overlay drains via archive interleave + background worker.
+    /// Also **budget-spills** a few chunks of `tx.head` write-behind (not a full
+    /// multi‑M dump). Remaining overlay drains via archive interleave + background.
     pub fn flush_header_archive(&self) -> Result<(), StoreError> {
         self.headers.flush()?;
         self.header_txs.flush()?;
         let chunk = crate::sharded_hashhead::spill_chunk_size();
-        // Cap work: up to 8 chunks each (~800k keys max) with yields between.
         for _ in 0..8 {
-            let a = self.points.spill_head_budget(chunk)?;
             let b = self.txs.spill_head_budget(chunk)?;
-            if a + b == 0 {
+            if b == 0 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -238,62 +237,101 @@ impl Store {
         self.outputs.get_run(run_fk, count)
     }
 
+    /// Annotate create outpoint as spent by `spending_tx_fk` (by create Class A fk).
+    pub fn put_spend_create(
+        &self,
+        create_tx_fk: Fk,
+        out_index: u32,
+        spending_tx_fk: Fk,
+    ) -> Result<(), StoreError> {
+        point_table::put_spend_on_create(
+            &self.txs,
+            &self.outputs,
+            &self.spenders,
+            create_tx_fk,
+            out_index,
+            spending_tx_fk,
+        )
+    }
+
+    /// Resolve `out_txid` via `tx.head`, then [`Self::put_spend_create`].
     pub fn put_spend(
         &self,
         out_txid: &[u8; 32],
         out_index: u32,
         spending_tx_fk: Fk,
-        spending_input_index: u32,
+        _spending_input_index: u32,
     ) -> Result<Fk, StoreError> {
-        self.points
-            .put_spend(out_txid, out_index, spending_tx_fk, spending_input_index)
+        let create_fk = self
+            .txs
+            .get_by_txid(out_txid)?
+            .map(|(fk, _)| fk)
+            .ok_or(StoreError::NotFound)?;
+        self.put_spend_create(create_fk, out_index, spending_tx_fk)?;
+        Ok(spending_tx_fk)
     }
 
-    /// Bulk point append (see [`crate::point_table::PointTable::put_spend_batch`]).
+    /// Bulk annotate by out_txid (resolves each create via `tx.head`).
+    /// Tuple: `(out_txid, vout, spending_tx_fk, input_index_ignored)`.
     pub fn put_spend_batch(
         &self,
         edges: &[([u8; 32], u32, Fk, u32)],
     ) -> Result<Vec<Fk>, StoreError> {
-        self.points.put_spend_batch(edges)
+        let mut out = Vec::with_capacity(edges.len());
+        for &(txid, vout, spend_fk, _) in edges {
+            self.put_spend(&txid, vout, spend_fk, 0)?;
+            out.push(spend_fk);
+        }
+        Ok(out)
     }
 
-    /// Catch-up run materialize: bulk point append without durable head probes.
-    pub fn put_spend_batch_cold(
+    /// Catch-up materialize: edges already have `create_tx_fk`.
+    /// Tuple: `(create_tx_fk, vout, spending_tx_fk)`.
+    pub fn put_spend_batch_by_create(
         &self,
-        edges: &[([u8; 32], u32, Fk, u32)],
-    ) -> Result<Vec<Fk>, StoreError> {
-        self.points.put_spend_batch_cold(edges)
+        edges: &[(Fk, u32, Fk)],
+    ) -> Result<(), StoreError> {
+        // Sort by create for output-run locality.
+        let mut work: Vec<(Fk, u32, Fk)> = edges.to_vec();
+        work.sort_unstable_by_key(|(c, v, _)| (c.0, *v));
+        for (create_fk, vout, spend_fk) in work {
+            self.put_spend_create(create_fk, vout, spend_fk)?;
+        }
+        Ok(())
     }
 
-    /// Buffer `point.head` upserts in RAM (IBD); spill at cap / flush.
-    pub fn enable_point_head_write_behind(&self, max_entries: usize) -> Result<(), StoreError> {
-        self.points.enable_head_write_behind(max_entries)
+    /// No-op: v5 has no point.head write-behind.
+    pub fn enable_point_head_write_behind(&self, _max_entries: usize) -> Result<(), StoreError> {
+        Ok(())
     }
 
     pub fn disable_point_head_write_behind(&self) -> Result<(), StoreError> {
-        self.points.disable_head_write_behind()
+        Ok(())
     }
 
     pub fn spill_point_head(&self) -> Result<(), StoreError> {
-        self.points.spill_head()
+        Ok(())
     }
 
     pub fn spill_point_head_fast(&self) -> Result<(), StoreError> {
-        self.points.spill_head_fast()
+        Ok(())
     }
 
-    pub fn spill_point_head_budget(&self, max_entries: usize) -> Result<usize, StoreError> {
-        self.points.spill_head_budget(max_entries)
+    pub fn spill_point_head_budget(&self, _max_entries: usize) -> Result<usize, StoreError> {
+        Ok(0)
     }
 
     pub fn spill_point_head_step_if_needed(&self) -> Result<usize, StoreError> {
-        self.points.spill_head_step_if_needed()
+        Ok(0)
     }
 
-    /// Defer soft-cap `point.head` spills while confirm is live (connect affinity).
-    /// Clearing defer does not bulk-spill.
-    pub fn set_point_head_defer_spill(&self, defer: bool) -> Result<(), StoreError> {
-        self.points.set_head_defer_spill(defer)
+    pub fn set_point_head_defer_spill(&self, _defer: bool) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// Multi-list node count only (sole spends do not allocate body rows).
+    pub fn spender_list_count(&self) -> u64 {
+        self.spenders.count()
     }
 
     /// Buffer `tx.head` upserts in RAM (optional IBD); spill at cap / flush.
@@ -365,73 +403,78 @@ impl Store {
         }
     }
 
-    /// True if any durable point edge for this outpoint is confirmed-strong.
-    ///
-    /// Early-exits on the first hit; does **not** allocate a spender `Vec`
-    /// (connect double-spend only needs empty / non-empty).
+    /// True if any annotated spender for this outpoint is confirmed-strong.
     pub fn has_confirmed_strong_spender(
         &self,
         out_txid: &[u8; 32],
         out_index: u32,
     ) -> Result<bool, StoreError> {
         let tip = self.confirmed.tip_height().map(|t| t.0);
-        let key = crate::point_table::PointRecord::outpoint_key(out_txid, out_index);
-        self.has_confirmed_strong_spender_key(&key, tip)
-    }
-
-    /// Like [`Self::has_confirmed_strong_spender`] with a precomputed outpoint key
-    /// and tip snapshot — used for wave_fill batch probes sorted by head key.
-    pub fn has_confirmed_strong_spender_key(
-        &self,
-        outpoint_key: &[u8; 32],
-        tip: Option<u32>,
-    ) -> Result<bool, StoreError> {
+        let Some((create_fk, _)) = self.txs.get_by_txid(out_txid)? else {
+            return Ok(false);
+        };
         let mut found = false;
-        self.points
-            .for_each_spender_key(outpoint_key, |spending_tx_fk, _in_idx| {
+        point_table::for_each_spender_create(
+            &self.txs,
+            &self.outputs,
+            &self.spenders,
+            create_fk,
+            out_index,
+            |spending_tx_fk| {
                 if self.is_confirmed_strong_at(spending_tx_fk, tip)? {
                     found = true;
-                    return Ok(false); // stop
+                    return Ok(false);
                 }
                 Ok(true)
-            })?;
+            },
+        )?;
         Ok(found)
     }
 
     /// Spenders whose spending transaction is confirmed-strong on the best tip.
-    ///
-    /// Filters with tip-bound strong checks so a kill mid-Class-C cannot poison
-    /// double-spend checks on restart.
     pub fn spenders(
         &self,
         out_txid: &[u8; 32],
         out_index: u32,
-    ) -> Result<Vec<crate::point_table::PointRecord>, StoreError> {
+    ) -> Result<Vec<PointRecord>, StoreError> {
         let tip = self.confirmed.tip_height().map(|t| t.0);
         let mut out = Vec::new();
-        self.points
-            .for_each_spender(out_txid, out_index, |spending_tx_fk, spending_input_index| {
-                if self.is_confirmed_strong_at(spending_tx_fk, tip)? {
-                    out.push(crate::point_table::PointRecord {
-                        out_txid: *out_txid,
-                        out_index,
-                        spending_tx_fk,
-                        spending_input_index,
-                        next: Fk::NULL,
-                    });
-                }
-                Ok(true)
-            })?;
+        for rec in self.spenders_raw(out_txid, out_index)? {
+            if self.is_confirmed_strong_at(rec.spending_tx_fk, tip)? {
+                out.push(rec);
+            }
+        }
         Ok(out)
     }
 
-    /// All point rows including unconfirmed historical spends (raw multimap).
+    /// All annotated spenders (including non-strong / reorg history).
     pub fn spenders_raw(
         &self,
         out_txid: &[u8; 32],
         out_index: u32,
-    ) -> Result<Vec<crate::point_table::PointRecord>, StoreError> {
-        self.points.spenders(out_txid, out_index)
+    ) -> Result<Vec<PointRecord>, StoreError> {
+        let Some((create_fk, _)) = self.txs.get_by_txid(out_txid)? else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        point_table::for_each_spender_create(
+            &self.txs,
+            &self.outputs,
+            &self.spenders,
+            create_fk,
+            out_index,
+            |spending_tx_fk| {
+                out.push(PointRecord {
+                    out_txid: *out_txid,
+                    out_index,
+                    spending_tx_fk,
+                    spending_input_index: 0,
+                    next: Fk::NULL,
+                });
+                Ok(true)
+            },
+        )?;
+        Ok(out)
     }
 
     /// Clear `strong_tx` + `tx_height` for txs whose height is above the confirmed tip.
@@ -510,7 +553,7 @@ impl Store {
         self.txs.flush()?;
         self.inputs.flush()?;
         self.outputs.flush()?;
-        self.points.flush()?;
+        self.spenders.flush()?;
         self.scripthash.flush()?;
         self.confirmed.flush()?;
         self.strong_tx.flush()?;
@@ -526,7 +569,8 @@ impl Store {
     pub fn flush_index_tables(&self) -> Result<(), StoreError> {
         // Ensure deferred mode is off so these flushes are durable.
         crate::ibd_io_policy::set_defer_durable_flush(false);
-        self.points.flush()?;
+        self.outputs.flush()?;
+        self.spenders.flush()?;
         self.txs.flush()?;
         self.scripthash.flush()?;
         Ok(())
@@ -534,21 +578,16 @@ impl Store {
 
     /// Process-exit flush (IBD / SIGTERM). Target: seconds, not minutes.
     ///
-    /// 1. **Fast** spill of head overlays (single apply each — not 32k chunks).
+    /// 1. **Fast** spill of tx.head overlay (single apply).
     /// 2. Fsync tip / Class C tables only.
     /// 3. MS_ASYNC Class A bodies **without** a second head spill.
-    ///
-    /// Caller must stop the archive writer first so it does not refill overlays
-    /// mid-spill (that caused a second ~3 min point spill on the old path).
     pub fn flush_for_shutdown(&self) -> Result<(), StoreError> {
         crate::file::try_set_io_best_effort();
         let t0 = std::time::Instant::now();
-        let pp = self.points.head_write_behind_len();
         let tp = self.txs.head_write_behind_len();
         rbitcoin_log::info!(
-            "store: shutdown flush — FAST spill heads (point pending≈{pp} tx pending≈{tp})…"
+            "store: shutdown flush — FAST spill heads (tx pending≈{tp})…"
         );
-        self.points.spill_head_fast()?;
         self.txs.spill_head_fast()?;
         rbitcoin_log::info!(
             "store: shutdown flush — fsync tip tables… elapsed={:?}",
@@ -563,12 +602,10 @@ impl Store {
             "store: shutdown flush — async Class A (no re-spill)… elapsed={:?}",
             t0.elapsed()
         );
-        // Bodies only + head files already spilled — never call flush_async on
-        // points/txs (that re-spilled the whole overlay again).
         self.txs.flush_async_no_spill()?;
         self.inputs.flush_async()?;
         self.outputs.flush_async()?;
-        self.points.flush_async_no_spill()?;
+        self.spenders.flush_async()?;
         self.scripthash.flush_async()?;
         rbitcoin_log::info!(
             "store: shutdown flush done elapsed={:?}",

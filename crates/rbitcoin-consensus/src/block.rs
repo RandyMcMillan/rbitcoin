@@ -402,7 +402,8 @@ pub(crate) fn connect_block_prevouts(
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
-        Vec<([u8; 32], u32)>,
+        // Spends: (prev_txid, vout, spending_tx_fk) for UTXO + spend-run enqueue.
+        Vec<([u8; 32], u32, rbitcoin_primitives::Fk)>,
         // Creates for light UTXO apply: (txid, vout, create_fk).
         Vec<([u8; 32], u32, rbitcoin_primitives::Fk)>,
     ),
@@ -438,7 +439,9 @@ pub(crate) fn connect_block_prevouts(
     } else {
         Vec::new()
     };
-    let mut spends: Vec<([u8; 32], u32)> = Vec::with_capacity(n_tx.saturating_mul(2));
+    // (prev_txid, vout, spending_tx_fk) — spend_fk is Class A id of this tx when archived.
+    let mut spends: Vec<([u8; 32], u32, rbitcoin_primitives::Fk)> =
+        Vec::with_capacity(n_tx.saturating_mul(2));
     let mut creates: Vec<([u8; 32], u32, rbitcoin_primitives::Fk)> =
         Vec::with_capacity(n_tx.saturating_mul(2));
     // Coinbase height cache spans the whole block (was recreated per tx).
@@ -554,7 +557,11 @@ pub(crate) fn connect_block_prevouts(
                     }
                 }
                 pending_spent.insert(key);
-                spends.push(key);
+                spends.push((
+                    key.0,
+                    key.1,
+                    spend_fk.unwrap_or(rbitcoin_primitives::Fk::NULL),
+                ));
                 value_in = value_in
                     .checked_add(prev_out.txout.value.to_sat() as i64)
                     .ok_or(ConsensusError::BadTx("value in overflow"))?;

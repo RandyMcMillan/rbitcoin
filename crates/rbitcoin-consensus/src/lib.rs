@@ -250,7 +250,7 @@ pub fn accept_and_connect_block(
             if ti > 0 {
                 for inp in &tx.input {
                     let op = inp.previous_output;
-                    spends.push((op.txid.to_byte_array(), op.vout));
+                    spends.push((op.txid.to_byte_array(), op.vout, create_fk));
                 }
             }
             if query.ibd_utxo_enabled() {

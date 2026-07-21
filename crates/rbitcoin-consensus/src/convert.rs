@@ -86,10 +86,10 @@ fn tx_to_apply(tx: &Transaction, txid: [u8; 32]) -> Result<TxApply, ConsensusErr
     let outputs: Vec<OutputRecord> = tx
         .output
         .iter()
-        .map(|o| OutputRecord {
-            value: o.value.to_sat() as i64,
-            script: o.script_pubkey.to_bytes(),
-        })
+        .map(|o| OutputRecord::unspent(
+            o.value.to_sat() as i64,
+            o.script_pubkey.to_bytes(),
+        ))
         .collect();
 
     Ok(TxApply {

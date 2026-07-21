@@ -98,12 +98,14 @@ pub mod input_flags {
     pub const LOCAL_PREV: u8 = 1 << 4;
 }
 
-/// Output record flags (schema v3).
+/// Output record flags (schema v5).
 pub mod output_flags {
     /// Empty scriptPubKey
     pub const EMPTY_SCRIPT: u8 = 1 << 0;
     /// Script is exactly `OP_TRUE` (0x51) — anyone-can-spend fixture
     pub const OP_TRUE: u8 = 1 << 1;
+    /// `spender_field` is a `spenders.body` list head (not a sole spending_tx_fk).
+    pub const MULTI_SPENDER: u8 = 1 << 2;
 }
 
 #[cfg(test)]

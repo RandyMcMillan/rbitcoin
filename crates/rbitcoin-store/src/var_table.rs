@@ -148,6 +148,19 @@ impl VarTable {
         Ok(buf)
     }
 
+    /// Patch bytes inside an existing record (same length; used for output spender_field).
+    pub fn write_at_record(&self, fk: Fk, rel_off: u64, data: &[u8]) -> Result<(), StoreError> {
+        let id = fk.get().ok_or(StoreError::InvalidFk)?;
+        let count = *self.count.lock().unwrap();
+        let start = self.record_start(id, count)?;
+        let end = self.record_end(id, count)?;
+        let abs = start.saturating_add(rel_off);
+        if abs.saturating_add(data.len() as u64) > end {
+            return Err(StoreError::Corrupt("var write_at_record past end"));
+        }
+        self.body.write_at(abs, data)
+    }
+
     pub fn flush(&self) -> Result<(), StoreError> {
         self.body.flush()?;
         self.idx.flush()?;

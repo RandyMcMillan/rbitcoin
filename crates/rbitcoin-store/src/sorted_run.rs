@@ -359,6 +359,10 @@ fn write_sorted_run_file(
             let _ = dirf.sync_all();
         }
     }
+    // Spill/merge output is durable; drop from page cache so run files (SH can
+    // be multi‑hundred MiB) do not crowd tip/tx.body working set. Next merge or
+    // materialize re-faults. Best-effort — never fails the write.
+    advise_file_dont_need(path);
     Ok(SortedRunPath {
         path: path.to_path_buf(),
         count,
@@ -366,6 +370,33 @@ fn write_sorted_run_file(
         key_len,
         body_crc32,
     })
+}
+
+/// Best-effort whole-file `POSIX_FADV_DONTNEED` (Linux). No-op elsewhere.
+fn advise_file_dont_need(path: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let f = match OpenOptions::new().read(true).open(path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        // offset=0, len=0 ⇒ entire file on Linux.
+        let rc = unsafe {
+            libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED)
+        };
+        if rc != 0 {
+            rbitcoin_log::trace!(
+                "store: sorted-run fadvise(DONTNEED) failed path={}: {}",
+                path.display(),
+                std::io::Error::from_raw_os_error(rc)
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+    }
 }
 
 /// Open and validate a run header + body length (does not re-hash the body).
@@ -842,6 +873,7 @@ mod tests {
 
     #[test]
     fn write_read_roundtrip() {
+        // Also covers post-write fadvise DONTNEED: re-fault on read must succeed.
         let d = tmp_dir();
         let path = d.join("000001.run");
         let mut body = Vec::new();

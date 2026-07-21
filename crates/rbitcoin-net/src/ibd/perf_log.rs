@@ -60,12 +60,12 @@ pub(crate) struct IbdPerfSample {
     pub strong_ms: u64,
     pub sh_ms: u64,
     pub tip_ms: u64,
-    /// Post–Class C light UTXO apply (catch-up only) = probe + flush.
+    /// Post–Class C durable spend annotate wall (logged as `spend=` ms).
     pub utxo_ms: u64,
-    /// Open-address insert/take only (no msync).
-    pub utxo_probe_ms: u64,
-    /// Always 0: light UTXO no longer msyncs on apply.
-    pub utxo_flush_ms: u64,
+    /// Spend annotate path mix: body-range / idx / skipped (null create_fk).
+    pub spend_ranged: u64,
+    pub spend_idx: u64,
+    pub spend_skip: u64,
     /// Formerly unaccounted confirm overhead (ms totals).
     pub resolve_ms: u64,
     pub prewarm_wait_ms: u64,
@@ -83,8 +83,6 @@ pub(crate) struct IbdPerfSample {
     pub sh_ns: u64,
     pub tip_ns: u64,
     pub utxo_apply_ns: u64,
-    pub utxo_probe_ns: u64,
-    pub utxo_flush_ns: u64,
     pub resolve_ns: u64,
     pub prewarm_wait_ns: u64,
     pub unpin_ns: u64,
@@ -184,8 +182,9 @@ impl Default for IbdPerfSample {
             sh_ms: 0,
             tip_ms: 0,
             utxo_ms: 0,
-            utxo_probe_ms: 0,
-            utxo_flush_ms: 0,
+            spend_ranged: 0,
+            spend_idx: 0,
+            spend_skip: 0,
             resolve_ms: 0,
             prewarm_wait_ms: 0,
             unpin_ms: 0,
@@ -201,8 +200,6 @@ impl Default for IbdPerfSample {
             sh_ns: 0,
             tip_ns: 0,
             utxo_apply_ns: 0,
-            utxo_probe_ns: 0,
-            utxo_flush_ns: 0,
             resolve_ns: 0,
             prewarm_wait_ns: 0,
             unpin_ns: 0,
@@ -291,10 +288,11 @@ pub(crate) fn sample(
         prewarm_wait_ns,
         unpin_ns,
         runway_tip_ns,
+        spend_ranged,
+        spend_idx,
+        spend_skip,
     ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
-    // Legacy light-UTXO counters (always 0; kept so phase label stays stable).
-    let (utxo_probe_ns, utxo_flush_ns) =
-        rbitcoin_query::ibd_utxo_stats::sample_probe_flush_and_reset();
+    let _ = rbitcoin_query::ibd_utxo_stats::sample_probe_flush_and_reset();
     let (sh_warm, sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head, sh_index) =
         rbitcoin_query::class_c_phase_stats::sample_sh_sub_and_reset();
     let (wf_body, wf_ptx, wf_pout, wf_spent, wf_cb) =
@@ -351,8 +349,9 @@ pub(crate) fn sample(
         sh_ms: ns_ms(sh_ns),
         tip_ms: ns_ms(tip_ns),
         utxo_ms: ns_ms(utxo_apply_ns),
-        utxo_probe_ms: ns_ms(utxo_probe_ns),
-        utxo_flush_ms: ns_ms(utxo_flush_ns),
+        spend_ranged,
+        spend_idx,
+        spend_skip,
         resolve_ms: ns_ms(resolve_ns),
         prewarm_wait_ms: ns_ms(prewarm_wait_ns),
         unpin_ms: ns_ms(unpin_ns),
@@ -368,8 +367,6 @@ pub(crate) fn sample(
         sh_ns,
         tip_ns,
         utxo_apply_ns,
-        utxo_probe_ns,
-        utxo_flush_ns,
         resolve_ns,
         prewarm_wait_ns,
         unpin_ns,
@@ -432,7 +429,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     );
     // Confirm cost this window (ms totals + block count).
     out.push_str(&format!(
-        " | conf blks={} recon={}ms(p={} w={} wire={}) connect={}ms script={}ms class_c={}ms strong={}ms sh={}ms tip={}ms utxo={}ms(probe={} flush={}) | ovh resolve={}ms pw_wait={}ms unpin={}ms tip_gc={}ms",
+        " | conf blks={} recon={}ms(p={} w={} wire={}) connect={}ms script={}ms class_c={}ms strong={}ms sh={}ms tip={}ms spend={}ms(r={} i={} skip={}) | ovh resolve={}ms pw_wait={}ms unpin={}ms tip_gc={}ms",
         s.phase_blks,
         s.recon_ms,
         s.prefetch_ms,
@@ -445,8 +442,9 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.sh_ms,
         s.tip_ms,
         s.utxo_ms,
-        s.utxo_probe_ms,
-        s.utxo_flush_ms,
+        s.spend_ranged,
+        s.spend_idx,
+        s.spend_skip,
         s.resolve_ms,
         s.prewarm_wait_ms,
         s.unpin_ms,
@@ -475,7 +473,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     };
     let mlock_mb = s.mlock_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | prewarm +{} thru={} parents={} bodies={} plans={}/{} blks={} body_io={} parent_io={} cache%={} {}ms mlock={mlock_mb}MiB ranges={} sh_runs={}",
+        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} blks={} body_io={} parent_io={} cache%={} {}ms mlock={mlock_mb}MiB ranges={} sh_runs={}",
         s.pw_ahead,
         s.pw_ready_through,
         s.pw_parents,
@@ -504,7 +502,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let denom = s.phase_blks.max(1);
     let us = |ns: u64| (ns / denom) / 1000;
     let mut out = format!(
-        "ibd: perf_dbg us/blk recon={} prefetch={} wave={} wire={} connect={} script={} class_c={} strong={} sh={} tip={} utxo={}(probe={} flush={}) | ovh resolve={} pw_wait={} unpin={} tip_gc={}",
+        "ibd: perf_dbg us/blk recon={} prefetch={} wave={} wire={} connect={} script={} class_c={} strong={} sh={} tip={} spend={}(r={} i={} skip={}) | ovh resolve={} pw_wait={} unpin={} tip_gc={}",
         us(s.recon_ns),
         us(s.prefetch_ns),
         us(s.wave_ns),
@@ -516,8 +514,9 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         us(s.sh_ns),
         us(s.tip_ns),
         us(s.utxo_apply_ns),
-        us(s.utxo_probe_ns),
-        us(s.utxo_flush_ns),
+        s.spend_ranged,
+        s.spend_idx,
+        s.spend_skip,
         us(s.resolve_ns),
         us(s.prewarm_wait_ns),
         us(s.unpin_ns),
@@ -545,7 +544,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let cp_tot = s.cp_wave + s.cp_class_a + s.cp_store;
     let mlock_mb = s.mlock_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | prewarm +{} thru={} parents={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} cache_hit={} body_io={} parent_io={} miss_p={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
+        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} cache_hit={} body_io={} parent_io={} miss_p={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
         s.pw_ahead,
         s.pw_ready_through,
         s.pw_parents,
@@ -645,7 +644,7 @@ mod tests {
         assert!(line.contains("conf blks=32"), "{line}");
         assert!(line.contains("recon=100ms"), "{line}");
         assert!(line.contains("class_c=40ms"), "{line}");
-        assert!(line.contains("utxo=25ms(probe=0 flush=0)"), "{line}");
+        assert!(line.contains("spend=25ms(r=0 i=0 skip=0)"), "{line}");
         assert!(line.contains("loop confirm"), "{line}");
         assert!(line.contains("reject=2"), "{line}");
         assert!(line.contains("live h=100 n=32 1500ms"), "{line}");
@@ -666,7 +665,7 @@ mod tests {
         s.sh_runs = 3;
         let line = format_info(&s);
         assert!(line.contains("prewarm +64 thru=200"), "{line}");
-        assert!(line.contains("parents=12 bodies=48 plans=80/256"), "{line}");
+        assert!(line.contains("by_txid=12 bodies=48 plans=80/256"), "{line}");
         assert!(line.contains("body_io=400 parent_io=120"), "{line}");
         assert!(line.contains("mlock=32MiB ranges=12 sh_runs=3"), "{line}");
         assert!(!line.contains("reserved"), "{line}");
@@ -681,8 +680,9 @@ mod tests {
         s.phase_blks = 10;
         s.recon_ns = 10_000_000; // 1ms/blk → 1000 us/blk
         s.utxo_apply_ns = 5_000_000; // 500 us/blk
-        s.utxo_probe_ns = 3_000_000; // 300 us/blk
-        s.utxo_flush_ns = 2_000_000; // 200 us/blk
+        s.spend_ranged = 10;
+        s.spend_idx = 2;
+        s.spend_skip = 0;
         s.wf_spent_ms = 50;
         s.pw_ahead = 64;
         s.pw_ready_through = 200;
@@ -699,7 +699,7 @@ mod tests {
         let line = format_debug(&s);
         assert!(line.starts_with("ibd: perf_dbg "), "{line}");
         assert!(line.contains("us/blk recon="), "{line}");
-        assert!(line.contains("utxo=500(probe=300 flush=200)"), "{line}"); // us/blk
+        assert!(line.contains("spend=500(r=10 i=2 skip=0)"), "{line}"); // us/blk wall
         assert!(line.contains("wave body="), "{line}");
         assert!(line.contains("spent=50"), "{line}");
         assert!(line.contains("prewarm +64 thru=200"), "{line}");

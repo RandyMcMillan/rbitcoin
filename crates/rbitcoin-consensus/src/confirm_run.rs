@@ -464,9 +464,11 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
             u32,
             rbitcoin_primitives::Fk,
         )> = Vec::new();
+        let mut n_skip = 0u64;
         for p in prepared {
             for &(_txid, vout, sfk, cfk) in &p.spends {
                 if sfk.is_null() || cfk.is_null() {
+                    n_skip = n_skip.saturating_add(1);
                     continue;
                 }
                 if let Some((off, len)) = query.confirm_parent_cache().get_body_range(cfk) {
@@ -476,6 +478,11 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
                 }
             }
         }
+        confirm_phase_stats::SPEND_ANNOTATE_RANGED
+            .fetch_add(ranged.len() as u64, Ordering::Relaxed);
+        confirm_phase_stats::SPEND_ANNOTATE_IDX
+            .fetch_add(by_create.len() as u64, Ordering::Relaxed);
+        confirm_phase_stats::SPEND_ANNOTATE_SKIP.fetch_add(n_skip, Ordering::Relaxed);
         if !ranged.is_empty() {
             query
                 .store()

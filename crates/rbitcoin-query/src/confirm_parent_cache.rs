@@ -122,6 +122,14 @@ struct RangeRec {
     end_page: u64, // exclusive page index within this table
 }
 
+/// Runway-scoped txid → create fk (with height for tip GC).
+#[derive(Clone, Copy, Debug)]
+struct TxidEntry {
+    fk: u64,
+    /// Create height or last spend-height that needed this parent.
+    height: u32,
+}
+
 struct Inner {
     depth: u32,
     /// Highest confirmed tip we have pruned to.
@@ -137,8 +145,10 @@ struct Inner {
     by_body: HashMap<u64, BodyEntry>,
     /// Thin edges without a full body parse (mlock prewarm).
     thin_edges: HashMap<u64, Vec<StashedThinInput>>,
-    /// create txid → fk (runway creates + loaded parents; replaces tx.head probes).
-    by_txid: HashMap<[u8; 32], u64>,
+    /// create txid → (fk, runway height). Height is create height or the spend
+    /// height that needed this parent; GC drops entries outside `(tip, tip+depth]`
+    /// unless still held by `by_body` / `by_fk`.
+    by_txid: HashMap<[u8; 32], TxidEntry>,
     /// height → header + tx list (replaces header.head/body + header_txs reads).
     headers: HashMap<u32, HeaderPlanCache>,
     /// hash → height for O(1) header resolve on confirm.
@@ -268,6 +278,7 @@ impl ConfirmParentCache {
             }
         }
         g.gc_orphaned_parents();
+        g.gc_by_txid(tip, max_h);
         let unlocks = g.gc_mlocks(tip, max_h);
         g.recompute_ready_through();
         self.ready_through
@@ -276,13 +287,15 @@ impl ConfirmParentCache {
     }
 
     /// Register a runway create after mlock (txid → fk only; no full body).
+    ///
+    /// `height` is the create height (or the spend height that needed this
+    /// parent). Entries are GC'd on tip advance when outside the runway window.
     pub fn register_mlocked_create(&self, fk: Fk, txid: [u8; 32], height: u32) {
         let Some(id) = fk.get() else {
             return;
         };
         let mut g = self.inner.lock().unwrap();
-        g.by_txid.insert(txid, id);
-        let _ = height;
+        g.insert_by_txid(txid, id, height);
     }
 
     /// Track successful `mlock` ranges for runway height `need_height`.
@@ -712,16 +725,17 @@ impl ConfirmParentCache {
     }
 
     /// Batch-register runway create txids after mlock prewarm.
+    /// Items: `(fk, txid, height)`.
     pub fn register_mlocked_creates_batch(&self, items: &[(Fk, [u8; 32], u32)]) {
         if items.is_empty() {
             return;
         }
         let mut g = self.inner.lock().unwrap();
-        for &(fk, txid, _height) in items {
+        for &(fk, txid, height) in items {
             let Some(id) = fk.get() else {
                 continue;
             };
-            g.by_txid.insert(txid, id);
+            g.insert_by_txid(txid, id, height);
         }
     }
 
@@ -732,7 +746,8 @@ impl ConfirmParentCache {
     pub fn reserve(&self, height: u32, prev_txid: [u8; 32], vout: u32) {
         let mut g = self.inner.lock().unwrap();
         // Already filled from runway create or prior UTXO load?
-        if let Some(&id) = g.by_txid.get(&prev_txid) {
+        if let Some(ent) = g.by_txid.get(&prev_txid).copied() {
+            let id = ent.fk;
             if g.by_fk
                 .get(&id)
                 .is_some_and(|e| e.outs.contains_key(&vout))
@@ -772,7 +787,7 @@ impl ConfirmParentCache {
         };
         let mut g = self.inner.lock().unwrap();
         let txid = tx.txid;
-        g.by_txid.insert(txid, id);
+        g.insert_by_txid(txid, id, create_height);
         {
             let e = g.by_fk.entry(id).or_insert_with(|| ParentEntry {
                 tx: tx.clone(),
@@ -843,7 +858,7 @@ impl ConfirmParentCache {
     /// is checked when confirm full-parses the parent.
     pub fn get_by_txid_if_out(&self, txid: &[u8; 32], vout: u32) -> Option<Fk> {
         let g = self.inner.lock().unwrap();
-        let &id = g.by_txid.get(txid)?;
+        let id = g.by_txid.get(txid)?.fk;
         // Mlock path: by_txid alone is the registration (no parsed outs).
         if g.mlock_n > 0 {
             return Some(Fk(id));
@@ -883,7 +898,7 @@ impl ConfirmParentCache {
             .unwrap()
             .by_txid
             .get(txid)
-            .map(|&id| Fk(id))
+            .map(|e| Fk(e.fk))
     }
 
     /// Sparse external-parent outs only (`by_fk`). Does **not** expand runway
@@ -942,14 +957,19 @@ impl ConfirmParentCache {
         self.inner.lock().unwrap().plans.len()
     }
 
+    /// Sparse external parents in `by_fk` (not every runway create).
     pub fn parent_count(&self) -> usize {
-        let g = self.inner.lock().unwrap();
-        if !g.by_fk.is_empty() {
-            g.by_fk.len()
-        } else {
-            // Approx: half of thin edges are external parents — use by_txid - bodies.
-            g.by_txid.len().saturating_sub(g.by_body.len())
-        }
+        self.inner.lock().unwrap().by_fk.len()
+    }
+
+    /// Runway-scoped `txid → fk` map size (should stay O(depth × txs), not O(chain)).
+    pub fn by_txid_count(&self) -> usize {
+        self.inner.lock().unwrap().by_txid.len()
+    }
+
+    /// Cached body-range entries (idx offsets for mlock/wave).
+    pub fn body_range_count(&self) -> usize {
+        self.inner.lock().unwrap().body_range.len()
     }
 
     pub fn reserved_count(&self) -> usize {
@@ -984,6 +1004,33 @@ impl ConfirmParentCache {
 }
 
 impl Inner {
+    /// Insert or refresh txid → fk; keep max height so parent stays while needed.
+    fn insert_by_txid(&mut self, txid: [u8; 32], fk: u64, height: u32) {
+        match self.by_txid.entry(txid) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let ent = e.get_mut();
+                ent.fk = fk;
+                if height > ent.height {
+                    ent.height = height;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(TxidEntry { fk, height });
+            }
+        }
+    }
+
+    /// Drop `by_txid` entries outside `(tip, max_h]` unless still live elsewhere.
+    fn gc_by_txid(&mut self, tip: u32, max_h: u32) {
+        self.by_txid.retain(|_txid, e| {
+            if e.height > tip && e.height <= max_h {
+                return true;
+            }
+            // Still a live runway body or sparse parent with outs.
+            self.by_body.contains_key(&e.fk) || self.by_fk.contains_key(&e.fk)
+        });
+    }
+
     fn insert_body(
         &mut self,
         id: u64,
@@ -992,7 +1039,7 @@ impl Inner {
         outputs: Vec<OutputRecord>,
         inputs: Vec<InputRecord>,
     ) {
-        self.by_txid.insert(tx.txid, id);
+        self.insert_by_txid(tx.txid, id, height);
         self.by_body.insert(
             id,
             BodyEntry {
@@ -1055,7 +1102,7 @@ impl Inner {
         vout: u32,
         output: OutputRecord,
     ) {
-        self.by_txid.insert(tx.txid, id);
+        self.insert_by_txid(tx.txid, id, height);
         let txid = tx.txid;
         {
             let e = self.by_fk.entry(id).or_insert_with(|| ParentEntry {
@@ -1088,7 +1135,9 @@ impl Inner {
                 let txid = e.tx.txid;
                 self.by_fk.remove(&id);
                 // Keep by_txid if this create is still a live runway body.
-                if !self.by_body.contains_key(&id) && self.by_txid.get(&txid) == Some(&id) {
+                if !self.by_body.contains_key(&id)
+                    && self.by_txid.get(&txid).is_some_and(|ent| ent.fk == id)
+                {
                     self.by_txid.remove(&txid);
                 }
             }
@@ -1172,7 +1221,12 @@ impl Inner {
         }
         for id in drop_ids {
             if let Some(e) = self.by_fk.remove(&id) {
-                if self.by_txid.get(&e.tx.txid) == Some(&id) {
+                if self
+                    .by_txid
+                    .get(&e.tx.txid)
+                    .is_some_and(|ent| ent.fk == id)
+                    && !self.by_body.contains_key(&id)
+                {
                     self.by_txid.remove(&e.tx.txid);
                 }
             }
@@ -1386,5 +1440,43 @@ mod tests {
         assert!(!c.is_ready(1)); // pruned
         assert_eq!(c.plan_count(), 0);
         assert_eq!(c.ready_through(), 1);
+    }
+
+    /// Regression: mlock-path `by_txid` must not grow forever with tip.
+    #[test]
+    fn advance_tip_prunes_by_txid_registrations() {
+        let c = ConfirmParentCache::new(32);
+        c.advance_tip(0);
+        // Simulate prewarm registering many creates along the runway.
+        for h in 1u32..=40 {
+            c.ensure_plan(h, [h as u8; 32]);
+            let t = tx(h as u8);
+            c.register_mlocked_create(Fk(h as u64), t.txid, h);
+            c.mark_scanned(h);
+        }
+        assert!(c.by_txid_count() >= 32, "registered runway creates");
+        // Tip mid-runway: old creates (height ≤ tip) must drop unless still live.
+        c.advance_tip(20);
+        // Entries with height 21..=20+32=52 would stay; we only registered 1..=40
+        // so 21..=40 remain → at most 20.
+        assert!(
+            c.by_txid_count() <= 20,
+            "by_txid leaked: count={}",
+            c.by_txid_count()
+        );
+        // Create at 30 still resolvable (in window).
+        let t30 = tx(30);
+        assert_eq!(c.get_by_txid(&t30.txid), Some(Fk(30)));
+        // Create at 10 is gone (≤ tip).
+        let t10 = tx(10);
+        assert!(c.get_by_txid(&t10.txid).is_none());
+        // Parent needed later bumps height and survives past create tip.
+        let t5 = tx(5);
+        c.register_mlocked_create(Fk(5), t5.txid, 25); // re-need as parent at h=25
+        assert_eq!(c.get_by_txid(&t5.txid), Some(Fk(5)));
+        c.advance_tip(24);
+        assert_eq!(c.get_by_txid(&t5.txid), Some(Fk(5)));
+        c.advance_tip(25);
+        assert!(c.get_by_txid(&t5.txid).is_none());
     }
 }

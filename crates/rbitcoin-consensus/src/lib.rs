@@ -126,8 +126,14 @@ pub mod confirm_phase_stats {
     /// Class C wall (`confirm_blocks_run` total).
     pub static CLASS_C_NS: AtomicU64 = AtomicU64::new(0);
     /// Post–Class C durable spend annotation batch (historical name `utxo_apply`).
-    /// Logged as `utxo_ms` / us/blk `utxo`.
+    /// Logged as `utxo_ms` / us/blk `utxo` (wall for all annotate paths).
     pub static UTXO_APPLY_NS: AtomicU64 = AtomicU64::new(0);
+    /// Annotate edges using prewarmed body range (no idx).
+    pub static SPEND_ANNOTATE_RANGED: AtomicU64 = AtomicU64::new(0);
+    /// Annotate edges with create_fk but no body_range (idx path).
+    pub static SPEND_ANNOTATE_IDX: AtomicU64 = AtomicU64::new(0);
+    /// Spends skipped (null create_fk or null spend_fk).
+    pub static SPEND_ANNOTATE_SKIP: AtomicU64 = AtomicU64::new(0);
     /// Header + body-fk resolve for the batch.
     pub static RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
     /// Last-mile prewarm + wait_ready/headroom on the confirm thread.
@@ -142,12 +148,16 @@ pub mod confirm_phase_stats {
     ///
     /// Returns
     /// `(recon, prefetch, wave_fill, wire, connect, script, class_c, strong, scripthash, tip,
-    ///   utxo_apply, blocks, resolve, prewarm_wait, unpin, runway_tip)`.
+    ///   utxo_apply, blocks, resolve, prewarm_wait, unpin, runway_tip,
+    ///   spend_ranged, spend_idx, spend_skip)`.
     /// `strong` / `scripthash` / `tip` come from [`rbitcoin_query::class_c_phase_stats`]
     /// (sub-phases inside Class C). `recon` is the sum of the three reconstruct sub-timers.
     #[allow(clippy::type_complexity)]
     pub fn sample_and_reset()
     -> (
+        u64,
+        u64,
+        u64,
         u64,
         u64,
         u64,
@@ -196,6 +206,9 @@ pub mod confirm_phase_stats {
             PREWARM_WAIT_NS.swap(0, Ordering::Relaxed),
             UNPIN_NS.swap(0, Ordering::Relaxed),
             RUNWAY_TIP_NS.swap(0, Ordering::Relaxed),
+            SPEND_ANNOTATE_RANGED.swap(0, Ordering::Relaxed),
+            SPEND_ANNOTATE_IDX.swap(0, Ordering::Relaxed),
+            SPEND_ANNOTATE_SKIP.swap(0, Ordering::Relaxed),
         )
     }
 }

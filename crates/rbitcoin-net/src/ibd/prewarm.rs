@@ -77,10 +77,10 @@ pub(crate) fn spawn_parent_prewarm(
                 let runway = ctrl.runway.lock().unwrap().clone();
                 if runway.is_empty() || cursor >= runway.len() {
                     if ever_worked && last_info.elapsed() >= Duration::from_secs(30) {
-                        let (through, ahead, parents, bodies, plans, d) =
+                        let (through, ahead, by_txid, bodies, plans, d) =
                             query.parent_prewarm_perf_snapshot();
                         info!(
-                            "ibd: prewarm idle tip={tip} +{ahead} thru={through} parents={parents} bodies={bodies} plans={plans}/{d} runway={}",
+                            "ibd: prewarm idle tip={tip} +{ahead} thru={through} by_txid={by_txid} bodies={bodies} plans={plans}/{d} runway={}",
                             runway.len()
                         );
                         last_info = std::time::Instant::now();
@@ -124,10 +124,10 @@ pub(crate) fn spawn_parent_prewarm(
                             );
                         }
                         if last_info.elapsed() >= Duration::from_secs(10) {
-                            let (_, _, parents, bodies, plans, d) =
+                            let (_, _, by_txid, bodies, plans, d) =
                                 query.parent_prewarm_perf_snapshot();
                             info!(
-                                "ibd: prewarm tip={tip} +{ahead} thru={through} parents={parents} bodies={bodies} plans={plans}/{d} cursor={cursor}/{} last_h={h0}..{h1} blks={} body_io={} parent_io={} {ms}ms",
+                                "ibd: prewarm tip={tip} +{ahead} thru={through} by_txid={by_txid} bodies={bodies} plans={plans}/{d} cursor={cursor}/{} last_h={h0}..{h1} blks={} body_io={} parent_io={} {ms}ms",
                                 runway.len(),
                                 st.blocks,
                                 st.body_tx_reads,

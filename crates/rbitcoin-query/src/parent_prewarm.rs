@@ -42,7 +42,9 @@ impl Query {
         self.confirm_parents.ready_through()
     }
 
-    /// Snapshot: `(ready_through, ahead, parents, bodies, plans, depth)`.
+    /// Snapshot: `(ready_through, ahead, by_txid, bodies, plans, depth)`.
+    ///
+    /// `by_txid` is the runway txid map size (should stay O(depth), not O(chain)).
     pub fn parent_prewarm_perf_snapshot(&self) -> (u32, u32, usize, usize, usize, u32) {
         let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
         let through = self.confirm_parents.ready_through();
@@ -50,7 +52,7 @@ impl Query {
         (
             through,
             ahead,
-            self.confirm_parents.parent_count(),
+            self.confirm_parents.by_txid_count(),
             self.confirm_parents.body_count(),
             self.confirm_parents.plan_count(),
             self.confirm_parents.depth(),
@@ -199,13 +201,11 @@ impl Query {
             if tx_fks.is_empty() {
                 continue;
             }
-            if self.tx_index_enabled() {
-                if let Some(&first) = tx_fks.first() {
-                    // Ensure first tx is indexable (archive race).
-                    let meta = self.store.get_tx(first)?;
-                    if self.store.txs.get_by_txid(&meta.txid)?.is_none() {
-                        continue;
-                    }
+            // Body readiness: first tx must have an idx range (no tx.head probe).
+            // Direct archive indexes head with bodies; head lag must not skip the height.
+            if let Some(&first) = tx_fks.first() {
+                if self.store.tx_body_range(first).is_err() {
+                    continue;
                 }
             }
 
@@ -222,10 +222,16 @@ impl Query {
 
             st.blocks = st.blocks.saturating_add(1);
 
-            let mut sorted_fks = tx_fks.clone();
-            sorted_fks.sort_unstable_by_key(|f| f.0);
+            // header_txs is almost always ascending fk; avoid clone+sort when so.
+            let fks_work: std::borrow::Cow<'_, [Fk]> = if tx_fks_is_sorted_ascending(&tx_fks) {
+                std::borrow::Cow::Borrowed(tx_fks.as_slice())
+            } else {
+                let mut v = tx_fks.clone();
+                v.sort_unstable_by_key(|f| f.0);
+                std::borrow::Cow::Owned(v)
+            };
 
-            for fk in &sorted_fks {
+            for fk in fks_work.iter() {
                 if self.confirm_cancelled() {
                     crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
                     return Err(StoreError::Corrupt("confirm cancelled"));
@@ -430,4 +436,10 @@ impl Query {
         self.confirm_parents.retire_spends(&resolved);
         Ok(())
     }
+}
+
+/// True when `fks` is empty or non-decreasing by Class A id (archive order).
+#[inline]
+fn tx_fks_is_sorted_ascending(fks: &[Fk]) -> bool {
+    fks.windows(2).all(|w| w[0].0 <= w[1].0)
 }

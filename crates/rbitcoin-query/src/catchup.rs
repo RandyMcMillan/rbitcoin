@@ -6,17 +6,6 @@
 use super::*;
 use std::sync::atomic::Ordering;
 
-/// Result of one hysteresis materialize step (legacy; SH bulk is the real path).
-#[derive(Clone, Debug)]
-pub struct MaterializeRunResult {
-    /// Which index: historically `point` / `tx.head` / `scripthash`.
-    pub store: &'static str,
-    /// Keys / edges applied from that run.
-    pub keys: u64,
-    /// Wall time for claim + apply + remove.
-    pub elapsed: std::time::Duration,
-}
-
 /// Index / spentness mode.
 ///
 /// | Mode | Durable `tx.head` | Durable spends | SH |
@@ -76,8 +65,6 @@ impl Query {
         self.set_index_mode(IndexMode::Direct);
         self.set_spend_index(true);
         self.set_tx_index(true);
-        // SH: enqueue + run merge only; no progressive head mat / peer-fetch pause.
-        crate::run_builder_core::run_materialize_control::set_hysteresis_enabled(false);
         self.sh_run.enable();
         self.drop_legacy_catchup_artifacts()?;
         Ok(())
@@ -130,32 +117,8 @@ impl Query {
         self.sh_run.finalize_and_bulk_materialize(&self.store)
     }
 
-    /// Drive SH run control. Progressive point/tx mat is gone; always force
-    /// fetch mode so peer getdata is never paused for run materialize.
-    pub fn publish_run_materialize_control(
-        &self,
-        arch_lead: u32,
-        archive_at_tip: bool,
-        peer_inflight: u32,
-    ) {
-        use crate::run_builder_core::run_materialize_control as ctl;
-        let was_mat = ctl::in_materialize_mode();
-        ctl::force_fetch_mode(arch_lead, archive_at_tip, peer_inflight);
-        rbitcoin_store::set_defer_durable_flush(false);
-        if was_mat {
-            if let Err(e) = self.store.flush_index_tables() {
-                rbitcoin_log::warn!("store: flush after leaving mat: {e}");
-            }
-        }
-    }
-
-    /// On-disk SH run count (tx/point runs no longer exist). Returns `(0, 0, sh)`.
-    pub fn index_run_counts(&self) -> (usize, usize, usize) {
-        (0, 0, self.sh_run.on_disk_run_count())
-    }
-
-    /// No progressive mat (Direct never mats heads from runs). Always `Ok(None)`.
-    pub fn materialize_one_index_run(&self) -> Result<Option<MaterializeRunResult>, QueryError> {
-        Ok(None)
+    /// On-disk scripthash sorted-run count (Direct IBD runway).
+    pub fn scripthash_run_count(&self) -> usize {
+        self.sh_run.on_disk_run_count()
     }
 }

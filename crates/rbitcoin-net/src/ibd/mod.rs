@@ -479,11 +479,8 @@ pub async fn ibd_cancellable(
         // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
         // When arch RAM budget is full, still densify **tip-near** so confirm has
         // runway (mid-sync was inflight=0 while arch_q sat at cap).
-        // Hysteresis materialize: stop **new** peer fetches (writer keeps draining).
         let arch_bytes = archive_queued.bytes();
-        let scope = if rbitcoin_query::run_materialize_control::should_pause_peer_fetch() {
-            AssignScope::None
-        } else if archive_queued.has_room() {
+        let scope = if archive_queued.has_room() {
             AssignScope::Full
         } else {
             AssignScope::TipNearOnly
@@ -538,9 +535,7 @@ pub async fn ibd_cancellable(
         }
         // Immediate re-top-up after Block events freed st.inflight during confirm.
         let arch_bytes2 = archive_queued.bytes();
-        let scope2 = if rbitcoin_query::run_materialize_control::should_pause_peer_fetch() {
-            AssignScope::None
-        } else if archive_queued.has_room() {
+        let scope2 = if archive_queued.has_room() {
             AssignScope::Full
         } else {
             AssignScope::TipNearOnly
@@ -640,18 +635,6 @@ pub async fn ibd_cancellable(
             }
             hub.query.seed_parent_runway(&items);
             prewarm_ctrl.publish(tip, arch, items);
-            // Lead hysteresis (Catchup only): pause peer fetch to materialize runs.
-            // Direct keeps publishing metrics but never pauses fetch.
-            let arch_lead = arch.saturating_sub(tip);
-            let peer_h = st.max_peer_height;
-            let archive_at_tip = peer_h > 0
-                && arch.saturating_add(2) >= peer_h
-                && arch_lead < 128;
-            hub.query.publish_run_materialize_control(
-                arch_lead,
-                archive_at_tip,
-                st.inflight.len() as u32,
-            );
         }
 
         // Stall only after progress events are applied.
@@ -802,14 +785,10 @@ pub async fn ibd_cancellable(
                 let peers_n = st.slots.iter().filter(|s| s.alive).count();
                 let (pw_through, pw_ahead, _pw_parents, _pw_bodies, _plans, _depth) =
                     hub.query.parent_prewarm_perf_snapshot();
-                let (tx_r, pt_r, sh_r) = hub.query.index_run_counts();
-                let (mat_runs, mat_keys) =
-                    rbitcoin_query::run_materialize_control::sample();
-                let mat_mode = rbitcoin_query::run_materialize_control::mode_label();
-                let pause_fetch =
-                    rbitcoin_query::run_materialize_control::should_pause_peer_fetch();
+                let sh_runs = hub.query.scripthash_run_count();
+                let mlock_mb = hub.query.prewarm_mlock_bytes() / (1024 * 1024);
                 info!(
-                    "ibd: progress {pct}% tip={} ({tip_rate:.0}/s) arch_hwm={} ({arch_rate:.0}/s lead={arch_lead}) hole={} peers={peers_n} prewarm+{pw_ahead} thru={pw_through} runs t={tx_r}/p={pt_r}/sh={sh_r} mat={mat_mode}/pause_fetch={pause_fetch} +runs={mat_runs}/keys={mat_keys} horizon={}",
+                    "ibd: progress {pct}% tip={} ({tip_rate:.0}/s) arch_hwm={} ({arch_rate:.0}/s lead={arch_lead}) hole={} peers={peers_n} prewarm+{pw_ahead} thru={pw_through} mlock={mlock_mb}MiB sh_runs={sh_runs} horizon={}",
                     prog.tip,
                     prog.archived,
                     prog.tip_hole,
@@ -849,6 +828,7 @@ pub async fn ibd_cancellable(
 
             // One sample/reset, then INFO `ibd: perf` (+ DEBUG `ibd: perf_dbg`).
             let prewarm_snap = hub.query.parent_prewarm_perf_snapshot();
+            let (mlock_n, mlock_bytes) = hub.query.prewarm_mlock_stats();
             let perf = perf_log::sample(
                 &loop_stats,
                 &pipe_stats,
@@ -864,8 +844,10 @@ pub async fn ibd_cancellable(
                 prog.tip_hole,
                 peers_n,
                 st.headers_done,
-                (false, 0, None, 0),
                 prewarm_snap,
+                mlock_n,
+                mlock_bytes,
+                hub.query.scripthash_run_count(),
             );
             perf_log::log_sample(&perf);
 

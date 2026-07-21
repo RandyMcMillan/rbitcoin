@@ -767,12 +767,8 @@ impl Store {
         Ok(())
     }
 
-    /// Flush catch-up index tables only (point / tx head / scripthash).
-    ///
-    /// Used when leaving run-materialize mode so deferred msync lands before
-    /// peer fetch/archive resume.
+    /// Flush durable index tables (spenders / tx head / scripthash).
     pub fn flush_index_tables(&self) -> Result<(), StoreError> {
-        // Ensure deferred mode is off so these flushes are durable.
         crate::ibd_io_policy::set_defer_durable_flush(false);
         self.spenders.flush()?;
         self.txs.flush()?;

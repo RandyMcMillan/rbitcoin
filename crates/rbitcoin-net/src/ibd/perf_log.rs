@@ -5,10 +5,10 @@
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
 //! | INFO  | `ibd: perf …` | Download queue, archive pressure, confirm cost, prewarm lead/IO, loop mix |
-//! | DEBUG | `ibd: perf_dbg …` | µs/blk phases, wave/SH subs, caches, pipe, utxo |
+//! | DEBUG | `ibd: perf_dbg …` | µs/blk phases, wave/SH subs, caches, pipe |
 //!
 //! `ibd: progress` (~1s on tip/arch delta) is the operator glance line: tip rate,
-//! archive lead, tip hole, peers, prewarm lead. WARN/ERROR unchanged.
+//! archive lead, tip hole, peers, prewarm lead, mlock RAM. WARN/ERROR unchanged.
 //!
 //! Sample **once** per tick and reset all atomics, then format INFO always and
 //! DEBUG only when enabled — so DEBUG never sees an empty window after INFO.
@@ -90,13 +90,11 @@ pub(crate) struct IbdPerfSample {
     pub unpin_ns: u64,
     pub runway_tip_ns: u64,
 
-    // Light UTXO snapshot (not phase timers)
-    pub utxo_enabled: bool,
-    pub utxo_live: u64,
-    /// mmap UTXO tip height; `None` if empty/disabled.
-    pub utxo_tip: Option<u32>,
-    /// Confirm heals this window (apply failed → full rebuild).
-    pub utxo_rebuilds: u64,
+    /// Confirm prewarm mlocked ranges / unique page RAM.
+    pub mlock_ranges: usize,
+    pub mlock_bytes: u64,
+    /// On-disk scripthash sorted runs waiting for tip bulk.
+    pub sh_runs: usize,
 
     // Wave-fill sub
     pub wf_body_ms: u64,
@@ -209,10 +207,9 @@ impl Default for IbdPerfSample {
             prewarm_wait_ns: 0,
             unpin_ns: 0,
             runway_tip_ns: 0,
-            utxo_enabled: false,
-            utxo_live: 0,
-            utxo_tip: None,
-            utxo_rebuilds: 0,
+            mlock_ranges: 0,
+            mlock_bytes: 0,
+            sh_runs: 0,
             wf_body_ms: 0,
             wf_ptx_ms: 0,
             wf_pout_ms: 0,
@@ -270,10 +267,11 @@ pub(crate) fn sample(
     hole: usize,
     peers: usize,
     headers_done: bool,
-    // (enabled, live, tip, rebuilds) from Query::ibd_utxo_perf_snapshot.
-    utxo: (bool, u64, Option<u32>, u64),
     // (ready_through, ahead, parents, bodies, plans, depth).
     prewarm: (u32, u32, usize, usize, usize, u32),
+    mlock_ranges: usize,
+    mlock_bytes: u64,
+    sh_runs: usize,
 ) -> IbdPerfSample {
     let hot = loop_stats.sample_and_reset();
     let (
@@ -294,6 +292,7 @@ pub(crate) fn sample(
         unpin_ns,
         runway_tip_ns,
     ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
+    // Legacy light-UTXO counters (always 0; kept so phase label stays stable).
     let (utxo_probe_ns, utxo_flush_ns) =
         rbitcoin_query::ibd_utxo_stats::sample_probe_flush_and_reset();
     let (sh_warm, sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head, sh_index) =
@@ -314,7 +313,6 @@ pub(crate) fn sample(
         pw_missing,
     ) = rbitcoin_query::parent_prewarm_stats::sample_and_reset();
     let pipe = pipe_stats.sample_and_reset();
-    let (utxo_enabled, utxo_live, utxo_tip, utxo_rebuilds) = utxo;
     let (pw_ready_through, pw_ahead, pw_parents, pw_bodies, pw_plans, pw_depth) = prewarm;
 
     IbdPerfSample {
@@ -376,10 +374,9 @@ pub(crate) fn sample(
         prewarm_wait_ns,
         unpin_ns,
         runway_tip_ns,
-        utxo_enabled,
-        utxo_live,
-        utxo_tip,
-        utxo_rebuilds,
+        mlock_ranges,
+        mlock_bytes,
+        sh_runs,
         wf_body_ms: ns_ms(wf_body),
         wf_ptx_ms: ns_ms(wf_ptx),
         wf_pout_ms: ns_ms(wf_pout),
@@ -476,8 +473,9 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             0
         }
     };
+    let mlock_mb = s.mlock_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | prewarm +{} thru={} parents={} bodies={} plans={}/{} blks={} body_io={} parent_io={} cache%={} {}ms",
+        " | prewarm +{} thru={} parents={} bodies={} plans={}/{} blks={} body_io={} parent_io={} cache%={} {}ms mlock={mlock_mb}MiB ranges={} sh_runs={}",
         s.pw_ahead,
         s.pw_ready_through,
         s.pw_parents,
@@ -489,6 +487,8 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.pw_parent_tx_reads,
         cache_pct,
         s.pw_ms,
+        s.mlock_ranges,
+        s.sh_runs,
     ));
     if s.pw_missing_parents > 0 {
         out.push_str(&format!(" miss_p={}", s.pw_missing_parents));
@@ -543,8 +543,9 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.sh_index_ms,
     ));
     let cp_tot = s.cp_wave + s.cp_class_a + s.cp_store;
+    let mlock_mb = s.mlock_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | prewarm +{} thru={} parents={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} cache_hit={} body_io={} parent_io={} miss_p={} | connect wave%={} parent%={} store%={}",
+        " | prewarm +{} thru={} parents={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} cache_hit={} body_io={} parent_io={} miss_p={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
         s.pw_ahead,
         s.pw_ready_through,
         s.pw_parents,
@@ -561,6 +562,8 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.pw_body_tx_reads,
         s.pw_parent_tx_reads,
         s.pw_missing_parents,
+        s.mlock_ranges,
+        s.sh_runs,
         if cp_tot > 0 {
             (100 * s.cp_wave) / cp_tot
         } else {
@@ -593,18 +596,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.pipe.write_coalesce_ms(),
         s.pipe.prep_ms(),
     ));
-    if s.utxo_enabled {
-        out.push_str(&format!(
-            " | utxo live={} tip={} rebuilds={}",
-            s.utxo_live,
-            s.utxo_tip
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| "none".into()),
-            s.utxo_rebuilds,
-        ));
-    } else {
-        out.push_str(&format!(" | utxo off rebuilds={}", s.utxo_rebuilds));
-    }
     out.push_str(&format!(
         " | loop confirm_blks={} confirm_us/blk={} reject_stops={} events={} status_scan_ms={}",
         s.confirm_blocks,
@@ -670,12 +661,18 @@ mod tests {
         s.pw_cache_hits = 80;
         s.pw_parent_unique = 20;
         s.pw_ms = 40;
+        s.mlock_bytes = 32 * 1024 * 1024;
+        s.mlock_ranges = 12;
+        s.sh_runs = 3;
         let line = format_info(&s);
         assert!(line.contains("prewarm +64 thru=200"), "{line}");
         assert!(line.contains("parents=12 bodies=48 plans=80/256"), "{line}");
         assert!(line.contains("body_io=400 parent_io=120"), "{line}");
+        assert!(line.contains("mlock=32MiB ranges=12 sh_runs=3"), "{line}");
         assert!(!line.contains("reserved"), "{line}");
         assert!(!line.contains("confirm_phases"), "{line}");
+        assert!(!line.contains("pause_fetch"), "{line}");
+        assert!(!line.contains("mat="), "{line}");
     }
 
     #[test]
@@ -696,10 +693,9 @@ mod tests {
         s.pw_parent_tx_reads = 50;
         s.pipe.write_blocks = 5;
         s.pipe.write_ns = 5_000_000;
-        s.utxo_enabled = true;
-        s.utxo_live = 12_345;
-        s.utxo_tip = Some(100);
-        s.utxo_rebuilds = 0;
+        s.mlock_bytes = 16 * 1024 * 1024;
+        s.mlock_ranges = 4;
+        s.sh_runs = 2;
         let line = format_debug(&s);
         assert!(line.starts_with("ibd: perf_dbg "), "{line}");
         assert!(line.contains("us/blk recon="), "{line}");
@@ -710,9 +706,10 @@ mod tests {
         assert!(line.contains("utxo_p=100"), "{line}");
         assert!(line.contains("creates=50"), "{line}");
         assert!(line.contains("body_io=200 parent_io=50"), "{line}");
+        assert!(line.contains("mlock=16MiB ranges=4 sh_runs=2"), "{line}");
         assert!(!line.contains("reserved"), "{line}");
+        assert!(!line.contains("pause_fetch"), "{line}");
         assert!(line.contains("pipe "), "{line}");
-        assert!(line.contains("utxo live=12345 tip=100 rebuilds=0"), "{line}");
         assert!(line.contains("loop "), "{line}");
     }
 }

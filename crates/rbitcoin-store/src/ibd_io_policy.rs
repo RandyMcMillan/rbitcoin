@@ -1,16 +1,17 @@
-//! Process-wide IBD IO policy: defer costly durable flushes while catch-up runs
-//! are materializing into open-hash heads.
+//! Process-wide IBD IO policy for table flushes.
 //!
-//! When deferred, [`crate::file::TableFile::flush`] updates the in-mmap HWM only
-//! (no `msync` / `fdatasync`). Callers should [`set_defer_durable_flush(false)`]
-//! and flush Class B tables when leaving materialize mode so dirty pages land
-//! before archive/getdata resume.
+//! Historical note: catch-up progressive materialize deferred `msync`/`fdatasync`
+//! while applying runs into open-hash heads. That mode is gone; the flag is kept
+//! so flush paths stay centralized and can be re-armed if needed. Default is
+//! **never defer** (always durable flush).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static DEFER_DURABLE_FLUSH: AtomicBool = AtomicBool::new(false);
 
 /// While true, skip msync/fdatasync in [`crate::file::TableFile::flush`].
+///
+/// Production IBD leaves this false.
 pub fn set_defer_durable_flush(defer: bool) {
     DEFER_DURABLE_FLUSH.store(defer, Ordering::Relaxed);
 }

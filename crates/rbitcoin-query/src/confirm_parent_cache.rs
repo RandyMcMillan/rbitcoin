@@ -333,6 +333,26 @@ impl ConfirmParentCache {
         self.inner.lock().unwrap().mlock_n
     }
 
+    /// Bytes of unique 4 KiB pages currently mlocked for the confirm runway.
+    ///
+    /// Counts distinct `(table, page)` entries under refcount (shared ranges
+    /// across heights count once). Approximate RSS contribution of prewarm pins.
+    pub fn mlock_bytes(&self) -> u64 {
+        const PAGE: u64 = 4096;
+        let g = self.inner.lock().unwrap();
+        (g.page_refs.len() as u64).saturating_mul(PAGE)
+    }
+
+    /// `(range_count, unique_page_bytes)` for prewarm pin diagnostics.
+    pub fn mlock_stats(&self) -> (usize, u64) {
+        const PAGE: u64 = 4096;
+        let g = self.inner.lock().unwrap();
+        (
+            g.mlock_n,
+            (g.page_refs.len() as u64).saturating_mul(PAGE),
+        )
+    }
+
     /// Cache header + tx list for a runway height (small; replaces header mlock).
     pub fn put_header_plan(
         &self,

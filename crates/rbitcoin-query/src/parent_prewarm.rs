@@ -57,6 +57,16 @@ impl Query {
         )
     }
 
+    /// Unique mlocked runway pages in bytes (confirm prewarm pins).
+    pub fn prewarm_mlock_bytes(&self) -> u64 {
+        self.confirm_parents.mlock_bytes()
+    }
+
+    /// `(range_count, unique_page_bytes)` for mlock diagnostics.
+    pub fn prewarm_mlock_stats(&self) -> (usize, u64) {
+        self.confirm_parents.mlock_stats()
+    }
+
     pub fn advance_parent_runway_tip(&self, tip: u32) {
         let unlocks = self.confirm_parents.advance_tip(tip);
         for r in &unlocks {

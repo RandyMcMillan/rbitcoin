@@ -64,9 +64,6 @@ pub(crate) enum AssignScope {
     /// Only tip hole + near band — when archive RAM budget is full so peers are
     /// not left `inflight=0` while confirm crawls on already-archived lag.
     TipNearOnly,
-    /// No new getdata (run-materialize hysteresis): let inflight drain so
-    /// materialize can start; archive writer keeps writing what already arrived.
-    None,
 }
 
 /// Assign getdata for bodies not yet Class A.
@@ -76,7 +73,6 @@ pub(crate) enum AssignScope {
 /// 2. Near band — tip+1‥tip+[`NEAR_DEPTH`] (single peer per hash).
 /// 3. Far — forward densify past near (height-ascending); skipped in
 ///    [`AssignScope::TipNearOnly`].
-/// 4. [`AssignScope::None`] — prune only (no new requests).
 pub(crate) fn assign_work_ordered(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -99,16 +95,6 @@ pub(crate) fn assign_work_ordered(
     }
 
     prune_satisfied_inflight(&mut st.slots, &mut st.inflight, hub);
-
-    if matches!(scope, AssignScope::None) {
-        // Still expire stale pending so limbo getdata cannot block forever.
-        let expired = st.body.expire_stale_pending(PENDING_STALE);
-        for h in expired {
-            clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
-        }
-        finish_assign(loop_stats, t0, issued);
-        return;
-    }
 
     let expired = st.body.expire_stale_pending(PENDING_STALE);
     for h in expired {

@@ -265,7 +265,7 @@ impl TableFile {
     /// Persist HWM to the file header, flush dirty mmap pages, and `sync_data`.
     ///
     /// **Costly on multi‑GiB tables** — prefer rare header-only flushes during IBD.
-    /// When [`crate::ibd_io_policy::defer_durable_flush`] is set (run materialize
+    /// When [`crate::ibd_io_policy::defer_durable_flush`] is set (normally false;
     /// window), only the mmap HWM is updated — no msync/fdatasync.
     pub fn flush(&self) -> Result<(), StoreError> {
         let logical = *self.len.lock().unwrap();

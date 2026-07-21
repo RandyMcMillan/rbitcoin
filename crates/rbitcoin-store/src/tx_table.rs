@@ -605,9 +605,27 @@ impl TxTable {
         self.body.mlock_record(fk)
     }
 
+    /// `mlock` the `tx.idx` slot for `fk`.
+    pub fn mlock_idx(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
+        self.body.mlock_idx_entry(fk)
+    }
+
+    /// `mlock` address-head probe slots for `txid` (until empty / MAX_PROBE).
+    pub fn mlock_head_probe(&self, txid: &[u8; 32]) -> Result<(u64, u64), StoreError> {
+        self.head.mlock_probe(txid)
+    }
+
     /// Best-effort `munlock` for a prior [`Self::mlock_body`] page range.
     pub fn munlock_body_pages(&self, page_start: u64, page_len: u64) {
-        self.body.munlock_pages(page_start, page_len);
+        self.body.munlock_body_pages(page_start, page_len);
+    }
+
+    pub fn munlock_idx_pages(&self, page_start: u64, page_len: u64) {
+        self.body.munlock_idx_pages(page_start, page_len);
+    }
+
+    pub fn munlock_head_pages(&self, page_start: u64, page_len: u64) {
+        self.head.munlock_pages(page_start, page_len);
     }
 
     /// Meta + input prevouts only (no script/witness allocation, no outputs).

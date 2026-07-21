@@ -115,6 +115,24 @@ impl ArrayTable {
         Ok(())
     }
 
+    /// `mlock` pages covering slots `[start_index, start_index + count)`.
+    pub fn mlock_indices(
+        &self,
+        start_index: u64,
+        count: u64,
+    ) -> Result<(u64, u64), StoreError> {
+        if count == 0 {
+            return Ok((0, 0));
+        }
+        let off = Self::offset(start_index);
+        let len = count.saturating_mul(ELEM);
+        self.file.mlock_range(off, len)
+    }
+
+    pub fn munlock_pages(&self, page_start: u64, page_len: u64) {
+        self.file.munlock_range(page_start, page_len);
+    }
+
     pub fn flush(&self) -> Result<(), StoreError> {
         self.file.flush()
     }

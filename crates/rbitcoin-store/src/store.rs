@@ -193,6 +193,184 @@ impl Store {
         self.txs.munlock_body_pages(page_start, page_len);
     }
 
+    /// Best-effort `munlock` for a prior [`crate::MlockRange`].
+    pub fn munlock_range(&self, r: &crate::MlockRange) {
+        if r.is_empty() {
+            return;
+        }
+        use crate::MlockTable::*;
+        match r.table {
+            TxBody => self.txs.munlock_body_pages(r.page_start, r.page_len),
+            TxIdx => self.txs.munlock_idx_pages(r.page_start, r.page_len),
+            TxHead => self.txs.munlock_head_pages(r.page_start, r.page_len),
+            HeaderBody => self.headers.munlock_body_pages(r.page_start, r.page_len),
+            HeaderHead => self.headers.munlock_head_pages(r.page_start, r.page_len),
+            HeaderTxsFirst => self
+                .header_txs
+                .munlock_first_pages(r.page_start, r.page_len),
+            HeaderTxsCount => self
+                .header_txs
+                .munlock_count_pages(r.page_start, r.page_len),
+            Spenders => self.spenders.munlock_pages(r.page_start, r.page_len),
+            StrongTx => self.strong_tx.munlock_pages(r.page_start, r.page_len),
+            TxHeight => self.tx_height.munlock_pages(r.page_start, r.page_len),
+            Confirmed => self.confirmed.munlock_pages(r.page_start, r.page_len),
+        }
+    }
+
+    fn push_mlock(
+        out: &mut Vec<crate::MlockRange>,
+        table: crate::MlockTable,
+        r: Result<(u64, u64), StoreError>,
+    ) {
+        match r {
+            Ok((ps, pl)) if pl > 0 => out.push(crate::MlockRange {
+                table,
+                page_start: ps,
+                page_len: pl,
+            }),
+            Ok(_) => {}
+            Err(e) => {
+                rbitcoin_log::trace!("store: mlock {table:?} failed: {e}");
+            }
+        }
+    }
+
+    /// Pin Class A idx+body for `fk` (wave / wire / spend annotate).
+    pub fn mlock_tx_class_a(&self, fk: Fk) -> Vec<crate::MlockRange> {
+        let mut out = Vec::with_capacity(2);
+        Self::push_mlock(&mut out, crate::MlockTable::TxIdx, self.txs.mlock_idx(fk));
+        Self::push_mlock(&mut out, crate::MlockTable::TxBody, self.txs.mlock_body(fk));
+        out
+    }
+
+    /// Pin `tx.head` probe chain for `txid`.
+    pub fn mlock_tx_head_for(&self, txid: &[u8; 32]) -> Vec<crate::MlockRange> {
+        let mut out = Vec::with_capacity(1);
+        Self::push_mlock(
+            &mut out,
+            crate::MlockTable::TxHead,
+            self.txs.mlock_head_probe(txid),
+        );
+        out
+    }
+
+    /// Pin header head+body for `hash`; returns header fk if found.
+    pub fn mlock_header_for_hash(
+        &self,
+        hash: &[u8; 32],
+    ) -> Result<(Option<(Fk, HeaderRecord)>, Vec<crate::MlockRange>), StoreError> {
+        let (found, raw) = self.headers.mlock_by_hash(hash)?;
+        let mut out = Vec::new();
+        // mlock_by_hash: first range is head, rest body (if any)
+        for (i, (ps, pl)) in raw.into_iter().enumerate() {
+            let table = if i == 0 {
+                crate::MlockTable::HeaderHead
+            } else {
+                crate::MlockTable::HeaderBody
+            };
+            if pl > 0 {
+                out.push(crate::MlockRange {
+                    table,
+                    page_start: ps,
+                    page_len: pl,
+                });
+            }
+        }
+        Ok((found, out))
+    }
+
+    /// Pin header_txs first+count for `header_fk`.
+    pub fn mlock_header_txs_for(&self, header_fk: Fk) -> Vec<crate::MlockRange> {
+        let mut out = Vec::with_capacity(2);
+        match self.header_txs.mlock_header(header_fk) {
+            Ok(((a0, a1), (b0, b1))) => {
+                if a1 > 0 {
+                    out.push(crate::MlockRange {
+                        table: crate::MlockTable::HeaderTxsFirst,
+                        page_start: a0,
+                        page_len: a1,
+                    });
+                }
+                if b1 > 0 {
+                    out.push(crate::MlockRange {
+                        table: crate::MlockTable::HeaderTxsCount,
+                        page_start: b0,
+                        page_len: b1,
+                    });
+                }
+            }
+            Err(e) => rbitcoin_log::trace!("store: mlock header_txs failed: {e}"),
+        }
+        out
+    }
+
+    /// Pin Class C strong bit + height slot for a tx (confirm write + spentness).
+    pub fn mlock_class_c_tx(&self, fk: Fk) -> Vec<crate::MlockRange> {
+        let mut out = Vec::with_capacity(2);
+        Self::push_mlock(
+            &mut out,
+            crate::MlockTable::StrongTx,
+            self.strong_tx.mlock_fk(fk),
+        );
+        Self::push_mlock(
+            &mut out,
+            crate::MlockTable::TxHeight,
+            self.tx_height.mlock_fk(fk),
+        );
+        out
+    }
+
+    /// Pin confirmed[] tip neighborhood for tip advance.
+    pub fn mlock_confirmed_height(&self, height: u32) -> Vec<crate::MlockRange> {
+        let mut out = Vec::with_capacity(1);
+        Self::push_mlock(
+            &mut out,
+            crate::MlockTable::Confirmed,
+            self.confirmed.mlock_height(Height(height)),
+        );
+        out
+    }
+
+    /// Pin spender-list + Class C for durable spentness check on `(create_fk, vout)`.
+    pub fn mlock_spend_oracle(&self, create_fk: Fk, vout: u32) -> Vec<crate::MlockRange> {
+        let mut out = Vec::new();
+        // Body already mlocked separately; still pin spender chain if multi.
+        let (multi, field) = match self.txs.get_output_spender_meta(create_fk, vout) {
+            Ok(m) => m,
+            Err(_) => return out,
+        };
+        if field.is_null() {
+            return out;
+        }
+        if !multi {
+            // Sole spender is a tx fk — pin its Class C bits.
+            out.extend(self.mlock_class_c_tx(field));
+            return out;
+        }
+        let mut cur = Some(field);
+        let mut guard = 0u32;
+        while let Some(fk) = cur {
+            if guard > 64 {
+                break;
+            }
+            guard += 1;
+            Self::push_mlock(
+                &mut out,
+                crate::MlockTable::Spenders,
+                self.spenders.mlock_record(fk),
+            );
+            match self.spenders.get(fk) {
+                Ok((spend_tx, next)) => {
+                    out.extend(self.mlock_class_c_tx(spend_tx));
+                    cur = if next.is_null() { None } else { Some(next) };
+                }
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
     /// Append packed full-tx Class A rows (preferred archive path).
     pub fn put_tx_full_batch_indexed(
         &self,

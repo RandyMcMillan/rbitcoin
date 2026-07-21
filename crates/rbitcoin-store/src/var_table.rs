@@ -86,9 +86,21 @@ impl VarTable {
         self.body.mlock_range(off, len)
     }
 
-    /// Best-effort `munlock` for a prior [`mlock_record`] page range.
-    pub fn munlock_pages(&self, page_start: u64, page_len: u64) {
+    /// `mlock` the `idx` slot for `fk` (8-byte absolute body offset).
+    pub fn mlock_idx_entry(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
+        let id = fk.get().ok_or(StoreError::InvalidFk)?;
+        let off = FILE_HEADER_LEN as u64 + (id - 1) * 8;
+        self.idx.mlock_range(off, 8)
+    }
+
+    /// Best-effort `munlock` for a prior body [`mlock_record`] page range.
+    pub fn munlock_body_pages(&self, page_start: u64, page_len: u64) {
         self.body.munlock_range(page_start, page_len);
+    }
+
+    /// Best-effort `munlock` for a prior [`mlock_idx_entry`] page range.
+    pub fn munlock_idx_pages(&self, page_start: u64, page_len: u64) {
+        self.idx.munlock_range(page_start, page_len);
     }
 
     /// Inspect record bytes without copying into a `Vec`.

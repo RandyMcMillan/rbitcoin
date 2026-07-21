@@ -81,6 +81,16 @@ impl SpenderTable {
         ))
     }
 
+    pub fn mlock_record(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
+        let id = fk.get().ok_or(StoreError::InvalidFk)?;
+        self.body
+            .mlock_range(Self::offset(id), SPENDER_RECORD_LEN as u64)
+    }
+
+    pub fn munlock_pages(&self, page_start: u64, page_len: u64) {
+        self.body.munlock_range(page_start, page_len);
+    }
+
     pub fn flush(&self) -> Result<(), StoreError> {
         self.body.flush()
     }

@@ -1,13 +1,15 @@
-//! Confirm-runway prewarm: **mlock body pages**, minimal input walk for parents.
+//! Confirm-runway prewarm: **mlock every store page confirm will touch**.
 //!
-//! For a batch of heights (ascending):
-//! 1. Resolve header → tx fks; `mlock` each Class A body; scan **prevouts only**
-//!    (no script/witness/output allocation) to discover parent creates.
-//! 2. Resolve external parent fks; `mlock` those parent bodies (no full parse).
-//! 3. Stash thin create-fk edges + `txid → fk` for runway creates; mark scanned.
+//! For each height in the batch (ascending):
+//! 1. `mlock` header head+body, `header_txs` slots, `confirmed[h]`.
+//! 2. For each body tx: `mlock` `tx.idx`+`tx.body`, `tx.head` probe, Class C
+//!    strong/height slots; scan **prevouts only** (no full parse into RAM).
+//! 3. External parents: `mlock` head probe, Class A idx+body, spend-oracle
+//!    (spender list + Class C for annotated spenders).
+//! 4. Stash thin create-fk edges + `txid → fk`; mark scanned.
 //!
-//! Confirm wave/connect **full-parses** from the (now resident) store. This path
-//! exists so confirm wall time is not dominated by page faults on Class A.
+//! Ranges are refcounted and released on tip advance when no runway height still
+//! needs them. Confirm wave/connect full-parses from the resident store.
 
 use super::*;
 use crate::confirm_parent_cache::{prewarm_headroom_from_env, StashedThinInput};
@@ -62,8 +64,8 @@ impl Query {
 
     pub fn advance_parent_runway_tip(&self, tip: u32) {
         let unlocks = self.confirm_parents.advance_tip(tip);
-        for (page_start, page_len) in unlocks {
-            self.store.munlock_tx_body_pages(page_start, page_len);
+        for r in &unlocks {
+            self.store.munlock_range(r);
         }
     }
 
@@ -171,17 +173,34 @@ impl Query {
         }
         self.confirm_parents.ensure_plans(&work);
 
-        // ── Phase 1: resolve header → tx fks, mlock + prevout-scan bodies ────
+        // ── Phase 1: resolve header → tx fks; mlock all tables confirm needs ─
+        // For each height: header head+body, header_txs, tx idx+body, tx.head,
+        // class C slots for runway txs, confirmed[height]. Then prevout-scan.
         let mut height_tx_fks: Vec<(u32, Vec<Fk>)> = Vec::with_capacity(work.len());
-        let mut all_body_fks: Vec<(u32, u64)> = Vec::new(); // (height, fk)
+        let mut body_prevouts: HashMap<u64, ([u8; 32], Vec<([u8; 32], u32)>)> = HashMap::new();
+        let mut create_regs: Vec<(Fk, [u8; 32], u32)> = Vec::new();
+        // parent (create_fk, vout) → spend heights that need it
+        let mut parent_vouts: HashMap<(u64, u32), Vec<u32>> = HashMap::new();
+        let mut thin_by_spend: HashMap<u64, Vec<StashedThinInput>> = HashMap::new();
+        let catchup = self.ibd_utxo_enabled();
+        let mut batch_creates: HashMap<[u8; 32], Fk> = HashMap::new();
+
         for &(height, hash) in &work {
             if self.confirm_cancelled() {
                 crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Corrupt("confirm cancelled"));
             }
-            let Some((header_fk, _)) = self.get_header_by_hash(&hash)? else {
+            // Header head + body pages.
+            let (found, hdr_ranges) = self.store.mlock_header_for_hash(&hash)?;
+            self.confirm_parents
+                .note_mlock_ranges(height, &hdr_ranges);
+            let Some((header_fk, _)) = found else {
                 continue;
             };
+            // header_txs first+count.
+            let ht_ranges = self.store.mlock_header_txs_for(header_fk);
+            self.confirm_parents.note_mlock_ranges(height, &ht_ranges);
+
             if !self.store.header_txs.has_body(header_fk)? {
                 continue;
             }
@@ -199,81 +218,51 @@ impl Query {
                     }
                 }
             }
+
+            // confirmed[height] for tip write path.
+            let conf_r = self.store.mlock_confirmed_height(height);
+            self.confirm_parents.note_mlock_ranges(height, &conf_r);
+
             st.blocks = st.blocks.saturating_add(1);
-            for fk in &tx_fks {
-                if let Some(id) = fk.get() {
-                    all_body_fks.push((height, id));
+
+            // Sort body fks for sequential body locality.
+            let mut sorted_fks = tx_fks.clone();
+            sorted_fks.sort_unstable_by_key(|f| f.0);
+
+            for fk in &sorted_fks {
+                if self.confirm_cancelled() {
+                    crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                    return Err(StoreError::Corrupt("confirm cancelled"));
                 }
+                let Some(id) = fk.get() else {
+                    continue;
+                };
+                // idx + body
+                let ca = self.store.mlock_tx_class_a(*fk);
+                self.confirm_parents.note_mlock_ranges(height, &ca);
+                // Class C write slots for this create.
+                let cc = self.store.mlock_class_c_tx(*fk);
+                self.confirm_parents.note_mlock_ranges(height, &cc);
+
+                let (meta, prevouts) = self.store.get_tx_meta_and_prevouts(*fk)?;
+                st.body_tx_reads = st.body_tx_reads.saturating_add(1);
+                // tx.head probe for create (put_spend / get_by_txid).
+                let head_r = self.store.mlock_tx_head_for(&meta.txid);
+                self.confirm_parents.note_mlock_ranges(height, &head_r);
+
+                create_regs.push((*fk, meta.txid, height));
+                batch_creates.insert(meta.txid, *fk);
+                body_prevouts.insert(id, (meta.txid, prevouts));
+                st.creates_registered = st.creates_registered.saturating_add(1);
             }
             height_tx_fks.push((height, tx_fks));
         }
 
-        // Sort by fk for sequential body locality under archive load.
-        all_body_fks.sort_unstable_by_key(|(_, id)| *id);
-        all_body_fks.dedup_by_key(|(_, id)| *id);
-
-        // fk → (txid, prevouts)
-        let mut body_prevouts: HashMap<u64, ([u8; 32], Vec<([u8; 32], u32)>)> =
-            HashMap::with_capacity(all_body_fks.len());
-        let mut mlock_notes: Vec<(Fk, u64, u64, Option<u32>, u32)> = Vec::new();
-        let mut create_regs: Vec<(Fk, [u8; 32], u32)> = Vec::new();
-
-        // height for each body fk (for mlock note)
-        let mut body_height: HashMap<u64, u32> = HashMap::with_capacity(all_body_fks.len());
-        for (height, tx_fks) in &height_tx_fks {
-            for fk in tx_fks {
-                if let Some(id) = fk.get() {
-                    body_height.insert(id, *height);
-                }
-            }
-        }
-
-        for &(_h, id) in &all_body_fks {
-            if self.confirm_cancelled() {
-                crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
-                return Err(StoreError::Corrupt("confirm cancelled"));
-            }
-            let fk = Fk(id);
-            let height = body_height.get(&id).copied().unwrap_or(0);
-            // mlock pages first so the subsequent mmap walk does not soft-fault.
-            match self.store.mlock_tx_body(fk) {
-                Ok((page_start, page_len)) => {
-                    mlock_notes.push((fk, page_start, page_len, Some(height), height));
-                }
-                Err(e) => {
-                    // Soft-fail: still scan (may page-fault); log once per batch via stats.
-                    rbitcoin_log::trace!("prewarm: mlock body fk={id} failed: {e}");
-                }
-            }
-            let (meta, prevouts) = self.store.get_tx_meta_and_prevouts(fk)?;
-            st.body_tx_reads = st.body_tx_reads.saturating_add(1);
-            create_regs.push((fk, meta.txid, height));
-            body_prevouts.insert(id, (meta.txid, prevouts));
-            st.creates_registered = st.creates_registered.saturating_add(1);
-        }
-
-        // Publish create map early so same-batch parents resolve while we walk.
         self.confirm_parents
             .register_mlocked_creates_batch(&create_regs);
-        self.confirm_parents.note_mlocks_batch(&mlock_notes);
 
-        // ── Phase 2: thin edges + mlock external parents ─────────────────────
-        let mut need_parent: Vec<(u32, u64)> = Vec::new(); // (spend_height, parent_fk)
-        let mut thin_by_spend: HashMap<u64, Vec<StashedThinInput>> = HashMap::new();
-        let catchup = self.ibd_utxo_enabled();
-
-        // Same-batch creates accumulate as we scan heights ascending.
-        let mut batch_creates: HashMap<[u8; 32], Fk> = HashMap::new();
-
+        // ── Phase 2: thin edges + mlock external parents + spend oracle ─────
         for (height, tx_fks) in &height_tx_fks {
-            for fk in tx_fks {
-                let Some(id) = fk.get() else {
-                    continue;
-                };
-                if let Some((txid, _)) = body_prevouts.get(&id) {
-                    batch_creates.insert(*txid, *fk);
-                }
-            }
             for fk in tx_fks {
                 let Some(id) = fk.get() else {
                     continue;
@@ -290,7 +279,6 @@ impl Query {
                         });
                         continue;
                     }
-                    // Same-bite create (this or earlier height in batch).
                     if let Some(&cfk) = batch_creates.get(&prev_txid) {
                         edges.push(StashedThinInput {
                             create_fk: cfk.get(),
@@ -300,7 +288,6 @@ impl Query {
                         st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                         continue;
                     }
-                    // Earlier runway / mlocked create.
                     if let Some(cfk) = self
                         .confirm_parents
                         .get_by_txid_if_out(&prev_txid, prev_index)
@@ -311,20 +298,25 @@ impl Query {
                         });
                         st.utxo_parents = st.utxo_parents.saturating_add(1);
                         st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
+                        // Still pin head + body + oracle for earlier-runway creates.
+                        if let Some(pid) = cfk.get() {
+                            parent_vouts.entry((pid, prev_index)).or_default().push(*height);
+                        }
                         continue;
                     }
-                    // Live UTXO parent (catch-up mode).
                     if let Some(create_fk) = self.ibd_utxo_create_fk(&prev_txid, prev_index)? {
                         edges.push(StashedThinInput {
                             create_fk: create_fk.get(),
                             prev_index,
                         });
                         if let Some(pid) = create_fk.get() {
-                            need_parent.push((*height, pid));
+                            parent_vouts.entry((pid, prev_index)).or_default().push(*height);
                         }
                         continue;
                     }
-                    // Durable head.
+                    // Durable head: pin head probe first so lookup is warm.
+                    let head_r = self.store.mlock_tx_head_for(&prev_txid);
+                    self.confirm_parents.note_mlock_ranges(*height, &head_r);
                     if let Some(create_fk) = self.tx_fk_by_txid(&prev_txid).ok().flatten() {
                         edges.push(StashedThinInput {
                             create_fk: create_fk.get(),
@@ -335,7 +327,7 @@ impl Query {
                             continue;
                         }
                         if let Some(pid) = create_fk.get() {
-                            need_parent.push((*height, pid));
+                            parent_vouts.entry((pid, prev_index)).or_default().push(*height);
                         }
                         continue;
                     }
@@ -349,41 +341,54 @@ impl Query {
             }
         }
 
-        need_parent.sort_unstable();
-        need_parent.dedup();
-        let mut uniq_parents: Vec<u64> = need_parent.iter().map(|(_, p)| *p).collect();
+        // Unique parent create fks → mlock class A + head + spend oracle.
+        let mut uniq_parents: Vec<u64> = parent_vouts.keys().map(|(p, _)| *p).collect();
         uniq_parents.sort_unstable();
         uniq_parents.dedup();
         st.parent_unique = st.parent_unique.saturating_add(uniq_parents.len() as u32);
 
-        // Map parent fk → one need height (for mlock tracking GC).
-        let mut parent_need_h: HashMap<u64, u32> = HashMap::with_capacity(uniq_parents.len());
-        for &(h, pid) in &need_parent {
-            parent_need_h.entry(pid).or_insert(h);
-        }
-
-        let mut parent_mlock_notes: Vec<(Fk, u64, u64, Option<u32>, u32)> = Vec::new();
         for pid in uniq_parents {
             if self.confirm_cancelled() {
                 crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Corrupt("confirm cancelled"));
             }
             let fk = Fk(pid);
-            let need_h = parent_need_h.get(&pid).copied().unwrap_or(0);
-            match self.store.mlock_tx_body(fk) {
-                Ok((page_start, page_len)) => {
-                    parent_mlock_notes.push((fk, page_start, page_len, None, need_h));
-                    st.full_tx_reads = st.full_tx_reads.saturating_add(1);
-                    st.utxo_parents = st.utxo_parents.saturating_add(1);
+            // Collect need heights for this parent (any vout).
+            let mut need_hs: Vec<u32> = parent_vouts
+                .iter()
+                .filter(|((p, _), _)| *p == pid)
+                .flat_map(|(_, hs)| hs.iter().copied())
+                .collect();
+            need_hs.sort_unstable();
+            need_hs.dedup();
+            let need_h = need_hs.first().copied().unwrap_or(0);
+
+            let ca = self.store.mlock_tx_class_a(fk);
+            for h in &need_hs {
+                self.confirm_parents.note_mlock_ranges(*h, &ca);
+            }
+            // Head for create txid (from body meta if available).
+            if let Ok((meta, _)) = self.store.get_tx_meta_and_prevouts(fk) {
+                let head_r = self.store.mlock_tx_head_for(&meta.txid);
+                for h in &need_hs {
+                    self.confirm_parents.note_mlock_ranges(*h, &head_r);
                 }
-                Err(e) => {
-                    rbitcoin_log::trace!("prewarm: mlock parent fk={pid} failed: {e}");
-                    // Still count as attempted parent pin; confirm may fault.
-                    st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+                self.confirm_parents
+                    .register_mlocked_create(fk, meta.txid, need_h);
+            }
+            // Spend-oracle pages for each needed vout.
+            for ((p, vout), hs) in &parent_vouts {
+                if *p != pid {
+                    continue;
+                }
+                let oracle = self.store.mlock_spend_oracle(fk, *vout);
+                for h in hs {
+                    self.confirm_parents.note_mlock_ranges(*h, &oracle);
                 }
             }
+            st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+            st.utxo_parents = st.utxo_parents.saturating_add(1);
         }
-        self.confirm_parents.note_mlocks_batch(&parent_mlock_notes);
 
         let thin_items: Vec<(Fk, Vec<StashedThinInput>)> = thin_by_spend
             .into_iter()

@@ -15,6 +15,7 @@ mod ibd_io_policy;
 mod hashhead;
 mod open_address;
 mod header_table;
+mod mlock;
 mod point_table;
 mod spender_table;
 mod scripthash;
@@ -33,6 +34,7 @@ pub use file::{
     ensure_memlock_budget, ensure_nofile_budget, ensure_nofile_budget_at_least,
     try_set_io_best_effort, try_set_io_idle, NOFILE_SOFT_TARGET,
 };
+pub use mlock::{MlockRange, MlockTable};
 pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush};
 pub use address_head::{bits_for_scale, AddressHead, MAINNET_BITS, TINY_BITS};
 pub use hashhead::{

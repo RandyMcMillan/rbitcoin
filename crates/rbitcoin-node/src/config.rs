@@ -36,9 +36,6 @@ pub struct NodeConfig {
     /// When true, ask systemd (if available) to block automatic suspend/idle
     /// while the node process is running. Off by default.
     pub inhibit_suspend: bool,
-    /// Pin light UTXO mmap in RAM (`mlock`) during catch-up. Off by default.
-    /// See `--mlock-utxo` / OPERATOR.md (needs raised `RLIMIT_MEMLOCK`).
-    pub mlock_utxo: bool,
 }
 
 impl Default for NodeConfig {
@@ -60,7 +57,6 @@ impl Default for NodeConfig {
             // ~300e6 weight units — see rbitcoin_mempool::DEFAULT_MAX_MEMPOOL_WEIGHT.
             mempool_max_weight: 300_000_000,
             inhibit_suspend: false,
-            mlock_utxo: false,
         }
     }
 }

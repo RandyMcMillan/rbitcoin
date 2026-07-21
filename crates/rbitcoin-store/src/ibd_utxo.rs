@@ -6,11 +6,6 @@
 //! ```
 //! Membership + parent resolve without a global txid→fk process map.
 //! Not a full coins cache (no value/script).
-//!
-//! Optional RAM pin (`mlock`): keep the map resident so materialize / Class A
-//! page-cache pressure cannot major-fault UTXO probes. Enabled via node
-//! `--mlock-utxo` (see [`IbdUtxo::open_or_create`]). Requires raised
-//! `RLIMIT_MEMLOCK`. Multi‑GiB pin is tight on 8 GiB hosts.
 
 use crate::error::StoreError;
 use memmap2::MmapMut;
@@ -18,7 +13,6 @@ use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAGIC: &[u8; 8] = b"RBUXTO03";
 const HEADER_LEN: usize = 4096;
@@ -51,128 +45,6 @@ const VERSION: u32 = 2;
 /// Production: `RBITCOIN_IBD_UTXO_SLOTS=268435456` (~6 GiB @ 24 B).
 pub const DEFAULT_NUM_SLOTS: u64 = 1 << 22;
 const LOAD_GROW: f64 = 0.80;
-
-/// Raise soft `RLIMIT_MEMLOCK` toward `want_bytes` (capped by hard). Best-effort.
-#[cfg(unix)]
-fn ensure_memlock_budget(want_bytes: u64) {
-    let mut rlim = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: getrlimit with valid pointer.
-    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rlim) } != 0 {
-        rbitcoin_log::warn!(
-            "store: getrlimit(MEMLOCK) failed: {}",
-            std::io::Error::last_os_error()
-        );
-        return;
-    }
-    let hard = rlim.rlim_max as u64;
-    let soft = rlim.rlim_cur as u64;
-    let hard_cap = if hard == u64::MAX || rlim.rlim_max == libc::RLIM_INFINITY {
-        want_bytes.max(soft)
-    } else {
-        hard
-    };
-    let target = want_bytes.min(hard_cap).max(soft);
-    if target > soft {
-        rlim.rlim_cur = target as libc::rlim_t;
-        // SAFETY: setrlimit soft ≤ hard.
-        if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) } != 0 {
-            rbitcoin_log::warn!(
-                "store: setrlimit(MEMLOCK) soft {soft}→{target} failed (hard={hard}): {}; \
-                 UTXO mlock may fail — raise LimitMEMLOCK / ulimit -l",
-                std::io::Error::last_os_error()
-            );
-            return;
-        }
-        rbitcoin_log::debug!(
-            "store: raised RLIMIT_MEMLOCK soft {soft}→{target} (hard={hard})"
-        );
-    } else if soft < want_bytes
-        && hard != u64::MAX
-        && rlim.rlim_max != libc::RLIM_INFINITY
-        && hard < want_bytes
-    {
-        rbitcoin_log::warn!(
-            "store: RLIMIT_MEMLOCK hard={hard} < UTXO map {want_bytes} bytes; \
-             mlock needs higher LimitMEMLOCK / ulimit -l"
-        );
-    }
-}
-
-/// Best-effort pin of the UTXO mmap when `enabled`. Never fails the open path.
-///
-/// Linux: prefer `mlock2(..., MLOCK_ONFAULT)` so empty slots lock lazily.
-/// Fallback: [`MmapMut::lock`] (full `mlock`).
-fn try_mlock_map(map: &MmapMut, path: &Path, enabled: bool) {
-    if !enabled {
-        return;
-    }
-    let len = map.len();
-    if len == 0 {
-        return;
-    }
-    #[cfg(unix)]
-    ensure_memlock_budget(len as u64);
-
-    #[cfg(target_os = "linux")]
-    {
-        // linux/mman.h MLOCK_ONFAULT = 1
-        const MLOCK_ONFAULT: libc::c_uint = 1;
-        let ptr = map.as_ptr() as *const libc::c_void;
-        // SAFETY: map is live for `len` bytes.
-        let rc = unsafe { libc::mlock2(ptr, len, MLOCK_ONFAULT) };
-        if rc == 0 {
-            static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !LOGGED.swap(true, Ordering::Relaxed) {
-                rbitcoin_log::info!(
-                    "store: ibd_utxo mlock2(ONFAULT) ok path={} size≈{:.2} GiB (--mlock-utxo)",
-                    path.display(),
-                    len as f64 / (1024.0 * 1024.0 * 1024.0)
-                );
-            } else {
-                rbitcoin_log::debug!(
-                    "store: ibd_utxo mlock2(ONFAULT) ok path={} size={}",
-                    path.display(),
-                    len
-                );
-            }
-            return;
-        }
-        rbitcoin_log::debug!(
-            "store: ibd_utxo mlock2(ONFAULT) failed ({}), trying mlock whole map",
-            std::io::Error::last_os_error()
-        );
-    }
-
-    match map.lock() {
-        Ok(()) => {
-            static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !LOGGED.swap(true, Ordering::Relaxed) {
-                rbitcoin_log::info!(
-                    "store: ibd_utxo mlock ok path={} size≈{:.2} GiB (--mlock-utxo)",
-                    path.display(),
-                    len as f64 / (1024.0 * 1024.0 * 1024.0)
-                );
-            } else {
-                rbitcoin_log::debug!(
-                    "store: ibd_utxo mlock ok path={} size={}",
-                    path.display(),
-                    len
-                );
-            }
-        }
-        Err(e) => {
-            rbitcoin_log::warn!(
-                "store: ibd_utxo mlock failed path={} size={} err={e} \
-                 (need RLIMIT_MEMLOCK ≥ map; node continues unlocked)",
-                path.display(),
-                len
-            );
-        }
-    }
-}
 
 #[inline]
 fn pack(state: u8, vout: u32) -> u32 {
@@ -221,8 +93,6 @@ pub struct IbdUtxo {
     tip: Option<u32>,
     /// Rare (prefix,vout) collisions with full txid + fk.
     overflow: HashMap<([u8; PREFIX_LEN], u32), Vec<OverflowEntry>>,
-    /// Re-applied after [`Self::grow`] (same process policy as open).
-    mlock: bool,
 }
 
 impl IbdUtxo {
@@ -321,14 +191,6 @@ impl IbdUtxo {
     }
 
     pub fn create(path: impl Into<PathBuf>, num_slots: u64) -> Result<Self, StoreError> {
-        Self::create_with_mlock(path, num_slots, false)
-    }
-
-    pub fn create_with_mlock(
-        path: impl Into<PathBuf>,
-        num_slots: u64,
-        mlock: bool,
-    ) -> Result<Self, StoreError> {
         let path = path.into();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
@@ -347,7 +209,6 @@ impl IbdUtxo {
         map[HEADER_LEN..].fill(0);
         Self::write_header(&mut map, None, num_slots, 0);
         map.flush().map_err(|e| io(&path, e))?;
-        try_mlock_map(&map, &path, mlock);
         Ok(Self {
             path,
             _file: file,
@@ -356,15 +217,10 @@ impl IbdUtxo {
             live: 0,
             tip: None,
             overflow: HashMap::new(),
-            mlock,
         })
     }
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
-        Self::open_with_mlock(path, false)
-    }
-
-    pub fn open_with_mlock(path: impl Into<PathBuf>, mlock: bool) -> Result<Self, StoreError> {
         let path = path.into();
         let file = OpenOptions::new()
             .read(true)
@@ -377,7 +233,6 @@ impl IbdUtxo {
         if (map.len() as u64) < expect {
             return Err(StoreError::Corrupt("ibd utxo file truncated"));
         }
-        try_mlock_map(&map, &path, mlock);
         Ok(Self {
             path,
             _file: file,
@@ -386,20 +241,13 @@ impl IbdUtxo {
             live,
             tip,
             overflow: HashMap::new(),
-            mlock,
         })
     }
 
     pub fn open_or_create(dir: &Path) -> Result<Self, StoreError> {
-        Self::open_or_create_with_mlock(dir, false)
-    }
-
-    /// Open/create under `dir/ibd_utxo.map`. When `mlock`, pin the map in RAM
-    /// (see module docs). Grow reuses the same policy.
-    pub fn open_or_create_with_mlock(dir: &Path, mlock: bool) -> Result<Self, StoreError> {
         let path = dir.join("ibd_utxo.map");
         if path.exists() {
-            match Self::open_with_mlock(&path, mlock) {
+            match Self::open(&path) {
                 Ok(u) => Ok(u),
                 Err(StoreError::Corrupt(_)) => {
                     // Schema bump / poison: recreate empty (caller rebuilds to tip).
@@ -408,7 +256,7 @@ impl IbdUtxo {
                         .ok()
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(DEFAULT_NUM_SLOTS);
-                    Self::create_with_mlock(path, n, mlock)
+                    Self::create(path, n)
                 }
                 Err(e) => Err(e),
             }
@@ -417,13 +265,8 @@ impl IbdUtxo {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_NUM_SLOTS);
-            Self::create_with_mlock(path, n, mlock)
+            Self::create(path, n)
         }
-    }
-
-    /// Whether this handle requested mlock on open (may still be unlocked if pin failed).
-    pub fn mlock_requested(&self) -> bool {
-        self.mlock
     }
 
     pub fn tip(&self) -> Option<u32> {
@@ -631,9 +474,8 @@ impl IbdUtxo {
 
     pub fn grow(&mut self) -> Result<(), StoreError> {
         let new_slots = self.num_slots.saturating_mul(2).max(16);
-        let mlock = self.mlock;
         let tmp = self.path.with_extension("map.tmp");
-        let mut neu = Self::create_with_mlock(&tmp, new_slots, mlock)?;
+        let mut neu = Self::create(&tmp, new_slots)?;
         for i in 0..self.num_slots {
             let (prefix, state, vout, fk_raw) = Self::read_slot(&self.map, self.num_slots, i);
             if state != STATE_LIVE {
@@ -668,7 +510,7 @@ impl IbdUtxo {
         neu.commit_tip(self.tip)?;
         drop(neu);
         std::fs::rename(&tmp, &self.path).map_err(|e| io(&self.path, e))?;
-        *self = Self::open_with_mlock(&self.path, mlock)?;
+        *self = Self::open(&self.path)?;
         Ok(())
     }
 
@@ -800,18 +642,6 @@ mod tests {
         t[2] = 0;
         t[3] = 0;
         assert_eq!(u2.get_create_fk(&t, 0).unwrap(), Some(Fk(1)));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn mlock_flag_open_does_not_fail() {
-        // Even if mlock fails (low RLIMIT_MEMLOCK), open must succeed.
-        let path = tmp();
-        let u = IbdUtxo::create_with_mlock(&path, 64, true).unwrap();
-        assert!(u.mlock_requested());
-        drop(u);
-        let u2 = IbdUtxo::open_with_mlock(&path, true).unwrap();
-        assert!(u2.mlock_requested());
         let _ = std::fs::remove_file(&path);
     }
 

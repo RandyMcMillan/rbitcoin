@@ -30,7 +30,6 @@ where
     let mut max_run_secs: Option<u64> = None;
     let mut mempool_size_mb: Option<u64> = None;
     let mut inhibit_suspend = false;
-    let mut mlock_utxo = false;
     // None = env/default; Some(None) = off; Some(Some(level)) = explicit level.
     let mut log_level_cli: Option<Option<Level>> = None;
 
@@ -39,7 +38,7 @@ where
         match a.as_ref() {
             "--help" | "-h" => {
                 eprintln!(
-                    "rbitcoin-node {} — usage:\n  rbitcoin-node [--datadir PATH] [--network NET] \\\n    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n    [--milestone HEIGHT] [--max-outbound N] [--mempool-size-mb N] \\\n    [--max-run-secs N] [--log-level LEVEL] [--no-seeds] [--smoke] \\\n    [--inhibit-suspend] [--mlock-utxo]\n\nNetworks: mainnet|testnet|signet|regtest\nLog level: error|warn|info|debug|trace (default info; or RBITCOIN_LOG / RUST_LOG).\nMilestone: skip script/sig checks at/below HEIGHT (assumevalid-style).\n  Default when omitted: mainnet 840000, signet 2000000, testnet 2500000, regtest 0.\n  Use --milestone 0 for full script validation.\nMempool: --mempool-size-mb sets weight budget (default ~300; eviction by worst chunk).\n  Libre-relay-class: 0.1 sat/vB min, no dust ban, full RBF. See OPERATOR.md.\n--inhibit-suspend: ask systemd to block auto sleep/idle while the node runs (off by default).\n--mlock-utxo: pin light UTXO mmap in RAM (mlock) so mat page-cache thrash does not\n  fault UTXO probes. Needs RLIMIT_MEMLOCK ≥ map (ulimit -l / LimitMEMLOCK). Multi‑GiB\n  pin is tight on 8 GiB hosts; off by default. See OPERATOR.md.\nElectrum: plain TCP only (TLS via nginx/caddy/etc). Memory envs:\n  RBITCOIN_ARCHIVE_QUEUE_MB, RBITCOIN_CLASS_A_CACHE_MB (default 256 each).\nIBD: up to 1024 concurrent block downloads, max 16 in transit per peer.",
+                    "rbitcoin-node {} — usage:\n  rbitcoin-node [--datadir PATH] [--network NET] \\\n    [--listen ADDR] [--connect ADDR]... [--electrum-listen ADDR] \\\n    [--milestone HEIGHT] [--max-outbound N] [--mempool-size-mb N] \\\n    [--max-run-secs N] [--log-level LEVEL] [--no-seeds] [--smoke] \\\n    [--inhibit-suspend]\n\nNetworks: mainnet|testnet|signet|regtest\nLog level: error|warn|info|debug|trace (default info; or RBITCOIN_LOG / RUST_LOG).\nMilestone: skip script/sig checks at/below HEIGHT (assumevalid-style).\n  Default when omitted: mainnet 840000, signet 2000000, testnet 2500000, regtest 0.\n  Use --milestone 0 for full script validation.\nMempool: --mempool-size-mb sets weight budget (default ~300; eviction by worst chunk).\n  Libre-relay-class: 0.1 sat/vB min, no dust ban, full RBF. See OPERATOR.md.\n--inhibit-suspend: ask systemd to block auto sleep/idle while the node runs (off by default).\nElectrum: plain TCP only (TLS via nginx/caddy/etc). Memory envs:\n  RBITCOIN_ARCHIVE_QUEUE_MB, RBITCOIN_CLASS_A_CACHE_MB (default 256 each).\nIBD: up to 1024 concurrent block downloads, max 16 in transit per peer.",
                     env!("CARGO_PKG_VERSION")
                 );
                 return ExitCode::SUCCESS;
@@ -58,10 +57,6 @@ where
             }
             "--inhibit-suspend" => {
                 inhibit_suspend = true;
-                i += 1;
-            }
-            "--mlock-utxo" => {
-                mlock_utxo = true;
                 i += 1;
             }
             "--datadir" => {
@@ -265,7 +260,6 @@ where
     };
     config.max_outbound = max_outbound;
     config.inhibit_suspend = inhibit_suspend;
-    config.mlock_utxo = mlock_utxo;
     // Map MiB → weight units (1 MiB ≈ 1e6 WU for budget purposes).
     if let Some(mb) = mempool_size_mb {
         config.mempool_max_weight = mb.saturating_mul(1_000_000);

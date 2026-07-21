@@ -45,7 +45,6 @@ Default: **info**. CLI wins over env.
 | Archive queue RAM | **256 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
 | Light UTXO (mmap) | **~96 MiB start** (24 B slots; grows) | `RBITCOIN_IBD_UTXO_SLOTS` |
-| Pin light UTXO in RAM | **off** | `--mlock-utxo` — `mlock2(ONFAULT)` / `mlock` so materialize page-cache thrash does not major-fault UTXO probes. Needs `RLIMIT_MEMLOCK` ≥ map size (`ulimit -l unlimited` / systemd `LimitMEMLOCK=infinity`). Multi‑GiB pin is tight on 8 GiB hosts; leave off unless measured. |
 | Parent prewarm depth / batch / headroom | **256 / 64 / 64** | `RBITCOIN_PARENT_PREWARM_DEPTH` / `_BATCH` / `_HEADROOM` |
 | Confirm wait for prewarm worker before last-mile | **1500 ms** | `RBITCOIN_PREWARM_WORKER_GRACE_MS` (`0` = last-mile immediately if not ready; use `0` in unit tests) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |

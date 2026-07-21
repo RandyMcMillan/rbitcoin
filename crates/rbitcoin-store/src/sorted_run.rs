@@ -573,6 +573,16 @@ fn sift_up(heap: &mut [MergeHead], mut i: usize, key_len: usize) {
 
 /// Remove one run from the catalog and delete its file (after materialize).
 pub fn remove_run(run: &SortedRunPath) -> Result<(), StoreError> {
+    detach_run(run)?;
+    let _ = fs::remove_file(&run.path);
+    Ok(())
+}
+
+/// Drop a run from the MANIFEST but **leave the file** (claim for materialize).
+///
+/// After this, [`list_runs`] / merge will not see the run. Caller must materialize
+/// then delete the file (or [`remove_run`] if still cataloged).
+pub fn detach_run(run: &SortedRunPath) -> Result<(), StoreError> {
     let Some(dir) = run.path.parent() else {
         return Ok(());
     };
@@ -581,7 +591,6 @@ pub fn remove_run(run: &SortedRunPath) -> Result<(), StoreError> {
         mf.entries.retain(|e| e.seq != seq);
         save_manifest(dir, &mf)?;
     }
-    let _ = fs::remove_file(&run.path);
     Ok(())
 }
 

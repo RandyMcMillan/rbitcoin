@@ -631,38 +631,44 @@ impl ShardedScriptHashHead {
         self.shards[self.shard_of(key)].clear_key(key)
     }
 
-    pub fn insert_many(&self, entries: &[([u8; 32], ShHeadValue)]) -> Result<(), StoreError> {
+    /// Insert head values, applying **one shard at a time** (sorted within shard).
+    ///
+    /// When `flush_each_shard` is true (large materialize runs), flush the shard
+    /// file after its bucket so the working set does not keep every shard dirty
+    /// at once. Small runs skip the per-shard flush and rely on later table flush.
+    pub fn insert_many_sharded(
+        &self,
+        entries: &[([u8; 32], ShHeadValue)],
+        flush_each_shard: bool,
+    ) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
         }
         let n = self.shards.len();
         if n == 1 {
-            return self.shards[0].insert_many(entries);
+            self.shards[0].reserve_additional(entries.len() as u64)?;
+            self.shards[0].insert_many(entries)?;
+            if flush_each_shard {
+                self.shards[0].flush()?;
+            }
+            return Ok(());
         }
         let mut buckets: Vec<Vec<([u8; 32], ShHeadValue)>> = (0..n).map(|_| Vec::new()).collect();
         for (k, v) in entries {
             buckets[self.shard_of(k)].push((*k, v.clone()));
         }
-        for (i, bucket) in buckets.into_iter().enumerate() {
-            if !bucket.is_empty() {
-                self.shards[i].insert_many(&bucket)?;
+        for (i, mut bucket) in buckets.into_iter().enumerate() {
+            if bucket.is_empty() {
+                continue;
             }
-        }
-        Ok(())
-    }
-
-    pub fn insert_many_paced(&self, entries: &[([u8; 32], ShHeadValue)]) -> Result<(), StoreError> {
-        self.insert_many(entries)
-    }
-
-    pub fn reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
-        if additional == 0 {
-            return Ok(());
-        }
-        let n = self.shards.len() as u64;
-        let per = additional.div_ceil(n).max(1);
-        for s in &self.shards {
-            s.reserve_additional(per)?;
+            // Stable order within shard for probe locality.
+            bucket.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            self.shards[i].reserve_additional(bucket.len() as u64)?;
+            self.shards[i].insert_many(&bucket)?;
+            if flush_each_shard {
+                // Release dirty pages for this shard before touching the next.
+                self.shards[i].flush()?;
+            }
         }
         Ok(())
     }

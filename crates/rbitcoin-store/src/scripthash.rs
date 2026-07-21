@@ -291,6 +291,11 @@ impl ScriptHashTable {
     /// Forward-append creates (no durable chain walk). Process-local `heads` map.
     ///
     /// Returns `(written_count, timing)`.
+    ///
+    /// Creates for the **same scripthash** are applied in one body write (after
+    /// sorting). Head upserts are applied **per shard**; when `recs.len()` is
+    /// ≥ [`Self::LARGE_BATCH_ROWS`], each shard is flushed before the next so a
+    /// multi-million-row materialize does not keep every head shard dirty.
     pub fn put_create_batch_append(
         &self,
         recs: &[ScriptHashRecord],
@@ -325,6 +330,8 @@ impl ScriptHashTable {
                     }
                 }
             }
+            // Seed in key order (same as body apply) for probe locality.
+            missing.sort_unstable();
             for key in missing {
                 if let Some(v) = self.head.get(&key)? {
                     heads.insert(key, v);
@@ -333,34 +340,38 @@ impl ScriptHashTable {
         }
         timing.seed_ns = t_seed.elapsed().as_nanos() as u64;
 
-        // Group new create_tx_fks by key (dedup by create_tx_fk, not vout).
+        // Walk sorted order; one body write per distinct scripthash with all
+        // new create_tx_fks for that key.
         let t_body = std::time::Instant::now();
-        let mut batch_seen: HashMap<[u8; 32], Vec<Fk>> = HashMap::new();
-        let mut per_key: HashMap<[u8; 32], Vec<ShEntry>> = HashMap::new();
-        let mut written = 0usize;
-
-        for &i in &order {
-            let rec = &recs[i];
-            if rec.create_tx_fk.is_null() {
-                continue;
-            }
-            let key = rec.scripthash;
-            let seen = batch_seen.entry(key).or_default();
-            if seen.iter().any(|&c| c == rec.create_tx_fk) {
-                continue;
-            }
-            seen.push(rec.create_tx_fk);
-            per_key
-                .entry(key)
-                .or_default()
-                .push(ShEntry::new(rec.create_tx_fk));
-            written += 1;
-        }
-
         let mut head_final: Vec<([u8; 32], ShHeadValue)> = Vec::new();
+        let mut written = 0usize;
         let mut alloc = self.alloc.lock().unwrap();
 
-        for (key, new_ents) in per_key {
+        let mut i = 0usize;
+        while i < order.len() {
+            let rec0 = &recs[order[i]];
+            if rec0.create_tx_fk.is_null() {
+                i += 1;
+                continue;
+            }
+            let key = rec0.scripthash;
+            let mut new_ents: Vec<ShEntry> = Vec::new();
+            let mut seen_fk: Vec<Fk> = Vec::new();
+            while i < order.len() {
+                let rec = &recs[order[i]];
+                if rec.scripthash != key {
+                    break;
+                }
+                if !rec.create_tx_fk.is_null() && !seen_fk.iter().any(|&c| c == rec.create_tx_fk) {
+                    seen_fk.push(rec.create_tx_fk);
+                    new_ents.push(ShEntry::new(rec.create_tx_fk));
+                }
+                i += 1;
+            }
+            if new_ents.is_empty() {
+                continue;
+            }
+
             let cur = heads.get(&key).cloned().unwrap_or(ShHeadValue::Empty);
             let mut old_live = self.collect_entries_locked(&cur)?;
             let add: Vec<ShEntry> = new_ents
@@ -374,6 +385,7 @@ impl ScriptHashTable {
             if add.is_empty() {
                 continue;
             }
+            written += add.len();
             old_live.extend(add);
             let new_val = self.write_entries_for_key(&mut alloc, &cur, &old_live)?;
             heads.insert(key, new_val.clone());
@@ -386,14 +398,17 @@ impl ScriptHashTable {
 
         if !head_final.is_empty() {
             let t_head = std::time::Instant::now();
-            head_final.sort_by(|a, b| a.0.cmp(&b.0));
-            // Pre-size so empty shards bulk-fill; one grow when non-empty.
-            self.head.reserve_additional(head_final.len() as u64)?;
-            self.head.insert_many_paced(&head_final)?;
+            // Per-shard apply; flush each shard when this batch is "large".
+            let flush_each = recs.len() as u64 >= Self::LARGE_BATCH_ROWS;
+            self.head
+                .insert_many_sharded(&head_final, flush_each)?;
             timing.head_ns = t_head.elapsed().as_nanos() as u64;
         }
         Ok((written, timing))
     }
+
+    /// ≈1M create rows: materialize flushes each head shard after its bucket.
+    pub const LARGE_BATCH_ROWS: u64 = 1_000_000;
 
     fn collect_entries_locked(&self, val: &ShHeadValue) -> Result<Vec<ShEntry>, StoreError> {
         match val {

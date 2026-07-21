@@ -1,7 +1,10 @@
 //! Shared catch-up sorted-run machinery (tx / point / scripthash).
 //!
-//! Pipeline: **memtable → spill sorted run → (no mid-IBD merge) → paced
+//! Pipeline: **memtable → spill sorted run → (SH: gradual merge) → paced
 //! materialize into open-hash heads** under fetch hysteresis.
+//!
+//! Point/tx workers flush only. Scripthash uses a custom worker that also
+//! merges ~1 pair of oldest runs per second (never the newest spill target).
 //!
 //! When archive lead is large, IBD **stops peer block fetches** (not the archive
 //! writer — that would leave prepared work in limbo). After **in-flight getdata

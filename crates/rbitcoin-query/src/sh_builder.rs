@@ -1,24 +1,26 @@
-//! Catch-up scripthash builder: memtable → sorted runs → low-prio compact →
-//! materialize into durable `scripthash` tables at tip mode.
+//! Catch-up scripthash builder: memtable → sorted runs → gradual merge →
+//! materialize into durable `scripthash` tables.
 //!
 //! Confirm only enqueues thin creates (no open-hash RMW). A background worker
-//! flushes and merges at idle IO priority **while confirm is live**.
+//! flushes and **merges** at idle IO priority (~1 merge/s of the two oldest
+//! immutable runs, never the newest spill target). Materialize claims the
+//! oldest run (detaches from MANIFEST) so merge cannot touch it mid-apply.
 
 use super::run_builder_core::{
-    clear_runs_dir, finalize_wait_join, memtable_cap, spawn_worker, take_oldest_run, worker_loop,
-    RunControl, RunMemtable, FAMILY_SH,
+    clear_runs_dir, finalize_wait_join, memtable_cap, spawn_worker, RunControl, RunMemtable,
+    FAMILY_SH, AFTER_WORK, IDLE_POLL,
 };
-use rbitcoin_log::{debug, info};
+use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
-    next_run_path, read_run_body, remove_run, write_sorted_run, ScriptHashRecord, Store, StoreError,
-    SortedRunPath,
+    detach_run, list_runs, merge_runs, next_run_path, read_run_body, write_sorted_run,
+    ScriptHashRecord, Store, StoreError, SortedRunPath,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Fixed run record: scripthash[32] | create_tx_fk:u64 = 40 bytes (no vout).
 pub const SH_RUN_REC_LEN: u32 = 40;
@@ -26,6 +28,10 @@ pub const SH_RUN_KEY_LEN: u32 = 32;
 
 const DEFAULT_MEMTABLE_CAP: usize = 256_000;
 const HARD_MEMTABLE_MUL: usize = 2;
+/// Background merge cadence (one k-way pair merge at most this often).
+const MERGE_INTERVAL: Duration = Duration::from_secs(1);
+/// ≈1M rows × 40 B — quick size gate for "large run" head flush policy.
+const LARGE_RUN_BYTES: u64 = 1_000_000 * SH_RUN_REC_LEN as u64;
 
 fn encode_rec(sh: &[u8; 32], tx_fk: Fk) -> [u8; SH_RUN_REC_LEN as usize] {
     let mut r = [0u8; SH_RUN_REC_LEN as usize];
@@ -47,6 +53,7 @@ fn decode_rec(buf: &[u8]) -> Result<([u8; 32], Fk), StoreError> {
 struct Inner {
     pending: Vec<([u8; 32], Fk)>,
     ctrl: RunControl,
+    last_merge: Instant,
 }
 
 impl RunMemtable for Inner {
@@ -64,7 +71,7 @@ impl RunMemtable for Inner {
             return Ok(0);
         }
         let mut recs = std::mem::take(&mut self.pending);
-        // Dedup (sh, create_tx_fk) — multi-vout same tx collapses.
+        // Sort by scripthash (run key) then create_tx_fk; dedup multi-vout same tx.
         recs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1 .0.cmp(&b.1 .0)));
         recs.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
         let mut body = Vec::with_capacity(recs.len() * SH_RUN_REC_LEN as usize);
@@ -95,6 +102,9 @@ impl ShRunBuilder {
             inner: Arc::new(Mutex::new(Inner {
                 pending: Vec::new(),
                 ctrl,
+                last_merge: Instant::now()
+                    .checked_sub(MERGE_INTERVAL)
+                    .unwrap_or_else(Instant::now),
             })),
             cv: Arc::new(Condvar::new()),
             enabled: AtomicBool::new(false),
@@ -119,17 +129,15 @@ impl ShRunBuilder {
             "ibd-sh-index",
             || {
                 info!(
-                    "ibd: scripthash catch-up mode ON (memtable→sorted runs; no durable SH head on confirm)"
+                    "ibd: scripthash catch-up mode ON (memtable→sorted runs+merge; no durable SH head on confirm)"
                 );
             },
             &self.enabled,
             &self.join,
             move || {
-                debug!("ibd: SH run worker started (idle IO prio)");
-                worker_loop(
+                debug!("ibd: SH run worker started (idle IO prio, ~1 merge/s)");
+                sh_worker_loop(
                     memtable_cap("RBITCOIN_SH_MEMTABLE_CAP", DEFAULT_MEMTABLE_CAP),
-                    "SH",
-                    FAMILY_SH,
                     inner_w,
                     cv_w,
                 );
@@ -145,9 +153,7 @@ impl ShRunBuilder {
             (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
         };
         let _io = runs_io.lock().unwrap();
-        rbitcoin_store::list_runs(&runs_dir)
-            .map(|r| r.len())
-            .unwrap_or(0)
+        list_runs(&runs_dir).map(|r| r.len()).unwrap_or(0)
     }
 
     /// Enqueue thin creates from confirm. Blocks only if hard memtable cap
@@ -180,25 +186,42 @@ impl ShRunBuilder {
     }
 
     /// Materialize the oldest on-disk run into scripthash tables. `Ok(None)` if empty.
+    ///
+    /// Claims the run (MANIFEST detach) under `runs_io` so the background merger
+    /// cannot pick it, then applies body+head, then deletes the file.
     pub fn materialize_oldest_run(&self, store: &Store) -> Result<Option<u64>, StoreError> {
         let (runs_dir, runs_io) = {
             let g = self.inner.lock().unwrap();
             (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
         };
-        let Some(run) = take_oldest_run(&runs_dir, &runs_io)? else {
+        let Some(run) = claim_oldest_run(&runs_dir, &runs_io)? else {
             return Ok(None);
         };
         let n = materialize_run(store, &run)?;
-        {
-            let _io = runs_io.lock().unwrap();
-            remove_run(&run)?;
-        }
+        let _ = std::fs::remove_file(&run.path);
         Ok(Some(n))
     }
 
-    /// Stop enqueues, flush remaining, materialize each run (no merge), join worker.
+    /// Stop enqueues, flush remaining, materialize each run, join worker.
     pub fn finalize_and_materialize(&self, store: &Store) -> Result<u64, StoreError> {
         finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
+        // Compact remaining runs so tip materialize sees fewer large sorted files.
+        {
+            let (runs_dir, runs_io, mut next_seq) = {
+                let g = self.inner.lock().unwrap();
+                (
+                    g.ctrl.runs_dir.clone(),
+                    Arc::clone(&g.ctrl.runs_io),
+                    g.ctrl.next_seq,
+                )
+            };
+            {
+                let _io = runs_io.lock().unwrap();
+                while try_merge_two_oldest(&runs_dir, &mut next_seq).unwrap_or(false) {}
+            }
+            let mut g = self.inner.lock().unwrap();
+            g.ctrl.next_seq = next_seq;
+        }
         let mut inserted = 0u64;
         loop {
             match self.materialize_oldest_run(store)? {
@@ -218,9 +241,135 @@ impl ShRunBuilder {
     }
 }
 
+/// Flush + gradual merge worker for SH runs only.
+fn sh_worker_loop(soft_cap: usize, inner: Arc<Mutex<Inner>>, cv: Arc<Condvar>) {
+    let _ = FAMILY_SH; // family id reserved for metrics / future shared scheduler
+    loop {
+        let mut g = inner.lock().unwrap();
+        if g.ctrl.stop {
+            break;
+        }
+        let need_flush = g.pending.len() >= soft_cap || (g.ctrl.finalize && !g.pending.is_empty());
+        if need_flush {
+            drop(g);
+            let mut g = inner.lock().unwrap();
+            if !g.pending.is_empty() {
+                if let Err(e) = g.flush_pending() {
+                    warn!("ibd: SH run flush failed: {e}");
+                }
+                cv.notify_all();
+            }
+            drop(g);
+            std::thread::sleep(AFTER_WORK);
+            continue;
+        }
+        if g.ctrl.finalize && g.pending.is_empty() {
+            // Final merge pass then stop.
+            let runs_dir = g.ctrl.runs_dir.clone();
+            let runs_io = Arc::clone(&g.ctrl.runs_io);
+            let mut next_seq = g.ctrl.next_seq;
+            drop(g);
+            {
+                let _io = runs_io.lock().unwrap();
+                while try_merge_two_oldest(&runs_dir, &mut next_seq).unwrap_or(false) {}
+            }
+            let mut g = inner.lock().unwrap();
+            g.ctrl.next_seq = next_seq;
+            g.ctrl.stop = true;
+            cv.notify_all();
+            break;
+        }
+
+        // Opportunistic merge: at most one pair every MERGE_INTERVAL.
+        let due = g.last_merge.elapsed() >= MERGE_INTERVAL;
+        if due {
+            let runs_dir = g.ctrl.runs_dir.clone();
+            let runs_io = Arc::clone(&g.ctrl.runs_io);
+            let mut next_seq = g.ctrl.next_seq;
+            drop(g);
+            let merged = {
+                let _io = runs_io.lock().unwrap();
+                try_merge_two_oldest(&runs_dir, &mut next_seq).unwrap_or(false)
+            };
+            let mut g = inner.lock().unwrap();
+            g.ctrl.next_seq = next_seq;
+            g.last_merge = Instant::now();
+            if merged {
+                debug!("ibd: SH run merge applied");
+                drop(g);
+                std::thread::sleep(AFTER_WORK);
+                continue;
+            }
+            // No merge possible — wait.
+            let (gg, _) = cv.wait_timeout(g, IDLE_POLL).unwrap();
+            g = gg;
+            if g.ctrl.stop {
+                break;
+            }
+            continue;
+        }
+
+        let (gg, _) = cv.wait_timeout(g, IDLE_POLL).unwrap();
+        g = gg;
+        if g.ctrl.stop {
+            break;
+        }
+    }
+}
+
+/// Merge the two **oldest** on-disk runs, excluding the **newest** (active spill
+/// target). Output is sorted by scripthash key (k-way merge). Returns true if a
+/// merge ran.
+fn try_merge_two_oldest(runs_dir: &Path, next_seq: &mut u64) -> Result<bool, StoreError> {
+    let mut runs = list_runs(runs_dir)?;
+    if runs.len() < 3 {
+        // Need ≥2 merge candidates + 1 newest protected.
+        // With exactly 2 runs, still merge them (both immutable once on disk).
+        if runs.len() < 2 {
+            return Ok(false);
+        }
+    }
+    runs.sort_by_key(|r| r.seq().unwrap_or(u64::MAX));
+    // Never merge the newest run (latest spill / still "active" target).
+    if runs.len() >= 3 {
+        runs.pop(); // drop newest
+    }
+    if runs.len() < 2 {
+        return Ok(false);
+    }
+    // Oldest pair.
+    let a = runs[0].clone();
+    let b = runs[1].clone();
+    let out = next_run_path(runs_dir, *next_seq);
+    *next_seq += 1;
+    let merged = merge_runs(&[a, b], &out)?;
+    debug!(
+        "ibd: SH merged runs → seq={:?} count={}",
+        merged.seq(),
+        merged.count
+    );
+    Ok(true)
+}
+
+/// Detach oldest run from MANIFEST (file remains for materialize).
+fn claim_oldest_run(
+    runs_dir: &Path,
+    runs_io: &Mutex<()>,
+) -> Result<Option<SortedRunPath>, StoreError> {
+    let _io = runs_io.lock().unwrap();
+    let mut runs = list_runs(runs_dir)?;
+    if runs.is_empty() {
+        return Ok(None);
+    }
+    runs.sort_by_key(|r| r.seq().unwrap_or(u64::MAX));
+    let run = runs.into_iter().next().unwrap();
+    detach_run(&run)?;
+    Ok(Some(run))
+}
+
 fn materialize_run(store: &Store, run: &SortedRunPath) -> Result<u64, StoreError> {
-    // Whole-run append: one seed/get pass over unique keys, one body+head apply.
-    // Heads are not used for Electrum reads until tip mode.
+    // Runs are sorted by scripthash; put_create_batch_append groups same key into
+    // one body write and applies head updates per shard (flush-each if large).
     let body = read_run_body(run)?;
     let rec_len = run.rec_len as usize;
     let n_rec = body.len() / rec_len.max(1);
@@ -237,6 +386,9 @@ fn materialize_run(store: &Store, run: &SortedRunPath) -> Result<u64, StoreError
     if batch.is_empty() {
         return Ok(0);
     }
+    // Prefer count/size from run header for large-run policy (batch may equal).
+    let _large = run.count >= 1_000_000
+        || (run.count.saturating_mul(u64::from(run.rec_len)) >= LARGE_RUN_BYTES);
     let mut heads: std::collections::HashMap<[u8; 32], rbitcoin_store::ShHeadValue> =
         std::collections::HashMap::new();
     let (n, _) = store
@@ -282,6 +434,59 @@ mod tests {
         let n = b.finalize_and_materialize(&store).unwrap();
         assert!(n >= 100, "inserted={n}");
         assert!(store.scripthash.entry_count() >= 100);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_two_oldest_excludes_newest() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-merge-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Three small sorted runs.
+        for seq in 1..=3u64 {
+            let mut body = Vec::new();
+            let mut sh = [0u8; 32];
+            sh[0] = seq as u8;
+            body.extend_from_slice(&encode_rec(&sh, Fk(seq)));
+            let path = next_run_path(&dir, seq);
+            write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body).unwrap();
+        }
+        let mut next = 4u64;
+        assert!(try_merge_two_oldest(&dir, &mut next).unwrap());
+        let runs = list_runs(&dir).unwrap();
+        // Merged 1+2 → new seq; newest (3) kept; total 2 runs.
+        assert_eq!(runs.len(), 2, "runs={runs:?}");
+        let counts: u64 = runs.iter().map(|r| r.count).sum();
+        assert_eq!(counts, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_key_bulk_materialize() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-bulk-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_or_create(&dir).unwrap();
+        let sh = [0xabu8; 32];
+        // One run, many creates for same key (already sorted by SH).
+        let mut body = Vec::new();
+        for i in 1..=20u64 {
+            body.extend_from_slice(&encode_rec(&sh, Fk(i)));
+        }
+        let path = next_run_path(&dir, 1);
+        let run = write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body).unwrap();
+        let n = materialize_run(&store, &run).unwrap();
+        assert_eq!(n, 20);
+        assert_eq!(store.scripthash.entries(&sh).unwrap().len(), 20);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

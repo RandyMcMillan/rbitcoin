@@ -45,8 +45,8 @@ pub use scripthash::{script_hash, ScriptHashEntry, ScriptHashRecord, ScriptHashT
 pub use scripthash_layout::ShHeadValue;
 pub use ibd_utxo::{IbdUtxo, DEFAULT_NUM_SLOTS as IBD_UTXO_DEFAULT_SLOTS, VOUT_MAX as IBD_UTXO_VOUT_MAX};
 pub use sorted_run::{
-    crc32, list_runs, lookup_key, merge_runs, next_run_path, open_run, read_run_body, remove_run,
-    verify_run_body, write_sorted_run, SortedRunPath,
+    crc32, detach_run, list_runs, lookup_key, merge_runs, next_run_path, open_run, read_run_body,
+    remove_run, verify_run_body, write_sorted_run, SortedRunPath,
 };
 pub use store::Store;
 pub use tx_table::{

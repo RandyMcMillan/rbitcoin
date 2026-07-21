@@ -38,19 +38,21 @@ pub fn shard_count_for_scale() -> usize {
 
 /// Shard count for a new head of `role` (existing dirs keep their layout on open).
 ///
-/// - **Header:** 256 (rehash locality for large open-address tables)
-/// - **Tx / ScriptHash:** 16 (smaller indexes; fewer FDs)
+/// - **Header:** **1** (single file; ~1 M headers ever — no need for 256-way)
+/// - **ScriptHash:** 16 (open-address rehash locality)
+/// - **Tx:** unused for address head (kept for any legacy callers)
 pub fn shard_count_for_role(role: HeadRole) -> usize {
     match HeadScale::from_env() {
         HeadScale::Tiny => 1,
         HeadScale::Mainnet => match role {
-            HeadRole::Header => SHARD_COUNT,
+            HeadRole::Header => 1,
             HeadRole::Tx | HeadRole::ScriptHash => SHARD_COUNT_TX_SH,
         },
     }
 }
 
-/// Initial slots **per shard** (not global).
+/// Initial slots **per shard** (not global). For header, shard count is 1 so this
+/// is the full table size (~1 M slots × 24 B ≈ 24 MiB).
 ///
 /// Override with `RBITCOIN_HEAD_SLOTS_*` as **per-shard** slot count when set.
 pub fn initial_slots_per_shard(role: HeadRole) -> u64 {
@@ -61,7 +63,8 @@ pub fn initial_slots_per_shard(role: HeadRole) -> u64 {
     match HeadScale::from_env() {
         HeadScale::Tiny => 64,
         HeadScale::Mainnet => match role {
-            HeadRole::Header => 1 << 12,
+            // Single-file: enough for full mainnet headers at 7/8 load.
+            HeadRole::Header => 1 << 20,
             HeadRole::ScriptHash | HeadRole::Tx => 1 << 16,
         },
     }

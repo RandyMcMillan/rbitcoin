@@ -805,10 +805,14 @@ impl TxTable {
 }
 
 /// Per-tx output **runs**: one var record = all outputs of one tx.
+///
+/// Legacy split Class A only; packed stores do not create these files.
+#[allow(dead_code)]
 pub struct OutputTable {
     body: VarTable,
 }
 
+#[allow(dead_code)]
 impl OutputTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
@@ -941,10 +945,14 @@ impl OutputTable {
 }
 
 /// Per-tx input **runs**: one var record = all inputs of one tx.
+///
+/// Legacy split Class A only; packed stores do not create these files.
+#[allow(dead_code)]
 pub struct InputTable {
     body: VarTable,
 }
 
+#[allow(dead_code)]
 impl InputTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {

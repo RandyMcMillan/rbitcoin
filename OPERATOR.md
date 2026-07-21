@@ -88,13 +88,14 @@ materialize continues until runs are empty (once inflight is clear). Progress:
 | `RBITCOIN_RUN_MATERIALIZE_STOP_LEAD` | `32768` | Resume peer fetch / pause materialize |
 | `RBITCOIN_HEAD_SHARD_PACE_MS` | `25` | Sleep between shards during paced head insert |
 
-New stores (schema **v9**): **header.head 256 shards**, **scripthash 16 shards**,
-**tx.head** = single fixed address file (~**8 GiB** sparse mainnet, `2^31` × **4 B**
-create_fk slots, no HAS_NEXT; override with `RBITCOIN_TX_HEAD_BITS` / tiny scale).
-**tx_height** uses 4 B slots. Dense Class A fk + **tx.idx** retained. Prior schema
-heads are not readable — wipe / fresh IBD. Future head pain (31-bit address):
-~**1.6 B** txs → first BITS widen; ~**3.2 B** → second BITS widen; ~**4 B** →
-8 B head entries (`u32` fk full). Spends are schema-v5 annotations on create outputs
+New stores (schema **v9**): **header.head** = **single** open-address file (~24 MiB
+pre-size; not 256-way), **scripthash** 16 shards, **tx.head** = single fixed address
+file (~**8 GiB** sparse mainnet, `2^31` × **4 B** create_fk slots, no HAS_NEXT;
+override with `RBITCOIN_TX_HEAD_BITS` / tiny scale). **tx_height** uses 4 B slots.
+Dense Class A fk + **tx.idx** retained. No empty `input.body` / `output.body` on
+create (packed Class A only). Prior schema heads may need wipe / fresh IBD. Future
+head pain (31-bit address): ~**1.6 B** txs → first BITS widen; ~**3.2 B** → second;
+~**4 B** → 8 B head entries. Spends are schema-v5 annotations on create outputs
 (no `point.head`).
 
 **Memory rule:** During Catchup, durable open-hash heads are off. Class A is

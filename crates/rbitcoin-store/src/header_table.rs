@@ -111,10 +111,14 @@ impl HeaderTable {
     }
 
     pub fn get_by_hash(&self, hash: &[u8; 32]) -> Result<Option<(Fk, HeaderRecord)>, StoreError> {
-        match self.head.get(hash)? {
-            None => Ok(None),
-            Some(fk) => Ok(Some((fk, self.get(fk)?))),
+        // 16-byte head prefix may collide — verify full hash on the body.
+        for fk in self.head.get_all(hash)? {
+            let rec = self.get(fk)?;
+            if rec.hash == *hash {
+                return Ok(Some((fk, rec)));
+            }
         }
+        Ok(None)
     }
 
     /// Number of header rows currently stored (highest fk = this value).

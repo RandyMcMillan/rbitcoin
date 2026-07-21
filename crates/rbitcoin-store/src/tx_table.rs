@@ -718,10 +718,27 @@ impl TxTable {
     }
 
     pub fn get_by_txid(&self, txid: &[u8; 32]) -> Result<Option<(Fk, TxRecord)>, StoreError> {
-        match self.head.get(txid)? {
-            None => Ok(None),
-            Some(fk) => Ok(Some((fk, self.get(fk)?))),
+        // 16-byte head prefix (and rare BIP30 duplicate full txids) may map to
+        // multiple Class A rows — verify body txid and prefer newest match.
+        for fk in self.head.get_all(txid)? {
+            let rec = self.get(fk)?;
+            if rec.txid == *txid {
+                return Ok(Some((fk, rec)));
+            }
         }
+        Ok(None)
+    }
+
+    /// All Class A fks whose body txid equals `txid` (BIP30: more than one).
+    pub fn get_all_by_txid(&self, txid: &[u8; 32]) -> Result<Vec<(Fk, TxRecord)>, StoreError> {
+        let mut out = Vec::new();
+        for fk in self.head.get_all(txid)? {
+            let rec = self.get(fk)?;
+            if rec.txid == *txid {
+                out.push((fk, rec));
+            }
+        }
+        Ok(out)
     }
 
     /// Ensure durable `tx.head` maps `txid → fk` for every Class A body.
@@ -748,7 +765,8 @@ impl TxTable {
         for id in 1..=n {
             let fk = Fk(id);
             let rec = self.get(fk)?;
-            if self.head.get(&rec.txid)?.is_none() {
+            // Prefix multi-list: only skip if this exact Class A fk is already linked.
+            if !self.head.get_all(&rec.txid)?.contains(&fk) {
                 batch.push((rec.txid, fk));
                 if batch.len() >= CHUNK {
                     inserted += batch.len() as u64;

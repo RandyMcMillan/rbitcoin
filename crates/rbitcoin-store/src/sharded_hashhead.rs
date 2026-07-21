@@ -12,7 +12,7 @@
 //! Write-behind overlay (if enabled) lives on this facade; shards stay write-through.
 
 use crate::error::StoreError;
-use crate::hashhead::{initial_slots_for, HeadRole, HeadScale, HashHead};
+use crate::hashhead::{head_key_prefix, initial_slots_for, HeadRole, HeadScale, HashHead};
 use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -176,7 +176,7 @@ impl ShardedHashHead {
             path.display(),
             n,
             per,
-            (n as u64 * per * 40) as f64 / (1024.0 * 1024.0 * 1024.0)
+            (n as u64 * per * 24) as f64 / (1024.0 * 1024.0 * 1024.0)
         );
         Ok(Self {
             shards,
@@ -200,6 +200,12 @@ impl ShardedHashHead {
                 .filter_map(|e| e.ok())
                 .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
                 .map(|e| e.file_name().to_string_lossy().into_owned())
+                // Shard files are `00`…`ff`; ignore multi-list siblings (`00.mlt`).
+                .filter(|name| {
+                    name.len() <= 2
+                        && !name.is_empty()
+                        && name.chars().all(|c| c.is_ascii_hexdigit())
+                })
                 .collect();
             names.sort();
             if names.is_empty() {
@@ -419,14 +425,33 @@ impl ShardedHashHead {
         Ok(())
     }
 
-    pub fn get(&self, key: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
+    /// All Class A fks for this key's 16-byte prefix (overlay + disk multi-list).
+    ///
+    /// Newest-first; callers that need exact identity must verify the body.
+    pub fn get_all(&self, key: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
+        let mut out = self.shards[self.shard_of(key)].get_all(key)?;
         {
             let guard = self.overlay.lock().unwrap();
             if let Some(ov) = guard.as_ref() {
+                let prefix = head_key_prefix(key);
+                for (k, fk) in ov.map.iter() {
+                    if head_key_prefix(k) == prefix && !out.contains(fk) {
+                        out.push(*fk);
+                    }
+                }
                 if let Some(&fk) = ov.map.get(key) {
-                    return Ok(Some(fk));
+                    out.retain(|f| *f != fk);
+                    out.insert(0, fk);
                 }
             }
+        }
+        Ok(out)
+    }
+
+    pub fn get(&self, key: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
+        // Overlay may hold same-prefix keys not yet spilled — merge via get_all.
+        if self.write_behind_len() > 0 {
+            return Ok(self.get_all(key)?.first().copied());
         }
         self.shards[self.shard_of(key)].get(key)
     }

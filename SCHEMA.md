@@ -1,8 +1,10 @@
-# On-disk schema (v6)
+# On-disk schema (v7)
 
 Versioned layouts for the chain store. **Format is unstable until 1.0.** Magic bytes and a schema version live in each file header.
 
-**Schema v6** (current): scripthash head **16 B key prefix** + **16 B value** (32 B slots); body entries are **create_tx_fk only** (8 B). Plus v5 spends.
+**Schema v7** (current): hash heads (`tx.head`, `header.head`, …) use **16 B key prefixes** (24 B slots) plus optional multi-fk lists (`*.head.mlt` / shard `NN.mlt`) for prefix collisions and BIP30 duplicate full txids. Lookups verify the Class A body. Keeps v6 scripthash compression and v5 spends.
+
+**Schema v6**: scripthash head **16 B key prefix** + **16 B value** (32 B slots); body entries are **create_tx_fk only** (8 B). Plus v5 spends.
 
 **Schema v5**: spend annotations on each create **output** (`spender_field:u64` + `MULTI_SPENDER` flag); rare multi-spend lists in `spenders.body` (16 B: spending_tx_fk | next). **No `point.head` open-hash multimap.**
 
@@ -81,7 +83,10 @@ See [`docs/concurrency.md`](./docs/concurrency.md): during IBD, one dedicated OS
 
 ## Hash head (`*.head`)
 
-- Slot = 32-byte key + 8-byte fk; power-of-two slot count; linear probe.
+- Slot = **16-byte key prefix** + 8-byte packed value (24 B); power-of-two slot count; linear probe.
+- Packed value: sole `create_fk` (high bit clear), or multi-list head (`MULTI_BIT | list_fk`) pointing at a sibling multi-list file (`path.mlt` or sharded `NN.mlt`).
+- Multi-list record (16 B): `create_fk:u64 | next:u64` (prepended on insert; newest first). Used for 16-byte prefix collisions and BIP30 (identical full txid → multiple Class A rows).
+- Lookups that need exact identity (`get_by_txid`, `get_by_hash`) load candidate fks via `get_all` and **verify** the body hash/txid.
 - Rehashes when load would exceed **7/8**.
 
 ## Dense u64 arrays (`confirmed`, `header_txs_first`, `header_txs_count`)

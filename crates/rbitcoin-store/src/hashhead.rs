@@ -1,36 +1,67 @@
-//! Growable hash head: key (32 bytes) → first record fk (u64).
+//! Growable hash head: key **prefix** (16 bytes) → record fk (u64), with multi-fk chains.
 //!
 //! Linear probing over a power-of-two slot table. Rehashes (doubles slots) when
 //! load factor exceeds [`MAX_LOAD_NUM`]/[`MAX_LOAD_DEN`].
 //!
-//! **File-backed probes:** slots live in the mmap table file. We do **not** keep a
-//! full process `Vec` copy of multi-GB heads (signet: `point.head`/`tx.head` were
-//! 5–6 GiB each, doubling RSS and blowing swap). Occupied keys are collected into
-//! a compact `Vec` only during rehash.
+//! **16-byte keys** (first 16 of full 32-byte hash) cut head size ~40%. Callers that
+//! need exact identity (tx.head, header.head) **verify** by loading the body.
+//! When multiple Class A rows share a prefix (or BIP30 duplicate full txids), the
+//! packed value sets the high bit and points at a multi-list (`.mlt` sibling file):
+//! `create_fk:u64 | next:u64`.
 //!
-//! **IBD write path:**
-//! - [`HashHead::insert_many`] sorts by primary slot and applies RMW through a
-//!   small page cache so probes within a batch hit sequential mmap pages.
-//! - Optional **write-behind overlay** (`enable_write_behind`) absorbs upserts in
-//!   a process-local map and spills sorted batches when the cap is hit or on
-//!   [`flush`] / rehash — cutting continuous random head IO during full-validation
-//!   IBD while keeping `get` coherent.
+//! **IBD write path:** page-cache insert_many + optional write-behind overlay.
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use rbitcoin_primitives::{Fk, TableKind};
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-const SLOT_SIZE: usize = 40; // 32 key + 8 fk
+/// Open-address key length (prefix of full 32-byte hash).
+pub const HEAD_KEY_LEN: usize = 16;
+/// Slot = key[16] + packed value[8].
+const SLOT_SIZE: usize = HEAD_KEY_LEN + 8;
+/// High bit of packed value: multi-list head (else sole create_fk).
+const MULTI_BIT: u64 = 1u64 << 63;
+const MULTI_REC_LEN: usize = 16; // create_fk | next
 const DEFAULT_SLOTS: u64 = 64;
 /// Rehash when occupied/slots ≥ 7/8.
 const MAX_LOAD_NUM: u64 = 7;
 const MAX_LOAD_DEN: u64 = 8;
-/// Slots per write-behind chunk (128 × 40 B = 5 KiB). Slot-aligned so probes
-/// never straddle a cache buffer (40 B does not divide 4 KiB after the 16 B header).
+/// Slots per write-behind chunk (128 × 24 B = 3 KiB).
 const SLOTS_PER_CHUNK: u64 = 128;
+
+pub type HeadKey = [u8; HEAD_KEY_LEN];
+
+#[inline]
+pub fn head_key_prefix(full: &[u8; 32]) -> HeadKey {
+    let mut k = [0u8; HEAD_KEY_LEN];
+    k.copy_from_slice(&full[0..HEAD_KEY_LEN]);
+    k
+}
+
+#[inline]
+fn pack_sole(fk: Fk) -> u64 {
+    debug_assert_eq!(fk.0 & MULTI_BIT, 0);
+    fk.0
+}
+
+#[inline]
+fn pack_multi(list_head: Fk) -> u64 {
+    debug_assert!(!list_head.is_null());
+    list_head.0 | MULTI_BIT
+}
+
+#[inline]
+fn unpack_value(v: u64) -> (bool, Fk) {
+    if v & MULTI_BIT != 0 {
+        (true, Fk(v & !MULTI_BIT))
+    } else {
+        (false, Fk(v))
+    }
+}
 /// Max chunks held in the insert cache (~1.25 MiB).
 const CHUNK_CACHE_MAX: usize = 256;
 /// Default write-behind cap when enabled without an explicit size.
@@ -124,8 +155,105 @@ pub fn initial_slots_for(role: HeadRole) -> u64 {
     HeadScale::from_env().initial_slots(role)
 }
 
+/// Append-only multi-fk list for a single 16-byte head key (prefix / BIP30).
+struct MultiList {
+    file: TableFile,
+    count: Mutex<u64>,
+}
+
+impl MultiList {
+    fn path_for(head_path: &Path) -> PathBuf {
+        let mut p = head_path.as_os_str().to_os_string();
+        p.push(".mlt");
+        PathBuf::from(p)
+    }
+
+    fn create(head_path: &Path) -> Result<Self, StoreError> {
+        let path = Self::path_for(head_path);
+        let file = TableFile::create(path, TableKind::ArrayLink)?;
+        Ok(Self {
+            file,
+            count: Mutex::new(0),
+        })
+    }
+
+    fn open(head_path: &Path) -> Result<Self, StoreError> {
+        let path = Self::path_for(head_path);
+        if !path.exists() {
+            return Self::create(head_path);
+        }
+        let file = TableFile::open(path, TableKind::ArrayLink)?;
+        let body = file.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
+        if body % MULTI_REC_LEN as u64 != 0 {
+            return Err(StoreError::Corrupt("hash head multi-list size"));
+        }
+        Ok(Self {
+            file,
+            count: Mutex::new(body / MULTI_REC_LEN as u64),
+        })
+    }
+
+    fn offset(id: u64) -> u64 {
+        FILE_HEADER_LEN as u64 + (id - 1) * MULTI_REC_LEN as u64
+    }
+
+    fn append(&self, create_fk: Fk, next: Fk) -> Result<Fk, StoreError> {
+        let mut count = self.count.lock().unwrap();
+        let id = *count + 1;
+        let mut buf = [0u8; MULTI_REC_LEN];
+        buf[0..8].copy_from_slice(&create_fk.0.to_le_bytes());
+        buf[8..16].copy_from_slice(&next.0.to_le_bytes());
+        self.file.write_at(Self::offset(id), &buf)?;
+        *count = id;
+        Ok(Fk(id))
+    }
+
+    fn get(&self, fk: Fk) -> Result<(Fk, Fk), StoreError> {
+        let id = fk.get().ok_or(StoreError::InvalidFk)?;
+        let count = *self.count.lock().unwrap();
+        if id == 0 || id > count {
+            return Err(StoreError::NotFound);
+        }
+        let mut buf = [0u8; MULTI_REC_LEN];
+        self.file.read_at(Self::offset(id), &mut buf)?;
+        Ok((
+            Fk(u64::from_le_bytes(buf[0..8].try_into().unwrap())),
+            Fk(u64::from_le_bytes(buf[8..16].try_into().unwrap())),
+        ))
+    }
+
+    fn collect(&self, head: Fk) -> Result<Vec<Fk>, StoreError> {
+        let mut out = Vec::new();
+        let mut cur = head;
+        let mut guard = 0u32;
+        while !cur.is_null() {
+            let (create_fk, next) = self.get(cur)?;
+            out.push(create_fk);
+            cur = next;
+            guard += 1;
+            if guard > 1_000_000 {
+                return Err(StoreError::Corrupt("hash head multi-list cycle"));
+            }
+        }
+        Ok(out)
+    }
+
+    fn contains(&self, head: Fk, target: Fk) -> Result<bool, StoreError> {
+        Ok(self.collect(head)?.iter().any(|f| *f == target))
+    }
+
+    fn flush(&self) -> Result<(), StoreError> {
+        self.file.flush()
+    }
+
+    fn flush_async(&self) -> Result<(), StoreError> {
+        self.file.flush_async()
+    }
+}
+
 pub struct HashHead {
     file: TableFile,
+    multi: MultiList,
     state: Mutex<HashState>,
     /// Process-local write-behind (IBD). `None` = write-through (default).
     overlay: Mutex<Option<WriteBehind>>,
@@ -178,17 +306,18 @@ impl HashHead {
         path: impl Into<std::path::PathBuf>,
         slots: u64,
     ) -> Result<Self, StoreError> {
+        let path = path.into();
         let slots = slots.max(2).next_power_of_two();
-        let file = TableFile::create(path, TableKind::HashHead)?;
+        let file = TableFile::create(&path, TableKind::HashHead)?;
+        let multi = MultiList::create(&path)?;
         let body_bytes = SLOT_SIZE as u64 * slots;
         let need = FILE_HEADER_LEN as u64 + body_bytes;
-        // Prefer fallocate + punch-hole over multi‑GiB zero writes.
         file.ensure_capacity(need)?;
         file.set_logical_len(need)?;
         file.zero_range(FILE_HEADER_LEN as u64, body_bytes)?;
         if slots > DEFAULT_SLOTS {
             rbitcoin_log::trace!(
-                "store: hash-head create path={} slots={} (~{:.2} GiB sparse)",
+                "store: hash-head create path={} slots={} (~{:.2} GiB sparse)",
                 file.path().display(),
                 slots,
                 body_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
@@ -196,6 +325,7 @@ impl HashHead {
         }
         Ok(Self {
             file,
+            multi,
             state: Mutex::new(HashState {
                 slots,
                 occupied: 0,
@@ -206,7 +336,9 @@ impl HashHead {
     }
 
     pub fn open(path: impl Into<std::path::PathBuf>) -> Result<Self, StoreError> {
-        let file = TableFile::open(path, TableKind::HashHead)?;
+        let path = path.into();
+        let file = TableFile::open(&path, TableKind::HashHead)?;
+        let multi = MultiList::open(&path)?;
         let body = file.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
         if body % SLOT_SIZE as u64 != 0 || body == 0 {
             return Err(StoreError::Corrupt("hash head size"));
@@ -215,9 +347,8 @@ impl HashHead {
         if !slots.is_power_of_two() {
             return Err(StoreError::Corrupt("hash head slots not power of two"));
         }
-        // Stream-count occupied slots in chunks — never allocate the full table.
         let mut occupied = 0u64;
-        let mut buf = vec![0u8; SLOT_SIZE * 4096]; // 160 KiB scan buffer
+        let mut buf = vec![0u8; SLOT_SIZE * 4096];
         let mut slot = 0u64;
         while slot < slots {
             let n = ((slots - slot) as usize).min(4096);
@@ -226,9 +357,11 @@ impl HashHead {
             file.read_at(off, &mut buf[..bytes])?;
             for i in 0..n {
                 let base = i * SLOT_SIZE;
-                let k: [u8; 32] = buf[base..base + 32].try_into().unwrap();
-                let fk = u64::from_le_bytes(buf[base + 32..base + 40].try_into().unwrap());
-                if !is_empty_slot(&k, fk) {
+                let k: HeadKey = buf[base..base + HEAD_KEY_LEN].try_into().unwrap();
+                let packed = u64::from_le_bytes(
+                    buf[base + HEAD_KEY_LEN..base + SLOT_SIZE].try_into().unwrap(),
+                );
+                if !is_empty_slot(&k, packed) {
                     occupied += 1;
                 }
             }
@@ -236,13 +369,14 @@ impl HashHead {
         }
         Ok(Self {
             file,
+            multi,
             state: Mutex::new(HashState { slots, occupied }),
             overlay: Mutex::new(None),
             spill_stats: Mutex::new(SpillStats::new()),
         })
     }
 
-    fn hash_slot(key: &[u8; 32], slots: u64) -> u64 {
+    fn hash_slot(key: &HeadKey, slots: u64) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
         for b in key {
             h ^= u64::from(*b);
@@ -255,12 +389,60 @@ impl HashHead {
         FILE_HEADER_LEN as u64 + slot * SLOT_SIZE as u64
     }
 
-    fn read_slot(&self, slot: u64) -> Result<([u8; 32], u64), StoreError> {
+    fn read_slot(&self, slot: u64) -> Result<(HeadKey, u64), StoreError> {
         let mut buf = [0u8; SLOT_SIZE];
         self.file.read_at(Self::slot_file_off(slot), &mut buf)?;
-        let k: [u8; 32] = buf[0..32].try_into().unwrap();
-        let fk = u64::from_le_bytes(buf[32..40].try_into().unwrap());
-        Ok((k, fk))
+        let k: HeadKey = buf[0..HEAD_KEY_LEN].try_into().unwrap();
+        let packed = u64::from_le_bytes(buf[HEAD_KEY_LEN..SLOT_SIZE].try_into().unwrap());
+        Ok((k, packed))
+    }
+
+    /// All Class A fks for this full 32-byte key's 16-byte prefix (sole or multi).
+    ///
+    /// Order: multi-list is **newest first** (prepend on insert). Overlay hits for the
+    /// exact full key are moved to the front. Callers must verify body identity.
+    pub fn get_all(&self, full: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
+        let key = head_key_prefix(full);
+        let mut out = self.get_all_prefix(&key)?;
+        {
+            let guard = self.overlay.lock().unwrap();
+            if let Some(ov) = guard.as_ref() {
+                for (k, fk) in ov.map.iter() {
+                    if head_key_prefix(k) == key && !out.contains(fk) {
+                        out.push(*fk);
+                    }
+                }
+                // Exact full key in overlay = most recent mapping for that identity.
+                if let Some(&fk) = ov.map.get(full) {
+                    out.retain(|f| *f != fk);
+                    out.insert(0, fk);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn get_all_prefix(&self, key: &HeadKey) -> Result<Vec<Fk>, StoreError> {
+        let slots = self.state.lock().unwrap().slots;
+        let mut slot = Self::hash_slot(key, slots);
+        for _ in 0..slots {
+            let (k, packed) = self.read_slot(slot)?;
+            if is_empty_slot(&k, packed) {
+                return Ok(Vec::new());
+            }
+            if &k == key {
+                let (multi, head) = unpack_value(packed);
+                if multi {
+                    return self.multi.collect(head);
+                }
+                if head.is_null() {
+                    return Ok(Vec::new());
+                }
+                return Ok(vec![head]);
+            }
+            slot = (slot + 1) & (slots - 1);
+        }
+        Ok(Vec::new())
     }
 
     /// Number of occupied hash slots on disk (excludes pure overlay inserts until spill).
@@ -395,33 +577,15 @@ impl HashHead {
         self.rehash_to(need)
     }
 
+    /// First mapped fk for this full key prefix (newest in multi lists).
+    ///
+    /// Callers that need exact identity must verify the body (txid/hash) or use
+    /// [`Self::get_all`] and filter.
     pub fn get(&self, key: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
-        {
-            let guard = self.overlay.lock().unwrap();
-            if let Some(ov) = guard.as_ref() {
-                if let Some(&fk) = ov.map.get(key) {
-                    return Ok(Some(fk));
-                }
-            }
-        }
-        self.get_file(key)
+        let all = self.get_all(key)?;
+        Ok(all.first().copied())
     }
 
-    fn get_file(&self, key: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
-        let slots = self.state.lock().unwrap().slots;
-        let mut slot = Self::hash_slot(key, slots);
-        for _ in 0..slots {
-            let (k, fk) = self.read_slot(slot)?;
-            if is_empty_slot(&k, fk) {
-                return Ok(None);
-            }
-            if &k == key {
-                return Ok(Fk::new(fk));
-            }
-            slot = (slot + 1) & (slots - 1);
-        }
-        Ok(None)
-    }
 
     /// Single-key insert (unit tests; production uses [`Self::insert_many`]).
     #[cfg(test)]
@@ -494,27 +658,25 @@ impl HashHead {
         // Sort by primary hash slot so linear probes walk nearby pages.
         let mut work: Vec<([u8; 32], Fk)> = entries.to_vec();
         let slots_now = self.state.lock().unwrap().slots;
-        work.sort_unstable_by_key(|(k, _)| Self::hash_slot(k, slots_now));
+        work.sort_unstable_by_key(|(k, _)| Self::hash_slot(&head_key_prefix(k), slots_now));
 
         let mut i = 0usize;
         while i < work.len() {
             let slots = self.state.lock().unwrap().slots;
             // Re-sort remaining if a rehash changed the slot map.
             if i > 0 {
-                work[i..].sort_unstable_by_key(|(k, _)| Self::hash_slot(k, slots));
+                work[i..].sort_unstable_by_key(|(k, _)| Self::hash_slot(&head_key_prefix(k), slots));
             }
             let mut cache = SlotPageCache::new(self, slots);
             let mut need_rehash = false;
             while i < work.len() {
                 let (key, fk) = work[i];
                 debug_assert!(!fk.is_null());
-                match cache.try_insert(&key, fk)? {
-                    InsertResult::Done(prev) => {
-                        {
+                match cache.try_insert_merge(&key, fk)? {
+                    InsertResult::Done { prev, new_slot } => {
+                        if new_slot {
                             let mut state = self.state.lock().unwrap();
-                            if prev.is_none() {
-                                state.occupied = state.occupied.saturating_add(1);
-                            }
+                            state.occupied = state.occupied.saturating_add(1);
                         }
                         on_prev(prev);
                         i += 1;
@@ -544,8 +706,9 @@ impl HashHead {
 
     /// Place `entries` into a currently-empty slot table (caller reserved capacity).
     ///
-    /// Last write wins for duplicate keys in `entries`. Builds the full slot
-    /// image in RAM then one `write_at` — used for cold run→head materialize.
+    /// Same 16-byte prefix with a different fk becomes a multi-list (BIP30 / prefix
+    /// collision). Builds the full slot image in RAM then one `write_at` — used for
+    /// cold run→head materialize.
     fn bulk_fill_empty(
         &self,
         entries: &[([u8; 32], Fk)],
@@ -557,26 +720,32 @@ impl HashHead {
         let mut table = vec![0u8; nbytes];
         let mut occupied = 0u64;
 
-        for &(key, fk) in entries {
+        for &(full, fk) in entries {
             debug_assert!(!fk.is_null());
+            let key = head_key_prefix(&full);
             let mut slot = Self::hash_slot(&key, slots);
             let mut placed = false;
             for _ in 0..slots {
                 let off = (slot as usize) * SLOT_SIZE;
-                let slot_key: [u8; 32] = table[off..off + 32].try_into().unwrap();
-                let slot_fk = u64::from_le_bytes(table[off + 32..off + 40].try_into().unwrap());
-                if is_empty_slot(&slot_key, slot_fk) {
-                    table[off..off + 32].copy_from_slice(&key);
-                    table[off + 32..off + 40].copy_from_slice(&fk.0.to_le_bytes());
+                let slot_key: HeadKey = table[off..off + HEAD_KEY_LEN].try_into().unwrap();
+                let packed = u64::from_le_bytes(
+                    table[off + HEAD_KEY_LEN..off + SLOT_SIZE].try_into().unwrap(),
+                );
+                if is_empty_slot(&slot_key, packed) {
+                    table[off..off + HEAD_KEY_LEN].copy_from_slice(&key);
+                    table[off + HEAD_KEY_LEN..off + SLOT_SIZE]
+                        .copy_from_slice(&pack_sole(fk).to_le_bytes());
                     occupied = occupied.saturating_add(1);
                     on_prev(None);
                     placed = true;
                     break;
                 }
                 if slot_key == key {
-                    // Overwrite existing placement of same key (last wins).
-                    table[off + 32..off + 40].copy_from_slice(&fk.0.to_le_bytes());
-                    on_prev(Fk::new(slot_fk));
+                    let new_packed = merge_packed(&self.multi, packed, fk)?;
+                    table[off + HEAD_KEY_LEN..off + SLOT_SIZE]
+                        .copy_from_slice(&new_packed.to_le_bytes());
+                    let (_, old_head) = unpack_value(packed);
+                    on_prev(if old_head.is_null() { None } else { Some(old_head) });
                     placed = true;
                     break;
                 }
@@ -692,8 +861,9 @@ impl HashHead {
         let new_bytes = SLOT_SIZE as u64 * new_slots;
         let t0 = Instant::now();
 
-        // Collect live entries only (~occupied × 40 B, not empty slots).
-        let mut entries: Vec<([u8; 32], u64)> = Vec::new();
+        // Collect live entries only (~occupied × slot, not empty slots). Packed
+        // values (sole or MULTI_BIT multi heads) are preserved as-is.
+        let mut entries: Vec<(HeadKey, u64)> = Vec::new();
         entries
             .try_reserve_exact(occupied as usize)
             .map_err(|_| StoreError::Corrupt("hash head rehash OOM"))?;
@@ -706,10 +876,12 @@ impl HashHead {
             self.file.read_at(off, &mut buf[..bytes])?;
             for i in 0..n {
                 let base = i * SLOT_SIZE;
-                let k: [u8; 32] = buf[base..base + 32].try_into().unwrap();
-                let fk = u64::from_le_bytes(buf[base + 32..base + 40].try_into().unwrap());
-                if !is_empty_slot(&k, fk) {
-                    entries.push((k, fk));
+                let k: HeadKey = buf[base..base + HEAD_KEY_LEN].try_into().unwrap();
+                let packed = u64::from_le_bytes(
+                    buf[base + HEAD_KEY_LEN..base + SLOT_SIZE].try_into().unwrap(),
+                );
+                if !is_empty_slot(&k, packed) {
+                    entries.push((k, packed));
                 }
             }
             slot += n as u64;
@@ -731,9 +903,9 @@ impl HashHead {
         entries.sort_unstable_by_key(|(k, _)| Self::hash_slot(k, new_slots));
         let n_entries = entries.len() as u64;
         let mut cache = SlotPageCache::new(self, new_slots);
-        for (k, fk) in entries {
-            match cache.try_insert(&k, Fk(fk))? {
-                InsertResult::Done(_) => {}
+        for (k, packed) in entries {
+            match cache.try_place_raw(&k, packed)? {
+                InsertResult::Done { .. } => {}
                 InsertResult::NeedRehash => {
                     cache.flush()?;
                     return Err(StoreError::Corrupt("hash rehash failed"));
@@ -754,10 +926,12 @@ impl HashHead {
 
     pub fn flush(&self) -> Result<(), StoreError> {
         self.spill_write_behind()?;
+        self.multi.flush()?;
         self.file.flush()
     }
 
     pub fn flush_async_no_spill(&self) -> Result<(), StoreError> {
+        self.multi.flush_async()?;
         self.file.flush_async()
     }
 }
@@ -785,36 +959,87 @@ impl<'a> SlotPageCache<'a> {
         }
     }
 
-    fn try_insert(&mut self, key: &[u8; 32], fk: Fk) -> Result<InsertResult, StoreError> {
-        let mut slot = HashHead::hash_slot(key, self.slots);
+    /// Insert / merge `fk` under the 16-byte prefix of `full`.
+    fn try_insert_merge(
+        &mut self,
+        full: &[u8; 32],
+        fk: Fk,
+    ) -> Result<InsertResult, StoreError> {
+        let key = head_key_prefix(full);
+        let mut slot = HashHead::hash_slot(&key, self.slots);
         for _ in 0..self.slots {
-            let (k, old_fk) = self.read_slot(slot)?;
-            if is_empty_slot(&k, old_fk) {
-                self.write_slot(slot, key, fk.0)?;
-                return Ok(InsertResult::Done(None));
+            let (k, packed) = self.read_slot(slot)?;
+            if is_empty_slot(&k, packed) {
+                self.write_slot(slot, &key, pack_sole(fk))?;
+                return Ok(InsertResult::Done {
+                    prev: None,
+                    new_slot: true,
+                });
             }
-            if &k == key {
-                self.write_slot(slot, key, fk.0)?;
-                return Ok(InsertResult::Done(Fk::new(old_fk)));
+            if k == key {
+                let (_, old_head) = unpack_value(packed);
+                let new_packed = merge_packed(&self.head.multi, packed, fk)?;
+                self.write_slot(slot, &key, new_packed)?;
+                return Ok(InsertResult::Done {
+                    prev: if old_head.is_null() {
+                        None
+                    } else {
+                        Some(old_head)
+                    },
+                    new_slot: false,
+                });
             }
             slot = (slot + 1) & (self.slots - 1);
         }
         Ok(InsertResult::NeedRehash)
     }
 
-    fn read_slot(&mut self, slot: u64) -> Result<([u8; 32], u64), StoreError> {
-        let chunk = self.ensure_chunk(slot)?;
-        let rel = ((slot - chunk.base_slot) as usize) * SLOT_SIZE;
-        let k: [u8; 32] = chunk.data[rel..rel + 32].try_into().unwrap();
-        let fk = u64::from_le_bytes(chunk.data[rel + 32..rel + 40].try_into().unwrap());
-        Ok((k, fk))
+    /// Place a pre-packed slot value during rehash (no multi merge).
+    fn try_place_raw(
+        &mut self,
+        key: &HeadKey,
+        packed: u64,
+    ) -> Result<InsertResult, StoreError> {
+        let mut slot = HashHead::hash_slot(key, self.slots);
+        for _ in 0..self.slots {
+            let (k, old) = self.read_slot(slot)?;
+            if is_empty_slot(&k, old) {
+                self.write_slot(slot, key, packed)?;
+                return Ok(InsertResult::Done {
+                    prev: None,
+                    new_slot: true,
+                });
+            }
+            if &k == key {
+                // Should not collide during rehash of unique prefixes.
+                self.write_slot(slot, key, packed)?;
+                return Ok(InsertResult::Done {
+                    prev: Some(Fk(old)),
+                    new_slot: false,
+                });
+            }
+            slot = (slot + 1) & (self.slots - 1);
+        }
+        Ok(InsertResult::NeedRehash)
     }
 
-    fn write_slot(&mut self, slot: u64, key: &[u8; 32], fk: u64) -> Result<(), StoreError> {
+    fn read_slot(&mut self, slot: u64) -> Result<(HeadKey, u64), StoreError> {
         let chunk = self.ensure_chunk(slot)?;
         let rel = ((slot - chunk.base_slot) as usize) * SLOT_SIZE;
-        chunk.data[rel..rel + 32].copy_from_slice(key);
-        chunk.data[rel + 32..rel + 40].copy_from_slice(&fk.to_le_bytes());
+        let k: HeadKey = chunk.data[rel..rel + HEAD_KEY_LEN].try_into().unwrap();
+        let packed = u64::from_le_bytes(
+            chunk.data[rel + HEAD_KEY_LEN..rel + SLOT_SIZE]
+                .try_into()
+                .unwrap(),
+        );
+        Ok((k, packed))
+    }
+
+    fn write_slot(&mut self, slot: u64, key: &HeadKey, packed: u64) -> Result<(), StoreError> {
+        let chunk = self.ensure_chunk(slot)?;
+        let rel = ((slot - chunk.base_slot) as usize) * SLOT_SIZE;
+        chunk.data[rel..rel + HEAD_KEY_LEN].copy_from_slice(key);
+        chunk.data[rel + HEAD_KEY_LEN..rel + SLOT_SIZE].copy_from_slice(&packed.to_le_bytes());
         chunk.dirty = true;
         Ok(())
     }
@@ -867,12 +1092,42 @@ impl SpillStats {
     }
 }
 
-fn is_empty_slot(k: &[u8; 32], fk: u64) -> bool {
-    fk == 0 && *k == [0u8; 32]
+fn is_empty_slot(k: &HeadKey, packed: u64) -> bool {
+    packed == 0 && *k == [0u8; HEAD_KEY_LEN]
+}
+
+/// Merge `fk` into an existing packed slot value (sole or multi-list head).
+///
+/// - Same fk already present → unchanged packed value.
+/// - Sole → different fk: convert to multi (new first, then old).
+/// - Multi: prepend if not already in the chain.
+fn merge_packed(multi: &MultiList, packed: u64, fk: Fk) -> Result<u64, StoreError> {
+    let (is_multi, head) = unpack_value(packed);
+    if is_multi {
+        if multi.contains(head, fk)? {
+            return Ok(packed);
+        }
+        let new_head = multi.append(fk, head)?;
+        return Ok(pack_multi(new_head));
+    }
+    if head.is_null() {
+        return Ok(pack_sole(fk));
+    }
+    if head == fk {
+        return Ok(packed);
+    }
+    // sole → multi: newest first
+    let old_node = multi.append(head, Fk::NULL)?;
+    let new_head = multi.append(fk, old_node)?;
+    Ok(pack_multi(new_head))
 }
 
 enum InsertResult {
-    Done(Option<Fk>),
+    Done {
+        prev: Option<Fk>,
+        /// True when a previously empty open-address slot became occupied.
+        new_slot: bool,
+    },
     NeedRehash,
 }
 
@@ -911,7 +1166,7 @@ mod tests {
             h.insert(&key, Fk(i + 1)).unwrap();
         }
         assert_eq!(h.get(&[0u8; 32]).unwrap(), Some(Fk(1)));
-        let _ = std::fs::remove_file(&path);
+        cleanup_hh(&path);
     }
 
     #[test]
@@ -935,7 +1190,7 @@ mod tests {
             key[0..8].copy_from_slice(&i.to_le_bytes());
             assert_eq!(h.get(&key).unwrap(), Some(Fk(i + 1)));
         }
-        let _ = std::fs::remove_file(&path);
+        cleanup_hh(&path);
     }
 
     #[test]
@@ -951,7 +1206,7 @@ mod tests {
         }
         h.insert_many(&batch).unwrap();
         assert_eq!(h.occupied(), 5_000);
-        let _ = std::fs::remove_file(&path);
+        cleanup_hh(&path);
     }
 
     #[test]
@@ -984,7 +1239,7 @@ mod tests {
         h.insert_many(&more).unwrap();
         assert_eq!(h.occupied(), 21_000);
         assert_eq!(h.get(&[0u8; 32]).unwrap(), Some(Fk(1)));
-        let _ = std::fs::remove_file(&path);
+        cleanup_hh(&path);
     }
 
     #[test]
@@ -1000,7 +1255,7 @@ mod tests {
         // Second reserve for same size is a no-op (no smaller/equal grow).
         h.reserve_additional(10_000).unwrap();
         assert_eq!(h.state.lock().unwrap().slots, 16_384);
-        let _ = std::fs::remove_file(&path);
+        cleanup_hh(&path);
     }
 
     #[test]
@@ -1011,7 +1266,7 @@ mod tests {
         assert_eq!(h.occupied(), 0);
         h.insert(&[1u8; 32], Fk(1)).unwrap();
         assert_eq!(h.get(&[1u8; 32]).unwrap(), Some(Fk(1)));
-        let _ = std::fs::remove_file(&path);
+        cleanup_hh(&path);
     }
 
     #[test]
@@ -1054,7 +1309,7 @@ mod tests {
             key[0..8].copy_from_slice(&i.to_le_bytes());
             assert_eq!(h.get(&key).unwrap(), Some(Fk(i + 1)));
         }
-        let _ = std::fs::remove_file(&path);
+        cleanup_hh(&path);
     }
 
     #[test]
@@ -1066,7 +1321,7 @@ mod tests {
         drop(h);
         let h = HashHead::open(&path).unwrap();
         assert_eq!(h.get(&[1u8; 32]).unwrap(), Some(Fk(42)));
-        let _ = std::fs::remove_file(&path);
+        cleanup_hh(&path);
     }
 
     #[test]
@@ -1085,7 +1340,7 @@ mod tests {
         assert_eq!(h.write_behind_len(), 0);
         assert_eq!(h.occupied(), 1);
         assert_eq!(h.get(&key).unwrap(), Some(Fk(99)));
-        let _ = std::fs::remove_file(&path);
+        cleanup_hh(&path);
     }
 
     #[test]
@@ -1108,7 +1363,7 @@ mod tests {
             key[0..8].copy_from_slice(&i.to_le_bytes());
             assert_eq!(h.get(&key).unwrap(), Some(Fk(i + 1)));
         }
-        let _ = std::fs::remove_file(&path);
+        cleanup_hh(&path);
     }
 
     #[test]
@@ -1132,7 +1387,7 @@ mod tests {
             key[0..8].copy_from_slice(&i.to_le_bytes());
             assert_eq!(h.get(&key).unwrap(), Some(Fk(i + 1)));
         }
-        let _ = std::fs::remove_file(&path);
+        cleanup_hh(&path);
     }
 
     #[test]
@@ -1162,6 +1417,79 @@ mod tests {
             assert_eq!(h.get(key).unwrap(), Some(*fk));
         }
         assert_eq!(h.occupied(), 500);
-        let _ = std::fs::remove_file(&path);
+        cleanup_hh(&path);
+    }
+
+    fn cleanup_hh(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let mut mlt = path.as_os_str().to_os_string();
+        mlt.push(".mlt");
+        let _ = std::fs::remove_file(mlt);
+    }
+
+    #[test]
+    fn prefix_collision_multi_list() {
+        let path = tmp_path();
+        let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
+        // Same first 16 bytes, different trailing bytes.
+        let mut k1 = [0u8; 32];
+        k1[0] = 0xab;
+        k1[15] = 1;
+        k1[16] = 1;
+        let mut k2 = k1;
+        k2[16] = 2;
+        h.insert(&k1, Fk(10)).unwrap();
+        h.insert(&k2, Fk(20)).unwrap();
+        assert_eq!(h.occupied(), 1); // one prefix slot
+        let all1 = h.get_all(&k1).unwrap();
+        let all2 = h.get_all(&k2).unwrap();
+        assert_eq!(all1, all2);
+        assert!(all1.contains(&Fk(10)) && all1.contains(&Fk(20)));
+        // Newest first
+        assert_eq!(all1[0], Fk(20));
+        assert_eq!(h.get(&k1).unwrap(), Some(Fk(20)));
+        cleanup_hh(&path);
+    }
+
+    #[test]
+    fn bip30_same_full_key_multi() {
+        let path = tmp_path();
+        let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
+        let key = [0x42u8; 32];
+        h.insert(&key, Fk(1)).unwrap();
+        h.insert(&key, Fk(2)).unwrap(); // same txid, second Class A row
+        let all = h.get_all(&key).unwrap();
+        assert_eq!(all, vec![Fk(2), Fk(1)]);
+        assert_eq!(h.occupied(), 1);
+        // Idempotent re-insert of existing fk
+        h.insert(&key, Fk(2)).unwrap();
+        assert_eq!(h.get_all(&key).unwrap(), vec![Fk(2), Fk(1)]);
+        h.flush().unwrap();
+        let h2 = HashHead::open(&path).unwrap();
+        assert_eq!(h2.get_all(&key).unwrap(), vec![Fk(2), Fk(1)]);
+        cleanup_hh(&path);
+    }
+
+    #[test]
+    fn multi_survives_rehash() {
+        let path = tmp_path();
+        let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
+        let mut k1 = [0u8; 32];
+        k1[0..4].copy_from_slice(&1u32.to_le_bytes());
+        let mut k2 = k1;
+        k2[20] = 9;
+        h.insert(&k1, Fk(100)).unwrap();
+        h.insert(&k2, Fk(200)).unwrap();
+        // Force growth
+        let mut batch = Vec::new();
+        for i in 0u64..200 {
+            let mut key = [0u8; 32];
+            key[0..8].copy_from_slice(&(i + 1000).to_le_bytes());
+            batch.push((key, Fk(i + 1)));
+        }
+        h.insert_many(&batch).unwrap();
+        let all = h.get_all(&k1).unwrap();
+        assert!(all.contains(&Fk(100)) && all.contains(&Fk(200)));
+        cleanup_hh(&path);
     }
 }

@@ -92,8 +92,9 @@ New stores (schema **v9**): **header.head 256 shards**, **scripthash 16 shards**
 **tx.head** = single fixed address file (~**8 GiB** sparse mainnet, `2^31` × **4 B**
 create_fk slots, no HAS_NEXT; override with `RBITCOIN_TX_HEAD_BITS` / tiny scale).
 **tx_height** uses 4 B slots. Dense Class A fk + **tx.idx** retained. Prior schema
-heads are not readable — wipe / fresh IBD. Future: ~3 B txs → wider address BITS;
-~4 B txs → 8 B head entries. Spends are schema-v5 annotations on create outputs
+heads are not readable — wipe / fresh IBD. Future head pain (31-bit address):
+~**1.6 B** txs → first BITS widen; ~**3.2 B** → second BITS widen; ~**4 B** →
+8 B head entries (`u32` fk full). Spends are schema-v5 annotations on create outputs
 (no `point.head`).
 
 **Memory rule:** During Catchup, durable open-hash heads are off. Class A is

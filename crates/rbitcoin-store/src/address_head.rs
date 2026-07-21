@@ -9,8 +9,8 @@
 //!
 //! Mainnet: BITS=31 → **8 GiB** sparse file. Tests / `HeadScale::Tiny`: BITS=16.
 //!
-//! **Limits:** create_fk must fit in `u32` (~4 B txs max before 8 B entries).
-//! At ~3 B txs, address **BITS** needs a painful widen (e.g. 33-bit).
+//! **Limits (BITS=31):** ~1.6 B txs → first address **BITS** widen; ~3.2 B → second
+//! BITS widen; ~4 B txs (`u32` create_fk full) → 8 B head entries.
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};

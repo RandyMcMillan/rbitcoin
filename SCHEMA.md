@@ -4,7 +4,7 @@ Versioned layouts for the chain store. **Format is unstable until 1.0.** Magic b
 
 **Schema v9** (current): **`tx.head`** is a fixed keyless address table — single file, `2^BITS` × **4 B** entries (mainnet `BITS=31` → **8 GiB** sparse), double-hash probe, **`u32` create_fk** (0 = empty), **no HAS_NEXT** (continue until empty). Dense Class A fks + **`tx.idx`** retained. **`tx_height`** uses **4 B** slots (`height+1`, 0 = unset). Lookups verify Class A body txid. Header / scripthash heads remain open-address with 16 B key prefixes. Fresh datadir from v8.
 
-**Future head pain:** ~**3 B** total txs → widen address **BITS** (e.g. 33-bit table rebuild); ~**4 B** txs → **`u32` fk exhausted**, head entries must become 8 B.
+**Future head pain** (mainnet `BITS=31`, ~2.1 B slots; ~75% load ≈ **1.6 B** entries): first widen address **BITS** (e.g. 32-bit rebuild); ~**3.2 B** txs → second widen (e.g. 33-bit); only then ~**4 B** txs → **`u32` create_fk exhausted**, head entries must become **8 B**.
 
 **Schema v8**: `tx.head` 2^31 × 8 B (fk + HAS_NEXT); `tx_height` u64 slots.
 
@@ -108,7 +108,7 @@ See [`docs/concurrency.md`](./docs/concurrency.md): during IBD, one dedicated OS
 - Body mismatch ⇒ continue until **empty** slot (no deletes on Class A).
 - BIP30: newest `create_fk` at earliest matching probe slot; older pushed deeper.
 - Lookups verify packed Class A body txid. Dense fk still resolves body via **`tx.idx`**.
-- **No growth rehash**. Future: ~3 B txs → wider **BITS**; ~4 B txs → **8 B entries**.
+- **No growth rehash**. Future: ~**1.6 B** txs → first **BITS** widen; ~**3.2 B** → second **BITS** widen; ~**4 B** → **8 B** entries (fk width).
 
 ## Dense u64 arrays (`confirmed`, `header_txs_first`, `header_txs_count`)
 

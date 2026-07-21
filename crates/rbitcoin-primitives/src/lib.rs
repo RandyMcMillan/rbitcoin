@@ -19,7 +19,8 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 ///
 /// v9: `tx.head` is `2^31` × **4 B** create_fk entries (no HAS_NEXT; probe until
 /// empty); `tx_height` uses **u32** slots. Dense Class A fk + `tx.idx` retained.
-/// Future: ~3e9 txs → widen address BITS; ~4e9 txs → 8 B head entries.
+/// Future (31-bit address): ~1.6e9 txs → first BITS widen; ~3.2e9 → second;
+/// ~4e9 → 8 B head entries (`u32` fk full).
 ///
 /// v8: `tx.head` `2^31` × 8 B (fk + HAS_NEXT); `tx_height` u64 slots.
 ///

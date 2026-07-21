@@ -32,8 +32,8 @@ const HARD_MEMTABLE_MUL: usize = 2;
 const MERGE_INTERVAL: Duration = Duration::from_secs(1);
 /// ≈1M rows × 40 B — quick size gate for "large run" head flush policy.
 const LARGE_RUN_BYTES: u64 = 1_000_000 * SH_RUN_REC_LEN as u64;
-/// Do not merge a run whose body is already ≥ this size (≈40 MiB / ~1M rows).
-/// Also refuse a pair whose combined body would exceed the cap.
+/// Do not **start** a merge with a run whose body is already ≥ this size
+/// (≈40 MiB / ~1M rows). Two smaller runs may still merge to larger than this.
 const SH_MERGE_MAX_BODY_BYTES: u64 = 40 * 1024 * 1024;
 
 #[inline]
@@ -337,7 +337,8 @@ fn sh_worker_loop(soft_cap: usize, inner: Arc<Mutex<Inner>>, cv: Arc<Condvar>) {
 
 /// Merge the two **oldest eligible** on-disk runs, excluding the **newest**
 /// (active spill target). A run is eligible only if its body is **under**
-/// [`SH_MERGE_MAX_BODY_BYTES`]; the pair must also fit under that cap combined.
+/// [`SH_MERGE_MAX_BODY_BYTES`] — do not start a merge that includes an already
+/// large file. The **output** may exceed 40 MiB (two 30 MiB inputs are fine).
 /// Output is sorted by scripthash key (k-way merge). Returns true if a merge ran.
 fn try_merge_two_oldest(runs_dir: &Path, next_seq: &mut u64) -> Result<bool, StoreError> {
     let mut runs = list_runs(runs_dir)?;
@@ -350,6 +351,7 @@ fn try_merge_two_oldest(runs_dir: &Path, next_seq: &mut u64) -> Result<bool, Sto
         runs.pop(); // drop newest
     }
     // Skip runs already ≥ 40 MiB body — leave them for materialize only.
+    // Prefer the oldest *eligible* pair (may skip oversized files in front).
     let eligible: Vec<SortedRunPath> = runs
         .into_iter()
         .filter(|r| run_body_bytes(r) < SH_MERGE_MAX_BODY_BYTES)
@@ -359,10 +361,6 @@ fn try_merge_two_oldest(runs_dir: &Path, next_seq: &mut u64) -> Result<bool, Sto
     }
     let a = eligible[0].clone();
     let b = eligible[1].clone();
-    let combined = run_body_bytes(&a).saturating_add(run_body_bytes(&b));
-    if combined > SH_MERGE_MAX_BODY_BYTES {
-        return Ok(false);
-    }
     let out = next_run_path(runs_dir, *next_seq);
     *next_seq += 1;
     let merged = merge_runs(&[a, b], &out)?;
@@ -493,14 +491,16 @@ mod tests {
     #[test]
     fn merge_size_gate_predicates() {
         let big_count = SH_MERGE_MAX_BODY_BYTES / u64::from(SH_RUN_REC_LEN);
+        // At or over cap: not eligible as a merge *input*.
         let over = SortedRunPath {
             path: std::path::PathBuf::from("over.run"),
-            count: big_count, // body == MAX → not eligible (< MAX required)
+            count: big_count,
             rec_len: SH_RUN_REC_LEN,
             key_len: SH_RUN_KEY_LEN,
             body_crc32: 0,
         };
         assert!(run_body_bytes(&over) >= SH_MERGE_MAX_BODY_BYTES);
+        // Under cap: eligible even if two such would sum over 40 MiB.
         let under = SortedRunPath {
             path: std::path::PathBuf::from("under.run"),
             count: big_count - 1,
@@ -509,24 +509,10 @@ mod tests {
             body_crc32: 0,
         };
         assert!(run_body_bytes(&under) < SH_MERGE_MAX_BODY_BYTES);
-        // Two runs each just over half: eligible alone but pair sum exceeds cap.
         let half_plus = (SH_MERGE_MAX_BODY_BYTES / 2) / u64::from(SH_RUN_REC_LEN) + 1;
-        let a = SortedRunPath {
-            path: std::path::PathBuf::from("a.run"),
-            count: half_plus,
-            rec_len: SH_RUN_REC_LEN,
-            key_len: SH_RUN_KEY_LEN,
-            body_crc32: 0,
-        };
-        let b = SortedRunPath {
-            path: std::path::PathBuf::from("b.run"),
-            count: half_plus,
-            rec_len: SH_RUN_REC_LEN,
-            key_len: SH_RUN_KEY_LEN,
-            body_crc32: 0,
-        };
-        assert!(run_body_bytes(&a) < SH_MERGE_MAX_BODY_BYTES);
-        assert!(run_body_bytes(&a).saturating_add(run_body_bytes(&b)) > SH_MERGE_MAX_BODY_BYTES);
+        let a_bytes = half_plus * u64::from(SH_RUN_REC_LEN);
+        assert!(a_bytes < SH_MERGE_MAX_BODY_BYTES);
+        assert!(a_bytes.saturating_mul(2) > SH_MERGE_MAX_BODY_BYTES);
     }
 
     #[test]

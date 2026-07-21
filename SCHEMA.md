@@ -10,7 +10,7 @@ Versioned layouts for the chain store. **Format is unstable until 1.0.** Magic b
 
 **Schema v7**: hash heads use **16 B key prefixes** (24 B slots) plus optional multi-fk lists (`*.head.mlt` / shard `NN.mlt`).
 
-**Class A bodies are packed-only**: each `tx.body` record is `PACKED_TX_V1 || TxRecord || inputs || outputs` (one body IO for full reconstruct). Legacy 3-table rows (bare `TxRecord` + separate `input.body` / `output.body` runs) are **rejected** on read. New stores **do not** create `input.*` / `output.*`; those files open only if already present (legacy).
+**Class A bodies are packed-only**: each `tx.body` record is `PACKED_TX_V1 || TxRecord || inputs || outputs` (one body IO for full reconstruct). There are **no** standalone `input.body` / `output.body` tables.
 
 **Schema v6**: scripthash head **16 B key prefix** + **16 B value** (32 B slots); body entries are **create_tx_fk only** (8 B). Plus v5 spends.
 
@@ -37,7 +37,6 @@ Endianness: **little-endian** for all multi-byte integers.
     meta                         # store magic + schema version
     header.body / header.head    # Class A headers + hash index
     tx.body / tx.idx / tx.head   # Class A txs (growable idx + v8 keyless address head)
-    # input.body / output.body   # legacy only (not created on new stores)
     spenders.body                # multi-spender list nodes only (v5; sole spends on outputs)
     confirmed.body               # Class C: height → header fk
     strong_tx.body               # Class C: bitset, bit (tx_fk-1) = strong
@@ -138,7 +137,7 @@ See [`docs/concurrency.md`](./docs/concurrency.md): during IBD, one dedicated OS
 ### Tx (variable; fixed payload 64 B)
 
 txid, version, locktime, input_start_fk, input_count, output_start_fk, output_count.  
-`input_start_fk` / `output_start_fk` address a **run** (one var record for all I/O of that tx).
+`input_start_fk` / `output_start_fk` are always null on packed rows (layout reserved; I/O live in the same body payload).
 
 ### Input run (one var record per tx with inputs)
 

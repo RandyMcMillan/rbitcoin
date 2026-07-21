@@ -679,42 +679,13 @@ impl Query {
         Ok(None)
     }
 
-    pub fn get_output_at(
-        &self,
-        run_fk: Fk,
-        count: u32,
-        index: u32,
-    ) -> Result<OutputRecord, QueryError> {
-        self.store.get_output_at(run_fk, count, index)
-    }
-
-    pub fn get_output_run(&self, run_fk: Fk, count: u32) -> Result<Vec<OutputRecord>, QueryError> {
-        self.store.get_output_run(run_fk, count)
-    }
-
-    pub fn get_input_at(
-        &self,
-        run_fk: Fk,
-        count: u32,
-        index: u32,
-    ) -> Result<InputRecord, QueryError> {
-        self.store.get_input_at(run_fk, count, index)
-    }
-
-    pub fn get_input_run(&self, run_fk: Fk, count: u32) -> Result<Vec<InputRecord>, QueryError> {
-        self.store.get_input_run(run_fk, count)
-    }
-
-    /// Input `i` of a tx row (run-addressed or packed full body via txid→fk).
+    /// Input `i` of a tx row (packed full body via txid→fk).
     ///
     /// Prefer [`Self::tx_input_at_fk`] when the create fk is known (packed Class A
     /// with `tx.head` off).
     pub fn tx_input(&self, tx: &TxRecord, i: u32) -> Result<InputRecord, QueryError> {
         if i >= tx.input_count {
             return Err(StoreError::NotFound);
-        }
-        if let Some(run) = tx.input_start_fk.get() {
-            return self.get_input_at(Fk(run), tx.input_count, i);
         }
         let fk = self
             .lookup_tx_fk(&tx.txid)?
@@ -731,9 +702,6 @@ impl Query {
     ) -> Result<InputRecord, QueryError> {
         if i >= tx.input_count {
             return Err(StoreError::NotFound);
-        }
-        if let Some(run) = tx.input_start_fk.get() {
-            return self.get_input_at(Fk(run), tx.input_count, i);
         }
         let (_, inputs, _) = self.store.get_tx_full(create_fk)?;
         inputs
@@ -767,7 +735,6 @@ impl Query {
         vout: u32,
         count_connect: bool,
     ) -> Result<OutputRecord, QueryError> {
-        use std::sync::atomic::Ordering;
         if vout >= tx.output_count {
             return Err(StoreError::NotFound);
         }
@@ -775,17 +742,10 @@ impl Query {
         if let Some(fk) = self.lookup_tx_fk(&tx.txid)? {
             return self.tx_output_at_fk_attributed(fk, tx, vout, count_connect);
         }
-        if let Some(run) = tx.output_start_fk.get() {
-            let out = self.get_output_at(Fk(run), tx.output_count, vout)?;
-            if count_connect {
-                connect_prevout_stats::STORE_MISS.fetch_add(1, Ordering::Relaxed);
-            }
-            return Ok(out);
-        }
         Err(StoreError::NotFound)
     }
 
-    /// Packed/legacy output load by known create fk + optional connect counters.
+    /// Packed output load by known create fk + optional connect counters.
     pub fn tx_output_at_fk_attributed(
         &self,
         create_fk: Fk,
@@ -803,13 +763,8 @@ impl Query {
             }
             return Ok(o);
         }
-        // Load full outs (packed = one body IO).
-        let outs = if let Some(run) = tx.output_start_fk.get() {
-            self.get_output_run(Fk(run), tx.output_count)?
-        } else {
-            let (_, _, o) = self.store.get_tx_full(create_fk)?;
-            o
-        };
+        // Packed Class A — one body IO.
+        let (_, _, outs) = self.store.get_tx_full(create_fk)?;
         let out = outs
             .get(vout as usize)
             .cloned()

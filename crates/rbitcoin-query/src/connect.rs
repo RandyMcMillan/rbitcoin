@@ -337,9 +337,6 @@ impl Query {
         if tx.input_count == 0 {
             return Ok(Vec::new());
         }
-        if let Some(run) = tx.input_start_fk.get() {
-            return self.get_input_run(Fk(run), tx.input_count);
-        }
         let fk = self
             .lookup_tx_fk(&tx.txid)?
             .ok_or(StoreError::NotFound)?;
@@ -355,11 +352,11 @@ impl Query {
         if tx.input_count == 0 {
             return Ok(Vec::new());
         }
-        if let Some(run) = tx.input_start_fk.get() {
-            return self.get_input_run(Fk(run), tx.input_count);
-        }
         // Packed Class A — one body IO.
         let (_, inputs, _) = self.store.get_tx_full(create_fk)?;
+        if inputs.len() as u32 != tx.input_count {
+            return Err(StoreError::Corrupt("packed input count mismatch"));
+        }
         Ok(inputs)
     }
 
@@ -375,11 +372,11 @@ impl Query {
         if tx.output_count == 0 {
             return Ok(Vec::new());
         }
-        if let Some(run) = tx.output_start_fk.get() {
-            return self.get_output_run(Fk(run), tx.output_count);
-        }
         // Packed Class A.
         let (_, _, outs) = self.store.get_tx_full(create_fk)?;
+        if outs.len() as u32 != tx.output_count {
+            return Err(StoreError::Corrupt("packed output count mismatch"));
+        }
         Ok(outs)
     }
 

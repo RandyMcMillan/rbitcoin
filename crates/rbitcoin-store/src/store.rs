@@ -5,7 +5,7 @@ use crate::header_table::{HeaderRecord, HeaderTable};
 use crate::point_table::{self, PointRecord};
 use crate::scripthash::ScriptHashTable;
 use crate::spender_table::SpenderTable;
-use crate::tx_table::{InputRecord, InputTable, OutputRecord, OutputTable, TxRecord, TxTable};
+use crate::tx_table::{InputRecord, OutputRecord, TxRecord, TxTable};
 use rbitcoin_primitives::{Fk, Height, SCHEMA_VERSION, STORE_MAGIC};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -17,11 +17,6 @@ pub struct Store {
     path: PathBuf,
     pub headers: HeaderTable,
     pub txs: TxTable,
-    /// Legacy split Class A input runs only (packed Class A does not use these).
-    /// Absent on new creates — no empty `input.body` / `input.idx`.
-    inputs: Option<InputTable>,
-    /// Legacy split Class A output runs only. Absent on new creates.
-    outputs: Option<OutputTable>,
     /// Multi-spender list nodes only (sole spends live on create outputs).
     pub spenders: SpenderTable,
     pub scripthash: ScriptHashTable,
@@ -53,9 +48,6 @@ impl Store {
         Ok(Self {
             headers: HeaderTable::create(&path)?,
             txs: TxTable::create(&path)?,
-            // Packed-only Class A: do not create vestigial input/output tables.
-            inputs: None,
-            outputs: None,
             spenders: SpenderTable::create(&path)?,
             scripthash: ScriptHashTable::create(&path)?,
             confirmed: ConfirmedTable::create(&path)?,
@@ -92,22 +84,9 @@ impl Store {
         } else {
             TxHeightTable::create(&path)?
         };
-        // Legacy split I/O tables: open only if present (never create empty stubs).
-        let inputs = if path.join("input.body").exists() {
-            Some(InputTable::open(&path)?)
-        } else {
-            None
-        };
-        let outputs = if path.join("output.body").exists() {
-            Some(OutputTable::open(&path)?)
-        } else {
-            None
-        };
         Ok(Self {
             headers: HeaderTable::open(&path)?,
             txs: TxTable::open(&path)?,
-            inputs,
-            outputs,
             spenders: SpenderTable::open(&path)?,
             scripthash,
             confirmed: ConfirmedTable::open(&path)?,
@@ -207,48 +186,6 @@ impl Store {
 
     pub fn get_tx_by_txid(&self, txid: &[u8; 32]) -> Result<Option<(Fk, TxRecord)>, StoreError> {
         self.txs.get_by_txid(txid)
-    }
-
-    /// Input at local index within a legacy run (`tx.input_start_fk`).
-    pub fn get_input_at(&self, run_fk: Fk, count: u32, index: u32) -> Result<InputRecord, StoreError> {
-        self.inputs
-            .as_ref()
-            .ok_or(StoreError::Corrupt(
-                "no input.body (packed-only store; legacy split I/O missing)",
-            ))?
-            .get_at(run_fk, count, index)
-    }
-
-    pub fn get_input_run(&self, run_fk: Fk, count: u32) -> Result<Vec<InputRecord>, StoreError> {
-        self.inputs
-            .as_ref()
-            .ok_or(StoreError::Corrupt(
-                "no input.body (packed-only store; legacy split I/O missing)",
-            ))?
-            .get_run(run_fk, count)
-    }
-
-    pub fn get_output_at(
-        &self,
-        run_fk: Fk,
-        count: u32,
-        index: u32,
-    ) -> Result<OutputRecord, StoreError> {
-        self.outputs
-            .as_ref()
-            .ok_or(StoreError::Corrupt(
-                "no output.body (packed-only store; legacy split I/O missing)",
-            ))?
-            .get_at(run_fk, count, index)
-    }
-
-    pub fn get_output_run(&self, run_fk: Fk, count: u32) -> Result<Vec<OutputRecord>, StoreError> {
-        self.outputs
-            .as_ref()
-            .ok_or(StoreError::Corrupt(
-                "no output.body (packed-only store; legacy split I/O missing)",
-            ))?
-            .get_run(run_fk, count)
     }
 
     /// Annotate create outpoint as spent by `spending_tx_fk` (by create Class A fk).
@@ -510,12 +447,6 @@ impl Store {
     pub fn flush(&self) -> Result<(), StoreError> {
         self.headers.flush()?;
         self.txs.flush()?;
-        if let Some(t) = &self.inputs {
-            t.flush()?;
-        }
-        if let Some(t) = &self.outputs {
-            t.flush()?;
-        }
         self.spenders.flush()?;
         self.scripthash.flush()?;
         self.confirmed.flush()?;
@@ -532,9 +463,6 @@ impl Store {
     pub fn flush_index_tables(&self) -> Result<(), StoreError> {
         // Ensure deferred mode is off so these flushes are durable.
         crate::ibd_io_policy::set_defer_durable_flush(false);
-        if let Some(t) = &self.outputs {
-            t.flush()?;
-        }
         self.spenders.flush()?;
         self.txs.flush()?;
         self.scripthash.flush()?;
@@ -559,12 +487,6 @@ impl Store {
             t0.elapsed()
         );
         self.txs.flush_async()?;
-        if let Some(t) = &self.inputs {
-            t.flush_async()?;
-        }
-        if let Some(t) = &self.outputs {
-            t.flush_async()?;
-        }
         self.spenders.flush_async()?;
         self.scripthash.flush_async()?;
         rbitcoin_log::info!(

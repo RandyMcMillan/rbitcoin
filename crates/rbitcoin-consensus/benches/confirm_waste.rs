@@ -76,13 +76,8 @@ fn main() {
             let fks = q.store().header_txs.get_list(header_fk).unwrap().unwrap();
             for fk in fks {
                 let rec = q.get_tx(fk).unwrap();
-                let _inputs = q.tx_input_run(&rec).unwrap();
-                if rec.output_count > 0 {
-                    let start = rec.output_start_fk.get().unwrap();
-                    let _ = q
-                        .get_output_run(rbitcoin_primitives::Fk(start), rec.output_count)
-                        .unwrap();
-                }
+                let _inputs = q.tx_input_run_class_a(fk, &rec).unwrap();
+                let _outs = q.tx_output_run_class_a(fk, &rec).unwrap();
             }
         }
     });

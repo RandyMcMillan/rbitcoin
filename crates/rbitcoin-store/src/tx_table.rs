@@ -172,7 +172,8 @@ pub fn encode_output_run(recs: &[OutputRecord], out: &mut Vec<u8>) {
     }
 }
 
-pub fn decode_output_run(buf: &[u8], count: u32) -> Result<Vec<OutputRecord>, StoreError> {
+#[cfg(test)]
+fn decode_output_run(buf: &[u8], count: u32) -> Result<Vec<OutputRecord>, StoreError> {
     let (out, used) = decode_output_run_prefix(buf, count)?;
     if used != buf.len() {
         return Err(StoreError::Corrupt("output run trailing bytes"));
@@ -364,7 +365,8 @@ pub fn encode_input_run(recs: &[InputRecord], out: &mut Vec<u8>) {
     }
 }
 
-pub fn decode_input_run(buf: &[u8], count: u32) -> Result<Vec<InputRecord>, StoreError> {
+#[cfg(test)]
+fn decode_input_run(buf: &[u8], count: u32) -> Result<Vec<InputRecord>, StoreError> {
     let (out, used) = decode_input_run_prefix(buf, count)?;
     if used != buf.len() {
         return Err(StoreError::Corrupt("input run trailing bytes"));
@@ -801,81 +803,6 @@ impl TxTable {
         self.body.flush_async()?;
         self.head.flush_async()?;
         Ok(())
-    }
-}
-
-/// Legacy split Class A **output** runs (`output.body` / `output.idx`).
-///
-/// Packed Class A does not create these files. Kept only to **open and read**
-/// pre-existing legacy datadirs that still have split runs.
-pub struct OutputTable {
-    body: VarTable,
-}
-
-impl OutputTable {
-    pub fn open(dir: &Path) -> Result<Self, StoreError> {
-        Ok(Self {
-            body: VarTable::open(dir, "output", TableKind::Output)?,
-        })
-    }
-
-    /// Decode full run; `count` must match TxRecord.output_count.
-    pub fn get_run(&self, fk: Fk, count: u32) -> Result<Vec<OutputRecord>, StoreError> {
-        let raw = self.body.get_raw(fk)?;
-        decode_output_run(&raw, count)
-    }
-
-    pub fn get_at(&self, fk: Fk, count: u32, index: u32) -> Result<OutputRecord, StoreError> {
-        if index >= count {
-            return Err(StoreError::NotFound);
-        }
-        let mut run = self.get_run(fk, count)?;
-        Ok(run.swap_remove(index as usize))
-    }
-
-    pub fn flush(&self) -> Result<(), StoreError> {
-        self.body.flush()
-    }
-
-    pub fn flush_async(&self) -> Result<(), StoreError> {
-        self.body.flush_async()
-    }
-}
-
-/// Legacy split Class A **input** runs (`input.body` / `input.idx`).
-///
-/// Packed Class A does not create these files. Kept only to **open and read**
-/// pre-existing legacy datadirs.
-pub struct InputTable {
-    body: VarTable,
-}
-
-impl InputTable {
-    pub fn open(dir: &Path) -> Result<Self, StoreError> {
-        Ok(Self {
-            body: VarTable::open(dir, "input", TableKind::Input)?,
-        })
-    }
-
-    pub fn get_run(&self, fk: Fk, count: u32) -> Result<Vec<InputRecord>, StoreError> {
-        let raw = self.body.get_raw(fk)?;
-        decode_input_run(&raw, count)
-    }
-
-    pub fn get_at(&self, fk: Fk, count: u32, index: u32) -> Result<InputRecord, StoreError> {
-        if index >= count {
-            return Err(StoreError::NotFound);
-        }
-        let mut run = self.get_run(fk, count)?;
-        Ok(run.swap_remove(index as usize))
-    }
-
-    pub fn flush(&self) -> Result<(), StoreError> {
-        self.body.flush()
-    }
-
-    pub fn flush_async(&self) -> Result<(), StoreError> {
-        self.body.flush_async()
     }
 }
 

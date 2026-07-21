@@ -182,9 +182,27 @@ impl Query {
             let Some((header_fk, _)) = self.get_header_by_hash(&hash)? else {
                 continue;
             };
+            // Do not prewarm until Class A body exists. In Direct mode archive
+            // co-writes `tx.head` with the body — wait for both before loading.
+            if !self.store.header_txs.has_body(header_fk)? {
+                continue;
+            }
             let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
                 continue;
             };
+            if tx_fks.is_empty() {
+                continue;
+            }
+            // Direct/tip with tx index: require first tx visible in head so parent
+            // resolve never races an in-flight archive without head upserts.
+            if self.tx_index_enabled() {
+                if let Some(&first) = tx_fks.first() {
+                    let meta = self.store.get_tx(first)?;
+                    if self.store.txs.get_by_txid(&meta.txid)?.is_none() {
+                        continue;
+                    }
+                }
+            }
             st.blocks = st.blocks.saturating_add(1);
             for fk in &tx_fks {
                 if let Some(id) = fk.get() {

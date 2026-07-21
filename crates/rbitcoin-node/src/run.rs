@@ -156,23 +156,26 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             milestone.height
         );
     }
-    // Catch-up IndexMode (even with full validation / milestone 0):
-    // - durable open-hash tx/point/SH off on the hot path
-    // - sequential sorted runs + light UTXO create_fk (catch-up spentness oracle)
-    // - materialize open-hash at enter_tip_mode before Electrum
+    // Direct IndexMode (IBD default):
+    // - archive batch-writes packed Class A + durable `tx.head`
+    // - confirm batch-writes spend annotations after Class C (no light UTXO)
+    // - SH still via sorted runs until enter_tip_mode
+    // - drops any leftover ibd_utxo.map and consumes point/tx runs from prior Catchup
     handle
         .query
-        .enter_catchup_mode()
-        .map_err(|e| NodeError::Config(format!("index catch-up mode: {e}")))?;
+        .enter_direct_index_mode()
+        .map_err(|e| NodeError::Config(format!("index direct mode: {e}")))?;
     info!(
-        "ibd: IndexMode::Catchup (tx/point/SH runs + mmap UTXO; materialize heads at Tip)"
+        "ibd: IndexMode::Direct (archive tx.head; confirm spend batch; SH runs; no light UTXO)"
     );
-    // Parent resolve during catch-up: light UTXO only (required in Catchup).
     handle
         .query
         .ensure_spent_oracle_ready()
         .map_err(|e| NodeError::Config(format!("spent oracle: {e}")))?;
-    info!("ibd: spent oracle ready (mmap UTXO tip aligned, mode={:?})", handle.query.index_mode());
+    info!(
+        "ibd: spent oracle ready (durable spends + tx.head, mode={:?})",
+        handle.query.index_mode()
+    );
 
     let listen = config
         .p2p_listen
@@ -775,10 +778,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rbitcoin-tip-mode-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         let q = Query::open_or_create(dir.join("store")).unwrap();
-        q.enter_catchup_mode().unwrap();
-        assert_eq!(q.index_mode(), IndexMode::Catchup);
-        assert!(!q.spend_index_enabled());
-        assert!(!q.tx_index_enabled());
+        q.enter_direct_index_mode().unwrap();
+        assert_eq!(q.index_mode(), IndexMode::Direct);
+        assert!(q.spend_index_enabled());
+        assert!(q.tx_index_enabled());
+        assert!(!q.ibd_utxo_enabled());
 
         enter_tip_mode(&q);
         assert_eq!(q.index_mode(), IndexMode::Tip);

@@ -63,10 +63,13 @@ warning and continues without inhibit.
 start (before seeds), updated after IBD and on shutdown. Seeds are merged in
 without clearing known flags.
 
-**Index modes:** IBD uses **`IndexMode::Catchup`** (sorted runs + light UTXO
-spentness). After tip ≈ peer height, the node materializes heads and switches to
-**`IndexMode::Tip`** (durable points / `tx.head`). Mid-chain peer death must
-**not** enter Tip (restart resumes Catchup).
+**Index modes:** IBD defaults to **`IndexMode::Direct`**: archive batch-writes
+packed Class A + durable **`tx.head`**; confirm batch-writes **spend annotations**
+after Class C (no light UTXO); scripthash still uses sorted runs until tip.
+On enter Direct, any leftover `ibd_utxo.map` is removed and point/tx runs are
+materialized. **`IndexMode::Catchup`** (runs + light UTXO) remains available via
+API for tests/experiments. After tip ≈ peer height, the node finishes SH runs and
+switches to **`IndexMode::Tip`**.
 
 **Catch-up runs → open-hash (hysteresis):** memtable spills **small sorted runs
 with no mid-IBD merge**. When `arch − tip ≥ 65536`, **new peer getdata stops**

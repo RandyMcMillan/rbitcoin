@@ -334,6 +334,8 @@ pub struct Query {
     point_run: point_run_builder::PointRunBuilder,
     /// Catch-up spentness: mmap unspent outpoint → create Class A fk.
     ibd_utxo: Mutex<Option<IbdUtxo>>,
+    /// Explicit [`IndexMode`] (Catchup / Direct / Tip).
+    index_mode_cell: std::sync::atomic::AtomicU8,
     /// Cooperative cancel for in-flight confirm (prewarm waits). Set on IBD
     /// SIGINT teardown so the confirm OS thread aborts waits before process exit.
     confirm_cancel: std::sync::atomic::AtomicBool,
@@ -368,6 +370,8 @@ impl Query {
             tx_run: tx_run_builder::TxRunBuilder::new(&store_path),
             point_run: point_run_builder::PointRunBuilder::new(&store_path),
             ibd_utxo: Mutex::new(None),
+            // Open as Tip until IBD selects Direct (default) or Catchup.
+            index_mode_cell: std::sync::atomic::AtomicU8::new(IndexMode::Tip as u8),
             confirm_cancel: std::sync::atomic::AtomicBool::new(false),
         };
         // Warm cache from durable head if present (resume with index on).
@@ -495,14 +499,16 @@ impl Query {
     /// True if this outpoint is spent on the **best chain**.
     ///
     /// - [`IndexMode::Catchup`]: light UTXO unspent set.
-    /// - [`IndexMode::Tip`]: durable confirmed-strong point edges only.
+    /// - [`IndexMode::Direct`] / [`IndexMode::Tip`]: durable confirmed-strong spends.
     ///
     /// Does **not** treat archive-only point rows as spent: Class A may write
     /// edges before Class C; those spenders are not strong yet.
     pub fn is_outpoint_spent(&self, txid: &[u8; 32], vout: u32) -> Result<bool, QueryError> {
         match self.index_mode() {
             IndexMode::Catchup => self.catchup_is_spent(txid, vout),
-            IndexMode::Tip => self.store.has_confirmed_strong_spender(txid, vout),
+            IndexMode::Direct | IndexMode::Tip => {
+                self.store.has_confirmed_strong_spender(txid, vout)
+            }
         }
     }
 

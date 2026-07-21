@@ -121,7 +121,7 @@ impl Query {
                 if vi >= n {
                     continue;
                 }
-                if self.catchup_is_spent(&tx.txid, v)? {
+                if self.is_outpoint_spent(&tx.txid, v)? {
                     continue;
                 }
                 if let Some(o) = outs_map.get(&v) {

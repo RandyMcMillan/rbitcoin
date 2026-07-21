@@ -453,9 +453,8 @@ pub(crate) fn connect_block_prevouts(
     // Spent checks:
     // - pending_spent: this confirm run (ephemeral)
     // - catch-up: light UTXO via catchup_is_spent
-    // - tip: durable has_confirmed_strong_spender (source of truth; no tip-live
-    //   short-circuit — that needed spent_local as a safety net)
-    let spend_index_on = query.spend_index_enabled();
+    // - direct/tip: durable has_confirmed_strong_spender
+    let durable_spends = query.index_mode().uses_durable_spends();
 
     for (ti, tx) in block.txdata.iter().enumerate() {
         let spend_fk = archived_tx_fks.map(|fks| fks[ti]);
@@ -508,8 +507,8 @@ pub(crate) fn connect_block_prevouts(
                 let wave_live = wave_prevouts
                     .and_then(|w| w.get_by_txid(op.txid.as_byte_array(), op.vout))
                     .is_some();
-                if spend_index_on {
-                    // Tip mode: durable confirmed-strong points only.
+                if durable_spends {
+                    // Direct/Tip: durable confirmed-strong spend annotations.
                     if query
                         .store()
                         .has_confirmed_strong_spender(op.txid.as_byte_array(), op.vout)
@@ -532,7 +531,7 @@ pub(crate) fn connect_block_prevouts(
                     .and_then(|e| e.create_fk.map(rbitcoin_primitives::Fk))
                     .or_else(|| pending_creates.get(&key).copied())
                     .or_else(|| {
-                        // Only probe UTXO for create_fk when wave/thin missed.
+                        // Only probe UTXO / head for create_fk when wave/thin missed.
                         if wave_live {
                             None
                         } else {
@@ -540,6 +539,12 @@ pub(crate) fn connect_block_prevouts(
                                 .ibd_utxo_create_fk(op.txid.as_byte_array(), op.vout)
                                 .ok()
                                 .flatten()
+                                .or_else(|| {
+                                    query
+                                        .tx_fk_by_txid(op.txid.as_byte_array())
+                                        .ok()
+                                        .flatten()
+                                })
                         }
                     });
                 let prev_out = resolve_prevout(

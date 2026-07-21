@@ -427,6 +427,8 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
     // Apply light UTXO first so the next wave's catchup_is_spent sees spends.
     // Catch-up unpin is a no-op (see Query::unpin_spent_parent_outs); tip-follow
     // does a cheap runway-only retire after apply.
+    // Direct mode: batch durable spend annotations for the whole run **before**
+    // the next confirm batch (spentness = confirmed-strong + annotation).
     let t_spent = Instant::now();
     if query.ibd_utxo_enabled() {
         // Per-height order (spends then creates) so H+1 can spend H in the same
@@ -445,6 +447,22 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
             query.note_ibd_utxo_rebuild();
             query
                 .rebuild_ibd_utxo_to_tip()
+                .map_err(ConsensusError::Store)?;
+        }
+    } else if query.index_mode().is_direct() && query.spend_index_enabled() {
+        let mut edges: Vec<([u8; 32], u32, rbitcoin_primitives::Fk, u32)> = Vec::new();
+        for p in prepared {
+            for &(txid, vout, sfk) in &p.spends {
+                if sfk.is_null() {
+                    continue;
+                }
+                edges.push((txid, vout, sfk, 0));
+            }
+        }
+        if !edges.is_empty() {
+            query
+                .store()
+                .put_spend_batch(&edges)
                 .map_err(ConsensusError::Store)?;
         }
     }

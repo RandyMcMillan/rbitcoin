@@ -92,7 +92,10 @@ impl Query {
         let mut packed: Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> = Vec::new();
         let mut per_header_ranges: Vec<(Fk, Fk, u32)> = Vec::with_capacity(need.len());
         let mut spends: Vec<([u8; 32], u32, Fk, u32)> = Vec::new();
-        let spend_on = self.spend_index_enabled();
+        // Tip: archive writes durable spends. Direct: confirm batch-writes after Class C.
+        // Catchup: no durable spends (point runs).
+        let archive_spends =
+            self.spend_index_enabled() && self.index_mode().is_tip();
         let index_tx = self.tx_index_enabled();
         let tx_runs = self.tx_run_enabled();
 
@@ -117,7 +120,7 @@ impl Query {
 
                 let mut inputs = ta.inputs;
                 for (i, inp) in inputs.iter_mut().enumerate() {
-                    if !inp.is_coinbase() && spend_on {
+                    if !inp.is_coinbase() && archive_spends {
                         // Tip mode: durable spend on output (resolve create via tx.head).
                         spends.push((inp.prev_txid, inp.prev_index, tx_fk, i as u32));
                     }
@@ -156,7 +159,7 @@ impl Query {
             }
         }
 
-        if spend_on && !spends.is_empty() {
+        if archive_spends && !spends.is_empty() {
             // Tip: annotate create outputs (tx.head resolve per prevout).
             self.store.put_spend_batch(&spends)?;
         }

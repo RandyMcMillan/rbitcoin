@@ -1,10 +1,12 @@
-//! Catch-up index mode: light UTXO, sorted runs, IndexMode helpers.
+//! Index modes: light UTXO + runs, direct durable tx/spends, tip-follow.
 //!
-//! Spentness truth in [`IndexMode::Catchup`] is the mmap unspent set
-//! (`ibd_utxo.map`). Tip mode uses durable points (see [`super::Query::is_outpoint_spent`]).
+//! Spentness truth:
+//! - [`IndexMode::Catchup`]: mmap unspent set (`ibd_utxo.map`)
+//! - [`IndexMode::Direct`] / [`IndexMode::Tip`]: durable confirmed-strong spends
 
 use super::*;
 use rbitcoin_store::IbdUtxo;
+use std::sync::atomic::Ordering;
 
 /// Result of one hysteresis materialize step (one sorted run into a durable index).
 #[derive(Clone, Debug)]
@@ -17,29 +19,47 @@ pub struct MaterializeRunResult {
     pub elapsed: std::time::Duration,
 }
 
-/// First-class index / spentness mode for catch-up vs tip-follow.
+/// First-class index / spentness mode.
 ///
-/// | Mode | Durable `tx.head` / points | Spentness truth |
-/// |------|----------------------------|-----------------|
-/// | [`Catchup`](IndexMode::Catchup) | off (sorted runs) | light mmap UTXO |
-/// | [`Tip`](IndexMode::Tip) | on (open-hash) | confirmed-strong points |
+/// | Mode | Durable `tx.head` | Durable spends | Light UTXO | Runs |
+/// |------|-------------------|----------------|------------|------|
+/// | [`Catchup`](IndexMode::Catchup) | off (tx runs) | off (point runs) | on | tx+point+SH |
+/// | [`Direct`](IndexMode::Direct) | on (archive batch) | on (confirm batch) | off | SH only |
+/// | [`Tip`](IndexMode::Tip) | on | on (archive path) | off | none (materialized) |
 ///
-/// Open defaults to [`Tip`] until the node calls [`Query::enter_catchup_mode`].
-/// After catch-up, materialize runs then [`Query::enter_tip_index_mode`].
+/// Open defaults to [`Tip`] until the node calls [`Query::enter_direct_index_mode`]
+/// (IBD default) or [`Query::enter_catchup_mode`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum IndexMode {
-    /// IBD / catch-up: runs + UTXO; durable open-hash heads off.
-    Catchup,
-    /// Steady-state / Electrum: durable points + `tx.head`.
-    Tip,
+    /// IBD: sorted runs + light UTXO; durable open-hash heads off.
+    Catchup = 0,
+    /// IBD: archive writes `tx.head`; confirm batch-writes spend annotations; no UTXO.
+    Direct = 1,
+    /// Steady-state / Electrum: durable points + `tx.head` (+ SH materialized).
+    Tip = 2,
 }
 
 impl IndexMode {
     pub fn is_catchup(self) -> bool {
         matches!(self, Self::Catchup)
     }
+    pub fn is_direct(self) -> bool {
+        matches!(self, Self::Direct)
+    }
     pub fn is_tip(self) -> bool {
         matches!(self, Self::Tip)
+    }
+    /// Spentness uses durable confirmed-strong annotations (not light UTXO).
+    pub fn uses_durable_spends(self) -> bool {
+        matches!(self, Self::Direct | Self::Tip)
+    }
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Catchup,
+            1 => Self::Direct,
+            _ => Self::Tip,
+        }
     }
 }
 
@@ -115,40 +135,103 @@ impl Query {
     }
 
     /// Current index / spentness mode ([`IndexMode`]).
-    ///
-    /// Derived from durable spend-index flag: off ⇒ Catchup, on ⇒ Tip.
     #[inline]
     pub fn index_mode(&self) -> IndexMode {
-        if self.spend_index_enabled() {
-            IndexMode::Tip
-        } else {
-            IndexMode::Catchup
-        }
+        IndexMode::from_u8(self.index_mode_cell.load(Ordering::SeqCst))
+    }
+
+    fn set_index_mode(&self, mode: IndexMode) {
+        self.index_mode_cell
+            .store(mode as u8, Ordering::SeqCst);
     }
 
     /// Enter catch-up: durable heads off, sorted runs on, light UTXO required.
     ///
-    /// Node IBD entry point. Prefer this over hand-toggling flags.
+    /// Kept for tests / experimental IBD. Production IBD uses
+    /// [`Self::enter_direct_index_mode`].
     pub fn enter_catchup_mode(&self) -> Result<(), QueryError> {
+        self.set_index_mode(IndexMode::Catchup);
         self.set_spend_index(false);
         self.set_tx_index(false);
         self.enable_index_run_mode()
+    }
+
+    /// Enter **direct** IBD: durable `tx.head` on archive, spend annotations on
+    /// confirm (batch), no light UTXO, no point/tx runs (SH runs still on).
+    ///
+    /// On entry: remove any `ibd_utxo.map` and materialize leftover point/tx runs
+    /// into durable indexes so the store is consistent before IBD continues.
+    pub fn enter_direct_index_mode(&self) -> Result<(), QueryError> {
+        self.set_index_mode(IndexMode::Direct);
+        self.set_spend_index(true);
+        self.set_tx_index(true);
+        // SH still deferred via runs; do not enable point/tx run workers.
+        self.sh_run.enable();
+        self.drop_ibd_utxo_file()?;
+        self.consume_point_and_tx_runs()?;
+        Ok(())
     }
 
     /// Flip durable index flags on for tip-follow (after run materialize / backfill).
     ///
     /// Does not materialize runs — the node `enter_tip_mode` path does that first.
     pub fn enter_tip_index_mode(&self) {
+        self.set_index_mode(IndexMode::Tip);
         self.set_spend_index(true);
         self.set_tx_index(true);
+    }
+
+    /// Drop process UTXO handle and delete `ibd_utxo.map` if present.
+    pub fn drop_ibd_utxo_file(&self) -> Result<(), QueryError> {
+        {
+            let mut g = self.ibd_utxo.lock().unwrap();
+            *g = None;
+        }
+        let path = self.store.path().join("ibd_utxo.map");
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| StoreError::io(&path, e))?;
+            rbitcoin_log::info!(
+                "store: removed light UTXO map {} (direct index mode)",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Materialize any on-disk point/tx sorted runs into durable indexes.
+    ///
+    /// Used when switching to [`IndexMode::Direct`] after a prior Catchup run.
+    pub fn consume_point_and_tx_runs(&self) -> Result<(), QueryError> {
+        // Finalize may no-op worker join if never enabled; still drains disk runs.
+        match self.point_run.finalize_and_materialize(&self.store) {
+            Ok(n) if n > 0 => {
+                rbitcoin_log::info!("store: consumed point runs edges≈{n} into durable spends")
+            }
+            Ok(_) => {}
+            Err(e) => {
+                rbitcoin_log::warn!("store: point run consume failed: {e}");
+                return Err(e);
+            }
+        }
+        match self.tx_run.finalize_and_materialize(&self.store) {
+            Ok(n) if n > 0 => {
+                rbitcoin_log::info!("store: consumed tx runs keys≈{n} into tx.head")
+            }
+            Ok(_) => {}
+            Err(e) => {
+                rbitcoin_log::warn!("store: tx run consume failed: {e}");
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     /// True if outpoint is spent on the **catch-up** oracle ([`IndexMode::Catchup`]).
     ///
     /// Light UTXO unspent set: not present ⇒ spent or never created.
-    /// Tip mode returns false so callers use durable points.
+    /// Direct/Tip return false so callers use durable points.
     pub fn catchup_is_spent(&self, txid: &[u8; 32], vout: u32) -> Result<bool, QueryError> {
-        if self.index_mode().is_tip() {
+        if !self.index_mode().is_catchup() {
             return Ok(false); // durable path handles spentness
         }
         let g = self.ibd_utxo.lock().unwrap();
@@ -305,9 +388,9 @@ impl Query {
 
     /// Hard-block catch-up confirm unless light UTXO is enabled and tip-aligned.
     ///
-    /// [`IndexMode::Tip`] uses durable points only — always ready.
+    /// [`IndexMode::Direct`] / [`IndexMode::Tip`] use durable spends — always ready.
     pub fn ensure_spent_oracle_ready(&self) -> Result<(), QueryError> {
-        if self.index_mode().is_tip() {
+        if !self.index_mode().is_catchup() {
             return Ok(());
         }
         let chain_tip = self.tip_height().map(|h| h.0);

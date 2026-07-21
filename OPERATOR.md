@@ -65,11 +65,12 @@ without clearing known flags.
 
 **Index modes:** IBD defaults to **`IndexMode::Direct`**: archive batch-writes
 packed Class A + durable **`tx.head`**; confirm batch-writes **spend annotations**
-after Class C (no light UTXO); scripthash still uses sorted runs until tip.
-On enter Direct, any leftover `ibd_utxo.map` is removed and point/tx runs are
-materialized. **`IndexMode::Catchup`** (runs + light UTXO) remains available via
-API for tests/experiments. After tip ≈ peer height, the node finishes SH runs and
-switches to **`IndexMode::Tip`**.
+after Class C (no light UTXO). Scripthash is **not** progressively materialized:
+confirm only enqueues sorted runs (background flush + merge); at tip the node
+**merges remaining runs and cold bulk-loads** durable SH tables (migration-style)
+before Electrum. On enter Direct, leftover `ibd_utxo.map` is removed and point/tx
+runs are materialized — prefer a **fresh datadir**. **`IndexMode::Catchup`**
+(runs + light UTXO + progressive mat) remains available for tests.
 
 **Catch-up runs → open-hash (hysteresis):** memtable spills **small sorted runs
 with no mid-IBD merge**. When `arch − tip ≥ 65536`, **new peer getdata stops**

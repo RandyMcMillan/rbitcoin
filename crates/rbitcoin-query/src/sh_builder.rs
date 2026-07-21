@@ -13,8 +13,8 @@ use super::run_builder_core::{
 use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
-    list_runs, merge_runs, next_run_path, read_run_body, write_sorted_run, ScriptHashRecord,
-    Store, StoreError, SortedRunPath,
+    list_runs, merge_runs, next_run_path, read_run_body, write_sorted_run, ScriptHashRecord, Store,
+    StoreError, SortedRunPath,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -216,44 +216,100 @@ impl ShRunBuilder {
 
     /// Stop enqueues, flush remaining, materialize each run, join worker.
     pub fn finalize_and_materialize(&self, store: &Store) -> Result<u64, StoreError> {
+        self.finalize_and_bulk_materialize(store)
+    }
+
+    /// Flush memtable, **fully merge** runs, then **cold bulk-load** into durable SH.
+    ///
+    /// Migration-style load (no per-key head seed probes when SH tables empty).
+    /// Preferred at tip after Direct IBD (runs only flush/merge during catch-up).
+    pub fn finalize_and_bulk_materialize(&self, store: &Store) -> Result<u64, StoreError> {
         finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
-        // Compact remaining runs so tip materialize sees fewer large sorted files.
+        let (runs_dir, runs_io, mut next_seq) = {
+            let g = self.inner.lock().unwrap();
+            (
+                g.ctrl.runs_dir.clone(),
+                Arc::clone(&g.ctrl.runs_io),
+                g.ctrl.next_seq,
+            )
+        };
         {
-            let (runs_dir, runs_io, mut next_seq) = {
-                let g = self.inner.lock().unwrap();
-                (
-                    g.ctrl.runs_dir.clone(),
-                    Arc::clone(&g.ctrl.runs_io),
-                    g.ctrl.next_seq,
-                )
-            };
-            {
-                let _io = runs_io.lock().unwrap();
-                while try_merge_two_oldest(&runs_dir, &mut next_seq).unwrap_or(false) {}
+            let _io = runs_io.lock().unwrap();
+            let mut merges = 0u32;
+            while try_merge_two_oldest(&runs_dir, &mut next_seq).unwrap_or(false) {
+                merges = merges.saturating_add(1);
+                if merges % 50 == 0 {
+                    info!("node: scripthash run merge progress merges={merges}");
+                }
             }
+            if merges > 0 {
+                info!("node: scripthash run merge done merges={merges}");
+            }
+        }
+        {
             let mut g = self.inner.lock().unwrap();
             g.ctrl.next_seq = next_seq;
         }
-        let mut inserted = 0u64;
-        loop {
-            let t0 = Instant::now();
-            match self.materialize_oldest_run(store)? {
-                Some(n) => {
-                    inserted = inserted.saturating_add(n);
-                    info!(
-                        "node: scripthash materialize run keys≈{n} total≈{inserted} elapsed={:?}",
-                        t0.elapsed()
-                    );
-                }
-                None => break,
+
+        // Claim all remaining runs under lock, then bulk-load sorted bodies.
+        let mut claimed: Vec<SortedRunPath> = Vec::new();
+        {
+            let _io = runs_io.lock().unwrap();
+            let mut runs = list_runs(&runs_dir)?;
+            runs.sort_by_key(|r| r.seq().unwrap_or(u64::MAX));
+            for run in runs {
+                claimed.push(rbitcoin_store::claim_run_for_materialize(&run)?);
             }
         }
-        if inserted == 0 {
-            info!("node: scripthash run materialize: no runs");
+
+        if claimed.is_empty() {
+            info!("node: scripthash bulk materialize: no runs");
+            clear_runs_dir(&runs_dir);
+            return Ok(0);
         }
-        let runs_dir = self.inner.lock().unwrap().ctrl.runs_dir.clone();
+
+        let total_recs: u64 = claimed.iter().map(|r| r.count).sum();
+        info!(
+            "node: scripthash bulk materialize start runs={} records≈{total_recs}",
+            claimed.len()
+        );
+        let t0 = Instant::now();
+        let mut all: Vec<ScriptHashRecord> =
+            Vec::with_capacity(total_recs.min(u64::from(u32::MAX)) as usize);
+        for run in &claimed {
+            let body = read_run_body(run)?;
+            let rec_len = run.rec_len as usize;
+            let mut offset = 0usize;
+            while offset + rec_len <= body.len() {
+                let (sh, tx_fk) = decode_rec(&body[offset..offset + rec_len])?;
+                offset += rec_len;
+                if tx_fk.is_null() {
+                    continue;
+                }
+                all.push(ScriptHashRecord::from_fk(sh, tx_fk));
+            }
+        }
+        // Runs are each sorted; after multi-run claim order is by seq (merge
+        // order). Re-sort for bulk_load key grouping.
+        all.sort_unstable_by(|a, b| {
+            a.scripthash
+                .cmp(&b.scripthash)
+                .then(a.create_tx_fk.0.cmp(&b.create_tx_fk.0))
+        });
+        all.dedup_by(|a, b| a.scripthash == b.scripthash && a.create_tx_fk == b.create_tx_fk);
+
+        let n = store.scripthash.bulk_load_sorted_creates(&all)?;
+        store.scripthash.flush()?;
+        for run in &claimed {
+            let _ = std::fs::remove_file(&run.path);
+        }
         clear_runs_dir(&runs_dir);
-        Ok(inserted)
+        info!(
+            "node: scripthash bulk materialize done creates≈{n} unique_in≈{} elapsed={:?}",
+            all.len(),
+            t0.elapsed()
+        );
+        Ok(n as u64)
     }
 }
 

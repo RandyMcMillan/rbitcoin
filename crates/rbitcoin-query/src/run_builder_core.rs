@@ -105,6 +105,15 @@ pub mod run_materialize_control {
         }
     }
 
+    /// Stay in fetch mode (no progressive head materialize). Direct IBD uses
+    /// this so SH runs only flush/merge until tip bulk-load.
+    pub fn force_fetch_mode(arch_lead: u32, archive_at_tip: bool, peer_inflight: u32) {
+        ARCH_LEAD.store(arch_lead, Ordering::Relaxed);
+        ARCHIVE_AT_TIP.store(archive_at_tip, Ordering::Relaxed);
+        PEER_INFLIGHT.store(peer_inflight, Ordering::Relaxed);
+        MODE.store(MODE_FETCH, Ordering::Relaxed);
+    }
+
     pub fn arch_lead() -> u32 {
         ARCH_LEAD.load(Ordering::Relaxed)
     }

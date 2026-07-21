@@ -589,6 +589,119 @@ impl ScriptHashTable {
         Ok(())
     }
 
+    /// Cold bulk load of **scripthash-sorted** creates (migration-style).
+    ///
+    /// When the table is empty: no per-key head probes, bump-only slab alloc,
+    /// batched `insert_many` for heads, **one** alloc-header write at the end.
+    /// When non-empty: falls back to [`Self::put_create_batch_append`].
+    ///
+    /// `recs` should be sorted by `scripthash` (as sorted-run materialize produces).
+    pub fn bulk_load_sorted_creates(
+        &self,
+        recs: &[ScriptHashRecord],
+    ) -> Result<usize, StoreError> {
+        if recs.is_empty() {
+            return Ok(0);
+        }
+        if self.entry_count() > 0 {
+            let mut heads = HashMap::new();
+            let (n, _) = self.put_create_batch_append(recs, &mut heads)?;
+            return Ok(n);
+        }
+
+        // Count unique keys for head reserve.
+        let mut n_keys = 0u64;
+        {
+            let mut prev: Option<[u8; 32]> = None;
+            for r in recs {
+                if r.create_tx_fk.is_null() {
+                    continue;
+                }
+                if prev != Some(r.scripthash) {
+                    n_keys = n_keys.saturating_add(1);
+                    prev = Some(r.scripthash);
+                }
+            }
+        }
+        if n_keys > 0 {
+            self.head.reserve_additional(n_keys)?;
+        }
+
+        const HEAD_FLUSH: usize = 65_536;
+        let mut head_buf: Vec<([u8; 32], ShHeadValue)> = Vec::with_capacity(HEAD_FLUSH);
+        let mut written = 0usize;
+        let mut alloc = self.alloc.lock().unwrap();
+
+        let mut i = 0usize;
+        while i < recs.len() {
+            if recs[i].create_tx_fk.is_null() {
+                i += 1;
+                continue;
+            }
+            let key = recs[i].scripthash;
+            let mut live: Vec<ShEntry> = Vec::new();
+            let mut seen: Vec<Fk> = Vec::new();
+            while i < recs.len() {
+                let r = &recs[i];
+                if r.scripthash != key {
+                    break;
+                }
+                if !r.create_tx_fk.is_null() && !seen.iter().any(|&c| c == r.create_tx_fk) {
+                    seen.push(r.create_tx_fk);
+                    live.push(ShEntry::new(r.create_tx_fk));
+                }
+                i += 1;
+            }
+            if live.is_empty() {
+                continue;
+            }
+            let n = live.len() as u32;
+            written = written.saturating_add(live.len());
+            alloc.live_count = alloc.live_count.saturating_add(u64::from(n));
+
+            let val = if n <= SH_INLINE_CAP as u32 {
+                if n == 1 {
+                    ShHeadValue::inline_one(live[0])
+                } else {
+                    ShHeadValue::inline_two(live[0], live[1])
+                }
+            } else {
+                let class = class_for_count(n).ok_or(StoreError::Corrupt(
+                    "scripthash bulk: entry count exceeds max slab class",
+                ))?;
+                let need = slab_bytes(class);
+                let off = alloc.bump;
+                alloc.bump = alloc.bump.saturating_add(need);
+                self.body.ensure_capacity(alloc.bump)?;
+                if alloc.bump > self.body.logical_len() {
+                    self.body.set_logical_len(alloc.bump)?;
+                }
+                let mut blob = Vec::with_capacity(need as usize);
+                for e in &live {
+                    blob.extend_from_slice(&e.encode());
+                }
+                blob.resize(need as usize, 0);
+                self.body.write_at(off, &blob)?;
+                ShHeadValue::Slab {
+                    class,
+                    used: n,
+                    slab_off: off,
+                }
+            };
+            head_buf.push((key, val));
+            if head_buf.len() >= HEAD_FLUSH {
+                self.head.insert_many_sharded(&head_buf, true)?;
+                head_buf.clear();
+            }
+        }
+        if !head_buf.is_empty() {
+            self.head.insert_many_sharded(&head_buf, true)?;
+        }
+        write_alloc_header(&self.body, &alloc)?;
+        drop(alloc);
+        Ok(written)
+    }
+
 }
 
 fn write_alloc_header(body: &TableFile, state: &AllocState) -> Result<(), StoreError> {

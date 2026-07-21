@@ -159,14 +159,14 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     // Direct IndexMode (IBD default):
     // - archive batch-writes packed Class A + durable `tx.head`
     // - confirm batch-writes spend annotations after Class C (no light UTXO)
-    // - SH still via sorted runs until enter_tip_mode
-    // - drops any leftover ibd_utxo.map and consumes point/tx runs from prior Catchup
+    // - SH: enqueue + run merge only (no progressive head mat); bulk-load at tip
+    // - drops leftover ibd_utxo.map / point+tx runs (fresh IBD has none)
     handle
         .query
         .enter_direct_index_mode()
         .map_err(|e| NodeError::Config(format!("index direct mode: {e}")))?;
     info!(
-        "ibd: IndexMode::Direct (archive tx.head; confirm spend batch; SH runs; no light UTXO)"
+        "ibd: IndexMode::Direct (archive tx.head; confirm spend batch; SH runs merge-only; bulk SH at tip; no light UTXO)"
     );
     handle
         .query
@@ -744,9 +744,11 @@ pub(crate) fn enter_tip_mode(query: &Query) {
         }
     }
 
+    // SH: Direct IBD only flush/merges runs; tip does cold bulk-load (migration-style).
+    info!("node: scripthash bulk materialize from runs (merge + cold load)…");
     match query.finalize_sh_runs() {
-        Ok(n) => info!("node: scripthash run materialize inserted≈{n}"),
-        Err(e) => warn!("node: scripthash run materialize failed: {e}"),
+        Ok(n) => info!("node: scripthash bulk materialize creates≈{n}"),
+        Err(e) => warn!("node: scripthash bulk materialize failed: {e}"),
     }
 
     // Tip-follow: durable indexes on (write-through; low rate). Spentness = points.
@@ -760,7 +762,7 @@ pub(crate) fn enter_tip_mode(query: &Query) {
         query.scripthash_entry_count()
     );
 
-    info!("node: tip-mode backfill complete — safe to start Electrum");
+    info!("node: tip-mode index build complete — safe to start Electrum");
 }
 
 #[cfg(test)]

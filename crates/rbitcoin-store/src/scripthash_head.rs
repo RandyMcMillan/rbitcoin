@@ -630,6 +630,19 @@ impl ShardedScriptHashHead {
         self.shards[self.shard_of(key)].clear_key(key)
     }
 
+    /// Pre-size shards for an upcoming bulk insert (`additional` keys globally).
+    pub fn reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
+        if self.shards.is_empty() {
+            return Ok(());
+        }
+        // Spread estimate evenly; each shard grows if needed.
+        let per = additional.div_ceil(self.shards.len() as u64).max(1);
+        for s in &self.shards {
+            s.reserve_additional(per)?;
+        }
+        Ok(())
+    }
+
     /// Insert head values, applying **one shard at a time** (sorted within shard).
     ///
     /// When `flush_each_shard` is true (large materialize runs), flush the shard

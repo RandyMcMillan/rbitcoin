@@ -24,7 +24,7 @@ pub struct MaterializeRunResult {
 /// | Mode | Durable `tx.head` | Durable spends | Light UTXO | Runs |
 /// |------|-------------------|----------------|------------|------|
 /// | [`Catchup`](IndexMode::Catchup) | off (tx runs) | off (point runs) | on | tx+point+SH |
-/// | [`Direct`](IndexMode::Direct) | on (archive batch) | on (confirm batch) | off | SH only |
+/// | [`Direct`](IndexMode::Direct) | on (archive batch) | on (confirm batch) | off | SH merge-only → bulk at tip |
 /// | [`Tip`](IndexMode::Tip) | on | on (archive path) | off | none (materialized) |
 ///
 /// Open defaults to [`Tip`] until the node calls [`Query::enter_direct_index_mode`]
@@ -159,8 +159,8 @@ impl Query {
     /// Enter **direct** IBD: durable `tx.head` on archive, spend annotations on
     /// confirm (batch), no light UTXO, no point/tx runs (SH runs still on).
     ///
-    /// On entry: remove any `ibd_utxo.map` and materialize leftover point/tx runs
-    /// into durable indexes so the store is consistent before IBD continues.
+    /// On entry: remove any `ibd_utxo.map` and materialize leftover point/tx runs.
+    /// Intended for a **fresh** (or already Direct) store — no chain backfill.
     pub fn enter_direct_index_mode(&self) -> Result<(), QueryError> {
         self.set_index_mode(IndexMode::Direct);
         self.set_spend_index(true);
@@ -424,9 +424,12 @@ impl Query {
         Ok(())
     }
 
-    /// Flush/compact SH runs and bulk-load durable scripthash tables (tip mode).
+    /// Flush/compact SH runs and load durable scripthash tables (tip mode).
+    ///
+    /// Direct: migration-style cold bulk load after full merge.
+    /// Catchup: may still have progressive mat residual; uses bulk if empty else append.
     pub fn finalize_sh_runs(&self) -> Result<u64, QueryError> {
-        self.sh_run.finalize_and_materialize(&self.store)
+        self.sh_run.finalize_and_bulk_materialize(&self.store)
     }
 
     pub fn finalize_tx_runs(&self) -> Result<u64, QueryError> {
@@ -452,6 +455,18 @@ impl Query {
         peer_inflight: u32,
     ) {
         use crate::run_builder_core::run_materialize_control as ctl;
+        // Direct: SH runs flush/merge only — never progressive head materialize.
+        if self.index_mode().is_direct() {
+            let was_mat = ctl::in_materialize_mode();
+            ctl::force_fetch_mode(arch_lead, archive_at_tip, peer_inflight);
+            rbitcoin_store::set_defer_durable_flush(false);
+            if was_mat {
+                if let Err(e) = self.store.flush_index_tables() {
+                    rbitcoin_log::warn!("store: flush after leaving mat (direct): {e}");
+                }
+            }
+            return;
+        }
         let was_mat = ctl::in_materialize_mode();
         ctl::publish(arch_lead, archive_at_tip, peer_inflight);
         let now_mat = ctl::in_materialize_mode();
@@ -478,19 +493,27 @@ impl Query {
 
     /// Materialize one oldest run (point → tx → SH). `Ok(None)` if nothing to do.
     ///
-    /// Logs `store`, key/edge count, and wall time at DEBUG for each successful apply.
+    /// Direct mode never progressive-mats SH (runs merge only; bulk load at tip).
     pub fn materialize_one_index_run(&self) -> Result<Option<MaterializeRunResult>, QueryError> {
+        let direct = self.index_mode().is_direct();
         let t0 = std::time::Instant::now();
-        if let Some(n) = self.point_run.materialize_oldest_run(&self.store)? {
-            return Ok(Some(Self::finish_mat_step("point", n, t0)));
+        if !direct {
+            if let Some(n) = self.point_run.materialize_oldest_run(&self.store)? {
+                return Ok(Some(Self::finish_mat_step("point", n, t0)));
+            }
         }
         let t0 = std::time::Instant::now();
-        if let Some(n) = self.tx_run.materialize_oldest_run(&self.store)? {
-            return Ok(Some(Self::finish_mat_step("tx.head", n, t0)));
+        if !direct {
+            if let Some(n) = self.tx_run.materialize_oldest_run(&self.store)? {
+                return Ok(Some(Self::finish_mat_step("tx.head", n, t0)));
+            }
         }
         let t0 = std::time::Instant::now();
-        if let Some(n) = self.sh_run.materialize_oldest_run(&self.store)? {
-            return Ok(Some(Self::finish_mat_step("scripthash", n, t0)));
+        // Catchup only: progressive SH mat. Direct waits for tip bulk-load.
+        if !direct {
+            if let Some(n) = self.sh_run.materialize_oldest_run(&self.store)? {
+                return Ok(Some(Self::finish_mat_step("scripthash", n, t0)));
+            }
         }
         Ok(None)
     }

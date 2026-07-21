@@ -59,14 +59,8 @@ impl RunMaterializeWorker {
                             // Nothing left this tick.
                             std::thread::sleep(IDLE);
                         }
-                        Ok(Some(step)) => {
-                            // Query already DEBUG-logs store/keys/elapsed; promote slow steps.
-                            if step.elapsed >= Duration::from_millis(500) {
-                                info!(
-                                    "ibd: run materialize store={} keys≈{} elapsed={:?}",
-                                    step.store, step.keys, step.elapsed
-                                );
-                            }
+                        Ok(Some(_step)) => {
+                            // Per-run DEBUG is emitted inside materialize_oldest_run.
                             std::thread::sleep(AFTER_RUN);
                         }
                         Err(e) => {

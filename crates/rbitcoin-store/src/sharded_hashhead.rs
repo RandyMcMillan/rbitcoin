@@ -13,23 +13,12 @@ use crate::error::StoreError;
 use crate::hashhead::{initial_slots_for, HeadRole, HeadScale, HashHead};
 use rbitcoin_primitives::Fk;
 use std::path::PathBuf;
-use std::time::Duration;
 
-/// Mainnet **header** shard count (`key[0]` → 256 files). Fine partitioning keeps
-/// each rehash local on large open-address tables.
+/// Historical 256-way header layout (new headers are single-file; constant kept
+/// for docs / env notes). Not used for new creates.
 pub const SHARD_COUNT: usize = 256;
-/// Mainnet **tx / scripthash** shard count (16 files). Enough to bound rehash
-/// size without the FD cost of 256-way for smaller heads.
+/// Mainnet **scripthash** shard count (16 files).
 pub const SHARD_COUNT_TX_SH: usize = 16;
-
-/// Inter-shard pause after a paced insert (ms). Override `RBITCOIN_HEAD_SHARD_PACE_MS`.
-pub fn shard_pace_ms() -> u64 {
-    std::env::var("RBITCOIN_HEAD_SHARD_PACE_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(25)
-        .min(5_000)
-}
 
 /// How many shards to create for the active scale (legacy helper; uses header layout).
 pub fn shard_count_for_scale() -> usize {
@@ -181,26 +170,6 @@ impl ShardedHashHead {
         }
     }
 
-    /// Occupied slots across shards (header diagnostics / tests).
-    #[allow(dead_code)]
-    pub fn occupied(&self) -> u64 {
-        self.shards.iter().map(|s| s.occupied()).sum()
-    }
-
-    /// Pre-size every shard for roughly `additional` new keys (spread evenly).
-    #[allow(dead_code)]
-    pub fn reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
-        if additional == 0 {
-            return Ok(());
-        }
-        let n = self.shards.len() as u64;
-        let per = additional.div_ceil(n).max(1);
-        for s in &self.shards {
-            s.reserve_additional(per)?;
-        }
-        Ok(())
-    }
-
     /// All Class A fks for this key's 16-byte prefix (sole or multi-list).
     pub fn get_all(&self, key: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
         self.shards[self.shard_of(key)].get_all(key)
@@ -218,26 +187,6 @@ impl ShardedHashHead {
     }
 
     pub fn insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
-        self.insert_many_disk_inner(entries, false)
-    }
-
-    /// IBD run-materialize path: insert one shard at a time and **pause between
-    /// shards** when pacing is enabled so rehashes do not stack.
-    ///
-    /// Still used for header bulk paths / tests; tx head no longer calls this.
-    #[allow(dead_code)]
-    pub fn insert_many_paced(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        self.insert_many_disk_inner(entries, true)
-    }
-
-    fn insert_many_disk_inner(
-        &self,
-        entries: &[([u8; 32], Fk)],
-        pace: bool,
-    ) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -249,21 +198,11 @@ impl ShardedHashHead {
         for &(key, fk) in entries {
             buckets[self.shard_of(&key)].push((key, fk));
         }
-        let pace_ms = if pace && crate::ibd_io_policy::shard_pace_enabled() {
-            shard_pace_ms()
-        } else {
-            0
-        };
-        let mut any = false;
         for (i, bucket) in buckets.into_iter().enumerate() {
             if bucket.is_empty() {
                 continue;
             }
-            if pace && any && pace_ms > 0 {
-                std::thread::sleep(Duration::from_millis(pace_ms));
-            }
             self.shards[i].insert_many(&bucket)?;
-            any = true;
         }
         Ok(())
     }
@@ -356,24 +295,6 @@ mod tests {
         drop(h);
         let h2 = ShardedHashHead::open_for_role(&path, HeadRole::Header).unwrap();
         assert_eq!(h2.get(&batch[0].0).unwrap(), Some(batch[0].1));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn insert_many_paced_matches() {
-        let dir = tmp_dir();
-        let h = ShardedHashHead::create_sharded(dir.join("head"), 16, 64).unwrap();
-        let mut batch = Vec::new();
-        for i in 0u64..500 {
-            let mut key = [0u8; 32];
-            key[0] = (i % 256) as u8;
-            key[1..9].copy_from_slice(&(i.wrapping_mul(0x9e3779b97f4a7c15)).to_le_bytes());
-            batch.push((key, Fk(i + 1)));
-        }
-        h.insert_many_paced(&batch).unwrap();
-        for (k, fk) in &batch {
-            assert_eq!(h.get(k).unwrap(), Some(*fk));
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

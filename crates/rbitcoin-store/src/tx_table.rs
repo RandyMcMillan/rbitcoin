@@ -804,53 +804,18 @@ impl TxTable {
     }
 }
 
-/// Per-tx output **runs**: one var record = all outputs of one tx.
+/// Legacy split Class A **output** runs (`output.body` / `output.idx`).
 ///
-/// Legacy split Class A only; packed stores do not create these files.
-#[allow(dead_code)]
+/// Packed Class A does not create these files. Kept only to **open and read**
+/// pre-existing legacy datadirs that still have split runs.
 pub struct OutputTable {
     body: VarTable,
 }
 
-#[allow(dead_code)]
 impl OutputTable {
-    pub fn create(dir: &Path) -> Result<Self, StoreError> {
-        Ok(Self {
-            body: VarTable::create(dir, "output", TableKind::Output)?,
-        })
-    }
-
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
             body: VarTable::open(dir, "output", TableKind::Output)?,
-        })
-    }
-
-    pub fn count(&self) -> u64 {
-        self.body.count()
-    }
-
-    pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {
-        self.body.reserve_append(body_bytes, n_records)
-    }
-
-    /// Append one run (all outputs of a tx). Returns run FK.
-    pub fn put_run(&self, recs: &[OutputRecord]) -> Result<Fk, StoreError> {
-        let mut fks = self.put_runs(std::slice::from_ref(&recs))?;
-        Ok(fks.pop().expect("one run"))
-    }
-
-    /// Append many runs. `runs[i]` is the output list for one tx.
-    pub fn put_runs(&self, runs: &[&[OutputRecord]]) -> Result<Vec<Fk>, StoreError> {
-        if runs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let est: usize = runs
-            .iter()
-            .map(|r| r.iter().map(|o| o.encoded_len()).sum::<usize>())
-            .sum();
-        self.body.put_batch_encode(runs.len(), est, |i, buf| {
-            encode_output_run(runs[i], buf);
         })
     }
 
@@ -868,73 +833,6 @@ impl OutputTable {
         Ok(run.swap_remove(index as usize))
     }
 
-    /// Byte offset of output `vout` within the run payload (start of its spender_field).
-    pub fn output_rel_offset(&self, run_fk: Fk, count: u32, vout: u32) -> Result<u64, StoreError> {
-        if vout >= count {
-            return Err(StoreError::NotFound);
-        }
-        let raw = self.body.get_raw(run_fk)?;
-        let mut off = 0usize;
-        for i in 0..=vout {
-            if off >= raw.len() {
-                return Err(StoreError::Corrupt("output run short for vout"));
-            }
-            if i == vout {
-                return Ok(off as u64);
-            }
-            let (_, used) = OutputRecord::decode_at(&raw[off..])?;
-            off += used;
-        }
-        Err(StoreError::NotFound)
-    }
-
-    /// Read multi flag + spender_field for one output without full script decode of all.
-    pub fn get_spender_meta(
-        &self,
-        run_fk: Fk,
-        count: u32,
-        vout: u32,
-    ) -> Result<(bool, Fk), StoreError> {
-        let rel = self.output_rel_offset(run_fk, count, vout)?;
-        let raw = self.body.get_raw(run_fk)?;
-        let off = rel as usize;
-        if raw.len() < off + 9 {
-            return Err(StoreError::Corrupt("output spender meta short"));
-        }
-        let field = Fk(u64::from_le_bytes(raw[off..off + 8].try_into().unwrap()));
-        let multi = raw[off + 8] & output_flags::MULTI_SPENDER != 0;
-        Ok((multi, field))
-    }
-
-    /// In-place write of spender_field and MULTI_SPENDER flag bit (variable tail unchanged).
-    pub fn set_spender_meta(
-        &self,
-        run_fk: Fk,
-        count: u32,
-        vout: u32,
-        multi: bool,
-        field: Fk,
-    ) -> Result<(), StoreError> {
-        let rel = self.output_rel_offset(run_fk, count, vout)?;
-        self.body
-            .write_at_record(run_fk, rel, &field.0.to_le_bytes())?;
-        // Patch only MULTI bit in flags (byte after field).
-        let raw = self.body.get_raw(run_fk)?;
-        let flag_off = rel as usize + 8;
-        if raw.len() <= flag_off {
-            return Err(StoreError::Corrupt("output flags missing"));
-        }
-        let mut flags = raw[flag_off];
-        if multi {
-            flags |= output_flags::MULTI_SPENDER;
-        } else {
-            flags &= !output_flags::MULTI_SPENDER;
-        }
-        self.body
-            .write_at_record(run_fk, rel + 8, &[flags])?;
-        Ok(())
-    }
-
     pub fn flush(&self) -> Result<(), StoreError> {
         self.body.flush()
     }
@@ -944,51 +842,18 @@ impl OutputTable {
     }
 }
 
-/// Per-tx input **runs**: one var record = all inputs of one tx.
+/// Legacy split Class A **input** runs (`input.body` / `input.idx`).
 ///
-/// Legacy split Class A only; packed stores do not create these files.
-#[allow(dead_code)]
+/// Packed Class A does not create these files. Kept only to **open and read**
+/// pre-existing legacy datadirs.
 pub struct InputTable {
     body: VarTable,
 }
 
-#[allow(dead_code)]
 impl InputTable {
-    pub fn create(dir: &Path) -> Result<Self, StoreError> {
-        Ok(Self {
-            body: VarTable::create(dir, "input", TableKind::Input)?,
-        })
-    }
-
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
             body: VarTable::open(dir, "input", TableKind::Input)?,
-        })
-    }
-
-    pub fn count(&self) -> u64 {
-        self.body.count()
-    }
-
-    pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {
-        self.body.reserve_append(body_bytes, n_records)
-    }
-
-    pub fn put_run(&self, recs: &[InputRecord]) -> Result<Fk, StoreError> {
-        let mut fks = self.put_runs(std::slice::from_ref(&recs))?;
-        Ok(fks.pop().expect("one run"))
-    }
-
-    pub fn put_runs(&self, runs: &[&[InputRecord]]) -> Result<Vec<Fk>, StoreError> {
-        if runs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let est: usize = runs
-            .iter()
-            .map(|r| r.iter().map(|o| o.encoded_len()).sum::<usize>())
-            .sum();
-        self.body.put_batch_encode(runs.len(), est, |i, buf| {
-            encode_input_run(runs[i], buf);
         })
     }
 

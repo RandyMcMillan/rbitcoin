@@ -679,10 +679,6 @@ impl Query {
         Ok(None)
     }
 
-    pub fn put_output_run(&self, recs: &[OutputRecord]) -> Result<Fk, QueryError> {
-        self.store.put_output_run(recs)
-    }
-
     pub fn get_output_at(
         &self,
         run_fk: Fk,
@@ -694,10 +690,6 @@ impl Query {
 
     pub fn get_output_run(&self, run_fk: Fk, count: u32) -> Result<Vec<OutputRecord>, QueryError> {
         self.store.get_output_run(run_fk, count)
-    }
-
-    pub fn put_input_run(&self, recs: &[InputRecord]) -> Result<Fk, QueryError> {
-        self.store.put_input_run(recs)
     }
 
     pub fn get_input_at(

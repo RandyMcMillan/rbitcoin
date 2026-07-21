@@ -19,10 +19,3 @@ pub fn set_defer_durable_flush(defer: bool) {
 pub fn defer_durable_flush() -> bool {
     DEFER_DURABLE_FLUSH.load(Ordering::Relaxed)
 }
-
-/// While durable flush is deferred, skip inter-shard sleep in paced inserts
-/// (fixed multi-second cost even for small materialize batches).
-#[inline]
-pub fn shard_pace_enabled() -> bool {
-    !defer_durable_flush()
-}

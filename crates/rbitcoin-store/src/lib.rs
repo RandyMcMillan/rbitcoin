@@ -33,7 +33,7 @@ pub use file::{
     ensure_nofile_budget, ensure_nofile_budget_at_least, try_set_io_best_effort, try_set_io_idle,
     NOFILE_SOFT_TARGET,
 };
-pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush, shard_pace_enabled};
+pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush};
 pub use address_head::{bits_for_scale, AddressHead, MAINNET_BITS, TINY_BITS};
 pub use hashhead::{
     initial_slots_for, HeadRole, HeadScale,

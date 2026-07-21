@@ -86,7 +86,6 @@ materialize continues until runs are empty (once inflight is clear). Progress:
 |-----|---------|---------|
 | `RBITCOIN_RUN_MATERIALIZE_START_LEAD` | `65536` | Stop peer fetch / arm materialize; `0` = off |
 | `RBITCOIN_RUN_MATERIALIZE_STOP_LEAD` | `32768` | Resume peer fetch / pause materialize |
-| `RBITCOIN_HEAD_SHARD_PACE_MS` | `25` | Sleep between shards during paced head insert |
 
 New stores (schema **v9**): **header.head** = **single** open-address file (~24 MiB
 pre-size; not 256-way), **scripthash** 16 shards, **tx.head** = single fixed address

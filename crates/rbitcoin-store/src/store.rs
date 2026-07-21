@@ -209,13 +209,6 @@ impl Store {
         self.txs.get_by_txid(txid)
     }
 
-    /// Append one input run (legacy split Class A only). Creates `input.*` on first use.
-    pub fn put_input_run(&self, _recs: &[InputRecord]) -> Result<Fk, StoreError> {
-        Err(StoreError::Corrupt(
-            "split input.body removed; use packed Class A (put_tx_full_batch)",
-        ))
-    }
-
     /// Input at local index within a legacy run (`tx.input_start_fk`).
     pub fn get_input_at(&self, run_fk: Fk, count: u32, index: u32) -> Result<InputRecord, StoreError> {
         self.inputs
@@ -233,14 +226,6 @@ impl Store {
                 "no input.body (packed-only store; legacy split I/O missing)",
             ))?
             .get_run(run_fk, count)
-    }
-
-    /// Append one output run (legacy split Class A only) — not used for packed rows.
-    pub fn put_output_run(&self, recs: &[OutputRecord]) -> Result<Fk, StoreError> {
-        let _ = recs;
-        Err(StoreError::Corrupt(
-            "split output.body removed; use packed Class A (put_tx_full_batch)",
-        ))
     }
 
     pub fn get_output_at(

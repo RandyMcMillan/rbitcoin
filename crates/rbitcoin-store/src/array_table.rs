@@ -1,6 +1,6 @@
 //! Growable dense array of little-endian `u64` values.
 //!
-//! 0-based indexing. Used for Class C: confirmed[height], strong_tx[tx_fk-1], etc.
+//! 0-based indexing. Used for Class C: confirmed[height], header_txs arrays, etc.
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
@@ -53,33 +53,6 @@ impl ArrayTable {
         Ok(u64::from_le_bytes(buf))
     }
 
-    /// Read `count` consecutive u64 slots starting at `start` into `out` (little-endian).
-    ///
-    /// Slots past `len` are returned as zero. Used by Class C repair scans.
-    #[allow(dead_code)] // was tx_height (now u32); kept for confirmed-scale scans
-    pub fn read_range(&self, start: u64, count: u64, out: &mut [u8]) -> Result<(), StoreError> {
-        let need = (count as usize).saturating_mul(8);
-        if out.len() < need {
-            return Err(StoreError::Corrupt("array read_range buffer"));
-        }
-        if count == 0 {
-            return Ok(());
-        }
-        let len = *self.len.lock().unwrap();
-        if start >= len {
-            out[..need].fill(0);
-            return Ok(());
-        }
-        let avail = (len - start).min(count);
-        let bytes = (avail as usize) * 8;
-        self.file
-            .read_at(Self::offset(start), &mut out[..bytes])?;
-        if avail < count {
-            out[bytes..need].fill(0);
-        }
-        Ok(())
-    }
-
     /// Set value at `index`, growing with zero-fill if needed.
     pub fn set(&self, index: u64, value: u64) -> Result<(), StoreError> {
         let mut len = self.len.lock().unwrap();
@@ -95,33 +68,6 @@ impl ArrayTable {
             self.file
                 .write_at(Self::offset(index), &value.to_le_bytes())?;
         }
-        Ok(())
-    }
-
-    /// Fill `count` consecutive slots starting at `start` with the same `value`
-    /// (one grow + one body write).
-    #[allow(dead_code)] // was tx_height (now u32-local fill)
-    pub fn fill_range(&self, start: u64, count: u64, value: u64) -> Result<(), StoreError> {
-        if count == 0 {
-            return Ok(());
-        }
-        let end = start.saturating_add(count); // exclusive
-        let mut len = self.len.lock().unwrap();
-        if end > *len {
-            // Zero-fill gap before start if any (single blob, not per-slot).
-            if start > *len {
-                let gap = start - *len;
-                let zeros = vec![0u8; (gap as usize).saturating_mul(8)];
-                self.file.write_at(Self::offset(*len), &zeros)?;
-            }
-            *len = end;
-        }
-        let mut blob = Vec::with_capacity((count as usize).saturating_mul(8));
-        let v = value.to_le_bytes();
-        for _ in 0..count {
-            blob.extend_from_slice(&v);
-        }
-        self.file.write_at(Self::offset(start), &blob)?;
         Ok(())
     }
 

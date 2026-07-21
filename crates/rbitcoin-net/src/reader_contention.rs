@@ -901,8 +901,14 @@ fn reader_contention_offload_deserialize() {
         speedup < (WORKERS as f64) + 1.5,
         "parallel speedup {speedup:.2} suggests more than ~{WORKERS} workers; check runtime"
     );
-    assert!(
-        speedup > 1.2,
-        "expected some parallel speedup from multi-thread runtime, got {speedup:.2}"
-    );
+    // llvm-cov / cfg(coverage) instrumentation flattens wall-clock speedups so a
+    // strict >1.2 gate is flaky; still exercise both paths above.
+    if cfg!(coverage) {
+        eprintln!("  (coverage build: skip parallel speedup gate, speedup={speedup:.2}x)");
+    } else {
+        assert!(
+            speedup > 1.2,
+            "expected some parallel speedup from multi-thread runtime, got {speedup:.2}"
+        );
+    }
 }

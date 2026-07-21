@@ -1,13 +1,16 @@
-//! Keyless addressable `tx.head`: fixed `2^BITS` × 8 B entries, open-address probe.
+//! Keyless addressable `tx.head`: fixed `2^BITS` × **4 B** entries, open-address probe.
 //!
-//! **Layout:** each entry is a LE `u64`: low 63 bits = `create_fk` (0 = empty),
-//! high bit = [`HAS_NEXT`] (another probe may follow on this key’s sequence).
-//! No key material — callers verify identity via Class A body txid.
+//! **Layout:** each entry is a LE `u32` create_fk (`0` = empty). No key material and
+//! **no HAS_NEXT** — probe continues until an empty slot (no Class A deletes).
+//! Callers verify identity via Class A body txid.
 //!
 //! **Probe:** double hashing from the txid (`h1` / odd `h2`), capped at
 //! [`MAX_PROBE`]. Foreign occupants are normal: body mismatch ⇒ continue.
 //!
-//! Mainnet: BITS=31 → 16 GiB sparse file. Tests / `HeadScale::Tiny`: BITS=16.
+//! Mainnet: BITS=31 → **8 GiB** sparse file. Tests / `HeadScale::Tiny`: BITS=16.
+//!
+//! **Limits:** create_fk must fit in `u32` (~4 B txs max before 8 B entries).
+//! At ~3 B txs, address **BITS** needs a painful widen (e.g. 33-bit).
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
@@ -17,32 +20,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// High bit: further probes may exist for keys that chain through this slot.
-pub const HAS_NEXT: u64 = 1u64 << 63;
-const ENTRY_SIZE: u64 = 8;
+const ENTRY_SIZE: u64 = 4;
 /// Hard cap — never scan the whole table.
 pub const MAX_PROBE: u32 = 128;
 
-/// Mainnet address width (2^31 slots × 8 B = 16 GiB).
+/// Mainnet address width (2^31 slots × 4 B = 8 GiB).
 pub const MAINNET_BITS: u32 = 31;
 /// Tiny / unit-test width.
 pub const TINY_BITS: u32 = 16;
-
-#[inline]
-fn pack(fk: Fk, has_next: bool) -> u64 {
-    debug_assert!(!fk.is_null());
-    debug_assert_eq!(fk.0 & HAS_NEXT, 0);
-    if has_next {
-        fk.0 | HAS_NEXT
-    } else {
-        fk.0
-    }
-}
-
-#[inline]
-fn unpack(e: u64) -> (bool, Fk) {
-    (e & HAS_NEXT != 0, Fk(e & !HAS_NEXT))
-}
 
 /// Leading `bits` of the first four txid bytes (big-endian bit order).
 #[inline]
@@ -87,13 +72,20 @@ pub fn bits_for_scale() -> u32 {
     }
 }
 
-/// Fixed-width keyless txid → fk table (single file).
+#[inline]
+fn fk_to_u32(fk: Fk) -> Result<u32, StoreError> {
+    if fk.is_null() || fk.0 > u64::from(u32::MAX) {
+        return Err(StoreError::InvalidFk);
+    }
+    Ok(fk.0 as u32)
+}
+
+/// Fixed-width keyless txid → dense create_fk table (single file, 4 B slots).
 pub struct AddressHead {
     file: TableFile,
     bits: u32,
     slots: u64,
     occupied: AtomicU64,
-    /// Serializes multi-step insert (HAS_NEXT updates + place).
     write_lock: Mutex<()>,
 }
 
@@ -109,7 +101,7 @@ impl AddressHead {
         }
         if path.exists() && path.is_dir() {
             return Err(StoreError::Corrupt(
-                "tx.head is a directory (schema v7 shards); wipe datadir for v8 address head",
+                "tx.head is a directory (legacy shards); wipe datadir for address head",
             ));
         }
         let slots = 1u64 << bits;
@@ -118,11 +110,10 @@ impl AddressHead {
         let need = FILE_HEADER_LEN as u64 + body_bytes;
         file.ensure_capacity(need)?;
         file.set_logical_len(need)?;
-        // Sparse zeros (punch hole when available) — do not write 16 GiB of zeros.
         file.zero_range(FILE_HEADER_LEN as u64, body_bytes)?;
         if bits >= 24 {
             rbitcoin_log::info!(
-                "store: address-head create path={} bits={} slots={} (~{:.2} GiB sparse)",
+                "store: address-head create path={} bits={} slots={} entry=4B (~{:.2} GiB sparse)",
                 file.path().display(),
                 bits,
                 slots,
@@ -142,7 +133,7 @@ impl AddressHead {
         let path = path.into();
         if path.is_dir() {
             return Err(StoreError::Corrupt(
-                "tx.head is a directory (schema v7 shards); wipe datadir for v8 address head",
+                "tx.head is a directory (legacy shards); wipe datadir for address head",
             ));
         }
         let file = TableFile::open(&path, TableKind::HashHead)?;
@@ -158,6 +149,8 @@ impl AddressHead {
         if bits > 31 {
             return Err(StoreError::Corrupt("address head bits > 31"));
         }
+        // Reject legacy 8 B-entry tables (same slot count would be 2× body size).
+        // Opened files with 8 B entries have body = slots*8; we only accept *4.
         let occupied = count_occupied(&file, slots)?;
         Ok(Self {
             file,
@@ -185,44 +178,31 @@ impl AddressHead {
         FILE_HEADER_LEN as u64 + slot * ENTRY_SIZE
     }
 
-    fn read_entry(&self, slot: u64) -> Result<u64, StoreError> {
-        let mut buf = [0u8; 8];
+    fn read_entry(&self, slot: u64) -> Result<u32, StoreError> {
+        let mut buf = [0u8; 4];
         self.file.read_at(Self::entry_off(slot), &mut buf)?;
-        Ok(u64::from_le_bytes(buf))
+        Ok(u32::from_le_bytes(buf))
     }
 
-    fn write_entry(&self, slot: u64, e: u64) -> Result<(), StoreError> {
+    fn write_entry(&self, slot: u64, e: u32) -> Result<(), StoreError> {
         self.file
             .write_at(Self::entry_off(slot), &e.to_le_bytes())
     }
 
-    /// Set HAS_NEXT on an occupied slot (no-op if already set or empty).
-    fn set_has_next(&self, slot: u64) -> Result<(), StoreError> {
-        let e = self.read_entry(slot)?;
-        if e == 0 || e & HAS_NEXT != 0 {
-            return Ok(());
-        }
-        self.write_entry(slot, e | HAS_NEXT)
-    }
-
-    /// Fixed table — capacity is always full slot count. No growth rehash.
     pub fn reserve_additional(&self, _additional: u64) -> Result<(), StoreError> {
         Ok(())
     }
 
     /// Insert one mapping. `body_txid(fk)` must return the Class A body txid.
     ///
-    /// BIP30 (same full txid, new fk): newest fk is written at the earliest
-    /// matching probe slot; older fks are pushed deeper on the same sequence.
+    /// BIP30: newest fk at earliest matching probe slot; older pushed deeper.
     pub fn insert(
         &self,
         txid: &[u8; 32],
         new_fk: Fk,
         mut body_txid: impl FnMut(Fk) -> Result<[u8; 32], StoreError>,
     ) -> Result<(), StoreError> {
-        if new_fk.is_null() || new_fk.0 & HAS_NEXT != 0 {
-            return Err(StoreError::InvalidFk);
-        }
+        let _ = fk_to_u32(new_fk)?;
         let _guard = self.write_lock.lock().unwrap();
         self.insert_locked(txid, new_fk, &mut body_txid)
     }
@@ -234,45 +214,31 @@ impl AddressHead {
         body_txid: &mut dyn FnMut(Fk) -> Result<[u8; 32], StoreError>,
     ) -> Result<(), StoreError> {
         let mut to_place = new_fk;
-        // Slots we stepped over (foreigners / will need HAS_NEXT once we place later).
-        let mut passed: Vec<u64> = Vec::new();
 
         for d in 0..MAX_PROBE {
             let slot = probe_index(txid, d, self.bits);
             let e = self.read_entry(slot)?;
             if e == 0 {
-                self.write_entry(slot, pack(to_place, false))?;
-                for s in &passed {
-                    self.set_has_next(*s)?;
-                }
+                self.write_entry(slot, fk_to_u32(to_place)?)?;
                 self.occupied.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
-            let (_hn, cur_fk) = unpack(e);
-            if cur_fk.0 == to_place.0 {
-                // Already on the chain (idempotent).
-                return Ok(());
-            }
-            // Also skip if the original new_fk is already present under another to_place.
-            if cur_fk.0 == new_fk.0 {
+            let cur_fk = Fk(u64::from(e));
+            if cur_fk.0 == to_place.0 || cur_fk.0 == new_fk.0 {
                 return Ok(());
             }
             let bt = body_txid(cur_fk)?;
             if &bt == txid {
-                // Same full txid (BIP30): newest (`to_place`) takes this slot;
-                // displace the older fk deeper.
-                self.write_entry(slot, pack(to_place, true))?;
+                // BIP30: newest takes this slot; displace older.
+                self.write_entry(slot, fk_to_u32(to_place)?)?;
                 to_place = cur_fk;
-                // Slot already has HAS_NEXT; do not add to passed.
                 continue;
             }
-            // Foreign occupant — continue probe.
-            passed.push(slot);
+            // Foreigner — continue until empty.
         }
         Err(StoreError::Corrupt("address head probe exhausted on insert"))
     }
 
-    /// Batch insert (sorted by primary probe for locality).
     pub fn insert_many(
         &self,
         entries: &[([u8; 32], Fk)],
@@ -291,7 +257,6 @@ impl AddressHead {
         Ok(())
     }
 
-    /// Same as [`Self::insert_many`] (fixed table — no shard pacing).
     pub fn insert_many_paced(
         &self,
         entries: &[([u8; 32], Fk)],
@@ -300,10 +265,7 @@ impl AddressHead {
         self.insert_many(entries, body_txid)
     }
 
-    /// Walk the probe sequence; return every fk until empty / early exit / cap.
-    ///
-    /// Callers that need exact identity must verify body txids. `HAS_NEXT` clear
-    /// after a non-empty slot stops the walk (nothing chained past).
+    /// Walk probe until empty; return every fk (may include foreigners).
     pub fn probe_fks(&self, txid: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
         let mut out = Vec::new();
         for d in 0..MAX_PROBE {
@@ -312,19 +274,11 @@ impl AddressHead {
             if e == 0 {
                 break;
             }
-            let (has_next, fk) = unpack(e);
-            out.push(fk);
-            if !has_next {
-                break;
-            }
+            out.push(Fk(u64::from(e)));
         }
         Ok(out)
     }
 
-    /// Body-aware lookup helpers used by [`crate::tx_table::TxTable`].
-    ///
-    /// Returns candidate fks in probe order (may include foreigners); prefer
-    /// interleaving body checks in the table layer for early exit.
     pub fn get_all_candidates(&self, txid: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
         self.probe_fks(txid)
     }
@@ -342,13 +296,8 @@ impl AddressHead {
     }
 }
 
-/// Count non-empty entries (chunked). Sparse holes read as zeros cheaply.
 fn count_occupied(file: &TableFile, slots: u64) -> Result<u64, StoreError> {
-    // Skip full scan on huge tables at open (multi‑GiB): metrics start at 0 and
-    // climb with inserts this process. Heuristics that compare occupied vs body
-    // count treat undercount as “maybe sparse” (idempotent backfill is safe).
-    // Accurate recount for tests / small tables only.
-    const SCAN_SLOT_CAP: u64 = 1 << 22; // 4 M slots ≈ 32 MiB
+    const SCAN_SLOT_CAP: u64 = 1 << 22; // 4 M slots ≈ 16 MiB at 4 B
     if slots > SCAN_SLOT_CAP {
         rbitcoin_log::debug!(
             "store: address-head open slots={slots} — skip full occupied scan (cap {SCAN_SLOT_CAP})"
@@ -365,7 +314,7 @@ fn count_occupied(file: &TableFile, slots: u64) -> Result<u64, StoreError> {
         let bytes = n * ENTRY_SIZE as usize;
         file.read_at(off, &mut buf[..bytes])?;
         for i in 0..n {
-            let e = u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap());
+            let e = u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
             if e != 0 {
                 occupied += 1;
             }
@@ -415,8 +364,7 @@ mod tests {
         txid[0] = 1;
         bodies.insert(1, txid);
         h.insert(&txid, Fk(1), body_map(&bodies)).unwrap();
-        let cands = h.probe_fks(&txid).unwrap();
-        assert_eq!(cands, vec![Fk(1)]);
+        assert_eq!(h.probe_fks(&txid).unwrap(), vec![Fk(1)]);
         assert_eq!(h.occupied(), 1);
         let _ = std::fs::remove_file(&path);
     }
@@ -425,7 +373,6 @@ mod tests {
     fn foreigner_collision_both_found() {
         let path = tmp("foreigner");
         let h = AddressHead::create_with_bits(&path, 8).unwrap();
-        // Same h1 (bits=8 → first byte); different h2 via byte[4].
         let mut a = [0u8; 32];
         let mut b = [0u8; 32];
         a[0] = 0x10;
@@ -438,8 +385,7 @@ mod tests {
         h.insert(&b, Fk(2), body_map(&bodies)).unwrap();
         assert!(h.probe_fks(&a).unwrap().contains(&Fk(1)));
         assert!(h.probe_fks(&b).unwrap().contains(&Fk(2)));
-        let ca = h.probe_fks(&a).unwrap();
-        assert_eq!(ca[0], Fk(1));
+        assert_eq!(h.probe_fks(&a).unwrap()[0], Fk(1));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -457,6 +403,18 @@ mod tests {
         let cands = h.probe_fks(&txid).unwrap();
         assert_eq!(cands[0], Fk(2));
         assert!(cands.contains(&Fk(1)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rejects_fk_above_u32() {
+        let path = tmp("bigu32");
+        let h = AddressHead::create_with_bits(&path, 12).unwrap();
+        let txid = [1u8; 32];
+        let err = h
+            .insert(&txid, Fk(u64::from(u32::MAX) + 1), |_| Ok(txid))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidFk));
         let _ = std::fs::remove_file(&path);
     }
 

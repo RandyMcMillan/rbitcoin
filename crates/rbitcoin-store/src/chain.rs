@@ -84,37 +84,114 @@ impl ConfirmedTable {
 
 /// Class C: per-tx create height for coinbase maturity (not a UTXO set).
 ///
-/// Index = `tx_fk - 1`; stored value = `height + 1` (0 = unset so height 0 is representable).
+/// Index = `tx_fk - 1`; stored value = `height + 1` as **u32** (0 = unset so
+/// height 0 is representable). Schema v9: 4 B slots (was u64).
 pub struct TxHeightTable {
-    arr: ArrayTable,
+    file: crate::file::TableFile,
+    len: std::sync::Mutex<u64>,
 }
+
+const TX_HEIGHT_ELEM: u64 = 4;
 
 impl TxHeightTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
+        let file =
+            crate::file::TableFile::create(dir.join("tx_height.body"), TableKind::TxHeight)?;
         Ok(Self {
-            arr: ArrayTable::create(dir.join("tx_height.body"), TableKind::TxHeight)?,
+            file,
+            len: std::sync::Mutex::new(0),
         })
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
+        let file = crate::file::TableFile::open(dir.join("tx_height.body"), TableKind::TxHeight)?;
+        let body = file
+            .logical_len()
+            .saturating_sub(crate::file::FILE_HEADER_LEN as u64);
+        if body % TX_HEIGHT_ELEM != 0 {
+            return Err(StoreError::Corrupt("tx_height size (expect 4 B slots)"));
+        }
         Ok(Self {
-            arr: ArrayTable::open(dir.join("tx_height.body"), TableKind::TxHeight)?,
+            file,
+            len: std::sync::Mutex::new(body / TX_HEIGHT_ELEM),
         })
+    }
+
+    fn offset(index: u64) -> u64 {
+        crate::file::FILE_HEADER_LEN as u64 + index * TX_HEIGHT_ELEM
+    }
+
+    fn get_slot(&self, index: u64) -> Result<u32, StoreError> {
+        let len = *self.len.lock().unwrap();
+        if index >= len {
+            return Ok(0);
+        }
+        let mut buf = [0u8; 4];
+        self.file.read_at(Self::offset(index), &mut buf)?;
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    fn set_slot(&self, index: u64, value: u32) -> Result<(), StoreError> {
+        let mut len = self.len.lock().unwrap();
+        if index >= *len {
+            // Extend with zeros up to index inclusive.
+            let need = index + 1;
+            let start = *len;
+            if need > start {
+                let zeros = vec![0u8; ((need - start) as usize) * 4];
+                self.file.write_at(Self::offset(start), &zeros)?;
+                *len = need;
+            }
+        }
+        self.file
+            .write_at(Self::offset(index), &value.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn fill_range(&self, start: u64, count: u64, value: u32) -> Result<(), StoreError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let end = start.saturating_add(count);
+        let mut len = self.len.lock().unwrap();
+        if end > *len {
+            let zeros = vec![0u8; ((end - *len) as usize) * 4];
+            self.file.write_at(Self::offset(*len), &zeros)?;
+            *len = end;
+        }
+        drop(len);
+        let word = value.to_le_bytes();
+        // Chunked fill.
+        const CHUNK: usize = 4096;
+        let mut blob = vec![0u8; CHUNK * 4];
+        for c in blob.chunks_exact_mut(4) {
+            c.copy_from_slice(&word);
+        }
+        let mut left = count;
+        let mut at = start;
+        while left > 0 {
+            let n = (left as usize).min(CHUNK);
+            self.file
+                .write_at(Self::offset(at), &blob[..n * 4])?;
+            at += n as u64;
+            left -= n as u64;
+        }
+        Ok(())
     }
 
     pub fn get(&self, tx_fk: Fk) -> Result<Option<u32>, StoreError> {
         let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
-        let v = self.arr.get(id - 1)?;
+        let v = self.get_slot(id - 1)?;
         if v == 0 {
             Ok(None)
         } else {
-            Ok(Some((v - 1) as u32))
+            Ok(Some(v - 1))
         }
     }
 
     pub fn set(&self, tx_fk: Fk, height: Height) -> Result<(), StoreError> {
         let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
-        self.arr.set(id - 1, u64::from(height.0) + 1)
+        self.set_slot(id - 1, height.0.saturating_add(1))
     }
 
     /// Set the same height for a contiguous tx_fk range.
@@ -123,21 +200,20 @@ impl TxHeightTable {
         if count == 0 {
             return Ok(());
         }
-        let v = u64::from(height.0) + 1;
-        self.arr.fill_range(id - 1, u64::from(count), v)
+        self.fill_range(id - 1, u64::from(count), height.0.saturating_add(1))
     }
 
     pub fn clear(&self, tx_fk: Fk) -> Result<(), StoreError> {
         let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
-        if id > self.arr.len() {
+        if id > self.len() {
             return Ok(());
         }
-        self.arr.set(id - 1, 0)
+        self.set_slot(id - 1, 0)
     }
 
     /// Number of allocated slots (covers tx fks `1..=len`).
     pub fn len(&self) -> u64 {
-        self.arr.len()
+        *self.len.lock().unwrap()
     }
 
     /// Zero `count` consecutive height slots starting at `first_tx_fk` (disconnect/repair).
@@ -147,12 +223,12 @@ impl TxHeightTable {
             return Ok(());
         }
         let start = id - 1;
-        let n = self.arr.len();
+        let n = self.len();
         if start >= n {
             return Ok(());
         }
         let take = u64::from(count).min(n - start);
-        self.arr.fill_range(start, take, 0)
+        self.fill_range(start, take, 0)
     }
 
     /// Bulk-scan set heights; `visit(tx_fk, height)` for each allocated non-zero slot.
@@ -160,19 +236,21 @@ impl TxHeightTable {
     where
         F: FnMut(Fk, u32) -> Result<(), StoreError>,
     {
-        let n = self.arr.len();
+        let n = self.len();
         const CHUNK: u64 = 8192;
-        let mut buf = vec![0u8; (CHUNK as usize) * 8];
+        let mut buf = vec![0u8; (CHUNK as usize) * 4];
         let mut i = 0u64;
         while i < n {
             let take = (n - i).min(CHUNK);
-            self.arr.read_range(i, take, &mut buf)?;
+            let bytes = (take as usize) * 4;
+            self.file
+                .read_at(Self::offset(i), &mut buf[..bytes])?;
             for j in 0..take as usize {
-                let off = j * 8;
-                let v = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+                let off = j * 4;
+                let v = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
                 if v != 0 {
                     let tx_fk = Fk(i + j as u64 + 1);
-                    visit(tx_fk, (v - 1) as u32)?;
+                    visit(tx_fk, v - 1)?;
                 }
             }
             i += take;
@@ -181,11 +259,11 @@ impl TxHeightTable {
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.arr.flush()
+        self.file.flush()
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {
-        self.arr.flush_async()
+        self.file.flush_async()
     }
 }
 

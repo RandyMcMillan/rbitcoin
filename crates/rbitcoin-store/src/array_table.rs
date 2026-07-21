@@ -56,6 +56,7 @@ impl ArrayTable {
     /// Read `count` consecutive u64 slots starting at `start` into `out` (little-endian).
     ///
     /// Slots past `len` are returned as zero. Used by Class C repair scans.
+    #[allow(dead_code)] // was tx_height (now u32); kept for confirmed-scale scans
     pub fn read_range(&self, start: u64, count: u64, out: &mut [u8]) -> Result<(), StoreError> {
         let need = (count as usize).saturating_mul(8);
         if out.len() < need {
@@ -98,7 +99,8 @@ impl ArrayTable {
     }
 
     /// Fill `count` consecutive slots starting at `start` with the same `value`
-    /// (one grow + one body write). Used for tx_height under confirm.
+    /// (one grow + one body write).
+    #[allow(dead_code)] // was tx_height (now u32-local fill)
     pub fn fill_range(&self, start: u64, count: u64, value: u64) -> Result<(), StoreError> {
         if count == 0 {
             return Ok(());

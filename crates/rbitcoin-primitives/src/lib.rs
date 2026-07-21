@@ -17,23 +17,20 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 
 /// Current on-disk schema version (see workspace `SCHEMA.md`).
 ///
-/// v8: `tx.head` is a fixed keyless address table (`2^31` × 8 B entries, double-hash
-/// probe, HAS_NEXT bit; body verify). Header / scripthash heads still use v7-style
-/// 16 B key prefixes + optional `.mlt` multi-lists.
+/// v9: `tx.head` is `2^31` × **4 B** create_fk entries (no HAS_NEXT; probe until
+/// empty); `tx_height` uses **u32** slots. Dense Class A fk + `tx.idx` retained.
+/// Future: ~3e9 txs → widen address BITS; ~4e9 txs → 8 B head entries.
 ///
-/// v7: hash heads (tx/header/…) use 16 B key prefixes + optional multi-fk list
-/// (`.mlt`) for prefix collisions and BIP30 duplicate txids; body verify on lookup.
+/// v8: `tx.head` `2^31` × 8 B (fk + HAS_NEXT); `tx_height` u64 slots.
+///
+/// v7: hash heads use 16 B key prefixes + optional multi-fk list (`.mlt`).
 ///
 /// v6: scripthash head 16 B key prefix + 16 B value; body entry = create_tx_fk only.
 ///
-/// v5: spend annotation on each output (`spender_field` + rare multi `spenders.body`);
-/// no `point.head` open-hash multimap.
+/// v5: spend annotation on each output; no `point.head` open-hash multimap.
 ///
-/// v4: hybrid scripthash (2-inline head or geometric body slab + size-class freelist).
-///
-/// v3: thin point/scripthash linked lists; strong_tx bitset; denser hash heads;
-/// Class A inputs always external `prev_txid`.
-pub const SCHEMA_VERSION: u16 = 8;
+/// v4: hybrid scripthash; v3: thin lists + strong_tx bitset; external prev_txid.
+pub const SCHEMA_VERSION: u16 = 9;
 
 /// 1-based foreign key into a store table body. Zero means null / absent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

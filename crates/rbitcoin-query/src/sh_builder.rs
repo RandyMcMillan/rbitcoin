@@ -7,8 +7,8 @@
 //! oldest run (detaches from MANIFEST) so merge cannot touch it mid-apply.
 
 use super::run_builder_core::{
-    claim_oldest_run, clear_runs_dir, finalize_wait_join, memtable_cap, spawn_worker, RunControl,
-    RunMemtable, FAMILY_SH, AFTER_WORK, IDLE_POLL,
+    claim_oldest_run, clear_runs_dir, finalize_wait_join, memtable_cap, on_disk_run_count,
+    runs_dir_io, spawn_worker, RunControl, RunMemtable, FAMILY_SH, AFTER_WORK, IDLE_POLL,
 };
 use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;
@@ -156,12 +156,10 @@ impl ShRunBuilder {
 
     /// On-disk sorted-run count (for IBD progress / lead-compact metrics).
     pub fn on_disk_run_count(&self) -> usize {
-        let (runs_dir, runs_io) = {
-            let g = self.inner.lock().unwrap();
-            (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
-        };
-        let _io = runs_io.lock().unwrap();
-        list_runs(&runs_dir).map(|r| r.len()).unwrap_or(0)
+        let g = self.inner.lock().unwrap();
+        let (dir, io) = runs_dir_io(&g.ctrl);
+        drop(g);
+        on_disk_run_count(&dir, &io)
     }
 
     /// Enqueue thin creates from confirm. Blocks only if hard memtable cap
@@ -200,7 +198,7 @@ impl ShRunBuilder {
     pub fn materialize_oldest_run(&self, store: &Store) -> Result<Option<u64>, StoreError> {
         let (runs_dir, runs_io) = {
             let g = self.inner.lock().unwrap();
-            (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
+            runs_dir_io(&g.ctrl)
         };
         let Some(run) = claim_oldest_run(&runs_dir, &runs_io)? else {
             return Ok(None);
@@ -426,15 +424,7 @@ mod tests {
             let mut sh = [0u8; 32];
             sh[0] = (i % 17) as u8;
             sh[1] = (i / 17) as u8;
-            creates.push(ScriptHashRecord {
-                scripthash: sh,
-                create_tx_fk: Fk(i as u64 + 1),
-                vout: 0,
-                next: Fk::NULL,
-                txid: [0u8; 32],
-                value: 0,
-                create_height: 0,
-            });
+            creates.push(ScriptHashRecord::from_fk(sh, Fk(i as u64 + 1)));
         }
         b.enqueue(&creates);
         let n = b.finalize_and_materialize(&store).unwrap();

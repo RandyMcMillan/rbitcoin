@@ -14,7 +14,7 @@
 //! DEBUG only when enabled — so DEBUG never sees an empty window after INFO.
 
 use super::archive::{ArchivePipelineSample, ArchivePipelineStats};
-use super::LoopStats;
+use super::status::LoopStats;
 use rbitcoin_log::{debug, enabled, info, Level};
 
 /// One 5s window of IBD counters (post sample-and-reset).

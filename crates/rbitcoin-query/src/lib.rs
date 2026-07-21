@@ -43,6 +43,9 @@ pub use confirm_parent_cache::{
 pub use run_builder_core::run_materialize_control;
 pub use connect::ConfirmPrepared;
 pub use parent_prewarm::PrewarmStats;
+pub use scripthash::{
+    ScriptHashBalance, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
+};
 pub use wave_prevout::WavePrevoutCache;
 
 /// Parent-prewarm window counters (reset by the IBD ~5s sampler).
@@ -976,27 +979,6 @@ fn wire_header(rec: &HeaderRecord, prev_blockhash: BlockHash) -> BlockHeader {
         bits: CompactTarget::from_consensus(rec.bits),
         nonce: rec.nonce,
     }
-}
-
-/// Electrum `blockchain.scripthash.get_history` row (confirmed only in v1).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScriptHashHistoryItem {
-    pub height: i64,
-    pub txid: [u8; 32],
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScriptHashBalance {
-    pub confirmed: i64,
-    pub unconfirmed: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScriptHashUtxo {
-    pub tx_hash: [u8; 32],
-    pub tx_pos: u32,
-    pub height: u32,
-    pub value: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

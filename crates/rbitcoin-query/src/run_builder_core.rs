@@ -175,12 +175,16 @@ pub mod run_materialize_control {
 }
 
 /// Control plane shared by every run builder's `Inner`.
+///
+/// **`runs_io` invariant:** all `list_runs` + write/merge/claim/delete for this
+/// family must hold `runs_io` for the full critical section. See
+/// [`claim_oldest_run`] and `rbitcoin_store::list_runs`.
 pub struct RunControl {
     pub runs_dir: PathBuf,
     pub next_seq: u64,
     pub stop: bool,
     pub finalize: bool,
-    /// Serializes run file list / write / merge / delete.
+    /// Serializes run file list / write / merge / delete / orphan cleanup.
     pub runs_io: Arc<Mutex<()>>,
 }
 
@@ -342,8 +346,15 @@ pub fn finalize_wait_join<T: RunMemtable>(
 /// from MANIFEST under `runs_io`. Caller materializes then **deletes** `path`
 /// (do not [`rbitcoin_store::remove_run`] — seq is no longer cataloged).
 ///
-/// Used for **point, tx, and scripthash** so concurrent `list_runs` orphan
+/// Used for **spend, tx, and scripthash** so concurrent `list_runs` orphan
 /// cleanup cannot wipe an in-flight body.
+///
+/// # Invariant
+///
+/// Every `list_runs` / `write_sorted_run` / `merge_runs` / claim for a family
+/// **must** hold that family's [`RunControl::runs_io`] mutex for the whole
+/// list→mutate→catalog sequence. Holding it only around write (not list) races
+/// orphan cleanup and can delete live data.
 pub fn claim_oldest_run(
     runs_dir: &Path,
     runs_io: &Mutex<()>,
@@ -356,6 +367,46 @@ pub fn claim_oldest_run(
     runs.sort_by_key(|r| r.seq().unwrap_or(u64::MAX));
     let run = runs.into_iter().next().unwrap();
     Ok(Some(claim_run_for_materialize(&run)?))
+}
+
+/// On-disk run count under `runs_io` (safe concurrent with merge/list).
+pub fn on_disk_run_count(runs_dir: &Path, runs_io: &Mutex<()>) -> usize {
+    let _io = runs_io.lock().unwrap();
+    list_runs(runs_dir).map(|r| r.len()).unwrap_or(0)
+}
+
+/// Snapshot `(runs_dir, runs_io)` from a locked memtable control.
+pub fn runs_dir_io(ctrl: &RunControl) -> (PathBuf, Arc<Mutex<()>>) {
+    (ctrl.runs_dir.clone(), Arc::clone(&ctrl.runs_io))
+}
+
+/// Drain claimed oldest runs via `materialize` until empty; clear residual files.
+pub fn finalize_materialize_all(
+    enabled: &AtomicBool,
+    inner: &Mutex<impl RunMemtable>,
+    cv: &Condvar,
+    join: &Mutex<Option<JoinHandle<()>>>,
+    mut materialize_one: impl FnMut() -> Result<Option<u64>, StoreError>,
+    log_tag: &str,
+) -> Result<u64, StoreError> {
+    finalize_wait_join(enabled, inner, cv, join)?;
+    let mut inserted = 0u64;
+    loop {
+        let t0 = std::time::Instant::now();
+        match materialize_one()? {
+            Some(n) => {
+                inserted = inserted.saturating_add(n);
+                rbitcoin_log::info!(
+                    "node: {log_tag} materialize run keys≈{n} total≈{inserted} elapsed={:?}",
+                    t0.elapsed()
+                );
+            }
+            None => break,
+        }
+    }
+    let runs_dir = inner.lock().unwrap().control().runs_dir.clone();
+    clear_runs_dir(&runs_dir);
+    Ok(inserted)
 }
 
 pub fn clear_runs_dir(runs_dir: &Path) {

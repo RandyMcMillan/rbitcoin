@@ -1661,15 +1661,7 @@ fn scripthash_reopen_warm_prevents_dup_creates() {
     q.store()
         .scripthash
         .for_each_live_create(|create_tx_fk| {
-            durable.push(ScriptHashRecord {
-                scripthash: [0u8; 32],
-                create_tx_fk,
-                vout: 0,
-                next: rbitcoin_primitives::Fk::NULL,
-                txid: [0u8; 32],
-                value: 0,
-                create_height: 0,
-            });
+            durable.push(ScriptHashRecord::from_fk([0u8; 32], create_tx_fk));
         })
         .unwrap();
     assert_eq!(durable.len() as u64, n0);

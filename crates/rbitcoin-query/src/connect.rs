@@ -322,16 +322,8 @@ impl Query {
             return Ok(());
         }
         let outputs = self.tx_output_run_class_a(tx_fk, &tx)?;
-        for (i, o) in outputs.iter().enumerate() {
-            out.push(ScriptHashRecord {
-                scripthash: script_hash(&o.script),
-                create_tx_fk: tx_fk,
-                vout: i as u32,
-                next: Fk::NULL,
-                txid: [0u8; 32],
-                value: 0,
-                create_height: 0,
-            });
+        for o in outputs.iter() {
+            out.push(ScriptHashRecord::from_fk(script_hash(&o.script), tx_fk));
         }
         Ok(())
     }

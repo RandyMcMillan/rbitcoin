@@ -27,9 +27,7 @@ const SLOT_SIZE: usize = HEAD_KEY_LEN + 8;
 const MULTI_BIT: u64 = 1u64 << 63;
 const MULTI_REC_LEN: usize = 16; // create_fk | next
 const DEFAULT_SLOTS: u64 = 64;
-/// Rehash when occupied/slots ≥ 7/8.
-const MAX_LOAD_NUM: u64 = 7;
-const MAX_LOAD_DEN: u64 = 8;
+use crate::open_address::{self, MAX_LOAD_DEN, MAX_LOAD_NUM};
 /// Slots per page-cache RMW chunk (128 × 24 B = 3 KiB).
 const SLOTS_PER_CHUNK: u64 = 128;
 
@@ -357,12 +355,7 @@ impl HashHead {
     }
 
     fn hash_slot(key: &HeadKey, slots: u64) -> u64 {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for b in key {
-            h ^= u64::from(*b);
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h & (slots - 1)
+        open_address::primary_slot(key, slots)
     }
 
     fn slot_file_off(slot: u64) -> u64 {
@@ -610,11 +603,9 @@ impl HashHead {
         Ok(())
     }
 
-    /// Process-wide: at most one hash-head shard rehash at a time (IBD materialize
-    /// must not stack multi-shard resizes into one host freeze).
+    /// Process-wide rehash serialization (shared with scripthash heads).
     fn rehash_gate() -> &'static std::sync::Mutex<()> {
-        static GATE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        GATE.get_or_init(|| std::sync::Mutex::new(()))
+        open_address::rehash_gate()
     }
 
     /// Process-wide rehash counters (sharded heads rehash many small files).

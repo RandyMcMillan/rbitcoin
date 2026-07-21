@@ -4,10 +4,10 @@
 //! when light UTXO supplies create_fk; materialize patches create outputs.
 
 use super::run_builder_core::{
-    claim_oldest_run, clear_runs_dir, finalize_wait_join, memtable_cap, spawn_worker, worker_loop,
-    RunControl, RunMemtable, FAMILY_POINT,
+    claim_oldest_run, finalize_materialize_all, memtable_cap, on_disk_run_count, runs_dir_io,
+    spawn_worker, worker_loop, RunControl, RunMemtable, FAMILY_POINT,
 };
-use rbitcoin_log::{debug, info};
+use rbitcoin_log::debug;
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
     next_run_path, read_run_body, write_sorted_run, Store, StoreError, SortedRunPath,
@@ -60,7 +60,8 @@ impl RunMemtable for Inner {
     }
 }
 
-pub struct PointRunBuilder {
+/// Catch-up spend-annotation run builder (on-disk dir remains `point.runs`).
+pub struct SpendRunBuilder {
     inner: Arc<Mutex<Inner>>,
     cv: Arc<Condvar>,
     enabled: AtomicBool,
@@ -68,7 +69,10 @@ pub struct PointRunBuilder {
     pub enqueued: AtomicU64,
 }
 
-impl PointRunBuilder {
+/// Historical name for [`SpendRunBuilder`] (schema v4 “point” multimap).
+pub type PointRunBuilder = SpendRunBuilder;
+
+impl SpendRunBuilder {
     pub fn new(store_dir: &Path) -> Self {
         let ctrl = RunControl::open(store_dir, "point.runs");
         Self {
@@ -100,7 +104,7 @@ impl PointRunBuilder {
             || debug!("ibd: spend-run worker on (confirm enqueue → output spender_field)"),
             &self.enabled,
             &self.join,
-            move || worker_loop(soft, "point", FAMILY_POINT, inner, cv),
+            move || worker_loop(soft, "spend", FAMILY_POINT, inner, cv),
         );
     }
 
@@ -119,21 +123,16 @@ impl PointRunBuilder {
     }
 
     pub fn on_disk_run_count(&self) -> usize {
-        let (runs_dir, runs_io) = {
-            let g = self.inner.lock().unwrap();
-            (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
-        };
-        // Hold runs_io so we never race merge write→MANIFEST (orphan killer).
-        let _io = runs_io.lock().unwrap();
-        rbitcoin_store::list_runs(&runs_dir)
-            .map(|r| r.len())
-            .unwrap_or(0)
+        let g = self.inner.lock().unwrap();
+        let (dir, io) = runs_dir_io(&g.ctrl);
+        drop(g);
+        on_disk_run_count(&dir, &io)
     }
 
     pub fn materialize_oldest_run(&self, store: &Store) -> Result<Option<u64>, StoreError> {
         let (runs_dir, runs_io) = {
             let g = self.inner.lock().unwrap();
-            (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
+            runs_dir_io(&g.ctrl)
         };
         let Some(run) = claim_oldest_run(&runs_dir, &runs_io)? else {
             return Ok(None);
@@ -143,31 +142,21 @@ impl PointRunBuilder {
         let _ = std::fs::remove_file(&run.path);
         let elapsed = t0.elapsed();
         rbitcoin_log::debug!(
-            "ibd: materialize store=point edges≈{n} count={} elapsed={elapsed:?}",
+            "ibd: materialize store=spend edges≈{n} count={} elapsed={elapsed:?}",
             run.count
         );
         Ok(Some(n))
     }
 
     pub fn finalize_and_materialize(&self, store: &Store) -> Result<u64, StoreError> {
-        finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
-        let mut inserted = 0u64;
-        loop {
-            let t0 = std::time::Instant::now();
-            match self.materialize_oldest_run(store)? {
-                Some(n) => {
-                    inserted = inserted.saturating_add(n);
-                    info!(
-                        "node: spend materialize run edges≈{n} total≈{inserted} elapsed={:?}",
-                        t0.elapsed()
-                    );
-                }
-                None => break,
-            }
-        }
-        let runs_dir = self.inner.lock().unwrap().ctrl.runs_dir.clone();
-        clear_runs_dir(&runs_dir);
-        Ok(inserted)
+        finalize_materialize_all(
+            &self.enabled,
+            &self.inner,
+            &self.cv,
+            &self.join,
+            || self.materialize_oldest_run(store),
+            "spend",
+        )
     }
 }
 

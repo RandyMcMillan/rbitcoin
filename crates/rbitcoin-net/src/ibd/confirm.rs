@@ -1,7 +1,7 @@
 //! Dedicated confirm engine (Class C tip walk) for IBD.
 
 use super::body::BodyPresence;
-use super::LoopStats;
+use super::status::LoopStats;
 use crate::chain::ChainHub;
 use bitcoin::BlockHash;
 use rbitcoin_log::{info, warn};

@@ -12,6 +12,7 @@ mod error;
 mod file;
 mod ibd_io_policy;
 mod hashhead;
+mod open_address;
 mod header_table;
 mod point_table;
 mod spender_table;

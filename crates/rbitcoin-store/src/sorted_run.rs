@@ -1,4 +1,4 @@
-//! Append-only **sorted run** files for index build-as-you-go (SH / tx / point).
+//! Append-only **sorted run** files for index build-as-you-go (SH / tx / spend).
 //!
 //! Fixed-width records, sorted by a leading key. Integrity:
 //! - Each run stores a **CRC-32** of the body in the header (format v2).
@@ -8,6 +8,15 @@
 //! - [`list_runs`] trusts the manifest (not a raw directory scan) when present;
 //!   missing listed files or CRC/header mismatch are reported; orphan `.run`
 //!   files are ignored (and removed best-effort).
+//!
+//! # Concurrency invariant (`runs_io`)
+//!
+//! Callers **must** hold the per-family `runs_io` mutex across any sequence that
+//! combines [`list_runs`] with write / merge / claim / delete. `list_runs` may
+//! **delete** uncataloged `*.run` files (orphan cleanup). A concurrent writer that
+//! creates a `.run` before MANIFEST update without holding the lock can lose that
+//! file. Materialize uses [`claim_run_for_materialize`] (`*.run.mat`) so claim
+//! bodies are never scanned as orphans.
 
 use crate::error::StoreError;
 use std::cmp::Ordering;
@@ -722,6 +731,9 @@ fn open_and_check_against_entry(
 /// When `MANIFEST` exists it is the **authoritative** set: only listed runs are
 /// returned; orphans are removed best-effort; missing listed files are warned.
 /// Without a manifest, falls back to a directory scan and rebuilds the catalog.
+///
+/// **Must** be called under the family's `runs_io` lock whenever concurrent
+/// writers/mergers/materialize may touch the same directory (see module docs).
 pub fn list_runs(dir: &Path) -> Result<Vec<SortedRunPath>, StoreError> {
     if !dir.exists() {
         return Ok(Vec::new());

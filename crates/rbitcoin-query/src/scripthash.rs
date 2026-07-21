@@ -1,18 +1,53 @@
 //! Electrum scripthash history / balance / UTXO.
 //!
-//! Index rows are create_tx_fk only. Expand to outpoints by loading Class A
-//! outputs and matching SHA256(spk). Spentness/heights from spends + Class C.
+//! Index rows are create_tx_fk only ([`ScriptHashRecord`]). Expand to
+//! [`ScriptHashOutpoint`] by loading Class A outputs and matching SHA256(spk).
+//! Spentness/heights from spends + Class C.
 
 use super::*;
 use rbitcoin_store::script_hash;
 
+/// Expanded Electrum create outpoint (Class A + height joins).
+///
+/// Store index only holds [`ScriptHashRecord`] (scripthash + create_tx_fk).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptHashOutpoint {
+    pub scripthash: [u8; 32],
+    pub create_tx_fk: rbitcoin_primitives::Fk,
+    pub vout: u32,
+    pub txid: [u8; 32],
+    pub value: i64,
+    pub create_height: u32,
+}
+
+/// Electrum `blockchain.scripthash.get_history` row (confirmed only in v1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptHashHistoryItem {
+    pub height: i64,
+    pub txid: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptHashBalance {
+    pub confirmed: i64,
+    pub unconfirmed: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptHashUtxo {
+    pub tx_hash: [u8; 32],
+    pub tx_pos: u32,
+    pub height: u32,
+    pub value: i64,
+}
+
 impl Query {
-    /// Expand one create_tx_fk into thin rows for each output matching `scripthash`.
-    fn expand_create_to_records(
+    /// Expand one create_tx_fk into outpoints for each output matching `scripthash`.
+    fn expand_create_to_outpoints(
         &self,
         scripthash: &[u8; 32],
         create_tx_fk: rbitcoin_primitives::Fk,
-    ) -> Result<Vec<ScriptHashRecord>, QueryError> {
+    ) -> Result<Vec<ScriptHashOutpoint>, QueryError> {
         let create = self.store.get_tx(create_tx_fk)?;
         let outs = if create.output_count == 0 {
             Vec::new()
@@ -25,11 +60,10 @@ impl Query {
             if script_hash(&o.script) != *scripthash {
                 continue;
             }
-            out.push(ScriptHashRecord {
+            out.push(ScriptHashOutpoint {
                 scripthash: *scripthash,
                 create_tx_fk,
                 vout: vout as u32,
-                next: rbitcoin_primitives::Fk::NULL,
                 txid: create.txid,
                 value: o.value,
                 create_height: height,
@@ -42,14 +76,14 @@ impl Query {
     fn scripthash_create_outpoints(
         &self,
         scripthash: &[u8; 32],
-    ) -> Result<Vec<ScriptHashRecord>, QueryError> {
+    ) -> Result<Vec<ScriptHashOutpoint>, QueryError> {
         let entries = self.store.scripthash.entries(scripthash)?;
         let mut out = Vec::new();
         for (_fk, thin) in entries {
             if !self.store.is_confirmed_strong(thin.create_tx_fk)? {
                 continue;
             }
-            out.extend(self.expand_create_to_records(scripthash, thin.create_tx_fk)?);
+            out.extend(self.expand_create_to_outpoints(scripthash, thin.create_tx_fk)?);
         }
         Ok(out)
     }

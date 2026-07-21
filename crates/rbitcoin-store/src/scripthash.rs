@@ -24,23 +24,15 @@ pub fn script_hash(script: &[u8]) -> [u8; 32] {
 
 pub use crate::scripthash_layout::ShEntry as ScriptHashEntry;
 
-/// In-memory row. Index stores `create_tx_fk` only; `vout` / `txid` / `value` /
-/// `create_height` are query joins (not stored on SH body).
+/// Store / index create pointer for a scripthash.
 ///
-/// `next` is unused (always null); retained for API compatibility.
+/// On-disk SH tables store **only** `create_tx_fk` per key (schema v6). Electrum
+/// expansion (vout / value / height / full txid) is a query-layer join, not part
+/// of this store type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScriptHashRecord {
     pub scripthash: [u8; 32],
     pub create_tx_fk: Fk,
-    /// Filled by query expand from Class A outputs (not indexed).
-    pub vout: u32,
-    pub next: Fk,
-    /// Query join from create_tx_fk (not stored).
-    pub txid: [u8; 32],
-    /// Query join from Class A output (not stored).
-    pub value: i64,
-    /// Query join from `tx_height` (not stored).
-    pub create_height: u32,
 }
 
 impl ScriptHashRecord {
@@ -52,11 +44,6 @@ impl ScriptHashRecord {
         Self {
             scripthash,
             create_tx_fk: e.create_tx_fk,
-            vout: 0,
-            next: Fk::NULL,
-            txid: [0u8; 32],
-            value: 0,
-            create_height: 0,
         }
     }
 
@@ -172,8 +159,9 @@ impl ScriptHashTable {
         })
     }
 
-    /// Live creates for a scripthash (oldest → newest). Second tuple element
-    /// keeps [`ScriptHashRecord`] for query joins (`next` always null).
+    /// Live creates for a scripthash (oldest → newest).
+    ///
+    /// Second element is a thin index row (no Class A joins). Expand at query.
     pub fn entries(
         &self,
         scripthash: &[u8; 32],
@@ -676,16 +664,8 @@ mod tests {
         p
     }
 
-    fn rec(sh: [u8; 32], tx: u64, vout: u32) -> ScriptHashRecord {
-        ScriptHashRecord {
-            scripthash: sh,
-            create_tx_fk: Fk(tx),
-            vout,
-            next: Fk::NULL,
-            txid: [0u8; 32],
-            value: 0,
-            create_height: 0,
-        }
+    fn rec(sh: [u8; 32], tx: u64, _vout: u32) -> ScriptHashRecord {
+        ScriptHashRecord::from_fk(sh, Fk(tx))
     }
 
     #[test]

@@ -17,9 +17,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use crate::open_address::{self, MAX_LOAD_DEN, MAX_LOAD_NUM};
+
 const DEFAULT_SLOTS: u64 = 64;
-const MAX_LOAD_NUM: u64 = 7;
-const MAX_LOAD_DEN: u64 = 8;
 const SLOTS_PER_CHUNK: u64 = 128; // 128 × 32 B = 4 KiB
 const CHUNK_CACHE_MAX: usize = 256;
 
@@ -95,12 +95,7 @@ impl ScriptHashHead {
     }
 
     fn hash_slot(key: &ShHeadKey, slots: u64) -> u64 {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for b in key {
-            h ^= u64::from(*b);
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h & (slots - 1)
+        open_address::primary_slot(key, slots)
     }
 
     fn slot_file_off(slot: u64) -> u64 {
@@ -300,6 +295,10 @@ impl ScriptHashHead {
 
     fn rehash_to(&self, new_slots: u64) -> Result<(), StoreError> {
         let new_slots = new_slots.max(2).next_power_of_two();
+        // Share process-wide gate with HashHead (no stacked multi-table freezes).
+        let _rehash_serial = open_address::rehash_gate()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (old_slots, occupied) = {
             let state = self.state.lock().unwrap();
             (state.slots, state.occupied)

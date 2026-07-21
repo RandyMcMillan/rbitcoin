@@ -57,6 +57,17 @@ impl VarTable {
         *self.count.lock().unwrap()
     }
 
+    /// Current body logical length (including file header).
+    pub fn body_logical_len(&self) -> u64 {
+        self.body.logical_len()
+    }
+
+    /// Best-effort drop of body page-cache for a byte range (see
+    /// [`crate::file::TableFile::advise_dont_need`]).
+    pub fn advise_body_dont_need(&self, offset: u64, len: u64) {
+        self.body.advise_dont_need(offset, len);
+    }
+
     /// Pre-grow body (+ idx) capacity so a following mega `put_batch` does not
     /// remap mid-write.
     pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {

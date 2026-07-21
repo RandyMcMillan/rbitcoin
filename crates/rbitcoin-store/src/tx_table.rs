@@ -500,6 +500,16 @@ impl TxTable {
         self.body.count()
     }
 
+    /// Current `tx.body` logical length (including file header).
+    pub fn body_logical_len(&self) -> u64 {
+        self.body.body_logical_len()
+    }
+
+    /// Best-effort: drop `tx.body` page-cache for a written range (archive far lead).
+    pub fn advise_body_dont_need(&self, offset: u64, len: u64) {
+        self.body.advise_body_dont_need(offset, len);
+    }
+
     pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {
         self.body.reserve_append(body_bytes, n_records)
     }

@@ -304,6 +304,114 @@ impl TableFile {
             .map_err(|e| StoreError::io(&self.path, e))?;
         Ok(())
     }
+
+    /// Best-effort: tell the kernel we do not need `[offset, offset+len)` in the
+    /// page cache soon (archive far ahead of confirm/prewarm).
+    ///
+    /// Uses `posix_fadvise(POSIX_FADV_DONTNEED)` on the file (exact range) and
+    /// `madvise(MADV_DONTNEED)` only on **whole pages strictly inside** the range
+    /// so we do not drop a partial page that still holds an older live record.
+    /// No-op on empty range / non-Linux / syscall failure (never fails the caller).
+    pub fn advise_dont_need(&self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let end = offset.saturating_add(len);
+            {
+                let file = self.file.lock().unwrap();
+                let fd = file.as_raw_fd();
+                // Exact file range — kernel may write back dirty pages then drop.
+                let rc = unsafe {
+                    libc::posix_fadvise(
+                        fd,
+                        offset as libc::off_t,
+                        len as libc::off_t,
+                        libc::POSIX_FADV_DONTNEED,
+                    )
+                };
+                if rc != 0 {
+                    rbitcoin_log::trace!(
+                        "store: posix_fadvise(DONTNEED) failed path={} off={offset} len={len}: {}",
+                        self.path.display(),
+                        std::io::Error::from_raw_os_error(rc)
+                    );
+                }
+            }
+            // Whole pages strictly inside [offset, end).
+            let page = page_size() as u64;
+            if page == 0 {
+                return;
+            }
+            let start_pg = offset.saturating_add(page - 1) & !(page - 1);
+            let end_pg = end & !(page - 1);
+            if end_pg <= start_pg {
+                return;
+            }
+            let map = self.map.lock().unwrap();
+            let map_len = map.len() as u64;
+            if start_pg >= map_len {
+                return;
+            }
+            let adv_end = end_pg.min(map_len);
+            let adv_len = (adv_end - start_pg) as usize;
+            if adv_len == 0 {
+                return;
+            }
+            // SAFETY: range is within the live mmap; MADV_DONTNEED is best-effort.
+            let ptr = unsafe { map.as_ptr().add(start_pg as usize) } as *mut libc::c_void;
+            let rc = unsafe { libc::madvise(ptr, adv_len, libc::MADV_DONTNEED) };
+            if rc != 0 {
+                rbitcoin_log::trace!(
+                    "store: madvise(DONTNEED) failed path={} off={start_pg} len={adv_len}: {}",
+                    self.path.display(),
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (offset, len);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn page_size() -> usize {
+    // SAFETY: sysconf is thread-safe for _SC_PAGESIZE.
+    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if n > 0 {
+        n as usize
+    } else {
+        4096
+    }
+}
+
+#[cfg(test)]
+mod advise_tests {
+    use super::*;
+    use rbitcoin_primitives::TableKind;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn advise_dont_need_is_best_effort() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("rbitcoin-advise-{id}"));
+        let _ = std::fs::remove_file(&path);
+        let f = TableFile::create(&path, TableKind::Tx).unwrap();
+        let payload = vec![0xabu8; 16 * 1024];
+        f.write_at(FILE_HEADER_LEN as u64, &payload).unwrap();
+        // Must not panic or return error (void best-effort).
+        f.advise_dont_need(FILE_HEADER_LEN as u64, payload.len() as u64);
+        f.advise_dont_need(0, 0);
+        let mut buf = vec![0u8; payload.len()];
+        f.read_at(FILE_HEADER_LEN as u64, &mut buf).unwrap();
+        assert_eq!(buf, payload);
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 /// Best-effort: set calling thread to Linux I/O priority idle (like `ionice -c3`).

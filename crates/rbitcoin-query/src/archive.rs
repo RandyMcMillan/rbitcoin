@@ -2,6 +2,11 @@
 
 use super::*;
 
+/// When Class A high-water is this many blocks ahead of the prewarm watermark,
+/// drop just-written `tx.body` pages from the page cache so archive dirty pages
+/// do not crowd out confirm/prewarm. Below this, keep pages (prewarm may need them).
+const ARCHIVE_BODY_DONTNEED_LEAD: u32 = 1024;
+
 impl Query {
     pub fn archive_block(
         &self,
@@ -142,6 +147,7 @@ impl Query {
             .txs
             .reserve_append(body_est, packed.len() as u64)?;
 
+        let body_off = self.store.txs.body_logical_len();
         let got_tx_fks = self.store.put_tx_full_batch_indexed(&packed, index_tx)?;
         if got_tx_fks.len() != packed.len() {
             return Err(StoreError::Corrupt("tx put_full_batch length"));
@@ -165,7 +171,29 @@ impl Query {
         }
 
         self.store.header_txs.put_ranges_batch(&per_header_ranges)?;
+
+        // Far archive lead: free just-written body pages so they do not sit in
+        // the page cache while prewarm/confirm work near tip.
+        let body_end = self.store.txs.body_logical_len();
+        let body_len = body_end.saturating_sub(body_off);
+        if body_len > 0 && self.archive_far_ahead_of_prewarm()? {
+            self.store.txs.advise_body_dont_need(body_off, body_len);
+        }
         Ok(())
+    }
+
+    /// True when Class A high-water is more than [`ARCHIVE_BODY_DONTNEED_LEAD`]
+    /// blocks ahead of the prewarm ready watermark (or tip if prewarm idle).
+    fn archive_far_ahead_of_prewarm(&self) -> Result<bool, QueryError> {
+        let bodies = self.store.header_txs.count_bodies()?;
+        if bodies == 0 {
+            return Ok(false);
+        }
+        // Contiguous IBD: highest archived height ≈ body count − 1.
+        let arch_hi = (bodies - 1) as u32;
+        let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
+        let prewarm = self.parent_prewarm_ready_through().max(tip);
+        Ok(arch_hi.saturating_sub(prewarm) > ARCHIVE_BODY_DONTNEED_LEAD)
     }
 
     /// Resolve prev outpoint txid for an input (local fk or stored external hash).

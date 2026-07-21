@@ -415,6 +415,11 @@ impl ScriptHashTable {
     }
 
     /// Pack `live` (full set, oldest→newest) into inline or slab; free old slab if needed.
+    ///
+    /// **Same-class growth is append-only:** when `old` is already a slab of the
+    /// target class and `live` extends it (`n >= old.used`, prefix unchanged on
+    /// disk), only the new tail is written. Shrinks / reorder (unlink) still
+    /// rewrite the used prefix; class bumps allocate a new slab and copy all.
     fn write_entries_for_key(
         &self,
         alloc: &mut AllocState,
@@ -449,12 +454,23 @@ impl ScriptHashTable {
         // Reuse existing slab if same class and capacity sufficient.
         if let ShHeadValue::Slab {
             class: oc,
+            used: old_used,
             slab_off,
-            ..
         } = old
         {
             if *oc == class && slab_cap(*oc) >= n {
-                self.write_slab_entries(*slab_off, live)?;
+                if n >= *old_used && (live.len() as u32) >= *old_used {
+                    // Append-only: disk already holds live[..old_used].
+                    let skip = *old_used as usize;
+                    if skip < live.len() {
+                        let tail_off =
+                            *slab_off + (*old_used as u64) * SH_ENTRY_LEN as u64;
+                        self.write_slab_entries(tail_off, &live[skip..])?;
+                    }
+                } else {
+                    // Shrink / reorder (unlink swap-remove): rewrite used prefix.
+                    self.write_slab_entries(*slab_off, live)?;
+                }
                 return Ok(ShHeadValue::Slab {
                     class: *oc,
                     used: n,
@@ -474,6 +490,9 @@ impl ScriptHashTable {
     }
 
     fn write_slab_entries(&self, off: u64, live: &[ShEntry]) -> Result<(), StoreError> {
+        if live.is_empty() {
+            return Ok(());
+        }
         let mut blob = Vec::with_capacity(live.len() * SH_ENTRY_LEN);
         for e in live {
             blob.extend_from_slice(&e.encode());
@@ -746,6 +765,74 @@ mod tests {
         let (n2, _) = t.put_create_batch_append(&more, &mut heads).unwrap();
         assert_eq!(n2, 1);
         assert_eq!(t.entries(&sh).unwrap().len(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_class_append_preserves_prefix_and_order() {
+        // Grow within class 1 (cap 8): first 5 entries, then +2 without class bump.
+        // Append-only path must leave the original prefix intact on disk.
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let sh = script_hash(&[0x7a]);
+        let mut heads = HashMap::new();
+        let first: Vec<_> = (1..=5u32).map(|v| rec(sh, u64::from(v), v)).collect();
+        let (n, _) = t.put_create_batch_append(&first, &mut heads).unwrap();
+        assert_eq!(n, 5);
+        let off = match t.head_value(&sh).unwrap().unwrap() {
+            ShHeadValue::Slab {
+                class,
+                used,
+                slab_off,
+            } => {
+                assert_eq!(class, 1);
+                assert_eq!(used, 5);
+                slab_off
+            }
+            other => panic!("expected slab, got {other:?}"),
+        };
+        let more: Vec<_> = (6..=7u32).map(|v| rec(sh, u64::from(v), v)).collect();
+        let (n2, _) = t.put_create_batch_append(&more, &mut heads).unwrap();
+        assert_eq!(n2, 2);
+        match t.head_value(&sh).unwrap().unwrap() {
+            ShHeadValue::Slab {
+                class,
+                used,
+                slab_off,
+            } => {
+                assert_eq!(class, 1);
+                assert_eq!(used, 7);
+                assert_eq!(slab_off, off, "same-class growth must reuse slab");
+            }
+            other => panic!("expected slab, got {other:?}"),
+        }
+        let ents = t.entries(&sh).unwrap();
+        assert_eq!(ents.len(), 7);
+        for (i, (_, e)) in ents.iter().enumerate() {
+            assert_eq!(e.create_tx_fk, Fk(i as u64 + 1));
+        }
+        // One more wave that still fits (used 7 → 8, class 1 cap 8).
+        let last = vec![rec(sh, 8, 8)];
+        let (n3, _) = t.put_create_batch_append(&last, &mut heads).unwrap();
+        assert_eq!(n3, 1);
+        assert_eq!(t.entries(&sh).unwrap().len(), 8);
+        // Class bump (9 needs class 2, cap 16): new slab, full history preserved.
+        let (n4, _) = t
+            .put_create_batch_append(&[rec(sh, 9, 9)], &mut heads)
+            .unwrap();
+        assert_eq!(n4, 1);
+        match t.head_value(&sh).unwrap().unwrap() {
+            ShHeadValue::Slab { class, used, .. } => {
+                assert_eq!(class, 2);
+                assert_eq!(used, 9);
+            }
+            other => panic!("expected class-2 slab, got {other:?}"),
+        }
+        let ents = t.entries(&sh).unwrap();
+        assert_eq!(ents.len(), 9);
+        for (i, (_, e)) in ents.iter().enumerate() {
+            assert_eq!(e.create_tx_fk, Fk(i as u64 + 1));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

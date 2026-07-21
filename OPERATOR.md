@@ -66,9 +66,9 @@ without clearing known flags.
 **Index modes:** IBD defaults to **`IndexMode::Direct`**: archive batch-writes
 packed Class A + durable **`tx.head`**; confirm batch-writes **spend annotations**
 after Class C (no light UTXO). Scripthash is **not** progressively materialized:
-confirm only enqueues sorted runs (background flush + merge); at tip the node
-**merges remaining runs and cold bulk-loads** durable SH tables (migration-style)
-before Electrum. On enter Direct, leftover `ibd_utxo.map` is removed and point/tx
+confirm only enqueues sorted runs (background flush + merge); lead hysteresis
+does **not** pause peer fetch/archive. At tip the node **merges remaining runs
+and cold bulk-loads** durable SH tables (migration-style) before Electrum. On enter Direct, leftover `ibd_utxo.map` is removed and point/tx
 runs are materialized — prefer a **fresh datadir**. **`IndexMode::Catchup`**
 (runs + light UTXO + progressive mat) remains available for tests.
 

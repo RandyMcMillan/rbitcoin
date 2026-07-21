@@ -153,6 +153,7 @@ impl Query {
         self.set_index_mode(IndexMode::Catchup);
         self.set_spend_index(false);
         self.set_tx_index(false);
+        crate::run_builder_core::run_materialize_control::set_hysteresis_enabled(true);
         self.enable_index_run_mode()
     }
 
@@ -165,7 +166,8 @@ impl Query {
         self.set_index_mode(IndexMode::Direct);
         self.set_spend_index(true);
         self.set_tx_index(true);
-        // SH still deferred via runs; do not enable point/tx run workers.
+        // SH: enqueue + merge only; no progressive mat / peer-fetch pause.
+        crate::run_builder_core::run_materialize_control::set_hysteresis_enabled(false);
         self.sh_run.enable();
         self.drop_ibd_utxo_file()?;
         self.consume_point_and_tx_runs()?;

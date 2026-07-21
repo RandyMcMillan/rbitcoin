@@ -379,9 +379,15 @@ pub async fn ibd_cancellable(
         Arc::clone(&archive_stop),
     );
 
-    // Catch-up runs → open-hash materialize under archive hysteresis (idle IO).
-    let mut run_materialize_worker =
-        Some(run_materialize::RunMaterializeWorker::spawn(Arc::clone(&hub.query)));
+    // Catch-up progressive mat under lead hysteresis. Direct: SH merge-only,
+    // no peer-fetch pause / mat worker (bulk SH at tip).
+    let mut run_materialize_worker = if hub.query.index_mode().is_direct() {
+        None
+    } else {
+        Some(run_materialize::RunMaterializeWorker::spawn(Arc::clone(
+            &hub.query,
+        )))
+    };
 
     // Fresh cancel state for this IBD session (may have been set on prior stop).
     hub.query.clear_confirm_cancel();
@@ -643,7 +649,8 @@ pub async fn ibd_cancellable(
             }
             hub.query.seed_parent_runway(&items);
             prewarm_ctrl.publish(tip, arch, items);
-            // Archive hysteresis: pause Class A / materialize runs when lead is huge.
+            // Lead hysteresis (Catchup only): pause peer fetch to materialize runs.
+            // Direct keeps publishing metrics but never pauses fetch.
             let arch_lead = arch.saturating_sub(tip);
             let peer_h = st.max_peer_height;
             let archive_at_tip = peer_h > 0

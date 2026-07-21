@@ -56,6 +56,9 @@ pub mod run_materialize_control {
     static RUNS_MATERIALIZED: AtomicU64 = AtomicU64::new(0);
     static KEYS_MATERIALIZED: AtomicU64 = AtomicU64::new(0);
     static LAST_LOG_S: AtomicU64 = AtomicU64::new(0);
+    /// When true, never enter materialize mode / never pause peer fetch.
+    /// Set by [`IndexMode::Direct`] (SH merge-only until tip bulk-load).
+    static HYSTERESIS_OFF: AtomicBool = AtomicBool::new(false);
 
     const MODE_FETCH: u32 = 0;
     const MODE_MATERIALIZE: u32 = 1;
@@ -74,9 +77,18 @@ pub mod run_materialize_control {
             .unwrap_or(32_768)
     }
 
-    /// `0` disables hysteresis materialize.
+    /// Permanently disable lead hysteresis (peer-fetch pause + progressive mat).
+    /// Direct IBD calls this on enter; Catchup leaves it enabled.
+    pub fn set_hysteresis_enabled(on: bool) {
+        HYSTERESIS_OFF.store(!on, Ordering::Relaxed);
+        if !on {
+            MODE.store(MODE_FETCH, Ordering::Relaxed);
+        }
+    }
+
+    /// `0` env or hysteresis-off disables materialize/fetch-pause.
     pub fn enabled() -> bool {
-        start_lead_from_env() > 0
+        !HYSTERESIS_OFF.load(Ordering::Relaxed) && start_lead_from_env() > 0
     }
 
     /// Update lead, peer getdata inflight, and archive-caught-up; advance hysteresis.
@@ -105,8 +117,7 @@ pub mod run_materialize_control {
         }
     }
 
-    /// Stay in fetch mode (no progressive head materialize). Direct IBD uses
-    /// this so SH runs only flush/merge until tip bulk-load.
+    /// Stay in fetch mode and publish metrics only (no progressive mat).
     pub fn force_fetch_mode(arch_lead: u32, archive_at_tip: bool, peer_inflight: u32) {
         ARCH_LEAD.store(arch_lead, Ordering::Relaxed);
         ARCHIVE_AT_TIP.store(archive_at_tip, Ordering::Relaxed);
@@ -432,6 +443,7 @@ mod tests {
 
     #[test]
     fn hysteresis_start_stop_drain_and_tip() {
+        ctl::set_hysteresis_enabled(true);
         std::env::set_var("RBITCOIN_RUN_MATERIALIZE_START_LEAD", "1000");
         std::env::set_var("RBITCOIN_RUN_MATERIALIZE_STOP_LEAD", "500");
         ctl::publish(100, false, 0);

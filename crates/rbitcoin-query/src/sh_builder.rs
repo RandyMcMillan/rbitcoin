@@ -214,11 +214,6 @@ impl ShRunBuilder {
         Ok(Some(n))
     }
 
-    /// Stop enqueues, flush remaining, materialize each run, join worker.
-    pub fn finalize_and_materialize(&self, store: &Store) -> Result<u64, StoreError> {
-        self.finalize_and_bulk_materialize(store)
-    }
-
     /// Flush memtable, **fully merge** runs, then **cold bulk-load** into durable SH.
     ///
     /// Migration-style load (no per-key head seed probes when SH tables empty).
@@ -483,7 +478,7 @@ mod tests {
             creates.push(ScriptHashRecord::from_fk(sh, Fk(i as u64 + 1)));
         }
         b.enqueue(&creates);
-        let n = b.finalize_and_materialize(&store).unwrap();
+        let n = b.finalize_and_bulk_materialize(&store).unwrap();
         assert!(n >= 100, "inserted={n}");
         assert!(store.scripthash.entry_count() >= 100);
         let _ = std::fs::remove_dir_all(&dir);

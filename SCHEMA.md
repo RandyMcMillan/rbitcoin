@@ -23,8 +23,6 @@ Versioned layouts for the chain store. **Format is unstable until 1.0.** Magic b
 - **strong_tx bitset** (1 bit per tx_fk vs u64)
 - **Hash heads** rehash at ~7/8 load (was 1/2)
 
-Catch-up also uses process-local **light UTXO** (`ibd_utxo.map`, magic `RBUXTO03`) — not part of the `RBT1` table set; rebuilt from confirmed chain if missing/corrupt.
-
 Legacy input flag `LOCAL_PREV` (old local `prev_tx_fk`) is **rejected** on decode.
 
 Endianness: **little-endian** for all multi-byte integers.
@@ -44,8 +42,7 @@ Endianness: **little-endian** for all multi-byte integers.
     header_txs_count.body        # header_fk-1 → tx count
     scripthash.body / scripthash.head  # Class B Electrum scripthash (thin)
     archive_epoch                # finalize + archive_mode
-    ibd_utxo.map                 # catch-up light UTXO (RBUXTO03; optional rebuild)
-    tx.runs / point.runs / scripthash.runs  # catch-up sorted runs (when index_run mode)
+    scripthash.runs              # SH sorted runs during Direct IBD (bulk-load at tip)
   wire/                          # tip wire ring (soft zone only)
 ```
 
@@ -197,21 +194,6 @@ Heights, value, spentness joined at query from Class A / spend annotations / Cla
 ### Archive epoch (`archive_epoch`, 32 bytes)
 
 magic, schema version, archive_mode flag, optional finalized_height, wire_depth.
-
-### Light UTXO (`ibd_utxo.map`, catch-up only)
-
-Separate file (not `RBT1`). Magic **`RBUXTO03`**, 4 KiB header + open-addressed slots.
-
-| Slot field (24 B) | Layout |
-|-------------------|--------|
-| prefix | first 12 bytes of txid |
-| pack | `state:u8` (empty/live/tomb) + `vout:u24` |
-| create_fk | u64 LE Class A fk of the creating tx |
-
-- Membership ≈ unspent; miss ⇒ spent or never created (when spend_index off).
-- Full-txid collisions (same prefix+vout) use a rare process-local overflow map.
-- Tip height in header must stay aligned with confirmed tip; corrupt/unsupported version → delete and rebuild from chain.
-- Slot count: power of two; default `1<<22`; override `RBITCOIN_IBD_UTXO_SLOTS`.
 
 ## Chain ops (query layer)
 

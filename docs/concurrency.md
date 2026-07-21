@@ -24,17 +24,16 @@ Prep never holds store write locks. The writer is the sole Class A producer for 
 
 ## Index modes (`IndexMode`)
 
-| Mode | When | Spentness | Durable `tx.head` / points |
-|------|------|-----------|----------------------------|
-| **Catchup** | IBD (`Query::enter_catchup_mode`) | light mmap UTXO | off (sorted runs) |
-| **Tip** | after catch-up (`enter_tip_mode` / `enter_tip_index_mode`) | confirmed-strong points | on |
+| Mode | When | Spentness | Durable `tx.head` / spends | SH |
+|------|------|-----------|----------------------------|-----|
+| **Direct** | IBD (`enter_direct_index_mode`) | confirmed-strong annotations | archive live head; confirm spend batch | runs merge-only → bulk at tip |
+| **Tip** | after IBD (`enter_tip_mode`) | confirmed-strong annotations | live heads + archive spends | durable write-through |
 
-Catch-up without UTXO is illegal (`ensure_spent_oracle_ready`). Do not enter Tip until tip ≈ peer height.
+Do not enter Tip until tip ≈ peer height (SH bulk materialize runs first).
 
 ## Locks
 
 - Store tables use fine-grained `Mutex`es per file/head (see `rbitcoin-store`).
-- Catch-up spentness / parent create_fk: `Query` light UTXO (`ibd_utxo.map` mmap under a mutex). No process-local spent HashSet.
 - `ChainHub::confirmed` is `RwLock<HashSet>` for O(1) `has_block` during IBD.
 
 ## Practical rules

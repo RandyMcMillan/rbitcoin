@@ -158,15 +158,14 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
     // Direct IndexMode (IBD default):
     // - archive batch-writes packed Class A + durable `tx.head`
-    // - confirm batch-writes spend annotations after Class C (no light UTXO)
-    // - SH: enqueue + run merge only (no progressive head mat); bulk-load at tip
-    // - drops leftover ibd_utxo.map / point+tx runs (fresh IBD has none)
+    // - confirm batch-writes spend annotations after Class C
+    // - SH: enqueue + run merge only; bulk-load at tip
     handle
         .query
         .enter_direct_index_mode()
         .map_err(|e| NodeError::Config(format!("index direct mode: {e}")))?;
     info!(
-        "ibd: IndexMode::Direct (archive tx.head; confirm spend batch; SH runs merge-only; bulk SH at tip; no light UTXO)"
+        "ibd: IndexMode::Direct (archive tx.head; confirm spend batch; SH runs merge-only; bulk SH at tip)"
     );
     handle
         .query
@@ -694,15 +693,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 /// Electrum binds**. Thin scripthash creates are always written on confirm;
 /// no tip-mode SH rebuild (corrupt index ⇒ reindex).
 pub(crate) fn enter_tip_mode(query: &Query) {
-    // Materialize catch-up runs into durable open-hash tables (one-time).
-    match query.finalize_tx_runs() {
-        Ok(n) => info!("node: tx.head run materialize inserted≈{n}"),
-        Err(e) => warn!("node: tx.head run materialize failed: {e}"),
-    }
+    // Crash recovery: sparse head/points after partial Direct IBD.
     let bodies = query.tx_body_count();
     let head_after = query.tx_head_occupied();
     if bodies > 0 && head_after.saturating_mul(2) < bodies {
-        info!("node: tx.head still sparse after runs — Class A backfill…");
+        info!("node: tx.head sparse — Class A backfill…");
         let t0 = Instant::now();
         match query.backfill_tx_index(|done, total, inserted| {
             info!(
@@ -718,15 +713,11 @@ pub(crate) fn enter_tip_mode(query: &Query) {
         }
     }
 
-    match query.finalize_point_runs() {
-        Ok(n) => info!("node: point run materialize edges≈{n}"),
-        Err(e) => warn!("node: point run materialize failed: {e}"),
-    }
     let tip = query.tip_height().map(|h| h.0).unwrap_or(0);
     let point_before = query.point_edge_count();
     if tip > 0 && point_before < tip as u64 {
         info!(
-            "node: points still sparse after runs — Class A backfill (tip={tip}, edges={point_before})…"
+            "node: points sparse — Class A backfill (tip={tip}, edges={point_before})…"
         );
         let t0 = Instant::now();
         match query.backfill_point_spends(|h, tip_h, txs, edges| {
@@ -744,7 +735,7 @@ pub(crate) fn enter_tip_mode(query: &Query) {
         }
     }
 
-    // SH: Direct IBD only flush/merges runs; tip does cold bulk-load (migration-style).
+    // SH: Direct IBD only flush/merges runs; tip does cold bulk-load.
     info!("node: scripthash bulk materialize from runs (merge + cold load)…");
     match query.finalize_sh_runs() {
         Ok(n) => info!("node: scripthash bulk materialize creates≈{n}"),
@@ -784,7 +775,6 @@ mod tests {
         assert_eq!(q.index_mode(), IndexMode::Direct);
         assert!(q.spend_index_enabled());
         assert!(q.tx_index_enabled());
-        assert!(!q.ibd_utxo_enabled());
 
         enter_tip_mode(&q);
         assert_eq!(q.index_mode(), IndexMode::Tip);

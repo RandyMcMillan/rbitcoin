@@ -167,7 +167,6 @@ impl Query {
         let mut create_regs: Vec<(Fk, [u8; 32], u32)> = Vec::new();
         let mut parent_need: HashMap<u64, Vec<u32>> = HashMap::new(); // parent_fk → need heights
         let mut thin_by_spend: HashMap<u64, Vec<StashedThinInput>> = HashMap::new();
-        let catchup = self.ibd_utxo_enabled();
         let mut batch_creates: HashMap<[u8; 32], Fk> = HashMap::new();
         let mut body_ranges: Vec<(Fk, u64, u64)> = Vec::new();
 
@@ -306,16 +305,6 @@ impl Query {
                         }
                         continue;
                     }
-                    if let Some(create_fk) = self.ibd_utxo_create_fk(&prev_txid, prev_index)? {
-                        edges.push(StashedThinInput {
-                            create_fk: create_fk.get(),
-                            prev_index,
-                        });
-                        if let Some(pid) = create_fk.get() {
-                            parent_need.entry(pid).or_default().push(*height);
-                        }
-                        continue;
-                    }
                     // Durable head lookup once; cache fk in by_txid (no head mlock).
                     if let Some(create_fk) = self.tx_fk_by_txid(&prev_txid).ok().flatten() {
                         edges.push(StashedThinInput {
@@ -328,10 +317,6 @@ impl Query {
                                 prev_txid,
                                 *height,
                             );
-                            if catchup && self.catchup_is_spent(&prev_txid, prev_index)? {
-                                st.utxo_parents = st.utxo_parents.saturating_add(1);
-                                continue;
-                            }
                             parent_need.entry(pid).or_default().push(*height);
                         }
                         continue;
@@ -424,9 +409,6 @@ impl Query {
         spends: &[([u8; 32], u32)],
     ) -> Result<(), QueryError> {
         if spends.is_empty() {
-            return Ok(());
-        }
-        if self.ibd_utxo_enabled() {
             return Ok(());
         }
         let mut resolved: Vec<(Fk, u32)> = Vec::with_capacity(spends.len());

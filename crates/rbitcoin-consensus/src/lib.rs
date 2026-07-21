@@ -125,7 +125,7 @@ pub mod confirm_phase_stats {
     pub static SCRIPT_NS: AtomicU64 = AtomicU64::new(0);
     /// Class C wall (`confirm_blocks_run` total).
     pub static CLASS_C_NS: AtomicU64 = AtomicU64::new(0);
-    /// Post–Class C catch-up oracle apply: mmap UTXO spends/creates.
+    /// Post–Class C durable spend annotation batch (historical name `utxo_apply`).
     /// Logged as `utxo_ms` / us/blk `utxo`.
     pub static UTXO_APPLY_NS: AtomicU64 = AtomicU64::new(0);
     /// Header + body-fk resolve for the batch.
@@ -234,36 +234,43 @@ pub fn accept_and_connect_block(
     let fk = query
         .connect_block(height, &header_rec, &txs)
         .map_err(ConsensusError::Store)?;
-    // Post Class C (same order as `confirm_archived_run`): UTXO apply.
-    let mut spends = Vec::new();
-    let mut creates = Vec::new();
-    if query.ibd_utxo_enabled() || query.spend_index_enabled() {
+    // Post Class C (same order as `confirm_archived_run`): durable spend annotate.
+    if query.spend_index_enabled() {
         let tx_fks = query
             .store()
             .header_txs
             .get_list(fk)
             .map_err(ConsensusError::Store)?
             .ok_or(ConsensusError::Store(StoreError::NotFound))?;
+        let mut by_create: Vec<(
+            rbitcoin_primitives::Fk,
+            u32,
+            rbitcoin_primitives::Fk,
+        )> = Vec::new();
         for (ti, tx) in block.txdata.iter().enumerate() {
-            let tid = txids[ti];
-            let create_fk = tx_fks.get(ti).copied().unwrap_or(rbitcoin_primitives::Fk::NULL);
-            if ti > 0 {
-                for inp in &tx.input {
-                    let op = inp.previous_output;
-                    spends.push((op.txid.to_byte_array(), op.vout, create_fk));
-                }
+            if ti == 0 {
+                continue;
             }
-            if query.ibd_utxo_enabled() {
-                for (v, _) in tx.output.iter().enumerate() {
-                    creates.push((tid, v as u32, create_fk));
+            let spend_fk = tx_fks.get(ti).copied().unwrap_or(rbitcoin_primitives::Fk::NULL);
+            if spend_fk.is_null() {
+                continue;
+            }
+            for inp in &tx.input {
+                let op = inp.previous_output;
+                if let Some(cfk) = query
+                    .tx_fk_by_txid(op.txid.as_byte_array())
+                    .map_err(ConsensusError::Store)?
+                {
+                    by_create.push((cfk, op.vout, spend_fk));
                 }
             }
         }
-    }
-    if query.ibd_utxo_enabled() {
-        query
-            .apply_ibd_utxo_block(&spends, &creates, height.0)
-            .map_err(ConsensusError::Store)?;
+        if !by_create.is_empty() {
+            query
+                .store()
+                .put_spend_batch_by_create(&by_create)
+                .map_err(ConsensusError::Store)?;
+        }
     }
     Ok(fk)
 }

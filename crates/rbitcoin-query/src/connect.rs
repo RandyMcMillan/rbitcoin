@@ -395,55 +395,12 @@ impl Query {
 
     /// Disconnect the current tip (Class C + scripthash create unlink; archive remains).
     ///
-    /// Catch-up: reverse light UTXO (remove creates, restore spent prevouts).
-    /// Tip mode: durable point edges remain for archive history; strong bits cleared below.
+    /// Durable point edges remain for archive history; strong bits cleared below.
     pub fn disconnect_tip(&self) -> Result<(), QueryError> {
         let height = self
             .tip_height()
             .ok_or(StoreError::Corrupt("no tip to disconnect"))?;
         let tx_fks = self.block_tx_fks(height)?;
-
-        // Undo catch-up UTXO for this tip (Core reorg).
-        if self.ibd_utxo_enabled() {
-            let mut unspends: Vec<([u8; 32], u32, Fk)> = Vec::new();
-            let mut uncreates: Vec<([u8; 32], u32)> = Vec::new();
-            for &tx_fk in &tx_fks {
-                let tx = self.store.get_tx(tx_fk)?;
-                for v in 0..tx.output_count {
-                    uncreates.push((tx.txid, v));
-                }
-                if tx.input_count == 0 {
-                    continue;
-                }
-                let inputs = self.tx_input_run_class_a(tx_fk, &tx)?;
-                for inp in &inputs {
-                    if inp.is_coinbase() {
-                        continue;
-                    }
-                    let prev_txid = self.resolve_prev_txid(inp)?;
-                    let parent_fk = self
-                        .tx_fk_by_txid(&prev_txid)
-                        .ok()
-                        .flatten()
-                        .or_else(|| self.find_tx_fk_by_txid_scan(&prev_txid).ok().flatten())
-                        .unwrap_or(Fk::NULL);
-                    unspends.push((prev_txid, inp.prev_index, parent_fk));
-                }
-            }
-            let mut g = self.ibd_utxo.lock().unwrap();
-            if let Some(ref mut u) = *g {
-                for &(txid, vout) in &uncreates {
-                    let _ = u.take_spend(&txid, vout)?;
-                }
-                for &(txid, vout, parent_fk) in &unspends {
-                    if !parent_fk.is_null() {
-                        u.insert_create(&txid, vout, parent_fk)?;
-                    }
-                }
-                let new_tip = height.0.checked_sub(1);
-                u.commit_tip(new_tip)?;
-            }
-        }
 
         let mut touched_sh: Vec<[u8; 32]> = Vec::new();
         for &tx_fk in &tx_fks {

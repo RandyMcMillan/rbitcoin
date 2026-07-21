@@ -245,9 +245,10 @@ fn store_error_and_corrupt_paths() {
     let s = Store::create(&path).unwrap();
     assert!(matches!(s.get_header(Fk::NULL), Err(StoreError::InvalidFk)));
     assert!(matches!(s.get_header(Fk(99)), Err(StoreError::NotFound)));
+    // All-zero txid has no create head entry → NotFound (not InvalidFk).
     assert!(matches!(
         s.put_spend(&[0u8; 32], 0, Fk::NULL, 0),
-        Err(StoreError::InvalidFk)
+        Err(StoreError::NotFound | StoreError::InvalidFk)
     ));
     let _ = format!("{}", StoreError::BadMagic);
     let _ = format!("{}", StoreError::BadSchema(3));
@@ -514,11 +515,11 @@ fn resume_work_path_sees_archived_bodies_after_reopen() {
 /// Single scenario covering the signet @2148 failure class and IBD:
 /// - archive bodies out of height order (ahead of tip)
 /// - re-archive / mega-batch duplicate is idempotent (fk + tx_height stable)
-/// - `tx.head` off: prevouts via light UTXO create_fk (external prev on Class A)
-/// - durable points off on confirm (process-local / UTXO); backfill restores spenders()
+/// - Direct: live `tx.head` + durable spend annotations on confirm
+/// - backfill restores spenders() when points sparse
 /// - coinbase maturity then spend still connects
 #[test]
-fn ibd_parallel_archive_idempotent_confirm_without_tx_head() {
+fn ibd_parallel_archive_idempotent_confirm_direct() {
     use rbitcoin_consensus::{
         accept_and_archive_block, accept_and_connect_block, confirm_archived_at, header_to_record,
         prepare_block_for_archive, ChainParams, Milestone,
@@ -527,9 +528,7 @@ fn ibd_parallel_archive_idempotent_confirm_without_tx_head() {
 
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
-    q.set_tx_index(false);
-    q.set_spend_index(false);
-    q.enable_ibd_utxo().unwrap();
+    q.enter_direct_index_mode().unwrap();
     let ms = Milestone { height: 1_000_000 };
     let params = ChainParams::regtest();
     let maturity = params.coinbase_maturity();
@@ -609,30 +608,23 @@ fn ibd_parallel_archive_idempotent_confirm_without_tx_head() {
         &b_spend.block_hash().to_byte_array(),
         ms,
     )
-    .expect("mature coinbase spend with head off + double-archive");
+    .expect("mature coinbase spend with Direct head + double-archive");
     assert_eq!(q.tip_height(), Some(Height(spend_h)));
-    // Durable points deferred; process-local set still sees the spend.
+    // Direct: confirm batch-writes durable spend annotations.
     assert!(
         q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
-        "local spent-set must mark spends when spend_index is off"
+        "durable strong spend must mark coinbase spent"
     );
-    assert!(
-        q.spenders(cb1.as_byte_array(), 0).unwrap().is_empty(),
-        "durable spenders empty until backfill"
-    );
-    q.set_spend_index(true);
-    let (_h, _txs) = q.backfill_point_spends(|_, _, _, _| {}).unwrap();
     assert_eq!(
         q.spenders(cb1.as_byte_array(), 0).unwrap().len(),
         1,
-        "backfill must write durable point edges for Electrum/spenders"
+        "confirm spend batch writes durable edges for Electrum/spenders"
     );
     let fks = q.block_tx_fks(Height(spend_h)).unwrap();
     assert!(fks.len() >= 2);
-    // Packed Class A + head off: address body by create fk.
     let rec = q.get_tx(fks[1]).unwrap();
     let inp = q.tx_input_at_fk(fks[1], &rec, 0).unwrap();
-    // Class A always external prev_txid; confirm used UTXO create_fk.
+    // Class A always external prev_txid; confirm used tx.head create_fk.
     assert_ne!(inp.prev_txid, [0u8; 32]);
     assert_eq!(inp.prev_index, 0);
 }
@@ -841,10 +833,9 @@ fn confirm_survives_partial_class_c_without_tip_advance() {
     assert_eq!(q2.tip_height(), Some(Height(spend_h + 1)));
 }
 
-/// Resume with `tx.head` off: spend archived with external prev_txid; confirm
-/// resolves parent via light UTXO create_fk (no process txid map / warm).
+/// Resume: spend archived with external prev_txid; confirm resolves via `tx.head`.
 #[test]
-fn resume_head_off_utxo_resolves_external_prev() {
+fn resume_tx_head_resolves_external_prev() {
     use rbitcoin_consensus::{
         accept_and_archive_block, accept_and_connect_block, confirm_archived_at, ChainParams,
         Milestone,
@@ -859,9 +850,7 @@ fn resume_head_off_utxo_resolves_external_prev() {
     // Session 1: mine + confirm pad so coinbase is mature; leave spend unarchived.
     let (cb1, tip, tip_time, spend_h, b_spend) = {
         let q = Query::open_or_create(td.store_path()).unwrap();
-        q.set_tx_index(false);
-        q.set_spend_index(false);
-        q.enable_ibd_utxo().unwrap();
+        q.enter_direct_index_mode().unwrap();
         let genesis = regtest_genesis();
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
         let mut tip = genesis.block_hash();
@@ -889,14 +878,10 @@ fn resume_head_off_utxo_resolves_external_prev() {
     // Session 2: reopen UTXO (tip aligned), archive spend with external prev, confirm.
     {
         let q = Query::open_or_create(td.store_path()).unwrap();
-        q.set_tx_index(false);
-        q.set_spend_index(false);
-        q.enable_ibd_utxo().unwrap();
+        q.enter_direct_index_mode().unwrap();
         assert!(
-            q.ibd_utxo_create_fk(cb1.as_byte_array(), 0)
-                .unwrap()
-                .is_some(),
-            "light UTXO must retain mature coinbase create_fk across reopen"
+            q.tx_fk_by_txid(cb1.as_byte_array()).unwrap().is_some(),
+            "tx.head must retain mature coinbase create_fk across reopen"
         );
         accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
         let fks = q
@@ -924,22 +909,23 @@ fn resume_head_off_utxo_resolves_external_prev() {
             &b_spend.block_hash().to_byte_array(),
             ms,
         )
-        .expect("external prev_txid resolves via light UTXO create_fk");
+        .expect("external prev_txid resolves via tx.head");
         assert_eq!(q.tip_height(), Some(Height(spend_h)));
         assert!(
             q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
-            "UTXO must see the confirmed spend"
+            "durable spend must see the confirmed spend"
         );
-        assert!(
-            q.spenders(cb1.as_byte_array(), 0).unwrap().is_empty(),
-            "durable points stay empty until spend_index / backfill"
+        assert_eq!(
+            q.spenders(cb1.as_byte_array(), 0).unwrap().len(),
+            1,
+            "Direct confirm writes durable spend annotations"
         );
     }
 }
 
-/// wave_fill: catch-up UTXO spentness suppresses parent live slots (no HashSet).
+/// wave_fill: durable spentness suppresses parent live slots.
 #[test]
-fn wave_fill_utxo_spent_suppresses_parent_live() {
+fn wave_fill_spent_suppresses_parent_live() {
     use rbitcoin_consensus::{
         accept_and_archive_block, accept_and_connect_block, ChainParams, Milestone,
     };
@@ -947,9 +933,7 @@ fn wave_fill_utxo_spent_suppresses_parent_live() {
 
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
-    q.set_spend_index(false);
-    q.set_tx_index(false);
-    q.enable_ibd_utxo().unwrap();
+    q.enter_direct_index_mode().unwrap();
     let ms = Milestone::NONE;
     let params = ChainParams::regtest();
     let maturity = params.coinbase_maturity();
@@ -1004,209 +988,7 @@ fn wave_fill_utxo_spent_suppresses_parent_live() {
         .unwrap();
     assert!(
         !wave_spent.has_live_output_txid(cb1.as_byte_array(), 0),
-        "UTXO spent must suppress parent live slot in wave_fill"
-    );
-}
-
-/// Light UTXO: double-spend reject, disconnect undo, rebuild after tip align.
-#[test]
-fn ibd_utxo_double_spend_and_disconnect() {
-    use rbitcoin_consensus::{
-        accept_and_connect_block, ChainParams, ConsensusError, Milestone,
-    };
-    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
-
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    q.set_spend_index(false);
-    q.set_tx_index(false);
-    q.enable_ibd_utxo().unwrap();
-    q.ensure_spent_oracle_ready().unwrap();
-    let ms = Milestone::NONE;
-    let params = ChainParams::regtest();
-    let maturity = params.coinbase_maturity();
-
-    let genesis = regtest_genesis();
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
-    let mut tip = genesis.block_hash();
-    let mut tip_time = genesis.header.time;
-
-    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
-    let cb1 = b1.txdata[0].compute_txid();
-    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
-    tip = b1.block_hash();
-    tip_time = b1.header.time;
-
-    let last_pad = maturity + 1;
-    for h in 2..=last_pad {
-        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
-        tip = b.block_hash();
-        tip_time = b.header.time;
-    }
-
-    let spend_h = last_pad + 1;
-    let spend = spend_anyone_can_spend(cb1, 0, bitcoin::Amount::from_sat(49_0000_0000));
-    let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
-    accept_and_connect_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
-    assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
-
-    // Double-spend must fail (UTXO oracle).
-    let spend2 = spend_anyone_can_spend(cb1, 0, bitcoin::Amount::from_sat(48_0000_0000));
-    let b_bad = mine_regtest_block(
-        b_spend.block_hash(),
-        b_spend.header.time + 600,
-        spend_h + 1,
-        vec![spend2],
-    );
-    let err = accept_and_connect_block(&q, &params, Height(spend_h + 1), &b_bad, ms);
-    assert!(
-        matches!(err, Err(ConsensusError::PrevoutSpent)),
-        "double-spend must be PrevoutSpent, got {err:?}"
-    );
-
-    // Disconnect tip unspends via UTXO reverse.
-    q.disconnect_tip().unwrap();
-    assert_eq!(q.tip_height(), Some(Height(spend_h - 1)));
-    assert!(
-        !q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
-        "disconnect must restore UTXO create"
-    );
-
-    // Re-confirm original spend after disconnect.
-    accept_and_connect_block(&q, &params, Height(spend_h), &b_spend, ms)
-        .expect("re-confirm spend after disconnect");
-    assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
-
-    // Catch-up without UTXO after tip-mode flip is illegal until enable/rebuild.
-    q.set_spend_index(true);
-    q.set_spend_index(false);
-    // UTXO still enabled and tip-aligned from prior enable — still ready.
-    q.ensure_spent_oracle_ready().unwrap();
-    let err2 = accept_and_connect_block(&q, &params, Height(spend_h + 1), &b_bad, ms);
-    assert!(
-        matches!(err2, Err(ConsensusError::PrevoutSpent)),
-        "double-spend still rejected, got {err2:?}"
-    );
-    q.rebuild_spent_oracle_to_tip().unwrap();
-    assert!(
-        q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
-        "rebuild must restore spends from confirmed chain"
-    );
-}
-
-/// Re-confirm path must not surface `ibd utxo duplicate create` (mainnet @519).
-/// Class C can succeed while UTXO apply is retried; inserts are idempotent and
-/// height-monotonic.
-#[test]
-fn ibd_utxo_reapply_same_height_is_idempotent() {
-    use rbitcoin_consensus::{
-        accept_and_connect_block, ChainParams, Milestone,
-    };
-    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
-
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    q.set_spend_index(false);
-    q.set_tx_index(false);
-    q.enable_ibd_utxo().unwrap();
-    let ms = Milestone::NONE;
-    let params = ChainParams::regtest();
-
-    let genesis = regtest_genesis();
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
-    let mut tip = genesis.block_hash();
-    let mut tip_time = genesis.header.time;
-
-    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
-    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
-    tip = b1.block_hash();
-    tip_time = b1.header.time;
-
-    // Simulate partial-apply retry: same creates at same tip height.
-    let cb = b1.txdata[0].compute_txid().to_byte_array();
-    let cb_fk = q
-        .ibd_utxo_create_fk(&cb, 0)
-        .unwrap()
-        .expect("height 1 coinbase in UTXO");
-    q.apply_ibd_utxo_block(&[], &[(cb, 0, cb_fk)], 1)
-        .expect("re-apply tip height must be no-op / idempotent");
-    q.apply_ibd_utxo_block(&[], &[(cb, 0, cb_fk)], 1)
-        .expect("second re-apply still ok");
-
-    let b2 = mine_regtest_block(tip, tip_time + 600, 2, vec![]);
-    accept_and_connect_block(&q, &params, Height(2), &b2, ms)
-        .expect("next height after re-apply must confirm");
-    assert_eq!(q.tip_height(), Some(Height(2)));
-}
-
-/// Multi-block `confirm_archived_run` must insert UTXO creates (tx_fks live on
-/// Class C items after mem::take). Regression for mainnet tip=169 reject @170
-/// PrevoutSpent: empty creates left the first real spend as a false miss.
-#[test]
-fn ibd_utxo_multi_block_run_keeps_creates() {
-    use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, confirm_archived_run, ChainParams,
-        Milestone,
-    };
-    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
-
-    let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create(td.store_path()).unwrap();
-    q.set_spend_index(false);
-    q.set_tx_index(false);
-    q.enable_ibd_utxo().unwrap();
-    let ms = Milestone::NONE;
-    let params = ChainParams::regtest();
-    let maturity = params.coinbase_maturity();
-
-    let genesis = regtest_genesis();
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
-    let mut tip = genesis.block_hash();
-    let mut tip_time = genesis.header.time;
-
-    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
-    let cb1 = b1.txdata[0].compute_txid();
-    accept_and_archive_block(&q, &params, Height(1), &b1, ms).unwrap();
-    tip = b1.block_hash();
-    tip_time = b1.header.time;
-
-    let last_pad = maturity + 1;
-    let mut run: Vec<(Height, [u8; 32])> = vec![(Height(1), b1.block_hash().to_byte_array())];
-    for h in 2..=last_pad {
-        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
-        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
-        tip = b.block_hash();
-        tip_time = b.header.time;
-        run.push((Height(h), b.block_hash().to_byte_array()));
-    }
-    let spend_h = last_pad + 1;
-    let spend = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
-    let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
-    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
-    run.push((
-        Height(spend_h),
-        b_spend.block_hash().to_byte_array(),
-    ));
-
-    // One multi-height confirm (IBD path): must apply creates from every height
-    // so the spend of cb1@0 in the last block does not false-positive as spent.
-    confirm_archived_run(&q, &params, ms, &run)
-        .expect("multi-block UTXO run must confirm pad+spend");
-    assert_eq!(q.tip_height(), Some(Height(spend_h)));
-    assert!(
-        q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
-        "cb1 coinbase must be spent after multi-block run"
-    );
-    assert!(
-        q.catchup_is_spent(cb1.as_byte_array(), 0).unwrap(),
-        "UTXO oracle must mark spent prevout"
-    );
-    // Spend creates a new unspent outpoint — must be present in UTXO.
-    let spend_txid = b_spend.txdata[1].compute_txid();
-    assert!(
-        !q.catchup_is_spent(spend_txid.as_byte_array(), 0).unwrap(),
-        "spend output must be unspent in mmap UTXO after multi-block apply"
+        "durable spent must suppress parent live slot in wave_fill"
     );
 }
 
@@ -1224,8 +1006,7 @@ fn confirm_batch_create_and_spend_parent_same_run() {
 
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
-    q.enter_catchup_mode().unwrap();
-    q.enable_ibd_utxo().unwrap();
+    q.enter_direct_index_mode().unwrap();
     let ms = Milestone::NONE;
     let params = ChainParams::regtest();
     let maturity = params.coinbase_maturity();
@@ -1282,7 +1063,7 @@ fn confirm_batch_create_and_spend_parent_same_run() {
         .expect("same-run create then spend must confirm (open reserve not a deadlock)");
     assert_eq!(q.tip_height(), Some(Height(spend_h)));
     assert!(
-        q.catchup_is_spent(parent_txid.as_byte_array(), 0).unwrap(),
+        q.is_outpoint_spent(parent_txid.as_byte_array(), 0).unwrap(),
         "in-batch parent must be spent after multi-block run"
     );
 }
@@ -1290,7 +1071,7 @@ fn confirm_batch_create_and_spend_parent_same_run() {
 /// Mainnet @546 shape:
 /// - height H: 1-in / 2-out parent
 /// - height H+1: tx spends both parent vouts (2-in/2-out), then same-block chain
-/// IBD multi-block `confirm_archived_run` (wave + light UTXO), no durable indexes.
+/// IBD multi-block `confirm_archived_run` under Direct (live heads + spend batch).
 #[test]
 fn confirm_spend_both_vouts_of_one_input_parent() {
     use bitcoin::absolute::LockTime;
@@ -1306,8 +1087,7 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
 
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
-    q.enter_catchup_mode().unwrap();
-    q.enable_ibd_utxo().unwrap();
+    q.enter_direct_index_mode().unwrap();
     let ms = Milestone::NONE;
     let params = ChainParams::regtest();
     let maturity = params.coinbase_maturity();
@@ -1404,10 +1184,10 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
     )
     .expect("mainnet-546-shaped multi-block confirm must not MissingPrevout");
     assert_eq!(q.tip_height(), Some(Height(merge_h)));
-    assert!(q.catchup_is_spent(parent_txid.as_byte_array(), 0).unwrap());
-    assert!(q.catchup_is_spent(parent_txid.as_byte_array(), 1).unwrap());
+    assert!(q.is_outpoint_spent(parent_txid.as_byte_array(), 0).unwrap());
+    assert!(q.is_outpoint_spent(parent_txid.as_byte_array(), 1).unwrap());
 
-    // Cross-batch: next height spends t3 via UTXO create_fk only (no pending_creates).
+    // Cross-batch: next height spends t3 via durable head create_fk only.
     tip = b_merge.block_hash();
     tip_time = b_merge.header.time;
     let t3_txid = b_merge.txdata[3].compute_txid();
@@ -1425,11 +1205,11 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
         &b_next.block_hash().to_byte_array(),
         ms,
     )
-    .expect("cross-batch UTXO create_fk resolve must work");
+    .expect("cross-batch tx.head create_fk resolve must work");
     assert_eq!(q.tip_height(), Some(Height(next_h)));
 }
 
-/// Sequential confirm_archived_run + failed confirm must not poison UTXO.
+/// Sequential confirm_archived_run + failed confirm must not poison spends.
 #[test]
 fn confirm_run_sequential_and_failed_no_spend_poison() {
     use rbitcoin_consensus::{
@@ -1440,9 +1220,7 @@ fn confirm_run_sequential_and_failed_no_spend_poison() {
 
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
-    q.set_tx_index(false);
-    q.set_spend_index(false);
-    q.enable_ibd_utxo().unwrap();
+    q.enter_direct_index_mode().unwrap();
     let ms = Milestone { height: 0 };
     let params = ChainParams::regtest();
 

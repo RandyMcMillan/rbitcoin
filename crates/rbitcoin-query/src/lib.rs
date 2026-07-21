@@ -9,9 +9,7 @@ mod parent_prewarm;
 mod reconstruct;
 mod run_builder_core;
 mod scripthash;
-mod point_run_builder;
 mod sh_builder;
-mod tx_run_builder;
 mod wave_prevout;
 
 use bitcoin::absolute::LockTime;
@@ -24,8 +22,8 @@ use bitcoin::{
 };
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_store::{
-    script_hash, HeaderRecord, IbdUtxo, InputRecord, OutputRecord, PointRecord, ScriptHashRecord,
-    Store, StoreError, TxRecord,
+    script_hash, HeaderRecord, InputRecord, OutputRecord, PointRecord, ScriptHashRecord, Store,
+    StoreError, TxRecord,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -59,7 +57,7 @@ pub mod parent_prewarm_stats {
     pub static NS: AtomicU64 = AtomicU64::new(0);
     /// Heights whose body was scanned this window.
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
-    /// Parent outs loaded via UTXO create_fk path.
+    /// Parent outs resolved via create_fk (runway / head) without full body warm.
     pub static UTXO_PARENTS: AtomicU64 = AtomicU64::new(0);
     /// Runway create txs registered (full outs).
     pub static CREATES: AtomicU64 = AtomicU64::new(0);
@@ -212,44 +210,15 @@ pub mod connect_prevout_stats {
     }
 }
 
-/// Light UTXO diagnostics (reset by the IBD sampler).
+/// Removed light-UTXO diagnostics (stub so IBD sampler still compiles).
 pub mod ibd_utxo_stats {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    /// Confirm heal: apply failed → full `rebuild_ibd_utxo_to_tip`.
-    pub static REBUILD_COUNT: AtomicU64 = AtomicU64::new(0);
-
-    /// Wall time in open-address `take_spend` / `insert_create` (no msync).
-    pub static PROBE_NS: AtomicU64 = AtomicU64::new(0);
-    /// Formerly msync time; always 0 now (UTXO flush dropped — rebuildable cache).
-    pub static FLUSH_NS: AtomicU64 = AtomicU64::new(0);
-
-    /// Rebuilds in the last sample window (then reset).
+    /// Always zero — light UTXO deleted.
     pub fn sample_rebuilds_and_reset() -> u64 {
-        REBUILD_COUNT.swap(0, Ordering::Relaxed)
+        0
     }
-
-    /// Probe / flush nanoseconds this window (then reset).
+    /// Always `(0, 0)`.
     pub fn sample_probe_flush_and_reset() -> (u64, u64) {
-        (
-            PROBE_NS.swap(0, Ordering::Relaxed),
-            FLUSH_NS.swap(0, Ordering::Relaxed),
-        )
-    }
-
-    #[inline]
-    pub fn note_rebuild() {
-        REBUILD_COUNT.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn note_probe_ns(ns: u64) {
-        PROBE_NS.fetch_add(ns, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn note_flush_ns(ns: u64) {
-        FLUSH_NS.fetch_add(ns, Ordering::Relaxed);
+        (0, 0)
     }
 }
 
@@ -313,28 +282,19 @@ pub struct ResumeWorkEntry {
 pub struct Query {
     store: Store,
     /// When false, archive **and** confirm skip durable Class B point (spend) writes.
-    /// Prefer [`Self::index_mode`] / [`Self::enter_catchup_mode`] over toggling alone.
-    /// Catch-up spentness is light UTXO only; tip mode uses durable points + strong.
     spend_index: std::sync::atomic::AtomicBool,
-    /// When false, archive skips durable `tx.head` inserts (main archive cost).
-    /// Parent resolve during catch-up uses light UTXO create_fk (not a txid map).
+    /// When false, archive skips durable `tx.head` inserts.
     tx_index: std::sync::atomic::AtomicBool,
     /// Process-local scripthash → body head fk (confirm append path; avoids durable chain walks).
     sh_heads: Mutex<HashMap<[u8; 32], rbitcoin_store::ShHeadValue>>,
     /// Last height whose SH creates were enqueued/written **after tip commit**.
     /// `u64::MAX` = none. Replaces unbounded `sh_tx_indexed` HashSet.
     sh_indexed_through: AtomicU64,
-    /// Block-structured confirm parent runway (UTXO-backed + reserved holes).
+    /// Block-structured confirm parent runway.
     confirm_parents: confirm_parent_cache::ConfirmParentCache,
-    /// Catch-up SH: memtable → sorted runs (no durable head on confirm).
+    /// Direct IBD SH: memtable → sorted runs (bulk materialize at tip).
     sh_run: sh_builder::ShRunBuilder,
-    /// Catch-up tx.head via sorted runs.
-    tx_run: tx_run_builder::TxRunBuilder,
-    /// Catch-up point edges via sorted runs.
-    point_run: point_run_builder::PointRunBuilder,
-    /// Catch-up spentness: mmap unspent outpoint → create Class A fk.
-    ibd_utxo: Mutex<Option<IbdUtxo>>,
-    /// Explicit [`IndexMode`] (Catchup / Direct / Tip).
+    /// Explicit [`IndexMode`] (Direct / Tip).
     index_mode_cell: std::sync::atomic::AtomicU8,
     /// Cooperative cancel for in-flight confirm (prewarm waits). Set on IBD
     /// SIGINT teardown so the confirm OS thread aborts waits before process exit.
@@ -367,10 +327,7 @@ impl Query {
             sh_indexed_through: AtomicU64::new(sh_through),
             confirm_parents: confirm_parent_cache::ConfirmParentCache::from_env(),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
-            tx_run: tx_run_builder::TxRunBuilder::new(&store_path),
-            point_run: point_run_builder::PointRunBuilder::new(&store_path),
-            ibd_utxo: Mutex::new(None),
-            // Open as Tip until IBD selects Direct (default) or Catchup.
+            // Open as Tip until IBD selects Direct.
             index_mode_cell: std::sync::atomic::AtomicU8::new(IndexMode::Tip as u8),
             confirm_cancel: std::sync::atomic::AtomicBool::new(false),
         };
@@ -414,8 +371,7 @@ impl Query {
             .store(v, AtomicOrdering::Release);
     }
 
-    /// Resolve txid → fk: runway cache → durable `tx.head` → `tx.runs`.
-    /// Catch-up parent resolve prefers light UTXO create_fk (outpoint), not this.
+    /// Resolve txid → fk: runway cache → durable `tx.head`.
     fn lookup_tx_fk(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
         if let Some(fk) = self.confirm_parents.get_by_txid(txid) {
             return Ok(Some(fk));
@@ -425,32 +381,12 @@ impl Query {
                 return Ok(Some(fk));
             }
         }
-        if self.tx_run_enabled() {
-            return self.tx_run.lookup(txid);
-        }
         Ok(None)
     }
 
-    /// Public resolve by txid (durable head / runs). Prefer `ibd_utxo_create_fk` for unspent.
+    /// Public resolve by txid (runway + durable head).
     pub fn tx_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
         self.lookup_tx_fk(txid)
-    }
-
-    /// Linear Class A body scan for txid → fk (disconnect undo without head/runs).
-    /// O(n) — rare reorg path only.
-    pub(crate) fn find_tx_fk_by_txid_scan(
-        &self,
-        txid: &[u8; 32],
-    ) -> Result<Option<Fk>, QueryError> {
-        let n = self.store.txs.count();
-        for id in 1..=n {
-            let fk = Fk(id);
-            let rec = self.store.get_tx(fk)?;
-            if &rec.txid == txid {
-                return Ok(Some(fk));
-            }
-        }
-        Ok(None)
     }
 
     pub fn store(&self) -> &Store {
@@ -477,8 +413,6 @@ impl Query {
     /// (default on). Off during catch-up for speed; re-enable and materialize /
     /// [`Self::backfill_point_spends`] before Electrum.
     ///
-    /// When turning **off**, catch-up confirm requires light UTXO
-    /// ([`Self::enable_ibd_utxo`] / [`Self::enable_index_run_mode`]).
     pub fn set_spend_index(&self, enabled: bool) {
         self.spend_index
             .store(enabled, std::sync::atomic::Ordering::SeqCst);
@@ -491,56 +425,34 @@ impl Query {
 
     /// Host-friendly process-exit flush (durability for open tables).
     ///
-    /// See [`rbitcoin_store::Store::flush_for_shutdown`]. Catch-up light UTXO and
-    /// open-hash heads are write-through; this is not a write-behind spill.
+    /// See [`rbitcoin_store::Store::flush_for_shutdown`].
     pub fn flush_for_shutdown(&self) -> Result<(), QueryError> {
         self.store.flush_for_shutdown()
     }
 }
 
 impl Query {
-    /// True if this outpoint is spent on the **best chain**.
-    ///
-    /// - [`IndexMode::Catchup`]: light UTXO unspent set.
-    /// - [`IndexMode::Direct`] / [`IndexMode::Tip`]: durable confirmed-strong spends.
+    /// True if this outpoint is spent on the **best chain** (durable confirmed-strong).
     ///
     /// Does **not** treat archive-only point rows as spent: Class A may write
     /// edges before Class C; those spenders are not strong yet.
     pub fn is_outpoint_spent(&self, txid: &[u8; 32], vout: u32) -> Result<bool, QueryError> {
-        match self.index_mode() {
-            IndexMode::Catchup => self.catchup_is_spent(txid, vout),
-            IndexMode::Direct | IndexMode::Tip => {
-                // Prefer runway create_fk + body range (no tx.head / idx).
-                if let Some(cfk) = self.confirm_parents.get_by_txid(txid) {
-                    let range = self.confirm_parents.get_body_range(cfk);
-                    return Ok(self
-                        .store
-                        .has_confirmed_strong_spender_create(cfk, vout, range)?);
-                }
-                Ok(self.store.has_confirmed_strong_spender(txid, vout)?)
-            }
+        // Prefer runway create_fk + body range (no tx.head / idx).
+        if let Some(cfk) = self.confirm_parents.get_by_txid(txid) {
+            let range = self.confirm_parents.get_body_range(cfk);
+            return Ok(self
+                .store
+                .has_confirmed_strong_spender_create(cfk, vout, range)?);
         }
+        Ok(self.store.has_confirmed_strong_spender(txid, vout)?)
     }
 
     /// Spentness by known create fk (wave_fill parent path — no head probe).
     pub fn is_outpoint_spent_create(&self, create_fk: Fk, vout: u32) -> Result<bool, QueryError> {
-        match self.index_mode() {
-            IndexMode::Catchup => {
-                // Need txid for light UTXO — fall back via body meta if ranged.
-                if let Some((off, len)) = self.confirm_parents.get_body_range(create_fk) {
-                    let (meta, _) = self.store.get_tx_meta_and_prevouts_at(off, len)?;
-                    return self.catchup_is_spent(&meta.txid, vout);
-                }
-                let meta = self.store.get_tx(create_fk)?;
-                self.catchup_is_spent(&meta.txid, vout)
-            }
-            IndexMode::Direct | IndexMode::Tip => {
-                let range = self.confirm_parents.get_body_range(create_fk);
-                Ok(self
-                    .store
-                    .has_confirmed_strong_spender_create(create_fk, vout, range)?)
-            }
-        }
+        let range = self.confirm_parents.get_body_range(create_fk);
+        Ok(self
+            .store
+            .has_confirmed_strong_spender_create(create_fk, vout, range)?)
     }
 
     /// Enable/disable txid hash-head inserts on archive (default on). Off under

@@ -29,7 +29,6 @@ mod peer_io;
 mod perf_log;
 mod prewarm;
 mod progress;
-mod run_materialize;
 mod state;
 mod status;
 
@@ -379,15 +378,7 @@ pub async fn ibd_cancellable(
         Arc::clone(&archive_stop),
     );
 
-    // Catch-up progressive mat under lead hysteresis. Direct: SH merge-only,
-    // no peer-fetch pause / mat worker (bulk SH at tip).
-    let mut run_materialize_worker = if hub.query.index_mode().is_direct() {
-        None
-    } else {
-        Some(run_materialize::RunMaterializeWorker::spawn(Arc::clone(
-            &hub.query,
-        )))
-    };
+    // Direct IBD: SH runs merge-only (no progressive head mat worker; bulk at tip).
 
     // Fresh cancel state for this IBD session (may have been set on prior stop).
     hub.query.clear_confirm_cancel();
@@ -857,7 +848,6 @@ pub async fn ibd_cancellable(
             let arch_q_now = archive_queued.count();
 
             // One sample/reset, then INFO `ibd: perf` (+ DEBUG `ibd: perf_dbg`).
-            let utxo_snap = hub.query.ibd_utxo_perf_snapshot();
             let prewarm_snap = hub.query.parent_prewarm_perf_snapshot();
             let perf = perf_log::sample(
                 &loop_stats,
@@ -874,7 +864,7 @@ pub async fn ibd_cancellable(
                 prog.tip_hole,
                 peers_n,
                 st.headers_done,
-                utxo_snap,
+                (false, 0, None, 0),
                 prewarm_snap,
             );
             perf_log::log_sample(&perf);
@@ -1119,11 +1109,6 @@ pub async fn ibd_cancellable(
     prewarm_ctrl.request_stop();
     if let Some(h) = prewarm_join.take() {
         let _ = h.join();
-    }
-
-    if let Some(w) = run_materialize_worker.take() {
-        w.request_stop();
-        drop(w);
     }
 
     // 3) Stop feeding the archive queue; prep/writer exit on stop + closed channels.

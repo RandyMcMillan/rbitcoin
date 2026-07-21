@@ -1,22 +1,9 @@
-//! Shared catch-up sorted-run machinery (tx / point / scripthash).
+//! Shared sorted-run machinery for **scripthash** (Direct IBD).
 //!
-//! Pipeline: **memtable → spill sorted run → (SH: gradual merge) → paced
-//! materialize into open-hash heads** under fetch hysteresis.
-//!
-//! Point/tx workers flush only. Scripthash uses a custom worker that also
-//! merges ~1 pair of oldest runs per second (never the newest spill target).
-//!
-//! When archive lead is large, IBD **stops peer block fetches** (not the archive
-//! writer — that would leave prepared work in limbo). After **in-flight getdata
-//! drains to zero**, an idle-IO worker materializes one small run at a time into
-//! durable heads (one shard rehash at a time). When lead shrinks, fetches resume
-//! and materialize stops until lead rebuilds. At archive≈tip, materialize
-//! continues until runs empty (once inflight is clear).
+//! Pipeline: **memtable → spill sorted run → gradual merge → bulk load at tip**.
+//! Progressive point/tx run materialize and peer-fetch pause are removed.
 
-use rbitcoin_log::warn;
-use rbitcoin_store::{
-    claim_run_for_materialize, list_runs, try_set_io_idle, SortedRunPath, StoreError,
-};
+use rbitcoin_store::{list_runs, try_set_io_idle, StoreError};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -30,9 +17,7 @@ pub const IDLE_POLL: Duration = Duration::from_millis(100);
 /// Finalize wait: 10ms × this ≈ 60s budget for large memtables.
 pub const FINALIZE_POLL_MAX: u32 = 6000;
 
-/// Family ids (materialize priority: point → tx → sh).
-pub const FAMILY_POINT: u8 = 1;
-pub const FAMILY_TX: u8 = 2;
+/// Family id (SH only; residual constant for worker spawn).
 pub const FAMILY_SH: u8 = 3;
 
 /// IBD hysteresis: stop **peer fetches** / materialize catch-up runs into heads.
@@ -281,52 +266,6 @@ pub fn spawn_worker(
     );
 }
 
-/// Background loop: **flush only** (no run↔run merge during IBD).
-///
-/// Materialize is owned by the IBD hysteresis worker (one run at a time into
-/// open-hash heads). Finalize still drains the memtable then stops; tip-mode
-/// materialize walks remaining runs without merging.
-pub fn worker_loop<T: RunMemtable + 'static>(
-    soft_cap: usize,
-    log_tag: &'static str,
-    _family: u8,
-    inner: Arc<Mutex<T>>,
-    cv: Arc<Condvar>,
-) {
-    loop {
-        let mut g = inner.lock().unwrap();
-        if g.control().stop {
-            break;
-        }
-        let need_flush =
-            g.pending_len() >= soft_cap || (g.control().finalize && g.pending_len() > 0);
-        if !need_flush {
-            if g.control().finalize && g.pending_len() == 0 {
-                g.control_mut().stop = true;
-                cv.notify_all();
-                break;
-            }
-            let (gg, _) = cv.wait_timeout(g, IDLE_POLL).unwrap();
-            g = gg;
-            if g.control().stop {
-                break;
-            }
-            continue;
-        }
-        drop(g);
-
-        let mut g = inner.lock().unwrap();
-        if g.pending_len() > 0 {
-            if let Err(e) = g.flush_pending() {
-                warn!("ibd: {log_tag} run flush failed: {e}");
-            }
-            cv.notify_all();
-        }
-        drop(g);
-        std::thread::sleep(AFTER_WORK);
-    }
-}
-
 /// Disable enqueues, signal finalize, wait for worker drain + join, flush leftovers.
 ///
 /// If no worker was ever spawned (`join` is empty), skip the poll wait — otherwise
@@ -377,33 +316,6 @@ pub fn finalize_wait_join<T: RunMemtable>(
     Ok(())
 }
 
-/// Claim the oldest run for materialize: rename `*.run` → `*.run.mat` and drop
-/// from MANIFEST under `runs_io`. Caller materializes then **deletes** `path`
-/// (do not [`rbitcoin_store::remove_run`] — seq is no longer cataloged).
-///
-/// Used for **spend, tx, and scripthash** so concurrent `list_runs` orphan
-/// cleanup cannot wipe an in-flight body.
-///
-/// # Invariant
-///
-/// Every `list_runs` / `write_sorted_run` / `merge_runs` / claim for a family
-/// **must** hold that family's [`RunControl::runs_io`] mutex for the whole
-/// list→mutate→catalog sequence. Holding it only around write (not list) races
-/// orphan cleanup and can delete live data.
-pub fn claim_oldest_run(
-    runs_dir: &Path,
-    runs_io: &Mutex<()>,
-) -> Result<Option<SortedRunPath>, StoreError> {
-    let _io = runs_io.lock().unwrap();
-    let mut runs = list_runs(runs_dir)?;
-    if runs.is_empty() {
-        return Ok(None);
-    }
-    runs.sort_by_key(|r| r.seq().unwrap_or(u64::MAX));
-    let run = runs.into_iter().next().unwrap();
-    Ok(Some(claim_run_for_materialize(&run)?))
-}
-
 /// On-disk run count under `runs_io` (safe concurrent with merge/list).
 pub fn on_disk_run_count(runs_dir: &Path, runs_io: &Mutex<()>) -> usize {
     let _io = runs_io.lock().unwrap();
@@ -413,35 +325,6 @@ pub fn on_disk_run_count(runs_dir: &Path, runs_io: &Mutex<()>) -> usize {
 /// Snapshot `(runs_dir, runs_io)` from a locked memtable control.
 pub fn runs_dir_io(ctrl: &RunControl) -> (PathBuf, Arc<Mutex<()>>) {
     (ctrl.runs_dir.clone(), Arc::clone(&ctrl.runs_io))
-}
-
-/// Drain claimed oldest runs via `materialize` until empty; clear residual files.
-pub fn finalize_materialize_all(
-    enabled: &AtomicBool,
-    inner: &Mutex<impl RunMemtable>,
-    cv: &Condvar,
-    join: &Mutex<Option<JoinHandle<()>>>,
-    mut materialize_one: impl FnMut() -> Result<Option<u64>, StoreError>,
-    log_tag: &str,
-) -> Result<u64, StoreError> {
-    finalize_wait_join(enabled, inner, cv, join)?;
-    let mut inserted = 0u64;
-    loop {
-        let t0 = std::time::Instant::now();
-        match materialize_one()? {
-            Some(n) => {
-                inserted = inserted.saturating_add(n);
-                rbitcoin_log::info!(
-                    "node: {log_tag} materialize run keys≈{n} total≈{inserted} elapsed={:?}",
-                    t0.elapsed()
-                );
-            }
-            None => break,
-        }
-    }
-    let runs_dir = inner.lock().unwrap().control().runs_dir.clone();
-    clear_runs_dir(&runs_dir);
-    Ok(inserted)
 }
 
 pub fn clear_runs_dir(runs_dir: &Path) {

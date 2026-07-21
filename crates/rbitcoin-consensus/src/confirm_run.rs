@@ -43,7 +43,7 @@ struct BodyMeta {
     tx_fks: Vec<rbitcoin_primitives::Fk>,
 }
 
-/// Connect output for one height (held until Class C + UTXO apply).
+/// Connect output for one height (held until Class C + spend annotate).
 struct Prepared {
     height: Height,
     header_fk: rbitcoin_primitives::Fk,
@@ -57,8 +57,6 @@ struct Prepared {
         rbitcoin_primitives::Fk,
         rbitcoin_primitives::Fk,
     )>,
-    /// Outpoints created this height for light UTXO (from connect; no re-get).
-    creates: Vec<([u8; 32], u32, rbitcoin_primitives::Fk)>,
     check_scripts: bool,
     time: u32,
     bits: bitcoin::CompactTarget,
@@ -69,7 +67,7 @@ struct Prepared {
 /// Confirm a contiguous tip-extension run of archived bodies.
 ///
 /// When archive leads tip (the post-milestone IBD case), a multi-height run:
-/// 1. Connects sequentially (run-local pending spends — no UTXO poison on failure)
+/// 1. Connects sequentially (run-local pending spends — no spend poison on failure)
 /// 2. Runs **one** rayon script wave across **all** inputs in the run
 /// 3. Class C in height order
 ///
@@ -361,7 +359,7 @@ fn connect_run(
         }
 
         let t_connect = Instant::now();
-        let (script_jobs, spends, creates) = connect_block_prevouts(
+        let (script_jobs, spends) = connect_block_prevouts(
             query,
             block,
             &ctx,
@@ -385,7 +383,6 @@ fn connect_run(
             tx_fks: meta.tx_fks,
             jobs: script_jobs,
             spends,
-            creates,
             check_scripts: !milestone.skips_scripts_at(height.0),
             time: block.header.time,
             bits: block.header.bits,
@@ -449,43 +446,11 @@ fn class_c_commit(
 }
 
 fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusError> {
-    // Apply light UTXO first so the next wave's catchup_is_spent sees spends.
-    // Catch-up unpin is a no-op (see Query::unpin_spent_parent_outs); tip-follow
-    // does a cheap runway-only retire after apply.
-    // Direct mode: batch durable spend annotations for the whole run **before**
+    // Direct IBD: batch durable spend annotations for the whole run **before**
     // the next confirm batch (spentness = confirmed-strong + annotation).
+    // Tip mode usually writes spends on archive; still safe if spend_index on.
     let t_spent = Instant::now();
-    if query.ibd_utxo_enabled() {
-        // Per-height order (spends then creates) so H+1 can spend H in the same
-        // batch. One mmap flush for the whole run. Heal via rebuild on failure.
-        let apply_res = (|| -> Result<(), ConsensusError> {
-            // Light UTXO wants (txid, vout, spend_fk) — strip create_fk.
-            let stripped: Vec<Vec<([u8; 32], u32, rbitcoin_primitives::Fk)>> = prepared
-                .iter()
-                .map(|p| {
-                    p.spends
-                        .iter()
-                        .map(|(t, v, s, _c)| (*t, *v, *s))
-                        .collect()
-                })
-                .collect();
-            let steps: Vec<_> = prepared
-                .iter()
-                .zip(stripped.iter())
-                .map(|(p, sp)| (sp.as_slice(), p.creates.as_slice(), p.height.0))
-                .collect();
-            query
-                .apply_ibd_utxo_run(&steps)
-                .map_err(ConsensusError::Store)?;
-            Ok(())
-        })();
-        if let Err(_e) = apply_res {
-            query.note_ibd_utxo_rebuild();
-            query
-                .rebuild_ibd_utxo_to_tip()
-                .map_err(ConsensusError::Store)?;
-        }
-    } else if query.index_mode().is_direct() && query.spend_index_enabled() {
+    if query.spend_index_enabled() && query.index_mode().uses_durable_spends() {
         // Prefer create_fk + prewarmed body range — no tx.head / tx.idx reads.
         let mut ranged: Vec<(
             rbitcoin_primitives::Fk,

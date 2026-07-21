@@ -44,7 +44,6 @@ Default: **info**. CLI wins over env.
 | Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` (`0` = full scripts) |
 | Archive queue RAM | **256 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
-| Light UTXO (mmap) | **~96 MiB start** (24 B slots; grows) | `RBITCOIN_IBD_UTXO_SLOTS` |
 | Parent prewarm depth / batch / headroom | **256 / 64 / 64** | `RBITCOIN_PARENT_PREWARM_DEPTH` / `_BATCH` / `_HEADROOM` |
 | Confirm wait for prewarm worker before last-mile | **1500 ms** | `RBITCOIN_PREWARM_WORKER_GRACE_MS` (`0` = last-mile immediately if not ready; use `0` in unit tests) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
@@ -65,27 +64,11 @@ without clearing known flags.
 
 **Index modes:** IBD defaults to **`IndexMode::Direct`**: archive batch-writes
 packed Class A + durable **`tx.head`**; confirm batch-writes **spend annotations**
-after Class C (no light UTXO). Scripthash is **not** progressively materialized:
-confirm only enqueues sorted runs (background flush + merge); lead hysteresis
-does **not** pause peer fetch/archive. At tip the node **merges remaining runs
-and cold bulk-loads** durable SH tables (migration-style) before Electrum. On enter Direct, leftover `ibd_utxo.map` is removed and point/tx
-runs are materialized — prefer a **fresh datadir**. **`IndexMode::Catchup`**
-(runs + light UTXO + progressive mat) remains available for tests.
-
-**Catch-up runs → open-hash (hysteresis):** memtable spills **small sorted runs
-with no mid-IBD merge**. When `arch − tip ≥ 65536`, **new peer getdata stops**
-(the Class A writer keeps draining already-queued work). After **inflight
-downloads hit 0**, an idle-IO worker materializes **one run at a time** into
-durable heads (point → tx → SH), with **at most one shard rehash at a time** and
-a short pause between shards. When lead falls below `32768`, fetches resume and
-materialize stops until lead rebuilds. When archive has caught the peer tip,
-materialize continues until runs are empty (once inflight is clear). Progress:
-`runs t=/p=/sh= mat=fetch|drain|materialize/pause_fetch=…`. Env:
-
-| Env | Default | Meaning |
-|-----|---------|---------|
-| `RBITCOIN_RUN_MATERIALIZE_START_LEAD` | `65536` | Stop peer fetch / arm materialize; `0` = off |
-| `RBITCOIN_RUN_MATERIALIZE_STOP_LEAD` | `32768` | Resume peer fetch / pause materialize |
+after Class C. Scripthash is **not** progressively materialized into heads:
+confirm only enqueues sorted runs (background flush + merge). At tip the node
+**merges remaining runs and cold bulk-loads** durable SH tables before Electrum.
+On enter Direct, leftover `ibd_utxo.map` / `point.runs` / `tx.runs` from old
+Catchup datadirs are removed — prefer a **fresh datadir**.
 
 New stores (schema **v9**): **header.head** = **single** open-address file (~24 MiB
 pre-size; not 256-way), **scripthash** 16 shards, **tx.head** = single fixed address
@@ -97,10 +80,10 @@ head pain (31-bit address): ~**1.6 B** txs → first BITS widen; ~**3.2 B** 
 ~**4 B** → 8 B head entries. Spends are schema-v5 annotations on create outputs
 (no `point.head`).
 
-**Memory rule:** During Catchup, durable open-hash heads are off. Class A is
-packed full-tx bodies; inputs always store **external** `prev_txid`. Parent
-resolve uses light UTXO (`outpoint → create_fk`); Tip uses spend annotations /
-`tx.head`. SH create dedupe is an **O(1) height watermark**. Do not raise
+**Memory rule:** Direct IBD writes durable `tx.head` live and spend annotations
+on confirm. Class A is packed full-tx bodies; inputs always store **external**
+`prev_txid`. Parent resolve uses runway cache + `tx.head`. SH create dedupe is
+an **O(1) height watermark**; durable SH tables bulk-load at tip. Do not raise
 archive queues without watching RSS vs page cache.
 
 ## Libre-relay-class policy (mempool + Electrum broadcast)

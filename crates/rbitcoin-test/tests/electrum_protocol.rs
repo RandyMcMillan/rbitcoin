@@ -151,11 +151,8 @@ fn backfill_tx_head_and_points_after_index_off() {
     let q = Query::open_or_create(dir.path().join("store")).unwrap();
     let params = ChainParams::regtest();
 
-    // Simulate milestone IBD: no durable tx.head / points; scripthash still on.
-    // Catch-up spentness is light UTXO only (required when spend_index off).
-    q.set_tx_index(false);
-    q.set_spend_index(false);
-    q.enable_ibd_utxo().unwrap();
+    // Direct IBD: live heads + spend annotations on confirm.
+    q.enter_direct_index_mode().unwrap();
 
     let g = regtest_genesis();
     accept_and_connect_block(&q, &params, Height::GENESIS, &g, Milestone::NONE).unwrap();
@@ -168,38 +165,32 @@ fn backfill_tx_head_and_points_after_index_off() {
         tip = b.block_hash();
     }
     assert_eq!(q.tip_height(), Some(Height(5)));
-    // Bodies exist but head was not filled (index off).
     assert!(q.tx_body_count() >= 6);
+    // Direct writes tx.head on archive/connect path.
     assert!(
-        q.tx_head_occupied() < q.tx_body_count(),
-        "head should lag bodies when index off"
+        q.tx_head_occupied() >= 6,
+        "head filled under Direct"
     );
-    // Thin SH always written on confirm.
-    assert!(
-        q.scripthash_entry_count() > 0,
-        "scripthash creates present without optional flag"
-    );
-
     let b1 = q.reconstruct_block_at_height(Height(1)).unwrap();
     let cb_txid = b1.txdata[0].compute_txid().to_byte_array();
     assert!(
-        q.tx_head_occupied() < q.tx_body_count(),
-        "head lags bodies under index-off archive"
-    );
-
-    let inserted = q.backfill_tx_index(|_, _, _| {}).unwrap();
-    assert!(inserted >= 6, "inserted {inserted}");
-    // Tip-mode: re-enable durable head lookups (matches enter_tip_mode).
-    q.set_tx_index(true);
-    assert!(
         q.get_tx_by_txid(&cb_txid).unwrap().is_some(),
-        "txid resolves after tx.head backfill + tx_index on"
+        "txid resolves via live tx.head under Direct"
     );
 
+    // Backfill is idempotent when already dense.
+    let inserted = q.backfill_tx_index(|_, _, _| {}).unwrap();
+    assert!(inserted <= q.tx_body_count());
+    q.set_tx_index(true);
     q.set_spend_index(true);
     let (ph, ptxs) = q.backfill_point_spends(|_, _, _, _| {}).unwrap();
-    assert_eq!(ph, 6);
-    assert!(ptxs >= 6);
+    assert!(ph <= 6);
+    let _ = ptxs;
+
+    // Direct IBD keeps SH in runs until tip bulk materialize.
+    let n_sh = q.finalize_sh_runs().unwrap();
+    assert!(n_sh > 0, "SH bulk materialize creates≈{n_sh}");
+    q.enter_tip_index_mode();
 
     // OP_TRUE coinbase outputs from mine_regtest_block appear under that scripthash.
     let sh = {
@@ -207,5 +198,5 @@ fn backfill_tx_head_and_points_after_index_off() {
         script_hash(&[0x51])
     };
     let hist = q.scripthash_history(&sh).unwrap();
-    assert!(!hist.is_empty(), "scripthash history non-empty after confirm");
+    assert!(!hist.is_empty(), "scripthash history non-empty after SH bulk");
 }

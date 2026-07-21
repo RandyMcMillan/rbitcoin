@@ -98,16 +98,12 @@ impl Query {
             wf_add(&wf::SPENT_NS, 0);
 
             let t_cb = Instant::now();
-            // Coinbase height: Class C slot (prewarm-mlocked); no input walk.
-            let cb_h = if tx.input_count == 1 {
-                self.store.tx_height.get(fk)?
-            } else {
-                None
-            };
-            let cb = if tx.input_count == 1 {
-                // Height table is set for coinbases on confirm. None height ⇒
-                // treat as non-cb for maturity (same as prior non-coinbase path).
-                Some(cb_h)
+            // Coinbase height: only true coinbases (1-in + null prev), not every
+            // 1-in tx. Prevout scan skips script/witness (cheap).
+            let cb = if tx.input_count != 1 {
+                Some(None)
+            } else if self.parent_is_coinbase(fk)? {
+                Some(self.store.tx_height.get(fk)?)
             } else {
                 Some(None)
             };
@@ -119,6 +115,22 @@ impl Query {
         let _ = t_tx;
 
         Ok((noted, wave))
+    }
+
+    /// True if Class A body is a coinbase (1-in, null prevout). Uses prevout-only decode.
+    fn parent_is_coinbase(&self, fk: Fk) -> Result<bool, QueryError> {
+        let (meta, prevouts) =
+            if let Some((off, len)) = self.confirm_parents.get_body_range(fk) {
+                self.store.get_tx_meta_and_prevouts_at(off, len)?
+            } else {
+                self.store.get_tx_meta_and_prevouts(fk)?
+            };
+        if meta.input_count != 1 {
+            return Ok(false);
+        }
+        Ok(prevouts
+            .first()
+            .is_some_and(|(t, v)| *t == [0u8; 32] && *v == 0xffff_ffff))
     }
 
     /// External parent: only the needed vouts (no full dense outs / no inputs).
@@ -167,10 +179,6 @@ impl Query {
                 .get_by_txid(&inp.prev_txid, inp.prev_index)
                 .map(|(pfk, _, _)| pfk)
                 .or_else(|| self.confirm_parents.get_by_txid(&inp.prev_txid))
-                .or(self
-                    .ibd_utxo_create_fk(&inp.prev_txid, inp.prev_index)
-                    .ok()
-                    .flatten())
                 .or(self.tx_fk_by_txid(&inp.prev_txid).ok().flatten());
             edges.push(ThinInput {
                 create_fk: create_fk.and_then(|f| f.get()),

@@ -98,11 +98,9 @@ impl Query {
         let mut per_header_ranges: Vec<(Fk, Fk, u32)> = Vec::with_capacity(need.len());
         let mut spends: Vec<([u8; 32], u32, Fk, u32)> = Vec::new();
         // Tip: archive writes durable spends. Direct: confirm batch-writes after Class C.
-        // Catchup: no durable spends (point runs).
         let archive_spends =
             self.spend_index_enabled() && self.index_mode().is_tip();
         let index_tx = self.tx_index_enabled();
-        let tx_runs = self.tx_run_enabled();
 
         for (header_fk, txs) in need.iter_mut() {
             if txs.is_empty() {
@@ -157,13 +155,8 @@ impl Query {
                 return Err(StoreError::Corrupt("tx put_full_batch fk mismatch"));
             }
         }
-        // No generic Class A cache: confirm parents live in ConfirmParentCache
-        // (prewarm). Archive only enqueues catch-up index runs.
-        for ((rec, _, _), fk) in packed.iter().zip(got_tx_fks.iter()) {
-            if tx_runs {
-                self.enqueue_tx_run(rec.txid, *fk);
-            }
-        }
+        // Confirm parents live in ConfirmParentCache (prewarm).
+        // `tx.head` written by put_tx_full_batch_indexed when index_tx.
 
         if archive_spends && !spends.is_empty() {
             // Tip: annotate create outputs (tx.head resolve per prevout).

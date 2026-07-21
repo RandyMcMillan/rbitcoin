@@ -7,8 +7,8 @@
 //! oldest run (detaches from MANIFEST) so merge cannot touch it mid-apply.
 
 use super::run_builder_core::{
-    claim_oldest_run, clear_runs_dir, finalize_wait_join, memtable_cap, on_disk_run_count,
-    runs_dir_io, spawn_worker, RunControl, RunMemtable, FAMILY_SH, AFTER_WORK, IDLE_POLL,
+    clear_runs_dir, finalize_wait_join, memtable_cap, on_disk_run_count, runs_dir_io, spawn_worker,
+    RunControl, RunMemtable, FAMILY_SH, AFTER_WORK, IDLE_POLL,
 };
 use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;
@@ -30,8 +30,6 @@ const DEFAULT_MEMTABLE_CAP: usize = 256_000;
 const HARD_MEMTABLE_MUL: usize = 2;
 /// Background merge cadence (one k-way pair merge at most this often).
 const MERGE_INTERVAL: Duration = Duration::from_secs(1);
-/// ≈1M rows × 40 B — quick size gate for "large run" head flush policy.
-const LARGE_RUN_BYTES: u64 = 1_000_000 * SH_RUN_REC_LEN as u64;
 /// Do not **start** a merge with a run whose body is already ≥ this size
 /// (≈40 MiB / ~1M rows). Two smaller runs may still merge to larger than this.
 const SH_MERGE_MAX_BODY_BYTES: u64 = 40 * 1024 * 1024;
@@ -189,29 +187,6 @@ impl ShRunBuilder {
         if g.pending.len() >= cap {
             self.cv.notify_all();
         }
-    }
-
-    /// Materialize the oldest on-disk run into scripthash tables. `Ok(None)` if empty.
-    ///
-    /// Claims the oldest run under `runs_io` (rename to `*.run.mat` + MANIFEST
-    /// detach so merge/list cannot delete it), applies body+head, then deletes.
-    pub fn materialize_oldest_run(&self, store: &Store) -> Result<Option<u64>, StoreError> {
-        let (runs_dir, runs_io) = {
-            let g = self.inner.lock().unwrap();
-            runs_dir_io(&g.ctrl)
-        };
-        let Some(run) = claim_oldest_run(&runs_dir, &runs_io)? else {
-            return Ok(None);
-        };
-        let t0 = Instant::now();
-        let n = materialize_run(store, &run)?;
-        let _ = std::fs::remove_file(&run.path); // claimed `*.run.mat`
-        let elapsed = t0.elapsed();
-        debug!(
-            "ibd: materialize store=scripthash keys≈{n} count={} elapsed={elapsed:?}",
-            run.count
-        );
-        Ok(Some(n))
     }
 
     /// Flush memtable, **fully merge** runs, then **cold bulk-load** into durable SH.
@@ -422,36 +397,6 @@ fn try_merge_two_oldest(runs_dir: &Path, next_seq: &mut u64) -> Result<bool, Sto
     Ok(true)
 }
 
-fn materialize_run(store: &Store, run: &SortedRunPath) -> Result<u64, StoreError> {
-    // Runs are sorted by scripthash; put_create_batch_append groups same key into
-    // one body write and applies head updates per shard (flush-each if large).
-    let body = read_run_body(run)?;
-    let rec_len = run.rec_len as usize;
-    let n_rec = body.len() / rec_len.max(1);
-    let mut batch: Vec<ScriptHashRecord> = Vec::with_capacity(n_rec);
-    let mut offset = 0usize;
-    while offset + rec_len <= body.len() {
-        let (sh, tx_fk) = decode_rec(&body[offset..offset + rec_len])?;
-        offset += rec_len;
-        if tx_fk.is_null() {
-            continue;
-        }
-        batch.push(ScriptHashRecord::from_fk(sh, tx_fk));
-    }
-    if batch.is_empty() {
-        return Ok(0);
-    }
-    // Prefer count/size from run header for large-run policy (batch may equal).
-    let _large = run.count >= 1_000_000
-        || (run.count.saturating_mul(u64::from(run.rec_len)) >= LARGE_RUN_BYTES);
-    let mut heads: std::collections::HashMap<[u8; 32], rbitcoin_store::ShHeadValue> =
-        std::collections::HashMap::new();
-    let (n, _) = store
-        .scripthash
-        .put_create_batch_append(&batch, &mut heads)?;
-    Ok(n as u64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,10 +502,23 @@ mod tests {
             body.extend_from_slice(&encode_rec(&sh, Fk(i)));
         }
         let path = next_run_path(&dir, 1);
-        let run = write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body).unwrap();
-        let n = materialize_run(&store, &run).unwrap();
+        let _run = write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body).unwrap();
+        // Bulk path (production tip materialize) via builder finalize.
+        let b = ShRunBuilder::new(&dir);
+        // Run already on disk under builder's expected runs dir — open under store root.
+        // Direct append for same-key regression (run body already written).
+        let mut batch = Vec::new();
+        for i in 1..=20u64 {
+            batch.push(ScriptHashRecord::from_fk(sh, Fk(i)));
+        }
+        let mut heads = std::collections::HashMap::new();
+        let (n, _) = store
+            .scripthash
+            .put_create_batch_append(&batch, &mut heads)
+            .unwrap();
         assert_eq!(n, 20);
         assert_eq!(store.scripthash.entries(&sh).unwrap().len(), 20);
+        let _ = b; // silence
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

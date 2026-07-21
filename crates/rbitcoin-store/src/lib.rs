@@ -22,7 +22,6 @@ mod scripthash;
 mod scripthash_head;
 mod scripthash_layout;
 mod sharded_hashhead;
-mod ibd_utxo;
 mod sorted_run;
 mod store;
 mod tx_table;
@@ -47,7 +46,6 @@ pub use header_table::HeaderRecord;
 pub use point_table::PointRecord;
 pub use scripthash::{script_hash, ScriptHashEntry, ScriptHashRecord, ScriptHashTable};
 pub use scripthash_layout::ShHeadValue;
-pub use ibd_utxo::{IbdUtxo, DEFAULT_NUM_SLOTS as IBD_UTXO_DEFAULT_SLOTS, VOUT_MAX as IBD_UTXO_VOUT_MAX};
 pub use sorted_run::{
     claim_run_for_materialize, crc32, detach_run, list_runs, lookup_key, merge_runs, next_run_path,
     open_run, read_run_body, remove_run, verify_run_body, write_sorted_run, SortedRunPath,

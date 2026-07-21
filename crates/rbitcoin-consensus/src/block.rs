@@ -313,10 +313,10 @@ pub fn validate_block_connect(
     }
 
     let check_scripts = !ctx.milestone.skips_scripts_at(ctx.height.0);
-    // Pending until connect+scripts succeed — do not apply UTXO / points on failure.
+    // Pending until connect+scripts succeed — no durable writes on failure.
     let mut pending = std::collections::HashSet::new();
     let mut pending_creates = std::collections::HashMap::new();
-    let (script_jobs, spends, _creates) = connect_block_prevouts(
+    let (script_jobs, spends) = connect_block_prevouts(
         query,
         block,
         ctx,
@@ -328,7 +328,6 @@ pub fn validate_block_connect(
     if check_scripts && !script_jobs.is_empty() {
         verify_scripts_pool(&script_jobs)?;
     }
-    // Catch-up UTXO is applied only after Class C succeeds (see confirm path).
     let _ = spends;
     Ok(())
 }
@@ -389,8 +388,7 @@ pub struct ScriptCheckJob {
 /// script check can drop them without poisoning the next attempt.
 ///
 /// `pending_creates` maps outpoints created earlier in this confirm run →
-/// create Class A fk. Required for mmap UTXO spentness + parent resolve until
-/// Class C applies UTXO.
+/// create Class A fk (same-run create→spend).
 pub(crate) fn connect_block_prevouts(
     query: &Query,
     block: &Block,
@@ -409,8 +407,6 @@ pub(crate) fn connect_block_prevouts(
             rbitcoin_primitives::Fk,
             rbitcoin_primitives::Fk,
         )>,
-        // Creates for light UTXO apply: (txid, vout, create_fk).
-        Vec<([u8; 32], u32, rbitcoin_primitives::Fk)>,
     ),
     ConsensusError,
 > {
@@ -451,20 +447,13 @@ pub(crate) fn connect_block_prevouts(
         rbitcoin_primitives::Fk,
         rbitcoin_primitives::Fk,
     )> = Vec::with_capacity(n_tx.saturating_mul(2));
-    let mut creates: Vec<([u8; 32], u32, rbitcoin_primitives::Fk)> =
-        Vec::with_capacity(n_tx.saturating_mul(2));
     // Coinbase height cache spans the whole block (was recreated per tx).
     let mut coinbase_height_cache: std::collections::HashMap<
         rbitcoin_primitives::Fk,
         Option<u32>,
     > = std::collections::HashMap::with_capacity(64);
 
-    // Spent checks:
-    // - pending_spent: this confirm run (ephemeral)
-    // - catch-up: light UTXO via catchup_is_spent
-    // - direct/tip: durable has_confirmed_strong_spender
-    let durable_spends = query.index_mode().uses_durable_spends();
-
+    // Spent checks: pending_spent (this run) + durable confirmed-strong annotations.
     for (ti, tx) in block.txdata.iter().enumerate() {
         let spend_fk = archived_tx_fks.map(|fks| fks[ti]);
         // Wave-local tx row first (no disk/class_a); else Class A.
@@ -509,8 +498,8 @@ pub(crate) fn connect_block_prevouts(
                 if pending_spent.contains(&key) {
                     return Err(ConsensusError::PrevoutSpent);
                 }
-                // Wave already filtered spent outs at fill time (same UTXO tip).
-                // Skip a second light-UTXO probe on the ~98% wave-hit path.
+                // Wave already filtered spent outs at fill time.
+                // Skip durable probes on the ~98% wave-hit path.
                 let wave_live = wave_prevouts
                     .and_then(|w| w.get_by_txid(op.txid.as_byte_array(), op.vout))
                     .is_some();
@@ -519,50 +508,32 @@ pub(crate) fn connect_block_prevouts(
                     .and_then(|e| e.create_fk.map(rbitcoin_primitives::Fk))
                     .or_else(|| pending_creates.get(&key).copied())
                     .or_else(|| {
-                        // Only probe UTXO / head for create_fk when wave/thin missed.
                         if wave_live {
                             None
                         } else {
                             query
-                                .ibd_utxo_create_fk(op.txid.as_byte_array(), op.vout)
+                                .tx_fk_by_txid(op.txid.as_byte_array())
                                 .ok()
                                 .flatten()
-                                .or_else(|| {
-                                    query
-                                        .tx_fk_by_txid(op.txid.as_byte_array())
-                                        .ok()
-                                        .flatten()
-                                })
                         }
                     });
-                // Spentness: wave already filtered live outs; pending covers same-run.
-                // Skip durable head probes on the wave-hit path (zero page-fault goal).
-                if durable_spends {
-                    if !wave_live && !pending_creates.contains_key(&key) {
-                        let spent = if let Some(cfk) = prev_fk {
-                            let range = query.confirm_parent_cache().get_body_range(cfk);
-                            query
-                                .store()
-                                .has_confirmed_strong_spender_create(cfk, op.vout, range)
-                                .map_err(ConsensusError::Store)?
-                        } else {
-                            query
-                                .store()
-                                .has_confirmed_strong_spender(op.txid.as_byte_array(), op.vout)
-                                .map_err(ConsensusError::Store)?
-                        };
-                        if spent {
-                            return Err(ConsensusError::PrevoutSpent);
-                        }
+                // Spentness: wave filtered live outs; pending covers same-run.
+                if !wave_live && !pending_creates.contains_key(&key) {
+                    let spent = if let Some(cfk) = prev_fk {
+                        let range = query.confirm_parent_cache().get_body_range(cfk);
+                        query
+                            .store()
+                            .has_confirmed_strong_spender_create(cfk, op.vout, range)
+                            .map_err(ConsensusError::Store)?
+                    } else {
+                        query
+                            .store()
+                            .has_confirmed_strong_spender(op.txid.as_byte_array(), op.vout)
+                            .map_err(ConsensusError::Store)?
+                    };
+                    if spent {
+                        return Err(ConsensusError::PrevoutSpent);
                     }
-                } else if !wave_live
-                    && !pending_creates.contains_key(&key)
-                    && query
-                        .catchup_is_spent(op.txid.as_byte_array(), op.vout)
-                        .map_err(ConsensusError::Store)?
-                {
-                    // Catch-up cold path only: light UTXO miss (not same-run create).
-                    return Err(ConsensusError::PrevoutSpent);
                 }
                 let prev_out = resolve_prevout(
                     query,
@@ -646,7 +617,6 @@ pub(crate) fn connect_block_prevouts(
             });
             if !create_fk.is_null() {
                 pending_creates.insert((txid, v as u32), create_fk);
-                creates.push((txid, v as u32, create_fk));
             }
         }
         same_block.insert(txid, outs);
@@ -667,7 +637,7 @@ pub(crate) fn connect_block_prevouts(
     }
 
     let _ = LockTime::ZERO;
-    Ok((script_jobs, spends, creates))
+    Ok((script_jobs, spends))
 }
 
 /// Parallel script checks for an owned job slice (preferred entry — no ref `Vec`).
@@ -798,16 +768,12 @@ fn resolve_prevout(
         }
     }
 
-    // Cold path: create-fk candidates (thin → UTXO → durable head / store).
+    // Cold path: create-fk candidates (thin → durable head / store).
     // Tip-follow without a wave (or wave miss) uses this path.
-    // Wrong thin hints must not block UTXO / head after a txid mismatch.
-    let utxo_fk = query
-        .ibd_utxo_create_fk(&prev_txid, op.vout)
-        .map_err(ConsensusError::Store)?;
     let head_fk = query
         .tx_fk_by_txid(&prev_txid)
         .map_err(ConsensusError::Store)?;
-    let candidates = [prev_fk, utxo_fk, head_fk];
+    let candidates = [prev_fk, head_fk];
     let mut seen: [u64; 3] = [0; 3];
     let mut n_seen = 0usize;
     for prev_fk in candidates.into_iter().flatten() {

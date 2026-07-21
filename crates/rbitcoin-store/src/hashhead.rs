@@ -401,7 +401,8 @@ impl HashHead {
         Ok(Vec::new())
     }
 
-    /// Number of occupied hash slots.
+    /// Number of occupied hash slots (unit tests only).
+    #[cfg(test)]
     pub fn occupied(&self) -> u64 {
         self.state.lock().unwrap().occupied
     }

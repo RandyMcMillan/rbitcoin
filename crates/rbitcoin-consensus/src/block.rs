@@ -402,8 +402,13 @@ pub(crate) fn connect_block_prevouts(
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
-        // Spends: (prev_txid, vout, spending_tx_fk) for UTXO + spend-run enqueue.
-        Vec<([u8; 32], u32, rbitcoin_primitives::Fk)>,
+        // Spends: (prev_txid, vout, spending_tx_fk, create_tx_fk).
+        Vec<(
+            [u8; 32],
+            u32,
+            rbitcoin_primitives::Fk,
+            rbitcoin_primitives::Fk,
+        )>,
         // Creates for light UTXO apply: (txid, vout, create_fk).
         Vec<([u8; 32], u32, rbitcoin_primitives::Fk)>,
     ),
@@ -439,9 +444,13 @@ pub(crate) fn connect_block_prevouts(
     } else {
         Vec::new()
     };
-    // (prev_txid, vout, spending_tx_fk) — spend_fk is Class A id of this tx when archived.
-    let mut spends: Vec<([u8; 32], u32, rbitcoin_primitives::Fk)> =
-        Vec::with_capacity(n_tx.saturating_mul(2));
+    // (prev_txid, vout, spending_tx_fk, create_tx_fk).
+    let mut spends: Vec<(
+        [u8; 32],
+        u32,
+        rbitcoin_primitives::Fk,
+        rbitcoin_primitives::Fk,
+    )> = Vec::with_capacity(n_tx.saturating_mul(2));
     let mut creates: Vec<([u8; 32], u32, rbitcoin_primitives::Fk)> =
         Vec::with_capacity(n_tx.saturating_mul(2));
     // Coinbase height cache spans the whole block (was recreated per tx).
@@ -507,24 +516,6 @@ pub(crate) fn connect_block_prevouts(
                 let wave_live = wave_prevouts
                     .and_then(|w| w.get_by_txid(op.txid.as_byte_array(), op.vout))
                     .is_some();
-                if durable_spends {
-                    // Direct/Tip: durable confirmed-strong spend annotations.
-                    if query
-                        .store()
-                        .has_confirmed_strong_spender(op.txid.as_byte_array(), op.vout)
-                        .map_err(ConsensusError::Store)?
-                    {
-                        return Err(ConsensusError::PrevoutSpent);
-                    }
-                } else if !wave_live
-                    && !pending_creates.contains_key(&key)
-                    && query
-                        .catchup_is_spent(op.txid.as_byte_array(), op.vout)
-                        .map_err(ConsensusError::Store)?
-                {
-                    // Catch-up cold path only: light UTXO miss (not same-run create).
-                    return Err(ConsensusError::PrevoutSpent);
-                }
                 let prev_fk = thin
                     .as_ref()
                     .and_then(|t| t.get(ii))
@@ -547,6 +538,35 @@ pub(crate) fn connect_block_prevouts(
                                 })
                         }
                     });
+                // Spentness: wave already filtered live outs; pending covers same-run.
+                // Skip durable head probes on the wave-hit path (zero page-fault goal).
+                if durable_spends {
+                    if !wave_live && !pending_creates.contains_key(&key) {
+                        let spent = if let Some(cfk) = prev_fk {
+                            let range = query.confirm_parent_cache().get_body_range(cfk);
+                            query
+                                .store()
+                                .has_confirmed_strong_spender_create(cfk, op.vout, range)
+                                .map_err(ConsensusError::Store)?
+                        } else {
+                            query
+                                .store()
+                                .has_confirmed_strong_spender(op.txid.as_byte_array(), op.vout)
+                                .map_err(ConsensusError::Store)?
+                        };
+                        if spent {
+                            return Err(ConsensusError::PrevoutSpent);
+                        }
+                    }
+                } else if !wave_live
+                    && !pending_creates.contains_key(&key)
+                    && query
+                        .catchup_is_spent(op.txid.as_byte_array(), op.vout)
+                        .map_err(ConsensusError::Store)?
+                {
+                    // Catch-up cold path only: light UTXO miss (not same-run create).
+                    return Err(ConsensusError::PrevoutSpent);
+                }
                 let prev_out = resolve_prevout(
                     query,
                     op,
@@ -562,10 +582,20 @@ pub(crate) fn connect_block_prevouts(
                     }
                 }
                 pending_spent.insert(key);
+                // Prefer create_fk from wave when thin missed (same-wave parent).
+                let create_fk = prev_fk
+                    .or_else(|| {
+                        wave_prevouts.and_then(|w| {
+                            w.get_by_txid(op.txid.as_byte_array(), op.vout)
+                                .map(|(pfk, _, _)| pfk)
+                        })
+                    })
+                    .unwrap_or(rbitcoin_primitives::Fk::NULL);
                 spends.push((
                     key.0,
                     key.1,
                     spend_fk.unwrap_or(rbitcoin_primitives::Fk::NULL),
+                    create_fk,
                 ));
                 value_in = value_in
                     .checked_add(prev_out.txout.value.to_sat() as i64)

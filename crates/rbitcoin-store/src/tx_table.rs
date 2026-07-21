@@ -753,7 +753,22 @@ impl TxTable {
         vout: u32,
     ) -> Result<(bool, Fk), StoreError> {
         let raw = self.body.get_raw(create_tx_fk)?;
-        let rel = Self::packed_output_spender_rel(&raw, vout)? as usize;
+        Self::spender_meta_from_raw(&raw, vout)
+    }
+
+    /// Like [`Self::get_output_spender_meta`] but uses a prewarmed body range (no idx).
+    pub fn get_output_spender_meta_at(
+        &self,
+        body_off: u64,
+        body_len: u64,
+        vout: u32,
+    ) -> Result<(bool, Fk), StoreError> {
+        self.body
+            .with_bytes_at(body_off, body_len, |raw| Self::spender_meta_from_raw(raw, vout))
+    }
+
+    fn spender_meta_from_raw(raw: &[u8], vout: u32) -> Result<(bool, Fk), StoreError> {
+        let rel = Self::packed_output_spender_rel(raw, vout)? as usize;
         if raw.len() < rel + 9 {
             return Err(StoreError::Corrupt("packed spender meta short"));
         }
@@ -770,24 +785,36 @@ impl TxTable {
         multi: bool,
         field: Fk,
     ) -> Result<(), StoreError> {
-        let raw = self.body.get_raw(create_tx_fk)?;
-        let rel = Self::packed_output_spender_rel(&raw, vout)?;
+        let (off, len) = self.body.record_range(create_tx_fk)?;
+        self.set_output_spender_meta_at(off, len, vout, multi, field)
+    }
+
+    /// Patch spender meta using a prewarmed body range (no idx read on the hot path).
+    pub fn set_output_spender_meta_at(
+        &self,
+        body_off: u64,
+        body_len: u64,
+        vout: u32,
+        multi: bool,
+        field: Fk,
+    ) -> Result<(), StoreError> {
+        let (rel, flag0) = self.body.with_bytes_at(body_off, body_len, |raw| {
+            let rel = Self::packed_output_spender_rel(raw, vout)?;
+            let fo = rel as usize + 8;
+            if fo >= raw.len() {
+                return Err(StoreError::Corrupt("packed flags missing"));
+            }
+            Ok((rel, raw[fo]))
+        })?;
         self.body
-            .write_at_record(create_tx_fk, rel, &field.0.to_le_bytes())?;
-        let flag_rel = rel + 8;
-        let mut flags = [0u8; 1];
-        // re-read flags byte after possible remap — use original raw
-        let fo = flag_rel as usize;
-        if fo >= raw.len() {
-            return Err(StoreError::Corrupt("packed flags missing"));
-        }
-        flags[0] = raw[fo];
+            .write_body_abs(body_off + rel, &field.0.to_le_bytes())?;
+        let mut flags = [flag0];
         if multi {
             flags[0] |= output_flags::MULTI_SPENDER;
         } else {
             flags[0] &= !output_flags::MULTI_SPENDER;
         }
-        self.body.write_at_record(create_tx_fk, flag_rel, &flags)?;
+        self.body.write_body_abs(body_off + rel + 8, &flags)?;
         Ok(())
     }
 

@@ -42,3 +42,8 @@ The workspace is mounted into the agent VM as **9p** (`workspace` on `/home/agen
 
 - Tip stall / confirm diagnostics against `./datadir-signet` failed at open with mmap EINVAL.
 - User-side IBD still advances; agent-side cannot drive or fully open that store.
+
+## No dead code warnings silenced unless there is an absolutely bulletproof justification.
+
+Do not leave dead code around. Delete it. Don't silence warnings unless there
+is bulletproof justification

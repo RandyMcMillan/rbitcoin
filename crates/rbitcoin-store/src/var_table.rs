@@ -123,6 +123,11 @@ impl VarTable {
         self.body.with_bytes(offset, len, f).and_then(|r| r)
     }
 
+    /// Absolute write into body file (no idx; caller has a prewarmed range).
+    pub fn write_body_abs(&self, abs_offset: u64, data: &[u8]) -> Result<(), StoreError> {
+        self.body.write_at(abs_offset, data)
+    }
+
     /// Pre-grow body (+ idx) capacity so a following mega `put_batch` does not
     /// remap mid-write.
     pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {
@@ -212,19 +217,6 @@ impl VarTable {
             self.body.read_at(start, &mut buf)?;
         }
         Ok(buf)
-    }
-
-    /// Patch bytes inside an existing record (same length; used for output spender_field).
-    pub fn write_at_record(&self, fk: Fk, rel_off: u64, data: &[u8]) -> Result<(), StoreError> {
-        let id = fk.get().ok_or(StoreError::InvalidFk)?;
-        let count = *self.count.lock().unwrap();
-        let start = self.record_start(id, count)?;
-        let end = self.record_end(id, count)?;
-        let abs = start.saturating_add(rel_off);
-        if abs.saturating_add(data.len() as u64) > end {
-            return Err(StoreError::Corrupt("var write_at_record past end"));
-        }
-        self.body.write_at(abs, data)
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {

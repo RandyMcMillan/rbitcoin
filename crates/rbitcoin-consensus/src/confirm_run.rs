@@ -49,7 +49,14 @@ struct Prepared {
     header_fk: rbitcoin_primitives::Fk,
     tx_fks: Vec<rbitcoin_primitives::Fk>,
     jobs: Vec<ScriptCheckJob>,
-    spends: Vec<([u8; 32], u32, rbitcoin_primitives::Fk)>,
+    /// `(prev_txid, vout, spending_tx_fk, create_tx_fk)` — create_fk for Direct
+    /// spend annotate without `tx.head`.
+    spends: Vec<(
+        [u8; 32],
+        u32,
+        rbitcoin_primitives::Fk,
+        rbitcoin_primitives::Fk,
+    )>,
     /// Outpoints created this height for light UTXO (from connect; no re-get).
     creates: Vec<([u8; 32], u32, rbitcoin_primitives::Fk)>,
     check_scripts: bool,
@@ -445,9 +452,20 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
         // Per-height order (spends then creates) so H+1 can spend H in the same
         // batch. One mmap flush for the whole run. Heal via rebuild on failure.
         let apply_res = (|| -> Result<(), ConsensusError> {
+            // Light UTXO wants (txid, vout, spend_fk) — strip create_fk.
+            let stripped: Vec<Vec<([u8; 32], u32, rbitcoin_primitives::Fk)>> = prepared
+                .iter()
+                .map(|p| {
+                    p.spends
+                        .iter()
+                        .map(|(t, v, s, _c)| (*t, *v, *s))
+                        .collect()
+                })
+                .collect();
             let steps: Vec<_> = prepared
                 .iter()
-                .map(|p| (p.spends.as_slice(), p.creates.as_slice(), p.height.0))
+                .zip(stripped.iter())
+                .map(|(p, sp)| (sp.as_slice(), p.creates.as_slice(), p.height.0))
                 .collect();
             query
                 .apply_ibd_utxo_run(&steps)
@@ -461,19 +479,41 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
                 .map_err(ConsensusError::Store)?;
         }
     } else if query.index_mode().is_direct() && query.spend_index_enabled() {
-        let mut edges: Vec<([u8; 32], u32, rbitcoin_primitives::Fk, u32)> = Vec::new();
+        // Prefer create_fk + prewarmed body range — no tx.head / tx.idx reads.
+        let mut ranged: Vec<(
+            rbitcoin_primitives::Fk,
+            u32,
+            rbitcoin_primitives::Fk,
+            u64,
+            u64,
+        )> = Vec::new();
+        let mut by_create: Vec<(
+            rbitcoin_primitives::Fk,
+            u32,
+            rbitcoin_primitives::Fk,
+        )> = Vec::new();
         for p in prepared {
-            for &(txid, vout, sfk) in &p.spends {
-                if sfk.is_null() {
+            for &(_txid, vout, sfk, cfk) in &p.spends {
+                if sfk.is_null() || cfk.is_null() {
                     continue;
                 }
-                edges.push((txid, vout, sfk, 0));
+                if let Some((off, len)) = query.confirm_parent_cache().get_body_range(cfk) {
+                    ranged.push((cfk, vout, sfk, off, len));
+                } else {
+                    by_create.push((cfk, vout, sfk));
+                }
             }
         }
-        if !edges.is_empty() {
+        if !ranged.is_empty() {
             query
                 .store()
-                .put_spend_batch(&edges)
+                .put_spend_batch_by_create_ranged(&ranged)
+                .map_err(ConsensusError::Store)?;
+        }
+        if !by_create.is_empty() {
+            query
+                .store()
+                .put_spend_batch_by_create(&by_create)
                 .map_err(ConsensusError::Store)?;
         }
     }
@@ -483,7 +523,7 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
     let t_unpin = Instant::now();
     let all_spends: Vec<([u8; 32], u32)> = prepared
         .iter()
-        .flat_map(|p| p.spends.iter().map(|(t, v, _)| (*t, *v)))
+        .flat_map(|p| p.spends.iter().map(|(t, v, _, _)| (*t, *v)))
         .collect();
     let _ = query.unpin_spent_parent_outs(&all_spends);
     confirm_phase_stats::UNPIN_NS.fetch_add(

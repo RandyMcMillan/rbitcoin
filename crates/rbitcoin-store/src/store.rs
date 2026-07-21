@@ -430,6 +430,25 @@ impl Store {
         )
     }
 
+    /// Annotate spend using a prewarmed body range (no `tx.idx` / `tx.head` reads).
+    pub fn put_spend_create_at(
+        &self,
+        create_tx_fk: Fk,
+        out_index: u32,
+        spending_tx_fk: Fk,
+        body_off: u64,
+        body_len: u64,
+    ) -> Result<(), StoreError> {
+        point_table::put_spend_on_create_at(
+            &self.txs,
+            &self.spenders,
+            create_tx_fk,
+            out_index,
+            spending_tx_fk,
+            Some((body_off, body_len)),
+        )
+    }
+
     /// Resolve `out_txid` via `tx.head`, then [`Self::put_spend_create`].
     pub fn put_spend(
         &self,
@@ -461,19 +480,76 @@ impl Store {
         Ok(out)
     }
 
-    /// Catch-up materialize: edges already have `create_tx_fk`.
-    /// Tuple: `(create_tx_fk, vout, spending_tx_fk)`.
+    /// Confirm hot path: edges already have `create_tx_fk` (+ optional body range).
+    ///
+    /// Tuple: `(create_tx_fk, vout, spending_tx_fk, Option<(body_off, body_len)>)`.
+    /// Sorted by create for locality. **No `tx.head`**. Uses body range when present
+    /// so **no `tx.idx`** either (prewarm-cached).
     pub fn put_spend_batch_by_create(
         &self,
         edges: &[(Fk, u32, Fk)],
     ) -> Result<(), StoreError> {
-        // Sort by create for output-run locality.
         let mut work: Vec<(Fk, u32, Fk)> = edges.to_vec();
         work.sort_unstable_by_key(|(c, v, _)| (c.0, *v));
         for (create_fk, vout, spend_fk) in work {
             self.put_spend_create(create_fk, vout, spend_fk)?;
         }
         Ok(())
+    }
+
+    /// Like [`Self::put_spend_batch_by_create`] with prewarmed body ranges.
+    /// Tuple: `(create_tx_fk, vout, spending_tx_fk, body_off, body_len)`.
+    pub fn put_spend_batch_by_create_ranged(
+        &self,
+        edges: &[(Fk, u32, Fk, u64, u64)],
+    ) -> Result<(), StoreError> {
+        let mut work = edges.to_vec();
+        work.sort_unstable_by_key(|(c, v, _, _, _)| (c.0, *v));
+        for (create_fk, vout, spend_fk, off, len) in work {
+            self.put_spend_create_at(create_fk, vout, spend_fk, off, len)?;
+        }
+        Ok(())
+    }
+
+    /// Spentness by create fk (no `tx.head`). Body must be mlocked / range-known.
+    ///
+    /// Sole spender: Class C strong on the spender fk. Multi-list is rare in IBD
+    /// (would touch `spenders.body` — not prewarm-mlocked by design).
+    pub fn has_confirmed_strong_spender_create(
+        &self,
+        create_tx_fk: Fk,
+        out_index: u32,
+        body_range: Option<(u64, u64)>,
+    ) -> Result<bool, StoreError> {
+        let tip = self.confirmed.tip_height().map(|t| t.0);
+        let (multi, field) = match body_range {
+            Some((off, len)) => self
+                .txs
+                .get_output_spender_meta_at(off, len, out_index)?,
+            None => self.txs.get_output_spender_meta(create_tx_fk, out_index)?,
+        };
+        if field.is_null() {
+            return Ok(false);
+        }
+        if !multi {
+            return self.is_confirmed_strong_at(field, tip);
+        }
+        // Multi: walk spenders (cold / rare during IBD).
+        let mut found = false;
+        point_table::for_each_spender_create(
+            &self.txs,
+            &self.spenders,
+            create_tx_fk,
+            out_index,
+            |spending_tx_fk| {
+                if self.is_confirmed_strong_at(spending_tx_fk, tip)? {
+                    found = true;
+                    return Ok(false);
+                }
+                Ok(true)
+            },
+        )?;
+        Ok(found)
     }
 
 

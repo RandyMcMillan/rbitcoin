@@ -126,7 +126,8 @@ impl Query {
                 if vi >= n {
                     continue;
                 }
-                if self.is_outpoint_spent(&tx.txid, v)? {
+                // Use create fk (no tx.head); body range from prewarm when present.
+                if self.is_outpoint_spent_create(fk, v)? {
                     continue;
                 }
                 if let Some(o) = outs_map.get(&v) {

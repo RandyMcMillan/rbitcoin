@@ -510,7 +510,35 @@ impl Query {
         match self.index_mode() {
             IndexMode::Catchup => self.catchup_is_spent(txid, vout),
             IndexMode::Direct | IndexMode::Tip => {
-                self.store.has_confirmed_strong_spender(txid, vout)
+                // Prefer runway create_fk + body range (no tx.head / idx).
+                if let Some(cfk) = self.confirm_parents.get_by_txid(txid) {
+                    let range = self.confirm_parents.get_body_range(cfk);
+                    return Ok(self
+                        .store
+                        .has_confirmed_strong_spender_create(cfk, vout, range)?);
+                }
+                Ok(self.store.has_confirmed_strong_spender(txid, vout)?)
+            }
+        }
+    }
+
+    /// Spentness by known create fk (wave_fill parent path — no head probe).
+    pub fn is_outpoint_spent_create(&self, create_fk: Fk, vout: u32) -> Result<bool, QueryError> {
+        match self.index_mode() {
+            IndexMode::Catchup => {
+                // Need txid for light UTXO — fall back via body meta if ranged.
+                if let Some((off, len)) = self.confirm_parents.get_body_range(create_fk) {
+                    let (meta, _) = self.store.get_tx_meta_and_prevouts_at(off, len)?;
+                    return self.catchup_is_spent(&meta.txid, vout);
+                }
+                let meta = self.store.get_tx(create_fk)?;
+                self.catchup_is_spent(&meta.txid, vout)
+            }
+            IndexMode::Direct | IndexMode::Tip => {
+                let range = self.confirm_parents.get_body_range(create_fk);
+                Ok(self
+                    .store
+                    .has_confirmed_strong_spender_create(create_fk, vout, range)?)
             }
         }
     }

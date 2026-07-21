@@ -29,26 +29,49 @@ pub fn put_spend_on_create(
     vout: u32,
     spending_tx_fk: Fk,
 ) -> Result<(), StoreError> {
+    put_spend_on_create_at(txs, spenders, create_tx_fk, vout, spending_tx_fk, None)
+}
+
+/// Like [`put_spend_on_create`] with optional prewarmed body `(offset, len)` — **no idx**.
+pub fn put_spend_on_create_at(
+    txs: &TxTable,
+    spenders: &SpenderTable,
+    create_tx_fk: Fk,
+    vout: u32,
+    spending_tx_fk: Fk,
+    body_range: Option<(u64, u64)>,
+) -> Result<(), StoreError> {
     if create_tx_fk.is_null() || spending_tx_fk.is_null() {
         return Err(StoreError::InvalidFk);
     }
-    let (multi, field) = txs.get_output_spender_meta(create_tx_fk, vout)?;
+    let (multi, field) = match body_range {
+        Some((off, len)) => txs.get_output_spender_meta_at(off, len, vout)?,
+        None => txs.get_output_spender_meta(create_tx_fk, vout)?,
+    };
+
+    let set = |multi: bool, field: Fk| -> Result<(), StoreError> {
+        match body_range {
+            Some((off, len)) => txs.set_output_spender_meta_at(off, len, vout, multi, field),
+            None => txs.set_output_spender_meta(create_tx_fk, vout, multi, field),
+        }
+    };
 
     if !multi && field.is_null() {
-        return txs.set_output_spender_meta(create_tx_fk, vout, false, spending_tx_fk);
+        return set(false, spending_tx_fk);
     }
     if !multi && field == spending_tx_fk {
         return Ok(());
     }
     if !multi {
         // Promote sole → multi list (field was previous spending_tx_fk).
+        // IBD first-spend path is sole-only; multi is rare (reorg / double annotate).
         let e1 = spenders.append(field, Fk::NULL)?;
         let e2 = spenders.append(spending_tx_fk, e1)?;
-        return txs.set_output_spender_meta(create_tx_fk, vout, true, e2);
+        return set(true, e2);
     }
     // Already multi: prepend.
     let e = spenders.append(spending_tx_fk, field)?;
-    txs.set_output_spender_meta(create_tx_fk, vout, true, e)
+    set(true, e)
 }
 
 /// Visit spending_tx_fks for a create outpoint (no Class C filter).

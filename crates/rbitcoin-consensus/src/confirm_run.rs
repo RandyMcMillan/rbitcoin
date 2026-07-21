@@ -200,14 +200,25 @@ fn resolve_body_metas(
 ) -> Result<Vec<BodyMeta>, ConsensusError> {
     let mut metas = Vec::with_capacity(blocks.len());
     for &(height, hash) in blocks {
+        // Prefer prewarm runway cache (header + header_txs, no store page faults).
+        if let Some(plan) = query.confirm_parent_cache().get_header_plan(height.0) {
+            if plan.header_rec.hash == hash {
+                metas.push(BodyMeta {
+                    height,
+                    hash,
+                    header_fk: plan.header_fk,
+                    header_rec: plan.header_rec,
+                    tx_fks: plan.tx_fks,
+                });
+                continue;
+            }
+        }
         let (header_fk, header_rec) = query
             .get_header_by_hash(&hash)
             .map_err(ConsensusError::Store)?
             .ok_or(ConsensusError::Store(StoreError::NotFound))?;
         let tx_fks = query
-            .store()
-            .header_txs
-            .get_list(header_fk)
+            .header_tx_fks(header_fk, Some(&hash))
             .map_err(ConsensusError::Store)?
             .ok_or(ConsensusError::Store(StoreError::Corrupt(
                 "confirm without archived body",

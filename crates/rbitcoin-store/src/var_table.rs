@@ -113,6 +113,16 @@ impl VarTable {
         self.body.with_bytes(off, len, f).and_then(|r| r)
     }
 
+    /// Inspect body bytes at a known absolute range (no idx read).
+    pub fn with_bytes_at<R>(
+        &self,
+        offset: u64,
+        len: u64,
+        f: impl FnOnce(&[u8]) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        self.body.with_bytes(offset, len, f).and_then(|r| r)
+    }
+
     /// Pre-grow body (+ idx) capacity so a following mega `put_batch` does not
     /// remap mid-write.
     pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {

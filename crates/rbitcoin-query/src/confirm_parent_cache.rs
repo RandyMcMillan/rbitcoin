@@ -1,19 +1,18 @@
 //! Block-structured **confirm parent runway** (replaces generic Class A cache).
 //!
-//! Prewarm **mlocks** Class A body pages for heights in `(tip, tip+depth]` and
-//! their external parents; it does **not** fully parse txs into RAM. Confirm
-//! wave/connect full-parse from the (now resident) store mappings.
+//! Prewarm strategy:
+//! - **RAM-cache** small lookups: header head/body, `header_txs`, `tx.head`→fk,
+//!   `tx.idx` body ranges.
+//! - **`mlock`** large / write-path pages only: `tx.body`, `strong_tx`, `tx_height`,
+//!   `confirmed[h]`. Never mlock `spenders` (no multi-spend writes in IBD).
+//! - Confirm full-parses from mlocked bodies; uses runway cache for resolve.
 //!
-//! - **Runway creates** register `txid → fk` (meta only) so same-batch spends
-//!   resolve without head probes.
-//! - **Thin input edges** (create_fk + vout) are stashed per spend tx after a
-//!   lightweight input prevout walk.
-//! - Optional full [`BodyEntry`] / [`ParentEntry`] paths remain for tests and
-//!   legacy callers; IBD prewarm no longer fills them.
-//! - A height is **ready** once its body has been **scanned** (mlocked + edges).
+//! - **Runway creates** register `txid → fk` so same-batch spends skip head probes.
+//! - **Thin input edges** stashed per spend tx after a lightweight prevout walk.
+//! - A height is **ready** once scanned (cache filled + body mlocked).
 
 use rbitcoin_primitives::Fk;
-use rbitcoin_store::{InputRecord, MlockRange, OutputRecord, TxRecord};
+use rbitcoin_store::{HeaderRecord, InputRecord, MlockRange, OutputRecord, TxRecord};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -88,6 +87,15 @@ pub struct BodyEntry {
     pub thin_inputs: Option<Vec<StashedThinInput>>,
 }
 
+/// Cached header + body fk list for one runway height (avoids header.head/body
+/// and header_txs page faults on confirm resolve).
+#[derive(Debug, Clone)]
+pub struct HeaderPlanCache {
+    pub header_fk: Fk,
+    pub header_rec: HeaderRecord,
+    pub tx_fks: Vec<Fk>,
+}
+
 /// Per-height plan: what prevouts block `height` needs.
 #[derive(Debug, Default)]
 struct HeightPlan {
@@ -133,8 +141,14 @@ struct Inner {
     by_body: HashMap<u64, BodyEntry>,
     /// Thin edges without a full body parse (mlock prewarm).
     thin_edges: HashMap<u64, Vec<StashedThinInput>>,
-    /// create txid → fk (runway creates + loaded parents).
+    /// create txid → fk (runway creates + loaded parents; replaces tx.head probes).
     by_txid: HashMap<[u8; 32], u64>,
+    /// height → header + tx list (replaces header.head/body + header_txs reads).
+    headers: HashMap<u32, HeaderPlanCache>,
+    /// hash → height for O(1) header resolve on confirm.
+    hash_to_height: HashMap<[u8; 32], u32>,
+    /// fk id → absolute body (offset, len) from tx.idx (replaces idx page faults).
+    body_range: HashMap<u64, (u64, u64)>,
     /// Reserved (txid, vout) → set of heights waiting (legacy; unused by new prewarm).
     reserve_waiters: HashMap<([u8; 32], u32), HashSet<u32>>,
     /// (table, page_start) → mlocked range + need_heights.
@@ -166,6 +180,9 @@ impl ConfirmParentCache {
                 by_body: HashMap::new(),
                 thin_edges: HashMap::new(),
                 by_txid: HashMap::new(),
+                headers: HashMap::new(),
+                hash_to_height: HashMap::new(),
+                body_range: HashMap::new(),
                 reserve_waiters: HashMap::new(),
                 mlocked: HashMap::new(),
                 page_refs: HashMap::new(),
@@ -234,6 +251,25 @@ impl ConfirmParentCache {
         });
         for id in &drop_body_fks {
             g.thin_edges.remove(id);
+            g.body_range.remove(id);
+        }
+        // Drop header plan cache + hash index for heights outside runway.
+        let drop_hdr: Vec<u32> = g
+            .headers
+            .keys()
+            .copied()
+            .filter(|h| *h <= tip || *h > max_h)
+            .collect();
+        for h in drop_hdr {
+            if let Some(plan) = g.headers.remove(&h) {
+                g.hash_to_height.remove(&plan.header_rec.hash);
+                for fk in &plan.tx_fks {
+                    if let Some(id) = fk.get() {
+                        g.body_range.remove(&id);
+                        g.thin_edges.remove(&id);
+                    }
+                }
+            }
         }
         g.gc_orphaned_parents();
         let unlocks = g.gc_mlocks(tip, max_h);
@@ -299,6 +335,77 @@ impl ConfirmParentCache {
     /// Number of distinct mlocked page ranges currently tracked.
     pub fn mlock_count(&self) -> usize {
         self.inner.lock().unwrap().mlock_n
+    }
+
+    /// Cache header + tx list for a runway height (small; replaces header mlock).
+    pub fn put_header_plan(
+        &self,
+        height: u32,
+        header_fk: Fk,
+        header_rec: HeaderRecord,
+        tx_fks: Vec<Fk>,
+    ) {
+        let mut g = self.inner.lock().unwrap();
+        let hash = header_rec.hash;
+        g.hash_to_height.insert(hash, height);
+        g.headers.insert(
+            height,
+            HeaderPlanCache {
+                header_fk,
+                header_rec,
+                tx_fks,
+            },
+        );
+    }
+
+    pub fn get_header_by_hash(
+        &self,
+        hash: &[u8; 32],
+    ) -> Option<(Fk, HeaderRecord)> {
+        let g = self.inner.lock().unwrap();
+        let h = *g.hash_to_height.get(hash)?;
+        let plan = g.headers.get(&h)?;
+        Some((plan.header_fk, plan.header_rec.clone()))
+    }
+
+    pub fn get_header_plan(&self, height: u32) -> Option<HeaderPlanCache> {
+        self.inner.lock().unwrap().headers.get(&height).cloned()
+    }
+
+    pub fn get_tx_fks_for_hash(&self, hash: &[u8; 32]) -> Option<Vec<Fk>> {
+        let g = self.inner.lock().unwrap();
+        let h = *g.hash_to_height.get(hash)?;
+        g.headers.get(&h).map(|p| p.tx_fks.clone())
+    }
+
+    /// Cache `tx.idx` body range for `fk` (small; body pages are mlocked separately).
+    pub fn put_body_range(&self, fk: Fk, offset: u64, len: u64) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        self.inner
+            .lock()
+            .unwrap()
+            .body_range
+            .insert(id, (offset, len));
+    }
+
+    pub fn get_body_range(&self, fk: Fk) -> Option<(u64, u64)> {
+        let id = fk.get()?;
+        self.inner.lock().unwrap().body_range.get(&id).copied()
+    }
+
+    /// Batch body ranges under one lock.
+    pub fn put_body_ranges_batch(&self, items: &[(Fk, u64, u64)]) {
+        if items.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        for &(fk, off, len) in items {
+            if let Some(id) = fk.get() {
+                g.body_range.insert(id, (off, len));
+            }
+        }
     }
 
     /// Store a full runway block body (phase-1 prewarm). Confirm/wave should

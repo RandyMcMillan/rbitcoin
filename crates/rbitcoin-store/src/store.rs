@@ -236,12 +236,42 @@ impl Store {
         }
     }
 
-    /// Pin Class A idx+body for `fk` (wave / wire / spend annotate).
+    /// Pin Class A **body only** (idx is RAM-cached by prewarm; not mlocked).
+    pub fn mlock_tx_body_only(&self, fk: Fk) -> Vec<crate::MlockRange> {
+        let mut out = Vec::with_capacity(1);
+        Self::push_mlock(&mut out, crate::MlockTable::TxBody, self.txs.mlock_body(fk));
+        out
+    }
+
+    /// Pin Class A idx+body for `fk` (legacy / tests). Prefer body-only + idx cache.
     pub fn mlock_tx_class_a(&self, fk: Fk) -> Vec<crate::MlockRange> {
         let mut out = Vec::with_capacity(2);
         Self::push_mlock(&mut out, crate::MlockTable::TxIdx, self.txs.mlock_idx(fk));
         Self::push_mlock(&mut out, crate::MlockTable::TxBody, self.txs.mlock_body(fk));
         out
+    }
+
+    /// Absolute body `(offset, len)` for `fk` (for prewarm idx cache).
+    pub fn tx_body_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
+        self.txs.body_range(fk)
+    }
+
+    /// Full tx decode from a cached body range (no idx read).
+    pub fn get_tx_full_at(
+        &self,
+        offset: u64,
+        len: u64,
+    ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>), StoreError> {
+        self.txs.get_full_at(offset, len)
+    }
+
+    /// Meta + prevouts from a cached body range (no idx read).
+    pub fn get_tx_meta_and_prevouts_at(
+        &self,
+        offset: u64,
+        len: u64,
+    ) -> Result<(TxRecord, Vec<([u8; 32], u32)>), StoreError> {
+        self.txs.get_meta_and_prevouts_at(offset, len)
     }
 
     /// Pin `tx.head` probe chain for `txid`.

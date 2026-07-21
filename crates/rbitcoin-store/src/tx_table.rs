@@ -638,6 +638,26 @@ impl TxTable {
         self.body.with_raw(fk, |raw| scan_packed_meta_and_prevouts(raw))
     }
 
+    /// Full decode from a known body range (skip idx).
+    pub fn get_full_at(
+        &self,
+        offset: u64,
+        len: u64,
+    ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>), StoreError> {
+        self.body
+            .with_bytes_at(offset, len, |raw| decode_packed_tx(raw))
+    }
+
+    /// Meta + prevouts from a known body range (skip idx).
+    pub fn get_meta_and_prevouts_at(
+        &self,
+        offset: u64,
+        len: u64,
+    ) -> Result<(TxRecord, Vec<([u8; 32], u32)>), StoreError> {
+        self.body
+            .with_bytes_at(offset, len, |raw| scan_packed_meta_and_prevouts(raw))
+    }
+
     pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {
         self.body.reserve_append(body_bytes, n_records)
     }

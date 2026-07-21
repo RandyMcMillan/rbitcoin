@@ -414,9 +414,12 @@ impl Query {
             .store(v, AtomicOrdering::Release);
     }
 
-    /// Resolve txid → fk: durable `tx.head` when index on; else `tx.runs` if enabled.
+    /// Resolve txid → fk: runway cache → durable `tx.head` → `tx.runs`.
     /// Catch-up parent resolve prefers light UTXO create_fk (outpoint), not this.
     fn lookup_tx_fk(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
+        if let Some(fk) = self.confirm_parents.get_by_txid(txid) {
+            return Ok(Some(fk));
+        }
         if self.tx_index_enabled() {
             if let Some((fk, _)) = self.store.get_tx_by_txid(txid)? {
                 return Ok(Some(fk));
@@ -653,7 +656,24 @@ impl Query {
         &self,
         hash: &[u8; 32],
     ) -> Result<Option<(Fk, HeaderRecord)>, QueryError> {
+        if let Some(v) = self.confirm_parents.get_header_by_hash(hash) {
+            return Ok(Some(v));
+        }
         self.store.get_header_by_hash(hash)
+    }
+
+    /// Header tx list: runway cache (prewarm) then store.
+    pub fn header_tx_fks(
+        &self,
+        header_fk: Fk,
+        hash: Option<&[u8; 32]>,
+    ) -> Result<Option<Vec<Fk>>, QueryError> {
+        if let Some(h) = hash {
+            if let Some(fks) = self.confirm_parents.get_tx_fks_for_hash(h) {
+                return Ok(Some(fks));
+            }
+        }
+        Ok(self.store.header_txs.get_list(header_fk)?)
     }
 
     pub fn put_tx(&self, rec: &TxRecord) -> Result<Fk, QueryError> {

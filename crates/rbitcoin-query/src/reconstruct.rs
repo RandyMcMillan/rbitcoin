@@ -22,7 +22,7 @@ impl Query {
             let Some((header_fk, _)) = self.get_header_by_hash(hash)? else {
                 continue;
             };
-            let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
+            let Some(tx_fks) = self.header_tx_fks(header_fk, Some(hash))? else {
                 continue;
             };
             for fk in tx_fks {
@@ -101,8 +101,13 @@ impl Query {
                 }
                 (tx, m)
             } else {
-                // Prewarm miss — should be rare; keep last-resort for safety.
-                let (tx, _, raw) = self.store.get_tx_full(fk)?;
+                // Prewarm miss — use cached body range when present (skip idx).
+                let (tx, _, raw) = if let Some((off, len)) = self.confirm_parents.get_body_range(fk)
+                {
+                    self.store.get_tx_full_at(off, len)?
+                } else {
+                    self.store.get_tx_full(fk)?
+                };
                 let mut m = HashMap::new();
                 for &v in needed_vouts {
                     if let Some(o) = raw.get(v as usize) {
@@ -175,7 +180,7 @@ impl Query {
         Ok(edges)
     }
 
-    /// Body for wave/wire: prewarm cache first, then store.
+    /// Body for wave/wire: full body cache → cached idx range + mlocked body → store.
     fn load_body_prewarmed(
         &self,
         fk: Fk,
@@ -190,6 +195,11 @@ impl Query {
         &self,
         fk: Fk,
     ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>), QueryError> {
+        // Prefer prewarmed idx range (skip idx page fault); body pages mlocked.
+        if let Some((off, len)) = self.confirm_parents.get_body_range(fk) {
+            let (tx, inputs, outs) = self.store.get_tx_full_at(off, len)?;
+            return Ok((tx, outs, inputs));
+        }
         let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
         Ok((tx, outs, inputs))
     }

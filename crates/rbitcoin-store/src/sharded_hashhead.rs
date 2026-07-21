@@ -15,8 +15,8 @@ use rbitcoin_primitives::Fk;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Mainnet **point** shard count (`key[0]` → 256 files). Large tables need fine
-/// partitioning so each rehash stays local.
+/// Mainnet **header** shard count (`key[0]` → 256 files). Fine partitioning keeps
+/// each rehash local on large open-address tables.
 pub const SHARD_COUNT: usize = 256;
 /// Mainnet **tx / scripthash** shard count (16 files). Enough to bound rehash
 /// size without the FD cost of 256-way for smaller heads.
@@ -31,21 +31,20 @@ pub fn shard_pace_ms() -> u64 {
         .min(5_000)
 }
 
-/// How many shards to create for the active scale (legacy: same for all roles).
+/// How many shards to create for the active scale (legacy helper; uses header layout).
 pub fn shard_count_for_scale() -> usize {
-    shard_count_for_role(HeadRole::Point)
+    shard_count_for_role(HeadRole::Header)
 }
 
 /// Shard count for a new head of `role` (existing dirs keep their layout on open).
 ///
-/// - **Point:** 256 (rehash locality for huge spend index)
+/// - **Header:** 256 (rehash locality for large open-address tables)
 /// - **Tx / ScriptHash:** 16 (smaller indexes; fewer FDs)
-/// - **Header:** 256 (same as historical mainnet create)
 pub fn shard_count_for_role(role: HeadRole) -> usize {
     match HeadScale::from_env() {
         HeadScale::Tiny => 1,
         HeadScale::Mainnet => match role {
-            HeadRole::Point | HeadRole::Header => SHARD_COUNT,
+            HeadRole::Header => SHARD_COUNT,
             HeadRole::Tx | HeadRole::ScriptHash => SHARD_COUNT_TX_SH,
         },
     }
@@ -63,7 +62,7 @@ pub fn initial_slots_per_shard(role: HeadRole) -> u64 {
         HeadScale::Tiny => 64,
         HeadScale::Mainnet => match role {
             HeadRole::Header => 1 << 12,
-            HeadRole::ScriptHash | HeadRole::Point | HeadRole::Tx => 1 << 16,
+            HeadRole::ScriptHash | HeadRole::Tx => 1 << 16,
         },
     }
 }
@@ -346,7 +345,7 @@ mod tests {
         h.insert_many(&batch).unwrap();
         h.flush().unwrap();
         drop(h);
-        let h2 = ShardedHashHead::open_for_role(&path, HeadRole::Point).unwrap();
+        let h2 = ShardedHashHead::open_for_role(&path, HeadRole::Header).unwrap();
         assert_eq!(h2.get(&batch[0].0).unwrap(), Some(batch[0].1));
         let _ = std::fs::remove_dir_all(&dir);
     }

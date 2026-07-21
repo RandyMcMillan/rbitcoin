@@ -28,6 +28,7 @@ On open, `repair_class_c_above_tip` clears strong/height **above** tip (tip-rela
 - Best-chain spentness: annotation + `is_confirmed_strong(spender)`.
 - Kill-safe: stale/non-strong fields do not false-positive if filter is applied.
 - No `point.head` (v4 open-hash multimap removed).
+- Class A bodies are **packed-only**; non-packed bare meta rows are rejected as corrupt.
 
 ## Thin scripthash (Electrum outpoint pointers)
 

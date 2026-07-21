@@ -9,15 +9,19 @@ use std::path::Path;
 
 /// Class A tx row (no wire blob — reconstruct from inputs/outputs + witness).
 ///
-/// `input_start_fk` / `output_start_fk` address a **per-tx run** record (one idx
-/// entry for all inputs/outputs of this tx), not a global per-I/O FK.
+/// On-disk bodies are **packed-only** ([`PACKED_TX_V1`]): inputs and outputs are
+/// embedded in the same `tx.body` payload. `input_start_fk` / `output_start_fk`
+/// are always [`Fk::NULL`] on write and ignored on read (kept in the fixed meta
+/// layout for encoding stability).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxRecord {
     pub txid: [u8; 32],
     pub version: i32,
     pub locktime: u32,
+    /// Always [`Fk::NULL`] for packed Class A (legacy split-run address unused).
     pub input_start_fk: Fk,
     pub input_count: u32,
+    /// Always [`Fk::NULL`] for packed Class A (legacy split-run address unused).
     pub output_start_fk: Fk,
     pub output_count: u32,
 }
@@ -387,7 +391,9 @@ pub fn decode_input_run_prefix(
 ///
 /// Layout: `PACKED_V1 || TxRecord(64) || input_run || output_run`
 /// so one `get_raw(fk)` returns the full transaction body (single body IO).
-/// Legacy records are exactly [`TxRecord::ENCODED_LEN`] bytes with no tag.
+///
+/// **All Class A bodies are packed** (schema current). Non-packed payloads are
+/// rejected as corrupt on read.
 pub const PACKED_TX_V1: u8 = 0x01;
 
 /// Encode a full Class A tx as one var payload.
@@ -538,18 +544,14 @@ impl TxTable {
 
     pub fn get(&self, fk: Fk) -> Result<TxRecord, StoreError> {
         let raw = self.body.get_raw(fk)?;
-        if is_packed_tx_payload(&raw) {
-            let (tx, _, _) = decode_packed_tx(&raw)?;
-            Ok(tx)
-        } else {
-            TxRecord::decode(&raw)
-        }
+        let (tx, _, _) = decode_packed_tx(&raw)?;
+        Ok(tx)
     }
 
     /// Relative byte offset of output `vout`'s `spender_field` inside a packed tx payload.
     fn packed_output_spender_rel(raw: &[u8], vout: u32) -> Result<u64, StoreError> {
         if raw.first().copied() != Some(PACKED_TX_V1) {
-            return Err(StoreError::Corrupt("not packed tx"));
+            return Err(StoreError::Corrupt("not a packed Class A tx"));
         }
         if raw.len() < 1 + TxRecord::ENCODED_LEN {
             return Err(StoreError::Corrupt("short packed tx"));
@@ -576,113 +578,67 @@ impl TxTable {
         Err(StoreError::NotFound)
     }
 
-    /// Read multi + spender_field for create tx output (packed or split run).
+    /// Read multi + spender_field for create tx output (packed Class A body).
     pub fn get_output_spender_meta(
         &self,
-        outputs: &OutputTable,
         create_tx_fk: Fk,
         vout: u32,
     ) -> Result<(bool, Fk), StoreError> {
         let raw = self.body.get_raw(create_tx_fk)?;
-        if is_packed_tx_payload(&raw) {
-            let rel = Self::packed_output_spender_rel(&raw, vout)? as usize;
-            if raw.len() < rel + 9 {
-                return Err(StoreError::Corrupt("packed spender meta short"));
-            }
-            let field = Fk(u64::from_le_bytes(raw[rel..rel + 8].try_into().unwrap()));
-            let multi = raw[rel + 8] & output_flags::MULTI_SPENDER != 0;
-            return Ok((multi, field));
+        let rel = Self::packed_output_spender_rel(&raw, vout)? as usize;
+        if raw.len() < rel + 9 {
+            return Err(StoreError::Corrupt("packed spender meta short"));
         }
-        let tx = TxRecord::decode(&raw)?;
-        if vout >= tx.output_count || tx.output_start_fk.is_null() {
-            return Err(StoreError::NotFound);
-        }
-        outputs.get_spender_meta(tx.output_start_fk, tx.output_count, vout)
+        let field = Fk(u64::from_le_bytes(raw[rel..rel + 8].try_into().unwrap()));
+        let multi = raw[rel + 8] & output_flags::MULTI_SPENDER != 0;
+        Ok((multi, field))
     }
 
-    /// Patch multi + spender_field on create tx output (packed or split run).
+    /// Patch multi + spender_field on create tx output (packed Class A body).
     pub fn set_output_spender_meta(
         &self,
-        outputs: &OutputTable,
         create_tx_fk: Fk,
         vout: u32,
         multi: bool,
         field: Fk,
     ) -> Result<(), StoreError> {
         let raw = self.body.get_raw(create_tx_fk)?;
-        if is_packed_tx_payload(&raw) {
-            let rel = Self::packed_output_spender_rel(&raw, vout)?;
-            self.body
-                .write_at_record(create_tx_fk, rel, &field.0.to_le_bytes())?;
-            let flag_rel = rel + 8;
-            let mut flags = [0u8; 1];
-            // re-read flags byte after possible remap — use original raw
-            let fo = flag_rel as usize;
-            if fo >= raw.len() {
-                return Err(StoreError::Corrupt("packed flags missing"));
-            }
-            flags[0] = raw[fo];
-            if multi {
-                flags[0] |= output_flags::MULTI_SPENDER;
-            } else {
-                flags[0] &= !output_flags::MULTI_SPENDER;
-            }
-            self.body.write_at_record(create_tx_fk, flag_rel, &flags)?;
-            return Ok(());
+        let rel = Self::packed_output_spender_rel(&raw, vout)?;
+        self.body
+            .write_at_record(create_tx_fk, rel, &field.0.to_le_bytes())?;
+        let flag_rel = rel + 8;
+        let mut flags = [0u8; 1];
+        // re-read flags byte after possible remap — use original raw
+        let fo = flag_rel as usize;
+        if fo >= raw.len() {
+            return Err(StoreError::Corrupt("packed flags missing"));
         }
-        let tx = TxRecord::decode(&raw)?;
-        if vout >= tx.output_count || tx.output_start_fk.is_null() {
-            return Err(StoreError::NotFound);
+        flags[0] = raw[fo];
+        if multi {
+            flags[0] |= output_flags::MULTI_SPENDER;
+        } else {
+            flags[0] &= !output_flags::MULTI_SPENDER;
         }
-        outputs.set_spender_meta(tx.output_start_fk, tx.output_count, vout, multi, field)
+        self.body.write_at_record(create_tx_fk, flag_rel, &flags)?;
+        Ok(())
     }
 
-    /// Full tx body in **one** `tx.body` read (packed), or legacy 3-table path.
+    /// Full tx body in **one** `tx.body` read (packed Class A only).
     pub fn get_full(
         &self,
         fk: Fk,
-        inputs: &InputTable,
-        outputs: &OutputTable,
     ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>), StoreError> {
         let raw = self.body.get_raw(fk)?;
-        if is_packed_tx_payload(&raw) {
-            return decode_packed_tx(&raw);
-        }
-        // Legacy split tables (pre-packed Class A).
-        let tx = TxRecord::decode(&raw)?;
-        let ins = if tx.input_count == 0 {
-            Vec::new()
-        } else {
-            let run = tx.input_start_fk.get().ok_or(StoreError::InvalidFk)?;
-            inputs.get_run(Fk(run), tx.input_count)?
-        };
-        let outs = if tx.output_count == 0 {
-            Vec::new()
-        } else {
-            let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-            outputs.get_run(Fk(run), tx.output_count)?
-        };
-        Ok((tx, ins, outs))
+        decode_packed_tx(&raw)
     }
 
-    /// Meta + outputs only (one body IO when packed; skips input materialization).
+    /// Meta + outputs only (one body IO; skips input materialization).
     pub fn get_meta_and_outputs(
         &self,
         fk: Fk,
-        outputs: &OutputTable,
     ) -> Result<(TxRecord, Vec<OutputRecord>), StoreError> {
         let raw = self.body.get_raw(fk)?;
-        if is_packed_tx_payload(&raw) {
-            return decode_packed_tx_outs_only(&raw);
-        }
-        let tx = TxRecord::decode(&raw)?;
-        let outs = if tx.output_count == 0 {
-            Vec::new()
-        } else {
-            let run = tx.output_start_fk.get().ok_or(StoreError::InvalidFk)?;
-            outputs.get_run(Fk(run), tx.output_count)?
-        };
-        Ok((tx, outs))
+        decode_packed_tx_outs_only(&raw)
     }
 
     /// Append packed full-tx records (one var payload per tx = one body IO on read).
@@ -1173,5 +1129,29 @@ mod tests {
         assert!(dtx.input_start_fk.get().is_none());
         assert_eq!(dins, inputs);
         assert_eq!(douts, outputs);
+    }
+
+    #[test]
+    fn non_packed_tx_body_rejected() {
+        // Bare TxRecord meta without PACKED_TX_V1 tag (legacy 3-table layout).
+        let rec = TxRecord {
+            txid: [1u8; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk(1),
+            input_count: 1,
+            output_start_fk: Fk(2),
+            output_count: 1,
+        };
+        let raw = rec.encode();
+        assert!(!is_packed_tx_payload(&raw));
+        assert!(matches!(
+            decode_packed_tx(&raw),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(matches!(
+            decode_packed_tx_outs_only(&raw),
+            Err(StoreError::Corrupt(_))
+        ));
     }
 }

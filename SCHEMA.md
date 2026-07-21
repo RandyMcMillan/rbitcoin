@@ -4,6 +4,8 @@ Versioned layouts for the chain store. **Format is unstable until 1.0.** Magic b
 
 **Schema v7** (current): hash heads (`tx.head`, `header.head`, …) use **16 B key prefixes** (24 B slots) plus optional multi-fk lists (`*.head.mlt` / shard `NN.mlt`) for prefix collisions and BIP30 duplicate full txids. Lookups verify the Class A body. Keeps v6 scripthash compression and v5 spends.
 
+**Class A bodies are packed-only**: each `tx.body` record is `PACKED_TX_V1 || TxRecord || inputs || outputs` (one body IO for full reconstruct). Legacy 3-table rows (bare `TxRecord` + separate `input.body` / `output.body` runs addressed by `input_start_fk` / `output_start_fk`) are **rejected** on read. Standalone `input.body` / `output.body` files may still exist empty on create for layout stability; they are not the Class A read path.
+
 **Schema v6**: scripthash head **16 B key prefix** + **16 B value** (32 B slots); body entries are **create_tx_fk only** (8 B). Plus v5 spends.
 
 **Schema v5**: spend annotations on each create **output** (`spender_field:u64` + `MULTI_SPENDER` flag); rare multi-spend lists in `spenders.body` (16 B: spending_tx_fk | next). **No `point.head` open-hash multimap.**

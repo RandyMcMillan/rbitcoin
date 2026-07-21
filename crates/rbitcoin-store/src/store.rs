@@ -165,13 +165,12 @@ impl Store {
         self.txs.get(fk)
     }
 
-    /// Full Class A body by fk: **one** `tx.body` read when packed; legacy
-    /// rows fall back to split input/output tables.
+    /// Full Class A body by fk: **one** `tx.body` read (packed only).
     pub fn get_tx_full(
         &self,
         fk: Fk,
     ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>), StoreError> {
-        self.txs.get_full(fk, &self.inputs, &self.outputs)
+        self.txs.get_full(fk)
     }
 
     /// Parent-prevout hot path: meta + outputs only (no input materialization).
@@ -179,7 +178,7 @@ impl Store {
         &self,
         fk: Fk,
     ) -> Result<(TxRecord, Vec<OutputRecord>), StoreError> {
-        self.txs.get_meta_and_outputs(fk, &self.outputs)
+        self.txs.get_meta_and_outputs(fk)
     }
 
     /// Append packed full-tx Class A rows (preferred archive path).
@@ -236,7 +235,6 @@ impl Store {
     ) -> Result<(), StoreError> {
         point_table::put_spend_on_create(
             &self.txs,
-            &self.outputs,
             &self.spenders,
             create_tx_fk,
             out_index,
@@ -354,7 +352,6 @@ impl Store {
         let mut found = false;
         point_table::for_each_spender_create(
             &self.txs,
-            &self.outputs,
             &self.spenders,
             create_fk,
             out_index,
@@ -397,7 +394,6 @@ impl Store {
         let mut out = Vec::new();
         point_table::for_each_spender_create(
             &self.txs,
-            &self.outputs,
             &self.spenders,
             create_fk,
             out_index,

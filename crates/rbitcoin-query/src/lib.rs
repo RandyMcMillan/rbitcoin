@@ -45,13 +45,6 @@ pub use connect::ConfirmPrepared;
 pub use parent_prewarm::PrewarmStats;
 pub use wave_prevout::WavePrevoutCache;
 
-/// Stub stats for IBD perf_log (Class A cache removed; use [`parent_prewarm_stats`]).
-pub mod class_a_cache_stats {
-    pub fn sample_and_reset() -> (u64, u64, u64) {
-        (0, 0, 0)
-    }
-}
-
 /// Parent-prewarm window counters (reset by the IBD ~5s sampler).
 ///
 /// Background worker + last-mile confirm prewarm both contribute. Pair with
@@ -486,10 +479,10 @@ impl Query {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Buffer `point.head` upserts in process RAM during full-validation IBD.
+    /// Host-friendly process-exit flush (durability for open tables).
     ///
-    /// Writes spill sorted/page-buffered when the map reaches `max_entries` or on
-    /// Host-friendly process-exit flush (see [`rbitcoin_store::Store::flush_for_shutdown`]).
+    /// See [`rbitcoin_store::Store::flush_for_shutdown`]. Catch-up light UTXO and
+    /// open-hash heads are write-through; this is not a write-behind spill.
     pub fn flush_for_shutdown(&self) -> Result<(), QueryError> {
         self.store.flush_for_shutdown()
     }

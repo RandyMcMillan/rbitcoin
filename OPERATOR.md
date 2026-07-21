@@ -84,14 +84,15 @@ materialize continues until runs are empty (once inflight is clear). Progress:
 | `RBITCOIN_RUN_MATERIALIZE_STOP_LEAD` | `32768` | Resume peer fetch / pause materialize |
 | `RBITCOIN_HEAD_SHARD_PACE_MS` | `25` | Sleep between shards during paced head insert |
 
-New stores: **point.head 256 shards**, **tx.head / scripthash 16 shards** (existing
-datadirs keep their on-disk shard layout).
+New stores: **header.head 256 shards**, **tx.head / scripthash 16 shards**
+(existing datadirs keep their on-disk shard layout). Spends are schema-v5
+annotations on create outputs (no `point.head`).
 
-**Memory rule:** During Catchup, durable open-hash heads are off. Class A inputs
-always store **external** `prev_txid` (no `prev_tx_fk` field). Parent resolve
-uses light UTXO (`outpoint → create_fk`); Tip uses points / `tx.head`.
-SH create dedupe is an **O(1) height watermark**. Do not raise Class A / archive
-queues without watching RSS vs page cache.
+**Memory rule:** During Catchup, durable open-hash heads are off. Class A is
+packed full-tx bodies; inputs always store **external** `prev_txid`. Parent
+resolve uses light UTXO (`outpoint → create_fk`); Tip uses spend annotations /
+`tx.head`. SH create dedupe is an **O(1) height watermark**. Do not raise
+archive queues without watching RSS vs page cache.
 
 ## Libre-relay-class policy (mempool + Electrum broadcast)
 

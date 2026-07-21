@@ -30,7 +30,7 @@ const DEFAULT_SLOTS: u64 = 64;
 /// Rehash when occupied/slots ≥ 7/8.
 const MAX_LOAD_NUM: u64 = 7;
 const MAX_LOAD_DEN: u64 = 8;
-/// Slots per write-behind chunk (128 × 24 B = 3 KiB).
+/// Slots per page-cache RMW chunk (128 × 24 B = 3 KiB).
 const SLOTS_PER_CHUNK: u64 = 128;
 
 pub type HeadKey = [u8; HEAD_KEY_LEN];
@@ -64,18 +64,20 @@ fn unpack_value(v: u64) -> (bool, Fk) {
 }
 /// Max chunks held in the insert cache (~1.25 MiB).
 const CHUNK_CACHE_MAX: usize = 256;
-/// Aggregate spill / rehash chatter at DEBUG this often; per-event is TRACE.
+/// Aggregate rehash chatter at DEBUG this often; per-event is TRACE.
 const SPILL_DEBUG_INTERVAL: Duration = Duration::from_secs(30);
 /// Single rehash still WARN if clear size or wall time exceeds these (host risk).
 const REHASH_WARN_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 const REHASH_WARN_MS: u128 = 500;
 
 /// Which hash-head file (drives mainnet pre-size).
+///
+/// Schema v5 removed the durable `point.head` spend multimap; spend edges live
+/// on create outputs. Roles here are only live open-hash tables.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadRole {
     Header,
     Tx,
-    Point,
     ScriptHash,
 }
 
@@ -128,7 +130,7 @@ impl HeadScale {
             // Unsharded fallback only (legacy single-file). Prefer sharded layout.
             HeadScale::Mainnet => match role {
                 HeadRole::Header => 1 << 20,
-                HeadRole::ScriptHash | HeadRole::Point | HeadRole::Tx => 1 << 22,
+                HeadRole::ScriptHash | HeadRole::Tx => 1 << 22,
             },
         }
     }
@@ -136,13 +138,12 @@ impl HeadScale {
 
 /// Effective initial slots for `role` (env scale + optional per-role override).
 ///
-/// Per-role: `RBITCOIN_HEAD_SLOTS_HEADER`, `_TX`, `_POINT`, `_SCRIPTHASH`
+/// Per-role: `RBITCOIN_HEAD_SLOTS_HEADER`, `_TX`, `_SCRIPTHASH`
 /// (decimal slot count, rounded up to power of two).
 pub fn initial_slots_for(role: HeadRole) -> u64 {
     let env_key = match role {
         HeadRole::Header => "RBITCOIN_HEAD_SLOTS_HEADER",
         HeadRole::Tx => "RBITCOIN_HEAD_SLOTS_TX",
-        HeadRole::Point => "RBITCOIN_HEAD_SLOTS_POINT",
         HeadRole::ScriptHash => "RBITCOIN_HEAD_SLOTS_SCRIPTHASH",
     };
     if let Ok(s) = std::env::var(env_key) {
@@ -675,7 +676,7 @@ impl HashHead {
 
     /// Grow to `new_slots` (power of two) and reinsert only **occupied** entries.
     ///
-    /// **Host freeze risk:** multi‑GiB heads (e.g. `point.head` ~10 GiB+) used to
+    /// **Host freeze risk:** multi‑GiB heads (e.g. large `tx.head` shards) used to
     /// zero-fill the whole table with `write_at` — a multi‑second IO storm. We now
     /// punch a hole (or sparse-clear) then reinsert only live keys.
     ///
@@ -1097,8 +1098,9 @@ mod tests {
 
     #[test]
     fn mainnet_scale_slot_targets() {
-        assert_eq!(HeadScale::Tiny.initial_slots(HeadRole::Point), 64);
-        assert!(HeadScale::Mainnet.initial_slots(HeadRole::Point) >= 64);
+        assert_eq!(HeadScale::Tiny.initial_slots(HeadRole::Tx), 64);
+        assert!(HeadScale::Mainnet.initial_slots(HeadRole::Tx) >= 64);
+        assert!(HeadScale::Mainnet.initial_slots(HeadRole::Header) >= 64);
     }
 
 

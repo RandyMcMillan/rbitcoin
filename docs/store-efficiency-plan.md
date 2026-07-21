@@ -1,33 +1,39 @@
 # Store efficiency plan: mainnet TB-scale + Electrum on 16 GiB RAM
 
-**Status:** design / sequencing (not all items implemented)  
+**Status:** design / sequencing (partially landed; some sections are pre-v5 historical)  
 **Audience:** operators hitting host freezes + agents changing the store  
 **Related:** [`ibd-io-audit.md`](./ibd-io-audit.md), [`concurrency.md`](./concurrency.md), [`SCHEMA.md`](../SCHEMA.md), [`libbitcoin-durable-archive-variant.md`](../libbitcoin-durable-archive-variant.md)
 
+**Current (schema v5–v7):** no durable `point.head`; spends on create outputs;
+packed Class A; catch-up light UTXO + sorted runs + materialize; hash heads
+write-through (no write-behind overlay). Snapshot tables below are from an
+earlier full-validation audit and should not be read as the live layout.
+
 ---
 
-## 1. Where we are (measured)
+## 1. Where we were (historical measurement)
 
-At ~20% mainnet full validation on this machine, `datadir-mainnet/store` is already **~50 GiB**:
+At ~20% mainnet full validation on this machine, `datadir-mainnet/store` was already **~50 GiB**:
 
-| File | ~Size | Access pattern |
+| File | ~Size | Access pattern (then) |
 |------|-------|----------------|
 | `input.body` | **21 GiB** | Sequential append (IBD); random read (confirm / reconstruct) |
-| `point.head` | **11 GiB** | Open hash, linear probe, rehash-doubles |
+| `point.head` | **11 GiB** | Open hash, linear probe, rehash-doubles — **gone in v5** |
 | `tx.head` | **5 GiB** | Open hash (txid → fk) |
 | `output.body` | **5 GiB** | Sequential append; random for Electrum enrich |
-| `tx.body` | **3.7 GiB** | Sequential + random |
-| `point.body` | **2.9 GiB** | Append multimap edges |
+| `tx.body` | **3.7 GiB** | Sequential + random (now packed full-tx dominant) |
+| `point.body` | **2.9 GiB** | Append multimap edges — **gone in v5** |
 | `scripthash.head` | **~1 GiB** | Open hash |
 | `scripthash.body` | **~0.4 GiB** | Thin create chains |
 
 Naive linear scale to “full mainnet” (wire ~600 GiB, archival indexes often **1–2 TiB** total):
 
-- `input.body` alone can approach **~100 GiB+**
-- `point.head` + `tx.head` can be **tens of GiB each** of *random-access* structure
-- On a **16 GiB RAM** box, **none** of these heads fit; every cold probe is a disk seek / page fault
+- Packed `tx.body` absorbs what used to be split I/O tables
+- `tx.head` (and scripthash heads) remain multi‑GiB random-access structures when materialized
+- On a **16 GiB RAM** box, large open-hash heads do not fit; every cold probe is a disk seek / page fault
 
-Logs already show the live shape of pain: `writer_busy%=100`, archive queue full, Class A cache thrash, and multi‑GiB mmap grow / hash rehash storms ([`ibd-io-audit.md`](./ibd-io-audit.md)).
+Historical pain shape: `writer_busy%=100`, archive queue full, multi‑GiB mmap grow /
+hash rehash storms ([`ibd-io-audit.md`](./ibd-io-audit.md)).
 
 ---
 
@@ -38,13 +44,13 @@ Logs already show the live shape of pain: `writer_busy%=100`, archive queue full
 `scripthash_history` / `balance` / `listunspent` ([`scripthash.rs`](../crates/rbitcoin-query/src/scripthash.rs)):
 
 1. Hash probe `scripthash.head` → walk thin create chain in `scripthash.body`
-2. Per create: **`get_tx(create_tx_fk)`** + **`tx_output`** + `tx_height` (enrich)
-3. Per create: **`spenders(outpoint)`** → point head probe + body walk + `get_tx(spend)` + height
+2. Per create: **`get_tx(create_tx_fk)`** + output + `tx_height` (enrich)
+3. Per create: **`spenders(outpoint)`** → create-output spender field (+ multi list) + `get_tx(spend)` + height
 
 So one quiet wallet with **N creates** is roughly:
 
 ```text
-O(N) × (scripthash body + Class A tx + Class A output + point head + point body + Class A spend tx)
+O(N) × (scripthash body + packed Class A create + spender meta + Class A spend tx)
 ```
 
 Each step is often a **different multi‑GiB mmap region**. On a cold cache / slow disk that is **dozens of random IOs per UTXO lifecycle**, not one index lookup.
@@ -129,9 +135,8 @@ Goal: **IO-efficient IBD** *and* **IO-efficient Electrum** on **16 GiB + medio
 |--------|--------|
 | Datadir on **dedicated** disk (not OS/UI disk) | Largest single freeze/latency win |
 | `nice` + `ionice -c3` | UI survives archive saturation |
-| Full validation: accept slower; or **milestone IBD then reindex** spends/scripthash | Avoid points on critical path during catch-up |
+| Full validation: accept slower; or **milestone / catch-up then materialize** heads | Avoid durable head RMW on critical path during catch-up |
 | Cap rayon: `RAYON_NUM_THREADS` | Leave cores for OS |
-| Keep Class A cache **≤256 MiB** unless dedicated big RAM | Avoid thrash |
 
 Ship as OPERATOR “sluggish disk / 16 GiB” profile (checklist).
 
@@ -143,7 +148,9 @@ Ship as OPERATOR “sluggish disk / 16 GiB” profile (checklist).
 | Hash rehash without multi‑GiB zero writes (punch-hole) | ✅ landed |
 | Log rehash duration | ✅ landed |
 | Slot-sorted / chunk-buffered `insert_many` | ✅ landed |
-| Process-local write-behind overlay on `point.head`/`tx.head` (full-validation IBD) | ✅ landed (spill at cap / archive flush / tip mode) |
+| Process-local write-behind overlay on heads | ❌ removed (write-through; catch-up uses runs) |
+| Schema v5 spend-on-output (no `point.head`) | ✅ landed |
+| Packed Class A (no 3-table get path) | ✅ landed |
 | Background rehash to side file + atomic swap | **Next** if freezes remain |
 | Never full `store.flush()` during IBD | Already mostly true; guardrails |
 
@@ -152,15 +159,15 @@ Ship as OPERATOR “sluggish disk / 16 GiB” profile (checklist).
 **IBD slim mode (default for catch-up):**
 
 ```text
-Write: Class A (headers, tx, in, out; always external prev_txid) + Class C as today
-Defer or batch: point.head updates, optional tx.head, dense Electrum
-Prevouts (catch-up): light UTXO create_fk + wave/tip caches; tip mode: points / tx.head
+Write: packed Class A + Class C as today
+Defer: tx.head / scripthash via sorted runs (materialize when archive lead allows)
+Prevouts (catch-up): light UTXO create_fk + wave/tip caches; tip mode: spend annotations / tx.head
 ```
 
 **Post-tip / serve build (one pass or streaming):**
 
 ```text
-Build / densify: point index, Electrum fat index, optional filters
+Build / densify: remaining heads, Electrum fat index, optional filters
 May take hours on slow disk — but once, offline-friendly, sequential-friendly
 ```
 
@@ -203,18 +210,19 @@ Open linear-probe tables of tens of GiB are hostile to sluggish disks.
 | **C. LSM / sorted string table for points & scripthash** | Sequential compaction, great for cold disk | Write amp, more code |
 | **D. Hybrid:** tip window open-hash in RAM + cold SST | Best 16 GiB fit | Two paths |
 
-**Recommendation:** **S3 fat Electrum first**; for points, **S2 defer during IBD** then **S4-C or partitioned heads** for spend index. Do not keep growing a single 10–50 GiB `point.head` as the forever design.
+**Recommendation:** **S3 fat Electrum first**; spends already use output annotations
+(v5). Prefer **partitioned / compressed heads** and run-based catch-up for remaining
+open-hash tables (`tx.head`, scripthash) rather than any single multi‑10 GiB head.
 
 ### Phase S5 — Working sets sized for 16 GiB
 
 | Cache | Size | Content |
 |-------|------|---------|
 | Confirm parent prewarm + UTXO slab | 256–512 MiB | Runway parents + light UTXO (not full set) |
-| Class A FIFO | 128–256 MiB | Archive→confirm locality only |
 | Electrum hot scripthash | 64–128 MiB MRU of fat slabs | Wallet sessions |
-| Hash probe bloom (optional) | 32–64 MiB | Negative lookups on tx/point |
+| Hash probe bloom (optional) | 32–64 MiB | Negative lookups on tx / scripthash |
 
-Never try to cache full `tx.head` / `point.head` in process RAM.
+Never try to cache full `tx.head` in process RAM.
 
 ### Phase S6 — Read path IO discipline
 

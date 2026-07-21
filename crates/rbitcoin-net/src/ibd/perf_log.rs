@@ -300,7 +300,6 @@ pub(crate) fn sample(
         rbitcoin_query::class_c_phase_stats::sample_sh_sub_and_reset();
     let (wf_body, wf_ptx, wf_pout, wf_spent, wf_cb) =
         rbitcoin_query::wave_fill_stats::sample_and_reset();
-    let _ = rbitcoin_query::class_a_cache_stats::sample_and_reset();
     let (pwh, pca, psm) = rbitcoin_query::connect_prevout_stats::sample_and_reset();
     let (
         pw_ns,

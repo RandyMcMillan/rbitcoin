@@ -55,13 +55,13 @@ impl Query {
     /// before tip advance leaves recoverable state — open repairs strong above
     /// tip, and re-confirm of tip+1 does not see false PrevoutSpent.
     ///
-    /// # Point edges
+    /// # Spend annotations
     ///
-    /// When `spend_index` is on, archive already wrote durable point edges.
-    /// Confirm does **not** re-probe `spenders_raw` / re-append edges: that was
-    /// O(inputs × point.head) per block and hung tip Class C on large signet
-    /// archives (@182692 class: scripts finished, `class_c_ms=0` forever).
-    /// Gaps from archive-with-spend-off are filled by `backfill_point_spends`.
+    /// When `spend_index` is on, archive already wrote durable spend annotations
+    /// on create outputs (schema v5+). Confirm does **not** re-probe spenders /
+    /// re-append edges: that was O(inputs × spend index) per block and hung tip
+    /// Class C on large signet archives. Gaps from archive-with-spend-off are
+    /// filled by `backfill_point_spends`.
     pub fn confirm_blocks_run(
         &self,
         items: &[ConfirmPrepared],

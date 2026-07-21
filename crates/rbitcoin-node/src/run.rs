@@ -160,6 +160,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     // - durable open-hash tx/point/SH off on the hot path
     // - sequential sorted runs + light UTXO create_fk (catch-up spentness oracle)
     // - materialize open-hash at enter_tip_mode before Electrum
+    if config.mlock_utxo {
+        handle.query.set_ibd_utxo_mlock(true);
+        info!("ibd: light UTXO mlock requested (--mlock-utxo; needs RLIMIT_MEMLOCK ≥ map)");
+    }
     handle
         .query
         .enter_catchup_mode()

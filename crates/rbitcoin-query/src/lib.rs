@@ -334,6 +334,8 @@ pub struct Query {
     point_run: point_run_builder::PointRunBuilder,
     /// Catch-up spentness: mmap unspent outpoint → create Class A fk.
     ibd_utxo: Mutex<Option<IbdUtxo>>,
+    /// Pin light UTXO mmap (`--mlock-utxo`); applied on open/grow/rebuild.
+    ibd_utxo_mlock: std::sync::atomic::AtomicBool,
     /// Cooperative cancel for in-flight confirm (prewarm waits). Set on IBD
     /// SIGINT teardown so the confirm OS thread aborts waits before process exit.
     confirm_cancel: std::sync::atomic::AtomicBool,
@@ -368,6 +370,7 @@ impl Query {
             tx_run: tx_run_builder::TxRunBuilder::new(&store_path),
             point_run: point_run_builder::PointRunBuilder::new(&store_path),
             ibd_utxo: Mutex::new(None),
+            ibd_utxo_mlock: std::sync::atomic::AtomicBool::new(false),
             confirm_cancel: std::sync::atomic::AtomicBool::new(false),
         };
         // Warm cache from durable head if present (resume with index on).

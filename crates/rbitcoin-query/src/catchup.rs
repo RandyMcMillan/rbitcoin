@@ -44,6 +44,20 @@ impl IndexMode {
 }
 
 impl Query {
+    /// Request light-UTXO mmap pin (`mlock`) for subsequent open/grow/rebuild.
+    ///
+    /// Call before [`Self::enter_catchup_mode`] / [`Self::enable_ibd_utxo`].
+    /// Node CLI: `--mlock-utxo`. No effect if UTXO already open (restart needed).
+    pub fn set_ibd_utxo_mlock(&self, mlock: bool) {
+        self.ibd_utxo_mlock
+            .store(mlock, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn ibd_utxo_mlock(&self) -> bool {
+        self.ibd_utxo_mlock
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Open/create mmap IBD UTXO under the store dir. Aligns with store tip via
     /// replay/rebuild so resume skips a full chain walk when meta matches.
     pub fn enable_ibd_utxo(&self) -> Result<(), QueryError> {
@@ -51,7 +65,8 @@ impl Query {
         if g.is_some() {
             return Ok(());
         }
-        let mut u = IbdUtxo::open_or_create(self.store.path())?;
+        let mlock = self.ibd_utxo_mlock();
+        let mut u = IbdUtxo::open_or_create_with_mlock(self.store.path(), mlock)?;
         let store_tip = self.tip_height().map(|h| h.0);
         // Empty live with a non-genesis tip is impossible (every height creates
         // ≥1 coinbase outpoint). Catches the pre-fix bug where multi-block
@@ -250,8 +265,10 @@ impl Query {
     /// Rebuild mmap UTXO by replaying confirmed chain (creates then spends per height).
     pub fn rebuild_ibd_utxo_to_tip(&self) -> Result<u64, QueryError> {
         let mut g = self.ibd_utxo.lock().unwrap();
+        let mlock = self.ibd_utxo_mlock();
         let u = g.get_or_insert_with(|| {
-            IbdUtxo::open_or_create(self.store.path()).expect("ibd utxo open")
+            IbdUtxo::open_or_create_with_mlock(self.store.path(), mlock)
+                .expect("ibd utxo open")
         });
         u.clear()?;
         let Some(tip) = self.tip_height() else {

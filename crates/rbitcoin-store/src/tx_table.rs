@@ -263,6 +263,65 @@ impl InputRecord {
         out
     }
 
+    /// Walk one input: return `(prev_txid, prev_index, bytes_consumed)` without
+    /// allocating `script_sig` / `witness` (prewarm parent discovery).
+    pub fn decode_prevout_at(buf: &[u8]) -> Result<([u8; 32], u32, usize), StoreError> {
+        if buf.is_empty() {
+            return Err(StoreError::Corrupt("short input record"));
+        }
+        let flags = buf[0];
+        let mut off = 1usize;
+        if flags & input_flags::LOCAL_PREV != 0 {
+            return Err(StoreError::Corrupt(
+                "input LOCAL_PREV removed; re-archive Class A (use external prev_txid)",
+            ));
+        }
+        let (prev_txid, prev_index) = if flags & input_flags::NULL_PREV != 0 {
+            ([0u8; 32], u32::MAX)
+        } else {
+            if buf.len() < off + 32 {
+                return Err(StoreError::Corrupt("input prev_txid truncated"));
+            }
+            let prev_txid: [u8; 32] = buf[off..off + 32].try_into().unwrap();
+            off += 32;
+            let (vout, n) = read_compact_size(&buf[off..])?;
+            off += n;
+            if vout > u64::from(u32::MAX) {
+                return Err(StoreError::Corrupt("prev_index too large"));
+            }
+            (prev_txid, vout as u32)
+        };
+        if flags & input_flags::SEQ_FINAL == 0 {
+            if buf.len() < off + 4 {
+                return Err(StoreError::Corrupt("input sequence truncated"));
+            }
+            off += 4;
+        }
+        if flags & input_flags::EMPTY_SCRIPT == 0 {
+            let (slen, n) = read_compact_size(&buf[off..])?;
+            off += n;
+            let slen = slen as usize;
+            if buf.len() < off + slen {
+                return Err(StoreError::Corrupt("input script truncated"));
+            }
+            off += slen;
+        }
+        if flags & input_flags::EMPTY_WITNESS == 0 {
+            let (nw, n) = read_compact_size(&buf[off..])?;
+            off += n;
+            for _ in 0..nw {
+                let (ilen, n) = read_compact_size(&buf[off..])?;
+                off += n;
+                let ilen = ilen as usize;
+                if buf.len() < off + ilen {
+                    return Err(StoreError::Corrupt("witness item truncated"));
+                }
+                off += ilen;
+            }
+        }
+        Ok((prev_txid, prev_index, off))
+    }
+
     /// Decode one input; returns (record, bytes_consumed).
     pub fn decode_at(buf: &[u8]) -> Result<(Self, usize), StoreError> {
         if buf.is_empty() {
@@ -442,6 +501,28 @@ pub fn decode_packed_tx(
     Ok((meta, inputs, outputs))
 }
 
+/// Packed meta + input prevouts only (skip scripts, witnesses, and outputs).
+pub fn scan_packed_meta_and_prevouts(
+    raw: &[u8],
+) -> Result<(TxRecord, Vec<([u8; 32], u32)>), StoreError> {
+    if raw.first().copied() != Some(PACKED_TX_V1) {
+        return Err(StoreError::Corrupt("not a packed Class A tx"));
+    }
+    if raw.len() < 1 + TxRecord::ENCODED_LEN {
+        return Err(StoreError::Corrupt("short packed Class A tx"));
+    }
+    let meta = TxRecord::decode(&raw[1..1 + TxRecord::ENCODED_LEN])?;
+    let mut off = 1 + TxRecord::ENCODED_LEN;
+    let mut prevouts = Vec::with_capacity(meta.input_count as usize);
+    for _ in 0..meta.input_count {
+        let (prev_txid, prev_index, used) = InputRecord::decode_prevout_at(&raw[off..])?;
+        off += used;
+        prevouts.push((prev_txid, prev_index));
+    }
+    let _ = off;
+    Ok((meta, prevouts))
+}
+
 /// Decode packed Class A **meta + outputs only** (skip allocating parent inputs).
 ///
 /// Same body IO as [`decode_packed_tx`]; cheaper CPU for prewarm parent loads
@@ -459,7 +540,7 @@ pub fn decode_packed_tx_outs_only(
     let mut off = 1 + TxRecord::ENCODED_LEN;
     // Walk inputs without keeping records (witness can be large).
     for _ in 0..meta.input_count {
-        let (_rec, used) = InputRecord::decode_at(&raw[off..])?;
+        let (_txid, _vout, used) = InputRecord::decode_prevout_at(&raw[off..])?;
         off += used;
     }
     let (outputs, out_used) = decode_output_run_prefix(&raw[off..], meta.output_count)?;
@@ -510,6 +591,33 @@ impl TxTable {
     /// Best-effort: drop `tx.body` page-cache for a written range (archive far lead).
     pub fn advise_body_dont_need(&self, offset: u64, len: u64) {
         self.body.advise_body_dont_need(offset, len);
+    }
+
+    /// Absolute `(offset, len)` of packed body for `fk`.
+    pub fn body_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
+        self.body.record_range(fk)
+    }
+
+    /// `mlock` pages covering the packed body for `fk`.
+    ///
+    /// Returns page-aligned `(page_start, page_len)` for later [`Self::munlock_body_pages`].
+    pub fn mlock_body(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
+        self.body.mlock_record(fk)
+    }
+
+    /// Best-effort `munlock` for a prior [`Self::mlock_body`] page range.
+    pub fn munlock_body_pages(&self, page_start: u64, page_len: u64) {
+        self.body.munlock_pages(page_start, page_len);
+    }
+
+    /// Meta + input prevouts only (no script/witness allocation, no outputs).
+    ///
+    /// Used by prewarm: discover parents after `mlock` without full parse into RAM.
+    pub fn get_meta_and_prevouts(
+        &self,
+        fk: Fk,
+    ) -> Result<(TxRecord, Vec<([u8; 32], u32)>), StoreError> {
+        self.body.with_raw(fk, |raw| scan_packed_meta_and_prevouts(raw))
     }
 
     pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {
@@ -809,6 +917,63 @@ impl TxTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_prevout_at_skips_script_and_witness() {
+        let rec = InputRecord {
+            prev_txid: [9u8; 32],
+            prev_index: 3,
+            sequence: 0xffff_fffe,
+            script_sig: vec![0xab; 40],
+            witness: vec![vec![0x30; 70], vec![0x21; 33]],
+        };
+        let enc = rec.encode();
+        let (txid, vout, used) = InputRecord::decode_prevout_at(&enc).unwrap();
+        assert_eq!(txid, [9u8; 32]);
+        assert_eq!(vout, 3);
+        assert_eq!(used, enc.len());
+        // Full decode still matches.
+        let (full, used2) = InputRecord::decode_at(&enc).unwrap();
+        assert_eq!(used2, used);
+        assert_eq!(full.script_sig.len(), 40);
+    }
+
+    #[test]
+    fn scan_packed_meta_and_prevouts_no_output_alloc() {
+        let tx = TxRecord {
+            txid: [7u8; 32],
+            version: 2,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 2,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let inputs = vec![
+            InputRecord {
+                prev_txid: [0u8; 32],
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0x01],
+                witness: vec![],
+            },
+            InputRecord {
+                prev_txid: [3u8; 32],
+                prev_index: 1,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![vec![0xaa]],
+            },
+        ];
+        let outputs = vec![OutputRecord::unspent(50, vec![0x51])];
+        let mut raw = Vec::new();
+        encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
+        let (meta, prevouts) = scan_packed_meta_and_prevouts(&raw).unwrap();
+        assert_eq!(meta.txid, [7u8; 32]);
+        assert_eq!(prevouts.len(), 2);
+        assert_eq!(prevouts[0], ([0u8; 32], u32::MAX));
+        assert_eq!(prevouts[1], ([3u8; 32], 1));
+    }
 
     #[test]
     fn input_witness_roundtrip() {

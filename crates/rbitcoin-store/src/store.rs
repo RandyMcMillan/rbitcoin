@@ -175,6 +175,24 @@ impl Store {
         self.txs.get_meta_and_outputs(fk)
     }
 
+    /// Prewarm: meta + input prevouts only (no script/output allocation).
+    pub fn get_tx_meta_and_prevouts(
+        &self,
+        fk: Fk,
+    ) -> Result<(TxRecord, Vec<([u8; 32], u32)>), StoreError> {
+        self.txs.get_meta_and_prevouts(fk)
+    }
+
+    /// `mlock` pages for a Class A body; returns page range for later munlock.
+    pub fn mlock_tx_body(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
+        self.txs.mlock_body(fk)
+    }
+
+    /// Best-effort `munlock` for a prior [`Self::mlock_tx_body`] page range.
+    pub fn munlock_tx_body_pages(&self, page_start: u64, page_len: u64) {
+        self.txs.munlock_body_pages(page_start, page_len);
+    }
+
     /// Append packed full-tx Class A rows (preferred archive path).
     pub fn put_tx_full_batch_indexed(
         &self,

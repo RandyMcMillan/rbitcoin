@@ -1,13 +1,13 @@
-//! Confirm-runway prewarm: **bodies first, then parents**.
+//! Confirm-runway prewarm: **mlock body pages**, minimal input walk for parents.
 //!
 //! For a batch of heights (ascending):
-//! 1. Load every full Class A body in the batch; register **all** creates so
-//!    same-batch / runway spends need no UTXO and no reservations.
-//! 2. Collect external parent needs; sort/dedup by create fk; load once each.
-//!    Stash per-tx **thin create-fk edges** so wave_fill does not re-walk inputs.
+//! 1. Resolve header → tx fks; `mlock` each Class A body; scan **prevouts only**
+//!    (no script/witness/output allocation) to discover parent creates.
+//! 2. Resolve external parent fks; `mlock` those parent bodies (no full parse).
+//! 3. Stash thin create-fk edges + `txid → fk` for runway creates; mark scanned.
 //!
-//! After prewarm, confirm should only **write** (Class C, light UTXO).
-//! Wave/wire rebuild prefer the body + thin-edge cache over store.
+//! Confirm wave/connect **full-parses** from the (now resident) store. This path
+//! exists so confirm wall time is not dominated by page faults on Class A.
 
 use super::*;
 use crate::confirm_parent_cache::{prewarm_headroom_from_env, StashedThinInput};
@@ -20,14 +20,13 @@ pub struct PrewarmStats {
     pub reserved: u32,
     pub creates_registered: u32,
     pub already_ready: u32,
-    /// Unique parent create fks loaded from store this call (after dedup).
+    /// Unique parent create fks mlocked this call (after dedup).
     pub parent_unique: u32,
-    /// Parent outs served from confirm_parents / same-batch body (no store).
+    /// Parent outs served from runway txid map / same-batch (no head probe).
     pub parent_cache_hits: u32,
-    /// `get_tx_full` calls for **block bodies** (phase 1).
+    /// Body txs mlocked + prevout-scanned (phase 1).
     pub body_tx_reads: u32,
-    /// Store parent loads (`get_tx_meta_and_outputs`) in phase 2 only.
-    /// (Historically double-counted body reads as `full_tx_reads` — fixed.)
+    /// Parent body mlocks (phase 2).
     pub full_tx_reads: u32,
     /// External parents that could not be resolved (should be 0 after phase 1).
     pub missing_parents: u32,
@@ -46,8 +45,7 @@ impl Query {
     /// Snapshot for IBD progress/perf:
     /// `(ready_through, ahead, parents, bodies, plans, depth)`.
     ///
-    /// Bodies = full Class A blocks cached for the runway (bodies-first prewarm).
-    /// Reservations are no longer used on the happy path.
+    /// Bodies = mlocked runway block txs (not fully parsed into RAM).
     pub fn parent_prewarm_perf_snapshot(&self) -> (u32, u32, usize, usize, usize, u32) {
         let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
         let through = self.confirm_parents.ready_through();
@@ -63,7 +61,10 @@ impl Query {
     }
 
     pub fn advance_parent_runway_tip(&self, tip: u32) {
-        self.confirm_parents.advance_tip(tip);
+        let unlocks = self.confirm_parents.advance_tip(tip);
+        for (page_start, page_len) in unlocks {
+            self.store.munlock_tx_body_pages(page_start, page_len);
+        }
     }
 
     pub fn seed_parent_runway(&self, items: &[(u32, [u8; 32])]) {
@@ -131,10 +132,10 @@ impl Query {
         Ok(())
     }
 
-    /// Prewarm a contiguous runway slice: **all bodies first**, then parents.
+    /// Prewarm a contiguous runway slice: **mlock bodies**, scan prevouts, mlock parents.
     ///
-    /// `items` must be height-ascending. No reservations: same-batch creates are
-    /// registered in phase 1; external parents load in phase 2 from UTXO/store.
+    /// `items` must be height-ascending. Does **not** fully parse txs into the
+    /// confirm parent cache — confirm wave/connect parse from store after mlock.
     ///
     /// Does **not** run tip GC (caller / confirm owns `advance_parent_runway_tip`).
     pub fn prewarm_parents_for_heights(
@@ -170,10 +171,9 @@ impl Query {
         }
         self.confirm_parents.ensure_plans(&work);
 
-        // ── Phase 1: resolve header → tx fks, then load bodies by **sorted fk** ─
-        // Sorting improves sequential locality in packed `tx.body` under archive load.
+        // ── Phase 1: resolve header → tx fks, mlock + prevout-scan bodies ────
         let mut height_tx_fks: Vec<(u32, Vec<Fk>)> = Vec::with_capacity(work.len());
-        let mut all_body_fks: Vec<u64> = Vec::new();
+        let mut all_body_fks: Vec<(u32, u64)> = Vec::new(); // (height, fk)
         for &(height, hash) in &work {
             if self.confirm_cancelled() {
                 crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
@@ -182,8 +182,6 @@ impl Query {
             let Some((header_fk, _)) = self.get_header_by_hash(&hash)? else {
                 continue;
             };
-            // Do not prewarm until Class A body exists. In Direct mode archive
-            // co-writes `tx.head` with the body — wait for both before loading.
             if !self.store.header_txs.has_body(header_fk)? {
                 continue;
             }
@@ -193,8 +191,6 @@ impl Query {
             if tx_fks.is_empty() {
                 continue;
             }
-            // Direct/tip with tx index: require first tx visible in head so parent
-            // resolve never races an in-flight archive without head upserts.
             if self.tx_index_enabled() {
                 if let Some(&first) = tx_fks.first() {
                     let meta = self.store.get_tx(first)?;
@@ -206,32 +202,63 @@ impl Query {
             st.blocks = st.blocks.saturating_add(1);
             for fk in &tx_fks {
                 if let Some(id) = fk.get() {
-                    all_body_fks.push(id);
+                    all_body_fks.push((height, id));
                 }
             }
             height_tx_fks.push((height, tx_fks));
         }
 
-        all_body_fks.sort_unstable();
-        all_body_fks.dedup();
-        // Load once; walk phase-2 from this map (no clone), then move into cache.
-        let mut body_by_fk: HashMap<u64, (TxRecord, Vec<OutputRecord>, Vec<InputRecord>)> =
+        // Sort by fk for sequential body locality under archive load.
+        all_body_fks.sort_unstable_by_key(|(_, id)| *id);
+        all_body_fks.dedup_by_key(|(_, id)| *id);
+
+        // fk → (txid, prevouts)
+        let mut body_prevouts: HashMap<u64, ([u8; 32], Vec<([u8; 32], u32)>)> =
             HashMap::with_capacity(all_body_fks.len());
-        for id in all_body_fks {
+        let mut mlock_notes: Vec<(Fk, u64, u64, Option<u32>, u32)> = Vec::new();
+        let mut create_regs: Vec<(Fk, [u8; 32], u32)> = Vec::new();
+
+        // height for each body fk (for mlock note)
+        let mut body_height: HashMap<u64, u32> = HashMap::with_capacity(all_body_fks.len());
+        for (height, tx_fks) in &height_tx_fks {
+            for fk in tx_fks {
+                if let Some(id) = fk.get() {
+                    body_height.insert(id, *height);
+                }
+            }
+        }
+
+        for &(_h, id) in &all_body_fks {
             if self.confirm_cancelled() {
                 crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Corrupt("confirm cancelled"));
             }
-            let (tx, inputs, outs) = self.store.get_tx_full(Fk(id))?;
+            let fk = Fk(id);
+            let height = body_height.get(&id).copied().unwrap_or(0);
+            // mlock pages first so the subsequent mmap walk does not soft-fault.
+            match self.store.mlock_tx_body(fk) {
+                Ok((page_start, page_len)) => {
+                    mlock_notes.push((fk, page_start, page_len, Some(height), height));
+                }
+                Err(e) => {
+                    // Soft-fail: still scan (may page-fault); log once per batch via stats.
+                    rbitcoin_log::trace!("prewarm: mlock body fk={id} failed: {e}");
+                }
+            }
+            let (meta, prevouts) = self.store.get_tx_meta_and_prevouts(fk)?;
             st.body_tx_reads = st.body_tx_reads.saturating_add(1);
-            body_by_fk.insert(id, (tx, outs, inputs));
+            create_regs.push((fk, meta.txid, height));
+            body_prevouts.insert(id, (meta.txid, prevouts));
+            st.creates_registered = st.creates_registered.saturating_add(1);
         }
 
-        // ── Phase 2 (before put): thin edges + parent needs from loaded bodies ─
-        // Avoids triple-cloning every script into cache intermediate Vecs.
-        let mut need_load: Vec<(u64, u32)> = Vec::new();
-        let mut need_put: Vec<(u32, Fk, u32)> = Vec::new();
-        let mut parent_puts: Vec<(u32, Fk, TxRecord, u32, OutputRecord)> = Vec::new();
+        // Publish create map early so same-batch parents resolve while we walk.
+        self.confirm_parents
+            .register_mlocked_creates_batch(&create_regs);
+        self.confirm_parents.note_mlocks_batch(&mlock_notes);
+
+        // ── Phase 2: thin edges + mlock external parents ─────────────────────
+        let mut need_parent: Vec<(u32, u64)> = Vec::new(); // (spend_height, parent_fk)
         let mut thin_by_spend: HashMap<u64, Vec<StashedThinInput>> = HashMap::new();
         let catchup = self.ibd_utxo_enabled();
 
@@ -239,87 +266,82 @@ impl Query {
         let mut batch_creates: HashMap<[u8; 32], Fk> = HashMap::new();
 
         for (height, tx_fks) in &height_tx_fks {
-            // Register this block's creates for later spends in the bite.
             for fk in tx_fks {
                 let Some(id) = fk.get() else {
                     continue;
                 };
-                if let Some((tx, _, _)) = body_by_fk.get(&id) {
-                    batch_creates.insert(tx.txid, *fk);
+                if let Some((txid, _)) = body_prevouts.get(&id) {
+                    batch_creates.insert(*txid, *fk);
                 }
             }
             for fk in tx_fks {
                 let Some(id) = fk.get() else {
                     continue;
                 };
-                let Some((_tx, _outs, inputs)) = body_by_fk.get(&id) else {
+                let Some((_txid, prevouts)) = body_prevouts.get(&id) else {
                     continue;
                 };
-                let mut edges: Vec<StashedThinInput> = Vec::with_capacity(inputs.len());
-                for inp in inputs {
-                    if inp.is_coinbase() {
+                let mut edges: Vec<StashedThinInput> = Vec::with_capacity(prevouts.len());
+                for &(prev_txid, prev_index) in prevouts {
+                    if prev_txid == [0u8; 32] && prev_index == u32::MAX {
                         edges.push(StashedThinInput {
                             create_fk: None,
-                            prev_index: inp.prev_index,
+                            prev_index,
                         });
                         continue;
                     }
                     // Same-bite create (this or earlier height in batch).
-                    if let Some(&cfk) = batch_creates.get(&inp.prev_txid) {
+                    if let Some(&cfk) = batch_creates.get(&prev_txid) {
                         edges.push(StashedThinInput {
                             create_fk: cfk.get(),
-                            prev_index: inp.prev_index,
+                            prev_index,
                         });
                         st.utxo_parents = st.utxo_parents.saturating_add(1);
                         st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                         continue;
                     }
-                    // Earlier runway body / sparse external parent (one lock).
+                    // Earlier runway / mlocked create.
                     if let Some(cfk) = self
                         .confirm_parents
-                        .get_by_txid_if_out(&inp.prev_txid, inp.prev_index)
+                        .get_by_txid_if_out(&prev_txid, prev_index)
                     {
                         edges.push(StashedThinInput {
                             create_fk: cfk.get(),
-                            prev_index: inp.prev_index,
+                            prev_index,
                         });
                         st.utxo_parents = st.utxo_parents.saturating_add(1);
                         st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                         continue;
                     }
-                    // Live UTXO parent (create_fk present ⇒ unspent). No spent check.
-                    if let Some(create_fk) =
-                        self.ibd_utxo_create_fk(&inp.prev_txid, inp.prev_index)?
-                    {
+                    // Live UTXO parent (catch-up mode).
+                    if let Some(create_fk) = self.ibd_utxo_create_fk(&prev_txid, prev_index)? {
                         edges.push(StashedThinInput {
                             create_fk: create_fk.get(),
-                            prev_index: inp.prev_index,
+                            prev_index,
                         });
-                        if let Some(id) = create_fk.get() {
-                            need_load.push((id, inp.prev_index));
-                            need_put.push((*height, create_fk, inp.prev_index));
+                        if let Some(pid) = create_fk.get() {
+                            need_parent.push((*height, pid));
                         }
                         continue;
                     }
-                    // Durable head: may be spent — skip Class A load when spent.
-                    if let Some(create_fk) = self.tx_fk_by_txid(&inp.prev_txid).ok().flatten() {
+                    // Durable head.
+                    if let Some(create_fk) = self.tx_fk_by_txid(&prev_txid).ok().flatten() {
                         edges.push(StashedThinInput {
                             create_fk: create_fk.get(),
-                            prev_index: inp.prev_index,
+                            prev_index,
                         });
-                        if catchup && self.catchup_is_spent(&inp.prev_txid, inp.prev_index)? {
+                        if catchup && self.catchup_is_spent(&prev_txid, prev_index)? {
                             st.utxo_parents = st.utxo_parents.saturating_add(1);
                             continue;
                         }
-                        if let Some(id) = create_fk.get() {
-                            need_load.push((id, inp.prev_index));
-                            need_put.push((*height, create_fk, inp.prev_index));
+                        if let Some(pid) = create_fk.get() {
+                            need_parent.push((*height, pid));
                         }
                         continue;
                     }
                     edges.push(StashedThinInput {
                         create_fk: None,
-                        prev_index: inp.prev_index,
+                        prev_index,
                     });
                     st.missing_parents = st.missing_parents.saturating_add(1);
                 }
@@ -327,58 +349,41 @@ impl Query {
             }
         }
 
-        need_load.sort_unstable();
-        need_load.dedup();
-        let mut uniq_fks: Vec<u64> = need_load.iter().map(|(f, _)| *f).collect();
-        uniq_fks.sort_unstable();
-        uniq_fks.dedup();
-        st.parent_unique = st.parent_unique.saturating_add(uniq_fks.len() as u32);
+        need_parent.sort_unstable();
+        need_parent.dedup();
+        let mut uniq_parents: Vec<u64> = need_parent.iter().map(|(_, p)| *p).collect();
+        uniq_parents.sort_unstable();
+        uniq_parents.dedup();
+        st.parent_unique = st.parent_unique.saturating_add(uniq_parents.len() as u32);
 
-        // Sequential parent meta+outs (sorted fks). No rayon — mmap thrash under writer.
-        let mut loaded: HashMap<u64, (TxRecord, Vec<OutputRecord>)> =
-            HashMap::with_capacity(uniq_fks.len());
-        for fk_id in uniq_fks {
+        // Map parent fk → one need height (for mlock tracking GC).
+        let mut parent_need_h: HashMap<u64, u32> = HashMap::with_capacity(uniq_parents.len());
+        for &(h, pid) in &need_parent {
+            parent_need_h.entry(pid).or_insert(h);
+        }
+
+        let mut parent_mlock_notes: Vec<(Fk, u64, u64, Option<u32>, u32)> = Vec::new();
+        for pid in uniq_parents {
             if self.confirm_cancelled() {
                 crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Corrupt("confirm cancelled"));
             }
-            let (ptx, outs) = self.store.get_tx_meta_and_outputs(Fk(fk_id))?;
-            st.full_tx_reads = st.full_tx_reads.saturating_add(1);
-            loaded.insert(fk_id, (ptx, outs));
-        }
-
-        for &(height, create_fk, vout) in &need_put {
-            let Some(id) = create_fk.get() else {
-                continue;
-            };
-            let Some((ptx, outs)) = loaded.get(&id) else {
-                continue;
-            };
-            let Some(o) = outs.get(vout as usize) else {
-                return Err(StoreError::NotFound);
-            };
-            parent_puts.push((height, create_fk, ptx.clone(), vout, o.clone()));
-            st.utxo_parents = st.utxo_parents.saturating_add(1);
-        }
-
-        // ── Phase 1 finish: move bodies into runway (one lock) ──────────────
-        let mut body_puts: Vec<(Fk, u32, TxRecord, Vec<OutputRecord>, Vec<InputRecord>)> =
-            Vec::with_capacity(body_by_fk.len());
-        for (height, tx_fks) in height_tx_fks {
-            for fk in tx_fks {
-                let Some(id) = fk.get() else {
-                    continue;
-                };
-                let Some((tx, outs, inputs)) = body_by_fk.remove(&id) else {
-                    continue;
-                };
-                body_puts.push((fk, height, tx, outs, inputs));
-                st.creates_registered = st.creates_registered.saturating_add(1);
+            let fk = Fk(pid);
+            let need_h = parent_need_h.get(&pid).copied().unwrap_or(0);
+            match self.store.mlock_tx_body(fk) {
+                Ok((page_start, page_len)) => {
+                    parent_mlock_notes.push((fk, page_start, page_len, None, need_h));
+                    st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+                    st.utxo_parents = st.utxo_parents.saturating_add(1);
+                }
+                Err(e) => {
+                    rbitcoin_log::trace!("prewarm: mlock parent fk={pid} failed: {e}");
+                    // Still count as attempted parent pin; confirm may fault.
+                    st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+                }
             }
         }
-        self.confirm_parents.put_bodies_batch(body_puts);
-
-        self.confirm_parents.put_utxo_parents_batch(&parent_puts);
+        self.confirm_parents.note_mlocks_batch(&parent_mlock_notes);
 
         let thin_items: Vec<(Fk, Vec<StashedThinInput>)> = thin_by_spend
             .into_iter()
@@ -386,7 +391,7 @@ impl Query {
             .collect();
         self.confirm_parents.put_thin_inputs_batch(thin_items);
 
-        // ── Phase 3: mark scanned (one ready_through recompute) ─────────────
+        // ── Phase 3: mark scanned ────────────────────────────────────────────
         let scanned: Vec<u32> = work.iter().map(|(h, _)| *h).collect();
         self.confirm_parents.mark_scanned_many(&scanned);
 
@@ -409,14 +414,9 @@ impl Query {
 
     /// Drop spent outs from the confirm parent runway after Class C.
     ///
-    /// **Catch-up (light UTXO on):** no-op. Spentness for the next wave is
-    /// decided by [`Query::catchup_is_spent`], not by zeroing cache slots.
-    /// Skipping avoids O(spends) UTXO/head probes that dominated confirm wall
-    /// (~50–60% in mainnet logs). Runway RAM stays bounded by tip advance
-    /// (drop plans/bodies + parent GC).
-    ///
-    /// **Tip-follow / index mode:** cheap path only — retire outs already
-    /// present in the runway (`by_txid`). No UTXO or durable-head lookup.
+    /// **Catch-up (light UTXO on):** no-op.
+    /// **Direct / tip:** retire sparse parsed parent outs if present; mlocked
+    /// parents stay until tip GC (`advance_parent_runway_tip`).
     pub fn unpin_spent_parent_outs(
         &self,
         spends: &[([u8; 32], u32)],
@@ -424,12 +424,9 @@ impl Query {
         if spends.is_empty() {
             return Ok(());
         }
-        // IBD catch-up: wave_fill filters parent slots with catchup_is_spent;
-        // connect hits the wave. Cache hygiene is tip GC, not per-spend UTXO.
         if self.ibd_utxo_enabled() {
             return Ok(());
         }
-        // Tip-follow: only touch parents already pinned on the runway.
         let mut resolved: Vec<(Fk, u32)> = Vec::with_capacity(spends.len());
         for &(txid, vout) in spends {
             if let Some(fk) = self.confirm_parents.get_by_txid(&txid) {

@@ -305,6 +305,109 @@ impl TableFile {
         Ok(())
     }
 
+    /// Walk a byte range under the mmap lock without copying (caller must not
+    /// hold other table locks that could deadlock).
+    pub fn with_bytes<R>(
+        &self,
+        offset: u64,
+        len: u64,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R, StoreError> {
+        let end = offset.saturating_add(len);
+        let logical = *self.len.lock().unwrap();
+        if end > logical {
+            return Err(StoreError::Corrupt("with_bytes past logical end"));
+        }
+        let map = self.map.lock().unwrap();
+        if end as usize > map.len() {
+            return Err(StoreError::Corrupt("with_bytes past map end"));
+        }
+        Ok(f(&map[offset as usize..end as usize]))
+    }
+
+    /// `mlock` page-aligned coverage of `[offset, offset+len)`.
+    ///
+    /// Expands to whole pages so subsequent reads never soft-fault. Requires a
+    /// sufficient `RLIMIT_MEMLOCK` (see [`ensure_memlock_budget`]). Returns the
+    /// locked page range `(page_start, page_len)` for later [`munlock_range`].
+    /// Empty range is a no-op (`0, 0`).
+    pub fn mlock_range(&self, offset: u64, len: u64) -> Result<(u64, u64), StoreError> {
+        if len == 0 {
+            return Ok((0, 0));
+        }
+        #[cfg(unix)]
+        {
+            let page = page_size() as u64;
+            if page == 0 {
+                return Ok((0, 0));
+            }
+            let end = offset.saturating_add(len);
+            let start_pg = offset & !(page - 1);
+            let end_pg = end.saturating_add(page - 1) & !(page - 1);
+            let map = self.map.lock().unwrap();
+            let map_len = map.len() as u64;
+            if start_pg >= map_len {
+                return Ok((0, 0));
+            }
+            let lock_end = end_pg.min(map_len);
+            let lock_len = lock_end.saturating_sub(start_pg);
+            if lock_len == 0 {
+                return Ok((0, 0));
+            }
+            // SAFETY: range is within the live mmap; mlock faults pages in.
+            let ptr = unsafe { map.as_ptr().add(start_pg as usize) } as *const libc::c_void;
+            let rc = unsafe { libc::mlock(ptr, lock_len as usize) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                rbitcoin_log::warn!(
+                    "store: mlock failed path={} off={start_pg} len={lock_len}: {err} \
+                     (raise RLIMIT_MEMLOCK / LimitMEMLOCK; soft budget may be exhausted)",
+                    self.path.display()
+                );
+                return Err(StoreError::io(&self.path, err));
+            }
+            return Ok((start_pg, lock_len));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (offset, len);
+            Ok((0, 0))
+        }
+    }
+
+    /// Best-effort `munlock` for a prior [`mlock_range`] page range.
+    pub fn munlock_range(&self, page_start: u64, page_len: u64) {
+        if page_len == 0 {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let map = self.map.lock().unwrap();
+            let map_len = map.len() as u64;
+            if page_start >= map_len {
+                return;
+            }
+            let unlock_len = page_len.min(map_len.saturating_sub(page_start)) as usize;
+            if unlock_len == 0 {
+                return;
+            }
+            // SAFETY: range was previously mlocked within this map (best-effort).
+            let ptr = unsafe { map.as_ptr().add(page_start as usize) } as *const libc::c_void;
+            let rc = unsafe { libc::munlock(ptr, unlock_len) };
+            if rc != 0 {
+                rbitcoin_log::trace!(
+                    "store: munlock failed path={} off={page_start} len={unlock_len}: {}",
+                    self.path.display(),
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (page_start, page_len);
+        }
+    }
+
     /// Best-effort: tell the kernel we do not need `[offset, offset+len)` in the
     /// page cache soon (archive far ahead of confirm/prewarm).
     ///
@@ -312,6 +415,8 @@ impl TableFile {
     /// `madvise(MADV_DONTNEED)` only on **whole pages strictly inside** the range
     /// so we do not drop a partial page that still holds an older live record.
     /// No-op on empty range / non-Linux / syscall failure (never fails the caller).
+    ///
+    /// **Does not** drop mlocked pages (kernel keeps them resident).
     pub fn advise_dont_need(&self, offset: u64, len: u64) {
         if len == 0 {
             return;
@@ -378,7 +483,7 @@ impl TableFile {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn page_size() -> usize {
     // SAFETY: sysconf is thread-safe for _SC_PAGESIZE.
     let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -387,6 +492,11 @@ fn page_size() -> usize {
     } else {
         4096
     }
+}
+
+#[cfg(not(unix))]
+fn page_size() -> usize {
+    4096
 }
 
 #[cfg(test)]
@@ -411,6 +521,38 @@ mod advise_tests {
         f.read_at(FILE_HEADER_LEN as u64, &mut buf).unwrap();
         assert_eq!(buf, payload);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mlock_range_roundtrip_or_soft_fail() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("rbitcoin-mlock-{id}"));
+        let _ = std::fs::remove_file(&path);
+        let f = TableFile::create(&path, TableKind::Tx).unwrap();
+        let payload = vec![0xcd_u8; 8 * 1024];
+        f.write_at(FILE_HEADER_LEN as u64, &payload).unwrap();
+        // Soft MEMLOCK may be 8 MiB (or less) in CI — success or clear error only.
+        match f.mlock_range(FILE_HEADER_LEN as u64, payload.len() as u64) {
+            Ok((start, len)) => {
+                assert!(len > 0 || payload.is_empty());
+                f.munlock_range(start, len);
+            }
+            Err(_) => {
+                // RLIMIT_MEMLOCK exhausted / unsupported — still a valid outcome.
+            }
+        }
+        let mut buf = vec![0u8; payload.len()];
+        f.read_at(FILE_HEADER_LEN as u64, &mut buf).unwrap();
+        assert_eq!(buf, payload);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ensure_memlock_budget_is_callable() {
+        let (soft, hard) = ensure_memlock_budget();
+        // Soft should be ≤ hard (or both infinite).
+        let _ = (soft, hard);
     }
 }
 
@@ -454,6 +596,76 @@ pub fn try_set_io_best_effort() {
 /// Default Linux soft `nofile` is often 1024 — too low. We raise the **soft**
 /// limit up to the **hard** limit (no root required for that).
 pub const NOFILE_SOFT_TARGET: u64 = 16_384;
+
+/// Raise `RLIMIT_MEMLOCK` soft limit to the hard limit (no root required for that).
+///
+/// Confirm prewarm `mlock`s Class A body pages so wave/connect do not soft-fault.
+/// Default Linux hard memlock is often **8 MiB** — raise the **hard** limit via
+/// NixOS `security.pam.loginLimits` / systemd `LimitMEMLOCK=` (e.g. 8 GiB) so this
+/// can actually take effect. Returns `(soft, hard)` bytes after the attempt
+/// (`u64::MAX` means unlimited / infinity).
+pub fn ensure_memlock_budget() -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        let mut rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit with valid rlimit pointer.
+        if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rlim) } != 0 {
+            rbitcoin_log::warn!(
+                "store: getrlimit(MEMLOCK) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return (0, 0);
+        }
+        let hard = rlim.rlim_max as u64;
+        let soft = rlim.rlim_cur as u64;
+        let inf = libc::RLIM_INFINITY as u64;
+        let hard_is_inf = rlim.rlim_max == libc::RLIM_INFINITY || hard == u64::MAX || hard == inf;
+        let soft_is_inf = rlim.rlim_cur == libc::RLIM_INFINITY || soft == u64::MAX || soft == inf;
+        if soft_is_inf || soft == hard {
+            if !soft_is_inf && soft < 64 * 1024 * 1024 {
+                rbitcoin_log::warn!(
+                    "store: RLIMIT_MEMLOCK soft=hard={soft} bytes (~{} MiB); \
+                     prewarm mlock may fail — raise hard LimitMEMLOCK (e.g. 8G)",
+                    soft / (1024 * 1024)
+                );
+            } else {
+                rbitcoin_log::debug!(
+                    "store: RLIMIT_MEMLOCK soft={soft} hard={hard} (already at hard)"
+                );
+            }
+            return (soft, hard);
+        }
+        // Raise soft to hard (hard may be infinity).
+        rlim.rlim_cur = rlim.rlim_max;
+        // SAFETY: setrlimit soft ≤ hard.
+        if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) } != 0 {
+            rbitcoin_log::warn!(
+                "store: setrlimit(MEMLOCK) soft {soft}→{hard} failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return (soft, hard);
+        }
+        let new_soft = rlim.rlim_cur as u64;
+        rbitcoin_log::info!(
+            "store: raised RLIMIT_MEMLOCK soft {soft}→{new_soft} (hard={hard})"
+        );
+        if !hard_is_inf && hard < 64 * 1024 * 1024 {
+            rbitcoin_log::warn!(
+                "store: RLIMIT_MEMLOCK hard={hard} bytes (~{} MiB) is low for body mlock; \
+                 set hard LimitMEMLOCK=8G (NixOS loginLimits / systemd)",
+                hard / (1024 * 1024)
+            );
+        }
+        return (new_soft, hard);
+    }
+    #[cfg(not(unix))]
+    {
+        (0, 0)
+    }
+}
 
 /// Raise `RLIMIT_NOFILE` soft limit toward [`NOFILE_SOFT_TARGET`] (capped by hard).
 ///

@@ -30,8 +30,8 @@ mod var_table;
 pub use epoch::ArchiveEpoch;
 pub use error::StoreError;
 pub use file::{
-    ensure_nofile_budget, ensure_nofile_budget_at_least, try_set_io_best_effort, try_set_io_idle,
-    NOFILE_SOFT_TARGET,
+    ensure_memlock_budget, ensure_nofile_budget, ensure_nofile_budget_at_least,
+    try_set_io_best_effort, try_set_io_idle, NOFILE_SOFT_TARGET,
 };
 pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush};
 pub use address_head::{bits_for_scale, AddressHead, MAINNET_BITS, TINY_BITS};
@@ -52,7 +52,8 @@ pub use sorted_run::{
 };
 pub use store::Store;
 pub use tx_table::{
-    encode_packed_tx, is_packed_tx_payload, InputRecord, OutputRecord, TxRecord, PACKED_TX_V1,
+    encode_packed_tx, is_packed_tx_payload, scan_packed_meta_and_prevouts, InputRecord,
+    OutputRecord, TxRecord, PACKED_TX_V1,
 };
 
 /// Crate identity for diagnostics and coverage scenarios.

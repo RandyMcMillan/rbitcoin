@@ -243,6 +243,11 @@ where
     if soft > 0 {
         rbitcoin_log::debug!("node: RLIMIT_NOFILE soft={soft} hard={hard}");
     }
+    // Prewarm mlocks Class A body pages — raise soft MEMLOCK to hard (e.g. 8 GiB).
+    let (ml_soft, ml_hard) = rbitcoin_store::ensure_memlock_budget();
+    if ml_soft > 0 {
+        rbitcoin_log::debug!("node: RLIMIT_MEMLOCK soft={ml_soft} hard={ml_hard}");
+    }
 
     let mut config = NodeConfig::default()
         .with_datadir(datadir)

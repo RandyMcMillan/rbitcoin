@@ -1224,8 +1224,7 @@ fn confirm_batch_create_and_spend_parent_same_run() {
 
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
-    q.set_spend_index(false);
-    q.set_tx_index(false);
+    q.enter_catchup_mode().unwrap();
     q.enable_ibd_utxo().unwrap();
     let ms = Milestone::NONE;
     let params = ChainParams::regtest();
@@ -1269,8 +1268,8 @@ fn confirm_batch_create_and_spend_parent_same_run() {
     accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     run.push((Height(spend_h), b_spend.block_hash().to_byte_array()));
 
-    // Prewarm the run: spend height may still hold an open reserve for the
-    // in-batch create; that must not make the height unready.
+    // Prewarm the run: mlock bodies + prevout scan; same-batch create must not
+    // leave the spend height unready.
     let items: Vec<(u32, [u8; 32])> = run.iter().map(|(h, hash)| (h.0, *hash)).collect();
     q.prewarm_parents_for_heights(&items).unwrap();
     let heights: Vec<u32> = items.iter().map(|(h, _)| *h).collect();
@@ -1307,8 +1306,7 @@ fn confirm_spend_both_vouts_of_one_input_parent() {
 
     let td = TestDatadir::new().unwrap();
     let q = Query::open_or_create(td.store_path()).unwrap();
-    q.set_spend_index(false);
-    q.set_tx_index(false);
+    q.enter_catchup_mode().unwrap();
     q.enable_ibd_utxo().unwrap();
     let ms = Milestone::NONE;
     let params = ChainParams::regtest();

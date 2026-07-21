@@ -68,6 +68,39 @@ impl VarTable {
         self.body.advise_dont_need(offset, len);
     }
 
+    /// Absolute `(offset, len)` of the unframed payload for `fk`.
+    pub fn record_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
+        let id = fk.get().ok_or(StoreError::InvalidFk)?;
+        let count = *self.count.lock().unwrap();
+        let start = self.record_start(id, count)?;
+        let end = self.record_end(id, count)?;
+        if end < start {
+            return Err(StoreError::Corrupt("var record end < start"));
+        }
+        Ok((start, end - start))
+    }
+
+    /// `mlock` the body pages covering `fk`. Returns page-aligned `(start, len)`.
+    pub fn mlock_record(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
+        let (off, len) = self.record_range(fk)?;
+        self.body.mlock_range(off, len)
+    }
+
+    /// Best-effort `munlock` for a prior [`mlock_record`] page range.
+    pub fn munlock_pages(&self, page_start: u64, page_len: u64) {
+        self.body.munlock_range(page_start, page_len);
+    }
+
+    /// Inspect record bytes without copying into a `Vec`.
+    pub fn with_raw<R>(
+        &self,
+        fk: Fk,
+        f: impl FnOnce(&[u8]) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        let (off, len) = self.record_range(fk)?;
+        self.body.with_bytes(off, len, f).and_then(|r| r)
+    }
+
     /// Pre-grow body (+ idx) capacity so a following mega `put_batch` does not
     /// remap mid-write.
     pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {

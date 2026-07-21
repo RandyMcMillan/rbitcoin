@@ -1,22 +1,16 @@
-//! Block-structured **confirm parent cache** (replaces generic Class A cache).
+//! Block-structured **confirm parent runway** (replaces generic Class A cache).
 //!
-//! Holds only prevouts we know confirm will need for heights in
-//! `(tip, tip+depth]`. Depth is tunable (`RBITCOIN_PARENT_PREWARM_DEPTH`);
-//! there is **no byte budget** — the horizon is the only bound.
+//! Prewarm **mlocks** Class A body pages for heights in `(tip, tip+depth]` and
+//! their external parents; it does **not** fully parse txs into RAM. Confirm
+//! wave/connect full-parse from the (now resident) store mappings.
 //!
-//! - **UTXO-backed** parents are loaded from store during prewarm.
-//! - **Not-in-UTXO** parents get a **reserved** hole (create is in a not-yet-
-//!   confirmed runway block); filled when that block's creates are registered.
-//! - **Runway creates** register `txid → fk` and fill any **existing** reserve
-//!   waiters from the body outs we already hold. We do **not** cache every
-//!   output of every runway create (that thrashed disk/RAM on mainnet). Later
-//!   spends resolve via `by_txid` + one store load, or same-wave at confirm.
-//! - A height is **ready** once its body has been **scanned**. Open
-//!   **reservations do not block readiness**: a multi-block confirm batch may
-//!   create a parent at height C and spend it at S in the same run; S reserves
-//!   (create not in UTXO yet) and wave/connect resolve the prevout from the
-//!   same-wave body or runway cache. Requiring `reserved.is_empty()` would
-//!   deadlock tip advance whenever a batch creates and consumes a parent.
+//! - **Runway creates** register `txid → fk` (meta only) so same-batch spends
+//!   resolve without head probes.
+//! - **Thin input edges** (create_fk + vout) are stashed per spend tx after a
+//!   lightweight input prevout walk.
+//! - Optional full [`BodyEntry`] / [`ParentEntry`] paths remain for tests and
+//!   legacy callers; IBD prewarm no longer fills them.
+//! - A height is **ready** once its body has been **scanned** (mlocked + edges).
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
@@ -115,6 +109,18 @@ impl HeightPlan {
     }
 }
 
+/// One mlocked Class A body (page-aligned range from `mlock`).
+struct MlockRec {
+    /// Runway height for block bodies; `None` for external parents.
+    body_height: Option<u32>,
+    /// Heights whose prewarm still needs this parent mlock.
+    need_heights: HashSet<u32>,
+    page_start: u64,
+    page_len: u64,
+    start_page: u64,
+    end_page: u64, // exclusive page index
+}
+
 struct Inner {
     depth: u32,
     /// Highest confirmed tip we have pruned to.
@@ -124,14 +130,20 @@ struct Inner {
     ready_through: u32,
     /// height → plan
     plans: BTreeMap<u32, HeightPlan>,
-    /// Parent bodies keyed by create fk id.
+    /// Parent bodies keyed by create fk id (optional; tests / legacy).
     by_fk: HashMap<u64, ParentEntry>,
-    /// Full runway block bodies by tx fk (phase-1 prewarm).
+    /// Full runway block bodies by tx fk (optional; tests / legacy).
     by_body: HashMap<u64, BodyEntry>,
+    /// Thin edges without a full body parse (mlock prewarm).
+    thin_edges: HashMap<u64, Vec<StashedThinInput>>,
     /// create txid → fk (runway creates + loaded parents).
     by_txid: HashMap<[u8; 32], u64>,
     /// Reserved (txid, vout) → set of heights waiting (legacy; unused by new prewarm).
     reserve_waiters: HashMap<([u8; 32], u32), HashSet<u32>>,
+    /// fk → mlocked body page range (prewarm).
+    mlocked: HashMap<u64, MlockRec>,
+    /// page index → refcount (shared pages between adjacent records).
+    page_refs: HashMap<u64, u32>,
 }
 
 /// Process-local confirm parent runway.
@@ -153,8 +165,11 @@ impl ConfirmParentCache {
                 plans: BTreeMap::new(),
                 by_fk: HashMap::new(),
                 by_body: HashMap::new(),
+                thin_edges: HashMap::new(),
                 by_txid: HashMap::new(),
                 reserve_waiters: HashMap::new(),
+                mlocked: HashMap::new(),
+                page_refs: HashMap::new(),
             }),
             depth: AtomicU32::new(depth),
             ready_through: AtomicU32::new(0),
@@ -181,7 +196,9 @@ impl ConfirmParentCache {
     }
 
     /// Advance tip: drop plans at/below tip; drop parents/bodies only needed there.
-    pub fn advance_tip(&self, tip: u32) {
+    ///
+    /// Returns page ranges whose refcount hit zero (caller should `munlock`).
+    pub fn advance_tip(&self, tip: u32) -> Vec<(u64, u64)> {
         let mut g = self.inner.lock().unwrap();
         g.tip = tip;
         if g.ready_through < tip {
@@ -207,11 +224,88 @@ impl ConfirmParentCache {
             g.plans.remove(&h);
         }
         // One body retain + one parent GC (was double-scanned every batch).
-        g.by_body.retain(|_, b| b.height > tip && b.height <= max_h);
+        let mut drop_body_fks: Vec<u64> = Vec::new();
+        g.by_body.retain(|id, b| {
+            let keep = b.height > tip && b.height <= max_h;
+            if !keep {
+                drop_body_fks.push(*id);
+            }
+            keep
+        });
+        for id in &drop_body_fks {
+            g.thin_edges.remove(id);
+        }
         g.gc_orphaned_parents();
+        let unlocks = g.gc_mlocks(tip, max_h);
         g.recompute_ready_through();
         self.ready_through
             .store(g.ready_through, Ordering::Relaxed);
+        unlocks
+    }
+
+    /// Register a runway create after mlock (txid → fk only; no full body).
+    pub fn register_mlocked_create(&self, fk: Fk, txid: [u8; 32], height: u32) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        let mut g = self.inner.lock().unwrap();
+        g.by_txid.insert(txid, id);
+        let _ = height;
+    }
+
+    /// Track a successful `mlock` of Class A body pages for a runway tx or parent.
+    ///
+    /// `body_height = Some(h)` for block bodies at height `h`; `None` for external
+    /// parents (then `need_height` is the spending height that needs the parent).
+    pub fn note_mlock(
+        &self,
+        fk: Fk,
+        page_start: u64,
+        page_len: u64,
+        body_height: Option<u32>,
+        need_height: u32,
+    ) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        if page_len == 0 {
+            return;
+        }
+        let page = 4096u64; // page refs only; actual mlock already page-aligned
+        let start_page = page_start / page;
+        let end_page = page_start
+            .saturating_add(page_len)
+            .div_ceil(page)
+            .max(start_page);
+        let mut g = self.inner.lock().unwrap();
+        if let Some(rec) = g.mlocked.get_mut(&id) {
+            if body_height.is_some() {
+                rec.body_height = body_height;
+            }
+            rec.need_heights.insert(need_height);
+            return;
+        }
+        for p in start_page..end_page {
+            *g.page_refs.entry(p).or_insert(0) = g.page_refs.get(&p).copied().unwrap_or(0).saturating_add(1);
+        }
+        let mut need = HashSet::new();
+        need.insert(need_height);
+        g.mlocked.insert(
+            id,
+            MlockRec {
+                body_height,
+                need_heights: need,
+                page_start,
+                page_len,
+                start_page,
+                end_page,
+            },
+        );
+    }
+
+    /// Number of mlocked Class A bodies currently tracked.
+    pub fn mlock_count(&self) -> usize {
+        self.inner.lock().unwrap().mlocked.len()
     }
 
     /// Store a full runway block body (phase-1 prewarm). Confirm/wave should
@@ -285,26 +379,40 @@ impl ConfirmParentCache {
         Some((e.tx.clone(), e.outputs.clone(), e.inputs.clone()))
     }
 
-    /// Attach prewarm-resolved thin edges to a runway body (wave_fill fast path).
+    /// Attach prewarm-resolved thin edges (wave_fill fast path; no full body required).
     pub fn put_thin_inputs(&self, fk: Fk, edges: Vec<StashedThinInput>) {
         let Some(id) = fk.get() else {
             return;
         };
         let mut g = self.inner.lock().unwrap();
         if let Some(e) = g.by_body.get_mut(&id) {
-            e.thin_inputs = Some(edges);
+            e.thin_inputs = Some(edges.clone());
         }
+        g.thin_edges.insert(id, edges);
     }
 
     /// Thin edges stashed during prewarm, if present.
     pub fn get_thin_inputs(&self, fk: Fk) -> Option<Vec<StashedThinInput>> {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
-        g.by_body.get(&id)?.thin_inputs.clone()
+        if let Some(e) = g.by_body.get(&id).and_then(|b| b.thin_inputs.clone()) {
+            return Some(e);
+        }
+        g.thin_edges.get(&id).cloned()
     }
 
     pub fn body_count(&self) -> usize {
-        self.inner.lock().unwrap().by_body.len()
+        let g = self.inner.lock().unwrap();
+        let mlock_bodies = g
+            .mlocked
+            .values()
+            .filter(|m| m.body_height.is_some())
+            .count();
+        if mlock_bodies > 0 {
+            mlock_bodies
+        } else {
+            g.by_body.len()
+        }
     }
 
     /// Ensure a height plan exists for `hash`.
@@ -472,8 +580,72 @@ impl ConfirmParentCache {
                 continue;
             };
             if let Some(e) = g.by_body.get_mut(&id) {
-                e.thin_inputs = Some(edges);
+                e.thin_inputs = Some(edges.clone());
             }
+            g.thin_edges.insert(id, edges);
+        }
+    }
+
+    /// Batch-register runway create txids after mlock prewarm.
+    pub fn register_mlocked_creates_batch(&self, items: &[(Fk, [u8; 32], u32)]) {
+        if items.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        for &(fk, txid, _height) in items {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            g.by_txid.insert(txid, id);
+        }
+    }
+
+    /// Note many mlocks under one lock (after successful store.mlock calls).
+    pub fn note_mlocks_batch(
+        &self,
+        items: &[(Fk, u64, u64, Option<u32>, u32)],
+    ) {
+        // (fk, page_start, page_len, body_height, need_height)
+        if items.is_empty() {
+            return;
+        }
+        let page = 4096u64;
+        let mut g = self.inner.lock().unwrap();
+        for &(fk, page_start, page_len, body_height, need_height) in items {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            if page_len == 0 {
+                continue;
+            }
+            if let Some(rec) = g.mlocked.get_mut(&id) {
+                if body_height.is_some() {
+                    rec.body_height = body_height;
+                }
+                rec.need_heights.insert(need_height);
+                continue;
+            }
+            let start_page = page_start / page;
+            let end_page = page_start
+                .saturating_add(page_len)
+                .div_ceil(page)
+                .max(start_page);
+            for p in start_page..end_page {
+                *g.page_refs.entry(p).or_insert(0) += 1;
+            }
+            let mut need = HashSet::new();
+            need.insert(need_height);
+            g.mlocked.insert(
+                id,
+                MlockRec {
+                    body_height,
+                    need_heights: need,
+                    page_start,
+                    page_len,
+                    start_page,
+                    end_page,
+                },
+            );
         }
     }
 
@@ -589,10 +761,16 @@ impl ConfirmParentCache {
         Self::out_present_locked(&g, id, vout)
     }
 
-    /// One-lock runway hit: `txid` known and `vout` present (body or sparse parent).
+    /// One-lock runway hit: `txid` known on runway (mlock or full body).
+    ///
+    /// With mlock prewarm we only have `by_txid` (no parsed outs); vout validity
+    /// is checked when confirm full-parses the parent.
     pub fn get_by_txid_if_out(&self, txid: &[u8; 32], vout: u32) -> Option<Fk> {
         let g = self.inner.lock().unwrap();
         let &id = g.by_txid.get(txid)?;
+        if g.mlocked.contains_key(&id) {
+            return Some(Fk(id));
+        }
         if Self::out_present_locked(&g, id, vout) {
             Some(Fk(id))
         } else {
@@ -654,7 +832,17 @@ impl ConfirmParentCache {
     }
 
     pub fn parent_count(&self) -> usize {
-        self.inner.lock().unwrap().by_fk.len()
+        let g = self.inner.lock().unwrap();
+        let mlock_parents = g
+            .mlocked
+            .values()
+            .filter(|m| m.body_height.is_none())
+            .count();
+        if mlock_parents > 0 {
+            mlock_parents
+        } else {
+            g.by_fk.len()
+        }
     }
 
     pub fn reserved_count(&self) -> usize {
@@ -810,6 +998,50 @@ impl Inner {
             }
         }
         self.ready_through = h.saturating_sub(1);
+    }
+
+    /// Drop mlocks for bodies past tip / outside horizon and parents no longer needed.
+    /// Returns page ranges with refcount 0 for the caller to `munlock`.
+    fn gc_mlocks(&mut self, tip: u32, max_h: u32) -> Vec<(u64, u64)> {
+        let mut drop_ids: Vec<u64> = Vec::new();
+        for (id, rec) in &mut self.mlocked {
+            if let Some(h) = rec.body_height {
+                if h <= tip || h > max_h {
+                    drop_ids.push(*id);
+                }
+            } else {
+                rec.need_heights.retain(|h| *h > tip && *h <= max_h);
+                if rec.need_heights.is_empty() {
+                    drop_ids.push(*id);
+                }
+            }
+        }
+        let mut unlocks: Vec<(u64, u64)> = Vec::new();
+        for id in drop_ids {
+            let Some(rec) = self.mlocked.remove(&id) else {
+                continue;
+            };
+            self.thin_edges.remove(&id);
+            // Drop by_txid if it pointed at this fk and nothing else needs it.
+            self.by_txid.retain(|_, fid| *fid != id);
+            for p in rec.start_page..rec.end_page {
+                let entry = self.page_refs.entry(p).or_insert(0);
+                *entry = entry.saturating_sub(1);
+                if *entry == 0 {
+                    self.page_refs.remove(&p);
+                    // Unlock whole record range once when any of its pages hit 0
+                    // is wrong if pages shared — unlock only when *all* pages of
+                    // this record hit 0. Collect zero-ref pages for this rec.
+                    let _ = p;
+                }
+            }
+            // If no page of this record still has a ref from another record, unlock.
+            let still = (rec.start_page..rec.end_page).any(|p| self.page_refs.contains_key(&p));
+            if !still {
+                unlocks.push((rec.page_start, rec.page_len));
+            }
+        }
+        unlocks
     }
 
     fn gc_orphaned_parents(&mut self) {

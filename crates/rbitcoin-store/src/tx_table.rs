@@ -658,6 +658,16 @@ impl TxTable {
             .with_bytes_at(offset, len, |raw| scan_packed_meta_and_prevouts(raw))
     }
 
+    /// Meta + outputs only from a known body range (skip allocating parent inputs).
+    pub fn get_meta_and_outputs_at(
+        &self,
+        offset: u64,
+        len: u64,
+    ) -> Result<(TxRecord, Vec<OutputRecord>), StoreError> {
+        self.body
+            .with_bytes_at(offset, len, |raw| decode_packed_tx_outs_only(raw))
+    }
+
     pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {
         self.body.reserve_append(body_bytes, n_records)
     }

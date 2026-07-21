@@ -5,16 +5,16 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 impl Query {
-    /// Build wave prevout map. **Requires** prewarm: bodies + parents in cache.
+    /// Build wave prevout map. **Requires** prewarm: bodies + parents ready.
     ///
-    /// Prefers stashed thin edges + [`crate::confirm_parent_cache`] so confirm
-    /// does not re-walk inputs or re-read Class A after a full prewarm.
+    /// - Wave-body txs: **one** full Class A decode, stashed for wire rebuild.
+    /// - Thin edges: moved from runway stash (same type as wave) — no remap.
+    /// - External parents: **outs-only** decode; only needed vouts kept.
     pub fn wave_fill_for_block_hashes(
         &self,
         hashes: &[[u8; 32]],
     ) -> Result<(usize, crate::WavePrevoutCache), QueryError> {
         use crate::wave_fill_stats::{self as wf, add as wf_add};
-        use crate::wave_prevout::ThinInput;
 
         let mut wave_fks: HashSet<u64> = HashSet::new();
         let mut wave_tx_fks: Vec<Fk> = Vec::new();
@@ -37,35 +37,24 @@ impl Query {
             crate::WavePrevoutCache::with_capacity(wave_tx_fks.len(), wave_tx_fks.len());
         let mut noted = 0usize;
 
-        // Pass 2: wave bodies from prewarm body cache (store only if missing).
-        // Prefer stashed thin edges from prewarm; fall back to walking inputs.
+        // Pass 2: wave bodies — full decode once; Arc-share outs with wire.
         let t_body = Instant::now();
-        let mut parent_needed: HashMap<u64, HashSet<u32>> = HashMap::new();
+        // parent_fk → needed vouts (small lists; sort/dedup later).
+        let mut parent_needed: HashMap<u64, Vec<u32>> = HashMap::new();
         for &fk in &wave_tx_fks {
             let (tx, outs, inputs) = self.load_body_prewarmed(fk)?;
             let cb_h = self.coinbase_height_for_tx_with_input0(fk, &tx, inputs.first())?;
-            wave.insert_parent_live(fk, tx, outs, Some(cb_h));
-            noted += 1;
 
-            let edges: Vec<ThinInput> =
-                if let Some(stashed) = self.confirm_parents.get_thin_inputs(fk) {
-                    stashed
-                        .into_iter()
-                        .map(|e| ThinInput {
-                            create_fk: e.create_fk,
-                            prev_index: e.prev_index,
-                        })
-                        .collect()
-                } else if inputs.is_empty() {
-                    Vec::new()
-                } else {
-                    // Fallback: no prewarm thin edges (tests / last-mile miss).
-                    self.thin_edges_from_inputs(&inputs, &wave)?
-                };
+            // Thin edges before moving outs/inputs into wave.
+            let edges = if let Some(stashed) = self.confirm_parents.take_thin_inputs(fk) {
+                // Same type as ThinInput — move, no remap.
+                stashed
+            } else if inputs.is_empty() {
+                Vec::new()
+            } else {
+                self.thin_edges_from_inputs(&inputs, &wave)?
+            };
 
-            if edges.is_empty() {
-                continue;
-            }
             for e in &edges {
                 let Some(pid) = e.create_fk else {
                     continue;
@@ -73,79 +62,89 @@ impl Query {
                 if wave_fks.contains(&pid) {
                     continue;
                 }
-                parent_needed
-                    .entry(pid)
-                    .or_default()
-                    .insert(e.prev_index);
+                parent_needed.entry(pid).or_default().push(e.prev_index);
             }
             wave.insert_thin_inputs(fk, edges);
+
+            // Parent + body_wire share one Arc of outs (no outs.clone() at fill).
+            wave.insert_wave_body(fk, tx, outs, inputs, Some(cb_h));
+            noted += 1;
         }
         wf_add(&wf::BODY_NS, t_body.elapsed().as_nanos() as u64);
 
-        // Pass 3: external parents from ConfirmParentCache (prewarm filled).
-        let mut parents: Vec<(u64, HashSet<u32>)> = parent_needed.into_iter().collect();
+        // Pass 3: external parents — only needed vouts, sparse map.
+        let mut parents: Vec<(u64, Vec<u32>)> = parent_needed.into_iter().collect();
         parents.sort_unstable_by_key(|(pid, _)| *pid);
+        for (_, vouts) in &mut parents {
+            vouts.sort_unstable();
+            vouts.dedup();
+        }
 
         let t_tx = Instant::now();
         for (pid, needed_vouts) in &parents {
             let fk = Fk(*pid);
-            let (tx, outs_map) = if let Some((tx, outs)) = self.confirm_parents.get_parent_outs(fk)
-            {
-                (tx, outs)
-            } else if let Some((tx, outs, _)) = self.confirm_parents.get_body(fk) {
-                let mut m = HashMap::new();
-                for &v in needed_vouts {
-                    if let Some(o) = outs.get(v as usize) {
-                        m.insert(v, o.clone());
-                    }
-                }
-                (tx, m)
-            } else {
-                // Prewarm miss — use cached body range when present (skip idx).
-                let (tx, _, raw) = if let Some((off, len)) = self.confirm_parents.get_body_range(fk)
-                {
-                    self.store.get_tx_full_at(off, len)?
-                } else {
-                    self.store.get_tx_full(fk)?
-                };
-                let mut m = HashMap::new();
-                for &v in needed_vouts {
-                    if let Some(o) = raw.get(v as usize) {
-                        m.insert(v, o.clone());
-                    }
-                }
-                (tx, m)
-            };
+            let (tx, mut candidates) = self.load_parent_needed_outs(fk, needed_vouts)?;
             wf_add(&wf::PARENT_TX_NS, 0);
             wf_add(&wf::PARENT_OUT_NS, 0);
 
-            let n = tx.output_count as usize;
-            let mut slots: Vec<Option<OutputRecord>> = vec![None; n];
-            for &v in needed_vouts {
-                let vi = v as usize;
-                if vi >= n {
-                    continue;
-                }
-                // Use create fk (no tx.head); body range from prewarm when present.
+            let n_out = tx.output_count;
+            let mut live: Vec<(u32, OutputRecord)> = Vec::with_capacity(candidates.len());
+            for (v, o) in candidates.drain(..) {
                 if self.is_outpoint_spent_create(fk, v)? {
                     continue;
                 }
-                if let Some(o) = outs_map.get(&v) {
-                    slots[vi] = Some(o.clone());
-                }
+                live.push((v, o));
             }
             wf_add(&wf::SPENT_NS, 0);
 
             let t_cb = Instant::now();
-            let cb_h = self.coinbase_height_for_tx(fk, &tx)?;
+            // Coinbase height: Class C slot (prewarm-mlocked); no input walk.
+            let cb_h = if tx.input_count == 1 {
+                self.store.tx_height.get(fk)?
+            } else {
+                None
+            };
+            let cb = if tx.input_count == 1 {
+                // Height table is set for coinbases on confirm. None height ⇒
+                // treat as non-cb for maturity (same as prior non-coinbase path).
+                Some(cb_h)
+            } else {
+                Some(None)
+            };
             wf_add(&wf::CB_HEIGHT_NS, t_cb.elapsed().as_nanos() as u64);
 
-            wave.insert_parent_slots(fk, tx, slots, Some(cb_h));
+            wave.insert_parent_sparse(fk, tx, n_out, live, cb);
             noted += 1;
         }
         let _ = t_tx;
 
         Ok((noted, wave))
+    }
+
+    /// External parent: only the needed vouts (no full dense outs / no inputs).
+    fn load_parent_needed_outs(
+        &self,
+        fk: Fk,
+        needed: &[u32],
+    ) -> Result<(TxRecord, Vec<(u32, OutputRecord)>), QueryError> {
+        // Sparse by_fk / body subset under one lock — clones only requested vouts.
+        if let Some((tx, live)) = self.confirm_parents.get_parent_outs_needed(fk, needed) {
+            return Ok((tx, live));
+        }
+        // Store outs-only decode (skip parent input/witness alloc). Clone only
+        // the few needed vouts (typically 1–2); drop the rest with `outs`.
+        let (tx, outs) = if let Some((off, len)) = self.confirm_parents.get_body_range(fk) {
+            self.store.get_tx_meta_and_outputs_at(off, len)?
+        } else {
+            self.store.get_tx_meta_and_outputs(fk)?
+        };
+        let mut live = Vec::with_capacity(needed.len());
+        for &v in needed {
+            if let Some(o) = outs.get(v as usize) {
+                live.push((v, o.clone()));
+            }
+        }
+        Ok((tx, live))
     }
 
     /// Build thin create-fk edges by walking inputs (wave_fill fallback).
@@ -203,18 +202,6 @@ impl Query {
         }
         let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
         Ok((tx, outs, inputs))
-    }
-
-    fn coinbase_height_for_tx(
-        &self,
-        fk: Fk,
-        tx: &TxRecord,
-    ) -> Result<Option<u32>, QueryError> {
-        if tx.input_count != 1 {
-            return Ok(None);
-        }
-        let inp = self.tx_input_at_fk(fk, tx, 0)?;
-        self.coinbase_height_for_tx_with_input0(fk, tx, Some(&inp))
     }
 
     fn coinbase_height_for_tx_with_input0(
@@ -379,12 +366,29 @@ impl Query {
         rec: HeaderRecord,
         tx_fks: Vec<Fk>,
     ) -> Result<Block, QueryError> {
+        self.reconstruct_archived_block_from_parts_wave(rec, tx_fks, None)
+    }
+
+    /// Like [`Self::reconstruct_archived_block_from_parts`] but reuses wave-fill
+    /// body decodes (one Class A parse per wave-body tx for the whole confirm run).
+    pub fn reconstruct_archived_block_from_parts_wave(
+        &self,
+        rec: HeaderRecord,
+        tx_fks: Vec<Fk>,
+        mut wave: Option<&mut crate::WavePrevoutCache>,
+    ) -> Result<Block, QueryError> {
         if tx_fks.is_empty() {
             return Err(StoreError::Corrupt("block has no transactions"));
         }
         let header = self.wire_header_from_record(&rec)?;
         let mut txdata = Vec::with_capacity(tx_fks.len());
         for fk in tx_fks {
+            if let Some(w) = wave.as_deref_mut() {
+                if let Some((tx, outs, ins)) = w.take_body_wire(fk) {
+                    txdata.push(Self::transaction_from_class_a(tx, outs, ins));
+                    continue;
+                }
+            }
             txdata.push(self.reconstruct_tx(fk)?);
         }
         Ok(Block { header, txdata })

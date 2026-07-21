@@ -497,10 +497,8 @@ pub(crate) fn connect_block_prevouts(
             } else {
                 Vec::new()
             };
-            // Thin create_fk hints from wave (no full input-run clone).
-            let thin = spend_fk.and_then(|fk| {
-                wave_prevouts.and_then(|w| w.thin_inputs(fk).map(|s| s.to_vec()))
-            });
+            // Thin create_fk hints from wave (borrow — no Vec clone).
+            let thin = spend_fk.and_then(|fk| wave_prevouts.and_then(|w| w.thin_inputs(fk)));
 
             for (ii, input) in tx.input.iter().enumerate() {
                 let op = input.previous_output;
@@ -517,7 +515,6 @@ pub(crate) fn connect_block_prevouts(
                     .and_then(|w| w.get_by_txid(op.txid.as_byte_array(), op.vout))
                     .is_some();
                 let prev_fk = thin
-                    .as_ref()
                     .and_then(|t| t.get(ii))
                     .and_then(|e| e.create_fk.map(rbitcoin_primitives::Fk))
                     .or_else(|| pending_creates.get(&key).copied())

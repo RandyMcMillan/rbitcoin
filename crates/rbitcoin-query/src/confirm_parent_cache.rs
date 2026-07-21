@@ -13,6 +13,7 @@
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{HeaderRecord, InputRecord, MlockRange, OutputRecord, TxRecord};
+// ThinInput used via StashedThinInput alias.
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -67,13 +68,8 @@ pub struct ParentEntry {
     pub create_height: Option<u32>,
 }
 
-/// Thin create-fk edge for one input (same layout as [`crate::wave_prevout::ThinInput`]).
-/// Stored on the runway body so wave_fill can skip re-walking inputs.
-#[derive(Debug, Clone, Copy)]
-pub struct StashedThinInput {
-    pub create_fk: Option<u64>,
-    pub prev_index: u32,
-}
+/// Thin create-fk edge (identical to wave [`crate::wave_prevout::ThinInput`]).
+pub type StashedThinInput = crate::wave_prevout::ThinInput;
 
 /// Full Class A body for a runway height (confirm should not re-read store).
 #[derive(Debug, Clone)]
@@ -491,7 +487,7 @@ impl ConfirmParentCache {
         g.thin_edges.insert(id, edges);
     }
 
-    /// Thin edges stashed during prewarm, if present.
+    /// Thin edges stashed during prewarm, if present (clone).
     pub fn get_thin_inputs(&self, fk: Fk) -> Option<Vec<StashedThinInput>> {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
@@ -499,6 +495,19 @@ impl ConfirmParentCache {
             return Some(e);
         }
         g.thin_edges.get(&id).cloned()
+    }
+
+    /// Move thin edges out of the runway (wave_fill is the sole consumer).
+    pub fn take_thin_inputs(&self, fk: Fk) -> Option<Vec<StashedThinInput>> {
+        let id = fk.get()?;
+        let mut g = self.inner.lock().unwrap();
+        if let Some(e) = g.by_body.get_mut(&id) {
+            if let Some(edges) = e.thin_inputs.take() {
+                g.thin_edges.remove(&id);
+                return Some(edges);
+            }
+        }
+        g.thin_edges.remove(&id)
     }
 
     pub fn body_count(&self) -> usize {
@@ -859,7 +868,7 @@ impl ConfirmParentCache {
 
     /// Sparse external-parent outs only (`by_fk`). Does **not** expand runway
     /// bodies — callers that need a subset of body outs should use
-    /// [`Self::get_body`] (avoids cloning every script of a multi-out create).
+    /// [`Self::get_parent_outs_needed`] (avoids cloning every script of a multi-out create).
     pub fn get_parent_outs(&self, fk: Fk) -> Option<(TxRecord, HashMap<u32, OutputRecord>)> {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
@@ -873,6 +882,40 @@ impl ConfirmParentCache {
             .map(|(v, o)| (*v, o.output.clone()))
             .collect();
         Some((e.tx.clone(), outs))
+    }
+
+    /// Clone only the requested parent vouts (sparse `by_fk`, else runway body).
+    ///
+    /// Wave_fill path: never materializes a full dense outs list for multi-out
+    /// creates when only 1–2 prevouts are needed.
+    pub fn get_parent_outs_needed(
+        &self,
+        fk: Fk,
+        vouts: &[u32],
+    ) -> Option<(TxRecord, Vec<(u32, OutputRecord)>)> {
+        let id = fk.get()?;
+        let g = self.inner.lock().unwrap();
+        if let Some(e) = g.by_fk.get(&id) {
+            if !e.outs.is_empty() {
+                let mut live = Vec::with_capacity(vouts.len());
+                for &v in vouts {
+                    if let Some(o) = e.outs.get(&v) {
+                        live.push((v, o.output.clone()));
+                    }
+                }
+                return Some((e.tx.clone(), live));
+            }
+        }
+        if let Some(b) = g.by_body.get(&id) {
+            let mut live = Vec::with_capacity(vouts.len());
+            for &v in vouts {
+                if let Some(o) = b.outputs.get(v as usize) {
+                    live.push((v, o.clone()));
+                }
+            }
+            return Some((b.tx.clone(), live));
+        }
+        None
     }
 
     pub fn plan_count(&self) -> usize {

@@ -117,10 +117,10 @@ pub fn confirm_archived_run(
 
     // ── 2. wave_fill (bodies + parents + thin edges from ConfirmParentCache) ─
     let hashes: Vec<[u8; 32]> = metas.iter().map(|m| m.hash).collect();
-    let wave_prevouts = wave_fill(query, &hashes)?;
+    let mut wave_prevouts = wave_fill(query, &hashes)?;
 
-    // ── 3. wire_rebuild ─────────────────────────────────────────────────────
-    let wire_blocks = wire_rebuild(query, &metas)?;
+    // ── 3. wire_rebuild (reuses wave body decodes — no second Class A parse) ─
+    let wire_blocks = wire_rebuild(query, &metas, &mut wave_prevouts)?;
 
     // ── 4. connect (headers + prevouts; run-local pending) ──────────────────
     let mut prepared = connect_run(
@@ -257,17 +257,24 @@ fn wave_fill(
     Ok(wave)
 }
 
-fn wire_rebuild(query: &Query, metas: &[BodyMeta]) -> Result<Vec<Block>, ConsensusError> {
+fn wire_rebuild(
+    query: &Query,
+    metas: &[BodyMeta],
+    wave: &mut rbitcoin_query::WavePrevoutCache,
+) -> Result<Vec<Block>, ConsensusError> {
     // Sequential by design: `rayon_audit` benches show par_iter reconstruct is
-    // *slower* than sequential for 1–128 blocks (store mmap + encode work units
-    // are too small / cache-bound; pool schedule + clone dominates). Script
-    // verify is the real multi-core win (`verify_scripts_pool`).
+    // *slower* than sequential for 1–128 blocks. Wave-fill already decoded Class A
+    // bodies once — wire rebuild takes those and only builds `bitcoin::Transaction`.
     let t0 = Instant::now();
     let mut blks = Vec::with_capacity(metas.len());
     for m in metas {
         blks.push(
             query
-                .reconstruct_archived_block_from_parts(m.header_rec.clone(), m.tx_fks.clone())
+                .reconstruct_archived_block_from_parts_wave(
+                    m.header_rec.clone(),
+                    m.tx_fks.clone(),
+                    Some(wave),
+                )
                 .map_err(ConsensusError::Store)?,
         );
     }

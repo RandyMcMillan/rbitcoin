@@ -274,6 +274,15 @@ impl Store {
         self.txs.get_meta_and_prevouts_at(offset, len)
     }
 
+    /// Meta + outputs only from a cached body range (no parent input materialization).
+    pub fn get_tx_meta_and_outputs_at(
+        &self,
+        offset: u64,
+        len: u64,
+    ) -> Result<(TxRecord, Vec<OutputRecord>), StoreError> {
+        self.txs.get_meta_and_outputs_at(offset, len)
+    }
+
     /// Pin `tx.head` probe chain for `txid`.
     pub fn mlock_tx_head_for(&self, txid: &[u8; 32]) -> Vec<crate::MlockRange> {
         let mut out = Vec::with_capacity(1);

@@ -6,6 +6,17 @@
 use super::*;
 use rbitcoin_store::IbdUtxo;
 
+/// Result of one hysteresis materialize step (one sorted run into a durable index).
+#[derive(Clone, Debug)]
+pub struct MaterializeRunResult {
+    /// Which index: `point`, `tx.head`, or `scripthash`.
+    pub store: &'static str,
+    /// Keys / edges applied from that run.
+    pub keys: u64,
+    /// Wall time for claim + apply + remove.
+    pub elapsed: std::time::Duration,
+}
+
 /// First-class index / spentness mode for catch-up vs tip-follow.
 ///
 /// | Mode | Durable `tx.head` / points | Spentness truth |
@@ -382,21 +393,38 @@ impl Query {
         )
     }
 
-    /// Materialize one oldest run (point → tx → SH). `Ok(0)` if nothing to do.
-    pub fn materialize_one_index_run(&self) -> Result<u64, QueryError> {
+    /// Materialize one oldest run (point → tx → SH). `Ok(None)` if nothing to do.
+    ///
+    /// Logs `store`, key/edge count, and wall time at DEBUG for each successful apply.
+    pub fn materialize_one_index_run(&self) -> Result<Option<MaterializeRunResult>, QueryError> {
+        let t0 = std::time::Instant::now();
         if let Some(n) = self.point_run.materialize_oldest_run(&self.store)? {
-            crate::run_builder_core::run_materialize_control::note_materialized(n);
-            return Ok(n);
+            return Ok(Some(Self::finish_mat_step("point", n, t0)));
         }
+        let t0 = std::time::Instant::now();
         if let Some(n) = self.tx_run.materialize_oldest_run(&self.store)? {
-            crate::run_builder_core::run_materialize_control::note_materialized(n);
-            return Ok(n);
+            return Ok(Some(Self::finish_mat_step("tx.head", n, t0)));
         }
+        let t0 = std::time::Instant::now();
         if let Some(n) = self.sh_run.materialize_oldest_run(&self.store)? {
-            crate::run_builder_core::run_materialize_control::note_materialized(n);
-            return Ok(n);
+            return Ok(Some(Self::finish_mat_step("scripthash", n, t0)));
         }
-        Ok(0)
+        Ok(None)
+    }
+
+    fn finish_mat_step(
+        store: &'static str,
+        keys: u64,
+        t0: std::time::Instant,
+    ) -> MaterializeRunResult {
+        let elapsed = t0.elapsed();
+        crate::run_builder_core::run_materialize_control::note_materialized(keys);
+        // Per-store DEBUG is emitted inside each `materialize_oldest_run`.
+        MaterializeRunResult {
+            store,
+            keys,
+            elapsed,
+        }
     }
 
     pub(crate) fn tx_run_enabled(&self) -> bool {

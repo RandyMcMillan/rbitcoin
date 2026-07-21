@@ -55,12 +55,18 @@ impl RunMaterializeWorker {
                         );
                     }
                     match query.materialize_one_index_run() {
-                        Ok(0) => {
+                        Ok(None) => {
                             // Nothing left this tick.
                             std::thread::sleep(IDLE);
                         }
-                        Ok(n) => {
-                            debug!("ibd: run materialize applied keys≈{n}");
+                        Ok(Some(step)) => {
+                            // Query already DEBUG-logs store/keys/elapsed; promote slow steps.
+                            if step.elapsed >= Duration::from_millis(500) {
+                                info!(
+                                    "ibd: run materialize store={} keys≈{} elapsed={:?}",
+                                    step.store, step.keys, step.elapsed
+                                );
+                            }
                             std::thread::sleep(AFTER_RUN);
                         }
                         Err(e) => {

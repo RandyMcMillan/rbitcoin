@@ -34,7 +34,7 @@ use std::sync::Mutex;
 
 pub type QueryError = StoreError;
 
-pub use catchup::IndexMode;
+pub use catchup::{IndexMode, MaterializeRunResult};
 pub use confirm_parent_cache::{
     prewarm_batch_from_env, prewarm_depth_from_env, prewarm_headroom_from_env,
     DEFAULT_PREWARM_BATCH as PREWARM_BATCH, DEFAULT_PREWARM_DEPTH as PREWARM_DEPTH,

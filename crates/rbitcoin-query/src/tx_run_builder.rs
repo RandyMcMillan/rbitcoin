@@ -193,11 +193,17 @@ impl TxRunBuilder {
         let Some(run) = take_oldest_run(&runs_dir, &runs_io)? else {
             return Ok(None);
         };
+        let t0 = std::time::Instant::now();
         let n = materialize(store, &run)?;
         {
             let _io = runs_io.lock().unwrap();
             remove_run(&run)?;
         }
+        let elapsed = t0.elapsed();
+        rbitcoin_log::debug!(
+            "ibd: materialize store=tx.head keys≈{n} count={} elapsed={elapsed:?}",
+            run.count
+        );
         Ok(Some(n))
     }
 
@@ -205,10 +211,14 @@ impl TxRunBuilder {
         finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
         let mut inserted = 0u64;
         loop {
+            let t0 = std::time::Instant::now();
             match self.materialize_oldest_run(store)? {
                 Some(n) => {
                     inserted = inserted.saturating_add(n);
-                    info!("node: tx.head materialize run keys≈{n} total≈{inserted}");
+                    info!(
+                        "node: tx.head materialize run keys≈{n} total≈{inserted} elapsed={:?}",
+                        t0.elapsed()
+                    );
                 }
                 None => break,
             }

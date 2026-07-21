@@ -197,8 +197,14 @@ impl ShRunBuilder {
         let Some(run) = claim_oldest_run(&runs_dir, &runs_io)? else {
             return Ok(None);
         };
+        let t0 = Instant::now();
         let n = materialize_run(store, &run)?;
         let _ = std::fs::remove_file(&run.path);
+        let elapsed = t0.elapsed();
+        debug!(
+            "ibd: materialize store=scripthash keys≈{n} count={} elapsed={elapsed:?}",
+            run.count
+        );
         Ok(Some(n))
     }
 
@@ -224,10 +230,14 @@ impl ShRunBuilder {
         }
         let mut inserted = 0u64;
         loop {
+            let t0 = Instant::now();
             match self.materialize_oldest_run(store)? {
                 Some(n) => {
                     inserted = inserted.saturating_add(n);
-                    info!("node: scripthash materialize run keys≈{n} total≈{inserted}");
+                    info!(
+                        "node: scripthash materialize run keys≈{n} total≈{inserted} elapsed={:?}",
+                        t0.elapsed()
+                    );
                 }
                 None => break,
             }

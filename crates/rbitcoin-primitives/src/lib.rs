@@ -18,10 +18,11 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version (see workspace `SCHEMA.md`).
 ///
 /// v10: packed Class A inputs store **create_fk:u64 + vout** (not prev_txid[32])
-/// for non-coinbase; wipe datadir from v9. `tx.head` still keyless 4 B (v9).
+/// for non-coinbase; wipe datadir from v9. `tx.head` keyless address with online
+/// sequential resize (default BITS=28 @ 4 B; 8 B entries at BITS≥33).
 ///
-/// v9: `tx.head` is `2^31` × **4 B** create_fk entries (no HAS_NEXT; probe until
-/// empty); `tx_height` uses **u32** slots. Dense Class A fk + `tx.idx` retained.
+/// v9: `tx.head` is fixed `2^BITS` × **4 B** create_fk entries (no HAS_NEXT; probe
+/// until empty); `tx_height` uses **u32** slots. Dense Class A fk + `tx.idx` retained.
 ///
 /// v8: `tx.head` `2^31` × 8 B (fk + HAS_NEXT); `tx_height` u64 slots.
 ///

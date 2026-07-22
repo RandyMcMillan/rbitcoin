@@ -2,11 +2,9 @@
 
 Versioned layouts for the chain store. **Format is unstable until 1.0.** Magic bytes and a schema version live in each file header.
 
-**Schema v10** (current): packed Class A **inputs store `create_fk:u64` + CompactSize vout** for non-coinbase (not `prev_txid[32]`). Soft `prev_txid` is RAM-only for wire rebuild (filled from create body). Archive resolves parent fks once (same-batch map → writer sticky → durable `tx.head`). **Wipe datadir from v9.** `tx.head` still keyless 4 B (v9 layout).
+**Schema v10** (current): packed Class A **inputs store `create_fk:u64` + CompactSize vout** for non-coinbase (not `prev_txid[32]`). Soft `prev_txid` is RAM-only for wire rebuild (filled from create body). Archive resolves parent fks once (same-batch map → writer sticky → durable `tx.head`). **Wipe datadir from v9.** `tx.head` is keyless address with **online sequential resize** (default mainnet **BITS=28** @ 4 B; see below).
 
-**Schema v9**: **`tx.head`** is a fixed keyless address table — single file, `2^BITS` × **4 B** entries (mainnet `BITS=31` → **8 GiB** sparse), double-hash probe, **`u32` create_fk** (0 = empty), **no HAS_NEXT** (continue until empty). Dense Class A fks + **`tx.idx`** retained. **`tx_height`** uses **4 B** slots (`height+1`, 0 = unset). Lookups verify Class A body txid. Header / scripthash heads remain open-address with 16 B key prefixes. Fresh datadir from v8. Inputs still carried `prev_txid[32]`.
-
-**Future head pain** (mainnet `BITS=31`, ~2.1 B slots; ~75% load ≈ **1.6 B** entries): first widen address **BITS** (e.g. 32-bit rebuild); ~**3.2 B** txs → second widen (e.g. 33-bit); only then ~**4 B** txs → **`u32` create_fk exhausted**, head entries must become **8 B**.
+**Schema v9**: **`tx.head`** fixed keyless address — single file, `2^BITS` × **4 B** entries (often `BITS=31`), double-hash probe, **`u32` create_fk** (0 = empty), **no HAS_NEXT**. Dense Class A fks + **`tx.idx`** retained. **`tx_height`** uses **4 B** slots (`height+1`, 0 = unset). Fresh datadir from v8. Inputs still carried `prev_txid[32]`.
 
 **Schema v8**: `tx.head` 2^31 × 8 B (fk + HAS_NEXT); `tx_height` u64 slots.
 
@@ -94,19 +92,21 @@ See [`docs/concurrency.md`](./docs/concurrency.md): during IBD, one dedicated OS
 - Lookups that need exact identity load candidate fks via `get_all` and **verify** the body hash/txid.
 - Rehashes when load would exceed **7/8**.
 
-## Tx address head (`tx.head`, schema v9)
+## Tx address head (`tx.head`)
 
-- **Single file** (not a shard directory). Fixed `2^BITS` slots × **4 B** (mainnet `BITS=31` → **8 GiB** sparse; tests: `RBITCOIN_HEAD_SCALE=tiny` / `RBITCOIN_TX_HEAD_BITS`).
-- Entry = LE **`u32`**: dense `create_fk` (1-based; **0 = empty**). **No HAS_NEXT** — all 32 bits available for fk (cap ~4 B txs).
-- **No key bytes**. Double-hash probe from txid:
-  - `h1` = leading `BITS` of `txid[0..4]` (BE)
-  - `h2` = odd step from `txid[4..8]`
-  - `idx(d) = (h1 + d·h2) mod 2^BITS`, `d < MAX_PROBE` (128)
-- Body mismatch ⇒ continue until **empty** slot (no deletes on Class A).
-- Insert: first empty probe slot (or idempotent if same `create_fk` already on chain). **No body check on insert** — a second Class A row for the same txid is appended deeper (no write-time BIP30 displace).
-- Lookup: body-verify from the **last occupied** probe slot toward the first so the newest same-txid create wins (BIP30-shaped).
-- Lookups verify packed Class A body txid. Dense fk still resolves body via **`tx.idx`**.
-- **No growth rehash**. Future: ~**1.6 B** txs → first **BITS** widen; ~**3.2 B** → second **BITS** widen; ~**4 B** → **8 B** entries (fk width).
+- **Single file** (not a shard directory). `2^BITS` slots × **4 B or 8 B** create_fk.
+- **Default create:** mainnet `BITS=28` → **1 GiB** sparse @ 4 B (`RBITCOIN_TX_HEAD_BITS` / tiny scale; range **8..=34**).
+- **Entry:** LE dense `create_fk` (1-based; **0 = empty**). **No HAS_NEXT**. 4 B packs u32 fk; **8 B from BITS ≥ 33** (load capacity exceeds u32).
+- **Meta:** `tx.head.meta` (`bits`, `entry_bytes`, `generation`). Legacy open without meta infers 4 B + `log2(body/4)`.
+- **No key bytes**. Double-hash probe from txid (`h1`/`h2` from txid prefix; `idx(d) = (h1 + d·h2) mod 2^BITS`, `d < MAX_PROBE` (128)).
+- Insert: first empty probe (or idempotent same fk). Second same-txid create appends deeper (BIP30-shaped).
+- Lookup: body-verify last occupied → first (newest wins). Dense fk resolves body via **`tx.idx`**.
+- **Online sequential resize** when `txs.count() / slots ≥ 0.80` (or probe exhaust):
+  1. Create `tx.head.new` with `bits+1` (entry width from policy).
+  2. Fill shadow **only** from dense Class A `fk = 1..=count` via `tx.idx` (deterministic order).
+  3. Live archive inserts continue on **primary only** (no dual-write).
+  4. Catch-up + brief exclusive insert lock → rename swap; control file `tx.head.resize` for crash resume.
+- **Capacity @ 0.80 load:** 28→215 M, 29→429 M, 30→859 M, 31→1.72 B, 32→3.44 B, 33→6.87 B (8 B entries), 34→13.7 B.
 
 ## Dense u64 arrays (`confirmed`, `header_txs_first`, `header_txs_count`)
 

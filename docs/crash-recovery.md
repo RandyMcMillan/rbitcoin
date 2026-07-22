@@ -49,5 +49,6 @@ Clean shutdown flushes mmap tables. Kill may lose the last unflushed pages (same
 
 ## Operator
 
-- Direct IBD keeps **`tx.head`** (archive) and **spend annotations** (confirm) live; tip entry does **not** re-scan Class A to repair them. Corrupt head/spends ⇒ reindex (optional manual `backfill_tx_index` is for future head rehash rebuild, not tip gate).
+- Direct IBD keeps **`tx.head`** (archive) and **spend annotations** (confirm) live; tip entry does **not** re-scan Class A to repair them. Corrupt head/spends ⇒ reindex (optional manual `backfill_tx_index` rebuilds primary head mappings).
+- **Online `tx.head` resize:** control file `tx.head.resize` + shadow `tx.head.new`. Kill mid-fill → open resumes fill from `cursor`. Successful swap clears control; `tx.head.meta` records `bits` / `entry_bytes` / `generation`.
 - Scripthash: thin creates go to **sorted runs** during Direct; tip **bulk-materializes** durable SH tables. Corrupt durable SH ⇒ reindex.

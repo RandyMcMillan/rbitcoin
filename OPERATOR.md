@@ -74,14 +74,15 @@ tables before Electrum (the only deferred index work). On enter Direct, leftover
 `ibd_utxo.map` / `point.runs` / `tx.runs` from old Catchup datadirs are removed —
 prefer a **fresh datadir**.
 
-New stores (schema **v9**): **header.head** = **single** open-address file (~24 MiB
-pre-size; not 256-way), **scripthash** 16 shards, **tx.head** = single fixed address
-file (~**8 GiB** sparse mainnet, `2^31` × **4 B** create_fk slots, no HAS_NEXT;
-override with `RBITCOIN_TX_HEAD_BITS` / tiny scale). **tx_height** uses 4 B slots.
-Dense Class A fk + **tx.idx** retained. Packed Class A only (no `input.body` /
-`output.body` tables). Prior schema heads may need wipe / fresh IBD. Future
-head pain (31-bit address): ~**1.6 B** txs → first BITS widen; ~**3.2 B** → second;
-~**4 B** → 8 B head entries. Spends are schema-v5 annotations on create outputs
+New stores (schema **v10**): **header.head** = **single** open-address file (~24 MiB
+pre-size; not 256-way), **scripthash** 16 shards, **tx.head** = single address file
+starting at mainnet **BITS=28** (~**1 GiB** sparse, `2^28` × **4 B** create_fk;
+override with `RBITCOIN_TX_HEAD_BITS` in `8..=34` / tiny scale). **Online sequential
+resize** when `txs.count()/slots ≥ 0.80`: rebuild shadow from dense `tx.idx` order
+(no dual-write on archive), then atomic rename. BITS **33+** use **8 B** entries.
+Legacy heads without `tx.head.meta` open as 4 B and may grow upward only.
+**tx_height** uses 4 B height slots (not fk width). Dense Class A fk + **tx.idx**
+retained. Packed Class A only. Spends are schema-v5 annotations on create outputs
 (no `point.head`).
 
 **Memory rule:** Direct IBD writes durable `tx.head` live and spend annotations

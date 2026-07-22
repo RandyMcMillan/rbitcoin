@@ -101,7 +101,7 @@ See [`docs/concurrency.md`](./docs/concurrency.md): during IBD, one dedicated OS
   - `h2` = odd step from `txid[4..8]`
   - `idx(d) = (h1 + d·h2) mod 2^BITS`, `d < MAX_PROBE` (128)
 - Body mismatch ⇒ continue until **empty** slot (no deletes on Class A).
-- BIP30: newest `create_fk` at earliest matching probe slot; older pushed deeper.
+- Insert: first empty probe slot (or idempotent if same `create_fk` already on chain). **No body check on insert** — not BIP30 newest-first; a second Class A row for the same txid is appended deeper; lookup still body-verifies and takes the first matching body along the probe.
 - Lookups verify packed Class A body txid. Dense fk still resolves body via **`tx.idx`**.
 - **No growth rehash**. Future: ~**1.6 B** txs → first **BITS** widen; ~**3.2 B** → second **BITS** widen; ~**4 B** → **8 B** entries (fk width).
 

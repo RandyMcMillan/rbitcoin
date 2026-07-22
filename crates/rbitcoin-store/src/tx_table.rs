@@ -1189,12 +1189,12 @@ impl TxTable {
 
     /// Bulk-insert head entries (archive / run materialize / backfill).
     ///
-    /// Body txids are loaded for collision / BIP30 decisions (keyless head).
+    /// Fast: probe until same fk (idempotent) or empty — **no body_txid** on insert.
     pub fn head_insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
         }
-        self.head.insert_many_paced(entries, |fk| self.body_txid(fk))
+        self.head.insert_many(entries)
     }
 
 

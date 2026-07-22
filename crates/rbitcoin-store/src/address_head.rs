@@ -2,10 +2,17 @@
 //!
 //! **Layout:** each entry is a LE `u32` create_fk (`0` = empty). No key material and
 //! **no HAS_NEXT** — probe continues until an empty slot (no Class A deletes).
-//! Callers verify identity via Class A body txid.
+//! Callers verify identity via Class A body txid on **lookup**.
+//!
+//! **Insert (fast path):** probe until the **same fk** is already present (idempotent)
+//! or an **empty** slot — write there. **No body_txid** on insert (no BIP30
+//! newest-first displacement). Foreigners and older same-txid creates are skipped
+//! blindly; a second Class A row for the same txid lands at the next empty slot
+//! (typically deeper). Lookups still body-verify and take the **first** matching
+//! body along the probe chain (older-first if both are present).
 //!
 //! **Probe:** double hashing from the txid (`h1` / odd `h2`), capped at
-//! [`MAX_PROBE`]. Foreign occupants are normal: body mismatch ⇒ continue.
+//! [`MAX_PROBE`]. Foreign occupants are normal on lookup: body mismatch ⇒ continue.
 //!
 //! Mainnet: BITS=31 → **8 GiB** sparse file. Tests / `HeadScale::Tiny`: BITS=16.
 //!
@@ -193,57 +200,38 @@ impl AddressHead {
         Ok(())
     }
 
-    /// Insert one mapping. `body_txid(fk)` must return the Class A body txid.
+    /// Insert one mapping (no body IO).
     ///
-    /// BIP30: newest fk at earliest matching probe slot; older pushed deeper.
-    pub fn insert(
-        &self,
-        txid: &[u8; 32],
-        new_fk: Fk,
-        mut body_txid: impl FnMut(Fk) -> Result<[u8; 32], StoreError>,
-    ) -> Result<(), StoreError> {
+    /// Probe until the same `new_fk` is already present (idempotent) or an empty
+    /// slot (write). Occupied slots with other fks are treated as opaque —
+    /// no body_txid / no BIP30 newest-first displacement.
+    pub fn insert(&self, txid: &[u8; 32], new_fk: Fk) -> Result<(), StoreError> {
         let _ = fk_to_u32(new_fk)?;
         let _guard = self.write_lock.lock().unwrap();
-        self.insert_locked(txid, new_fk, &mut body_txid)
+        self.insert_locked(txid, new_fk)
     }
 
-    fn insert_locked(
-        &self,
-        txid: &[u8; 32],
-        new_fk: Fk,
-        body_txid: &mut dyn FnMut(Fk) -> Result<[u8; 32], StoreError>,
-    ) -> Result<(), StoreError> {
-        let mut to_place = new_fk;
-
+    fn insert_locked(&self, txid: &[u8; 32], new_fk: Fk) -> Result<(), StoreError> {
+        let new_u = fk_to_u32(new_fk)?;
         for d in 0..MAX_PROBE {
             let slot = probe_index(txid, d, self.bits);
             let e = self.read_entry(slot)?;
             if e == 0 {
-                self.write_entry(slot, fk_to_u32(to_place)?)?;
+                self.write_entry(slot, new_u)?;
                 self.occupied.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
-            let cur_fk = Fk(u64::from(e));
-            if cur_fk.0 == to_place.0 || cur_fk.0 == new_fk.0 {
+            if e == new_u {
+                // Already indexed — no body check.
                 return Ok(());
             }
-            let bt = body_txid(cur_fk)?;
-            if &bt == txid {
-                // BIP30: newest takes this slot; displace older.
-                self.write_entry(slot, fk_to_u32(to_place)?)?;
-                to_place = cur_fk;
-                continue;
-            }
-            // Foreigner — continue until empty.
+            // Other fk (foreigner or older same-txid) — keep walking.
         }
         Err(StoreError::Corrupt("address head probe exhausted on insert"))
     }
 
-    pub fn insert_many(
-        &self,
-        entries: &[([u8; 32], Fk)],
-        mut body_txid: impl FnMut(Fk) -> Result<[u8; 32], StoreError>,
-    ) -> Result<(), StoreError> {
+    /// Bulk insert; primary-slot sort for locality. No body IO.
+    pub fn insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -252,17 +240,14 @@ impl AddressHead {
         work.sort_unstable_by_key(|(txid, _)| probe_index(txid, 0, bits));
         let _guard = self.write_lock.lock().unwrap();
         for (txid, fk) in &work {
-            self.insert_locked(txid, *fk, &mut body_txid)?;
+            self.insert_locked(txid, *fk)?;
         }
         Ok(())
     }
 
-    pub fn insert_many_paced(
-        &self,
-        entries: &[([u8; 32], Fk)],
-        body_txid: impl FnMut(Fk) -> Result<[u8; 32], StoreError>,
-    ) -> Result<(), StoreError> {
-        self.insert_many(entries, body_txid)
+    /// Alias of [`Self::insert_many`] (historical name from paced head writes).
+    pub fn insert_many_paced(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
+        self.insert_many(entries)
     }
 
     /// Walk probe until empty; return every fk (may include foreigners).
@@ -355,7 +340,6 @@ fn count_occupied(file: &TableFile, slots: u64) -> Result<u64, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     fn tmp(name: &str) -> PathBuf {
@@ -365,14 +349,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         let _ = std::fs::remove_file(&p);
         p
-    }
-
-    fn body_map(m: &HashMap<u64, [u8; 32]>) -> impl FnMut(Fk) -> Result<[u8; 32], StoreError> + '_ {
-        move |fk| {
-            m.get(&fk.0)
-                .copied()
-                .ok_or(StoreError::Corrupt("missing body in test map"))
-        }
     }
 
     #[test]
@@ -387,12 +363,13 @@ mod tests {
     fn insert_get_roundtrip() {
         let path = tmp("roundtrip");
         let h = AddressHead::create_with_bits(&path, 12).unwrap();
-        let mut bodies = HashMap::new();
         let mut txid = [0u8; 32];
         txid[0] = 1;
-        bodies.insert(1, txid);
-        h.insert(&txid, Fk(1), body_map(&bodies)).unwrap();
+        h.insert(&txid, Fk(1)).unwrap();
         assert_eq!(h.probe_fks(&txid).unwrap(), vec![Fk(1)]);
+        assert_eq!(h.occupied(), 1);
+        // Idempotent re-insert of same fk.
+        h.insert(&txid, Fk(1)).unwrap();
         assert_eq!(h.occupied(), 1);
         let _ = std::fs::remove_file(&path);
     }
@@ -406,31 +383,28 @@ mod tests {
         a[0] = 0x10;
         b[0] = 0x10;
         b[4] = 0x02;
-        let mut bodies = HashMap::new();
-        bodies.insert(1, a);
-        bodies.insert(2, b);
-        h.insert(&a, Fk(1), body_map(&bodies)).unwrap();
-        h.insert(&b, Fk(2), body_map(&bodies)).unwrap();
+        h.insert(&a, Fk(1)).unwrap();
+        h.insert(&b, Fk(2)).unwrap();
         assert!(h.probe_fks(&a).unwrap().contains(&Fk(1)));
         assert!(h.probe_fks(&b).unwrap().contains(&Fk(2)));
         assert_eq!(h.probe_fks(&a).unwrap()[0], Fk(1));
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Duplicate txid (BIP30-shaped): second insert does **not** displace first;
+    /// both sit on the probe chain, oldest at the earliest slot.
     #[test]
-    fn bip30_newest_first() {
+    fn bip30_second_create_appends_deeper() {
         let path = tmp("bip30");
         let h = AddressHead::create_with_bits(&path, 12).unwrap();
         let mut txid = [0u8; 32];
         txid[0] = 0x55;
-        let mut bodies = HashMap::new();
-        bodies.insert(1, txid);
-        bodies.insert(2, txid);
-        h.insert(&txid, Fk(1), body_map(&bodies)).unwrap();
-        h.insert(&txid, Fk(2), body_map(&bodies)).unwrap();
+        h.insert(&txid, Fk(1)).unwrap();
+        h.insert(&txid, Fk(2)).unwrap();
         let cands = h.probe_fks(&txid).unwrap();
-        assert_eq!(cands[0], Fk(2));
-        assert!(cands.contains(&Fk(1)));
+        assert_eq!(cands[0], Fk(1), "first insert stays at earliest slot");
+        assert!(cands.contains(&Fk(2)));
+        assert_eq!(h.occupied(), 2);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -440,7 +414,7 @@ mod tests {
         let h = AddressHead::create_with_bits(&path, 12).unwrap();
         let txid = [1u8; 32];
         let err = h
-            .insert(&txid, Fk(u64::from(u32::MAX) + 1), |_| Ok(txid))
+            .insert(&txid, Fk(u64::from(u32::MAX) + 1))
             .unwrap_err();
         assert!(matches!(err, StoreError::InvalidFk));
         let _ = std::fs::remove_file(&path);
@@ -459,10 +433,8 @@ mod tests {
         let path = tmp("reopen");
         {
             let h = AddressHead::create_with_bits(&path, 12).unwrap();
-            let mut bodies = HashMap::new();
             let txid = [7u8; 32];
-            bodies.insert(3, txid);
-            h.insert(&txid, Fk(3), body_map(&bodies)).unwrap();
+            h.insert(&txid, Fk(3)).unwrap();
             h.flush().unwrap();
         }
         let h = AddressHead::open(&path).unwrap();
@@ -488,17 +460,15 @@ mod tests {
     fn insert_many_batch() {
         let path = tmp("batch");
         let h = AddressHead::create_with_bits(&path, 14).unwrap();
-        let mut bodies = HashMap::new();
         let mut entries = Vec::new();
         for i in 1..=50u64 {
             let mut txid = [0u8; 32];
             txid[0] = (i & 0xff) as u8;
             txid[1] = ((i >> 8) & 0xff) as u8;
             txid[4] = (i * 3) as u8;
-            bodies.insert(i, txid);
             entries.push((txid, Fk(i)));
         }
-        h.insert_many(&entries, body_map(&bodies)).unwrap();
+        h.insert_many(&entries).unwrap();
         assert_eq!(h.occupied(), 50);
         for (txid, fk) in &entries {
             assert!(h.probe_fks(txid).unwrap().contains(fk));

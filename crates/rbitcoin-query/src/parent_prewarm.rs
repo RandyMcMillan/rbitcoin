@@ -15,7 +15,6 @@
 
 use super::*;
 use crate::confirm_parent_cache::{prewarm_headroom_from_env, StashedThinInput};
-use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -497,35 +496,18 @@ impl Query {
             .thin_runway_ns
             .saturating_add(t_runway.elapsed().as_nanos() as u64);
 
-        // ── thin: durable head probes (slot-ordered for page locality) ─────
-        // Sort by primary probe slot so rayon workers touch nearby head pages
-        // instead of random order across the 8 GiB sparse map.
+        // ── thin: durable head probes (slot-ordered; batch body-txid verify) ─
+        // Sort by primary probe slot for head locality, then one batch that
+        // probes then verifies body txids in fk order (not random interleave).
         let t_head = Instant::now();
         need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
         st.head_lookups = st.head_lookups.saturating_add(need_head.len() as u32);
-        let head_hits: Vec<([u8; 32], Option<Fk>)> = if need_head.len() >= 32
-            && !self.confirm_cancelled()
-        {
-            let store = &self.store;
-            need_head
-                .par_iter()
-                .map(|txid| {
-                    let fk = store.get_fk_by_txid(txid).ok().flatten();
-                    (*txid, fk)
-                })
-                .collect()
-        } else {
-            let mut out = Vec::with_capacity(need_head.len());
-            for txid in &need_head {
-                if self.confirm_cancelled() {
-                    crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
-                    return Err(StoreError::Cancelled("confirm cancelled"));
-                }
-                let fk = self.store.get_fk_by_txid(txid).ok().flatten();
-                out.push((*txid, fk));
-            }
-            out
-        };
+        if self.confirm_cancelled() {
+            crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+            return Err(StoreError::Cancelled("confirm cancelled"));
+        }
+        let head_hits: Vec<([u8; 32], Option<Fk>)> =
+            self.store.get_fk_by_txid_batch(&need_head)?;
 
         let mut head_regs: Vec<(Fk, [u8; 32], u32)> = Vec::with_capacity(head_hits.len());
         let mut head_sourced: HashSet<[u8; 32]> = HashSet::with_capacity(head_hits.len());

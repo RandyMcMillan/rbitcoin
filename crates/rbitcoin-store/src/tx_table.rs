@@ -5,6 +5,7 @@ use crate::compact::{
 use crate::error::StoreError;
 use crate::var_table::VarTable;
 use rbitcoin_primitives::{Fk, TableKind};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Class A tx row (no wire blob — reconstruct from inputs/outputs + witness).
@@ -822,6 +823,62 @@ impl TxTable {
         Ok(None)
     }
 
+    /// Batch head resolve for prewarm thin (caller should **primary-slot sort**).
+    ///
+    /// 1. Sequential head probe in call order (slot-sorted → page locality).
+    /// 2. Unique candidate fks sorted → sequential body-txid reads.
+    /// 3. Match each txid to first candidate whose body txid equals it.
+    ///
+    /// Beats N independent `get_fk_by_txid` when body verifies thrash randomly
+    /// and when head walks share nearby slots.
+    pub fn get_fk_by_txid_batch(
+        &self,
+        txids: &[[u8; 32]],
+    ) -> Result<Vec<([u8; 32], Option<Fk>)>, StoreError> {
+        if txids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pairs: Vec<([u8; 32], Vec<Fk>)> = Vec::with_capacity(txids.len());
+        let mut cand_ids: Vec<u64> = Vec::new();
+        for txid in txids {
+            let cands = self.head.probe_fks(txid)?;
+            for fk in &cands {
+                if let Some(id) = fk.get() {
+                    cand_ids.push(id);
+                }
+            }
+            pairs.push((*txid, cands));
+        }
+        cand_ids.sort_unstable();
+        cand_ids.dedup();
+        // Body txid for unique fks in ascending order (page locality).
+        let mut body_txids: HashMap<u64, [u8; 32]> = HashMap::with_capacity(cand_ids.len());
+        for id in cand_ids {
+            match self.body_txid(Fk(id)) {
+                Ok(t) => {
+                    body_txids.insert(id, t);
+                }
+                Err(StoreError::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let mut out = Vec::with_capacity(pairs.len());
+        for (txid, cands) in pairs {
+            let mut hit = None;
+            for fk in cands {
+                let Some(id) = fk.get() else {
+                    continue;
+                };
+                if body_txids.get(&id) == Some(&txid) {
+                    hit = Some(fk);
+                    break;
+                }
+            }
+            out.push((txid, hit));
+        }
+        Ok(out)
+    }
+
     /// Read multi + spender_field for create tx output (packed Class A body).
     pub fn get_output_spender_meta(
         &self,
@@ -1260,6 +1317,59 @@ mod tests {
             assert!(raw.len() >= fo + 9);
             assert_eq!(&raw[fo..fo + 8], &[0u8; 8]);
         }
+    }
+
+    #[test]
+    fn get_fk_by_txid_batch_matches_single() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-batch-fk-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        let t = TxTable::create(&dir).unwrap();
+        let mut items = Vec::new();
+        for i in 0u8..5 {
+            let mut txid = [0u8; 32];
+            txid[0] = i.wrapping_add(1);
+            let tx = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0x01],
+                witness: vec![],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+            items.push((tx, inputs, outputs));
+        }
+        let fks = t.put_full_batch_indexed(&items, true).unwrap();
+        let mut keys: Vec<[u8; 32]> = items.iter().map(|(tx, _, _)| tx.txid).collect();
+        keys.sort_unstable_by_key(|k| t.head_primary_slot(k));
+        let batch = t.get_fk_by_txid_batch(&keys).unwrap();
+        assert_eq!(batch.len(), 5);
+        for (txid, fk) in &batch {
+            let single = t.get_fk_by_txid(txid).unwrap();
+            assert_eq!(*fk, single);
+            assert!(fk.is_some());
+        }
+        // Miss
+        let miss = t.get_fk_by_txid_batch(&[[0xff; 32]]).unwrap();
+        assert_eq!(miss[0].1, None);
+        let _ = fks;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

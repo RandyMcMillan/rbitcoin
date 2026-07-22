@@ -614,6 +614,14 @@ impl Store {
         self.txs.get_fk_by_txid(txid)
     }
 
+    /// Batch head resolve (prewarm thin). Prefer primary-slot-sorted `txids`.
+    pub fn get_fk_by_txid_batch(
+        &self,
+        txids: &[[u8; 32]],
+    ) -> Result<Vec<([u8; 32], Option<Fk>)>, StoreError> {
+        self.txs.get_fk_by_txid_batch(txids)
+    }
+
     /// Spentness by create fk (no `tx.head`). Body must be mlocked / range-known.
     ///
     /// Sole spender: Class C strong on the spender fk. Multi-list is rare in IBD

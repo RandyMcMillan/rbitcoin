@@ -157,8 +157,9 @@ struct Inner {
     /// Thin edges without a full body parse (mlock prewarm).
     thin_edges: HashMap<u64, Vec<StashedThinInput>>,
     /// create txid → (fk, runway height). Height is create height or the spend
-    /// height that needed this parent; GC drops entries outside `(tip, tip+depth]`
-    /// unless still held by `by_body` / `by_fk`.
+    /// height that needed this parent. GC keeps `(tip−depth, tip+depth]` so
+    /// recent external parents re-hit without `tx.head` (prewarm thin hot path).
+    /// Also kept while held by `by_body` / `by_fk`.
     by_txid: HashMap<[u8; 32], TxidEntry>,
     /// height → header + tx list (replaces header.head/body + header_txs reads).
     headers: HashMap<u32, HeaderPlanCache>,
@@ -1265,10 +1266,15 @@ impl Inner {
         }
     }
 
-    /// Drop `by_txid` entries outside `(tip, max_h]` unless still live elsewhere.
+    /// Drop `by_txid` entries outside `(tip−depth, tip+depth]` unless live.
+    ///
+    /// Keeping **depth behind tip** is intentional: external parents resolved
+    /// via head are keyed by spend height; re-spends of the same create in
+    /// the next few hundred blocks should hit this map (no second head probe).
     fn gc_by_txid(&mut self, tip: u32, max_h: u32) {
+        let min_keep = tip.saturating_sub(self.depth);
         self.by_txid.retain(|_txid, e| {
-            if e.height > tip && e.height <= max_h {
+            if e.height > min_keep && e.height <= max_h {
                 return true;
             }
             // Still a live runway body or sparse parent with outs.
@@ -1919,7 +1925,8 @@ mod tests {
         assert_eq!(c.ready_through(), 1);
     }
 
-    /// Regression: mlock-path `by_txid` must not grow forever with tip.
+    /// Regression: `by_txid` keeps depth behind tip (sticky external parents)
+    /// but still bounds growth to O(depth), not O(chain).
     #[test]
     fn advance_tip_prunes_by_txid_registrations() {
         let c = ConfirmParentCache::new(32);
@@ -1932,28 +1939,27 @@ mod tests {
             c.mark_scanned(h);
         }
         assert!(c.by_txid_count() >= 32, "registered runway creates");
-        // Tip mid-runway: old creates (height ≤ tip) must drop unless still live.
+        // tip=20, depth=32 → keep height in (0, 52] → all 1..=40 stay (sticky behind tip).
         c.advance_tip(20);
-        // Entries with height 21..=20+32=52 would stay; we only registered 1..=40
-        // so 21..=40 remain → at most 20.
+        assert_eq!(c.by_txid_count(), 40, "sticky window keeps depth behind tip");
+        assert_eq!(c.get_by_txid(&tx(10).txid), Some(Fk(10)));
+        assert_eq!(c.get_by_txid(&tx(30).txid), Some(Fk(30)));
+        // tip=45 → min_keep=13, max=77 → keep 14..=40 only.
+        c.advance_tip(45);
         assert!(
-            c.by_txid_count() <= 20,
+            c.by_txid_count() <= 27,
             "by_txid leaked: count={}",
             c.by_txid_count()
         );
-        // Create at 30 still resolvable (in window).
-        let t30 = tx(30);
-        assert_eq!(c.get_by_txid(&t30.txid), Some(Fk(30)));
-        // Create at 10 is gone (≤ tip).
-        let t10 = tx(10);
-        assert!(c.get_by_txid(&t10.txid).is_none());
-        // Parent needed later bumps height and survives past create tip.
+        assert!(c.get_by_txid(&tx(10).txid).is_none());
+        assert_eq!(c.get_by_txid(&tx(30).txid), Some(Fk(30)));
+        // Re-need parent at h=50 bumps height; survives until tip passes height+depth.
         let t5 = tx(5);
-        c.register_mlocked_create(Fk(5), t5.txid, 25); // re-need as parent at h=25
+        c.register_mlocked_create(Fk(5), t5.txid, 50);
         assert_eq!(c.get_by_txid(&t5.txid), Some(Fk(5)));
-        c.advance_tip(24);
-        assert_eq!(c.get_by_txid(&t5.txid), Some(Fk(5)));
-        c.advance_tip(25);
+        c.advance_tip(50);
+        assert_eq!(c.get_by_txid(&t5.txid), Some(Fk(5))); // still in sticky behind
+        c.advance_tip(50 + 32); // min_keep=50 → height 50 dropped
         assert!(c.get_by_txid(&t5.txid).is_none());
     }
 }

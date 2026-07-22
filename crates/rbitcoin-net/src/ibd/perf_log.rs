@@ -838,7 +838,6 @@ mod tests {
         assert!(line.contains("mlock=32MiB ranges=12 sh_runs=3"), "{line}");
         assert!(!line.contains("reserved"), "{line}");
         assert!(!line.contains("confirm_phases"), "{line}");
-        assert!(!line.contains("pause_fetch"), "{line}");
         assert!(!line.contains("mat="), "{line}");
     }
 
@@ -885,7 +884,6 @@ mod tests {
         assert!(line.contains("arch_res resolve_us/blk="), "{line}");
         assert!(line.contains("sticky_map="), "{line}");
         assert!(!line.contains("reserved"), "{line}");
-        assert!(!line.contains("pause_fetch"), "{line}");
         assert!(line.contains("pipe "), "{line}");
         assert!(line.contains("loop "), "{line}");
     }

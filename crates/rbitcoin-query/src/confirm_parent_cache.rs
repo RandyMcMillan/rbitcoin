@@ -768,24 +768,6 @@ impl ConfirmParentCache {
         g.ready_through >= max_plan
     }
 
-    /// Prewarm runway is **full** by either definition used elsewhere:
-    ///
-    /// 1. **Depth-full:** `ready_through >= tip + depth` (entire configured runway).
-    /// 2. **Headroom-full:** [`Self::headroom_ready`] for `tip+1` with the configured
-    ///    headroom — ready lead covers headroom, **or** every seeded plan is ready
-    ///    (short archive runway / depth edge).
-    pub fn is_runway_full(&self, tip: u32, headroom: u32) -> bool {
-        let through = self.ready_through();
-        let depth = self.depth();
-        let ahead = through.saturating_sub(tip);
-        if ahead >= depth {
-            return true;
-        }
-        // Next confirm heights start at tip+1.
-        let batch_end = tip.saturating_add(1);
-        self.headroom_ready(batch_end, headroom)
-    }
-
     /// Mark body scan complete for `height` (after registering needs/fills).
     pub fn mark_scanned(&self, height: u32) {
         self.mark_scanned_many(&[height]);
@@ -1846,35 +1828,6 @@ mod tests {
         if sticky_only.contains(&t.txid) {
             assert_eq!(sticky_only.len(), 1);
         }
-    }
-
-    #[test]
-    fn runway_full_depth_or_headroom_or_all_seeded() {
-        let c = ConfirmParentCache::new(64);
-        c.advance_tip(100);
-        // Empty: not full.
-        assert!(!c.is_runway_full(100, 16));
-
-        // Seed short runway tip+1..tip+10.
-        for h in 101..=110 {
-            c.ensure_plan(h, [h as u8; 32]);
-        }
-        assert!(!c.is_runway_full(100, 16));
-        // Headroom definition: all seeded plans ready → full even if depth=64.
-        for h in 101..=110 {
-            c.mark_scanned(h);
-        }
-        assert!(c.is_runway_full(100, 16));
-        assert_eq!(c.ready_through(), 110);
-
-        // Depth definition: ahead >= depth without needing every plan if ready_through high enough.
-        let c2 = ConfirmParentCache::new(32);
-        c2.advance_tip(0);
-        for h in 1..=32 {
-            c2.ensure_plan(h, [h as u8; 32]);
-            c2.mark_scanned(h);
-        }
-        assert!(c2.is_runway_full(0, 64)); // depth-full (32) even if headroom is 64
     }
 
     #[test]

@@ -64,75 +64,6 @@ pub(crate) enum AssignScope {
     /// Only tip hole + near band — when archive RAM budget is full so peers are
     /// not left `inflight=0` while confirm crawls on already-archived lag.
     TipNearOnly,
-    /// No new getdata. Prewarm lead is 0 while archive is far ahead — yield disk
-    /// until prewarm recovers (see IBD main loop hysteresis).
-    Paused,
-}
-
-/// Enter pause when prewarm lead is 0 and contiguous archive lead exceeds this.
-pub(crate) const PREWARM_FETCH_PAUSE_ARCH_LEAD: u32 = 1024;
-
-/// Update fetch-pause latch for prewarm vs archive lead.
-///
-/// - Enter pause: `pw_ahead == 0 && arch_lead > PREWARM_FETCH_PAUSE_ARCH_LEAD`
-/// - Exit pause: `prewarm_full` (depth-full **or** headroom/all-seeded full)
-///
-/// Returns `(new_paused, transitioned)` where `transitioned` is true when the
-/// latch flipped (for logging).
-pub(crate) fn update_prewarm_fetch_pause(
-    paused: bool,
-    pw_ahead: u32,
-    arch_lead: u32,
-    prewarm_full: bool,
-) -> (bool, bool) {
-    if paused {
-        if prewarm_full {
-            return (false, true);
-        }
-        (true, false)
-    } else if pw_ahead == 0 && arch_lead > PREWARM_FETCH_PAUSE_ARCH_LEAD {
-        (true, true)
-    } else {
-        (false, false)
-    }
-}
-
-#[cfg(test)]
-mod prewarm_pause_tests {
-    use super::*;
-
-    #[test]
-    fn prewarm_fetch_pause_until_full() {
-        // Healthy: prewarm ahead, deep arch — no pause.
-        assert_eq!(
-            update_prewarm_fetch_pause(false, 100, 50_000, false),
-            (false, false)
-        );
-        // Enter: prewarm empty, arch lead deep.
-        assert_eq!(
-            update_prewarm_fetch_pause(false, 0, 1025, false),
-            (true, true)
-        );
-        // Stay paused while climbing but not full yet.
-        assert_eq!(
-            update_prewarm_fetch_pause(true, 32, 50_000, false),
-            (true, false)
-        );
-        assert_eq!(
-            update_prewarm_fetch_pause(true, 64, 50_000, false),
-            (true, false)
-        );
-        // Exit only when prewarm reports full.
-        assert_eq!(
-            update_prewarm_fetch_pause(true, 64, 50_000, true),
-            (false, true)
-        );
-        // No enter when arch lead is only 1024 (strict >).
-        assert_eq!(
-            update_prewarm_fetch_pause(false, 0, 1024, false),
-            (false, false)
-        );
-    }
 }
 
 /// Assign getdata for bodies not yet Class A.
@@ -142,7 +73,6 @@ mod prewarm_pause_tests {
 /// 2. Near band — tip+1‥tip+[`NEAR_DEPTH`] (single peer per hash).
 /// 3. Far — forward densify past near (height-ascending); skipped in
 ///    [`AssignScope::TipNearOnly`].
-/// 4. [`AssignScope::Paused`] — prune only; no new requests.
 pub(crate) fn assign_work_ordered(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -163,11 +93,6 @@ pub(crate) fn assign_work_ordered(
     }
 
     prune_satisfied_inflight(&mut st.slots, &mut st.inflight, hub);
-
-    if matches!(scope, AssignScope::Paused) {
-        finish_assign(loop_stats, t0, issued);
-        return;
-    }
 
     let expired = st.body.expire_stale_pending(PENDING_STALE);
     for h in expired {

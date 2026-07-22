@@ -55,9 +55,7 @@ use progress::{
     format_rate, ibd_pct, work_chain_progress, TipRateTracker,
 };
 use state::IbdWorkState;
-use assign::{
-    assign_work_ordered, update_prewarm_fetch_pause, AssignScope, PREWARM_FETCH_PAUSE_ARCH_LEAD,
-};
+use assign::{assign_work_ordered, AssignScope};
 use events::{
     apply_archive_result, apply_confirm_reject, apply_peer_event, disconnect_all_peers,
     drain_ready_peer_and_archive_events, update_confirm_lag,
@@ -353,8 +351,8 @@ pub async fn ibd_cancellable(
     }
 
     // Archive pipeline: multi-core prep + exclusive writer (mmap Class A).
-    // Byte budget (~1 GiB default via RBITCOIN_ARCHIVE_QUEUE_MB) caps decoded
-    // blocks waiting for archive; getdata pauses when full (no drop).
+    // Byte budget (default via RBITCOIN_ARCHIVE_QUEUE_MB) caps decoded blocks
+    // waiting for archive; when full, getdata is TipNearOnly (no drop).
     let archive_queued = ArchiveQueueBudget::from_env();
     info!(
         "ibd: archive queue budget={} MiB (RBITCOIN_ARCHIVE_QUEUE_MB)",
@@ -427,10 +425,6 @@ pub async fn ibd_cancellable(
     update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_archived_height);
 
     let mut loop_n = 0u32;
-    // When prewarm lead is 0 and archive already has a deep contiguous runway,
-    // pause new getdata until prewarm recovers — reduces disk contention that
-    // freezes tip while arch lead keeps growing.
-    let mut fetch_paused_for_prewarm = false;
     loop {
         if cancelled() {
             warn!("ibd: cancel requested — stopping IBD");
@@ -495,32 +489,7 @@ pub async fn ibd_cancellable(
         // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
         // When arch RAM budget is full, still densify **tip-near** so confirm has
         // runway (mid-sync was inflight=0 while arch_q sat at cap).
-        // When prewarm is empty and archive lead is deep, pause all new getdata
-        // until prewarm is **full** (depth-full or headroom/all-seeded full).
-        let tip_for_pw = hub.tip_height().unwrap_or(0);
-        let pw_ahead = hub
-            .query
-            .parent_prewarm_ready_through()
-            .saturating_sub(tip_for_pw);
-        let arch_lead = st.max_archived_height.saturating_sub(tip_for_pw);
-        let pw_full = hub.query.prewarm_is_full();
-        let (paused, flipped) =
-            update_prewarm_fetch_pause(fetch_paused_for_prewarm, pw_ahead, arch_lead, pw_full);
-        if flipped {
-            if paused {
-                info!(
-                    "ibd: pause getdata (prewarm +{pw_ahead}, arch lead={arch_lead} > {PREWARM_FETCH_PAUSE_ARCH_LEAD})"
-                );
-            } else {
-                info!(
-                    "ibd: resume getdata (prewarm full +{pw_ahead}; arch lead={arch_lead})"
-                );
-            }
-        }
-        fetch_paused_for_prewarm = paused;
-        let scope = if fetch_paused_for_prewarm {
-            AssignScope::Paused
-        } else if archive_queued.has_room() {
+        let scope = if archive_queued.has_room() {
             AssignScope::Full
         } else {
             AssignScope::TipNearOnly
@@ -576,31 +545,7 @@ pub async fn ibd_cancellable(
         // (avoid double planner work every loop tick).
         let freed = inflight_before.saturating_sub(st.inflight.len());
         if freed >= 8 || st.inflight.is_empty() {
-            // Re-evaluate pause latch (prewarm may have advanced during drain).
-            let tip2 = hub.tip_height().unwrap_or(0);
-            let pw2 = hub
-                .query
-                .parent_prewarm_ready_through()
-                .saturating_sub(tip2);
-            let arch2 = st.max_archived_height.saturating_sub(tip2);
-            let pw_full2 = hub.query.prewarm_is_full();
-            let (paused2, flipped2) =
-                update_prewarm_fetch_pause(fetch_paused_for_prewarm, pw2, arch2, pw_full2);
-            if flipped2 {
-                if paused2 {
-                    info!(
-                        "ibd: pause getdata (prewarm +{pw2}, arch lead={arch2} > {PREWARM_FETCH_PAUSE_ARCH_LEAD})"
-                    );
-                } else {
-                    info!(
-                        "ibd: resume getdata (prewarm full +{pw2}; arch lead={arch2})"
-                    );
-                }
-            }
-            fetch_paused_for_prewarm = paused2;
-            let scope2 = if fetch_paused_for_prewarm {
-                AssignScope::Paused
-            } else if archive_queued.has_room() {
+            let scope2 = if archive_queued.has_room() {
                 AssignScope::Full
             } else {
                 AssignScope::TipNearOnly

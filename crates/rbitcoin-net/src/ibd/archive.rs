@@ -280,6 +280,9 @@ enum ParkInsert {
     /// the **second** charge via [`ArchiveResult::Dropped`] — **not** Ok
     /// (body is not written yet; Ok would false-mark Class A for confirm).
     Duplicate(PreparedArchive),
+    /// Too far ahead of `next_h` — refuse park so RAM stays near ContigPark head.
+    /// Caller releases charge and requeues getdata for later.
+    BeyondHorizon(PreparedArchive),
 }
 
 impl ContigPark {
@@ -298,12 +301,16 @@ impl ContigPark {
         self.parked.len()
     }
 
-    fn insert(&mut self, p: PreparedArchive) -> ParkInsert {
+    /// `horizon` = max offset past `next_h` we will hold (e.g. [`super::CONTIG_DENSIFY_AHEAD`]).
+    fn insert(&mut self, p: PreparedArchive, horizon: u32) -> ParkInsert {
         if p.height == u32::MAX {
             return ParkInsert::Late(p);
         }
         if p.height < self.next_h {
             return ParkInsert::Late(p);
+        }
+        if p.height > self.next_h.saturating_add(horizon) {
+            return ParkInsert::BeyondHorizon(p);
         }
         use std::collections::btree_map::Entry;
         match self.parked.entry(p.height) {
@@ -406,11 +413,12 @@ mod contig_park_tests {
     #[test]
     fn parks_ahead_until_gap_filled() {
         let mut p = ContigPark::new(10);
-        assert!(matches!(p.insert(prep(12)), super::ParkInsert::Parked));
-        assert!(matches!(p.insert(prep(11)), super::ParkInsert::Parked));
+        const H: u32 = 2048;
+        assert!(matches!(p.insert(prep(12), H), super::ParkInsert::Parked));
+        assert!(matches!(p.insert(prep(11), H), super::ParkInsert::Parked));
         assert!(p.take_contiguous(8).is_empty(), "gap at 10");
         assert_eq!(p.parked_len(), 2);
-        assert!(matches!(p.insert(prep(10)), super::ParkInsert::Parked));
+        assert!(matches!(p.insert(prep(10), H), super::ParkInsert::Parked));
         let run = p.take_contiguous(8);
         assert_eq!(run.len(), 3);
         assert_eq!(run[0].height, 10);
@@ -422,7 +430,7 @@ mod contig_park_tests {
     #[test]
     fn late_height_returned_for_idempotent_path() {
         let mut p = ContigPark::new(5);
-        match p.insert(prep(3)) {
+        match p.insert(prep(3), 2048) {
             super::ParkInsert::Late(late) => assert_eq!(late.height, 3),
             _ => panic!("expected Late"),
         }
@@ -430,11 +438,22 @@ mod contig_park_tests {
     }
 
     #[test]
+    fn beyond_horizon_refused() {
+        let mut p = ContigPark::new(10);
+        match p.insert(prep(10 + 2049), 2048) {
+            super::ParkInsert::BeyondHorizon(f) => assert_eq!(f.height, 10 + 2049),
+            _ => panic!("expected BeyondHorizon"),
+        }
+        assert_eq!(p.parked_len(), 0);
+        assert!(matches!(p.insert(prep(10 + 2048), 2048), super::ParkInsert::Parked));
+    }
+
+    #[test]
     fn duplicate_height_returns_dup_for_budget_release_only() {
         // Multi-peer redelivery: caller must ArchiveResult::Dropped (not Ok).
         let mut p = ContigPark::new(1);
-        assert!(matches!(p.insert(prep(1)), super::ParkInsert::Parked));
-        match p.insert(prep(1)) {
+        assert!(matches!(p.insert(prep(1), 2048), super::ParkInsert::Parked));
+        match p.insert(prep(1), 2048) {
             super::ParkInsert::Duplicate(d) => {
                 assert_eq!(d.height, 1);
                 assert_eq!(d.hash, prep(1).hash);
@@ -449,7 +468,7 @@ mod contig_park_tests {
     fn caps_run_at_max() {
         let mut p = ContigPark::new(0);
         for h in 0..10 {
-            assert!(matches!(p.insert(prep(h)), super::ParkInsert::Parked));
+            assert!(matches!(p.insert(prep(h), 2048), super::ParkInsert::Parked));
         }
         let run = p.take_contiguous(4);
         assert_eq!(run.len(), 4);
@@ -460,8 +479,8 @@ mod contig_park_tests {
     #[test]
     fn force_advance_unblocks_parked_prefix() {
         let mut p = ContigPark::new(10);
-        assert!(matches!(p.insert(prep(12)), super::ParkInsert::Parked));
-        assert!(matches!(p.insert(prep(11)), super::ParkInsert::Parked));
+        assert!(matches!(p.insert(prep(12), 2048), super::ParkInsert::Parked));
+        assert!(matches!(p.insert(prep(11), 2048), super::ParkInsert::Parked));
         assert!(p.take_contiguous(8).is_empty());
         // Simulate 10 already Class A — skip without a parked body.
         p.force_advance(1);
@@ -487,10 +506,13 @@ pub(crate) enum ArchiveResult {
     /// Release pipeline budget only — body was never Class-A written.
     ///
     /// Used for multi-peer redelivery while the first copy is still in
-    /// [`ContigPark`]. Must **not** call `mark_archived` (confirm would race
-    /// with "confirm without archive").
+    /// [`ContigPark`], and for beyond-horizon refuse. Must **not** call
+    /// `mark_archived`. When `requeue`, mark_missing so densify can re-getdata
+    /// once `write_next` advances into range.
     Dropped {
+        hash: BlockHash,
         wire_bytes: usize,
+        requeue: bool,
     },
 }
 
@@ -541,6 +563,8 @@ pub(crate) fn spawn_archive_pipeline(
                 let mut pri_open = true;
                 let mut far_open = true;
                 let mut park = ContigPark::new(write_next.load(Ordering::Relaxed));
+                // Refuse park beyond ContigPark head + densify band (same as assign).
+                let park_horizon = super::CONTIG_DENSIFY_AHEAD;
 
                 /// Park one prepared body; late/dup must always emit ArchiveResult
                 /// so archive_queued charge is released (else IBD never path_drains).
@@ -549,15 +573,28 @@ pub(crate) fn spawn_archive_pipeline(
                     p: PreparedArchive,
                     write_hub: &ChainHub,
                     write_result: &mpsc::UnboundedSender<ArchiveResult>,
+                    park_horizon: u32,
                 ) -> bool {
-                    match park.insert(p) {
+                    match park.insert(p, park_horizon) {
                         ParkInsert::Parked => true,
                         ParkInsert::Duplicate(dup) => {
                             // Multi-peer redelivery while first is still parked:
                             // free the **duplicate** charge only — do not claim Ok.
                             write_result
                                 .send(ArchiveResult::Dropped {
+                                    hash: dup.hash,
                                     wire_bytes: dup.wire_bytes,
+                                    requeue: false,
+                                })
+                                .is_ok()
+                        }
+                        ParkInsert::BeyondHorizon(far) => {
+                            // Too far ahead of ContigPark head — free RAM; re-getdata later.
+                            write_result
+                                .send(ArchiveResult::Dropped {
+                                    hash: far.hash,
+                                    wire_bytes: far.wire_bytes,
+                                    requeue: true,
                                 })
                                 .is_ok()
                         }
@@ -661,7 +698,13 @@ pub(crate) fn spawn_archive_pipeline(
 
                     if let Some(p) = first {
                         write_q_dec(&write_depth);
-                        if !handle_insert(&mut park, p, &write_hub, &write_result) {
+                        if !handle_insert(
+                            &mut park,
+                            p,
+                            &write_hub,
+                            &write_result,
+                            park_horizon,
+                        ) {
                             return;
                         }
                     }
@@ -675,14 +718,26 @@ pub(crate) fn spawn_archive_pipeline(
                         let mut got = false;
                         while let Ok(p) = pri_write_rx.try_recv() {
                             write_q_dec(&write_depth);
-                            if !handle_insert(&mut park, p, &write_hub, &write_result) {
+                            if !handle_insert(
+                                &mut park,
+                                p,
+                                &write_hub,
+                                &write_result,
+                                park_horizon,
+                            ) {
                                 return;
                             }
                             got = true;
                         }
                         while let Ok(p) = far_write_rx.try_recv() {
                             write_q_dec(&write_depth);
-                            if !handle_insert(&mut park, p, &write_hub, &write_result) {
+                            if !handle_insert(
+                                &mut park,
+                                p,
+                                &write_hub,
+                                &write_result,
+                                park_horizon,
+                            ) {
                                 return;
                             }
                             got = true;
@@ -759,6 +814,7 @@ pub(crate) fn spawn_archive_pipeline(
                                             p,
                                             &write_hub,
                                             &write_result,
+                                            park_horizon,
                                         ) {
                                             return;
                                         }
@@ -772,6 +828,7 @@ pub(crate) fn spawn_archive_pipeline(
                                         p,
                                         &write_hub,
                                         &write_result,
+                                        park_horizon,
                                     ) {
                                         return;
                                     }

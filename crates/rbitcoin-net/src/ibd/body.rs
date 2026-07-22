@@ -93,11 +93,22 @@ impl BodyPresence {
     /// Covers stuck decode/archive after [`mark_pending`] (tip hole otherwise
     /// never re-requests because `skip_download` treats pending as done).
     pub(crate) fn expire_stale_pending(&mut self, max_age: Duration) -> Vec<BlockHash> {
+        self.expire_stale_pending_if(max_age, |_| true)
+    }
+
+    /// Like [`expire_stale_pending`] but only for hashes matching `pred`.
+    ///
+    /// Used for ContigPark gap band (short timeout) without disturbing far pending.
+    pub(crate) fn expire_stale_pending_if(
+        &mut self,
+        max_age: Duration,
+        mut pred: impl FnMut(&BlockHash) -> bool,
+    ) -> Vec<BlockHash> {
         let now = Instant::now();
         let stale: Vec<BlockHash> = self
             .pending_since
             .iter()
-            .filter(|(_, t)| now.duration_since(**t) >= max_age)
+            .filter(|(h, t)| pred(h) && now.duration_since(**t) >= max_age)
             .map(|(h, _)| *h)
             .collect();
         for h in &stale {

@@ -114,6 +114,8 @@ pub(crate) const TIP_HOLE_THIRD_PEER_AFTER: Duration = Duration::from_secs(10);
 pub(crate) const MAX_PEER_POOL: usize = 256;
 /// Pending (framed, not Class A) longer than this → re-getdata.
 pub(crate) const PENDING_STALE: Duration = Duration::from_secs(45);
+/// ContigPark gap-band pending: re-getdata much sooner (slow peer / stuck prep).
+pub(crate) const CONTIG_GAP_PENDING_STALE: Duration = Duration::from_secs(5);
 /// Max hashes per far getdata batch.
 pub(crate) const FAR_BATCH_MAX: usize = 16;
 /// Cap height scan for far candidates per assign tick.
@@ -121,8 +123,11 @@ pub(crate) const FAR_SCAN_BUDGET: usize = 16_384;
 /// Max heights to re-getdata at ContigPark `write_next` (unstick archive under
 /// far admission is 0 / budget pressure when a far gap blocks the park).
 pub(crate) const CONTIG_GAP_FILL_MAX: u32 = 64;
+/// First N gap heights get tip-hole-style multi-peer race (rest single-peer).
+pub(crate) const CONTIG_GAP_RACE_PREFIX: usize = 8;
 /// Under budget pressure (`far_scale < 0.5`), densify only this many heights
 /// past ContigPark `write_next` (contiguous park feed — not full-horizon far).
+/// Also hard park horizon: refuse to charge/park bodies further ahead.
 pub(crate) const CONTIG_DENSIFY_AHEAD: u32 = 2048;
 /// Per-peer far slots while in full pressure (scale=0) for contig densify only.
 pub(crate) const CONTIG_DENSIFY_FAR_SLOTS: usize = 4;
@@ -474,6 +479,7 @@ pub async fn ibd_cancellable(
             &mut arch_res_rx,
             &arch_job_tx,
             &archive_queued,
+            &archive_write_next,
             &loop_stats,
             peer_sess.book_mut(),
             local_addr,
@@ -549,6 +555,7 @@ pub async fn ibd_cancellable(
             &mut arch_res_rx,
             &arch_job_tx,
             &archive_queued,
+            &archive_write_next,
             &loop_stats,
             peer_sess.book_mut(),
             local_addr,
@@ -992,6 +999,7 @@ pub async fn ibd_cancellable(
                     ev,
                     &arch_job_tx,
                     &archive_queued,
+                    &archive_write_next,
                     peer_sess.book_mut(),
                     local_addr,
                 );
@@ -1008,6 +1016,7 @@ pub async fn ibd_cancellable(
                     ev,
                     &arch_job_tx,
                     &archive_queued,
+                    &archive_write_next,
                     peer_sess.book_mut(),
                     local_addr,
                 );
@@ -1166,7 +1175,11 @@ pub async fn ibd_cancellable(
     while let Ok(r) = arch_res_rx.try_recv() {
         match r {
             ArchiveResult::Ok { hash, .. } => st.body.mark_archived(hash),
-            ArchiveResult::Dropped { .. } => {}
+            ArchiveResult::Dropped { hash, requeue, .. } => {
+                if requeue {
+                    st.body.mark_missing(hash);
+                }
+            }
             ArchiveResult::Err { hash, .. } => st.body.mark_missing(hash),
         }
     }
@@ -1253,10 +1266,10 @@ mod contig_gap_assign_tests {
 
         let need = contig_gap_need(&mut st, &hub, 100, CONTIG_GAP_FILL_MAX);
         assert!(!need.is_empty(), "expected gap fills");
-        assert_eq!(need[0], h(103), "first fill after skips");
-        assert!(need
-            .iter()
-            .all(|x| *x != h(100) && *x != h(101) && *x != h(102)));
+        // 100 pending + 101 archived skipped; 102 inflight is kept for multi-peer race.
+        assert_eq!(need[0], h(102), "inflight kept for race prefix");
+        assert!(need.iter().all(|x| *x != h(100) && *x != h(101)));
+        assert!(need.contains(&h(103)));
         for hash in &need {
             let ht = st.hash_height[hash];
             assert!((100..=100 + CONTIG_GAP_FILL_MAX - 1).contains(&ht));

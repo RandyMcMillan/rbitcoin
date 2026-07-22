@@ -9,7 +9,10 @@ use super::path::work_path_tips;
 use super::peer_io::{note_block_progress, note_block_rx, PeerCmd, PeerEvent};
 use super::state::IbdWorkState;
 use super::status::LoopStats;
-use super::{MAX_ORDERED_HEADERS, MAX_PEER_POOL, NEAR_DEPTH, ORDERED_HEADERS_SOFT_CAP};
+use super::{
+    CONTIG_DENSIFY_AHEAD, CONTIG_GAP_FILL_MAX, MAX_ORDERED_HEADERS, MAX_PEER_POOL, NEAR_DEPTH,
+    ORDERED_HEADERS_SOFT_CAP,
+};
 use crate::chain::ChainHub;
 use crate::codec::MAX_HEADERS_RESULTS;
 use crate::error::NetError;
@@ -63,6 +66,7 @@ pub(crate) fn drain_ready_peer_and_archive_events(
     arch_res_rx: &mut mpsc::UnboundedReceiver<ArchiveResult>,
     arch_job_tx: &mpsc::UnboundedSender<ArchiveJob>,
     archive_queued: &ArchiveQueueBudget,
+    archive_write_next: &AtomicU32,
     loop_stats: &LoopStats,
     peer_book: &mut AddrMan,
     local_addr: SocketAddr,
@@ -96,6 +100,7 @@ pub(crate) fn drain_ready_peer_and_archive_events(
                     ev,
                     arch_job_tx,
                     archive_queued,
+                    archive_write_next,
                     peer_book,
                     local_addr,
                 );
@@ -118,6 +123,7 @@ pub(crate) fn drain_ready_peer_and_archive_events(
                     ev,
                     arch_job_tx,
                     archive_queued,
+                    archive_write_next,
                     peer_book,
                     local_addr,
                 );
@@ -141,6 +147,7 @@ pub(crate) fn apply_peer_event(
     ev: PeerEvent,
     arch_job_tx: &mpsc::UnboundedSender<ArchiveJob>,
     archive_queued: &ArchiveQueueBudget,
+    archive_write_next: &AtomicU32,
     peer_book: &mut AddrMan,
     local_addr: SocketAddr,
 ) {
@@ -357,19 +364,31 @@ pub(crate) fn apply_peer_event(
             // Prevent re-getdata while prep/writer owns this body.
             st.body.mark_pending(hash);
             let tip_h = hub.tip_height().unwrap_or(0);
-            let priority = st
-                .hash_height
-                .get(&hash)
-                .map(|&ht| ht <= tip_h.saturating_add(NEAR_DEPTH))
-                .unwrap_or(false);
-            // Approx wire size for RAM budget (already-decoded; never drop).
-            let wire_bytes = block.total_size();
-            archive_queued.charge(wire_bytes);
             let height = st
                 .hash_height
                 .get(&hash)
                 .copied()
                 .unwrap_or(u32::MAX);
+            let write_next = archive_write_next.load(Ordering::Relaxed);
+            // Hard horizon: do not charge/park bodies ContigPark cannot use yet.
+            // Re-getdata once write_next advances into range (densify / gap cover).
+            if height != u32::MAX
+                && height > write_next.saturating_add(CONTIG_DENSIFY_AHEAD)
+            {
+                st.body.mark_missing(hash);
+                return;
+            }
+            let priority = st
+                .hash_height
+                .get(&hash)
+                .map(|&ht| {
+                    ht <= tip_h.saturating_add(NEAR_DEPTH)
+                        || ht <= write_next.saturating_add(CONTIG_GAP_FILL_MAX)
+                })
+                .unwrap_or(false);
+            // Approx wire size for RAM budget (already-decoded; never drop).
+            let wire_bytes = block.total_size();
+            archive_queued.charge(wire_bytes);
             if arch_job_tx
                 .send(ArchiveJob {
                     block,
@@ -472,9 +491,16 @@ pub(crate) fn apply_archive_result(
                 st.max_archived_height = st.max_archived_height.max(ht);
             }
         }
-        ArchiveResult::Dropped { wire_bytes } => {
-            // Duplicate while ContigPark still holds the first body — budget only.
+        ArchiveResult::Dropped {
+            hash,
+            wire_bytes,
+            requeue,
+        } => {
+            // Duplicate (requeue=false) or beyond-horizon refuse (requeue=true).
             archive_queued.release(wire_bytes);
+            if requeue {
+                st.body.mark_missing(hash);
+            }
         }
         ArchiveResult::Err {
             hash,

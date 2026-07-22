@@ -5,9 +5,10 @@ use super::peer_io::{touch_block_progress, PeerCmd, PeerSlot};
 use super::state::{self, IbdWorkState};
 use super::status::LoopStats;
 use super::{
-    IbdConfig, CONTIG_DENSIFY_AHEAD, CONTIG_DENSIFY_FAR_SLOTS, CONTIG_GAP_FILL_MAX, FAR_BATCH_MAX,
-    FAR_SCAN_BUDGET, NEAR_DEPTH, PENDING_STALE, TIP_HOLE_IMMEDIATE_PEERS, TIP_HOLE_MAX,
-    TIP_HOLE_MAX_PEERS, TIP_HOLE_THIRD_PEER_AFTER,
+    IbdConfig, CONTIG_DENSIFY_AHEAD, CONTIG_DENSIFY_FAR_SLOTS, CONTIG_GAP_FILL_MAX,
+    CONTIG_GAP_PENDING_STALE, CONTIG_GAP_RACE_PREFIX, FAR_BATCH_MAX, FAR_SCAN_BUDGET, NEAR_DEPTH,
+    PENDING_STALE, TIP_HOLE_IMMEDIATE_PEERS, TIP_HOLE_MAX, TIP_HOLE_MAX_PEERS,
+    TIP_HOLE_THIRD_PEER_AFTER,
 };
 use crate::chain::ChainHub;
 use bitcoin::BlockHash;
@@ -109,6 +110,17 @@ pub(crate) fn assign_work_ordered(
 
     let expired = st.body.expire_stale_pending(PENDING_STALE);
     for h in expired {
+        clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
+    }
+    // ContigPark gap band: re-request much sooner (one slow peer must not freeze arch).
+    let wn = archive_write_next;
+    let gap_hi = wn.saturating_add(CONTIG_GAP_FILL_MAX.saturating_sub(1));
+    let gap_expired = st.body.expire_stale_pending_if(CONTIG_GAP_PENDING_STALE, |h| {
+        st.hash_height
+            .get(h)
+            .is_some_and(|&ht| ht >= wn && ht <= gap_hi)
+    });
+    for h in gap_expired {
         clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
     }
 
@@ -528,7 +540,10 @@ pub(crate) fn tip_hole_peer_target(
 }
 
 /// Collect hashes for ContigPark `write_next`‥`write_next+max-1` that still need
-/// getdata (height-ascending). Pure helper for tests and assign.
+/// getdata or multi-peer race (height-ascending).
+///
+/// Includes hashes already in `inflight` (so the race prefix can add peers).
+/// Skips pending/known/rejected (body already in pipeline or done).
 pub(crate) fn contig_gap_need(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -547,11 +562,15 @@ pub(crate) fn contig_gap_need(
         if !st.ordered_set.contains(&h) {
             continue;
         }
-        if st.inflight.contains_key(&h)
-            || st.body.is_known_archived(&h)
+        if st.body.is_known_archived(&h)
             || st.body.is_pending(&h)
             || st.body.is_rejected(&h)
         {
+            continue;
+        }
+        // Already inflight: keep for multi-peer race on the prefix.
+        if st.inflight.contains_key(&h) {
+            out.push(h);
             continue;
         }
         if st.body.skip_download(hub, &h) {
@@ -562,10 +581,11 @@ pub(crate) fn contig_gap_need(
     out
 }
 
-/// Cover ContigPark's next commit heights with getdata (single peer each).
+/// Cover ContigPark's next commit heights with getdata.
 ///
-/// Runs even when `far_scale == 0` so a missing far gap cannot freeze the writer
-/// while the budget is full of parked later heights.
+/// First [`CONTIG_GAP_RACE_PREFIX`] heights use tip-hole multi-peer race (2–3
+/// peers). Remaining band heights get a single peer. Runs even when
+/// `far_scale == 0` so a far gap cannot freeze the writer.
 pub(crate) fn cover_archive_contig_gap(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -581,39 +601,63 @@ pub(crate) fn cover_archive_contig_gap(
         return 0;
     }
     let mut issued = 0u64;
-    let mut room = cfg.window.saturating_sub(st.inflight.len());
-    if room == 0 {
-        // Still try: reserve a few slots over window for the critical gap
-        // (window is soft enough; one missing body unblocks MiB of park).
-        room = CONTIG_GAP_FILL_MAX.min(8) as usize;
-    }
     let mut peer_i = st.assign_rot;
     st.assign_rot = st.assign_rot.wrapping_add(1);
-    for h in need {
-        if room == 0 {
-            break;
+    let now = Instant::now();
+
+    for (i, &h) in need.iter().enumerate() {
+        if hub.has_block(&h) || st.body.is_pending(&h) || st.body.ready(hub, &h) {
+            continue;
         }
-        // Prefer a peer with free per_peer capacity.
-        let mut placed = false;
+        let race = i < CONTIG_GAP_RACE_PREFIX;
+        let (already, second_at) = st
+            .inflight
+            .get(&h)
+            .map(|e| (e.len(), e.second_peer_at))
+            .unwrap_or((0, None));
+        let want = if race {
+            tip_hole_peer_target(already, second_at, now)
+        } else if already >= 1 {
+            continue; // single-peer band already covered
+        } else {
+            1
+        };
+        if already >= want {
+            continue;
+        }
+        let mut need_peers = want - already;
+        let mut placed_any = false;
         for _ in 0..alive.len() {
+            if need_peers == 0 {
+                break;
+            }
             let pid = alive[peer_i % alive.len()];
             peer_i += 1;
             let Some(idx) = st.slots.iter().position(|s| s.id == pid && s.alive) else {
                 continue;
             };
-            if st.slots[idx].in_flight.len() >= cfg.per_peer {
-                continue;
-            }
             if st.slots[idx].in_flight.contains(&h) {
                 continue;
             }
+            if st
+                .inflight
+                .get(&h)
+                .map(|e| e.contains_peer(pid))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if st.slots[idx].in_flight.len() >= cfg.per_peer {
+                continue;
+            }
+            let mut room = 1usize;
             if issue_one(st, pid, h, &mut room, &mut issued) {
-                placed = true;
-                break;
+                placed_any = true;
+                need_peers = need_peers.saturating_sub(1);
             }
         }
-        if !placed {
-            // No free peer slot — stop; next tick will retry.
+        // Race prefix: if write_next has zero coverage and no free peer, stop.
+        if race && already == 0 && !placed_any {
             break;
         }
     }

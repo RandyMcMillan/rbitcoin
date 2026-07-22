@@ -1142,6 +1142,55 @@ impl ConfirmParentCache {
         Self::out_present_locked(&g, id, vout)
     }
 
+    /// True when prewarm pin can skip store decode for `vouts` (wave already
+    /// served by `get_parent_outs_needed` / body path).
+    ///
+    /// Covered if sparse `by_fk` has a full checked set (or all live outs), or
+    /// a runway `by_body` holds every requested index.
+    pub fn parent_pin_covered(&self, fk: Fk, vouts: &[u32]) -> bool {
+        let Some(id) = fk.get() else {
+            return false;
+        };
+        let g = self.inner.lock().unwrap();
+        Self::pin_covered_locked(&g, id, vouts)
+    }
+
+    /// One-lock cover check for many parents (`(create_fk_id, need_vouts)`).
+    pub fn parent_pins_covered(&self, items: &[(u64, Vec<u32>)]) -> Vec<bool> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        let g = self.inner.lock().unwrap();
+        items
+            .iter()
+            .map(|(id, vouts)| Self::pin_covered_locked(&g, *id, vouts))
+            .collect()
+    }
+
+    /// Keep-alive already-stashed parents for sliding-window re-pin skip:
+    /// attach `need_fk` at `height` so tip GC does not drop them before confirm.
+    pub fn touch_parent_needs(&self, height: u32, fk: Fk, vouts: &[u32]) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        if vouts.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        g.touch_parent_needs_inner(height, id, vouts);
+    }
+
+    /// Batch keep-alive: `(height, create_fk_id, vouts)`.
+    pub fn touch_parent_needs_batch(&self, items: &[(u32, u64, Vec<u32>)]) {
+        if items.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        for (height, id, vouts) in items {
+            g.touch_parent_needs_inner(*height, *id, vouts);
+        }
+    }
+
     /// One-lock runway hit: `txid` known on runway (mlock or full body).
     ///
     /// With mlock prewarm we only have `by_txid` (no parsed outs); vout validity
@@ -1171,6 +1220,30 @@ impl ConfirmParentCache {
         g.by_body
             .get(&id)
             .is_some_and(|b| (vout as usize) < b.outputs.len())
+    }
+
+    /// See [`Self::parent_pin_covered`].
+    #[inline]
+    fn pin_covered_locked(g: &Inner, id: u64, vouts: &[u32]) -> bool {
+        if vouts.is_empty() {
+            return true;
+        }
+        if let Some(e) = g.by_fk.get(&id) {
+            // Prewarm already spent-filtered these vouts.
+            if !e.checked.is_empty() && vouts.iter().all(|v| e.checked.contains(v)) {
+                return true;
+            }
+            // Legacy / partial: every requested vout is a live stashed out.
+            if !e.outs.is_empty() && vouts.iter().all(|v| e.outs.contains_key(v)) {
+                return true;
+            }
+        }
+        if let Some(b) = g.by_body.get(&id) {
+            return vouts
+                .iter()
+                .all(|v| (*v as usize) < b.outputs.len());
+        }
+        false
     }
 
     pub fn get_parent_tx(&self, fk: Fk) -> Option<TxRecord> {
@@ -1462,6 +1535,33 @@ impl Inner {
             &[vout],
             None,
         );
+    }
+
+    /// Attach plan keep-alive for an already-stashed parent (no re-decode).
+    fn touch_parent_needs_inner(&mut self, height: u32, id: u64, vouts: &[u32]) {
+        // Collect under by_fk/by_body first — cannot hold plan mut borrow too.
+        let pins: Vec<u32> = if let Some(e) = self.by_fk.get(&id) {
+            let mut vs: Vec<u32> = vouts
+                .iter()
+                .copied()
+                .filter(|v| e.outs.contains_key(v) || e.checked.contains(v))
+                .collect();
+            if vs.is_empty() {
+                if let Some(&v) = e.outs.keys().next().or_else(|| e.checked.iter().next()) {
+                    vs.push(v);
+                }
+            }
+            vs
+        } else if self.by_body.contains_key(&id) {
+            vouts.to_vec()
+        } else {
+            return;
+        };
+        if let Some(plan) = self.plans.get_mut(&height) {
+            for v in pins {
+                plan.need_fk.insert((id, v));
+            }
+        }
     }
 
     fn put_parent_outs_resolved_inner(
@@ -1939,6 +2039,43 @@ mod tests {
         assert_eq!(live0.len(), 1);
         // Unknown vout 2 → not complete → None (wave falls back to store).
         assert!(c.get_parent_outs_needed(Fk(90), &[0, 2]).is_none());
+    }
+
+    #[test]
+    fn parent_pin_covered_and_touch_skip_redecode() {
+        // Sliding-window re-pin: already-stashed outs → covered; touch keep-alive.
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(0);
+        c.ensure_plan(1, [1u8; 32]);
+        c.ensure_plan(2, [2u8; 32]);
+        let t = tx(42);
+        c.put_parent_outs_resolved(
+            1,
+            Fk(42),
+            t,
+            &[(0, out(50)), (1, out(60))],
+            &[0, 1],
+            Some(None),
+        );
+        assert!(c.parent_pin_covered(Fk(42), &[0]));
+        assert!(c.parent_pin_covered(Fk(42), &[0, 1]));
+        assert!(!c.parent_pin_covered(Fk(42), &[0, 2])); // missing checked vout
+        assert!(!c.parent_pin_covered(Fk(99), &[0])); // unknown parent
+
+        let batch = c.parent_pins_covered(&[(42, vec![0, 1]), (99, vec![0])]);
+        assert_eq!(batch, vec![true, false]);
+
+        // Touch for a later height (sliding window) without re-put.
+        c.touch_parent_needs(2, Fk(42), &[0, 1]);
+        // Wave still serves spent-filtered outs after touch.
+        let (_, live, filtered) = c.get_parent_outs_needed(Fk(42), &[0, 1]).unwrap();
+        assert!(filtered);
+        assert_eq!(live.len(), 2);
+
+        // Body path also covers pin skip.
+        c.put_body(Fk(70), 1, tx(70), vec![out(1), out(2)], vec![]);
+        assert!(c.parent_pin_covered(Fk(70), &[0, 1]));
+        assert!(!c.parent_pin_covered(Fk(70), &[0, 2]));
     }
 
     #[test]

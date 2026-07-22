@@ -60,6 +60,9 @@ pub mod parent_prewarm_stats {
     pub static CREATES: AtomicU64 = AtomicU64::new(0);
     pub static ALREADY_READY: AtomicU64 = AtomicU64::new(0);
     pub static PARENT_UNIQUE: AtomicU64 = AtomicU64::new(0);
+    /// Pin loop: already-stashed outs (skip store decode) vs first-time pin.
+    pub static PIN_ALREADY_CACHED: AtomicU64 = AtomicU64::new(0);
+    pub static PIN_NEW: AtomicU64 = AtomicU64::new(0);
     pub static PARENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
     pub static FULL_TX_READS: AtomicU64 = AtomicU64::new(0);
     pub static BODY_TX_READS: AtomicU64 = AtomicU64::new(0);
@@ -99,6 +102,8 @@ pub mod parent_prewarm_stats {
         pub creates: u64,
         pub already_ready: u64,
         pub parent_unique: u64,
+        pub pin_already_cached: u64,
+        pub pin_new: u64,
         pub cache_hits: u64,
         pub body_tx: u64,
         pub parent_tx: u64,
@@ -133,6 +138,8 @@ pub mod parent_prewarm_stats {
             creates: CREATES.swap(0, Ordering::Relaxed),
             already_ready: ALREADY_READY.swap(0, Ordering::Relaxed),
             parent_unique: PARENT_UNIQUE.swap(0, Ordering::Relaxed),
+            pin_already_cached: PIN_ALREADY_CACHED.swap(0, Ordering::Relaxed),
+            pin_new: PIN_NEW.swap(0, Ordering::Relaxed),
             cache_hits: PARENT_CACHE_HITS.swap(0, Ordering::Relaxed),
             body_tx: BODY_TX_READS.swap(0, Ordering::Relaxed),
             parent_tx: FULL_TX_READS.swap(0, Ordering::Relaxed),
@@ -177,6 +184,8 @@ pub mod parent_prewarm_stats {
         add!(creates_registered, CREATES);
         add!(already_ready, ALREADY_READY);
         add!(parent_unique, PARENT_UNIQUE);
+        add!(pin_already_cached, PIN_ALREADY_CACHED);
+        add!(pin_new, PIN_NEW);
         add!(parent_cache_hits, PARENT_CACHE_HITS);
         add!(full_tx_reads, FULL_TX_READS);
         add!(body_tx_reads, BODY_TX_READS);

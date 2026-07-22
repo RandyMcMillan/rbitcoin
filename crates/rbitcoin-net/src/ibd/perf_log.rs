@@ -129,6 +129,9 @@ pub(crate) struct IbdPerfSample {
     pub pw_creates: u64,
     pub pw_already_ready: u64,
     pub pw_parent_unique: u64,
+    /// Of uniq_p: already-stashed (skip re-decode) vs first-time store pin.
+    pub pw_pin_already_cached: u64,
+    pub pw_pin_new: u64,
     pub pw_cache_hits: u64,
     /// Phase-1 body Class A reads this window.
     pub pw_body_tx_reads: u64,
@@ -271,6 +274,8 @@ impl Default for IbdPerfSample {
             pw_creates: 0,
             pw_already_ready: 0,
             pw_parent_unique: 0,
+            pw_pin_already_cached: 0,
+            pw_pin_new: 0,
             pw_cache_hits: 0,
             pw_body_tx_reads: 0,
             pw_parent_tx_reads: 0,
@@ -465,6 +470,8 @@ pub(crate) fn sample(
         pw_creates: pw.creates,
         pw_already_ready: pw.already_ready,
         pw_parent_unique: pw.parent_unique,
+        pw_pin_already_cached: pw.pin_already_cached,
+        pw_pin_new: pw.pin_new,
         pw_cache_hits: pw.cache_hits,
         pw_body_tx_reads: pw.body_tx,
         pw_parent_tx_reads: pw.parent_tx,
@@ -570,7 +577,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     };
     let mlock_mb = s.mlock_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} blks={} body_io={} parent_io={} cache%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
+        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} blks={} body_io={} parent_io={} pin_cached={} pin_new={} cache%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
         s.pw_ahead,
         s.pw_ready_through,
         s.pw_parents,
@@ -580,6 +587,8 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.pw_blocks,
         s.pw_body_tx_reads,
         s.pw_parent_tx_reads,
+        s.pw_pin_already_cached,
+        s.pw_pin_new,
         cache_pct,
         s.pw_ms,
         s.pw_hdr_ms,
@@ -659,7 +668,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let cp_tot = s.cp_wave + s.cp_class_a + s.cp_store;
     let mlock_mb = s.mlock_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} cache_hit={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} head={}/{} mlock_sys={}/{} edges same={} runway={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
+        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cached={} pin_new={} cache_hit={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} head={}/{} mlock_sys={}/{} edges same={} runway={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
         s.pw_ahead,
         s.pw_ready_through,
         s.pw_parents,
@@ -672,6 +681,8 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.pw_creates,
         s.pw_already_ready,
         s.pw_parent_unique,
+        s.pw_pin_already_cached,
+        s.pw_pin_new,
         s.pw_cache_hits,
         s.pw_body_tx_reads,
         s.pw_parent_tx_reads,
@@ -813,6 +824,8 @@ mod tests {
         s.pw_parent_tx_reads = 120;
         s.pw_cache_hits = 80;
         s.pw_parent_unique = 20;
+        s.pw_pin_already_cached = 5;
+        s.pw_pin_new = 15;
         s.pw_ms = 40;
         s.mlock_bytes = 32 * 1024 * 1024;
         s.mlock_ranges = 12;
@@ -821,6 +834,7 @@ mod tests {
         assert!(line.contains("prewarm +64 thru=200"), "{line}");
         assert!(line.contains("by_txid=12 bodies=48 plans=80/256"), "{line}");
         assert!(line.contains("body_io=400 parent_io=120"), "{line}");
+        assert!(line.contains("pin_cached=5 pin_new=15"), "{line}");
         assert!(line.contains("mlock=32MiB ranges=12 sh_runs=3"), "{line}");
         assert!(!line.contains("reserved"), "{line}");
         assert!(!line.contains("confirm_phases"), "{line}");
@@ -845,6 +859,8 @@ mod tests {
         s.pw_creates = 50;
         s.pw_body_tx_reads = 200;
         s.pw_parent_tx_reads = 50;
+        s.pw_pin_already_cached = 12;
+        s.pw_pin_new = 38;
         s.pipe.write_blocks = 5;
         s.pipe.write_ns = 5_000_000;
         s.mlock_bytes = 16 * 1024 * 1024;
@@ -864,6 +880,7 @@ mod tests {
         assert!(line.contains("utxo_p=100"), "{line}");
         assert!(line.contains("creates=50"), "{line}");
         assert!(line.contains("body_io=200 parent_io=50"), "{line}");
+        assert!(line.contains("pin_cached=12 pin_new=38"), "{line}");
         assert!(line.contains("mlock=16MiB ranges=4 sh_runs=2"), "{line}");
         assert!(line.contains("arch_res resolve_us/blk="), "{line}");
         assert!(line.contains("sticky_map="), "{line}");

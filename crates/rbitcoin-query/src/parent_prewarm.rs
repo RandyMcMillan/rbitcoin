@@ -27,6 +27,10 @@ pub struct PrewarmStats {
     pub already_ready: u32,
     /// Unique parent create fks pinned this call (after dedup).
     pub parent_unique: u32,
+    /// Of `parent_unique`: outs already stashed — skip store decode (re-pin).
+    pub pin_already_cached: u32,
+    /// Of `parent_unique`: first-time sparse pin (store decode).
+    pub pin_new: u32,
     /// Parent outs served from runway txid map / same-batch.
     pub parent_cache_hits: u32,
     /// Body txs mlocked + full-decoded (phase 1).
@@ -655,11 +659,31 @@ impl Query {
 
         // ── Pin external parents: mlock + sparse needed outs (spent-filtered) ─
         // Wave_fill then hits get_parent_outs_needed without store re-decode.
+        // Skip re-decode when outs already cover needed vouts (sliding-window re-pin).
         let t_par = Instant::now();
         let mut uniq_parents: Vec<u64> = parent_need.keys().copied().collect();
         uniq_parents.sort_unstable();
         st.parent_unique = st.parent_unique.saturating_add(uniq_parents.len() as u32);
 
+        // Build need lists once; cover-check under one cache lock.
+        let mut pin_jobs: Vec<(u64, u32, Vec<u32>, Vec<u32>)> =
+            Vec::with_capacity(uniq_parents.len());
+        for pid in uniq_parents {
+            let mut need_hs = parent_need.remove(&pid).unwrap_or_default();
+            need_hs.sort_unstable();
+            need_hs.dedup();
+            let max_h = need_hs.last().copied().unwrap_or(0);
+            let mut need_vouts = parent_vouts.remove(&pid).unwrap_or_default();
+            need_vouts.sort_unstable();
+            need_vouts.dedup();
+            pin_jobs.push((pid, max_h, need_hs, need_vouts));
+        }
+        let cover_keys: Vec<(u64, Vec<u32>)> = pin_jobs
+            .iter()
+            .map(|(pid, _, _, vouts)| (*pid, vouts.clone()))
+            .collect();
+        let covered = self.confirm_parents.parent_pins_covered(&cover_keys);
+        let mut touch_batch: Vec<(u32, u64, Vec<u32>)> = Vec::new();
         let mut parent_ranges: Vec<(Fk, u64, u64)> = Vec::new();
         // (max_height, fk, tx, live outs, checked vouts, coinbase_height)
         let mut sparse_parents: Vec<(
@@ -669,20 +693,21 @@ impl Query {
             Vec<(u32, rbitcoin_store::OutputRecord)>,
             Vec<u32>,
             Option<Option<u32>>,
-        )> = Vec::with_capacity(uniq_parents.len());
-        for pid in uniq_parents {
+        )> = Vec::with_capacity(pin_jobs.len());
+        for (i, (pid, max_h, need_hs, need_vouts)) in pin_jobs.into_iter().enumerate() {
             if self.confirm_cancelled() {
                 crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Cancelled("confirm cancelled"));
             }
             let fk = Fk(pid);
-            let mut need_hs = parent_need.remove(&pid).unwrap_or_default();
-            need_hs.sort_unstable();
-            need_hs.dedup();
-            let max_h = need_hs.last().copied().unwrap_or(0);
-            let mut need_vouts = parent_vouts.remove(&pid).unwrap_or_default();
-            need_vouts.sort_unstable();
-            need_vouts.dedup();
+            if covered.get(i).copied().unwrap_or(false) {
+                st.pin_already_cached = st.pin_already_cached.saturating_add(1);
+                // Keep-alive for GC; no mlock / store decode.
+                touch_batch.push((max_h, pid, need_vouts));
+                st.utxo_parents = st.utxo_parents.saturating_add(1);
+                continue;
+            }
+            st.pin_new = st.pin_new.saturating_add(1);
 
             // Prefer cached body range (same-batch creates) over idx read.
             let range = self
@@ -787,6 +812,10 @@ impl Query {
                 }
             }
             st.utxo_parents = st.utxo_parents.saturating_add(1);
+        }
+        if !touch_batch.is_empty() {
+            self.confirm_parents
+                .touch_parent_needs_batch(&touch_batch);
         }
         if !parent_ranges.is_empty() {
             self.confirm_parents.put_body_ranges_batch(&parent_ranges);

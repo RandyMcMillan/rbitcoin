@@ -624,15 +624,93 @@ impl TxTable {
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         let head_path = dir.join("tx.head");
-        let head = AddressHead::open(&head_path)?;
+        let body = VarTable::open(dir, "tx", TableKind::Tx)?;
+        let n_bodies = body.count();
+        // Operator recovery: delete `tx.head` (+ optional `.meta`) → empty create
+        // + full rebuild from Class A bodies on next open. Incomplete heads that
+        // still open successfully are *not* auto-rebuilt (delete to force).
+        let mut need_rebuild = false;
+        let head = if !head_path.exists() {
+            need_rebuild = n_bodies > 0;
+            Self::prepare_fresh_head(&head_path, n_bodies)?
+        } else {
+            match AddressHead::open(&head_path) {
+                Ok(h) => h,
+                Err(e) => {
+                    // Unreadable head with live Class A: recreate rather than
+                    // refuse the whole store (same recovery as a deliberate delete).
+                    if n_bodies > 0 {
+                        rbitcoin_log::warn!(
+                            "store: tx.head open failed ({e}) with {n_bodies} Class A bodies — recreating and rebuilding"
+                        );
+                        let _ = std::fs::remove_file(&head_path);
+                        let mut meta = head_path.as_os_str().to_os_string();
+                        meta.push(".meta");
+                        let _ = std::fs::remove_file(PathBuf::from(meta));
+                        need_rebuild = true;
+                        Self::prepare_fresh_head(&head_path, n_bodies)?
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        };
         let t = Self {
-            body: VarTable::open(dir, "tx", TableKind::Tx)?,
+            body,
             head: RwLock::new(head),
             head_path,
             resize: Mutex::new(None),
         };
-        t.resume_head_resize_if_needed()?;
+        if need_rebuild {
+            let inserted = t.rebuild_head_from_bodies(|done, total, ins| {
+                if done == total || done % 1_000_000 == 0 {
+                    rbitcoin_log::info!(
+                        "store: tx.head rebuild progress {done}/{total} inserted={ins}"
+                    );
+                }
+            })?;
+            t.head.read().unwrap().flush()?;
+            rbitcoin_log::warn!(
+                "store: tx.head rebuild complete inserted={inserted} bodies={}",
+                t.count()
+            );
+        } else {
+            t.resume_head_resize_if_needed()?;
+        }
         Ok(t)
+    }
+
+    /// Create empty `tx.head` (default layout), drop resize leftovers.
+    fn prepare_fresh_head(head_path: &Path, n_bodies: u64) -> Result<AddressHead, StoreError> {
+        clear_resize_control(head_path);
+        let shadow = shadow_head_path(head_path);
+        let _ = std::fs::remove_file(&shadow);
+        {
+            let mut p = shadow.as_os_str().to_os_string();
+            p.push(".meta");
+            let _ = std::fs::remove_file(PathBuf::from(p));
+        }
+        let bak = bak_head_path(head_path);
+        let _ = std::fs::remove_file(&bak);
+        {
+            let mut p = bak.as_os_str().to_os_string();
+            p.push(".meta");
+            let _ = std::fs::remove_file(PathBuf::from(p));
+        }
+        // Stale meta from a deleted head would confuse layout; drop it.
+        {
+            let mut meta = head_path.as_os_str().to_os_string();
+            meta.push(".meta");
+            let _ = std::fs::remove_file(PathBuf::from(meta));
+        }
+        if n_bodies > 0 {
+            rbitcoin_log::warn!(
+                "store: tx.head missing/recreated — rebuilding from {n_bodies} Class A bodies (this can take a while)"
+            );
+        } else {
+            rbitcoin_log::info!("store: tx.head missing — creating empty address head");
+        }
+        AddressHead::create(head_path)
     }
 
     pub fn count(&self) -> u64 {
@@ -1205,14 +1283,32 @@ impl TxTable {
 
     /// Ensure durable `tx.head` maps `txid → fk` for every Class A body.
     ///
-    /// Rebuild `tx.head` from Class A bodies (idempotent; skips present fks).
-    ///
-    /// Production tip entry does **not** call this — Direct archive keeps head
-    /// live. Also used by sequential online resize fill. Returns number of inserts.
+    /// Idempotent: skips fks already present in the probe chain. Prefer
+    /// [`Self::rebuild_head_from_bodies`] after a deliberate empty recreate
+    /// (skips presence probes — much faster for a full rebuild).
     ///
     /// `on_progress(done_bodies, total_bodies, inserted)` is invoked periodically.
     pub fn backfill_head(
         &self,
+        on_progress: impl FnMut(u64, u64, u64),
+    ) -> Result<u64, StoreError> {
+        self.backfill_head_inner(/* force_all */ false, on_progress)
+    }
+
+    /// Insert **every** Class A body into `tx.head` without presence probes.
+    ///
+    /// Used when the head was just created empty (missing-file recovery on open).
+    /// Assumes the head is empty or overwrite-safe (same fk re-insert is a no-op).
+    pub fn rebuild_head_from_bodies(
+        &self,
+        on_progress: impl FnMut(u64, u64, u64),
+    ) -> Result<u64, StoreError> {
+        self.backfill_head_inner(/* force_all */ true, on_progress)
+    }
+
+    fn backfill_head_inner(
+        &self,
+        force_all: bool,
         mut on_progress: impl FnMut(u64, u64, u64),
     ) -> Result<u64, StoreError> {
         let n = self.count();
@@ -1226,20 +1322,28 @@ impl TxTable {
         let mut last_progress = 0u64;
         for id in 1..=n {
             let fk = Fk(id);
-            let rec = self.get(fk)?;
-            let present = self
-                .head
-                .read()
-                .unwrap()
-                .probe_fks(&rec.txid)?
-                .contains(&fk);
-            if !present {
-                batch.push((rec.txid, fk));
-                if batch.len() >= CHUNK {
-                    inserted += batch.len() as u64;
-                    self.head_insert_many(&batch)?;
-                    batch.clear();
+            // body_txid only — avoid full packed decode for tens of millions of rows.
+            let txid = self.body_txid(fk)?;
+            if !force_all {
+                let present = self
+                    .head
+                    .read()
+                    .unwrap()
+                    .probe_fks(&txid)?
+                    .contains(&fk);
+                if present {
+                    if id - last_progress >= PROGRESS_EVERY || id == n {
+                        on_progress(id, n, inserted + batch.len() as u64);
+                        last_progress = id;
+                    }
+                    continue;
                 }
+            }
+            batch.push((txid, fk));
+            if batch.len() >= CHUNK {
+                inserted += batch.len() as u64;
+                self.head_insert_many(&batch)?;
+                batch.clear();
             }
             if id - last_progress >= PROGRESS_EVERY || id == n {
                 on_progress(id, n, inserted + batch.len() as u64);
@@ -1250,7 +1354,9 @@ impl TxTable {
             inserted += batch.len() as u64;
             self.head_insert_many(&batch)?;
         }
-        on_progress(n, n, inserted);
+        if last_progress != n {
+            on_progress(n, n, inserted);
+        }
         Ok(inserted)
     }
 
@@ -1997,6 +2103,107 @@ mod tests {
         keys.sort_unstable_by_key(|k| t.head_primary_slot(k));
         assert!(t.head_primary_slot(&keys[0]) <= t.head_primary_slot(&keys[1]));
         let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("RBITCOIN_HEAD_SCALE");
+    }
+
+    /// Operator recovery: delete `tx.head` → open rebuilds from Class A bodies.
+    #[test]
+    fn missing_tx_head_rebuilds_from_bodies_on_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-head-rebuild-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+
+        let mk = |i: u64| {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            let rec = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+            (rec, inputs, outputs)
+        };
+
+        {
+            let t = TxTable::create(&dir).unwrap();
+            for i in 1..=20u64 {
+                let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
+            }
+            assert_eq!(t.count(), 20);
+            // Sanity: head resolves before delete.
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&7u64.to_le_bytes());
+            assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(7)));
+            t.flush().unwrap();
+        }
+
+        // Simulate operator: wipe head (+ meta).
+        let head = dir.join("tx.head");
+        assert!(head.exists());
+        std::fs::remove_file(&head).unwrap();
+        let mut meta = head.as_os_str().to_os_string();
+        meta.push(".meta");
+        let _ = std::fs::remove_file(std::path::PathBuf::from(meta));
+
+        // Reopen must recreate head and rebuild from bodies.
+        let t = TxTable::open(&dir).unwrap();
+        assert_eq!(t.count(), 20);
+        assert!(dir.join("tx.head").exists());
+        for i in 1..=20u64 {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            assert_eq!(
+                t.get_fk_by_txid(&txid).unwrap(),
+                Some(Fk(i)),
+                "txid {i} missing after head rebuild"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("RBITCOIN_HEAD_SCALE");
+    }
+
+    #[test]
+    fn missing_tx_head_with_no_bodies_creates_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-head-empty-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        {
+            let t = TxTable::create(&dir).unwrap();
+            t.flush().unwrap();
+        }
+        std::fs::remove_file(dir.join("tx.head")).unwrap();
+        let t = TxTable::open(&dir).unwrap();
+        assert_eq!(t.count(), 0);
+        assert!(dir.join("tx.head").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("RBITCOIN_HEAD_SCALE");
     }
 
     #[test]

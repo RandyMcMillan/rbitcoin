@@ -5,7 +5,8 @@
 //!   `tx.idx` body ranges.
 //! - **`mlock`** large / write-path pages only: `tx.body`, `strong_tx`, `tx_height`,
 //!   `confirmed[h]`. Never mlock `spenders` (no multi-spend writes in IBD).
-//! - Confirm full-parses from mlocked bodies; uses runway cache for resolve.
+//! - **Full-decode** runway Class A bodies into `by_body` once; wave_fill / wire
+//!   rebuild consume that cache (no second packed parse on confirm).
 //!
 //! - **Runway creates** register `txid → fk` so same-batch spends skip head probes.
 //! - **Thin input edges** stashed per spend tx after a lightweight prevout walk.
@@ -551,11 +552,11 @@ impl ConfirmParentCache {
 
     pub fn body_count(&self) -> usize {
         let g = self.inner.lock().unwrap();
-        // Prefer mlock runway size for perf; fall back to parsed bodies.
-        if g.mlock_n > 0 {
-            g.mlock_n
-        } else {
+        // Prefer full-decoded runway bodies (decode-once cache); else mlock pins.
+        if !g.by_body.is_empty() {
             g.by_body.len()
+        } else {
+            g.mlock_n
         }
     }
 

@@ -1,11 +1,14 @@
-//! Confirm-runway prewarm: **RAM-cache small lookups; mlock large/write pages**.
+//! Confirm-runway prewarm: **RAM-cache small lookups; mlock large/write pages;
+//! full-decode runway bodies once for wave**.
 //!
 //! For each height in the batch (ascending):
 //! 1. **Cache** (no mlock): header head/body result, `header_txs` list, `tx.head`
 //!    → create fk, `tx.idx` body ranges.
 //! 2. **`mlock`**: `tx.body` for runway txs + external parents; Class C
 //!    `strong_tx` / `tx_height` for those fks; `confirmed[h]`.
-//! 3. Prevout-scan bodies (meta only); stash thin edges; mark scanned.
+//! 3. **Full Class A decode** of runway bodies into `ConfirmParentCache.by_body`
+//!    (wave_fill / wire rebuild reuse — no second store parse).
+//! 4. Stash thin edges from decoded inputs; mark scanned.
 //!
 //! Never mlock `spenders.body` (no multi-spend writes during IBD).
 //! Mlock ranges are refcounted and released on tip advance.
@@ -210,7 +213,7 @@ impl Query {
         Ok(())
     }
 
-    /// Prewarm: cache small maps; mlock body + Class C write pages only.
+    /// Prewarm: cache small maps; mlock body + Class C; **full-decode runway bodies**.
     pub fn prewarm_parents_for_heights(
         &self,
         items: &[(u32, [u8; 32])],
@@ -244,6 +247,14 @@ impl Query {
         self.confirm_parents.ensure_plans(&work);
 
         let mut height_tx_fks: Vec<(u32, Vec<Fk>)> = Vec::with_capacity(work.len());
+        // Full-decoded runway bodies for wave (decode once).
+        let mut body_fulls: Vec<(
+            Fk,
+            u32,
+            rbitcoin_store::TxRecord,
+            Vec<rbitcoin_store::OutputRecord>,
+            Vec<rbitcoin_store::InputRecord>,
+        )> = Vec::new();
         let mut body_prevouts: HashMap<u64, ([u8; 32], Vec<([u8; 32], u32)>)> = HashMap::new();
         let mut create_regs: Vec<(Fk, [u8; 32], u32)> = Vec::new();
         let mut parent_need: HashMap<u64, Vec<u32>> = HashMap::new(); // parent_fk → need heights
@@ -343,21 +354,29 @@ impl Query {
                 let cc = self.store.mlock_class_c_tx(fk);
                 self.mlock_note_skip_pinned(height, &cc);
 
-                let (meta, prevouts) = if let Some((off, len)) = range {
-                    self.store.get_tx_meta_and_prevouts_at(off, len)?
+                // Full decode once — wave_fill / wire rebuild consume from by_body.
+                let (tx, inputs, outs) = if let Some((off, len)) = range {
+                    self.store.get_tx_full_at(off, len)?
                 } else {
-                    self.store.get_tx_meta_and_prevouts(fk)?
+                    self.store.get_tx_full(fk)?
                 };
                 st.body_tx_reads = st.body_tx_reads.saturating_add(1);
-                create_regs.push((fk, meta.txid, height));
-                batch_creates.insert(meta.txid, fk);
-                body_prevouts.insert(id, (meta.txid, prevouts));
+                let prevouts: Vec<([u8; 32], u32)> = inputs
+                    .iter()
+                    .map(|i| (i.prev_txid, i.prev_index))
+                    .collect();
+                create_regs.push((fk, tx.txid, height));
+                batch_creates.insert(tx.txid, fk);
+                body_prevouts.insert(id, (tx.txid, prevouts));
+                body_fulls.push((fk, height, tx, outs, inputs));
                 st.creates_registered = st.creates_registered.saturating_add(1);
             }
             height_tx_fks.push((height, tx_fks));
         }
 
         self.confirm_parents.put_body_ranges_batch(&body_ranges);
+        // One lock: full bodies for wave (by_txid registered inside insert_body).
+        self.confirm_parents.put_bodies_batch(body_fulls);
         self.confirm_parents
             .register_mlocked_creates_batch(&create_regs);
 

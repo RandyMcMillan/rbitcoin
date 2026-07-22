@@ -204,7 +204,9 @@ impl Query {
         Ok(edges)
     }
 
-    /// Body for wave/wire: full body cache → cached idx range + mlocked body → store.
+    /// Body for wave/wire: prewarm full-decode cache → idx range + mlocked body → store.
+    ///
+    /// Hot path: [`ConfirmParentCache::get_body`] (decode-once in prewarm).
     fn load_body_prewarmed(
         &self,
         fk: Fk,

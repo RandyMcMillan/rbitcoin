@@ -64,8 +64,11 @@ pub struct ParentOut {
 #[derive(Debug, Clone)]
 pub struct ParentEntry {
     pub tx: TxRecord,
-    /// Needed / registered vouts → output.
+    /// Live (unspent) needed vouts → output. Spent vouts are omitted.
     pub outs: HashMap<u32, ParentOut>,
+    /// Vouts that prewarm fully resolved (spent-filtered). When all requested
+    /// vouts are in this set, wave can skip store decode + spent re-check.
+    pub checked: HashSet<u32>,
     /// Height of the runway body that registered this create (`None` = UTXO load).
     pub create_height: Option<u32>,
 }
@@ -843,6 +846,43 @@ impl ConfirmParentCache {
         }
     }
 
+    /// Prewarm parent pin: stash live outs + mark all evaluated vouts checked.
+    ///
+    /// `checked` includes spent-filtered vouts that are **not** in `live` so
+    /// wave can treat the set as complete without re-decoding the body.
+    /// `height` is the max runway height needing this parent (GC / by_txid).
+    pub fn put_parent_outs_resolved(
+        &self,
+        height: u32,
+        fk: Fk,
+        tx: TxRecord,
+        live: &[(u32, OutputRecord)],
+        checked: &[u32],
+    ) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        let mut g = self.inner.lock().unwrap();
+        g.put_parent_outs_resolved_inner(height, id, tx, live, checked);
+    }
+
+    /// Many resolved parents under one lock (prewarm pin finish).
+    pub fn put_parent_outs_resolved_batch(
+        &self,
+        items: &[(u32, Fk, TxRecord, Vec<(u32, OutputRecord)>, Vec<u32>)],
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        for (height, fk, tx, live, checked) in items {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            g.put_parent_outs_resolved_inner(*height, id, tx.clone(), live, checked);
+        }
+    }
+
     /// Batch thin edges under one lock (moves ownership — no edge clone).
     pub fn put_thin_inputs_batch(&self, items: Vec<(Fk, Vec<StashedThinInput>)>) {
         if items.is_empty() {
@@ -945,17 +985,20 @@ impl ConfirmParentCache {
             let e = g.by_fk.entry(id).or_insert_with(|| ParentEntry {
                 tx: tx.clone(),
                 outs: HashMap::new(),
+                checked: HashSet::new(),
                 create_height: Some(create_height),
             });
             e.tx = tx.clone();
             e.create_height = Some(create_height);
             for (v, o) in outputs.iter().enumerate() {
+                let v = v as u32;
                 e.outs.insert(
-                    v as u32,
+                    v,
                     ParentOut {
                         output: o.clone(),
                     },
                 );
+                e.checked.insert(v);
             }
         }
         // Clear any legacy waiters for this create.
@@ -1074,24 +1117,40 @@ impl ConfirmParentCache {
 
     /// Clone only the requested parent vouts (sparse `by_fk`, else runway body).
     ///
+    /// Returns `(tx, live_outs, spent_filtered)`:
+    /// - `spent_filtered == true`: prewarm already dropped spent vouts; wave
+    ///   must not re-check spentness for these candidates.
+    /// - `spent_filtered == false`: candidates need a spent filter (body path).
+    ///
     /// Wave_fill path: never materializes a full dense outs list for multi-out
     /// creates when only 1–2 prevouts are needed.
     pub fn get_parent_outs_needed(
         &self,
         fk: Fk,
         vouts: &[u32],
-    ) -> Option<(TxRecord, Vec<(u32, OutputRecord)>)> {
+    ) -> Option<(TxRecord, Vec<(u32, OutputRecord)>, bool)> {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
         if let Some(e) = g.by_fk.get(&id) {
-            if !e.outs.is_empty() {
+            // Fully resolved by prewarm (all requested vouts checked).
+            if !e.checked.is_empty() && vouts.iter().all(|v| e.checked.contains(v)) {
                 let mut live = Vec::with_capacity(vouts.len());
                 for &v in vouts {
                     if let Some(o) = e.outs.get(&v) {
                         live.push((v, o.output.clone()));
                     }
                 }
-                return Some((e.tx.clone(), live));
+                return Some((e.tx.clone(), live, true));
+            }
+            // Legacy / partial: all requested present as live outs (no checked).
+            if !e.outs.is_empty() && vouts.iter().all(|v| e.outs.contains_key(v)) {
+                let mut live = Vec::with_capacity(vouts.len());
+                for &v in vouts {
+                    if let Some(o) = e.outs.get(&v) {
+                        live.push((v, o.output.clone()));
+                    }
+                }
+                return Some((e.tx.clone(), live, false));
             }
         }
         if let Some(b) = g.by_body.get(&id) {
@@ -1101,7 +1160,9 @@ impl ConfirmParentCache {
                     live.push((v, o.clone()));
                 }
             }
-            return Some((b.tx.clone(), live));
+            // Body path still needs spent filter (wave-body creates are live
+            // only after wave own spent filter; external body rare).
+            return Some((b.tx.clone(), live, false));
         }
         None
     }
@@ -1227,6 +1288,7 @@ impl Inner {
                 let e = self.by_fk.entry(id).or_insert_with(|| ParentEntry {
                     tx: tx.clone(),
                     outs: HashMap::new(),
+                    checked: HashSet::new(),
                     create_height: Some(height),
                 });
                 e.tx = tx.clone();
@@ -1237,6 +1299,7 @@ impl Inner {
                         output: o.clone(),
                     },
                 );
+                e.checked.insert(v);
             }
             for h in waiters {
                 if let Some(plan) = self.plans.get_mut(&h) {
@@ -1255,27 +1318,64 @@ impl Inner {
         vout: u32,
         output: OutputRecord,
     ) {
+        self.put_parent_outs_resolved_inner(
+            height,
+            id,
+            tx,
+            &[(vout, output)],
+            &[vout],
+        );
+    }
+
+    fn put_parent_outs_resolved_inner(
+        &mut self,
+        height: u32,
+        id: u64,
+        tx: TxRecord,
+        live: &[(u32, OutputRecord)],
+        checked: &[u32],
+    ) {
         self.insert_by_txid(tx.txid, id, height);
         let txid = tx.txid;
         {
             let e = self.by_fk.entry(id).or_insert_with(|| ParentEntry {
                 tx: tx.clone(),
                 outs: HashMap::new(),
+                checked: HashSet::new(),
                 create_height: None,
             });
             e.tx = tx;
-            e.outs.insert(vout, ParentOut { output });
+            for &v in checked {
+                e.checked.insert(v);
+            }
+            for (v, output) in live {
+                e.outs.insert(*v, ParentOut {
+                    output: output.clone(),
+                });
+                e.checked.insert(*v);
+            }
         }
-        if let Some(plan) = self.plans.get_mut(&height) {
-            plan.need_fk.insert((id, vout));
-            plan.reserved.remove(&(txid, vout));
+        // Plan bookkeeping for live outs (GC keep-alive via need_fk).
+        for (v, _) in live {
+            if let Some(plan) = self.plans.get_mut(&height) {
+                plan.need_fk.insert((id, *v));
+                plan.reserved.remove(&(txid, *v));
+            }
+            let key = (txid, *v);
+            if let Some(waiters) = self.reserve_waiters.remove(&key) {
+                for h in waiters {
+                    if let Some(plan) = self.plans.get_mut(&h) {
+                        plan.reserved.remove(&key);
+                        plan.need_fk.insert((id, *v));
+                    }
+                }
+            }
         }
-        let key = (txid, vout);
-        if let Some(waiters) = self.reserve_waiters.remove(&key) {
-            for h in waiters {
-                if let Some(plan) = self.plans.get_mut(&h) {
-                    plan.reserved.remove(&key);
-                    plan.need_fk.insert((id, vout));
+        // Spent-only checked vouts still pin the parent entry for the height.
+        if live.is_empty() && !checked.is_empty() {
+            if let Some(plan) = self.plans.get_mut(&height) {
+                if let Some(&v) = checked.first() {
+                    plan.need_fk.insert((id, v));
                 }
             }
         }
@@ -1641,6 +1741,35 @@ mod tests {
         // Dropped with body when tip advances past create height.
         c.advance_tip(1);
         assert!(c.get_thin_inputs(Fk(10)).is_none());
+    }
+
+    #[test]
+    fn parent_outs_resolved_skips_spent_recheck() {
+        // Prewarm stashes live outs + checked set; wave must see spent_filtered.
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(0);
+        c.ensure_plan(1, [1u8; 32]);
+        let t = tx(9);
+        // vout 0 live, vout 1 spent (checked but not live).
+        c.put_parent_outs_resolved(
+            1,
+            Fk(90),
+            t.clone(),
+            &[(0, out(100))],
+            &[0, 1],
+        );
+        let (txr, live, filtered) = c.get_parent_outs_needed(Fk(90), &[0, 1]).unwrap();
+        assert!(filtered);
+        assert_eq!(txr.txid, t.txid);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].0, 0);
+        assert_eq!(live[0].1.value, 100);
+        // Partial request still complete.
+        let (_, live0, f0) = c.get_parent_outs_needed(Fk(90), &[0]).unwrap();
+        assert!(f0);
+        assert_eq!(live0.len(), 1);
+        // Unknown vout 2 → not complete → None (wave falls back to store).
+        assert!(c.get_parent_outs_needed(Fk(90), &[0, 2]).is_none());
     }
 
     #[test]

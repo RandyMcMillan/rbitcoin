@@ -655,6 +655,54 @@ impl Store {
         Ok(found)
     }
 
+    /// Unspent subset of `vouts` on one create (wave/prewarm hot path).
+    ///
+    /// With `body_range`, **one** packed body walk for all vouts (not one walk
+    /// per vout). Multi-spender lists fall back to the rare cold path.
+    pub fn unspent_create_vouts(
+        &self,
+        create_tx_fk: Fk,
+        vouts: &[u32],
+        body_range: Option<(u64, u64)>,
+    ) -> Result<Vec<u32>, StoreError> {
+        if vouts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tip = self.confirmed.tip_height().map(|t| t.0);
+        let metas: Vec<(u32, bool, Fk)> = match body_range {
+            Some((off, len)) => self.txs.get_output_spender_metas_at(off, len, vouts)?,
+            None => {
+                // No range: still prefer one body pin via per-vout meta (idx once
+                // each — rare when prewarm registers ranges).
+                let mut out = Vec::with_capacity(vouts.len());
+                for &v in vouts {
+                    let (multi, field) = self.txs.get_output_spender_meta(create_tx_fk, v)?;
+                    out.push((v, multi, field));
+                }
+                out
+            }
+        };
+        let mut unspent = Vec::with_capacity(metas.len());
+        for (v, multi, field) in metas {
+            if field.is_null() {
+                unspent.push(v);
+                continue;
+            }
+            if !multi {
+                if !self.is_confirmed_strong_at(field, tip)? {
+                    unspent.push(v);
+                }
+                continue;
+            }
+            // Multi-list: rare during IBD.
+            if !self.has_confirmed_strong_spender_create(create_tx_fk, v, body_range)? {
+                unspent.push(v);
+            }
+        }
+        // Vouts missing from body (corrupt / OOB) are treated as not live.
+        Ok(unspent)
+    }
+
 
 
 

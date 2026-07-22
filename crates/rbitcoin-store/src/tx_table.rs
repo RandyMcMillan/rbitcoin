@@ -837,6 +837,34 @@ impl TxTable {
             .with_bytes_at(body_off, body_len, |raw| Self::spender_meta_from_raw(raw, vout))
     }
 
+    /// One packed body walk: spender meta for many vouts (ascending).
+    ///
+    /// Returns `(vout, multi, field)` for each found vout. Missing vouts omitted.
+    pub fn get_output_spender_metas_at(
+        &self,
+        body_off: u64,
+        body_len: u64,
+        vouts: &[u32],
+    ) -> Result<Vec<(u32, bool, Fk)>, StoreError> {
+        if vouts.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.body.with_bytes_at(body_off, body_len, |raw| {
+            let rels = Self::packed_output_spender_rels(raw, vouts)?;
+            let mut out = Vec::with_capacity(rels.len());
+            for (v, rel) in rels {
+                let fo = rel as usize;
+                if raw.len() < fo + 9 {
+                    return Err(StoreError::Corrupt("packed spender meta short"));
+                }
+                let field = Fk(u64::from_le_bytes(raw[fo..fo + 8].try_into().unwrap()));
+                let multi = raw[fo + 8] & output_flags::MULTI_SPENDER != 0;
+                out.push((v, multi, field));
+            }
+            Ok(out)
+        })
+    }
+
     fn spender_meta_from_raw(raw: &[u8], vout: u32) -> Result<(bool, Fk), StoreError> {
         let rel = Self::packed_output_spender_rel(raw, vout)? as usize;
         if raw.len() < rel + 9 {
@@ -1226,6 +1254,58 @@ mod tests {
             assert!(raw.len() >= fo + 9);
             assert_eq!(&raw[fo..fo + 8], &[0u8; 8]);
         }
+    }
+
+    #[test]
+    fn get_output_spender_metas_at_one_walk() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-metas-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        let t = TxTable::create(&dir).unwrap();
+        let spenders = crate::spender_table::SpenderTable::create(&dir).unwrap();
+        let tx = TxRecord {
+            txid: [0xcd; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 3,
+        };
+        let inputs = vec![InputRecord {
+            prev_txid: [0u8; 32],
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![0x01],
+            witness: vec![],
+        }];
+        let outputs = vec![
+            OutputRecord::unspent(1, vec![0x51]),
+            OutputRecord::unspent(2, vec![0x51]),
+            OutputRecord::unspent(3, vec![0x51]),
+        ];
+        let fks = t
+            .put_full_batch_indexed(&[(tx, inputs, outputs)], false)
+            .unwrap();
+        let (off, len) = t.body_range(fks[0]).unwrap();
+        let s1 = Fk(10);
+        t.put_spends_on_create_at(&spenders, off, len, &[(0, s1), (2, Fk(20))])
+            .unwrap();
+        let metas = t
+            .get_output_spender_metas_at(off, len, &[0, 1, 2])
+            .unwrap();
+        assert_eq!(metas.len(), 3);
+        assert!(!metas[0].1 && metas[0].2 == s1);
+        assert!(!metas[1].1 && metas[1].2.is_null());
+        assert!(!metas[2].1 && metas[2].2 == Fk(20));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

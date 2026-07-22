@@ -133,20 +133,29 @@ impl Query {
         for (pid, needed_vouts) in &parents {
             let fk = Fk(*pid);
             let t_par = Instant::now();
-            let (tx, mut candidates) = self.load_parent_needed_outs(fk, needed_vouts)?;
+            let (tx, mut candidates, spent_filtered) =
+                self.load_parent_needed_outs(fk, needed_vouts)?;
             // Parent load is outs-focused (cache sparse or store meta+outs).
-            // Attribute wall to PARENT_TX_NS; PARENT_OUT_NS reserved for finer split.
             wf_add(&wf::PARENT_TX_NS, t_par.elapsed().as_nanos() as u64);
 
             let n_out = tx.output_count;
             let t_spent = Instant::now();
-            let mut live: Vec<(u32, OutputRecord)> = Vec::with_capacity(candidates.len());
-            for (v, o) in candidates.drain(..) {
-                if self.is_outpoint_spent_create(fk, v)? {
-                    continue;
-                }
-                live.push((v, o));
-            }
+            let live: Vec<(u32, OutputRecord)> = if spent_filtered {
+                // Prewarm already dropped spent vouts.
+                candidates
+            } else {
+                // One body walk for all needed vouts (not per-vout packed walk).
+                let range = self.confirm_parents.get_body_range(fk);
+                let unspent: HashSet<u32> = self
+                    .store
+                    .unspent_create_vouts(fk, needed_vouts, range)?
+                    .into_iter()
+                    .collect();
+                candidates
+                    .drain(..)
+                    .filter(|(v, _)| unspent.contains(v))
+                    .collect()
+            };
             wf_add(&wf::SPENT_NS, t_spent.elapsed().as_nanos() as u64);
 
             let t_cb = Instant::now();
@@ -185,14 +194,18 @@ impl Query {
     }
 
     /// External parent: only the needed vouts (no full dense outs / no inputs).
+    ///
+    /// Third tuple field: `spent_filtered` — prewarm already dropped spent outs.
     fn load_parent_needed_outs(
         &self,
         fk: Fk,
         needed: &[u32],
-    ) -> Result<(TxRecord, Vec<(u32, OutputRecord)>), QueryError> {
+    ) -> Result<(TxRecord, Vec<(u32, OutputRecord)>, bool), QueryError> {
         // Sparse by_fk / body subset under one lock — clones only requested vouts.
-        if let Some((tx, live)) = self.confirm_parents.get_parent_outs_needed(fk, needed) {
-            return Ok((tx, live));
+        if let Some((tx, live, filtered)) =
+            self.confirm_parents.get_parent_outs_needed(fk, needed)
+        {
+            return Ok((tx, live, filtered));
         }
         // Store outs-only decode (skip parent input/witness alloc). Clone only
         // the few needed vouts (typically 1–2); drop the rest with `outs`.
@@ -207,7 +220,7 @@ impl Query {
                 live.push((v, o.clone()));
             }
         }
-        Ok((tx, live))
+        Ok((tx, live, false))
     }
 
     /// Build thin create-fk edges by walking inputs (wave_fill fallback).

@@ -288,6 +288,8 @@ impl Query {
         let mut body_prevouts: HashMap<u64, ([u8; 32], Vec<([u8; 32], u32)>)> = HashMap::new();
         let mut create_regs: Vec<(Fk, [u8; 32], u32)> = Vec::new();
         let mut parent_need: HashMap<u64, Vec<u32>> = HashMap::new(); // parent_fk → need heights
+        // parent_fk → needed prev_index (vouts) for sparse outs stash.
+        let mut parent_vouts: HashMap<u64, Vec<u32>> = HashMap::new();
         let mut thin_by_spend: HashMap<u64, Vec<StashedThinInput>> = HashMap::new();
         let mut batch_creates: HashMap<[u8; 32], Fk> = HashMap::new();
         let mut body_ranges: Vec<(Fk, u64, u64)> = Vec::new();
@@ -574,6 +576,7 @@ impl Query {
                             }
                             if let Some(pid) = cfk.get() {
                                 parent_need.entry(pid).or_default().push(*height);
+                                parent_vouts.entry(pid).or_default().push(prev_index);
                             }
                         }
                         Some(None) | None => {
@@ -590,13 +593,22 @@ impl Query {
         }
         st.thin_ns = st.thin_ns.saturating_add(t_thin.elapsed().as_nanos() as u64);
 
-        // ── Pin external parent bodies (mlock only; already registered by txid) ─
+        // ── Pin external parents: mlock + sparse needed outs (spent-filtered) ─
+        // Wave_fill then hits get_parent_outs_needed without store re-decode.
         let t_par = Instant::now();
         let mut uniq_parents: Vec<u64> = parent_need.keys().copied().collect();
         uniq_parents.sort_unstable();
         st.parent_unique = st.parent_unique.saturating_add(uniq_parents.len() as u32);
 
         let mut parent_ranges: Vec<(Fk, u64, u64)> = Vec::new();
+        // (max_height, fk, tx, live outs, checked vouts)
+        let mut sparse_parents: Vec<(
+            u32,
+            Fk,
+            rbitcoin_store::TxRecord,
+            Vec<(u32, rbitcoin_store::OutputRecord)>,
+            Vec<u32>,
+        )> = Vec::with_capacity(uniq_parents.len());
         for pid in uniq_parents {
             if self.confirm_cancelled() {
                 crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
@@ -606,6 +618,10 @@ impl Query {
             let mut need_hs = parent_need.remove(&pid).unwrap_or_default();
             need_hs.sort_unstable();
             need_hs.dedup();
+            let max_h = need_hs.last().copied().unwrap_or(0);
+            let mut need_vouts = parent_vouts.remove(&pid).unwrap_or_default();
+            need_vouts.sort_unstable();
+            need_vouts.dedup();
 
             // Prefer cached body range (same-batch creates) over idx read.
             let range = self
@@ -622,8 +638,33 @@ impl Query {
                 for h in &need_hs {
                     self.mlock_note_skip_pinned(*h, &cc);
                 }
-                // by_txid already registered during thin resolve for external
-                // parents; no second meta/prevouts walk.
+                // Sparse outs + spent filter for wave (one outs decode + one
+                // spender-meta walk per parent — not again on confirm).
+                if !need_vouts.is_empty() {
+                    match self.store.get_tx_meta_and_outputs_at(off, len) {
+                        Ok((tx, outs)) => {
+                            let unspent = self
+                                .store
+                                .unspent_create_vouts(fk, &need_vouts, Some((off, len)))
+                                .unwrap_or_default();
+                            let unspent_set: std::collections::HashSet<u32> =
+                                unspent.into_iter().collect();
+                            let mut live = Vec::with_capacity(unspent_set.len());
+                            for &v in &need_vouts {
+                                if unspent_set.contains(&v) {
+                                    if let Some(o) = outs.get(v as usize) {
+                                        live.push((v, o.clone()));
+                                    }
+                                }
+                            }
+                            sparse_parents.push((max_h, fk, tx, live, need_vouts));
+                            st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+                        }
+                        Err(_) => {
+                            // Leave wave to store-decode; range still registered.
+                        }
+                    }
+                }
             } else {
                 let body_ml = self.store.mlock_tx_body_only(fk);
                 st.mlock_syscalls = st.mlock_syscalls.saturating_add(1);
@@ -634,12 +675,36 @@ impl Query {
                 for h in &need_hs {
                     self.mlock_note_skip_pinned(*h, &cc);
                 }
+                // No range: try idx-based outs for sparse stash (rare).
+                if !need_vouts.is_empty() {
+                    if let Ok((tx, outs)) = self.store.get_tx_meta_and_outputs(fk) {
+                        let unspent = self
+                            .store
+                            .unspent_create_vouts(fk, &need_vouts, None)
+                            .unwrap_or_default();
+                        let unspent_set: std::collections::HashSet<u32> =
+                            unspent.into_iter().collect();
+                        let mut live = Vec::with_capacity(unspent_set.len());
+                        for &v in &need_vouts {
+                            if unspent_set.contains(&v) {
+                                if let Some(o) = outs.get(v as usize) {
+                                    live.push((v, o.clone()));
+                                }
+                            }
+                        }
+                        sparse_parents.push((max_h, fk, tx, live, need_vouts));
+                        st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+                    }
+                }
             }
-            st.full_tx_reads = st.full_tx_reads.saturating_add(1);
             st.utxo_parents = st.utxo_parents.saturating_add(1);
         }
         if !parent_ranges.is_empty() {
             self.confirm_parents.put_body_ranges_batch(&parent_ranges);
+        }
+        if !sparse_parents.is_empty() {
+            self.confirm_parents
+                .put_parent_outs_resolved_batch(&sparse_parents);
         }
         st.parent_pin_ns = st
             .parent_pin_ns

@@ -560,6 +560,16 @@ impl Query {
             .has_confirmed_strong_spender_create(create_fk, vout, range)?)
     }
 
+    /// Unspent subset of vouts on a create (batch; one body walk when ranged).
+    pub fn unspent_create_vouts(
+        &self,
+        create_fk: Fk,
+        vouts: &[u32],
+    ) -> Result<Vec<u32>, QueryError> {
+        let range = self.confirm_parents.get_body_range(create_fk);
+        Ok(self.store.unspent_create_vouts(create_fk, vouts, range)?)
+    }
+
     /// Enable/disable txid hash-head inserts on archive (default on). Off under
     /// milestone IBD; Class A bodies remain complete via header_txs fk lists.
     pub fn set_tx_index(&self, enabled: bool) {

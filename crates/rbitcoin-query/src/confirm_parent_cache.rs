@@ -65,6 +65,49 @@ pub fn prewarm_headroom_from_env() -> u32 {
         .clamp(0, MAX_PREWARM_DEPTH)
 }
 
+/// Default: mlock **off** (decode-stash pin only). Set `=1`/`true` to re-enable.
+///
+/// mlock paid for cold majflt during mixed archive+confirm; with archive done
+/// and warm page cache it was mostly syscall + GC cost (signet logs: 0 majflt).
+pub fn prewarm_mlock_from_env() -> bool {
+    match std::env::var("RBITCOIN_PARENT_PREWARM_MLOCK") {
+        Ok(s) => {
+            let t = s.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on")
+        }
+        // Default off.
+        Err(_) => false,
+    }
+}
+
+/// Only pin external parents needed by spends in tip+1‥tip+K (0 = full runway).
+///
+/// Default 64: confirm batches are small; pinning full depth 256 was old
+/// “hide all IO” strategy that over-pinned far runway.
+pub const DEFAULT_PREWARM_PIN_NEAR: u32 = 64;
+
+pub fn prewarm_pin_near_from_env() -> u32 {
+    std::env::var("RBITCOIN_PARENT_PREWARM_PIN_NEAR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_PREWARM_PIN_NEAR)
+        .min(MAX_PREWARM_DEPTH)
+}
+
+/// Thin edge walk: only stamped create_fk + coinbase (skip soft prev_txid/head).
+///
+/// Default **on** — v10 IBD stamps create_fk; soft/head path is legacy.
+/// Set `=0`/`false` to restore soft prev_txid + sticky/head resolve.
+pub fn prewarm_thin_create_fk_only_from_env() -> bool {
+    match std::env::var("RBITCOIN_PARENT_PREWARM_THIN_CREATE_FK_ONLY") {
+        Ok(s) => {
+            let t = s.trim();
+            !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true,
+    }
+}
+
 /// One needed prevout under a parent create.
 #[derive(Debug, Clone)]
 pub struct ParentOut {
@@ -343,16 +386,15 @@ impl ConfirmParentCache {
         self.ready_cv.notify_all();
     }
 
-    /// Register a runway create after mlock (txid → fk only; no full body).
+    /// Register a create identity (txid → fk) into sticky only (no outs).
     ///
-    /// `height` is the create height (or the spend height that needed this
-    /// parent). Entries are GC'd on tip advance when outside the runway window.
+    /// Used for head-resolved external parents and tests. Bodies use sticky via
+    /// [`Self::put_bodies_batch`] / insert_body.
     pub fn register_mlocked_create(&self, fk: Fk, txid: [u8; 32], height: u32) {
         let Some(id) = fk.get() else {
             return;
         };
         let mut g = self.inner.lock().unwrap();
-        g.insert_by_txid(txid, id, height);
         g.sticky_insert(txid, id, height);
     }
 
@@ -981,11 +1023,8 @@ impl ConfirmParentCache {
         }
     }
 
-    /// Batch-register runway create txids after mlock prewarm.
+    /// Batch-register create identities into sticky (head-resolve / tests).
     /// Items: `(fk, txid, height)`.
-    ///
-    /// Also inserts into **confirmed sticky** (create identity) so after tip GC
-    /// of the runway window thin still resolves without `tx.head`.
     pub fn register_mlocked_creates_batch(&self, items: &[(Fk, [u8; 32], u32)]) {
         if items.is_empty() {
             return;
@@ -995,7 +1034,6 @@ impl ConfirmParentCache {
             let Some(id) = fk.get() else {
                 continue;
             };
-            g.insert_by_txid(txid, id, height);
             g.sticky_insert(txid, id, height);
         }
     }
@@ -1283,11 +1321,11 @@ impl ConfirmParentCache {
 
     pub fn get_by_txid(&self, txid: &[u8; 32]) -> Option<Fk> {
         let g = self.inner.lock().unwrap();
-        if let Some(e) = g.by_txid.get(txid) {
+        // Prefer sticky (bodies + head resolves). Optional by_txid is legacy.
+        if let Some(e) = g.sticky_confirmed.get(txid) {
             return Some(Fk(e.fk));
         }
-        // After tip GC of by_txid, sticky still holds create identity.
-        g.sticky_confirmed.get(txid).map(|e| Fk(e.fk))
+        g.by_txid.get(txid).map(|e| Fk(e.fk))
     }
 
     /// Sparse external-parent outs only (`by_fk`). Does **not** expand runway
@@ -1486,7 +1524,9 @@ impl Inner {
         outputs: Vec<OutputRecord>,
         inputs: Vec<InputRecord>,
     ) {
-        self.insert_by_txid(tx.txid, id, height);
+        // Identity: sticky only (not dual by_txid). Runway by_txid was a
+        // prev_txid-era index; thin/unpin/connect no longer need it for bodies.
+        // External head resolves still use register_mlocked_creates → sticky.
         self.sticky_insert(tx.txid, id, height);
         self.by_body.insert(
             id,
@@ -1846,7 +1886,8 @@ mod tests {
         let keys = [[1u8; 32], [2u8; 32], [9u8; 32]];
         let (hits, sticky) = c.lookup_txids_batch(&keys);
         assert_eq!(hits.len(), 2);
-        assert!(sticky.is_empty()); // still in runway by_txid
+        // register_mlocked_create → sticky only (not by_txid).
+        assert_eq!(sticky.len(), 2);
         assert_eq!(hits.get(&[1u8; 32]).copied(), Some(Fk(1)));
         assert_eq!(hits.get(&[2u8; 32]).copied(), Some(Fk(2)));
         assert!(!hits.contains_key(&[9u8; 32]));
@@ -2231,44 +2272,25 @@ mod tests {
         assert_eq!(c.ready_through(), 1);
     }
 
-    /// Regression: runway `by_txid` map stays O(depth); `get_by_txid` may still
-    /// resolve via confirmed sticky after runway prune.
+    /// Bodies register sticky only (not dual by_txid). Identity survives tip GC.
     #[test]
-    fn advance_tip_prunes_by_txid_registrations() {
+    fn body_identity_is_sticky_not_runway_by_txid() {
         let c = ConfirmParentCache::new(32);
         c.advance_tip(0);
-        // Simulate prewarm registering many creates along the runway.
         for h in 1u32..=40 {
             c.ensure_plan(h, [h as u8; 32]);
             let t = tx(h as u8);
-            c.register_mlocked_create(Fk(h as u64), t.txid, h);
+            c.put_body(Fk(h as u64), h, t, vec![out(1)], vec![]);
             c.mark_scanned(h);
         }
-        assert!(c.by_txid_count() >= 32, "registered runway creates");
-        // tip=20, depth=32 → keep height in (0, 52] → all 1..=40 stay.
-        c.advance_tip(20);
-        assert_eq!(c.by_txid_count(), 40, "runway window keeps depth behind tip");
+        // No dual by_txid registration for bodies.
+        assert_eq!(c.by_txid_count(), 0);
+        assert!(c.sticky_confirmed_count() >= 32);
         assert_eq!(c.get_by_txid(&tx(10).txid), Some(Fk(10)));
-        assert_eq!(c.get_by_txid(&tx(30).txid), Some(Fk(30)));
-        // tip=45 → min_keep=13, max=77 → keep 14..=40 only in by_txid map.
         c.advance_tip(45);
-        assert!(
-            c.by_txid_count() <= 27,
-            "by_txid leaked: count={}",
-            c.by_txid_count()
-        );
-        // height 10 pruned from runway map but sticky still serves identity.
+        // Bodies GC'd; sticky still serves identity.
+        assert!(!c.has_body(Fk(10)));
         assert_eq!(c.get_by_txid(&tx(10).txid), Some(Fk(10)));
         assert_eq!(c.get_by_txid(&tx(30).txid), Some(Fk(30)));
-        // Re-need parent at h=50 bumps runway height.
-        let t5 = tx(5);
-        c.register_mlocked_create(Fk(5), t5.txid, 50);
-        assert_eq!(c.get_by_txid(&t5.txid), Some(Fk(5)));
-        c.advance_tip(50);
-        assert_eq!(c.get_by_txid(&t5.txid), Some(Fk(5)));
-        c.advance_tip(50 + 32); // min_keep=50 → height 50 dropped from by_txid
-        // Sticky still resolves; identity is capacity-capped, not tip-windowed.
-        assert_eq!(c.get_by_txid(&t5.txid), Some(Fk(5)));
-        assert!(c.sticky_confirmed_count() >= 1);
     }
 }

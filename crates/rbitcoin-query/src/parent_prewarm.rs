@@ -1,20 +1,19 @@
-//! Confirm-runway prewarm: **RAM-cache small lookups; mlock large/write pages;
-//! full-decode runway bodies once for wave**.
+//! Confirm-runway prewarm: RAM-cache lookups; optional mlock; full-decode bodies once.
 //!
 //! For each height in the batch (ascending):
-//! 1. **Cache** (no mlock): header head/body result, `header_txs` list, `tx.head`
-//!    → create fk, `tx.idx` body ranges.
-//! 2. **`mlock`**: `tx.body` for runway txs + external parents; Class C
-//!    `strong_tx` / `tx_height` for those fks; `confirmed[h]`.
-//! 3. **Full Class A decode** of runway bodies into `ConfirmParentCache.by_body`
-//!    (wave_fill / wire rebuild reuse — no second store parse).
-//! 4. Stash thin edges from decoded inputs; mark scanned.
+//! 1. **Cache**: header + `header_txs`, body ranges.
+//! 2. **Optional `mlock`** (`RBITCOIN_PARENT_PREWARM_MLOCK=1`): body + Class C pages.
+//!    Default **off** — decode-stash is enough when the page cache is warm.
+//! 3. **Full Class A decode** into `by_body` (wave/wire reuse).
+//! 4. **Thin edges** (default create_fk-only) + **tip-near parent pin**.
 //!
-//! Never mlock `spenders.body` (no multi-spend writes during IBD).
-//! Mlock ranges are refcounted and released on tip advance.
+//! Env: `RBITCOIN_PARENT_PREWARM_{DEPTH,BATCH,HEADROOM,MLOCK,PIN_NEAR,THIN_CREATE_FK_ONLY}`.
 
 use super::*;
-use crate::confirm_parent_cache::{prewarm_headroom_from_env, StashedThinInput};
+use crate::confirm_parent_cache::{
+    prewarm_headroom_from_env, prewarm_mlock_from_env, prewarm_pin_near_from_env,
+    prewarm_thin_create_fk_only_from_env, StashedThinInput,
+};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -339,9 +338,9 @@ impl Query {
             );
             st.header_ns = st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
 
-            // ── mlock confirmed[h] + body pages ────────────────────────────
+            // ── optional mlock + body ranges ────────────────────────────────
+            let do_mlock = prewarm_mlock_from_env();
             let t_ml = Instant::now();
-            self.mlock_note_skip_pinned(height, &self.store.mlock_confirmed_height(height));
             st.blocks = st.blocks.saturating_add(1);
 
             let fks_work: std::borrow::Cow<'_, [Fk]> = if tx_fks_is_sorted_ascending(&tx_fks) {
@@ -370,22 +369,27 @@ impl Query {
                     }
                 }
             }
-            let (_body_ml, sys, sk) =
-                self.mlock_body_spans_for_heights(&[height], &height_body_abs);
-            st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
-            st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
-            for &(fk, range) in &height_fks_resolved {
-                if range.is_some() {
-                    continue;
+            if do_mlock {
+                self.mlock_note_skip_pinned(
+                    height,
+                    &self.store.mlock_confirmed_height(height),
+                );
+                let (_body_ml, sys, sk) =
+                    self.mlock_body_spans_for_heights(&[height], &height_body_abs);
+                st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
+                st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
+                for &(fk, range) in &height_fks_resolved {
+                    if range.is_some() {
+                        continue;
+                    }
+                    let body_ml = self.store.mlock_tx_body_only(fk);
+                    st.mlock_syscalls = st.mlock_syscalls.saturating_add(1);
+                    self.mlock_note_skip_pinned(height, &body_ml);
                 }
-                let body_ml = self.store.mlock_tx_body_only(fk);
-                st.mlock_syscalls = st.mlock_syscalls.saturating_add(1);
-                self.mlock_note_skip_pinned(height, &body_ml);
-            }
-            // Class C for runway creates (batch note after one mlock set).
-            for &(fk, _) in &height_fks_resolved {
-                let cc = self.store.mlock_class_c_tx(fk);
-                self.mlock_note_skip_pinned(height, &cc);
+                for &(fk, _) in &height_fks_resolved {
+                    let cc = self.store.mlock_class_c_tx(fk);
+                    self.mlock_note_skip_pinned(height, &cc);
+                }
             }
             st.body_mlock_ns = st
                 .body_mlock_ns
@@ -450,56 +454,55 @@ impl Query {
             .cache_put_ns
             .saturating_add(t_put.elapsed().as_nanos() as u64);
 
-        // ── Thin edges + external parent discovery ─────────────────────────
-        //
-        // Hot path was ~90% of prewarm wall: per-edge mutex + sequential head.
-        // Rewrite:
-        //   1. Local maps (batch creates + resolved txid→fk)
-        //   2. Unique external txids → one-lock runway batch lookup
-        //   3. Remaining unique → parallel durable head probes (slot-sorted)
-        //   4. Bulk register head hits; walk edges lock-free on locals
+        // ── Thin edges (create_fk-first; optional soft/head legacy) ─────────
+        let thin_fk_only = prewarm_thin_create_fk_only_from_env();
+        let pin_near = prewarm_pin_near_from_env();
+        // 0 = pin all runway heights; else only tip+1‥tip+pin_near.
+        let pin_hi = if pin_near == 0 {
+            u32::MAX
+        } else {
+            tip.saturating_add(pin_near)
+        };
         let t_thin = Instant::now();
 
-        // Local resolve table: Some(fk) hit, None known miss after head probe.
         let mut local_fk: HashMap<[u8; 32], Option<Fk>> =
             HashMap::with_capacity(batch_creates.len().saturating_mul(2));
         for (txid, fk) in &batch_creates {
             local_fk.insert(*txid, Some(*fk));
         }
 
-        // ── thin: collect unique external prev_txids (create_fk miss only) ──
-        // v10 archive stamps create_fk; head is only needed for legacy/unresolved.
         let t_collect = Instant::now();
         let mut need_external: HashSet<[u8; 32]> = HashSet::new();
-        // Max spend-height per external txid (for by_txid GC height).
         let mut external_max_h: HashMap<[u8; 32], u32> = HashMap::new();
-        for (height, tx_fks) in &height_tx_fks {
-            for fk in tx_fks {
-                let Some(id) = fk.get() else {
-                    continue;
-                };
-                let Some((_txid, prevouts)) = body_prevouts.get(&id) else {
-                    continue;
-                };
-                for &(create_fk_opt, prev_txid, prev_index) in prevouts {
-                    if create_fk_opt.is_some() {
-                        // Identity already on disk — no head for this edge.
+        if !thin_fk_only {
+            // Legacy: collect soft prev_txid for unstamped edges only.
+            for (height, tx_fks) in &height_tx_fks {
+                for fk in tx_fks {
+                    let Some(id) = fk.get() else {
                         continue;
-                    }
-                    if prev_txid == [0u8; 32] && prev_index == u32::MAX {
+                    };
+                    let Some((_txid, prevouts)) = body_prevouts.get(&id) else {
                         continue;
+                    };
+                    for &(create_fk_opt, prev_txid, prev_index) in prevouts {
+                        if create_fk_opt.is_some() {
+                            continue;
+                        }
+                        if prev_txid == [0u8; 32] {
+                            continue;
+                        }
+                        if prev_index == u32::MAX {
+                            continue;
+                        }
+                        if batch_creates.contains_key(&prev_txid) {
+                            continue;
+                        }
+                        need_external.insert(prev_txid);
+                        external_max_h
+                            .entry(prev_txid)
+                            .and_modify(|h| *h = (*h).max(*height))
+                            .or_insert(*height);
                     }
-                    if prev_txid == [0u8; 32] {
-                        continue;
-                    }
-                    if batch_creates.contains_key(&prev_txid) {
-                        continue;
-                    }
-                    need_external.insert(prev_txid);
-                    external_max_h
-                        .entry(prev_txid)
-                        .and_modify(|h| *h = (*h).max(*height))
-                        .or_insert(*height);
                 }
             }
         }
@@ -507,75 +510,76 @@ impl Query {
             .thin_collect_ns
             .saturating_add(t_collect.elapsed().as_nanos() as u64);
 
-        // ── thin: runway by_txid + confirmed sticky ────────────────────────
-        let t_runway = Instant::now();
-        let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
-        let (map_hits, sticky_sourced) =
-            self.confirm_parents.lookup_txids_batch(&need_vec);
-        st.sticky_hits = st
-            .sticky_hits
-            .saturating_add(sticky_sourced.len() as u32);
-        let mut need_head: Vec<[u8; 32]> = Vec::with_capacity(need_vec.len() / 2);
-        for txid in &need_vec {
-            if let Some(fk) = map_hits.get(txid).copied() {
-                local_fk.insert(*txid, Some(fk));
+        let mut sticky_sourced: HashSet<[u8; 32]> = HashSet::new();
+        let mut head_sourced: HashSet<[u8; 32]> = HashSet::new();
+        if !need_external.is_empty() {
+            let t_runway = Instant::now();
+            let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
+            let (map_hits, sticky_only) =
+                self.confirm_parents.lookup_txids_batch(&need_vec);
+            sticky_sourced = sticky_only;
+            st.sticky_hits = st
+                .sticky_hits
+                .saturating_add(sticky_sourced.len() as u32);
+            let mut need_head: Vec<[u8; 32]> = Vec::with_capacity(need_vec.len() / 2);
+            for txid in &need_vec {
+                if let Some(fk) = map_hits.get(txid).copied() {
+                    local_fk.insert(*txid, Some(fk));
+                } else {
+                    need_head.push(*txid);
+                }
+            }
+            st.thin_runway_ns = st
+                .thin_runway_ns
+                .saturating_add(t_runway.elapsed().as_nanos() as u64);
+
+            let t_head = Instant::now();
+            need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
+            st.head_lookups = st.head_lookups.saturating_add(need_head.len() as u32);
+            let head_hits: Vec<([u8; 32], Option<Fk>)> = if need_head.is_empty() {
+                Vec::new()
             } else {
-                need_head.push(*txid);
-            }
-        }
-        st.thin_runway_ns = st
-            .thin_runway_ns
-            .saturating_add(t_runway.elapsed().as_nanos() as u64);
-
-        // ── thin: durable head (batch: slot-sorted probe + sequential body_txid) ─
-        let t_head = Instant::now();
-        need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
-        st.head_lookups = st.head_lookups.saturating_add(need_head.len() as u32);
-        let head_hits: Vec<([u8; 32], Option<Fk>)> = if need_head.is_empty() {
-            Vec::new()
-        } else {
-            if self.confirm_cancelled() {
-                crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
-                return Err(StoreError::Cancelled("confirm cancelled"));
-            }
-            self.store
-                .get_fk_by_txid_batch(&need_head)
-                .unwrap_or_else(|_| {
-                    need_head
-                        .iter()
-                        .map(|txid| (*txid, self.store.get_fk_by_txid(txid).ok().flatten()))
-                        .collect()
-                })
-        };
-
-        let mut head_regs: Vec<(Fk, [u8; 32], u32)> = Vec::with_capacity(head_hits.len());
-        let mut head_sourced: HashSet<[u8; 32]> = HashSet::with_capacity(head_hits.len());
-        for (txid, fk_opt) in head_hits {
-            match fk_opt {
-                Some(fk) => {
-                    st.head_hits = st.head_hits.saturating_add(1);
-                    local_fk.insert(txid, Some(fk));
-                    head_sourced.insert(txid);
-                    let h = external_max_h.get(&txid).copied().unwrap_or(0);
-                    head_regs.push((fk, txid, h));
+                if self.confirm_cancelled() {
+                    crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                    return Err(StoreError::Cancelled("confirm cancelled"));
                 }
-                None => {
-                    local_fk.insert(txid, None);
+                self.store
+                    .get_fk_by_txid_batch(&need_head)
+                    .unwrap_or_else(|_| {
+                        need_head
+                            .iter()
+                            .map(|txid| (*txid, self.store.get_fk_by_txid(txid).ok().flatten()))
+                            .collect()
+                    })
+            };
+            let mut head_regs: Vec<(Fk, [u8; 32], u32)> = Vec::with_capacity(head_hits.len());
+            for (txid, fk_opt) in head_hits {
+                match fk_opt {
+                    Some(fk) => {
+                        st.head_hits = st.head_hits.saturating_add(1);
+                        local_fk.insert(txid, Some(fk));
+                        head_sourced.insert(txid);
+                        let h = external_max_h.get(&txid).copied().unwrap_or(0);
+                        head_regs.push((fk, txid, h));
+                    }
+                    None => {
+                        local_fk.insert(txid, None);
+                    }
                 }
             }
+            if !head_regs.is_empty() {
+                self.confirm_parents
+                    .register_mlocked_creates_batch(&head_regs);
+            }
+            st.thin_head_ns = st
+                .thin_head_ns
+                .saturating_add(t_head.elapsed().as_nanos() as u64);
         }
-        if !head_regs.is_empty() {
-            // by_txid + sticky (register_mlocked_creates_batch inserts both).
-            self.confirm_parents
-                .register_mlocked_creates_batch(&head_regs);
-        }
-        st.thin_head_ns = st
-            .thin_head_ns
-            .saturating_add(t_head.elapsed().as_nanos() as u64);
 
-        // ── thin: lock-free edge walk (prefer stamped create_fk) ───────────
+        // ── thin: edge walk ────────────────────────────────────────────────
         let t_edge = Instant::now();
         for (height, tx_fks) in &height_tx_fks {
+            let pin_this_height = *height <= pin_hi;
             for fk in tx_fks {
                 let Some(id) = fk.get() else {
                     continue;
@@ -585,7 +589,6 @@ impl Query {
                 };
                 let mut edges: Vec<StashedThinInput> = Vec::with_capacity(prevouts.len());
                 for &(create_fk_opt, prev_txid, prev_index) in prevouts {
-                    // Coinbase: null create + null prev index.
                     if create_fk_opt.is_none() && prev_index == u32::MAX {
                         edges.push(StashedThinInput {
                             create_fk: None,
@@ -594,7 +597,7 @@ impl Query {
                         st.edge_coinbase = st.edge_coinbase.saturating_add(1);
                         continue;
                     }
-                    // v10 hot path: archive already stamped create_fk.
+                    // v10 hot path: stamped create_fk.
                     if let Some(pid) = create_fk_opt {
                         edges.push(StashedThinInput {
                             create_fk: Some(pid),
@@ -604,16 +607,27 @@ impl Query {
                         if batch_create_ids.contains(&pid) {
                             st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                             st.edge_same_batch = st.edge_same_batch.saturating_add(1);
-                        } else {
-                            // External parent body pin (no head — identity known).
+                        } else if pin_this_height {
                             parent_need.entry(pid).or_default().push(*height);
                             parent_vouts.entry(pid).or_default().push(prev_index);
                             st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                             st.edge_runway = st.edge_runway.saturating_add(1);
+                        } else {
+                            // Far runway: edge identity only; wave loads parent if needed.
+                            st.edge_runway = st.edge_runway.saturating_add(1);
                         }
                         continue;
                     }
-                    // Fallback: soft prev_txid resolve (legacy / incomplete stamp).
+                    if thin_fk_only {
+                        // Unstamped non-coinbase: miss (no soft/head on default path).
+                        edges.push(StashedThinInput {
+                            create_fk: None,
+                            prev_index,
+                        });
+                        st.missing_parents = st.missing_parents.saturating_add(1);
+                        continue;
+                    }
+                    // Legacy soft prev_txid resolve.
                     if let Some(&cfk) = batch_creates.get(&prev_txid) {
                         edges.push(StashedThinInput {
                             create_fk: cfk.get(),
@@ -641,8 +655,10 @@ impl Query {
                                 st.edge_runway = st.edge_runway.saturating_add(1);
                             }
                             if let Some(pid) = cfk.get() {
-                                parent_need.entry(pid).or_default().push(*height);
-                                parent_vouts.entry(pid).or_default().push(prev_index);
+                                if pin_this_height {
+                                    parent_need.entry(pid).or_default().push(*height);
+                                    parent_vouts.entry(pid).or_default().push(prev_index);
+                                }
                             }
                         }
                         Some(None) | None => {
@@ -662,9 +678,8 @@ impl Query {
             .saturating_add(t_edge.elapsed().as_nanos() as u64);
         st.thin_ns = st.thin_ns.saturating_add(t_thin.elapsed().as_nanos() as u64);
 
-        // ── Pin external parents: mlock + sparse needed outs (spent-filtered) ─
-        // Wave_fill then hits get_parent_outs_needed without store re-decode.
-        // Skip re-decode when outs already cover needed vouts (sliding-window re-pin).
+        // ── Pin external parents (tip-near; optional mlock + sparse outs) ───
+        let do_mlock = prewarm_mlock_from_env();
         let t_par = Instant::now();
         let mut uniq_parents: Vec<u64> = parent_need.keys().copied().collect();
         uniq_parents.sort_unstable();
@@ -721,13 +736,15 @@ impl Query {
                 .or_else(|| self.store.tx_body_range(fk).ok());
             if let Some((off, len)) = range {
                 parent_ranges.push((fk, off, len));
-                let (_, sys, sk) =
-                    self.mlock_body_spans_for_heights(&need_hs, &[(off, len)]);
-                st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
-                st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
-                let cc = self.store.mlock_class_c_tx(fk);
-                for h in &need_hs {
-                    self.mlock_note_skip_pinned(*h, &cc);
+                if do_mlock {
+                    let (_, sys, sk) =
+                        self.mlock_body_spans_for_heights(&need_hs, &[(off, len)]);
+                    st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
+                    st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
+                    let cc = self.store.mlock_class_c_tx(fk);
+                    for h in &need_hs {
+                        self.mlock_note_skip_pinned(*h, &cc);
+                    }
                 }
                 // Sparse outs + spent filter + coinbase height for wave.
                 if !need_vouts.is_empty() {
@@ -772,14 +789,16 @@ impl Query {
                     }
                 }
             } else {
-                let body_ml = self.store.mlock_tx_body_only(fk);
-                st.mlock_syscalls = st.mlock_syscalls.saturating_add(1);
-                for h in &need_hs {
-                    self.mlock_note_skip_pinned(*h, &body_ml);
-                }
-                let cc = self.store.mlock_class_c_tx(fk);
-                for h in &need_hs {
-                    self.mlock_note_skip_pinned(*h, &cc);
+                if do_mlock {
+                    let body_ml = self.store.mlock_tx_body_only(fk);
+                    st.mlock_syscalls = st.mlock_syscalls.saturating_add(1);
+                    for h in &need_hs {
+                        self.mlock_note_skip_pinned(*h, &body_ml);
+                    }
+                    let cc = self.store.mlock_class_c_tx(fk);
+                    for h in &need_hs {
+                        self.mlock_note_skip_pinned(*h, &cc);
+                    }
                 }
                 // No range: try idx-based outs for sparse stash (rare).
                 if !need_vouts.is_empty() {

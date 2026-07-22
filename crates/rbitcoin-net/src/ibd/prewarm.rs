@@ -60,8 +60,11 @@ pub(crate) fn spawn_parent_prewarm(
             let depth = prewarm_depth_from_env();
             let batch = prewarm_batch_from_env();
             let headroom = prewarm_headroom_from_env();
+            let mlock = rbitcoin_query::prewarm_mlock_from_env();
+            let pin_near = rbitcoin_query::prewarm_pin_near_from_env();
+            let thin_fk = rbitcoin_query::prewarm_thin_create_fk_only_from_env();
             info!(
-                "ibd: parent prewarm worker ON (depth≤{depth}, batch≤{batch}, headroom={headroom} soft; env RBITCOIN_PARENT_PREWARM_*)"
+                "ibd: parent prewarm worker ON (depth≤{depth}, batch≤{batch}, headroom={headroom}, mlock={mlock}, pin_near={pin_near}, thin_create_fk_only={thin_fk}; env RBITCOIN_PARENT_PREWARM_*)"
             );
             // next_height watermark (not index into a replaced Arc runway).
             // ConfirmParentCache.tip **must** track IBD tip: ensure_plans only

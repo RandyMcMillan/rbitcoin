@@ -617,21 +617,24 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
     confirm_phase_stats::UTXO_APPLY_NS
         .fetch_add(t_spent.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+    // IBD (Direct): skip per-spend unpin — tip GC drops the same runway outs.
+    // Tip mode: still retire spent sparse parents so long-lived runway stays lean.
     let t_unpin = Instant::now();
-    // v10: retire by create_fk (4th tuple field) — no by_txid resolve.
-    let all_spends: Vec<(rbitcoin_primitives::Fk, u32)> = prepared
-        .iter()
-        .flat_map(|p| {
-            p.spends.iter().filter_map(|(_txid, vout, _sfk, cfk)| {
-                if cfk.is_null() {
-                    None
-                } else {
-                    Some((*cfk, *vout))
-                }
+    if query.index_mode() != rbitcoin_query::IndexMode::Direct {
+        let all_spends: Vec<(rbitcoin_primitives::Fk, u32)> = prepared
+            .iter()
+            .flat_map(|p| {
+                p.spends.iter().filter_map(|(_txid, vout, _sfk, cfk)| {
+                    if cfk.is_null() {
+                        None
+                    } else {
+                        Some((*cfk, *vout))
+                    }
+                })
             })
-        })
-        .collect();
-    let _ = query.unpin_spent_parent_outs(&all_spends);
+            .collect();
+        let _ = query.unpin_spent_parent_outs(&all_spends);
+    }
     confirm_phase_stats::UNPIN_NS.fetch_add(
         t_unpin.elapsed().as_nanos() as u64,
         Ordering::Relaxed,

@@ -824,6 +824,23 @@ impl ConfirmParentCache {
         }
     }
 
+    /// One-lock bulk `txid → fk` for prewarm thin-resolve (avoids per-edge mutex).
+    ///
+    /// Missing keys are omitted (caller treats as head-probe candidates).
+    pub fn lookup_txids_batch(&self, txids: &[[u8; 32]]) -> HashMap<[u8; 32], Fk> {
+        if txids.is_empty() {
+            return HashMap::new();
+        }
+        let g = self.inner.lock().unwrap();
+        let mut out = HashMap::with_capacity(txids.len() / 2);
+        for txid in txids {
+            if let Some(e) = g.by_txid.get(txid) {
+                out.insert(*txid, Fk(e.fk));
+            }
+        }
+        out
+    }
+
     /// Reserve a hole for a prevout not in UTXO (create is still on the runway).
     ///
     /// If the create was already registered with full outs (create-before-reserve),
@@ -1397,6 +1414,20 @@ mod tests {
         c.mark_scanned(11);
         j.join().unwrap();
         assert!(c.is_ready(11));
+    }
+
+    #[test]
+    fn lookup_txids_batch_one_lock() {
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(0);
+        c.register_mlocked_create(Fk(1), [1u8; 32], 1);
+        c.register_mlocked_create(Fk(2), [2u8; 32], 2);
+        let keys = [[1u8; 32], [2u8; 32], [9u8; 32]];
+        let hits = c.lookup_txids_batch(&keys);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits.get(&[1u8; 32]).copied(), Some(Fk(1)));
+        assert_eq!(hits.get(&[2u8; 32]).copied(), Some(Fk(2)));
+        assert!(!hits.contains_key(&[9u8; 32]));
     }
 
     #[test]

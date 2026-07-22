@@ -15,7 +15,8 @@
 
 use super::*;
 use crate::confirm_parent_cache::{prewarm_headroom_from_env, StashedThinInput};
-use std::collections::HashMap;
+use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -425,7 +426,111 @@ impl Query {
             .saturating_add(t_put.elapsed().as_nanos() as u64);
 
         // ── Thin edges + external parent discovery ─────────────────────────
+        //
+        // Hot path was ~90% of prewarm wall: per-edge mutex + sequential head.
+        // Rewrite:
+        //   1. Local maps (batch creates + resolved txid→fk)
+        //   2. Unique external txids → one-lock runway batch lookup
+        //   3. Remaining unique → parallel durable head probes
+        //   4. Bulk register head hits; walk edges lock-free on locals
         let t_thin = Instant::now();
+
+        // Local resolve table: Some(fk) hit, None known miss after head probe.
+        let mut local_fk: HashMap<[u8; 32], Option<Fk>> =
+            HashMap::with_capacity(batch_creates.len().saturating_mul(2));
+        for (txid, fk) in &batch_creates {
+            local_fk.insert(*txid, Some(*fk));
+        }
+
+        // Unique prev_txids that are not same-batch creates (need runway/head).
+        let mut need_external: HashSet<[u8; 32]> = HashSet::new();
+        // Max spend-height per external txid (for by_txid GC height).
+        let mut external_max_h: HashMap<[u8; 32], u32> = HashMap::new();
+        for (height, tx_fks) in &height_tx_fks {
+            for fk in tx_fks {
+                let Some(id) = fk.get() else {
+                    continue;
+                };
+                let Some((_txid, prevouts)) = body_prevouts.get(&id) else {
+                    continue;
+                };
+                for &(prev_txid, prev_index) in prevouts {
+                    if prev_txid == [0u8; 32] && prev_index == u32::MAX {
+                        continue;
+                    }
+                    if batch_creates.contains_key(&prev_txid) {
+                        continue;
+                    }
+                    need_external.insert(prev_txid);
+                    external_max_h
+                        .entry(prev_txid)
+                        .and_modify(|h| *h = (*h).max(*height))
+                        .or_insert(*height);
+                }
+            }
+        }
+
+        // One-lock runway bulk lookup for unique external txids.
+        let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
+        let runway_hits = self.confirm_parents.lookup_txids_batch(&need_vec);
+        let mut need_head: Vec<[u8; 32]> = Vec::with_capacity(need_vec.len() / 2);
+        for txid in need_vec {
+            if let Some(fk) = runway_hits.get(&txid).copied() {
+                local_fk.insert(txid, Some(fk));
+            } else {
+                need_head.push(txid);
+            }
+        }
+
+        // Parallel durable head probes for unique misses (100% hit rate on
+        // mainnet IBD stats — cost is probe IO, not misses).
+        st.head_lookups = st.head_lookups.saturating_add(need_head.len() as u32);
+        let head_hits: Vec<([u8; 32], Option<Fk>)> = if need_head.len() >= 32
+            && !self.confirm_cancelled()
+        {
+            let store = &self.store;
+            need_head
+                .par_iter()
+                .map(|txid| {
+                    let fk = store.get_fk_by_txid(txid).ok().flatten();
+                    (*txid, fk)
+                })
+                .collect()
+        } else {
+            let mut out = Vec::with_capacity(need_head.len());
+            for txid in &need_head {
+                if self.confirm_cancelled() {
+                    crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                    return Err(StoreError::Cancelled("confirm cancelled"));
+                }
+                let fk = self.store.get_fk_by_txid(txid).ok().flatten();
+                out.push((*txid, fk));
+            }
+            out
+        };
+
+        let mut head_regs: Vec<(Fk, [u8; 32], u32)> = Vec::with_capacity(head_hits.len());
+        let mut head_sourced: HashSet<[u8; 32]> = HashSet::with_capacity(head_hits.len());
+        for (txid, fk_opt) in head_hits {
+            match fk_opt {
+                Some(fk) => {
+                    st.head_hits = st.head_hits.saturating_add(1);
+                    local_fk.insert(txid, Some(fk));
+                    head_sourced.insert(txid);
+                    let h = external_max_h.get(&txid).copied().unwrap_or(0);
+                    head_regs.push((fk, txid, h));
+                }
+                None => {
+                    local_fk.insert(txid, None);
+                }
+            }
+        }
+        if !head_regs.is_empty() {
+            self.confirm_parents
+                .register_mlocked_creates_batch(&head_regs);
+        }
+
+        // Lock-free edge walk on local tables.
         for (height, tx_fks) in &height_tx_fks {
             for fk in tx_fks {
                 let Some(id) = fk.get() else {
@@ -454,46 +559,31 @@ impl Query {
                         st.edge_same_batch = st.edge_same_batch.saturating_add(1);
                         continue;
                     }
-                    if let Some(cfk) = self
-                        .confirm_parents
-                        .get_by_txid_if_out(&prev_txid, prev_index)
-                    {
-                        edges.push(StashedThinInput {
-                            create_fk: cfk.get(),
-                            prev_index,
-                        });
-                        st.utxo_parents = st.utxo_parents.saturating_add(1);
-                        st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
-                        st.edge_runway = st.edge_runway.saturating_add(1);
-                        if let Some(pid) = cfk.get() {
-                            parent_need.entry(pid).or_default().push(*height);
+                    match local_fk.get(&prev_txid).copied() {
+                        Some(Some(cfk)) => {
+                            edges.push(StashedThinInput {
+                                create_fk: cfk.get(),
+                                prev_index,
+                            });
+                            st.utxo_parents = st.utxo_parents.saturating_add(1);
+                            if head_sourced.contains(&prev_txid) {
+                                st.edge_head = st.edge_head.saturating_add(1);
+                            } else {
+                                st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
+                                st.edge_runway = st.edge_runway.saturating_add(1);
+                            }
+                            if let Some(pid) = cfk.get() {
+                                parent_need.entry(pid).or_default().push(*height);
+                            }
                         }
-                        continue;
-                    }
-                    // Durable head lookup once; cache fk in by_txid (no head mlock).
-                    st.head_lookups = st.head_lookups.saturating_add(1);
-                    if let Some(create_fk) = self.tx_fk_by_txid(&prev_txid).ok().flatten() {
-                        st.head_hits = st.head_hits.saturating_add(1);
-                        edges.push(StashedThinInput {
-                            create_fk: create_fk.get(),
-                            prev_index,
-                        });
-                        st.edge_head = st.edge_head.saturating_add(1);
-                        if let Some(pid) = create_fk.get() {
-                            self.confirm_parents.register_mlocked_create(
-                                create_fk,
-                                prev_txid,
-                                *height,
-                            );
-                            parent_need.entry(pid).or_default().push(*height);
+                        Some(None) | None => {
+                            edges.push(StashedThinInput {
+                                create_fk: None,
+                                prev_index,
+                            });
+                            st.missing_parents = st.missing_parents.saturating_add(1);
                         }
-                        continue;
                     }
-                    edges.push(StashedThinInput {
-                        create_fk: None,
-                        prev_index,
-                    });
-                    st.missing_parents = st.missing_parents.saturating_add(1);
                 }
                 thin_by_spend.insert(id, edges);
             }

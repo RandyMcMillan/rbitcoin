@@ -11,6 +11,8 @@ rbitcoin-primitives = { workspace = true }
 rbitcoin-store = { workspace = true }
 rbitcoin-log = { workspace = true }
 bitcoin = { workspace = true }
+# Parallel durable tx.head probes during prewarm thin-resolve.
+rayon = "1.10"
 
 [lints]
 workspace = true

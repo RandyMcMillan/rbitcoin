@@ -86,19 +86,30 @@ pub fn confirm_archived_run(
     blocks: &[(Height, [u8; 32])],
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
     let ok = confirm_script_phase(query, params, milestone, blocks)?;
-    confirm_writeback_phase(query, params, milestone, ok)
+    confirm_writeback_phase(query, params, milestone, ok.batch)
 }
 
-/// SCRIPT STAGE: resolve → prewarm wait → wave → wire → assemble → scripts.
+/// Outcome of the script stage: ready batch + pure work wall (excludes prewarm wait).
+pub struct ConfirmScriptOutcome {
+    pub batch: ScriptOkBatch,
+    /// Resolve → wave → wire → assemble → scripts only (not prewarm Condvar wait).
+    pub work_ns: u64,
+}
+
+/// SCRIPT STAGE: prewarm wait → resolve → wave → wire → assemble → scripts.
 ///
 /// Does **not** advance tip or probe durable spentness (except provisional
 /// same-run doubles during assemble).
+///
+/// When the IBD prewarm worker is live, after wait this stage is **cache-only**
+/// (no Class A / head / spend table cold touches). Prewarm wait is tracked in
+/// [`confirm_phase_stats::PREWARM_WAIT_NS`] and excluded from [`ConfirmScriptOutcome::work_ns`].
 pub fn confirm_script_phase(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
     blocks: &[(Height, [u8; 32])],
-) -> Result<ScriptOkBatch, ConsensusError> {
+) -> Result<ConfirmScriptOutcome, ConsensusError> {
     if blocks.is_empty() {
         return Err(ConsensusError::BadBlock("empty confirm batch"));
     }
@@ -111,15 +122,10 @@ pub fn confirm_script_phase(
         }
     }
 
-    let t_resolve = Instant::now();
-    let metas = resolve_body_metas(query, blocks)?;
-    confirm_phase_stats::RESOLVE_NS.fetch_add(
-        t_resolve.elapsed().as_nanos() as u64,
-        Ordering::Relaxed,
-    );
-
-    let heights: Vec<u32> = metas.iter().map(|m| m.height.0).collect();
-    let items: Vec<(u32, [u8; 32])> = metas.iter().map(|m| (m.height.0, m.hash)).collect();
+    // Seed + wait **before** any confirm-thread store access so cold plan/header
+    // probes are not charged as script work and (with worker live) do not majflt.
+    let heights: Vec<u32> = blocks.iter().map(|(h, _)| h.0).collect();
+    let items: Vec<(u32, [u8; 32])> = blocks.iter().map(|(h, hash)| (h.0, *hash)).collect();
     let batch_end = heights.last().copied().unwrap_or(0);
     let t_pw = Instant::now();
     wait_for_prewarm(query, &heights, &items, batch_end)?;
@@ -128,9 +134,18 @@ pub fn confirm_script_phase(
         Ordering::Relaxed,
     );
 
+    let t_work = Instant::now();
     let _majflt = ConfirmMajfltGuard::start(
         blocks.first().map(|b| b.0 .0).unwrap_or(0),
         blocks.len(),
+    );
+
+    let cache_only = query.prewarm_worker_live();
+    let t_resolve = Instant::now();
+    let metas = resolve_body_metas(query, blocks, cache_only)?;
+    confirm_phase_stats::RESOLVE_NS.fetch_add(
+        t_resolve.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
     );
 
     let mut wave_prevouts = wave_fill(query, &metas)?;
@@ -142,6 +157,7 @@ pub fn confirm_script_phase(
         metas,
         &wire_blocks,
         &wave_prevouts,
+        cache_only,
     )?;
     script_wave(&prepared)?;
     // Drop heavy script jobs before queueing writeback (spends/fees remain).
@@ -150,10 +166,14 @@ pub fn confirm_script_phase(
         p.jobs.shrink_to_fit();
     }
 
-    Ok(ScriptOkBatch {
-        prepared,
-        wire_blocks,
-        wave_prevouts,
+    let work_ns = t_work.elapsed().as_nanos() as u64;
+    Ok(ConfirmScriptOutcome {
+        batch: ScriptOkBatch {
+            prepared,
+            wire_blocks,
+            wave_prevouts,
+        },
+        work_ns,
     })
 }
 
@@ -332,6 +352,8 @@ mod writeback_idempotent_tests {
     }
 }
 
+
+
 // ─── phases ───────────────────────────────────────────────────────────────────
 
 /// Wait for the confirm batch to be prewarm-ready.
@@ -375,6 +397,7 @@ fn wait_for_prewarm(
 fn resolve_body_metas(
     query: &Query,
     blocks: &[(Height, [u8; 32])],
+    cache_only: bool,
 ) -> Result<Vec<BodyMeta>, ConsensusError> {
     let mut metas = Vec::with_capacity(blocks.len());
     for &(height, hash) in blocks {
@@ -390,6 +413,11 @@ fn resolve_body_metas(
                 });
                 continue;
             }
+        }
+        if cache_only {
+            return Err(ConsensusError::Store(StoreError::Corrupt(
+                "confirm: prewarm incomplete (header plan missing after wait)",
+            )));
         }
         let (header_fk, header_rec) = query
             .get_header_by_hash(&hash)
@@ -464,6 +492,7 @@ fn assemble_run(
     metas: Vec<BodyMeta>,
     wire_blocks: &[Block],
     wave_prevouts: &rbitcoin_query::WavePrevoutCache,
+    cache_only: bool,
 ) -> Result<Vec<Prepared>, ConsensusError> {
     // Provisional same-run double-spend only (not durable spentness).
     let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
@@ -478,17 +507,47 @@ fn assemble_run(
         let ctx = ValidationContext::at(params, height, milestone);
 
         if i == 0 {
-            validate_header(query, params, height, &block.header)?;
+            // MTP + prev link: prefer runway header plans (no header.body fault).
             if height.0 >= 1 {
                 let prev_h = Height(height.0 - 1);
                 let start = prev_h.0.saturating_sub(10);
+                let mut from_plans = true;
+                let mut times = Vec::with_capacity(11);
                 for h in start..=prev_h.0 {
-                    let (_fk, rec) = query
-                        .header_at_height(Height(h))
-                        .map_err(ConsensusError::Store)?
-                        .ok_or(ConsensusError::BadPrev)?;
-                    time_window.push(rec.timestamp);
+                    if let Some(plan) = query.confirm_parent_cache().get_header_plan(h) {
+                        times.push(plan.header_rec.timestamp);
+                        if h == prev_h.0
+                            && plan.header_rec.hash != block.header.prev_blockhash.to_byte_array()
+                        {
+                            return Err(ConsensusError::BadPrev);
+                        }
+                    } else {
+                        from_plans = false;
+                        break;
+                    }
                 }
+                if from_plans {
+                    let mtp = median_time_past_times(&times);
+                    if block.header.time <= mtp {
+                        return Err(ConsensusError::BadHeader("timestamp <= median-time-past"));
+                    }
+                    time_window = times;
+                } else {
+                    // Prior tip headers may not be on the prewarm runway (only
+                    // tip+1..). Header rows are tiny fixed records — use store.
+                    // Class A body/parent cold paths remain cache-only above.
+                    let _ = cache_only;
+                    validate_header(query, params, height, &block.header)?;
+                    for h in start..=prev_h.0 {
+                        let (_fk, rec) = query
+                            .header_at_height(Height(h))
+                            .map_err(ConsensusError::Store)?
+                            .ok_or(ConsensusError::BadPrev)?;
+                        time_window.push(rec.timestamp);
+                    }
+                }
+            } else {
+                validate_header(query, params, height, &block.header)?;
             }
         } else {
             let prev = &prepared[i - 1];

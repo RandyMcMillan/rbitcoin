@@ -124,10 +124,9 @@ pub(crate) fn spawn_confirm_engine(
                                 return;
                             }
                         }
+                        // Writeback pure work only (recv already done before t0).
+                        // Do not mix into confirm_ns — that is script-stage work.
                         let elapsed = t0.elapsed();
-                        loop_stats_wb
-                            .confirm_ns
-                            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
                         if elapsed.as_millis() > 2_000 {
                             info!(
                                 "ibd: confirm writeback slow batch={n} first={first_h} {:?}",
@@ -250,7 +249,6 @@ pub(crate) fn spawn_confirm_engine(
                     continue;
                 }
 
-                let t0 = Instant::now();
                 let expect_h = batch[0].0;
                 struct LiveGuard<'a> {
                     stats: &'a LoopStats,
@@ -272,6 +270,7 @@ pub(crate) fn spawn_confirm_engine(
                 }
 
                 // SCRIPT STAGE only — writeback is async FIFO.
+                // `work_ns` excludes prewarm Condvar wait (honest script timing).
                 let script_res = hub.confirm_script_phase(&batch);
                 let script_res = match script_res {
                     Err(e) if batch.len() > 1 => {
@@ -284,6 +283,7 @@ pub(crate) fn spawn_confirm_engine(
                         } else if msg.contains("confirm without archive")
                             || msg.contains("NotFound")
                             || msg.contains("not found")
+                            || msg.contains("prewarm incomplete")
                         {
                             Err(e)
                         } else {
@@ -293,11 +293,7 @@ pub(crate) fn spawn_confirm_engine(
                     }
                     other => other,
                 };
-                let elapsed = t0.elapsed();
                 drop(_live_guard);
-                loop_stats
-                    .confirm_ns
-                    .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
 
                 if feed.stopped() || hub.query.confirm_cancelled() {
                     if let Err(e) = &script_res {
@@ -317,18 +313,22 @@ pub(crate) fn spawn_confirm_engine(
                     Ok(None) => {
                         // Already confirmed — heights already claimed off feed.
                     }
-                    Ok(Some(ok_batch)) => {
-                        // Hand to writeback (blocks if queue full — backpressure).
-                        // Heights already claimed off feed when the batch was taken.
-                        if wb_tx.send(ok_batch).is_err() {
+                    Ok(Some(outcome)) => {
+                        // Pure script-stage wall only (not prewarm wait, not wb send).
+                        loop_stats
+                            .confirm_ns
+                            .fetch_add(outcome.work_ns, Ordering::Relaxed);
+                        let work_ms = outcome.work_ns / 1_000_000;
+                        // Hand to writeback — `send` may block on full queue; that
+                        // wait is backpressure, not script work (do not time it).
+                        if wb_tx.send(outcome.batch).is_err() {
                             info!("ibd: confirm writeback channel closed");
                             return;
                         }
-                        if elapsed.as_millis() > 2_000 {
+                        if work_ms > 2_000 {
                             info!(
-                                "ibd: confirm scripts slow batch={} first={expect_h} {:?}",
+                                "ibd: confirm scripts slow batch={} first={expect_h} work_ms={work_ms}",
                                 batch.len(),
-                                elapsed
                             );
                         }
                     }
@@ -340,6 +340,23 @@ pub(crate) fn spawn_confirm_engine(
                             drop(wb_tx);
                             let _ = _writeback.join();
                             return;
+                        }
+                        if msg.contains("prewarm incomplete") {
+                            // Runway lag / GC race — re-queue and wait (do not demote Class A).
+                            {
+                                let mut g = feed.ready.lock().unwrap();
+                                for &(h, ha) in &batch {
+                                    if !hub.has_block(&ha) {
+                                        g.insert(h, ha);
+                                    }
+                                }
+                                feed.cv.notify_one();
+                            }
+                            debug!(
+                                "ibd: confirm prewarm incomplete @ {expect} {hash} — re-queue (wait runway)"
+                            );
+                            std::thread::sleep(Duration::from_millis(10));
+                            continue;
                         }
                         if msg.contains("confirm without archive")
                             || msg.contains("NotFound")

@@ -232,7 +232,7 @@ impl ChainHub {
     pub fn confirm_script_phase(
         &self,
         blocks: &[(u32, BlockHash)],
-    ) -> Result<Option<ScriptOkBatch>, NetError> {
+    ) -> Result<Option<rbitcoin_consensus::ConfirmScriptOutcome>, NetError> {
         if blocks.is_empty() {
             return Ok(None);
         }

@@ -30,15 +30,20 @@ impl Query {
     /// Wave fill from already-resolved per-block Class A fk lists (confirm hot path).
     ///
     /// - Wave-body txs: **move** prewarmed bodies out of the runway (no clone);
-    ///   store decode only on cache miss. Stashed for wire rebuild.
+    ///   store decode only on cache miss **when prewarm worker is not live**.
     /// - Thin edges: batch-moved from runway stash (same type as wave) — no remap.
     /// - External parents: **outs-only** decode; only needed vouts kept.
+    ///
+    /// When [`Self::prewarm_worker_live`], this path is **cache-only**: any body
+    /// or parent miss returns `Corrupt("confirm: prewarm incomplete …")` instead
+    /// of touching cold Class A / spend tables (no confirm-thread majflt).
     pub fn wave_fill_for_tx_fk_lists(
         &self,
         per_block: &[&[Fk]],
     ) -> Result<(usize, crate::WavePrevoutCache), QueryError> {
         use crate::wave_fill_stats::{self as wf, add as wf_add, add_count as wf_count};
 
+        let cache_only = self.prewarm_worker_live();
         let mut wave_fks: HashSet<u64> = HashSet::new();
         let mut wave_tx_fks: Vec<Fk> = Vec::new();
         for list in per_block {
@@ -70,15 +75,46 @@ impl Query {
                 if let Some(parts) = taken_bodies.remove(&id) {
                     n_cache = n_cache.saturating_add(1);
                     parts
+                } else if cache_only {
+                    return Err(StoreError::Corrupt(
+                        "confirm: prewarm incomplete (wave body missing from runway)",
+                    )
+                    .into());
                 } else {
                     n_store = n_store.saturating_add(1);
                     self.load_body_from_store(fk)?
                 }
+            } else if cache_only {
+                return Err(StoreError::Corrupt(
+                    "confirm: prewarm incomplete (null wave body fk)",
+                )
+                .into());
             } else {
                 n_store = n_store.saturating_add(1);
                 self.load_body_from_store(fk)?
             };
-            let cb_h = self.coinbase_height_for_tx_with_input0(fk, &tx, inputs.first())?;
+            // Coinbase height for maturity (writeback). Prefer prewarm stash;
+            // never touch cold tx_height on the confirm thread when worker is live.
+            let cb_h: Option<Option<u32>> = if cache_only {
+                self.confirm_parents
+                    .get_parent_coinbase_height(fk)
+                    .or_else(|| {
+                        let is_cb = tx.input_count == 1
+                            && inputs.first().is_some_and(|i| {
+                                i.is_coinbase()
+                                    || (i.prev_txid == [0u8; 32]
+                                        && i.prev_index == 0xffff_ffff)
+                            });
+                        if is_cb {
+                            // Unknown height — structural writeback can resolve later.
+                            None
+                        } else {
+                            Some(None)
+                        }
+                    })
+            } else {
+                Some(self.coinbase_height_for_tx_with_input0(fk, &tx, inputs.first())?)
+            };
 
             // Thin edges before moving outs/inputs into wave.
             let edges = if let Some(id) = id {
@@ -87,12 +123,19 @@ impl Query {
                     stashed
                 } else if inputs.is_empty() {
                     Vec::new()
+                } else if cache_only {
+                    // Rebuild from stamped create_fk only (no head / store).
+                    n_thin_rebuild = n_thin_rebuild.saturating_add(1);
+                    self.thin_edges_from_inputs_cache_only(&inputs)?
                 } else {
                     n_thin_rebuild = n_thin_rebuild.saturating_add(1);
                     self.thin_edges_from_inputs(&inputs, &wave)?
                 }
             } else if inputs.is_empty() {
                 Vec::new()
+            } else if cache_only {
+                n_thin_rebuild = n_thin_rebuild.saturating_add(1);
+                self.thin_edges_from_inputs_cache_only(&inputs)?
             } else {
                 n_thin_rebuild = n_thin_rebuild.saturating_add(1);
                 self.thin_edges_from_inputs(&inputs, &wave)?
@@ -110,7 +153,7 @@ impl Query {
             wave.insert_thin_inputs(fk, edges);
 
             // Parent + body_wire share one Arc of outs (no outs.clone() at fill).
-            wave.insert_wave_body(fk, tx, outs, inputs, Some(cb_h));
+            wave.insert_wave_body(fk, tx, outs, inputs, cb_h);
             noted += 1;
         }
         wf_add(&wf::BODY_NS, t_body.elapsed().as_nanos() as u64);
@@ -133,8 +176,19 @@ impl Query {
         for (pid, needed_vouts) in &parents {
             let fk = Fk(*pid);
             let t_par = Instant::now();
-            let (tx, mut candidates, spent_filtered) =
-                self.load_parent_needed_outs(fk, needed_vouts)?;
+            let (tx, mut candidates, spent_filtered) = if cache_only {
+                match self.confirm_parents.get_parent_outs_needed(fk, needed_vouts) {
+                    Some((tx, live, filtered)) => (tx, live, filtered),
+                    None => {
+                        return Err(StoreError::Corrupt(
+                            "confirm: prewarm incomplete (parent outs missing from runway)",
+                        )
+                        .into());
+                    }
+                }
+            } else {
+                self.load_parent_needed_outs(fk, needed_vouts)?
+            };
             // Parent load is outs-focused (cache sparse or store meta+outs).
             wf_add(&wf::PARENT_TX_NS, t_par.elapsed().as_nanos() as u64);
 
@@ -143,6 +197,13 @@ impl Query {
             let live: Vec<(u32, OutputRecord)> = if spent_filtered {
                 // Prewarm already dropped spent vouts.
                 candidates
+            } else if cache_only {
+                // No cold spend walk on confirm thread — treat as already filtered
+                // empty if prewarm didn't mark spent_filtered (should not happen).
+                return Err(StoreError::Corrupt(
+                    "confirm: prewarm incomplete (parent spent filter missing)",
+                )
+                .into());
             } else {
                 // One body walk for all needed vouts (not per-vout packed walk).
                 let range = self.confirm_parents.get_body_range(fk);
@@ -164,6 +225,9 @@ impl Query {
                 self.confirm_parents.get_parent_coinbase_height(fk)
             {
                 Some(resolved)
+            } else if cache_only {
+                // Unknown maturity → treat as non-coinbase (scripts don't need height).
+                Some(None)
             } else {
                 Some(self.resolve_parent_coinbase_height(
                     fk,
@@ -178,6 +242,35 @@ impl Query {
         }
 
         Ok((noted, wave))
+    }
+
+    /// Thin edges from stamped `create_fk` only — no head / by_txid store probes.
+    fn thin_edges_from_inputs_cache_only(
+        &self,
+        inputs: &[InputRecord],
+    ) -> Result<Vec<crate::wave_prevout::ThinInput>, QueryError> {
+        use crate::wave_prevout::ThinInput;
+        let mut edges = Vec::with_capacity(inputs.len());
+        for inp in inputs {
+            if inp.is_coinbase() {
+                edges.push(ThinInput {
+                    create_fk: None,
+                    prev_index: inp.prev_index,
+                });
+                continue;
+            }
+            if inp.create_fk.is_null() {
+                return Err(StoreError::Corrupt(
+                    "confirm: prewarm incomplete (input create_fk unstamped)",
+                )
+                .into());
+            }
+            edges.push(ThinInput {
+                create_fk: inp.create_fk.get(),
+                prev_index: inp.prev_index,
+            });
+        }
+        Ok(edges)
     }
 
     /// Resolve create maturity: `None` = not coinbase, `Some(h)` = coinbase height.

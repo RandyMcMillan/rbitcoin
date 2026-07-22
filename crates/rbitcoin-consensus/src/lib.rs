@@ -235,7 +235,8 @@ pub fn confirm_archived_at(
 /// See [`confirm_run`]: script phase then writeback. IBD uses the split phases
 /// for pipeline overlap.
 pub use confirm_run::{
-    confirm_archived_run, confirm_script_phase, confirm_writeback_phase, ScriptOkBatch,
+    confirm_archived_run, confirm_script_phase, confirm_writeback_phase, ConfirmScriptOutcome,
+    ScriptOkBatch,
 };
 
 /// Accept + archive + confirm in one step (genesis / tip extension tests).

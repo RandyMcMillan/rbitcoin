@@ -63,20 +63,39 @@ pub(crate) fn spawn_parent_prewarm(
             info!(
                 "ibd: parent prewarm worker ON (depth≤{depth}, batch≤{batch}, headroom={headroom} soft; env RBITCOIN_PARENT_PREWARM_*)"
             );
-            // next_height watermark (not index into a replaced vec). Tip GC is
-            // owned by confirm post_commit only — avoid dual advance_tip races.
+            // next_height watermark (not index into a replaced Arc runway).
+            // ConfirmParentCache.tip **must** track IBD tip: ensure_plans only
+            // accepts heights in (cache.tip, cache.tip+depth]. Without
+            // advance_tip, plans stay empty, ready_through stays 0, confirm
+            // never moves (mainnet stuck tip=360250 plans=0 thru=0).
             let mut next_height: u32 = 0;
+            let mut last_tip = u32::MAX;
             let mut last_info = std::time::Instant::now();
             let mut ever_worked = false;
             while !ctrl.stop.load(Ordering::Relaxed) {
                 let tip = ctrl.tip.load(Ordering::Relaxed);
-                if next_height <= tip {
+                if tip != last_tip {
+                    last_tip = tip;
+                    // Sets plan horizon + GC; mutex-serialized with confirm's tip GC.
+                    query.advance_parent_runway_tip(tip);
+                    // Re-walk runway; is_ready skips heights already marked.
+                    next_height = tip.saturating_add(1);
+                } else if next_height <= tip {
                     next_height = tip.saturating_add(1);
                 }
                 let runway = Arc::clone(&*ctrl.runway.lock().unwrap());
                 // First index with height >= next_height.
                 let start = runway.partition_point(|(h, _)| *h < next_height);
                 if runway.is_empty() || start >= runway.len() {
+                    // Stuck recovery: walked past runway but nothing ready ahead
+                    // of tip (e.g. tip never advanced cache before first walk).
+                    let through = query.parent_prewarm_ready_through();
+                    if !runway.is_empty() && through <= tip {
+                        next_height = tip.saturating_add(1);
+                        // fall through next iteration without long sleep
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
                     if ever_worked && last_info.elapsed() >= Duration::from_secs(30) {
                         let (through, ahead, by_txid, bodies, plans, d) =
                             query.parent_prewarm_perf_snapshot();

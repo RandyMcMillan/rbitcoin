@@ -1278,6 +1278,26 @@ mod tests {
         assert_eq!(o.value, 100);
     }
 
+    /// Regression: without advance_tip to the real IBD tip, ensure_plans rejects
+    /// heights outside (0, depth] and ready_through never leaves 0 — confirm stalls.
+    #[test]
+    fn ensure_plans_requires_tip_horizon() {
+        let c = ConfirmParentCache::new(64);
+        // Cache tip still 0 (prewarm forgot advance_tip).
+        c.ensure_plans(&[(360_251, [1u8; 32]), (360_252, [2u8; 32])]);
+        assert_eq!(c.plan_count(), 0, "heights far above tip+depth must not seed");
+        c.mark_scanned_many(&[360_251, 360_252]);
+        assert_eq!(c.ready_through(), 0);
+
+        c.advance_tip(360_250);
+        c.ensure_plans(&[(360_251, [1u8; 32]), (360_252, [2u8; 32])]);
+        assert_eq!(c.plan_count(), 2);
+        c.mark_scanned_many(&[360_251, 360_252]);
+        assert!(c.is_ready(360_251));
+        assert!(c.is_ready(360_252));
+        assert_eq!(c.ready_through(), 360_252);
+    }
+
     #[test]
     fn reserve_then_register_create_fills() {
         let c = ConfirmParentCache::new(64);

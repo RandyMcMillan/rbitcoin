@@ -56,6 +56,10 @@ pub struct PrewarmStats {
     pub edge_runway: u32,
     pub edge_head: u32,
     pub edge_coinbase: u32,
+    /// Thin edges resolved via confirmed sticky map.
+    pub edge_sticky: u32,
+    /// Unique externals resolved via sticky (subset of need_external).
+    pub sticky_hits: u32,
 }
 
 impl Query {
@@ -481,16 +485,20 @@ impl Query {
             .thin_collect_ns
             .saturating_add(t_collect.elapsed().as_nanos() as u64);
 
-        // ── thin: one-lock runway bulk lookup ──────────────────────────────
+        // ── thin: runway by_txid + confirmed sticky ────────────────────────
         let t_runway = Instant::now();
         let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
-        let runway_hits = self.confirm_parents.lookup_txids_batch(&need_vec);
+        let (map_hits, sticky_sourced) =
+            self.confirm_parents.lookup_txids_batch(&need_vec);
+        st.sticky_hits = st
+            .sticky_hits
+            .saturating_add(sticky_sourced.len() as u32);
         let mut need_head: Vec<[u8; 32]> = Vec::with_capacity(need_vec.len() / 2);
-        for txid in need_vec {
-            if let Some(fk) = runway_hits.get(&txid).copied() {
-                local_fk.insert(txid, Some(fk));
+        for txid in &need_vec {
+            if let Some(fk) = map_hits.get(txid).copied() {
+                local_fk.insert(*txid, Some(fk));
             } else {
-                need_head.push(txid);
+                need_head.push(*txid);
             }
         }
         st.thin_runway_ns = st
@@ -498,9 +506,6 @@ impl Query {
             .saturating_add(t_runway.elapsed().as_nanos() as u64);
 
         // ── thin: durable head probes (parallel; slot-ordered for locality) ─
-        // R3 sequential get_fk_by_txid_batch regressed thead ms/probe (~0.33→0.46).
-        // Restore rayon per-txid resolve (probe+body verify). Sticky by_txid
-        // (depth behind tip) still cuts unique probes across batches.
         let t_head = Instant::now();
         need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
         st.head_lookups = st.head_lookups.saturating_add(need_head.len() as u32);
@@ -545,6 +550,7 @@ impl Query {
             }
         }
         if !head_regs.is_empty() {
+            // by_txid + sticky (register_mlocked_creates_batch inserts both).
             self.confirm_parents
                 .register_mlocked_creates_batch(&head_regs);
         }
@@ -591,6 +597,9 @@ impl Query {
                             st.utxo_parents = st.utxo_parents.saturating_add(1);
                             if head_sourced.contains(&prev_txid) {
                                 st.edge_head = st.edge_head.saturating_add(1);
+                            } else if sticky_sourced.contains(&prev_txid) {
+                                st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
+                                st.edge_sticky = st.edge_sticky.saturating_add(1);
                             } else {
                                 st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                                 st.edge_runway = st.edge_runway.saturating_add(1);

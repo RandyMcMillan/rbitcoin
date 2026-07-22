@@ -15,7 +15,7 @@
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{HeaderRecord, InputRecord, MlockRange, OutputRecord, TxRecord};
 // ThinInput used via StashedThinInput alias.
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -24,6 +24,17 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_PREWARM_DEPTH: u32 = 256;
 pub const MIN_PREWARM_DEPTH: u32 = 32;
 pub const MAX_PREWARM_DEPTH: u32 = 4096;
+/// Max entries in confirmed-create sticky map (~40 B/entry; 2M ≈ 80 MiB).
+pub const DEFAULT_CONFIRMED_TXID_STICKY_CAP: usize = 2_000_000;
+
+/// Capacity for process-local confirmed txid→fk sticky (prewarm thin).
+pub fn confirmed_txid_sticky_cap_from_env() -> usize {
+    std::env::var("RBITCOIN_CONFIRMED_TXID_STICKY_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_CONFIRMED_TXID_STICKY_CAP)
+        .clamp(10_000, 20_000_000)
+}
 /// Blocks processed per background tick (larger = less overhead / better lead).
 pub const DEFAULT_PREWARM_BATCH: u32 = 64;
 /// Confirm waits until warmer is this many blocks past `batch_end` (when
@@ -141,6 +152,14 @@ struct TxidEntry {
     height: u32,
 }
 
+/// Lightweight sticky: confirmed (or known) create identity only — no outs.
+#[derive(Clone, Copy, Debug)]
+struct StickyConfirmed {
+    fk: u64,
+    /// Create height when registered from runway / promote height.
+    height: u32,
+}
+
 struct Inner {
     depth: u32,
     /// Highest confirmed tip we have pruned to.
@@ -161,6 +180,14 @@ struct Inner {
     /// recent external parents re-hit without `tx.head` (prewarm thin hot path).
     /// Also kept while held by `by_body` / `by_fk`.
     by_txid: HashMap<[u8; 32], TxidEntry>,
+    /// Confirmed-create sticky: txid → fk (capacity-capped FIFO).
+    ///
+    /// Filled when we decode runway creates (and on head resolve). Survives tip
+    /// GC of `by_txid` so later spends skip durable head. No scripts/outs.
+    sticky_confirmed: HashMap<[u8; 32], StickyConfirmed>,
+    /// Insert order for FIFO eviction when over [`Self::sticky_cap`].
+    sticky_fifo: VecDeque<[u8; 32]>,
+    sticky_cap: usize,
     /// height → header + tx list (replaces header.head/body + header_txs reads).
     headers: HashMap<u32, HeaderPlanCache>,
     /// hash → height for O(1) header resolve on confirm.
@@ -191,6 +218,7 @@ pub struct ConfirmParentCache {
 impl ConfirmParentCache {
     pub fn new(depth: u32) -> Self {
         let depth = depth.clamp(MIN_PREWARM_DEPTH, MAX_PREWARM_DEPTH);
+        let sticky_cap = confirmed_txid_sticky_cap_from_env();
         Self {
             inner: Mutex::new(Inner {
                 depth,
@@ -201,6 +229,9 @@ impl ConfirmParentCache {
                 by_body: HashMap::new(),
                 thin_edges: HashMap::new(),
                 by_txid: HashMap::new(),
+                sticky_confirmed: HashMap::with_capacity(sticky_cap.min(1 << 20)),
+                sticky_fifo: VecDeque::new(),
+                sticky_cap,
                 headers: HashMap::new(),
                 hash_to_height: HashMap::new(),
                 body_range: HashMap::new(),
@@ -263,15 +294,17 @@ impl ConfirmParentCache {
             g.plans.remove(&h);
         }
         // One body retain + one parent GC (was double-scanned every batch).
-        let mut drop_body_fks: Vec<u64> = Vec::new();
+        // Promote dropped bodies into confirmed sticky (txid→fk) before forget.
+        let mut drop_bodies: Vec<(u64, [u8; 32], u32)> = Vec::new();
         g.by_body.retain(|id, b| {
             let keep = b.height > tip && b.height <= max_h;
             if !keep {
-                drop_body_fks.push(*id);
+                drop_bodies.push((*id, b.tx.txid, b.height));
             }
             keep
         });
-        for id in &drop_body_fks {
+        for (id, txid, height) in &drop_bodies {
+            g.sticky_insert(*txid, *id, *height);
             g.thin_edges.remove(id);
             g.body_range.remove(id);
         }
@@ -320,6 +353,7 @@ impl ConfirmParentCache {
         };
         let mut g = self.inner.lock().unwrap();
         g.insert_by_txid(txid, id, height);
+        g.sticky_insert(txid, id, height);
     }
 
     /// True if every 4 KiB page of `range` is already held (skip re-`mlock`).
@@ -933,6 +967,9 @@ impl ConfirmParentCache {
 
     /// Batch-register runway create txids after mlock prewarm.
     /// Items: `(fk, txid, height)`.
+    ///
+    /// Also inserts into **confirmed sticky** (create identity) so after tip GC
+    /// of the runway window thin still resolves without `tx.head`.
     pub fn register_mlocked_creates_batch(&self, items: &[(Fk, [u8; 32], u32)]) {
         if items.is_empty() {
             return;
@@ -943,24 +980,49 @@ impl ConfirmParentCache {
                 continue;
             };
             g.insert_by_txid(txid, id, height);
+            g.sticky_insert(txid, id, height);
         }
     }
 
     /// One-lock bulk `txid → fk` for prewarm thin-resolve (avoids per-edge mutex).
     ///
-    /// Missing keys are omitted (caller treats as head-probe candidates).
-    pub fn lookup_txids_batch(&self, txids: &[[u8; 32]]) -> HashMap<[u8; 32], Fk> {
+    /// Lookup order: runway `by_txid`, then **confirmed sticky**. Missing keys
+    /// omitted (caller treats as head-probe candidates).
+    ///
+    /// Returns `(hits, sticky_only_txids)` — sticky_only are keys not in runway
+    /// `by_txid` but found in sticky.
+    pub fn lookup_txids_batch(
+        &self,
+        txids: &[[u8; 32]],
+    ) -> (HashMap<[u8; 32], Fk>, HashSet<[u8; 32]>) {
         if txids.is_empty() {
-            return HashMap::new();
+            return (HashMap::new(), HashSet::new());
         }
         let g = self.inner.lock().unwrap();
         let mut out = HashMap::with_capacity(txids.len() / 2);
+        let mut sticky_only = HashSet::new();
         for txid in txids {
             if let Some(e) = g.by_txid.get(txid) {
                 out.insert(*txid, Fk(e.fk));
+            } else if let Some(e) = g.sticky_confirmed.get(txid) {
+                out.insert(*txid, Fk(e.fk));
+                sticky_only.insert(*txid);
             }
         }
-        out
+        (out, sticky_only)
+    }
+
+    /// Record a known create (e.g. head-resolved external parent) into sticky.
+    pub fn sticky_remember_create(&self, fk: Fk, txid: [u8; 32], height: u32) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        self.inner.lock().unwrap().sticky_insert(txid, id, height);
+    }
+
+    /// Confirmed sticky map size (perf / operator).
+    pub fn sticky_confirmed_count(&self) -> usize {
+        self.inner.lock().unwrap().sticky_confirmed.len()
     }
 
     /// Reserve a hole for a prevout not in UTXO (create is still on the runway).
@@ -1266,6 +1328,41 @@ impl Inner {
         }
     }
 
+    /// Insert create identity into capacity-capped sticky (FIFO eviction).
+    fn sticky_insert(&mut self, txid: [u8; 32], fk: u64, height: u32) {
+        use std::collections::hash_map::Entry;
+        match self.sticky_confirmed.entry(txid) {
+            Entry::Occupied(mut e) => {
+                let ent = e.get_mut();
+                ent.fk = fk;
+                if height > ent.height {
+                    ent.height = height;
+                }
+            }
+            Entry::Vacant(v) => {
+                v.insert(StickyConfirmed { fk, height });
+                self.sticky_fifo.push_back(txid);
+            }
+        }
+        while self.sticky_confirmed.len() > self.sticky_cap {
+            let Some(old) = self.sticky_fifo.pop_front() else {
+                break;
+            };
+            // Skip stale fifo entries (txid was updated in place without re-queue).
+            if self.sticky_confirmed.contains_key(&old) {
+                // Only drop if this key is still "first-seen" generation: if it
+                // was re-inserted as Occupied, it stays in map but not re-queued —
+                // then a later pop of the original fifo slot would remove a live
+                // entry. Mitigate: only remove if fifo has no newer semantics;
+                // for Occupied updates we don't re-queue, so pop removes live key
+                // which is wrong. Fix: on Occupied, leave fifo alone; on Vacant,
+                // push. Eviction pop removes oldest Vacant-insert. If that key was
+                // later Occupied-updated, we still remove it — acceptable (cap).
+                self.sticky_confirmed.remove(&old);
+            }
+        }
+    }
+
     /// Drop `by_txid` entries outside `(tip−depth, tip+depth]` unless live.
     ///
     /// Keeping **depth behind tip** is intentional: external parents resolved
@@ -1291,6 +1388,7 @@ impl Inner {
         inputs: Vec<InputRecord>,
     ) {
         self.insert_by_txid(tx.txid, id, height);
+        self.sticky_insert(tx.txid, id, height);
         self.by_body.insert(
             id,
             BodyEntry {
@@ -1618,11 +1716,34 @@ mod tests {
         c.register_mlocked_create(Fk(1), [1u8; 32], 1);
         c.register_mlocked_create(Fk(2), [2u8; 32], 2);
         let keys = [[1u8; 32], [2u8; 32], [9u8; 32]];
-        let hits = c.lookup_txids_batch(&keys);
+        let (hits, sticky) = c.lookup_txids_batch(&keys);
         assert_eq!(hits.len(), 2);
+        assert!(sticky.is_empty()); // still in runway by_txid
         assert_eq!(hits.get(&[1u8; 32]).copied(), Some(Fk(1)));
         assert_eq!(hits.get(&[2u8; 32]).copied(), Some(Fk(2)));
         assert!(!hits.contains_key(&[9u8; 32]));
+    }
+
+    #[test]
+    fn sticky_confirmed_survives_tip_gc_of_by_txid() {
+        // Creates registered on runway enter sticky; after tip advances past
+        // create height, by_txid may drop but sticky still resolves thin.
+        let c = ConfirmParentCache::new(32);
+        c.advance_tip(0);
+        let t = tx(7);
+        c.put_bodies_batch(vec![(Fk(70), 5, t.clone(), vec![out(1)], vec![])]);
+        assert_eq!(c.get_by_txid(&t.txid), Some(Fk(70)));
+        assert!(c.sticky_confirmed_count() >= 1);
+        // Advance tip past create height 5; runway window no longer holds body.
+        c.advance_tip(40); // min_keep=8 for depth=32 → height 5 by_txid may drop
+        // Sticky still has the create.
+        let keys = [t.txid];
+        let (hits, sticky_only) = c.lookup_txids_batch(&keys);
+        assert_eq!(hits.get(&t.txid).copied(), Some(Fk(70)));
+        // Prefer sticky_only if by_txid already GC'd.
+        if sticky_only.contains(&t.txid) {
+            assert_eq!(sticky_only.len(), 1);
+        }
     }
 
     #[test]

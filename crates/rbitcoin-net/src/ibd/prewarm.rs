@@ -156,8 +156,9 @@ pub(crate) fn spawn_parent_prewarm(
                             let t_edge = st.thin_edge_ns / 1_000_000;
                             let pin = st.parent_pin_ns / 1_000_000;
                             let put = st.cache_put_ns / 1_000_000;
+                            let sticky_n = query.confirm_parent_cache().sticky_confirmed_count();
                             info!(
-                                "ibd: prewarm tip={tip} +{ahead} thru={through} by_txid={by_txid} bodies={bodies} plans={plans}/{d} next_h={next_height} runway={} last_h={h0}..{h1} blks={} body_io={} parent_io={} head={}/{} mlock_sys={}/{} edges same={} runway={} head={} {ms}ms (hdr={hdr} mlock={ml} dec={dec} thin={thin}[col={t_col} run={t_run} head={t_head} edge={t_edge}] pin={pin} put={put})",
+                                "ibd: prewarm tip={tip} +{ahead} thru={through} by_txid={by_txid} bodies={bodies} sticky={sticky_n} plans={plans}/{d} next_h={next_height} runway={} last_h={h0}..{h1} blks={} body_io={} parent_io={} head={}/{} mlock_sys={}/{} edges same={} runway={} sticky={} head={} sticky_hit={} {ms}ms (hdr={hdr} mlock={ml} dec={dec} thin={thin}[col={t_col} run={t_run} head={t_head} edge={t_edge}] pin={pin} put={put})",
                                 runway.len(),
                                 st.blocks,
                                 st.body_tx_reads,
@@ -168,7 +169,9 @@ pub(crate) fn spawn_parent_prewarm(
                                 st.mlock_skipped,
                                 st.edge_same_batch,
                                 st.edge_runway,
+                                st.edge_sticky,
                                 st.edge_head,
+                                st.sticky_hits,
                             );
                             last_info = std::time::Instant::now();
                         }

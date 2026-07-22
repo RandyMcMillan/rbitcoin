@@ -86,6 +86,8 @@ pub mod parent_prewarm_stats {
     pub static EDGE_RUNWAY: AtomicU64 = AtomicU64::new(0);
     pub static EDGE_HEAD: AtomicU64 = AtomicU64::new(0);
     pub static EDGE_COINBASE: AtomicU64 = AtomicU64::new(0);
+    pub static EDGE_STICKY: AtomicU64 = AtomicU64::new(0);
+    pub static STICKY_HITS: AtomicU64 = AtomicU64::new(0);
 
     /// One sampler snapshot (all counters reset).
     #[derive(Debug, Default, Clone, Copy)]
@@ -118,6 +120,8 @@ pub mod parent_prewarm_stats {
         pub edge_runway: u64,
         pub edge_head: u64,
         pub edge_coinbase: u64,
+        pub edge_sticky: u64,
+        pub sticky_hits: u64,
     }
 
     pub fn sample_and_reset() -> Sample {
@@ -150,6 +154,8 @@ pub mod parent_prewarm_stats {
             edge_runway: EDGE_RUNWAY.swap(0, Ordering::Relaxed),
             edge_head: EDGE_HEAD.swap(0, Ordering::Relaxed),
             edge_coinbase: EDGE_COINBASE.swap(0, Ordering::Relaxed),
+            edge_sticky: EDGE_STICKY.swap(0, Ordering::Relaxed),
+            sticky_hits: STICKY_HITS.swap(0, Ordering::Relaxed),
         }
     }
 
@@ -192,6 +198,8 @@ pub mod parent_prewarm_stats {
         add!(edge_runway, EDGE_RUNWAY);
         add!(edge_head, EDGE_HEAD);
         add!(edge_coinbase, EDGE_COINBASE);
+        add!(edge_sticky, EDGE_STICKY);
+        add!(sticky_hits, STICKY_HITS);
     }
 }
 

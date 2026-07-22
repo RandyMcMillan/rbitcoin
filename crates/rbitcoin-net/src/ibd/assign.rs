@@ -56,17 +56,20 @@ pub(crate) fn inflight_add_peer(
         .add_peer(peer);
 }
 
-/// Getdata assign scope.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AssignScope {
-    /// Tip hole + near + far densify.
-    Full,
-    /// Only tip hole + near band — when archive RAM budget is full so peers are
-    /// not left `inflight=0` while confirm crawls on already-archived lag.
-    ///
-    /// Still requests ContigPark `write_next` gap fills (see
-    /// [`cover_archive_contig_gap`]) so a far park gap cannot deadlock the writer.
-    TipNearOnly,
+/// Scale far densify capacity by archive budget admission (`0.0`..=`1.0`).
+///
+/// `0.0` = tip hole + near + ContigPark gap only (no general far densify).
+/// `1.0` = full far slots / window reserve.
+pub(crate) fn scale_far_cap(base_far_cap: usize, far_scale: f64) -> usize {
+    if base_far_cap == 0 || far_scale <= 0.0 {
+        return 0;
+    }
+    if far_scale >= 1.0 {
+        return base_far_cap;
+    }
+    // Ceil so tiny residual headroom still allows a drip of far work.
+    let scaled = ((base_far_cap as f64) * far_scale).ceil() as usize;
+    scaled.max(1).min(base_far_cap)
 }
 
 /// Assign getdata for bodies not yet Class A.
@@ -74,10 +77,10 @@ pub(crate) enum AssignScope {
 /// 1. Tip hole — 2 peers immediately; 3rd after [`TIP_HOLE_THIRD_PEER_AFTER`]
 ///    from when the second was attached (no stall disconnect required).
 /// 2. **Archive ContigPark gap** — heights at/after `archive_write_next` that
-///    still need a body (always, including [`AssignScope::TipNearOnly`]).
+///    still need a body (**always**, even when `far_scale == 0`).
 /// 3. Near band — tip+1‥tip+[`NEAR_DEPTH`] (single peer per hash).
-/// 4. Far — forward densify past near (height-ascending); skipped in
-///    [`AssignScope::TipNearOnly`].
+/// 4. Far — forward densify past near (height-ascending); capacity scaled by
+///    `far_scale` from [`super::archive::ArchiveQueueBudget::far_admission_scale`].
 ///
 /// `archive_write_next` is ContigPark's next commit height (shared atomic from
 /// the writer). Filling gaps there unblocks parked RAM under a full budget.
@@ -86,7 +89,7 @@ pub(crate) fn assign_work_ordered(
     hub: &ChainHub,
     cfg: &IbdConfig,
     loop_stats: &LoopStats,
-    scope: AssignScope,
+    far_scale: f64,
     archive_write_next: u32,
 ) {
     let t0 = Instant::now();
@@ -115,7 +118,7 @@ pub(crate) fn assign_work_ordered(
 
     issued += cover_tip_holes(st, hub, cfg, &alive, &tip_holes);
 
-    // Unstick ContigPark even when TipNearOnly (budget full + large lead).
+    // Unstick ContigPark even when far_scale == 0 (budget pressure / hysteresis).
     issued += cover_archive_contig_gap(st, hub, cfg, &alive, archive_write_next);
 
     let mut room = cfg.window.saturating_sub(st.inflight.len());
@@ -132,14 +135,13 @@ pub(crate) fn assign_work_ordered(
         return;
     }
 
-    // TipNearOnly: give the whole window to tip runway (no far reserve).
-    // Contig gap already handled above.
-    let want_far = matches!(scope, AssignScope::Full);
-    let far_cap = if want_far {
-        far_slots_per_peer(cfg.per_peer, tip_hole)
-    } else {
-        0
-    };
+    // Far densify scaled by archive free headroom (proportional + hysteresis).
+    // Contig gap already handled above; near always uses remaining room.
+    let far_scale = far_scale.clamp(0.0, 1.0);
+    let base_far = far_slots_per_peer(cfg.per_peer, tip_hole);
+    let far_cap = scale_far_cap(base_far, far_scale);
+    let want_far = far_cap > 0;
+    // far_cap is already scale-adjusted; reserve uses the reduced per-peer far slots.
     let far_window_reserve = if want_far {
         alive
             .len()
@@ -152,7 +154,7 @@ pub(crate) fn assign_work_ordered(
     let near_window_cap = room.saturating_sub(far_window_reserve);
 
     let (near_work, far_work) =
-        collect_need(st, hub, tip, near_hi, near_window_cap, room, want_far && far_cap > 0);
+        collect_need(st, hub, tip, near_hi, near_window_cap, room, want_far);
     if near_work.is_empty() && far_work.is_empty() {
         finish_assign(loop_stats, t0, issued);
         return;
@@ -524,8 +526,8 @@ pub(crate) fn contig_gap_need(
 
 /// Cover ContigPark's next commit heights with getdata (single peer each).
 ///
-/// Runs under **both** Full and TipNearOnly so a missing far gap cannot freeze
-/// the writer while the budget is full of parked later heights.
+/// Runs even when `far_scale == 0` so a missing far gap cannot freeze the writer
+/// while the budget is full of parked later heights.
 pub(crate) fn cover_archive_contig_gap(
     st: &mut IbdWorkState,
     hub: &ChainHub,

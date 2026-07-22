@@ -55,7 +55,7 @@ use progress::{
     format_rate, ibd_pct, work_chain_progress, TipRateTracker,
 };
 use state::IbdWorkState;
-use assign::{assign_work_ordered, AssignScope};
+use assign::assign_work_ordered;
 use events::{
     apply_archive_result, apply_confirm_reject, apply_peer_event, disconnect_all_peers,
     drain_ready_peer_and_archive_events, update_confirm_lag,
@@ -119,7 +119,7 @@ pub(crate) const FAR_BATCH_MAX: usize = 16;
 /// Cap height scan for far candidates per assign tick.
 pub(crate) const FAR_SCAN_BUDGET: usize = 16_384;
 /// Max heights to re-getdata at ContigPark `write_next` (unstick archive under
-/// TipNearOnly / full RAM budget when a far gap blocks the park).
+/// far admission is 0 / budget pressure when a far gap blocks the park).
 pub(crate) const CONTIG_GAP_FILL_MAX: u32 = 64;
 
 /// Tunables for IBD (defaults lean libbitcoin/Core-ish).
@@ -355,7 +355,8 @@ pub async fn ibd_cancellable(
 
     // Archive pipeline: multi-core prep + exclusive writer (mmap Class A).
     // Byte budget (default via RBITCOIN_ARCHIVE_QUEUE_MB) caps decoded blocks
-    // waiting for archive; when full, getdata is TipNearOnly (no drop).
+    // waiting for archive; far getdata scales with free headroom (hysteresis
+    // 90%/70%) — never drops in-flight, only throttles new far densify.
     let archive_queued = ArchiveQueueBudget::from_env();
     info!(
         "ibd: archive queue budget={} MiB (RBITCOIN_ARCHIVE_QUEUE_MB)",
@@ -494,14 +495,9 @@ pub async fn ibd_cancellable(
         st.hygiene();
 
         // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
-        // When arch RAM budget is full, still densify **tip-near** so confirm has
-        // runway (mid-sync was inflight=0 while arch_q sat at cap). ContigPark
-        // write_next gaps are always covered inside assign (even TipNearOnly).
-        let scope = if archive_queued.has_room() {
-            AssignScope::Full
-        } else {
-            AssignScope::TipNearOnly
-        };
+        // Far densify scaled by archive free headroom (proportional + 90%/70%
+        // pressure hysteresis). Tip-near + ContigPark gap always run.
+        let far_scale = archive_queued.far_admission_scale();
         let write_next = archive_write_next.load(Ordering::Relaxed);
         let inflight_before = st.inflight.len();
         assign_work_ordered(
@@ -509,7 +505,7 @@ pub async fn ibd_cancellable(
             hub.as_ref(),
             &cfg,
             &loop_stats,
-            scope,
+            far_scale,
             write_next,
         );
 
@@ -558,18 +554,14 @@ pub async fn ibd_cancellable(
         // (avoid double planner work every loop tick).
         let freed = inflight_before.saturating_sub(st.inflight.len());
         if freed >= 8 || st.inflight.is_empty() {
-            let scope2 = if archive_queued.has_room() {
-                AssignScope::Full
-            } else {
-                AssignScope::TipNearOnly
-            };
+            let far_scale2 = archive_queued.far_admission_scale();
             let write_next2 = archive_write_next.load(Ordering::Relaxed);
             assign_work_ordered(
                 &mut st,
                 hub.as_ref(),
                 &cfg,
                 &loop_stats,
-                scope2,
+                far_scale2,
                 write_next2,
             );
         }

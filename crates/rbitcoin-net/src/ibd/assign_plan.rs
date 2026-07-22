@@ -122,13 +122,15 @@ mod tests {
         assert_eq!(far_slots_per_peer(8, false), 4);
     }
 
-    /// When archive RAM is full we set far_cap=0 so all window room is near.
+    /// Pressure / far_scale=0 → no far slots (near + contig gap only).
     #[test]
-    fn tip_near_only_means_zero_far_cap() {
-        assert_eq!(far_slots_per_peer(16, false).min(0), 0);
-        // Explicit: tip-near assign path uses far_cap = 0 regardless of tip_hole.
-        let far_cap_when_budget_full = 0usize;
-        assert_eq!(far_cap_when_budget_full, 0);
+    fn zero_far_scale_means_zero_far_cap() {
+        use super::super::assign::scale_far_cap;
+        assert_eq!(scale_far_cap(8, 0.0), 0);
+        assert_eq!(scale_far_cap(8, 0.5), 4);
+        assert_eq!(scale_far_cap(8, 1.0), 8);
+        // Tiny residual headroom still drips one far slot.
+        assert_eq!(scale_far_cap(8, 0.01), 1);
     }
 
     #[test]

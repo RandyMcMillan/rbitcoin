@@ -108,15 +108,27 @@ impl ArchivePipelineSample {
 /// and stacked with Class A cache + OS page cache of multi‑GB store files.
 pub const DEFAULT_ARCHIVE_QUEUE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
+/// Enter “pressure” (far_scale = 0) when fill ≥ this fraction of budget.
+pub const ARCHIVE_PRESSURE_ENTER: f64 = 0.90;
+/// Leave pressure only after fill ≤ this (hysteresis vs enter).
+pub const ARCHIVE_PRESSURE_EXIT: f64 = 0.70;
+
 /// Shared counter of blocks (and approx wire bytes) in the archive pipeline.
 ///
 /// Charged when a decoded body is handed to the job channel; released when the
 /// writer (or prep error path) returns [`ArchiveResult`]. Used for getdata
 /// backpressure so RAM waiting on archive stays near the configured budget.
+///
+/// Admission for **far** densify is smoothed via [`Self::far_admission_scale`]:
+/// proportional free headroom plus 90%/70% pressure hysteresis (avoids
+/// bang-bang Full ↔ TipNearOnly spikes).
 pub(crate) struct ArchiveQueueBudget {
     count: AtomicUsize,
     bytes: AtomicUsize,
     budget: usize,
+    /// Latched high-fill mode: once ≥ [`ARCHIVE_PRESSURE_ENTER`], stays until
+    /// ≤ [`ARCHIVE_PRESSURE_EXIT`].
+    pressure: AtomicBool,
 }
 
 impl ArchiveQueueBudget {
@@ -126,6 +138,7 @@ impl ArchiveQueueBudget {
             bytes: AtomicUsize::new(0),
             // At least 16 MiB so tiny overrides still leave room for a few blocks.
             budget: budget.max(16 * 1024 * 1024),
+            pressure: AtomicBool::new(false),
         }
     }
 
@@ -150,9 +163,46 @@ impl ArchiveQueueBudget {
         self.bytes.load(Ordering::Relaxed)
     }
 
-    /// True while charged bytes are under the budget (room for more getdata).
-    pub fn has_room(&self) -> bool {
-        self.bytes() < self.budget
+    /// Charged bytes / budget (may be > 1 when oversubscribed).
+    pub fn fill_ratio(&self) -> f64 {
+        let b = self.budget.max(1) as f64;
+        self.bytes() as f64 / b
+    }
+
+    /// Whether pressure hysteresis is latched (far densify off).
+    #[cfg(test)]
+    pub fn in_pressure(&self) -> bool {
+        self.pressure.load(Ordering::Relaxed)
+    }
+
+    /// Update pressure latch from current fill; return far admission scale in **0..=1**.
+    ///
+    /// - **Pressure (A):** enter at fill ≥ 0.90, exit only at fill ≤ 0.70 → scale 0.
+    /// - **Proportional (B):** outside pressure, `scale = (1 - fill).clamp(0, 1)`
+    ///   so half-full budget ≈ half far work (smooth BW, no cliff at budget).
+    ///
+    /// ContigPark gap + tip-near are **not** gated by this (assign always covers them).
+    pub fn far_admission_scale(&self) -> f64 {
+        let fill = self.fill_ratio();
+        let was = self.pressure.load(Ordering::Relaxed);
+        let (scale, pressure) = Self::far_scale_from(fill, was);
+        self.pressure.store(pressure, Ordering::Relaxed);
+        scale
+    }
+
+    /// Pure helper: scale from fill + pressure latch (shared by production + tests).
+    pub(crate) fn far_scale_from(fill: f64, mut pressure: bool) -> (f64, bool) {
+        if fill >= ARCHIVE_PRESSURE_ENTER {
+            pressure = true;
+        } else if fill <= ARCHIVE_PRESSURE_EXIT {
+            pressure = false;
+        }
+        let scale = if pressure {
+            0.0
+        } else {
+            (1.0 - fill).clamp(0.0, 1.0)
+        };
+        (scale, pressure)
     }
 
     /// Charge a block entering the pipeline (job channel → prep → writer).
@@ -962,9 +1012,66 @@ mod tests {
     fn budget_default_is_256mib() {
         let b = ArchiveQueueBudget::new(DEFAULT_ARCHIVE_QUEUE_BUDGET_BYTES);
         assert_eq!(b.budget_bytes(), 256 * 1024 * 1024);
-        assert!(b.has_room());
+        assert!(b.fill_ratio() < 1.0);
         assert_eq!(b.count(), 0);
         assert_eq!(b.bytes(), 0);
+    }
+
+    #[test]
+    fn far_scale_proportional_and_hysteresis() {
+        // Empty → full far.
+        let (s0, p0) = ArchiveQueueBudget::far_scale_from(0.0, false);
+        assert!((s0 - 1.0).abs() < 1e-9 && !p0);
+        // Half full → half far (proportional).
+        let (s50, p50) = ArchiveQueueBudget::far_scale_from(0.5, false);
+        assert!((s50 - 0.5).abs() < 1e-9 && !p50);
+        // Enter pressure at 90%.
+        let (s90, p90) = ArchiveQueueBudget::far_scale_from(0.90, false);
+        assert_eq!(s90, 0.0);
+        assert!(p90);
+        // Stay in pressure until ≤70% even if fill eases to 80%.
+        let (s80, p80) = ArchiveQueueBudget::far_scale_from(0.80, true);
+        assert_eq!(s80, 0.0);
+        assert!(p80);
+        // Exit at 70% → proportional again.
+        let (s70, p70) = ArchiveQueueBudget::far_scale_from(0.70, true);
+        assert!((s70 - 0.30).abs() < 1e-9);
+        assert!(!p70);
+    }
+
+    #[test]
+    fn far_admission_scale_uses_live_bytes() {
+        let budget = 100 * 1024 * 1024;
+        let b = ArchiveQueueBudget::new(budget);
+        // Charge to ~50% (charged_bytes applies 1.5× overhead).
+        let wire = (budget * 2 / 3) / 2; // one charge → ~50% after overhead
+        b.charge(wire);
+        let fill = b.fill_ratio();
+        assert!((0.4..0.6).contains(&fill), "fill={fill}");
+        let scale = b.far_admission_scale();
+        assert!((scale - (1.0 - fill)).abs() < 1e-9);
+        assert!(!b.in_pressure());
+        // Overshoot enter threshold.
+        while b.fill_ratio() < ARCHIVE_PRESSURE_ENTER {
+            b.charge(wire);
+        }
+        assert_eq!(b.far_admission_scale(), 0.0);
+        assert!(b.in_pressure());
+        // Drain to mid-band: still pressure.
+        while b.fill_ratio() > 0.75 && b.count() > 0 {
+            b.release(wire);
+        }
+        if b.fill_ratio() > ARCHIVE_PRESSURE_EXIT {
+            assert_eq!(b.far_admission_scale(), 0.0);
+            assert!(b.in_pressure());
+        }
+        // Drain to exit.
+        while b.fill_ratio() > ARCHIVE_PRESSURE_EXIT && b.count() > 0 {
+            b.release(wire);
+        }
+        let s = b.far_admission_scale();
+        assert!(!b.in_pressure());
+        assert!(s > 0.0, "scale after exit={s}");
     }
 
     #[test]
@@ -976,12 +1083,12 @@ mod tests {
         b.charge(w);
         assert_eq!(b.count(), 2);
         assert_eq!(b.bytes(), ArchiveQueueBudget::charged_bytes(w) * 2);
-        assert!(b.has_room());
+        assert!(b.fill_ratio() < 1.0);
         b.charge(w);
-        assert!(!b.has_room());
+        assert!(b.fill_ratio() >= 1.0);
         b.release(w);
         assert_eq!(b.count(), 2);
-        assert!(b.has_room());
+        assert!(b.fill_ratio() < 1.0);
         b.release(w);
         b.release(w);
         assert_eq!(b.count(), 0);

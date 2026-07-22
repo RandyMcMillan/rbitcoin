@@ -2,6 +2,7 @@
 
 use super::coalesce::{coalesce_wait, max_batch_for_lag, min_batch_for_lag};
 use crate::chain::ChainHub;
+use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash};
 use rbitcoin_consensus::prepare_block_for_archive_ibd;
 use rbitcoin_log::debug;
@@ -276,6 +277,23 @@ impl ContigPark {
         n as usize
     }
 
+    /// Advance `next_h` without writing (caller verified Class A already holds
+    /// that height — e.g. Late single-archive or resume HWM).
+    fn force_advance(&mut self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        self.next_h = self.next_h.saturating_add(n);
+        // Drop any parked entries that are now past (shouldn't exist).
+        while let Some((&h, _)) = self.parked.first_key_value() {
+            if h < self.next_h {
+                self.parked.remove(&h);
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Pop a contiguous run `[next_h, next_h+len)` of at most `max` blocks.
     /// Advances `next_h` by the number taken (caller must [`rewind`] on write failure).
     fn take_contiguous(&mut self, max: usize) -> Vec<PreparedArchive> {
@@ -386,6 +404,22 @@ mod contig_park_tests {
         assert_eq!(run.len(), 4);
         assert_eq!(p.next_h(), 4);
         assert_eq!(p.parked_len(), 6);
+    }
+
+    #[test]
+    fn force_advance_unblocks_parked_prefix() {
+        let mut p = ContigPark::new(10);
+        assert!(matches!(p.insert(prep(12)), super::ParkInsert::Parked));
+        assert!(matches!(p.insert(prep(11)), super::ParkInsert::Parked));
+        assert!(p.take_contiguous(8).is_empty());
+        // Simulate 10 already Class A — skip without a parked body.
+        p.force_advance(1);
+        assert_eq!(p.next_h(), 11);
+        let run = p.take_contiguous(8);
+        assert_eq!(run.len(), 2);
+        assert_eq!(run[0].height, 11);
+        assert_eq!(run[1].height, 12);
+        assert_eq!(p.next_h(), 13);
     }
 }
 
@@ -610,7 +644,44 @@ pub(crate) fn spawn_archive_pipeline(
                     let lag = write_lag.load(Ordering::Relaxed);
                     let max_mega = max_batch_for_lag(lag);
                     let min_batch = min_batch_for_lag(lag);
-                    let ready = park.ready_prefix_len();
+                    let mut ready = park.ready_prefix_len();
+
+                    // If the park is waiting on a height already Class A (Late
+                    // path / prior write), advance so parked higher heights drain.
+                    // Without this, a full budget of non-contiguous park + missing
+                    // re-getdata can freeze write_next forever.
+                    if ready == 0 && park.parked_len() > 0 {
+                        let mut skipped = 0u32;
+                        while skipped < 64 && park.ready_prefix_len() == 0 {
+                            let nh = park.next_h();
+                            // Prefer process-local height map via header hash on
+                            // the prepared park (higher keys) is not next_h.
+                            // Probe store: confirmed[] only covers tip; use
+                            // header_at_height when confirmed, else stop.
+                            let archived = match write_hub.query.header_at_height(
+                                rbitcoin_primitives::Height(nh),
+                            ) {
+                                Ok(Some((_, rec))) => {
+                                    let hash = bitcoin::BlockHash::from_byte_array(rec.hash);
+                                    write_hub.is_archived(&hash)
+                                }
+                                _ => false,
+                            };
+                            if !archived {
+                                break;
+                            }
+                            park.force_advance(1);
+                            skipped += 1;
+                        }
+                        if skipped > 0 {
+                            write_next.store(park.next_h(), Ordering::Relaxed);
+                            ready = park.ready_prefix_len();
+                            rbitcoin_log::debug!(
+                                "ibd: ContigPark advanced past {skipped} already-archived height(s) next_h={}",
+                                park.next_h()
+                            );
+                        }
+                    }
 
                     // Wait briefly to grow a larger contiguous quanta when only a few
                     // heights at next_h are ready (same coalesce policy as before).

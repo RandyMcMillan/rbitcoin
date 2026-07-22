@@ -118,6 +118,9 @@ pub(crate) const PENDING_STALE: Duration = Duration::from_secs(45);
 pub(crate) const FAR_BATCH_MAX: usize = 16;
 /// Cap height scan for far candidates per assign tick.
 pub(crate) const FAR_SCAN_BUDGET: usize = 16_384;
+/// Max heights to re-getdata at ContigPark `write_next` (unstick archive under
+/// TipNearOnly / full RAM budget when a far gap blocks the park).
+pub(crate) const CONTIG_GAP_FILL_MAX: u32 = 64;
 
 /// Tunables for IBD (defaults lean libbitcoin/Core-ish).
 #[derive(Clone, Debug)]
@@ -492,12 +495,14 @@ pub async fn ibd_cancellable(
 
         // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
         // When arch RAM budget is full, still densify **tip-near** so confirm has
-        // runway (mid-sync was inflight=0 while arch_q sat at cap).
+        // runway (mid-sync was inflight=0 while arch_q sat at cap). ContigPark
+        // write_next gaps are always covered inside assign (even TipNearOnly).
         let scope = if archive_queued.has_room() {
             AssignScope::Full
         } else {
             AssignScope::TipNearOnly
         };
+        let write_next = archive_write_next.load(Ordering::Relaxed);
         let inflight_before = st.inflight.len();
         assign_work_ordered(
             &mut st,
@@ -505,6 +510,7 @@ pub async fn ibd_cancellable(
             &cfg,
             &loop_stats,
             scope,
+            write_next,
         );
 
         // Offer archived bodies to the dedicated confirm engine (non-blocking).
@@ -557,12 +563,14 @@ pub async fn ibd_cancellable(
             } else {
                 AssignScope::TipNearOnly
             };
+            let write_next2 = archive_write_next.load(Ordering::Relaxed);
             assign_work_ordered(
                 &mut st,
                 hub.as_ref(),
                 &cfg,
                 &loop_stats,
                 scope2,
+                write_next2,
             );
         }
 
@@ -1199,6 +1207,64 @@ mod tip_hole_race_tests {
             3
         );
         assert_eq!(tip_hole_peer_target(3, Some(t0), t0 + Duration::from_secs(60)), 3);
+    }
+}
+
+#[cfg(test)]
+mod contig_gap_assign_tests {
+    use super::assign::contig_gap_need;
+    use super::state::IbdWorkState;
+    use super::CONTIG_GAP_FILL_MAX;
+    use bitcoin::hashes::Hash;
+    use bitcoin::BlockHash;
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_query::Query;
+
+    fn h(n: u32) -> BlockHash {
+        let mut b = [0u8; 32];
+        b[0..4].copy_from_slice(&n.to_le_bytes());
+        BlockHash::from_byte_array(b)
+    }
+
+    #[test]
+    fn contig_gap_need_picks_write_next_band() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-contig-gap-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+
+        let mut st = IbdWorkState::new(vec![], None, None);
+        // Heights 100..=110 on the ordered path; write_next=100 gap-fill window.
+        for ht in 100u32..=110 {
+            let hash = h(ht);
+            st.record_height(hash, ht);
+            st.ordered_set.insert(hash);
+            st.ordered.push_back(hash);
+            st.max_ordered_height = ht;
+        }
+        // 100 pending (in pipeline), 101 known archived, 102 inflight → skip.
+        st.body.mark_pending(h(100));
+        st.body.mark_archived(h(101));
+        st.inflight
+            .insert(h(102), super::state::InflightReq::new(0));
+
+        let need = contig_gap_need(&mut st, &hub, 100, CONTIG_GAP_FILL_MAX);
+        assert!(!need.is_empty(), "expected gap fills");
+        assert_eq!(need[0], h(103), "first fill after skips");
+        assert!(need
+            .iter()
+            .all(|x| *x != h(100) && *x != h(101) && *x != h(102)));
+        for hash in &need {
+            let ht = st.hash_height[hash];
+            assert!((100..=100 + CONTIG_GAP_FILL_MAX - 1).contains(&ht));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

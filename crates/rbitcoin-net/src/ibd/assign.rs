@@ -5,8 +5,8 @@ use super::peer_io::{touch_block_progress, PeerCmd, PeerSlot};
 use super::state::{self, IbdWorkState};
 use super::status::LoopStats;
 use super::{
-    IbdConfig, FAR_BATCH_MAX, FAR_SCAN_BUDGET, NEAR_DEPTH, PENDING_STALE, TIP_HOLE_IMMEDIATE_PEERS,
-    TIP_HOLE_MAX, TIP_HOLE_MAX_PEERS, TIP_HOLE_THIRD_PEER_AFTER,
+    IbdConfig, CONTIG_GAP_FILL_MAX, FAR_BATCH_MAX, FAR_SCAN_BUDGET, NEAR_DEPTH, PENDING_STALE,
+    TIP_HOLE_IMMEDIATE_PEERS, TIP_HOLE_MAX, TIP_HOLE_MAX_PEERS, TIP_HOLE_THIRD_PEER_AFTER,
 };
 use crate::chain::ChainHub;
 use bitcoin::BlockHash;
@@ -63,6 +63,9 @@ pub(crate) enum AssignScope {
     Full,
     /// Only tip hole + near band — when archive RAM budget is full so peers are
     /// not left `inflight=0` while confirm crawls on already-archived lag.
+    ///
+    /// Still requests ContigPark `write_next` gap fills (see
+    /// [`cover_archive_contig_gap`]) so a far park gap cannot deadlock the writer.
     TipNearOnly,
 }
 
@@ -70,15 +73,21 @@ pub(crate) enum AssignScope {
 ///
 /// 1. Tip hole — 2 peers immediately; 3rd after [`TIP_HOLE_THIRD_PEER_AFTER`]
 ///    from when the second was attached (no stall disconnect required).
-/// 2. Near band — tip+1‥tip+[`NEAR_DEPTH`] (single peer per hash).
-/// 3. Far — forward densify past near (height-ascending); skipped in
+/// 2. **Archive ContigPark gap** — heights at/after `archive_write_next` that
+///    still need a body (always, including [`AssignScope::TipNearOnly`]).
+/// 3. Near band — tip+1‥tip+[`NEAR_DEPTH`] (single peer per hash).
+/// 4. Far — forward densify past near (height-ascending); skipped in
 ///    [`AssignScope::TipNearOnly`].
+///
+/// `archive_write_next` is ContigPark's next commit height (shared atomic from
+/// the writer). Filling gaps there unblocks parked RAM under a full budget.
 pub(crate) fn assign_work_ordered(
     st: &mut IbdWorkState,
     hub: &ChainHub,
     cfg: &IbdConfig,
     loop_stats: &LoopStats,
     scope: AssignScope,
+    archive_write_next: u32,
 ) {
     let t0 = Instant::now();
     let mut issued = 0u64;
@@ -106,6 +115,9 @@ pub(crate) fn assign_work_ordered(
 
     issued += cover_tip_holes(st, hub, cfg, &alive, &tip_holes);
 
+    // Unstick ContigPark even when TipNearOnly (budget full + large lead).
+    issued += cover_archive_contig_gap(st, hub, cfg, &alive, archive_write_next);
+
     let mut room = cfg.window.saturating_sub(st.inflight.len());
     if room == 0 {
         finish_assign(loop_stats, t0, issued);
@@ -121,6 +133,7 @@ pub(crate) fn assign_work_ordered(
     }
 
     // TipNearOnly: give the whole window to tip runway (no far reserve).
+    // Contig gap already handled above.
     let want_far = matches!(scope, AssignScope::Full);
     let far_cap = if want_far {
         far_slots_per_peer(cfg.per_peer, tip_hole)
@@ -472,6 +485,104 @@ pub(crate) fn tip_hole_peer_target(
     } else {
         TIP_HOLE_IMMEDIATE_PEERS
     }
+}
+
+/// Collect hashes for ContigPark `write_next`‥`write_next+max-1` that still need
+/// getdata (height-ascending). Pure helper for tests and assign.
+pub(crate) fn contig_gap_need(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    write_next: u32,
+    max: u32,
+) -> Vec<BlockHash> {
+    if max == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(max.min(64) as usize);
+    let hi = write_next.saturating_add(max.saturating_sub(1));
+    for ht in write_next..=hi {
+        let Some(&h) = st.height_to_hash.get(&ht) else {
+            continue;
+        };
+        if !st.ordered_set.contains(&h) {
+            continue;
+        }
+        if st.inflight.contains_key(&h)
+            || st.body.is_known_archived(&h)
+            || st.body.is_pending(&h)
+            || st.body.is_rejected(&h)
+        {
+            continue;
+        }
+        if st.body.skip_download(hub, &h) {
+            continue;
+        }
+        out.push(h);
+    }
+    out
+}
+
+/// Cover ContigPark's next commit heights with getdata (single peer each).
+///
+/// Runs under **both** Full and TipNearOnly so a missing far gap cannot freeze
+/// the writer while the budget is full of parked later heights.
+pub(crate) fn cover_archive_contig_gap(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    cfg: &IbdConfig,
+    alive: &[usize],
+    write_next: u32,
+) -> u64 {
+    if alive.is_empty() {
+        return 0;
+    }
+    let need = contig_gap_need(st, hub, write_next, CONTIG_GAP_FILL_MAX);
+    if need.is_empty() {
+        return 0;
+    }
+    let mut issued = 0u64;
+    let mut room = cfg.window.saturating_sub(st.inflight.len());
+    if room == 0 {
+        // Still try: reserve a few slots over window for the critical gap
+        // (window is soft enough; one missing body unblocks MiB of park).
+        room = CONTIG_GAP_FILL_MAX.min(8) as usize;
+    }
+    let mut peer_i = st.assign_rot;
+    st.assign_rot = st.assign_rot.wrapping_add(1);
+    for h in need {
+        if room == 0 {
+            break;
+        }
+        // Prefer a peer with free per_peer capacity.
+        let mut placed = false;
+        for _ in 0..alive.len() {
+            let pid = alive[peer_i % alive.len()];
+            peer_i += 1;
+            let Some(idx) = st.slots.iter().position(|s| s.id == pid && s.alive) else {
+                continue;
+            };
+            if st.slots[idx].in_flight.len() >= cfg.per_peer {
+                continue;
+            }
+            if st.slots[idx].in_flight.contains(&h) {
+                continue;
+            }
+            if issue_one(st, pid, h, &mut room, &mut issued) {
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            // No free peer slot — stop; next tick will retry.
+            break;
+        }
+    }
+    if issued > 0 {
+        rbitcoin_log::debug!(
+            "ibd: contig-gap getdata write_next={write_next} issued={issued} (unstick ContigPark)"
+        );
+    }
+    issued
 }
 
 /// Cover each tip-hole hash with staged multi-peer getdata (2 now, 3 after 10s).

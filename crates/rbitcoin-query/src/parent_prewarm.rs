@@ -114,6 +114,15 @@ impl Query {
         self.confirm_parents.ready_through()
     }
 
+    /// Prewarm runway full (depth-full **or** headroom/all-seeded-plans full).
+    ///
+    /// Used by IBD getdata pause hysteresis: stay paused until this is true.
+    pub fn prewarm_is_full(&self) -> bool {
+        let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
+        self.confirm_parents
+            .is_runway_full(tip, prewarm_headroom_from_env())
+    }
+
     /// Snapshot: `(ready_through, ahead, by_txid, bodies, plans, depth)`.
     ///
     /// `by_txid` is the runway txid map size (should stay O(depth), not O(chain)).

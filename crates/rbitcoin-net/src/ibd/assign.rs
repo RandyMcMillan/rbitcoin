@@ -71,22 +71,22 @@ pub(crate) enum AssignScope {
 
 /// Enter pause when prewarm lead is 0 and contiguous archive lead exceeds this.
 pub(crate) const PREWARM_FETCH_PAUSE_ARCH_LEAD: u32 = 1024;
-/// Resume getdata once prewarm lead exceeds this (hysteresis vs enter-at-0).
-pub(crate) const PREWARM_FETCH_RESUME_AHEAD: u32 = 64;
 
 /// Update fetch-pause latch for prewarm vs archive lead.
 ///
 /// - Enter pause: `pw_ahead == 0 && arch_lead > PREWARM_FETCH_PAUSE_ARCH_LEAD`
-/// - Exit pause: `pw_ahead > PREWARM_FETCH_RESUME_AHEAD`
+/// - Exit pause: `prewarm_full` (depth-full **or** headroom/all-seeded full)
+///
 /// Returns `(new_paused, transitioned)` where `transitioned` is true when the
 /// latch flipped (for logging).
 pub(crate) fn update_prewarm_fetch_pause(
     paused: bool,
     pw_ahead: u32,
     arch_lead: u32,
+    prewarm_full: bool,
 ) -> (bool, bool) {
     if paused {
-        if pw_ahead > PREWARM_FETCH_RESUME_AHEAD {
+        if prewarm_full {
             return (false, true);
         }
         (true, false)
@@ -102,18 +102,36 @@ mod prewarm_pause_tests {
     use super::*;
 
     #[test]
-    fn prewarm_fetch_pause_hysteresis() {
+    fn prewarm_fetch_pause_until_full() {
         // Healthy: prewarm ahead, deep arch — no pause.
-        assert_eq!(update_prewarm_fetch_pause(false, 100, 50_000), (false, false));
+        assert_eq!(
+            update_prewarm_fetch_pause(false, 100, 50_000, false),
+            (false, false)
+        );
         // Enter: prewarm empty, arch lead deep.
-        assert_eq!(update_prewarm_fetch_pause(false, 0, 1025), (true, true));
-        // Stay paused while prewarm climbing but still ≤ 64.
-        assert_eq!(update_prewarm_fetch_pause(true, 0, 50_000), (true, false));
-        assert_eq!(update_prewarm_fetch_pause(true, 64, 50_000), (true, false));
-        // Exit only when prewarm > 64.
-        assert_eq!(update_prewarm_fetch_pause(true, 65, 50_000), (false, true));
+        assert_eq!(
+            update_prewarm_fetch_pause(false, 0, 1025, false),
+            (true, true)
+        );
+        // Stay paused while climbing but not full yet.
+        assert_eq!(
+            update_prewarm_fetch_pause(true, 32, 50_000, false),
+            (true, false)
+        );
+        assert_eq!(
+            update_prewarm_fetch_pause(true, 64, 50_000, false),
+            (true, false)
+        );
+        // Exit only when prewarm reports full.
+        assert_eq!(
+            update_prewarm_fetch_pause(true, 64, 50_000, true),
+            (false, true)
+        );
         // No enter when arch lead is only 1024 (strict >).
-        assert_eq!(update_prewarm_fetch_pause(false, 0, 1024), (false, false));
+        assert_eq!(
+            update_prewarm_fetch_pause(false, 0, 1024, false),
+            (false, false)
+        );
     }
 }
 

@@ -55,7 +55,6 @@ use progress::{ibd_pct, work_chain_progress};
 use state::IbdWorkState;
 use assign::{
     assign_work_ordered, update_prewarm_fetch_pause, AssignScope, PREWARM_FETCH_PAUSE_ARCH_LEAD,
-    PREWARM_FETCH_RESUME_AHEAD,
 };
 use events::{
     apply_archive_result, apply_confirm_reject, apply_peer_event, disconnect_all_peers,
@@ -487,16 +486,16 @@ pub async fn ibd_cancellable(
         // When arch RAM budget is full, still densify **tip-near** so confirm has
         // runway (mid-sync was inflight=0 while arch_q sat at cap).
         // When prewarm is empty and archive lead is deep, pause all new getdata
-        // until prewarm lead recovers (hysteresis: enter at +0 & lead>1024,
-        // exit at prewarm > 64).
+        // until prewarm is **full** (depth-full or headroom/all-seeded full).
         let tip_for_pw = hub.tip_height().unwrap_or(0);
         let pw_ahead = hub
             .query
             .parent_prewarm_ready_through()
             .saturating_sub(tip_for_pw);
         let arch_lead = st.max_archived_height.saturating_sub(tip_for_pw);
+        let pw_full = hub.query.prewarm_is_full();
         let (paused, flipped) =
-            update_prewarm_fetch_pause(fetch_paused_for_prewarm, pw_ahead, arch_lead);
+            update_prewarm_fetch_pause(fetch_paused_for_prewarm, pw_ahead, arch_lead, pw_full);
         if flipped {
             if paused {
                 info!(
@@ -504,7 +503,7 @@ pub async fn ibd_cancellable(
                 );
             } else {
                 info!(
-                    "ibd: resume getdata (prewarm +{pw_ahead} > {PREWARM_FETCH_RESUME_AHEAD}; arch lead={arch_lead})"
+                    "ibd: resume getdata (prewarm full +{pw_ahead}; arch lead={arch_lead})"
                 );
             }
         }
@@ -574,8 +573,9 @@ pub async fn ibd_cancellable(
                 .parent_prewarm_ready_through()
                 .saturating_sub(tip2);
             let arch2 = st.max_archived_height.saturating_sub(tip2);
+            let pw_full2 = hub.query.prewarm_is_full();
             let (paused2, flipped2) =
-                update_prewarm_fetch_pause(fetch_paused_for_prewarm, pw2, arch2);
+                update_prewarm_fetch_pause(fetch_paused_for_prewarm, pw2, arch2, pw_full2);
             if flipped2 {
                 if paused2 {
                     info!(
@@ -583,7 +583,7 @@ pub async fn ibd_cancellable(
                     );
                 } else {
                     info!(
-                        "ibd: resume getdata (prewarm +{pw2} > {PREWARM_FETCH_RESUME_AHEAD}; arch lead={arch2})"
+                        "ibd: resume getdata (prewarm full +{pw2}; arch lead={arch2})"
                     );
                 }
             }

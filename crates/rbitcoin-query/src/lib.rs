@@ -68,6 +68,11 @@ pub mod parent_prewarm_stats {
     pub static BODY_MLOCK_NS: AtomicU64 = AtomicU64::new(0);
     pub static BODY_DECODE_NS: AtomicU64 = AtomicU64::new(0);
     pub static THIN_NS: AtomicU64 = AtomicU64::new(0);
+    /// Thin sub-phases (collect unique / runway map / head probe / edge walk).
+    pub static THIN_COLLECT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static THIN_RUNWAY_NS: AtomicU64 = AtomicU64::new(0);
+    pub static THIN_HEAD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static THIN_EDGE_NS: AtomicU64 = AtomicU64::new(0);
     pub static PARENT_PIN_NS: AtomicU64 = AtomicU64::new(0);
     pub static CACHE_PUT_NS: AtomicU64 = AtomicU64::new(0);
     /// Durable `tx.head` probes during thin resolve.
@@ -99,6 +104,10 @@ pub mod parent_prewarm_stats {
         pub body_mlock_ns: u64,
         pub body_decode_ns: u64,
         pub thin_ns: u64,
+        pub thin_collect_ns: u64,
+        pub thin_runway_ns: u64,
+        pub thin_head_ns: u64,
+        pub thin_edge_ns: u64,
         pub parent_pin_ns: u64,
         pub cache_put_ns: u64,
         pub head_lookups: u64,
@@ -127,6 +136,10 @@ pub mod parent_prewarm_stats {
             body_mlock_ns: BODY_MLOCK_NS.swap(0, Ordering::Relaxed),
             body_decode_ns: BODY_DECODE_NS.swap(0, Ordering::Relaxed),
             thin_ns: THIN_NS.swap(0, Ordering::Relaxed),
+            thin_collect_ns: THIN_COLLECT_NS.swap(0, Ordering::Relaxed),
+            thin_runway_ns: THIN_RUNWAY_NS.swap(0, Ordering::Relaxed),
+            thin_head_ns: THIN_HEAD_NS.swap(0, Ordering::Relaxed),
+            thin_edge_ns: THIN_EDGE_NS.swap(0, Ordering::Relaxed),
             parent_pin_ns: PARENT_PIN_NS.swap(0, Ordering::Relaxed),
             cache_put_ns: CACHE_PUT_NS.swap(0, Ordering::Relaxed),
             head_lookups: HEAD_LOOKUPS.swap(0, Ordering::Relaxed),
@@ -165,6 +178,10 @@ pub mod parent_prewarm_stats {
         add!(body_mlock_ns, BODY_MLOCK_NS);
         add!(body_decode_ns, BODY_DECODE_NS);
         add!(thin_ns, THIN_NS);
+        add!(thin_collect_ns, THIN_COLLECT_NS);
+        add!(thin_runway_ns, THIN_RUNWAY_NS);
+        add!(thin_head_ns, THIN_HEAD_NS);
+        add!(thin_edge_ns, THIN_EDGE_NS);
         add!(parent_pin_ns, PARENT_PIN_NS);
         add!(cache_put_ns, CACHE_PUT_NS);
         add!(head_lookups, HEAD_LOOKUPS);

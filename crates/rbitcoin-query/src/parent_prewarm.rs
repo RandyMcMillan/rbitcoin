@@ -41,6 +41,11 @@ pub struct PrewarmStats {
     pub body_mlock_ns: u64,
     pub body_decode_ns: u64,
     pub thin_ns: u64,
+    /// Thin sub-phases (sum into `thin_ns`).
+    pub thin_collect_ns: u64,
+    pub thin_runway_ns: u64,
+    pub thin_head_ns: u64,
+    pub thin_edge_ns: u64,
     pub parent_pin_ns: u64,
     pub cache_put_ns: u64,
     pub head_lookups: u32,
@@ -433,7 +438,7 @@ impl Query {
         // Rewrite:
         //   1. Local maps (batch creates + resolved txid→fk)
         //   2. Unique external txids → one-lock runway batch lookup
-        //   3. Remaining unique → parallel durable head probes
+        //   3. Remaining unique → parallel durable head probes (slot-sorted)
         //   4. Bulk register head hits; walk edges lock-free on locals
         let t_thin = Instant::now();
 
@@ -444,7 +449,8 @@ impl Query {
             local_fk.insert(*txid, Some(*fk));
         }
 
-        // Unique prev_txids that are not same-batch creates (need runway/head).
+        // ── thin: collect unique external prev_txids ───────────────────────
+        let t_collect = Instant::now();
         let mut need_external: HashSet<[u8; 32]> = HashSet::new();
         // Max spend-height per external txid (for by_txid GC height).
         let mut external_max_h: HashMap<[u8; 32], u32> = HashMap::new();
@@ -456,8 +462,8 @@ impl Query {
                 let Some((_txid, prevouts)) = body_prevouts.get(&id) else {
                     continue;
                 };
-                for &(prev_txid, prev_index) in prevouts {
-                    if prev_txid == [0u8; 32] && prev_index == u32::MAX {
+                for &(prev_txid, _prev_index) in prevouts {
+                    if prev_txid == [0u8; 32] && _prev_index == u32::MAX {
                         continue;
                     }
                     if batch_creates.contains_key(&prev_txid) {
@@ -471,8 +477,12 @@ impl Query {
                 }
             }
         }
+        st.thin_collect_ns = st
+            .thin_collect_ns
+            .saturating_add(t_collect.elapsed().as_nanos() as u64);
 
-        // One-lock runway bulk lookup for unique external txids.
+        // ── thin: one-lock runway bulk lookup ──────────────────────────────
+        let t_runway = Instant::now();
         let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
         let runway_hits = self.confirm_parents.lookup_txids_batch(&need_vec);
         let mut need_head: Vec<[u8; 32]> = Vec::with_capacity(need_vec.len() / 2);
@@ -483,9 +493,15 @@ impl Query {
                 need_head.push(txid);
             }
         }
+        st.thin_runway_ns = st
+            .thin_runway_ns
+            .saturating_add(t_runway.elapsed().as_nanos() as u64);
 
-        // Parallel durable head probes for unique misses (100% hit rate on
-        // mainnet IBD stats — cost is probe IO, not misses).
+        // ── thin: durable head probes (slot-ordered for page locality) ─────
+        // Sort by primary probe slot so rayon workers touch nearby head pages
+        // instead of random order across the 8 GiB sparse map.
+        let t_head = Instant::now();
+        need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
         st.head_lookups = st.head_lookups.saturating_add(need_head.len() as u32);
         let head_hits: Vec<([u8; 32], Option<Fk>)> = if need_head.len() >= 32
             && !self.confirm_cancelled()
@@ -531,8 +547,12 @@ impl Query {
             self.confirm_parents
                 .register_mlocked_creates_batch(&head_regs);
         }
+        st.thin_head_ns = st
+            .thin_head_ns
+            .saturating_add(t_head.elapsed().as_nanos() as u64);
 
-        // Lock-free edge walk on local tables.
+        // ── thin: lock-free edge walk on local tables ──────────────────────
+        let t_edge = Instant::now();
         for (height, tx_fks) in &height_tx_fks {
             for fk in tx_fks {
                 let Some(id) = fk.get() else {
@@ -591,6 +611,9 @@ impl Query {
                 thin_by_spend.insert(id, edges);
             }
         }
+        st.thin_edge_ns = st
+            .thin_edge_ns
+            .saturating_add(t_edge.elapsed().as_nanos() as u64);
         st.thin_ns = st.thin_ns.saturating_add(t_thin.elapsed().as_nanos() as u64);
 
         // ── Pin external parents: mlock + sparse needed outs (spent-filtered) ─

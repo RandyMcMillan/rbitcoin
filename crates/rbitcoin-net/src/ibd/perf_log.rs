@@ -149,6 +149,11 @@ pub(crate) struct IbdPerfSample {
     pub pw_body_mlock_ms: u64,
     pub pw_decode_ms: u64,
     pub pw_thin_ms: u64,
+    /// Thin sub-phases (ms window sum).
+    pub pw_thin_collect_ms: u64,
+    pub pw_thin_runway_ms: u64,
+    pub pw_thin_head_ms: u64,
+    pub pw_thin_edge_ms: u64,
     pub pw_parent_pin_ms: u64,
     pub pw_cache_put_ms: u64,
     pub pw_head_lookups: u64,
@@ -267,6 +272,10 @@ impl Default for IbdPerfSample {
             pw_body_mlock_ms: 0,
             pw_decode_ms: 0,
             pw_thin_ms: 0,
+            pw_thin_collect_ms: 0,
+            pw_thin_runway_ms: 0,
+            pw_thin_head_ms: 0,
+            pw_thin_edge_ms: 0,
             pw_parent_pin_ms: 0,
             pw_cache_put_ms: 0,
             pw_head_lookups: 0,
@@ -443,6 +452,10 @@ pub(crate) fn sample(
         pw_body_mlock_ms: ns_ms(pw.body_mlock_ns),
         pw_decode_ms: ns_ms(pw.body_decode_ns),
         pw_thin_ms: ns_ms(pw.thin_ns),
+        pw_thin_collect_ms: ns_ms(pw.thin_collect_ns),
+        pw_thin_runway_ms: ns_ms(pw.thin_runway_ns),
+        pw_thin_head_ms: ns_ms(pw.thin_head_ns),
+        pw_thin_edge_ms: ns_ms(pw.thin_edge_ns),
         pw_parent_pin_ms: ns_ms(pw.parent_pin_ns),
         pw_cache_put_ms: ns_ms(pw.cache_put_ns),
         pw_head_lookups: pw.head_lookups,
@@ -520,7 +533,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     };
     let mlock_mb = s.mlock_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} blks={} body_io={} parent_io={} cache%={} {}ms (hdr={} mlock={} dec={} thin={} pin={} put={}) head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
+        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} blks={} body_io={} parent_io={} cache%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
         s.pw_ahead,
         s.pw_ready_through,
         s.pw_parents,
@@ -536,6 +549,10 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.pw_body_mlock_ms,
         s.pw_decode_ms,
         s.pw_thin_ms,
+        s.pw_thin_collect_ms,
+        s.pw_thin_runway_ms,
+        s.pw_thin_head_ms,
+        s.pw_thin_edge_ms,
         s.pw_parent_pin_ms,
         s.pw_cache_put_ms,
         s.pw_head_hits,
@@ -605,7 +622,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let cp_tot = s.cp_wave + s.cp_class_a + s.cp_store;
     let mlock_mb = s.mlock_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} cache_hit={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={} pin={} put={} head={}/{} mlock_sys={}/{} edges same={} runway={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
+        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} cache_hit={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} head={}/{} mlock_sys={}/{} edges same={} runway={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
         s.pw_ahead,
         s.pw_ready_through,
         s.pw_parents,
@@ -626,6 +643,10 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.pw_body_mlock_ms,
         s.pw_decode_ms,
         s.pw_thin_ms,
+        s.pw_thin_collect_ms,
+        s.pw_thin_runway_ms,
+        s.pw_thin_head_ms,
+        s.pw_thin_edge_ms,
         s.pw_parent_pin_ms,
         s.pw_cache_put_ms,
         s.pw_head_hits,

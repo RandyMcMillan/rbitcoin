@@ -35,7 +35,9 @@ pub use file::{
 };
 pub use mlock::{MlockRange, MlockTable};
 pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush};
-pub use address_head::{bits_for_scale, AddressHead, MAINNET_BITS, TINY_BITS};
+pub use address_head::{
+    bits_for_scale, probe_index, AddressHead, MAINNET_BITS, TINY_BITS,
+};
 pub use hashhead::{
     initial_slots_for, HeadRole, HeadScale,
 };

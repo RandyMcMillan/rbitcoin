@@ -806,6 +806,12 @@ impl TxTable {
         })
     }
 
+    /// Primary head probe slot for `txid` (sort key for locality-friendly batches).
+    #[inline]
+    pub fn head_primary_slot(&self, txid: &[u8; 32]) -> u64 {
+        crate::address_head::probe_index(txid, 0, self.head.bits())
+    }
+
     /// Probe address head and verify body **txid only** (no full packed decode).
     pub fn get_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
         for fk in self.head.probe_fks(txid)? {
@@ -1254,6 +1260,32 @@ mod tests {
             assert!(raw.len() >= fo + 9);
             assert_eq!(&raw[fo..fo + 8], &[0u8; 8]);
         }
+    }
+
+    #[test]
+    fn head_primary_slot_stable_and_ordered() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-slot-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        let t = TxTable::create(&dir).unwrap();
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let sa = t.head_primary_slot(&a);
+        let sb = t.head_primary_slot(&b);
+        assert_eq!(sa, t.head_primary_slot(&a));
+        // Distinct keys almost always land on distinct primary slots at tiny scale.
+        assert_ne!(sa, sb);
+        let mut keys = vec![b, a];
+        keys.sort_unstable_by_key(|k| t.head_primary_slot(k));
+        assert!(t.head_primary_slot(&keys[0]) <= t.head_primary_slot(&keys[1]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

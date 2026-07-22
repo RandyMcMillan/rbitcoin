@@ -150,10 +150,14 @@ pub(crate) fn spawn_parent_prewarm(
                             let ml = st.body_mlock_ns / 1_000_000;
                             let dec = st.body_decode_ns / 1_000_000;
                             let thin = st.thin_ns / 1_000_000;
+                            let t_col = st.thin_collect_ns / 1_000_000;
+                            let t_run = st.thin_runway_ns / 1_000_000;
+                            let t_head = st.thin_head_ns / 1_000_000;
+                            let t_edge = st.thin_edge_ns / 1_000_000;
                             let pin = st.parent_pin_ns / 1_000_000;
                             let put = st.cache_put_ns / 1_000_000;
                             info!(
-                                "ibd: prewarm tip={tip} +{ahead} thru={through} by_txid={by_txid} bodies={bodies} plans={plans}/{d} next_h={next_height} runway={} last_h={h0}..{h1} blks={} body_io={} parent_io={} head={}/{} mlock_sys={}/{} edges same={} runway={} head={} {ms}ms (hdr={hdr} mlock={ml} dec={dec} thin={thin} pin={pin} put={put})",
+                                "ibd: prewarm tip={tip} +{ahead} thru={through} by_txid={by_txid} bodies={bodies} plans={plans}/{d} next_h={next_height} runway={} last_h={h0}..{h1} blks={} body_io={} parent_io={} head={}/{} mlock_sys={}/{} edges same={} runway={} head={} {ms}ms (hdr={hdr} mlock={ml} dec={dec} thin={thin}[col={t_col} run={t_run} head={t_head} edge={t_edge}] pin={pin} put={put})",
                                 runway.len(),
                                 st.blocks,
                                 st.body_tx_reads,

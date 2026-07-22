@@ -371,7 +371,6 @@ version = "0.1.0"
 dependencies = [
  "bitcoin",
  "bitcoin_hashes 0.14.101",
- "libc",
  "rayon",
  "rbitcoin-log",
  "rbitcoin-primitives",

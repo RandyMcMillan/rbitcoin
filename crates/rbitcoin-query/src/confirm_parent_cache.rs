@@ -67,8 +67,8 @@ pub fn prewarm_headroom_from_env() -> u32 {
 
 /// Default: mlock **off** (decode-stash pin only). Set `=1`/`true` to re-enable.
 ///
-/// mlock paid for cold majflt during mixed archive+confirm; with archive done
-/// and warm page cache it was mostly syscall + GC cost (signet logs: 0 majflt).
+/// mlock was for cold store page faults; with warm page cache it is mostly
+/// syscall + range-GC cost for little benefit on the confirm path.
 pub fn prewarm_mlock_from_env() -> bool {
     match std::env::var("RBITCOIN_PARENT_PREWARM_MLOCK") {
         Ok(s) => {

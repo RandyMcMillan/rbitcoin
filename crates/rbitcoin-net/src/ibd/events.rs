@@ -365,12 +365,18 @@ pub(crate) fn apply_peer_event(
             // Approx wire size for RAM budget (already-decoded; never drop).
             let wire_bytes = block.total_size();
             archive_queued.charge(wire_bytes);
+            let height = st
+                .hash_height
+                .get(&hash)
+                .copied()
+                .unwrap_or(u32::MAX);
             if arch_job_tx
                 .send(ArchiveJob {
                     block,
                     header_fk,
                     priority,
                     wire_bytes,
+                    height,
                 })
                 .is_err()
             {

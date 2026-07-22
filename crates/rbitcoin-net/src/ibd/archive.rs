@@ -193,6 +193,9 @@ pub(crate) struct ArchiveJob {
     pub priority: bool,
     /// Approx serialized size charged against [`ArchiveQueueBudget`].
     pub wire_bytes: usize,
+    /// Chain height when known (`u32::MAX` if unknown). Writer sorts by this so
+    /// parents tend to commit before spends (schema v10 create_fk resolve).
+    pub height: u32,
 }
 
 struct PreparedArchive {
@@ -202,6 +205,7 @@ struct PreparedArchive {
     header_fk: Fk,
     priority: bool,
     wire_bytes: usize,
+    height: u32,
 }
 
 pub(crate) enum ArchiveResult {
@@ -386,14 +390,42 @@ pub(crate) fn spawn_archive_pipeline(
                         .fetch_add(coal_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
                     let n_blocks = batch.len() as u64;
-                    let outcomes: Vec<(BlockHash, usize)> =
-                        batch.iter().map(|p| (p.hash, p.wire_bytes)).collect();
-                    let mut owned: Vec<_> = batch
-                        .into_iter()
-                        .map(|p| (p.header_fk, p.header, p.txs))
-                        .collect();
+                    // Height order: parents commit (and enter sticky) before spends.
+                    let mut batch = batch;
+                    batch.sort_by_key(|p| p.height);
                     let write_t0 = Instant::now();
-                    let write_res = write_hub.query.archive_prepared_with_fks(&mut owned);
+                    // Per-block archive results: schema v10 create_fk needs parents
+                    // already committed; a mega all-or-nothing Err poisoned coinbases
+                    // that shared a coalesce batch with an early spend.
+                    let mut ok_n = 0u64;
+                    for p in batch {
+                        let hash = p.hash;
+                        let wire_bytes = p.wire_bytes;
+                        let mut one = [(p.header_fk, p.header, p.txs)];
+                        match write_hub.query.archive_prepared_with_fks(&mut one) {
+                            Ok(_) => {
+                                ok_n = ok_n.saturating_add(1);
+                                if write_result
+                                    .send(ArchiveResult::Ok { hash, wire_bytes })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                if write_result
+                                    .send(ArchiveResult::Err {
+                                        hash,
+                                        err: e.to_string(),
+                                        wire_bytes,
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     write_stats
                         .write_ns
                         .fetch_add(write_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -402,45 +434,16 @@ pub(crate) fn spawn_archive_pipeline(
                     write_stats
                         .write_batch_blocks
                         .fetch_add(n_blocks, Ordering::Relaxed);
-                    match write_res {
-                        Ok(_fks) => {
-                            // Do **not** sleep the Class A writer under lag: coalesce
-                            // already shrinks far quanta; sleeping re-fills arch_q and
-                            // freezes far densify. Idle IOPRIO + small batches yield disk.
-                            let _ = (is_pri, lag);
-                            for (hash, wire_bytes) in outcomes {
-                                if write_result
-                                    .send(ArchiveResult::Ok { hash, wire_bytes })
-                                    .is_err()
-                                {
-                                    return;
-                                }
+                    let _ = (is_pri, lag);
+                    if ok_n > 0 {
+                        blocks_since_flush = blocks_since_flush.saturating_add(ok_n);
+                        if blocks_since_flush >= FLUSH_EVERY_BLOCKS {
+                            if let Err(e) = write_hub.query.flush_header_archive() {
+                                rbitcoin_log::warn!(
+                                    "ibd: header archive flush failed: {e}"
+                                );
                             }
-                            blocks_since_flush =
-                                blocks_since_flush.saturating_add(n_blocks);
-                            if blocks_since_flush >= FLUSH_EVERY_BLOCKS {
-                                if let Err(e) = write_hub.query.flush_header_archive() {
-                                    rbitcoin_log::warn!(
-                                        "ibd: header archive flush failed: {e}"
-                                    );
-                                }
-                                blocks_since_flush = 0;
-                            }
-                        }
-                        Err(e) => {
-                            let err = e.to_string();
-                            for (hash, wire_bytes) in outcomes {
-                                if write_result
-                                    .send(ArchiveResult::Err {
-                                        hash,
-                                        err: err.clone(),
-                                        wire_bytes,
-                                    })
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
+                            blocks_since_flush = 0;
                         }
                     }
                 }
@@ -496,6 +499,7 @@ pub(crate) fn spawn_archive_pipeline(
                     let header_fk = job.header_fk;
                     let priority = job.priority;
                     let wire_bytes = job.wire_bytes;
+                    let height = job.height;
                     let prep_t0 = Instant::now();
                     let prep_res = prepare_block_for_archive_ibd(&prep_params, &job.block);
                     prep_stats
@@ -512,6 +516,7 @@ pub(crate) fn spawn_archive_pipeline(
                                 header_fk,
                                 priority,
                                 wire_bytes,
+                                height,
                             };
                             let send_ok = if priority {
                                 pri_write_tx.send(item).is_ok()

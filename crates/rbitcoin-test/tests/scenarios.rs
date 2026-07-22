@@ -838,6 +838,80 @@ fn confirm_survives_partial_class_c_without_tip_advance() {
     assert_eq!(q2.tip_height(), Some(Height(spend_h + 1)));
 }
 
+/// Schema v10: spend body may arrive before its parent create is archived.
+/// Archive must return a **transient** NotFound (not Corrupt), leave sticky clean,
+/// and succeed once the parent is on disk — regresses mainnet-ibd.log cascade.
+#[test]
+fn archive_spend_before_parent_is_transient_then_ok() {
+    use rbitcoin_consensus::{
+        accept_and_connect_block, header_to_record, prepare_block_for_archive_ibd, ChainParams,
+        Milestone,
+    };
+    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.enter_direct_index_mode().unwrap();
+    let ms = Milestone { height: 1_000_000 };
+    let params = ChainParams::regtest();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let g_fk = q
+        .get_header_by_hash(genesis.block_hash().as_byte_array())
+        .unwrap()
+        .unwrap()
+        .0;
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    // Parent create at height 1 — headers only first (no Class A body yet).
+    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+    let cb1 = b1.txdata[0].compute_txid();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+    let h1 = header_to_record(g_fk, &b1.header);
+    let h1_fk = q.store().put_header(&h1).unwrap();
+
+    // Spend of b1 coinbase (IBD prep: no store prev check).
+    let spend = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
+    let b_spend = mine_regtest_block(tip, tip_time + 600, 2, vec![spend]);
+    let (mut hs, txs) = prepare_block_for_archive_ibd(&params, &b_spend).unwrap();
+    hs.prev_fk = h1_fk;
+    let hs_fk = q.store().put_header(&hs).unwrap();
+
+    let err = q
+        .archive_prepared_with_fks(&mut [(hs_fk, hs.clone(), txs.clone())])
+        .expect_err("spend without parent create must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("not found"),
+        "expected transient NotFound, got: {msg}"
+    );
+    assert!(
+        !msg.to_lowercase().contains("corrupt") && !msg.contains("schema mismatch"),
+        "must not look like permanent corruption: {msg}"
+    );
+    assert!(
+        !q.store().header_txs.has_body(hs_fk).unwrap(),
+        "failed spend must not leave a Class A body"
+    );
+
+    // Parent body lands, then spend retries (sticky/head resolve).
+    let (_h1b, txs1) = prepare_block_for_archive_ibd(&params, &b1).unwrap();
+    q.archive_prepared_with_fks(&mut [(h1_fk, h1, txs1)])
+        .unwrap();
+    q.archive_prepared_with_fks(&mut [(hs_fk, hs, txs)])
+        .expect("spend archives after parent");
+    assert!(q.store().header_txs.has_body(hs_fk).unwrap());
+    let fks = q.store().header_txs.get_list(hs_fk).unwrap().unwrap();
+    let rec = q.get_tx(fks[1]).unwrap();
+    let inp = q.tx_input_at_fk(fks[1], &rec, 0).unwrap();
+    assert!(!inp.create_fk.is_null());
+    assert_eq!(q.resolve_prev_txid(&inp).unwrap(), *cb1.as_byte_array());
+    let _ = ms;
+}
+
 /// Resume: spend archived with create_fk (archive sticky/head); confirm spends.
 #[test]
 fn resume_tx_head_resolves_external_prev() {

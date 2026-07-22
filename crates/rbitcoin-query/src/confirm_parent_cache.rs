@@ -415,8 +415,12 @@ impl ConfirmParentCache {
 
     /// Track successful `mlock` ranges for runway height `need_height`.
     ///
-    /// Same range re-noted by a later batch only adds the height (no double-count
-    /// of page refs). Released when every needing height falls ≤ tip / past horizon.
+    /// Keyed by `(table, page_start)`. If a later note shares `page_start` but
+    /// covers a **longer** span, page refs and `rec.range` are **extended** so
+    /// kernel-locked pages are never tracked short (under-track ⇒ permanent
+    /// mlock leak when GC unlocks only the short range).
+    ///
+    /// Released when every needing height falls ≤ tip / past horizon.
     pub fn note_mlock_ranges(&self, need_height: u32, ranges: &[MlockRange]) {
         if ranges.is_empty() {
             return;
@@ -427,19 +431,35 @@ impl ConfirmParentCache {
             if range.is_empty() {
                 continue;
             }
-            let key = (range.table.as_u8(), range.page_start);
-            if let Some(rec) = g.mlocked.get_mut(&key) {
-                rec.need_heights.insert(need_height);
-                continue;
-            }
+            let table = range.table.as_u8();
+            let key = (table, range.page_start);
             let start_page = range.page_start / PAGE;
             let end_page = range
                 .page_start
                 .saturating_add(range.page_len)
                 .div_ceil(PAGE)
                 .max(start_page);
+            if g.mlocked.contains_key(&key) {
+                let old_end = g.mlocked.get(&key).map(|r| r.end_page).unwrap_or(0);
+                // Extend page_refs before mutably touching the RangeRec.
+                if end_page > old_end {
+                    for p in old_end..end_page {
+                        *g.page_refs.entry((table, p)).or_insert(0) += 1;
+                    }
+                }
+                if let Some(rec) = g.mlocked.get_mut(&key) {
+                    rec.need_heights.insert(need_height);
+                    if end_page > rec.end_page {
+                        rec.end_page = end_page;
+                        rec.range.page_len = end_page
+                            .saturating_sub(start_page)
+                            .saturating_mul(PAGE);
+                    }
+                }
+                continue;
+            }
             for p in start_page..end_page {
-                *g.page_refs.entry((range.table.as_u8(), p)).or_insert(0) += 1;
+                *g.page_refs.entry((table, p)).or_insert(0) += 1;
             }
             let mut need = HashSet::new();
             need.insert(need_height);
@@ -2268,6 +2288,36 @@ mod tests {
         assert!(!c.is_ready(1)); // pruned
         assert_eq!(c.plan_count(), 0);
         assert_eq!(c.ready_through(), 1);
+    }
+
+    /// Same page_start, longer later note must extend page_refs (mlock leak class).
+    #[test]
+    fn note_mlock_extends_shorter_prior_range() {
+        use rbitcoin_store::{MlockRange, MlockTable};
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(0);
+        let short = MlockRange {
+            table: MlockTable::TxBody,
+            page_start: 0,
+            page_len: 4096, // 1 page
+        };
+        let long = MlockRange {
+            table: MlockTable::TxBody,
+            page_start: 0,
+            page_len: 4096 * 4, // 4 pages
+        };
+        c.note_mlock_ranges(1, &[short]);
+        assert_eq!(c.mlock_bytes(), 4096);
+        c.note_mlock_ranges(2, &[long]);
+        // Must track all 4 pages, not stay stuck at 1.
+        assert_eq!(c.mlock_bytes(), 4096 * 4);
+        // GC both need heights → unlock long range.
+        let unlocks = c.advance_tip(10);
+        assert!(
+            unlocks.iter().any(|r| r.page_len >= 4096 * 4),
+            "expected unlock of extended range, got {unlocks:?}"
+        );
+        assert_eq!(c.mlock_bytes(), 0);
     }
 
     /// Bodies register sticky only (not dual by_txid). Identity survives tip GC.

@@ -162,8 +162,11 @@ pub(crate) fn spawn_parent_prewarm(
                             let pin = st.parent_pin_ns / 1_000_000;
                             let put = st.cache_put_ns / 1_000_000;
                             let sticky_n = query.confirm_parent_cache().sticky_confirmed_count();
+                            let (mlock_ranges, mlock_bytes) = query.prewarm_mlock_stats();
+                            let parents = query.confirm_parent_cache().parent_count();
                             info!(
-                                "ibd: prewarm tip={tip} +{ahead} thru={through} by_txid={by_txid} bodies={bodies} sticky={sticky_n} plans={plans}/{d} next_h={next_height} runway={} last_h={h0}..{h1} blks={} body_io={} parent_io={} pin_cached={} pin_new={} head={}/{} mlock_sys={}/{} edges same={} runway={} sticky={} head={} sticky_hit={} {ms}ms (hdr={hdr} mlock={ml} dec={dec} thin={thin}[col={t_col} run={t_run} head={t_head} edge={t_edge}] pin={pin} put={put})",
+                                "ibd: prewarm tip={tip} +{ahead} thru={through} by_txid={by_txid} bodies={bodies} parents={parents} sticky={sticky_n} mlock_rng={mlock_ranges} mlock_MiB={} plans={plans}/{d} next_h={next_height} runway={} last_h={h0}..{h1} blks={} body_io={} parent_io={} pin_cached={} pin_new={} head={}/{} mlock_sys={}/{} edges same={} runway={} sticky={} head={} sticky_hit={} {ms}ms (hdr={hdr} mlock={ml} dec={dec} thin={thin}[col={t_col} run={t_run} head={t_head} edge={t_edge}] pin={pin} put={put})",
+                                mlock_bytes / (1024 * 1024),
                                 runway.len(),
                                 st.blocks,
                                 st.body_tx_reads,

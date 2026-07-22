@@ -1,14 +1,13 @@
 //! Consolidated IBD performance sampling and logging.
 //!
-//! **Cadence:** one sample every ~5s status tick (see `ibd`).
+//! **Cadence:** one centralized ~5s status tick (see `ibd` main loop) emits both
+//! `ibd: progress` and `ibd: perf` together.
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
-//! | INFO  | `ibd: perf …` | Download queue, archive pressure, confirm cost, prewarm lead/IO, loop mix |
+//! | INFO  | `ibd: progress …` | Tip/arch rates over the **last 5s**, prewarm lead, horizon, **1h tip ETA** |
+//! | INFO  | `ibd: perf …` | Download queue, archive pressure, confirm cost, prewarm phases, loop mix |
 //! | DEBUG | `ibd: perf_dbg …` | µs/blk phases, wave/SH subs, caches, pipe |
-//!
-//! `ibd: progress` (~1s on tip/arch delta) is the operator glance line: tip rate,
-//! archive lead, tip hole, peers, prewarm lead, mlock RAM. WARN/ERROR unchanged.
 //!
 //! Sample **once** per tick and reset all atomics, then format INFO always and
 //! DEBUG only when enabled — so DEBUG never sees an empty window after INFO.

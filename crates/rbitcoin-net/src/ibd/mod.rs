@@ -51,7 +51,9 @@ use exit::{
     peer_caught_up, AllPeersDead,
 };
 use prewarm::{spawn_parent_prewarm, PrewarmControl};
-use progress::{ibd_pct, work_chain_progress};
+use progress::{
+    format_rate, ibd_pct, work_chain_progress, TipRateTracker,
+};
 use state::IbdWorkState;
 use assign::{
     assign_work_ordered, update_prewarm_fetch_pause, AssignScope, PREWARM_FETCH_PAUSE_ARCH_LEAD,
@@ -329,9 +331,10 @@ pub async fn ibd_cancellable(
     let confirm_lag = Arc::new(AtomicU32::new(0));
     let mut last_progress = Instant::now();
     let mut last_status = Instant::now();
-    let mut last_progress_log = Instant::now() - Duration::from_secs(2);
-    // Last tip we emitted on an INFO progress line.
-    let mut last_logged_tip = start_tip;
+    // Snapshot for genuine 5s rates (progress + perf share this tick).
+    let mut last_sample_tip = start_tip;
+    let mut tip_rate_tracker = TipRateTracker::new();
+    tip_rate_tracker.push(Instant::now(), start_tip);
     // Max concurrent unique downloads (not tip-distance).
     let window = cfg.window;
 
@@ -339,6 +342,7 @@ pub async fn ibd_cancellable(
     // Reload post-tip headers + Class A from disk so restart does not re-getdata
     // bodies that are already archived (ordered path was process-local only).
     seed_work_path_from_store(&mut st, hub.as_ref());
+    let mut last_sample_arch_hwm = st.max_archived_height;
 
     // Kick header sync — try a few peers (channel may close if handshake race).
     for _ in 0..st.slots.len().min(4) {
@@ -363,7 +367,6 @@ pub async fn ibd_cancellable(
     loop_stats
         .archived_bodies
         .store(store_arch_total, Ordering::Relaxed);
-    let mut last_logged_arch_total = store_arch_total;
     if store_arch_total > 0 {
         info!("ibd: store has {store_arch_total} Class A bodies (arch_total seed)");
     }
@@ -814,49 +817,11 @@ pub async fn ibd_cancellable(
             last_redial = Instant::now();
         }
 
-        // Single INFO progress path (~1/s when tip or archived advanced).
-        // Glance line: tip rate, archive lead, tip-hole, peers, prewarm lead.
-        // Status every 5s is pipeline health only (`ibd: perf`).
-        if last_progress_log.elapsed() >= Duration::from_secs(1) {
-            let prog = work_chain_progress(
-                hub.as_ref(),
-                &st.ordered,
-                &st.ordered_set,
-                &mut st.body,
-                st.max_peer_height,
-                st.max_archived_height,
-            );
-            let tip_delta = prog.tip.saturating_sub(last_logged_tip);
-            // Cumulative Class-A body count (any height); +arch is the interval delta.
-            let arch_total = loop_stats.archived_bodies.load(Ordering::Relaxed);
-            let arch_delta = arch_total.saturating_sub(last_logged_arch_total);
-            if tip_delta > 0 || arch_delta > 0 {
-                let pct = ibd_pct(prog.tip, prog.headers);
-                let secs = last_progress_log.elapsed().as_secs_f64().max(0.001);
-                let tip_rate = tip_delta as f64 / secs;
-                let arch_rate = arch_delta as f64 / secs;
-                let arch_lead = prog.archived.saturating_sub(prog.tip);
-                let peers_n = st.slots.iter().filter(|s| s.alive).count();
-                let (pw_through, pw_ahead, _pw_parents, _pw_bodies, _plans, _depth) =
-                    hub.query.parent_prewarm_perf_snapshot();
-                let sh_runs = hub.query.scripthash_run_count();
-                let mlock_mb = hub.query.prewarm_mlock_bytes() / (1024 * 1024);
-                info!(
-                    "ibd: progress {pct}% tip={} ({tip_rate:.0}/s) arch_hwm={} ({arch_rate:.0}/s lead={arch_lead}) hole={} peers={peers_n} prewarm+{pw_ahead} thru={pw_through} mlock={mlock_mb}MiB sh_runs={sh_runs} horizon={}",
-                    prog.tip,
-                    prog.archived,
-                    prog.tip_hole,
-                    prog.headers,
-                );
-                last_logged_tip = prog.tip;
-                last_logged_arch_total = arch_total;
-                last_progress_log = Instant::now();
-                let _ = std::io::Write::flush(&mut std::io::stderr());
-            } else {
-                last_progress_log = Instant::now();
-            }
-        }
-        if last_status.elapsed() > Duration::from_secs(5) {
+        // Centralized ~5s operator tick: genuine window rates + progress + perf.
+        // (No separate 1s "chunk size / elapsed" progress path — that lied.)
+        if last_status.elapsed() >= Duration::from_secs(5) {
+            let now = Instant::now();
+            let window_secs = last_status.elapsed().as_secs_f64().max(0.001);
             let scan_t0 = Instant::now();
             let prog = work_chain_progress(
                 hub.as_ref(),
@@ -869,7 +834,37 @@ pub async fn ibd_cancellable(
             loop_stats
                 .status_scan_ns
                 .fetch_add(scan_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+            // Genuine rates over this 5s window (height deltas / wall).
+            let tip_delta = prog.tip.saturating_sub(last_sample_tip);
+            let arch_delta = prog.archived.saturating_sub(last_sample_arch_hwm);
+            let tip_rate = tip_delta as f64 / window_secs;
+            let arch_rate = arch_delta as f64 / window_secs;
+            let arch_lead = prog.archived.saturating_sub(prog.tip);
             let peers_n = st.slots.iter().filter(|s| s.alive).count();
+            let (_pw_through, pw_ahead, _pw_parents, _pw_bodies, _plans, _depth) =
+                hub.query.parent_prewarm_perf_snapshot();
+            let sh_runs = hub.query.scripthash_run_count();
+            let mlock_mb = hub.query.prewarm_mlock_bytes() / (1024 * 1024);
+            let pct = ibd_pct(prog.tip, prog.headers);
+
+            tip_rate_tracker.push(now, prog.tip);
+            let eta = tip_rate_tracker.eta_string(now, prog.tip, prog.headers);
+
+            info!(
+                "ibd: progress {pct}% tip={} ({}/s) arch_hwm={} ({}/s lead={arch_lead}) hole={} peers={peers_n} prewarm+{pw_ahead} mlock={mlock_mb}MiB sh_runs={sh_runs} horizon={} {eta}",
+                prog.tip,
+                format_rate(tip_rate),
+                prog.archived,
+                format_rate(arch_rate),
+                prog.tip_hole,
+                prog.headers,
+            );
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+
+            last_sample_tip = prog.tip;
+            last_sample_arch_hwm = prog.archived;
+
             let peer_cap = peers_n.saturating_mul(cfg.per_peer);
             let inflight_cap = cfg.window.min(peer_cap).max(1);
             let ahead = prog

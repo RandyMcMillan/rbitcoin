@@ -6,10 +6,13 @@
 //!
 //! **Insert (fast path):** probe until the **same fk** is already present (idempotent)
 //! or an **empty** slot — write there. **No body_txid** on insert (no BIP30
-//! newest-first displacement). Foreigners and older same-txid creates are skipped
+//! displacement on write). Foreigners and older same-txid creates are skipped
 //! blindly; a second Class A row for the same txid lands at the next empty slot
-//! (typically deeper). Lookups still body-verify and take the **first** matching
-//! body along the probe chain (older-first if both are present).
+//! (deeper on the probe chain).
+//!
+//! **Lookup:** walk candidates from the **last occupied** probe slot toward the
+//! first, body-verify — so the deepest same-txid create wins (newest under
+//! append-deeper insert).
 //!
 //! **Probe:** double hashing from the txid (`h1` / odd `h2`), capped at
 //! [`MAX_PROBE`]. Foreign occupants are normal on lookup: body mismatch ⇒ continue.

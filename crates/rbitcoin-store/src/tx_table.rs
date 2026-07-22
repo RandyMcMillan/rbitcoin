@@ -814,8 +814,13 @@ impl TxTable {
     }
 
     /// Probe address head and verify body **txid only** (no full packed decode).
+    ///
+    /// Body-check order is **last occupied probe slot → first** so that, after
+    /// fast inserts (second same-txid lands deeper, no newest-first displace),
+    /// the newest Class A create is preferred (BIP30-shaped duplicates).
     pub fn get_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
-        for fk in self.head.probe_fks(txid)? {
+        let cands = self.head.probe_fks(txid)?;
+        for fk in cands.into_iter().rev() {
             if self.body_txid(fk)? == *txid {
                 return Ok(Some(fk));
             }
@@ -827,7 +832,8 @@ impl TxTable {
     ///
     /// 1. Sequential head probe in call order (slot-sorted → page locality).
     /// 2. Unique candidate fks sorted → sequential body-txid reads.
-    /// 3. Match each txid to first candidate whose body txid equals it.
+    /// 3. Match each txid to the **last** probe candidate whose body txid equals
+    ///    it (same preference as [`Self::get_fk_by_txid`]).
     ///
     /// Beats N independent `get_fk_by_txid` when body verifies thrash randomly
     /// and when head walks share nearby slots.
@@ -865,7 +871,8 @@ impl TxTable {
         let mut out = Vec::with_capacity(pairs.len());
         for (txid, cands) in pairs {
             let mut hit = None;
-            for fk in cands {
+            // Reverse: prefer deepest body match (newest under append-deeper insert).
+            for fk in cands.into_iter().rev() {
                 let Some(id) = fk.get() else {
                     continue;
                 };
@@ -1038,9 +1045,12 @@ impl TxTable {
     }
 
     /// All Class A fks whose body txid equals `txid` (BIP30: more than one).
+    ///
+    /// Order is **newest-first** (deepest probe match first), matching
+    /// [`Self::get_fk_by_txid`].
     pub fn get_all_by_txid(&self, txid: &[u8; 32]) -> Result<Vec<(Fk, TxRecord)>, StoreError> {
         let mut out = Vec::new();
-        for fk in self.head.probe_fks(txid)? {
+        for fk in self.head.probe_fks(txid)?.into_iter().rev() {
             if self.body_txid(fk)? != *txid {
                 continue;
             }
@@ -1317,6 +1327,64 @@ mod tests {
             assert!(raw.len() >= fo + 9);
             assert_eq!(&raw[fo..fo + 8], &[0u8; 8]);
         }
+    }
+
+    /// After fast head insert (no write-time BIP30 displace), sole lookup must
+    /// prefer the **newer** create (deeper on the probe chain).
+    #[test]
+    fn get_fk_by_txid_prefers_newer_bip30_duplicate() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-bip30-get-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        let t = TxTable::create(&dir).unwrap();
+        let txid = [0x55u8; 32];
+        let mk = |fk_hint: u8| {
+            let rec = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![fk_hint],
+                witness: vec![],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+            (rec, inputs, outputs)
+        };
+        // Two packed bodies, same txid (BIP30-shaped). Distinct script_sig so
+        // bodies differ but body_txid still reads the shared txid prefix.
+        let a = mk(1);
+        let b = mk(2);
+        let fk1 = t.put_full_batch_indexed(&[a], true).unwrap()[0];
+        let fk2 = t.put_full_batch_indexed(&[b], true).unwrap()[0];
+        assert!(fk2.0 > fk1.0);
+        // Probe order: older first, newer deeper.
+        let cands = t.head.probe_fks(&txid).unwrap();
+        assert_eq!(cands[0], fk1);
+        assert!(cands.contains(&fk2));
+        // Sole resolve prefers newest.
+        assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(fk2));
+        let batch = t.get_fk_by_txid_batch(&[txid]).unwrap();
+        assert_eq!(batch[0].1, Some(fk2));
+        let all = t.get_all_by_txid(&txid).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].0, fk2);
+        assert_eq!(all[1].0, fk1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -2,10 +2,10 @@
 //!
 //! For each height in the batch (ascending):
 //! 1. **Cache**: header + `header_txs`, body ranges.
-//! 2. **Optional `mlock`** (`RBITCOIN_PARENT_PREWARM_MLOCK=1`): body + Class C pages.
-//!    Default **off** — decode-stash is enough when the page cache is warm.
+//! 2. **`mlock`** (default on; `RBITCOIN_PARENT_PREWARM_MLOCK=0` to disable): body + Class C.
 //! 3. **Full Class A decode** into `by_body` (wave/wire reuse).
-//! 4. **Thin edges** (default create_fk-only) + **tip-near parent pin**.
+//! 4. **Thin edges** (default create_fk-only) + **parent pin** (full depth by default;
+//!    `PIN_NEAR=K` limits to tip+1‥tip+K).
 //!
 //! Env: `RBITCOIN_PARENT_PREWARM_{DEPTH,BATCH,HEADROOM,MLOCK,PIN_NEAR,THIN_CREATE_FK_ONLY}`.
 

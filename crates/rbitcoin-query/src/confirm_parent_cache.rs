@@ -65,26 +65,24 @@ pub fn prewarm_headroom_from_env() -> u32 {
         .clamp(0, MAX_PREWARM_DEPTH)
 }
 
-/// Default: mlock **off** (decode-stash pin only). Set `=1`/`true` to re-enable.
-///
-/// mlock was for cold store page faults; with warm page cache it is mostly
-/// syscall + range-GC cost for little benefit on the confirm path.
+/// Default: mlock **on** (body + Class C pages for runway / parents).
+/// Set `=0`/`false`/`off` for decode-stash only (no mlock syscalls).
 pub fn prewarm_mlock_from_env() -> bool {
     match std::env::var("RBITCOIN_PARENT_PREWARM_MLOCK") {
         Ok(s) => {
             let t = s.trim();
-            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on")
+            !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
         }
-        // Default off.
-        Err(_) => false,
+        // Default on.
+        Err(_) => true,
     }
 }
 
-/// Only pin external parents needed by spends in tip+1‥tip+K (0 = full runway).
+/// Only pin external parents needed by spends in tip+1‥tip+K.
 ///
-/// Default 64: confirm batches are small; pinning full depth 256 was old
-/// “hide all IO” strategy that over-pinned far runway.
-pub const DEFAULT_PREWARM_PIN_NEAR: u32 = 64;
+/// **0 = full runway** (default): pin every external parent in the prewarm window.
+/// Non-zero K limits pin to heights ≤ tip+K (experimental tip-near).
+pub const DEFAULT_PREWARM_PIN_NEAR: u32 = 0;
 
 pub fn prewarm_pin_near_from_env() -> u32 {
     std::env::var("RBITCOIN_PARENT_PREWARM_PIN_NEAR")

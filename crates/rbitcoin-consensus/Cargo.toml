@@ -15,6 +15,8 @@ bitcoin = { workspace = true }
 bitcoin_hashes = { workspace = true }
 # Global thread pool for script checks — avoid spawn/teardown per block.
 rayon = "1.10"
+# Confirm-thread majflt sampling (getrusage RUSAGE_THREAD).
+libc = "0.2"
 
 [[bench]]
 name = "script_pool"

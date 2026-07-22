@@ -45,6 +45,8 @@ Default: **info**. CLI wins over env.
 | Archive queue RAM | **256 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
 | Parent prewarm depth / batch / headroom | **256 / 64 / 64** | `RBITCOIN_PARENT_PREWARM_DEPTH` / `_BATCH` / `_HEADROOM` |
+| Parent prewarm mlock | **on** | `RBITCOIN_PARENT_PREWARM_MLOCK=0` to disable |
+| Parent prewarm pin_near | **0** (full depth) | `RBITCOIN_PARENT_PREWARM_PIN_NEAR=K` tip+1‥tip+K only |
 | Confirm wait for prewarm worker before last-mile | **1500 ms** | `RBITCOIN_PREWARM_WORKER_GRACE_MS` (`0` = last-mile immediately if not ready; use `0` in unit tests) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 | Inhibit auto-suspend | **off** | `--inhibit-suspend` (uses `systemd-inhibit` if available) |

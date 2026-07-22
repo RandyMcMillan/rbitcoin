@@ -532,6 +532,22 @@ pub(crate) fn update_confirm_lag(lag: &AtomicU32, tip: Option<u32>, max_archived
 }
 
 pub(crate) fn apply_confirm_reject(st: &mut IbdWorkState, height: u32, hash: BlockHash, err: &str) {
+    // Never blacklist the all-zero sentinel (writeback used to emit this on
+    // mis-attributed rejects). Never freeze tip on pipeline "already spent"
+    // races that race a successful commit.
+    use bitcoin::hashes::Hash;
+    if hash.to_byte_array() == [0u8; 32] {
+        warn!("ibd: confirm reject ignored zero-hash @{height}: {err}");
+        return;
+    }
+    if err.contains("prevout already spent") {
+        // Likely dup writeback after claim race (fixed separately). Do not
+        // permanent-blacklist a valid tip extension.
+        warn!(
+            "ibd: confirm reject not blacklisted @{height} {hash}: {err} (treat as transient)"
+        );
+        return;
+    }
     st.body.mark_rejected(hash);
     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
@@ -542,6 +558,76 @@ pub(crate) fn apply_confirm_reject(st: &mut IbdWorkState, height: u32, hash: Blo
         warn!(
             "ibd: confirm reject applied {hash} @{height}: {err} (blacklisted, count={n})"
         );
+    }
+}
+
+#[cfg(test)]
+mod confirm_reject_tests {
+    use super::apply_confirm_reject;
+    use super::super::state::IbdWorkState;
+    use bitcoin::hashes::Hash;
+    use bitcoin::BlockHash;
+
+    fn h(n: u8) -> BlockHash {
+        let mut b = [0u8; 32];
+        b[0] = n;
+        BlockHash::from_byte_array(b)
+    }
+
+    #[test]
+    fn zero_hash_reject_is_not_blacklisted() {
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(100));
+        let zero = BlockHash::from_byte_array([0u8; 32]);
+        apply_confirm_reject(
+            &mut st,
+            101,
+            zero,
+            "consensus: prevout already spent on best chain",
+        );
+        assert!(!st.body.is_rejected(&zero));
+    }
+
+    #[test]
+    fn prevout_spent_reject_is_not_blacklisted() {
+        // Pipeline race: second writeback of the same tip+1 after the first
+        // already committed. Blacklisting freezes IBD forever (mainnet log
+        // tip=362595 stuck after "prevout already spent").
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(362_594));
+        let hash = h(0x29);
+        st.body.mark_archived(hash);
+        st.ordered.push_back(hash);
+        st.ordered_set.insert(hash);
+        apply_confirm_reject(
+            &mut st,
+            362_595,
+            hash,
+            "consensus: prevout already spent on best chain",
+        );
+        assert!(
+            !st.body.is_rejected(&hash),
+            "prevout-spent race must not permanent-blacklist tip+1"
+        );
+        assert!(
+            st.ordered_set.contains(&hash),
+            "transient race must leave ordered path intact"
+        );
+    }
+
+    #[test]
+    fn real_script_reject_is_blacklisted() {
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(50));
+        let hash = h(7);
+        st.body.mark_archived(hash);
+        st.ordered.push_back(hash);
+        st.ordered_set.insert(hash);
+        apply_confirm_reject(
+            &mut st,
+            51,
+            hash,
+            "consensus: script verification failed: script false",
+        );
+        assert!(st.body.is_rejected(&hash));
+        assert!(!st.ordered_set.contains(&hash));
     }
 }
 

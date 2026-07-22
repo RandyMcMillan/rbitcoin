@@ -157,6 +157,12 @@ pub fn confirm_script_phase(
     })
 }
 
+/// Keep only heights strictly above the confirmed tip (dup writeback race).
+#[inline]
+fn writeback_height_needed(tip: u32, height: u32) -> bool {
+    height > tip
+}
+
 /// WRITEBACK STAGE: structural → class_c → spend annotate → tip GC (FIFO caller).
 pub fn confirm_writeback_phase(
     query: &Query,
@@ -164,6 +170,27 @@ pub fn confirm_writeback_phase(
     milestone: Milestone,
     mut batch: ScriptOkBatch,
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
+    // Idempotent: skip heights already on the confirmed tip (dup pipeline race).
+    let tip = query.tip_height().map(|h| h.0).unwrap_or(0);
+    let mut prep = Vec::with_capacity(batch.prepared.len());
+    let mut wires = Vec::with_capacity(batch.wire_blocks.len());
+    for (p, w) in batch
+        .prepared
+        .into_iter()
+        .zip(batch.wire_blocks.into_iter())
+    {
+        if !writeback_height_needed(tip, p.height.0) {
+            continue;
+        }
+        prep.push(p);
+        wires.push(w);
+    }
+    if prep.is_empty() {
+        return Ok(Vec::new());
+    }
+    batch.prepared = prep;
+    batch.wire_blocks = wires;
+
     structural_run(
         query,
         params,
@@ -281,6 +308,27 @@ mod majflt_tests {
     fn majflt_guard_drop_does_not_panic() {
         let g = ConfirmMajfltGuard::start(0, 1);
         drop(g);
+    }
+}
+
+#[cfg(test)]
+mod writeback_idempotent_tests {
+    use super::writeback_height_needed;
+
+    /// Heights at or below tip must be stripped before structural writeback
+    /// (dup pipeline race after scripts claim the same tip+1 twice).
+    #[test]
+    fn filter_keeps_only_heights_above_tip() {
+        let tip = 100u32;
+        let heights = [98u32, 99, 100, 101, 102];
+        let kept: Vec<u32> = heights
+            .into_iter()
+            .filter(|&h| writeback_height_needed(tip, h))
+            .collect();
+        assert_eq!(kept, vec![101, 102]);
+        assert!(!writeback_height_needed(tip, tip));
+        assert!(!writeback_height_needed(0, 0));
+        assert!(writeback_height_needed(0, 1));
     }
 }
 

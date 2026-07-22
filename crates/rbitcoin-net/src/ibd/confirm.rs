@@ -110,10 +110,9 @@ pub(crate) fn spawn_confirm_engine(
                 let heights_hashes = batch.heights_hashes();
                 match hub_wb.confirm_writeback(batch) {
                     Ok(_outcomes) => {
-                        let mut g = feed_wb.ready.lock().unwrap();
-                        for (height, raw) in heights_hashes {
-                            let hash = BlockHash::from_byte_array(raw);
-                            g.remove(&height);
+                        // Heights were claimed off the feed at script-take time.
+                        for (_height, raw) in &heights_hashes {
+                            let hash = BlockHash::from_byte_array(*raw);
                             loop_stats_wb
                                 .confirm_blocks
                                 .fetch_add(1, Ordering::Relaxed);
@@ -125,7 +124,6 @@ pub(crate) fn spawn_confirm_engine(
                                 return;
                             }
                         }
-                        drop(g);
                         let elapsed = t0.elapsed();
                         loop_stats_wb
                             .confirm_ns
@@ -143,22 +141,37 @@ pub(crate) fn spawn_confirm_engine(
                             info!("ibd: confirm writeback aborted: {msg}");
                             break;
                         }
+                        // Real batch identity (never all-zero hash).
+                        let (height, hash) = heights_hashes
+                            .first()
+                            .map(|(h, raw)| (*h, BlockHash::from_byte_array(*raw)))
+                            .unwrap_or((first_h, BlockHash::from_byte_array([0u8; 32])));
+                        // Already confirmed (stale/dup pipeline): do not blacklist.
+                        if hub_wb.has_block(&hash)
+                            || (msg.contains("prevout already spent")
+                                && heights_hashes.iter().all(|(_, raw)| {
+                                    hub_wb.has_block(&BlockHash::from_byte_array(*raw))
+                                }))
+                        {
+                            debug!(
+                                "ibd: confirm writeback skip already-committed @{height} ({msg})"
+                            );
+                            for (_, raw) in &heights_hashes {
+                                let h = BlockHash::from_byte_array(*raw);
+                                if hub_wb.has_block(&h) {
+                                    loop_stats_wb
+                                        .confirm_blocks
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    accepted_wb.fetch_add(1, Ordering::SeqCst);
+                                    let _ = event_tx_wb.send(ConfirmEvent::Accepted { hash: h });
+                                }
+                            }
+                            continue;
+                        }
                         loop_stats_wb
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
-                        // Attribute to first height still on feed if possible.
-                        let (height, hash) = {
-                            let g = feed_wb.ready.lock().unwrap();
-                            let tip = hub_wb.tip_height().unwrap_or(0);
-                            let expect = tip.saturating_add(1);
-                            if let Some(&h) = g.get(&expect) {
-                                (expect, h)
-                            } else {
-                                (first_h, BlockHash::from_byte_array([0u8; 32]))
-                            }
-                        };
                         warn!("ibd: confirm writeback reject @ {height}: {e}");
-                        let _ = feed_wb.ready.lock().unwrap().remove(&height);
                         let _ = event_tx_wb.send(ConfirmEvent::Reject {
                             height,
                             hash,
@@ -199,10 +212,18 @@ pub(crate) fn spawn_confirm_engine(
                             g.retain(|&h, _| h > t);
                         }
                         if g.contains_key(&expect) {
+                            // Claim heights off the feed immediately so we cannot
+                            // re-script the same tip+1 while writeback is still
+                            // in-flight (that double-queued structural checks and
+                            // blacklisted valid blocks as "prevout already spent").
                             let mut run = Vec::with_capacity(CONFIRM_RUN_MAX);
                             let mut h = expect;
                             while run.len() < CONFIRM_RUN_MAX {
-                                let Some(&hash) = g.get(&h) else { break };
+                                let Some(hash) = g.remove(&h) else { break };
+                                if hub.has_block(&hash) {
+                                    h = h.saturating_add(1);
+                                    continue;
+                                }
                                 run.push((h, hash));
                                 h = h.saturating_add(1);
                             }
@@ -224,29 +245,8 @@ pub(crate) fn spawn_confirm_engine(
                 };
 
                 if batch.is_empty() {
-                    continue;
-                }
-
-                let batch: Vec<(u32, BlockHash)> = batch
-                    .into_iter()
-                    .filter(|(_, h)| !hub.has_block(h))
-                    .collect();
-                if batch.is_empty() {
-                    let mut g = feed.ready.lock().unwrap();
-                    if let Some(t) = hub.tip_height() {
-                        g.retain(|&h, _| h > t);
-                    }
-                    static STALE: AtomicU32 = AtomicU32::new(0);
-                    let n = STALE.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n <= 5 || n % 200 == 0 {
-                        warn!(
-                            "ibd: confirm feed stale (batch empty after has_block filter) tip={:?} feed_len={} (n={n})",
-                            hub.tip_height(),
-                            g.len()
-                        );
-                    }
-                    drop(g);
-                    std::thread::sleep(Duration::from_millis(50));
+                    // Claim skipped already-confirmed heights; wait for tip+1.
+                    std::thread::sleep(Duration::from_millis(20));
                     continue;
                 }
 
@@ -315,14 +315,11 @@ pub(crate) fn spawn_confirm_engine(
 
                 match script_res {
                     Ok(None) => {
-                        // All already confirmed — scrub feed.
-                        let mut g = feed.ready.lock().unwrap();
-                        for (height, _) in &batch {
-                            g.remove(height);
-                        }
+                        // Already confirmed — heights already claimed off feed.
                     }
                     Ok(Some(ok_batch)) => {
                         // Hand to writeback (blocks if queue full — backpressure).
+                        // Heights already claimed off feed when the batch was taken.
                         if wb_tx.send(ok_batch).is_err() {
                             info!("ibd: confirm writeback channel closed");
                             return;
@@ -360,7 +357,16 @@ pub(crate) fn spawn_confirm_engine(
                                     "ibd: confirm without archive still missing {hash} @ {expect} (n={n})"
                                 );
                             }
-                            let _ = feed.ready.lock().unwrap().remove(&expect);
+                            // Re-queue claimed heights so offer can retry after Class A lands.
+                            {
+                                let mut g = feed.ready.lock().unwrap();
+                                for &(h, ha) in &batch {
+                                    if !hub.has_block(&ha) {
+                                        g.insert(h, ha);
+                                    }
+                                }
+                                feed.cv.notify_one();
+                            }
                             if missing_tries.len() > 256 {
                                 missing_tries.retain(|&h, _| h.saturating_add(64) > expect);
                             }
@@ -373,12 +379,22 @@ pub(crate) fn spawn_confirm_engine(
                             std::thread::sleep(Duration::from_millis(5));
                             continue;
                         }
+                        // Multi-block script failure: re-queue suffix after tip+1 so
+                        // a single bad tip does not strand later ready heights.
+                        if batch.len() > 1 {
+                            let mut g = feed.ready.lock().unwrap();
+                            for &(h, ha) in batch.iter().skip(1) {
+                                if !hub.has_block(&ha) {
+                                    g.insert(h, ha);
+                                }
+                            }
+                            feed.cv.notify_one();
+                        }
                         missing_tries.remove(&expect);
                         loop_stats
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
                         warn!("ibd: confirm script reject {hash} @ {expect}: {e}");
-                        let _ = feed.ready.lock().unwrap().remove(&expect);
                         if event_tx
                             .send(ConfirmEvent::Reject {
                                 height: expect,

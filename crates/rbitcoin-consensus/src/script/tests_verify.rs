@@ -719,3 +719,43 @@ fn mainnet_block_140493_high_bit_s_lax_der_p2pkh() {
         "expected der error, got {err}"
     );
 }
+
+/// Mainnet height 443992 tx `5fec539b…`: P2SH redeem with multiple
+/// `OP_CODESEPARATOR`s. Legacy sighash must **omit** CODESEPARATOR bytes from
+/// the serialized scriptCode (Core `SerializeScriptCode`). Without that strip,
+/// CHECKSIGVERIFY fails and tip stalls after blacklisting the block.
+#[test]
+fn mainnet_block_443992_p2sh_codeseparator_scriptcode() {
+    use bitcoin::consensus::deserialize;
+    use bitcoin::{Amount, ScriptBuf, TxOut};
+    fn hx(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+    let spend: Transaction = deserialize(&hx(
+        "01000000016aaa18f4ab91fab80ecda666c4def68b8b75cc6bb1169ecd81716eab03ff14d007000000fd8701483045022100ac4319cf798ab10d864ad5f206cd405b7a15957eef2b0094ab24ffcf2c28fbfb022012053c8142d9e4f832d85c6ce7dba82d44d011c7713fb584771fb8770da97c0c012102c8662aaa171b5c98fef66c02138165f600c7c5743380686958e395edf8eb36bf47304402202feedc3b54cd87868406e93ee650742b61ce39162d70b6fde5a805fd40a56c900220015970a2fc874c32edfcd6341981d35e5b019a14b17662e00f49e363db72b93c014cd22102fb6827937707bf432d85b094bc180ab93394ee013b3ecaafa04b9135e3ab6e50ad74926404162c5658b15167762103db22e387923ad0552e1c4a4355324313af85926d4266c0eaa86f02eb1e01b2d28763ac67762102c8662aaa171b5c98fef66c02138165f600c7c5743380686958e395edf8eb36bf886e6b6b0064ab05636f6e643175ac687664756c6c6e6b6bab05636f6e643275ac687664756c6c6e6b6bab05636f6e643375ac687664756c6c6e6b6bab05636f6e643475ac687664756c6c6e6b6bab05636f6e643575ac686868ffffffff01204e0000000000001976a914648a4310b84426f426398ef27e3388a4d2c05a2888ac342c5658",
+    ))
+    .unwrap();
+    assert_eq!(
+        spend.compute_txid().to_string(),
+        "5fec539b26083b26d9d77014402e5942566a3c8c6e1b2b0c9cd245d51a0a5c61"
+    );
+    let prevout = TxOut {
+        value: Amount::from_sat(70_000),
+        script_pubkey: ScriptBuf::from_bytes(hx(
+            "a9143ae52dbc43c884ef43211a43082d01a0091ef1e387",
+        )),
+    };
+    let job = ScriptCheckJob {
+        prevouts: vec![prevout],
+        tx: spend,
+        bip65_active: true,  // 388381
+        bip112_active: true, // 419328
+        bip66_active: true,  // 363725
+        bip16_active: true,
+    };
+    script::verify_job_all_inputs(&job)
+        .expect("P2SH redeem with CODESEPARATOR must verify under Core scriptCode rules");
+}

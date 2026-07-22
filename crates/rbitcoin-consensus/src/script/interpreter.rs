@@ -1033,6 +1033,64 @@ fn script_code_bytes<'a>(ctx: &'a EvalContext<'_>) -> &'a [u8] {
     }
 }
 
+/// Core `CTransactionSignatureSerializer::SerializeScriptCode`: when hashing a
+/// legacy (BASE) scriptCode, **skip every `OP_CODESEPARATOR` opcode** (0xab).
+///
+/// This is distinct from `pbegincodehash` truncation (which only drops bytes
+/// *before* the last executed CODESEPARATOR). Separators that remain *after*
+/// that point are still omitted from the serialized scriptCode. Without this,
+/// redeem scripts that embed CODESEPARATOR (e.g. mainnet block 443992 P2SH
+/// multi-condition contracts) produce a wrong sighash and fail CHECKSIGVERIFY.
+fn strip_op_codeseparator(script: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(script.len());
+    let mut i = 0usize;
+    while i < script.len() {
+        let op = script[i];
+        i += 1;
+        if op == 0xab {
+            // OP_CODESEPARATOR — omit from legacy sighash scriptCode.
+            continue;
+        }
+        out.push(op);
+        let n = if (1..=75).contains(&op) {
+            op as usize
+        } else if op == 0x4c {
+            if i >= script.len() {
+                break;
+            }
+            let n = script[i] as usize;
+            out.push(script[i]);
+            i += 1;
+            n
+        } else if op == 0x4d {
+            if i + 1 >= script.len() {
+                break;
+            }
+            let n = u16::from_le_bytes([script[i], script[i + 1]]) as usize;
+            out.extend_from_slice(&script[i..i + 2]);
+            i += 2;
+            n
+        } else if op == 0x4e {
+            if i + 3 >= script.len() {
+                break;
+            }
+            let n = u32::from_le_bytes([script[i], script[i + 1], script[i + 2], script[i + 3]])
+                as usize;
+            out.extend_from_slice(&script[i..i + 4]);
+            i += 4;
+            n
+        } else {
+            0
+        };
+        if n > 0 {
+            let end = (i + n).min(script.len());
+            out.extend_from_slice(&script[i..end]);
+            i = end;
+        }
+    }
+    out
+}
+
 /// Legacy / witness-v0 CHECKSIG: empty or bad sig → false (does not hard-fail).
 ///
 /// `script_code_override`: when `Some`, use these bytes as scriptCode for sighash
@@ -1133,6 +1191,9 @@ fn sighash_for_script(
     match ctx.sig_version {
         SigVersion::Base => {
             // Raw hashtype (0 is not the same as SIGHASH_ALL=1).
+            // Strip OP_CODESEPARATOR from scriptCode (Core SerializeScriptCode).
+            let stripped = strip_op_codeseparator(script_bytes);
+            let script_code = Script::from_bytes(&stripped);
             let h = cache
                 .legacy_signature_hash(ctx.input_index, script_code, ty_raw)
                 .map_err(|_| ConsensusError::Script("legacy sighash".into()))?;

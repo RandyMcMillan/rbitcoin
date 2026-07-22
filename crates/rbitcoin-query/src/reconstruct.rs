@@ -29,14 +29,15 @@ impl Query {
 
     /// Wave fill from already-resolved per-block Class A fk lists (confirm hot path).
     ///
-    /// - Wave-body txs: **one** full Class A decode, stashed for wire rebuild.
-    /// - Thin edges: moved from runway stash (same type as wave) — no remap.
+    /// - Wave-body txs: **move** prewarmed bodies out of the runway (no clone);
+    ///   store decode only on cache miss. Stashed for wire rebuild.
+    /// - Thin edges: batch-moved from runway stash (same type as wave) — no remap.
     /// - External parents: **outs-only** decode; only needed vouts kept.
     pub fn wave_fill_for_tx_fk_lists(
         &self,
         per_block: &[&[Fk]],
     ) -> Result<(usize, crate::WavePrevoutCache), QueryError> {
-        use crate::wave_fill_stats::{self as wf, add as wf_add};
+        use crate::wave_fill_stats::{self as wf, add as wf_add, add_count as wf_count};
 
         let mut wave_fks: HashSet<u64> = HashSet::new();
         let mut wave_tx_fks: Vec<Fk> = Vec::new();
@@ -53,21 +54,47 @@ impl Query {
             crate::WavePrevoutCache::with_capacity(wave_tx_fks.len(), wave_tx_fks.len());
         let mut noted = 0usize;
 
-        // Pass 2: wave bodies — full decode once; Arc-share outs with wire.
+        // Pass 2: wave bodies — batch move from runway (one lock each), else store.
         let t_body = Instant::now();
+        let mut taken_bodies = self.confirm_parents.take_bodies_batch(&wave_tx_fks);
+        let mut taken_thin = self.confirm_parents.take_thin_inputs_batch(&wave_tx_fks);
         // parent_fk → needed vouts (small lists; sort/dedup later).
         let mut parent_needed: HashMap<u64, Vec<u32>> = HashMap::new();
+        let mut n_cache = 0u64;
+        let mut n_store = 0u64;
+        let mut n_thin_move = 0u64;
+        let mut n_thin_rebuild = 0u64;
         for &fk in &wave_tx_fks {
-            let (tx, outs, inputs) = self.load_body_prewarmed(fk)?;
+            let id = fk.get();
+            let (tx, outs, inputs) = if let Some(id) = id {
+                if let Some(parts) = taken_bodies.remove(&id) {
+                    n_cache = n_cache.saturating_add(1);
+                    parts
+                } else {
+                    n_store = n_store.saturating_add(1);
+                    self.load_body_from_store(fk)?
+                }
+            } else {
+                n_store = n_store.saturating_add(1);
+                self.load_body_from_store(fk)?
+            };
             let cb_h = self.coinbase_height_for_tx_with_input0(fk, &tx, inputs.first())?;
 
             // Thin edges before moving outs/inputs into wave.
-            let edges = if let Some(stashed) = self.confirm_parents.take_thin_inputs(fk) {
-                // Same type as ThinInput — move, no remap.
-                stashed
+            let edges = if let Some(id) = id {
+                if let Some(stashed) = taken_thin.remove(&id) {
+                    n_thin_move = n_thin_move.saturating_add(1);
+                    stashed
+                } else if inputs.is_empty() {
+                    Vec::new()
+                } else {
+                    n_thin_rebuild = n_thin_rebuild.saturating_add(1);
+                    self.thin_edges_from_inputs(&inputs, &wave)?
+                }
             } else if inputs.is_empty() {
                 Vec::new()
             } else {
+                n_thin_rebuild = n_thin_rebuild.saturating_add(1);
                 self.thin_edges_from_inputs(&inputs, &wave)?
             };
 
@@ -87,6 +114,13 @@ impl Query {
             noted += 1;
         }
         wf_add(&wf::BODY_NS, t_body.elapsed().as_nanos() as u64);
+        wf_count(&wf::BODY_CACHE_MOVE, n_cache);
+        wf_count(&wf::BODY_STORE, n_store);
+        wf_count(&wf::THIN_CACHE_MOVE, n_thin_move);
+        wf_count(&wf::THIN_REBUILD, n_thin_rebuild);
+        // Drop leftover maps early (should be empty when prewarm complete).
+        drop(taken_bodies);
+        drop(taken_thin);
 
         // Pass 3: external parents — only needed vouts, sparse map.
         let mut parents: Vec<(u64, Vec<u32>)> = parent_needed.into_iter().collect();
@@ -96,14 +130,16 @@ impl Query {
             vouts.dedup();
         }
 
-        let t_tx = Instant::now();
         for (pid, needed_vouts) in &parents {
             let fk = Fk(*pid);
+            let t_par = Instant::now();
             let (tx, mut candidates) = self.load_parent_needed_outs(fk, needed_vouts)?;
-            wf_add(&wf::PARENT_TX_NS, 0);
-            wf_add(&wf::PARENT_OUT_NS, 0);
+            // Parent load is outs-focused (cache sparse or store meta+outs).
+            // Attribute wall to PARENT_TX_NS; PARENT_OUT_NS reserved for finer split.
+            wf_add(&wf::PARENT_TX_NS, t_par.elapsed().as_nanos() as u64);
 
             let n_out = tx.output_count;
+            let t_spent = Instant::now();
             let mut live: Vec<(u32, OutputRecord)> = Vec::with_capacity(candidates.len());
             for (v, o) in candidates.drain(..) {
                 if self.is_outpoint_spent_create(fk, v)? {
@@ -111,7 +147,7 @@ impl Query {
                 }
                 live.push((v, o));
             }
-            wf_add(&wf::SPENT_NS, 0);
+            wf_add(&wf::SPENT_NS, t_spent.elapsed().as_nanos() as u64);
 
             let t_cb = Instant::now();
             // Coinbase height: only true coinbases (1-in + null prev), not every
@@ -128,7 +164,6 @@ impl Query {
             wave.insert_parent_sparse(fk, tx, n_out, live, cb);
             noted += 1;
         }
-        let _ = t_tx;
 
         Ok((noted, wave))
     }
@@ -204,9 +239,10 @@ impl Query {
         Ok(edges)
     }
 
-    /// Body for wave/wire: prewarm full-decode cache → idx range + mlocked body → store.
+    /// Body for RPC/Electrum reconstruct: clone from runway if present, else store.
     ///
-    /// Hot path: [`ConfirmParentCache::get_body`] (decode-once in prewarm).
+    /// Confirm wave fill uses [`ConfirmParentCache::take_bodies_batch`] (move-out)
+    /// instead — do not call this on the confirm hot path.
     fn load_body_prewarmed(
         &self,
         fk: Fk,

@@ -99,6 +99,12 @@ pub(crate) struct IbdPerfSample {
     pub wf_pout_ms: u64,
     pub wf_spent_ms: u64,
     pub wf_cb_ms: u64,
+    /// Wave bodies moved from runway cache vs re-decoded from store.
+    pub wf_body_cache: u64,
+    pub wf_body_store: u64,
+    /// Thin edges moved from runway stash vs rebuilt from inputs.
+    pub wf_thin_cache: u64,
+    pub wf_thin_rebuild: u64,
 
     // SH sub
     pub sh_warm_ms: u64,
@@ -226,6 +232,10 @@ impl Default for IbdPerfSample {
             wf_pout_ms: 0,
             wf_spent_ms: 0,
             wf_cb_ms: 0,
+            wf_body_cache: 0,
+            wf_body_store: 0,
+            wf_thin_cache: 0,
+            wf_thin_rebuild: 0,
             sh_warm_ms: 0,
             sh_filter_ms: 0,
             sh_collect_ms: 0,
@@ -325,6 +335,8 @@ pub(crate) fn sample(
         rbitcoin_query::class_c_phase_stats::sample_sh_sub_and_reset();
     let (wf_body, wf_ptx, wf_pout, wf_spent, wf_cb) =
         rbitcoin_query::wave_fill_stats::sample_and_reset();
+    let (wf_body_cache, wf_body_store, wf_thin_cache, wf_thin_rebuild) =
+        rbitcoin_query::wave_fill_stats::sample_counts_and_reset();
     let (pwh, pca, psm) = rbitcoin_query::connect_prevout_stats::sample_and_reset();
     let pw = rbitcoin_query::parent_prewarm_stats::sample_and_reset();
     let pipe = pipe_stats.sample_and_reset();
@@ -396,6 +408,10 @@ pub(crate) fn sample(
         wf_pout_ms: ns_ms(wf_pout),
         wf_spent_ms: ns_ms(wf_spent),
         wf_cb_ms: ns_ms(wf_cb),
+        wf_body_cache,
+        wf_body_store,
+        wf_thin_cache,
+        wf_thin_rebuild,
         sh_warm_ms: ns_ms(sh_warm),
         sh_filter_ms: ns_ms(sh_filter),
         sh_collect_ms: ns_ms(sh_collect),
@@ -564,12 +580,16 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         us(s.runway_tip_ns),
     );
     out.push_str(&format!(
-        " | wave body={} ptx={} pout={} spent={} cb={}",
+        " | wave body={} ptx={} pout={} spent={} cb={} cache={} store={} thin={} rebuild={}",
         s.wf_body_ms,
         s.wf_ptx_ms,
         s.wf_pout_ms,
         s.wf_spent_ms,
         s.wf_cb_ms,
+        s.wf_body_cache,
+        s.wf_body_store,
+        s.wf_thin_cache,
+        s.wf_thin_rebuild,
     ));
     out.push_str(&format!(
         " | sh warm={} filter={} collect={} sort={} seed={} body={} head={} index={}",
@@ -757,6 +777,10 @@ mod tests {
         assert!(line.contains("spend=500(r=10 i=2 skip=0)"), "{line}"); // us/blk wall
         assert!(line.contains("wave body="), "{line}");
         assert!(line.contains("spent=50"), "{line}");
+        assert!(line.contains("cache="), "{line}");
+        assert!(line.contains("store="), "{line}");
+        assert!(line.contains("thin="), "{line}");
+        assert!(line.contains("rebuild="), "{line}");
         assert!(line.contains("prewarm +64 thru=200"), "{line}");
         assert!(line.contains("utxo_p=100"), "{line}");
         assert!(line.contains("creates=50"), "{line}");

@@ -284,14 +284,22 @@ pub mod wave_fill_stats {
 
     /// Wave-body txs from Class A → wave map + parent_needed collect.
     pub static BODY_NS: AtomicU64 = AtomicU64::new(0);
-    /// External parent `get_tx` (sorted-by-fk warm).
+    /// External parent load (cache sparse outs or store meta+outputs).
     pub static PARENT_TX_NS: AtomicU64 = AtomicU64::new(0);
-    /// External parent output loads (sorted fk; full run or sparse).
+    /// External parent output materialization (subset of parent load when split).
     pub static PARENT_OUT_NS: AtomicU64 = AtomicU64::new(0);
     /// Durable / local spent filter on needed parent vouts.
     pub static SPENT_NS: AtomicU64 = AtomicU64::new(0);
     /// Coinbase create-height for parents.
     pub static CB_HEIGHT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Wave bodies moved out of ConfirmParentCache (no clone).
+    pub static BODY_CACHE_MOVE: AtomicU64 = AtomicU64::new(0);
+    /// Wave bodies re-decoded from store (cache miss / not prewarmed).
+    pub static BODY_STORE: AtomicU64 = AtomicU64::new(0);
+    /// Thin edges moved from runway stash (batch take).
+    pub static THIN_CACHE_MOVE: AtomicU64 = AtomicU64::new(0);
+    /// Thin edges rebuilt by walking inputs (stash miss).
+    pub static THIN_REBUILD: AtomicU64 = AtomicU64::new(0);
 
     /// `(body, parent_tx, parent_out, spent, cb_height)` nanoseconds.
     pub fn sample_and_reset() -> (u64, u64, u64, u64, u64) {
@@ -304,10 +312,27 @@ pub mod wave_fill_stats {
         )
     }
 
+    /// `(cache_move, store, thin_move, thin_rebuild)` counts since last sample.
+    pub fn sample_counts_and_reset() -> (u64, u64, u64, u64) {
+        (
+            BODY_CACHE_MOVE.swap(0, Ordering::Relaxed),
+            BODY_STORE.swap(0, Ordering::Relaxed),
+            THIN_CACHE_MOVE.swap(0, Ordering::Relaxed),
+            THIN_REBUILD.swap(0, Ordering::Relaxed),
+        )
+    }
+
     #[inline]
     pub(crate) fn add(part: &AtomicU64, ns: u64) {
         if ns > 0 {
             part.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_count(part: &AtomicU64, n: u64) {
+        if n > 0 {
+            part.fetch_add(n, Ordering::Relaxed);
         }
     }
 }

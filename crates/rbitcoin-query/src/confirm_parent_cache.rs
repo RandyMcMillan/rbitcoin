@@ -541,6 +541,39 @@ impl ConfirmParentCache {
         Some((e.tx.clone(), e.outputs.clone(), e.inputs.clone()))
     }
 
+    /// Move a full body out of the runway (wave_fill sole consumer — no clone).
+    pub fn take_body(
+        &self,
+        fk: Fk,
+    ) -> Option<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>)> {
+        let id = fk.get()?;
+        let mut g = self.inner.lock().unwrap();
+        let e = g.by_body.remove(&id)?;
+        // thin_edges may still be taken separately; body_range stays for spend annotate.
+        Some((e.tx, e.outputs, e.inputs))
+    }
+
+    /// Move many bodies under **one** lock (confirm wave_fill hot path).
+    pub fn take_bodies_batch(
+        &self,
+        fks: &[Fk],
+    ) -> HashMap<u64, (TxRecord, Vec<OutputRecord>, Vec<InputRecord>)> {
+        if fks.is_empty() {
+            return HashMap::new();
+        }
+        let mut g = self.inner.lock().unwrap();
+        let mut out = HashMap::with_capacity(fks.len());
+        for &fk in fks {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            if let Some(e) = g.by_body.remove(&id) {
+                out.insert(id, (e.tx, e.outputs, e.inputs));
+            }
+        }
+        out
+    }
+
     /// Attach prewarm-resolved thin edges (wave_fill fast path; no full body required).
     ///
     /// Stored only in `thin_edges` (not dual-copied onto optional `by_body`).
@@ -561,6 +594,24 @@ impl ConfirmParentCache {
     pub fn take_thin_inputs(&self, fk: Fk) -> Option<Vec<StashedThinInput>> {
         let id = fk.get()?;
         self.inner.lock().unwrap().thin_edges.remove(&id)
+    }
+
+    /// Move many thin-edge lists under **one** lock.
+    pub fn take_thin_inputs_batch(&self, fks: &[Fk]) -> HashMap<u64, Vec<StashedThinInput>> {
+        if fks.is_empty() {
+            return HashMap::new();
+        }
+        let mut g = self.inner.lock().unwrap();
+        let mut out = HashMap::with_capacity(fks.len());
+        for &fk in fks {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            if let Some(edges) = g.thin_edges.remove(&id) {
+                out.insert(id, edges);
+            }
+        }
+        out
     }
 
     pub fn body_count(&self) -> usize {
@@ -1590,6 +1641,57 @@ mod tests {
         // Dropped with body when tip advances past create height.
         c.advance_tip(1);
         assert!(c.get_thin_inputs(Fk(10)).is_none());
+    }
+
+    #[test]
+    fn take_bodies_batch_moves_no_clone_left() {
+        // Wave fill must move prewarmed bodies out (sole consumer), not clone.
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(0);
+        let t1 = tx(1);
+        let t2 = tx(2);
+        c.put_bodies_batch(vec![
+            (Fk(1), 1, t1.clone(), vec![out(10)], vec![]),
+            (Fk(2), 1, t2.clone(), vec![out(20)], vec![]),
+        ]);
+        c.put_body_range(Fk(1), 100, 50);
+        c.put_body_range(Fk(2), 200, 60);
+        // body_range survives take (spend annotate still needs it).
+        let taken = c.take_bodies_batch(&[Fk(1), Fk(2), Fk(3)]);
+        assert_eq!(taken.len(), 2);
+        assert_eq!(taken.get(&1).unwrap().0.txid, t1.txid);
+        assert_eq!(taken.get(&2).unwrap().1[0].value, 20);
+        assert!(c.get_body(Fk(1)).is_none());
+        assert!(c.get_body(Fk(2)).is_none());
+        assert_eq!(c.get_body_range(Fk(1)), Some((100, 50)));
+        assert_eq!(c.get_body_range(Fk(2)), Some((200, 60)));
+        // Second take is empty.
+        assert!(c.take_bodies_batch(&[Fk(1)]).is_empty());
+    }
+
+    #[test]
+    fn take_thin_inputs_batch_moves() {
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(0);
+        c.put_thin_inputs(
+            Fk(5),
+            vec![StashedThinInput {
+                create_fk: Some(9),
+                prev_index: 2,
+            }],
+        );
+        c.put_thin_inputs(
+            Fk(6),
+            vec![StashedThinInput {
+                create_fk: None,
+                prev_index: 0xffff_ffff,
+            }],
+        );
+        let taken = c.take_thin_inputs_batch(&[Fk(5), Fk(6)]);
+        assert_eq!(taken.len(), 2);
+        assert_eq!(taken.get(&5).unwrap()[0].create_fk, Some(9));
+        assert!(c.get_thin_inputs(Fk(5)).is_none());
+        assert!(c.take_thin_inputs(Fk(6)).is_none());
     }
 
     #[test]

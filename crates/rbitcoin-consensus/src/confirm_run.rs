@@ -436,32 +436,65 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
     // Tip mode usually writes spends on archive; still safe if spend_index on.
     let t_spent = Instant::now();
     if query.spend_index_enabled() && query.index_mode().uses_durable_spends() {
-        // Prefer create_fk + prewarmed body range — no tx.head / tx.idx reads.
-        let mut ranged: Vec<(
-            rbitcoin_primitives::Fk,
-            u32,
-            rbitcoin_primitives::Fk,
-            u64,
-            u64,
-        )> = Vec::new();
-        let mut by_create: Vec<(
+        // Prefer create_fk + body range — no tx.head; ranged path skips tx.idx.
+        // Resolve ranges once per unique create (cache or one idx probe), then
+        // annotate almost entirely via the ranged batch API.
+        use std::collections::{HashMap, HashSet};
+        let mut pending: Vec<(
             rbitcoin_primitives::Fk,
             u32,
             rbitcoin_primitives::Fk,
         )> = Vec::new();
         let mut n_skip = 0u64;
+        let mut unique_creates: HashSet<u64> = HashSet::new();
         for p in prepared {
             for &(_txid, vout, sfk, cfk) in &p.spends {
                 if sfk.is_null() || cfk.is_null() {
                     n_skip = n_skip.saturating_add(1);
                     continue;
                 }
-                if let Some((off, len)) = query.confirm_parent_cache().get_body_range(cfk) {
-                    ranged.push((cfk, vout, sfk, off, len));
-                } else {
-                    by_create.push((cfk, vout, sfk));
+                pending.push((cfk, vout, sfk));
+                if let Some(id) = cfk.get() {
+                    unique_creates.insert(id);
                 }
             }
+        }
+        let mut range_by_create: HashMap<u64, (u64, u64)> =
+            HashMap::with_capacity(unique_creates.len());
+        let mut filled: Vec<(rbitcoin_primitives::Fk, u64, u64)> = Vec::new();
+        for id in unique_creates {
+            let fk = rbitcoin_primitives::Fk(id);
+            if let Some(r) = query.confirm_parent_cache().get_body_range(fk) {
+                range_by_create.insert(id, r);
+            } else if let Ok(r) = query.store().tx_body_range(fk) {
+                range_by_create.insert(id, r);
+                filled.push((fk, r.0, r.1));
+            }
+        }
+        if !filled.is_empty() {
+            query.confirm_parent_cache().put_body_ranges_batch(&filled);
+        }
+        let mut ranged: Vec<(
+            rbitcoin_primitives::Fk,
+            u32,
+            rbitcoin_primitives::Fk,
+            u64,
+            u64,
+        )> = Vec::with_capacity(pending.len());
+        let mut by_create: Vec<(
+            rbitcoin_primitives::Fk,
+            u32,
+            rbitcoin_primitives::Fk,
+        )> = Vec::new();
+        for (cfk, vout, sfk) in pending {
+            if let Some(id) = cfk.get() {
+                if let Some(&(off, len)) = range_by_create.get(&id) {
+                    ranged.push((cfk, vout, sfk, off, len));
+                    continue;
+                }
+            }
+            // Still no range (corrupt / missing body) — fall back to idx path.
+            by_create.push((cfk, vout, sfk));
         }
         confirm_phase_stats::SPEND_ANNOTATE_RANGED
             .fetch_add(ranged.len() as u64, Ordering::Relaxed);

@@ -457,16 +457,26 @@ pub(crate) fn connect_block_prevouts(
     // Spent checks: pending_spent (this run) + durable confirmed-strong annotations.
     for (ti, tx) in block.txdata.iter().enumerate() {
         let spend_fk = archived_tx_fks.map(|fks| fks[ti]);
-        // Wave-local tx row first (no disk/class_a); else Class A.
-        let archived_rec = if let Some(fk) = spend_fk {
+        // Txid only — do not clone full TxRecord (wave already holds it).
+        let archived_txid: Option<[u8; 32]> = if let Some(fk) = spend_fk {
             if let Some(w) = wave_prevouts {
                 if let Some(rec) = w.get_tx(fk) {
-                    Some(rec.clone())
+                    Some(rec.txid)
                 } else {
-                    Some(query.get_tx_class_a(fk).map_err(ConsensusError::Store)?)
+                    Some(
+                        query
+                            .get_tx_class_a(fk)
+                            .map_err(ConsensusError::Store)?
+                            .txid,
+                    )
                 }
             } else {
-                Some(query.get_tx_class_a(fk).map_err(ConsensusError::Store)?)
+                Some(
+                    query
+                        .get_tx_class_a(fk)
+                        .map_err(ConsensusError::Store)?
+                        .txid,
+                )
             }
         } else {
             None
@@ -605,8 +615,8 @@ pub(crate) fn connect_block_prevouts(
             }
         }
 
-        let txid = if let Some(ref rec) = archived_rec {
-            rec.txid
+        let txid = if let Some(t) = archived_txid {
+            t
         } else {
             tx.compute_txid().to_byte_array()
         };

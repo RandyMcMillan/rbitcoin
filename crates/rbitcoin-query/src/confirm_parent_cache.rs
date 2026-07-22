@@ -585,6 +585,40 @@ impl ConfirmParentCache {
         Some((e.tx.clone(), e.outputs.clone(), e.inputs.clone()))
     }
 
+    /// True if a full runway body is already stashed (skip store re-decode).
+    pub fn has_body(&self, fk: Fk) -> bool {
+        let Some(id) = fk.get() else {
+            return false;
+        };
+        self.inner.lock().unwrap().by_body.contains_key(&id)
+    }
+
+    /// Thin-edge inputs from a cached body without re-reading the store.
+    ///
+    /// Each edge is `(create_fk_opt, soft_prev_txid, vout)`. Soft prev_txid is
+    /// zero when create_fk is set (v10 disk encoding).
+    pub fn body_prevout_edges(
+        &self,
+        fk: Fk,
+    ) -> Option<([u8; 32], Vec<(Option<u64>, [u8; 32], u32)>)> {
+        let id = fk.get()?;
+        let g = self.inner.lock().unwrap();
+        let e = g.by_body.get(&id)?;
+        let prevouts: Vec<(Option<u64>, [u8; 32], u32)> = e
+            .inputs
+            .iter()
+            .map(|i| {
+                let soft = if i.create_fk.is_null() {
+                    i.prev_txid
+                } else {
+                    [0u8; 32]
+                };
+                (i.create_fk.get(), soft, i.prev_index)
+            })
+            .collect();
+        Some((e.tx.txid, prevouts))
+    }
+
     /// Move a full body out of the runway (wave_fill sole consumer — no clone).
     pub fn take_body(
         &self,
@@ -1248,12 +1282,12 @@ impl ConfirmParentCache {
     }
 
     pub fn get_by_txid(&self, txid: &[u8; 32]) -> Option<Fk> {
-        self.inner
-            .lock()
-            .unwrap()
-            .by_txid
-            .get(txid)
-            .map(|e| Fk(e.fk))
+        let g = self.inner.lock().unwrap();
+        if let Some(e) = g.by_txid.get(txid) {
+            return Some(Fk(e.fk));
+        }
+        // After tip GC of by_txid, sticky still holds create identity.
+        g.sticky_confirmed.get(txid).map(|e| Fk(e.fk))
     }
 
     /// Sparse external-parent outs only (`by_fk`). Does **not** expand runway
@@ -1916,10 +1950,59 @@ mod tests {
             vec![],
         );
         assert!(c.get_body(Fk(50)).is_some());
+        assert!(c.has_body(Fk(50)));
         c.advance_tip(0);
         assert!(c.get_body(Fk(50)).is_some());
         c.advance_tip(1);
         assert!(c.get_body(Fk(50)).is_none());
+        assert!(!c.has_body(Fk(50)));
+    }
+
+    #[test]
+    fn body_prevout_edges_prefers_create_fk_without_soft_txid() {
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(0);
+        let t = tx(9);
+        let inputs = vec![
+            InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk(3),
+                prev_index: 1,
+                sequence: 0xffff_ffff,
+                script_sig: vec![],
+                witness: vec![],
+            },
+            InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: 0xffff_ffff,
+                script_sig: vec![],
+                witness: vec![],
+            },
+        ];
+        c.put_body(Fk(90), 1, t.clone(), vec![out(1)], inputs);
+        let (txid, edges) = c.body_prevout_edges(Fk(90)).unwrap();
+        assert_eq!(txid, t.txid);
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].0, Some(3));
+        assert_eq!(edges[0].1, [0u8; 32]); // soft zero when create_fk set
+        assert_eq!(edges[0].2, 1);
+        assert_eq!(edges[1].0, None);
+        assert_eq!(edges[1].2, u32::MAX);
+    }
+
+    #[test]
+    fn get_by_txid_falls_back_to_sticky_after_runway_gc() {
+        let c = ConfirmParentCache::new(32);
+        c.advance_tip(0);
+        let t = tx(11);
+        c.put_body(Fk(11), 1, t.clone(), vec![out(1)], vec![]);
+        assert_eq!(c.get_by_txid(&t.txid), Some(Fk(11)));
+        // Tip past create; body GC'd but sticky retains identity.
+        c.advance_tip(40);
+        assert!(!c.has_body(Fk(11)));
+        assert_eq!(c.get_by_txid(&t.txid), Some(Fk(11)));
     }
 
     #[test]
@@ -2148,8 +2231,8 @@ mod tests {
         assert_eq!(c.ready_through(), 1);
     }
 
-    /// Regression: `by_txid` keeps depth behind tip (sticky external parents)
-    /// but still bounds growth to O(depth), not O(chain).
+    /// Regression: runway `by_txid` map stays O(depth); `get_by_txid` may still
+    /// resolve via confirmed sticky after runway prune.
     #[test]
     fn advance_tip_prunes_by_txid_registrations() {
         let c = ConfirmParentCache::new(32);
@@ -2162,27 +2245,30 @@ mod tests {
             c.mark_scanned(h);
         }
         assert!(c.by_txid_count() >= 32, "registered runway creates");
-        // tip=20, depth=32 → keep height in (0, 52] → all 1..=40 stay (sticky behind tip).
+        // tip=20, depth=32 → keep height in (0, 52] → all 1..=40 stay.
         c.advance_tip(20);
-        assert_eq!(c.by_txid_count(), 40, "sticky window keeps depth behind tip");
+        assert_eq!(c.by_txid_count(), 40, "runway window keeps depth behind tip");
         assert_eq!(c.get_by_txid(&tx(10).txid), Some(Fk(10)));
         assert_eq!(c.get_by_txid(&tx(30).txid), Some(Fk(30)));
-        // tip=45 → min_keep=13, max=77 → keep 14..=40 only.
+        // tip=45 → min_keep=13, max=77 → keep 14..=40 only in by_txid map.
         c.advance_tip(45);
         assert!(
             c.by_txid_count() <= 27,
             "by_txid leaked: count={}",
             c.by_txid_count()
         );
-        assert!(c.get_by_txid(&tx(10).txid).is_none());
+        // height 10 pruned from runway map but sticky still serves identity.
+        assert_eq!(c.get_by_txid(&tx(10).txid), Some(Fk(10)));
         assert_eq!(c.get_by_txid(&tx(30).txid), Some(Fk(30)));
-        // Re-need parent at h=50 bumps height; survives until tip passes height+depth.
+        // Re-need parent at h=50 bumps runway height.
         let t5 = tx(5);
         c.register_mlocked_create(Fk(5), t5.txid, 50);
         assert_eq!(c.get_by_txid(&t5.txid), Some(Fk(5)));
         c.advance_tip(50);
-        assert_eq!(c.get_by_txid(&t5.txid), Some(Fk(5))); // still in sticky behind
-        c.advance_tip(50 + 32); // min_keep=50 → height 50 dropped
-        assert!(c.get_by_txid(&t5.txid).is_none());
+        assert_eq!(c.get_by_txid(&t5.txid), Some(Fk(5)));
+        c.advance_tip(50 + 32); // min_keep=50 → height 50 dropped from by_txid
+        // Sticky still resolves; identity is capacity-capped, not tip-windowed.
+        assert_eq!(c.get_by_txid(&t5.txid), Some(Fk(5)));
+        assert!(c.sticky_confirmed_count() >= 1);
     }
 }

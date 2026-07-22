@@ -292,7 +292,6 @@ impl Query {
         // v10: create_fk is stamped at archive; soft prev_txid may be zero.
         let mut body_prevouts: HashMap<u64, ([u8; 32], Vec<(Option<u64>, [u8; 32], u32)>)> =
             HashMap::new();
-        let mut create_regs: Vec<(Fk, [u8; 32], u32)> = Vec::new();
         let mut parent_need: HashMap<u64, Vec<u32>> = HashMap::new(); // parent_fk → need heights
         // parent_fk → needed prev_index (vouts) for sparse outs stash.
         let mut parent_vouts: HashMap<u64, Vec<u32>> = HashMap::new();
@@ -392,7 +391,7 @@ impl Query {
                 .body_mlock_ns
                 .saturating_add(t_ml.elapsed().as_nanos() as u64);
 
-            // ── Full body decode ───────────────────────────────────────────
+            // ── Full body decode (skip store when runway already has the body) ─
             let t_dec = Instant::now();
             for &(fk, range) in &height_fks_resolved {
                 if self.confirm_cancelled() {
@@ -402,18 +401,33 @@ impl Query {
                 let Some(id) = fk.get() else {
                     continue;
                 };
+                // Sliding-window re-touch: body still in cache → no store re-decode.
+                if let Some((txid, prevouts)) = self.confirm_parents.body_prevout_edges(fk) {
+                    batch_creates.insert(txid, fk);
+                    batch_create_ids.insert(id);
+                    body_prevouts.insert(id, (txid, prevouts));
+                    st.creates_registered = st.creates_registered.saturating_add(1);
+                    // by_txid/sticky already registered on first put_bodies_batch.
+                    continue;
+                }
                 let (tx, inputs, outs) = if let Some((off, len)) = range {
                     self.store.get_tx_full_at(off, len)?
                 } else {
                     self.store.get_tx_full(fk)?
                 };
                 st.body_tx_reads = st.body_tx_reads.saturating_add(1);
-                // v10: create_fk on inputs — edges without head when fk present.
+                // v10: create_fk on inputs — soft prev_txid zero when fk stamped.
                 let prevouts: Vec<(Option<u64>, [u8; 32], u32)> = inputs
                     .iter()
-                    .map(|i| (i.create_fk.get(), i.prev_txid, i.prev_index))
+                    .map(|i| {
+                        let soft = if i.create_fk.is_null() {
+                            i.prev_txid
+                        } else {
+                            [0u8; 32]
+                        };
+                        (i.create_fk.get(), soft, i.prev_index)
+                    })
                     .collect();
-                create_regs.push((fk, tx.txid, height));
                 batch_creates.insert(tx.txid, fk);
                 batch_create_ids.insert(id);
                 body_prevouts.insert(id, (tx.txid, prevouts));
@@ -426,12 +440,12 @@ impl Query {
             height_tx_fks.push((height, tx_fks));
         }
 
-        // ── Cache put (bodies + creates + ranges) ──────────────────────────
+        // ── Cache put (bodies + ranges) ────────────────────────────────────
+        // put_bodies_batch already inserts by_txid + sticky via insert_body —
+        // no second register_mlocked_creates_batch (that doubled by_txid work).
         let t_put = Instant::now();
         self.confirm_parents.put_body_ranges_batch(&body_ranges);
         self.confirm_parents.put_bodies_batch(body_fulls);
-        self.confirm_parents
-            .register_mlocked_creates_batch(&create_regs);
         st.cache_put_ns = st
             .cache_put_ns
             .saturating_add(t_put.elapsed().as_nanos() as u64);
@@ -845,20 +859,18 @@ impl Query {
         self.prewarm_parents_for_heights(&items)
     }
 
+    /// Retire spent parent outs from the runway cache by **create_fk** (schema v10).
+    ///
+    /// Prefer this over txid lookup: spends are already stamped with create_fk at
+    /// connect time, so we avoid a large `by_txid` walk on every confirm batch.
     pub fn unpin_spent_parent_outs(
         &self,
-        spends: &[([u8; 32], u32)],
+        spends: &[(Fk, u32)],
     ) -> Result<(), QueryError> {
         if spends.is_empty() {
             return Ok(());
         }
-        let mut resolved: Vec<(Fk, u32)> = Vec::with_capacity(spends.len());
-        for &(txid, vout) in spends {
-            if let Some(fk) = self.confirm_parents.get_by_txid(&txid) {
-                resolved.push((fk, vout));
-            }
-        }
-        self.confirm_parents.retire_spends(&resolved);
+        self.confirm_parents.retire_spends(spends);
         Ok(())
     }
 }

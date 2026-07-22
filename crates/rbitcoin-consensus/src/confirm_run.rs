@@ -618,9 +618,18 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
         .fetch_add(t_spent.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
     let t_unpin = Instant::now();
-    let all_spends: Vec<([u8; 32], u32)> = prepared
+    // v10: retire by create_fk (4th tuple field) — no by_txid resolve.
+    let all_spends: Vec<(rbitcoin_primitives::Fk, u32)> = prepared
         .iter()
-        .flat_map(|p| p.spends.iter().map(|(t, v, _, _)| (*t, *v)))
+        .flat_map(|p| {
+            p.spends.iter().filter_map(|(_txid, vout, _sfk, cfk)| {
+                if cfk.is_null() {
+                    None
+                } else {
+                    Some((*cfk, *vout))
+                }
+            })
+        })
         .collect();
     let _ = query.unpin_spent_parent_outs(&all_spends);
     confirm_phase_stats::UNPIN_NS.fetch_add(

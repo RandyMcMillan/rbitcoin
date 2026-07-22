@@ -8,10 +8,10 @@
 //! ```
 //!
 //! **Prewarm ownership:** the IBD background worker loads Class A into
-//! [`ConfirmParentCache`]. Confirm **waits** for the batch to be ready; it does
-//! not compete for store IO on the hot path. A short grace lets the worker
-//! finish the tip batch; only if still not ready do we last-mile load once
-//! (unit tests without a worker / recovery if the worker stalls).
+//! [`ConfirmParentCache`]. Confirm **only waits** (Condvar notify on mark_scanned)
+//! — it never last-miles / duplicates prewarm work while the worker is live.
+//! Unit tests without a worker still call `prewarm_parents_for_heights` once
+//! (sole owner of the load).
 //!
 //! Timers: [`crate::confirm_phase_stats`]. Multi-block order: sequential connect,
 //! one script wave, one Class C run, one UTXO flush.
@@ -100,9 +100,8 @@ pub fn confirm_archived_run(
     );
 
     // ── 1b. wait for parent prewarm (worker owns Class A load) ─────────────
-    // Hard-wait for this batch's heights to be scanned. Headroom is soft so a
-    // slow warmer cannot freeze tip/peers. Confirm does not last-mile load
-    // while the worker is progressing (avoids dual Class A thrash on tip).
+    // Confirm never duplicates prewarm: with a live worker we only wait for
+    // ready notify; without a worker (unit tests) we are the sole prewarm owner.
     let heights: Vec<u32> = metas.iter().map(|m| m.height.0).collect();
     let items: Vec<(u32, [u8; 32])> = metas.iter().map(|m| (m.height.0, m.hash)).collect();
     let batch_end = heights.last().copied().unwrap_or(0);
@@ -145,13 +144,13 @@ pub fn confirm_archived_run(
 
 // ─── phases ───────────────────────────────────────────────────────────────────
 
-/// Wait for the confirm batch to be prewarm-ready without stealing store IO
-/// from the background worker when it is already working the runway.
+/// Wait for the confirm batch to be prewarm-ready.
 ///
-/// 1. Soft-wait [`prewarm_worker_grace`] for the worker to mark the batch ready.
-/// 2. If still not ready: **one** emergency `prewarm_parents_for_heights` (tests
-///    without a worker, or a stalled warmer) — then wait again.
-/// 3. Soft headroom wait (best-effort).
+/// - **Worker live (IBD):** only wait on ready Condvar — never call
+///   `prewarm_parents_for_heights` (would duplicate the worker).
+/// - **No worker (unit tests):** sole owner — prewarm the batch once, then proceed.
+///
+/// Headroom beyond the batch is soft (best-effort).
 fn wait_for_prewarm(
     query: &Query,
     heights: &[u32],
@@ -161,41 +160,26 @@ fn wait_for_prewarm(
     if heights.is_empty() {
         return Ok(());
     }
-    // Ensure plans exist so the worker (and emergency last-mile) know the hashes.
+    // Seed plans so the worker knows which heights to mark ready.
     query.seed_parent_runway(items);
 
-    let grace = prewarm_worker_grace();
-    if !query.is_prewarm_ready(heights) && !grace.is_zero() {
-        let _ = query.wait_prewarm_ready(heights, grace);
-    }
-    if !query.is_prewarm_ready(heights) {
-        // Emergency only: worker behind / unit tests with no prewarm thread.
-        let _ = query
+    if query.prewarm_worker_live() {
+        // Wait only — worker does all Class A load / decode / mlock.
+        query
+            .wait_prewarm_ready_with_headroom(
+                heights,
+                batch_end,
+                None,
+                std::time::Duration::from_secs(600),
+            )
+            .map_err(ConsensusError::Store)?;
+    } else {
+        // No background worker (tests): we own prewarm exclusively.
+        query
             .prewarm_parents_for_heights(items)
             .map_err(ConsensusError::Store)?;
     }
-    query
-        .wait_prewarm_ready_with_headroom(
-            heights,
-            batch_end,
-            None,
-            std::time::Duration::from_secs(120),
-        )
-        .map_err(ConsensusError::Store)?;
     Ok(())
-}
-
-/// How long confirm waits for the background prewarm worker before last-mile.
-///
-/// Override with `RBITCOIN_PREWARM_WORKER_GRACE_MS` (default **1500**). Set `0`
-/// to last-mile immediately when not ready (old behavior). Higher values give
-/// the worker exclusive Class A time when the runway is empty.
-fn prewarm_worker_grace() -> std::time::Duration {
-    let ms = std::env::var("RBITCOIN_PREWARM_WORKER_GRACE_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(1500);
-    std::time::Duration::from_millis(ms.min(60_000))
 }
 
 fn resolve_body_metas(

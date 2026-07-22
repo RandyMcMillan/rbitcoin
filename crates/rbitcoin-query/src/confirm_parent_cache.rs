@@ -17,7 +17,8 @@ use rbitcoin_store::{HeaderRecord, InputRecord, MlockRange, OutputRecord, TxReco
 // ThinInput used via StashedThinInput alias.
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Default runway depth (blocks ahead of tip). Override with env.
 pub const DEFAULT_PREWARM_DEPTH: u32 = 256;
@@ -169,6 +170,9 @@ struct Inner {
 /// Process-local confirm parent runway.
 pub struct ConfirmParentCache {
     inner: Mutex<Inner>,
+    /// Signaled when plans become ready (`mark_scanned*`) or tip GC advances
+    /// readiness — confirm waits here instead of spinning / last-mile load.
+    ready_cv: Condvar,
     depth: AtomicU32,
     /// Mirror of `Inner::ready_through` for lock-free reads.
     ready_through: AtomicU32,
@@ -195,6 +199,7 @@ impl ConfirmParentCache {
                 page_refs: HashMap::new(),
                 mlock_n: 0,
             }),
+            ready_cv: Condvar::new(),
             depth: AtomicU32::new(depth),
             ready_through: AtomicU32::new(0),
         }
@@ -284,7 +289,15 @@ impl ConfirmParentCache {
         g.recompute_ready_through();
         self.ready_through
             .store(g.ready_through, Ordering::Relaxed);
+        drop(g);
+        // Wake confirm waiters (tip advance can satisfy / re-horizon plans).
+        self.ready_cv.notify_all();
         unlocks
+    }
+
+    /// Wake any thread blocked in [`Self::wait_heights_ready`] (cancel / shutdown).
+    pub fn notify_ready_waiters(&self) {
+        self.ready_cv.notify_all();
     }
 
     /// Register a runway create after mlock (txid → fk only; no full body).
@@ -679,6 +692,53 @@ impl ConfirmParentCache {
         g.recompute_ready_through();
         self.ready_through
             .store(g.ready_through, Ordering::Relaxed);
+        drop(g);
+        self.ready_cv.notify_all();
+    }
+
+    /// Block until every height in `heights` is ready, `cancelled` returns true,
+    /// or `timeout` elapses.
+    ///
+    /// Uses [`Self::ready_cv`] — woken by [`Self::mark_scanned_many`] / tip GC /
+    /// [`Self::notify_ready_waiters`]. Does **not** perform prewarm work.
+    ///
+    /// Returns `Ok(())` when ready, `Err(true)` if cancelled, `Err(false)` on timeout.
+    pub fn wait_heights_ready(
+        &self,
+        heights: &[u32],
+        timeout: Duration,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<(), bool> {
+        if heights.is_empty() {
+            return Ok(());
+        }
+        let start = Instant::now();
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            let ready = heights.iter().all(|h| {
+                g.plans
+                    .get(h)
+                    .map(|p| p.is_ready())
+                    .unwrap_or(false)
+            });
+            if ready {
+                return Ok(());
+            }
+            if cancelled() {
+                return Err(true);
+            }
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return Err(false);
+            }
+            // Cap wait slices so cancel is observed promptly.
+            let slice = (timeout - elapsed).min(Duration::from_millis(100));
+            let (guard, _) = self
+                .ready_cv
+                .wait_timeout(g, slice)
+                .expect("confirm parent ready_cv");
+            g = guard;
+        }
     }
 
     /// Register a UTXO-backed parent out for `height`.
@@ -1297,6 +1357,28 @@ mod tests {
         assert!(c.is_ready(360_251));
         assert!(c.is_ready(360_252));
         assert_eq!(c.ready_through(), 360_252);
+    }
+
+    #[test]
+    fn wait_heights_ready_notified_by_mark_scanned() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let c = Arc::new(ConfirmParentCache::new(64));
+        c.advance_tip(10);
+        c.ensure_plan(11, [9u8; 32]);
+
+        let waiter = Arc::clone(&c);
+        let j = thread::spawn(move || {
+            waiter
+                .wait_heights_ready(&[11], Duration::from_secs(2), || false)
+                .expect("should become ready")
+        });
+        thread::sleep(Duration::from_millis(20));
+        c.mark_scanned(11);
+        j.join().unwrap();
+        assert!(c.is_ready(11));
     }
 
     #[test]

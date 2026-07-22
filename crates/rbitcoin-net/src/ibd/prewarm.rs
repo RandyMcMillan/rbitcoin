@@ -1,12 +1,11 @@
 //! Background confirm-runway parent prewarm (tip+1 … tip+depth).
 //!
-//! **Owns Class A load** for the confirm runway. Confirm waits for batch
-//! readiness (see `confirm_run::wait_for_prewarm`); it only last-miles after a
-//! grace if this worker has not marked the tip batch ready.
+//! **Owns Class A load** for the confirm runway. Confirm only waits on ready
+//! notify (see `confirm_run::wait_for_prewarm`) — it never last-miles while
+//! this worker is live.
 //!
 //! Normal I/O priority (not best-effort): when tip is hard on the runway the
-//! warmer must not lose the disk to archive. UTXO / durable parents load from
-//! store; runway creates register full outs (bodies-first).
+//! warmer must not lose the disk to archive.
 
 use rbitcoin_log::{debug, info};
 use rbitcoin_query::{
@@ -56,7 +55,8 @@ pub(crate) fn spawn_parent_prewarm(
         .spawn(move || {
             // Intentionally **not** IOPRIO best-effort: prewarm must keep pace
             // with tip. Archive already writes continuously; starving the warmer
-            // forces confirm last-mile and kills tip rate.
+            // freezes confirm (which only waits while we are live).
+            query.set_prewarm_worker_live(true);
             let depth = prewarm_depth_from_env();
             let batch = prewarm_batch_from_env();
             let headroom = prewarm_headroom_from_env();
@@ -171,6 +171,7 @@ pub(crate) fn spawn_parent_prewarm(
                     }
                 }
             }
+            query.set_prewarm_worker_live(false);
             info!("ibd: parent prewarm worker stopped");
         })
         .expect("spawn ibd-parent-prewarm")

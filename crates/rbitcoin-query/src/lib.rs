@@ -47,8 +47,8 @@ pub use wave_prevout::WavePrevoutCache;
 
 /// Parent-prewarm window counters (reset by the IBD ~5s sampler).
 ///
-/// Background worker + last-mile confirm prewarm both contribute. Pair with
-/// [`Query::parent_prewarm_perf_snapshot`] for ahead-of-tip watermark / size.
+/// Background prewarm worker owns Class A load during IBD; confirm only waits.
+/// Pair with [`Query::parent_prewarm_perf_snapshot`] for ahead-of-tip watermark.
 pub mod parent_prewarm_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -298,6 +298,9 @@ pub struct Query {
     /// Cooperative cancel for in-flight confirm (prewarm waits). Set on IBD
     /// SIGINT teardown so the confirm OS thread aborts waits before process exit.
     confirm_cancel: std::sync::atomic::AtomicBool,
+    /// True while the IBD background parent-prewarm worker is running.
+    /// Confirm never last-miles when this is set (waits on ready notify only).
+    prewarm_worker_live: std::sync::atomic::AtomicBool,
 }
 
 impl Query {
@@ -329,6 +332,7 @@ impl Query {
             // Open as Tip until IBD selects Direct.
             index_mode_cell: std::sync::atomic::AtomicU8::new(IndexMode::Tip as u8),
             confirm_cancel: std::sync::atomic::AtomicBool::new(false),
+            prewarm_worker_live: std::sync::atomic::AtomicBool::new(false),
         };
         // Warm cache from durable head if present (resume with index on).
         // Full body scan is not done here; fresh genesis IBD fills cache as it archives.
@@ -339,6 +343,8 @@ impl Query {
     pub fn request_confirm_cancel(&self) {
         self.confirm_cancel
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Wake confirm threads blocked on prewarm ready.
+        self.confirm_parents.notify_ready_waiters();
     }
 
     /// Clear cancel before a new confirm/IBD session.
@@ -350,6 +356,21 @@ impl Query {
     /// True after [`Self::request_confirm_cancel`] until cleared.
     pub fn confirm_cancelled(&self) -> bool {
         self.confirm_cancel
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// IBD parent-prewarm worker is running (confirm must only wait, never last-mile).
+    pub fn set_prewarm_worker_live(&self, live: bool) {
+        self.prewarm_worker_live
+            .store(live, std::sync::atomic::Ordering::SeqCst);
+        if !live {
+            // Unblock waiters if worker exits while confirm is waiting.
+            self.confirm_parents.notify_ready_waiters();
+        }
+    }
+
+    pub fn prewarm_worker_live(&self) -> bool {
+        self.prewarm_worker_live
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 

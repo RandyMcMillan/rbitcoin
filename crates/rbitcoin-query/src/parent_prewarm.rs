@@ -156,6 +156,7 @@ impl Query {
         self.confirm_parents.all_ready(heights)
     }
 
+    /// Wait until every height is prewarm-ready (Condvar; no Class A load).
     pub fn wait_prewarm_ready(
         &self,
         heights: &[u32],
@@ -164,23 +165,18 @@ impl Query {
         if heights.is_empty() {
             return Ok(());
         }
-        let start = std::time::Instant::now();
-        loop {
-            if self.confirm_cancelled() {
-                return Err(StoreError::Corrupt("confirm cancelled"));
-            }
-            if self.confirm_parents.all_ready(heights) {
-                return Ok(());
-            }
-            if start.elapsed() >= timeout {
-                return Err(StoreError::Corrupt(
-                    "confirm parent prewarm not ready (timeout)",
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        match self.confirm_parents.wait_heights_ready(heights, timeout, || {
+            self.confirm_cancelled()
+        }) {
+            Ok(()) => Ok(()),
+            Err(true) => Err(StoreError::Corrupt("confirm cancelled")),
+            Err(false) => Err(StoreError::Corrupt(
+                "confirm parent prewarm not ready (timeout)",
+            )),
         }
     }
 
+    /// Wait for batch ready, then optionally soft-wait headroom (never last-mile).
     pub fn wait_prewarm_ready_with_headroom(
         &self,
         heights: &[u32],
@@ -199,6 +195,8 @@ impl Query {
         if hr == 0 || self.confirm_parents.headroom_ready(batch_end, hr) {
             return Ok(());
         }
+        // Soft headroom only — tip must not freeze for runway lead.
+        // Brief sleeps; mark_scanned notifies will still advance ready_through.
         let soft = std::time::Duration::from_millis(50);
         let start = std::time::Instant::now();
         while start.elapsed() < soft {

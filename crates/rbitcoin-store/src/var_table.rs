@@ -83,7 +83,12 @@ impl VarTable {
     /// `mlock` the body pages covering `fk`. Returns page-aligned `(start, len)`.
     pub fn mlock_record(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
         let (off, len) = self.record_range(fk)?;
-        self.body.mlock_range(off, len)
+        self.mlock_body_range(off, len)
+    }
+
+    /// `mlock` body pages for a known absolute range (no idx).
+    pub fn mlock_body_range(&self, offset: u64, len: u64) -> Result<(u64, u64), StoreError> {
+        self.body.mlock_range(offset, len)
     }
 
     /// `mlock` the `idx` slot for `fk` (8-byte absolute body offset).

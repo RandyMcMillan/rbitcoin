@@ -113,9 +113,8 @@ pub fn confirm_archived_run(
         Ordering::Relaxed,
     );
 
-    // ── 2. wave_fill (bodies + parents + thin edges from ConfirmParentCache) ─
-    let hashes: Vec<[u8; 32]> = metas.iter().map(|m| m.hash).collect();
-    let mut wave_prevouts = wave_fill(query, &hashes)?;
+    // ── 2. wave_fill (reuse resolve tx_fks — no header re-probe) ────────────
+    let mut wave_prevouts = wave_fill(query, &metas)?;
 
     // ── 3. wire_rebuild (reuses wave body decodes — no second Class A parse) ─
     let wire_blocks = wire_rebuild(query, &metas, &mut wave_prevouts)?;
@@ -241,13 +240,15 @@ fn resolve_body_metas(
 
 fn wave_fill(
     query: &Query,
-    hashes: &[[u8; 32]],
+    metas: &[BodyMeta],
 ) -> Result<rbitcoin_query::WavePrevoutCache, ConsensusError> {
     // Prefetch Class A is a no-op (bodies live in ConfirmParentCache). Leave
     // PREFETCH_CLASS_A_NS at 0 so perf still shows p=0 cleanly.
     let t0 = Instant::now();
+    let lists: Vec<&[rbitcoin_primitives::Fk]> =
+        metas.iter().map(|m| m.tx_fks.as_slice()).collect();
     let (_n, wave) = query
-        .wave_fill_for_block_hashes(hashes)
+        .wave_fill_for_tx_fk_lists(&lists)
         .map_err(ConsensusError::Store)?;
     let ns = t0.elapsed().as_nanos() as u64;
     confirm_phase_stats::WAVE_FILL_NS.fetch_add(ns, Ordering::Relaxed);

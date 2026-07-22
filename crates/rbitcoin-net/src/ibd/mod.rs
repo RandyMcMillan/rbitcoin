@@ -479,19 +479,17 @@ pub async fn ibd_cancellable(
         // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
         // When arch RAM budget is full, still densify **tip-near** so confirm has
         // runway (mid-sync was inflight=0 while arch_q sat at cap).
-        let arch_bytes = archive_queued.bytes();
         let scope = if archive_queued.has_room() {
             AssignScope::Full
         } else {
             AssignScope::TipNearOnly
         };
+        let inflight_before = st.inflight.len();
         assign_work_ordered(
             &mut st,
             hub.as_ref(),
             &cfg,
             &loop_stats,
-            arch_bytes,
-            archive_queued.budget_bytes(),
             scope,
         );
 
@@ -533,22 +531,23 @@ pub async fn ibd_cancellable(
         )? {
             break;
         }
-        // Immediate re-top-up after Block events freed st.inflight during confirm.
-        let arch_bytes2 = archive_queued.bytes();
-        let scope2 = if archive_queued.has_room() {
-            AssignScope::Full
-        } else {
-            AssignScope::TipNearOnly
-        };
-        assign_work_ordered(
-            &mut st,
-            hub.as_ref(),
-            &cfg,
-            &loop_stats,
-            arch_bytes2,
-            archive_queued.budget_bytes(),
-            scope2,
-        );
+        // Re-assign only if drain/confirm freed meaningful inflight slots
+        // (avoid double planner work every loop tick).
+        let freed = inflight_before.saturating_sub(st.inflight.len());
+        if freed >= 8 || st.inflight.is_empty() {
+            let scope2 = if archive_queued.has_room() {
+                AssignScope::Full
+            } else {
+                AssignScope::TipNearOnly
+            };
+            assign_work_ordered(
+                &mut st,
+                hub.as_ref(),
+                &cfg,
+                &loop_stats,
+                scope2,
+            );
+        }
 
         // Header sync: soft-cap live work (`ordered_set`), not deque len (ghosts).
         //

@@ -298,6 +298,23 @@ impl ConfirmParentCache {
         g.insert_by_txid(txid, id, height);
     }
 
+    /// True if every 4 KiB page of `range` is already held (skip re-`mlock`).
+    pub fn is_range_pinned(&self, range: &MlockRange) -> bool {
+        if range.is_empty() {
+            return true;
+        }
+        const PAGE: u64 = 4096;
+        let start_page = range.page_start / PAGE;
+        let end_page = range
+            .page_start
+            .saturating_add(range.page_len)
+            .div_ceil(PAGE)
+            .max(start_page);
+        let g = self.inner.lock().unwrap();
+        let t = range.table.as_u8();
+        (start_page..end_page).all(|p| g.page_refs.contains_key(&(t, p)))
+    }
+
     /// Track successful `mlock` ranges for runway height `need_height`.
     ///
     /// Same range re-noted by a later batch only adds the height (no double-count
@@ -340,6 +357,8 @@ impl ConfirmParentCache {
             g.mlock_n = g.mlock_n.saturating_add(1);
         }
     }
+
+
 
     /// Number of distinct mlocked page ranges currently tracked.
     pub fn mlock_count(&self) -> usize {
@@ -509,38 +528,25 @@ impl ConfirmParentCache {
     }
 
     /// Attach prewarm-resolved thin edges (wave_fill fast path; no full body required).
+    ///
+    /// Stored only in `thin_edges` (not dual-copied onto optional `by_body`).
     pub fn put_thin_inputs(&self, fk: Fk, edges: Vec<StashedThinInput>) {
         let Some(id) = fk.get() else {
             return;
         };
-        let mut g = self.inner.lock().unwrap();
-        if let Some(e) = g.by_body.get_mut(&id) {
-            e.thin_inputs = Some(edges.clone());
-        }
-        g.thin_edges.insert(id, edges);
+        self.inner.lock().unwrap().thin_edges.insert(id, edges);
     }
 
     /// Thin edges stashed during prewarm, if present (clone).
     pub fn get_thin_inputs(&self, fk: Fk) -> Option<Vec<StashedThinInput>> {
         let id = fk.get()?;
-        let g = self.inner.lock().unwrap();
-        if let Some(e) = g.by_body.get(&id).and_then(|b| b.thin_inputs.clone()) {
-            return Some(e);
-        }
-        g.thin_edges.get(&id).cloned()
+        self.inner.lock().unwrap().thin_edges.get(&id).cloned()
     }
 
     /// Move thin edges out of the runway (wave_fill is the sole consumer).
     pub fn take_thin_inputs(&self, fk: Fk) -> Option<Vec<StashedThinInput>> {
         let id = fk.get()?;
-        let mut g = self.inner.lock().unwrap();
-        if let Some(e) = g.by_body.get_mut(&id) {
-            if let Some(edges) = e.thin_inputs.take() {
-                g.thin_edges.remove(&id);
-                return Some(edges);
-            }
-        }
-        g.thin_edges.remove(&id)
+        self.inner.lock().unwrap().thin_edges.remove(&id)
     }
 
     pub fn body_count(&self) -> usize {

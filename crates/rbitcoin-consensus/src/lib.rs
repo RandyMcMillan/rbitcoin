@@ -125,8 +125,10 @@ pub mod confirm_phase_stats {
     pub static SCRIPT_NS: AtomicU64 = AtomicU64::new(0);
     /// Class C wall (`confirm_blocks_run` total).
     pub static CLASS_C_NS: AtomicU64 = AtomicU64::new(0);
-    /// Post–Class C durable spend annotation batch (historical name `utxo_apply`).
-    /// Logged as `utxo_ms` / us/blk `utxo` (wall for all annotate paths).
+    /// Post–Class C durable spend annotation batch.
+    ///
+    /// Historical name `UTXO_APPLY_NS` / log field `utxo_ms` — this is **not** a
+    /// light-UTXO map apply (Catchup removed). Wall time for all annotate paths.
     pub static UTXO_APPLY_NS: AtomicU64 = AtomicU64::new(0);
     /// Annotate edges using prewarmed body range (no idx).
     pub static SPEND_ANNOTATE_RANGED: AtomicU64 = AtomicU64::new(0);

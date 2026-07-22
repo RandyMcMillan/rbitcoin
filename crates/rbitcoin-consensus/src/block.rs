@@ -429,7 +429,8 @@ pub(crate) fn connect_block_prevouts(
     let n_tx = block.txdata.len();
     let mut block_spends: std::collections::HashSet<OutPoint> =
         std::collections::HashSet::with_capacity(n_tx.saturating_mul(2));
-    let mut same_block: std::collections::HashMap<[u8; 32], Vec<TxOut>> =
+    // txid → index into `block.txdata` (no script clones until a same-block spend).
+    let mut same_block: std::collections::HashMap<[u8; 32], usize> =
         std::collections::HashMap::with_capacity(n_tx);
     let mut fees = 0i64;
     // Skip job materialization (tx clone + prevout retention) when scripts are
@@ -537,6 +538,7 @@ pub(crate) fn connect_block_prevouts(
                 }
                 let prev_out = resolve_prevout(
                     query,
+                    block,
                     op,
                     prev_fk,
                     &same_block,
@@ -609,17 +611,12 @@ pub(crate) fn connect_block_prevouts(
             tx.compute_txid().to_byte_array()
         };
         let create_fk = spend_fk.unwrap_or(rbitcoin_primitives::Fk::NULL);
-        let mut outs = Vec::with_capacity(tx.output.len());
-        for (v, o) in tx.output.iter().enumerate() {
-            outs.push(TxOut {
-                value: o.value,
-                script_pubkey: o.script_pubkey.clone(),
-            });
+        for (v, _) in tx.output.iter().enumerate() {
             if !create_fk.is_null() {
                 pending_creates.insert((txid, v as u32), create_fk);
             }
         }
-        same_block.insert(txid, outs);
+        same_block.insert(txid, ti);
     }
 
     let subsidy = block_subsidy(ctx.height.0, ctx.params);
@@ -714,10 +711,11 @@ struct ResolvedPrevout {
 
 fn resolve_prevout(
     query: &Query,
+    block: &Block,
     op: OutPoint,
     // Prefer thin create_fk from wave (avoids full InputRecord).
     prev_fk_hint: Option<rbitcoin_primitives::Fk>,
-    same_block: &std::collections::HashMap<[u8; 32], Vec<TxOut>>,
+    same_block: &std::collections::HashMap<[u8; 32], usize>,
     wave_prevouts: Option<&rbitcoin_query::WavePrevoutCache>,
     coinbase_height_cache: &mut std::collections::HashMap<rbitcoin_primitives::Fk, Option<u32>>,
 ) -> Result<ResolvedPrevout, ConsensusError> {
@@ -727,13 +725,16 @@ fn resolve_prevout(
     let prev_txid = op.txid.to_byte_array();
 
     // Same-block spend of an earlier output in this block.
-    if let Some(outs) = same_block.get(&prev_txid) {
+    // Clone script only for the spent vout (not every create in the block).
+    if let Some(&ti) = same_block.get(&prev_txid) {
+        let tx = block
+            .txdata
+            .get(ti)
+            .ok_or(ConsensusError::MissingPrevout)?;
         let v = op.vout as usize;
-        if v >= outs.len() {
-            return Err(ConsensusError::MissingPrevout);
-        }
+        let o = tx.output.get(v).ok_or(ConsensusError::MissingPrevout)?;
         return Ok(ResolvedPrevout {
-            txout: outs[v].clone(),
+            txout: o.clone(),
             coinbase_height: None,
         });
     }

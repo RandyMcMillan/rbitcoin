@@ -50,11 +50,13 @@ struct BodyWire {
 }
 
 /// Process-local, single-threaded during connect of one confirm wave.
+///
+/// Layout is intentionally flat: **parents** (live outs) + **body_wire** (wave
+/// decode for wire rebuild) + **thin_inputs**. No separate `txs` map — wave-body
+/// meta lives on the parent row / body_wire.
 pub struct WavePrevoutCache {
     parents: HashMap<u64, Parent>,
     by_txid: HashMap<[u8; 32], u64>,
-    /// Wave-body spending txs (and creates): fk → row.
-    txs: HashMap<u64, TxRecord>,
     /// Wave-body non-coinbase inputs: spending_fk → edges aligned to input index.
     thin_inputs: HashMap<u64, Vec<ThinInput>>,
     /// Full Class A parts for wave-body fks (wire reconstruct).
@@ -66,7 +68,6 @@ impl WavePrevoutCache {
         Self {
             parents: HashMap::with_capacity(n_parents),
             by_txid: HashMap::with_capacity(n_parents + n_txs),
-            txs: HashMap::with_capacity(n_txs),
             thin_inputs: HashMap::with_capacity(n_txs),
             body_wire: HashMap::with_capacity(n_txs),
         }
@@ -77,16 +78,7 @@ impl WavePrevoutCache {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.parents.is_empty() && self.txs.is_empty()
-    }
-
-    pub fn insert_tx(&mut self, fk: Fk, tx: TxRecord) {
-        let id = match fk.get() {
-            Some(i) => i,
-            None => return,
-        };
-        self.by_txid.insert(tx.txid, id);
-        self.txs.insert(id, tx);
+        self.parents.is_empty() && self.body_wire.is_empty()
     }
 
     pub fn insert_thin_inputs(&mut self, spending_fk: Fk, edges: Vec<ThinInput>) {
@@ -156,9 +148,10 @@ impl WavePrevoutCache {
 
     pub fn get_tx(&self, fk: Fk) -> Option<&TxRecord> {
         let id = fk.get()?;
-        self.txs
+        self.parents
             .get(&id)
-            .or_else(|| self.parents.get(&id).map(|p| &p.tx))
+            .map(|p| &p.tx)
+            .or_else(|| self.body_wire.get(&id).map(|b| &b.tx))
     }
 
     pub fn thin_inputs(&self, spending_fk: Fk) -> Option<&[ThinInput]> {

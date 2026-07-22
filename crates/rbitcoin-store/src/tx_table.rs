@@ -605,6 +605,11 @@ impl TxTable {
         self.body.mlock_record(fk)
     }
 
+    /// `mlock` body pages for a known absolute `(offset, len)` (no idx read).
+    pub fn mlock_body_at(&self, offset: u64, len: u64) -> Result<(u64, u64), StoreError> {
+        self.body.mlock_body_range(offset, len)
+    }
+
     /// `mlock` the `tx.idx` slot for `fk`.
     pub fn mlock_idx(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
         self.body.mlock_idx_entry(fk)
@@ -727,33 +732,88 @@ impl TxTable {
     }
 
     /// Relative byte offset of output `vout`'s `spender_field` inside a packed tx payload.
+    ///
+    /// Input walk uses [`InputRecord::decode_prevout_at`] (no script/witness alloc).
     fn packed_output_spender_rel(raw: &[u8], vout: u32) -> Result<u64, StoreError> {
+        let found = Self::packed_output_spender_rels(raw, &[vout])?;
+        found
+            .into_iter()
+            .next()
+            .map(|(_, rel)| rel)
+            .ok_or(StoreError::NotFound)
+    }
+
+    /// One packed walk: for each requested `vout`, relative offset of its spender_field.
+    ///
+    /// `vouts` need not be sorted; results are returned in ascending vout order.
+    /// Missing vouts are omitted (caller treats as NotFound).
+    fn packed_output_spender_rels(raw: &[u8], vouts: &[u32]) -> Result<Vec<(u32, u64)>, StoreError> {
         if raw.first().copied() != Some(PACKED_TX_V1) {
             return Err(StoreError::Corrupt("not a packed Class A tx"));
         }
         if raw.len() < 1 + TxRecord::ENCODED_LEN {
             return Err(StoreError::Corrupt("short packed tx"));
         }
+        if vouts.is_empty() {
+            return Ok(Vec::new());
+        }
         let meta = TxRecord::decode(&raw[1..1 + TxRecord::ENCODED_LEN])?;
-        if vout >= meta.output_count {
+        let mut want: Vec<u32> = vouts.to_vec();
+        want.sort_unstable();
+        want.dedup();
+        let max_v = *want.last().unwrap();
+        if max_v >= meta.output_count {
             return Err(StoreError::NotFound);
         }
         let mut off = 1 + TxRecord::ENCODED_LEN;
+        // Skip inputs without materializing script/witness.
         for _ in 0..meta.input_count {
-            let (_rec, used) = InputRecord::decode_at(&raw[off..])?;
+            let (_txid, _vout, used) = InputRecord::decode_prevout_at(&raw[off..])?;
             off += used;
         }
-        for i in 0..=vout {
+        let mut out = Vec::with_capacity(want.len());
+        let mut wi = 0usize;
+        for i in 0..=max_v {
             if off >= raw.len() {
                 return Err(StoreError::Corrupt("packed outputs short"));
             }
-            if i == vout {
-                return Ok(off as u64);
+            if wi < want.len() && want[wi] == i {
+                out.push((i, off as u64));
+                wi += 1;
             }
             let (_, used) = OutputRecord::decode_at(&raw[off..])?;
             off += used;
         }
-        Err(StoreError::NotFound)
+        if out.len() != want.len() {
+            return Err(StoreError::NotFound);
+        }
+        Ok(out)
+    }
+
+    /// Read Class A body txid from a known range (no idx).
+    pub fn body_txid_at(&self, offset: u64, len: u64) -> Result<[u8; 32], StoreError> {
+        self.body.with_bytes_at(offset, len, |raw| {
+            if raw.first().copied() == Some(PACKED_TX_V1) {
+                if raw.len() < 1 + 32 {
+                    return Err(StoreError::Corrupt("short packed tx for txid"));
+                }
+                return Ok(raw[1..33].try_into().unwrap());
+            }
+            if raw.len() < 32 {
+                return Err(StoreError::Corrupt("short tx record for txid"));
+            }
+            Ok(raw[0..32].try_into().unwrap())
+        })
+    }
+
+    /// Probe address head and verify body **txid only** (no full packed decode).
+    pub fn get_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
+        for fk in self.head.probe_fks(txid)? {
+            if self.body_txid(fk)? == *txid {
+                return Ok(Some(fk));
+            }
+        }
+        Ok(None)
     }
 
     /// Read multi + spender_field for create tx output (packed Class A body).
@@ -879,27 +939,105 @@ impl TxTable {
     }
 
     pub fn get_by_txid(&self, txid: &[u8; 32]) -> Result<Option<(Fk, TxRecord)>, StoreError> {
-        // Keyless address head: probe candidates, verify body; prefer first match
-        // (newest-first BIP30 insert places newest earliest on the probe chain).
-        for fk in self.head.probe_fks(txid)? {
-            let rec = self.get(fk)?;
-            if rec.txid == *txid {
-                return Ok(Some((fk, rec)));
-            }
-        }
-        Ok(None)
+        // Probe + body_txid only; full decode only on match.
+        let Some(fk) = self.get_fk_by_txid(txid)? else {
+            return Ok(None);
+        };
+        Ok(Some((fk, self.get(fk)?)))
     }
 
     /// All Class A fks whose body txid equals `txid` (BIP30: more than one).
     pub fn get_all_by_txid(&self, txid: &[u8; 32]) -> Result<Vec<(Fk, TxRecord)>, StoreError> {
         let mut out = Vec::new();
         for fk in self.head.probe_fks(txid)? {
-            let rec = self.get(fk)?;
-            if rec.txid == *txid {
-                out.push((fk, rec));
+            if self.body_txid(fk)? != *txid {
+                continue;
             }
+            out.push((fk, self.get(fk)?));
         }
         Ok(out)
+    }
+
+    /// One body pin: apply many spend annotations `(vout, spending_tx_fk)` on one create.
+    ///
+    /// Walks inputs once (prevout-only) and outputs up to max needed vout once,
+    /// then patches each output's spender field.
+    pub fn put_spends_on_create_at(
+        &self,
+        spenders: &crate::spender_table::SpenderTable,
+        body_off: u64,
+        body_len: u64,
+        edges: &[(u32, Fk)],
+    ) -> Result<(), StoreError> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        for &(_, sfk) in edges {
+            if sfk.is_null() {
+                return Err(StoreError::InvalidFk);
+            }
+        }
+        let vouts: Vec<u32> = {
+            let mut v: Vec<u32> = edges.iter().map(|(v, _)| *v).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let metas: Vec<(u32, u64, bool, Fk)> =
+            self.body.with_bytes_at(body_off, body_len, |raw| {
+                let rels = Self::packed_output_spender_rels(raw, &vouts)?;
+                let mut out = Vec::with_capacity(rels.len());
+                for (v, rel) in rels {
+                    let fo = rel as usize;
+                    if raw.len() < fo + 9 {
+                        return Err(StoreError::Corrupt("packed spender meta short"));
+                    }
+                    let field = Fk(u64::from_le_bytes(raw[fo..fo + 8].try_into().unwrap()));
+                    let multi = raw[fo + 8] & output_flags::MULTI_SPENDER != 0;
+                    out.push((v, rel, multi, field));
+                }
+                Ok(out)
+            })?;
+        let mut by_vout: std::collections::HashMap<u32, (u64, bool, Fk)> =
+            std::collections::HashMap::with_capacity(metas.len());
+        for (v, rel, multi, field) in metas {
+            by_vout.insert(v, (rel, multi, field));
+        }
+        for &(vout, spend_fk) in edges {
+            let Some(&(rel, multi, field)) = by_vout.get(&vout) else {
+                return Err(StoreError::NotFound);
+            };
+            let (new_multi, new_field) = if !multi && field.is_null() {
+                (false, spend_fk)
+            } else if !multi && field == spend_fk {
+                continue;
+            } else if !multi {
+                let e1 = spenders.append(field, Fk::NULL)?;
+                let e2 = spenders.append(spend_fk, e1)?;
+                (true, e2)
+            } else {
+                let e = spenders.append(spend_fk, field)?;
+                (true, e)
+            };
+            self.body
+                .write_body_abs(body_off + rel, &new_field.0.to_le_bytes())?;
+            let flag0 = self.body.with_bytes_at(body_off, body_len, |raw| {
+                let fo = rel as usize + 8;
+                if fo >= raw.len() {
+                    return Err(StoreError::Corrupt("packed flags missing"));
+                }
+                Ok(raw[fo])
+            })?;
+            let mut flags = [flag0];
+            if new_multi {
+                flags[0] |= output_flags::MULTI_SPENDER;
+            } else {
+                flags[0] &= !output_flags::MULTI_SPENDER;
+            }
+            self.body.write_body_abs(body_off + rel + 8, &flags)?;
+            by_vout.insert(vout, (rel, new_multi, new_field));
+        }
+        Ok(())
     }
 
     /// Ensure durable `tx.head` maps `txid → fk` for every Class A body.
@@ -1048,6 +1186,99 @@ mod tests {
         assert_eq!(prevouts.len(), 2);
         assert_eq!(prevouts[0], ([0u8; 32], u32::MAX));
         assert_eq!(prevouts[1], ([3u8; 32], 1));
+    }
+
+    #[test]
+    fn packed_output_spender_rels_multi_vout_one_walk() {
+        let tx = TxRecord {
+            txid: [8u8; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 4,
+        };
+        let inputs = vec![InputRecord {
+            prev_txid: [0u8; 32],
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![0x01],
+            witness: vec![],
+        }];
+        let outputs = vec![
+            OutputRecord::unspent(1, vec![0x51]),
+            OutputRecord::unspent(2, vec![0x51]),
+            OutputRecord::unspent(3, vec![0x51]),
+            OutputRecord::unspent(4, vec![0x51]),
+        ];
+        let mut raw = Vec::new();
+        encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
+        let single0 = TxTable::packed_output_spender_rel(&raw, 0).unwrap();
+        let single3 = TxTable::packed_output_spender_rel(&raw, 3).unwrap();
+        let multi = TxTable::packed_output_spender_rels(&raw, &[3, 0, 3]).unwrap();
+        assert_eq!(multi.len(), 2);
+        assert_eq!(multi[0], (0, single0));
+        assert_eq!(multi[1], (3, single3));
+        // Each rel points at a 9-byte spender field (null fk + flags).
+        for (_, rel) in multi {
+            let fo = rel as usize;
+            assert!(raw.len() >= fo + 9);
+            assert_eq!(&raw[fo..fo + 8], &[0u8; 8]);
+        }
+    }
+
+    #[test]
+    fn put_spends_on_create_at_batch_patches_all_vouts() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-spend-batch-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        let t = TxTable::create(&dir).unwrap();
+        let spenders = crate::spender_table::SpenderTable::create(&dir).unwrap();
+        let tx = TxRecord {
+            txid: [0xab; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 3,
+        };
+        let inputs = vec![InputRecord {
+            prev_txid: [0u8; 32],
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![0x01],
+            witness: vec![],
+        }];
+        let outputs = vec![
+            OutputRecord::unspent(10, vec![0x51]),
+            OutputRecord::unspent(20, vec![0x51]),
+            OutputRecord::unspent(30, vec![0x51]),
+        ];
+        let fks = t
+            .put_full_batch_indexed(&[(tx, inputs, outputs)], true)
+            .unwrap();
+        let fk = fks[0];
+        let (off, len) = t.body_range(fk).unwrap();
+        let s1 = Fk(100);
+        let s2 = Fk(200);
+        t.put_spends_on_create_at(&spenders, off, len, &[(0, s1), (2, s2)])
+            .unwrap();
+        let (m0, f0) = t.get_output_spender_meta_at(off, len, 0).unwrap();
+        let (m2, f2) = t.get_output_spender_meta_at(off, len, 2).unwrap();
+        assert!(!m0 && f0 == s1);
+        assert!(!m2 && f2 == s2);
+        let (m1, f1) = t.get_output_spender_meta_at(off, len, 1).unwrap();
+        assert!(!m1 && f1.is_null());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

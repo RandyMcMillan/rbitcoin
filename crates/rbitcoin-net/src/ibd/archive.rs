@@ -404,14 +404,10 @@ pub(crate) fn spawn_archive_pipeline(
                         .fetch_add(n_blocks, Ordering::Relaxed);
                     match write_res {
                         Ok(_fks) => {
-                            // Deep confirm lag: yield disk so wave parent loads
-                            // are not starved (mainnet ~220k tip freeze while
-                            // arch lead ~400k and writer_busy%=100).
-                            if !is_pri && lag >= 4_096 {
-                                let steps = (lag / 4_096).min(25);
-                                let ms = (steps as u64).saturating_mul(8); // 8..200ms
-                                std::thread::sleep(Duration::from_millis(ms));
-                            }
+                            // Do **not** sleep the Class A writer under lag: coalesce
+                            // already shrinks far quanta; sleeping re-fills arch_q and
+                            // freezes far densify. Idle IOPRIO + small batches yield disk.
+                            let _ = (is_pri, lag);
                             for (hash, wire_bytes) in outcomes {
                                 if write_result
                                     .send(ArchiveResult::Ok { hash, wire_bytes })

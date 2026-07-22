@@ -78,8 +78,6 @@ pub(crate) fn assign_work_ordered(
     hub: &ChainHub,
     cfg: &IbdConfig,
     loop_stats: &LoopStats,
-    _arch_bytes: usize,
-    _arch_budget: usize,
     scope: AssignScope,
 ) {
     let t0 = Instant::now();

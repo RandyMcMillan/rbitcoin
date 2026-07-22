@@ -376,7 +376,8 @@ impl Query {
             return Ok(Some(fk));
         }
         if self.tx_index_enabled() {
-            if let Some((fk, _)) = self.store.get_tx_by_txid(txid)? {
+            // body_txid verify only — avoid full packed decode on probe misses.
+            if let Some(fk) = self.store.get_fk_by_txid(txid)? {
                 return Ok(Some(fk));
             }
         }
@@ -386,6 +387,11 @@ impl Query {
     /// Public resolve by txid (runway + durable head).
     pub fn tx_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
         self.lookup_tx_fk(txid)
+    }
+
+    /// Durable head probe with **body txid only** (no full packed decode).
+    pub fn tx_fk_by_txid_store(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
+        Ok(self.store.get_fk_by_txid(txid)?)
     }
 
     pub fn store(&self) -> &Store {

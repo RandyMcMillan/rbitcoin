@@ -7,17 +7,13 @@ use std::time::Instant;
 impl Query {
     /// Build wave prevout map. **Requires** prewarm: bodies + parents ready.
     ///
-    /// - Wave-body txs: **one** full Class A decode, stashed for wire rebuild.
-    /// - Thin edges: moved from runway stash (same type as wave) — no remap.
-    /// - External parents: **outs-only** decode; only needed vouts kept.
+    /// Prefer [`Self::wave_fill_for_tx_fk_lists`] when header + tx lists are
+    /// already resolved (confirm batch) to avoid re-probing header head.
     pub fn wave_fill_for_block_hashes(
         &self,
         hashes: &[[u8; 32]],
     ) -> Result<(usize, crate::WavePrevoutCache), QueryError> {
-        use crate::wave_fill_stats::{self as wf, add as wf_add};
-
-        let mut wave_fks: HashSet<u64> = HashSet::new();
-        let mut wave_tx_fks: Vec<Fk> = Vec::new();
+        let mut lists: Vec<Vec<Fk>> = Vec::with_capacity(hashes.len());
         for hash in hashes {
             let Some((header_fk, _)) = self.get_header_by_hash(hash)? else {
                 continue;
@@ -25,7 +21,27 @@ impl Query {
             let Some(tx_fks) = self.header_tx_fks(header_fk, Some(hash))? else {
                 continue;
             };
-            for fk in tx_fks {
+            lists.push(tx_fks);
+        }
+        let refs: Vec<&[Fk]> = lists.iter().map(|v| v.as_slice()).collect();
+        self.wave_fill_for_tx_fk_lists(&refs)
+    }
+
+    /// Wave fill from already-resolved per-block Class A fk lists (confirm hot path).
+    ///
+    /// - Wave-body txs: **one** full Class A decode, stashed for wire rebuild.
+    /// - Thin edges: moved from runway stash (same type as wave) — no remap.
+    /// - External parents: **outs-only** decode; only needed vouts kept.
+    pub fn wave_fill_for_tx_fk_lists(
+        &self,
+        per_block: &[&[Fk]],
+    ) -> Result<(usize, crate::WavePrevoutCache), QueryError> {
+        use crate::wave_fill_stats::{self as wf, add as wf_add};
+
+        let mut wave_fks: HashSet<u64> = HashSet::new();
+        let mut wave_tx_fks: Vec<Fk> = Vec::new();
+        for list in per_block {
+            for &fk in *list {
                 if let Some(id) = fk.get() {
                     wave_fks.insert(id);
                 }

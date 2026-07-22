@@ -243,6 +243,69 @@ impl Store {
         out
     }
 
+    /// Pin Class A body pages for a known absolute range (no idx).
+    pub fn mlock_tx_body_at(&self, offset: u64, len: u64) -> Vec<crate::MlockRange> {
+        let mut out = Vec::with_capacity(1);
+        Self::push_mlock(
+            &mut out,
+            crate::MlockTable::TxBody,
+            self.txs.mlock_body_at(offset, len),
+        );
+        out
+    }
+
+    /// Coalesce absolute body `(offset, len)` into page spans and `mlock` each.
+    ///
+    /// Adjacent / overlapping page ranges merge so sequential Class A bodies in
+    /// the same file region cost one syscall instead of one per tx.
+    pub fn mlock_tx_body_ranges_coalesced(
+        &self,
+        ranges: &[(u64, u64)],
+    ) -> Vec<crate::MlockRange> {
+        if ranges.is_empty() {
+            return Vec::new();
+        }
+        const PAGE: u64 = 4096;
+        let mut spans: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for &(off, len) in ranges {
+            if len == 0 {
+                continue;
+            }
+            let start = off & !(PAGE - 1);
+            let end = off.saturating_add(len).saturating_add(PAGE - 1) & !(PAGE - 1);
+            let plen = end.saturating_sub(start);
+            if plen > 0 {
+                spans.push((start, plen));
+            }
+        }
+        if spans.is_empty() {
+            return Vec::new();
+        }
+        spans.sort_unstable_by_key(|(s, _)| *s);
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
+        for (s, l) in spans {
+            if let Some((ms, ml)) = merged.last_mut() {
+                let mend = ms.saturating_add(*ml);
+                if s <= mend {
+                    let new_end = s.saturating_add(l).max(mend);
+                    *ml = new_end.saturating_sub(*ms);
+                    continue;
+                }
+            }
+            merged.push((s, l));
+        }
+        let mut out = Vec::with_capacity(merged.len());
+        for (ps, pl) in merged {
+            // mlock_range page-aligns again (idempotent for already-aligned).
+            Self::push_mlock(
+                &mut out,
+                crate::MlockTable::TxBody,
+                self.txs.mlock_body_at(ps, pl),
+            );
+        }
+        out
+    }
+
     /// Pin Class A idx+body for `fk` (legacy / tests). Prefer body-only + idx cache.
     pub fn mlock_tx_class_a(&self, fk: Fk) -> Vec<crate::MlockRange> {
         let mut out = Vec::with_capacity(2);
@@ -508,16 +571,47 @@ impl Store {
 
     /// Like [`Self::put_spend_batch_by_create`] with prewarmed body ranges.
     /// Tuple: `(create_tx_fk, vout, spending_tx_fk, body_off, body_len)`.
+    ///
+    /// Groups by create body and applies all vouts with **one** packed walk per
+    /// create (no per-edge full input walk).
     pub fn put_spend_batch_by_create_ranged(
         &self,
         edges: &[(Fk, u32, Fk, u64, u64)],
     ) -> Result<(), StoreError> {
+        if edges.is_empty() {
+            return Ok(());
+        }
         let mut work = edges.to_vec();
-        work.sort_unstable_by_key(|(c, v, _, _, _)| (c.0, *v));
-        for (create_fk, vout, spend_fk, off, len) in work {
-            self.put_spend_create_at(create_fk, vout, spend_fk, off, len)?;
+        // Group by create_fk + body range, then vout.
+        work.sort_unstable_by_key(|(c, v, _, off, _)| (c.0, *off, *v));
+        let mut i = 0;
+        while i < work.len() {
+            let (cfk, _, _, off, len) = work[i];
+            if cfk.is_null() {
+                return Err(StoreError::InvalidFk);
+            }
+            let mut j = i + 1;
+            while j < work.len()
+                && work[j].0 == cfk
+                && work[j].3 == off
+                && work[j].4 == len
+            {
+                j += 1;
+            }
+            let batch: Vec<(u32, Fk)> = work[i..j]
+                .iter()
+                .map(|(_, v, s, _, _)| (*v, *s))
+                .collect();
+            self.txs
+                .put_spends_on_create_at(&self.spenders, off, len, &batch)?;
+            i = j;
         }
         Ok(())
+    }
+
+    /// Resolve txid → Class A fk without full body decode (head probe + body txid).
+    pub fn get_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
+        self.txs.get_fk_by_txid(txid)
     }
 
     /// Spentness by create fk (no `tx.head`). Body must be mlocked / range-known.

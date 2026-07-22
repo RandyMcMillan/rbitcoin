@@ -244,8 +244,33 @@ impl ShRunBuilder {
             claimed.len()
         );
         let t0 = Instant::now();
-        let mut all: Vec<ScriptHashRecord> =
-            Vec::with_capacity(total_recs.min(u64::from(u32::MAX)) as usize);
+        // Stream one run (or chunk) at a time — avoid holding every SH create in
+        // RAM at once. `bulk_load_sorted_creates` accepts sequential sorted
+        // batches (empty → cold path; subsequent → append).
+        const CHUNK: usize = 512_000;
+        let mut n_total = 0usize;
+        let mut unique_in = 0usize;
+        let mut chunk: Vec<ScriptHashRecord> = Vec::with_capacity(CHUNK.min(1 << 20));
+        let mut flush_chunk =
+            |store: &Store, chunk: &mut Vec<ScriptHashRecord>| -> Result<(), StoreError> {
+                if chunk.is_empty() {
+                    return Ok(());
+                }
+                chunk.sort_unstable_by(|a, b| {
+                    a.scripthash
+                        .cmp(&b.scripthash)
+                        .then(a.create_tx_fk.0.cmp(&b.create_tx_fk.0))
+                });
+                chunk.dedup_by(|a, b| {
+                    a.scripthash == b.scripthash && a.create_tx_fk == b.create_tx_fk
+                });
+                unique_in = unique_in.saturating_add(chunk.len());
+                let n = store.scripthash.bulk_load_sorted_creates(chunk)?;
+                n_total = n_total.saturating_add(n);
+                chunk.clear();
+                Ok(())
+            };
+
         for run in &claimed {
             let body = read_run_body(run)?;
             let rec_len = run.rec_len as usize;
@@ -256,30 +281,42 @@ impl ShRunBuilder {
                 if tx_fk.is_null() {
                     continue;
                 }
-                all.push(ScriptHashRecord::from_fk(sh, tx_fk));
+                chunk.push(ScriptHashRecord::from_fk(sh, tx_fk));
+                if chunk.len() >= CHUNK {
+                    // Prefer not to split a scripthash multi-list on the cold
+                    // first batch; hold the trailing key. If one key fills the
+                    // chunk, force-flush anyway (append path merges).
+                    let last_sh = chunk.last().map(|r| r.scripthash);
+                    let mut hold = Vec::new();
+                    if let Some(sh) = last_sh {
+                        while chunk.last().is_some_and(|r| r.scripthash == sh) {
+                            hold.push(chunk.pop().unwrap());
+                        }
+                    }
+                    if chunk.is_empty() {
+                        hold.reverse();
+                        chunk.extend(hold);
+                        flush_chunk(store, &mut chunk)?;
+                    } else {
+                        flush_chunk(store, &mut chunk)?;
+                        hold.reverse();
+                        chunk.extend(hold);
+                    }
+                }
             }
+            // End of run: flush remaining (run is fully sorted).
+            flush_chunk(store, &mut chunk)?;
         }
-        // Runs are each sorted; after multi-run claim order is by seq (merge
-        // order). Re-sort for bulk_load key grouping.
-        all.sort_unstable_by(|a, b| {
-            a.scripthash
-                .cmp(&b.scripthash)
-                .then(a.create_tx_fk.0.cmp(&b.create_tx_fk.0))
-        });
-        all.dedup_by(|a, b| a.scripthash == b.scripthash && a.create_tx_fk == b.create_tx_fk);
-
-        let n = store.scripthash.bulk_load_sorted_creates(&all)?;
         store.scripthash.flush()?;
         for run in &claimed {
             let _ = std::fs::remove_file(&run.path);
         }
         clear_runs_dir(&runs_dir);
         info!(
-            "node: scripthash bulk materialize done creates≈{n} unique_in≈{} elapsed={:?}",
-            all.len(),
+            "node: scripthash bulk materialize done creates≈{n_total} unique_in≈{unique_in} elapsed={:?}",
             t0.elapsed()
         );
-        Ok(n as u64)
+        Ok(n_total as u64)
     }
 }
 

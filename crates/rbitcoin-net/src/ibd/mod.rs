@@ -55,7 +55,7 @@ use progress::{
     format_rate, ibd_pct, work_chain_progress, TipRateTracker,
 };
 use state::IbdWorkState;
-use assign::assign_work_ordered;
+use assign::{archive_pipeline_saturated, assign_work_ordered, AssignDepth};
 use events::{
     apply_archive_result, apply_confirm_reject, apply_peer_event, disconnect_all_peers,
     drain_ready_peer_and_archive_events, update_confirm_lag,
@@ -114,23 +114,18 @@ pub(crate) const TIP_HOLE_THIRD_PEER_AFTER: Duration = Duration::from_secs(10);
 pub(crate) const MAX_PEER_POOL: usize = 256;
 /// Pending (framed, not Class A) longer than this → re-getdata.
 pub(crate) const PENDING_STALE: Duration = Duration::from_secs(45);
-/// ContigPark gap-band pending: re-getdata much sooner (slow peer / stuck prep).
-pub(crate) const CONTIG_GAP_PENDING_STALE: Duration = Duration::from_secs(5);
-/// Max hashes per far getdata batch.
+/// ContigPark race-band pending: re-getdata much sooner (slow peer / stuck prep).
+pub(crate) const CONTIG_PARK_PENDING_STALE: Duration = Duration::from_secs(5);
+/// Max hashes per densify getdata batch.
 pub(crate) const FAR_BATCH_MAX: usize = 16;
-/// Cap height scan for far candidates per assign tick.
+/// Cap height scan for densify candidates per assign tick.
 pub(crate) const FAR_SCAN_BUDGET: usize = 16_384;
-/// Max heights to re-getdata at ContigPark `write_next` (unstick archive under
-/// far admission is 0 / budget pressure when a far gap blocks the park).
-pub(crate) const CONTIG_GAP_FILL_MAX: u32 = 64;
-/// First N gap heights get tip-hole-style multi-peer race (rest single-peer).
-pub(crate) const CONTIG_GAP_RACE_PREFIX: usize = 8;
-/// Under budget pressure (`far_scale < 0.5`), densify only this many heights
-/// past ContigPark `write_next` (contiguous park feed — not full-horizon far).
-/// Also hard park horizon: refuse to charge/park bodies further ahead.
+/// Multi-peer race only on ContigPark `write_next`‥`write_next+R-1` (rest of
+/// densify band is single-peer).
+pub(crate) const CONTIG_PARK_RACE: usize = 8;
+/// ContigPark densify horizon past `write_next` (single-peer feed). Also hard
+/// park horizon: refuse to charge/park bodies further ahead.
 pub(crate) const CONTIG_DENSIFY_AHEAD: u32 = 2048;
-/// Per-peer far slots while in full pressure (scale=0) for contig densify only.
-pub(crate) const CONTIG_DENSIFY_FAR_SLOTS: usize = 4;
 
 /// Tunables for IBD (defaults lean libbitcoin/Core-ish).
 #[derive(Clone, Debug)]
@@ -506,11 +501,22 @@ pub async fn ibd_cancellable(
         st.hygiene();
 
         // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
-        // Far densify scaled by archive free headroom (proportional + 90%/70%
-        // pressure hysteresis). Tip-near + ContigPark gap always run.
+        // ContigPark densify scaled by archive free headroom (proportional +
+        // 90%/70% hysteresis). When pending/arch_q is saturated and inflight is
+        // already low, only Critical assign (tip hole + write_next race) runs —
+        // full scans waste CPU while the pipeline digests bodies.
         let far_scale = archive_queued.far_admission_scale();
         let write_next = archive_write_next.load(Ordering::Relaxed);
         let inflight_before = st.inflight.len();
+        let depth = if archive_pipeline_saturated(
+            st.body.pending_len(),
+            st.inflight.len(),
+            archive_queued.fill_ratio(),
+        ) {
+            AssignDepth::Critical
+        } else {
+            AssignDepth::Full
+        };
         assign_work_ordered(
             &mut st,
             hub.as_ref(),
@@ -518,6 +524,7 @@ pub async fn ibd_cancellable(
             &loop_stats,
             far_scale,
             write_next,
+            depth,
         );
 
         // Offer archived bodies to the dedicated confirm engine (non-blocking).
@@ -563,11 +570,21 @@ pub async fn ibd_cancellable(
             break;
         }
         // Re-assign only if drain/confirm freed meaningful inflight slots
-        // (avoid double planner work every loop tick).
+        // (avoid double planner work every loop tick). Empty inflight + saturated
+        // pipeline still runs Critical only (write_next race / tip hole).
         let freed = inflight_before.saturating_sub(st.inflight.len());
         if freed >= 8 || st.inflight.is_empty() {
             let far_scale2 = archive_queued.far_admission_scale();
             let write_next2 = archive_write_next.load(Ordering::Relaxed);
+            let depth2 = if archive_pipeline_saturated(
+                st.body.pending_len(),
+                st.inflight.len(),
+                archive_queued.fill_ratio(),
+            ) {
+                AssignDepth::Critical
+            } else {
+                AssignDepth::Full
+            };
             assign_work_ordered(
                 &mut st,
                 hub.as_ref(),
@@ -575,6 +592,7 @@ pub async fn ibd_cancellable(
                 &loop_stats,
                 far_scale2,
                 write_next2,
+                depth2,
             );
         }
 
@@ -1221,10 +1239,10 @@ mod tip_hole_race_tests {
 }
 
 #[cfg(test)]
-mod contig_gap_assign_tests {
-    use super::assign::contig_gap_need;
+mod park_race_assign_tests {
+    use super::assign::{archive_pipeline_saturated, park_race_need};
     use super::state::IbdWorkState;
-    use super::CONTIG_GAP_FILL_MAX;
+    use super::CONTIG_PARK_RACE;
     use bitcoin::hashes::Hash;
     use bitcoin::BlockHash;
     use rbitcoin_consensus::{ChainParams, Milestone};
@@ -1237,9 +1255,9 @@ mod contig_gap_assign_tests {
     }
 
     #[test]
-    fn contig_gap_need_picks_write_next_band() {
+    fn park_race_need_only_write_next_prefix() {
         let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-contig-gap-{}",
+            "rbitcoin-park-race-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -1250,31 +1268,43 @@ mod contig_gap_assign_tests {
         let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
 
         let mut st = IbdWorkState::new(vec![], None, None);
-        // Heights 100..=110 on the ordered path; write_next=100 gap-fill window.
-        for ht in 100u32..=110 {
+        // Heights 100..=120 on the ordered path; race is write_next..+R-1 only.
+        for ht in 100u32..=120 {
             let hash = h(ht);
             st.record_height(hash, ht);
             st.ordered_set.insert(hash);
             st.ordered.push_back(hash);
             st.max_ordered_height = ht;
         }
-        // 100 pending (in pipeline), 101 known archived, 102 inflight → skip.
+        // 100 pending (in pipeline), 101 known archived, 102 inflight → race keeps it.
         st.body.mark_pending(h(100));
         st.body.mark_archived(h(101));
         st.inflight
             .insert(h(102), super::state::InflightReq::new(0));
 
-        let need = contig_gap_need(&mut st, &hub, 100, CONTIG_GAP_FILL_MAX);
-        assert!(!need.is_empty(), "expected gap fills");
+        let need = park_race_need(&mut st, &hub, 100);
+        assert!(!need.is_empty(), "expected park-race need");
         // 100 pending + 101 archived skipped; 102 inflight is kept for multi-peer race.
         assert_eq!(need[0], h(102), "inflight kept for race prefix");
         assert!(need.iter().all(|x| *x != h(100) && *x != h(101)));
-        assert!(need.contains(&h(103)));
+        // Densify-only heights beyond race prefix must not appear.
+        let race_hi = 100 + CONTIG_PARK_RACE as u32 - 1;
         for hash in &need {
             let ht = st.hash_height[hash];
-            assert!((100..=100 + CONTIG_GAP_FILL_MAX - 1).contains(&ht));
+            assert!((100..=race_hi).contains(&ht), "ht={ht} outside race");
         }
+        // Height just past race prefix is densify, not multi-peer race need.
+        assert!(!need.contains(&h(race_hi + 1)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_pipeline_saturated_gates_full_assign() {
+        assert!(!archive_pipeline_saturated(0, 0, 0.0));
+        assert!(!archive_pipeline_saturated(200, 32, 0.95)); // inflight still high
+        assert!(archive_pipeline_saturated(96, 0, 0.0));
+        assert!(archive_pipeline_saturated(0, 0, 0.85));
+        assert!(archive_pipeline_saturated(200, 15, 0.9));
     }
 }
 

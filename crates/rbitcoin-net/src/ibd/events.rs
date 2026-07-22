@@ -10,7 +10,7 @@ use super::peer_io::{note_block_progress, note_block_rx, PeerCmd, PeerEvent};
 use super::state::IbdWorkState;
 use super::status::LoopStats;
 use super::{
-    CONTIG_DENSIFY_AHEAD, CONTIG_GAP_FILL_MAX, MAX_ORDERED_HEADERS, MAX_PEER_POOL, NEAR_DEPTH,
+    CONTIG_DENSIFY_AHEAD, MAX_ORDERED_HEADERS, MAX_PEER_POOL, NEAR_DEPTH,
     ORDERED_HEADERS_SOFT_CAP,
 };
 use crate::chain::ChainHub;
@@ -380,12 +380,13 @@ pub(crate) fn apply_peer_event(
             }
             // Prevent re-getdata while prep/writer owns this body.
             st.body.mark_pending(hash);
+            // Priority: confirm runway + ContigPark densify horizon (parkable soon).
             let priority = st
                 .hash_height
                 .get(&hash)
                 .map(|&ht| {
                     ht <= tip_h.saturating_add(NEAR_DEPTH)
-                        || ht <= write_next.saturating_add(CONTIG_GAP_FILL_MAX)
+                        || ht <= write_next.saturating_add(CONTIG_DENSIFY_AHEAD)
                 })
                 .unwrap_or(false);
             // Approx wire size for RAM budget (already-decoded; never drop).

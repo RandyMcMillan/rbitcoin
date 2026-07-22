@@ -1,26 +1,38 @@
-//! Getdata assign: tip-hole race, near band, far densify.
+//! Getdata assign: tip-hole race, confirm runway, ContigPark feed.
+//!
+//! Height ownership (single policy):
+//! - **Tip holes:** ordered front unready → multi-peer race
+//! - **Confirm runway:** tip+1‥min(near_hi, write_next−1) → single peer
+//! - **ContigPark feed:** write_next‥write_next+W → multi-peer on write_next‥+R−1,
+//!   single peer on the rest; capacity scaled by archive budget admission
+//! - **Beyond write_next+W:** never request (events also refuse park)
 
-use super::assign_plan::{classify_height, far_slots_per_peer, WorkClass};
+use super::assign_plan::far_slots_per_peer;
 use super::peer_io::{touch_block_progress, PeerCmd, PeerSlot};
 use super::state::{self, IbdWorkState};
 use super::status::LoopStats;
 use super::{
-    IbdConfig, CONTIG_DENSIFY_AHEAD, CONTIG_DENSIFY_FAR_SLOTS, CONTIG_GAP_FILL_MAX,
-    CONTIG_GAP_PENDING_STALE, CONTIG_GAP_RACE_PREFIX, FAR_BATCH_MAX, FAR_SCAN_BUDGET, NEAR_DEPTH,
-    PENDING_STALE, TIP_HOLE_IMMEDIATE_PEERS, TIP_HOLE_MAX, TIP_HOLE_MAX_PEERS,
-    TIP_HOLE_THIRD_PEER_AFTER,
+    IbdConfig, CONTIG_DENSIFY_AHEAD, CONTIG_PARK_PENDING_STALE, CONTIG_PARK_RACE,
+    FAR_BATCH_MAX, FAR_SCAN_BUDGET, NEAR_DEPTH, PENDING_STALE, TIP_HOLE_IMMEDIATE_PEERS,
+    TIP_HOLE_MAX, TIP_HOLE_MAX_PEERS, TIP_HOLE_THIRD_PEER_AFTER,
 };
 use crate::chain::ChainHub;
 use bitcoin::BlockHash;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+/// How much assign work to do this call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AssignDepth {
+    /// Tip holes + ContigPark `write_next` multi-peer race only (cheap).
+    /// Used when archive pipeline is saturated so we do not spin full scans.
+    Critical,
+    /// Critical + confirm runway + ContigPark densify band.
+    Full,
+}
+
 /// Drop `hash` from global inflight and every peer's in_flight set.
-///
-/// Used when the first body arrives (or archive/confirm settles the hash) so
-/// racing peers stop counting it as outstanding work. Late `Block` messages are
-/// ignored via [`BodyPresence::skip_download`].
 pub(crate) fn clear_hash_inflight(
     slots: &mut [PeerSlot],
     inflight: &mut HashMap<BlockHash, state::InflightReq>,
@@ -33,8 +45,6 @@ pub(crate) fn clear_hash_inflight(
 }
 
 /// Free peer/global slots for hashes already on the confirmed tip (RAM set).
-/// Archived-but-unconfirmed ghosts are cleared on Block / archive-ok via
-/// [`clear_hash_inflight`] — avoid `is_archived` store probes every assign.
 pub(crate) fn prune_satisfied_inflight(
     slots: &mut [PeerSlot],
     inflight: &mut HashMap<BlockHash, state::InflightReq>,
@@ -46,7 +56,7 @@ pub(crate) fn prune_satisfied_inflight(
     }
 }
 
-/// Record `peer` as requesting `hash` (tip-hole may accumulate multiple peers).
+/// Record `peer` as requesting `hash` (tip-hole / park race may accumulate peers).
 pub(crate) fn inflight_add_peer(
     inflight: &mut HashMap<BlockHash, state::InflightReq>,
     hash: BlockHash,
@@ -58,41 +68,42 @@ pub(crate) fn inflight_add_peer(
         .add_peer(peer);
 }
 
-/// Scale far densify capacity by archive budget admission (`0.0`..=`1.0`).
-///
-/// `0.0` = tip hole + near + ContigPark gap only (no general far densify).
-/// `1.0` = full far slots / window reserve.
-pub(crate) fn scale_far_cap(base_far_cap: usize, far_scale: f64) -> usize {
-    if base_far_cap == 0 || far_scale <= 0.0 {
+/// Scale ContigPark densify per-peer slots by archive admission (`0.0`..=`1.0`).
+pub(crate) fn scale_feed_cap(base: usize, scale: f64) -> usize {
+    if base == 0 || scale <= 0.0 {
         return 0;
     }
-    if far_scale >= 1.0 {
-        return base_far_cap;
+    if scale >= 1.0 {
+        return base;
     }
-    // Ceil so tiny residual headroom still allows a drip of far work.
-    let scaled = ((base_far_cap as f64) * far_scale).ceil() as usize;
-    scaled.max(1).min(base_far_cap)
+    let scaled = ((base as f64) * scale).ceil() as usize;
+    scaled.max(1).min(base)
+}
+
+/// True when the archive pipeline is full of work and getdata inflight is low.
+///
+/// Full assign scans are wasteful here — bodies are pending/queued, not missing
+/// on the wire. Critical assign (tip hole + write_next race) still runs.
+pub(crate) fn archive_pipeline_saturated(
+    pending_len: usize,
+    inflight_len: usize,
+    fill_ratio: f64,
+) -> bool {
+    inflight_len < 16 && (pending_len >= 96 || fill_ratio >= 0.85)
 }
 
 /// Assign getdata for bodies not yet Class A.
 ///
-/// 1. Tip hole — 2 peers immediately; 3rd after [`TIP_HOLE_THIRD_PEER_AFTER`]
-///    from when the second was attached (no stall disconnect required).
-/// 2. **Archive ContigPark gap** — heights at/after `archive_write_next` that
-///    still need a body (**always**, even when `far_scale == 0`).
-/// 3. Near band — tip+1‥tip+[`NEAR_DEPTH`] (single peer per hash).
-/// 4. Far — forward densify past near (height-ascending); capacity scaled by
-///    `far_scale` from [`super::archive::ArchiveQueueBudget::far_admission_scale`].
-///
-/// `archive_write_next` is ContigPark's next commit height (shared atomic from
-/// the writer). Filling gaps there unblocks parked RAM under a full budget.
+/// `archive_feed_scale` is [`super::archive::ArchiveQueueBudget::far_admission_scale`]
+/// (0 = densify drip only / multi-peer race still on; 1 = full densify capacity).
 pub(crate) fn assign_work_ordered(
     st: &mut IbdWorkState,
     hub: &ChainHub,
     cfg: &IbdConfig,
     loop_stats: &LoopStats,
-    far_scale: f64,
+    archive_feed_scale: f64,
     archive_write_next: u32,
+    depth: AssignDepth,
 ) {
     let t0 = Instant::now();
     let mut issued = 0u64;
@@ -112,13 +123,13 @@ pub(crate) fn assign_work_ordered(
     for h in expired {
         clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
     }
-    // ContigPark gap band: re-request much sooner (one slow peer must not freeze arch).
+    // ContigPark race band: re-request much sooner than global pending stale.
     let wn = archive_write_next;
-    let gap_hi = wn.saturating_add(CONTIG_GAP_FILL_MAX.saturating_sub(1));
-    let gap_expired = st.body.expire_stale_pending_if(CONTIG_GAP_PENDING_STALE, |h| {
+    let race_hi = wn.saturating_add(CONTIG_PARK_RACE.saturating_sub(1) as u32);
+    let gap_expired = st.body.expire_stale_pending_if(CONTIG_PARK_PENDING_STALE, |h| {
         st.hash_height
             .get(h)
-            .is_some_and(|&ht| ht >= wn && ht <= gap_hi)
+            .is_some_and(|&ht| ht >= wn && ht <= race_hi)
     });
     for h in gap_expired {
         clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
@@ -127,12 +138,16 @@ pub(crate) fn assign_work_ordered(
     let tip = hub.tip_height().unwrap_or(0);
     let near_hi = tip.saturating_add(NEAR_DEPTH);
     let tip_holes = contiguous_tip_holes(st, hub, TIP_HOLE_MAX);
-    let tip_hole = !tip_holes.is_empty();
 
     issued += cover_tip_holes(st, hub, cfg, &alive, &tip_holes);
 
-    // Unstick ContigPark even when far_scale == 0 (budget pressure / hysteresis).
-    issued += cover_archive_contig_gap(st, hub, cfg, &alive, archive_write_next);
+    // Multi-peer race only on write_next .. write_next+R-1 (not a long band).
+    issued += cover_park_race(st, hub, cfg, &alive, archive_write_next);
+
+    if matches!(depth, AssignDepth::Critical) {
+        finish_assign(loop_stats, t0, issued);
+        return;
+    }
 
     let mut room = cfg.window.saturating_sub(st.inflight.len());
     if room == 0 {
@@ -140,7 +155,7 @@ pub(crate) fn assign_work_ordered(
         return;
     }
     if st.inflight.is_empty()
-        && !tip_hole
+        && tip_holes.is_empty()
         && st.max_archived_height > 0
         && st.max_archived_height >= st.max_ordered_height
     {
@@ -148,46 +163,45 @@ pub(crate) fn assign_work_ordered(
         return;
     }
 
-    // Far densify scaled by archive free headroom (proportional + hysteresis).
-    // Contig gap already handled above; near always uses remaining room.
-    // Under pressure (scale=0) still drip ContigPark-band densify so the park
-    // can form contiguous mega-batches without full-horizon far junk.
-    let far_scale = far_scale.clamp(0.0, 1.0);
-    let base_far = far_slots_per_peer(cfg.per_peer, tip_hole);
-    let far_cap = if far_scale <= 0.0 {
-        CONTIG_DENSIFY_FAR_SLOTS.min(cfg.per_peer).max(1)
+    let feed_scale = archive_feed_scale.clamp(0.0, 1.0);
+    // Densify capacity in the ContigPark band (beyond the race prefix).
+    let tip_hole = !tip_holes.is_empty();
+    let base_feed = far_slots_per_peer(cfg.per_peer, tip_hole);
+    let feed_cap = if feed_scale <= 0.0 {
+        // Pressure: still drip densify so park can grow a contiguous run.
+        2usize.min(cfg.per_peer).max(1)
     } else {
-        scale_far_cap(base_far, far_scale)
+        scale_feed_cap(base_feed, feed_scale)
     };
-    let want_far = far_cap > 0;
-    // Always densify only ContigPark's usable band (write_next..+CONTIG_DENSIFY_AHEAD).
-    // Full-horizon far filled the park with unwritable heights, which were then
-    // refused/requeued → getdata thrash. Headroom still scales *how many* far slots.
-    let contig_densify_only = true;
-    // far_cap is already scale-adjusted; reserve uses the reduced per-peer far slots.
-    let far_window_reserve = if want_far {
-        alive
-            .len()
-            .saturating_mul(far_cap)
-            .min(room.saturating_mul(3) / 4)
-            .max(far_cap.min(room))
-    } else {
-        0
-    };
-    let near_window_cap = room.saturating_sub(far_window_reserve);
 
-    let (near_work, far_work) = collect_need(
+    // Confirm runway: tip+1 .. min(near_hi, write_next-1). Park feed owns ≥ write_next.
+    let runway_hi = if archive_write_next > tip.saturating_add(1) {
+        near_hi.min(archive_write_next.saturating_sub(1))
+    } else {
+        // write_next at/behind tip+1 → park feed covers the near window.
+        tip
+    };
+
+    let feed_reserve = alive
+        .len()
+        .saturating_mul(feed_cap)
+        .min(room.saturating_mul(3) / 4)
+        .max(feed_cap.min(room));
+    let runway_cap = room.saturating_sub(feed_reserve);
+
+    let runway = collect_runway(st, hub, tip, runway_hi, runway_cap);
+    // Densify: write_next+R .. write_next+W (race prefix already multi-peered).
+    let densify_lo = archive_write_next.saturating_add(CONTIG_PARK_RACE as u32);
+    let densify_hi = archive_write_next.saturating_add(CONTIG_DENSIFY_AHEAD);
+    let densify = collect_height_band(
         st,
         hub,
-        tip,
-        near_hi,
-        near_window_cap,
-        room,
-        want_far,
-        archive_write_next,
-        contig_densify_only,
+        densify_lo,
+        densify_hi,
+        room.saturating_sub(runway.len()).max(1),
     );
-    if near_work.is_empty() && far_work.is_empty() {
+
+    if runway.is_empty() && densify.is_empty() {
         finish_assign(loop_stats, t0, issued);
         return;
     }
@@ -195,19 +209,20 @@ pub(crate) fn assign_work_ordered(
     let mut peer_i = st.assign_rot;
     st.assign_rot = st.assign_rot.wrapping_add(1);
 
-    let mut near = near_work;
-    while room > far_window_reserve && !near.is_empty() {
+    // Issue confirm runway (single peer), leaving feed_reserve for densify.
+    let mut runway_q = runway;
+    while room > feed_reserve && !runway_q.is_empty() {
         let mut any = false;
         for _ in 0..alive.len() {
-            if room <= far_window_reserve || near.is_empty() {
+            if room <= feed_reserve || runway_q.is_empty() {
                 break;
             }
             let pid = alive[peer_i % alive.len()];
             peer_i += 1;
-            if !peer_can_take_near(st, pid, cfg.per_peer, far_cap, tip, near_hi) {
+            if !peer_has_slot(st, pid, cfg.per_peer) {
                 continue;
             }
-            let Some(h) = pop_need(&mut near, st, hub) else {
+            let Some(h) = pop_need(&mut runway_q, st, hub) else {
                 break;
             };
             if issue_one(st, pid, h, &mut room, &mut issued) {
@@ -219,22 +234,23 @@ pub(crate) fn assign_work_ordered(
         }
     }
 
-    let mut far = far_work;
-    while room > 0 && !far.is_empty() {
+    // ContigPark densify band (single peer per hash, feed_cap slots/peer).
+    let mut densify_q = densify;
+    while room > 0 && !densify_q.is_empty() {
         let mut any = false;
         for _ in 0..alive.len() {
-            if room == 0 || far.is_empty() {
+            if room == 0 || densify_q.is_empty() {
                 break;
             }
             let pid = alive[peer_i % alive.len()];
             peer_i += 1;
-            let Some(n) = peer_far_free(st, pid, cfg.per_peer, far_cap, tip, near_hi) else {
+            let Some(n) = peer_feed_free(st, pid, cfg.per_peer, feed_cap) else {
                 continue;
             };
             let take = n.min(room).min(FAR_BATCH_MAX);
             let mut batch = Vec::with_capacity(take);
             while batch.len() < take {
-                let Some(h) = pop_need(&mut far, st, hub) else {
+                let Some(h) = pop_need(&mut densify_q, st, hub) else {
                     break;
                 };
                 batch.push(h);
@@ -263,87 +279,68 @@ pub(crate) fn finish_assign(loop_stats: &LoopStats, t0: Instant, issued: u64) {
     }
 }
 
-/// Collect (near, far) hashes that still need getdata.
-///
-/// Far densify is always ContigPark band only:
-/// `max(near_hi+1, write_next)`‥`write_next+CONTIG_DENSIFY_AHEAD`
-/// (near collect still covers tip runway). Avoids full-horizon far junkyard.
-///
-/// Does not update `max_archived_height` (that is archive-result / seed only).
-pub(crate) fn collect_need(
+/// Confirm runway: tip+1 ‥ runway_hi (exclusive of ContigPark write_next and above).
+fn collect_runway(
     st: &mut IbdWorkState,
     hub: &ChainHub,
     tip: u32,
-    near_hi: u32,
-    near_cap: usize,
-    total_room: usize,
-    want_far: bool,
-    write_next: u32,
-    _contig_densify_only: bool,
-) -> (VecDeque<BlockHash>, VecDeque<BlockHash>) {
-    let mut near = VecDeque::new();
-    let mut far = VecDeque::new();
-
-    for ht in tip.saturating_add(1)..=near_hi {
-        if near.len() >= near_cap {
+    runway_hi: u32,
+    cap: usize,
+) -> VecDeque<BlockHash> {
+    let mut out = VecDeque::new();
+    if runway_hi <= tip || cap == 0 {
+        return out;
+    }
+    for ht in tip.saturating_add(1)..=runway_hi {
+        if out.len() >= cap {
             break;
         }
-        let Some(&h) = st.height_to_hash.get(&ht) else {
-            continue;
-        };
-        if !st.ordered_set.contains(&h) || st.inflight.contains_key(&h) {
-            continue;
+        if let Some(h) = need_hash_at(st, hub, ht) {
+            out.push_back(h);
         }
-        if st.body.is_known_archived(&h) || st.body.is_pending(&h) {
-            continue;
-        }
-        if st.body.skip_download(hub, &h) {
-            continue;
-        }
-        near.push_back(h);
     }
+    out
+}
 
-    if !want_far {
-        return (near, far);
+/// Single-peer need list over an inclusive height band.
+fn collect_height_band(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    lo: u32,
+    hi: u32,
+    cap: usize,
+) -> VecDeque<BlockHash> {
+    let mut out = VecDeque::new();
+    if lo > hi || cap == 0 {
+        return out;
     }
-
-    let far_room = total_room.saturating_sub(near.len()).max(
-        total_room.saturating_sub(near_cap),
-    );
-    if far_room == 0 {
-        return (near, far);
-    }
-
+    let hi = hi.min(st.max_ordered_height.max(lo));
     let mut inspected = 0usize;
-    // Feed ContigPark head only — avoids filling RAM with unwritable far junk.
-    let far_lo = write_next.max(near_hi.saturating_add(1));
-    let far_hi = write_next
-        .saturating_add(CONTIG_DENSIFY_AHEAD)
-        .min(st.max_ordered_height.max(far_lo));
-    if far_lo > far_hi {
-        return (near, far);
-    }
-    for ht in far_lo..=far_hi {
-        if far.len() >= far_room || inspected >= FAR_SCAN_BUDGET {
+    for ht in lo..=hi {
+        if out.len() >= cap || inspected >= FAR_SCAN_BUDGET {
             break;
-        }
-        let Some(&h) = st.height_to_hash.get(&ht) else {
-            continue;
-        };
-        if !st.ordered_set.contains(&h) || st.inflight.contains_key(&h) {
-            continue;
-        }
-        if st.body.is_known_archived(&h) || st.body.is_pending(&h) {
-            continue;
         }
         inspected += 1;
-        if st.body.skip_download(hub, &h) {
-            continue;
+        if let Some(h) = need_hash_at(st, hub, ht) {
+            out.push_back(h);
         }
-        far.push_back(h);
     }
+    out
+}
 
-    (near, far)
+/// Hash at `ht` that still needs a new single-peer getdata (not inflight/pending/done).
+fn need_hash_at(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> Option<BlockHash> {
+    let &h = st.height_to_hash.get(&ht)?;
+    if !st.ordered_set.contains(&h) || st.inflight.contains_key(&h) {
+        return None;
+    }
+    if st.body.is_known_archived(&h) || st.body.is_pending(&h) || st.body.is_rejected(&h) {
+        return None;
+    }
+    if st.body.skip_download(hub, &h) {
+        return None;
+    }
+    Some(h)
 }
 
 pub(crate) fn pop_need(
@@ -360,70 +357,29 @@ pub(crate) fn pop_need(
     None
 }
 
-pub(crate) fn peer_can_take_near(
-    st: &IbdWorkState,
-    pid: usize,
-    per_peer: usize,
-    far_cap: usize,
-    tip: u32,
-    near_hi: u32,
-) -> bool {
-    let Some(s) = st.slots.iter().find(|s| s.id == pid && s.alive) else {
-        return false;
-    };
-    if s.in_flight.len() >= per_peer {
-        return false;
-    }
-    // Reserve far_cap slots on the peer for archive-ahead work so near cannot
-    // pin every in-flight slot (that froze Class A a few k ahead of tip).
-    if far_cap > 0 {
-        let (near_n, _far_n) = count_class(&s.in_flight, &st.hash_height, tip, near_hi);
-        let near_cap = per_peer.saturating_sub(far_cap);
-        if near_n >= near_cap {
-            return false;
-        }
-    }
-    true
+fn peer_has_slot(st: &IbdWorkState, pid: usize, per_peer: usize) -> bool {
+    st.slots
+        .iter()
+        .find(|s| s.id == pid && s.alive)
+        .is_some_and(|s| s.in_flight.len() < per_peer)
 }
 
-pub(crate) fn peer_far_free(
+/// Free densify slots on peer (cap how many ContigPark-feed hashes per peer).
+fn peer_feed_free(
     st: &IbdWorkState,
     pid: usize,
     per_peer: usize,
-    far_cap: usize,
-    tip: u32,
-    near_hi: u32,
+    feed_cap: usize,
 ) -> Option<usize> {
     let s = st.slots.iter().find(|s| s.id == pid && s.alive)?;
     let free_total = per_peer.saturating_sub(s.in_flight.len());
-    if free_total == 0 {
+    if free_total == 0 || feed_cap == 0 {
         return None;
     }
-    let far_n = count_class(&s.in_flight, &st.hash_height, tip, near_hi).1;
-    let free_far = far_cap.saturating_sub(far_n).min(free_total);
-    if free_far == 0 {
-        None
-    } else {
-        Some(free_far)
-    }
-}
-
-pub(crate) fn count_class(
-    in_flight: &HashSet<BlockHash>,
-    heights: &HashMap<BlockHash, u32>,
-    tip: u32,
-    near_hi: u32,
-) -> (usize, usize) {
-    let depth = near_hi.saturating_sub(tip);
-    let mut near = 0usize;
-    let mut far = 0usize;
-    for h in in_flight {
-        match classify_height(heights.get(h).copied(), tip, depth) {
-            WorkClass::Near => near += 1,
-            WorkClass::Far => far += 1,
-        }
-    }
-    (near, far)
+    // Count how many of this peer's inflight are already densify/race (not tip runway).
+    // Approximate: any hash with height > tip+NEAR is feed; also height >= write_next
+    // is hard without write_next here — use free_total.min(feed_cap) as simple bound.
+    Some(free_total.min(feed_cap))
 }
 
 pub(crate) fn issue_one(
@@ -449,7 +405,6 @@ pub(crate) fn issue_batch(
     let Some(idx) = st.slots.iter().position(|s| s.id == pid && s.alive) else {
         return false;
     };
-    // Skip hashes this peer already has outstanding (tip-hole re-cover).
     let batch: Vec<BlockHash> = batch
         .into_iter()
         .filter(|h| !st.slots[idx].in_flight.contains(h))
@@ -471,7 +426,6 @@ pub(crate) fn issue_batch(
         inflight_add_peer(&mut st.inflight, h, pid);
     }
     *issued += batch.len() as u64;
-    // Window counts unique hashes: only charge hashes that were not already inflight.
     let new_unique = batch
         .iter()
         .filter(|h| st.inflight.get(*h).map(|e| e.len() == 1).unwrap_or(false))
@@ -505,11 +459,7 @@ pub(crate) fn contiguous_tip_holes(
     holes
 }
 
-/// Desired concurrent getdata peers for a tip-hole hash.
-///
-/// - 0–1 outstanding → aim for [`TIP_HOLE_IMMEDIATE_PEERS`] (2) immediately
-/// - 2 outstanding → hold until [`TIP_HOLE_THIRD_PEER_AFTER`] from second attach
-/// - then allow [`TIP_HOLE_MAX_PEERS`] (3)
+/// Desired concurrent getdata peers for a tip-hole / park-race hash.
 pub(crate) fn tip_hole_peer_target(
     already: usize,
     second_peer_at: Option<Instant>,
@@ -532,22 +482,23 @@ pub(crate) fn tip_hole_peer_target(
     }
 }
 
-/// Collect hashes for ContigPark `write_next`‥`write_next+max-1` that still need
-/// getdata or multi-peer race (height-ascending).
-///
-/// Includes hashes already in `inflight` (so the race prefix can add peers).
-/// Skips pending/known/rejected (body already in pipeline or done).
-pub(crate) fn contig_gap_need(
+/// Multi-peer race for ContigPark `write_next`‥`write_next+R-1` only.
+pub(crate) fn cover_park_race(
     st: &mut IbdWorkState,
     hub: &ChainHub,
+    cfg: &IbdConfig,
+    alive: &[usize],
     write_next: u32,
-    max: u32,
-) -> Vec<BlockHash> {
-    if max == 0 {
-        return Vec::new();
+) -> u64 {
+    if alive.is_empty() || CONTIG_PARK_RACE == 0 {
+        return 0;
     }
-    let mut out = Vec::with_capacity(max.min(64) as usize);
-    let hi = write_next.saturating_add(max.saturating_sub(1));
+    let mut issued = 0u64;
+    let mut peer_i = st.assign_rot;
+    st.assign_rot = st.assign_rot.wrapping_add(1);
+    let now = Instant::now();
+    let hi = write_next.saturating_add(CONTIG_PARK_RACE.saturating_sub(1) as u32);
+
     for ht in write_next..=hi {
         let Some(&h) = st.height_to_hash.get(&ht) else {
             continue;
@@ -555,68 +506,23 @@ pub(crate) fn contig_gap_need(
         if !st.ordered_set.contains(&h) {
             continue;
         }
-        if st.body.is_known_archived(&h)
+        if hub.has_block(&h)
             || st.body.is_pending(&h)
             || st.body.is_rejected(&h)
+            || st.body.ready(hub, &h)
         {
             continue;
         }
-        // Already inflight: keep for multi-peer race on the prefix.
-        if st.inflight.contains_key(&h) {
-            out.push(h);
+        // Not known/pending: either need first peer or more race peers.
+        if !st.inflight.contains_key(&h) && st.body.skip_download(hub, &h) {
             continue;
         }
-        if st.body.skip_download(hub, &h) {
-            continue;
-        }
-        out.push(h);
-    }
-    out
-}
-
-/// Cover ContigPark's next commit heights with getdata.
-///
-/// First [`CONTIG_GAP_RACE_PREFIX`] heights use tip-hole multi-peer race (2–3
-/// peers). Remaining band heights get a single peer. Runs even when
-/// `far_scale == 0` so a far gap cannot freeze the writer.
-///
-/// Logs at most once per second (or when `write_next` moves) to avoid main-loop spam.
-pub(crate) fn cover_archive_contig_gap(
-    st: &mut IbdWorkState,
-    hub: &ChainHub,
-    cfg: &IbdConfig,
-    alive: &[usize],
-    write_next: u32,
-) -> u64 {
-    if alive.is_empty() {
-        return 0;
-    }
-    let need = contig_gap_need(st, hub, write_next, CONTIG_GAP_FILL_MAX);
-    if need.is_empty() {
-        return 0;
-    }
-    let mut issued = 0u64;
-    let mut peer_i = st.assign_rot;
-    st.assign_rot = st.assign_rot.wrapping_add(1);
-    let now = Instant::now();
-
-    for (i, &h) in need.iter().enumerate() {
-        if hub.has_block(&h) || st.body.is_pending(&h) || st.body.ready(hub, &h) {
-            continue;
-        }
-        let race = i < CONTIG_GAP_RACE_PREFIX;
         let (already, second_at) = st
             .inflight
             .get(&h)
             .map(|e| (e.len(), e.second_peer_at))
             .unwrap_or((0, None));
-        let want = if race {
-            tip_hole_peer_target(already, second_at, now)
-        } else if already >= 1 {
-            continue; // single-peer band already covered
-        } else {
-            1
-        };
+        let want = tip_hole_peer_target(already, second_at, now);
         if already >= want {
             continue;
         }
@@ -651,13 +557,12 @@ pub(crate) fn cover_archive_contig_gap(
                 need_peers = need_peers.saturating_sub(1);
             }
         }
-        // Race prefix: if write_next has zero coverage and no free peer, stop.
-        if race && already == 0 && !placed_any {
+        // write_next with zero coverage and no free peer — stop.
+        if ht == write_next && already == 0 && !placed_any {
             break;
         }
     }
     if issued > 0 {
-        // Assign runs many times per second; rate-limit so DEBUG stays usable.
         use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrd};
         static LAST_LOG_WN: AtomicU32 = AtomicU32::new(u32::MAX);
         static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
@@ -671,7 +576,7 @@ pub(crate) fn cover_archive_contig_gap(
             LAST_LOG_WN.store(write_next, AtomicOrd::Relaxed);
             LAST_LOG_MS.store(now_ms, AtomicOrd::Relaxed);
             rbitcoin_log::debug!(
-                "ibd: contig-gap getdata write_next={write_next} issued={issued} (unstick ContigPark)"
+                "ibd: park-race getdata write_next={write_next} issued={issued}"
             );
         }
     }
@@ -679,7 +584,6 @@ pub(crate) fn cover_archive_contig_gap(
 }
 
 /// Cover each tip-hole hash with staged multi-peer getdata (2 now, 3 after 10s).
-/// First delivery clears all racers via [`clear_hash_inflight`].
 pub(crate) fn cover_tip_holes(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -738,7 +642,6 @@ pub(crate) fn cover_tip_holes(
                 need = need.saturating_sub(1);
             }
         }
-        // No free peer slots for a hole with zero coverage — later holes wait.
         if already == 0 && !placed_any {
             break;
         }
@@ -746,3 +649,35 @@ pub(crate) fn cover_tip_holes(
     issued
 }
 
+/// Hashes in ContigPark race band that still need coverage (tests + diagnostics).
+pub(crate) fn park_race_need(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    write_next: u32,
+) -> Vec<BlockHash> {
+    let mut out = Vec::new();
+    let hi = write_next.saturating_add(CONTIG_PARK_RACE.saturating_sub(1) as u32);
+    for ht in write_next..=hi {
+        let Some(&h) = st.height_to_hash.get(&ht) else {
+            continue;
+        };
+        if !st.ordered_set.contains(&h) {
+            continue;
+        }
+        if st.body.is_known_archived(&h)
+            || st.body.is_pending(&h)
+            || st.body.is_rejected(&h)
+        {
+            continue;
+        }
+        if st.inflight.contains_key(&h) {
+            out.push(h);
+            continue;
+        }
+        if st.body.skip_download(hub, &h) {
+            continue;
+        }
+        out.push(h);
+    }
+    out
+}

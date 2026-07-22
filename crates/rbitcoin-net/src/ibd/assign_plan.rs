@@ -122,15 +122,15 @@ mod tests {
         assert_eq!(far_slots_per_peer(8, false), 4);
     }
 
-    /// Pressure / far_scale=0 → no far slots (near + contig gap only).
+    /// Pressure / feed_scale=0 → no densify slots (tip hole + park race only).
     #[test]
-    fn zero_far_scale_means_zero_far_cap() {
-        use super::super::assign::scale_far_cap;
-        assert_eq!(scale_far_cap(8, 0.0), 0);
-        assert_eq!(scale_far_cap(8, 0.5), 4);
-        assert_eq!(scale_far_cap(8, 1.0), 8);
-        // Tiny residual headroom still drips one far slot.
-        assert_eq!(scale_far_cap(8, 0.01), 1);
+    fn zero_feed_scale_means_zero_feed_cap() {
+        use super::super::assign::scale_feed_cap;
+        assert_eq!(scale_feed_cap(8, 0.0), 0);
+        assert_eq!(scale_feed_cap(8, 0.5), 4);
+        assert_eq!(scale_feed_cap(8, 1.0), 8);
+        // Tiny residual headroom still drips one densify slot.
+        assert_eq!(scale_feed_cap(8, 0.01), 1);
     }
 
     #[test]

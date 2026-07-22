@@ -52,23 +52,7 @@ pub(crate) fn compact_ordered(
     *ordered = next;
 }
 
-/// Height classification for getdata slot accounting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WorkClass {
-    Near,
-    Far,
-}
-
-/// Near = tip < height ≤ tip+near_depth. Unknown heights count as near.
-pub(crate) fn classify_height(height: Option<u32>, tip: u32, near_depth: u32) -> WorkClass {
-    match height {
-        Some(ht) if ht > tip && ht <= tip.saturating_add(near_depth) => WorkClass::Near,
-        Some(ht) if ht > tip.saturating_add(near_depth) => WorkClass::Far,
-        _ => WorkClass::Near,
-    }
-}
-
-/// Far slots per peer: drip while a tip hole exists, else half of `per_peer`.
+/// Densify slots per peer: drip while a tip hole exists, else half of `per_peer`.
 pub(crate) fn far_slots_per_peer(per_peer: usize, tip_hole: bool) -> usize {
     if tip_hole {
         2
@@ -104,15 +88,6 @@ mod tests {
         b[0] = (n & 0xff) as u8;
         b[1] = (n >> 8) as u8;
         BlockHash::from_byte_array(b)
-    }
-
-    #[test]
-    fn classify_near_far() {
-        assert_eq!(classify_height(Some(101), 100, 128), WorkClass::Near);
-        assert_eq!(classify_height(Some(228), 100, 128), WorkClass::Near);
-        assert_eq!(classify_height(Some(229), 100, 128), WorkClass::Far);
-        assert_eq!(classify_height(Some(100), 100, 128), WorkClass::Near); // ≤ tip → near bias
-        assert_eq!(classify_height(None, 100, 128), WorkClass::Near);
     }
 
     #[test]

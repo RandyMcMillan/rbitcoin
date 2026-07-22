@@ -649,7 +649,8 @@ pub(crate) fn cover_tip_holes(
     issued
 }
 
-/// Hashes in ContigPark race band that still need coverage (tests + diagnostics).
+/// Hashes in ContigPark race band that still need coverage (tests).
+#[cfg(test)]
 pub(crate) fn park_race_need(
     st: &mut IbdWorkState,
     hub: &ChainHub,

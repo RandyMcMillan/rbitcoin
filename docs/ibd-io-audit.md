@@ -120,7 +120,7 @@ Per-`TableFile` mutexes, light UTXO mutex, `ChainHub` RwLock — explain
 
 ```bash
 # Dedicated disk if possible
-export RBITCOIN_ARCHIVE_QUEUE_MB=256
+export RBITCOIN_ARCHIVE_QUEUE_MB=512
 export RAYON_NUM_THREADS=4   # example: leave cores for desktop
 
 nice -n 10 ionice -c 3 \

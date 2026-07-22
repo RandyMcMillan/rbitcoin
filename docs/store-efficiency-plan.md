@@ -64,7 +64,7 @@ ElectrumX / Fulcrum avoid this by storing **fat history rows** (txid, height, va
 | OS + page cache (must exist) | 4–6 GiB minimum for UI to stay alive |
 | Process RSS (node + peers + rayon) | 4–6 GiB realistic target |
 | Class A cache | **≤128–256 MiB** (already default 256; larger can thrash worse) |
-| Archive queue | **≤128–256 MiB** |
+| Archive queue | **≤256–512 MiB** (default 512) |
 | Mempool | **≤100–300 MiB** weight budget mapped to live set |
 | Hash heads | **must not** be fully faulted in |
 

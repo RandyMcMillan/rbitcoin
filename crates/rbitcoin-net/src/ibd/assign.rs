@@ -5,8 +5,9 @@ use super::peer_io::{touch_block_progress, PeerCmd, PeerSlot};
 use super::state::{self, IbdWorkState};
 use super::status::LoopStats;
 use super::{
-    IbdConfig, CONTIG_GAP_FILL_MAX, FAR_BATCH_MAX, FAR_SCAN_BUDGET, NEAR_DEPTH, PENDING_STALE,
-    TIP_HOLE_IMMEDIATE_PEERS, TIP_HOLE_MAX, TIP_HOLE_MAX_PEERS, TIP_HOLE_THIRD_PEER_AFTER,
+    IbdConfig, CONTIG_DENSIFY_AHEAD, CONTIG_DENSIFY_FAR_SLOTS, CONTIG_GAP_FILL_MAX, FAR_BATCH_MAX,
+    FAR_SCAN_BUDGET, NEAR_DEPTH, PENDING_STALE, TIP_HOLE_IMMEDIATE_PEERS, TIP_HOLE_MAX,
+    TIP_HOLE_MAX_PEERS, TIP_HOLE_THIRD_PEER_AFTER,
 };
 use crate::chain::ChainHub;
 use bitcoin::BlockHash;
@@ -137,10 +138,18 @@ pub(crate) fn assign_work_ordered(
 
     // Far densify scaled by archive free headroom (proportional + hysteresis).
     // Contig gap already handled above; near always uses remaining room.
+    // Under pressure (scale=0) still drip ContigPark-band densify so the park
+    // can form contiguous mega-batches without full-horizon far junk.
     let far_scale = far_scale.clamp(0.0, 1.0);
     let base_far = far_slots_per_peer(cfg.per_peer, tip_hole);
-    let far_cap = scale_far_cap(base_far, far_scale);
+    let far_cap = if far_scale <= 0.0 {
+        CONTIG_DENSIFY_FAR_SLOTS.min(cfg.per_peer).max(1)
+    } else {
+        scale_far_cap(base_far, far_scale)
+    };
     let want_far = far_cap > 0;
+    // Restrict densify horizon to write_next band when budget is tight.
+    let contig_densify_only = far_scale < 0.5;
     // far_cap is already scale-adjusted; reserve uses the reduced per-peer far slots.
     let far_window_reserve = if want_far {
         alive
@@ -153,8 +162,17 @@ pub(crate) fn assign_work_ordered(
     };
     let near_window_cap = room.saturating_sub(far_window_reserve);
 
-    let (near_work, far_work) =
-        collect_need(st, hub, tip, near_hi, near_window_cap, room, want_far);
+    let (near_work, far_work) = collect_need(
+        st,
+        hub,
+        tip,
+        near_hi,
+        near_window_cap,
+        room,
+        want_far,
+        archive_write_next,
+        contig_densify_only,
+    );
     if near_work.is_empty() && far_work.is_empty() {
         finish_assign(loop_stats, t0, issued);
         return;
@@ -233,7 +251,12 @@ pub(crate) fn finish_assign(loop_stats: &LoopStats, t0: Instant, issued: u64) {
 
 /// Collect (near, far) hashes that still need getdata.
 ///
-/// Far is **forward-only** from `near_hi+1` (densify Class A behind tip).
+/// Far densify:
+/// - **Full headroom** (`contig_densify_only = false`): `near_hi+1`‥`max_ordered`
+/// - **Budget pressure** (`contig_densify_only = true`): only ContigPark band
+///   `write_next`‥`write_next+CONTIG_DENSIFY_AHEAD` (heights already in near are
+///   skipped here; near collect still covers tip runway).
+///
 /// Does not update `max_archived_height` (that is archive-result / seed only).
 pub(crate) fn collect_need(
     st: &mut IbdWorkState,
@@ -243,6 +266,8 @@ pub(crate) fn collect_need(
     near_cap: usize,
     total_room: usize,
     want_far: bool,
+    write_next: u32,
+    contig_densify_only: bool,
 ) -> (VecDeque<BlockHash>, VecDeque<BlockHash>) {
     let mut near = VecDeque::new();
     let mut far = VecDeque::new();
@@ -278,8 +303,21 @@ pub(crate) fn collect_need(
     }
 
     let mut inspected = 0usize;
-    let far_lo = near_hi.saturating_add(1);
-    let far_hi = st.max_ordered_height.max(far_lo);
+    let (far_lo, far_hi) = if contig_densify_only {
+        // Feed ContigPark head only — avoids filling RAM with unwritable far junk.
+        let lo = write_next.max(near_hi.saturating_add(1));
+        let hi = write_next
+            .saturating_add(CONTIG_DENSIFY_AHEAD)
+            .min(st.max_ordered_height.max(lo));
+        (lo, hi)
+    } else {
+        let lo = near_hi.saturating_add(1);
+        let hi = st.max_ordered_height.max(lo);
+        (lo, hi)
+    };
+    if far_lo > far_hi {
+        return (near, far);
+    }
     for ht in far_lo..=far_hi {
         if far.len() >= far_room || inspected >= FAR_SCAN_BUDGET {
             break;

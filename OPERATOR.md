@@ -42,7 +42,7 @@ Default: **info**. CLI wins over env.
 | Blocks in transit / peer | **16** | `IbdConfig::per_peer` |
 | Live IBD peers | **16** | `--max-outbound` |
 | Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` (`0` = full scripts) |
-| Archive queue RAM | **256 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
+| Archive queue RAM | **512 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
 | Parent prewarm depth / batch / headroom | **256 / 64 / 64** | `RBITCOIN_PARENT_PREWARM_DEPTH` / `_BATCH` / `_HEADROOM` |
 | Parent prewarm mlock | **on** | `RBITCOIN_PARENT_PREWARM_MLOCK=0` to disable |

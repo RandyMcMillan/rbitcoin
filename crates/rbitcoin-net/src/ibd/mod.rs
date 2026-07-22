@@ -121,6 +121,11 @@ pub(crate) const FAR_SCAN_BUDGET: usize = 16_384;
 /// Max heights to re-getdata at ContigPark `write_next` (unstick archive under
 /// far admission is 0 / budget pressure when a far gap blocks the park).
 pub(crate) const CONTIG_GAP_FILL_MAX: u32 = 64;
+/// Under budget pressure (`far_scale < 0.5`), densify only this many heights
+/// past ContigPark `write_next` (contiguous park feed — not full-horizon far).
+pub(crate) const CONTIG_DENSIFY_AHEAD: u32 = 2048;
+/// Per-peer far slots while in full pressure (scale=0) for contig densify only.
+pub(crate) const CONTIG_DENSIFY_FAR_SLOTS: usize = 4;
 
 /// Tunables for IBD (defaults lean libbitcoin/Core-ish).
 #[derive(Clone, Debug)]

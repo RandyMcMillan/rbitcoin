@@ -1,6 +1,6 @@
 //! Archive prep + writer pipeline for IBD.
 
-use super::coalesce::{coalesce_wait, max_batch_for_lag, min_batch_for_lag};
+use super::coalesce::{coalesce_wait, max_batch_for_lag, min_batch_for_queue};
 use crate::chain::ChainHub;
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash};
@@ -101,12 +101,13 @@ impl ArchivePipelineSample {
 }
 
 
-/// Default RAM budget for decoded blocks waiting in the archive pipeline (~256 MiB).
+/// Default RAM budget for decoded blocks waiting in the archive pipeline (~512 MiB).
 /// Override with env `RBITCOIN_ARCHIVE_QUEUE_MB`.
 ///
-/// Was 1 GiB; wire-size undercounts true RSS of decoded `Block` + prep structures,
-/// and stacked with Class A cache + OS page cache of multi‑GB store files.
-pub const DEFAULT_ARCHIVE_QUEUE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+/// Sized so network stays busy and ContigPark can form mega-batches without a
+/// multi‑GiB junkyard. Wire-size undercounts true RSS of decoded `Block` + prep
+/// (×1.5 charge); still stacked with prewarm mlock + page cache.
+pub const DEFAULT_ARCHIVE_QUEUE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Enter “pressure” (far_scale = 0) when fill ≥ this fraction of budget.
 pub const ARCHIVE_PRESSURE_ENTER: f64 = 0.90;
@@ -692,8 +693,9 @@ pub(crate) fn spawn_archive_pipeline(
                     }
 
                     let lag = write_lag.load(Ordering::Relaxed);
+                    let arch_q_n = write_arch_q.count();
                     let max_mega = max_batch_for_lag(lag);
-                    let min_batch = min_batch_for_lag(lag);
+                    let min_batch = min_batch_for_queue(arch_q_n, lag);
                     let mut ready = park.ready_prefix_len();
 
                     // If the park is waiting on a height already Class A (Late
@@ -1009,9 +1011,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn budget_default_is_256mib() {
+    fn budget_default_is_512mib() {
         let b = ArchiveQueueBudget::new(DEFAULT_ARCHIVE_QUEUE_BUDGET_BYTES);
-        assert_eq!(b.budget_bytes(), 256 * 1024 * 1024);
+        assert_eq!(b.budget_bytes(), 512 * 1024 * 1024);
         assert!(b.fill_ratio() < 1.0);
         assert_eq!(b.count(), 0);
         assert_eq!(b.bytes(), 0);

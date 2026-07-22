@@ -286,14 +286,11 @@ pub fn bip34_height_script(height: u32) -> Vec<u8> {
 
 /// Connect checks on contiguous tip confirm.
 ///
-/// Always: prevouts, double-spend (point+strong), maturity, fees/subsidy, same-block map.
-/// Connect + optional script/sig checks.
-///
-/// Split into:
-/// 1. **Connect** — sequential prevouts / spentness / maturity / fees (store-bound;
-///    parallelizing these only contended on table `Mutex`es).
-/// 2. **Scripts** — above milestone, each non-coinbase tx is checked with its
-///    resolved prevouts on a small worker pool (CPU-bound, no store).
+/// Pipeline (optimistic scripts, assumevalid-shaped):
+/// 1. **Assemble** — resolve prevout *content*, intra-block doubles, fees; build jobs
+///    (no durable spentness / maturity).
+/// 2. **Scripts** — above milestone, rayon pool (CPU; needs prevout values only).
+/// 3. **Structural** — durable spentness, maturity, coinbase subsidy (order-sensitive).
 ///
 /// Class C tip updates (`confirm_block`) stay outside this function.
 ///
@@ -313,10 +310,10 @@ pub fn validate_block_connect(
     }
 
     let check_scripts = !ctx.milestone.skips_scripts_at(ctx.height.0);
-    // Pending until connect+scripts succeed — no durable writes on failure.
+    // Pending until assemble+scripts+structural succeed — no durable writes on failure.
     let mut pending = std::collections::HashSet::new();
     let mut pending_creates = std::collections::HashMap::new();
-    let (script_jobs, spends) = connect_block_prevouts(
+    let (script_jobs, spends, fees) = assemble_block_prevouts(
         query,
         block,
         ctx,
@@ -328,8 +325,28 @@ pub fn validate_block_connect(
     if check_scripts && !script_jobs.is_empty() {
         verify_scripts_pool(&script_jobs)?;
     }
-    let _ = spends;
+    // Structural: re-walk with durable spentness (fresh pending for this single block).
+    let mut structural_pending = std::collections::HashSet::new();
+    structural_validate_spends(
+        query,
+        block,
+        ctx,
+        archived_tx_fks,
+        None,
+        &spends,
+        fees,
+        &mut structural_pending,
+    )?;
     Ok(())
+}
+
+/// Whether assemble should probe durable spentness / maturity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AssembleMode {
+    /// Resolve prevout content + build script jobs; skip durable spentness/maturity.
+    Optimistic,
+    /// Full connect (legacy one-shot): spentness + maturity during assemble.
+    Full,
 }
 
 /// One non-coinbase tx ready for script/sig verification (prevouts already resolved).
@@ -382,14 +399,16 @@ pub struct ScriptCheckJob {
 
 
 
-/// Sequential connect: resolve prevouts and fee checks; build script jobs.
+/// Sequential assemble: resolve prevout **content**, build script jobs, collect spends.
 ///
-/// Spent outpoints go into `pending_spent` (run-local only) so a failed
-/// script check can drop them without poisoning the next attempt.
+/// [`AssembleMode::Optimistic`] (confirm path): no durable spentness / maturity —
+/// those run in [`structural_validate_spends`] after scripts.
+/// [`AssembleMode::Full`]: spentness + maturity during the walk (tests / legacy).
 ///
-/// `pending_creates` maps outpoints created earlier in this confirm run →
-/// create Class A fk (same-run create→spend).
-pub(crate) fn connect_block_prevouts(
+/// `pending_spent` / `pending_creates`: run-local same-run tracking.
+///
+/// Returns `(script_jobs, spends, fees)` — fees for coinbase subsidy check on structural.
+pub(crate) fn assemble_block_prevouts(
     query: &Query,
     block: &Block,
     ctx: &ValidationContext<'_>,
@@ -407,6 +426,41 @@ pub(crate) fn connect_block_prevouts(
             rbitcoin_primitives::Fk,
             rbitcoin_primitives::Fk,
         )>,
+        i64, // total fees
+    ),
+    ConsensusError,
+> {
+    assemble_block_prevouts_mode(
+        query,
+        block,
+        ctx,
+        archived_tx_fks,
+        wave_prevouts,
+        pending_spent,
+        pending_creates,
+        AssembleMode::Optimistic,
+    )
+}
+
+fn assemble_block_prevouts_mode(
+    query: &Query,
+    block: &Block,
+    ctx: &ValidationContext<'_>,
+    archived_tx_fks: Option<&[rbitcoin_primitives::Fk]>,
+    wave_prevouts: Option<&rbitcoin_query::WavePrevoutCache>,
+    pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
+    pending_creates: &mut std::collections::HashMap<([u8; 32], u32), rbitcoin_primitives::Fk>,
+    mode: AssembleMode,
+) -> Result<
+    (
+        Vec<ScriptCheckJob>,
+        Vec<(
+            [u8; 32],
+            u32,
+            rbitcoin_primitives::Fk,
+            rbitcoin_primitives::Fk,
+        )>,
+        i64,
     ),
     ConsensusError,
 > {
@@ -528,8 +582,12 @@ pub(crate) fn connect_block_prevouts(
                                 .flatten()
                         }
                     });
-                // Spentness: wave filtered live outs; pending covers same-run.
-                if !wave_live && !pending_creates.contains_key(&key) {
+                // Durable spentness: Full mode only. Optimistic defers to structural
+                // after scripts (assumevalid-shaped: scripts need values, not UTXO proof).
+                if mode == AssembleMode::Full
+                    && !wave_live
+                    && !pending_creates.contains_key(&key)
+                {
                     let spent = if let Some(cfk) = prev_fk {
                         let range = query.confirm_parent_cache().get_body_range(cfk);
                         query
@@ -555,12 +613,15 @@ pub(crate) fn connect_block_prevouts(
                     wave_prevouts,
                     &mut coinbase_height_cache,
                 )?;
-                if let Some(created) = prev_out.coinbase_height {
-                    let maturity = ctx.params.coinbase_maturity();
-                    if ctx.height.0 < created.saturating_add(maturity) {
-                        return Err(ConsensusError::BadTx("coinbase immature"));
+                if mode == AssembleMode::Full {
+                    if let Some(created) = prev_out.coinbase_height {
+                        let maturity = ctx.params.coinbase_maturity();
+                        if ctx.height.0 < created.saturating_add(maturity) {
+                            return Err(ConsensusError::BadTx("coinbase immature"));
+                        }
                     }
                 }
+                // Same-run / provisional double-spend tracking (both modes).
                 pending_spent.insert(key);
                 // Prefer create_fk from wave when thin missed (same-wave parent).
                 let create_fk = prev_fk
@@ -629,6 +690,15 @@ pub(crate) fn connect_block_prevouts(
         same_block.insert(txid, ti);
     }
 
+    let _ = LockTime::ZERO;
+    Ok((script_jobs, spends, fees))
+}
+
+fn check_coinbase_subsidy(
+    block: &Block,
+    ctx: &ValidationContext<'_>,
+    fees: i64,
+) -> Result<(), ConsensusError> {
     let subsidy = block_subsidy(ctx.height.0, ctx.params);
     let mut coinbase_out = 0i64;
     for o in &block.txdata[0].output {
@@ -642,9 +712,86 @@ pub(crate) fn connect_block_prevouts(
     if coinbase_out > max_cb {
         return Err(ConsensusError::BadBlock("coinbase excess value"));
     }
+    Ok(())
+}
 
-    let _ = LockTime::ZERO;
-    Ok((script_jobs, spends))
+/// Post-script structural checks: durable spentness, maturity, coinbase subsidy.
+///
+/// Runs in height order on the writeback path (Phase 1: same thread after scripts).
+/// `pending_spent` is writeback-local across a multi-height run.
+pub(crate) fn structural_validate_spends(
+    query: &Query,
+    block: &Block,
+    ctx: &ValidationContext<'_>,
+    archived_tx_fks: Option<&[rbitcoin_primitives::Fk]>,
+    wave_prevouts: Option<&rbitcoin_query::WavePrevoutCache>,
+    spends: &[(
+        [u8; 32],
+        u32,
+        rbitcoin_primitives::Fk,
+        rbitcoin_primitives::Fk,
+    )],
+    fees: i64,
+    pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
+) -> Result<(), ConsensusError> {
+    let mut coinbase_height_cache: std::collections::HashMap<
+        rbitcoin_primitives::Fk,
+        Option<u32>,
+    > = std::collections::HashMap::with_capacity(64);
+    let maturity = ctx.params.coinbase_maturity();
+
+    for &(prev_txid, vout, _spend_fk, create_fk) in spends {
+        let key = (prev_txid, vout);
+        if pending_spent.contains(&key) {
+            return Err(ConsensusError::PrevoutSpent);
+        }
+        // Durable confirmed-strong spender (always re-check; wave is not authority).
+        let spent = if !create_fk.is_null() {
+            let range = query.confirm_parent_cache().get_body_range(create_fk);
+            query
+                .store()
+                .has_confirmed_strong_spender_create(create_fk, vout, range)
+                .map_err(ConsensusError::Store)?
+        } else {
+            query
+                .store()
+                .has_confirmed_strong_spender(&prev_txid, vout)
+                .map_err(ConsensusError::Store)?
+        };
+        if spent {
+            return Err(ConsensusError::PrevoutSpent);
+        }
+        // Coinbase maturity (need create Class A meta).
+        if !create_fk.is_null() {
+            let prev_rec = if let Some(w) = wave_prevouts {
+                w.get_tx(create_fk).cloned()
+            } else {
+                None
+            };
+            let prev_rec = match prev_rec {
+                Some(r) => r,
+                None => query
+                    .get_tx_class_a(create_fk)
+                    .map_err(ConsensusError::Store)?,
+            };
+            let created = coinbase_height_for_maturity(
+                query,
+                create_fk,
+                &prev_rec,
+                wave_prevouts,
+                &mut coinbase_height_cache,
+            )?;
+            if let Some(ch) = created {
+                if ctx.height.0 < ch.saturating_add(maturity) {
+                    return Err(ConsensusError::BadTx("coinbase immature"));
+                }
+            }
+        }
+        pending_spent.insert(key);
+    }
+
+    let _ = archived_tx_fks;
+    check_coinbase_subsidy(block, ctx, fees)
 }
 
 /// Parallel script checks for an owned job slice (preferred entry — no ref `Vec`).

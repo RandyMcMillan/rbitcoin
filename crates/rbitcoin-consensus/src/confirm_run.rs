@@ -1,10 +1,12 @@
 //! Multi-block confirm orchestrator (IBD Class C path).
 //!
-//! Pipeline (order is consensus-critical — do not reorder):
+//! Pipeline (optimistic scripts — assumevalid-shaped):
 //! ```text
 //! resolve_bodies → prewarm_wait → wave_fill → wire_rebuild
-//!   → connect (headers + prevouts) → scripts → class_c
-//!   → utxo_apply (catch-up only)
+//!   → assemble (prevout content + jobs; no durable spentness)
+//!   → scripts (rayon)
+//!   → structural (durable spentness + maturity + subsidy; height-ordered)
+//!   → class_c → spend annotate / tip GC
 //! ```
 //!
 //! **Prewarm ownership:** the IBD background worker loads Class A into
@@ -13,12 +15,12 @@
 //! Unit tests without a worker still call `prewarm_parents_for_heights` once
 //! (sole owner of the load).
 //!
-//! Timers: [`crate::confirm_phase_stats`]. Multi-block order: sequential connect,
-//! one script wave, one Class C run, one UTXO flush.
+//! Timers: [`crate::confirm_phase_stats`]. Multi-block: sequential assemble,
+//! one script wave, structural in height order, one Class C run.
 
 use crate::block::{
-    bip34_height_script, block_has_witness, connect_block_prevouts, ScriptCheckJob,
-    ValidationContext,
+    assemble_block_prevouts, bip34_height_script, block_has_witness, structural_validate_spends,
+    ScriptCheckJob, ValidationContext,
 };
 use crate::error::ConsensusError;
 use crate::header::{median_time_past_times, validate_header};
@@ -43,7 +45,7 @@ struct BodyMeta {
     tx_fks: Vec<rbitcoin_primitives::Fk>,
 }
 
-/// Connect output for one height (held until Class C + spend annotate).
+/// Assemble output for one height (held through scripts → structural → Class C).
 struct Prepared {
     height: Height,
     header_fk: rbitcoin_primitives::Fk,
@@ -57,6 +59,8 @@ struct Prepared {
         rbitcoin_primitives::Fk,
         rbitcoin_primitives::Fk,
     )>,
+    /// Total fees from assemble (for structural coinbase subsidy check).
+    fees: i64,
     check_scripts: bool,
     time: u32,
     bits: bitcoin::CompactTarget,
@@ -67,9 +71,10 @@ struct Prepared {
 /// Confirm a contiguous tip-extension run of archived bodies.
 ///
 /// When archive leads tip (the post-milestone IBD case), a multi-height run:
-/// 1. Connects sequentially (run-local pending spends — no spend poison on failure)
+/// 1. Assembles sequentially (prevout content + jobs; no durable spentness)
 /// 2. Runs **one** rayon script wave across **all** inputs in the run
-/// 3. Class C in height order
+/// 3. Structural spentness/maturity/subsidy in height order
+/// 4. Class C in height order
 ///
 /// Intermediate heights are not yet in `confirmed[]`, so header checks after the
 /// first use the previous block in the run (not `header_at_height`).
@@ -129,8 +134,8 @@ pub fn confirm_archived_run(
     // ── 3. wire_rebuild (reuses wave body decodes — no second Class A parse) ─
     let wire_blocks = wire_rebuild(query, &metas, &mut wave_prevouts)?;
 
-    // ── 4. connect (headers + prevouts; run-local pending) ──────────────────
-    let mut prepared = connect_run(
+    // ── 4. assemble (headers + prevout content + jobs; no durable spentness) ─
+    let mut prepared = assemble_run(
         query,
         params,
         milestone,
@@ -139,14 +144,24 @@ pub fn confirm_archived_run(
         &wave_prevouts,
     )?;
 
-    // ── 5. scripts (one wave for the whole run) ─────────────────────────────
+    // ── 5. scripts first (optimistic; needs values only) ────────────────────
     script_wave(&prepared)?;
 
-    // ── 6. class_c ──────────────────────────────────────────────────────────
+    // ── 6. structural (durable spentness + maturity + subsidy; ordered) ─────
+    structural_run(
+        query,
+        params,
+        milestone,
+        &prepared,
+        &wire_blocks,
+        &wave_prevouts,
+    )?;
+
+    // ── 7. class_c ──────────────────────────────────────────────────────────
     let n_blocks = prepared.len();
     let out = class_c_commit(query, &mut prepared)?;
 
-    // ── 7. utxo_apply (catch-up) + runway unpin/tip GC ───────────────────────
+    // ── 8. spend annotate + runway unpin/tip GC ──────────────────────────────
     post_commit(query, &prepared)?;
 
     confirm_phase_stats::BLOCKS.fetch_add(n_blocks as u64, Ordering::Relaxed);
@@ -365,7 +380,7 @@ fn wire_rebuild(
     Ok(blks)
 }
 
-fn connect_run(
+fn assemble_run(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
@@ -373,6 +388,7 @@ fn connect_run(
     wire_blocks: &[Block],
     wave_prevouts: &rbitcoin_query::WavePrevoutCache,
 ) -> Result<Vec<Prepared>, ConsensusError> {
+    // Provisional same-run double-spend only (not durable spentness).
     let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
     let mut pending_creates: HashMap<([u8; 32], u32), rbitcoin_primitives::Fk> = HashMap::new();
     let mut time_window: Vec<u32> = Vec::with_capacity(11);
@@ -426,7 +442,6 @@ fn connect_run(
         }
 
         // Height-gated structure soft forks (archive prep skipped these).
-        // Core/Inquisition: mainnet BIP34@227931 segwit@481824; signet both @1.
         if params.bip34_active_at(height.0) {
             check_bip34(block, height.0)?;
         }
@@ -442,7 +457,7 @@ fn connect_run(
         }
 
         let t_connect = Instant::now();
-        let (script_jobs, spends) = connect_block_prevouts(
+        let (script_jobs, spends, fees) = assemble_block_prevouts(
             query,
             block,
             &ctx,
@@ -466,6 +481,7 @@ fn connect_run(
             tx_fks: meta.tx_fks,
             jobs: script_jobs,
             spends,
+            fees,
             check_scripts: !milestone.skips_scripts_at(height.0),
             time: block.header.time,
             bits: block.header.bits,
@@ -473,6 +489,35 @@ fn connect_run(
         });
     }
     Ok(prepared)
+}
+
+/// Durable spentness + maturity + subsidy after scripts (height order).
+fn structural_run(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    prepared: &[Prepared],
+    wire_blocks: &[Block],
+    wave_prevouts: &rbitcoin_query::WavePrevoutCache,
+) -> Result<(), ConsensusError> {
+    let t0 = Instant::now();
+    let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
+    for (i, p) in prepared.iter().enumerate() {
+        let ctx = ValidationContext::at(params, p.height, milestone);
+        structural_validate_spends(
+            query,
+            &wire_blocks[i],
+            &ctx,
+            Some(&p.tx_fks),
+            Some(wave_prevouts),
+            &p.spends,
+            p.fees,
+            &mut pending_spent,
+        )?;
+    }
+    confirm_phase_stats::STRUCTURAL_NS
+        .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    Ok(())
 }
 
 fn script_wave(prepared: &[Prepared]) -> Result<(), ConsensusError> {

@@ -121,8 +121,11 @@ pub mod confirm_phase_stats {
     pub static WAVE_FILL_NS: AtomicU64 = AtomicU64::new(0);
     /// Full wire `Block` rebuild from Class A rows.
     pub static RECONSTRUCT_WIRE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Optimistic assemble (prevout content + jobs; no durable spentness).
     pub static CONNECT_NS: AtomicU64 = AtomicU64::new(0);
     pub static SCRIPT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Post-script durable spentness + maturity + subsidy.
+    pub static STRUCTURAL_NS: AtomicU64 = AtomicU64::new(0);
     /// Class C wall (`confirm_blocks_run` total).
     pub static CLASS_C_NS: AtomicU64 = AtomicU64::new(0);
     /// Post–Class C durable spend annotation batch.

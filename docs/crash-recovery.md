@@ -49,5 +49,5 @@ Clean shutdown flushes mmap tables. Kill may lose the last unflushed pages (same
 
 ## Operator
 
-- Indexes off during milestone (`tx.head`, points) are **backfilled** at tip mode when needed.
-- Scripthash is **always** maintained on confirm (thin creates); no disable flag and no recovery backfill — corrupt index ⇒ reindex.
+- Direct IBD keeps **`tx.head`** (archive) and **spend annotations** (confirm) live; tip entry does **not** re-scan Class A to repair them. Corrupt head/spends ⇒ reindex (optional manual `backfill_tx_index` is for future head rehash rebuild, not tip gate).
+- Scripthash: thin creates go to **sorted runs** during Direct; tip **bulk-materializes** durable SH tables. Corrupt durable SH ⇒ reindex.

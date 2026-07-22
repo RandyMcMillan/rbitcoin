@@ -57,11 +57,9 @@ impl Query {
     ///
     /// # Spend annotations
     ///
-    /// When `spend_index` is on, archive already wrote durable spend annotations
-    /// on create outputs (schema v5+). Confirm does **not** re-probe spenders /
-    /// re-append edges: that was O(inputs × spend index) per block and hung tip
-    /// Class C on large signet archives. Gaps from archive-with-spend-off are
-    /// filled by `backfill_point_spends`.
+    /// When `spend_index` is on, durable spend annotations land on create outputs
+    /// (schema v5+). Under Direct IBD, **confirm** batch-writes those annotations
+    /// after Class C (not archive). Tip mode assumes they are already complete.
     pub fn confirm_blocks_run(
         &self,
         items: &[ConfirmPrepared],

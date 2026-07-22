@@ -1177,9 +1177,11 @@ impl TxTable {
 
     /// Ensure durable `tx.head` maps `txid → fk` for every Class A body.
     ///
-    /// Used after milestone IBD (archive with `index=false`) so Electrum
-    /// `transaction.get` / scripthash prevout joins can resolve by txid.
-    /// Idempotent: skips keys already present. Returns number of inserts.
+    /// Rebuild `tx.head` from Class A bodies (idempotent; skips present fks).
+    ///
+    /// Production tip entry does **not** call this — Direct archive keeps head
+    /// live. Retained for **manual rebuild / future address-head rehash** after
+    /// a layout change. Returns number of inserts.
     ///
     /// `on_progress(done_bodies, total_bodies, inserted)` is invoked periodically.
     pub fn backfill_head(

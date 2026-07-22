@@ -517,7 +517,6 @@ fn resume_work_path_sees_archived_bodies_after_reopen() {
 /// - archive bodies out of height order (ahead of tip)
 /// - re-archive / mega-batch duplicate is idempotent (fk + tx_height stable)
 /// - Direct: live `tx.head` + durable spend annotations on confirm
-/// - backfill restores spenders() when points sparse
 /// - coinbase maturity then spend still connects
 #[test]
 fn ibd_parallel_archive_idempotent_confirm_direct() {

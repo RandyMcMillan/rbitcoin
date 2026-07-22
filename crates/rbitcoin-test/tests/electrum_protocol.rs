@@ -138,10 +138,11 @@ async fn electrum_server_version_history_balance() {
     handle.shutdown().await;
 }
 
-/// Milestone-style IBD leaves tx.head / points empty; tip-mode backfill restores them.
-/// Scripthash creates are always written on confirm (not optional / no recovery API).
+/// Direct IBD leaves live `tx.head` + spend annotations; tip only bulk-loads SH.
+/// `backfill_tx_index` stays available (idempotent rebuild / future rehash) but is
+/// not required for tip entry.
 #[test]
-fn backfill_tx_head_and_points_after_index_off() {
+fn direct_indexes_then_sh_bulk_at_tip() {
     use bitcoin::hashes::Hash;
     use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
     use rbitcoin_primitives::Height;
@@ -178,14 +179,9 @@ fn backfill_tx_head_and_points_after_index_off() {
         "txid resolves via live tx.head under Direct"
     );
 
-    // Backfill is idempotent when already dense.
+    // Manual rebuild is idempotent when head is already dense (rehash tool).
     let inserted = q.backfill_tx_index(|_, _, _| {}).unwrap();
-    assert!(inserted <= q.tx_body_count());
-    q.set_tx_index(true);
-    q.set_spend_index(true);
-    let (ph, ptxs) = q.backfill_point_spends(|_, _, _, _| {}).unwrap();
-    assert!(ph <= 6);
-    let _ = ptxs;
+    assert_eq!(inserted, 0, "no missing head entries after Direct");
 
     // Direct IBD keeps SH in runs until tip bulk materialize.
     let n_sh = q.finalize_sh_runs().unwrap();

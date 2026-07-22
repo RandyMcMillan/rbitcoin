@@ -66,11 +66,13 @@ without clearing known flags.
 
 **Index modes:** IBD defaults to **`IndexMode::Direct`**: archive batch-writes
 packed Class A + durable **`tx.head`**; confirm batch-writes **spend annotations**
-after Class C. Scripthash is **not** progressively materialized into heads:
-confirm only enqueues sorted runs (background flush + merge). At tip the node
-**merges remaining runs and cold bulk-loads** durable SH tables before Electrum.
-On enter Direct, leftover `ibd_utxo.map` / `point.runs` / `tx.runs` from old
-Catchup datadirs are removed — prefer a **fresh datadir**.
+after Class C. Those two indexes are **complete before tip** — catch-up must
+finish; tip entry does not backfill them. Scripthash is **not** progressively
+materialized into heads: confirm only enqueues sorted runs (background flush +
+merge). At tip the node **merges remaining runs and cold bulk-loads** durable SH
+tables before Electrum (the only deferred index work). On enter Direct, leftover
+`ibd_utxo.map` / `point.runs` / `tx.runs` from old Catchup datadirs are removed —
+prefer a **fresh datadir**.
 
 New stores (schema **v9**): **header.head** = **single** open-address file (~24 MiB
 pre-size; not 256-way), **scripthash** 16 shards, **tx.head** = single fixed address

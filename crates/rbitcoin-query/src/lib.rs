@@ -641,10 +641,11 @@ impl Query {
         Ok(())
     }
 
-    /// Enable/disable durable point (spend) multimap writes on archive **and** confirm
-    /// (default on). Off during catch-up for speed; re-enable and materialize /
-    /// [`Self::backfill_point_spends`] before Electrum.
+    /// Enable/disable durable spend-annotation writes on archive **and** confirm
+    /// (schema v5 create-out annotations; default on).
     ///
+    /// Direct IBD keeps this **on** (confirm batch after Class C). Tip mode
+    /// assumes annotations are already complete — no automatic backfill.
     pub fn set_spend_index(&self, enabled: bool) {
         self.spend_index
             .store(enabled, std::sync::atomic::Ordering::SeqCst);
@@ -717,10 +718,11 @@ impl Query {
         )
     }
 
-    /// Write durable `tx.head` for every Class A body missing from the hash head.
+    /// Rebuild durable `tx.head` from every Class A body (idempotent).
     ///
-    /// After milestone IBD (`tx_index` off), Electrum and prevout-by-txid need this
-    /// before scripthash backfill / `transaction.get`. Idempotent. Returns inserts.
+    /// **Not** part of tip entry: Direct IBD already writes `tx.head` on archive.
+    /// Kept for **operator / future head rehash rebuild** (scan bodies → insert
+    /// missing mappings). Returns number of inserts performed.
     ///
     /// `on_progress(done_bodies, total_bodies, inserted)` for operator logs.
     pub fn backfill_tx_index(
@@ -745,18 +747,20 @@ impl Query {
         self.store.scripthash.entry_count()
     }
 
-    /// Durable point (spend-edge) count (for backfill heuristics / logs).
-    /// Multi-list node count only (v5 sole spends do not allocate body rows).
+    /// Multi-list spend body node count (diagnostic).
+    ///
+    /// Schema v5 **sole** spends do not allocate multi-list rows, so this is
+    /// often 0 even with full spend annotations — do **not** treat as “points empty.”
     pub fn point_edge_count(&self) -> u64 {
         self.store.spender_list_count()
     }
 
-    /// Write durable point edges for every confirmed non-coinbase input.
+    /// Rewrite durable spend annotations for every confirmed non-coinbase input.
     ///
-    /// After milestone IBD (confirm skipped `put_spend`), Electrum and
-    /// `spenders()` need this. When the point table is empty, uses an append-only
-    /// bulk path (`put_spend_batch`, no `spenders_raw` probe). Otherwise probes
-    /// for idempotency.
+    /// **Not** part of tip entry: Direct IBD already annotates on confirm.
+    /// Manual recovery only (corrupt/partial annotations). Prefer reindex when
+    /// spentness is wrong at scale. When multi-list count is 0, uses bulk
+    /// `put_spend_batch` without probe; otherwise probes for idempotency.
     ///
     /// `on_progress(height, tip, txs_so_far, edges_so_far)`.
     /// Returns `(heights_walked, txs_touched)`.

@@ -365,14 +365,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
 
     // ── Steady state: tip tracking + block relay ────────────────────────────
-    // After catch-up we re-enable indexes that were off for IBD speed, open
-    // long-lived follow peers (inv/headers + announce), and stop thrashing
-    // sequential re-IBD every progress tick (signet log: "retry catch-up"
-    // every 10s forever while already at peer tip).
+    // After true catch-up: SH bulk materialize + IndexMode::Tip, then long-lived
+    // follow peers (inv/headers + announce). `tx.head` and spend annotations are
+    // already correct from Direct IBD — tip entry does not re-scan Class A.
     //
-    // Only when catch_up_complete: mid-chain peer death must leave catch-up
-    // indexes (mmap UTXO / runs) so a restart can resume IBD without a false
-    // tip-mode materialize (mainnet log @161249 / horizon ~958k).
+    // Only when catch_up_complete: mid-chain peer death must not enter tip mode
+    // (would bulk-load SH while still behind horizon).
     if catch_up_complete && !shutdown.requested() {
         enter_tip_mode(&node.hub.query);
         // Tip mode: enable inv/tx accept + announce (P4). Off during IBD by default.
@@ -685,56 +683,19 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     Ok(())
 }
 
-/// Re-enable store indexes that were disabled for IBD speed so tip-follow /
-/// Electrum / spend queries work in steady state.
+/// Enter steady-state tip mode after true catch-up.
 ///
-/// After milestone catch-up, Class A bodies exist but durable `tx.head` and
-/// **point spends** may have been skipped. We **backfill** those here **before
-/// Electrum binds**. Thin scripthash creates are always written on confirm;
-/// no tip-mode SH rebuild (corrupt index ⇒ reindex).
+/// **Preconditions (enforced by IBD, not repaired here):** Direct catch-up already
+/// wrote durable **`tx.head`** (archive) and **spend annotations** (confirm).
+/// Incomplete IBD must not call this (`catch_up_complete` only after full horizon).
+///
+/// **Work here:** the only deferred Direct index is **scripthash** — merge remaining
+/// runs and cold bulk-load durable SH tables, then flip [`IndexMode::Tip`].
+///
+/// No automatic `tx.head` / spend backfill: those paths are recovery tools
+/// ([`Query::backfill_tx_index`] for future head rehash rebuild; spend rewrite is
+/// not part of tip entry). Corrupt head/spends ⇒ reindex, not silent tip repair.
 pub(crate) fn enter_tip_mode(query: &Query) {
-    // Crash recovery: sparse head/points after partial Direct IBD.
-    let bodies = query.tx_body_count();
-    let head_after = query.tx_head_occupied();
-    if bodies > 0 && head_after.saturating_mul(2) < bodies {
-        info!("node: tx.head sparse — Class A backfill…");
-        let t0 = Instant::now();
-        match query.backfill_tx_index(|done, total, inserted| {
-            info!(
-                "node: backfill tx.head progress {done}/{total} bodies (inserted≈{inserted}, elapsed {:?})",
-                t0.elapsed()
-            );
-        }) {
-            Ok(n) => info!(
-                "node: backfill tx.head done inserted={n} in {:?}",
-                t0.elapsed()
-            ),
-            Err(e) => warn!("node: backfill tx.head failed: {e}"),
-        }
-    }
-
-    let tip = query.tip_height().map(|h| h.0).unwrap_or(0);
-    let point_before = query.point_edge_count();
-    if tip > 0 && point_before < tip as u64 {
-        info!(
-            "node: points sparse — Class A backfill (tip={tip}, edges={point_before})…"
-        );
-        let t0 = Instant::now();
-        match query.backfill_point_spends(|h, tip_h, txs, edges| {
-            info!(
-                "node: backfill point spends progress height={h}/{tip_h} txs={txs} edges≈{edges} (elapsed {:?})",
-                t0.elapsed()
-            );
-        }) {
-            Ok((heights, txs)) => info!(
-                "node: backfill point spends done heights={heights} txs={txs} edges_now={} in {:?}",
-                query.point_edge_count(),
-                t0.elapsed()
-            ),
-            Err(e) => warn!("node: backfill point spends failed: {e}"),
-        }
-    }
-
     // SH: Direct IBD only flush/merges runs; tip does cold bulk-load.
     info!("node: scripthash bulk materialize from runs (merge + cold load)…");
     match query.finalize_sh_runs() {
@@ -742,18 +703,17 @@ pub(crate) fn enter_tip_mode(query: &Query) {
         Err(e) => warn!("node: scripthash bulk materialize failed: {e}"),
     }
 
-    // Tip-follow: durable indexes on (write-through; low rate). Spentness = points.
     query.enter_tip_index_mode();
     info!(
-        "node: IndexMode::Tip (spend=on tx_head=on scripthash=on) mode={:?}",
+        "node: IndexMode::Tip (tx.head + spend annotations already live; SH durable) mode={:?}",
         query.index_mode()
     );
     info!(
-        "node: scripthash rows={} (thin creates; spentness via points)",
+        "node: scripthash rows={} (thin creates from runs; spentness = confirmed-strong annotations)",
         query.scripthash_entry_count()
     );
 
-    info!("node: tip-mode index build complete — safe to start Electrum");
+    info!("node: tip-mode complete — safe to start Electrum");
 }
 
 #[cfg(test)]

@@ -98,8 +98,10 @@ impl Query {
         need: &mut [(Fk, Vec<TxApply>)],
     ) -> Result<(), QueryError> {
         use std::collections::{HashMap, HashSet};
+        use std::time::Instant;
 
         let mut next_tx = self.store.txs.count() + 1;
+        let n_headers = need.iter().filter(|(_, t)| !t.is_empty()).count() as u64;
 
         // Pass 1: assign create fks + build batch_map (txid → create_fk).
         let mut batch_map: HashMap<[u8; 32], Fk> = HashMap::new();
@@ -136,6 +138,7 @@ impl Query {
         }
 
         // Pass 2: unique external prev_txids that still need fk.
+        let t_resolve = Instant::now();
         let mut need_external: HashSet<[u8; 32]> = HashSet::new();
         for (_sfk, _tx, inputs, _) in &work {
             for inp in inputs {
@@ -155,6 +158,7 @@ impl Query {
         // Sticky (committed prior batches) then durable head for misses.
         let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
         let sticky_hits = self.archive_txid_sticky.lookup_batch(&need_vec);
+        let sticky_hit_n = sticky_hits.len() as u64;
         let mut resolved: HashMap<[u8; 32], Fk> = sticky_hits;
         let mut need_head: Vec<[u8; 32]> = Vec::new();
         for t in &need_vec {
@@ -162,6 +166,8 @@ impl Query {
                 need_head.push(*t);
             }
         }
+        let head_need_n = need_head.len() as u64;
+        let mut head_hit_n = 0u64;
 
         if !need_head.is_empty() {
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
@@ -169,13 +175,17 @@ impl Query {
             for (txid, fk_opt) in hits {
                 if let Some(fk) = fk_opt {
                     resolved.insert(txid, fk);
+                    head_hit_n = head_hit_n.saturating_add(1);
                 }
             }
         }
+        let resolve_ns = t_resolve.elapsed().as_nanos() as u64;
 
         // Pass 3: stamp create_fk on inputs; tip spends list.
         let mut packed: Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> =
             Vec::with_capacity(work.len());
+        let mut batch_stamp = 0u64;
+        let mut resolved_stamp = 0u64;
         for (tx_fk, tx, mut inputs, outputs) in work {
             for (i, inp) in inputs.iter_mut().enumerate() {
                 if inp.is_coinbase() {
@@ -184,14 +194,17 @@ impl Query {
                     continue;
                 }
                 if inp.create_fk.is_null() {
-                    let cfk = batch_map
-                        .get(&inp.prev_txid)
-                        .copied()
-                        .or_else(|| resolved.get(&inp.prev_txid).copied())
-                        .ok_or(StoreError::Corrupt(
+                    if let Some(&cfk) = batch_map.get(&inp.prev_txid) {
+                        inp.create_fk = cfk;
+                        batch_stamp = batch_stamp.saturating_add(1);
+                    } else if let Some(&cfk) = resolved.get(&inp.prev_txid) {
+                        inp.create_fk = cfk;
+                        resolved_stamp = resolved_stamp.saturating_add(1);
+                    } else {
+                        return Err(StoreError::Corrupt(
                             "archive: parent create_fk unresolved (contiguous batch required)",
-                        ))?;
-                    inp.create_fk = cfk;
+                        ));
+                    }
                 }
                 if archive_spends {
                     spends.push((inp.prev_txid, inp.prev_index, tx_fk, i as u32));
@@ -199,6 +212,16 @@ impl Query {
             }
             packed.push((tx, inputs, outputs));
         }
+        crate::archive_resolve_stats::note(
+            n_headers,
+            need_vec.len() as u64,
+            sticky_hit_n,
+            head_need_n,
+            head_hit_n,
+            batch_stamp,
+            resolved_stamp,
+            resolve_ns,
+        );
 
         let body_est: u64 = packed
             .iter()

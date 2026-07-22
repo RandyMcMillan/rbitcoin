@@ -91,11 +91,23 @@ pub enum HeadScale {
     Mainnet,
 }
 
+/// True when this process is a `cargo test` binary (`target/*/deps/*`).
+fn running_as_cargo_test_binary() -> bool {
+    std::env::current_exe()
+        .ok()
+        .map(|p| {
+            let s = p.to_string_lossy();
+            // Unix + Windows deps layout for cargo test executables.
+            s.contains("/deps/") || s.contains("\\deps\\")
+        })
+        .unwrap_or(false)
+}
+
 impl HeadScale {
     /// Resolve from `RBITCOIN_HEAD_SCALE` (`tiny`/`test`/`mainnet`/`full`).
     ///
-    /// Default: [`HeadScale::Mainnet`] in normal builds; [`HeadScale::Tiny`] when
-    /// this crate is compiled with `cfg(test)` so unit tests stay small.
+    /// Default: [`HeadScale::Mainnet`] for normal binaries; [`HeadScale::Tiny`]
+    /// when this crate is under `cfg(test)` or the process is a cargo test binary.
     pub fn from_env() -> Self {
         match std::env::var("RBITCOIN_HEAD_SCALE")
             .map(|s| s.to_ascii_lowercase())
@@ -111,7 +123,10 @@ impl HeadScale {
                 HeadScale::Mainnet
             }
             None => {
-                if cfg!(test) {
+                // Tiny for unit tests of this crate, and for cargo test binaries
+                // (they live under target/*/deps/; store is a non-test dep so
+                // cfg!(test) is false there — without this, 8 GiB mainnet heads).
+                if cfg!(test) || running_as_cargo_test_binary() {
                     HeadScale::Tiny
                 } else {
                     HeadScale::Mainnet

@@ -158,15 +158,15 @@ impl Default for IbdConfig {
 }
 
 impl IbdConfig {
-    /// Smaller window for tests.
+    /// Smaller window / short dials for tests (no multi-second connect stalls).
     pub fn for_test() -> Self {
         Self {
             window: 32,
             per_peer: 8,
             target_peers: 4,
-            stall: Duration::from_secs(10),
+            stall: Duration::from_secs(3),
             headers_batch: MAX_HEADERS_RESULTS,
-            connect_timeout: Duration::from_secs(3),
+            connect_timeout: Duration::from_millis(400),
             peers: None,
         }
     }
@@ -904,6 +904,7 @@ pub async fn ibd_cancellable(
                 mlock_n,
                 mlock_bytes,
                 hub.query.scripthash_run_count(),
+                hub.query.archive_txid_sticky_stats(),
             );
             perf_log::log_sample(&perf);
 

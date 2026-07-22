@@ -45,6 +45,15 @@ impl ArchiveTxidSticky {
         Self::new(archive_txid_sticky_cap_from_env())
     }
 
+    /// Current entries (for IBD diagnostics).
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().map.len()
+    }
+
+    pub fn cap(&self) -> usize {
+        self.inner.lock().unwrap().cap
+    }
+
     pub fn insert(&self, txid: [u8; 32], fk: Fk) {
         if fk.is_null() {
             return;

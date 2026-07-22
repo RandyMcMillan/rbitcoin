@@ -165,6 +165,19 @@ pub(crate) struct IbdPerfSample {
     pub pw_edge_head: u64,
     pub pw_edge_cb: u64,
 
+    // Archive create_fk resolve (window)
+    pub arch_ext_need: u64,
+    pub arch_sticky_hit: u64,
+    pub arch_head_need: u64,
+    pub arch_head_hit: u64,
+    pub arch_batch_stamp: u64,
+    pub arch_resolved_stamp: u64,
+    pub arch_resolve_ns: u64,
+    pub arch_resolve_blocks: u64,
+    /// Live sticky map size (not window-reset).
+    pub arch_sticky_len: usize,
+    pub arch_sticky_cap: usize,
+
     // Pipe
     pub pipe: ArchivePipelineSample,
 }
@@ -286,6 +299,16 @@ impl Default for IbdPerfSample {
             pw_edge_runway: 0,
             pw_edge_head: 0,
             pw_edge_cb: 0,
+            arch_ext_need: 0,
+            arch_sticky_hit: 0,
+            arch_head_need: 0,
+            arch_head_hit: 0,
+            arch_batch_stamp: 0,
+            arch_resolved_stamp: 0,
+            arch_resolve_ns: 0,
+            arch_resolve_blocks: 0,
+            arch_sticky_len: 0,
+            arch_sticky_cap: 0,
             pipe: ArchivePipelineSample::default(),
         }
     }
@@ -316,6 +339,8 @@ pub(crate) fn sample(
     mlock_ranges: usize,
     mlock_bytes: u64,
     sh_runs: usize,
+    // Live archive sticky (len, cap).
+    arch_sticky: (usize, usize),
 ) -> IbdPerfSample {
     let hot = loop_stats.sample_and_reset();
     let (
@@ -348,8 +373,10 @@ pub(crate) fn sample(
         rbitcoin_query::wave_fill_stats::sample_counts_and_reset();
     let (pwh, pca, psm) = rbitcoin_query::connect_prevout_stats::sample_and_reset();
     let pw = rbitcoin_query::parent_prewarm_stats::sample_and_reset();
+    let arch_res = rbitcoin_query::archive_resolve_stats::sample_and_reset();
     let pipe = pipe_stats.sample_and_reset();
     let (pw_ready_through, pw_ahead, pw_parents, pw_bodies, pw_plans, pw_depth) = prewarm;
+    let (arch_sticky_len, arch_sticky_cap) = arch_sticky;
 
     IbdPerfSample {
         inflight,
@@ -466,6 +493,16 @@ pub(crate) fn sample(
         pw_edge_runway: pw.edge_runway,
         pw_edge_head: pw.edge_head,
         pw_edge_cb: pw.edge_coinbase,
+        arch_ext_need: arch_res.ext_need,
+        arch_sticky_hit: arch_res.sticky_hit,
+        arch_head_need: arch_res.head_need,
+        arch_head_hit: arch_res.head_hit,
+        arch_batch_stamp: arch_res.batch_stamp,
+        arch_resolved_stamp: arch_res.resolved_stamp,
+        arch_resolve_ns: arch_res.resolve_ns,
+        arch_resolve_blocks: arch_res.blocks,
+        arch_sticky_len,
+        arch_sticky_cap,
         pipe,
     }
 }
@@ -679,8 +716,18 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let idle = s.pipe.write_idle_ms();
     let total_w = busy.saturating_add(idle).max(1);
     let writer_busy_pct = (100 * busy) / total_w;
+    let resolve_us_blk = if s.arch_resolve_blocks > 0 {
+        (s.arch_resolve_ns / s.arch_resolve_blocks) / 1000
+    } else {
+        0
+    };
+    let sticky_pct = if s.arch_ext_need > 0 {
+        (100 * s.arch_sticky_hit) / s.arch_ext_need
+    } else {
+        0
+    };
     out.push_str(&format!(
-        " | pipe prep_us/blk={} prep_blks={} write_us/blk={} write_blks={} batch_avg={} writer_busy%={} idle_ms={} coalesce_ms={} prep_ms={}",
+        " | pipe prep_us/blk={} prep_blks={} write_us/blk={} write_blks={} batch_avg={} writer_busy%={} idle_ms={} coalesce_ms={} prep_ms={} | arch_res resolve_us/blk={} ext={} sticky={}/{} ({}%) head={}/{} stamp batch={} res={} sticky_map={}/{}",
         s.pipe.prep_us_per_block(),
         s.pipe.prep_blocks,
         s.pipe.write_us_per_block(),
@@ -690,6 +737,17 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         idle,
         s.pipe.write_coalesce_ms(),
         s.pipe.prep_ms(),
+        resolve_us_blk,
+        s.arch_ext_need,
+        s.arch_sticky_hit,
+        s.arch_ext_need,
+        sticky_pct,
+        s.arch_head_hit,
+        s.arch_head_need,
+        s.arch_batch_stamp,
+        s.arch_resolved_stamp,
+        s.arch_sticky_len,
+        s.arch_sticky_cap,
     ));
     out.push_str(&format!(
         " | loop confirm_blks={} confirm_us/blk={} reject_stops={} events={} status_scan_ms={}",
@@ -807,6 +865,8 @@ mod tests {
         assert!(line.contains("creates=50"), "{line}");
         assert!(line.contains("body_io=200 parent_io=50"), "{line}");
         assert!(line.contains("mlock=16MiB ranges=4 sh_runs=2"), "{line}");
+        assert!(line.contains("arch_res resolve_us/blk="), "{line}");
+        assert!(line.contains("sticky_map="), "{line}");
         assert!(!line.contains("reserved"), "{line}");
         assert!(!line.contains("pause_fetch"), "{line}");
         assert!(line.contains("pipe "), "{line}");

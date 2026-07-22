@@ -204,6 +204,93 @@ pub mod parent_prewarm_stats {
     }
 }
 
+/// Archive create_fk resolve counters (reset by the IBD ~5s sampler).
+///
+/// Phase 1.5: decide whether sticky/head still matter and that archive is not
+/// the long pole — compare head need vs sticky and resolve_ns vs write_ns.
+pub mod archive_resolve_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Headers (blocks) packed this window.
+    pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
+    /// Unique external prev_txids that needed resolve (not same-batch / coinbase).
+    pub static EXT_NEED: AtomicU64 = AtomicU64::new(0);
+    /// Of EXT_NEED, hits in writer sticky (before head).
+    pub static STICKY_HIT: AtomicU64 = AtomicU64::new(0);
+    /// Sticky misses probed on durable tx.head.
+    pub static HEAD_NEED: AtomicU64 = AtomicU64::new(0);
+    /// Head probes that returned a create_fk.
+    pub static HEAD_HIT: AtomicU64 = AtomicU64::new(0);
+    /// Non-coinbase inputs stamped from same-mega-batch map.
+    pub static BATCH_STAMP: AtomicU64 = AtomicU64::new(0);
+    /// Non-coinbase inputs stamped from sticky/head resolve map.
+    pub static RESOLVED_STAMP: AtomicU64 = AtomicU64::new(0);
+    /// Wall ns of resolve (sticky + head) only, not body put.
+    pub static RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct Sample {
+        pub blocks: u64,
+        pub ext_need: u64,
+        pub sticky_hit: u64,
+        pub head_need: u64,
+        pub head_hit: u64,
+        pub batch_stamp: u64,
+        pub resolved_stamp: u64,
+        pub resolve_ns: u64,
+    }
+
+    pub fn sample_and_reset() -> Sample {
+        Sample {
+            blocks: BLOCKS.swap(0, Ordering::Relaxed),
+            ext_need: EXT_NEED.swap(0, Ordering::Relaxed),
+            sticky_hit: STICKY_HIT.swap(0, Ordering::Relaxed),
+            head_need: HEAD_NEED.swap(0, Ordering::Relaxed),
+            head_hit: HEAD_HIT.swap(0, Ordering::Relaxed),
+            batch_stamp: BATCH_STAMP.swap(0, Ordering::Relaxed),
+            resolved_stamp: RESOLVED_STAMP.swap(0, Ordering::Relaxed),
+            resolve_ns: RESOLVE_NS.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn note(
+        blocks: u64,
+        ext_need: u64,
+        sticky_hit: u64,
+        head_need: u64,
+        head_hit: u64,
+        batch_stamp: u64,
+        resolved_stamp: u64,
+        resolve_ns: u64,
+    ) {
+        if blocks > 0 {
+            BLOCKS.fetch_add(blocks, Ordering::Relaxed);
+        }
+        if ext_need > 0 {
+            EXT_NEED.fetch_add(ext_need, Ordering::Relaxed);
+        }
+        if sticky_hit > 0 {
+            STICKY_HIT.fetch_add(sticky_hit, Ordering::Relaxed);
+        }
+        if head_need > 0 {
+            HEAD_NEED.fetch_add(head_need, Ordering::Relaxed);
+        }
+        if head_hit > 0 {
+            HEAD_HIT.fetch_add(head_hit, Ordering::Relaxed);
+        }
+        if batch_stamp > 0 {
+            BATCH_STAMP.fetch_add(batch_stamp, Ordering::Relaxed);
+        }
+        if resolved_stamp > 0 {
+            RESOLVED_STAMP.fetch_add(resolved_stamp, Ordering::Relaxed);
+        }
+        if resolve_ns > 0 {
+            RESOLVE_NS.fetch_add(resolve_ns, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Class C sub-phase wall times (nanoseconds; reset by the IBD sampler).
 ///
 /// Split so logs can tell strong/height vs scripthash puts vs tip commit.
@@ -609,6 +696,14 @@ impl Query {
     pub fn tx_index_enabled(&self) -> bool {
         self.tx_index
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Archive writer sticky map occupancy `(len, cap)` for IBD diagnostics.
+    pub fn archive_txid_sticky_stats(&self) -> (usize, usize) {
+        (
+            self.archive_txid_sticky.len(),
+            self.archive_txid_sticky.cap(),
+        )
     }
 
     /// Write durable `tx.head` for every Class A body missing from the hash head.

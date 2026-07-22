@@ -220,7 +220,7 @@ impl Query {
         }
         Ok(prevouts
             .first()
-            .is_some_and(|(t, v)| *t == [0u8; 32] && *v == 0xffff_ffff))
+            .is_some_and(|(fk, v)| fk.is_null() && *v == 0xffff_ffff))
     }
 
     /// External parent: only the needed vouts (no full dense outs / no inputs).
@@ -265,6 +265,14 @@ impl Query {
             if inp.is_coinbase() {
                 edges.push(ThinInput {
                     create_fk: None,
+                    prev_index: inp.prev_index,
+                });
+                continue;
+            }
+            // v10: prefer stamped create_fk (no head / by_txid).
+            if !inp.create_fk.is_null() {
+                edges.push(ThinInput {
+                    create_fk: inp.create_fk.get(),
                     prev_index: inp.prev_index,
                 });
                 continue;
@@ -397,7 +405,8 @@ impl Query {
 
     /// Reconstruct a consensus `Transaction` from Class A rows (no stored raw).
     pub fn reconstruct_tx(&self, tx_fk: Fk) -> Result<Transaction, QueryError> {
-        let (rec, stored_outputs, stored_inputs) = self.load_body_prewarmed(tx_fk)?;
+        let (rec, stored_outputs, mut stored_inputs) = self.load_body_prewarmed(tx_fk)?;
+        self.fill_input_prev_txids(&mut stored_inputs)?;
         Ok(Self::transaction_from_class_a(
             rec,
             stored_outputs,
@@ -410,6 +419,8 @@ impl Query {
         stored_outputs: Vec<OutputRecord>,
         stored_inputs: Vec<InputRecord>,
     ) -> Transaction {
+        // Soft prev_txid may be zero after disk decode — fill from create body below
+        // only when caller used fill_input_prev_txids first. Prefer non-zero soft.
         let mut input = Vec::with_capacity(stored_inputs.len());
         for inp in stored_inputs {
             let prev_txid = inp.prev_txid;
@@ -439,6 +450,27 @@ impl Query {
             input,
             output,
         }
+    }
+
+    /// Fill soft `prev_txid` on inputs from each create body (schema v10).
+    pub(crate) fn fill_input_prev_txids(
+        &self,
+        inputs: &mut [InputRecord],
+    ) -> Result<(), QueryError> {
+        for inp in inputs.iter_mut() {
+            if inp.is_coinbase() {
+                inp.prev_txid = [0u8; 32];
+                continue;
+            }
+            if inp.prev_txid != [0u8; 32] {
+                continue;
+            }
+            if inp.create_fk.is_null() {
+                return Err(StoreError::Corrupt("input missing create_fk for wire rebuild"));
+            }
+            inp.prev_txid = self.store.txs.body_txid(inp.create_fk)?;
+        }
+        Ok(())
     }
 
     /// Consensus-encoded wire bytes for a stored tx (Electrum / RPC).
@@ -489,7 +521,8 @@ impl Query {
         let mut txdata = Vec::with_capacity(tx_fks.len());
         for fk in tx_fks {
             if let Some(w) = wave.as_deref_mut() {
-                if let Some((tx, outs, ins)) = w.take_body_wire(fk) {
+                if let Some((tx, outs, mut ins)) = w.take_body_wire(fk) {
+                    self.fill_input_prev_txids(&mut ins)?;
                     txdata.push(Self::transaction_from_class_a(tx, outs, ins));
                     continue;
                 }

@@ -197,17 +197,20 @@ pub fn decode_output_run_prefix(
     Ok((out, off))
 }
 
-/// Class A input + BIP141 witness (addressed via `tx.input_start_fk` run + local i).
+/// Class A input + BIP141 witness (schema v10).
 ///
-/// Prevout encoding (on disk):
-/// - coinbase: `NULL_PREV`
-/// - non-coinbase: full `prev_txid[32]` + CompactSize `vout`
+/// On-disk prevout:
+/// - coinbase: `NULL_PREV` (no payload)
+/// - non-coinbase: **`create_fk:u64` LE** + CompactSize `vout` (not prev_txid)
 ///
-/// No local `prev_tx_fk` on Class A: catch-up resolves create fk via light UTXO;
-/// tip mode uses durable points / `tx.head`.
+/// [`Self::prev_txid`] is a soft cache for wire rebuild (zeros until filled from
+/// the create body or from the wire convert path). Encoding never writes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputRecord {
+    /// Soft: wire txid of parent create (`[0;32]` if unknown / coinbase).
     pub prev_txid: [u8; 32],
+    /// Dense Class A fk of parent create; [`Fk::NULL`] for coinbase.
+    pub create_fk: Fk,
     pub prev_index: u32,
     pub sequence: u32,
     pub script_sig: Vec<u8>,
@@ -217,11 +220,23 @@ pub struct InputRecord {
 
 impl InputRecord {
     pub fn is_coinbase(&self) -> bool {
-        self.prev_txid == [0u8; 32] && self.prev_index == u32::MAX
+        self.create_fk.is_null() && self.prev_index == u32::MAX
+    }
+
+    /// Coinbase null prevout.
+    pub fn coinbase(sequence: u32, script_sig: Vec<u8>, witness: Vec<Vec<u8>>) -> Self {
+        Self {
+            prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
+            prev_index: u32::MAX,
+            sequence,
+            script_sig,
+            witness,
+        }
     }
 
     pub fn encode_into(&self, out: &mut Vec<u8>) {
-        let null_prev = self.is_coinbase();
+        let null_prev = self.create_fk.is_null() && self.prev_index == u32::MAX;
         let mut flags = 0u8;
         if self.sequence == u32::MAX {
             flags |= input_flags::SEQ_FINAL;
@@ -239,7 +254,11 @@ impl InputRecord {
         if null_prev {
             // nothing
         } else {
-            out.extend_from_slice(&self.prev_txid);
+            debug_assert!(
+                !self.create_fk.is_null(),
+                "non-coinbase input requires create_fk before encode"
+            );
+            out.extend_from_slice(&self.create_fk.0.to_le_bytes());
             write_compact_size(out, u64::from(self.prev_index));
         }
         if flags & input_flags::SEQ_FINAL == 0 {
@@ -264,33 +283,37 @@ impl InputRecord {
         out
     }
 
-    /// Walk one input: return `(prev_txid, prev_index, bytes_consumed)` without
-    /// allocating `script_sig` / `witness` (prewarm parent discovery).
-    pub fn decode_prevout_at(buf: &[u8]) -> Result<([u8; 32], u32, usize), StoreError> {
+    /// Skip past one input after reading create_fk + vout (no script/witness alloc).
+    ///
+    /// Returns `(create_fk, prev_index, bytes_consumed)`. Coinbase → `(NULL, u32::MAX, …)`.
+    pub fn decode_prevout_at(buf: &[u8]) -> Result<(Fk, u32, usize), StoreError> {
         if buf.is_empty() {
             return Err(StoreError::Corrupt("short input record"));
         }
         let flags = buf[0];
         let mut off = 1usize;
-        if flags & input_flags::LOCAL_PREV != 0 {
+        if flags & input_flags::RESERVED4 != 0 {
             return Err(StoreError::Corrupt(
-                "input LOCAL_PREV removed; re-archive Class A (use external prev_txid)",
+                "input reserved flag set (wipe datadir for schema v10)",
             ));
         }
-        let (prev_txid, prev_index) = if flags & input_flags::NULL_PREV != 0 {
-            ([0u8; 32], u32::MAX)
+        let (create_fk, prev_index) = if flags & input_flags::NULL_PREV != 0 {
+            (Fk::NULL, u32::MAX)
         } else {
-            if buf.len() < off + 32 {
-                return Err(StoreError::Corrupt("input prev_txid truncated"));
+            if buf.len() < off + 8 {
+                return Err(StoreError::Corrupt("input create_fk truncated"));
             }
-            let prev_txid: [u8; 32] = buf[off..off + 32].try_into().unwrap();
-            off += 32;
+            let id = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+            off += 8;
+            if id == 0 {
+                return Err(StoreError::Corrupt("non-coinbase create_fk is null"));
+            }
             let (vout, n) = read_compact_size(&buf[off..])?;
             off += n;
             if vout > u64::from(u32::MAX) {
                 return Err(StoreError::Corrupt("prev_index too large"));
             }
-            (prev_txid, vout as u32)
+            (Fk(id), vout as u32)
         };
         if flags & input_flags::SEQ_FINAL == 0 {
             if buf.len() < off + 4 {
@@ -320,35 +343,40 @@ impl InputRecord {
                 off += ilen;
             }
         }
-        Ok((prev_txid, prev_index, off))
+        Ok((create_fk, prev_index, off))
     }
 
     /// Decode one input; returns (record, bytes_consumed).
+    ///
+    /// `prev_txid` is left zero; fill from create body when wire needs it.
     pub fn decode_at(buf: &[u8]) -> Result<(Self, usize), StoreError> {
         if buf.is_empty() {
             return Err(StoreError::Corrupt("short input record"));
         }
         let flags = buf[0];
         let mut off = 1usize;
-        if flags & input_flags::LOCAL_PREV != 0 {
+        if flags & input_flags::RESERVED4 != 0 {
             return Err(StoreError::Corrupt(
-                "input LOCAL_PREV removed; re-archive Class A (use external prev_txid)",
+                "input reserved flag set (wipe datadir for schema v10)",
             ));
         }
-        let (prev_txid, prev_index) = if flags & input_flags::NULL_PREV != 0 {
-            ([0u8; 32], u32::MAX)
+        let (create_fk, prev_index) = if flags & input_flags::NULL_PREV != 0 {
+            (Fk::NULL, u32::MAX)
         } else {
-            if buf.len() < off + 32 {
-                return Err(StoreError::Corrupt("input prev_txid truncated"));
+            if buf.len() < off + 8 {
+                return Err(StoreError::Corrupt("input create_fk truncated"));
             }
-            let prev_txid: [u8; 32] = buf[off..off + 32].try_into().unwrap();
-            off += 32;
+            let id = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+            off += 8;
+            if id == 0 {
+                return Err(StoreError::Corrupt("non-coinbase create_fk is null"));
+            }
             let (vout, n) = read_compact_size(&buf[off..])?;
             off += n;
             if vout > u64::from(u32::MAX) {
                 return Err(StoreError::Corrupt("prev_index too large"));
             }
-            (prev_txid, vout as u32)
+            (Fk(id), vout as u32)
         };
         let sequence = if flags & input_flags::SEQ_FINAL != 0 {
             u32::MAX
@@ -393,7 +421,8 @@ impl InputRecord {
         };
         Ok((
             Self {
-                prev_txid,
+                prev_txid: [0u8; 32],
+                create_fk,
                 prev_index,
                 sequence,
                 script_sig,
@@ -412,8 +441,8 @@ impl InputRecord {
     }
 
     pub fn encoded_len(&self) -> usize {
-        // upper bound for reserve estimates
-        1 + 32 + 9 + 9 + 4 + 9 + self.script_sig.len() + 9
+        // flags + create_fk(8) + vout + sequence + script + witness (upper bound)
+        1 + 8 + 9 + 4 + 9 + self.script_sig.len() + 9
             + self.witness.iter().map(|i| 9 + i.len()).sum::<usize>()
     }
 }
@@ -502,10 +531,12 @@ pub fn decode_packed_tx(
     Ok((meta, inputs, outputs))
 }
 
-/// Packed meta + input prevouts only (skip scripts, witnesses, and outputs).
+/// Packed meta + input create edges only (skip scripts, witnesses, and outputs).
+///
+/// Each edge is `(create_fk, vout)`; coinbase → `(Fk::NULL, u32::MAX)`.
 pub fn scan_packed_meta_and_prevouts(
     raw: &[u8],
-) -> Result<(TxRecord, Vec<([u8; 32], u32)>), StoreError> {
+) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
     if raw.first().copied() != Some(PACKED_TX_V1) {
         return Err(StoreError::Corrupt("not a packed Class A tx"));
     }
@@ -516,9 +547,9 @@ pub fn scan_packed_meta_and_prevouts(
     let mut off = 1 + TxRecord::ENCODED_LEN;
     let mut prevouts = Vec::with_capacity(meta.input_count as usize);
     for _ in 0..meta.input_count {
-        let (prev_txid, prev_index, used) = InputRecord::decode_prevout_at(&raw[off..])?;
+        let (create_fk, prev_index, used) = InputRecord::decode_prevout_at(&raw[off..])?;
         off += used;
-        prevouts.push((prev_txid, prev_index));
+        prevouts.push((create_fk, prev_index));
     }
     let _ = off;
     Ok((meta, prevouts))
@@ -640,7 +671,7 @@ impl TxTable {
     pub fn get_meta_and_prevouts(
         &self,
         fk: Fk,
-    ) -> Result<(TxRecord, Vec<([u8; 32], u32)>), StoreError> {
+    ) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
         self.body.with_raw(fk, |raw| scan_packed_meta_and_prevouts(raw))
     }
 
@@ -659,7 +690,7 @@ impl TxTable {
         &self,
         offset: u64,
         len: u64,
-    ) -> Result<(TxRecord, Vec<([u8; 32], u32)>), StoreError> {
+    ) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
         self.body
             .with_bytes_at(offset, len, |raw| scan_packed_meta_and_prevouts(raw))
     }
@@ -717,7 +748,10 @@ impl TxTable {
     }
 
     /// Read Class A body txid only (packed prefix or bare TxRecord).
-    fn body_txid(&self, fk: Fk) -> Result<[u8; 32], StoreError> {
+    ///
+    /// Public for wire rebuild / archive sticky: schema v10 inputs store
+    /// `create_fk` only; callers fill soft `prev_txid` from the create body.
+    pub fn body_txid(&self, fk: Fk) -> Result<[u8; 32], StoreError> {
         let raw = self.body.get_raw(fk)?;
         if raw.first().copied() == Some(PACKED_TX_V1) {
             if raw.len() < 1 + 32 {
@@ -1236,20 +1270,43 @@ mod tests {
     fn decode_prevout_at_skips_script_and_witness() {
         let rec = InputRecord {
             prev_txid: [9u8; 32],
+            create_fk: Fk(1),
             prev_index: 3,
             sequence: 0xffff_fffe,
             script_sig: vec![0xab; 40],
             witness: vec![vec![0x30; 70], vec![0x21; 33]],
         };
         let enc = rec.encode();
-        let (txid, vout, used) = InputRecord::decode_prevout_at(&enc).unwrap();
-        assert_eq!(txid, [9u8; 32]);
+        let (cfk, vout, used) = InputRecord::decode_prevout_at(&enc).unwrap();
+        assert_eq!(cfk, Fk(1));
         assert_eq!(vout, 3);
         assert_eq!(used, enc.len());
         // Full decode still matches.
         let (full, used2) = InputRecord::decode_at(&enc).unwrap();
         assert_eq!(used2, used);
         assert_eq!(full.script_sig.len(), 40);
+    }
+
+    /// v10: non-coinbase prev is create_fk(8) + vout, not prev_txid(32) (−24 B).
+    #[test]
+    fn input_encode_create_fk_not_prev_txid() {
+        let rec = InputRecord {
+            prev_txid: [0xaa; 32], // soft only — not on disk
+            create_fk: Fk(42),
+            prev_index: 7,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        };
+        let enc = rec.encode();
+        // flags(1) + create_fk(8) + compact vout(1 for 7) = 10
+        assert_eq!(enc.len(), 10, "enc={:?}", enc);
+        // v9 would have been flags + 32-byte txid + vout = 34 for same case
+        assert!(enc.len() + 24 <= 34);
+        let dec = InputRecord::decode(&enc).unwrap();
+        assert_eq!(dec.create_fk, Fk(42));
+        assert_eq!(dec.prev_index, 7);
+        assert_eq!(dec.prev_txid, [0u8; 32]);
     }
 
     #[test]
@@ -1266,6 +1323,7 @@ mod tests {
         let inputs = vec![
             InputRecord {
                 prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
                 prev_index: u32::MAX,
                 sequence: u32::MAX,
                 script_sig: vec![0x01],
@@ -1273,6 +1331,7 @@ mod tests {
             },
             InputRecord {
                 prev_txid: [3u8; 32],
+            create_fk: Fk(1),
                 prev_index: 1,
                 sequence: u32::MAX,
                 script_sig: vec![],
@@ -1285,8 +1344,8 @@ mod tests {
         let (meta, prevouts) = scan_packed_meta_and_prevouts(&raw).unwrap();
         assert_eq!(meta.txid, [7u8; 32]);
         assert_eq!(prevouts.len(), 2);
-        assert_eq!(prevouts[0], ([0u8; 32], u32::MAX));
-        assert_eq!(prevouts[1], ([3u8; 32], 1));
+        assert_eq!(prevouts[0], (Fk::NULL, u32::MAX));
+        assert_eq!(prevouts[1], (Fk(1), 1));
     }
 
     #[test]
@@ -1302,6 +1361,7 @@ mod tests {
         };
         let inputs = vec![InputRecord {
             prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
             prev_index: u32::MAX,
             sequence: u32::MAX,
             script_sig: vec![0x01],
@@ -1357,6 +1417,7 @@ mod tests {
             };
             let inputs = vec![InputRecord {
                 prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
                 prev_index: u32::MAX,
                 sequence: u32::MAX,
                 script_sig: vec![fk_hint],
@@ -1415,6 +1476,7 @@ mod tests {
             };
             let inputs = vec![InputRecord {
                 prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
                 prev_index: u32::MAX,
                 sequence: u32::MAX,
                 script_sig: vec![0x01],
@@ -1491,6 +1553,7 @@ mod tests {
         };
         let inputs = vec![InputRecord {
             prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
             prev_index: u32::MAX,
             sequence: u32::MAX,
             script_sig: vec![0x01],
@@ -1543,6 +1606,7 @@ mod tests {
         };
         let inputs = vec![InputRecord {
             prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
             prev_index: u32::MAX,
             sequence: u32::MAX,
             script_sig: vec![0x01],
@@ -1575,6 +1639,7 @@ mod tests {
     fn input_witness_roundtrip() {
         let rec = InputRecord {
             prev_txid: [1u8; 32],
+            create_fk: Fk(1),
             prev_index: 2,
             sequence: 0xffff_fffe,
             script_sig: vec![0x00],
@@ -1582,13 +1647,19 @@ mod tests {
         };
         let enc = rec.encode();
         let dec = InputRecord::decode(&enc).unwrap();
-        assert_eq!(rec, dec);
+        assert_eq!(dec.create_fk, Fk(1));
+        assert_eq!(dec.prev_index, 2);
+        assert_eq!(dec.sequence, rec.sequence);
+        assert_eq!(dec.script_sig, rec.script_sig);
+        assert_eq!(dec.witness, rec.witness);
+        assert_eq!(dec.prev_txid, [0u8; 32], "prev_txid not on disk");
     }
 
     #[test]
     fn input_flags_roundtrip() {
         let rec = InputRecord {
             prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
             prev_index: u32::MAX,
             sequence: u32::MAX,
             script_sig: vec![],
@@ -1604,7 +1675,7 @@ mod tests {
     fn input_rejects_legacy_local_prev() {
         use crate::compact::write_compact_size;
         // flags: LOCAL_PREV | SEQ_FINAL | EMPTY_SCRIPT | EMPTY_WITNESS
-        let flags = input_flags::LOCAL_PREV
+        let flags = input_flags::RESERVED4
             | input_flags::SEQ_FINAL
             | input_flags::EMPTY_SCRIPT
             | input_flags::EMPTY_WITNESS;
@@ -1619,6 +1690,7 @@ mod tests {
         let run = vec![
             InputRecord {
                 prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
                 prev_index: u32::MAX,
                 sequence: u32::MAX,
                 script_sig: vec![0x01],
@@ -1626,6 +1698,7 @@ mod tests {
             },
             InputRecord {
                 prev_txid: [2u8; 32],
+            create_fk: Fk(1),
                 prev_index: 0,
                 sequence: 1,
                 script_sig: vec![],
@@ -1633,6 +1706,7 @@ mod tests {
             },
             InputRecord {
                 prev_txid: [3u8; 32],
+            create_fk: Fk(1),
                 prev_index: 3,
                 sequence: u32::MAX,
                 script_sig: vec![],
@@ -1641,7 +1715,16 @@ mod tests {
         ];
         let mut enc = Vec::new();
         encode_input_run(&run, &mut enc);
-        assert_eq!(decode_input_run(&enc, 3).unwrap(), run);
+        let dec = decode_input_run(&enc, 3).unwrap();
+        assert_eq!(dec.len(), 3);
+        assert!(dec[0].is_coinbase());
+        assert_eq!(dec[1].create_fk, Fk(1));
+        assert_eq!(dec[1].prev_index, 0);
+        assert_eq!(dec[1].witness, vec![vec![0xab]]);
+        assert_eq!(dec[2].create_fk, Fk(1));
+        assert_eq!(dec[2].prev_index, 3);
+        // Soft prev_txid not on disk.
+        assert_eq!(dec[1].prev_txid, [0u8; 32]);
     }
 
     #[test]
@@ -1689,6 +1772,7 @@ mod tests {
         };
         let inputs = vec![InputRecord {
             prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
             prev_index: u32::MAX,
             sequence: u32::MAX,
             script_sig: vec![0x01, 0x00],
@@ -1759,6 +1843,7 @@ mod tests {
         };
         let inputs = vec![InputRecord {
             prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
             prev_index: u32::MAX,
             sequence: u32::MAX,
             script_sig: vec![],

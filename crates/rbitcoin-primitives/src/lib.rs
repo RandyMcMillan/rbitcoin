@@ -17,10 +17,11 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 
 /// Current on-disk schema version (see workspace `SCHEMA.md`).
 ///
+/// v10: packed Class A inputs store **create_fk:u64 + vout** (not prev_txid[32])
+/// for non-coinbase; wipe datadir from v9. `tx.head` still keyless 4 B (v9).
+///
 /// v9: `tx.head` is `2^31` × **4 B** create_fk entries (no HAS_NEXT; probe until
 /// empty); `tx_height` uses **u32** slots. Dense Class A fk + `tx.idx` retained.
-/// Future (31-bit address): ~1.6e9 txs → first BITS widen; ~3.2e9 → second;
-/// ~4e9 → 8 B head entries (`u32` fk full).
 ///
 /// v8: `tx.head` `2^31` × 8 B (fk + HAS_NEXT); `tx_height` u64 slots.
 ///
@@ -31,7 +32,7 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// v5: spend annotation on each output; no `point.head` open-hash multimap.
 ///
 /// v4: hybrid scripthash; v3: thin lists + strong_tx bitset; external prev_txid.
-pub const SCHEMA_VERSION: u16 = 9;
+pub const SCHEMA_VERSION: u16 = 10;
 
 /// 1-based foreign key into a store table body. Zero means null / absent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

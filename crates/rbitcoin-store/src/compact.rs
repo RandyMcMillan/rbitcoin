@@ -84,7 +84,7 @@ pub fn read_uleb128(buf: &[u8]) -> Result<(u64, usize), StoreError> {
     Err(StoreError::Corrupt("uleb128 truncated"))
 }
 
-/// Input record flags (schema v3).
+/// Input record flags (schema v10).
 pub mod input_flags {
     /// `sequence == 0xffff_ffff`
     pub const SEQ_FINAL: u8 = 1 << 0;
@@ -92,10 +92,10 @@ pub mod input_flags {
     pub const EMPTY_SCRIPT: u8 = 1 << 1;
     /// Empty witness stack
     pub const EMPTY_WITNESS: u8 = 1 << 2;
-    /// Null prevout (coinbase): skip 32-byte txid + use prev_index = 0xffff_ffff
+    /// Null prevout (coinbase): no create_fk payload; prev_index = 0xffff_ffff
     pub const NULL_PREV: u8 = 1 << 3;
-    /// Deprecated: was CompactSize prev_tx_fk + vout. Class A no longer uses this.
-    pub const LOCAL_PREV: u8 = 1 << 4;
+    /// Reserved / unused (v9 and earlier LOCAL_PREV; rejected if set).
+    pub const RESERVED4: u8 = 1 << 4;
 }
 
 /// Output record flags (schema v5).

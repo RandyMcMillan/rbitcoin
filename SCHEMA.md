@@ -1,8 +1,10 @@
-# On-disk schema (v9)
+# On-disk schema (v10)
 
 Versioned layouts for the chain store. **Format is unstable until 1.0.** Magic bytes and a schema version live in each file header.
 
-**Schema v9** (current): **`tx.head`** is a fixed keyless address table — single file, `2^BITS` × **4 B** entries (mainnet `BITS=31` → **8 GiB** sparse), double-hash probe, **`u32` create_fk** (0 = empty), **no HAS_NEXT** (continue until empty). Dense Class A fks + **`tx.idx`** retained. **`tx_height`** uses **4 B** slots (`height+1`, 0 = unset). Lookups verify Class A body txid. Header / scripthash heads remain open-address with 16 B key prefixes. Fresh datadir from v8.
+**Schema v10** (current): packed Class A **inputs store `create_fk:u64` + CompactSize vout** for non-coinbase (not `prev_txid[32]`). Soft `prev_txid` is RAM-only for wire rebuild (filled from create body). Archive resolves parent fks once (same-batch map → writer sticky → durable `tx.head`). **Wipe datadir from v9.** `tx.head` still keyless 4 B (v9 layout).
+
+**Schema v9**: **`tx.head`** is a fixed keyless address table — single file, `2^BITS` × **4 B** entries (mainnet `BITS=31` → **8 GiB** sparse), double-hash probe, **`u32` create_fk** (0 = empty), **no HAS_NEXT** (continue until empty). Dense Class A fks + **`tx.idx`** retained. **`tx_height`** uses **4 B** slots (`height+1`, 0 = unset). Lookups verify Class A body txid. Header / scripthash heads remain open-address with 16 B key prefixes. Fresh datadir from v8. Inputs still carried `prev_txid[32]`.
 
 **Future head pain** (mainnet `BITS=31`, ~2.1 B slots; ~75% load ≈ **1.6 B** entries): first widen address **BITS** (e.g. 32-bit rebuild); ~**3.2 B** txs → second widen (e.g. 33-bit); only then ~**4 B** txs → **`u32` create_fk exhausted**, head entries must become **8 B**.
 
@@ -145,13 +147,13 @@ Each input:
 
 | Field | Encoding |
 |-------|----------|
-| flags | u8 — `SEQ_FINAL`, `EMPTY_SCRIPT`, `EMPTY_WITNESS`, `NULL_PREV` (`LOCAL_PREV` bit reserved; **decode reject**) |
-| prev | `NULL_PREV`: coinbase (no payload); else `prev_txid[32]` + CompactSize vout |
+| flags | u8 — `SEQ_FINAL`, `EMPTY_SCRIPT`, `EMPTY_WITNESS`, `NULL_PREV` (`LOCAL_PREV` / bit4 reserved; **decode reject**) |
+| prev | `NULL_PREV`: coinbase (no payload); else **`create_fk:u64` LE** + CompactSize vout (**not** `prev_txid[32]`) |
 | sequence | omitted if `SEQ_FINAL`; else u32 LE |
 | script_sig | omitted if empty; else CompactSize len + bytes |
 | witness | omitted if empty; else CompactSize n + (CompactSize len + bytes)×n |
 
-Catch-up parent resolve uses light UTXO (`outpoint → create Class A fk`) or tip/wave caches — not a Class A `prev_tx_fk` field. Tip mode uses points / `tx.head`.
+Non-coinbase inputs are **−24 B** vs v9 (`create_fk` 8 B replaces `prev_txid` 32 B). Wire rebuild fills soft `prev_txid` from the create body's packed txid prefix. Archive stamps `create_fk` before pack (batch map → sticky → head). Confirm/prewarm prefer stamped `create_fk` and skip `tx.head` for those edges.
 
 ### Output run (one var record per tx with outputs) — also embedded in packed Class A
 

@@ -82,22 +82,24 @@ impl Query {
         Ok(header_fks)
     }
 
-    /// Mega-batch Class A: **packed full-tx** rows (one `tx.body` payload per
-    /// tx → single IO on `get_tx_full`). Split input/output tables are no longer
-    /// written for new archives (legacy rows remain readable).
+    /// Mega-batch Class A: **packed full-tx** rows (one `tx.body` payload per tx).
     ///
-    /// Non-coinbase inputs always store external `prev_txid` + vout (no Class A
-    /// `prev_tx_fk`). Confirm uses light UTXO create_fk; tip mode uses points/head.
+    /// Non-coinbase inputs store **create_fk + vout** (schema v10). Parent fks are
+    /// resolved here: same mega-batch map → writer sticky → durable `tx.head`.
     fn archive_bodies_mega_owned(
         &self,
         need: &mut [(Fk, Vec<TxApply>)],
     ) -> Result<(), QueryError> {
+        use std::collections::{HashMap, HashSet};
+
         let mut next_tx = self.store.txs.count() + 1;
 
-        let mut packed: Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> = Vec::new();
+        // Pass 1: assign create fks + build batch_map (txid → create_fk).
+        let mut batch_map: HashMap<[u8; 32], Fk> = HashMap::new();
+        let mut work: Vec<(Fk, TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> =
+            Vec::new();
         let mut per_header_ranges: Vec<(Fk, Fk, u32)> = Vec::with_capacity(need.len());
         let mut spends: Vec<([u8; 32], u32, Fk, u32)> = Vec::new();
-        // Tip: archive writes durable spends. Direct: confirm batch-writes after Class C.
         let archive_spends =
             self.spend_index_enabled() && self.index_mode().is_tip();
         let index_tx = self.tx_index_enabled();
@@ -115,22 +117,90 @@ impl Query {
                 next_tx += 1;
 
                 let mut tx = ta.tx;
-                // Packed rows are self-contained; I/O fks stay NULL.
                 tx.input_start_fk = Fk::NULL;
                 tx.input_count = n_in;
                 tx.output_start_fk = Fk::NULL;
                 tx.output_count = n_out;
 
-                let mut inputs = ta.inputs;
-                for (i, inp) in inputs.iter_mut().enumerate() {
-                    if !inp.is_coinbase() && archive_spends {
-                        // Tip mode: durable spend on output (resolve create via tx.head).
-                        spends.push((inp.prev_txid, inp.prev_index, tx_fk, i as u32));
-                    }
-                }
-                packed.push((tx, inputs, ta.outputs));
+                batch_map.insert(tx.txid, tx_fk);
+                work.push((tx_fk, tx, ta.inputs, ta.outputs));
             }
             per_header_ranges.push((*header_fk, first_tx_fk, n_txs));
+        }
+
+        // Register all creates into writer sticky (cross-batch).
+        let sticky_regs: Vec<([u8; 32], Fk)> = batch_map
+            .iter()
+            .map(|(t, f)| (*t, *f))
+            .collect();
+        self.archive_txid_sticky.insert_many(&sticky_regs);
+
+        // Pass 2: unique external prev_txids that still need fk.
+        let mut need_external: HashSet<[u8; 32]> = HashSet::new();
+        for (_sfk, _tx, inputs, _) in &work {
+            for inp in inputs {
+                if inp.is_coinbase() || !inp.create_fk.is_null() {
+                    continue;
+                }
+                if batch_map.contains_key(&inp.prev_txid) {
+                    continue;
+                }
+                if inp.prev_txid == [0u8; 32] {
+                    continue;
+                }
+                need_external.insert(inp.prev_txid);
+            }
+        }
+
+        // Sticky hits for externals.
+        let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
+        let sticky_hits = self.archive_txid_sticky.lookup_batch(&need_vec);
+        let mut resolved: HashMap<[u8; 32], Fk> = sticky_hits;
+        let mut need_head: Vec<[u8; 32]> = Vec::new();
+        for t in &need_vec {
+            if !resolved.contains_key(t) {
+                need_head.push(*t);
+            }
+        }
+
+        // Durable head for sticky misses: batch probe + sequential body_txid
+        // (slot-sorted). Prefer this over N independent get_fk_by_txid calls.
+        if !need_head.is_empty() && index_tx {
+            need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
+            let hits = self.store.get_fk_by_txid_batch(&need_head)?;
+            for (txid, fk_opt) in hits {
+                if let Some(fk) = fk_opt {
+                    resolved.insert(txid, fk);
+                    self.archive_txid_sticky.insert(txid, fk);
+                }
+            }
+        }
+
+        // Pass 3: stamp create_fk on inputs; tip spends list.
+        let mut packed: Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> =
+            Vec::with_capacity(work.len());
+        for (tx_fk, tx, mut inputs, outputs) in work {
+            for (i, inp) in inputs.iter_mut().enumerate() {
+                if inp.is_coinbase() {
+                    inp.create_fk = Fk::NULL;
+                    inp.prev_index = u32::MAX;
+                    continue;
+                }
+                if inp.create_fk.is_null() {
+                    let cfk = batch_map
+                        .get(&inp.prev_txid)
+                        .copied()
+                        .or_else(|| resolved.get(&inp.prev_txid).copied())
+                        .ok_or(StoreError::Corrupt(
+                            "archive: parent create_fk unresolved (wipe/reindex if schema mismatch)",
+                        ))?;
+                    inp.create_fk = cfk;
+                }
+                if archive_spends {
+                    spends.push((inp.prev_txid, inp.prev_index, tx_fk, i as u32));
+                }
+            }
+            packed.push((tx, inputs, outputs));
         }
 
         let body_est: u64 = packed
@@ -155,18 +225,13 @@ impl Query {
                 return Err(StoreError::Corrupt("tx put_full_batch fk mismatch"));
             }
         }
-        // Confirm parents live in ConfirmParentCache (prewarm).
-        // `tx.head` written by put_tx_full_batch_indexed when index_tx.
 
         if archive_spends && !spends.is_empty() {
-            // Tip: annotate create outputs (tx.head resolve per prevout).
             self.store.put_spend_batch(&spends)?;
         }
 
         self.store.header_txs.put_ranges_batch(&per_header_ranges)?;
 
-        // Far archive lead: free just-written body pages so they do not sit in
-        // the page cache while prewarm/confirm work near tip.
         let body_end = self.store.txs.body_logical_len();
         let body_len = body_end.saturating_sub(body_off);
         if body_len > 0 && self.archive_far_ahead_of_prewarm()? {
@@ -189,14 +254,21 @@ impl Query {
         Ok(arch_hi.saturating_sub(prewarm) > ARCHIVE_BODY_DONTNEED_LEAD)
     }
 
-    /// Resolve prev outpoint txid for an input (local fk or stored external hash).
+    /// Resolve prev outpoint txid for an input.
     ///
-    /// Parent **txid** only (not prevout outs). Reconstruct / Class C spend edges.
+    /// Schema v10: soft `prev_txid` may be zero after disk decode; fall back to
+    /// create body txid via `create_fk`. Parent **txid** only (not prevout outs).
     pub fn resolve_prev_txid(&self, inp: &InputRecord) -> Result<[u8; 32], QueryError> {
         if inp.is_coinbase() {
             return Ok([0u8; 32]);
         }
-        Ok(inp.prev_txid)
+        if inp.prev_txid != [0u8; 32] {
+            return Ok(inp.prev_txid);
+        }
+        if inp.create_fk.is_null() {
+            return Err(StoreError::Corrupt("input missing create_fk for prev_txid"));
+        }
+        Ok(self.store.txs.body_txid(inp.create_fk)?)
     }
 
     /// Confirm an already-archived block at `height` (genesis or tip+1).

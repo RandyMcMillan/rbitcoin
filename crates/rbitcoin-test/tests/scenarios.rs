@@ -415,6 +415,7 @@ fn chain_connect_reorg_and_growth() {
             },
             inputs: vec![InputRecord {
                 prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
                 prev_index: u32::MAX,
                 sequence: u32::MAX,
                 script_sig: vec![0],
@@ -624,8 +625,12 @@ fn ibd_parallel_archive_idempotent_confirm_direct() {
     assert!(fks.len() >= 2);
     let rec = q.get_tx(fks[1]).unwrap();
     let inp = q.tx_input_at_fk(fks[1], &rec, 0).unwrap();
-    // Class A always external prev_txid; confirm used tx.head create_fk.
-    assert_ne!(inp.prev_txid, [0u8; 32]);
+    // v10: create_fk stamped at archive; soft prev_txid zero until wire rebuild.
+    assert!(!inp.create_fk.is_null());
+    assert_eq!(
+        q.resolve_prev_txid(&inp).unwrap(),
+        *cb1.as_byte_array()
+    );
     assert_eq!(inp.prev_index, 0);
 }
 
@@ -833,7 +838,7 @@ fn confirm_survives_partial_class_c_without_tip_advance() {
     assert_eq!(q2.tip_height(), Some(Height(spend_h + 1)));
 }
 
-/// Resume: spend archived with external prev_txid; confirm resolves via `tx.head`.
+/// Resume: spend archived with create_fk (archive sticky/head); confirm spends.
 #[test]
 fn resume_tx_head_resolves_external_prev() {
     use rbitcoin_consensus::{
@@ -875,7 +880,7 @@ fn resume_tx_head_resolves_external_prev() {
     };
     let _ = (tip, tip_time);
 
-    // Session 2: reopen UTXO (tip aligned), archive spend with external prev, confirm.
+    // Session 2: reopen, archive spend (create_fk via head), confirm.
     {
         let q = Query::open_or_create(td.store_path()).unwrap();
         q.enter_direct_index_mode().unwrap();
@@ -897,9 +902,14 @@ fn resume_tx_head_resolves_external_prev() {
             .unwrap();
         let rec = q.get_tx(fks[1]).unwrap();
         let inp = q.tx_input_at_fk(fks[1], &rec, 0).unwrap();
-        assert_ne!(
-            inp.prev_txid, [0u8; 32],
-            "Class A stores external prev_txid (no prev_tx_fk field)"
+        assert!(
+            !inp.create_fk.is_null(),
+            "v10 Class A stores create_fk (not prev_txid on disk)"
+        );
+        assert_eq!(
+            q.resolve_prev_txid(&inp).unwrap(),
+            *cb1.as_byte_array(),
+            "create body supplies parent txid for wire"
         );
 
         confirm_archived_at(
@@ -909,7 +919,7 @@ fn resume_tx_head_resolves_external_prev() {
             &b_spend.block_hash().to_byte_array(),
             ms,
         )
-        .expect("external prev_txid resolves via tx.head");
+        .expect("create_fk spend confirms");
         assert_eq!(q.tip_height(), Some(Height(spend_h)));
         assert!(
             q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap(),
@@ -1255,7 +1265,7 @@ fn confirm_run_sequential_and_failed_no_spend_poison() {
 /// Single mature-chain build covers:
 /// - accept genesis + long mine (reopen tip)
 /// - coinbase maturity + spend + double-spend reject
-/// - external prev_txid on spend + reconstruct
+/// - create_fk on spend + reconstruct (soft prev_txid from create body)
 /// - reconstruct after reopen (sampled + multi-tx spend block)
 /// - store-backed locator/headers helpers
 /// - service flags
@@ -1297,15 +1307,25 @@ fn consensus_mature_chain_spend_and_reconstruct() {
         q.resolve_prev_txid(&inp).unwrap(),
         chain.matured_coinbase_txid.to_byte_array()
     );
+    assert!(
+        !inp.create_fk.is_null(),
+        "v10 spend input must carry create_fk"
+    );
     let enc = InputRecord {
         prev_txid: inp.prev_txid,
+        create_fk: inp.create_fk,
         prev_index: inp.prev_index,
         sequence: inp.sequence,
         script_sig: inp.script_sig.clone(),
         witness: inp.witness.clone(),
     }
     .encode();
-    assert!(enc.len() > 32, "external prev includes 32-byte txid: {}", enc.len());
+    // create_fk:u64 + CompactSize vout — not prev_txid[32] (−24 B per input).
+    assert!(
+        enc.len() < 32,
+        "v10 input encodes create_fk not prev_txid: {}",
+        enc.len()
+    );
     assert_reconstruct_eq(&q, chain.spend_height, spend_block);
     let cbin = q
         .tx_input(&q.get_tx(q.block_tx_fks(Height(chain.spend_height)).unwrap()[0]).unwrap(), 0)

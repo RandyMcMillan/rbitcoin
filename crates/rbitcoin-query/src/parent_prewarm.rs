@@ -15,7 +15,6 @@
 
 use super::*;
 use crate::confirm_parent_cache::{prewarm_headroom_from_env, StashedThinInput};
-use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -294,13 +293,17 @@ impl Query {
             Vec<rbitcoin_store::OutputRecord>,
             Vec<rbitcoin_store::InputRecord>,
         )> = Vec::new();
-        let mut body_prevouts: HashMap<u64, ([u8; 32], Vec<([u8; 32], u32)>)> = HashMap::new();
+        // (txid, edges): each edge is (create_fk_opt, soft prev_txid, vout).
+        // v10: create_fk is stamped at archive; soft prev_txid may be zero.
+        let mut body_prevouts: HashMap<u64, ([u8; 32], Vec<(Option<u64>, [u8; 32], u32)>)> =
+            HashMap::new();
         let mut create_regs: Vec<(Fk, [u8; 32], u32)> = Vec::new();
         let mut parent_need: HashMap<u64, Vec<u32>> = HashMap::new(); // parent_fk → need heights
         // parent_fk → needed prev_index (vouts) for sparse outs stash.
         let mut parent_vouts: HashMap<u64, Vec<u32>> = HashMap::new();
         let mut thin_by_spend: HashMap<u64, Vec<StashedThinInput>> = HashMap::new();
         let mut batch_creates: HashMap<[u8; 32], Fk> = HashMap::new();
+        let mut batch_create_ids: HashSet<u64> = HashSet::new();
         let mut body_ranges: Vec<(Fk, u64, u64)> = Vec::new();
 
         for &(height, hash) in &work {
@@ -410,12 +413,14 @@ impl Query {
                     self.store.get_tx_full(fk)?
                 };
                 st.body_tx_reads = st.body_tx_reads.saturating_add(1);
-                let prevouts: Vec<([u8; 32], u32)> = inputs
+                // v10: create_fk on inputs — edges without head when fk present.
+                let prevouts: Vec<(Option<u64>, [u8; 32], u32)> = inputs
                     .iter()
-                    .map(|i| (i.prev_txid, i.prev_index))
+                    .map(|i| (i.create_fk.get(), i.prev_txid, i.prev_index))
                     .collect();
                 create_regs.push((fk, tx.txid, height));
                 batch_creates.insert(tx.txid, fk);
+                batch_create_ids.insert(id);
                 body_prevouts.insert(id, (tx.txid, prevouts));
                 body_fulls.push((fk, height, tx, outs, inputs));
                 st.creates_registered = st.creates_registered.saturating_add(1);
@@ -453,7 +458,8 @@ impl Query {
             local_fk.insert(*txid, Some(*fk));
         }
 
-        // ── thin: collect unique external prev_txids ───────────────────────
+        // ── thin: collect unique external prev_txids (create_fk miss only) ──
+        // v10 archive stamps create_fk; head is only needed for legacy/unresolved.
         let t_collect = Instant::now();
         let mut need_external: HashSet<[u8; 32]> = HashSet::new();
         // Max spend-height per external txid (for by_txid GC height).
@@ -466,8 +472,15 @@ impl Query {
                 let Some((_txid, prevouts)) = body_prevouts.get(&id) else {
                     continue;
                 };
-                for &(prev_txid, _prev_index) in prevouts {
-                    if prev_txid == [0u8; 32] && _prev_index == u32::MAX {
+                for &(create_fk_opt, prev_txid, prev_index) in prevouts {
+                    if create_fk_opt.is_some() {
+                        // Identity already on disk — no head for this edge.
+                        continue;
+                    }
+                    if prev_txid == [0u8; 32] && prev_index == u32::MAX {
+                        continue;
+                    }
+                    if prev_txid == [0u8; 32] {
                         continue;
                     }
                     if batch_creates.contains_key(&prev_txid) {
@@ -505,32 +518,25 @@ impl Query {
             .thin_runway_ns
             .saturating_add(t_runway.elapsed().as_nanos() as u64);
 
-        // ── thin: durable head probes (parallel; slot-ordered for locality) ─
+        // ── thin: durable head (batch: slot-sorted probe + sequential body_txid) ─
         let t_head = Instant::now();
         need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
         st.head_lookups = st.head_lookups.saturating_add(need_head.len() as u32);
-        let head_hits: Vec<([u8; 32], Option<Fk>)> = if need_head.len() >= 32
-            && !self.confirm_cancelled()
-        {
-            let store = &self.store;
-            need_head
-                .par_iter()
-                .map(|txid| {
-                    let fk = store.get_fk_by_txid(txid).ok().flatten();
-                    (*txid, fk)
-                })
-                .collect()
+        let head_hits: Vec<([u8; 32], Option<Fk>)> = if need_head.is_empty() {
+            Vec::new()
         } else {
-            let mut out = Vec::with_capacity(need_head.len());
-            for txid in &need_head {
-                if self.confirm_cancelled() {
-                    crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
-                    return Err(StoreError::Cancelled("confirm cancelled"));
-                }
-                let fk = self.store.get_fk_by_txid(txid).ok().flatten();
-                out.push((*txid, fk));
+            if self.confirm_cancelled() {
+                crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                return Err(StoreError::Cancelled("confirm cancelled"));
             }
-            out
+            self.store
+                .get_fk_by_txid_batch(&need_head)
+                .unwrap_or_else(|_| {
+                    need_head
+                        .iter()
+                        .map(|txid| (*txid, self.store.get_fk_by_txid(txid).ok().flatten()))
+                        .collect()
+                })
         };
 
         let mut head_regs: Vec<(Fk, [u8; 32], u32)> = Vec::with_capacity(head_hits.len());
@@ -558,7 +564,7 @@ impl Query {
             .thin_head_ns
             .saturating_add(t_head.elapsed().as_nanos() as u64);
 
-        // ── thin: lock-free edge walk on local tables ──────────────────────
+        // ── thin: lock-free edge walk (prefer stamped create_fk) ───────────
         let t_edge = Instant::now();
         for (height, tx_fks) in &height_tx_fks {
             for fk in tx_fks {
@@ -569,8 +575,9 @@ impl Query {
                     continue;
                 };
                 let mut edges: Vec<StashedThinInput> = Vec::with_capacity(prevouts.len());
-                for &(prev_txid, prev_index) in prevouts {
-                    if prev_txid == [0u8; 32] && prev_index == u32::MAX {
+                for &(create_fk_opt, prev_txid, prev_index) in prevouts {
+                    // Coinbase: null create + null prev index.
+                    if create_fk_opt.is_none() && prev_index == u32::MAX {
                         edges.push(StashedThinInput {
                             create_fk: None,
                             prev_index,
@@ -578,6 +585,26 @@ impl Query {
                         st.edge_coinbase = st.edge_coinbase.saturating_add(1);
                         continue;
                     }
+                    // v10 hot path: archive already stamped create_fk.
+                    if let Some(pid) = create_fk_opt {
+                        edges.push(StashedThinInput {
+                            create_fk: Some(pid),
+                            prev_index,
+                        });
+                        st.utxo_parents = st.utxo_parents.saturating_add(1);
+                        if batch_create_ids.contains(&pid) {
+                            st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
+                            st.edge_same_batch = st.edge_same_batch.saturating_add(1);
+                        } else {
+                            // External parent body pin (no head — identity known).
+                            parent_need.entry(pid).or_default().push(*height);
+                            parent_vouts.entry(pid).or_default().push(prev_index);
+                            st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
+                            st.edge_runway = st.edge_runway.saturating_add(1);
+                        }
+                        continue;
+                    }
+                    // Fallback: soft prev_txid resolve (legacy / incomplete stamp).
                     if let Some(&cfk) = batch_creates.get(&prev_txid) {
                         edges.push(StashedThinInput {
                             create_fk: cfk.get(),

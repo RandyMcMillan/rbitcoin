@@ -74,12 +74,23 @@ fn tx_to_apply(tx: &Transaction, txid: [u8; 32]) -> Result<TxApply, ConsensusErr
     let inputs: Vec<InputRecord> = tx
         .input
         .iter()
-        .map(|inp| InputRecord {
-            prev_txid: inp.previous_output.txid.to_byte_array(),
-            prev_index: inp.previous_output.vout,
-            sequence: inp.sequence.to_consensus_u32(),
-            script_sig: inp.script_sig.to_bytes(),
-            witness: inp.witness.to_vec(),
+        .map(|inp| {
+            let is_cb = inp.previous_output.is_null()
+                || (inp.previous_output.txid.to_byte_array() == [0u8; 32]
+                    && inp.previous_output.vout == u32::MAX);
+            InputRecord {
+                prev_txid: inp.previous_output.txid.to_byte_array(),
+                // Archive resolve fills create_fk before pack; coinbase stays NULL.
+                create_fk: Fk::NULL,
+                prev_index: if is_cb {
+                    u32::MAX
+                } else {
+                    inp.previous_output.vout
+                },
+                sequence: inp.sequence.to_consensus_u32(),
+                script_sig: inp.script_sig.to_bytes(),
+                witness: inp.witness.to_vec(),
+            }
         })
         .collect();
 

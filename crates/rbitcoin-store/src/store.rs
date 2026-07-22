@@ -179,7 +179,7 @@ impl Store {
     pub fn get_tx_meta_and_prevouts(
         &self,
         fk: Fk,
-    ) -> Result<(TxRecord, Vec<([u8; 32], u32)>), StoreError> {
+    ) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
         self.txs.get_meta_and_prevouts(fk)
     }
 
@@ -333,7 +333,7 @@ impl Store {
         &self,
         offset: u64,
         len: u64,
-    ) -> Result<(TxRecord, Vec<([u8; 32], u32)>), StoreError> {
+    ) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
         self.txs.get_meta_and_prevouts_at(offset, len)
     }
 

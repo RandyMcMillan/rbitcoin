@@ -1,6 +1,7 @@
 //! Domain query layer over [`rbitcoin_store::Store`].
 
 mod archive;
+mod archive_txid_sticky;
 mod catchup;
 mod chain_view;
 mod confirm_parent_cache;
@@ -395,6 +396,8 @@ pub struct Query {
     sh_indexed_through: AtomicU64,
     /// Block-structured confirm parent runway.
     confirm_parents: confirm_parent_cache::ConfirmParentCache,
+    /// Archive writer sticky: txid → create_fk for packing spends (cross mega-batch).
+    archive_txid_sticky: archive_txid_sticky::ArchiveTxidSticky,
     /// Direct IBD SH: memtable → sorted runs (bulk materialize at tip).
     sh_run: sh_builder::ShRunBuilder,
     /// Explicit [`IndexMode`] (Direct / Tip).
@@ -432,6 +435,7 @@ impl Query {
             sh_heads: Mutex::new(HashMap::new()),
             sh_indexed_through: AtomicU64::new(sh_through),
             confirm_parents: confirm_parent_cache::ConfirmParentCache::from_env(),
+            archive_txid_sticky: archive_txid_sticky::ArchiveTxidSticky::from_env(),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
             // Open as Tip until IBD selects Direct.
             index_mode_cell: std::sync::atomic::AtomicU8::new(IndexMode::Tip as u8),

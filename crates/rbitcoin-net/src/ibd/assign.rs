@@ -160,8 +160,10 @@ pub(crate) fn assign_work_ordered(
         scale_far_cap(base_far, far_scale)
     };
     let want_far = far_cap > 0;
-    // Restrict densify horizon to write_next band when budget is tight.
-    let contig_densify_only = far_scale < 0.5;
+    // Always densify only ContigPark's usable band (write_next..+CONTIG_DENSIFY_AHEAD).
+    // Full-horizon far filled the park with unwritable heights, which were then
+    // refused/requeued → getdata thrash. Headroom still scales *how many* far slots.
+    let contig_densify_only = true;
     // far_cap is already scale-adjusted; reserve uses the reduced per-peer far slots.
     let far_window_reserve = if want_far {
         alive
@@ -263,11 +265,9 @@ pub(crate) fn finish_assign(loop_stats: &LoopStats, t0: Instant, issued: u64) {
 
 /// Collect (near, far) hashes that still need getdata.
 ///
-/// Far densify:
-/// - **Full headroom** (`contig_densify_only = false`): `near_hi+1`‥`max_ordered`
-/// - **Budget pressure** (`contig_densify_only = true`): only ContigPark band
-///   `write_next`‥`write_next+CONTIG_DENSIFY_AHEAD` (heights already in near are
-///   skipped here; near collect still covers tip runway).
+/// Far densify is always ContigPark band only:
+/// `max(near_hi+1, write_next)`‥`write_next+CONTIG_DENSIFY_AHEAD`
+/// (near collect still covers tip runway). Avoids full-horizon far junkyard.
 ///
 /// Does not update `max_archived_height` (that is archive-result / seed only).
 pub(crate) fn collect_need(
@@ -279,7 +279,7 @@ pub(crate) fn collect_need(
     total_room: usize,
     want_far: bool,
     write_next: u32,
-    contig_densify_only: bool,
+    _contig_densify_only: bool,
 ) -> (VecDeque<BlockHash>, VecDeque<BlockHash>) {
     let mut near = VecDeque::new();
     let mut far = VecDeque::new();
@@ -315,18 +315,11 @@ pub(crate) fn collect_need(
     }
 
     let mut inspected = 0usize;
-    let (far_lo, far_hi) = if contig_densify_only {
-        // Feed ContigPark head only — avoids filling RAM with unwritable far junk.
-        let lo = write_next.max(near_hi.saturating_add(1));
-        let hi = write_next
-            .saturating_add(CONTIG_DENSIFY_AHEAD)
-            .min(st.max_ordered_height.max(lo));
-        (lo, hi)
-    } else {
-        let lo = near_hi.saturating_add(1);
-        let hi = st.max_ordered_height.max(lo);
-        (lo, hi)
-    };
+    // Feed ContigPark head only — avoids filling RAM with unwritable far junk.
+    let far_lo = write_next.max(near_hi.saturating_add(1));
+    let far_hi = write_next
+        .saturating_add(CONTIG_DENSIFY_AHEAD)
+        .min(st.max_ordered_height.max(far_lo));
     if far_lo > far_hi {
         return (near, far);
     }
@@ -586,6 +579,8 @@ pub(crate) fn contig_gap_need(
 /// First [`CONTIG_GAP_RACE_PREFIX`] heights use tip-hole multi-peer race (2–3
 /// peers). Remaining band heights get a single peer. Runs even when
 /// `far_scale == 0` so a far gap cannot freeze the writer.
+///
+/// Logs at most once per second (or when `write_next` moves) to avoid main-loop spam.
 pub(crate) fn cover_archive_contig_gap(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -662,9 +657,23 @@ pub(crate) fn cover_archive_contig_gap(
         }
     }
     if issued > 0 {
-        rbitcoin_log::debug!(
-            "ibd: contig-gap getdata write_next={write_next} issued={issued} (unstick ContigPark)"
-        );
+        // Assign runs many times per second; rate-limit so DEBUG stays usable.
+        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrd};
+        static LAST_LOG_WN: AtomicU32 = AtomicU32::new(u32::MAX);
+        static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let prev_wn = LAST_LOG_WN.load(AtomicOrd::Relaxed);
+        let prev_ms = LAST_LOG_MS.load(AtomicOrd::Relaxed);
+        if write_next != prev_wn || now_ms.saturating_sub(prev_ms) >= 1000 {
+            LAST_LOG_WN.store(write_next, AtomicOrd::Relaxed);
+            LAST_LOG_MS.store(now_ms, AtomicOrd::Relaxed);
+            rbitcoin_log::debug!(
+                "ibd: contig-gap getdata write_next={write_next} issued={issued} (unstick ContigPark)"
+            );
+        }
     }
     issued
 }

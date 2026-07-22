@@ -361,8 +361,6 @@ pub(crate) fn apply_peer_event(
                     }
                 }
             };
-            // Prevent re-getdata while prep/writer owns this body.
-            st.body.mark_pending(hash);
             let tip_h = hub.tip_height().unwrap_or(0);
             let height = st
                 .hash_height
@@ -371,13 +369,17 @@ pub(crate) fn apply_peer_event(
                 .unwrap_or(u32::MAX);
             let write_next = archive_write_next.load(Ordering::Relaxed);
             // Hard horizon: do not charge/park bodies ContigPark cannot use yet.
-            // Re-getdata once write_next advances into range (densify / gap cover).
+            // mark_missing (not pending) so densify can re-get once write_next
+            // advances; densify is capped to write_next+CONTIG_DENSIFY_AHEAD so
+            // this does not thrash re-download of far heights every tick.
             if height != u32::MAX
                 && height > write_next.saturating_add(CONTIG_DENSIFY_AHEAD)
             {
                 st.body.mark_missing(hash);
                 return;
             }
+            // Prevent re-getdata while prep/writer owns this body.
+            st.body.mark_pending(hash);
             let priority = st
                 .hash_height
                 .get(&hash)

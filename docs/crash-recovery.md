@@ -6,11 +6,13 @@ Hard kills (`kill -9`) and tip disconnects are normal. **Corrupt files are not r
 
 Best-chain views ignore uncommitted Class C state:
 
-| Write order (confirm run) | Role |
-|---------------------------|------|
+| Write order (confirm **writeback** thread) | Role |
+|-------------------------------------------|------|
+| 0. Structural spentness / maturity / subsidy | No durable tip write yet |
 | 1. `strong_tx` + `tx_height` | May lead tip after kill |
 | 2. Thin scripthash **creates** (batched) | May lead tip after kill |
 | 3. `confirmed[]` tip advance | **Commit** |
+| 4. Spend annotations (Direct) | After tip; spentness filters use strong+height |
 
 `is_confirmed_strong(tx)` ⇔ strong ∧ `tx_height ≤ tip`. Queries that mean “on best chain” use this (or equivalent).
 

@@ -2,21 +2,19 @@
 //!
 //! Pipeline (optimistic scripts — assumevalid-shaped):
 //! ```text
-//! resolve_bodies → prewarm_wait → wave_fill → wire_rebuild
-//!   → assemble (prevout content + jobs; no durable spentness)
-//!   → scripts (rayon)
-//!   → structural (durable spentness + maturity + subsidy; height-ordered)
-//!   → class_c → spend annotate / tip GC
+//! SCRIPT STAGE (confirm OS thread + rayon):
+//!   resolve → prewarm_wait → wave → wire → assemble → scripts
+//! WRITEBACK STAGE (ibd-confirm-writeback OS thread, FIFO):
+//!   structural (spentness/maturity/subsidy) → class_c → spend annotate → tip GC
 //! ```
+//!
+//! [`confirm_archived_run`] runs both stages synchronously (tests / tip path).
+//! IBD uses [`confirm_script_phase`] then queues [`ScriptOkBatch`] for
+//! [`confirm_writeback_phase`] so scripts(N+1) can overlap writeback(N).
 //!
 //! **Prewarm ownership:** the IBD background worker loads Class A into
 //! [`ConfirmParentCache`]. Confirm **only waits** (Condvar notify on mark_scanned)
 //! — it never last-miles / duplicates prewarm work while the worker is live.
-//! Unit tests without a worker still call `prewarm_parents_for_heights` once
-//! (sole owner of the load).
-//!
-//! Timers: [`crate::confirm_phase_stats`]. Multi-block: sequential assemble,
-//! one script wave, structural in height order, one Class C run.
 
 use crate::block::{
     assemble_block_prevouts, bip34_height_script, block_has_witness, structural_validate_spends,
@@ -45,7 +43,7 @@ struct BodyMeta {
     tx_fks: Vec<rbitcoin_primitives::Fk>,
 }
 
-/// Assemble output for one height (held through scripts → structural → Class C).
+/// Assemble output for one height (held through scripts → writeback).
 struct Prepared {
     height: Height,
     header_fk: rbitcoin_primitives::Fk,
@@ -68,28 +66,41 @@ struct Prepared {
     hash: [u8; 32],
 }
 
-/// Confirm a contiguous tip-extension run of archived bodies.
+/// Script-verified batch ready for ordered writeback (structural + Class C + spends).
 ///
-/// When archive leads tip (the post-milestone IBD case), a multi-height run:
-/// 1. Assembles sequentially (prevout content + jobs; no durable spentness)
-/// 2. Runs **one** rayon script wave across **all** inputs in the run
-/// 3. Structural spentness/maturity/subsidy in height order
-/// 4. Class C in height order
+/// `Send` so IBD can hand off from the confirm/script thread to writeback.
+pub struct ScriptOkBatch {
+    prepared: Vec<Prepared>,
+    wire_blocks: Vec<Block>,
+    wave_prevouts: rbitcoin_query::WavePrevoutCache,
+}
+
+/// Confirm a contiguous tip-extension run of archived bodies (sync both stages).
 ///
-/// Intermediate heights are not yet in `confirmed[]`, so header checks after the
-/// first use the previous block in the run (not `header_at_height`).
-///
-/// **Majflt guard:** after prewarm is ready, samples this thread's major page
-/// faults (`getrusage` `RUSAGE_THREAD`) for wave→post_commit. If the count
-/// rises, logs a **warn** (cold store touch / mlock gap). Never fails the batch.
+/// Prefer [`confirm_script_phase`] + [`confirm_writeback_phase`] in IBD so
+/// writeback of batch N overlaps scripts of batch N+1.
 pub fn confirm_archived_run(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
     blocks: &[(Height, [u8; 32])],
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
+    let ok = confirm_script_phase(query, params, milestone, blocks)?;
+    confirm_writeback_phase(query, params, milestone, ok)
+}
+
+/// SCRIPT STAGE: resolve → prewarm wait → wave → wire → assemble → scripts.
+///
+/// Does **not** advance tip or probe durable spentness (except provisional
+/// same-run doubles during assemble).
+pub fn confirm_script_phase(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    blocks: &[(Height, [u8; 32])],
+) -> Result<ScriptOkBatch, ConsensusError> {
     if blocks.is_empty() {
-        return Ok(Vec::new());
+        return Err(ConsensusError::BadBlock("empty confirm batch"));
     }
     query
         .ensure_spent_oracle_ready()
@@ -100,7 +111,6 @@ pub fn confirm_archived_run(
         }
     }
 
-    // ── 1. resolve_bodies ───────────────────────────────────────────────────
     let t_resolve = Instant::now();
     let metas = resolve_body_metas(query, blocks)?;
     confirm_phase_stats::RESOLVE_NS.fetch_add(
@@ -108,9 +118,6 @@ pub fn confirm_archived_run(
         Ordering::Relaxed,
     );
 
-    // ── 1b. wait for parent prewarm (worker owns Class A load) ─────────────
-    // Confirm never duplicates prewarm: with a live worker we only wait for
-    // ready notify; without a worker (unit tests) we are the sole prewarm owner.
     let heights: Vec<u32> = metas.iter().map(|m| m.height.0).collect();
     let items: Vec<(u32, [u8; 32])> = metas.iter().map(|m| (m.height.0, m.hash)).collect();
     let batch_end = heights.last().copied().unwrap_or(0);
@@ -121,20 +128,13 @@ pub fn confirm_archived_run(
         Ordering::Relaxed,
     );
 
-    // Majflt window: confirm hot path only (after runway should be mlocked).
-    // Excludes wait / test-only prewarm load so those intentional faults do not warn.
     let _majflt = ConfirmMajfltGuard::start(
         blocks.first().map(|b| b.0 .0).unwrap_or(0),
         blocks.len(),
     );
 
-    // ── 2. wave_fill (reuse resolve tx_fks — no header re-probe) ────────────
     let mut wave_prevouts = wave_fill(query, &metas)?;
-
-    // ── 3. wire_rebuild (reuses wave body decodes — no second Class A parse) ─
     let wire_blocks = wire_rebuild(query, &metas, &mut wave_prevouts)?;
-
-    // ── 4. assemble (headers + prevout content + jobs; no durable spentness) ─
     let mut prepared = assemble_run(
         query,
         params,
@@ -143,29 +143,58 @@ pub fn confirm_archived_run(
         &wire_blocks,
         &wave_prevouts,
     )?;
-
-    // ── 5. scripts first (optimistic; needs values only) ────────────────────
     script_wave(&prepared)?;
+    // Drop heavy script jobs before queueing writeback (spends/fees remain).
+    for p in &mut prepared {
+        p.jobs.clear();
+        p.jobs.shrink_to_fit();
+    }
 
-    // ── 6. structural (durable spentness + maturity + subsidy; ordered) ─────
+    Ok(ScriptOkBatch {
+        prepared,
+        wire_blocks,
+        wave_prevouts,
+    })
+}
+
+/// WRITEBACK STAGE: structural → class_c → spend annotate → tip GC (FIFO caller).
+pub fn confirm_writeback_phase(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    mut batch: ScriptOkBatch,
+) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
     structural_run(
         query,
         params,
         milestone,
-        &prepared,
-        &wire_blocks,
-        &wave_prevouts,
+        &batch.prepared,
+        &batch.wire_blocks,
+        &batch.wave_prevouts,
     )?;
-
-    // ── 7. class_c ──────────────────────────────────────────────────────────
-    let n_blocks = prepared.len();
-    let out = class_c_commit(query, &mut prepared)?;
-
-    // ── 8. spend annotate + runway unpin/tip GC ──────────────────────────────
-    post_commit(query, &prepared)?;
-
+    let n_blocks = batch.prepared.len();
+    let out = class_c_commit(query, &mut batch.prepared)?;
+    post_commit(query, &batch.prepared)?;
     confirm_phase_stats::BLOCKS.fetch_add(n_blocks as u64, Ordering::Relaxed);
     Ok(out)
+}
+
+impl ScriptOkBatch {
+    /// Heights and header hashes in this batch (for events / feed scrub).
+    pub fn heights_hashes(&self) -> Vec<(u32, [u8; 32])> {
+        self.prepared
+            .iter()
+            .map(|p| (p.height.0, p.hash))
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.prepared.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.prepared.is_empty()
+    }
 }
 
 /// Samples major page faults for the **calling** thread only (Linux).

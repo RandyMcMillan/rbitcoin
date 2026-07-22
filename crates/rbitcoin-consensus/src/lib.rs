@@ -230,11 +230,13 @@ pub fn confirm_archived_at(
     Ok(fks[0])
 }
 
-/// Confirm a contiguous tip-extension run of archived bodies.
+/// Confirm a contiguous tip-extension run of archived bodies (sync script+writeback).
 ///
-/// Orchestrator: `resolve → prefetch/wave → wire → connect → scripts → class_c → utxo`.
-/// See [`confirm_run`] module for phase details. Behavior and timers unchanged.
-pub use confirm_run::confirm_archived_run;
+/// See [`confirm_run`]: script phase then writeback. IBD uses the split phases
+/// for pipeline overlap.
+pub use confirm_run::{
+    confirm_archived_run, confirm_script_phase, confirm_writeback_phase, ScriptOkBatch,
+};
 
 /// Accept + archive + confirm in one step (genesis / tip extension tests).
 pub fn accept_and_connect_block(

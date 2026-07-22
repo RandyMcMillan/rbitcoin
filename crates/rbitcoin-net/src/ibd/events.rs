@@ -472,6 +472,10 @@ pub(crate) fn apply_archive_result(
                 st.max_archived_height = st.max_archived_height.max(ht);
             }
         }
+        ArchiveResult::Dropped { wire_bytes } => {
+            // Duplicate while ContigPark still holds the first body — budget only.
+            archive_queued.release(wire_bytes);
+        }
         ArchiveResult::Err {
             hash,
             err,

@@ -224,8 +224,9 @@ enum ParkInsert {
     Parked,
     /// Height already past HWM or unknown — caller should single-archive / fail.
     Late(PreparedArchive),
-    /// Same height already parked (multi-peer). Caller must release budget
-    /// (`ArchiveResult::Ok`) without dropping the charge forever.
+    /// Same height already parked (multi-peer redelivery). Caller must release
+    /// the **second** charge via [`ArchiveResult::Dropped`] — **not** Ok
+    /// (body is not written yet; Ok would false-mark Class A for confirm).
     Duplicate(PreparedArchive),
 }
 
@@ -360,13 +361,18 @@ mod contig_park_tests {
     }
 
     #[test]
-    fn duplicate_height_does_not_drop_charge_silently() {
+    fn duplicate_height_returns_dup_for_budget_release_only() {
+        // Multi-peer redelivery: caller must ArchiveResult::Dropped (not Ok).
         let mut p = ContigPark::new(1);
         assert!(matches!(p.insert(prep(1)), super::ParkInsert::Parked));
         match p.insert(prep(1)) {
-            super::ParkInsert::Duplicate(d) => assert_eq!(d.height, 1),
+            super::ParkInsert::Duplicate(d) => {
+                assert_eq!(d.height, 1);
+                assert_eq!(d.hash, prep(1).hash);
+            }
             _ => panic!("expected Duplicate"),
         }
+        // Original remains parked until contiguous write.
         assert_eq!(p.parked_len(), 1);
     }
 
@@ -391,6 +397,14 @@ pub(crate) enum ArchiveResult {
     Err {
         hash: BlockHash,
         err: String,
+        wire_bytes: usize,
+    },
+    /// Release pipeline budget only — body was never Class-A written.
+    ///
+    /// Used for multi-peer redelivery while the first copy is still in
+    /// [`ContigPark`]. Must **not** call `mark_archived` (confirm would race
+    /// with "confirm without archive").
+    Dropped {
         wire_bytes: usize,
     },
 }
@@ -454,10 +468,10 @@ pub(crate) fn spawn_archive_pipeline(
                     match park.insert(p) {
                         ParkInsert::Parked => true,
                         ParkInsert::Duplicate(dup) => {
-                            // Multi-peer redelivery while first is still parked.
+                            // Multi-peer redelivery while first is still parked:
+                            // free the **duplicate** charge only — do not claim Ok.
                             write_result
-                                .send(ArchiveResult::Ok {
-                                    hash: dup.hash,
+                                .send(ArchiveResult::Dropped {
                                     wire_bytes: dup.wire_bytes,
                                 })
                                 .is_ok()

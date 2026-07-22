@@ -70,6 +70,14 @@ impl BodyPresence {
         self.missing.insert(h);
     }
 
+    /// Drop optimistic Class A cache only — next [`Self::ready`] re-probes the store.
+    ///
+    /// Used when confirm saw "without archive". Do **not** poison `missing`
+    /// (that would block re-offer until a fresh archive Ok).
+    pub(crate) fn demote_known(&mut self, h: BlockHash) {
+        self.known.remove(&h);
+    }
+
     /// Permanent confirm failure: never re-offer this hash to the confirm engine
     /// and never re-getdata it (Class A may still hold the body).
     pub(crate) fn mark_rejected(&mut self, h: BlockHash) {
@@ -123,6 +131,9 @@ impl BodyPresence {
     }
 
     /// True if Class A body is present (confirmable). Does not treat pending as ready.
+    ///
+    /// Trusts the local `known` set (set only after durable archive Ok). If confirm
+    /// races a stale known entry, the engine asks the main loop to [`Self::mark_missing`].
     pub(crate) fn ready(&mut self, hub: &ChainHub, h: &BlockHash) -> bool {
         if self.rejected.contains(h) {
             return false;
@@ -276,6 +287,18 @@ mod tests {
         body.mark_archived(hash);
         assert!(body.known.contains(&hash));
         assert!(!body.missing.contains(&hash));
+    }
+
+    #[test]
+    fn demote_known_allows_reprobe_without_missing() {
+        let mut body = BodyPresence::new();
+        let hash = h(6);
+        body.mark_archived(hash);
+        assert!(body.is_known_archived(&hash));
+        body.demote_known(hash);
+        assert!(!body.is_known_archived(&hash));
+        // Not in missing — ready() may re-probe store.
+        assert_eq!(body.skip_download_cached(&hash), None);
     }
 
     #[test]

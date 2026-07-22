@@ -4,7 +4,7 @@ use super::body::BodyPresence;
 use super::status::LoopStats;
 use crate::chain::ChainHub;
 use bitcoin::BlockHash;
-use rbitcoin_log::{info, warn};
+use rbitcoin_log::{debug, info, warn};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -53,6 +53,11 @@ pub(crate) enum ConfirmEvent {
         hash: BlockHash,
         err: String,
     },
+    /// Confirm saw tip+1 without durable Class A — clear optimistic `known` and
+    /// drop the feed entry so offer re-probes the store (no permanent blacklist).
+    BodyMissing {
+        hash: BlockHash,
+    },
 }
 
 /// How many consecutive ready heights to confirm in one multi-block script wave.
@@ -77,6 +82,8 @@ pub(crate) fn spawn_confirm_engine(
         .name("ibd-confirm".into())
         .spawn(move || {
             info!("ibd: confirm engine on dedicated OS thread");
+            // Per-height try counts for "without archive" (not a global spam counter).
+            let mut missing_tries: HashMap<u32, u32> = HashMap::new();
             loop {
                 if feed.stopped() {
                     break;
@@ -223,6 +230,7 @@ pub(crate) fn spawn_confirm_engine(
                         let mut g = feed.ready.lock().unwrap();
                         for i in 0..n {
                             let (height, hash) = batch[i];
+                            missing_tries.remove(&height);
                             g.remove(&height);
                             loop_stats.confirm_blocks.fetch_add(1, Ordering::Relaxed);
                             accepted.fetch_add(1, Ordering::SeqCst);
@@ -251,27 +259,37 @@ pub(crate) fn spawn_confirm_engine(
                             || msg.contains("NotFound")
                             || msg.contains("not found")
                         {
-                            // Transient only for a short window; then drop so we
-                            // re-offer / re-getdata instead of spinning forever.
-                            static TRANSIENT: AtomicU32 = AtomicU32::new(0);
-                            let n = TRANSIENT.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n <= 8 || n % 50 == 0 {
+                            // Stale feed / known vs store: drop tip+1, clear known on
+                            // main thread, re-offer only after durable Class A.
+                            let tries = missing_tries.entry(expect).or_insert(0);
+                            *tries = tries.saturating_add(1);
+                            let n = *tries;
+                            // First sighting + rare repeats only (avoid early-IBD WARN spam).
+                            if n == 1 {
+                                debug!(
+                                    "ibd: confirm without archive {hash} @ {expect} (will re-offer when Class A lands)"
+                                );
+                            } else if n == 10 || n % 100 == 0 {
                                 warn!(
-                                    "ibd: confirm transient {hash} @ {expect}: {msg} (n={n})"
+                                    "ibd: confirm without archive still missing {hash} @ {expect} (n={n})"
                                 );
                             }
-                            if n >= 40 {
-                                // Drop from feed so offer can re-note after body state updates.
-                                // Do **not** Reject (that blacklists permanently).
-                                let _ = feed.ready.lock().unwrap().remove(&expect);
-                                TRANSIENT.store(0, Ordering::Relaxed);
-                                warn!(
-                                    "ibd: confirm drop transient {hash} @ {expect} after {n} tries: {msg}"
-                                );
+                            let _ = feed.ready.lock().unwrap().remove(&expect);
+                            // Cap map growth if tip races through many misses.
+                            if missing_tries.len() > 256 {
+                                missing_tries.retain(|&h, _| h.saturating_add(64) > expect);
                             }
-                            std::thread::sleep(Duration::from_millis(25));
+                            if event_tx
+                                .send(ConfirmEvent::BodyMissing { hash })
+                                .is_err()
+                            {
+                                break;
+                            }
+                            // Brief yield so archive/main can make progress.
+                            std::thread::sleep(Duration::from_millis(5));
                             continue;
                         }
+                        missing_tries.remove(&expect);
                         loop_stats
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);

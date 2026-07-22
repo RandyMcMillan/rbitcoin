@@ -446,6 +446,10 @@ pub async fn ibd_cancellable(
                     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
                     st.body.mark_archived(hash);
                 }
+                ConfirmEvent::BodyMissing { hash } => {
+                    // Stale known vs store: re-probe on next offer (do not mark missing).
+                    st.body.demote_known(hash);
+                }
                 ConfirmEvent::Reject { height, hash, err } => {
                     apply_confirm_reject(&mut st, height, hash, &err);
                 }
@@ -520,6 +524,9 @@ pub async fn ibd_cancellable(
                     last_progress = Instant::now();
                     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
                     st.body.mark_archived(hash);
+                }
+                ConfirmEvent::BodyMissing { hash } => {
+                    st.body.demote_known(hash);
                 }
                 ConfirmEvent::Reject { height, hash, err } => {
                     apply_confirm_reject(&mut st, height, hash, &err);
@@ -1033,6 +1040,9 @@ pub async fn ibd_cancellable(
                             remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
                             st.body.mark_archived(hash);
                         }
+                        ConfirmEvent::BodyMissing { hash } => {
+                            st.body.demote_known(hash);
+                        }
                         ConfirmEvent::Reject { height, hash, err } => {
                             apply_confirm_reject(&mut st, height, hash, &err);
                         }
@@ -1150,6 +1160,7 @@ pub async fn ibd_cancellable(
     while let Ok(r) = arch_res_rx.try_recv() {
         match r {
             ArchiveResult::Ok { hash, .. } => st.body.mark_archived(hash),
+            ArchiveResult::Dropped { .. } => {}
             ArchiveResult::Err { hash, .. } => st.body.mark_missing(hash),
         }
     }

@@ -117,7 +117,7 @@ pub(crate) struct IbdPerfSample {
     pub cp_store: u64,
 
     // Parent prewarm (window counters + live snapshot)
-    /// Wall ms spent prewarming this window (worker + last-mile).
+    /// Wall ms spent prewarming this window.
     pub pw_ms: u64,
     pub pw_blocks: u64,
     pub pw_utxo_parents: u64,
@@ -127,7 +127,7 @@ pub(crate) struct IbdPerfSample {
     pub pw_cache_hits: u64,
     /// Phase-1 body Class A reads this window.
     pub pw_body_tx_reads: u64,
-    /// Phase-2 external parent Class A reads this window.
+    /// Phase-2 external parent pins this window.
     pub pw_parent_tx_reads: u64,
     pub pw_missing_parents: u64,
     /// Contiguous ready watermark height.
@@ -139,6 +139,21 @@ pub(crate) struct IbdPerfSample {
     pub pw_bodies: usize,
     pub pw_plans: usize,
     pub pw_depth: u32,
+    /// Prewarm internal phase ms (window sum).
+    pub pw_hdr_ms: u64,
+    pub pw_body_mlock_ms: u64,
+    pub pw_decode_ms: u64,
+    pub pw_thin_ms: u64,
+    pub pw_parent_pin_ms: u64,
+    pub pw_cache_put_ms: u64,
+    pub pw_head_lookups: u64,
+    pub pw_head_hits: u64,
+    pub pw_mlock_sys: u64,
+    pub pw_mlock_skip: u64,
+    pub pw_edge_same: u64,
+    pub pw_edge_runway: u64,
+    pub pw_edge_head: u64,
+    pub pw_edge_cb: u64,
 
     // Pipe
     pub pipe: ArchivePipelineSample,
@@ -239,6 +254,20 @@ impl Default for IbdPerfSample {
             pw_bodies: 0,
             pw_plans: 0,
             pw_depth: 0,
+            pw_hdr_ms: 0,
+            pw_body_mlock_ms: 0,
+            pw_decode_ms: 0,
+            pw_thin_ms: 0,
+            pw_parent_pin_ms: 0,
+            pw_cache_put_ms: 0,
+            pw_head_lookups: 0,
+            pw_head_hits: 0,
+            pw_mlock_sys: 0,
+            pw_mlock_skip: 0,
+            pw_edge_same: 0,
+            pw_edge_runway: 0,
+            pw_edge_head: 0,
+            pw_edge_cb: 0,
             pipe: ArchivePipelineSample::default(),
         }
     }
@@ -298,18 +327,7 @@ pub(crate) fn sample(
     let (wf_body, wf_ptx, wf_pout, wf_spent, wf_cb) =
         rbitcoin_query::wave_fill_stats::sample_and_reset();
     let (pwh, pca, psm) = rbitcoin_query::connect_prevout_stats::sample_and_reset();
-    let (
-        pw_ns,
-        pw_blocks,
-        pw_utxo,
-        pw_creates,
-        pw_ready,
-        pw_parent_unique,
-        pw_cache_hits,
-        pw_body_tx,
-        pw_parent_tx,
-        pw_missing,
-    ) = rbitcoin_query::parent_prewarm_stats::sample_and_reset();
+    let pw = rbitcoin_query::parent_prewarm_stats::sample_and_reset();
     let pipe = pipe_stats.sample_and_reset();
     let (pw_ready_through, pw_ahead, pw_parents, pw_bodies, pw_plans, pw_depth) = prewarm;
 
@@ -390,22 +408,36 @@ pub(crate) fn sample(
         cp_wave: pwh,
         cp_class_a: pca,
         cp_store: psm,
-        pw_ms: ns_ms(pw_ns),
-        pw_blocks,
-        pw_utxo_parents: pw_utxo,
-        pw_creates,
-        pw_already_ready: pw_ready,
-        pw_parent_unique,
-        pw_cache_hits,
-        pw_body_tx_reads: pw_body_tx,
-        pw_parent_tx_reads: pw_parent_tx,
-        pw_missing_parents: pw_missing,
+        pw_ms: ns_ms(pw.ns),
+        pw_blocks: pw.blocks,
+        pw_utxo_parents: pw.utxo_parents,
+        pw_creates: pw.creates,
+        pw_already_ready: pw.already_ready,
+        pw_parent_unique: pw.parent_unique,
+        pw_cache_hits: pw.cache_hits,
+        pw_body_tx_reads: pw.body_tx,
+        pw_parent_tx_reads: pw.parent_tx,
+        pw_missing_parents: pw.missing,
         pw_ready_through,
         pw_ahead,
         pw_parents,
         pw_bodies,
         pw_plans,
         pw_depth,
+        pw_hdr_ms: ns_ms(pw.header_ns),
+        pw_body_mlock_ms: ns_ms(pw.body_mlock_ns),
+        pw_decode_ms: ns_ms(pw.body_decode_ns),
+        pw_thin_ms: ns_ms(pw.thin_ns),
+        pw_parent_pin_ms: ns_ms(pw.parent_pin_ns),
+        pw_cache_put_ms: ns_ms(pw.cache_put_ns),
+        pw_head_lookups: pw.head_lookups,
+        pw_head_hits: pw.head_hits,
+        pw_mlock_sys: pw.mlock_syscalls,
+        pw_mlock_skip: pw.mlock_skipped,
+        pw_edge_same: pw.edge_same_batch,
+        pw_edge_runway: pw.edge_runway,
+        pw_edge_head: pw.edge_head,
+        pw_edge_cb: pw.edge_coinbase,
         pipe,
     }
 }
@@ -473,7 +505,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     };
     let mlock_mb = s.mlock_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} blks={} body_io={} parent_io={} cache%={} {}ms mlock={mlock_mb}MiB ranges={} sh_runs={}",
+        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} blks={} body_io={} parent_io={} cache%={} {}ms (hdr={} mlock={} dec={} thin={} pin={} put={}) head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
         s.pw_ahead,
         s.pw_ready_through,
         s.pw_parents,
@@ -485,6 +517,16 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.pw_parent_tx_reads,
         cache_pct,
         s.pw_ms,
+        s.pw_hdr_ms,
+        s.pw_body_mlock_ms,
+        s.pw_decode_ms,
+        s.pw_thin_ms,
+        s.pw_parent_pin_ms,
+        s.pw_cache_put_ms,
+        s.pw_head_hits,
+        s.pw_head_lookups,
+        s.pw_mlock_sys,
+        s.pw_mlock_skip,
         s.mlock_ranges,
         s.sh_runs,
     ));
@@ -544,7 +586,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let cp_tot = s.cp_wave + s.cp_class_a + s.cp_store;
     let mlock_mb = s.mlock_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} cache_hit={} body_io={} parent_io={} miss_p={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
+        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} cache_hit={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={} pin={} put={} head={}/{} mlock_sys={}/{} edges same={} runway={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
         s.pw_ahead,
         s.pw_ready_through,
         s.pw_parents,
@@ -561,6 +603,20 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.pw_body_tx_reads,
         s.pw_parent_tx_reads,
         s.pw_missing_parents,
+        s.pw_hdr_ms,
+        s.pw_body_mlock_ms,
+        s.pw_decode_ms,
+        s.pw_thin_ms,
+        s.pw_parent_pin_ms,
+        s.pw_cache_put_ms,
+        s.pw_head_hits,
+        s.pw_head_lookups,
+        s.pw_mlock_sys,
+        s.pw_mlock_skip,
+        s.pw_edge_same,
+        s.pw_edge_runway,
+        s.pw_edge_head,
+        s.pw_edge_cb,
         s.mlock_ranges,
         s.sh_runs,
         if cp_tot > 0 {

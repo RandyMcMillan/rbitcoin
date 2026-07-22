@@ -146,12 +146,25 @@ pub(crate) fn spawn_parent_prewarm(
                         if last_info.elapsed() >= Duration::from_secs(10) {
                             let (_, _, by_txid, bodies, plans, d) =
                                 query.parent_prewarm_perf_snapshot();
+                            let hdr = st.header_ns / 1_000_000;
+                            let ml = st.body_mlock_ns / 1_000_000;
+                            let dec = st.body_decode_ns / 1_000_000;
+                            let thin = st.thin_ns / 1_000_000;
+                            let pin = st.parent_pin_ns / 1_000_000;
+                            let put = st.cache_put_ns / 1_000_000;
                             info!(
-                                "ibd: prewarm tip={tip} +{ahead} thru={through} by_txid={by_txid} bodies={bodies} plans={plans}/{d} next_h={next_height} runway={} last_h={h0}..{h1} blks={} body_io={} parent_io={} {ms}ms",
+                                "ibd: prewarm tip={tip} +{ahead} thru={through} by_txid={by_txid} bodies={bodies} plans={plans}/{d} next_h={next_height} runway={} last_h={h0}..{h1} blks={} body_io={} parent_io={} head={}/{} mlock_sys={}/{} edges same={} runway={} head={} {ms}ms (hdr={hdr} mlock={ml} dec={dec} thin={thin} pin={pin} put={put})",
                                 runway.len(),
                                 st.blocks,
                                 st.body_tx_reads,
                                 st.full_tx_reads,
+                                st.head_hits,
+                                st.head_lookups,
+                                st.mlock_syscalls,
+                                st.mlock_skipped,
+                                st.edge_same_batch,
+                                st.edge_runway,
+                                st.edge_head,
                             );
                             last_info = std::time::Instant::now();
                         }

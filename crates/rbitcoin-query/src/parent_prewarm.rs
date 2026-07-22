@@ -16,6 +16,7 @@
 use super::*;
 use crate::confirm_parent_cache::{prewarm_headroom_from_env, StashedThinInput};
 use std::collections::HashMap;
+use std::time::Instant;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PrewarmStats {
@@ -28,12 +29,27 @@ pub struct PrewarmStats {
     pub parent_unique: u32,
     /// Parent outs served from runway txid map / same-batch.
     pub parent_cache_hits: u32,
-    /// Body txs mlocked + prevout-scanned (phase 1).
+    /// Body txs mlocked + full-decoded (phase 1).
     pub body_tx_reads: u32,
     /// Parent body mlocks (phase 2).
     pub full_tx_reads: u32,
     /// External parents that could not be resolved.
     pub missing_parents: u32,
+    /// Phase wall times (ns).
+    pub header_ns: u64,
+    pub body_mlock_ns: u64,
+    pub body_decode_ns: u64,
+    pub thin_ns: u64,
+    pub parent_pin_ns: u64,
+    pub cache_put_ns: u64,
+    pub head_lookups: u32,
+    pub head_hits: u32,
+    pub mlock_syscalls: u32,
+    pub mlock_skipped: u32,
+    pub edge_same_batch: u32,
+    pub edge_runway: u32,
+    pub edge_head: u32,
+    pub edge_coinbase: u32,
 }
 
 impl Query {
@@ -44,14 +60,16 @@ impl Query {
     }
 
     /// Page-align + merge body `(offset, len)`, `mlock` only spans not already
-    /// pinned, note all spans for `height`.
-    fn mlock_body_spans_skip_pinned(
+    /// pinned, note all spans for each of `heights`.
+    ///
+    /// Returns `(ranges, syscalls, skipped)`.
+    fn mlock_body_spans_for_heights(
         &self,
-        height: u32,
+        heights: &[u32],
         abs_ranges: &[(u64, u64)],
-    ) -> Vec<rbitcoin_store::MlockRange> {
-        if abs_ranges.is_empty() {
-            return Vec::new();
+    ) -> (Vec<rbitcoin_store::MlockRange>, u32, u32) {
+        if abs_ranges.is_empty() || heights.is_empty() {
+            return (Vec::new(), 0, 0);
         }
         const PAGE: u64 = 4096;
         let mut spans: Vec<(u64, u64)> = Vec::with_capacity(abs_ranges.len());
@@ -67,7 +85,7 @@ impl Query {
             }
         }
         if spans.is_empty() {
-            return Vec::new();
+            return (Vec::new(), 0, 0);
         }
         spans.sort_unstable_by_key(|(s, _)| *s);
         let mut merged: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
@@ -83,6 +101,8 @@ impl Query {
             merged.push((s, l));
         }
         let mut noted = Vec::with_capacity(merged.len());
+        let mut syscalls = 0u32;
+        let mut skipped = 0u32;
         for (ps, pl) in merged {
             let candidate = rbitcoin_store::MlockRange {
                 table: rbitcoin_store::MlockTable::TxBody,
@@ -91,19 +111,21 @@ impl Query {
             };
             if self.confirm_parents.is_range_pinned(&candidate) {
                 noted.push(candidate);
+                skipped = skipped.saturating_add(1);
                 continue;
             }
             let ml = self.store.mlock_tx_body_at(ps, pl);
+            syscalls = syscalls.saturating_add(1);
             if ml.is_empty() {
-                // Soft-fail mlock still note the candidate span for GC bookkeeping
-                // (pages may be resident without mlock).
                 noted.push(candidate);
             } else {
                 noted.extend(ml);
             }
         }
-        self.confirm_parents.note_mlock_ranges(height, &noted);
-        noted
+        for &h in heights {
+            self.confirm_parents.note_mlock_ranges(h, &noted);
+        }
+        (noted, syscalls, skipped)
     }
 
     pub fn parent_prewarm_depth(&self) -> u32 {
@@ -225,7 +247,7 @@ impl Query {
         &self,
         items: &[(u32, [u8; 32])],
     ) -> Result<PrewarmStats, QueryError> {
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         let mut st = PrewarmStats::default();
         if items.is_empty() {
             return Ok(st);
@@ -275,40 +297,44 @@ impl Query {
                 return Err(StoreError::Cancelled("confirm cancelled"));
             }
 
-            // ── Small: load + RAM-cache header / header_txs (no mlock) ─────
+            // ── Header + header_txs ────────────────────────────────────────
+            let t_hdr = Instant::now();
             let Some((header_fk, header_rec)) = self.store.get_header_by_hash(&hash)? else {
+                st.header_ns = st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
                 continue;
             };
             if !self.store.header_txs.has_body(header_fk)? {
+                st.header_ns = st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
                 continue;
             }
             let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
+                st.header_ns = st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
                 continue;
             };
             if tx_fks.is_empty() {
+                st.header_ns = st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
                 continue;
             }
             // Body readiness: first tx must have an idx range (no tx.head probe).
-            // Direct archive indexes head with bodies; head lag must not skip the height.
             if let Some(&first) = tx_fks.first() {
                 if self.store.tx_body_range(first).is_err() {
+                    st.header_ns = st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
                     continue;
                 }
             }
-
             self.confirm_parents.put_header_plan(
                 height,
                 header_fk,
                 header_rec,
                 tx_fks.clone(),
             );
+            st.header_ns = st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
 
-            // ── Large/write: mlock confirmed[h] (skip if already pinned) ───
+            // ── mlock confirmed[h] + body pages ────────────────────────────
+            let t_ml = Instant::now();
             self.mlock_note_skip_pinned(height, &self.store.mlock_confirmed_height(height));
-
             st.blocks = st.blocks.saturating_add(1);
 
-            // header_txs is almost always ascending fk; avoid clone+sort when so.
             let fks_work: std::borrow::Cow<'_, [Fk]> = if tx_fks_is_sorted_ascending(&tx_fks) {
                 std::borrow::Cow::Borrowed(tx_fks.as_slice())
             } else {
@@ -317,8 +343,6 @@ impl Query {
                 std::borrow::Cow::Owned(v)
             };
 
-            // Collect body ranges first → one coalesced mlock pass (fewer syscalls
-            // when sequential Class A fks share/adjacent pages).
             let mut height_body_abs: Vec<(u64, u64)> = Vec::with_capacity(fks_work.len());
             let mut height_fks_resolved: Vec<(Fk, Option<(u64, u64)>)> =
                 Vec::with_capacity(fks_work.len());
@@ -337,18 +361,29 @@ impl Query {
                     }
                 }
             }
-            // Coalesce page spans; mlock only unpinned; always note need_height.
-            let body_ml = self.mlock_body_spans_skip_pinned(height, &height_body_abs);
-            let _ = body_ml;
-            // Fallback bodies without cached range still need per-fk mlock.
+            let (_body_ml, sys, sk) =
+                self.mlock_body_spans_for_heights(&[height], &height_body_abs);
+            st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
+            st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
             for &(fk, range) in &height_fks_resolved {
                 if range.is_some() {
                     continue;
                 }
                 let body_ml = self.store.mlock_tx_body_only(fk);
+                st.mlock_syscalls = st.mlock_syscalls.saturating_add(1);
                 self.mlock_note_skip_pinned(height, &body_ml);
             }
+            // Class C for runway creates (batch note after one mlock set).
+            for &(fk, _) in &height_fks_resolved {
+                let cc = self.store.mlock_class_c_tx(fk);
+                self.mlock_note_skip_pinned(height, &cc);
+            }
+            st.body_mlock_ns = st
+                .body_mlock_ns
+                .saturating_add(t_ml.elapsed().as_nanos() as u64);
 
+            // ── Full body decode ───────────────────────────────────────────
+            let t_dec = Instant::now();
             for &(fk, range) in &height_fks_resolved {
                 if self.confirm_cancelled() {
                     crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
@@ -357,11 +392,6 @@ impl Query {
                 let Some(id) = fk.get() else {
                     continue;
                 };
-                // Class C write slots for runway creates.
-                let cc = self.store.mlock_class_c_tx(fk);
-                self.mlock_note_skip_pinned(height, &cc);
-
-                // Full decode once — wave_fill / wire rebuild consume from by_body.
                 let (tx, inputs, outs) = if let Some((off, len)) = range {
                     self.store.get_tx_full_at(off, len)?
                 } else {
@@ -378,16 +408,24 @@ impl Query {
                 body_fulls.push((fk, height, tx, outs, inputs));
                 st.creates_registered = st.creates_registered.saturating_add(1);
             }
+            st.body_decode_ns = st
+                .body_decode_ns
+                .saturating_add(t_dec.elapsed().as_nanos() as u64);
             height_tx_fks.push((height, tx_fks));
         }
 
+        // ── Cache put (bodies + creates + ranges) ──────────────────────────
+        let t_put = Instant::now();
         self.confirm_parents.put_body_ranges_batch(&body_ranges);
-        // One lock: full bodies for wave (by_txid registered inside insert_body).
         self.confirm_parents.put_bodies_batch(body_fulls);
         self.confirm_parents
             .register_mlocked_creates_batch(&create_regs);
+        st.cache_put_ns = st
+            .cache_put_ns
+            .saturating_add(t_put.elapsed().as_nanos() as u64);
 
-        // ── Thin edges + external parents ───────────────────────────────────
+        // ── Thin edges + external parent discovery ─────────────────────────
+        let t_thin = Instant::now();
         for (height, tx_fks) in &height_tx_fks {
             for fk in tx_fks {
                 let Some(id) = fk.get() else {
@@ -403,6 +441,7 @@ impl Query {
                             create_fk: None,
                             prev_index,
                         });
+                        st.edge_coinbase = st.edge_coinbase.saturating_add(1);
                         continue;
                     }
                     if let Some(&cfk) = batch_creates.get(&prev_txid) {
@@ -412,6 +451,7 @@ impl Query {
                         });
                         st.utxo_parents = st.utxo_parents.saturating_add(1);
                         st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
+                        st.edge_same_batch = st.edge_same_batch.saturating_add(1);
                         continue;
                     }
                     if let Some(cfk) = self
@@ -424,17 +464,21 @@ impl Query {
                         });
                         st.utxo_parents = st.utxo_parents.saturating_add(1);
                         st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
+                        st.edge_runway = st.edge_runway.saturating_add(1);
                         if let Some(pid) = cfk.get() {
                             parent_need.entry(pid).or_default().push(*height);
                         }
                         continue;
                     }
                     // Durable head lookup once; cache fk in by_txid (no head mlock).
+                    st.head_lookups = st.head_lookups.saturating_add(1);
                     if let Some(create_fk) = self.tx_fk_by_txid(&prev_txid).ok().flatten() {
+                        st.head_hits = st.head_hits.saturating_add(1);
                         edges.push(StashedThinInput {
                             create_fk: create_fk.get(),
                             prev_index,
                         });
+                        st.edge_head = st.edge_head.saturating_add(1);
                         if let Some(pid) = create_fk.get() {
                             self.confirm_parents.register_mlocked_create(
                                 create_fk,
@@ -454,11 +498,15 @@ impl Query {
                 thin_by_spend.insert(id, edges);
             }
         }
+        st.thin_ns = st.thin_ns.saturating_add(t_thin.elapsed().as_nanos() as u64);
 
+        // ── Pin external parent bodies (mlock only; already registered by txid) ─
+        let t_par = Instant::now();
         let mut uniq_parents: Vec<u64> = parent_need.keys().copied().collect();
         uniq_parents.sort_unstable();
         st.parent_unique = st.parent_unique.saturating_add(uniq_parents.len() as u32);
 
+        let mut parent_ranges: Vec<(Fk, u64, u64)> = Vec::new();
         for pid in uniq_parents {
             if self.confirm_cancelled() {
                 crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
@@ -468,25 +516,27 @@ impl Query {
             let mut need_hs = parent_need.remove(&pid).unwrap_or_default();
             need_hs.sort_unstable();
             need_hs.dedup();
-            let need_h = need_hs.first().copied().unwrap_or(0);
 
-            // Cache idx range; mlock body only (no spenders). Skip syscall if
-            // runway body already pinned this create.
-            if let Ok((off, len)) = self.store.tx_body_range(fk) {
-                body_ranges.push((fk, off, len));
-                for h in &need_hs {
-                    let _ = self.mlock_body_spans_skip_pinned(*h, &[(off, len)]);
-                }
+            // Prefer cached body range (same-batch creates) over idx read.
+            let range = self
+                .confirm_parents
+                .get_body_range(fk)
+                .or_else(|| self.store.tx_body_range(fk).ok());
+            if let Some((off, len)) = range {
+                parent_ranges.push((fk, off, len));
+                let (_, sys, sk) =
+                    self.mlock_body_spans_for_heights(&need_hs, &[(off, len)]);
+                st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
+                st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
                 let cc = self.store.mlock_class_c_tx(fk);
                 for h in &need_hs {
                     self.mlock_note_skip_pinned(*h, &cc);
                 }
-                if let Ok((meta, _)) = self.store.get_tx_meta_and_prevouts_at(off, len) {
-                    self.confirm_parents
-                        .register_mlocked_create(fk, meta.txid, need_h);
-                }
+                // by_txid already registered during thin resolve for external
+                // parents; no second meta/prevouts walk.
             } else {
                 let body_ml = self.store.mlock_tx_body_only(fk);
+                st.mlock_syscalls = st.mlock_syscalls.saturating_add(1);
                 for h in &need_hs {
                     self.mlock_note_skip_pinned(*h, &body_ml);
                 }
@@ -498,8 +548,12 @@ impl Query {
             st.full_tx_reads = st.full_tx_reads.saturating_add(1);
             st.utxo_parents = st.utxo_parents.saturating_add(1);
         }
-        // Parent body ranges may have been added after first batch put.
-        self.confirm_parents.put_body_ranges_batch(&body_ranges);
+        if !parent_ranges.is_empty() {
+            self.confirm_parents.put_body_ranges_batch(&parent_ranges);
+        }
+        st.parent_pin_ns = st
+            .parent_pin_ns
+            .saturating_add(t_par.elapsed().as_nanos() as u64);
 
         let thin_items: Vec<(Fk, Vec<StashedThinInput>)> = thin_by_spend
             .into_iter()

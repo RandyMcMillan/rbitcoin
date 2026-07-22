@@ -54,39 +54,90 @@ pub mod parent_prewarm_stats {
 
     /// Wall time in `prewarm_parents_for_heights`.
     pub static NS: AtomicU64 = AtomicU64::new(0);
-    /// Heights whose body was scanned this window.
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
-    /// Parent outs resolved via create_fk (runway / head) without full body warm.
     pub static UTXO_PARENTS: AtomicU64 = AtomicU64::new(0);
-    /// Runway create txs registered (full outs).
     pub static CREATES: AtomicU64 = AtomicU64::new(0);
-    /// Heights already ready (skipped).
     pub static ALREADY_READY: AtomicU64 = AtomicU64::new(0);
-    /// Unique parent create fks loaded (after sort/dedup).
     pub static PARENT_UNIQUE: AtomicU64 = AtomicU64::new(0);
-    /// Parent outs from cache (no store).
     pub static PARENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-    /// Phase-2 parent store loads (`get_tx_meta_and_outputs` only; not bodies).
     pub static FULL_TX_READS: AtomicU64 = AtomicU64::new(0);
-    /// Phase-1 body `get_tx_full` loads.
     pub static BODY_TX_READS: AtomicU64 = AtomicU64::new(0);
-    /// Unresolved external parents (should stay 0).
     pub static MISSING_PARENTS: AtomicU64 = AtomicU64::new(0);
+    /// Phase nanoseconds (sum over calls this window).
+    pub static HEADER_NS: AtomicU64 = AtomicU64::new(0);
+    pub static BODY_MLOCK_NS: AtomicU64 = AtomicU64::new(0);
+    pub static BODY_DECODE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static THIN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PARENT_PIN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static CACHE_PUT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Durable `tx.head` probes during thin resolve.
+    pub static HEAD_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+    pub static HEAD_HITS: AtomicU64 = AtomicU64::new(0);
+    /// Body-page mlock syscalls vs already-pinned skips.
+    pub static MLOCK_SYSCALLS: AtomicU64 = AtomicU64::new(0);
+    pub static MLOCK_SKIPPED: AtomicU64 = AtomicU64::new(0);
+    /// Thin edges classified: same-batch / runway / head / coinbase / miss.
+    pub static EDGE_SAME_BATCH: AtomicU64 = AtomicU64::new(0);
+    pub static EDGE_RUNWAY: AtomicU64 = AtomicU64::new(0);
+    pub static EDGE_HEAD: AtomicU64 = AtomicU64::new(0);
+    pub static EDGE_COINBASE: AtomicU64 = AtomicU64::new(0);
 
-    /// `(ns, blocks, utxo_parents, creates, already_ready, parent_unique, cache_hits, body_tx, parent_tx, missing)`.
-    pub fn sample_and_reset() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
-        (
-            NS.swap(0, Ordering::Relaxed),
-            BLOCKS.swap(0, Ordering::Relaxed),
-            UTXO_PARENTS.swap(0, Ordering::Relaxed),
-            CREATES.swap(0, Ordering::Relaxed),
-            ALREADY_READY.swap(0, Ordering::Relaxed),
-            PARENT_UNIQUE.swap(0, Ordering::Relaxed),
-            PARENT_CACHE_HITS.swap(0, Ordering::Relaxed),
-            BODY_TX_READS.swap(0, Ordering::Relaxed),
-            FULL_TX_READS.swap(0, Ordering::Relaxed),
-            MISSING_PARENTS.swap(0, Ordering::Relaxed),
-        )
+    /// One sampler snapshot (all counters reset).
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct Sample {
+        pub ns: u64,
+        pub blocks: u64,
+        pub utxo_parents: u64,
+        pub creates: u64,
+        pub already_ready: u64,
+        pub parent_unique: u64,
+        pub cache_hits: u64,
+        pub body_tx: u64,
+        pub parent_tx: u64,
+        pub missing: u64,
+        pub header_ns: u64,
+        pub body_mlock_ns: u64,
+        pub body_decode_ns: u64,
+        pub thin_ns: u64,
+        pub parent_pin_ns: u64,
+        pub cache_put_ns: u64,
+        pub head_lookups: u64,
+        pub head_hits: u64,
+        pub mlock_syscalls: u64,
+        pub mlock_skipped: u64,
+        pub edge_same_batch: u64,
+        pub edge_runway: u64,
+        pub edge_head: u64,
+        pub edge_coinbase: u64,
+    }
+
+    pub fn sample_and_reset() -> Sample {
+        Sample {
+            ns: NS.swap(0, Ordering::Relaxed),
+            blocks: BLOCKS.swap(0, Ordering::Relaxed),
+            utxo_parents: UTXO_PARENTS.swap(0, Ordering::Relaxed),
+            creates: CREATES.swap(0, Ordering::Relaxed),
+            already_ready: ALREADY_READY.swap(0, Ordering::Relaxed),
+            parent_unique: PARENT_UNIQUE.swap(0, Ordering::Relaxed),
+            cache_hits: PARENT_CACHE_HITS.swap(0, Ordering::Relaxed),
+            body_tx: BODY_TX_READS.swap(0, Ordering::Relaxed),
+            parent_tx: FULL_TX_READS.swap(0, Ordering::Relaxed),
+            missing: MISSING_PARENTS.swap(0, Ordering::Relaxed),
+            header_ns: HEADER_NS.swap(0, Ordering::Relaxed),
+            body_mlock_ns: BODY_MLOCK_NS.swap(0, Ordering::Relaxed),
+            body_decode_ns: BODY_DECODE_NS.swap(0, Ordering::Relaxed),
+            thin_ns: THIN_NS.swap(0, Ordering::Relaxed),
+            parent_pin_ns: PARENT_PIN_NS.swap(0, Ordering::Relaxed),
+            cache_put_ns: CACHE_PUT_NS.swap(0, Ordering::Relaxed),
+            head_lookups: HEAD_LOOKUPS.swap(0, Ordering::Relaxed),
+            head_hits: HEAD_HITS.swap(0, Ordering::Relaxed),
+            mlock_syscalls: MLOCK_SYSCALLS.swap(0, Ordering::Relaxed),
+            mlock_skipped: MLOCK_SKIPPED.swap(0, Ordering::Relaxed),
+            edge_same_batch: EDGE_SAME_BATCH.swap(0, Ordering::Relaxed),
+            edge_runway: EDGE_RUNWAY.swap(0, Ordering::Relaxed),
+            edge_head: EDGE_HEAD.swap(0, Ordering::Relaxed),
+            edge_coinbase: EDGE_COINBASE.swap(0, Ordering::Relaxed),
+        }
     }
 
     #[inline]
@@ -94,33 +145,36 @@ pub mod parent_prewarm_stats {
         if ns > 0 {
             NS.fetch_add(ns, Ordering::Relaxed);
         }
-        if st.blocks > 0 {
-            BLOCKS.fetch_add(st.blocks as u64, Ordering::Relaxed);
+        macro_rules! add {
+            ($field:ident, $atom:ident) => {
+                if st.$field > 0 {
+                    $atom.fetch_add(st.$field as u64, Ordering::Relaxed);
+                }
+            };
         }
-        if st.utxo_parents > 0 {
-            UTXO_PARENTS.fetch_add(st.utxo_parents as u64, Ordering::Relaxed);
-        }
-        if st.creates_registered > 0 {
-            CREATES.fetch_add(st.creates_registered as u64, Ordering::Relaxed);
-        }
-        if st.already_ready > 0 {
-            ALREADY_READY.fetch_add(st.already_ready as u64, Ordering::Relaxed);
-        }
-        if st.parent_unique > 0 {
-            PARENT_UNIQUE.fetch_add(st.parent_unique as u64, Ordering::Relaxed);
-        }
-        if st.parent_cache_hits > 0 {
-            PARENT_CACHE_HITS.fetch_add(st.parent_cache_hits as u64, Ordering::Relaxed);
-        }
-        if st.full_tx_reads > 0 {
-            FULL_TX_READS.fetch_add(st.full_tx_reads as u64, Ordering::Relaxed);
-        }
-        if st.body_tx_reads > 0 {
-            BODY_TX_READS.fetch_add(st.body_tx_reads as u64, Ordering::Relaxed);
-        }
-        if st.missing_parents > 0 {
-            MISSING_PARENTS.fetch_add(st.missing_parents as u64, Ordering::Relaxed);
-        }
+        add!(blocks, BLOCKS);
+        add!(utxo_parents, UTXO_PARENTS);
+        add!(creates_registered, CREATES);
+        add!(already_ready, ALREADY_READY);
+        add!(parent_unique, PARENT_UNIQUE);
+        add!(parent_cache_hits, PARENT_CACHE_HITS);
+        add!(full_tx_reads, FULL_TX_READS);
+        add!(body_tx_reads, BODY_TX_READS);
+        add!(missing_parents, MISSING_PARENTS);
+        add!(header_ns, HEADER_NS);
+        add!(body_mlock_ns, BODY_MLOCK_NS);
+        add!(body_decode_ns, BODY_DECODE_NS);
+        add!(thin_ns, THIN_NS);
+        add!(parent_pin_ns, PARENT_PIN_NS);
+        add!(cache_put_ns, CACHE_PUT_NS);
+        add!(head_lookups, HEAD_LOOKUPS);
+        add!(head_hits, HEAD_HITS);
+        add!(mlock_syscalls, MLOCK_SYSCALLS);
+        add!(mlock_skipped, MLOCK_SKIPPED);
+        add!(edge_same_batch, EDGE_SAME_BATCH);
+        add!(edge_runway, EDGE_RUNWAY);
+        add!(edge_head, EDGE_HEAD);
+        add!(edge_coinbase, EDGE_COINBASE);
     }
 }
 

@@ -160,14 +160,35 @@ fn civil_utc(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     (y, m, d, h, mi, s)
 }
 
+/// Optional line emphasis (ANSI on a TTY stderr only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Style {
+    #[default]
+    Plain,
+    /// Bold message body (`\x1b[1m…\x1b[0m`) when stderr is a terminal.
+    Bold,
+}
+
 /// Write one log line if `level` is enabled.
 pub fn log_at(level: Level, args: fmt::Arguments<'_>) {
+    log_at_style(level, Style::Plain, args);
+}
+
+/// Write one log line with optional style. Bold is applied only when stderr is
+/// an interactive terminal so redirected logs stay clean ASCII.
+pub fn log_at_style(level: Level, style: Style, args: fmt::Arguments<'_>) {
     if !enabled(level) {
         return;
     }
     let ts = format_timestamp(SystemTime::now());
     let mut stderr = io::stderr().lock();
-    let _ = writeln!(stderr, "{ts} {level:<5} {args}");
+    // Bold only on interactive stderr so `> file` / pipes stay plain text.
+    let bold = matches!(style, Style::Bold) && io::IsTerminal::is_terminal(&stderr);
+    if bold {
+        let _ = writeln!(stderr, "{ts} {level:<5} \x1b[1m{args}\x1b[0m");
+    } else {
+        let _ = writeln!(stderr, "{ts} {level:<5} {args}");
+    }
     let _ = stderr.flush();
 }
 
@@ -197,6 +218,18 @@ macro_rules! warn {
 macro_rules! info {
     ($($arg:tt)*) => {
         $crate::log_at($crate::Level::Info, format_args!($($arg)*))
+    };
+}
+
+/// Log an info-level line with bold emphasis (TTY only; plain when redirected).
+#[macro_export]
+macro_rules! info_bold {
+    ($($arg:tt)*) => {
+        $crate::log_at_style(
+            $crate::Level::Info,
+            $crate::Style::Bold,
+            format_args!($($arg)*),
+        )
     };
 }
 
@@ -269,7 +302,13 @@ mod tests {
         // Should not panic; visual check not required.
         log_at(Level::Info, format_args!("hidden"));
         log_at(Level::Error, format_args!("shown {}", 1));
+        log_at_style(Level::Error, Style::Bold, format_args!("bold shown"));
         init(Level::Info);
+    }
+
+    #[test]
+    fn style_default_is_plain() {
+        assert_eq!(Style::default(), Style::Plain);
     }
 
     #[test]

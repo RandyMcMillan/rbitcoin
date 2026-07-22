@@ -5,7 +5,7 @@
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
-//! | INFO  | `ibd: progress …` | Tip/arch rates over the **last 5s**, prewarm lead, horizon, **1h tip ETA** |
+//! | INFO  | `ibd: progress …` | Tip/arch rates over the **last 5s**, prewarm lead, horizon, **1h tip ETA** (bold on TTY) |
 //! | INFO  | `ibd: perf …` | Download queue, archive pressure, confirm cost, prewarm phases, loop mix |
 //! | DEBUG | `ibd: perf_dbg …` | µs/blk phases, wave/SH subs, caches, pipe |
 //!

@@ -75,7 +75,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use rbitcoin_log::{info, warn};
+use rbitcoin_log::{info, info_bold, warn};
 
 /// Default max **concurrent** unique block downloads (in-flight getdata).
 ///
@@ -810,7 +810,8 @@ pub async fn ibd_cancellable(
             tip_rate_tracker.push(now, prog.tip);
             let eta = tip_rate_tracker.eta_string(now, prog.tip, prog.headers);
 
-            info!(
+            // Bold on a TTY so the 5s progress line stands out among perf/debug noise.
+            info_bold!(
                 "ibd: progress {pct}% tip={} ({}/s) arch_hwm={} ({}/s lead={arch_lead}) hole={} peers={peers_n} prewarm+{pw_ahead} mlock={mlock_mb}MiB sh_runs={sh_runs} horizon={} {eta}",
                 prog.tip,
                 format_rate(tip_rate),

@@ -32,7 +32,7 @@ On open, `repair_class_c_above_tip` clears strong/height **above** tip (tip-rela
 
 ## Thin scripthash (Electrum outpoint pointers)
 
-- Hybrid (schema v4): head holds ≤2 inline creates or one geometric body slab (`create_tx_fk | vout` entries, no `next`). Size-class freelist reuses freed slabs.
+- Hybrid (current / since v4–v6): head holds ≤2 inline creates or one geometric body slab (`create_tx_fk` only, no `next`). Size-class freelist reuses freed slabs.
 - **No spend columns** — spentness from points + Class C at query time.
 - Creates written on confirm (before tip advance).
 - **Kill-safe without chain walks:** first confirm after open **sequentially scans**

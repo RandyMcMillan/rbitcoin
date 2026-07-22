@@ -15,24 +15,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// File magic for store tables: ASCII `RBT1`.
 pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 
-/// Current on-disk schema version (see workspace `SCHEMA.md`).
-///
-/// v10: packed Class A inputs store **create_fk:u64 + vout** (not prev_txid[32])
-/// for non-coinbase; wipe datadir from v9. `tx.head` keyless address with online
-/// sequential resize (default BITS=28 @ 4 B; 8 B entries at BITS≥33).
-///
-/// v9: `tx.head` is fixed `2^BITS` × **4 B** create_fk entries (no HAS_NEXT; probe
-/// until empty); `tx_height` uses **u32** slots. Dense Class A fk + `tx.idx` retained.
-///
-/// v8: `tx.head` `2^31` × 8 B (fk + HAS_NEXT); `tx_height` u64 slots.
-///
-/// v7: hash heads use 16 B key prefixes + optional multi-fk list (`.mlt`).
-///
-/// v6: scripthash head 16 B key prefix + 16 B value; body entry = create_tx_fk only.
-///
-/// v5: spend annotation on each output; no `point.head` open-hash multimap.
-///
-/// v4: hybrid scripthash; v3: thin lists + strong_tx bitset; external prev_txid.
+/// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
+/// Historic versions: `SCHEMA_HISTORY.md`.
 pub const SCHEMA_VERSION: u16 = 10;
 
 /// 1-based foreign key into a store table body. Zero means null / absent.

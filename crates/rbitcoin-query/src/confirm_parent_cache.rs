@@ -1237,6 +1237,16 @@ impl ConfirmParentCache {
         g.by_body.get(&id).map(|b| b.tx.clone())
     }
 
+    /// Txid of a stashed parent create (by_fk sparse or runway body) — no clone of outs.
+    pub fn get_parent_txid(&self, fk: Fk) -> Option<[u8; 32]> {
+        let id = fk.get()?;
+        let g = self.inner.lock().unwrap();
+        if let Some(e) = g.by_fk.get(&id) {
+            return Some(e.tx.txid);
+        }
+        g.by_body.get(&id).map(|b| b.tx.txid)
+    }
+
     pub fn get_by_txid(&self, txid: &[u8; 32]) -> Option<Fk> {
         self.inner
             .lock()

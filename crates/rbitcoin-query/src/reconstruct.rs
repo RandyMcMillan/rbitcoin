@@ -406,7 +406,8 @@ impl Query {
     /// Reconstruct a consensus `Transaction` from Class A rows (no stored raw).
     pub fn reconstruct_tx(&self, tx_fk: Fk) -> Result<Transaction, QueryError> {
         let (rec, stored_outputs, mut stored_inputs) = self.load_body_prewarmed(tx_fk)?;
-        self.fill_input_prev_txids(&mut stored_inputs)?;
+        let mut cache = HashMap::new();
+        self.fill_input_prev_txids_cached(&mut stored_inputs, None, &mut cache)?;
         Ok(Self::transaction_from_class_a(
             rec,
             stored_outputs,
@@ -452,10 +453,20 @@ impl Query {
         }
     }
 
-    /// Fill soft `prev_txid` on inputs from each create body (schema v10).
-    pub(crate) fn fill_input_prev_txids(
+    /// Resolve soft `prev_txid` from create_fk without re-reading every parent body.
+    ///
+    /// Schema v10 stamps create_fk and leaves soft prev_txid zero on disk. Wire
+    /// rebuild used to call [`Store::body_txid`] once per input (~thousands of
+    /// body reads/block). Prefer, in order:
+    /// 1. already-filled soft prev_txid
+    /// 2. wave parent / body_wire TxRecord (confirm hot path — already decoded)
+    /// 3. confirm parent cache (prewarm sparse / runway body)
+    /// 4. store `body_txid` (deduped via `cache` across a block)
+    pub(crate) fn fill_input_prev_txids_cached(
         &self,
         inputs: &mut [InputRecord],
+        wave: Option<&crate::WavePrevoutCache>,
+        cache: &mut HashMap<u64, [u8; 32]>,
     ) -> Result<(), QueryError> {
         for inp in inputs.iter_mut() {
             if inp.is_coinbase() {
@@ -465,10 +476,28 @@ impl Query {
             if inp.prev_txid != [0u8; 32] {
                 continue;
             }
-            if inp.create_fk.is_null() {
-                return Err(StoreError::Corrupt("input missing create_fk for wire rebuild"));
+            let Some(id) = inp.create_fk.get() else {
+                return Err(StoreError::Corrupt(
+                    "input missing create_fk for wire rebuild",
+                ));
+            };
+            if let Some(&txid) = cache.get(&id) {
+                inp.prev_txid = txid;
+                continue;
             }
-            inp.prev_txid = self.store.txs.body_txid(inp.create_fk)?;
+            let from_ram = if let Some(w) = wave {
+                w.get_tx(Fk(id)).map(|t| t.txid)
+            } else {
+                None
+            }
+            .or_else(|| self.confirm_parents.get_parent_txid(Fk(id)));
+            let txid = match from_ram {
+                Some(t) => t,
+                // Unique create: one body prefix read, then reused via `cache`.
+                None => self.store.txs.body_txid(Fk(id))?,
+            };
+            cache.insert(id, txid);
+            inp.prev_txid = txid;
         }
         Ok(())
     }
@@ -519,15 +548,32 @@ impl Query {
         }
         let header = self.wire_header_from_record(&rec)?;
         let mut txdata = Vec::with_capacity(tx_fks.len());
+        // Dedup create_fk → txid across the whole block (and prefer wave parents).
+        let mut prev_txid_cache: HashMap<u64, [u8; 32]> = HashMap::new();
         for fk in tx_fks {
             if let Some(w) = wave.as_deref_mut() {
                 if let Some((tx, outs, mut ins)) = w.take_body_wire(fk) {
-                    self.fill_input_prev_txids(&mut ins)?;
+                    self.fill_input_prev_txids_cached(
+                        &mut ins,
+                        Some(w),
+                        &mut prev_txid_cache,
+                    )?;
                     txdata.push(Self::transaction_from_class_a(tx, outs, ins));
                     continue;
                 }
             }
-            txdata.push(self.reconstruct_tx(fk)?);
+            // No wave body: still use shared cache + parent runway before body_txid.
+            let (rec_tx, stored_outputs, mut stored_inputs) = self.load_body_prewarmed(fk)?;
+            self.fill_input_prev_txids_cached(
+                &mut stored_inputs,
+                wave.as_deref(),
+                &mut prev_txid_cache,
+            )?;
+            txdata.push(Self::transaction_from_class_a(
+                rec_tx,
+                stored_outputs,
+                stored_inputs,
+            ));
         }
         Ok(Block { header, txdata })
     }

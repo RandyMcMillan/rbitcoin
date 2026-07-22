@@ -73,6 +73,10 @@ struct Prepared {
 ///
 /// Intermediate heights are not yet in `confirmed[]`, so header checks after the
 /// first use the previous block in the run (not `header_at_height`).
+///
+/// **Majflt guard:** after prewarm is ready, samples this thread's major page
+/// faults (`getrusage` `RUSAGE_THREAD`) for wave→post_commit. If the count
+/// rises, logs a **warn** (cold store touch / mlock gap). Never fails the batch.
 pub fn confirm_archived_run(
     query: &Query,
     params: &ChainParams,
@@ -112,6 +116,13 @@ pub fn confirm_archived_run(
         Ordering::Relaxed,
     );
 
+    // Majflt window: confirm hot path only (after runway should be mlocked).
+    // Excludes wait / test-only prewarm load so those intentional faults do not warn.
+    let _majflt = ConfirmMajfltGuard::start(
+        blocks.first().map(|b| b.0 .0).unwrap_or(0),
+        blocks.len(),
+    );
+
     // ── 2. wave_fill (reuse resolve tx_fks — no header re-probe) ────────────
     let mut wave_prevouts = wave_fill(query, &metas)?;
 
@@ -140,6 +151,95 @@ pub fn confirm_archived_run(
 
     confirm_phase_stats::BLOCKS.fetch_add(n_blocks as u64, Ordering::Relaxed);
     Ok(out)
+}
+
+/// Samples major page faults for the **calling** thread only (Linux).
+///
+/// Other threads (archive, prewarm, rayon script workers) do not count. Store
+/// cold touches on the confirm OS thread show up here; `mlock` gaps → warn.
+fn thread_majflt() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        // RUSAGE_THREAD is Linux-specific (not in all libc feature sets as a
+        // portable constant — use the numeric value 1 when needed).
+        const RUSAGE_THREAD: libc::c_int = 1;
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        let rc = unsafe { libc::getrusage(RUSAGE_THREAD, usage.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        let u = unsafe { usage.assume_init() };
+        Some(u.ru_majflt as u64)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// On drop: warn if this confirm thread took major page faults during the run.
+struct ConfirmMajfltGuard {
+    before: Option<u64>,
+    first_h: u32,
+    n_blocks: usize,
+    started: Instant,
+}
+
+impl ConfirmMajfltGuard {
+    fn start(first_h: u32, n_blocks: usize) -> Self {
+        Self {
+            before: thread_majflt(),
+            first_h,
+            n_blocks,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ConfirmMajfltGuard {
+    fn drop(&mut self) {
+        let Some(before) = self.before else {
+            return;
+        };
+        let Some(after) = thread_majflt() else {
+            return;
+        };
+        if after <= before {
+            return;
+        }
+        let delta = after - before;
+        rbitcoin_log::warn!(
+            "confirm: major page fault(s) on confirm thread delta={delta} first_h={} n={} elapsed_ms={} (cold store touch; prewarm/mlock gap)",
+            self.first_h,
+            self.n_blocks,
+            self.started.elapsed().as_millis(),
+        );
+    }
+}
+
+#[cfg(test)]
+mod majflt_tests {
+    use super::*;
+
+    #[test]
+    fn thread_majflt_samples_on_linux() {
+        #[cfg(target_os = "linux")]
+        {
+            // Sampleable; absolute value is environment-dependent.
+            assert!(thread_majflt().is_some());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(thread_majflt().is_none());
+        }
+    }
+
+    #[test]
+    fn majflt_guard_drop_does_not_panic() {
+        // No faults expected; guard must be silent and non-fatal.
+        let g = ConfirmMajfltGuard::start(0, 1);
+        drop(g);
+    }
 }
 
 // ─── phases ───────────────────────────────────────────────────────────────────

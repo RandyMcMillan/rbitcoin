@@ -10,10 +10,13 @@ description = "Block and transaction validation / confirmability"
 rbitcoin-primitives = { workspace = true }
 rbitcoin-query = { workspace = true }
 rbitcoin-store = { workspace = true }
+rbitcoin-log = { workspace = true }
 bitcoin = { workspace = true }
 bitcoin_hashes = { workspace = true }
 # Global thread pool for script checks — avoid spawn/teardown per block.
 rayon = "1.10"
+# Confirm-thread majflt sampling (getrusage RUSAGE_THREAD).
+libc = "0.2"
 
 [[bench]]
 name = "script_pool"

@@ -26,6 +26,10 @@ impl Drop for TempStore {
 }
 
 fn temp_hub() -> (TempStore, Arc<ChainHub>) {
+    // Tiny heads — this module is diagnostic and often ignored, but keep cheap.
+    if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+    }
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -79,6 +83,7 @@ fn chain_headers(hub: &ChainHub, n: u32) -> Vec<Header> {
 }
 
 #[test]
+#[ignore = "diagnostic microbench; run: cargo test -p rbitcoin-net freeze_bench -- --ignored --nocapture"]
 fn freeze_bench_ensure_header_fk_known_vs_new() {
     let (_dir, hub) = temp_hub();
     let headers = chain_headers(&hub, 4_000);
@@ -129,6 +134,7 @@ fn freeze_bench_ensure_header_fk_known_vs_new() {
 }
 
 #[test]
+#[ignore = "diagnostic microbench; run: cargo test -p rbitcoin-net freeze_bench -- --ignored --nocapture"]
 fn freeze_bench_headers_apply_overlap() {
     let (_dir, hub) = temp_hub();
     let headers = chain_headers(&hub, 3_000);
@@ -232,6 +238,7 @@ fn freeze_bench_headers_apply_overlap() {
 }
 
 #[test]
+#[ignore = "diagnostic microbench; run: cargo test -p rbitcoin-net freeze_bench -- --ignored --nocapture"]
 fn freeze_bench_unbounded_drain_livelock_shape() {
     eprintln!("\n=== drain budget vs livelock shape ===");
     // Model: producer adds events while consumer drains; unbounded drain never

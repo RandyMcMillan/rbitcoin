@@ -390,6 +390,7 @@ fn multi_rt() -> tokio::runtime::Runtime {
 }
 
 #[test]
+#[ignore = "diagnostic contention bench; run: cargo test -p rbitcoin-net reader_contention -- --ignored --nocapture"]
 fn reader_contention_matrix() {
     eprintln!("\n=== reader contention matrix (workers={WORKERS}, readers={READERS}, msgs/reader={MSGS_PER_READER}) ===");
 
@@ -500,6 +501,7 @@ fn reader_contention_matrix() {
 /// Pure CPU: how expensive is one full `RawNetworkMessage`/`Block` deserialize
 /// relative to framing alone? (Reader path does both before `PeerEvent::Block`.)
 #[test]
+#[ignore = "diagnostic contention bench; run: cargo test -p rbitcoin-net reader_contention -- --ignored --nocapture"]
 fn reader_contention_deserialize_cost() {
     let magic = signet_magic();
     let block = fat_block(7);
@@ -577,6 +579,7 @@ fn reader_contention_deserialize_cost() {
 /// Many concurrent readers each doing full deserialize on a 4-worker runtime:
 /// self-contention even without an external hog (N readers > workers).
 #[test]
+#[ignore = "diagnostic contention bench; run: cargo test -p rbitcoin-net reader_contention -- --ignored --nocapture"]
 fn reader_contention_many_peers_self_saturate() {
     eprintln!("\n=== many-peer self-contention (deserialize on reader tasks) ===");
     let magic = signet_magic();
@@ -634,6 +637,7 @@ fn reader_contention_many_peers_self_saturate() {
 /// cooperative deserializers share the runtime (models archive-prep + multi-peer
 /// decode competing with socket reads). Compare against spawn_blocking offload.
 #[test]
+#[ignore = "diagnostic contention bench; run: cargo test -p rbitcoin-net reader_contention -- --ignored --nocapture"]
 fn reader_contention_sustained_coop_tax() {
     eprintln!("\n=== sustained cooperative tax (500ms windows) ===");
     let magic = signet_magic();
@@ -784,6 +788,7 @@ fn reader_contention_sustained_coop_tax() {
 /// Direct comparison: deserialize on the reader task (today) vs frame-only on
 /// the reader + `spawn_blocking` deserialize (isolation option).
 #[test]
+#[ignore = "diagnostic contention bench; run: cargo test -p rbitcoin-net reader_contention -- --ignored --nocapture"]
 fn reader_contention_offload_deserialize() {
     eprintln!("\n=== deserialize on-reader vs spawn_blocking offload ===");
     let magic = signet_magic();

@@ -1700,10 +1700,12 @@ mod tests {
         let waiter = Arc::clone(&c);
         let j = thread::spawn(move || {
             waiter
-                .wait_heights_ready(&[11], Duration::from_secs(2), || false)
+                .wait_heights_ready(&[11], Duration::from_millis(500), || false)
                 .expect("should become ready")
         });
-        thread::sleep(Duration::from_millis(20));
+        // Yield so the waiter parks on the condvar before we mark scanned.
+        thread::yield_now();
+        thread::sleep(Duration::from_millis(1));
         c.mark_scanned(11);
         j.join().unwrap();
         assert!(c.is_ready(11));

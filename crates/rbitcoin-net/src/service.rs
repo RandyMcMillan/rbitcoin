@@ -220,7 +220,7 @@ impl P2PNode {
             }
             tokio::select! {
                 _ = self.hub.notify.notified() => {}
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
             }
         }
     }
@@ -240,7 +240,7 @@ impl P2PNode {
             }
             tokio::select! {
                 _ = self.hub.notify.notified() => {}
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
             }
         }
     }

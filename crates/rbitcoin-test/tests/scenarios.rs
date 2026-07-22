@@ -838,11 +838,11 @@ fn confirm_survives_partial_class_c_without_tip_advance() {
     assert_eq!(q2.tip_height(), Some(Height(spend_h + 1)));
 }
 
-/// Schema v10: spend body may arrive before its parent create is archived.
-/// Archive must return a **transient** NotFound (not Corrupt), leave sticky clean,
-/// and succeed once the parent is on disk — regresses mainnet-ibd.log cascade.
+/// Schema v10: Class A archive requires parent create on disk (or same mega-batch).
+/// IBD parks out-of-order bodies until height-contiguous; direct archive of a
+/// spend without its parent must fail cleanly, then succeed after the parent.
 #[test]
-fn archive_spend_before_parent_is_transient_then_ok() {
+fn archive_spend_requires_parent_then_ok() {
     use rbitcoin_consensus::{
         accept_and_connect_block, header_to_record, prepare_block_for_archive_ibd, ChainParams,
         Milestone,
@@ -885,12 +885,8 @@ fn archive_spend_before_parent_is_transient_then_ok() {
         .expect_err("spend without parent create must fail");
     let msg = err.to_string();
     assert!(
-        msg.to_lowercase().contains("not found"),
-        "expected transient NotFound, got: {msg}"
-    );
-    assert!(
-        !msg.to_lowercase().contains("corrupt") && !msg.contains("schema mismatch"),
-        "must not look like permanent corruption: {msg}"
+        msg.contains("parent create_fk unresolved") || msg.contains("contiguous"),
+        "expected create_fk parent error, got: {msg}"
     );
     assert!(
         !q.store().header_txs.has_body(hs_fk).unwrap(),

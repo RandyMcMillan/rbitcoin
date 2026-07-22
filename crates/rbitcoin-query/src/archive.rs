@@ -24,6 +24,9 @@ impl Query {
     /// Libbitcoin-style: plan FKs, contiguous put of txs/ins/outs, bulk hash
     /// heads. Prefer this from the IBD writer over N×[`archive_block`].
     ///
+    /// Caller should pass a **height-contiguous** run so create_fk parents are
+    /// already committed or in this batch (IBD writer enforces this).
+    ///
     /// `items[i].1` is drained (empty on success). Returns header fk per item.
     pub fn archive_prepared_owned(
         &self,
@@ -85,95 +88,61 @@ impl Query {
     /// Mega-batch Class A: **packed full-tx** rows (one `tx.body` payload per tx).
     ///
     /// Non-coinbase inputs store **create_fk + vout** (schema v10). Parent fks are
-    /// resolved per header: same-block map → writer sticky → durable `tx.head`.
+    /// resolved here: same mega-batch map → writer sticky → durable `tx.head`.
     ///
-    /// Headers are committed **one at a time** (put + sticky after success) so:
-    /// - out-of-order body delivery does not poison earlier coinbase headers when a
-    ///   later spend's parent is not archived yet;
-    /// - sticky never advertises create fks that were not written (failed batch).
-    ///
-    /// Missing parent → [`StoreError::NotFound`] (transient; IBD requeues), not
-    /// Corrupt (which looked like a permanent schema failure).
+    /// IBD feeds **height-contiguous** mega-batches only (out-of-order bodies are
+    /// parked until the next height is ready). That keeps same-batch + sticky
+    /// resolve complete without per-block fallback.
     fn archive_bodies_mega_owned(
         &self,
         need: &mut [(Fk, Vec<TxApply>)],
     ) -> Result<(), QueryError> {
-        let mut first_err: Option<QueryError> = None;
-        for (header_fk, txs) in need.iter_mut() {
-            if txs.is_empty() {
-                continue;
-            }
-            // Skip already-archived (idempotent multi-peer).
-            if self.store.header_txs.has_body(*header_fk)? {
-                let _ = std::mem::take(txs);
-                continue;
-            }
-            match self.archive_one_header_body(*header_fk, txs) {
-                Ok(()) => {}
-                Err(e) => {
-                    // Keep going so later headers in the batch (e.g. lower height
-                    // coinbases that landed after a spend) still commit when possible.
-                    // First error is returned after the pass; IBD requeues failures.
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
-                }
-            }
-        }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
-
-    /// Archive one header's Class A bodies; update sticky only after put succeeds.
-    fn archive_one_header_body(
-        &self,
-        header_fk: Fk,
-        txs: &mut Vec<TxApply>,
-    ) -> Result<(), QueryError> {
         use std::collections::{HashMap, HashSet};
 
-        if txs.is_empty() {
-            return Ok(());
-        }
+        let mut next_tx = self.store.txs.count() + 1;
+
+        // Pass 1: assign create fks + build batch_map (txid → create_fk).
+        let mut batch_map: HashMap<[u8; 32], Fk> = HashMap::new();
+        let mut work: Vec<(Fk, TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> =
+            Vec::new();
+        let mut per_header_ranges: Vec<(Fk, Fk, u32)> = Vec::with_capacity(need.len());
+        let mut spends: Vec<([u8; 32], u32, Fk, u32)> = Vec::new();
         let archive_spends =
             self.spend_index_enabled() && self.index_mode().is_tip();
         let index_tx = self.tx_index_enabled();
 
-        let mut next_tx = self.store.txs.count() + 1;
-        let first_tx_fk = Fk(next_tx);
-        let n_txs = txs.len() as u32;
+        for (header_fk, txs) in need.iter_mut() {
+            if txs.is_empty() {
+                continue;
+            }
+            let first_tx_fk = Fk(next_tx);
+            let n_txs = txs.len() as u32;
+            for ta in txs.drain(..) {
+                let n_in = ta.inputs.len() as u32;
+                let n_out = ta.outputs.len() as u32;
+                let tx_fk = Fk(next_tx);
+                next_tx += 1;
 
-        // Same-block creates (child may spend parent coinbase in this block).
-        let mut block_map: HashMap<[u8; 32], Fk> = HashMap::with_capacity(txs.len());
-        let mut work: Vec<(Fk, TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> =
-            Vec::with_capacity(txs.len());
+                let mut tx = ta.tx;
+                tx.input_start_fk = Fk::NULL;
+                tx.input_count = n_in;
+                tx.output_start_fk = Fk::NULL;
+                tx.output_count = n_out;
 
-        for ta in txs.drain(..) {
-            let n_in = ta.inputs.len() as u32;
-            let n_out = ta.outputs.len() as u32;
-            let tx_fk = Fk(next_tx);
-            next_tx += 1;
-
-            let mut tx = ta.tx;
-            tx.input_start_fk = Fk::NULL;
-            tx.input_count = n_in;
-            tx.output_start_fk = Fk::NULL;
-            tx.output_count = n_out;
-
-            block_map.insert(tx.txid, tx_fk);
-            work.push((tx_fk, tx, ta.inputs, ta.outputs));
+                batch_map.insert(tx.txid, tx_fk);
+                work.push((tx_fk, tx, ta.inputs, ta.outputs));
+            }
+            per_header_ranges.push((*header_fk, first_tx_fk, n_txs));
         }
 
-        // Unique external parents (not same-block).
+        // Pass 2: unique external prev_txids that still need fk.
         let mut need_external: HashSet<[u8; 32]> = HashSet::new();
         for (_sfk, _tx, inputs, _) in &work {
             for inp in inputs {
                 if inp.is_coinbase() || !inp.create_fk.is_null() {
                     continue;
                 }
-                if block_map.contains_key(&inp.prev_txid) {
+                if batch_map.contains_key(&inp.prev_txid) {
                     continue;
                 }
                 if inp.prev_txid == [0u8; 32] {
@@ -183,10 +152,10 @@ impl Query {
             }
         }
 
+        // Sticky (committed prior batches) then durable head for misses.
         let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
-        // Sticky holds **committed** creates only (previous successful headers).
-        let mut resolved: HashMap<[u8; 32], Fk> =
-            self.archive_txid_sticky.lookup_batch(&need_vec);
+        let sticky_hits = self.archive_txid_sticky.lookup_batch(&need_vec);
+        let mut resolved: HashMap<[u8; 32], Fk> = sticky_hits;
         let mut need_head: Vec<[u8; 32]> = Vec::new();
         for t in &need_vec {
             if !resolved.contains_key(t) {
@@ -194,7 +163,6 @@ impl Query {
             }
         }
 
-        // Head read is independent of whether we index this put (always try).
         if !need_head.is_empty() {
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
             let hits = self.store.get_fk_by_txid_batch(&need_head)?;
@@ -205,10 +173,9 @@ impl Query {
             }
         }
 
-        // Stamp create_fk; missing parent is transient (body arrived before parent).
+        // Pass 3: stamp create_fk on inputs; tip spends list.
         let mut packed: Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> =
             Vec::with_capacity(work.len());
-        let mut spends: Vec<([u8; 32], u32, Fk, u32)> = Vec::new();
         for (tx_fk, tx, mut inputs, outputs) in work {
             for (i, inp) in inputs.iter_mut().enumerate() {
                 if inp.is_coinbase() {
@@ -217,11 +184,13 @@ impl Query {
                     continue;
                 }
                 if inp.create_fk.is_null() {
-                    let cfk = block_map
+                    let cfk = batch_map
                         .get(&inp.prev_txid)
                         .copied()
                         .or_else(|| resolved.get(&inp.prev_txid).copied())
-                        .ok_or(StoreError::NotFound)?;
+                        .ok_or(StoreError::Corrupt(
+                            "archive: parent create_fk unresolved (contiguous batch required)",
+                        ))?;
                     inp.create_fk = cfk;
                 }
                 if archive_spends {
@@ -248,17 +217,17 @@ impl Query {
         if got_tx_fks.len() != packed.len() {
             return Err(StoreError::Corrupt("tx put_full_batch length"));
         }
-        if got_tx_fks.first().copied() != Some(first_tx_fk) {
-            return Err(StoreError::Corrupt("tx put_full_batch fk mismatch"));
+        if let Some(&(_, first_tx, _)) = per_header_ranges.first() {
+            if got_tx_fks.first().copied() != Some(first_tx) {
+                return Err(StoreError::Corrupt("tx put_full_batch fk mismatch"));
+            }
         }
 
         if archive_spends && !spends.is_empty() {
             self.store.put_spend_batch(&spends)?;
         }
 
-        self.store
-            .header_txs
-            .put_ranges_batch(&[(header_fk, first_tx_fk, n_txs)])?;
+        self.store.header_txs.put_ranges_batch(&per_header_ranges)?;
 
         // Sticky only after durable put — never advertise uncommitted fks.
         let sticky_regs: Vec<([u8; 32], Fk)> = packed
@@ -267,7 +236,6 @@ impl Query {
             .map(|((tx, _, _), fk)| (tx.txid, *fk))
             .collect();
         self.archive_txid_sticky.insert_many(&sticky_regs);
-        // Also sticky head-resolved parents (cold parents stay hot for next spends).
         for (txid, fk) in &resolved {
             self.archive_txid_sticky.insert(*txid, *fk);
         }
@@ -311,9 +279,6 @@ impl Query {
         Ok(self.store.txs.body_txid(inp.create_fk)?)
     }
 
-    /// Confirm an already-archived block at `height` (genesis or tip+1).
-    ///
-    /// Always: Class C strong + confirmed, **tx_height**, and **point spends** for
     pub fn set_archive_mode(&self, enabled: bool) -> Result<(), QueryError> {
         self.store.set_archive_mode(enabled)
     }

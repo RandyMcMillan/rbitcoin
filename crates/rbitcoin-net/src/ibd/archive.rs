@@ -8,6 +8,7 @@ use rbitcoin_log::debug;
 use rbitcoin_primitives::Fk;
 use rbitcoin_query::TxApply;
 use rbitcoin_store::HeaderRecord;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -193,8 +194,8 @@ pub(crate) struct ArchiveJob {
     pub priority: bool,
     /// Approx serialized size charged against [`ArchiveQueueBudget`].
     pub wire_bytes: usize,
-    /// Chain height when known (`u32::MAX` if unknown). Writer sorts by this so
-    /// parents tend to commit before spends (schema v10 create_fk resolve).
+    /// Chain height when known (`u32::MAX` if unknown). Required for contiguous
+    /// mega-batch assembly (schema v10 create_fk needs parents already written).
     pub height: u32,
 }
 
@@ -203,9 +204,183 @@ struct PreparedArchive {
     header: HeaderRecord,
     txs: Vec<TxApply>,
     header_fk: Fk,
-    priority: bool,
     wire_bytes: usize,
     height: u32,
+}
+
+/// Parks prepared bodies until a **height-contiguous** mega-batch can start at
+/// `next_h`. Out-of-order peer delivery stays in RAM here; only contiguous runs
+/// are passed to Class A mega-write (fast create_fk resolve via batch_map/sticky).
+struct ContigPark {
+    /// Next height the writer may commit (contiguous HWM + 1).
+    next_h: u32,
+    /// `height → prepared` for heights ≥ `next_h`.
+    parked: BTreeMap<u32, PreparedArchive>,
+}
+
+/// Result of trying to park a prepared body.
+enum ParkInsert {
+    /// Stored; wait for contiguous prefix.
+    Parked,
+    /// Height already past HWM or unknown — caller should single-archive / fail.
+    Late(PreparedArchive),
+    /// Same height already parked (multi-peer). Caller must release budget
+    /// (`ArchiveResult::Ok`) without dropping the charge forever.
+    Duplicate(PreparedArchive),
+}
+
+impl ContigPark {
+    fn new(next_h: u32) -> Self {
+        Self {
+            next_h,
+            parked: BTreeMap::new(),
+        }
+    }
+
+    fn next_h(&self) -> u32 {
+        self.next_h
+    }
+
+    fn parked_len(&self) -> usize {
+        self.parked.len()
+    }
+
+    fn insert(&mut self, p: PreparedArchive) -> ParkInsert {
+        if p.height == u32::MAX {
+            return ParkInsert::Late(p);
+        }
+        if p.height < self.next_h {
+            return ParkInsert::Late(p);
+        }
+        use std::collections::btree_map::Entry;
+        match self.parked.entry(p.height) {
+            Entry::Vacant(e) => {
+                e.insert(p);
+                ParkInsert::Parked
+            }
+            Entry::Occupied(_) => ParkInsert::Duplicate(p),
+        }
+    }
+
+    /// How many contiguous heights are ready starting at `next_h`.
+    fn ready_prefix_len(&self) -> usize {
+        let mut n = 0u32;
+        loop {
+            if self.parked.contains_key(&self.next_h.saturating_add(n)) {
+                n += 1;
+            } else {
+                break;
+            }
+        }
+        n as usize
+    }
+
+    /// Pop a contiguous run `[next_h, next_h+len)` of at most `max` blocks.
+    /// Advances `next_h` by the number taken (caller must [`rewind`] on write failure).
+    fn take_contiguous(&mut self, max: usize) -> Vec<PreparedArchive> {
+        if max == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(max.min(64));
+        while out.len() < max {
+            let h = self.next_h.saturating_add(out.len() as u32);
+            match self.parked.remove(&h) {
+                Some(p) => out.push(p),
+                None => break,
+            }
+        }
+        if !out.is_empty() {
+            self.next_h = self.next_h.saturating_add(out.len() as u32);
+        }
+        out
+    }
+
+    /// Undo a failed mega-write that already advanced `next_h`.
+    fn rewind(&mut self, n: u32) {
+        self.next_h = self.next_h.saturating_sub(n);
+    }
+
+    /// Drain all parked bodies (shutdown). Caller must release each charge.
+    fn drain_all(&mut self) -> Vec<PreparedArchive> {
+        std::mem::take(&mut self.parked).into_values().collect()
+    }
+}
+
+#[cfg(test)]
+mod contig_park_tests {
+    use super::ContigPark;
+    use bitcoin::hashes::Hash;
+    use bitcoin::BlockHash;
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_store::HeaderRecord;
+
+    fn prep(h: u32) -> super::PreparedArchive {
+        super::PreparedArchive {
+            hash: BlockHash::from_byte_array([h as u8; 32]),
+            header: HeaderRecord {
+                prev_fk: Fk::NULL,
+                version: 1,
+                timestamp: 0,
+                bits: 0,
+                nonce: 0,
+                merkle_root: [0u8; 32],
+                hash: [h as u8; 32],
+            },
+            txs: vec![],
+            header_fk: Fk(h as u64 + 1),
+            wire_bytes: 100,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn parks_ahead_until_gap_filled() {
+        let mut p = ContigPark::new(10);
+        assert!(matches!(p.insert(prep(12)), super::ParkInsert::Parked));
+        assert!(matches!(p.insert(prep(11)), super::ParkInsert::Parked));
+        assert!(p.take_contiguous(8).is_empty(), "gap at 10");
+        assert_eq!(p.parked_len(), 2);
+        assert!(matches!(p.insert(prep(10)), super::ParkInsert::Parked));
+        let run = p.take_contiguous(8);
+        assert_eq!(run.len(), 3);
+        assert_eq!(run[0].height, 10);
+        assert_eq!(run[2].height, 12);
+        assert_eq!(p.next_h(), 13);
+        assert_eq!(p.parked_len(), 0);
+    }
+
+    #[test]
+    fn late_height_returned_for_idempotent_path() {
+        let mut p = ContigPark::new(5);
+        match p.insert(prep(3)) {
+            super::ParkInsert::Late(late) => assert_eq!(late.height, 3),
+            _ => panic!("expected Late"),
+        }
+        assert_eq!(p.parked_len(), 0);
+    }
+
+    #[test]
+    fn duplicate_height_does_not_drop_charge_silently() {
+        let mut p = ContigPark::new(1);
+        assert!(matches!(p.insert(prep(1)), super::ParkInsert::Parked));
+        match p.insert(prep(1)) {
+            super::ParkInsert::Duplicate(d) => assert_eq!(d.height, 1),
+            _ => panic!("expected Duplicate"),
+        }
+        assert_eq!(p.parked_len(), 1);
+    }
+
+    #[test]
+    fn caps_run_at_max() {
+        let mut p = ContigPark::new(0);
+        for h in 0..10 {
+            assert!(matches!(p.insert(prep(h)), super::ParkInsert::Parked));
+        }
+        let run = p.take_contiguous(4);
+        assert_eq!(run.len(), 4);
+        assert_eq!(p.next_h(), 4);
+        assert_eq!(p.parked_len(), 6);
+    }
 }
 
 pub(crate) enum ArchiveResult {
@@ -220,11 +395,12 @@ pub(crate) enum ArchiveResult {
     },
 }
 
-/// Dual-lane prep + writer: tip-near priority jumps far FIFO.
+/// Dual-lane prep + writer: tip-near priority jumps far FIFO into a **contiguous
+/// height park**. Schema v10 create_fk resolve needs parents already written (or
+/// in the same mega-batch); the writer only mega-archives height-contiguous runs.
 ///
-/// Archive never stalls for confirm: long `confirm_live` waves used to starve the
-/// far lane, fill `arch_q`, freeze getdata (`inflight=0`), then false peer stall
-/// disconnects. Priority still wins when both lanes have work.
+/// Out-of-order bodies sit in [`ContigPark`] until `next_h` arrives — no per-block
+/// fallback thrash.
 pub(crate) fn spawn_archive_pipeline(
     hub: Arc<ChainHub>,
     mut job_rx: mpsc::UnboundedReceiver<ArchiveJob>,
@@ -232,13 +408,15 @@ pub(crate) fn spawn_archive_pipeline(
     stats: Arc<ArchivePipelineStats>,
     archive_queued: Arc<ArchiveQueueBudget>,
     confirm_lag: Arc<AtomicU32>,
+    // Next height the writer may commit (contiguous archived HWM + 1).
+    write_next_height: Arc<AtomicU32>,
     // Cooperative stop (SIGINT): exit after current write batch; drop queue.
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         const WRITE_Q: usize = 4096;
         const PRI_Q: usize = 512;
-        debug!("ibd: archive pipeline prep=1 (OS thread) writer=1 (OS thread) dual-lane");
+        debug!("ibd: archive pipeline prep=1 (OS thread) writer=1 (OS thread) dual-lane contig-park");
 
         let (pri_write_tx, pri_write_rx) =
             std::sync::mpsc::sync_channel::<PreparedArchive>(PRI_Q);
@@ -252,134 +430,213 @@ pub(crate) fn spawn_archive_pipeline(
         let write_arch_q = Arc::clone(&archive_queued);
         let write_depth = Arc::clone(&write_q_depth);
         let write_lag = Arc::clone(&confirm_lag);
+        let write_next = Arc::clone(&write_next_height);
         let write_stop = Arc::clone(&stop);
 
         let writer = std::thread::Builder::new()
             .name("ibd-archive-writer".into())
             .spawn(move || {
                 rbitcoin_store::try_set_io_idle();
-                // Batch size is lag-aware (see coalesce::max_batch_for_lag): when
-                // Class A leads tip deeply, use **small** quanta so confirm can
-                // interleave instead of multi-minute 300–1024 block dumps.
                 const FLUSH_EVERY_BLOCKS: u64 = 8192;
                 let mut blocks_since_flush = 0u64;
                 let mut pri_open = true;
                 let mut far_open = true;
+                let mut park = ContigPark::new(write_next.load(Ordering::Relaxed));
+
+                /// Park one prepared body; late/dup must always emit ArchiveResult
+                /// so archive_queued charge is released (else IBD never path_drains).
+                fn handle_insert(
+                    park: &mut ContigPark,
+                    p: PreparedArchive,
+                    write_hub: &ChainHub,
+                    write_result: &mpsc::UnboundedSender<ArchiveResult>,
+                ) -> bool {
+                    match park.insert(p) {
+                        ParkInsert::Parked => true,
+                        ParkInsert::Duplicate(dup) => {
+                            // Multi-peer redelivery while first is still parked.
+                            write_result
+                                .send(ArchiveResult::Ok {
+                                    hash: dup.hash,
+                                    wire_bytes: dup.wire_bytes,
+                                })
+                                .is_ok()
+                        }
+                        ParkInsert::Late(late) => {
+                            let hash = late.hash;
+                            let wire_bytes = late.wire_bytes;
+                            if late.height == u32::MAX {
+                                return write_result
+                                    .send(ArchiveResult::Err {
+                                        hash,
+                                        err: "archive: missing height for contiguous batch"
+                                            .into(),
+                                        wire_bytes,
+                                    })
+                                    .is_ok();
+                            }
+                            let mut one = [(late.header_fk, late.header, late.txs)];
+                            let res = match write_hub.query.archive_prepared_with_fks(&mut one)
+                            {
+                                Ok(_) => ArchiveResult::Ok { hash, wire_bytes },
+                                Err(e) => ArchiveResult::Err {
+                                    hash,
+                                    err: e.to_string(),
+                                    wire_bytes,
+                                },
+                            };
+                            write_result.send(res).is_ok()
+                        }
+                    }
+                }
+
                 loop {
                     if write_stop.load(Ordering::Relaxed) {
-                        // Drop queued prepared work so prep can exit; skip writes.
-                        while pri_write_rx.try_recv().is_ok() {
+                        while let Ok(p) = pri_write_rx.try_recv() {
                             write_q_dec(&write_depth);
+                            let _ = write_result.send(ArchiveResult::Err {
+                                hash: p.hash,
+                                err: "archive stopped".into(),
+                                wire_bytes: p.wire_bytes,
+                            });
                         }
-                        while far_write_rx.try_recv().is_ok() {
+                        while let Ok(p) = far_write_rx.try_recv() {
                             write_q_dec(&write_depth);
+                            let _ = write_result.send(ArchiveResult::Err {
+                                hash: p.hash,
+                                err: "archive stopped".into(),
+                                wire_bytes: p.wire_bytes,
+                            });
+                        }
+                        for p in park.drain_all() {
+                            let _ = write_result.send(ArchiveResult::Err {
+                                hash: p.hash,
+                                err: "archive stopped".into(),
+                                wire_bytes: p.wire_bytes,
+                            });
                         }
                         break;
                     }
-                    if !pri_open && !far_open {
+                    if !pri_open && !far_open && park.parked_len() == 0 {
                         break;
                     }
+
                     let idle_t0 = Instant::now();
-                    // Priority first; otherwise drain far. Never idle while either
-                    // lane has work (confirm runs on a separate OS thread).
-                    let (first, is_pri) = match pri_write_rx.try_recv() {
-                        Ok(p) => (p, true),
+                    // Pull at least one prepared body (or timeout to re-check stop / park).
+                    let first = match pri_write_rx.try_recv() {
+                        Ok(p) => Some(p),
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                             pri_open = false;
-                            match far_write_rx.recv() {
-                                Ok(p) => (p, false),
-                                Err(_) => break,
+                            match far_write_rx.recv_timeout(Duration::from_millis(2)) {
+                                Ok(p) => Some(p),
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    far_open = false;
+                                    None
+                                }
                             }
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
                             match far_write_rx.recv_timeout(Duration::from_millis(2)) {
-                                Ok(p) => (p, false),
+                                Ok(p) => Some(p),
                                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                                     match pri_write_rx.try_recv() {
-                                        Ok(p) => (p, true),
-                                        Err(std::sync::mpsc::TryRecvError::Empty) => continue,
+                                        Ok(p) => Some(p),
+                                        Err(std::sync::mpsc::TryRecvError::Empty) => None,
                                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                                             pri_open = false;
-                                            continue;
+                                            None
                                         }
                                     }
                                 }
                                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                                     far_open = false;
-                                    match pri_write_rx.recv() {
-                                        Ok(p) => (p, true),
-                                        Err(_) => break,
+                                    match pri_write_rx.try_recv() {
+                                        Ok(p) => Some(p),
+                                        Err(_) => None,
                                     }
                                 }
                             }
                         }
                     };
-                    write_q_dec(&write_depth);
+
+                    if let Some(p) = first {
+                        write_q_dec(&write_depth);
+                        if !handle_insert(&mut park, p, &write_hub, &write_result) {
+                            return;
+                        }
+                    }
                     write_stats
                         .write_idle_ns
                         .fetch_add(idle_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+                    // Drain everything currently available into the park.
+                    let coal_t0 = Instant::now();
+                    loop {
+                        let mut got = false;
+                        while let Ok(p) = pri_write_rx.try_recv() {
+                            write_q_dec(&write_depth);
+                            if !handle_insert(&mut park, p, &write_hub, &write_result) {
+                                return;
+                            }
+                            got = true;
+                        }
+                        while let Ok(p) = far_write_rx.try_recv() {
+                            write_q_dec(&write_depth);
+                            if !handle_insert(&mut park, p, &write_hub, &write_result) {
+                                return;
+                            }
+                            got = true;
+                        }
+                        if !got {
+                            break;
+                        }
+                    }
+
                     let lag = write_lag.load(Ordering::Relaxed);
                     let max_mega = max_batch_for_lag(lag);
-                    // Tip-near priority: always small so confirm runway lands fast.
-                    let pri_cap = 32usize.min(max_mega);
+                    let min_batch = min_batch_for_lag(lag);
+                    let ready = park.ready_prefix_len();
 
-                    let coal_t0 = Instant::now();
-                    let mut batch = Vec::with_capacity(if is_pri { pri_cap } else { max_mega });
-                    batch.push(first);
-                    if is_pri {
-                        while batch.len() < pri_cap {
-                            match pri_write_rx.try_recv() {
-                                Ok(p) => {
-                                    write_q_dec(&write_depth);
-                                    batch.push(p);
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                    } else {
-                        let min_batch = min_batch_for_lag(lag);
-                        while batch.len() < max_mega {
-                            // Tip-near always wins mid far-pack.
-                            if let Ok(p) = pri_write_rx.try_recv() {
-                                write_q_dec(&write_depth);
-                                batch.insert(0, p);
-                                break;
-                            }
-                            match far_write_rx.try_recv() {
-                                Ok(p) => {
-                                    write_q_dec(&write_depth);
-                                    batch.push(p);
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        if batch.len() < min_batch && batch.iter().all(|p| !p.priority) {
-                            let wait = coalesce_wait(
-                                batch.len(),
-                                write_depth.load(Ordering::Relaxed),
-                                write_arch_q.count(),
-                                lag,
-                            );
-                            if !wait.is_zero() {
-                                let deadline = Instant::now() + wait;
-                                while batch.len() < max_mega {
-                                    if Instant::now() >= deadline {
-                                        break;
-                                    }
-                                    if let Ok(p) = pri_write_rx.try_recv() {
+                    // Wait briefly to grow a larger contiguous quanta when only a few
+                    // heights at next_h are ready (same coalesce policy as before).
+                    if ready > 0 && ready < min_batch {
+                        let wait = coalesce_wait(
+                            ready,
+                            write_depth.load(Ordering::Relaxed),
+                            write_arch_q.count(),
+                            lag,
+                        );
+                        if !wait.is_zero() {
+                            let deadline = Instant::now() + wait.min(Duration::from_millis(12));
+                            while Instant::now() < deadline
+                                && park.ready_prefix_len() < min_batch
+                            {
+                                match far_write_rx.recv_timeout(
+                                    deadline.saturating_duration_since(Instant::now()),
+                                ) {
+                                    Ok(p) => {
                                         write_q_dec(&write_depth);
-                                        batch.insert(0, p);
-                                        break;
-                                    }
-                                    match far_write_rx.recv_timeout(
-                                        deadline.saturating_duration_since(Instant::now()),
-                                    ) {
-                                        Ok(p) => {
-                                            write_q_dec(&write_depth);
-                                            batch.push(p);
+                                        if !handle_insert(
+                                            &mut park,
+                                            p,
+                                            &write_hub,
+                                            &write_result,
+                                        ) {
+                                            return;
                                         }
-                                        Err(_) => break,
+                                    }
+                                    Err(_) => break,
+                                }
+                                while let Ok(p) = pri_write_rx.try_recv() {
+                                    write_q_dec(&write_depth);
+                                    if !handle_insert(
+                                        &mut park,
+                                        p,
+                                        &write_hub,
+                                        &write_result,
+                                    ) {
+                                        return;
                                     }
                                 }
                             }
@@ -389,43 +646,20 @@ pub(crate) fn spawn_archive_pipeline(
                         .write_coalesce_ns
                         .fetch_add(coal_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-                    let n_blocks = batch.len() as u64;
-                    // Height order: parents commit (and enter sticky) before spends.
-                    let mut batch = batch;
-                    batch.sort_by_key(|p| p.height);
-                    let write_t0 = Instant::now();
-                    // Per-block archive results: schema v10 create_fk needs parents
-                    // already committed; a mega all-or-nothing Err poisoned coinbases
-                    // that shared a coalesce batch with an early spend.
-                    let mut ok_n = 0u64;
-                    for p in batch {
-                        let hash = p.hash;
-                        let wire_bytes = p.wire_bytes;
-                        let mut one = [(p.header_fk, p.header, p.txs)];
-                        match write_hub.query.archive_prepared_with_fks(&mut one) {
-                            Ok(_) => {
-                                ok_n = ok_n.saturating_add(1);
-                                if write_result
-                                    .send(ArchiveResult::Ok { hash, wire_bytes })
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                if write_result
-                                    .send(ArchiveResult::Err {
-                                        hash,
-                                        err: e.to_string(),
-                                        wire_bytes,
-                                    })
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                        }
+                    let batch = park.take_contiguous(max_mega);
+                    if batch.is_empty() {
+                        continue;
                     }
+
+                    let n_blocks = batch.len() as u64;
+                    let outcomes: Vec<(BlockHash, usize)> =
+                        batch.iter().map(|p| (p.hash, p.wire_bytes)).collect();
+                    let mut owned: Vec<_> = batch
+                        .into_iter()
+                        .map(|p| (p.header_fk, p.header, p.txs))
+                        .collect();
+                    let write_t0 = Instant::now();
+                    let write_res = write_hub.query.archive_prepared_with_fks(&mut owned);
                     write_stats
                         .write_ns
                         .fetch_add(write_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -434,16 +668,48 @@ pub(crate) fn spawn_archive_pipeline(
                     write_stats
                         .write_batch_blocks
                         .fetch_add(n_blocks, Ordering::Relaxed);
-                    let _ = (is_pri, lag);
-                    if ok_n > 0 {
-                        blocks_since_flush = blocks_since_flush.saturating_add(ok_n);
-                        if blocks_since_flush >= FLUSH_EVERY_BLOCKS {
-                            if let Err(e) = write_hub.query.flush_header_archive() {
-                                rbitcoin_log::warn!(
-                                    "ibd: header archive flush failed: {e}"
-                                );
+
+                    match write_res {
+                        Ok(_fks) => {
+                            write_next.store(park.next_h(), Ordering::Relaxed);
+                            for (hash, wire_bytes) in outcomes {
+                                if write_result
+                                    .send(ArchiveResult::Ok { hash, wire_bytes })
+                                    .is_err()
+                                {
+                                    return;
+                                }
                             }
-                            blocks_since_flush = 0;
+                            blocks_since_flush =
+                                blocks_since_flush.saturating_add(n_blocks);
+                            if blocks_since_flush >= FLUSH_EVERY_BLOCKS {
+                                if let Err(e) = write_hub.query.flush_header_archive() {
+                                    rbitcoin_log::warn!(
+                                        "ibd: header archive flush failed: {e}"
+                                    );
+                                }
+                                blocks_since_flush = 0;
+                            }
+                        }
+                        Err(e) => {
+                            // Contiguous run failed hard — report all; rewind HWM so
+                            // re-getdata can rebuild the same heights.
+                            let err = e.to_string();
+                            let roll = outcomes.len() as u32;
+                            park.rewind(roll);
+                            write_next.store(park.next_h(), Ordering::Relaxed);
+                            for (hash, wire_bytes) in outcomes {
+                                if write_result
+                                    .send(ArchiveResult::Err {
+                                        hash,
+                                        err: err.clone(),
+                                        wire_bytes,
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
@@ -514,7 +780,6 @@ pub(crate) fn spawn_archive_pipeline(
                                 header,
                                 txs,
                                 header_fk,
-                                priority,
                                 wire_bytes,
                                 height,
                             };

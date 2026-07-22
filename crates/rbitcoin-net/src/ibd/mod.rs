@@ -373,6 +373,12 @@ pub async fn ibd_cancellable(
     let (arch_job_tx, arch_job_rx) = mpsc::unbounded_channel::<ArchiveJob>();
     let (arch_res_tx, mut arch_res_rx) = mpsc::unbounded_channel::<ArchiveResult>();
     let archive_stop = Arc::new(AtomicBool::new(false));
+    // Contiguous Class A writer starts just past the resume archive HWM (or 0).
+    let archive_write_next = Arc::new(AtomicU32::new(if hub.tip_height().is_some() {
+        st.max_archived_height.saturating_add(1)
+    } else {
+        0
+    }));
     let mut pipeline = spawn_archive_pipeline(
         hub.clone(),
         arch_job_rx,
@@ -380,6 +386,7 @@ pub async fn ibd_cancellable(
         Arc::clone(&pipe_stats),
         Arc::clone(&archive_queued),
         Arc::clone(&confirm_lag),
+        Arc::clone(&archive_write_next),
         Arc::clone(&archive_stop),
     );
 

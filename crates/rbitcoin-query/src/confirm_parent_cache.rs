@@ -69,6 +69,12 @@ pub struct ParentEntry {
     /// Vouts that prewarm fully resolved (spent-filtered). When all requested
     /// vouts are in this set, wave can skip store decode + spent re-check.
     pub checked: HashSet<u32>,
+    /// Coinbase maturity height resolved at prewarm (wave skips body re-walk).
+    ///
+    /// - `None` = not resolved yet
+    /// - `Some(None)` = not a coinbase
+    /// - `Some(Some(h))` = coinbase created at height `h`
+    pub coinbase_height: Option<Option<u32>>,
     /// Height of the runway body that registered this create (`None` = UTXO load).
     pub create_height: Option<u32>,
 }
@@ -851,6 +857,8 @@ impl ConfirmParentCache {
     /// `checked` includes spent-filtered vouts that are **not** in `live` so
     /// wave can treat the set as complete without re-decoding the body.
     /// `height` is the max runway height needing this parent (GC / by_txid).
+    /// `coinbase_height`: `None` = not a coinbase; `Some(h)` = cb create height.
+    /// Pass as pre-resolved maturity field (outer `Some` means stashed).
     pub fn put_parent_outs_resolved(
         &self,
         height: u32,
@@ -858,29 +866,51 @@ impl ConfirmParentCache {
         tx: TxRecord,
         live: &[(u32, OutputRecord)],
         checked: &[u32],
+        coinbase_height: Option<Option<u32>>,
     ) {
         let Some(id) = fk.get() else {
             return;
         };
         let mut g = self.inner.lock().unwrap();
-        g.put_parent_outs_resolved_inner(height, id, tx, live, checked);
+        g.put_parent_outs_resolved_inner(height, id, tx, live, checked, coinbase_height);
     }
 
     /// Many resolved parents under one lock (prewarm pin finish).
+    ///
+    /// Tuple: `(runway_h, fk, tx, live, checked, coinbase_height)`.
+    /// `coinbase_height`: `None` = not stashed; `Some(None)` = not cb; `Some(Some(h))` = height.
     pub fn put_parent_outs_resolved_batch(
         &self,
-        items: &[(u32, Fk, TxRecord, Vec<(u32, OutputRecord)>, Vec<u32>)],
+        items: &[(
+            u32,
+            Fk,
+            TxRecord,
+            Vec<(u32, OutputRecord)>,
+            Vec<u32>,
+            Option<Option<u32>>,
+        )],
     ) {
         if items.is_empty() {
             return;
         }
         let mut g = self.inner.lock().unwrap();
-        for (height, fk, tx, live, checked) in items {
+        for (height, fk, tx, live, checked, cb) in items {
             let Some(id) = fk.get() else {
                 continue;
             };
-            g.put_parent_outs_resolved_inner(*height, id, tx.clone(), live, checked);
+            g.put_parent_outs_resolved_inner(*height, id, tx.clone(), live, checked, *cb);
         }
+    }
+
+    /// Prewarm-resolved coinbase maturity for a create fk.
+    ///
+    /// - `None` = not stashed (wave must compute)
+    /// - `Some(None)` = not a coinbase
+    /// - `Some(Some(h))` = coinbase at height `h`
+    pub fn get_parent_coinbase_height(&self, fk: Fk) -> Option<Option<u32>> {
+        let id = fk.get()?;
+        // Field is already Option<Option<u32>>; missing entry / unset → None.
+        self.inner.lock().unwrap().by_fk.get(&id)?.coinbase_height
     }
 
     /// Batch thin edges under one lock (moves ownership — no edge clone).
@@ -986,6 +1016,7 @@ impl ConfirmParentCache {
                 tx: tx.clone(),
                 outs: HashMap::new(),
                 checked: HashSet::new(),
+                coinbase_height: None,
                 create_height: Some(create_height),
             });
             e.tx = tx.clone();
@@ -1289,6 +1320,7 @@ impl Inner {
                     tx: tx.clone(),
                     outs: HashMap::new(),
                     checked: HashSet::new(),
+                    coinbase_height: None,
                     create_height: Some(height),
                 });
                 e.tx = tx.clone();
@@ -1324,6 +1356,7 @@ impl Inner {
             tx,
             &[(vout, output)],
             &[vout],
+            None,
         );
     }
 
@@ -1334,6 +1367,7 @@ impl Inner {
         tx: TxRecord,
         live: &[(u32, OutputRecord)],
         checked: &[u32],
+        coinbase_height: Option<Option<u32>>,
     ) {
         self.insert_by_txid(tx.txid, id, height);
         let txid = tx.txid;
@@ -1342,9 +1376,13 @@ impl Inner {
                 tx: tx.clone(),
                 outs: HashMap::new(),
                 checked: HashSet::new(),
+                coinbase_height: None,
                 create_height: None,
             });
             e.tx = tx;
+            if coinbase_height.is_some() {
+                e.coinbase_height = coinbase_height;
+            }
             for &v in checked {
                 e.checked.insert(v);
             }
@@ -1757,6 +1795,7 @@ mod tests {
             t.clone(),
             &[(0, out(100))],
             &[0, 1],
+            Some(None), // not a coinbase
         );
         let (txr, live, filtered) = c.get_parent_outs_needed(Fk(90), &[0, 1]).unwrap();
         assert!(filtered);
@@ -1764,12 +1803,32 @@ mod tests {
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].0, 0);
         assert_eq!(live[0].1.value, 100);
+        assert_eq!(c.get_parent_coinbase_height(Fk(90)), Some(None));
         // Partial request still complete.
         let (_, live0, f0) = c.get_parent_outs_needed(Fk(90), &[0]).unwrap();
         assert!(f0);
         assert_eq!(live0.len(), 1);
         // Unknown vout 2 → not complete → None (wave falls back to store).
         assert!(c.get_parent_outs_needed(Fk(90), &[0, 2]).is_none());
+    }
+
+    #[test]
+    fn parent_coinbase_height_stashed_for_wave() {
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(0);
+        c.ensure_plan(1, [1u8; 32]);
+        let t = tx(11);
+        c.put_parent_outs_resolved(
+            1,
+            Fk(11),
+            t,
+            &[(0, out(50))],
+            &[0],
+            Some(Some(100)), // coinbase at height 100
+        );
+        assert_eq!(c.get_parent_coinbase_height(Fk(11)), Some(Some(100)));
+        // Unknown fk.
+        assert!(c.get_parent_coinbase_height(Fk(99)).is_none());
     }
 
     #[test]

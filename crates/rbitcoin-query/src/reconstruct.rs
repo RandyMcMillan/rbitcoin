@@ -159,14 +159,17 @@ impl Query {
             wf_add(&wf::SPENT_NS, t_spent.elapsed().as_nanos() as u64);
 
             let t_cb = Instant::now();
-            // Coinbase height: only true coinbases (1-in + null prev), not every
-            // 1-in tx. Prevout scan skips script/witness (cheap).
-            let cb = if tx.input_count != 1 {
-                Some(None)
-            } else if self.parent_is_coinbase(fk)? {
-                Some(self.store.tx_height.get(fk)?)
+            // Prefer prewarm-stashed coinbase height (no body re-walk).
+            let cb = if let Some(resolved) =
+                self.confirm_parents.get_parent_coinbase_height(fk)
+            {
+                Some(resolved)
             } else {
-                Some(None)
+                Some(self.resolve_parent_coinbase_height(
+                    fk,
+                    tx.input_count,
+                    self.confirm_parents.get_body_range(fk),
+                )?)
             };
             wf_add(&wf::CB_HEIGHT_NS, t_cb.elapsed().as_nanos() as u64);
 
@@ -177,14 +180,41 @@ impl Query {
         Ok((noted, wave))
     }
 
-    /// True if Class A body is a coinbase (1-in, null prevout). Uses prevout-only decode.
-    fn parent_is_coinbase(&self, fk: Fk) -> Result<bool, QueryError> {
-        let (meta, prevouts) =
-            if let Some((off, len)) = self.confirm_parents.get_body_range(fk) {
-                self.store.get_tx_meta_and_prevouts_at(off, len)?
-            } else {
-                self.store.get_tx_meta_and_prevouts(fk)?
-            };
+    /// Resolve create maturity: `None` = not coinbase, `Some(h)` = coinbase height.
+    ///
+    /// Only true coinbases (1-in + null prev), not every 1-in tx. Prevout scan
+    /// skips script/witness. Prewarm stashes this so wave rarely calls here.
+    pub(crate) fn resolve_parent_coinbase_height(
+        &self,
+        fk: Fk,
+        input_count: u32,
+        body_range: Option<(u64, u64)>,
+    ) -> Result<Option<u32>, QueryError> {
+        if input_count != 1 {
+            return Ok(None);
+        }
+        if !self.parent_is_coinbase_at(fk, body_range)? {
+            return Ok(None);
+        }
+        Ok(self.store.tx_height.get(fk)?)
+    }
+
+    /// True if Class A body is a coinbase (1-in, null prevout). Prevout-only decode.
+    fn parent_is_coinbase_at(
+        &self,
+        fk: Fk,
+        body_range: Option<(u64, u64)>,
+    ) -> Result<bool, QueryError> {
+        let (meta, prevouts) = match body_range {
+            Some((off, len)) => self.store.get_tx_meta_and_prevouts_at(off, len)?,
+            None => {
+                if let Some((off, len)) = self.confirm_parents.get_body_range(fk) {
+                    self.store.get_tx_meta_and_prevouts_at(off, len)?
+                } else {
+                    self.store.get_tx_meta_and_prevouts(fk)?
+                }
+            }
+        };
         if meta.input_count != 1 {
             return Ok(false);
         }

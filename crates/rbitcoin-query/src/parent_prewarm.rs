@@ -601,13 +601,14 @@ impl Query {
         st.parent_unique = st.parent_unique.saturating_add(uniq_parents.len() as u32);
 
         let mut parent_ranges: Vec<(Fk, u64, u64)> = Vec::new();
-        // (max_height, fk, tx, live outs, checked vouts)
+        // (max_height, fk, tx, live outs, checked vouts, coinbase_height)
         let mut sparse_parents: Vec<(
             u32,
             Fk,
             rbitcoin_store::TxRecord,
             Vec<(u32, rbitcoin_store::OutputRecord)>,
             Vec<u32>,
+            Option<Option<u32>>,
         )> = Vec::with_capacity(uniq_parents.len());
         for pid in uniq_parents {
             if self.confirm_cancelled() {
@@ -638,8 +639,7 @@ impl Query {
                 for h in &need_hs {
                     self.mlock_note_skip_pinned(*h, &cc);
                 }
-                // Sparse outs + spent filter for wave (one outs decode + one
-                // spender-meta walk per parent — not again on confirm).
+                // Sparse outs + spent filter + coinbase height for wave.
                 if !need_vouts.is_empty() {
                     match self.store.get_tx_meta_and_outputs_at(off, len) {
                         Ok((tx, outs)) => {
@@ -657,7 +657,23 @@ impl Query {
                                     }
                                 }
                             }
-                            sparse_parents.push((max_h, fk, tx, live, need_vouts));
+                            // Ok(v) → Some(v) stashed; Err → None (wave recomputes).
+                            let cb_stash = match self.resolve_parent_coinbase_height(
+                                fk,
+                                tx.input_count,
+                                Some((off, len)),
+                            ) {
+                                Ok(v) => Some(v),
+                                Err(_) => None,
+                            };
+                            sparse_parents.push((
+                                max_h,
+                                fk,
+                                tx,
+                                live,
+                                need_vouts,
+                                cb_stash,
+                            ));
                             st.full_tx_reads = st.full_tx_reads.saturating_add(1);
                         }
                         Err(_) => {
@@ -692,7 +708,20 @@ impl Query {
                                 }
                             }
                         }
-                        sparse_parents.push((max_h, fk, tx, live, need_vouts));
+                        let cb_stash = match self
+                            .resolve_parent_coinbase_height(fk, tx.input_count, None)
+                        {
+                            Ok(v) => Some(v),
+                            Err(_) => None,
+                        };
+                        sparse_parents.push((
+                            max_h,
+                            fk,
+                            tx,
+                            live,
+                            need_vouts,
+                            cb_stash,
+                        ));
                         st.full_tx_reads = st.full_tx_reads.saturating_add(1);
                     }
                 }

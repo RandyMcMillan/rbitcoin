@@ -4,7 +4,7 @@ use super::body::BodyPresence;
 use crate::chain::ChainHub;
 use bitcoin::BlockHash;
 use std::collections::{HashSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Work-chain progress for status / progress logs.
 ///
@@ -65,82 +65,92 @@ pub(crate) fn ibd_pct(tip: u32, horizon: u32) -> u32 {
     ((u64::from(tip) * 100) / u64::from(denom)) as u32
 }
 
-/// Rolling tip samples for genuine rate / ETA (not last-batch chunk size).
+/// Half-life for the tip-rate EWMA used by ETA (seconds).
 ///
-/// Samples are pushed on the centralized 5s status tick. Rates use the oldest
-/// sample still inside the requested window (up to ~1h retained).
+/// ~90s: recent IBD pace dominates (not the last hour of early empty blocks).
+/// A single 5s spike only moves the estimate a few percent; a sustained regime
+/// change is mostly reflected within ~5–6 minutes.
+const ETA_RATE_HALF_LIFE_SECS: f64 = 90.0;
+
+/// Need at least this much wall time of samples before publishing an ETA.
+const ETA_MIN_ELAPSED_SECS: f64 = 20.0;
+
+/// Present-biased smoothed tip rate for IBD ETA logs.
+///
+/// Samples are pushed on the centralized ~5s status tick. ETA uses an EWMA of
+/// inter-sample rates (half-life [`ETA_RATE_HALF_LIFE_SECS`]): recent pace
+/// dominates, but a single 5s spike only moves the estimate a few percent.
 pub(crate) struct TipRateTracker {
-    /// `(when, tip_height)` ascending by time.
-    samples: VecDeque<(Instant, u32)>,
-    retain: Duration,
+    /// EWMA of tip advance rate (blocks/s).
+    rate_ema: Option<f64>,
+    /// Previous sample used to form the next instantaneous interval rate.
+    last: Option<(Instant, u32)>,
+    /// First sample time (gate ETA until we have a few ticks of history).
+    first_at: Option<Instant>,
 }
 
 impl TipRateTracker {
     pub(crate) fn new() -> Self {
         Self {
-            samples: VecDeque::new(),
-            retain: Duration::from_secs(3600 + 30), // 1h + slack
+            rate_ema: None,
+            last: None,
+            first_at: None,
         }
     }
 
     /// Record a sample (call once per centralized status tick).
     pub(crate) fn push(&mut self, now: Instant, tip: u32) {
-        self.samples.push_back((now, tip));
-        self.prune(now);
-    }
-
-    fn prune(&mut self, now: Instant) {
-        let cutoff = now.checked_sub(self.retain).unwrap_or(now);
-        while self.samples.len() > 2 {
-            if let Some(&(t, _)) = self.samples.front() {
-                if t < cutoff {
-                    self.samples.pop_front();
-                    continue;
-                }
-            }
-            break;
+        if self.first_at.is_none() {
+            self.first_at = Some(now);
         }
+        if let Some((t0, tip0)) = self.last {
+            let dt = now.duration_since(t0).as_secs_f64();
+            // Ignore zero/negative clock skew; tiny dt would explode inst rate.
+            if dt >= 0.5 {
+                let inst = tip.saturating_sub(tip0) as f64 / dt;
+                let inst = if inst.is_finite() && inst >= 0.0 {
+                    inst
+                } else {
+                    0.0
+                };
+                self.rate_ema = Some(match self.rate_ema {
+                    None => inst,
+                    Some(prev) => {
+                        // alpha = 1 - exp(-ln2 * dt / half_life)
+                        let alpha = 1.0
+                            - (-std::f64::consts::LN_2 * dt / ETA_RATE_HALF_LIFE_SECS).exp();
+                        // Bound so a pathological long gap cannot fully reset.
+                        let alpha = alpha.clamp(0.02, 0.5);
+                        alpha * inst + (1.0 - alpha) * prev
+                    }
+                });
+            }
+        }
+        self.last = Some((now, tip));
     }
 
-    /// Blocks/sec of tip advance over the last `window` (using samples).
+    /// Smoothed tip rate (blocks/s) for ETA: present-biased EWMA.
     ///
-    /// Returns `None` if fewer than two samples or zero elapsed.
-    pub(crate) fn rate_over(&self, now: Instant, window: Duration) -> Option<f64> {
-        if self.samples.len() < 2 {
+    /// Returns `None` until enough wall time has elapsed for a stable read.
+    pub(crate) fn eta_rate(&self, now: Instant) -> Option<f64> {
+        let first = self.first_at?;
+        let elapsed = now.duration_since(first).as_secs_f64();
+        if elapsed < ETA_MIN_ELAPSED_SECS {
             return None;
         }
-        let &(_, tip_now) = self.samples.back()?;
-        let start = now.checked_sub(window).unwrap_or(now);
-        // Oldest sample at or after `start`; if all newer, use oldest available.
-        let mut base = *self.samples.front()?;
-        for &(t, h) in &self.samples {
-            if t <= start {
-                base = (t, h);
-            } else {
-                break;
-            }
-        }
-        let (t0, tip0) = base;
-        let secs = now.duration_since(t0).as_secs_f64();
-        if secs < 1.0 {
-            return None;
-        }
-        let delta = tip_now.saturating_sub(tip0) as f64;
-        Some(delta / secs)
+        let ema = self.rate_ema.filter(|r| r.is_finite() && *r > 1e-6)?;
+        Some(ema)
     }
 
-    /// Human ETA from tip→horizon using ~1h tip rate. Empty if not progressing.
+    /// Human ETA from tip→horizon using smoothed present-biased tip rate.
     pub(crate) fn eta_string(&self, now: Instant, tip: u32, horizon: u32) -> String {
         let remain = horizon.saturating_sub(tip);
         if remain == 0 {
             return "done".into();
         }
-        let Some(rate) = self.rate_over(now, Duration::from_secs(3600)) else {
+        let Some(rate) = self.eta_rate(now) else {
             return "eta=?".into();
         };
-        if rate < 1e-6 {
-            return "eta=?".into();
-        }
         let secs = (remain as f64 / rate).ceil() as u64;
         format!("eta={}", format_duration_short(secs))
     }
@@ -231,18 +241,6 @@ mod tests {
     }
 
     #[test]
-    fn tip_rate_over_window() {
-        let mut t = TipRateTracker::new();
-        let t0 = Instant::now();
-        t.push(t0, 1000);
-        t.push(t0 + Duration::from_secs(100), 1200);
-        let rate = t
-            .rate_over(t0 + Duration::from_secs(100), Duration::from_secs(100))
-            .unwrap();
-        assert!((rate - 2.0).abs() < 0.01, "rate={rate}");
-    }
-
-    #[test]
     fn eta_and_format() {
         assert_eq!(format_duration_short(45), "45s");
         assert_eq!(format_duration_short(120), "2m");
@@ -250,10 +248,72 @@ mod tests {
         assert_eq!(format_rate(31.2), "31");
         let mut t = TipRateTracker::new();
         let t0 = Instant::now();
-        t.push(t0, 100);
-        t.push(t0 + Duration::from_secs(3600), 100 + 3600); // 1 blk/s
-        let eta = t.eta_string(t0 + Duration::from_secs(3600), 100 + 3600, 100 + 3600 + 7200);
+        // Steady 1 blk/s for a few minutes (5s ticks).
+        for i in 0u32..=60 {
+            t.push(t0 + Duration::from_secs(u64::from(i) * 5), 100 + i * 5);
+        }
+        let now = t0 + Duration::from_secs(300);
+        let rate = t.eta_rate(now).unwrap();
+        assert!((rate - 1.0).abs() < 0.05, "rate={rate}");
+        let eta = t.eta_string(now, 100 + 300, 100 + 300 + 7200);
         assert!(eta.contains("eta="), "{eta}");
         assert!(eta.contains("2.0h") || eta.contains("2h"), "{eta}");
+    }
+
+    #[test]
+    fn eta_needs_warmup() {
+        let mut t = TipRateTracker::new();
+        let t0 = Instant::now();
+        t.push(t0, 0);
+        t.push(t0 + Duration::from_secs(5), 50);
+        // Only 5s of history — hide ETA until min elapsed.
+        assert!(t.eta_rate(t0 + Duration::from_secs(5)).is_none());
+        assert_eq!(
+            t.eta_string(t0 + Duration::from_secs(5), 50, 1_000_000),
+            "eta=?"
+        );
+    }
+
+    #[test]
+    fn eta_brief_spike_does_not_dominate() {
+        let mut t = TipRateTracker::new();
+        let t0 = Instant::now();
+        // ~5 minutes at 10 blk/s (5s ticks: +50 tip each).
+        for i in 0u32..=60 {
+            t.push(t0 + Duration::from_secs(u64::from(i) * 5), i * 50);
+        }
+        let before = t.eta_rate(t0 + Duration::from_secs(300)).unwrap();
+        assert!((before - 10.0).abs() < 0.5, "before={before}");
+        // One wild 5s interval at 500 blk/s.
+        t.push(t0 + Duration::from_secs(305), 60 * 50 + 2500);
+        let after = t.eta_rate(t0 + Duration::from_secs(305)).unwrap();
+        // EWMA half-life ~90s: one tick cannot pull rate near the spike.
+        assert!(after < 30.0, "after spike rate should stay near 10, got {after}");
+        assert!(after > 8.0, "after={after}");
+    }
+
+    #[test]
+    fn eta_tracks_sustained_slowdown() {
+        let mut t = TipRateTracker::new();
+        let t0 = Instant::now();
+        // Fast early: 100 blk/s for 1 minute.
+        for i in 0u32..=12 {
+            t.push(t0 + Duration::from_secs(u64::from(i) * 5), i * 500);
+        }
+        let fast = t.eta_rate(t0 + Duration::from_secs(60)).unwrap();
+        assert!(fast > 50.0, "fast={fast}");
+        // Then dense chain at 10 blk/s for several minutes — present bias
+        // should leave the early hour-style optimism behind.
+        let tip0 = 12u32 * 500;
+        for i in 1u32..=72 {
+            t.push(
+                t0 + Duration::from_secs(60 + u64::from(i) * 5),
+                tip0 + i * 50,
+            );
+        }
+        let slow = t.eta_rate(t0 + Duration::from_secs(60 + 72 * 5)).unwrap();
+        // ~6 min of dense pace with 90s half-life → well below early 100 blk/s.
+        assert!(slow < 18.0, "should track denser pace, got {slow}");
+        assert!(slow > 5.0, "slow={slow}");
     }
 }

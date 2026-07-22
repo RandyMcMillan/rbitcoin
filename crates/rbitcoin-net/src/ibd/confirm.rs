@@ -206,7 +206,13 @@ pub(crate) fn spawn_confirm_engine(
                 // Shutdown: do not emit reject events or blacklist after stop.
                 if feed.stopped() || hub.query.confirm_cancelled() {
                     if let Err(e) = &res {
-                        info!("ibd: confirm aborted after stop: {e}");
+                        let msg = e.to_string();
+                        // Cancel is expected on SIGINT — never look like corruption.
+                        if msg.contains("cancelled") || msg.contains("confirm cancelled") {
+                            info!("ibd: confirm aborted after stop (cancelled)");
+                        } else {
+                            info!("ibd: confirm aborted after stop: {e}");
+                        }
                     }
                     return;
                 }

@@ -15,6 +15,8 @@ pub enum StoreError {
     InvalidFk,
     NotDirectory(PathBuf),
     Corrupt(&'static str),
+    /// Cooperative abort (SIGINT / IBD stop) — not data corruption.
+    Cancelled(&'static str),
 }
 
 impl StoreError {
@@ -46,6 +48,7 @@ impl fmt::Display for StoreError {
                 write!(f, "store path is not a directory: {}", p.display())
             }
             StoreError::Corrupt(m) => write!(f, "corrupt record: {m}"),
+            StoreError::Cancelled(m) => write!(f, "cancelled: {m}"),
         }
     }
 }

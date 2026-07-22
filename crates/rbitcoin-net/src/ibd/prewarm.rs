@@ -166,7 +166,12 @@ pub(crate) fn spawn_parent_prewarm(
                     }
                     Err(e) => {
                         next_height = h1.saturating_add(1);
-                        debug!("ibd: prewarm error: {e}");
+                        let msg = e.to_string();
+                        if msg.contains("cancelled") {
+                            debug!("ibd: prewarm stopped (cancelled)");
+                        } else {
+                            debug!("ibd: prewarm error: {e}");
+                        }
                         std::thread::sleep(Duration::from_millis(5));
                     }
                 }

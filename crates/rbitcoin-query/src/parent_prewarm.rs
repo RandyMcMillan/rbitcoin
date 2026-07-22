@@ -169,7 +169,7 @@ impl Query {
             self.confirm_cancelled()
         }) {
             Ok(()) => Ok(()),
-            Err(true) => Err(StoreError::Corrupt("confirm cancelled")),
+            Err(true) => Err(StoreError::Cancelled("confirm cancelled")),
             Err(false) => Err(StoreError::Corrupt(
                 "confirm parent prewarm not ready (timeout)",
             )),
@@ -189,7 +189,7 @@ impl Query {
         }
         self.wait_prewarm_ready(heights, timeout)?;
         if self.confirm_cancelled() {
-            return Err(StoreError::Corrupt("confirm cancelled"));
+            return Err(StoreError::Cancelled("confirm cancelled"));
         }
         let hr = headroom.unwrap_or_else(prewarm_headroom_from_env);
         if hr == 0 || self.confirm_parents.headroom_ready(batch_end, hr) {
@@ -201,7 +201,7 @@ impl Query {
         let start = std::time::Instant::now();
         while start.elapsed() < soft {
             if self.confirm_cancelled() {
-                return Err(StoreError::Corrupt("confirm cancelled"));
+                return Err(StoreError::Cancelled("confirm cancelled"));
             }
             if self.confirm_parents.headroom_ready(batch_end, hr) {
                 return Ok(());
@@ -227,7 +227,7 @@ impl Query {
         for &(height, hash) in items {
             if self.confirm_cancelled() {
                 crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
-                return Err(StoreError::Corrupt("confirm cancelled"));
+                return Err(StoreError::Cancelled("confirm cancelled"));
             }
             if height <= tip {
                 continue;
@@ -263,7 +263,7 @@ impl Query {
         for &(height, hash) in &work {
             if self.confirm_cancelled() {
                 crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
-                return Err(StoreError::Corrupt("confirm cancelled"));
+                return Err(StoreError::Cancelled("confirm cancelled"));
             }
 
             // ── Small: load + RAM-cache header / header_txs (no mlock) ─────
@@ -343,7 +343,7 @@ impl Query {
             for &(fk, range) in &height_fks_resolved {
                 if self.confirm_cancelled() {
                     crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
-                    return Err(StoreError::Corrupt("confirm cancelled"));
+                    return Err(StoreError::Cancelled("confirm cancelled"));
                 }
                 let Some(id) = fk.get() else {
                     continue;
@@ -453,7 +453,7 @@ impl Query {
         for pid in uniq_parents {
             if self.confirm_cancelled() {
                 crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
-                return Err(StoreError::Corrupt("confirm cancelled"));
+                return Err(StoreError::Cancelled("confirm cancelled"));
             }
             let fk = Fk(pid);
             let mut need_hs = parent_need.remove(&pid).unwrap_or_default();

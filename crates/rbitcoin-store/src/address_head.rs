@@ -4,18 +4,17 @@
 //! **no HAS_NEXT** — probe continues until an empty slot (no Class A deletes).
 //! Callers verify identity via Class A body txid on **lookup**.
 //!
-//! **Insert (default):** probe until the **same fk** is already present (idempotent)
-//! or an **empty** slot — **CAS** `0 → fk` there (no whole-map insert lock).
+//! **Insert (sole writer):** probe until the **same fk** is already present
+//! (idempotent) or an **empty** slot — plain **Release** store `0 → fk` (no CAS).
 //! **No body_txid** on insert (no BIP30 displacement on write). Foreigners and
 //! older same-txid creates are skipped blindly; a second Class A row for the same
-//! txid lands at the next empty slot (deeper on the probe chain). Concurrent
-//! inserts of different keys only serialize at colliding empty slots via CAS.
+//! txid lands at the next empty slot (deeper on the probe chain).
 //!
-//! **Insert (archive sole-writer):** [`insert_many_sole`] uses plain Release stores
-//! into empty slots (no CAS, no primary-slot sort). Safe only when a single thread
-//! is inserting; IBD archive writer is that thread. Callers must publish sticky /
-//! drop in-flight maps only **after** a visibility fence.
-//! A process-wide `write_lock` remains only for online resize final catch-up/swap.
+//! **Concurrency:** at most **one** thread may insert into a given `tx.head`
+//! (archive writer in IBD; single tip accept path after). Multi-writer races are
+//! not supported. After each insert batch, a **SeqCst fence** publishes stores for
+//! concurrent readers (Acquire loads on probe). Online resize still uses
+//! `write_lock` only for final catch-up + file swap.
 //!
 //! **Lookup:** walk candidates from the **last occupied** probe slot toward the
 //! first, body-verify — so the deepest same-txid create wins (newest under
@@ -365,17 +364,10 @@ impl AddressHead {
     }
 
     fn read_entry(&self, slot: u64) -> Result<u64, StoreError> {
+        let off = self.entry_off(slot);
         match self.layout.entry_bytes {
-            4 => {
-                let mut buf = [0u8; 4];
-                self.file.read_at(self.entry_off(slot), &mut buf)?;
-                Ok(u64::from(u32::from_le_bytes(buf)))
-            }
-            8 => {
-                let mut buf = [0u8; 8];
-                self.file.read_at(self.entry_off(slot), &mut buf)?;
-                Ok(u64::from_le_bytes(buf))
-            }
+            4 => Ok(u64::from(self.file.load_u32_le(off)?)),
+            8 => self.file.load_u64_le(off),
             _ => Err(StoreError::Corrupt("address head entry_bytes")),
         }
     }
@@ -394,72 +386,9 @@ impl AddressHead {
         Ok(())
     }
 
-    /// Insert one mapping (no body IO). Lock-free vs other inserts: CAS empty→fk.
+    /// Insert one mapping (no body IO). Sole writer: Release store into empty slot.
     pub fn insert(&self, txid: &[u8; 32], new_fk: Fk) -> Result<(), StoreError> {
-        self.insert_cas(txid, new_fk)
-    }
-
-    /// CAS empty slot → fk; idempotent if `new_fk` already on the probe chain.
-    fn insert_cas(&self, txid: &[u8; 32], new_fk: Fk) -> Result<(), StoreError> {
-        let new_u = self.encode_fk(new_fk)?;
-        for d in 0..MAX_PROBE {
-            let slot = probe_index(txid, d, self.layout.bits);
-            let e = self.read_entry(slot)?;
-            if e == new_u {
-                return Ok(());
-            }
-            if e != 0 {
-                continue;
-            }
-            // Empty: claim with CAS (another inserter may win the slot).
-            if self.cas_entry(slot, 0, new_u)? {
-                self.occupied.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
-            }
-            // Lost race — re-check; same fk is success, else keep probing.
-            let e2 = self.read_entry(slot)?;
-            if e2 == new_u {
-                return Ok(());
-            }
-        }
-        Err(StoreError::Corrupt("address head probe exhausted on insert"))
-    }
-
-    /// Compare-and-swap one head entry (`expected` → `new`).
-    fn cas_entry(&self, slot: u64, expected: u64, new: u64) -> Result<bool, StoreError> {
-        let off = self.entry_off(slot);
-        match self.layout.entry_bytes {
-            4 => {
-                if expected > u64::from(u32::MAX) || new > u64::from(u32::MAX) {
-                    return Err(StoreError::InvalidFk);
-                }
-                self.file
-                    .cas_u32_le(off, expected as u32, new as u32)
-            }
-            8 => self.file.cas_u64_le(off, expected, new),
-            _ => Err(StoreError::Corrupt("address head entry_bytes")),
-        }
-    }
-
-    /// Bulk insert; primary-slot sort for locality. No body IO.
-    ///
-    /// Concurrent-safe with other inserts (per-slot CAS). Does **not** take
-    /// [`lock_writes`] — that is only for resize swap.
-    pub fn insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let mut work = entries.to_vec();
-        let bits = self.layout.bits;
-        work.sort_unstable_by_key(|(txid, _)| probe_index(txid, 0, bits));
-        for (txid, fk) in &work {
-            self.insert_cas(txid, *fk)?;
-        }
-        Ok(())
-    }
-
-    pub fn insert_many_paced(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
-        self.insert_many(entries)
+        self.insert_many(&[(*txid, new_fk)])
     }
 
     /// Unconditional empty-slot store (Release). Sole-writer only.
@@ -477,11 +406,11 @@ impl AddressHead {
         }
     }
 
-    /// Sole-writer insert: plain store into first empty probe slot (no CAS).
+    /// Sole-writer insert into first empty probe slot (no CAS).
     ///
-    /// Idempotent if `new_fk` is already on the chain. **Not** safe concurrent with
-    /// other inserters — archive IBD writer only.
-    fn insert_sole(&self, txid: &[u8; 32], new_fk: Fk) -> Result<(), StoreError> {
+    /// Idempotent if `new_fk` is already on the chain. Requires at most one
+    /// concurrent inserter process-wide for this head.
+    fn insert_one(&self, txid: &[u8; 32], new_fk: Fk) -> Result<(), StoreError> {
         let new_u = self.encode_fk(new_fk)?;
         for d in 0..MAX_PROBE {
             let slot = probe_index(txid, d, self.layout.bits);
@@ -492,29 +421,37 @@ impl AddressHead {
             if e != 0 {
                 continue;
             }
-            // Empty: sole writer claims without CAS.
             self.store_entry(slot, new_u)?;
             self.occupied.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        Err(StoreError::Corrupt(
-            "address head probe exhausted on sole insert",
-        ))
+        Err(StoreError::Corrupt("address head probe exhausted on insert"))
     }
 
-    /// Archive sole-writer bulk insert: **no CAS**, **no primary-slot sort**.
+    /// Bulk insert in **call order** (no sort). Plain Release stores; **SeqCst fence**
+    /// at end so concurrent Acquire probes observe the batch.
     ///
-    /// Inserts in call order. After the batch, callers should `fence(SeqCst)` (or
-    /// equivalent) before publishing sticky / dropping in-flight maps so prep and
-    /// other readers observe the new slots.
-    pub fn insert_many_sole(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
+    /// Does **not** take [`lock_writes`] — that is only for resize swap.
+    pub fn insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
         }
         for (txid, fk) in entries {
-            self.insert_sole(txid, *fk)?;
+            self.insert_one(txid, *fk)?;
         }
+        // Publish the batch for readers (pairs with Acquire loads in read_entry).
+        std::sync::atomic::fence(Ordering::SeqCst);
         Ok(())
+    }
+
+    pub fn insert_many_paced(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
+        self.insert_many(entries)
+    }
+
+    /// Alias of [`insert_many`] (historical archive name).
+    #[inline]
+    pub fn insert_many_sole(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
+        self.insert_many(entries)
     }
 
     /// Walk probe until empty; return every fk (may include foreigners).
@@ -575,7 +512,7 @@ impl AddressHead {
 
     /// Exclusive barrier for online resize final catch-up + swap only.
     ///
-    /// Steady-state inserts use per-slot CAS and do **not** take this lock.
+    /// Steady-state sole-writer inserts do **not** take this lock.
     pub fn lock_writes(&self) -> std::sync::MutexGuard<'_, ()> {
         self.write_lock.lock().unwrap()
     }
@@ -901,55 +838,49 @@ mod tests {
         let _ = std::fs::remove_file(meta_path(&path));
     }
 
+    /// Sole writer + concurrent probes (no multi-inserter).
     #[test]
-    fn concurrent_inserts_and_probes_all_found() {
+    fn sole_writer_with_concurrent_probes_all_found() {
         use std::sync::{Arc, Barrier};
         use std::thread;
 
-        let path = tmp("cas_conc");
+        let path = tmp("sole_probe");
         let h = Arc::new(AddressHead::create_with_bits(&path, 16).unwrap());
         let n = 200u64;
-        let barrier = Arc::new(Barrier::new(5));
-        let mut handles = Vec::new();
+        let barrier = Arc::new(Barrier::new(2));
 
-        // Four inserter threads, disjoint fk ranges.
-        for t in 0..4u64 {
+        let prober = {
             let h = Arc::clone(&h);
             let barrier = Arc::clone(&barrier);
-            handles.push(thread::spawn(move || {
+            thread::spawn(move || {
                 barrier.wait();
-                let start = t * (n / 4) + 1;
-                let end = if t == 3 { n } else { (t + 1) * (n / 4) };
-                let mut batch = Vec::new();
-                for i in start..=end {
-                    let mut txid = [0u8; 32];
-                    txid[0] = (i & 0xff) as u8;
-                    txid[1] = ((i >> 8) & 0xff) as u8;
-                    txid[2] = 0xca;
-                    batch.push((txid, Fk(i)));
-                }
-                h.insert_many(&batch).unwrap();
-            }));
-        }
-
-        // Prober while inserts run.
-        {
-            let h = Arc::clone(&h);
-            let barrier = Arc::clone(&barrier);
-            handles.push(thread::spawn(move || {
-                barrier.wait();
-                for _ in 0..500 {
+                for _ in 0..2000 {
                     let mut txid = [0u8; 32];
                     txid[0] = 1;
                     txid[2] = 0xca;
                     let _ = h.probe_fks(&txid);
                 }
-            }));
-        }
+            })
+        };
 
-        for handle in handles {
-            handle.join().unwrap();
+        barrier.wait();
+        // Single inserter, batched (fences between batches).
+        let mut batch = Vec::new();
+        for i in 1..=n {
+            let mut txid = [0u8; 32];
+            txid[0] = (i & 0xff) as u8;
+            txid[1] = ((i >> 8) & 0xff) as u8;
+            txid[2] = 0xca;
+            batch.push((txid, Fk(i)));
+            if batch.len() >= 32 {
+                h.insert_many(&batch).unwrap();
+                batch.clear();
+            }
         }
+        if !batch.is_empty() {
+            h.insert_many(&batch).unwrap();
+        }
+        prober.join().unwrap();
 
         assert_eq!(h.occupied(), n);
         for i in 1..=n {

@@ -270,55 +270,47 @@ impl TableFile {
         Ok(())
     }
 
-    /// Compare-and-swap a little-endian `u32` at `offset` (must be 4-byte aligned).
-    ///
-    /// Returns `Ok(true)` if the store succeeded (`*p` was `expected`). Does **not**
-    /// extend [`logical_len`] — for in-place head slots already in the published range.
-    pub fn cas_u32_le(&self, offset: u64, expected: u32, new: u32) -> Result<bool, StoreError> {
+    /// Atomic little-endian `u32` load (Acquire). Head probe path.
+    pub fn load_u32_le(&self, offset: u64) -> Result<u32, StoreError> {
         if offset % 4 != 0 {
-            return Err(StoreError::Corrupt("cas_u32 unaligned"));
+            return Err(StoreError::Corrupt("load_u32 unaligned"));
         }
         let end = offset.saturating_add(4);
         let len = self.published_len.load(Ordering::Acquire);
         if end > len {
-            return Err(StoreError::Corrupt("cas_u32 past logical end"));
+            return Err(StoreError::Corrupt("load_u32 past logical end"));
         }
         let pin = self.pin();
         if end > pin.epoch.cap() {
-            return Err(StoreError::Corrupt("cas_u32 past map end"));
+            return Err(StoreError::Corrupt("load_u32 past map end"));
         }
-        // SAFETY: aligned offset within published+capacity pin; head slots only.
-        let ok = unsafe {
+        // SAFETY: aligned offset within published+capacity pin.
+        let v = unsafe {
             let p = pin.epoch.as_ptr().add(offset as usize) as *mut u32;
-            AtomicU32::from_ptr(p)
-                .compare_exchange(expected, new, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+            AtomicU32::from_ptr(p).load(Ordering::Acquire)
         };
-        Ok(ok)
+        Ok(v)
     }
 
-    /// Compare-and-swap a little-endian `u64` at `offset` (must be 8-byte aligned).
-    pub fn cas_u64_le(&self, offset: u64, expected: u64, new: u64) -> Result<bool, StoreError> {
+    /// Atomic little-endian `u64` load (Acquire). Head probe path.
+    pub fn load_u64_le(&self, offset: u64) -> Result<u64, StoreError> {
         if offset % 8 != 0 {
-            return Err(StoreError::Corrupt("cas_u64 unaligned"));
+            return Err(StoreError::Corrupt("load_u64 unaligned"));
         }
         let end = offset.saturating_add(8);
         let len = self.published_len.load(Ordering::Acquire);
         if end > len {
-            return Err(StoreError::Corrupt("cas_u64 past logical end"));
+            return Err(StoreError::Corrupt("load_u64 past logical end"));
         }
         let pin = self.pin();
         if end > pin.epoch.cap() {
-            return Err(StoreError::Corrupt("cas_u64 past map end"));
+            return Err(StoreError::Corrupt("load_u64 past map end"));
         }
-        // SAFETY: aligned offset within published+capacity pin; head slots only.
-        let ok = unsafe {
+        let v = unsafe {
             let p = pin.epoch.as_ptr().add(offset as usize) as *mut u64;
-            AtomicU64::from_ptr(p)
-                .compare_exchange(expected, new, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+            AtomicU64::from_ptr(p).load(Ordering::Acquire)
         };
-        Ok(ok)
+        Ok(v)
     }
 
     /// Unconditional little-endian `u32` store (Release). Head sole-writer path.

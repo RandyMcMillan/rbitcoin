@@ -1385,10 +1385,10 @@ impl TxTable {
         self.head.read().unwrap().reserve_additional(additional)
     }
 
-    /// Bulk-insert head entries (archive / run materialize / backfill).
+    /// Bulk-insert head entries (archive / tip / rebuild).
     ///
-    /// Fast: probe until same fk (idempotent) or empty — **no body_txid** on insert.
-    /// May start / advance a sequential online resize (shadow filled from `tx.idx`).
+    /// Sole writer: plain store empty→fk, call order, SeqCst fence after batch.
+    /// **No body_txid** on insert. May start / advance sequential online resize.
     pub fn head_insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if !entries.is_empty() {
             self.head.read().unwrap().insert_many(entries)?;
@@ -1400,16 +1400,10 @@ impl TxTable {
         Ok(())
     }
 
-    /// Archive sole-writer head insert: no CAS, no sort (see [`AddressHead::insert_many_sole`]).
-    ///
-    /// Still may start / poll online resize after the batch.
+    /// Same as [`Self::head_insert_many`] (sole-writer path is the only path).
+    #[inline]
     pub fn head_insert_many_sole(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
-        if !entries.is_empty() {
-            self.head.read().unwrap().insert_many_sole(entries)?;
-        }
-        self.maybe_start_head_resize()?;
-        self.head_resize_poll(8_192)?;
-        Ok(())
+        self.head_insert_many(entries)
     }
 
     /// True if a sequential head rebuild is in progress.

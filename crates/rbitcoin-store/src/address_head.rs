@@ -446,18 +446,211 @@ impl AddressHead {
         Err(StoreError::Corrupt("address head probe exhausted on insert"))
     }
 
-    /// Bulk insert in **call order** (no sort). Plain Release stores; **SeqCst fence**
-    /// at end so concurrent Acquire probes observe the batch.
+    /// Bulk insert in **call order** (no sort). **SeqCst fence** at end so
+    /// concurrent Acquire probes observe the batch.
+    ///
+    /// When io_uring is enabled, uses wave-pipelined **pread probe + pwrite store**
+    /// so the kernel can schedule many head slots at once (archive write path).
+    /// Falls back to sequential mmap Release stores when uring is off.
     ///
     /// Does **not** take [`lock_writes`] — that is only for resize swap.
     pub fn insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
         }
+        if crate::bulk_io::io_uring_enabled() {
+            return self.insert_many_uring(entries);
+        }
         for (txid, fk) in entries {
             self.insert_one(txid, *fk)?;
         }
         // Publish the batch for readers (pairs with Acquire loads in read_entry).
+        std::sync::atomic::fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// io_uring bulk insert: many probe preads per wave, then empty-slot pwrites.
+    ///
+    /// Sole writer only (same contract as [`insert_one`]). Completions may finish
+    /// out of order within a wave; each key still walks probe depths in order.
+    fn insert_many_uring(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
+        use crate::bulk_io::{self, ReadOp, WriteOp};
+
+        let fd = self.read_fd();
+        let bits = self.layout.bits;
+        let entry_bytes = self.layout.entry_bytes;
+        let es = u64::from(entry_bytes);
+        let published = self.published_len();
+        let path = self.path_str();
+
+        struct Key {
+            txid: [u8; 32],
+            new_u: u64,
+            /// Next probe depth to issue (if not done).
+            depth: u8,
+            done: bool,
+            /// True if we issued a successful empty-slot write (count for occupied).
+            wrote: bool,
+        }
+
+        let mut keys: Vec<Key> = Vec::with_capacity(entries.len());
+        for (txid, fk) in entries {
+            let new_u = self.encode_fk(*fk)?;
+            keys.push(Key {
+                txid: *txid,
+                new_u,
+                depth: 0,
+                done: false,
+                wrote: false,
+            });
+        }
+
+        // Pending probe work: (key_i, depth). Seed depth 0 for every key.
+        let mut need_probe: Vec<(u32, u8)> = (0..keys.len() as u32).map(|i| (i, 0)).collect();
+
+        while !need_probe.is_empty() {
+            // --- probe wave ---
+            let n = need_probe.len();
+            let mut arena = vec![0u8; n * entry_bytes as usize];
+            let mut offs = vec![0u64; n];
+            {
+                for (i, &(ki, depth)) in need_probe.iter().enumerate() {
+                    let slot = probe_index(&keys[ki as usize].txid, u32::from(depth), bits);
+                    let off = FILE_HEADER_LEN as u64 + slot * es;
+                    if off.saturating_add(es) > published {
+                        return Err(StoreError::Corrupt("head insert probe past published"));
+                    }
+                    offs[i] = off;
+                }
+            }
+            let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(n);
+            {
+                let mut rest = arena.as_mut_slice();
+                for i in 0..n {
+                    let (left, right) = rest.split_at_mut(entry_bytes as usize);
+                    rest = right;
+                    read_ops.push(ReadOp {
+                        fd,
+                        offset: offs[i],
+                        buf: left,
+                        result: i32::MIN,
+                    });
+                }
+                bulk_io::pread_batch(&mut read_ops);
+            }
+
+            // Collect empty slots to write this round.
+            struct PendWrite {
+                key_i: u32,
+                off: u64,
+                bytes: [u8; 8],
+            }
+            let mut pending_writes: Vec<PendWrite> = Vec::new();
+            let mut next_probe: Vec<(u32, u8)> = Vec::new();
+
+            for (i, ro) in read_ops.iter().enumerate() {
+                let (ki, depth) = need_probe[i];
+                let k = &mut keys[ki as usize];
+                if k.done {
+                    continue;
+                }
+                if ro.result < 0 {
+                    return Err(StoreError::io(
+                        path,
+                        std::io::Error::from_raw_os_error(-ro.result),
+                    ));
+                }
+                if ro.result as usize != entry_bytes as usize {
+                    return Err(StoreError::Corrupt("head insert probe pread short"));
+                }
+                let e = match entry_bytes {
+                    4 => u64::from(u32::from_le_bytes(ro.buf[..4].try_into().unwrap())),
+                    8 => u64::from_le_bytes(ro.buf[..8].try_into().unwrap()),
+                    _ => return Err(StoreError::Corrupt("address head entry_bytes")),
+                };
+                if e == k.new_u {
+                    // Idempotent: already present.
+                    k.done = true;
+                    continue;
+                }
+                if e != 0 {
+                    // Foreigner — deeper slot.
+                    let nd = depth.saturating_add(1);
+                    if u32::from(nd) >= MAX_PROBE {
+                        return Err(StoreError::Corrupt(
+                            "address head probe exhausted on insert",
+                        ));
+                    }
+                    next_probe.push((ki, nd));
+                    k.depth = nd;
+                    continue;
+                }
+                // Empty: store here.
+                let mut bytes = [0u8; 8];
+                match entry_bytes {
+                    4 => bytes[..4].copy_from_slice(&(k.new_u as u32).to_le_bytes()),
+                    8 => bytes[..8].copy_from_slice(&k.new_u.to_le_bytes()),
+                    _ => unreachable!(),
+                }
+                pending_writes.push(PendWrite {
+                    key_i: ki,
+                    off: offs[i],
+                    bytes,
+                });
+            }
+
+            // --- write wave (empty slots) ---
+            if !pending_writes.is_empty() {
+                let wlen = entry_bytes as usize;
+                let mut warena = vec![0u8; pending_writes.len() * wlen];
+                for (i, pw) in pending_writes.iter().enumerate() {
+                    warena[i * wlen..i * wlen + wlen]
+                        .copy_from_slice(&pw.bytes[..wlen]);
+                }
+                let mut write_ops: Vec<WriteOp<'_>> = Vec::with_capacity(pending_writes.len());
+                let mut rest = warena.as_slice();
+                let mut pieces: Vec<&[u8]> = Vec::with_capacity(pending_writes.len());
+                for _ in 0..pending_writes.len() {
+                    let (left, right) = rest.split_at(wlen);
+                    pieces.push(left);
+                    rest = right;
+                }
+                for (piece, pw) in pieces.into_iter().zip(pending_writes.iter()) {
+                    write_ops.push(WriteOp {
+                        fd,
+                        offset: pw.off,
+                        buf: piece,
+                        result: i32::MIN,
+                    });
+                }
+                bulk_io::pwrite_batch(&mut write_ops);
+                for (wo, pw) in write_ops.iter().zip(pending_writes.iter()) {
+                    if wo.result < 0 {
+                        return Err(StoreError::io(
+                            path,
+                            std::io::Error::from_raw_os_error(-wo.result),
+                        ));
+                    }
+                    if wo.result as usize != wlen {
+                        return Err(StoreError::Corrupt("head insert pwrite short"));
+                    }
+                    let k = &mut keys[pw.key_i as usize];
+                    k.done = true;
+                    k.wrote = true;
+                }
+            }
+
+            need_probe = next_probe;
+        }
+
+        if keys.iter().any(|k| !k.done) {
+            return Err(StoreError::Corrupt("address head bulk insert incomplete"));
+        }
+        let n_new = keys.iter().filter(|k| k.wrote).count() as u64;
+        if n_new > 0 {
+            self.occupied.fetch_add(n_new, Ordering::Relaxed);
+        }
+        // Publish: pairs with Acquire loads on probe (mmap or pread readers).
         std::sync::atomic::fence(Ordering::SeqCst);
         Ok(())
     }

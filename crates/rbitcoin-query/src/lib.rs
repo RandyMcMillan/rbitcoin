@@ -67,6 +67,11 @@ pub mod confirm_load_stats {
     pub static PIN_COVER_MISS_PARTIAL: AtomicU64 = AtomicU64::new(0);
     pub static PIN_SPENT_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_MLOCK_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PIN_COVER_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PIN_BODY_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PIN_NEW_META_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PIN_PUT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PIN_TOUCH_NS: AtomicU64 = AtomicU64::new(0);
     pub static PARENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
     pub static FULL_TX_READS: AtomicU64 = AtomicU64::new(0);
     pub static BODY_TX_READS: AtomicU64 = AtomicU64::new(0);
@@ -114,6 +119,11 @@ pub mod confirm_load_stats {
         pub pin_cover_miss_partial: u64,
         pub pin_spent_ns: u64,
         pub pin_mlock_ns: u64,
+        pub pin_cover_ns: u64,
+        pub pin_body_ns: u64,
+        pub pin_new_meta_ns: u64,
+        pub pin_put_ns: u64,
+        pub pin_touch_ns: u64,
         pub cache_hits: u64,
         pub body_tx: u64,
         pub parent_tx: u64,
@@ -154,6 +164,11 @@ pub mod confirm_load_stats {
             pin_cover_miss_partial: PIN_COVER_MISS_PARTIAL.swap(0, Ordering::Relaxed),
             pin_spent_ns: PIN_SPENT_NS.swap(0, Ordering::Relaxed),
             pin_mlock_ns: PIN_MLOCK_NS.swap(0, Ordering::Relaxed),
+            pin_cover_ns: PIN_COVER_NS.swap(0, Ordering::Relaxed),
+            pin_body_ns: PIN_BODY_NS.swap(0, Ordering::Relaxed),
+            pin_new_meta_ns: PIN_NEW_META_NS.swap(0, Ordering::Relaxed),
+            pin_put_ns: PIN_PUT_NS.swap(0, Ordering::Relaxed),
+            pin_touch_ns: PIN_TOUCH_NS.swap(0, Ordering::Relaxed),
             cache_hits: PARENT_CACHE_HITS.swap(0, Ordering::Relaxed),
             body_tx: BODY_TX_READS.swap(0, Ordering::Relaxed),
             parent_tx: FULL_TX_READS.swap(0, Ordering::Relaxed),
@@ -204,6 +219,11 @@ pub mod confirm_load_stats {
         add!(pin_cover_miss_partial, PIN_COVER_MISS_PARTIAL);
         add!(pin_spent_ns, PIN_SPENT_NS);
         add!(pin_mlock_ns, PIN_MLOCK_NS);
+        add!(pin_cover_ns, PIN_COVER_NS);
+        add!(pin_body_ns, PIN_BODY_NS);
+        add!(pin_new_meta_ns, PIN_NEW_META_NS);
+        add!(pin_put_ns, PIN_PUT_NS);
+        add!(pin_touch_ns, PIN_TOUCH_NS);
         add!(parent_cache_hits, PARENT_CACHE_HITS);
         add!(full_tx_reads, FULL_TX_READS);
         add!(body_tx_reads, BODY_TX_READS);

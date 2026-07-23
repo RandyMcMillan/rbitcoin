@@ -4,9 +4,9 @@
 //! 1. **Cache** header + `header_txs` + body ranges.
 //! 2. **Full Class A decode** into `by_body` (wire/assemble clone from here).
 //! 3. **Thin edges** (stamped create_fk) + **sparse parent pin** (spent-filtered outs).
-//! 4. **`mlock`** (default on; `RBITCOIN_CONFIRM_MLOCK=0` off): **only parent
-//!    create `tx.body` pages** that write will annotate. Refcounted by needing
-//!    batch heights; tip GC after write munlocks when no active batch needs them.
+//! 4. **`mlock`** (default **off**; `RBITCOIN_CONFIRM_MLOCK=1` on): optional
+//!    parent create `tx.body` pages for write annotate. Host IBD: mlock off
+//!    matches tip rate; residual pin CPU/IO is the long pole.
 //!
 //! No background worker / no wave fill: load owns the batch's Class A + parents.
 //! Bodies stay in `by_body` (post-tip LRU) for pin hits; thin edges + `by_fk`
@@ -40,8 +40,18 @@ pub struct ConfirmLoadStats {
     pub pin_cover_miss_partial: u32,
     /// Wall ns in `unspent_create_vouts` during pin (store spent-filter).
     pub pin_spent_ns: u64,
-    /// Wall ns in pin-loop mlock helpers.
+    /// Wall ns in pin-loop mlock helpers (0 when mlock default-off).
     pub pin_mlock_ns: u64,
+    /// Cover check + covered/uncovered split.
+    pub pin_cover_ns: u64,
+    /// Body-LRU batch lookup + pin_cache resolve (excludes spent timer).
+    pub pin_body_ns: u64,
+    /// pin_new range + meta/outs resolve (excludes spent timer).
+    pub pin_new_meta_ns: u64,
+    /// `put_parent_outs_resolved_batch` + body_range put.
+    pub pin_put_ns: u64,
+    /// `touch_parent_needs_batch` (incl. covered re-touch).
+    pub pin_touch_ns: u64,
     /// Same-batch create edges (identity known in-batch). Not pin body hit rate.
     pub parent_cache_hits: u32,
     /// Stamped create_fk on input, parent **not** in this batch (external fk).
@@ -515,6 +525,7 @@ impl Query {
             need_vouts.dedup();
             pin_jobs.push((pid, max_h, need_hs, need_vouts));
         }
+        let t_cover = Instant::now();
         let cover_keys: Vec<(u64, Vec<u32>)> = pin_jobs
             .iter()
             .map(|(pid, _, _, vouts)| (*pid, vouts.clone()))
@@ -566,7 +577,11 @@ impl Query {
                 uncovered.push((i, pid, max_h, need_hs, need_vouts));
             }
         }
+        st.pin_cover_ns = st
+            .pin_cover_ns
+            .saturating_add(t_cover.elapsed().as_nanos() as u64);
 
+        let t_body = Instant::now();
         let body_pin_keys: Vec<(u64, Vec<u32>)> = uncovered
             .iter()
             .filter(|(_, _, _, _, vouts)| !vouts.is_empty())
@@ -668,6 +683,9 @@ impl Query {
             }
             pin_new_jobs.push((pid, max_h, need_hs, need_vouts, range));
         }
+        st.pin_body_ns = st
+            .pin_body_ns
+            .saturating_add(t_body.elapsed().as_nanos() as u64);
 
         // Unique-range mlock before pin_new meta reads (and cover need_height notes).
         if do_mlock && (!mlock_items.is_empty() || !mlock_no_range.is_empty()) {
@@ -689,6 +707,7 @@ impl Query {
         }
 
         // Sparse outs + spent filter for pin_new (pages warm when mlock on).
+        let t_new = Instant::now();
         for (pid, max_h, need_hs, need_vouts, range) in pin_new_jobs {
             if self.confirm_cancelled() {
                 crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
@@ -788,8 +807,13 @@ impl Query {
             }
             st.utxo_parents = st.utxo_parents.saturating_add(1);
         }
+        st.pin_new_meta_ns = st
+            .pin_new_meta_ns
+            .saturating_add(t_new.elapsed().as_nanos() as u64);
+
         // Put by_fk first so touch can attach need_fk for pure pin_new parents
         // (touch before put was a no-op when neither by_fk nor by_body held them).
+        let t_put = Instant::now();
         if !sparse_parents.is_empty() {
             self.confirm_parents
                 .put_parent_outs_resolved_batch(&sparse_parents);
@@ -797,10 +821,17 @@ impl Query {
         if !parent_ranges.is_empty() {
             self.confirm_parents.put_body_ranges_batch(&parent_ranges);
         }
+        st.pin_put_ns = st
+            .pin_put_ns
+            .saturating_add(t_put.elapsed().as_nanos() as u64);
+        let t_touch = Instant::now();
         if !touch_batch.is_empty() {
             self.confirm_parents
                 .touch_parent_needs_batch(&touch_batch);
         }
+        st.pin_touch_ns = st
+            .pin_touch_ns
+            .saturating_add(t_touch.elapsed().as_nanos() as u64);
         st.parent_pin_ns = st
             .parent_pin_ns
             .saturating_add(t_par.elapsed().as_nanos() as u64);

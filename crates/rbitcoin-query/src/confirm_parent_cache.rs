@@ -55,17 +55,19 @@ fn estimate_body_bytes(
     n
 }
 
-/// Default: mlock **on** (parent create `tx.body` pages for write annotate).
-/// Set `=0`/`false`/`off` for decode-stash only (no mlock syscalls).
+/// Default: mlock **off** (IBD host proof: same tip with/without; less MEMLOCK).
+///
+/// Opt-in parent create `tx.body` mlock for write annotate:
+/// `RBITCOIN_CONFIRM_MLOCK=1` / `true` / `on` (legacy `RBITCOIN_PARENT_PREWARM_MLOCK`).
 pub fn confirm_mlock_from_env() -> bool {
     match std::env::var("RBITCOIN_CONFIRM_MLOCK")
         .or_else(|_| std::env::var("RBITCOIN_PARENT_PREWARM_MLOCK"))
     {
         Ok(s) => {
             let t = s.trim();
-            !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on")
         }
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 

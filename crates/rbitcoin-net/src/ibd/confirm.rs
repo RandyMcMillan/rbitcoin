@@ -87,6 +87,29 @@ pub(crate) struct ConfirmQueueDepths {
     scripts_to_write: AtomicUsize,
 }
 
+/// Format one confirm pipeline queue slot for logs.
+///
+/// Depth 0 uses `name<0/cap` (next worker waiting on an empty queue);
+/// otherwise `name=n/cap`.
+#[inline]
+pub(crate) fn format_queue_depth(name: &str, depth: usize, cap: usize) -> String {
+    if depth == 0 {
+        format!("{name}<0/{cap}")
+    } else {
+        format!("{name}={depth}/{cap}")
+    }
+}
+
+/// `conf_q load… write…` fragment used by progress and perf lines.
+#[inline]
+pub(crate) fn format_conf_q(load: usize, write: usize, load_cap: usize, write_cap: usize) -> String {
+    format!(
+        "conf_q {} {}",
+        format_queue_depth("load", load, load_cap),
+        format_queue_depth("write", write, write_cap),
+    )
+}
+
 impl ConfirmQueueDepths {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self::default())
@@ -622,7 +645,7 @@ pub(crate) fn offer_confirm_ready(
 
 #[cfg(test)]
 mod tests {
-    use super::is_confirm_load_retryable;
+    use super::{format_conf_q, format_queue_depth, is_confirm_load_retryable};
 
     /// Contiguous feed claim (2-stage): up to max heights, skip already-confirmed.
     fn claim_feed_run(
@@ -677,5 +700,25 @@ mod tests {
         ));
         assert!(!is_confirm_load_retryable("script failed: false"));
         assert!(!is_confirm_load_retryable("prevout already spent"));
+    }
+
+    #[test]
+    fn queue_depth_log_uses_lt_when_empty() {
+        assert_eq!(format_queue_depth("load", 0, 2), "load<0/2");
+        assert_eq!(format_queue_depth("write", 0, 2), "write<0/2");
+        assert_eq!(format_queue_depth("load", 1, 2), "load=1/2");
+        assert_eq!(format_queue_depth("write", 2, 2), "write=2/2");
+        assert_eq!(
+            format_conf_q(0, 1, 2, 2),
+            "conf_q load<0/2 write=1/2"
+        );
+        assert_eq!(
+            format_conf_q(1, 0, 2, 2),
+            "conf_q load=1/2 write<0/2"
+        );
+        assert_eq!(
+            format_conf_q(0, 0, 2, 2),
+            "conf_q load<0/2 write<0/2"
+        );
     }
 }

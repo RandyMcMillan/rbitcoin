@@ -613,12 +613,14 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         }
     };
     let mlock_mb = s.mlock_bytes / (1024 * 1024);
-    out.push_str(&format!(
-        " | conf_q load={}/{} write={}/{} | parents thru={} by_txid={} bodies={} plans={} blks={} body_io={} parent_io={} pin_cached={} pin_cache={} pin_new={} cache%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
+    let conf_q = super::confirm::format_conf_q(
         s.conf_load_q,
-        s.conf_load_q_cap,
         s.conf_write_q,
+        s.conf_load_q_cap,
         s.conf_write_q_cap,
+    );
+    out.push_str(&format!(
+        " | {conf_q} | parents thru={} by_txid={} bodies={} plans={} blks={} body_io={} parent_io={} pin_cached={} pin_cache={} pin_new={} cache%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
         s.load_ready_through,
         s.cache_parents,
         s.cache_bodies,
@@ -710,12 +712,14 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     ));
     let cp_tot = s.cp_wave + s.cp_class_a + s.cp_store;
     let mlock_mb = s.mlock_bytes / (1024 * 1024);
-    out.push_str(&format!(
-        " | conf_q load={}/{} write={}/{} | parents thru={} by_txid={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cached={} pin_cache={} pin_new={} cache_hit={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} head={}/{} mlock_sys={}/{} edges same={} cache={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
+    let conf_q = super::confirm::format_conf_q(
         s.conf_load_q,
-        s.conf_load_q_cap,
         s.conf_write_q,
+        s.conf_load_q_cap,
         s.conf_write_q_cap,
+    );
+    out.push_str(&format!(
+        " | {conf_q} | parents thru={} by_txid={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cached={} pin_cache={} pin_new={} cache_hit={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} head={}/{} mlock_sys={}/{} edges same={} cache={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
         s.load_ready_through,
         s.cache_parents,
         s.cache_bodies,
@@ -951,7 +955,8 @@ mod tests {
         assert!(line.contains("store="), "{line}");
         assert!(line.contains("thin="), "{line}");
         assert!(line.contains("rebuild="), "{line}");
-        assert!(line.contains("conf_q load=0/2 write=1/2"), "{line}");
+        // Depth 0 → `<` (scripts waiting on empty load queue).
+        assert!(line.contains("conf_q load<0/2 write=1/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
         assert!(line.contains("utxo_p=100"), "{line}");
         assert!(line.contains("creates=50"), "{line}");

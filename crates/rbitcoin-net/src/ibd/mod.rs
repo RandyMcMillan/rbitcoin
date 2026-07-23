@@ -816,16 +816,20 @@ pub async fn ibd_cancellable(
             let eta = tip_rate_tracker.eta_string(now, prog.tip, prog.headers);
 
             // Bold on a TTY so the 5s progress line stands out among perf/debug noise.
-            // conf_q: load→scripts / scripts→write pipeline depth (cap 2 each).
+            // conf_q: load→scripts / scripts→write depth; `name<0/cap` = consumer waiting.
+            let conf_q = confirm::format_conf_q(
+                load_q,
+                write_q,
+                confirm::LOAD_QUEUE_CAP,
+                confirm::WRITE_QUEUE_CAP,
+            );
             info_bold!(
-                "ibd: progress {pct}% tip={} ({}/s) arch_hwm={} ({}/s lead={arch_lead}) hole={} peers={peers_n} conf_q load={load_q}/{} write={write_q}/{} mlock={mlock_mb}MiB sh_runs={sh_runs} horizon={} {eta}",
+                "ibd: progress {pct}% tip={} ({}/s) arch_hwm={} ({}/s lead={arch_lead}) hole={} peers={peers_n} {conf_q} mlock={mlock_mb}MiB sh_runs={sh_runs} horizon={} {eta}",
                 prog.tip,
                 format_rate(tip_rate),
                 prog.archived,
                 format_rate(arch_rate),
                 prog.tip_hole,
-                confirm::LOAD_QUEUE_CAP,
-                confirm::WRITE_QUEUE_CAP,
                 prog.headers,
             );
             let _ = std::io::Write::flush(&mut std::io::stderr());

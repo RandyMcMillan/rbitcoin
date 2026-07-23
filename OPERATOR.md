@@ -45,7 +45,7 @@ Default: **info**. CLI wins over env.
 | Archive queue RAM | **512 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
 | Parent body mlock (write annotate) | **on** | `RBITCOIN_CONFIRM_MLOCK=0` to disable |
-| Confirm stages | **load · scripts · write** | Pipeline queues cap **2** each (`conf_q load=n/2 write=m/2` in progress logs) |
+| Confirm stages | **load · scripts · write** | Pipeline queues cap **2** each (`conf_q load=n/2 write=m/2`; `name<0/cap` when the next worker is waiting on an empty queue) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 | Inhibit auto-suspend | **off** | `--inhibit-suspend` (uses `systemd-inhibit` if available) |
 

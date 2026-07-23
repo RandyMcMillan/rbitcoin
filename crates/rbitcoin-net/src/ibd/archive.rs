@@ -627,16 +627,7 @@ pub(crate) fn spawn_archive_pipeline(
                     } else {
                         write_hub.query.archive_commit_plan(plan)
                     };
-                    write_stats
-                        .write_ns
-                        .fetch_add(write_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    write_stats.write_batches.fetch_add(1, Ordering::Relaxed);
-                    write_stats
-                        .write_blocks
-                        .fetch_add(n_blocks, Ordering::Relaxed);
-                    write_stats
-                        .write_batch_blocks
-                        .fetch_add(n_blocks, Ordering::Relaxed);
+                    // commit walls recorded inside archive_commit_plan
 
                     if !clear_inflight.is_empty() {
                         let mut g = write_inflight.lock().unwrap();
@@ -658,15 +649,34 @@ pub(crate) fn spawn_archive_pipeline(
                             blocks_since_flush =
                                 blocks_since_flush.saturating_add(n_blocks);
                             if blocks_since_flush >= FLUSH_EVERY_BLOCKS {
+                                let t_flush = Instant::now();
                                 if let Err(e) = write_hub.query.flush_header_archive() {
                                     rbitcoin_log::warn!(
                                         "ibd: header archive flush failed: {e}"
                                     );
                                 }
+                                rbitcoin_query::archive_phase_stats::note_write_flush(
+                                    t_flush.elapsed().as_nanos() as u64,
+                                );
                                 blocks_since_flush = 0;
                             }
+                            let wall = write_t0.elapsed().as_nanos() as u64;
+                            write_stats.write_ns.fetch_add(wall, Ordering::Relaxed);
+                            write_stats.write_batches.fetch_add(1, Ordering::Relaxed);
+                            write_stats
+                                .write_blocks
+                                .fetch_add(n_blocks, Ordering::Relaxed);
+                            write_stats
+                                .write_batch_blocks
+                                .fetch_add(n_blocks, Ordering::Relaxed);
                         }
                         Err(e) => {
+                            let wall = write_t0.elapsed().as_nanos() as u64;
+                            write_stats.write_ns.fetch_add(wall, Ordering::Relaxed);
+                            write_stats.write_batches.fetch_add(1, Ordering::Relaxed);
+                            write_stats
+                                .write_blocks
+                                .fetch_add(n_blocks, Ordering::Relaxed);
                             // Ordered FK reservation: after a commit failure, any
                             // later queued plans are invalid — fail them and stop.
                             let err = e.to_string();
@@ -826,6 +836,7 @@ pub(crate) fn spawn_archive_pipeline(
                     let mut items: Vec<(Fk, rbitcoin_store::HeaderRecord, Vec<TxApply>)> =
                         Vec::with_capacity(jobs.len());
 
+                    let t_struct = Instant::now();
                     for job in jobs {
                         let hash = job.block.block_hash();
                         outcomes.push((hash, job.wire_bytes));
@@ -846,14 +857,12 @@ pub(crate) fn spawn_archive_pipeline(
                             }
                         }
                     }
-                    stats
-                        .prep_ns
-                        .fetch_add(prep_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    stats
-                        .prep_blocks
-                        .fetch_add(jobs.len() as u64, Ordering::Relaxed);
+                    let struct_ns = t_struct.elapsed().as_nanos() as u64;
 
-                    let plan = match hub.query.archive_filter_need_bodies(&mut items) {
+                    let t_filter = Instant::now();
+                    let filter_res = hub.query.archive_filter_need_bodies(&mut items);
+                    let filter_ns = t_filter.elapsed().as_nanos() as u64;
+                    let plan = match filter_res {
                         Ok((_fks, mut need)) => {
                             if need.is_empty() {
                                 rbitcoin_query::ArchiveWritePlan::empty()
@@ -892,6 +901,7 @@ pub(crate) fn spawn_archive_pipeline(
                         }
                     };
 
+                    let t_publish = Instant::now();
                     // Advance reserved HWM only after a successful non-empty plan.
                     if let Some(last) = plan.planned_fks.last() {
                         *next_plan_fk = last.0.saturating_add(1);
@@ -903,10 +913,12 @@ pub(crate) fn spawn_archive_pipeline(
                             g.insert(txid, fk);
                         }
                     }
+                    let publish_ns = t_publish.elapsed().as_nanos() as u64;
 
                     // Empty plan still goes through writer so Ok results stay ordered.
                     let mut batch = WriteReadyBatch { outcomes, plan };
                     // Backpressure when full, but do not block forever on SIGINT.
+                    let t_qwait = Instant::now();
                     loop {
                         if stop.load(Ordering::Relaxed) {
                             // Drop planned batch — writer will not commit after stop.
@@ -926,7 +938,7 @@ pub(crate) fn spawn_archive_pipeline(
                             return PlanSend::FailedRewind;
                         }
                         match write_tx.try_send(batch) {
-                            Ok(()) => return PlanSend::Done,
+                            Ok(()) => break,
                             Err(std::sync::mpsc::TrySendError::Full(b)) => {
                                 batch = b;
                                 std::thread::sleep(Duration::from_millis(2));
@@ -936,6 +948,25 @@ pub(crate) fn spawn_archive_pipeline(
                             }
                         }
                     }
+                    let qwait_ns = t_qwait.elapsed().as_nanos() as u64;
+                    let total_ns = prep_t0.elapsed().as_nanos() as u64;
+
+                    stats
+                        .prep_ns
+                        .fetch_add(total_ns, Ordering::Relaxed);
+                    stats
+                        .prep_blocks
+                        .fetch_add(jobs.len() as u64, Ordering::Relaxed);
+                    // Plan sub-phases noted inside archive_plan_mega_from.
+                    rbitcoin_query::archive_phase_stats::note_prep_batch(
+                        total_ns,
+                        struct_ns,
+                        filter_ns,
+                        publish_ns,
+                        qwait_ns,
+                        jobs.len() as u64,
+                    );
+                    PlanSend::Done
                 }
 
                 loop {

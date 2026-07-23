@@ -207,6 +207,7 @@ impl Query {
         let n_headers = need.iter().filter(|(_, t)| !t.is_empty()).count() as u64;
 
         // Pass 1: assign create fks + build batch_map (txid → create_fk).
+        let t_assign = Instant::now();
         let mut batch_map: HashMap<[u8; 32], Fk> = HashMap::new();
         let mut work: Vec<(Fk, TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> =
             Vec::new();
@@ -239,9 +240,10 @@ impl Query {
             }
             per_header_ranges.push((*header_fk, first_tx_fk, n_txs));
         }
+        let assign_ns = t_assign.elapsed().as_nanos() as u64;
 
         // Pass 2: unique external prev_txids that still need fk (reads only).
-        let t_resolve = Instant::now();
+        let t_collect = Instant::now();
         let mut need_external: HashSet<[u8; 32]> = HashSet::new();
         for (_sfk, _tx, inputs, _) in &work {
             for inp in inputs {
@@ -257,11 +259,16 @@ impl Query {
                 need_external.insert(inp.prev_txid);
             }
         }
-
         let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
+        let collect_ns = t_collect.elapsed().as_nanos() as u64;
+
+        let t_sticky = Instant::now();
         let mut resolved = self.archive_txid_sticky.lookup_batch(&need_vec);
         let sticky_hit_n = resolved.len() as u64;
+        let sticky_ns = t_sticky.elapsed().as_nanos() as u64;
+
         // Prior mega-batch(es) still in the write queue: not sticky/head yet.
+        let t_inflight = Instant::now();
         if !in_flight.is_empty() {
             for t in &need_vec {
                 if resolved.contains_key(t) {
@@ -272,6 +279,9 @@ impl Query {
                 }
             }
         }
+        let inflight_ns = t_inflight.elapsed().as_nanos() as u64;
+
+        let t_head = Instant::now();
         let mut need_head: Vec<[u8; 32]> = Vec::new();
         for t in &need_vec {
             if !resolved.contains_key(t) {
@@ -293,9 +303,10 @@ impl Query {
                 }
             }
         }
-        let resolve_ns = t_resolve.elapsed().as_nanos() as u64;
+        let head_ns = t_head.elapsed().as_nanos() as u64;
 
         // Pass 3: stamp create_fk on inputs; tip spends list.
+        let t_stamp = Instant::now();
         let mut packed: Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> =
             Vec::with_capacity(work.len());
         let mut planned_fks: Vec<Fk> = Vec::with_capacity(work.len());
@@ -328,17 +339,9 @@ impl Query {
             planned_fks.push(tx_fk);
             packed.push((tx, inputs, outputs));
         }
-        crate::archive_resolve_stats::note(
-            n_headers,
-            need_vec.len() as u64,
-            sticky_hit_n,
-            head_need_n,
-            head_hit_n,
-            batch_stamp,
-            resolved_stamp,
-            resolve_ns,
-        );
+        let stamp_ns = t_stamp.elapsed().as_nanos() as u64;
 
+        let t_finish = Instant::now();
         let body_est: u64 = packed
             .iter()
             .map(|(_tx, ins, outs)| {
@@ -354,6 +357,28 @@ impl Query {
             .map(|((tx, _, _), fk)| (tx.txid, *fk))
             .collect();
 
+        let advise_dont_need = self.archive_far_ahead_of_confirm()?;
+        let finish_ns = t_finish.elapsed().as_nanos() as u64;
+
+        crate::archive_phase_stats::note_resolve_counts(
+            n_headers,
+            need_vec.len() as u64,
+            sticky_hit_n,
+            head_need_n,
+            head_hit_n,
+            batch_stamp,
+            resolved_stamp,
+        );
+        crate::archive_phase_stats::note_prep_plan(
+            assign_ns,
+            collect_ns,
+            sticky_ns,
+            inflight_ns,
+            head_ns,
+            stamp_ns,
+            finish_ns,
+        );
+
         Ok(ArchiveWritePlan {
             packed,
             planned_fks,
@@ -363,7 +388,7 @@ impl Query {
             head_resolved,
             index_tx,
             body_est,
-            advise_dont_need: self.archive_far_ahead_of_confirm()?,
+            advise_dont_need,
         })
     }
 
@@ -407,19 +432,28 @@ impl Query {
     /// **Writer / write path:** durable Class A put + sticky publish.
     ///
     /// No sticky/head **lookups** — only appends and sticky inserts.
+    /// Phase walls go to [`crate::archive_phase_stats`] (body vs head split).
     pub fn archive_commit_plan(&self, plan: ArchiveWritePlan) -> Result<(), QueryError> {
+        use std::time::Instant;
         if plan.packed.is_empty() {
             return Ok(());
         }
+        let t0 = Instant::now();
+        let n_blocks = plan.per_header_ranges.len() as u64;
 
+        let t = Instant::now();
         self.store
             .txs
             .reserve_append(plan.body_est, plan.packed.len() as u64)?;
+        let reserve_ns = t.elapsed().as_nanos() as u64;
 
         let body_off = self.store.txs.body_logical_len();
+        // Body append first (no head), then head insert — separate timers.
+        let t = Instant::now();
         let got_tx_fks = self
             .store
-            .put_tx_full_batch_indexed(&plan.packed, plan.index_tx)?;
+            .put_tx_full_batch_indexed(&plan.packed, /*index=*/ false)?;
+        let body_ns = t.elapsed().as_nanos() as u64;
         if got_tx_fks.len() != plan.packed.len() {
             return Err(StoreError::Corrupt("tx put_full_batch length"));
         }
@@ -429,28 +463,61 @@ impl Query {
             ));
         }
 
+        let t = Instant::now();
+        if plan.index_tx {
+            let heads: Vec<([u8; 32], Fk)> = plan
+                .packed
+                .iter()
+                .zip(got_tx_fks.iter())
+                .map(|((tx, _, _), fk)| (tx.txid, *fk))
+                .collect();
+            self.store.txs.head_insert_many(&heads)?;
+        }
+        let head_ns = t.elapsed().as_nanos() as u64;
+
+        let t = Instant::now();
         if !plan.spends.is_empty() {
             self.store.put_spend_batch(&plan.spends)?;
         }
+        let spend_ns = t.elapsed().as_nanos() as u64;
 
+        let t = Instant::now();
         if !plan.per_header_ranges.is_empty() {
             self.store
                 .header_txs
                 .put_ranges_batch(&plan.per_header_ranges)?;
         }
+        let htxs_ns = t.elapsed().as_nanos() as u64;
 
         // Sticky only after durable put — never advertise uncommitted fks.
+        let t = Instant::now();
         self.archive_txid_sticky.insert_many(&plan.sticky_creates);
         if !plan.head_resolved.is_empty() {
             self.archive_txid_sticky
                 .insert_many(&plan.head_resolved);
         }
+        let sticky_ns = t.elapsed().as_nanos() as u64;
 
+        let t = Instant::now();
         let body_end = self.store.txs.body_logical_len();
         let body_len = body_end.saturating_sub(body_off);
         if body_len > 0 && plan.advise_dont_need {
             self.store.txs.advise_body_dont_need(body_off, body_len);
         }
+        let dontneed_ns = t.elapsed().as_nanos() as u64;
+
+        let total_ns = t0.elapsed().as_nanos() as u64;
+        crate::archive_phase_stats::note_write_commit(
+            total_ns,
+            reserve_ns,
+            body_ns,
+            head_ns,
+            spend_ns,
+            htxs_ns,
+            sticky_ns,
+            dontneed_ns,
+            n_blocks.max(1),
+        );
         Ok(())
     }
 
@@ -542,6 +609,39 @@ mod tests {
             }],
             outputs: vec![OutputRecord::unspent(50 * 100_000_000, vec![0x51])],
         }
+    }
+
+    #[test]
+    fn archive_phase_stats_cover_plan_and_commit_wall() {
+        use std::collections::HashMap;
+        // Drain any prior noise.
+        let _ = crate::archive_phase_stats::sample_and_reset();
+        let (dir, q) = temp_query("arch-phases");
+        let mut need = vec![(Fk(1), vec![coinbase_apply(1), coinbase_apply(2)])];
+        let plan = q
+            .archive_plan_mega_from(&mut need, 1, &HashMap::new())
+            .unwrap();
+        assert_eq!(plan.planned_fks.len(), 2);
+        q.archive_commit_plan(plan).unwrap();
+        let s = crate::archive_phase_stats::sample_and_reset();
+        assert!(s.prep_assign_ns > 0 || s.prep_stamp_ns > 0, "plan timed");
+        assert!(s.write_total_ns > 0, "commit total");
+        assert!(s.write_body_ns > 0, "body put timed");
+        let wsum = s.write_phases_sum_ns();
+        // Sequential Instant slices: sum ≤ total + small clock noise; gap is residual.
+        assert!(
+            wsum <= s.write_total_ns.saturating_add(200_000),
+            "write sum {} ≫ total {}",
+            wsum,
+            s.write_total_ns
+        );
+        assert!(
+            s.write_total_ns.saturating_sub(wsum) < s.write_total_ns.max(1),
+            "unaccounted write {} of total {}",
+            s.write_total_ns.saturating_sub(wsum),
+            s.write_total_ns
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

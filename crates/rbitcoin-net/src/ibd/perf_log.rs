@@ -189,7 +189,7 @@ pub(crate) struct IbdPerfSample {
     pub load_edge_head: u64,
     pub load_edge_cb: u64,
 
-    // Archive create_fk resolve (window)
+    // Archive create_fk resolve + phase walls (window)
     pub arch_ext_need: u64,
     pub arch_sticky_hit: u64,
     pub arch_head_need: u64,
@@ -198,6 +198,33 @@ pub(crate) struct IbdPerfSample {
     pub arch_resolved_stamp: u64,
     pub arch_resolve_ns: u64,
     pub arch_resolve_blocks: u64,
+    /// Prep end-to-end + sub-phases (ms window sum).
+    pub arch_prep_total_ms: u64,
+    pub arch_prep_struct_ms: u64,
+    pub arch_prep_filter_ms: u64,
+    pub arch_prep_assign_ms: u64,
+    pub arch_prep_collect_ms: u64,
+    pub arch_prep_sticky_ms: u64,
+    pub arch_prep_inflight_ms: u64,
+    pub arch_prep_head_ms: u64,
+    pub arch_prep_stamp_ms: u64,
+    pub arch_prep_finish_ms: u64,
+    pub arch_prep_publish_ms: u64,
+    pub arch_prep_qwait_ms: u64,
+    pub arch_prep_sum_ms: u64,
+    pub arch_prep_blocks: u64,
+    /// Write end-to-end + sub-phases (ms window sum).
+    pub arch_write_total_ms: u64,
+    pub arch_write_reserve_ms: u64,
+    pub arch_write_body_ms: u64,
+    pub arch_write_head_ms: u64,
+    pub arch_write_spend_ms: u64,
+    pub arch_write_htxs_ms: u64,
+    pub arch_write_sticky_ms: u64,
+    pub arch_write_dontneed_ms: u64,
+    pub arch_write_flush_ms: u64,
+    pub arch_write_sum_ms: u64,
+    pub arch_write_blocks: u64,
     /// Live sticky map size (not window-reset).
     pub arch_sticky_len: usize,
     pub arch_sticky_cap: usize,
@@ -353,6 +380,31 @@ impl Default for IbdPerfSample {
             arch_resolved_stamp: 0,
             arch_resolve_ns: 0,
             arch_resolve_blocks: 0,
+            arch_prep_total_ms: 0,
+            arch_prep_struct_ms: 0,
+            arch_prep_filter_ms: 0,
+            arch_prep_assign_ms: 0,
+            arch_prep_collect_ms: 0,
+            arch_prep_sticky_ms: 0,
+            arch_prep_inflight_ms: 0,
+            arch_prep_head_ms: 0,
+            arch_prep_stamp_ms: 0,
+            arch_prep_finish_ms: 0,
+            arch_prep_publish_ms: 0,
+            arch_prep_qwait_ms: 0,
+            arch_prep_sum_ms: 0,
+            arch_prep_blocks: 0,
+            arch_write_total_ms: 0,
+            arch_write_reserve_ms: 0,
+            arch_write_body_ms: 0,
+            arch_write_head_ms: 0,
+            arch_write_spend_ms: 0,
+            arch_write_htxs_ms: 0,
+            arch_write_sticky_ms: 0,
+            arch_write_dontneed_ms: 0,
+            arch_write_flush_ms: 0,
+            arch_write_sum_ms: 0,
+            arch_write_blocks: 0,
             arch_sticky_len: 0,
             arch_sticky_cap: 0,
             contig_next_h: 0,
@@ -426,7 +478,7 @@ pub(crate) fn sample(
         rbitcoin_query::wave_fill_stats::sample_io_and_reset();
     let (pwh, pca, psm) = rbitcoin_query::connect_prevout_stats::sample_and_reset();
     let pw = rbitcoin_query::confirm_load_stats::sample_and_reset();
-    let arch_res = rbitcoin_query::archive_resolve_stats::sample_and_reset();
+    let arch_res = rbitcoin_query::archive_phase_stats::sample_and_reset();
     let pipe = pipe_stats.sample_and_reset();
     let (contig_next_h, contig_parked, contig_ready) =
         rbitcoin_query::contig_park_stats::snapshot();
@@ -573,6 +625,31 @@ pub(crate) fn sample(
         arch_resolved_stamp: arch_res.resolved_stamp,
         arch_resolve_ns: arch_res.resolve_ns,
         arch_resolve_blocks: arch_res.blocks,
+        arch_prep_total_ms: ns_ms(arch_res.prep_total_ns),
+        arch_prep_struct_ms: ns_ms(arch_res.prep_struct_ns),
+        arch_prep_filter_ms: ns_ms(arch_res.prep_filter_ns),
+        arch_prep_assign_ms: ns_ms(arch_res.prep_assign_ns),
+        arch_prep_collect_ms: ns_ms(arch_res.prep_collect_ns),
+        arch_prep_sticky_ms: ns_ms(arch_res.prep_sticky_ns),
+        arch_prep_inflight_ms: ns_ms(arch_res.prep_inflight_ns),
+        arch_prep_head_ms: ns_ms(arch_res.prep_head_ns),
+        arch_prep_stamp_ms: ns_ms(arch_res.prep_stamp_ns),
+        arch_prep_finish_ms: ns_ms(arch_res.prep_finish_ns),
+        arch_prep_publish_ms: ns_ms(arch_res.prep_publish_ns),
+        arch_prep_qwait_ms: ns_ms(arch_res.prep_qwait_ns),
+        arch_prep_sum_ms: ns_ms(arch_res.prep_phases_sum_ns()),
+        arch_prep_blocks: arch_res.prep_blocks,
+        arch_write_total_ms: ns_ms(arch_res.write_total_ns),
+        arch_write_reserve_ms: ns_ms(arch_res.write_reserve_ns),
+        arch_write_body_ms: ns_ms(arch_res.write_body_ns),
+        arch_write_head_ms: ns_ms(arch_res.write_head_ns),
+        arch_write_spend_ms: ns_ms(arch_res.write_spend_ns),
+        arch_write_htxs_ms: ns_ms(arch_res.write_htxs_ns),
+        arch_write_sticky_ms: ns_ms(arch_res.write_sticky_ns),
+        arch_write_dontneed_ms: ns_ms(arch_res.write_dontneed_ns),
+        arch_write_flush_ms: ns_ms(arch_res.write_flush_ns),
+        arch_write_sum_ms: ns_ms(arch_res.write_phases_sum_ns()),
+        arch_write_blocks: arch_res.write_blocks,
         arch_sticky_len,
         arch_sticky_cap,
         contig_next_h,
@@ -837,8 +914,14 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     } else {
         0
     };
+    let prep_gap = s
+        .arch_prep_total_ms
+        .saturating_sub(s.arch_prep_sum_ms);
+    let write_gap = s
+        .arch_write_total_ms
+        .saturating_sub(s.arch_write_sum_ms);
     out.push_str(&format!(
-        " | pipe prep_us/blk={} prep_blks={} write_us/blk={} write_blks={} batch_avg={} writer_busy%={} idle_ms={} coalesce_ms={} prep_ms={} | arch_res resolve_us/blk={} ext={} sticky={}/{} ({}%) head={}/{} stamp batch={} res={} sticky_map={}/{} | contig next_h={} parked={} ready={}",
+        " | pipe prep_us/blk={} prep_blks={} write_us/blk={} write_blks={} batch_avg={} writer_busy%={} idle_ms={} coalesce_ms={} prep_ms={} | arch_prep total={} sum={} gap={} struct={} filter={} assign={} collect={} sticky={} inflight={} head={} stamp={} finish={} publish={} qwait={} blks={} | arch_write total={} sum={} gap={} reserve={} body={} head={} spend={} htxs={} sticky={} dontneed={} flush={} blks={} | arch_res resolve_us/blk={} ext={} sticky={}/{} ({}%) head={}/{} stamp batch={} res={} sticky_map={}/{} | contig next_h={} parked={} ready={}",
         s.pipe.prep_us_per_block(),
         s.pipe.prep_blocks,
         s.pipe.write_us_per_block(),
@@ -848,6 +931,33 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         idle,
         s.pipe.write_coalesce_ms(),
         s.pipe.prep_ms(),
+        s.arch_prep_total_ms,
+        s.arch_prep_sum_ms,
+        prep_gap,
+        s.arch_prep_struct_ms,
+        s.arch_prep_filter_ms,
+        s.arch_prep_assign_ms,
+        s.arch_prep_collect_ms,
+        s.arch_prep_sticky_ms,
+        s.arch_prep_inflight_ms,
+        s.arch_prep_head_ms,
+        s.arch_prep_stamp_ms,
+        s.arch_prep_finish_ms,
+        s.arch_prep_publish_ms,
+        s.arch_prep_qwait_ms,
+        s.arch_prep_blocks,
+        s.arch_write_total_ms,
+        s.arch_write_sum_ms,
+        write_gap,
+        s.arch_write_reserve_ms,
+        s.arch_write_body_ms,
+        s.arch_write_head_ms,
+        s.arch_write_spend_ms,
+        s.arch_write_htxs_ms,
+        s.arch_write_sticky_ms,
+        s.arch_write_dontneed_ms,
+        s.arch_write_flush_ms,
+        s.arch_write_blocks,
         resolve_us_blk,
         s.arch_ext_need,
         s.arch_sticky_hit,
@@ -1017,6 +1127,9 @@ mod tests {
         assert!(line.contains("pin_cached=12 pin_cache=0 pin_new=38"), "{line}");
         assert!(line.contains("mlock=16MiB ranges=4 sh_runs=2"), "{line}");
         assert!(line.contains("arch_res resolve_us/blk="), "{line}");
+        assert!(line.contains("arch_prep total="), "{line}");
+        assert!(line.contains("arch_write total="), "{line}");
+        assert!(line.contains("gap="), "{line}");
         assert!(line.contains("sticky_map="), "{line}");
         assert!(line.contains("store_ms="), "{line}");
         assert!(line.contains("lock_ms="), "{line}");

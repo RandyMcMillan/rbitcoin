@@ -251,29 +251,55 @@ pub mod confirm_load_stats {
     }
 }
 
-/// Archive create_fk resolve counters (reset by the IBD ~5s sampler).
+/// Archive prep + commit phase walls and resolve counts (IBD ~5s sampler reset).
 ///
-/// Phase 1.5: decide whether sticky/head still matter and that archive is not
-/// the long pole — compare head need vs sticky and resolve_ns vs write_ns.
-pub mod archive_resolve_stats {
+/// **Accounting:** `prep_total_ns` / `write_total_ns` are end-to-end walls for
+/// each batch; sub-phase ns should sum to ≈ total (gap = unaccounted). Prep
+/// includes structure decode, plan/resolve, and write-queue wait. Write includes
+/// reserve, body, head, spends, header_txs, sticky, dontneed, and periodic flush.
+pub mod archive_phase_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Headers (blocks) packed this window.
+    // ── counts (resolve mix) ─────────────────────────────────────────────
+    /// Headers (blocks) planned this window.
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
-    /// Unique external prev_txids that needed resolve (not same-batch / coinbase).
     pub static EXT_NEED: AtomicU64 = AtomicU64::new(0);
-    /// Of EXT_NEED, hits in writer sticky (before head).
     pub static STICKY_HIT: AtomicU64 = AtomicU64::new(0);
-    /// Sticky misses probed on durable tx.head.
     pub static HEAD_NEED: AtomicU64 = AtomicU64::new(0);
-    /// Head probes that returned a create_fk.
     pub static HEAD_HIT: AtomicU64 = AtomicU64::new(0);
-    /// Non-coinbase inputs stamped from same-mega-batch map.
     pub static BATCH_STAMP: AtomicU64 = AtomicU64::new(0);
-    /// Non-coinbase inputs stamped from sticky/head resolve map.
     pub static RESOLVED_STAMP: AtomicU64 = AtomicU64::new(0);
-    /// Wall ns of resolve (sticky + head) only, not body put.
-    pub static RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
+
+    // ── prep walls (ns) ──────────────────────────────────────────────────
+    /// Full prep batch wall (struct → plan → enqueue wait).
+    pub static PREP_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PREP_STRUCT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PREP_FILTER_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PREP_ASSIGN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PREP_COLLECT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PREP_STICKY_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PREP_INFLIGHT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PREP_HEAD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PREP_STAMP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PREP_FINISH_NS: AtomicU64 = AtomicU64::new(0);
+    /// Reserved HWM + inflight create map publish after plan.
+    pub static PREP_PUBLISH_NS: AtomicU64 = AtomicU64::new(0);
+    /// Blocked on full prep→writer queue.
+    pub static PREP_QWAIT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PREP_BLOCKS: AtomicU64 = AtomicU64::new(0);
+
+    // ── write / commit walls (ns) ─────────────────────────────────────────
+    pub static WRITE_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WRITE_RESERVE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WRITE_BODY_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WRITE_HEAD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WRITE_SPEND_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WRITE_HTXS_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WRITE_STICKY_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WRITE_DONTNEED_NS: AtomicU64 = AtomicU64::new(0);
+    /// Periodic `flush_header_archive` on the writer thread.
+    pub static WRITE_FLUSH_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WRITE_BLOCKS: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Debug, Default, Clone, Copy)]
     pub struct Sample {
@@ -284,10 +310,66 @@ pub mod archive_resolve_stats {
         pub head_hit: u64,
         pub batch_stamp: u64,
         pub resolved_stamp: u64,
+        /// Sticky+head resolve only (prep_sticky + prep_inflight + prep_head).
         pub resolve_ns: u64,
+        pub prep_total_ns: u64,
+        pub prep_struct_ns: u64,
+        pub prep_filter_ns: u64,
+        pub prep_assign_ns: u64,
+        pub prep_collect_ns: u64,
+        pub prep_sticky_ns: u64,
+        pub prep_inflight_ns: u64,
+        pub prep_head_ns: u64,
+        pub prep_stamp_ns: u64,
+        pub prep_finish_ns: u64,
+        pub prep_publish_ns: u64,
+        pub prep_qwait_ns: u64,
+        pub prep_blocks: u64,
+        pub write_total_ns: u64,
+        pub write_reserve_ns: u64,
+        pub write_body_ns: u64,
+        pub write_head_ns: u64,
+        pub write_spend_ns: u64,
+        pub write_htxs_ns: u64,
+        pub write_sticky_ns: u64,
+        pub write_dontneed_ns: u64,
+        pub write_flush_ns: u64,
+        pub write_blocks: u64,
+    }
+
+    impl Sample {
+        /// Sum of prep sub-phases (should ≈ prep_total_ns).
+        pub fn prep_phases_sum_ns(&self) -> u64 {
+            self.prep_struct_ns
+                .saturating_add(self.prep_filter_ns)
+                .saturating_add(self.prep_assign_ns)
+                .saturating_add(self.prep_collect_ns)
+                .saturating_add(self.prep_sticky_ns)
+                .saturating_add(self.prep_inflight_ns)
+                .saturating_add(self.prep_head_ns)
+                .saturating_add(self.prep_stamp_ns)
+                .saturating_add(self.prep_finish_ns)
+                .saturating_add(self.prep_publish_ns)
+                .saturating_add(self.prep_qwait_ns)
+        }
+
+        /// Sum of write sub-phases (should ≈ write_total_ns).
+        pub fn write_phases_sum_ns(&self) -> u64 {
+            self.write_reserve_ns
+                .saturating_add(self.write_body_ns)
+                .saturating_add(self.write_head_ns)
+                .saturating_add(self.write_spend_ns)
+                .saturating_add(self.write_htxs_ns)
+                .saturating_add(self.write_sticky_ns)
+                .saturating_add(self.write_dontneed_ns)
+                .saturating_add(self.write_flush_ns)
+        }
     }
 
     pub fn sample_and_reset() -> Sample {
+        let prep_sticky = PREP_STICKY_NS.swap(0, Ordering::Relaxed);
+        let prep_inflight = PREP_INFLIGHT_NS.swap(0, Ordering::Relaxed);
+        let prep_head = PREP_HEAD_NS.swap(0, Ordering::Relaxed);
         Sample {
             blocks: BLOCKS.swap(0, Ordering::Relaxed),
             ext_need: EXT_NEED.swap(0, Ordering::Relaxed),
@@ -296,12 +378,45 @@ pub mod archive_resolve_stats {
             head_hit: HEAD_HIT.swap(0, Ordering::Relaxed),
             batch_stamp: BATCH_STAMP.swap(0, Ordering::Relaxed),
             resolved_stamp: RESOLVED_STAMP.swap(0, Ordering::Relaxed),
-            resolve_ns: RESOLVE_NS.swap(0, Ordering::Relaxed),
+            resolve_ns: prep_sticky
+                .saturating_add(prep_inflight)
+                .saturating_add(prep_head),
+            prep_total_ns: PREP_TOTAL_NS.swap(0, Ordering::Relaxed),
+            prep_struct_ns: PREP_STRUCT_NS.swap(0, Ordering::Relaxed),
+            prep_filter_ns: PREP_FILTER_NS.swap(0, Ordering::Relaxed),
+            prep_assign_ns: PREP_ASSIGN_NS.swap(0, Ordering::Relaxed),
+            prep_collect_ns: PREP_COLLECT_NS.swap(0, Ordering::Relaxed),
+            prep_sticky_ns: prep_sticky,
+            prep_inflight_ns: prep_inflight,
+            prep_head_ns: prep_head,
+            prep_stamp_ns: PREP_STAMP_NS.swap(0, Ordering::Relaxed),
+            prep_finish_ns: PREP_FINISH_NS.swap(0, Ordering::Relaxed),
+            prep_publish_ns: PREP_PUBLISH_NS.swap(0, Ordering::Relaxed),
+            prep_qwait_ns: PREP_QWAIT_NS.swap(0, Ordering::Relaxed),
+            prep_blocks: PREP_BLOCKS.swap(0, Ordering::Relaxed),
+            write_total_ns: WRITE_TOTAL_NS.swap(0, Ordering::Relaxed),
+            write_reserve_ns: WRITE_RESERVE_NS.swap(0, Ordering::Relaxed),
+            write_body_ns: WRITE_BODY_NS.swap(0, Ordering::Relaxed),
+            write_head_ns: WRITE_HEAD_NS.swap(0, Ordering::Relaxed),
+            write_spend_ns: WRITE_SPEND_NS.swap(0, Ordering::Relaxed),
+            write_htxs_ns: WRITE_HTXS_NS.swap(0, Ordering::Relaxed),
+            write_sticky_ns: WRITE_STICKY_NS.swap(0, Ordering::Relaxed),
+            write_dontneed_ns: WRITE_DONTNEED_NS.swap(0, Ordering::Relaxed),
+            write_flush_ns: WRITE_FLUSH_NS.swap(0, Ordering::Relaxed),
+            write_blocks: WRITE_BLOCKS.swap(0, Ordering::Relaxed),
         }
     }
 
     #[inline]
-    pub(crate) fn note(
+    fn add(atom: &AtomicU64, v: u64) {
+        if v > 0 {
+            atom.fetch_add(v, Ordering::Relaxed);
+        }
+    }
+
+    /// Resolve mix counters (one plan batch).
+    #[inline]
+    pub fn note_resolve_counts(
         blocks: u64,
         ext_need: u64,
         sticky_hit: u64,
@@ -309,33 +424,90 @@ pub mod archive_resolve_stats {
         head_hit: u64,
         batch_stamp: u64,
         resolved_stamp: u64,
-        resolve_ns: u64,
     ) {
-        if blocks > 0 {
-            BLOCKS.fetch_add(blocks, Ordering::Relaxed);
-        }
-        if ext_need > 0 {
-            EXT_NEED.fetch_add(ext_need, Ordering::Relaxed);
-        }
-        if sticky_hit > 0 {
-            STICKY_HIT.fetch_add(sticky_hit, Ordering::Relaxed);
-        }
-        if head_need > 0 {
-            HEAD_NEED.fetch_add(head_need, Ordering::Relaxed);
-        }
-        if head_hit > 0 {
-            HEAD_HIT.fetch_add(head_hit, Ordering::Relaxed);
-        }
-        if batch_stamp > 0 {
-            BATCH_STAMP.fetch_add(batch_stamp, Ordering::Relaxed);
-        }
-        if resolved_stamp > 0 {
-            RESOLVED_STAMP.fetch_add(resolved_stamp, Ordering::Relaxed);
-        }
-        if resolve_ns > 0 {
-            RESOLVE_NS.fetch_add(resolve_ns, Ordering::Relaxed);
-        }
+        add(&BLOCKS, blocks);
+        add(&EXT_NEED, ext_need);
+        add(&STICKY_HIT, sticky_hit);
+        add(&HEAD_NEED, head_need);
+        add(&HEAD_HIT, head_hit);
+        add(&BATCH_STAMP, batch_stamp);
+        add(&RESOLVED_STAMP, resolved_stamp);
     }
+
+    /// Prep sub-phases for one mega-batch plan (`archive_plan_mega_from`).
+    #[inline]
+    pub fn note_prep_plan(
+        assign_ns: u64,
+        collect_ns: u64,
+        sticky_ns: u64,
+        inflight_ns: u64,
+        head_ns: u64,
+        stamp_ns: u64,
+        finish_ns: u64,
+    ) {
+        add(&PREP_ASSIGN_NS, assign_ns);
+        add(&PREP_COLLECT_NS, collect_ns);
+        add(&PREP_STICKY_NS, sticky_ns);
+        add(&PREP_INFLIGHT_NS, inflight_ns);
+        add(&PREP_HEAD_NS, head_ns);
+        add(&PREP_STAMP_NS, stamp_ns);
+        add(&PREP_FINISH_NS, finish_ns);
+    }
+
+    /// Outer prep batch (structure + filter + publish + queue wait).
+    /// Plan sub-phases are noted separately via [`note_prep_plan`].
+    #[inline]
+    pub fn note_prep_batch(
+        total_ns: u64,
+        struct_ns: u64,
+        filter_ns: u64,
+        publish_ns: u64,
+        qwait_ns: u64,
+        blocks: u64,
+    ) {
+        add(&PREP_TOTAL_NS, total_ns);
+        add(&PREP_STRUCT_NS, struct_ns);
+        add(&PREP_FILTER_NS, filter_ns);
+        add(&PREP_PUBLISH_NS, publish_ns);
+        add(&PREP_QWAIT_NS, qwait_ns);
+        add(&PREP_BLOCKS, blocks);
+    }
+
+    /// Commit path sub-phases (`archive_commit_plan`).
+    #[inline]
+    pub fn note_write_commit(
+        total_ns: u64,
+        reserve_ns: u64,
+        body_ns: u64,
+        head_ns: u64,
+        spend_ns: u64,
+        htxs_ns: u64,
+        sticky_ns: u64,
+        dontneed_ns: u64,
+        blocks: u64,
+    ) {
+        add(&WRITE_TOTAL_NS, total_ns);
+        add(&WRITE_RESERVE_NS, reserve_ns);
+        add(&WRITE_BODY_NS, body_ns);
+        add(&WRITE_HEAD_NS, head_ns);
+        add(&WRITE_SPEND_NS, spend_ns);
+        add(&WRITE_HTXS_NS, htxs_ns);
+        add(&WRITE_STICKY_NS, sticky_ns);
+        add(&WRITE_DONTNEED_NS, dontneed_ns);
+        add(&WRITE_BLOCKS, blocks);
+    }
+
+    #[inline]
+    pub fn note_write_flush(ns: u64) {
+        add(&WRITE_FLUSH_NS, ns);
+        // Include flush in write total so phases_sum ≈ total.
+        add(&WRITE_TOTAL_NS, ns);
+    }
+}
+
+/// Backward-compatible name for archive resolve/phase sampler.
+pub mod archive_resolve_stats {
+    pub use super::archive_phase_stats::*;
 }
 
 /// Class C sub-phase wall times (nanoseconds; reset by the IBD sampler).

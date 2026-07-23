@@ -502,10 +502,11 @@ pub async fn ibd_cancellable(
 
         // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
         // ContigPark densify scaled by archive free headroom (proportional +
-        // 90%/70% hysteresis). When pending/arch_q is saturated and inflight is
-        // already low, only Critical assign (tip hole + write_next race) runs —
-        // full scans waste CPU while the pipeline digests bodies.
+        // 90%/70% hysteresis). Hard stop densify/runway when !can_assign (at
+        // budget); tip-hole + write_next race always run. In-flight bodies still
+        // enqueue (may overshoot). Saturated pipeline → Critical only (CPU).
         let far_scale = archive_queued.far_admission_scale();
+        let can_assign_new = archive_queued.can_assign();
         let write_next = archive_write_next.load(Ordering::Relaxed);
         let inflight_before = st.inflight.len();
         let depth = if archive_pipeline_saturated(
@@ -525,6 +526,7 @@ pub async fn ibd_cancellable(
             far_scale,
             write_next,
             depth,
+            can_assign_new,
         );
 
         // Offer archived bodies to the dedicated confirm engine (non-blocking).
@@ -575,6 +577,7 @@ pub async fn ibd_cancellable(
         let freed = inflight_before.saturating_sub(st.inflight.len());
         if freed >= 8 || st.inflight.is_empty() {
             let far_scale2 = archive_queued.far_admission_scale();
+            let can_assign2 = archive_queued.can_assign();
             let write_next2 = archive_write_next.load(Ordering::Relaxed);
             let depth2 = if archive_pipeline_saturated(
                 st.body.pending_len(),
@@ -593,6 +596,7 @@ pub async fn ibd_cancellable(
                 far_scale2,
                 write_next2,
                 depth2,
+                can_assign2,
             );
         }
 

@@ -95,7 +95,12 @@ pub(crate) fn archive_pipeline_saturated(
 /// Assign getdata for bodies not yet Class A.
 ///
 /// `archive_feed_scale` is [`super::archive::ArchiveQueueBudget::far_admission_scale`]
-/// (0 = densify drip only / multi-peer race still on; 1 = full densify capacity).
+/// (0 = no densify; multi-peer tip/park race still on; 1 = full densify).
+///
+/// `can_assign_new`: [`super::archive::ArchiveQueueBudget::can_assign`] — when
+/// false, only tip-hole + ContigPark race run (fill contig / tip). Densify and
+/// confirm-runway getdata stop so charged RAM stays near the budget; bodies
+/// already in flight still enqueue (may overshoot).
 pub(crate) fn assign_work_ordered(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -104,6 +109,7 @@ pub(crate) fn assign_work_ordered(
     archive_feed_scale: f64,
     archive_write_next: u32,
     depth: AssignDepth,
+    can_assign_new: bool,
 ) {
     let t0 = Instant::now();
     let mut issued = 0u64;
@@ -119,24 +125,23 @@ pub(crate) fn assign_work_ordered(
 
     prune_satisfied_inflight(&mut st.slots, &mut st.inflight, hub);
 
-    // Under archive RAM pressure (`far_admission_scale == 0`), do **not** expire
-    // pending → re-getdata. Bodies are already charged in the pipeline; clearing
-    // pending only re-admits duplicates once budget frees (or thrash when soft
-    // admission was still open). Tip-hole / park-race assign still runs below.
-    if archive_feed_scale > 0.0 {
+    // ContigPark race band: always re-request stuck holes so the writer can
+    // advance even when the queue is at budget (only first copy is enqueued).
+    let wn = archive_write_next;
+    let race_hi = wn.saturating_add(CONTIG_PARK_RACE.saturating_sub(1) as u32);
+    let gap_expired = st.body.expire_stale_pending_if(CONTIG_PARK_PENDING_STALE, |h| {
+        st.hash_height
+            .get(h)
+            .is_some_and(|&ht| ht >= wn && ht <= race_hi)
+    });
+    for h in gap_expired {
+        clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
+    }
+    // Global pending-stale only when we have assign room for densify re-get —
+    // otherwise thrash bandwidth while the pipeline is full.
+    if can_assign_new {
         let expired = st.body.expire_stale_pending(PENDING_STALE);
         for h in expired {
-            clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
-        }
-        // ContigPark race band: re-request much sooner than global pending stale.
-        let wn = archive_write_next;
-        let race_hi = wn.saturating_add(CONTIG_PARK_RACE.saturating_sub(1) as u32);
-        let gap_expired = st.body.expire_stale_pending_if(CONTIG_PARK_PENDING_STALE, |h| {
-            st.hash_height
-                .get(h)
-                .is_some_and(|&ht| ht >= wn && ht <= race_hi)
-        });
-        for h in gap_expired {
             clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
         }
     }
@@ -150,7 +155,8 @@ pub(crate) fn assign_work_ordered(
     // Multi-peer race only on write_next .. write_next+R-1 (not a long band).
     issued += cover_park_race(st, hub, cfg, &alive, archive_write_next);
 
-    if matches!(depth, AssignDepth::Critical) {
+    // At budget or critical: no densify / confirm-runway assign.
+    if !can_assign_new || matches!(depth, AssignDepth::Critical) {
         finish_assign(loop_stats, t0, issued);
         return;
     }
@@ -171,14 +177,10 @@ pub(crate) fn assign_work_ordered(
 
     let feed_scale = archive_feed_scale.clamp(0.0, 1.0);
     // Densify capacity in the ContigPark band (beyond the race prefix).
+    // scale=0 → zero densify slots (no drip under pressure); runway may still run.
     let tip_hole = !tip_holes.is_empty();
     let base_feed = far_slots_per_peer(cfg.per_peer, tip_hole);
-    let feed_cap = if feed_scale <= 0.0 {
-        // Pressure: still drip densify so park can grow a contiguous run.
-        2usize.min(cfg.per_peer).max(1)
-    } else {
-        scale_feed_cap(base_feed, feed_scale)
-    };
+    let feed_cap = scale_feed_cap(base_feed, feed_scale);
 
     // Confirm runway: tip+1 .. min(near_hi, write_next-1). Park feed owns ≥ write_next.
     let runway_hi = if archive_write_next > tip.saturating_add(1) {
@@ -340,7 +342,11 @@ fn need_hash_at(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> Option<BlockH
     if !st.ordered_set.contains(&h) || st.inflight.contains_key(&h) {
         return None;
     }
-    if st.body.is_known_archived(&h) || st.body.is_pending(&h) || st.body.is_rejected(&h) {
+    if st.body.is_known_archived(&h)
+        || st.body.is_pending(&h)
+        || st.body.is_archive_charged(&h)
+        || st.body.is_rejected(&h)
+    {
         return None;
     }
     if st.body.skip_download(hub, &h) {
@@ -355,7 +361,10 @@ pub(crate) fn pop_need(
     hub: &ChainHub,
 ) -> Option<BlockHash> {
     while let Some(h) = q.pop_front() {
-        if st.body.skip_download(hub, &h) || st.inflight.contains_key(&h) {
+        if st.body.skip_download(hub, &h)
+            || st.body.is_archive_charged(&h)
+            || st.inflight.contains_key(&h)
+        {
             continue;
         }
         return Some(h);
@@ -514,9 +523,12 @@ pub(crate) fn cover_park_race(
         }
         if hub.has_block(&h)
             || st.body.is_pending(&h)
+            || st.body.is_archive_charged(&h)
             || st.body.is_rejected(&h)
             || st.body.ready(hub, &h)
         {
+            // Already in archive pipeline (charged) or pending: never multi-queue.
+            // Multi-peer race is only for hashes not yet enqueued.
             continue;
         }
         // Not known/pending: either need first peer or more race peers.
@@ -605,7 +617,11 @@ pub(crate) fn cover_tip_holes(
     let now = Instant::now();
 
     for &h in holes {
-        if hub.has_block(&h) || st.body.is_pending(&h) || st.body.ready(hub, &h) {
+        if hub.has_block(&h)
+            || st.body.is_pending(&h)
+            || st.body.is_archive_charged(&h)
+            || st.body.ready(hub, &h)
+        {
             continue;
         }
         let (already, second_at) = st
@@ -673,6 +689,7 @@ pub(crate) fn park_race_need(
         }
         if st.body.is_known_archived(&h)
             || st.body.is_pending(&h)
+            || st.body.is_archive_charged(&h)
             || st.body.is_rejected(&h)
         {
             continue;

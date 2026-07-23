@@ -117,13 +117,13 @@ pub const ARCHIVE_PRESSURE_EXIT: f64 = 0.70;
 /// Shared counter of blocks (and approx wire bytes) in the archive pipeline.
 ///
 /// Charged when a decoded body is handed to the job channel; released when the
-/// writer (or prep error path) returns [`ArchiveResult`]. Used for getdata
-/// backpressure so RAM waiting on archive stays near the configured budget.
+/// writer (or prep error path) returns [`ArchiveResult`].
 ///
-/// **Hard cap:** [`Self::try_charge`] refuses admission once charged bytes would
-/// exceed the budget (empty queue still admits one). Soft densify scaling via
-/// [`Self::far_admission_scale`] (proportional headroom + 90%/70% pressure
-/// hysteresis) only reduces far getdata — it does not bound the job channel.
+/// **Assign gate (not receive gate):** [`Self::can_assign`] is false once charged
+/// fill ≥ budget — stop issuing new densify/runway getdata. Bodies already in
+/// flight still [`charge`] and enqueue (may briefly overshoot). Soft
+/// [`Self::far_admission_scale`] (proportional + 90%/70% hysteresis) scales
+/// densify capacity before the hard stop.
 pub(crate) struct ArchiveQueueBudget {
     count: AtomicUsize,
     bytes: AtomicUsize,
@@ -207,8 +207,11 @@ impl ArchiveQueueBudget {
         (scale, pressure)
     }
 
-    /// Unconditional charge (tests / forced overshoot). Hot path uses [`try_charge`].
-    #[cfg(test)]
+    /// Charge a body entering the job channel (may overshoot budget).
+    ///
+    /// In-flight getdata must always be enqueued — never dump the first copy of
+    /// a peer body because the meter is full. Cap **new** getdata via
+    /// [`Self::can_assign`] instead.
     pub fn charge(&self, wire_bytes: usize) {
         let charged = Self::charged_bytes(wire_bytes);
         self.count.fetch_add(1, Ordering::Relaxed);
@@ -220,37 +223,11 @@ impl ArchiveQueueBudget {
         wire_bytes.saturating_mul(3).saturating_add(4096) / 2
     }
 
-    /// Hard admission: charge only if current fill + this block stays ≤ budget.
-    ///
-    /// Always admits when the queue is empty (so a single huge block can still
-    /// enter). Returns `false` without mutating counters when full — caller must
-    /// **not** put the body in the pipeline (mark_missing / re-getdata later).
-    ///
-    /// Soft [`far_admission_scale`] alone is not enough: ContigPark densify and
-    /// pending redelivery kept charging into an unbounded job channel until
-    /// mainnet held ~50k decoded bodies (~60 GiB) against a 512 MiB budget.
-    pub fn try_charge(&self, wire_bytes: usize) -> bool {
-        let charged = Self::charged_bytes(wire_bytes);
-        loop {
-            let cur = self.bytes.load(Ordering::Relaxed);
-            // Empty queue: always admit one (progress / tip-hole even if one
-            // block's charged size exceeds budget).
-            if cur > 0 && cur.saturating_add(charged) > self.budget {
-                return false;
-            }
-            match self.bytes.compare_exchange_weak(
-                cur,
-                cur.saturating_add(charged),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.count.fetch_add(1, Ordering::Relaxed);
-                    return true;
-                }
-                Err(_) => continue,
-            }
-        }
+    /// True while charged fill is **strictly below** budget — issue densify /
+    /// confirm-runway getdata. Tip-hole and ContigPark race assign ignore this
+    /// so a hole at `write_next` can still be filled when the queue is full.
+    pub fn can_assign(&self) -> bool {
+        self.bytes() < self.budget
     }
 
     /// Release after archive Ok/Err (or failed send into a closed pipeline).
@@ -1187,37 +1164,28 @@ mod tests {
     }
 
     #[test]
-    fn try_charge_hard_caps_at_budget() {
+    fn can_assign_stops_at_budget_charge_may_overshoot() {
         let budget = 32 * 1024 * 1024;
         let b = ArchiveQueueBudget::new(budget);
         // charged = wire×1.5 + 4 KiB → 4 MiB wire ≈ 6 MiB charged.
         let w = 4 * 1024 * 1024;
-        assert!(b.try_charge(w));
-        assert!(b.try_charge(w));
-        assert!(b.try_charge(w));
-        assert!(b.try_charge(w));
-        assert!(b.try_charge(w)); // ~30 MiB charged of 32
-        // Next would exceed — refuse without growing counters.
+        assert!(b.can_assign());
+        for _ in 0..5 {
+            assert!(b.can_assign());
+            b.charge(w);
+        }
+        // ~30 MiB < 32 → still assignable; one more overshoots meter but charge ok.
+        assert!(b.can_assign());
+        b.charge(w);
+        assert!(!b.can_assign(), "fill ≥ budget → stop densify assign");
+        // In-flight body still charges (overshoot) — never refuse receive.
         let before_n = b.count();
-        let before_b = b.bytes();
-        assert!(!b.try_charge(w), "must refuse once at/over budget");
-        assert_eq!(b.count(), before_n);
-        assert_eq!(b.bytes(), before_b);
-        // After release, admit again.
+        b.charge(w);
+        assert_eq!(b.count(), before_n + 1);
+        assert!(b.bytes() > budget);
         b.release(w);
-        assert!(b.try_charge(w));
-    }
-
-    #[test]
-    fn try_charge_admits_first_even_if_block_exceeds_budget() {
-        // Budget clamps to 16 MiB minimum; charge a wire size whose overhead > budget.
-        let b = ArchiveQueueBudget::new(16 * 1024 * 1024);
-        let huge = 32 * 1024 * 1024; // charged ≈ 48 MiB > 16 MiB
-        assert!(b.try_charge(huge), "empty queue always admits one");
-        assert_eq!(b.count(), 1);
-        // Second must refuse.
-        assert!(!b.try_charge(1));
-        assert_eq!(b.count(), 1);
+        b.release(w);
+        assert!(b.can_assign());
     }
 
     #[test]

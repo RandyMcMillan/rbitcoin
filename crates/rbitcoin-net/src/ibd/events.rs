@@ -394,14 +394,10 @@ pub(crate) fn apply_peer_event(
                 })
                 .unwrap_or(false);
             // Approx wire size for RAM budget (already-decoded).
+            // Always enqueue the first copy (may overshoot budget). Assign stops
+            // new densify getdata via `can_assign`; never dump in-flight peer bytes.
             let wire_bytes = block.total_size();
-            // Hard budget: refuse when charged fill would exceed budget. Soft
-            // far_admission_scale alone allowed ContigPark densify to stack
-            // ~50k bodies (~60 GiB) against a 512 MiB budget while confirm stalled.
-            if !archive_queued.try_charge(wire_bytes) {
-                st.body.mark_missing(hash);
-                return;
-            }
+            archive_queued.charge(wire_bytes);
             st.body.mark_archive_charged(hash);
             // Prevent re-getdata while prep/writer owns this body.
             st.body.mark_pending(hash);

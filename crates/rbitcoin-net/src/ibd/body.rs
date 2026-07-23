@@ -62,7 +62,7 @@ impl BodyPresence {
         self.archive_charged.contains(h)
     }
 
-    /// Record that `h` was successfully [`ArchiveQueueBudget::try_charge`]d.
+    /// Record that `h` was charged into the archive job pipeline (first copy).
     pub(crate) fn mark_archive_charged(&mut self, h: BlockHash) {
         if self.rejected.contains(&h) {
             return;

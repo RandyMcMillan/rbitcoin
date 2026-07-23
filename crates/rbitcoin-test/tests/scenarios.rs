@@ -1938,6 +1938,72 @@ fn three_stage_confirm_and_parent_mlock_surface() {
     assert!(st2.already_ready > 0 || st2.blocks == 0);
 }
 
+/// Load may claim tip+1 while earlier heights are still in-flight (not written).
+///
+/// Signet IBD failed at height 11 with permanent BadPrev: assemble_run fell back
+/// to store `confirmed[prev]` because the MTP window was not *all* header plans
+/// (genesis / tip-GC'd heights missing), even though parent height 10 had a plan
+/// from the prior load batch. Mixed store(≤tip)+plan(>tip) must succeed.
+#[test]
+fn confirm_load_ahead_of_write_does_not_badprev() {
+    use rbitcoin_consensus::{
+        accept_and_archive_block, accept_and_connect_block, confirm_load_phase,
+        confirm_scripts_phase, confirm_write_phase, ChainParams, Milestone,
+    };
+    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.enter_direct_index_mode().unwrap();
+    let ms = Milestone::NONE;
+    let params = ChainParams::regtest();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    // Archive 20 thin coinbase blocks (same shape as early signet).
+    let mut all: Vec<(Height, [u8; 32])> = Vec::with_capacity(20);
+    for h in 1u32..=20 {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+        all.push((Height(h), b.block_hash().to_byte_array()));
+    }
+    assert_eq!(q.tip_height(), Some(Height::GENESIS));
+
+    // Batch A: load heights 1..=10 (do not write yet — parent plans stay above tip).
+    let batch_a: Vec<(Height, [u8; 32])> = all[..10].to_vec();
+    let mat_a = confirm_load_phase(&q, &params, ms, &batch_a)
+        .expect("load 1..=10 must assemble with tip=0");
+    assert_eq!(mat_a.batch.len(), 10);
+    assert_eq!(q.tip_height(), Some(Height::GENESIS), "load must not advance tip");
+
+    // Batch B: load 11..=20 while tip still genesis (IBD load queue depth ≥ 2).
+    // Regression: used to permanent-BadPrev on height 11 (prev not in confirmed[]).
+    let batch_b: Vec<(Height, [u8; 32])> = all[10..].to_vec();
+    let mat_b = confirm_load_phase(&q, &params, ms, &batch_b).unwrap_or_else(|e| {
+        panic!("load 11..=20 ahead of write must not fail (got {e}); tip still genesis");
+    });
+    assert_eq!(mat_b.batch.len(), 10);
+    assert_eq!(
+        mat_b.batch.heights_hashes()[0].0,
+        11,
+        "second batch starts at 11"
+    );
+
+    // Finish pipeline: scripts + write A then B.
+    let ok_a = confirm_scripts_phase(mat_a.batch).expect("scripts A");
+    confirm_write_phase(&q, &params, ms, ok_a.batch).expect("write A");
+    assert_eq!(q.tip_height(), Some(Height(10)));
+
+    let ok_b = confirm_scripts_phase(mat_b.batch).expect("scripts B");
+    confirm_write_phase(&q, &params, ms, ok_b.batch).expect("write B");
+    assert_eq!(q.tip_height(), Some(Height(20)));
+}
+
 /// BlockCache + MempoolHub public surfaces used by P2P tip mode / Electrum.
 #[test]
 fn block_cache_and_mempool_hub_surface() {

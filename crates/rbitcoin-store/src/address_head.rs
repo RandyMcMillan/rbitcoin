@@ -5,10 +5,12 @@
 //! Callers verify identity via Class A body txid on **lookup**.
 //!
 //! **Insert (fast path):** probe until the **same fk** is already present (idempotent)
-//! or an **empty** slot — write there. **No body_txid** on insert (no BIP30
-//! displacement on write). Foreigners and older same-txid creates are skipped
-//! blindly; a second Class A row for the same txid lands at the next empty slot
-//! (deeper on the probe chain).
+//! or an **empty** slot — **CAS** `0 → fk` there (no whole-map insert lock).
+//! **No body_txid** on insert (no BIP30 displacement on write). Foreigners and
+//! older same-txid creates are skipped blindly; a second Class A row for the same
+//! txid lands at the next empty slot (deeper on the probe chain). Concurrent
+//! inserts of different keys only serialize at colliding empty slots via CAS.
+//! A process-wide `write_lock` remains only for online resize final catch-up/swap.
 //!
 //! **Lookup:** walk candidates from the **last occupied** probe slot toward the
 //! first, body-verify — so the deepest same-txid create wins (newest under
@@ -373,20 +375,6 @@ impl AddressHead {
         }
     }
 
-    fn write_entry(&self, slot: u64, e: u64) -> Result<(), StoreError> {
-        match self.layout.entry_bytes {
-            4 => {
-                if e > u64::from(u32::MAX) {
-                    return Err(StoreError::InvalidFk);
-                }
-                self.file
-                    .write_at(self.entry_off(slot), &(e as u32).to_le_bytes())
-            }
-            8 => self.file.write_at(self.entry_off(slot), &e.to_le_bytes()),
-            _ => Err(StoreError::Corrupt("address head entry_bytes")),
-        }
-    }
-
     fn encode_fk(&self, fk: Fk) -> Result<u64, StoreError> {
         if fk.is_null() {
             return Err(StoreError::InvalidFk);
@@ -401,31 +389,57 @@ impl AddressHead {
         Ok(())
     }
 
-    /// Insert one mapping (no body IO).
+    /// Insert one mapping (no body IO). Lock-free vs other inserts: CAS empty→fk.
     pub fn insert(&self, txid: &[u8; 32], new_fk: Fk) -> Result<(), StoreError> {
-        let _ = self.encode_fk(new_fk)?;
-        let _guard = self.write_lock.lock().unwrap();
-        self.insert_locked(txid, new_fk)
+        self.insert_cas(txid, new_fk)
     }
 
-    fn insert_locked(&self, txid: &[u8; 32], new_fk: Fk) -> Result<(), StoreError> {
+    /// CAS empty slot → fk; idempotent if `new_fk` already on the probe chain.
+    fn insert_cas(&self, txid: &[u8; 32], new_fk: Fk) -> Result<(), StoreError> {
         let new_u = self.encode_fk(new_fk)?;
         for d in 0..MAX_PROBE {
             let slot = probe_index(txid, d, self.layout.bits);
             let e = self.read_entry(slot)?;
-            if e == 0 {
-                self.write_entry(slot, new_u)?;
+            if e == new_u {
+                return Ok(());
+            }
+            if e != 0 {
+                continue;
+            }
+            // Empty: claim with CAS (another inserter may win the slot).
+            if self.cas_entry(slot, 0, new_u)? {
                 self.occupied.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
-            if e == new_u {
+            // Lost race — re-check; same fk is success, else keep probing.
+            let e2 = self.read_entry(slot)?;
+            if e2 == new_u {
                 return Ok(());
             }
         }
         Err(StoreError::Corrupt("address head probe exhausted on insert"))
     }
 
+    /// Compare-and-swap one head entry (`expected` → `new`).
+    fn cas_entry(&self, slot: u64, expected: u64, new: u64) -> Result<bool, StoreError> {
+        let off = self.entry_off(slot);
+        match self.layout.entry_bytes {
+            4 => {
+                if expected > u64::from(u32::MAX) || new > u64::from(u32::MAX) {
+                    return Err(StoreError::InvalidFk);
+                }
+                self.file
+                    .cas_u32_le(off, expected as u32, new as u32)
+            }
+            8 => self.file.cas_u64_le(off, expected, new),
+            _ => Err(StoreError::Corrupt("address head entry_bytes")),
+        }
+    }
+
     /// Bulk insert; primary-slot sort for locality. No body IO.
+    ///
+    /// Concurrent-safe with other inserts (per-slot CAS). Does **not** take
+    /// [`lock_writes`] — that is only for resize swap.
     pub fn insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
@@ -433,9 +447,8 @@ impl AddressHead {
         let mut work = entries.to_vec();
         let bits = self.layout.bits;
         work.sort_unstable_by_key(|(txid, _)| probe_index(txid, 0, bits));
-        let _guard = self.write_lock.lock().unwrap();
         for (txid, fk) in &work {
-            self.insert_locked(txid, *fk)?;
+            self.insert_cas(txid, *fk)?;
         }
         Ok(())
     }
@@ -500,7 +513,9 @@ impl AddressHead {
         self.file.path()
     }
 
-    /// Take exclusive insert lock (final resize catch-up / swap barrier).
+    /// Exclusive barrier for online resize final catch-up + swap only.
+    ///
+    /// Steady-state inserts use per-slot CAS and do **not** take this lock.
     pub fn lock_writes(&self) -> std::sync::MutexGuard<'_, ()> {
         self.write_lock.lock().unwrap()
     }
@@ -794,6 +809,83 @@ mod tests {
         for (txid, fk) in &entries {
             assert!(h.probe_fks(txid).unwrap().contains(fk));
         }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(meta_path(&path));
+    }
+
+    #[test]
+    fn concurrent_inserts_and_probes_all_found() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let path = tmp("cas_conc");
+        let h = Arc::new(AddressHead::create_with_bits(&path, 16).unwrap());
+        let n = 200u64;
+        let barrier = Arc::new(Barrier::new(5));
+        let mut handles = Vec::new();
+
+        // Four inserter threads, disjoint fk ranges.
+        for t in 0..4u64 {
+            let h = Arc::clone(&h);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                let start = t * (n / 4) + 1;
+                let end = if t == 3 { n } else { (t + 1) * (n / 4) };
+                let mut batch = Vec::new();
+                for i in start..=end {
+                    let mut txid = [0u8; 32];
+                    txid[0] = (i & 0xff) as u8;
+                    txid[1] = ((i >> 8) & 0xff) as u8;
+                    txid[2] = 0xca;
+                    batch.push((txid, Fk(i)));
+                }
+                h.insert_many(&batch).unwrap();
+            }));
+        }
+
+        // Prober while inserts run.
+        {
+            let h = Arc::clone(&h);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..500 {
+                    let mut txid = [0u8; 32];
+                    txid[0] = 1;
+                    txid[2] = 0xca;
+                    let _ = h.probe_fks(&txid);
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(h.occupied(), n);
+        for i in 1..=n {
+            let mut txid = [0u8; 32];
+            txid[0] = (i & 0xff) as u8;
+            txid[1] = ((i >> 8) & 0xff) as u8;
+            txid[2] = 0xca;
+            assert!(
+                h.probe_fks(&txid).unwrap().contains(&Fk(i)),
+                "missing fk {i}"
+            );
+        }
+        // Idempotent re-insert of a subset.
+        let mut again = Vec::new();
+        for i in 1..=20u64 {
+            let mut txid = [0u8; 32];
+            txid[0] = (i & 0xff) as u8;
+            txid[1] = ((i >> 8) & 0xff) as u8;
+            txid[2] = 0xca;
+            again.push((txid, Fk(i)));
+        }
+        h.insert_many(&again).unwrap();
+        assert_eq!(h.occupied(), n);
+
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(meta_path(&path));
     }

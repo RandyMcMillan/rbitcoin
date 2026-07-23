@@ -43,7 +43,8 @@ Do not enter Tip until tip ≈ peer height. Tip entry only bulk-materializes SH
 | Map **epochs** (`TableFile`) | No map `Mutex` on read/write/mlock; capacity = new mmap window + pointer swap |
 | Atomic `count` / HWM | Publish barrier (Acquire readers / Release appender) |
 | Role exclusivity | One appender, one annotator — not a global store mutex |
-| `tx.head` resize swap | Brief exclusive catch-up + rename (shadow fill is unlocked) |
+| `tx.head` insert | Per-slot **CAS** empty→fk (no whole-map insert lock) |
+| `tx.head` resize swap | Brief exclusive catch-up + rename (shadow fill unlocked; CAS inserts pause only for final swap) |
 | Process `rehash_gate` | Rare multi‑GiB open-hash rehash (host freeze prevention) |
 | `ChainHub::confirmed` | `RwLock<HashSet>` for O(1) `has_block` (IBD assign path) |
 

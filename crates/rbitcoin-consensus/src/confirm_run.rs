@@ -75,11 +75,12 @@ struct Prepared {
 /// Wire + assemble complete; script jobs still attached (not yet verified).
 ///
 /// `Send` so IBD can hand off load → scripts threads.
-/// Prevouts for write structural come from ConfirmParentCache (still live
-/// until tip GC after Class C), not a batch-local wave map.
+/// Sparse spent-filtered parents ride on the batch (not tip-GCed).
 pub struct LoadedBatch {
     prepared: Vec<Prepared>,
     wire_blocks: Vec<Block>,
+    /// Per-batch pin map: load → assemble → write structural, then drop.
+    batch_parents: rbitcoin_query::BatchParents,
 }
 
 /// Script-verified batch ready for ordered write (structural + Class C + spends).
@@ -88,6 +89,7 @@ pub struct LoadedBatch {
 pub struct ScriptOkBatch {
     prepared: Vec<Prepared>,
     wire_blocks: Vec<Block>,
+    batch_parents: rbitcoin_query::BatchParents,
 }
 
 /// Confirm a contiguous tip-extension run of archived bodies (sync all stages).
@@ -152,9 +154,9 @@ pub fn confirm_load_phase(
 
     let t_work = Instant::now();
 
-    // Decode bodies, pin parents, mlock parent create body pages write will patch.
+    // Decode bodies, pin parents into batch map, mlock parent create body pages.
     let t_load = Instant::now();
-    load_confirm_batch(query, &heights, &items, batch_end)?;
+    let batch_parents = load_confirm_batch(query, &heights, &items, batch_end)?;
     let load_ns = t_load.elapsed().as_nanos() as u64;
     confirm_phase_stats::LOAD_NS.fetch_add(load_ns, Ordering::Relaxed);
 
@@ -166,13 +168,15 @@ pub fn confirm_load_phase(
     );
 
     let wire_blocks = wire_rebuild(query, &metas)?;
-    let prepared = assemble_run(query, params, milestone, metas, &wire_blocks)?;
+    let prepared =
+        assemble_run(query, params, milestone, metas, &wire_blocks, &batch_parents)?;
 
     let work_ns = t_work.elapsed().as_nanos() as u64;
     Ok(ConfirmLoadOutcome {
         batch: LoadedBatch {
             prepared,
             wire_blocks,
+            batch_parents,
         },
         work_ns,
     })
@@ -200,6 +204,7 @@ pub fn confirm_scripts_phase(
         batch: ScriptOkBatch {
             prepared: batch.prepared,
             wire_blocks: batch.wire_blocks,
+            batch_parents: batch.batch_parents,
         },
         work_ns,
     })
@@ -261,10 +266,12 @@ pub fn confirm_write_phase(
         milestone,
         &batch.prepared,
         &batch.wire_blocks,
+        &batch.batch_parents,
     )?;
     let n_blocks = batch.prepared.len();
     let out = class_c_commit(query, &mut batch.prepared)?;
     post_commit(query, &batch.prepared)?;
+    // batch_parents dropped here with ScriptOkBatch — no tip GC of sparse pins.
     confirm_phase_stats::BLOCKS.fetch_add(n_blocks as u64, Ordering::Relaxed);
     Ok(out)
 }
@@ -342,6 +349,7 @@ mod write_idempotent_tests {
         let batch = LoadedBatch {
             prepared: Vec::new(),
             wire_blocks: Vec::new(),
+            batch_parents: rbitcoin_query::BatchParents::new(),
         };
         let ok = confirm_scripts_phase(batch).expect("empty scripts ok");
         assert!(ok.batch.prepared.is_empty());
@@ -355,21 +363,21 @@ mod write_idempotent_tests {
 
 /// Load Class A + pin/mlock write parents for the claimed batch.
 ///
-/// Inline only: decode bodies, thin edges, sparse parent pin, mlock parent
-/// create body pages. No background worker / Condvar wait.
+/// Inline only: decode bodies, thin edges, sparse parent pin into
+/// [`rbitcoin_query::BatchParents`], mlock parent create body pages.
 fn load_confirm_batch(
     query: &Query,
     heights: &[u32],
     items: &[(u32, [u8; 32])],
     _batch_end: u32,
-) -> Result<(), ConsensusError> {
+) -> Result<rbitcoin_query::BatchParents, ConsensusError> {
     if heights.is_empty() {
-        return Ok(());
+        return Ok(rbitcoin_query::BatchParents::new());
     }
-    query
+    let (_st, batch_parents) = query
         .load_confirm_parents(items)
         .map_err(ConsensusError::Store)?;
-    Ok(())
+    Ok(batch_parents)
 }
 
 fn resolve_body_metas(
@@ -446,6 +454,7 @@ fn assemble_run(
     milestone: Milestone,
     metas: Vec<BodyMeta>,
     wire_blocks: &[Block],
+    batch_parents: &rbitcoin_query::BatchParents,
 ) -> Result<Vec<Prepared>, ConsensusError> {
     // Provisional same-run double-spend only (not durable spentness).
     let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
@@ -601,6 +610,7 @@ fn assemble_run(
             Some(&meta.tx_fks),
             &mut pending_spent,
             &mut pending_creates,
+            batch_parents,
         )?;
         confirm_phase_stats::CONNECT_NS
             .fetch_add(t_connect.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -634,6 +644,7 @@ fn structural_run(
     milestone: Milestone,
     prepared: &[Prepared],
     wire_blocks: &[Block],
+    batch_parents: &rbitcoin_query::BatchParents,
 ) -> Result<(), ConsensusError> {
     let t0 = Instant::now();
     let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
@@ -647,6 +658,7 @@ fn structural_run(
             &p.spends,
             p.fees,
             &mut pending_spent,
+            batch_parents,
         )?;
     }
     confirm_phase_stats::STRUCTURAL_NS

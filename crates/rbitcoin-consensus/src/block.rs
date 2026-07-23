@@ -313,6 +313,8 @@ pub fn validate_block_connect(
     // Pending until assemble+scripts+structural succeed — no durable writes on failure.
     let mut pending = std::collections::HashSet::new();
     let mut pending_creates = std::collections::HashMap::new();
+    // Tip/connect path: no separate pin stage; resolve from body cache + store.
+    let batch_parents = rbitcoin_query::BatchParents::new();
     let (script_jobs, spends, fees) = assemble_block_prevouts(
         query,
         block,
@@ -320,6 +322,7 @@ pub fn validate_block_connect(
         archived_tx_fks,
         &mut pending,
         &mut pending_creates,
+        &batch_parents,
     )?;
     if check_scripts && !script_jobs.is_empty() {
         verify_scripts_pool(&script_jobs)?;
@@ -334,6 +337,7 @@ pub fn validate_block_connect(
         &spends,
         fees,
         &mut structural_pending,
+        &batch_parents,
     )?;
     Ok(())
 }
@@ -405,8 +409,8 @@ pub struct ScriptCheckJob {
 ///
 /// `pending_spent` / `pending_creates`: run-local same-run tracking.
 ///
-/// Prevouts resolve from load-stage ConfirmParentCache (thin create_fk +
-/// pinned outs / body) then durable store — no separate wave map.
+/// Prevouts resolve from per-batch [`rbitcoin_query::BatchParents`] (spent-filtered
+/// pin) + shared body cache (thin create_fk / by_body), then durable store.
 ///
 /// Returns `(script_jobs, spends, fees)` — fees for coinbase subsidy check on structural.
 pub(crate) fn assemble_block_prevouts(
@@ -416,6 +420,7 @@ pub(crate) fn assemble_block_prevouts(
     archived_tx_fks: Option<&[rbitcoin_primitives::Fk]>,
     pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
     pending_creates: &mut std::collections::HashMap<([u8; 32], u32), rbitcoin_primitives::Fk>,
+    batch_parents: &rbitcoin_query::BatchParents,
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
@@ -438,6 +443,7 @@ pub(crate) fn assemble_block_prevouts(
         pending_spent,
         pending_creates,
         AssembleMode::Optimistic,
+        batch_parents,
     )
 }
 
@@ -449,6 +455,7 @@ fn assemble_block_prevouts_mode(
     pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
     pending_creates: &mut std::collections::HashMap<([u8; 32], u32), rbitcoin_primitives::Fk>,
     mode: AssembleMode,
+    batch_parents: &rbitcoin_query::BatchParents,
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
@@ -507,12 +514,12 @@ fn assemble_block_prevouts_mode(
     > = std::collections::HashMap::with_capacity(64);
 
     // Spent checks: pending_spent (this run) + durable confirmed-strong annotations.
-    let parents = query.confirm_parent_cache();
+    let cache = query.confirm_parent_cache();
     for (ti, tx) in block.txdata.iter().enumerate() {
         let spend_fk = archived_tx_fks.map(|fks| fks[ti]);
         // Txid only — prefer cache body meta (no full Class A re-decode).
         let archived_txid: Option<[u8; 32]> = if let Some(fk) = spend_fk {
-            parents.get_parent_txid(fk).or_else(|| {
+            cache.get_parent_txid(fk).or_else(|| {
                 query
                     .get_tx_class_a(fk)
                     .ok()
@@ -538,7 +545,7 @@ fn assemble_block_prevouts_mode(
                 Vec::new()
             };
             // Thin create_fk edges stashed at load (clone once per spender).
-            let thin = spend_fk.and_then(|fk| parents.get_thin_inputs(fk));
+            let thin = spend_fk.and_then(|fk| cache.get_thin_inputs(fk));
 
             for (ii, input) in tx.input.iter().enumerate() {
                 let op = input.previous_output;
@@ -550,7 +557,7 @@ fn assemble_block_prevouts_mode(
                     return Err(ConsensusError::PrevoutSpent);
                 }
                 // Load pin spent-filtered sparse outs / body creates: skip durable
-                // probes when the parent out is already in the parent cache.
+                // probes when the parent out is already in the batch pin map or body.
                 let prev_fk = thin
                     .as_ref()
                     .and_then(|t| t.get(ii))
@@ -563,7 +570,10 @@ fn assemble_block_prevouts_mode(
                             .flatten()
                     });
                 let pin_live = prev_fk
-                    .map(|fk| parents.has_parent_out(fk, op.vout))
+                    .map(|fk| {
+                        batch_parents.has_parent_out(fk, op.vout)
+                            || cache.has_parent_out(fk, op.vout)
+                    })
                     .unwrap_or(false);
                 // Durable spentness: Full mode only. Optimistic defers to structural
                 // after scripts (assumevalid-shaped: scripts need values, not UTXO proof).
@@ -572,7 +582,7 @@ fn assemble_block_prevouts_mode(
                     && !pending_creates.contains_key(&key)
                 {
                     let spent = if let Some(cfk) = prev_fk {
-                        let range = parents.get_body_range(cfk);
+                        let range = cache.get_body_range(cfk);
                         query
                             .store()
                             .has_confirmed_strong_spender_create(cfk, op.vout, range)
@@ -594,6 +604,7 @@ fn assemble_block_prevouts_mode(
                     prev_fk,
                     &same_block,
                     &mut coinbase_height_cache,
+                    batch_parents,
                 )?;
                 if mode == AssembleMode::Full {
                     if let Some(created) = prev_out.coinbase_height {
@@ -706,13 +717,14 @@ pub(crate) fn structural_validate_spends(
     )],
     fees: i64,
     pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
+    batch_parents: &rbitcoin_query::BatchParents,
 ) -> Result<(), ConsensusError> {
     let mut coinbase_height_cache: std::collections::HashMap<
         rbitcoin_primitives::Fk,
         Option<u32>,
     > = std::collections::HashMap::with_capacity(64);
     let maturity = ctx.params.coinbase_maturity();
-    let parents = query.confirm_parent_cache();
+    let cache = query.confirm_parent_cache();
 
     for &(prev_txid, vout, _spend_fk, create_fk) in spends {
         let key = (prev_txid, vout);
@@ -721,7 +733,7 @@ pub(crate) fn structural_validate_spends(
         }
         // Durable confirmed-strong spender (always re-check; pin is not authority).
         let spent = if !create_fk.is_null() {
-            let range = parents.get_body_range(create_fk);
+            let range = cache.get_body_range(create_fk);
             query
                 .store()
                 .has_confirmed_strong_spender_create(create_fk, vout, range)
@@ -737,7 +749,10 @@ pub(crate) fn structural_validate_spends(
         }
         // Coinbase maturity (need create Class A meta).
         if !create_fk.is_null() {
-            let prev_rec = match parents.get_parent_tx(create_fk) {
+            let prev_rec = match batch_parents
+                .get_parent_tx(create_fk)
+                .or_else(|| cache.get_parent_tx(create_fk))
+            {
                 Some(r) => r,
                 None => query
                     .get_tx_class_a(create_fk)
@@ -747,6 +762,7 @@ pub(crate) fn structural_validate_spends(
                 query,
                 create_fk,
                 &prev_rec,
+                batch_parents,
                 &mut coinbase_height_cache,
             )?;
             if let Some(ch) = created {
@@ -842,6 +858,7 @@ fn resolve_prevout(
     prev_fk_hint: Option<rbitcoin_primitives::Fk>,
     same_block: &std::collections::HashMap<[u8; 32], usize>,
     coinbase_height_cache: &mut std::collections::HashMap<rbitcoin_primitives::Fk, Option<u32>>,
+    batch_parents: &rbitcoin_query::BatchParents,
 ) -> Result<ResolvedPrevout, ConsensusError> {
     use rbitcoin_query::connect_prevout_stats;
     use std::sync::atomic::Ordering;
@@ -863,18 +880,22 @@ fn resolve_prevout(
         });
     }
 
-    let parents = query.confirm_parent_cache();
+    let cache = query.confirm_parent_cache();
 
-    // Load-stage pin / body first (create_fk-keyed). Wire prev_txid is
+    // Batch pin map first, then shared body cache. Wire prev_txid is
     // authoritative — reject wrong create_fk hits.
     if let Some(prev_fk) = prev_fk_hint {
-        if let Some((prev_rec, out)) = parents.get_parent_out(prev_fk, op.vout) {
+        let hit = batch_parents
+            .get_parent_out(prev_fk, op.vout)
+            .or_else(|| cache.get_parent_out(prev_fk, op.vout));
+        if let Some((prev_rec, out)) = hit {
             if prev_rec.txid == prev_txid {
                 connect_prevout_stats::WAVE_HIT.fetch_add(1, Ordering::Relaxed);
                 let cb_h = coinbase_height_for_maturity(
                     query,
                     prev_fk,
                     &prev_rec,
+                    batch_parents,
                     coinbase_height_cache,
                 )?;
                 return Ok(ResolvedPrevout {
@@ -923,6 +944,7 @@ fn resolve_prevout(
             query,
             prev_fk,
             &prev_rec,
+            batch_parents,
             coinbase_height_cache,
         )?;
         return Ok(ResolvedPrevout {
@@ -945,9 +967,11 @@ fn coinbase_height_for_maturity(
     query: &Query,
     prev_fk: rbitcoin_primitives::Fk,
     prev_rec: &rbitcoin_store::TxRecord,
+    batch_parents: &rbitcoin_query::BatchParents,
     coinbase_height_cache: &mut std::collections::HashMap<rbitcoin_primitives::Fk, Option<u32>>,
 ) -> Result<Option<u32>, ConsensusError> {
-    let (is_cb, cb_h) = coinbase_info(query, prev_fk, prev_rec, coinbase_height_cache)?;
+    let (is_cb, cb_h) =
+        coinbase_info(query, prev_fk, prev_rec, batch_parents, coinbase_height_cache)?;
     if !is_cb {
         return Ok(None);
     }
@@ -967,6 +991,7 @@ fn coinbase_info(
     query: &Query,
     prev_fk: rbitcoin_primitives::Fk,
     prev_rec: &rbitcoin_store::TxRecord,
+    batch_parents: &rbitcoin_query::BatchParents,
     cache: &mut std::collections::HashMap<rbitcoin_primitives::Fk, Option<u32>>,
 ) -> Result<(bool, Option<u32>), ConsensusError> {
     if let Some(&h) = cache.get(&prev_fk) {
@@ -978,8 +1003,8 @@ fn coinbase_info(
         // 1-in parent in one spending tx).
         return Ok((h.is_some(), h));
     }
-    // Load-stage pin may stash coinbase height (no tx_height / input-run disk).
-    if let Some(cached) = query.confirm_parent_cache().get_parent_coinbase_height(prev_fk) {
+    // Batch pin may stash coinbase height (no tx_height / input-run disk).
+    if let Some(cached) = batch_parents.get_parent_coinbase_height(prev_fk) {
         cache.insert(prev_fk, cached);
         return Ok((cached.is_some(), cached));
     }

@@ -133,22 +133,17 @@ pub(crate) struct IbdPerfSample {
     pub load_creates: u64,
     pub load_already_ready: u64,
     pub load_parent_unique: u64,
-    /// Of uniq_p: by_fk re-pin / cache body / store decode.
-    pub load_pin_already_cached: u64,
+    /// Of uniq_p: body-LRU pin vs store pin_new.
     pub load_pin_cache_body: u64,
     pub load_pin_new: u64,
-    pub load_pin_cover_miss_no_fk: u64,
-    pub load_pin_cover_miss_partial: u64,
     /// Spent-filter wall on pin path (ms).
     pub load_pin_spent_ms: u64,
     /// Mlock wall on pin path (ms; 0 when mlock default-off).
     pub load_pin_mlock_ms: u64,
-    /// Pin residual sub-phases (ms): cover / body-LRU+pin_cache / pin_new meta / put / touch.
-    pub load_pin_cover_ms: u64,
+    /// Pin residual sub-phases (ms): body-LRU / pin_new meta / batch put.
     pub load_pin_body_ms: u64,
     pub load_pin_new_meta_ms: u64,
     pub load_pin_put_ms: u64,
-    pub load_pin_touch_ms: u64,
 
     /// Phase-1 body Class A reads this window.
     pub load_body_tx_reads: u64,
@@ -157,8 +152,7 @@ pub(crate) struct IbdPerfSample {
     pub load_missing_parents: u64,
     /// Contiguous ready watermark height.
     pub load_ready_through: u32,
-    /// Parent-cache snapshot (bodies still held / plans / depth).
-    pub cache_parents: usize,
+    /// Parent-cache snapshot (bodies still held / plans).
     pub cache_bodies: usize,
     pub cache_plans: usize,
     /// Confirm pipeline queue depths (load→scripts, scripts→write).
@@ -336,24 +330,18 @@ impl Default for IbdPerfSample {
             load_creates: 0,
             load_already_ready: 0,
             load_parent_unique: 0,
-            load_pin_already_cached: 0,
             load_pin_cache_body: 0,
             load_pin_new: 0,
-            load_pin_cover_miss_no_fk: 0,
-            load_pin_cover_miss_partial: 0,
             load_pin_spent_ms: 0,
             load_pin_mlock_ms: 0,
-            load_pin_cover_ms: 0,
             load_pin_body_ms: 0,
             load_pin_new_meta_ms: 0,
             load_pin_put_ms: 0,
-            load_pin_touch_ms: 0,
 
             load_body_tx_reads: 0,
             load_parent_tx_reads: 0,
             load_missing_parents: 0,
             load_ready_through: 0,
-            cache_parents: 0,
             cache_bodies: 0,
             cache_plans: 0,
             conf_load_q: 0,
@@ -496,7 +484,7 @@ pub(crate) fn sample(
     let pipe = pipe_stats.sample_and_reset();
     let (contig_next_h, contig_parked, contig_ready) =
         rbitcoin_query::contig_park_stats::snapshot();
-    let (load_ready_through, _cache_ahead, cache_parents, cache_bodies, cache_plans) = load;
+    let (load_ready_through, _cache_ahead, _cache_parents, cache_bodies, cache_plans) = load;
     let (arch_sticky_len, arch_sticky_cap) = arch_sticky;
 
     IbdPerfSample {
@@ -588,24 +576,18 @@ pub(crate) fn sample(
         load_creates: pw.creates,
         load_already_ready: pw.already_ready,
         load_parent_unique: pw.parent_unique,
-        load_pin_already_cached: pw.pin_already_cached,
         load_pin_cache_body: pw.pin_cache_body,
         load_pin_new: pw.pin_new,
-        load_pin_cover_miss_no_fk: pw.pin_cover_miss_no_fk,
-        load_pin_cover_miss_partial: pw.pin_cover_miss_partial,
         load_pin_spent_ms: ns_ms(pw.pin_spent_ns),
         load_pin_mlock_ms: ns_ms(pw.pin_mlock_ns),
-        load_pin_cover_ms: ns_ms(pw.pin_cover_ns),
         load_pin_body_ms: ns_ms(pw.pin_body_ns),
         load_pin_new_meta_ms: ns_ms(pw.pin_new_meta_ns),
         load_pin_put_ms: ns_ms(pw.pin_put_ns),
-        load_pin_touch_ms: ns_ms(pw.pin_touch_ns),
 
         load_body_tx_reads: pw.body_tx,
         load_parent_tx_reads: pw.parent_tx,
         load_missing_parents: pw.missing,
         load_ready_through,
-        cache_parents,
         cache_bodies,
         cache_plans,
         conf_load_q,
@@ -729,12 +711,9 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     if let Some((first, n, elapsed_ms)) = s.live {
         out.push_str(&format!(" | live h={first} n={n} {elapsed_ms}ms"));
     }
-    // Pin reuse rate (unique parents): already-covered + body-in-cache vs store pin.
-    // (Old formula mixed per-edge thin hits with unique parents — inflated / meaningless.)
+    // Body-LRU pin vs store pin_new (unique parents).
     let pin_hit_pct = {
-        let hits = s
-            .load_pin_already_cached
-            .saturating_add(s.load_pin_cache_body);
+        let hits = s.load_pin_cache_body;
         let tot = hits.saturating_add(s.load_pin_new);
         if tot > 0 {
             (100 * hits) / tot
@@ -750,15 +729,13 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.conf_write_q_cap,
     );
     out.push_str(&format!(
-        " | {conf_q} | parents thru={} by_fk={} bodies={} plans={} blks={} body_io={} parent_io={} pin_cached={} pin_cache={} pin_new={} pin_hit%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) spent={}ms mlock_pin={}ms pin_sub cover={} body={} new={} put={} touch={} miss_nf={} miss_part={} head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
+        " | {conf_q} | parents thru={} bodies={} plans={} blks={} body_io={} parent_io={} pin_cache={} pin_new={} pin_hit%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) spent={}ms mlock_pin={}ms pin_sub body={} new={} put={} head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
         s.load_ready_through,
-        s.cache_parents,
         s.cache_bodies,
         s.cache_plans,
         s.load_blocks,
         s.load_body_tx_reads,
         s.load_parent_tx_reads,
-        s.load_pin_already_cached,
         s.load_pin_cache_body,
         s.load_pin_new,
         pin_hit_pct,
@@ -775,13 +752,9 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.load_cache_put_ms,
         s.load_pin_spent_ms,
         s.load_pin_mlock_ms,
-        s.load_pin_cover_ms,
         s.load_pin_body_ms,
         s.load_pin_new_meta_ms,
         s.load_pin_put_ms,
-        s.load_pin_touch_ms,
-        s.load_pin_cover_miss_no_fk,
-        s.load_pin_cover_miss_partial,
         s.load_head_hits,
         s.load_head_lookups,
         s.load_mlock_sys,
@@ -857,9 +830,8 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.conf_write_q_cap,
     );
     out.push_str(&format!(
-        " | {conf_q} | parents thru={} by_fk={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cached={} pin_cache={} pin_new={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} spent={}ms mlock_pin={}ms pin_sub cover={} body={} new={} put={} touch={} miss_nf={} miss_part={} head={}/{} mlock_sys={}/{} edges same={} cache={} fk={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
+        " | {conf_q} | parents thru={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cache={} pin_new={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} spent={}ms mlock_pin={}ms pin_sub body={} new={} put={} head={}/{} mlock_sys={}/{} edges same={} cache={} fk={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
         s.load_ready_through,
-        s.cache_parents,
         s.cache_bodies,
         s.cache_plans,
         s.load_win_ms,
@@ -868,7 +840,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.load_creates,
         s.load_already_ready,
         s.load_parent_unique,
-        s.load_pin_already_cached,
         s.load_pin_cache_body,
         s.load_pin_new,
         s.load_body_tx_reads,
@@ -886,13 +857,9 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.load_cache_put_ms,
         s.load_pin_spent_ms,
         s.load_pin_mlock_ms,
-        s.load_pin_cover_ms,
         s.load_pin_body_ms,
         s.load_pin_new_meta_ms,
         s.load_pin_put_ms,
-        s.load_pin_touch_ms,
-        s.load_pin_cover_miss_no_fk,
-        s.load_pin_cover_miss_partial,
         s.load_head_hits,
         s.load_head_lookups,
         s.load_mlock_sys,
@@ -1076,15 +1043,13 @@ mod tests {
         s.conf_load_q_cap = 2;
         s.conf_write_q_cap = 2;
         s.load_ready_through = 200;
-        s.cache_parents = 12;
         s.cache_bodies = 48;
         s.cache_plans = 80;
         s.load_blocks = 32;
         s.load_body_tx_reads = 400;
         s.load_parent_tx_reads = 120;
         s.load_parent_unique = 20;
-        s.load_pin_already_cached = 5;
-        s.load_pin_cache_body = 3;
+        s.load_pin_cache_body = 8;
         s.load_pin_new = 12;
         s.load_win_ms = 40;
         s.mlock_bytes = 32 * 1024 * 1024;
@@ -1093,10 +1058,12 @@ mod tests {
         let line = format_info(&s);
         assert!(line.contains("conf_q load=1/2 write=2/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
-        assert!(line.contains("by_fk=12 bodies=48 plans=80"), "{line}");
+        assert!(line.contains("bodies=48 plans=80"), "{line}");
+        assert!(!line.contains("by_fk="), "{line}");
+        assert!(!line.contains("pin_cached="), "{line}");
         assert!(line.contains("body_io=400 parent_io=120"), "{line}");
-        assert!(line.contains("pin_cached=5 pin_cache=3 pin_new=12"), "{line}");
-        // pin_hit% = (5+3)/(5+3+12) = 40
+        assert!(line.contains("pin_cache=8 pin_new=12"), "{line}");
+        // pin_hit% = 8/(8+12) = 40
         assert!(line.contains("pin_hit%=40"), "{line}");
         assert!(!line.contains("cache%="), "{line}");
         assert!(line.contains("mlock=32MiB ranges=12 sh_runs=3"), "{line}");
@@ -1126,7 +1093,7 @@ mod tests {
         s.load_creates = 50;
         s.load_body_tx_reads = 200;
         s.load_parent_tx_reads = 50;
-        s.load_pin_already_cached = 12;
+        s.load_pin_cache_body = 0;
         s.load_pin_new = 38;
         s.pipe.write_blocks = 5;
         s.pipe.write_ns = 5_000_000;
@@ -1139,7 +1106,8 @@ mod tests {
         assert!(line.contains("spend=500(r=10 i=2 skip=0)"), "{line}"); // us/blk wall
         assert!(line.contains("wave body="), "{line}");
         assert!(line.contains("spent=50"), "{line}");
-        assert!(line.contains("pin_sub cover="), "{line}");
+        assert!(line.contains("pin_sub body="), "{line}");
+        assert!(!line.contains("pin_sub cover="), "{line}");
         assert!(line.contains("cache="), "{line}");
         assert!(line.contains("store="), "{line}");
         assert!(line.contains("thin="), "{line}");
@@ -1150,7 +1118,8 @@ mod tests {
         assert!(line.contains("utxo_p=100"), "{line}");
         assert!(line.contains("creates=50"), "{line}");
         assert!(line.contains("body_io=200 parent_io=50"), "{line}");
-        assert!(line.contains("pin_cached=12 pin_cache=0 pin_new=38"), "{line}");
+        assert!(line.contains("pin_cache=0 pin_new=38"), "{line}");
+        assert!(!line.contains("pin_cached="), "{line}");
         assert!(line.contains("mlock=16MiB ranges=4 sh_runs=2"), "{line}");
         assert!(line.contains("arch_res resolve_us/blk="), "{line}");
         assert!(line.contains("arch_prep total="), "{line}");

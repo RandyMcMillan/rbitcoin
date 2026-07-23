@@ -1269,15 +1269,10 @@ impl ConfirmParentCache {
         }
     }
 
-    /// Load-resolved coinbase maturity for a create fk.
-    ///
-    /// - `None` = not stashed (wave must compute)
-    /// - `Some(None)` = not a coinbase
-    /// - `Some(Some(h))` = coinbase at height `h`
-    pub fn get_parent_coinbase_height(&self, fk: Fk) -> Option<Option<u32>> {
-        let id = fk.get()?;
-        // Field is already Option<Option<u32>>; missing entry / unset → None.
-        self.inner.lock().unwrap().by_fk.get(&id)?.coinbase_height
+    /// Coinbase maturity stash was moved to per-batch [`crate::BatchParents`].
+    /// Shared cache no longer holds sparse pin metadata.
+    pub fn get_parent_coinbase_height(&self, _fk: Fk) -> Option<Option<u32>> {
+        None
     }
 
     /// Batch thin edges under one lock (moves ownership — no edge clone).
@@ -1383,8 +1378,7 @@ impl ConfirmParentCache {
 
     /// Look up a populated parent out (for wave fill / connect).
     ///
-    /// Prefers sparse external-parent `by_fk`, then cache **body** outs
-    /// (bodies-first cache no longer dual-copies every create into `by_fk`).
+    /// Cache **body** outs only (sparse pins live on per-batch [`crate::BatchParents`]).
     pub fn get_parent_out(
         &self,
         fk: Fk,
@@ -1392,11 +1386,6 @@ impl ConfirmParentCache {
     ) -> Option<(TxRecord, OutputRecord)> {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
-        if let Some(e) = g.by_fk.get(&id) {
-            if let Some(o) = e.outs.get(&vout) {
-                return Some((e.tx.clone(), o.output.clone()));
-            }
-        }
         if let Some(b) = g.by_body.get(&id) {
             let o = b.outputs.get(vout as usize)?;
             return Some((b.tx.clone(), o.clone()));
@@ -1404,13 +1393,15 @@ impl ConfirmParentCache {
         None
     }
 
-    /// True if vout is present (by_fk sparse or body) — no record clone.
+    /// True if vout is present on a cached body — no record clone.
     pub fn has_parent_out(&self, fk: Fk, vout: u32) -> bool {
         let Some(id) = fk.get() else {
             return false;
         };
         let g = self.inner.lock().unwrap();
-        Self::out_present_locked(&g, id, vout)
+        g.by_body
+            .get(&id)
+            .is_some_and(|b| (vout as usize) < b.outputs.len())
     }
 
     /// True when parent pin can skip store decode for `vouts` (wave already
@@ -1611,23 +1602,10 @@ impl ConfirmParentCache {
         }
     }
 
-    #[inline]
-    fn out_present_locked(g: &Inner, id: u64, vout: u32) -> bool {
-        if g.by_fk
-            .get(&id)
-            .is_some_and(|e| e.outs.contains_key(&vout))
-        {
-            return true;
-        }
-        g.by_body
-            .get(&id)
-            .is_some_and(|b| (vout as usize) < b.outputs.len())
-    }
-
     /// See [`Self::parent_pin_covered`].
     ///
-    /// Only **spent-filtered** `by_fk` entries count. Bare cache `by_body` does
-    /// **not** cover external parents (wave cache_only requires spent_filtered).
+    /// Only **spent-filtered** sparse `by_fk` entries count (legacy/test inserts).
+    /// Production pins live on per-batch [`crate::BatchParents`].
     #[inline]
     fn pin_covered_locked(g: &Inner, id: u64, vouts: &[u32]) -> bool {
         if vouts.is_empty() {
@@ -1644,13 +1622,14 @@ impl ConfirmParentCache {
     pub fn get_parent_tx(&self, fk: Fk) -> Option<TxRecord> {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
-        if let Some(e) = g.by_fk.get(&id) {
-            return Some(e.tx.clone());
+        // Prefer body (shared LRU); legacy sparse by_fk for unit tests only.
+        if let Some(b) = g.by_body.get(&id) {
+            return Some(b.tx.clone());
         }
-        g.by_body.get(&id).map(|b| b.tx.clone())
+        g.by_fk.get(&id).map(|e| e.tx.clone())
     }
 
-    /// Txid of a stashed parent create (by_fk sparse or cache body) — no clone of outs.
+    /// Txid of a stashed parent create (body or legacy sparse) — no clone of outs.
     pub fn get_parent_txid(&self, fk: Fk) -> Option<[u8; 32]> {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();

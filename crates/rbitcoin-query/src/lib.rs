@@ -2,6 +2,7 @@
 
 mod archive;
 mod archive_txid_sticky;
+mod batch_parents;
 mod catchup;
 mod chain_view;
 mod confirm_parent_cache;
@@ -33,6 +34,7 @@ use std::sync::Mutex;
 
 pub type QueryError = StoreError;
 
+pub use batch_parents::BatchParents;
 pub use catchup::IndexMode;
 pub use confirm_parent_cache::confirm_mlock_from_env;
 pub use connect::ConfirmPrepared;
@@ -57,21 +59,15 @@ pub mod confirm_load_stats {
     pub static CREATES: AtomicU64 = AtomicU64::new(0);
     pub static ALREADY_READY: AtomicU64 = AtomicU64::new(0);
     pub static PARENT_UNIQUE: AtomicU64 = AtomicU64::new(0);
-    /// Pin loop: already-stashed outs in by_fk (skip store decode).
-    pub static PIN_ALREADY_CACHED: AtomicU64 = AtomicU64::new(0);
     /// Pin filled from cache `by_body` (no Class A re-decode).
     pub static PIN_CACHE_BODY: AtomicU64 = AtomicU64::new(0);
     /// Pin that had to load from store.
     pub static PIN_NEW: AtomicU64 = AtomicU64::new(0);
-    pub static PIN_COVER_MISS_NO_FK: AtomicU64 = AtomicU64::new(0);
-    pub static PIN_COVER_MISS_PARTIAL: AtomicU64 = AtomicU64::new(0);
     pub static PIN_SPENT_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_MLOCK_NS: AtomicU64 = AtomicU64::new(0);
-    pub static PIN_COVER_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_BODY_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_NEW_META_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_PUT_NS: AtomicU64 = AtomicU64::new(0);
-    pub static PIN_TOUCH_NS: AtomicU64 = AtomicU64::new(0);
     pub static PARENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
     pub static FULL_TX_READS: AtomicU64 = AtomicU64::new(0);
     pub static BODY_TX_READS: AtomicU64 = AtomicU64::new(0);
@@ -112,18 +108,13 @@ pub mod confirm_load_stats {
         pub creates: u64,
         pub already_ready: u64,
         pub parent_unique: u64,
-        pub pin_already_cached: u64,
         pub pin_cache_body: u64,
         pub pin_new: u64,
-        pub pin_cover_miss_no_fk: u64,
-        pub pin_cover_miss_partial: u64,
         pub pin_spent_ns: u64,
         pub pin_mlock_ns: u64,
-        pub pin_cover_ns: u64,
         pub pin_body_ns: u64,
         pub pin_new_meta_ns: u64,
         pub pin_put_ns: u64,
-        pub pin_touch_ns: u64,
         pub cache_hits: u64,
         pub body_tx: u64,
         pub parent_tx: u64,
@@ -157,18 +148,13 @@ pub mod confirm_load_stats {
             creates: CREATES.swap(0, Ordering::Relaxed),
             already_ready: ALREADY_READY.swap(0, Ordering::Relaxed),
             parent_unique: PARENT_UNIQUE.swap(0, Ordering::Relaxed),
-            pin_already_cached: PIN_ALREADY_CACHED.swap(0, Ordering::Relaxed),
             pin_cache_body: PIN_CACHE_BODY.swap(0, Ordering::Relaxed),
             pin_new: PIN_NEW.swap(0, Ordering::Relaxed),
-            pin_cover_miss_no_fk: PIN_COVER_MISS_NO_FK.swap(0, Ordering::Relaxed),
-            pin_cover_miss_partial: PIN_COVER_MISS_PARTIAL.swap(0, Ordering::Relaxed),
             pin_spent_ns: PIN_SPENT_NS.swap(0, Ordering::Relaxed),
             pin_mlock_ns: PIN_MLOCK_NS.swap(0, Ordering::Relaxed),
-            pin_cover_ns: PIN_COVER_NS.swap(0, Ordering::Relaxed),
             pin_body_ns: PIN_BODY_NS.swap(0, Ordering::Relaxed),
             pin_new_meta_ns: PIN_NEW_META_NS.swap(0, Ordering::Relaxed),
             pin_put_ns: PIN_PUT_NS.swap(0, Ordering::Relaxed),
-            pin_touch_ns: PIN_TOUCH_NS.swap(0, Ordering::Relaxed),
             cache_hits: PARENT_CACHE_HITS.swap(0, Ordering::Relaxed),
             body_tx: BODY_TX_READS.swap(0, Ordering::Relaxed),
             parent_tx: FULL_TX_READS.swap(0, Ordering::Relaxed),
@@ -212,18 +198,13 @@ pub mod confirm_load_stats {
         add!(creates_registered, CREATES);
         add!(already_ready, ALREADY_READY);
         add!(parent_unique, PARENT_UNIQUE);
-        add!(pin_already_cached, PIN_ALREADY_CACHED);
         add!(pin_cache_body, PIN_CACHE_BODY);
         add!(pin_new, PIN_NEW);
-        add!(pin_cover_miss_no_fk, PIN_COVER_MISS_NO_FK);
-        add!(pin_cover_miss_partial, PIN_COVER_MISS_PARTIAL);
         add!(pin_spent_ns, PIN_SPENT_NS);
         add!(pin_mlock_ns, PIN_MLOCK_NS);
-        add!(pin_cover_ns, PIN_COVER_NS);
         add!(pin_body_ns, PIN_BODY_NS);
         add!(pin_new_meta_ns, PIN_NEW_META_NS);
         add!(pin_put_ns, PIN_PUT_NS);
-        add!(pin_touch_ns, PIN_TOUCH_NS);
         add!(parent_cache_hits, PARENT_CACHE_HITS);
         add!(full_tx_reads, FULL_TX_READS);
         add!(body_tx_reads, BODY_TX_READS);

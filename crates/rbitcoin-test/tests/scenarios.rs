@@ -1135,14 +1135,14 @@ fn confirm_structural_rejects_already_spent_prevout() {
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
     accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     let spend_hash = b_spend.block_hash().to_byte_array();
-    q.load_confirm_parents(&[(spend_h, spend_hash)]).unwrap();
+    let (_st, batch_parents) = q.load_confirm_parents(&[(spend_h, spend_hash)]).unwrap();
     let create_fk = q
         .tx_fk_by_txid(cb1.as_byte_array())
         .unwrap()
         .expect("cb create fk");
     assert!(
-        q.confirm_parent_cache().has_parent_out(create_fk, 0),
-        "unspent parent content available in pin/body before first confirm"
+        batch_parents.has_parent_out(create_fk, 0),
+        "unspent parent content available in per-batch pin map before first confirm"
     );
 
     accept_and_connect_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
@@ -1225,7 +1225,7 @@ fn confirm_batch_create_and_spend_parent_same_run() {
     // Runway the run: mlock bodies + prevout scan; same-batch create must not
     // leave the spend height unready.
     let items: Vec<(u32, [u8; 32])> = run.iter().map(|(h, hash)| (h.0, *hash)).collect();
-    q.load_confirm_parents(&items).unwrap();
+    let _ = q.load_confirm_parents(&items).unwrap();
     let heights: Vec<u32> = items.iter().map(|(h, _)| *h).collect();
     assert!(
         q.is_confirm_load_ready(&heights),
@@ -1900,7 +1900,7 @@ fn three_stage_confirm_and_parent_mlock_surface() {
 
     // Inline confirm load (parent pin + optional body mlock).
     let items: Vec<(u32, [u8; 32])> = run.iter().map(|(h, hash)| (h.0, *hash)).collect();
-    let st = q.load_confirm_parents(&items).unwrap();
+    let (st, _bp) = q.load_confirm_parents(&items).unwrap();
     assert!(st.blocks > 0 || st.already_ready > 0);
     let _ = q.load_confirm_parents_for_hashes(&[b_spend.block_hash().to_byte_array()]);
     let snap = q.parent_cache_perf_snapshot();
@@ -1934,7 +1934,7 @@ fn three_stage_confirm_and_parent_mlock_surface() {
     assert!(empty.is_err());
 
     // Idempotent re-load of already-ready batch.
-    let st2 = q.load_confirm_parents(&items).unwrap();
+    let (st2, _) = q.load_confirm_parents(&items).unwrap();
     assert!(st2.already_ready > 0 || st2.blocks == 0);
 }
 

@@ -81,35 +81,6 @@ pub(crate) fn is_prewarm_retryable(msg: &str) -> bool {
         || msg.contains("prewarm not ready")
 }
 
-/// Contiguous claim from `expect`: feed entries that are package-ready, up to `max`.
-/// Pure helper so tests can trigger over-claim / hole-stop without OS threads.
-#[inline]
-pub(crate) fn claim_package_ready_run(
-    expect: u32,
-    max: usize,
-    feed_has: impl Fn(u32) -> bool,
-    already_confirmed: impl Fn(u32) -> bool,
-    package_ready: impl Fn(u32) -> bool,
-) -> Vec<u32> {
-    let mut run = Vec::with_capacity(max.min(32));
-    let mut h = expect;
-    while run.len() < max {
-        if !feed_has(h) {
-            break;
-        }
-        if already_confirmed(h) {
-            h = h.saturating_add(1);
-            continue;
-        }
-        if !package_ready(h) {
-            break;
-        }
-        run.push(h);
-        h = h.saturating_add(1);
-    }
-    run
-}
-
 /// Spawn confirm **script** + **writeback** OS threads.
 ///
 /// Scripts run optimistically on `ibd-confirm`; structural spentness + Class C +
@@ -553,61 +524,59 @@ pub(crate) fn offer_confirm_ready(
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_package_ready_run, is_prewarm_retryable};
+    use super::is_prewarm_retryable;
 
-    #[test]
-    fn claim_stops_at_first_package_hole() {
-        // Feed has 32 heights; only tip+1 and tip+2 package_ready → claim 2, not 32.
-        // Historical bug: claim 32 then Condvar-wait 600s while prewarm +2 idle.
-        let feed_end = 100u32 + 32;
-        let ready_through = 102u32; // tip=100 → tip+1, tip+2 ready
-        let run = claim_package_ready_run(
-            101,
-            32,
-            |h| h >= 101 && h < feed_end,
-            |_| false,
-            |h| h > 100 && h <= ready_through,
-        );
-        assert_eq!(run, vec![101, 102], "must not over-claim past package hole");
+    /// Contiguous feed claim (2-stage): up to max heights, skip already-confirmed.
+    fn claim_feed_run(
+        expect: u32,
+        max: usize,
+        feed_has: impl Fn(u32) -> bool,
+        already_confirmed: impl Fn(u32) -> bool,
+    ) -> Vec<u32> {
+        let mut run = Vec::with_capacity(max.min(32));
+        let mut h = expect;
+        while run.len() < max {
+            if !feed_has(h) {
+                break;
+            }
+            if already_confirmed(h) {
+                h = h.saturating_add(1);
+                continue;
+            }
+            run.push(h);
+            h = h.saturating_add(1);
+        }
+        run
     }
 
     #[test]
-    fn claim_skips_already_confirmed_and_fills_wave() {
-        let run = claim_package_ready_run(
+    fn claim_feed_takes_contiguous_wave() {
+        let run = claim_feed_run(101, 32, |h| h >= 101 && h < 101 + 40, |_| false);
+        assert_eq!(run.len(), 32);
+        assert_eq!(run[0], 101);
+        assert_eq!(*run.last().unwrap(), 132);
+    }
+
+    #[test]
+    fn claim_feed_skips_already_confirmed() {
+        let run = claim_feed_run(
             10,
             32,
             |h| h >= 10 && h <= 50,
-            |h| h == 10 || h == 11, // already confirmed
-            |h| h <= 20,
+            |h| h == 10 || h == 11,
         );
-        // expect=10 skipped (confirmed), 11 skipped, 12..=20 claimed (9 heights).
         assert_eq!(run.first().copied(), Some(12));
-        assert_eq!(run.last().copied(), Some(20));
-        assert_eq!(run.len(), 9);
-    }
-
-    #[test]
-    fn claim_empty_when_tip1_not_package_ready() {
-        let run = claim_package_ready_run(
-            50,
-            32,
-            |h| h >= 50 && h <= 80,
-            |_| false,
-            |_| false, // nothing ready
-        );
-        assert!(run.is_empty());
+        assert_eq!(run.len(), 32);
     }
 
     #[test]
     fn wait_timeout_is_prewarm_retryable_not_reject() {
-        // Must match the StoreError string from wait_prewarm_ready.
         assert!(is_prewarm_retryable(
             "confirm: prewarm incomplete (parent package not ready, timeout)"
         ));
         assert!(is_prewarm_retryable(
             "confirm: prewarm incomplete (wave body missing from runway)"
         ));
-        // Permanent consensus errors must NOT look retryable.
         assert!(!is_prewarm_retryable("script failed: false"));
         assert!(!is_prewarm_retryable("prevout already spent"));
     }

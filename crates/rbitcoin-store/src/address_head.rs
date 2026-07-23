@@ -359,11 +359,12 @@ impl AddressHead {
     }
 
     #[inline]
-    fn entry_off(&self, slot: u64) -> u64 {
+    pub(crate) fn entry_off(&self, slot: u64) -> u64 {
         FILE_HEADER_LEN as u64 + slot * self.layout.entry_size()
     }
 
-    fn read_entry(&self, slot: u64) -> Result<u64, StoreError> {
+    /// Read one open-address entry (0 = empty). Used by sequential and bulk probe.
+    pub(crate) fn read_entry(&self, slot: u64) -> Result<u64, StoreError> {
         let off = self.entry_off(slot);
         match self.layout.entry_bytes {
             4 => Ok(u64::from(self.file.load_u32_le(off)?)),

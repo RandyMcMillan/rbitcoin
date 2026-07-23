@@ -86,6 +86,12 @@ impl VarTable {
         Ok((start, end - start))
     }
 
+    /// Raw idx slot read (bulk IO / concurrent head-resolve).
+    #[inline]
+    pub(crate) fn idx_read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
+        self.idx.read_at(offset, buf)
+    }
+
     /// `mlock` the body pages covering `fk`. Returns page-aligned `(start, len)`.
     pub fn mlock_record(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
         let (off, len) = self.record_range(fk)?;

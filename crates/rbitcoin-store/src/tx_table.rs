@@ -9,7 +9,6 @@ use crate::compact::{
 use crate::error::StoreError;
 use crate::var_table::VarTable;
 use rbitcoin_primitives::{Fk, TableKind};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
@@ -980,17 +979,17 @@ impl TxTable {
         Ok(None)
     }
 
-    /// Batch head resolve for load thin (caller should **primary-slot sort**).
+    /// Batch head resolve (archive prep bulk path).
     ///
-    /// 1. Sequential head probe in call order (slot-sorted → page locality).
-    /// 2. Unique candidate fks sorted → sequential body-txid reads.
-    /// 3. Match each txid to the **last** probe candidate whose body txid equals
-    ///    it (same preference as [`Self::get_fk_by_txid`]).
+    /// **Wave-pipelined bulk IO:** submit many independent reads per wave so the
+    /// kernel can schedule them; completions may finish in any order within a
+    /// wave. Dependent stages per key:
+    /// `probe(d) → (non-empty) probe(d+1) + idx(fk) → body_txid → maybe best`.
     ///
-    /// Beats N independent `get_fk_by_txid` when body verifies thrash randomly
-    /// and when head walks share nearby slots.
+    /// BIP30 / deepest match: each candidate carries probe depth; a body match
+    /// only wins if deeper than the current best (completion order independent).
     ///
-    /// Timers: [`crate::head_resolve_stats`] probe / idx / body.
+    /// Timers: [`crate::head_resolve_stats`] probe / idx / body (per-wave wall).
     pub fn get_fk_by_txid_batch(
         &self,
         txids: &[[u8; 32]],
@@ -999,51 +998,402 @@ impl TxTable {
         if txids.is_empty() {
             return Ok(Vec::new());
         }
-        let mut pairs: Vec<([u8; 32], Vec<Fk>)> = Vec::with_capacity(txids.len());
-        let mut cand_ids: Vec<u64> = Vec::new();
-        let t_probe = Instant::now();
-        {
-            let head = self.head.read().unwrap();
-            for txid in txids {
-                let cands = head.probe_fks(txid)?;
-                for fk in &cands {
-                    if let Some(id) = fk.get() {
-                        cand_ids.push(id);
+        crate::head_resolve_stats::add_keys(txids.len() as u64);
+
+        #[derive(Clone, Copy)]
+        enum Stage {
+            Probe { depth: u8 },
+            Idx { depth: u8, fk: u64 },
+            Body {
+                depth: u8,
+                fk: u64,
+                off: u64,
+                len: u64,
+            },
+        }
+
+        struct Op {
+            key_i: u32,
+            stage: Stage,
+            /// Filled by concurrent readers.
+            entry: u64,
+            range: (u64, u64),
+            prefix: [u8; 33],
+            prefix_n: usize,
+            err: Option<StoreError>,
+        }
+
+        struct KeyState {
+            /// Deepest body-verified match so far.
+            best: Option<(u64, u8)>,
+        }
+
+        let head = self.head.read().unwrap();
+        let bits = head.bits();
+        let count = self.body.count();
+        let body_logical = self.body.body_logical_len().max(crate::file::FILE_HEADER_LEN as u64);
+
+        let mut keys: Vec<KeyState> = (0..txids.len())
+            .map(|_| KeyState { best: None })
+            .collect();
+
+        // Seed: probe depth 0 for every key.
+        let mut scheduled: Vec<Op> = (0..txids.len())
+            .map(|i| Op {
+                key_i: i as u32,
+                stage: Stage::Probe { depth: 0 },
+                entry: 0,
+                range: (0, 0),
+                prefix: [0u8; 33],
+                prefix_n: 0,
+                err: None,
+            })
+            .collect();
+
+        let mut cands_total = 0u64;
+        let mut body_lookups = 0u64;
+
+        while !scheduled.is_empty() {
+            // Partition wave by stage for timers (still one concurrent pass).
+            let t_wave = Instant::now();
+            let mut any_probe = false;
+            let mut any_idx = false;
+            let mut any_body = false;
+            for op in &scheduled {
+                match op.stage {
+                    Stage::Probe { .. } => any_probe = true,
+                    Stage::Idx { .. } => any_idx = true,
+                    Stage::Body { .. } => any_body = true,
+                }
+            }
+
+            // Concurrent issue: each op is independent (different offsets).
+            crate::bulk_io::for_each_mut(&mut scheduled, |op| {
+                match op.stage {
+                    Stage::Probe { depth } => {
+                        let txid = &txids[op.key_i as usize];
+                        let slot = crate::address_head::probe_index(txid, u32::from(depth), bits);
+                        match head.read_entry(slot) {
+                            Ok(e) => op.entry = e,
+                            Err(e) => op.err = Some(e),
+                        }
+                    }
+                    Stage::Idx { fk, .. } => {
+                        // record_range: start(id) and end (start(id+1) or body end).
+                        let id = fk;
+                        if id == 0 || id > count {
+                            op.err = Some(StoreError::NotFound);
+                            return;
+                        }
+                        let mut off_buf = [0u8; 8];
+                        let idx_off = crate::file::FILE_HEADER_LEN as u64 + (id - 1) * 8;
+                        // Read start.
+                        if let Err(e) = self.body.idx_read_at(idx_off, &mut off_buf) {
+                            op.err = Some(e);
+                            return;
+                        }
+                        let start = u64::from_le_bytes(off_buf);
+                        let end = if id < count {
+                            let idx_off2 = crate::file::FILE_HEADER_LEN as u64 + id * 8;
+                            if let Err(e) = self.body.idx_read_at(idx_off2, &mut off_buf) {
+                                op.err = Some(e);
+                                return;
+                            }
+                            u64::from_le_bytes(off_buf)
+                        } else {
+                            body_logical
+                        };
+                        if end < start {
+                            op.err = Some(StoreError::Corrupt("var record end < start"));
+                            return;
+                        }
+                        op.range = (start, end - start);
+                    }
+                    Stage::Body { off, len, .. } => {
+                        let n = (len as usize).min(33);
+                        if n == 0 {
+                            op.err = Some(StoreError::Corrupt("empty body for txid"));
+                            return;
+                        }
+                        match self.body.read_prefix_at(off, len, &mut op.prefix) {
+                            Ok(got) => op.prefix_n = got,
+                            Err(e) => op.err = Some(e),
+                        }
                     }
                 }
-                crate::head_resolve_stats::add_cands(cands.len() as u64);
-                pairs.push((*txid, cands));
-            }
-        }
-        crate::head_resolve_stats::add_probe(t_probe.elapsed().as_nanos() as u64);
-        crate::head_resolve_stats::add_keys(txids.len() as u64);
-        cand_ids.sort_unstable();
-        cand_ids.dedup();
-        // Body txid for unique fks in ascending order (page locality).
-        let mut body_txids: HashMap<u64, [u8; 32]> = HashMap::with_capacity(cand_ids.len());
-        for id in cand_ids {
-            match self.body_txid(Fk(id)) {
-                Ok(t) => {
-                    body_txids.insert(id, t);
+            });
+
+            let wave_ns = t_wave.elapsed().as_nanos() as u64;
+            // Attribute wave wall time to the dominant stage present (overlapping
+            // stages share the wave; probe-only / idx-only / body-only is common).
+            if any_body && !any_probe && !any_idx {
+                crate::head_resolve_stats::add_body(wave_ns);
+            } else if any_idx && !any_probe && !any_body {
+                crate::head_resolve_stats::add_idx(wave_ns);
+            } else if any_probe && !any_idx && !any_body {
+                crate::head_resolve_stats::add_probe(wave_ns);
+            } else {
+                // Mixed wave: split evenly across present stages for rough totals.
+                let parts = u64::from(any_probe) + u64::from(any_idx) + u64::from(any_body);
+                let share = if parts > 0 { wave_ns / parts } else { 0 };
+                if any_probe {
+                    crate::head_resolve_stats::add_probe(share);
                 }
-                Err(StoreError::NotFound) => {}
-                Err(e) => return Err(e),
+                if any_idx {
+                    crate::head_resolve_stats::add_idx(share);
+                }
+                if any_body {
+                    crate::head_resolve_stats::add_body(share);
+                }
             }
+
+            let mut next: Vec<Op> = Vec::with_capacity(scheduled.len());
+            // Apply completions in reverse so unit tests of order independence
+            // still pass if someone reorders; depth-max is order-invariant.
+            for op in scheduled.into_iter().rev() {
+                if let Some(e) = op.err {
+                    return Err(e);
+                }
+                let ki = op.key_i as usize;
+                match op.stage {
+                    Stage::Probe { depth } => {
+                        if op.entry == 0 {
+                            // Chain ends; no more probes for this key.
+                            continue;
+                        }
+                        cands_total = cands_total.saturating_add(1);
+                        let fk = op.entry;
+                        // Continue probe chain (depends on non-empty at d).
+                        if u32::from(depth) + 1 < crate::address_head::MAX_PROBE {
+                            next.push(Op {
+                                key_i: op.key_i,
+                                stage: Stage::Probe {
+                                    depth: depth.saturating_add(1),
+                                },
+                                entry: 0,
+                                range: (0, 0),
+                                prefix: [0u8; 33],
+                                prefix_n: 0,
+                                err: None,
+                            });
+                        }
+                        // Idx for this candidate (independent of later probes).
+                        next.push(Op {
+                            key_i: op.key_i,
+                            stage: Stage::Idx { depth, fk },
+                            entry: 0,
+                            range: (0, 0),
+                            prefix: [0u8; 33],
+                            prefix_n: 0,
+                            err: None,
+                        });
+                    }
+                    Stage::Idx { depth, fk } => {
+                        let (off, len) = op.range;
+                        next.push(Op {
+                            key_i: op.key_i,
+                            stage: Stage::Body {
+                                depth,
+                                fk,
+                                off,
+                                len,
+                            },
+                            entry: 0,
+                            range: (0, 0),
+                            prefix: [0u8; 33],
+                            prefix_n: 0,
+                            err: None,
+                        });
+                    }
+                    Stage::Body { depth, fk, .. } => {
+                        body_lookups = body_lookups.saturating_add(1);
+                        let want = &txids[ki];
+                        match Self::txid_from_body_prefix(&op.prefix[..op.prefix_n]) {
+                            Ok(got) if got == *want => {
+                                // Deepest probe depth wins (BIP30-shaped).
+                                match keys[ki].best {
+                                    Some((_, best_d)) if depth <= best_d => {}
+                                    _ => keys[ki].best = Some((fk, depth)),
+                                }
+                            }
+                            Ok(_) => {
+                                // Foreigner — ignore.
+                            }
+                            Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {
+                                // Missing/short body: skip candidate.
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+            }
+            scheduled = next;
         }
-        let mut out = Vec::with_capacity(pairs.len());
-        for (txid, cands) in pairs {
-            let mut hit = None;
-            // Reverse: prefer deepest body match (newest under append-deeper insert).
-            for fk in cands.into_iter().rev() {
-                let Some(id) = fk.get() else {
+
+        crate::head_resolve_stats::add_cands(cands_total);
+        crate::head_resolve_stats::add_body_lookups(body_lookups);
+
+        let mut out = Vec::with_capacity(txids.len());
+        for (i, txid) in txids.iter().enumerate() {
+            let hit = keys[i].best.map(|(id, _)| Fk(id));
+            out.push((*txid, hit));
+        }
+        Ok(out)
+    }
+
+    /// Bulk `body_range` for many fks (confirm load). Concurrent idx reads.
+    pub fn body_range_batch(
+        &self,
+        fks: &[Fk],
+    ) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
+        if fks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let count = self.body.count();
+        let body_logical = self.body.body_logical_len().max(crate::file::FILE_HEADER_LEN as u64);
+        struct Job {
+            fk: Fk,
+            out: Option<(u64, u64)>,
+            err: Option<StoreError>,
+        }
+        let mut jobs: Vec<Job> = fks
+            .iter()
+            .map(|fk| Job {
+                fk: *fk,
+                out: None,
+                err: None,
+            })
+            .collect();
+        crate::bulk_io::for_each_mut(&mut jobs, |job| {
+            let Some(id) = job.fk.get() else {
+                job.out = None;
+                return;
+            };
+            if id == 0 || id > count {
+                job.out = None;
+                return;
+            }
+            let mut off_buf = [0u8; 8];
+            let idx_off = crate::file::FILE_HEADER_LEN as u64 + (id - 1) * 8;
+            if let Err(e) = self.body.idx_read_at(idx_off, &mut off_buf) {
+                job.err = Some(e);
+                return;
+            }
+            let start = u64::from_le_bytes(off_buf);
+            let end = if id < count {
+                let idx_off2 = crate::file::FILE_HEADER_LEN as u64 + id * 8;
+                if let Err(e) = self.body.idx_read_at(idx_off2, &mut off_buf) {
+                    job.err = Some(e);
+                    return;
+                }
+                u64::from_le_bytes(off_buf)
+            } else {
+                body_logical
+            };
+            if end < start {
+                job.err = Some(StoreError::Corrupt("var record end < start"));
+                return;
+            }
+            job.out = Some((start, end - start));
+        });
+        let mut out = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            if let Some(e) = job.err {
+                return Err(e);
+            }
+            out.push(job.out);
+        }
+        Ok(out)
+    }
+
+    /// Bulk full packed decode from known ranges (confirm load create bodies).
+    ///
+    /// Concurrent body reads; decode on the same worker as the read.
+    pub fn get_full_batch_at(
+        &self,
+        ranges: &[(Fk, u64, u64)],
+    ) -> Result<Vec<Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)>>, StoreError> {
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        struct Job {
+            off: u64,
+            len: u64,
+            out: Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)>,
+            err: Option<StoreError>,
+        }
+        let mut jobs: Vec<Job> = ranges
+            .iter()
+            .map(|(_, off, len)| Job {
+                off: *off,
+                len: *len,
+                out: None,
+                err: None,
+            })
+            .collect();
+        crate::bulk_io::for_each_mut(&mut jobs, |job| {
+            match self.body.with_bytes_at(job.off, job.len, |raw| decode_packed_tx(raw)) {
+                Ok(v) => job.out = Some(v),
+                Err(e) => job.err = Some(e),
+            }
+        });
+        let mut out = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            if let Some(e) = job.err {
+                // Soft-fail individual corrupt bodies as None so load can skip.
+                if matches!(e, StoreError::Corrupt(_) | StoreError::NotFound) {
+                    out.push(None);
                     continue;
-                };
-                if body_txids.get(&id) == Some(&txid) {
-                    hit = Some(fk);
-                    break;
                 }
+                return Err(e);
             }
-            out.push((txid, hit));
+            out.push(job.out);
+        }
+        Ok(out)
+    }
+
+    /// Bulk meta+outputs from known ranges (confirm pin_new).
+    pub fn get_meta_and_outputs_batch_at(
+        &self,
+        ranges: &[(u64, u64)],
+    ) -> Result<Vec<Option<(TxRecord, Vec<OutputRecord>)>>, StoreError> {
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        struct Job {
+            off: u64,
+            len: u64,
+            out: Option<(TxRecord, Vec<OutputRecord>)>,
+            err: Option<StoreError>,
+        }
+        let mut jobs: Vec<Job> = ranges
+            .iter()
+            .map(|(off, len)| Job {
+                off: *off,
+                len: *len,
+                out: None,
+                err: None,
+            })
+            .collect();
+        crate::bulk_io::for_each_mut(&mut jobs, |job| {
+            match self
+                .body
+                .with_bytes_at(job.off, job.len, |raw| decode_packed_tx_outs_only(raw))
+            {
+                Ok(v) => job.out = Some(v),
+                Err(e) => job.err = Some(e),
+            }
+        });
+        let mut out = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            if let Some(e) = job.err {
+                if matches!(e, StoreError::Corrupt(_) | StoreError::NotFound) {
+                    out.push(None);
+                    continue;
+                }
+                return Err(e);
+            }
+            out.push(job.out);
         }
         Ok(out)
     }
@@ -2101,6 +2451,160 @@ mod tests {
         assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(fk));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::remove_var("RBITCOIN_HEAD_SCALE");
+    }
+
+    /// Bulk body_range + get_full_batch_at agree with sequential paths.
+    #[test]
+    fn bulk_body_range_and_full_match_sequential() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-bulk-body-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        let t = TxTable::create(&dir).unwrap();
+        let mut fks = Vec::new();
+        for i in 0u8..12 {
+            let mut txid = [0u8; 32];
+            txid[0] = i.wrapping_add(10);
+            let tx = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![i],
+                witness: vec![],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+            fks.push(
+                t.put_full_batch_indexed(&[(tx, inputs, outputs)], true)
+                    .unwrap()[0],
+            );
+        }
+        let batch_ranges = t.body_range_batch(&fks).unwrap();
+        for (fk, br) in fks.iter().zip(batch_ranges.iter()) {
+            let seq = t.body_range(*fk).unwrap();
+            assert_eq!(*br, Some(seq));
+        }
+        let range_args: Vec<(Fk, u64, u64)> = fks
+            .iter()
+            .zip(batch_ranges.iter())
+            .filter_map(|(fk, r)| r.map(|(o, l)| (*fk, o, l)))
+            .collect();
+        let bulk = t.get_full_batch_at(&range_args).unwrap();
+        for ((fk, off, len), got) in range_args.iter().zip(bulk.iter()) {
+            let seq = t.get_full_at(*off, *len).unwrap();
+            let b = got.as_ref().expect("bulk decode");
+            assert_eq!(b.0.txid, seq.0.txid);
+            assert_eq!(b.0.txid, t.body_txid(*fk).unwrap());
+        }
+        let meta_ranges: Vec<(u64, u64)> = range_args.iter().map(|(_, o, l)| (*o, *l)).collect();
+        let meta = t.get_meta_and_outputs_batch_at(&meta_ranges).unwrap();
+        for ((_, off, len), got) in range_args.iter().zip(meta.iter()) {
+            let seq = t.get_meta_and_outputs_at(*off, *len).unwrap();
+            let b = got.as_ref().expect("meta bulk");
+            assert_eq!(b.0, seq.0);
+            assert_eq!(b.1.len(), seq.1.len());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("RBITCOIN_HEAD_SCALE");
+    }
+
+    /// Depth-max match: foreigners + two same-txid creates; batch prefers deepest.
+    #[test]
+    fn get_fk_by_txid_batch_depth_wins_with_workers() {
+        std::env::set_var("RBITCOIN_BULK_IO_WORKERS", "4");
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-batch-depth-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        let t = TxTable::create(&dir).unwrap();
+        let txid = [0xab; 32];
+        let mk = |hint: u8| {
+            let rec = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![hint],
+                witness: vec![],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+            (rec, inputs, outputs)
+        };
+        let fk1 = t.put_full_batch_indexed(&[mk(1)], true).unwrap()[0];
+        let fk2 = t.put_full_batch_indexed(&[mk(2)], true).unwrap()[0];
+        // Also resolve a few unrelated keys in the same bulk call.
+        let mut extra = Vec::new();
+        for i in 0u8..10 {
+            let mut other = [0u8; 32];
+            other[0] = i.wrapping_add(1);
+            let rec = TxRecord {
+                txid: other,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0x01],
+                witness: vec![],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+            let fk = t
+                .put_full_batch_indexed(&[(rec, inputs, outputs)], true)
+                .unwrap()[0];
+            extra.push((other, fk));
+        }
+        let mut keys: Vec<[u8; 32]> = extra.iter().map(|(t, _)| *t).collect();
+        keys.push(txid);
+        keys.push([0xff; 32]); // miss
+        let batch = t.get_fk_by_txid_batch(&keys).unwrap();
+        let hit = batch.iter().find(|(t, _)| *t == txid).unwrap().1;
+        assert_eq!(hit, Some(fk2));
+        assert_ne!(hit, Some(fk1));
+        for (other, fk) in &extra {
+            let h = batch.iter().find(|(t, _)| t == other).unwrap().1;
+            assert_eq!(h, Some(*fk));
+        }
+        assert!(batch.iter().any(|(t, f)| *t == [0xff; 32] && f.is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("RBITCOIN_HEAD_SCALE");
+        std::env::remove_var("RBITCOIN_BULK_IO_WORKERS");
     }
 
     #[test]

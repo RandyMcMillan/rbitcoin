@@ -6,6 +6,7 @@
 
 mod address_head;
 mod array_table;
+mod bulk_io;
 mod chain;
 mod compact;
 mod epoch;
@@ -56,6 +57,7 @@ pub use sorted_run::{
     open_run, read_run_body, remove_run, verify_run_body, write_sorted_run, SortedRunPath,
 };
 pub use store::Store;
+pub use bulk_io::bulk_io_workers;
 pub use head_resolve_stats::Sample as HeadResolveSample;
 pub use tx_table::{
     encode_packed_tx, is_packed_tx_payload, scan_packed_meta_and_prevouts, InputRecord,

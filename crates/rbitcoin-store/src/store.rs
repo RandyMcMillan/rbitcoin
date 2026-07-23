@@ -622,6 +622,33 @@ impl Store {
         self.txs.get_fk_by_txid_batch(txids)
     }
 
+    /// Bulk Class A body ranges (confirm load). Concurrent idx reads.
+    pub fn tx_body_range_batch(
+        &self,
+        fks: &[Fk],
+    ) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
+        self.txs.body_range_batch(fks)
+    }
+
+    /// Bulk full packed decode from known ranges (confirm load).
+    pub fn get_tx_full_batch_at(
+        &self,
+        ranges: &[(Fk, u64, u64)],
+    ) -> Result<
+        Vec<Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)>>,
+        StoreError,
+    > {
+        self.txs.get_full_batch_at(ranges)
+    }
+
+    /// Bulk meta+outputs from known ranges (confirm pin_new).
+    pub fn get_tx_meta_and_outputs_batch_at(
+        &self,
+        ranges: &[(u64, u64)],
+    ) -> Result<Vec<Option<(TxRecord, Vec<OutputRecord>)>>, StoreError> {
+        self.txs.get_meta_and_outputs_batch_at(ranges)
+    }
+
     /// Spentness by create fk (no `tx.head`). Body must be mlocked / range-known.
     ///
     /// Sole spender: Class C strong on the spender fk. Multi-list is rare in IBD

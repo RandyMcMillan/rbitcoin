@@ -378,18 +378,19 @@ impl Query {
 
             let mut height_fks_resolved: Vec<(Fk, Option<(u64, u64)>)> =
                 Vec::with_capacity(fks_work.len());
-            for fk in fks_work.iter() {
-                if fk.get().is_none() {
-                    continue;
-                }
-                match self.store.tx_body_range(*fk) {
-                    Ok((off, len)) => {
-                        body_ranges.push((*fk, off, len));
-                        height_fks_resolved.push((*fk, Some((off, len))));
-                    }
-                    Err(_) => {
-                        height_fks_resolved.push((*fk, None));
-                    }
+            // Bulk idx range resolve (concurrent) — kernel can schedule many reads.
+            let range_fks: Vec<Fk> = fks_work
+                .iter()
+                .copied()
+                .filter(|fk| fk.get().is_some())
+                .collect();
+            let ranges = self.store.tx_body_range_batch(&range_fks)?;
+            for (fk, range_opt) in range_fks.iter().zip(ranges.into_iter()) {
+                if let Some((off, len)) = range_opt {
+                    body_ranges.push((*fk, off, len));
+                    height_fks_resolved.push((*fk, Some((off, len))));
+                } else {
+                    height_fks_resolved.push((*fk, None));
                 }
             }
             st.body_mlock_ns = st
@@ -398,7 +399,10 @@ impl Query {
 
             // ── Full body decode (skip store when cache already has the body) ─
             let t_dec = Instant::now();
-            for &(fk, range) in &height_fks_resolved {
+            // Partition: cache hits vs need store bulk full decode.
+            let mut need_full: Vec<(Fk, u64, u64)> = Vec::new();
+            let mut need_full_meta: Vec<(usize, Fk)> = Vec::new(); // index into height_fks_resolved
+            for (i, &(fk, range)) in height_fks_resolved.iter().enumerate() {
                 if self.confirm_cancelled() {
                     crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                     return Err(StoreError::Cancelled("confirm cancelled"));
@@ -413,28 +417,56 @@ impl Query {
                     st.creates_registered = st.creates_registered.saturating_add(1);
                     continue;
                 }
-                let (tx, inputs, outs) = if let Some((off, len)) = range {
-                    self.store.get_tx_full_at(off, len)?
+                if let Some((off, len)) = range {
+                    need_full_meta.push((i, fk));
+                    need_full.push((fk, off, len));
                 } else {
-                    self.store.get_tx_full(fk)?
-                };
-                st.body_tx_reads = st.body_tx_reads.saturating_add(1);
-                // v10: create_fk on inputs — soft prev_txid zero when fk stamped.
-                let prevouts: Vec<(Option<u64>, [u8; 32], u32)> = inputs
-                    .iter()
-                    .map(|i| {
-                        let soft = if i.create_fk.is_null() {
-                            i.prev_txid
-                        } else {
-                            [0u8; 32]
-                        };
-                        (i.create_fk.get(), soft, i.prev_index)
-                    })
-                    .collect();
-                batch_create_ids.insert(id);
-                body_prevouts.insert(id, (tx.txid, prevouts));
-                body_fulls.push((fk, height, tx, outs, inputs));
-                st.creates_registered = st.creates_registered.saturating_add(1);
+                    // Rare: no range — sequential fallback.
+                    let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
+                    st.body_tx_reads = st.body_tx_reads.saturating_add(1);
+                    let prevouts: Vec<(Option<u64>, [u8; 32], u32)> = inputs
+                        .iter()
+                        .map(|inp| {
+                            let soft = if inp.create_fk.is_null() {
+                                inp.prev_txid
+                            } else {
+                                [0u8; 32]
+                            };
+                            (inp.create_fk.get(), soft, inp.prev_index)
+                        })
+                        .collect();
+                    batch_create_ids.insert(id);
+                    body_prevouts.insert(id, (tx.txid, prevouts));
+                    body_fulls.push((fk, height, tx, outs, inputs));
+                    st.creates_registered = st.creates_registered.saturating_add(1);
+                }
+            }
+            if !need_full.is_empty() {
+                let decoded = self.store.get_tx_full_batch_at(&need_full)?;
+                for ((_, fk), got) in need_full_meta.iter().zip(decoded.into_iter()) {
+                    let Some(id) = fk.get() else {
+                        continue;
+                    };
+                    let Some((tx, inputs, outs)) = got else {
+                        continue;
+                    };
+                    st.body_tx_reads = st.body_tx_reads.saturating_add(1);
+                    let prevouts: Vec<(Option<u64>, [u8; 32], u32)> = inputs
+                        .iter()
+                        .map(|inp| {
+                            let soft = if inp.create_fk.is_null() {
+                                inp.prev_txid
+                            } else {
+                                [0u8; 32]
+                            };
+                            (inp.create_fk.get(), soft, inp.prev_index)
+                        })
+                        .collect();
+                    batch_create_ids.insert(id);
+                    body_prevouts.insert(id, (tx.txid, prevouts));
+                    body_fulls.push((*fk, height, tx, outs, inputs));
+                    st.creates_registered = st.creates_registered.saturating_add(1);
+                }
             }
             st.body_decode_ns = st
                 .body_decode_ns
@@ -707,8 +739,38 @@ impl Query {
         }
 
         // Sparse outs + spent filter for pin_new (pages warm when mlock on).
+        // Bulk concurrent meta+outputs body reads, then spent filter per parent.
         let t_new = Instant::now();
-        for (pid, max_h, need_hs, need_vouts, range) in pin_new_jobs {
+        if self.confirm_cancelled() {
+            crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
+            return Err(StoreError::Cancelled("confirm cancelled"));
+        }
+        // Jobs with known ranges and needed vouts → bulk body read.
+        let mut bulk_idx: Vec<usize> = Vec::new();
+        let mut bulk_ranges: Vec<(u64, u64)> = Vec::new();
+        for (i, (_pid, _max_h, _need_hs, need_vouts, range)) in pin_new_jobs.iter().enumerate() {
+            if let Some((off, len)) = range {
+                if !need_vouts.is_empty() {
+                    bulk_idx.push(i);
+                    bulk_ranges.push((*off, *len));
+                }
+            }
+        }
+        let bulk_decoded = if bulk_ranges.is_empty() {
+            Vec::new()
+        } else {
+            self.store
+                .get_tx_meta_and_outputs_batch_at(&bulk_ranges)?
+        };
+        let mut bulk_by_job: HashMap<usize, (rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>)> =
+            HashMap::with_capacity(bulk_idx.len());
+        for (ji, got) in bulk_idx.into_iter().zip(bulk_decoded.into_iter()) {
+            if let Some(v) = got {
+                bulk_by_job.insert(ji, v);
+            }
+        }
+
+        for (ji, (pid, max_h, need_hs, need_vouts, range)) in pin_new_jobs.into_iter().enumerate() {
             if self.confirm_cancelled() {
                 crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Cancelled("confirm cancelled"));
@@ -716,52 +778,48 @@ impl Query {
             let fk = Fk(pid);
             if let Some((off, len)) = range {
                 if !need_vouts.is_empty() {
-                    match self.store.get_tx_meta_and_outputs_at(off, len) {
-                        Ok((tx, outs)) => {
-                            let t_sp = Instant::now();
-                            let unspent = self
-                                .store
-                                .unspent_create_vouts(fk, &need_vouts, Some((off, len)))
-                                .unwrap_or_default();
-                            st.pin_spent_ns = st
-                                .pin_spent_ns
-                                .saturating_add(t_sp.elapsed().as_nanos() as u64);
-                            let unspent_set: std::collections::HashSet<u32> =
-                                unspent.into_iter().collect();
-                            let mut live = Vec::with_capacity(unspent_set.len());
-                            for &v in &need_vouts {
-                                if unspent_set.contains(&v) {
-                                    if let Some(o) = outs.get(v as usize) {
-                                        live.push((v, o.clone()));
-                                    }
+                    if let Some((tx, outs)) = bulk_by_job.remove(&ji) {
+                        let t_sp = Instant::now();
+                        let unspent = self
+                            .store
+                            .unspent_create_vouts(fk, &need_vouts, Some((off, len)))
+                            .unwrap_or_default();
+                        st.pin_spent_ns = st
+                            .pin_spent_ns
+                            .saturating_add(t_sp.elapsed().as_nanos() as u64);
+                        let unspent_set: std::collections::HashSet<u32> =
+                            unspent.into_iter().collect();
+                        let mut live = Vec::with_capacity(unspent_set.len());
+                        for &v in &need_vouts {
+                            if unspent_set.contains(&v) {
+                                if let Some(o) = outs.get(v as usize) {
+                                    live.push((v, o.clone()));
                                 }
                             }
-                            let cb_stash = match self.resolve_parent_coinbase_height(
-                                fk,
-                                tx.input_count,
-                                Some((off, len)),
-                            ) {
-                                Ok(v) => Some(v),
-                                Err(_) => None,
-                            };
-                            sparse_parents.push((
-                                max_h,
-                                fk,
-                                tx,
-                                live,
-                                need_vouts.clone(),
-                                cb_stash,
-                                None,
-                            ));
-                            for &h in &need_hs {
-                                touch_batch.push((h, pid, need_vouts.clone()));
-                            }
-                            st.full_tx_reads = st.full_tx_reads.saturating_add(1);
                         }
-                        Err(_) => {
-                            // Leave wave to store-decode; range still registered.
+                        let cb_stash = match self.resolve_parent_coinbase_height(
+                            fk,
+                            tx.input_count,
+                            Some((off, len)),
+                        ) {
+                            Ok(v) => Some(v),
+                            Err(_) => None,
+                        };
+                        sparse_parents.push((
+                            max_h,
+                            fk,
+                            tx,
+                            live,
+                            need_vouts.clone(),
+                            cb_stash,
+                            None,
+                        ));
+                        for &h in &need_hs {
+                            touch_batch.push((h, pid, need_vouts.clone()));
                         }
+                        st.full_tx_reads = st.full_tx_reads.saturating_add(1);
                     }
+                    // else: soft-fail leave wave to store-decode; range still registered.
                 }
             } else if !need_vouts.is_empty() {
                 // No range: try idx-based outs for sparse stash (rare).

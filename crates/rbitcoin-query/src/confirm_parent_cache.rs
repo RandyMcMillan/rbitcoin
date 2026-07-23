@@ -1829,12 +1829,19 @@ impl Inner {
 
     /// Full confirm package on runway (header + bodies + edges + external parents).
     ///
-    /// Content-based — `scanned` alone is never enough. Used by wait, ready_through,
-    /// and prewarm skip/rehydrate.
+    /// Requires **both** `plan.scanned` (prewarm finished this height's pin pass)
+    /// **and** content. Content alone is not enough: during a multi-height bite,
+    /// tip+1 can look complete mid-loop (e.g. coinbase / early puts) before the
+    /// bite's pin phase runs — confirm then claims and fails with
+    /// "header plan missing" / incomplete after wait. `mark_scanned` is only
+    /// set after the full height attempt (bodies + thin + pin).
     fn package_ready(&self, height: u32) -> bool {
         let Some(plan) = self.plans.get(&height) else {
             return false;
         };
+        if !plan.scanned {
+            return false;
+        }
         let Some(hdr) = self.headers.get(&height) else {
             return false;
         };
@@ -2070,6 +2077,44 @@ mod tests {
             "scanned without bodies must not unblock confirm"
         );
         assert_eq!(c.ready_through(), 10);
+    }
+
+    /// Mid-bite coinbase puts must not unblock confirm before mark_scanned (pin pass).
+    #[test]
+    fn unscanned_content_is_not_package_ready() {
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(10);
+        // Full coinbase package content without mark_scanned.
+        let hash = [9u8; 32];
+        c.ensure_plan(11, hash);
+        let mut t = tx(1);
+        t.txid = hash;
+        t.input_count = 1;
+        t.output_count = 1;
+        let inputs = vec![InputRecord {
+            prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
+            prev_index: u32::MAX,
+            sequence: 0xffff_ffff,
+            script_sig: vec![],
+            witness: vec![],
+        }];
+        c.put_header_plan(
+            11,
+            Fk(11),
+            header_rec(hash),
+            vec![Fk(1001)],
+            [0u8; 32],
+        );
+        c.put_body(Fk(1001), 11, t, vec![out(50)], inputs);
+        assert!(
+            !c.package_ready(11),
+            "content without scanned must not claim mid prewarm bite"
+        );
+        assert_eq!(c.ready_through(), 10);
+        c.mark_scanned(11);
+        assert!(c.package_ready(11));
+        assert_eq!(c.ready_through(), 11);
     }
 
     /// Body drained after mark: watermark must fall to the last complete package.

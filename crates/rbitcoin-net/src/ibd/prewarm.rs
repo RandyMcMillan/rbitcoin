@@ -26,12 +26,24 @@ pub(crate) fn prewarm_work_cursor(tip: u32, ready_through: u32) -> u32 {
     ready_through.max(tip).saturating_add(1)
 }
 
+/// Align with confirm script wave ([`super::confirm`] CONFIRM_RUN_MAX = 32).
+/// First prewarm bites target this so confirm can start without waiting on a
+/// 64/128-block pin pass.
+pub(crate) const PREWARM_CONFIRM_WAVE: u32 = 32;
+
 /// How many runway heights to take in one `prewarm_parents_for_heights` call.
+///
+/// When the contiguous ready lead is below one confirm wave, use a **wave-sized**
+/// bite (not full `batch` / 2×). Otherwise the first post-restart call pins 64–128
+/// heights for tens of seconds while confirm starves or races mid-construction.
 #[inline]
 pub(crate) fn prewarm_bite_size(ahead: u32, batch: u32, headroom: u32) -> usize {
-    if ahead == 0 {
-        batch as usize
-    } else if ahead < headroom.max(16) {
+    let batch = batch.max(1);
+    let wave = PREWARM_CONFIRM_WAVE;
+    if ahead < wave {
+        // Deliver tip+1‥tip+wave ASAP for the first confirm claim.
+        (batch as usize).min(wave as usize)
+    } else if ahead < headroom.max(wave) {
         (batch as usize).saturating_mul(2).min(256)
     } else {
         batch as usize
@@ -132,9 +144,8 @@ pub(crate) fn spawn_parent_prewarm(
                     std::thread::sleep(Duration::from_millis(20));
                     continue;
                 }
-                // Bite size: always a configured batch (or 2× when building lead).
-                // Never force bite=1 for tip+1 rehydrate — that serialized the
-                // whole runway after restart (prewarm+1…+2, confirm never starts).
+                // Bite size: wave-sized until we have a confirm wave of lead,
+                // then batch / 2× to build headroom (never 1-block force).
                 let ahead = through.saturating_sub(tip);
                 let bite = prewarm_bite_size(ahead, batch, headroom);
                 let end = (start + bite).min(runway.len());
@@ -246,11 +257,26 @@ mod tests {
     }
 
     #[test]
-    fn bite_never_collapses_to_one_for_empty_runway() {
-        // Empty lead uses full batch; was force_tip1 → 1 and confirmed 1-at-a-time.
-        assert_eq!(prewarm_bite_size(0, 64, 64), 64);
-        assert_eq!(prewarm_bite_size(8, 64, 64), 128); // building lead → 2×
+    fn bite_prioritizes_first_confirm_wave() {
+        // Empty / short lead → wave-sized (32), not 64 or 128 — first package
+        // delivered promptly for confirm claim.
+        assert_eq!(prewarm_bite_size(0, 64, 64), 32);
+        assert_eq!(prewarm_bite_size(16, 64, 64), 32);
+        assert_eq!(prewarm_bite_size(31, 64, 64), 32);
+        // Full wave ready → may 2× while building headroom.
+        assert_eq!(prewarm_bite_size(32, 64, 64), 128);
         assert_eq!(prewarm_bite_size(100, 64, 64), 64); // enough lead
         assert_eq!(prewarm_bite_size(0, 1, 64), 1); // env batch=1 only
+        assert_eq!(prewarm_bite_size(0, 16, 64), 16); // batch < wave
+    }
+
+    #[test]
+    fn ahead_after_one_confirm_is_not_a_package_hole() {
+        // ready_through fixed, tip +1 → ahead drops by 1 (e.g. +64 → +63).
+        // Not a failed bite; just tip advance arithmetic.
+        let tip = 100u32;
+        let through = 164u32;
+        assert_eq!(through.saturating_sub(tip), 64);
+        assert_eq!(through.saturating_sub(tip + 1), 63);
     }
 }

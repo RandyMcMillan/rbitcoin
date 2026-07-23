@@ -1025,6 +1025,8 @@ impl TxTable {
             entry: u64,
             range: (u64, u64),
             prefix_n: usize,
+            /// Soft-skip this candidate (stale/foreign fk, no hard error).
+            dead: bool,
             err: Option<StoreError>,
         }
 
@@ -1061,6 +1063,7 @@ impl TxTable {
                 entry: 0,
                 range: (0, 0),
                 prefix_n: 0,
+                dead: false,
                 err: None,
             })
             .collect();
@@ -1097,8 +1100,11 @@ impl TxTable {
                     Stage::Idx { fk, .. } => {
                         any_idx = true;
                         let id = fk;
+                        // Stale/garbage probe or race: skip candidate (do not fail batch).
+                        // Pre-uring path ignored body NotFound the same way.
                         if id == 0 || id > count {
-                            op.err = Some(StoreError::NotFound);
+                            op.dead = true;
+                            op.buf_len = 0;
                             continue;
                         }
                         let idx_off = crate::file::FILE_HEADER_LEN as u64 + (id - 1) * 8;
@@ -1106,7 +1112,8 @@ impl TxTable {
                         let nbytes: u8 = if id < count { 16 } else { 8 };
                         let need = u64::from(nbytes);
                         if idx_off.saturating_add(need) > self.body.idx_published_len() {
-                            op.err = Some(StoreError::Corrupt("idx past published"));
+                            op.dead = true;
+                            op.buf_len = 0;
                             continue;
                         }
                         op.fd = idx_fd;
@@ -1265,6 +1272,7 @@ impl TxTable {
                                 entry: 0,
                                 range: (0, 0),
                                 prefix_n: 0,
+                                dead: false,
                                 err: None,
                             });
                         }
@@ -1278,11 +1286,18 @@ impl TxTable {
                             entry: 0,
                             range: (0, 0),
                             prefix_n: 0,
+                            dead: false,
                             err: None,
                         });
                     }
                     Stage::Idx { depth, fk } => {
+                        if op.dead {
+                            continue;
+                        }
                         let (off, len) = op.range;
+                        if len == 0 {
+                            continue;
+                        }
                         next.push(Op {
                             key_i: op.key_i,
                             stage: Stage::Body {
@@ -1298,6 +1313,7 @@ impl TxTable {
                             entry: 0,
                             range: (0, 0),
                             prefix_n: 0,
+                            dead: false,
                             err: None,
                         });
                     }

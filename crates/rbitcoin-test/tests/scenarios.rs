@@ -1850,10 +1850,8 @@ fn three_stage_confirm_and_parent_mlock_surface() {
     let params = ChainParams::regtest();
     let maturity = params.coinbase_maturity();
 
-    // Empty wait / timeout / cancel paths on runway helpers.
+    // Timeout / cancel paths on load-ready wait (tests only; production is inline).
     q.wait_confirm_load_ready(&[], std::time::Duration::from_millis(1))
-        .unwrap();
-    q.wait_confirm_load_ready_with_headroom(&[], 0, Some(0), std::time::Duration::from_millis(1))
         .unwrap();
     let wait_err = q
         .wait_confirm_load_ready(&[9_999], std::time::Duration::from_millis(5))

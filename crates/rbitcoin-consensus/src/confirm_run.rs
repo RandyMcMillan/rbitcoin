@@ -152,15 +152,14 @@ pub fn confirm_load_phase(
         blocks.len(),
     );
 
-    // Inline batch load (no background load worker): decode bodies, pin parents,
-    // mlock only parent create body pages write will patch.
+    // Decode bodies, pin parents, mlock parent create body pages write will patch.
     let t_load = Instant::now();
     load_confirm_batch(query, &heights, &items, batch_end)?;
     let load_ns = t_load.elapsed().as_nanos() as u64;
     confirm_phase_stats::LOAD_NS.fetch_add(load_ns, Ordering::Relaxed);
 
     let t_resolve = Instant::now();
-    let metas = resolve_body_metas(query, blocks, false)?;
+    let metas = resolve_body_metas(query, blocks)?;
     confirm_phase_stats::RESOLVE_NS.fetch_add(
         t_resolve.elapsed().as_nanos() as u64,
         Ordering::Relaxed,
@@ -175,7 +174,6 @@ pub fn confirm_load_phase(
         metas,
         &wire_blocks,
         &wave_prevouts,
-        false,
     )?;
 
     let work_ns = t_work.elapsed().as_nanos() as u64;
@@ -436,48 +434,32 @@ mod write_idempotent_tests {
 
 // ─── phases ───────────────────────────────────────────────────────────────────
 
-/// Load Class A for the claimed batch into the confirm parent cache.
+/// Load Class A + pin/mlock write parents for the claimed batch.
 ///
-/// Always **inline** (no background load worker). If a legacy worker is still live
-/// (tests), wait on Condvar instead of double-loading.
+/// Inline only: decode bodies, thin edges, sparse parent pin, mlock parent
+/// create body pages. No background worker / Condvar wait.
 fn load_confirm_batch(
     query: &Query,
     heights: &[u32],
     items: &[(u32, [u8; 32])],
-    batch_end: u32,
+    _batch_end: u32,
 ) -> Result<(), ConsensusError> {
     if heights.is_empty() {
         return Ok(());
     }
-    query.seed_parent_runway(items);
-
-    if query.legacy_load_worker_live() {
-        // Legacy path: worker owns load — wait only.
-        query
-            .wait_confirm_load_ready_with_headroom(
-                heights,
-                batch_end,
-                None,
-                std::time::Duration::from_secs(600),
-            )
-            .map_err(ConsensusError::Store)?;
-    } else {
-        // Load owns load for this batch only.
-        query
-            .load_confirm_parents(items)
-            .map_err(ConsensusError::Store)?;
-    }
+    query
+        .load_confirm_parents(items)
+        .map_err(ConsensusError::Store)?;
     Ok(())
 }
 
 fn resolve_body_metas(
     query: &Query,
     blocks: &[(Height, [u8; 32])],
-    cache_only: bool,
 ) -> Result<Vec<BodyMeta>, ConsensusError> {
     let mut metas = Vec::with_capacity(blocks.len());
     for &(height, hash) in blocks {
-        // Prefer confirm runway cache (header + header_txs, no store page faults).
+        // Prefer load-stage header plan (no store page faults after load).
         if let Some(plan) = query.confirm_parent_cache().get_header_plan(height.0) {
             if plan.header_rec.hash == hash {
                 metas.push(BodyMeta {
@@ -490,11 +472,7 @@ fn resolve_body_metas(
                 continue;
             }
         }
-        if cache_only {
-            return Err(ConsensusError::Store(StoreError::Corrupt(
-                "confirm: load incomplete (header plan missing after wait)",
-            )));
-        }
+        // Store fallback (load miss / hash mismatch).
         let (header_fk, header_rec) = query
             .get_header_by_hash(&hash)
             .map_err(ConsensusError::Store)?
@@ -573,7 +551,6 @@ fn assemble_run(
     metas: Vec<BodyMeta>,
     wire_blocks: &[Block],
     wave_prevouts: &rbitcoin_query::WavePrevoutCache,
-    cache_only: bool,
 ) -> Result<Vec<Prepared>, ConsensusError> {
     // Provisional same-run double-spend only (not durable spentness).
     let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
@@ -588,7 +565,7 @@ fn assemble_run(
         let ctx = ValidationContext::at(params, height, milestone);
 
         if i == 0 {
-            // MTP + prev link: prefer runway header plans (no header.body fault).
+            // MTP + prev link: prefer load header plans (no header.body fault).
             if height.0 >= 1 {
                 let prev_h = Height(height.0 - 1);
                 let start = prev_h.0.saturating_sub(10);
@@ -614,10 +591,7 @@ fn assemble_run(
                     }
                     time_window = times;
                 } else {
-                    // Prior tip headers may not be on the confirm runway (only
-                    // tip+1..). Header rows are tiny fixed records — use store.
-                    // Class A body/parent cold paths remain cache-only above.
-                    let _ = cache_only;
+                    // Prior tip headers are not on the load runway — tiny store reads.
                     validate_header(query, params, height, &block.header)?;
                     for h in start..=prev_h.0 {
                         let (_fk, rec) = query

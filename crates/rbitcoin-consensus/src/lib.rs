@@ -141,7 +141,7 @@ pub mod confirm_phase_stats {
     pub static SPEND_ANNOTATE_SKIP: AtomicU64 = AtomicU64::new(0);
     /// Header + body-fk resolve for the batch.
     pub static RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
-    /// Last-mile runway + wait_ready/headroom on the confirm thread.
+    /// Confirm load wall (Class A + parent pin/mlock) on the load thread.
     pub static LOAD_NS: AtomicU64 = AtomicU64::new(0);
     /// Unpin spent outs from ConfirmParentCache after Class C.
     pub static UNPIN_NS: AtomicU64 = AtomicU64::new(0);

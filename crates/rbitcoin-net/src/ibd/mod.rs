@@ -399,10 +399,7 @@ pub async fn ibd_cancellable(
     // Fresh cancel state for this IBD session (may have been set on prior stop).
     hub.query.clear_confirm_cancel();
 
-    // Load owns Class A load for each claimed batch (no background
-    // load worker). Parent create body pages for write annotate are
-    // mlocked with refcounted need_heights; tip GC munlocks after write.
-    hub.query.set_legacy_load_worker_live(false);
+    // Load stage owns Class A + parent pin/mlock for each claimed batch.
     info!(
         "ibd: confirm pipeline load+scripts+write (Class A load inline; \
          mlock write parent body pages only)"

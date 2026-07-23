@@ -547,12 +547,9 @@ pub struct Query {
     sh_run: sh_builder::ShRunBuilder,
     /// Explicit [`IndexMode`] (Direct / Tip).
     index_mode_cell: std::sync::atomic::AtomicU8,
-    /// Cooperative cancel for in-flight confirm (load waits). Set on IBD
-    /// SIGINT teardown so the confirm OS thread aborts waits before process exit.
+    /// Cooperative cancel for in-flight confirm load. Set on IBD SIGINT
+    /// teardown so the confirm load thread aborts before process exit.
     confirm_cancel: std::sync::atomic::AtomicBool,
-    /// True while the IBD background parent-runway worker is running.
-    /// Confirm never last-miles when this is set (waits on ready notify only).
-    legacy_load_worker_live: std::sync::atomic::AtomicBool,
 }
 
 impl Query {
@@ -585,18 +582,17 @@ impl Query {
             // Open as Tip until IBD selects Direct.
             index_mode_cell: std::sync::atomic::AtomicU8::new(IndexMode::Tip as u8),
             confirm_cancel: std::sync::atomic::AtomicBool::new(false),
-            legacy_load_worker_live: std::sync::atomic::AtomicBool::new(false),
         };
         // Warm cache from durable head if present (resume with index on).
         // Full body scan is not done here; fresh genesis IBD fills cache as it archives.
         Ok(q)
     }
 
-    /// Request in-flight confirm to abort cooperative waits (IBD SIGINT).
+    /// Request in-flight confirm to abort cooperative load (IBD SIGINT).
     pub fn request_confirm_cancel(&self) {
         self.confirm_cancel
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        // Wake confirm threads blocked on runway ready.
+        // Wake any thread blocked on runway ready (tests / cancel path).
         self.confirm_parents.notify_ready_waiters();
     }
 
@@ -609,21 +605,6 @@ impl Query {
     /// True after [`Self::request_confirm_cancel`] until cleared.
     pub fn confirm_cancelled(&self) -> bool {
         self.confirm_cancel
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// IBD parent-runway worker is running (confirm must only wait, never last-mile).
-    pub fn set_legacy_load_worker_live(&self, live: bool) {
-        self.legacy_load_worker_live
-            .store(live, std::sync::atomic::Ordering::SeqCst);
-        if !live {
-            // Unblock waiters if worker exits while confirm is waiting.
-            self.confirm_parents.notify_ready_waiters();
-        }
-    }
-
-    pub fn legacy_load_worker_live(&self) -> bool {
-        self.legacy_load_worker_live
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 

@@ -29,14 +29,10 @@ impl Query {
 
     /// Wave fill from already-resolved per-block Class A fk lists (confirm hot path).
     ///
-    /// - Wave-body txs: **move** runway-cached bodies out of the runway (no clone);
-    ///   store decode only on cache miss **when load worker is not live**.
-    /// - Thin edges: batch-moved from runway stash (same type as wave) — no remap.
-    /// - External parents: **outs-only** decode; only needed vouts kept.
-    ///
-    /// When [`Self::legacy_load_worker_live`], this path is **cache-only**: any body
-    /// or parent miss returns `Corrupt("confirm: load incomplete …")` instead
-    /// of touching cold Class A / spend tables (no confirm-thread majflt).
+    /// - Wave-body txs: **move** load-stage bodies out of the runway (no clone);
+    ///   store decode only on cache miss (should be rare after load).
+    /// - Thin edges: batch-moved from load stash — no remap.
+    /// - External parents: prefer sparse pin from load; store outs-only fallback.
     pub fn wave_fill_for_tx_fk_lists(
         &self,
         per_block: &[&[Fk]],
@@ -558,8 +554,8 @@ impl Query {
     /// Like [`Self::reconstruct_archived_block_from_parts`] but reuses wave-fill
     /// body decodes (one Class A parse per wave-body tx for the whole confirm run).
     ///
-    /// `prev_hash`: when set (runway header plan), wire header needs no store IO.
-    /// When `legacy_load_worker_live`, misses fall back to Corrupt rather than store decode.
+    /// `prev_hash`: when set (load header plan), wire header needs no store IO.
+    /// Body misses fall back to store decode.
     pub fn reconstruct_archived_block_from_parts_wave(
         &self,
         rec: HeaderRecord,

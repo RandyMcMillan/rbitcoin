@@ -1,19 +1,23 @@
-//! Batch Class A load for confirm **load** stage (and optional legacy load worker).
+//! Confirm **load** stage: Class A decode + parent pin/mlock for one claimed batch.
 //!
 //! For each height in the batch (ascending):
-//! 1. **Cache**: header + `header_txs`, body ranges.
-//! 2. **Full Class A decode** into `by_body` (wave/wire reuse).
-//! 3. **Thin edges** (default create_fk-only) + **parent pin**.
+//! 1. **Cache** header + `header_txs` + body ranges.
+//! 2. **Full Class A decode** into `by_body` (wave/wire takes these; no re-decode).
+//! 3. **Thin edges** (create_fk-first) + **sparse parent pin** (spent-filtered outs).
 //! 4. **`mlock`** (default on; `RBITCOIN_CONFIRM_MLOCK=0` off): **only parent
-//!    create `tx.body` pages** write will patch (spender annotate). Refcounted
-//!    by needing batch heights; tip GC munlocks when heights leave the runway.
+//!    create `tx.body` pages** that write will annotate. Refcounted by needing
+//!    batch heights; tip GC after write munlocks when no active batch needs them.
 //!
-//! Env: `RBITCOIN_PARENT_LOAD_{DEPTH,BATCH,HEADROOM,MLOCK,PIN_NEAR,THIN_CREATE_FK_ONLY}`.
+//! No background worker: load is owned by the confirm load thread for the batch
+//! it claimed. Wave bodies are **moved** out of the runway at wave_fill; parent
+//! `by_fk` + body ranges stay until tip GC (write annotate + next-batch cache).
+//!
+//! Env: `RBITCOIN_CONFIRM_{RUNWAY_DEPTH,MLOCK,THIN_CREATE_FK_ONLY}` (and legacy
+//! `RBITCOIN_PARENT_PREWARM_*` aliases).
 
 use super::*;
 use crate::confirm_parent_cache::{
-    runway_headroom_from_env, confirm_mlock_from_env, runway_pin_near_from_env,
-    thin_create_fk_only_from_env, StashedThinInput,
+    confirm_mlock_from_env, thin_create_fk_only_from_env, StashedThinInput,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -193,7 +197,8 @@ impl Query {
         self.confirm_parents.all_ready(heights)
     }
 
-    /// Wait until every height is runway-ready (Condvar; no Class A load).
+    /// Wait until every height is load-ready (Condvar). Used by tests / cancel;
+    /// production load is inline ([`Self::load_confirm_parents`]), not wait-based.
     pub fn wait_confirm_load_ready(
         &self,
         heights: &[u32],
@@ -209,51 +214,18 @@ impl Query {
             Err(true) => Err(StoreError::Cancelled("confirm cancelled")),
             // Message must contain "load incomplete" so the confirm engine
             // re-queues the batch instead of treating a wait timeout as a
-            // permanent script reject (historical 600s live n=32 → reject tip).
+            // permanent reject.
             Err(false) => Err(StoreError::Corrupt(
                 "confirm: load incomplete (parent package not ready, timeout)",
             )),
         }
     }
 
-    /// Wait for batch ready, then optionally soft-wait headroom (never last-mile).
-    pub fn wait_confirm_load_ready_with_headroom(
-        &self,
-        heights: &[u32],
-        batch_end: u32,
-        headroom: Option<u32>,
-        timeout: std::time::Duration,
-    ) -> Result<(), QueryError> {
-        if heights.is_empty() {
-            return Ok(());
-        }
-        self.wait_confirm_load_ready(heights, timeout)?;
-        if self.confirm_cancelled() {
-            return Err(StoreError::Cancelled("confirm cancelled"));
-        }
-        let hr = headroom.unwrap_or_else(runway_headroom_from_env);
-        if hr == 0 || self.confirm_parents.headroom_ready(batch_end, hr) {
-            return Ok(());
-        }
-        // Soft headroom only — tip must not freeze for runway lead.
-        // Brief sleeps; mark_scanned notifies will still advance ready_through.
-        let soft = std::time::Duration::from_millis(50);
-        let start = std::time::Instant::now();
-        while start.elapsed() < soft {
-            if self.confirm_cancelled() {
-                return Err(StoreError::Cancelled("confirm cancelled"));
-            }
-            if self.confirm_parents.headroom_ready(batch_end, hr) {
-                return Ok(());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        Ok(())
-    }
-
     /// Load Class A for heights into the confirm parent cache (load stage / tests).
     ///
-    /// Full-decode bodies + parent pin; mlock **parent create body pages only**.
+    /// Full-decode bodies + parent pin; mlock **parent create body pages only**
+    /// (write spender annotate). Pins every parent needed by heights in `items`
+    /// (no tip-near pin window — batch is the unit of work).
     pub fn load_confirm_parents(
         &self,
         items: &[(u32, [u8; 32])],
@@ -463,14 +435,8 @@ impl Query {
             .saturating_add(t_put.elapsed().as_nanos() as u64);
 
         // ── Thin edges (create_fk-first; optional soft/head legacy) ─────────
+        // Always pin parents for every height in this batch (claimed unit of work).
         let thin_fk_only = thin_create_fk_only_from_env();
-        let pin_near = runway_pin_near_from_env();
-        // 0 = pin all runway heights; else only tip+1‥tip+pin_near.
-        let pin_hi = if pin_near == 0 {
-            u32::MAX
-        } else {
-            tip.saturating_add(pin_near)
-        };
         let t_thin = Instant::now();
 
         let mut local_fk: HashMap<[u8; 32], Option<Fk>> =
@@ -587,7 +553,6 @@ impl Query {
         // ── thin: edge walk ────────────────────────────────────────────────
         let t_edge = Instant::now();
         for (height, tx_fks) in &height_tx_fks {
-            let pin_this_height = *height <= pin_hi;
             for fk in tx_fks {
                 let Some(id) = fk.get() else {
                     continue;
@@ -612,24 +577,15 @@ impl Query {
                             prev_index,
                         });
                         st.utxo_parents = st.utxo_parents.saturating_add(1);
-                        // Same-batch create (even cross-height) still needs a
-                        // spent-filtered by_fk pin: package_ready / cache-only
-                        // wave skip bare by_body. Pin from runway body (no
-                        // store re-decode) in the pin phase below.
+                        // Pin every parent (same-batch or external): wave uses
+                        // sparse by_fk; write mlocks create bodies to annotate.
+                        parent_need.entry(pid).or_default().push(*height);
+                        parent_vouts.entry(pid).or_default().push(prev_index);
                         if batch_create_ids.contains(&pid) {
                             st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                             st.edge_same_batch = st.edge_same_batch.saturating_add(1);
-                            if pin_this_height {
-                                parent_need.entry(pid).or_default().push(*height);
-                                parent_vouts.entry(pid).or_default().push(prev_index);
-                            }
-                        } else if pin_this_height {
-                            parent_need.entry(pid).or_default().push(*height);
-                            parent_vouts.entry(pid).or_default().push(prev_index);
-                            st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
-                            st.edge_runway = st.edge_runway.saturating_add(1);
                         } else {
-                            // Far runway: edge identity only; wave loads parent if needed.
+                            st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                             st.edge_runway = st.edge_runway.saturating_add(1);
                         }
                         continue;
@@ -671,10 +627,8 @@ impl Query {
                                 st.edge_runway = st.edge_runway.saturating_add(1);
                             }
                             if let Some(pid) = cfk.get() {
-                                if pin_this_height {
-                                    parent_need.entry(pid).or_default().push(*height);
-                                    parent_vouts.entry(pid).or_default().push(prev_index);
-                                }
+                                parent_need.entry(pid).or_default().push(*height);
+                                parent_vouts.entry(pid).or_default().push(prev_index);
                             }
                         }
                         Some(None) | None => {
@@ -695,8 +649,8 @@ impl Query {
         st.thin_ns = st.thin_ns.saturating_add(t_thin.elapsed().as_nanos() as u64);
 
         // ── Pin parents (sparse outs) + mlock parent create body pages only ─
-        // Writeback annotates spenders into create outputs; keep those body
-        // pages resident until tip GC (need_heights refcount → 0).
+        // Write annotates spenders into create outputs; keep those body pages
+        // resident until tip GC (need_heights refcount → 0).
         let do_mlock = confirm_mlock_from_env();
         let t_par = Instant::now();
         let mut uniq_parents: Vec<u64> = parent_need.keys().copied().collect();

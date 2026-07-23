@@ -46,8 +46,7 @@ Default: **info**. CLI wins over env.
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
 | Confirm runway depth | **256** | `RBITCOIN_CONFIRM_RUNWAY_DEPTH` (cache horizon / tip GC) |
 | Parent body mlock (write annotate) | **on** | `RBITCOIN_CONFIRM_MLOCK=0` to disable |
-| Parent pin_near | **0** (full batch) | `RBITCOIN_CONFIRM_PIN_NEAR=K` tip+1‥tip+K only |
-| Confirm stages | **load · scripts · write** | Class A load inline in load stage; mlock parent create bodies for write annotate |
+| Confirm stages | **load · scripts · write** | Load pins + mlocks all parent create bodies needed by the claimed batch |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 | Inhibit auto-suspend | **off** | `--inhibit-suspend` (uses `systemd-inhibit` if available) |
 

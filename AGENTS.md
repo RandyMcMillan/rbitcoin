@@ -47,3 +47,15 @@ The workspace is mounted into the agent VM as **9p** (`workspace` on `/home/agen
 
 Do not leave dead code around. Delete it. Don't silence warnings unless there
 is bulletproof justification
+
+## Do test-driven development when practical
+
+Always for bugs, make sure to create a test the replicates the bug, run it to
+see it fail, then fix the bug and run the test to see it pass.
+
+For features, ideally we'd write a scenario test that fails without the
+required feature before beginning and then implement the feature and see the
+test pass.
+
+For performance, ideally we'd have a benchmark before we begin development
+that shows a clear change after.

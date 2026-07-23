@@ -137,6 +137,12 @@ pub(crate) struct IbdPerfSample {
     pub load_pin_already_cached: u64,
     pub load_pin_cache_body: u64,
     pub load_pin_new: u64,
+    pub load_pin_cover_miss_no_fk: u64,
+    pub load_pin_cover_miss_partial: u64,
+    /// Spent-filter wall on pin path (ms).
+    pub load_pin_spent_ms: u64,
+    /// Mlock wall on pin path (ms).
+    pub load_pin_mlock_ms: u64,
 
     /// Phase-1 body Class A reads this window.
     pub load_body_tx_reads: u64,
@@ -293,6 +299,10 @@ impl Default for IbdPerfSample {
             load_pin_already_cached: 0,
             load_pin_cache_body: 0,
             load_pin_new: 0,
+            load_pin_cover_miss_no_fk: 0,
+            load_pin_cover_miss_partial: 0,
+            load_pin_spent_ms: 0,
+            load_pin_mlock_ms: 0,
 
             load_body_tx_reads: 0,
             load_parent_tx_reads: 0,
@@ -504,6 +514,10 @@ pub(crate) fn sample(
         load_pin_already_cached: pw.pin_already_cached,
         load_pin_cache_body: pw.pin_cache_body,
         load_pin_new: pw.pin_new,
+        load_pin_cover_miss_no_fk: pw.pin_cover_miss_no_fk,
+        load_pin_cover_miss_partial: pw.pin_cover_miss_partial,
+        load_pin_spent_ms: ns_ms(pw.pin_spent_ns),
+        load_pin_mlock_ms: ns_ms(pw.pin_mlock_ns),
 
         load_body_tx_reads: pw.body_tx,
         load_parent_tx_reads: pw.parent_tx,
@@ -623,7 +637,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.conf_write_q_cap,
     );
     out.push_str(&format!(
-        " | {conf_q} | parents thru={} by_fk={} bodies={} plans={} blks={} body_io={} parent_io={} pin_cached={} pin_cache={} pin_new={} pin_hit%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
+        " | {conf_q} | parents thru={} by_fk={} bodies={} plans={} blks={} body_io={} parent_io={} pin_cached={} pin_cache={} pin_new={} pin_hit%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) spent={}ms mlock_pin={}ms miss_nf={} miss_part={} head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
         s.load_ready_through,
         s.cache_parents,
         s.cache_bodies,
@@ -646,6 +660,10 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.load_thin_edge_ms,
         s.load_parent_pin_ms,
         s.load_cache_put_ms,
+        s.load_pin_spent_ms,
+        s.load_pin_mlock_ms,
+        s.load_pin_cover_miss_no_fk,
+        s.load_pin_cover_miss_partial,
         s.load_head_hits,
         s.load_head_lookups,
         s.load_mlock_sys,
@@ -721,7 +739,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.conf_write_q_cap,
     );
     out.push_str(&format!(
-        " | {conf_q} | parents thru={} by_fk={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cached={} pin_cache={} pin_new={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} head={}/{} mlock_sys={}/{} edges same={} cache={} fk={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
+        " | {conf_q} | parents thru={} by_fk={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cached={} pin_cache={} pin_new={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} spent={}ms mlock_pin={}ms miss_nf={} miss_part={} head={}/{} mlock_sys={}/{} edges same={} cache={} fk={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
         s.load_ready_through,
         s.cache_parents,
         s.cache_bodies,
@@ -748,6 +766,10 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.load_thin_edge_ms,
         s.load_parent_pin_ms,
         s.load_cache_put_ms,
+        s.load_pin_spent_ms,
+        s.load_pin_mlock_ms,
+        s.load_pin_cover_miss_no_fk,
+        s.load_pin_cover_miss_partial,
         s.load_head_hits,
         s.load_head_lookups,
         s.load_mlock_sys,

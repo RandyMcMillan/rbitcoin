@@ -30,10 +30,18 @@ pub struct ConfirmLoadStats {
     pub parent_unique: u32,
     /// Of `parent_unique`: outs already stashed in by_fk — re-pin touch only.
     pub pin_already_cached: u32,
-    /// Of `parent_unique`: filled from cache `by_body` (no store decode).
+    /// Of `parent_unique`: filled from cache `by_body` (no Class A re-decode).
     pub pin_cache_body: u32,
     /// Of `parent_unique`: first-time sparse pin (store decode).
     pub pin_new: u32,
+    /// Cover miss: no by_fk row (among uncovered parents).
+    pub pin_cover_miss_no_fk: u32,
+    /// Cover miss: by_fk present but checked incomplete for need vouts.
+    pub pin_cover_miss_partial: u32,
+    /// Wall ns in `unspent_create_vouts` during pin (store spent-filter).
+    pub pin_spent_ns: u64,
+    /// Wall ns in pin-loop mlock helpers.
+    pub pin_mlock_ns: u64,
     /// Same-batch create edges (identity known in-batch). Not pin body hit rate.
     pub parent_cache_hits: u32,
     /// Stamped create_fk on input, parent **not** in this batch (external fk).
@@ -498,7 +506,10 @@ impl Query {
             .iter()
             .map(|(pid, _, _, vouts)| (*pid, vouts.clone()))
             .collect();
-        let covered = self.confirm_parents.parent_pins_covered(&cover_keys);
+        let (covered, miss_no_fk, miss_partial) =
+            self.confirm_parents.parent_pins_covered_detail(&cover_keys);
+        st.pin_cover_miss_no_fk = miss_no_fk;
+        st.pin_cover_miss_partial = miss_partial;
         let mut touch_batch: Vec<(u32, u64, Vec<u32>)> = Vec::new();
         let mut parent_ranges: Vec<(Fk, u64, u64)> = Vec::new();
         // Per-parent mlock (not batch-coalesced): each call notes page_refs so the
@@ -525,6 +536,7 @@ impl Query {
                 }
                 let fk = Fk(pid);
                 if do_mlock {
+                    let t_ml = Instant::now();
                     if let Some((off, len)) = self
                         .confirm_parents
                         .get_body_range(fk)
@@ -541,6 +553,9 @@ impl Query {
                             self.mlock_note_skip_pinned(*h, &body_ml);
                         }
                     }
+                    st.pin_mlock_ns = st
+                        .pin_mlock_ns
+                        .saturating_add(t_ml.elapsed().as_nanos() as u64);
                 }
                 st.utxo_parents = st.utxo_parents.saturating_add(1);
             } else {
@@ -570,12 +585,29 @@ impl Query {
                     if let Some((off, len)) = *range {
                         parent_ranges.push((fk, off, len));
                     }
-                    let unspent = self
-                        .store
-                        .unspent_create_vouts(fk, &need_vouts, *range)
-                        .unwrap_or_else(|_| need_vouts.clone());
-                    let unspent_set: std::collections::HashSet<u32> =
-                        unspent.into_iter().collect();
+                    // Only spent-filter vouts not already in by_fk.checked.
+                    let already = self.confirm_parents.parent_checked_vouts(fk, &need_vouts);
+                    let already_set: HashSet<u32> = already.iter().copied().collect();
+                    let need_filter: Vec<u32> = need_vouts
+                        .iter()
+                        .copied()
+                        .filter(|v| !already_set.contains(v))
+                        .collect();
+                    let t_sp = Instant::now();
+                    let mut unspent_set: HashSet<u32> = already_set;
+                    if !need_filter.is_empty() {
+                        if let Ok(u) =
+                            self.store
+                                .unspent_create_vouts(fk, &need_filter, *range)
+                        {
+                            unspent_set.extend(u);
+                        } else {
+                            unspent_set.extend(need_filter.iter().copied());
+                        }
+                    }
+                    st.pin_spent_ns = st
+                        .pin_spent_ns
+                        .saturating_add(t_sp.elapsed().as_nanos() as u64);
                     let mut live = Vec::with_capacity(unspent_set.len());
                     for (v, o) in outs {
                         if unspent_set.contains(v) {
@@ -623,19 +655,27 @@ impl Query {
             if let Some((off, len)) = range {
                 parent_ranges.push((fk, off, len));
                 if do_mlock {
+                    let t_ml = Instant::now();
                     let (_, sys, sk) =
                         self.mlock_body_spans_for_heights(&need_hs, &[(off, len)]);
                     st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
                     st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
+                    st.pin_mlock_ns = st
+                        .pin_mlock_ns
+                        .saturating_add(t_ml.elapsed().as_nanos() as u64);
                 }
                 // Sparse outs + spent filter + coinbase height for wave.
                 if !need_vouts.is_empty() {
                     match self.store.get_tx_meta_and_outputs_at(off, len) {
                         Ok((tx, outs)) => {
+                            let t_sp = Instant::now();
                             let unspent = self
                                 .store
                                 .unspent_create_vouts(fk, &need_vouts, Some((off, len)))
                                 .unwrap_or_default();
+                            st.pin_spent_ns = st
+                                .pin_spent_ns
+                                .saturating_add(t_sp.elapsed().as_nanos() as u64);
                             let unspent_set: std::collections::HashSet<u32> =
                                 unspent.into_iter().collect();
                             let mut live = Vec::with_capacity(unspent_set.len());
@@ -676,19 +716,27 @@ impl Query {
                 }
             } else {
                 if do_mlock {
+                    let t_ml = Instant::now();
                     let body_ml = self.store.mlock_tx_body_only(fk);
                     st.mlock_syscalls = st.mlock_syscalls.saturating_add(1);
                     for h in &need_hs {
                         self.mlock_note_skip_pinned(*h, &body_ml);
                     }
+                    st.pin_mlock_ns = st
+                        .pin_mlock_ns
+                        .saturating_add(t_ml.elapsed().as_nanos() as u64);
                 }
                 // No range: try idx-based outs for sparse stash (rare).
                 if !need_vouts.is_empty() {
                     if let Ok((tx, outs)) = self.store.get_tx_meta_and_outputs(fk) {
+                        let t_sp = Instant::now();
                         let unspent = self
                             .store
                             .unspent_create_vouts(fk, &need_vouts, None)
                             .unwrap_or_default();
+                        st.pin_spent_ns = st
+                            .pin_spent_ns
+                            .saturating_add(t_sp.elapsed().as_nanos() as u64);
                         let unspent_set: std::collections::HashSet<u32> =
                             unspent.into_iter().collect();
                         let mut live = Vec::with_capacity(unspent_set.len());

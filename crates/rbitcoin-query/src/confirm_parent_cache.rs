@@ -92,6 +92,9 @@ pub struct ParentEntry {
     pub coinbase_height: Option<Option<u32>>,
     /// Height of the parent cache body that registered this create (`None` = UTXO load).
     pub create_height: Option<u32>,
+    /// Max confirm height that still needs this pin. Survives tip GC while
+    /// `keep_until > tip` even if plan.need_fk was dropped (load pipeline lag).
+    pub keep_until: u32,
 }
 
 /// Thin create-fk edge (identical to wave [`crate::wave_prevout::ThinInput`]).
@@ -1216,9 +1219,11 @@ impl ConfirmParentCache {
                 checked: HashSet::new(),
                 coinbase_height: None,
                 create_height: Some(create_height),
+                keep_until: create_height,
             });
             e.tx = tx.clone();
             e.create_height = Some(create_height);
+            e.keep_until = e.keep_until.max(create_height);
             for (v, o) in outputs.iter().enumerate() {
                 let v = v as u32;
                 e.outs.insert(
@@ -1302,6 +1307,60 @@ impl ConfirmParentCache {
             .collect()
     }
 
+    /// Cover check with miss classification for diagnostics.
+    ///
+    /// Returns `(covered[], miss_no_fk, miss_partial)` where misses are counts
+    /// among **uncovered** items only.
+    pub fn parent_pins_covered_detail(
+        &self,
+        items: &[(u64, Vec<u32>)],
+    ) -> (Vec<bool>, u32, u32) {
+        if items.is_empty() {
+            return (Vec::new(), 0, 0);
+        }
+        let g = self.inner.lock().unwrap();
+        let mut miss_no_fk = 0u32;
+        let mut miss_partial = 0u32;
+        let covered: Vec<bool> = items
+            .iter()
+            .map(|(id, vouts)| {
+                if vouts.is_empty() {
+                    return true;
+                }
+                match g.by_fk.get(id) {
+                    None => {
+                        miss_no_fk = miss_no_fk.saturating_add(1);
+                        false
+                    }
+                    Some(e) => {
+                        if !e.checked.is_empty() && vouts.iter().all(|v| e.checked.contains(v)) {
+                            true
+                        } else {
+                            miss_partial = miss_partial.saturating_add(1);
+                            false
+                        }
+                    }
+                }
+            })
+            .collect();
+        (covered, miss_no_fk, miss_partial)
+    }
+
+    /// Vouts already spent-filtered on `by_fk` (subset of `need` that can skip store).
+    pub fn parent_checked_vouts(&self, fk: Fk, need: &[u32]) -> Vec<u32> {
+        let Some(id) = fk.get() else {
+            return Vec::new();
+        };
+        let g = self.inner.lock().unwrap();
+        let Some(e) = g.by_fk.get(&id) else {
+            return Vec::new();
+        };
+        need.iter()
+            .copied()
+            .filter(|v| e.checked.contains(v))
+            .collect()
+    }
+
     /// Keep-alive already-stashed parents for sliding-window re-pin skip:
     /// attach `need_fk` at `height` so tip GC does not drop them before confirm.
     pub fn touch_parent_needs(&self, height: u32, fk: Fk, vouts: &[u32]) {
@@ -1353,9 +1412,6 @@ impl ConfirmParentCache {
                 return true;
             }
         }
-        // Runway full body can supply pin without store — treat as covered for
-        // skip-path accounting; caller still uses get_body_for_pin when not
-        // by_fk-stashed (see parent pin_cache_body).
         false
     }
 
@@ -1712,9 +1768,11 @@ impl Inner {
                     checked: HashSet::new(),
                     coinbase_height: None,
                     create_height: Some(height),
+                    keep_until: height,
                 });
                 e.tx = tx.clone();
                 e.create_height = Some(height);
+                e.keep_until = e.keep_until.max(height);
                 e.outs.insert(
                     v,
                     ParentOut {
@@ -1754,7 +1812,8 @@ impl Inner {
     /// Attach plan keep-alive for an already-stashed parent (no re-decode).
     fn touch_parent_needs_inner(&mut self, height: u32, id: u64, vouts: &[u32]) {
         // Collect under by_fk/by_body first — cannot hold plan mut borrow too.
-        let pins: Vec<u32> = if let Some(e) = self.by_fk.get(&id) {
+        let pins: Vec<u32> = if let Some(e) = self.by_fk.get_mut(&id) {
+            e.keep_until = e.keep_until.max(height);
             let mut vs: Vec<u32> = vouts
                 .iter()
                 .copied()
@@ -1796,8 +1855,10 @@ impl Inner {
                 checked: HashSet::new(),
                 coinbase_height: None,
                 create_height: None,
+                keep_until: height,
             });
             e.tx = tx;
+            e.keep_until = e.keep_until.max(height);
             if coinbase_height.is_some() {
                 e.coinbase_height = coinbase_height;
             }
@@ -1995,7 +2056,11 @@ impl Inner {
             if live.contains(&id) {
                 continue;
             }
-            // Keep by_fk until tip passes create height (in-flight pin keep-alive).
+            // Load pipeline lag: keep until last needing height confirms.
+            if e.keep_until > tip {
+                continue;
+            }
+            // Keep by_fk until tip passes create height (runway creates).
             if let Some(ch) = e.create_height {
                 if ch > tip {
                     continue;
@@ -2916,6 +2981,40 @@ mod tests {
         );
         // Runway still present.
         assert!(c.has_body(Fk(1000)));
+    }
+
+    /// keep_until must retain by_fk after tip advances past create_height until
+    /// the last needing confirm height is confirmed (load pipeline lag).
+    #[test]
+    fn pin_keep_until_survives_tip_gc_until_spender_confirms() {
+        let c = ConfirmParentCache::new();
+        c.advance_tip(10);
+        // Parent create at height 5 (already confirmed), pinned for spender at 100.
+        let t = tx(9);
+        c.put_parent_outs_resolved(
+            100,
+            Fk(99),
+            t.clone(),
+            &[(0, out(1))],
+            &[0],
+            Some(None),
+        );
+        // create_height None — only keep_until=100 keeps the row.
+        assert!(c.parent_pin_covered(Fk(99), &[0]));
+        c.advance_tip(50); // past create, but spender 100 still ahead
+        assert!(
+            c.parent_pin_covered(Fk(99), &[0]),
+            "by_fk must survive tip GC while keep_until > tip"
+        );
+        // Touch later batch needing height 120.
+        c.touch_parent_needs(120, Fk(99), &[0]);
+        c.advance_tip(100);
+        assert!(c.parent_pin_covered(Fk(99), &[0]), "keep_until extended to 120");
+        c.advance_tip(120);
+        assert!(
+            !c.parent_pin_covered(Fk(99), &[0]),
+            "drop after tip passes keep_until"
+        );
     }
 
     /// Slim batch pin: only requested outs, one lock, coinbase hint; no full input clone.

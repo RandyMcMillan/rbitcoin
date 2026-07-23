@@ -2427,8 +2427,8 @@ mod tests {
         let t = tx(11);
         c.put_body(Fk(11), 1, t.clone(), vec![out(1)], vec![]);
         assert_eq!(c.get_by_txid(&t.txid), Some(Fk(11)));
-        // Tip past create; body GC'd but sticky retains identity.
-        c.advance_tip(40);
+        // Tip past create + hold window; body GC'd but sticky retains identity.
+        c.advance_tip(1 + ConfirmParentCache::MLOCK_HOLD_BEHIND_TIP);
         assert!(!c.has_body(Fk(11)));
         assert_eq!(c.get_by_txid(&t.txid), Some(Fk(11)));
     }
@@ -2479,8 +2479,10 @@ mod tests {
         assert_eq!(edges.len(), 2);
         assert_eq!(edges[1].create_fk, Some(99));
         assert_eq!(edges[1].prev_index, 1);
-        // Dropped with body when tip advances past create height.
+        // Held through tip=create for writeback pipeline; gone past hold window.
         c.advance_tip(1);
+        assert!(c.get_thin_inputs(Fk(10)).is_some());
+        c.advance_tip(1 + ConfirmParentCache::MLOCK_HOLD_BEHIND_TIP);
         assert!(c.get_thin_inputs(Fk(10)).is_none());
     }
 
@@ -2748,9 +2750,11 @@ mod tests {
         assert_eq!(c.by_txid_count(), 0);
         assert!(c.sticky_confirmed_count() >= 32);
         assert_eq!(c.get_by_txid(&tx(10).txid), Some(Fk(10)));
-        c.advance_tip(45);
+        // Past hold window relative to height 10/30.
+        c.advance_tip(30 + ConfirmParentCache::MLOCK_HOLD_BEHIND_TIP);
         // Bodies GC'd; sticky still serves identity.
         assert!(!c.has_body(Fk(10)));
+        assert!(!c.has_body(Fk(30)));
         assert_eq!(c.get_by_txid(&tx(10).txid), Some(Fk(10)));
         assert_eq!(c.get_by_txid(&tx(30).txid), Some(Fk(30)));
     }

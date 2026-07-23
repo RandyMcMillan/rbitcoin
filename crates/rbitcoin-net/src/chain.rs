@@ -8,7 +8,8 @@ use bitcoin::{Block, BlockHash, Work};
 use std::sync::RwLock;
 use rbitcoin_consensus::{
     accept_and_archive_block, accept_and_connect_block, confirm_archived_run,
-    confirm_script_phase, confirm_writeback_phase, genesis_block, header_to_record,
+    confirm_materialize_phase, confirm_script_phase, confirm_scripts_phase,
+    confirm_writeback_phase, genesis_block, header_to_record,
     ChainParams, Milestone, ScriptOkBatch,
 };
 use rbitcoin_log::info;
@@ -228,7 +229,34 @@ impl ChainHub {
         Ok((need, need_meta))
     }
 
-    /// SCRIPT stage only (optimistic). Hand result to [`Self::confirm_writeback`].
+    /// MATERIALIZE stage: prewarm wait → resolve → wave → wire → assemble.
+    /// Hand result to [`Self::confirm_scripts`].
+    pub fn confirm_materialize_phase(
+        &self,
+        blocks: &[(u32, BlockHash)],
+    ) -> Result<Option<rbitcoin_consensus::ConfirmMaterializeOutcome>, NetError> {
+        if blocks.is_empty() {
+            return Ok(None);
+        }
+        let (need, _) = self.prepare_confirm_need(blocks)?;
+        if need.is_empty() {
+            return Ok(None);
+        }
+        let ok = confirm_materialize_phase(&self.query, &self.params, self.milestone, &need)
+            .map_err(|e| NetError::Consensus(e.to_string()))?;
+        Ok(Some(ok))
+    }
+
+    /// SCRIPT stage only: verify jobs on a materialized batch.
+    pub fn confirm_scripts(
+        &self,
+        batch: rbitcoin_consensus::MaterializedBatch,
+    ) -> Result<rbitcoin_consensus::ConfirmScriptOutcome, NetError> {
+        confirm_scripts_phase(&self.query, batch)
+            .map_err(|e| NetError::Consensus(e.to_string()))
+    }
+
+    /// MATERIALIZE + SCRIPTS (compat). Prefer split stages in IBD.
     pub fn confirm_script_phase(
         &self,
         blocks: &[(u32, BlockHash)],

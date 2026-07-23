@@ -273,7 +273,7 @@ pub async fn ibd_cancellable(
             .map(|n| n.get())
             .unwrap_or(1);
         info!(
-            "ibd: tokio worker threads≈{workers} (peer decode: blocking pool; archive: 1 OS prep + 1 OS writer; confirm: 1 OS thread)"
+            "ibd: tokio worker threads≈{workers} (peer decode: blocking pool; archive: 1 OS prep + 1 OS writer; confirm: materialize+scripts+writeback OS threads)"
         );
     }
     // Dial book: persisted peers (flags) + seeds/connect, ranked by PeerFlags.

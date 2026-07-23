@@ -230,12 +230,13 @@ pub fn confirm_archived_at(
     Ok(fks[0])
 }
 
-/// Confirm a contiguous tip-extension run of archived bodies (sync script+writeback).
+/// Confirm a contiguous tip-extension run of archived bodies (sync all stages).
 ///
-/// See [`confirm_run`]: script phase then writeback. IBD uses the split phases
-/// for pipeline overlap.
+/// See [`confirm_run`]: materialize → scripts → writeback. IBD uses the split
+/// phases for 3-stage pipeline overlap.
 pub use confirm_run::{
-    confirm_archived_run, confirm_script_phase, confirm_writeback_phase, ConfirmScriptOutcome,
+    confirm_archived_run, confirm_materialize_phase, confirm_script_phase, confirm_scripts_phase,
+    confirm_writeback_phase, ConfirmMaterializeOutcome, ConfirmScriptOutcome, MaterializedBatch,
     ScriptOkBatch,
 };
 

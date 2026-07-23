@@ -70,7 +70,9 @@ const CONFIRM_RUN_MAX: usize = 32;
 /// ≥ [`CONFIRM_RUN_MAX`] so the engine can fill a full wave when bodies exist.
 const OFFER_AHEAD: u32 = 96;
 
-/// Max script-ok batches buffered for writeback (scripts(N+1) may run while N writes).
+/// Materialized batches waiting for scripts (materialize(N+1) may run while N scripts).
+const MATERIALIZE_QUEUE: usize = 2;
+/// Script-ok batches buffered for writeback (scripts(N+1) may run while N writes).
 const WRITEBACK_QUEUE: usize = 2;
 
 /// True when a script/wait error should re-queue the batch (not permanent reject).
@@ -81,12 +83,12 @@ pub(crate) fn is_prewarm_retryable(msg: &str) -> bool {
         || msg.contains("prewarm not ready")
 }
 
-/// Spawn confirm **script** + **writeback** OS threads.
+/// Spawn confirm **materialize** + **scripts** + **writeback** OS threads.
 ///
-/// Scripts run optimistically on `ibd-confirm`; structural spentness + Class C +
-/// spend annotate run FIFO on `ibd-confirm-writeback` so scripts(N+1) can overlap
-/// writeback(N). Returns the script-thread join handle (writeback joins on drop
-/// of the channel when the script thread exits).
+/// Materialize (wait→wave→wire→assemble) on `ibd-confirm-materialize`; scripts
+/// on `ibd-confirm`; structural + Class C + spend annotate on
+/// `ibd-confirm-writeback`. Overlap: materialize(N+1) ∥ scripts(N) ∥ writeback(N−1).
+/// Returns the materialize-thread join handle (downstream joins on channel close).
 pub(crate) fn spawn_confirm_engine(
     hub: Arc<ChainHub>,
     feed: Arc<ConfirmFeed>,
@@ -94,6 +96,10 @@ pub(crate) fn spawn_confirm_engine(
     accepted: Arc<AtomicU32>,
     loop_stats: Arc<LoopStats>,
 ) -> std::thread::JoinHandle<()> {
+    let (mat_tx, mat_rx) = std::sync::mpsc::sync_channel::<(
+        rbitcoin_consensus::MaterializedBatch,
+        u64, // materialize work_ns
+    )>(MATERIALIZE_QUEUE);
     let (wb_tx, wb_rx) = std::sync::mpsc::sync_channel::<rbitcoin_consensus::ScriptOkBatch>(
         WRITEBACK_QUEUE,
     );
@@ -104,7 +110,7 @@ pub(crate) fn spawn_confirm_engine(
     let event_tx_wb = event_tx.clone();
     let accepted_wb = Arc::clone(&accepted);
     let loop_stats_wb = Arc::clone(&loop_stats);
-    let _writeback = std::thread::Builder::new()
+    let writeback = std::thread::Builder::new()
         .name("ibd-confirm-writeback".into())
         .spawn(move || {
             info!("ibd: confirm writeback on dedicated OS thread");
@@ -118,7 +124,6 @@ pub(crate) fn spawn_confirm_engine(
                 let heights_hashes = batch.heights_hashes();
                 match hub_wb.confirm_writeback(batch) {
                     Ok(_outcomes) => {
-                        // Heights were claimed off the feed at script-take time.
                         for (_height, raw) in &heights_hashes {
                             let hash = BlockHash::from_byte_array(*raw);
                             loop_stats_wb
@@ -132,8 +137,6 @@ pub(crate) fn spawn_confirm_engine(
                                 return;
                             }
                         }
-                        // Writeback pure work only (recv already done before t0).
-                        // Do not mix into confirm_ns — that is script-stage work.
                         let elapsed = t0.elapsed();
                         if elapsed.as_millis() > 2_000 {
                             info!(
@@ -148,12 +151,10 @@ pub(crate) fn spawn_confirm_engine(
                             info!("ibd: confirm writeback aborted: {msg}");
                             break;
                         }
-                        // Real batch identity (never all-zero hash).
                         let (height, hash) = heights_hashes
                             .first()
                             .map(|(h, raw)| (*h, BlockHash::from_byte_array(*raw)))
                             .unwrap_or((first_h, BlockHash::from_byte_array([0u8; 32])));
-                        // Already confirmed (stale/dup pipeline): do not blacklist.
                         if hub_wb.has_block(&hash)
                             || (msg.contains("prevout already spent")
                                 && heights_hashes.iter().all(|(_, raw)| {
@@ -191,10 +192,78 @@ pub(crate) fn spawn_confirm_engine(
         })
         .expect("spawn ibd-confirm-writeback");
 
-    std::thread::Builder::new()
+    // Scripts: materialize batch → script verify → writeback queue.
+    let hub_sc = Arc::clone(&hub);
+    let feed_sc = Arc::clone(&feed);
+    let event_tx_sc = event_tx.clone();
+    let loop_stats_sc = Arc::clone(&loop_stats);
+    let scripts = std::thread::Builder::new()
         .name("ibd-confirm".into())
         .spawn(move || {
-            info!("ibd: confirm scripts on dedicated OS thread (writeback pipelined)");
+            info!("ibd: confirm scripts on dedicated OS thread (materialize+writeback pipelined)");
+            while let Ok((mat_batch, mat_ns)) = mat_rx.recv() {
+                if feed_sc.stopped() || hub_sc.query.confirm_cancelled() {
+                    break;
+                }
+                let n = mat_batch.len();
+                let first_h = mat_batch
+                    .heights_hashes()
+                    .first()
+                    .map(|(h, _)| *h)
+                    .unwrap_or(0);
+                let heights_hashes = mat_batch.heights_hashes();
+                let t0 = Instant::now();
+                match hub_sc.confirm_scripts(mat_batch) {
+                    Ok(outcome) => {
+                        loop_stats_sc
+                            .confirm_ns
+                            .fetch_add(mat_ns.saturating_add(outcome.work_ns), Ordering::Relaxed);
+                        let script_ms = outcome.work_ns / 1_000_000;
+                        let mat_ms = mat_ns / 1_000_000;
+                        if wb_tx.send(outcome.batch).is_err() {
+                            info!("ibd: confirm writeback channel closed");
+                            break;
+                        }
+                        if script_ms > 2_000 || mat_ms > 2_000 {
+                            info!(
+                                "ibd: confirm scripts slow batch={n} first={first_h} mat_ms={mat_ms} script_ms={script_ms} wall_ms={}",
+                                t0.elapsed().as_millis()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("confirm cancelled") || feed_sc.stopped() {
+                            info!("ibd: confirm scripts aborted: {msg}");
+                            break;
+                        }
+                        let (height, hash) = heights_hashes
+                            .first()
+                            .map(|(h, raw)| (*h, BlockHash::from_byte_array(*raw)))
+                            .unwrap_or((first_h, BlockHash::from_byte_array([0u8; 32])));
+                        loop_stats_sc
+                            .confirm_reject_stops
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!("ibd: confirm scripts reject @ {height}: {e}");
+                        let _ = event_tx_sc.send(ConfirmEvent::Reject {
+                            height,
+                            hash,
+                            err: msg,
+                        });
+                    }
+                }
+            }
+            drop(wb_tx);
+            let _ = writeback.join();
+            info!("ibd: confirm scripts exit");
+        })
+        .expect("spawn ibd-confirm");
+
+    // Materialize: claim feed → wait/wave/wire/assemble → scripts queue.
+    std::thread::Builder::new()
+        .name("ibd-confirm-materialize".into())
+        .spawn(move || {
+            info!("ibd: confirm materialize on dedicated OS thread (wave/wire/assemble)");
             let mut missing_tries: HashMap<u32, u32> = HashMap::new();
             loop {
                 if feed.stopped() {
@@ -206,8 +275,8 @@ pub(crate) fn spawn_confirm_engine(
                     let found = loop {
                         if feed.stopped() {
                             drop(g);
-                            drop(wb_tx);
-                            let _ = _writeback.join();
+                            drop(mat_tx);
+                            let _ = scripts.join();
                             return;
                         }
                         let tip = hub.tip_height();
@@ -219,10 +288,6 @@ pub(crate) fn spawn_confirm_engine(
                             g.retain(|&h, _| h > t);
                         }
                         if g.contains_key(&expect) {
-                            // 2-stage claim: contiguous feed heights (not package_ready
-                            // gate). Wait for scanned is inside confirm_script_phase —
-                            // same blocking work as pre-pipeline, then scripts(N) can
-                            // overlap writeback(N-1) on the other OS thread.
                             let mut run = Vec::with_capacity(CONFIRM_RUN_MAX);
                             let mut h = expect;
                             while run.len() < CONFIRM_RUN_MAX {
@@ -255,7 +320,6 @@ pub(crate) fn spawn_confirm_engine(
                 };
 
                 if batch.is_empty() {
-                    // Claim skipped already-confirmed heights; wait for tip+1.
                     std::thread::sleep(Duration::from_millis(20));
                     continue;
                 }
@@ -275,15 +339,13 @@ pub(crate) fn spawn_confirm_engine(
                 };
                 if feed.stopped() || hub.query.confirm_cancelled() {
                     drop(_live_guard);
-                    drop(wb_tx);
-                    let _ = _writeback.join();
+                    drop(mat_tx);
+                    let _ = scripts.join();
                     return;
                 }
 
-                // SCRIPT STAGE only — writeback is async FIFO.
-                // `work_ns` excludes prewarm Condvar wait (honest script timing).
-                let script_res = hub.confirm_script_phase(&batch);
-                let script_res = match script_res {
+                let mat_res = hub.confirm_materialize_phase(&batch);
+                let mat_res = match mat_res {
                     Err(e) if batch.len() > 1 => {
                         let msg = e.to_string();
                         if feed.stopped()
@@ -298,9 +360,6 @@ pub(crate) fn spawn_confirm_engine(
                         {
                             Err(e)
                         } else {
-                            // Shrink to tip+1: always re-queue suffix so a single
-                            // bad height does not permanently strip ready feed
-                            // entries (offer may lag; stranded suffix frozen tip).
                             {
                                 let mut g = feed.ready.lock().unwrap();
                                 for &(h, ha) in batch.iter().skip(1) {
@@ -311,7 +370,7 @@ pub(crate) fn spawn_confirm_engine(
                                 feed.cv.notify_one();
                             }
                             loop_stats.confirm_begin(expect_h, 1);
-                            hub.confirm_script_phase(&batch[..1])
+                            hub.confirm_materialize_phase(&batch[..1])
                         }
                     }
                     other => other,
@@ -319,38 +378,33 @@ pub(crate) fn spawn_confirm_engine(
                 drop(_live_guard);
 
                 if feed.stopped() || hub.query.confirm_cancelled() {
-                    if let Err(e) = &script_res {
+                    if let Err(e) = &mat_res {
                         let msg = e.to_string();
                         if msg.contains("cancelled") || msg.contains("confirm cancelled") {
-                            info!("ibd: confirm aborted after stop (cancelled)");
+                            info!("ibd: confirm materialize aborted after stop (cancelled)");
                         } else {
-                            info!("ibd: confirm aborted after stop: {e}");
+                            info!("ibd: confirm materialize aborted after stop: {e}");
                         }
                     }
-                    drop(wb_tx);
-                    let _ = _writeback.join();
+                    drop(mat_tx);
+                    let _ = scripts.join();
                     return;
                 }
 
-                match script_res {
-                    Ok(None) => {
-                        // Already confirmed — heights already claimed off feed.
-                    }
+                match mat_res {
+                    Ok(None) => {}
                     Ok(Some(outcome)) => {
-                        // Pure script-stage wall only (not prewarm wait, not wb send).
-                        loop_stats
-                            .confirm_ns
-                            .fetch_add(outcome.work_ns, Ordering::Relaxed);
                         let work_ms = outcome.work_ns / 1_000_000;
-                        // Hand to writeback — `send` may block on full queue; that
-                        // wait is backpressure, not script work (do not time it).
-                        if wb_tx.send(outcome.batch).is_err() {
-                            info!("ibd: confirm writeback channel closed");
+                        if mat_tx
+                            .send((outcome.batch, outcome.work_ns))
+                            .is_err()
+                        {
+                            info!("ibd: confirm scripts channel closed");
                             return;
                         }
                         if work_ms > 2_000 {
                             info!(
-                                "ibd: confirm scripts slow batch={} first={expect_h} work_ms={work_ms}",
+                                "ibd: confirm materialize slow batch={} first={expect_h} work_ms={work_ms}",
                                 batch.len(),
                             );
                         }
@@ -359,14 +413,12 @@ pub(crate) fn spawn_confirm_engine(
                         let (expect, hash) = batch[0];
                         let msg = e.to_string();
                         if msg.contains("confirm cancelled") {
-                            info!("ibd: confirm cancelled @ {expect}");
-                            drop(wb_tx);
-                            let _ = _writeback.join();
+                            info!("ibd: confirm materialize cancelled @ {expect}");
+                            drop(mat_tx);
+                            let _ = scripts.join();
                             return;
                         }
                         if is_prewarm_retryable(&msg) {
-                            // Runway lag / package drained / wait timeout — re-queue
-                            // (do not demote Class A or permanent-reject tip).
                             {
                                 let mut g = feed.ready.lock().unwrap();
                                 for &(h, ha) in &batch {
@@ -383,8 +435,6 @@ pub(crate) fn spawn_confirm_engine(
                                     "ibd: confirm prewarm incomplete @ {expect} {hash} — re-queue (n={n}): {msg}"
                                 );
                             }
-                            // Give the prewarm worker time to re-hydrate tip+1
-                            // (and avoid multi-kHz spam when package is still empty).
                             std::thread::sleep(Duration::from_millis(50));
                             continue;
                         }
@@ -404,7 +454,6 @@ pub(crate) fn spawn_confirm_engine(
                                     "ibd: confirm without archive still missing {hash} @ {expect} (n={n})"
                                 );
                             }
-                            // Re-queue claimed heights so offer can retry after Class A lands.
                             {
                                 let mut g = feed.ready.lock().unwrap();
                                 for &(h, ha) in &batch {
@@ -426,8 +475,6 @@ pub(crate) fn spawn_confirm_engine(
                             std::thread::sleep(Duration::from_millis(5));
                             continue;
                         }
-                        // Multi-block script failure: re-queue suffix after tip+1 so
-                        // a single bad tip does not strand later ready heights.
                         if batch.len() > 1 {
                             let mut g = feed.ready.lock().unwrap();
                             for &(h, ha) in batch.iter().skip(1) {
@@ -441,7 +488,7 @@ pub(crate) fn spawn_confirm_engine(
                         loop_stats
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
-                        warn!("ibd: confirm script reject {hash} @ {expect}: {e}");
+                        warn!("ibd: confirm materialize reject {hash} @ {expect}: {e}");
                         if event_tx
                             .send(ConfirmEvent::Reject {
                                 height: expect,
@@ -456,10 +503,10 @@ pub(crate) fn spawn_confirm_engine(
                     }
                 }
             }
-            drop(wb_tx);
-            let _ = _writeback.join();
+            drop(mat_tx);
+            let _ = scripts.join();
         })
-        .expect("spawn ibd-confirm")
+        .expect("spawn ibd-confirm-materialize")
 }
 
 /// Offer a run of ready archived heights starting at tip+1 into the confirm feed.

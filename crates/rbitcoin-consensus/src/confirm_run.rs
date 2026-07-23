@@ -2,18 +2,19 @@
 //!
 //! Pipeline (optimistic scripts — assumevalid-shaped):
 //! ```text
-//! SCRIPT STAGE (confirm OS thread + rayon):
-//!   resolve → prewarm_wait → wave → wire → assemble → scripts
+//! MATERIALIZE STAGE (ibd-confirm-materialize OS thread):
+//!   prewarm_wait → resolve → wave → wire → assemble
+//! SCRIPT STAGE (ibd-confirm OS thread + rayon):
+//!   scripts only
 //! WRITEBACK STAGE (ibd-confirm-writeback OS thread, FIFO):
 //!   structural (spentness/maturity/subsidy) → class_c → spend annotate → tip GC
 //! ```
 //!
-//! [`confirm_archived_run`] runs both stages synchronously (tests / tip path).
-//! IBD uses [`confirm_script_phase`] then queues [`ScriptOkBatch`] for
-//! [`confirm_writeback_phase`] so scripts(N+1) can overlap writeback(N).
+//! [`confirm_archived_run`] runs all stages synchronously (tests / tip path).
+//! IBD pipelines the three stages so materialize(N+1) ∥ scripts(N) ∥ writeback(N−1).
 //!
 //! **Prewarm ownership:** the IBD background worker loads Class A into
-//! [`ConfirmParentCache`]. Confirm **only waits** (Condvar notify on mark_scanned)
+//! [`ConfirmParentCache`]. Materialize **only waits** (Condvar notify on mark_scanned)
 //! — it never last-miles / duplicates prewarm work while the worker is live.
 
 use crate::block::{
@@ -66,50 +67,66 @@ struct Prepared {
     hash: [u8; 32],
 }
 
+/// Wire + assemble complete; script jobs still attached (not yet verified).
+///
+/// `Send` so IBD can hand off materialize → scripts threads.
+pub struct MaterializedBatch {
+    prepared: Vec<Prepared>,
+    wire_blocks: Vec<Block>,
+    wave_prevouts: rbitcoin_query::WavePrevoutCache,
+}
+
 /// Script-verified batch ready for ordered writeback (structural + Class C + spends).
 ///
-/// `Send` so IBD can hand off from the confirm/script thread to writeback.
+/// `Send` so IBD can hand off scripts → writeback.
 pub struct ScriptOkBatch {
     prepared: Vec<Prepared>,
     wire_blocks: Vec<Block>,
     wave_prevouts: rbitcoin_query::WavePrevoutCache,
 }
 
-/// Confirm a contiguous tip-extension run of archived bodies (sync both stages).
+/// Confirm a contiguous tip-extension run of archived bodies (sync all stages).
 ///
-/// Prefer [`confirm_script_phase`] + [`confirm_writeback_phase`] in IBD so
-/// writeback of batch N overlaps scripts of batch N+1.
+/// Prefer the split phases in IBD for pipeline overlap.
 pub fn confirm_archived_run(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
     blocks: &[(Height, [u8; 32])],
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
-    let ok = confirm_script_phase(query, params, milestone, blocks)?;
+    let mat = confirm_materialize_phase(query, params, milestone, blocks)?;
+    let ok = confirm_scripts_phase(query, mat.batch)?;
     confirm_writeback_phase(query, params, milestone, ok.batch)
 }
 
-/// Outcome of the script stage: ready batch + pure work wall (excludes prewarm wait).
-pub struct ConfirmScriptOutcome {
-    pub batch: ScriptOkBatch,
-    /// Resolve → wave → wire → assemble → scripts only (not prewarm Condvar wait).
+/// Outcome of materialize: batch ready for scripts + pure work wall.
+pub struct ConfirmMaterializeOutcome {
+    pub batch: MaterializedBatch,
+    /// Resolve → wave → wire → assemble only (not prewarm Condvar wait).
     pub work_ns: u64,
 }
 
-/// SCRIPT STAGE: prewarm wait → resolve → wave → wire → assemble → scripts.
+/// Outcome of the script stage: ready batch + pure script wall.
+pub struct ConfirmScriptOutcome {
+    pub batch: ScriptOkBatch,
+    /// Script verify only (when produced by [`confirm_scripts_phase`]).
+    /// When produced by [`confirm_script_phase`], includes materialize work too.
+    pub work_ns: u64,
+}
+
+/// MATERIALIZE STAGE: prewarm wait → resolve → wave → wire → assemble.
 ///
-/// Does **not** advance tip or probe durable spentness (except provisional
-/// same-run doubles during assemble).
+/// Does **not** run scripts, advance tip, or probe durable spentness (except
+/// provisional same-run doubles during assemble).
 ///
-/// When the IBD prewarm worker is live, after wait this stage is **cache-only**
-/// (no Class A / head / spend table cold touches). Prewarm wait is tracked in
-/// [`confirm_phase_stats::PREWARM_WAIT_NS`] and excluded from [`ConfirmScriptOutcome::work_ns`].
-pub fn confirm_script_phase(
+/// Prewarm wait is tracked in [`confirm_phase_stats::PREWARM_WAIT_NS`] and
+/// excluded from [`ConfirmMaterializeOutcome::work_ns`].
+pub fn confirm_materialize_phase(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
     blocks: &[(Height, [u8; 32])],
-) -> Result<ConfirmScriptOutcome, ConsensusError> {
+) -> Result<ConfirmMaterializeOutcome, ConsensusError> {
     if blocks.is_empty() {
         return Err(ConsensusError::BadBlock("empty confirm batch"));
     }
@@ -122,8 +139,8 @@ pub fn confirm_script_phase(
         }
     }
 
-    // Seed + wait **before** any confirm-thread store access so cold plan/header
-    // probes are not charged as script work and (with worker live) do not majflt.
+    // Seed + wait **before** store access so cold plan/header probes are not
+    // charged as materialize work and (with worker live) do not majflt.
     let heights: Vec<u32> = blocks.iter().map(|(h, _)| h.0).collect();
     let items: Vec<(u32, [u8; 32])> = blocks.iter().map(|(h, hash)| (h.0, *hash)).collect();
     let batch_end = heights.last().copied().unwrap_or(0);
@@ -141,7 +158,6 @@ pub fn confirm_script_phase(
     );
 
     // Prefer runway cache; store-fallback on miss (same work as 2-stage).
-    // Hard cache-only was pipeline-era extra re-queue cost.
     let t_resolve = Instant::now();
     let metas = resolve_body_metas(query, blocks, false)?;
     confirm_phase_stats::RESOLVE_NS.fetch_add(
@@ -151,7 +167,7 @@ pub fn confirm_script_phase(
 
     let mut wave_prevouts = wave_fill(query, &metas)?;
     let wire_blocks = wire_rebuild(query, &metas, &mut wave_prevouts)?;
-    let mut prepared = assemble_run(
+    let prepared = assemble_run(
         query,
         params,
         milestone,
@@ -160,22 +176,57 @@ pub fn confirm_script_phase(
         &wave_prevouts,
         false,
     )?;
-    script_wave(&prepared)?;
-    // Drop heavy script jobs before queueing writeback (spends/fees remain).
-    for p in &mut prepared {
-        p.jobs.clear();
-        p.jobs.shrink_to_fit();
-    }
 
     let work_ns = t_work.elapsed().as_nanos() as u64;
-    Ok(ConfirmScriptOutcome {
-        batch: ScriptOkBatch {
+    Ok(ConfirmMaterializeOutcome {
+        batch: MaterializedBatch {
             prepared,
             wire_blocks,
             wave_prevouts,
         },
         work_ns,
     })
+}
+
+/// SCRIPT STAGE: verify script jobs on a materialized batch (rayon).
+///
+/// Clears jobs after success so writeback carries spends/fees only.
+pub fn confirm_scripts_phase(
+    _query: &Query,
+    mut batch: MaterializedBatch,
+) -> Result<ConfirmScriptOutcome, ConsensusError> {
+    let t_work = Instant::now();
+    script_wave(&batch.prepared)?;
+    for p in &mut batch.prepared {
+        p.jobs.clear();
+        p.jobs.shrink_to_fit();
+    }
+    let work_ns = t_work.elapsed().as_nanos() as u64;
+    Ok(ConfirmScriptOutcome {
+        batch: ScriptOkBatch {
+            prepared: batch.prepared,
+            wire_blocks: batch.wire_blocks,
+            wave_prevouts: batch.wave_prevouts,
+        },
+        work_ns,
+    })
+}
+
+/// MATERIALIZE + SCRIPTS in one call (tests / tip path / ChainHub compat).
+///
+/// Prewarm wait excluded from [`ConfirmScriptOutcome::work_ns`]; work is
+/// materialize + scripts.
+pub fn confirm_script_phase(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    blocks: &[(Height, [u8; 32])],
+) -> Result<ConfirmScriptOutcome, ConsensusError> {
+    let mat = confirm_materialize_phase(query, params, milestone, blocks)?;
+    let mat_ns = mat.work_ns;
+    let mut ok = confirm_scripts_phase(query, mat.batch)?;
+    ok.work_ns = ok.work_ns.saturating_add(mat_ns);
+    Ok(ok)
 }
 
 /// Keep only heights strictly above the confirmed tip (dup writeback race).
@@ -225,6 +276,24 @@ pub fn confirm_writeback_phase(
     post_commit(query, &batch.prepared)?;
     confirm_phase_stats::BLOCKS.fetch_add(n_blocks as u64, Ordering::Relaxed);
     Ok(out)
+}
+
+impl MaterializedBatch {
+    /// Heights and header hashes in this batch (for events / feed scrub).
+    pub fn heights_hashes(&self) -> Vec<(u32, [u8; 32])> {
+        self.prepared
+            .iter()
+            .map(|p| (p.height.0, p.hash))
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.prepared.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.prepared.is_empty()
+    }
 }
 
 impl ScriptOkBatch {
@@ -350,6 +419,16 @@ mod writeback_idempotent_tests {
         assert!(!writeback_height_needed(tip, tip));
         assert!(!writeback_height_needed(0, 0));
         assert!(writeback_height_needed(0, 1));
+    }
+
+    #[test]
+    fn three_stage_entry_points_exist() {
+        // Materialize / scripts / writeback are separate public surfaces for IBD.
+        let _m = super::confirm_materialize_phase;
+        let _s = super::confirm_scripts_phase;
+        let _w = super::confirm_writeback_phase;
+        let _combined = super::confirm_script_phase;
+        let _sync = super::confirm_archived_run;
     }
 }
 

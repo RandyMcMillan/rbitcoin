@@ -18,6 +18,7 @@ use memmap2::MmapMut;
 use rbitcoin_primitives::{TableKind, SCHEMA_VERSION, STORE_MAGIC};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
@@ -57,6 +58,9 @@ pub struct TableFile {
     path: PathBuf,
     /// Grow / fsync / fadvise only — not on the read/write memcpy path.
     file: Mutex<File>,
+    /// Cloned FD for lock-free [`pread`](Self::pread_at) / io_uring bulk reads.
+    /// Same inode as `file`; concurrent pread is safe with the role protocol.
+    read_file: File,
     /// Always non-null after construction. Loaded with Arc refcount bump.
     epoch: AtomicPtr<MapEpoch>,
     /// Logical length including header (published HWM).
@@ -138,11 +142,13 @@ impl TableFile {
         // SAFETY: exclusive file we just created; length set above.
         let map = unsafe { MmapMut::map_mut(&file) }.map_err(|e| StoreError::io(&path, e))?;
         let epoch = Arc::new(MapEpoch { map });
+        let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
 
         let _ = kind;
         Ok(Self {
             path,
             file: Mutex::new(file),
+            read_file,
             epoch: Self::install_epoch(epoch),
             published_len: AtomicU64::new(FILE_HEADER_LEN as u64),
         })
@@ -185,9 +191,11 @@ impl TableFile {
 
         let map = unsafe { MmapMut::map_mut(&file) }.map_err(|e| StoreError::io(&path, e))?;
         let epoch = Arc::new(MapEpoch { map });
+        let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
         Ok(Self {
             path,
             file: Mutex::new(file),
+            read_file,
             epoch: Self::install_epoch(epoch),
             published_len: AtomicU64::new(logical),
         })
@@ -200,6 +208,14 @@ impl TableFile {
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
+
+    /// Raw FD for io_uring / pread bulk reads (lock-free; do not close).
+    #[inline]
+    pub fn read_fd(&self) -> RawFd {
+        self.read_file.as_raw_fd()
+    }
+
+
 
     /// Shrink or set logical length (must be ≥ header size). Does not zero freed bytes.
     pub fn set_logical_len(&self, logical: u64) -> Result<(), StoreError> {

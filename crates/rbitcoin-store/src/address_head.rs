@@ -373,6 +373,23 @@ impl AddressHead {
         }
     }
 
+    /// FD for bulk io_uring / pread of head entries.
+    #[inline]
+    pub(crate) fn read_fd(&self) -> std::os::fd::RawFd {
+        self.file.read_fd()
+    }
+
+    /// Published head file length (bounds bulk reads).
+    #[inline]
+    pub(crate) fn published_len(&self) -> u64 {
+        self.file.logical_len()
+    }
+
+    #[inline]
+    pub(crate) fn path_str(&self) -> &std::path::Path {
+        self.file.path()
+    }
+
     fn encode_fk(&self, fk: Fk) -> Result<u64, StoreError> {
         if fk.is_null() {
             return Err(StoreError::InvalidFk);

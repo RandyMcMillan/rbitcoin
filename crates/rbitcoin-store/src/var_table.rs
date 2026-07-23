@@ -86,10 +86,34 @@ impl VarTable {
         Ok((start, end - start))
     }
 
-    /// Raw idx slot read (bulk IO / concurrent head-resolve).
     #[inline]
-    pub(crate) fn idx_read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
-        self.idx.read_at(offset, buf)
+    pub(crate) fn idx_read_fd(&self) -> std::os::fd::RawFd {
+        self.idx.read_fd()
+    }
+
+    #[inline]
+    pub(crate) fn body_read_fd(&self) -> std::os::fd::RawFd {
+        self.body.read_fd()
+    }
+
+    #[inline]
+    pub(crate) fn idx_file_path(&self) -> &Path {
+        self.idx.path()
+    }
+
+    #[inline]
+    pub(crate) fn body_file_path(&self) -> &Path {
+        self.body.path()
+    }
+
+    #[inline]
+    pub(crate) fn idx_published_len(&self) -> u64 {
+        self.idx.logical_len()
+    }
+
+    #[inline]
+    pub(crate) fn body_published_len(&self) -> u64 {
+        self.body.logical_len()
     }
 
     /// `mlock` the body pages covering `fk`. Returns page-aligned `(start, len)`.

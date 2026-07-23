@@ -37,6 +37,7 @@ pub use catchup::IndexMode;
 pub use confirm_parent_cache::confirm_mlock_from_env;
 pub use connect::ConfirmPrepared;
 pub use confirm_load::ConfirmLoadStats;
+pub use archive::ArchiveWritePlan;
 pub use scripthash::{
     ScriptHashBalance, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
 };

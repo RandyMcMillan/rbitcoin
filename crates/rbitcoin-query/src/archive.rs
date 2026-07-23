@@ -1,6 +1,50 @@
 //! Class A archive write path.
+//!
+//! Split for IBD dual-thread:
+//! - **Plan** ([`Query::archive_plan_mega_owned`]): store **reads** — assign create
+//!   fks, sticky + `tx.head` resolve, stamp inputs.
+//! - **Commit** ([`Query::archive_commit_plan`]): store **writes** — body append,
+//!   head index, header_txs, sticky publish.
 
 use super::*;
+
+/// Write-ready mega-batch from plan (prep) to commit (writer).
+///
+/// Planned create fks match `txs.count()+1…` at plan time; commit fails if the
+/// appender returns different fks (another writer interleave — must not happen).
+#[derive(Debug)]
+pub struct ArchiveWritePlan {
+    pub packed: Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)>,
+    pub planned_fks: Vec<Fk>,
+    pub per_header_ranges: Vec<(Fk, Fk, u32)>,
+    pub spends: Vec<([u8; 32], u32, Fk, u32)>,
+    pub sticky_creates: Vec<([u8; 32], Fk)>,
+    pub head_resolved: Vec<([u8; 32], Fk)>,
+    pub index_tx: bool,
+    pub body_est: u64,
+    /// Snapshot of “far ahead of confirm” at plan time.
+    pub advise_dont_need: bool,
+}
+
+impl ArchiveWritePlan {
+    pub fn empty() -> Self {
+        Self {
+            packed: Vec::new(),
+            planned_fks: Vec::new(),
+            per_header_ranges: Vec::new(),
+            spends: Vec::new(),
+            sticky_creates: Vec::new(),
+            head_resolved: Vec::new(),
+            index_tx: false,
+            body_est: 0,
+            advise_dont_need: false,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.packed.is_empty()
+    }
+}
 
 /// When Class A high-water is this many blocks ahead of the parent cache watermark,
 /// drop just-written `tx.body` pages from the page cache so archive dirty pages
@@ -80,25 +124,55 @@ impl Query {
             }
         }
         if !need.is_empty() {
-            self.archive_bodies_mega_owned(&mut need)?;
+            let plan = self.archive_plan_mega_owned(&mut need)?;
+            self.archive_commit_plan(plan)?;
         }
         Ok(header_fks)
     }
 
-    /// Mega-batch Class A: **packed full-tx** rows (one `tx.body` payload per tx).
+    /// Filter already-archived headers (store **read**). Returns items that still
+    /// need Class A, plus the header_fk list for the caller's result order.
     ///
-    /// Non-coinbase inputs store **create_fk + vout** (schema v10). Parent fks are
-    /// resolved here: same mega-batch map → writer sticky → durable `tx.head`.
+    /// Used by IBD prep after structure decode.
+    pub fn archive_filter_need_bodies(
+        &self,
+        items: &mut [(Fk, HeaderRecord, Vec<TxApply>)],
+    ) -> Result<(Vec<Fk>, Vec<(Fk, Vec<TxApply>)>), QueryError> {
+        let mut header_fks = Vec::with_capacity(items.len());
+        let mut need: Vec<(Fk, Vec<TxApply>)> = Vec::with_capacity(items.len());
+        let mut seen_headers = std::collections::HashSet::new();
+        for (fk, _header, txs) in items.iter_mut() {
+            header_fks.push(*fk);
+            if !seen_headers.insert(*fk) {
+                let _ = std::mem::take(txs);
+                continue;
+            }
+            if self.store.header_txs.has_body(*fk)? {
+                let _ = std::mem::take(txs);
+                continue;
+            }
+            if !txs.is_empty() {
+                need.push((*fk, std::mem::take(txs)));
+            }
+        }
+        Ok((header_fks, need))
+    }
+
+    /// **Prep / read path:** assign create fks, sticky + head resolve, stamp
+    /// inputs. No Class A body/head writes (those are [`Self::archive_commit_plan`]).
     ///
-    /// IBD feeds **height-contiguous** mega-batches only (out-of-order bodies are
-    /// parked until the next height is ready). That keeps same-batch + sticky
-    /// resolve complete without per-block fallback.
-    fn archive_bodies_mega_owned(
+    /// Caller must not plan the next mega-batch until the previous plan has been
+    /// committed — planned fks are `txs.count()+1…` at plan time.
+    pub fn archive_plan_mega_owned(
         &self,
         need: &mut [(Fk, Vec<TxApply>)],
-    ) -> Result<(), QueryError> {
+    ) -> Result<ArchiveWritePlan, QueryError> {
         use std::collections::{HashMap, HashSet};
         use std::time::Instant;
+
+        if need.is_empty() {
+            return Ok(ArchiveWritePlan::empty());
+        }
 
         let mut next_tx = self.store.txs.count() + 1;
         let n_headers = need.iter().filter(|(_, t)| !t.is_empty()).count() as u64;
@@ -137,7 +211,7 @@ impl Query {
             per_header_ranges.push((*header_fk, first_tx_fk, n_txs));
         }
 
-        // Pass 2: unique external prev_txids that still need fk.
+        // Pass 2: unique external prev_txids that still need fk (reads only).
         let t_resolve = Instant::now();
         let mut need_external: HashSet<[u8; 32]> = HashSet::new();
         for (_sfk, _tx, inputs, _) in &work {
@@ -155,8 +229,6 @@ impl Query {
             }
         }
 
-        // Sticky (committed prior batches) then durable head for misses.
-        // Lookup touches FIFO recency so hot parents survive create-flood eviction.
         let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
         let mut resolved = self.archive_txid_sticky.lookup_batch(&need_vec);
         let sticky_hit_n = resolved.len() as u64;
@@ -168,7 +240,6 @@ impl Query {
         }
         let head_need_n = need_head.len() as u64;
         let mut head_hit_n = 0u64;
-        // Parents resolved via durable head (for sticky register after put).
         let mut head_resolved: Vec<([u8; 32], Fk)> = Vec::new();
 
         if !need_head.is_empty() {
@@ -187,6 +258,7 @@ impl Query {
         // Pass 3: stamp create_fk on inputs; tip spends list.
         let mut packed: Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> =
             Vec::with_capacity(work.len());
+        let mut planned_fks: Vec<Fk> = Vec::with_capacity(work.len());
         let mut batch_stamp = 0u64;
         let mut resolved_stamp = 0u64;
         for (tx_fk, tx, mut inputs, outputs) in work {
@@ -213,6 +285,7 @@ impl Query {
                     spends.push((inp.prev_txid, inp.prev_index, tx_fk, i as u32));
                 }
             }
+            planned_fks.push(tx_fk);
             packed.push((tx, inputs, outputs));
         }
         crate::archive_resolve_stats::note(
@@ -234,43 +307,71 @@ impl Query {
                     + outs.iter().map(|x| x.encoded_len() as u64).sum::<u64>()
             })
             .sum();
-        self.store
-            .txs
-            .reserve_append(body_est, packed.len() as u64)?;
 
-        let body_off = self.store.txs.body_logical_len();
-        let got_tx_fks = self.store.put_tx_full_batch_indexed(&packed, index_tx)?;
-        if got_tx_fks.len() != packed.len() {
-            return Err(StoreError::Corrupt("tx put_full_batch length"));
-        }
-        if let Some(&(_, first_tx, _)) = per_header_ranges.first() {
-            if got_tx_fks.first().copied() != Some(first_tx) {
-                return Err(StoreError::Corrupt("tx put_full_batch fk mismatch"));
-            }
-        }
-
-        if archive_spends && !spends.is_empty() {
-            self.store.put_spend_batch(&spends)?;
-        }
-
-        self.store.header_txs.put_ranges_batch(&per_header_ranges)?;
-
-        // Sticky only after durable put — never advertise uncommitted fks.
-        // Creates first, then head-resolved parents (FIFO-newest). Sticky hits
-        // were already touched at lookup. One lock per insert_many.
-        let sticky_regs: Vec<([u8; 32], Fk)> = packed
+        let sticky_creates: Vec<([u8; 32], Fk)> = packed
             .iter()
-            .zip(got_tx_fks.iter())
+            .zip(planned_fks.iter())
             .map(|((tx, _, _), fk)| (tx.txid, *fk))
             .collect();
-        self.archive_txid_sticky.insert_many(&sticky_regs);
-        if !head_resolved.is_empty() {
-            self.archive_txid_sticky.insert_many(&head_resolved);
+
+        Ok(ArchiveWritePlan {
+            packed,
+            planned_fks,
+            per_header_ranges,
+            spends,
+            sticky_creates,
+            head_resolved,
+            index_tx,
+            body_est,
+            advise_dont_need: self.archive_far_ahead_of_confirm()?,
+        })
+    }
+
+    /// **Writer / write path:** durable Class A put + sticky publish.
+    ///
+    /// No sticky/head **lookups** — only appends and sticky inserts.
+    pub fn archive_commit_plan(&self, plan: ArchiveWritePlan) -> Result<(), QueryError> {
+        if plan.packed.is_empty() {
+            return Ok(());
+        }
+
+        self.store
+            .txs
+            .reserve_append(plan.body_est, plan.packed.len() as u64)?;
+
+        let body_off = self.store.txs.body_logical_len();
+        let got_tx_fks = self
+            .store
+            .put_tx_full_batch_indexed(&plan.packed, plan.index_tx)?;
+        if got_tx_fks.len() != plan.packed.len() {
+            return Err(StoreError::Corrupt("tx put_full_batch length"));
+        }
+        if got_tx_fks != plan.planned_fks {
+            return Err(StoreError::Corrupt(
+                "tx put_full_batch fk mismatch (plan not committed in order)",
+            ));
+        }
+
+        if !plan.spends.is_empty() {
+            self.store.put_spend_batch(&plan.spends)?;
+        }
+
+        if !plan.per_header_ranges.is_empty() {
+            self.store
+                .header_txs
+                .put_ranges_batch(&plan.per_header_ranges)?;
+        }
+
+        // Sticky only after durable put — never advertise uncommitted fks.
+        self.archive_txid_sticky.insert_many(&plan.sticky_creates);
+        if !plan.head_resolved.is_empty() {
+            self.archive_txid_sticky
+                .insert_many(&plan.head_resolved);
         }
 
         let body_end = self.store.txs.body_logical_len();
         let body_len = body_end.saturating_sub(body_off);
-        if body_len > 0 && self.archive_far_ahead_of_confirm()? {
+        if body_len > 0 && plan.advise_dont_need {
             self.store.txs.advise_body_dont_need(body_off, body_len);
         }
         Ok(())

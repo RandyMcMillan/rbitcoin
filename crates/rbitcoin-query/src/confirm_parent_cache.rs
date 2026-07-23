@@ -692,10 +692,18 @@ impl ConfirmParentCache {
         Some(out)
     }
 
-    /// `(body_count, confirmed_lru_bytes, lru_cap_bytes)` for perf logs.
-    pub fn body_lru_stats(&self) -> (usize, u64, u64) {
+    /// `(body_count, confirmed_lru_bytes, lru_cap_bytes, lazy_deque_len)` for perf/tests.
+    ///
+    /// `lazy_deque_len` should stay O(body_count); if it grows to many× body_count,
+    /// compaction is lagging and load pin will slow with runtime.
+    pub fn body_lru_stats(&self) -> (usize, u64, u64, usize) {
         let g = self.inner.lock().unwrap();
-        (g.by_body.len(), g.body_lru_bytes, g.body_lru_cap)
+        (
+            g.by_body.len(),
+            g.body_lru_bytes,
+            g.body_lru_cap,
+            g.body_lru.len(),
+        )
     }
 
     /// Clone thin edges under one lock (keeps stash for retries).
@@ -1469,37 +1477,38 @@ impl Inner {
     }
 
     /// Evict oldest **confirmed** (`height ≤ tip`) bodies until under cap.
-    /// Runway bodies (`height > tip`) are never evicted here.
+    ///
+    /// Runway bodies (`height > tip`) are never evicted. Work is **one linear
+    /// pass** of the lazy deque (plus optional compact): runway stamps are held
+    /// aside and restored after — no O(deque) `.all()` per pop.
     fn evict_body_lru_to_cap(&mut self) {
         if self.body_lru_cap == 0 {
             return;
         }
+        // Drop stale stamps first so the pass is proportional to live entries.
+        self.compact_body_lru_stale();
+        if self.body_lru_bytes <= self.body_lru_cap {
+            return;
+        }
         let tip = self.tip;
-        while self.body_lru_bytes > self.body_lru_cap {
+        let pass_n = self.body_lru.len();
+        let mut hold: VecDeque<(u64, u64)> = VecDeque::with_capacity(pass_n.min(1024));
+        for _ in 0..pass_n {
+            if self.body_lru_bytes <= self.body_lru_cap {
+                break;
+            }
             let Some((id, stamp)) = self.body_lru.pop_front() else {
                 break;
             };
             let Some(e) = self.by_body.get(&id) else {
-                continue;
+                continue; // gone; discard stamp
             };
             if e.lru_stamp != stamp {
-                continue; // stale touch record
+                continue; // superseded by a newer touch
             }
             if e.height > tip {
-                // Protected runway — requeue at back without counting as eviction.
-                self.body_lru.push_back((id, stamp));
-                // If only runway remains in the queue, stop (cannot free budget).
-                if self
-                    .body_lru
-                    .iter()
-                    .all(|(i, s)| {
-                        self.by_body
-                            .get(i)
-                            .is_some_and(|b| b.lru_stamp == *s && b.height > tip)
-                    })
-                {
-                    break;
-                }
+                // Protected runway — hold aside (no full-queue rescan).
+                hold.push_back((id, stamp));
                 continue;
             }
             let size = e.size_bytes;
@@ -1507,15 +1516,79 @@ impl Inner {
             self.thin_edges.remove(&id);
             self.body_lru_bytes = self.body_lru_bytes.saturating_sub(size);
         }
+        // Restore runway / non-evicted live stamps (confirmed survivors stay
+        // ahead in whatever order remained after the pass).
+        while let Some(x) = hold.pop_front() {
+            self.body_lru.push_back(x);
+        }
+        // Safety: if budget still high (stamp desync), rebuild from by_body.
+        if self.body_lru_bytes > self.body_lru_cap {
+            self.reaccount_body_lru_bytes();
+            self.rebuild_body_lru_from_map();
+            self.evict_confirmed_by_stamp_until_cap();
+        }
     }
 
-    fn maybe_compact_body_lru(&mut self) {
-        let limit = self
+    /// Rebuild lazy deque as one live stamp per `by_body` entry (oldest first).
+    fn rebuild_body_lru_from_map(&mut self) {
+        let mut items: Vec<(u64, u64)> = self
             .by_body
-            .len()
-            .saturating_mul(3)
-            .max(self.body_lru.len().min(64));
-        if self.body_lru.len() <= limit.max(self.by_body.len().saturating_mul(2)) {
+            .iter()
+            .map(|(&id, e)| (id, e.lru_stamp))
+            .collect();
+        items.sort_unstable_by_key(|(_, stamp)| *stamp);
+        self.body_lru = items.into();
+    }
+
+    /// After rebuild: drop oldest confirmed until under cap (no lazy stamps).
+    fn evict_confirmed_by_stamp_until_cap(&mut self) {
+        if self.body_lru_cap == 0 {
+            return;
+        }
+        let tip = self.tip;
+        // Walk oldest→newest; remove confirmed until under budget.
+        let mut keep: VecDeque<(u64, u64)> =
+            VecDeque::with_capacity(self.by_body.len().saturating_add(8));
+        // Drain in stamp order already in body_lru.
+        while let Some((id, stamp)) = self.body_lru.pop_front() {
+            let Some(e) = self.by_body.get(&id) else {
+                continue;
+            };
+            if e.lru_stamp != stamp {
+                continue;
+            }
+            if e.height > tip {
+                keep.push_back((id, stamp));
+                continue;
+            }
+            if self.body_lru_bytes > self.body_lru_cap {
+                let size = e.size_bytes;
+                self.by_body.remove(&id);
+                self.thin_edges.remove(&id);
+                self.body_lru_bytes = self.body_lru_bytes.saturating_sub(size);
+                continue;
+            }
+            keep.push_back((id, stamp));
+        }
+        self.body_lru = keep;
+    }
+
+    /// Keep lazy deque from growing unbounded with touch stamps.
+    ///
+    /// Compact when `body_lru.len() > 2 * by_body.len()` (and at least 64), so
+    /// pin/touch paths stay O(bodies) amortized rather than O(touches).
+    fn maybe_compact_body_lru(&mut self) {
+        let n_body = self.by_body.len();
+        let limit = n_body.saturating_mul(2).max(64);
+        if self.body_lru.len() <= limit {
+            return;
+        }
+        self.compact_body_lru_stale();
+    }
+
+    /// Drop superseded stamps and entries no longer in `by_body`. O(deque).
+    fn compact_body_lru_stale(&mut self) {
+        if self.body_lru.is_empty() {
             return;
         }
         let mut kept = VecDeque::with_capacity(self.by_body.len().saturating_add(64));
@@ -2699,12 +2772,61 @@ mod tests {
         // Advance tip through all — bodies may remain in the confirmed LRU (≤ cap),
         // not unbounded growth beyond the byte budget.
         c.advance_tip(64);
-        let (n, lru_bytes, cap) = c.body_lru_stats();
+        let (n, lru_bytes, cap, deque_len) = c.body_lru_stats();
         assert!(
             lru_bytes <= cap || cap == 0,
             "confirmed body LRU over budget: bytes={lru_bytes} cap={cap} n={n}"
         );
         // With default 1 GiB cap, 64×32 small synthetic bodies fit; still bounded.
         assert!(n <= 64 * 32);
+        // Lazy deque must not grow unboundedly vs live map (runtime pin tax).
+        assert!(
+            deque_len <= n.saturating_mul(2).max(64),
+            "lazy body_lru deque too long: deque={deque_len} bodies={n}"
+        );
+    }
+
+    /// Many pin touches must not leave a multi×-bodies stamp queue; eviction with
+    /// runway mixed in must not full-scan the deque per pop.
+    #[test]
+    fn body_lru_touch_compacts_and_evict_skips_runway_without_all_scan() {
+        // Tiny cap: force eviction of confirmed while runway bodies stay.
+        std::env::set_var("RBITCOIN_CONFIRM_BODY_LRU_MB", "1"); // 1 MiB
+        let c = ConfirmParentCache::from_env();
+        std::env::remove_var("RBITCOIN_CONFIRM_BODY_LRU_MB");
+        c.advance_tip(0);
+        // Fat bodies so a few fill 1 MiB.
+        let fat_out = || {
+            vec![OutputRecord::unspent(1, vec![0x51; 8 * 1024]); 8]
+        };
+        // Confirmed-height bodies after tip advance.
+        for i in 0..40u64 {
+            let mut t = tx((i & 0xff) as u8);
+            t.txid[0] = i as u8;
+            c.put_body(Fk(i + 1), 1, t, fat_out(), vec![]);
+        }
+        // Runway bodies (height 10 > tip).
+        for i in 0..20u64 {
+            let mut t = tx(((i + 40) & 0xff) as u8);
+            t.txid[0] = 0x80 | (i as u8);
+            c.put_body(Fk(1000 + i), 10, t, fat_out(), vec![]);
+        }
+        c.advance_tip(1); // confirmed set enters LRU budget; must stay ≤ cap
+        let (n, bytes, cap, _deque0) = c.body_lru_stats();
+        assert!(bytes <= cap, "over cap bytes={bytes} cap={cap} n={n}");
+        // Spam touches (lazy stamps) — must compact.
+        for _ in 0..200 {
+            for i in 0..20u64 {
+                let _ = c.get_body_for_pin(Fk(1000 + i)); // runway pin touches
+            }
+        }
+        let (n2, bytes2, cap2, deque2) = c.body_lru_stats();
+        assert!(bytes2 <= cap2);
+        assert!(
+            deque2 <= n2.saturating_mul(2).max(64),
+            "deque grew with touches: deque={deque2} bodies={n2}"
+        );
+        // Runway still present.
+        assert!(c.has_body(Fk(1000)));
     }
 }

@@ -308,13 +308,33 @@ impl Query {
 
     /// Collect thin scripthash create pointers for one tx's outputs (no spend marks).
     ///
-    /// Always keys Class A by `tx_fk` (not txid lookup). Confirm waves already
-    /// prefetched outs under that fk; catch-up has no durable `tx.head`.
+    /// Prefer prewarm runway `by_body` outs (no Class A re-decode / majflt). Store
+    /// full decode is last resort — writeback was spending multi-second SH collect
+    /// re-reading bodies that scripts already held in RAM.
     pub(crate) fn collect_scripthash_creates(
         &self,
         tx_fk: Fk,
         out: &mut Vec<ScriptHashRecord>,
     ) -> Result<(), QueryError> {
+        // 1) Runway full body (prewarm / script stage).
+        if let Some((_tx, outputs, _ins)) = self.confirm_parents.get_body(tx_fk) {
+            for o in outputs.iter() {
+                out.push(ScriptHashRecord::from_fk(script_hash(&o.script), tx_fk));
+            }
+            return Ok(());
+        }
+        // 2) Known body range → meta+outs only (still warm if mlock held).
+        if let Some((off, len)) = self.confirm_parents.get_body_range(tx_fk) {
+            let (tx, outputs) = self.store.get_tx_meta_and_outputs_at(off, len)?;
+            if tx.output_count == 0 {
+                return Ok(());
+            }
+            for o in outputs.iter() {
+                out.push(ScriptHashRecord::from_fk(script_hash(&o.script), tx_fk));
+            }
+            return Ok(());
+        }
+        // 3) Cold store (idx + body) — should be rare on IBD writeback.
         let tx = self.get_tx_class_a(tx_fk)?;
         if tx.output_count == 0 {
             return Ok(());

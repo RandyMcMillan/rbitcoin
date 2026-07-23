@@ -130,15 +130,16 @@ pub(crate) fn spawn_parent_prewarm(
                     std::thread::sleep(Duration::from_millis(20));
                     continue;
                 }
-                // Bite size: start with **one** height when the runway is empty so
-                // tip+1 becomes confirm-ready ASAP (large first bites starved confirm
-                // for tens of seconds while decoding 64–128 fat blocks). Grow once
-                // tip+1 is ready; only 2× when still below headroom.
-                // Force single-height when re-hydrating tip+1 package.
+                // Bite size: when the runway is empty, take **one configured batch**
+                // (not 1 block — confirm claims multi-height waves; not 2× which
+                // starved tip for a long first decode). 2× only once we have
+                // some lead but are still below headroom. Re-hydrate tip+1 alone.
                 let through = query.parent_prewarm_ready_through();
                 let ahead = through.saturating_sub(tip);
-                let bite = if force_tip1 || ahead == 0 {
+                let bite = if force_tip1 {
                     1usize
+                } else if ahead == 0 {
+                    batch as usize
                 } else if ahead < headroom.max(16) {
                     (batch as usize).saturating_mul(2).min(256)
                 } else {

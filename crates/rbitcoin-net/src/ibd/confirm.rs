@@ -244,7 +244,7 @@ pub(crate) fn spawn_confirm_engine(
     let scripts = std::thread::Builder::new()
         .name("ibd-confirm".into())
         .spawn(move || {
-            info!("ibd: confirm scripts on dedicated OS thread (load+write pipelined)");
+            info!("ibd: confirm scripts on dedicated OS thread (pure CPU; no store)");
             while let Ok((mat_batch, mat_ns)) = mat_rx.recv() {
                 q_sc.note_load_recv();
                 if feed_sc.stopped() || hub_sc.query.confirm_cancelled() {
@@ -258,7 +258,8 @@ pub(crate) fn spawn_confirm_engine(
                     .unwrap_or(0);
                 let heights_hashes = mat_batch.heights_hashes();
                 let t0 = Instant::now();
-                match hub_sc.confirm_scripts(mat_batch) {
+                // Pure: LoadedBatch → ScriptOkBatch; no Query/store.
+                match rbitcoin_consensus::confirm_scripts_phase(mat_batch) {
                     Ok(outcome) => {
                         loop_stats_sc
                             .confirm_ns

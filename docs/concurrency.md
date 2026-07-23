@@ -9,7 +9,8 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 | Peer IO (N tasks) | tokio multi-thread | none (wire only) |
 | Archive **prep** | 1 tokio task | **none** (CPU encode only) |
 | Archive **writer** | 1 OS thread (`ibd-archive-writer`) | **Class A exclusive**: header body/head, tx body/idx/head, in/out runs; optional points when spend_index on |
-| Confirm **scripts** | 1 OS thread (`ibd-confirm`) | none (CPU: assemble + rayon scripts; optimistic, no durable spentness) |
+| Confirm **load** | 1 OS thread (`ibd-confirm-load`) | none (reads Class A / parent cache; pin/mlock parent bodies) |
+| Confirm **scripts** | 1 OS thread (`ibd-confirm`) | **none** — pure CPU on `LoadedBatch` (rayon script verify only; **no store / Query reads or writes**) |
 | Confirm **write** | 1 OS thread (`ibd-confirm-write`) | **structural** spentness/maturity/subsidy, then **Class C** (`strong_tx` / `tx_height` / SH creates / `confirmed[]`), then spend annotate (Direct). FIFO by height |
 | IBD main loop | 1 tokio task | none (orchestration only) |
 
@@ -42,7 +43,7 @@ Do not enter Tip until tip ≈ peer height. Tip entry only bulk-materializes SH
 
 1. Do **not** spawn a second Class A writer while IBD archive is running.
 2. Confirm may lag archive; that is intentional (tip holes vs archive lead).
-3. Scripts for batch N+1 may run while write finishes batch N (bounded queue).
+3. Scripts for batch N may run while load does N+1 and write does N−1 (two queues, cap 2 each). Scripts never touch disk.
 4. On SIGINT, IBD cancels cooperatively — do not drop nested runtimes mid-await.
 
 ## Host freezes / IO storms

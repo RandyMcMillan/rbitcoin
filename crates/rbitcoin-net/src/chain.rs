@@ -247,13 +247,14 @@ impl ChainHub {
         Ok(Some(ok))
     }
 
-    /// SCRIPT stage only: verify jobs on a loaded batch.
+    /// SCRIPT stage only: pure verify of jobs on a loaded batch (no store access).
     pub fn confirm_scripts(
         &self,
         batch: rbitcoin_consensus::LoadedBatch,
     ) -> Result<rbitcoin_consensus::ConfirmScriptOutcome, NetError> {
-        confirm_scripts_phase(&self.query, batch)
-            .map_err(|e| NetError::Consensus(e.to_string()))
+        // Scripts never touch Query/store — receiver kept for call-site symmetry.
+        let _hub = self;
+        confirm_scripts_phase(batch).map_err(|e| NetError::Consensus(e.to_string()))
     }
 
     /// MATERIALIZE + SCRIPTS (compat). Prefer split stages in IBD.

@@ -1917,7 +1917,7 @@ fn three_stage_confirm_and_parent_mlock_surface() {
     assert_eq!(mat.batch.len(), run.len());
 
     // SCRIPTS
-    let ok = confirm_scripts_phase(&q, mat.batch).expect("scripts");
+    let ok = confirm_scripts_phase(mat.batch).expect("scripts");
     assert!(ok.work_ns > 0 || true);
 
     // WRITE

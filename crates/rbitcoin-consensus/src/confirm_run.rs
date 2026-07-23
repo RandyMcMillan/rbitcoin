@@ -3,20 +3,20 @@
 //! Pipeline (optimistic scripts — assumevalid-shaped):
 //! ```text
 //! LOAD STAGE (ibd-confirm-load OS thread):
-//!   load Class A + pin/mlock write parents → resolve → wave → wire → assemble
+//!   Class A + pin/mlock parents → resolve → wave → wire → assemble
+//!   (only stage that may touch the store / parent cache)
 //! SCRIPTS STAGE (ibd-confirm OS thread + rayon):
-//!   scripts only
+//!   pure CPU: verify ScriptCheckJob list from LoadedBatch — no Query, no disk
 //! WRITE STAGE (ibd-confirm-write OS thread, FIFO):
 //!   structural (spentness/maturity/subsidy) → class_c → spend annotate → tip GC
 //! ```
 //!
 //! [`confirm_archived_run`] runs all stages synchronously (tests / tip path).
-//! IBD pipelines the three stages so load(N+1) ∥ scripts(N) ∥ write(N−1).
+//! IBD pipelines so load(N+1) ∥ scripts(N) ∥ write(N−1).
 //!
-//! **Load owns Class A load** (no background load worker). Parent
-//! create `tx.body` pages that write will annotate are `mlock`ed with
-//! refcounted need_heights; write tip GC `munlock`s when no active batch
-//! still references them.
+//! **Scripts purity:** [`confirm_scripts_phase`] is a pure function of
+//! [`LoadedBatch`] → [`ScriptOkBatch`]. Jobs already carry prevouts, txs, and
+//! softfork flags from load; verification must not open tables or the parent cache.
 
 use crate::block::{
     assemble_block_prevouts, bip34_height_script, block_has_witness, structural_validate_spends,
@@ -96,7 +96,7 @@ pub fn confirm_archived_run(
     blocks: &[(Height, [u8; 32])],
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
     let mat = confirm_load_phase(query, params, milestone, blocks)?;
-    let ok = confirm_scripts_phase(query, mat.batch)?;
+    let ok = confirm_scripts_phase(mat.batch)?;
     confirm_write_phase(query, params, milestone, ok.batch)
 }
 
@@ -187,11 +187,15 @@ pub fn confirm_load_phase(
     })
 }
 
-/// SCRIPTS STAGE: verify script jobs on a loaded batch (rayon).
+/// SCRIPTS STAGE: pure verification of jobs already assembled at load.
 ///
-/// Clears jobs after success so write carries spends/fees only.
+/// **No store / Query / side effects.** Input is a [`LoadedBatch`] (script jobs
+/// hold prevouts + txs + softfork flags); output is a [`ScriptOkBatch`] for the
+/// write queue. Clears jobs after success so write carries spends/fees only.
+///
+/// Uses rayon for CPU parallelism only — does not touch disk or process-global
+/// tables (aside from the rayon pool and script phase timers).
 pub fn confirm_scripts_phase(
-    _query: &Query,
     mut batch: LoadedBatch,
 ) -> Result<ConfirmScriptOutcome, ConsensusError> {
     let t_work = Instant::now();
@@ -213,7 +217,7 @@ pub fn confirm_scripts_phase(
 
 /// LOAD + SCRIPTS in one call (tests / tip path / ChainHub compat).
 ///
-/// Work is full load (Class A + parents) + scripts.
+/// Work is full load (Class A + parents) + pure scripts.
 pub fn confirm_script_phase(
     query: &Query,
     params: &ChainParams,
@@ -222,7 +226,7 @@ pub fn confirm_script_phase(
 ) -> Result<ConfirmScriptOutcome, ConsensusError> {
     let mat = confirm_load_phase(query, params, milestone, blocks)?;
     let mat_ns = mat.work_ns;
-    let mut ok = confirm_scripts_phase(query, mat.batch)?;
+    let mut ok = confirm_scripts_phase(mat.batch)?;
     ok.work_ns = ok.work_ns.saturating_add(mat_ns);
     Ok(ok)
 }
@@ -427,6 +431,21 @@ mod write_idempotent_tests {
         let _w = super::confirm_write_phase;
         let _combined = super::confirm_script_phase;
         let _sync = super::confirm_archived_run;
+    }
+
+    /// Scripts stage accepts an empty LoadedBatch without a Query (pure API).
+    #[test]
+    fn scripts_phase_is_pure_no_query_arg() {
+        use super::{confirm_scripts_phase, LoadedBatch};
+        use rbitcoin_query::WavePrevoutCache;
+        let batch = LoadedBatch {
+            prepared: Vec::new(),
+            wire_blocks: Vec::new(),
+            wave_prevouts: WavePrevoutCache::with_capacity(0, 0),
+        };
+        let ok = confirm_scripts_phase(batch).expect("empty scripts ok");
+        assert!(ok.batch.prepared.is_empty());
+        assert!(ok.batch.wire_blocks.is_empty());
     }
 }
 
@@ -711,6 +730,7 @@ fn structural_run(
     Ok(())
 }
 
+/// Verify all script jobs in `prepared` (CPU only; jobs are self-contained).
 fn script_wave(prepared: &[Prepared]) -> Result<(), ConsensusError> {
     let t_script = Instant::now();
     {

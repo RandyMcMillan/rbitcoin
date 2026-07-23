@@ -1169,20 +1169,46 @@ pub async fn ibd_cancellable(
         }
     }
 
-    // Archive pipeline: short wait, then abort the tokio task (OS threads check stop).
-    match tokio::time::timeout(Duration::from_secs(15), &mut pipeline).await {
-        Ok(Ok(())) => info!(
-            "ibd: archive pipeline stopped cleanly ({:?})",
-            t_teardown.elapsed()
-        ),
-        Ok(Err(e)) => warn!("ibd: archive pipeline join: {e}"),
-        Err(_) => {
-            warn!(
-                "ibd: archive pipeline slow after 15s — aborting ({:?})",
-                t_teardown.elapsed()
-            );
-            pipeline.abort();
-            let _ = tokio::time::timeout(Duration::from_secs(5), pipeline).await;
+    // Archive pipeline: stop is set so prep/writer finish the current commit
+    // (if any) and abandon the rest. Do **not** abort the join early — that
+    // leaked OS threads and hung the process for ~1min after "clean exit".
+    // Log every 2s while waiting for an in-flight Class A put to complete.
+    {
+        let mut waited_s = 0u64;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), &mut pipeline).await {
+                Ok(Ok(())) => {
+                    info!(
+                        "ibd: archive pipeline stopped cleanly ({:?})",
+                        t_teardown.elapsed()
+                    );
+                    break;
+                }
+                Ok(Err(e)) => {
+                    warn!("ibd: archive pipeline join: {e}");
+                    break;
+                }
+                Err(_) => {
+                    waited_s = waited_s.saturating_add(2);
+                    if waited_s <= 30 || waited_s % 10 == 0 {
+                        warn!(
+                            "ibd: waiting for archive pipeline ({waited_s}s, total {:?}) — \
+                             finishing in-flight Class A commit if any…",
+                            t_teardown.elapsed()
+                        );
+                    }
+                    // Safety valve: after a very long commit, abort the tokio task
+                    // (OS threads should already have seen stop; join is inside the task).
+                    if waited_s >= 90 {
+                        warn!(
+                            "ibd: archive pipeline still running after {waited_s}s — aborting task"
+                        );
+                        pipeline.abort();
+                        let _ = tokio::time::timeout(Duration::from_secs(2), pipeline).await;
+                        break;
+                    }
+                }
+            }
         }
     }
     while let Ok(r) = arch_res_rx.try_recv() {

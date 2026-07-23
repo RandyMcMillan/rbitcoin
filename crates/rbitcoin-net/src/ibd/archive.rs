@@ -591,6 +591,26 @@ pub(crate) fn spawn_archive_pipeline(
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     };
+                    // Stop between batches: abandon queued plans (no more commits).
+                    // The batch we already started receiving is still committed below
+                    // only if stop was false at recv — re-check before heavy put.
+                    if write_stop.load(Ordering::Relaxed) {
+                        let WriteReadyBatch { outcomes, plan } = batch;
+                        if !plan.sticky_creates.is_empty() {
+                            let mut g = write_inflight.lock().unwrap();
+                            for (t, _) in &plan.sticky_creates {
+                                g.remove(t);
+                            }
+                        }
+                        for (hash, wire_bytes) in outcomes {
+                            let _ = write_result.send(ArchiveResult::Err {
+                                hash,
+                                err: "archive stopped".into(),
+                                wire_bytes,
+                            });
+                        }
+                        break;
+                    }
                     write_stats.write_idle_ns.fetch_add(
                         idle_t0.elapsed().as_nanos() as u64,
                         Ordering::Relaxed,
@@ -680,6 +700,22 @@ pub(crate) fn spawn_archive_pipeline(
                         }
                     }
                 }
+                // Abandon any remaining queued plans without committing (SIGINT).
+                while let Ok(rest) = write_rx.try_recv() {
+                    if !rest.plan.sticky_creates.is_empty() {
+                        let mut g = write_inflight.lock().unwrap();
+                        for (t, _) in &rest.plan.sticky_creates {
+                            g.remove(t);
+                        }
+                    }
+                    for (hash, wire_bytes) in rest.outcomes {
+                        let _ = write_result.send(ArchiveResult::Err {
+                            hash,
+                            err: "archive stopped".into(),
+                            wire_bytes,
+                        });
+                    }
+                }
             })
             .expect("spawn ibd-archive-writer");
 
@@ -713,6 +749,7 @@ pub(crate) fn spawn_archive_pipeline(
                     inflight: &Mutex<HashMap<[u8; 32], Fk>>,
                     stats: &ArchivePipelineStats,
                     params: &rbitcoin_consensus::ChainParams,
+                    stop: &AtomicBool,
                 ) -> bool {
                     match ins {
                         ParkInsert::Parked => true,
@@ -742,6 +779,7 @@ pub(crate) fn spawn_archive_pipeline(
                                     next_plan_fk,
                                     inflight,
                                     result_tx,
+                                    stop,
                                 ),
                                 PlanSend::WriterDead
                             )
@@ -760,10 +798,11 @@ pub(crate) fn spawn_archive_pipeline(
                     WriterDead,
                 }
 
-                /// Structure decode + FK plan (reads), then **blocking** enqueue.
+                /// Structure decode + FK plan (reads), then enqueue to writer.
                 ///
-                /// Blocks only when the write queue is full (`ARCHIVE_WRITE_QUEUE_CAP`).
-                /// Create fks come from `*next_plan_fk` so overlapping plans do not
+                /// Blocks only when the write queue is full (`ARCHIVE_WRITE_QUEUE_CAP`),
+                /// but **wakes on stop** so SIGINT is not stuck behind a full queue + long
+                /// commit. Create fks come from `*next_plan_fk` so overlapping plans do not
                 /// re-use durable `txs.count()+1` while a prior batch is in flight.
                 /// Resolve uses `inflight` so a later batch can spend prior planned creates.
                 fn plan_and_send_jobs(
@@ -775,6 +814,7 @@ pub(crate) fn spawn_archive_pipeline(
                     next_plan_fk: &mut u64,
                     inflight: &Mutex<HashMap<[u8; 32], Fk>>,
                     result_tx: &mpsc::UnboundedSender<ArchiveResult>,
+                    stop: &AtomicBool,
                 ) -> PlanSend {
                     if jobs.is_empty() {
                         return PlanSend::Done;
@@ -865,12 +905,37 @@ pub(crate) fn spawn_archive_pipeline(
                     }
 
                     // Empty plan still goes through writer so Ok results stay ordered.
-                    let batch = WriteReadyBatch { outcomes, plan };
-                    // Blocks when queue full — backpressure, not single-flight ack.
-                    if write_tx.send(batch).is_err() {
-                        return PlanSend::WriterDead;
+                    let mut batch = WriteReadyBatch { outcomes, plan };
+                    // Backpressure when full, but do not block forever on SIGINT.
+                    loop {
+                        if stop.load(Ordering::Relaxed) {
+                            // Drop planned batch — writer will not commit after stop.
+                            if !batch.plan.sticky_creates.is_empty() {
+                                let mut g = inflight.lock().unwrap();
+                                for (t, _) in &batch.plan.sticky_creates {
+                                    g.remove(t);
+                                }
+                            }
+                            for (hash, wire_bytes) in batch.outcomes.drain(..) {
+                                let _ = result_tx.send(ArchiveResult::Err {
+                                    hash,
+                                    err: "archive stopped".into(),
+                                    wire_bytes,
+                                });
+                            }
+                            return PlanSend::FailedRewind;
+                        }
+                        match write_tx.try_send(batch) {
+                            Ok(()) => return PlanSend::Done,
+                            Err(std::sync::mpsc::TrySendError::Full(b)) => {
+                                batch = b;
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                return PlanSend::WriterDead;
+                            }
+                        }
                     }
-                    PlanSend::Done
                 }
 
                 loop {
@@ -939,6 +1004,7 @@ pub(crate) fn spawn_archive_pipeline(
                             &prep_inflight,
                             &prep_stats,
                             &prep_params,
+                            &prep_stop,
                         ) {
                             return;
                         }
@@ -959,6 +1025,7 @@ pub(crate) fn spawn_archive_pipeline(
                                 &prep_inflight,
                                 &prep_stats,
                                 &prep_params,
+                                &prep_stop,
                             ) {
                                 return;
                             }
@@ -975,6 +1042,7 @@ pub(crate) fn spawn_archive_pipeline(
                                 &prep_inflight,
                                 &prep_stats,
                                 &prep_params,
+                                &prep_stop,
                             ) {
                                 return;
                             }
@@ -1048,6 +1116,7 @@ pub(crate) fn spawn_archive_pipeline(
                                             &prep_inflight,
                                             &prep_stats,
                                             &prep_params,
+                                            &prep_stop,
                                         ) {
                                             return;
                                         }
@@ -1065,6 +1134,7 @@ pub(crate) fn spawn_archive_pipeline(
                                         &prep_inflight,
                                         &prep_stats,
                                         &prep_params,
+                                        &prep_stop,
                                     ) {
                                         return;
                                     }
@@ -1076,6 +1146,11 @@ pub(crate) fn spawn_archive_pipeline(
                         .write_coalesce_ns
                         .fetch_add(coal_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+                    // SIGINT: do not start another mega-batch plan (writer drains).
+                    if prep_stop.load(Ordering::Relaxed) {
+                        continue;
+                    }
+
                     let batch = park.take_contiguous(max_mega);
                     if batch.is_empty() {
                         continue;
@@ -1085,7 +1160,7 @@ pub(crate) fn spawn_archive_pipeline(
                     // until commit Ok marks archived).
                     prep_next.store(park.next_h(), Ordering::Relaxed);
 
-                    // Plan + enqueue (blocks only if write queue is full).
+                    // Plan + enqueue (try_send wakes on stop — not stuck behind commit).
                     match plan_and_send_jobs(
                         &batch,
                         &prep_hub,
@@ -1095,6 +1170,7 @@ pub(crate) fn spawn_archive_pipeline(
                         &mut next_plan_fk,
                         &prep_inflight,
                         &prep_result,
+                        &prep_stop,
                     ) {
                         PlanSend::Done => {}
                         PlanSend::FailedRewind => {

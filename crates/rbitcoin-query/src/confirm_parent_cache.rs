@@ -80,9 +80,11 @@ pub fn prewarm_mlock_from_env() -> bool {
 
 /// Only pin external parents needed by spends in tip+1‥tip+K.
 ///
-/// **0 = full runway** (default): pin every external parent in the prewarm window.
-/// Non-zero K limits pin to heights ≤ tip+K (experimental tip-near).
-pub const DEFAULT_PREWARM_PIN_NEAR: u32 = 0;
+/// **0 = full runway** (pin every external parent in the prewarm window — high RAM).
+/// Default **96** (~3× confirm wave): enough for multi-batch confirm lead without
+/// stashing hundreds of thousands of sparse parents for tip+100‥tip+256.
+/// Override with `RBITCOIN_PARENT_PREWARM_PIN_NEAR=0` for full-depth pin.
+pub const DEFAULT_PREWARM_PIN_NEAR: u32 = 96;
 
 pub fn prewarm_pin_near_from_env() -> u32 {
     std::env::var("RBITCOIN_PARENT_PREWARM_PIN_NEAR")
@@ -300,19 +302,15 @@ impl ConfirmParentCache {
         self.ready_through.load(Ordering::Relaxed)
     }
 
-    /// How far behind tip to keep Class A / Class C **mlocks** after confirm.
-    ///
-    /// Scripts and writeback are pipelined (`WRITEBACK_QUEUE=2` × 32-height waves).
-    /// Spend annotate + SH collect of batch N+1 still touch create bodies of
-    /// recently confirmed heights; dropping mlocks at tip immediately caused
-    /// multi-second writeback + majflt while archive/prewarm competed for disk.
-    /// RAM `by_body` still GC's at tip (size); pages stay resident via mlock lag.
-    pub const MLOCK_HOLD_BEHIND_TIP: u32 = 64;
-
     /// Advance tip: drop plans at/below tip; drop parents/bodies only needed there.
     ///
+    /// Called from writeback `post_commit` after Class C + spend annotate for the
+    /// committed batch — so mlocks for heights ≤ tip are released only once
+    /// writeback for those heights is done (need_heights drop when h ≤ tip).
+    /// No artificial lag behind tip: in-flight later waves keep mlocks via their
+    /// own need_heights (h > tip).
+    ///
     /// Returns store ranges whose refcount hit zero (caller should `munlock`).
-    /// Mlock release lags tip by [`Self::MLOCK_HOLD_BEHIND_TIP`].
     pub fn advance_tip(&self, tip: u32) -> Vec<MlockRange> {
         let mut g = self.inner.lock().unwrap();
         g.tip = tip;
@@ -338,43 +336,31 @@ impl ConfirmParentCache {
         for h in far {
             g.plans.remove(&h);
         }
-        // One body retain + one parent GC (was double-scanned every batch).
-        // Promote dropped bodies into confirmed sticky (txid→fk) before forget.
-        // Keep decoded bodies slightly behind tip so in-flight writeback SH can
-        // still hit RAM (scripts(N+1) // writeback(N) race on the same tip GC).
-        let body_floor = tip.saturating_sub(Self::MLOCK_HOLD_BEHIND_TIP);
+        // Decoded bodies GC at tip — multi-GB if held. Promote sticky identity.
         let mut drop_bodies: Vec<(u64, [u8; 32], u32)> = Vec::new();
         g.by_body.retain(|id, b| {
-            let keep = b.height > body_floor && b.height <= max_h;
+            let keep = b.height > tip && b.height <= max_h;
             if !keep {
                 drop_bodies.push((*id, b.tx.txid, b.height));
             }
             keep
         });
-        for (id, txid, height) in &drop_bodies {
-            g.sticky_insert(*txid, *id, *height);
+        for (id, txid, _height) in &drop_bodies {
+            g.sticky_insert(*txid, *id, *_height);
             g.thin_edges.remove(id);
-            // Keep body_range until mlock floor so spend-annotate can still
-            // resolve abs ranges without idx cold probes.
-            if *height <= body_floor {
-                g.body_range.remove(id);
-            }
         }
-        // Drop header plan cache + hash index for heights outside runway.
-        // Lag header drop with body_floor so writeback can still resolve tx_fks
-        // / ranges for the pipeline hold window.
+        // Drop header plan cache for heights at/below tip (or past depth).
         let drop_hdr: Vec<u32> = g
             .headers
             .keys()
             .copied()
-            .filter(|h| *h <= body_floor || *h > max_h)
+            .filter(|h| *h <= tip || *h > max_h)
             .collect();
         for h in drop_hdr {
             if let Some(plan) = g.headers.remove(&h) {
                 g.hash_to_height.remove(&plan.header_rec.hash);
                 for fk in &plan.tx_fks {
                     if let Some(id) = fk.get() {
-                        g.body_range.remove(&id);
                         g.thin_edges.remove(&id);
                     }
                 }
@@ -382,9 +368,11 @@ impl ConfirmParentCache {
         }
         g.gc_orphaned_parents();
         g.gc_by_txid(tip, max_h);
-        // Mlock release lags tip — pages stay faulted-in for pipeline writeback.
-        let mlock_floor = tip.saturating_sub(Self::MLOCK_HOLD_BEHIND_TIP);
-        let unlocks = g.gc_mlocks(mlock_floor, max_h);
+        // Drop body_range not tied to live runway bodies or parent pins.
+        g.gc_body_ranges();
+        // Munlock when no remaining need_height in (tip, max_h] — i.e. writeback
+        // finished for those heights and no later runway height still needs the page.
+        let unlocks = g.gc_mlocks(tip, max_h);
         g.recompute_ready_through();
         self.ready_through
             .store(g.ready_through, Ordering::Relaxed);
@@ -1905,6 +1893,19 @@ impl Inner {
         true
     }
 
+    /// Drop body_range entries not referenced by live runway bodies or parent pins.
+    ///
+    /// Parent pin used to insert ranges forever (never tied to a height plan),
+    /// so body_range grew O(unique parents ever seen) across IBD.
+    fn gc_body_ranges(&mut self) {
+        if self.body_range.is_empty() {
+            return;
+        }
+        self.body_range.retain(|id, _| {
+            self.by_body.contains_key(id) || self.by_fk.contains_key(id)
+        });
+    }
+
     /// Drop mlocks whose needing heights left `(tip, max_h]`.
     /// Returns ranges with full page-ref zero for the caller to `munlock`.
     fn gc_mlocks(&mut self, tip: u32, max_h: u32) -> Vec<MlockRange> {
@@ -2378,12 +2379,39 @@ mod tests {
         assert!(c.has_body(Fk(50)));
         c.advance_tip(0);
         assert!(c.get_body(Fk(50)).is_some());
-        // Held for writeback pipeline (MLOCK_HOLD_BEHIND_TIP), not dropped at tip=1.
+        // Decoded bodies GC at tip (mlock lag only — not multi-GB script RAM).
         c.advance_tip(1);
-        assert!(c.get_body(Fk(50)).is_some());
-        c.advance_tip(1 + ConfirmParentCache::MLOCK_HOLD_BEHIND_TIP);
         assert!(c.get_body(Fk(50)).is_none());
         assert!(!c.has_body(Fk(50)));
+    }
+
+    /// Parent pin body_range must not accumulate forever across tip advances.
+    #[test]
+    fn body_range_gc_drops_orphaned_parent_ranges() {
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(0);
+        c.ensure_plan(1, [1u8; 32]);
+        // Parent pin range only (no by_body / by_fk keep-alive after tip).
+        c.put_body_range(Fk(999), 1000, 50);
+        assert_eq!(c.body_range_count(), 1);
+        // Live parent keeps range.
+        c.put_parent_outs_resolved(
+            1,
+            Fk(999),
+            tx(9),
+            &[(0, out(1))],
+            &[0],
+            Some(None),
+        );
+        assert_eq!(c.body_range_count(), 1);
+        c.mark_scanned(1);
+        // Tip past plan → orphan parent GC → body_range gone.
+        c.advance_tip(1);
+        assert_eq!(
+            c.body_range_count(),
+            0,
+            "orphaned parent body_range must not leak across tip"
+        );
     }
 
     #[test]
@@ -2427,8 +2455,8 @@ mod tests {
         let t = tx(11);
         c.put_body(Fk(11), 1, t.clone(), vec![out(1)], vec![]);
         assert_eq!(c.get_by_txid(&t.txid), Some(Fk(11)));
-        // Tip past create + hold window; body GC'd but sticky retains identity.
-        c.advance_tip(1 + ConfirmParentCache::MLOCK_HOLD_BEHIND_TIP);
+        // Tip past create; body GC'd but sticky retains identity.
+        c.advance_tip(1);
         assert!(!c.has_body(Fk(11)));
         assert_eq!(c.get_by_txid(&t.txid), Some(Fk(11)));
     }
@@ -2479,10 +2507,8 @@ mod tests {
         assert_eq!(edges.len(), 2);
         assert_eq!(edges[1].create_fk, Some(99));
         assert_eq!(edges[1].prev_index, 1);
-        // Held through tip=create for writeback pipeline; gone past hold window.
+        // Dropped with body when tip advances past create height.
         c.advance_tip(1);
-        assert!(c.get_thin_inputs(Fk(10)).is_some());
-        c.advance_tip(1 + ConfirmParentCache::MLOCK_HOLD_BEHIND_TIP);
         assert!(c.get_thin_inputs(Fk(10)).is_none());
     }
 
@@ -2698,11 +2724,8 @@ mod tests {
         c.note_mlock_ranges(2, &[long]);
         // Must track all 4 pages, not stay stuck at 1.
         assert_eq!(c.mlock_bytes(), 4096 * 4);
-        // Within hold window: still locked (pipeline writeback).
+        // need_heights are 1 and 2 — tip past both → unlock after writeback tip GC.
         let unlocks = c.advance_tip(10);
-        assert!(unlocks.is_empty(), "hold keeps mlocks near tip: {unlocks:?}");
-        // Past hold: GC both need heights → unlock long range.
-        let unlocks = c.advance_tip(10 + ConfirmParentCache::MLOCK_HOLD_BEHIND_TIP);
         assert!(
             unlocks.iter().any(|r| r.page_len >= 4096 * 4),
             "expected unlock of extended range, got {unlocks:?}"
@@ -2710,10 +2733,10 @@ mod tests {
         assert_eq!(c.mlock_bytes(), 0);
     }
 
-    /// Mlock need_heights lag tip so pipelined writeback does not munlock pages
-    /// that spend-annotate / SH of the next wave still touch.
+    /// Mlocks release at tip once no remaining need_height > tip (writeback done).
+    /// Later runway heights that still need a page keep it locked.
     #[test]
-    fn advance_tip_mlock_lags_behind_tip() {
+    fn advance_tip_munlocks_when_writeback_done_keeps_later_needs() {
         use rbitcoin_store::{MlockRange, MlockTable};
         let c = ConfirmParentCache::new(64);
         c.advance_tip(0);
@@ -2722,16 +2745,17 @@ mod tests {
             page_start: 4096,
             page_len: 4096,
         };
-        c.note_mlock_ranges(10, &[r]);
+        // Same pages needed by height 5 and height 20.
+        c.note_mlock_ranges(5, &[r]);
+        c.note_mlock_ranges(20, &[r]);
         assert_eq!(c.mlock_stats().0, 1);
-        let unlocks = c.advance_tip(10);
-        assert!(
-            unlocks.is_empty(),
-            "must not munlock at tip while within hold window"
-        );
+        // Writeback finished through 5 — height 20 still needs the page.
+        let unlocks = c.advance_tip(5);
+        assert!(unlocks.is_empty(), "later runway need keeps mlock: {unlocks:?}");
         assert_eq!(c.mlock_stats().0, 1);
-        let unlocks = c.advance_tip(10 + ConfirmParentCache::MLOCK_HOLD_BEHIND_TIP);
-        assert_eq!(unlocks.len(), 1, "munlock after hold window");
+        // Writeback finished through 20 — no remaining need → munlock.
+        let unlocks = c.advance_tip(20);
+        assert_eq!(unlocks.len(), 1, "munlock when writeback done for all needers");
         assert_eq!(c.mlock_stats().0, 0);
     }
 
@@ -2750,12 +2774,49 @@ mod tests {
         assert_eq!(c.by_txid_count(), 0);
         assert!(c.sticky_confirmed_count() >= 32);
         assert_eq!(c.get_by_txid(&tx(10).txid), Some(Fk(10)));
-        // Past hold window relative to height 10/30.
-        c.advance_tip(30 + ConfirmParentCache::MLOCK_HOLD_BEHIND_TIP);
+        c.advance_tip(45);
         // Bodies GC'd; sticky still serves identity.
         assert!(!c.has_body(Fk(10)));
         assert!(!c.has_body(Fk(30)));
         assert_eq!(c.get_by_txid(&tx(10).txid), Some(Fk(10)));
         assert_eq!(c.get_by_txid(&tx(30).txid), Some(Fk(30)));
+    }
+
+    /// Synthetic pressure: many full bodies must leave RAM when tip catches up.
+    #[test]
+    fn large_runway_bodies_do_not_accumulate_past_tip() {
+        let c = ConfirmParentCache::new(256);
+        c.advance_tip(0);
+        // ~2k "txs" per height × 64 heights — enough to trip unbounded hold.
+        for h in 1u32..=64 {
+            c.ensure_plan(h, [h as u8; 32]);
+            for i in 0u32..32 {
+                let id = (h as u64) * 1000 + i as u64;
+                let mut t = tx((i & 0xff) as u8);
+                t.txid[0] = h as u8;
+                t.txid[1] = i as u8;
+                // Fat-ish scripts (mainnet-like weight on a small scale).
+                let outs = vec![out(50); 4];
+                let ins = vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    create_fk: Fk::NULL,
+                    prev_index: u32::MAX,
+                    sequence: 0xffff_ffff,
+                    script_sig: vec![0x51; 64],
+                    witness: vec![vec![0u8; 32]],
+                }];
+                c.put_body(Fk(id), h, t, outs, ins);
+            }
+            c.mark_scanned(h);
+        }
+        assert_eq!(c.body_count(), 64 * 32);
+        // Advance tip through all — bodies must be gone (not held for 32/64).
+        c.advance_tip(64);
+        assert_eq!(
+            c.body_count(),
+            0,
+            "decoded bodies must not leak behind tip after writeback tip GC"
+        );
+        assert_eq!(c.body_range_count(), 0);
     }
 }

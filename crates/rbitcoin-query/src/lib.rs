@@ -84,9 +84,11 @@ pub mod confirm_load_stats {
     /// Body-page mlock syscalls vs already-pinned skips.
     pub static MLOCK_SYSCALLS: AtomicU64 = AtomicU64::new(0);
     pub static MLOCK_SKIPPED: AtomicU64 = AtomicU64::new(0);
-    /// Thin edges classified: same-batch / cache / head / coinbase / miss.
+    /// Thin edges classified: same-batch / cache / stamped-fk / head / coinbase / miss.
     pub static EDGE_SAME_BATCH: AtomicU64 = AtomicU64::new(0);
     pub static EDGE_RUNWAY: AtomicU64 = AtomicU64::new(0);
+    /// Stamped create_fk on input, parent outside this batch (still may need pin IO).
+    pub static EDGE_FK: AtomicU64 = AtomicU64::new(0);
     pub static EDGE_HEAD: AtomicU64 = AtomicU64::new(0);
     pub static EDGE_COINBASE: AtomicU64 = AtomicU64::new(0);
     pub static EDGE_STICKY: AtomicU64 = AtomicU64::new(0);
@@ -124,6 +126,7 @@ pub mod confirm_load_stats {
         pub mlock_skipped: u64,
         pub edge_same_batch: u64,
         pub edge_cache: u64,
+        pub edge_fk: u64,
         pub edge_head: u64,
         pub edge_coinbase: u64,
         pub edge_sticky: u64,
@@ -161,6 +164,7 @@ pub mod confirm_load_stats {
             mlock_skipped: MLOCK_SKIPPED.swap(0, Ordering::Relaxed),
             edge_same_batch: EDGE_SAME_BATCH.swap(0, Ordering::Relaxed),
             edge_cache: EDGE_RUNWAY.swap(0, Ordering::Relaxed),
+            edge_fk: EDGE_FK.swap(0, Ordering::Relaxed),
             edge_head: EDGE_HEAD.swap(0, Ordering::Relaxed),
             edge_coinbase: EDGE_COINBASE.swap(0, Ordering::Relaxed),
             edge_sticky: EDGE_STICKY.swap(0, Ordering::Relaxed),
@@ -207,6 +211,7 @@ pub mod confirm_load_stats {
         add!(mlock_syscalls, MLOCK_SYSCALLS);
         add!(mlock_skipped, MLOCK_SKIPPED);
         add!(edge_same_batch, EDGE_SAME_BATCH);
+        add!(edge_fk, EDGE_FK);
         add!(edge_cache, EDGE_RUNWAY);
         add!(edge_head, EDGE_HEAD);
         add!(edge_coinbase, EDGE_COINBASE);

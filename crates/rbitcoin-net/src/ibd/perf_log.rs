@@ -138,7 +138,7 @@ pub(crate) struct IbdPerfSample {
     pub load_pin_already_cached: u64,
     pub load_pin_cache_body: u64,
     pub load_pin_new: u64,
-    pub load_cache_hits: u64,
+
     /// Phase-1 body Class A reads this window.
     pub load_body_tx_reads: u64,
     /// Phase-2 external parent pins this window.
@@ -173,6 +173,8 @@ pub(crate) struct IbdPerfSample {
     pub load_mlock_skip: u64,
     pub load_edge_same: u64,
     pub load_edge_cache: u64,
+    /// Stamped create_fk, parent outside batch (not a RAM cache hit).
+    pub load_edge_fk: u64,
     pub load_edge_head: u64,
     pub load_edge_cb: u64,
 
@@ -293,7 +295,7 @@ impl Default for IbdPerfSample {
             load_pin_already_cached: 0,
             load_pin_cache_body: 0,
             load_pin_new: 0,
-            load_cache_hits: 0,
+
             load_body_tx_reads: 0,
             load_parent_tx_reads: 0,
             load_missing_parents: 0,
@@ -321,6 +323,7 @@ impl Default for IbdPerfSample {
             load_mlock_skip: 0,
             load_edge_same: 0,
             load_edge_cache: 0,
+            load_edge_fk: 0,
             load_edge_head: 0,
             load_edge_cb: 0,
             arch_ext_need: 0,
@@ -504,7 +507,7 @@ pub(crate) fn sample(
         load_pin_already_cached: pw.pin_already_cached,
         load_pin_cache_body: pw.pin_cache_body,
         load_pin_new: pw.pin_new,
-        load_cache_hits: pw.cache_hits,
+
         load_body_tx_reads: pw.body_tx,
         load_parent_tx_reads: pw.parent_tx,
         load_missing_parents: pw.missing,
@@ -532,6 +535,7 @@ pub(crate) fn sample(
         load_mlock_skip: pw.mlock_skipped,
         load_edge_same: pw.edge_same_batch,
         load_edge_cache: pw.edge_cache,
+        load_edge_fk: pw.edge_fk,
         load_edge_head: pw.edge_head,
         load_edge_cb: pw.edge_coinbase,
         arch_ext_need: arch_res.ext_need,
@@ -601,11 +605,13 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     if let Some((first, n, elapsed_ms)) = s.live {
         out.push_str(&format!(" | live h={first} n={n} {elapsed_ms}ms"));
     }
-    // Load: how far ahead of tip + Class A IO mix this window.
-    let cache_pct = {
-        let hits = s.load_cache_hits;
-        let loads = s.load_parent_unique;
-        let tot = hits.saturating_add(loads);
+    // Pin reuse rate (unique parents): already-covered + body-in-cache vs store pin.
+    // (Old formula mixed per-edge thin hits with unique parents — inflated / meaningless.)
+    let pin_hit_pct = {
+        let hits = s
+            .load_pin_already_cached
+            .saturating_add(s.load_pin_cache_body);
+        let tot = hits.saturating_add(s.load_pin_new);
         if tot > 0 {
             (100 * hits) / tot
         } else {
@@ -620,7 +626,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.conf_write_q_cap,
     );
     out.push_str(&format!(
-        " | {conf_q} | parents thru={} by_txid={} bodies={} plans={} blks={} body_io={} parent_io={} pin_cached={} pin_cache={} pin_new={} cache%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
+        " | {conf_q} | parents thru={} by_txid={} bodies={} plans={} blks={} body_io={} parent_io={} pin_cached={} pin_cache={} pin_new={} pin_hit%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
         s.load_ready_through,
         s.cache_parents,
         s.cache_bodies,
@@ -631,7 +637,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.load_pin_already_cached,
         s.load_pin_cache_body,
         s.load_pin_new,
-        cache_pct,
+        pin_hit_pct,
         s.load_win_ms,
         s.load_hdr_ms,
         s.load_body_mlock_ms,
@@ -719,7 +725,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.conf_write_q_cap,
     );
     out.push_str(&format!(
-        " | {conf_q} | parents thru={} by_txid={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cached={} pin_cache={} pin_new={} cache_hit={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} head={}/{} mlock_sys={}/{} edges same={} cache={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
+        " | {conf_q} | parents thru={} by_txid={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cached={} pin_cache={} pin_new={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} head={}/{} mlock_sys={}/{} edges same={} cache={} fk={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
         s.load_ready_through,
         s.cache_parents,
         s.cache_bodies,
@@ -733,7 +739,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.load_pin_already_cached,
         s.load_pin_cache_body,
         s.load_pin_new,
-        s.load_cache_hits,
         s.load_body_tx_reads,
         s.load_parent_tx_reads,
         s.load_missing_parents,
@@ -753,6 +758,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.load_mlock_skip,
         s.load_edge_same,
         s.load_edge_cache,
+        s.load_edge_fk,
         s.load_edge_head,
         s.load_edge_cb,
         s.mlock_ranges,
@@ -897,10 +903,10 @@ mod tests {
         s.load_blocks = 32;
         s.load_body_tx_reads = 400;
         s.load_parent_tx_reads = 120;
-        s.load_cache_hits = 80;
         s.load_parent_unique = 20;
         s.load_pin_already_cached = 5;
-        s.load_pin_new = 15;
+        s.load_pin_cache_body = 3;
+        s.load_pin_new = 12;
         s.load_win_ms = 40;
         s.mlock_bytes = 32 * 1024 * 1024;
         s.mlock_ranges = 12;
@@ -910,7 +916,10 @@ mod tests {
         assert!(line.contains("thru=200"), "{line}");
         assert!(line.contains("by_txid=12 bodies=48 plans=80"), "{line}");
         assert!(line.contains("body_io=400 parent_io=120"), "{line}");
-        assert!(line.contains("pin_cached=5 pin_cache=0 pin_new=15"), "{line}");
+        assert!(line.contains("pin_cached=5 pin_cache=3 pin_new=12"), "{line}");
+        // pin_hit% = (5+3)/(5+3+12) = 40
+        assert!(line.contains("pin_hit%=40"), "{line}");
+        assert!(!line.contains("cache%="), "{line}");
         assert!(line.contains("mlock=32MiB ranges=12 sh_runs=3"), "{line}");
         assert!(!line.contains("reserved"), "{line}");
         assert!(!line.contains("confirm_phases"), "{line}");

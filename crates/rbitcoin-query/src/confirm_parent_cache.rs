@@ -80,11 +80,9 @@ pub fn prewarm_mlock_from_env() -> bool {
 
 /// Only pin external parents needed by spends in tip+1‥tip+K.
 ///
-/// **0 = full runway** (pin every external parent in the prewarm window — high RAM).
-/// Default **96** (~3× confirm wave): enough for multi-batch confirm lead without
-/// stashing hundreds of thousands of sparse parents for tip+100‥tip+256.
-/// Override with `RBITCOIN_PARENT_PREWARM_PIN_NEAR=0` for full-depth pin.
-pub const DEFAULT_PREWARM_PIN_NEAR: u32 = 96;
+/// **0 = full runway** (default): pin every external parent in the prewarm window.
+/// Non-zero K limits pin to heights ≤ tip+K (tip-near pin; lower RAM).
+pub const DEFAULT_PREWARM_PIN_NEAR: u32 = 0;
 
 pub fn prewarm_pin_near_from_env() -> u32 {
     std::env::var("RBITCOIN_PARENT_PREWARM_PIN_NEAR")

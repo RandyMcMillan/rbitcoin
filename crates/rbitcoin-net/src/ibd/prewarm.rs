@@ -92,19 +92,11 @@ pub(crate) fn spawn_parent_prewarm(
                 // spins on "prewarm incomplete" while the worker works far ahead.
                 let tip1 = tip.saturating_add(1);
                 let mut force_tip1 = false;
-                if let Some(&(h, hash)) = runway.iter().find(|(h, _)| *h == tip1) {
-                    let incomplete = query
-                        .confirm_parent_cache()
-                        .get_header_plan(h)
-                        .map(|p| {
-                            p.header_rec.hash != hash
-                                || !query.confirm_parent_cache().bodies_complete(&p.tx_fks)
-                        })
-                        .unwrap_or(true);
-                    if incomplete {
-                        next_height = tip1;
-                        force_tip1 = true;
-                    }
+                if runway.iter().any(|(h, _)| *h == tip1)
+                    && !query.confirm_parent_cache().package_ready(tip1)
+                {
+                    next_height = tip1;
+                    force_tip1 = true;
                 }
                 // First index with height >= next_height.
                 let start = runway.partition_point(|(h, _)| *h < next_height);

@@ -78,8 +78,19 @@ impl Query {
     }
 
     pub(crate) fn wire_header_from_record(&self, rec: &HeaderRecord) -> Result<BlockHeader, QueryError> {
+        self.wire_header_from_record_prev(rec, None)
+    }
+
+    /// Wire header with optional prev hash (prewarm package — avoids store get).
+    pub(crate) fn wire_header_from_record_prev(
+        &self,
+        rec: &HeaderRecord,
+        prev_hash: Option<[u8; 32]>,
+    ) -> Result<BlockHeader, QueryError> {
         let prev_blockhash = if rec.prev_fk.is_null() {
             BlockHash::from_byte_array([0u8; 32])
+        } else if let Some(h) = prev_hash {
+            BlockHash::from_byte_array(h)
         } else {
             let prev = self.store.get_header(rec.prev_fk)?;
             BlockHash::from_byte_array(prev.hash)

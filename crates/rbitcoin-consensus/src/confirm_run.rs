@@ -469,12 +469,17 @@ fn wire_rebuild(
     let t0 = Instant::now();
     let mut blks = Vec::with_capacity(metas.len());
     for m in metas {
+        let prev_hash = query
+            .confirm_parent_cache()
+            .get_header_plan(m.height.0)
+            .map(|p| p.prev_hash);
         blks.push(
             query
                 .reconstruct_archived_block_from_parts_wave(
                     m.header_rec.clone(),
                     m.tx_fks.clone(),
                     Some(wave),
+                    prev_hash,
                 )
                 .map_err(ConsensusError::Store)?,
         );

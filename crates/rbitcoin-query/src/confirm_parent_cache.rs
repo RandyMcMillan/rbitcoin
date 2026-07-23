@@ -153,27 +153,21 @@ pub struct HeaderPlanCache {
     pub header_fk: Fk,
     pub header_rec: HeaderRecord,
     pub tx_fks: Vec<Fk>,
+    /// Previous block hash (zeros at genesis). Filled at prewarm so wire rebuild
+    /// never `store.get_header(prev_fk)`.
+    pub prev_hash: [u8; 32],
 }
 
 /// Per-height plan: what prevouts block `height` needs.
 #[derive(Debug, Default)]
 struct HeightPlan {
     hash: [u8; 32],
-    /// Prewarm finished scanning this body (may still have open reserves).
+    /// Prewarm finished a full package attempt for this height (see package_ready).
     scanned: bool,
     /// (create_fk, vout) fully populated in cache.
     need_fk: HashSet<(u64, u32)>,
     /// (prev_txid, vout) not in UTXO at prewarm — expect runway / same-wave create.
-    /// Does **not** block [`HeightPlan::is_ready`].
     reserved: HashSet<([u8; 32], u32)>,
-}
-
-impl HeightPlan {
-    /// Ready for confirm once scanned. Open reservations are OK: same-batch
-    /// create→spend resolves in the wave; filled cache is best-effort.
-    fn is_ready(&self) -> bool {
-        self.scanned
-    }
 }
 
 /// One mlocked page range (any store table) held for runway heights.
@@ -510,6 +504,7 @@ impl ConfirmParentCache {
         header_fk: Fk,
         header_rec: HeaderRecord,
         tx_fks: Vec<Fk>,
+        prev_hash: [u8; 32],
     ) {
         let mut g = self.inner.lock().unwrap();
         let hash = header_rec.hash;
@@ -520,6 +515,7 @@ impl ConfirmParentCache {
                 header_fk,
                 header_rec,
                 tx_fks,
+                prev_hash,
             },
         );
     }
@@ -869,7 +865,14 @@ impl ConfirmParentCache {
     /// True if height was scanned (open reservations do not block).
     pub fn is_ready(&self, height: u32) -> bool {
         let g = self.inner.lock().unwrap();
-        g.plans.get(&height).map(|p| p.is_ready()).unwrap_or(false)
+        g.package_ready(height)
+    }
+
+    /// True when the height has a **complete confirm package** on the runway:
+    /// header plan, all Class A bodies, thin/create_fk edges, and external
+    /// parent outs with spent filter applied. This is what wait_prewarm waits for.
+    pub fn package_ready(&self, height: u32) -> bool {
+        self.inner.lock().unwrap().package_ready(height)
     }
 
     /// True if height still has open reserved holes (debug / tests).
@@ -883,12 +886,7 @@ impl ConfirmParentCache {
     /// All heights in `heights` ready (scanned).
     pub fn all_ready(&self, heights: &[u32]) -> bool {
         let g = self.inner.lock().unwrap();
-        heights.iter().all(|h| {
-            g.plans
-                .get(h)
-                .map(|p| p.is_ready())
-                .unwrap_or(false)
-        })
+        heights.iter().all(|h| g.package_ready(*h))
     }
 
     /// Confirm headroom: warmer has fully ready plans through at least
@@ -962,12 +960,7 @@ impl ConfirmParentCache {
         let start = Instant::now();
         let mut g = self.inner.lock().unwrap();
         loop {
-            let ready = heights.iter().all(|h| {
-                g.plans
-                    .get(h)
-                    .map(|p| p.is_ready())
-                    .unwrap_or(false)
-            });
+            let ready = heights.iter().all(|h| g.package_ready(*h));
             if ready {
                 return Ok(());
             }
@@ -1353,25 +1346,18 @@ impl ConfirmParentCache {
     }
 
     /// See [`Self::parent_pin_covered`].
+    ///
+    /// Only **spent-filtered** `by_fk` entries count. Bare runway `by_body` does
+    /// **not** cover external parents (wave cache_only requires spent_filtered).
     #[inline]
     fn pin_covered_locked(g: &Inner, id: u64, vouts: &[u32]) -> bool {
         if vouts.is_empty() {
             return true;
         }
         if let Some(e) = g.by_fk.get(&id) {
-            // Prewarm already spent-filtered these vouts.
             if !e.checked.is_empty() && vouts.iter().all(|v| e.checked.contains(v)) {
                 return true;
             }
-            // Legacy / partial: every requested vout is a live stashed out.
-            if !e.outs.is_empty() && vouts.iter().all(|v| e.outs.contains_key(v)) {
-                return true;
-            }
-        }
-        if let Some(b) = g.by_body.get(&id) {
-            return vouts
-                .iter()
-                .all(|v| (*v as usize) < b.outputs.len());
         }
         false
     }
@@ -1781,16 +1767,77 @@ impl Inner {
         }
     }
 
-    /// Contiguous ready watermark from tip+1 upward.
+    /// Contiguous **package-complete** watermark from tip+1 upward.
     fn recompute_ready_through(&mut self) {
         let mut h = self.tip.saturating_add(1);
-        loop {
-            match self.plans.get(&h) {
-                Some(p) if p.is_ready() => h = h.saturating_add(1),
-                _ => break,
-            }
+        while self.package_ready(h) {
+            h = h.saturating_add(1);
         }
         self.ready_through = h.saturating_sub(1);
+    }
+
+    /// Full confirm package on runway (header + bodies + edges + external parents).
+    ///
+    /// Content-based — `scanned` alone is never enough. Used by wait, ready_through,
+    /// and prewarm skip/rehydrate.
+    fn package_ready(&self, height: u32) -> bool {
+        let Some(plan) = self.plans.get(&height) else {
+            return false;
+        };
+        let Some(hdr) = self.headers.get(&height) else {
+            return false;
+        };
+        if hdr.header_rec.hash != plan.hash || hdr.tx_fks.is_empty() {
+            return false;
+        }
+        let wave_ids: HashSet<u64> = hdr
+            .tx_fks
+            .iter()
+            .filter_map(|f| f.get())
+            .collect();
+        // Collect external (create_fk, vout) needed from non-wave parents.
+        let mut external: HashMap<u64, HashSet<u32>> = HashMap::new();
+        for fk in &hdr.tx_fks {
+            let Some(id) = fk.get() else {
+                return false;
+            };
+            let Some(body) = self.by_body.get(&id) else {
+                return false;
+            };
+            let thin = self.thin_edges.get(&id);
+            for (i, inp) in body.inputs.iter().enumerate() {
+                if inp.is_coinbase()
+                    || (inp.prev_txid == [0u8; 32] && inp.prev_index == u32::MAX)
+                {
+                    continue;
+                }
+                let pid = thin
+                    .and_then(|t| t.get(i))
+                    .and_then(|e| e.create_fk)
+                    .or_else(|| inp.create_fk.get());
+                let Some(pid) = pid else {
+                    return false; // unstamped create_fk
+                };
+                let vout = thin
+                    .and_then(|t| t.get(i))
+                    .map(|e| e.prev_index)
+                    .unwrap_or(inp.prev_index);
+                if wave_ids.contains(&pid) {
+                    continue; // same-block create; wave resolves
+                }
+                external.entry(pid).or_default().insert(vout);
+            }
+        }
+        for (pid, vouts) in &external {
+            let Some(e) = self.by_fk.get(pid) else {
+                return false;
+            };
+            // Must be spent-filtered for every needed vout.
+            if e.checked.is_empty() || !vouts.iter().all(|v| e.checked.contains(v)) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Drop mlocks whose needing heights left `(tip, max_h]`.
@@ -1893,20 +1940,72 @@ mod tests {
         OutputRecord::unspent(v, vec![0x51])
     }
 
+    fn header_rec(hash: [u8; 32]) -> HeaderRecord {
+        HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x1d00ffff,
+            nonce: 0,
+            merkle_root: [0u8; 32],
+            hash,
+        }
+    }
+
+    /// Minimal coinbase-only package: package_ready without external parents.
+    fn seed_coinbase_package(c: &ConfirmParentCache, height: u32, hash: [u8; 32], body_fk: u64) {
+        c.ensure_plan(height, hash);
+        let mut t = tx((body_fk & 0xff) as u8);
+        t.txid = hash;
+        t.input_count = 1;
+        t.output_count = 1;
+        let inputs = vec![InputRecord {
+            prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
+            prev_index: u32::MAX,
+            sequence: 0xffff_ffff,
+            script_sig: vec![],
+            witness: vec![],
+        }];
+        c.put_header_plan(
+            height,
+            Fk(height as u64),
+            header_rec(hash),
+            vec![Fk(body_fk)],
+            [0u8; 32],
+        );
+        c.put_body(Fk(body_fk), height, t, vec![out(50)], inputs);
+        c.mark_scanned(height);
+    }
+
     #[test]
     fn utxo_parent_marks_ready() {
         let c = ConfirmParentCache::new(64);
         c.advance_tip(10);
         let hash = [9u8; 32];
-        c.ensure_plan(11, hash);
+        // Ready = full package (coinbase body), not mark_scanned alone.
+        seed_coinbase_package(&c, 11, hash, 1001);
+        // External parent pin is orthogonal to package for coinbase-only height.
         let t = tx(1);
         c.put_utxo_parent(11, Fk(7), t, 0, out(100));
-        c.mark_scanned(11);
         assert!(c.is_ready(11));
         assert_eq!(c.ready_through(), 11);
         let (tx, o) = c.get_parent_out(Fk(7), 0).unwrap();
         assert_eq!(tx.txid[0], 1);
         assert_eq!(o.value, 100);
+    }
+
+    #[test]
+    fn hollow_mark_scanned_is_not_package_ready() {
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(10);
+        c.ensure_plan(11, [9u8; 32]);
+        c.mark_scanned(11);
+        assert!(
+            !c.package_ready(11),
+            "scanned without bodies must not unblock confirm"
+        );
+        assert_eq!(c.ready_through(), 10);
     }
 
     /// Regression: without advance_tip to the real IBD tip, ensure_plans rejects
@@ -1923,7 +2022,8 @@ mod tests {
         c.advance_tip(360_250);
         c.ensure_plans(&[(360_251, [1u8; 32]), (360_252, [2u8; 32])]);
         assert_eq!(c.plan_count(), 2);
-        c.mark_scanned_many(&[360_251, 360_252]);
+        seed_coinbase_package(&c, 360_251, [1u8; 32], 360_251);
+        seed_coinbase_package(&c, 360_252, [2u8; 32], 360_252);
         assert!(c.is_ready(360_251));
         assert!(c.is_ready(360_252));
         assert_eq!(c.ready_through(), 360_252);
@@ -1937,7 +2037,8 @@ mod tests {
 
         let c = Arc::new(ConfirmParentCache::new(64));
         c.advance_tip(10);
-        c.ensure_plan(11, [9u8; 32]);
+        let hash = [9u8; 32];
+        c.ensure_plan(11, hash);
 
         let waiter = Arc::clone(&c);
         let j = thread::spawn(move || {
@@ -1945,10 +2046,10 @@ mod tests {
                 .wait_heights_ready(&[11], Duration::from_millis(500), || false)
                 .expect("should become ready")
         });
-        // Yield so the waiter parks on the condvar before we mark scanned.
         thread::yield_now();
         thread::sleep(Duration::from_millis(1));
-        c.mark_scanned(11);
+        // Deliver full package then notify via mark_scanned.
+        seed_coinbase_package(&c, 11, hash, 1111);
         j.join().unwrap();
         assert!(c.is_ready(11));
     }
@@ -1995,12 +2096,11 @@ mod tests {
     fn reserve_then_register_create_fills() {
         let c = ConfirmParentCache::new(64);
         c.advance_tip(0);
-        c.ensure_plan(2, [2u8; 32]);
+        let hash = [2u8; 32];
+        // Coinbase package is ready even with open reserves on the plan.
+        seed_coinbase_package(&c, 2, hash, 2002);
         let t = tx(5);
-        // Spend of 5:0 not in UTXO yet.
         c.reserve(2, t.txid, 0);
-        c.mark_scanned(2);
-        // Open reserve must NOT block readiness (batch may create+spend).
         assert!(c.is_ready(2));
         assert!(c.has_open_reserves(2));
         // Create appears from height 1 body — fills cache for wave/connect.
@@ -2012,23 +2112,19 @@ mod tests {
 
     #[test]
     fn open_reserves_do_not_block_ready_or_watermark() {
-        // Simulate batch create@1 + spend@2: spend reserves before create is
-        // filled; confirm must still see both heights ready after scan.
+        // Simulate batch create@1 + spend@2: open reserves must not block package.
         let c = ConfirmParentCache::new(64);
         c.advance_tip(0);
-        c.ensure_plan(1, [1u8; 32]);
-        c.mark_scanned(1);
-        c.ensure_plan(2, [2u8; 32]);
+        seed_coinbase_package(&c, 1, [1u8; 32], 1001);
+        seed_coinbase_package(&c, 2, [2u8; 32], 1002);
         let t = tx(9);
         c.reserve(2, t.txid, 0);
-        c.mark_scanned(2);
         assert!(c.is_ready(1));
         assert!(c.is_ready(2));
         assert!(c.has_open_reserves(2));
         assert!(c.all_ready(&[1, 2]));
         assert_eq!(c.ready_through(), 2);
         assert!(c.headroom_ready(2, 0));
-        // Create later fills reserve (best-effort); readiness unchanged.
         c.register_runway_creates(Fk(90), &t, &[out(1)], 1);
         assert!(!c.has_open_reserves(2));
         assert_eq!(c.ready_through(), 2);
@@ -2039,17 +2135,15 @@ mod tests {
         // Bodies first: create height registers all outs; spend height hits cache.
         let c = ConfirmParentCache::new(64);
         c.advance_tip(0);
-        c.ensure_plan(1, [1u8; 32]);
+        seed_coinbase_package(&c, 1, [1u8; 32], 1001);
         let t = tx(5);
         c.register_runway_creates(Fk(50), &t, &[out(42), out(43)], 1);
-        c.mark_scanned(1);
         assert!(c.is_ready(1));
         assert_eq!(c.get_by_txid(&t.txid), Some(Fk(50)));
         assert_eq!(c.get_parent_out(Fk(50), 1).unwrap().1.value, 43);
 
-        c.ensure_plan(2, [2u8; 32]);
+        seed_coinbase_package(&c, 2, [2u8; 32], 1002);
         c.put_utxo_parent(2, Fk(50), t.clone(), 1, out(43));
-        c.mark_scanned(2);
         assert!(c.is_ready(2));
         assert_eq!(c.ready_through(), 2);
     }
@@ -2235,10 +2329,12 @@ mod tests {
         assert!(filtered);
         assert_eq!(live.len(), 2);
 
-        // Body path also covers pin skip.
+        // Bare by_body does **not** count as pin-covered (need spent-filtered by_fk).
         c.put_body(Fk(70), 1, tx(70), vec![out(1), out(2)], vec![]);
-        assert!(c.parent_pin_covered(Fk(70), &[0, 1]));
-        assert!(!c.parent_pin_covered(Fk(70), &[0, 2]));
+        assert!(
+            !c.parent_pin_covered(Fk(70), &[0, 1]),
+            "runway body alone must not skip external parent pin"
+        );
     }
 
     #[test]
@@ -2328,10 +2424,11 @@ mod tests {
     fn headroom_ready_requires_watermark() {
         let c = ConfirmParentCache::new(128);
         c.advance_tip(0);
-        // Ready 1..=3 only.
+        // Ready 1..=3 only (full packages).
         for h in 1..=3u32 {
-            c.ensure_plan(h, [h as u8; 32]);
-            c.mark_scanned(h);
+            let mut hash = [0u8; 32];
+            hash[0] = h as u8;
+            seed_coinbase_package(&c, h, hash, 1000 + h as u64);
         }
         assert_eq!(c.ready_through(), 3);
         assert!(c.headroom_ready(1, 0));
@@ -2343,8 +2440,8 @@ mod tests {
         c.ensure_plan(4, [4u8; 32]);
         c.ensure_plan(5, [5u8; 32]);
         assert!(!c.headroom_ready(3, 2)); // need 5 ready, only through 3
-        c.mark_scanned(4);
-        c.mark_scanned(5);
+        seed_coinbase_package(&c, 4, [4u8; 32], 1004);
+        seed_coinbase_package(&c, 5, [5u8; 32], 1005);
         assert!(c.headroom_ready(3, 2));
     }
 

@@ -266,24 +266,19 @@ impl Query {
             if height <= tip {
                 continue;
             }
-            if self.confirm_parents.is_ready(height) {
-                // Scanned ≠ package still on runway: confirm used to take/move
-                // bodies; a failed re-queue then spun on "prewarm incomplete".
-                // Re-hydrate if any Class A body for this height is gone.
-                let package_ok = self
+            // package_ready = full confirm handoff (bodies + edges + parents).
+            if self.confirm_parents.package_ready(height) {
+                // Hash must still match the plan (reorg / re-note).
+                if self
                     .confirm_parents
                     .get_header_plan(height)
-                    .map(|p| {
-                        p.header_rec.hash == hash
-                            && self.confirm_parents.bodies_complete(&p.tx_fks)
-                    })
-                    .unwrap_or(false);
-                if package_ok {
+                    .is_some_and(|p| p.header_rec.hash == hash)
+                {
                     st.already_ready = st.already_ready.saturating_add(1);
                     continue;
                 }
-                // Fall through: re-decode bodies / re-pin parents for this height.
             }
+            // Incomplete or hash mismatch: re-decode / re-pin.
             work.push((height, hash));
         }
         if work.is_empty() {
@@ -344,11 +339,24 @@ impl Query {
                     continue;
                 }
             }
+            let prev_hash = if header_rec.prev_fk.is_null() {
+                [0u8; 32]
+            } else {
+                match self.store.get_header(header_rec.prev_fk) {
+                    Ok(prev) => prev.hash,
+                    Err(_) => {
+                        st.header_ns =
+                            st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
+                        continue;
+                    }
+                }
+            };
             self.confirm_parents.put_header_plan(
                 height,
                 header_fk,
                 header_rec,
                 tx_fks.clone(),
+                prev_hash,
             );
             st.header_ns = st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
 
@@ -872,8 +880,17 @@ impl Query {
             .collect();
         self.confirm_parents.put_thin_inputs_batch(thin_items);
 
-        let scanned: Vec<u32> = work.iter().map(|(h, _)| *h).collect();
-        self.confirm_parents.mark_scanned_many(&scanned);
+        // Mark only heights with a complete package (content-based package_ready).
+        // Hollow early-continues never get bodies → never ready → never block tip+1.
+        let mut ok: Vec<u32> = Vec::with_capacity(work.len());
+        for &(h, _) in &work {
+            if self.confirm_parents.package_ready(h) {
+                ok.push(h);
+            }
+        }
+        if !ok.is_empty() {
+            self.confirm_parents.mark_scanned_many(&ok);
+        }
 
         crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
         Ok(st)

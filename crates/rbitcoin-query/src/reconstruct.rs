@@ -511,7 +511,7 @@ impl Query {
     pub fn reconstruct_tx(&self, tx_fk: Fk) -> Result<Transaction, QueryError> {
         let (rec, stored_outputs, mut stored_inputs) = self.load_body_prewarmed(tx_fk)?;
         let mut cache = HashMap::new();
-        self.fill_input_prev_txids_cached(&mut stored_inputs, None, &mut cache)?;
+        self.fill_input_prev_txids_cached(&mut stored_inputs, None, &mut cache, false)?;
         Ok(Self::transaction_from_class_a(
             rec,
             stored_outputs,
@@ -571,6 +571,7 @@ impl Query {
         inputs: &mut [InputRecord],
         wave: Option<&crate::WavePrevoutCache>,
         cache: &mut HashMap<u64, [u8; 32]>,
+        cache_only: bool,
     ) -> Result<(), QueryError> {
         for inp in inputs.iter_mut() {
             if inp.is_coinbase() {
@@ -597,6 +598,12 @@ impl Query {
             .or_else(|| self.confirm_parents.get_parent_txid(Fk(id)));
             let txid = match from_ram {
                 Some(t) => t,
+                None if cache_only => {
+                    return Err(StoreError::Corrupt(
+                        "confirm: prewarm incomplete (parent txid missing from runway)",
+                    )
+                    .into());
+                }
                 // Unique create: one body prefix read, then reused via `cache`.
                 None => self.store.txs.body_txid(Fk(id))?,
             };
@@ -636,21 +643,26 @@ impl Query {
         rec: HeaderRecord,
         tx_fks: Vec<Fk>,
     ) -> Result<Block, QueryError> {
-        self.reconstruct_archived_block_from_parts_wave(rec, tx_fks, None)
+        self.reconstruct_archived_block_from_parts_wave(rec, tx_fks, None, None)
     }
 
     /// Like [`Self::reconstruct_archived_block_from_parts`] but reuses wave-fill
     /// body decodes (one Class A parse per wave-body tx for the whole confirm run).
+    ///
+    /// `prev_hash`: when set (prewarm header plan), wire header needs no store IO.
+    /// When `prewarm_worker_live`, misses fall back to Corrupt rather than store decode.
     pub fn reconstruct_archived_block_from_parts_wave(
         &self,
         rec: HeaderRecord,
         tx_fks: Vec<Fk>,
         mut wave: Option<&mut crate::WavePrevoutCache>,
+        prev_hash: Option<[u8; 32]>,
     ) -> Result<Block, QueryError> {
         if tx_fks.is_empty() {
             return Err(StoreError::Corrupt("block has no transactions"));
         }
-        let header = self.wire_header_from_record(&rec)?;
+        let header = self.wire_header_from_record_prev(&rec, prev_hash)?;
+        let cache_only = self.prewarm_worker_live();
         let mut txdata = Vec::with_capacity(tx_fks.len());
         // Dedup create_fk → txid across the whole block (and prefer wave parents).
         let mut prev_txid_cache: HashMap<u64, [u8; 32]> = HashMap::new();
@@ -661,10 +673,17 @@ impl Query {
                         &mut ins,
                         Some(w),
                         &mut prev_txid_cache,
+                        cache_only,
                     )?;
                     txdata.push(Self::transaction_from_class_a(tx, outs, ins));
                     continue;
                 }
+            }
+            if cache_only {
+                return Err(StoreError::Corrupt(
+                    "confirm: prewarm incomplete (wire body missing from wave)",
+                )
+                .into());
             }
             // No wave body: still use shared cache + parent runway before body_txid.
             let (rec_tx, stored_outputs, mut stored_inputs) = self.load_body_prewarmed(fk)?;
@@ -672,6 +691,7 @@ impl Query {
                 &mut stored_inputs,
                 wave.as_deref(),
                 &mut prev_txid_cache,
+                false,
             )?;
             txdata.push(Self::transaction_from_class_a(
                 rec_tx,

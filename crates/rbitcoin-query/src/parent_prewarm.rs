@@ -1,11 +1,12 @@
-//! Confirm-runway prewarm: RAM-cache lookups; optional mlock; full-decode bodies once.
+//! Batch Class A load for confirm **materialize** (and optional legacy prewarm worker).
 //!
 //! For each height in the batch (ascending):
 //! 1. **Cache**: header + `header_txs`, body ranges.
-//! 2. **`mlock`** (default on; `RBITCOIN_PARENT_PREWARM_MLOCK=0` to disable): body + Class C.
-//! 3. **Full Class A decode** into `by_body` (wave/wire reuse).
-//! 4. **Thin edges** (default create_fk-only) + **parent pin** (full depth by default;
-//!    `PIN_NEAR=K` limits to tip+1‥tip+K).
+//! 2. **Full Class A decode** into `by_body` (wave/wire reuse).
+//! 3. **Thin edges** (default create_fk-only) + **parent pin**.
+//! 4. **`mlock`** (default on; `RBITCOIN_PARENT_PREWARM_MLOCK=0` off): **only parent
+//!    create `tx.body` pages** writeback will patch (spender annotate). Refcounted
+//!    by needing batch heights; tip GC munlocks when heights leave the runway.
 //!
 //! Env: `RBITCOIN_PARENT_PREWARM_{DEPTH,BATCH,HEADROOM,MLOCK,PIN_NEAR,THIN_CREATE_FK_ONLY}`.
 
@@ -34,9 +35,9 @@ pub struct PrewarmStats {
     pub pin_new: u32,
     /// Parent outs served from runway txid map / same-batch.
     pub parent_cache_hits: u32,
-    /// Body txs mlocked + full-decoded (phase 1).
+    /// Body txs full-decoded (phase 1).
     pub body_tx_reads: u32,
-    /// Parent body mlocks (phase 2).
+    /// Parent outs loaded from store (sparse pin).
     pub full_tx_reads: u32,
     /// External parents that could not be resolved.
     pub missing_parents: u32,
@@ -250,7 +251,9 @@ impl Query {
         Ok(())
     }
 
-    /// Prewarm: cache small maps; mlock body + Class C; **full-decode runway bodies**.
+    /// Load Class A for heights into the confirm parent cache (materialize / tests).
+    ///
+    /// Full-decode bodies + parent pin; mlock **parent create body pages only**.
     pub fn prewarm_parents_for_heights(
         &self,
         items: &[(u32, [u8; 32])],
@@ -364,8 +367,11 @@ impl Query {
             );
             st.header_ns = st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
 
-            // ── optional mlock + body ranges ────────────────────────────────
-            let do_mlock = prewarm_mlock_from_env();
+            // ── body ranges (decode); mlock only writeback parent pages later ─
+            // Wave bodies / Class C are read then written on writeback via
+            // strong/height — those pages are small/sparse; the multi-page
+            // write path that benefits from mlock is parent create bodies
+            // (spender annotate). See pin loop below.
             let t_ml = Instant::now();
             st.blocks = st.blocks.saturating_add(1);
 
@@ -377,7 +383,6 @@ impl Query {
                 std::borrow::Cow::Owned(v)
             };
 
-            let mut height_body_abs: Vec<(u64, u64)> = Vec::with_capacity(fks_work.len());
             let mut height_fks_resolved: Vec<(Fk, Option<(u64, u64)>)> =
                 Vec::with_capacity(fks_work.len());
             for fk in fks_work.iter() {
@@ -386,35 +391,12 @@ impl Query {
                 }
                 match self.store.tx_body_range(*fk) {
                     Ok((off, len)) => {
-                        height_body_abs.push((off, len));
                         body_ranges.push((*fk, off, len));
                         height_fks_resolved.push((*fk, Some((off, len))));
                     }
                     Err(_) => {
                         height_fks_resolved.push((*fk, None));
                     }
-                }
-            }
-            if do_mlock {
-                self.mlock_note_skip_pinned(
-                    height,
-                    &self.store.mlock_confirmed_height(height),
-                );
-                let (_body_ml, sys, sk) =
-                    self.mlock_body_spans_for_heights(&[height], &height_body_abs);
-                st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
-                st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
-                for &(fk, range) in &height_fks_resolved {
-                    if range.is_some() {
-                        continue;
-                    }
-                    let body_ml = self.store.mlock_tx_body_only(fk);
-                    st.mlock_syscalls = st.mlock_syscalls.saturating_add(1);
-                    self.mlock_note_skip_pinned(height, &body_ml);
-                }
-                for &(fk, _) in &height_fks_resolved {
-                    let cc = self.store.mlock_class_c_tx(fk);
-                    self.mlock_note_skip_pinned(height, &cc);
                 }
             }
             st.body_mlock_ns = st
@@ -712,7 +694,9 @@ impl Query {
             .saturating_add(t_edge.elapsed().as_nanos() as u64);
         st.thin_ns = st.thin_ns.saturating_add(t_thin.elapsed().as_nanos() as u64);
 
-        // ── Pin external parents (tip-near; optional mlock + sparse outs) ───
+        // ── Pin parents (sparse outs) + mlock parent create body pages only ─
+        // Writeback annotates spenders into create outputs; keep those body
+        // pages resident until tip GC (need_heights refcount → 0).
         let do_mlock = prewarm_mlock_from_env();
         let t_par = Instant::now();
         let mut uniq_parents: Vec<u64> = parent_need.keys().copied().collect();
@@ -760,6 +744,27 @@ impl Query {
                 for &h in &need_hs {
                     touch_batch.push((h, pid, need_vouts.clone()));
                 }
+                // Re-note mlock need_heights for this batch even when outs are
+                // already stashed — otherwise tip GC after an earlier batch
+                // can munlock while a later in-flight batch still annotates.
+                if do_mlock {
+                    if let Some((off, len)) = self
+                        .confirm_parents
+                        .get_body_range(fk)
+                        .or_else(|| self.store.tx_body_range(fk).ok())
+                    {
+                        let (_, sys, sk) =
+                            self.mlock_body_spans_for_heights(&need_hs, &[(off, len)]);
+                        st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
+                        st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
+                    } else {
+                        let body_ml = self.store.mlock_tx_body_only(fk);
+                        st.mlock_syscalls = st.mlock_syscalls.saturating_add(1);
+                        for h in &need_hs {
+                            self.mlock_note_skip_pinned(*h, &body_ml);
+                        }
+                    }
+                }
                 st.utxo_parents = st.utxo_parents.saturating_add(1);
                 continue;
             }
@@ -774,14 +779,11 @@ impl Query {
                     if let Some((off, len)) = range {
                         parent_ranges.push((fk, off, len));
                         if do_mlock {
+                            // Parent create body only (spender annotate write path).
                             let (_, sys, sk) =
                                 self.mlock_body_spans_for_heights(&need_hs, &[(off, len)]);
                             st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
                             st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
-                            let cc = self.store.mlock_class_c_tx(fk);
-                            for h in &need_hs {
-                                self.mlock_note_skip_pinned(*h, &cc);
-                            }
                         }
                     }
                     let unspent = self
@@ -835,10 +837,6 @@ impl Query {
                         self.mlock_body_spans_for_heights(&need_hs, &[(off, len)]);
                     st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
                     st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
-                    let cc = self.store.mlock_class_c_tx(fk);
-                    for h in &need_hs {
-                        self.mlock_note_skip_pinned(*h, &cc);
-                    }
                 }
                 // Sparse outs + spent filter + coinbase height for wave.
                 if !need_vouts.is_empty() {
@@ -891,10 +889,6 @@ impl Query {
                     st.mlock_syscalls = st.mlock_syscalls.saturating_add(1);
                     for h in &need_hs {
                         self.mlock_note_skip_pinned(*h, &body_ml);
-                    }
-                    let cc = self.store.mlock_class_c_tx(fk);
-                    for h in &need_hs {
-                        self.mlock_note_skip_pinned(*h, &cc);
                     }
                 }
                 // No range: try idx-based outs for sparse stash (rare).

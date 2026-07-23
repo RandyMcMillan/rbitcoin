@@ -48,10 +48,10 @@ pub use scripthash::{
 };
 pub use wave_prevout::WavePrevoutCache;
 
-/// Parent-prewarm window counters (reset by the IBD ~5s sampler).
+/// Materialize Class A load / parent-pin window counters (IBD ~5s sampler).
 ///
-/// Background prewarm worker owns Class A load during IBD; confirm only waits.
-/// Pair with [`Query::parent_prewarm_perf_snapshot`] for ahead-of-tip watermark.
+/// Accrued by `prewarm_parents_for_heights` (now called inline from materialize).
+/// Pair with [`Query::parent_prewarm_perf_snapshot`] for cache watermarks.
 pub mod parent_prewarm_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 

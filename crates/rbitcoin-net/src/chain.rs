@@ -229,7 +229,7 @@ impl ChainHub {
         Ok((need, need_meta))
     }
 
-    /// MATERIALIZE stage: prewarm wait → resolve → wave → wire → assemble.
+    /// MATERIALIZE stage: Class A load + pin/mlock parents → resolve → wave → wire → assemble.
     /// Hand result to [`Self::confirm_scripts`].
     pub fn confirm_materialize_phase(
         &self,

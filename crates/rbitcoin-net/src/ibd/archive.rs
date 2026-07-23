@@ -106,7 +106,7 @@ impl ArchivePipelineSample {
 ///
 /// Sized so network stays busy and ContigPark can form mega-batches without a
 /// multi‑GiB junkyard. Wire-size undercounts true RSS of decoded `Block` + prep
-/// (×1.5 charge); still stacked with prewarm mlock + page cache.
+/// (×1.5 charge); still stacked with parent-body mlock + page cache.
 pub const DEFAULT_ARCHIVE_QUEUE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Enter “pressure” (far_scale = 0) when fill ≥ this fraction of budget.

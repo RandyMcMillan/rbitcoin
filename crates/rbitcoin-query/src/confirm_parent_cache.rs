@@ -1,16 +1,18 @@
 //! Block-structured **confirm parent runway** (replaces generic Class A cache).
 //!
-//! Prewarm strategy:
+//! Materialize-stage strategy (no background prewarm worker):
 //! - **RAM-cache** small lookups: header head/body, `header_txs`, `tx.head`→fk,
 //!   `tx.idx` body ranges.
-//! - **`mlock`** large / write-path pages only: `tx.body`, `strong_tx`, `tx_height`,
-//!   `confirmed[h]`. Never mlock `spenders` (no multi-spend writes in IBD).
-//! - **Full-decode** runway Class A bodies into `by_body` once; wave_fill / wire
+//! - **Full-decode** batch Class A bodies into `by_body` once; wave_fill / wire
 //!   rebuild consume that cache (no second packed parse on confirm).
+//! - **`mlock`** only parent create `tx.body` pages writeback will patch
+//!   (spender annotate). Refcounted via `need_heights`; tip GC after writeback
+//!   `munlock`s when no active confirm batch still references the page.
+//!   Never mlock `spenders` (no multi-spend writes in IBD).
 //!
 //! - **Runway creates** register `txid → fk` so same-batch spends skip head probes.
 //! - **Thin input edges** stashed per spend tx after a lightweight prevout walk.
-//! - A height is **ready** once scanned (cache filled + body mlocked).
+//! - A height is **ready** once scanned (cache filled + parents pinned).
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{HeaderRecord, InputRecord, MlockRange, OutputRecord, TxRecord};
@@ -65,7 +67,7 @@ pub fn prewarm_headroom_from_env() -> u32 {
         .clamp(0, MAX_PREWARM_DEPTH)
 }
 
-/// Default: mlock **on** (body + Class C pages for runway / parents).
+/// Default: mlock **on** (parent create `tx.body` pages for writeback annotate).
 /// Set `=0`/`false`/`off` for decode-stash only (no mlock syscalls).
 pub fn prewarm_mlock_from_env() -> bool {
     match std::env::var("RBITCOIN_PARENT_PREWARM_MLOCK") {
@@ -2832,6 +2834,37 @@ mod tests {
         let unlocks = c.advance_tip(20);
         assert_eq!(unlocks.len(), 1, "munlock when writeback done for all needers");
         assert_eq!(c.mlock_stats().0, 0);
+    }
+
+    /// Materialize batches re-note the same parent body page for later heights
+    /// (covered pin path). Without re-note, tip GC after the first batch would
+    /// munlock while a later in-flight batch still needs the page for annotate.
+    #[test]
+    fn re_note_need_height_after_first_batch_keeps_mlock_across_pipeline() {
+        use rbitcoin_store::{MlockRange, MlockTable};
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(0);
+        let r = MlockRange {
+            table: MlockTable::TxBody,
+            page_start: 8192,
+            page_len: 4096,
+        };
+        // Batch A (height 10) mlocks parent body.
+        c.note_mlock_ranges(10, &[r]);
+        assert!(c.is_range_pinned(&r));
+        // Batch B (height 11) finds pin covered — must still re-note need 11.
+        c.note_mlock_ranges(11, &[r]);
+        // Writeback A advances tip through 10; B still in flight.
+        let unlocks = c.advance_tip(10);
+        assert!(
+            unlocks.is_empty(),
+            "batch B need_height must keep parent body mlocked: {unlocks:?}"
+        );
+        assert!(c.is_range_pinned(&r));
+        // Writeback B done.
+        let unlocks = c.advance_tip(11);
+        assert_eq!(unlocks.len(), 1);
+        assert!(!c.is_range_pinned(&r));
     }
 
     /// Bodies register sticky only (not dual by_txid). Identity survives tip GC.

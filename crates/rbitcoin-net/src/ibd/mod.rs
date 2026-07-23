@@ -27,7 +27,6 @@ mod exit;
 mod path;
 mod peer_io;
 mod perf_log;
-mod prewarm;
 mod progress;
 mod state;
 mod status;
@@ -50,7 +49,6 @@ use exit::{
     all_peers_dead_action, catchup_complete_after_drain, header_lag_behind_peers, path_drained,
     peer_caught_up, AllPeersDead,
 };
-use prewarm::{spawn_parent_prewarm, PrewarmControl};
 use progress::{
     format_rate, ibd_pct, work_chain_progress, TipRateTracker,
 };
@@ -66,7 +64,6 @@ use status::LoopStats;
 use crate::chain::ChainHub;
 use crate::codec::MAX_HEADERS_RESULTS;
 use crate::error::NetError;
-use bitcoin::hashes::Hash;
 use bitcoin::p2p::Magic;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -402,13 +399,14 @@ pub async fn ibd_cancellable(
     // Fresh cancel state for this IBD session (may have been set on prior stop).
     hub.query.clear_confirm_cancel();
 
-    // Parent prewarm: high-prio runway worker loads/pins parents for tip+1…tip+1k
-    // so confirm wave-fill hits RAM instead of contending with archive I/O.
-    let prewarm_ctrl = Arc::new(PrewarmControl::new());
-    let mut prewarm_join = Some(spawn_parent_prewarm(
-        Arc::clone(&hub.query),
-        Arc::clone(&prewarm_ctrl),
-    ));
+    // Materialize owns Class A load for each claimed batch (no background
+    // prewarm worker). Parent create body pages for writeback annotate are
+    // mlocked with refcounted need_heights; tip GC munlocks after writeback.
+    hub.query.set_prewarm_worker_live(false);
+    info!(
+        "ibd: confirm materialize loads Class A inline (no background prewarm worker; \
+         mlock writeback parent body pages only)"
+    );
 
     // Dedicated confirm path — never blocks the network/archive event loop.
     let confirm_feed = Arc::new(ConfirmFeed::new());
@@ -662,29 +660,6 @@ pub async fn ibd_cancellable(
             let tips = work_path_tips(&st);
             let _ = request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
             last_progress = Instant::now();
-        }
-
-        // Publish confirm runway for the parent-prewarm worker (tip+1 … tip+depth).
-        // Seed plans for the full runway so confirm headroom can wait on
-        // unfinished heights (not just the last-mile batch).
-        {
-            let tip = hub.tip_height().unwrap_or(0);
-            let arch = st.max_archived_height;
-            let depth = hub.query.parent_prewarm_depth();
-            let end = tip.saturating_add(depth).min(arch);
-            let mut items = Vec::new();
-            if end > tip {
-                items.reserve((end - tip) as usize);
-                for h in (tip + 1)..=end {
-                    if let Some(&hash) = st.height_to_hash.get(&h) {
-                        items.push((h, hash.to_byte_array()));
-                    } else {
-                        break; // keep contiguous
-                    }
-                }
-            }
-            hub.query.seed_parent_runway(&items);
-            prewarm_ctrl.publish(tip, arch, items);
         }
 
         // Stall only after progress events are applied.
@@ -1131,16 +1106,12 @@ pub async fn ibd_cancellable(
         t_teardown.elapsed()
     );
 
-    // 2) Signal cooperative stops. Confirm cancel aborts prewarm waits so the
-    //    engine can exit; we **always join** it before returning (no ghost rejects
-    //    minutes after "clean exit").
+    // 2) Signal cooperative stops. Confirm cancel aborts materialize loads so
+    //    the engine can exit; we **always join** it before returning (no ghost
+    //    rejects minutes after "clean exit").
     confirm_feed.request_stop();
     hub.query.request_confirm_cancel();
     archive_stop.store(true, Ordering::Relaxed);
-    prewarm_ctrl.request_stop();
-    if let Some(h) = prewarm_join.take() {
-        let _ = h.join();
-    }
 
     // 3) Stop feeding the archive queue; prep/writer exit on stop + closed channels.
     drop(arch_job_tx);

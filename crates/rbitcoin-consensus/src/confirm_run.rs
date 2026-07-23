@@ -3,7 +3,7 @@
 //! Pipeline (optimistic scripts — assumevalid-shaped):
 //! ```text
 //! MATERIALIZE STAGE (ibd-confirm-materialize OS thread):
-//!   prewarm_wait → resolve → wave → wire → assemble
+//!   load Class A + pin/mlock writeback parents → resolve → wave → wire → assemble
 //! SCRIPT STAGE (ibd-confirm OS thread + rayon):
 //!   scripts only
 //! WRITEBACK STAGE (ibd-confirm-writeback OS thread, FIFO):
@@ -13,9 +13,10 @@
 //! [`confirm_archived_run`] runs all stages synchronously (tests / tip path).
 //! IBD pipelines the three stages so materialize(N+1) ∥ scripts(N) ∥ writeback(N−1).
 //!
-//! **Prewarm ownership:** the IBD background worker loads Class A into
-//! [`ConfirmParentCache`]. Materialize **only waits** (Condvar notify on mark_scanned)
-//! — it never last-miles / duplicates prewarm work while the worker is live.
+//! **Materialize owns Class A load** (no background prewarm worker). Parent
+//! create `tx.body` pages that writeback will annotate are `mlock`ed with
+//! refcounted need_heights; writeback tip GC `munlock`s when no active batch
+//! still references them.
 
 use crate::block::{
     assemble_block_prevouts, bip34_height_script, block_has_witness, structural_validate_spends,
@@ -102,7 +103,7 @@ pub fn confirm_archived_run(
 /// Outcome of materialize: batch ready for scripts + pure work wall.
 pub struct ConfirmMaterializeOutcome {
     pub batch: MaterializedBatch,
-    /// Resolve → wave → wire → assemble only (not prewarm Condvar wait).
+    /// Full materialize wall (inline Class A load + resolve → assemble).
     pub work_ns: u64,
 }
 
@@ -114,13 +115,15 @@ pub struct ConfirmScriptOutcome {
     pub work_ns: u64,
 }
 
-/// MATERIALIZE STAGE: prewarm wait → resolve → wave → wire → assemble.
+/// MATERIALIZE STAGE: load batch Class A + pin/mlock writeback parents →
+/// resolve → wave → wire → assemble.
 ///
 /// Does **not** run scripts, advance tip, or probe durable spentness (except
 /// provisional same-run doubles during assemble).
 ///
-/// Prewarm wait is tracked in [`confirm_phase_stats::PREWARM_WAIT_NS`] and
-/// excluded from [`ConfirmMaterializeOutcome::work_ns`].
+/// Inline Class A load is included in [`ConfirmMaterializeOutcome::work_ns`]
+/// and also accrued into [`confirm_phase_stats::PREWARM_WAIT_NS`] (historical
+/// counter name) for IBD log continuity.
 pub fn confirm_materialize_phase(
     query: &Query,
     params: &ChainParams,
@@ -139,17 +142,9 @@ pub fn confirm_materialize_phase(
         }
     }
 
-    // Seed + wait **before** store access so cold plan/header probes are not
-    // charged as materialize work and (with worker live) do not majflt.
     let heights: Vec<u32> = blocks.iter().map(|(h, _)| h.0).collect();
     let items: Vec<(u32, [u8; 32])> = blocks.iter().map(|(h, hash)| (h.0, *hash)).collect();
     let batch_end = heights.last().copied().unwrap_or(0);
-    let t_pw = Instant::now();
-    wait_for_prewarm(query, &heights, &items, batch_end)?;
-    confirm_phase_stats::PREWARM_WAIT_NS.fetch_add(
-        t_pw.elapsed().as_nanos() as u64,
-        Ordering::Relaxed,
-    );
 
     let t_work = Instant::now();
     let _majflt = ConfirmMajfltGuard::start(
@@ -157,7 +152,13 @@ pub fn confirm_materialize_phase(
         blocks.len(),
     );
 
-    // Prefer runway cache; store-fallback on miss (same work as 2-stage).
+    // Inline batch load (no background prewarm): decode bodies, pin parents,
+    // mlock only parent create body pages writeback will patch.
+    let t_load = Instant::now();
+    load_batch_for_materialize(query, &heights, &items, batch_end)?;
+    let load_ns = t_load.elapsed().as_nanos() as u64;
+    confirm_phase_stats::PREWARM_WAIT_NS.fetch_add(load_ns, Ordering::Relaxed);
+
     let t_resolve = Instant::now();
     let metas = resolve_body_metas(query, blocks, false)?;
     confirm_phase_stats::RESOLVE_NS.fetch_add(
@@ -214,8 +215,7 @@ pub fn confirm_scripts_phase(
 
 /// MATERIALIZE + SCRIPTS in one call (tests / tip path / ChainHub compat).
 ///
-/// Prewarm wait excluded from [`ConfirmScriptOutcome::work_ns`]; work is
-/// materialize + scripts.
+/// Work is full materialize (including Class A load) + scripts.
 pub fn confirm_script_phase(
     query: &Query,
     params: &ChainParams,
@@ -370,7 +370,7 @@ impl Drop for ConfirmMajfltGuard {
         }
         let delta = after - before;
         rbitcoin_log::warn!(
-            "confirm: major page fault(s) on confirm thread delta={delta} first_h={} n={} elapsed_ms={} (cold store touch; prewarm/mlock gap)",
+            "confirm: major page fault(s) on confirm thread delta={delta} first_h={} n={} elapsed_ms={} (cold store touch; materialize/mlock gap)",
             self.first_h,
             self.n_blocks,
             self.started.elapsed().as_millis(),
@@ -436,14 +436,11 @@ mod writeback_idempotent_tests {
 
 // ─── phases ───────────────────────────────────────────────────────────────────
 
-/// Wait for the confirm batch to be prewarm-ready.
+/// Load Class A for the claimed batch into the confirm parent cache.
 ///
-/// - **Worker live (IBD):** only wait on ready Condvar — never call
-///   `prewarm_parents_for_heights` (would duplicate the worker).
-/// - **No worker (unit tests):** sole owner — prewarm the batch once, then proceed.
-///
-/// Headroom beyond the batch is soft (best-effort).
-fn wait_for_prewarm(
+/// Always **inline** (no background prewarm). If a legacy worker is still live
+/// (tests), wait on Condvar instead of double-loading.
+fn load_batch_for_materialize(
     query: &Query,
     heights: &[u32],
     items: &[(u32, [u8; 32])],
@@ -452,11 +449,10 @@ fn wait_for_prewarm(
     if heights.is_empty() {
         return Ok(());
     }
-    // Seed plans so the worker knows which heights to mark ready.
     query.seed_parent_runway(items);
 
     if query.prewarm_worker_live() {
-        // Wait only — worker does all Class A load / decode / mlock.
+        // Legacy path: worker owns load — wait only.
         query
             .wait_prewarm_ready_with_headroom(
                 heights,
@@ -466,7 +462,7 @@ fn wait_for_prewarm(
             )
             .map_err(ConsensusError::Store)?;
     } else {
-        // No background worker (tests): we own prewarm exclusively.
+        // Materialize owns load for this batch only.
         query
             .prewarm_parents_for_heights(items)
             .map_err(ConsensusError::Store)?;

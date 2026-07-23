@@ -85,9 +85,10 @@ pub(crate) fn is_prewarm_retryable(msg: &str) -> bool {
 
 /// Spawn confirm **materialize** + **scripts** + **writeback** OS threads.
 ///
-/// Materialize (wait→wave→wire→assemble) on `ibd-confirm-materialize`; scripts
-/// on `ibd-confirm`; structural + Class C + spend annotate on
-/// `ibd-confirm-writeback`. Overlap: materialize(N+1) ∥ scripts(N) ∥ writeback(N−1).
+/// Materialize (Class A load + pin/mlock parents → wave → wire → assemble) on
+/// `ibd-confirm-materialize`; scripts on `ibd-confirm`; structural + Class C +
+/// spend annotate on `ibd-confirm-writeback`.
+/// Overlap: materialize(N+1) ∥ scripts(N) ∥ writeback(N−1).
 /// Returns the materialize-thread join handle (downstream joins on channel close).
 pub(crate) fn spawn_confirm_engine(
     hub: Arc<ChainHub>,

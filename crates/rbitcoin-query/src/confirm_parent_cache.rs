@@ -675,6 +675,10 @@ impl ConfirmParentCache {
     /// Full body for parent pin (runway or post-confirm LRU).
     ///
     /// Prefer this over a store re-decode when the create is already full-decoded.
+    ///
+    /// **Hot path:** use [`Self::get_bodies_for_pin_batch`] — this clones **all**
+    /// inputs/outputs and takes the cache lock per call (scales poorly with
+    /// `|by_body|` under IBD pin volume).
     pub fn get_body_for_pin(
         &self,
         fk: Fk,
@@ -690,6 +694,67 @@ impl ConfirmParentCache {
         );
         g.touch_body_lru(id);
         Some(out)
+    }
+
+    /// Slim pin hits under **one** lock: only clone requested outs + tx meta.
+    ///
+    /// `items`: `(create_fk_id, need_vouts)`. Missing bodies omitted.
+    ///
+    /// Returns `id → (create_height, tx, outs, coinbase_hint, body_range)`:
+    /// - `outs`: only requested vouts that exist on the body (not spent-filtered)
+    /// - `coinbase_hint`: `Some(true)` clearly coinbase, `Some(false)` not,
+    ///   `None` ambiguous 1-in (caller may store-resolve)
+    /// - `body_range`: cached absolute range if known
+    ///
+    /// Touches body LRU once per hit. Avoids cloning full witness/input vectors
+    /// that made per-parent pin scale with uptime as `|by_body|` grew.
+    pub fn get_bodies_for_pin_batch(
+        &self,
+        items: &[(u64, Vec<u32>)],
+    ) -> HashMap<
+        u64,
+        (
+            u32,
+            TxRecord,
+            Vec<(u32, OutputRecord)>,
+            Option<bool>,
+            Option<(u64, u64)>,
+        ),
+    > {
+        if items.is_empty() {
+            return HashMap::new();
+        }
+        let mut g = self.inner.lock().unwrap();
+        let mut out = HashMap::with_capacity(items.len());
+        for (id, vouts) in items {
+            let hit = {
+                let Some(e) = g.by_body.get(id) else {
+                    continue;
+                };
+                let mut outs = Vec::with_capacity(vouts.len());
+                for &v in vouts {
+                    if let Some(o) = e.outputs.get(v as usize) {
+                        outs.push((v, o.clone()));
+                    }
+                }
+                let cb_hint = if e.tx.input_count != 1 {
+                    Some(false)
+                } else if e
+                    .inputs
+                    .first()
+                    .is_some_and(|i| i.is_coinbase() || i.prev_index == u32::MAX)
+                {
+                    Some(true)
+                } else {
+                    None
+                };
+                let range = g.body_range.get(id).copied();
+                (e.height, e.tx.clone(), outs, cb_hint, range)
+            };
+            g.touch_body_lru(*id);
+            out.insert(*id, hit);
+        }
+        out
     }
 
     /// `(body_count, confirmed_lru_bytes, lru_cap_bytes, lazy_deque_len)` for perf/tests.
@@ -1022,13 +1087,22 @@ impl ConfirmParentCache {
             return;
         };
         let mut g = self.inner.lock().unwrap();
-        g.put_parent_outs_resolved_inner(height, id, tx, live, checked, coinbase_height);
+        g.put_parent_outs_resolved_inner(
+            height,
+            id,
+            tx,
+            live,
+            checked,
+            coinbase_height,
+            None,
+        );
     }
 
     /// Many resolved parents under one lock (parent pin finish).
     ///
-    /// Tuple: `(height, fk, tx, live, checked, coinbase_height)`.
+    /// Tuple: `(height, fk, tx, live, checked, coinbase_height, create_height)`.
     /// `coinbase_height`: `None` = not stashed; `Some(None)` = not cb; `Some(Some(h))` = height.
+    /// `create_height`: body height when known (pin_cache / runway) for GC keep-alive.
     pub fn put_parent_outs_resolved_batch(
         &self,
         items: &[(
@@ -1038,17 +1112,26 @@ impl ConfirmParentCache {
             Vec<(u32, OutputRecord)>,
             Vec<u32>,
             Option<Option<u32>>,
+            Option<u32>,
         )],
     ) {
         if items.is_empty() {
             return;
         }
         let mut g = self.inner.lock().unwrap();
-        for (height, fk, tx, live, checked, cb) in items {
+        for (height, fk, tx, live, checked, cb, create_h) in items {
             let Some(id) = fk.get() else {
                 continue;
             };
-            g.put_parent_outs_resolved_inner(*height, id, tx.clone(), live, checked, *cb);
+            g.put_parent_outs_resolved_inner(
+                *height,
+                id,
+                tx.clone(),
+                live,
+                checked,
+                *cb,
+                *create_h,
+            );
         }
     }
 
@@ -1664,6 +1747,7 @@ impl Inner {
             &[(vout, output)],
             &[vout],
             None,
+            None,
         );
     }
 
@@ -1702,6 +1786,7 @@ impl Inner {
         live: &[(u32, OutputRecord)],
         checked: &[u32],
         coinbase_height: Option<Option<u32>>,
+        create_height: Option<u32>,
     ) {
         let txid = tx.txid;
         {
@@ -1715,6 +1800,9 @@ impl Inner {
             e.tx = tx;
             if coinbase_height.is_some() {
                 e.coinbase_height = coinbase_height;
+            }
+            if create_height.is_some() {
+                e.create_height = create_height;
             }
             for &v in checked {
                 e.checked.insert(v);
@@ -2828,5 +2916,62 @@ mod tests {
         );
         // Runway still present.
         assert!(c.has_body(Fk(1000)));
+    }
+
+    /// Slim batch pin: only requested outs, one lock, coinbase hint; no full input clone.
+    #[test]
+    fn get_bodies_for_pin_batch_slims_outs_and_covers_after_put() {
+        let c = ConfirmParentCache::new();
+        c.advance_tip(0);
+        let mut t = tx(7);
+        t.input_count = 1;
+        let coinbase_in = InputRecord {
+            prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![0xde; 200], // would be expensive if cloned every pin
+            witness: vec![vec![0xad; 500]],
+        };
+        c.put_body(
+            Fk(77),
+            5,
+            t.clone(),
+            vec![out(10), out(20), out(30)],
+            vec![coinbase_in],
+        );
+        c.put_body_range(Fk(77), 1000, 64);
+
+        let hits = c.get_bodies_for_pin_batch(&[(77, vec![0, 2])]);
+        let (h, txr, outs, cb, range) = hits.get(&77).expect("hit");
+        assert_eq!(*h, 5);
+        assert_eq!(txr.txid, t.txid);
+        assert_eq!(outs.len(), 2);
+        assert_eq!(outs[0].0, 0);
+        assert_eq!(outs[1].0, 2);
+        assert_eq!(*cb, Some(true));
+        assert_eq!(*range, Some((1000, 64)));
+
+        // After spent-filtered put, same vouts are pin_covered (cheap path).
+        c.put_parent_outs_resolved(
+            6,
+            Fk(77),
+            txr.clone(),
+            &[(0, outs[0].1.clone())],
+            &[0, 2],
+            Some(Some(5)),
+        );
+        // create_height via batch put path
+        c.put_parent_outs_resolved_batch(&[(
+            6,
+            Fk(77),
+            txr.clone(),
+            vec![(0, outs[0].1.clone())],
+            vec![0, 2],
+            Some(Some(5)),
+            Some(5),
+        )]);
+        assert!(c.parent_pin_covered(Fk(77), &[0, 2]));
+        assert!(!c.parent_pin_covered(Fk(77), &[0, 1])); // vout 1 never checked
     }
 }

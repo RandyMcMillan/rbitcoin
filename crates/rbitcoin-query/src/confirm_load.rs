@@ -504,7 +504,7 @@ impl Query {
         // Per-parent mlock (not batch-coalesced): each call notes page_refs so the
         // next parent can skip already-pinned pages. Batching all ranges first
         // notes only at the end → mlock_sys skip=0 and worse wall time.
-        // (max_height, fk, tx, live outs, checked vouts, coinbase_height)
+        // (max_height, fk, tx, live outs, checked vouts, coinbase_height, create_height)
         let mut sparse_parents: Vec<(
             u32,
             Fk,
@@ -512,22 +512,18 @@ impl Query {
             Vec<(u32, rbitcoin_store::OutputRecord)>,
             Vec<u32>,
             Option<Option<u32>>,
+            Option<u32>,
         )> = Vec::with_capacity(pin_jobs.len());
+
+        // Split covered vs rest; batch body-LRU pin under one cache lock (slim outs).
+        let mut uncovered: Vec<(usize, u64, u32, Vec<u32>, Vec<u32>)> = Vec::new();
         for (i, (pid, max_h, need_hs, need_vouts)) in pin_jobs.into_iter().enumerate() {
-            if self.confirm_cancelled() {
-                crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
-                return Err(StoreError::Cancelled("confirm cancelled"));
-            }
-            let fk = Fk(pid);
             if covered.get(i).copied().unwrap_or(false) {
                 st.pin_already_cached = st.pin_already_cached.saturating_add(1);
-                // Keep-alive for GC on every needing height (not only max_h).
                 for &h in &need_hs {
                     touch_batch.push((h, pid, need_vouts.clone()));
                 }
-                // Re-note mlock need_heights for this batch even when outs are
-                // already stashed — otherwise tip GC after an earlier batch
-                // can munlock while a later in-flight batch still annotates.
+                let fk = Fk(pid);
                 if do_mlock {
                     if let Some((off, len)) = self
                         .confirm_parents
@@ -547,51 +543,69 @@ impl Query {
                     }
                 }
                 st.utxo_parents = st.utxo_parents.saturating_add(1);
-                continue;
+            } else {
+                uncovered.push((i, pid, max_h, need_hs, need_vouts));
             }
-            // Prefer cache full body (same-bite / prior-bite creates) — no Class A
-            // re-decode. package_ready still needs spent-filtered by_fk.
+        }
+
+        let body_pin_keys: Vec<(u64, Vec<u32>)> = uncovered
+            .iter()
+            .filter(|(_, _, _, _, vouts)| !vouts.is_empty())
+            .map(|(_, pid, _, _, vouts)| (*pid, vouts.clone()))
+            .collect();
+        let body_hits = self
+            .confirm_parents
+            .get_bodies_for_pin_batch(&body_pin_keys);
+
+        for (_i, pid, max_h, need_hs, need_vouts) in uncovered {
+            if self.confirm_cancelled() {
+                crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                return Err(StoreError::Cancelled("confirm cancelled"));
+            }
+            let fk = Fk(pid);
+            // Prefer cache body (runway / post-confirm LRU) — slim clone, no full inputs.
             if !need_vouts.is_empty() {
-                if let Some((create_h, tx, outs, inputs)) =
-                    self.confirm_parents.get_body_for_pin(fk)
-                {
-                    // RAM hit (runway or post-confirm body LRU): no store decode.
-                    // Skip mlock — write may fault pages; preferred over cold pin_new.
+                if let Some((create_h, tx, outs, cb_hint, range)) = body_hits.get(&pid) {
                     st.pin_cache_body = st.pin_cache_body.saturating_add(1);
-                    let range = self.confirm_parents.get_body_range(fk);
-                    if let Some((off, len)) = range {
+                    if let Some((off, len)) = *range {
                         parent_ranges.push((fk, off, len));
                     }
                     let unspent = self
                         .store
-                        .unspent_create_vouts(fk, &need_vouts, range)
+                        .unspent_create_vouts(fk, &need_vouts, *range)
                         .unwrap_or_else(|_| need_vouts.clone());
                     let unspent_set: std::collections::HashSet<u32> =
                         unspent.into_iter().collect();
                     let mut live = Vec::with_capacity(unspent_set.len());
-                    for &v in &need_vouts {
-                        if unspent_set.contains(&v) {
-                            if let Some(o) = outs.get(v as usize) {
-                                live.push((v, o.clone()));
-                            }
+                    for (v, o) in outs {
+                        if unspent_set.contains(v) {
+                            live.push((*v, o.clone()));
                         }
                     }
-                    let cb_stash = if tx.input_count == 1
-                        && inputs
-                            .first()
-                            .is_some_and(|i| i.is_coinbase() || i.prev_index == u32::MAX)
-                    {
-                        Some(Some(create_h))
-                    } else if tx.input_count == 1 {
-                        // Ambiguous 1-in: fall back to store height if available.
-                        match self.resolve_parent_coinbase_height(fk, tx.input_count, range) {
-                            Ok(v) => Some(v),
-                            Err(_) => Some(None),
+                    let cb_stash = match *cb_hint {
+                        Some(true) => Some(Some(*create_h)),
+                        Some(false) => Some(None),
+                        None => {
+                            // Ambiguous 1-in: fall back to store height if available.
+                            match self.resolve_parent_coinbase_height(
+                                fk,
+                                tx.input_count,
+                                *range,
+                            ) {
+                                Ok(v) => Some(v),
+                                Err(_) => Some(None),
+                            }
                         }
-                    } else {
-                        Some(None)
                     };
-                    sparse_parents.push((max_h, fk, tx, live, need_vouts.clone(), cb_stash));
+                    sparse_parents.push((
+                        max_h,
+                        fk,
+                        tx.clone(),
+                        live,
+                        need_vouts.clone(),
+                        cb_stash,
+                        Some(*create_h),
+                    ));
                     for &h in &need_hs {
                         touch_batch.push((h, pid, need_vouts.clone()));
                     }
@@ -648,6 +662,7 @@ impl Query {
                                 live,
                                 need_vouts.clone(),
                                 cb_stash,
+                                None,
                             ));
                             for &h in &need_hs {
                                 touch_batch.push((h, pid, need_vouts.clone()));
@@ -697,6 +712,7 @@ impl Query {
                             live,
                             need_vouts.clone(),
                             cb_stash,
+                            None,
                         ));
                         for &h in &need_hs {
                             touch_batch.push((h, pid, need_vouts.clone()));
@@ -707,16 +723,18 @@ impl Query {
             }
             st.utxo_parents = st.utxo_parents.saturating_add(1);
         }
-        if !touch_batch.is_empty() {
+        // Put by_fk first so touch can attach need_fk for pure pin_new parents
+        // (touch before put was a no-op when neither by_fk nor by_body held them).
+        if !sparse_parents.is_empty() {
             self.confirm_parents
-                .touch_parent_needs_batch(&touch_batch);
+                .put_parent_outs_resolved_batch(&sparse_parents);
         }
         if !parent_ranges.is_empty() {
             self.confirm_parents.put_body_ranges_batch(&parent_ranges);
         }
-        if !sparse_parents.is_empty() {
+        if !touch_batch.is_empty() {
             self.confirm_parents
-                .put_parent_outs_resolved_batch(&sparse_parents);
+                .touch_parent_needs_batch(&touch_batch);
         }
         st.parent_pin_ns = st
             .parent_pin_ns

@@ -7,7 +7,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use rbitcoin_log::{debug, info, warn};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -71,9 +71,48 @@ const CONFIRM_RUN_MAX: usize = 32;
 const OFFER_AHEAD: u32 = 96;
 
 /// Loaded batches waiting for scripts (load(N+1) may run while N scripts).
-const LOAD_QUEUE: usize = 2;
+pub(crate) const LOAD_QUEUE_CAP: usize = 2;
 /// Script-ok batches buffered for write (scripts(N+1) may run while N writes).
-const WRITE_QUEUE: usize = 2;
+pub(crate) const WRITE_QUEUE_CAP: usize = 2;
+
+/// Live depths of the two bounded confirm pipeline queues (0..=cap).
+///
+/// Updated on successful send/recv so the status loop can log pressure without
+/// poking into the OS channels.
+#[derive(Debug, Default)]
+pub(crate) struct ConfirmQueueDepths {
+    /// load → scripts (`SyncSender` capacity [`LOAD_QUEUE_CAP`]).
+    load_to_scripts: AtomicUsize,
+    /// scripts → write (`SyncSender` capacity [`WRITE_QUEUE_CAP`]).
+    scripts_to_write: AtomicUsize,
+}
+
+impl ConfirmQueueDepths {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// `(load→scripts depth, scripts→write depth)`.
+    pub(crate) fn snap(&self) -> (usize, usize) {
+        (
+            self.load_to_scripts.load(Ordering::Relaxed),
+            self.scripts_to_write.load(Ordering::Relaxed),
+        )
+    }
+
+    fn note_load_send(&self) {
+        self.load_to_scripts.fetch_add(1, Ordering::Relaxed);
+    }
+    fn note_load_recv(&self) {
+        self.load_to_scripts.fetch_sub(1, Ordering::Relaxed);
+    }
+    fn note_write_send(&self) {
+        self.scripts_to_write.fetch_add(1, Ordering::Relaxed);
+    }
+    fn note_write_recv(&self) {
+        self.scripts_to_write.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// True when a load/script error should re-queue the batch (not permanent reject).
 #[inline]
@@ -89,20 +128,21 @@ pub(crate) fn is_confirm_load_retryable(msg: &str) -> bool {
 /// `ibd-confirm-load`; scripts on `ibd-confirm`; structural + Class C +
 /// spend annotate on `ibd-confirm-write`.
 /// Overlap: load(N+1) ∥ scripts(N) ∥ write(N−1).
-/// Returns the load-thread join handle (downstream joins on channel close).
+/// Returns the load-thread join handle and shared queue-depth counters.
 pub(crate) fn spawn_confirm_engine(
     hub: Arc<ChainHub>,
     feed: Arc<ConfirmFeed>,
     event_tx: std::sync::mpsc::Sender<ConfirmEvent>,
     accepted: Arc<AtomicU32>,
     loop_stats: Arc<LoopStats>,
-) -> std::thread::JoinHandle<()> {
+) -> (std::thread::JoinHandle<()>, Arc<ConfirmQueueDepths>) {
+    let queues = ConfirmQueueDepths::new();
     let (mat_tx, mat_rx) = std::sync::mpsc::sync_channel::<(
         rbitcoin_consensus::LoadedBatch,
         u64, // load work_ns
-    )>(LOAD_QUEUE);
+    )>(LOAD_QUEUE_CAP);
     let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<rbitcoin_consensus::ScriptOkBatch>(
-        WRITE_QUEUE,
+        WRITE_QUEUE_CAP,
     );
 
     // Write: structural + class_c + annotate; emits tip events.
@@ -111,11 +151,13 @@ pub(crate) fn spawn_confirm_engine(
     let event_tx_wb = event_tx.clone();
     let accepted_wb = Arc::clone(&accepted);
     let loop_stats_wb = Arc::clone(&loop_stats);
+    let q_wb = Arc::clone(&queues);
     let write_thr = std::thread::Builder::new()
         .name("ibd-confirm-write".into())
         .spawn(move || {
             info!("ibd: confirm write on dedicated OS thread");
             while let Ok(batch) = write_rx.recv() {
+                q_wb.note_write_recv();
                 if feed_wb.stopped() || hub_wb.query.confirm_cancelled() {
                     break;
                 }
@@ -198,11 +240,13 @@ pub(crate) fn spawn_confirm_engine(
     let feed_sc = Arc::clone(&feed);
     let event_tx_sc = event_tx.clone();
     let loop_stats_sc = Arc::clone(&loop_stats);
+    let q_sc = Arc::clone(&queues);
     let scripts = std::thread::Builder::new()
         .name("ibd-confirm".into())
         .spawn(move || {
             info!("ibd: confirm scripts on dedicated OS thread (load+write pipelined)");
             while let Ok((mat_batch, mat_ns)) = mat_rx.recv() {
+                q_sc.note_load_recv();
                 if feed_sc.stopped() || hub_sc.query.confirm_cancelled() {
                     break;
                 }
@@ -225,6 +269,7 @@ pub(crate) fn spawn_confirm_engine(
                             info!("ibd: confirm write channel closed");
                             break;
                         }
+                        q_sc.note_write_send();
                         if script_ms > 2_000 || mat_ms > 2_000 {
                             info!(
                                 "ibd: confirm scripts slow batch={n} first={first_h} mat_ms={mat_ms} script_ms={script_ms} wall_ms={}",
@@ -260,8 +305,10 @@ pub(crate) fn spawn_confirm_engine(
         })
         .expect("spawn ibd-confirm");
 
-    // Materialize: claim feed → wait/wave/wire/assemble → scripts queue.
-    std::thread::Builder::new()
+    // Load: claim feed → load/wave/wire/assemble → scripts queue.
+    // Capture queues for depth accounting (moved into this thread).
+    let queues_load = Arc::clone(&queues);
+    let load_join = std::thread::Builder::new()
         .name("ibd-confirm-load".into())
         .spawn(move || {
             info!("ibd: confirm load on dedicated OS thread (wave/wire/assemble)");
@@ -403,6 +450,7 @@ pub(crate) fn spawn_confirm_engine(
                             info!("ibd: confirm scripts channel closed");
                             return;
                         }
+                        queues_load.note_load_send();
                         if work_ms > 2_000 {
                             info!(
                                 "ibd: confirm load slow batch={} first={expect_h} work_ms={work_ms}",
@@ -507,7 +555,8 @@ pub(crate) fn spawn_confirm_engine(
             drop(mat_tx);
             let _ = scripts.join();
         })
-        .expect("spawn ibd-confirm-load")
+        .expect("spawn ibd-confirm-load");
+    (load_join, queues)
 }
 
 /// Offer a run of ready archived heights starting at tip+1 into the confirm feed.
@@ -519,7 +568,7 @@ pub(crate) fn spawn_confirm_engine(
 /// ordered path (that pegged a core at ~130k headers with tip frozen).
 ///
 /// Does **not** require `ordered_set` membership: after resume seed + tip trim,
-/// height_to_hash is the source of truth for the confirm runway. Gating on
+/// height_to_hash is the source of truth for the parent cache. Gating on
 /// ordered_set left tip frozen with hole=0 when the set lagged the height map.
 pub(crate) fn offer_confirm_ready(
     feed: &ConfirmFeed,
@@ -623,7 +672,7 @@ mod tests {
             "confirm: load incomplete (parent package not ready, timeout)"
         ));
         assert!(is_confirm_load_retryable(
-            "confirm: load incomplete (wave body missing from runway)"
+            "confirm: load incomplete (wave body missing from cache)"
         ));
         assert!(!is_confirm_load_retryable("script failed: false"));
         assert!(!is_confirm_load_retryable("prevout already spent"));

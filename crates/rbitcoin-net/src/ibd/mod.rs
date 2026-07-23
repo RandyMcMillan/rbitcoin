@@ -88,7 +88,7 @@ pub(crate) const MAX_ORDERED_HEADERS: usize = 500_000;
 /// Soft cap: stop **requesting** more headers once we have this many on the path.
 /// Multi-peer getheaders while `ordered` was 100k–500k flooded the main loop with
 /// expensive Headers events (drain livelock → multi-minute freezes, getdata starved).
-/// ~64k is ample runway for window=1024 archive race + tip holes.
+/// ~64k is ample cache for window=1024 archive race + tip holes.
 pub(crate) const ORDERED_HEADERS_SOFT_CAP: usize = 64_000;
 
 /// Max blocks in flight to a single peer (Core `MAX_BLOCKS_IN_TRANSIT_PER_PEER`).
@@ -97,7 +97,7 @@ pub(crate) const ORDERED_HEADERS_SOFT_CAP: usize = 64_000;
 /// concurrency scales with peer count (`peers × 16`), not by piling work on few hosts.
 pub const DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 
-/// Near band: tip+1 ..= tip+N (confirm runway + bulk near assign).
+/// Near band: tip+1 ..= tip+N (parent cache + bulk near assign).
 pub(crate) const NEAR_DEPTH: u32 = 4096;
 /// Max contiguous tip+1.. holes to cover per assign.
 pub(crate) const TIP_HOLE_MAX: usize = 32;
@@ -410,7 +410,7 @@ pub async fn ibd_cancellable(
     // Unbounded: SyncSender(512) deadlocked the confirm OS thread when the main
     // loop lagged on header drain (send blocks → tip frozen, hole=0, confirm_blks=0).
     let (confirm_ev_tx, confirm_ev_rx) = std::sync::mpsc::channel::<ConfirmEvent>();
-    let confirm_engine = spawn_confirm_engine(
+    let (confirm_engine, confirm_queues) = spawn_confirm_engine(
         hub.clone(),
         Arc::clone(&confirm_feed),
         confirm_ev_tx,
@@ -497,7 +497,7 @@ pub async fn ibd_cancellable(
 
         // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
         // ContigPark densify scaled by archive free headroom (proportional +
-        // 90%/70% hysteresis). Hard stop densify/runway when !can_assign (at
+        // 90%/70% hysteresis). Hard stop densify/cache when !can_assign (at
         // budget); tip-hole + write_next race always run. In-flight bodies still
         // enqueue (may overshoot). Saturated pipeline → Critical only (CPU).
         let far_scale = archive_queued.far_admission_scale();
@@ -598,31 +598,31 @@ pub async fn ibd_cancellable(
         // Header sync: soft-cap live work (`ordered_set`), not deque len (ghosts).
         //
         // Sparse far-only archives used to push max_archived ≈ max_ordered while
-        // most bodies were still missing. That made `arch_runway` look empty and
+        // most bodies were still missing. That made `arch_cache` look empty and
         // **bypassed the soft cap forever** → header floods, drain livelock,
         // arch_q=0 / writer idle, ~5–10 unique Class A bodies/s despite high BW.
         // Only bypass soft cap when the ordered path is **mostly archived** (dense).
         {
             let live = st.ordered_set.len();
             let known_arch = st.body.known_len();
-            let arch_runway = st
+            let arch_cache = st
                 .max_ordered_height
                 .saturating_sub(st.max_archived_height);
-            let need_arch_runway = want_headers_beyond_soft_cap(
+            let need_arch_cache = want_headers_beyond_soft_cap(
                 live,
                 known_arch,
-                arch_runway,
+                arch_cache,
                 (window as u32).saturating_mul(4).max(2048),
             );
             let under_hard = live < MAX_ORDERED_HEADERS;
             let under_soft = live < ORDERED_HEADERS_SOFT_CAP;
-            if !st.headers_done && under_hard && (under_soft || need_arch_runway) {
+            if !st.headers_done && under_hard && (under_soft || need_arch_cache) {
                 let tip_h = hub.tip_height().unwrap_or(0);
-                let min_runway = window.saturating_mul(8).max(4096);
+                let min_cache = window.saturating_mul(8).max(4096);
                 let want_more = live == 0
-                    || live < min_runway
+                    || live < min_cache
                     || header_lag_behind_peers(&st, tip_h) > 0
-                    || need_arch_runway;
+                    || need_arch_cache;
                 if want_more {
                     let tips = work_path_tips(&st);
                     // Cold start / empty path: fan getheaders to several peers so a
@@ -807,8 +807,7 @@ pub async fn ibd_cancellable(
             let arch_rate = arch_delta as f64 / window_secs;
             let arch_lead = prog.archived.saturating_sub(prog.tip);
             let peers_n = st.slots.iter().filter(|s| s.alive).count();
-            let (_load_through, runway_ahead, _runway_parents, _runway_bodies, _plans, _depth) =
-                hub.query.parent_runway_perf_snapshot();
+            let (load_q, write_q) = confirm_queues.snap();
             let sh_runs = hub.query.scripthash_run_count();
             let mlock_mb = hub.query.confirm_mlock_bytes() / (1024 * 1024);
             let pct = ibd_pct(prog.tip, prog.headers);
@@ -817,13 +816,16 @@ pub async fn ibd_cancellable(
             let eta = tip_rate_tracker.eta_string(now, prog.tip, prog.headers);
 
             // Bold on a TTY so the 5s progress line stands out among perf/debug noise.
+            // conf_q: load→scripts / scripts→write pipeline depth (cap 2 each).
             info_bold!(
-                "ibd: progress {pct}% tip={} ({}/s) arch_hwm={} ({}/s lead={arch_lead}) hole={} peers={peers_n} runway+{runway_ahead} mlock={mlock_mb}MiB sh_runs={sh_runs} horizon={} {eta}",
+                "ibd: progress {pct}% tip={} ({}/s) arch_hwm={} ({}/s lead={arch_lead}) hole={} peers={peers_n} conf_q load={load_q}/{} write={write_q}/{} mlock={mlock_mb}MiB sh_runs={sh_runs} horizon={} {eta}",
                 prog.tip,
                 format_rate(tip_rate),
                 prog.archived,
                 format_rate(arch_rate),
                 prog.tip_hole,
+                confirm::LOAD_QUEUE_CAP,
+                confirm::WRITE_QUEUE_CAP,
                 prog.headers,
             );
             let _ = std::io::Write::flush(&mut std::io::stderr());
@@ -842,8 +844,9 @@ pub async fn ibd_cancellable(
             let arch_q_now = archive_queued.count();
 
             // One sample/reset, then INFO `ibd: perf` (+ DEBUG `ibd: perf_dbg`).
-            let runway_snap = hub.query.parent_runway_perf_snapshot();
+            let parent_cache_snap = hub.query.parent_cache_perf_snapshot();
             let (mlock_n, mlock_bytes) = hub.query.confirm_mlock_stats();
+            let (load_q, write_q) = confirm_queues.snap();
             let perf = perf_log::sample(
                 &loop_stats,
                 &pipe_stats,
@@ -859,7 +862,9 @@ pub async fn ibd_cancellable(
                 prog.tip_hole,
                 peers_n,
                 st.headers_done,
-                runway_snap,
+                parent_cache_snap,
+                load_q,
+                write_q,
                 mlock_n,
                 mlock_bytes,
                 hub.query.scripthash_run_count(),

@@ -64,18 +64,18 @@ pub(crate) fn far_slots_per_peer(per_peer: usize, tip_hole: bool) -> usize {
 /// Whether to request more headers past the soft cap.
 ///
 /// Only when the ordered path is **mostly archived** (dense Class A) and the
-/// height runway to max_ordered is short — never for sparse far-only archives.
+/// height cache to max_ordered is short — never for sparse far-only archives.
 pub(crate) fn want_headers_beyond_soft_cap(
     live: usize,
     known_arch: usize,
-    arch_runway: u32,
-    runway_need: u32,
+    arch_cache: u32,
+    cache_need: u32,
 ) -> bool {
     if live == 0 {
         return true;
     }
     let mostly_archived = known_arch >= live.saturating_mul(3) / 4;
-    mostly_archived && arch_runway < runway_need
+    mostly_archived && arch_cache < cache_need
 }
 
 #[cfg(test)]
@@ -112,9 +112,9 @@ mod tests {
     fn header_soft_cap_density_gate() {
         // Sparse: 4k known of 120k live → no bypass
         assert!(!want_headers_beyond_soft_cap(120_000, 4_000, 100, 2048));
-        // Dense + short runway → bypass
+        // Dense + short cache → bypass
         assert!(want_headers_beyond_soft_cap(64_000, 50_000, 100, 2048));
-        // Dense but long runway → no need
+        // Dense but long cache → no need
         assert!(!want_headers_beyond_soft_cap(64_000, 50_000, 10_000, 2048));
         // Empty path
         assert!(want_headers_beyond_soft_cap(0, 0, 0, 2048));

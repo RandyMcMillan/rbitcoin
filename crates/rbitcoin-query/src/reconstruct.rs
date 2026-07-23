@@ -29,7 +29,7 @@ impl Query {
 
     /// Wave fill from already-resolved per-block Class A fk lists (confirm hot path).
     ///
-    /// - Wave-body txs: **move** load-stage bodies out of the runway (no clone);
+    /// - Wave-body txs: **move** load-stage bodies out of the parent cache (no clone);
     ///   store decode only on cache miss (should be rare after load).
     /// - Thin edges: batch-moved from load stash — no remap.
     /// - External parents: prefer sparse pin from load; store outs-only fallback.
@@ -39,7 +39,7 @@ impl Query {
     ) -> Result<(usize, crate::WavePrevoutCache), QueryError> {
         use crate::wave_fill_stats::{self as wf, add as wf_add, add_count as wf_count};
 
-        // Prefer runway cache; **store-fallback on miss** (2-stage). Hard
+        // Prefer parent cache; **store-fallback on miss** (2-stage). Hard
         // cache-only was pipeline-era extra work that re-queued batches instead
         // of finishing the same Class A load the old path did inline.
         let mut wave_fks: HashSet<u64> = HashSet::new();
@@ -57,7 +57,7 @@ impl Query {
             crate::WavePrevoutCache::with_capacity(wave_tx_fks.len(), wave_tx_fks.len());
         let mut noted = 0usize;
 
-        // Pass 2: move bodies from runway (no clone — 2-stage hot path).
+        // Pass 2: move bodies from cache (no clone — 2-stage hot path).
         let t_body = Instant::now();
         let mut taken_bodies = self.confirm_parents.take_bodies_batch(&wave_tx_fks);
         let mut taken_thin = self.confirm_parents.take_thin_inputs_batch(&wave_tx_fks);
@@ -122,7 +122,7 @@ impl Query {
         wf_count(&wf::BODY_STORE, n_store);
         wf_count(&wf::THIN_CACHE_MOVE, n_thin_move);
         wf_count(&wf::THIN_REBUILD, n_thin_rebuild);
-        // Drop leftover maps early (should be empty when runway complete).
+        // Drop leftover maps early (should be empty when cache complete).
         drop(taken_bodies);
         drop(taken_thin);
 
@@ -137,7 +137,7 @@ impl Query {
         for (pid, needed_vouts) in &parents {
             let fk = Fk(*pid);
             let t_par = Instant::now();
-            // Prefer runway pin; store-fallback like 2-stage.
+            // Prefer parent pin; store-fallback like 2-stage.
             let (tx, mut candidates, spent_filtered) =
                 match self.confirm_parents.get_parent_outs_needed(fk, needed_vouts) {
                     Some((tx, live, filtered)) => (tx, live, filtered),
@@ -229,7 +229,7 @@ impl Query {
 
     /// External parent: only the needed vouts (no full dense outs / no inputs).
     ///
-    /// Third tuple field: `spent_filtered` — runway already dropped spent outs.
+    /// Third tuple field: `spent_filtered` — cache already dropped spent outs.
     fn load_parent_needed_outs(
         &self,
         fk: Fk,
@@ -294,11 +294,11 @@ impl Query {
         Ok(edges)
     }
 
-    /// Body for RPC/Electrum reconstruct: clone from runway if present, else store.
+    /// Body for RPC/Electrum reconstruct: clone from cache if present, else store.
     ///
     /// Confirm wave fill uses [`ConfirmParentCache::take_bodies_batch`] (move-out)
     /// instead — do not call this on the confirm hot path.
-    fn load_body_from_runway(
+    fn load_body_from_cache(
         &self,
         fk: Fk,
     ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>), QueryError> {
@@ -315,7 +315,7 @@ impl Query {
         use crate::wave_fill_stats::{self as wf, add as wf_add};
         let t0 = Instant::now();
         let maj_before = thread_majflt();
-        // Prefer runway-cached idx range (skip idx page fault); body pages mlocked.
+        // Prefer cache-held idx range (skip idx page fault); body pages mlocked.
         let res = if let Some((off, len)) = self.confirm_parents.get_body_range(fk) {
             let (tx, inputs, outs) = self.store.get_tx_full_at(off, len)?;
             Ok((tx, outs, inputs))
@@ -420,7 +420,7 @@ impl Query {
 
     /// Reconstruct a consensus `Transaction` from Class A rows (no stored raw).
     pub fn reconstruct_tx(&self, tx_fk: Fk) -> Result<Transaction, QueryError> {
-        let (rec, stored_outputs, mut stored_inputs) = self.load_body_from_runway(tx_fk)?;
+        let (rec, stored_outputs, mut stored_inputs) = self.load_body_from_cache(tx_fk)?;
         let mut cache = HashMap::new();
         self.fill_input_prev_txids_cached(&mut stored_inputs, None, &mut cache, false)?;
         Ok(Self::transaction_from_class_a(
@@ -475,7 +475,7 @@ impl Query {
     /// body reads/block). Prefer, in order:
     /// 1. already-filled soft prev_txid
     /// 2. wave parent / body_wire TxRecord (confirm hot path — already decoded)
-    /// 3. confirm parent cache (runway sparse / runway body)
+    /// 3. confirm parent cache (cache sparse / cache body)
     /// 4. store `body_txid` (deduped via `cache` across a block)
     pub(crate) fn fill_input_prev_txids_cached(
         &self,
@@ -584,7 +584,7 @@ impl Query {
                 }
             }
             // No wave body: store-fallback (2-stage).
-            let (rec_tx, stored_outputs, mut stored_inputs) = self.load_body_from_runway(fk)?;
+            let (rec_tx, stored_outputs, mut stored_inputs) = self.load_body_from_cache(fk)?;
             self.fill_input_prev_txids_cached(
                 &mut stored_inputs,
                 wave.as_deref(),

@@ -1,4 +1,4 @@
-//! Block-structured **confirm parent runway** (replaces generic Class A cache).
+//! Block-structured **confirm parent cache** (replaces generic Class A cache).
 //!
 //! Materialize-stage strategy (no background load worker):
 //! - **RAM-cache** small lookups: header head/body, `header_txs`, `tx.head`→fk,
@@ -22,10 +22,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Default runway depth (blocks ahead of tip). Override with env.
-pub const DEFAULT_RUNWAY_DEPTH: u32 = 256;
-pub const MIN_RUNWAY_DEPTH: u32 = 32;
-pub const MAX_RUNWAY_DEPTH: u32 = 4096;
+/// Default cache depth (blocks ahead of tip). Override with env.
+pub const DEFAULT_CACHE_DEPTH: u32 = 256;
+pub const MIN_CACHE_DEPTH: u32 = 32;
+pub const MAX_CACHE_DEPTH: u32 = 4096;
 /// Max entries in confirmed-create sticky map (~40 B/entry; 2M ≈ 80 MiB).
 pub const DEFAULT_CONFIRMED_TXID_STICKY_CAP: usize = 2_000_000;
 
@@ -38,37 +38,41 @@ pub fn confirmed_txid_sticky_cap_from_env() -> usize {
         .clamp(10_000, 20_000_000)
 }
 /// Blocks processed per background tick (larger = less overhead / better lead).
-pub const DEFAULT_RUNWAY_BATCH: u32 = 64;
+pub const DEFAULT_CACHE_BATCH: u32 = 64;
 /// Confirm waits until warmer is this many blocks past `batch_end` (when
-/// those heights exist on the runway). Default matches one runway batch.
-pub const DEFAULT_RUNWAY_HEADROOM: u32 = 64;
+/// those heights exist on the parent cache). Default matches one cache batch.
+pub const DEFAULT_CACHE_HEADROOM: u32 = 64;
 
-pub fn runway_depth_from_env() -> u32 {
+pub fn cache_depth_from_env() -> u32 {
     // Prefer RBITCOIN_CONFIRM_*; accept legacy RBITCOIN_PARENT_PREWARM_* names.
     env_u32(
-        &["RBITCOIN_CONFIRM_RUNWAY_DEPTH", "RBITCOIN_PARENT_PREWARM_DEPTH"],
-        DEFAULT_RUNWAY_DEPTH,
+        &[
+            "RBITCOIN_CONFIRM_CACHE_DEPTH",
+            "RBITCOIN_CONFIRM_RUNWAY_DEPTH", // prior name
+            "RBITCOIN_PARENT_PREWARM_DEPTH",
+        ],
+        DEFAULT_CACHE_DEPTH,
     )
-    .clamp(MIN_RUNWAY_DEPTH, MAX_RUNWAY_DEPTH)
+    .clamp(MIN_CACHE_DEPTH, MAX_CACHE_DEPTH)
 }
 
-pub fn runway_batch_from_env() -> u32 {
+pub fn cache_batch_from_env() -> u32 {
     env_u32(
-        &["RBITCOIN_CONFIRM_RUNWAY_BATCH", "RBITCOIN_PARENT_PREWARM_BATCH"],
-        DEFAULT_RUNWAY_BATCH,
+        &["RBITCOIN_CONFIRM_CACHE_BATCH", "RBITCOIN_PARENT_PREWARM_BATCH"],
+        DEFAULT_CACHE_BATCH,
     )
     .clamp(8, 512)
 }
 
-pub fn runway_headroom_from_env() -> u32 {
+pub fn cache_headroom_from_env() -> u32 {
     env_u32(
         &[
-            "RBITCOIN_CONFIRM_RUNWAY_HEADROOM",
+            "RBITCOIN_CONFIRM_CACHE_HEADROOM",
             "RBITCOIN_PARENT_PREWARM_HEADROOM",
         ],
-        DEFAULT_RUNWAY_HEADROOM,
+        DEFAULT_CACHE_HEADROOM,
     )
-    .clamp(0, MAX_RUNWAY_DEPTH)
+    .clamp(0, MAX_CACHE_DEPTH)
 }
 
 /// Default: mlock **on** (parent create `tx.body` pages for write annotate).
@@ -82,16 +86,16 @@ pub fn confirm_mlock_from_env() -> bool {
 
 /// Only pin external parents needed by spends in tip+1‥tip+K.
 ///
-/// **0 = full runway** (default): pin every external parent in the runway window.
+/// **0 = full cache** (default): pin every external parent in the parent cache window.
 /// Non-zero K limits pin to heights ≤ tip+K (tip-near pin; lower RAM).
-pub const DEFAULT_RUNWAY_PIN_NEAR: u32 = 0;
+pub const DEFAULT_CACHE_PIN_NEAR: u32 = 0;
 
-pub fn runway_pin_near_from_env() -> u32 {
+pub fn cache_pin_near_from_env() -> u32 {
     env_u32(
         &["RBITCOIN_CONFIRM_PIN_NEAR", "RBITCOIN_PARENT_PREWARM_PIN_NEAR"],
-        DEFAULT_RUNWAY_PIN_NEAR,
+        DEFAULT_CACHE_PIN_NEAR,
     )
-    .min(MAX_RUNWAY_DEPTH)
+    .min(MAX_CACHE_DEPTH)
 }
 
 /// Thin edge walk: only stamped create_fk + coinbase (skip soft prev_txid/head).
@@ -132,29 +136,29 @@ pub struct ParentOut {
     pub output: OutputRecord,
 }
 
-/// Parent create row held for the runway.
+/// Parent create row held for the parent cache.
 #[derive(Debug, Clone)]
 pub struct ParentEntry {
     pub tx: TxRecord,
     /// Live (unspent) needed vouts → output. Spent vouts are omitted.
     pub outs: HashMap<u32, ParentOut>,
-    /// Vouts that runway fully resolved (spent-filtered). When all requested
+    /// Vouts that cache fully resolved (spent-filtered). When all requested
     /// vouts are in this set, wave can skip store decode + spent re-check.
     pub checked: HashSet<u32>,
-    /// Coinbase maturity height resolved at runway (wave skips body re-walk).
+    /// Coinbase maturity height resolved at cache (wave skips body re-walk).
     ///
     /// - `None` = not resolved yet
     /// - `Some(None)` = not a coinbase
     /// - `Some(Some(h))` = coinbase created at height `h`
     pub coinbase_height: Option<Option<u32>>,
-    /// Height of the runway body that registered this create (`None` = UTXO load).
+    /// Height of the parent cache body that registered this create (`None` = UTXO load).
     pub create_height: Option<u32>,
 }
 
 /// Thin create-fk edge (identical to wave [`crate::wave_prevout::ThinInput`]).
 pub type StashedThinInput = crate::wave_prevout::ThinInput;
 
-/// Full Class A body for a runway height (confirm should not re-read store).
+/// Full Class A body for a cache height (confirm should not re-read store).
 #[derive(Debug, Clone)]
 pub struct BodyEntry {
     pub height: u32,
@@ -166,14 +170,14 @@ pub struct BodyEntry {
     pub thin_inputs: Option<Vec<StashedThinInput>>,
 }
 
-/// Cached header + body fk list for one runway height (avoids header.head/body
+/// Cached header + body fk list for one cache height (avoids header.head/body
 /// and header_txs page faults on confirm resolve).
 #[derive(Debug, Clone)]
 pub struct HeaderPlanCache {
     pub header_fk: Fk,
     pub header_rec: HeaderRecord,
     pub tx_fks: Vec<Fk>,
-    /// Previous block hash (zeros at genesis). Filled at runway so wire rebuild
+    /// Previous block hash (zeros at genesis). Filled at cache so wire rebuild
     /// never `store.get_header(prev_fk)`.
     pub prev_hash: [u8; 32],
 }
@@ -190,7 +194,7 @@ struct HeightPlan {
     scanned: bool,
     /// (create_fk, vout) fully populated in cache.
     need_fk: HashSet<(u64, u32)>,
-    /// (prev_txid, vout) not in UTXO at runway — expect runway / same-wave create.
+    /// (prev_txid, vout) not in UTXO at cache — expect cache / same-wave create.
     reserved: HashSet<([u8; 32], u32)>,
 }
 
@@ -202,7 +206,7 @@ impl HeightPlan {
     }
 }
 
-/// One mlocked page range (any store table) held for runway heights.
+/// One mlocked page range (any store table) held for cache heights.
 struct RangeRec {
     range: MlockRange,
     /// Heights that still need this range warm.
@@ -223,7 +227,7 @@ struct TxidEntry {
 #[derive(Clone, Copy, Debug)]
 struct StickyConfirmed {
     fk: u64,
-    /// Create height when registered from runway / promote height.
+    /// Create height when registered from cache / promote height.
     height: u32,
 }
 
@@ -238,18 +242,18 @@ struct Inner {
     plans: BTreeMap<u32, HeightPlan>,
     /// Parent bodies keyed by create fk id (optional; tests / legacy).
     by_fk: HashMap<u64, ParentEntry>,
-    /// Full runway block bodies by tx fk (optional; tests / legacy).
+    /// Full cache block bodies by tx fk (optional; tests / legacy).
     by_body: HashMap<u64, BodyEntry>,
-    /// Thin edges without a full body parse (mlock runway).
+    /// Thin edges without a full body parse (mlock cache).
     thin_edges: HashMap<u64, Vec<StashedThinInput>>,
-    /// create txid → (fk, runway height). Height is create height or the spend
+    /// create txid → (fk, cache height). Height is create height or the spend
     /// height that needed this parent. GC keeps `(tip−depth, tip+depth]` so
     /// recent external parents re-hit without `tx.head` (load thin hot path).
     /// Also kept while held by `by_body` / `by_fk`.
     by_txid: HashMap<[u8; 32], TxidEntry>,
     /// Confirmed-create sticky: txid → fk (capacity-capped FIFO).
     ///
-    /// Filled when we decode runway creates (and on head resolve). Survives tip
+    /// Filled when we decode cache creates (and on head resolve). Survives tip
     /// GC of `by_txid` so later spends skip durable head. No scripts/outs.
     sticky_confirmed: HashMap<[u8; 32], StickyConfirmed>,
     /// Insert order for FIFO eviction when over [`Self::sticky_cap`].
@@ -261,7 +265,7 @@ struct Inner {
     hash_to_height: HashMap<[u8; 32], u32>,
     /// fk id → absolute body (offset, len) from tx.idx (replaces idx page faults).
     body_range: HashMap<u64, (u64, u64)>,
-    /// Reserved (txid, vout) → set of heights waiting (legacy; unused by new runway).
+    /// Reserved (txid, vout) → set of heights waiting (legacy; unused by new cache).
     reserve_waiters: HashMap<([u8; 32], u32), HashSet<u32>>,
     /// (table, page_start) → mlocked range + need_heights.
     mlocked: HashMap<(u8, u64), RangeRec>,
@@ -271,7 +275,7 @@ struct Inner {
     mlock_n: usize,
 }
 
-/// Process-local confirm parent runway.
+/// Process-local confirm parent cache.
 pub struct ConfirmParentCache {
     inner: Mutex<Inner>,
     /// Signaled when plans become ready (`mark_scanned*`) or tip GC advances
@@ -284,7 +288,7 @@ pub struct ConfirmParentCache {
 
 impl ConfirmParentCache {
     pub fn new(depth: u32) -> Self {
-        let depth = depth.clamp(MIN_RUNWAY_DEPTH, MAX_RUNWAY_DEPTH);
+        let depth = depth.clamp(MIN_CACHE_DEPTH, MAX_CACHE_DEPTH);
         let sticky_cap = confirmed_txid_sticky_cap_from_env();
         Self {
             inner: Mutex::new(Inner {
@@ -314,7 +318,7 @@ impl ConfirmParentCache {
     }
 
     pub fn from_env() -> Self {
-        Self::new(runway_depth_from_env())
+        Self::new(cache_depth_from_env())
     }
 
     pub fn depth(&self) -> u32 {
@@ -322,7 +326,7 @@ impl ConfirmParentCache {
     }
 
     pub fn set_depth(&self, depth: u32) {
-        let d = depth.clamp(MIN_RUNWAY_DEPTH, MAX_RUNWAY_DEPTH);
+        let d = depth.clamp(MIN_CACHE_DEPTH, MAX_CACHE_DEPTH);
         self.depth.store(d, Ordering::Relaxed);
         self.inner.lock().unwrap().depth = d;
     }
@@ -398,10 +402,10 @@ impl ConfirmParentCache {
         }
         g.gc_orphaned_parents();
         g.gc_by_txid(tip, max_h);
-        // Drop body_range not tied to live runway bodies or parent pins.
+        // Drop body_range not tied to live cache bodies or parent pins.
         g.gc_body_ranges();
         // Munlock when no remaining need_height in (tip, max_h] — i.e. write
-        // finished for those heights and no later runway height still needs the page.
+        // finished for those heights and no later cache height still needs the page.
         let unlocks = g.gc_mlocks(tip, max_h);
         g.recompute_ready_through();
         self.ready_through
@@ -446,7 +450,7 @@ impl ConfirmParentCache {
         (start_page..end_page).all(|p| g.page_refs.contains_key(&(t, p)))
     }
 
-    /// Track successful `mlock` ranges for runway height `need_height`.
+    /// Track successful `mlock` ranges for cache height `need_height`.
     ///
     /// Keyed by `(table, page_start)`. If a later note shares `page_start` but
     /// covers a **longer** span, page refs and `rec.range` are **extended** so
@@ -516,17 +520,17 @@ impl ConfirmParentCache {
         self.inner.lock().unwrap().mlock_n
     }
 
-    /// Bytes of unique 4 KiB pages currently mlocked for the confirm runway.
+    /// Bytes of unique 4 KiB pages currently mlocked for the parent cache.
     ///
     /// Counts distinct `(table, page)` entries under refcount (shared ranges
-    /// across heights count once). Approximate RSS contribution of runway pins.
+    /// across heights count once). Approximate RSS contribution of parent pins.
     pub fn mlock_bytes(&self) -> u64 {
         const PAGE: u64 = 4096;
         let g = self.inner.lock().unwrap();
         (g.page_refs.len() as u64).saturating_mul(PAGE)
     }
 
-    /// `(range_count, unique_page_bytes)` for runway pin diagnostics.
+    /// `(range_count, unique_page_bytes)` for parent pin diagnostics.
     pub fn mlock_stats(&self) -> (usize, u64) {
         const PAGE: u64 = 4096;
         let g = self.inner.lock().unwrap();
@@ -536,7 +540,7 @@ impl ConfirmParentCache {
         )
     }
 
-    /// Cache header + tx list for a runway height (small; replaces header mlock).
+    /// Cache header + tx list for a cache height (small; replaces header mlock).
     pub fn put_header_plan(
         &self,
         height: u32,
@@ -609,7 +613,7 @@ impl ConfirmParentCache {
         }
     }
 
-    /// Store a full runway block body (phase-1 runway). Confirm/wave should
+    /// Store a full cache block body (phase-1 cache). Confirm/wave should
     /// prefer this over Class A store reads.
     ///
     /// Inserts `txid → fk` so later spends resolve via [`Self::get_by_txid`] +
@@ -649,7 +653,7 @@ impl ConfirmParentCache {
     /// Phase-1 hot path: body + `by_txid` (creates are the body outs).
     ///
     /// Does **not** clone every output into `by_fk` — that doubled RAM/CPU on
-    /// mainnet (~all scripts twice). Wave/runway resolve runway creates via
+    /// mainnet (~all scripts twice). Wave/cache resolve cache creates via
     /// [`Self::get_parent_out`] body fallback. Sparse `by_fk` is only for
     /// external UTXO parents and legacy reserve waiters.
     pub fn put_body_and_creates(
@@ -680,7 +684,7 @@ impl ConfirmParentCache {
         Some((e.tx.clone(), e.outputs.clone(), e.inputs.clone()))
     }
 
-    /// True if a full runway body is already stashed (skip store re-decode).
+    /// True if a full cache body is already stashed (skip store re-decode).
     pub fn has_body(&self, fk: Fk) -> bool {
         let Some(id) = fk.get() else {
             return false;
@@ -714,7 +718,7 @@ impl ConfirmParentCache {
         Some((e.tx.txid, prevouts))
     }
 
-    /// Move a full body out of the runway (wave_fill sole consumer — no clone).
+    /// Move a full body out of the parent cache (wave_fill sole consumer — no clone).
     pub fn take_body(
         &self,
         fk: Fk,
@@ -729,7 +733,7 @@ impl ConfirmParentCache {
     /// Move many bodies under **one** lock (confirm wave_fill hot path).
     ///
     /// Prefer [`Self::get_bodies_batch`] when confirm may re-queue (failed
-    /// package must not empty the runway while the height stays "ready").
+    /// package must not empty the parent cache while the height stays "ready").
     pub fn take_bodies_batch(
         &self,
         fks: &[Fk],
@@ -755,7 +759,7 @@ impl ConfirmParentCache {
         out
     }
 
-    /// Clone many bodies under **one** lock (keeps runway intact for retries).
+    /// Clone many bodies under **one** lock (keeps cache intact for retries).
     pub fn get_bodies_batch(
         &self,
         fks: &[Fk],
@@ -781,10 +785,10 @@ impl ConfirmParentCache {
         out
     }
 
-    /// Runway body + create height for runway parent pin (same-bite creates).
+    /// Runway body + create height for cache parent pin (same-bite creates).
     ///
     /// Prefer this over a store re-decode when the create is already full-decoded
-    /// on the runway (cross-height same-batch spends).
+    /// on the parent cache (cross-height same-batch spends).
     pub fn get_body_for_pin(
         &self,
         fk: Fk,
@@ -818,9 +822,9 @@ impl ConfirmParentCache {
         out
     }
 
-    /// True if every Class A body in `tx_fks` is still fully decoded on the runway.
+    /// True if every Class A body in `tx_fks` is still fully decoded on the parent cache.
     ///
-    /// Used to re-runway heights that were `mark_scanned` but later drained
+    /// Used to re-cache heights that were `mark_scanned` but later drained
     /// (e.g. historical `take_bodies_batch` on a failed confirm).
     pub fn bodies_complete(&self, tx_fks: &[Fk]) -> bool {
         if tx_fks.is_empty() {
@@ -834,7 +838,7 @@ impl ConfirmParentCache {
         })
     }
 
-    /// Attach runway-resolved thin edges (wave_fill fast path; no full body required).
+    /// Attach cache-resolved thin edges (wave_fill fast path; no full body required).
     ///
     /// Stored only in `thin_edges` (not dual-copied onto optional `by_body`).
     pub fn put_thin_inputs(&self, fk: Fk, edges: Vec<StashedThinInput>) {
@@ -844,13 +848,13 @@ impl ConfirmParentCache {
         self.inner.lock().unwrap().thin_edges.insert(id, edges);
     }
 
-    /// Thin edges stashed during runway, if present (clone).
+    /// Thin edges stashed during cache, if present (clone).
     pub fn get_thin_inputs(&self, fk: Fk) -> Option<Vec<StashedThinInput>> {
         let id = fk.get()?;
         self.inner.lock().unwrap().thin_edges.get(&id).cloned()
     }
 
-    /// Move thin edges out of the runway (wave_fill is the sole consumer).
+    /// Move thin edges out of the parent cache (wave_fill is the sole consumer).
     pub fn take_thin_inputs(&self, fk: Fk) -> Option<Vec<StashedThinInput>> {
         let id = fk.get()?;
         self.inner.lock().unwrap().thin_edges.remove(&id)
@@ -876,7 +880,7 @@ impl ConfirmParentCache {
 
     pub fn body_count(&self) -> usize {
         let g = self.inner.lock().unwrap();
-        // Prefer full-decoded runway bodies (decode-once cache); else mlock pins.
+        // Prefer full-decoded cache bodies (decode-once cache); else mlock pins.
         if !g.by_body.is_empty() {
             g.by_body.len()
         } else {
@@ -907,7 +911,7 @@ impl ConfirmParentCache {
         }
     }
 
-    /// Seed many plans under one lock (IBD runway publish).
+    /// Seed many plans under one lock (IBD cache publish).
     pub fn ensure_plans(&self, items: &[(u32, [u8; 32])]) {
         if items.is_empty() {
             return;
@@ -930,7 +934,7 @@ impl ConfirmParentCache {
         }
     }
 
-    /// True if runway finished a scan attempt for this height (2-stage wait).
+    /// True if cache finished a scan attempt for this height (2-stage wait).
     pub fn is_ready(&self, height: u32) -> bool {
         let g = self.inner.lock().unwrap();
         g.plans.get(&height).is_some_and(|p| p.is_ready())
@@ -960,9 +964,9 @@ impl ConfirmParentCache {
 
     /// Confirm headroom: warmer has fully ready plans through at least
     /// `batch_end + headroom`, or through the furthest **seeded** plan if the
-    /// runway is shorter (archive lag / depth edge).
+    /// cache is shorter (archive lag / depth edge).
     ///
-    /// IBD should [`Self::ensure_plan`] the full published runway so unfinished
+    /// IBD should [`Self::ensure_plan`] the full published cache so unfinished
     /// heights appear as plans (not "missing" → falsely satisfied). When the
     /// furthest plan is already ready, headroom is satisfied even if
     /// `ready_through < batch_end + headroom` (nothing further to warm).
@@ -982,7 +986,7 @@ impl ConfirmParentCache {
         if g.ready_through >= target {
             return true;
         }
-        // Short runway: every seeded plan is ready — archive lag / depth edge.
+        // Short cache: every seeded plan is ready — archive lag / depth edge.
         let max_plan = g.plans.keys().next_back().copied().unwrap_or(g.tip);
         g.ready_through >= max_plan
     }
@@ -1027,7 +1031,7 @@ impl ConfirmParentCache {
     /// or `timeout` elapses.
     ///
     /// Uses [`Self::ready_cv`] — woken by [`Self::mark_scanned_many`] / tip GC /
-    /// [`Self::notify_ready_waiters`]. Does **not** perform runway work.
+    /// [`Self::notify_ready_waiters`]. Does **not** perform cache work.
     ///
     /// Returns `Ok(())` when ready, `Err(true)` if cancelled, `Err(false)` on timeout.
     pub fn wait_heights_ready(
@@ -1043,7 +1047,7 @@ impl ConfirmParentCache {
         let mut g = self.inner.lock().unwrap();
         loop {
             // 2-stage semantics: scanned only (O(1)). Content completeness is
-            // runway's job; wave store-fallbacks residual misses like before.
+            // cache's job; wave store-fallbacks residual misses like before.
             let ready = heights
                 .iter()
                 .all(|h| g.plans.get(h).is_some_and(|p| p.is_ready()));
@@ -1104,7 +1108,7 @@ impl ConfirmParentCache {
     ///
     /// `checked` includes spent-filtered vouts that are **not** in `live` so
     /// wave can treat the set as complete without re-decoding the body.
-    /// `height` is the max runway height needing this parent (GC / by_txid).
+    /// `height` is the max cache height needing this parent (GC / by_txid).
     /// `coinbase_height`: `None` = not a coinbase; `Some(h)` = cb create height.
     /// Pass as pre-resolved maturity field (outer `Some` means stashed).
     pub fn put_parent_outs_resolved(
@@ -1123,9 +1127,9 @@ impl ConfirmParentCache {
         g.put_parent_outs_resolved_inner(height, id, tx, live, checked, coinbase_height);
     }
 
-    /// Many resolved parents under one lock (runway pin finish).
+    /// Many resolved parents under one lock (parent pin finish).
     ///
-    /// Tuple: `(runway_h, fk, tx, live, checked, coinbase_height)`.
+    /// Tuple: `(height, fk, tx, live, checked, coinbase_height)`.
     /// `coinbase_height`: `None` = not stashed; `Some(None)` = not cb; `Some(Some(h))` = height.
     pub fn put_parent_outs_resolved_batch(
         &self,
@@ -1195,10 +1199,10 @@ impl ConfirmParentCache {
 
     /// One-lock bulk `txid → fk` for load thin-resolve (avoids per-edge mutex).
     ///
-    /// Lookup order: runway `by_txid`, then **confirmed sticky**. Missing keys
+    /// Lookup order: cache `by_txid`, then **confirmed sticky**. Missing keys
     /// omitted (caller treats as head-probe candidates).
     ///
-    /// Returns `(hits, sticky_only_txids)` — sticky_only are keys not in runway
+    /// Returns `(hits, sticky_only_txids)` — sticky_only are keys not in cache
     /// `by_txid` but found in sticky.
     pub fn lookup_txids_batch(
         &self,
@@ -1234,13 +1238,13 @@ impl ConfirmParentCache {
         self.inner.lock().unwrap().sticky_confirmed.len()
     }
 
-    /// Reserve a hole for a prevout not in UTXO (create is still on the runway).
+    /// Reserve a hole for a prevout not in UTXO (create is still on the parent cache).
     ///
     /// If the create was already registered with full outs (create-before-reserve),
     /// fills immediately without a store round-trip.
     pub fn reserve(&self, height: u32, prev_txid: [u8; 32], vout: u32) {
         let mut g = self.inner.lock().unwrap();
-        // Already filled from runway create or prior UTXO load?
+        // Already filled from cache create or prior UTXO load?
         if let Some(ent) = g.by_txid.get(&prev_txid).copied() {
             let id = ent.fk;
             if g.by_fk
@@ -1265,12 +1269,12 @@ impl ConfirmParentCache {
             .insert(height);
     }
 
-    /// Register creates from a runway body with **all** outputs.
+    /// Register creates from a cache body with **all** outputs.
     ///
-    /// Phase-1 runway loads full blocks first so later spends in the same
+    /// Phase-1 cache loads full blocks first so later spends in the same
     /// batch resolve creates without UTXO or reservations.
     /// Prefer [`Self::put_body_and_creates`] on the hot path (one lock).
-    pub fn register_runway_creates(
+    pub fn register_cache_creates(
         &self,
         create_fk: Fk,
         tx: &TxRecord,
@@ -1321,8 +1325,8 @@ impl ConfirmParentCache {
 
     /// Look up a populated parent out (for wave fill / connect).
     ///
-    /// Prefers sparse external-parent `by_fk`, then runway **body** outs
-    /// (bodies-first runway no longer dual-copies every create into `by_fk`).
+    /// Prefers sparse external-parent `by_fk`, then cache **body** outs
+    /// (bodies-first cache no longer dual-copies every create into `by_fk`).
     pub fn get_parent_out(
         &self,
         fk: Fk,
@@ -1351,11 +1355,11 @@ impl ConfirmParentCache {
         Self::out_present_locked(&g, id, vout)
     }
 
-    /// True when runway pin can skip store decode for `vouts` (wave already
+    /// True when parent pin can skip store decode for `vouts` (wave already
     /// served by `get_parent_outs_needed` / body path).
     ///
     /// Covered if sparse `by_fk` has a full checked set (or all live outs), or
-    /// a runway `by_body` holds every requested index.
+    /// a cache `by_body` holds every requested index.
     pub fn parent_pin_covered(&self, fk: Fk, vouts: &[u32]) -> bool {
         let Some(id) = fk.get() else {
             return false;
@@ -1400,9 +1404,9 @@ impl ConfirmParentCache {
         }
     }
 
-    /// One-lock runway hit: `txid` known on runway (mlock or full body).
+    /// One-lock cache hit: `txid` known on cache (mlock or full body).
     ///
-    /// With mlock runway we only have `by_txid` (no parsed outs); vout validity
+    /// With mlock cache we only have `by_txid` (no parsed outs); vout validity
     /// is checked when confirm full-parses the parent.
     pub fn get_by_txid_if_out(&self, txid: &[u8; 32], vout: u32) -> Option<Fk> {
         let g = self.inner.lock().unwrap();
@@ -1433,7 +1437,7 @@ impl ConfirmParentCache {
 
     /// See [`Self::parent_pin_covered`].
     ///
-    /// Only **spent-filtered** `by_fk` entries count. Bare runway `by_body` does
+    /// Only **spent-filtered** `by_fk` entries count. Bare cache `by_body` does
     /// **not** cover external parents (wave cache_only requires spent_filtered).
     #[inline]
     fn pin_covered_locked(g: &Inner, id: u64, vouts: &[u32]) -> bool {
@@ -1447,7 +1451,7 @@ impl ConfirmParentCache {
         }
         // Runway full body can supply pin without store — treat as covered for
         // skip-path accounting; caller still uses get_body_for_pin when not
-        // by_fk-stashed (see runway pin_runway_body).
+        // by_fk-stashed (see parent pin_cache_body).
         false
     }
 
@@ -1460,7 +1464,7 @@ impl ConfirmParentCache {
         g.by_body.get(&id).map(|b| b.tx.clone())
     }
 
-    /// Txid of a stashed parent create (by_fk sparse or runway body) — no clone of outs.
+    /// Txid of a stashed parent create (by_fk sparse or cache body) — no clone of outs.
     pub fn get_parent_txid(&self, fk: Fk) -> Option<[u8; 32]> {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
@@ -1479,7 +1483,7 @@ impl ConfirmParentCache {
         g.by_txid.get(txid).map(|e| Fk(e.fk))
     }
 
-    /// Sparse external-parent outs only (`by_fk`). Does **not** expand runway
+    /// Sparse external-parent outs only (`by_fk`). Does **not** expand cache
     /// bodies — callers that need a subset of body outs should use
     /// [`Self::get_parent_outs_needed`] (avoids cloning every script of a multi-out create).
     pub fn get_parent_outs(&self, fk: Fk) -> Option<(TxRecord, HashMap<u32, OutputRecord>)> {
@@ -1497,10 +1501,10 @@ impl ConfirmParentCache {
         Some((e.tx.clone(), outs))
     }
 
-    /// Clone only the requested parent vouts (sparse `by_fk`, else runway body).
+    /// Clone only the requested parent vouts (sparse `by_fk`, else cache body).
     ///
     /// Returns `(tx, live_outs, spent_filtered)`:
-    /// - `spent_filtered == true`: runway already dropped spent vouts; wave
+    /// - `spent_filtered == true`: cache already dropped spent vouts; wave
     ///   must not re-check spentness for these candidates.
     /// - `spent_filtered == false`: candidates need a spent filter (body path).
     ///
@@ -1514,7 +1518,7 @@ impl ConfirmParentCache {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
         if let Some(e) = g.by_fk.get(&id) {
-            // Fully resolved by runway (all requested vouts checked).
+            // Fully resolved by cache (all requested vouts checked).
             if !e.checked.is_empty() && vouts.iter().all(|v| e.checked.contains(v)) {
                 let mut live = Vec::with_capacity(vouts.len());
                 for &v in vouts {
@@ -1553,7 +1557,7 @@ impl ConfirmParentCache {
         self.inner.lock().unwrap().plans.len()
     }
 
-    /// Sparse external parents in `by_fk` (not every runway create).
+    /// Sparse external parents in `by_fk` (not every cache create).
     pub fn parent_count(&self) -> usize {
         self.inner.lock().unwrap().by_fk.len()
     }
@@ -1670,7 +1674,7 @@ impl Inner {
             if e.height > min_keep && e.height <= max_h {
                 return true;
             }
-            // Still a live runway body or sparse parent with outs.
+            // Still a live cache body or sparse parent with outs.
             self.by_body.contains_key(&e.fk) || self.by_fk.contains_key(&e.fk)
         });
     }
@@ -1852,9 +1856,9 @@ impl Inner {
         if let Some(e) = self.by_fk.get_mut(&id) {
             e.outs.remove(&vout);
             // Keep the by_fk row when only live outs are gone: `checked` still
-            // covers spent-filtered package_ready for other runway heights.
+            // covers spent-filtered package_ready for other cache heights.
             // Dropping the whole entry here left tip+N incomplete while
-            // ready_through stayed high until the next tip GC (runway cursor
+            // ready_through stayed high until the next tip GC (cache cursor
             // jumped past the hole). Full drop is tip GC / gc_orphaned_parents.
             if e.outs.is_empty() && e.checked.is_empty() {
                 let txid = e.tx.txid;
@@ -1948,7 +1952,7 @@ impl Inner {
         true
     }
 
-    /// Drop body_range entries not referenced by live runway bodies or parent pins.
+    /// Drop body_range entries not referenced by live cache bodies or parent pins.
     ///
     /// Parent pin used to insert ranges forever (never tied to a height plan),
     /// so body_range grew O(unique parents ever seen) across IBD.
@@ -2010,7 +2014,7 @@ impl Inner {
                 continue;
             }
             // Runway creates: keep by_fk identity until tip passes create height
-            // so later runway get_by_txid still resolves same-batch parents.
+            // so later cache get_by_txid still resolves same-batch parents.
             if let Some(ch) = e.create_height {
                 if ch > tip {
                     continue;
@@ -2167,7 +2171,7 @@ mod tests {
     }
 
     /// Retiring the last live out must not delete spent-filtered `checked` coverage
-    /// or leave ready_through above a now-incomplete height (runway cursor skip).
+    /// or leave ready_through above a now-incomplete height (cache cursor skip).
     #[test]
     fn retire_last_live_out_keeps_checked_and_recomputes_watermark() {
         let c = ConfirmParentCache::new(64);
@@ -2225,7 +2229,7 @@ mod tests {
 
     /// Regression: same-bite create@11 + spend@12 must pin create into spent-filtered
     /// `by_fk`. Bare `by_body` is not enough for package_ready / cache-only wave —
-    /// skipping pin left ready_through at tip+1/+2 after multi-block runway bites.
+    /// skipping pin left ready_through at tip+1/+2 after multi-block cache bites.
     #[test]
     fn cross_height_spend_needs_parent_pin_for_package_ready() {
         let c = ConfirmParentCache::new(64);
@@ -2275,8 +2279,8 @@ mod tests {
             "spend of same-bite create without by_fk pin must not be package_ready"
         );
 
-        // Pin from runway body (what runway does for batch_create_ids).
-        let (create_h, tx, outs, _ins) = c.get_body_for_pin(Fk(1100)).expect("runway body");
+        // Pin from cache body (what cache does for batch_create_ids).
+        let (create_h, tx, outs, _ins) = c.get_body_for_pin(Fk(1100)).expect("cache body");
         assert_eq!(create_h, 11);
         c.put_parent_outs_resolved(
             12,
@@ -2294,7 +2298,7 @@ mod tests {
     #[test]
     fn ensure_plans_requires_tip_horizon() {
         let c = ConfirmParentCache::new(64);
-        // Cache tip still 0 (runway forgot advance_tip).
+        // Cache tip still 0 (cache forgot advance_tip).
         c.ensure_plans(&[(360_251, [1u8; 32]), (360_252, [2u8; 32])]);
         assert_eq!(c.plan_count(), 0, "heights far above tip+depth must not seed");
         c.mark_scanned_many(&[360_251, 360_252]);
@@ -2382,7 +2386,7 @@ mod tests {
 
     #[test]
     fn sticky_confirmed_survives_tip_gc_of_by_txid() {
-        // Creates registered on runway enter sticky; after tip advances past
+        // Creates registered on cache enter sticky; after tip advances past
         // create height, by_txid may drop but sticky still resolves thin.
         let c = ConfirmParentCache::new(32);
         c.advance_tip(0);
@@ -2390,7 +2394,7 @@ mod tests {
         c.put_bodies_batch(vec![(Fk(70), 5, t.clone(), vec![out(1)], vec![])]);
         assert_eq!(c.get_by_txid(&t.txid), Some(Fk(70)));
         assert!(c.sticky_confirmed_count() >= 1);
-        // Advance tip past create height 5; runway window no longer holds body.
+        // Advance tip past create height 5; cache window no longer holds body.
         c.advance_tip(40); // min_keep=8 for depth=32 → height 5 by_txid may drop
         // Sticky still has the create.
         let keys = [t.txid];
@@ -2414,7 +2418,7 @@ mod tests {
         assert!(c.is_ready(2));
         assert!(c.has_open_reserves(2));
         // Create appears from height 1 body — fills cache for wave/connect.
-        c.register_runway_creates(Fk(50), &t, &[out(42), out(43)], 1);
+        c.register_cache_creates(Fk(50), &t, &[out(42), out(43)], 1);
         assert!(c.is_ready(2));
         assert!(!c.has_open_reserves(2));
         assert_eq!(c.get_parent_out(Fk(50), 0).unwrap().1.value, 42);
@@ -2435,7 +2439,7 @@ mod tests {
         assert!(c.all_ready(&[1, 2]));
         assert_eq!(c.ready_through(), 2);
         assert!(c.headroom_ready(2, 0));
-        c.register_runway_creates(Fk(90), &t, &[out(1)], 1);
+        c.register_cache_creates(Fk(90), &t, &[out(1)], 1);
         assert!(!c.has_open_reserves(2));
         assert_eq!(c.ready_through(), 2);
     }
@@ -2447,7 +2451,7 @@ mod tests {
         c.advance_tip(0);
         seed_coinbase_package(&c, 1, [1u8; 32], 1001);
         let t = tx(5);
-        c.register_runway_creates(Fk(50), &t, &[out(42), out(43)], 1);
+        c.register_cache_creates(Fk(50), &t, &[out(42), out(43)], 1);
         assert!(c.is_ready(1));
         assert_eq!(c.get_by_txid(&t.txid), Some(Fk(50)));
         assert_eq!(c.get_parent_out(Fk(50), 1).unwrap().1.value, 43);
@@ -2544,7 +2548,7 @@ mod tests {
     }
 
     #[test]
-    fn get_by_txid_falls_back_to_sticky_after_runway_gc() {
+    fn get_by_txid_falls_back_to_sticky_after_cache_gc() {
         let c = ConfirmParentCache::new(32);
         c.advance_tip(0);
         let t = tx(11);
@@ -2673,7 +2677,7 @@ mod tests {
         c.put_body(Fk(70), 1, tx(70), vec![out(1), out(2)], vec![]);
         assert!(
             !c.parent_pin_covered(Fk(70), &[0, 1]),
-            "runway body alone must not skip external parent pin"
+            "cache body alone must not skip external parent pin"
         );
     }
 
@@ -2721,7 +2725,7 @@ mod tests {
     }
 
     #[test]
-    fn get_bodies_batch_keeps_runway_for_retry() {
+    fn get_bodies_batch_keeps_cache_for_retry() {
         // Worker-live confirm clones so a failed package can re-queue.
         let c = ConfirmParentCache::new(64);
         c.advance_tip(0);
@@ -2773,10 +2777,10 @@ mod tests {
         assert_eq!(c.ready_through(), 3);
         assert!(c.headroom_ready(1, 0));
         assert!(c.headroom_ready(1, 2)); // need through 3
-        // Short runway: max plan is 3 and ready → satisfied for any headroom.
+        // Short cache: max plan is 3 and ready → satisfied for any headroom.
         assert!(c.headroom_ready(1, 3));
         assert!(c.headroom_ready(3, 64));
-        // Seed unfinished plans further ahead (IBD publishes full runway).
+        // Seed unfinished plans further ahead (IBD publishes full cache).
         c.ensure_plan(4, [4u8; 32]);
         c.ensure_plan(5, [5u8; 32]);
         assert!(!c.headroom_ready(3, 2)); // need 5 ready, only through 3
@@ -2829,7 +2833,7 @@ mod tests {
     }
 
     /// Mlocks release at tip once no remaining need_height > tip (write done).
-    /// Later runway heights that still need a page keep it locked.
+    /// Later cache heights that still need a page keep it locked.
     #[test]
     fn advance_tip_munlocks_when_write_done_keeps_later_needs() {
         use rbitcoin_store::{MlockRange, MlockTable};
@@ -2846,7 +2850,7 @@ mod tests {
         assert_eq!(c.mlock_stats().0, 1);
         // Write finished through 5 — height 20 still needs the page.
         let unlocks = c.advance_tip(5);
-        assert!(unlocks.is_empty(), "later runway need keeps mlock: {unlocks:?}");
+        assert!(unlocks.is_empty(), "later cache need keeps mlock: {unlocks:?}");
         assert_eq!(c.mlock_stats().0, 1);
         // Write finished through 20 — no remaining need → munlock.
         let unlocks = c.advance_tip(20);
@@ -2887,7 +2891,7 @@ mod tests {
 
     /// Bodies register sticky only (not dual by_txid). Identity survives tip GC.
     #[test]
-    fn body_identity_is_sticky_not_runway_by_txid() {
+    fn body_identity_is_sticky_not_cache_by_txid() {
         let c = ConfirmParentCache::new(32);
         c.advance_tip(0);
         for h in 1u32..=40 {
@@ -2910,7 +2914,7 @@ mod tests {
 
     /// Synthetic pressure: many full bodies must leave RAM when tip catches up.
     #[test]
-    fn large_runway_bodies_do_not_accumulate_past_tip() {
+    fn large_cache_bodies_do_not_accumulate_past_tip() {
         let c = ConfirmParentCache::new(256);
         c.advance_tip(0);
         // ~2k "txs" per height × 64 heights — enough to trip unbounded hold.

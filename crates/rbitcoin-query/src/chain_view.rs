@@ -81,7 +81,7 @@ impl Query {
         self.wire_header_from_record_prev(rec, None)
     }
 
-    /// Wire header with optional prev hash (runway package — avoids store get).
+    /// Wire header with optional prev hash (cache package — avoids store get).
     pub(crate) fn wire_header_from_record_prev(
         &self,
         rec: &HeaderRecord,

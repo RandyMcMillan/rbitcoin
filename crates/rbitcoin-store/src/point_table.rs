@@ -32,7 +32,7 @@ pub fn put_spend_on_create(
     put_spend_on_create_at(txs, spenders, create_tx_fk, vout, spending_tx_fk, None)
 }
 
-/// Like [`put_spend_on_create`] with optional runway-cached body `(offset, len)` — **no idx**.
+/// Like [`put_spend_on_create`] with optional cache-held body `(offset, len)` — **no idx**.
 pub fn put_spend_on_create_at(
     txs: &TxTable,
     spenders: &SpenderTable,

@@ -34,7 +34,7 @@ struct Parent {
 /// Thin input edge: create-tx Class A fk when known at wave fill (UTXO / same-wave).
 /// Coinbase / unknown → `create_fk = None`. Not stored on Class A disk.
 ///
-/// Same layout as runway `StashedThinInput` (type alias there).
+/// Same layout as cache `StashedThinInput` (type alias there).
 #[derive(Clone, Copy, Debug)]
 pub struct ThinInput {
     pub create_fk: Option<u64>,

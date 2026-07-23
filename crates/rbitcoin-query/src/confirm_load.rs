@@ -9,10 +9,10 @@
 //!    batch heights; tip GC after write munlocks when no active batch needs them.
 //!
 //! No background worker: load is owned by the confirm load thread for the batch
-//! it claimed. Wave bodies are **moved** out of the runway at wave_fill; parent
+//! it claimed. Wave bodies are **moved** out of the parent cache at wave_fill; parent
 //! `by_fk` + body ranges stay until tip GC (write annotate + next-batch cache).
 //!
-//! Env: `RBITCOIN_CONFIRM_{RUNWAY_DEPTH,MLOCK,THIN_CREATE_FK_ONLY}` (and legacy
+//! Env: `RBITCOIN_CONFIRM_{CACHE_DEPTH,MLOCK,THIN_CREATE_FK_ONLY}` (and legacy
 //! `RBITCOIN_PARENT_PREWARM_*` aliases).
 
 use super::*;
@@ -33,11 +33,11 @@ pub struct ConfirmLoadStats {
     pub parent_unique: u32,
     /// Of `parent_unique`: outs already stashed in by_fk — re-pin touch only.
     pub pin_already_cached: u32,
-    /// Of `parent_unique`: filled from runway `by_body` (no store decode).
-    pub pin_runway_body: u32,
+    /// Of `parent_unique`: filled from cache `by_body` (no store decode).
+    pub pin_cache_body: u32,
     /// Of `parent_unique`: first-time sparse pin (store decode).
     pub pin_new: u32,
-    /// Parent outs served from runway txid map / same-batch.
+    /// Parent outs served from cache txid map / same-batch.
     pub parent_cache_hits: u32,
     /// Body txs full-decoded (phase 1).
     pub body_tx_reads: u32,
@@ -52,7 +52,7 @@ pub struct ConfirmLoadStats {
     pub thin_ns: u64,
     /// Thin sub-phases (sum into `thin_ns`).
     pub thin_collect_ns: u64,
-    pub thin_runway_ns: u64,
+    pub thin_cache_ns: u64,
     pub thin_head_ns: u64,
     pub thin_edge_ns: u64,
     pub parent_pin_ns: u64,
@@ -62,7 +62,7 @@ pub struct ConfirmLoadStats {
     pub mlock_syscalls: u32,
     pub mlock_skipped: u32,
     pub edge_same_batch: u32,
-    pub edge_runway: u32,
+    pub edge_cache: u32,
     pub edge_head: u32,
     pub edge_coinbase: u32,
     /// Thin edges resolved via confirmed sticky map.
@@ -147,18 +147,18 @@ impl Query {
         (noted, syscalls, skipped)
     }
 
-    pub fn parent_runway_depth(&self) -> u32 {
+    pub fn parent_cache_depth(&self) -> u32 {
         self.confirm_parents.depth()
     }
 
-    pub fn parent_runway_ready_through(&self) -> u32 {
+    pub fn parent_cache_ready_through(&self) -> u32 {
         self.confirm_parents.ready_through()
     }
 
     /// Snapshot: `(ready_through, ahead, by_txid, bodies, plans, depth)`.
     ///
-    /// `by_txid` is the runway txid map size (should stay O(depth), not O(chain)).
-    pub fn parent_runway_perf_snapshot(&self) -> (u32, u32, usize, usize, usize, u32) {
+    /// `by_txid` is the parent cache txid map size (should stay O(depth), not O(chain)).
+    pub fn parent_cache_perf_snapshot(&self) -> (u32, u32, usize, usize, usize, u32) {
         let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
         let through = self.confirm_parents.ready_through();
         let ahead = through.saturating_sub(tip);
@@ -172,7 +172,7 @@ impl Query {
         )
     }
 
-    /// Unique mlocked runway pages in bytes (confirm runway pins).
+    /// Unique mlocked cache pages in bytes (parent cache pins).
     pub fn confirm_mlock_bytes(&self) -> u64 {
         self.confirm_parents.mlock_bytes()
     }
@@ -182,14 +182,14 @@ impl Query {
         self.confirm_parents.mlock_stats()
     }
 
-    pub fn advance_parent_runway_tip(&self, tip: u32) {
+    pub fn advance_parent_cache_tip(&self, tip: u32) {
         let unlocks = self.confirm_parents.advance_tip(tip);
         for r in &unlocks {
             self.store.munlock_range(r);
         }
     }
 
-    pub fn seed_parent_runway(&self, items: &[(u32, [u8; 32])]) {
+    pub fn seed_parent_cache(&self, items: &[(u32, [u8; 32])]) {
         self.confirm_parents.ensure_plans(items);
     }
 
@@ -267,7 +267,7 @@ impl Query {
         self.confirm_parents.ensure_plans(&work);
 
         let mut height_tx_fks: Vec<(u32, Vec<Fk>)> = Vec::with_capacity(work.len());
-        // Full-decoded runway bodies for wave (decode once).
+        // Full-decoded cache bodies for wave (decode once).
         let mut body_fulls: Vec<(
             Fk,
             u32,
@@ -375,7 +375,7 @@ impl Query {
                 .body_mlock_ns
                 .saturating_add(t_ml.elapsed().as_nanos() as u64);
 
-            // ── Full body decode (skip store when runway already has the body) ─
+            // ── Full body decode (skip store when cache already has the body) ─
             let t_dec = Instant::now();
             for &(fk, range) in &height_fks_resolved {
                 if self.confirm_cancelled() {
@@ -487,7 +487,7 @@ impl Query {
         let mut sticky_sourced: HashSet<[u8; 32]> = HashSet::new();
         let mut head_sourced: HashSet<[u8; 32]> = HashSet::new();
         if !need_external.is_empty() {
-            let t_runway = Instant::now();
+            let t_cache = Instant::now();
             let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
             let (map_hits, sticky_only) =
                 self.confirm_parents.lookup_txids_batch(&need_vec);
@@ -503,9 +503,9 @@ impl Query {
                     need_head.push(*txid);
                 }
             }
-            st.thin_runway_ns = st
-                .thin_runway_ns
-                .saturating_add(t_runway.elapsed().as_nanos() as u64);
+            st.thin_cache_ns = st
+                .thin_cache_ns
+                .saturating_add(t_cache.elapsed().as_nanos() as u64);
 
             let t_head = Instant::now();
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
@@ -586,7 +586,7 @@ impl Query {
                             st.edge_same_batch = st.edge_same_batch.saturating_add(1);
                         } else {
                             st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
-                            st.edge_runway = st.edge_runway.saturating_add(1);
+                            st.edge_cache = st.edge_cache.saturating_add(1);
                         }
                         continue;
                     }
@@ -624,7 +624,7 @@ impl Query {
                                 st.edge_sticky = st.edge_sticky.saturating_add(1);
                             } else {
                                 st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
-                                st.edge_runway = st.edge_runway.saturating_add(1);
+                                st.edge_cache = st.edge_cache.saturating_add(1);
                             }
                             if let Some(pid) = cfk.get() {
                                 parent_need.entry(pid).or_default().push(*height);
@@ -722,13 +722,13 @@ impl Query {
                 st.utxo_parents = st.utxo_parents.saturating_add(1);
                 continue;
             }
-            // Prefer runway full body (same-bite / prior-bite creates) — no Class A
+            // Prefer cache full body (same-bite / prior-bite creates) — no Class A
             // re-decode. package_ready still needs spent-filtered by_fk.
             if !need_vouts.is_empty() {
                 if let Some((create_h, tx, outs, inputs)) =
                     self.confirm_parents.get_body_for_pin(fk)
                 {
-                    st.pin_runway_body = st.pin_runway_body.saturating_add(1);
+                    st.pin_cache_body = st.pin_cache_body.saturating_add(1);
                     let range = self.confirm_parents.get_body_range(fk);
                     if let Some((off, len)) = range {
                         parent_ranges.push((fk, off, len));
@@ -932,7 +932,7 @@ impl Query {
         self.load_confirm_parents(&items)
     }
 
-    /// Retire spent parent outs from the runway cache by **create_fk** (schema v10).
+    /// Retire spent parent outs from the parent cache cache by **create_fk** (schema v10).
     ///
     /// Prefer this over txid lookup: spends are already stamped with create_fk at
     /// connect time, so we avoid a large `by_txid` walk on every confirm batch.

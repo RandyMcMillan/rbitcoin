@@ -120,7 +120,7 @@ pub const ARCHIVE_PRESSURE_EXIT: f64 = 0.70;
 /// writer (or prep error path) returns [`ArchiveResult`].
 ///
 /// **Assign gate (not receive gate):** [`Self::can_assign`] is false once charged
-/// fill ≥ budget — stop issuing new densify/runway getdata. Bodies already in
+/// fill ≥ budget — stop issuing new densify/cache getdata. Bodies already in
 /// flight still [`charge`] and enqueue (may briefly overshoot). Soft
 /// [`Self::far_admission_scale`] (proportional + 90%/70% hysteresis) scales
 /// densify capacity before the hard stop.
@@ -224,7 +224,7 @@ impl ArchiveQueueBudget {
     }
 
     /// True while charged fill is **strictly below** budget — issue densify /
-    /// confirm-runway getdata. Tip-hole and ContigPark race assign ignore this
+    /// confirm-cache getdata. Tip-hole and ContigPark race assign ignore this
     /// so a hole at `write_next` can still be filled when the queue is full.
     pub fn can_assign(&self) -> bool {
         self.bytes() < self.budget

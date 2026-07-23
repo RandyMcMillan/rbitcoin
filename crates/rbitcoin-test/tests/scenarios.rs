@@ -1214,7 +1214,7 @@ fn confirm_batch_create_and_spend_parent_same_run() {
     tip_time = b_create.header.time;
     run.push((Height(create_h), b_create.block_hash().to_byte_array()));
 
-    // Height spend_h: spend that same-batch parent (runway will reserve it).
+    // Height spend_h: spend that same-batch parent (cache will reserve it).
     let spend_h = create_h + 1;
     let spend_parent = spend_anyone_can_spend(parent_txid, 0, Amount::from_sat(48_0000_0000));
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend_parent]);
@@ -1902,7 +1902,7 @@ fn three_stage_confirm_and_parent_mlock_surface() {
     let st = q.load_confirm_parents(&items).unwrap();
     assert!(st.blocks > 0 || st.already_ready > 0);
     let _ = q.load_confirm_parents_for_hashes(&[b_spend.block_hash().to_byte_array()]);
-    let snap = q.parent_runway_perf_snapshot();
+    let snap = q.parent_cache_perf_snapshot();
     assert!(snap.5 > 0, "depth");
     let (_n, _bytes) = q.confirm_mlock_stats();
     let _ = q.confirm_mlock_bytes();
@@ -1927,7 +1927,7 @@ fn three_stage_confirm_and_parent_mlock_surface() {
     assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
 
     // Tip GC releases parent body mlocks for heights ≤ tip.
-    q.advance_parent_runway_tip(spend_h);
+    q.advance_parent_cache_tip(spend_h);
     // Combined load+scripts entry (ChainHub path) on empty above tip: reject empty.
     let empty = confirm_script_phase(&q, &params, ms, &[]);
     assert!(empty.is_err());

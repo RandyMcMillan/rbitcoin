@@ -409,7 +409,7 @@ impl TableFile {
     }
 
     /// Best-effort: tell the kernel we do not need `[offset, offset+len)` in the
-    /// page cache soon (archive far ahead of confirm/runway).
+    /// page cache soon (archive far ahead of confirm/cache).
     ///
     /// Uses `posix_fadvise(POSIX_FADV_DONTNEED)` on the file (exact range) and
     /// `madvise(MADV_DONTNEED)` only on **whole pages strictly inside** the range
@@ -599,7 +599,7 @@ pub const NOFILE_SOFT_TARGET: u64 = 16_384;
 
 /// Raise `RLIMIT_MEMLOCK` soft limit to the hard limit (no root required for that).
 ///
-/// Confirm runway `mlock`s Class A body pages so wave/connect do not soft-fault.
+/// Parent cache `mlock`s Class A body pages so wave/connect do not soft-fault.
 /// Default Linux hard memlock is often **8 MiB** — raise the **hard** limit via
 /// NixOS `security.pam.loginLimits` / systemd `LimitMEMLOCK=` (e.g. 8 GiB) so this
 /// can actually take effect. Returns `(soft, hard)` bytes after the attempt

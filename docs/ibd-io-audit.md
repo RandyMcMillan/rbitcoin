@@ -44,7 +44,7 @@ Documented roles: [`concurrency.md`](./concurrency.md). **One** Class A writer i
 correct for locking; freezes come from **how much** that writer (and hash rehash)
 does to multi‑GiB mmaps, not from N concurrent Class A writers.
 
-Background: confirm load / runway / archive may run additional disk paths; confirm
+Background: confirm load / cache / archive may run additional disk paths; confirm
 stays on its own OS thread.
 
 ---
@@ -79,7 +79,7 @@ are fine.
 
 ### 4. Confirm / parent-load thrash (medium)
 
-Confirm parent resolve under lag can amplify random reads. Prefer parent runway
+Confirm parent resolve under lag can amplify random reads. Prefer parent cache
 + light UTXO in catch-up; keep archive lead moderate.
 
 ### 5. Full `store.flush()` (medium, rare)

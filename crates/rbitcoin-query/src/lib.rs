@@ -35,11 +35,11 @@ pub type QueryError = StoreError;
 
 pub use catchup::IndexMode;
 pub use confirm_parent_cache::{
-    runway_batch_from_env, runway_depth_from_env, runway_headroom_from_env,
-    confirm_mlock_from_env, runway_pin_near_from_env, thin_create_fk_only_from_env,
-    DEFAULT_RUNWAY_BATCH as RUNWAY_BATCH, DEFAULT_RUNWAY_DEPTH as RUNWAY_DEPTH,
-    DEFAULT_RUNWAY_HEADROOM as RUNWAY_HEADROOM, DEFAULT_RUNWAY_PIN_NEAR as RUNWAY_PIN_NEAR,
-    MAX_RUNWAY_DEPTH, MIN_RUNWAY_DEPTH,
+    cache_batch_from_env, cache_depth_from_env, cache_headroom_from_env,
+    confirm_mlock_from_env, cache_pin_near_from_env, thin_create_fk_only_from_env,
+    DEFAULT_CACHE_BATCH as CACHE_BATCH, DEFAULT_CACHE_DEPTH as CACHE_DEPTH,
+    DEFAULT_CACHE_HEADROOM as CACHE_HEADROOM, DEFAULT_CACHE_PIN_NEAR as CACHE_PIN_NEAR,
+    MAX_CACHE_DEPTH, MIN_CACHE_DEPTH,
 };
 pub use connect::ConfirmPrepared;
 pub use confirm_load::ConfirmLoadStats;
@@ -51,7 +51,7 @@ pub use wave_prevout::WavePrevoutCache;
 /// Confirm load Class A / parent-pin window counters (IBD ~5s sampler).
 ///
 /// Accrued by `load_confirm_parents` (now called inline from confirm load).
-/// Pair with [`Query::parent_runway_perf_snapshot`] for cache watermarks.
+/// Pair with [`Query::parent_cache_perf_snapshot`] for cache watermarks.
 pub mod confirm_load_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -64,8 +64,8 @@ pub mod confirm_load_stats {
     pub static PARENT_UNIQUE: AtomicU64 = AtomicU64::new(0);
     /// Pin loop: already-stashed outs in by_fk (skip store decode).
     pub static PIN_ALREADY_CACHED: AtomicU64 = AtomicU64::new(0);
-    /// Pin filled from runway `by_body` (no Class A re-decode).
-    pub static PIN_RUNWAY_BODY: AtomicU64 = AtomicU64::new(0);
+    /// Pin filled from cache `by_body` (no Class A re-decode).
+    pub static PIN_CACHE_BODY: AtomicU64 = AtomicU64::new(0);
     /// Pin that had to load from store.
     pub static PIN_NEW: AtomicU64 = AtomicU64::new(0);
     pub static PARENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
@@ -77,7 +77,7 @@ pub mod confirm_load_stats {
     pub static BODY_MLOCK_NS: AtomicU64 = AtomicU64::new(0);
     pub static BODY_DECODE_NS: AtomicU64 = AtomicU64::new(0);
     pub static THIN_NS: AtomicU64 = AtomicU64::new(0);
-    /// Thin sub-phases (collect unique / runway map / head probe / edge walk).
+    /// Thin sub-phases (collect unique / cache map / head probe / edge walk).
     pub static THIN_COLLECT_NS: AtomicU64 = AtomicU64::new(0);
     pub static THIN_RUNWAY_NS: AtomicU64 = AtomicU64::new(0);
     pub static THIN_HEAD_NS: AtomicU64 = AtomicU64::new(0);
@@ -90,7 +90,7 @@ pub mod confirm_load_stats {
     /// Body-page mlock syscalls vs already-pinned skips.
     pub static MLOCK_SYSCALLS: AtomicU64 = AtomicU64::new(0);
     pub static MLOCK_SKIPPED: AtomicU64 = AtomicU64::new(0);
-    /// Thin edges classified: same-batch / runway / head / coinbase / miss.
+    /// Thin edges classified: same-batch / cache / head / coinbase / miss.
     pub static EDGE_SAME_BATCH: AtomicU64 = AtomicU64::new(0);
     pub static EDGE_RUNWAY: AtomicU64 = AtomicU64::new(0);
     pub static EDGE_HEAD: AtomicU64 = AtomicU64::new(0);
@@ -108,7 +108,7 @@ pub mod confirm_load_stats {
         pub already_ready: u64,
         pub parent_unique: u64,
         pub pin_already_cached: u64,
-        pub pin_runway_body: u64,
+        pub pin_cache_body: u64,
         pub pin_new: u64,
         pub cache_hits: u64,
         pub body_tx: u64,
@@ -119,7 +119,7 @@ pub mod confirm_load_stats {
         pub body_decode_ns: u64,
         pub thin_ns: u64,
         pub thin_collect_ns: u64,
-        pub thin_runway_ns: u64,
+        pub thin_cache_ns: u64,
         pub thin_head_ns: u64,
         pub thin_edge_ns: u64,
         pub parent_pin_ns: u64,
@@ -129,7 +129,7 @@ pub mod confirm_load_stats {
         pub mlock_syscalls: u64,
         pub mlock_skipped: u64,
         pub edge_same_batch: u64,
-        pub edge_runway: u64,
+        pub edge_cache: u64,
         pub edge_head: u64,
         pub edge_coinbase: u64,
         pub edge_sticky: u64,
@@ -145,7 +145,7 @@ pub mod confirm_load_stats {
             already_ready: ALREADY_READY.swap(0, Ordering::Relaxed),
             parent_unique: PARENT_UNIQUE.swap(0, Ordering::Relaxed),
             pin_already_cached: PIN_ALREADY_CACHED.swap(0, Ordering::Relaxed),
-            pin_runway_body: PIN_RUNWAY_BODY.swap(0, Ordering::Relaxed),
+            pin_cache_body: PIN_CACHE_BODY.swap(0, Ordering::Relaxed),
             pin_new: PIN_NEW.swap(0, Ordering::Relaxed),
             cache_hits: PARENT_CACHE_HITS.swap(0, Ordering::Relaxed),
             body_tx: BODY_TX_READS.swap(0, Ordering::Relaxed),
@@ -156,7 +156,7 @@ pub mod confirm_load_stats {
             body_decode_ns: BODY_DECODE_NS.swap(0, Ordering::Relaxed),
             thin_ns: THIN_NS.swap(0, Ordering::Relaxed),
             thin_collect_ns: THIN_COLLECT_NS.swap(0, Ordering::Relaxed),
-            thin_runway_ns: THIN_RUNWAY_NS.swap(0, Ordering::Relaxed),
+            thin_cache_ns: THIN_RUNWAY_NS.swap(0, Ordering::Relaxed),
             thin_head_ns: THIN_HEAD_NS.swap(0, Ordering::Relaxed),
             thin_edge_ns: THIN_EDGE_NS.swap(0, Ordering::Relaxed),
             parent_pin_ns: PARENT_PIN_NS.swap(0, Ordering::Relaxed),
@@ -166,7 +166,7 @@ pub mod confirm_load_stats {
             mlock_syscalls: MLOCK_SYSCALLS.swap(0, Ordering::Relaxed),
             mlock_skipped: MLOCK_SKIPPED.swap(0, Ordering::Relaxed),
             edge_same_batch: EDGE_SAME_BATCH.swap(0, Ordering::Relaxed),
-            edge_runway: EDGE_RUNWAY.swap(0, Ordering::Relaxed),
+            edge_cache: EDGE_RUNWAY.swap(0, Ordering::Relaxed),
             edge_head: EDGE_HEAD.swap(0, Ordering::Relaxed),
             edge_coinbase: EDGE_COINBASE.swap(0, Ordering::Relaxed),
             edge_sticky: EDGE_STICKY.swap(0, Ordering::Relaxed),
@@ -192,7 +192,7 @@ pub mod confirm_load_stats {
         add!(already_ready, ALREADY_READY);
         add!(parent_unique, PARENT_UNIQUE);
         add!(pin_already_cached, PIN_ALREADY_CACHED);
-        add!(pin_runway_body, PIN_RUNWAY_BODY);
+        add!(pin_cache_body, PIN_CACHE_BODY);
         add!(pin_new, PIN_NEW);
         add!(parent_cache_hits, PARENT_CACHE_HITS);
         add!(full_tx_reads, FULL_TX_READS);
@@ -203,7 +203,7 @@ pub mod confirm_load_stats {
         add!(body_decode_ns, BODY_DECODE_NS);
         add!(thin_ns, THIN_NS);
         add!(thin_collect_ns, THIN_COLLECT_NS);
-        add!(thin_runway_ns, THIN_RUNWAY_NS);
+        add!(thin_cache_ns, THIN_RUNWAY_NS);
         add!(thin_head_ns, THIN_HEAD_NS);
         add!(thin_edge_ns, THIN_EDGE_NS);
         add!(parent_pin_ns, PARENT_PIN_NS);
@@ -213,7 +213,7 @@ pub mod confirm_load_stats {
         add!(mlock_syscalls, MLOCK_SYSCALLS);
         add!(mlock_skipped, MLOCK_SKIPPED);
         add!(edge_same_batch, EDGE_SAME_BATCH);
-        add!(edge_runway, EDGE_RUNWAY);
+        add!(edge_cache, EDGE_RUNWAY);
         add!(edge_head, EDGE_HEAD);
         add!(edge_coinbase, EDGE_COINBASE);
         add!(edge_sticky, EDGE_STICKY);
@@ -424,7 +424,7 @@ pub mod wave_fill_stats {
     pub static CB_HEIGHT_NS: AtomicU64 = AtomicU64::new(0);
     /// Wave bodies moved out of ConfirmParentCache (no clone).
     pub static BODY_CACHE_MOVE: AtomicU64 = AtomicU64::new(0);
-    /// Wave bodies re-decoded from store (cache miss / not runway-cached).
+    /// Wave bodies re-decoded from store (cache miss / not cache-held).
     pub static BODY_STORE: AtomicU64 = AtomicU64::new(0);
     /// Wall ns spent in store body decode (subset of BODY_NS on miss).
     pub static BODY_STORE_NS: AtomicU64 = AtomicU64::new(0);
@@ -432,7 +432,7 @@ pub mod wave_fill_stats {
     pub static BODY_STORE_MAJFLT: AtomicU64 = AtomicU64::new(0);
     /// Time waiting on ConfirmParentCache mutex (ns).
     pub static CACHE_LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Thin edges moved from runway stash (batch take).
+    /// Thin edges moved from cache stash (batch take).
     pub static THIN_CACHE_MOVE: AtomicU64 = AtomicU64::new(0);
     /// Thin edges rebuilt by walking inputs (stash miss).
     pub static THIN_REBUILD: AtomicU64 = AtomicU64::new(0);
@@ -539,7 +539,7 @@ pub struct Query {
     /// Last height whose SH creates were enqueued/written **after tip commit**.
     /// `u64::MAX` = none. Replaces unbounded `sh_tx_indexed` HashSet.
     sh_indexed_through: AtomicU64,
-    /// Block-structured confirm parent runway.
+    /// Block-structured confirm parent cache.
     confirm_parents: confirm_parent_cache::ConfirmParentCache,
     /// Archive writer sticky: txid → create_fk for packing spends (cross mega-batch).
     archive_txid_sticky: archive_txid_sticky::ArchiveTxidSticky,
@@ -592,7 +592,7 @@ impl Query {
     pub fn request_confirm_cancel(&self) {
         self.confirm_cancel
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        // Wake any thread blocked on runway ready (tests / cancel path).
+        // Wake any thread blocked on cache ready (tests / cancel path).
         self.confirm_parents.notify_ready_waiters();
     }
 
@@ -625,7 +625,7 @@ impl Query {
             .store(v, AtomicOrdering::Release);
     }
 
-    /// Resolve txid → fk: runway cache → durable `tx.head`.
+    /// Resolve txid → fk: parent cache → durable `tx.head`.
     fn lookup_tx_fk(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
         if let Some(fk) = self.confirm_parents.get_by_txid(txid) {
             return Ok(Some(fk));
@@ -639,7 +639,7 @@ impl Query {
         Ok(None)
     }
 
-    /// Public resolve by txid (runway + durable head).
+    /// Public resolve by txid (cache + durable head).
     pub fn tx_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
         self.lookup_tx_fk(txid)
     }
@@ -698,7 +698,7 @@ impl Query {
     /// Does **not** treat archive-only point rows as spent: Class A may write
     /// edges before Class C; those spenders are not strong yet.
     pub fn is_outpoint_spent(&self, txid: &[u8; 32], vout: u32) -> Result<bool, QueryError> {
-        // Prefer runway create_fk + body range (no tx.head / idx).
+        // Prefer cache create_fk + body range (no tx.head / idx).
         if let Some(cfk) = self.confirm_parents.get_by_txid(txid) {
             let range = self.confirm_parents.get_body_range(cfk);
             return Ok(self
@@ -885,7 +885,7 @@ impl Query {
         self.store.get_header_by_hash(hash)
     }
 
-    /// Header tx list: runway cache (load) then store.
+    /// Header tx list: parent cache (load) then store.
     pub fn header_tx_fks(
         &self,
         header_fk: Fk,

@@ -1,7 +1,7 @@
-//! Confirm-runway page pinning: identify and unlock mmap ranges across tables.
+//! Confirm-cache page pinning: identify and unlock mmap ranges across tables.
 //!
 //! Runway `mlock`s every Class A / Class C / head page confirm will touch for
-//! heights in the runway, then releases via tip GC when heights leave
+//! heights in the parent cache, then releases via tip GC when heights leave
 //! `(tip, tip+depth]`.
 
 /// Which store mmap a locked page range belongs to (for unlock routing).

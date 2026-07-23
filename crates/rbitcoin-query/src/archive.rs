@@ -2,9 +2,9 @@
 
 use super::*;
 
-/// When Class A high-water is this many blocks ahead of the runway watermark,
+/// When Class A high-water is this many blocks ahead of the parent cache watermark,
 /// drop just-written `tx.body` pages from the page cache so archive dirty pages
-/// do not crowd out confirm/runway. Below this, keep pages (runway may need them).
+/// do not crowd out confirm/cache. Below this, keep pages (cache may need them).
 const ARCHIVE_BODY_DONTNEED_LEAD: u32 = 1024;
 
 impl Query {
@@ -265,15 +265,15 @@ impl Query {
 
         let body_end = self.store.txs.body_logical_len();
         let body_len = body_end.saturating_sub(body_off);
-        if body_len > 0 && self.archive_far_ahead_of_runway()? {
+        if body_len > 0 && self.archive_far_ahead_of_confirm()? {
             self.store.txs.advise_body_dont_need(body_off, body_len);
         }
         Ok(())
     }
 
     /// True when Class A high-water is more than [`ARCHIVE_BODY_DONTNEED_LEAD`]
-    /// blocks ahead of the runway ready watermark (or tip if runway idle).
-    fn archive_far_ahead_of_runway(&self) -> Result<bool, QueryError> {
+    /// blocks ahead of the parent cache ready watermark (or tip if cache idle).
+    fn archive_far_ahead_of_confirm(&self) -> Result<bool, QueryError> {
         let bodies = self.store.header_txs.count_bodies()?;
         if bodies == 0 {
             return Ok(false);
@@ -281,8 +281,8 @@ impl Query {
         // Contiguous IBD: highest archived height ≈ body count − 1.
         let arch_hi = (bodies - 1) as u32;
         let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
-        let runway = self.parent_runway_ready_through().max(tip);
-        Ok(arch_hi.saturating_sub(runway) > ARCHIVE_BODY_DONTNEED_LEAD)
+        let cache = self.parent_cache_ready_through().max(tip);
+        Ok(arch_hi.saturating_sub(cache) > ARCHIVE_BODY_DONTNEED_LEAD)
     }
 
     /// Resolve prev outpoint txid for an input.

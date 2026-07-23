@@ -218,7 +218,7 @@ open-hash tables (`tx.head`, scripthash) rather than any single multi‑10 GiB
 
 | Cache | Size | Content |
 |-------|------|---------|
-| Confirm parent runway + UTXO slab | 256–512 MiB | Runway parents + light UTXO (not full set) |
+| Confirm parent cache + UTXO slab | 256–512 MiB | Runway parents + light UTXO (not full set) |
 | Electrum hot scripthash | 64–128 MiB MRU of fat slabs | Wallet sessions |
 | Hash probe bloom (optional) | 32–64 MiB | Negative lookups on tx / scripthash |
 

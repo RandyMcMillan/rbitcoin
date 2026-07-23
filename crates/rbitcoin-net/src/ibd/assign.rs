@@ -1,8 +1,8 @@
-//! Getdata assign: tip-hole race, confirm runway, ContigPark feed.
+//! Getdata assign: tip-hole race, parent cache, ContigPark feed.
 //!
 //! Height ownership (single policy):
 //! - **Tip holes:** ordered front unready → multi-peer race
-//! - **Confirm runway:** tip+1‥min(near_hi, write_next−1) → single peer
+//! - **Parent cache:** tip+1‥min(near_hi, write_next−1) → single peer
 //! - **ContigPark feed:** write_next‥write_next+W → multi-peer on write_next‥+R−1,
 //!   single peer on the rest; capacity scaled by archive budget admission
 //! - **Beyond write_next+W:** never request (events also refuse park)
@@ -28,7 +28,7 @@ pub(crate) enum AssignDepth {
     /// Tip holes + ContigPark `write_next` multi-peer race only (cheap).
     /// Used when archive pipeline is saturated so we do not spin full scans.
     Critical,
-    /// Critical + confirm runway + ContigPark densify band.
+    /// Critical + parent cache + ContigPark densify band.
     Full,
 }
 
@@ -99,7 +99,7 @@ pub(crate) fn archive_pipeline_saturated(
 ///
 /// `can_assign_new`: [`super::archive::ArchiveQueueBudget::can_assign`] — when
 /// false, only tip-hole + ContigPark race run (fill contig / tip). Densify and
-/// confirm-runway getdata stop so charged RAM stays near the budget; bodies
+/// confirm-cache getdata stop so charged RAM stays near the budget; bodies
 /// already in flight still enqueue (may overshoot).
 pub(crate) fn assign_work_ordered(
     st: &mut IbdWorkState,
@@ -155,7 +155,7 @@ pub(crate) fn assign_work_ordered(
     // Multi-peer race only on write_next .. write_next+R-1 (not a long band).
     issued += cover_park_race(st, hub, cfg, &alive, archive_write_next);
 
-    // At budget or critical: no densify / confirm-runway assign.
+    // At budget or critical: no densify / confirm-cache assign.
     if !can_assign_new || matches!(depth, AssignDepth::Critical) {
         finish_assign(loop_stats, t0, issued);
         return;
@@ -177,13 +177,13 @@ pub(crate) fn assign_work_ordered(
 
     let feed_scale = archive_feed_scale.clamp(0.0, 1.0);
     // Densify capacity in the ContigPark band (beyond the race prefix).
-    // scale=0 → zero densify slots (no drip under pressure); runway may still run.
+    // scale=0 → zero densify slots (no drip under pressure); cache may still run.
     let tip_hole = !tip_holes.is_empty();
     let base_feed = far_slots_per_peer(cfg.per_peer, tip_hole);
     let feed_cap = scale_feed_cap(base_feed, feed_scale);
 
-    // Confirm runway: tip+1 .. min(near_hi, write_next-1). Park feed owns ≥ write_next.
-    let runway_hi = if archive_write_next > tip.saturating_add(1) {
+    // Parent cache: tip+1 .. min(near_hi, write_next-1). Park feed owns ≥ write_next.
+    let cache_hi = if archive_write_next > tip.saturating_add(1) {
         near_hi.min(archive_write_next.saturating_sub(1))
     } else {
         // write_next at/behind tip+1 → park feed covers the near window.
@@ -195,9 +195,9 @@ pub(crate) fn assign_work_ordered(
         .saturating_mul(feed_cap)
         .min(room.saturating_mul(3) / 4)
         .max(feed_cap.min(room));
-    let runway_cap = room.saturating_sub(feed_reserve);
+    let cache_cap = room.saturating_sub(feed_reserve);
 
-    let runway = collect_runway(st, hub, tip, runway_hi, runway_cap);
+    let cache = collect_height_window(st, hub, tip, cache_hi, cache_cap);
     // Densify: write_next+R .. write_next+W (race prefix already multi-peered).
     let densify_lo = archive_write_next.saturating_add(CONTIG_PARK_RACE as u32);
     let densify_hi = archive_write_next.saturating_add(CONTIG_DENSIFY_AHEAD);
@@ -206,10 +206,10 @@ pub(crate) fn assign_work_ordered(
         hub,
         densify_lo,
         densify_hi,
-        room.saturating_sub(runway.len()).max(1),
+        room.saturating_sub(cache.len()).max(1),
     );
 
-    if runway.is_empty() && densify.is_empty() {
+    if cache.is_empty() && densify.is_empty() {
         finish_assign(loop_stats, t0, issued);
         return;
     }
@@ -217,12 +217,12 @@ pub(crate) fn assign_work_ordered(
     let mut peer_i = st.assign_rot;
     st.assign_rot = st.assign_rot.wrapping_add(1);
 
-    // Issue confirm runway (single peer), leaving feed_reserve for densify.
-    let mut runway_q = runway;
-    while room > feed_reserve && !runway_q.is_empty() {
+    // Issue parent cache (single peer), leaving feed_reserve for densify.
+    let mut cache_q = cache;
+    while room > feed_reserve && !cache_q.is_empty() {
         let mut any = false;
         for _ in 0..alive.len() {
-            if room <= feed_reserve || runway_q.is_empty() {
+            if room <= feed_reserve || cache_q.is_empty() {
                 break;
             }
             let pid = alive[peer_i % alive.len()];
@@ -230,7 +230,7 @@ pub(crate) fn assign_work_ordered(
             if !peer_has_slot(st, pid, cfg.per_peer) {
                 continue;
             }
-            let Some(h) = pop_need(&mut runway_q, st, hub) else {
+            let Some(h) = pop_need(&mut cache_q, st, hub) else {
                 break;
             };
             if issue_one(st, pid, h, &mut room, &mut issued) {
@@ -287,19 +287,19 @@ pub(crate) fn finish_assign(loop_stats: &LoopStats, t0: Instant, issued: u64) {
     }
 }
 
-/// Confirm runway: tip+1 ‥ runway_hi (exclusive of ContigPark write_next and above).
-fn collect_runway(
+/// Parent cache: tip+1 ‥ cache_hi (exclusive of ContigPark write_next and above).
+fn collect_height_window(
     st: &mut IbdWorkState,
     hub: &ChainHub,
     tip: u32,
-    runway_hi: u32,
+    cache_hi: u32,
     cap: usize,
 ) -> VecDeque<BlockHash> {
     let mut out = VecDeque::new();
-    if runway_hi <= tip || cap == 0 {
+    if cache_hi <= tip || cap == 0 {
         return out;
     }
-    for ht in tip.saturating_add(1)..=runway_hi {
+    for ht in tip.saturating_add(1)..=cache_hi {
         if out.len() >= cap {
             break;
         }
@@ -391,7 +391,7 @@ fn peer_feed_free(
     if free_total == 0 || feed_cap == 0 {
         return None;
     }
-    // Count how many of this peer's inflight are already densify/race (not tip runway).
+    // Count how many of this peer's inflight are already densify/race (not tip cache).
     // Approximate: any hash with height > tip+NEAR is feed; also height >= write_next
     // is hard without write_next here — use free_total.min(feed_cap) as simple bound.
     Some(free_total.min(feed_cap))

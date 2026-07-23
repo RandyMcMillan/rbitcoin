@@ -117,7 +117,7 @@ impl Query {
         self.sh_run.finalize_and_bulk_materialize(&self.store)
     }
 
-    /// On-disk scripthash sorted-run count (Direct IBD runway).
+    /// On-disk scripthash sorted-run count (Direct IBD cache).
     pub fn scripthash_run_count(&self) -> usize {
         self.sh_run.on_disk_run_count()
     }

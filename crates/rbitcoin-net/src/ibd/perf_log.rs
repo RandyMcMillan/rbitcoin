@@ -5,8 +5,8 @@
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
-//! | INFO  | `ibd: progress …` | Tip/arch rates over the **last 5s**, runway lead, horizon, **1h tip ETA** (bold on TTY) |
-//! | INFO  | `ibd: perf …` | Download queue, archive pressure, confirm cost, load phases, loop mix |
+//! | INFO  | `ibd: progress …` | Tip/arch rates over the **last 5s**, confirm pipeline queue depths, horizon, **1h tip ETA** (bold on TTY) |
+//! | INFO  | `ibd: perf …` | Download queue, archive pressure, confirm cost, load phases, conf_q, loop mix |
 //! | DEBUG | `ibd: perf_dbg …` | µs/blk phases, wave/SH subs, caches, pipe |
 //!
 //! Sample **once** per tick and reset all atomics, then format INFO always and
@@ -69,7 +69,7 @@ pub(crate) struct IbdPerfSample {
     pub resolve_ms: u64,
     pub load_ms: u64,
     pub unpin_ms: u64,
-    pub runway_tip_ms: u64,
+    pub cache_tip_ms: u64,
     // raw ns for us/blk
     pub recon_ns: u64,
     pub prefetch_ns: u64,
@@ -85,7 +85,7 @@ pub(crate) struct IbdPerfSample {
     pub resolve_ns: u64,
     pub load_ns: u64,
     pub unpin_ns: u64,
-    pub runway_tip_ns: u64,
+    pub cache_tip_ns: u64,
 
     /// Confirm-load mlocked ranges / unique page RAM.
     pub mlock_ranges: usize,
@@ -99,10 +99,10 @@ pub(crate) struct IbdPerfSample {
     pub wf_pout_ms: u64,
     pub wf_spent_ms: u64,
     pub wf_cb_ms: u64,
-    /// Wave bodies moved from runway cache vs re-decoded from store.
+    /// Wave bodies moved from parent cache vs re-decoded from store.
     pub wf_body_cache: u64,
     pub wf_body_store: u64,
-    /// Thin edges moved from runway stash vs rebuilt from inputs.
+    /// Thin edges moved from cache stash vs rebuilt from inputs.
     pub wf_thin_cache: u64,
     pub wf_thin_rebuild: u64,
     /// Store body decode wall (ms) + majflt count during those loads.
@@ -126,7 +126,7 @@ pub(crate) struct IbdPerfSample {
     pub cp_class_a: u64,
     pub cp_store: u64,
 
-    // Parent runway / confirm-load window counters + live snapshot
+    // Parent cache / confirm-load window counters + live snapshot
     /// Wall ms in `load_confirm_parents` this window (sampler).
     pub load_win_ms: u64,
     pub load_blocks: u64,
@@ -134,9 +134,9 @@ pub(crate) struct IbdPerfSample {
     pub load_creates: u64,
     pub load_already_ready: u64,
     pub load_parent_unique: u64,
-    /// Of uniq_p: by_fk re-pin / runway body / store decode.
+    /// Of uniq_p: by_fk re-pin / cache body / store decode.
     pub load_pin_already_cached: u64,
-    pub load_pin_runway_body: u64,
+    pub load_pin_cache_body: u64,
     pub load_pin_new: u64,
     pub load_cache_hits: u64,
     /// Phase-1 body Class A reads this window.
@@ -146,13 +146,16 @@ pub(crate) struct IbdPerfSample {
     pub load_missing_parents: u64,
     /// Contiguous ready watermark height.
     pub load_ready_through: u32,
-    /// `ready_through - tip` (blocks warmer is ahead of confirm tip).
-    pub runway_ahead: u32,
-    pub runway_parents: usize,
-    /// Full bodies cached for the runway.
-    pub runway_bodies: usize,
-    pub runway_plans: usize,
-    pub runway_depth: u32,
+    /// Parent-cache snapshot (bodies still held / plans / depth).
+    pub cache_parents: usize,
+    pub cache_bodies: usize,
+    pub cache_plans: usize,
+    pub cache_depth: u32,
+    /// Confirm pipeline queue depths (load→scripts, scripts→write).
+    pub conf_load_q: usize,
+    pub conf_write_q: usize,
+    pub conf_load_q_cap: usize,
+    pub conf_write_q_cap: usize,
     /// Runway internal phase ms (window sum).
     pub load_hdr_ms: u64,
     pub load_body_mlock_ms: u64,
@@ -160,7 +163,7 @@ pub(crate) struct IbdPerfSample {
     pub load_thin_ms: u64,
     /// Thin sub-phases (ms window sum).
     pub load_thin_collect_ms: u64,
-    pub load_thin_runway_ms: u64,
+    pub load_thin_cache_ms: u64,
     pub load_thin_head_ms: u64,
     pub load_thin_edge_ms: u64,
     pub load_parent_pin_ms: u64,
@@ -170,7 +173,7 @@ pub(crate) struct IbdPerfSample {
     pub load_mlock_sys: u64,
     pub load_mlock_skip: u64,
     pub load_edge_same: u64,
-    pub load_edge_runway: u64,
+    pub load_edge_cache: u64,
     pub load_edge_head: u64,
     pub load_edge_cb: u64,
 
@@ -240,7 +243,7 @@ impl Default for IbdPerfSample {
             resolve_ms: 0,
             load_ms: 0,
             unpin_ms: 0,
-            runway_tip_ms: 0,
+            cache_tip_ms: 0,
             recon_ns: 0,
             prefetch_ns: 0,
             wave_ns: 0,
@@ -255,7 +258,7 @@ impl Default for IbdPerfSample {
             resolve_ns: 0,
             load_ns: 0,
             unpin_ns: 0,
-            runway_tip_ns: 0,
+            cache_tip_ns: 0,
             mlock_ranges: 0,
             mlock_bytes: 0,
             sh_runs: 0,
@@ -289,24 +292,27 @@ impl Default for IbdPerfSample {
             load_already_ready: 0,
             load_parent_unique: 0,
             load_pin_already_cached: 0,
-            load_pin_runway_body: 0,
+            load_pin_cache_body: 0,
             load_pin_new: 0,
             load_cache_hits: 0,
             load_body_tx_reads: 0,
             load_parent_tx_reads: 0,
             load_missing_parents: 0,
             load_ready_through: 0,
-            runway_ahead: 0,
-            runway_parents: 0,
-            runway_bodies: 0,
-            runway_plans: 0,
-            runway_depth: 0,
+            cache_parents: 0,
+            cache_bodies: 0,
+            cache_plans: 0,
+            cache_depth: 0,
+            conf_load_q: 0,
+            conf_write_q: 0,
+            conf_load_q_cap: super::confirm::LOAD_QUEUE_CAP,
+            conf_write_q_cap: super::confirm::WRITE_QUEUE_CAP,
             load_hdr_ms: 0,
             load_body_mlock_ms: 0,
             load_decode_ms: 0,
             load_thin_ms: 0,
             load_thin_collect_ms: 0,
-            load_thin_runway_ms: 0,
+            load_thin_cache_ms: 0,
             load_thin_head_ms: 0,
             load_thin_edge_ms: 0,
             load_parent_pin_ms: 0,
@@ -316,7 +322,7 @@ impl Default for IbdPerfSample {
             load_mlock_sys: 0,
             load_mlock_skip: 0,
             load_edge_same: 0,
-            load_edge_runway: 0,
+            load_edge_cache: 0,
             load_edge_head: 0,
             load_edge_cb: 0,
             arch_ext_need: 0,
@@ -359,6 +365,8 @@ pub(crate) fn sample(
     headers_done: bool,
     // (ready_through, ahead, parents, bodies, plans, depth).
     load: (u32, u32, usize, usize, usize, u32),
+    conf_load_q: usize,
+    conf_write_q: usize,
     mlock_ranges: usize,
     mlock_bytes: u64,
     sh_runs: usize,
@@ -382,7 +390,7 @@ pub(crate) fn sample(
         resolve_ns,
         load_ns,
         unpin_ns,
-        runway_tip_ns,
+        cache_tip_ns,
         spend_ranged,
         spend_idx,
         spend_skip,
@@ -402,7 +410,8 @@ pub(crate) fn sample(
     let pipe = pipe_stats.sample_and_reset();
     let (contig_next_h, contig_parked, contig_ready) =
         rbitcoin_query::contig_park_stats::snapshot();
-    let (load_ready_through, runway_ahead, runway_parents, runway_bodies, runway_plans, runway_depth) = load;
+    let (load_ready_through, _cache_ahead, cache_parents, cache_bodies, cache_plans, cache_depth) =
+        load;
     let (arch_sticky_len, arch_sticky_cap) = arch_sticky;
 
     IbdPerfSample {
@@ -447,7 +456,7 @@ pub(crate) fn sample(
         resolve_ms: ns_ms(resolve_ns),
         load_ms: ns_ms(load_ns),
         unpin_ms: ns_ms(unpin_ns),
-        runway_tip_ms: ns_ms(runway_tip_ns),
+        cache_tip_ms: ns_ms(cache_tip_ns),
         recon_ns,
         prefetch_ns,
         wave_ns: wave_fill_ns,
@@ -462,7 +471,7 @@ pub(crate) fn sample(
         resolve_ns,
         load_ns,
         unpin_ns,
-        runway_tip_ns,
+        cache_tip_ns,
         mlock_ranges,
         mlock_bytes,
         sh_runs,
@@ -496,24 +505,27 @@ pub(crate) fn sample(
         load_already_ready: pw.already_ready,
         load_parent_unique: pw.parent_unique,
         load_pin_already_cached: pw.pin_already_cached,
-        load_pin_runway_body: pw.pin_runway_body,
+        load_pin_cache_body: pw.pin_cache_body,
         load_pin_new: pw.pin_new,
         load_cache_hits: pw.cache_hits,
         load_body_tx_reads: pw.body_tx,
         load_parent_tx_reads: pw.parent_tx,
         load_missing_parents: pw.missing,
         load_ready_through,
-        runway_ahead,
-        runway_parents,
-        runway_bodies,
-        runway_plans,
-        runway_depth,
+        cache_parents,
+        cache_bodies,
+        cache_plans,
+        cache_depth,
+        conf_load_q,
+        conf_write_q,
+        conf_load_q_cap: super::confirm::LOAD_QUEUE_CAP,
+        conf_write_q_cap: super::confirm::WRITE_QUEUE_CAP,
         load_hdr_ms: ns_ms(pw.header_ns),
         load_body_mlock_ms: ns_ms(pw.body_mlock_ns),
         load_decode_ms: ns_ms(pw.body_decode_ns),
         load_thin_ms: ns_ms(pw.thin_ns),
         load_thin_collect_ms: ns_ms(pw.thin_collect_ns),
-        load_thin_runway_ms: ns_ms(pw.thin_runway_ns),
+        load_thin_cache_ms: ns_ms(pw.thin_cache_ns),
         load_thin_head_ms: ns_ms(pw.thin_head_ns),
         load_thin_edge_ms: ns_ms(pw.thin_edge_ns),
         load_parent_pin_ms: ns_ms(pw.parent_pin_ns),
@@ -523,7 +535,7 @@ pub(crate) fn sample(
         load_mlock_sys: pw.mlock_syscalls,
         load_mlock_skip: pw.mlock_skipped,
         load_edge_same: pw.edge_same_batch,
-        load_edge_runway: pw.edge_runway,
+        load_edge_cache: pw.edge_cache,
         load_edge_head: pw.edge_head,
         load_edge_cb: pw.edge_coinbase,
         arch_ext_need: arch_res.ext_need,
@@ -581,7 +593,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.resolve_ms,
         s.load_ms,
         s.unpin_ms,
-        s.runway_tip_ms,
+        s.cache_tip_ms,
     ));
     out.push_str(&format!(
         " | loop {} conf={}ms assign={}ms getdata={} drain={}ms",
@@ -606,18 +618,21 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     };
     let mlock_mb = s.mlock_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | runway +{} thru={} by_txid={} bodies={} plans={}/{} blks={} body_io={} parent_io={} pin_cached={} pin_runway={} pin_new={} cache%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
-        s.runway_ahead,
+        " | conf_q load={}/{} write={}/{} | parents thru={} by_txid={} bodies={} plans={}/{} blks={} body_io={} parent_io={} pin_cached={} pin_cache={} pin_new={} cache%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
+        s.conf_load_q,
+        s.conf_load_q_cap,
+        s.conf_write_q,
+        s.conf_write_q_cap,
         s.load_ready_through,
-        s.runway_parents,
-        s.runway_bodies,
-        s.runway_plans,
-        s.runway_depth,
+        s.cache_parents,
+        s.cache_bodies,
+        s.cache_plans,
+        s.cache_depth,
         s.load_blocks,
         s.load_body_tx_reads,
         s.load_parent_tx_reads,
         s.load_pin_already_cached,
-        s.load_pin_runway_body,
+        s.load_pin_cache_body,
         s.load_pin_new,
         cache_pct,
         s.load_win_ms,
@@ -626,7 +641,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.load_decode_ms,
         s.load_thin_ms,
         s.load_thin_collect_ms,
-        s.load_thin_runway_ms,
+        s.load_thin_cache_ms,
         s.load_thin_head_ms,
         s.load_thin_edge_ms,
         s.load_parent_pin_ms,
@@ -670,7 +685,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         us(s.resolve_ns),
         us(s.load_ns),
         us(s.unpin_ns),
-        us(s.runway_tip_ns),
+        us(s.cache_tip_ns),
     );
     out.push_str(&format!(
         " | wave body={} ptx={} pout={} spent={} cb={} cache={} store={} thin={} rebuild={} store_ms={} majflt={} lock_ms={}",
@@ -701,13 +716,16 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let cp_tot = s.cp_wave + s.cp_class_a + s.cp_store;
     let mlock_mb = s.mlock_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | runway +{} thru={} by_txid={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cached={} pin_runway={} pin_new={} cache_hit={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} head={}/{} mlock_sys={}/{} edges same={} runway={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
-        s.runway_ahead,
+        " | conf_q load={}/{} write={}/{} | parents thru={} by_txid={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cached={} pin_cache={} pin_new={} cache_hit={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} head={}/{} mlock_sys={}/{} edges same={} cache={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
+        s.conf_load_q,
+        s.conf_load_q_cap,
+        s.conf_write_q,
+        s.conf_write_q_cap,
         s.load_ready_through,
-        s.runway_parents,
-        s.runway_bodies,
-        s.runway_plans,
-        s.runway_depth,
+        s.cache_parents,
+        s.cache_bodies,
+        s.cache_plans,
+        s.cache_depth,
         s.load_win_ms,
         s.load_blocks,
         s.load_utxo_parents,
@@ -715,7 +733,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.load_already_ready,
         s.load_parent_unique,
         s.load_pin_already_cached,
-        s.load_pin_runway_body,
+        s.load_pin_cache_body,
         s.load_pin_new,
         s.load_cache_hits,
         s.load_body_tx_reads,
@@ -726,7 +744,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.load_decode_ms,
         s.load_thin_ms,
         s.load_thin_collect_ms,
-        s.load_thin_runway_ms,
+        s.load_thin_cache_ms,
         s.load_thin_head_ms,
         s.load_thin_edge_ms,
         s.load_parent_pin_ms,
@@ -736,7 +754,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.load_mlock_sys,
         s.load_mlock_skip,
         s.load_edge_same,
-        s.load_edge_runway,
+        s.load_edge_cache,
         s.load_edge_head,
         s.load_edge_cb,
         s.mlock_ranges,
@@ -870,12 +888,15 @@ mod tests {
         assert!(line.contains("loop confirm"), "{line}");
         assert!(line.contains("reject=2"), "{line}");
         assert!(line.contains("live h=100 n=32 1500ms"), "{line}");
-        s.runway_ahead = 64;
+        s.conf_load_q = 1;
+        s.conf_write_q = 2;
+        s.conf_load_q_cap = 2;
+        s.conf_write_q_cap = 2;
         s.load_ready_through = 200;
-        s.runway_parents = 12;
-        s.runway_bodies = 48;
-        s.runway_plans = 80;
-        s.runway_depth = 256;
+        s.cache_parents = 12;
+        s.cache_bodies = 48;
+        s.cache_plans = 80;
+        s.cache_depth = 256;
         s.load_blocks = 32;
         s.load_body_tx_reads = 400;
         s.load_parent_tx_reads = 120;
@@ -888,14 +909,16 @@ mod tests {
         s.mlock_ranges = 12;
         s.sh_runs = 3;
         let line = format_info(&s);
-        assert!(line.contains("runway +64 thru=200"), "{line}");
+        assert!(line.contains("conf_q load=1/2 write=2/2"), "{line}");
+        assert!(line.contains("thru=200"), "{line}");
         assert!(line.contains("by_txid=12 bodies=48 plans=80/256"), "{line}");
         assert!(line.contains("body_io=400 parent_io=120"), "{line}");
-        assert!(line.contains("pin_cached=5 pin_runway=0 pin_new=15"), "{line}");
+        assert!(line.contains("pin_cached=5 pin_cache=0 pin_new=15"), "{line}");
         assert!(line.contains("mlock=32MiB ranges=12 sh_runs=3"), "{line}");
         assert!(!line.contains("reserved"), "{line}");
         assert!(!line.contains("confirm_phases"), "{line}");
         assert!(!line.contains("mat="), "{line}");
+        assert!(!line.contains("runway"), "{line}");
     }
 
     #[test]
@@ -908,7 +931,10 @@ mod tests {
         s.spend_idx = 2;
         s.spend_skip = 0;
         s.wf_spent_ms = 50;
-        s.runway_ahead = 64;
+        s.conf_load_q = 0;
+        s.conf_write_q = 1;
+        s.conf_load_q_cap = 2;
+        s.conf_write_q_cap = 2;
         s.load_ready_through = 200;
         s.load_blocks = 16;
         s.load_utxo_parents = 100;
@@ -932,11 +958,12 @@ mod tests {
         assert!(line.contains("store="), "{line}");
         assert!(line.contains("thin="), "{line}");
         assert!(line.contains("rebuild="), "{line}");
-        assert!(line.contains("runway +64 thru=200"), "{line}");
+        assert!(line.contains("conf_q load=0/2 write=1/2"), "{line}");
+        assert!(line.contains("thru=200"), "{line}");
         assert!(line.contains("utxo_p=100"), "{line}");
         assert!(line.contains("creates=50"), "{line}");
         assert!(line.contains("body_io=200 parent_io=50"), "{line}");
-        assert!(line.contains("pin_cached=12 pin_runway=0 pin_new=38"), "{line}");
+        assert!(line.contains("pin_cached=12 pin_cache=0 pin_new=38"), "{line}");
         assert!(line.contains("mlock=16MiB ranges=4 sh_runs=2"), "{line}");
         assert!(line.contains("arch_res resolve_us/blk="), "{line}");
         assert!(line.contains("sticky_map="), "{line}");
@@ -947,6 +974,7 @@ mod tests {
         assert!(!line.contains("reserved"), "{line}");
         assert!(line.contains("pipe "), "{line}");
         assert!(line.contains("loop "), "{line}");
+        assert!(!line.contains("runway"), "{line}");
     }
 
     #[test]

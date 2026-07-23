@@ -44,9 +44,9 @@ Default: **info**. CLI wins over env.
 | Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` (`0` = full scripts) |
 | Archive queue RAM | **512 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
-| Confirm runway depth | **256** | `RBITCOIN_CONFIRM_RUNWAY_DEPTH` (cache horizon / tip GC) |
+| Parent-cache GC horizon | **256** | `RBITCOIN_CONFIRM_CACHE_DEPTH` (tip GC for pins/mlock only; does **not** control load size) |
 | Parent body mlock (write annotate) | **on** | `RBITCOIN_CONFIRM_MLOCK=0` to disable |
-| Confirm stages | **load · scripts · write** | Load pins + mlocks all parent create bodies needed by the claimed batch |
+| Confirm stages | **load · scripts · write** | Pipeline queues cap **2** each (`conf_q load=n/2 write=m/2` in progress logs) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 | Inhibit auto-suspend | **off** | `--inhibit-suspend` (uses `systemd-inhibit` if available) |
 
@@ -86,7 +86,7 @@ retained. Packed Class A only. Spends are schema-v5 annotations on create output
 
 **Memory rule:** Direct IBD writes durable `tx.head` live and spend annotations
 on confirm. Class A is packed full-tx bodies; inputs always store **external**
-`prev_txid`. Parent resolve uses runway cache + `tx.head`. SH create dedupe is
+`prev_txid`. Parent resolve uses parent cache + `tx.head`. SH create dedupe is
 an **O(1) height watermark**; durable SH tables bulk-load at tip. Do not raise
 archive queues without watching RSS vs page cache.
 

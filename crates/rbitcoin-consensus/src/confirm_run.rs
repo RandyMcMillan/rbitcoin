@@ -314,7 +314,7 @@ impl ScriptOkBatch {
 
 /// Samples major page faults for the **calling** thread only (Linux).
 ///
-/// Other threads (archive, runway, rayon script workers) do not count. Store
+/// Other threads (archive, cache, rayon script workers) do not count. Store
 /// cold touches on the confirm OS thread show up here; `mlock` gaps → warn.
 fn thread_majflt() -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -591,7 +591,7 @@ fn assemble_run(
                     }
                     time_window = times;
                 } else {
-                    // Prior tip headers are not on the load runway — tiny store reads.
+                    // Prior tip headers are not on the load cache — tiny store reads.
                     validate_header(query, params, height, &block.header)?;
                     for h in start..=prev_h.0 {
                         let (_fk, rec) = query
@@ -851,8 +851,8 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
     confirm_phase_stats::UTXO_APPLY_NS
         .fetch_add(t_spent.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-    // IBD (Direct): skip per-spend unpin — tip GC drops the same runway outs.
-    // Tip mode: still retire spent sparse parents so long-lived runway stays lean.
+    // IBD (Direct): skip per-spend unpin — tip GC drops the same parent outs.
+    // Tip mode: still retire spent sparse parents so long-lived cache stays lean.
     let t_unpin = Instant::now();
     if query.index_mode() != rbitcoin_query::IndexMode::Direct {
         let all_spends: Vec<(rbitcoin_primitives::Fk, u32)> = prepared
@@ -874,11 +874,11 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
         Ordering::Relaxed,
     );
 
-    // Prune confirm-parent runway for heights at/below new tip.
+    // Prune confirm-parent cache for heights at/below new tip.
     if let Some(tip) = prepared.last().map(|p| p.height.0) {
         let t_tip = Instant::now();
-        query.advance_parent_runway_tip(tip);
-        confirm_phase_stats::RUNWAY_TIP_NS.fetch_add(
+        query.advance_parent_cache_tip(tip);
+        confirm_phase_stats::CACHE_TIP_NS.fetch_add(
             t_tip.elapsed().as_nanos() as u64,
             Ordering::Relaxed,
         );

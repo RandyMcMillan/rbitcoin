@@ -224,7 +224,7 @@ pub(crate) fn apply_peer_event(
                 st.empty_header_streak = 0;
                 st.headers_done = false;
                 let live = st.ordered_set.len();
-                let need_arch_runway = want_headers_beyond_soft_cap(
+                let need_arch_cache = want_headers_beyond_soft_cap(
                     live,
                     st.body.known_len(),
                     st.max_ordered_height.saturating_sub(st.max_archived_height),
@@ -232,7 +232,7 @@ pub(crate) fn apply_peer_event(
                 );
                 if batch_len >= MAX_HEADERS_RESULTS
                     && live < MAX_ORDERED_HEADERS
-                    && (live < ORDERED_HEADERS_SOFT_CAP || need_arch_runway)
+                    && (live < ORDERED_HEADERS_SOFT_CAP || need_arch_cache)
                 {
                     let tips = work_path_tips(st);
                     let _ = request_headers_from(
@@ -283,17 +283,17 @@ pub(crate) fn apply_peer_event(
                 // (do **not** count toward headers_done — multi-peer overlap was
                 // marking done after one 2000-header window).
                 let live = st.ordered_set.len();
-                let need_arch_runway = want_headers_beyond_soft_cap(
+                let need_arch_cache = want_headers_beyond_soft_cap(
                     live,
                     st.body.known_len(),
                     st.max_ordered_height.saturating_sub(st.max_archived_height),
                     4096,
                 );
                 if live < MAX_ORDERED_HEADERS
-                    && (live < ORDERED_HEADERS_SOFT_CAP || need_arch_runway)
+                    && (live < ORDERED_HEADERS_SOFT_CAP || need_arch_cache)
                     && (batch_len >= MAX_HEADERS_RESULTS
                         || header_lag_behind_peers(st, hub.tip_height().unwrap_or(0)) > 2
-                        || need_arch_runway)
+                        || need_arch_cache)
                 {
                     let tips = work_path_tips(st);
                     let _ = request_headers_from(
@@ -384,7 +384,7 @@ pub(crate) fn apply_peer_event(
                 st.body.mark_missing(hash);
                 return;
             }
-            // Priority: confirm runway + ContigPark densify horizon (parkable soon).
+            // Priority: parent cache + ContigPark densify horizon (parkable soon).
             let priority = st
                 .hash_height
                 .get(&hash)

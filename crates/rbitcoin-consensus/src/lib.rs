@@ -133,7 +133,7 @@ pub mod confirm_phase_stats {
     /// Historical name `UTXO_APPLY_NS` / log field `utxo_ms` — this is **not** a
     /// light-UTXO map apply (Catchup removed). Wall time for all annotate paths.
     pub static UTXO_APPLY_NS: AtomicU64 = AtomicU64::new(0);
-    /// Annotate edges using runway-cached body range (no idx).
+    /// Annotate edges using cache-held body range (no idx).
     pub static SPEND_ANNOTATE_RANGED: AtomicU64 = AtomicU64::new(0);
     /// Annotate edges with create_fk but no body_range (idx path).
     pub static SPEND_ANNOTATE_IDX: AtomicU64 = AtomicU64::new(0);
@@ -145,15 +145,15 @@ pub mod confirm_phase_stats {
     pub static LOAD_NS: AtomicU64 = AtomicU64::new(0);
     /// Unpin spent outs from ConfirmParentCache after Class C.
     pub static UNPIN_NS: AtomicU64 = AtomicU64::new(0);
-    /// `advance_parent_runway_tip` (drop bodies / GC parents).
-    pub static RUNWAY_TIP_NS: AtomicU64 = AtomicU64::new(0);
+    /// `advance_parent_cache_tip` (drop bodies / GC parents).
+    pub static CACHE_TIP_NS: AtomicU64 = AtomicU64::new(0);
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
 
     /// Sample and reset all confirm phases.
     ///
     /// Returns
     /// `(recon, prefetch, wave_fill, wire, connect, script, class_c, strong, scripthash, tip,
-    ///   utxo_apply, blocks, resolve, load, unpin, runway_tip,
+    ///   utxo_apply, blocks, resolve, load, unpin, cache_tip,
     ///   spend_ranged, spend_idx, spend_skip)`.
     /// `strong` / `scripthash` / `tip` come from [`rbitcoin_query::class_c_phase_stats`]
     /// (sub-phases inside Class C). `recon` is the sum of the three reconstruct sub-timers.
@@ -210,7 +210,7 @@ pub mod confirm_phase_stats {
             RESOLVE_NS.swap(0, Ordering::Relaxed),
             LOAD_NS.swap(0, Ordering::Relaxed),
             UNPIN_NS.swap(0, Ordering::Relaxed),
-            RUNWAY_TIP_NS.swap(0, Ordering::Relaxed),
+            CACHE_TIP_NS.swap(0, Ordering::Relaxed),
             SPEND_ANNOTATE_RANGED.swap(0, Ordering::Relaxed),
             SPEND_ANNOTATE_IDX.swap(0, Ordering::Relaxed),
             SPEND_ANNOTATE_SKIP.swap(0, Ordering::Relaxed),

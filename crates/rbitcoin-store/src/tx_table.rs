@@ -858,9 +858,16 @@ impl TxTable {
     /// Public for wire rebuild / archive sticky: schema v10 inputs store
     /// `create_fk` only; callers fill soft `prev_txid` from the create body.
     pub fn body_txid(&self, fk: Fk) -> Result<[u8; 32], StoreError> {
+        use std::time::Instant;
         // Packed: [PACKED_TX_V1][txid;32]…  Bare legacy: [txid;32]…
+        let t_idx = Instant::now();
+        let (off, len) = self.body.record_range(fk)?;
+        crate::head_resolve_stats::add_idx(t_idx.elapsed().as_nanos() as u64);
+        let t_body = Instant::now();
         let mut prefix = [0u8; 33];
-        let n = self.body.read_prefix(fk, &mut prefix)?;
+        let n = self.body.read_prefix_at(off, len, &mut prefix)?;
+        crate::head_resolve_stats::add_body(t_body.elapsed().as_nanos() as u64);
+        crate::head_resolve_stats::add_body_lookups(1);
         Self::txid_from_body_prefix(&prefix[..n])
     }
 
@@ -959,7 +966,12 @@ impl TxTable {
     /// fast inserts (second same-txid lands deeper, no newest-first displace),
     /// the newest Class A create is preferred (BIP30-shaped duplicates).
     pub fn get_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
+        use std::time::Instant;
+        let t_probe = Instant::now();
         let cands = self.head.read().unwrap().probe_fks(txid)?;
+        crate::head_resolve_stats::add_probe(t_probe.elapsed().as_nanos() as u64);
+        crate::head_resolve_stats::add_keys(1);
+        crate::head_resolve_stats::add_cands(cands.len() as u64);
         for fk in cands.into_iter().rev() {
             if self.body_txid(fk)? == *txid {
                 return Ok(Some(fk));
@@ -977,15 +989,19 @@ impl TxTable {
     ///
     /// Beats N independent `get_fk_by_txid` when body verifies thrash randomly
     /// and when head walks share nearby slots.
+    ///
+    /// Timers: [`crate::head_resolve_stats`] probe / idx / body.
     pub fn get_fk_by_txid_batch(
         &self,
         txids: &[[u8; 32]],
     ) -> Result<Vec<([u8; 32], Option<Fk>)>, StoreError> {
+        use std::time::Instant;
         if txids.is_empty() {
             return Ok(Vec::new());
         }
         let mut pairs: Vec<([u8; 32], Vec<Fk>)> = Vec::with_capacity(txids.len());
         let mut cand_ids: Vec<u64> = Vec::new();
+        let t_probe = Instant::now();
         {
             let head = self.head.read().unwrap();
             for txid in txids {
@@ -995,9 +1011,12 @@ impl TxTable {
                         cand_ids.push(id);
                     }
                 }
+                crate::head_resolve_stats::add_cands(cands.len() as u64);
                 pairs.push((*txid, cands));
             }
         }
+        crate::head_resolve_stats::add_probe(t_probe.elapsed().as_nanos() as u64);
+        crate::head_resolve_stats::add_keys(txids.len() as u64);
         cand_ids.sort_unstable();
         cand_ids.dedup();
         // Body txid for unique fks in ascending order (page locality).

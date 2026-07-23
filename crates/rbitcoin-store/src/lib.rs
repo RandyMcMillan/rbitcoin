@@ -11,6 +11,7 @@ mod compact;
 mod epoch;
 mod error;
 mod file;
+pub mod head_resolve_stats;
 mod ibd_io_policy;
 mod hashhead;
 mod open_address;
@@ -55,6 +56,7 @@ pub use sorted_run::{
     open_run, read_run_body, remove_run, verify_run_body, write_sorted_run, SortedRunPath,
 };
 pub use store::Store;
+pub use head_resolve_stats::Sample as HeadResolveSample;
 pub use tx_table::{
     encode_packed_tx, is_packed_tx_payload, scan_packed_meta_and_prevouts, InputRecord,
     OutputRecord, TxRecord, PACKED_TX_V1,

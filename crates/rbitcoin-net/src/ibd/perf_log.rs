@@ -207,6 +207,13 @@ pub(crate) struct IbdPerfSample {
     pub arch_prep_sticky_ms: u64,
     pub arch_prep_inflight_ms: u64,
     pub arch_prep_head_ms: u64,
+    /// Head resolve split (store): open-address probe / tx.idx / body prefix.
+    pub arch_prep_probe_ms: u64,
+    pub arch_prep_idx_ms: u64,
+    pub arch_prep_body_txid_ms: u64,
+    pub arch_prep_head_keys: u64,
+    pub arch_prep_head_cands: u64,
+    pub arch_prep_body_lookups: u64,
     pub arch_prep_stamp_ms: u64,
     pub arch_prep_finish_ms: u64,
     pub arch_prep_publish_ms: u64,
@@ -388,6 +395,12 @@ impl Default for IbdPerfSample {
             arch_prep_sticky_ms: 0,
             arch_prep_inflight_ms: 0,
             arch_prep_head_ms: 0,
+            arch_prep_probe_ms: 0,
+            arch_prep_idx_ms: 0,
+            arch_prep_body_txid_ms: 0,
+            arch_prep_head_keys: 0,
+            arch_prep_head_cands: 0,
+            arch_prep_body_lookups: 0,
             arch_prep_stamp_ms: 0,
             arch_prep_finish_ms: 0,
             arch_prep_publish_ms: 0,
@@ -479,6 +492,7 @@ pub(crate) fn sample(
     let (pwh, pca, psm) = rbitcoin_query::connect_prevout_stats::sample_and_reset();
     let pw = rbitcoin_query::confirm_load_stats::sample_and_reset();
     let arch_res = rbitcoin_query::archive_phase_stats::sample_and_reset();
+    let head_res = rbitcoin_store::head_resolve_stats::sample_and_reset();
     let pipe = pipe_stats.sample_and_reset();
     let (contig_next_h, contig_parked, contig_ready) =
         rbitcoin_query::contig_park_stats::snapshot();
@@ -633,6 +647,12 @@ pub(crate) fn sample(
         arch_prep_sticky_ms: ns_ms(arch_res.prep_sticky_ns),
         arch_prep_inflight_ms: ns_ms(arch_res.prep_inflight_ns),
         arch_prep_head_ms: ns_ms(arch_res.prep_head_ns),
+        arch_prep_probe_ms: ns_ms(head_res.probe_ns),
+        arch_prep_idx_ms: ns_ms(head_res.idx_ns),
+        arch_prep_body_txid_ms: ns_ms(head_res.body_ns),
+        arch_prep_head_keys: head_res.keys,
+        arch_prep_head_cands: head_res.cands,
+        arch_prep_body_lookups: head_res.body_lookups,
         arch_prep_stamp_ms: ns_ms(arch_res.prep_stamp_ns),
         arch_prep_finish_ms: ns_ms(arch_res.prep_finish_ns),
         arch_prep_publish_ms: ns_ms(arch_res.prep_publish_ns),
@@ -921,7 +941,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         .arch_write_total_ms
         .saturating_sub(s.arch_write_sum_ms);
     out.push_str(&format!(
-        " | pipe prep_us/blk={} prep_blks={} write_us/blk={} write_blks={} batch_avg={} writer_busy%={} idle_ms={} coalesce_ms={} prep_ms={} | arch_prep total={} sum={} gap={} struct={} filter={} assign={} collect={} sticky={} inflight={} head={} stamp={} finish={} publish={} qwait={} blks={} | arch_write total={} sum={} gap={} reserve={} body={} head={} spend={} htxs={} sticky={} dontneed={} flush={} blks={} | arch_res resolve_us/blk={} ext={} sticky={}/{} ({}%) head={}/{} stamp batch={} res={} sticky_map={}/{} | contig next_h={} parked={} ready={}",
+        " | pipe prep_us/blk={} prep_blks={} write_us/blk={} write_blks={} batch_avg={} writer_busy%={} idle_ms={} coalesce_ms={} prep_ms={} | arch_prep total={} sum={} gap={} struct={} filter={} assign={} collect={} sticky={} inflight={} head={} (probe={} idx={} body={} keys={} cands={} lookups={}) stamp={} finish={} publish={} qwait={} blks={} | arch_write total={} sum={} gap={} reserve={} body={} head={} spend={} htxs={} sticky={} dontneed={} flush={} blks={} | arch_res resolve_us/blk={} ext={} sticky={}/{} ({}%) head={}/{} stamp batch={} res={} sticky_map={}/{} | contig next_h={} parked={} ready={}",
         s.pipe.prep_us_per_block(),
         s.pipe.prep_blocks,
         s.pipe.write_us_per_block(),
@@ -941,6 +961,12 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.arch_prep_sticky_ms,
         s.arch_prep_inflight_ms,
         s.arch_prep_head_ms,
+        s.arch_prep_probe_ms,
+        s.arch_prep_idx_ms,
+        s.arch_prep_body_txid_ms,
+        s.arch_prep_head_keys,
+        s.arch_prep_head_cands,
+        s.arch_prep_body_lookups,
         s.arch_prep_stamp_ms,
         s.arch_prep_finish_ms,
         s.arch_prep_publish_ms,
@@ -1128,6 +1154,8 @@ mod tests {
         assert!(line.contains("mlock=16MiB ranges=4 sh_runs=2"), "{line}");
         assert!(line.contains("arch_res resolve_us/blk="), "{line}");
         assert!(line.contains("arch_prep total="), "{line}");
+        assert!(line.contains("probe="), "{line}");
+        assert!(line.contains("lookups="), "{line}");
         assert!(line.contains("arch_write total="), "{line}");
         assert!(line.contains("gap="), "{line}");
         assert!(line.contains("sticky_map="), "{line}");

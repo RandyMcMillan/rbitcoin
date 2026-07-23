@@ -849,12 +849,24 @@ impl TxTable {
         Ok(tx)
     }
 
-    /// Read Class A body txid only (packed prefix or bare TxRecord).
+    /// Read Class A body **txid only** (packed prefix or bare TxRecord).
+    ///
+    /// Thin I/O: idx range + first **33** body bytes (magic+txid) — does **not**
+    /// load scripts/inputs/witness. Used by head resolve (`get_fk_by_txid*`) and
+    /// archive sticky prewarm.
     ///
     /// Public for wire rebuild / archive sticky: schema v10 inputs store
     /// `create_fk` only; callers fill soft `prev_txid` from the create body.
     pub fn body_txid(&self, fk: Fk) -> Result<[u8; 32], StoreError> {
-        let raw = self.body.get_raw(fk)?;
+        // Packed: [PACKED_TX_V1][txid;32]…  Bare legacy: [txid;32]…
+        let mut prefix = [0u8; 33];
+        let n = self.body.read_prefix(fk, &mut prefix)?;
+        Self::txid_from_body_prefix(&prefix[..n])
+    }
+
+    /// Parse txid from the leading bytes of a Class A body payload.
+    #[inline]
+    fn txid_from_body_prefix(raw: &[u8]) -> Result<[u8; 32], StoreError> {
         if raw.first().copied() == Some(PACKED_TX_V1) {
             if raw.len() < 1 + 32 {
                 return Err(StoreError::Corrupt("short packed tx for txid"));
@@ -927,20 +939,11 @@ impl TxTable {
         Ok(out)
     }
 
-    /// Read Class A body txid from a known range (no idx).
+    /// Read Class A body txid from a known range (no idx). Thin: first 33 bytes only.
     pub fn body_txid_at(&self, offset: u64, len: u64) -> Result<[u8; 32], StoreError> {
-        self.body.with_bytes_at(offset, len, |raw| {
-            if raw.first().copied() == Some(PACKED_TX_V1) {
-                if raw.len() < 1 + 32 {
-                    return Err(StoreError::Corrupt("short packed tx for txid"));
-                }
-                return Ok(raw[1..33].try_into().unwrap());
-            }
-            if raw.len() < 32 {
-                return Err(StoreError::Corrupt("short tx record for txid"));
-            }
-            Ok(raw[0..32].try_into().unwrap())
-        })
+        let mut prefix = [0u8; 33];
+        let n = self.body.read_prefix_at(offset, len, &mut prefix)?;
+        Self::txid_from_body_prefix(&prefix[..n])
     }
 
     /// Primary head probe slot for `txid` (sort key for locality-friendly batches).
@@ -2035,6 +2038,56 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         std::env::remove_var("RBITCOIN_TX_HEAD_BITS");
+    }
+
+    /// Fat packed body: body_txid must match full-record path without needing
+    /// the full payload (large witness).
+    #[test]
+    fn body_txid_thin_prefix_matches_fat_packed_body() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-thin-txid-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        let t = TxTable::create(&dir).unwrap();
+        let mut txid = [0xabu8; 32];
+        txid[0] = 0x7e;
+        let tx = TxRecord {
+            txid,
+            version: 2,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let inputs = vec![InputRecord {
+            prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![0xde; 64],
+            witness: vec![vec![0xad; 50_000]], // fat body
+        }];
+        let outputs = vec![OutputRecord::unspent(42, vec![0x51; 100])];
+        let fk = t
+            .put_full_batch_indexed(&[(tx, inputs, outputs)], true)
+            .unwrap()[0];
+        let from_thin = t.body_txid(fk).unwrap();
+        assert_eq!(from_thin, txid);
+        // Range path (cache-held off/len).
+        let (off, len) = t.body.record_range(fk).unwrap();
+        assert!(len > 50_000, "body should be large");
+        assert_eq!(t.body_txid_at(off, len).unwrap(), txid);
+        // Head resolve still works.
+        assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(fk));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("RBITCOIN_HEAD_SCALE");
     }
 
     #[test]

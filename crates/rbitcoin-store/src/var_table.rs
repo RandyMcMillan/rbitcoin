@@ -225,6 +225,42 @@ impl VarTable {
         Ok(buf)
     }
 
+    /// Read only the first `buf.len()` bytes of the unframed payload (or fewer
+    /// if the record is shorter). Avoids allocating / faulting the full body
+    /// when the caller only needs a fixed prefix (e.g. Class A txid).
+    ///
+    /// Returns bytes actually copied into `buf`.
+    pub fn read_prefix(&self, fk: Fk, buf: &mut [u8]) -> Result<usize, StoreError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let (off, len) = self.record_range(fk)?;
+        let n = (len as usize).min(buf.len());
+        if n == 0 {
+            return Ok(0);
+        }
+        self.body.read_at(off, &mut buf[..n])?;
+        Ok(n)
+    }
+
+    /// Like [`read_prefix`] for a known absolute body `(offset, len)` (no idx).
+    pub fn read_prefix_at(
+        &self,
+        offset: u64,
+        len: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, StoreError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let n = (len as usize).min(buf.len());
+        if n == 0 {
+            return Ok(0);
+        }
+        self.body.read_at(offset, &mut buf[..n])?;
+        Ok(n)
+    }
+
     pub fn flush(&self) -> Result<(), StoreError> {
         self.body.flush()?;
         self.idx.flush()?;

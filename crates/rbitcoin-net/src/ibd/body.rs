@@ -23,6 +23,12 @@ pub(crate) struct BodyPresence {
     pending: HashSet<BlockHash>,
     /// When each pending hash was marked (for stuck-pipeline re-getdata).
     pending_since: HashMap<BlockHash, Instant>,
+    /// Budget-charged into the archive job pipeline (not yet Ok/Err/Dropped).
+    ///
+    /// Distinct from [`pending`]: `BlockFramed` marks pending before decode, but
+    /// charge happens only on `Block`. Redeliveries must not re-charge while this
+    /// set still holds the hash (mainnet stacked tens of GiB of duplicate jobs).
+    archive_charged: HashSet<BlockHash>,
     /// Store-probed and not archived yet (safe to request getdata).
     missing: HashSet<BlockHash>,
     /// Confirm rejected this hash; do not re-offer or re-download.
@@ -35,6 +41,7 @@ impl BodyPresence {
             known: HashSet::new(),
             pending: HashSet::new(),
             pending_since: HashMap::new(),
+            archive_charged: HashSet::new(),
             missing: HashSet::new(),
             rejected: HashSet::new(),
         }
@@ -50,6 +57,24 @@ impl BodyPresence {
         }
     }
 
+    /// True if this hash already holds an archive-queue budget charge.
+    pub(crate) fn is_archive_charged(&self, h: &BlockHash) -> bool {
+        self.archive_charged.contains(h)
+    }
+
+    /// Record that `h` was successfully [`ArchiveQueueBudget::try_charge`]d.
+    pub(crate) fn mark_archive_charged(&mut self, h: BlockHash) {
+        if self.rejected.contains(&h) {
+            return;
+        }
+        self.archive_charged.insert(h);
+    }
+
+    /// Drop the charged marker after budget [`release`] (Ok / Err / Dropped).
+    pub(crate) fn clear_archive_charged(&mut self, h: &BlockHash) {
+        self.archive_charged.remove(h);
+    }
+
     pub(crate) fn mark_archived(&mut self, h: BlockHash) {
         if self.rejected.contains(&h) {
             return;
@@ -57,6 +82,7 @@ impl BodyPresence {
         self.missing.remove(&h);
         self.pending.remove(&h);
         self.pending_since.remove(&h);
+        self.archive_charged.remove(&h);
         self.known.insert(h);
     }
 
@@ -67,6 +93,9 @@ impl BodyPresence {
         self.known.remove(&h);
         self.pending.remove(&h);
         self.pending_since.remove(&h);
+        // Keep `archive_charged` if still set: a body may still be in the job
+        // queue after pending-stale expire. Charge is cleared only on pipeline
+        // result so redelivery cannot double-charge.
         self.missing.insert(h);
     }
 
@@ -84,6 +113,7 @@ impl BodyPresence {
         self.known.remove(&h);
         self.pending.remove(&h);
         self.pending_since.remove(&h);
+        self.archive_charged.remove(&h);
         self.missing.remove(&h);
         self.rejected.insert(h);
     }
@@ -195,6 +225,9 @@ impl BodyPresence {
             self.pending.remove(&h);
             self.pending_since.remove(&h);
         }
+        // Drop charged markers only when the hash left the work path; if a body
+        // is still in the archive pipeline its charge is released via result.
+        self.archive_charged.retain(|h| keep(h));
         // rejected: permanent blacklist
     }
 
@@ -324,5 +357,34 @@ mod tests {
         body.mark_archived(hash);
         assert!(body.is_rejected(&hash));
         assert!(!body.known.contains(&hash));
+    }
+
+    #[test]
+    fn archive_charged_survives_pending_stale_missing() {
+        let mut body = BodyPresence::new();
+        let hash = h(7);
+        // BlockFramed: pending before charge.
+        body.mark_pending(hash);
+        assert!(!body.is_archive_charged(&hash));
+        // Block: charge once.
+        body.mark_archive_charged(hash);
+        assert!(body.is_archive_charged(&hash));
+        // Pending-stale expire → missing, but charge still held (body in job q).
+        body.mark_missing(hash);
+        assert!(body.is_archive_charged(&hash), "must not re-charge while in pipeline");
+        assert_eq!(body.skip_download_cached(&hash), Some(false)); // missing
+        // Pipeline result releases charge.
+        body.clear_archive_charged(&hash);
+        assert!(!body.is_archive_charged(&hash));
+    }
+
+    #[test]
+    fn mark_archived_clears_archive_charged() {
+        let mut body = BodyPresence::new();
+        let hash = h(8);
+        body.mark_archive_charged(hash);
+        body.mark_pending(hash);
+        body.mark_archived(hash);
+        assert!(!body.is_archive_charged(&hash));
     }
 }

@@ -342,6 +342,12 @@ pub(crate) fn apply_peer_event(
             {
                 return;
             }
+            // Already budget-charged into the archive job pipeline: drop multi-peer
+            // / re-get redelivery **without** a second charge. (`pending` alone is
+            // wrong — BlockFramed marks pending before decode/charge.)
+            if st.body.is_archive_charged(&hash) {
+                return;
+            }
             // Prefer RAM-cached fk from getheaders (no store lock on hot path).
             let header_fk = if let Some(&fk) = st.header_fks.get(&hash) {
                 fk
@@ -378,8 +384,6 @@ pub(crate) fn apply_peer_event(
                 st.body.mark_missing(hash);
                 return;
             }
-            // Prevent re-getdata while prep/writer owns this body.
-            st.body.mark_pending(hash);
             // Priority: confirm runway + ContigPark densify horizon (parkable soon).
             let priority = st
                 .hash_height
@@ -389,9 +393,18 @@ pub(crate) fn apply_peer_event(
                         || ht <= write_next.saturating_add(CONTIG_DENSIFY_AHEAD)
                 })
                 .unwrap_or(false);
-            // Approx wire size for RAM budget (already-decoded; never drop).
+            // Approx wire size for RAM budget (already-decoded).
             let wire_bytes = block.total_size();
-            archive_queued.charge(wire_bytes);
+            // Hard budget: refuse when charged fill would exceed budget. Soft
+            // far_admission_scale alone allowed ContigPark densify to stack
+            // ~50k bodies (~60 GiB) against a 512 MiB budget while confirm stalled.
+            if !archive_queued.try_charge(wire_bytes) {
+                st.body.mark_missing(hash);
+                return;
+            }
+            st.body.mark_archive_charged(hash);
+            // Prevent re-getdata while prep/writer owns this body.
+            st.body.mark_pending(hash);
             if arch_job_tx
                 .send(ArchiveJob {
                     block,
@@ -403,6 +416,7 @@ pub(crate) fn apply_peer_event(
                 .is_err()
             {
                 archive_queued.release(wire_bytes);
+                st.body.clear_archive_charged(&hash);
                 st.body.mark_missing(hash);
                 warn!("ibd: archive pipeline closed; drop {hash}");
             }
@@ -479,6 +493,7 @@ pub(crate) fn apply_archive_result(
     match r {
         ArchiveResult::Ok { hash, wire_bytes } => {
             archive_queued.release(wire_bytes);
+            st.body.clear_archive_charged(&hash);
             clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
             // Do **not** confirm here — confirm on the main loop after assign so
             // free getdata slots are refilled before Class C burns the turn.
@@ -501,6 +516,7 @@ pub(crate) fn apply_archive_result(
         } => {
             // Duplicate (requeue=false) or beyond-horizon refuse (requeue=true).
             archive_queued.release(wire_bytes);
+            st.body.clear_archive_charged(&hash);
             if requeue {
                 st.body.mark_missing(hash);
             }
@@ -511,6 +527,7 @@ pub(crate) fn apply_archive_result(
             wire_bytes,
         } => {
             archive_queued.release(wire_bytes);
+            st.body.clear_archive_charged(&hash);
             st.body.mark_missing(hash);
             static REJECTS: AtomicU32 = AtomicU32::new(0);
             let n = REJECTS.fetch_add(1, Ordering::Relaxed) + 1;

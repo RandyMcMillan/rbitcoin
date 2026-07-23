@@ -119,20 +119,26 @@ pub(crate) fn assign_work_ordered(
 
     prune_satisfied_inflight(&mut st.slots, &mut st.inflight, hub);
 
-    let expired = st.body.expire_stale_pending(PENDING_STALE);
-    for h in expired {
-        clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
-    }
-    // ContigPark race band: re-request much sooner than global pending stale.
-    let wn = archive_write_next;
-    let race_hi = wn.saturating_add(CONTIG_PARK_RACE.saturating_sub(1) as u32);
-    let gap_expired = st.body.expire_stale_pending_if(CONTIG_PARK_PENDING_STALE, |h| {
-        st.hash_height
-            .get(h)
-            .is_some_and(|&ht| ht >= wn && ht <= race_hi)
-    });
-    for h in gap_expired {
-        clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
+    // Under archive RAM pressure (`far_admission_scale == 0`), do **not** expire
+    // pending → re-getdata. Bodies are already charged in the pipeline; clearing
+    // pending only re-admits duplicates once budget frees (or thrash when soft
+    // admission was still open). Tip-hole / park-race assign still runs below.
+    if archive_feed_scale > 0.0 {
+        let expired = st.body.expire_stale_pending(PENDING_STALE);
+        for h in expired {
+            clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
+        }
+        // ContigPark race band: re-request much sooner than global pending stale.
+        let wn = archive_write_next;
+        let race_hi = wn.saturating_add(CONTIG_PARK_RACE.saturating_sub(1) as u32);
+        let gap_expired = st.body.expire_stale_pending_if(CONTIG_PARK_PENDING_STALE, |h| {
+            st.hash_height
+                .get(h)
+                .is_some_and(|&ht| ht >= wn && ht <= race_hi)
+        });
+        for h in gap_expired {
+            clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
+        }
     }
 
     let tip = hub.tip_height().unwrap_or(0);

@@ -678,9 +678,9 @@ impl Query {
         let covered = self.confirm_parents.parent_pins_covered(&cover_keys);
         let mut touch_batch: Vec<(u32, u64, Vec<u32>)> = Vec::new();
         let mut parent_ranges: Vec<(Fk, u64, u64)> = Vec::new();
-        // Defer mlock: one coalesced page pass for the whole batch (not per-parent).
-        let mut mlock_abs: Vec<(u64, u64)> = Vec::with_capacity(pin_jobs.len());
-        let mut mlock_heights: Vec<u32> = Vec::new();
+        // Per-parent mlock (not batch-coalesced): each call notes page_refs so the
+        // next parent can skip already-pinned pages. Batching all ranges first
+        // notes only at the end → mlock_sys skip=0 and worse wall time.
         // (max_height, fk, tx, live outs, checked vouts, coinbase_height)
         let mut sparse_parents: Vec<(
             u32,
@@ -701,9 +701,6 @@ impl Query {
                 // Keep-alive for GC on every needing height (not only max_h).
                 for &h in &need_hs {
                     touch_batch.push((h, pid, need_vouts.clone()));
-                    if do_mlock {
-                        mlock_heights.push(h);
-                    }
                 }
                 // Re-note mlock need_heights for this batch even when outs are
                 // already stashed — otherwise tip GC after an earlier batch
@@ -714,7 +711,16 @@ impl Query {
                         .get_body_range(fk)
                         .or_else(|| self.store.tx_body_range(fk).ok())
                     {
-                        mlock_abs.push((off, len));
+                        let (_, sys, sk) =
+                            self.mlock_body_spans_for_heights(&need_hs, &[(off, len)]);
+                        st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
+                        st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
+                    } else {
+                        let body_ml = self.store.mlock_tx_body_only(fk);
+                        st.mlock_syscalls = st.mlock_syscalls.saturating_add(1);
+                        for h in &need_hs {
+                            self.mlock_note_skip_pinned(*h, &body_ml);
+                        }
                     }
                 }
                 st.utxo_parents = st.utxo_parents.saturating_add(1);
@@ -731,8 +737,10 @@ impl Query {
                     if let Some((off, len)) = range {
                         parent_ranges.push((fk, off, len));
                         if do_mlock {
-                            mlock_abs.push((off, len));
-                            mlock_heights.extend_from_slice(&need_hs);
+                            let (_, sys, sk) =
+                                self.mlock_body_spans_for_heights(&need_hs, &[(off, len)]);
+                            st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
+                            st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
                         }
                     }
                     let unspent = self
@@ -782,8 +790,10 @@ impl Query {
             if let Some((off, len)) = range {
                 parent_ranges.push((fk, off, len));
                 if do_mlock {
-                    mlock_abs.push((off, len));
-                    mlock_heights.extend_from_slice(&need_hs);
+                    let (_, sys, sk) =
+                        self.mlock_body_spans_for_heights(&need_hs, &[(off, len)]);
+                    st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
+                    st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
                 }
                 // Sparse outs + spent filter + coinbase height for wave.
                 if !need_vouts.is_empty() {
@@ -831,7 +841,6 @@ impl Query {
                     }
                 }
             } else {
-                // No absolute range yet: mlock via fk helper after outs resolve.
                 if do_mlock {
                     let body_ml = self.store.mlock_tx_body_only(fk);
                     st.mlock_syscalls = st.mlock_syscalls.saturating_add(1);
@@ -878,17 +887,6 @@ impl Query {
                 }
             }
             st.utxo_parents = st.utxo_parents.saturating_add(1);
-        }
-        // One coalesced mlock over all parent body spans (page-merge + skip pinned).
-        if do_mlock && !mlock_abs.is_empty() {
-            mlock_heights.sort_unstable();
-            mlock_heights.dedup();
-            if !mlock_heights.is_empty() {
-                let (_, sys, sk) =
-                    self.mlock_body_spans_for_heights(&mlock_heights, &mlock_abs);
-                st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
-                st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
-            }
         }
         if !touch_batch.is_empty() {
             self.confirm_parents

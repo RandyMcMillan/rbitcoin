@@ -1095,9 +1095,10 @@ fn resume_tx_head_resolves_external_prev() {
     }
 }
 
-/// wave_fill: durable spentness suppresses parent live slots.
+/// After confirm, durable spentness is authority (body LRU may still hold outs).
+/// Structural rejects double-spend; no separate wave spent-filter map.
 #[test]
-fn wave_fill_spent_suppresses_parent_live() {
+fn confirm_structural_rejects_already_spent_prevout() {
     use rbitcoin_consensus::{
         accept_and_archive_block, accept_and_connect_block, ChainParams, Milestone,
     };
@@ -1132,20 +1133,21 @@ fn wave_fill_spent_suppresses_parent_live() {
     let spend_h = last_pad + 1;
     let spend = spend_anyone_can_spend(cb1, 0, bitcoin::Amount::from_sat(49_0000_0000));
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
-    // Pre-confirm: parent still unspent → wave shows live.
     accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     let spend_hash = b_spend.block_hash().to_byte_array();
-    let (_n, wave_live) = q
-        .wave_fill_for_block_hashes(&[spend_hash])
-        .unwrap();
+    q.load_confirm_parents(&[(spend_h, spend_hash)]).unwrap();
+    let create_fk = q
+        .tx_fk_by_txid(cb1.as_byte_array())
+        .unwrap()
+        .expect("cb create fk");
     assert!(
-        wave_live.has_live_output_txid(cb1.as_byte_array(), 0),
-        "unspent parent must be live before confirm"
+        q.confirm_parent_cache().has_parent_out(create_fk, 0),
+        "unspent parent content available in pin/body before first confirm"
     );
 
-    // Confirm spend → UTXO take; wave for a next archive that re-spends must not show live.
     accept_and_connect_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
+
     let spend2 = spend_anyone_can_spend(cb1, 0, bitcoin::Amount::from_sat(48_0000_0000));
     let b_bad = mine_regtest_block(
         b_spend.block_hash(),
@@ -1154,13 +1156,12 @@ fn wave_fill_spent_suppresses_parent_live() {
         vec![spend2],
     );
     accept_and_archive_block(&q, &params, Height(spend_h + 1), &b_bad, ms).unwrap();
-    let bad_hash = b_bad.block_hash().to_byte_array();
-    let (_n, wave_spent) = q
-        .wave_fill_for_block_hashes(&[bad_hash])
-        .unwrap();
+    let err = accept_and_connect_block(&q, &params, Height(spend_h + 1), &b_bad, ms)
+        .expect_err("double-spend must fail structural");
+    let msg = err.to_string();
     assert!(
-        !wave_spent.has_live_output_txid(cb1.as_byte_array(), 0),
-        "durable spent must suppress parent live slot in wave_fill"
+        msg.contains("spent") || msg.contains("PrevoutSpent") || msg.contains("prevout"),
+        "unexpected reject: {msg}"
     );
 }
 

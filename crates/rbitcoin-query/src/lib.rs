@@ -40,7 +40,7 @@ pub use confirm_load::ConfirmLoadStats;
 pub use scripthash::{
     ScriptHashBalance, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
 };
-pub use wave_prevout::WavePrevoutCache;
+pub use wave_prevout::ThinInput;
 
 /// Confirm load Class A / parent-pin window counters (IBD ~5s sampler).
 ///
@@ -398,36 +398,36 @@ pub mod ibd_utxo_stats {
     }
 }
 
-/// Wave-fill sub-phase wall times (nanoseconds; reset by the IBD sampler).
+/// Wire-rebuild body load counters (nanoseconds / counts; IBD sampler).
 ///
-/// Breaks down the dominant `wave_fill` recon cost: body vs parent warm vs spent
-/// vs coinbase height. Also tracks store IO cost and parent-cache lock wait.
+/// Historical name `wave_fill_stats` — wave fill is gone; these still track
+/// parent-cache body hits vs store decode during confirm wire rebuild.
 pub mod wave_fill_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Wave-body txs from Class A → wave map + parent_needed collect.
+    /// Unused (kept zero for sampler layout).
     pub static BODY_NS: AtomicU64 = AtomicU64::new(0);
-    /// External parent load (cache sparse outs or store meta+outputs).
+    /// Unused (kept zero for sampler layout).
     pub static PARENT_TX_NS: AtomicU64 = AtomicU64::new(0);
-    /// External parent output materialization (subset of parent load when split).
+    /// Unused (kept zero for sampler layout).
     pub static PARENT_OUT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Durable / local spent filter on needed parent vouts.
+    /// Unused (kept zero for sampler layout).
     pub static SPENT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Coinbase create-height for parents.
+    /// Unused (kept zero for sampler layout).
     pub static CB_HEIGHT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Wave bodies moved out of ConfirmParentCache (no clone).
+    /// Wire bodies cloned from ConfirmParentCache.
     pub static BODY_CACHE_MOVE: AtomicU64 = AtomicU64::new(0);
-    /// Wave bodies re-decoded from store (cache miss / not cache-held).
+    /// Wire bodies re-decoded from store (cache miss).
     pub static BODY_STORE: AtomicU64 = AtomicU64::new(0);
-    /// Wall ns spent in store body decode (subset of BODY_NS on miss).
+    /// Wall ns spent in store body decode.
     pub static BODY_STORE_NS: AtomicU64 = AtomicU64::new(0);
-    /// Major page faults observed on the confirm thread during store body loads.
+    /// Major page faults during store body loads on the confirm thread.
     pub static BODY_STORE_MAJFLT: AtomicU64 = AtomicU64::new(0);
     /// Time waiting on ConfirmParentCache mutex (ns).
     pub static CACHE_LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Thin edges moved from cache stash (batch take).
+    /// Unused (kept zero for sampler layout).
     pub static THIN_CACHE_MOVE: AtomicU64 = AtomicU64::new(0);
-    /// Thin edges rebuilt by walking inputs (stash miss).
+    /// Unused (kept zero for sampler layout).
     pub static THIN_REBUILD: AtomicU64 = AtomicU64::new(0);
 
     /// `(body, parent_tx, parent_out, spent, cb_height)` nanoseconds.
@@ -621,8 +621,7 @@ impl Query {
     /// Resolve txid → fk via durable `tx.head` (when the index is enabled).
     ///
     /// ConfirmParentCache is keyed by create fk only (no process-local txid map).
-    /// IBD thin edges carry stamped create_fk; wave_prevout holds its own
-    /// same-wave txid map. Cold/soft paths use head.
+    /// IBD thin edges carry stamped create_fk; cold/soft paths use durable head.
     fn lookup_tx_fk(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
         if self.tx_index_enabled() {
             // body_txid verify only — avoid full packed decode on probe misses.
@@ -697,7 +696,7 @@ impl Query {
         Ok(self.store.has_confirmed_strong_spender(txid, vout)?)
     }
 
-    /// Spentness by known create fk (wave_fill parent path — no head probe).
+    /// Spentness by known create fk (confirm pin path — no head probe).
     pub fn is_outpoint_spent_create(&self, create_fk: Fk, vout: u32) -> Result<bool, QueryError> {
         let range = self.confirm_parents.get_body_range(create_fk);
         Ok(self

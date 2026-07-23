@@ -105,7 +105,7 @@ pub struct BodyEntry {
     pub outputs: Vec<OutputRecord>,
     pub inputs: Vec<InputRecord>,
     /// Per-input create-fk edges filled after load phase-2 parent resolve.
-    /// `None` = not yet stashed (wave_fill falls back to walking `inputs`).
+    /// `None` = not yet stashed (assemble falls back via store/thin rebuild).
     pub thin_inputs: Option<Vec<StashedThinInput>>,
     /// Estimated heap bytes (LRU accounting).
     size_bytes: u64,
@@ -635,10 +635,9 @@ impl ConfirmParentCache {
         Some(out)
     }
 
-    /// Clone many bodies under **one** lock (wave_fill + keeps post-confirm LRU).
+    /// Clone many bodies under **one** lock (keeps post-confirm LRU).
     ///
-    /// Formerly moved bodies out of the map (zero-clone). Bodies now stay so
-    /// near-subsequent parent pin can hit RAM after tip advance.
+    /// Compatibility alias for [`Self::get_bodies_batch`].
     pub fn take_bodies_batch(
         &self,
         fks: &[Fk],
@@ -733,7 +732,7 @@ impl ConfirmParentCache {
         })
     }
 
-    /// Attach cache-resolved thin edges (wave_fill fast path; no full body required).
+    /// Attach load-resolved thin edges (assemble reads these; no full body required).
     ///
     /// Stored only in `thin_edges` (not dual-copied onto optional `by_body`).
     pub fn put_thin_inputs(&self, fk: Fk, edges: Vec<StashedThinInput>) {
@@ -749,13 +748,13 @@ impl ConfirmParentCache {
         self.inner.lock().unwrap().thin_edges.get(&id).cloned()
     }
 
-    /// Move thin edges out of the parent cache (wave_fill is the sole consumer).
+    /// Remove thin edges for `fk` (tests / explicit drain).
     pub fn take_thin_inputs(&self, fk: Fk) -> Option<Vec<StashedThinInput>> {
         let id = fk.get()?;
         self.inner.lock().unwrap().thin_edges.remove(&id)
     }
 
-    /// Move many thin-edge lists under **one** lock.
+    /// Remove many thin-edge lists under **one** lock (tests).
     pub fn take_thin_inputs_batch(&self, fks: &[Fk]) -> HashMap<u64, Vec<StashedThinInput>> {
         if fks.is_empty() {
             return HashMap::new();

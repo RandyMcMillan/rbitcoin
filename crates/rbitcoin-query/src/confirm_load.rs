@@ -2,15 +2,15 @@
 //!
 //! For each height in the batch (ascending):
 //! 1. **Cache** header + `header_txs` + body ranges.
-//! 2. **Full Class A decode** into `by_body` (wave/wire takes these; no re-decode).
-//! 3. **Thin edges** (create_fk-first) + **sparse parent pin** (spent-filtered outs).
+//! 2. **Full Class A decode** into `by_body` (wire/assemble clone from here).
+//! 3. **Thin edges** (stamped create_fk) + **sparse parent pin** (spent-filtered outs).
 //! 4. **`mlock`** (default on; `RBITCOIN_CONFIRM_MLOCK=0` off): **only parent
 //!    create `tx.body` pages** that write will annotate. Refcounted by needing
 //!    batch heights; tip GC after write munlocks when no active batch needs them.
 //!
-//! No background worker: load is owned by the confirm load thread for the batch
-//! it claimed. Wave bodies are **moved** out of the parent cache at wave_fill; parent
-//! `by_fk` + body ranges stay until tip GC (write annotate + next-batch cache).
+//! No background worker / no wave fill: load owns the batch's Class A + parents.
+//! Bodies stay in `by_body` (post-tip LRU) for pin hits; thin edges + `by_fk`
+//! stay until tip GC after write.
 //!
 //! Env: `RBITCOIN_CONFIRM_MLOCK` (legacy `RBITCOIN_PARENT_PREWARM_MLOCK` alias).
 

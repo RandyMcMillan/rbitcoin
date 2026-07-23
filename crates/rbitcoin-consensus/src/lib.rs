@@ -152,7 +152,7 @@ pub mod confirm_phase_stats {
     /// Sample and reset all confirm phases.
     ///
     /// Returns
-    /// `(recon, prefetch, wave_fill, wire, connect, script, class_c, strong, scripthash, tip,
+    /// `(recon, prefetch, wave_fill(=0), wire, connect, script, class_c, strong, scripthash, tip,
     ///   utxo_apply, blocks, resolve, load, unpin, cache_tip,
     ///   spend_ranged, spend_idx, spend_skip)`.
     /// `strong` / `scripthash` / `tip` come from [`rbitcoin_query::class_c_phase_stats`]

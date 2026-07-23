@@ -295,7 +295,7 @@ pub fn bip34_height_script(height: u32) -> Vec<u8> {
 /// Class C tip updates (`confirm_block`) stay outside this function.
 ///
 /// `archived_tx_fks`: Class A fks for `block.txdata` (same order) when confirming
-/// archived bodies (wave thin create_fk / Class A rows).
+/// archived bodies (thin create_fk / Class A rows in parent cache).
 pub fn validate_block_connect(
     query: &Query,
     block: &Block,
@@ -318,7 +318,6 @@ pub fn validate_block_connect(
         block,
         ctx,
         archived_tx_fks,
-        None,
         &mut pending,
         &mut pending_creates,
     )?;
@@ -332,7 +331,6 @@ pub fn validate_block_connect(
         block,
         ctx,
         archived_tx_fks,
-        None,
         &spends,
         fees,
         &mut structural_pending,
@@ -407,13 +405,15 @@ pub struct ScriptCheckJob {
 ///
 /// `pending_spent` / `pending_creates`: run-local same-run tracking.
 ///
+/// Prevouts resolve from load-stage ConfirmParentCache (thin create_fk +
+/// pinned outs / body) then durable store — no separate wave map.
+///
 /// Returns `(script_jobs, spends, fees)` — fees for coinbase subsidy check on structural.
 pub(crate) fn assemble_block_prevouts(
     query: &Query,
     block: &Block,
     ctx: &ValidationContext<'_>,
     archived_tx_fks: Option<&[rbitcoin_primitives::Fk]>,
-    wave_prevouts: Option<&rbitcoin_query::WavePrevoutCache>,
     pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
     pending_creates: &mut std::collections::HashMap<([u8; 32], u32), rbitcoin_primitives::Fk>,
 ) -> Result<
@@ -435,7 +435,6 @@ pub(crate) fn assemble_block_prevouts(
         block,
         ctx,
         archived_tx_fks,
-        wave_prevouts,
         pending_spent,
         pending_creates,
         AssembleMode::Optimistic,
@@ -447,7 +446,6 @@ fn assemble_block_prevouts_mode(
     block: &Block,
     ctx: &ValidationContext<'_>,
     archived_tx_fks: Option<&[rbitcoin_primitives::Fk]>,
-    wave_prevouts: Option<&rbitcoin_query::WavePrevoutCache>,
     pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
     pending_creates: &mut std::collections::HashMap<([u8; 32], u32), rbitcoin_primitives::Fk>,
     mode: AssembleMode,
@@ -509,29 +507,17 @@ fn assemble_block_prevouts_mode(
     > = std::collections::HashMap::with_capacity(64);
 
     // Spent checks: pending_spent (this run) + durable confirmed-strong annotations.
+    let parents = query.confirm_parent_cache();
     for (ti, tx) in block.txdata.iter().enumerate() {
         let spend_fk = archived_tx_fks.map(|fks| fks[ti]);
-        // Txid only — do not clone full TxRecord (wave already holds it).
+        // Txid only — prefer cache body meta (no full Class A re-decode).
         let archived_txid: Option<[u8; 32]> = if let Some(fk) = spend_fk {
-            if let Some(w) = wave_prevouts {
-                if let Some(rec) = w.get_tx(fk) {
-                    Some(rec.txid)
-                } else {
-                    Some(
-                        query
-                            .get_tx_class_a(fk)
-                            .map_err(ConsensusError::Store)?
-                            .txid,
-                    )
-                }
-            } else {
-                Some(
-                    query
-                        .get_tx_class_a(fk)
-                        .map_err(ConsensusError::Store)?
-                        .txid,
-                )
-            }
+            parents.get_parent_txid(fk).or_else(|| {
+                query
+                    .get_tx_class_a(fk)
+                    .ok()
+                    .map(|r| r.txid)
+            })
         } else {
             None
         };
@@ -551,8 +537,8 @@ fn assemble_block_prevouts_mode(
             } else {
                 Vec::new()
             };
-            // Thin create_fk hints from wave (borrow — no Vec clone).
-            let thin = spend_fk.and_then(|fk| wave_prevouts.and_then(|w| w.thin_inputs(fk)));
+            // Thin create_fk edges stashed at load (clone once per spender).
+            let thin = spend_fk.and_then(|fk| parents.get_thin_inputs(fk));
 
             for (ii, input) in tx.input.iter().enumerate() {
                 let op = input.previous_output;
@@ -563,33 +549,30 @@ fn assemble_block_prevouts_mode(
                 if pending_spent.contains(&key) {
                     return Err(ConsensusError::PrevoutSpent);
                 }
-                // Wave already filtered spent outs at fill time.
-                // Skip durable probes on the ~98% wave-hit path.
-                let wave_live = wave_prevouts
-                    .and_then(|w| w.get_by_txid(op.txid.as_byte_array(), op.vout))
-                    .is_some();
+                // Load pin spent-filtered sparse outs / body creates: skip durable
+                // probes when the parent out is already in the parent cache.
                 let prev_fk = thin
+                    .as_ref()
                     .and_then(|t| t.get(ii))
                     .and_then(|e| e.create_fk.map(rbitcoin_primitives::Fk))
                     .or_else(|| pending_creates.get(&key).copied())
                     .or_else(|| {
-                        if wave_live {
-                            None
-                        } else {
-                            query
-                                .tx_fk_by_txid(op.txid.as_byte_array())
-                                .ok()
-                                .flatten()
-                        }
+                        query
+                            .tx_fk_by_txid(op.txid.as_byte_array())
+                            .ok()
+                            .flatten()
                     });
+                let pin_live = prev_fk
+                    .map(|fk| parents.has_parent_out(fk, op.vout))
+                    .unwrap_or(false);
                 // Durable spentness: Full mode only. Optimistic defers to structural
                 // after scripts (assumevalid-shaped: scripts need values, not UTXO proof).
                 if mode == AssembleMode::Full
-                    && !wave_live
+                    && !pin_live
                     && !pending_creates.contains_key(&key)
                 {
                     let spent = if let Some(cfk) = prev_fk {
-                        let range = query.confirm_parent_cache().get_body_range(cfk);
+                        let range = parents.get_body_range(cfk);
                         query
                             .store()
                             .has_confirmed_strong_spender_create(cfk, op.vout, range)
@@ -610,7 +593,6 @@ fn assemble_block_prevouts_mode(
                     op,
                     prev_fk,
                     &same_block,
-                    wave_prevouts,
                     &mut coinbase_height_cache,
                 )?;
                 if mode == AssembleMode::Full {
@@ -623,15 +605,7 @@ fn assemble_block_prevouts_mode(
                 }
                 // Same-run / provisional double-spend tracking (both modes).
                 pending_spent.insert(key);
-                // Prefer create_fk from wave when thin missed (same-wave parent).
-                let create_fk = prev_fk
-                    .or_else(|| {
-                        wave_prevouts.and_then(|w| {
-                            w.get_by_txid(op.txid.as_byte_array(), op.vout)
-                                .map(|(pfk, _, _)| pfk)
-                        })
-                    })
-                    .unwrap_or(rbitcoin_primitives::Fk::NULL);
+                let create_fk = prev_fk.unwrap_or(rbitcoin_primitives::Fk::NULL);
                 spends.push((
                     key.0,
                     key.1,
@@ -724,7 +698,6 @@ pub(crate) fn structural_validate_spends(
     block: &Block,
     ctx: &ValidationContext<'_>,
     archived_tx_fks: Option<&[rbitcoin_primitives::Fk]>,
-    wave_prevouts: Option<&rbitcoin_query::WavePrevoutCache>,
     spends: &[(
         [u8; 32],
         u32,
@@ -739,15 +712,16 @@ pub(crate) fn structural_validate_spends(
         Option<u32>,
     > = std::collections::HashMap::with_capacity(64);
     let maturity = ctx.params.coinbase_maturity();
+    let parents = query.confirm_parent_cache();
 
     for &(prev_txid, vout, _spend_fk, create_fk) in spends {
         let key = (prev_txid, vout);
         if pending_spent.contains(&key) {
             return Err(ConsensusError::PrevoutSpent);
         }
-        // Durable confirmed-strong spender (always re-check; wave is not authority).
+        // Durable confirmed-strong spender (always re-check; pin is not authority).
         let spent = if !create_fk.is_null() {
-            let range = query.confirm_parent_cache().get_body_range(create_fk);
+            let range = parents.get_body_range(create_fk);
             query
                 .store()
                 .has_confirmed_strong_spender_create(create_fk, vout, range)
@@ -763,12 +737,7 @@ pub(crate) fn structural_validate_spends(
         }
         // Coinbase maturity (need create Class A meta).
         if !create_fk.is_null() {
-            let prev_rec = if let Some(w) = wave_prevouts {
-                w.get_tx(create_fk).cloned()
-            } else {
-                None
-            };
-            let prev_rec = match prev_rec {
+            let prev_rec = match parents.get_parent_tx(create_fk) {
                 Some(r) => r,
                 None => query
                     .get_tx_class_a(create_fk)
@@ -778,7 +747,6 @@ pub(crate) fn structural_validate_spends(
                 query,
                 create_fk,
                 &prev_rec,
-                wave_prevouts,
                 &mut coinbase_height_cache,
             )?;
             if let Some(ch) = created {
@@ -870,10 +838,9 @@ fn resolve_prevout(
     query: &Query,
     block: &Block,
     op: OutPoint,
-    // Prefer thin create_fk from wave (avoids full InputRecord).
+    // Prefer thin create_fk from load (avoids full InputRecord).
     prev_fk_hint: Option<rbitcoin_primitives::Fk>,
     same_block: &std::collections::HashMap<[u8; 32], usize>,
-    wave_prevouts: Option<&rbitcoin_query::WavePrevoutCache>,
     coinbase_height_cache: &mut std::collections::HashMap<rbitcoin_primitives::Fk, Option<u32>>,
 ) -> Result<ResolvedPrevout, ConsensusError> {
     use rbitcoin_query::connect_prevout_stats;
@@ -896,42 +863,36 @@ fn resolve_prevout(
         });
     }
 
-    let prev_fk = prev_fk_hint;
+    let parents = query.confirm_parent_cache();
 
-    // Wave-local map first (no mutex; built during parent prefetch).
-    //
-    // **Wire `prev_txid` is authoritative.** Prefer by-txid; only accept an fk
-    // hit when the cached parent's txid matches. Otherwise a wrong create_fk
-    // hint can hit another wave entry (every wave-body create is a live parent)
-    // and feed the wrong scriptPubKey into script checks.
-    if let Some(wave) = wave_prevouts {
-        let wave_hit = wave.get_by_txid(&prev_txid, op.vout).or_else(|| {
-            prev_fk.and_then(|fk| {
-                wave.get_by_fk(fk, op.vout)
-                    .filter(|(_, rec, _)| rec.txid == prev_txid)
-            })
-        });
-        if let Some((prev_fk, prev_rec, out)) = wave_hit {
-            connect_prevout_stats::WAVE_HIT.fetch_add(1, Ordering::Relaxed);
-            let cb_h =
-                coinbase_height_for_maturity(query, prev_fk, prev_rec, wave_prevouts, coinbase_height_cache)?;
-            // Found a live parent out with matching wire txid — never MissingPrevout.
-            return Ok(ResolvedPrevout {
-                txout: TxOut {
-                    value: Amount::from_sat(out.value as u64),
-                    script_pubkey: ScriptBuf::from_bytes(out.script.clone()),
-                },
-                coinbase_height: cb_h,
-            });
+    // Load-stage pin / body first (create_fk-keyed). Wire prev_txid is
+    // authoritative — reject wrong create_fk hits.
+    if let Some(prev_fk) = prev_fk_hint {
+        if let Some((prev_rec, out)) = parents.get_parent_out(prev_fk, op.vout) {
+            if prev_rec.txid == prev_txid {
+                connect_prevout_stats::WAVE_HIT.fetch_add(1, Ordering::Relaxed);
+                let cb_h = coinbase_height_for_maturity(
+                    query,
+                    prev_fk,
+                    &prev_rec,
+                    coinbase_height_cache,
+                )?;
+                return Ok(ResolvedPrevout {
+                    txout: TxOut {
+                        value: Amount::from_sat(out.value as u64),
+                        script_pubkey: ScriptBuf::from_bytes(out.script),
+                    },
+                    coinbase_height: cb_h,
+                });
+            }
         }
     }
 
     // Cold path: create-fk candidates (thin → durable head / store).
-    // Tip-follow without a wave (or wave miss) uses this path.
     let head_fk = query
         .tx_fk_by_txid(&prev_txid)
         .map_err(ConsensusError::Store)?;
-    let candidates = [prev_fk, head_fk];
+    let candidates = [prev_fk_hint, head_fk];
     let mut seen: [u64; 3] = [0; 3];
     let mut n_seen = 0usize;
     for prev_fk in candidates.into_iter().flatten() {
@@ -962,7 +923,6 @@ fn resolve_prevout(
             query,
             prev_fk,
             &prev_rec,
-            wave_prevouts,
             coinbase_height_cache,
         )?;
         return Ok(ResolvedPrevout {
@@ -985,18 +945,16 @@ fn coinbase_height_for_maturity(
     query: &Query,
     prev_fk: rbitcoin_primitives::Fk,
     prev_rec: &rbitcoin_store::TxRecord,
-    wave_prevouts: Option<&rbitcoin_query::WavePrevoutCache>,
     coinbase_height_cache: &mut std::collections::HashMap<rbitcoin_primitives::Fk, Option<u32>>,
 ) -> Result<Option<u32>, ConsensusError> {
-    let (is_cb, cb_h) =
-        coinbase_info(query, prev_fk, prev_rec, wave_prevouts, coinbase_height_cache)?;
+    let (is_cb, cb_h) = coinbase_info(query, prev_fk, prev_rec, coinbase_height_cache)?;
     if !is_cb {
         return Ok(None);
     }
     if cb_h.is_some() {
         return Ok(cb_h);
     }
-    // Last resort: durable tx_height (wave may have been filled pre-Class-C).
+    // Last resort: durable tx_height.
     Ok(query
         .store()
         .tx_height
@@ -1009,7 +967,6 @@ fn coinbase_info(
     query: &Query,
     prev_fk: rbitcoin_primitives::Fk,
     prev_rec: &rbitcoin_store::TxRecord,
-    wave_prevouts: Option<&rbitcoin_query::WavePrevoutCache>,
     cache: &mut std::collections::HashMap<rbitcoin_primitives::Fk, Option<u32>>,
 ) -> Result<(bool, Option<u32>), ConsensusError> {
     if let Some(&h) = cache.get(&prev_fk) {
@@ -1021,12 +978,10 @@ fn coinbase_info(
         // 1-in parent in one spending tx).
         return Ok((h.is_some(), h));
     }
-    // Wave-prefetched coinbase height (no tx_height / input-run disk).
-    if let Some(wave) = wave_prevouts {
-        if let Some(cached) = wave.coinbase_height_fk(prev_fk) {
-            cache.insert(prev_fk, cached);
-            return Ok((cached.is_some(), cached));
-        }
+    // Load-stage pin may stash coinbase height (no tx_height / input-run disk).
+    if let Some(cached) = query.confirm_parent_cache().get_parent_coinbase_height(prev_fk) {
+        cache.insert(prev_fk, cached);
+        return Ok((cached.is_some(), cached));
     }
     if prev_rec.input_count != 1 {
         cache.insert(prev_fk, None);

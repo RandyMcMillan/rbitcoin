@@ -3,7 +3,7 @@
 //! Pipeline (optimistic scripts — assumevalid-shaped):
 //! ```text
 //! LOAD STAGE (ibd-confirm-load OS thread):
-//!   Class A + pin/mlock parents → resolve → wave → wire → assemble
+//!   Class A + pin/mlock parents → resolve → wire → assemble
 //!   (only stage that may touch the store / parent cache)
 //! SCRIPTS STAGE (ibd-confirm OS thread + rayon):
 //!   pure CPU: verify ScriptCheckJob list from LoadedBatch — no Query, no disk
@@ -13,6 +13,10 @@
 //!
 //! [`confirm_archived_run`] runs all stages synchronously (tests / tip path).
 //! IBD pipelines so load(N+1) ∥ scripts(N) ∥ write(N−1).
+//!
+//! **No wave fill:** load already decodes bodies, stashes thin create_fk edges,
+//! and pins sparse parent outs into ConfirmParentCache. Wire rebuild and
+//! assemble/structural resolve prevouts from that cache (create_fk-first).
 //!
 //! **Scripts purity:** [`confirm_scripts_phase`] is a pure function of
 //! [`LoadedBatch`] → [`ScriptOkBatch`]. Jobs already carry prevouts, txs, and
@@ -71,10 +75,11 @@ struct Prepared {
 /// Wire + assemble complete; script jobs still attached (not yet verified).
 ///
 /// `Send` so IBD can hand off load → scripts threads.
+/// Prevouts for write structural come from ConfirmParentCache (still live
+/// until tip GC after Class C), not a batch-local wave map.
 pub struct LoadedBatch {
     prepared: Vec<Prepared>,
     wire_blocks: Vec<Block>,
-    wave_prevouts: rbitcoin_query::WavePrevoutCache,
 }
 
 /// Script-verified batch ready for ordered write (structural + Class C + spends).
@@ -83,7 +88,6 @@ pub struct LoadedBatch {
 pub struct ScriptOkBatch {
     prepared: Vec<Prepared>,
     wire_blocks: Vec<Block>,
-    wave_prevouts: rbitcoin_query::WavePrevoutCache,
 }
 
 /// Confirm a contiguous tip-extension run of archived bodies (sync all stages).
@@ -116,7 +120,7 @@ pub struct ConfirmScriptOutcome {
 }
 
 /// LOAD STAGE: load batch Class A + pin/mlock write parents →
-/// resolve → wave → wire → assemble.
+/// resolve → wire → assemble.
 ///
 /// Does **not** run scripts, advance tip, or probe durable spentness (except
 /// provisional same-run doubles during assemble).
@@ -165,23 +169,14 @@ pub fn confirm_load_phase(
         Ordering::Relaxed,
     );
 
-    let mut wave_prevouts = wave_fill(query, &metas)?;
-    let wire_blocks = wire_rebuild(query, &metas, &mut wave_prevouts)?;
-    let prepared = assemble_run(
-        query,
-        params,
-        milestone,
-        metas,
-        &wire_blocks,
-        &wave_prevouts,
-    )?;
+    let wire_blocks = wire_rebuild(query, &metas)?;
+    let prepared = assemble_run(query, params, milestone, metas, &wire_blocks)?;
 
     let work_ns = t_work.elapsed().as_nanos() as u64;
     Ok(ConfirmLoadOutcome {
         batch: LoadedBatch {
             prepared,
             wire_blocks,
-            wave_prevouts,
         },
         work_ns,
     })
@@ -209,7 +204,6 @@ pub fn confirm_scripts_phase(
         batch: ScriptOkBatch {
             prepared: batch.prepared,
             wire_blocks: batch.wire_blocks,
-            wave_prevouts: batch.wave_prevouts,
         },
         work_ns,
     })
@@ -271,7 +265,6 @@ pub fn confirm_write_phase(
         milestone,
         &batch.prepared,
         &batch.wire_blocks,
-        &batch.wave_prevouts,
     )?;
     let n_blocks = batch.prepared.len();
     let out = class_c_commit(query, &mut batch.prepared)?;
@@ -437,11 +430,9 @@ mod write_idempotent_tests {
     #[test]
     fn scripts_phase_is_pure_no_query_arg() {
         use super::{confirm_scripts_phase, LoadedBatch};
-        use rbitcoin_query::WavePrevoutCache;
         let batch = LoadedBatch {
             prepared: Vec::new(),
             wire_blocks: Vec::new(),
-            wave_prevouts: WavePrevoutCache::with_capacity(0, 0),
         };
         let ok = confirm_scripts_phase(batch).expect("empty scripts ok");
         assert!(ok.batch.prepared.is_empty());
@@ -513,32 +504,10 @@ fn resolve_body_metas(
     Ok(metas)
 }
 
-fn wave_fill(
-    query: &Query,
-    metas: &[BodyMeta],
-) -> Result<rbitcoin_query::WavePrevoutCache, ConsensusError> {
-    // Prefetch Class A is a no-op (bodies live in ConfirmParentCache). Leave
-    // PREFETCH_CLASS_A_NS at 0 so perf still shows p=0 cleanly.
-    let t0 = Instant::now();
-    let lists: Vec<&[rbitcoin_primitives::Fk]> =
-        metas.iter().map(|m| m.tx_fks.as_slice()).collect();
-    let (_n, wave) = query
-        .wave_fill_for_tx_fk_lists(&lists)
-        .map_err(ConsensusError::Store)?;
-    let ns = t0.elapsed().as_nanos() as u64;
-    confirm_phase_stats::WAVE_FILL_NS.fetch_add(ns, Ordering::Relaxed);
-    confirm_phase_stats::RECONSTRUCT_NS.fetch_add(ns, Ordering::Relaxed);
-    Ok(wave)
-}
-
-fn wire_rebuild(
-    query: &Query,
-    metas: &[BodyMeta],
-    wave: &mut rbitcoin_query::WavePrevoutCache,
-) -> Result<Vec<Block>, ConsensusError> {
+fn wire_rebuild(query: &Query, metas: &[BodyMeta]) -> Result<Vec<Block>, ConsensusError> {
     // Sequential by design: `rayon_audit` benches show par_iter reconstruct is
-    // *slower* than sequential for 1–128 blocks. Wave-fill already decoded Class A
-    // bodies once — wire rebuild takes those and only builds `bitcoin::Transaction`.
+    // *slower* than sequential for 1–128 blocks. Load already decoded Class A
+    // into ConfirmParentCache — wire clones from cache (store fallback on miss).
     let t0 = Instant::now();
     let mut blks = Vec::with_capacity(metas.len());
     for m in metas {
@@ -548,10 +517,9 @@ fn wire_rebuild(
             .map(|p| p.prev_hash);
         blks.push(
             query
-                .reconstruct_archived_block_from_parts_wave(
+                .reconstruct_archived_block_from_parts_cached(
                     m.header_rec.clone(),
                     m.tx_fks.clone(),
-                    Some(wave),
                     prev_hash,
                 )
                 .map_err(ConsensusError::Store)?,
@@ -569,7 +537,6 @@ fn assemble_run(
     milestone: Milestone,
     metas: Vec<BodyMeta>,
     wire_blocks: &[Block],
-    wave_prevouts: &rbitcoin_query::WavePrevoutCache,
 ) -> Result<Vec<Prepared>, ConsensusError> {
     // Provisional same-run double-spend only (not durable spentness).
     let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
@@ -672,7 +639,6 @@ fn assemble_run(
             block,
             &ctx,
             Some(&meta.tx_fks),
-            Some(wave_prevouts),
             &mut pending_spent,
             &mut pending_creates,
         )?;
@@ -708,7 +674,6 @@ fn structural_run(
     milestone: Milestone,
     prepared: &[Prepared],
     wire_blocks: &[Block],
-    wave_prevouts: &rbitcoin_query::WavePrevoutCache,
 ) -> Result<(), ConsensusError> {
     let t0 = Instant::now();
     let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
@@ -719,7 +684,6 @@ fn structural_run(
             &wire_blocks[i],
             &ctx,
             Some(&p.tx_fks),
-            Some(wave_prevouts),
             &p.spends,
             p.fees,
             &mut pending_spent,

@@ -147,7 +147,7 @@ pub(crate) fn is_confirm_load_retryable(msg: &str) -> bool {
 
 /// Spawn confirm **load** + **scripts** + **write** OS threads.
 ///
-/// Load (Class A + pin/mlock parents → wave → wire → assemble) on
+/// Load (Class A + pin/mlock parents → wire → assemble) on
 /// `ibd-confirm-load`; scripts on `ibd-confirm`; structural + Class C +
 /// spend annotate on `ibd-confirm-write`.
 /// Overlap: load(N+1) ∥ scripts(N) ∥ write(N−1).

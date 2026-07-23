@@ -383,6 +383,20 @@ pub async fn ibd_cancellable(
     } else {
         0
     }));
+    // Linear sticky prewarm from last N Class A tx.idx rows before any archive work.
+    // Avoids multi-second head resolve storms after cold restart.
+    match hub.query.archive_sticky_prewarm() {
+        Ok((loaded, ms)) => {
+            let (len, cap) = hub.query.archive_txid_sticky_stats();
+            info!(
+                "ibd: archive sticky prewarm loaded={loaded} map={len}/{cap} in {ms}ms \
+                 (last min(cap,tx_count) via sequential tx.idx)"
+            );
+        }
+        Err(e) => {
+            warn!("ibd: archive sticky prewarm failed (continuing cold): {e}");
+        }
+    }
     let mut pipeline = spawn_archive_pipeline(
         hub.clone(),
         arch_job_rx,

@@ -519,13 +519,22 @@ pub(crate) enum ArchiveResult {
     },
 }
 
+/// Prep → writer queue depth (like confirm load→scripts): prep can plan the next
+/// mega-batch while the prior commit is still running. Blocking `send` when full
+/// provides backpressure. Ordered FIFO keeps reserved create fks aligned with
+/// durable `txs.count()` at commit time.
+pub(crate) const ARCHIVE_WRITE_QUEUE_CAP: usize = 2;
+
 /// ContigPark → prep (structure + FK assign/resolve reads) → writer (Class A puts).
 ///
 /// **Park first:** out-of-order wire jobs sit in ContigPark without Class A work.
 /// When a contiguous prefix is ready, prep decodes TxApply and plans create_fks
 /// (sticky + `tx.head` reads only). Writer commits the plan (body/head/header_txs
-/// writes + sticky publish). Prep waits for write ack before planning the next
-/// mega-batch so planned fks stay aligned with `txs.count()`.
+/// writes + sticky publish).
+///
+/// **Overlap:** prep→writer is a bounded queue ([`ARCHIVE_WRITE_QUEUE_CAP`]).
+/// Prep reserves create fks via a local HWM (`archive_plan_mega_from`) so a second
+/// plan can proceed while the first is still committing.
 pub(crate) fn spawn_archive_pipeline(
     hub: Arc<ChainHub>,
     mut job_rx: mpsc::UnboundedReceiver<ArchiveJob>,
@@ -542,16 +551,15 @@ pub(crate) fn spawn_archive_pipeline(
         const JOB_Q: usize = 4096;
         const PRI_Q: usize = 512;
         debug!(
-            "ibd: archive pipeline prep=1 (park+resolve) writer=1 (commit) contig-park-before-prep"
+            "ibd: archive pipeline prep=1 (park+resolve) writer=1 (commit) write_q={ARCHIVE_WRITE_QUEUE_CAP} contig-park-before-prep"
         );
 
         // Tokio → prep: raw jobs (priority jumps far).
         let (pri_job_tx, pri_job_rx) = std::sync::mpsc::sync_channel::<ArchiveJob>(PRI_Q);
         let (far_job_tx, far_job_rx) = std::sync::mpsc::sync_channel::<ArchiveJob>(JOB_Q);
-        // Prep → writer: capacity 1 + blocking ack after every send (single-flight).
-        // Must not leave prep with "in flight" while writer is idle (silent stall).
-        let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<WriteReadyBatch>(1);
-        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        // Prep → writer: depth-2 queue (plan while prior commit runs).
+        let (write_tx, write_rx) =
+            std::sync::mpsc::sync_channel::<WriteReadyBatch>(ARCHIVE_WRITE_QUEUE_CAP);
 
         let write_hub = hub.clone();
         let write_result = result_tx.clone();
@@ -606,7 +614,6 @@ pub(crate) fn spawn_archive_pipeline(
                                     .send(ArchiveResult::Ok { hash, wire_bytes })
                                     .is_err()
                                 {
-                                    let _ = ack_tx.send(());
                                     return;
                                 }
                             }
@@ -622,24 +629,31 @@ pub(crate) fn spawn_archive_pipeline(
                             }
                         }
                         Err(e) => {
+                            // Ordered FK reservation: after a commit failure, any
+                            // later queued plans are invalid — fail them and stop.
                             let err = e.to_string();
                             for (hash, wire_bytes) in batch.outcomes {
-                                if write_result
-                                    .send(ArchiveResult::Err {
+                                let _ = write_result.send(ArchiveResult::Err {
+                                    hash,
+                                    err: err.clone(),
+                                    wire_bytes,
+                                });
+                            }
+                            while let Ok(rest) = write_rx.try_recv() {
+                                for (hash, wire_bytes) in rest.outcomes {
+                                    let _ = write_result.send(ArchiveResult::Err {
                                         hash,
                                         err: err.clone(),
                                         wire_bytes,
-                                    })
-                                    .is_err()
-                                {
-                                    let _ = ack_tx.send(());
-                                    return;
+                                    });
                                 }
                             }
+                            rbitcoin_log::warn!(
+                                "ibd: archive writer commit failed — pipeline stop: {err}"
+                            );
+                            return;
                         }
                     }
-                    // Unblock prep to plan the next mega-batch (fk HWM is durable).
-                    let _ = ack_tx.send(());
                 }
             })
             .expect("spawn ibd-archive-writer");
@@ -660,13 +674,16 @@ pub(crate) fn spawn_archive_pipeline(
                 let mut far_open = true;
                 let mut park = ContigPark::new(prep_next.load(Ordering::Relaxed));
                 let park_horizon = super::CONTIG_DENSIFY_AHEAD;
+                // Reserved create-fk HWM for overlapping plan while prior commit runs.
+                let mut next_plan_fk = prep_hub.query.tx_body_count().saturating_add(1).max(1);
+
                 /// Emit Dropped / Err for park insert edge cases.
                 fn handle_park_edge(
                     ins: ParkInsert,
                     result_tx: &mpsc::UnboundedSender<ArchiveResult>,
                     hub: &ChainHub,
                     write_tx: &std::sync::mpsc::SyncSender<WriteReadyBatch>,
-                    ack_rx: &std::sync::mpsc::Receiver<()>,
+                    next_plan_fk: &mut u64,
                     stats: &ArchivePipelineStats,
                     params: &rbitcoin_consensus::ChainParams,
                 ) -> bool {
@@ -687,7 +704,7 @@ pub(crate) fn spawn_archive_pipeline(
                             })
                             .is_ok(),
                         ParkInsert::Late(late) => {
-                            // Already past HWM: plan+commit single without ContigPark.
+                            // Already past HWM: plan+queue single without ContigPark.
                             !matches!(
                                 plan_and_send_jobs(
                                     std::slice::from_ref(&late),
@@ -695,7 +712,7 @@ pub(crate) fn spawn_archive_pipeline(
                                     params,
                                     stats,
                                     write_tx,
-                                    ack_rx,
+                                    next_plan_fk,
                                     result_tx,
                                 ),
                                 PlanSend::WriterDead
@@ -704,9 +721,10 @@ pub(crate) fn spawn_archive_pipeline(
                     }
                 }
 
-                /// Outcome of plan+blocking commit.
+                /// Outcome of plan + queue to writer.
                 enum PlanSend {
-                    /// Commit finished (or empty batch / already archived Ok path).
+                    /// Plan queued (or empty already-archived path). Writer may still
+                    /// be committing; prep can plan the next batch immediately.
                     Done,
                     /// Structure/plan failed; caller should rewind ContigPark HWM.
                     FailedRewind,
@@ -714,18 +732,18 @@ pub(crate) fn spawn_archive_pipeline(
                     WriterDead,
                 }
 
-                /// Structure decode + FK plan (reads), then **blocking** write+ack.
+                /// Structure decode + FK plan (reads), then **blocking** enqueue.
                 ///
-                /// Single-flight: does not return until the writer has finished
-                /// commit (or failed). That keeps planned create fks aligned with
-                /// `txs.count()` and prevents prep/writer desync stalls.
+                /// Blocks only when the write queue is full (`ARCHIVE_WRITE_QUEUE_CAP`).
+                /// Create fks come from `*next_plan_fk` so overlapping plans do not
+                /// re-use durable `txs.count()+1` while a prior batch is in flight.
                 fn plan_and_send_jobs(
                     jobs: &[ArchiveJob],
                     hub: &ChainHub,
                     params: &rbitcoin_consensus::ChainParams,
                     stats: &ArchivePipelineStats,
                     write_tx: &std::sync::mpsc::SyncSender<WriteReadyBatch>,
-                    ack_rx: &std::sync::mpsc::Receiver<()>,
+                    next_plan_fk: &mut u64,
                     result_tx: &mpsc::UnboundedSender<ArchiveResult>,
                 ) -> PlanSend {
                     if jobs.is_empty() {
@@ -770,7 +788,8 @@ pub(crate) fn spawn_archive_pipeline(
                             if need.is_empty() {
                                 rbitcoin_query::ArchiveWritePlan::empty()
                             } else {
-                                match hub.query.archive_plan_mega_owned(&mut need) {
+                                match hub.query.archive_plan_mega_from(&mut need, *next_plan_fk)
+                                {
                                     Ok(p) => p,
                                     Err(e) => {
                                         let err = e.to_string();
@@ -799,16 +818,18 @@ pub(crate) fn spawn_archive_pipeline(
                         }
                     };
 
-                    // Empty plan still goes through writer so Ok results + ack stay ordered.
+                    // Advance reserved HWM only after a successful non-empty plan.
+                    if let Some(last) = plan.planned_fks.last() {
+                        *next_plan_fk = last.0.saturating_add(1);
+                    }
+
+                    // Empty plan still goes through writer so Ok results stay ordered.
                     let batch = WriteReadyBatch { outcomes, plan };
+                    // Blocks when queue full — backpressure, not single-flight ack.
                     if write_tx.send(batch).is_err() {
                         return PlanSend::WriterDead;
                     }
-                    // Block until commit finishes — never leave "in flight" dangling.
-                    match ack_rx.recv() {
-                        Ok(()) => PlanSend::Done,
-                        Err(_) => PlanSend::WriterDead,
-                    }
+                    PlanSend::Done
                 }
 
                 loop {
@@ -873,7 +894,7 @@ pub(crate) fn spawn_archive_pipeline(
                             &prep_result,
                             &prep_hub,
                             &write_tx,
-                            &ack_rx,
+                            &mut next_plan_fk,
                             &prep_stats,
                             &prep_params,
                         ) {
@@ -892,7 +913,7 @@ pub(crate) fn spawn_archive_pipeline(
                                 &prep_result,
                                 &prep_hub,
                                 &write_tx,
-                                &ack_rx,
+                                &mut next_plan_fk,
                                 &prep_stats,
                                 &prep_params,
                             ) {
@@ -907,7 +928,7 @@ pub(crate) fn spawn_archive_pipeline(
                                 &prep_result,
                                 &prep_hub,
                                 &write_tx,
-                                &ack_rx,
+                                &mut next_plan_fk,
                                 &prep_stats,
                                 &prep_params,
                             ) {
@@ -979,7 +1000,7 @@ pub(crate) fn spawn_archive_pipeline(
                                             &prep_result,
                                             &prep_hub,
                                             &write_tx,
-                                            &ack_rx,
+                                            &mut next_plan_fk,
                                             &prep_stats,
                                             &prep_params,
                                         ) {
@@ -995,7 +1016,7 @@ pub(crate) fn spawn_archive_pipeline(
                                         &prep_result,
                                         &prep_hub,
                                         &write_tx,
-                                        &ack_rx,
+                                        &mut next_plan_fk,
                                         &prep_stats,
                                         &prep_params,
                                     ) {
@@ -1018,14 +1039,14 @@ pub(crate) fn spawn_archive_pipeline(
                     // until commit Ok marks archived).
                     prep_next.store(park.next_h(), Ordering::Relaxed);
 
-                    // Blocks until writer commit+ack (single-flight).
+                    // Plan + enqueue (blocks only if write queue is full).
                     match plan_and_send_jobs(
                         &batch,
                         &prep_hub,
                         &prep_params,
                         &prep_stats,
                         &write_tx,
-                        &ack_rx,
+                        &mut next_plan_fk,
                         &prep_result,
                     ) {
                         PlanSend::Done => {}

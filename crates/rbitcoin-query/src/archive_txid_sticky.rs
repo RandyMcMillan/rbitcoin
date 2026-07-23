@@ -44,6 +44,7 @@ pub struct ArchiveTxidSticky {
 impl ArchiveTxidSticky {
     pub fn new(cap: usize) -> Self {
         let cap = cap.clamp(100_000, 20_000_000);
+        // Modest initial capacity; [`Self::reserve_for_prewarm`] grows for startup fill.
         Self {
             inner: Mutex::new(Inner {
                 map: HashMap::with_capacity(cap.min(1 << 20)),
@@ -65,6 +66,14 @@ impl ArchiveTxidSticky {
 
     pub fn cap(&self) -> usize {
         self.inner.lock().unwrap().cap
+    }
+
+    /// Grow map toward full cap before a linear prewarm (one rehash, not thrash).
+    pub fn reserve_for_prewarm(&self, n: usize) {
+        let mut g = self.inner.lock().unwrap();
+        let want = n.min(g.cap);
+        let have = g.map.len();
+        g.map.reserve(want.saturating_sub(have));
     }
 
     /// Batch insert under **one** lock (mega-batch path).

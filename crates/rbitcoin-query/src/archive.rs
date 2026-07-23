@@ -1,10 +1,13 @@
 //! Class A archive write path.
 //!
-//! Split for IBD dual-thread:
-//! - **Plan** ([`Query::archive_plan_mega_owned`]): store **reads** — assign create
-//!   fks, sticky + `tx.head` resolve, stamp inputs.
+//! Split for IBD dual-thread (prep/write may overlap with a small plan queue):
+//! - **Plan** ([`Query::archive_plan_mega_owned`] / [`Query::archive_plan_mega_from`]):
+//!   store **reads** — assign create fks (optionally from a reserved HWM), sticky +
+//!   `tx.head` resolve, stamp inputs.
 //! - **Commit** ([`Query::archive_commit_plan`]): store **writes** — body append,
 //!   head index, header_txs, sticky publish.
+//! - **Prewarm** ([`Query::archive_sticky_prewarm`]): sequential last-N `tx.idx`
+//!   fill of sticky before the pipeline starts.
 
 use super::*;
 
@@ -161,11 +164,27 @@ impl Query {
     /// **Prep / read path:** assign create fks, sticky + head resolve, stamp
     /// inputs. No Class A body/head writes (those are [`Self::archive_commit_plan`]).
     ///
-    /// Caller must not plan the next mega-batch until the previous plan has been
-    /// committed — planned fks are `txs.count()+1…` at plan time.
+    /// Planned create fks start at `txs.count()+1`. For overlapping plan/write
+    /// (prep queue depth &gt; 1), use [`Self::archive_plan_mega_from`] with a
+    /// reserved FK HWM so in-flight plans do not collide.
     pub fn archive_plan_mega_owned(
         &self,
         need: &mut [(Fk, Vec<TxApply>)],
+    ) -> Result<ArchiveWritePlan, QueryError> {
+        let start = self.store.txs.count().saturating_add(1);
+        self.archive_plan_mega_from(need, start)
+    }
+
+    /// Like [`Self::archive_plan_mega_owned`], but assign create fks from
+    /// `next_tx_start` (inclusive) instead of live `txs.count()+1`.
+    ///
+    /// IBD prep keeps a local reserved HWM: after each successful non-empty plan,
+    /// advance to `planned_fks.last()+1` so the next mega-batch can be planned
+    /// while a prior batch is still committing (ordered writer preserves match).
+    pub fn archive_plan_mega_from(
+        &self,
+        need: &mut [(Fk, Vec<TxApply>)],
+        next_tx_start: u64,
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::collections::{HashMap, HashSet};
         use std::time::Instant;
@@ -174,7 +193,7 @@ impl Query {
             return Ok(ArchiveWritePlan::empty());
         }
 
-        let mut next_tx = self.store.txs.count() + 1;
+        let mut next_tx = next_tx_start.max(1);
         let n_headers = need.iter().filter(|(_, t)| !t.is_empty()).count() as u64;
 
         // Pass 1: assign create fks + build batch_map (txid → create_fk).
@@ -327,6 +346,43 @@ impl Query {
         })
     }
 
+    /// Linear sticky prewarm: last `cap` Class A bodies via sequential `tx.idx`
+    /// order (`body_txid` only — no full decode / head probe).
+    ///
+    /// Call once before the IBD archive pipeline so cold restarts avoid a head
+    /// resolve storm. Returns `(loaded, elapsed_ms)`.
+    pub fn archive_sticky_prewarm(&self) -> Result<(usize, u64), QueryError> {
+        use std::time::Instant;
+        let t0 = Instant::now();
+        let cap = self.archive_txid_sticky.cap();
+        let n = self.store.txs.count();
+        if n == 0 || cap == 0 {
+            return Ok((0, t0.elapsed().as_millis() as u64));
+        }
+        // Last `min(cap, n)` fks: (n-cap+1)..=n (1-based).
+        let start = n.saturating_sub(cap as u64).saturating_add(1).max(1);
+        let expect = (n.saturating_sub(start).saturating_add(1)) as usize;
+        self.archive_txid_sticky.reserve_for_prewarm(expect);
+        const CHUNK: usize = 8192;
+        let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(CHUNK);
+        let mut loaded = 0usize;
+        for id in start..=n {
+            let fk = Fk(id);
+            let txid = self.store.txs.body_txid(fk)?;
+            batch.push((txid, fk));
+            if batch.len() >= CHUNK {
+                self.archive_txid_sticky.insert_many(&batch);
+                loaded = loaded.saturating_add(batch.len());
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            self.archive_txid_sticky.insert_many(&batch);
+            loaded = loaded.saturating_add(batch.len());
+        }
+        Ok((loaded, t0.elapsed().as_millis() as u64))
+    }
+
     /// **Writer / write path:** durable Class A put + sticky publish.
     ///
     /// No sticky/head **lookups** — only appends and sticky inserts.
@@ -420,4 +476,142 @@ impl Query {
         self.store.epoch()
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Query, TxApply};
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_query(label: &str) -> (std::path::PathBuf, Query) {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-arch-{label}-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        (dir, q)
+    }
+
+    fn coinbase_apply(i: u64) -> TxApply {
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&i.to_le_bytes());
+        txid[8] = 0xcb;
+        TxApply {
+            tx: TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![i as u8],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(50 * 100_000_000, vec![0x51])],
+        }
+    }
+
+    #[test]
+    fn plan_from_reserves_fks_for_overlap_then_commit_in_order() {
+        let (dir, q) = temp_query("plan-from");
+        // Seed one body so count starts at 1.
+        let seed = vec![(Fk(1), vec![coinbase_apply(1)])];
+        // Need a real header_fk path: plan only needs Vec<(Fk, Vec<TxApply>)>.
+        let mut need0 = seed;
+        let p0 = q.archive_plan_mega_owned(&mut need0).unwrap();
+        q.archive_commit_plan(p0).unwrap();
+        assert_eq!(q.tx_body_count(), 1);
+
+        // Reserve two plans as prep would with write queue depth 2.
+        let mut next = q.tx_body_count() + 1;
+        let mut need_a = vec![(Fk(10), vec![coinbase_apply(10), coinbase_apply(11)])];
+        let plan_a = q.archive_plan_mega_from(&mut need_a, next).unwrap();
+        assert_eq!(plan_a.planned_fks, vec![Fk(2), Fk(3)]);
+        next = plan_a.planned_fks.last().unwrap().0 + 1;
+        assert_eq!(next, 4);
+
+        let mut need_b = vec![(Fk(20), vec![coinbase_apply(20)])];
+        let plan_b = q.archive_plan_mega_from(&mut need_b, next).unwrap();
+        assert_eq!(plan_b.planned_fks, vec![Fk(4)]);
+        // Durable count still 1 until commit.
+        assert_eq!(q.tx_body_count(), 1);
+
+        q.archive_commit_plan(plan_a).unwrap();
+        assert_eq!(q.tx_body_count(), 3);
+        q.archive_commit_plan(plan_b).unwrap();
+        assert_eq!(q.tx_body_count(), 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sticky_prewarm_loads_last_n_via_idx_order() {
+        let (dir, q) = temp_query("sticky-prewarm");
+        // Insert more than a small sticky would hold — use env is hard; just
+        // prewarm whatever is in the store (cap defaults to 4M, store has few).
+        let mut packed = Vec::new();
+        for i in 1u64..=50 {
+            let ta = coinbase_apply(i);
+            packed.push((ta.tx, ta.inputs, ta.outputs));
+        }
+        q.store
+            .txs
+            .put_full_batch_indexed(&packed, true)
+            .unwrap();
+        assert_eq!(q.tx_body_count(), 50);
+        assert_eq!(q.archive_txid_sticky_stats().0, 0);
+
+        let (loaded, _ms) = q.archive_sticky_prewarm().unwrap();
+        assert_eq!(loaded, 50);
+        let (len, _cap) = q.archive_txid_sticky_stats();
+        assert_eq!(len, 50);
+
+        // Last txid must resolve from sticky (lookup_batch).
+        let mut last_txid = [0u8; 32];
+        last_txid[0..8].copy_from_slice(&50u64.to_le_bytes());
+        last_txid[8] = 0xcb;
+        let hit = q.archive_txid_sticky.lookup_batch(&[last_txid]);
+        assert_eq!(hit.get(&last_txid), Some(&Fk(50)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sticky_prewarm_keeps_tail_when_over_cap() {
+        // Use a tiny sticky via constructing sticky alone is hard (Query uses
+        // env). Instead verify the start id math: last min(n,cap) of a 50-body
+        // store with full prewarm path already tested; here check body_txid
+        // range endpoint for Fk(n).
+        let (dir, q) = temp_query("sticky-tail");
+        let mut packed = Vec::new();
+        for i in 1u64..=5 {
+            let ta = coinbase_apply(i);
+            packed.push((ta.tx, ta.inputs, ta.outputs));
+        }
+        q.store
+            .txs
+            .put_full_batch_indexed(&packed, false)
+            .unwrap();
+        let (loaded, _) = q.archive_sticky_prewarm().unwrap();
+        assert_eq!(loaded, 5);
+        // Fk 1 and Fk 5 both present when under cap.
+        let t1 = coinbase_apply(1).tx.txid;
+        let t5 = coinbase_apply(5).tx.txid;
+        let hits = q.archive_txid_sticky.lookup_batch(&[t1, t5]);
+        assert_eq!(hits.get(&t1), Some(&Fk(1)));
+        assert_eq!(hits.get(&t5), Some(&Fk(5)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

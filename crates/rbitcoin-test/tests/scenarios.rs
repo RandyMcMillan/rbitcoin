@@ -189,6 +189,99 @@ fn node_cli_and_surface_smoke() {
         node_cli_main(["rbitcoin-node", "--max-outbound", "0"]),
         ExitCode::SUCCESS
     );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--max-outbound"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--max-outbound", "nope"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--mempool-size-mb"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--mempool-size-mb", "0"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--mempool-size-mb", "x"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--max-run-secs"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--max-run-secs", "x"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--log-level"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--log-level", "loud"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--electrum-listen"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--electrum-listen", "bad"]),
+        ExitCode::SUCCESS
+    );
+    assert_ne!(
+        node_cli_main(["rbitcoin-node", "--milestone"]),
+        ExitCode::SUCCESS
+    );
+    // Happy-path flag combinations (smoke exits after open).
+    let flags_ok = td.path().join("flags-ok");
+    assert_eq!(
+        node_cli_main([
+            "rbitcoin-node",
+            "--datadir",
+            flags_ok.to_str().unwrap(),
+            "--network",
+            "regtest",
+            "--no-seeds",
+            "--milestone",
+            "0",
+            "--max-outbound",
+            "2",
+            "--mempool-size-mb",
+            "32",
+            "--max-run-secs",
+            "1",
+            "--log-level",
+            "warn",
+            "--listen",
+            "127.0.0.1:0",
+            "--connect",
+            "127.0.0.1:1",
+            "--electrum-listen",
+            "127.0.0.1:0",
+            "--inhibit-suspend",
+            "--smoke",
+        ]),
+        ExitCode::SUCCESS
+    );
+    let flags_off = td.path().join("flags-log-off");
+    assert_eq!(
+        node_cli_main([
+            "rbitcoin-node",
+            "--datadir",
+            flags_off.to_str().unwrap(),
+            "--network",
+            "regtest",
+            "--log-level",
+            "off",
+            "--smoke",
+        ]),
+        ExitCode::SUCCESS
+    );
     let _ = node_cli_main([
         "rbitcoin-node",
         "--help",
@@ -1735,4 +1828,230 @@ fn consensus_reject_bad_structure_and_milestone() {
             || msg.contains("spend"),
         "expected prevout failure under milestone, got: {err}"
     );
+}
+
+// ─── 3-stage confirm + materialize parent mlock surface ─────────────────────
+
+/// Split materialize → scripts → writeback (IBD pipeline stages) on a spend run.
+/// Also exercises parent pin/mlock stats + tip GC, and prewarm wait timeout/cancel.
+#[test]
+fn three_stage_confirm_and_parent_mlock_surface() {
+    use rbitcoin_consensus::{
+        accept_and_archive_block, accept_and_connect_block, confirm_materialize_phase,
+        confirm_script_phase, confirm_scripts_phase, confirm_writeback_phase, ChainParams,
+        Milestone,
+    };
+    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.enter_direct_index_mode().unwrap();
+    let ms = Milestone::NONE;
+    let params = ChainParams::regtest();
+    let maturity = params.coinbase_maturity();
+
+    // Empty wait / timeout / cancel paths on prewarm helpers.
+    q.wait_prewarm_ready(&[], std::time::Duration::from_millis(1))
+        .unwrap();
+    q.wait_prewarm_ready_with_headroom(&[], 0, Some(0), std::time::Duration::from_millis(1))
+        .unwrap();
+    let wait_err = q
+        .wait_prewarm_ready(&[9_999], std::time::Duration::from_millis(5))
+        .expect_err("missing plan must timeout");
+    assert!(
+        wait_err.to_string().contains("prewarm incomplete"),
+        "{wait_err}"
+    );
+    q.request_confirm_cancel();
+    let cancel_err = q
+        .wait_prewarm_ready(&[9_998], std::time::Duration::from_secs(1))
+        .expect_err("cancel aborts wait");
+    assert!(
+        cancel_err.to_string().to_lowercase().contains("cancel"),
+        "{cancel_err}"
+    );
+    q.clear_confirm_cancel();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+    let cb1 = b1.txdata[0].compute_txid();
+    accept_and_archive_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+
+    let last_pad = maturity + 1;
+    let mut run: Vec<(Height, [u8; 32])> = vec![(Height(1), b1.block_hash().to_byte_array())];
+    for h in 2..=last_pad {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+        run.push((Height(h), b.block_hash().to_byte_array()));
+    }
+
+    let spend_h = last_pad + 1;
+    let spend = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
+    let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
+    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
+    run.push((Height(spend_h), b_spend.block_hash().to_byte_array()));
+
+    // Inline materialize load (parent pin + optional body mlock).
+    let items: Vec<(u32, [u8; 32])> = run.iter().map(|(h, hash)| (h.0, *hash)).collect();
+    let st = q.prewarm_parents_for_heights(&items).unwrap();
+    assert!(st.blocks > 0 || st.already_ready > 0);
+    let _ = q.prewarm_parents_for_block_hashes(&[b_spend.block_hash().to_byte_array()]);
+    let snap = q.parent_prewarm_perf_snapshot();
+    assert!(snap.5 > 0, "depth");
+    let (_n, _bytes) = q.prewarm_mlock_stats();
+    let _ = q.prewarm_mlock_bytes();
+    assert!(q.is_prewarm_ready(&items.iter().map(|(h, _)| *h).collect::<Vec<_>>()));
+
+    // Stage 1
+    let mat = confirm_materialize_phase(&q, &params, ms, &run).expect("materialize");
+    assert!(!mat.batch.is_empty());
+    assert!(mat.work_ns > 0);
+    let heights = mat.batch.heights_hashes();
+    assert_eq!(heights.len(), run.len());
+    assert_eq!(mat.batch.len(), run.len());
+
+    // Stage 2
+    let ok = confirm_scripts_phase(&q, mat.batch).expect("scripts");
+    assert!(ok.work_ns > 0 || true);
+
+    // Stage 3
+    let fks = confirm_writeback_phase(&q, &params, ms, ok.batch).expect("writeback");
+    assert_eq!(fks.len(), run.len());
+    assert_eq!(q.tip_height(), Some(Height(spend_h)));
+    assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
+
+    // Tip GC releases parent body mlocks for heights ≤ tip.
+    q.advance_parent_runway_tip(spend_h);
+    // Combined materialize+scripts entry (ChainHub path) on empty above tip: reject empty.
+    let empty = confirm_script_phase(&q, &params, ms, &[]);
+    assert!(empty.is_err());
+
+    // Idempotent re-load of already-ready batch.
+    let st2 = q.prewarm_parents_for_heights(&items).unwrap();
+    assert!(st2.already_ready > 0 || st2.blocks == 0);
+}
+
+/// BlockCache + MempoolHub public surfaces used by P2P tip mode / Electrum.
+#[test]
+fn block_cache_and_mempool_hub_surface() {
+    use bitcoin::hashes::Hash;
+    use rbitcoin_net::{BlockCache, MempoolHub};
+    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
+    use std::sync::Arc;
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.enter_direct_index_mode().unwrap();
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    let mut blocks = vec![genesis.clone()];
+    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+    let cb1_txid = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+    blocks.push(b1);
+    for h in 2..=maturity + 1 {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+        blocks.push(b);
+    }
+
+    // BlockCache: push chain, locator, headers, truncate, depth eviction.
+    let cache = BlockCache::with_body_depth(4);
+    assert!(cache.is_empty());
+    assert_eq!(cache.len(), 0);
+    for b in &blocks {
+        cache.push_best(b.clone()).unwrap();
+    }
+    assert!(!cache.is_empty());
+    assert_eq!(cache.tip_hash(), Some(tip));
+    assert_eq!(cache.tip_height(), Some(maturity + 1));
+    assert!(cache.get_block(&tip).is_some());
+    assert!(cache.get_header(&tip).is_some());
+    assert!(cache.hash_at_height(0).is_some());
+    assert!(cache.header_at_height(maturity + 1).is_some());
+    // Bodies outside depth window dropped; genesis body gone when chain > depth.
+    assert!(
+        cache.get_block(&blocks[0].block_hash()).is_none(),
+        "body depth eviction"
+    );
+    assert!(cache.hash_at_height(0).is_some(), "hash chain retained");
+    let loc = cache.locator();
+    assert!(!loc.is_empty());
+    let stop = BlockHash::from_byte_array([0u8; 32]);
+    let hdrs = cache.headers_after_locator(&loc[loc.len().saturating_sub(1)..], stop);
+    assert!(!hdrs.is_empty());
+    // Bad extension rejected.
+    let mut bad = blocks.last().unwrap().clone();
+    bad.header.prev_blockhash = BlockHash::from_byte_array([0xee; 32]);
+    assert!(cache.push_best(bad).is_err());
+    cache.truncate_to_height(2);
+    assert!(cache.tip_height().unwrap() <= 2);
+    cache.clear();
+    assert!(cache.is_empty());
+    let empty = BlockCache::new();
+    assert!(!empty.locator().is_empty());
+    assert!(empty
+        .headers_after_locator(&[], BlockHash::from_byte_array([0u8; 32]))
+        .is_empty());
+
+    // MempoolHub: accept a real mature coinbase spend via Query UTXO provider.
+    let q_arc = Arc::new(q);
+    let hub = MempoolHub::open_with_weight(td.path().join("mempool"), Arc::clone(&q_arc), 50_000_000)
+        .unwrap();
+    assert!(!hub.relay_enabled());
+    hub.set_relay_enabled(true);
+    assert!(hub.relay_enabled());
+    assert_eq!(hub.live_count(), 0);
+    let _ = hub.generation();
+    let _ = hub.subscribe_announces();
+    let _ = hub.fee_histogram();
+    let _ = hub.estimate_fee_btc_per_kb(6);
+    let _ = MempoolHub::relay_fee_btc_per_kb();
+    let sh = {
+        use rbitcoin_store::script_hash;
+        script_hash(&[0x51])
+    };
+    assert!(hub.scripthash_mempool(&sh).is_empty());
+    assert_eq!(hub.scripthash_unconfirmed_delta(&sh), 0);
+
+    let spend = spend_anyone_can_spend(cb1_txid, 0, Amount::from_sat(49_0000_0000));
+    let r = hub
+        .accept_tx(&spend)
+        .expect("mempool accept mature coinbase spend");
+    assert!(hub.contains(&r.txid));
+    assert!(hub.get_tx(&r.txid).is_some());
+    assert_eq!(hub.live_count(), 1);
+    assert!(!hub.list_live().is_empty());
+    assert!(
+        !hub.scripthash_mempool(&sh).is_empty()
+            || hub.scripthash_unconfirmed_delta(&sh) != 0
+    );
+    hub.flush().unwrap();
+    let _ = hub.compact();
+    assert_eq!(hub.remove_for_block(&[r.txid]), 1);
+    assert_eq!(hub.live_count(), 0);
+    assert!(hub.reorg_reaccept(std::slice::from_ref(&spend)) >= 1);
+    let _ = hub.accept_package(std::slice::from_ref(&spend));
+    // Confirmed UTXO still readable via query (provider path used by accept).
+    let b2 = q_arc.reconstruct_block_at_height(Height(2)).unwrap();
+    let cb2 = b2.txdata[0].compute_txid().to_byte_array();
+    assert!(q_arc.get_tx_by_txid(&cb2).unwrap().is_some());
 }

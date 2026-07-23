@@ -61,7 +61,9 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 
 | ID | Layer | Description |
 |----|-------|-------------|
-| `node_cli_and_surface_smoke` | Lifecycle/CLI | Networks, config errors, CLI flags, params, net surface |
+| `node_cli_and_surface_smoke` | Lifecycle/CLI | Networks, config errors, CLI flags (incl. log-level/mempool/electrum/inhibit), params, net surface |
+| `three_stage_confirm_and_parent_mlock_surface` | Consensus+query | Split materialize→scripts→writeback; parent pin/mlock; prewarm wait timeout/cancel |
+| `block_cache_and_mempool_hub_surface` | Net | BlockCache locator/eviction + MempoolHub accept/remove/reorg on mature chain |
 | `store_error_and_corrupt_paths` | Store | Error/corrupt surfaces |
 | `store_table_header_and_idx_corrupt` | Store | Table header/head corrupt open |
 | `chain_connect_reorg_and_growth` | Query | Synthetic growth + disconnect (rehash) |
@@ -73,6 +75,7 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `scripthash_index_history_balance_and_reorg` | Query | Electrum index + reorg spend clear |
 | `wire_ring_and_archive_epoch` | Wire/epoch | Multi-tip ring + finalize soft zone |
 | `electrum_server_version_history_balance` | Electrum | Protocol fixture: version, history, balance, headers |
+| `electrum_more_methods_and_errors` | Electrum | ping/features/block headers/listunspent/tx get+merkle/fees + error paths |
 | `two_node_header_and_block_sync` | P2P | Seeder → peer |
 | `serve_after_restart_via_reconstruct` | P2P | Cold serve via reconstruct |
 | `three_node_relay_path` | P2P | Hop serve |

@@ -9,6 +9,7 @@ mod run;
 pub use cli::cli_main;
 pub use config::NodeConfig;
 pub use error::NodeError;
+pub use inhibit::SuspendInhibit;
 pub use run::{run_node, run_p2p, NodeHandle};
 
 pub fn crate_name() -> &'static str {

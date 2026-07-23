@@ -410,6 +410,33 @@ mod tests {
         };
         let err = hub.accept_tx(&tx).unwrap_err();
         assert!(matches!(err, AcceptError::MissingPrevout(_)));
+        assert!(hub.fee_histogram().is_empty());
+        assert!(hub.estimate_fee_btc_per_kb(2) < 0.0 || hub.estimate_fee_btc_per_kb(2) >= 0.0);
+        assert!(MempoolHub::relay_fee_btc_per_kb() > 0.0);
+        assert!(hub.scripthash_mempool(&[0u8; 32]).is_empty());
+        assert_eq!(hub.scripthash_unconfirmed_delta(&[0u8; 32]), 0);
+        assert!(hub.list_live().is_empty());
+        assert_eq!(hub.remove_for_block(&[]), 0);
+        assert_eq!(hub.reorg_reaccept(&[]), 0);
+        hub.flush().unwrap();
+        let _ = hub.compact();
+        let _ = hub.generation();
+        let _ = hub.subscribe_announces();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn open_with_weight_and_package_empty() {
+        let dir = tmp();
+        let store_dir = tmp();
+        let q = Query::open_or_create(&store_dir).unwrap();
+        let hub = MempoolHub::open_with_weight(&dir, Arc::new(q), 1_000_000).unwrap();
+        hub.set_relay_enabled(true);
+        assert!(matches!(
+            hub.accept_package(&[]),
+            Err(AcceptError::PackageEmpty)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }

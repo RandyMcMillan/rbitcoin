@@ -7,16 +7,22 @@
 //! Record length is derived from the index: `len(i) = start(i+1) - start(i)`,
 //! and for the last record `logical_body_end - start`. No per-record `u32`
 //! frame (eliminates double-length encoding when payloads are self-describing).
+//!
+//! # Publish order (lock-free)
+//!
+//! Single appender: **body bytes → idx slots → `count` Release**. Readers load
+//! `count` with Acquire and only observe complete records.
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct VarTable {
     body: TableFile,
     idx: TableFile,
-    count: std::sync::Mutex<u64>,
+    count: AtomicU64,
 }
 
 impl VarTable {
@@ -26,7 +32,7 @@ impl VarTable {
         Ok(Self {
             body,
             idx,
-            count: std::sync::Mutex::new(0),
+            count: AtomicU64::new(0),
         })
     }
 
@@ -41,7 +47,7 @@ impl VarTable {
         Ok(Self {
             body,
             idx,
-            count: std::sync::Mutex::new(count),
+            count: AtomicU64::new(count),
         })
     }
 
@@ -54,7 +60,7 @@ impl VarTable {
     }
 
     pub fn count(&self) -> u64 {
-        *self.count.lock().unwrap()
+        self.count.load(Ordering::Acquire)
     }
 
     /// Current body logical length (including file header).
@@ -71,7 +77,7 @@ impl VarTable {
     /// Absolute `(offset, len)` of the unframed payload for `fk`.
     pub fn record_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
-        let count = *self.count.lock().unwrap();
+        let count = self.count.load(Ordering::Acquire);
         let start = self.record_start(id, count)?;
         let end = self.record_end(id, count)?;
         if end < start {
@@ -145,9 +151,8 @@ impl VarTable {
 
     /// Encode `n` records into one body blob then one write.
     ///
-    /// Encoding runs **outside** the count lock (caller is the exclusive writer);
-    /// only the short append+idx update is locked. `encode(i, buf)` appends the
-    /// **unframed** payload for record `i`. Length comes from idx deltas on read.
+    /// Encoding runs outside any count barrier (single appender role). Publish
+    /// order: body → idx → `count` Release.
     pub fn put_batch_encode(
         &self,
         n: usize,
@@ -157,13 +162,8 @@ impl VarTable {
         if n == 0 {
             return Ok(Vec::new());
         }
-        let (start, base_count) = {
-            let count = self.count.lock().unwrap();
-            (
-                self.body.logical_len().max(FILE_HEADER_LEN as u64),
-                *count,
-            )
-        };
+        let base_count = self.count.load(Ordering::Acquire);
+        let start = self.body.logical_len().max(FILE_HEADER_LEN as u64);
         let mut body_blob = Vec::with_capacity(estimate_bytes);
         let mut idx_blob = Vec::with_capacity(n * 8);
         let mut fks = Vec::with_capacity(n);
@@ -175,15 +175,16 @@ impl VarTable {
             encode(i, &mut body_blob);
             cursor += (body_blob.len() - before) as u64;
         }
-        let mut count = self.count.lock().unwrap();
-        debug_assert_eq!(*count, base_count);
-        if *count != base_count {
+        // Single appender: count must still equal base.
+        if self.count.load(Ordering::Acquire) != base_count {
             return Err(StoreError::Corrupt("var put_batch_encode race"));
         }
         self.body.write_at(start, &body_blob)?;
-        let off_pos = FILE_HEADER_LEN as u64 + (*count) * 8;
+        let off_pos = FILE_HEADER_LEN as u64 + base_count * 8;
         self.idx.write_at(off_pos, &idx_blob)?;
-        *count += n as u64;
+        // Publish complete records.
+        self.count
+            .store(base_count + n as u64, Ordering::Release);
         Ok(fks)
     }
 
@@ -210,7 +211,7 @@ impl VarTable {
     /// Raw unframed payload for `fk`.
     pub fn get_raw(&self, fk: Fk) -> Result<Vec<u8>, StoreError> {
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
-        let count = *self.count.lock().unwrap();
+        let count = self.count.load(Ordering::Acquire);
         let start = self.record_start(id, count)?;
         let end = self.record_end(id, count)?;
         if end < start {
@@ -235,5 +236,67 @@ impl VarTable {
         self.body.flush_async()?;
         self.idx.flush_async()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rbitcoin_primitives::TableKind;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    #[test]
+    fn put_batch_publish_visible_to_concurrent_readers() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, AtomicOrdering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rbitcoin-var-pub-{id}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = Arc::new(VarTable::create(&dir, "tx", TableKind::Tx).unwrap());
+
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+
+        {
+            let t = Arc::clone(&t);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for batch in 0..50u8 {
+                    let payload = vec![batch; 128];
+                    t.put_batch_encode(4, 512, |_i, buf| {
+                        buf.extend_from_slice(&payload);
+                    })
+                    .unwrap();
+                }
+            }));
+        }
+
+        for _ in 0..3 {
+            let t = Arc::clone(&t);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..2000 {
+                    let c = t.count();
+                    if c == 0 {
+                        continue;
+                    }
+                    // Every published fk must fully decode as raw of expected size.
+                    let fk = Fk(c); // last published
+                    let raw = t.get_raw(fk).unwrap();
+                    assert_eq!(raw.len(), 128);
+                    assert!(raw.iter().all(|&b| b == raw[0]));
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(t.count(), 200);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

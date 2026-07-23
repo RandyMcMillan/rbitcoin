@@ -97,7 +97,7 @@ impl ConfirmedTable {
 /// height 0 is representable). Schema v9: 4 B slots (was u64).
 pub struct TxHeightTable {
     file: crate::file::TableFile,
-    len: std::sync::Mutex<u64>,
+    len: std::sync::atomic::AtomicU64,
 }
 
 const TX_HEIGHT_ELEM: u64 = 4;
@@ -108,7 +108,7 @@ impl TxHeightTable {
             crate::file::TableFile::create(dir.join("tx_height.body"), TableKind::TxHeight)?;
         Ok(Self {
             file,
-            len: std::sync::Mutex::new(0),
+            len: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -122,7 +122,7 @@ impl TxHeightTable {
         }
         Ok(Self {
             file,
-            len: std::sync::Mutex::new(body / TX_HEIGHT_ELEM),
+            len: std::sync::atomic::AtomicU64::new(body / TX_HEIGHT_ELEM),
         })
     }
 
@@ -131,7 +131,8 @@ impl TxHeightTable {
     }
 
     fn get_slot(&self, index: u64) -> Result<u32, StoreError> {
-        let len = *self.len.lock().unwrap();
+        use std::sync::atomic::Ordering;
+        let len = self.len.load(Ordering::Acquire);
         if index >= len {
             return Ok(0);
         }
@@ -141,15 +142,15 @@ impl TxHeightTable {
     }
 
     fn set_slot(&self, index: u64, value: u32) -> Result<(), StoreError> {
-        let mut len = self.len.lock().unwrap();
-        if index >= *len {
-            // Extend with zeros up to index inclusive.
+        use std::sync::atomic::Ordering;
+        let len = self.len.load(Ordering::Acquire);
+        if index >= len {
             let need = index + 1;
-            let start = *len;
+            let start = len;
             if need > start {
                 let zeros = vec![0u8; ((need - start) as usize) * 4];
                 self.file.write_at(Self::offset(start), &zeros)?;
-                *len = need;
+                self.len.store(need, Ordering::Release);
             }
         }
         self.file
@@ -158,17 +159,17 @@ impl TxHeightTable {
     }
 
     fn fill_range(&self, start: u64, count: u64, value: u32) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
         if count == 0 {
             return Ok(());
         }
         let end = start.saturating_add(count);
-        let mut len = self.len.lock().unwrap();
-        if end > *len {
-            let zeros = vec![0u8; ((end - *len) as usize) * 4];
-            self.file.write_at(Self::offset(*len), &zeros)?;
-            *len = end;
+        let len = self.len.load(Ordering::Acquire);
+        if end > len {
+            let zeros = vec![0u8; ((end - len) as usize) * 4];
+            self.file.write_at(Self::offset(len), &zeros)?;
+            self.len.store(end, Ordering::Release);
         }
-        drop(len);
         let word = value.to_le_bytes();
         // Chunked fill.
         const CHUNK: usize = 4096;
@@ -222,7 +223,7 @@ impl TxHeightTable {
 
     /// Number of allocated slots (covers tx fks `1..=len`).
     pub fn len(&self) -> u64 {
-        *self.len.lock().unwrap()
+        self.len.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Zero `count` consecutive height slots starting at `first_tx_fk` (disconnect/repair).
@@ -293,14 +294,14 @@ impl TxHeightTable {
 pub struct StrongTxTable {
     bits: crate::file::TableFile,
     /// Number of bits allocated (covers tx fks 1..=n_bits).
-    n_bits: std::sync::Mutex<u64>,
+    n_bits: std::sync::atomic::AtomicU64,
 }
 
 impl StrongTxTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
             bits: crate::file::TableFile::create(dir.join("strong_tx.body"), TableKind::StrongTx)?,
-            n_bits: std::sync::Mutex::new(0),
+            n_bits: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -311,7 +312,7 @@ impl StrongTxTable {
             .saturating_sub(crate::file::FILE_HEADER_LEN as u64);
         Ok(Self {
             bits,
-            n_bits: std::sync::Mutex::new(body.saturating_mul(8)),
+            n_bits: std::sync::atomic::AtomicU64::new(body.saturating_mul(8)),
         })
     }
 
@@ -320,12 +321,13 @@ impl StrongTxTable {
     }
 
     fn ensure_bits(&self, need_bits: u64) -> Result<(), StoreError> {
-        let mut n = self.n_bits.lock().unwrap();
-        if need_bits <= *n {
+        use std::sync::atomic::Ordering;
+        let n = self.n_bits.load(Ordering::Acquire);
+        if need_bits <= n {
             return Ok(());
         }
         let need_bytes = (need_bits + 7) / 8;
-        let cur_bytes = (*n + 7) / 8;
+        let cur_bytes = (n + 7) / 8;
         if need_bytes > cur_bytes {
             let zeros = vec![0u8; (need_bytes - cur_bytes) as usize];
             self.bits.write_at(
@@ -333,12 +335,13 @@ impl StrongTxTable {
                 &zeros,
             )?;
         }
-        *n = need_bits;
+        self.n_bits.store(need_bits, Ordering::Release);
         Ok(())
     }
 
     fn get_bit(&self, bit: u64) -> Result<bool, StoreError> {
-        let n = *self.n_bits.lock().unwrap();
+        use std::sync::atomic::Ordering;
+        let n = self.n_bits.load(Ordering::Acquire);
         if bit >= n {
             return Ok(false);
         }
@@ -452,7 +455,7 @@ impl StrongTxTable {
 
     pub fn set_unstrong(&self, tx_fk: Fk) -> Result<(), StoreError> {
         let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
-        let n = *self.n_bits.lock().unwrap();
+        let n = self.n_bits.load(std::sync::atomic::Ordering::Acquire);
         if id - 1 >= n {
             return Ok(());
         }
@@ -467,7 +470,7 @@ impl StrongTxTable {
         }
         let start = id - 1;
         let end = start + u64::from(count);
-        let n = *self.n_bits.lock().unwrap();
+        let n = self.n_bits.load(std::sync::atomic::Ordering::Acquire);
         if start >= n {
             return Ok(());
         }

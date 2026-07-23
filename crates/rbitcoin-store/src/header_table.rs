@@ -49,7 +49,7 @@ impl HeaderRecord {
 pub struct HeaderTable {
     body: TableFile,
     head: ShardedHashHead,
-    count: std::sync::Mutex<u64>,
+    count: std::sync::atomic::AtomicU64,
 }
 
 impl HeaderTable {
@@ -62,7 +62,7 @@ impl HeaderTable {
         Ok(Self {
             body,
             head,
-            count: std::sync::Mutex::new(0),
+            count: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -80,27 +80,28 @@ impl HeaderTable {
         Ok(Self {
             body,
             head,
-            count: std::sync::Mutex::new(count),
+            count: std::sync::atomic::AtomicU64::new(count),
         })
     }
 
     /// Append header and publish into the hash head. Returns new FK.
     pub fn put(&self, rec: &HeaderRecord) -> Result<Fk, StoreError> {
-        let mut count = self.count.lock().unwrap();
-        let fk = Fk(*count + 1);
-        let offset = FILE_HEADER_LEN as u64 + (*count) * HEADER_RECORD_LEN as u64;
+        use std::sync::atomic::Ordering;
+        // Single appender: body → count → head (allocate-then-publish).
+        let base = self.count.load(Ordering::Acquire);
+        let fk = Fk(base + 1);
+        let offset = FILE_HEADER_LEN as u64 + base * HEADER_RECORD_LEN as u64;
         let bytes = rec.encode();
-        // Allocate body first, then publish head (allocate-then-publish).
         self.body.write_at(offset, &bytes)?;
-        // Advance logical length if needed is handled by write_at.
-        *count += 1;
+        self.count.store(base + 1, Ordering::Release);
         self.head.insert(&rec.hash, fk)?;
         Ok(fk)
     }
 
     pub fn get(&self, fk: Fk) -> Result<HeaderRecord, StoreError> {
+        use std::sync::atomic::Ordering;
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
-        let count = *self.count.lock().unwrap();
+        let count = self.count.load(Ordering::Acquire);
         if id == 0 || id > count {
             return Err(StoreError::NotFound);
         }
@@ -156,7 +157,7 @@ impl HeaderTable {
 
     /// Number of header rows currently stored (highest fk = this value).
     pub fn count(&self) -> u64 {
-        *self.count.lock().unwrap()
+        self.count.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {

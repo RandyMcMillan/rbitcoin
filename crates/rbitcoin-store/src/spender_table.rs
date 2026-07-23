@@ -9,13 +9,13 @@ use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const SPENDER_RECORD_LEN: usize = 16;
 
 pub struct SpenderTable {
     body: TableFile,
-    count: Mutex<u64>,
+    count: AtomicU64,
 }
 
 impl SpenderTable {
@@ -23,7 +23,7 @@ impl SpenderTable {
         let body = TableFile::create(dir.join("spenders.body"), TableKind::Spender)?;
         Ok(Self {
             body,
-            count: Mutex::new(0),
+            count: AtomicU64::new(0),
         })
     }
 
@@ -40,12 +40,12 @@ impl SpenderTable {
         let count = body_len / SPENDER_RECORD_LEN as u64;
         Ok(Self {
             body,
-            count: Mutex::new(count),
+            count: AtomicU64::new(count),
         })
     }
 
     pub fn count(&self) -> u64 {
-        *self.count.lock().unwrap()
+        self.count.load(Ordering::Acquire)
     }
 
     fn offset(id: u64) -> u64 {
@@ -57,19 +57,19 @@ impl SpenderTable {
         if spending_tx_fk.is_null() {
             return Err(StoreError::InvalidFk);
         }
-        let mut count = self.count.lock().unwrap();
-        let id = *count + 1;
+        // Single annotator role: load → write → publish count.
+        let id = self.count.load(Ordering::Acquire) + 1;
         let mut buf = [0u8; SPENDER_RECORD_LEN];
         buf[0..8].copy_from_slice(&spending_tx_fk.0.to_le_bytes());
         buf[8..16].copy_from_slice(&next.0.to_le_bytes());
         self.body.write_at(Self::offset(id), &buf)?;
-        *count = id;
+        self.count.store(id, Ordering::Release);
         Ok(Fk(id))
     }
 
     pub fn get(&self, fk: Fk) -> Result<(Fk, Fk), StoreError> {
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
-        let count = *self.count.lock().unwrap();
+        let count = self.count.load(Ordering::Acquire);
         if id == 0 || id > count {
             return Err(StoreError::NotFound);
         }

@@ -34,10 +34,21 @@ Prep never holds store write locks. The writer is the sole Class A producer for 
 Do not enter Tip until tip ≈ peer height. Tip entry only bulk-materializes SH
 (runs → durable tables); it does **not** rebuild `tx.head` or spend annotations.
 
-## Locks
+## Locks (exceptions only)
 
-- Store tables use fine-grained `Mutex`es per file/head (see `rbitcoin-store`).
-- `ChainHub::confirmed` is `RwLock<HashSet>` for O(1) `has_block` during IBD.
+**Default is lock-free** on table hot paths (see `AGENTS.md`):
+
+| Mechanism | What it replaces |
+|-----------|------------------|
+| Map **epochs** (`TableFile`) | No map `Mutex` on read/write/mlock; capacity = new mmap window + pointer swap |
+| Atomic `count` / HWM | Publish barrier (Acquire readers / Release appender) |
+| Role exclusivity | One appender, one annotator — not a global store mutex |
+| `tx.head` resize swap | Brief exclusive catch-up + rename (shadow fill is unlocked) |
+| Process `rehash_gate` | Rare multi‑GiB open-hash rehash (host freeze prevention) |
+| `ChainHub::confirmed` | `RwLock<HashSet>` for O(1) `has_block` (IBD assign path) |
+
+There is **no** global “pause queries during confirm write.” Tip-as-commit +
+`is_confirmed_strong` define query visibility ([`crash-recovery.md`](./crash-recovery.md)).
 
 ## Practical rules
 

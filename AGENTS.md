@@ -1,5 +1,21 @@
 # Agent notes
 
+## Store concurrency: lock-free by default
+
+**Default: no locks on the store hot path.** Concurrency is **roles + publish
+order + map epochs**, not `Mutex` around mmap.
+
+| Rule | Detail |
+|------|--------|
+| Roles | At most **one Class A appender** and **one spend annotator** per process; **N readers** of published ranges always free |
+| Publish | body → idx → count/HWM (Release); then head / `header_txs` as visibility requires |
+| Capacity grow | fallocate + map a **new epoch** on the same file; swap pointer; old epoch lives until pins drop (readers never pause). Same *spirit* as online `tx.head` shadow fill + brief final swap |
+| Layout grow (`tx.head`) | shadow fill unlocked; exclusive **only** at final catch-up + rename + head swap |
+| Not OK | Long-held map mutexes, “pause all queries during confirm”, multi appenders, dual-write to head shadow on every insert |
+
+If a change introduces a new long-held store lock on the IBD/read path, it is the
+wrong design — fix the protocol. See `docs/concurrency.md`.
+
 ## Commit + release build after code changes
 
 Whenever a turn **changes code** (or you finish a multi-step coding task in that turn):

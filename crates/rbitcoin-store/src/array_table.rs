@@ -1,17 +1,20 @@
 //! Growable dense array of little-endian `u64` values.
 //!
 //! 0-based indexing. Used for Class C: confirmed[height], header_txs arrays, etc.
+//!
+//! Length is an atomic publish barrier: slots `0..len` are complete.
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use rbitcoin_primitives::TableKind;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const ELEM: u64 = 8;
 
 pub struct ArrayTable {
     file: TableFile,
-    len: std::sync::Mutex<u64>,
+    len: AtomicU64,
 }
 
 impl ArrayTable {
@@ -19,7 +22,7 @@ impl ArrayTable {
         let file = TableFile::create(path.as_ref(), kind)?;
         Ok(Self {
             file,
-            len: std::sync::Mutex::new(0),
+            len: AtomicU64::new(0),
         })
     }
 
@@ -31,12 +34,12 @@ impl ArrayTable {
         }
         Ok(Self {
             file,
-            len: std::sync::Mutex::new(body / ELEM),
+            len: AtomicU64::new(body / ELEM),
         })
     }
 
     pub fn len(&self) -> u64 {
-        *self.len.lock().unwrap()
+        self.len.load(Ordering::Acquire)
     }
 
     fn offset(index: u64) -> u64 {
@@ -44,7 +47,7 @@ impl ArrayTable {
     }
 
     pub fn get(&self, index: u64) -> Result<u64, StoreError> {
-        let len = *self.len.lock().unwrap();
+        let len = self.len.load(Ordering::Acquire);
         if index >= len {
             return Ok(0);
         }
@@ -55,15 +58,14 @@ impl ArrayTable {
 
     /// Set value at `index`, growing with zero-fill if needed.
     pub fn set(&self, index: u64, value: u64) -> Result<(), StoreError> {
-        let mut len = self.len.lock().unwrap();
-        if index >= *len {
-            for i in *len..index {
+        let len = self.len.load(Ordering::Acquire);
+        if index >= len {
+            for i in len..index {
                 self.file.write_at(Self::offset(i), &0u64.to_le_bytes())?;
             }
-            *len = index + 1;
-            // ensure slot index exists
             self.file
                 .write_at(Self::offset(index), &value.to_le_bytes())?;
+            self.len.store(index + 1, Ordering::Release);
         } else {
             self.file
                 .write_at(Self::offset(index), &value.to_le_bytes())?;
@@ -78,13 +80,12 @@ impl ArrayTable {
             return Ok(());
         }
         let max_idx = pairs.iter().map(|(i, _)| *i).max().unwrap();
-        let mut len = self.len.lock().unwrap();
-        if max_idx >= *len {
+        let len = self.len.load(Ordering::Acquire);
+        if max_idx >= len {
             let new_len = max_idx + 1;
-            let gap = new_len - *len;
-            // One zero blob for the extension (may be large on first use).
-            const CHUNK: usize = 1024 * 1024; // 1 MiB of zeros = 128k slots
-            let mut offset = Self::offset(*len);
+            let gap = new_len - len;
+            const CHUNK: usize = 1024 * 1024;
+            let mut offset = Self::offset(len);
             let mut remaining = gap * ELEM;
             let zeros = vec![0u8; CHUNK];
             while remaining > 0 {
@@ -93,9 +94,8 @@ impl ArrayTable {
                 offset += n as u64;
                 remaining -= n as u64;
             }
-            *len = new_len;
+            self.len.store(new_len, Ordering::Release);
         }
-        drop(len);
         for &(index, value) in pairs {
             self.file
                 .write_at(Self::offset(index), &value.to_le_bytes())?;
@@ -105,11 +105,11 @@ impl ArrayTable {
 
     /// Shrink to `new_len` slots (tip disconnect).
     pub fn truncate(&self, new_len: u64) -> Result<(), StoreError> {
-        let mut len = self.len.lock().unwrap();
-        if new_len > *len {
+        let len = self.len.load(Ordering::Acquire);
+        if new_len > len {
             return Err(StoreError::Corrupt("array truncate grows"));
         }
-        *len = new_len;
+        self.len.store(new_len, Ordering::Release);
         let logical = FILE_HEADER_LEN as u64 + new_len * ELEM;
         self.file.set_logical_len(logical)?;
         Ok(())
@@ -125,7 +125,7 @@ impl ArrayTable {
             return Ok((0, 0));
         }
         let off = Self::offset(start_index);
-        let len = count.saturating_mul(ELEM);
+        let len = count * ELEM;
         self.file.mlock_range(off, len)
     }
 

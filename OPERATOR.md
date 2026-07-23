@@ -46,7 +46,7 @@ Default: **info**. CLI wins over env.
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
 | Parent body mlock (write annotate) | **off** | `RBITCOIN_CONFIRM_MLOCK=1` to enable (IBD: same tip with/without) |
 | Parent pin keep-alive grace | **256** heights past last known need | `RBITCOIN_CONFIRM_PIN_KEEP_GRACE` (`0` = need+1 only) |
-| Bulk store IO | **io_uring** (Linux) | Head resolve + confirm bodies (**pread**); archive `tx.head` insert (**pread probe + pwrite**). `RBITCOIN_IO_URING=0` → pread/pwrite fallback; `RBITCOIN_BULK_IO_WORKERS` for pread fallback parallelism |
+| Bulk store reads | **io_uring** (Linux) | Head resolve + confirm bodies (**pread**). Archive `tx.head` insert stays **mmap** (uring pwrite measured slower). `RBITCOIN_IO_URING=0` → pread fallback; `RBITCOIN_BULK_IO_WORKERS` for fallback parallelism |
 | Confirm stages | **load · scripts · write** | Pipeline queues cap **2** each (`conf_q load=n/2 write=m/2`; `name<0/cap` when the next worker is waiting on an empty queue) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 | Inhibit auto-suspend | **off** | `--inhibit-suspend` (uses `systemd-inhibit` if available) |

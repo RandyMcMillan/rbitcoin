@@ -548,7 +548,8 @@ pub(crate) fn spawn_archive_pipeline(
         // Tokio → prep: raw jobs (priority jumps far).
         let (pri_job_tx, pri_job_rx) = std::sync::mpsc::sync_channel::<ArchiveJob>(PRI_Q);
         let (far_job_tx, far_job_rx) = std::sync::mpsc::sync_channel::<ArchiveJob>(JOB_Q);
-        // Prep → writer: one in-flight plan (writer ack before next plan).
+        // Prep → writer: capacity 1 + blocking ack after every send (single-flight).
+        // Must not leave prep with "in flight" while writer is idle (silent stall).
         let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<WriteReadyBatch>(1);
         let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(1);
 
@@ -659,8 +660,6 @@ pub(crate) fn spawn_archive_pipeline(
                 let mut far_open = true;
                 let mut park = ContigPark::new(prep_next.load(Ordering::Relaxed));
                 let park_horizon = super::CONTIG_DENSIFY_AHEAD;
-                let mut write_in_flight = false;
-
                 /// Emit Dropped / Err for park insert edge cases.
                 fn handle_park_edge(
                     ins: ParkInsert,
@@ -668,7 +667,6 @@ pub(crate) fn spawn_archive_pipeline(
                     hub: &ChainHub,
                     write_tx: &std::sync::mpsc::SyncSender<WriteReadyBatch>,
                     ack_rx: &std::sync::mpsc::Receiver<()>,
-                    write_in_flight: &mut bool,
                     stats: &ArchivePipelineStats,
                     params: &rbitcoin_consensus::ChainParams,
                 ) -> bool {
@@ -690,22 +688,37 @@ pub(crate) fn spawn_archive_pipeline(
                             .is_ok(),
                         ParkInsert::Late(late) => {
                             // Already past HWM: plan+commit single without ContigPark.
-                            plan_and_send_jobs(
-                                std::slice::from_ref(&late),
-                                hub,
-                                params,
-                                stats,
-                                write_tx,
-                                ack_rx,
-                                write_in_flight,
-                                result_tx,
-                                /*advance_write_next*/ false,
-                                None,
+                            !matches!(
+                                plan_and_send_jobs(
+                                    std::slice::from_ref(&late),
+                                    hub,
+                                    params,
+                                    stats,
+                                    write_tx,
+                                    ack_rx,
+                                    result_tx,
+                                ),
+                                PlanSend::WriterDead
                             )
                         }
                     }
                 }
 
+                /// Outcome of plan+blocking commit.
+                enum PlanSend {
+                    /// Commit finished (or empty batch / already archived Ok path).
+                    Done,
+                    /// Structure/plan failed; caller should rewind ContigPark HWM.
+                    FailedRewind,
+                    /// Writer channel dead.
+                    WriterDead,
+                }
+
+                /// Structure decode + FK plan (reads), then **blocking** write+ack.
+                ///
+                /// Single-flight: does not return until the writer has finished
+                /// commit (or failed). That keeps planned create fks aligned with
+                /// `txs.count()` and prevents prep/writer desync stalls.
                 fn plan_and_send_jobs(
                     jobs: &[ArchiveJob],
                     hub: &ChainHub,
@@ -713,20 +726,10 @@ pub(crate) fn spawn_archive_pipeline(
                     stats: &ArchivePipelineStats,
                     write_tx: &std::sync::mpsc::SyncSender<WriteReadyBatch>,
                     ack_rx: &std::sync::mpsc::Receiver<()>,
-                    write_in_flight: &mut bool,
                     result_tx: &mpsc::UnboundedSender<ArchiveResult>,
-                    _advance_write_next: bool,
-                    write_next: Option<&AtomicU32>,
-                ) -> bool {
+                ) -> PlanSend {
                     if jobs.is_empty() {
-                        return true;
-                    }
-                    // Wait for previous commit so planned fks match body HWM.
-                    if *write_in_flight {
-                        match ack_rx.recv() {
-                            Ok(()) => *write_in_flight = false,
-                            Err(_) => return false,
-                        }
+                        return PlanSend::Done;
                     }
 
                     let prep_t0 = Instant::now();
@@ -744,15 +747,14 @@ pub(crate) fn spawn_archive_pipeline(
                             }
                             Err(e) => {
                                 let err = e.to_string();
-                                for (h, wb) in outcomes {
+                                for (h, wb) in &outcomes {
                                     let _ = result_tx.send(ArchiveResult::Err {
-                                        hash: h,
+                                        hash: *h,
                                         err: err.clone(),
-                                        wire_bytes: wb,
+                                        wire_bytes: *wb,
                                     });
                                 }
-                                // Remaining jobs not in outcomes yet — fail them too.
-                                return true;
+                                return PlanSend::FailedRewind;
                             }
                         }
                     }
@@ -772,40 +774,41 @@ pub(crate) fn spawn_archive_pipeline(
                                     Ok(p) => p,
                                     Err(e) => {
                                         let err = e.to_string();
-                                        for (h, wb) in outcomes {
+                                        for (h, wb) in &outcomes {
                                             let _ = result_tx.send(ArchiveResult::Err {
-                                                hash: h,
+                                                hash: *h,
                                                 err: err.clone(),
-                                                wire_bytes: wb,
+                                                wire_bytes: *wb,
                                             });
                                         }
-                                        return true;
+                                        return PlanSend::FailedRewind;
                                     }
                                 }
                             }
                         }
                         Err(e) => {
                             let err = e.to_string();
-                            for (h, wb) in outcomes {
+                            for (h, wb) in &outcomes {
                                 let _ = result_tx.send(ArchiveResult::Err {
-                                    hash: h,
+                                    hash: *h,
                                     err: err.clone(),
-                                    wire_bytes: wb,
+                                    wire_bytes: *wb,
                                 });
                             }
-                            return true;
+                            return PlanSend::FailedRewind;
                         }
                     };
 
-                    // If plan is empty, still need Ok results (already archived).
-                    // Send through writer for uniform result path + ack sequencing.
+                    // Empty plan still goes through writer so Ok results + ack stay ordered.
                     let batch = WriteReadyBatch { outcomes, plan };
                     if write_tx.send(batch).is_err() {
-                        return false;
+                        return PlanSend::WriterDead;
                     }
-                    *write_in_flight = true;
-                    let _ = write_next;
-                    true
+                    // Block until commit finishes — never leave "in flight" dangling.
+                    match ack_rx.recv() {
+                        Ok(()) => PlanSend::Done,
+                        Err(_) => PlanSend::WriterDead,
+                    }
                 }
 
                 loop {
@@ -821,7 +824,7 @@ pub(crate) fn spawn_archive_pipeline(
                         }
                         break;
                     }
-                    if !pri_open && !far_open && park.parked_len() == 0 && !write_in_flight {
+                    if !pri_open && !far_open && park.parked_len() == 0 {
                         break;
                     }
 
@@ -871,7 +874,6 @@ pub(crate) fn spawn_archive_pipeline(
                             &prep_hub,
                             &write_tx,
                             &ack_rx,
-                            &mut write_in_flight,
                             &prep_stats,
                             &prep_params,
                         ) {
@@ -891,7 +893,6 @@ pub(crate) fn spawn_archive_pipeline(
                                 &prep_hub,
                                 &write_tx,
                                 &ack_rx,
-                                &mut write_in_flight,
                                 &prep_stats,
                                 &prep_params,
                             ) {
@@ -907,7 +908,6 @@ pub(crate) fn spawn_archive_pipeline(
                                 &prep_hub,
                                 &write_tx,
                                 &ack_rx,
-                                &mut write_in_flight,
                                 &prep_stats,
                                 &prep_params,
                             ) {
@@ -917,15 +917,6 @@ pub(crate) fn spawn_archive_pipeline(
                         }
                         if !got {
                             break;
-                        }
-                    }
-
-                    // Collect write ack without blocking park.
-                    if write_in_flight {
-                        match ack_rx.try_recv() {
-                            Ok(()) => write_in_flight = false,
-                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
                         }
                     }
 
@@ -971,7 +962,7 @@ pub(crate) fn spawn_archive_pipeline(
                     }
 
                     // Coalesce wait for larger contiguous quanta.
-                    if !write_in_flight && ready > 0 && ready < min_batch {
+                    if ready > 0 && ready < min_batch {
                         let wait = coalesce_wait(ready, 0, prep_arch_q.count(), lag);
                         if !wait.is_zero() {
                             let deadline = Instant::now() + wait.min(Duration::from_millis(12));
@@ -989,7 +980,6 @@ pub(crate) fn spawn_archive_pipeline(
                                             &prep_hub,
                                             &write_tx,
                                             &ack_rx,
-                                            &mut write_in_flight,
                                             &prep_stats,
                                             &prep_params,
                                         ) {
@@ -1006,7 +996,6 @@ pub(crate) fn spawn_archive_pipeline(
                                         &prep_hub,
                                         &write_tx,
                                         &ack_rx,
-                                        &mut write_in_flight,
                                         &prep_stats,
                                         &prep_params,
                                     ) {
@@ -1020,48 +1009,38 @@ pub(crate) fn spawn_archive_pipeline(
                         .write_coalesce_ns
                         .fetch_add(coal_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-                    if write_in_flight {
-                        continue;
-                    }
-
                     let batch = park.take_contiguous(max_mega);
                     if batch.is_empty() {
                         continue;
                     }
                     let n = batch.len() as u32;
-                    // Publish park HWM for assign densify.
+                    // Publish park HWM for assign densify (may be ahead of arch_hwm
+                    // until commit Ok marks archived).
                     prep_next.store(park.next_h(), Ordering::Relaxed);
 
-                    let before_inflight = write_in_flight;
-                    if !plan_and_send_jobs(
+                    // Blocks until writer commit+ack (single-flight).
+                    match plan_and_send_jobs(
                         &batch,
                         &prep_hub,
                         &prep_params,
                         &prep_stats,
                         &write_tx,
                         &ack_rx,
-                        &mut write_in_flight,
                         &prep_result,
-                        true,
-                        Some(&prep_next),
                     ) {
-                        // Writer dead.
-                        park.rewind(n);
-                        prep_next.store(park.next_h(), Ordering::Relaxed);
-                        return;
-                    }
-                    // Plan failed before send (results already Err) — rewind HWM
-                    // so densify can re-getdata the same heights.
-                    if !before_inflight && !write_in_flight {
-                        park.rewind(n);
-                        prep_next.store(park.next_h(), Ordering::Relaxed);
+                        PlanSend::Done => {}
+                        PlanSend::FailedRewind => {
+                            park.rewind(n);
+                            prep_next.store(park.next_h(), Ordering::Relaxed);
+                        }
+                        PlanSend::WriterDead => {
+                            park.rewind(n);
+                            prep_next.store(park.next_h(), Ordering::Relaxed);
+                            return;
+                        }
                     }
                 }
                 drop(write_tx);
-                // Drain final ack
-                if write_in_flight {
-                    let _ = ack_rx.recv();
-                }
             })
             .expect("spawn ibd-archive-prep");
 

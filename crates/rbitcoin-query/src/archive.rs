@@ -156,10 +156,10 @@ impl Query {
         }
 
         // Sticky (committed prior batches) then durable head for misses.
+        // Lookup touches FIFO recency so hot parents survive create-flood eviction.
         let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
-        let sticky_hits = self.archive_txid_sticky.lookup_batch(&need_vec);
-        let sticky_hit_n = sticky_hits.len() as u64;
-        let mut resolved: HashMap<[u8; 32], Fk> = sticky_hits;
+        let mut resolved = self.archive_txid_sticky.lookup_batch(&need_vec);
+        let sticky_hit_n = resolved.len() as u64;
         let mut need_head: Vec<[u8; 32]> = Vec::new();
         for t in &need_vec {
             if !resolved.contains_key(t) {
@@ -168,6 +168,8 @@ impl Query {
         }
         let head_need_n = need_head.len() as u64;
         let mut head_hit_n = 0u64;
+        // Parents resolved via durable head (for sticky register after put).
+        let mut head_resolved: Vec<([u8; 32], Fk)> = Vec::new();
 
         if !need_head.is_empty() {
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
@@ -175,6 +177,7 @@ impl Query {
             for (txid, fk_opt) in hits {
                 if let Some(fk) = fk_opt {
                     resolved.insert(txid, fk);
+                    head_resolved.push((txid, fk));
                     head_hit_n = head_hit_n.saturating_add(1);
                 }
             }
@@ -253,14 +256,16 @@ impl Query {
         self.store.header_txs.put_ranges_batch(&per_header_ranges)?;
 
         // Sticky only after durable put — never advertise uncommitted fks.
+        // Creates first, then head-resolved parents (FIFO-newest). Sticky hits
+        // were already touched at lookup. One lock per insert_many.
         let sticky_regs: Vec<([u8; 32], Fk)> = packed
             .iter()
             .zip(got_tx_fks.iter())
             .map(|((tx, _, _), fk)| (tx.txid, *fk))
             .collect();
         self.archive_txid_sticky.insert_many(&sticky_regs);
-        for (txid, fk) in &resolved {
-            self.archive_txid_sticky.insert(*txid, *fk);
+        if !head_resolved.is_empty() {
+            self.archive_txid_sticky.insert_many(&head_resolved);
         }
 
         let body_end = self.store.txs.body_logical_len();

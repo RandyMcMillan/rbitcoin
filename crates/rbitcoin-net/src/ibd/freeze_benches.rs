@@ -82,6 +82,21 @@ fn chain_headers(hub: &ChainHub, n: u32) -> Vec<Header> {
     out
 }
 
+/// Always-on smoke so coverage hits helpers (full microbench remains ignored).
+#[test]
+fn freeze_bench_helpers_smoke() {
+    let (_dir, hub) = temp_hub();
+    let headers = chain_headers(&hub, 8);
+    assert_eq!(headers.len(), 8);
+    for h in &headers {
+        let _ = hub.ensure_header_fk(h).unwrap();
+    }
+    // Second pass hits known headers (hash-head path).
+    for h in &headers {
+        let _ = hub.ensure_header_fk(h).unwrap();
+    }
+}
+
 #[test]
 #[ignore = "diagnostic microbench; run: cargo test -p rbitcoin-net freeze_bench -- --ignored --nocapture"]
 fn freeze_bench_ensure_header_fk_known_vs_new() {

@@ -62,8 +62,11 @@ pub mod parent_prewarm_stats {
     pub static CREATES: AtomicU64 = AtomicU64::new(0);
     pub static ALREADY_READY: AtomicU64 = AtomicU64::new(0);
     pub static PARENT_UNIQUE: AtomicU64 = AtomicU64::new(0);
-    /// Pin loop: already-stashed outs (skip store decode) vs first-time pin.
+    /// Pin loop: already-stashed outs in by_fk (skip store decode).
     pub static PIN_ALREADY_CACHED: AtomicU64 = AtomicU64::new(0);
+    /// Pin filled from runway `by_body` (no Class A re-decode).
+    pub static PIN_RUNWAY_BODY: AtomicU64 = AtomicU64::new(0);
+    /// Pin that had to load from store.
     pub static PIN_NEW: AtomicU64 = AtomicU64::new(0);
     pub static PARENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
     pub static FULL_TX_READS: AtomicU64 = AtomicU64::new(0);
@@ -105,6 +108,7 @@ pub mod parent_prewarm_stats {
         pub already_ready: u64,
         pub parent_unique: u64,
         pub pin_already_cached: u64,
+        pub pin_runway_body: u64,
         pub pin_new: u64,
         pub cache_hits: u64,
         pub body_tx: u64,
@@ -141,6 +145,7 @@ pub mod parent_prewarm_stats {
             already_ready: ALREADY_READY.swap(0, Ordering::Relaxed),
             parent_unique: PARENT_UNIQUE.swap(0, Ordering::Relaxed),
             pin_already_cached: PIN_ALREADY_CACHED.swap(0, Ordering::Relaxed),
+            pin_runway_body: PIN_RUNWAY_BODY.swap(0, Ordering::Relaxed),
             pin_new: PIN_NEW.swap(0, Ordering::Relaxed),
             cache_hits: PARENT_CACHE_HITS.swap(0, Ordering::Relaxed),
             body_tx: BODY_TX_READS.swap(0, Ordering::Relaxed),
@@ -187,6 +192,7 @@ pub mod parent_prewarm_stats {
         add!(already_ready, ALREADY_READY);
         add!(parent_unique, PARENT_UNIQUE);
         add!(pin_already_cached, PIN_ALREADY_CACHED);
+        add!(pin_runway_body, PIN_RUNWAY_BODY);
         add!(pin_new, PIN_NEW);
         add!(parent_cache_hits, PARENT_CACHE_HITS);
         add!(full_tx_reads, FULL_TX_READS);
@@ -402,7 +408,7 @@ pub mod ibd_utxo_stats {
 /// Wave-fill sub-phase wall times (nanoseconds; reset by the IBD sampler).
 ///
 /// Breaks down the dominant `wave_fill` recon cost: body vs parent warm vs spent
-/// vs coinbase height.
+/// vs coinbase height. Also tracks store IO cost and parent-cache lock wait.
 pub mod wave_fill_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -420,6 +426,12 @@ pub mod wave_fill_stats {
     pub static BODY_CACHE_MOVE: AtomicU64 = AtomicU64::new(0);
     /// Wave bodies re-decoded from store (cache miss / not prewarmed).
     pub static BODY_STORE: AtomicU64 = AtomicU64::new(0);
+    /// Wall ns spent in store body decode (subset of BODY_NS on miss).
+    pub static BODY_STORE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Major page faults observed on the confirm thread during store body loads.
+    pub static BODY_STORE_MAJFLT: AtomicU64 = AtomicU64::new(0);
+    /// Time waiting on ConfirmParentCache mutex (ns).
+    pub static CACHE_LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
     /// Thin edges moved from runway stash (batch take).
     pub static THIN_CACHE_MOVE: AtomicU64 = AtomicU64::new(0);
     /// Thin edges rebuilt by walking inputs (stash miss).
@@ -446,6 +458,15 @@ pub mod wave_fill_stats {
         )
     }
 
+    /// `(store_body_ns, store_majflt, cache_lock_wait_ns)`.
+    pub fn sample_io_and_reset() -> (u64, u64, u64) {
+        (
+            BODY_STORE_NS.swap(0, Ordering::Relaxed),
+            BODY_STORE_MAJFLT.swap(0, Ordering::Relaxed),
+            CACHE_LOCK_WAIT_NS.swap(0, Ordering::Relaxed),
+        )
+    }
+
     #[inline]
     pub(crate) fn add(part: &AtomicU64, ns: u64) {
         if ns > 0 {
@@ -458,6 +479,32 @@ pub mod wave_fill_stats {
         if n > 0 {
             part.fetch_add(n, Ordering::Relaxed);
         }
+    }
+}
+
+/// ContigPark live snapshot (writer thread updates; sampler reads without reset).
+pub mod contig_park_stats {
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+    /// Next height the writer may commit.
+    pub static NEXT_H: AtomicU32 = AtomicU32::new(0);
+    /// Bodies parked (height ≥ next_h).
+    pub static PARKED: AtomicUsize = AtomicUsize::new(0);
+    /// Contiguous ready prefix length at next_h.
+    pub static READY_PREFIX: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn snapshot() -> (u32, usize, usize) {
+        (
+            NEXT_H.load(Ordering::Relaxed),
+            PARKED.load(Ordering::Relaxed),
+            READY_PREFIX.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn store(next_h: u32, parked: usize, ready: usize) {
+        NEXT_H.store(next_h, Ordering::Relaxed);
+        PARKED.store(parked, Ordering::Relaxed);
+        READY_PREFIX.store(ready, Ordering::Relaxed);
     }
 }
 

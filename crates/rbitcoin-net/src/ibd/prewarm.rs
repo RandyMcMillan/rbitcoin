@@ -166,13 +166,14 @@ pub(crate) fn spawn_parent_prewarm(
                             || st.creates_registered > 0
                         {
                             rbitcoin_log::trace!(
-                                "ibd: prewarm h={h0}..{h1} blocks={} parents={} creates={} body_io={} parent_io={} pin_cached={} pin_new={} cache_hit={} skip={} +{ahead} thru={through} {ms}ms",
+                                "ibd: prewarm h={h0}..{h1} blocks={} parents={} creates={} body_io={} parent_io={} pin_cached={} pin_runway={} pin_new={} cache_hit={} skip={} +{ahead} thru={through} {ms}ms",
                                 st.blocks,
                                 st.utxo_parents,
                                 st.creates_registered,
                                 st.body_tx_reads,
                                 st.full_tx_reads,
                                 st.pin_already_cached,
+                                st.pin_runway_body,
                                 st.pin_new,
                                 st.parent_cache_hits,
                                 st.already_ready,
@@ -195,13 +196,14 @@ pub(crate) fn spawn_parent_prewarm(
                             let (mlock_ranges, mlock_bytes) = query.prewarm_mlock_stats();
                             let parents = query.confirm_parent_cache().parent_count();
                             info!(
-                                "ibd: prewarm tip={tip} +{ahead} thru={through} by_txid={by_txid} bodies={bodies} parents={parents} sticky={sticky_n} mlock_rng={mlock_ranges} mlock_MiB={} plans={plans}/{d} next_h={next_height} runway={} last_h={h0}..{h1} blks={} body_io={} parent_io={} pin_cached={} pin_new={} head={}/{} mlock_sys={}/{} edges same={} runway={} sticky={} head={} sticky_hit={} {ms}ms (hdr={hdr} mlock={ml} dec={dec} thin={thin}[col={t_col} run={t_run} head={t_head} edge={t_edge}] pin={pin} put={put})",
+                                "ibd: prewarm tip={tip} +{ahead} thru={through} by_txid={by_txid} bodies={bodies} parents={parents} sticky={sticky_n} mlock_rng={mlock_ranges} mlock_MiB={} plans={plans}/{d} next_h={next_height} runway={} last_h={h0}..{h1} blks={} body_io={} parent_io={} pin_cached={} pin_runway={} pin_new={} head={}/{} mlock_sys={}/{} edges same={} runway={} sticky={} head={} sticky_hit={} {ms}ms (hdr={hdr} mlock={ml} dec={dec} thin={thin}[col={t_col} run={t_run} head={t_head} edge={t_edge}] pin={pin} put={put})",
                                 mlock_bytes / (1024 * 1024),
                                 runway.len(),
                                 st.blocks,
                                 st.body_tx_reads,
                                 st.full_tx_reads,
                                 st.pin_already_cached,
+                                st.pin_runway_body,
                                 st.pin_new,
                                 st.head_hits,
                                 st.head_lookups,

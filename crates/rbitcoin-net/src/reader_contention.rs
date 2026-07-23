@@ -389,6 +389,39 @@ fn multi_rt() -> tokio::runtime::Runtime {
         .expect("runtime")
 }
 
+/// Always-on smoke: exercise v1 framer + short duplex round-trip (coverage).
+#[test]
+fn reader_contention_framer_smoke() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let magic = signet_magic();
+        let (mut client, mut server) = duplex(64 * 1024);
+        let raw = RawNetworkMessage::new(magic, NetworkMessage::GetAddr);
+        let bytes = serialize(&raw);
+        client.write_all(&bytes).await.unwrap();
+        let mut stream = MessageStream::new();
+        let msg = stream
+            .read_msg(&mut server, Some(magic))
+            .await
+            .expect("framed getaddr");
+        assert!(matches!(msg.payload(), NetworkMessage::GetAddr));
+        // Bad magic / oversized payload error paths.
+        let mut stream2 = MessageStream::new();
+        let bad = RawNetworkMessage::new(Magic::from_bytes([1, 2, 3, 4]), NetworkMessage::GetAddr);
+        client.write_all(&serialize(&bad)).await.unwrap();
+        let err = stream2
+            .read_msg(&mut server, Some(magic))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NetError::BadMagic));
+    });
+    let _ = fat_block(1);
+    let _ = fat_block_with_txs(2, 2);
+}
+
 #[test]
 #[ignore = "diagnostic contention bench; run: cargo test -p rbitcoin-net reader_contention -- --ignored --nocapture"]
 fn reader_contention_matrix() {

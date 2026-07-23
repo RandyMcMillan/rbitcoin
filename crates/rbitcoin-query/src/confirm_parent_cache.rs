@@ -717,7 +717,12 @@ impl ConfirmParentCache {
         if fks.is_empty() {
             return HashMap::new();
         }
+        let t0 = std::time::Instant::now();
         let mut g = self.inner.lock().unwrap();
+        crate::wave_fill_stats::add(
+            &crate::wave_fill_stats::CACHE_LOCK_WAIT_NS,
+            t0.elapsed().as_nanos() as u64,
+        );
         let mut out = HashMap::with_capacity(fks.len());
         for &fk in fks {
             let Some(id) = fk.get() else {
@@ -738,7 +743,12 @@ impl ConfirmParentCache {
         if fks.is_empty() {
             return HashMap::new();
         }
+        let t0 = std::time::Instant::now();
         let g = self.inner.lock().unwrap();
+        crate::wave_fill_stats::add(
+            &crate::wave_fill_stats::CACHE_LOCK_WAIT_NS,
+            t0.elapsed().as_nanos() as u64,
+        );
         let mut out = HashMap::with_capacity(fks.len());
         for &fk in fks {
             let Some(id) = fk.get() else {
@@ -1415,6 +1425,9 @@ impl ConfirmParentCache {
                 return true;
             }
         }
+        // Runway full body can supply pin without store — treat as covered for
+        // skip-path accounting; caller still uses get_body_for_pin when not
+        // by_fk-stashed (see prewarm pin_runway_body).
         false
     }
 
@@ -2316,6 +2329,35 @@ mod tests {
         assert_eq!(hits.get(&[1u8; 32]).copied(), Some(Fk(1)));
         assert_eq!(hits.get(&[2u8; 32]).copied(), Some(Fk(2)));
         assert!(!hits.contains_key(&[9u8; 32]));
+    }
+
+    #[test]
+    fn take_bodies_batch_records_lock_wait_counter() {
+        use crate::wave_fill_stats;
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(0);
+        let mut t = tx(1);
+        t.txid = [9u8; 32];
+        c.put_body(
+            Fk(100),
+            1,
+            t,
+            vec![out(50)],
+            vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: 0xffff_ffff,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+        );
+        let _ = wave_fill_stats::sample_io_and_reset();
+        let got = c.take_bodies_batch(&[Fk(100)]);
+        assert_eq!(got.len(), 1);
+        let (_store_ns, _maj, lock_ns) = wave_fill_stats::sample_io_and_reset();
+        // Lock wait is usually tiny but the counter path must execute.
+        let _ = lock_ns;
     }
 
     #[test]

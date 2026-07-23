@@ -761,6 +761,12 @@ pub(crate) fn spawn_archive_pipeline(
                     let max_mega = max_batch_for_lag(lag);
                     let min_batch = min_batch_for_queue(arch_q_n, lag);
                     let mut ready = park.ready_prefix_len();
+                    // Live ContigPark snapshot for IBD perf (sampler reads, no reset).
+                    rbitcoin_query::contig_park_stats::store(
+                        park.next_h(),
+                        park.parked_len(),
+                        ready,
+                    );
 
                     // If the park is waiting on a height already Class A (Late
                     // path / prior write), advance so parked higher heights drain.

@@ -54,23 +54,52 @@ if command -v cargo-llvm-cov >/dev/null 2>&1 || cargo llvm-cov --version >/dev/n
   # cargo-llvm-cov's text "Missed Lines" counts partially-covered *regions* inside a line
   # (e.g. match or-patterns). The HTML report's uncovered-line markers are the source of
   # truth for "every executable line executed at least once".
+  cargo llvm-cov report \
+    --ignore-filename-regex "$IGNORE" \
+    --lcov --output-path "$ROOT/coverage/lcov.info" || true
+
+  # Line gate: LCOV LH/LF (HTML class names vary by llvm-cov version).
+  LCOV_STATS="$(python3 - <<'PY'
+from pathlib import Path
+p = Path("coverage/lcov.info")
+lf = lh = 0
+if p.exists():
+    for line in p.read_text(errors="replace").splitlines():
+        if line.startswith("LF:"):
+            lf += int(line[3:])
+        elif line.startswith("LH:"):
+            lh += int(line[3:])
+print(f"{lh} {lf}")
+PY
+)"
+  read -r LCOV_HIT LCOV_TOT <<<"$LCOV_STATS"
+  LCOV_HIT="${LCOV_HIT:-0}"
+  LCOV_TOT="${LCOV_TOT:-0}"
+  if [[ "$LCOV_TOT" -gt 0 ]]; then
+    LCOV_PCT="$(python3 -c "print(f'{100.0*$LCOV_HIT/$LCOV_TOT:.2f}')")"
+    echo "LCOV lines: ${LCOV_HIT}/${LCOV_TOT} (${LCOV_PCT}%)"
+  fi
   UNCOV="$(rg -c 'uncovered-line' "$ROOT/coverage" --glob '*.html' 2>/dev/null || true)"
   UNCOV_TOTAL=0
   if [[ -n "$UNCOV" ]]; then
     UNCOV_TOTAL="$(echo "$UNCOV" | awk -F: '{s+=$2} END {print s+0}')"
   fi
+  # Prefer LCOV miss when HTML markers absent (newer llvm-cov HTML).
+  MISS=$((LCOV_TOT > LCOV_HIT ? LCOV_TOT - LCOV_HIT : 0))
   if [[ "$UNCOV_TOTAL" -ne 0 ]]; then
     echo "FAIL: $UNCOV_TOTAL uncovered executable line(s) in HTML report (need 0)" >&2
     echo "$UNCOV" >&2
     cargo llvm-cov report --ignore-filename-regex "$IGNORE" --show-missing-lines || true
     exit 1
   fi
+  if [[ "$MISS" -ne 0 ]]; then
+    echo "FAIL: LCOV reports $MISS missed line(s) (${LCOV_HIT}/${LCOV_TOT}; need 100%)" >&2
+    cargo llvm-cov report --ignore-filename-regex "$IGNORE" --show-missing-lines || true
+    exit 1
+  fi
 
-  cargo llvm-cov report \
-    --ignore-filename-regex "$IGNORE" \
-    --lcov --output-path "$ROOT/coverage/lcov.info" || true
-  echo "Coverage OK: 0 uncovered executable lines (see coverage/index.html)"
-  echo "Note: full branch coverage requires nightly; region-partial lines may still appear in text report."
+  echo "Coverage OK: 0 uncovered executable lines (see coverage/index.html / lcov.info)"
+  echo "Note: full branch coverage requires nightly --branch; region-partial lines may still appear in text report."
   echo "Tip: set COVERAGE_CLEAN=1 only when you need a cold instrumented rebuild."
   exit 0
 fi

@@ -316,13 +316,24 @@ impl Query {
         &self,
         fk: Fk,
     ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>), QueryError> {
+        use crate::wave_fill_stats::{self as wf, add as wf_add};
+        let t0 = Instant::now();
+        let maj_before = thread_majflt();
         // Prefer prewarmed idx range (skip idx page fault); body pages mlocked.
-        if let Some((off, len)) = self.confirm_parents.get_body_range(fk) {
+        let res = if let Some((off, len)) = self.confirm_parents.get_body_range(fk) {
             let (tx, inputs, outs) = self.store.get_tx_full_at(off, len)?;
-            return Ok((tx, outs, inputs));
+            Ok((tx, outs, inputs))
+        } else {
+            let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
+            Ok((tx, outs, inputs))
+        };
+        wf_add(&wf::BODY_STORE_NS, t0.elapsed().as_nanos() as u64);
+        if let (Some(b), Some(a)) = (maj_before, thread_majflt()) {
+            if a > b {
+                wf::add_count(&wf::BODY_STORE_MAJFLT, a - b);
+            }
         }
-        let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
-        Ok((tx, outs, inputs))
+        res
     }
 
     fn coinbase_height_for_tx_with_input0(
@@ -621,4 +632,21 @@ impl Query {
             Some(h) => Ok(Some(self.reconstruct_block_at_height(h)?)),
         }
     }
+}
+
+/// Process majflt sample (Linux); `None` when unavailable.
+#[cfg(target_os = "linux")]
+fn thread_majflt() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MajFlt:") {
+            return rest.trim().split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thread_majflt() -> Option<u64> {
+    None
 }

@@ -26,8 +26,10 @@ pub struct PrewarmStats {
     pub already_ready: u32,
     /// Unique parent create fks pinned this call (after dedup).
     pub parent_unique: u32,
-    /// Of `parent_unique`: outs already stashed — skip store decode (re-pin).
+    /// Of `parent_unique`: outs already stashed in by_fk — re-pin touch only.
     pub pin_already_cached: u32,
+    /// Of `parent_unique`: filled from runway `by_body` (no store decode).
+    pub pin_runway_body: u32,
     /// Of `parent_unique`: first-time sparse pin (store decode).
     pub pin_new: u32,
     /// Parent outs served from runway txid map / same-batch.
@@ -761,14 +763,13 @@ impl Query {
                 st.utxo_parents = st.utxo_parents.saturating_add(1);
                 continue;
             }
-            st.pin_new = st.pin_new.saturating_add(1);
-
             // Prefer runway full body (same-bite / prior-bite creates) — no Class A
             // re-decode. package_ready still needs spent-filtered by_fk.
             if !need_vouts.is_empty() {
                 if let Some((create_h, tx, outs, inputs)) =
                     self.confirm_parents.get_body_for_pin(fk)
                 {
+                    st.pin_runway_body = st.pin_runway_body.saturating_add(1);
                     let range = self.confirm_parents.get_body_range(fk);
                     if let Some((off, len)) = range {
                         parent_ranges.push((fk, off, len));
@@ -820,6 +821,7 @@ impl Query {
                     continue;
                 }
             }
+            st.pin_new = st.pin_new.saturating_add(1);
 
             // Prefer cached body range over idx read.
             let range = self

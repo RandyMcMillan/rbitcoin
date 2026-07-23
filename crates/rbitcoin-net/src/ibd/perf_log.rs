@@ -105,6 +105,11 @@ pub(crate) struct IbdPerfSample {
     /// Thin edges moved from runway stash vs rebuilt from inputs.
     pub wf_thin_cache: u64,
     pub wf_thin_rebuild: u64,
+    /// Store body decode wall (ms) + majflt count during those loads.
+    pub wf_store_body_ms: u64,
+    pub wf_store_majflt: u64,
+    /// ConfirmParentCache mutex wait (ms).
+    pub wf_cache_lock_ms: u64,
 
     // SH sub
     pub sh_warm_ms: u64,
@@ -129,8 +134,9 @@ pub(crate) struct IbdPerfSample {
     pub pw_creates: u64,
     pub pw_already_ready: u64,
     pub pw_parent_unique: u64,
-    /// Of uniq_p: already-stashed (skip re-decode) vs first-time store pin.
+    /// Of uniq_p: by_fk re-pin / runway body / store decode.
     pub pw_pin_already_cached: u64,
+    pub pw_pin_runway_body: u64,
     pub pw_pin_new: u64,
     pub pw_cache_hits: u64,
     /// Phase-1 body Class A reads this window.
@@ -180,6 +186,11 @@ pub(crate) struct IbdPerfSample {
     /// Live sticky map size (not window-reset).
     pub arch_sticky_len: usize,
     pub arch_sticky_cap: usize,
+
+    /// ContigPark live snapshot (writer; not window-reset).
+    pub contig_next_h: u32,
+    pub contig_parked: usize,
+    pub contig_ready: usize,
 
     // Pipe
     pub pipe: ArchivePipelineSample,
@@ -257,6 +268,9 @@ impl Default for IbdPerfSample {
             wf_body_store: 0,
             wf_thin_cache: 0,
             wf_thin_rebuild: 0,
+            wf_store_body_ms: 0,
+            wf_store_majflt: 0,
+            wf_cache_lock_ms: 0,
             sh_warm_ms: 0,
             sh_filter_ms: 0,
             sh_collect_ms: 0,
@@ -275,6 +289,7 @@ impl Default for IbdPerfSample {
             pw_already_ready: 0,
             pw_parent_unique: 0,
             pw_pin_already_cached: 0,
+            pw_pin_runway_body: 0,
             pw_pin_new: 0,
             pw_cache_hits: 0,
             pw_body_tx_reads: 0,
@@ -314,6 +329,9 @@ impl Default for IbdPerfSample {
             arch_resolve_blocks: 0,
             arch_sticky_len: 0,
             arch_sticky_cap: 0,
+            contig_next_h: 0,
+            contig_parked: 0,
+            contig_ready: 0,
             pipe: ArchivePipelineSample::default(),
         }
     }
@@ -376,10 +394,14 @@ pub(crate) fn sample(
         rbitcoin_query::wave_fill_stats::sample_and_reset();
     let (wf_body_cache, wf_body_store, wf_thin_cache, wf_thin_rebuild) =
         rbitcoin_query::wave_fill_stats::sample_counts_and_reset();
+    let (wf_store_body_ns, wf_store_majflt, wf_cache_lock_ns) =
+        rbitcoin_query::wave_fill_stats::sample_io_and_reset();
     let (pwh, pca, psm) = rbitcoin_query::connect_prevout_stats::sample_and_reset();
     let pw = rbitcoin_query::parent_prewarm_stats::sample_and_reset();
     let arch_res = rbitcoin_query::archive_resolve_stats::sample_and_reset();
     let pipe = pipe_stats.sample_and_reset();
+    let (contig_next_h, contig_parked, contig_ready) =
+        rbitcoin_query::contig_park_stats::snapshot();
     let (pw_ready_through, pw_ahead, pw_parents, pw_bodies, pw_plans, pw_depth) = prewarm;
     let (arch_sticky_len, arch_sticky_cap) = arch_sticky;
 
@@ -453,6 +475,9 @@ pub(crate) fn sample(
         wf_body_store,
         wf_thin_cache,
         wf_thin_rebuild,
+        wf_store_body_ms: ns_ms(wf_store_body_ns),
+        wf_store_majflt,
+        wf_cache_lock_ms: ns_ms(wf_cache_lock_ns),
         sh_warm_ms: ns_ms(sh_warm),
         sh_filter_ms: ns_ms(sh_filter),
         sh_collect_ms: ns_ms(sh_collect),
@@ -471,6 +496,7 @@ pub(crate) fn sample(
         pw_already_ready: pw.already_ready,
         pw_parent_unique: pw.parent_unique,
         pw_pin_already_cached: pw.pin_already_cached,
+        pw_pin_runway_body: pw.pin_runway_body,
         pw_pin_new: pw.pin_new,
         pw_cache_hits: pw.cache_hits,
         pw_body_tx_reads: pw.body_tx,
@@ -510,6 +536,9 @@ pub(crate) fn sample(
         arch_resolve_blocks: arch_res.blocks,
         arch_sticky_len,
         arch_sticky_cap,
+        contig_next_h,
+        contig_parked,
+        contig_ready,
         pipe,
     }
 }
@@ -577,7 +606,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     };
     let mlock_mb = s.mlock_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} blks={} body_io={} parent_io={} pin_cached={} pin_new={} cache%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
+        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} blks={} body_io={} parent_io={} pin_cached={} pin_runway={} pin_new={} cache%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
         s.pw_ahead,
         s.pw_ready_through,
         s.pw_parents,
@@ -588,6 +617,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.pw_body_tx_reads,
         s.pw_parent_tx_reads,
         s.pw_pin_already_cached,
+        s.pw_pin_runway_body,
         s.pw_pin_new,
         cache_pct,
         s.pw_ms,
@@ -643,7 +673,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         us(s.runway_tip_ns),
     );
     out.push_str(&format!(
-        " | wave body={} ptx={} pout={} spent={} cb={} cache={} store={} thin={} rebuild={}",
+        " | wave body={} ptx={} pout={} spent={} cb={} cache={} store={} thin={} rebuild={} store_ms={} majflt={} lock_ms={}",
         s.wf_body_ms,
         s.wf_ptx_ms,
         s.wf_pout_ms,
@@ -653,6 +683,9 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.wf_body_store,
         s.wf_thin_cache,
         s.wf_thin_rebuild,
+        s.wf_store_body_ms,
+        s.wf_store_majflt,
+        s.wf_cache_lock_ms,
     ));
     out.push_str(&format!(
         " | sh warm={} filter={} collect={} sort={} seed={} body={} head={} index={}",
@@ -668,7 +701,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let cp_tot = s.cp_wave + s.cp_class_a + s.cp_store;
     let mlock_mb = s.mlock_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cached={} pin_new={} cache_hit={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} head={}/{} mlock_sys={}/{} edges same={} runway={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
+        " | prewarm +{} thru={} by_txid={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cached={} pin_runway={} pin_new={} cache_hit={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} head={}/{} mlock_sys={}/{} edges same={} runway={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
         s.pw_ahead,
         s.pw_ready_through,
         s.pw_parents,
@@ -682,6 +715,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.pw_already_ready,
         s.pw_parent_unique,
         s.pw_pin_already_cached,
+        s.pw_pin_runway_body,
         s.pw_pin_new,
         s.pw_cache_hits,
         s.pw_body_tx_reads,
@@ -738,7 +772,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         0
     };
     out.push_str(&format!(
-        " | pipe prep_us/blk={} prep_blks={} write_us/blk={} write_blks={} batch_avg={} writer_busy%={} idle_ms={} coalesce_ms={} prep_ms={} | arch_res resolve_us/blk={} ext={} sticky={}/{} ({}%) head={}/{} stamp batch={} res={} sticky_map={}/{}",
+        " | pipe prep_us/blk={} prep_blks={} write_us/blk={} write_blks={} batch_avg={} writer_busy%={} idle_ms={} coalesce_ms={} prep_ms={} | arch_res resolve_us/blk={} ext={} sticky={}/{} ({}%) head={}/{} stamp batch={} res={} sticky_map={}/{} | contig next_h={} parked={} ready={}",
         s.pipe.prep_us_per_block(),
         s.pipe.prep_blocks,
         s.pipe.write_us_per_block(),
@@ -759,6 +793,9 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.arch_resolved_stamp,
         s.arch_sticky_len,
         s.arch_sticky_cap,
+        s.contig_next_h,
+        s.contig_parked,
+        s.contig_ready,
     ));
     out.push_str(&format!(
         " | loop confirm_blks={} confirm_us/blk={} reject_stops={} events={} status_scan_ms={}",
@@ -776,6 +813,26 @@ pub(crate) fn log_sample(s: &IbdPerfSample) {
     info!("{}", format_info(s));
     if enabled(Level::Debug) {
         debug!("{}", format_debug(s));
+    }
+    // Surface multi-second writeback / SH tails that hide in window averages.
+    if s.phase_blks > 0 {
+        let c_ms = s.class_c_ms / s.phase_blks.max(1);
+        let sh_ms = s.sh_ms / s.phase_blks.max(1);
+        let recon_ms = s.recon_ms / s.phase_blks.max(1);
+        if c_ms >= 1000 || sh_ms >= 1000 || recon_ms >= 5000 {
+            rbitcoin_log::warn!(
+                "ibd: slow confirm phase ms/blk recon={} script={} class_c={} sh={} (sh_collect={}ms window) store_body={}ms majflt={} cache_lock={}ms blks={}",
+                recon_ms,
+                s.script_ms / s.phase_blks.max(1),
+                c_ms,
+                sh_ms,
+                s.sh_collect_ms,
+                s.wf_store_body_ms,
+                s.wf_store_majflt,
+                s.wf_cache_lock_ms,
+                s.phase_blks,
+            );
+        }
     }
     let _ = std::io::Write::flush(&mut std::io::stderr());
 }
@@ -834,7 +891,7 @@ mod tests {
         assert!(line.contains("prewarm +64 thru=200"), "{line}");
         assert!(line.contains("by_txid=12 bodies=48 plans=80/256"), "{line}");
         assert!(line.contains("body_io=400 parent_io=120"), "{line}");
-        assert!(line.contains("pin_cached=5 pin_new=15"), "{line}");
+        assert!(line.contains("pin_cached=5 pin_runway=0 pin_new=15"), "{line}");
         assert!(line.contains("mlock=32MiB ranges=12 sh_runs=3"), "{line}");
         assert!(!line.contains("reserved"), "{line}");
         assert!(!line.contains("confirm_phases"), "{line}");
@@ -879,12 +936,25 @@ mod tests {
         assert!(line.contains("utxo_p=100"), "{line}");
         assert!(line.contains("creates=50"), "{line}");
         assert!(line.contains("body_io=200 parent_io=50"), "{line}");
-        assert!(line.contains("pin_cached=12 pin_new=38"), "{line}");
+        assert!(line.contains("pin_cached=12 pin_runway=0 pin_new=38"), "{line}");
         assert!(line.contains("mlock=16MiB ranges=4 sh_runs=2"), "{line}");
         assert!(line.contains("arch_res resolve_us/blk="), "{line}");
         assert!(line.contains("sticky_map="), "{line}");
+        assert!(line.contains("store_ms="), "{line}");
+        assert!(line.contains("majflt="), "{line}");
+        assert!(line.contains("lock_ms="), "{line}");
+        assert!(line.contains("contig next_h="), "{line}");
         assert!(!line.contains("reserved"), "{line}");
         assert!(line.contains("pipe "), "{line}");
         assert!(line.contains("loop "), "{line}");
+    }
+
+    #[test]
+    fn contig_park_stats_snapshot_roundtrip() {
+        rbitcoin_query::contig_park_stats::store(42, 7, 3);
+        assert_eq!(
+            rbitcoin_query::contig_park_stats::snapshot(),
+            (42, 7, 3)
+        );
     }
 }

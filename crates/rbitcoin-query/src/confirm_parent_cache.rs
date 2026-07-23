@@ -999,7 +999,7 @@ impl ConfirmParentCache {
     ///
     /// `checked` includes spent-filtered vouts that are **not** in `live` so
     /// wave can treat the set as complete without re-decoding the body.
-    /// `height` is the max cache height needing this parent (GC / by_txid).
+    /// `height` is the max cache height needing this parent (plan keep-alive).
     /// `coinbase_height`: `None` = not a coinbase; `Some(h)` = cb create height.
     /// Pass as pre-resolved maturity field (outer `Some` means stashed).
     pub fn put_parent_outs_resolved(
@@ -1890,16 +1890,7 @@ impl Inner {
             drop_ids.push(id);
         }
         for id in drop_ids {
-            if let Some(e) = self.by_fk.remove(&id) {
-                if self
-                    .by_txid
-                    .get(&e.tx.txid)
-                    .is_some_and(|ent| ent.fk == id)
-                    && !self.by_body.contains_key(&id)
-                {
-                    self.by_txid.remove(&e.tx.txid);
-                }
-            }
+            self.by_fk.remove(&id);
         }
     }
 }

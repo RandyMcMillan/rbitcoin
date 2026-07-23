@@ -146,9 +146,10 @@ impl Query {
         self.confirm_parents.ready_through()
     }
 
-    /// Snapshot: `(ready_through, ahead, by_txid, bodies, plans)`.
+    /// Snapshot: `(ready_through, ahead, sparse_parents, bodies, plans)`.
     ///
     /// `ahead` is ready_through − tip (in-flight load watermark, not a depth knobs).
+    /// Third field is sparse `by_fk` parent count (process-local by_txid removed).
     pub fn parent_cache_perf_snapshot(&self) -> (u32, u32, usize, usize, usize) {
         let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
         let through = self.confirm_parents.ready_through();
@@ -156,7 +157,7 @@ impl Query {
         (
             through,
             ahead,
-            self.confirm_parents.by_txid_count(),
+            self.confirm_parents.parent_count(),
             self.confirm_parents.body_count(),
             self.confirm_parents.plan_count(),
         )
@@ -379,7 +380,6 @@ impl Query {
                     batch_create_ids.insert(id);
                     body_prevouts.insert(id, (txid, prevouts));
                     st.creates_registered = st.creates_registered.saturating_add(1);
-                    // by_txid already registered on first put_bodies_batch.
                     continue;
                 }
                 let (tx, inputs, outs) = if let Some((off, len)) = range {
@@ -412,7 +412,6 @@ impl Query {
         }
 
         // ── Cache put (bodies + ranges) ────────────────────────────────────
-        // put_bodies_batch registers by_txid for live cache identity.
         let t_put = Instant::now();
         self.confirm_parents.put_body_ranges_batch(&body_ranges);
         self.confirm_parents.put_bodies_batch(body_fulls);
@@ -758,7 +757,7 @@ impl Query {
     /// Retire spent parent outs from the parent cache cache by **create_fk** (schema v10).
     ///
     /// Prefer this over txid lookup: spends are already stamped with create_fk at
-    /// connect time, so we avoid a large `by_txid` walk on every confirm batch.
+    /// connect time.
     pub fn unpin_spent_parent_outs(
         &self,
         spends: &[(Fk, u32)],

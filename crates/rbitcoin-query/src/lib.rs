@@ -618,8 +618,9 @@ impl Query {
             .store(v, AtomicOrdering::Release);
     }
 
-    /// Resolve txid → fk: parent cache → durable `tx.head`.
+    /// Resolve txid → fk: RAM body/parent scan → durable `tx.head`.
     fn lookup_tx_fk(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
+        // Optional RAM hit (scan by_body/by_fk) — not the IBD thin hot path.
         if let Some(fk) = self.confirm_parents.get_by_txid(txid) {
             return Ok(Some(fk));
         }
@@ -632,7 +633,7 @@ impl Query {
         Ok(None)
     }
 
-    /// Public resolve by txid (cache + durable head).
+    /// Public resolve by txid (RAM scan + durable head).
     pub fn tx_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
         self.lookup_tx_fk(txid)
     }
@@ -691,7 +692,7 @@ impl Query {
     /// Does **not** treat archive-only point rows as spent: Class A may write
     /// edges before Class C; those spenders are not strong yet.
     pub fn is_outpoint_spent(&self, txid: &[u8; 32], vout: u32) -> Result<bool, QueryError> {
-        // Prefer cache create_fk + body range (no tx.head / idx).
+        // Prefer RAM body/parent scan → create_fk + body range (no head/idx).
         if let Some(cfk) = self.confirm_parents.get_by_txid(txid) {
             let range = self.confirm_parents.get_body_range(cfk);
             return Ok(self

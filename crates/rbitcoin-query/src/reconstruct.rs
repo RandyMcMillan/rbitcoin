@@ -273,7 +273,7 @@ impl Query {
                 });
                 continue;
             }
-            // v10: prefer stamped create_fk (no head / by_txid).
+            // v10: stamped create_fk. Soft prev_txid → wave then durable head only.
             if !inp.create_fk.is_null() {
                 edges.push(ThinInput {
                     create_fk: inp.create_fk.get(),
@@ -284,7 +284,6 @@ impl Query {
             let create_fk = wave
                 .get_by_txid(&inp.prev_txid, inp.prev_index)
                 .map(|(pfk, _, _)| pfk)
-                .or_else(|| self.confirm_parents.get_by_txid(&inp.prev_txid))
                 .or(self.tx_fk_by_txid(&inp.prev_txid).ok().flatten());
             edges.push(ThinInput {
                 create_fk: create_fk.and_then(|f| f.get()),

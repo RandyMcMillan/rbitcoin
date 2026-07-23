@@ -618,12 +618,12 @@ impl Query {
             .store(v, AtomicOrdering::Release);
     }
 
-    /// Resolve txid → fk: RAM body/parent scan → durable `tx.head`.
+    /// Resolve txid → fk via durable `tx.head` (when the index is enabled).
+    ///
+    /// ConfirmParentCache is keyed by create fk only (no process-local txid map).
+    /// IBD thin edges carry stamped create_fk; wave_prevout holds its own
+    /// same-wave txid map. Cold/soft paths use head.
     fn lookup_tx_fk(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
-        // Optional RAM hit (scan by_body/by_fk) — not the IBD thin hot path.
-        if let Some(fk) = self.confirm_parents.get_by_txid(txid) {
-            return Ok(Some(fk));
-        }
         if self.tx_index_enabled() {
             // body_txid verify only — avoid full packed decode on probe misses.
             if let Some(fk) = self.store.get_fk_by_txid(txid)? {
@@ -633,7 +633,7 @@ impl Query {
         Ok(None)
     }
 
-    /// Public resolve by txid (RAM scan + durable head).
+    /// Public resolve by txid (durable head when index enabled).
     pub fn tx_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
         self.lookup_tx_fk(txid)
     }
@@ -692,13 +692,8 @@ impl Query {
     /// Does **not** treat archive-only point rows as spent: Class A may write
     /// edges before Class C; those spenders are not strong yet.
     pub fn is_outpoint_spent(&self, txid: &[u8; 32], vout: u32) -> Result<bool, QueryError> {
-        // Prefer RAM body/parent scan → create_fk + body range (no head/idx).
-        if let Some(cfk) = self.confirm_parents.get_by_txid(txid) {
-            let range = self.confirm_parents.get_body_range(cfk);
-            return Ok(self
-                .store
-                .has_confirmed_strong_spender_create(cfk, vout, range)?);
-        }
+        // Durable head → spender. Confirm path uses create_fk via
+        // [`Self::is_outpoint_spent_create`] when the fk is already known.
         Ok(self.store.has_confirmed_strong_spender(txid, vout)?)
     }
 

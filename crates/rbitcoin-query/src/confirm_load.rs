@@ -149,7 +149,7 @@ impl Query {
     /// Snapshot: `(ready_through, ahead, sparse_parents, bodies, plans)`.
     ///
     /// `ahead` is ready_through − tip (in-flight load watermark, not a depth knobs).
-    /// Third field is sparse `by_fk` parent count (process-local by_txid removed).
+    /// Third field is sparse `by_fk` parent count.
     pub fn parent_cache_perf_snapshot(&self) -> (u32, u32, usize, usize, usize) {
         let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
         let through = self.confirm_parents.ready_through();

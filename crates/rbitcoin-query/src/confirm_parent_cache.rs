@@ -1236,22 +1236,6 @@ impl ConfirmParentCache {
         }
     }
 
-    /// Resolve create fk for `txid` if sparse outs or body hold `vout`.
-    pub fn get_by_txid_if_out(&self, txid: &[u8; 32], vout: u32) -> Option<Fk> {
-        let g = self.inner.lock().unwrap();
-        for (&id, e) in &g.by_fk {
-            if e.tx.txid == *txid && Self::out_present_locked(&g, id, vout) {
-                return Some(Fk(id));
-            }
-        }
-        for (&id, b) in &g.by_body {
-            if b.tx.txid == *txid && (vout as usize) < b.outputs.len() {
-                return Some(Fk(id));
-            }
-        }
-        None
-    }
-
     #[inline]
     fn out_present_locked(g: &Inner, id: u64, vout: u32) -> bool {
         if g.by_fk
@@ -1302,24 +1286,6 @@ impl ConfirmParentCache {
             return Some(e.tx.txid);
         }
         g.by_body.get(&id).map(|b| b.tx.txid)
-    }
-
-    /// Best-effort: find create fk if body or sparse parent is in RAM (scan).
-    /// Not on the IBD thin hot path (stamped create_fk). Prefer durable head for
-    /// general resolve via [`crate::Query::tx_fk_by_txid`].
-    pub fn get_by_txid(&self, txid: &[u8; 32]) -> Option<Fk> {
-        let g = self.inner.lock().unwrap();
-        for (&id, b) in &g.by_body {
-            if b.tx.txid == *txid {
-                return Some(Fk(id));
-            }
-        }
-        for (&id, e) in &g.by_fk {
-            if e.tx.txid == *txid {
-                return Some(Fk(id));
-            }
-        }
-        None
     }
 
     /// Sparse external-parent outs only (`by_fk`). Does **not** expand cache
@@ -1399,12 +1365,6 @@ impl ConfirmParentCache {
     /// Sparse external parents in `by_fk` (not every cache create).
     pub fn parent_count(&self) -> usize {
         self.inner.lock().unwrap().by_fk.len()
-    }
-
-    /// Runway-scoped `txid → fk` map size (should stay O(depth × txs), not O(chain)).
-    /// Compatibility: always 0 (process-local by_txid map removed).
-    pub fn by_txid_count(&self) -> usize {
-        0
     }
 
     /// Cached body-range entries (idx offsets for mlock/wave).
@@ -2266,7 +2226,7 @@ mod tests {
         let t = tx(5);
         c.register_cache_creates(Fk(50), &t, &[out(42), out(43)], 1);
         assert!(c.is_ready(1));
-        assert_eq!(c.get_by_txid(&t.txid), Some(Fk(50)));
+        assert!(c.has_parent_out(Fk(50), 0));
         assert_eq!(c.get_parent_out(Fk(50), 1).unwrap().1.value, 43);
 
         seed_coinbase_package(&c, 2, [2u8; 32], 1002);
@@ -2374,7 +2334,8 @@ mod tests {
             vec![out(10), out(20)],
             vec![],
         )]);
-        assert_eq!(c.get_by_txid(&t.txid), Some(Fk(70)));
+        assert!(c.has_body(Fk(70)));
+        assert_eq!(c.get_parent_txid(Fk(70)), Some(t.txid));
         assert!(c.has_parent_out(Fk(70), 1));
         assert_eq!(c.get_parent_out(Fk(70), 1).unwrap().1.value, 20);
         // Sparse external path still works alongside body.

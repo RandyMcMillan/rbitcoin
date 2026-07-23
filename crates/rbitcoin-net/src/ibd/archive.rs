@@ -625,10 +625,14 @@ pub(crate) fn spawn_archive_pipeline(
                     let write_res = if plan.is_empty() {
                         Ok(())
                     } else {
+                        // Commit: body → head sole-store → fence → sticky → …
                         write_hub.query.archive_commit_plan(plan)
                     };
                     // commit walls recorded inside archive_commit_plan
 
+                    // After sticky publish (on Ok path inside commit): drop in-flight
+                    // txid→fk so prep resolve uses sticky/head for these creates.
+                    // Also clear on Err so failed planned fks are not reused.
                     if !clear_inflight.is_empty() {
                         let mut g = write_inflight.lock().unwrap();
                         for t in &clear_inflight {

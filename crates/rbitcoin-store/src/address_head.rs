@@ -4,12 +4,17 @@
 //! **no HAS_NEXT** — probe continues until an empty slot (no Class A deletes).
 //! Callers verify identity via Class A body txid on **lookup**.
 //!
-//! **Insert (fast path):** probe until the **same fk** is already present (idempotent)
+//! **Insert (default):** probe until the **same fk** is already present (idempotent)
 //! or an **empty** slot — **CAS** `0 → fk` there (no whole-map insert lock).
 //! **No body_txid** on insert (no BIP30 displacement on write). Foreigners and
 //! older same-txid creates are skipped blindly; a second Class A row for the same
 //! txid lands at the next empty slot (deeper on the probe chain). Concurrent
 //! inserts of different keys only serialize at colliding empty slots via CAS.
+//!
+//! **Insert (archive sole-writer):** [`insert_many_sole`] uses plain Release stores
+//! into empty slots (no CAS, no primary-slot sort). Safe only when a single thread
+//! is inserting; IBD archive writer is that thread. Callers must publish sticky /
+//! drop in-flight maps only **after** a visibility fence.
 //! A process-wide `write_lock` remains only for online resize final catch-up/swap.
 //!
 //! **Lookup:** walk candidates from the **last occupied** probe slot toward the
@@ -457,6 +462,61 @@ impl AddressHead {
         self.insert_many(entries)
     }
 
+    /// Unconditional empty-slot store (Release). Sole-writer only.
+    fn store_entry(&self, slot: u64, new: u64) -> Result<(), StoreError> {
+        let off = self.entry_off(slot);
+        match self.layout.entry_bytes {
+            4 => {
+                if new > u64::from(u32::MAX) {
+                    return Err(StoreError::InvalidFk);
+                }
+                self.file.store_u32_le(off, new as u32)
+            }
+            8 => self.file.store_u64_le(off, new),
+            _ => Err(StoreError::Corrupt("address head entry_bytes")),
+        }
+    }
+
+    /// Sole-writer insert: plain store into first empty probe slot (no CAS).
+    ///
+    /// Idempotent if `new_fk` is already on the chain. **Not** safe concurrent with
+    /// other inserters — archive IBD writer only.
+    fn insert_sole(&self, txid: &[u8; 32], new_fk: Fk) -> Result<(), StoreError> {
+        let new_u = self.encode_fk(new_fk)?;
+        for d in 0..MAX_PROBE {
+            let slot = probe_index(txid, d, self.layout.bits);
+            let e = self.read_entry(slot)?;
+            if e == new_u {
+                return Ok(());
+            }
+            if e != 0 {
+                continue;
+            }
+            // Empty: sole writer claims without CAS.
+            self.store_entry(slot, new_u)?;
+            self.occupied.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        Err(StoreError::Corrupt(
+            "address head probe exhausted on sole insert",
+        ))
+    }
+
+    /// Archive sole-writer bulk insert: **no CAS**, **no primary-slot sort**.
+    ///
+    /// Inserts in call order. After the batch, callers should `fence(SeqCst)` (or
+    /// equivalent) before publishing sticky / dropping in-flight maps so prep and
+    /// other readers observe the new slots.
+    pub fn insert_many_sole(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        for (txid, fk) in entries {
+            self.insert_sole(txid, *fk)?;
+        }
+        Ok(())
+    }
+
     /// Walk probe until empty; return every fk (may include foreigners).
     pub fn probe_fks(&self, txid: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
         let mut out = Vec::new();
@@ -808,6 +868,34 @@ mod tests {
         assert_eq!(h.occupied(), 50);
         for (txid, fk) in &entries {
             assert!(h.probe_fks(txid).unwrap().contains(fk));
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(meta_path(&path));
+    }
+
+    #[test]
+    fn insert_many_sole_no_sort_roundtrip() {
+        let path = tmp("sole");
+        let h = AddressHead::create_with_bits(&path, 14).unwrap();
+        let mut entries = Vec::new();
+        // Unsorted / reverse-ish order (no primary-slot sort on sole path).
+        for i in (1..=80u64).rev() {
+            let mut txid = [0u8; 32];
+            txid[0] = (i & 0xff) as u8;
+            txid[1] = ((i >> 8) & 0xff) as u8;
+            txid[3] = 0x5e;
+            entries.push((txid, Fk(i)));
+        }
+        h.insert_many_sole(&entries).unwrap();
+        assert_eq!(h.occupied(), 80);
+        // Idempotent re-insert.
+        h.insert_many_sole(&entries[..10]).unwrap();
+        assert_eq!(h.occupied(), 80);
+        for (txid, fk) in &entries {
+            assert!(
+                h.probe_fks(txid).unwrap().contains(fk),
+                "missing after sole insert"
+            );
         }
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(meta_path(&path));

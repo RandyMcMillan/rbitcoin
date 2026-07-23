@@ -1397,6 +1397,18 @@ impl TxTable {
         Ok(())
     }
 
+    /// Archive sole-writer head insert: no CAS, no sort (see [`AddressHead::insert_many_sole`]).
+    ///
+    /// Still may start / poll online resize after the batch.
+    pub fn head_insert_many_sole(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
+        if !entries.is_empty() {
+            self.head.read().unwrap().insert_many_sole(entries)?;
+        }
+        self.maybe_start_head_resize()?;
+        self.head_resize_poll(8_192)?;
+        Ok(())
+    }
+
     /// True if a sequential head rebuild is in progress.
     pub fn head_resize_in_progress(&self) -> bool {
         self.resize.lock().unwrap().is_some()

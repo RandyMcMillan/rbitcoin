@@ -463,6 +463,9 @@ impl Query {
             ));
         }
 
+        // Head sole-writer: plain store (no CAS), no primary-slot sort.
+        // Visibility fence before sticky so prep may drop in-flight and rely on
+        // sticky/head without racing empty terminator slots mid-insert.
         let t = Instant::now();
         if plan.index_tx {
             let heads: Vec<([u8; 32], Fk)> = plan
@@ -471,7 +474,9 @@ impl Query {
                 .zip(got_tx_fks.iter())
                 .map(|((tx, _, _), fk)| (tx.txid, *fk))
                 .collect();
-            self.store.txs.head_insert_many(&heads)?;
+            self.store.txs.head_insert_many_sole(&heads)?;
+            // Ensure all Release stores are visible before sticky publish.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         }
         let head_ns = t.elapsed().as_nanos() as u64;
 
@@ -489,13 +494,17 @@ impl Query {
         }
         let htxs_ns = t.elapsed().as_nanos() as u64;
 
-        // Sticky only after durable put — never advertise uncommitted fks.
+        // Sticky only after head is fenced — never advertise uncommitted fks.
+        // Writer then drops in-flight txid→fk so prep uses sticky/head next.
         let t = Instant::now();
         self.archive_txid_sticky.insert_many(&plan.sticky_creates);
         if !plan.head_resolved.is_empty() {
             self.archive_txid_sticky
                 .insert_many(&plan.head_resolved);
         }
+        // Sticky map uses mutex; fence so any later non-locked readers of head
+        // (prep after sticky miss) cannot reorder before sticky publish.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         let sticky_ns = t.elapsed().as_nanos() as u64;
 
         let t = Instant::now();

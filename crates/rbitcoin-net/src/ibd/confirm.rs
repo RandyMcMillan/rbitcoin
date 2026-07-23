@@ -70,8 +70,8 @@ const CONFIRM_RUN_MAX: usize = 32;
 /// ≥ [`CONFIRM_RUN_MAX`] so the engine can fill a full wave when bodies exist.
 const OFFER_AHEAD: u32 = 96;
 
-/// Loaded batches waiting for scripts (load(N+1) may run while N scripts).
-pub(crate) const LOAD_QUEUE_CAP: usize = 2;
+/// Loaded batches waiting for scripts (load can run ahead of scripts).
+pub(crate) const LOAD_QUEUE_CAP: usize = 8;
 /// Script-ok batches buffered for write (scripts(N+1) may run while N writes).
 pub(crate) const WRITE_QUEUE_CAP: usize = 2;
 

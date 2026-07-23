@@ -308,7 +308,7 @@ impl Query {
 
     /// Collect thin scripthash create pointers for one tx's outputs (no spend marks).
     ///
-    /// Prefer parent cache `by_body` outs (no Class A re-decode / majflt). Store
+    /// Prefer parent cache `by_body` outs (no Class A re-decode). Store
     /// full decode is last resort — write was spending multi-second SH collect
     /// re-reading bodies that scripts already held in RAM.
     pub(crate) fn collect_scripthash_creates(

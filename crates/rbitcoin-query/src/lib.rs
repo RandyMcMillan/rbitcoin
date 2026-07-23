@@ -421,8 +421,6 @@ pub mod wave_fill_stats {
     pub static BODY_STORE: AtomicU64 = AtomicU64::new(0);
     /// Wall ns spent in store body decode.
     pub static BODY_STORE_NS: AtomicU64 = AtomicU64::new(0);
-    /// Major page faults during store body loads on the confirm thread.
-    pub static BODY_STORE_MAJFLT: AtomicU64 = AtomicU64::new(0);
     /// Time waiting on ConfirmParentCache mutex (ns).
     pub static CACHE_LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
     /// Unused (kept zero for sampler layout).
@@ -451,11 +449,10 @@ pub mod wave_fill_stats {
         )
     }
 
-    /// `(store_body_ns, store_majflt, cache_lock_wait_ns)`.
-    pub fn sample_io_and_reset() -> (u64, u64, u64) {
+    /// `(store_body_ns, cache_lock_wait_ns)`.
+    pub fn sample_io_and_reset() -> (u64, u64) {
         (
             BODY_STORE_NS.swap(0, Ordering::Relaxed),
-            BODY_STORE_MAJFLT.swap(0, Ordering::Relaxed),
             CACHE_LOCK_WAIT_NS.swap(0, Ordering::Relaxed),
         )
     }

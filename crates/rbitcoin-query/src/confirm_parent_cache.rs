@@ -2172,7 +2172,7 @@ mod tests {
         let _ = wave_fill_stats::sample_io_and_reset();
         let got = c.take_bodies_batch(&[Fk(100)]);
         assert_eq!(got.len(), 1);
-        let (_store_ns, _maj, lock_ns) = wave_fill_stats::sample_io_and_reset();
+        let (_store_ns, lock_ns) = wave_fill_stats::sample_io_and_reset();
         // Lock wait is usually tiny but the counter path must execute.
         let _ = lock_ns;
     }

@@ -67,7 +67,6 @@ impl Query {
     ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>), QueryError> {
         use crate::wave_fill_stats::{self as wf, add as wf_add, add_count as wf_count};
         let t0 = Instant::now();
-        let maj_before = thread_majflt();
         wf_count(&wf::BODY_STORE, 1);
         // Prefer cache-held idx range (skip idx page fault); body pages mlocked.
         let res = if let Some((off, len)) = self.confirm_parents.get_body_range(fk) {
@@ -78,11 +77,6 @@ impl Query {
             Ok((tx, outs, inputs))
         };
         wf_add(&wf::BODY_STORE_NS, t0.elapsed().as_nanos() as u64);
-        if let (Some(b), Some(a)) = (maj_before, thread_majflt()) {
-            if a > b {
-                wf::add_count(&wf::BODY_STORE_MAJFLT, a - b);
-            }
-        }
         res
     }
 
@@ -325,21 +319,4 @@ impl Query {
             Some(h) => Ok(Some(self.reconstruct_block_at_height(h)?)),
         }
     }
-}
-
-/// Process majflt sample (Linux); `None` when unavailable.
-#[cfg(target_os = "linux")]
-fn thread_majflt() -> Option<u64> {
-    let s = std::fs::read_to_string("/proc/self/status").ok()?;
-    for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("MajFlt:") {
-            return rest.trim().split_whitespace().next()?.parse().ok();
-        }
-    }
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
-fn thread_majflt() -> Option<u64> {
-    None
 }

@@ -105,9 +105,8 @@ pub(crate) struct IbdPerfSample {
     /// Thin edges moved from cache stash vs rebuilt from inputs.
     pub wf_thin_cache: u64,
     pub wf_thin_rebuild: u64,
-    /// Store body decode wall (ms) + majflt count during those loads.
+    /// Store body decode wall (ms) during wire rebuild.
     pub wf_store_body_ms: u64,
-    pub wf_store_majflt: u64,
     /// ConfirmParentCache mutex wait (ms).
     pub wf_cache_lock_ms: u64,
 
@@ -273,7 +272,6 @@ impl Default for IbdPerfSample {
             wf_thin_cache: 0,
             wf_thin_rebuild: 0,
             wf_store_body_ms: 0,
-            wf_store_majflt: 0,
             wf_cache_lock_ms: 0,
             sh_warm_ms: 0,
             sh_filter_ms: 0,
@@ -403,7 +401,7 @@ pub(crate) fn sample(
         rbitcoin_query::wave_fill_stats::sample_and_reset();
     let (wf_body_cache, wf_body_store, wf_thin_cache, wf_thin_rebuild) =
         rbitcoin_query::wave_fill_stats::sample_counts_and_reset();
-    let (wf_store_body_ns, wf_store_majflt, wf_cache_lock_ns) =
+    let (wf_store_body_ns, wf_cache_lock_ns) =
         rbitcoin_query::wave_fill_stats::sample_io_and_reset();
     let (pwh, pca, psm) = rbitcoin_query::connect_prevout_stats::sample_and_reset();
     let pw = rbitcoin_query::confirm_load_stats::sample_and_reset();
@@ -485,7 +483,6 @@ pub(crate) fn sample(
         wf_thin_cache,
         wf_thin_rebuild,
         wf_store_body_ms: ns_ms(wf_store_body_ns),
-        wf_store_majflt,
         wf_cache_lock_ms: ns_ms(wf_cache_lock_ns),
         sh_warm_ms: ns_ms(sh_warm),
         sh_filter_ms: ns_ms(sh_filter),
@@ -691,7 +688,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         us(s.cache_tip_ns),
     );
     out.push_str(&format!(
-        " | wave body={} ptx={} pout={} spent={} cb={} cache={} store={} thin={} rebuild={} store_ms={} majflt={} lock_ms={}",
+        " | wave body={} ptx={} pout={} spent={} cb={} cache={} store={} thin={} rebuild={} store_ms={} lock_ms={}",
         s.wf_body_ms,
         s.wf_ptx_ms,
         s.wf_pout_ms,
@@ -702,7 +699,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.wf_thin_cache,
         s.wf_thin_rebuild,
         s.wf_store_body_ms,
-        s.wf_store_majflt,
         s.wf_cache_lock_ms,
     ));
     out.push_str(&format!(
@@ -843,14 +839,13 @@ pub(crate) fn log_sample(s: &IbdPerfSample) {
         let recon_ms = s.recon_ms / s.phase_blks.max(1);
         if c_ms >= 1000 || sh_ms >= 1000 || recon_ms >= 5000 {
             rbitcoin_log::warn!(
-                "ibd: slow confirm phase ms/blk recon={} script={} class_c={} sh={} (sh_collect={}ms window) store_body={}ms majflt={} cache_lock={}ms blks={}",
+                "ibd: slow confirm phase ms/blk recon={} script={} class_c={} sh={} (sh_collect={}ms window) store_body={}ms cache_lock={}ms blks={}",
                 recon_ms,
                 s.script_ms / s.phase_blks.max(1),
                 c_ms,
                 sh_ms,
                 s.sh_collect_ms,
                 s.wf_store_body_ms,
-                s.wf_store_majflt,
                 s.wf_cache_lock_ms,
                 s.phase_blks,
             );
@@ -975,8 +970,8 @@ mod tests {
         assert!(line.contains("arch_res resolve_us/blk="), "{line}");
         assert!(line.contains("sticky_map="), "{line}");
         assert!(line.contains("store_ms="), "{line}");
-        assert!(line.contains("majflt="), "{line}");
         assert!(line.contains("lock_ms="), "{line}");
+        assert!(!line.contains("majflt="), "{line}");
         assert!(line.contains("contig next_h="), "{line}");
         assert!(!line.contains("reserved"), "{line}");
         assert!(line.contains("pipe "), "{line}");

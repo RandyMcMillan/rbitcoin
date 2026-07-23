@@ -69,6 +69,33 @@ pub fn confirm_mlock_from_env() -> bool {
     }
 }
 
+/// Default grace heights added past last known need when stamping `keep_until`.
+///
+/// Cross-batch re-spends of the same parent are common; with empty conf_q load
+/// depth, tip GC would otherwise drop `by_fk` before the next load sees them.
+/// `256` ≈ 8 × 32-blk batches. `RBITCOIN_CONFIRM_PIN_KEEP_GRACE=0` = strict
+/// (need+1 exclusive only).
+pub const DEFAULT_PIN_KEEP_GRACE: u32 = 256;
+
+/// `RBITCOIN_CONFIRM_PIN_KEEP_GRACE` (default [`DEFAULT_PIN_KEEP_GRACE`]).
+pub fn pin_keep_grace_from_env() -> u32 {
+    std::env::var("RBITCOIN_CONFIRM_PIN_KEEP_GRACE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_PIN_KEEP_GRACE)
+}
+
+/// Exclusive retention end: drop when `tip >= keep_until`.
+///
+/// `need + 1` keeps the entry through tip == need (write just finished that
+/// height); `+ grace` covers unknown future re-spends without load queue depth.
+#[inline]
+pub fn pin_keep_until_for(need_height: u32, grace: u32) -> u32 {
+    need_height
+        .saturating_add(1)
+        .saturating_add(grace)
+}
+
 /// One needed prevout under a parent create.
 #[derive(Debug, Clone)]
 pub struct ParentOut {
@@ -92,8 +119,9 @@ pub struct ParentEntry {
     pub coinbase_height: Option<Option<u32>>,
     /// Height of the parent cache body that registered this create (`None` = UTXO load).
     pub create_height: Option<u32>,
-    /// Max confirm height that still needs this pin. Survives tip GC while
-    /// `keep_until > tip` even if plan.need_fk was dropped (load pipeline lag).
+    /// Exclusive end height for tip GC retention: keep while `keep_until > tip`
+    /// even if plan.need_fk was dropped. Stamped as `need + 1 + pin_keep_grace`
+    /// so empty conf_q / cross-batch re-spends still hit `pin_cached`.
     pub keep_until: u32,
 }
 
@@ -196,6 +224,8 @@ struct Inner {
     page_refs: HashMap<(u8, u64), u32>,
     /// How many distinct ranges currently held (perf).
     mlock_n: usize,
+    /// Heights past last known need retained in `by_fk` (see `pin_keep_until_for`).
+    pin_keep_grace: u32,
 }
 
 /// Process-local confirm parent cache.
@@ -229,6 +259,7 @@ impl ConfirmParentCache {
                 mlocked: HashMap::new(),
                 page_refs: HashMap::new(),
                 mlock_n: 0,
+                pin_keep_grace: pin_keep_grace_from_env(),
             }),
             ready_cv: Condvar::new(),
             ready_through: AtomicU32::new(0),
@@ -237,6 +268,16 @@ impl ConfirmParentCache {
 
     pub fn from_env() -> Self {
         Self::new()
+    }
+
+    /// Override pin keep-alive grace (tests / ops). Default from env at `new`.
+    pub fn set_pin_keep_grace(&self, grace: u32) {
+        self.inner.lock().unwrap().pin_keep_grace = grace;
+    }
+
+    /// Current pin keep-alive grace heights.
+    pub fn pin_keep_grace(&self) -> u32 {
+        self.inner.lock().unwrap().pin_keep_grace
     }
 
     /// Highest height such that every plan in `(tip, ready_through]` is ready.
@@ -365,7 +406,13 @@ impl ConfirmParentCache {
     ///
     /// Released when every needing height falls ≤ tip / past horizon.
     pub fn note_mlock_ranges(&self, need_height: u32, ranges: &[MlockRange]) {
-        if ranges.is_empty() {
+        self.note_mlock_ranges_for_heights(&[need_height], ranges);
+    }
+
+    /// Like [`Self::note_mlock_ranges`] but one lock for many needing heights
+    /// (batch unique-range mlock path).
+    pub fn note_mlock_ranges_for_heights(&self, heights: &[u32], ranges: &[MlockRange]) {
+        if ranges.is_empty() || heights.is_empty() {
             return;
         }
         const PAGE: u64 = 4096;
@@ -391,7 +438,9 @@ impl ConfirmParentCache {
                     }
                 }
                 if let Some(rec) = g.mlocked.get_mut(&key) {
-                    rec.need_heights.insert(need_height);
+                    for &h in heights {
+                        rec.need_heights.insert(h);
+                    }
                     if end_page > rec.end_page {
                         rec.end_page = end_page;
                         rec.range.page_len = end_page
@@ -404,8 +453,10 @@ impl ConfirmParentCache {
             for p in start_page..end_page {
                 *g.page_refs.entry((table, p)).or_insert(0) += 1;
             }
-            let mut need = HashSet::new();
-            need.insert(need_height);
+            let mut need = HashSet::with_capacity(heights.len());
+            for &h in heights {
+                need.insert(h);
+            }
             g.mlocked.insert(
                 key,
                 RangeRec {
@@ -1812,8 +1863,9 @@ impl Inner {
     /// Attach plan keep-alive for an already-stashed parent (no re-decode).
     fn touch_parent_needs_inner(&mut self, height: u32, id: u64, vouts: &[u32]) {
         // Collect under by_fk/by_body first — cannot hold plan mut borrow too.
+        let grace = self.pin_keep_grace;
         let pins: Vec<u32> = if let Some(e) = self.by_fk.get_mut(&id) {
-            e.keep_until = e.keep_until.max(height);
+            e.keep_until = e.keep_until.max(pin_keep_until_for(height, grace));
             let mut vs: Vec<u32> = vouts
                 .iter()
                 .copied()
@@ -1848,6 +1900,8 @@ impl Inner {
         create_height: Option<u32>,
     ) {
         let txid = tx.txid;
+        let grace = self.pin_keep_grace;
+        let until = pin_keep_until_for(height, grace);
         {
             let e = self.by_fk.entry(id).or_insert_with(|| ParentEntry {
                 tx: tx.clone(),
@@ -1855,10 +1909,10 @@ impl Inner {
                 checked: HashSet::new(),
                 coinbase_height: None,
                 create_height: None,
-                keep_until: height,
+                keep_until: until,
             });
             e.tx = tx;
-            e.keep_until = e.keep_until.max(height);
+            e.keep_until = e.keep_until.max(until);
             if coinbase_height.is_some() {
                 e.coinbase_height = coinbase_height;
             }
@@ -2486,6 +2540,7 @@ mod tests {
     #[test]
     fn body_range_gc_drops_orphaned_parent_ranges() {
         let c = ConfirmParentCache::new();
+        c.set_pin_keep_grace(0); // exclusive need+1 only for this GC test
         c.advance_tip(0);
         c.ensure_plan(1, [1u8; 32]);
         // Parent pin range only (no by_body / by_fk keep-alive after tip).
@@ -2502,8 +2557,10 @@ mod tests {
         );
         assert_eq!(c.body_range_count(), 1);
         c.mark_scanned(1);
-        // Tip past plan → orphan parent GC → body_range gone.
+        // tip == need still retains (keep_until = need+1); tip past exclusive end drops.
         c.advance_tip(1);
+        assert_eq!(c.body_range_count(), 1, "grace=0 still holds at tip == need");
+        c.advance_tip(2);
         assert_eq!(
             c.body_range_count(),
             0,
@@ -2984,10 +3041,11 @@ mod tests {
     }
 
     /// keep_until must retain by_fk after tip advances past create_height until
-    /// the last needing confirm height is confirmed (load pipeline lag).
+    /// the exclusive retention end (need+1 with grace=0).
     #[test]
     fn pin_keep_until_survives_tip_gc_until_spender_confirms() {
         let c = ConfirmParentCache::new();
+        c.set_pin_keep_grace(0); // exclusive need+1 only
         c.advance_tip(10);
         // Parent create at height 5 (already confirmed), pinned for spender at 100.
         let t = tx(9);
@@ -2999,22 +3057,88 @@ mod tests {
             &[0],
             Some(None),
         );
-        // create_height None — only keep_until=100 keeps the row.
+        // keep_until = 101 (need+1); create_height None.
         assert!(c.parent_pin_covered(Fk(99), &[0]));
-        c.advance_tip(50); // past create, but spender 100 still ahead
+        c.advance_tip(50); // past create, but keep_until still ahead
         assert!(
             c.parent_pin_covered(Fk(99), &[0]),
             "by_fk must survive tip GC while keep_until > tip"
         );
-        // Touch later batch needing height 120.
-        c.touch_parent_needs(120, Fk(99), &[0]);
+        // tip == need still retains (exclusive end = need+1).
         c.advance_tip(100);
-        assert!(c.parent_pin_covered(Fk(99), &[0]), "keep_until extended to 120");
+        assert!(
+            c.parent_pin_covered(Fk(99), &[0]),
+            "retain at tip == need with grace=0"
+        );
+        // Touch later batch needing height 120 → keep_until = 121.
+        c.touch_parent_needs(120, Fk(99), &[0]);
         c.advance_tip(120);
         assert!(
-            !c.parent_pin_covered(Fk(99), &[0]),
-            "drop after tip passes keep_until"
+            c.parent_pin_covered(Fk(99), &[0]),
+            "retain at tip == need after touch"
         );
+        c.advance_tip(121);
+        assert!(
+            !c.parent_pin_covered(Fk(99), &[0]),
+            "drop when tip >= keep_until"
+        );
+    }
+
+    /// Grace keeps by_fk across tip == need so empty conf_q still gets pin_cached.
+    #[test]
+    fn pin_keep_grace_survives_cross_batch_without_load_depth() {
+        let c = ConfirmParentCache::new();
+        c.set_pin_keep_grace(32);
+        c.advance_tip(10);
+        let t = tx(3);
+        c.put_parent_outs_resolved(
+            100,
+            Fk(55),
+            t,
+            &[(0, out(1))],
+            &[0],
+            Some(None),
+        );
+        // keep_until = 100 + 1 + 32 = 133
+        c.advance_tip(100);
+        assert!(
+            c.parent_pin_covered(Fk(55), &[0]),
+            "grace retains after tip reaches last known need"
+        );
+        c.advance_tip(132);
+        assert!(c.parent_pin_covered(Fk(55), &[0]));
+        c.advance_tip(133);
+        assert!(
+            !c.parent_pin_covered(Fk(55), &[0]),
+            "drop after tip passes need+1+grace"
+        );
+    }
+
+    #[test]
+    fn pin_keep_until_for_math() {
+        assert_eq!(pin_keep_until_for(100, 0), 101);
+        assert_eq!(pin_keep_until_for(100, 256), 357);
+        assert_eq!(pin_keep_until_for(u32::MAX, 10), u32::MAX);
+    }
+
+    #[test]
+    fn note_mlock_ranges_for_heights_unions_needs() {
+        let c = ConfirmParentCache::new();
+        c.advance_tip(0);
+        let r = MlockRange {
+            table: rbitcoin_store::MlockTable::TxBody,
+            page_start: 0,
+            page_len: 4096,
+        };
+        c.note_mlock_ranges_for_heights(&[5, 6, 7], &[r]);
+        assert!(c.is_range_pinned(&r));
+        // Tip past 5 but not 6/7 — range still held.
+        let unlocks = c.advance_tip(5);
+        assert!(unlocks.is_empty(), "heights 6,7 still need pages");
+        assert!(c.is_range_pinned(&r));
+        let unlocks = c.advance_tip(7);
+        assert!(!unlocks.is_empty());
+        assert!(!c.is_range_pinned(&r));
     }
 
     /// Slim batch pin: only requested outs, one lock, coinbase hint; no full input clone.

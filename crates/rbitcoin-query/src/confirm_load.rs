@@ -75,79 +75,92 @@ pub struct ConfirmLoadStats {
 }
 
 impl Query {
-    /// Note ranges for `height` (always). Prefer calling after an mlock that
-    /// skipped already-pinned spans so need_heights stay accurate for GC.
-    fn mlock_note_skip_pinned(&self, height: u32, ranges: &[rbitcoin_store::MlockRange]) {
-        self.confirm_parents.note_mlock_ranges(height, ranges);
-    }
-
-    /// Page-align + merge body `(offset, len)`, `mlock` only spans not already
-    /// pinned, note all spans for each of `heights`.
+    /// Batch-mlock **unique** page-aligned body spans for many parents.
     ///
-    /// Returns `(ranges, syscalls, skipped)`.
-    fn mlock_body_spans_for_heights(
-        &self,
-        heights: &[u32],
-        abs_ranges: &[(u64, u64)],
-    ) -> (Vec<rbitcoin_store::MlockRange>, u32, u32) {
-        if abs_ranges.is_empty() || heights.is_empty() {
-            return (Vec::new(), 0, 0);
+    /// Each item is `(need_heights, body_offset, body_len)`. Overlapping /
+    /// adjacent pages merge so one kernel `mlock` covers many parents. Notes
+    /// need_heights **immediately per merged span** so later spans in the same
+    /// batch can skip already-held pages (do not regress “note only at end”).
+    ///
+    /// Returns `(syscalls, skipped)`.
+    fn mlock_unique_body_ranges(&self, items: &[(Vec<u32>, u64, u64)]) -> (u32, u32) {
+        if items.is_empty() {
+            return (0, 0);
         }
         const PAGE: u64 = 4096;
-        let mut spans: Vec<(u64, u64)> = Vec::with_capacity(abs_ranges.len());
-        for &(off, len) in abs_ranges {
-            if len == 0 {
+        // (page_start, page_len, heights_idx into a side table) — expand then merge.
+        let mut spans: Vec<(u64, u64, usize)> = Vec::with_capacity(items.len());
+        let mut height_sets: Vec<Vec<u32>> = Vec::with_capacity(items.len());
+        for (hs, off, len) in items {
+            if *len == 0 || hs.is_empty() {
                 continue;
             }
-            let start = off & !(PAGE - 1);
-            let end = off.saturating_add(len).saturating_add(PAGE - 1) & !(PAGE - 1);
+            let start = *off & !(PAGE - 1);
+            let end = off.saturating_add(*len).saturating_add(PAGE - 1) & !(PAGE - 1);
             let plen = end.saturating_sub(start);
-            if plen > 0 {
-                spans.push((start, plen));
+            if plen == 0 {
+                continue;
             }
+            let idx = height_sets.len();
+            height_sets.push(hs.clone());
+            spans.push((start, plen, idx));
         }
         if spans.is_empty() {
-            return (Vec::new(), 0, 0);
+            return (0, 0);
         }
-        spans.sort_unstable_by_key(|(s, _)| *s);
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
-        for (s, l) in spans {
-            if let Some((ms, ml)) = merged.last_mut() {
+        spans.sort_unstable_by_key(|(s, _, _)| *s);
+        // Merge overlapping/adjacent; union height set indices.
+        let mut merged: Vec<(u64, u64, HashSet<usize>)> = Vec::with_capacity(spans.len());
+        for (s, l, idx) in spans {
+            if let Some((ms, ml, set)) = merged.last_mut() {
                 let mend = ms.saturating_add(*ml);
                 if s <= mend {
                     let new_end = s.saturating_add(l).max(mend);
                     *ml = new_end.saturating_sub(*ms);
+                    set.insert(idx);
                     continue;
                 }
             }
-            merged.push((s, l));
+            let mut set = HashSet::with_capacity(1);
+            set.insert(idx);
+            merged.push((s, l, set));
         }
-        let mut noted = Vec::with_capacity(merged.len());
         let mut syscalls = 0u32;
         let mut skipped = 0u32;
-        for (ps, pl) in merged {
+        for (ps, pl, idx_set) in merged {
+            // Union need heights for this span.
+            let mut heights: Vec<u32> = Vec::new();
+            for i in idx_set {
+                heights.extend(height_sets[i].iter().copied());
+            }
+            heights.sort_unstable();
+            heights.dedup();
+            if heights.is_empty() {
+                continue;
+            }
             let candidate = rbitcoin_store::MlockRange {
                 table: rbitcoin_store::MlockTable::TxBody,
                 page_start: ps,
                 page_len: pl,
             };
-            if self.confirm_parents.is_range_pinned(&candidate) {
-                noted.push(candidate);
-                skipped = skipped.saturating_add(1);
-                continue;
-            }
-            let ml = self.store.mlock_tx_body_at(ps, pl);
-            syscalls = syscalls.saturating_add(1);
-            if ml.is_empty() {
-                noted.push(candidate);
-            } else {
-                noted.extend(ml);
-            }
+            let noted: Vec<rbitcoin_store::MlockRange> =
+                if self.confirm_parents.is_range_pinned(&candidate) {
+                    skipped = skipped.saturating_add(1);
+                    vec![candidate]
+                } else {
+                    let ml = self.store.mlock_tx_body_at(ps, pl);
+                    syscalls = syscalls.saturating_add(1);
+                    if ml.is_empty() {
+                        vec![candidate]
+                    } else {
+                        ml
+                    }
+                };
+            // Note immediately so the next merged span can skip shared pages.
+            self.confirm_parents
+                .note_mlock_ranges_for_heights(&heights, &noted);
         }
-        for &h in heights {
-            self.confirm_parents.note_mlock_ranges(h, &noted);
-        }
-        (noted, syscalls, skipped)
+        (syscalls, skipped)
     }
 
     pub fn parent_cache_ready_through(&self) -> u32 {
@@ -512,9 +525,11 @@ impl Query {
         st.pin_cover_miss_partial = miss_partial;
         let mut touch_batch: Vec<(u32, u64, Vec<u32>)> = Vec::new();
         let mut parent_ranges: Vec<(Fk, u64, u64)> = Vec::new();
-        // Per-parent mlock (not batch-coalesced): each call notes page_refs so the
-        // next parent can skip already-pinned pages. Batching all ranges first
-        // notes only at the end → mlock_sys skip=0 and worse wall time.
+        // Unique-range mlock: collect (need_heights, off, len) for cover + pin_new;
+        // one page-merged pass notes immediately per span (skip works in-batch).
+        // Body-LRU pin_cache skips kernel mlock (pages already in RAM).
+        let mut mlock_items: Vec<(Vec<u32>, u64, u64)> = Vec::new();
+        let mut mlock_no_range: Vec<(Vec<u32>, Fk)> = Vec::new();
         // (max_height, fk, tx, live outs, checked vouts, coinbase_height, create_height)
         let mut sparse_parents: Vec<(
             u32,
@@ -536,26 +551,15 @@ impl Query {
                 }
                 let fk = Fk(pid);
                 if do_mlock {
-                    let t_ml = Instant::now();
                     if let Some((off, len)) = self
                         .confirm_parents
                         .get_body_range(fk)
                         .or_else(|| self.store.tx_body_range(fk).ok())
                     {
-                        let (_, sys, sk) =
-                            self.mlock_body_spans_for_heights(&need_hs, &[(off, len)]);
-                        st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
-                        st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
+                        mlock_items.push((need_hs, off, len));
                     } else {
-                        let body_ml = self.store.mlock_tx_body_only(fk);
-                        st.mlock_syscalls = st.mlock_syscalls.saturating_add(1);
-                        for h in &need_hs {
-                            self.mlock_note_skip_pinned(*h, &body_ml);
-                        }
+                        mlock_no_range.push((need_hs, fk));
                     }
-                    st.pin_mlock_ns = st
-                        .pin_mlock_ns
-                        .saturating_add(t_ml.elapsed().as_nanos() as u64);
                 }
                 st.utxo_parents = st.utxo_parents.saturating_add(1);
             } else {
@@ -572,6 +576,10 @@ impl Query {
             .confirm_parents
             .get_bodies_for_pin_batch(&body_pin_keys);
 
+        // pin_new jobs: resolve ranges first so unique-range mlock runs before
+        // meta/out reads (warm pages), then decode.
+        let mut pin_new_jobs: Vec<(u64, u32, Vec<u32>, Vec<u32>, Option<(u64, u64)>)> =
+            Vec::new();
         for (_i, pid, max_h, need_hs, need_vouts) in uncovered {
             if self.confirm_cancelled() {
                 crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
@@ -646,8 +654,6 @@ impl Query {
                 }
             }
             st.pin_new = st.pin_new.saturating_add(1);
-
-            // Prefer cached body range over idx read.
             let range = self
                 .confirm_parents
                 .get_body_range(fk)
@@ -655,16 +661,41 @@ impl Query {
             if let Some((off, len)) = range {
                 parent_ranges.push((fk, off, len));
                 if do_mlock {
-                    let t_ml = Instant::now();
-                    let (_, sys, sk) =
-                        self.mlock_body_spans_for_heights(&need_hs, &[(off, len)]);
-                    st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
-                    st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
-                    st.pin_mlock_ns = st
-                        .pin_mlock_ns
-                        .saturating_add(t_ml.elapsed().as_nanos() as u64);
+                    mlock_items.push((need_hs.clone(), off, len));
                 }
-                // Sparse outs + spent filter + coinbase height for wave.
+            } else if do_mlock {
+                mlock_no_range.push((need_hs.clone(), fk));
+            }
+            pin_new_jobs.push((pid, max_h, need_hs, need_vouts, range));
+        }
+
+        // Unique-range mlock before pin_new meta reads (and cover need_height notes).
+        if do_mlock && (!mlock_items.is_empty() || !mlock_no_range.is_empty()) {
+            let t_ml = Instant::now();
+            if !mlock_items.is_empty() {
+                let (sys, sk) = self.mlock_unique_body_ranges(&mlock_items);
+                st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
+                st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
+            }
+            for (need_hs, fk) in &mlock_no_range {
+                let body_ml = self.store.mlock_tx_body_only(*fk);
+                st.mlock_syscalls = st.mlock_syscalls.saturating_add(1);
+                self.confirm_parents
+                    .note_mlock_ranges_for_heights(need_hs, &body_ml);
+            }
+            st.pin_mlock_ns = st
+                .pin_mlock_ns
+                .saturating_add(t_ml.elapsed().as_nanos() as u64);
+        }
+
+        // Sparse outs + spent filter for pin_new (pages warm when mlock on).
+        for (pid, max_h, need_hs, need_vouts, range) in pin_new_jobs {
+            if self.confirm_cancelled() {
+                crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                return Err(StoreError::Cancelled("confirm cancelled"));
+            }
+            let fk = Fk(pid);
+            if let Some((off, len)) = range {
                 if !need_vouts.is_empty() {
                     match self.store.get_tx_meta_and_outputs_at(off, len) {
                         Ok((tx, outs)) => {
@@ -686,7 +717,6 @@ impl Query {
                                     }
                                 }
                             }
-                            // Ok(v) → Some(v) stashed; Err → None (wave recomputes).
                             let cb_stash = match self.resolve_parent_coinbase_height(
                                 fk,
                                 tx.input_count,
@@ -714,59 +744,46 @@ impl Query {
                         }
                     }
                 }
-            } else {
-                if do_mlock {
-                    let t_ml = Instant::now();
-                    let body_ml = self.store.mlock_tx_body_only(fk);
-                    st.mlock_syscalls = st.mlock_syscalls.saturating_add(1);
-                    for h in &need_hs {
-                        self.mlock_note_skip_pinned(*h, &body_ml);
-                    }
-                    st.pin_mlock_ns = st
-                        .pin_mlock_ns
-                        .saturating_add(t_ml.elapsed().as_nanos() as u64);
-                }
+            } else if !need_vouts.is_empty() {
                 // No range: try idx-based outs for sparse stash (rare).
-                if !need_vouts.is_empty() {
-                    if let Ok((tx, outs)) = self.store.get_tx_meta_and_outputs(fk) {
-                        let t_sp = Instant::now();
-                        let unspent = self
-                            .store
-                            .unspent_create_vouts(fk, &need_vouts, None)
-                            .unwrap_or_default();
-                        st.pin_spent_ns = st
-                            .pin_spent_ns
-                            .saturating_add(t_sp.elapsed().as_nanos() as u64);
-                        let unspent_set: std::collections::HashSet<u32> =
-                            unspent.into_iter().collect();
-                        let mut live = Vec::with_capacity(unspent_set.len());
-                        for &v in &need_vouts {
-                            if unspent_set.contains(&v) {
-                                if let Some(o) = outs.get(v as usize) {
-                                    live.push((v, o.clone()));
-                                }
+                if let Ok((tx, outs)) = self.store.get_tx_meta_and_outputs(fk) {
+                    let t_sp = Instant::now();
+                    let unspent = self
+                        .store
+                        .unspent_create_vouts(fk, &need_vouts, None)
+                        .unwrap_or_default();
+                    st.pin_spent_ns = st
+                        .pin_spent_ns
+                        .saturating_add(t_sp.elapsed().as_nanos() as u64);
+                    let unspent_set: std::collections::HashSet<u32> =
+                        unspent.into_iter().collect();
+                    let mut live = Vec::with_capacity(unspent_set.len());
+                    for &v in &need_vouts {
+                        if unspent_set.contains(&v) {
+                            if let Some(o) = outs.get(v as usize) {
+                                live.push((v, o.clone()));
                             }
                         }
-                        let cb_stash = match self
-                            .resolve_parent_coinbase_height(fk, tx.input_count, None)
-                        {
-                            Ok(v) => Some(v),
-                            Err(_) => None,
-                        };
-                        sparse_parents.push((
-                            max_h,
-                            fk,
-                            tx,
-                            live,
-                            need_vouts.clone(),
-                            cb_stash,
-                            None,
-                        ));
-                        for &h in &need_hs {
-                            touch_batch.push((h, pid, need_vouts.clone()));
-                        }
-                        st.full_tx_reads = st.full_tx_reads.saturating_add(1);
                     }
+                    let cb_stash = match self
+                        .resolve_parent_coinbase_height(fk, tx.input_count, None)
+                    {
+                        Ok(v) => Some(v),
+                        Err(_) => None,
+                    };
+                    sparse_parents.push((
+                        max_h,
+                        fk,
+                        tx,
+                        live,
+                        need_vouts.clone(),
+                        cb_stash,
+                        None,
+                    ));
+                    for &h in &need_hs {
+                        touch_batch.push((h, pid, need_vouts.clone()));
+                    }
+                    st.full_tx_reads = st.full_tx_reads.saturating_add(1);
                 }
             }
             st.utxo_parents = st.utxo_parents.saturating_add(1);

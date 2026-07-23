@@ -342,7 +342,7 @@ pub(crate) fn spawn_confirm_engine(
                             return;
                         }
                         if msg.contains("prewarm incomplete") {
-                            // Runway lag / GC race — re-queue and wait (do not demote Class A).
+                            // Runway lag / package drained — re-queue (do not demote Class A).
                             {
                                 let mut g = feed.ready.lock().unwrap();
                                 for &(h, ha) in &batch {
@@ -352,10 +352,16 @@ pub(crate) fn spawn_confirm_engine(
                                 }
                                 feed.cv.notify_one();
                             }
-                            debug!(
-                                "ibd: confirm prewarm incomplete @ {expect} {hash} — re-queue (wait runway)"
-                            );
-                            std::thread::sleep(Duration::from_millis(10));
+                            static N: AtomicU32 = AtomicU32::new(0);
+                            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n <= 3 || n % 200 == 0 {
+                                warn!(
+                                    "ibd: confirm prewarm incomplete @ {expect} {hash} — re-queue (n={n}): {msg}"
+                                );
+                            }
+                            // Give the prewarm worker time to re-hydrate tip+1
+                            // (and avoid multi-kHz spam when package is still empty).
+                            std::thread::sleep(Duration::from_millis(50));
                             continue;
                         }
                         if msg.contains("confirm without archive")

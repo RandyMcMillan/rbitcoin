@@ -692,6 +692,9 @@ impl ConfirmParentCache {
     }
 
     /// Move many bodies under **one** lock (confirm wave_fill hot path).
+    ///
+    /// Prefer [`Self::get_bodies_batch`] when confirm may re-queue (failed
+    /// package must not empty the runway while the height stays "ready").
     pub fn take_bodies_batch(
         &self,
         fks: &[Fk],
@@ -710,6 +713,61 @@ impl ConfirmParentCache {
             }
         }
         out
+    }
+
+    /// Clone many bodies under **one** lock (keeps runway intact for retries).
+    pub fn get_bodies_batch(
+        &self,
+        fks: &[Fk],
+    ) -> HashMap<u64, (TxRecord, Vec<OutputRecord>, Vec<InputRecord>)> {
+        if fks.is_empty() {
+            return HashMap::new();
+        }
+        let g = self.inner.lock().unwrap();
+        let mut out = HashMap::with_capacity(fks.len());
+        for &fk in fks {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            if let Some(e) = g.by_body.get(&id) {
+                out.insert(id, (e.tx.clone(), e.outputs.clone(), e.inputs.clone()));
+            }
+        }
+        out
+    }
+
+    /// Clone thin edges under one lock (keeps stash for retries).
+    pub fn get_thin_inputs_batch(&self, fks: &[Fk]) -> HashMap<u64, Vec<StashedThinInput>> {
+        if fks.is_empty() {
+            return HashMap::new();
+        }
+        let g = self.inner.lock().unwrap();
+        let mut out = HashMap::with_capacity(fks.len());
+        for &fk in fks {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            if let Some(edges) = g.thin_edges.get(&id) {
+                out.insert(id, edges.clone());
+            }
+        }
+        out
+    }
+
+    /// True if every Class A body in `tx_fks` is still fully decoded on the runway.
+    ///
+    /// Used to re-prewarm heights that were `mark_scanned` but later drained
+    /// (e.g. historical `take_bodies_batch` on a failed confirm).
+    pub fn bodies_complete(&self, tx_fks: &[Fk]) -> bool {
+        if tx_fks.is_empty() {
+            return false;
+        }
+        let g = self.inner.lock().unwrap();
+        tx_fks.iter().all(|fk| {
+            fk.get()
+                .map(|id| g.by_body.contains_key(&id))
+                .unwrap_or(false)
+        })
     }
 
     /// Attach prewarm-resolved thin edges (wave_fill fast path; no full body required).
@@ -2204,7 +2262,7 @@ mod tests {
 
     #[test]
     fn take_bodies_batch_moves_no_clone_left() {
-        // Wave fill must move prewarmed bodies out (sole consumer), not clone.
+        // No-worker path may still move bodies; body_range survives for annotate.
         let c = ConfirmParentCache::new(64);
         c.advance_tip(0);
         let t1 = tx(1);
@@ -2215,7 +2273,6 @@ mod tests {
         ]);
         c.put_body_range(Fk(1), 100, 50);
         c.put_body_range(Fk(2), 200, 60);
-        // body_range survives take (spend annotate still needs it).
         let taken = c.take_bodies_batch(&[Fk(1), Fk(2), Fk(3)]);
         assert_eq!(taken.len(), 2);
         assert_eq!(taken.get(&1).unwrap().0.txid, t1.txid);
@@ -2224,8 +2281,22 @@ mod tests {
         assert!(c.get_body(Fk(2)).is_none());
         assert_eq!(c.get_body_range(Fk(1)), Some((100, 50)));
         assert_eq!(c.get_body_range(Fk(2)), Some((200, 60)));
-        // Second take is empty.
         assert!(c.take_bodies_batch(&[Fk(1)]).is_empty());
+    }
+
+    #[test]
+    fn get_bodies_batch_keeps_runway_for_retry() {
+        // Worker-live confirm clones so a failed package can re-queue.
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(0);
+        let t1 = tx(1);
+        c.put_bodies_batch(vec![(Fk(1), 1, t1.clone(), vec![out(10)], vec![])]);
+        let got = c.get_bodies_batch(&[Fk(1)]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got.get(&1).unwrap().0.txid, t1.txid);
+        assert!(c.has_body(Fk(1)));
+        assert!(c.bodies_complete(&[Fk(1)]));
+        assert!(!c.bodies_complete(&[Fk(1), Fk(2)]));
     }
 
     #[test]

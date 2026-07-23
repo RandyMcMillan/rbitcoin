@@ -59,10 +59,21 @@ impl Query {
             crate::WavePrevoutCache::with_capacity(wave_tx_fks.len(), wave_tx_fks.len());
         let mut noted = 0usize;
 
-        // Pass 2: wave bodies — batch move from runway (one lock each), else store.
+        // Pass 2: wave bodies from runway.
+        // Cache-only / worker-live: **clone** (get) so a failed confirm can
+        // re-queue without emptying the runway while heights stay "ready".
+        // No-worker (tests / sync path): move (take) as before.
         let t_body = Instant::now();
-        let mut taken_bodies = self.confirm_parents.take_bodies_batch(&wave_tx_fks);
-        let mut taken_thin = self.confirm_parents.take_thin_inputs_batch(&wave_tx_fks);
+        let mut taken_bodies = if cache_only {
+            self.confirm_parents.get_bodies_batch(&wave_tx_fks)
+        } else {
+            self.confirm_parents.take_bodies_batch(&wave_tx_fks)
+        };
+        let mut taken_thin = if cache_only {
+            self.confirm_parents.get_thin_inputs_batch(&wave_tx_fks)
+        } else {
+            self.confirm_parents.take_thin_inputs_batch(&wave_tx_fks)
+        };
         // parent_fk → needed vouts (small lists; sort/dedup later).
         let mut parent_needed: HashMap<u64, Vec<u32>> = HashMap::new();
         let mut n_cache = 0u64;

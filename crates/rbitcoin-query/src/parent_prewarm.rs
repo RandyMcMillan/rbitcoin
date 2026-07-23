@@ -267,8 +267,22 @@ impl Query {
                 continue;
             }
             if self.confirm_parents.is_ready(height) {
-                st.already_ready = st.already_ready.saturating_add(1);
-                continue;
+                // Scanned ≠ package still on runway: confirm used to take/move
+                // bodies; a failed re-queue then spun on "prewarm incomplete".
+                // Re-hydrate if any Class A body for this height is gone.
+                let package_ok = self
+                    .confirm_parents
+                    .get_header_plan(height)
+                    .map(|p| {
+                        p.header_rec.hash == hash
+                            && self.confirm_parents.bodies_complete(&p.tx_fks)
+                    })
+                    .unwrap_or(false);
+                if package_ok {
+                    st.already_ready = st.already_ready.saturating_add(1);
+                    continue;
+                }
+                // Fall through: re-decode bodies / re-pin parents for this height.
             }
             work.push((height, hash));
         }

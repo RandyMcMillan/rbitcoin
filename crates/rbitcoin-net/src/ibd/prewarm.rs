@@ -87,6 +87,25 @@ pub(crate) fn spawn_parent_prewarm(
                     next_height = tip.saturating_add(1);
                 }
                 let runway = Arc::clone(&*ctrl.runway.lock().unwrap());
+                // Prefer re-hydrating tip+1 if it was marked ready but bodies
+                // were drained (failed confirm take / GC). Otherwise confirm
+                // spins on "prewarm incomplete" while the worker works far ahead.
+                let tip1 = tip.saturating_add(1);
+                let mut force_tip1 = false;
+                if let Some(&(h, hash)) = runway.iter().find(|(h, _)| *h == tip1) {
+                    let incomplete = query
+                        .confirm_parent_cache()
+                        .get_header_plan(h)
+                        .map(|p| {
+                            p.header_rec.hash != hash
+                                || !query.confirm_parent_cache().bodies_complete(&p.tx_fks)
+                        })
+                        .unwrap_or(true);
+                    if incomplete {
+                        next_height = tip1;
+                        force_tip1 = true;
+                    }
+                }
                 // First index with height >= next_height.
                 let start = runway.partition_point(|(h, _)| *h < next_height);
                 if runway.is_empty() || start >= runway.len() {
@@ -111,10 +130,16 @@ pub(crate) fn spawn_parent_prewarm(
                     std::thread::sleep(Duration::from_millis(20));
                     continue;
                 }
-                // When behind tip, take a larger bite (up to 2× configured batch).
+                // Bite size: start with **one** height when the runway is empty so
+                // tip+1 becomes confirm-ready ASAP (large first bites starved confirm
+                // for tens of seconds while decoding 64–128 fat blocks). Grow once
+                // tip+1 is ready; only 2× when still below headroom.
+                // Force single-height when re-hydrating tip+1 package.
                 let through = query.parent_prewarm_ready_through();
                 let ahead = through.saturating_sub(tip);
-                let bite = if ahead < headroom.max(16) {
+                let bite = if force_tip1 || ahead == 0 {
+                    1usize
+                } else if ahead < headroom.max(16) {
                     (batch as usize).saturating_mul(2).min(256)
                 } else {
                     batch as usize

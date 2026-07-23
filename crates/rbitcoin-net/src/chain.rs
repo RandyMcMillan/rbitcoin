@@ -8,8 +8,8 @@ use bitcoin::{Block, BlockHash, Work};
 use std::sync::RwLock;
 use rbitcoin_consensus::{
     accept_and_archive_block, accept_and_connect_block, confirm_archived_run,
-    confirm_materialize_phase, confirm_script_phase, confirm_scripts_phase,
-    confirm_writeback_phase, genesis_block, header_to_record,
+    confirm_load_phase, confirm_script_phase, confirm_scripts_phase,
+    confirm_write_phase, genesis_block, header_to_record,
     ChainParams, Milestone, ScriptOkBatch,
 };
 use rbitcoin_log::info;
@@ -229,12 +229,12 @@ impl ChainHub {
         Ok((need, need_meta))
     }
 
-    /// MATERIALIZE stage: Class A load + pin/mlock parents → resolve → wave → wire → assemble.
+    /// LOAD stage: Class A load + pin/mlock parents → resolve → wave → wire → assemble.
     /// Hand result to [`Self::confirm_scripts`].
-    pub fn confirm_materialize_phase(
+    pub fn confirm_load_phase(
         &self,
         blocks: &[(u32, BlockHash)],
-    ) -> Result<Option<rbitcoin_consensus::ConfirmMaterializeOutcome>, NetError> {
+    ) -> Result<Option<rbitcoin_consensus::ConfirmLoadOutcome>, NetError> {
         if blocks.is_empty() {
             return Ok(None);
         }
@@ -242,15 +242,15 @@ impl ChainHub {
         if need.is_empty() {
             return Ok(None);
         }
-        let ok = confirm_materialize_phase(&self.query, &self.params, self.milestone, &need)
+        let ok = confirm_load_phase(&self.query, &self.params, self.milestone, &need)
             .map_err(|e| NetError::Consensus(e.to_string()))?;
         Ok(Some(ok))
     }
 
-    /// SCRIPT stage only: verify jobs on a materialized batch.
+    /// SCRIPT stage only: verify jobs on a loaded batch.
     pub fn confirm_scripts(
         &self,
-        batch: rbitcoin_consensus::MaterializedBatch,
+        batch: rbitcoin_consensus::LoadedBatch,
     ) -> Result<rbitcoin_consensus::ConfirmScriptOutcome, NetError> {
         confirm_scripts_phase(&self.query, batch)
             .map_err(|e| NetError::Consensus(e.to_string()))
@@ -273,14 +273,14 @@ impl ChainHub {
         Ok(Some(ok))
     }
 
-    /// WRITEBACK stage: structural + Class C + spend annotate (ordered).
-    pub fn confirm_writeback(&self, batch: ScriptOkBatch) -> Result<Vec<AcceptOutcome>, NetError> {
+    /// WRITE stage: structural + Class C + spend annotate (ordered).
+    pub fn confirm_write(&self, batch: ScriptOkBatch) -> Result<Vec<AcceptOutcome>, NetError> {
         let meta: Vec<(u32, BlockHash)> = batch
             .heights_hashes()
             .into_iter()
             .map(|(h, raw)| (h, BlockHash::from_byte_array(raw)))
             .collect();
-        confirm_writeback_phase(&self.query, &self.params, self.milestone, batch)
+        confirm_write_phase(&self.query, &self.params, self.milestone, batch)
             .map_err(|e| NetError::Consensus(e.to_string()))?;
         self.note_confirmed_tip(&meta)?;
         Ok(meta
@@ -289,7 +289,7 @@ impl ChainHub {
             .collect())
     }
 
-    /// Confirm a contiguous tip-extension run (sync script + writeback).
+    /// Confirm a contiguous tip-extension run (sync script + write).
     pub fn confirm_run(
         &self,
         blocks: &[(u32, BlockHash)],

@@ -1,25 +1,25 @@
-//! Batch Class A load for confirm **materialize** (and optional legacy prewarm worker).
+//! Batch Class A load for confirm **load** stage (and optional legacy load worker).
 //!
 //! For each height in the batch (ascending):
 //! 1. **Cache**: header + `header_txs`, body ranges.
 //! 2. **Full Class A decode** into `by_body` (wave/wire reuse).
 //! 3. **Thin edges** (default create_fk-only) + **parent pin**.
-//! 4. **`mlock`** (default on; `RBITCOIN_PARENT_PREWARM_MLOCK=0` off): **only parent
-//!    create `tx.body` pages** writeback will patch (spender annotate). Refcounted
+//! 4. **`mlock`** (default on; `RBITCOIN_CONFIRM_MLOCK=0` off): **only parent
+//!    create `tx.body` pages** write will patch (spender annotate). Refcounted
 //!    by needing batch heights; tip GC munlocks when heights leave the runway.
 //!
-//! Env: `RBITCOIN_PARENT_PREWARM_{DEPTH,BATCH,HEADROOM,MLOCK,PIN_NEAR,THIN_CREATE_FK_ONLY}`.
+//! Env: `RBITCOIN_PARENT_LOAD_{DEPTH,BATCH,HEADROOM,MLOCK,PIN_NEAR,THIN_CREATE_FK_ONLY}`.
 
 use super::*;
 use crate::confirm_parent_cache::{
-    prewarm_headroom_from_env, prewarm_mlock_from_env, prewarm_pin_near_from_env,
-    prewarm_thin_create_fk_only_from_env, StashedThinInput,
+    runway_headroom_from_env, confirm_mlock_from_env, runway_pin_near_from_env,
+    thin_create_fk_only_from_env, StashedThinInput,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct PrewarmStats {
+pub struct ConfirmLoadStats {
     pub blocks: u32,
     pub utxo_parents: u32,
     pub reserved: u32,
@@ -143,18 +143,18 @@ impl Query {
         (noted, syscalls, skipped)
     }
 
-    pub fn parent_prewarm_depth(&self) -> u32 {
+    pub fn parent_runway_depth(&self) -> u32 {
         self.confirm_parents.depth()
     }
 
-    pub fn parent_prewarm_ready_through(&self) -> u32 {
+    pub fn parent_runway_ready_through(&self) -> u32 {
         self.confirm_parents.ready_through()
     }
 
     /// Snapshot: `(ready_through, ahead, by_txid, bodies, plans, depth)`.
     ///
     /// `by_txid` is the runway txid map size (should stay O(depth), not O(chain)).
-    pub fn parent_prewarm_perf_snapshot(&self) -> (u32, u32, usize, usize, usize, u32) {
+    pub fn parent_runway_perf_snapshot(&self) -> (u32, u32, usize, usize, usize, u32) {
         let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
         let through = self.confirm_parents.ready_through();
         let ahead = through.saturating_sub(tip);
@@ -168,13 +168,13 @@ impl Query {
         )
     }
 
-    /// Unique mlocked runway pages in bytes (confirm prewarm pins).
-    pub fn prewarm_mlock_bytes(&self) -> u64 {
+    /// Unique mlocked runway pages in bytes (confirm runway pins).
+    pub fn confirm_mlock_bytes(&self) -> u64 {
         self.confirm_parents.mlock_bytes()
     }
 
     /// `(range_count, unique_page_bytes)` for mlock diagnostics.
-    pub fn prewarm_mlock_stats(&self) -> (usize, u64) {
+    pub fn confirm_mlock_stats(&self) -> (usize, u64) {
         self.confirm_parents.mlock_stats()
     }
 
@@ -189,12 +189,12 @@ impl Query {
         self.confirm_parents.ensure_plans(items);
     }
 
-    pub fn is_prewarm_ready(&self, heights: &[u32]) -> bool {
+    pub fn is_confirm_load_ready(&self, heights: &[u32]) -> bool {
         self.confirm_parents.all_ready(heights)
     }
 
-    /// Wait until every height is prewarm-ready (Condvar; no Class A load).
-    pub fn wait_prewarm_ready(
+    /// Wait until every height is runway-ready (Condvar; no Class A load).
+    pub fn wait_confirm_load_ready(
         &self,
         heights: &[u32],
         timeout: std::time::Duration,
@@ -207,17 +207,17 @@ impl Query {
         }) {
             Ok(()) => Ok(()),
             Err(true) => Err(StoreError::Cancelled("confirm cancelled")),
-            // Message must contain "prewarm incomplete" so the confirm engine
+            // Message must contain "load incomplete" so the confirm engine
             // re-queues the batch instead of treating a wait timeout as a
             // permanent script reject (historical 600s live n=32 → reject tip).
             Err(false) => Err(StoreError::Corrupt(
-                "confirm: prewarm incomplete (parent package not ready, timeout)",
+                "confirm: load incomplete (parent package not ready, timeout)",
             )),
         }
     }
 
     /// Wait for batch ready, then optionally soft-wait headroom (never last-mile).
-    pub fn wait_prewarm_ready_with_headroom(
+    pub fn wait_confirm_load_ready_with_headroom(
         &self,
         heights: &[u32],
         batch_end: u32,
@@ -227,11 +227,11 @@ impl Query {
         if heights.is_empty() {
             return Ok(());
         }
-        self.wait_prewarm_ready(heights, timeout)?;
+        self.wait_confirm_load_ready(heights, timeout)?;
         if self.confirm_cancelled() {
             return Err(StoreError::Cancelled("confirm cancelled"));
         }
-        let hr = headroom.unwrap_or_else(prewarm_headroom_from_env);
+        let hr = headroom.unwrap_or_else(runway_headroom_from_env);
         if hr == 0 || self.confirm_parents.headroom_ready(batch_end, hr) {
             return Ok(());
         }
@@ -251,15 +251,15 @@ impl Query {
         Ok(())
     }
 
-    /// Load Class A for heights into the confirm parent cache (materialize / tests).
+    /// Load Class A for heights into the confirm parent cache (load stage / tests).
     ///
     /// Full-decode bodies + parent pin; mlock **parent create body pages only**.
-    pub fn prewarm_parents_for_heights(
+    pub fn load_confirm_parents(
         &self,
         items: &[(u32, [u8; 32])],
-    ) -> Result<PrewarmStats, QueryError> {
+    ) -> Result<ConfirmLoadStats, QueryError> {
         let t0 = Instant::now();
-        let mut st = PrewarmStats::default();
+        let mut st = ConfirmLoadStats::default();
         if items.is_empty() {
             return Ok(st);
         }
@@ -268,7 +268,7 @@ impl Query {
         let mut work: Vec<(u32, [u8; 32])> = Vec::new();
         for &(height, hash) in items {
             if self.confirm_cancelled() {
-                crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Cancelled("confirm cancelled"));
             }
             if height <= tip {
@@ -289,7 +289,7 @@ impl Query {
             work.push((height, hash));
         }
         if work.is_empty() {
-            crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+            crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
             return Ok(st);
         }
         self.confirm_parents.ensure_plans(&work);
@@ -317,7 +317,7 @@ impl Query {
 
         for &(height, hash) in &work {
             if self.confirm_cancelled() {
-                crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Cancelled("confirm cancelled"));
             }
 
@@ -367,8 +367,8 @@ impl Query {
             );
             st.header_ns = st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
 
-            // ── body ranges (decode); mlock only writeback parent pages later ─
-            // Wave bodies / Class C are read then written on writeback via
+            // ── body ranges (decode); mlock only write parent pages later ─
+            // Wave bodies / Class C are read then written on write via
             // strong/height — those pages are small/sparse; the multi-page
             // write path that benefits from mlock is parent create bodies
             // (spender annotate). See pin loop below.
@@ -407,7 +407,7 @@ impl Query {
             let t_dec = Instant::now();
             for &(fk, range) in &height_fks_resolved {
                 if self.confirm_cancelled() {
-                    crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                    crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                     return Err(StoreError::Cancelled("confirm cancelled"));
                 }
                 let Some(id) = fk.get() else {
@@ -463,8 +463,8 @@ impl Query {
             .saturating_add(t_put.elapsed().as_nanos() as u64);
 
         // ── Thin edges (create_fk-first; optional soft/head legacy) ─────────
-        let thin_fk_only = prewarm_thin_create_fk_only_from_env();
-        let pin_near = prewarm_pin_near_from_env();
+        let thin_fk_only = thin_create_fk_only_from_env();
+        let pin_near = runway_pin_near_from_env();
         // 0 = pin all runway heights; else only tip+1‥tip+pin_near.
         let pin_hi = if pin_near == 0 {
             u32::MAX
@@ -548,7 +548,7 @@ impl Query {
                 Vec::new()
             } else {
                 if self.confirm_cancelled() {
-                    crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                    crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                     return Err(StoreError::Cancelled("confirm cancelled"));
                 }
                 self.store
@@ -697,7 +697,7 @@ impl Query {
         // ── Pin parents (sparse outs) + mlock parent create body pages only ─
         // Writeback annotates spenders into create outputs; keep those body
         // pages resident until tip GC (need_heights refcount → 0).
-        let do_mlock = prewarm_mlock_from_env();
+        let do_mlock = confirm_mlock_from_env();
         let t_par = Instant::now();
         let mut uniq_parents: Vec<u64> = parent_need.keys().copied().collect();
         uniq_parents.sort_unstable();
@@ -734,7 +734,7 @@ impl Query {
         )> = Vec::with_capacity(pin_jobs.len());
         for (i, (pid, max_h, need_hs, need_vouts)) in pin_jobs.into_iter().enumerate() {
             if self.confirm_cancelled() {
-                crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Cancelled("confirm cancelled"));
             }
             let fk = Fk(pid);
@@ -961,21 +961,21 @@ impl Query {
             self.confirm_parents.mark_scanned_many(&scanned);
         }
 
-        crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);
+        crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
         Ok(st)
     }
 
-    pub fn prewarm_parents_for_block_hashes(
+    pub fn load_confirm_parents_for_hashes(
         &self,
         hashes: &[[u8; 32]],
-    ) -> Result<PrewarmStats, QueryError> {
+    ) -> Result<ConfirmLoadStats, QueryError> {
         let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
         let mut items = Vec::with_capacity(hashes.len());
         for (i, hash) in hashes.iter().enumerate() {
             let h = tip.saturating_add(1).saturating_add(i as u32);
             items.push((h, *hash));
         }
-        self.prewarm_parents_for_heights(&items)
+        self.load_confirm_parents(&items)
     }
 
     /// Retire spent parent outs from the runway cache by **create_fk** (schema v10).

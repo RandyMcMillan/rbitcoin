@@ -6,7 +6,7 @@ Hard kills (`kill -9`) and tip disconnects are normal. **Corrupt files are not r
 
 Best-chain views ignore uncommitted Class C state:
 
-| Write order (confirm **writeback** thread) | Role |
+| Write order (confirm **write** thread) | Role |
 |-------------------------------------------|------|
 | 0. Structural spentness / maturity / subsidy | No durable tip write yet |
 | 1. `strong_tx` + `tx_height` | May lead tip after kill |

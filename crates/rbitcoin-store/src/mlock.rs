@@ -1,6 +1,6 @@
 //! Confirm-runway page pinning: identify and unlock mmap ranges across tables.
 //!
-//! Prewarm `mlock`s every Class A / Class C / head page confirm will touch for
+//! Runway `mlock`s every Class A / Class C / head page confirm will touch for
 //! heights in the runway, then releases via tip GC when heights leave
 //! `(tip, tip+depth]`.
 

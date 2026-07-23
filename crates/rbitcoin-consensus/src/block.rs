@@ -717,8 +717,8 @@ fn check_coinbase_subsidy(
 
 /// Post-script structural checks: durable spentness, maturity, coinbase subsidy.
 ///
-/// Runs in height order on the writeback path (Phase 1: same thread after scripts).
-/// `pending_spent` is writeback-local across a multi-height run.
+/// Runs in height order on the write path (Phase 1: same thread after scripts).
+/// `pending_spent` is write-local across a multi-height run.
 pub(crate) fn structural_validate_spends(
     query: &Query,
     block: &Block,

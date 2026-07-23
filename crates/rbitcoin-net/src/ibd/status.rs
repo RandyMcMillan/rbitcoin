@@ -10,11 +10,11 @@ use std::time::Instant;
 /// event drain, or the status scan itself.
 ///
 /// **Live confirm:** `confirm_ns` only accrues when a **script** batch finishes.
-/// It counts pure script-stage work, **not** materialize Class A load and
-/// **not** blocking on the writeback channel. During a multi-second batch,
+/// It counts pure script-stage work, **not** confirm load Class A work and
+/// **not** blocking on the write channel. During a multi-second batch,
 /// [`Self::confirm_live`] is set so status can show in-progress wall.
 pub(crate) struct LoopStats {
-    /// Pure script-stage wall for completed batches (excludes mat/wb waits).
+    /// Pure script-stage wall for completed batches (excludes load/write waits).
     pub(crate) confirm_ns: AtomicU64,
     /// Successful tip accepts this window.
     pub(crate) confirm_blocks: AtomicU64,

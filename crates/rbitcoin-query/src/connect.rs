@@ -308,15 +308,15 @@ impl Query {
 
     /// Collect thin scripthash create pointers for one tx's outputs (no spend marks).
     ///
-    /// Prefer prewarm runway `by_body` outs (no Class A re-decode / majflt). Store
-    /// full decode is last resort — writeback was spending multi-second SH collect
+    /// Prefer confirm runway `by_body` outs (no Class A re-decode / majflt). Store
+    /// full decode is last resort — write was spending multi-second SH collect
     /// re-reading bodies that scripts already held in RAM.
     pub(crate) fn collect_scripthash_creates(
         &self,
         tx_fk: Fk,
         out: &mut Vec<ScriptHashRecord>,
     ) -> Result<(), QueryError> {
-        // 1) Runway full body (prewarm / script stage).
+        // 1) Runway full body (runway / script stage).
         if let Some((_tx, outputs, _ins)) = self.confirm_parents.get_body(tx_fk) {
             for o in outputs.iter() {
                 out.push(ScriptHashRecord::from_fk(script_hash(&o.script), tx_fk));
@@ -334,7 +334,7 @@ impl Query {
             }
             return Ok(());
         }
-        // 3) Cold store (idx + body) — should be rare on IBD writeback.
+        // 3) Cold store (idx + body) — should be rare on IBD write.
         let tx = self.get_tx_class_a(tx_fk)?;
         if tx.output_count == 0 {
             return Ok(());

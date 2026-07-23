@@ -1165,7 +1165,7 @@ fn wave_fill_spent_suppresses_parent_live() {
 }
 
 /// Multi-block confirm batch that **creates** a non-coinbase parent and
-/// **spends** it in a later height of the same run. Prewarm reserves that
+/// **spends** it in a later height of the same run. Runway reserves that
 /// parent (not in UTXO yet); readiness must not require the reserve to fill
 /// or tip would never advance.
 #[test]
@@ -1214,20 +1214,20 @@ fn confirm_batch_create_and_spend_parent_same_run() {
     tip_time = b_create.header.time;
     run.push((Height(create_h), b_create.block_hash().to_byte_array()));
 
-    // Height spend_h: spend that same-batch parent (prewarm will reserve it).
+    // Height spend_h: spend that same-batch parent (runway will reserve it).
     let spend_h = create_h + 1;
     let spend_parent = spend_anyone_can_spend(parent_txid, 0, Amount::from_sat(48_0000_0000));
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend_parent]);
     accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     run.push((Height(spend_h), b_spend.block_hash().to_byte_array()));
 
-    // Prewarm the run: mlock bodies + prevout scan; same-batch create must not
+    // Runway the run: mlock bodies + prevout scan; same-batch create must not
     // leave the spend height unready.
     let items: Vec<(u32, [u8; 32])> = run.iter().map(|(h, hash)| (h.0, *hash)).collect();
-    q.prewarm_parents_for_heights(&items).unwrap();
+    q.load_confirm_parents(&items).unwrap();
     let heights: Vec<u32> = items.iter().map(|(h, _)| *h).collect();
     assert!(
-        q.is_prewarm_ready(&heights),
+        q.is_confirm_load_ready(&heights),
         "scanned batch must be ready even if spend reserved the create height parent"
     );
 
@@ -1830,15 +1830,15 @@ fn consensus_reject_bad_structure_and_milestone() {
     );
 }
 
-// ─── 3-stage confirm + materialize parent mlock surface ─────────────────────
+// ─── 3-stage confirm + load parent mlock surface ────────────────────────────
 
-/// Split materialize → scripts → writeback (IBD pipeline stages) on a spend run.
-/// Also exercises parent pin/mlock stats + tip GC, and prewarm wait timeout/cancel.
+/// Split load → scripts → write (IBD pipeline stages) on a spend run.
+/// Also exercises parent pin/mlock stats + tip GC, and load ready timeout/cancel.
 #[test]
 fn three_stage_confirm_and_parent_mlock_surface() {
     use rbitcoin_consensus::{
-        accept_and_archive_block, accept_and_connect_block, confirm_materialize_phase,
-        confirm_script_phase, confirm_scripts_phase, confirm_writeback_phase, ChainParams,
+        accept_and_archive_block, accept_and_connect_block, confirm_load_phase,
+        confirm_script_phase, confirm_scripts_phase, confirm_write_phase, ChainParams,
         Milestone,
     };
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
@@ -1850,21 +1850,21 @@ fn three_stage_confirm_and_parent_mlock_surface() {
     let params = ChainParams::regtest();
     let maturity = params.coinbase_maturity();
 
-    // Empty wait / timeout / cancel paths on prewarm helpers.
-    q.wait_prewarm_ready(&[], std::time::Duration::from_millis(1))
+    // Empty wait / timeout / cancel paths on runway helpers.
+    q.wait_confirm_load_ready(&[], std::time::Duration::from_millis(1))
         .unwrap();
-    q.wait_prewarm_ready_with_headroom(&[], 0, Some(0), std::time::Duration::from_millis(1))
+    q.wait_confirm_load_ready_with_headroom(&[], 0, Some(0), std::time::Duration::from_millis(1))
         .unwrap();
     let wait_err = q
-        .wait_prewarm_ready(&[9_999], std::time::Duration::from_millis(5))
+        .wait_confirm_load_ready(&[9_999], std::time::Duration::from_millis(5))
         .expect_err("missing plan must timeout");
     assert!(
-        wait_err.to_string().contains("prewarm incomplete"),
+        wait_err.to_string().contains("load incomplete"),
         "{wait_err}"
     );
     q.request_confirm_cancel();
     let cancel_err = q
-        .wait_prewarm_ready(&[9_998], std::time::Duration::from_secs(1))
+        .wait_confirm_load_ready(&[9_998], std::time::Duration::from_secs(1))
         .expect_err("cancel aborts wait");
     assert!(
         cancel_err.to_string().to_lowercase().contains("cancel"),
@@ -1899,43 +1899,43 @@ fn three_stage_confirm_and_parent_mlock_surface() {
     accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     run.push((Height(spend_h), b_spend.block_hash().to_byte_array()));
 
-    // Inline materialize load (parent pin + optional body mlock).
+    // Inline confirm load (parent pin + optional body mlock).
     let items: Vec<(u32, [u8; 32])> = run.iter().map(|(h, hash)| (h.0, *hash)).collect();
-    let st = q.prewarm_parents_for_heights(&items).unwrap();
+    let st = q.load_confirm_parents(&items).unwrap();
     assert!(st.blocks > 0 || st.already_ready > 0);
-    let _ = q.prewarm_parents_for_block_hashes(&[b_spend.block_hash().to_byte_array()]);
-    let snap = q.parent_prewarm_perf_snapshot();
+    let _ = q.load_confirm_parents_for_hashes(&[b_spend.block_hash().to_byte_array()]);
+    let snap = q.parent_runway_perf_snapshot();
     assert!(snap.5 > 0, "depth");
-    let (_n, _bytes) = q.prewarm_mlock_stats();
-    let _ = q.prewarm_mlock_bytes();
-    assert!(q.is_prewarm_ready(&items.iter().map(|(h, _)| *h).collect::<Vec<_>>()));
+    let (_n, _bytes) = q.confirm_mlock_stats();
+    let _ = q.confirm_mlock_bytes();
+    assert!(q.is_confirm_load_ready(&items.iter().map(|(h, _)| *h).collect::<Vec<_>>()));
 
-    // Stage 1
-    let mat = confirm_materialize_phase(&q, &params, ms, &run).expect("materialize");
+    // LOAD
+    let mat = confirm_load_phase(&q, &params, ms, &run).expect("load");
     assert!(!mat.batch.is_empty());
     assert!(mat.work_ns > 0);
     let heights = mat.batch.heights_hashes();
     assert_eq!(heights.len(), run.len());
     assert_eq!(mat.batch.len(), run.len());
 
-    // Stage 2
+    // SCRIPTS
     let ok = confirm_scripts_phase(&q, mat.batch).expect("scripts");
     assert!(ok.work_ns > 0 || true);
 
-    // Stage 3
-    let fks = confirm_writeback_phase(&q, &params, ms, ok.batch).expect("writeback");
+    // WRITE
+    let fks = confirm_write_phase(&q, &params, ms, ok.batch).expect("write");
     assert_eq!(fks.len(), run.len());
     assert_eq!(q.tip_height(), Some(Height(spend_h)));
     assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
 
     // Tip GC releases parent body mlocks for heights ≤ tip.
     q.advance_parent_runway_tip(spend_h);
-    // Combined materialize+scripts entry (ChainHub path) on empty above tip: reject empty.
+    // Combined load+scripts entry (ChainHub path) on empty above tip: reject empty.
     let empty = confirm_script_phase(&q, &params, ms, &[]);
     assert!(empty.is_err());
 
     // Idempotent re-load of already-ready batch.
-    let st2 = q.prewarm_parents_for_heights(&items).unwrap();
+    let st2 = q.load_confirm_parents(&items).unwrap();
     assert!(st2.already_ready > 0 || st2.blocks == 0);
 }
 

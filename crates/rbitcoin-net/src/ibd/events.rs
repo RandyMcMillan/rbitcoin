@@ -545,7 +545,7 @@ pub(crate) fn update_confirm_lag(lag: &AtomicU32, tip: Option<u32>, max_archived
 }
 
 pub(crate) fn apply_confirm_reject(st: &mut IbdWorkState, height: u32, hash: BlockHash, err: &str) {
-    // Never blacklist the all-zero sentinel (writeback used to emit this on
+    // Never blacklist the all-zero sentinel (write used to emit this on
     // mis-attributed rejects). Never freeze tip on pipeline "already spent"
     // races that race a successful commit.
     use bitcoin::hashes::Hash;
@@ -554,7 +554,7 @@ pub(crate) fn apply_confirm_reject(st: &mut IbdWorkState, height: u32, hash: Blo
         return;
     }
     if err.contains("prevout already spent") {
-        // Likely dup writeback after claim race (fixed separately). Do not
+        // Likely dup write after claim race (fixed separately). Do not
         // permanent-blacklist a valid tip extension.
         warn!(
             "ibd: confirm reject not blacklisted @{height} {hash}: {err} (treat as transient)"
@@ -602,7 +602,7 @@ mod confirm_reject_tests {
 
     #[test]
     fn prevout_spent_reject_is_not_blacklisted() {
-        // Pipeline race: second writeback of the same tip+1 after the first
+        // Pipeline race: second write of the same tip+1 after the first
         // already committed. Blacklisting freezes IBD forever (mainnet log
         // tip=362595 stuck after "prevout already spent").
         let mut st = IbdWorkState::new(Vec::new(), None, Some(362_594));

@@ -6,7 +6,7 @@ mod catchup;
 mod chain_view;
 mod confirm_parent_cache;
 mod connect;
-mod parent_prewarm;
+mod confirm_load;
 mod reconstruct;
 mod run_builder_core;
 mod scripthash;
@@ -35,27 +35,27 @@ pub type QueryError = StoreError;
 
 pub use catchup::IndexMode;
 pub use confirm_parent_cache::{
-    prewarm_batch_from_env, prewarm_depth_from_env, prewarm_headroom_from_env,
-    prewarm_mlock_from_env, prewarm_pin_near_from_env, prewarm_thin_create_fk_only_from_env,
-    DEFAULT_PREWARM_BATCH as PREWARM_BATCH, DEFAULT_PREWARM_DEPTH as PREWARM_DEPTH,
-    DEFAULT_PREWARM_HEADROOM as PREWARM_HEADROOM, DEFAULT_PREWARM_PIN_NEAR as PREWARM_PIN_NEAR,
-    MAX_PREWARM_DEPTH, MIN_PREWARM_DEPTH,
+    runway_batch_from_env, runway_depth_from_env, runway_headroom_from_env,
+    confirm_mlock_from_env, runway_pin_near_from_env, thin_create_fk_only_from_env,
+    DEFAULT_RUNWAY_BATCH as RUNWAY_BATCH, DEFAULT_RUNWAY_DEPTH as RUNWAY_DEPTH,
+    DEFAULT_RUNWAY_HEADROOM as RUNWAY_HEADROOM, DEFAULT_RUNWAY_PIN_NEAR as RUNWAY_PIN_NEAR,
+    MAX_RUNWAY_DEPTH, MIN_RUNWAY_DEPTH,
 };
 pub use connect::ConfirmPrepared;
-pub use parent_prewarm::PrewarmStats;
+pub use confirm_load::ConfirmLoadStats;
 pub use scripthash::{
     ScriptHashBalance, ScriptHashHistoryItem, ScriptHashOutpoint, ScriptHashUtxo,
 };
 pub use wave_prevout::WavePrevoutCache;
 
-/// Materialize Class A load / parent-pin window counters (IBD ~5s sampler).
+/// Confirm load Class A / parent-pin window counters (IBD ~5s sampler).
 ///
-/// Accrued by `prewarm_parents_for_heights` (now called inline from materialize).
-/// Pair with [`Query::parent_prewarm_perf_snapshot`] for cache watermarks.
-pub mod parent_prewarm_stats {
+/// Accrued by `load_confirm_parents` (now called inline from confirm load).
+/// Pair with [`Query::parent_runway_perf_snapshot`] for cache watermarks.
+pub mod confirm_load_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Wall time in `prewarm_parents_for_heights`.
+    /// Wall time in `load_confirm_parents`.
     pub static NS: AtomicU64 = AtomicU64::new(0);
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
     pub static UTXO_PARENTS: AtomicU64 = AtomicU64::new(0);
@@ -175,7 +175,7 @@ pub mod parent_prewarm_stats {
     }
 
     #[inline]
-    pub(crate) fn note(st: &crate::parent_prewarm::PrewarmStats, ns: u64) {
+    pub(crate) fn note(st: &crate::confirm_load::ConfirmLoadStats, ns: u64) {
         if ns > 0 {
             NS.fetch_add(ns, Ordering::Relaxed);
         }
@@ -424,7 +424,7 @@ pub mod wave_fill_stats {
     pub static CB_HEIGHT_NS: AtomicU64 = AtomicU64::new(0);
     /// Wave bodies moved out of ConfirmParentCache (no clone).
     pub static BODY_CACHE_MOVE: AtomicU64 = AtomicU64::new(0);
-    /// Wave bodies re-decoded from store (cache miss / not prewarmed).
+    /// Wave bodies re-decoded from store (cache miss / not runway-cached).
     pub static BODY_STORE: AtomicU64 = AtomicU64::new(0);
     /// Wall ns spent in store body decode (subset of BODY_NS on miss).
     pub static BODY_STORE_NS: AtomicU64 = AtomicU64::new(0);
@@ -547,12 +547,12 @@ pub struct Query {
     sh_run: sh_builder::ShRunBuilder,
     /// Explicit [`IndexMode`] (Direct / Tip).
     index_mode_cell: std::sync::atomic::AtomicU8,
-    /// Cooperative cancel for in-flight confirm (prewarm waits). Set on IBD
+    /// Cooperative cancel for in-flight confirm (load waits). Set on IBD
     /// SIGINT teardown so the confirm OS thread aborts waits before process exit.
     confirm_cancel: std::sync::atomic::AtomicBool,
-    /// True while the IBD background parent-prewarm worker is running.
+    /// True while the IBD background parent-runway worker is running.
     /// Confirm never last-miles when this is set (waits on ready notify only).
-    prewarm_worker_live: std::sync::atomic::AtomicBool,
+    legacy_load_worker_live: std::sync::atomic::AtomicBool,
 }
 
 impl Query {
@@ -585,7 +585,7 @@ impl Query {
             // Open as Tip until IBD selects Direct.
             index_mode_cell: std::sync::atomic::AtomicU8::new(IndexMode::Tip as u8),
             confirm_cancel: std::sync::atomic::AtomicBool::new(false),
-            prewarm_worker_live: std::sync::atomic::AtomicBool::new(false),
+            legacy_load_worker_live: std::sync::atomic::AtomicBool::new(false),
         };
         // Warm cache from durable head if present (resume with index on).
         // Full body scan is not done here; fresh genesis IBD fills cache as it archives.
@@ -596,7 +596,7 @@ impl Query {
     pub fn request_confirm_cancel(&self) {
         self.confirm_cancel
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        // Wake confirm threads blocked on prewarm ready.
+        // Wake confirm threads blocked on runway ready.
         self.confirm_parents.notify_ready_waiters();
     }
 
@@ -612,9 +612,9 @@ impl Query {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// IBD parent-prewarm worker is running (confirm must only wait, never last-mile).
-    pub fn set_prewarm_worker_live(&self, live: bool) {
-        self.prewarm_worker_live
+    /// IBD parent-runway worker is running (confirm must only wait, never last-mile).
+    pub fn set_legacy_load_worker_live(&self, live: bool) {
+        self.legacy_load_worker_live
             .store(live, std::sync::atomic::Ordering::SeqCst);
         if !live {
             // Unblock waiters if worker exits while confirm is waiting.
@@ -622,8 +622,8 @@ impl Query {
         }
     }
 
-    pub fn prewarm_worker_live(&self) -> bool {
-        self.prewarm_worker_live
+    pub fn legacy_load_worker_live(&self) -> bool {
+        self.legacy_load_worker_live
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -904,7 +904,7 @@ impl Query {
         self.store.get_header_by_hash(hash)
     }
 
-    /// Header tx list: runway cache (prewarm) then store.
+    /// Header tx list: runway cache (load) then store.
     pub fn header_tx_fks(
         &self,
         header_fk: Fk,

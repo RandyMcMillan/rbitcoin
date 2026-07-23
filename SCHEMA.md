@@ -146,7 +146,7 @@ Legacy `LOCAL_PREV` is **rejected** on decode.
 
 **Soft `prev_txid`:** RAM-only for wire rebuild; filled from the create body’s packed txid when needed. Not stored in the input stream.
 
-**Decision:** stamp `create_fk` at archive (batch map → sticky → `tx.head`) so confirm/prewarm can skip head probes on already-resolved edges.
+**Decision:** stamp `create_fk` at archive (batch map → sticky → `tx.head`) so confirm/runway can skip head probes on already-resolved edges.
 
 ### Output encoding (embedded)
 

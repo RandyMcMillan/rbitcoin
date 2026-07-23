@@ -2,20 +2,20 @@
 //!
 //! Pipeline (optimistic scripts — assumevalid-shaped):
 //! ```text
-//! MATERIALIZE STAGE (ibd-confirm-materialize OS thread):
-//!   load Class A + pin/mlock writeback parents → resolve → wave → wire → assemble
-//! SCRIPT STAGE (ibd-confirm OS thread + rayon):
+//! LOAD STAGE (ibd-confirm-load OS thread):
+//!   load Class A + pin/mlock write parents → resolve → wave → wire → assemble
+//! SCRIPTS STAGE (ibd-confirm OS thread + rayon):
 //!   scripts only
-//! WRITEBACK STAGE (ibd-confirm-writeback OS thread, FIFO):
+//! WRITE STAGE (ibd-confirm-write OS thread, FIFO):
 //!   structural (spentness/maturity/subsidy) → class_c → spend annotate → tip GC
 //! ```
 //!
 //! [`confirm_archived_run`] runs all stages synchronously (tests / tip path).
-//! IBD pipelines the three stages so materialize(N+1) ∥ scripts(N) ∥ writeback(N−1).
+//! IBD pipelines the three stages so load(N+1) ∥ scripts(N) ∥ write(N−1).
 //!
-//! **Materialize owns Class A load** (no background prewarm worker). Parent
-//! create `tx.body` pages that writeback will annotate are `mlock`ed with
-//! refcounted need_heights; writeback tip GC `munlock`s when no active batch
+//! **Load owns Class A load** (no background load worker). Parent
+//! create `tx.body` pages that write will annotate are `mlock`ed with
+//! refcounted need_heights; write tip GC `munlock`s when no active batch
 //! still references them.
 
 use crate::block::{
@@ -45,7 +45,7 @@ struct BodyMeta {
     tx_fks: Vec<rbitcoin_primitives::Fk>,
 }
 
-/// Assemble output for one height (held through scripts → writeback).
+/// Assemble output for one height (held through scripts → write).
 struct Prepared {
     height: Height,
     header_fk: rbitcoin_primitives::Fk,
@@ -70,16 +70,16 @@ struct Prepared {
 
 /// Wire + assemble complete; script jobs still attached (not yet verified).
 ///
-/// `Send` so IBD can hand off materialize → scripts threads.
-pub struct MaterializedBatch {
+/// `Send` so IBD can hand off load → scripts threads.
+pub struct LoadedBatch {
     prepared: Vec<Prepared>,
     wire_blocks: Vec<Block>,
     wave_prevouts: rbitcoin_query::WavePrevoutCache,
 }
 
-/// Script-verified batch ready for ordered writeback (structural + Class C + spends).
+/// Script-verified batch ready for ordered write (structural + Class C + spends).
 ///
-/// `Send` so IBD can hand off scripts → writeback.
+/// `Send` so IBD can hand off scripts → write.
 pub struct ScriptOkBatch {
     prepared: Vec<Prepared>,
     wire_blocks: Vec<Block>,
@@ -95,41 +95,41 @@ pub fn confirm_archived_run(
     milestone: Milestone,
     blocks: &[(Height, [u8; 32])],
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
-    let mat = confirm_materialize_phase(query, params, milestone, blocks)?;
+    let mat = confirm_load_phase(query, params, milestone, blocks)?;
     let ok = confirm_scripts_phase(query, mat.batch)?;
-    confirm_writeback_phase(query, params, milestone, ok.batch)
+    confirm_write_phase(query, params, milestone, ok.batch)
 }
 
-/// Outcome of materialize: batch ready for scripts + pure work wall.
-pub struct ConfirmMaterializeOutcome {
-    pub batch: MaterializedBatch,
-    /// Full materialize wall (inline Class A load + resolve → assemble).
+/// Outcome of load: batch ready for scripts + pure work wall.
+pub struct ConfirmLoadOutcome {
+    pub batch: LoadedBatch,
+    /// Full load wall (Class A + parent pin/mlock + resolve → assemble).
     pub work_ns: u64,
 }
 
-/// Outcome of the script stage: ready batch + pure script wall.
+/// Outcome of the scripts stage: ready batch + pure script wall.
 pub struct ConfirmScriptOutcome {
     pub batch: ScriptOkBatch,
     /// Script verify only (when produced by [`confirm_scripts_phase`]).
-    /// When produced by [`confirm_script_phase`], includes materialize work too.
+    /// When produced by [`confirm_script_phase`], includes load work too.
     pub work_ns: u64,
 }
 
-/// MATERIALIZE STAGE: load batch Class A + pin/mlock writeback parents →
+/// LOAD STAGE: load batch Class A + pin/mlock write parents →
 /// resolve → wave → wire → assemble.
 ///
 /// Does **not** run scripts, advance tip, or probe durable spentness (except
 /// provisional same-run doubles during assemble).
 ///
-/// Inline Class A load is included in [`ConfirmMaterializeOutcome::work_ns`]
-/// and also accrued into [`confirm_phase_stats::PREWARM_WAIT_NS`] (historical
+/// Inline Class A load is included in [`ConfirmLoadOutcome::work_ns`]
+/// and also accrued into [`confirm_phase_stats::LOAD_NS`] (historical
 /// counter name) for IBD log continuity.
-pub fn confirm_materialize_phase(
+pub fn confirm_load_phase(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
     blocks: &[(Height, [u8; 32])],
-) -> Result<ConfirmMaterializeOutcome, ConsensusError> {
+) -> Result<ConfirmLoadOutcome, ConsensusError> {
     if blocks.is_empty() {
         return Err(ConsensusError::BadBlock("empty confirm batch"));
     }
@@ -152,12 +152,12 @@ pub fn confirm_materialize_phase(
         blocks.len(),
     );
 
-    // Inline batch load (no background prewarm): decode bodies, pin parents,
-    // mlock only parent create body pages writeback will patch.
+    // Inline batch load (no background load worker): decode bodies, pin parents,
+    // mlock only parent create body pages write will patch.
     let t_load = Instant::now();
-    load_batch_for_materialize(query, &heights, &items, batch_end)?;
+    load_confirm_batch(query, &heights, &items, batch_end)?;
     let load_ns = t_load.elapsed().as_nanos() as u64;
-    confirm_phase_stats::PREWARM_WAIT_NS.fetch_add(load_ns, Ordering::Relaxed);
+    confirm_phase_stats::LOAD_NS.fetch_add(load_ns, Ordering::Relaxed);
 
     let t_resolve = Instant::now();
     let metas = resolve_body_metas(query, blocks, false)?;
@@ -179,8 +179,8 @@ pub fn confirm_materialize_phase(
     )?;
 
     let work_ns = t_work.elapsed().as_nanos() as u64;
-    Ok(ConfirmMaterializeOutcome {
-        batch: MaterializedBatch {
+    Ok(ConfirmLoadOutcome {
+        batch: LoadedBatch {
             prepared,
             wire_blocks,
             wave_prevouts,
@@ -189,12 +189,12 @@ pub fn confirm_materialize_phase(
     })
 }
 
-/// SCRIPT STAGE: verify script jobs on a materialized batch (rayon).
+/// SCRIPTS STAGE: verify script jobs on a loaded batch (rayon).
 ///
-/// Clears jobs after success so writeback carries spends/fees only.
+/// Clears jobs after success so write carries spends/fees only.
 pub fn confirm_scripts_phase(
     _query: &Query,
-    mut batch: MaterializedBatch,
+    mut batch: LoadedBatch,
 ) -> Result<ConfirmScriptOutcome, ConsensusError> {
     let t_work = Instant::now();
     script_wave(&batch.prepared)?;
@@ -213,30 +213,30 @@ pub fn confirm_scripts_phase(
     })
 }
 
-/// MATERIALIZE + SCRIPTS in one call (tests / tip path / ChainHub compat).
+/// LOAD + SCRIPTS in one call (tests / tip path / ChainHub compat).
 ///
-/// Work is full materialize (including Class A load) + scripts.
+/// Work is full load (Class A + parents) + scripts.
 pub fn confirm_script_phase(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
     blocks: &[(Height, [u8; 32])],
 ) -> Result<ConfirmScriptOutcome, ConsensusError> {
-    let mat = confirm_materialize_phase(query, params, milestone, blocks)?;
+    let mat = confirm_load_phase(query, params, milestone, blocks)?;
     let mat_ns = mat.work_ns;
     let mut ok = confirm_scripts_phase(query, mat.batch)?;
     ok.work_ns = ok.work_ns.saturating_add(mat_ns);
     Ok(ok)
 }
 
-/// Keep only heights strictly above the confirmed tip (dup writeback race).
+/// Keep only heights strictly above the confirmed tip (dup write race).
 #[inline]
-fn writeback_height_needed(tip: u32, height: u32) -> bool {
+fn write_height_needed(tip: u32, height: u32) -> bool {
     height > tip
 }
 
-/// WRITEBACK STAGE: structural → class_c → spend annotate → tip GC (FIFO caller).
-pub fn confirm_writeback_phase(
+/// WRITE STAGE: structural → class_c → spend annotate → tip GC (FIFO caller).
+pub fn confirm_write_phase(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
@@ -251,7 +251,7 @@ pub fn confirm_writeback_phase(
         .into_iter()
         .zip(batch.wire_blocks.into_iter())
     {
-        if !writeback_height_needed(tip, p.height.0) {
+        if !write_height_needed(tip, p.height.0) {
             continue;
         }
         prep.push(p);
@@ -278,7 +278,7 @@ pub fn confirm_writeback_phase(
     Ok(out)
 }
 
-impl MaterializedBatch {
+impl LoadedBatch {
     /// Heights and header hashes in this batch (for events / feed scrub).
     pub fn heights_hashes(&self) -> Vec<(u32, [u8; 32])> {
         self.prepared
@@ -316,7 +316,7 @@ impl ScriptOkBatch {
 
 /// Samples major page faults for the **calling** thread only (Linux).
 ///
-/// Other threads (archive, prewarm, rayon script workers) do not count. Store
+/// Other threads (archive, runway, rayon script workers) do not count. Store
 /// cold touches on the confirm OS thread show up here; `mlock` gaps → warn.
 fn thread_majflt() -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -370,7 +370,7 @@ impl Drop for ConfirmMajfltGuard {
         }
         let delta = after - before;
         rbitcoin_log::warn!(
-            "confirm: major page fault(s) on confirm thread delta={delta} first_h={} n={} elapsed_ms={} (cold store touch; materialize/mlock gap)",
+            "confirm: major page fault(s) on confirm thread delta={delta} first_h={} n={} elapsed_ms={} (cold store touch; load/mlock gap)",
             self.first_h,
             self.n_blocks,
             self.started.elapsed().as_millis(),
@@ -402,10 +402,10 @@ mod majflt_tests {
 }
 
 #[cfg(test)]
-mod writeback_idempotent_tests {
-    use super::writeback_height_needed;
+mod write_idempotent_tests {
+    use super::write_height_needed;
 
-    /// Heights at or below tip must be stripped before structural writeback
+    /// Heights at or below tip must be stripped before structural write
     /// (dup pipeline race after scripts claim the same tip+1 twice).
     #[test]
     fn filter_keeps_only_heights_above_tip() {
@@ -413,20 +413,20 @@ mod writeback_idempotent_tests {
         let heights = [98u32, 99, 100, 101, 102];
         let kept: Vec<u32> = heights
             .into_iter()
-            .filter(|&h| writeback_height_needed(tip, h))
+            .filter(|&h| write_height_needed(tip, h))
             .collect();
         assert_eq!(kept, vec![101, 102]);
-        assert!(!writeback_height_needed(tip, tip));
-        assert!(!writeback_height_needed(0, 0));
-        assert!(writeback_height_needed(0, 1));
+        assert!(!write_height_needed(tip, tip));
+        assert!(!write_height_needed(0, 0));
+        assert!(write_height_needed(0, 1));
     }
 
     #[test]
     fn three_stage_entry_points_exist() {
-        // Materialize / scripts / writeback are separate public surfaces for IBD.
-        let _m = super::confirm_materialize_phase;
+        // Load / scripts / write are separate public surfaces for IBD.
+        let _m = super::confirm_load_phase;
         let _s = super::confirm_scripts_phase;
-        let _w = super::confirm_writeback_phase;
+        let _w = super::confirm_write_phase;
         let _combined = super::confirm_script_phase;
         let _sync = super::confirm_archived_run;
     }
@@ -438,9 +438,9 @@ mod writeback_idempotent_tests {
 
 /// Load Class A for the claimed batch into the confirm parent cache.
 ///
-/// Always **inline** (no background prewarm). If a legacy worker is still live
+/// Always **inline** (no background load worker). If a legacy worker is still live
 /// (tests), wait on Condvar instead of double-loading.
-fn load_batch_for_materialize(
+fn load_confirm_batch(
     query: &Query,
     heights: &[u32],
     items: &[(u32, [u8; 32])],
@@ -451,10 +451,10 @@ fn load_batch_for_materialize(
     }
     query.seed_parent_runway(items);
 
-    if query.prewarm_worker_live() {
+    if query.legacy_load_worker_live() {
         // Legacy path: worker owns load — wait only.
         query
-            .wait_prewarm_ready_with_headroom(
+            .wait_confirm_load_ready_with_headroom(
                 heights,
                 batch_end,
                 None,
@@ -462,9 +462,9 @@ fn load_batch_for_materialize(
             )
             .map_err(ConsensusError::Store)?;
     } else {
-        // Materialize owns load for this batch only.
+        // Load owns load for this batch only.
         query
-            .prewarm_parents_for_heights(items)
+            .load_confirm_parents(items)
             .map_err(ConsensusError::Store)?;
     }
     Ok(())
@@ -477,7 +477,7 @@ fn resolve_body_metas(
 ) -> Result<Vec<BodyMeta>, ConsensusError> {
     let mut metas = Vec::with_capacity(blocks.len());
     for &(height, hash) in blocks {
-        // Prefer prewarm runway cache (header + header_txs, no store page faults).
+        // Prefer confirm runway cache (header + header_txs, no store page faults).
         if let Some(plan) = query.confirm_parent_cache().get_header_plan(height.0) {
             if plan.header_rec.hash == hash {
                 metas.push(BodyMeta {
@@ -492,7 +492,7 @@ fn resolve_body_metas(
         }
         if cache_only {
             return Err(ConsensusError::Store(StoreError::Corrupt(
-                "confirm: prewarm incomplete (header plan missing after wait)",
+                "confirm: load incomplete (header plan missing after wait)",
             )));
         }
         let (header_fk, header_rec) = query
@@ -614,7 +614,7 @@ fn assemble_run(
                     }
                     time_window = times;
                 } else {
-                    // Prior tip headers may not be on the prewarm runway (only
+                    // Prior tip headers may not be on the confirm runway (only
                     // tip+1..). Header rows are tiny fixed records — use store.
                     // Class A body/parent cold paths remain cache-only above.
                     let _ = cache_only;

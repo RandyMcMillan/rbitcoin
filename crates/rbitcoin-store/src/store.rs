@@ -175,7 +175,7 @@ impl Store {
         self.txs.get_meta_and_outputs(fk)
     }
 
-    /// Prewarm: meta + input prevouts only (no script/output allocation).
+    /// Load: meta + input prevouts only (no script/output allocation).
     pub fn get_tx_meta_and_prevouts(
         &self,
         fk: Fk,
@@ -236,7 +236,7 @@ impl Store {
         }
     }
 
-    /// Pin Class A **body only** (idx is RAM-cached by prewarm; not mlocked).
+    /// Pin Class A **body only** (idx is RAM-cached by runway; not mlocked).
     pub fn mlock_tx_body_only(&self, fk: Fk) -> Vec<crate::MlockRange> {
         let mut out = Vec::with_capacity(1);
         Self::push_mlock(&mut out, crate::MlockTable::TxBody, self.txs.mlock_body(fk));
@@ -314,7 +314,7 @@ impl Store {
         out
     }
 
-    /// Absolute body `(offset, len)` for `fk` (for prewarm idx cache).
+    /// Absolute body `(offset, len)` for `fk` (for runway idx cache).
     pub fn tx_body_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
         self.txs.body_range(fk)
     }
@@ -502,7 +502,7 @@ impl Store {
         )
     }
 
-    /// Annotate spend using a prewarmed body range (no `tx.idx` / `tx.head` reads).
+    /// Annotate spend using a runway-cached body range (no `tx.idx` / `tx.head` reads).
     pub fn put_spend_create_at(
         &self,
         create_tx_fk: Fk,
@@ -556,7 +556,7 @@ impl Store {
     ///
     /// Tuple: `(create_tx_fk, vout, spending_tx_fk, Option<(body_off, body_len)>)`.
     /// Sorted by create for locality. **No `tx.head`**. Uses body range when present
-    /// so **no `tx.idx`** either (prewarm-cached).
+    /// so **no `tx.idx`** either (load-cached).
     pub fn put_spend_batch_by_create(
         &self,
         edges: &[(Fk, u32, Fk)],
@@ -569,7 +569,7 @@ impl Store {
         Ok(())
     }
 
-    /// Like [`Self::put_spend_batch_by_create`] with prewarmed body ranges.
+    /// Like [`Self::put_spend_batch_by_create`] with runway-cached body ranges.
     /// Tuple: `(create_tx_fk, vout, spending_tx_fk, body_off, body_len)`.
     ///
     /// Groups by create body and applies all vouts with **one** packed walk per
@@ -614,7 +614,7 @@ impl Store {
         self.txs.get_fk_by_txid(txid)
     }
 
-    /// Batch head resolve (prewarm thin). Prefer primary-slot-sorted `txids`.
+    /// Batch head resolve (load thin). Prefer primary-slot-sorted `txids`.
     pub fn get_fk_by_txid_batch(
         &self,
         txids: &[[u8; 32]],
@@ -625,7 +625,7 @@ impl Store {
     /// Spentness by create fk (no `tx.head`). Body must be mlocked / range-known.
     ///
     /// Sole spender: Class C strong on the spender fk. Multi-list is rare in IBD
-    /// (would touch `spenders.body` — not prewarm-mlocked by design).
+    /// (would touch `spenders.body` — not runway-mlocked by design).
     pub fn has_confirmed_strong_spender_create(
         &self,
         create_tx_fk: Fk,
@@ -663,7 +663,7 @@ impl Store {
         Ok(found)
     }
 
-    /// Unspent subset of `vouts` on one create (wave/prewarm hot path).
+    /// Unspent subset of `vouts` on one create (wave/runway hot path).
     ///
     /// With `body_range`, **one** packed body walk for all vouts (not one walk
     /// per vout). Multi-spender lists fall back to the rare cold path.
@@ -681,7 +681,7 @@ impl Store {
             Some((off, len)) => self.txs.get_output_spender_metas_at(off, len, vouts)?,
             None => {
                 // No range: still prefer one body pin via per-vout meta (idx once
-                // each — rare when prewarm registers ranges).
+                // each — rare when runway registers ranges).
                 let mut out = Vec::with_capacity(vouts.len());
                 for &v in vouts {
                     let (multi, field) = self.txs.get_output_spender_meta(create_tx_fk, v)?;

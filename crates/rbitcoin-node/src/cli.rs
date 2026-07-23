@@ -243,7 +243,7 @@ where
     if soft > 0 {
         rbitcoin_log::debug!("node: RLIMIT_NOFILE soft={soft} hard={hard}");
     }
-    // Confirm materialize mlocks parent create body pages — raise soft MEMLOCK to hard.
+    // Confirm load mlocks parent create body pages — raise soft MEMLOCK to hard.
     let (ml_soft, ml_hard) = rbitcoin_store::ensure_memlock_budget();
     if ml_soft > 0 {
         rbitcoin_log::debug!("node: RLIMIT_MEMLOCK soft={ml_soft} hard={ml_hard}");

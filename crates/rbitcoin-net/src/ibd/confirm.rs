@@ -70,26 +70,26 @@ const CONFIRM_RUN_MAX: usize = 32;
 /// ≥ [`CONFIRM_RUN_MAX`] so the engine can fill a full wave when bodies exist.
 const OFFER_AHEAD: u32 = 96;
 
-/// Materialized batches waiting for scripts (materialize(N+1) may run while N scripts).
-const MATERIALIZE_QUEUE: usize = 2;
-/// Script-ok batches buffered for writeback (scripts(N+1) may run while N writes).
-const WRITEBACK_QUEUE: usize = 2;
+/// Loaded batches waiting for scripts (load(N+1) may run while N scripts).
+const LOAD_QUEUE: usize = 2;
+/// Script-ok batches buffered for write (scripts(N+1) may run while N writes).
+const WRITE_QUEUE: usize = 2;
 
-/// True when a script/wait error should re-queue the batch (not permanent reject).
+/// True when a load/script error should re-queue the batch (not permanent reject).
 #[inline]
-pub(crate) fn is_prewarm_retryable(msg: &str) -> bool {
-    msg.contains("prewarm incomplete")
+pub(crate) fn is_confirm_load_retryable(msg: &str) -> bool {
+    msg.contains("load incomplete")
         || msg.contains("parent package not ready")
-        || msg.contains("prewarm not ready")
+        || msg.contains("load not ready")
 }
 
-/// Spawn confirm **materialize** + **scripts** + **writeback** OS threads.
+/// Spawn confirm **load** + **scripts** + **write** OS threads.
 ///
-/// Materialize (Class A load + pin/mlock parents → wave → wire → assemble) on
-/// `ibd-confirm-materialize`; scripts on `ibd-confirm`; structural + Class C +
-/// spend annotate on `ibd-confirm-writeback`.
-/// Overlap: materialize(N+1) ∥ scripts(N) ∥ writeback(N−1).
-/// Returns the materialize-thread join handle (downstream joins on channel close).
+/// Load (Class A + pin/mlock parents → wave → wire → assemble) on
+/// `ibd-confirm-load`; scripts on `ibd-confirm`; structural + Class C +
+/// spend annotate on `ibd-confirm-write`.
+/// Overlap: load(N+1) ∥ scripts(N) ∥ write(N−1).
+/// Returns the load-thread join handle (downstream joins on channel close).
 pub(crate) fn spawn_confirm_engine(
     hub: Arc<ChainHub>,
     feed: Arc<ConfirmFeed>,
@@ -98,24 +98,24 @@ pub(crate) fn spawn_confirm_engine(
     loop_stats: Arc<LoopStats>,
 ) -> std::thread::JoinHandle<()> {
     let (mat_tx, mat_rx) = std::sync::mpsc::sync_channel::<(
-        rbitcoin_consensus::MaterializedBatch,
-        u64, // materialize work_ns
-    )>(MATERIALIZE_QUEUE);
-    let (wb_tx, wb_rx) = std::sync::mpsc::sync_channel::<rbitcoin_consensus::ScriptOkBatch>(
-        WRITEBACK_QUEUE,
+        rbitcoin_consensus::LoadedBatch,
+        u64, // load work_ns
+    )>(LOAD_QUEUE);
+    let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<rbitcoin_consensus::ScriptOkBatch>(
+        WRITE_QUEUE,
     );
 
-    // Writeback: structural + class_c + annotate; emits tip events.
+    // Write: structural + class_c + annotate; emits tip events.
     let hub_wb = Arc::clone(&hub);
     let feed_wb = Arc::clone(&feed);
     let event_tx_wb = event_tx.clone();
     let accepted_wb = Arc::clone(&accepted);
     let loop_stats_wb = Arc::clone(&loop_stats);
-    let writeback = std::thread::Builder::new()
-        .name("ibd-confirm-writeback".into())
+    let write_thr = std::thread::Builder::new()
+        .name("ibd-confirm-write".into())
         .spawn(move || {
-            info!("ibd: confirm writeback on dedicated OS thread");
-            while let Ok(batch) = wb_rx.recv() {
+            info!("ibd: confirm write on dedicated OS thread");
+            while let Ok(batch) = write_rx.recv() {
                 if feed_wb.stopped() || hub_wb.query.confirm_cancelled() {
                     break;
                 }
@@ -123,7 +123,7 @@ pub(crate) fn spawn_confirm_engine(
                 let first_h = batch.heights_hashes().first().map(|(h, _)| *h).unwrap_or(0);
                 let t0 = Instant::now();
                 let heights_hashes = batch.heights_hashes();
-                match hub_wb.confirm_writeback(batch) {
+                match hub_wb.confirm_write(batch) {
                     Ok(_outcomes) => {
                         for (_height, raw) in &heights_hashes {
                             let hash = BlockHash::from_byte_array(*raw);
@@ -141,7 +141,7 @@ pub(crate) fn spawn_confirm_engine(
                         let elapsed = t0.elapsed();
                         if elapsed.as_millis() > 2_000 {
                             info!(
-                                "ibd: confirm writeback slow batch={n} first={first_h} {:?}",
+                                "ibd: confirm write slow batch={n} first={first_h} {:?}",
                                 elapsed
                             );
                         }
@@ -149,7 +149,7 @@ pub(crate) fn spawn_confirm_engine(
                     Err(e) => {
                         let msg = e.to_string();
                         if msg.contains("confirm cancelled") || feed_wb.stopped() {
-                            info!("ibd: confirm writeback aborted: {msg}");
+                            info!("ibd: confirm write aborted: {msg}");
                             break;
                         }
                         let (height, hash) = heights_hashes
@@ -163,7 +163,7 @@ pub(crate) fn spawn_confirm_engine(
                                 }))
                         {
                             debug!(
-                                "ibd: confirm writeback skip already-committed @{height} ({msg})"
+                                "ibd: confirm write skip already-committed @{height} ({msg})"
                             );
                             for (_, raw) in &heights_hashes {
                                 let h = BlockHash::from_byte_array(*raw);
@@ -180,7 +180,7 @@ pub(crate) fn spawn_confirm_engine(
                         loop_stats_wb
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
-                        warn!("ibd: confirm writeback reject @ {height}: {e}");
+                        warn!("ibd: confirm write reject @ {height}: {e}");
                         let _ = event_tx_wb.send(ConfirmEvent::Reject {
                             height,
                             hash,
@@ -189,11 +189,11 @@ pub(crate) fn spawn_confirm_engine(
                     }
                 }
             }
-            info!("ibd: confirm writeback exit");
+            info!("ibd: confirm write exit");
         })
-        .expect("spawn ibd-confirm-writeback");
+        .expect("spawn ibd-confirm-write");
 
-    // Scripts: materialize batch → script verify → writeback queue.
+    // Scripts: loaded batch → script verify → write queue.
     let hub_sc = Arc::clone(&hub);
     let feed_sc = Arc::clone(&feed);
     let event_tx_sc = event_tx.clone();
@@ -201,7 +201,7 @@ pub(crate) fn spawn_confirm_engine(
     let scripts = std::thread::Builder::new()
         .name("ibd-confirm".into())
         .spawn(move || {
-            info!("ibd: confirm scripts on dedicated OS thread (materialize+writeback pipelined)");
+            info!("ibd: confirm scripts on dedicated OS thread (load+write pipelined)");
             while let Ok((mat_batch, mat_ns)) = mat_rx.recv() {
                 if feed_sc.stopped() || hub_sc.query.confirm_cancelled() {
                     break;
@@ -221,8 +221,8 @@ pub(crate) fn spawn_confirm_engine(
                             .fetch_add(mat_ns.saturating_add(outcome.work_ns), Ordering::Relaxed);
                         let script_ms = outcome.work_ns / 1_000_000;
                         let mat_ms = mat_ns / 1_000_000;
-                        if wb_tx.send(outcome.batch).is_err() {
-                            info!("ibd: confirm writeback channel closed");
+                        if write_tx.send(outcome.batch).is_err() {
+                            info!("ibd: confirm write channel closed");
                             break;
                         }
                         if script_ms > 2_000 || mat_ms > 2_000 {
@@ -254,17 +254,17 @@ pub(crate) fn spawn_confirm_engine(
                     }
                 }
             }
-            drop(wb_tx);
-            let _ = writeback.join();
+            drop(write_tx);
+            let _ = write_thr.join();
             info!("ibd: confirm scripts exit");
         })
         .expect("spawn ibd-confirm");
 
     // Materialize: claim feed → wait/wave/wire/assemble → scripts queue.
     std::thread::Builder::new()
-        .name("ibd-confirm-materialize".into())
+        .name("ibd-confirm-load".into())
         .spawn(move || {
-            info!("ibd: confirm materialize on dedicated OS thread (wave/wire/assemble)");
+            info!("ibd: confirm load on dedicated OS thread (wave/wire/assemble)");
             let mut missing_tries: HashMap<u32, u32> = HashMap::new();
             loop {
                 if feed.stopped() {
@@ -345,7 +345,7 @@ pub(crate) fn spawn_confirm_engine(
                     return;
                 }
 
-                let mat_res = hub.confirm_materialize_phase(&batch);
+                let mat_res = hub.confirm_load_phase(&batch);
                 let mat_res = match mat_res {
                     Err(e) if batch.len() > 1 => {
                         let msg = e.to_string();
@@ -357,7 +357,7 @@ pub(crate) fn spawn_confirm_engine(
                         } else if msg.contains("confirm without archive")
                             || msg.contains("NotFound")
                             || msg.contains("not found")
-                            || is_prewarm_retryable(&msg)
+                            || is_confirm_load_retryable(&msg)
                         {
                             Err(e)
                         } else {
@@ -371,7 +371,7 @@ pub(crate) fn spawn_confirm_engine(
                                 feed.cv.notify_one();
                             }
                             loop_stats.confirm_begin(expect_h, 1);
-                            hub.confirm_materialize_phase(&batch[..1])
+                            hub.confirm_load_phase(&batch[..1])
                         }
                     }
                     other => other,
@@ -382,9 +382,9 @@ pub(crate) fn spawn_confirm_engine(
                     if let Err(e) = &mat_res {
                         let msg = e.to_string();
                         if msg.contains("cancelled") || msg.contains("confirm cancelled") {
-                            info!("ibd: confirm materialize aborted after stop (cancelled)");
+                            info!("ibd: confirm load aborted after stop (cancelled)");
                         } else {
-                            info!("ibd: confirm materialize aborted after stop: {e}");
+                            info!("ibd: confirm load aborted after stop: {e}");
                         }
                     }
                     drop(mat_tx);
@@ -405,7 +405,7 @@ pub(crate) fn spawn_confirm_engine(
                         }
                         if work_ms > 2_000 {
                             info!(
-                                "ibd: confirm materialize slow batch={} first={expect_h} work_ms={work_ms}",
+                                "ibd: confirm load slow batch={} first={expect_h} work_ms={work_ms}",
                                 batch.len(),
                             );
                         }
@@ -414,12 +414,12 @@ pub(crate) fn spawn_confirm_engine(
                         let (expect, hash) = batch[0];
                         let msg = e.to_string();
                         if msg.contains("confirm cancelled") {
-                            info!("ibd: confirm materialize cancelled @ {expect}");
+                            info!("ibd: confirm load cancelled @ {expect}");
                             drop(mat_tx);
                             let _ = scripts.join();
                             return;
                         }
-                        if is_prewarm_retryable(&msg) {
+                        if is_confirm_load_retryable(&msg) {
                             {
                                 let mut g = feed.ready.lock().unwrap();
                                 for &(h, ha) in &batch {
@@ -433,7 +433,7 @@ pub(crate) fn spawn_confirm_engine(
                             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
                             if n <= 3 || n % 200 == 0 {
                                 warn!(
-                                    "ibd: confirm prewarm incomplete @ {expect} {hash} — re-queue (n={n}): {msg}"
+                                    "ibd: confirm load incomplete @ {expect} {hash} — re-queue (n={n}): {msg}"
                                 );
                             }
                             std::thread::sleep(Duration::from_millis(50));
@@ -489,7 +489,7 @@ pub(crate) fn spawn_confirm_engine(
                         loop_stats
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
-                        warn!("ibd: confirm materialize reject {hash} @ {expect}: {e}");
+                        warn!("ibd: confirm load reject {hash} @ {expect}: {e}");
                         if event_tx
                             .send(ConfirmEvent::Reject {
                                 height: expect,
@@ -507,7 +507,7 @@ pub(crate) fn spawn_confirm_engine(
             drop(mat_tx);
             let _ = scripts.join();
         })
-        .expect("spawn ibd-confirm-materialize")
+        .expect("spawn ibd-confirm-load")
 }
 
 /// Offer a run of ready archived heights starting at tip+1 into the confirm feed.
@@ -572,7 +572,7 @@ pub(crate) fn offer_confirm_ready(
 
 #[cfg(test)]
 mod tests {
-    use super::is_prewarm_retryable;
+    use super::is_confirm_load_retryable;
 
     /// Contiguous feed claim (2-stage): up to max heights, skip already-confirmed.
     fn claim_feed_run(
@@ -618,14 +618,14 @@ mod tests {
     }
 
     #[test]
-    fn wait_timeout_is_prewarm_retryable_not_reject() {
-        assert!(is_prewarm_retryable(
-            "confirm: prewarm incomplete (parent package not ready, timeout)"
+    fn wait_timeout_is_confirm_load_retryable_not_reject() {
+        assert!(is_confirm_load_retryable(
+            "confirm: load incomplete (parent package not ready, timeout)"
         ));
-        assert!(is_prewarm_retryable(
-            "confirm: prewarm incomplete (wave body missing from runway)"
+        assert!(is_confirm_load_retryable(
+            "confirm: load incomplete (wave body missing from runway)"
         ));
-        assert!(!is_prewarm_retryable("script failed: false"));
-        assert!(!is_prewarm_retryable("prevout already spent"));
+        assert!(!is_confirm_load_retryable("script failed: false"));
+        assert!(!is_confirm_load_retryable("prevout already spent"));
     }
 }

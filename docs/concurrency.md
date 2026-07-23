@@ -10,7 +10,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 | Archive **prep** | 1 tokio task | **none** (CPU encode only) |
 | Archive **writer** | 1 OS thread (`ibd-archive-writer`) | **Class A exclusive**: header body/head, tx body/idx/head, in/out runs; optional points when spend_index on |
 | Confirm **scripts** | 1 OS thread (`ibd-confirm`) | none (CPU: assemble + rayon scripts; optimistic, no durable spentness) |
-| Confirm **writeback** | 1 OS thread (`ibd-confirm-writeback`) | **structural** spentness/maturity/subsidy, then **Class C** (`strong_tx` / `tx_height` / SH creates / `confirmed[]`), then spend annotate (Direct). FIFO by height |
+| Confirm **write** | 1 OS thread (`ibd-confirm-write`) | **structural** spentness/maturity/subsidy, then **Class C** (`strong_tx` / `tx_height` / SH creates / `confirmed[]`), then spend annotate (Direct). FIFO by height |
 | IBD main loop | 1 tokio task | none (orchestration only) |
 
 Prep never holds store write locks. The writer is the sole Class A producer for a process during IBD; multi-peer delivery is idempotent (`header_txs` body already present → skip re-append).
@@ -42,7 +42,7 @@ Do not enter Tip until tip ≈ peer height. Tip entry only bulk-materializes SH
 
 1. Do **not** spawn a second Class A writer while IBD archive is running.
 2. Confirm may lag archive; that is intentional (tip holes vs archive lead).
-3. Scripts for batch N+1 may run while writeback finishes batch N (bounded queue).
+3. Scripts for batch N+1 may run while write finishes batch N (bounded queue).
 4. On SIGINT, IBD cancels cooperatively — do not drop nested runtimes mid-await.
 
 ## Host freezes / IO storms

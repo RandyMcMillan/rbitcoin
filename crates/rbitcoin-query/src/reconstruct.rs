@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 impl Query {
-    /// Build wave prevout map. **Requires** prewarm: bodies + parents ready.
+    /// Build wave prevout map. **Requires** load: bodies + parents ready.
     ///
     /// Prefer [`Self::wave_fill_for_tx_fk_lists`] when header + tx lists are
     /// already resolved (confirm batch) to avoid re-probing header head.
@@ -29,13 +29,13 @@ impl Query {
 
     /// Wave fill from already-resolved per-block Class A fk lists (confirm hot path).
     ///
-    /// - Wave-body txs: **move** prewarmed bodies out of the runway (no clone);
-    ///   store decode only on cache miss **when prewarm worker is not live**.
+    /// - Wave-body txs: **move** runway-cached bodies out of the runway (no clone);
+    ///   store decode only on cache miss **when load worker is not live**.
     /// - Thin edges: batch-moved from runway stash (same type as wave) — no remap.
     /// - External parents: **outs-only** decode; only needed vouts kept.
     ///
-    /// When [`Self::prewarm_worker_live`], this path is **cache-only**: any body
-    /// or parent miss returns `Corrupt("confirm: prewarm incomplete …")` instead
+    /// When [`Self::legacy_load_worker_live`], this path is **cache-only**: any body
+    /// or parent miss returns `Corrupt("confirm: load incomplete …")` instead
     /// of touching cold Class A / spend tables (no confirm-thread majflt).
     pub fn wave_fill_for_tx_fk_lists(
         &self,
@@ -126,7 +126,7 @@ impl Query {
         wf_count(&wf::BODY_STORE, n_store);
         wf_count(&wf::THIN_CACHE_MOVE, n_thin_move);
         wf_count(&wf::THIN_REBUILD, n_thin_rebuild);
-        // Drop leftover maps early (should be empty when prewarm complete).
+        // Drop leftover maps early (should be empty when runway complete).
         drop(taken_bodies);
         drop(taken_thin);
 
@@ -191,7 +191,7 @@ impl Query {
     /// Resolve create maturity: `None` = not coinbase, `Some(h)` = coinbase height.
     ///
     /// Only true coinbases (1-in + null prev), not every 1-in tx. Prevout scan
-    /// skips script/witness. Prewarm stashes this so wave rarely calls here.
+    /// skips script/witness. Runway stashes this so wave rarely calls here.
     pub(crate) fn resolve_parent_coinbase_height(
         &self,
         fk: Fk,
@@ -233,7 +233,7 @@ impl Query {
 
     /// External parent: only the needed vouts (no full dense outs / no inputs).
     ///
-    /// Third tuple field: `spent_filtered` — prewarm already dropped spent outs.
+    /// Third tuple field: `spent_filtered` — runway already dropped spent outs.
     fn load_parent_needed_outs(
         &self,
         fk: Fk,
@@ -302,7 +302,7 @@ impl Query {
     ///
     /// Confirm wave fill uses [`ConfirmParentCache::take_bodies_batch`] (move-out)
     /// instead — do not call this on the confirm hot path.
-    fn load_body_prewarmed(
+    fn load_body_from_runway(
         &self,
         fk: Fk,
     ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>), QueryError> {
@@ -319,7 +319,7 @@ impl Query {
         use crate::wave_fill_stats::{self as wf, add as wf_add};
         let t0 = Instant::now();
         let maj_before = thread_majflt();
-        // Prefer prewarmed idx range (skip idx page fault); body pages mlocked.
+        // Prefer runway-cached idx range (skip idx page fault); body pages mlocked.
         let res = if let Some((off, len)) = self.confirm_parents.get_body_range(fk) {
             let (tx, inputs, outs) = self.store.get_tx_full_at(off, len)?;
             Ok((tx, outs, inputs))
@@ -424,7 +424,7 @@ impl Query {
 
     /// Reconstruct a consensus `Transaction` from Class A rows (no stored raw).
     pub fn reconstruct_tx(&self, tx_fk: Fk) -> Result<Transaction, QueryError> {
-        let (rec, stored_outputs, mut stored_inputs) = self.load_body_prewarmed(tx_fk)?;
+        let (rec, stored_outputs, mut stored_inputs) = self.load_body_from_runway(tx_fk)?;
         let mut cache = HashMap::new();
         self.fill_input_prev_txids_cached(&mut stored_inputs, None, &mut cache, false)?;
         Ok(Self::transaction_from_class_a(
@@ -479,7 +479,7 @@ impl Query {
     /// body reads/block). Prefer, in order:
     /// 1. already-filled soft prev_txid
     /// 2. wave parent / body_wire TxRecord (confirm hot path — already decoded)
-    /// 3. confirm parent cache (prewarm sparse / runway body)
+    /// 3. confirm parent cache (runway sparse / runway body)
     /// 4. store `body_txid` (deduped via `cache` across a block)
     pub(crate) fn fill_input_prev_txids_cached(
         &self,
@@ -558,8 +558,8 @@ impl Query {
     /// Like [`Self::reconstruct_archived_block_from_parts`] but reuses wave-fill
     /// body decodes (one Class A parse per wave-body tx for the whole confirm run).
     ///
-    /// `prev_hash`: when set (prewarm header plan), wire header needs no store IO.
-    /// When `prewarm_worker_live`, misses fall back to Corrupt rather than store decode.
+    /// `prev_hash`: when set (runway header plan), wire header needs no store IO.
+    /// When `legacy_load_worker_live`, misses fall back to Corrupt rather than store decode.
     pub fn reconstruct_archived_block_from_parts_wave(
         &self,
         rec: HeaderRecord,
@@ -588,7 +588,7 @@ impl Query {
                 }
             }
             // No wave body: store-fallback (2-stage).
-            let (rec_tx, stored_outputs, mut stored_inputs) = self.load_body_prewarmed(fk)?;
+            let (rec_tx, stored_outputs, mut stored_inputs) = self.load_body_from_runway(fk)?;
             self.fill_input_prev_txids_cached(
                 &mut stored_inputs,
                 wave.as_deref(),

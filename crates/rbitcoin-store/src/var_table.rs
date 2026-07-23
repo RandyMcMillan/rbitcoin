@@ -128,7 +128,7 @@ impl VarTable {
         self.body.with_bytes(offset, len, f).and_then(|r| r)
     }
 
-    /// Absolute write into body file (no idx; caller has a prewarmed range).
+    /// Absolute write into body file (no idx; caller has a runway-cached range).
     pub fn write_body_abs(&self, abs_offset: u64, data: &[u8]) -> Result<(), StoreError> {
         self.body.write_at(abs_offset, data)
     }

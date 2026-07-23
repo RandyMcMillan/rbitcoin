@@ -1,12 +1,12 @@
 //! Block-structured **confirm parent runway** (replaces generic Class A cache).
 //!
-//! Materialize-stage strategy (no background prewarm worker):
+//! Materialize-stage strategy (no background load worker):
 //! - **RAM-cache** small lookups: header head/body, `header_txs`, `tx.head`→fk,
 //!   `tx.idx` body ranges.
 //! - **Full-decode** batch Class A bodies into `by_body` once; wave_fill / wire
 //!   rebuild consume that cache (no second packed parse on confirm).
-//! - **`mlock`** only parent create `tx.body` pages writeback will patch
-//!   (spender annotate). Refcounted via `need_heights`; tip GC after writeback
+//! - **`mlock`** only parent create `tx.body` pages write will patch
+//!   (spender annotate). Refcounted via `need_heights`; tip GC after write
 //!   `munlock`s when no active confirm batch still references the page.
 //!   Never mlock `spenders` (no multi-spend writes in IBD).
 //!
@@ -23,13 +23,13 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Default runway depth (blocks ahead of tip). Override with env.
-pub const DEFAULT_PREWARM_DEPTH: u32 = 256;
-pub const MIN_PREWARM_DEPTH: u32 = 32;
-pub const MAX_PREWARM_DEPTH: u32 = 4096;
+pub const DEFAULT_RUNWAY_DEPTH: u32 = 256;
+pub const MIN_RUNWAY_DEPTH: u32 = 32;
+pub const MAX_RUNWAY_DEPTH: u32 = 4096;
 /// Max entries in confirmed-create sticky map (~40 B/entry; 2M ≈ 80 MiB).
 pub const DEFAULT_CONFIRMED_TXID_STICKY_CAP: usize = 2_000_000;
 
-/// Capacity for process-local confirmed txid→fk sticky (prewarm thin).
+/// Capacity for process-local confirmed txid→fk sticky (load thin).
 pub fn confirmed_txid_sticky_cap_from_env() -> usize {
     std::env::var("RBITCOIN_CONFIRMED_TXID_STICKY_CAP")
         .ok()
@@ -38,74 +38,92 @@ pub fn confirmed_txid_sticky_cap_from_env() -> usize {
         .clamp(10_000, 20_000_000)
 }
 /// Blocks processed per background tick (larger = less overhead / better lead).
-pub const DEFAULT_PREWARM_BATCH: u32 = 64;
+pub const DEFAULT_RUNWAY_BATCH: u32 = 64;
 /// Confirm waits until warmer is this many blocks past `batch_end` (when
-/// those heights exist on the runway). Default matches one prewarm batch.
-pub const DEFAULT_PREWARM_HEADROOM: u32 = 64;
+/// those heights exist on the runway). Default matches one runway batch.
+pub const DEFAULT_RUNWAY_HEADROOM: u32 = 64;
 
-pub fn prewarm_depth_from_env() -> u32 {
-    std::env::var("RBITCOIN_PARENT_PREWARM_DEPTH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_PREWARM_DEPTH)
-        .clamp(MIN_PREWARM_DEPTH, MAX_PREWARM_DEPTH)
+pub fn runway_depth_from_env() -> u32 {
+    // Prefer RBITCOIN_CONFIRM_*; accept legacy RBITCOIN_PARENT_PREWARM_* names.
+    env_u32(
+        &["RBITCOIN_CONFIRM_RUNWAY_DEPTH", "RBITCOIN_PARENT_PREWARM_DEPTH"],
+        DEFAULT_RUNWAY_DEPTH,
+    )
+    .clamp(MIN_RUNWAY_DEPTH, MAX_RUNWAY_DEPTH)
 }
 
-pub fn prewarm_batch_from_env() -> u32 {
-    std::env::var("RBITCOIN_PARENT_PREWARM_BATCH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_PREWARM_BATCH)
-        .clamp(8, 512)
+pub fn runway_batch_from_env() -> u32 {
+    env_u32(
+        &["RBITCOIN_CONFIRM_RUNWAY_BATCH", "RBITCOIN_PARENT_PREWARM_BATCH"],
+        DEFAULT_RUNWAY_BATCH,
+    )
+    .clamp(8, 512)
 }
 
-pub fn prewarm_headroom_from_env() -> u32 {
-    std::env::var("RBITCOIN_PARENT_PREWARM_HEADROOM")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_PREWARM_HEADROOM)
-        .clamp(0, MAX_PREWARM_DEPTH)
+pub fn runway_headroom_from_env() -> u32 {
+    env_u32(
+        &[
+            "RBITCOIN_CONFIRM_RUNWAY_HEADROOM",
+            "RBITCOIN_PARENT_PREWARM_HEADROOM",
+        ],
+        DEFAULT_RUNWAY_HEADROOM,
+    )
+    .clamp(0, MAX_RUNWAY_DEPTH)
 }
 
-/// Default: mlock **on** (parent create `tx.body` pages for writeback annotate).
+/// Default: mlock **on** (parent create `tx.body` pages for write annotate).
 /// Set `=0`/`false`/`off` for decode-stash only (no mlock syscalls).
-pub fn prewarm_mlock_from_env() -> bool {
-    match std::env::var("RBITCOIN_PARENT_PREWARM_MLOCK") {
-        Ok(s) => {
-            let t = s.trim();
-            !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
-        }
-        // Default on.
-        Err(_) => true,
-    }
+pub fn confirm_mlock_from_env() -> bool {
+    env_bool_default_on(&[
+        "RBITCOIN_CONFIRM_MLOCK",
+        "RBITCOIN_PARENT_PREWARM_MLOCK",
+    ])
 }
 
 /// Only pin external parents needed by spends in tip+1‥tip+K.
 ///
-/// **0 = full runway** (default): pin every external parent in the prewarm window.
+/// **0 = full runway** (default): pin every external parent in the runway window.
 /// Non-zero K limits pin to heights ≤ tip+K (tip-near pin; lower RAM).
-pub const DEFAULT_PREWARM_PIN_NEAR: u32 = 0;
+pub const DEFAULT_RUNWAY_PIN_NEAR: u32 = 0;
 
-pub fn prewarm_pin_near_from_env() -> u32 {
-    std::env::var("RBITCOIN_PARENT_PREWARM_PIN_NEAR")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_PREWARM_PIN_NEAR)
-        .min(MAX_PREWARM_DEPTH)
+pub fn runway_pin_near_from_env() -> u32 {
+    env_u32(
+        &["RBITCOIN_CONFIRM_PIN_NEAR", "RBITCOIN_PARENT_PREWARM_PIN_NEAR"],
+        DEFAULT_RUNWAY_PIN_NEAR,
+    )
+    .min(MAX_RUNWAY_DEPTH)
 }
 
 /// Thin edge walk: only stamped create_fk + coinbase (skip soft prev_txid/head).
 ///
 /// Default **on** — v10 IBD stamps create_fk; soft/head path is legacy.
 /// Set `=0`/`false` to restore soft prev_txid + sticky/head resolve.
-pub fn prewarm_thin_create_fk_only_from_env() -> bool {
-    match std::env::var("RBITCOIN_PARENT_PREWARM_THIN_CREATE_FK_ONLY") {
-        Ok(s) => {
-            let t = s.trim();
-            !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+pub fn thin_create_fk_only_from_env() -> bool {
+    env_bool_default_on(&[
+        "RBITCOIN_CONFIRM_THIN_CREATE_FK_ONLY",
+        "RBITCOIN_PARENT_PREWARM_THIN_CREATE_FK_ONLY",
+    ])
+}
+
+fn env_u32(keys: &[&str], default: u32) -> u32 {
+    for k in keys {
+        if let Ok(s) = std::env::var(k) {
+            if let Ok(v) = s.parse() {
+                return v;
+            }
         }
-        Err(_) => true,
     }
+    default
+}
+
+fn env_bool_default_on(keys: &[&str]) -> bool {
+    for k in keys {
+        if let Ok(s) = std::env::var(k) {
+            let t = s.trim();
+            return !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"));
+        }
+    }
+    true
 }
 
 /// One needed prevout under a parent create.
@@ -120,10 +138,10 @@ pub struct ParentEntry {
     pub tx: TxRecord,
     /// Live (unspent) needed vouts → output. Spent vouts are omitted.
     pub outs: HashMap<u32, ParentOut>,
-    /// Vouts that prewarm fully resolved (spent-filtered). When all requested
+    /// Vouts that runway fully resolved (spent-filtered). When all requested
     /// vouts are in this set, wave can skip store decode + spent re-check.
     pub checked: HashSet<u32>,
-    /// Coinbase maturity height resolved at prewarm (wave skips body re-walk).
+    /// Coinbase maturity height resolved at runway (wave skips body re-walk).
     ///
     /// - `None` = not resolved yet
     /// - `Some(None)` = not a coinbase
@@ -143,7 +161,7 @@ pub struct BodyEntry {
     pub tx: TxRecord,
     pub outputs: Vec<OutputRecord>,
     pub inputs: Vec<InputRecord>,
-    /// Per-input create-fk edges filled after prewarm phase-2 parent resolve.
+    /// Per-input create-fk edges filled after load phase-2 parent resolve.
     /// `None` = not yet stashed (wave_fill falls back to walking `inputs`).
     pub thin_inputs: Option<Vec<StashedThinInput>>,
 }
@@ -155,7 +173,7 @@ pub struct HeaderPlanCache {
     pub header_fk: Fk,
     pub header_rec: HeaderRecord,
     pub tx_fks: Vec<Fk>,
-    /// Previous block hash (zeros at genesis). Filled at prewarm so wire rebuild
+    /// Previous block hash (zeros at genesis). Filled at runway so wire rebuild
     /// never `store.get_header(prev_fk)`.
     pub prev_hash: [u8; 32],
 }
@@ -164,7 +182,7 @@ pub struct HeaderPlanCache {
 #[derive(Debug, Default)]
 struct HeightPlan {
     hash: [u8; 32],
-    /// Prewarm finished a body+thin+pin attempt for this height.
+    /// Runway finished a body+thin+pin attempt for this height.
     ///
     /// This is the **2-stage wait bit**: confirm unblocks when scanned (same work
     /// as pre-pipeline). Full content completeness is best-effort in the pin
@@ -172,12 +190,12 @@ struct HeightPlan {
     scanned: bool,
     /// (create_fk, vout) fully populated in cache.
     need_fk: HashSet<(u64, u32)>,
-    /// (prev_txid, vout) not in UTXO at prewarm — expect runway / same-wave create.
+    /// (prev_txid, vout) not in UTXO at runway — expect runway / same-wave create.
     reserved: HashSet<([u8; 32], u32)>,
 }
 
 impl HeightPlan {
-    /// Prewarm attempt finished — O(1). Used by wait / ready_through (2-stage).
+    /// Runway attempt finished — O(1). Used by wait / ready_through (2-stage).
     #[inline]
     fn is_ready(&self) -> bool {
         self.scanned
@@ -222,11 +240,11 @@ struct Inner {
     by_fk: HashMap<u64, ParentEntry>,
     /// Full runway block bodies by tx fk (optional; tests / legacy).
     by_body: HashMap<u64, BodyEntry>,
-    /// Thin edges without a full body parse (mlock prewarm).
+    /// Thin edges without a full body parse (mlock runway).
     thin_edges: HashMap<u64, Vec<StashedThinInput>>,
     /// create txid → (fk, runway height). Height is create height or the spend
     /// height that needed this parent. GC keeps `(tip−depth, tip+depth]` so
-    /// recent external parents re-hit without `tx.head` (prewarm thin hot path).
+    /// recent external parents re-hit without `tx.head` (load thin hot path).
     /// Also kept while held by `by_body` / `by_fk`.
     by_txid: HashMap<[u8; 32], TxidEntry>,
     /// Confirmed-create sticky: txid → fk (capacity-capped FIFO).
@@ -243,7 +261,7 @@ struct Inner {
     hash_to_height: HashMap<[u8; 32], u32>,
     /// fk id → absolute body (offset, len) from tx.idx (replaces idx page faults).
     body_range: HashMap<u64, (u64, u64)>,
-    /// Reserved (txid, vout) → set of heights waiting (legacy; unused by new prewarm).
+    /// Reserved (txid, vout) → set of heights waiting (legacy; unused by new runway).
     reserve_waiters: HashMap<([u8; 32], u32), HashSet<u32>>,
     /// (table, page_start) → mlocked range + need_heights.
     mlocked: HashMap<(u8, u64), RangeRec>,
@@ -266,7 +284,7 @@ pub struct ConfirmParentCache {
 
 impl ConfirmParentCache {
     pub fn new(depth: u32) -> Self {
-        let depth = depth.clamp(MIN_PREWARM_DEPTH, MAX_PREWARM_DEPTH);
+        let depth = depth.clamp(MIN_RUNWAY_DEPTH, MAX_RUNWAY_DEPTH);
         let sticky_cap = confirmed_txid_sticky_cap_from_env();
         Self {
             inner: Mutex::new(Inner {
@@ -296,7 +314,7 @@ impl ConfirmParentCache {
     }
 
     pub fn from_env() -> Self {
-        Self::new(prewarm_depth_from_env())
+        Self::new(runway_depth_from_env())
     }
 
     pub fn depth(&self) -> u32 {
@@ -304,7 +322,7 @@ impl ConfirmParentCache {
     }
 
     pub fn set_depth(&self, depth: u32) {
-        let d = depth.clamp(MIN_PREWARM_DEPTH, MAX_PREWARM_DEPTH);
+        let d = depth.clamp(MIN_RUNWAY_DEPTH, MAX_RUNWAY_DEPTH);
         self.depth.store(d, Ordering::Relaxed);
         self.inner.lock().unwrap().depth = d;
     }
@@ -316,9 +334,9 @@ impl ConfirmParentCache {
 
     /// Advance tip: drop plans at/below tip; drop parents/bodies only needed there.
     ///
-    /// Called from writeback `post_commit` after Class C + spend annotate for the
+    /// Called from write `post_commit` after Class C + spend annotate for the
     /// committed batch — so mlocks for heights ≤ tip are released only once
-    /// writeback for those heights is done (need_heights drop when h ≤ tip).
+    /// write for those heights is done (need_heights drop when h ≤ tip).
     /// No artificial lag behind tip: in-flight later waves keep mlocks via their
     /// own need_heights (h > tip).
     ///
@@ -382,7 +400,7 @@ impl ConfirmParentCache {
         g.gc_by_txid(tip, max_h);
         // Drop body_range not tied to live runway bodies or parent pins.
         g.gc_body_ranges();
-        // Munlock when no remaining need_height in (tip, max_h] — i.e. writeback
+        // Munlock when no remaining need_height in (tip, max_h] — i.e. write
         // finished for those heights and no later runway height still needs the page.
         let unlocks = g.gc_mlocks(tip, max_h);
         g.recompute_ready_through();
@@ -501,14 +519,14 @@ impl ConfirmParentCache {
     /// Bytes of unique 4 KiB pages currently mlocked for the confirm runway.
     ///
     /// Counts distinct `(table, page)` entries under refcount (shared ranges
-    /// across heights count once). Approximate RSS contribution of prewarm pins.
+    /// across heights count once). Approximate RSS contribution of runway pins.
     pub fn mlock_bytes(&self) -> u64 {
         const PAGE: u64 = 4096;
         let g = self.inner.lock().unwrap();
         (g.page_refs.len() as u64).saturating_mul(PAGE)
     }
 
-    /// `(range_count, unique_page_bytes)` for prewarm pin diagnostics.
+    /// `(range_count, unique_page_bytes)` for runway pin diagnostics.
     pub fn mlock_stats(&self) -> (usize, u64) {
         const PAGE: u64 = 4096;
         let g = self.inner.lock().unwrap();
@@ -591,7 +609,7 @@ impl ConfirmParentCache {
         }
     }
 
-    /// Store a full runway block body (phase-1 prewarm). Confirm/wave should
+    /// Store a full runway block body (phase-1 runway). Confirm/wave should
     /// prefer this over Class A store reads.
     ///
     /// Inserts `txid → fk` so later spends resolve via [`Self::get_by_txid`] +
@@ -611,7 +629,7 @@ impl ConfirmParentCache {
         g.insert_body(id, height, tx, outputs, inputs);
     }
 
-    /// Many bodies under **one** lock (prewarm phase-1 finish). Moves ownership.
+    /// Many bodies under **one** lock (load phase-1 finish). Moves ownership.
     pub fn put_bodies_batch(
         &self,
         items: Vec<(Fk, u32, TxRecord, Vec<OutputRecord>, Vec<InputRecord>)>,
@@ -631,7 +649,7 @@ impl ConfirmParentCache {
     /// Phase-1 hot path: body + `by_txid` (creates are the body outs).
     ///
     /// Does **not** clone every output into `by_fk` — that doubled RAM/CPU on
-    /// mainnet (~all scripts twice). Wave/prewarm resolve runway creates via
+    /// mainnet (~all scripts twice). Wave/runway resolve runway creates via
     /// [`Self::get_parent_out`] body fallback. Sparse `by_fk` is only for
     /// external UTXO parents and legacy reserve waiters.
     pub fn put_body_and_creates(
@@ -763,7 +781,7 @@ impl ConfirmParentCache {
         out
     }
 
-    /// Runway body + create height for prewarm parent pin (same-bite creates).
+    /// Runway body + create height for runway parent pin (same-bite creates).
     ///
     /// Prefer this over a store re-decode when the create is already full-decoded
     /// on the runway (cross-height same-batch spends).
@@ -802,7 +820,7 @@ impl ConfirmParentCache {
 
     /// True if every Class A body in `tx_fks` is still fully decoded on the runway.
     ///
-    /// Used to re-prewarm heights that were `mark_scanned` but later drained
+    /// Used to re-runway heights that were `mark_scanned` but later drained
     /// (e.g. historical `take_bodies_batch` on a failed confirm).
     pub fn bodies_complete(&self, tx_fks: &[Fk]) -> bool {
         if tx_fks.is_empty() {
@@ -816,7 +834,7 @@ impl ConfirmParentCache {
         })
     }
 
-    /// Attach prewarm-resolved thin edges (wave_fill fast path; no full body required).
+    /// Attach runway-resolved thin edges (wave_fill fast path; no full body required).
     ///
     /// Stored only in `thin_edges` (not dual-copied onto optional `by_body`).
     pub fn put_thin_inputs(&self, fk: Fk, edges: Vec<StashedThinInput>) {
@@ -826,7 +844,7 @@ impl ConfirmParentCache {
         self.inner.lock().unwrap().thin_edges.insert(id, edges);
     }
 
-    /// Thin edges stashed during prewarm, if present (clone).
+    /// Thin edges stashed during runway, if present (clone).
     pub fn get_thin_inputs(&self, fk: Fk) -> Option<Vec<StashedThinInput>> {
         let id = fk.get()?;
         self.inner.lock().unwrap().thin_edges.get(&id).cloned()
@@ -912,7 +930,7 @@ impl ConfirmParentCache {
         }
     }
 
-    /// True if prewarm finished a scan attempt for this height (2-stage wait).
+    /// True if runway finished a scan attempt for this height (2-stage wait).
     pub fn is_ready(&self, height: u32) -> bool {
         let g = self.inner.lock().unwrap();
         g.plans.get(&height).is_some_and(|p| p.is_ready())
@@ -1009,7 +1027,7 @@ impl ConfirmParentCache {
     /// or `timeout` elapses.
     ///
     /// Uses [`Self::ready_cv`] — woken by [`Self::mark_scanned_many`] / tip GC /
-    /// [`Self::notify_ready_waiters`]. Does **not** perform prewarm work.
+    /// [`Self::notify_ready_waiters`]. Does **not** perform runway work.
     ///
     /// Returns `Ok(())` when ready, `Err(true)` if cancelled, `Err(false)` on timeout.
     pub fn wait_heights_ready(
@@ -1025,7 +1043,7 @@ impl ConfirmParentCache {
         let mut g = self.inner.lock().unwrap();
         loop {
             // 2-stage semantics: scanned only (O(1)). Content completeness is
-            // prewarm's job; wave store-fallbacks residual misses like before.
+            // runway's job; wave store-fallbacks residual misses like before.
             let ready = heights
                 .iter()
                 .all(|h| g.plans.get(h).is_some_and(|p| p.is_ready()));
@@ -1068,7 +1086,7 @@ impl ConfirmParentCache {
         g.put_utxo_parent_inner(height, id, tx, vout, output);
     }
 
-    /// Batch parent outs under one lock (prewarm phase-2 finish).
+    /// Batch parent outs under one lock (load phase-2 finish).
     pub fn put_utxo_parents_batch(&self, items: &[(u32, Fk, TxRecord, u32, OutputRecord)]) {
         if items.is_empty() {
             return;
@@ -1082,7 +1100,7 @@ impl ConfirmParentCache {
         }
     }
 
-    /// Prewarm parent pin: stash live outs + mark all evaluated vouts checked.
+    /// Runway parent pin: stash live outs + mark all evaluated vouts checked.
     ///
     /// `checked` includes spent-filtered vouts that are **not** in `live` so
     /// wave can treat the set as complete without re-decoding the body.
@@ -1105,7 +1123,7 @@ impl ConfirmParentCache {
         g.put_parent_outs_resolved_inner(height, id, tx, live, checked, coinbase_height);
     }
 
-    /// Many resolved parents under one lock (prewarm pin finish).
+    /// Many resolved parents under one lock (runway pin finish).
     ///
     /// Tuple: `(runway_h, fk, tx, live, checked, coinbase_height)`.
     /// `coinbase_height`: `None` = not stashed; `Some(None)` = not cb; `Some(Some(h))` = height.
@@ -1132,7 +1150,7 @@ impl ConfirmParentCache {
         }
     }
 
-    /// Prewarm-resolved coinbase maturity for a create fk.
+    /// Load-resolved coinbase maturity for a create fk.
     ///
     /// - `None` = not stashed (wave must compute)
     /// - `Some(None)` = not a coinbase
@@ -1175,7 +1193,7 @@ impl ConfirmParentCache {
         }
     }
 
-    /// One-lock bulk `txid → fk` for prewarm thin-resolve (avoids per-edge mutex).
+    /// One-lock bulk `txid → fk` for load thin-resolve (avoids per-edge mutex).
     ///
     /// Lookup order: runway `by_txid`, then **confirmed sticky**. Missing keys
     /// omitted (caller treats as head-probe candidates).
@@ -1249,7 +1267,7 @@ impl ConfirmParentCache {
 
     /// Register creates from a runway body with **all** outputs.
     ///
-    /// Phase-1 prewarm loads full blocks first so later spends in the same
+    /// Phase-1 runway loads full blocks first so later spends in the same
     /// batch resolve creates without UTXO or reservations.
     /// Prefer [`Self::put_body_and_creates`] on the hot path (one lock).
     pub fn register_runway_creates(
@@ -1304,7 +1322,7 @@ impl ConfirmParentCache {
     /// Look up a populated parent out (for wave fill / connect).
     ///
     /// Prefers sparse external-parent `by_fk`, then runway **body** outs
-    /// (bodies-first prewarm no longer dual-copies every create into `by_fk`).
+    /// (bodies-first runway no longer dual-copies every create into `by_fk`).
     pub fn get_parent_out(
         &self,
         fk: Fk,
@@ -1333,7 +1351,7 @@ impl ConfirmParentCache {
         Self::out_present_locked(&g, id, vout)
     }
 
-    /// True when prewarm pin can skip store decode for `vouts` (wave already
+    /// True when runway pin can skip store decode for `vouts` (wave already
     /// served by `get_parent_outs_needed` / body path).
     ///
     /// Covered if sparse `by_fk` has a full checked set (or all live outs), or
@@ -1384,7 +1402,7 @@ impl ConfirmParentCache {
 
     /// One-lock runway hit: `txid` known on runway (mlock or full body).
     ///
-    /// With mlock prewarm we only have `by_txid` (no parsed outs); vout validity
+    /// With mlock runway we only have `by_txid` (no parsed outs); vout validity
     /// is checked when confirm full-parses the parent.
     pub fn get_by_txid_if_out(&self, txid: &[u8; 32], vout: u32) -> Option<Fk> {
         let g = self.inner.lock().unwrap();
@@ -1429,7 +1447,7 @@ impl ConfirmParentCache {
         }
         // Runway full body can supply pin without store — treat as covered for
         // skip-path accounting; caller still uses get_body_for_pin when not
-        // by_fk-stashed (see prewarm pin_runway_body).
+        // by_fk-stashed (see runway pin_runway_body).
         false
     }
 
@@ -1482,7 +1500,7 @@ impl ConfirmParentCache {
     /// Clone only the requested parent vouts (sparse `by_fk`, else runway body).
     ///
     /// Returns `(tx, live_outs, spent_filtered)`:
-    /// - `spent_filtered == true`: prewarm already dropped spent vouts; wave
+    /// - `spent_filtered == true`: runway already dropped spent vouts; wave
     ///   must not re-check spentness for these candidates.
     /// - `spent_filtered == false`: candidates need a spent filter (body path).
     ///
@@ -1496,7 +1514,7 @@ impl ConfirmParentCache {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
         if let Some(e) = g.by_fk.get(&id) {
-            // Fully resolved by prewarm (all requested vouts checked).
+            // Fully resolved by runway (all requested vouts checked).
             if !e.checked.is_empty() && vouts.iter().all(|v| e.checked.contains(v)) {
                 let mut live = Vec::with_capacity(vouts.len());
                 for &v in vouts {
@@ -1836,7 +1854,7 @@ impl Inner {
             // Keep the by_fk row when only live outs are gone: `checked` still
             // covers spent-filtered package_ready for other runway heights.
             // Dropping the whole entry here left tip+N incomplete while
-            // ready_through stayed high until the next tip GC (prewarm cursor
+            // ready_through stayed high until the next tip GC (runway cursor
             // jumped past the hole). Full drop is tip GC / gc_orphaned_parents.
             if e.outs.is_empty() && e.checked.is_empty() {
                 let txid = e.tx.txid;
@@ -1992,7 +2010,7 @@ impl Inner {
                 continue;
             }
             // Runway creates: keep by_fk identity until tip passes create height
-            // so later prewarm get_by_txid still resolves same-batch parents.
+            // so later runway get_by_txid still resolves same-batch parents.
             if let Some(ch) = e.create_height {
                 if ch > tip {
                     continue;
@@ -2149,7 +2167,7 @@ mod tests {
     }
 
     /// Retiring the last live out must not delete spent-filtered `checked` coverage
-    /// or leave ready_through above a now-incomplete height (prewarm cursor skip).
+    /// or leave ready_through above a now-incomplete height (runway cursor skip).
     #[test]
     fn retire_last_live_out_keeps_checked_and_recomputes_watermark() {
         let c = ConfirmParentCache::new(64);
@@ -2207,7 +2225,7 @@ mod tests {
 
     /// Regression: same-bite create@11 + spend@12 must pin create into spent-filtered
     /// `by_fk`. Bare `by_body` is not enough for package_ready / cache-only wave —
-    /// skipping pin left ready_through at tip+1/+2 after multi-block prewarm bites.
+    /// skipping pin left ready_through at tip+1/+2 after multi-block runway bites.
     #[test]
     fn cross_height_spend_needs_parent_pin_for_package_ready() {
         let c = ConfirmParentCache::new(64);
@@ -2257,7 +2275,7 @@ mod tests {
             "spend of same-bite create without by_fk pin must not be package_ready"
         );
 
-        // Pin from runway body (what prewarm does for batch_create_ids).
+        // Pin from runway body (what runway does for batch_create_ids).
         let (create_h, tx, outs, _ins) = c.get_body_for_pin(Fk(1100)).expect("runway body");
         assert_eq!(create_h, 11);
         c.put_parent_outs_resolved(
@@ -2276,7 +2294,7 @@ mod tests {
     #[test]
     fn ensure_plans_requires_tip_horizon() {
         let c = ConfirmParentCache::new(64);
-        // Cache tip still 0 (prewarm forgot advance_tip).
+        // Cache tip still 0 (runway forgot advance_tip).
         c.ensure_plans(&[(360_251, [1u8; 32]), (360_252, [2u8; 32])]);
         assert_eq!(c.plan_count(), 0, "heights far above tip+depth must not seed");
         c.mark_scanned_many(&[360_251, 360_252]);
@@ -2591,7 +2609,7 @@ mod tests {
 
     #[test]
     fn parent_outs_resolved_skips_spent_recheck() {
-        // Prewarm stashes live outs + checked set; wave must see spent_filtered.
+        // Runway stashes live outs + checked set; wave must see spent_filtered.
         let c = ConfirmParentCache::new(64);
         c.advance_tip(0);
         c.ensure_plan(1, [1u8; 32]);
@@ -2801,7 +2819,7 @@ mod tests {
         c.note_mlock_ranges(2, &[long]);
         // Must track all 4 pages, not stay stuck at 1.
         assert_eq!(c.mlock_bytes(), 4096 * 4);
-        // need_heights are 1 and 2 — tip past both → unlock after writeback tip GC.
+        // need_heights are 1 and 2 — tip past both → unlock after write tip GC.
         let unlocks = c.advance_tip(10);
         assert!(
             unlocks.iter().any(|r| r.page_len >= 4096 * 4),
@@ -2810,10 +2828,10 @@ mod tests {
         assert_eq!(c.mlock_bytes(), 0);
     }
 
-    /// Mlocks release at tip once no remaining need_height > tip (writeback done).
+    /// Mlocks release at tip once no remaining need_height > tip (write done).
     /// Later runway heights that still need a page keep it locked.
     #[test]
-    fn advance_tip_munlocks_when_writeback_done_keeps_later_needs() {
+    fn advance_tip_munlocks_when_write_done_keeps_later_needs() {
         use rbitcoin_store::{MlockRange, MlockTable};
         let c = ConfirmParentCache::new(64);
         c.advance_tip(0);
@@ -2826,13 +2844,13 @@ mod tests {
         c.note_mlock_ranges(5, &[r]);
         c.note_mlock_ranges(20, &[r]);
         assert_eq!(c.mlock_stats().0, 1);
-        // Writeback finished through 5 — height 20 still needs the page.
+        // Write finished through 5 — height 20 still needs the page.
         let unlocks = c.advance_tip(5);
         assert!(unlocks.is_empty(), "later runway need keeps mlock: {unlocks:?}");
         assert_eq!(c.mlock_stats().0, 1);
-        // Writeback finished through 20 — no remaining need → munlock.
+        // Write finished through 20 — no remaining need → munlock.
         let unlocks = c.advance_tip(20);
-        assert_eq!(unlocks.len(), 1, "munlock when writeback done for all needers");
+        assert_eq!(unlocks.len(), 1, "munlock when write done for all needers");
         assert_eq!(c.mlock_stats().0, 0);
     }
 
@@ -2923,7 +2941,7 @@ mod tests {
         assert_eq!(
             c.body_count(),
             0,
-            "decoded bodies must not leak behind tip after writeback tip GC"
+            "decoded bodies must not leak behind tip after write tip GC"
         );
         assert_eq!(c.body_range_count(), 0);
     }

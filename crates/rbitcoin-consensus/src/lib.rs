@@ -133,7 +133,7 @@ pub mod confirm_phase_stats {
     /// Historical name `UTXO_APPLY_NS` / log field `utxo_ms` — this is **not** a
     /// light-UTXO map apply (Catchup removed). Wall time for all annotate paths.
     pub static UTXO_APPLY_NS: AtomicU64 = AtomicU64::new(0);
-    /// Annotate edges using prewarmed body range (no idx).
+    /// Annotate edges using runway-cached body range (no idx).
     pub static SPEND_ANNOTATE_RANGED: AtomicU64 = AtomicU64::new(0);
     /// Annotate edges with create_fk but no body_range (idx path).
     pub static SPEND_ANNOTATE_IDX: AtomicU64 = AtomicU64::new(0);
@@ -141,8 +141,8 @@ pub mod confirm_phase_stats {
     pub static SPEND_ANNOTATE_SKIP: AtomicU64 = AtomicU64::new(0);
     /// Header + body-fk resolve for the batch.
     pub static RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
-    /// Last-mile prewarm + wait_ready/headroom on the confirm thread.
-    pub static PREWARM_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Last-mile runway + wait_ready/headroom on the confirm thread.
+    pub static LOAD_NS: AtomicU64 = AtomicU64::new(0);
     /// Unpin spent outs from ConfirmParentCache after Class C.
     pub static UNPIN_NS: AtomicU64 = AtomicU64::new(0);
     /// `advance_parent_runway_tip` (drop bodies / GC parents).
@@ -153,7 +153,7 @@ pub mod confirm_phase_stats {
     ///
     /// Returns
     /// `(recon, prefetch, wave_fill, wire, connect, script, class_c, strong, scripthash, tip,
-    ///   utxo_apply, blocks, resolve, prewarm_wait, unpin, runway_tip,
+    ///   utxo_apply, blocks, resolve, load, unpin, runway_tip,
     ///   spend_ranged, spend_idx, spend_skip)`.
     /// `strong` / `scripthash` / `tip` come from [`rbitcoin_query::class_c_phase_stats`]
     /// (sub-phases inside Class C). `recon` is the sum of the three reconstruct sub-timers.
@@ -208,7 +208,7 @@ pub mod confirm_phase_stats {
             UTXO_APPLY_NS.swap(0, Ordering::Relaxed),
             BLOCKS.swap(0, Ordering::Relaxed),
             RESOLVE_NS.swap(0, Ordering::Relaxed),
-            PREWARM_WAIT_NS.swap(0, Ordering::Relaxed),
+            LOAD_NS.swap(0, Ordering::Relaxed),
             UNPIN_NS.swap(0, Ordering::Relaxed),
             RUNWAY_TIP_NS.swap(0, Ordering::Relaxed),
             SPEND_ANNOTATE_RANGED.swap(0, Ordering::Relaxed),
@@ -232,11 +232,11 @@ pub fn confirm_archived_at(
 
 /// Confirm a contiguous tip-extension run of archived bodies (sync all stages).
 ///
-/// See [`confirm_run`]: materialize → scripts → writeback. IBD uses the split
+/// See [`confirm_run`]: load → scripts → write. IBD uses the split
 /// phases for 3-stage pipeline overlap.
 pub use confirm_run::{
-    confirm_archived_run, confirm_materialize_phase, confirm_script_phase, confirm_scripts_phase,
-    confirm_writeback_phase, ConfirmMaterializeOutcome, ConfirmScriptOutcome, MaterializedBatch,
+    confirm_archived_run, confirm_load_phase, confirm_script_phase, confirm_scripts_phase,
+    confirm_write_phase, ConfirmLoadOutcome, ConfirmScriptOutcome, LoadedBatch,
     ScriptOkBatch,
 };
 

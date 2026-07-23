@@ -562,7 +562,7 @@ pub fn scan_packed_meta_and_prevouts(
 
 /// Decode packed Class A **meta + outputs only** (skip allocating parent inputs).
 ///
-/// Same body IO as [`decode_packed_tx`]; cheaper CPU for prewarm parent loads
+/// Same body IO as [`decode_packed_tx`]; cheaper CPU for runway parent loads
 /// that only need prevout script/value.
 pub fn decode_packed_tx_outs_only(
     raw: &[u8],
@@ -769,7 +769,7 @@ impl TxTable {
 
     /// Meta + input prevouts only (no script/witness allocation, no outputs).
     ///
-    /// Used by prewarm: discover parents after `mlock` without full parse into RAM.
+    /// Used by load: discover parents after `mlock` without full parse into RAM.
     pub fn get_meta_and_prevouts(
         &self,
         fk: Fk,
@@ -965,7 +965,7 @@ impl TxTable {
         Ok(None)
     }
 
-    /// Batch head resolve for prewarm thin (caller should **primary-slot sort**).
+    /// Batch head resolve for load thin (caller should **primary-slot sort**).
     ///
     /// 1. Sequential head probe in call order (slot-sorted → page locality).
     /// 2. Unique candidate fks sorted → sequential body-txid reads.
@@ -1036,7 +1036,7 @@ impl TxTable {
         Self::spender_meta_from_raw(&raw, vout)
     }
 
-    /// Like [`Self::get_output_spender_meta`] but uses a prewarmed body range (no idx).
+    /// Like [`Self::get_output_spender_meta`] but uses a runway-cached body range (no idx).
     pub fn get_output_spender_meta_at(
         &self,
         body_off: u64,
@@ -1097,7 +1097,7 @@ impl TxTable {
         self.set_output_spender_meta_at(off, len, vout, multi, field)
     }
 
-    /// Patch spender meta using a prewarmed body range (no idx read on the hot path).
+    /// Patch spender meta using a runway-cached body range (no idx read on the hot path).
     pub fn set_output_spender_meta_at(
         &self,
         body_off: u64,

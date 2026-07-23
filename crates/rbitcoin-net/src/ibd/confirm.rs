@@ -12,24 +12,66 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Shared feed of archived (height, hash) pairs for the dedicated confirm engine.
+///
+/// **In-flight tracking:** once load claims a contiguous run, those heights sit in
+/// `inflight` until write finishes (or load re-queues). `note` will not re-insert
+/// them — otherwise offer re-notes tip+1 every main-loop tick and load re-claims
+/// the same batch into the load→scripts queue (duplicate script work).
 pub(crate) struct ConfirmFeed {
-    ready: std::sync::Mutex<std::collections::BTreeMap<u32, BlockHash>>,
+    inner: std::sync::Mutex<ConfirmFeedInner>,
     cv: std::sync::Condvar,
     stop: AtomicBool,
+}
+
+struct ConfirmFeedInner {
+    ready: std::collections::BTreeMap<u32, BlockHash>,
+    /// Claimed by load; not yet written or released. Offer must not re-note.
+    inflight: std::collections::HashSet<u32>,
 }
 
 impl ConfirmFeed {
     pub(crate) fn new() -> Self {
         Self {
-            ready: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            inner: std::sync::Mutex::new(ConfirmFeedInner {
+                ready: std::collections::BTreeMap::new(),
+                inflight: std::collections::HashSet::new(),
+            }),
             cv: std::sync::Condvar::new(),
             stop: AtomicBool::new(false),
         }
     }
 
+    /// Note a ready archived body. No-op if height is already claimed (in-flight).
     pub(crate) fn note(&self, height: u32, hash: BlockHash) {
-        let mut g = self.ready.lock().unwrap();
-        g.insert(height, hash);
+        let mut g = self.inner.lock().unwrap();
+        if g.inflight.contains(&height) {
+            return;
+        }
+        g.ready.insert(height, hash);
+        self.cv.notify_one();
+    }
+
+    /// Return heights to the ready map (load incomplete / without-archive retry).
+    pub(crate) fn requeue(&self, batch: &[(u32, BlockHash)]) {
+        if batch.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        for &(h, hash) in batch {
+            g.inflight.remove(&h);
+            g.ready.insert(h, hash);
+        }
+        self.cv.notify_one();
+    }
+
+    /// Write (or permanent reject) finished — height may be re-offered only after
+    /// tip moves past it (or a future requeue path).
+    pub(crate) fn finish(&self, heights: impl IntoIterator<Item = u32>) {
+        let mut g = self.inner.lock().unwrap();
+        for h in heights {
+            g.inflight.remove(&h);
+        }
+        drop(g);
         self.cv.notify_one();
     }
 
@@ -190,7 +232,7 @@ pub(crate) fn spawn_confirm_engine(
                 let heights_hashes = batch.heights_hashes();
                 match hub_wb.confirm_write(batch) {
                     Ok(_outcomes) => {
-                        for (_height, raw) in &heights_hashes {
+                        for (height, raw) in &heights_hashes {
                             let hash = BlockHash::from_byte_array(*raw);
                             loop_stats_wb
                                 .confirm_blocks
@@ -200,9 +242,12 @@ pub(crate) fn spawn_confirm_engine(
                                 .send(ConfirmEvent::Accepted { hash })
                                 .is_err()
                             {
+                                feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                                 return;
                             }
+                            let _ = height;
                         }
+                        feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                         let elapsed = t0.elapsed();
                         if elapsed.as_millis() > 2_000 {
                             info!(
@@ -240,8 +285,12 @@ pub(crate) fn spawn_confirm_engine(
                                     let _ = event_tx_wb.send(ConfirmEvent::Accepted { hash: h });
                                 }
                             }
+                            feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                             continue;
                         }
+                        // Permanent write reject — clear inflight (do not re-queue;
+                        // reject event handles blacklist / operator path).
+                        feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                         loop_stats_wb
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
@@ -311,6 +360,8 @@ pub(crate) fn spawn_confirm_engine(
                             .first()
                             .map(|(h, raw)| (*h, BlockHash::from_byte_array(*raw)))
                             .unwrap_or((first_h, BlockHash::from_byte_array([0u8; 32])));
+                        // Clear inflight so we do not pin tip forever after a script fail.
+                        feed_sc.finish(heights_hashes.iter().map(|(h, _)| *h));
                         loop_stats_sc
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
@@ -343,7 +394,7 @@ pub(crate) fn spawn_confirm_engine(
                 }
 
                 let batch: Vec<(u32, BlockHash)> = {
-                    let mut g = feed.ready.lock().unwrap();
+                    let mut g = feed.inner.lock().unwrap();
                     let found = loop {
                         if feed.stopped() {
                             drop(g);
@@ -352,29 +403,51 @@ pub(crate) fn spawn_confirm_engine(
                             return;
                         }
                         let tip = hub.tip_height();
-                        let expect = match tip {
-                            None => 0u32,
-                            Some(t) => t.saturating_add(1),
+                        let tip_h = tip.unwrap_or(0);
+                        // Genesis: tip None → expect 0; otherwise tip+1.
+                        let path_lo = if tip.is_none() {
+                            0u32
+                        } else {
+                            tip_h.saturating_add(1)
                         };
-                        if let Some(t) = tip {
-                            g.retain(|&h, _| h > t);
-                        }
-                        if g.contains_key(&expect) {
+                        g.ready.retain(|&h, _| h >= path_lo);
+                        g.inflight.retain(|&h| h >= path_lo);
+
+                        // Next claim start: walk from tip+1, skip heights already
+                        // in-flight (pipeline overlap: load N+1 while scripts N).
+                        // Stop at a hole (neither ready nor inflight).
+                        let mut claim_at = path_lo;
+                        let claim_start = loop {
+                            if g.inflight.contains(&claim_at) {
+                                claim_at = claim_at.saturating_add(1);
+                                continue;
+                            }
+                            if g.ready.contains_key(&claim_at) {
+                                break Some(claim_at);
+                            }
+                            break None; // hole or nothing ready
+                        };
+                        if let Some(expect) = claim_start {
                             let mut run = Vec::with_capacity(CONFIRM_RUN_MAX);
                             let mut h = expect;
                             while run.len() < CONFIRM_RUN_MAX {
-                                let Some(hash) = g.remove(&h) else { break };
+                                if g.inflight.contains(&h) {
+                                    break; // don't merge into another claimed run
+                                }
+                                let Some(hash) = g.ready.remove(&h) else { break };
                                 if hub.has_block(&hash) {
                                     h = h.saturating_add(1);
                                     continue;
                                 }
+                                g.inflight.insert(h);
                                 run.push((h, hash));
                                 h = h.saturating_add(1);
                             }
-                            if run.is_empty() {
-                                continue;
+                            if !run.is_empty() {
+                                break Some(run);
                             }
-                            break Some(run);
+                            // Empty after skipping confirmed — retry loop.
+                            continue;
                         }
                         let (gg, wait_res) = feed
                             .cv
@@ -432,15 +505,16 @@ pub(crate) fn spawn_confirm_engine(
                         {
                             Err(e)
                         } else {
-                            {
-                                let mut g = feed.ready.lock().unwrap();
-                                for &(h, ha) in batch.iter().skip(1) {
-                                    if !hub.has_block(&ha) {
-                                        g.insert(h, ha);
-                                    }
-                                }
-                                feed.cv.notify_one();
-                            }
+                            // Permanent failure on multi-block: re-queue tail only;
+                            // first height stays inflight for the single-block retry.
+                            let tail: Vec<(u32, BlockHash)> = batch
+                                .iter()
+                                .skip(1)
+                                .filter(|(_, ha)| !hub.has_block(ha))
+                                .copied()
+                                .collect();
+                            feed.requeue(&tail);
+                            // first stays inflight for the single-height retry below
                             loop_stats.confirm_begin(expect_h, 1);
                             hub.confirm_load_phase(&batch[..1])
                         }
@@ -492,15 +566,12 @@ pub(crate) fn spawn_confirm_engine(
                             return;
                         }
                         if is_confirm_load_retryable(&msg) {
-                            {
-                                let mut g = feed.ready.lock().unwrap();
-                                for &(h, ha) in &batch {
-                                    if !hub.has_block(&ha) {
-                                        g.insert(h, ha);
-                                    }
-                                }
-                                feed.cv.notify_one();
-                            }
+                            let retry: Vec<(u32, BlockHash)> = batch
+                                .iter()
+                                .filter(|(_, ha)| !hub.has_block(ha))
+                                .copied()
+                                .collect();
+                            feed.requeue(&retry);
                             static N: AtomicU32 = AtomicU32::new(0);
                             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
                             if n <= 3 || n % 200 == 0 {
@@ -527,15 +598,12 @@ pub(crate) fn spawn_confirm_engine(
                                     "ibd: confirm without archive still missing {hash} @ {expect} (n={n})"
                                 );
                             }
-                            {
-                                let mut g = feed.ready.lock().unwrap();
-                                for &(h, ha) in &batch {
-                                    if !hub.has_block(&ha) {
-                                        g.insert(h, ha);
-                                    }
-                                }
-                                feed.cv.notify_one();
-                            }
+                            let retry: Vec<(u32, BlockHash)> = batch
+                                .iter()
+                                .filter(|(_, ha)| !hub.has_block(ha))
+                                .copied()
+                                .collect();
+                            feed.requeue(&retry);
                             if missing_tries.len() > 256 {
                                 missing_tries.retain(|&h, _| h.saturating_add(64) > expect);
                             }
@@ -549,14 +617,17 @@ pub(crate) fn spawn_confirm_engine(
                             continue;
                         }
                         if batch.len() > 1 {
-                            let mut g = feed.ready.lock().unwrap();
-                            for &(h, ha) in batch.iter().skip(1) {
-                                if !hub.has_block(&ha) {
-                                    g.insert(h, ha);
-                                }
-                            }
-                            feed.cv.notify_one();
+                            let tail: Vec<(u32, BlockHash)> = batch
+                                .iter()
+                                .skip(1)
+                                .filter(|(_, ha)| !hub.has_block(ha))
+                                .copied()
+                                .collect();
+                            feed.requeue(&tail);
                         }
+                        // Permanent reject on first height — drop inflight so tip can move
+                        // only after operator/event handling; do not re-queue first.
+                        feed.finish(std::iter::once(expect));
                         missing_tries.remove(&expect);
                         loop_stats
                             .confirm_reject_stops
@@ -645,7 +716,13 @@ pub(crate) fn offer_confirm_ready(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_conf_q, format_queue_depth, is_confirm_load_retryable};
+    use super::{format_conf_q, format_queue_depth, is_confirm_load_retryable, ConfirmFeed};
+    use bitcoin::hashes::Hash;
+    use bitcoin::BlockHash;
+
+    fn bh(b: u8) -> BlockHash {
+        BlockHash::from_byte_array([b; 32])
+    }
 
     /// Contiguous feed claim (2-stage): up to max heights, skip already-confirmed.
     fn claim_feed_run(
@@ -700,6 +777,52 @@ mod tests {
         ));
         assert!(!is_confirm_load_retryable("script failed: false"));
         assert!(!is_confirm_load_retryable("prevout already spent"));
+    }
+
+    /// offer re-note must not re-queue heights already claimed (duplicate scripts bug).
+    #[test]
+    fn note_skips_inflight_heights() {
+        let feed = ConfirmFeed::new();
+        feed.note(100, bh(1));
+        {
+            let mut g = feed.inner.lock().unwrap();
+            let hash = g.ready.remove(&100).unwrap();
+            g.inflight.insert(100);
+            assert_eq!(hash, bh(1));
+        }
+        // Main loop offer would re-note tip+1 every tick — must be ignored.
+        feed.note(100, bh(1));
+        let g = feed.inner.lock().unwrap();
+        assert!(g.ready.is_empty(), "inflight height must not re-enter ready");
+        assert!(g.inflight.contains(&100));
+    }
+
+    #[test]
+    fn requeue_returns_to_ready_and_clears_inflight() {
+        let feed = ConfirmFeed::new();
+        {
+            let mut g = feed.inner.lock().unwrap();
+            g.inflight.insert(50);
+            g.inflight.insert(51);
+        }
+        feed.requeue(&[(50, bh(5)), (51, bh(6))]);
+        let g = feed.inner.lock().unwrap();
+        assert!(!g.inflight.contains(&50));
+        assert_eq!(g.ready.get(&50), Some(&bh(5)));
+        assert_eq!(g.ready.get(&51), Some(&bh(6)));
+    }
+
+    #[test]
+    fn finish_clears_inflight() {
+        let feed = ConfirmFeed::new();
+        {
+            let mut g = feed.inner.lock().unwrap();
+            g.inflight.insert(10);
+            g.inflight.insert(11);
+        }
+        feed.finish([10, 11]);
+        let g = feed.inner.lock().unwrap();
+        assert!(g.inflight.is_empty());
     }
 
     #[test]

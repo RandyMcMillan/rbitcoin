@@ -12,8 +12,8 @@
 //! it claimed. Wave bodies are **moved** out of the parent cache at wave_fill; parent
 //! `by_fk` + body ranges stay until tip GC (write annotate + next-batch cache).
 //!
-//! Env: `RBITCOIN_CONFIRM_{CACHE_DEPTH,MLOCK,THIN_CREATE_FK_ONLY}` (and legacy
-//! `RBITCOIN_PARENT_PREWARM_*` aliases).
+//! Env: `RBITCOIN_CONFIRM_MLOCK`, `RBITCOIN_CONFIRM_THIN_CREATE_FK_ONLY`
+//! (legacy `RBITCOIN_PARENT_PREWARM_*` aliases still accepted).
 
 use super::*;
 use crate::confirm_parent_cache::{
@@ -147,18 +147,14 @@ impl Query {
         (noted, syscalls, skipped)
     }
 
-    pub fn parent_cache_depth(&self) -> u32 {
-        self.confirm_parents.depth()
-    }
-
     pub fn parent_cache_ready_through(&self) -> u32 {
         self.confirm_parents.ready_through()
     }
 
-    /// Snapshot: `(ready_through, ahead, by_txid, bodies, plans, depth)`.
+    /// Snapshot: `(ready_through, ahead, by_txid, bodies, plans)`.
     ///
-    /// `by_txid` is the parent cache txid map size (should stay O(depth), not O(chain)).
-    pub fn parent_cache_perf_snapshot(&self) -> (u32, u32, usize, usize, usize, u32) {
+    /// `ahead` is ready_through − tip (in-flight load watermark, not a depth knobs).
+    pub fn parent_cache_perf_snapshot(&self) -> (u32, u32, usize, usize, usize) {
         let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
         let through = self.confirm_parents.ready_through();
         let ahead = through.saturating_sub(tip);
@@ -168,7 +164,6 @@ impl Query {
             self.confirm_parents.by_txid_count(),
             self.confirm_parents.body_count(),
             self.confirm_parents.plan_count(),
-            self.confirm_parents.depth(),
         )
     }
 

@@ -150,7 +150,6 @@ pub(crate) struct IbdPerfSample {
     pub cache_parents: usize,
     pub cache_bodies: usize,
     pub cache_plans: usize,
-    pub cache_depth: u32,
     /// Confirm pipeline queue depths (load→scripts, scripts→write).
     pub conf_load_q: usize,
     pub conf_write_q: usize,
@@ -302,7 +301,6 @@ impl Default for IbdPerfSample {
             cache_parents: 0,
             cache_bodies: 0,
             cache_plans: 0,
-            cache_depth: 0,
             conf_load_q: 0,
             conf_write_q: 0,
             conf_load_q_cap: super::confirm::LOAD_QUEUE_CAP,
@@ -363,8 +361,8 @@ pub(crate) fn sample(
     hole: usize,
     peers: usize,
     headers_done: bool,
-    // (ready_through, ahead, parents, bodies, plans, depth).
-    load: (u32, u32, usize, usize, usize, u32),
+    // (ready_through, ahead, parents, bodies, plans).
+    load: (u32, u32, usize, usize, usize),
     conf_load_q: usize,
     conf_write_q: usize,
     mlock_ranges: usize,
@@ -410,8 +408,7 @@ pub(crate) fn sample(
     let pipe = pipe_stats.sample_and_reset();
     let (contig_next_h, contig_parked, contig_ready) =
         rbitcoin_query::contig_park_stats::snapshot();
-    let (load_ready_through, _cache_ahead, cache_parents, cache_bodies, cache_plans, cache_depth) =
-        load;
+    let (load_ready_through, _cache_ahead, cache_parents, cache_bodies, cache_plans) = load;
     let (arch_sticky_len, arch_sticky_cap) = arch_sticky;
 
     IbdPerfSample {
@@ -515,7 +512,6 @@ pub(crate) fn sample(
         cache_parents,
         cache_bodies,
         cache_plans,
-        cache_depth,
         conf_load_q,
         conf_write_q,
         conf_load_q_cap: super::confirm::LOAD_QUEUE_CAP,
@@ -618,7 +614,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     };
     let mlock_mb = s.mlock_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | conf_q load={}/{} write={}/{} | parents thru={} by_txid={} bodies={} plans={}/{} blks={} body_io={} parent_io={} pin_cached={} pin_cache={} pin_new={} cache%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
+        " | conf_q load={}/{} write={}/{} | parents thru={} by_txid={} bodies={} plans={} blks={} body_io={} parent_io={} pin_cached={} pin_cache={} pin_new={} cache%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
         s.conf_load_q,
         s.conf_load_q_cap,
         s.conf_write_q,
@@ -627,7 +623,6 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.cache_parents,
         s.cache_bodies,
         s.cache_plans,
-        s.cache_depth,
         s.load_blocks,
         s.load_body_tx_reads,
         s.load_parent_tx_reads,
@@ -716,7 +711,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let cp_tot = s.cp_wave + s.cp_class_a + s.cp_store;
     let mlock_mb = s.mlock_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | conf_q load={}/{} write={}/{} | parents thru={} by_txid={} bodies={} plans={}/{} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cached={} pin_cache={} pin_new={} cache_hit={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} head={}/{} mlock_sys={}/{} edges same={} cache={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
+        " | conf_q load={}/{} write={}/{} | parents thru={} by_txid={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cached={} pin_cache={} pin_new={} cache_hit={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} head={}/{} mlock_sys={}/{} edges same={} cache={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
         s.conf_load_q,
         s.conf_load_q_cap,
         s.conf_write_q,
@@ -725,7 +720,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.cache_parents,
         s.cache_bodies,
         s.cache_plans,
-        s.cache_depth,
         s.load_win_ms,
         s.load_blocks,
         s.load_utxo_parents,
@@ -896,7 +890,6 @@ mod tests {
         s.cache_parents = 12;
         s.cache_bodies = 48;
         s.cache_plans = 80;
-        s.cache_depth = 256;
         s.load_blocks = 32;
         s.load_body_tx_reads = 400;
         s.load_parent_tx_reads = 120;
@@ -911,7 +904,7 @@ mod tests {
         let line = format_info(&s);
         assert!(line.contains("conf_q load=1/2 write=2/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
-        assert!(line.contains("by_txid=12 bodies=48 plans=80/256"), "{line}");
+        assert!(line.contains("by_txid=12 bodies=48 plans=80"), "{line}");
         assert!(line.contains("body_io=400 parent_io=120"), "{line}");
         assert!(line.contains("pin_cached=5 pin_cache=0 pin_new=15"), "{line}");
         assert!(line.contains("mlock=32MiB ranges=12 sh_runs=3"), "{line}");

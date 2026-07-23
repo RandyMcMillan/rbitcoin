@@ -1,18 +1,15 @@
-//! Block-structured **confirm parent cache** (replaces generic Class A cache).
+//! Block-structured **confirm parent cache**.
 //!
-//! Materialize-stage strategy (no background load worker):
-//! - **RAM-cache** small lookups: header head/body, `header_txs`, `tx.head`→fk,
-//!   `tx.idx` body ranges.
-//! - **Full-decode** batch Class A bodies into `by_body` once; wave_fill / wire
-//!   rebuild consume that cache (no second packed parse on confirm).
-//! - **`mlock`** only parent create `tx.body` pages write will patch
-//!   (spender annotate). Refcounted via `need_heights`; tip GC after write
-//!   `munlock`s when no active confirm batch still references the page.
-//!   Never mlock `spenders` (no multi-spend writes in IBD).
+//! Load-stage strategy (no background worker):
+//! - **RAM-cache** small lookups: header + `header_txs`, body ranges, thin edges.
+//! - **Full-decode** batch Class A into `by_body` once; wave/wire consume it.
+//! - **`mlock`** only parent create `tx.body` pages write will annotate.
+//!   Refcounted via `need_heights`; tip GC after write drops heights ≤ tip and
+//!   `munlock`s when no remaining needer. No fixed “depth ahead of tip” window —
+//!   load only inserts the claimed batch, so nothing far is held.
 //!
-//! - **Runway creates** register `txid → fk` so same-batch spends skip head probes.
-//! - **Thin input edges** stashed per spend tx after a lightweight prevout walk.
-//! - A height is **ready** once scanned (cache filled + parents pinned).
+//! - Creates register sticky `txid → fk` for thin resolves.
+//! - A height is **ready** once scanned (load finished for that height).
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{HeaderRecord, InputRecord, MlockRange, OutputRecord, TxRecord};
@@ -22,10 +19,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Default cache depth (blocks ahead of tip). Override with env.
-pub const DEFAULT_CACHE_DEPTH: u32 = 256;
-pub const MIN_CACHE_DEPTH: u32 = 32;
-pub const MAX_CACHE_DEPTH: u32 = 4096;
 /// Max entries in confirmed-create sticky map (~40 B/entry; 2M ≈ 80 MiB).
 pub const DEFAULT_CONFIRMED_TXID_STICKY_CAP: usize = 2_000_000;
 
@@ -37,65 +30,19 @@ pub fn confirmed_txid_sticky_cap_from_env() -> usize {
         .unwrap_or(DEFAULT_CONFIRMED_TXID_STICKY_CAP)
         .clamp(10_000, 20_000_000)
 }
-/// Blocks processed per background tick (larger = less overhead / better lead).
-pub const DEFAULT_CACHE_BATCH: u32 = 64;
-/// Confirm waits until warmer is this many blocks past `batch_end` (when
-/// those heights exist on the parent cache). Default matches one cache batch.
-pub const DEFAULT_CACHE_HEADROOM: u32 = 64;
-
-pub fn cache_depth_from_env() -> u32 {
-    // Prefer RBITCOIN_CONFIRM_*; accept legacy RBITCOIN_PARENT_PREWARM_* names.
-    env_u32(
-        &[
-            "RBITCOIN_CONFIRM_CACHE_DEPTH",
-            "RBITCOIN_CONFIRM_RUNWAY_DEPTH", // prior name
-            "RBITCOIN_PARENT_PREWARM_DEPTH",
-        ],
-        DEFAULT_CACHE_DEPTH,
-    )
-    .clamp(MIN_CACHE_DEPTH, MAX_CACHE_DEPTH)
-}
-
-pub fn cache_batch_from_env() -> u32 {
-    env_u32(
-        &["RBITCOIN_CONFIRM_CACHE_BATCH", "RBITCOIN_PARENT_PREWARM_BATCH"],
-        DEFAULT_CACHE_BATCH,
-    )
-    .clamp(8, 512)
-}
-
-pub fn cache_headroom_from_env() -> u32 {
-    env_u32(
-        &[
-            "RBITCOIN_CONFIRM_CACHE_HEADROOM",
-            "RBITCOIN_PARENT_PREWARM_HEADROOM",
-        ],
-        DEFAULT_CACHE_HEADROOM,
-    )
-    .clamp(0, MAX_CACHE_DEPTH)
-}
 
 /// Default: mlock **on** (parent create `tx.body` pages for write annotate).
 /// Set `=0`/`false`/`off` for decode-stash only (no mlock syscalls).
 pub fn confirm_mlock_from_env() -> bool {
-    env_bool_default_on(&[
-        "RBITCOIN_CONFIRM_MLOCK",
-        "RBITCOIN_PARENT_PREWARM_MLOCK",
-    ])
-}
-
-/// Only pin external parents needed by spends in tip+1‥tip+K.
-///
-/// **0 = full cache** (default): pin every external parent in the parent cache window.
-/// Non-zero K limits pin to heights ≤ tip+K (tip-near pin; lower RAM).
-pub const DEFAULT_CACHE_PIN_NEAR: u32 = 0;
-
-pub fn cache_pin_near_from_env() -> u32 {
-    env_u32(
-        &["RBITCOIN_CONFIRM_PIN_NEAR", "RBITCOIN_PARENT_PREWARM_PIN_NEAR"],
-        DEFAULT_CACHE_PIN_NEAR,
-    )
-    .min(MAX_CACHE_DEPTH)
+    match std::env::var("RBITCOIN_CONFIRM_MLOCK")
+        .or_else(|_| std::env::var("RBITCOIN_PARENT_PREWARM_MLOCK"))
+    {
+        Ok(s) => {
+            let t = s.trim();
+            !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true,
+    }
 }
 
 /// Thin edge walk: only stamped create_fk + coinbase (skip soft prev_txid/head).
@@ -103,31 +50,15 @@ pub fn cache_pin_near_from_env() -> u32 {
 /// Default **on** — v10 IBD stamps create_fk; soft/head path is legacy.
 /// Set `=0`/`false` to restore soft prev_txid + sticky/head resolve.
 pub fn thin_create_fk_only_from_env() -> bool {
-    env_bool_default_on(&[
-        "RBITCOIN_CONFIRM_THIN_CREATE_FK_ONLY",
-        "RBITCOIN_PARENT_PREWARM_THIN_CREATE_FK_ONLY",
-    ])
-}
-
-fn env_u32(keys: &[&str], default: u32) -> u32 {
-    for k in keys {
-        if let Ok(s) = std::env::var(k) {
-            if let Ok(v) = s.parse() {
-                return v;
-            }
-        }
-    }
-    default
-}
-
-fn env_bool_default_on(keys: &[&str]) -> bool {
-    for k in keys {
-        if let Ok(s) = std::env::var(k) {
+    match std::env::var("RBITCOIN_CONFIRM_THIN_CREATE_FK_ONLY")
+        .or_else(|_| std::env::var("RBITCOIN_PARENT_PREWARM_THIN_CREATE_FK_ONLY"))
+    {
+        Ok(s) => {
             let t = s.trim();
-            return !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"));
+            !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
         }
+        Err(_) => true,
     }
-    true
 }
 
 /// One needed prevout under a parent create.
@@ -232,7 +163,6 @@ struct StickyConfirmed {
 }
 
 struct Inner {
-    depth: u32,
     /// Highest confirmed tip we have pruned to.
     tip: u32,
     /// Contiguous ready watermark: all heights in `(tip, ready_through]` are ready.
@@ -247,9 +177,8 @@ struct Inner {
     /// Thin edges without a full body parse (mlock cache).
     thin_edges: HashMap<u64, Vec<StashedThinInput>>,
     /// create txid → (fk, cache height). Height is create height or the spend
-    /// height that needed this parent. GC keeps `(tip−depth, tip+depth]` so
-    /// recent external parents re-hit without `tx.head` (load thin hot path).
-    /// Also kept while held by `by_body` / `by_fk`.
+    /// height that needed this parent. GC drops when height ≤ tip unless still
+    /// live in `by_body` / `by_fk`. Sticky covers long-lived identity.
     by_txid: HashMap<[u8; 32], TxidEntry>,
     /// Confirmed-create sticky: txid → fk (capacity-capped FIFO).
     ///
@@ -281,18 +210,15 @@ pub struct ConfirmParentCache {
     /// Signaled when plans become ready (`mark_scanned*`) or tip GC advances
     /// readiness — confirm waits here instead of spinning / last-mile load.
     ready_cv: Condvar,
-    depth: AtomicU32,
     /// Mirror of `Inner::ready_through` for lock-free reads.
     ready_through: AtomicU32,
 }
 
 impl ConfirmParentCache {
-    pub fn new(depth: u32) -> Self {
-        let depth = depth.clamp(MIN_CACHE_DEPTH, MAX_CACHE_DEPTH);
+    pub fn new() -> Self {
         let sticky_cap = confirmed_txid_sticky_cap_from_env();
         Self {
             inner: Mutex::new(Inner {
-                depth,
                 tip: 0,
                 ready_through: 0,
                 plans: BTreeMap::new(),
@@ -312,23 +238,12 @@ impl ConfirmParentCache {
                 mlock_n: 0,
             }),
             ready_cv: Condvar::new(),
-            depth: AtomicU32::new(depth),
             ready_through: AtomicU32::new(0),
         }
     }
 
     pub fn from_env() -> Self {
-        Self::new(cache_depth_from_env())
-    }
-
-    pub fn depth(&self) -> u32 {
-        self.depth.load(Ordering::Relaxed)
-    }
-
-    pub fn set_depth(&self, depth: u32) {
-        let d = depth.clamp(MIN_CACHE_DEPTH, MAX_CACHE_DEPTH);
-        self.depth.store(d, Ordering::Relaxed);
-        self.inner.lock().unwrap().depth = d;
+        Self::new()
     }
 
     /// Highest height such that every plan in `(tip, ready_through]` is ready.
@@ -364,16 +279,11 @@ impl ConfirmParentCache {
                 }
             }
         }
-        // Horizon: drop plans beyond tip+depth.
-        let max_h = tip.saturating_add(g.depth);
-        let far: Vec<u32> = g.plans.range((max_h + 1)..).map(|(h, _)| *h).collect();
-        for h in far {
-            g.plans.remove(&h);
-        }
         // Decoded bodies GC at tip — multi-GB if held. Promote sticky identity.
+        // No far-horizon prune: load only inserts claimed-batch heights.
         let mut drop_bodies: Vec<(u64, [u8; 32], u32)> = Vec::new();
         g.by_body.retain(|id, b| {
-            let keep = b.height > tip && b.height <= max_h;
+            let keep = b.height > tip;
             if !keep {
                 drop_bodies.push((*id, b.tx.txid, b.height));
             }
@@ -383,12 +293,12 @@ impl ConfirmParentCache {
             g.sticky_insert(*txid, *id, *_height);
             g.thin_edges.remove(id);
         }
-        // Drop header plan cache for heights at/below tip (or past depth).
+        // Drop header plan cache for heights at/below tip.
         let drop_hdr: Vec<u32> = g
             .headers
             .keys()
             .copied()
-            .filter(|h| *h <= tip || *h > max_h)
+            .filter(|h| *h <= tip)
             .collect();
         for h in drop_hdr {
             if let Some(plan) = g.headers.remove(&h) {
@@ -401,12 +311,11 @@ impl ConfirmParentCache {
             }
         }
         g.gc_orphaned_parents();
-        g.gc_by_txid(tip, max_h);
+        g.gc_by_txid(tip);
         // Drop body_range not tied to live cache bodies or parent pins.
         g.gc_body_ranges();
-        // Munlock when no remaining need_height in (tip, max_h] — i.e. write
-        // finished for those heights and no later cache height still needs the page.
-        let unlocks = g.gc_mlocks(tip, max_h);
+        // Munlock when no remaining need_height > tip (write done for those heights).
+        let unlocks = g.gc_mlocks(tip);
         g.recompute_ready_through();
         self.ready_through
             .store(g.ready_through, Ordering::Relaxed);
@@ -897,9 +806,6 @@ impl ConfirmParentCache {
         if height <= g.tip {
             return;
         }
-        if height > g.tip.saturating_add(g.depth) {
-            return;
-        }
         g.plans.entry(height).or_insert_with(|| HeightPlan {
             hash,
             scanned: false,
@@ -911,15 +817,14 @@ impl ConfirmParentCache {
         }
     }
 
-    /// Seed many plans under one lock (IBD cache publish).
+    /// Seed many plans under one lock (confirm load batch).
     pub fn ensure_plans(&self, items: &[(u32, [u8; 32])]) {
         if items.is_empty() {
             return;
         }
         let mut g = self.inner.lock().unwrap();
-        let max_h = g.tip.saturating_add(g.depth);
         for &(height, hash) in items {
-            if height <= g.tip || height > max_h {
+            if height <= g.tip {
                 continue;
             }
             g.plans.entry(height).or_insert_with(|| HeightPlan {
@@ -1663,18 +1568,13 @@ impl Inner {
         }
     }
 
-    /// Drop `by_txid` entries outside `(tip−depth, tip+depth]` unless live.
-    ///
-    /// Keeping **depth behind tip** is intentional: external parents resolved
-    /// via head are keyed by spend height; re-spends of the same create in
-    /// the next few hundred blocks should hit this map (no second head probe).
-    fn gc_by_txid(&mut self, tip: u32, max_h: u32) {
-        let min_keep = tip.saturating_sub(self.depth);
+    /// Drop `by_txid` entries at/below tip unless still live in by_body/by_fk.
+    /// Sticky map covers long-lived create identity for thin resolve.
+    fn gc_by_txid(&mut self, tip: u32) {
         self.by_txid.retain(|_txid, e| {
-            if e.height > min_keep && e.height <= max_h {
+            if e.height > tip {
                 return true;
             }
-            // Still a live cache body or sparse parent with outs.
             self.by_body.contains_key(&e.fk) || self.by_fk.contains_key(&e.fk)
         });
     }
@@ -1965,12 +1865,12 @@ impl Inner {
         });
     }
 
-    /// Drop mlocks whose needing heights left `(tip, max_h]`.
+    /// Drop mlocks whose needing heights are all ≤ tip.
     /// Returns ranges with full page-ref zero for the caller to `munlock`.
-    fn gc_mlocks(&mut self, tip: u32, max_h: u32) -> Vec<MlockRange> {
+    fn gc_mlocks(&mut self, tip: u32) -> Vec<MlockRange> {
         let mut drop_keys: Vec<(u8, u64)> = Vec::new();
         for (key, rec) in &mut self.mlocked {
-            rec.need_heights.retain(|h| *h > tip && *h <= max_h);
+            rec.need_heights.retain(|h| *h > tip);
             if rec.need_heights.is_empty() {
                 drop_keys.push(*key);
             }
@@ -2105,7 +2005,7 @@ mod tests {
 
     #[test]
     fn utxo_parent_marks_ready() {
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(10);
         let hash = [9u8; 32];
         // Ready = full package (coinbase body), not mark_scanned alone.
@@ -2122,7 +2022,7 @@ mod tests {
 
     #[test]
     fn hollow_mark_scanned_is_not_package_ready() {
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(10);
         c.ensure_plan(11, [9u8; 32]);
         c.mark_scanned(11);
@@ -2138,7 +2038,7 @@ mod tests {
     /// Wait / ready_through use scanned (2-stage), not content package_ready.
     #[test]
     fn scanned_unblocks_wait_without_package_ready_content() {
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(10);
         c.ensure_plan(11, [9u8; 32]);
         // No bodies — package_ready false, but scanned is the wait bit.
@@ -2155,7 +2055,7 @@ mod tests {
     /// (2-stage wait does not re-walk content).
     #[test]
     fn recompute_watermark_scanned_not_content() {
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(10);
         seed_coinbase_package(&c, 11, [0x11; 32], 1100);
         seed_coinbase_package(&c, 12, [0x12; 32], 1200);
@@ -2174,7 +2074,7 @@ mod tests {
     /// or leave ready_through above a now-incomplete height (cache cursor skip).
     #[test]
     fn retire_last_live_out_keeps_checked_and_recomputes_watermark() {
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(10);
         seed_coinbase_package(&c, 11, [0x11; 32], 1100);
         // Height 12 spends parent 42:0 — pin with checked+live.
@@ -2232,7 +2132,7 @@ mod tests {
     /// skipping pin left ready_through at tip+1/+2 after multi-block cache bites.
     #[test]
     fn cross_height_spend_needs_parent_pin_for_package_ready() {
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(10);
         let h11 = [0x11u8; 32];
         let h12 = [0x12u8; 32];
@@ -2293,19 +2193,16 @@ mod tests {
         assert!(c.package_ready(12));
     }
 
-    /// Regression: without advance_tip to the real IBD tip, ensure_plans rejects
-    /// heights outside (0, depth] and ready_through never leaves 0 — confirm stalls.
+    /// ensure_plans ignores heights ≤ tip; after advance_tip, batch heights seed.
     #[test]
-    fn ensure_plans_requires_tip_horizon() {
-        let c = ConfirmParentCache::new(64);
-        // Cache tip still 0 (cache forgot advance_tip).
-        c.ensure_plans(&[(360_251, [1u8; 32]), (360_252, [2u8; 32])]);
-        assert_eq!(c.plan_count(), 0, "heights far above tip+depth must not seed");
-        c.mark_scanned_many(&[360_251, 360_252]);
-        assert_eq!(c.ready_through(), 0);
-
+    fn ensure_plans_skips_at_or_below_tip() {
+        let c = ConfirmParentCache::new();
         c.advance_tip(360_250);
-        c.ensure_plans(&[(360_251, [1u8; 32]), (360_252, [2u8; 32])]);
+        c.ensure_plans(&[
+            (360_250, [0u8; 32]), // at tip — skip
+            (360_251, [1u8; 32]),
+            (360_252, [2u8; 32]),
+        ]);
         assert_eq!(c.plan_count(), 2);
         seed_coinbase_package(&c, 360_251, [1u8; 32], 360_251);
         seed_coinbase_package(&c, 360_252, [2u8; 32], 360_252);
@@ -2320,7 +2217,7 @@ mod tests {
         use std::thread;
         use std::time::Duration;
 
-        let c = Arc::new(ConfirmParentCache::new(64));
+        let c = Arc::new(ConfirmParentCache::new());
         c.advance_tip(10);
         let hash = [9u8; 32];
         c.ensure_plan(11, hash);
@@ -2341,7 +2238,7 @@ mod tests {
 
     #[test]
     fn lookup_txids_batch_one_lock() {
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         c.register_mlocked_create(Fk(1), [1u8; 32], 1);
         c.register_mlocked_create(Fk(2), [2u8; 32], 2);
@@ -2358,7 +2255,7 @@ mod tests {
     #[test]
     fn take_bodies_batch_records_lock_wait_counter() {
         use crate::wave_fill_stats;
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         let mut t = tx(1);
         t.txid = [9u8; 32];
@@ -2388,14 +2285,14 @@ mod tests {
     fn sticky_confirmed_survives_tip_gc_of_by_txid() {
         // Creates registered on cache enter sticky; after tip advances past
         // create height, by_txid may drop but sticky still resolves thin.
-        let c = ConfirmParentCache::new(32);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         let t = tx(7);
         c.put_bodies_batch(vec![(Fk(70), 5, t.clone(), vec![out(1)], vec![])]);
         assert_eq!(c.get_by_txid(&t.txid), Some(Fk(70)));
         assert!(c.sticky_confirmed_count() >= 1);
-        // Advance tip past create height 5; cache window no longer holds body.
-        c.advance_tip(40); // min_keep=8 for depth=32 → height 5 by_txid may drop
+        // Advance tip past create height 5; body/by_txid at ≤ tip may drop.
+        c.advance_tip(40);
         // Sticky still has the create.
         let keys = [t.txid];
         let (hits, sticky_only) = c.lookup_txids_batch(&keys);
@@ -2408,7 +2305,7 @@ mod tests {
 
     #[test]
     fn reserve_then_register_create_fills() {
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         let hash = [2u8; 32];
         // Coinbase package is ready even with open reserves on the plan.
@@ -2427,7 +2324,7 @@ mod tests {
     #[test]
     fn open_reserves_do_not_block_ready_or_watermark() {
         // Simulate batch create@1 + spend@2: open reserves must not block package.
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         seed_coinbase_package(&c, 1, [1u8; 32], 1001);
         seed_coinbase_package(&c, 2, [2u8; 32], 1002);
@@ -2447,7 +2344,7 @@ mod tests {
     #[test]
     fn phase1_register_keeps_all_outs_for_later_spend() {
         // Bodies first: create height registers all outs; spend height hits cache.
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         seed_coinbase_package(&c, 1, [1u8; 32], 1001);
         let t = tx(5);
@@ -2464,7 +2361,7 @@ mod tests {
 
     #[test]
     fn body_cache_survives_until_tip_advances() {
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         let t = tx(5);
         c.put_body(
@@ -2487,7 +2384,7 @@ mod tests {
     /// Parent pin body_range must not accumulate forever across tip advances.
     #[test]
     fn body_range_gc_drops_orphaned_parent_ranges() {
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         c.ensure_plan(1, [1u8; 32]);
         // Parent pin range only (no by_body / by_fk keep-alive after tip).
@@ -2515,7 +2412,7 @@ mod tests {
 
     #[test]
     fn body_prevout_edges_prefers_create_fk_without_soft_txid() {
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         let t = tx(9);
         let inputs = vec![
@@ -2549,7 +2446,7 @@ mod tests {
 
     #[test]
     fn get_by_txid_falls_back_to_sticky_after_cache_gc() {
-        let c = ConfirmParentCache::new(32);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         let t = tx(11);
         c.put_body(Fk(11), 1, t.clone(), vec![out(1)], vec![]);
@@ -2563,7 +2460,7 @@ mod tests {
     #[test]
     fn body_create_resolves_without_by_fk_dual_copy() {
         // Bodies-first: put_body only; get_parent_out/has_parent_out use body outs.
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         let t = tx(7);
         c.put_bodies_batch(vec![(
@@ -2585,7 +2482,7 @@ mod tests {
 
     #[test]
     fn thin_inputs_stash_on_body() {
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         c.put_body(Fk(10), 1, tx(1), vec![out(1)], vec![]);
         assert!(c.get_thin_inputs(Fk(10)).is_none());
@@ -2614,7 +2511,7 @@ mod tests {
     #[test]
     fn parent_outs_resolved_skips_spent_recheck() {
         // Runway stashes live outs + checked set; wave must see spent_filtered.
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         c.ensure_plan(1, [1u8; 32]);
         let t = tx(9);
@@ -2645,7 +2542,7 @@ mod tests {
     #[test]
     fn parent_pin_covered_and_touch_skip_redecode() {
         // Sliding-window re-pin: already-stashed outs → covered; touch keep-alive.
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         c.ensure_plan(1, [1u8; 32]);
         c.ensure_plan(2, [2u8; 32]);
@@ -2683,7 +2580,7 @@ mod tests {
 
     #[test]
     fn parent_coinbase_height_stashed_for_wave() {
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         c.ensure_plan(1, [1u8; 32]);
         let t = tx(11);
@@ -2703,7 +2600,7 @@ mod tests {
     #[test]
     fn take_bodies_batch_moves_no_clone_left() {
         // No-worker path may still move bodies; body_range survives for annotate.
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         let t1 = tx(1);
         let t2 = tx(2);
@@ -2727,7 +2624,7 @@ mod tests {
     #[test]
     fn get_bodies_batch_keeps_cache_for_retry() {
         // Worker-live confirm clones so a failed package can re-queue.
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         let t1 = tx(1);
         c.put_bodies_batch(vec![(Fk(1), 1, t1.clone(), vec![out(10)], vec![])]);
@@ -2741,7 +2638,7 @@ mod tests {
 
     #[test]
     fn take_thin_inputs_batch_moves() {
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         c.put_thin_inputs(
             Fk(5),
@@ -2766,7 +2663,7 @@ mod tests {
 
     #[test]
     fn headroom_ready_requires_watermark() {
-        let c = ConfirmParentCache::new(128);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         // Ready 1..=3 only (full packages).
         for h in 1..=3u32 {
@@ -2791,7 +2688,7 @@ mod tests {
 
     #[test]
     fn advance_tip_prunes() {
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         c.ensure_plan(1, [1u8; 32]);
         c.put_utxo_parent(1, Fk(1), tx(1), 0, out(1));
@@ -2806,7 +2703,7 @@ mod tests {
     #[test]
     fn note_mlock_extends_shorter_prior_range() {
         use rbitcoin_store::{MlockRange, MlockTable};
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         let short = MlockRange {
             table: MlockTable::TxBody,
@@ -2837,7 +2734,7 @@ mod tests {
     #[test]
     fn advance_tip_munlocks_when_write_done_keeps_later_needs() {
         use rbitcoin_store::{MlockRange, MlockTable};
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         let r = MlockRange {
             table: MlockTable::TxBody,
@@ -2864,7 +2761,7 @@ mod tests {
     #[test]
     fn re_note_need_height_after_first_batch_keeps_mlock_across_pipeline() {
         use rbitcoin_store::{MlockRange, MlockTable};
-        let c = ConfirmParentCache::new(64);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         let r = MlockRange {
             table: MlockTable::TxBody,
@@ -2892,7 +2789,7 @@ mod tests {
     /// Bodies register sticky only (not dual by_txid). Identity survives tip GC.
     #[test]
     fn body_identity_is_sticky_not_cache_by_txid() {
-        let c = ConfirmParentCache::new(32);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         for h in 1u32..=40 {
             c.ensure_plan(h, [h as u8; 32]);
@@ -2915,7 +2812,7 @@ mod tests {
     /// Synthetic pressure: many full bodies must leave RAM when tip catches up.
     #[test]
     fn large_cache_bodies_do_not_accumulate_past_tip() {
-        let c = ConfirmParentCache::new(256);
+        let c = ConfirmParentCache::new();
         c.advance_tip(0);
         // ~2k "txs" per height × 64 heights — enough to trip unbounded hold.
         for h in 1u32..=64 {

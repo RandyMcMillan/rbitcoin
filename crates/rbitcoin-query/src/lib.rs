@@ -34,13 +34,7 @@ use std::sync::Mutex;
 pub type QueryError = StoreError;
 
 pub use catchup::IndexMode;
-pub use confirm_parent_cache::{
-    cache_batch_from_env, cache_depth_from_env, cache_headroom_from_env,
-    confirm_mlock_from_env, cache_pin_near_from_env, thin_create_fk_only_from_env,
-    DEFAULT_CACHE_BATCH as CACHE_BATCH, DEFAULT_CACHE_DEPTH as CACHE_DEPTH,
-    DEFAULT_CACHE_HEADROOM as CACHE_HEADROOM, DEFAULT_CACHE_PIN_NEAR as CACHE_PIN_NEAR,
-    MAX_CACHE_DEPTH, MIN_CACHE_DEPTH,
-};
+pub use confirm_parent_cache::{confirm_mlock_from_env, thin_create_fk_only_from_env};
 pub use connect::ConfirmPrepared;
 pub use confirm_load::ConfirmLoadStats;
 pub use scripthash::{

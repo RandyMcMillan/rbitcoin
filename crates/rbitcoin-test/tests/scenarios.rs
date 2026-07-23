@@ -1903,7 +1903,7 @@ fn three_stage_confirm_and_parent_mlock_surface() {
     assert!(st.blocks > 0 || st.already_ready > 0);
     let _ = q.load_confirm_parents_for_hashes(&[b_spend.block_hash().to_byte_array()]);
     let snap = q.parent_cache_perf_snapshot();
-    assert!(snap.5 > 0, "depth");
+    assert!(snap.4 > 0, "plans after load");
     let (_n, _bytes) = q.confirm_mlock_stats();
     let _ = q.confirm_mlock_bytes();
     assert!(q.is_confirm_load_ready(&items.iter().map(|(h, _)| *h).collect::<Vec<_>>()));

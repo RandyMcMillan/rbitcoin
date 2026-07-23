@@ -9,9 +9,9 @@ use rbitcoin_log::debug;
 use rbitcoin_primitives::Fk;
 use rbitcoin_query::TxApply;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -560,11 +560,17 @@ pub(crate) fn spawn_archive_pipeline(
         // Prep → writer: depth-2 queue (plan while prior commit runs).
         let (write_tx, write_rx) =
             std::sync::mpsc::sync_channel::<WriteReadyBatch>(ARCHIVE_WRITE_QUEUE_CAP);
+        // Planned create txid→fk not yet durable (queued / committing). Prep resolve
+        // reads this so a later mega-batch can spend prior-batch creates; writer
+        // drops entries after commit success/fail (sticky holds them after Ok).
+        let inflight_creates: Arc<Mutex<HashMap<[u8; 32], Fk>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         let write_hub = hub.clone();
         let write_result = result_tx.clone();
         let write_stats = Arc::clone(&stats);
         let write_stop = Arc::clone(&stop);
+        let write_inflight = Arc::clone(&inflight_creates);
 
         let writer = std::thread::Builder::new()
             .name("ibd-archive-writer".into())
@@ -590,11 +596,16 @@ pub(crate) fn spawn_archive_pipeline(
                         Ordering::Relaxed,
                     );
                     let n_blocks = batch.outcomes.len() as u64;
+                    let WriteReadyBatch { outcomes, plan } = batch;
+                    // Drop inflight creates after this batch either way — on Ok sticky
+                    // has them; on Err they must not be used for later resolve.
+                    let clear_inflight: Vec<[u8; 32]> =
+                        plan.sticky_creates.iter().map(|(t, _)| *t).collect();
                     let write_t0 = Instant::now();
-                    let write_res = if batch.plan.is_empty() {
+                    let write_res = if plan.is_empty() {
                         Ok(())
                     } else {
-                        write_hub.query.archive_commit_plan(batch.plan)
+                        write_hub.query.archive_commit_plan(plan)
                     };
                     write_stats
                         .write_ns
@@ -607,9 +618,16 @@ pub(crate) fn spawn_archive_pipeline(
                         .write_batch_blocks
                         .fetch_add(n_blocks, Ordering::Relaxed);
 
+                    if !clear_inflight.is_empty() {
+                        let mut g = write_inflight.lock().unwrap();
+                        for t in &clear_inflight {
+                            g.remove(t);
+                        }
+                    }
+
                     match write_res {
                         Ok(()) => {
-                            for (hash, wire_bytes) in batch.outcomes {
+                            for (hash, wire_bytes) in outcomes {
                                 if write_result
                                     .send(ArchiveResult::Ok { hash, wire_bytes })
                                     .is_err()
@@ -632,7 +650,7 @@ pub(crate) fn spawn_archive_pipeline(
                             // Ordered FK reservation: after a commit failure, any
                             // later queued plans are invalid — fail them and stop.
                             let err = e.to_string();
-                            for (hash, wire_bytes) in batch.outcomes {
+                            for (hash, wire_bytes) in outcomes {
                                 let _ = write_result.send(ArchiveResult::Err {
                                     hash,
                                     err: err.clone(),
@@ -640,6 +658,13 @@ pub(crate) fn spawn_archive_pipeline(
                                 });
                             }
                             while let Ok(rest) = write_rx.try_recv() {
+                                // Drop their inflight creates too.
+                                if !rest.plan.sticky_creates.is_empty() {
+                                    let mut g = write_inflight.lock().unwrap();
+                                    for (t, _) in &rest.plan.sticky_creates {
+                                        g.remove(t);
+                                    }
+                                }
                                 for (hash, wire_bytes) in rest.outcomes {
                                     let _ = write_result.send(ArchiveResult::Err {
                                         hash,
@@ -666,6 +691,7 @@ pub(crate) fn spawn_archive_pipeline(
         let prep_next = Arc::clone(&write_next_height);
         let prep_lag = Arc::clone(&confirm_lag);
         let prep_arch_q = Arc::clone(&archive_queued);
+        let prep_inflight = Arc::clone(&inflight_creates);
 
         let prep_thread = std::thread::Builder::new()
             .name("ibd-archive-prep".into())
@@ -684,6 +710,7 @@ pub(crate) fn spawn_archive_pipeline(
                     hub: &ChainHub,
                     write_tx: &std::sync::mpsc::SyncSender<WriteReadyBatch>,
                     next_plan_fk: &mut u64,
+                    inflight: &Mutex<HashMap<[u8; 32], Fk>>,
                     stats: &ArchivePipelineStats,
                     params: &rbitcoin_consensus::ChainParams,
                 ) -> bool {
@@ -713,6 +740,7 @@ pub(crate) fn spawn_archive_pipeline(
                                     stats,
                                     write_tx,
                                     next_plan_fk,
+                                    inflight,
                                     result_tx,
                                 ),
                                 PlanSend::WriterDead
@@ -737,6 +765,7 @@ pub(crate) fn spawn_archive_pipeline(
                 /// Blocks only when the write queue is full (`ARCHIVE_WRITE_QUEUE_CAP`).
                 /// Create fks come from `*next_plan_fk` so overlapping plans do not
                 /// re-use durable `txs.count()+1` while a prior batch is in flight.
+                /// Resolve uses `inflight` so a later batch can spend prior planned creates.
                 fn plan_and_send_jobs(
                     jobs: &[ArchiveJob],
                     hub: &ChainHub,
@@ -744,6 +773,7 @@ pub(crate) fn spawn_archive_pipeline(
                     stats: &ArchivePipelineStats,
                     write_tx: &std::sync::mpsc::SyncSender<WriteReadyBatch>,
                     next_plan_fk: &mut u64,
+                    inflight: &Mutex<HashMap<[u8; 32], Fk>>,
                     result_tx: &mpsc::UnboundedSender<ArchiveResult>,
                 ) -> PlanSend {
                     if jobs.is_empty() {
@@ -788,8 +818,12 @@ pub(crate) fn spawn_archive_pipeline(
                             if need.is_empty() {
                                 rbitcoin_query::ArchiveWritePlan::empty()
                             } else {
-                                match hub.query.archive_plan_mega_from(&mut need, *next_plan_fk)
-                                {
+                                let g = inflight.lock().unwrap();
+                                match hub.query.archive_plan_mega_from(
+                                    &mut need,
+                                    *next_plan_fk,
+                                    &g,
+                                ) {
                                     Ok(p) => p,
                                     Err(e) => {
                                         let err = e.to_string();
@@ -821,6 +855,13 @@ pub(crate) fn spawn_archive_pipeline(
                     // Advance reserved HWM only after a successful non-empty plan.
                     if let Some(last) = plan.planned_fks.last() {
                         *next_plan_fk = last.0.saturating_add(1);
+                    }
+                    // Publish planned creates for the next overlapping plan's resolve.
+                    if !plan.sticky_creates.is_empty() {
+                        let mut g = inflight.lock().unwrap();
+                        for &(txid, fk) in &plan.sticky_creates {
+                            g.insert(txid, fk);
+                        }
                     }
 
                     // Empty plan still goes through writer so Ok results stay ordered.
@@ -895,6 +936,7 @@ pub(crate) fn spawn_archive_pipeline(
                             &prep_hub,
                             &write_tx,
                             &mut next_plan_fk,
+                            &prep_inflight,
                             &prep_stats,
                             &prep_params,
                         ) {
@@ -914,6 +956,7 @@ pub(crate) fn spawn_archive_pipeline(
                                 &prep_hub,
                                 &write_tx,
                                 &mut next_plan_fk,
+                                &prep_inflight,
                                 &prep_stats,
                                 &prep_params,
                             ) {
@@ -929,6 +972,7 @@ pub(crate) fn spawn_archive_pipeline(
                                 &prep_hub,
                                 &write_tx,
                                 &mut next_plan_fk,
+                                &prep_inflight,
                                 &prep_stats,
                                 &prep_params,
                             ) {
@@ -1001,6 +1045,7 @@ pub(crate) fn spawn_archive_pipeline(
                                             &prep_hub,
                                             &write_tx,
                                             &mut next_plan_fk,
+                                            &prep_inflight,
                                             &prep_stats,
                                             &prep_params,
                                         ) {
@@ -1017,6 +1062,7 @@ pub(crate) fn spawn_archive_pipeline(
                                         &prep_hub,
                                         &write_tx,
                                         &mut next_plan_fk,
+                                        &prep_inflight,
                                         &prep_stats,
                                         &prep_params,
                                     ) {
@@ -1047,6 +1093,7 @@ pub(crate) fn spawn_archive_pipeline(
                         &prep_stats,
                         &write_tx,
                         &mut next_plan_fk,
+                        &prep_inflight,
                         &prep_result,
                     ) {
                         PlanSend::Done => {}

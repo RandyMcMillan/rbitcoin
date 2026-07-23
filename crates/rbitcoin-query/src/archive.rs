@@ -3,11 +3,14 @@
 //! Split for IBD dual-thread (prep/write may overlap with a small plan queue):
 //! - **Plan** ([`Query::archive_plan_mega_owned`] / [`Query::archive_plan_mega_from`]):
 //!   store **reads** — assign create fks (optionally from a reserved HWM), sticky +
-//!   `tx.head` resolve, stamp inputs.
+//!   **in-flight planned creates** + `tx.head` resolve, stamp inputs.
 //! - **Commit** ([`Query::archive_commit_plan`]): store **writes** — body append,
 //!   head index, header_txs, sticky publish.
 //! - **Prewarm** ([`Query::archive_sticky_prewarm`]): sequential last-N `tx.idx`
 //!   fill of sticky before the pipeline starts.
+//!
+//! Overlap requires the in-flight map: a later mega-batch may spend outputs from a
+//! prior plan that is still queued/committing (not yet in sticky/head).
 
 use super::*;
 
@@ -171,8 +174,10 @@ impl Query {
         &self,
         need: &mut [(Fk, Vec<TxApply>)],
     ) -> Result<ArchiveWritePlan, QueryError> {
+        use std::collections::HashMap;
         let start = self.store.txs.count().saturating_add(1);
-        self.archive_plan_mega_from(need, start)
+        let empty = HashMap::new();
+        self.archive_plan_mega_from(need, start, &empty)
     }
 
     /// Like [`Self::archive_plan_mega_owned`], but assign create fks from
@@ -181,10 +186,15 @@ impl Query {
     /// IBD prep keeps a local reserved HWM: after each successful non-empty plan,
     /// advance to `planned_fks.last()+1` so the next mega-batch can be planned
     /// while a prior batch is still committing (ordered writer preserves match).
+    ///
+    /// `in_flight`: create txid→fk from prior plans that are queued/committing
+    /// but not yet in sticky/head. Required for queue depth &gt; 1 when a later
+    /// batch spends a prior batch's creates.
     pub fn archive_plan_mega_from(
         &self,
         need: &mut [(Fk, Vec<TxApply>)],
         next_tx_start: u64,
+        in_flight: &std::collections::HashMap<[u8; 32], Fk>,
     ) -> Result<ArchiveWritePlan, QueryError> {
         use std::collections::{HashMap, HashSet};
         use std::time::Instant;
@@ -251,6 +261,17 @@ impl Query {
         let need_vec: Vec<[u8; 32]> = need_external.iter().copied().collect();
         let mut resolved = self.archive_txid_sticky.lookup_batch(&need_vec);
         let sticky_hit_n = resolved.len() as u64;
+        // Prior mega-batch(es) still in the write queue: not sticky/head yet.
+        if !in_flight.is_empty() {
+            for t in &need_vec {
+                if resolved.contains_key(t) {
+                    continue;
+                }
+                if let Some(&fk) = in_flight.get(t) {
+                    resolved.insert(*t, fk);
+                }
+            }
+        }
         let mut need_head: Vec<[u8; 32]> = Vec::new();
         for t in &need_vec {
             if !resolved.contains_key(t) {
@@ -525,6 +546,7 @@ mod tests {
 
     #[test]
     fn plan_from_reserves_fks_for_overlap_then_commit_in_order() {
+        use std::collections::HashMap;
         let (dir, q) = temp_query("plan-from");
         // Seed one body so count starts at 1.
         let seed = vec![(Fk(1), vec![coinbase_apply(1)])];
@@ -535,15 +557,16 @@ mod tests {
         assert_eq!(q.tx_body_count(), 1);
 
         // Reserve two plans as prep would with write queue depth 2.
+        let empty = HashMap::new();
         let mut next = q.tx_body_count() + 1;
         let mut need_a = vec![(Fk(10), vec![coinbase_apply(10), coinbase_apply(11)])];
-        let plan_a = q.archive_plan_mega_from(&mut need_a, next).unwrap();
+        let plan_a = q.archive_plan_mega_from(&mut need_a, next, &empty).unwrap();
         assert_eq!(plan_a.planned_fks, vec![Fk(2), Fk(3)]);
         next = plan_a.planned_fks.last().unwrap().0 + 1;
         assert_eq!(next, 4);
 
         let mut need_b = vec![(Fk(20), vec![coinbase_apply(20)])];
-        let plan_b = q.archive_plan_mega_from(&mut need_b, next).unwrap();
+        let plan_b = q.archive_plan_mega_from(&mut need_b, next, &empty).unwrap();
         assert_eq!(plan_b.planned_fks, vec![Fk(4)]);
         // Durable count still 1 until commit.
         assert_eq!(q.tx_body_count(), 1);
@@ -553,6 +576,91 @@ mod tests {
         q.archive_commit_plan(plan_b).unwrap();
         assert_eq!(q.tx_body_count(), 4);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Overlapping plan must resolve parents from a prior uncommitted mega-batch.
+    /// Without `in_flight`, this is the "parent create_fk unresolved" corruption.
+    #[test]
+    fn overlap_plan_resolves_parent_via_inflight_creates() {
+        use std::collections::HashMap;
+        let (dir, q) = temp_query("inflight-parent");
+        let mut need_a = vec![(Fk(1), vec![coinbase_apply(1)])];
+        let empty = HashMap::new();
+        let plan_a = q.archive_plan_mega_from(&mut need_a, 1, &empty).unwrap();
+        assert_eq!(plan_a.planned_fks, vec![Fk(1)]);
+        let parent_txid = plan_a.sticky_creates[0].0;
+        let parent_fk = plan_a.sticky_creates[0].1;
+
+        // Child spends parent — not in sticky/head until plan_a commits.
+        let mut child_txid = [0u8; 32];
+        child_txid[0] = 0xee;
+        let child = TxApply {
+            tx: TxRecord {
+                txid: child_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: parent_txid,
+                create_fk: Fk::NULL, // must resolve
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        let mut need_b = vec![(Fk(2), vec![child])];
+
+        // Without in_flight → unresolved.
+        let err = q
+            .archive_plan_mega_from(&mut need_b, 2, &empty)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("create_fk unresolved"),
+            "expected unresolved without inflight, got {err}"
+        );
+
+        // Rebuild child (need_b was drained on failure).
+        let child = TxApply {
+            tx: TxRecord {
+                txid: child_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: parent_txid,
+                create_fk: Fk::NULL,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        let mut need_b = vec![(Fk(2), vec![child])];
+        let inflight: HashMap<_, _> = plan_a.sticky_creates.iter().copied().collect();
+        let plan_b = q
+            .archive_plan_mega_from(&mut need_b, 2, &inflight)
+            .expect("inflight parent resolve");
+        assert_eq!(plan_b.planned_fks, vec![Fk(2)]);
+        assert_eq!(
+            plan_b.packed[0].1[0].create_fk, parent_fk,
+            "child input must stamp prior planned create_fk"
+        );
+
+        q.archive_commit_plan(plan_a).unwrap();
+        q.archive_commit_plan(plan_b).unwrap();
+        assert_eq!(q.tx_body_count(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -162,12 +162,24 @@ pub struct HeaderPlanCache {
 #[derive(Debug, Default)]
 struct HeightPlan {
     hash: [u8; 32],
-    /// Prewarm finished a full package attempt for this height (see package_ready).
+    /// Prewarm finished a body+thin+pin attempt for this height.
+    ///
+    /// This is the **2-stage wait bit**: confirm unblocks when scanned (same work
+    /// as pre-pipeline). Full content completeness is best-effort in the pin
+    /// phase; wave may store-fallback on residual misses.
     scanned: bool,
     /// (create_fk, vout) fully populated in cache.
     need_fk: HashSet<(u64, u32)>,
     /// (prev_txid, vout) not in UTXO at prewarm — expect runway / same-wave create.
     reserved: HashSet<([u8; 32], u32)>,
+}
+
+impl HeightPlan {
+    /// Prewarm attempt finished — O(1). Used by wait / ready_through (2-stage).
+    #[inline]
+    fn is_ready(&self) -> bool {
+        self.scanned
+    }
 }
 
 /// One mlocked page range (any store table) held for runway heights.
@@ -888,15 +900,14 @@ impl ConfirmParentCache {
         }
     }
 
-    /// True if height was scanned (open reservations do not block).
+    /// True if prewarm finished a scan attempt for this height (2-stage wait).
     pub fn is_ready(&self, height: u32) -> bool {
         let g = self.inner.lock().unwrap();
-        g.package_ready(height)
+        g.plans.get(&height).is_some_and(|p| p.is_ready())
     }
 
-    /// True when the height has a **complete confirm package** on the runway:
-    /// header plan, all Class A bodies, thin/create_fk edges, and external
-    /// parent outs with spent filter applied. This is what wait_prewarm waits for.
+    /// Content-complete package (header+bodies+edges+pinned parents). Diagnostic
+    /// / optional strict claim; **wait uses [`Self::is_ready`]** like 2-stage.
     pub fn package_ready(&self, height: u32) -> bool {
         self.inner.lock().unwrap().package_ready(height)
     }
@@ -909,10 +920,12 @@ impl ConfirmParentCache {
             .is_some_and(|p| !p.reserved.is_empty())
     }
 
-    /// All heights in `heights` ready (scanned).
+    /// All heights in `heights` ready (scanned — 2-stage wait).
     pub fn all_ready(&self, heights: &[u32]) -> bool {
         let g = self.inner.lock().unwrap();
-        heights.iter().all(|h| g.package_ready(*h))
+        heights
+            .iter()
+            .all(|h| g.plans.get(h).is_some_and(|p| p.is_ready()))
     }
 
     /// Confirm headroom: warmer has fully ready plans through at least
@@ -999,7 +1012,11 @@ impl ConfirmParentCache {
         let start = Instant::now();
         let mut g = self.inner.lock().unwrap();
         loop {
-            let ready = heights.iter().all(|h| g.package_ready(*h));
+            // 2-stage semantics: scanned only (O(1)). Content completeness is
+            // prewarm's job; wave store-fallbacks residual misses like before.
+            let ready = heights
+                .iter()
+                .all(|h| g.plans.get(h).is_some_and(|p| p.is_ready()));
             if ready {
                 return Ok(());
             }
@@ -1818,23 +1835,23 @@ impl Inner {
         }
     }
 
-    /// Contiguous **package-complete** watermark from tip+1 upward.
+    /// Contiguous **scanned** watermark from tip+1 upward (2-stage ready).
     fn recompute_ready_through(&mut self) {
         let mut h = self.tip.saturating_add(1);
-        while self.package_ready(h) {
-            h = h.saturating_add(1);
+        loop {
+            match self.plans.get(&h) {
+                Some(p) if p.is_ready() => h = h.saturating_add(1),
+                _ => break,
+            }
         }
         self.ready_through = h.saturating_sub(1);
     }
 
-    /// Full confirm package on runway (header + bodies + edges + external parents).
+    /// Content-complete package (header + bodies + edges + external parents).
     ///
-    /// Requires **both** `plan.scanned` (prewarm finished this height's pin pass)
-    /// **and** content. Content alone is not enough: during a multi-height bite,
-    /// tip+1 can look complete mid-loop (e.g. coinbase / early puts) before the
-    /// bite's pin phase runs — confirm then claims and fails with
-    /// "header plan missing" / incomplete after wait. `mark_scanned` is only
-    /// set after the full height attempt (bodies + thin + pin).
+    /// Optional strict check (diagnostics / tests). Wait / ready_through use
+    /// scanned-only [`HeightPlan::is_ready`] so the pipeline does not do more
+    /// blocking work than the 2-stage path.
     fn package_ready(&self, height: u32) -> bool {
         let Some(plan) = self.plans.get(&height) else {
             return false;
@@ -2072,69 +2089,47 @@ mod tests {
         c.advance_tip(10);
         c.ensure_plan(11, [9u8; 32]);
         c.mark_scanned(11);
+        // Wait uses scanned (2-stage); package_ready stays content-strict.
+        assert!(c.is_ready(11));
+        assert_eq!(c.ready_through(), 11);
         assert!(
             !c.package_ready(11),
-            "scanned without bodies must not unblock confirm"
+            "scanned without bodies is not content-complete"
         );
-        assert_eq!(c.ready_through(), 10);
     }
 
-    /// Mid-bite coinbase puts must not unblock confirm before mark_scanned (pin pass).
+    /// Wait / ready_through use scanned (2-stage), not content package_ready.
     #[test]
-    fn unscanned_content_is_not_package_ready() {
+    fn scanned_unblocks_wait_without_package_ready_content() {
         let c = ConfirmParentCache::new(64);
         c.advance_tip(10);
-        // Full coinbase package content without mark_scanned.
-        let hash = [9u8; 32];
-        c.ensure_plan(11, hash);
-        let mut t = tx(1);
-        t.txid = hash;
-        t.input_count = 1;
-        t.output_count = 1;
-        let inputs = vec![InputRecord {
-            prev_txid: [0u8; 32],
-            create_fk: Fk::NULL,
-            prev_index: u32::MAX,
-            sequence: 0xffff_ffff,
-            script_sig: vec![],
-            witness: vec![],
-        }];
-        c.put_header_plan(
-            11,
-            Fk(11),
-            header_rec(hash),
-            vec![Fk(1001)],
-            [0u8; 32],
-        );
-        c.put_body(Fk(1001), 11, t, vec![out(50)], inputs);
+        c.ensure_plan(11, [9u8; 32]);
+        // No bodies — package_ready false, but scanned is the wait bit.
+        c.mark_scanned(11);
+        assert!(c.is_ready(11));
+        assert_eq!(c.ready_through(), 11);
         assert!(
             !c.package_ready(11),
-            "content without scanned must not claim mid prewarm bite"
+            "package_ready still content-strict for diagnostics"
         );
-        assert_eq!(c.ready_through(), 10);
-        c.mark_scanned(11);
-        assert!(c.package_ready(11));
-        assert_eq!(c.ready_through(), 11);
     }
 
-    /// Body drained after mark: watermark must fall to the last complete package.
+    /// Body drained after mark: package_ready false; scanned ready_through stays
+    /// (2-stage wait does not re-walk content).
     #[test]
-    fn recompute_watermark_drops_when_body_drained() {
+    fn recompute_watermark_scanned_not_content() {
         let c = ConfirmParentCache::new(64);
         c.advance_tip(10);
         seed_coinbase_package(&c, 11, [0x11; 32], 1100);
         seed_coinbase_package(&c, 12, [0x12; 32], 1200);
         assert_eq!(c.ready_through(), 12);
-        // Historical take_bodies emptied runway while ready_through stayed high.
         let _ = c.take_bodies_batch(&[Fk(1200)]);
         assert!(!c.package_ready(12));
-        // Without recompute, atomic watermark would still say 12.
-        assert_eq!(c.ready_through(), 12, "stale until recompute");
         c.recompute_ready_watermark();
         assert_eq!(
             c.ready_through(),
-            11,
-            "cursor must resume at first incomplete (12)"
+            12,
+            "scanned watermark ignores content drain (wave store-fallbacks)"
         );
     }
 
@@ -2239,17 +2234,15 @@ mod tests {
             }],
         );
         c.mark_scanned(12);
+        // Wait unblocks on scanned (2-stage); content package still incomplete.
+        assert!(c.is_ready(12));
+        assert_eq!(c.ready_through(), 12);
         assert!(
             !c.package_ready(12),
             "spend of same-bite create without by_fk pin must not be package_ready"
         );
-        assert_eq!(
-            c.ready_through(),
-            11,
-            "watermark must stop at last complete package"
-        );
 
-        // Pin from runway body (what prewarm now does for batch_create_ids).
+        // Pin from runway body (what prewarm does for batch_create_ids).
         let (create_h, tx, outs, _ins) = c.get_body_for_pin(Fk(1100)).expect("runway body");
         assert_eq!(create_h, 11);
         c.put_parent_outs_resolved(
@@ -2260,10 +2253,7 @@ mod tests {
             &[0],
             Some(Some(11)),
         );
-        // Content-based package_ready (no re-mark needed once pin lands).
         assert!(c.package_ready(12));
-        c.mark_scanned(12); // notify + recompute ready_through
-        assert_eq!(c.ready_through(), 12);
     }
 
     /// Regression: without advance_tip to the real IBD tip, ensure_plans rejects

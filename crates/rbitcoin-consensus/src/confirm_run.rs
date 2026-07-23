@@ -140,9 +140,10 @@ pub fn confirm_script_phase(
         blocks.len(),
     );
 
-    let cache_only = query.prewarm_worker_live();
+    // Prefer runway cache; store-fallback on miss (same work as 2-stage).
+    // Hard cache-only was pipeline-era extra re-queue cost.
     let t_resolve = Instant::now();
-    let metas = resolve_body_metas(query, blocks, cache_only)?;
+    let metas = resolve_body_metas(query, blocks, false)?;
     confirm_phase_stats::RESOLVE_NS.fetch_add(
         t_resolve.elapsed().as_nanos() as u64,
         Ordering::Relaxed,
@@ -157,7 +158,7 @@ pub fn confirm_script_phase(
         metas,
         &wire_blocks,
         &wave_prevouts,
-        cache_only,
+        false,
     )?;
     script_wave(&prepared)?;
     // Drop heavy script jobs before queueing writeback (spends/fees remain).

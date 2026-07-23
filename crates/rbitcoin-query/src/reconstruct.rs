@@ -43,7 +43,9 @@ impl Query {
     ) -> Result<(usize, crate::WavePrevoutCache), QueryError> {
         use crate::wave_fill_stats::{self as wf, add as wf_add, add_count as wf_count};
 
-        let cache_only = self.prewarm_worker_live();
+        // Prefer runway cache; **store-fallback on miss** (2-stage). Hard
+        // cache-only was pipeline-era extra work that re-queued batches instead
+        // of finishing the same Class A load the old path did inline.
         let mut wave_fks: HashSet<u64> = HashSet::new();
         let mut wave_tx_fks: Vec<Fk> = Vec::new();
         for list in per_block {
@@ -59,21 +61,10 @@ impl Query {
             crate::WavePrevoutCache::with_capacity(wave_tx_fks.len(), wave_tx_fks.len());
         let mut noted = 0usize;
 
-        // Pass 2: wave bodies from runway.
-        // Cache-only / worker-live: **clone** (get) so a failed confirm can
-        // re-queue without emptying the runway while heights stay "ready".
-        // No-worker (tests / sync path): move (take) as before.
+        // Pass 2: move bodies from runway (no clone — 2-stage hot path).
         let t_body = Instant::now();
-        let mut taken_bodies = if cache_only {
-            self.confirm_parents.get_bodies_batch(&wave_tx_fks)
-        } else {
-            self.confirm_parents.take_bodies_batch(&wave_tx_fks)
-        };
-        let mut taken_thin = if cache_only {
-            self.confirm_parents.get_thin_inputs_batch(&wave_tx_fks)
-        } else {
-            self.confirm_parents.take_thin_inputs_batch(&wave_tx_fks)
-        };
+        let mut taken_bodies = self.confirm_parents.take_bodies_batch(&wave_tx_fks);
+        let mut taken_thin = self.confirm_parents.take_thin_inputs_batch(&wave_tx_fks);
         // parent_fk → needed vouts (small lists; sort/dedup later).
         let mut parent_needed: HashMap<u64, Vec<u32>> = HashMap::new();
         let mut n_cache = 0u64;
@@ -86,46 +77,16 @@ impl Query {
                 if let Some(parts) = taken_bodies.remove(&id) {
                     n_cache = n_cache.saturating_add(1);
                     parts
-                } else if cache_only {
-                    return Err(StoreError::Corrupt(
-                        "confirm: prewarm incomplete (wave body missing from runway)",
-                    )
-                    .into());
                 } else {
                     n_store = n_store.saturating_add(1);
                     self.load_body_from_store(fk)?
                 }
-            } else if cache_only {
-                return Err(StoreError::Corrupt(
-                    "confirm: prewarm incomplete (null wave body fk)",
-                )
-                .into());
             } else {
                 n_store = n_store.saturating_add(1);
                 self.load_body_from_store(fk)?
             };
-            // Coinbase height for maturity (writeback). Prefer prewarm stash;
-            // never touch cold tx_height on the confirm thread when worker is live.
-            let cb_h: Option<Option<u32>> = if cache_only {
-                self.confirm_parents
-                    .get_parent_coinbase_height(fk)
-                    .or_else(|| {
-                        let is_cb = tx.input_count == 1
-                            && inputs.first().is_some_and(|i| {
-                                i.is_coinbase()
-                                    || (i.prev_txid == [0u8; 32]
-                                        && i.prev_index == 0xffff_ffff)
-                            });
-                        if is_cb {
-                            // Unknown height — structural writeback can resolve later.
-                            None
-                        } else {
-                            Some(None)
-                        }
-                    })
-            } else {
-                Some(self.coinbase_height_for_tx_with_input0(fk, &tx, inputs.first())?)
-            };
+            let cb_h: Option<Option<u32>> =
+                Some(self.coinbase_height_for_tx_with_input0(fk, &tx, inputs.first())?);
 
             // Thin edges before moving outs/inputs into wave.
             let edges = if let Some(id) = id {
@@ -134,19 +95,12 @@ impl Query {
                     stashed
                 } else if inputs.is_empty() {
                     Vec::new()
-                } else if cache_only {
-                    // Rebuild from stamped create_fk only (no head / store).
-                    n_thin_rebuild = n_thin_rebuild.saturating_add(1);
-                    self.thin_edges_from_inputs_cache_only(&inputs)?
                 } else {
                     n_thin_rebuild = n_thin_rebuild.saturating_add(1);
                     self.thin_edges_from_inputs(&inputs, &wave)?
                 }
             } else if inputs.is_empty() {
                 Vec::new()
-            } else if cache_only {
-                n_thin_rebuild = n_thin_rebuild.saturating_add(1);
-                self.thin_edges_from_inputs_cache_only(&inputs)?
             } else {
                 n_thin_rebuild = n_thin_rebuild.saturating_add(1);
                 self.thin_edges_from_inputs(&inputs, &wave)?
@@ -187,36 +141,19 @@ impl Query {
         for (pid, needed_vouts) in &parents {
             let fk = Fk(*pid);
             let t_par = Instant::now();
-            let (tx, mut candidates, spent_filtered) = if cache_only {
+            // Prefer runway pin; store-fallback like 2-stage.
+            let (tx, mut candidates, spent_filtered) =
                 match self.confirm_parents.get_parent_outs_needed(fk, needed_vouts) {
                     Some((tx, live, filtered)) => (tx, live, filtered),
-                    None => {
-                        return Err(StoreError::Corrupt(
-                            "confirm: prewarm incomplete (parent outs missing from runway)",
-                        )
-                        .into());
-                    }
-                }
-            } else {
-                self.load_parent_needed_outs(fk, needed_vouts)?
-            };
-            // Parent load is outs-focused (cache sparse or store meta+outs).
+                    None => self.load_parent_needed_outs(fk, needed_vouts)?,
+                };
             wf_add(&wf::PARENT_TX_NS, t_par.elapsed().as_nanos() as u64);
 
             let n_out = tx.output_count;
             let t_spent = Instant::now();
             let live: Vec<(u32, OutputRecord)> = if spent_filtered {
-                // Prewarm already dropped spent vouts.
                 candidates
-            } else if cache_only {
-                // No cold spend walk on confirm thread — treat as already filtered
-                // empty if prewarm didn't mark spent_filtered (should not happen).
-                return Err(StoreError::Corrupt(
-                    "confirm: prewarm incomplete (parent spent filter missing)",
-                )
-                .into());
             } else {
-                // One body walk for all needed vouts (not per-vout packed walk).
                 let range = self.confirm_parents.get_body_range(fk);
                 let unspent: HashSet<u32> = self
                     .store
@@ -231,14 +168,10 @@ impl Query {
             wf_add(&wf::SPENT_NS, t_spent.elapsed().as_nanos() as u64);
 
             let t_cb = Instant::now();
-            // Prefer prewarm-stashed coinbase height (no body re-walk).
             let cb = if let Some(resolved) =
                 self.confirm_parents.get_parent_coinbase_height(fk)
             {
                 Some(resolved)
-            } else if cache_only {
-                // Unknown maturity → treat as non-coinbase (scripts don't need height).
-                Some(None)
             } else {
                 Some(self.resolve_parent_coinbase_height(
                     fk,
@@ -253,35 +186,6 @@ impl Query {
         }
 
         Ok((noted, wave))
-    }
-
-    /// Thin edges from stamped `create_fk` only — no head / by_txid store probes.
-    fn thin_edges_from_inputs_cache_only(
-        &self,
-        inputs: &[InputRecord],
-    ) -> Result<Vec<crate::wave_prevout::ThinInput>, QueryError> {
-        use crate::wave_prevout::ThinInput;
-        let mut edges = Vec::with_capacity(inputs.len());
-        for inp in inputs {
-            if inp.is_coinbase() {
-                edges.push(ThinInput {
-                    create_fk: None,
-                    prev_index: inp.prev_index,
-                });
-                continue;
-            }
-            if inp.create_fk.is_null() {
-                return Err(StoreError::Corrupt(
-                    "confirm: prewarm incomplete (input create_fk unstamped)",
-                )
-                .into());
-            }
-            edges.push(ThinInput {
-                create_fk: inp.create_fk.get(),
-                prev_index: inp.prev_index,
-            });
-        }
-        Ok(edges)
     }
 
     /// Resolve create maturity: `None` = not coinbase, `Some(h)` = coinbase height.
@@ -571,7 +475,7 @@ impl Query {
         inputs: &mut [InputRecord],
         wave: Option<&crate::WavePrevoutCache>,
         cache: &mut HashMap<u64, [u8; 32]>,
-        cache_only: bool,
+        _cache_only: bool,
     ) -> Result<(), QueryError> {
         for inp in inputs.iter_mut() {
             if inp.is_coinbase() {
@@ -598,12 +502,6 @@ impl Query {
             .or_else(|| self.confirm_parents.get_parent_txid(Fk(id)));
             let txid = match from_ram {
                 Some(t) => t,
-                None if cache_only => {
-                    return Err(StoreError::Corrupt(
-                        "confirm: prewarm incomplete (parent txid missing from runway)",
-                    )
-                    .into());
-                }
                 // Unique create: one body prefix read, then reused via `cache`.
                 None => self.store.txs.body_txid(Fk(id))?,
             };
@@ -662,7 +560,6 @@ impl Query {
             return Err(StoreError::Corrupt("block has no transactions"));
         }
         let header = self.wire_header_from_record_prev(&rec, prev_hash)?;
-        let cache_only = self.prewarm_worker_live();
         let mut txdata = Vec::with_capacity(tx_fks.len());
         // Dedup create_fk → txid across the whole block (and prefer wave parents).
         let mut prev_txid_cache: HashMap<u64, [u8; 32]> = HashMap::new();
@@ -673,19 +570,13 @@ impl Query {
                         &mut ins,
                         Some(w),
                         &mut prev_txid_cache,
-                        cache_only,
+                        false,
                     )?;
                     txdata.push(Self::transaction_from_class_a(tx, outs, ins));
                     continue;
                 }
             }
-            if cache_only {
-                return Err(StoreError::Corrupt(
-                    "confirm: prewarm incomplete (wire body missing from wave)",
-                )
-                .into());
-            }
-            // No wave body: still use shared cache + parent runway before body_txid.
+            // No wave body: store-fallback (2-stage).
             let (rec_tx, stored_outputs, mut stored_inputs) = self.load_body_prewarmed(fk)?;
             self.fill_input_prev_txids_cached(
                 &mut stored_inputs,

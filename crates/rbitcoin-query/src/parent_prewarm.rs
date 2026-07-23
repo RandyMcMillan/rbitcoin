@@ -269,9 +269,8 @@ impl Query {
             if height <= tip {
                 continue;
             }
-            // package_ready = full confirm handoff (bodies + edges + parents).
-            if self.confirm_parents.package_ready(height) {
-                // Hash must still match the plan (reorg / re-note).
+            // Skip if already scanned this height (2-stage ready) with matching hash.
+            if self.confirm_parents.is_ready(height) {
                 if self
                     .confirm_parents
                     .get_header_plan(height)
@@ -957,20 +956,13 @@ impl Query {
             .collect();
         self.confirm_parents.put_thin_inputs_batch(thin_items);
 
-        // Mark only heights with a complete package (content-based package_ready).
-        // Hollow early-continues never get bodies → never ready → never block tip+1.
-        let mut ok: Vec<u32> = Vec::with_capacity(work.len());
-        for &(h, _) in &work {
-            if self.confirm_parents.package_ready(h) {
-                ok.push(h);
-            }
-        }
-        if !ok.is_empty() {
-            self.confirm_parents.mark_scanned_many(&ok);
-        } else if !work.is_empty() {
-            // Bite produced zero complete packages — still recompute watermark so
-            // a mid-bite invalidation cannot leave ready_through optimistically high.
-            self.confirm_parents.recompute_ready_watermark();
+        // 2-stage semantics: mark every height that got a header+body attempt
+        // (present in height_tx_fks). Confirm wait unblocks on scanned; wave
+        // store-fallbacks residual parent misses — same work as pre-pipeline,
+        // not a stricter package_ready gate that delayed confirm for no gain.
+        let scanned: Vec<u32> = height_tx_fks.iter().map(|(h, _)| *h).collect();
+        if !scanned.is_empty() {
+            self.confirm_parents.mark_scanned_many(&scanned);
         }
 
         crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);

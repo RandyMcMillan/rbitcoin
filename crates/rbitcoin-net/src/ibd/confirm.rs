@@ -248,41 +248,19 @@ pub(crate) fn spawn_confirm_engine(
                             g.retain(|&h, _| h > t);
                         }
                         if g.contains_key(&expect) {
-                            // Claim only contiguous **package_ready** heights so
-                            // scripts start on a complete multi-block wave instead
-                            // of claiming 32 and Condvar-waiting while prewarm
-                            // still has a hole (ready_through stuck at tip+1/+2).
-                            let heights = {
-                                let cache = hub.query.confirm_parent_cache();
-                                claim_package_ready_run(
-                                    expect,
-                                    CONFIRM_RUN_MAX,
-                                    |h| g.contains_key(&h),
-                                    |h| g.get(&h).is_some_and(|ha| hub.has_block(ha)),
-                                    |h| cache.package_ready(h),
-                                )
-                            };
-                            if heights.is_empty() {
-                                // tip+1 on feed but package not ready — poll;
-                                // prewarm wakes ready_cv (not this feed), so short
-                                // timeout avoids a multi-kHz empty-claim spin.
-                                let (gg, _) = feed
-                                    .cv
-                                    .wait_timeout(g, Duration::from_millis(20))
-                                    .unwrap();
-                                g = gg;
-                                continue;
-                            }
-                            // Remove claimed (+ already-confirmed skips) through last.
-                            let mut run = Vec::with_capacity(heights.len());
-                            let last = *heights.last().unwrap_or(&expect);
+                            // 2-stage claim: contiguous feed heights (not package_ready
+                            // gate). Wait for scanned is inside confirm_script_phase —
+                            // same blocking work as pre-pipeline, then scripts(N) can
+                            // overlap writeback(N-1) on the other OS thread.
+                            let mut run = Vec::with_capacity(CONFIRM_RUN_MAX);
                             let mut h = expect;
-                            while h <= last {
-                                if let Some(hash) = g.remove(&h) {
-                                    if !hub.has_block(&hash) && heights.contains(&h) {
-                                        run.push((h, hash));
-                                    }
+                            while run.len() < CONFIRM_RUN_MAX {
+                                let Some(hash) = g.remove(&h) else { break };
+                                if hub.has_block(&hash) {
+                                    h = h.saturating_add(1);
+                                    continue;
                                 }
+                                run.push((h, hash));
                                 h = h.saturating_add(1);
                             }
                             if run.is_empty() {

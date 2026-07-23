@@ -581,21 +581,40 @@ pub(crate) fn cover_park_race(
         }
     }
     if issued > 0 {
+        // Empty-block phase advances write_next every few ms; per-call / per-wn
+        // lines drown the log. Aggregate into a periodic summary instead.
         use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrd};
-        static LAST_LOG_WN: AtomicU32 = AtomicU32::new(u32::MAX);
+        static TOTAL_ISSUED: AtomicU64 = AtomicU64::new(0);
+        static TOTAL_WAVES: AtomicU32 = AtomicU32::new(0);
+        static MIN_WN: AtomicU32 = AtomicU32::new(u32::MAX);
+        static MAX_WN: AtomicU32 = AtomicU32::new(0);
         static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+        const SUMMARY_MS: u64 = 5_000;
+
+        TOTAL_ISSUED.fetch_add(issued, AtomicOrd::Relaxed);
+        TOTAL_WAVES.fetch_add(1, AtomicOrd::Relaxed);
+        MIN_WN.fetch_min(write_next, AtomicOrd::Relaxed);
+        MAX_WN.fetch_max(write_next, AtomicOrd::Relaxed);
+
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let prev_wn = LAST_LOG_WN.load(AtomicOrd::Relaxed);
         let prev_ms = LAST_LOG_MS.load(AtomicOrd::Relaxed);
-        if write_next != prev_wn || now_ms.saturating_sub(prev_ms) >= 1000 {
-            LAST_LOG_WN.store(write_next, AtomicOrd::Relaxed);
-            LAST_LOG_MS.store(now_ms, AtomicOrd::Relaxed);
-            rbitcoin_log::debug!(
-                "ibd: park-race getdata write_next={write_next} issued={issued}"
-            );
+        if now_ms.saturating_sub(prev_ms) >= SUMMARY_MS
+            && LAST_LOG_MS
+                .compare_exchange(prev_ms, now_ms, AtomicOrd::Relaxed, AtomicOrd::Relaxed)
+                .is_ok()
+        {
+            let total = TOTAL_ISSUED.swap(0, AtomicOrd::Relaxed);
+            let waves = TOTAL_WAVES.swap(0, AtomicOrd::Relaxed);
+            let min_wn = MIN_WN.swap(u32::MAX, AtomicOrd::Relaxed);
+            let max_wn = MAX_WN.swap(0, AtomicOrd::Relaxed);
+            if total > 0 {
+                rbitcoin_log::debug!(
+                    "ibd: park-race getdata summary issued={total} waves={waves} write_next={min_wn}..{max_wn}"
+                );
+            }
         }
     }
     issued

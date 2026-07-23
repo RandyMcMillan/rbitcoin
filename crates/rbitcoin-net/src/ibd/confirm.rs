@@ -73,6 +73,43 @@ const OFFER_AHEAD: u32 = 96;
 /// Max script-ok batches buffered for writeback (scripts(N+1) may run while N writes).
 const WRITEBACK_QUEUE: usize = 2;
 
+/// True when a script/wait error should re-queue the batch (not permanent reject).
+#[inline]
+pub(crate) fn is_prewarm_retryable(msg: &str) -> bool {
+    msg.contains("prewarm incomplete")
+        || msg.contains("parent package not ready")
+        || msg.contains("prewarm not ready")
+}
+
+/// Contiguous claim from `expect`: feed entries that are package-ready, up to `max`.
+/// Pure helper so tests can trigger over-claim / hole-stop without OS threads.
+#[inline]
+pub(crate) fn claim_package_ready_run(
+    expect: u32,
+    max: usize,
+    feed_has: impl Fn(u32) -> bool,
+    already_confirmed: impl Fn(u32) -> bool,
+    package_ready: impl Fn(u32) -> bool,
+) -> Vec<u32> {
+    let mut run = Vec::with_capacity(max.min(32));
+    let mut h = expect;
+    while run.len() < max {
+        if !feed_has(h) {
+            break;
+        }
+        if already_confirmed(h) {
+            h = h.saturating_add(1);
+            continue;
+        }
+        if !package_ready(h) {
+            break;
+        }
+        run.push(h);
+        h = h.saturating_add(1);
+    }
+    run
+}
+
 /// Spawn confirm **script** + **writeback** OS threads.
 ///
 /// Scripts run optimistically on `ibd-confirm`; structural spentness + Class C +
@@ -215,25 +252,17 @@ pub(crate) fn spawn_confirm_engine(
                             // scripts start on a complete multi-block wave instead
                             // of claiming 32 and Condvar-waiting while prewarm
                             // still has a hole (ready_through stuck at tip+1/+2).
-                            // Heights leave the feed only when ready — re-script
-                            // race vs writeback is still prevented for claimed ones.
-                            let mut run = Vec::with_capacity(CONFIRM_RUN_MAX);
-                            let mut h = expect;
-                            while run.len() < CONFIRM_RUN_MAX {
-                                let Some(&hash) = g.get(&h) else { break };
-                                if hub.has_block(&hash) {
-                                    g.remove(&h);
-                                    h = h.saturating_add(1);
-                                    continue;
-                                }
-                                if !hub.query.confirm_parent_cache().package_ready(h) {
-                                    break;
-                                }
-                                g.remove(&h);
-                                run.push((h, hash));
-                                h = h.saturating_add(1);
-                            }
-                            if run.is_empty() {
+                            let heights = {
+                                let cache = hub.query.confirm_parent_cache();
+                                claim_package_ready_run(
+                                    expect,
+                                    CONFIRM_RUN_MAX,
+                                    |h| g.contains_key(&h),
+                                    |h| g.get(&h).is_some_and(|ha| hub.has_block(ha)),
+                                    |h| cache.package_ready(h),
+                                )
+                            };
+                            if heights.is_empty() {
                                 // tip+1 on feed but package not ready — poll;
                                 // prewarm wakes ready_cv (not this feed), so short
                                 // timeout avoids a multi-kHz empty-claim spin.
@@ -242,6 +271,21 @@ pub(crate) fn spawn_confirm_engine(
                                     .wait_timeout(g, Duration::from_millis(20))
                                     .unwrap();
                                 g = gg;
+                                continue;
+                            }
+                            // Remove claimed (+ already-confirmed skips) through last.
+                            let mut run = Vec::with_capacity(heights.len());
+                            let last = *heights.last().unwrap_or(&expect);
+                            let mut h = expect;
+                            while h <= last {
+                                if let Some(hash) = g.remove(&h) {
+                                    if !hub.has_block(&hash) && heights.contains(&h) {
+                                        run.push((h, hash));
+                                    }
+                                }
+                                h = h.saturating_add(1);
+                            }
+                            if run.is_empty() {
                                 continue;
                             }
                             break Some(run);
@@ -301,10 +345,22 @@ pub(crate) fn spawn_confirm_engine(
                         } else if msg.contains("confirm without archive")
                             || msg.contains("NotFound")
                             || msg.contains("not found")
-                            || msg.contains("prewarm incomplete")
+                            || is_prewarm_retryable(&msg)
                         {
                             Err(e)
                         } else {
+                            // Shrink to tip+1: always re-queue suffix so a single
+                            // bad height does not permanently strip ready feed
+                            // entries (offer may lag; stranded suffix frozen tip).
+                            {
+                                let mut g = feed.ready.lock().unwrap();
+                                for &(h, ha) in batch.iter().skip(1) {
+                                    if !hub.has_block(&ha) {
+                                        g.insert(h, ha);
+                                    }
+                                }
+                                feed.cv.notify_one();
+                            }
                             loop_stats.confirm_begin(expect_h, 1);
                             hub.confirm_script_phase(&batch[..1])
                         }
@@ -359,8 +415,9 @@ pub(crate) fn spawn_confirm_engine(
                             let _ = _writeback.join();
                             return;
                         }
-                        if msg.contains("prewarm incomplete") {
-                            // Runway lag / package drained — re-queue (do not demote Class A).
+                        if is_prewarm_retryable(&msg) {
+                            // Runway lag / package drained / wait timeout — re-queue
+                            // (do not demote Class A or permanent-reject tip).
                             {
                                 let mut g = feed.ready.lock().unwrap();
                                 for &(h, ha) in &batch {
@@ -514,4 +571,66 @@ pub(crate) fn offer_confirm_ready(
         noted += 1;
     }
     noted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{claim_package_ready_run, is_prewarm_retryable};
+
+    #[test]
+    fn claim_stops_at_first_package_hole() {
+        // Feed has 32 heights; only tip+1 and tip+2 package_ready → claim 2, not 32.
+        // Historical bug: claim 32 then Condvar-wait 600s while prewarm +2 idle.
+        let feed_end = 100u32 + 32;
+        let ready_through = 102u32; // tip=100 → tip+1, tip+2 ready
+        let run = claim_package_ready_run(
+            101,
+            32,
+            |h| h >= 101 && h < feed_end,
+            |_| false,
+            |h| h > 100 && h <= ready_through,
+        );
+        assert_eq!(run, vec![101, 102], "must not over-claim past package hole");
+    }
+
+    #[test]
+    fn claim_skips_already_confirmed_and_fills_wave() {
+        let run = claim_package_ready_run(
+            10,
+            32,
+            |h| h >= 10 && h <= 50,
+            |h| h == 10 || h == 11, // already confirmed
+            |h| h <= 20,
+        );
+        // expect=10 skipped (confirmed), 11 skipped, 12..=20 claimed (9 heights).
+        assert_eq!(run.first().copied(), Some(12));
+        assert_eq!(run.last().copied(), Some(20));
+        assert_eq!(run.len(), 9);
+    }
+
+    #[test]
+    fn claim_empty_when_tip1_not_package_ready() {
+        let run = claim_package_ready_run(
+            50,
+            32,
+            |h| h >= 50 && h <= 80,
+            |_| false,
+            |_| false, // nothing ready
+        );
+        assert!(run.is_empty());
+    }
+
+    #[test]
+    fn wait_timeout_is_prewarm_retryable_not_reject() {
+        // Must match the StoreError string from wait_prewarm_ready.
+        assert!(is_prewarm_retryable(
+            "confirm: prewarm incomplete (parent package not ready, timeout)"
+        ));
+        assert!(is_prewarm_retryable(
+            "confirm: prewarm incomplete (wave body missing from runway)"
+        ));
+        // Permanent consensus errors must NOT look retryable.
+        assert!(!is_prewarm_retryable("script failed: false"));
+        assert!(!is_prewarm_retryable("prevout already spent"));
+    }
 }

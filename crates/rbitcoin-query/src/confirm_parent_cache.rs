@@ -960,6 +960,19 @@ impl ConfirmParentCache {
         self.ready_cv.notify_all();
     }
 
+    /// Recompute contiguous package watermark from tip (no scan flags).
+    ///
+    /// Call after cache mutations that can invalidate packages without going
+    /// through [`Self::mark_scanned_many`] (e.g. parent pin fill mid-flight).
+    pub fn recompute_ready_watermark(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.recompute_ready_through();
+        self.ready_through
+            .store(g.ready_through, Ordering::Relaxed);
+        drop(g);
+        self.ready_cv.notify_all();
+    }
+
     /// Block until every height in `heights` is ready, `cancelled` returns true,
     /// or `timeout` elapses.
     ///
@@ -1515,6 +1528,9 @@ impl ConfirmParentCache {
     }
 
     /// Batch retire after Class C (one lock for the whole spend list).
+    ///
+    /// Recomputes [`Self::ready_through`]: removing the last live out of a parent
+    /// must not leave a hollow watermark above a now-incomplete package.
     pub fn retire_spends(&self, spends: &[(Fk, u32)]) {
         if spends.is_empty() {
             return;
@@ -1526,6 +1542,11 @@ impl ConfirmParentCache {
             };
             g.retire_spend_id(id, vout);
         }
+        g.recompute_ready_through();
+        self.ready_through
+            .store(g.ready_through, Ordering::Relaxed);
+        drop(g);
+        self.ready_cv.notify_all();
     }
 }
 
@@ -1773,10 +1794,14 @@ impl Inner {
     fn retire_spend_id(&mut self, id: u64, vout: u32) {
         if let Some(e) = self.by_fk.get_mut(&id) {
             e.outs.remove(&vout);
-            if e.outs.is_empty() {
+            // Keep the by_fk row when only live outs are gone: `checked` still
+            // covers spent-filtered package_ready for other runway heights.
+            // Dropping the whole entry here left tip+N incomplete while
+            // ready_through stayed high until the next tip GC (prewarm cursor
+            // jumped past the hole). Full drop is tip GC / gc_orphaned_parents.
+            if e.outs.is_empty() && e.checked.is_empty() {
                 let txid = e.tx.txid;
                 self.by_fk.remove(&id);
-                // Keep by_txid if this create is still a live runway body.
                 if !self.by_body.contains_key(&id)
                     && self.by_txid.get(&txid).is_some_and(|ent| ent.fk == id)
                 {
@@ -2025,6 +2050,84 @@ mod tests {
             "scanned without bodies must not unblock confirm"
         );
         assert_eq!(c.ready_through(), 10);
+    }
+
+    /// Body drained after mark: watermark must fall to the last complete package.
+    #[test]
+    fn recompute_watermark_drops_when_body_drained() {
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(10);
+        seed_coinbase_package(&c, 11, [0x11; 32], 1100);
+        seed_coinbase_package(&c, 12, [0x12; 32], 1200);
+        assert_eq!(c.ready_through(), 12);
+        // Historical take_bodies emptied runway while ready_through stayed high.
+        let _ = c.take_bodies_batch(&[Fk(1200)]);
+        assert!(!c.package_ready(12));
+        // Without recompute, atomic watermark would still say 12.
+        assert_eq!(c.ready_through(), 12, "stale until recompute");
+        c.recompute_ready_watermark();
+        assert_eq!(
+            c.ready_through(),
+            11,
+            "cursor must resume at first incomplete (12)"
+        );
+    }
+
+    /// Retiring the last live out must not delete spent-filtered `checked` coverage
+    /// or leave ready_through above a now-incomplete height (prewarm cursor skip).
+    #[test]
+    fn retire_last_live_out_keeps_checked_and_recomputes_watermark() {
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(10);
+        seed_coinbase_package(&c, 11, [0x11; 32], 1100);
+        // Height 12 spends parent 42:0 — pin with checked+live.
+        let h12 = [0x12u8; 32];
+        c.ensure_plan(12, h12);
+        let mut t12 = tx(12);
+        t12.txid = h12;
+        t12.input_count = 1;
+        t12.output_count = 1;
+        let spend_in = vec![InputRecord {
+            prev_txid: [0x42; 32],
+            create_fk: Fk(42),
+            prev_index: 0,
+            sequence: 0xffff_ffff,
+            script_sig: vec![],
+            witness: vec![],
+        }];
+        c.put_header_plan(12, Fk(12), header_rec(h12), vec![Fk(1200)], [0x11; 32]);
+        c.put_body(Fk(1200), 12, t12, vec![out(49)], spend_in);
+        c.put_thin_inputs(
+            Fk(1200),
+            vec![crate::wave_prevout::ThinInput {
+                create_fk: Some(42),
+                prev_index: 0,
+            }],
+        );
+        let parent_tx = tx(42);
+        c.put_parent_outs_resolved(
+            12,
+            Fk(42),
+            parent_tx.clone(),
+            &[(0, out(100))],
+            &[0],
+            Some(None),
+        );
+        c.mark_scanned(12);
+        assert!(c.package_ready(12));
+        assert_eq!(c.ready_through(), 12);
+
+        // Confirm spent 42:0 — old code dropped the whole by_fk row when outs empty.
+        c.retire_spends(&[(Fk(42), 0)]);
+        // Spent-filtered identity remains (checked kept); package still content-ready
+        // for re-queue / headroom (vout is checked, not necessarily live).
+        assert!(
+            c.parent_pin_covered(Fk(42), &[0]),
+            "checked coverage must survive last-live retire"
+        );
+        // If a later height needed a different vout that was never pinned, watermark
+        // recompute still ran (no panic / stale atomic).
+        assert_eq!(c.ready_through(), 12);
     }
 
     /// Regression: same-bite create@11 + spend@12 must pin create into spent-filtered

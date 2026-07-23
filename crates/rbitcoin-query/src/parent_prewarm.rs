@@ -204,8 +204,11 @@ impl Query {
         }) {
             Ok(()) => Ok(()),
             Err(true) => Err(StoreError::Cancelled("confirm cancelled")),
+            // Message must contain "prewarm incomplete" so the confirm engine
+            // re-queues the batch instead of treating a wait timeout as a
+            // permanent script reject (historical 600s live n=32 → reject tip).
             Err(false) => Err(StoreError::Corrupt(
-                "confirm parent prewarm not ready (timeout)",
+                "confirm: prewarm incomplete (parent package not ready, timeout)",
             )),
         }
     }
@@ -752,8 +755,10 @@ impl Query {
             let fk = Fk(pid);
             if covered.get(i).copied().unwrap_or(false) {
                 st.pin_already_cached = st.pin_already_cached.saturating_add(1);
-                // Keep-alive for GC; no mlock / store decode.
-                touch_batch.push((max_h, pid, need_vouts));
+                // Keep-alive for GC on every needing height (not only max_h).
+                for &h in &need_hs {
+                    touch_batch.push((h, pid, need_vouts.clone()));
+                }
                 st.utxo_parents = st.utxo_parents.saturating_add(1);
                 continue;
             }
@@ -808,7 +813,10 @@ impl Query {
                     } else {
                         Some(None)
                     };
-                    sparse_parents.push((max_h, fk, tx, live, need_vouts, cb_stash));
+                    sparse_parents.push((max_h, fk, tx, live, need_vouts.clone(), cb_stash));
+                    for &h in &need_hs {
+                        touch_batch.push((h, pid, need_vouts.clone()));
+                    }
                     st.utxo_parents = st.utxo_parents.saturating_add(1);
                     continue;
                 }
@@ -863,9 +871,12 @@ impl Query {
                                 fk,
                                 tx,
                                 live,
-                                need_vouts,
+                                need_vouts.clone(),
                                 cb_stash,
                             ));
+                            for &h in &need_hs {
+                                touch_batch.push((h, pid, need_vouts.clone()));
+                            }
                             st.full_tx_reads = st.full_tx_reads.saturating_add(1);
                         }
                         Err(_) => {
@@ -913,9 +924,12 @@ impl Query {
                             fk,
                             tx,
                             live,
-                            need_vouts,
+                            need_vouts.clone(),
                             cb_stash,
                         ));
+                        for &h in &need_hs {
+                            touch_batch.push((h, pid, need_vouts.clone()));
+                        }
                         st.full_tx_reads = st.full_tx_reads.saturating_add(1);
                     }
                 }
@@ -953,6 +967,10 @@ impl Query {
         }
         if !ok.is_empty() {
             self.confirm_parents.mark_scanned_many(&ok);
+        } else if !work.is_empty() {
+            // Bite produced zero complete packages — still recompute watermark so
+            // a mid-bite invalidation cannot leave ready_through optimistically high.
+            self.confirm_parents.recompute_ready_watermark();
         }
 
         crate::parent_prewarm_stats::note(&st, t0.elapsed().as_nanos() as u64);

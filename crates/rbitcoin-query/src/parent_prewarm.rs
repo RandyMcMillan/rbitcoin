@@ -626,9 +626,17 @@ impl Query {
                             prev_index,
                         });
                         st.utxo_parents = st.utxo_parents.saturating_add(1);
+                        // Same-batch create (even cross-height) still needs a
+                        // spent-filtered by_fk pin: package_ready / cache-only
+                        // wave skip bare by_body. Pin from runway body (no
+                        // store re-decode) in the pin phase below.
                         if batch_create_ids.contains(&pid) {
                             st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                             st.edge_same_batch = st.edge_same_batch.saturating_add(1);
+                            if pin_this_height {
+                                parent_need.entry(pid).or_default().push(*height);
+                                parent_vouts.entry(pid).or_default().push(prev_index);
+                            }
                         } else if pin_this_height {
                             parent_need.entry(pid).or_default().push(*height);
                             parent_vouts.entry(pid).or_default().push(prev_index);
@@ -751,7 +759,62 @@ impl Query {
             }
             st.pin_new = st.pin_new.saturating_add(1);
 
-            // Prefer cached body range (same-batch creates) over idx read.
+            // Prefer runway full body (same-bite / prior-bite creates) — no Class A
+            // re-decode. package_ready still needs spent-filtered by_fk.
+            if !need_vouts.is_empty() {
+                if let Some((create_h, tx, outs, inputs)) =
+                    self.confirm_parents.get_body_for_pin(fk)
+                {
+                    let range = self.confirm_parents.get_body_range(fk);
+                    if let Some((off, len)) = range {
+                        parent_ranges.push((fk, off, len));
+                        if do_mlock {
+                            let (_, sys, sk) =
+                                self.mlock_body_spans_for_heights(&need_hs, &[(off, len)]);
+                            st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
+                            st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
+                            let cc = self.store.mlock_class_c_tx(fk);
+                            for h in &need_hs {
+                                self.mlock_note_skip_pinned(*h, &cc);
+                            }
+                        }
+                    }
+                    let unspent = self
+                        .store
+                        .unspent_create_vouts(fk, &need_vouts, range)
+                        .unwrap_or_else(|_| need_vouts.clone());
+                    let unspent_set: std::collections::HashSet<u32> =
+                        unspent.into_iter().collect();
+                    let mut live = Vec::with_capacity(unspent_set.len());
+                    for &v in &need_vouts {
+                        if unspent_set.contains(&v) {
+                            if let Some(o) = outs.get(v as usize) {
+                                live.push((v, o.clone()));
+                            }
+                        }
+                    }
+                    let cb_stash = if tx.input_count == 1
+                        && inputs
+                            .first()
+                            .is_some_and(|i| i.is_coinbase() || i.prev_index == u32::MAX)
+                    {
+                        Some(Some(create_h))
+                    } else if tx.input_count == 1 {
+                        // Ambiguous 1-in: fall back to store height if available.
+                        match self.resolve_parent_coinbase_height(fk, tx.input_count, range) {
+                            Ok(v) => Some(v),
+                            Err(_) => Some(None),
+                        }
+                    } else {
+                        Some(None)
+                    };
+                    sparse_parents.push((max_h, fk, tx, live, need_vouts, cb_stash));
+                    st.utxo_parents = st.utxo_parents.saturating_add(1);
+                    continue;
+                }
+            }
+
+            // Prefer cached body range over idx read.
             let range = self
                 .confirm_parents
                 .get_body_range(fk)

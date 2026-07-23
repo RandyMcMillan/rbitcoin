@@ -6,6 +6,10 @@
 //!
 //! Normal I/O priority (not best-effort): when tip is hard on the runway the
 //! warmer must not lose the disk to archive.
+//!
+//! Work cursor is always `max(ready_through, tip) + 1` (first package gap).
+//! Bite size is a configured batch (or 2× while building lead) — never 1-block
+//! forced rehydrate, which serialized post-restart confirm.
 
 use rbitcoin_log::{debug, info};
 use rbitcoin_query::{
@@ -15,6 +19,24 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+/// First height the worker should attempt: contiguous package gap after tip.
+#[inline]
+pub(crate) fn prewarm_work_cursor(tip: u32, ready_through: u32) -> u32 {
+    ready_through.max(tip).saturating_add(1)
+}
+
+/// How many runway heights to take in one `prewarm_parents_for_heights` call.
+#[inline]
+pub(crate) fn prewarm_bite_size(ahead: u32, batch: u32, headroom: u32) -> usize {
+    if ahead == 0 {
+        batch as usize
+    } else if ahead < headroom.max(16) {
+        (batch as usize).saturating_mul(2).min(256)
+    } else {
+        batch as usize
+    }
+}
 
 /// Shared runway: main loop publishes tip/arch/hashes; worker prewarms.
 pub(crate) struct PrewarmControl {
@@ -66,12 +88,14 @@ pub(crate) fn spawn_parent_prewarm(
             info!(
                 "ibd: parent prewarm worker ON (depth≤{depth}, batch≤{batch}, headroom={headroom}, mlock={mlock}, pin_near={pin_near}, thin_create_fk_only={thin_fk}; env RBITCOIN_PARENT_PREWARM_*)"
             );
-            // next_height watermark (not index into a replaced Arc runway).
+            // Work cursor is always the first package gap after tip
+            // (`ready_through + 1`). Never skip incomplete middle heights:
+            // advancing past a hole left ready_through stuck at +1/+2 while the
+            // worker chewed far runway (confirm starved, logs looked 1-block).
             // ConfirmParentCache.tip **must** track IBD tip: ensure_plans only
             // accepts heights in (cache.tip, cache.tip+depth]. Without
             // advance_tip, plans stay empty, ready_through stays 0, confirm
             // never moves (mainnet stuck tip=360250 plans=0 thru=0).
-            let mut next_height: u32 = 0;
             let mut last_tip = u32::MAX;
             let mut last_info = std::time::Instant::now();
             let mut ever_worked = false;
@@ -81,31 +105,17 @@ pub(crate) fn spawn_parent_prewarm(
                     last_tip = tip;
                     // Sets plan horizon + GC; mutex-serialized with confirm's tip GC.
                     query.advance_parent_runway_tip(tip);
-                    // Re-walk runway; is_ready skips heights already marked.
-                    next_height = tip.saturating_add(1);
-                } else if next_height <= tip {
-                    next_height = tip.saturating_add(1);
                 }
                 let runway = Arc::clone(&*ctrl.runway.lock().unwrap());
-                // Prefer re-hydrating tip+1 if it was marked ready but bodies
-                // were drained (failed confirm take / GC). Otherwise confirm
-                // spins on "prewarm incomplete" while the worker works far ahead.
-                let tip1 = tip.saturating_add(1);
-                let mut force_tip1 = false;
-                if runway.iter().any(|(h, _)| *h == tip1)
-                    && !query.confirm_parent_cache().package_ready(tip1)
-                {
-                    next_height = tip1;
-                    force_tip1 = true;
-                }
+                // Contiguous package watermark: resume at first incomplete height.
+                let through = query.parent_prewarm_ready_through();
+                let next_height = prewarm_work_cursor(tip, through);
                 // First index with height >= next_height.
                 let start = runway.partition_point(|(h, _)| *h < next_height);
                 if runway.is_empty() || start >= runway.len() {
                     // Stuck recovery: walked past runway but nothing ready ahead
                     // of tip (e.g. tip never advanced cache before first walk).
-                    let through = query.parent_prewarm_ready_through();
                     if !runway.is_empty() && through <= tip {
-                        next_height = tip.saturating_add(1);
                         // fall through next iteration without long sleep
                         std::thread::sleep(Duration::from_millis(1));
                         continue;
@@ -122,21 +132,11 @@ pub(crate) fn spawn_parent_prewarm(
                     std::thread::sleep(Duration::from_millis(20));
                     continue;
                 }
-                // Bite size: when the runway is empty, take **one configured batch**
-                // (not 1 block — confirm claims multi-height waves; not 2× which
-                // starved tip for a long first decode). 2× only once we have
-                // some lead but are still below headroom. Re-hydrate tip+1 alone.
-                let through = query.parent_prewarm_ready_through();
+                // Bite size: always a configured batch (or 2× when building lead).
+                // Never force bite=1 for tip+1 rehydrate — that serialized the
+                // whole runway after restart (prewarm+1…+2, confirm never starts).
                 let ahead = through.saturating_sub(tip);
-                let bite = if force_tip1 {
-                    1usize
-                } else if ahead == 0 {
-                    batch as usize
-                } else if ahead < headroom.max(16) {
-                    (batch as usize).saturating_mul(2).min(256)
-                } else {
-                    batch as usize
-                };
+                let bite = prewarm_bite_size(ahead, batch, headroom);
                 let end = (start + bite).min(runway.len());
                 let slice = &runway[start..end];
                 let h0 = slice.first().map(|x| x.0).unwrap_or(0);
@@ -145,8 +145,9 @@ pub(crate) fn spawn_parent_prewarm(
                 match query.prewarm_parents_for_heights(slice) {
                     Ok(st) => {
                         ever_worked = true;
-                        next_height = h1.saturating_add(1);
+                        // next work = first incomplete after tip (ready_through+1).
                         let through = query.parent_prewarm_ready_through();
+                        let next_height = prewarm_work_cursor(tip, through);
                         let ahead = through.saturating_sub(tip);
                         let ms = t0.elapsed().as_millis();
                         if st.blocks > 0
@@ -213,7 +214,7 @@ pub(crate) fn spawn_parent_prewarm(
                         }
                     }
                     Err(e) => {
-                        next_height = h1.saturating_add(1);
+                        // Do not advance past the gap — retry from ready_through+1.
                         let msg = e.to_string();
                         if msg.contains("cancelled") {
                             debug!("ibd: prewarm stopped (cancelled)");
@@ -228,4 +229,28 @@ pub(crate) fn spawn_parent_prewarm(
             info!("ibd: parent prewarm worker stopped");
         })
         .expect("spawn ibd-parent-prewarm")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{prewarm_bite_size, prewarm_work_cursor};
+
+    #[test]
+    fn work_cursor_resumes_first_package_gap() {
+        // After a bite leaves only tip+1..tip+2 ready, resume at tip+3 — never
+        // jump to h1+1 past the hole (historical +1/+2 stall).
+        assert_eq!(prewarm_work_cursor(100, 102), 103);
+        assert_eq!(prewarm_work_cursor(100, 100), 101);
+        assert_eq!(prewarm_work_cursor(100, 0), 101); // hollow watermark
+        assert_eq!(prewarm_work_cursor(100, 99), 101); // ready behind tip
+    }
+
+    #[test]
+    fn bite_never_collapses_to_one_for_empty_runway() {
+        // Empty lead uses full batch; was force_tip1 → 1 and confirmed 1-at-a-time.
+        assert_eq!(prewarm_bite_size(0, 64, 64), 64);
+        assert_eq!(prewarm_bite_size(8, 64, 64), 128); // building lead → 2×
+        assert_eq!(prewarm_bite_size(100, 64, 64), 64); // enough lead
+        assert_eq!(prewarm_bite_size(0, 1, 64), 1); // env batch=1 only
+    }
 }

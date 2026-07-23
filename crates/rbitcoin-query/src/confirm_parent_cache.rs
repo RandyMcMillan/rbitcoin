@@ -732,6 +732,25 @@ impl ConfirmParentCache {
         out
     }
 
+    /// Runway body + create height for prewarm parent pin (same-bite creates).
+    ///
+    /// Prefer this over a store re-decode when the create is already full-decoded
+    /// on the runway (cross-height same-batch spends).
+    pub fn get_body_for_pin(
+        &self,
+        fk: Fk,
+    ) -> Option<(u32, TxRecord, Vec<OutputRecord>, Vec<InputRecord>)> {
+        let id = fk.get()?;
+        let g = self.inner.lock().unwrap();
+        let e = g.by_body.get(&id)?;
+        Some((
+            e.height,
+            e.tx.clone(),
+            e.outputs.clone(),
+            e.inputs.clone(),
+        ))
+    }
+
     /// Clone thin edges under one lock (keeps stash for retries).
     pub fn get_thin_inputs_batch(&self, fks: &[Fk]) -> HashMap<u64, Vec<StashedThinInput>> {
         if fks.is_empty() {
@@ -2006,6 +2025,77 @@ mod tests {
             "scanned without bodies must not unblock confirm"
         );
         assert_eq!(c.ready_through(), 10);
+    }
+
+    /// Regression: same-bite create@11 + spend@12 must pin create into spent-filtered
+    /// `by_fk`. Bare `by_body` is not enough for package_ready / cache-only wave —
+    /// skipping pin left ready_through at tip+1/+2 after multi-block prewarm bites.
+    #[test]
+    fn cross_height_spend_needs_parent_pin_for_package_ready() {
+        let c = ConfirmParentCache::new(64);
+        c.advance_tip(10);
+        let h11 = [0x11u8; 32];
+        let h12 = [0x12u8; 32];
+        // Create body at 11 (not coinbase-only seed — height 12 will spend it).
+        seed_coinbase_package(&c, 11, h11, 1100);
+        assert!(c.package_ready(11));
+        assert_eq!(c.ready_through(), 11);
+
+        // Height 12 spends create 1100:0 — external to wave_ids of 12.
+        c.ensure_plan(12, h12);
+        let mut t12 = tx(12);
+        t12.txid = h12;
+        t12.input_count = 1;
+        t12.output_count = 1;
+        let spend_in = vec![InputRecord {
+            prev_txid: h11,
+            create_fk: Fk(1100),
+            prev_index: 0,
+            sequence: 0xffff_ffff,
+            script_sig: vec![],
+            witness: vec![],
+        }];
+        c.put_header_plan(
+            12,
+            Fk(12),
+            header_rec(h12),
+            vec![Fk(1200)],
+            h11,
+        );
+        c.put_body(Fk(1200), 12, t12, vec![out(49)], spend_in);
+        c.put_thin_inputs(
+            Fk(1200),
+            vec![crate::wave_prevout::ThinInput {
+                create_fk: Some(1100),
+                prev_index: 0,
+            }],
+        );
+        c.mark_scanned(12);
+        assert!(
+            !c.package_ready(12),
+            "spend of same-bite create without by_fk pin must not be package_ready"
+        );
+        assert_eq!(
+            c.ready_through(),
+            11,
+            "watermark must stop at last complete package"
+        );
+
+        // Pin from runway body (what prewarm now does for batch_create_ids).
+        let (create_h, tx, outs, _ins) = c.get_body_for_pin(Fk(1100)).expect("runway body");
+        assert_eq!(create_h, 11);
+        c.put_parent_outs_resolved(
+            12,
+            Fk(1100),
+            tx,
+            &[(0, outs[0].clone())],
+            &[0],
+            Some(Some(11)),
+        );
+        // Content-based package_ready (no re-mark needed once pin lands).
+        assert!(c.package_ready(12));
+        c.mark_scanned(12); // notify + recompute ready_through
+        assert_eq!(c.ready_through(), 12);
     }
 
     /// Regression: without advance_tip to the real IBD tip, ensure_plans rejects

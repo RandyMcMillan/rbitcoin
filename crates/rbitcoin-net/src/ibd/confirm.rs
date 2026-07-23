@@ -211,20 +211,38 @@ pub(crate) fn spawn_confirm_engine(
                             g.retain(|&h, _| h > t);
                         }
                         if g.contains_key(&expect) {
-                            // Claim heights off the feed immediately so we cannot
-                            // re-script the same tip+1 while writeback is still
-                            // in-flight (that double-queued structural checks and
-                            // blacklisted valid blocks as "prevout already spent").
+                            // Claim only contiguous **package_ready** heights so
+                            // scripts start on a complete multi-block wave instead
+                            // of claiming 32 and Condvar-waiting while prewarm
+                            // still has a hole (ready_through stuck at tip+1/+2).
+                            // Heights leave the feed only when ready — re-script
+                            // race vs writeback is still prevented for claimed ones.
                             let mut run = Vec::with_capacity(CONFIRM_RUN_MAX);
                             let mut h = expect;
                             while run.len() < CONFIRM_RUN_MAX {
-                                let Some(hash) = g.remove(&h) else { break };
+                                let Some(&hash) = g.get(&h) else { break };
                                 if hub.has_block(&hash) {
+                                    g.remove(&h);
                                     h = h.saturating_add(1);
                                     continue;
                                 }
+                                if !hub.query.confirm_parent_cache().package_ready(h) {
+                                    break;
+                                }
+                                g.remove(&h);
                                 run.push((h, hash));
                                 h = h.saturating_add(1);
+                            }
+                            if run.is_empty() {
+                                // tip+1 on feed but package not ready — poll;
+                                // prewarm wakes ready_cv (not this feed), so short
+                                // timeout avoids a multi-kHz empty-claim spin.
+                                let (gg, _) = feed
+                                    .cv
+                                    .wait_timeout(g, Duration::from_millis(20))
+                                    .unwrap();
+                                g = gg;
+                                continue;
                             }
                             break Some(run);
                         }

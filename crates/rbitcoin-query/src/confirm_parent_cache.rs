@@ -158,6 +158,36 @@ pub struct HeaderPlanCache {
     pub prev_hash: [u8; 32],
 }
 
+/// Per-parent result from [`ConfirmParentCache::prepare_pin_batch`].
+#[derive(Debug)]
+pub enum PinPrepareKind {
+    /// `by_fk` already spent-filtered for all need vouts — touch only.
+    Covered,
+    /// Body-LRU hit: slim outs + meta for pin_cache path.
+    Body {
+        create_h: u32,
+        tx: TxRecord,
+        outs: Vec<(u32, OutputRecord)>,
+        /// `Some(true)` coinbase, `Some(false)` not, `None` ambiguous 1-in.
+        cb_hint: Option<bool>,
+        range: Option<(u64, u64)>,
+        /// Need vouts already in `by_fk.checked` (skip durable spent re-check).
+        already_checked: Vec<u32>,
+    },
+    /// No body in cache — pin_new store path.
+    Miss {
+        already_checked: Vec<u32>,
+    },
+}
+
+/// Batch result for [`ConfirmParentCache::prepare_pin_batch`].
+#[derive(Debug)]
+pub struct PinPrepareBatch {
+    pub kinds: Vec<PinPrepareKind>,
+    pub miss_no_fk: u32,
+    pub miss_partial: u32,
+}
+
 /// Per-height plan: what prevouts block `height` needs.
 #[derive(Debug, Default)]
 struct HeightPlan {
@@ -282,6 +312,11 @@ impl ConfirmParentCache {
         self.inner.lock().unwrap().pin_keep_grace
     }
 
+    /// Override confirmed-body LRU byte cap (tests). `0` = drop bodies at tip.
+    pub fn set_body_lru_cap_bytes(&self, cap: u64) {
+        self.inner.lock().unwrap().body_lru_cap = cap;
+    }
+
     /// Highest height such that every plan in `(tip, ready_through]` is ready.
     pub fn ready_through(&self) -> u32 {
         self.ready_through.load(Ordering::Relaxed)
@@ -298,6 +333,7 @@ impl ConfirmParentCache {
     /// Returns store ranges whose refcount hit zero (caller should `munlock`).
     pub fn advance_tip(&self, tip: u32) -> Vec<MlockRange> {
         let mut g = self.inner.lock().unwrap();
+        let old_tip = g.tip;
         g.tip = tip;
         if g.ready_through < tip {
             g.ready_through = tip;
@@ -318,6 +354,11 @@ impl ConfirmParentCache {
         // Bodies with height ≤ tip enter the confirmed LRU budget (kept for
         // near-subsequent parent pin hits). Thin edges for ≤tip heights drop
         // (wave already consumed them). Cap 0 = drop bodies immediately.
+        //
+        // Budget update is O(confirmed batch headers' tx_fks), not O(|by_body|):
+        // full `reaccount_body_lru_bytes` scanned ~1.8M bodies every tip advance
+        // and held the parent-cache lock long enough that load pin stalled
+        // (`pin_sub cover` inflated while write tip_gc ran).
         if g.body_lru_cap == 0 {
             let mut drop_ids: Vec<u64> = Vec::new();
             g.by_body.retain(|id, b| {
@@ -333,18 +374,55 @@ impl ConfirmParentCache {
             g.body_lru.clear();
             g.body_lru_bytes = 0;
         } else {
-            // Recompute confirmed-byte total; thin edges for ≤tip only.
-            g.reaccount_body_lru_bytes();
-            let drop_thin: Vec<u64> = g
-                .by_body
-                .iter()
-                .filter(|(_, b)| b.height <= tip)
-                .map(|(id, _)| *id)
-                .collect();
-            for id in drop_thin {
-                g.thin_edges.remove(&id);
+            // Account runway→confirmed using header plans for newly confirmed
+            // heights (before those headers are dropped). O(batch txs).
+            if tip > old_tip {
+                let mut newly: Vec<u64> = Vec::new();
+                for h in old_tip.saturating_add(1)..=tip {
+                    let Some(plan) = g.headers.get(&h) else {
+                        continue;
+                    };
+                    for fk in &plan.tx_fks {
+                        if let Some(id) = fk.get() {
+                            newly.push(id);
+                        }
+                    }
+                }
+                for id in newly {
+                    // Body create height just crossed into confirmed budget.
+                    let add = g.by_body.get(&id).and_then(|b| {
+                        if b.height > old_tip && b.height <= tip {
+                            Some(b.size_bytes)
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(sz) = add {
+                        g.body_lru_bytes = g.body_lru_bytes.saturating_add(sz);
+                    }
+                }
+            }
+            // Thin edges are only useful on runway; drop for confirmed creates.
+            // Scan thin_edges (small) not by_body (~millions).
+            if !g.thin_edges.is_empty() {
+                let thin_ids: Vec<u64> = g.thin_edges.keys().copied().collect();
+                for id in thin_ids {
+                    let drop = match g.by_body.get(&id) {
+                        Some(b) => b.height <= tip,
+                        None => true, // orphan thin
+                    };
+                    if drop {
+                        g.thin_edges.remove(&id);
+                    }
+                }
             }
             g.evict_body_lru_to_cap();
+            // Safety net if stamps/budget drifted (rare): one full reaccount.
+            if g.body_lru_bytes > g.body_lru_cap {
+                g.reaccount_body_lru_bytes();
+                g.rebuild_body_lru_from_map();
+                g.evict_confirmed_by_stamp_until_cap();
+            }
         }
         // Drop header plan cache for heights at/below tip.
         let drop_hdr: Vec<u32> = g
@@ -1397,6 +1475,101 @@ impl ConfirmParentCache {
             })
             .collect();
         (covered, miss_no_fk, miss_partial)
+    }
+
+    /// One-lock pin classify: cover + body-LRU slim outs + already-checked.
+    ///
+    /// Replaces separate `parent_pins_covered_detail` + `get_bodies_for_pin_batch`
+    /// + N× `parent_checked_vouts` (each took the parent-cache mutex — contended
+    /// with write tip GC).
+    ///
+    /// `items`: `(create_fk_id, need_vouts)`. Result index-aligned with `items`.
+    pub fn prepare_pin_batch(&self, items: &[(u64, Vec<u32>)]) -> PinPrepareBatch {
+        let mut out = PinPrepareBatch {
+            kinds: Vec::with_capacity(items.len()),
+            miss_no_fk: 0,
+            miss_partial: 0,
+        };
+        if items.is_empty() {
+            return out;
+        }
+        let mut g = self.inner.lock().unwrap();
+        for (id, vouts) in items {
+            if vouts.is_empty() {
+                out.kinds.push(PinPrepareKind::Covered);
+                continue;
+            }
+            // Spent-filtered by_fk cover (wave/write can skip store).
+            if let Some(e) = g.by_fk.get(id) {
+                if !e.checked.is_empty() && vouts.iter().all(|v| e.checked.contains(v)) {
+                    out.kinds.push(PinPrepareKind::Covered);
+                    continue;
+                }
+                // Partial: fall through to body / pin_new; carry already-checked.
+            }
+            let already_checked: Vec<u32> = g
+                .by_fk
+                .get(id)
+                .map(|e| {
+                    vouts
+                        .iter()
+                        .copied()
+                        .filter(|v| e.checked.contains(v))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if already_checked.is_empty() && !g.by_fk.contains_key(id) {
+                out.miss_no_fk = out.miss_no_fk.saturating_add(1);
+            } else if g.by_fk.contains_key(id) {
+                out.miss_partial = out.miss_partial.saturating_add(1);
+            }
+
+            let body_hit = {
+                let Some(e) = g.by_body.get(id) else {
+                    out.kinds.push(PinPrepareKind::Miss {
+                        already_checked,
+                    });
+                    continue;
+                };
+                let mut outs = Vec::with_capacity(vouts.len());
+                for &v in vouts {
+                    if let Some(o) = e.outputs.get(v as usize) {
+                        outs.push((v, o.clone()));
+                    }
+                }
+                let cb_hint = if e.tx.input_count != 1 {
+                    Some(false)
+                } else if e
+                    .inputs
+                    .first()
+                    .is_some_and(|i| i.is_coinbase() || i.prev_index == u32::MAX)
+                {
+                    Some(true)
+                } else {
+                    None
+                };
+                let range = g.body_range.get(id).copied();
+                (
+                    e.height,
+                    e.tx.clone(),
+                    outs,
+                    cb_hint,
+                    range,
+                    already_checked,
+                )
+            };
+            g.touch_body_lru(*id);
+            let (create_h, tx, outs, cb_hint, range, already_checked) = body_hit;
+            out.kinds.push(PinPrepareKind::Body {
+                create_h,
+                tx,
+                outs,
+                cb_hint,
+                range,
+                already_checked,
+            });
+        }
+        out
     }
 
     /// Vouts already spent-filtered on `by_fk` (subset of `need` that can skip store).
@@ -2774,10 +2947,9 @@ mod tests {
 
     #[test]
     fn body_lru_evicts_oldest_confirmed_under_tiny_cap() {
-        std::env::set_var("RBITCOIN_CONFIRM_BODY_LRU_MB", "0");
-        // Cap 0: legacy drop-at-tip.
+        // Cap 0: legacy drop-at-tip (setter avoids process-env races with other tests).
         let c = ConfirmParentCache::new();
-        std::env::remove_var("RBITCOIN_CONFIRM_BODY_LRU_MB");
+        c.set_body_lru_cap_bytes(0);
         c.advance_tip(0);
         c.put_bodies_batch(vec![(Fk(1), 1, tx(1), vec![out(10)], vec![])]);
         assert!(c.has_body(Fk(1)));
@@ -3003,9 +3175,8 @@ mod tests {
     #[test]
     fn body_lru_touch_compacts_and_evict_skips_runway_without_all_scan() {
         // Tiny cap: force eviction of confirmed while runway bodies stay.
-        std::env::set_var("RBITCOIN_CONFIRM_BODY_LRU_MB", "1"); // 1 MiB
-        let c = ConfirmParentCache::from_env();
-        std::env::remove_var("RBITCOIN_CONFIRM_BODY_LRU_MB");
+        let c = ConfirmParentCache::new();
+        c.set_body_lru_cap_bytes(1024 * 1024); // 1 MiB
         c.advance_tip(0);
         // Fat bodies so a few fill 1 MiB.
         let fat_out = || {
@@ -3141,6 +3312,60 @@ mod tests {
         let unlocks = c.advance_tip(7);
         assert!(!unlocks.is_empty());
         assert!(!c.is_range_pinned(&r));
+    }
+
+    /// One-lock prepare: Covered / Body / Miss + same-batch-friendly already_checked.
+    #[test]
+    fn prepare_pin_batch_classifies_cover_body_miss() {
+        let c = ConfirmParentCache::new();
+        c.advance_tip(0);
+        let mut t = tx(9);
+        t.input_count = 1;
+        let coinbase_in = InputRecord {
+            prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![1],
+            witness: vec![],
+        };
+        c.put_body(
+            Fk(90),
+            3,
+            t.clone(),
+            vec![out(1), out(2), out(3)],
+            vec![coinbase_in],
+        );
+        c.put_body_range(Fk(90), 500, 40);
+
+        // Body hit, no by_fk yet.
+        let prep = c.prepare_pin_batch(&[(90, vec![0, 2]), (99, vec![0])]);
+        assert_eq!(prep.kinds.len(), 2);
+        assert!(matches!(prep.kinds[0], PinPrepareKind::Body { .. }));
+        assert!(matches!(prep.kinds[1], PinPrepareKind::Miss { .. }));
+        assert_eq!(prep.miss_no_fk, 2); // neither had by_fk cover
+
+        // Spent-filter put → Covered on next prepare.
+        if let PinPrepareKind::Body {
+            create_h,
+            tx: txr,
+            outs,
+            ..
+        } = &prep.kinds[0]
+        {
+            c.put_parent_outs_resolved(
+                4,
+                Fk(90),
+                txr.clone(),
+                &[(0, outs[0].1.clone()), (2, outs[1].1.clone())],
+                &[0, 2],
+                Some(Some(*create_h)),
+            );
+        }
+        let prep2 = c.prepare_pin_batch(&[(90, vec![0, 2])]);
+        assert!(matches!(prep2.kinds[0], PinPrepareKind::Covered));
+        assert_eq!(prep2.miss_no_fk, 0);
+        assert_eq!(prep2.miss_partial, 0);
     }
 
     /// Slim batch pin: only requested outs, one lock, coinbase hint; no full input clone.

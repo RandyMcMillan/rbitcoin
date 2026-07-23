@@ -15,7 +15,9 @@
 //! Env: `RBITCOIN_CONFIRM_MLOCK` (legacy `RBITCOIN_PARENT_PREWARM_MLOCK` alias).
 
 use super::*;
-use crate::confirm_parent_cache::{confirm_mlock_from_env, StashedThinInput};
+use crate::confirm_parent_cache::{
+    confirm_mlock_from_env, PinPrepareKind, StashedThinInput,
+};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -544,7 +546,7 @@ impl Query {
         uniq_parents.sort_unstable();
         st.parent_unique = st.parent_unique.saturating_add(uniq_parents.len() as u32);
 
-        // Build need lists once; cover-check under one cache lock.
+        // Build need lists once; one-lock cover+body+checked prepare.
         let mut pin_jobs: Vec<(u64, u32, Vec<u32>, Vec<u32>)> =
             Vec::with_capacity(uniq_parents.len());
         for pid in uniq_parents {
@@ -558,14 +560,17 @@ impl Query {
             pin_jobs.push((pid, max_h, need_hs, need_vouts));
         }
         let t_cover = Instant::now();
-        let cover_keys: Vec<(u64, Vec<u32>)> = pin_jobs
+        let prepare_keys: Vec<(u64, Vec<u32>)> = pin_jobs
             .iter()
             .map(|(pid, _, _, vouts)| (*pid, vouts.clone()))
             .collect();
-        let (covered, miss_no_fk, miss_partial) =
-            self.confirm_parents.parent_pins_covered_detail(&cover_keys);
-        st.pin_cover_miss_no_fk = miss_no_fk;
-        st.pin_cover_miss_partial = miss_partial;
+        let prepared = self.confirm_parents.prepare_pin_batch(&prepare_keys);
+        st.pin_cover_miss_no_fk = prepared.miss_no_fk;
+        st.pin_cover_miss_partial = prepared.miss_partial;
+        st.pin_cover_ns = st
+            .pin_cover_ns
+            .saturating_add(t_cover.elapsed().as_nanos() as u64);
+
         let mut touch_batch: Vec<(u32, u64, Vec<u32>)> = Vec::new();
         let mut parent_ranges: Vec<(Fk, u64, u64)> = Vec::new();
         // Unique-range mlock: collect (need_heights, off, len) for cover + pin_new;
@@ -584,100 +589,97 @@ impl Query {
             Option<u32>,
         )> = Vec::with_capacity(pin_jobs.len());
 
-        // Split covered vs rest; batch body-LRU pin under one cache lock (slim outs).
-        let mut uncovered: Vec<(usize, u64, u32, Vec<u32>, Vec<u32>)> = Vec::new();
-        for (i, (pid, max_h, need_hs, need_vouts)) in pin_jobs.into_iter().enumerate() {
-            if covered.get(i).copied().unwrap_or(false) {
-                st.pin_already_cached = st.pin_already_cached.saturating_add(1);
-                for &h in &need_hs {
-                    touch_batch.push((h, pid, need_vouts.clone()));
-                }
-                let fk = Fk(pid);
-                if do_mlock {
-                    if let Some((off, len)) = self
-                        .confirm_parents
-                        .get_body_range(fk)
-                        .or_else(|| self.store.tx_body_range(fk).ok())
-                    {
-                        mlock_items.push((need_hs, off, len));
-                    } else {
-                        mlock_no_range.push((need_hs, fk));
-                    }
-                }
-                st.utxo_parents = st.utxo_parents.saturating_add(1);
-            } else {
-                uncovered.push((i, pid, max_h, need_hs, need_vouts));
-            }
-        }
-        st.pin_cover_ns = st
-            .pin_cover_ns
-            .saturating_add(t_cover.elapsed().as_nanos() as u64);
-
-        let t_body = Instant::now();
-        let body_pin_keys: Vec<(u64, Vec<u32>)> = uncovered
-            .iter()
-            .filter(|(_, _, _, _, vouts)| !vouts.is_empty())
-            .map(|(_, pid, _, _, vouts)| (*pid, vouts.clone()))
-            .collect();
-        let body_hits = self
-            .confirm_parents
-            .get_bodies_for_pin_batch(&body_pin_keys);
-
         // pin_new jobs: resolve ranges first so unique-range mlock runs before
         // meta/out reads (warm pages), then decode.
         let mut pin_new_jobs: Vec<(u64, u32, Vec<u32>, Vec<u32>, Option<(u64, u64)>)> =
             Vec::new();
-        for (_i, pid, max_h, need_hs, need_vouts) in uncovered {
+
+        let t_body = Instant::now();
+        debug_assert_eq!(pin_jobs.len(), prepared.kinds.len());
+        for ((pid, max_h, need_hs, need_vouts), kind) in
+            pin_jobs.into_iter().zip(prepared.kinds.into_iter())
+        {
             if self.confirm_cancelled() {
                 crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Cancelled("confirm cancelled"));
             }
             let fk = Fk(pid);
-            // Prefer cache body (runway / post-confirm LRU) — slim clone, no full inputs.
-            if !need_vouts.is_empty() {
-                if let Some((create_h, tx, outs, cb_hint, range)) = body_hits.get(&pid) {
+            match kind {
+                PinPrepareKind::Covered => {
+                    st.pin_already_cached = st.pin_already_cached.saturating_add(1);
+                    for &h in &need_hs {
+                        touch_batch.push((h, pid, need_vouts.clone()));
+                    }
+                    if do_mlock {
+                        if let Some((off, len)) = self
+                            .confirm_parents
+                            .get_body_range(fk)
+                            .or_else(|| self.store.tx_body_range(fk).ok())
+                        {
+                            mlock_items.push((need_hs, off, len));
+                        } else {
+                            mlock_no_range.push((need_hs, fk));
+                        }
+                    }
+                    st.utxo_parents = st.utxo_parents.saturating_add(1);
+                }
+                PinPrepareKind::Body {
+                    create_h,
+                    tx,
+                    outs,
+                    cb_hint,
+                    range,
+                    already_checked,
+                } => {
                     st.pin_cache_body = st.pin_cache_body.saturating_add(1);
-                    if let Some((off, len)) = *range {
+                    if let Some((off, len)) = range {
                         parent_ranges.push((fk, off, len));
                     }
-                    // Only spent-filter vouts not already in by_fk.checked.
-                    let already = self.confirm_parents.parent_checked_vouts(fk, &need_vouts);
-                    let already_set: HashSet<u32> = already.iter().copied().collect();
-                    let need_filter: Vec<u32> = need_vouts
-                        .iter()
-                        .copied()
-                        .filter(|v| !already_set.contains(v))
-                        .collect();
-                    let t_sp = Instant::now();
+                    // Same-batch creates cannot have durable spenders yet — skip
+                    // store spent filter (large fraction of pin work on dense tips).
+                    let same_batch = batch_create_ids.contains(&pid);
+                    let already_set: HashSet<u32> = already_checked.into_iter().collect();
                     let mut unspent_set: HashSet<u32> = already_set;
-                    if !need_filter.is_empty() {
-                        if let Ok(u) =
-                            self.store
-                                .unspent_create_vouts(fk, &need_filter, *range)
-                        {
-                            unspent_set.extend(u);
-                        } else {
-                            unspent_set.extend(need_filter.iter().copied());
+                    if same_batch {
+                        // All body outs for need_vouts are live.
+                        for (v, _) in &outs {
+                            unspent_set.insert(*v);
+                        }
+                    } else {
+                        let need_filter: Vec<u32> = need_vouts
+                            .iter()
+                            .copied()
+                            .filter(|v| !unspent_set.contains(v))
+                            .collect();
+                        if !need_filter.is_empty() {
+                            let t_sp = Instant::now();
+                            if let Ok(u) =
+                                self.store
+                                    .unspent_create_vouts(fk, &need_filter, range)
+                            {
+                                unspent_set.extend(u);
+                            } else {
+                                unspent_set.extend(need_filter.iter().copied());
+                            }
+                            st.pin_spent_ns = st
+                                .pin_spent_ns
+                                .saturating_add(t_sp.elapsed().as_nanos() as u64);
                         }
                     }
-                    st.pin_spent_ns = st
-                        .pin_spent_ns
-                        .saturating_add(t_sp.elapsed().as_nanos() as u64);
                     let mut live = Vec::with_capacity(unspent_set.len());
                     for (v, o) in outs {
-                        if unspent_set.contains(v) {
-                            live.push((*v, o.clone()));
+                        if unspent_set.contains(&v) {
+                            live.push((v, o));
                         }
                     }
-                    let cb_stash = match *cb_hint {
-                        Some(true) => Some(Some(*create_h)),
+                    let cb_stash = match cb_hint {
+                        Some(true) => Some(Some(create_h)),
                         Some(false) => Some(None),
                         None => {
-                            // Ambiguous 1-in: fall back to store height if available.
                             match self.resolve_parent_coinbase_height(
                                 fk,
                                 tx.input_count,
-                                *range,
+                                range,
                             ) {
                                 Ok(v) => Some(v),
                                 Err(_) => Some(None),
@@ -687,33 +689,34 @@ impl Query {
                     sparse_parents.push((
                         max_h,
                         fk,
-                        tx.clone(),
+                        tx,
                         live,
                         need_vouts.clone(),
                         cb_stash,
-                        Some(*create_h),
+                        Some(create_h),
                     ));
                     for &h in &need_hs {
                         touch_batch.push((h, pid, need_vouts.clone()));
                     }
                     st.utxo_parents = st.utxo_parents.saturating_add(1);
-                    continue;
+                }
+                PinPrepareKind::Miss { already_checked: _ } => {
+                    st.pin_new = st.pin_new.saturating_add(1);
+                    let range = self
+                        .confirm_parents
+                        .get_body_range(fk)
+                        .or_else(|| self.store.tx_body_range(fk).ok());
+                    if let Some((off, len)) = range {
+                        parent_ranges.push((fk, off, len));
+                        if do_mlock {
+                            mlock_items.push((need_hs.clone(), off, len));
+                        }
+                    } else if do_mlock {
+                        mlock_no_range.push((need_hs.clone(), fk));
+                    }
+                    pin_new_jobs.push((pid, max_h, need_hs, need_vouts, range));
                 }
             }
-            st.pin_new = st.pin_new.saturating_add(1);
-            let range = self
-                .confirm_parents
-                .get_body_range(fk)
-                .or_else(|| self.store.tx_body_range(fk).ok());
-            if let Some((off, len)) = range {
-                parent_ranges.push((fk, off, len));
-                if do_mlock {
-                    mlock_items.push((need_hs.clone(), off, len));
-                }
-            } else if do_mlock {
-                mlock_no_range.push((need_hs.clone(), fk));
-            }
-            pin_new_jobs.push((pid, max_h, need_hs, need_vouts, range));
         }
         st.pin_body_ns = st
             .pin_body_ns

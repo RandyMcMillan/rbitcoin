@@ -556,16 +556,12 @@ impl Query {
                 if let Some((create_h, tx, outs, inputs)) =
                     self.confirm_parents.get_body_for_pin(fk)
                 {
+                    // RAM hit (runway or post-confirm body LRU): no store decode.
+                    // Skip mlock — write may fault pages; preferred over cold pin_new.
                     st.pin_cache_body = st.pin_cache_body.saturating_add(1);
                     let range = self.confirm_parents.get_body_range(fk);
                     if let Some((off, len)) = range {
                         parent_ranges.push((fk, off, len));
-                        if do_mlock {
-                            let (_, sys, sk) =
-                                self.mlock_body_spans_for_heights(&need_hs, &[(off, len)]);
-                            st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
-                            st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
-                        }
                     }
                     let unspent = self
                         .store

@@ -19,7 +19,6 @@ pub type BatchThin = HashMap<u64, Vec<ThinInput>>;
 pub struct ConfirmLoadStats {
     pub blocks: u32,
     pub utxo_parents: u32,
-    pub reserved: u32,
     pub creates_registered: u32,
     /// Unique parent create fks pinned this call (after dedup).
     pub parent_unique: u32,
@@ -29,12 +28,10 @@ pub struct ConfirmLoadStats {
     pub pin_new: u32,
     /// Wall ns in `unspent_create_vouts` during pin (store spent-filter).
     pub pin_spent_ns: u64,
-    /// Body-LRU batch lookup + pin_cache resolve (excludes spent timer).
+    /// FIFO hit path resolve (excludes spent timer).
     pub pin_body_ns: u64,
-    /// pin_new range + meta/outs resolve (excludes spent timer).
+    /// pin_new meta/outs resolve (excludes spent timer).
     pub pin_new_meta_ns: u64,
-    /// Body-range put under parent cache lock (parents insert during body/new).
-    pub pin_put_ns: u64,
     /// Same-batch create edges (identity known in-batch).
     pub parent_cache_hits: u32,
     /// Stamped create_fk on input, parent **not** in this batch (external fk).
@@ -49,18 +46,9 @@ pub struct ConfirmLoadStats {
     pub header_ns: u64,
     pub body_decode_ns: u64,
     pub thin_ns: u64,
-    /// Thin sub-phases (sum into `thin_ns`).
-    pub thin_collect_ns: u64,
-    pub thin_cache_ns: u64,
-    pub thin_head_ns: u64,
-    pub thin_edge_ns: u64,
     pub parent_pin_ns: u64,
     pub cache_put_ns: u64,
-    pub head_lookups: u32,
-    pub head_hits: u32,
     pub edge_same_batch: u32,
-    pub edge_cache: u32,
-    pub edge_head: u32,
     pub edge_coinbase: u32,
 }
 
@@ -313,7 +301,6 @@ impl Query {
         // ── Thin edges: stamped create_fk only (schema v10) ────────────────
         // Soft prev_txid / sticky / head resolve removed — archive stamps create_fk.
         let t_thin = Instant::now();
-        let t_edge = Instant::now();
         for (height, tx_fks) in &height_tx_fks {
             for fk in tx_fks {
                 let Some(id) = fk.get() else {
@@ -358,9 +345,6 @@ impl Query {
                 thin_by_spend.insert(id, edges);
             }
         }
-        st.thin_edge_ns = st
-            .thin_edge_ns
-            .saturating_add(t_edge.elapsed().as_nanos() as u64);
         st.thin_ns = st.thin_ns.saturating_add(t_thin.elapsed().as_nanos() as u64);
 
         // ── Pin parents into per-batch BatchParents ───────────────────────
@@ -566,7 +550,6 @@ impl Query {
             .saturating_add(t_new.elapsed().as_nanos() as u64);
 
         // Parents already moved into BatchParents; thin stays batch-local.
-        st.pin_put_ns = 0;
         st.parent_pin_ns = st
             .parent_pin_ns
             .saturating_add(t_par.elapsed().as_nanos() as u64);

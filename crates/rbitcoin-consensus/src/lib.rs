@@ -113,12 +113,8 @@ use rbitcoin_store::{HeaderRecord, StoreError};
 /// IBD diagnostics: wall time spent in each phase (nanoseconds; reset by the sampler).
 pub mod confirm_phase_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
-    /// Total reconstruct-ish wall (prefetch + wave fill + wire reconstruct).
+    /// Total reconstruct-ish wall (wire rebuild; historical total).
     pub static RECONSTRUCT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Class A warm for wave-body txs (tx+ins+outs into class_a cache).
-    pub static PREFETCH_CLASS_A_NS: AtomicU64 = AtomicU64::new(0);
-    /// Wave prevout map build (parents + thin inputs; reuses class_a).
-    pub static WAVE_FILL_NS: AtomicU64 = AtomicU64::new(0);
     /// Full wire `Block` rebuild from Class A rows.
     pub static RECONSTRUCT_WIRE_NS: AtomicU64 = AtomicU64::new(0);
     /// Optimistic assemble (prevout content + jobs; no durable spentness).
@@ -152,11 +148,11 @@ pub mod confirm_phase_stats {
     /// Sample and reset all confirm phases.
     ///
     /// Returns
-    /// `(recon, prefetch, wave_fill(=0), wire, connect, script, class_c, strong, scripthash, tip,
+    /// `(recon, wire, connect, script, class_c, strong, scripthash, tip,
     ///   utxo_apply, blocks, resolve, load, unpin, cache_tip,
     ///   spend_ranged, spend_idx, spend_skip)`.
-    /// `strong` / `scripthash` / `tip` come from [`rbitcoin_query::class_c_phase_stats`]
-    /// (sub-phases inside Class C). `recon` is the sum of the three reconstruct sub-timers.
+    /// `strong` / `scripthash` / `tip` come from [`rbitcoin_query::class_c_phase_stats`].
+    /// `recon` prefers wire sub-timer, else legacy total.
     #[allow(clippy::type_complexity)]
     pub fn sample_and_reset()
     -> (
@@ -177,27 +173,13 @@ pub mod confirm_phase_stats {
         u64,
         u64,
         u64,
-        u64,
-        u64,
     ) {
         let (strong, sh, tip) = rbitcoin_query::class_c_phase_stats::sample_and_reset();
-        let prefetch = PREFETCH_CLASS_A_NS.swap(0, Ordering::Relaxed);
-        let wave = WAVE_FILL_NS.swap(0, Ordering::Relaxed);
         let wire = RECONSTRUCT_WIRE_NS.swap(0, Ordering::Relaxed);
-        // Prefer explicit sum of subs; fall back to legacy total if only that was bumped.
         let recon_total = RECONSTRUCT_NS.swap(0, Ordering::Relaxed);
-        let recon = {
-            let sum = prefetch.saturating_add(wave).saturating_add(wire);
-            if sum > 0 {
-                sum
-            } else {
-                recon_total
-            }
-        };
+        let recon = if wire > 0 { wire } else { recon_total };
         (
             recon,
-            prefetch,
-            wave,
             wire,
             CONNECT_NS.swap(0, Ordering::Relaxed),
             SCRIPT_NS.swap(0, Ordering::Relaxed),

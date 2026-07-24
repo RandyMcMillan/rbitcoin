@@ -20,11 +20,7 @@ use super::status::LoopStats;
 use rbitcoin_log::{debug, enabled, info, Level};
 
 /// One 5s window of IBD counters (post sample-and-reset).
-///
-/// Some fields are still sampled but omitted from formatters when always zero
-/// on Direct IBD (ghost paths). Kept until a follow-up deletes the atomics.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // formatter triage: unused fields pending counter cleanup
 pub(crate) struct IbdPerfSample {
     // Pipeline health (not from atomics).
     pub inflight: usize,
@@ -33,8 +29,6 @@ pub(crate) struct IbdPerfSample {
     pub arch_mb: usize,
     pub arch_budget_mb: usize,
     pub pending: usize,
-    pub known_arch: usize,
-    pub ordered: usize,
     pub ahead: u32,
     pub hole: usize,
     pub peers: usize,
@@ -57,30 +51,22 @@ pub(crate) struct IbdPerfSample {
     // Confirm phases (ns → ms at format)
     pub phase_blks: u64,
     pub recon_ms: u64,
-    pub prefetch_ms: u64,
-    pub wave_ms: u64,
     pub wire_ms: u64,
     pub connect_ms: u64,
     pub script_ms: u64,
     pub class_c_ms: u64,
     pub strong_ms: u64,
     pub sh_ms: u64,
-    pub tip_ms: u64,
     /// Post–Class C durable spend annotate wall (logged as `spend=` ms).
     pub utxo_ms: u64,
-    /// Spend annotate path mix: body-range / idx / skipped (null create_fk).
     pub spend_ranged: u64,
     pub spend_idx: u64,
     pub spend_skip: u64,
-    /// Formerly unaccounted confirm overhead (ms totals).
     pub resolve_ms: u64,
     pub load_ms: u64,
-    pub unpin_ms: u64,
     pub cache_tip_ms: u64,
     // raw ns for us/blk
     pub recon_ns: u64,
-    pub prefetch_ns: u64,
-    pub wave_ns: u64,
     pub wire_ns: u64,
     pub connect_ns: u64,
     pub script_ns: u64,
@@ -91,98 +77,53 @@ pub(crate) struct IbdPerfSample {
     pub utxo_apply_ns: u64,
     pub resolve_ns: u64,
     pub load_ns: u64,
-    pub unpin_ns: u64,
     pub cache_tip_ns: u64,
 
-    /// On-disk scripthash sorted runs waiting for tip bulk.
     pub sh_runs: usize,
 
-    // Wave-fill sub
-    pub wf_body_ms: u64,
-    pub wf_ptx_ms: u64,
-    pub wf_pout_ms: u64,
-    pub wf_spent_ms: u64,
-    pub wf_cb_ms: u64,
-    /// Wave bodies moved from parent cache vs re-decoded from store.
-    pub wf_body_cache: u64,
+    /// Wire rebuild: store body decode count + wall ms.
     pub wf_body_store: u64,
-    /// Thin edges moved from cache stash vs rebuilt from inputs.
-    pub wf_thin_cache: u64,
-    pub wf_thin_rebuild: u64,
-    /// Store body decode wall (ms) during wire rebuild.
     pub wf_store_body_ms: u64,
-    /// ConfirmParentCache mutex wait (ms).
-    pub wf_cache_lock_ms: u64,
 
-    // SH sub
-    pub sh_warm_ms: u64,
+    // SH sub (Direct: collect; tip append: sort/seed/body/head)
     pub sh_filter_ms: u64,
     pub sh_collect_ms: u64,
     pub sh_sort_ms: u64,
     pub sh_seed_ms: u64,
     pub sh_body_ms: u64,
     pub sh_head_ms: u64,
-    pub sh_index_ms: u64,
 
-    // Connect prevout resolve mix
-    pub cp_wave: u64,
-    pub cp_class_a: u64,
-    pub cp_store: u64,
-
-    // Parent cache / confirm-load window counters + live snapshot
-    /// Wall ms in `load_confirm_parents` this window (sampler).
+    // Parent cache / confirm-load
     pub load_win_ms: u64,
     pub load_blocks: u64,
     pub load_utxo_parents: u64,
     pub load_creates: u64,
-    pub load_already_ready: u64,
     pub load_parent_unique: u64,
-    /// Of uniq_p: body-LRU pin vs store pin_new.
     pub load_pin_cache_body: u64,
     pub load_pin_new: u64,
-    /// Spent-filter wall on pin path (ms).
     pub load_pin_spent_ms: u64,
-    /// Pin residual sub-phases (ms): body-LRU / pin_new meta / batch put.
     pub load_pin_body_ms: u64,
     pub load_pin_new_meta_ms: u64,
-    pub load_pin_put_ms: u64,
-
-    /// Phase-1 body Class A reads this window.
     pub load_body_tx_reads: u64,
-    /// Phase-2 external parent pins this window.
     pub load_parent_tx_reads: u64,
     pub load_missing_parents: u64,
-    /// Contiguous ready watermark height.
     pub load_ready_through: u32,
-    /// Parent-cache snapshot (bodies still held / plans).
     pub cache_bodies: usize,
     pub cache_plans: usize,
-    /// Confirm pipeline queue depths (load→scripts, scripts→write).
     pub conf_load_q: usize,
     pub conf_write_q: usize,
     pub conf_load_q_cap: usize,
     pub conf_write_q_cap: usize,
-    /// Runway internal phase ms (window sum).
     pub load_hdr_ms: u64,
     pub load_decode_ms: u64,
     pub load_thin_ms: u64,
-    /// Thin sub-phases (ms window sum).
-    pub load_thin_collect_ms: u64,
-    pub load_thin_cache_ms: u64,
-    pub load_thin_head_ms: u64,
-    pub load_thin_edge_ms: u64,
     pub load_parent_pin_ms: u64,
     pub load_cache_put_ms: u64,
-    pub load_head_lookups: u64,
-    pub load_head_hits: u64,
     pub load_edge_same: u64,
-    pub load_edge_cache: u64,
-    /// Stamped create_fk, parent outside batch (not a RAM cache hit).
     pub load_edge_fk: u64,
-    pub load_edge_head: u64,
     pub load_edge_cb: u64,
 
-    // Archive create_fk resolve + phase walls (window)
+    // Archive
     pub arch_ext_need: u64,
     pub arch_sticky_hit: u64,
     pub arch_head_need: u64,
@@ -191,7 +132,6 @@ pub(crate) struct IbdPerfSample {
     pub arch_resolved_stamp: u64,
     pub arch_resolve_ns: u64,
     pub arch_resolve_blocks: u64,
-    /// Prep end-to-end + sub-phases (ms window sum).
     pub arch_prep_total_ms: u64,
     pub arch_prep_struct_ms: u64,
     pub arch_prep_filter_ms: u64,
@@ -200,7 +140,6 @@ pub(crate) struct IbdPerfSample {
     pub arch_prep_sticky_ms: u64,
     pub arch_prep_inflight_ms: u64,
     pub arch_prep_head_ms: u64,
-    /// Head resolve split (store): open-address probe / tx.idx / body prefix.
     pub arch_prep_probe_ms: u64,
     pub arch_prep_idx_ms: u64,
     pub arch_prep_body_txid_ms: u64,
@@ -211,9 +150,7 @@ pub(crate) struct IbdPerfSample {
     pub arch_prep_finish_ms: u64,
     pub arch_prep_publish_ms: u64,
     pub arch_prep_qwait_ms: u64,
-    pub arch_prep_sum_ms: u64,
     pub arch_prep_blocks: u64,
-    /// Write end-to-end + sub-phases (ms window sum).
     pub arch_write_total_ms: u64,
     pub arch_write_reserve_ms: u64,
     pub arch_write_body_ms: u64,
@@ -223,18 +160,14 @@ pub(crate) struct IbdPerfSample {
     pub arch_write_sticky_ms: u64,
     pub arch_write_dontneed_ms: u64,
     pub arch_write_flush_ms: u64,
-    pub arch_write_sum_ms: u64,
     pub arch_write_blocks: u64,
-    /// Live sticky map size (not window-reset).
     pub arch_sticky_len: usize,
     pub arch_sticky_cap: usize,
 
-    /// ContigPark live snapshot (writer; not window-reset).
     pub contig_next_h: u32,
     pub contig_parked: usize,
     pub contig_ready: usize,
 
-    // Pipe
     pub pipe: ArchivePipelineSample,
 }
 
@@ -247,8 +180,6 @@ impl Default for IbdPerfSample {
             arch_mb: 0,
             arch_budget_mb: 0,
             pending: 0,
-            known_arch: 0,
-            ordered: 0,
             ahead: 0,
             hole: 0,
             peers: 0,
@@ -266,26 +197,20 @@ impl Default for IbdPerfSample {
             live: None,
             phase_blks: 0,
             recon_ms: 0,
-            prefetch_ms: 0,
-            wave_ms: 0,
             wire_ms: 0,
             connect_ms: 0,
             script_ms: 0,
             class_c_ms: 0,
             strong_ms: 0,
             sh_ms: 0,
-            tip_ms: 0,
             utxo_ms: 0,
             spend_ranged: 0,
             spend_idx: 0,
             spend_skip: 0,
             resolve_ms: 0,
             load_ms: 0,
-            unpin_ms: 0,
             cache_tip_ms: 0,
             recon_ns: 0,
-            prefetch_ns: 0,
-            wave_ns: 0,
             wire_ns: 0,
             connect_ns: 0,
             script_ns: 0,
@@ -296,44 +221,26 @@ impl Default for IbdPerfSample {
             utxo_apply_ns: 0,
             resolve_ns: 0,
             load_ns: 0,
-            unpin_ns: 0,
             cache_tip_ns: 0,
             sh_runs: 0,
-            wf_body_ms: 0,
-            wf_ptx_ms: 0,
-            wf_pout_ms: 0,
-            wf_spent_ms: 0,
-            wf_cb_ms: 0,
-            wf_body_cache: 0,
             wf_body_store: 0,
-            wf_thin_cache: 0,
-            wf_thin_rebuild: 0,
             wf_store_body_ms: 0,
-            wf_cache_lock_ms: 0,
-            sh_warm_ms: 0,
             sh_filter_ms: 0,
             sh_collect_ms: 0,
             sh_sort_ms: 0,
             sh_seed_ms: 0,
             sh_body_ms: 0,
             sh_head_ms: 0,
-            sh_index_ms: 0,
-            cp_wave: 0,
-            cp_class_a: 0,
-            cp_store: 0,
             load_win_ms: 0,
             load_blocks: 0,
             load_utxo_parents: 0,
             load_creates: 0,
-            load_already_ready: 0,
             load_parent_unique: 0,
             load_pin_cache_body: 0,
             load_pin_new: 0,
             load_pin_spent_ms: 0,
             load_pin_body_ms: 0,
             load_pin_new_meta_ms: 0,
-            load_pin_put_ms: 0,
-
             load_body_tx_reads: 0,
             load_parent_tx_reads: 0,
             load_missing_parents: 0,
@@ -347,18 +254,10 @@ impl Default for IbdPerfSample {
             load_hdr_ms: 0,
             load_decode_ms: 0,
             load_thin_ms: 0,
-            load_thin_collect_ms: 0,
-            load_thin_cache_ms: 0,
-            load_thin_head_ms: 0,
-            load_thin_edge_ms: 0,
             load_parent_pin_ms: 0,
             load_cache_put_ms: 0,
-            load_head_lookups: 0,
-            load_head_hits: 0,
             load_edge_same: 0,
-            load_edge_cache: 0,
             load_edge_fk: 0,
-            load_edge_head: 0,
             load_edge_cb: 0,
             arch_ext_need: 0,
             arch_sticky_hit: 0,
@@ -386,7 +285,6 @@ impl Default for IbdPerfSample {
             arch_prep_finish_ms: 0,
             arch_prep_publish_ms: 0,
             arch_prep_qwait_ms: 0,
-            arch_prep_sum_ms: 0,
             arch_prep_blocks: 0,
             arch_write_total_ms: 0,
             arch_write_reserve_ms: 0,
@@ -397,7 +295,6 @@ impl Default for IbdPerfSample {
             arch_write_sticky_ms: 0,
             arch_write_dontneed_ms: 0,
             arch_write_flush_ms: 0,
-            arch_write_sum_ms: 0,
             arch_write_blocks: 0,
             arch_sticky_len: 0,
             arch_sticky_cap: 0,
@@ -407,10 +304,6 @@ impl Default for IbdPerfSample {
             pipe: ArchivePipelineSample::default(),
         }
     }
-}
-
-fn ns_ms(ns: u64) -> u64 {
-    ns / 1_000_000
 }
 
 /// Sample every counter once and reset atomics.
@@ -423,8 +316,8 @@ pub(crate) fn sample(
     arch_mb: usize,
     arch_budget_mb: usize,
     pending: usize,
-    known_arch: usize,
-    ordered: usize,
+    _known_arch: usize,
+    _ordered: usize,
     ahead: u32,
     hole: usize,
     peers: usize,
@@ -440,8 +333,6 @@ pub(crate) fn sample(
     let hot = loop_stats.sample_and_reset();
     let (
         recon_ns,
-        prefetch_ns,
-        wave_fill_ns,
         wire_ns,
         connect_ns,
         script_ns,
@@ -453,22 +344,18 @@ pub(crate) fn sample(
         phase_blks,
         resolve_ns,
         load_ns,
-        unpin_ns,
+        _unpin_ns,
         cache_tip_ns,
         spend_ranged,
         spend_idx,
         spend_skip,
     ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
-    let _ = rbitcoin_query::ibd_utxo_stats::sample_probe_flush_and_reset();
-    let (sh_warm, sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head, sh_index) =
+    let (sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head) =
         rbitcoin_query::class_c_phase_stats::sample_sh_sub_and_reset();
-    let (wf_body, wf_ptx, wf_pout, wf_spent, wf_cb) =
-        rbitcoin_query::wave_fill_stats::sample_and_reset();
-    let (wf_body_cache, wf_body_store, wf_thin_cache, wf_thin_rebuild) =
-        rbitcoin_query::wave_fill_stats::sample_counts_and_reset();
-    let (wf_store_body_ns, wf_cache_lock_ns) =
-        rbitcoin_query::wave_fill_stats::sample_io_and_reset();
-    let (pwh, pca, psm) = rbitcoin_query::connect_prevout_stats::sample_and_reset();
+    let (wf_body_store, wf_store_body_ns) =
+        rbitcoin_query::wave_fill_stats::sample_store_and_reset();
+    // Drain connect prevout counters (not displayed; avoid unbounded growth).
+    let _ = rbitcoin_query::connect_prevout_stats::sample_and_reset();
     let pw = rbitcoin_query::confirm_load_stats::sample_and_reset();
     let arch_res = rbitcoin_query::archive_phase_stats::sample_and_reset();
     let head_res = rbitcoin_store::head_resolve_stats::sample_and_reset();
@@ -485,8 +372,6 @@ pub(crate) fn sample(
         arch_mb,
         arch_budget_mb,
         pending,
-        known_arch,
-        ordered,
         ahead,
         hole,
         peers,
@@ -504,26 +389,20 @@ pub(crate) fn sample(
         live: hot.confirm_live,
         phase_blks,
         recon_ms: ns_ms(recon_ns),
-        prefetch_ms: ns_ms(prefetch_ns),
-        wave_ms: ns_ms(wave_fill_ns),
         wire_ms: ns_ms(wire_ns),
         connect_ms: ns_ms(connect_ns),
         script_ms: ns_ms(script_ns),
         class_c_ms: ns_ms(class_c_ns),
         strong_ms: ns_ms(strong_ns),
         sh_ms: ns_ms(sh_ns),
-        tip_ms: ns_ms(tip_ns),
         utxo_ms: ns_ms(utxo_apply_ns),
         spend_ranged,
         spend_idx,
         spend_skip,
         resolve_ms: ns_ms(resolve_ns),
         load_ms: ns_ms(load_ns),
-        unpin_ms: ns_ms(unpin_ns),
         cache_tip_ms: ns_ms(cache_tip_ns),
         recon_ns,
-        prefetch_ns,
-        wave_ns: wave_fill_ns,
         wire_ns,
         connect_ns,
         script_ns,
@@ -534,44 +413,26 @@ pub(crate) fn sample(
         utxo_apply_ns,
         resolve_ns,
         load_ns,
-        unpin_ns,
         cache_tip_ns,
         sh_runs,
-        wf_body_ms: ns_ms(wf_body),
-        wf_ptx_ms: ns_ms(wf_ptx),
-        wf_pout_ms: ns_ms(wf_pout),
-        wf_spent_ms: ns_ms(wf_spent),
-        wf_cb_ms: ns_ms(wf_cb),
-        wf_body_cache,
         wf_body_store,
-        wf_thin_cache,
-        wf_thin_rebuild,
         wf_store_body_ms: ns_ms(wf_store_body_ns),
-        wf_cache_lock_ms: ns_ms(wf_cache_lock_ns),
-        sh_warm_ms: ns_ms(sh_warm),
         sh_filter_ms: ns_ms(sh_filter),
         sh_collect_ms: ns_ms(sh_collect),
         sh_sort_ms: ns_ms(sh_sort),
         sh_seed_ms: ns_ms(sh_seed),
         sh_body_ms: ns_ms(sh_body),
         sh_head_ms: ns_ms(sh_head),
-        sh_index_ms: ns_ms(sh_index),
-        cp_wave: pwh,
-        cp_class_a: pca,
-        cp_store: psm,
         load_win_ms: ns_ms(pw.ns),
         load_blocks: pw.blocks,
         load_utxo_parents: pw.utxo_parents,
         load_creates: pw.creates,
-        load_already_ready: pw.already_ready,
         load_parent_unique: pw.parent_unique,
         load_pin_cache_body: pw.pin_cache_body,
         load_pin_new: pw.pin_new,
         load_pin_spent_ms: ns_ms(pw.pin_spent_ns),
         load_pin_body_ms: ns_ms(pw.pin_body_ns),
         load_pin_new_meta_ms: ns_ms(pw.pin_new_meta_ns),
-        load_pin_put_ms: ns_ms(pw.pin_put_ns),
-
         load_body_tx_reads: pw.body_tx,
         load_parent_tx_reads: pw.parent_tx,
         load_missing_parents: pw.missing,
@@ -585,18 +446,10 @@ pub(crate) fn sample(
         load_hdr_ms: ns_ms(pw.header_ns),
         load_decode_ms: ns_ms(pw.body_decode_ns),
         load_thin_ms: ns_ms(pw.thin_ns),
-        load_thin_collect_ms: ns_ms(pw.thin_collect_ns),
-        load_thin_cache_ms: ns_ms(pw.thin_cache_ns),
-        load_thin_head_ms: ns_ms(pw.thin_head_ns),
-        load_thin_edge_ms: ns_ms(pw.thin_edge_ns),
         load_parent_pin_ms: ns_ms(pw.parent_pin_ns),
         load_cache_put_ms: ns_ms(pw.cache_put_ns),
-        load_head_lookups: pw.head_lookups,
-        load_head_hits: pw.head_hits,
         load_edge_same: pw.edge_same_batch,
-        load_edge_cache: pw.edge_cache,
         load_edge_fk: pw.edge_fk,
-        load_edge_head: pw.edge_head,
         load_edge_cb: pw.edge_coinbase,
         arch_ext_need: arch_res.ext_need,
         arch_sticky_hit: arch_res.sticky_hit,
@@ -624,7 +477,6 @@ pub(crate) fn sample(
         arch_prep_finish_ms: ns_ms(arch_res.prep_finish_ns),
         arch_prep_publish_ms: ns_ms(arch_res.prep_publish_ns),
         arch_prep_qwait_ms: ns_ms(arch_res.prep_qwait_ns),
-        arch_prep_sum_ms: ns_ms(arch_res.prep_phases_sum_ns()),
         arch_prep_blocks: arch_res.prep_blocks,
         arch_write_total_ms: ns_ms(arch_res.write_total_ns),
         arch_write_reserve_ms: ns_ms(arch_res.write_reserve_ns),
@@ -635,7 +487,6 @@ pub(crate) fn sample(
         arch_write_sticky_ms: ns_ms(arch_res.write_sticky_ns),
         arch_write_dontneed_ms: ns_ms(arch_res.write_dontneed_ns),
         arch_write_flush_ms: ns_ms(arch_res.write_flush_ns),
-        arch_write_sum_ms: ns_ms(arch_res.write_phases_sum_ns()),
         arch_write_blocks: arch_res.write_blocks,
         arch_sticky_len,
         arch_sticky_cap,
@@ -644,6 +495,10 @@ pub(crate) fn sample(
         contig_ready,
         pipe,
     }
+}
+
+fn ns_ms(ns: u64) -> u64 {
+    ns / 1_000_000
 }
 
 /// Append ` key=value` only when `v != 0` (keeps DEBUG free of ghost columns).
@@ -768,23 +623,20 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     append_nz(&mut out, "resolve_us", us(s.resolve_ns));
     append_nz(&mut out, "strong_us", us(s.strong_ns));
     append_nz(&mut out, "tip_us", us(s.tip_ns));
-    // Wire rebuild store cost (live); omit stub wave-fill zeros.
-    if s.wf_body_store > 0 || s.wf_body_cache > 0 || s.wf_store_body_ms > 0 || s.wf_cache_lock_ms > 0
-    {
+    // Wire rebuild store cost (live).
+    if s.wf_body_store > 0 || s.wf_store_body_ms > 0 {
         out.push_str(&format!(
-            " | wire_body cache={} store={} store_ms={} lock_ms={}",
-            s.wf_body_cache, s.wf_body_store, s.wf_store_body_ms, s.wf_cache_lock_ms,
+            " | wire_body store={} store_ms={}",
+            s.wf_body_store, s.wf_store_body_ms,
         ));
     }
     // SH: Direct only accrues collect; tip-append fields only if non-zero.
     out.push_str(&format!(" | sh collect={}", s.sh_collect_ms));
-    append_nz(&mut out, "warm", s.sh_warm_ms);
     append_nz(&mut out, "filter", s.sh_filter_ms);
     append_nz(&mut out, "sort", s.sh_sort_ms);
     append_nz(&mut out, "seed", s.sh_seed_ms);
     append_nz(&mut out, "body", s.sh_body_ms);
     append_nz(&mut out, "head", s.sh_head_ms);
-    append_nz(&mut out, "index", s.sh_index_ms);
 
     let conf_q = super::confirm::format_conf_q(
         s.conf_load_q,
@@ -807,7 +659,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.load_body_tx_reads,
         s.load_parent_tx_reads,
     ));
-    append_nz(&mut out, "skip", s.load_already_ready);
     append_nz(&mut out, "miss_p", s.load_missing_parents);
     out.push_str(&format!(
         " phases hdr={} dec={} thin={} pin={} put={} spent={}ms pin_sub body={} new={}",
@@ -820,14 +671,11 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.load_pin_body_ms,
         s.load_pin_new_meta_ms,
     ));
-    append_nz(&mut out, "pin_put", s.load_pin_put_ms);
-    // Edges: same/fk/cb are live; cache/head kinds dropped when zero.
+    // Edges: same/fk/cb are live.
     out.push_str(&format!(
         " edges same={} fk={} cb={}",
         s.load_edge_same, s.load_edge_fk, s.load_edge_cb,
     ));
-    append_nz(&mut out, "edge_cache", s.load_edge_cache);
-    append_nz(&mut out, "edge_head", s.load_edge_head);
     out.push_str(&format!(" sh_runs={}", s.sh_runs));
 
     let busy = s.pipe.write_busy_ms();
@@ -932,14 +780,13 @@ pub(crate) fn log_sample(s: &IbdPerfSample) {
         let recon_ms = s.recon_ms / s.phase_blks.max(1);
         if c_ms >= 1000 || sh_ms >= 1000 || recon_ms >= 5000 {
             rbitcoin_log::warn!(
-                "ibd: slow confirm phase ms/blk recon={} script={} class_c={} sh={} (sh_collect={}ms window) store_body={}ms cache_lock={}ms blks={}",
+                "ibd: slow confirm phase ms/blk recon={} script={} class_c={} sh={} (sh_collect={}ms window) store_body={}ms blks={}",
                 recon_ms,
                 s.script_ms / s.phase_blks.max(1),
                 c_ms,
                 sh_ms,
                 s.sh_collect_ms,
                 s.wf_store_body_ms,
-                s.wf_cache_lock_ms,
                 s.phase_blks,
             );
         }
@@ -1024,6 +871,7 @@ mod tests {
         s.spend_skip = 0;
         s.wf_body_store = 3;
         s.wf_store_body_ms = 50;
+        // (no cache/lock fields — pruned)
         s.conf_load_q = 0;
         s.conf_write_q = 1;
         s.conf_load_q_cap = 2;

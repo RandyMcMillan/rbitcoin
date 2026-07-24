@@ -58,16 +58,14 @@ pub mod confirm_load_stats {
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
     pub static UTXO_PARENTS: AtomicU64 = AtomicU64::new(0);
     pub static CREATES: AtomicU64 = AtomicU64::new(0);
-    pub static ALREADY_READY: AtomicU64 = AtomicU64::new(0);
     pub static PARENT_UNIQUE: AtomicU64 = AtomicU64::new(0);
-    /// Pin filled from cache `by_body` (no Class A re-decode).
+    /// Pin filled from outs FIFO (no Class A re-decode).
     pub static PIN_CACHE_BODY: AtomicU64 = AtomicU64::new(0);
     /// Pin that had to load from store.
     pub static PIN_NEW: AtomicU64 = AtomicU64::new(0);
     pub static PIN_SPENT_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_BODY_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_NEW_META_NS: AtomicU64 = AtomicU64::new(0);
-    pub static PIN_PUT_NS: AtomicU64 = AtomicU64::new(0);
     pub static PARENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
     pub static FULL_TX_READS: AtomicU64 = AtomicU64::new(0);
     pub static BODY_TX_READS: AtomicU64 = AtomicU64::new(0);
@@ -76,24 +74,12 @@ pub mod confirm_load_stats {
     pub static HEADER_NS: AtomicU64 = AtomicU64::new(0);
     pub static BODY_DECODE_NS: AtomicU64 = AtomicU64::new(0);
     pub static THIN_NS: AtomicU64 = AtomicU64::new(0);
-    /// Thin sub-phases (collect unique / cache map / head probe / edge walk).
-    pub static THIN_COLLECT_NS: AtomicU64 = AtomicU64::new(0);
-    pub static THIN_RUNWAY_NS: AtomicU64 = AtomicU64::new(0);
-    pub static THIN_HEAD_NS: AtomicU64 = AtomicU64::new(0);
-    pub static THIN_EDGE_NS: AtomicU64 = AtomicU64::new(0);
     pub static PARENT_PIN_NS: AtomicU64 = AtomicU64::new(0);
     pub static CACHE_PUT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Durable `tx.head` probes during thin resolve.
-    pub static HEAD_LOOKUPS: AtomicU64 = AtomicU64::new(0);
-    pub static HEAD_HITS: AtomicU64 = AtomicU64::new(0);
-    /// Thin edges classified: same-batch / cache / stamped-fk / head / coinbase / miss.
+    /// Thin edges: same-batch / stamped-fk / coinbase.
     pub static EDGE_SAME_BATCH: AtomicU64 = AtomicU64::new(0);
-    pub static EDGE_RUNWAY: AtomicU64 = AtomicU64::new(0);
-    /// Stamped create_fk on input, parent outside this batch (still may need pin IO).
     pub static EDGE_FK: AtomicU64 = AtomicU64::new(0);
-    pub static EDGE_HEAD: AtomicU64 = AtomicU64::new(0);
     pub static EDGE_COINBASE: AtomicU64 = AtomicU64::new(0);
-
 
     /// One sampler snapshot (all counters reset).
     #[derive(Debug, Default, Clone, Copy)]
@@ -102,14 +88,12 @@ pub mod confirm_load_stats {
         pub blocks: u64,
         pub utxo_parents: u64,
         pub creates: u64,
-        pub already_ready: u64,
         pub parent_unique: u64,
         pub pin_cache_body: u64,
         pub pin_new: u64,
         pub pin_spent_ns: u64,
         pub pin_body_ns: u64,
         pub pin_new_meta_ns: u64,
-        pub pin_put_ns: u64,
         pub cache_hits: u64,
         pub body_tx: u64,
         pub parent_tx: u64,
@@ -117,18 +101,10 @@ pub mod confirm_load_stats {
         pub header_ns: u64,
         pub body_decode_ns: u64,
         pub thin_ns: u64,
-        pub thin_collect_ns: u64,
-        pub thin_cache_ns: u64,
-        pub thin_head_ns: u64,
-        pub thin_edge_ns: u64,
         pub parent_pin_ns: u64,
         pub cache_put_ns: u64,
-        pub head_lookups: u64,
-        pub head_hits: u64,
         pub edge_same_batch: u64,
-        pub edge_cache: u64,
         pub edge_fk: u64,
-        pub edge_head: u64,
         pub edge_coinbase: u64,
     }
 
@@ -138,14 +114,12 @@ pub mod confirm_load_stats {
             blocks: BLOCKS.swap(0, Ordering::Relaxed),
             utxo_parents: UTXO_PARENTS.swap(0, Ordering::Relaxed),
             creates: CREATES.swap(0, Ordering::Relaxed),
-            already_ready: ALREADY_READY.swap(0, Ordering::Relaxed),
             parent_unique: PARENT_UNIQUE.swap(0, Ordering::Relaxed),
             pin_cache_body: PIN_CACHE_BODY.swap(0, Ordering::Relaxed),
             pin_new: PIN_NEW.swap(0, Ordering::Relaxed),
             pin_spent_ns: PIN_SPENT_NS.swap(0, Ordering::Relaxed),
             pin_body_ns: PIN_BODY_NS.swap(0, Ordering::Relaxed),
             pin_new_meta_ns: PIN_NEW_META_NS.swap(0, Ordering::Relaxed),
-            pin_put_ns: PIN_PUT_NS.swap(0, Ordering::Relaxed),
             cache_hits: PARENT_CACHE_HITS.swap(0, Ordering::Relaxed),
             body_tx: BODY_TX_READS.swap(0, Ordering::Relaxed),
             parent_tx: FULL_TX_READS.swap(0, Ordering::Relaxed),
@@ -153,18 +127,10 @@ pub mod confirm_load_stats {
             header_ns: HEADER_NS.swap(0, Ordering::Relaxed),
             body_decode_ns: BODY_DECODE_NS.swap(0, Ordering::Relaxed),
             thin_ns: THIN_NS.swap(0, Ordering::Relaxed),
-            thin_collect_ns: THIN_COLLECT_NS.swap(0, Ordering::Relaxed),
-            thin_cache_ns: THIN_RUNWAY_NS.swap(0, Ordering::Relaxed),
-            thin_head_ns: THIN_HEAD_NS.swap(0, Ordering::Relaxed),
-            thin_edge_ns: THIN_EDGE_NS.swap(0, Ordering::Relaxed),
             parent_pin_ns: PARENT_PIN_NS.swap(0, Ordering::Relaxed),
             cache_put_ns: CACHE_PUT_NS.swap(0, Ordering::Relaxed),
-            head_lookups: HEAD_LOOKUPS.swap(0, Ordering::Relaxed),
-            head_hits: HEAD_HITS.swap(0, Ordering::Relaxed),
             edge_same_batch: EDGE_SAME_BATCH.swap(0, Ordering::Relaxed),
-            edge_cache: EDGE_RUNWAY.swap(0, Ordering::Relaxed),
             edge_fk: EDGE_FK.swap(0, Ordering::Relaxed),
-            edge_head: EDGE_HEAD.swap(0, Ordering::Relaxed),
             edge_coinbase: EDGE_COINBASE.swap(0, Ordering::Relaxed),
         }
     }
@@ -190,7 +156,6 @@ pub mod confirm_load_stats {
         add!(pin_spent_ns, PIN_SPENT_NS);
         add!(pin_body_ns, PIN_BODY_NS);
         add!(pin_new_meta_ns, PIN_NEW_META_NS);
-        add!(pin_put_ns, PIN_PUT_NS);
         add!(parent_cache_hits, PARENT_CACHE_HITS);
         add!(full_tx_reads, FULL_TX_READS);
         add!(body_tx_reads, BODY_TX_READS);
@@ -198,20 +163,11 @@ pub mod confirm_load_stats {
         add!(header_ns, HEADER_NS);
         add!(body_decode_ns, BODY_DECODE_NS);
         add!(thin_ns, THIN_NS);
-        add!(thin_collect_ns, THIN_COLLECT_NS);
-        add!(thin_cache_ns, THIN_RUNWAY_NS);
-        add!(thin_head_ns, THIN_HEAD_NS);
-        add!(thin_edge_ns, THIN_EDGE_NS);
         add!(parent_pin_ns, PARENT_PIN_NS);
         add!(cache_put_ns, CACHE_PUT_NS);
-        add!(head_lookups, HEAD_LOOKUPS);
-        add!(head_hits, HEAD_HITS);
         add!(edge_same_batch, EDGE_SAME_BATCH);
         add!(edge_fk, EDGE_FK);
-        add!(edge_cache, EDGE_RUNWAY);
-        add!(edge_head, EDGE_HEAD);
         add!(edge_coinbase, EDGE_COINBASE);
-
     }
 }
 
@@ -486,22 +442,18 @@ pub mod class_c_phase_stats {
     pub static SCRIPTHASH_NS: AtomicU64 = AtomicU64::new(0);
     pub static TIP_NS: AtomicU64 = AtomicU64::new(0);
 
-    /// SH: warm create-tx index (first confirm only; should be ~0 after).
-    pub static SH_WARM_NS: AtomicU64 = AtomicU64::new(0);
     /// SH: filter which wave txs need create rows.
     pub static SH_FILTER_NS: AtomicU64 = AtomicU64::new(0);
-    /// SH: load creates from Class A for new txs.
+    /// SH: load creates from Class A for new txs (Direct runs enqueue).
     pub static SH_COLLECT_NS: AtomicU64 = AtomicU64::new(0);
-    /// SH: sort creates by scripthash.
+    /// SH: sort creates by scripthash (tip append path).
     pub static SH_SORT_NS: AtomicU64 = AtomicU64::new(0);
-    /// SH: seed process/durable heads for new scripthash keys.
+    /// SH: seed process/durable heads (tip append path).
     pub static SH_SEED_NS: AtomicU64 = AtomicU64::new(0);
-    /// SH: encode + body `write_at`.
+    /// SH: encode + body `write_at` (tip append path).
     pub static SH_BODY_NS: AtomicU64 = AtomicU64::new(0);
-    /// SH: `scripthash.head` insert_many.
+    /// SH: `scripthash.head` insert_many (tip append path).
     pub static SH_HEAD_NS: AtomicU64 = AtomicU64::new(0);
-    /// SH: advance height watermark (was set inserts; now near-zero).
-    pub static SH_INDEX_NS: AtomicU64 = AtomicU64::new(0);
 
     /// `(strong, scripthash, tip)` nanoseconds.
     ///
@@ -516,17 +468,15 @@ pub mod class_c_phase_stats {
         )
     }
 
-    /// `(warm, filter, collect, sort, seed, body, head, index)` nanoseconds.
-    pub fn sample_sh_sub_and_reset() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    /// `(filter, collect, sort, seed, body, head)` nanoseconds.
+    pub fn sample_sh_sub_and_reset() -> (u64, u64, u64, u64, u64, u64) {
         (
-            SH_WARM_NS.swap(0, Ordering::Relaxed),
             SH_FILTER_NS.swap(0, Ordering::Relaxed),
             SH_COLLECT_NS.swap(0, Ordering::Relaxed),
             SH_SORT_NS.swap(0, Ordering::Relaxed),
             SH_SEED_NS.swap(0, Ordering::Relaxed),
             SH_BODY_NS.swap(0, Ordering::Relaxed),
             SH_HEAD_NS.swap(0, Ordering::Relaxed),
-            SH_INDEX_NS.swap(0, Ordering::Relaxed),
         )
     }
 
@@ -559,74 +509,22 @@ pub mod connect_prevout_stats {
     }
 }
 
-/// Removed light-UTXO diagnostics (stub so IBD sampler still compiles).
-pub mod ibd_utxo_stats {
-    /// Always zero — light UTXO deleted.
-    pub fn sample_rebuilds_and_reset() -> u64 {
-        0
-    }
-    /// Always `(0, 0)`.
-    pub fn sample_probe_flush_and_reset() -> (u64, u64) {
-        (0, 0)
-    }
-}
-
-/// Wire-rebuild body load counters (nanoseconds / counts; IBD sampler).
+/// Wire-rebuild body load counters (IBD sampler).
 ///
-/// Historical name `wave_fill_stats` — wave fill is gone; these still track
-/// parent-cache body hits vs store decode during confirm wire rebuild.
+/// Historical name `wave_fill_stats` — only store body decode remains live.
 pub mod wave_fill_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Unused (kept zero for sampler layout).
-    pub static BODY_NS: AtomicU64 = AtomicU64::new(0);
-    /// Unused (kept zero for sampler layout).
-    pub static PARENT_TX_NS: AtomicU64 = AtomicU64::new(0);
-    /// Unused (kept zero for sampler layout).
-    pub static PARENT_OUT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Unused (kept zero for sampler layout).
-    pub static SPENT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Unused (kept zero for sampler layout).
-    pub static CB_HEIGHT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Wire bodies cloned from ConfirmParentCache.
-    pub static BODY_CACHE_MOVE: AtomicU64 = AtomicU64::new(0);
-    /// Wire bodies re-decoded from store (cache miss).
+    /// Wire bodies re-decoded from store.
     pub static BODY_STORE: AtomicU64 = AtomicU64::new(0);
     /// Wall ns spent in store body decode.
     pub static BODY_STORE_NS: AtomicU64 = AtomicU64::new(0);
-    /// Time waiting on ConfirmParentCache mutex (ns).
-    pub static CACHE_LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Unused (kept zero for sampler layout).
-    pub static THIN_CACHE_MOVE: AtomicU64 = AtomicU64::new(0);
-    /// Unused (kept zero for sampler layout).
-    pub static THIN_REBUILD: AtomicU64 = AtomicU64::new(0);
 
-    /// `(body, parent_tx, parent_out, spent, cb_height)` nanoseconds.
-    pub fn sample_and_reset() -> (u64, u64, u64, u64, u64) {
+    /// `(store_count, store_body_ns)`.
+    pub fn sample_store_and_reset() -> (u64, u64) {
         (
-            BODY_NS.swap(0, Ordering::Relaxed),
-            PARENT_TX_NS.swap(0, Ordering::Relaxed),
-            PARENT_OUT_NS.swap(0, Ordering::Relaxed),
-            SPENT_NS.swap(0, Ordering::Relaxed),
-            CB_HEIGHT_NS.swap(0, Ordering::Relaxed),
-        )
-    }
-
-    /// `(cache_move, store, thin_move, thin_rebuild)` counts since last sample.
-    pub fn sample_counts_and_reset() -> (u64, u64, u64, u64) {
-        (
-            BODY_CACHE_MOVE.swap(0, Ordering::Relaxed),
             BODY_STORE.swap(0, Ordering::Relaxed),
-            THIN_CACHE_MOVE.swap(0, Ordering::Relaxed),
-            THIN_REBUILD.swap(0, Ordering::Relaxed),
-        )
-    }
-
-    /// `(store_body_ns, cache_lock_wait_ns)`.
-    pub fn sample_io_and_reset() -> (u64, u64) {
-        (
             BODY_STORE_NS.swap(0, Ordering::Relaxed),
-            CACHE_LOCK_WAIT_NS.swap(0, Ordering::Relaxed),
         )
     }
 

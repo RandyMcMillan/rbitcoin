@@ -2,7 +2,7 @@
 
 use crate::cache::BlockCache;
 use crate::chain::{AcceptOutcome, ChainHub};
-use crate::codec::{FramedMessage, MAX_HEADERS_RESULTS, MAX_INV_SIZE};
+use crate::codec::{FramedMessage, MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR_SZ};
 use crate::error::NetError;
 use crate::msg_decode::decode_framed_offload;
 use crate::v2::{
@@ -11,7 +11,7 @@ use crate::v2::{
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::address::Address;
 use bitcoin::p2p::message::NetworkMessage;
-use bitcoin::p2p::message_blockdata::Inventory;
+use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 use bitcoin::p2p::message_compact_blocks::SendCmpct;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Magic, ServiceFlags, PROTOCOL_VERSION};
@@ -19,14 +19,45 @@ use bitcoin::BlockHash;
 use rbitcoin_query::Query;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
+
+/// Protocol version we advertise (BIP339 wtxidrelay needs ≥70016; rust-bitcoin's
+/// `PROTOCOL_VERSION` is still 70001).
+const OUR_PROTOCOL_VERSION: u32 = 70016;
+
+/// How often an established session re-issues `getheaders` so a quiet peer or
+/// a gap opened while we were offline still gets filled (signet ~10m blocks).
+const HEADERS_POLL_SECS: u64 = 120;
 
 /// Services we advertise once store-backed reconstruct serve is available.
 pub fn local_service_flags() -> ServiceFlags {
     ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2
+}
+
+/// Optional bookkeeping for outbound tip-follow sessions.
+#[derive(Clone, Default)]
+pub struct FollowSessionMeta {
+    /// Peer address (logging).
+    pub peer: Option<SocketAddr>,
+    /// Live outbound follow count (inc on start, dec on exit).
+    pub live: Option<Arc<AtomicUsize>>,
+}
+
+/// Decrements the live follow counter when a session task exits.
+/// Increment happens in [`crate::service::P2PNode::follow_from`] so the count
+/// is visible as soon as handshake succeeds (before the task is scheduled).
+struct LiveFollowDec(Option<Arc<AtomicUsize>>);
+
+impl Drop for LiveFollowDec {
+    fn drop(&mut self) {
+        if let Some(ref c) = self.0 {
+            c.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Open BIP324 v2 transport + perform the version/verack exchange.
@@ -64,7 +95,7 @@ async fn application_handshake(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let version = VersionMessage {
-        version: PROTOCOL_VERSION,
+        version: OUR_PROTOCOL_VERSION.max(PROTOCOL_VERSION),
         services,
         timestamp: now,
         receiver: Address::new(&their_addr, ServiceFlags::NONE),
@@ -100,6 +131,11 @@ async fn application_handshake(
     if inbound {
         write_v2_msg(writer, NetworkMessage::Version(version)).await?;
     }
+    // BIP339: wtxidrelay MUST be sent after version and before verack when both
+    // sides speak ≥70016. Late (post-verack) messages are ignored/invalid.
+    if their_version.version >= 70016 {
+        write_v2_msg(writer, NetworkMessage::WtxidRelay).await?;
+    }
     write_v2_msg(writer, NetworkMessage::Verack).await?;
 
     loop {
@@ -133,22 +169,33 @@ fn rand_nonce() -> u64 {
         .wrapping_add(seq.wrapping_mul(0xBF58_476D_1CE4_E5B9))
 }
 
-/// Bidirectional peer session: serve history, follow tip, announce our tip.
+/// Bidirectional peer session: serve history, tip follow, announce our tip.
 ///
-/// History catch-up is **not** done here — use [`crate::ibd`] / [`crate::service::P2PNode::sync`].
-/// This session only handles steady-state inv/headers/getdata serve + tip announce.
+/// After handshake preferences (`sendheaders` / `sendcmpct`), the session
+/// **actively** `getheaders` from our tip locator so blocks mined while we were
+/// offline or mid–SH materialize are pulled — not only unsolicited announces.
+/// Long history catch-up remains [`crate::ibd`] / [`crate::service::P2PNode::sync`].
 ///
 /// A dedicated writer drains outbound messages while the reader keeps draining
-/// the encrypted channel.
-pub async fn peer_session(
+/// the encrypted channel. `meta` labels the peer for logs and optionally tracks
+/// live outbound follow count.
+pub async fn peer_session_with(
     mut reader: V2Reader,
     mut writer: V2Writer,
     magic: Magic,
     hub: Arc<ChainHub>,
     mut tip_rx: broadcast::Receiver<crate::chain::TipEvent>,
+    meta: FollowSessionMeta,
 ) -> Result<(), NetError> {
+    let _live_dec = LiveFollowDec(meta.live.clone());
+    let peer_s = meta
+        .peer
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "peer".into());
+
     // Prefer headers announcements from peer; we do not send compact by default
     // (no mempool short-ids). Advertise we understand cmpct v1/v2 but request full blocks.
+    // (wtxidrelay is negotiated pre-verack in the handshake — BIP339.)
     let _ = write_v2_msg(&mut writer, NetworkMessage::SendHeaders).await;
     let _ = write_v2_msg(
         &mut writer,
@@ -158,8 +205,6 @@ pub async fn peer_session(
         }),
     )
     .await;
-    // Prefer wtxid inventory for txs when peers support it (BIP339).
-    let _ = write_v2_msg(&mut writer, NetworkMessage::WtxidRelay).await;
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<NetworkMessage>();
 
@@ -171,6 +216,11 @@ pub async fn peer_session(
         }
     });
 
+    // Bootstrap: ask for anything above our tip (critical after IBD disconnect).
+    if let Err(e) = queue_getheaders(&out_tx, hub.as_ref()) {
+        rbitcoin_log::warn!("p2p: {peer_s} initial getheaders queue failed: {e}");
+    }
+
     let mut peer_wants_headers = false;
     // Headers received while assembling a potential reorg branch (hash → header).
     let mut pending_headers: HashMap<BlockHash, bitcoin::block::Header> = HashMap::new();
@@ -179,6 +229,9 @@ pub async fn peer_session(
     // Txids we received from this peer (origin exclusion for announce).
     let mut from_this_peer: HashMap<bitcoin::Txid, ()> = HashMap::new();
     let mut tx_announce_rx = hub.mempool().map(|m| m.subscribe_announces());
+    let mut headers_poll = tokio::time::interval(Duration::from_secs(HEADERS_POLL_SECS));
+    // First tick completes immediately — skip so we don't double the bootstrap send.
+    headers_poll.tick().await;
 
     let result = async {
         loop {
@@ -192,6 +245,10 @@ pub async fn peer_session(
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     }
+                }
+                _ = headers_poll.tick() => {
+                    // Quiet peers / missed announces: re-pull from our tip locator.
+                    let _ = queue_getheaders(&out_tx, hub.as_ref());
                 }
                 ann = async {
                     if let Some(rx) = tx_announce_rx.as_mut() {
@@ -260,7 +317,40 @@ pub async fn peer_session(
     drop(out_tx);
     writer_task.abort();
     let _ = writer_task.await;
+    match &result {
+        Ok(()) => rbitcoin_log::info!("p2p: session {peer_s} closed"),
+        Err(e) => rbitcoin_log::warn!("p2p: session {peer_s} ended: {e}"),
+    }
     result
+}
+
+/// Tip locator for post-handshake `getheaders` (store chain; genesis fallback).
+pub(crate) fn tip_follow_locator(hub: &ChainHub) -> Vec<BlockHash> {
+    match hub.query.locator_hashes() {
+        Ok(mut v) if !v.is_empty() => {
+            if v.len() > MAX_LOCATOR_SZ {
+                v.truncate(MAX_LOCATOR_SZ);
+            }
+            v
+        }
+        _ => {
+            let mut v = Vec::new();
+            if let Some(t) = hub.tip_hash() {
+                v.push(t);
+            }
+            v.push(BlockHash::from_byte_array([0u8; 32]));
+            v
+        }
+    }
+}
+
+fn queue_getheaders(
+    out: &mpsc::UnboundedSender<NetworkMessage>,
+    hub: &ChainHub,
+) -> Result<(), NetError> {
+    let locator = tip_follow_locator(hub);
+    let gh = GetHeadersMessage::new(locator, BlockHash::from_byte_array([0u8; 32]));
+    queue_out(out, NetworkMessage::GetHeaders(gh))
 }
 
 async fn handle_peer_frame(
@@ -345,7 +435,8 @@ async fn handle_peer_frame(
         }
         NetworkMessage::Headers(headers) => {
             let mut want = Vec::new();
-            for hdr in headers.iter().take(MAX_HEADERS_RESULTS) {
+            let n = headers.len().min(MAX_HEADERS_RESULTS);
+            for hdr in headers.iter().take(n) {
                 let hash = hdr.block_hash();
                 pending_headers.insert(hash, *hdr);
                 if !hub.has_block(&hash) {
@@ -353,7 +444,14 @@ async fn handle_peer_frame(
                 }
             }
             if !want.is_empty() {
-                queue_out(out_tx, NetworkMessage::GetData(want))?;
+                // Cap getdata burst; remaining headers stay pending until bodies arrive.
+                for chunk in want.chunks(MAX_INV_SIZE.min(500)) {
+                    queue_out(out_tx, NetworkMessage::GetData(chunk.to_vec()))?;
+                }
+            }
+            // Full window ⇒ peer likely has more; walk forward with a new locator.
+            if n >= MAX_HEADERS_RESULTS {
+                let _ = queue_getheaders(out_tx, hub);
             }
         }
         NetworkMessage::Block(block) => {
@@ -552,6 +650,60 @@ fn block_for_peer(
     match query.reconstruct_block_by_hash(&hash.to_byte_array()) {
         Ok(b) => Ok(b),
         Err(e) => Err(NetError::Consensus(e.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_query::Query;
+
+    fn tmp_store(label: &str) -> (std::path::PathBuf, Query) {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-peer-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(&dir).unwrap();
+        (dir, q)
+    }
+
+    #[test]
+    fn tip_follow_locator_empty_store_has_genesis_zero() {
+        let (dir, q) = tmp_store("empty");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        let loc = tip_follow_locator(&hub);
+        assert!(!loc.is_empty());
+        assert_eq!(loc.last().unwrap().to_byte_array(), [0u8; 32]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tip_follow_locator_includes_tip_after_genesis() {
+        let (dir, q) = tmp_store("gen");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let loc = tip_follow_locator(&hub);
+        assert!(!loc.is_empty());
+        // Newest-first: tip hash is first.
+        assert_eq!(loc[0], hub.tip_hash().unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn live_follow_dec_on_drop() {
+        let c = Arc::new(AtomicUsize::new(2));
+        {
+            let _g = LiveFollowDec(Some(c.clone()));
+            assert_eq!(c.load(Ordering::SeqCst), 2);
+        }
+        assert_eq!(c.load(Ordering::SeqCst), 1);
     }
 }
 

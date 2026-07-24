@@ -240,6 +240,10 @@ async fn tip_follow_after_ibd() {
         .await
         .expect("ibd");
     peer.follow_from(seed.local_addr).await.expect("follow");
+    assert!(
+        peer.follow_live_count() >= 1,
+        "outbound follow session should be live"
+    );
 
     // Seed mines block 6 — inbound peer_session should announce to follower.
     let tip = seed.cache.tip_hash().unwrap();
@@ -258,6 +262,57 @@ async fn tip_follow_after_ibd() {
         .await
         .expect("tip follow");
     assert_eq!(peer.query.tip_height(), Some(Height(6)));
+
+    seed.shutdown().await;
+    peer.shutdown().await;
+}
+
+/// Regression: blocks mined while disconnected are pulled via post-connect
+/// `getheaders` (not only unsolicited inv/headers announces).
+///
+/// Models post-IBD SH materialize gap: follow peers connect after tip advanced
+/// on the network; without getheaders the follower would stall forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tip_follow_getheaders_catches_missed_blocks() {
+    let seed_dir = TempDir::new().unwrap();
+    let peer_dir = TempDir::new().unwrap();
+
+    let seed = start_node(&seed_dir).await;
+    seed_chain(&seed, 5).await;
+
+    let mut peer = start_node(&peer_dir).await;
+    sync_ibd(&peer, seed.local_addr).await;
+    peer.wait_height(5, Duration::from_secs(10))
+        .await
+        .expect("ibd");
+
+    // Peer is NOT following yet — mine several tips on the seed only.
+    let mut tip = seed.hub.tip_hash().unwrap();
+    let mut tip_time = seed
+        .query
+        .header_at_height(Height(5))
+        .unwrap()
+        .unwrap()
+        .1
+        .timestamp;
+    let mut last = tip;
+    for h in 6..=9 {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        tip = b.block_hash();
+        tip_time = b.header.time;
+        last = tip;
+        seed.ingest_block(h, b).unwrap();
+    }
+    assert_eq!(peer.query.tip_height(), Some(Height(5)));
+    assert_eq!(seed.query.tip_height(), Some(Height(9)));
+
+    // Connect follow — session must getheaders + getdata the gap.
+    peer.follow_from(seed.local_addr).await.expect("follow");
+    peer.wait_tip_hash(last, Duration::from_secs(15))
+        .await
+        .expect("getheaders gap fill");
+    assert_eq!(peer.query.tip_height(), Some(Height(9)));
+    assert_eq!(peer.follow_live_count(), 1);
 
     seed.shutdown().await;
     peer.shutdown().await;

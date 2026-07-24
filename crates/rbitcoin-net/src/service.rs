@@ -4,7 +4,7 @@ use crate::cache::BlockCache;
 use crate::chain::{AcceptOutcome, ChainHub};
 use crate::error::NetError;
 use crate::ibd::IbdConfig;
-use crate::peer::{connect_and_handshake, peer_session};
+use crate::peer::{connect_and_handshake, peer_session_with, FollowSessionMeta};
 use bitcoin::p2p::Magic;
 use bitcoin::Block;
 use bitcoin::BlockHash;
@@ -12,7 +12,7 @@ use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_primitives::Network as RNetwork;
 use rbitcoin_query::Query;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -45,6 +45,8 @@ pub struct P2PNode {
     pub local_addr: SocketAddr,
     magic: Magic,
     shutdown: Arc<AtomicBool>,
+    /// Live outbound tip-follow sessions (inc/dec inside session task).
+    follow_live: Arc<AtomicUsize>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -101,15 +103,19 @@ impl P2PNode {
                                 Ok(x) => x,
                                 Err(e) => {
                                     // V1-only peers fail BIP324; log once-style message.
-                                    eprintln!("ibd: inbound handshake {peer_addr} failed: {e}");
+                                    rbitcoin_log::debug!(
+                                        "p2p: inbound handshake {peer_addr} failed: {e}"
+                                    );
                                     return;
                                 }
                             };
-                            // Inbound: serve + tip announce only (no catch-up on this path).
-                            if let Err(e) = peer_session(reader, writer, magic_c, hub, tip_rx).await
-                            {
-                                eprintln!("ibd: inbound session {peer_addr} ended: {e}");
-                            }
+                            // Inbound: serve + tip announce + active getheaders pull.
+                            let meta = FollowSessionMeta {
+                                peer: Some(peer_addr),
+                                live: None,
+                            };
+                            let _ =
+                                peer_session_with(reader, writer, magic_c, hub, tip_rx, meta).await;
                         });
                     }
                     Ok(Err(_)) => break,
@@ -125,8 +131,14 @@ impl P2PNode {
             local_addr,
             magic,
             shutdown,
+            follow_live: Arc::new(AtomicUsize::new(0)),
             tasks: vec![accept_task],
         })
+    }
+
+    /// Number of live outbound tip-follow sessions.
+    pub fn follow_live_count(&self) -> usize {
+        self.follow_live.load(Ordering::SeqCst)
     }
 
     pub fn handle(&self) -> P2PHandle {
@@ -186,7 +198,9 @@ impl P2PNode {
 
     /// Persistent outbound peer: tip-follow + announce for the session lifetime.
     ///
-    /// Does **not** download history — call [`Self::sync`] first when behind.
+    /// After handshake the session sends `getheaders` from our tip locator so
+    /// any gap (e.g. blocks mined during SH materialize) is filled actively.
+    /// Call [`Self::sync`] first when far behind (multi-thousand height IBD).
     pub async fn follow_from(&mut self, peer: SocketAddr) -> Result<(), NetError> {
         let stream = TcpStream::connect(peer).await?;
         let height = self.tip_height().map(|h| h as i32).unwrap_or(0);
@@ -202,8 +216,15 @@ impl P2PNode {
         let hub = self.hub.clone();
         let tip_rx = hub.subscribe_tips();
         let magic = self.magic;
+        let live = self.follow_live.clone();
+        // Count as live now (handshake done); session task decrements on exit.
+        live.fetch_add(1, Ordering::SeqCst);
+        let meta = FollowSessionMeta {
+            peer: Some(peer),
+            live: Some(live),
+        };
         let task = tokio::spawn(async move {
-            let _ = peer_session(reader, writer, magic, hub, tip_rx).await;
+            let _ = peer_session_with(reader, writer, magic, hub, tip_rx, meta).await;
         });
         self.tasks.push(task);
         Ok(())

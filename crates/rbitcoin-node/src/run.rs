@@ -381,7 +381,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     // Persistent follow: stay connected for tip relay after catch-up.
     // Bound each connect so a single dead seed cannot stall post-IBD for minutes
     // (OS TCP timeouts are often 2+ min; IBD dial already uses 8s).
-    let mut follow_peers = 0usize;
+    // Each session actively getheaders from tip (fills gaps after SH materialize).
     if !shutdown.requested() {
         let follow_n = targets.len().min(max_out.min(3));
         const FOLLOW_CONNECT_SECS: u64 = 8;
@@ -401,8 +401,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 ) => {
                     match result {
                         Ok(Ok(())) => {
-                            info!("node: following peer[{i}] {peer}");
-                            follow_peers += 1;
+                            info!(
+                                "node: following peer[{i}] {peer} (live={})",
+                                node.follow_live_count()
+                            );
                         }
                         Ok(Err(e)) => warn!("node: follow {peer} failed: {e}"),
                         Err(_) => warn!(
@@ -412,7 +414,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 }
             }
         }
-        if follow_peers == 0 && !targets.is_empty() {
+        if node.follow_live_count() == 0 && !targets.is_empty() {
             warn!("node: no follow peers connected — tip announce may stall");
         }
     }
@@ -526,13 +528,14 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             let elapsed = started.elapsed().as_secs().max(1);
             let delta = tip.saturating_sub(start_tip);
 
+            let follow_live = node.follow_live_count();
             if let Wake::Tip(ev) = &wake {
                 // Prefer event height when present (same as store tip after accept).
                 let h = ev.height;
                 if h != last_tip {
                     let rate = delta as f64 / elapsed as f64;
                     info!(
-                        "node: tip={h} (+{delta} since start, ~{rate:.2} blk/s, elapsed {elapsed}s, follow peers={follow_peers})"
+                        "node: tip={h} (+{delta} since start, ~{rate:.2} blk/s, elapsed {elapsed}s, follow_live={follow_live})"
                     );
                     last_tip = h;
                     last_tip_change = Instant::now();
@@ -544,7 +547,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             if tip != last_tip {
                 let rate = delta as f64 / elapsed as f64;
                 info!(
-                    "node: tip={tip} (+{delta} since start, ~{rate:.2} blk/s, elapsed {elapsed}s, follow peers={follow_peers})"
+                    "node: tip={tip} (+{delta} since start, ~{rate:.2} blk/s, elapsed {elapsed}s, follow_live={follow_live})"
                 );
                 last_tip = tip;
                 last_tip_change = Instant::now();
@@ -559,7 +562,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 continue;
             }
 
-            // Stale tip: dial one more outbound looking for a higher tip (Core-ish).
+            // Stale tip: dial one more outbound. New sessions always getheaders from
+            // our locator (existing live sessions also re-poll every 2m).
             last_tip_change = Instant::now(); // rate-limit reconnect attempts
             let extra = addrman.take_outbound_offset(1, seed_offset);
             seed_offset = seed_offset.saturating_add(1);
@@ -569,7 +573,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 }
                 if catch_up_complete {
                     info!(
-                        "node: tip may be stale (height={tip}, no update ≥{STALE_TIP_SECS}s) — connecting {peer} for a higher tip"
+                        "node: tip may be stale (height={tip}, no update ≥{STALE_TIP_SECS}s, follow_live={follow_live}) — connecting {peer} for a higher tip"
                     );
                     tokio::select! {
                         biased;
@@ -580,8 +584,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         ) => {
                             match result {
                                 Ok(Ok(())) => {
-                                    follow_peers += 1;
-                                    info!("node: added follow peer {peer} (follow peers={follow_peers})");
+                                    info!(
+                                        "node: added follow peer {peer} (follow_live={})",
+                                        node.follow_live_count()
+                                    );
                                 }
                                 Ok(Err(e)) => warn!("node: stale-tip peer {peer} failed: {e}"),
                                 Err(_) => warn!("node: stale-tip peer {peer} connect timed out"),

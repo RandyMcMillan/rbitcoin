@@ -673,14 +673,24 @@ impl ScriptHashTable {
 
     /// Start a buffered cold bulk session (historical migration builder path).
     ///
-    /// Pre-sizes head for `expected_keys` (overestimate is fine). Continues
-    /// from the current alloc bump so a reinit'd empty table starts at the
-    /// payload origin. Exclusive: no concurrent SH readers/writers until
-    /// [`ScriptHashBulkSession::finish`].
+    /// Pre-sizes **empty** head shards for `expected_keys` so each shard can be
+    /// bulk-filled from RAM once at [`ScriptHashBulkSession::finish`]. Head
+    /// values are deferred (per-shard buckets) until finish — no intermediate
+    /// open-address RMW. Continues from the current alloc bump. Exclusive until
+    /// finish.
     pub fn bulk_session(&self, expected_keys: u64) -> Result<ScriptHashBulkSession<'_>, StoreError> {
-        if expected_keys > 0 {
-            self.head.reserve_additional(expected_keys)?;
+        if !self.head.is_empty() {
+            return Err(StoreError::Corrupt(
+                "scripthash bulk_session requires empty head (reinit first)",
+            ));
         }
+        if expected_keys > 0 {
+            self.head.reserve_for_cold_bulk(expected_keys)?;
+        }
+        let n_shards = self.head.shard_count().max(1);
+        let per_cap = (expected_keys as usize)
+            .div_ceil(n_shards)
+            .saturating_add(1);
         let (bump, live_count) = {
             let a = self.alloc.lock().unwrap();
             (a.bump, a.live_count)
@@ -689,7 +699,9 @@ impl ScriptHashTable {
             table: self,
             bump,
             live_count,
-            head_buf: Vec::with_capacity(BULK_HEAD_FLUSH.min(expected_keys as usize + 1)),
+            head_shards: (0..n_shards)
+                .map(|_| Vec::with_capacity(per_cap.min(1 << 20)))
+                .collect(),
             body_buf: Vec::with_capacity(BULK_BODY_FLUSH.min(4 << 20)),
             body_write_off: bump,
             finished: false,
@@ -701,21 +713,22 @@ impl ScriptHashTable {
 /// Buffered bulk writer for cold SH materialize (revived from migration
 /// `ScriptHashBulkBuilder`).
 ///
-/// Streams complete per-key create chains via [`put_chain`], buffering body
-/// slabs (~16 MiB) and head inserts (65 536) before disk RMW. Call
-/// [`finish`] once at the end so the alloc header is written a single time.
+/// Streams complete per-key create chains via [`put_chain`]: body slabs buffer
+/// (~16 MiB); **heads are deferred** into per-shard buckets and written once at
+/// [`finish`] with a single empty-table bulk fill per shard (full shard image
+/// in RAM, one sequential write).
 pub struct ScriptHashBulkSession<'a> {
     table: &'a ScriptHashTable,
     bump: u64,
     live_count: u64,
-    head_buf: Vec<([u8; 32], ShHeadValue)>,
+    /// Per-shard deferred heads (index = [`ShardedScriptHashHead::shard_index`]).
+    head_shards: Vec<Vec<([u8; 32], ShHeadValue)>>,
     body_buf: Vec<u8>,
     body_write_off: u64,
     finished: bool,
     keys_written: u64,
 }
 
-const BULK_HEAD_FLUSH: usize = 65_536;
 const BULK_BODY_FLUSH: usize = 16 * 1024 * 1024;
 
 impl<'a> ScriptHashBulkSession<'a> {
@@ -776,10 +789,9 @@ impl<'a> ScriptHashBulkSession<'a> {
             }
         };
 
-        self.head_buf.push((key, val));
-        if self.head_buf.len() >= BULK_HEAD_FLUSH {
-            self.flush_heads()?;
-        }
+        // Defer head durable write until finish (one bulk_fill_empty per shard).
+        let si = self.table.head.shard_index(&key);
+        self.head_shards[si].push((key, val));
         Ok(())
     }
 
@@ -840,23 +852,17 @@ impl<'a> ScriptHashBulkSession<'a> {
         Ok(())
     }
 
-    fn flush_heads(&mut self) -> Result<(), StoreError> {
-        if self.head_buf.is_empty() {
+    fn flush_heads_cold(&mut self) -> Result<(), StoreError> {
+        if self.head_shards.iter().all(|b| b.is_empty()) {
             return Ok(());
         }
-        // No per-shard flush during bulk: keep dirty pages and rely on
-        // finish / table.flush. Matches historical migration builder.
-        self.table
-            .head
-            .insert_many_sharded(&self.head_buf, false)?;
-        self.head_buf.clear();
-        Ok(())
+        self.table.head.bulk_fill_shards_cold(&mut self.head_shards)
     }
 
-    /// Flush body + heads + alloc header. Marks the session finished.
+    /// Flush body + deferred heads (one bulk fill per empty shard) + alloc header.
     pub fn finish(mut self) -> Result<(u64, u64), StoreError> {
         self.flush_body()?;
-        self.flush_heads()?;
+        self.flush_heads_cold()?;
         if self.bump > self.table.body.logical_len() {
             self.table.body.set_logical_len(self.bump)?;
         }
@@ -879,7 +885,7 @@ impl Drop for ScriptHashBulkSession<'_> {
         }
         // Best-effort publish of partial state so reinit/entry_count stay honest.
         let _ = self.flush_body();
-        let _ = self.flush_heads();
+        let _ = self.flush_heads_cold();
         if self.bump > self.table.body.logical_len() {
             let _ = self.table.body.set_logical_len(self.bump);
         }
@@ -1234,6 +1240,48 @@ mod tests {
         assert_eq!(n, 3);
         assert_eq!(t.entries(&sh).unwrap().len(), 3);
         assert_eq!(t.entry_count(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bulk_session_defers_heads_past_old_flush_threshold() {
+        // Regression: heads must stay empty until finish so every shard uses
+        // bulk_fill_empty once (not open-address RMW after a 65k intermediate flush).
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        const N: u32 = 80_000;
+        // Unique 16 B head prefixes (head truncates full 32 B to 16 B).
+        let key = |i: u32| {
+            let mut sh = [0u8; 32];
+            sh[0..4].copy_from_slice(&i.to_le_bytes());
+            sh[4] = (i >> 8) as u8; // spread across shard byte for multi-shard
+            sh
+        };
+        let mut session = t.bulk_session(u64::from(N)).unwrap();
+        assert!(t.head_value(&key(0)).unwrap().is_none());
+        for i in 0..N {
+            let sh = key(i);
+            session
+                .put_chain(sh, &[ShEntry::new(Fk(u64::from(i) + 1))])
+                .unwrap();
+            // Mid-session: durable head still empty (deferred).
+            if i == 70_000 {
+                assert!(
+                    t.head_value(&sh).unwrap().is_none(),
+                    "heads must not land before finish"
+                );
+            }
+        }
+        let (creates, keys) = session.finish().unwrap();
+        assert_eq!(creates, u64::from(N));
+        assert_eq!(keys, u64::from(N));
+        assert_eq!(t.entry_count(), u64::from(N));
+        // Spot-check a few keys survive bulk fill.
+        for i in [0u32, 1, 65_535, 70_000, N - 1] {
+            let ents = t.entries(&key(i)).unwrap();
+            assert_eq!(ents.len(), 1, "i={i}");
+            assert_eq!(ents[0].1.create_tx_fk, Fk(u64::from(i) + 1));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

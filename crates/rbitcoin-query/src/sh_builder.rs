@@ -269,8 +269,8 @@ impl ShRunBuilder {
             claimed.len()
         );
         let t0 = Instant::now();
-        // One buffered bulk session (historical ScriptHashBulkBuilder): pre-size
-        // head, 16 MiB body buffer, 65k head insert batches, single alloc finish.
+        // One buffered bulk session: pre-size empty head shards, 16 MiB body
+        // buffer, deferred heads → one bulk_fill_empty per shard at finish.
         // Stream k-way merge into complete put_chain calls (key changes).
         // expected_keys ≈ total creates (overestimate unique keys; reserve is cheap).
         let mut session = store.scripthash.bulk_session(total_recs.max(1))?;

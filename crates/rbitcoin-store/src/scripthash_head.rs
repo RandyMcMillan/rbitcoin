@@ -291,6 +291,10 @@ impl ScriptHashHead {
         min.next_power_of_two().max(DEFAULT_SLOTS)
     }
 
+    pub fn occupied(&self) -> u64 {
+        self.state.lock().unwrap().occupied
+    }
+
     pub fn reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
         if additional == 0 {
             return Ok(());
@@ -301,8 +305,38 @@ impl ScriptHashHead {
         };
         let need = Self::slots_for_keys(occupied.saturating_add(additional));
         if need > slots {
-            self.rehash_to(need)?;
+            if occupied == 0 {
+                // Cold bulk: grow empty table without scanning zeros.
+                self.grow_empty_to(need)?;
+            } else {
+                self.rehash_to(need)?;
+            }
         }
+        Ok(())
+    }
+
+    /// Expand an **empty** open-address table to `new_slots` (power of two).
+    ///
+    /// Used by cold materialize so pre-size is fallocate/zero only — no slot scan.
+    fn grow_empty_to(&self, new_slots: u64) -> Result<(), StoreError> {
+        let new_slots = new_slots.max(2).next_power_of_two();
+        let (old_slots, occupied) = {
+            let state = self.state.lock().unwrap();
+            (state.slots, state.occupied)
+        };
+        if occupied != 0 {
+            return self.rehash_to(new_slots);
+        }
+        if new_slots <= old_slots {
+            return Ok(());
+        }
+        let new_bytes = SH_HEAD_SLOT_SIZE as u64 * new_slots;
+        let need = FILE_HEADER_LEN as u64 + new_bytes;
+        self.file.ensure_capacity(need)?;
+        self.file.set_logical_len(need)?;
+        // Zero full body (new region may reuse stale bytes past old logical len).
+        self.file.zero_range(FILE_HEADER_LEN as u64, new_bytes)?;
+        self.state.lock().unwrap().slots = new_slots;
         Ok(())
     }
 
@@ -651,6 +685,21 @@ impl ShardedScriptHashHead {
         self.shards[self.shard_of(key)].clear_key(key)
     }
 
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Shard index for a full Electrum scripthash (same as insert routing).
+    #[inline]
+    pub fn shard_index(&self, full: &[u8; 32]) -> usize {
+        self.shard_of(full)
+    }
+
+    /// True when every shard has zero occupied slots (cold bulk fill precondition).
+    pub fn is_empty(&self) -> bool {
+        self.shards.iter().all(|s| s.occupied() == 0)
+    }
+
     /// Pre-size shards for an upcoming bulk insert (`additional` keys globally).
     pub fn reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
         if self.shards.is_empty() {
@@ -660,6 +709,62 @@ impl ShardedScriptHashHead {
         let per = additional.div_ceil(self.shards.len() as u64).max(1);
         for s in &self.shards {
             s.reserve_additional(per)?;
+        }
+        Ok(())
+    }
+
+    /// Pre-size every **empty** shard so a single RAM [`ScriptHashHead::insert_many`]
+    /// bulk-fill can place `expected_keys` (global) without mid-fill rehash.
+    ///
+    /// Inflates by 25% then even-splits across shards (margin for `key[0] % n` skew).
+    /// Slot table bytes = `slots × 32`; that is the peak RAM for one
+    /// `bulk_fill_empty` (one shard at a time at finish).
+    pub fn reserve_for_cold_bulk(&self, expected_keys: u64) -> Result<(), StoreError> {
+        if expected_keys == 0 {
+            return Ok(());
+        }
+        if !self.is_empty() {
+            return Err(StoreError::Corrupt(
+                "scripthash head reserve_for_cold_bulk: head not empty",
+            ));
+        }
+        let inflated = expected_keys.saturating_mul(5).div_ceil(4).max(1);
+        self.reserve_additional(inflated)
+    }
+
+    /// Cold materialize: one empty-table bulk fill per shard, releasing each
+    /// bucket before the next so only one full shard image is in RAM.
+    ///
+    /// `buckets[i]` must contain only keys for shard `i`. Consumes the vectors.
+    /// Requires every shard to be empty (call after reinit / fresh create and
+    /// [`reserve_for_cold_bulk`]).
+    pub fn bulk_fill_shards_cold(
+        &self,
+        buckets: &mut [Vec<([u8; 32], ShHeadValue)>],
+    ) -> Result<(), StoreError> {
+        if buckets.len() != self.shards.len() {
+            return Err(StoreError::Corrupt(
+                "scripthash bulk_fill_shards_cold: bucket/shard count mismatch",
+            ));
+        }
+        for (i, s) in self.shards.iter().enumerate() {
+            if s.occupied() != 0 {
+                return Err(StoreError::Corrupt(
+                    "scripthash bulk_fill_shards_cold: shard not empty",
+                ));
+            }
+            let mut bucket = std::mem::take(&mut buckets[i]);
+            if bucket.is_empty() {
+                continue;
+            }
+            // Ensure capacity for this shard's actual key count (skew).
+            s.reserve_additional(bucket.len() as u64)?;
+            // insert_many → bulk_fill_empty while occupied==0: one RAM table + write.
+            s.insert_many(&bucket)?;
+            // Drop entries before building the next shard image.
+            bucket.clear();
+            bucket.shrink_to_fit();
+            drop(bucket);
         }
         Ok(())
     }

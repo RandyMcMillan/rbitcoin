@@ -11,8 +11,8 @@ use crate::error::StoreError;
 use crate::var_table::VarTable;
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -600,8 +600,12 @@ pub fn is_packed_tx_payload(raw: &[u8]) -> bool {
 }
 
 /// In-progress sequential `tx.head` rebuild (shadow filled from `tx.idx` order).
+///
+/// `shadow` is [`Arc`] so [`Self::head_resize_poll`] can fill **without** holding
+/// `resize` Mutex across body/idx IO — that lock is also taken by every archive
+/// `head_insert_many` (`maybe_start_head_resize` / `head_resize_in_progress`).
 struct HeadResize {
-    shadow: AddressHead,
+    shadow: Arc<AddressHead>,
     cursor: u64,
     target: HeadLayout,
 }
@@ -623,6 +627,9 @@ pub struct TxTable {
     /// Directory containing `tx.head` (for rename / control paths).
     head_path: PathBuf,
     resize: Mutex<Option<HeadResize>>,
+    /// True from resize start until swap completes (or abandoned). Survives brief
+    /// windows where `resize` Mutex holds `None` while closing the shadow Arc.
+    resize_active: AtomicBool,
     /// Background sequential fill for `tx.head.new` (independent of archive inserts).
     resize_bg: Mutex<Option<JoinHandle<()>>>,
     /// Generation of the live bg worker; bump to ask a previous worker to exit.
@@ -654,6 +661,7 @@ impl TxTable {
             head: RwLock::new(AddressHead::create_with_layout(&head_path, layout)?),
             head_path,
             resize: Mutex::new(None),
+            resize_active: AtomicBool::new(false),
             resize_bg: Mutex::new(None),
             resize_bg_gen: AtomicU64::new(0),
         })
@@ -696,6 +704,7 @@ impl TxTable {
             head: RwLock::new(head),
             head_path,
             resize: Mutex::new(None),
+            resize_active: AtomicBool::new(false),
             resize_bg: Mutex::new(None),
             resize_bg_gen: AtomicU64::new(0),
         };
@@ -2245,7 +2254,8 @@ impl TxTable {
 
     /// True if a sequential head rebuild is in progress.
     pub fn head_resize_in_progress(&self) -> bool {
-        self.resize.lock().unwrap().is_some()
+        self.resize_active.load(AtomicOrdering::Acquire)
+            || self.resize.lock().unwrap().is_some()
     }
 
     /// Resume incomplete resize from `tx.head.resize` control file (on open).
@@ -2262,12 +2272,16 @@ impl TxTable {
         let shadow_path = shadow_head_path(&self.head_path);
         if !shadow_path.exists() {
             // Control without shadow: restart shadow create.
-            let shadow = AddressHead::create_with_layout(&shadow_path, ctrl.target)?;
+            let shadow = Arc::new(AddressHead::create_with_layout(
+                &shadow_path,
+                ctrl.target,
+            )?);
             *self.resize.lock().unwrap() = Some(HeadResize {
                 shadow,
                 cursor: ctrl.cursor.max(1),
                 target: ctrl.target,
             });
+            self.resize_active.store(true, AtomicOrdering::Release);
             rbitcoin_log::info!(
                 "store: resume tx.head resize bits={} entry={}B cursor={}",
                 ctrl.target.bits,
@@ -2277,7 +2291,7 @@ impl TxTable {
             self.ensure_resize_bg_running();
             return Ok(());
         }
-        let shadow = AddressHead::open(&shadow_path)?;
+        let shadow = Arc::new(AddressHead::open(&shadow_path)?);
         if shadow.layout() != ctrl.target {
             return Err(StoreError::Corrupt(
                 "tx.head.resize layout mismatch vs shadow",
@@ -2288,6 +2302,7 @@ impl TxTable {
             cursor: ctrl.cursor.max(1),
             target: ctrl.target,
         });
+        self.resize_active.store(true, AtomicOrdering::Release);
         rbitcoin_log::info!(
             "store: resume tx.head resize bits={} entry={}B cursor={}",
             ctrl.target.bits,
@@ -2379,7 +2394,7 @@ impl TxTable {
         let shadow_path = shadow_head_path(&self.head_path);
         let _ = std::fs::remove_file(&shadow_path);
         crate::address_head::remove_legacy_meta_sidecar(&shadow_path);
-        let shadow = AddressHead::create_with_layout(&shadow_path, target)?;
+        let shadow = Arc::new(AddressHead::create_with_layout(&shadow_path, target)?);
         let gen = self.head.read().unwrap().generation();
         let ctrl = ResizeControl {
             target,
@@ -2404,6 +2419,7 @@ impl TxTable {
             cursor: 1,
             target,
         });
+        self.resize_active.store(true, AtomicOrdering::Release);
         drop(rg);
         self.ensure_resize_bg_running();
         Ok(())
@@ -2473,14 +2489,17 @@ impl TxTable {
     /// Does **not** dual-write live inserts — only `tx.idx` order into shadow.
     /// Body txids are read in bulk (io_uring / parallel pread); shadow inserts
     /// remain ordered `insert_many` on `tx.head.new`.
+    ///
+    /// **Lock discipline:** `resize` Mutex is held only to snapshot `(shadow, cursor)`
+    /// and later to commit the cursor. Fill IO runs **without** the mutex so archive
+    /// `head_insert_many` → `maybe_start_head_resize` is not blocked for whole waves.
     pub fn head_resize_poll(&self, budget: u64) -> Result<(), StoreError> {
         if budget == 0 {
             return Ok(());
         }
         let n = self.count();
-        let mut done_fill = false;
-        let mut progress_log: Option<(u64, u64, u32)> = None;
-        {
+        // Snapshot under lock — do not hold across body_txid_range / insert_many.
+        let work: Option<(Arc<AddressHead>, u64, u64, HeadLayout)> = {
             let mut rg = self.resize.lock().unwrap();
             let Some(r) = rg.as_mut() else {
                 return Ok(());
@@ -2489,45 +2508,66 @@ impl TxTable {
                 r.cursor = 1;
             }
             if n == 0 || r.cursor > n {
-                done_fill = true;
+                None
             } else {
                 let start = r.cursor;
                 let end = (r.cursor + budget - 1).min(n);
-                self.shadow_fill_fk_range(&r.shadow, r.cursor, end)?;
-                r.cursor = end + 1;
-                write_resize_control(
-                    &self.head_path,
-                    &ResizeControl {
-                        target: r.target,
-                        cursor: r.cursor,
-                        generation: self.head.read().unwrap().generation(),
-                    },
-                )?;
-                // Progress log every ~1M Class A fks advanced (or when finishing).
-                // Bg waves are 1M; this aligns with one INFO per wave.
-                let advanced = r.cursor.saturating_sub(start);
-                let milestone = r.cursor > 1
-                    && (r.cursor / 1_000_000 > start.saturating_sub(1) / 1_000_000
-                        || r.cursor > n
-                        || advanced >= 1_000_000);
-                if milestone {
-                    progress_log = Some((r.cursor.saturating_sub(1), n, r.target.bits));
-                }
-                if r.cursor > n {
-                    done_fill = true;
-                }
+                Some((Arc::clone(&r.shadow), start, end, r.target))
             }
-        }
-        if let Some((cur, total, bits)) = progress_log {
-            let pct = if total > 0 {
-                100.0 * (cur as f64) / (total as f64)
-            } else {
-                100.0
-            };
-            rbitcoin_log::info!(
-                "store: tx.head resize progress cursor={cur}/{total} ({pct:.1}%) target_bits={bits}"
-            );
-        }
+        };
+
+        let done_fill = match work {
+            None => true,
+            Some((shadow, start, end, target)) => {
+                self.shadow_fill_fk_range(&shadow, start, end)?;
+                let mut progress_log: Option<(u64, u64, u32)> = None;
+                let mut done = false;
+                {
+                    let mut rg = self.resize.lock().unwrap();
+                    let Some(r) = rg.as_mut() else {
+                        return Ok(());
+                    };
+                    // Only one bg filler; still refuse to rewind if something advanced.
+                    if r.cursor != start {
+                        return Ok(());
+                    }
+                    r.cursor = end + 1;
+                    let gen = self.head.read().unwrap().generation();
+                    write_resize_control(
+                        &self.head_path,
+                        &ResizeControl {
+                            target,
+                            cursor: r.cursor,
+                            generation: gen,
+                        },
+                    )?;
+                    let advanced = r.cursor.saturating_sub(start);
+                    let n_now = self.count();
+                    let milestone = r.cursor > 1
+                        && (r.cursor / 1_000_000 > start.saturating_sub(1) / 1_000_000
+                            || r.cursor > n_now
+                            || advanced >= 1_000_000);
+                    if milestone {
+                        progress_log =
+                            Some((r.cursor.saturating_sub(1), n_now, r.target.bits));
+                    }
+                    if r.cursor > n_now {
+                        done = true;
+                    }
+                }
+                if let Some((cur, total, bits)) = progress_log {
+                    let pct = if total > 0 {
+                        100.0 * (cur as f64) / (total as f64)
+                    } else {
+                        100.0
+                    };
+                    rbitcoin_log::info!(
+                        "store: tx.head resize progress cursor={cur}/{total} ({pct:.1}%) target_bits={bits}"
+                    );
+                }
+                done
+            }
+        };
         if done_fill {
             self.try_complete_head_resize()?;
         }
@@ -2542,29 +2582,51 @@ impl TxTable {
             "store: tx.head resize fill done — final catch-up + swap (shadow → primary)"
         );
 
-        // Phase 1: catch-up + flush **without** exclusive `head.write()` so we do
-        // not block forever behind long head-resolve batches (sole inserter is us).
+        // Phase 1: catch-up + flush **without** exclusive `head.write()` and
+        // **without** holding `resize` across fill IO (same archive-stall fix as poll).
         {
             let n = self.count();
-            let mut rg = self.resize.lock().unwrap();
-            let Some(r) = rg.as_mut() else {
+            let snap = {
+                let rg = self.resize.lock().unwrap();
+                rg.as_ref().map(|r| (Arc::clone(&r.shadow), r.cursor, r.target))
+            };
+            let Some((shadow, mut cursor, target)) = snap else {
                 return Ok(());
             };
-            if r.cursor <= n {
-                self.shadow_fill_fk_range(&r.shadow, r.cursor, n)?;
-                r.cursor = n + 1;
+            if cursor == 0 {
+                cursor = 1;
+            }
+            if cursor <= n {
+                self.shadow_fill_fk_range(&shadow, cursor, n)?;
+                cursor = n + 1;
             }
             let n2 = self.count();
-            if r.cursor <= n2 {
-                self.shadow_fill_fk_range(&r.shadow, r.cursor, n2)?;
-                r.cursor = n2 + 1;
+            if cursor <= n2 {
+                self.shadow_fill_fk_range(&shadow, cursor, n2)?;
+                cursor = n2 + 1;
+            }
+            {
+                let mut rg = self.resize.lock().unwrap();
+                let Some(r) = rg.as_mut() else {
+                    return Ok(());
+                };
+                r.cursor = cursor;
+                let gen = self.head.read().unwrap().generation();
+                write_resize_control(
+                    &self.head_path,
+                    &ResizeControl {
+                        target,
+                        cursor: r.cursor,
+                        generation: gen,
+                    },
+                )?;
             }
             rbitcoin_log::info!(
                 "store: tx.head resize flushing shadow (cursor={}, n={})",
-                r.cursor.saturating_sub(1),
+                cursor.saturating_sub(1),
                 n2.max(n)
             );
-            r.shadow.flush()?;
+            shadow.flush()?;
         }
 
         // Phase 2: exclusive head ownership for rename + reopen. Use try_write so
@@ -2607,29 +2669,62 @@ impl TxTable {
         }
 
         let primary_writes = head_w.lock_writes();
-        // One more catch-up under exclusive insert barrier.
+        // One more catch-up under exclusive insert barrier (archive paused).
+        // Still avoid holding `resize` for the fill itself.
         let n3 = self.count();
-        let mut rg = self.resize.lock().unwrap();
-        let Some(r) = rg.as_mut() else {
-            return Ok(());
+        let (shadow, mut cursor, target) = {
+            let rg = self.resize.lock().unwrap();
+            let Some(r) = rg.as_ref() else {
+                return Ok(());
+            };
+            (Arc::clone(&r.shadow), r.cursor, r.target)
         };
-        if r.cursor <= n3 {
-            self.shadow_fill_fk_range(&r.shadow, r.cursor, n3)?;
-            r.cursor = n3 + 1;
-            r.shadow.flush()?;
+        if cursor == 0 {
+            cursor = 1;
         }
-        let target = r.target;
+        if cursor <= n3 {
+            self.shadow_fill_fk_range(&shadow, cursor, n3)?;
+            cursor = n3 + 1;
+            shadow.flush()?;
+        }
+        drop(shadow);
         let new_gen = head_w.generation().saturating_add(1);
         let shadow_path = shadow_head_path(&self.head_path);
         let bak = bak_head_path(&self.head_path);
         let _ = std::fs::remove_file(&bak);
-        let _shadow = match rg.take() {
-            Some(s) => s.shadow,
-            None => return Ok(()),
+
+        // Take ownership of HeadResize and wait until we hold the **only** Arc to
+        // the shadow AddressHead. Concurrent `head_resize_poll` clones must drop
+        // before rename or mmap/FD is double-closed (IO Safety abort).
+        let hr = {
+            let mut rg = self.resize.lock().unwrap();
+            let Some(mut r) = rg.take() else {
+                return Ok(());
+            };
+            r.cursor = cursor;
+            r
         };
-        drop(_shadow);
+        let wait_arc = Instant::now();
+        let mut spins = 0u32;
+        while Arc::strong_count(&hr.shadow) > 1 {
+            spins = spins.saturating_add(1);
+            if spins == 1 || spins % 200 == 0 {
+                rbitcoin_log::info!(
+                    "store: tx.head resize waiting for shadow Arc exclusive \
+                     (strong={}, {:?})",
+                    Arc::strong_count(&hr.shadow),
+                    wait_arc.elapsed()
+                );
+            }
+            if self.resize_bg_gen.load(AtomicOrdering::Acquire) != gen_at_start {
+                // Put resize back so Drop/resume can clean up; abandon swap.
+                *self.resize.lock().unwrap() = Some(hr);
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(hr); // closes shadow mmap/FD on tx.head.new
         drop(primary_writes);
-        drop(rg);
 
         rbitcoin_log::info!(
             "store: tx.head resize renaming shadow → primary (bits={} slots={})",
@@ -2647,6 +2742,7 @@ impl TxTable {
         let _ = std::fs::remove_file(&bak);
         crate::address_head::remove_legacy_meta_sidecar(&bak);
         crate::address_head::remove_legacy_meta_sidecar(&shadow_path);
+        self.resize_active.store(false, AtomicOrdering::Release);
         rbitcoin_log::info!(
             "store: tx.head resize complete bits={} entry={}B slots={} gen={}",
             target.bits,

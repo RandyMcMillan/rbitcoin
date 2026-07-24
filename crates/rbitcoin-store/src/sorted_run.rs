@@ -530,18 +530,21 @@ pub fn lookup_key(run: &SortedRunPath, key: &[u8]) -> Result<Option<Vec<u8>>, St
 
 // ── Merge ───────────────────────────────────────────────────────────────────
 
-/// Streaming cursor over a run (for merge).
+/// Streaming cursor over a run (for merge). Record bytes live in `buf` only —
+/// no per-record heap clone.
 struct RunCursor {
     file: File,
     path: PathBuf,
     remaining: u64,
+    /// Fixed-width current record (valid after successful [`fill_next`]).
     buf: Vec<u8>,
 }
 
 impl RunCursor {
-    fn open(run: &SortedRunPath) -> Result<Self, StoreError> {
-        // Cheap integrity before streaming a multi-GB merge.
-        verify_run_body(run)?;
+    fn open(run: &SortedRunPath, verify: bool) -> Result<Self, StoreError> {
+        if verify {
+            verify_run_body(run)?;
+        }
         let mut file = File::open(&run.path).map_err(|e| io_err(&run.path, e))?;
         file.seek(SeekFrom::Start(HEADER_LEN as u64))
             .map_err(|e| io_err(&run.path, e))?;
@@ -553,26 +556,31 @@ impl RunCursor {
         })
     }
 
-    fn next_rec(&mut self) -> Result<Option<Vec<u8>>, StoreError> {
+    /// Read next record into `buf`. Returns false at EOF.
+    fn fill_next(&mut self) -> Result<bool, StoreError> {
         if self.remaining == 0 {
-            return Ok(None);
+            return Ok(false);
         }
         self.file
             .read_exact(&mut self.buf)
             .map_err(|e| io_err(&self.path, e))?;
         self.remaining -= 1;
-        Ok(Some(self.buf.clone()))
+        Ok(true)
+    }
+
+    #[inline]
+    fn rec(&self) -> &[u8] {
+        &self.buf
     }
 }
 
 struct MergeHead {
     cursor: RunCursor,
-    rec: Vec<u8>,
     idx: usize,
 }
 
 fn head_less(a: &MergeHead, b: &MergeHead, key_len: usize) -> bool {
-    match a.rec[..key_len].cmp(&b.rec[..key_len]) {
+    match a.cursor.rec()[..key_len].cmp(&b.cursor.rec()[..key_len]) {
         Ordering::Less => true,
         Ordering::Greater => false,
         Ordering::Equal => a.idx < b.idx,
@@ -710,8 +718,21 @@ pub fn list_materialize_claims(dir: &Path) -> Result<Vec<SortedRunPath>, StoreEr
 /// Does **not** buffer the full merge body (unlike [`merge_runs`]). Used by SH
 /// bulk materialize so multi-run catalogs stay one sorted stream without
 /// multi-GB RAM.
+///
+/// `verify_crc`: when true, re-scan each run body CRC before streaming (safe
+/// default for merge). Materialize can pass **false** when MANIFEST/claims
+/// already carry trusted CRCs from spill time.
 pub fn for_each_merged_rec(
     inputs: &[SortedRunPath],
+    on_rec: impl FnMut(&[u8]) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    for_each_merged_rec_opts(inputs, true, on_rec)
+}
+
+/// Like [`for_each_merged_rec`] with explicit CRC-verify control.
+pub fn for_each_merged_rec_opts(
+    inputs: &[SortedRunPath],
+    verify_crc: bool,
     mut on_rec: impl FnMut(&[u8]) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
     if inputs.is_empty() {
@@ -726,9 +747,9 @@ pub fn for_each_merged_rec(
     }
     let mut heap: Vec<MergeHead> = Vec::new();
     for (idx, run) in inputs.iter().enumerate() {
-        let mut cursor = RunCursor::open(run)?;
-        if let Some(rec) = cursor.next_rec()? {
-            heap.push(MergeHead { cursor, rec, idx });
+        let mut cursor = RunCursor::open(run, verify_crc)?;
+        if cursor.fill_next()? {
+            heap.push(MergeHead { cursor, idx });
         }
     }
     for i in (0..heap.len()).rev() {
@@ -739,9 +760,8 @@ pub fn for_each_merged_rec(
         if !heap.is_empty() {
             sift_down(&mut heap, 0, key_len);
         }
-        on_rec(&min.rec)?;
-        if let Some(next) = min.cursor.next_rec()? {
-            min.rec = next;
+        on_rec(min.cursor.rec())?;
+        if min.cursor.fill_next()? {
             heap.push(min);
             let last = heap.len() - 1;
             sift_up(&mut heap, last, key_len);
@@ -754,6 +774,9 @@ pub fn for_each_merged_rec(
 ///
 /// Equal keys: all records are kept (multi-value multimap for SH creates).
 /// Single atomic MANIFEST update: drop inputs, add output.
+///
+/// Streams the merge to disk (incremental CRC) — does **not** hold the full
+/// output body in RAM (needed for finalize compact of large SH runs).
 pub fn merge_runs(inputs: &[SortedRunPath], out_path: &Path) -> Result<SortedRunPath, StoreError> {
     if inputs.is_empty() {
         return write_sorted_run(out_path, 32, 44, &[]);
@@ -768,39 +791,76 @@ pub fn merge_runs(inputs: &[SortedRunPath], out_path: &Path) -> Result<SortedRun
 
     let mut heap: Vec<MergeHead> = Vec::new();
     for (idx, run) in inputs.iter().enumerate() {
-        let mut cursor = RunCursor::open(run)?;
-        if let Some(rec) = cursor.next_rec()? {
-            heap.push(MergeHead { cursor, rec, idx });
+        let mut cursor = RunCursor::open(run, true)?;
+        if cursor.fill_next()? {
+            heap.push(MergeHead { cursor, idx });
         }
     }
     for i in (0..heap.len()).rev() {
         sift_down(&mut heap, i, key_len);
     }
 
-    let mut out_body = Vec::new();
-    let total: u64 = inputs.iter().map(|r| r.count).sum();
-    out_body.reserve((total as usize).saturating_mul(rec_len as usize));
-
-    while !heap.is_empty() {
-        let mut min = heap.swap_remove(0);
-        if !heap.is_empty() {
-            sift_down(&mut heap, 0, key_len);
+    // Stream write: placeholder header, body + CRC, then rewrite header.
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+    }
+    let tmp = out_path.with_extension("tmp");
+    let mut count = 0u64;
+    let mut body_crc = 0xFFFF_FFFFu32;
+    let table = crc32_table();
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| io_err(&tmp, e))?;
+        let hdr = [0u8; HEADER_LEN];
+        f.write_all(&hdr).map_err(|e| io_err(&tmp, e))?;
+        while !heap.is_empty() {
+            let mut min = heap.swap_remove(0);
+            if !heap.is_empty() {
+                sift_down(&mut heap, 0, key_len);
+            }
+            let rec = min.cursor.rec();
+            f.write_all(rec).map_err(|e| io_err(&tmp, e))?;
+            for &b in rec {
+                body_crc = table[((body_crc ^ u32::from(b)) & 0xFF) as usize] ^ (body_crc >> 8);
+            }
+            count = count.saturating_add(1);
+            if min.cursor.fill_next()? {
+                heap.push(min);
+                let last = heap.len() - 1;
+                sift_up(&mut heap, last, key_len);
+            }
         }
-        out_body.extend_from_slice(&min.rec);
-        if let Some(next) = min.cursor.next_rec()? {
-            min.rec = next;
-            heap.push(min);
-            let last = heap.len() - 1;
-            sift_up(&mut heap, last, key_len);
+        body_crc ^= 0xFFFF_FFFF;
+        // Header with final count + CRC.
+        f.seek(SeekFrom::Start(0)).map_err(|e| io_err(&tmp, e))?;
+        let mut hdr = [0u8; HEADER_LEN];
+        hdr[0..8].copy_from_slice(&MAGIC);
+        hdr[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        hdr[12..16].copy_from_slice(&(key_len as u32).to_le_bytes());
+        hdr[16..20].copy_from_slice(&rec_len.to_le_bytes());
+        hdr[20..28].copy_from_slice(&count.to_le_bytes());
+        hdr[28..32].copy_from_slice(&body_crc.to_le_bytes());
+        f.write_all(&hdr).map_err(|e| io_err(&tmp, e))?;
+        f.sync_all().map_err(|e| io_err(&tmp, e))?;
+    }
+    fs::rename(&tmp, out_path).map_err(|e| io_err(out_path, e))?;
+    if let Some(parent) = out_path.parent() {
+        if let Ok(dirf) = File::open(parent) {
+            let _ = dirf.sync_all();
         }
     }
-
-    // 1) Write new run file (not yet in MANIFEST).
-    // 2) Atomic MANIFEST: drop inputs, add output — crash after this still has
-    //    a consistent catalog; leftover input files become orphans and are
-    //    removed on the next list_runs.
-    // 3) Delete input files.
-    let written = write_sorted_run_file(out_path, key_len as u32, rec_len, &out_body)?;
+    advise_file_dont_need(out_path);
+    let written = SortedRunPath {
+        path: out_path.to_path_buf(),
+        count,
+        rec_len,
+        key_len: key_len as u32,
+        body_crc32: body_crc,
+    };
     let remove_seqs: Vec<u64> = inputs.iter().filter_map(|r| r.seq()).collect();
     if let Some(dir) = out_path.parent() {
         manifest_merge_commit(dir, &remove_seqs, &written)?;

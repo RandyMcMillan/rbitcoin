@@ -13,9 +13,9 @@ use super::run_builder_core::{
 use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
-    claim_run_for_materialize, for_each_merged_rec, list_materialize_claims, list_runs, merge_runs,
-    next_run_path, write_sorted_run, ScriptHashEntry, ScriptHashRecord, Store, StoreError,
-    SortedRunPath,
+    claim_run_for_materialize, for_each_merged_rec_opts, list_materialize_claims, list_runs,
+    merge_runs, next_run_path, write_sorted_run, ScriptHashEntry, ScriptHashRecord, Store,
+    StoreError, SortedRunPath,
 };
 // re-export for tests that claim runs
 use std::path::Path;
@@ -32,9 +32,12 @@ const DEFAULT_MEMTABLE_CAP: usize = 256_000;
 const HARD_MEMTABLE_MUL: usize = 2;
 /// Background merge cadence (one k-way pair merge at most this often).
 const MERGE_INTERVAL: Duration = Duration::from_secs(1);
-/// Do not **start** a merge with a run whose body is already ≥ this size
-/// (≈40 MiB / ~1M rows). Two smaller runs may still merge to larger than this.
+/// Do not **start** a background merge with a run whose body is already ≥ this
+/// size (≈40 MiB / ~1M rows). Two smaller runs may still merge to larger than this.
 const SH_MERGE_MAX_BODY_BYTES: u64 = 40 * 1024 * 1024;
+/// Finalize compact: no per-input size gate — merge until ≤ this many cataloged
+/// runs remain (k-way materialize fan-in). Streaming merge keeps RAM bounded.
+const SH_FINALIZE_TARGET_RUNS: usize = 1;
 
 #[inline]
 fn run_body_bytes(run: &SortedRunPath) -> u64 {
@@ -208,18 +211,29 @@ impl ShRunBuilder {
                 g.ctrl.next_seq,
             )
         };
+        // Finalize compact: merge without the 40 MiB background gate until we
+        // reach SH_FINALIZE_TARGET_RUNS (streaming merge — no full-body RAM).
+        let t_compact = Instant::now();
+        let mut merges = 0u32;
         {
             let _io = runs_io.lock().unwrap();
-            let mut merges = 0u32;
-            while try_merge_two_oldest(&runs_dir, &mut next_seq).unwrap_or(false) {
+            while try_merge_two_oldest_finalize(&runs_dir, &mut next_seq).unwrap_or(false) {
                 merges = merges.saturating_add(1);
-                if merges % 50 == 0 {
-                    info!("node: scripthash run merge progress merges={merges}");
+                if merges % 20 == 0 {
+                    let n = list_runs(&runs_dir).map(|r| r.len()).unwrap_or(0);
+                    info!(
+                        "node: scripthash finalize compact merges={merges} runs_left={n} elapsed={:?}",
+                        t_compact.elapsed()
+                    );
                 }
             }
-            if merges > 0 {
-                info!("node: scripthash run merge done merges={merges}");
-            }
+        }
+        let compact_ns = t_compact.elapsed().as_nanos() as u64;
+        if merges > 0 {
+            info!(
+                "node: scripthash finalize compact done merges={merges} elapsed={:?}",
+                t_compact.elapsed()
+            );
         }
         {
             let mut g = self.inner.lock().unwrap();
@@ -227,6 +241,7 @@ impl ShRunBuilder {
         }
 
         // Claim cataloged runs + recover prior materialize claims (*.run.mat).
+        let t_claim = Instant::now();
         let mut claimed: Vec<SortedRunPath> = Vec::new();
         {
             let _io = runs_io.lock().unwrap();
@@ -245,6 +260,7 @@ impl ShRunBuilder {
                 claimed.push(claim_run_for_materialize(&run)?);
             }
         }
+        let claim_ns = t_claim.elapsed().as_nanos() as u64;
 
         if claimed.is_empty() {
             info!("node: scripthash bulk materialize: no runs");
@@ -265,7 +281,9 @@ impl ShRunBuilder {
              claims={} entry_count={n_existing} head_empty={head_empty}",
             claimed.len()
         );
+        let t_reinit = Instant::now();
         store.scripthash.reinit_empty_for_cold_materialize()?;
+        let reinit_ns = t_reinit.elapsed().as_nanos() as u64;
         debug_assert_eq!(store.scripthash.entry_count(), 0);
         debug_assert!(store.scripthash.head_is_empty());
         info!(
@@ -285,7 +303,10 @@ impl ShRunBuilder {
         let mut last_log_keys = 0u64;
         let mut last_shards = 0u32;
 
-        for_each_merged_rec(&claimed, |rec| {
+        let t_stream = Instant::now();
+        // Trust claim/MANIFEST CRCs — skip full-body re-verify on open (big win
+        // with many runs). Still detects short reads via read_exact.
+        for_each_merged_rec_opts(&claimed, false, |rec| {
             if rec.len() < SH_RUN_REC_LEN as usize {
                 return Err(StoreError::Corrupt("sh run short record in merge stream"));
             }
@@ -309,9 +330,12 @@ impl ShRunBuilder {
                             last_log_keys = keys;
                             last_shards = shards;
                             info!(
-                                "node: scripthash materialize progress keys≈{} creates≈{} shards={shards}/{n_shards} elapsed={:?}",
+                                "node: scripthash materialize progress keys≈{} creates≈{} shards={shards}/{n_shards} \
+                                 body_flush={:?} head_fill={:?} elapsed={:?}",
                                 keys,
                                 session.creates_written(),
+                                Duration::from_nanos(session.body_flush_ns),
+                                Duration::from_nanos(session.head_fill_ns),
                                 t0.elapsed()
                             );
                         }
@@ -331,16 +355,28 @@ impl ShRunBuilder {
                 session.put_chain(prev, &chain)?;
             }
         }
+        let stream_ns = t_stream.elapsed().as_nanos() as u64;
 
-        let (n_total, n_keys) = session.finish()?;
+        let t_finish = Instant::now();
+        let (n_total, n_keys, body_flush_ns, head_fill_ns) = session.finish()?;
         store.scripthash.flush()?;
+        let finish_ns = t_finish.elapsed().as_nanos() as u64;
         for run in &claimed {
             let _ = std::fs::remove_file(&run.path);
         }
         clear_runs_dir(&runs_dir);
         info!(
-            "node: scripthash bulk materialize done creates≈{n_total} keys≈{n_keys} unique_in≈{unique_in} shards={n_shards} elapsed={:?}",
-            t0.elapsed()
+            "node: scripthash bulk materialize done creates≈{n_total} keys≈{n_keys} unique_in≈{unique_in} \
+             shards={n_shards} elapsed={:?} \
+             stages: compact={:?} claim={:?} reinit={:?} stream={:?} body_flush={:?} head_fill={:?} finish_flush={:?}",
+            t0.elapsed(),
+            Duration::from_nanos(compact_ns),
+            Duration::from_nanos(claim_ns),
+            Duration::from_nanos(reinit_ns),
+            Duration::from_nanos(stream_ns),
+            Duration::from_nanos(body_flush_ns),
+            Duration::from_nanos(head_fill_ns),
+            Duration::from_nanos(finish_ns),
         );
         Ok(n_total)
     }
@@ -428,21 +464,45 @@ fn sh_worker_loop(soft_cap: usize, inner: Arc<Mutex<Inner>>, cv: Arc<Condvar>) {
 /// large file. The **output** may exceed 40 MiB (two 30 MiB inputs are fine).
 /// Output is sorted by scripthash key (k-way merge). Returns true if a merge ran.
 fn try_merge_two_oldest(runs_dir: &Path, next_seq: &mut u64) -> Result<bool, StoreError> {
+    try_merge_two_oldest_gated(runs_dir, next_seq, Some(SH_MERGE_MAX_BODY_BYTES), false)
+}
+
+/// Finalize compact: merge two oldest cataloged runs with **no** size gate,
+/// until fewer than 2 runs remain (or target reached). Includes the newest
+/// run — nothing is still spilling after finalize wait.
+fn try_merge_two_oldest_finalize(
+    runs_dir: &Path,
+    next_seq: &mut u64,
+) -> Result<bool, StoreError> {
+    let runs = list_runs(runs_dir)?;
+    if runs.len() <= SH_FINALIZE_TARGET_RUNS {
+        return Ok(false);
+    }
+    try_merge_two_oldest_gated(runs_dir, next_seq, None, true)
+}
+
+fn try_merge_two_oldest_gated(
+    runs_dir: &Path,
+    next_seq: &mut u64,
+    max_input_body: Option<u64>,
+    include_newest: bool,
+) -> Result<bool, StoreError> {
     let mut runs = list_runs(runs_dir)?;
     if runs.len() < 2 {
         return Ok(false);
     }
     runs.sort_by_key(|r| r.seq().unwrap_or(u64::MAX));
-    // Never merge the newest run (latest spill / still "active" target).
-    if runs.len() >= 3 {
-        runs.pop(); // drop newest
+    // Background: never merge the newest run (latest spill / still "active").
+    if !include_newest && runs.len() >= 3 {
+        runs.pop();
     }
-    // Skip runs already ≥ 40 MiB body — leave them for materialize only.
-    // Prefer the oldest *eligible* pair (may skip oversized files in front).
-    let eligible: Vec<SortedRunPath> = runs
-        .into_iter()
-        .filter(|r| run_body_bytes(r) < SH_MERGE_MAX_BODY_BYTES)
-        .collect();
+    let eligible: Vec<SortedRunPath> = match max_input_body {
+        Some(cap) => runs
+            .into_iter()
+            .filter(|r| run_body_bytes(r) < cap)
+            .collect(),
+        None => runs,
+    };
     if eligible.len() < 2 {
         return Ok(false);
     }

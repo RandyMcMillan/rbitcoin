@@ -689,7 +689,7 @@ impl ScriptHashTable {
         }
         let mut session = self.bulk_session(n_keys)?;
         let written = session.put_sorted_creates(recs)?;
-        session.finish()?;
+        let _ = session.finish()?;
         Ok(written)
     }
 
@@ -730,6 +730,8 @@ impl ScriptHashTable {
             finished: false,
             keys_written: 0,
             shards_flushed: 0,
+            body_flush_ns: 0,
+            head_fill_ns: 0,
         })
     }
 
@@ -759,6 +761,10 @@ pub struct ScriptHashBulkSession<'a> {
     finished: bool,
     keys_written: u64,
     shards_flushed: u32,
+    /// Wall time spent in body `write_at` flushes.
+    pub body_flush_ns: u64,
+    /// Wall time spent bulk-filling head shards.
+    pub head_fill_ns: u64,
 }
 
 const BULK_BODY_FLUSH: usize = 16 * 1024 * 1024;
@@ -891,6 +897,7 @@ impl<'a> ScriptHashBulkSession<'a> {
         if self.body_buf.is_empty() {
             return Ok(());
         }
+        let t0 = std::time::Instant::now();
         let end = self.body_write_off + self.body_buf.len() as u64;
         self.ensure_body_capacity(end)?;
         self.table
@@ -898,6 +905,9 @@ impl<'a> ScriptHashBulkSession<'a> {
             .write_at(self.body_write_off, &self.body_buf)?;
         self.body_write_off = end;
         self.body_buf.clear();
+        self.body_flush_ns = self
+            .body_flush_ns
+            .saturating_add(t0.elapsed().as_nanos() as u64);
         Ok(())
     }
 
@@ -909,9 +919,13 @@ impl<'a> ScriptHashBulkSession<'a> {
         // Body slabs for this shard's keys must be durable before head points at them.
         self.flush_body()?;
         if !self.head_buf.is_empty() {
+            let t0 = std::time::Instant::now();
             self.table
                 .head
                 .bulk_fill_one_shard_cold(si, &mut self.head_buf)?;
+            self.head_fill_ns = self
+                .head_fill_ns
+                .saturating_add(t0.elapsed().as_nanos() as u64);
             self.shards_flushed = self.shards_flushed.saturating_add(1);
         }
         self.head_buf.clear();
@@ -921,7 +935,9 @@ impl<'a> ScriptHashBulkSession<'a> {
     }
 
     /// Flush last shard head + alloc header.
-    pub fn finish(mut self) -> Result<(u64, u64), StoreError> {
+    ///
+    /// Returns `(creates, keys, body_flush_ns, head_fill_ns)`.
+    pub fn finish(mut self) -> Result<(u64, u64, u64, u64), StoreError> {
         self.flush_active_shard()?;
         if self.bump > self.table.body.logical_len() {
             self.table.body.set_logical_len(self.bump)?;
@@ -934,7 +950,12 @@ impl<'a> ScriptHashBulkSession<'a> {
         write_alloc_header(&self.table.body, &state)?;
         *self.table.alloc.lock().unwrap() = state;
         self.finished = true;
-        Ok((self.live_count, self.keys_written))
+        Ok((
+            self.live_count,
+            self.keys_written,
+            self.body_flush_ns,
+            self.head_fill_ns,
+        ))
     }
 }
 
@@ -1263,7 +1284,7 @@ mod tests {
                 .collect();
             session.put_chain(sh, &ents).unwrap();
         }
-        let (creates, keys) = session.finish().unwrap();
+        let (creates, keys, _, _) = session.finish().unwrap();
         assert_eq!(keys, 50);
         assert_eq!(creates, t.entry_count());
         assert!(creates > 50);
@@ -1327,7 +1348,7 @@ mod tests {
         session
             .put_chain(sh, &[ShEntry::new(Fk(1))])
             .unwrap();
-        let (n, _) = session.finish().unwrap();
+        let (n, _, _, _) = session.finish().unwrap();
         assert_eq!(n, 1);
         assert_eq!(t.entries(&sh).unwrap()[0].1.create_tx_fk, Fk(1));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1362,7 +1383,7 @@ mod tests {
                 );
             }
         }
-        let (creates, keys) = session.finish().unwrap();
+        let (creates, keys, _, _) = session.finish().unwrap();
         assert_eq!(creates, u64::from(N));
         assert_eq!(keys, u64::from(N));
         assert_eq!(t.entry_count(), u64::from(N));

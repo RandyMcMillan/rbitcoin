@@ -91,7 +91,8 @@ resize** when `txs.count()/slots ≥ 0.75`: rebuild shadow from dense `tx.idx` o
 (batch idx pread + io_uring/parallel body-txid prefixes, ordered `insert_many` into
 `tx.head.new`; no dual-write on archive), then atomic rename. BITS **33+** use **8 B** entries.
 `tx.head.meta` **v2** marks linear probe; older meta / missing meta forces recreate +
-rebuild from Class A on open.
+rebuild from Class A on open. Online resize fill runs on a **dedicated OS thread**
+(`rbitcoin-tx-head-resize`); archive only waits if insert hits probe exhaust.
 **tx_height** uses 4 B height slots (not fk width). Dense Class A fk + **tx.idx**
 retained. Packed Class A only. Spends are schema-v5 annotations on create outputs
 (no `point.head`).

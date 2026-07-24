@@ -107,14 +107,24 @@ impl ScriptHashHead {
     }
 
     /// Zero all slots and reset occupied (cold rematerialize after partial load).
+    ///
+    /// Writes zeros through the mmap path (not punch-hole alone) so the map
+    /// view matches `occupied = 0`. Punch-hole can leave stale mmap pages.
     pub fn reinit_empty(&self) -> Result<(), StoreError> {
         let slots = {
             let state = self.state.lock().unwrap();
             state.slots
         };
         let body_bytes = SH_HEAD_SLOT_SIZE as u64 * slots;
-        self.file
-            .zero_range(FILE_HEADER_LEN as u64, body_bytes)?;
+        // Chunked write_at so the active mmap is cleared, not only the file.
+        let zero = vec![0u8; (1024 * 1024).min(body_bytes as usize).max(SH_HEAD_SLOT_SIZE)];
+        let mut off = 0u64;
+        while off < body_bytes {
+            let n = ((body_bytes - off) as usize).min(zero.len());
+            self.file
+                .write_at(FILE_HEADER_LEN as u64 + off, &zero[..n])?;
+            off += n as u64;
+        }
         self.state.lock().unwrap().occupied = 0;
         Ok(())
     }

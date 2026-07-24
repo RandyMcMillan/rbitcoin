@@ -143,11 +143,20 @@ impl ScriptHashTable {
         self.alloc.lock().unwrap().live_count
     }
 
+    /// True when every head shard reports zero occupied slots.
+    pub fn head_is_empty(&self) -> bool {
+        self.head.is_empty()
+    }
+
     /// Wipe body alloc + all head slots for a full cold rematerialize.
     ///
     /// Used when runs/`*.run.mat` still hold the complete create set after a
     /// partial/crashed bulk load. Does not delete files — resets in place so
     /// open mmaps stay valid. Exclusive: no concurrent SH readers/writers.
+    ///
+    /// Must run whenever claims are about to cold-load, not only when
+    /// `entry_count > 0`: crash mid-finish can leave head shards occupied while
+    /// the alloc header still says `live_count == 0`.
     pub fn reinit_empty_for_cold_materialize(&self) -> Result<(), StoreError> {
         let payload0 = payload_start(FILE_HEADER_LEN);
         {
@@ -162,12 +171,25 @@ impl ScriptHashTable {
         // Discard old slabs from the published HWM (new cold load bumps from payload0).
         self.body.set_logical_len(payload0)?;
         self.head.reinit_empty()?;
+        debug_assert!(self.head.is_empty());
         Ok(())
     }
 
     /// Head value for a key (process-cache seed / disconnect refresh).
     pub fn head_value(&self, scripthash: &[u8; 32]) -> Result<Option<ShHeadValue>, StoreError> {
         self.head.get(scripthash)
+    }
+
+    /// Test-only: set alloc `live_count = 0` without clearing head slots.
+    ///
+    /// Models crash mid-finish after deferred heads landed but before the
+    /// alloc header was updated (entry_count==0, head non-empty).
+    #[cfg(test)]
+    pub fn test_zero_live_count_keep_head(&self) -> Result<(), StoreError> {
+        let mut alloc = self.alloc.lock().unwrap();
+        alloc.live_count = 0;
+        write_alloc_header(&self.body, &alloc)?;
+        Ok(())
     }
 
     /// Visit every live create_tx_fk across all keys (head occupancy walk).
@@ -1240,6 +1262,38 @@ mod tests {
         assert_eq!(n, 3);
         assert_eq!(t.entries(&sh).unwrap().len(), 3);
         assert_eq!(t.entry_count(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reinit_clears_head_when_live_count_already_zero() {
+        // Crash mid-finish: heads durable, alloc live_count still 0.
+        // bulk_session must not hard-error; reinit then cold load.
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let mut sh = [0u8; 32];
+        sh[0] = 0x7e;
+        let mut session = t.bulk_session(1).unwrap();
+        session
+            .put_chain(sh, &[ShEntry::new(Fk(42))])
+            .unwrap();
+        let _ = session.finish().unwrap();
+        assert!(!t.head_is_empty());
+        t.test_zero_live_count_keep_head().unwrap();
+        assert_eq!(t.entry_count(), 0);
+        assert!(!t.head_is_empty());
+        // Old bug: only reinit when entry_count>0 → bulk_session fails here.
+        assert!(t.bulk_session(1).is_err());
+        t.reinit_empty_for_cold_materialize().unwrap();
+        assert!(t.head_is_empty());
+        assert_eq!(t.entry_count(), 0);
+        let mut session = t.bulk_session(2).unwrap();
+        session
+            .put_chain(sh, &[ShEntry::new(Fk(1))])
+            .unwrap();
+        let (n, _) = session.finish().unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(t.entries(&sh).unwrap()[0].1.create_tx_fk, Fk(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -254,16 +254,20 @@ impl ShRunBuilder {
         }
 
         let total_recs: u64 = claimed.iter().map(|r| r.count).sum();
+        // Always wipe before cold load. Claims are the source of truth.
+        // entry_count alone is insufficient: a crash mid-finish (deferred heads)
+        // can leave head shards occupied while alloc live_count is still 0 —
+        // bulk_session then hard-errors "requires empty head" and never reinit'd.
         let n_existing = store.scripthash.entry_count();
-        if n_existing > 0 {
-            info!(
-                "node: scripthash table non-empty (entry_count={n_existing}) — \
-                 reinit empty for cold rematerialize from {} run claim(s)",
-                claimed.len()
-            );
-            store.scripthash.reinit_empty_for_cold_materialize()?;
-            debug_assert_eq!(store.scripthash.entry_count(), 0);
-        }
+        let head_empty = store.scripthash.head_is_empty();
+        info!(
+            "node: scripthash reinit empty for cold rematerialize \
+             claims={} entry_count={n_existing} head_empty={head_empty}",
+            claimed.len()
+        );
+        store.scripthash.reinit_empty_for_cold_materialize()?;
+        debug_assert_eq!(store.scripthash.entry_count(), 0);
+        debug_assert!(store.scripthash.head_is_empty());
         info!(
             "node: scripthash bulk materialize start runs={} records≈{total_recs} cold=true",
             claimed.len()

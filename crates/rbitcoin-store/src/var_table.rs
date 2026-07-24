@@ -116,33 +116,15 @@ impl VarTable {
         self.body.logical_len()
     }
 
-    /// `mlock` the body pages covering `fk`. Returns page-aligned `(start, len)`.
-    pub fn mlock_record(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
-        let (off, len) = self.record_range(fk)?;
-        self.mlock_body_range(off, len)
-    }
 
-    /// `mlock` body pages for a known absolute range (no idx).
-    pub fn mlock_body_range(&self, offset: u64, len: u64) -> Result<(u64, u64), StoreError> {
-        self.body.mlock_range(offset, len)
-    }
 
-    /// `mlock` the `idx` slot for `fk` (8-byte absolute body offset).
-    pub fn mlock_idx_entry(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
-        let id = fk.get().ok_or(StoreError::InvalidFk)?;
-        let off = FILE_HEADER_LEN as u64 + (id - 1) * 8;
-        self.idx.mlock_range(off, 8)
-    }
 
-    /// Best-effort `munlock` for a prior body [`mlock_record`] page range.
-    pub fn munlock_body_pages(&self, page_start: u64, page_len: u64) {
-        self.body.munlock_range(page_start, page_len);
-    }
 
-    /// Best-effort `munlock` for a prior [`mlock_idx_entry`] page range.
-    pub fn munlock_idx_pages(&self, page_start: u64, page_len: u64) {
-        self.idx.munlock_range(page_start, page_len);
-    }
+
+
+
+
+
 
     /// Inspect record bytes without copying into a `Vec`.
     pub fn with_raw<R>(

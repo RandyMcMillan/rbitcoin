@@ -229,7 +229,7 @@ impl ChainHub {
         Ok((need, need_meta))
     }
 
-    /// LOAD stage: Class A load + pin/mlock parents → resolve → wave → wire → assemble.
+    /// LOAD stage: Class A load + pin parents → resolve → wave → wire → assemble.
     /// Hand result to [`Self::confirm_scripts`].
     pub fn confirm_load_phase(
         &self,

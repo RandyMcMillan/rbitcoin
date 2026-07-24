@@ -17,7 +17,6 @@ mod ibd_io_policy;
 mod hashhead;
 mod open_address;
 mod header_table;
-mod mlock;
 mod point_table;
 mod spender_table;
 mod scripthash;
@@ -32,10 +31,8 @@ mod var_table;
 pub use epoch::ArchiveEpoch;
 pub use error::StoreError;
 pub use file::{
-    ensure_memlock_budget, ensure_nofile_budget, ensure_nofile_budget_at_least,
-    try_set_io_best_effort, try_set_io_idle, NOFILE_SOFT_TARGET,
+    ensure_nofile_budget, ensure_nofile_budget_at_least, NOFILE_SOFT_TARGET,
 };
-pub use mlock::{MlockRange, MlockTable};
 pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush};
 pub use address_head::{
     bits_for_scale, entry_bytes_for_bits, load_needs_resize, probe_index, AddressHead,

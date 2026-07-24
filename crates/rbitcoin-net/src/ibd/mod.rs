@@ -413,10 +413,10 @@ pub async fn ibd_cancellable(
     // Fresh cancel state for this IBD session (may have been set on prior stop).
     hub.query.clear_confirm_cancel();
 
-    // Load stage owns Class A + parent pin/mlock for each claimed batch.
+    // Load stage owns Class A + parent pin for each claimed batch.
     info!(
         "ibd: confirm pipeline load+scripts+write (Class A load inline; \
-         mlock write parent body pages only)"
+         parent pin for write annotate)"
     );
 
     // Dedicated confirm path — never blocks the network/archive event loop.
@@ -823,7 +823,6 @@ pub async fn ibd_cancellable(
             let peers_n = st.slots.iter().filter(|s| s.alive).count();
             let (load_q, write_q) = confirm_queues.snap();
             let sh_runs = hub.query.scripthash_run_count();
-            let mlock_mb = hub.query.confirm_mlock_bytes() / (1024 * 1024);
             let pct = ibd_pct(prog.tip, prog.headers);
 
             tip_rate_tracker.push(now, prog.tip);
@@ -838,7 +837,7 @@ pub async fn ibd_cancellable(
                 confirm::WRITE_QUEUE_CAP,
             );
             info_bold!(
-                "ibd: progress {pct}% tip={} ({}/s) arch_hwm={} ({}/s lead={arch_lead}) hole={} peers={peers_n} {conf_q} mlock={mlock_mb}MiB sh_runs={sh_runs} horizon={} {eta}",
+                "ibd: progress {pct}% tip={} ({}/s) arch_hwm={} ({}/s lead={arch_lead}) hole={} peers={peers_n} {conf_q} sh_runs={sh_runs} horizon={} {eta}",
                 prog.tip,
                 format_rate(tip_rate),
                 prog.archived,
@@ -863,7 +862,6 @@ pub async fn ibd_cancellable(
 
             // One sample/reset, then INFO `ibd: perf` (+ DEBUG `ibd: perf_dbg`).
             let parent_cache_snap = hub.query.parent_cache_perf_snapshot();
-            let (mlock_n, mlock_bytes) = hub.query.confirm_mlock_stats();
             let (load_q, write_q) = confirm_queues.snap();
             let perf = perf_log::sample(
                 &loop_stats,
@@ -883,8 +881,6 @@ pub async fn ibd_cancellable(
                 parent_cache_snap,
                 load_q,
                 write_q,
-                mlock_n,
-                mlock_bytes,
                 hub.query.scripthash_run_count(),
                 hub.query.archive_txid_sticky_stats(),
             );

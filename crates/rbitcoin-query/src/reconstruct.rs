@@ -68,7 +68,7 @@ impl Query {
         use crate::wave_fill_stats::{self as wf, add as wf_add, add_count as wf_count};
         let t0 = Instant::now();
         wf_count(&wf::BODY_STORE, 1);
-        // Prefer cache-held idx range (skip idx page fault); body pages mlocked.
+        // Prefer cache-held idx range (skip idx page fault).
         let res = if let Some((off, len)) = self.confirm_parents.get_body_range(fk) {
             let (tx, inputs, outs) = self.store.get_tx_full_at(off, len)?;
             Ok((tx, outs, inputs))

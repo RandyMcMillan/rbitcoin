@@ -73,14 +73,8 @@ impl ConfirmedTable {
         }
     }
 
-    /// `mlock` confirmed[height] slot (and a small neighborhood for tip writes).
-    pub fn mlock_height(&self, height: Height) -> Result<(u64, u64), StoreError> {
-        self.arr.mlock_indices(u64::from(height.0), 1)
-    }
 
-    pub fn munlock_pages(&self, page_start: u64, page_len: u64) {
-        self.arr.munlock_pages(page_start, page_len);
-    }
+
 
     pub fn flush(&self) -> Result<(), StoreError> {
         self.arr.flush()
@@ -268,15 +262,8 @@ impl TxHeightTable {
         Ok(())
     }
 
-    /// `mlock` the height slot for `tx_fk`.
-    pub fn mlock_fk(&self, tx_fk: Fk) -> Result<(u64, u64), StoreError> {
-        let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
-        self.file.mlock_range(Self::offset(id - 1), TX_HEIGHT_ELEM)
-    }
 
-    pub fn munlock_pages(&self, page_start: u64, page_len: u64) {
-        self.file.munlock_range(page_start, page_len);
-    }
+
 
     pub fn flush(&self) -> Result<(), StoreError> {
         self.file.flush()
@@ -483,16 +470,8 @@ impl StrongTxTable {
         self.get_bit(id - 1)
     }
 
-    /// `mlock` the byte containing the strong bit for `tx_fk`.
-    pub fn mlock_fk(&self, tx_fk: Fk) -> Result<(u64, u64), StoreError> {
-        let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
-        let off = Self::byte_off(id - 1);
-        self.bits.mlock_range(off, 1)
-    }
 
-    pub fn munlock_pages(&self, page_start: u64, page_len: u64) {
-        self.bits.munlock_range(page_start, page_len);
-    }
+
 
     pub fn flush(&self) -> Result<(), StoreError> {
         self.bits.flush()
@@ -676,25 +655,9 @@ impl HeaderTxsTable {
         Ok(self.get_range(header_fk)?.is_some())
     }
 
-    /// `mlock` first+count array slots for `header_fk`.
-    pub fn mlock_header(
-        &self,
-        header_fk: Fk,
-    ) -> Result<((u64, u64), (u64, u64)), StoreError> {
-        let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
-        let idx = id - 1;
-        let a = self.first.mlock_indices(idx, 1)?;
-        let b = self.count.mlock_indices(idx, 1)?;
-        Ok((a, b))
-    }
 
-    pub fn munlock_first_pages(&self, page_start: u64, page_len: u64) {
-        self.first.munlock_pages(page_start, page_len);
-    }
 
-    pub fn munlock_count_pages(&self, page_start: u64, page_len: u64) {
-        self.count.munlock_pages(page_start, page_len);
-    }
+
 
     /// Number of headers that currently have a Class A body (`count > 0`).
     ///

@@ -768,39 +768,8 @@ impl HashHead {
         Ok(())
     }
 
-    /// `mlock` linear-probe walk for `full` key until empty (bounded scan).
-    pub fn mlock_probe(&self, full: &[u8; 32]) -> Result<(u64, u64), StoreError> {
-        let key = head_key_prefix(full);
-        let slots = self.state.lock().unwrap().slots;
-        let mut slot = Self::hash_slot(&key, slots);
-        let mut min_off = u64::MAX;
-        let mut max_end = 0u64;
-        let mut any = false;
-        for _ in 0..slots.min(4096) {
-            let off = Self::slot_file_off(slot);
-            min_off = min_off.min(off);
-            max_end = max_end.max(off + SLOT_SIZE as u64);
-            any = true;
-            let (k, packed) = self.read_slot(slot)?;
-            if is_empty_slot(&k, packed) {
-                break;
-            }
-            if &k == &key {
-                // Found match (or multi) — still continue? Usually stop after match
-                // for get_all, but we already locked the path here. Done.
-                break;
-            }
-            slot = (slot + 1) & (slots - 1);
-        }
-        if !any || min_off == u64::MAX {
-            return Ok((0, 0));
-        }
-        self.file.mlock_range(min_off, max_end - min_off)
-    }
 
-    pub fn munlock_pages(&self, page_start: u64, page_len: u64) {
-        self.file.munlock_range(page_start, page_len);
-    }
+
 
     pub fn flush(&self) -> Result<(), StoreError> {
         self.multi.flush()?;

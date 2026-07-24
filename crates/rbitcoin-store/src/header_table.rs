@@ -122,38 +122,9 @@ impl HeaderTable {
         Ok(None)
     }
 
-    /// `mlock` header head probe + body record for `hash` (confirm resolve path).
-    pub fn mlock_by_hash(
-        &self,
-        hash: &[u8; 32],
-    ) -> Result<(Option<(Fk, HeaderRecord)>, Vec<(u64, u64)>), StoreError> {
-        let mut ranges = Vec::new();
-        if let Ok(r) = self.head.mlock_probe(hash) {
-            if r.1 > 0 {
-                ranges.push(r);
-            }
-        }
-        let found = self.get_by_hash(hash)?;
-        if let Some((fk, ref rec)) = found {
-            let id = fk.get().ok_or(StoreError::InvalidFk)?;
-            let off = FILE_HEADER_LEN as u64 + (id - 1) * HEADER_RECORD_LEN as u64;
-            if let Ok(r) = self.body.mlock_range(off, HEADER_RECORD_LEN as u64) {
-                if r.1 > 0 {
-                    ranges.push(r);
-                }
-            }
-            let _ = rec;
-        }
-        Ok((found, ranges))
-    }
 
-    pub fn munlock_body_pages(&self, page_start: u64, page_len: u64) {
-        self.body.munlock_range(page_start, page_len);
-    }
 
-    pub fn munlock_head_pages(&self, page_start: u64, page_len: u64) {
-        self.head.munlock_pages(page_start, page_len);
-    }
+
 
     /// Number of header rows currently stored (highest fk = this value).
     pub fn count(&self) -> u64 {

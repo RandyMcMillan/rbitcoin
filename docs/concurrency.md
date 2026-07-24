@@ -9,7 +9,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 | Peer IO (N tasks) | tokio multi-thread | none (wire only) |
 | Archive **prep** | 1 tokio task | **none** (CPU encode only) |
 | Archive **writer** | 1 OS thread (`ibd-archive-writer`) | **Class A exclusive**: header body/head, tx body/idx/head, in/out runs; optional points when spend_index on |
-| Confirm **load** | 1 OS thread (`ibd-confirm-load`) | none (reads Class A / parent cache; pin/mlock parent bodies) |
+| Confirm **load** | 1 OS thread (`ibd-confirm-load`) | none (reads Class A / parent cache; pin parents) |
 | Confirm **scripts** | 1 OS thread (`ibd-confirm`) | **none** — pure CPU on `LoadedBatch` (rayon script verify only; **no store / Query reads or writes**) |
 | Confirm **write** | 1 OS thread (`ibd-confirm-write`) | **structural** spentness/maturity/subsidy, then **Class C** (`strong_tx` / `tx_height` / SH creates / `confirmed[]`), then spend annotate (Direct). FIFO by height |
 | IBD main loop | 1 tokio task | none (orchestration only) |
@@ -40,7 +40,7 @@ Do not enter Tip until tip ≈ peer height. Tip entry only bulk-materializes SH
 
 | Mechanism | What it replaces |
 |-----------|------------------|
-| Map **epochs** (`TableFile`) | No map `Mutex` on read/write/mlock; capacity = new mmap window + pointer swap |
+| Map **epochs** (`TableFile`) | No map `Mutex` on read/write; capacity = new mmap window + pointer swap |
 | Atomic `count` / HWM | Publish barrier (Acquire readers / Release appender) |
 | Role exclusivity | One appender, one annotator — not a global store mutex |
 | `tx.head` insert | **Sole writer**: plain Release store empty→fk + SeqCst fence per batch (no CAS). Role exclusivity — not multi-inserter safe |

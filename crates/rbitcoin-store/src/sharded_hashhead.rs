@@ -207,19 +207,8 @@ impl ShardedHashHead {
         Ok(())
     }
 
-    /// `mlock` probe path for `key` on the owning shard.
-    pub fn mlock_probe(&self, key: &[u8; 32]) -> Result<(u64, u64), StoreError> {
-        let i = self.shard_of(key);
-        self.shards[i].mlock_probe(key)
-    }
 
-    pub fn munlock_pages(&self, page_start: u64, page_len: u64) {
-        // Single-file header: one shard. Multi-shard: unlock applies to the file
-        // that owns the range — callers use ranges from the same shard's mlock.
-        for s in &self.shards {
-            s.munlock_pages(page_start, page_len);
-        }
-    }
+
 
     pub fn flush(&self) -> Result<(), StoreError> {
         for s in &self.shards {

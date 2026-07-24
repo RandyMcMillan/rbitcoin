@@ -493,31 +493,7 @@ impl AddressHead {
         self.probe_fks(txid)
     }
 
-    pub fn mlock_probe(&self, txid: &[u8; 32]) -> Result<(u64, u64), StoreError> {
-        let mut min_off = u64::MAX;
-        let mut max_end = 0u64;
-        let mut any = false;
-        let es = self.layout.entry_size();
-        for d in 0..MAX_PROBE {
-            let slot = probe_index(txid, d, self.layout.bits);
-            let off = self.entry_off(slot);
-            min_off = min_off.min(off);
-            max_end = max_end.max(off + es);
-            any = true;
-            let e = self.read_entry(slot)?;
-            if e == 0 {
-                break;
-            }
-        }
-        if !any || min_off == u64::MAX {
-            return Ok((0, 0));
-        }
-        self.file.mlock_range(min_off, max_end - min_off)
-    }
 
-    pub fn munlock_pages(&self, page_start: u64, page_len: u64) {
-        self.file.munlock_range(page_start, page_len);
-    }
 
     pub fn flush(&self) -> Result<(), StoreError> {
         self.file.flush()

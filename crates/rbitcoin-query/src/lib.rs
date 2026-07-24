@@ -36,7 +36,6 @@ pub type QueryError = StoreError;
 
 pub use batch_parents::BatchParents;
 pub use catchup::IndexMode;
-pub use confirm_parent_cache::confirm_mlock_from_env;
 pub use connect::ConfirmPrepared;
 pub use confirm_load::ConfirmLoadStats;
 pub use archive::ArchiveWritePlan;
@@ -64,7 +63,6 @@ pub mod confirm_load_stats {
     /// Pin that had to load from store.
     pub static PIN_NEW: AtomicU64 = AtomicU64::new(0);
     pub static PIN_SPENT_NS: AtomicU64 = AtomicU64::new(0);
-    pub static PIN_MLOCK_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_BODY_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_NEW_META_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_PUT_NS: AtomicU64 = AtomicU64::new(0);
@@ -74,7 +72,6 @@ pub mod confirm_load_stats {
     pub static MISSING_PARENTS: AtomicU64 = AtomicU64::new(0);
     /// Phase nanoseconds (sum over calls this window).
     pub static HEADER_NS: AtomicU64 = AtomicU64::new(0);
-    pub static BODY_MLOCK_NS: AtomicU64 = AtomicU64::new(0);
     pub static BODY_DECODE_NS: AtomicU64 = AtomicU64::new(0);
     pub static THIN_NS: AtomicU64 = AtomicU64::new(0);
     /// Thin sub-phases (collect unique / cache map / head probe / edge walk).
@@ -87,9 +84,6 @@ pub mod confirm_load_stats {
     /// Durable `tx.head` probes during thin resolve.
     pub static HEAD_LOOKUPS: AtomicU64 = AtomicU64::new(0);
     pub static HEAD_HITS: AtomicU64 = AtomicU64::new(0);
-    /// Body-page mlock syscalls vs already-pinned skips.
-    pub static MLOCK_SYSCALLS: AtomicU64 = AtomicU64::new(0);
-    pub static MLOCK_SKIPPED: AtomicU64 = AtomicU64::new(0);
     /// Thin edges classified: same-batch / cache / stamped-fk / head / coinbase / miss.
     pub static EDGE_SAME_BATCH: AtomicU64 = AtomicU64::new(0);
     pub static EDGE_RUNWAY: AtomicU64 = AtomicU64::new(0);
@@ -111,7 +105,6 @@ pub mod confirm_load_stats {
         pub pin_cache_body: u64,
         pub pin_new: u64,
         pub pin_spent_ns: u64,
-        pub pin_mlock_ns: u64,
         pub pin_body_ns: u64,
         pub pin_new_meta_ns: u64,
         pub pin_put_ns: u64,
@@ -120,7 +113,6 @@ pub mod confirm_load_stats {
         pub parent_tx: u64,
         pub missing: u64,
         pub header_ns: u64,
-        pub body_mlock_ns: u64,
         pub body_decode_ns: u64,
         pub thin_ns: u64,
         pub thin_collect_ns: u64,
@@ -131,8 +123,6 @@ pub mod confirm_load_stats {
         pub cache_put_ns: u64,
         pub head_lookups: u64,
         pub head_hits: u64,
-        pub mlock_syscalls: u64,
-        pub mlock_skipped: u64,
         pub edge_same_batch: u64,
         pub edge_cache: u64,
         pub edge_fk: u64,
@@ -151,7 +141,6 @@ pub mod confirm_load_stats {
             pin_cache_body: PIN_CACHE_BODY.swap(0, Ordering::Relaxed),
             pin_new: PIN_NEW.swap(0, Ordering::Relaxed),
             pin_spent_ns: PIN_SPENT_NS.swap(0, Ordering::Relaxed),
-            pin_mlock_ns: PIN_MLOCK_NS.swap(0, Ordering::Relaxed),
             pin_body_ns: PIN_BODY_NS.swap(0, Ordering::Relaxed),
             pin_new_meta_ns: PIN_NEW_META_NS.swap(0, Ordering::Relaxed),
             pin_put_ns: PIN_PUT_NS.swap(0, Ordering::Relaxed),
@@ -160,7 +149,6 @@ pub mod confirm_load_stats {
             parent_tx: FULL_TX_READS.swap(0, Ordering::Relaxed),
             missing: MISSING_PARENTS.swap(0, Ordering::Relaxed),
             header_ns: HEADER_NS.swap(0, Ordering::Relaxed),
-            body_mlock_ns: BODY_MLOCK_NS.swap(0, Ordering::Relaxed),
             body_decode_ns: BODY_DECODE_NS.swap(0, Ordering::Relaxed),
             thin_ns: THIN_NS.swap(0, Ordering::Relaxed),
             thin_collect_ns: THIN_COLLECT_NS.swap(0, Ordering::Relaxed),
@@ -171,8 +159,6 @@ pub mod confirm_load_stats {
             cache_put_ns: CACHE_PUT_NS.swap(0, Ordering::Relaxed),
             head_lookups: HEAD_LOOKUPS.swap(0, Ordering::Relaxed),
             head_hits: HEAD_HITS.swap(0, Ordering::Relaxed),
-            mlock_syscalls: MLOCK_SYSCALLS.swap(0, Ordering::Relaxed),
-            mlock_skipped: MLOCK_SKIPPED.swap(0, Ordering::Relaxed),
             edge_same_batch: EDGE_SAME_BATCH.swap(0, Ordering::Relaxed),
             edge_cache: EDGE_RUNWAY.swap(0, Ordering::Relaxed),
             edge_fk: EDGE_FK.swap(0, Ordering::Relaxed),
@@ -201,7 +187,6 @@ pub mod confirm_load_stats {
         add!(pin_cache_body, PIN_CACHE_BODY);
         add!(pin_new, PIN_NEW);
         add!(pin_spent_ns, PIN_SPENT_NS);
-        add!(pin_mlock_ns, PIN_MLOCK_NS);
         add!(pin_body_ns, PIN_BODY_NS);
         add!(pin_new_meta_ns, PIN_NEW_META_NS);
         add!(pin_put_ns, PIN_PUT_NS);
@@ -210,7 +195,6 @@ pub mod confirm_load_stats {
         add!(body_tx_reads, BODY_TX_READS);
         add!(missing_parents, MISSING_PARENTS);
         add!(header_ns, HEADER_NS);
-        add!(body_mlock_ns, BODY_MLOCK_NS);
         add!(body_decode_ns, BODY_DECODE_NS);
         add!(thin_ns, THIN_NS);
         add!(thin_collect_ns, THIN_COLLECT_NS);
@@ -221,8 +205,6 @@ pub mod confirm_load_stats {
         add!(cache_put_ns, CACHE_PUT_NS);
         add!(head_lookups, HEAD_LOOKUPS);
         add!(head_hits, HEAD_HITS);
-        add!(mlock_syscalls, MLOCK_SYSCALLS);
-        add!(mlock_skipped, MLOCK_SKIPPED);
         add!(edge_same_batch, EDGE_SAME_BATCH);
         add!(edge_fk, EDGE_FK);
         add!(edge_cache, EDGE_RUNWAY);

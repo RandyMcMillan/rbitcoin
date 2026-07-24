@@ -1,21 +1,17 @@
-//! Confirm **load** stage: Class A decode + parent pin/mlock for one claimed batch.
+//! Confirm **load** stage: Class A decode + parent pin for one claimed batch.
 //!
 //! For each height in the batch (ascending):
 //! 1. **Cache** header + `header_txs` + body ranges.
 //! 2. **Full Class A decode** into `by_body` (wire/assemble clone from here).
 //! 3. **Thin edges** (stamped create_fk) + **sparse parent pin** into a
 //!    per-batch [`BatchParents`] map (spent-filtered outs; dropped after write).
-//! 4. **`mlock`** (default **off**; `RBITCOIN_CONFIRM_MLOCK=1` on): optional
-//!    parent create `tx.body` pages for write annotate.
 //!
 //! Bodies stay in the shared `by_body` LRU for later pin hits. Sparse parents
 //! are **not** tip-GCed — they live only on the confirm batch object.
-//!
-//! Env: `RBITCOIN_CONFIRM_MLOCK` (legacy `RBITCOIN_PARENT_PREWARM_MLOCK` alias).
 
 use super::*;
 use crate::batch_parents::BatchParents;
-use crate::confirm_parent_cache::{confirm_mlock_from_env, StashedThinInput};
+use crate::confirm_parent_cache::StashedThinInput;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -34,8 +30,6 @@ pub struct ConfirmLoadStats {
     pub pin_new: u32,
     /// Wall ns in `unspent_create_vouts` during pin (store spent-filter).
     pub pin_spent_ns: u64,
-    /// Wall ns in pin-loop mlock helpers (0 when mlock default-off).
-    pub pin_mlock_ns: u64,
     /// Body-LRU batch lookup + pin_cache resolve (excludes spent timer).
     pub pin_body_ns: u64,
     /// pin_new range + meta/outs resolve (excludes spent timer).
@@ -54,7 +48,6 @@ pub struct ConfirmLoadStats {
     pub missing_parents: u32,
     /// Phase wall times (ns).
     pub header_ns: u64,
-    pub body_mlock_ns: u64,
     pub body_decode_ns: u64,
     pub thin_ns: u64,
     /// Thin sub-phases (sum into `thin_ns`).
@@ -66,8 +59,6 @@ pub struct ConfirmLoadStats {
     pub cache_put_ns: u64,
     pub head_lookups: u32,
     pub head_hits: u32,
-    pub mlock_syscalls: u32,
-    pub mlock_skipped: u32,
     pub edge_same_batch: u32,
     pub edge_cache: u32,
     pub edge_head: u32,
@@ -75,94 +66,6 @@ pub struct ConfirmLoadStats {
 }
 
 impl Query {
-    /// Batch-mlock **unique** page-aligned body spans for many parents.
-    ///
-    /// Each item is `(need_heights, body_offset, body_len)`. Overlapping /
-    /// adjacent pages merge so one kernel `mlock` covers many parents. Notes
-    /// need_heights **immediately per merged span** so later spans in the same
-    /// batch can skip already-held pages (do not regress “note only at end”).
-    ///
-    /// Returns `(syscalls, skipped)`.
-    fn mlock_unique_body_ranges(&self, items: &[(Vec<u32>, u64, u64)]) -> (u32, u32) {
-        if items.is_empty() {
-            return (0, 0);
-        }
-        const PAGE: u64 = 4096;
-        // (page_start, page_len, heights_idx into a side table) — expand then merge.
-        let mut spans: Vec<(u64, u64, usize)> = Vec::with_capacity(items.len());
-        let mut height_sets: Vec<Vec<u32>> = Vec::with_capacity(items.len());
-        for (hs, off, len) in items {
-            if *len == 0 || hs.is_empty() {
-                continue;
-            }
-            let start = *off & !(PAGE - 1);
-            let end = off.saturating_add(*len).saturating_add(PAGE - 1) & !(PAGE - 1);
-            let plen = end.saturating_sub(start);
-            if plen == 0 {
-                continue;
-            }
-            let idx = height_sets.len();
-            height_sets.push(hs.clone());
-            spans.push((start, plen, idx));
-        }
-        if spans.is_empty() {
-            return (0, 0);
-        }
-        spans.sort_unstable_by_key(|(s, _, _)| *s);
-        // Merge overlapping/adjacent; union height set indices.
-        let mut merged: Vec<(u64, u64, HashSet<usize>)> = Vec::with_capacity(spans.len());
-        for (s, l, idx) in spans {
-            if let Some((ms, ml, set)) = merged.last_mut() {
-                let mend = ms.saturating_add(*ml);
-                if s <= mend {
-                    let new_end = s.saturating_add(l).max(mend);
-                    *ml = new_end.saturating_sub(*ms);
-                    set.insert(idx);
-                    continue;
-                }
-            }
-            let mut set = HashSet::with_capacity(1);
-            set.insert(idx);
-            merged.push((s, l, set));
-        }
-        let mut syscalls = 0u32;
-        let mut skipped = 0u32;
-        for (ps, pl, idx_set) in merged {
-            // Union need heights for this span.
-            let mut heights: Vec<u32> = Vec::new();
-            for i in idx_set {
-                heights.extend(height_sets[i].iter().copied());
-            }
-            heights.sort_unstable();
-            heights.dedup();
-            if heights.is_empty() {
-                continue;
-            }
-            let candidate = rbitcoin_store::MlockRange {
-                table: rbitcoin_store::MlockTable::TxBody,
-                page_start: ps,
-                page_len: pl,
-            };
-            let noted: Vec<rbitcoin_store::MlockRange> =
-                if self.confirm_parents.is_range_pinned(&candidate) {
-                    skipped = skipped.saturating_add(1);
-                    vec![candidate]
-                } else {
-                    let ml = self.store.mlock_tx_body_at(ps, pl);
-                    syscalls = syscalls.saturating_add(1);
-                    if ml.is_empty() {
-                        vec![candidate]
-                    } else {
-                        ml
-                    }
-                };
-            // Note immediately so the next merged span can skip shared pages.
-            self.confirm_parents
-                .note_mlock_ranges_for_heights(&heights, &noted);
-        }
-        (syscalls, skipped)
-    }
-
     pub fn parent_cache_ready_through(&self) -> u32 {
         self.confirm_parents.ready_through()
     }
@@ -184,21 +87,8 @@ impl Query {
         )
     }
 
-    /// Unique mlocked cache pages in bytes (parent cache pins).
-    pub fn confirm_mlock_bytes(&self) -> u64 {
-        self.confirm_parents.mlock_bytes()
-    }
-
-    /// `(range_count, unique_page_bytes)` for mlock diagnostics.
-    pub fn confirm_mlock_stats(&self) -> (usize, u64) {
-        self.confirm_parents.mlock_stats()
-    }
-
     pub fn advance_parent_cache_tip(&self, tip: u32) {
-        let unlocks = self.confirm_parents.advance_tip(tip);
-        for r in &unlocks {
-            self.store.munlock_range(r);
-        }
+        self.confirm_parents.advance_tip(tip);
     }
 
     pub fn seed_parent_cache(&self, items: &[(u32, [u8; 32])]) {
@@ -235,8 +125,7 @@ impl Query {
 
     /// Load Class A for heights into the confirm parent cache (load stage / tests).
     ///
-    /// Full-decode bodies + parent pin; mlock **parent create body pages only**
-    /// (write spender annotate). Pins every parent needed by heights in `items`
+    /// Full-decode bodies + parent pin. Pins every parent needed by heights in `items`
     /// into a **per-batch** [`BatchParents`] map (caller carries it to write).
     pub fn load_confirm_parents(
         &self,
@@ -351,13 +240,9 @@ impl Query {
             );
             st.header_ns = st.header_ns.saturating_add(t_hdr.elapsed().as_nanos() as u64);
 
-            // ── body ranges (decode); mlock only write parent pages later ─
-            // Wave bodies / Class C are read then written on write via
-            // strong/height — those pages are small/sparse; the multi-page
-            // write path that benefits from mlock is parent create bodies
-            // (spender annotate). See pin loop below.
-            let t_ml = Instant::now();
+            // ── body ranges + full Class A decode ─────────────────────────
             st.blocks = st.blocks.saturating_add(1);
+            let t_dec = Instant::now();
 
             let fks_work: std::borrow::Cow<'_, [Fk]> = if tx_fks_is_sorted_ascending(&tx_fks) {
                 std::borrow::Cow::Borrowed(tx_fks.as_slice())
@@ -384,12 +269,8 @@ impl Query {
                     height_fks_resolved.push((*fk, None));
                 }
             }
-            st.body_mlock_ns = st
-                .body_mlock_ns
-                .saturating_add(t_ml.elapsed().as_nanos() as u64);
 
-            // ── Full body decode (skip store when cache already has the body) ─
-            let t_dec = Instant::now();
+            // Full body decode (skip store when cache already has the body).
             // Partition: cache hits vs need store bulk full decode.
             let mut need_full: Vec<(Fk, u64, u64)> = Vec::new();
             let mut need_full_meta: Vec<(usize, Fk)> = Vec::new(); // index into height_fks_resolved
@@ -526,50 +407,43 @@ impl Query {
             .saturating_add(t_edge.elapsed().as_nanos() as u64);
         st.thin_ns = st.thin_ns.saturating_add(t_thin.elapsed().as_nanos() as u64);
 
-        // ── Pin parents into per-batch BatchParents + optional mlock ───────
+        // ── Pin parents into per-batch BatchParents ───────────────────────
         // Sparse spent-filtered outs live on the batch object (not tip-GCed).
         // Shared by_body LRU still supplies pin_cache hits.
         //
         // Ownership path: body-LRU hits move once into BatchParents (no
         // intermediate sparse_parents + re-clone). Vec-backed ParentEntry
         // avoids HashMap/HashSet allocs per parent at pin volume.
-        let do_mlock = confirm_mlock_from_env();
         let t_par = Instant::now();
         let mut uniq_parents: Vec<u64> = parent_need.keys().copied().collect();
         uniq_parents.sort_unstable();
         st.parent_unique = st.parent_unique.saturating_add(uniq_parents.len() as u32);
 
-        // (pid, need_hs, need_vouts) — max_h unused after by_fk removal.
-        let mut pin_jobs: Vec<(u64, Vec<u32>, Vec<u32>)> =
-            Vec::with_capacity(uniq_parents.len());
+        // (pid, need_vouts)
+        let mut pin_jobs: Vec<(u64, Vec<u32>)> = Vec::with_capacity(uniq_parents.len());
         for pid in uniq_parents {
-            let mut need_hs = parent_need.remove(&pid).unwrap_or_default();
-            need_hs.sort_unstable();
-            need_hs.dedup();
+            let _ = parent_need.remove(&pid);
             let mut need_vouts = parent_vouts.remove(&pid).unwrap_or_default();
             need_vouts.sort_unstable();
             need_vouts.dedup();
-            pin_jobs.push((pid, need_hs, need_vouts));
+            pin_jobs.push((pid, need_vouts));
         }
         batch_parents = BatchParents::with_capacity(pin_jobs.len());
 
         let mut parent_ranges: Vec<(Fk, u64, u64)> = Vec::new();
-        let mut mlock_items: Vec<(Vec<u32>, u64, u64)> = Vec::new();
-        let mut mlock_no_range: Vec<(Vec<u32>, Fk)> = Vec::new();
-        let mut pin_new_jobs: Vec<(u64, Vec<u32>, Vec<u32>, Option<(u64, u64)>)> =
-            Vec::new();
+        let mut pin_new_jobs: Vec<(u64, Vec<u32>, Option<(u64, u64)>)> = Vec::new();
 
         let t_body = Instant::now();
         let body_keys: Vec<(u64, &[u32])> = pin_jobs
             .iter()
-            .filter(|(_, _, vouts)| !vouts.is_empty())
-            .map(|(pid, _, vouts)| (*pid, vouts.as_slice()))
+            .filter(|(_, vouts)| !vouts.is_empty())
+            .map(|(pid, vouts)| (*pid, vouts.as_slice()))
             .collect();
         let mut body_hits = self
             .confirm_parents
             .get_bodies_for_pin_batch(&body_keys);
 
-        for (pid, need_hs, need_vouts) in pin_jobs {
+        for (pid, need_vouts) in pin_jobs {
             if self.confirm_cancelled() {
                 crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Cancelled("confirm cancelled"));
@@ -629,35 +503,12 @@ impl Query {
                 .or_else(|| self.store.tx_body_range(fk).ok());
             if let Some((off, len)) = range {
                 parent_ranges.push((fk, off, len));
-                if do_mlock {
-                    mlock_items.push((need_hs.clone(), off, len));
-                }
-            } else if do_mlock {
-                mlock_no_range.push((need_hs.clone(), fk));
             }
-            pin_new_jobs.push((pid, need_hs, need_vouts, range));
+            pin_new_jobs.push((pid, need_vouts, range));
         }
         st.pin_body_ns = st
             .pin_body_ns
             .saturating_add(t_body.elapsed().as_nanos() as u64);
-
-        if do_mlock && (!mlock_items.is_empty() || !mlock_no_range.is_empty()) {
-            let t_ml = Instant::now();
-            if !mlock_items.is_empty() {
-                let (sys, sk) = self.mlock_unique_body_ranges(&mlock_items);
-                st.mlock_syscalls = st.mlock_syscalls.saturating_add(sys);
-                st.mlock_skipped = st.mlock_skipped.saturating_add(sk);
-            }
-            for (need_hs, fk) in &mlock_no_range {
-                let body_ml = self.store.mlock_tx_body_only(*fk);
-                st.mlock_syscalls = st.mlock_syscalls.saturating_add(1);
-                self.confirm_parents
-                    .note_mlock_ranges_for_heights(need_hs, &body_ml);
-            }
-            st.pin_mlock_ns = st
-                .pin_mlock_ns
-                .saturating_add(t_ml.elapsed().as_nanos() as u64);
-        }
 
         let t_new = Instant::now();
         if self.confirm_cancelled() {
@@ -666,7 +517,7 @@ impl Query {
         }
         let mut bulk_idx: Vec<usize> = Vec::new();
         let mut bulk_ranges: Vec<(u64, u64)> = Vec::new();
-        for (i, (_pid, _need_hs, need_vouts, range)) in pin_new_jobs.iter().enumerate() {
+        for (i, (_pid, need_vouts, range)) in pin_new_jobs.iter().enumerate() {
             if let Some((off, len)) = range {
                 if !need_vouts.is_empty() {
                     bulk_idx.push(i);
@@ -690,7 +541,7 @@ impl Query {
             }
         }
 
-        for (ji, (pid, _need_hs, need_vouts, range)) in pin_new_jobs.into_iter().enumerate() {
+        for (ji, (pid, need_vouts, range)) in pin_new_jobs.into_iter().enumerate() {
             if self.confirm_cancelled() {
                 crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Cancelled("confirm cancelled"));

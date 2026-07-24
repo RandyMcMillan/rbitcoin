@@ -1,4 +1,4 @@
-//! Process-local archive writer sticky: `txid → create_fk` (no outs / mlock).
+//! Process-local archive writer sticky: `txid → create_fk` (no outs).
 //!
 //! Cross mega-batch RAM hit for parent resolve when packing create_fk into spends.
 //! Capacity-capped FIFO (~4 M default ≈ 192 MiB planning budget).

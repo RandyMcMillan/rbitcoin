@@ -1222,7 +1222,7 @@ fn confirm_batch_create_and_spend_parent_same_run() {
     accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     run.push((Height(spend_h), b_spend.block_hash().to_byte_array()));
 
-    // Runway the run: mlock bodies + prevout scan; same-batch create must not
+    // Runway the run: parent pin + prevout scan; same-batch create must not
     // leave the spend height unready.
     let items: Vec<(u32, [u8; 32])> = run.iter().map(|(h, hash)| (h.0, *hash)).collect();
     let _ = q.load_confirm_parents(&items).unwrap();
@@ -1831,12 +1831,12 @@ fn consensus_reject_bad_structure_and_milestone() {
     );
 }
 
-// ─── 3-stage confirm + load parent mlock surface ────────────────────────────
+// ─── 3-stage confirm + parent pin surface ───────────────────────────────────
 
 /// Split load → scripts → write (IBD pipeline stages) on a spend run.
-/// Also exercises parent pin/mlock stats + tip GC, and load ready timeout/cancel.
+/// Also exercises parent pin stats + tip advance, and load ready timeout/cancel.
 #[test]
-fn three_stage_confirm_and_parent_mlock_surface() {
+fn three_stage_confirm_and_parent_pin_surface() {
     use rbitcoin_consensus::{
         accept_and_archive_block, accept_and_connect_block, confirm_load_phase,
         confirm_script_phase, confirm_scripts_phase, confirm_write_phase, ChainParams,
@@ -1898,15 +1898,13 @@ fn three_stage_confirm_and_parent_mlock_surface() {
     accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     run.push((Height(spend_h), b_spend.block_hash().to_byte_array()));
 
-    // Inline confirm load (parent pin + optional body mlock).
+    // Inline confirm load (parent pin).
     let items: Vec<(u32, [u8; 32])> = run.iter().map(|(h, hash)| (h.0, *hash)).collect();
     let (st, _bp) = q.load_confirm_parents(&items).unwrap();
     assert!(st.blocks > 0 || st.already_ready > 0);
     let _ = q.load_confirm_parents_for_hashes(&[b_spend.block_hash().to_byte_array()]);
     let snap = q.parent_cache_perf_snapshot();
     assert!(snap.4 > 0, "plans after load");
-    let (_n, _bytes) = q.confirm_mlock_stats();
-    let _ = q.confirm_mlock_bytes();
     assert!(q.is_confirm_load_ready(&items.iter().map(|(h, _)| *h).collect::<Vec<_>>()));
 
     // LOAD
@@ -1927,7 +1925,7 @@ fn three_stage_confirm_and_parent_mlock_surface() {
     assert_eq!(q.tip_height(), Some(Height(spend_h)));
     assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
 
-    // Tip GC releases parent body mlocks for heights ≤ tip.
+    // Tip advance prunes plans/headers ≤ tip (body LRU retains under budget).
     q.advance_parent_cache_tip(spend_h);
     // Combined load+scripts entry (ChainHub path) on empty above tip: reject empty.
     let empty = confirm_script_phase(&q, &params, ms, &[]);

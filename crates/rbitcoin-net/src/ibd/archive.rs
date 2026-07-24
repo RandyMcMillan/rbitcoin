@@ -106,7 +106,7 @@ impl ArchivePipelineSample {
 ///
 /// Sized so network stays busy and ContigPark can form mega-batches without a
 /// multi‑GiB junkyard. Wire-size undercounts true RSS of decoded `Block` + prep
-/// (×1.5 charge); still stacked with parent-body mlock + page cache.
+/// (×1.5 charge); still stacked with parent-body decode + page cache.
 pub const DEFAULT_ARCHIVE_QUEUE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Enter “pressure” (far_scale = 0) when fill ≥ this fraction of budget.
@@ -575,7 +575,6 @@ pub(crate) fn spawn_archive_pipeline(
         let writer = std::thread::Builder::new()
             .name("ibd-archive-writer".into())
             .spawn(move || {
-                rbitcoin_store::try_set_io_idle();
                 const FLUSH_EVERY_BLOCKS: u64 = 8192;
                 let mut blocks_since_flush = 0u64;
                 while !write_stop.load(Ordering::Relaxed) {

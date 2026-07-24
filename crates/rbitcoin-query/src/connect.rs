@@ -323,7 +323,7 @@ impl Query {
             }
             return Ok(());
         }
-        // 2) Known body range → meta+outs only (still warm if mlock held).
+        // 2) Known body range → meta+outs only.
         if let Some((off, len)) = self.confirm_parents.get_body_range(tx_fk) {
             let (tx, outputs) = self.store.get_tx_meta_and_outputs_at(off, len)?;
             if tx.output_count == 0 {

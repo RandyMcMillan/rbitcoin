@@ -3,8 +3,6 @@
 //! Load-stage strategy (no background worker):
 //! - **RAM-cache** small lookups: header + `header_txs`, body ranges, thin edges.
 //! - **Full-decode** batch Class A into `by_body` once; wave/wire clone from it.
-//! - **`mlock`** parent create pages for write annotate when body is not already
-//!   in RAM (body LRU hit skips store + mlock on the pin path).
 //! - After tip advance, decoded bodies with `height ≤ tip` stay in `by_body`
 //!   under a **byte-capped LRU** (default 1 GiB) so near-subsequent spends hit
 //!   RAM instead of cold Class A. Runway bodies (`height > tip`) are never
@@ -15,14 +13,14 @@
 //! - Prevouts use stamped create_fk only.
 
 use rbitcoin_primitives::Fk;
-use rbitcoin_store::{HeaderRecord, InputRecord, MlockRange, OutputRecord, TxRecord};
+use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
 // ThinInput used via StashedThinInput alias.
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Default post-confirm body LRU budget (decoded RAM, not mlock).
+/// Default post-confirm body LRU budget (decoded RAM).
 pub const DEFAULT_BODY_LRU_MB: u64 = 1024;
 
 /// `RBITCOIN_CONFIRM_BODY_LRU_MB` (default 1024). `0` = drop bodies at tip (legacy).
@@ -53,22 +51,6 @@ fn estimate_body_bytes(
         }
     }
     n
-}
-
-/// Default: mlock **off** (IBD host proof: same tip with/without; less MEMLOCK).
-///
-/// Opt-in parent create `tx.body` mlock for write annotate:
-/// `RBITCOIN_CONFIRM_MLOCK=1` / `true` / `on` (legacy `RBITCOIN_PARENT_PREWARM_MLOCK`).
-pub fn confirm_mlock_from_env() -> bool {
-    match std::env::var("RBITCOIN_CONFIRM_MLOCK")
-        .or_else(|_| std::env::var("RBITCOIN_PARENT_PREWARM_MLOCK"))
-    {
-        Ok(s) => {
-            let t = s.trim();
-            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on")
-        }
-        Err(_) => false,
-    }
 }
 
 /// Thin create-fk edge (identical to wave [`crate::wave_prevout::ThinInput`]).
@@ -102,20 +84,12 @@ pub struct HeaderPlanCache {
     pub prev_hash: [u8; 32],
 }
 
-/// Per-height plan: what prevouts block `height` needs.
+/// Per-height plan: load scan watermark (ready_through) only.
 #[derive(Debug, Default)]
 struct HeightPlan {
     hash: [u8; 32],
-    /// Runway finished a body+thin+pin attempt for this height.
-    ///
-    /// This is the **2-stage wait bit**: confirm unblocks when scanned (same work
-    /// as pre-pipeline). Full content completeness is best-effort in the pin
-    /// phase; wave may store-fallback on residual misses.
+    /// Load finished a body+thin+pin attempt for this height (2-stage wait bit).
     scanned: bool,
-    /// (create_fk, vout) fully populated in cache.
-    need_fk: HashSet<(u64, u32)>,
-    /// (prev_txid, vout) not in UTXO at cache — expect cache / same-wave create.
-    reserved: HashSet<([u8; 32], u32)>,
 }
 
 impl HeightPlan {
@@ -124,15 +98,6 @@ impl HeightPlan {
     fn is_ready(&self) -> bool {
         self.scanned
     }
-}
-
-/// One mlocked page range (any store table) held for cache heights.
-struct RangeRec {
-    range: MlockRange,
-    /// Heights that still need this range warm.
-    need_heights: HashSet<u32>,
-    start_page: u64,
-    end_page: u64, // exclusive page index within this table
 }
 
 struct Inner {
@@ -152,7 +117,7 @@ struct Inner {
     /// Lazy LRU order: `(fk_id, stamp)`; front = oldest. Touch pushes new stamp.
     body_lru: VecDeque<(u64, u64)>,
     next_lru_stamp: u64,
-    /// Thin edges without a full body parse (mlock cache).
+    /// Thin edges without a full body parse.
     thin_edges: HashMap<u64, Vec<StashedThinInput>>,
     /// height → header + tx list (replaces header.head/body + header_txs reads).
     headers: HashMap<u32, HeaderPlanCache>,
@@ -160,14 +125,6 @@ struct Inner {
     hash_to_height: HashMap<[u8; 32], u32>,
     /// fk id → absolute body (offset, len) from tx.idx (replaces idx page faults).
     body_range: HashMap<u64, (u64, u64)>,
-    /// Reserved (txid, vout) → set of heights waiting (legacy; unused by new cache).
-    reserve_waiters: HashMap<([u8; 32], u32), HashSet<u32>>,
-    /// (table, page_start) → mlocked range + need_heights.
-    mlocked: HashMap<(u8, u64), RangeRec>,
-    /// (table, page_index) → refcount (shared pages).
-    page_refs: HashMap<(u8, u64), u32>,
-    /// How many distinct ranges currently held (perf).
-    mlock_n: usize,
 }
 
 /// Process-local confirm parent cache.
@@ -196,10 +153,6 @@ impl ConfirmParentCache {
                 headers: HashMap::new(),
                 hash_to_height: HashMap::new(),
                 body_range: HashMap::new(),
-                reserve_waiters: HashMap::new(),
-                mlocked: HashMap::new(),
-                page_refs: HashMap::new(),
-                mlock_n: 0,
             }),
             ready_cv: Condvar::new(),
             ready_through: AtomicU32::new(0),
@@ -220,16 +173,10 @@ impl ConfirmParentCache {
         self.ready_through.load(Ordering::Relaxed)
     }
 
-    /// Advance tip: drop plans at/below tip; drop parents/bodies only needed there.
+    /// Advance tip: drop plans/headers at/below tip; confirm body LRU account/evict.
     ///
-    /// Called from write `post_commit` after Class C + spend annotate for the
-    /// committed batch — so mlocks for heights ≤ tip are released only once
-    /// write for those heights is done (need_heights drop when h ≤ tip).
-    /// No artificial lag behind tip: in-flight later waves keep mlocks via their
-    /// own need_heights (h > tip).
-    ///
-    /// Returns store ranges whose refcount hit zero (caller should `munlock`).
-    pub fn advance_tip(&self, tip: u32) -> Vec<MlockRange> {
+    /// Called from write `post_commit` after Class C + spend annotate.
+    pub fn advance_tip(&self, tip: u32) {
         let mut g = self.inner.lock().unwrap();
         let old_tip = g.tip;
         g.tip = tip;
@@ -238,16 +185,7 @@ impl ConfirmParentCache {
         }
         let drop_h: Vec<u32> = g.plans.range(..=tip).map(|(h, _)| *h).collect();
         for h in drop_h {
-            if let Some(plan) = g.plans.remove(&h) {
-                for key in plan.reserved {
-                    if let Some(waiters) = g.reserve_waiters.get_mut(&key) {
-                        waiters.remove(&h);
-                        if waiters.is_empty() {
-                            g.reserve_waiters.remove(&key);
-                        }
-                    }
-                }
-            }
+            g.plans.remove(&h);
         }
         // Bodies with height ≤ tip enter the confirmed LRU budget (kept for
         // near-subsequent parent pin hits). Thin edges for ≤tip heights drop
@@ -341,15 +279,12 @@ impl ConfirmParentCache {
         }
         // Drop body_range not tied to live cache bodies.
         g.gc_body_ranges();
-        // Munlock when no remaining need_height > tip (write done for those heights).
-        let unlocks = g.gc_mlocks(tip);
         g.recompute_ready_through();
         self.ready_through
             .store(g.ready_through, Ordering::Relaxed);
         drop(g);
         // Wake confirm waiters (tip advance can satisfy / re-horizon plans).
         self.ready_cv.notify_all();
-        unlocks
     }
 
     /// Wake any thread blocked in [`Self::wait_heights_ready`] (cancel / shutdown).
@@ -357,124 +292,7 @@ impl ConfirmParentCache {
         self.ready_cv.notify_all();
     }
 
-    /// True if every 4 KiB page of `range` is already held (skip re-`mlock`).
-    pub fn is_range_pinned(&self, range: &MlockRange) -> bool {
-        if range.is_empty() {
-            return true;
-        }
-        const PAGE: u64 = 4096;
-        let start_page = range.page_start / PAGE;
-        let end_page = range
-            .page_start
-            .saturating_add(range.page_len)
-            .div_ceil(PAGE)
-            .max(start_page);
-        let g = self.inner.lock().unwrap();
-        let t = range.table.as_u8();
-        (start_page..end_page).all(|p| g.page_refs.contains_key(&(t, p)))
-    }
-
-    /// Track successful `mlock` ranges for cache height `need_height`.
-    ///
-    /// Keyed by `(table, page_start)`. If a later note shares `page_start` but
-    /// covers a **longer** span, page refs and `rec.range` are **extended** so
-    /// kernel-locked pages are never tracked short (under-track ⇒ permanent
-    /// mlock leak when GC unlocks only the short range).
-    ///
-    /// Released when every needing height falls ≤ tip / past horizon.
-    pub fn note_mlock_ranges(&self, need_height: u32, ranges: &[MlockRange]) {
-        self.note_mlock_ranges_for_heights(&[need_height], ranges);
-    }
-
-    /// Like [`Self::note_mlock_ranges`] but one lock for many needing heights
-    /// (batch unique-range mlock path).
-    pub fn note_mlock_ranges_for_heights(&self, heights: &[u32], ranges: &[MlockRange]) {
-        if ranges.is_empty() || heights.is_empty() {
-            return;
-        }
-        const PAGE: u64 = 4096;
-        let mut g = self.inner.lock().unwrap();
-        for &range in ranges {
-            if range.is_empty() {
-                continue;
-            }
-            let table = range.table.as_u8();
-            let key = (table, range.page_start);
-            let start_page = range.page_start / PAGE;
-            let end_page = range
-                .page_start
-                .saturating_add(range.page_len)
-                .div_ceil(PAGE)
-                .max(start_page);
-            if g.mlocked.contains_key(&key) {
-                let old_end = g.mlocked.get(&key).map(|r| r.end_page).unwrap_or(0);
-                // Extend page_refs before mutably touching the RangeRec.
-                if end_page > old_end {
-                    for p in old_end..end_page {
-                        *g.page_refs.entry((table, p)).or_insert(0) += 1;
-                    }
-                }
-                if let Some(rec) = g.mlocked.get_mut(&key) {
-                    for &h in heights {
-                        rec.need_heights.insert(h);
-                    }
-                    if end_page > rec.end_page {
-                        rec.end_page = end_page;
-                        rec.range.page_len = end_page
-                            .saturating_sub(start_page)
-                            .saturating_mul(PAGE);
-                    }
-                }
-                continue;
-            }
-            for p in start_page..end_page {
-                *g.page_refs.entry((table, p)).or_insert(0) += 1;
-            }
-            let mut need = HashSet::with_capacity(heights.len());
-            for &h in heights {
-                need.insert(h);
-            }
-            g.mlocked.insert(
-                key,
-                RangeRec {
-                    range,
-                    need_heights: need,
-                    start_page,
-                    end_page,
-                },
-            );
-            g.mlock_n = g.mlock_n.saturating_add(1);
-        }
-    }
-
-
-
-    /// Number of distinct mlocked page ranges currently tracked.
-    pub fn mlock_count(&self) -> usize {
-        self.inner.lock().unwrap().mlock_n
-    }
-
-    /// Bytes of unique 4 KiB pages currently mlocked for the parent cache.
-    ///
-    /// Counts distinct `(table, page)` entries under refcount (shared ranges
-    /// across heights count once). Approximate RSS contribution of parent pins.
-    pub fn mlock_bytes(&self) -> u64 {
-        const PAGE: u64 = 4096;
-        let g = self.inner.lock().unwrap();
-        (g.page_refs.len() as u64).saturating_mul(PAGE)
-    }
-
-    /// `(range_count, unique_page_bytes)` for parent pin diagnostics.
-    pub fn mlock_stats(&self) -> (usize, u64) {
-        const PAGE: u64 = 4096;
-        let g = self.inner.lock().unwrap();
-        (
-            g.mlock_n,
-            (g.page_refs.len() as u64).saturating_mul(PAGE),
-        )
-    }
-
-    /// Cache header + tx list for a cache height (small; replaces header mlock).
+    /// Cache header + tx list for a cache height.
     pub fn put_header_plan(
         &self,
         height: u32,
@@ -517,7 +335,7 @@ impl ConfirmParentCache {
         g.headers.get(&h).map(|p| p.tx_fks.clone())
     }
 
-    /// Cache `tx.idx` body range for `fk` (small; body pages are mlocked separately).
+    /// Cache `tx.idx` body range for `fk`.
     pub fn put_body_range(&self, fk: Fk, offset: u64, len: u64) {
         let Some(id) = fk.get() else {
             return;
@@ -599,9 +417,6 @@ impl ConfirmParentCache {
             return;
         };
         let mut g = self.inner.lock().unwrap();
-        let txid = tx.txid;
-        // Resolve legacy reserve waiters into plan.need_fk (no sparse by_fk map).
-        g.fill_reserve_waiters_from_body(id, txid, height, outputs.len() as u32);
         g.insert_body(id, height, tx, outputs, inputs);
     }
 
@@ -879,13 +694,7 @@ impl ConfirmParentCache {
     }
 
     pub fn body_count(&self) -> usize {
-        let g = self.inner.lock().unwrap();
-        // Prefer full-decoded cache bodies (decode-once cache); else mlock pins.
-        if !g.by_body.is_empty() {
-            g.by_body.len()
-        } else {
-            g.mlock_n
-        }
+        self.inner.lock().unwrap().by_body.len()
     }
 
     /// Ensure a height plan exists for `hash`.
@@ -900,8 +709,6 @@ impl ConfirmParentCache {
         g.plans.entry(height).or_insert_with(|| HeightPlan {
             hash,
             scanned: false,
-            need_fk: HashSet::new(),
-            reserved: HashSet::new(),
         });
         if let Some(p) = g.plans.get_mut(&height) {
             p.hash = hash;
@@ -921,8 +728,6 @@ impl ConfirmParentCache {
             g.plans.entry(height).or_insert_with(|| HeightPlan {
                 hash,
                 scanned: false,
-                need_fk: HashSet::new(),
-                reserved: HashSet::new(),
             });
             if let Some(p) = g.plans.get_mut(&height) {
                 p.hash = hash;
@@ -940,14 +745,6 @@ impl ConfirmParentCache {
     /// / optional strict claim; **wait uses [`Self::is_ready`]** like 2-stage.
     pub fn package_ready(&self, height: u32) -> bool {
         self.inner.lock().unwrap().package_ready(height)
-    }
-
-    /// True if height still has open reserved holes (debug / tests).
-    pub fn has_open_reserves(&self, height: u32) -> bool {
-        let g = self.inner.lock().unwrap();
-        g.plans
-            .get(&height)
-            .is_some_and(|p| !p.reserved.is_empty())
     }
 
     /// All heights in `heights` ready (scanned — 2-stage wait).
@@ -1089,34 +886,6 @@ impl ConfirmParentCache {
         }
     }
 
-    /// Reserve a hole for a prevout whose create is still on the runway.
-    ///
-    /// Filled when the create body lands ([`Self::put_body_and_creates`]) via
-    /// body txid match — no sparse by_fk map.
-    pub fn reserve(&self, height: u32, prev_txid: [u8; 32], vout: u32) {
-        let mut g = self.inner.lock().unwrap();
-        // Already have create body with matching txid?
-        if let Some((&id, b)) = g.by_body.iter().find(|(_, b)| b.tx.txid == prev_txid) {
-            if (vout as usize) < b.outputs.len() {
-                if let Some(plan) = g.plans.get_mut(&height) {
-                    plan.need_fk.insert((id, vout));
-                    plan.reserved.remove(&(prev_txid, vout));
-                }
-                g.recompute_ready_through();
-                self.ready_through
-                    .store(g.ready_through, Ordering::Relaxed);
-                return;
-            }
-        }
-        if let Some(plan) = g.plans.get_mut(&height) {
-            plan.reserved.insert((prev_txid, vout));
-        }
-        g.reserve_waiters
-            .entry((prev_txid, vout))
-            .or_default()
-            .insert(height);
-    }
-
 
     /// Look up a populated parent out (for wave fill / connect).
     ///
@@ -1174,14 +943,11 @@ impl ConfirmParentCache {
     }
 
 
-    /// Cached body-range entries (idx offsets for mlock/wave).
+    /// Cached body-range entries (idx offsets for spent filter / annotate).
     pub fn body_range_count(&self) -> usize {
         self.inner.lock().unwrap().body_range.len()
     }
 
-    pub fn reserved_count(&self) -> usize {
-        self.inner.lock().unwrap().reserve_waiters.len()
-    }
 
 
 }
@@ -1444,64 +1210,6 @@ impl Inner {
             .retain(|id, _| self.by_body.contains_key(id));
     }
 
-    /// Resolve legacy reserve waiters when a create body lands (by txid).
-    fn fill_reserve_waiters_from_body(
-        &mut self,
-        id: u64,
-        txid: [u8; 32],
-        _height: u32,
-        n_outputs: u32,
-    ) {
-        if self.reserve_waiters.is_empty() {
-            return;
-        }
-        for v in 0..n_outputs {
-            let key = (txid, v);
-            let Some(waiters) = self.reserve_waiters.remove(&key) else {
-                continue;
-            };
-            for h in waiters {
-                if let Some(plan) = self.plans.get_mut(&h) {
-                    plan.reserved.remove(&key);
-                    plan.need_fk.insert((id, v));
-                }
-            }
-        }
-    }
-
-    /// Drop mlocks whose needing heights are all ≤ tip.
-    /// Returns ranges with full page-ref zero for the caller to `munlock`.
-    fn gc_mlocks(&mut self, tip: u32) -> Vec<MlockRange> {
-        let mut drop_keys: Vec<(u8, u64)> = Vec::new();
-        for (key, rec) in &mut self.mlocked {
-            rec.need_heights.retain(|h| *h > tip);
-            if rec.need_heights.is_empty() {
-                drop_keys.push(*key);
-            }
-        }
-        let mut unlocks: Vec<MlockRange> = Vec::new();
-        for key in drop_keys {
-            let Some(rec) = self.mlocked.remove(&key) else {
-                continue;
-            };
-            self.mlock_n = self.mlock_n.saturating_sub(1);
-            let table = key.0;
-            for p in rec.start_page..rec.end_page {
-                let pk = (table, p);
-                let entry = self.page_refs.entry(pk).or_insert(0);
-                *entry = entry.saturating_sub(1);
-                if *entry == 0 {
-                    self.page_refs.remove(&pk);
-                }
-            }
-            let still = (rec.start_page..rec.end_page)
-                .any(|p| self.page_refs.contains_key(&(table, p)));
-            if !still {
-                unlocks.push(rec.range);
-            }
-        }
-        unlocks
-    }
 
 }
 
@@ -1691,25 +1399,6 @@ mod tests {
 
 
 
-    #[test]
-    fn open_reserves_do_not_block_ready_or_watermark() {
-        // Simulate batch create@1 + spend@2: open reserves must not block package.
-        let c = ConfirmParentCache::new();
-        c.advance_tip(0);
-        seed_coinbase_package(&c, 1, [1u8; 32], 1001);
-        seed_coinbase_package(&c, 2, [2u8; 32], 1002);
-        let t = tx(9);
-        c.reserve(2, t.txid, 0);
-        assert!(c.is_ready(1));
-        assert!(c.is_ready(2));
-        assert!(c.has_open_reserves(2));
-        assert!(c.all_ready(&[1, 2]));
-        assert_eq!(c.ready_through(), 2);
-        assert!(c.headroom_ready(2, 0));
-        c.put_body_and_creates(Fk(90), 1, t, vec![out(1)], vec![]);
-        assert!(!c.has_open_reserves(2));
-        assert_eq!(c.ready_through(), 2);
-    }
 
 
     #[test]
@@ -1941,92 +1630,8 @@ mod tests {
         assert_eq!(c.ready_through(), 1);
     }
 
-    /// Same page_start, longer later note must extend page_refs (mlock leak class).
-    #[test]
-    fn note_mlock_extends_shorter_prior_range() {
-        use rbitcoin_store::{MlockRange, MlockTable};
-        let c = ConfirmParentCache::new();
-        c.advance_tip(0);
-        let short = MlockRange {
-            table: MlockTable::TxBody,
-            page_start: 0,
-            page_len: 4096, // 1 page
-        };
-        let long = MlockRange {
-            table: MlockTable::TxBody,
-            page_start: 0,
-            page_len: 4096 * 4, // 4 pages
-        };
-        c.note_mlock_ranges(1, &[short]);
-        assert_eq!(c.mlock_bytes(), 4096);
-        c.note_mlock_ranges(2, &[long]);
-        // Must track all 4 pages, not stay stuck at 1.
-        assert_eq!(c.mlock_bytes(), 4096 * 4);
-        // need_heights are 1 and 2 — tip past both → unlock after write tip GC.
-        let unlocks = c.advance_tip(10);
-        assert!(
-            unlocks.iter().any(|r| r.page_len >= 4096 * 4),
-            "expected unlock of extended range, got {unlocks:?}"
-        );
-        assert_eq!(c.mlock_bytes(), 0);
-    }
 
-    /// Mlocks release at tip once no remaining need_height > tip (write done).
-    /// Later cache heights that still need a page keep it locked.
-    #[test]
-    fn advance_tip_munlocks_when_write_done_keeps_later_needs() {
-        use rbitcoin_store::{MlockRange, MlockTable};
-        let c = ConfirmParentCache::new();
-        c.advance_tip(0);
-        let r = MlockRange {
-            table: MlockTable::TxBody,
-            page_start: 4096,
-            page_len: 4096,
-        };
-        // Same pages needed by height 5 and height 20.
-        c.note_mlock_ranges(5, &[r]);
-        c.note_mlock_ranges(20, &[r]);
-        assert_eq!(c.mlock_stats().0, 1);
-        // Write finished through 5 — height 20 still needs the page.
-        let unlocks = c.advance_tip(5);
-        assert!(unlocks.is_empty(), "later cache need keeps mlock: {unlocks:?}");
-        assert_eq!(c.mlock_stats().0, 1);
-        // Write finished through 20 — no remaining need → munlock.
-        let unlocks = c.advance_tip(20);
-        assert_eq!(unlocks.len(), 1, "munlock when write done for all needers");
-        assert_eq!(c.mlock_stats().0, 0);
-    }
 
-    /// Materialize batches re-note the same parent body page for later heights
-    /// (covered pin path). Without re-note, tip GC after the first batch would
-    /// munlock while a later in-flight batch still needs the page for annotate.
-    #[test]
-    fn re_note_need_height_after_first_batch_keeps_mlock_across_pipeline() {
-        use rbitcoin_store::{MlockRange, MlockTable};
-        let c = ConfirmParentCache::new();
-        c.advance_tip(0);
-        let r = MlockRange {
-            table: MlockTable::TxBody,
-            page_start: 8192,
-            page_len: 4096,
-        };
-        // Batch A (height 10) mlocks parent body.
-        c.note_mlock_ranges(10, &[r]);
-        assert!(c.is_range_pinned(&r));
-        // Batch B (height 11) finds pin covered — must still re-note need 11.
-        c.note_mlock_ranges(11, &[r]);
-        // Writeback A advances tip through 10; B still in flight.
-        let unlocks = c.advance_tip(10);
-        assert!(
-            unlocks.is_empty(),
-            "batch B need_height must keep parent body mlocked: {unlocks:?}"
-        );
-        assert!(c.is_range_pinned(&r));
-        // Writeback B done.
-        let unlocks = c.advance_tip(11);
-        assert_eq!(unlocks.len(), 1);
-        assert!(!c.is_range_pinned(&r));
-    }
 
     /// Synthetic pressure: many full bodies must leave RAM when tip catches up.
     #[test]
@@ -2116,25 +1721,6 @@ mod tests {
         assert!(c.has_body(Fk(1000)));
     }
 
-    #[test]
-    fn note_mlock_ranges_for_heights_unions_needs() {
-        let c = ConfirmParentCache::new();
-        c.advance_tip(0);
-        let r = MlockRange {
-            table: rbitcoin_store::MlockTable::TxBody,
-            page_start: 0,
-            page_len: 4096,
-        };
-        c.note_mlock_ranges_for_heights(&[5, 6, 7], &[r]);
-        assert!(c.is_range_pinned(&r));
-        // Tip past 5 but not 6/7 — range still held.
-        let unlocks = c.advance_tip(5);
-        assert!(unlocks.is_empty(), "heights 6,7 still need pages");
-        assert!(c.is_range_pinned(&r));
-        let unlocks = c.advance_tip(7);
-        assert!(!unlocks.is_empty());
-        assert!(!c.is_range_pinned(&r));
-    }
 
     /// Slim batch pin: only requested outs, one lock, coinbase hint; no full input clone.
     #[test]

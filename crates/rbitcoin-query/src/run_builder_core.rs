@@ -3,7 +3,7 @@
 //! Pipeline: **memtable → spill sorted run → gradual merge → bulk load at tip**.
 //! No peer-fetch pause / progressive head materialize (removed with Catchup).
 
-use rbitcoin_store::{list_runs, try_set_io_idle, StoreError};
+use rbitcoin_store::{list_runs, StoreError};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -99,7 +99,6 @@ pub fn spawn_worker(
         std::thread::Builder::new()
             .name(thread_name.into())
             .spawn(move || {
-                try_set_io_idle();
                 work();
             })
             .unwrap_or_else(|e| panic!("spawn {thread_name}: {e}")),

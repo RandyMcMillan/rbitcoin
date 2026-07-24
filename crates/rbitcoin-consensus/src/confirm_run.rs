@@ -3,7 +3,7 @@
 //! Pipeline (optimistic scripts — assumevalid-shaped):
 //! ```text
 //! LOAD STAGE (ibd-confirm-load OS thread):
-//!   Class A + pin/mlock parents → resolve → wire → assemble
+//!   Class A + pin parents → resolve → wire → assemble
 //!   (only stage that may touch the store / parent cache)
 //! SCRIPTS STAGE (ibd-confirm OS thread + rayon):
 //!   pure CPU: verify ScriptCheckJob list from LoadedBatch — no Query, no disk
@@ -109,7 +109,7 @@ pub fn confirm_archived_run(
 /// Outcome of load: batch ready for scripts + pure work wall.
 pub struct ConfirmLoadOutcome {
     pub batch: LoadedBatch,
-    /// Full load wall (Class A + parent pin/mlock + resolve → assemble).
+    /// Full load wall (Class A + parent pin + resolve → assemble).
     pub work_ns: u64,
 }
 
@@ -121,7 +121,7 @@ pub struct ConfirmScriptOutcome {
     pub work_ns: u64,
 }
 
-/// LOAD STAGE: load batch Class A + pin/mlock write parents →
+/// LOAD STAGE: load batch Class A + pin parents →
 /// resolve → wire → assemble.
 ///
 /// Does **not** run scripts, advance tip, or probe durable spentness (except
@@ -154,7 +154,7 @@ pub fn confirm_load_phase(
 
     let t_work = Instant::now();
 
-    // Decode bodies, pin parents into batch map, mlock parent create body pages.
+    // Decode bodies, pin parents into batch map.
     let t_load = Instant::now();
     let batch_parents = load_confirm_batch(query, &heights, &items, batch_end)?;
     let load_ns = t_load.elapsed().as_nanos() as u64;
@@ -361,10 +361,10 @@ mod write_idempotent_tests {
 
 // ─── phases ───────────────────────────────────────────────────────────────────
 
-/// Load Class A + pin/mlock write parents for the claimed batch.
+/// Load Class A + pin parents for the claimed batch.
 ///
 /// Inline only: decode bodies, thin edges, sparse parent pin into
-/// [`rbitcoin_query::BatchParents`], mlock parent create body pages.
+/// [`rbitcoin_query::BatchParents`].
 fn load_confirm_batch(
     query: &Query,
     heights: &[u32],

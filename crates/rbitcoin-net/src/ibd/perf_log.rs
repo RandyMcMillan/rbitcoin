@@ -87,9 +87,6 @@ pub(crate) struct IbdPerfSample {
     pub unpin_ns: u64,
     pub cache_tip_ns: u64,
 
-    /// Confirm-load mlocked ranges / unique page RAM.
-    pub mlock_ranges: usize,
-    pub mlock_bytes: u64,
     /// On-disk scripthash sorted runs waiting for tip bulk.
     pub sh_runs: usize,
 
@@ -138,8 +135,6 @@ pub(crate) struct IbdPerfSample {
     pub load_pin_new: u64,
     /// Spent-filter wall on pin path (ms).
     pub load_pin_spent_ms: u64,
-    /// Mlock wall on pin path (ms; 0 when mlock default-off).
-    pub load_pin_mlock_ms: u64,
     /// Pin residual sub-phases (ms): body-LRU / pin_new meta / batch put.
     pub load_pin_body_ms: u64,
     pub load_pin_new_meta_ms: u64,
@@ -162,7 +157,6 @@ pub(crate) struct IbdPerfSample {
     pub conf_write_q_cap: usize,
     /// Runway internal phase ms (window sum).
     pub load_hdr_ms: u64,
-    pub load_body_mlock_ms: u64,
     pub load_decode_ms: u64,
     pub load_thin_ms: u64,
     /// Thin sub-phases (ms window sum).
@@ -174,8 +168,6 @@ pub(crate) struct IbdPerfSample {
     pub load_cache_put_ms: u64,
     pub load_head_lookups: u64,
     pub load_head_hits: u64,
-    pub load_mlock_sys: u64,
-    pub load_mlock_skip: u64,
     pub load_edge_same: u64,
     pub load_edge_cache: u64,
     /// Stamped create_fk, parent outside batch (not a RAM cache hit).
@@ -299,8 +291,6 @@ impl Default for IbdPerfSample {
             load_ns: 0,
             unpin_ns: 0,
             cache_tip_ns: 0,
-            mlock_ranges: 0,
-            mlock_bytes: 0,
             sh_runs: 0,
             wf_body_ms: 0,
             wf_ptx_ms: 0,
@@ -333,7 +323,6 @@ impl Default for IbdPerfSample {
             load_pin_cache_body: 0,
             load_pin_new: 0,
             load_pin_spent_ms: 0,
-            load_pin_mlock_ms: 0,
             load_pin_body_ms: 0,
             load_pin_new_meta_ms: 0,
             load_pin_put_ms: 0,
@@ -349,7 +338,6 @@ impl Default for IbdPerfSample {
             conf_load_q_cap: super::confirm::LOAD_QUEUE_CAP,
             conf_write_q_cap: super::confirm::WRITE_QUEUE_CAP,
             load_hdr_ms: 0,
-            load_body_mlock_ms: 0,
             load_decode_ms: 0,
             load_thin_ms: 0,
             load_thin_collect_ms: 0,
@@ -360,8 +348,6 @@ impl Default for IbdPerfSample {
             load_cache_put_ms: 0,
             load_head_lookups: 0,
             load_head_hits: 0,
-            load_mlock_sys: 0,
-            load_mlock_skip: 0,
             load_edge_same: 0,
             load_edge_cache: 0,
             load_edge_fk: 0,
@@ -440,8 +426,6 @@ pub(crate) fn sample(
     load: (u32, u32, usize, usize, usize),
     conf_load_q: usize,
     conf_write_q: usize,
-    mlock_ranges: usize,
-    mlock_bytes: u64,
     sh_runs: usize,
     // Live archive sticky (len, cap).
     arch_sticky: (usize, usize),
@@ -545,8 +529,6 @@ pub(crate) fn sample(
         load_ns,
         unpin_ns,
         cache_tip_ns,
-        mlock_ranges,
-        mlock_bytes,
         sh_runs,
         wf_body_ms: ns_ms(wf_body),
         wf_ptx_ms: ns_ms(wf_ptx),
@@ -579,7 +561,6 @@ pub(crate) fn sample(
         load_pin_cache_body: pw.pin_cache_body,
         load_pin_new: pw.pin_new,
         load_pin_spent_ms: ns_ms(pw.pin_spent_ns),
-        load_pin_mlock_ms: ns_ms(pw.pin_mlock_ns),
         load_pin_body_ms: ns_ms(pw.pin_body_ns),
         load_pin_new_meta_ms: ns_ms(pw.pin_new_meta_ns),
         load_pin_put_ms: ns_ms(pw.pin_put_ns),
@@ -595,7 +576,6 @@ pub(crate) fn sample(
         conf_load_q_cap: super::confirm::LOAD_QUEUE_CAP,
         conf_write_q_cap: super::confirm::WRITE_QUEUE_CAP,
         load_hdr_ms: ns_ms(pw.header_ns),
-        load_body_mlock_ms: ns_ms(pw.body_mlock_ns),
         load_decode_ms: ns_ms(pw.body_decode_ns),
         load_thin_ms: ns_ms(pw.thin_ns),
         load_thin_collect_ms: ns_ms(pw.thin_collect_ns),
@@ -606,8 +586,6 @@ pub(crate) fn sample(
         load_cache_put_ms: ns_ms(pw.cache_put_ns),
         load_head_lookups: pw.head_lookups,
         load_head_hits: pw.head_hits,
-        load_mlock_sys: pw.mlock_syscalls,
-        load_mlock_skip: pw.mlock_skipped,
         load_edge_same: pw.edge_same_batch,
         load_edge_cache: pw.edge_cache,
         load_edge_fk: pw.edge_fk,
@@ -721,7 +699,6 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             0
         }
     };
-    let mlock_mb = s.mlock_bytes / (1024 * 1024);
     let conf_q = super::confirm::format_conf_q(
         s.conf_load_q,
         s.conf_write_q,
@@ -729,7 +706,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.conf_write_q_cap,
     );
     out.push_str(&format!(
-        " | {conf_q} | parents thru={} bodies={} plans={} blks={} body_io={} parent_io={} pin_cache={} pin_new={} pin_hit%={} {}ms (hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) spent={}ms mlock_pin={}ms pin_sub body={} new={} put={} head={}/{} mlock_sys={}/{} mlock={mlock_mb}MiB ranges={} sh_runs={}",
+        " | {conf_q} | parents thru={} bodies={} plans={} blks={} body_io={} parent_io={} pin_cache={} pin_new={} pin_hit%={} {}ms (hdr={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) spent={}ms pin_sub body={} new={} put={} head={}/{} sh_runs={}",
         s.load_ready_through,
         s.cache_bodies,
         s.cache_plans,
@@ -741,7 +718,6 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         pin_hit_pct,
         s.load_win_ms,
         s.load_hdr_ms,
-        s.load_body_mlock_ms,
         s.load_decode_ms,
         s.load_thin_ms,
         s.load_thin_collect_ms,
@@ -751,15 +727,11 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.load_parent_pin_ms,
         s.load_cache_put_ms,
         s.load_pin_spent_ms,
-        s.load_pin_mlock_ms,
         s.load_pin_body_ms,
         s.load_pin_new_meta_ms,
         s.load_pin_put_ms,
         s.load_head_hits,
         s.load_head_lookups,
-        s.load_mlock_sys,
-        s.load_mlock_skip,
-        s.mlock_ranges,
         s.sh_runs,
     ));
     if s.load_missing_parents > 0 {
@@ -822,7 +794,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.sh_index_ms,
     ));
     let cp_tot = s.cp_wave + s.cp_class_a + s.cp_store;
-    let mlock_mb = s.mlock_bytes / (1024 * 1024);
     let conf_q = super::confirm::format_conf_q(
         s.conf_load_q,
         s.conf_write_q,
@@ -830,7 +801,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.conf_write_q_cap,
     );
     out.push_str(&format!(
-        " | {conf_q} | parents thru={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cache={} pin_new={} body_io={} parent_io={} miss_p={} phases_ms hdr={} mlock={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} spent={}ms mlock_pin={}ms pin_sub body={} new={} put={} head={}/{} mlock_sys={}/{} edges same={} cache={} fk={} head={} cb={} mlock={mlock_mb}MiB ranges={} sh_runs={} | connect wave%={} parent%={} store%={}",
+        " | {conf_q} | parents thru={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cache={} pin_new={} body_io={} parent_io={} miss_p={} phases_ms hdr={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} spent={}ms pin_sub body={} new={} put={} head={}/{} edges same={} cache={} fk={} head={} cb={} sh_runs={} | connect wave%={} parent%={} store%={}",
         s.load_ready_through,
         s.cache_bodies,
         s.cache_plans,
@@ -846,7 +817,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.load_parent_tx_reads,
         s.load_missing_parents,
         s.load_hdr_ms,
-        s.load_body_mlock_ms,
         s.load_decode_ms,
         s.load_thin_ms,
         s.load_thin_collect_ms,
@@ -856,20 +826,16 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.load_parent_pin_ms,
         s.load_cache_put_ms,
         s.load_pin_spent_ms,
-        s.load_pin_mlock_ms,
         s.load_pin_body_ms,
         s.load_pin_new_meta_ms,
         s.load_pin_put_ms,
         s.load_head_hits,
         s.load_head_lookups,
-        s.load_mlock_sys,
-        s.load_mlock_skip,
         s.load_edge_same,
         s.load_edge_cache,
         s.load_edge_fk,
         s.load_edge_head,
         s.load_edge_cb,
-        s.mlock_ranges,
         s.sh_runs,
         if cp_tot > 0 {
             (100 * s.cp_wave) / cp_tot
@@ -1052,8 +1018,6 @@ mod tests {
         s.load_pin_cache_body = 8;
         s.load_pin_new = 12;
         s.load_win_ms = 40;
-        s.mlock_bytes = 32 * 1024 * 1024;
-        s.mlock_ranges = 12;
         s.sh_runs = 3;
         let line = format_info(&s);
         assert!(line.contains("conf_q load=1/2 write=2/2"), "{line}");
@@ -1066,7 +1030,7 @@ mod tests {
         // pin_hit% = 8/(8+12) = 40
         assert!(line.contains("pin_hit%=40"), "{line}");
         assert!(!line.contains("cache%="), "{line}");
-        assert!(line.contains("mlock=32MiB ranges=12 sh_runs=3"), "{line}");
+        assert!(line.contains("sh_runs=3"), "{line}");
         assert!(!line.contains("reserved"), "{line}");
         assert!(!line.contains("confirm_phases"), "{line}");
         assert!(!line.contains("mat="), "{line}");
@@ -1097,8 +1061,6 @@ mod tests {
         s.load_pin_new = 38;
         s.pipe.write_blocks = 5;
         s.pipe.write_ns = 5_000_000;
-        s.mlock_bytes = 16 * 1024 * 1024;
-        s.mlock_ranges = 4;
         s.sh_runs = 2;
         let line = format_debug(&s);
         assert!(line.starts_with("ibd: perf_dbg "), "{line}");
@@ -1120,7 +1082,7 @@ mod tests {
         assert!(line.contains("body_io=200 parent_io=50"), "{line}");
         assert!(line.contains("pin_cache=0 pin_new=38"), "{line}");
         assert!(!line.contains("pin_cached="), "{line}");
-        assert!(line.contains("mlock=16MiB ranges=4 sh_runs=2"), "{line}");
+        assert!(line.contains("sh_runs=2"), "{line}");
         assert!(line.contains("arch_res resolve_us/blk="), "{line}");
         assert!(line.contains("arch_prep total="), "{line}");
         assert!(line.contains("probe="), "{line}");

@@ -7,7 +7,7 @@
 //!   same file, then swaps an `Arc` pointer. Readers pin the epoch they load;
 //!   old epochs live until the last pin drops (same idea as `tx.head` shadow
 //!   swap — no reader pause for capacity).
-//! - Steady-state **read / write / mlock** do **not** take a map mutex.
+//! - Steady-state **read / write** do **not** take a map mutex.
 //! - `File` is only locked for grow (`fallocate`/`set_len`), fsync, and fadvise.
 //!
 //! Roles (see `AGENTS.md` / `docs/concurrency.md`): at most one appender and one
@@ -536,81 +536,6 @@ impl TableFile {
         Ok(f(slice))
     }
 
-    pub fn mlock_range(&self, offset: u64, len: u64) -> Result<(u64, u64), StoreError> {
-        if len == 0 {
-            return Ok((0, 0));
-        }
-        #[cfg(unix)]
-        {
-            let page = page_size() as u64;
-            if page == 0 {
-                return Ok((0, 0));
-            }
-            let end = offset.saturating_add(len);
-            let start_pg = offset & !(page - 1);
-            let end_pg = end.saturating_add(page - 1) & !(page - 1);
-            let pin = self.pin();
-            let map_len = pin.epoch.cap();
-            if start_pg >= map_len {
-                return Ok((0, 0));
-            }
-            let lock_end = end_pg.min(map_len);
-            let lock_len = lock_end.saturating_sub(start_pg);
-            if lock_len == 0 {
-                return Ok((0, 0));
-            }
-            let ptr = unsafe { pin.epoch.as_ptr().add(start_pg as usize) } as *const libc::c_void;
-            let rc = unsafe { libc::mlock(ptr, lock_len as usize) };
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                rbitcoin_log::warn!(
-                    "store: mlock failed path={} off={start_pg} len={lock_len}: {err} \
-                     (raise RLIMIT_MEMLOCK / LimitMEMLOCK; soft budget may be exhausted)",
-                    self.path.display()
-                );
-                return Err(StoreError::io(&self.path, err));
-            }
-            return Ok((start_pg, lock_len));
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (offset, len);
-            Ok((0, 0))
-        }
-    }
-
-    pub fn munlock_range(&self, page_start: u64, page_len: u64) {
-        if page_len == 0 {
-            return;
-        }
-        #[cfg(unix)]
-        {
-            let pin = self.pin();
-            let map_len = pin.epoch.cap();
-            if page_start >= map_len {
-                return;
-            }
-            let unlock_len = page_len.min(map_len.saturating_sub(page_start)) as usize;
-            if unlock_len == 0 {
-                return;
-            }
-            let ptr =
-                unsafe { pin.epoch.as_ptr().add(page_start as usize) } as *const libc::c_void;
-            let rc = unsafe { libc::munlock(ptr, unlock_len) };
-            if rc != 0 {
-                rbitcoin_log::trace!(
-                    "store: munlock failed path={} off={page_start} len={unlock_len}: {}",
-                    self.path.display(),
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (page_start, page_len);
-        }
-    }
-
     pub fn advise_dont_need(&self, offset: u64, len: u64) {
         if len == 0 {
             return;
@@ -713,33 +638,7 @@ mod advise_tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn mlock_range_roundtrip_or_soft_fail() {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let id = N.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("rbitcoin-mlock-{id}"));
-        let _ = std::fs::remove_file(&path);
-        let f = TableFile::create(&path, TableKind::Tx).unwrap();
-        let payload = vec![0xcd_u8; 8 * 1024];
-        f.write_at(FILE_HEADER_LEN as u64, &payload).unwrap();
-        match f.mlock_range(FILE_HEADER_LEN as u64, payload.len() as u64) {
-            Ok((start, len)) => {
-                assert!(len > 0 || payload.is_empty());
-                f.munlock_range(start, len);
-            }
-            Err(_) => {}
-        }
-        let mut buf = vec![0u8; payload.len()];
-        f.read_at(FILE_HEADER_LEN as u64, &mut buf).unwrap();
-        assert_eq!(buf, payload);
-        let _ = std::fs::remove_file(&path);
-    }
 
-    #[test]
-    fn ensure_memlock_budget_is_callable() {
-        let (soft, hard) = ensure_memlock_budget();
-        let _ = (soft, hard);
-    }
 
     #[test]
     fn concurrent_readers_during_append_and_grow() {
@@ -825,95 +724,8 @@ mod advise_tests {
     }
 }
 
-/// Best-effort: set calling thread to Linux I/O priority idle (like `ionice -c3`).
-pub fn try_set_io_idle() {
-    #[cfg(target_os = "linux")]
-    {
-        const IOPRIO_WHO_PROCESS: libc::c_int = 1;
-        const IOPRIO_CLASS_IDLE: libc::c_int = 3;
-        let prio = (IOPRIO_CLASS_IDLE << 13) as libc::c_int;
-        let rc = unsafe { libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, prio) };
-        if rc == 0 {
-            rbitcoin_log::debug!("store: set IOPRIO_CLASS_IDLE on thread");
-        }
-    }
-}
-
-/// Best-effort: best-effort I/O class, highest priority within class (shutdown spill).
-pub fn try_set_io_best_effort() {
-    #[cfg(target_os = "linux")]
-    {
-        const IOPRIO_WHO_PROCESS: libc::c_int = 1;
-        const IOPRIO_CLASS_BE: libc::c_int = 2;
-        let prio = (IOPRIO_CLASS_BE << 13) as libc::c_int;
-        let rc = unsafe { libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, prio) };
-        if rc == 0 {
-            rbitcoin_log::debug!("store: set IOPRIO_CLASS_BE (high) on thread");
-        }
-    }
-}
-
 pub const NOFILE_SOFT_TARGET: u64 = 16_384;
 
-pub fn ensure_memlock_budget() -> (u64, u64) {
-    #[cfg(unix)]
-    {
-        let mut rlim = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rlim) } != 0 {
-            rbitcoin_log::warn!(
-                "store: getrlimit(MEMLOCK) failed: {}",
-                std::io::Error::last_os_error()
-            );
-            return (0, 0);
-        }
-        let hard = rlim.rlim_max as u64;
-        let soft = rlim.rlim_cur as u64;
-        let inf = libc::RLIM_INFINITY as u64;
-        let hard_is_inf = rlim.rlim_max == libc::RLIM_INFINITY || hard == u64::MAX || hard == inf;
-        let soft_is_inf = rlim.rlim_cur == libc::RLIM_INFINITY || soft == u64::MAX || soft == inf;
-        if soft_is_inf || soft == hard {
-            if !soft_is_inf && soft < 64 * 1024 * 1024 {
-                rbitcoin_log::warn!(
-                    "store: RLIMIT_MEMLOCK soft=hard={soft} bytes (~{} MiB); \
-                     confirm mlock may fail — raise hard LimitMEMLOCK (e.g. 8G)",
-                    soft / (1024 * 1024)
-                );
-            } else {
-                rbitcoin_log::debug!(
-                    "store: RLIMIT_MEMLOCK soft={soft} hard={hard} (already at hard)"
-                );
-            }
-            return (soft, hard);
-        }
-        rlim.rlim_cur = rlim.rlim_max;
-        if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) } != 0 {
-            rbitcoin_log::warn!(
-                "store: setrlimit(MEMLOCK) soft {soft}→{hard} failed: {}",
-                std::io::Error::last_os_error()
-            );
-            return (soft, hard);
-        }
-        let new_soft = rlim.rlim_cur as u64;
-        rbitcoin_log::info!(
-            "store: raised RLIMIT_MEMLOCK soft {soft}→{new_soft} (hard={hard})"
-        );
-        if !hard_is_inf && hard < 64 * 1024 * 1024 {
-            rbitcoin_log::warn!(
-                "store: RLIMIT_MEMLOCK hard={hard} bytes (~{} MiB) is low for body mlock; \
-                 set hard LimitMEMLOCK=8G (NixOS loginLimits / systemd)",
-                hard / (1024 * 1024)
-            );
-        }
-        return (new_soft, hard);
-    }
-    #[cfg(not(unix))]
-    {
-        (0, 0)
-    }
-}
 
 pub fn ensure_nofile_budget() -> (u64, u64) {
     ensure_nofile_budget_at_least(NOFILE_SOFT_TARGET)

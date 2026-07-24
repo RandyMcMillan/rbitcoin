@@ -84,15 +84,13 @@ prefer a **fresh datadir**.
 
 New stores (schema **v10**): **header.head** = **single** open-address file (~24 MiB
 pre-size; not 256-way), **scripthash** 16 shards, **tx.head** = single address file
-starting at mainnet **BITS=28** (~**1 GiB** sparse, `2^28` × **4 B** create_fk;
-override with `RBITCOIN_TX_HEAD_BITS` in `8..=34` / tiny scale). Probe is **linear**
-from primary `h1(txid)` (adjacent slots; page-friendly). **Online sequential
-resize** when `txs.count()/slots ≥ 0.75`: rebuild shadow from dense `tx.idx` order
-(batch idx pread + io_uring/parallel body-txid prefixes, ordered `insert_many` into
-`tx.head.new`; no dual-write on archive), then atomic rename. BITS **33+** use **8 B** entries.
-`tx.head.meta` **v2** marks linear probe; older meta / missing meta forces recreate +
-rebuild from Class A on open. Online resize fill runs on a **dedicated OS thread**
-(`rbitcoin-tx-head-resize`); archive only waits if insert hits probe exhaust.
+starting at mainnet **BITS=26** (~**256 MiB** sparse, `2^26` × **4 B** create_fk;
+override with `RBITCOIN_TX_HEAD_BITS` in `8..=34` / tiny scale). Probe is **page-local**:
+high txid bits select a 1024-slot page, double-hash within the page (one 4 KiB IO @ 4 B).
+**Online sequential resize** when `txs.count()/slots ≥ 0.75` or first deep insert
+(depth>128) / probe exhaust: shadow rebuild on a **dedicated OS thread**
+(`rbitcoin-tx-head-resize`). BITS **33+** use **8 B** entries. `tx.head.meta` **v3** =
+page-local probe; older meta forces recreate + rebuild from Class A.
 **tx_height** uses 4 B height slots (not fk width). Dense Class A fk + **tx.idx**
 retained. Packed Class A only. Spends are schema-v5 annotations on create outputs
 (no `point.head`).

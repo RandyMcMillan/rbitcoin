@@ -1118,11 +1118,9 @@ impl TxTable {
 
     /// Batch head resolve (archive prep bulk path).
     ///
-    /// **Probe:** one ~[`crate::address_head::PROBE_REGION_BYTES`] pread per key
-    /// from the linear-probe home (io_uring / parallel); scan entries in memory;
-    /// only another region if the response was short/partial and no empty was
-    /// found. **Then** idx + body-prefix waves for all candidates (same as
-    /// before). BIP30: deepest matching body wins.
+    /// **Probe:** one full **page** pread per key (io_uring / parallel), then
+    /// in-page double-hash hop in RAM. **Then** idx + body-prefix waves for all
+    /// candidates. BIP30: deepest matching body wins.
     ///
     /// Timers: [`crate::head_resolve_stats`] probe / idx / body (per-wave wall).
     pub fn get_fk_by_txid_batch(
@@ -1130,7 +1128,8 @@ impl TxTable {
         txids: &[[u8; 32]],
     ) -> Result<Vec<([u8; 32], Option<Fk>)>, StoreError> {
         use crate::address_head::{
-            entry_file_off, h1, probe_region_want, scan_probe_region, MAX_PROBE,
+            h1_in_page, h2_in_page, hop_scan_page, page_file_off, page_pread_len,
+            page_slot_count, MAX_PROBE,
         };
         use crate::bulk_io::{self, ReadOp};
         use std::time::Instant;
@@ -1160,143 +1159,73 @@ impl TxTable {
         let idx_pub = self.body.idx_published_len();
         let count = self.body.count();
         let body_logical = self.body.body_logical_len().max(crate::file::FILE_HEADER_LEN as u64);
-        let mask = head_slots - 1;
         let es = entry_bytes;
+        let page_slots = page_slot_count(bits);
 
-        /// Per-key probe cursor until empty / MAX_PROBE.
-        struct ProbeCur {
-            slot: u64,
-            depth: u32,
-            done: bool,
-            /// (depth, fk)
-            cands: Vec<(u32, u64)>,
-        }
-
-        let mut probes: Vec<ProbeCur> = txids
+        // --- Phase 1: one page pread per key ---
+        let t_probe = Instant::now();
+        let wants: Vec<usize> = txids
             .iter()
-            .map(|txid| ProbeCur {
-                slot: h1(txid, bits),
-                depth: 0,
-                done: false,
-                cands: Vec::new(),
-            })
+            .map(|t| page_pread_len(t, bits, es, head_slots, head_pub))
+            .collect();
+        let offs: Vec<u64> = txids
+            .iter()
+            .map(|t| page_file_off(t, bits, es))
             .collect();
 
-        // --- Phase 1: region probe (parallel across keys) ---
+        let mut cands_by_key: Vec<Vec<(u32, u64)>> = vec![Vec::new(); txids.len()];
         let mut cands_total = 0u64;
-        while probes.iter().any(|p| !p.done) {
-            let t_wave = Instant::now();
-            let active: Vec<usize> = probes
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| !p.done)
-                .map(|(i, _)| i)
-                .collect();
-            if active.is_empty() {
-                break;
-            }
 
-            // want + file_off per active key (0 want → wrap / skip IO).
-            let mut wants: Vec<usize> = Vec::with_capacity(active.len());
-            let mut offs: Vec<u64> = Vec::with_capacity(active.len());
-            for &i in &active {
-                let p = &probes[i];
-                let mut slot = p.slot;
-                let mut want = probe_region_want(slot, head_slots, es, head_pub);
-                if want == 0 && slot != 0 {
-                    slot = 0;
-                    probes[i].slot = 0;
-                    want = probe_region_want(0, head_slots, es, head_pub);
-                }
-                wants.push(want);
-                offs.push(if want > 0 {
-                    entry_file_off(slot, es)
-                } else {
-                    0
+        let io_keys: Vec<usize> = wants
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| **w > 0)
+            .map(|(i, _)| i)
+            .collect();
+        if !io_keys.is_empty() {
+            let total: usize = io_keys.iter().map(|&i| wants[i]).sum();
+            let mut arena = vec![0u8; total.max(1)];
+            let mut spans: Vec<(usize, usize, usize)> = Vec::with_capacity(io_keys.len());
+            let mut aoff = 0usize;
+            for &i in &io_keys {
+                let w = wants[i];
+                spans.push((i, w, aoff));
+                aoff += w;
+            }
+            let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(spans.len());
+            for &(i, w, a) in &spans {
+                let ptr = arena[a..a + w].as_mut_ptr();
+                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, w) };
+                read_ops.push(ReadOp {
+                    fd: head_fd,
+                    offset: offs[i],
+                    buf: slice,
+                    result: i32::MIN,
                 });
             }
-
-            let io_keys: Vec<usize> = active
-                .iter()
-                .copied()
-                .zip(wants.iter().copied())
-                .filter(|(_, w)| *w > 0)
-                .map(|(i, _)| i)
-                .collect();
-
-            if !io_keys.is_empty() {
-                let total: usize = io_keys
-                    .iter()
-                    .map(|&i| {
-                        let ai = active.iter().position(|&x| x == i).unwrap();
-                        wants[ai]
-                    })
-                    .sum();
-                let mut arena = vec![0u8; total.max(1)];
-                let mut spans: Vec<(usize, usize, usize)> = Vec::with_capacity(io_keys.len());
-                // (key_i, want, arena_off)
-                let mut aoff = 0usize;
-                for &i in &io_keys {
-                    let ai = active.iter().position(|&x| x == i).unwrap();
-                    let w = wants[ai];
-                    spans.push((i, w, aoff));
-                    aoff += w;
+            bulk_io::pread_batch(&mut read_ops);
+            for (ro, &(key_i, want, a)) in read_ops.iter().zip(spans.iter()) {
+                if ro.result < 0 {
+                    return Err(StoreError::io(
+                        &head_path,
+                        std::io::Error::from_raw_os_error(-ro.result),
+                    ));
                 }
-                // SAFETY: disjoint arena slices.
-                let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(spans.len());
-                for &(i, w, a) in &spans {
-                    let ai = active.iter().position(|&x| x == i).unwrap();
-                    let ptr = arena[a..a + w].as_mut_ptr();
-                    let slice = unsafe { std::slice::from_raw_parts_mut(ptr, w) };
-                    read_ops.push(ReadOp {
-                        fd: head_fd,
-                        offset: offs[ai],
-                        buf: slice,
-                        result: i32::MIN,
-                    });
-                }
-                bulk_io::pread_batch(&mut read_ops);
-
-                for (ro, &(key_i, want, a)) in read_ops.iter().zip(spans.iter()) {
-                    if ro.result < 0 {
-                        return Err(StoreError::io(
-                            &head_path,
-                            std::io::Error::from_raw_os_error(-ro.result),
-                        ));
-                    }
-                    // Partial/short is OK — scan what we got (entry-align).
-                    let got = (ro.result as usize).min(want);
-                    let esz = es as usize;
-                    let n = (got / esz) * esz;
-                    let buf = &arena[a..a + n];
-                    let p = &mut probes[key_i];
-                    let scan = scan_probe_region(buf, es, p.depth, MAX_PROBE);
-                    for &(d, fk) in &scan.cands {
-                        p.cands.push((d, fk));
-                        cands_total = cands_total.saturating_add(1);
-                    }
-                    if scan.hit_empty || p.depth.saturating_add(scan.slots_advanced) >= MAX_PROBE
-                    {
-                        p.done = true;
-                    } else if scan.slots_advanced == 0 {
-                        p.done = true;
-                    } else {
-                        p.slot = p.slot.wrapping_add(u64::from(scan.slots_advanced)) & mask;
-                        p.depth = p.depth.saturating_add(scan.slots_advanced);
-                    }
+                let got = (ro.result as usize).min(want);
+                let esz = es as usize;
+                let n = (got / esz) * esz;
+                let buf = &arena[a..a + n];
+                let txid = &txids[key_i];
+                let h1p = h1_in_page(txid, bits);
+                let h2p = h2_in_page(txid, bits);
+                let scan = hop_scan_page(buf, es, h1p, h2p, page_slots, MAX_PROBE);
+                for &(d, fk) in &scan.cands {
+                    cands_by_key[key_i].push((d, fk));
+                    cands_total = cands_total.saturating_add(1);
                 }
             }
-
-            // Keys with want==0 after wrap attempt: done (no more table).
-            for &i in &active {
-                let ai = active.iter().position(|&x| x == i).unwrap();
-                if wants[ai] == 0 {
-                    probes[i].done = true;
-                }
-            }
-
-            crate::head_resolve_stats::add_probe(t_wave.elapsed().as_nanos() as u64);
         }
+        crate::head_resolve_stats::add_probe(t_probe.elapsed().as_nanos() as u64);
 
         // --- Phase 2: idx + body for every candidate ---
         #[derive(Clone, Copy)]
@@ -1332,8 +1261,8 @@ impl TxTable {
             .collect();
 
         let mut scheduled: Vec<Op> = Vec::new();
-        for (i, p) in probes.iter().enumerate() {
-            for &(d, fk) in &p.cands {
+        for (i, cands) in cands_by_key.iter().enumerate() {
+            for &(d, fk) in cands {
                 scheduled.push(Op {
                     key_i: i as u32,
                     stage: Stage::Idx {

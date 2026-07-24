@@ -20,19 +20,17 @@
 //! first, body-verify — so the deepest same-txid create wins (newest under
 //! append-deeper insert).
 //!
-//! **Probe:** **linear** from primary slot `h1(txid)` (`slot = (h1 + d) mod 2^bits`),
-//! capped at [`MAX_PROBE`]. Lookup/insert load a **[`PROBE_REGION_BYTES`] (2048 B)**
-//! contiguous run from the current slot in one IO, scan entries in memory, and only
-//! issue another region read if no empty was found (short/partial first response is
-//! fine — kernel/page boundaries are not special-cased). Foreign occupants are normal
-//! on lookup: body mismatch ⇒ continue. (Keyless entries cannot Robin-Hood: foreigner
-//! probe depth is unknown without a body read.)
-//! First insert at depth > [`PROBE_DEPTH_WARN`] requests online resize (see
-//! [`take_probe_depth_resize_request`]).
+//! **Probe (page-local open address):** high bits of the txid select a **page** of
+//! [`PAGE_SLOTS`] (2¹⁰) slots; within the page, **double hashing** with the next
+//! key bits (`h1` / odd `h2`). Depth is capped at [`MAX_PROBE`] (= page size).
+//! Lookup/insert load **one page** (4 KiB @ 4 B entries) then hop in RAM — one IO
+//! for all candidates. Foreign occupants: body mismatch ⇒ continue. Keyless slots
+//! cannot Robin-Hood. First insert at depth > [`PROBE_DEPTH_WARN`] requests online
+//! resize ([`take_probe_depth_resize_request`]).
 //!
-//! **Mainnet default:** BITS=28 → **1 GiB** sparse @ 4 B entries. Online resize
-//! widens BITS (sequential rebuild from `tx.idx`); entry width becomes 8 B at
-//! BITS ≥ 33. Load trigger: [`HEAD_LOAD_START`] (0.75).
+//! **Mainnet default:** BITS=**26** → **256 MiB** sparse @ 4 B (`2^16` pages × 4 KiB).
+//! Online resize widens BITS; entry width becomes 8 B at BITS ≥ 33 (page then 8 KiB —
+//! two OS pages; future tuning). Load trigger: [`HEAD_LOAD_START`] (0.75).
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
@@ -42,13 +40,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// Hard cap — never scan the whole table.
-pub const MAX_PROBE: u32 = 256;
+/// In-page slot index width (1024 slots / page @ any entry width).
+pub const PAGE_SLOT_BITS: u32 = 10;
+/// Slots per page (`2^PAGE_SLOT_BITS`).
+pub const PAGE_SLOTS: u64 = 1 << PAGE_SLOT_BITS;
 
-/// Bytes requested per head probe IO (covers [`MAX_PROBE`] × 8 B entries).
-/// Kernel may return a short/partial length; callers scan what they got and only
-/// request another region if no empty slot appears.
-pub const PROBE_REGION_BYTES: usize = 2048;
+/// Hard cap — full in-page exploration (never leave the page).
+pub const MAX_PROBE: u32 = 1024;
+
+/// Max bytes of one head page load (1024 × 8 B). 4 B entries use half.
+pub const PROBE_REGION_BYTES: usize = (PAGE_SLOTS as usize) * 8;
 
 /// Inserts that needed probe depth **> [`PROBE_DEPTH_WARN`]** (warning band).
 /// Cumulative counter for lagging/retry logs; WARN only once at first event.
@@ -67,8 +68,8 @@ static PROBE_DEPTH_RESIZE_REQUEST: std::sync::atomic::AtomicBool =
 /// trigger an early online resize request (first event only).
 pub const PROBE_DEPTH_WARN: u32 = 128;
 
-/// Mainnet address width (2^28 slots × 4 B = 1 GiB sparse). Online resize grows.
-pub const MAINNET_BITS: u32 = 28;
+/// Mainnet address width (2^26 slots × 4 B = 256 MiB sparse). Online resize grows.
+pub const MAINNET_BITS: u32 = 26;
 /// Tiny / unit-test width.
 pub const TINY_BITS: u32 = 16;
 /// Maximum supported address width (probe + create).
@@ -139,9 +140,9 @@ fn note_probe_exhausted() {
 }
 
 const META_MAGIC: &[u8; 4] = b"THM1";
-/// `2` = linear probe from `h1`. Version `1` was double-hash (`h1 + d·h2`); open
-/// refuses v1 so [`crate::tx_table::TxTable::open`] recreates + rebuilds.
-const META_VERSION: u16 = 2;
+/// `3` = page-local double-hash (10-bit page slots). v2 linear / v1 global double-hash
+/// refused so open recreates + rebuilds.
+const META_VERSION: u16 = 3;
 
 /// On-disk / in-memory address-head geometry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,26 +202,76 @@ pub fn entry_bytes_for_bits(bits: u32) -> u8 {
     }
 }
 
-/// Leading `bits` of the txid as a big-endian bit stream (supports bits up to 34).
-/// Primary home slot for linear probing.
+/// First 8 bytes of txid as big-endian u64 (bit stream for page / h1).
 #[inline]
-pub fn h1(txid: &[u8; 32], bits: u32) -> u64 {
-    debug_assert!((MIN_BITS..=MAX_BITS).contains(&bits));
-    // First 8 bytes cover up to 64 bits; we only need ≤34.
-    let v = u64::from_be_bytes([
+fn key_be_u64(txid: &[u8; 32]) -> u64 {
+    u64::from_be_bytes([
         txid[0], txid[1], txid[2], txid[3], txid[4], txid[5], txid[6], txid[7],
-    ]);
-    v >> (64 - bits)
+    ])
 }
 
-/// Probe index at depth `d` (**linear** from [`h1`]).
+/// Page index from the **top** `(bits - 10)` bits of the txid (0 if bits ≤ 10).
+#[inline]
+pub fn page_index(txid: &[u8; 32], bits: u32) -> u64 {
+    debug_assert!((MIN_BITS..=MAX_BITS).contains(&bits));
+    if bits <= PAGE_SLOT_BITS {
+        return 0;
+    }
+    let page_bits = bits - PAGE_SLOT_BITS;
+    key_be_u64(txid) >> (64 - page_bits)
+}
+
+/// In-page h1: next 10 bits after the page-select field (mod 2^10).
+#[inline]
+pub fn h1_in_page(txid: &[u8; 32], bits: u32) -> u64 {
+    let v = key_be_u64(txid);
+    if bits <= PAGE_SLOT_BITS {
+        return (v >> (64 - bits)) & ((1u64 << bits) - 1);
+    }
+    let page_bits = bits - PAGE_SLOT_BITS;
+    // Bits [page_bits, page_bits+10) of the BE stream.
+    (v >> (64 - page_bits - PAGE_SLOT_BITS)) & (PAGE_SLOTS - 1)
+}
+
+/// In-page odd step from a second window of the txid (1,3,… within the page).
+#[inline]
+pub fn h2_in_page(txid: &[u8; 32], bits: u32) -> u64 {
+    let v = u64::from_be_bytes([
+        txid[4], txid[5], txid[6], txid[7], txid[8], txid[9], txid[10], txid[11],
+    ]);
+    let mask = if bits <= PAGE_SLOT_BITS {
+        (1u64 << bits) - 1
+    } else {
+        PAGE_SLOTS - 1
+    };
+    (v | 1) & mask
+}
+
+/// Global slot at probe depth `d`: page from high bits, double-hash within page.
 ///
-/// `slot(d) = (h1(txid) + d) mod 2^bits`. Adjacent depths are consecutive slots
-/// (wrap at table end), matching `HashHead` / `ScriptHashHead` locality.
+/// `slot = (page << 10) | ((h1 + d·h2) mod 1024)` when `bits > 10`.
 #[inline]
 pub fn probe_index(txid: &[u8; 32], d: u32, bits: u32) -> u64 {
-    let mask = (1u64 << bits) - 1;
-    h1(txid, bits).wrapping_add(u64::from(d)) & mask
+    debug_assert!((MIN_BITS..=MAX_BITS).contains(&bits));
+    let h1 = h1_in_page(txid, bits);
+    let h2 = h2_in_page(txid, bits);
+    if bits <= PAGE_SLOT_BITS {
+        let mask = (1u64 << bits) - 1;
+        return h1.wrapping_add(u64::from(d).wrapping_mul(h2)) & mask;
+    }
+    let page = page_index(txid, bits);
+    let local = h1.wrapping_add(u64::from(d).wrapping_mul(h2)) & (PAGE_SLOTS - 1);
+    (page << PAGE_SLOT_BITS) | local
+}
+
+/// Number of slots in the probe page for this table width.
+#[inline]
+pub fn page_slot_count(bits: u32) -> u64 {
+    if bits <= PAGE_SLOT_BITS {
+        1u64 << bits
+    } else {
+        PAGE_SLOTS
+    }
 }
 
 /// Absolute file offset of open-address slot `slot` (4 B or 8 B entries).
@@ -229,89 +280,100 @@ pub fn entry_file_off(slot: u64, entry_bytes: u8) -> u64 {
     FILE_HEADER_LEN as u64 + slot * u64::from(entry_bytes)
 }
 
-/// Contiguous bytes available from `slot` to the end of the table body, capped
-/// by `published_len` (short regions near table end / HWM are expected).
+/// File offset of the page that holds `txid`'s probe chain.
 #[inline]
-pub fn probe_region_avail(
-    slot: u64,
-    slots: u64,
-    entry_bytes: u8,
-    published_len: u64,
-) -> u64 {
-    let off = entry_file_off(slot, entry_bytes);
-    let table_end = FILE_HEADER_LEN as u64 + slots * u64::from(entry_bytes);
-    let end = table_end.min(published_len);
-    end.saturating_sub(off)
+pub fn page_file_off(txid: &[u8; 32], bits: u32, entry_bytes: u8) -> u64 {
+    let base = if bits <= PAGE_SLOT_BITS {
+        0
+    } else {
+        page_index(txid, bits) << PAGE_SLOT_BITS
+    };
+    entry_file_off(base, entry_bytes)
 }
 
-/// Result of scanning one probe-region buffer.
+/// Decode one LE create_fk from a page buffer at local slot index.
+#[inline]
+pub fn entry_from_page_buf(buf: &[u8], local: u64, entry_bytes: u8) -> Option<u64> {
+    let es = entry_bytes as usize;
+    let off = (local as usize).checked_mul(es)?;
+    if off + es > buf.len() {
+        return None;
+    }
+    Some(match entry_bytes {
+        4 => u64::from(u32::from_le_bytes(buf[off..off + 4].try_into().ok()?)),
+        8 => u64::from_le_bytes(buf[off..off + 8].try_into().ok()?),
+        _ => return None,
+    })
+}
+
+/// Result of hopping through one loaded page.
 #[derive(Debug, Clone)]
 pub struct ProbeRegionScan {
     /// Occupied create_fks with absolute probe depth (home = 0).
     pub cands: Vec<(u32, u64)>,
     /// Saw an empty slot (probe chain ends).
     pub hit_empty: bool,
-    /// Complete entries advanced (occupied + empty if [`Self::hit_empty`]).
-    pub slots_advanced: u32,
+    /// Depth of empty slot if [`Self::hit_empty`], else depths explored without empty.
+    pub depth_end: u32,
+    /// Local slot index of empty (valid if hit_empty).
+    pub empty_local: u64,
 }
 
-/// Scan LE create_fk entries in `buf` (may be short / unaligned tail ignored).
-///
-/// Stops at empty, [`MAX_PROBE`], or end of complete entries in `buf`.
+/// Double-hash hop through a loaded page buffer.
 #[inline]
-pub fn scan_probe_region(
-    buf: &[u8],
+pub fn hop_scan_page(
+    page_buf: &[u8],
     entry_bytes: u8,
-    start_depth: u32,
+    h1: u64,
+    h2: u64,
+    page_slots: u64,
     max_probe: u32,
 ) -> ProbeRegionScan {
-    let es = entry_bytes as usize;
-    debug_assert!(es == 4 || es == 8);
+    let mask = page_slots - 1;
+    let max_d = max_probe.min(page_slots as u32);
     let mut cands = Vec::new();
-    let mut slots_advanced = 0u32;
-    let mut depth = start_depth;
-    let mut off = 0usize;
-    while off + es <= buf.len() && depth < max_probe {
-        let e = match entry_bytes {
-            4 => u64::from(u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())),
-            8 => u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()),
-            _ => break,
+    for d in 0..max_d {
+        let local = h1.wrapping_add(u64::from(d).wrapping_mul(h2)) & mask;
+        let Some(e) = entry_from_page_buf(page_buf, local, entry_bytes) else {
+            break;
         };
-        off += es;
-        slots_advanced = slots_advanced.saturating_add(1);
         if e == 0 {
             return ProbeRegionScan {
                 cands,
                 hit_empty: true,
-                slots_advanced,
+                depth_end: d,
+                empty_local: local,
             };
         }
-        cands.push((depth, e));
-        depth = depth.saturating_add(1);
+        cands.push((d, e));
     }
     ProbeRegionScan {
         cands,
         hit_empty: false,
-        slots_advanced,
+        depth_end: max_d,
+        empty_local: 0,
     }
 }
 
-/// Request size for a region pread from `slot` (≤ [`PROBE_REGION_BYTES`], entry-aligned).
+/// Bytes to pread for the full probe page of `txid` (entry-aligned, published-capped).
 #[inline]
-pub fn probe_region_want(
-    slot: u64,
-    slots: u64,
+pub fn page_pread_len(
+    txid: &[u8; 32],
+    bits: u32,
     entry_bytes: u8,
+    table_slots: u64,
     published_len: u64,
 ) -> usize {
-    let avail = probe_region_avail(slot, slots, entry_bytes, published_len);
-    let es = u64::from(entry_bytes);
-    if avail < es {
-        return 0;
-    }
-    let want = (PROBE_REGION_BYTES as u64).min(avail);
-    // Entry-align (drop trailing partial entry if avail is odd for some reason).
-    ((want / es) * es) as usize
+    let base = if bits <= PAGE_SLOT_BITS {
+        0
+    } else {
+        page_index(txid, bits) << PAGE_SLOT_BITS
+    };
+    let nslots = page_slot_count(bits).min(table_slots.saturating_sub(base));
+    let want = nslots.saturating_mul(u64::from(entry_bytes));
+    let off = entry_file_off(base, entry_bytes);
+    let avail = published_len.saturating_sub(off);
+    want.min(avail) as usize
 }
 
 /// Resolve address width for new creates.
@@ -383,9 +445,9 @@ pub fn read_head_meta(head_path: &Path) -> Result<Option<(HeadLayout, u64)>, Sto
     }
     let ver = u16::from_le_bytes([raw[4], raw[5]]);
     if ver != META_VERSION {
-        // v1 = double-hash layout; linear probe is incompatible without rebuild.
+        // Older probe algorithms are incompatible without rebuild.
         return Err(StoreError::Corrupt(
-            "tx.head.meta version (linear probe; rebuild tx.head)",
+            "tx.head.meta version (page-local probe; rebuild tx.head)",
         ));
     }
     let bits = u32::from(raw[6]);
@@ -479,7 +541,7 @@ impl AddressHead {
             }
             None => {
                 return Err(StoreError::Corrupt(
-                    "tx.head.meta missing (linear probe; rebuild tx.head)",
+                    "tx.head.meta missing (page-local probe; rebuild tx.head)",
                 ));
             }
         };
@@ -535,23 +597,21 @@ impl AddressHead {
         }
     }
 
-    /// Load up to `want` bytes of contiguous entries starting at `slot` into `buf`
-    /// (Acquire loads — pairs with Release stores on insert). Returns bytes filled
-    /// (entry-aligned). Stops at table end (short region); does **not** wrap.
-    fn load_probe_region(
+    /// Load a full probe page starting at global `page_base` into `buf` (Acquire
+    /// loads). Returns bytes filled.
+    fn load_page_slots(
         &self,
-        slot: u64,
-        want: usize,
+        page_base: u64,
+        n_slots: u64,
         buf: &mut [u8],
     ) -> Result<usize, StoreError> {
         let es = self.layout.entry_bytes as usize;
-        debug_assert!(want <= buf.len());
-        debug_assert!(want % es == 0);
-        let max_slots = self.slots.saturating_sub(slot) as usize;
-        let n_ent = (want / es).min(max_slots);
+        let n = n_slots as usize;
+        let need = n.saturating_mul(es);
+        debug_assert!(need <= buf.len());
         let mut filled = 0usize;
-        for i in 0..n_ent {
-            let e = self.read_entry(slot + i as u64)?;
+        for i in 0..n {
+            let e = self.read_entry(page_base + i as u64)?;
             match es {
                 4 => buf[filled..filled + 4].copy_from_slice(&(e as u32).to_le_bytes()),
                 8 => buf[filled..filled + 8].copy_from_slice(&e.to_le_bytes()),
@@ -613,54 +673,36 @@ impl AddressHead {
         }
     }
 
-    /// Sole-writer insert into first empty probe slot (no CAS).
+    /// Sole-writer insert into first empty **in-page** probe slot (no CAS).
     ///
-    /// Idempotent if `new_fk` is already on the chain. Requires at most one
-    /// concurrent inserter process-wide for this head.
-    ///
-    /// Loads [`PROBE_REGION_BYTES`] at a time from the current slot; scans in
-    /// memory; another region only if no empty in the bytes returned.
+    /// Idempotent if `new_fk` is already on the chain. Loads **one page**, then
+    /// double-hash hops in memory.
     fn insert_one(&self, txid: &[u8; 32], new_fk: Fk) -> Result<(), StoreError> {
         let new_u = self.encode_fk(new_fk)?;
+        let bits = self.layout.bits;
         let es = self.layout.entry_bytes;
-        let mask = self.slots - 1;
-        let pub_len = self.file.logical_len();
-        let mut slot = h1(txid, self.layout.bits);
-        let mut depth = 0u32;
+        let page_slots = page_slot_count(bits);
+        let page_base = if bits <= PAGE_SLOT_BITS {
+            0
+        } else {
+            page_index(txid, bits) << PAGE_SLOT_BITS
+        };
+        let h1 = h1_in_page(txid, bits);
+        let h2 = h2_in_page(txid, bits);
         let mut buf = [0u8; PROBE_REGION_BYTES];
-        while depth < MAX_PROBE {
-            let want = probe_region_want(slot, self.slots, es, pub_len);
-            if want == 0 {
-                // Past contiguous table body at this slot — wrap to 0.
-                if slot == 0 {
-                    break;
-                }
-                slot = 0;
-                continue;
-            }
-            let n = self.load_probe_region(slot, want, &mut buf)?;
-            let scan = scan_probe_region(&buf[..n], es, depth, MAX_PROBE);
-            for &(_d, e) in &scan.cands {
-                if e == new_u {
-                    return Ok(());
-                }
-            }
-            if scan.hit_empty {
-                // Empty sits immediately after the occupied run in this region.
-                let empty_depth = depth.saturating_add(scan.cands.len() as u32);
-                note_probe_depth_on_insert(empty_depth);
-                let empty_slot = slot.wrapping_add(scan.cands.len() as u64) & mask;
-                self.store_entry(empty_slot, new_u)?;
-                self.occupied.fetch_add(1, Ordering::Relaxed);
+        let n = self.load_page_slots(page_base, page_slots, &mut buf)?;
+        let scan = hop_scan_page(&buf[..n], es, h1, h2, page_slots, MAX_PROBE);
+        for &(_d, e) in &scan.cands {
+            if e == new_u {
                 return Ok(());
             }
-            // No empty in this region (full or short) — advance and continue.
-            if scan.slots_advanced == 0 {
-                break;
-            }
-            debug_assert_eq!(scan.slots_advanced as usize, scan.cands.len());
-            slot = slot.wrapping_add(u64::from(scan.slots_advanced)) & mask;
-            depth = depth.saturating_add(scan.slots_advanced);
+        }
+        if scan.hit_empty {
+            note_probe_depth_on_insert(scan.depth_end);
+            let global = page_base + scan.empty_local;
+            self.store_entry(global, new_u)?;
+            self.occupied.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
         }
         note_probe_exhausted();
         Err(StoreError::Corrupt("address head probe exhausted on insert"))
@@ -695,43 +737,24 @@ impl AddressHead {
         self.insert_many(entries)
     }
 
-    /// Walk probe until empty; return every fk (may include foreigners).
+    /// Walk in-page double-hash until empty; return every fk (may include foreigners).
     ///
-    /// One [`PROBE_REGION_BYTES`] read per wave from the current slot; scan for
-    /// create_fks; only another IO if the response had no empty (short/partial
-    /// near table end or wrap is handled by continuing from the next slot).
+    /// One page load, then hop in RAM (single IO for the full candidate set).
     pub fn probe_fks(&self, txid: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
+        let bits = self.layout.bits;
         let es = self.layout.entry_bytes;
-        let mask = self.slots - 1;
-        let pub_len = self.file.logical_len();
-        let mut out = Vec::new();
-        let mut slot = h1(txid, self.layout.bits);
-        let mut depth = 0u32;
+        let page_slots = page_slot_count(bits);
+        let page_base = if bits <= PAGE_SLOT_BITS {
+            0
+        } else {
+            page_index(txid, bits) << PAGE_SLOT_BITS
+        };
+        let h1p = h1_in_page(txid, bits);
+        let h2p = h2_in_page(txid, bits);
         let mut buf = [0u8; PROBE_REGION_BYTES];
-        while depth < MAX_PROBE {
-            let want = probe_region_want(slot, self.slots, es, pub_len);
-            if want == 0 {
-                if slot == 0 {
-                    break;
-                }
-                slot = 0;
-                continue;
-            }
-            let n = self.load_probe_region(slot, want, &mut buf)?;
-            let scan = scan_probe_region(&buf[..n], es, depth, MAX_PROBE);
-            for &(_d, e) in &scan.cands {
-                out.push(Fk(e));
-            }
-            if scan.hit_empty {
-                break;
-            }
-            if scan.slots_advanced == 0 {
-                break;
-            }
-            slot = slot.wrapping_add(u64::from(scan.slots_advanced)) & mask;
-            depth = depth.saturating_add(scan.slots_advanced);
-        }
-        Ok(out)
+        let n = self.load_page_slots(page_base, page_slots, &mut buf)?;
+        let scan = hop_scan_page(&buf[..n], es, h1p, h2p, page_slots, MAX_PROBE);
+        Ok(scan.cands.into_iter().map(|(_, e)| Fk(e)).collect())
     }
 
     pub fn get_all_candidates(&self, txid: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
@@ -882,11 +905,13 @@ mod tests {
 
     #[test]
     fn probe_limits_match_policy() {
-        assert_eq!(MAX_PROBE, 256);
-        assert_eq!(PROBE_REGION_BYTES, 2048);
+        assert_eq!(MAX_PROBE, 1024);
+        assert_eq!(PAGE_SLOTS, 1024);
+        assert_eq!(PAGE_SLOT_BITS, 10);
+        assert_eq!(PROBE_REGION_BYTES, 8192);
         assert_eq!(PROBE_DEPTH_WARN, 128);
-        // Region must cover a full max-depth chain of 8 B entries.
-        assert!(PROBE_REGION_BYTES as u32 >= MAX_PROBE * 8);
+        assert_eq!(MAINNET_BITS, 26);
+        assert!(PROBE_REGION_BYTES as u64 >= PAGE_SLOTS * 8);
     }
 
     #[test]
@@ -898,98 +923,63 @@ mod tests {
     }
 
     #[test]
-    fn scan_probe_region_stops_at_empty_and_partial() {
-        // 4B entries: fk 1, 2, empty, 3
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&1u32.to_le_bytes());
-        buf.extend_from_slice(&2u32.to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        buf.extend_from_slice(&3u32.to_le_bytes());
-        let s = scan_probe_region(&buf, 4, 0, MAX_PROBE);
+    fn hop_scan_page_stops_at_empty() {
+        // Page of 4 slots: place fks at double-hash locals.
+        let mut buf = vec![0u8; 16];
+        // h1=0, h2=1 → locals 0,1,2,...
+        buf[0..4].copy_from_slice(&1u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&2u32.to_le_bytes());
+        // slot 2 empty
+        let s = hop_scan_page(&buf, 4, 0, 1, 4, MAX_PROBE);
         assert!(s.hit_empty);
         assert_eq!(s.cands, vec![(0, 1), (1, 2)]);
-        assert_eq!(s.slots_advanced, 3); // two occupied + empty
-
-        // Short buffer: only one entry, no empty → need more.
-        let short = 7u32.to_le_bytes();
-        let s2 = scan_probe_region(&short, 4, 5, MAX_PROBE);
-        assert!(!s2.hit_empty);
-        assert_eq!(s2.cands, vec![(5, 7)]);
-        assert_eq!(s2.slots_advanced, 1);
-
-        // Trailing partial entry ignored.
-        let mut partial = 9u32.to_le_bytes().to_vec();
-        partial.push(0xff);
-        let s3 = scan_probe_region(&partial, 4, 0, MAX_PROBE);
-        assert_eq!(s3.cands, vec![(0, 9)]);
-        assert!(!s3.hit_empty);
+        assert_eq!(s.depth_end, 2);
+        assert_eq!(s.empty_local, 2);
     }
 
     #[test]
-    fn probe_region_covers_chain_across_table_end_wrap() {
-        // Tiny table: force home near end so first region is short, then wrap.
-        let path = tmp("wrap_region");
-        let h = AddressHead::create_with_bits(&path, 8).unwrap(); // 256 slots
-        // Craft txid with h1 = 254 so chain uses 254,255,0,1,...
-        let mut txid = [0u8; 32];
-        // bits=8 → h1 = first byte
-        txid[0] = 254;
-        assert_eq!(h1(&txid, 8), 254);
-        h.insert(&txid, Fk(1)).unwrap();
-        // Foreigners fill 255 so second insert of same txid goes to wrap (or we
-        // just check first lands and probe_fks finds it with region wrap).
-        let mut other = [0u8; 32];
-        other[0] = 255;
-        h.insert(&other, Fk(2)).unwrap();
-        // Same home 254: second create for txid goes deeper (255 occupied by other → 0).
-        h.insert(&txid, Fk(3)).unwrap();
-        let cands = h.probe_fks(&txid).unwrap();
-        assert!(cands.contains(&Fk(1)));
-        assert!(cands.contains(&Fk(3)));
-        // Reverse body-order semantics: deepest is last in probe_fks order.
-        assert_eq!(cands[0], Fk(1));
-        assert!(cands.last() == Some(&Fk(3)) || cands.contains(&Fk(3)));
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(meta_path(&path));
-    }
-
-    #[test]
-    fn probe_is_linear_from_h1() {
-        let k = [0xabu8; 32];
-        let bits = 16u32;
-        let mask = (1u64 << bits) - 1;
-        let home = h1(&k, bits);
-        assert_eq!(probe_index(&k, 0, bits), home);
-        for d in 0..32u32 {
-            let expect = home.wrapping_add(u64::from(d)) & mask;
-            assert_eq!(probe_index(&k, d, bits), expect, "d={d}");
-        }
-        // Wrap: last slot then 0.
-        let near_end = mask;
-        // Craft txid whose h1 is near_end via top bits of first 8 bytes.
-        // h1 = first 8 bytes BE >> (64-bits).
-        let mut k2 = [0u8; 32];
-        // For bits=16, top 16 bits of first 8 bytes = 0xffff → h1 = 0xffff.
-        k2[0] = 0xff;
-        k2[1] = 0xff;
-        assert_eq!(h1(&k2, 16), near_end);
-        assert_eq!(probe_index(&k2, 0, 16), near_end);
-        assert_eq!(probe_index(&k2, 1, 16), 0);
-        assert_eq!(probe_index(&k2, 2, 16), 1);
-    }
-
-    #[test]
-    fn probe_bits_28_to_34_in_range() {
+    fn page_local_double_hash_stays_in_page() {
         let k = [0x11u8; 32];
-        for bits in [28u32, 31, 32, 33, 34] {
+        let bits = 26u32;
+        let page = page_index(&k, bits);
+        for d in 0..64u32 {
+            let slot = probe_index(&k, d, bits);
+            assert_eq!(slot >> PAGE_SLOT_BITS, page, "d={d}");
+            assert!(slot < (1u64 << bits));
+        }
+        // Distinct depths should differ (odd h2).
+        assert_ne!(probe_index(&k, 0, bits), probe_index(&k, 1, bits));
+    }
+
+    #[test]
+    fn probe_bits_26_to_34_in_range() {
+        let k = [0x11u8; 32];
+        for bits in [26u32, 28, 31, 32, 33, 34] {
             let idx = probe_index(&k, 0, bits);
             assert!(idx < (1u64 << bits), "bits={bits} idx={idx}");
             let idx2 = probe_index(&k, 7, bits);
             assert!(idx2 < (1u64 << bits));
-            // Consecutive depths differ by 1 (mod 2^bits).
-            let mask = (1u64 << bits) - 1;
-            assert_eq!(idx2, idx.wrapping_add(7) & mask);
+            // Same page for all depths.
+            if bits > PAGE_SLOT_BITS {
+                assert_eq!(idx >> PAGE_SLOT_BITS, idx2 >> PAGE_SLOT_BITS);
+            }
         }
+    }
+
+    #[test]
+    fn bip30_second_create_same_page() {
+        let path = tmp("bip30_page");
+        let h = AddressHead::create_with_bits(&path, 16).unwrap();
+        let mut txid = [0u8; 32];
+        txid[0] = 0x55;
+        h.insert(&txid, Fk(1)).unwrap();
+        h.insert(&txid, Fk(2)).unwrap();
+        let cands = h.probe_fks(&txid).unwrap();
+        assert!(cands.contains(&Fk(1)));
+        assert!(cands.contains(&Fk(2)));
+        assert_eq!(cands[0], Fk(1));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(meta_path(&path));
     }
 
     #[test]
@@ -1005,8 +995,9 @@ mod tests {
         buf[4..6].copy_from_slice(&1u16.to_le_bytes());
         std::fs::write(&meta, &buf).unwrap();
         match AddressHead::open(&path) {
-            Err(StoreError::Corrupt(m)) if m.contains("linear probe") => {}
-            Err(e) => panic!("expected linear-probe meta error, got {e}"),
+            Err(StoreError::Corrupt(m))
+                if m.contains("page-local") || m.contains("rebuild") => {}
+            Err(e) => panic!("expected page-local meta error, got {e}"),
             Ok(_) => panic!("expected open failure for meta v1"),
         }
         let _ = std::fs::remove_file(&path);
@@ -1274,8 +1265,10 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_default_bits_is_28() {
-        assert_eq!(MAINNET_BITS, 28);
+    fn mainnet_default_bits_is_26() {
+        assert_eq!(MAINNET_BITS, 26);
         assert_eq!(entry_bytes_for_bits(MAINNET_BITS), 4);
+        // 4 B × 1024 = 4 KiB pages at mainnet default.
+        assert_eq!(PAGE_SLOTS as usize * 4, 4096);
     }
 }

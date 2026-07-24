@@ -183,16 +183,16 @@ Keyless open-address table: **txid → dense create_fk**.
 | Property | Current |
 |----------|---------|
 | File | Single `tx.head` (not sharded) |
-| Default | **BITS=28**, **4 B** entries → **1 GiB** sparse (`2^28` slots) |
+| Default | **BITS=26**, **4 B** entries → **256 MiB** sparse (`2^26` slots = 2¹⁶ pages × 1024) |
 | Env | `RBITCOIN_TX_HEAD_BITS` in **8..=34**; tiny scale uses BITS=16 |
 | Entry | LE create_fk; **0 = empty**; **no HAS_NEXT** |
-| Entry width | **4 B** for BITS ≤ 32; **8 B** for BITS ≥ 33 |
-| Meta | `tx.head.meta`: bits, entry_bytes, generation; **version 2** = linear probe |
-| Probe | **Linear** from primary `h1(txid)`: `slot = (h1 + d) mod 2^bits`; load **2048 B** region per IO, scan in RAM, more only if no empty (short/partial OK); max depth **256**; first insert depth **>128** starts online resize if not already running |
-| Insert | First empty (or same fk idempotent); second same-txid create goes **deeper** on the run |
+| Entry width | **4 B** for BITS ≤ 32; **8 B** for BITS ≥ 33 (page then 8 KiB) |
+| Meta | `tx.head.meta`: bits, entry_bytes, generation; **version 3** = page-local probe |
+| Probe | **Page** from high txid bits; **10-bit** in-page double-hash; one page load (4 KiB @ 4 B); max depth **1024**; first insert depth **>128** starts online resize if not already running |
+| Insert | First empty in-page (or same fk idempotent); second same-txid goes **deeper** in-page |
 | Lookup | Body-verify from **last occupied → first** (newest BIP30-shaped create wins) |
 
-**Probe note:** same locality model as key-prefix hash heads (`header.head`, `scripthash.head`). Keyless slots cannot Robin-Hood (foreigner depth unknown without a body read). Meta **v1** (double-hash) is refused on open → recreate + rebuild from Class A.
+**Probe note:** all candidates for a key share one page (single IO). Keyless slots cannot Robin-Hood. Meta **&lt; v3** refused on open → recreate + rebuild from Class A.
 
 ### Online sequential resize
 
@@ -204,7 +204,7 @@ Trigger: `txs.count() / slots ≥ 0.75` (or probe exhaust → sleep-retry while 
 4. Catch-up + brief exclusive insert lock → rename swap; control `tx.head.resize` for crash resume.
 
 **Capacity @ 0.75 load (approx):**  
-28→215 M · 29→429 M · 30→859 M · 31→1.72 B · 32→3.44 B · 33→6.87 B (8 B) · 34→13.7 B.
+26→50 M · 27→100 M · 28→215 M · 29→429 M · 30→859 M · 31→1.72 B · 32→3.44 B · 33→6.87 B (8 B) · 34→13.7 B.
 
 **Decision:** start small (28) and resize during IBD rather than one fixed 8 GiB 31-bit cliff; sequential rebuild keeps the archiver hot path free of dual-write.
 

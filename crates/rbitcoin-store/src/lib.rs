@@ -50,8 +50,9 @@ pub use point_table::PointRecord;
 pub use scripthash::{script_hash, ScriptHashEntry, ScriptHashRecord, ScriptHashTable};
 pub use scripthash_layout::ShHeadValue;
 pub use sorted_run::{
-    claim_run_for_materialize, crc32, detach_run, list_runs, lookup_key, merge_runs, next_run_path,
-    open_run, read_run_body, remove_run, verify_run_body, write_sorted_run, SortedRunPath,
+    claim_run_for_materialize, crc32, detach_run, for_each_merged_rec, list_materialize_claims,
+    list_runs, lookup_key, merge_runs, next_run_path, open_run, read_run_body, remove_run,
+    verify_run_body, write_sorted_run, SortedRunPath,
 };
 pub use store::Store;
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};

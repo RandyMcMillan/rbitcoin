@@ -642,7 +642,19 @@ pub fn detach_run(run: &SortedRunPath) -> Result<(), StoreError> {
 /// cannot delete the claimed body while materialize runs.
 ///
 /// Caller must materialize `claimed.path` then delete that file.
+///
+/// If `run.path` already ends with `.run.mat` (crash recovery), open as-is
+/// without rename/detach.
 pub fn claim_run_for_materialize(run: &SortedRunPath) -> Result<SortedRunPath, StoreError> {
+    let is_mat = run
+        .path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|n| n.ends_with(".run.mat"));
+    if is_mat {
+        // Already claimed (interrupted materialize) — just re-open.
+        return open_run(&run.path);
+    }
     let mat_path = {
         let mut s = run.path.as_os_str().to_os_string();
         s.push(".mat");
@@ -657,6 +669,85 @@ pub fn claim_run_for_materialize(run: &SortedRunPath) -> Result<SortedRunPath, S
         key_len: run.key_len,
         body_crc32: run.body_crc32,
     })
+}
+
+/// Open incomplete materialize claims left after crash/SIGINT (`*.run.mat`).
+///
+/// These are detached from MANIFEST by [`claim_run_for_materialize`]; without
+/// this scan, restart would see "no runs" and drop the bodies.
+pub fn list_materialize_claims(dir: &Path) -> Result<Vec<SortedRunPath>, StoreError> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+        .map_err(|e| io_err(dir, e))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| n.ends_with(".run.mat"))
+        })
+        .collect();
+    paths.sort();
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        match open_run(&p) {
+            Ok(r) => out.push(r),
+            Err(e) => {
+                rbitcoin_log::warn!(
+                    "store: skipping bad materialize claim {}: {e}",
+                    p.display()
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Stream k-way merge of sorted runs, invoking `on_rec` for each record in key order.
+///
+/// Does **not** buffer the full merge body (unlike [`merge_runs`]). Used by SH
+/// bulk materialize so multi-run catalogs stay one sorted stream without
+/// multi-GB RAM.
+pub fn for_each_merged_rec(
+    inputs: &[SortedRunPath],
+    mut on_rec: impl FnMut(&[u8]) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    let key_len = inputs[0].key_len as usize;
+    let rec_len = inputs[0].rec_len;
+    for r in inputs {
+        if r.key_len as usize != key_len || r.rec_len != rec_len {
+            return Err(StoreError::Corrupt("sorted run: merge len mismatch"));
+        }
+    }
+    let mut heap: Vec<MergeHead> = Vec::new();
+    for (idx, run) in inputs.iter().enumerate() {
+        let mut cursor = RunCursor::open(run)?;
+        if let Some(rec) = cursor.next_rec()? {
+            heap.push(MergeHead { cursor, rec, idx });
+        }
+    }
+    for i in (0..heap.len()).rev() {
+        sift_down(&mut heap, i, key_len);
+    }
+    while !heap.is_empty() {
+        let mut min = heap.swap_remove(0);
+        if !heap.is_empty() {
+            sift_down(&mut heap, 0, key_len);
+        }
+        on_rec(&min.rec)?;
+        if let Some(next) = min.cursor.next_rec()? {
+            min.rec = next;
+            heap.push(min);
+            let last = heap.len() - 1;
+            sift_up(&mut heap, last, key_len);
+        }
+    }
+    Ok(())
 }
 
 /// K-way merge of sorted runs → new run at `out_path`. Deletes input files on success.
@@ -955,6 +1046,44 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].seq(), Some(1));
         assert!(!orphan.exists(), "orphan should be removed");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn list_materialize_claims_finds_orphan_mats() {
+        let d = tmp_dir();
+        let path = d.join("000001.run");
+        let run = write_sorted_run(&path, 32, 44, &rec(1, 1)).unwrap();
+        let claimed = claim_run_for_materialize(&run).unwrap();
+        // MANIFEST empty; list_runs empty; claims still visible.
+        assert!(list_runs(&d).unwrap().is_empty());
+        let mats = list_materialize_claims(&d).unwrap();
+        assert_eq!(mats.len(), 1);
+        assert_eq!(mats[0].path, claimed.path);
+        assert_eq!(mats[0].count, 1);
+        // Re-claim is idempotent (open as-is).
+        let again = claim_run_for_materialize(&mats[0]).unwrap();
+        assert_eq!(again.path, claimed.path);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn for_each_merged_rec_orders_keys() {
+        let d = tmp_dir();
+        let p1 = d.join("000001.run");
+        let p2 = d.join("000002.run");
+        // key bytes: high first so merge must re-order
+        write_sorted_run(&p1, 32, 44, &rec(2, 20)).unwrap();
+        write_sorted_run(&p2, 32, 44, &rec(1, 10)).unwrap();
+        let r1 = open_run(&p1).unwrap();
+        let r2 = open_run(&p2).unwrap();
+        let mut keys = Vec::new();
+        for_each_merged_rec(&[r1, r2], |rec| {
+            keys.push(rec[0]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(keys, vec![1, 2]);
         let _ = fs::remove_dir_all(&d);
     }
 

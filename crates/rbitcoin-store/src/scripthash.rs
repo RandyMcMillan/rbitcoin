@@ -595,6 +595,10 @@ impl ScriptHashTable {
     /// batched `insert_many` for heads, **one** alloc-header write at the end.
     /// When non-empty: falls back to [`Self::put_create_batch_append`].
     ///
+    /// For multi-chunk **global** sorted streams (k-way materialize), use
+    /// [`Self::bulk_load_sorted_creates_cold`] after the first empty-table
+    /// call so later chunks do not fall back to the slow append path.
+    ///
     /// `recs` should be sorted by `scripthash` (as sorted-run materialize produces).
     pub fn bulk_load_sorted_creates(
         &self,
@@ -607,6 +611,24 @@ impl ScriptHashTable {
             let mut heads = HashMap::new();
             let (n, _) = self.put_create_batch_append(recs, &mut heads)?;
             return Ok(n);
+        }
+        self.bulk_load_sorted_creates_cold(recs)
+    }
+
+    /// Continue a cold materialize session: bump-alloc slabs + head insert for
+    /// **new** keys only (no durable head seed).
+    ///
+    /// Safe only when each scripthash appears in a single contiguous batch and
+    /// is not already present (k-way merge stream + hold-key at chunk borders).
+    /// Unlike [`Self::bulk_load_sorted_creates`], does **not** fall back to
+    /// append when `entry_count() > 0` — that fallback made multi-run materialize
+    /// pathologically slow after the first 512k flush.
+    pub fn bulk_load_sorted_creates_cold(
+        &self,
+        recs: &[ScriptHashRecord],
+    ) -> Result<usize, StoreError> {
+        if recs.is_empty() {
+            return Ok(0);
         }
 
         // Count unique keys for head reserve.

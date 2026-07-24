@@ -3,7 +3,7 @@
 //! Pipeline: **memtable → spill sorted run → gradual merge → bulk load at tip**.
 //! No peer-fetch pause / progressive head materialize (removed with Catchup).
 
-use rbitcoin_store::{list_runs, StoreError};
+use rbitcoin_store::{list_materialize_claims, list_runs, StoreError};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -156,9 +156,16 @@ pub fn finalize_wait_join<T: RunMemtable>(
 }
 
 /// On-disk run count under `runs_io` (safe concurrent with merge/list).
+///
+/// Includes incomplete materialize claims (`*.run.mat`) so tip-entry leftover
+/// detection sees crash mid-materialize state.
 pub fn on_disk_run_count(runs_dir: &Path, runs_io: &Mutex<()>) -> usize {
     let _io = runs_io.lock().unwrap();
-    list_runs(runs_dir).map(|r| r.len()).unwrap_or(0)
+    let catalog = list_runs(runs_dir).map(|r| r.len()).unwrap_or(0);
+    let claims = list_materialize_claims(runs_dir)
+        .map(|r| r.len())
+        .unwrap_or(0);
+    catalog.saturating_add(claims)
 }
 
 /// Snapshot `(runs_dir, runs_io)` from a locked memtable control.

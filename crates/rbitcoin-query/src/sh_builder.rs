@@ -13,9 +13,10 @@ use super::run_builder_core::{
 use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
-    list_runs, merge_runs, next_run_path, read_run_body, write_sorted_run, ScriptHashRecord, Store,
-    StoreError, SortedRunPath,
+    claim_run_for_materialize, for_each_merged_rec, list_materialize_claims, list_runs, merge_runs,
+    next_run_path, write_sorted_run, ScriptHashRecord, Store, StoreError, SortedRunPath,
 };
+// re-export for tests that claim runs
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -189,10 +190,14 @@ impl ShRunBuilder {
         }
     }
 
-    /// Flush memtable, **fully merge** runs, then **cold bulk-load** into durable SH.
+    /// Flush memtable, optional merge, then **cold bulk-load** into durable SH.
     ///
-    /// Migration-style load (no per-key head seed probes when SH tables empty).
-    /// Preferred at tip after Direct IBD (runs only flush/merge during catch-up).
+    /// - Recovers incomplete `*.run.mat` claims from a prior crash/SIGINT.
+    /// - Streams a **k-way merge** of all claimed runs (no multi-GB RAM buffer).
+    /// - Uses cold multi-chunk load when the SH table starts empty (does not
+    ///   fall back to per-key append after the first 512k flush).
+    /// - When the table is already non-empty (resume after partial load), uses
+    ///   append path so existing heads are merged.
     pub fn finalize_and_bulk_materialize(&self, store: &Store) -> Result<u64, StoreError> {
         finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
         let (runs_dir, runs_io, mut next_seq) = {
@@ -221,99 +226,140 @@ impl ShRunBuilder {
             g.ctrl.next_seq = next_seq;
         }
 
-        // Claim all remaining runs under lock, then bulk-load sorted bodies.
+        // Claim cataloged runs + recover prior materialize claims (*.run.mat).
         let mut claimed: Vec<SortedRunPath> = Vec::new();
         {
             let _io = runs_io.lock().unwrap();
+            // Crash recovery first: incomplete claims are off MANIFEST.
+            let mut prior = list_materialize_claims(&runs_dir)?;
+            if !prior.is_empty() {
+                info!(
+                    "node: scripthash resuming {} incomplete materialize claim(s)",
+                    prior.len()
+                );
+            }
+            claimed.append(&mut prior);
             let mut runs = list_runs(&runs_dir)?;
             runs.sort_by_key(|r| r.seq().unwrap_or(u64::MAX));
             for run in runs {
-                claimed.push(rbitcoin_store::claim_run_for_materialize(&run)?);
+                claimed.push(claim_run_for_materialize(&run)?);
             }
         }
 
         if claimed.is_empty() {
             info!("node: scripthash bulk materialize: no runs");
+            // Do not wipe leftover unknown files aggressively — only empty catalog.
             clear_runs_dir(&runs_dir);
             return Ok(0);
         }
 
         let total_recs: u64 = claimed.iter().map(|r| r.count).sum();
+        let cold = store.scripthash.entry_count() == 0;
+        if !cold {
+            warn!(
+                "node: scripthash table non-empty (entry_count={}) — resume uses append path; \
+                 incomplete prior load will be merged",
+                store.scripthash.entry_count()
+            );
+        }
         info!(
-            "node: scripthash bulk materialize start runs={} records≈{total_recs}",
+            "node: scripthash bulk materialize start runs={} records≈{total_recs} cold={cold}",
             claimed.len()
         );
         let t0 = Instant::now();
-        // Stream one run (or chunk) at a time — avoid holding every SH create in
-        // RAM at once. `bulk_load_sorted_creates` accepts sequential sorted
-        // batches (empty → cold path; subsequent → append).
+        // Global sorted stream via k-way merge + hold-key at chunk borders so
+        // each scripthash is flushed complete (required for cold multi-batch).
         const CHUNK: usize = 512_000;
         let mut n_total = 0usize;
         let mut unique_in = 0usize;
+        let mut flushed_chunks = 0u32;
         let mut chunk: Vec<ScriptHashRecord> = Vec::with_capacity(CHUNK.min(1 << 20));
-        let mut flush_chunk =
-            |store: &Store, chunk: &mut Vec<ScriptHashRecord>| -> Result<(), StoreError> {
-                if chunk.is_empty() {
-                    return Ok(());
-                }
-                chunk.sort_unstable_by(|a, b| {
-                    a.scripthash
-                        .cmp(&b.scripthash)
-                        .then(a.create_tx_fk.0.cmp(&b.create_tx_fk.0))
-                });
-                chunk.dedup_by(|a, b| {
-                    a.scripthash == b.scripthash && a.create_tx_fk == b.create_tx_fk
-                });
-                unique_in = unique_in.saturating_add(chunk.len());
-                let n = store.scripthash.bulk_load_sorted_creates(chunk)?;
-                n_total = n_total.saturating_add(n);
-                chunk.clear();
-                Ok(())
-            };
 
-        for run in &claimed {
-            let body = read_run_body(run)?;
-            let rec_len = run.rec_len as usize;
-            let mut offset = 0usize;
-            while offset + rec_len <= body.len() {
-                let (sh, tx_fk) = decode_rec(&body[offset..offset + rec_len])?;
-                offset += rec_len;
-                if tx_fk.is_null() {
-                    continue;
-                }
-                chunk.push(ScriptHashRecord::from_fk(sh, tx_fk));
-                if chunk.len() >= CHUNK {
-                    // Prefer not to split a scripthash multi-list on the cold
-                    // first batch; hold the trailing key. If one key fills the
-                    // chunk, force-flush anyway (append path merges).
-                    let last_sh = chunk.last().map(|r| r.scripthash);
-                    let mut hold = Vec::new();
-                    if let Some(sh) = last_sh {
-                        while chunk.last().is_some_and(|r| r.scripthash == sh) {
-                            hold.push(chunk.pop().unwrap());
-                        }
-                    }
-                    if chunk.is_empty() {
-                        hold.reverse();
-                        chunk.extend(hold);
-                        flush_chunk(store, &mut chunk)?;
-                    } else {
-                        flush_chunk(store, &mut chunk)?;
-                        hold.reverse();
-                        chunk.extend(hold);
-                    }
+        let flush_chunk = |chunk: &mut Vec<ScriptHashRecord>,
+                           n_total: &mut usize,
+                           unique_in: &mut usize,
+                           flushed_chunks: &mut u32|
+         -> Result<(), StoreError> {
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            chunk.dedup_by(|a, b| {
+                a.scripthash == b.scripthash && a.create_tx_fk == b.create_tx_fk
+            });
+            *unique_in = unique_in.saturating_add(chunk.len());
+            let n = if cold {
+                store.scripthash.bulk_load_sorted_creates_cold(chunk)?
+            } else {
+                store.scripthash.bulk_load_sorted_creates(chunk)?
+            };
+            *n_total = n_total.saturating_add(n);
+            *flushed_chunks = flushed_chunks.saturating_add(1);
+            if *flushed_chunks == 1 || *flushed_chunks % 10 == 0 {
+                info!(
+                    "node: scripthash materialize progress chunks={} creates≈{} elapsed={:?}",
+                    *flushed_chunks,
+                    *n_total,
+                    t0.elapsed()
+                );
+            }
+            chunk.clear();
+            Ok(())
+        };
+
+        for_each_merged_rec(&claimed, |rec| {
+            if rec.len() < SH_RUN_REC_LEN as usize {
+                return Err(StoreError::Corrupt("sh run short record in merge stream"));
+            }
+            let (sh, tx_fk) = decode_rec(rec)?;
+            if tx_fk.is_null() {
+                return Ok(());
+            }
+            chunk.push(ScriptHashRecord::from_fk(sh, tx_fk));
+            if chunk.len() < CHUNK {
+                return Ok(());
+            }
+            let last_sh = chunk.last().map(|r| r.scripthash);
+            let mut hold = Vec::new();
+            if let Some(sh) = last_sh {
+                while chunk.last().is_some_and(|r| r.scripthash == sh) {
+                    hold.push(chunk.pop().unwrap());
                 }
             }
-            // End of run: flush remaining (run is fully sorted).
-            flush_chunk(store, &mut chunk)?;
-        }
+            if chunk.is_empty() {
+                hold.reverse();
+                chunk.extend(hold);
+                flush_chunk(
+                    &mut chunk,
+                    &mut n_total,
+                    &mut unique_in,
+                    &mut flushed_chunks,
+                )?;
+            } else {
+                flush_chunk(
+                    &mut chunk,
+                    &mut n_total,
+                    &mut unique_in,
+                    &mut flushed_chunks,
+                )?;
+                hold.reverse();
+                chunk.extend(hold);
+            }
+            Ok(())
+        })?;
+        flush_chunk(
+            &mut chunk,
+            &mut n_total,
+            &mut unique_in,
+            &mut flushed_chunks,
+        )?;
+
         store.scripthash.flush()?;
         for run in &claimed {
             let _ = std::fs::remove_file(&run.path);
         }
         clear_runs_dir(&runs_dir);
         info!(
-            "node: scripthash bulk materialize done creates≈{n_total} unique_in≈{unique_in} elapsed={:?}",
+            "node: scripthash bulk materialize done creates≈{n_total} unique_in≈{unique_in} chunks={flushed_chunks} elapsed={:?}",
             t0.elapsed()
         );
         Ok(n_total as u64)
@@ -520,6 +566,42 @@ mod tests {
         let a_bytes = half_plus * u64::from(SH_RUN_REC_LEN);
         assert!(a_bytes < SH_MERGE_MAX_BODY_BYTES);
         assert!(a_bytes.saturating_mul(2) > SH_MERGE_MAX_BODY_BYTES);
+    }
+
+    #[test]
+    fn materialize_recovers_claimed_mat_files() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-mat-resume-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_or_create(&dir).unwrap();
+        let b = ShRunBuilder::new(&dir);
+        let runs_dir = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        // Write a cataloged run then claim it (simulates crash mid-materialize).
+        let mut body = Vec::new();
+        for i in 0..50u32 {
+            let mut sh = [0u8; 32];
+            sh[0] = i as u8;
+            body.extend_from_slice(&encode_rec(&sh, Fk(i as u64 + 1)));
+        }
+        let path = next_run_path(&runs_dir, 1);
+        let run = write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body).unwrap();
+        let claimed = claim_run_for_materialize(&run).unwrap();
+        assert!(claimed.path.to_string_lossy().ends_with(".run.mat"));
+        assert!(list_runs(&runs_dir).unwrap().is_empty());
+        assert_eq!(list_materialize_claims(&runs_dir).unwrap().len(), 1);
+
+        // finalize without enable — recovers .mat and materializes.
+        let n = b.finalize_and_bulk_materialize(&store).unwrap();
+        assert!(n >= 50, "inserted={n}");
+        assert!(store.scripthash.entry_count() >= 50);
+        // Claims cleaned up.
+        assert!(list_materialize_claims(&runs_dir).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

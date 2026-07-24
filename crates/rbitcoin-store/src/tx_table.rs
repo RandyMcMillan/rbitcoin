@@ -1,7 +1,8 @@
 use crate::address_head::{
     bak_head_path, clear_resize_control, is_probe_exhausted_error, load_needs_resize,
-    load_ratio, read_resize_control, shadow_head_path, write_head_meta, write_resize_control,
-    AddressHead, HeadLayout, ResizeControl, HEAD_LOAD_WARN, MAX_BITS,
+    load_ratio, read_resize_control, shadow_head_path, take_probe_depth_resize_request,
+    write_head_meta, write_resize_control, AddressHead, HeadLayout, ResizeControl,
+    HEAD_LOAD_WARN, MAX_BITS,
 };
 use crate::compact::{
     input_flags, output_flags, read_compact_size, read_uleb128, write_compact_size, write_uleb128,
@@ -2171,6 +2172,11 @@ impl TxTable {
         if !entries.is_empty() {
             self.head_insert_many_with_resize_retry(entries)?;
         }
+        // First insert past PROBE_DEPTH_WARN requests early widen (before load 0.75
+        // or probe exhaust).
+        if take_probe_depth_resize_request() && !self.head_resize_in_progress() {
+            self.ensure_head_resize_for_probe_exhaust()?;
+        }
         // After live inserts into primary only — never dual-write to shadow.
         self.maybe_start_head_resize()?;
         self.ensure_resize_bg_running();
@@ -2249,7 +2255,7 @@ impl TxTable {
                                 "store: tx.head probe exhausted — waiting on bg resize \
                                  (attempt={attempts} \
                                  cursor={}/{n} ({pct:.1}%) target_bits={target_bits} \
-                                 slots={slots} deep_gt64={deep} exhaust={exh} \
+                                 slots={slots} deep_warn={deep} exhaust={exh} \
                                  batch={} elapsed={:?})",
                                 cursor.saturating_sub(1),
                                 entries.len(),
@@ -2404,7 +2410,7 @@ impl TxTable {
                         rbitcoin_log::warn!(
                             "store: tx.head resize lagging load={ratio:.3} n={n} slots={slots} \
                              shadow_cursor={}/{} ({pct:.1}%) target_bits={} \
-                             deep_gt64={deep} exhaust={exh}",
+                             deep_warn={deep} exhaust={exh}",
                             r.cursor.saturating_sub(1),
                             n,
                             r.target.bits

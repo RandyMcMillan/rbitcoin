@@ -21,12 +21,14 @@
 //! append-deeper insert).
 //!
 //! **Probe:** **linear** from primary slot `h1(txid)` (`slot = (h1 + d) mod 2^bits`),
-//! capped at [`MAX_PROBE`]. Lookup/insert load a **[`PROBE_REGION_BYTES`] (1024 B)**
+//! capped at [`MAX_PROBE`]. Lookup/insert load a **[`PROBE_REGION_BYTES`] (2048 B)**
 //! contiguous run from the current slot in one IO, scan entries in memory, and only
 //! issue another region read if no empty was found (short/partial first response is
 //! fine — kernel/page boundaries are not special-cased). Foreign occupants are normal
 //! on lookup: body mismatch ⇒ continue. (Keyless entries cannot Robin-Hood: foreigner
 //! probe depth is unknown without a body read.)
+//! First insert at depth > [`PROBE_DEPTH_WARN`] requests online resize (see
+//! [`take_probe_depth_resize_request`]).
 //!
 //! **Mainnet default:** BITS=28 → **1 GiB** sparse @ 4 B entries. Online resize
 //! widens BITS (sequential rebuild from `tx.idx`); entry width becomes 8 B at
@@ -41,23 +43,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// Hard cap — never scan the whole table.
-pub const MAX_PROBE: u32 = 128;
+pub const MAX_PROBE: u32 = 256;
 
 /// Bytes requested per head probe IO (covers [`MAX_PROBE`] × 8 B entries).
 /// Kernel may return a short/partial length; callers scan what they got and only
 /// request another region if no empty slot appears.
-pub const PROBE_REGION_BYTES: usize = 1024;
+pub const PROBE_REGION_BYTES: usize = 2048;
 
-/// Inserts that needed probe depth **> 64** (warning band; not yet exhausted).
+/// Inserts that needed probe depth **> [`PROBE_DEPTH_WARN`]** (warning band).
 /// Cumulative counter for lagging/retry logs; WARN only once at first event.
-static PROBE_INSERT_DEPTH_GT64: AtomicU64 = AtomicU64::new(0);
+static PROBE_INSERT_DEPTH_WARN_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Inserts that exhausted [`MAX_PROBE`] (sleep-retry through resize).
 /// Counter only — the retry loop owns operator-facing logs.
 static PROBE_INSERT_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 
-/// Depth threshold above which inserts count as “deep” for ops visibility.
-pub const PROBE_DEPTH_WARN: u32 = 64;
+/// Set on the **first** insert that lands past [`PROBE_DEPTH_WARN`].
+/// [`take_probe_depth_resize_request`] clears it for the tx.head owner to start resize.
+static PROBE_DEPTH_RESIZE_REQUEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Depth threshold above which inserts count as “deep” for ops visibility and
+/// trigger an early online resize request (first event only).
+pub const PROBE_DEPTH_WARN: u32 = 128;
 
 /// Mainnet address width (2^28 slots × 4 B = 1 GiB sparse). Online resize grows.
 pub const MAINNET_BITS: u32 = 28;
@@ -75,21 +83,28 @@ pub const HEAD_LOAD_WARN: f64 = 0.85;
 /// Soft ceiling (align open-address 7/8); avoid dwelling here.
 pub const HEAD_LOAD_CEILING: f64 = 0.875;
 
-/// `(depth_gt64, probe_exhausted)` cumulative counters (no reset).
+/// `(depth_warn_count, probe_exhausted)` cumulative counters (no reset).
 #[inline]
 pub fn probe_depth_stats_snapshot() -> (u64, u64) {
     (
-        PROBE_INSERT_DEPTH_GT64.load(Ordering::Relaxed),
+        PROBE_INSERT_DEPTH_WARN_COUNT.load(Ordering::Relaxed),
         PROBE_INSERT_EXHAUSTED.load(Ordering::Relaxed),
     )
 }
 
-/// `(depth_gt64, probe_exhausted)` since last sample; both reset.
+/// `(depth_warn_count, probe_exhausted)` since last sample; both reset.
 pub fn sample_probe_depth_stats() -> (u64, u64) {
     (
-        PROBE_INSERT_DEPTH_GT64.swap(0, Ordering::Relaxed),
+        PROBE_INSERT_DEPTH_WARN_COUNT.swap(0, Ordering::Relaxed),
         PROBE_INSERT_EXHAUSTED.swap(0, Ordering::Relaxed),
     )
+}
+
+/// Consume a one-shot request from the first deep insert (depth > [`PROBE_DEPTH_WARN`]).
+/// Caller should start online resize if not already running.
+#[inline]
+pub fn take_probe_depth_resize_request() -> bool {
+    PROBE_DEPTH_RESIZE_REQUEST.swap(false, Ordering::AcqRel)
 }
 
 /// True when `err` is the sole-writer open-address insert failure (table full
@@ -107,13 +122,14 @@ fn note_probe_depth_on_insert(depth: u32) {
     if depth <= PROBE_DEPTH_WARN {
         return;
     }
-    let n = PROBE_INSERT_DEPTH_GT64.fetch_add(1, Ordering::Relaxed) + 1;
-    // Once only — ongoing load is surfaced via resize lagging / sleep-retry lines.
+    let n = PROBE_INSERT_DEPTH_WARN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    // Once only — first deep insert requests resize; further events counted silently.
     if n == 1 {
         rbitcoin_log::warn!(
             "store: tx.head insert probe depth>{PROBE_DEPTH_WARN} (first depth={depth}; \
-             further events counted silently)"
+             requesting online resize if not already running; further deep inserts counted silently)"
         );
+        PROBE_DEPTH_RESIZE_REQUEST.store(true, Ordering::Release);
     }
 }
 
@@ -862,6 +878,15 @@ mod tests {
         let meta = meta_path(&p);
         let _ = std::fs::remove_file(&meta);
         p
+    }
+
+    #[test]
+    fn probe_limits_match_policy() {
+        assert_eq!(MAX_PROBE, 256);
+        assert_eq!(PROBE_REGION_BYTES, 2048);
+        assert_eq!(PROBE_DEPTH_WARN, 128);
+        // Region must cover a full max-depth chain of 8 B entries.
+        assert!(PROBE_REGION_BYTES as u32 >= MAX_PROBE * 8);
     }
 
     #[test]

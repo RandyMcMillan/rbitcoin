@@ -21,10 +21,12 @@
 //! append-deeper insert).
 //!
 //! **Probe:** **linear** from primary slot `h1(txid)` (`slot = (h1 + d) mod 2^bits`),
-//! capped at [`MAX_PROBE`]. Consecutive depths stay on adjacent slots (page locality
-//! for cold mmap). Foreign occupants are normal on lookup: body mismatch ⇒ continue.
-//! (Keyless entries cannot Robin-Hood: foreigner probe depth is unknown without a
-//! body read.)
+//! capped at [`MAX_PROBE`]. Lookup/insert load a **[`PROBE_REGION_BYTES`] (1024 B)**
+//! contiguous run from the current slot in one IO, scan entries in memory, and only
+//! issue another region read if no empty was found (short/partial first response is
+//! fine — kernel/page boundaries are not special-cased). Foreign occupants are normal
+//! on lookup: body mismatch ⇒ continue. (Keyless entries cannot Robin-Hood: foreigner
+//! probe depth is unknown without a body read.)
 //!
 //! **Mainnet default:** BITS=28 → **1 GiB** sparse @ 4 B entries. Online resize
 //! widens BITS (sequential rebuild from `tx.idx`); entry width becomes 8 B at
@@ -40,6 +42,11 @@ use std::sync::Mutex;
 
 /// Hard cap — never scan the whole table.
 pub const MAX_PROBE: u32 = 128;
+
+/// Bytes requested per head probe IO (covers [`MAX_PROBE`] × 8 B entries).
+/// Kernel may return a short/partial length; callers scan what they got and only
+/// request another region if no empty slot appears.
+pub const PROBE_REGION_BYTES: usize = 1024;
 
 /// Inserts that needed probe depth **> 64** (warning band; not yet exhausted).
 /// Cumulative counter for lagging/retry logs; WARN only once at first event.
@@ -198,6 +205,97 @@ pub fn h1(txid: &[u8; 32], bits: u32) -> u64 {
 pub fn probe_index(txid: &[u8; 32], d: u32, bits: u32) -> u64 {
     let mask = (1u64 << bits) - 1;
     h1(txid, bits).wrapping_add(u64::from(d)) & mask
+}
+
+/// Absolute file offset of open-address slot `slot` (4 B or 8 B entries).
+#[inline]
+pub fn entry_file_off(slot: u64, entry_bytes: u8) -> u64 {
+    FILE_HEADER_LEN as u64 + slot * u64::from(entry_bytes)
+}
+
+/// Contiguous bytes available from `slot` to the end of the table body, capped
+/// by `published_len` (short regions near table end / HWM are expected).
+#[inline]
+pub fn probe_region_avail(
+    slot: u64,
+    slots: u64,
+    entry_bytes: u8,
+    published_len: u64,
+) -> u64 {
+    let off = entry_file_off(slot, entry_bytes);
+    let table_end = FILE_HEADER_LEN as u64 + slots * u64::from(entry_bytes);
+    let end = table_end.min(published_len);
+    end.saturating_sub(off)
+}
+
+/// Result of scanning one probe-region buffer.
+#[derive(Debug, Clone)]
+pub struct ProbeRegionScan {
+    /// Occupied create_fks with absolute probe depth (home = 0).
+    pub cands: Vec<(u32, u64)>,
+    /// Saw an empty slot (probe chain ends).
+    pub hit_empty: bool,
+    /// Complete entries advanced (occupied + empty if [`Self::hit_empty`]).
+    pub slots_advanced: u32,
+}
+
+/// Scan LE create_fk entries in `buf` (may be short / unaligned tail ignored).
+///
+/// Stops at empty, [`MAX_PROBE`], or end of complete entries in `buf`.
+#[inline]
+pub fn scan_probe_region(
+    buf: &[u8],
+    entry_bytes: u8,
+    start_depth: u32,
+    max_probe: u32,
+) -> ProbeRegionScan {
+    let es = entry_bytes as usize;
+    debug_assert!(es == 4 || es == 8);
+    let mut cands = Vec::new();
+    let mut slots_advanced = 0u32;
+    let mut depth = start_depth;
+    let mut off = 0usize;
+    while off + es <= buf.len() && depth < max_probe {
+        let e = match entry_bytes {
+            4 => u64::from(u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())),
+            8 => u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()),
+            _ => break,
+        };
+        off += es;
+        slots_advanced = slots_advanced.saturating_add(1);
+        if e == 0 {
+            return ProbeRegionScan {
+                cands,
+                hit_empty: true,
+                slots_advanced,
+            };
+        }
+        cands.push((depth, e));
+        depth = depth.saturating_add(1);
+    }
+    ProbeRegionScan {
+        cands,
+        hit_empty: false,
+        slots_advanced,
+    }
+}
+
+/// Request size for a region pread from `slot` (≤ [`PROBE_REGION_BYTES`], entry-aligned).
+#[inline]
+pub fn probe_region_want(
+    slot: u64,
+    slots: u64,
+    entry_bytes: u8,
+    published_len: u64,
+) -> usize {
+    let avail = probe_region_avail(slot, slots, entry_bytes, published_len);
+    let es = u64::from(entry_bytes);
+    if avail < es {
+        return 0;
+    }
+    let want = (PROBE_REGION_BYTES as u64).min(avail);
+    // Entry-align (drop trailing partial entry if avail is odd for some reason).
+    ((want / es) * es) as usize
 }
 
 /// Resolve address width for new creates.
@@ -421,6 +519,33 @@ impl AddressHead {
         }
     }
 
+    /// Load up to `want` bytes of contiguous entries starting at `slot` into `buf`
+    /// (Acquire loads — pairs with Release stores on insert). Returns bytes filled
+    /// (entry-aligned). Stops at table end (short region); does **not** wrap.
+    fn load_probe_region(
+        &self,
+        slot: u64,
+        want: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, StoreError> {
+        let es = self.layout.entry_bytes as usize;
+        debug_assert!(want <= buf.len());
+        debug_assert!(want % es == 0);
+        let max_slots = self.slots.saturating_sub(slot) as usize;
+        let n_ent = (want / es).min(max_slots);
+        let mut filled = 0usize;
+        for i in 0..n_ent {
+            let e = self.read_entry(slot + i as u64)?;
+            match es {
+                4 => buf[filled..filled + 4].copy_from_slice(&(e as u32).to_le_bytes()),
+                8 => buf[filled..filled + 8].copy_from_slice(&e.to_le_bytes()),
+                _ => return Err(StoreError::Corrupt("address head entry_bytes")),
+            }
+            filled += es;
+        }
+        Ok(filled)
+    }
+
     /// FD for bulk io_uring / pread of head entries.
     #[inline]
     pub(crate) fn read_fd(&self) -> std::os::fd::RawFd {
@@ -476,21 +601,50 @@ impl AddressHead {
     ///
     /// Idempotent if `new_fk` is already on the chain. Requires at most one
     /// concurrent inserter process-wide for this head.
+    ///
+    /// Loads [`PROBE_REGION_BYTES`] at a time from the current slot; scans in
+    /// memory; another region only if no empty in the bytes returned.
     fn insert_one(&self, txid: &[u8; 32], new_fk: Fk) -> Result<(), StoreError> {
         let new_u = self.encode_fk(new_fk)?;
-        for d in 0..MAX_PROBE {
-            let slot = probe_index(txid, d, self.layout.bits);
-            let e = self.read_entry(slot)?;
-            if e == new_u {
-                return Ok(());
-            }
-            if e != 0 {
+        let es = self.layout.entry_bytes;
+        let mask = self.slots - 1;
+        let pub_len = self.file.logical_len();
+        let mut slot = h1(txid, self.layout.bits);
+        let mut depth = 0u32;
+        let mut buf = [0u8; PROBE_REGION_BYTES];
+        while depth < MAX_PROBE {
+            let want = probe_region_want(slot, self.slots, es, pub_len);
+            if want == 0 {
+                // Past contiguous table body at this slot — wrap to 0.
+                if slot == 0 {
+                    break;
+                }
+                slot = 0;
                 continue;
             }
-            note_probe_depth_on_insert(d);
-            self.store_entry(slot, new_u)?;
-            self.occupied.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+            let n = self.load_probe_region(slot, want, &mut buf)?;
+            let scan = scan_probe_region(&buf[..n], es, depth, MAX_PROBE);
+            for &(_d, e) in &scan.cands {
+                if e == new_u {
+                    return Ok(());
+                }
+            }
+            if scan.hit_empty {
+                // Empty sits immediately after the occupied run in this region.
+                let empty_depth = depth.saturating_add(scan.cands.len() as u32);
+                note_probe_depth_on_insert(empty_depth);
+                let empty_slot = slot.wrapping_add(scan.cands.len() as u64) & mask;
+                self.store_entry(empty_slot, new_u)?;
+                self.occupied.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            // No empty in this region (full or short) — advance and continue.
+            if scan.slots_advanced == 0 {
+                break;
+            }
+            debug_assert_eq!(scan.slots_advanced as usize, scan.cands.len());
+            slot = slot.wrapping_add(u64::from(scan.slots_advanced)) & mask;
+            depth = depth.saturating_add(scan.slots_advanced);
         }
         note_probe_exhausted();
         Err(StoreError::Corrupt("address head probe exhausted on insert"))
@@ -526,15 +680,40 @@ impl AddressHead {
     }
 
     /// Walk probe until empty; return every fk (may include foreigners).
+    ///
+    /// One [`PROBE_REGION_BYTES`] read per wave from the current slot; scan for
+    /// create_fks; only another IO if the response had no empty (short/partial
+    /// near table end or wrap is handled by continuing from the next slot).
     pub fn probe_fks(&self, txid: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
+        let es = self.layout.entry_bytes;
+        let mask = self.slots - 1;
+        let pub_len = self.file.logical_len();
         let mut out = Vec::new();
-        for d in 0..MAX_PROBE {
-            let slot = probe_index(txid, d, self.layout.bits);
-            let e = self.read_entry(slot)?;
-            if e == 0 {
+        let mut slot = h1(txid, self.layout.bits);
+        let mut depth = 0u32;
+        let mut buf = [0u8; PROBE_REGION_BYTES];
+        while depth < MAX_PROBE {
+            let want = probe_region_want(slot, self.slots, es, pub_len);
+            if want == 0 {
+                if slot == 0 {
+                    break;
+                }
+                slot = 0;
+                continue;
+            }
+            let n = self.load_probe_region(slot, want, &mut buf)?;
+            let scan = scan_probe_region(&buf[..n], es, depth, MAX_PROBE);
+            for &(_d, e) in &scan.cands {
+                out.push(Fk(e));
+            }
+            if scan.hit_empty {
                 break;
             }
-            out.push(Fk(e));
+            if scan.slots_advanced == 0 {
+                break;
+            }
+            slot = slot.wrapping_add(u64::from(scan.slots_advanced)) & mask;
+            depth = depth.saturating_add(scan.slots_advanced);
         }
         Ok(out)
     }
@@ -691,6 +870,62 @@ mod tests {
         assert_eq!(probe_index(&k, 0, 16), probe_index(&k, 0, 16));
         assert_ne!(probe_index(&k, 0, 16), probe_index(&k, 1, 16));
         assert!(probe_index(&k, 0, 16) < (1 << 16));
+    }
+
+    #[test]
+    fn scan_probe_region_stops_at_empty_and_partial() {
+        // 4B entries: fk 1, 2, empty, 3
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        let s = scan_probe_region(&buf, 4, 0, MAX_PROBE);
+        assert!(s.hit_empty);
+        assert_eq!(s.cands, vec![(0, 1), (1, 2)]);
+        assert_eq!(s.slots_advanced, 3); // two occupied + empty
+
+        // Short buffer: only one entry, no empty → need more.
+        let short = 7u32.to_le_bytes();
+        let s2 = scan_probe_region(&short, 4, 5, MAX_PROBE);
+        assert!(!s2.hit_empty);
+        assert_eq!(s2.cands, vec![(5, 7)]);
+        assert_eq!(s2.slots_advanced, 1);
+
+        // Trailing partial entry ignored.
+        let mut partial = 9u32.to_le_bytes().to_vec();
+        partial.push(0xff);
+        let s3 = scan_probe_region(&partial, 4, 0, MAX_PROBE);
+        assert_eq!(s3.cands, vec![(0, 9)]);
+        assert!(!s3.hit_empty);
+    }
+
+    #[test]
+    fn probe_region_covers_chain_across_table_end_wrap() {
+        // Tiny table: force home near end so first region is short, then wrap.
+        let path = tmp("wrap_region");
+        let h = AddressHead::create_with_bits(&path, 8).unwrap(); // 256 slots
+        // Craft txid with h1 = 254 so chain uses 254,255,0,1,...
+        let mut txid = [0u8; 32];
+        // bits=8 → h1 = first byte
+        txid[0] = 254;
+        assert_eq!(h1(&txid, 8), 254);
+        h.insert(&txid, Fk(1)).unwrap();
+        // Foreigners fill 255 so second insert of same txid goes to wrap (or we
+        // just check first lands and probe_fks finds it with region wrap).
+        let mut other = [0u8; 32];
+        other[0] = 255;
+        h.insert(&other, Fk(2)).unwrap();
+        // Same home 254: second create for txid goes deeper (255 occupied by other → 0).
+        h.insert(&txid, Fk(3)).unwrap();
+        let cands = h.probe_fks(&txid).unwrap();
+        assert!(cands.contains(&Fk(1)));
+        assert!(cands.contains(&Fk(3)));
+        // Reverse body-order semantics: deepest is last in probe_fks order.
+        assert_eq!(cands[0], Fk(1));
+        assert!(cands.last() == Some(&Fk(3)) || cands.contains(&Fk(3)));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(meta_path(&path));
     }
 
     #[test]

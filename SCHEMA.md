@@ -188,7 +188,7 @@ Keyless open-address table: **txid → dense create_fk**.
 | Entry | LE create_fk; **0 = empty**; **no HAS_NEXT** |
 | Entry width | **4 B** for BITS ≤ 32; **8 B** for BITS ≥ 33 |
 | Meta | `tx.head.meta`: bits, entry_bytes, generation; **version 2** = linear probe |
-| Probe | **Linear** from primary `h1(txid)`: `slot = (h1 + d) mod 2^bits`; max depth 128; stop at empty |
+| Probe | **Linear** from primary `h1(txid)`: `slot = (h1 + d) mod 2^bits`; load **1024 B** region per IO, scan in RAM, more only if no empty (short/partial OK); max depth 128 |
 | Insert | First empty (or same fk idempotent); second same-txid create goes **deeper** on the run |
 | Lookup | Body-verify from **last occupied → first** (newest BIP30-shaped create wins) |
 

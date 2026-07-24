@@ -1028,19 +1028,20 @@ impl TxTable {
 
     /// Batch head resolve (archive prep bulk path).
     ///
-    /// **io_uring wave pipeline:** each wave submits independent preads
-    /// (`probe` / `idx` / `body` mix) so the kernel schedules them as a set;
-    /// completions finish in any order. Dependent stages per key:
-    /// `probe(d) → (non-empty) probe(d+1) + idx(fk) → body_txid → maybe best`.
-    ///
-    /// BIP30 / deepest match: each candidate carries probe depth; a body match
-    /// only wins if deeper than the current best (completion order independent).
+    /// **Probe:** one ~[`crate::address_head::PROBE_REGION_BYTES`] pread per key
+    /// from the linear-probe home (io_uring / parallel); scan entries in memory;
+    /// only another region if the response was short/partial and no empty was
+    /// found. **Then** idx + body-prefix waves for all candidates (same as
+    /// before). BIP30: deepest matching body wins.
     ///
     /// Timers: [`crate::head_resolve_stats`] probe / idx / body (per-wave wall).
     pub fn get_fk_by_txid_batch(
         &self,
         txids: &[[u8; 32]],
     ) -> Result<Vec<([u8; 32], Option<Fk>)>, StoreError> {
+        use crate::address_head::{
+            entry_file_off, h1, probe_region_want, scan_probe_region, MAX_PROBE,
+        };
         use crate::bulk_io::{self, ReadOp};
         use std::time::Instant;
         if txids.is_empty() {
@@ -1048,9 +1049,168 @@ impl TxTable {
         }
         crate::head_resolve_stats::add_keys(txids.len() as u64);
 
+        // Snapshot head geometry + fd under a **brief** read lock, then drop.
+        // Holding `head.read()` for the whole batch starves resize swap.
+        let (bits, entry_bytes, head_fd, head_pub, head_path, head_slots) = {
+            let head = self.head.read().unwrap();
+            (
+                head.bits(),
+                head.entry_bytes(),
+                head.read_fd(),
+                head.published_len(),
+                head.path_str().to_path_buf(),
+                head.slots(),
+            )
+        };
+        let idx_fd = self.body.idx_read_fd();
+        let body_fd = self.body.body_read_fd();
+        let idx_path = self.body.idx_file_path();
+        let body_path = self.body.body_file_path();
+        let body_pub = self.body.body_published_len();
+        let idx_pub = self.body.idx_published_len();
+        let count = self.body.count();
+        let body_logical = self.body.body_logical_len().max(crate::file::FILE_HEADER_LEN as u64);
+        let mask = head_slots - 1;
+        let es = entry_bytes;
+
+        /// Per-key probe cursor until empty / MAX_PROBE.
+        struct ProbeCur {
+            slot: u64,
+            depth: u32,
+            done: bool,
+            /// (depth, fk)
+            cands: Vec<(u32, u64)>,
+        }
+
+        let mut probes: Vec<ProbeCur> = txids
+            .iter()
+            .map(|txid| ProbeCur {
+                slot: h1(txid, bits),
+                depth: 0,
+                done: false,
+                cands: Vec::new(),
+            })
+            .collect();
+
+        // --- Phase 1: region probe (parallel across keys) ---
+        let mut cands_total = 0u64;
+        while probes.iter().any(|p| !p.done) {
+            let t_wave = Instant::now();
+            let active: Vec<usize> = probes
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| !p.done)
+                .map(|(i, _)| i)
+                .collect();
+            if active.is_empty() {
+                break;
+            }
+
+            // want + file_off per active key (0 want → wrap / skip IO).
+            let mut wants: Vec<usize> = Vec::with_capacity(active.len());
+            let mut offs: Vec<u64> = Vec::with_capacity(active.len());
+            for &i in &active {
+                let p = &probes[i];
+                let mut slot = p.slot;
+                let mut want = probe_region_want(slot, head_slots, es, head_pub);
+                if want == 0 && slot != 0 {
+                    slot = 0;
+                    probes[i].slot = 0;
+                    want = probe_region_want(0, head_slots, es, head_pub);
+                }
+                wants.push(want);
+                offs.push(if want > 0 {
+                    entry_file_off(slot, es)
+                } else {
+                    0
+                });
+            }
+
+            let io_keys: Vec<usize> = active
+                .iter()
+                .copied()
+                .zip(wants.iter().copied())
+                .filter(|(_, w)| *w > 0)
+                .map(|(i, _)| i)
+                .collect();
+
+            if !io_keys.is_empty() {
+                let total: usize = io_keys
+                    .iter()
+                    .map(|&i| {
+                        let ai = active.iter().position(|&x| x == i).unwrap();
+                        wants[ai]
+                    })
+                    .sum();
+                let mut arena = vec![0u8; total.max(1)];
+                let mut spans: Vec<(usize, usize, usize)> = Vec::with_capacity(io_keys.len());
+                // (key_i, want, arena_off)
+                let mut aoff = 0usize;
+                for &i in &io_keys {
+                    let ai = active.iter().position(|&x| x == i).unwrap();
+                    let w = wants[ai];
+                    spans.push((i, w, aoff));
+                    aoff += w;
+                }
+                // SAFETY: disjoint arena slices.
+                let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(spans.len());
+                for &(i, w, a) in &spans {
+                    let ai = active.iter().position(|&x| x == i).unwrap();
+                    let ptr = arena[a..a + w].as_mut_ptr();
+                    let slice = unsafe { std::slice::from_raw_parts_mut(ptr, w) };
+                    read_ops.push(ReadOp {
+                        fd: head_fd,
+                        offset: offs[ai],
+                        buf: slice,
+                        result: i32::MIN,
+                    });
+                }
+                bulk_io::pread_batch(&mut read_ops);
+
+                for (ro, &(key_i, want, a)) in read_ops.iter().zip(spans.iter()) {
+                    if ro.result < 0 {
+                        return Err(StoreError::io(
+                            &head_path,
+                            std::io::Error::from_raw_os_error(-ro.result),
+                        ));
+                    }
+                    // Partial/short is OK — scan what we got (entry-align).
+                    let got = (ro.result as usize).min(want);
+                    let esz = es as usize;
+                    let n = (got / esz) * esz;
+                    let buf = &arena[a..a + n];
+                    let p = &mut probes[key_i];
+                    let scan = scan_probe_region(buf, es, p.depth, MAX_PROBE);
+                    for &(d, fk) in &scan.cands {
+                        p.cands.push((d, fk));
+                        cands_total = cands_total.saturating_add(1);
+                    }
+                    if scan.hit_empty || p.depth.saturating_add(scan.slots_advanced) >= MAX_PROBE
+                    {
+                        p.done = true;
+                    } else if scan.slots_advanced == 0 {
+                        p.done = true;
+                    } else {
+                        p.slot = p.slot.wrapping_add(u64::from(scan.slots_advanced)) & mask;
+                        p.depth = p.depth.saturating_add(scan.slots_advanced);
+                    }
+                }
+            }
+
+            // Keys with want==0 after wrap attempt: done (no more table).
+            for &i in &active {
+                let ai = active.iter().position(|&x| x == i).unwrap();
+                if wants[ai] == 0 {
+                    probes[i].done = true;
+                }
+            }
+
+            crate::head_resolve_stats::add_probe(t_wave.elapsed().as_nanos() as u64);
+        }
+
+        // --- Phase 2: idx + body for every candidate ---
         #[derive(Clone, Copy)]
         enum Stage {
-            Probe { depth: u8 },
             Idx { depth: u8, fk: u64 },
             Body {
                 depth: u8,
@@ -1063,16 +1223,12 @@ impl TxTable {
         struct Op {
             key_i: u32,
             stage: Stage,
-            /// Scratch for pread (probe 8 / idx 16 / body 33).
             buf: [u8; 33],
-            /// Bytes of `buf` that are live for this stage.
             buf_len: u8,
             file_off: u64,
             fd: std::os::fd::RawFd,
-            entry: u64,
             range: (u64, u64),
             prefix_n: usize,
-            /// Soft-skip this candidate (stale/foreign fk, no hard error).
             dead: bool,
             err: Option<StoreError>,
         }
@@ -1081,94 +1237,50 @@ impl TxTable {
             best: Option<(u64, u8)>,
         }
 
-        // Snapshot head geometry + fd under a **brief** read lock, then drop.
-        // Holding `head.read()` for the whole batch starves `try_complete_head_resize`
-        // (`head.write()`), which leaves `tx.head` + `tx.head.new` both on disk and
-        // blocks the archive writer forever after shadow fill hits 100%.
-        // Linux keeps the old fd valid across rename, so mid-batch swap is safe for
-        // in-flight preads; new batches re-snapshot.
-        let (bits, entry_bytes, head_fd, head_pub, head_path) = {
-            let head = self.head.read().unwrap();
-            (
-                head.bits(),
-                head.entry_bytes(),
-                head.read_fd(),
-                head.published_len(),
-                head.path_str().to_path_buf(),
-            )
-        };
-        let idx_fd = self.body.idx_read_fd();
-        let body_fd = self.body.body_read_fd();
-        let idx_path = self.body.idx_file_path();
-        let body_path = self.body.body_file_path();
-        let body_pub = self.body.body_published_len();
-        let count = self.body.count();
-        let body_logical = self.body.body_logical_len().max(crate::file::FILE_HEADER_LEN as u64);
-
         let mut keys: Vec<KeyState> = (0..txids.len())
             .map(|_| KeyState { best: None })
             .collect();
 
-        let mut scheduled: Vec<Op> = (0..txids.len())
-            .map(|i| Op {
-                key_i: i as u32,
-                stage: Stage::Probe { depth: 0 },
-                buf: [0u8; 33],
-                buf_len: 0,
-                file_off: 0,
-                fd: head_fd,
-                entry: 0,
-                range: (0, 0),
-                prefix_n: 0,
-                dead: false,
-                err: None,
-            })
-            .collect();
+        let mut scheduled: Vec<Op> = Vec::new();
+        for (i, p) in probes.iter().enumerate() {
+            for &(d, fk) in &p.cands {
+                scheduled.push(Op {
+                    key_i: i as u32,
+                    stage: Stage::Idx {
+                        depth: d as u8,
+                        fk,
+                    },
+                    buf: [0u8; 33],
+                    buf_len: 0,
+                    file_off: 0,
+                    fd: idx_fd,
+                    range: (0, 0),
+                    prefix_n: 0,
+                    dead: false,
+                    err: None,
+                });
+            }
+        }
 
-        let mut cands_total = 0u64;
         let mut body_lookups = 0u64;
-
         while !scheduled.is_empty() {
             let t_wave = Instant::now();
-            let mut any_probe = false;
             let mut any_idx = false;
             let mut any_body = false;
 
-            // Prepare offsets/fds before submit.
             for op in scheduled.iter_mut() {
                 match op.stage {
-                    Stage::Probe { depth } => {
-                        any_probe = true;
-                        let txid = &txids[op.key_i as usize];
-                        let slot =
-                            crate::address_head::probe_index(txid, u32::from(depth), bits);
-                        let off = crate::file::FILE_HEADER_LEN as u64
-                            + slot * u64::from(entry_bytes);
-                        let need = u64::from(entry_bytes);
-                        if off.saturating_add(need) > head_pub {
-                            op.err = Some(StoreError::Corrupt("probe past head published"));
-                            continue;
-                        }
-                        op.fd = head_fd;
-                        op.file_off = off;
-                        op.buf_len = entry_bytes;
-                        op.buf[..entry_bytes as usize].fill(0);
-                    }
                     Stage::Idx { fk, .. } => {
                         any_idx = true;
                         let id = fk;
-                        // Stale/garbage probe or race: skip candidate (do not fail batch).
-                        // Pre-uring path ignored body NotFound the same way.
                         if id == 0 || id > count {
                             op.dead = true;
                             op.buf_len = 0;
                             continue;
                         }
                         let idx_off = crate::file::FILE_HEADER_LEN as u64 + (id - 1) * 8;
-                        // One 16B pread covers start+end when not last; else 8B.
                         let nbytes: u8 = if id < count { 16 } else { 8 };
-                        let need = u64::from(nbytes);
-                        if idx_off.saturating_add(need) > self.body.idx_published_len() {
+                        if idx_off.saturating_add(u64::from(nbytes)) > idx_pub {
                             op.dead = true;
                             op.buf_len = 0;
                             continue;
@@ -1197,7 +1309,6 @@ impl TxTable {
                 }
             }
 
-            // Collect ops that need IO; arena-backed preads (io_uring).
             let io_idx: Vec<usize> = scheduled
                 .iter()
                 .enumerate()
@@ -1207,7 +1318,6 @@ impl TxTable {
             if !io_idx.is_empty() {
                 let total: usize = io_idx.iter().map(|&i| scheduled[i].buf_len as usize).sum();
                 let mut arena = vec![0u8; total];
-                // (scheduled_i, len)
                 let spans: Vec<(usize, usize)> = io_idx
                     .iter()
                     .map(|&i| (i, scheduled[i].buf_len as usize))
@@ -1234,7 +1344,6 @@ impl TxTable {
                     let op = &mut scheduled[op_i];
                     if ro.result < 0 {
                         let path: &std::path::Path = match op.stage {
-                            Stage::Probe { .. } => head_path.as_path(),
                             Stage::Idx { .. } => idx_path.as_ref(),
                             Stage::Body { .. } => body_path.as_ref(),
                         };
@@ -1244,24 +1353,13 @@ impl TxTable {
                         ));
                         continue;
                     }
+                    // Idx/body still require full length (known sizes).
                     if ro.result as usize != len {
                         op.err = Some(StoreError::Corrupt("bulk pread short"));
                         continue;
                     }
                     op.buf[..len].copy_from_slice(&ro.buf[..len]);
                     match op.stage {
-                        Stage::Probe { .. } => {
-                            op.entry = match entry_bytes {
-                                4 => u64::from(u32::from_le_bytes(
-                                    op.buf[..4].try_into().unwrap(),
-                                )),
-                                8 => u64::from_le_bytes(op.buf[..8].try_into().unwrap()),
-                                _ => {
-                                    op.err = Some(StoreError::Corrupt("entry_bytes"));
-                                    continue;
-                                }
-                            };
-                        }
                         Stage::Idx { fk, .. } => {
                             let start = u64::from_le_bytes(op.buf[..8].try_into().unwrap());
                             let end = if fk < count {
@@ -1283,18 +1381,13 @@ impl TxTable {
             }
 
             let wave_ns = t_wave.elapsed().as_nanos() as u64;
-            if any_body && !any_probe && !any_idx {
+            if any_body && !any_idx {
                 crate::head_resolve_stats::add_body(wave_ns);
-            } else if any_idx && !any_probe && !any_body {
+            } else if any_idx && !any_body {
                 crate::head_resolve_stats::add_idx(wave_ns);
-            } else if any_probe && !any_idx && !any_body {
-                crate::head_resolve_stats::add_probe(wave_ns);
             } else {
-                let parts = u64::from(any_probe) + u64::from(any_idx) + u64::from(any_body);
+                let parts = u64::from(any_idx) + u64::from(any_body);
                 let share = if parts > 0 { wave_ns / parts } else { 0 };
-                if any_probe {
-                    crate::head_resolve_stats::add_probe(share);
-                }
                 if any_idx {
                     crate::head_resolve_stats::add_idx(share);
                 }
@@ -1304,49 +1397,12 @@ impl TxTable {
             }
 
             let mut next: Vec<Op> = Vec::with_capacity(scheduled.len());
-            for op in scheduled.into_iter().rev() {
+            for op in scheduled {
                 if let Some(e) = op.err {
                     return Err(e);
                 }
                 let ki = op.key_i as usize;
                 match op.stage {
-                    Stage::Probe { depth } => {
-                        if op.entry == 0 {
-                            continue;
-                        }
-                        cands_total = cands_total.saturating_add(1);
-                        let fk = op.entry;
-                        if u32::from(depth) + 1 < crate::address_head::MAX_PROBE {
-                            next.push(Op {
-                                key_i: op.key_i,
-                                stage: Stage::Probe {
-                                    depth: depth.saturating_add(1),
-                                },
-                                buf: [0u8; 33],
-                                buf_len: 0,
-                                file_off: 0,
-                                fd: head_fd,
-                                entry: 0,
-                                range: (0, 0),
-                                prefix_n: 0,
-                                dead: false,
-                                err: None,
-                            });
-                        }
-                        next.push(Op {
-                            key_i: op.key_i,
-                            stage: Stage::Idx { depth, fk },
-                            buf: [0u8; 33],
-                            buf_len: 0,
-                            file_off: 0,
-                            fd: idx_fd,
-                            entry: 0,
-                            range: (0, 0),
-                            prefix_n: 0,
-                            dead: false,
-                            err: None,
-                        });
-                    }
                     Stage::Idx { depth, fk } => {
                         if op.dead {
                             continue;
@@ -1367,7 +1423,6 @@ impl TxTable {
                             buf_len: 0,
                             file_off: 0,
                             fd: body_fd,
-                            entry: 0,
                             range: (0, 0),
                             prefix_n: 0,
                             dead: false,

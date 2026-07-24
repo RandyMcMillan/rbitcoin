@@ -39,11 +39,11 @@ use std::sync::Mutex;
 pub const MAX_PROBE: u32 = 128;
 
 /// Inserts that needed probe depth **> 64** (warning band; not yet exhausted).
-/// Sampled/reset by IBD / diagnostics; also rate-limited WARN on the first and
-/// every 10_000th event.
+/// Cumulative counter for lagging/retry logs; WARN only once at first event.
 static PROBE_INSERT_DEPTH_GT64: AtomicU64 = AtomicU64::new(0);
 
-/// Inserts that exhausted [`MAX_PROBE`] (should sleep-retry through resize).
+/// Inserts that exhausted [`MAX_PROBE`] (sleep-retry through resize).
+/// Counter only — the retry loop owns operator-facing logs.
 static PROBE_INSERT_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 
 /// Depth threshold above which inserts count as “deep” for ops visibility.
@@ -98,21 +98,18 @@ fn note_probe_depth_on_insert(depth: u32) {
         return;
     }
     let n = PROBE_INSERT_DEPTH_GT64.fetch_add(1, Ordering::Relaxed) + 1;
-    if n == 1 || n % 10_000 == 0 {
+    // Once only — ongoing load is surfaced via resize lagging / sleep-retry lines.
+    if n == 1 {
         rbitcoin_log::warn!(
-            "store: tx.head insert probe depth>{PROBE_DEPTH_WARN} (depth={depth} count={n})"
+            "store: tx.head insert probe depth>{PROBE_DEPTH_WARN} (first depth={depth}; \
+             further events counted silently)"
         );
     }
 }
 
 #[inline]
 fn note_probe_exhausted() {
-    let n = PROBE_INSERT_EXHAUSTED.fetch_add(1, Ordering::Relaxed) + 1;
-    if n == 1 || n % 100 == 0 {
-        rbitcoin_log::warn!(
-            "store: tx.head insert probe exhausted (MAX_PROBE={MAX_PROBE} count={n})"
-        );
-    }
+    PROBE_INSERT_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
 }
 
 const META_MAGIC: &[u8; 4] = b"THM1";

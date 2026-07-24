@@ -1952,44 +1952,80 @@ impl TxTable {
     ) -> Result<(), StoreError> {
         use std::time::{Duration, Instant};
 
-        /// Aggressive shadow fill while the archive writer is blocked.
+        /// Shadow fill budget while the archive writer is blocked on capacity.
         const RETRY_POLL_BUDGET: u64 = 65_536;
-        const SLEEP: Duration = Duration::from_millis(50);
+        /// Base sleep between retries (grows with attempts, capped).
+        const SLEEP_BASE: Duration = Duration::from_secs(2);
+        const SLEEP_MAX: Duration = Duration::from_secs(15);
         /// Safety valve — operator can restart if resize is truly stuck.
         const MAX_WAIT: Duration = Duration::from_secs(30 * 60);
+        /// How often to emit a sleep-retry progress WARN after the first.
+        const LOG_EVERY: Duration = Duration::from_secs(60);
 
         let t0 = Instant::now();
         let mut attempts = 0u32;
+        let mut last_log = Instant::now()
+            .checked_sub(LOG_EVERY)
+            .unwrap_or_else(Instant::now);
         loop {
             match self.head.read().unwrap().insert_many(entries) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    if attempts > 0 {
+                        rbitcoin_log::info!(
+                            "store: tx.head insert resumed after probe exhaust \
+                             (attempts={attempts} waited={:?} batch={})",
+                            t0.elapsed(),
+                            entries.len()
+                        );
+                    }
+                    return Ok(());
+                }
                 Err(e) if is_probe_exhausted_error(&e) => {
                     attempts = attempts.saturating_add(1);
                     // Ensure a widen is running (force start even if under load
                     // threshold — probe exhaust is a hard capacity signal).
                     self.ensure_head_resize_for_probe_exhaust()?;
-                    let (cursor, n, target_bits, slots) = self.head_resize_progress();
-                    let (deep, exh) = crate::address_head::probe_depth_stats_snapshot();
-                    rbitcoin_log::warn!(
-                        "store: tx.head probe exhausted — sleep-retry while resize runs \
-                         (attempt={attempts} cursor={cursor}/{n} target_bits={target_bits} \
-                         slots_primary={slots} deep_probe_gt64={deep} exhaust_events={exh} \
-                         batch={} elapsed={:?})",
-                        entries.len(),
-                        t0.elapsed()
-                    );
-                    // Drive rebuild hard while the sole writer is waiting.
+                    // Drive rebuild while the sole writer is waiting.
                     self.head_resize_poll(RETRY_POLL_BUDGET)?;
                     if t0.elapsed() > MAX_WAIT {
+                        let (cursor, n, _, _) = self.head_resize_progress();
                         rbitcoin_log::error!(
                             "store: tx.head probe exhausted — resize did not free capacity \
                              within {MAX_WAIT:?} (attempts={attempts} cursor={cursor}/{n})"
                         );
                         return Err(e);
                     }
-                    // If resize finished this poll, retry immediately; else nap.
+                    // If resize finished this poll, retry immediately; else sleep.
                     if self.head_resize_in_progress() {
-                        std::thread::sleep(SLEEP);
+                        // 2s → 4s → 8s → 15s cap — give the fill real wall time.
+                        let shift = attempts.saturating_sub(1).min(3);
+                        let sleep = SLEEP_BASE
+                            .saturating_mul(1u32 << shift)
+                            .min(SLEEP_MAX);
+                        let should_log = attempts == 1
+                            || last_log.elapsed() >= LOG_EVERY;
+                        if should_log {
+                            let (cursor, n, target_bits, slots) = self.head_resize_progress();
+                            let (deep, exh) =
+                                crate::address_head::probe_depth_stats_snapshot();
+                            let pct = if n > 0 {
+                                100.0 * (cursor.saturating_sub(1) as f64) / (n as f64)
+                            } else {
+                                100.0
+                            };
+                            rbitcoin_log::warn!(
+                                "store: tx.head probe exhausted — waiting on resize \
+                                 (attempt={attempts} sleep={sleep:?} \
+                                 cursor={}/{n} ({pct:.1}%) target_bits={target_bits} \
+                                 slots={slots} deep_gt64={deep} exhaust={exh} \
+                                 batch={} elapsed={:?})",
+                                cursor.saturating_sub(1),
+                                entries.len(),
+                                t0.elapsed()
+                            );
+                            last_log = Instant::now();
+                        }
+                        std::thread::sleep(sleep);
                     }
                 }
                 Err(e) => return Err(e),
@@ -2018,7 +2054,7 @@ impl TxTable {
             return Ok(());
         }
         let target = HeadLayout::new(bits + 1)?;
-        rbitcoin_log::warn!(
+        rbitcoin_log::info!(
             "store: tx.head probe exhausted — forcing resize start {}→{} bits (n={})",
             bits,
             target.bits,
@@ -2105,20 +2141,39 @@ impl TxTable {
                 };
                 let ratio = load_ratio(n, slots);
                 if ratio >= HEAD_LOAD_WARN {
-                    let pct = if n > 0 {
-                        100.0 * (r.cursor.saturating_sub(1) as f64) / (n as f64)
-                    } else {
-                        100.0
-                    };
-                    let (deep, exh) = crate::address_head::probe_depth_stats_snapshot();
-                    rbitcoin_log::warn!(
-                        "store: tx.head resize lagging load={ratio:.3} n={n} slots={slots} \
-                         shadow_cursor={}/{} ({pct:.1}%) target_bits={} \
-                         deep_probe_gt64={deep} exhaust_events={exh}",
-                        r.cursor.saturating_sub(1),
-                        n,
-                        r.target.bits
-                    );
+                    // Rate-limit: maybe_start is called on every head batch.
+                    static LAST_LAG_LOG_MS: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let prev = LAST_LAG_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+                    if now_ms.saturating_sub(prev) >= 60_000
+                        && LAST_LAG_LOG_MS
+                            .compare_exchange(
+                                prev,
+                                now_ms,
+                                std::sync::atomic::Ordering::Relaxed,
+                                std::sync::atomic::Ordering::Relaxed,
+                            )
+                            .is_ok()
+                    {
+                        let pct = if n > 0 {
+                            100.0 * (r.cursor.saturating_sub(1) as f64) / (n as f64)
+                        } else {
+                            100.0
+                        };
+                        let (deep, exh) = crate::address_head::probe_depth_stats_snapshot();
+                        rbitcoin_log::warn!(
+                            "store: tx.head resize lagging load={ratio:.3} n={n} slots={slots} \
+                             shadow_cursor={}/{} ({pct:.1}%) target_bits={} \
+                             deep_gt64={deep} exhaust={exh}",
+                            r.cursor.saturating_sub(1),
+                            n,
+                            r.target.bits
+                        );
+                    }
                 }
                 return Ok(());
             }

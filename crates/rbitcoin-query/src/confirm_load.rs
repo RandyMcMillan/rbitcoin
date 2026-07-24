@@ -40,7 +40,7 @@ pub struct ConfirmLoadStats {
     pub pin_body_ns: u64,
     /// pin_new range + meta/outs resolve (excludes spent timer).
     pub pin_new_meta_ns: u64,
-    /// BatchParents put + body_range put.
+    /// Body-range put under parent cache lock (parents insert during body/new).
     pub pin_put_ns: u64,
     /// Same-batch create edges (identity known in-batch).
     pub parent_cache_hits: u32,
@@ -529,110 +529,95 @@ impl Query {
         // ── Pin parents into per-batch BatchParents + optional mlock ───────
         // Sparse spent-filtered outs live on the batch object (not tip-GCed).
         // Shared by_body LRU still supplies pin_cache hits.
+        //
+        // Ownership path: body-LRU hits move once into BatchParents (no
+        // intermediate sparse_parents + re-clone). Vec-backed ParentEntry
+        // avoids HashMap/HashSet allocs per parent at pin volume.
         let do_mlock = confirm_mlock_from_env();
         let t_par = Instant::now();
         let mut uniq_parents: Vec<u64> = parent_need.keys().copied().collect();
         uniq_parents.sort_unstable();
         st.parent_unique = st.parent_unique.saturating_add(uniq_parents.len() as u32);
 
-        let mut pin_jobs: Vec<(u64, u32, Vec<u32>, Vec<u32>)> =
+        // (pid, need_hs, need_vouts) — max_h unused after by_fk removal.
+        let mut pin_jobs: Vec<(u64, Vec<u32>, Vec<u32>)> =
             Vec::with_capacity(uniq_parents.len());
         for pid in uniq_parents {
             let mut need_hs = parent_need.remove(&pid).unwrap_or_default();
             need_hs.sort_unstable();
             need_hs.dedup();
-            let max_h = need_hs.last().copied().unwrap_or(0);
             let mut need_vouts = parent_vouts.remove(&pid).unwrap_or_default();
             need_vouts.sort_unstable();
             need_vouts.dedup();
-            pin_jobs.push((pid, max_h, need_hs, need_vouts));
+            pin_jobs.push((pid, need_hs, need_vouts));
         }
+        batch_parents = BatchParents::with_capacity(pin_jobs.len());
 
         let mut parent_ranges: Vec<(Fk, u64, u64)> = Vec::new();
         let mut mlock_items: Vec<(Vec<u32>, u64, u64)> = Vec::new();
         let mut mlock_no_range: Vec<(Vec<u32>, Fk)> = Vec::new();
-        let mut sparse_parents: Vec<(
-            u32,
-            Fk,
-            rbitcoin_store::TxRecord,
-            Vec<(u32, rbitcoin_store::OutputRecord)>,
-            Vec<u32>,
-            Option<Option<u32>>,
-            Option<u32>,
-        )> = Vec::with_capacity(pin_jobs.len());
-        let mut pin_new_jobs: Vec<(u64, u32, Vec<u32>, Vec<u32>, Option<(u64, u64)>)> =
+        let mut pin_new_jobs: Vec<(u64, Vec<u32>, Vec<u32>, Option<(u64, u64)>)> =
             Vec::new();
 
         let t_body = Instant::now();
-        let body_keys: Vec<(u64, Vec<u32>)> = pin_jobs
+        let body_keys: Vec<(u64, &[u32])> = pin_jobs
             .iter()
-            .filter(|(_, _, _, vouts)| !vouts.is_empty())
-            .map(|(pid, _, _, vouts)| (*pid, vouts.clone()))
+            .filter(|(_, _, vouts)| !vouts.is_empty())
+            .map(|(pid, _, vouts)| (*pid, vouts.as_slice()))
             .collect();
-        let body_hits = self
+        let mut body_hits = self
             .confirm_parents
             .get_bodies_for_pin_batch(&body_keys);
 
-        for (pid, max_h, need_hs, need_vouts) in pin_jobs {
+        for (pid, need_hs, need_vouts) in pin_jobs {
             if self.confirm_cancelled() {
                 crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Cancelled("confirm cancelled"));
             }
             let fk = Fk(pid);
             if !need_vouts.is_empty() {
-                if let Some((create_h, tx, outs, cb_hint, range)) = body_hits.get(&pid) {
+                if let Some((create_h, tx, outs, cb_hint, range)) = body_hits.remove(&pid) {
                     st.pin_cache_body = st.pin_cache_body.saturating_add(1);
-                    if let Some((off, len)) = *range {
+                    if let Some((off, len)) = range {
                         parent_ranges.push((fk, off, len));
                     }
-                    // Same-batch creates: no durable spenders yet.
+                    // Same-batch creates: no durable spenders yet — all body
+                    // outs for need_vouts are live (move, no re-clone).
                     let same_batch = batch_create_ids.contains(&pid);
-                    let mut unspent_set: HashSet<u32> = HashSet::new();
-                    if same_batch {
-                        for (v, _) in outs {
-                            unspent_set.insert(*v);
-                        }
+                    let live = if same_batch {
+                        outs
                     } else {
                         let t_sp = Instant::now();
-                        if let Ok(u) =
-                            self.store
-                                .unspent_create_vouts(fk, &need_vouts, *range)
-                        {
-                            unspent_set.extend(u);
-                        } else {
-                            unspent_set.extend(need_vouts.iter().copied());
-                        }
+                        let unspent = self
+                            .store
+                            .unspent_create_vouts(fk, &need_vouts, range)
+                            .unwrap_or_else(|_| need_vouts.clone());
                         st.pin_spent_ns = st
                             .pin_spent_ns
                             .saturating_add(t_sp.elapsed().as_nanos() as u64);
-                    }
-                    let mut live = Vec::with_capacity(unspent_set.len());
-                    for (v, o) in outs {
-                        if unspent_set.contains(v) {
-                            live.push((*v, o.clone()));
+                        let unspent_set: HashSet<u32> = unspent.into_iter().collect();
+                        let mut live = Vec::with_capacity(outs.len());
+                        for (v, o) in outs {
+                            if unspent_set.contains(&v) {
+                                live.push((v, o));
+                            }
                         }
-                    }
-                    let cb_stash = match *cb_hint {
-                        Some(true) => Some(Some(*create_h)),
+                        live
+                    };
+                    let cb_stash = match cb_hint {
+                        Some(true) => Some(Some(create_h)),
                         Some(false) => Some(None),
                         None => match self.resolve_parent_coinbase_height(
                             fk,
                             tx.input_count,
-                            *range,
+                            range,
                         ) {
                             Ok(v) => Some(v),
                             Err(_) => Some(None),
                         },
                     };
-                    sparse_parents.push((
-                        max_h,
-                        fk,
-                        tx.clone(),
-                        live,
-                        need_vouts,
-                        cb_stash,
-                        Some(*create_h),
-                    ));
+                    // Move tx/live/need_vouts into batch map (single insert).
+                    batch_parents.insert_owned(fk, tx, live, need_vouts, cb_stash);
                     st.utxo_parents = st.utxo_parents.saturating_add(1);
                     continue;
                 }
@@ -650,7 +635,7 @@ impl Query {
             } else if do_mlock {
                 mlock_no_range.push((need_hs.clone(), fk));
             }
-            pin_new_jobs.push((pid, max_h, need_hs, need_vouts, range));
+            pin_new_jobs.push((pid, need_hs, need_vouts, range));
         }
         st.pin_body_ns = st
             .pin_body_ns
@@ -681,7 +666,7 @@ impl Query {
         }
         let mut bulk_idx: Vec<usize> = Vec::new();
         let mut bulk_ranges: Vec<(u64, u64)> = Vec::new();
-        for (i, (_pid, _max_h, _need_hs, need_vouts, range)) in pin_new_jobs.iter().enumerate() {
+        for (i, (_pid, _need_hs, need_vouts, range)) in pin_new_jobs.iter().enumerate() {
             if let Some((off, len)) = range {
                 if !need_vouts.is_empty() {
                     bulk_idx.push(i);
@@ -705,9 +690,7 @@ impl Query {
             }
         }
 
-        for (ji, (pid, max_h, _need_hs, need_vouts, range)) in
-            pin_new_jobs.into_iter().enumerate()
-        {
+        for (ji, (pid, _need_hs, need_vouts, range)) in pin_new_jobs.into_iter().enumerate() {
             if self.confirm_cancelled() {
                 crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Cancelled("confirm cancelled"));
@@ -741,15 +724,7 @@ impl Query {
                             Ok(v) => Some(v),
                             Err(_) => None,
                         };
-                        sparse_parents.push((
-                            max_h,
-                            fk,
-                            tx,
-                            live,
-                            need_vouts,
-                            cb_stash,
-                            None,
-                        ));
+                        batch_parents.insert_owned(fk, tx, live, need_vouts, cb_stash);
                         st.full_tx_reads = st.full_tx_reads.saturating_add(1);
                     }
                 }
@@ -778,15 +753,7 @@ impl Query {
                         Ok(v) => Some(v),
                         Err(_) => None,
                     };
-                    sparse_parents.push((
-                        max_h,
-                        fk,
-                        tx,
-                        live,
-                        need_vouts,
-                        cb_stash,
-                        None,
-                    ));
+                    batch_parents.insert_owned(fk, tx, live, need_vouts, cb_stash);
                     st.full_tx_reads = st.full_tx_reads.saturating_add(1);
                 }
             }
@@ -796,10 +763,8 @@ impl Query {
             .pin_new_meta_ns
             .saturating_add(t_new.elapsed().as_nanos() as u64);
 
+        // pin put is mostly body_range registration now (parents already moved).
         let t_put = Instant::now();
-        if !sparse_parents.is_empty() {
-            batch_parents.put_resolved_batch(&sparse_parents);
-        }
         if !parent_ranges.is_empty() {
             self.confirm_parents.put_body_ranges_batch(&parent_ranges);
         }

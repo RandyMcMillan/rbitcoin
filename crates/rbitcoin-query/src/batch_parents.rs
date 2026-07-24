@@ -1,31 +1,29 @@
 //! Per-confirm-batch spent-filtered parent outs.
 //!
-//! Lifetime: built during load pin, carried on [`crate`] load/script/write batch
-//! objects, dropped when the batch finishes write. Not tip-GCed and not shared
-//! across concurrent in-flight batches.
+//! Lifetime: built during load pin, carried on load/script/write batch objects,
+//! dropped when the batch finishes write. Not tip-GCed and not shared across
+//! concurrent in-flight batches.
+//!
+//! **Hot path:** parents are inserted once per batch with ownership moves
+//! ([`BatchParents::insert_owned`]). Storage uses small `Vec`s (typical 1–3
+//! vouts) — not `HashMap`/`HashSet` per parent — to avoid thrashing the
+//! allocator when pin volume is tens of thousands of creates per load window.
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};
-use std::collections::{HashMap, HashSet};
-
-/// One needed prevout under a parent create.
-#[derive(Debug, Clone)]
-pub struct ParentOut {
-    pub output: OutputRecord,
-}
+use std::collections::HashMap;
 
 /// Sparse parent create row for one confirm batch.
 #[derive(Debug, Clone)]
 pub struct ParentEntry {
     pub tx: TxRecord,
-    /// Live (unspent) needed vouts → output. Spent vouts are omitted.
-    pub outs: HashMap<u32, ParentOut>,
+    /// Live (unspent) needed outs. Spent vouts omitted. Small N; linear scan.
+    pub outs: Vec<(u32, OutputRecord)>,
     /// Vouts fully spent-filtered for this batch (wave skips durable re-check).
-    pub checked: HashSet<u32>,
+    /// Sorted unique (from pin need_vouts).
+    pub checked: Vec<u32>,
     /// Coinbase maturity: `None` unset; `Some(None)` not cb; `Some(Some(h))` height.
     pub coinbase_height: Option<Option<u32>>,
-    /// Create height when known (body height).
-    pub create_height: Option<u32>,
 }
 
 /// Spent-filtered parents for **one** confirm batch (load → write).
@@ -41,6 +39,12 @@ impl BatchParents {
         }
     }
 
+    pub fn with_capacity(n: usize) -> Self {
+        Self {
+            by_fk: HashMap::with_capacity(n),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.by_fk.len()
     }
@@ -49,7 +53,38 @@ impl BatchParents {
         self.by_fk.is_empty()
     }
 
-    /// Insert/merge spent-filtered outs for a parent create.
+    /// Insert one parent with **ownership** (load pin hot path).
+    ///
+    /// Callers unique-key by create fk within a batch; a second insert for the
+    /// same id overwrites (should not happen on the normal pin path).
+    ///
+    /// - `live`: unspent needed outs (moved, no clone)
+    /// - `checked`: all spent-filtered need vouts (sorted unique; typically the
+    ///   pin `need_vouts` list, moved)
+    #[inline]
+    pub fn insert_owned(
+        &mut self,
+        fk: Fk,
+        tx: TxRecord,
+        live: Vec<(u32, OutputRecord)>,
+        checked: Vec<u32>,
+        coinbase_height: Option<Option<u32>>,
+    ) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        self.by_fk.insert(
+            id,
+            ParentEntry {
+                tx,
+                outs: live,
+                checked,
+                coinbase_height,
+            },
+        );
+    }
+
+    /// Test / convenience: clone from slices into the map.
     pub fn put_resolved(
         &mut self,
         fk: Fk,
@@ -57,62 +92,15 @@ impl BatchParents {
         live: &[(u32, OutputRecord)],
         checked: &[u32],
         coinbase_height: Option<Option<u32>>,
-        create_height: Option<u32>,
     ) {
-        let Some(id) = fk.get() else {
-            return;
-        };
-        let e = self.by_fk.entry(id).or_insert_with(|| ParentEntry {
-            tx: tx.clone(),
-            outs: HashMap::new(),
-            checked: HashSet::new(),
-            coinbase_height: None,
-            create_height: None,
-        });
-        e.tx = tx;
-        if coinbase_height.is_some() {
-            e.coinbase_height = coinbase_height;
-        }
-        if create_height.is_some() {
-            e.create_height = create_height;
-        }
-        for &v in checked {
-            e.checked.insert(v);
-        }
-        for (v, output) in live {
-            e.outs.insert(
-                *v,
-                ParentOut {
-                    output: output.clone(),
-                },
-            );
-            e.checked.insert(*v);
-        }
-    }
-
-    /// Batch insert (load pin finish).
-    pub fn put_resolved_batch(
-        &mut self,
-        items: &[(
-            u32, // max need height (unused; batch-scoped)
-            Fk,
-            TxRecord,
-            Vec<(u32, OutputRecord)>,
-            Vec<u32>,
-            Option<Option<u32>>,
-            Option<u32>,
-        )],
-    ) {
-        for (_h, fk, tx, live, checked, cb, create_h) in items {
-            self.put_resolved(*fk, tx.clone(), live, checked, *cb, *create_h);
-        }
+        self.insert_owned(fk, tx, live.to_vec(), checked.to_vec(), coinbase_height);
     }
 
     pub fn get_parent_out(&self, fk: Fk, vout: u32) -> Option<(TxRecord, OutputRecord)> {
         let id = fk.get()?;
         let e = self.by_fk.get(&id)?;
-        let o = e.outs.get(&vout)?;
-        Some((e.tx.clone(), o.output.clone()))
+        let o = e.outs.iter().find(|(v, _)| *v == vout)?;
+        Some((e.tx.clone(), o.1.clone()))
     }
 
     pub fn get_parent_tx(&self, fk: Fk) -> Option<TxRecord> {
@@ -131,7 +119,7 @@ impl BatchParents {
         };
         self.by_fk
             .get(&id)
-            .is_some_and(|e| e.outs.contains_key(&vout))
+            .is_some_and(|e| e.outs.iter().any(|(v, _)| *v == vout))
     }
 
     /// True when all `vouts` are spent-filtered (`checked`) for this batch.
@@ -145,7 +133,10 @@ impl BatchParents {
         let Some(e) = self.by_fk.get(&id) else {
             return false;
         };
-        !e.checked.is_empty() && vouts.iter().all(|v| e.checked.contains(v))
+        if e.checked.is_empty() {
+            return false;
+        }
+        vouts.iter().all(|v| checked_contains(&e.checked, *v))
     }
 
     /// Sparse outs for wave: `(tx, live outs for vouts, spent_filtered)`.
@@ -156,26 +147,33 @@ impl BatchParents {
     ) -> Option<(TxRecord, Vec<(u32, OutputRecord)>, bool)> {
         let id = fk.get()?;
         let e = self.by_fk.get(&id)?;
-        if !e.checked.is_empty() && vouts.iter().all(|v| e.checked.contains(v)) {
+        let covered = !e.checked.is_empty() && vouts.iter().all(|v| checked_contains(&e.checked, *v));
+        if covered {
             let mut live = Vec::with_capacity(vouts.len());
             for &v in vouts {
-                if let Some(o) = e.outs.get(&v) {
-                    live.push((v, o.output.clone()));
+                if let Some((_, o)) = e.outs.iter().find(|(ov, _)| *ov == v) {
+                    live.push((v, o.clone()));
                 }
             }
             return Some((e.tx.clone(), live, true));
         }
-        if !e.outs.is_empty() && vouts.iter().all(|v| e.outs.contains_key(v)) {
+        if !e.outs.is_empty() && vouts.iter().all(|v| e.outs.iter().any(|(ov, _)| ov == v)) {
             let mut live = Vec::with_capacity(vouts.len());
             for &v in vouts {
-                if let Some(o) = e.outs.get(&v) {
-                    live.push((v, o.output.clone()));
+                if let Some((_, o)) = e.outs.iter().find(|(ov, _)| *ov == v) {
+                    live.push((v, o.clone()));
                 }
             }
             return Some((e.tx.clone(), live, false));
         }
         None
     }
+}
+
+/// `checked` is sorted unique from pin dedup — binary search.
+#[inline]
+fn checked_contains(checked: &[u32], v: u32) -> bool {
+    checked.binary_search(&v).is_ok()
 }
 
 #[cfg(test)]
@@ -211,7 +209,6 @@ mod tests {
             &[(0, out(10)), (1, out(20))],
             &[0, 1],
             Some(None),
-            Some(5),
         );
         assert!(bp.pin_covered(Fk(7), &[0, 1]));
         let (t, o) = bp.get_parent_out(Fk(7), 0).unwrap();
@@ -219,5 +216,28 @@ mod tests {
         assert_eq!(o.value, 10);
         assert_eq!(bp.get_parent_coinbase_height(Fk(7)), Some(None));
         assert_eq!(bp.len(), 1);
+    }
+
+    #[test]
+    fn insert_owned_moves_without_extra_live_clone() {
+        let mut bp = BatchParents::with_capacity(1);
+        let live = vec![(0, out(42)), (2, out(99))];
+        bp.insert_owned(Fk(9), tx(9), live, vec![0, 1, 2], Some(Some(3)));
+        assert!(bp.pin_covered(Fk(9), &[0, 1, 2]));
+        assert!(!bp.has_parent_out(Fk(9), 1)); // spent-filtered, not live
+        assert!(bp.has_parent_out(Fk(9), 0));
+        let (_, o) = bp.get_parent_out(Fk(9), 2).unwrap();
+        assert_eq!(o.value, 99);
+        let needed = bp.get_parent_outs_needed(Fk(9), &[0, 2]).unwrap();
+        assert!(needed.2); // spent_filtered
+        assert_eq!(needed.1.len(), 2);
+    }
+
+    #[test]
+    fn pin_covered_requires_checked_membership() {
+        let mut bp = BatchParents::new();
+        bp.insert_owned(Fk(1), tx(1), vec![(0, out(1))], vec![0, 2], None);
+        assert!(bp.pin_covered(Fk(1), &[0, 2]));
+        assert!(!bp.pin_covered(Fk(1), &[0, 1]));
     }
 }

@@ -727,7 +727,8 @@ impl ConfirmParentCache {
 
     /// Slim pin hits under **one** lock: only clone requested outs + tx meta.
     ///
-    /// `items`: `(create_fk_id, need_vouts)`. Missing bodies omitted.
+    /// `items`: `(create_fk_id, need_vouts)`. Missing bodies omitted. Vouts are
+    /// borrowed (no per-parent `Vec` clone of the need list).
     ///
     /// Returns `id → (create_height, tx, outs, coinbase_hint, body_range)`:
     /// - `outs`: only requested vouts that exist on the body (not spent-filtered)
@@ -737,9 +738,12 @@ impl ConfirmParentCache {
     ///
     /// Touches body LRU once per hit. Avoids cloning full witness/input vectors
     /// that made per-parent pin scale with uptime as `|by_body|` grew.
+    ///
+    /// Caller should **`remove`** hits and move `tx`/`outs` into
+    /// [`crate::BatchParents`] (no second clone).
     pub fn get_bodies_for_pin_batch(
         &self,
-        items: &[(u64, Vec<u32>)],
+        items: &[(u64, &[u32])],
     ) -> HashMap<
         u64,
         (
@@ -755,9 +759,9 @@ impl ConfirmParentCache {
         }
         let mut g = self.inner.lock().unwrap();
         let mut out = HashMap::with_capacity(items.len());
-        for (id, vouts) in items {
+        for &(id, vouts) in items {
             let hit = {
-                let Some(e) = g.by_body.get(id) else {
+                let Some(e) = g.by_body.get(&id) else {
                     continue;
                 };
                 let mut outs = Vec::with_capacity(vouts.len());
@@ -777,11 +781,11 @@ impl ConfirmParentCache {
                 } else {
                     None
                 };
-                let range = g.body_range.get(id).copied();
+                let range = g.body_range.get(&id).copied();
                 (e.height, e.tx.clone(), outs, cb_hint, range)
             };
-            g.touch_body_lru(*id);
-            out.insert(*id, hit);
+            g.touch_body_lru(id);
+            out.insert(id, hit);
         }
         out
     }
@@ -2156,25 +2160,19 @@ mod tests {
         );
         c.put_body_range(Fk(77), 1000, 64);
 
-        let hits = c.get_bodies_for_pin_batch(&[(77, vec![0, 2])]);
-        let (h, txr, outs, cb, range) = hits.get(&77).expect("hit");
-        assert_eq!(*h, 5);
+        let need = [0u32, 2];
+        let mut hits = c.get_bodies_for_pin_batch(&[(77, &need)]);
+        let (h, txr, outs, cb, range) = hits.remove(&77).expect("hit");
+        assert_eq!(h, 5);
         assert_eq!(txr.txid, t.txid);
         assert_eq!(outs.len(), 2);
         assert_eq!(outs[0].0, 0);
         assert_eq!(outs[1].0, 2);
-        assert_eq!(*cb, Some(true));
-        assert_eq!(*range, Some((1000, 64)));
+        assert_eq!(cb, Some(true));
+        assert_eq!(range, Some((1000, 64)));
         // Spent-filtered pin lives on BatchParents (not shared by_fk).
         let mut bp = crate::BatchParents::new();
-        bp.put_resolved(
-            Fk(77),
-            txr.clone(),
-            &[(0, outs[0].1.clone()), (2, outs[1].1.clone())],
-            &[0, 2],
-            Some(Some(5)),
-            Some(5),
-        );
+        bp.insert_owned(Fk(77), txr, outs, need.to_vec(), Some(Some(5)));
         assert!(bp.pin_covered(Fk(77), &[0, 2]));
         assert!(!bp.pin_covered(Fk(77), &[0, 1]));
     }

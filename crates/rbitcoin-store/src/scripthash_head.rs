@@ -106,6 +106,19 @@ impl ScriptHashHead {
         head_key_from_full(full)
     }
 
+    /// Zero all slots and reset occupied (cold rematerialize after partial load).
+    pub fn reinit_empty(&self) -> Result<(), StoreError> {
+        let slots = {
+            let state = self.state.lock().unwrap();
+            state.slots
+        };
+        let body_bytes = SH_HEAD_SLOT_SIZE as u64 * slots;
+        self.file
+            .zero_range(FILE_HEADER_LEN as u64, body_bytes)?;
+        self.state.lock().unwrap().occupied = 0;
+        Ok(())
+    }
+
     pub fn get(&self, full: &[u8; 32]) -> Result<Option<ShHeadValue>, StoreError> {
         let key = Self::to_key(full);
         let slots = self.state.lock().unwrap().slots;
@@ -570,6 +583,14 @@ impl ShardedScriptHashHead {
         let _ = HeadScale::from_env();
         let _ = initial_slots_for(HeadRole::ScriptHash);
         Ok(Self { shards })
+    }
+
+    /// Zero every shard (cold rematerialize).
+    pub fn reinit_empty(&self) -> Result<(), StoreError> {
+        for s in &self.shards {
+            s.reinit_empty()?;
+        }
+        Ok(())
     }
 
     pub fn open_for_role(path: impl Into<PathBuf>, _role: HeadRole) -> Result<Self, StoreError> {

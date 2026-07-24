@@ -143,6 +143,28 @@ impl ScriptHashTable {
         self.alloc.lock().unwrap().live_count
     }
 
+    /// Wipe body alloc + all head slots for a full cold rematerialize.
+    ///
+    /// Used when runs/`*.run.mat` still hold the complete create set after a
+    /// partial/crashed bulk load. Does not delete files — resets in place so
+    /// open mmaps stay valid. Exclusive: no concurrent SH readers/writers.
+    pub fn reinit_empty_for_cold_materialize(&self) -> Result<(), StoreError> {
+        let payload0 = payload_start(FILE_HEADER_LEN);
+        {
+            let mut alloc = self.alloc.lock().unwrap();
+            *alloc = AllocState {
+                live_count: 0,
+                bump: payload0,
+                free_head: [0; SH_MAX_CLASS as usize + 1],
+            };
+            write_alloc_header(&self.body, &alloc)?;
+        }
+        // Discard old slabs from the published HWM (new cold load bumps from payload0).
+        self.body.set_logical_len(payload0)?;
+        self.head.reinit_empty()?;
+        Ok(())
+    }
+
     /// Head value for a key (process-cache seed / disconnect refresh).
     pub fn head_value(&self, scripthash: &[u8; 32]) -> Result<Option<ShHeadValue>, StoreError> {
         self.head.get(scripthash)
@@ -620,9 +642,9 @@ impl ScriptHashTable {
     ///
     /// Safe only when each scripthash appears in a single contiguous batch and
     /// is not already present (k-way merge stream + hold-key at chunk borders).
-    /// Unlike [`Self::bulk_load_sorted_creates`], does **not** fall back to
-    /// append when `entry_count() > 0` — that fallback made multi-run materialize
-    /// pathologically slow after the first 512k flush.
+    /// Never falls back to append. Callers must ensure the table starts empty
+    /// for the first batch; later batches in the same session are fine once
+    /// keys do not overlap.
     pub fn bulk_load_sorted_creates_cold(
         &self,
         recs: &[ScriptHashRecord],

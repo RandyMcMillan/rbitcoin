@@ -701,13 +701,20 @@ pub(crate) fn enter_tip_mode(query: &Query) {
     info!("node: scripthash bulk materialize from runs (merge + cold load)…");
     match query.finalize_sh_runs() {
         Ok(n) => info!("node: scripthash bulk materialize creates≈{n}"),
-        Err(e) => warn!("node: scripthash bulk materialize failed: {e}"),
+        Err(e) => {
+            warn!("node: scripthash bulk materialize failed: {e}");
+            warn!(
+                "node: Electrum history incomplete until materialize succeeds — \
+                 keep store/scripthash.runs (incl. *.run.mat) and restart; \
+                 finalize will reinit SH tables and cold-load from claims"
+            );
+        }
     }
     let leftover = query.scripthash_run_count();
     if leftover > 0 {
         warn!(
             "node: scripthash still has {leftover} on-disk run(s) after materialize — \
-             Electrum history may be incomplete; restart to retry finalize"
+             Electrum history may be incomplete; fix and restart to retry finalize"
         );
     }
 

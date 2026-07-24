@@ -194,10 +194,9 @@ impl ShRunBuilder {
     ///
     /// - Recovers incomplete `*.run.mat` claims from a prior crash/SIGINT.
     /// - Streams a **k-way merge** of all claimed runs (no multi-GB RAM buffer).
-    /// - Uses cold multi-chunk load when the SH table starts empty (does not
-    ///   fall back to per-key append after the first 512k flush).
-    /// - When the table is already non-empty (resume after partial load), uses
-    ///   append path so existing heads are merged.
+    /// - **Cold path only** (no append fallback). If the SH table is non-empty
+    ///   from a partial prior load, it is **reinit'd empty** first then loaded
+    ///   from the complete run claims.
     pub fn finalize_and_bulk_materialize(&self, store: &Store) -> Result<u64, StoreError> {
         finalize_wait_join(&self.enabled, &self.inner, &self.cv, &self.join)?;
         let (runs_dir, runs_io, mut next_seq) = {
@@ -254,16 +253,18 @@ impl ShRunBuilder {
         }
 
         let total_recs: u64 = claimed.iter().map(|r| r.count).sum();
-        let cold = store.scripthash.entry_count() == 0;
-        if !cold {
-            warn!(
-                "node: scripthash table non-empty (entry_count={}) — resume uses append path; \
-                 incomplete prior load will be merged",
-                store.scripthash.entry_count()
+        let n_existing = store.scripthash.entry_count();
+        if n_existing > 0 {
+            info!(
+                "node: scripthash table non-empty (entry_count={n_existing}) — \
+                 reinit empty for cold rematerialize from {} run claim(s)",
+                claimed.len()
             );
+            store.scripthash.reinit_empty_for_cold_materialize()?;
+            debug_assert_eq!(store.scripthash.entry_count(), 0);
         }
         info!(
-            "node: scripthash bulk materialize start runs={} records≈{total_recs} cold={cold}",
+            "node: scripthash bulk materialize start runs={} records≈{total_recs} cold=true",
             claimed.len()
         );
         let t0 = Instant::now();
@@ -287,11 +288,7 @@ impl ShRunBuilder {
                 a.scripthash == b.scripthash && a.create_tx_fk == b.create_tx_fk
             });
             *unique_in = unique_in.saturating_add(chunk.len());
-            let n = if cold {
-                store.scripthash.bulk_load_sorted_creates_cold(chunk)?
-            } else {
-                store.scripthash.bulk_load_sorted_creates(chunk)?
-            };
+            let n = store.scripthash.bulk_load_sorted_creates_cold(chunk)?;
             *n_total = n_total.saturating_add(n);
             *flushed_chunks = flushed_chunks.saturating_add(1);
             if *flushed_chunks == 1 || *flushed_chunks % 10 == 0 {
@@ -566,6 +563,53 @@ mod tests {
         let a_bytes = half_plus * u64::from(SH_RUN_REC_LEN);
         assert!(a_bytes < SH_MERGE_MAX_BODY_BYTES);
         assert!(a_bytes.saturating_mul(2) > SH_MERGE_MAX_BODY_BYTES);
+    }
+
+    #[test]
+    fn materialize_reinits_nonempty_table_for_cold_reload() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-reinit-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_or_create(&dir).unwrap();
+        let b = ShRunBuilder::new(&dir);
+        let runs_dir = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+
+        // First full materialize.
+        let mut body = Vec::new();
+        for i in 0..30u32 {
+            let mut sh = [0u8; 32];
+            sh[0] = i as u8;
+            body.extend_from_slice(&encode_rec(&sh, Fk(i as u64 + 1)));
+        }
+        let path = next_run_path(&runs_dir, 1);
+        write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body).unwrap();
+        let n1 = b.finalize_and_bulk_materialize(&store).unwrap();
+        assert!(n1 >= 30);
+        assert!(store.scripthash.entry_count() >= 30);
+
+        // Simulate crash after re-claim: non-empty table + .run.mat left.
+        let mut body2 = Vec::new();
+        for i in 0..40u32 {
+            let mut sh = [0u8; 32];
+            sh[0] = (i + 100) as u8;
+            body2.extend_from_slice(&encode_rec(&sh, Fk(i as u64 + 1000)));
+        }
+        let path2 = next_run_path(&runs_dir, 2);
+        let run2 = write_sorted_run(&path2, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body2).unwrap();
+        let _ = claim_run_for_materialize(&run2).unwrap();
+        assert!(store.scripthash.entry_count() > 0);
+
+        let n2 = b.finalize_and_bulk_materialize(&store).unwrap();
+        // Reinit wiped prior rows; only the rematerialized claim remains.
+        assert!(n2 >= 40, "inserted={n2}");
+        assert_eq!(store.scripthash.entry_count(), n2 as u64);
+        assert!(list_materialize_claims(&runs_dir).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

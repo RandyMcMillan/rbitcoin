@@ -34,6 +34,16 @@ Operational logs go to **stderr** with UTC timestamps:
 
 Default: **info**. CLI wins over env.
 
+### IBD status lines (every ~5s)
+
+| Line | Level | Use |
+|------|-------|-----|
+| `ibd: progress` | INFO | Tip/arch rate, conf_q, `sh_runs`, horizon, ETA |
+| `ibd: perf` | INFO | Inflight/archive pressure, **script/load** cost, **pin_hit%**, coarse load phases |
+| `ibd: perf_dbg` | DEBUG | µs/blk, pin/edge detail, **archive prep/write/sticky**, contig park |
+
+At **info**, you only get progress + slim perf. Enable **debug** when diagnosing archive sticky, prep vs write, or pin body_io. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters.
+
 ## Defaults and memory budgets
 
 | Knob | Default | Override |

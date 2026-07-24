@@ -1978,7 +1978,15 @@ impl TxTable {
             .checked_sub(LOG_EVERY)
             .unwrap_or_else(Instant::now);
         loop {
-            match self.head.read().unwrap().insert_many(entries) {
+            // Drop the read guard **before** resize/swap. Matching on
+            // `head.read().insert_many(...)` would keep the guard through the
+            // Err arm; `try_complete` then needs `head.write()` → self-deadlock
+            // ("waiting for exclusive head lock" forever).
+            let insert_result = {
+                let head = self.head.read().unwrap();
+                head.insert_many(entries)
+            };
+            match insert_result {
                 Ok(()) => {
                     if attempts > 0 {
                         rbitcoin_log::info!(

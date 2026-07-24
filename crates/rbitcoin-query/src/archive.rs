@@ -6,7 +6,7 @@
 //!   **in-flight planned creates** + `tx.head` resolve, stamp inputs.
 //! - **Commit** ([`Query::archive_commit_plan`]): store **writes** — body append,
 //!   head index, header_txs, sticky publish.
-//! - **Prewarm** ([`Query::archive_sticky_prewarm`]): sequential last-N `tx.idx`
+//! - **Prewarm** ([`Query::archive_sticky_prewarm`]): bulk last-N `body_txid_range`
 //!   fill of sticky before the pipeline starts.
 //!
 //! Overlap requires the in-flight map: a later mega-batch may spend outputs from a
@@ -393,7 +393,7 @@ impl Query {
     }
 
     /// Linear sticky prewarm: last `cap` Class A bodies via sequential `tx.idx`
-    /// order (`body_txid` only — no full decode / head probe).
+    /// order (bulk `body_txid_range` — no full decode / head probe).
     ///
     /// Call once before the IBD archive pipeline so cold restarts avoid a head
     /// resolve storm. Returns `(loaded, elapsed_ms)`.
@@ -409,22 +409,22 @@ impl Query {
         let start = n.saturating_sub(cap as u64).saturating_add(1).max(1);
         let expect = (n.saturating_sub(start).saturating_add(1)) as usize;
         self.archive_txid_sticky.reserve_for_prewarm(expect);
-        const CHUNK: usize = 8192;
-        let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(CHUNK);
+        // Same ballpark as head-resize bulk waves; sticky insert is cheap.
+        const CHUNK: u64 = 8192;
         let mut loaded = 0usize;
-        for id in start..=n {
-            let fk = Fk(id);
-            let txid = self.store.txs.body_txid(fk)?;
-            batch.push((txid, fk));
-            if batch.len() >= CHUNK {
-                self.archive_txid_sticky.insert_many(&batch);
-                loaded = loaded.saturating_add(batch.len());
-                batch.clear();
-            }
-        }
-        if !batch.is_empty() {
+        let mut cur = start;
+        while cur <= n {
+            let end = (cur + CHUNK - 1).min(n);
+            let txids = self.store.txs.body_txid_range(cur, end)?;
+            debug_assert_eq!(txids.len() as u64, end - cur + 1);
+            let batch: Vec<([u8; 32], Fk)> = txids
+                .into_iter()
+                .enumerate()
+                .map(|(i, txid)| (txid, Fk(cur + i as u64)))
+                .collect();
             self.archive_txid_sticky.insert_many(&batch);
             loaded = loaded.saturating_add(batch.len());
+            cur = end + 1;
         }
         Ok((loaded, t0.elapsed().as_millis() as u64))
     }

@@ -1939,39 +1939,49 @@ impl TxTable {
             return Ok(0);
         }
         let mut inserted = 0u64;
-        const CHUNK: usize = 4096;
+        // Bulk body_txid waves (io_uring / parallel pread); insert_many still
+        // chunked for fence / probe cost.
+        const READ_CHUNK: u64 = 8192;
+        const INSERT_CHUNK: usize = 4096;
         const PROGRESS_EVERY: u64 = 50_000;
-        let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(CHUNK);
+        let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(INSERT_CHUNK);
         let mut last_progress = 0u64;
-        for id in 1..=n {
-            let fk = Fk(id);
-            // body_txid only — avoid full packed decode for tens of millions of rows.
-            let txid = self.body_txid(fk)?;
-            if !force_all {
-                let present = self
-                    .head
-                    .read()
-                    .unwrap()
-                    .probe_fks(&txid)?
-                    .contains(&fk);
-                if present {
-                    if id - last_progress >= PROGRESS_EVERY || id == n {
-                        on_progress(id, n, inserted + batch.len() as u64);
-                        last_progress = id;
+        let mut cur = 1u64;
+        while cur <= n {
+            let end = (cur + READ_CHUNK - 1).min(n);
+            // Contiguous idx + bulk 33B prefixes — same path as head resize fill.
+            let txids = self.body_txid_range(cur, end)?;
+            debug_assert_eq!(txids.len() as u64, end - cur + 1);
+            for (i, txid) in txids.into_iter().enumerate() {
+                let id = cur + i as u64;
+                let fk = Fk(id);
+                if !force_all {
+                    let present = self
+                        .head
+                        .read()
+                        .unwrap()
+                        .probe_fks(&txid)?
+                        .contains(&fk);
+                    if present {
+                        if id - last_progress >= PROGRESS_EVERY || id == n {
+                            on_progress(id, n, inserted + batch.len() as u64);
+                            last_progress = id;
+                        }
+                        continue;
                     }
-                    continue;
+                }
+                batch.push((txid, fk));
+                if batch.len() >= INSERT_CHUNK {
+                    inserted += batch.len() as u64;
+                    self.head_insert_many(&batch)?;
+                    batch.clear();
+                }
+                if id - last_progress >= PROGRESS_EVERY || id == n {
+                    on_progress(id, n, inserted + batch.len() as u64);
+                    last_progress = id;
                 }
             }
-            batch.push((txid, fk));
-            if batch.len() >= CHUNK {
-                inserted += batch.len() as u64;
-                self.head_insert_many(&batch)?;
-                batch.clear();
-            }
-            if id - last_progress >= PROGRESS_EVERY || id == n {
-                on_progress(id, n, inserted + batch.len() as u64);
-                last_progress = id;
-            }
+            cur = end + 1;
         }
         if !batch.is_empty() {
             inserted += batch.len() as u64;

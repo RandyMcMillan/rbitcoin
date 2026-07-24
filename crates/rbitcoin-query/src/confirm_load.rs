@@ -2,11 +2,13 @@
 //!
 //! For each height in the batch (ascending):
 //! 1. **Cache** header + `header_txs` (process-local, tip-GCed).
-//! 2. **Full Class A decode** into the outs FIFO (pin hits); wire uses store.
+//! 2. **Full Class A decode once** into [`BatchFullBodies`] (wire) + outs FIFO
+//!    (pin hits; inputs dropped there).
 //! 3. **Thin edges** + **sparse parent pin** as **batch-local** maps.
 //! Body ranges from `tx.idx` on demand.
 
 use super::*;
+use crate::batch_full_bodies::BatchFullBodies;
 use crate::batch_parents::BatchParents;
 use crate::wave_prevout::ThinInput;
 use std::collections::{HashMap, HashSet};
@@ -89,18 +91,20 @@ impl Query {
 
     /// Load Class A for heights: outs FIFO + **per-batch** parent pin + thin edges.
     ///
-    /// Returns `(stats, batch_parents, batch_thin)`. Thin edges are assemble-only
-    /// and must not be stored on the process parent cache.
+    /// Returns `(stats, batch_parents, batch_thin, batch_bodies)`. Thin edges and
+    /// full bodies are assemble/wire-only and must not be stored on the process
+    /// parent cache long-term (FIFO keeps outs only).
     pub fn load_confirm_parents(
         &self,
         items: &[(u32, [u8; 32])],
-    ) -> Result<(ConfirmLoadStats, BatchParents, BatchThin), QueryError> {
+    ) -> Result<(ConfirmLoadStats, BatchParents, BatchThin, BatchFullBodies), QueryError> {
         let t0 = Instant::now();
         let mut st = ConfirmLoadStats::default();
         let mut batch_parents = BatchParents::new();
         let mut batch_thin = BatchThin::new();
+        let mut batch_bodies = BatchFullBodies::new();
         if items.is_empty() {
-            return Ok((st, batch_parents, batch_thin));
+            return Ok((st, batch_parents, batch_thin, batch_bodies));
         }
         let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
 
@@ -118,19 +122,12 @@ impl Query {
         }
         if work.is_empty() {
             crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
-            return Ok((st, batch_parents, batch_thin));
+            return Ok((st, batch_parents, batch_thin, batch_bodies));
         }
         self.confirm_parents.ensure_plans(&work);
 
         let mut height_tx_fks: Vec<(u32, Vec<Fk>)> = Vec::with_capacity(work.len());
-        // Full-decoded cache bodies for wave (decode once).
-        let mut body_fulls: Vec<(
-            Fk,
-            u32,
-            rbitcoin_store::TxRecord,
-            Vec<rbitcoin_store::OutputRecord>,
-            Vec<rbitcoin_store::InputRecord>,
-        )> = Vec::new();
+        // Full-decoded bodies once for wire + FIFO outs (decode once).
         // (txid, edges): each edge is (create_fk_opt, soft prev_txid, vout).
         // v10: create_fk is stamped at archive; soft prev_txid may be zero.
         let mut body_prevouts: HashMap<u64, ([u8; 32], Vec<(Option<u64>, [u8; 32], u32)>)> =
@@ -254,7 +251,7 @@ impl Query {
                         .collect();
                     batch_create_ids.insert(id);
                     body_prevouts.insert(id, (tx.txid, prevouts));
-                    body_fulls.push((fk, height, tx, outs, inputs));
+                    batch_bodies.insert(fk, height, tx, inputs, outs);
                     st.creates_registered = st.creates_registered.saturating_add(1);
                 }
             }
@@ -281,7 +278,7 @@ impl Query {
                         .collect();
                     batch_create_ids.insert(id);
                     body_prevouts.insert(id, (tx.txid, prevouts));
-                    body_fulls.push((*fk, height, tx, outs, inputs));
+                    batch_bodies.insert(*fk, height, tx, inputs, outs);
                     st.creates_registered = st.creates_registered.saturating_add(1);
                 }
             }
@@ -291,9 +288,9 @@ impl Query {
             height_tx_fks.push((height, tx_fks));
         }
 
-        // ── Cache put (create outs FIFO; idx→body via store) ───────────────
+        // ── Cache put (create outs FIFO; outs only — wire uses batch_bodies) ─
         let t_put = Instant::now();
-        self.confirm_parents.put_bodies_batch(body_fulls);
+        self.confirm_parents.put_bodies_from_batch_full(&batch_bodies);
         st.cache_put_ns = st
             .cache_put_ns
             .saturating_add(t_put.elapsed().as_nanos() as u64);
@@ -562,13 +559,13 @@ impl Query {
         }
 
         crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
-        Ok((st, batch_parents, batch_thin))
+        Ok((st, batch_parents, batch_thin, batch_bodies))
     }
 
     pub fn load_confirm_parents_for_hashes(
         &self,
         hashes: &[[u8; 32]],
-    ) -> Result<(ConfirmLoadStats, BatchParents, BatchThin), QueryError> {
+    ) -> Result<(ConfirmLoadStats, BatchParents, BatchThin, BatchFullBodies), QueryError> {
         let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
         let mut items = Vec::with_capacity(hashes.len());
         for (i, hash) in hashes.iter().enumerate() {

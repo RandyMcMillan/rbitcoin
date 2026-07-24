@@ -220,6 +220,30 @@ impl ConfirmParentCache {
         }
     }
 
+    /// Outs FIFO put from batch-local full bodies (load → wire keeps full Class A
+    /// separately). Clones meta+outs into the FIFO; does not retain inputs.
+    pub fn put_bodies_from_batch_full(&self, bodies: &crate::BatchFullBodies) {
+        if bodies.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        for (fk, height, tx, inputs, outs) in bodies.iter() {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            let is_coinbase = is_coinbase_inputs(tx, inputs);
+            let _ = g.outs.insert(
+                id,
+                CreateOuts {
+                    height,
+                    tx: tx.clone(),
+                    outputs: outs.to_vec(),
+                    is_coinbase,
+                },
+            );
+        }
+    }
+
     /// True if create outs are still in the FIFO.
     pub fn has_body(&self, fk: Fk) -> bool {
         let Some(id) = fk.get() else {

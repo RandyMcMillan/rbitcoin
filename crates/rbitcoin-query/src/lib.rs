@@ -2,6 +2,7 @@
 
 mod archive;
 mod archive_txid_sticky;
+mod batch_full_bodies;
 mod batch_parents;
 mod catchup;
 mod chain_view;
@@ -35,6 +36,7 @@ use std::sync::Mutex;
 
 pub type QueryError = StoreError;
 
+pub use batch_full_bodies::BatchFullBodies;
 pub use batch_parents::BatchParents;
 pub use confirm_load::BatchThin;
 pub use catchup::IndexMode;

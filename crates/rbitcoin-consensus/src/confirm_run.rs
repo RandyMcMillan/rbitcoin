@@ -14,9 +14,10 @@
 //! [`confirm_archived_run`] runs all stages synchronously (tests / tip path).
 //! IBD pipelines so load(N+1) ∥ scripts(N) ∥ write(N−1).
 //!
-//! **No wave fill:** load already decodes bodies, stashes thin create_fk edges,
-//! and pins sparse parent outs into ConfirmParentCache. Wire rebuild and
-//! assemble/structural resolve prevouts from that cache (create_fk-first).
+//! **No wave fill:** load decodes bodies **once** into batch-local full Class A
+//! ([`rbitcoin_query::BatchFullBodies`]) + outs FIFO; thin create_fk edges and
+//! sparse parent pins are batch-local. Wire rebuild uses the batch bodies (no
+//! second store full-decode for batch creates).
 //!
 //! **Scripts purity:** [`confirm_scripts_phase`] is a pure function of
 //! [`LoadedBatch`] → [`ScriptOkBatch`]. Jobs already carry prevouts, txs, and
@@ -151,9 +152,9 @@ pub fn confirm_load_phase(
 
     let t_work = Instant::now();
 
-    // Decode bodies, pin parents + thin edges (batch-local).
+    // Decode bodies once, pin parents + thin edges (batch-local).
     let t_load = Instant::now();
-    let (batch_parents, batch_thin) =
+    let (batch_parents, batch_thin, batch_bodies) =
         load_confirm_batch(query, &heights, &items, batch_end)?;
     let load_ns = t_load.elapsed().as_nanos() as u64;
     confirm_phase_stats::LOAD_NS.fetch_add(load_ns, Ordering::Relaxed);
@@ -165,7 +166,7 @@ pub fn confirm_load_phase(
         Ordering::Relaxed,
     );
 
-    let wire_blocks = wire_rebuild(query, &metas)?;
+    let wire_blocks = wire_rebuild(query, &metas, &batch_bodies)?;
     let prepared = assemble_run(
         query,
         params,
@@ -372,17 +373,25 @@ fn load_confirm_batch(
     heights: &[u32],
     items: &[(u32, [u8; 32])],
     _batch_end: u32,
-) -> Result<(rbitcoin_query::BatchParents, rbitcoin_query::BatchThin), ConsensusError> {
+) -> Result<
+    (
+        rbitcoin_query::BatchParents,
+        rbitcoin_query::BatchThin,
+        rbitcoin_query::BatchFullBodies,
+    ),
+    ConsensusError,
+> {
     if heights.is_empty() {
         return Ok((
             rbitcoin_query::BatchParents::new(),
             rbitcoin_query::BatchThin::new(),
+            rbitcoin_query::BatchFullBodies::new(),
         ));
     }
-    let (_st, batch_parents, batch_thin) = query
+    let (_st, batch_parents, batch_thin, batch_bodies) = query
         .load_confirm_parents(items)
         .map_err(ConsensusError::Store)?;
-    Ok((batch_parents, batch_thin))
+    Ok((batch_parents, batch_thin, batch_bodies))
 }
 
 fn resolve_body_metas(
@@ -426,10 +435,15 @@ fn resolve_body_metas(
     Ok(metas)
 }
 
-fn wire_rebuild(query: &Query, metas: &[BodyMeta]) -> Result<Vec<Block>, ConsensusError> {
+fn wire_rebuild(
+    query: &Query,
+    metas: &[BodyMeta],
+    batch_bodies: &rbitcoin_query::BatchFullBodies,
+) -> Result<Vec<Block>, ConsensusError> {
     // Sequential by design: `rayon_audit` benches show par_iter reconstruct is
-    // *slower* than sequential for 1–128 blocks. Load already decoded Class A
-    // into ConfirmParentCache — wire clones from cache (store fallback on miss).
+    // *slower* than sequential for 1–128 blocks. Load decoded Class A once into
+    // `batch_bodies` — wire builds `bitcoin::Transaction` from that map (store
+    // only if a create is missing from the batch, which should not happen).
     let t0 = Instant::now();
     let mut blks = Vec::with_capacity(metas.len());
     for m in metas {
@@ -443,6 +457,7 @@ fn wire_rebuild(query: &Query, metas: &[BodyMeta]) -> Result<Vec<Block>, Consens
                     m.header_rec.clone(),
                     m.tx_fks.clone(),
                     prev_hash,
+                    Some(batch_bodies),
                 )
                 .map_err(ConsensusError::Store)?,
         );

@@ -42,11 +42,21 @@ impl Query {
             .is_some_and(|(fk, v)| fk.is_null() && *v == 0xffff_ffff))
     }
 
-    /// Body for wire rebuild / RPC: store via tx.idx (outs FIFO has no full body).
-    fn load_body_from_cache(
+    /// Body for wire rebuild / RPC.
+    ///
+    /// Prefer batch-local full decode from confirm load ([`BatchFullBodies`]);
+    /// OutFifo has outs only. Store via `tx.idx` is the fallback (RPC / miss).
+    fn load_body_for_wire(
         &self,
         fk: Fk,
+        batch: Option<&crate::BatchFullBodies>,
     ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>), QueryError> {
+        if let Some(b) = batch {
+            if let Some((tx, inputs, outs)) = b.get_owned(fk) {
+                // Match historical order: (meta, outs, inputs) for reconstruct_tx.
+                return Ok((tx, outs, inputs));
+            }
+        }
         self.load_body_from_store(fk)
     }
 
@@ -126,9 +136,18 @@ impl Query {
 
     /// Reconstruct a consensus `Transaction` from Class A rows (no stored raw).
     pub fn reconstruct_tx(&self, tx_fk: Fk) -> Result<Transaction, QueryError> {
-        let (rec, stored_outputs, mut stored_inputs) = self.load_body_from_cache(tx_fk)?;
+        self.reconstruct_tx_with_batch(tx_fk, None)
+    }
+
+    /// Like [`Self::reconstruct_tx`], using load-stage full bodies when present.
+    pub fn reconstruct_tx_with_batch(
+        &self,
+        tx_fk: Fk,
+        batch: Option<&crate::BatchFullBodies>,
+    ) -> Result<Transaction, QueryError> {
+        let (rec, stored_outputs, mut stored_inputs) = self.load_body_for_wire(tx_fk, batch)?;
         let mut cache = HashMap::new();
-        self.fill_input_prev_txids_cached(&mut stored_inputs, &mut cache)?;
+        self.fill_input_prev_txids_cached(&mut stored_inputs, &mut cache, batch)?;
         Ok(Self::transaction_from_class_a(
             rec,
             stored_outputs,
@@ -184,6 +203,7 @@ impl Query {
         &self,
         inputs: &mut [InputRecord],
         cache: &mut HashMap<u64, [u8; 32]>,
+        batch: Option<&crate::BatchFullBodies>,
     ) -> Result<(), QueryError> {
         for inp in inputs.iter_mut() {
             if inp.is_coinbase() {
@@ -202,9 +222,12 @@ impl Query {
                 inp.prev_txid = txid;
                 continue;
             }
-            let txid = match self.confirm_parents.get_parent_txid(Fk(id)) {
-                Some(t) => t,
-                None => self.store.txs.body_txid(Fk(id))?,
+            let txid = if let Some(t) = batch.and_then(|b| b.txid(Fk(id))) {
+                t
+            } else if let Some(t) = self.confirm_parents.get_parent_txid(Fk(id)) {
+                t
+            } else {
+                self.store.txs.body_txid(Fk(id))?
             };
             cache.insert(id, txid);
             inp.prev_txid = txid;
@@ -242,10 +265,11 @@ impl Query {
         rec: HeaderRecord,
         tx_fks: Vec<Fk>,
     ) -> Result<Block, QueryError> {
-        self.reconstruct_archived_block_from_parts_cached(rec, tx_fks, None)
+        self.reconstruct_archived_block_from_parts_cached(rec, tx_fks, None, None)
     }
 
-    /// Confirm hot path: bodies from load-stage parent cache (store fallback).
+    /// Confirm hot path: full bodies from load-stage [`BatchFullBodies`] when
+    /// present (no second store decode); store fallback for RPC / miss.
     ///
     /// `prev_hash`: when set (load header plan), wire header needs no store IO.
     pub fn reconstruct_archived_block_from_parts_cached(
@@ -253,6 +277,7 @@ impl Query {
         rec: HeaderRecord,
         tx_fks: Vec<Fk>,
         prev_hash: Option<[u8; 32]>,
+        batch_bodies: Option<&crate::BatchFullBodies>,
     ) -> Result<Block, QueryError> {
         if tx_fks.is_empty() {
             return Err(StoreError::Corrupt("block has no transactions"));
@@ -262,8 +287,13 @@ impl Query {
         // Dedup create_fk → txid across the whole block.
         let mut prev_txid_cache: HashMap<u64, [u8; 32]> = HashMap::new();
         for fk in tx_fks {
-            let (rec_tx, stored_outputs, mut stored_inputs) = self.load_body_from_cache(fk)?;
-            self.fill_input_prev_txids_cached(&mut stored_inputs, &mut prev_txid_cache)?;
+            let (rec_tx, stored_outputs, mut stored_inputs) =
+                self.load_body_for_wire(fk, batch_bodies)?;
+            self.fill_input_prev_txids_cached(
+                &mut stored_inputs,
+                &mut prev_txid_cache,
+                batch_bodies,
+            )?;
             txdata.push(Self::transaction_from_class_a(
                 rec_tx,
                 stored_outputs,

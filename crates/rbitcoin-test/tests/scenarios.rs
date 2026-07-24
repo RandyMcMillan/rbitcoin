@@ -1135,7 +1135,8 @@ fn confirm_structural_rejects_already_spent_prevout() {
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
     accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     let spend_hash = b_spend.block_hash().to_byte_array();
-    let (_st, batch_parents, _thin) = q.load_confirm_parents(&[(spend_h, spend_hash)]).unwrap();
+    let (_st, batch_parents, _thin, _bodies) =
+        q.load_confirm_parents(&[(spend_h, spend_hash)]).unwrap();
     let create_fk = q
         .tx_fk_by_txid(cb1.as_byte_array())
         .unwrap()
@@ -1880,7 +1881,7 @@ fn three_stage_confirm_and_parent_pin_surface() {
 
     // Inline confirm load (parent pin).
     let items: Vec<(u32, [u8; 32])> = run.iter().map(|(h, hash)| (h.0, *hash)).collect();
-    let (st, _bp, _thin) = q.load_confirm_parents(&items).unwrap();
+    let (st, _bp, _thin, _bodies) = q.load_confirm_parents(&items).unwrap();
     assert!(st.blocks > 0);
     let _ = q.load_confirm_parents_for_hashes(&[b_spend.block_hash().to_byte_array()]);
     let snap = q.parent_cache_perf_snapshot();
@@ -1912,7 +1913,7 @@ fn three_stage_confirm_and_parent_pin_surface() {
     assert!(empty.is_err());
 
     // Heights ≤ tip are not re-loaded (work filtered out).
-    let (st2, _, _) = q.load_confirm_parents(&items).unwrap();
+    let (st2, _, _, _) = q.load_confirm_parents(&items).unwrap();
     assert_eq!(st2.blocks, 0);
 }
 

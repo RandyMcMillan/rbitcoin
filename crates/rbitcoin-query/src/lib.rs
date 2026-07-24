@@ -8,6 +8,7 @@ mod chain_view;
 mod confirm_parent_cache;
 mod connect;
 mod confirm_load;
+mod out_fifo;
 mod reconstruct;
 mod run_builder_core;
 mod scripthash;

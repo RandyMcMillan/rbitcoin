@@ -2,75 +2,27 @@
 //!
 //! Load-stage strategy (no background worker):
 //! - **RAM-cache** small lookups: header + `header_txs`, body ranges, thin edges.
-//! - **Full-decode** batch Class A into `by_body` once; wave/wire clone from it.
-//! - After tip advance, decoded bodies with `height ≤ tip` stay in `by_body`
-//!   under a **byte-capped LRU** (default 1 GiB) so near-subsequent spends hit
-//!   RAM instead of cold Class A. Runway bodies (`height > tip`) are never
-//!   LRU-evicted.
+//! - **Create outs FIFO** ([`crate::out_fifo::OutFifo`]): tx meta + outputs only
+//!   for parent pin / prevout resolve (cap 2²⁴ outs by default). No full-body
+//!   inputs/witness; wire rebuild falls back to store (+ cached body range).
+//! - Eviction is plain FIFO by create (oldest whole create dropped) — no tip
+//!   reaccount / full-map body scans.
 //!
-//! - Parent pin uses create_fk; no process-local txid→fk map (use durable head if needed).
+//! - Parent pin uses create_fk; no process-local txid→fk map.
 //! - A height is **ready** once scanned (load finished for that height).
 //! - Prevouts use stamped create_fk only.
 
 use rbitcoin_primitives::Fk;
+use crate::out_fifo::{is_coinbase_inputs, CreateOuts, OutFifo};
 use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
 // ThinInput used via StashedThinInput alias.
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Default post-confirm body LRU budget (decoded RAM).
-pub const DEFAULT_BODY_LRU_MB: u64 = 1024;
-
-/// `RBITCOIN_CONFIRM_BODY_LRU_MB` (default 1024). `0` = drop bodies at tip (legacy).
-pub fn body_lru_cap_bytes_from_env() -> u64 {
-    let mb = std::env::var("RBITCOIN_CONFIRM_BODY_LRU_MB")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_BODY_LRU_MB);
-    mb.saturating_mul(1024 * 1024)
-}
-
-/// Rough heap weight of a decoded Class A row (scripts + witness + overhead).
-fn estimate_body_bytes(
-    _tx: &TxRecord,
-    outputs: &[OutputRecord],
-    inputs: &[InputRecord],
-) -> u64 {
-    let mut n = 256u64;
-    for o in outputs {
-        n = n.saturating_add(32);
-        n = n.saturating_add(o.script.len() as u64);
-    }
-    for i in inputs {
-        n = n.saturating_add(64);
-        n = n.saturating_add(i.script_sig.len() as u64);
-        for w in &i.witness {
-            n = n.saturating_add(w.len() as u64);
-        }
-    }
-    n
-}
-
 /// Thin create-fk edge (identical to wave [`crate::wave_prevout::ThinInput`]).
 pub type StashedThinInput = crate::wave_prevout::ThinInput;
-
-/// Full Class A body for a cache height (confirm should not re-read store).
-#[derive(Debug, Clone)]
-pub struct BodyEntry {
-    pub height: u32,
-    pub tx: TxRecord,
-    pub outputs: Vec<OutputRecord>,
-    pub inputs: Vec<InputRecord>,
-    /// Per-input create-fk edges filled after load phase-2 parent resolve.
-    /// `None` = not yet stashed (assemble falls back via store/thin rebuild).
-    pub thin_inputs: Option<Vec<StashedThinInput>>,
-    /// Estimated heap bytes (LRU accounting).
-    size_bytes: u64,
-    /// Lazy LRU stamp (matches [`Inner::body_lru`] records).
-    lru_stamp: u64,
-}
 
 /// Cached header + body fk list for one cache height (avoids header.head/body
 /// and header_txs page faults on confirm resolve).
@@ -104,26 +56,18 @@ struct Inner {
     /// Highest confirmed tip we have pruned to.
     tip: u32,
     /// Contiguous ready watermark: all heights in `(tip, ready_through]` are ready.
-    /// `ready_through == tip` means nothing ahead is ready.
     ready_through: u32,
     /// height → plan
     plans: BTreeMap<u32, HeightPlan>,
-    /// Full decoded bodies by create fk (runway + post-confirm LRU).
-    by_body: HashMap<u64, BodyEntry>,
-    /// Total `BodyEntry::size_bytes` for entries with `height ≤ tip` (LRU budget).
-    body_lru_bytes: u64,
-    /// Cap for confirmed-body LRU (`height ≤ tip`). Runway (`height > tip`) free.
-    body_lru_cap: u64,
-    /// Lazy LRU order: `(fk_id, stamp)`; front = oldest. Touch pushes new stamp.
-    body_lru: VecDeque<(u64, u64)>,
-    next_lru_stamp: u64,
+    /// Create outs FIFO (prevout pin cache).
+    outs: OutFifo,
     /// Thin edges without a full body parse.
     thin_edges: HashMap<u64, Vec<StashedThinInput>>,
-    /// height → header + tx list (replaces header.head/body + header_txs reads).
+    /// height → header + tx list.
     headers: HashMap<u32, HeaderPlanCache>,
     /// hash → height for O(1) header resolve on confirm.
     hash_to_height: HashMap<[u8; 32], u32>,
-    /// fk id → absolute body (offset, len) from tx.idx (replaces idx page faults).
+    /// fk id → absolute body (offset, len) from tx.idx.
     body_range: HashMap<u64, (u64, u64)>,
 }
 
@@ -144,11 +88,7 @@ impl ConfirmParentCache {
                 tip: 0,
                 ready_through: 0,
                 plans: BTreeMap::new(),
-                by_body: HashMap::new(),
-                body_lru_bytes: 0,
-                body_lru_cap: body_lru_cap_bytes_from_env(),
-                body_lru: VecDeque::new(),
-                next_lru_stamp: 1,
+                outs: OutFifo::with_env_cap(),
                 thin_edges: HashMap::new(),
                 headers: HashMap::new(),
                 hash_to_height: HashMap::new(),
@@ -163,9 +103,10 @@ impl ConfirmParentCache {
         Self::new()
     }
 
-    /// Override confirmed-body LRU byte cap (tests). `0` = drop bodies at tip.
-    pub fn set_body_lru_cap_bytes(&self, cap: u64) {
-        self.inner.lock().unwrap().body_lru_cap = cap;
+    /// Override out-FIFO capacity (tests).
+    pub fn set_out_fifo_cap(&self, cap_outs: u64) {
+        let mut g = self.inner.lock().unwrap();
+        g.outs = OutFifo::new(cap_outs.max(1));
     }
 
     /// Highest height such that every plan in `(tip, ready_through]` is ready.
@@ -173,12 +114,12 @@ impl ConfirmParentCache {
         self.ready_through.load(Ordering::Relaxed)
     }
 
-    /// Advance tip: drop plans/headers at/below tip; confirm body LRU account/evict.
+    /// Advance tip: drop plans/headers/thin at/below tip.
     ///
+    /// Create outs live in the FIFO until evicted by capacity — no tip reaccount.
     /// Called from write `post_commit` after Class C + spend annotate.
     pub fn advance_tip(&self, tip: u32) {
         let mut g = self.inner.lock().unwrap();
-        let old_tip = g.tip;
         g.tip = tip;
         if g.ready_through < tip {
             g.ready_through = tip;
@@ -187,80 +128,7 @@ impl ConfirmParentCache {
         for h in drop_h {
             g.plans.remove(&h);
         }
-        // Bodies with height ≤ tip enter the confirmed LRU budget (kept for
-        // near-subsequent parent pin hits). Thin edges for ≤tip heights drop
-        // (wave already consumed them). Cap 0 = drop bodies immediately.
-        //
-        // Budget update is O(confirmed batch headers' tx_fks), not O(|by_body|):
-        // full `reaccount_body_lru_bytes` scanned ~1.8M bodies every tip advance
-        // and held the parent-cache lock long enough that load pin stalled
-        // (`pin_sub cover` inflated while write tip_gc ran).
-        if g.body_lru_cap == 0 {
-            let mut drop_ids: Vec<u64> = Vec::new();
-            g.by_body.retain(|id, b| {
-                let keep = b.height > tip;
-                if !keep {
-                    drop_ids.push(*id);
-                }
-                keep
-            });
-            for id in drop_ids {
-                g.thin_edges.remove(&id);
-            }
-            g.body_lru.clear();
-            g.body_lru_bytes = 0;
-        } else {
-            // Account runway→confirmed using header plans for newly confirmed
-            // heights (before those headers are dropped). O(batch txs).
-            if tip > old_tip {
-                let mut newly: Vec<u64> = Vec::new();
-                for h in old_tip.saturating_add(1)..=tip {
-                    let Some(plan) = g.headers.get(&h) else {
-                        continue;
-                    };
-                    for fk in &plan.tx_fks {
-                        if let Some(id) = fk.get() {
-                            newly.push(id);
-                        }
-                    }
-                }
-                for id in newly {
-                    // Body create height just crossed into confirmed budget.
-                    let add = g.by_body.get(&id).and_then(|b| {
-                        if b.height > old_tip && b.height <= tip {
-                            Some(b.size_bytes)
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(sz) = add {
-                        g.body_lru_bytes = g.body_lru_bytes.saturating_add(sz);
-                    }
-                }
-            }
-            // Thin edges are only useful on runway; drop for confirmed creates.
-            // Scan thin_edges (small) not by_body (~millions).
-            if !g.thin_edges.is_empty() {
-                let thin_ids: Vec<u64> = g.thin_edges.keys().copied().collect();
-                for id in thin_ids {
-                    let drop = match g.by_body.get(&id) {
-                        Some(b) => b.height <= tip,
-                        None => true, // orphan thin
-                    };
-                    if drop {
-                        g.thin_edges.remove(&id);
-                    }
-                }
-            }
-            g.evict_body_lru_to_cap();
-            // Safety net if stamps/budget drifted (rare): one full reaccount.
-            if g.body_lru_bytes > g.body_lru_cap {
-                g.reaccount_body_lru_bytes();
-                g.rebuild_body_lru_from_map();
-                g.evict_confirmed_by_stamp_until_cap();
-            }
-        }
-        // Drop header plan cache for heights at/below tip.
+        // Drop header plans + thin edges for confirmed heights (O(batch txs)).
         let drop_hdr: Vec<u32> = g
             .headers
             .keys()
@@ -277,15 +145,15 @@ impl ConfirmParentCache {
                 }
             }
         }
-        // Drop body_range not tied to live cache bodies.
-        g.gc_body_ranges();
+        // Optional: drop outs for creates at/below tip (FIFO still has hard cap).
+        // Keep them for pin hits — only capacity evicts. (No O(map) scan required.)
         g.recompute_ready_through();
         self.ready_through
             .store(g.ready_through, Ordering::Relaxed);
         drop(g);
-        // Wake confirm waiters (tip advance can satisfy / re-horizon plans).
         self.ready_cv.notify_all();
     }
+
 
     /// Wake any thread blocked in [`Self::wait_heights_ready`] (cancel / shutdown).
     pub fn notify_ready_waiters(&self) {
@@ -365,10 +233,8 @@ impl ConfirmParentCache {
         }
     }
 
-    /// Store a full cache block body (phase-1 cache). Confirm/wave should
-    /// prefer this over Class A store reads.
-    ///
-    /// Wave/cache resolve cache creates via [`Self::get_parent_out`] body fallback.
+
+    /// Insert create outs into the FIFO (meta + outputs only; inputs used only for coinbase flag).
     pub fn put_body(
         &self,
         fk: Fk,
@@ -380,11 +246,25 @@ impl ConfirmParentCache {
         let Some(id) = fk.get() else {
             return;
         };
+        let is_coinbase = is_coinbase_inputs(&tx, &inputs);
         let mut g = self.inner.lock().unwrap();
-        g.insert_body(id, height, tx, outputs, inputs);
+        let evicted = g.outs.insert(
+            id,
+            CreateOuts {
+                height,
+                tx,
+                outputs,
+                is_coinbase,
+            },
+        );
+        for eid in evicted {
+            g.body_range.remove(&eid);
+        }
     }
 
-    /// Many bodies under **one** lock (load phase-1 finish). Moves ownership.
+    /// Many creates under **one** lock (load phase-1 finish). Moves ownership.
+    ///
+    /// Inputs are consumed only for the coinbase flag, then dropped.
     pub fn put_bodies_batch(
         &self,
         items: Vec<(Fk, u32, TxRecord, Vec<OutputRecord>, Vec<InputRecord>)>,
@@ -397,14 +277,23 @@ impl ConfirmParentCache {
             let Some(id) = fk.get() else {
                 continue;
             };
-            g.insert_body(id, height, tx, outputs, inputs);
+            let is_coinbase = is_coinbase_inputs(&tx, &inputs);
+            let evicted = g.outs.insert(
+                id,
+                CreateOuts {
+                    height,
+                    tx,
+                    outputs,
+                    is_coinbase,
+                },
+            );
+            for eid in evicted {
+                g.body_range.remove(&eid);
+            }
         }
     }
 
-    /// Phase-1 hot path: body only (creates are the body outs).
-    ///
-    /// Sparse spent-filtered parents live on per-batch [`crate::BatchParents`].
-    /// Creates resolve via body outs / thin edges.
+    /// Alias: same as [`Self::put_body`] (creates = body outs).
     pub fn put_body_and_creates(
         &self,
         fk: Fk,
@@ -413,75 +302,42 @@ impl ConfirmParentCache {
         outputs: Vec<OutputRecord>,
         inputs: Vec<InputRecord>,
     ) {
-        let Some(id) = fk.get() else {
-            return;
-        };
-        let mut g = self.inner.lock().unwrap();
-        g.insert_body(id, height, tx, outputs, inputs);
+        self.put_body(fk, height, tx, outputs, inputs);
     }
 
+    /// Full Class A body is **not** retained (outs-only FIFO). Always `None`.
+    /// Wire rebuild uses store (+ [`Self::get_body_range`]).
     pub fn get_body(
         &self,
-        fk: Fk,
+        _fk: Fk,
     ) -> Option<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>)> {
-        let id = fk.get()?;
-        let g = self.inner.lock().unwrap();
-        let e = g.by_body.get(&id)?;
-        Some((e.tx.clone(), e.outputs.clone(), e.inputs.clone()))
+        None
     }
 
-    /// True if a full cache body is already stashed (skip store re-decode).
+    /// True if create outs are still in the FIFO.
     pub fn has_body(&self, fk: Fk) -> bool {
         let Some(id) = fk.get() else {
             return false;
         };
-        self.inner.lock().unwrap().by_body.contains_key(&id)
+        self.inner.lock().unwrap().outs.contains(id)
     }
 
-    /// Thin-edge inputs from a cached body without re-reading the store.
-    ///
-    /// Each edge is `(create_fk_opt, soft_prev_txid, vout)`. Soft prev_txid is
-    /// zero when create_fk is set (v10 disk encoding).
+    /// Full inputs are not retained — always `None` (caller re-decodes for thin).
     pub fn body_prevout_edges(
         &self,
-        fk: Fk,
+        _fk: Fk,
     ) -> Option<([u8; 32], Vec<(Option<u64>, [u8; 32], u32)>)> {
-        let id = fk.get()?;
-        let mut g = self.inner.lock().unwrap();
-        let e = g.by_body.get(&id)?;
-        let prevouts: Vec<(Option<u64>, [u8; 32], u32)> = e
-            .inputs
-            .iter()
-            .map(|i| {
-                let soft = if i.create_fk.is_null() {
-                    i.prev_txid
-                } else {
-                    [0u8; 32]
-                };
-                (i.create_fk.get(), soft, i.prev_index)
-            })
-            .collect();
-        let txid = e.tx.txid;
-        g.touch_body_lru(id);
-        Some((txid, prevouts))
+        None
     }
 
-    /// Clone a full body; keeps entry for post-confirm LRU / retries.
+    /// Compatibility: full body not held.
     pub fn take_body(
         &self,
-        fk: Fk,
+        _fk: Fk,
     ) -> Option<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>)> {
-        let id = fk.get()?;
-        let mut g = self.inner.lock().unwrap();
-        let e = g.by_body.get(&id)?;
-        let out = (e.tx.clone(), e.outputs.clone(), e.inputs.clone());
-        g.touch_body_lru(id);
-        Some(out)
+        None
     }
 
-    /// Clone many bodies under **one** lock (keeps post-confirm LRU).
-    ///
-    /// Compatibility alias for [`Self::get_bodies_batch`].
     pub fn take_bodies_batch(
         &self,
         fks: &[Fk],
@@ -489,73 +345,28 @@ impl ConfirmParentCache {
         self.get_bodies_batch(fks)
     }
 
-    /// Clone many bodies under **one** lock (keeps cache intact for retries).
+    /// Full bodies not held — empty map (wire/reconstruct use store).
     pub fn get_bodies_batch(
         &self,
-        fks: &[Fk],
+        _fks: &[Fk],
     ) -> HashMap<u64, (TxRecord, Vec<OutputRecord>, Vec<InputRecord>)> {
-        if fks.is_empty() {
-            return HashMap::new();
-        }
-        let t0 = std::time::Instant::now();
-        let mut g = self.inner.lock().unwrap();
-        crate::wave_fill_stats::add(
-            &crate::wave_fill_stats::CACHE_LOCK_WAIT_NS,
-            t0.elapsed().as_nanos() as u64,
-        );
-        let mut out = HashMap::with_capacity(fks.len());
-        for &fk in fks {
-            let Some(id) = fk.get() else {
-                continue;
-            };
-            if let Some(e) = g.by_body.get(&id) {
-                out.insert(id, (e.tx.clone(), e.outputs.clone(), e.inputs.clone()));
-                g.touch_body_lru(id);
-            }
-        }
-        out
+        HashMap::new()
     }
 
-    /// Full body for parent pin (runway or post-confirm LRU).
-    ///
-    /// Prefer this over a store re-decode when the create is already full-decoded.
-    ///
-    /// **Hot path:** use [`Self::get_bodies_for_pin_batch`] — this clones **all**
-    /// inputs/outputs and takes the cache lock per call (scales poorly with
-    /// `|by_body|` under IBD pin volume).
+    /// Pin path (legacy full-body shape) — not used; prefer [`Self::get_bodies_for_pin_batch`].
     pub fn get_body_for_pin(
         &self,
         fk: Fk,
     ) -> Option<(u32, TxRecord, Vec<OutputRecord>, Vec<InputRecord>)> {
         let id = fk.get()?;
-        let mut g = self.inner.lock().unwrap();
-        let e = g.by_body.get(&id)?;
-        let out = (
-            e.height,
-            e.tx.clone(),
-            e.outputs.clone(),
-            e.inputs.clone(),
-        );
-        g.touch_body_lru(id);
-        Some(out)
+        let g = self.inner.lock().unwrap();
+        let e = g.outs.get(id)?;
+        Some((e.height, e.tx.clone(), e.outputs.clone(), Vec::new()))
     }
 
     /// Slim pin hits under **one** lock: only clone requested outs + tx meta.
     ///
-    /// `items`: `(create_fk_id, need_vouts)`. Missing bodies omitted. Vouts are
-    /// borrowed (no per-parent `Vec` clone of the need list).
-    ///
-    /// Returns `id → (create_height, tx, outs, coinbase_hint, body_range)`:
-    /// - `outs`: only requested vouts that exist on the body (not spent-filtered)
-    /// - `coinbase_hint`: `Some(true)` clearly coinbase, `Some(false)` not,
-    ///   `None` ambiguous 1-in (caller may store-resolve)
-    /// - `body_range`: cached absolute range if known
-    ///
-    /// Touches body LRU once per hit. Avoids cloning full witness/input vectors
-    /// that made per-parent pin scale with uptime as `|by_body|` grew.
-    ///
-    /// Caller should **`remove`** hits and move `tx`/`outs` into
-    /// [`crate::BatchParents`] (no second clone).
+    /// Returns `id → (create_height, tx, outs, coinbase_hint, body_range)`.
     pub fn get_bodies_for_pin_batch(
         &self,
         items: &[(u64, &[u32])],
@@ -572,50 +383,40 @@ impl ConfirmParentCache {
         if items.is_empty() {
             return HashMap::new();
         }
-        let mut g = self.inner.lock().unwrap();
+        let g = self.inner.lock().unwrap();
         let mut out = HashMap::with_capacity(items.len());
         for &(id, vouts) in items {
-            let hit = {
-                let Some(e) = g.by_body.get(&id) else {
-                    continue;
-                };
-                let mut outs = Vec::with_capacity(vouts.len());
-                for &v in vouts {
-                    if let Some(o) = e.outputs.get(v as usize) {
-                        outs.push((v, o.clone()));
-                    }
-                }
-                let cb_hint = if e.tx.input_count != 1 {
-                    Some(false)
-                } else if e
-                    .inputs
-                    .first()
-                    .is_some_and(|i| i.is_coinbase() || i.prev_index == u32::MAX)
-                {
-                    Some(true)
-                } else {
-                    None
-                };
-                let range = g.body_range.get(&id).copied();
-                (e.height, e.tx.clone(), outs, cb_hint, range)
+            let Some(e) = g.outs.get(id) else {
+                continue;
             };
-            g.touch_body_lru(id);
-            out.insert(id, hit);
+            let mut outs = Vec::with_capacity(vouts.len());
+            for &v in vouts {
+                if let Some(o) = e.outputs.get(v as usize) {
+                    outs.push((v, o.clone()));
+                }
+            }
+            let cb_hint = if e.tx.input_count != 1 {
+                Some(false)
+            } else if e.is_coinbase {
+                Some(true)
+            } else {
+                // 1-in non-cb or unknown — let caller resolve if needed
+                Some(false)
+            };
+            let range = g.body_range.get(&id).copied();
+            out.insert(id, (e.height, e.tx.clone(), outs, cb_hint, range));
         }
         out
     }
 
-    /// `(body_count, confirmed_lru_bytes, lru_cap_bytes, lazy_deque_len)` for perf/tests.
-    ///
-    /// `lazy_deque_len` should stay O(body_count); if it grows to many× body_count,
-    /// compaction is lagging and load pin will slow with runtime.
+    /// `(create_count, total_outs, cap_outs, fifo_order_len)` for perf/tests.
     pub fn body_lru_stats(&self) -> (usize, u64, u64, usize) {
         let g = self.inner.lock().unwrap();
         (
-            g.by_body.len(),
-            g.body_lru_bytes,
-            g.body_lru_cap,
-            g.body_lru.len(),
+            g.outs.len(),
+            g.outs.total_outs(),
+            g.outs.cap_outs(),
+            g.outs.len(), // order length ≈ creates (stale skips rare)
         )
     }
 
@@ -648,7 +449,7 @@ impl ConfirmParentCache {
         let g = self.inner.lock().unwrap();
         tx_fks.iter().all(|fk| {
             fk.get()
-                .map(|id| g.by_body.contains_key(&id))
+                .map(|id| g.outs.contains(id))
                 .unwrap_or(false)
         })
     }
@@ -694,7 +495,7 @@ impl ConfirmParentCache {
     }
 
     pub fn body_count(&self) -> usize {
-        self.inner.lock().unwrap().by_body.len()
+        self.inner.lock().unwrap().outs.len()
     }
 
     /// Ensure a height plan exists for `hash`.
@@ -879,9 +680,6 @@ impl ConfirmParentCache {
             let Some(id) = fk.get() else {
                 continue;
             };
-            if let Some(e) = g.by_body.get_mut(&id) {
-                e.thin_inputs = Some(edges.clone());
-            }
             g.thin_edges.insert(id, edges);
         }
     }
@@ -897,11 +695,9 @@ impl ConfirmParentCache {
     ) -> Option<(TxRecord, OutputRecord)> {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
-        if let Some(b) = g.by_body.get(&id) {
-            let o = b.outputs.get(vout as usize)?;
-            return Some((b.tx.clone(), o.clone()));
-        }
-        None
+        let e = g.outs.get(id)?;
+        let o = e.outputs.get(vout as usize)?;
+        Some((e.tx.clone(), o.clone()))
     }
 
     /// True if vout is present on a cached body — no record clone.
@@ -909,11 +705,14 @@ impl ConfirmParentCache {
         let Some(id) = fk.get() else {
             return false;
         };
-        let g = self.inner.lock().unwrap();
-        g.by_body
-            .get(&id)
-            .is_some_and(|b| (vout as usize) < b.outputs.len())
+        self.inner
+            .lock()
+            .unwrap()
+            .outs
+            .get(id)
+            .is_some_and(|e| (vout as usize) < e.outputs.len())
     }
+
 
 
 
@@ -925,16 +724,16 @@ impl ConfirmParentCache {
 
     pub fn get_parent_tx(&self, fk: Fk) -> Option<TxRecord> {
         let id = fk.get()?;
-        let g = self.inner.lock().unwrap();
-        g.by_body.get(&id).map(|b| b.tx.clone())
+        self.inner.lock().unwrap().outs.get(id).map(|e| e.tx.clone())
     }
+
 
     /// Txid of a stashed parent create body — no clone of outs.
     pub fn get_parent_txid(&self, fk: Fk) -> Option<[u8; 32]> {
         let id = fk.get()?;
-        let g = self.inner.lock().unwrap();
-        g.by_body.get(&id).map(|b| b.tx.txid)
+        self.inner.lock().unwrap().outs.get(id).map(|e| e.tx.txid)
     }
+
 
 
 
@@ -953,196 +752,6 @@ impl ConfirmParentCache {
 }
 
 impl Inner {
-    fn insert_body(
-        &mut self,
-        id: u64,
-        height: u32,
-        tx: TxRecord,
-        outputs: Vec<OutputRecord>,
-        inputs: Vec<InputRecord>,
-    ) {
-        let size_bytes = estimate_body_bytes(&tx, &outputs, &inputs);
-        if let Some(old) = self.by_body.remove(&id) {
-            if old.height <= self.tip {
-                self.body_lru_bytes = self.body_lru_bytes.saturating_sub(old.size_bytes);
-            }
-        }
-        let stamp = self.next_lru_stamp;
-        self.next_lru_stamp = self.next_lru_stamp.saturating_add(1);
-        self.by_body.insert(
-            id,
-            BodyEntry {
-                height,
-                tx,
-                outputs,
-                inputs,
-                thin_inputs: None,
-                size_bytes,
-                lru_stamp: stamp,
-            },
-        );
-        self.body_lru.push_back((id, stamp));
-        if height <= self.tip {
-            self.body_lru_bytes = self.body_lru_bytes.saturating_add(size_bytes);
-            self.evict_body_lru_to_cap();
-        }
-        self.maybe_compact_body_lru();
-    }
-
-    fn touch_body_lru(&mut self, id: u64) {
-        let Some(e) = self.by_body.get_mut(&id) else {
-            return;
-        };
-        let stamp = self.next_lru_stamp;
-        self.next_lru_stamp = self.next_lru_stamp.saturating_add(1);
-        e.lru_stamp = stamp;
-        self.body_lru.push_back((id, stamp));
-        self.maybe_compact_body_lru();
-    }
-
-    fn reaccount_body_lru_bytes(&mut self) {
-        let tip = self.tip;
-        self.body_lru_bytes = self
-            .by_body
-            .values()
-            .filter(|b| b.height <= tip)
-            .map(|b| b.size_bytes)
-            .sum();
-    }
-
-    /// Evict oldest **confirmed** (`height ≤ tip`) bodies until under cap.
-    ///
-    /// Runway bodies (`height > tip`) are never evicted. Work is **one linear
-    /// pass** of the lazy deque (plus optional compact): runway stamps are held
-    /// aside and restored after — no O(deque) `.all()` per pop.
-    fn evict_body_lru_to_cap(&mut self) {
-        if self.body_lru_cap == 0 {
-            return;
-        }
-        // Drop stale stamps first so the pass is proportional to live entries.
-        self.compact_body_lru_stale();
-        if self.body_lru_bytes <= self.body_lru_cap {
-            return;
-        }
-        let tip = self.tip;
-        let pass_n = self.body_lru.len();
-        let mut hold: VecDeque<(u64, u64)> = VecDeque::with_capacity(pass_n.min(1024));
-        for _ in 0..pass_n {
-            if self.body_lru_bytes <= self.body_lru_cap {
-                break;
-            }
-            let Some((id, stamp)) = self.body_lru.pop_front() else {
-                break;
-            };
-            let Some(e) = self.by_body.get(&id) else {
-                continue; // gone; discard stamp
-            };
-            if e.lru_stamp != stamp {
-                continue; // superseded by a newer touch
-            }
-            if e.height > tip {
-                // Protected runway — hold aside (no full-queue rescan).
-                hold.push_back((id, stamp));
-                continue;
-            }
-            let size = e.size_bytes;
-            self.by_body.remove(&id);
-            self.thin_edges.remove(&id);
-            self.body_lru_bytes = self.body_lru_bytes.saturating_sub(size);
-        }
-        // Restore runway / non-evicted live stamps (confirmed survivors stay
-        // ahead in whatever order remained after the pass).
-        while let Some(x) = hold.pop_front() {
-            self.body_lru.push_back(x);
-        }
-        // Safety: if budget still high (stamp desync), rebuild from by_body.
-        if self.body_lru_bytes > self.body_lru_cap {
-            self.reaccount_body_lru_bytes();
-            self.rebuild_body_lru_from_map();
-            self.evict_confirmed_by_stamp_until_cap();
-        }
-    }
-
-    /// Rebuild lazy deque as one live stamp per `by_body` entry (oldest first).
-    fn rebuild_body_lru_from_map(&mut self) {
-        let mut items: Vec<(u64, u64)> = self
-            .by_body
-            .iter()
-            .map(|(&id, e)| (id, e.lru_stamp))
-            .collect();
-        items.sort_unstable_by_key(|(_, stamp)| *stamp);
-        self.body_lru = items.into();
-    }
-
-    /// After rebuild: drop oldest confirmed until under cap (no lazy stamps).
-    fn evict_confirmed_by_stamp_until_cap(&mut self) {
-        if self.body_lru_cap == 0 {
-            return;
-        }
-        let tip = self.tip;
-        // Walk oldest→newest; remove confirmed until under budget.
-        let mut keep: VecDeque<(u64, u64)> =
-            VecDeque::with_capacity(self.by_body.len().saturating_add(8));
-        // Drain in stamp order already in body_lru.
-        while let Some((id, stamp)) = self.body_lru.pop_front() {
-            let Some(e) = self.by_body.get(&id) else {
-                continue;
-            };
-            if e.lru_stamp != stamp {
-                continue;
-            }
-            if e.height > tip {
-                keep.push_back((id, stamp));
-                continue;
-            }
-            if self.body_lru_bytes > self.body_lru_cap {
-                let size = e.size_bytes;
-                self.by_body.remove(&id);
-                self.thin_edges.remove(&id);
-                self.body_lru_bytes = self.body_lru_bytes.saturating_sub(size);
-                continue;
-            }
-            keep.push_back((id, stamp));
-        }
-        self.body_lru = keep;
-    }
-
-    /// Keep lazy deque from growing unbounded with touch stamps.
-    ///
-    /// Compact when `body_lru.len() > 2 * by_body.len()` (and at least 64), so
-    /// pin/touch paths stay O(bodies) amortized rather than O(touches).
-    fn maybe_compact_body_lru(&mut self) {
-        let n_body = self.by_body.len();
-        let limit = n_body.saturating_mul(2).max(64);
-        if self.body_lru.len() <= limit {
-            return;
-        }
-        self.compact_body_lru_stale();
-    }
-
-    /// Drop superseded stamps and entries no longer in `by_body`. O(deque).
-    fn compact_body_lru_stale(&mut self) {
-        if self.body_lru.is_empty() {
-            return;
-        }
-        let mut kept = VecDeque::with_capacity(self.by_body.len().saturating_add(64));
-        while let Some((id, stamp)) = self.body_lru.pop_front() {
-            if self
-                .by_body
-                .get(&id)
-                .is_some_and(|e| e.lru_stamp == stamp)
-            {
-                kept.push_back((id, stamp));
-            }
-        }
-        self.body_lru = kept;
-    }
-
-
-
-
-
-
     /// Contiguous **scanned** watermark from tip+1 upward (2-stage ready).
     fn recompute_ready_through(&mut self) {
         let mut h = self.tip.saturating_add(1);
@@ -1179,35 +788,12 @@ impl Inner {
             let Some(id) = fk.get() else {
                 return false;
             };
-            let Some(body) = self.by_body.get(&id) else {
+            // Outs present (or thin for coinbase-only).
+            if !self.outs.contains(id) && !self.thin_edges.contains_key(&id) {
                 return false;
-            };
-            let thin = self.thin_edges.get(&id);
-            for (i, inp) in body.inputs.iter().enumerate() {
-                if inp.is_coinbase()
-                    || (inp.prev_txid == [0u8; 32] && inp.prev_index == u32::MAX)
-                {
-                    continue;
-                }
-                let pid = thin
-                    .and_then(|t| t.get(i))
-                    .and_then(|e| e.create_fk)
-                    .or_else(|| inp.create_fk.get());
-                if pid.is_none() {
-                    return false; // unstamped create_fk
-                }
             }
         }
         true
-    }
-
-    /// Drop body_range entries not referenced by live cache bodies.
-    fn gc_body_ranges(&mut self) {
-        if self.body_range.is_empty() {
-            return;
-        }
-        self.body_range
-            .retain(|id, _| self.by_body.contains_key(id));
     }
 
 
@@ -1369,8 +955,7 @@ mod tests {
 
 
     #[test]
-    fn take_bodies_batch_records_lock_wait_counter() {
-        use crate::wave_fill_stats;
+    fn pin_batch_hits_out_fifo() {
         let c = ConfirmParentCache::new();
         c.advance_tip(0);
         let mut t = tx(1);
@@ -1379,7 +964,7 @@ mod tests {
             Fk(100),
             1,
             t,
-            vec![out(50)],
+            vec![out(50), out(60)],
             vec![InputRecord {
                 prev_txid: [0u8; 32],
                 create_fk: Fk::NULL,
@@ -1389,12 +974,10 @@ mod tests {
                 witness: vec![],
             }],
         );
-        let _ = wave_fill_stats::sample_io_and_reset();
-        let got = c.take_bodies_batch(&[Fk(100)]);
-        assert_eq!(got.len(), 1);
-        let (_store_ns, lock_ns) = wave_fill_stats::sample_io_and_reset();
-        // Lock wait is usually tiny but the counter path must execute.
-        let _ = lock_ns;
+        let need = [0u32, 1];
+        let hits = c.get_bodies_for_pin_batch(&[(100, &need)]);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits.get(&100).unwrap().2.len(), 2);
     }
 
 
@@ -1402,7 +985,7 @@ mod tests {
 
 
     #[test]
-    fn body_cache_survives_past_tip_in_lru() {
+    fn out_fifo_survives_past_tip() {
         let c = ConfirmParentCache::new();
         c.advance_tip(0);
         let t = tx(5);
@@ -1413,11 +996,9 @@ mod tests {
             vec![out(42)],
             vec![],
         );
-        assert!(c.get_body(Fk(50)).is_some());
+        // Full body API is outs-only — get_body always None.
+        assert!(c.get_body(Fk(50)).is_none());
         assert!(c.has_body(Fk(50)));
-        c.advance_tip(0);
-        assert!(c.get_body(Fk(50)).is_some());
-        // After tip past create height, body stays in confirmed LRU (default 1 GiB).
         c.advance_tip(1);
         assert!(c.has_body(Fk(50)));
         assert!(c.get_body_for_pin(Fk(50)).is_some());
@@ -1449,19 +1030,15 @@ mod tests {
             },
         ];
         c.put_body(Fk(90), 1, t.clone(), vec![out(1)], inputs);
-        let (txid, edges) = c.body_prevout_edges(Fk(90)).unwrap();
-        assert_eq!(txid, t.txid);
-        assert_eq!(edges.len(), 2);
-        assert_eq!(edges[0].0, Some(3));
-        assert_eq!(edges[0].1, [0u8; 32]); // soft zero when create_fk set
-        assert_eq!(edges[0].2, 1);
-        assert_eq!(edges[1].0, None);
-        assert_eq!(edges[1].2, u32::MAX);
+        // Full inputs not retained — thin rebuild re-decodes from store.
+        assert!(c.body_prevout_edges(Fk(90)).is_none());
+        assert!(c.has_body(Fk(90)));
+        assert!(c.get_parent_out(Fk(90), 0).is_some());
     }
 
 
     #[test]
-    fn body_create_resolves_from_by_body() {
+    fn body_create_resolves_from_out_fifo() {
         // Bodies-first: put_body only; get_parent_out/has_parent_out use body outs.
         let c = ConfirmParentCache::new();
         c.advance_tip(0);
@@ -1482,11 +1059,10 @@ mod tests {
     }
 
     #[test]
-    fn thin_inputs_stash_on_body() {
+    fn thin_inputs_stash_and_tip_drops_via_header_plan() {
         let c = ConfirmParentCache::new();
         c.advance_tip(0);
-        c.put_body(Fk(10), 1, tx(1), vec![out(1)], vec![]);
-        assert!(c.get_thin_inputs(Fk(10)).is_none());
+        c.put_header_plan(1, Fk(1), header_rec([1u8; 32]), vec![Fk(10)], [0u8; 32]);
         c.put_thin_inputs(
             Fk(10),
             vec![
@@ -1503,8 +1079,7 @@ mod tests {
         let edges = c.get_thin_inputs(Fk(10)).unwrap();
         assert_eq!(edges.len(), 2);
         assert_eq!(edges[1].create_fk, Some(99));
-        assert_eq!(edges[1].prev_index, 1);
-        // Dropped with body when tip advances past create height.
+        // Thin dropped when header plan for that height is tip-GC'd.
         c.advance_tip(1);
         assert!(c.get_thin_inputs(Fk(10)).is_none());
     }
@@ -1513,60 +1088,42 @@ mod tests {
 
 
     #[test]
-    fn take_bodies_batch_keeps_for_parent_lru() {
-        // Wave clones bodies; entries stay for post-confirm parent pin hits.
+    fn out_fifo_keeps_outs_across_tip_for_pin() {
         let c = ConfirmParentCache::new();
         c.advance_tip(0);
         let t1 = tx(1);
-        let t2 = tx(2);
         c.put_bodies_batch(vec![
             (Fk(1), 1, t1.clone(), vec![out(10)], vec![]),
-            (Fk(2), 1, t2.clone(), vec![out(20)], vec![]),
+            (Fk(2), 1, tx(2), vec![out(20)], vec![]),
         ]);
         c.put_body_range(Fk(1), 100, 50);
-        c.put_body_range(Fk(2), 200, 60);
-        let taken = c.take_bodies_batch(&[Fk(1), Fk(2), Fk(3)]);
-        assert_eq!(taken.len(), 2);
-        assert_eq!(taken.get(&1).unwrap().0.txid, t1.txid);
-        assert_eq!(taken.get(&2).unwrap().1[0].value, 20);
         assert!(c.has_body(Fk(1)));
-        assert!(c.has_body(Fk(2)));
-        assert_eq!(c.get_body_range(Fk(1)), Some((100, 50)));
-        // After tip past create height, bodies remain in LRU (default 1 GiB).
+        assert!(c.bodies_complete(&[Fk(1), Fk(2)]));
+        // Full body API empty (outs-only).
+        assert!(c.get_bodies_batch(&[Fk(1)]).is_empty());
+        // After tip past create, outs stay until FIFO capacity eviction.
         c.advance_tip(10);
         assert!(c.has_body(Fk(1)));
-        assert!(c.get_body_for_pin(Fk(2)).is_some());
+        let pin = c.get_body_for_pin(Fk(2)).expect("pin");
+        assert_eq!(pin.2[0].value, 20);
+        assert_eq!(c.get_body_range(Fk(1)), Some((100, 50)));
     }
 
     #[test]
-    fn body_lru_evicts_oldest_confirmed_under_tiny_cap() {
-        // Cap 0: legacy drop-at-tip (setter avoids process-env races with other tests).
+    fn out_fifo_cap_evicts_oldest_creates() {
         let c = ConfirmParentCache::new();
-        c.set_body_lru_cap_bytes(0);
+        c.set_out_fifo_cap(5); // max 5 outs
         c.advance_tip(0);
-        c.put_bodies_batch(vec![(Fk(1), 1, tx(1), vec![out(10)], vec![])]);
-        assert!(c.has_body(Fk(1)));
-        c.advance_tip(1);
-        assert!(
-            !c.has_body(Fk(1)),
-            "cap 0 must drop bodies at tip"
-        );
+        c.put_bodies_batch(vec![(Fk(1), 1, tx(1), vec![out(1), out(2), out(3)], vec![])]);
+        c.put_bodies_batch(vec![(Fk(2), 2, tx(2), vec![out(4), out(5), out(6)], vec![])]);
+        assert!(!c.has_body(Fk(1)), "oldest create evicted when over out cap");
+        assert!(c.has_body(Fk(2)));
+        let (n, total, cap, _) = c.body_lru_stats();
+        assert_eq!(n, 1);
+        assert_eq!(total, 3);
+        assert_eq!(cap, 5);
     }
 
-    #[test]
-    fn get_bodies_batch_keeps_cache_for_retry() {
-        // Worker-live confirm clones so a failed package can re-queue.
-        let c = ConfirmParentCache::new();
-        c.advance_tip(0);
-        let t1 = tx(1);
-        c.put_bodies_batch(vec![(Fk(1), 1, t1.clone(), vec![out(10)], vec![])]);
-        let got = c.get_bodies_batch(&[Fk(1)]);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got.get(&1).unwrap().0.txid, t1.txid);
-        assert!(c.has_body(Fk(1)));
-        assert!(c.bodies_complete(&[Fk(1)]));
-        assert!(!c.bodies_complete(&[Fk(1), Fk(2)]));
-    }
 
     #[test]
     fn take_thin_inputs_batch_moves() {
@@ -1633,93 +1190,22 @@ mod tests {
 
 
 
-    /// Synthetic pressure: many full bodies must leave RAM when tip catches up.
     #[test]
-    fn large_cache_bodies_do_not_accumulate_past_tip() {
+    fn out_fifo_bounds_total_outs() {
         let c = ConfirmParentCache::new();
+        c.set_out_fifo_cap(100);
         c.advance_tip(0);
-        // ~2k "txs" per height × 64 heights — enough to trip unbounded hold.
-        for h in 1u32..=64 {
-            c.ensure_plan(h, [h as u8; 32]);
-            for i in 0u32..32 {
-                let id = (h as u64) * 1000 + i as u64;
-                let mut t = tx((i & 0xff) as u8);
-                t.txid[0] = h as u8;
-                t.txid[1] = i as u8;
-                // Fat-ish scripts (mainnet-like weight on a small scale).
-                let outs = vec![out(50); 4];
-                let ins = vec![InputRecord {
-                    prev_txid: [0u8; 32],
-                    create_fk: Fk::NULL,
-                    prev_index: u32::MAX,
-                    sequence: 0xffff_ffff,
-                    script_sig: vec![0x51; 64],
-                    witness: vec![vec![0u8; 32]],
-                }];
-                c.put_body(Fk(id), h, t, outs, ins);
-            }
-            c.mark_scanned(h);
-        }
-        assert_eq!(c.body_count(), 64 * 32);
-        // Advance tip through all — bodies may remain in the confirmed LRU (≤ cap),
-        // not unbounded growth beyond the byte budget.
-        c.advance_tip(64);
-        let (n, lru_bytes, cap, deque_len) = c.body_lru_stats();
-        assert!(
-            lru_bytes <= cap || cap == 0,
-            "confirmed body LRU over budget: bytes={lru_bytes} cap={cap} n={n}"
-        );
-        // With default 1 GiB cap, 64×32 small synthetic bodies fit; still bounded.
-        assert!(n <= 64 * 32);
-        // Lazy deque must not grow unboundedly vs live map (runtime pin tax).
-        assert!(
-            deque_len <= n.saturating_mul(2).max(64),
-            "lazy body_lru deque too long: deque={deque_len} bodies={n}"
-        );
-    }
-
-    /// Many pin touches must not leave a multi×-bodies stamp queue; eviction with
-    /// runway mixed in must not full-scan the deque per pop.
-    #[test]
-    fn body_lru_touch_compacts_and_evict_skips_runway_without_all_scan() {
-        // Tiny cap: force eviction of confirmed while runway bodies stay.
-        let c = ConfirmParentCache::new();
-        c.set_body_lru_cap_bytes(1024 * 1024); // 1 MiB
-        c.advance_tip(0);
-        // Fat bodies so a few fill 1 MiB.
-        let fat_out = || {
-            vec![OutputRecord::unspent(1, vec![0x51; 8 * 1024]); 8]
-        };
-        // Confirmed-height bodies after tip advance.
-        for i in 0..40u64 {
+        for i in 0..50u64 {
             let mut t = tx((i & 0xff) as u8);
             t.txid[0] = i as u8;
-            c.put_body(Fk(i + 1), 1, t, fat_out(), vec![]);
+            // 4 outs each → 200 outs > 100 cap
+            c.put_body(Fk(i + 1), 1, t, vec![out(1); 4], vec![]);
         }
-        // Runway bodies (height 10 > tip).
-        for i in 0..20u64 {
-            let mut t = tx(((i + 40) & 0xff) as u8);
-            t.txid[0] = 0x80 | (i as u8);
-            c.put_body(Fk(1000 + i), 10, t, fat_out(), vec![]);
-        }
-        c.advance_tip(1); // confirmed set enters LRU budget; must stay ≤ cap
-        let (n, bytes, cap, _deque0) = c.body_lru_stats();
-        assert!(bytes <= cap, "over cap bytes={bytes} cap={cap} n={n}");
-        // Spam touches (lazy stamps) — must compact.
-        for _ in 0..200 {
-            for i in 0..20u64 {
-                let _ = c.get_body_for_pin(Fk(1000 + i)); // runway pin touches
-            }
-        }
-        let (n2, bytes2, cap2, deque2) = c.body_lru_stats();
-        assert!(bytes2 <= cap2);
-        assert!(
-            deque2 <= n2.saturating_mul(2).max(64),
-            "deque grew with touches: deque={deque2} bodies={n2}"
-        );
-        // Runway still present.
-        assert!(c.has_body(Fk(1000)));
+        let (n, total, cap, _) = c.body_lru_stats();
+        assert!(total <= cap, "total_outs={total} cap={cap} creates={n}");
+        assert!(n <= 25, "creates={n}");
     }
+
 
 
     /// Slim batch pin: only requested outs, one lock, coinbase hint; no full input clone.

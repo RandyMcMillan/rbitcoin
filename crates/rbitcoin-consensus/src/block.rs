@@ -582,10 +582,10 @@ fn assemble_block_prevouts_mode(
                     && !pending_creates.contains_key(&key)
                 {
                     let spent = if let Some(cfk) = prev_fk {
-                        let range = cache.get_body_range(cfk);
+                        // `None` range → store resolves via tx.idx.
                         query
                             .store()
-                            .has_confirmed_strong_spender_create(cfk, op.vout, range)
+                            .has_confirmed_strong_spender_create(cfk, op.vout, None)
                             .map_err(ConsensusError::Store)?
                     } else {
                         query
@@ -733,10 +733,9 @@ pub(crate) fn structural_validate_spends(
         }
         // Durable confirmed-strong spender (always re-check; pin is not authority).
         let spent = if !create_fk.is_null() {
-            let range = cache.get_body_range(create_fk);
             query
                 .store()
-                .has_confirmed_strong_spender_create(create_fk, vout, range)
+                .has_confirmed_strong_spender_create(create_fk, vout, None)
                 .map_err(ConsensusError::Store)?
         } else {
             query

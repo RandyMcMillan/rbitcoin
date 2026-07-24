@@ -868,20 +868,18 @@ impl Query {
 
     /// Spentness by known create fk (confirm pin path — no head probe).
     pub fn is_outpoint_spent_create(&self, create_fk: Fk, vout: u32) -> Result<bool, QueryError> {
-        let range = self.confirm_parents.get_body_range(create_fk);
         Ok(self
             .store
-            .has_confirmed_strong_spender_create(create_fk, vout, range)?)
+            .has_confirmed_strong_spender_create(create_fk, vout, None)?)
     }
 
-    /// Unspent subset of vouts on a create (batch; one body walk when ranged).
+    /// Unspent subset of vouts on a create (batch; store uses tx.idx when needed).
     pub fn unspent_create_vouts(
         &self,
         create_fk: Fk,
         vouts: &[u32],
     ) -> Result<Vec<u32>, QueryError> {
-        let range = self.confirm_parents.get_body_range(create_fk);
-        Ok(self.store.unspent_create_vouts(create_fk, vouts, range)?)
+        Ok(self.store.unspent_create_vouts(create_fk, vouts, None)?)
     }
 
     /// Enable/disable txid hash-head inserts on archive (default on). Off under

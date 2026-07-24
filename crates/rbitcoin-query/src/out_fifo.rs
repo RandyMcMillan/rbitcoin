@@ -86,7 +86,7 @@ impl OutFifo {
     /// Insert or replace. Replaces in place (no FIFO re-order). New creates go
     /// to the back; eviction pops the front until `total_outs + n ≤ cap`.
     ///
-    /// Returns create fks that were fully evicted (caller may drop `body_range`).
+    /// Returns create fks that were fully evicted.
     pub fn insert(&mut self, id: u64, entry: CreateOuts) -> Vec<u64> {
         let n = entry.outputs.len() as u64;
         if let Some(old) = self.by_fk.get_mut(&id) {

@@ -32,13 +32,7 @@ impl Query {
     ) -> Result<bool, QueryError> {
         let (meta, prevouts) = match body_range {
             Some((off, len)) => self.store.get_tx_meta_and_prevouts_at(off, len)?,
-            None => {
-                if let Some((off, len)) = self.confirm_parents.get_body_range(fk) {
-                    self.store.get_tx_meta_and_prevouts_at(off, len)?
-                } else {
-                    self.store.get_tx_meta_and_prevouts(fk)?
-                }
-            }
+            None => self.store.get_tx_meta_and_prevouts(fk)?,
         };
         if meta.input_count != 1 {
             return Ok(false);
@@ -68,16 +62,10 @@ impl Query {
         use crate::wave_fill_stats::{self as wf, add as wf_add, add_count as wf_count};
         let t0 = Instant::now();
         wf_count(&wf::BODY_STORE, 1);
-        // Prefer cache-held idx range (skip idx page fault).
-        let res = if let Some((off, len)) = self.confirm_parents.get_body_range(fk) {
-            let (tx, inputs, outs) = self.store.get_tx_full_at(off, len)?;
-            Ok((tx, outs, inputs))
-        } else {
-            let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
-            Ok((tx, outs, inputs))
-        };
+        // create_fk → body via tx.idx (no process-local range cache).
+        let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
         wf_add(&wf::BODY_STORE_NS, t0.elapsed().as_nanos() as u64);
-        res
+        Ok((tx, outs, inputs))
     }
 
     pub fn merkle_proof(

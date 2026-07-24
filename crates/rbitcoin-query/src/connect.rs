@@ -316,25 +316,14 @@ impl Query {
         tx_fk: Fk,
         out: &mut Vec<ScriptHashRecord>,
     ) -> Result<(), QueryError> {
-        // 1) Runway full body (cache / script stage).
-        if let Some((_tx, outputs, _ins)) = self.confirm_parents.get_body(tx_fk) {
+        // Outs-only FIFO when still warm (no full body / no range cache).
+        if let Some((_h, _tx, outputs, _ins)) = self.confirm_parents.get_body_for_pin(tx_fk) {
             for o in outputs.iter() {
                 out.push(ScriptHashRecord::from_fk(script_hash(&o.script), tx_fk));
             }
             return Ok(());
         }
-        // 2) Known body range → meta+outs only.
-        if let Some((off, len)) = self.confirm_parents.get_body_range(tx_fk) {
-            let (tx, outputs) = self.store.get_tx_meta_and_outputs_at(off, len)?;
-            if tx.output_count == 0 {
-                return Ok(());
-            }
-            for o in outputs.iter() {
-                out.push(ScriptHashRecord::from_fk(script_hash(&o.script), tx_fk));
-            }
-            return Ok(());
-        }
-        // 3) Cold store (idx + body) — should be rare on IBD write.
+        // Cold store: create_fk → tx.idx → body.
         let tx = self.get_tx_class_a(tx_fk)?;
         if tx.output_count == 0 {
             return Ok(());

@@ -449,14 +449,18 @@ impl Store {
         let metas: Vec<(u32, bool, Fk)> = match body_range {
             Some((off, len)) => self.txs.get_output_spender_metas_at(off, len, vouts)?,
             None => {
-                // No range: still prefer one body pin via per-vout meta (idx once
-                // each — rare when cache registers ranges).
-                let mut out = Vec::with_capacity(vouts.len());
-                for &v in vouts {
-                    let (multi, field) = self.txs.get_output_spender_meta(create_tx_fk, v)?;
-                    out.push((v, multi, field));
+                // Resolve create_fk → body via tx.idx once, then one packed walk.
+                if let Ok((off, len)) = self.txs.body_range(create_tx_fk) {
+                    self.txs.get_output_spender_metas_at(off, len, vouts)?
+                } else {
+                    let mut out = Vec::with_capacity(vouts.len());
+                    for &v in vouts {
+                        let (multi, field) =
+                            self.txs.get_output_spender_meta(create_tx_fk, v)?;
+                        out.push((v, multi, field));
+                    }
+                    out
                 }
-                out
             }
         };
         let mut unspent = Vec::with_capacity(metas.len());

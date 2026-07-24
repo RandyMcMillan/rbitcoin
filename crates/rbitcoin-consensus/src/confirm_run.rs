@@ -720,9 +720,8 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
     // Tip mode usually writes spends on archive; still safe if spend_index on.
     let t_spent = Instant::now();
     if query.spend_index_enabled() && query.index_mode().uses_durable_spends() {
-        // Prefer create_fk + body range — no tx.head; ranged path skips tx.idx.
-        // Resolve ranges once per unique create (cache or one idx probe), then
-        // annotate almost entirely via the ranged batch API.
+        // Prefer create_fk + body range from tx.idx (no process-local range cache).
+        // Resolve ranges once per unique create, then annotate via ranged batch.
         use std::collections::{HashMap, HashSet};
         let mut pending: Vec<(
             rbitcoin_primitives::Fk,
@@ -745,18 +744,11 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
         }
         let mut range_by_create: HashMap<u64, (u64, u64)> =
             HashMap::with_capacity(unique_creates.len());
-        let mut filled: Vec<(rbitcoin_primitives::Fk, u64, u64)> = Vec::new();
         for id in unique_creates {
             let fk = rbitcoin_primitives::Fk(id);
-            if let Some(r) = query.confirm_parent_cache().get_body_range(fk) {
+            if let Ok(r) = query.store().tx_body_range(fk) {
                 range_by_create.insert(id, r);
-            } else if let Ok(r) = query.store().tx_body_range(fk) {
-                range_by_create.insert(id, r);
-                filled.push((fk, r.0, r.1));
             }
-        }
-        if !filled.is_empty() {
-            query.confirm_parent_cache().put_body_ranges_batch(&filled);
         }
         let mut ranged: Vec<(
             rbitcoin_primitives::Fk,

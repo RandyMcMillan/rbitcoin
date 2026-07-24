@@ -1,10 +1,10 @@
 //! Block-structured **confirm parent cache**.
 //!
 //! Load-stage strategy (no background worker):
-//! - **RAM-cache** small lookups: header + `header_txs`, body ranges, thin edges.
+//! - **RAM-cache** small lookups: header + `header_txs`, thin edges.
 //! - **Create outs FIFO** ([`crate::out_fifo::OutFifo`]): tx meta + outputs only
 //!   for parent pin / prevout resolve (cap 2²⁴ outs by default). No full-body
-//!   inputs/witness; wire rebuild falls back to store (+ cached body range).
+//!   inputs/witness; wire rebuild and idx→body use store (`tx.idx` / `tx.body`).
 //! - Eviction is plain FIFO by create (oldest whole create dropped) — no tip
 //!   reaccount / full-map body scans.
 //!
@@ -67,8 +67,6 @@ struct Inner {
     headers: HashMap<u32, HeaderPlanCache>,
     /// hash → height for O(1) header resolve on confirm.
     hash_to_height: HashMap<[u8; 32], u32>,
-    /// fk id → absolute body (offset, len) from tx.idx.
-    body_range: HashMap<u64, (u64, u64)>,
 }
 
 /// Process-local confirm parent cache.
@@ -92,7 +90,6 @@ impl ConfirmParentCache {
                 thin_edges: HashMap::new(),
                 headers: HashMap::new(),
                 hash_to_height: HashMap::new(),
-                body_range: HashMap::new(),
             }),
             ready_cv: Condvar::new(),
             ready_through: AtomicU32::new(0),
@@ -203,37 +200,6 @@ impl ConfirmParentCache {
         g.headers.get(&h).map(|p| p.tx_fks.clone())
     }
 
-    /// Cache `tx.idx` body range for `fk`.
-    pub fn put_body_range(&self, fk: Fk, offset: u64, len: u64) {
-        let Some(id) = fk.get() else {
-            return;
-        };
-        self.inner
-            .lock()
-            .unwrap()
-            .body_range
-            .insert(id, (offset, len));
-    }
-
-    pub fn get_body_range(&self, fk: Fk) -> Option<(u64, u64)> {
-        let id = fk.get()?;
-        self.inner.lock().unwrap().body_range.get(&id).copied()
-    }
-
-    /// Batch body ranges under one lock.
-    pub fn put_body_ranges_batch(&self, items: &[(Fk, u64, u64)]) {
-        if items.is_empty() {
-            return;
-        }
-        let mut g = self.inner.lock().unwrap();
-        for &(fk, off, len) in items {
-            if let Some(id) = fk.get() {
-                g.body_range.insert(id, (off, len));
-            }
-        }
-    }
-
-
     /// Insert create outs into the FIFO (meta + outputs only; inputs used only for coinbase flag).
     pub fn put_body(
         &self,
@@ -248,7 +214,7 @@ impl ConfirmParentCache {
         };
         let is_coinbase = is_coinbase_inputs(&tx, &inputs);
         let mut g = self.inner.lock().unwrap();
-        let evicted = g.outs.insert(
+        let _ = g.outs.insert(
             id,
             CreateOuts {
                 height,
@@ -257,9 +223,6 @@ impl ConfirmParentCache {
                 is_coinbase,
             },
         );
-        for eid in evicted {
-            g.body_range.remove(&eid);
-        }
     }
 
     /// Many creates under **one** lock (load phase-1 finish). Moves ownership.
@@ -278,7 +241,7 @@ impl ConfirmParentCache {
                 continue;
             };
             let is_coinbase = is_coinbase_inputs(&tx, &inputs);
-            let evicted = g.outs.insert(
+            let _ = g.outs.insert(
                 id,
                 CreateOuts {
                     height,
@@ -287,9 +250,6 @@ impl ConfirmParentCache {
                     is_coinbase,
                 },
             );
-            for eid in evicted {
-                g.body_range.remove(&eid);
-            }
         }
     }
 
@@ -306,7 +266,7 @@ impl ConfirmParentCache {
     }
 
     /// Full Class A body is **not** retained (outs-only FIFO). Always `None`.
-    /// Wire rebuild uses store (+ [`Self::get_body_range`]).
+    /// Wire rebuild uses store (`tx.idx` → `tx.body`).
     pub fn get_body(
         &self,
         _fk: Fk,
@@ -366,20 +326,12 @@ impl ConfirmParentCache {
 
     /// Slim pin hits under **one** lock: only clone requested outs + tx meta.
     ///
-    /// Returns `id → (create_height, tx, outs, coinbase_hint, body_range)`.
+    /// Returns `id → (create_height, tx, outs, coinbase_hint)`.
+    /// Callers that need a packed body range use store `tx.idx` (`tx_body_range`).
     pub fn get_bodies_for_pin_batch(
         &self,
         items: &[(u64, &[u32])],
-    ) -> HashMap<
-        u64,
-        (
-            u32,
-            TxRecord,
-            Vec<(u32, OutputRecord)>,
-            Option<bool>,
-            Option<(u64, u64)>,
-        ),
-    > {
+    ) -> HashMap<u64, (u32, TxRecord, Vec<(u32, OutputRecord)>, Option<bool>)> {
         if items.is_empty() {
             return HashMap::new();
         }
@@ -403,8 +355,7 @@ impl ConfirmParentCache {
                 // 1-in non-cb or unknown — let caller resolve if needed
                 Some(false)
             };
-            let range = g.body_range.get(&id).copied();
-            out.insert(id, (e.height, e.tx.clone(), outs, cb_hint, range));
+            out.insert(id, (e.height, e.tx.clone(), outs, cb_hint));
         }
         out
     }
@@ -740,15 +691,6 @@ impl ConfirmParentCache {
     pub fn plan_count(&self) -> usize {
         self.inner.lock().unwrap().plans.len()
     }
-
-
-    /// Cached body-range entries (idx offsets for spent filter / annotate).
-    pub fn body_range_count(&self) -> usize {
-        self.inner.lock().unwrap().body_range.len()
-    }
-
-
-
 }
 
 impl Inner {
@@ -1004,8 +946,6 @@ mod tests {
         assert!(c.get_body_for_pin(Fk(50)).is_some());
     }
 
-    /// Parent pin body_range must not accumulate forever across tip advances.
-
     #[test]
     fn body_prevout_edges_prefers_create_fk_without_soft_txid() {
         let c = ConfirmParentCache::new();
@@ -1096,7 +1036,6 @@ mod tests {
             (Fk(1), 1, t1.clone(), vec![out(10)], vec![]),
             (Fk(2), 1, tx(2), vec![out(20)], vec![]),
         ]);
-        c.put_body_range(Fk(1), 100, 50);
         assert!(c.has_body(Fk(1)));
         assert!(c.bodies_complete(&[Fk(1), Fk(2)]));
         // Full body API empty (outs-only).
@@ -1106,7 +1045,6 @@ mod tests {
         assert!(c.has_body(Fk(1)));
         let pin = c.get_body_for_pin(Fk(2)).expect("pin");
         assert_eq!(pin.2[0].value, 20);
-        assert_eq!(c.get_body_range(Fk(1)), Some((100, 50)));
     }
 
     #[test]
@@ -1230,18 +1168,16 @@ mod tests {
             vec![out(10), out(20), out(30)],
             vec![coinbase_in],
         );
-        c.put_body_range(Fk(77), 1000, 64);
 
         let need = [0u32, 2];
         let mut hits = c.get_bodies_for_pin_batch(&[(77, &need)]);
-        let (h, txr, outs, cb, range) = hits.remove(&77).expect("hit");
+        let (h, txr, outs, cb) = hits.remove(&77).expect("hit");
         assert_eq!(h, 5);
         assert_eq!(txr.txid, t.txid);
         assert_eq!(outs.len(), 2);
         assert_eq!(outs[0].0, 0);
         assert_eq!(outs[1].0, 2);
         assert_eq!(cb, Some(true));
-        assert_eq!(range, Some((1000, 64)));
         // Spent-filtered pin lives on BatchParents (not shared by_fk).
         let mut bp = crate::BatchParents::new();
         bp.insert_owned(Fk(77), txr, outs, need.to_vec(), Some(Some(5)));

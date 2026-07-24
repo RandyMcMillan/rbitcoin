@@ -1011,12 +1011,22 @@ impl TxTable {
             best: Option<(u64, u8)>,
         }
 
-        let head = self.head.read().unwrap();
-        let bits = head.bits();
-        let entry_bytes = head.entry_bytes();
-        let head_fd = head.read_fd();
-        let head_pub = head.published_len();
-        let head_path = head.path_str();
+        // Snapshot head geometry + fd under a **brief** read lock, then drop.
+        // Holding `head.read()` for the whole batch starves `try_complete_head_resize`
+        // (`head.write()`), which leaves `tx.head` + `tx.head.new` both on disk and
+        // blocks the archive writer forever after shadow fill hits 100%.
+        // Linux keeps the old fd valid across rename, so mid-batch swap is safe for
+        // in-flight preads; new batches re-snapshot.
+        let (bits, entry_bytes, head_fd, head_pub, head_path) = {
+            let head = self.head.read().unwrap();
+            (
+                head.bits(),
+                head.entry_bytes(),
+                head.read_fd(),
+                head.published_len(),
+                head.path_str().to_path_buf(),
+            )
+        };
         let idx_fd = self.body.idx_read_fd();
         let body_fd = self.body.body_read_fd();
         let idx_path = self.body.idx_file_path();
@@ -1153,10 +1163,10 @@ impl TxTable {
                 for (ro, &(op_i, len)) in read_ops.iter().zip(spans.iter()) {
                     let op = &mut scheduled[op_i];
                     if ro.result < 0 {
-                        let path = match op.stage {
-                            Stage::Probe { .. } => head_path,
-                            Stage::Idx { .. } => idx_path,
-                            Stage::Body { .. } => body_path,
+                        let path: &std::path::Path = match op.stage {
+                            Stage::Probe { .. } => head_path.as_path(),
+                            Stage::Idx { .. } => idx_path.as_ref(),
+                            Stage::Body { .. } => body_path.as_ref(),
                         };
                         op.err = Some(StoreError::io(
                             path,
@@ -2319,17 +2329,99 @@ impl TxTable {
 
     /// Final catch-up under primary insert lock, then atomic rename swap.
     fn try_complete_head_resize(&self) -> Result<(), StoreError> {
-        // Exclusive: pause primary head inserts, catch up shadow, swap files.
-        let mut head_w = self.head.write().unwrap();
+        use std::time::{Duration, Instant};
+
+        rbitcoin_log::info!(
+            "store: tx.head resize fill done — final catch-up + swap (shadow → primary)"
+        );
+
+        // Phase 1: catch-up + flush **without** exclusive `head.write()` so we do
+        // not block forever behind long head-resolve batches (sole inserter is us).
+        {
+            let n = self.count();
+            let mut rg = self.resize.lock().unwrap();
+            let Some(r) = rg.as_mut() else {
+                return Ok(());
+            };
+            if r.cursor <= n {
+                let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(256);
+                for id in r.cursor..=n {
+                    let fk = Fk(id);
+                    let txid = self.body_txid(fk)?;
+                    batch.push((txid, fk));
+                    if batch.len() >= 256 {
+                        r.shadow.insert_many(&batch)?;
+                        batch.clear();
+                    }
+                }
+                if !batch.is_empty() {
+                    r.shadow.insert_many(&batch)?;
+                }
+                r.cursor = n + 1;
+            }
+            let n2 = self.count();
+            if r.cursor <= n2 {
+                let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(256);
+                for id in r.cursor..=n2 {
+                    let fk = Fk(id);
+                    let txid = self.body_txid(fk)?;
+                    batch.push((txid, fk));
+                    if batch.len() >= 256 {
+                        r.shadow.insert_many(&batch)?;
+                        batch.clear();
+                    }
+                }
+                if !batch.is_empty() {
+                    r.shadow.insert_many(&batch)?;
+                }
+                r.cursor = n2 + 1;
+            }
+            rbitcoin_log::info!(
+                "store: tx.head resize flushing shadow (cursor={}, n={})",
+                r.cursor.saturating_sub(1),
+                n2.max(n)
+            );
+            r.shadow.flush()?;
+        }
+
+        // Phase 2: exclusive head ownership for rename + reopen. Use try_write so
+        // we log while waiting (std RwLock write can starve under continuous reads).
+        rbitcoin_log::info!("store: tx.head resize acquiring exclusive head lock for swap…");
+        let t_lock = Instant::now();
+        let mut waited = 0u32;
+        let mut head_w = loop {
+            match self.head.try_write() {
+                Ok(g) => break g,
+                Err(_) => {
+                    waited = waited.saturating_add(1);
+                    if waited == 1 || waited % 40 == 0 {
+                        rbitcoin_log::warn!(
+                            "store: tx.head resize waiting for exclusive head lock \
+                             ({:?}; other threads still hold head.read)",
+                            t_lock.elapsed()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        if waited > 0 {
+            rbitcoin_log::info!(
+                "store: tx.head resize exclusive lock acquired after {:?}",
+                t_lock.elapsed()
+            );
+        }
+
         let primary_writes = head_w.lock_writes();
-        let n = self.count();
+        // One more catch-up under exclusive insert barrier.
+        let n3 = self.count();
         let mut rg = self.resize.lock().unwrap();
         let Some(r) = rg.as_mut() else {
             return Ok(());
         };
-        if r.cursor <= n {
+        if r.cursor <= n3 {
             let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(256);
-            for id in r.cursor..=n {
+            for id in r.cursor..=n3 {
                 let fk = Fk(id);
                 let txid = self.body_txid(fk)?;
                 batch.push((txid, fk));
@@ -2341,27 +2433,9 @@ impl TxTable {
             if !batch.is_empty() {
                 r.shadow.insert_many(&batch)?;
             }
-            r.cursor = n + 1;
+            r.cursor = n3 + 1;
+            r.shadow.flush()?;
         }
-        // Body may have grown if archive appends without head insert; re-check once.
-        let n2 = self.count();
-        if r.cursor <= n2 {
-            let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(256);
-            for id in r.cursor..=n2 {
-                let fk = Fk(id);
-                let txid = self.body_txid(fk)?;
-                batch.push((txid, fk));
-                if batch.len() >= 256 {
-                    r.shadow.insert_many(&batch)?;
-                    batch.clear();
-                }
-            }
-            if !batch.is_empty() {
-                r.shadow.insert_many(&batch)?;
-            }
-            r.cursor = n2 + 1;
-        }
-        r.shadow.flush()?;
         let target = r.target;
         let new_gen = head_w.generation().saturating_add(1);
         let shadow_path = shadow_head_path(&self.head_path);
@@ -2373,6 +2447,13 @@ impl TxTable {
         };
         drop(_shadow);
         drop(primary_writes);
+        drop(rg);
+
+        rbitcoin_log::info!(
+            "store: tx.head resize renaming shadow → primary (bits={} slots={})",
+            target.bits,
+            target.slots()
+        );
         // head_w still held — primary mmap open on old path; Linux allows rename.
         std::fs::rename(&self.head_path, &bak).map_err(|e| StoreError::io(&self.head_path, e))?;
         std::fs::rename(&shadow_path, &self.head_path)

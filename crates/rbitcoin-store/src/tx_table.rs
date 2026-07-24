@@ -1,7 +1,7 @@
 use crate::address_head::{
-    bak_head_path, clear_resize_control, load_needs_resize, load_ratio, read_resize_control,
-    shadow_head_path, write_head_meta, write_resize_control, AddressHead, HeadLayout,
-    ResizeControl, HEAD_LOAD_WARN, MAX_BITS,
+    bak_head_path, clear_resize_control, is_probe_exhausted_error, load_needs_resize,
+    load_ratio, read_resize_control, shadow_head_path, write_head_meta, write_resize_control,
+    AddressHead, HeadLayout, ResizeControl, HEAD_LOAD_WARN, MAX_BITS,
 };
 use crate::compact::{
     input_flags, output_flags, read_compact_size, read_uleb128, write_compact_size, write_uleb128,
@@ -1929,15 +1929,102 @@ impl TxTable {
     ///
     /// Sole writer: plain store empty→fk, call order, SeqCst fence after batch.
     /// **No body_txid** on insert. May start / advance sequential online resize.
+    ///
+    /// On open-address **probe exhaust**, blocks the writer and sleep-polls the
+    /// in-flight resize until the primary table is swapped wider, then retries
+    /// the batch (instead of killing the archive pipeline).
     pub fn head_insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if !entries.is_empty() {
-            self.head.read().unwrap().insert_many(entries)?;
+            self.head_insert_many_with_resize_retry(entries)?;
         }
         // After live inserts into primary only — never dual-write to shadow.
         self.maybe_start_head_resize()?;
         // Amortize sequential fill with archive batches (cooperative worker).
         self.head_resize_poll(8_192)?;
         Ok(())
+    }
+
+    /// Insert batch; if the primary probe chain is full, drive online resize to
+    /// completion (or progress) and retry.
+    fn head_insert_many_with_resize_retry(
+        &self,
+        entries: &[([u8; 32], Fk)],
+    ) -> Result<(), StoreError> {
+        use std::time::{Duration, Instant};
+
+        /// Aggressive shadow fill while the archive writer is blocked.
+        const RETRY_POLL_BUDGET: u64 = 65_536;
+        const SLEEP: Duration = Duration::from_millis(50);
+        /// Safety valve — operator can restart if resize is truly stuck.
+        const MAX_WAIT: Duration = Duration::from_secs(30 * 60);
+
+        let t0 = Instant::now();
+        let mut attempts = 0u32;
+        loop {
+            match self.head.read().unwrap().insert_many(entries) {
+                Ok(()) => return Ok(()),
+                Err(e) if is_probe_exhausted_error(&e) => {
+                    attempts = attempts.saturating_add(1);
+                    // Ensure a widen is running (force start even if under load
+                    // threshold — probe exhaust is a hard capacity signal).
+                    self.ensure_head_resize_for_probe_exhaust()?;
+                    let (cursor, n, target_bits, slots) = self.head_resize_progress();
+                    let (deep, exh) = crate::address_head::probe_depth_stats_snapshot();
+                    rbitcoin_log::warn!(
+                        "store: tx.head probe exhausted — sleep-retry while resize runs \
+                         (attempt={attempts} cursor={cursor}/{n} target_bits={target_bits} \
+                         slots_primary={slots} deep_probe_gt64={deep} exhaust_events={exh} \
+                         batch={} elapsed={:?})",
+                        entries.len(),
+                        t0.elapsed()
+                    );
+                    // Drive rebuild hard while the sole writer is waiting.
+                    self.head_resize_poll(RETRY_POLL_BUDGET)?;
+                    if t0.elapsed() > MAX_WAIT {
+                        rbitcoin_log::error!(
+                            "store: tx.head probe exhausted — resize did not free capacity \
+                             within {MAX_WAIT:?} (attempts={attempts} cursor={cursor}/{n})"
+                        );
+                        return Err(e);
+                    }
+                    // If resize finished this poll, retry immediately; else nap.
+                    if self.head_resize_in_progress() {
+                        std::thread::sleep(SLEEP);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// `(shadow_cursor, class_a_count, target_bits, primary_slots)` for logs.
+    fn head_resize_progress(&self) -> (u64, u64, u32, u64) {
+        let n = self.count();
+        let slots = self.head.read().unwrap().slots();
+        let g = self.resize.lock().unwrap();
+        match g.as_ref() {
+            Some(r) => (r.cursor, n, r.target.bits, slots),
+            None => (0, n, self.head.read().unwrap().bits(), slots),
+        }
+    }
+
+    /// Start a BITS+1 rebuild if none is running (probe-exhaust path).
+    fn ensure_head_resize_for_probe_exhaust(&self) -> Result<(), StoreError> {
+        if self.head_resize_in_progress() {
+            return Ok(());
+        }
+        let bits = self.head.read().unwrap().bits();
+        if bits >= MAX_BITS {
+            return Ok(());
+        }
+        let target = HeadLayout::new(bits + 1)?;
+        rbitcoin_log::warn!(
+            "store: tx.head probe exhausted — forcing resize start {}→{} bits (n={})",
+            bits,
+            target.bits,
+            self.count()
+        );
+        self.start_head_resize(target)
     }
 
     /// Same as [`Self::head_insert_many`] (sole-writer path is the only path).
@@ -2010,7 +2097,7 @@ impl TxTable {
     pub fn maybe_start_head_resize(&self) -> Result<(), StoreError> {
         {
             let rg = self.resize.lock().unwrap();
-            if rg.is_some() {
+            if let Some(r) = rg.as_ref() {
                 // Warn if primary load is high while resizing.
                 let (slots, n) = {
                     let h = self.head.read().unwrap();
@@ -2018,8 +2105,19 @@ impl TxTable {
                 };
                 let ratio = load_ratio(n, slots);
                 if ratio >= HEAD_LOAD_WARN {
+                    let pct = if n > 0 {
+                        100.0 * (r.cursor.saturating_sub(1) as f64) / (n as f64)
+                    } else {
+                        100.0
+                    };
+                    let (deep, exh) = crate::address_head::probe_depth_stats_snapshot();
                     rbitcoin_log::warn!(
-                        "store: tx.head resize lagging load={ratio:.3} n={n} slots={slots}"
+                        "store: tx.head resize lagging load={ratio:.3} n={n} slots={slots} \
+                         shadow_cursor={}/{} ({pct:.1}%) target_bits={} \
+                         deep_probe_gt64={deep} exhaust_events={exh}",
+                        r.cursor.saturating_sub(1),
+                        n,
+                        r.target.bits
                     );
                 }
                 return Ok(());
@@ -2069,13 +2167,17 @@ impl TxTable {
             generation: gen,
         };
         write_resize_control(&self.head_path, &ctrl)?;
+        let slots_old = self.head.read().unwrap().slots();
+        let n = self.count();
+        let load = load_ratio(n, slots_old);
         rbitcoin_log::info!(
-            "store: tx.head resize start {}→{} bits entry={}B n={} slots_old={}",
+            "store: tx.head resize start {}→{} bits entry={}B n={n} slots_old={slots_old} \
+             load={load:.3} slots_new={} (threshold={})",
             cur_bits,
             target.bits,
             target.entry_bytes,
-            self.count(),
-            self.head.read().unwrap().slots()
+            target.slots(),
+            crate::address_head::HEAD_LOAD_START
         );
         *rg = Some(HeadResize {
             shadow,
@@ -2094,6 +2196,7 @@ impl TxTable {
         }
         let n = self.count();
         let mut done_fill = false;
+        let mut progress_log: Option<(u64, u64, u32)> = None;
         {
             let mut rg = self.resize.lock().unwrap();
             let Some(r) = rg.as_mut() else {
@@ -2105,6 +2208,7 @@ impl TxTable {
             if n == 0 || r.cursor > n {
                 done_fill = true;
             } else {
+                let start = r.cursor;
                 let end = (r.cursor + budget - 1).min(n);
                 let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(256);
                 for id in r.cursor..=end {
@@ -2128,10 +2232,29 @@ impl TxTable {
                         generation: self.head.read().unwrap().generation(),
                     },
                 )?;
+                // Progress log every ~1M Class A fks advanced (or when finishing).
+                let advanced = r.cursor.saturating_sub(start);
+                let milestone = r.cursor > 1
+                    && (r.cursor / 1_000_000 > start.saturating_sub(1) / 1_000_000
+                        || r.cursor > n
+                        || advanced >= 1_000_000);
+                if milestone {
+                    progress_log = Some((r.cursor.saturating_sub(1), n, r.target.bits));
+                }
                 if r.cursor > n {
                     done_fill = true;
                 }
             }
+        }
+        if let Some((cur, total, bits)) = progress_log {
+            let pct = if total > 0 {
+                100.0 * (cur as f64) / (total as f64)
+            } else {
+                100.0
+            };
+            rbitcoin_log::info!(
+                "store: tx.head resize progress cursor={cur}/{total} ({pct:.1}%) target_bits={bits}"
+            );
         }
         if done_fill {
             self.try_complete_head_resize()?;
@@ -2525,7 +2648,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // 2^8 = 256 slots; trigger at ceil(0.80*256)=205.
+        // 2^8 = 256 slots; trigger at ceil(0.75*256)=192.
         std::env::set_var("RBITCOIN_TX_HEAD_BITS", "8");
         let t = TxTable::create(&dir).unwrap();
         assert_eq!(t.head_slots(), 256);
@@ -2552,7 +2675,7 @@ mod tests {
             let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
             (rec, inputs, outputs)
         };
-        for i in 1..=210u64 {
+        for i in 1..=200u64 {
             let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
         }
         // head_insert_many should have started resize; poll until done.
@@ -2565,7 +2688,7 @@ mod tests {
         }
         assert!(t.head_bits() >= 9, "bits={}", t.head_bits());
         // Spot-check resolves.
-        for i in [1u64, 100, 210] {
+        for i in [1u64, 100, 200] {
             let mut txid = [0u8; 32];
             txid[0..8].copy_from_slice(&i.to_le_bytes());
             assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)));

@@ -194,14 +194,14 @@ Keyless open-address table: **txid → dense create_fk**.
 
 ### Online sequential resize
 
-Trigger: `txs.count() / slots ≥ 0.80` (or probe exhaust).
+Trigger: `txs.count() / slots ≥ 0.75` (or probe exhaust → sleep-retry while resize runs).
 
 1. Create `tx.head.new` at `bits+1` (entry width from policy).
 2. Fill shadow **only** from dense Class A `fk = 1..=count` via `tx.idx` (deterministic order).
 3. Live archive inserts continue on **primary only** (no dual-write).
 4. Catch-up + brief exclusive insert lock → rename swap; control `tx.head.resize` for crash resume.
 
-**Capacity @ 0.80 load (approx):**  
+**Capacity @ 0.75 load (approx):**  
 28→215 M · 29→429 M · 30→859 M · 31→1.72 B · 32→3.44 B · 33→6.87 B (8 B) · 34→13.7 B.
 
 **Decision:** start small (28) and resize during IBD rather than one fixed 8 GiB 31-bit cliff; sequential rebuild keeps the archiver hot path free of dual-write.

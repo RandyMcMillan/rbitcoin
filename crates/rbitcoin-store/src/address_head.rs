@@ -25,7 +25,7 @@
 //!
 //! **Mainnet default:** BITS=28 → **1 GiB** sparse @ 4 B entries. Online resize
 //! widens BITS (sequential rebuild from `tx.idx`); entry width becomes 8 B at
-//! BITS ≥ 33. Load trigger: [`HEAD_LOAD_START`] (0.80).
+//! BITS ≥ 33. Load trigger: [`HEAD_LOAD_START`] (0.75).
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
@@ -38,6 +38,17 @@ use std::sync::Mutex;
 /// Hard cap — never scan the whole table.
 pub const MAX_PROBE: u32 = 128;
 
+/// Inserts that needed probe depth **> 64** (warning band; not yet exhausted).
+/// Sampled/reset by IBD / diagnostics; also rate-limited WARN on the first and
+/// every 10_000th event.
+static PROBE_INSERT_DEPTH_GT64: AtomicU64 = AtomicU64::new(0);
+
+/// Inserts that exhausted [`MAX_PROBE`] (should sleep-retry through resize).
+static PROBE_INSERT_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+
+/// Depth threshold above which inserts count as “deep” for ops visibility.
+pub const PROBE_DEPTH_WARN: u32 = 64;
+
 /// Mainnet address width (2^28 slots × 4 B = 1 GiB sparse). Online resize grows.
 pub const MAINNET_BITS: u32 = 28;
 /// Tiny / unit-test width.
@@ -48,11 +59,61 @@ pub const MAX_BITS: u32 = 34;
 pub const MIN_BITS: u32 = 8;
 
 /// Start sequential rebuild when `txs.count() / slots >=` this.
-pub const HEAD_LOAD_START: f64 = 0.80;
+pub const HEAD_LOAD_START: f64 = 0.75;
 /// Warn while resizing if load reaches this.
 pub const HEAD_LOAD_WARN: f64 = 0.85;
 /// Soft ceiling (align open-address 7/8); avoid dwelling here.
 pub const HEAD_LOAD_CEILING: f64 = 0.875;
+
+/// `(depth_gt64, probe_exhausted)` cumulative counters (no reset).
+#[inline]
+pub fn probe_depth_stats_snapshot() -> (u64, u64) {
+    (
+        PROBE_INSERT_DEPTH_GT64.load(Ordering::Relaxed),
+        PROBE_INSERT_EXHAUSTED.load(Ordering::Relaxed),
+    )
+}
+
+/// `(depth_gt64, probe_exhausted)` since last sample; both reset.
+pub fn sample_probe_depth_stats() -> (u64, u64) {
+    (
+        PROBE_INSERT_DEPTH_GT64.swap(0, Ordering::Relaxed),
+        PROBE_INSERT_EXHAUSTED.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// True when `err` is the sole-writer open-address insert failure (table full
+/// along the probe chain — wait for online resize, then retry).
+#[inline]
+pub fn is_probe_exhausted_error(err: &StoreError) -> bool {
+    matches!(
+        err,
+        StoreError::Corrupt(m) if *m == "address head probe exhausted on insert"
+    )
+}
+
+#[inline]
+fn note_probe_depth_on_insert(depth: u32) {
+    if depth <= PROBE_DEPTH_WARN {
+        return;
+    }
+    let n = PROBE_INSERT_DEPTH_GT64.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 10_000 == 0 {
+        rbitcoin_log::warn!(
+            "store: tx.head insert probe depth>{PROBE_DEPTH_WARN} (depth={depth} count={n})"
+        );
+    }
+}
+
+#[inline]
+fn note_probe_exhausted() {
+    let n = PROBE_INSERT_EXHAUSTED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 100 == 0 {
+        rbitcoin_log::warn!(
+            "store: tx.head insert probe exhausted (MAX_PROBE={MAX_PROBE} count={n})"
+        );
+    }
+}
 
 const META_MAGIC: &[u8; 4] = b"THM1";
 const META_VERSION: u16 = 1;
@@ -439,10 +500,12 @@ impl AddressHead {
             if e != 0 {
                 continue;
             }
+            note_probe_depth_on_insert(d);
             self.store_entry(slot, new_u)?;
             self.occupied.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
+        note_probe_exhausted();
         Err(StoreError::Corrupt("address head probe exhausted on insert"))
     }
 
@@ -663,12 +726,20 @@ mod tests {
     }
 
     #[test]
-    fn load_trigger_at_80_percent() {
+    fn load_trigger_at_75_percent() {
         let slots = 1024u64;
         let thr = ((slots as f64) * HEAD_LOAD_START).ceil() as u64;
+        assert_eq!(thr, 768); // ceil(0.75 * 1024)
         assert!(!load_needs_resize(thr - 1, slots));
         assert!(load_needs_resize(thr, slots));
         assert!(load_needs_resize(slots, slots));
+    }
+
+    #[test]
+    fn is_probe_exhausted_matches_insert_error() {
+        let e = StoreError::Corrupt("address head probe exhausted on insert");
+        assert!(is_probe_exhausted_error(&e));
+        assert!(!is_probe_exhausted_error(&StoreError::NotFound));
     }
 
     #[test]

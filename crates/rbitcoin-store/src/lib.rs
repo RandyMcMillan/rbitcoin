@@ -47,7 +47,9 @@ pub use sharded_hashhead::{
 };
 pub use header_table::HeaderRecord;
 pub use point_table::PointRecord;
-pub use scripthash::{script_hash, ScriptHashEntry, ScriptHashRecord, ScriptHashTable};
+pub use scripthash::{
+    script_hash, ScriptHashBulkSession, ScriptHashEntry, ScriptHashRecord, ScriptHashTable,
+};
 pub use scripthash_layout::ShHeadValue;
 pub use sorted_run::{
     claim_run_for_materialize, crc32, detach_run, for_each_merged_rec, list_materialize_claims,

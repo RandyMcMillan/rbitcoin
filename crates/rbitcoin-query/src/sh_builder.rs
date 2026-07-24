@@ -14,7 +14,8 @@ use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
     claim_run_for_materialize, for_each_merged_rec, list_materialize_claims, list_runs, merge_runs,
-    next_run_path, write_sorted_run, ScriptHashRecord, Store, StoreError, SortedRunPath,
+    next_run_path, write_sorted_run, ScriptHashEntry, ScriptHashRecord, Store, StoreError,
+    SortedRunPath,
 };
 // re-export for tests that claim runs
 use std::path::Path;
@@ -268,40 +269,16 @@ impl ShRunBuilder {
             claimed.len()
         );
         let t0 = Instant::now();
-        // Global sorted stream via k-way merge + hold-key at chunk borders so
-        // each scripthash is flushed complete (required for cold multi-batch).
-        const CHUNK: usize = 512_000;
-        let mut n_total = 0usize;
-        let mut unique_in = 0usize;
-        let mut flushed_chunks = 0u32;
-        let mut chunk: Vec<ScriptHashRecord> = Vec::with_capacity(CHUNK.min(1 << 20));
-
-        let flush_chunk = |chunk: &mut Vec<ScriptHashRecord>,
-                           n_total: &mut usize,
-                           unique_in: &mut usize,
-                           flushed_chunks: &mut u32|
-         -> Result<(), StoreError> {
-            if chunk.is_empty() {
-                return Ok(());
-            }
-            chunk.dedup_by(|a, b| {
-                a.scripthash == b.scripthash && a.create_tx_fk == b.create_tx_fk
-            });
-            *unique_in = unique_in.saturating_add(chunk.len());
-            let n = store.scripthash.bulk_load_sorted_creates_cold(chunk)?;
-            *n_total = n_total.saturating_add(n);
-            *flushed_chunks = flushed_chunks.saturating_add(1);
-            if *flushed_chunks == 1 || *flushed_chunks % 10 == 0 {
-                info!(
-                    "node: scripthash materialize progress chunks={} creates≈{} elapsed={:?}",
-                    *flushed_chunks,
-                    *n_total,
-                    t0.elapsed()
-                );
-            }
-            chunk.clear();
-            Ok(())
-        };
+        // One buffered bulk session (historical ScriptHashBulkBuilder): pre-size
+        // head, 16 MiB body buffer, 65k head insert batches, single alloc finish.
+        // Stream k-way merge into complete put_chain calls (key changes).
+        // expected_keys ≈ total creates (overestimate unique keys; reserve is cheap).
+        let mut session = store.scripthash.bulk_session(total_recs.max(1))?;
+        let mut cur_key: Option<[u8; 32]> = None;
+        let mut chain: Vec<ScriptHashEntry> = Vec::new();
+        let mut seen: Vec<Fk> = Vec::new();
+        let mut unique_in = 0u64;
+        let mut last_log_keys = 0u64;
 
         for_each_merged_rec(&claimed, |rec| {
             if rec.len() < SH_RUN_REC_LEN as usize {
@@ -311,55 +288,51 @@ impl ShRunBuilder {
             if tx_fk.is_null() {
                 return Ok(());
             }
-            chunk.push(ScriptHashRecord::from_fk(sh, tx_fk));
-            if chunk.len() < CHUNK {
-                return Ok(());
-            }
-            let last_sh = chunk.last().map(|r| r.scripthash);
-            let mut hold = Vec::new();
-            if let Some(sh) = last_sh {
-                while chunk.last().is_some_and(|r| r.scripthash == sh) {
-                    hold.push(chunk.pop().unwrap());
+            if cur_key != Some(sh) {
+                if let Some(prev) = cur_key.take() {
+                    if !chain.is_empty() {
+                        unique_in = unique_in.saturating_add(1);
+                        session.put_chain(prev, &chain)?;
+                        chain.clear();
+                        seen.clear();
+                        let keys = session.keys_written();
+                        if keys == 1 || keys.saturating_sub(last_log_keys) >= 100_000 {
+                            last_log_keys = keys;
+                            info!(
+                                "node: scripthash materialize progress keys≈{} creates≈{} elapsed={:?}",
+                                keys,
+                                session.creates_written(),
+                                t0.elapsed()
+                            );
+                        }
+                    }
                 }
+                cur_key = Some(sh);
             }
-            if chunk.is_empty() {
-                hold.reverse();
-                chunk.extend(hold);
-                flush_chunk(
-                    &mut chunk,
-                    &mut n_total,
-                    &mut unique_in,
-                    &mut flushed_chunks,
-                )?;
-            } else {
-                flush_chunk(
-                    &mut chunk,
-                    &mut n_total,
-                    &mut unique_in,
-                    &mut flushed_chunks,
-                )?;
-                hold.reverse();
-                chunk.extend(hold);
+            if !seen.iter().any(|&c| c == tx_fk) {
+                seen.push(tx_fk);
+                chain.push(ScriptHashEntry::new(tx_fk));
             }
             Ok(())
         })?;
-        flush_chunk(
-            &mut chunk,
-            &mut n_total,
-            &mut unique_in,
-            &mut flushed_chunks,
-        )?;
+        if let Some(prev) = cur_key.take() {
+            if !chain.is_empty() {
+                unique_in = unique_in.saturating_add(1);
+                session.put_chain(prev, &chain)?;
+            }
+        }
 
+        let (n_total, n_keys) = session.finish()?;
         store.scripthash.flush()?;
         for run in &claimed {
             let _ = std::fs::remove_file(&run.path);
         }
         clear_runs_dir(&runs_dir);
         info!(
-            "node: scripthash bulk materialize done creates≈{n_total} unique_in≈{unique_in} chunks={flushed_chunks} elapsed={:?}",
+            "node: scripthash bulk materialize done creates≈{n_total} keys≈{n_keys} unique_in≈{unique_in} elapsed={:?}",
             t0.elapsed()
         );
-        Ok(n_total as u64)
+        Ok(n_total)
     }
 }
 

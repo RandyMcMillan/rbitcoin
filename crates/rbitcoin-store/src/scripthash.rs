@@ -617,9 +617,9 @@ impl ScriptHashTable {
     /// batched `insert_many` for heads, **one** alloc-header write at the end.
     /// When non-empty: falls back to [`Self::put_create_batch_append`].
     ///
-    /// For multi-chunk **global** sorted streams (k-way materialize), use
-    /// [`Self::bulk_load_sorted_creates_cold`] after the first empty-table
-    /// call so later chunks do not fall back to the slow append path.
+    /// For tip materialize prefer [`Self::bulk_session`] + stream `put_chain`
+    /// (one session, buffered body/head). This one-shot API is for tests and
+    /// small batches.
     ///
     /// `recs` should be sorted by `scripthash` (as sorted-run materialize produces).
     pub fn bulk_load_sorted_creates(
@@ -637,14 +637,14 @@ impl ScriptHashTable {
         self.bulk_load_sorted_creates_cold(recs)
     }
 
-    /// Continue a cold materialize session: bump-alloc slabs + head insert for
-    /// **new** keys only (no durable head seed).
+    /// One-shot cold load of a scripthash-sorted batch via [`ScriptHashBulkSession`].
     ///
-    /// Safe only when each scripthash appears in a single contiguous batch and
-    /// is not already present (k-way merge stream + hold-key at chunk borders).
-    /// Never falls back to append. Callers must ensure the table starts empty
-    /// for the first batch; later batches in the same session are fine once
-    /// keys do not overlap.
+    /// Safe only when each scripthash appears in a single contiguous span and
+    /// is not already present. Never falls back to append.
+    ///
+    /// Production multi-run materialize should hold **one**
+    /// [`Self::bulk_session`] across the whole k-way stream instead of calling
+    /// this per chunk (avoids per-chunk alloc-header RMW and small body writes).
     pub fn bulk_load_sorted_creates_cold(
         &self,
         recs: &[ScriptHashRecord],
@@ -652,8 +652,6 @@ impl ScriptHashTable {
         if recs.is_empty() {
             return Ok(0);
         }
-
-        // Count unique keys for head reserve.
         let mut n_keys = 0u64;
         {
             let mut prev: Option<[u8; 32]> = None;
@@ -667,15 +665,130 @@ impl ScriptHashTable {
                 }
             }
         }
-        if n_keys > 0 {
-            self.head.reserve_additional(n_keys)?;
+        let mut session = self.bulk_session(n_keys)?;
+        let written = session.put_sorted_creates(recs)?;
+        session.finish()?;
+        Ok(written)
+    }
+
+    /// Start a buffered cold bulk session (historical migration builder path).
+    ///
+    /// Pre-sizes head for `expected_keys` (overestimate is fine). Continues
+    /// from the current alloc bump so a reinit'd empty table starts at the
+    /// payload origin. Exclusive: no concurrent SH readers/writers until
+    /// [`ScriptHashBulkSession::finish`].
+    pub fn bulk_session(&self, expected_keys: u64) -> Result<ScriptHashBulkSession<'_>, StoreError> {
+        if expected_keys > 0 {
+            self.head.reserve_additional(expected_keys)?;
         }
+        let (bump, live_count) = {
+            let a = self.alloc.lock().unwrap();
+            (a.bump, a.live_count)
+        };
+        Ok(ScriptHashBulkSession {
+            table: self,
+            bump,
+            live_count,
+            head_buf: Vec::with_capacity(BULK_HEAD_FLUSH.min(expected_keys as usize + 1)),
+            body_buf: Vec::with_capacity(BULK_BODY_FLUSH.min(4 << 20)),
+            body_write_off: bump,
+            finished: false,
+            keys_written: 0,
+        })
+    }
+}
 
-        const HEAD_FLUSH: usize = 65_536;
-        let mut head_buf: Vec<([u8; 32], ShHeadValue)> = Vec::with_capacity(HEAD_FLUSH);
+/// Buffered bulk writer for cold SH materialize (revived from migration
+/// `ScriptHashBulkBuilder`).
+///
+/// Streams complete per-key create chains via [`put_chain`], buffering body
+/// slabs (~16 MiB) and head inserts (65 536) before disk RMW. Call
+/// [`finish`] once at the end so the alloc header is written a single time.
+pub struct ScriptHashBulkSession<'a> {
+    table: &'a ScriptHashTable,
+    bump: u64,
+    live_count: u64,
+    head_buf: Vec<([u8; 32], ShHeadValue)>,
+    body_buf: Vec<u8>,
+    body_write_off: u64,
+    finished: bool,
+    keys_written: u64,
+}
+
+const BULK_HEAD_FLUSH: usize = 65_536;
+const BULK_BODY_FLUSH: usize = 16 * 1024 * 1024;
+
+impl<'a> ScriptHashBulkSession<'a> {
+    /// Creates written so far (sum of chain lengths, not unique keys).
+    pub fn creates_written(&self) -> u64 {
+        self.live_count
+    }
+
+    /// Unique keys packed so far.
+    pub fn keys_written(&self) -> u64 {
+        self.keys_written
+    }
+
+    /// Pack one key's live creates (oldest→newest). Empty chains are skipped.
+    pub fn put_chain(&mut self, key: [u8; 32], entries: &[ShEntry]) -> Result<(), StoreError> {
+        let n = entries.len() as u32;
+        if n == 0 {
+            return Ok(());
+        }
+        self.live_count = self.live_count.saturating_add(u64::from(n));
+        self.keys_written = self.keys_written.saturating_add(1);
+
+        let val = if n <= SH_INLINE_CAP as u32 {
+            if n == 1 {
+                ShHeadValue::inline_one(entries[0])
+            } else {
+                ShHeadValue::inline_two(entries[0], entries[1])
+            }
+        } else {
+            let class = class_for_count(n).ok_or(StoreError::Corrupt(
+                "scripthash bulk: entry count exceeds max slab class",
+            ))?;
+            let need = slab_bytes(class);
+            let off = self.bump;
+            self.bump = self.bump.saturating_add(need);
+            // Pad gap if body_buf is contiguous from body_write_off.
+            let pending_end = self.body_write_off + self.body_buf.len() as u64;
+            if pending_end < off {
+                // Should not happen with sequential bump alloc.
+                self.flush_body()?;
+            }
+            for e in entries {
+                self.body_buf.extend_from_slice(&e.encode());
+            }
+            // Zero-fill remainder of slab so freelist size classes stay aligned.
+            let live_bytes = entries.len() * SH_ENTRY_LEN;
+            let pad = need as usize - live_bytes;
+            if pad > 0 {
+                self.body_buf.resize(self.body_buf.len() + pad, 0);
+            }
+            if self.body_buf.len() >= BULK_BODY_FLUSH {
+                self.flush_body()?;
+            }
+            ShHeadValue::Slab {
+                class,
+                used: n,
+                slab_off: off,
+            }
+        };
+
+        self.head_buf.push((key, val));
+        if self.head_buf.len() >= BULK_HEAD_FLUSH {
+            self.flush_heads()?;
+        }
+        Ok(())
+    }
+
+    /// Group a scripthash-sorted record slice into chains and [`put_chain`] each.
+    ///
+    /// Dedups create_tx_fk within a key (first occurrence wins). Returns create
+    /// count written.
+    pub fn put_sorted_creates(&mut self, recs: &[ScriptHashRecord]) -> Result<usize, StoreError> {
         let mut written = 0usize;
-        let mut alloc = self.alloc.lock().unwrap();
-
         let mut i = 0usize;
         while i < recs.len() {
             if recs[i].create_tx_fk.is_null() {
@@ -699,53 +812,87 @@ impl ScriptHashTable {
             if live.is_empty() {
                 continue;
             }
-            let n = live.len() as u32;
             written = written.saturating_add(live.len());
-            alloc.live_count = alloc.live_count.saturating_add(u64::from(n));
-
-            let val = if n <= SH_INLINE_CAP as u32 {
-                if n == 1 {
-                    ShHeadValue::inline_one(live[0])
-                } else {
-                    ShHeadValue::inline_two(live[0], live[1])
-                }
-            } else {
-                let class = class_for_count(n).ok_or(StoreError::Corrupt(
-                    "scripthash bulk: entry count exceeds max slab class",
-                ))?;
-                let need = slab_bytes(class);
-                let off = alloc.bump;
-                alloc.bump = alloc.bump.saturating_add(need);
-                self.body.ensure_capacity(alloc.bump)?;
-                if alloc.bump > self.body.logical_len() {
-                    self.body.set_logical_len(alloc.bump)?;
-                }
-                let mut blob = Vec::with_capacity(need as usize);
-                for e in &live {
-                    blob.extend_from_slice(&e.encode());
-                }
-                blob.resize(need as usize, 0);
-                self.body.write_at(off, &blob)?;
-                ShHeadValue::Slab {
-                    class,
-                    used: n,
-                    slab_off: off,
-                }
-            };
-            head_buf.push((key, val));
-            if head_buf.len() >= HEAD_FLUSH {
-                self.head.insert_many_sharded(&head_buf, true)?;
-                head_buf.clear();
-            }
+            self.put_chain(key, &live)?;
         }
-        if !head_buf.is_empty() {
-            self.head.insert_many_sharded(&head_buf, true)?;
-        }
-        write_alloc_header(&self.body, &alloc)?;
-        drop(alloc);
         Ok(written)
     }
 
+    fn ensure_body_capacity(&self, need: u64) -> Result<(), StoreError> {
+        self.table.body.ensure_capacity(need)?;
+        if need > self.table.body.logical_len() {
+            self.table.body.set_logical_len(need)?;
+        }
+        Ok(())
+    }
+
+    fn flush_body(&mut self) -> Result<(), StoreError> {
+        if self.body_buf.is_empty() {
+            return Ok(());
+        }
+        let end = self.body_write_off + self.body_buf.len() as u64;
+        self.ensure_body_capacity(end)?;
+        self.table
+            .body
+            .write_at(self.body_write_off, &self.body_buf)?;
+        self.body_write_off = end;
+        self.body_buf.clear();
+        Ok(())
+    }
+
+    fn flush_heads(&mut self) -> Result<(), StoreError> {
+        if self.head_buf.is_empty() {
+            return Ok(());
+        }
+        // No per-shard flush during bulk: keep dirty pages and rely on
+        // finish / table.flush. Matches historical migration builder.
+        self.table
+            .head
+            .insert_many_sharded(&self.head_buf, false)?;
+        self.head_buf.clear();
+        Ok(())
+    }
+
+    /// Flush body + heads + alloc header. Marks the session finished.
+    pub fn finish(mut self) -> Result<(u64, u64), StoreError> {
+        self.flush_body()?;
+        self.flush_heads()?;
+        if self.bump > self.table.body.logical_len() {
+            self.table.body.set_logical_len(self.bump)?;
+        }
+        let state = AllocState {
+            live_count: self.live_count,
+            bump: self.bump,
+            free_head: [0; SH_MAX_CLASS as usize + 1],
+        };
+        write_alloc_header(&self.table.body, &state)?;
+        *self.table.alloc.lock().unwrap() = state;
+        self.finished = true;
+        Ok((self.live_count, self.keys_written))
+    }
+}
+
+impl Drop for ScriptHashBulkSession<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // Best-effort publish of partial state so reinit/entry_count stay honest.
+        let _ = self.flush_body();
+        let _ = self.flush_heads();
+        if self.bump > self.table.body.logical_len() {
+            let _ = self.table.body.set_logical_len(self.bump);
+        }
+        let state = AllocState {
+            live_count: self.live_count,
+            bump: self.bump,
+            free_head: [0; SH_MAX_CLASS as usize + 1],
+        };
+        let _ = write_alloc_header(&self.table.body, &state);
+        if let Ok(mut g) = self.table.alloc.lock() {
+            *g = state;
+        }
+    }
 }
 
 fn write_alloc_header(body: &TableFile, state: &AllocState) -> Result<(), StoreError> {
@@ -1033,6 +1180,60 @@ mod tests {
             _ => panic!("slab"),
         };
         assert_eq!(off1, off2, "class-0 freelist should reuse offset");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bulk_session_put_chain_roundtrip() {
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let mut session = t.bulk_session(100).unwrap();
+        // Many distinct keys, mix of inline and slab.
+        for i in 0..50u32 {
+            let mut sh = [0u8; 32];
+            sh[0] = i as u8;
+            sh[1] = 0xab;
+            let n = if i % 5 == 0 { 8 } else { 1 + (i % 2) };
+            let ents: Vec<_> = (0..n)
+                .map(|j| ShEntry::new(Fk(u64::from(i) * 100 + u64::from(j) + 1)))
+                .collect();
+            session.put_chain(sh, &ents).unwrap();
+        }
+        let (creates, keys) = session.finish().unwrap();
+        assert_eq!(keys, 50);
+        assert_eq!(creates, t.entry_count());
+        assert!(creates > 50);
+        // Spot-check a slab key (i=0 → 8 creates).
+        let mut sh0 = [0u8; 32];
+        sh0[1] = 0xab;
+        assert_eq!(t.entries(&sh0).unwrap().len(), 8);
+        // Spot-check inline.
+        let mut sh1 = [0u8; 32];
+        sh1[0] = 1;
+        sh1[1] = 0xab;
+        assert_eq!(t.entries(&sh1).unwrap().len(), 2);
+        t.flush().unwrap();
+        let t2 = ScriptHashTable::open(&dir).unwrap();
+        assert_eq!(t2.entry_count(), creates);
+        assert_eq!(t2.entries(&sh0).unwrap().len(), 8);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bulk_session_put_sorted_creates_dedups() {
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let sh = script_hash(&[0x99]);
+        let recs = vec![
+            rec(sh, 1, 0),
+            rec(sh, 1, 0), // dup
+            rec(sh, 2, 0),
+            rec(sh, 3, 0),
+        ];
+        let n = t.bulk_load_sorted_creates_cold(&recs).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(t.entries(&sh).unwrap().len(), 3);
+        assert_eq!(t.entry_count(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

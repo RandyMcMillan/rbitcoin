@@ -18,11 +18,15 @@ use rbitcoin_store::{
     StoreError, SortedRunPath,
 };
 // re-export for tests that claim runs
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// Linear dedup is fine for short chains; switch to a set past this length.
+const CHAIN_SET_THRESHOLD: usize = 16;
 
 /// Fixed run record: scripthash[32] | create_tx_fk:u64 = 40 bytes (no vout).
 pub const SH_RUN_REC_LEN: u32 = 40;
@@ -51,14 +55,19 @@ fn encode_rec(sh: &[u8; 32], tx_fk: Fk) -> [u8; SH_RUN_REC_LEN as usize] {
     r
 }
 
-fn decode_rec(buf: &[u8]) -> Result<([u8; 32], Fk), StoreError> {
-    if buf.len() < SH_RUN_REC_LEN as usize {
-        return Err(StoreError::Corrupt("sh run short record"));
-    }
-    let mut sh = [0u8; 32];
-    sh.copy_from_slice(&buf[0..32]);
+/// Fast path: caller guarantees `buf.len() >= 40` (merge cursor / fixed runs).
+#[inline(always)]
+fn decode_rec_fixed(buf: &[u8]) -> ([u8; 32], Fk) {
+    debug_assert!(buf.len() >= SH_RUN_REC_LEN as usize);
+    let sh: [u8; 32] = buf[0..32].try_into().unwrap();
     let tx_fk = Fk(u64::from_le_bytes(buf[32..40].try_into().unwrap()));
-    Ok((sh, tx_fk))
+    (sh, tx_fk)
+}
+
+/// True if `fk` is already in the chain (linear for short; typical creates/key is small).
+#[inline]
+fn chain_has_fk(chain: &[ScriptHashEntry], fk: Fk) -> bool {
+    chain.iter().any(|e| e.create_tx_fk == fk)
 }
 
 struct Inner {
@@ -297,30 +306,32 @@ impl ShRunBuilder {
         let n_shards = store.scripthash.head_shard_count();
         let mut session = store.scripthash.bulk_session(total_recs.max(1))?;
         let mut cur_key: Option<[u8; 32]> = None;
-        let mut chain: Vec<ScriptHashEntry> = Vec::new();
-        let mut seen: Vec<Fk> = Vec::new();
+        // Reused across keys; most keys have 1–2 creates.
+        let mut chain: Vec<ScriptHashEntry> = Vec::with_capacity(8);
+        // Hot scripts with long histories: O(1) dedup after threshold.
+        let mut long_seen: Option<HashSet<u64>> = None;
         let mut unique_in = 0u64;
         let mut last_log_keys = 0u64;
         let mut last_shards = 0u32;
 
         let t_stream = Instant::now();
-        // Trust claim/MANIFEST CRCs — skip full-body re-verify on open (big win
-        // with many runs). Still detects short reads via read_exact.
+        // Trust claim/MANIFEST CRCs — skip full-body re-verify on open.
+        // Cursor uses 256 KiB block reads (not per-rec syscalls).
         for_each_merged_rec_opts(&claimed, false, |rec| {
             if rec.len() < SH_RUN_REC_LEN as usize {
                 return Err(StoreError::Corrupt("sh run short record in merge stream"));
             }
-            let (sh, tx_fk) = decode_rec(rec)?;
+            let (sh, tx_fk) = decode_rec_fixed(rec);
             if tx_fk.is_null() {
                 return Ok(());
             }
             if cur_key != Some(sh) {
-                if let Some(prev) = cur_key.take() {
+                if let Some(prev) = cur_key {
                     if !chain.is_empty() {
                         unique_in = unique_in.saturating_add(1);
                         session.put_chain(prev, &chain)?;
                         chain.clear();
-                        seen.clear();
+                        long_seen = None;
                         let keys = session.keys_written();
                         let shards = session.shards_flushed();
                         if keys == 1
@@ -343,9 +354,22 @@ impl ShRunBuilder {
                 }
                 cur_key = Some(sh);
             }
-            if !seen.iter().any(|&c| c == tx_fk) {
-                seen.push(tx_fk);
+            let is_dup = if let Some(ref set) = long_seen {
+                set.contains(&tx_fk.0)
+            } else {
+                chain_has_fk(&chain, tx_fk)
+            };
+            if !is_dup {
                 chain.push(ScriptHashEntry::new(tx_fk));
+                if let Some(ref mut set) = long_seen {
+                    set.insert(tx_fk.0);
+                } else if chain.len() >= CHAIN_SET_THRESHOLD {
+                    let mut set = HashSet::with_capacity(chain.len() * 2);
+                    for e in &chain {
+                        set.insert(e.create_tx_fk.0);
+                    }
+                    long_seen = Some(set);
+                }
             }
             Ok(())
         })?;

@@ -530,14 +530,27 @@ pub fn lookup_key(run: &SortedRunPath, key: &[u8]) -> Result<Option<Vec<u8>>, St
 
 // ── Merge ───────────────────────────────────────────────────────────────────
 
-/// Streaming cursor over a run (for merge). Record bytes live in `buf` only —
-/// no per-record heap clone.
+/// Read-ahead page for merge cursors (~256 KiB; many fixed-width records).
+const RUN_CURSOR_PAGE: usize = 256 * 1024;
+
+/// Streaming cursor over a run (for merge).
+///
+/// Records are served from a block buffer (no per-record heap clone, no 40 B
+/// `read_exact` syscall). [`rec`] is a slice into the page, valid until the
+/// next [`fill_next`].
 struct RunCursor {
     file: File,
     path: PathBuf,
     remaining: u64,
-    /// Fixed-width current record (valid after successful [`fill_next`]).
-    buf: Vec<u8>,
+    rec_len: usize,
+    /// Read-ahead page; current record is `page[cur..cur+rec_len]`.
+    page: Vec<u8>,
+    /// Valid byte length of `page`.
+    page_len: usize,
+    /// Start of current record within `page` (set by last successful fill).
+    cur: usize,
+    /// Next unread byte in `page` (after current record).
+    next: usize,
 }
 
 impl RunCursor {
@@ -545,32 +558,73 @@ impl RunCursor {
         if verify {
             verify_run_body(run)?;
         }
+        let rec_len = run.rec_len as usize;
+        if rec_len == 0 {
+            return Err(StoreError::Corrupt("sorted run: zero rec_len"));
+        }
         let mut file = File::open(&run.path).map_err(|e| io_err(&run.path, e))?;
         file.seek(SeekFrom::Start(HEADER_LEN as u64))
             .map_err(|e| io_err(&run.path, e))?;
+        let page_cap = RUN_CURSOR_PAGE
+            .max(rec_len)
+            .div_ceil(rec_len)
+            .saturating_mul(rec_len);
         Ok(Self {
             file,
             path: run.path.clone(),
             remaining: run.count,
-            buf: vec![0u8; run.rec_len as usize],
+            rec_len,
+            page: vec![0u8; page_cap],
+            page_len: 0,
+            cur: 0,
+            next: 0,
         })
     }
 
-    /// Read next record into `buf`. Returns false at EOF.
+    /// Pull more bytes from the file into `page` (preserving any leftover).
+    fn refill(&mut self) -> Result<(), StoreError> {
+        let leftover = self.page_len.saturating_sub(self.next);
+        if leftover > 0 && self.next > 0 {
+            self.page.copy_within(self.next..self.page_len, 0);
+        }
+        self.page_len = leftover;
+        self.next = 0;
+        self.cur = 0;
+        let space = self.page.len().saturating_sub(self.page_len);
+        let max_from_file = (self.remaining as usize).saturating_mul(self.rec_len);
+        // Only pull whole records.
+        let to_read = (space.min(max_from_file) / self.rec_len).saturating_mul(self.rec_len);
+        if to_read == 0 {
+            return Ok(());
+        }
+        let start = self.page_len;
+        self.file
+            .read_exact(&mut self.page[start..start + to_read])
+            .map_err(|e| io_err(&self.path, e))?;
+        self.page_len = start + to_read;
+        Ok(())
+    }
+
+    /// Advance to the next record. Returns false at EOF.
     fn fill_next(&mut self) -> Result<bool, StoreError> {
         if self.remaining == 0 {
             return Ok(false);
         }
-        self.file
-            .read_exact(&mut self.buf)
-            .map_err(|e| io_err(&self.path, e))?;
+        if self.next + self.rec_len > self.page_len {
+            self.refill()?;
+            if self.next + self.rec_len > self.page_len {
+                return Err(StoreError::Corrupt("sorted run: short read on merge cursor"));
+            }
+        }
+        self.cur = self.next;
+        self.next += self.rec_len;
         self.remaining -= 1;
         Ok(true)
     }
 
     #[inline]
     fn rec(&self) -> &[u8] {
-        &self.buf
+        &self.page[self.cur..self.cur + self.rec_len]
     }
 }
 

@@ -71,62 +71,6 @@ pub fn confirm_mlock_from_env() -> bool {
     }
 }
 
-/// Default grace heights added past last known need when stamping `keep_until`.
-///
-/// Cross-batch re-spends of the same parent are common; with empty conf_q load
-/// depth, tip GC would otherwise drop `by_fk` before the next load sees them.
-/// `256` ≈ 8 × 32-blk batches. `RBITCOIN_CONFIRM_PIN_KEEP_GRACE=0` = strict
-/// (need+1 exclusive only).
-pub const DEFAULT_PIN_KEEP_GRACE: u32 = 256;
-
-/// `RBITCOIN_CONFIRM_PIN_KEEP_GRACE` (default [`DEFAULT_PIN_KEEP_GRACE`]).
-pub fn pin_keep_grace_from_env() -> u32 {
-    std::env::var("RBITCOIN_CONFIRM_PIN_KEEP_GRACE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_PIN_KEEP_GRACE)
-}
-
-/// Exclusive retention end: drop when `tip >= keep_until`.
-///
-/// `need + 1` keeps the entry through tip == need (write just finished that
-/// height); `+ grace` covers unknown future re-spends without load queue depth.
-#[inline]
-pub fn pin_keep_until_for(need_height: u32, grace: u32) -> u32 {
-    need_height
-        .saturating_add(1)
-        .saturating_add(grace)
-}
-
-/// One needed prevout under a parent create.
-#[derive(Debug, Clone)]
-pub struct ParentOut {
-    pub output: OutputRecord,
-}
-
-/// Parent create row held for the parent cache.
-#[derive(Debug, Clone)]
-pub struct ParentEntry {
-    pub tx: TxRecord,
-    /// Live (unspent) needed vouts → output. Spent vouts are omitted.
-    pub outs: HashMap<u32, ParentOut>,
-    /// Vouts that cache fully resolved (spent-filtered). When all requested
-    /// vouts are in this set, wave can skip store decode + spent re-check.
-    pub checked: HashSet<u32>,
-    /// Coinbase maturity height resolved at cache (wave skips body re-walk).
-    ///
-    /// - `None` = not resolved yet
-    /// - `Some(None)` = not a coinbase
-    /// - `Some(Some(h))` = coinbase created at height `h`
-    pub coinbase_height: Option<Option<u32>>,
-    /// Height of the parent cache body that registered this create (`None` = UTXO load).
-    pub create_height: Option<u32>,
-    /// Exclusive end height for tip GC retention: keep while `keep_until > tip`
-    /// even if plan.need_fk was dropped. Stamped as `need + 1 + pin_keep_grace`
-    /// so empty conf_q / cross-batch re-spends still hit `pin_cached`.
-    pub keep_until: u32,
-}
-
 /// Thin create-fk edge (identical to wave [`crate::wave_prevout::ThinInput`]).
 pub type StashedThinInput = crate::wave_prevout::ThinInput;
 
@@ -156,36 +100,6 @@ pub struct HeaderPlanCache {
     /// Previous block hash (zeros at genesis). Filled at cache so wire rebuild
     /// never `store.get_header(prev_fk)`.
     pub prev_hash: [u8; 32],
-}
-
-/// Per-parent result from [`ConfirmParentCache::prepare_pin_batch`].
-#[derive(Debug)]
-pub enum PinPrepareKind {
-    /// `by_fk` already spent-filtered for all need vouts — touch only.
-    Covered,
-    /// Body-LRU hit: slim outs + meta for pin_cache path.
-    Body {
-        create_h: u32,
-        tx: TxRecord,
-        outs: Vec<(u32, OutputRecord)>,
-        /// `Some(true)` coinbase, `Some(false)` not, `None` ambiguous 1-in.
-        cb_hint: Option<bool>,
-        range: Option<(u64, u64)>,
-        /// Need vouts already in `by_fk.checked` (skip durable spent re-check).
-        already_checked: Vec<u32>,
-    },
-    /// No body in cache — pin_new store path.
-    Miss {
-        already_checked: Vec<u32>,
-    },
-}
-
-/// Batch result for [`ConfirmParentCache::prepare_pin_batch`].
-#[derive(Debug)]
-pub struct PinPrepareBatch {
-    pub kinds: Vec<PinPrepareKind>,
-    pub miss_no_fk: u32,
-    pub miss_partial: u32,
 }
 
 /// Per-height plan: what prevouts block `height` needs.
@@ -229,8 +143,6 @@ struct Inner {
     ready_through: u32,
     /// height → plan
     plans: BTreeMap<u32, HeightPlan>,
-    /// Parent bodies keyed by create fk id (optional; tests / legacy).
-    by_fk: HashMap<u64, ParentEntry>,
     /// Full decoded bodies by create fk (runway + post-confirm LRU).
     by_body: HashMap<u64, BodyEntry>,
     /// Total `BodyEntry::size_bytes` for entries with `height ≤ tip` (LRU budget).
@@ -256,8 +168,6 @@ struct Inner {
     page_refs: HashMap<(u8, u64), u32>,
     /// How many distinct ranges currently held (perf).
     mlock_n: usize,
-    /// Heights past last known need retained in `by_fk` (see `pin_keep_until_for`).
-    pin_keep_grace: u32,
 }
 
 /// Process-local confirm parent cache.
@@ -277,7 +187,6 @@ impl ConfirmParentCache {
                 tip: 0,
                 ready_through: 0,
                 plans: BTreeMap::new(),
-                by_fk: HashMap::new(),
                 by_body: HashMap::new(),
                 body_lru_bytes: 0,
                 body_lru_cap: body_lru_cap_bytes_from_env(),
@@ -291,7 +200,6 @@ impl ConfirmParentCache {
                 mlocked: HashMap::new(),
                 page_refs: HashMap::new(),
                 mlock_n: 0,
-                pin_keep_grace: pin_keep_grace_from_env(),
             }),
             ready_cv: Condvar::new(),
             ready_through: AtomicU32::new(0),
@@ -300,16 +208,6 @@ impl ConfirmParentCache {
 
     pub fn from_env() -> Self {
         Self::new()
-    }
-
-    /// Override pin keep-alive grace (tests / ops). Default from env at `new`.
-    pub fn set_pin_keep_grace(&self, grace: u32) {
-        self.inner.lock().unwrap().pin_keep_grace = grace;
-    }
-
-    /// Current pin keep-alive grace heights.
-    pub fn pin_keep_grace(&self) -> u32 {
-        self.inner.lock().unwrap().pin_keep_grace
     }
 
     /// Override confirmed-body LRU byte cap (tests). `0` = drop bodies at tip.
@@ -441,8 +339,7 @@ impl ConfirmParentCache {
                 }
             }
         }
-        g.gc_orphaned_parents();
-        // Drop body_range not tied to live cache bodies or parent pins.
+        // Drop body_range not tied to live cache bodies.
         g.gc_body_ranges();
         // Munlock when no remaining need_height > tip (write done for those heights).
         let unlocks = g.gc_mlocks(tip);
@@ -688,10 +585,8 @@ impl ConfirmParentCache {
 
     /// Phase-1 hot path: body only (creates are the body outs).
     ///
-    /// Does **not** clone every output into `by_fk` — that doubled RAM/CPU on
-    /// mainnet (~all scripts twice). Wave/cache resolve cache creates via
-    /// [`Self::get_parent_out`] body fallback. Sparse `by_fk` is only for
-    /// external UTXO parents and legacy reserve waiters.
+    /// Sparse spent-filtered parents live on per-batch [`crate::BatchParents`].
+    /// Creates resolve via body outs / thin edges.
     pub fn put_body_and_creates(
         &self,
         fk: Fk,
@@ -705,8 +600,8 @@ impl ConfirmParentCache {
         };
         let mut g = self.inner.lock().unwrap();
         let txid = tx.txid;
-        // Rare reserve waiters: copy only waited-for outs into by_fk.
-        g.fill_reserve_waiters_from_body(id, txid, height, &tx, &outputs);
+        // Resolve legacy reserve waiters into plan.need_fk (no sparse by_fk map).
+        g.fill_reserve_waiters_from_body(id, txid, height, outputs.len() as u32);
         g.insert_body(id, height, tx, outputs, inputs);
     }
 
@@ -1168,112 +1063,10 @@ impl ConfirmParentCache {
         }
     }
 
-    /// Register a UTXO-backed parent out for `height`.
-    ///
-    /// Does not recompute ready watermark (plan is still unscanned until
-    /// [`Self::mark_scanned`]).
-    pub fn put_utxo_parent(
-        &self,
-        height: u32,
-        fk: Fk,
-        tx: TxRecord,
-        vout: u32,
-        output: OutputRecord,
-    ) {
-        let Some(id) = fk.get() else {
-            return;
-        };
-        let mut g = self.inner.lock().unwrap();
-        g.put_utxo_parent_inner(height, id, tx, vout, output);
-    }
 
-    /// Batch parent outs under one lock (load phase-2 finish).
-    pub fn put_utxo_parents_batch(&self, items: &[(u32, Fk, TxRecord, u32, OutputRecord)]) {
-        if items.is_empty() {
-            return;
-        }
-        let mut g = self.inner.lock().unwrap();
-        for &(height, fk, ref tx, vout, ref output) in items {
-            let Some(id) = fk.get() else {
-                continue;
-            };
-            g.put_utxo_parent_inner(height, id, tx.clone(), vout, output.clone());
-        }
-    }
 
-    /// Runway parent pin: stash live outs + mark all evaluated vouts checked.
-    ///
-    /// `checked` includes spent-filtered vouts that are **not** in `live` so
-    /// wave can treat the set as complete without re-decoding the body.
-    /// `height` is the max cache height needing this parent (plan keep-alive).
-    /// `coinbase_height`: `None` = not a coinbase; `Some(h)` = cb create height.
-    /// Pass as pre-resolved maturity field (outer `Some` means stashed).
-    pub fn put_parent_outs_resolved(
-        &self,
-        height: u32,
-        fk: Fk,
-        tx: TxRecord,
-        live: &[(u32, OutputRecord)],
-        checked: &[u32],
-        coinbase_height: Option<Option<u32>>,
-    ) {
-        let Some(id) = fk.get() else {
-            return;
-        };
-        let mut g = self.inner.lock().unwrap();
-        g.put_parent_outs_resolved_inner(
-            height,
-            id,
-            tx,
-            live,
-            checked,
-            coinbase_height,
-            None,
-        );
-    }
 
-    /// Many resolved parents under one lock (parent pin finish).
-    ///
-    /// Tuple: `(height, fk, tx, live, checked, coinbase_height, create_height)`.
-    /// `coinbase_height`: `None` = not stashed; `Some(None)` = not cb; `Some(Some(h))` = height.
-    /// `create_height`: body height when known (pin_cache / runway) for GC keep-alive.
-    pub fn put_parent_outs_resolved_batch(
-        &self,
-        items: &[(
-            u32,
-            Fk,
-            TxRecord,
-            Vec<(u32, OutputRecord)>,
-            Vec<u32>,
-            Option<Option<u32>>,
-            Option<u32>,
-        )],
-    ) {
-        if items.is_empty() {
-            return;
-        }
-        let mut g = self.inner.lock().unwrap();
-        for (height, fk, tx, live, checked, cb, create_h) in items {
-            let Some(id) = fk.get() else {
-                continue;
-            };
-            g.put_parent_outs_resolved_inner(
-                *height,
-                id,
-                tx.clone(),
-                live,
-                checked,
-                *cb,
-                *create_h,
-            );
-        }
-    }
 
-    /// Coinbase maturity stash was moved to per-batch [`crate::BatchParents`].
-    /// Shared cache no longer holds sparse pin metadata.
-    pub fn get_parent_coinbase_height(&self, _fk: Fk) -> Option<Option<u32>> {
-        None
-    }
 
     /// Batch thin edges under one lock (moves ownership — no edge clone).
     pub fn put_thin_inputs_batch(&self, items: Vec<(Fk, Vec<StashedThinInput>)>) {
@@ -1292,25 +1085,24 @@ impl ConfirmParentCache {
         }
     }
 
-    /// Reserve a hole for a prevout not in UTXO (create is still on the parent cache).
+    /// Reserve a hole for a prevout whose create is still on the runway.
     ///
-    /// If the create was already registered with full outs (create-before-reserve),
-    /// fills immediately without a store round-trip.
+    /// Filled when the create body lands ([`Self::put_body_and_creates`]) via
+    /// body txid match — no sparse by_fk map.
     pub fn reserve(&self, height: u32, prev_txid: [u8; 32], vout: u32) {
         let mut g = self.inner.lock().unwrap();
-        // Already filled from sparse parent pin (legacy reserve path)?
-        if let Some((&id, _)) = g
-            .by_fk
-            .iter()
-            .find(|(_, e)| e.tx.txid == prev_txid && e.outs.contains_key(&vout))
-        {
-            if let Some(plan) = g.plans.get_mut(&height) {
-                plan.need_fk.insert((id, vout));
+        // Already have create body with matching txid?
+        if let Some((&id, b)) = g.by_body.iter().find(|(_, b)| b.tx.txid == prev_txid) {
+            if (vout as usize) < b.outputs.len() {
+                if let Some(plan) = g.plans.get_mut(&height) {
+                    plan.need_fk.insert((id, vout));
+                    plan.reserved.remove(&(prev_txid, vout));
+                }
+                g.recompute_ready_through();
+                self.ready_through
+                    .store(g.ready_through, Ordering::Relaxed);
+                return;
             }
-            g.recompute_ready_through();
-            self.ready_through
-                .store(g.ready_through, Ordering::Relaxed);
-            return;
         }
         if let Some(plan) = g.plans.get_mut(&height) {
             plan.reserved.insert((prev_txid, vout));
@@ -1321,60 +1113,6 @@ impl ConfirmParentCache {
             .insert(height);
     }
 
-    /// Register creates from a cache body with **all** outputs.
-    ///
-    /// Phase-1 cache loads full blocks first so later spends in the same
-    /// batch resolve creates without UTXO or reservations.
-    /// Prefer [`Self::put_body_and_creates`] on the hot path (one lock).
-    pub fn register_cache_creates(
-        &self,
-        create_fk: Fk,
-        tx: &TxRecord,
-        outputs: &[OutputRecord],
-        create_height: u32,
-    ) {
-        let Some(id) = create_fk.get() else {
-            return;
-        };
-        let mut g = self.inner.lock().unwrap();
-        let txid = tx.txid;
-        {
-            let e = g.by_fk.entry(id).or_insert_with(|| ParentEntry {
-                tx: tx.clone(),
-                outs: HashMap::new(),
-                checked: HashSet::new(),
-                coinbase_height: None,
-                create_height: Some(create_height),
-                keep_until: create_height,
-            });
-            e.tx = tx.clone();
-            e.create_height = Some(create_height);
-            e.keep_until = e.keep_until.max(create_height);
-            for (v, o) in outputs.iter().enumerate() {
-                let v = v as u32;
-                e.outs.insert(
-                    v,
-                    ParentOut {
-                        output: o.clone(),
-                    },
-                );
-                e.checked.insert(v);
-            }
-        }
-        // Clear any legacy waiters for this create.
-        for v in 0..outputs.len() as u32 {
-            let key = (txid, v);
-            if let Some(waiters) = g.reserve_waiters.remove(&key) {
-                for h in waiters {
-                    if let Some(plan) = g.plans.get_mut(&h) {
-                        plan.reserved.remove(&key);
-                        plan.need_fk.insert((id, v));
-                    }
-                }
-            }
-        }
-        // ready_through unchanged until mark_scanned.
-    }
 
     /// Look up a populated parent out (for wave fill / connect).
     ///
@@ -1404,319 +1142,33 @@ impl ConfirmParentCache {
             .is_some_and(|b| (vout as usize) < b.outputs.len())
     }
 
-    /// True when parent pin can skip store decode for `vouts` (wave already
-    /// served by `get_parent_outs_needed` / body path).
-    ///
-    /// Covered if sparse `by_fk` has a full checked set (or all live outs), or
-    /// a cache `by_body` holds every requested index.
-    pub fn parent_pin_covered(&self, fk: Fk, vouts: &[u32]) -> bool {
-        let Some(id) = fk.get() else {
-            return false;
-        };
-        let g = self.inner.lock().unwrap();
-        Self::pin_covered_locked(&g, id, vouts)
-    }
 
-    /// One-lock cover check for many parents (`(create_fk_id, need_vouts)`).
-    pub fn parent_pins_covered(&self, items: &[(u64, Vec<u32>)]) -> Vec<bool> {
-        if items.is_empty() {
-            return Vec::new();
-        }
-        let g = self.inner.lock().unwrap();
-        items
-            .iter()
-            .map(|(id, vouts)| Self::pin_covered_locked(&g, *id, vouts))
-            .collect()
-    }
 
-    /// Cover check with miss classification for diagnostics.
-    ///
-    /// Returns `(covered[], miss_no_fk, miss_partial)` where misses are counts
-    /// among **uncovered** items only.
-    pub fn parent_pins_covered_detail(
-        &self,
-        items: &[(u64, Vec<u32>)],
-    ) -> (Vec<bool>, u32, u32) {
-        if items.is_empty() {
-            return (Vec::new(), 0, 0);
-        }
-        let g = self.inner.lock().unwrap();
-        let mut miss_no_fk = 0u32;
-        let mut miss_partial = 0u32;
-        let covered: Vec<bool> = items
-            .iter()
-            .map(|(id, vouts)| {
-                if vouts.is_empty() {
-                    return true;
-                }
-                match g.by_fk.get(id) {
-                    None => {
-                        miss_no_fk = miss_no_fk.saturating_add(1);
-                        false
-                    }
-                    Some(e) => {
-                        if !e.checked.is_empty() && vouts.iter().all(|v| e.checked.contains(v)) {
-                            true
-                        } else {
-                            miss_partial = miss_partial.saturating_add(1);
-                            false
-                        }
-                    }
-                }
-            })
-            .collect();
-        (covered, miss_no_fk, miss_partial)
-    }
 
-    /// One-lock pin classify: cover + body-LRU slim outs + already-checked.
-    ///
-    /// Replaces separate `parent_pins_covered_detail` + `get_bodies_for_pin_batch`
-    /// + N× `parent_checked_vouts` (each took the parent-cache mutex — contended
-    /// with write tip GC).
-    ///
-    /// `items`: `(create_fk_id, need_vouts)`. Result index-aligned with `items`.
-    pub fn prepare_pin_batch(&self, items: &[(u64, Vec<u32>)]) -> PinPrepareBatch {
-        let mut out = PinPrepareBatch {
-            kinds: Vec::with_capacity(items.len()),
-            miss_no_fk: 0,
-            miss_partial: 0,
-        };
-        if items.is_empty() {
-            return out;
-        }
-        let mut g = self.inner.lock().unwrap();
-        for (id, vouts) in items {
-            if vouts.is_empty() {
-                out.kinds.push(PinPrepareKind::Covered);
-                continue;
-            }
-            // Spent-filtered by_fk cover (wave/write can skip store).
-            if let Some(e) = g.by_fk.get(id) {
-                if !e.checked.is_empty() && vouts.iter().all(|v| e.checked.contains(v)) {
-                    out.kinds.push(PinPrepareKind::Covered);
-                    continue;
-                }
-                // Partial: fall through to body / pin_new; carry already-checked.
-            }
-            let already_checked: Vec<u32> = g
-                .by_fk
-                .get(id)
-                .map(|e| {
-                    vouts
-                        .iter()
-                        .copied()
-                        .filter(|v| e.checked.contains(v))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if already_checked.is_empty() && !g.by_fk.contains_key(id) {
-                out.miss_no_fk = out.miss_no_fk.saturating_add(1);
-            } else if g.by_fk.contains_key(id) {
-                out.miss_partial = out.miss_partial.saturating_add(1);
-            }
 
-            let body_hit = {
-                let Some(e) = g.by_body.get(id) else {
-                    out.kinds.push(PinPrepareKind::Miss {
-                        already_checked,
-                    });
-                    continue;
-                };
-                let mut outs = Vec::with_capacity(vouts.len());
-                for &v in vouts {
-                    if let Some(o) = e.outputs.get(v as usize) {
-                        outs.push((v, o.clone()));
-                    }
-                }
-                let cb_hint = if e.tx.input_count != 1 {
-                    Some(false)
-                } else if e
-                    .inputs
-                    .first()
-                    .is_some_and(|i| i.is_coinbase() || i.prev_index == u32::MAX)
-                {
-                    Some(true)
-                } else {
-                    None
-                };
-                let range = g.body_range.get(id).copied();
-                (
-                    e.height,
-                    e.tx.clone(),
-                    outs,
-                    cb_hint,
-                    range,
-                    already_checked,
-                )
-            };
-            g.touch_body_lru(*id);
-            let (create_h, tx, outs, cb_hint, range, already_checked) = body_hit;
-            out.kinds.push(PinPrepareKind::Body {
-                create_h,
-                tx,
-                outs,
-                cb_hint,
-                range,
-                already_checked,
-            });
-        }
-        out
-    }
 
-    /// Vouts already spent-filtered on `by_fk` (subset of `need` that can skip store).
-    pub fn parent_checked_vouts(&self, fk: Fk, need: &[u32]) -> Vec<u32> {
-        let Some(id) = fk.get() else {
-            return Vec::new();
-        };
-        let g = self.inner.lock().unwrap();
-        let Some(e) = g.by_fk.get(&id) else {
-            return Vec::new();
-        };
-        need.iter()
-            .copied()
-            .filter(|v| e.checked.contains(v))
-            .collect()
-    }
 
-    /// Keep-alive already-stashed parents for sliding-window re-pin skip:
-    /// attach `need_fk` at `height` so tip GC does not drop them before confirm.
-    pub fn touch_parent_needs(&self, height: u32, fk: Fk, vouts: &[u32]) {
-        let Some(id) = fk.get() else {
-            return;
-        };
-        if vouts.is_empty() {
-            return;
-        }
-        let mut g = self.inner.lock().unwrap();
-        g.touch_parent_needs_inner(height, id, vouts);
-    }
 
-    /// Batch keep-alive: `(height, create_fk_id, vouts)`.
-    pub fn touch_parent_needs_batch(&self, items: &[(u32, u64, Vec<u32>)]) {
-        if items.is_empty() {
-            return;
-        }
-        let mut g = self.inner.lock().unwrap();
-        for (height, id, vouts) in items {
-            g.touch_parent_needs_inner(*height, *id, vouts);
-        }
-    }
-
-    /// See [`Self::parent_pin_covered`].
-    ///
-    /// Only **spent-filtered** sparse `by_fk` entries count (legacy/test inserts).
-    /// Production pins live on per-batch [`crate::BatchParents`].
-    #[inline]
-    fn pin_covered_locked(g: &Inner, id: u64, vouts: &[u32]) -> bool {
-        if vouts.is_empty() {
-            return true;
-        }
-        if let Some(e) = g.by_fk.get(&id) {
-            if !e.checked.is_empty() && vouts.iter().all(|v| e.checked.contains(v)) {
-                return true;
-            }
-        }
-        false
-    }
 
     pub fn get_parent_tx(&self, fk: Fk) -> Option<TxRecord> {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
-        // Prefer body (shared LRU); legacy sparse by_fk for unit tests only.
-        if let Some(b) = g.by_body.get(&id) {
-            return Some(b.tx.clone());
-        }
-        g.by_fk.get(&id).map(|e| e.tx.clone())
+        g.by_body.get(&id).map(|b| b.tx.clone())
     }
 
-    /// Txid of a stashed parent create (body or legacy sparse) — no clone of outs.
+    /// Txid of a stashed parent create body — no clone of outs.
     pub fn get_parent_txid(&self, fk: Fk) -> Option<[u8; 32]> {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
-        if let Some(e) = g.by_fk.get(&id) {
-            return Some(e.tx.txid);
-        }
         g.by_body.get(&id).map(|b| b.tx.txid)
     }
 
-    /// Sparse external-parent outs only (`by_fk`). Does **not** expand cache
-    /// bodies — callers that need a subset of body outs should use
-    /// [`Self::get_parent_outs_needed`] (avoids cloning every script of a multi-out create).
-    pub fn get_parent_outs(&self, fk: Fk) -> Option<(TxRecord, HashMap<u32, OutputRecord>)> {
-        let id = fk.get()?;
-        let g = self.inner.lock().unwrap();
-        let e = g.by_fk.get(&id)?;
-        if e.outs.is_empty() {
-            return None;
-        }
-        let outs: HashMap<u32, OutputRecord> = e
-            .outs
-            .iter()
-            .map(|(v, o)| (*v, o.output.clone()))
-            .collect();
-        Some((e.tx.clone(), outs))
-    }
 
-    /// Clone only the requested parent vouts (sparse `by_fk`, else cache body).
-    ///
-    /// Returns `(tx, live_outs, spent_filtered)`:
-    /// - `spent_filtered == true`: cache already dropped spent vouts; wave
-    ///   must not re-check spentness for these candidates.
-    /// - `spent_filtered == false`: candidates need a spent filter (body path).
-    ///
-    /// Wave_fill path: never materializes a full dense outs list for multi-out
-    /// creates when only 1–2 prevouts are needed.
-    pub fn get_parent_outs_needed(
-        &self,
-        fk: Fk,
-        vouts: &[u32],
-    ) -> Option<(TxRecord, Vec<(u32, OutputRecord)>, bool)> {
-        let id = fk.get()?;
-        let g = self.inner.lock().unwrap();
-        if let Some(e) = g.by_fk.get(&id) {
-            // Fully resolved by cache (all requested vouts checked).
-            if !e.checked.is_empty() && vouts.iter().all(|v| e.checked.contains(v)) {
-                let mut live = Vec::with_capacity(vouts.len());
-                for &v in vouts {
-                    if let Some(o) = e.outs.get(&v) {
-                        live.push((v, o.output.clone()));
-                    }
-                }
-                return Some((e.tx.clone(), live, true));
-            }
-            // Legacy / partial: all requested present as live outs (no checked).
-            if !e.outs.is_empty() && vouts.iter().all(|v| e.outs.contains_key(v)) {
-                let mut live = Vec::with_capacity(vouts.len());
-                for &v in vouts {
-                    if let Some(o) = e.outs.get(&v) {
-                        live.push((v, o.output.clone()));
-                    }
-                }
-                return Some((e.tx.clone(), live, false));
-            }
-        }
-        if let Some(b) = g.by_body.get(&id) {
-            let mut live = Vec::with_capacity(vouts.len());
-            for &v in vouts {
-                if let Some(o) = b.outputs.get(v as usize) {
-                    live.push((v, o.clone()));
-                }
-            }
-            // Body path still needs spent filter (wave-body creates are live
-            // only after wave own spent filter; external body rare).
-            return Some((b.tx.clone(), live, false));
-        }
-        None
-    }
 
     pub fn plan_count(&self) -> usize {
         self.inner.lock().unwrap().plans.len()
     }
 
-    /// Sparse external parents in `by_fk` (not every cache create).
-    pub fn parent_count(&self) -> usize {
-        self.inner.lock().unwrap().by_fk.len()
-    }
 
     /// Cached body-range entries (idx offsets for mlock/wave).
     pub fn body_range_count(&self) -> usize {
@@ -1727,39 +1179,7 @@ impl ConfirmParentCache {
         self.inner.lock().unwrap().reserve_waiters.len()
     }
 
-    /// Drop a spent out from cache (after Class C). O(1) under the cache lock.
-    ///
-    /// Does **not** scan all height plans: stale `need_fk` entries are dropped
-    /// when the plan is removed on tip advance. Parent GC uses remaining plans.
-    pub fn retire_spend(&self, create_fk: Fk, vout: u32) {
-        let Some(id) = create_fk.get() else {
-            return;
-        };
-        let mut g = self.inner.lock().unwrap();
-        g.retire_spend_id(id, vout);
-    }
 
-    /// Batch retire after Class C (one lock for the whole spend list).
-    ///
-    /// Recomputes [`Self::ready_through`]: removing the last live out of a parent
-    /// must not leave a hollow watermark above a now-incomplete package.
-    pub fn retire_spends(&self, spends: &[(Fk, u32)]) {
-        if spends.is_empty() {
-            return;
-        }
-        let mut g = self.inner.lock().unwrap();
-        for &(fk, vout) in spends {
-            let Some(id) = fk.get() else {
-                continue;
-            };
-            g.retire_spend_id(id, vout);
-        }
-        g.recompute_ready_through();
-        self.ready_through
-            .store(g.ready_through, Ordering::Relaxed);
-        drop(g);
-        self.ready_cv.notify_all();
-    }
 }
 
 impl Inner {
@@ -1948,180 +1368,10 @@ impl Inner {
         self.body_lru = kept;
     }
 
-    /// Legacy reserve path only: copy waited-for outs into sparse `by_fk`.
-    fn fill_reserve_waiters_from_body(
-        &mut self,
-        id: u64,
-        txid: [u8; 32],
-        height: u32,
-        tx: &TxRecord,
-        outputs: &[OutputRecord],
-    ) {
-        if self.reserve_waiters.is_empty() {
-            return;
-        }
-        for v in 0..outputs.len() as u32 {
-            let key = (txid, v);
-            let Some(waiters) = self.reserve_waiters.remove(&key) else {
-                continue;
-            };
-            let o = &outputs[v as usize];
-            {
-                let e = self.by_fk.entry(id).or_insert_with(|| ParentEntry {
-                    tx: tx.clone(),
-                    outs: HashMap::new(),
-                    checked: HashSet::new(),
-                    coinbase_height: None,
-                    create_height: Some(height),
-                    keep_until: height,
-                });
-                e.tx = tx.clone();
-                e.create_height = Some(height);
-                e.keep_until = e.keep_until.max(height);
-                e.outs.insert(
-                    v,
-                    ParentOut {
-                        output: o.clone(),
-                    },
-                );
-                e.checked.insert(v);
-            }
-            for h in waiters {
-                if let Some(plan) = self.plans.get_mut(&h) {
-                    plan.reserved.remove(&key);
-                    plan.need_fk.insert((id, v));
-                }
-            }
-        }
-    }
 
-    fn put_utxo_parent_inner(
-        &mut self,
-        height: u32,
-        id: u64,
-        tx: TxRecord,
-        vout: u32,
-        output: OutputRecord,
-    ) {
-        self.put_parent_outs_resolved_inner(
-            height,
-            id,
-            tx,
-            &[(vout, output)],
-            &[vout],
-            None,
-            None,
-        );
-    }
 
-    /// Attach plan keep-alive for an already-stashed parent (no re-decode).
-    fn touch_parent_needs_inner(&mut self, height: u32, id: u64, vouts: &[u32]) {
-        // Collect under by_fk/by_body first — cannot hold plan mut borrow too.
-        let grace = self.pin_keep_grace;
-        let pins: Vec<u32> = if let Some(e) = self.by_fk.get_mut(&id) {
-            e.keep_until = e.keep_until.max(pin_keep_until_for(height, grace));
-            let mut vs: Vec<u32> = vouts
-                .iter()
-                .copied()
-                .filter(|v| e.outs.contains_key(v) || e.checked.contains(v))
-                .collect();
-            if vs.is_empty() {
-                if let Some(&v) = e.outs.keys().next().or_else(|| e.checked.iter().next()) {
-                    vs.push(v);
-                }
-            }
-            vs
-        } else if self.by_body.contains_key(&id) {
-            vouts.to_vec()
-        } else {
-            return;
-        };
-        if let Some(plan) = self.plans.get_mut(&height) {
-            for v in pins {
-                plan.need_fk.insert((id, v));
-            }
-        }
-    }
 
-    fn put_parent_outs_resolved_inner(
-        &mut self,
-        height: u32,
-        id: u64,
-        tx: TxRecord,
-        live: &[(u32, OutputRecord)],
-        checked: &[u32],
-        coinbase_height: Option<Option<u32>>,
-        create_height: Option<u32>,
-    ) {
-        let txid = tx.txid;
-        let grace = self.pin_keep_grace;
-        let until = pin_keep_until_for(height, grace);
-        {
-            let e = self.by_fk.entry(id).or_insert_with(|| ParentEntry {
-                tx: tx.clone(),
-                outs: HashMap::new(),
-                checked: HashSet::new(),
-                coinbase_height: None,
-                create_height: None,
-                keep_until: until,
-            });
-            e.tx = tx;
-            e.keep_until = e.keep_until.max(until);
-            if coinbase_height.is_some() {
-                e.coinbase_height = coinbase_height;
-            }
-            if create_height.is_some() {
-                e.create_height = create_height;
-            }
-            for &v in checked {
-                e.checked.insert(v);
-            }
-            for (v, output) in live {
-                e.outs.insert(*v, ParentOut {
-                    output: output.clone(),
-                });
-                e.checked.insert(*v);
-            }
-        }
-        // Plan bookkeeping for live outs (GC keep-alive via need_fk).
-        for (v, _) in live {
-            if let Some(plan) = self.plans.get_mut(&height) {
-                plan.need_fk.insert((id, *v));
-                plan.reserved.remove(&(txid, *v));
-            }
-            let key = (txid, *v);
-            if let Some(waiters) = self.reserve_waiters.remove(&key) {
-                for h in waiters {
-                    if let Some(plan) = self.plans.get_mut(&h) {
-                        plan.reserved.remove(&key);
-                        plan.need_fk.insert((id, *v));
-                    }
-                }
-            }
-        }
-        // Spent-only checked vouts still pin the parent entry for the height.
-        if live.is_empty() && !checked.is_empty() {
-            if let Some(plan) = self.plans.get_mut(&height) {
-                if let Some(&v) = checked.first() {
-                    plan.need_fk.insert((id, v));
-                }
-            }
-        }
-    }
 
-    fn retire_spend_id(&mut self, id: u64, vout: u32) {
-        if let Some(e) = self.by_fk.get_mut(&id) {
-            e.outs.remove(&vout);
-            // Keep the by_fk row when only live outs are gone: `checked` still
-            // covers spent-filtered package_ready for other cache heights.
-            // Dropping the whole entry here left tip+N incomplete while
-            // ready_through stayed high until the next tip GC (cache cursor
-            // jumped past the hole). Full drop is tip GC / gc_orphaned_parents.
-            if e.outs.is_empty() && e.checked.is_empty() {
-                self.by_fk.remove(&id);
-            }
-        }
-    }
 
     /// Contiguous **scanned** watermark from tip+1 upward (2-stage ready).
     fn recompute_ready_through(&mut self) {
@@ -2138,8 +1388,10 @@ impl Inner {
     /// Content-complete package (header + bodies + edges + external parents).
     ///
     /// Optional strict check (diagnostics / tests). Wait / ready_through use
-    /// scanned-only [`HeightPlan::is_ready`] so the pipeline does not do more
-    /// blocking work than the 2-stage path.
+    /// scanned-only [`HeightPlan::is_ready`]. Content check: header + all wave
+    /// bodies present and non-coinbase inputs have stamped create_fk (thin or
+    /// body). External spent-filtered pins live on per-batch [`crate::BatchParents`]
+    /// and are not required here.
     fn package_ready(&self, height: u32) -> bool {
         let Some(plan) = self.plans.get(&height) else {
             return false;
@@ -2153,13 +1405,6 @@ impl Inner {
         if hdr.header_rec.hash != plan.hash || hdr.tx_fks.is_empty() {
             return false;
         }
-        let wave_ids: HashSet<u64> = hdr
-            .tx_fks
-            .iter()
-            .filter_map(|f| f.get())
-            .collect();
-        // Collect external (create_fk, vout) needed from non-wave parents.
-        let mut external: HashMap<u64, HashSet<u32>> = HashMap::new();
         for fk in &hdr.tx_fks {
             let Some(id) = fk.get() else {
                 return false;
@@ -2178,42 +1423,46 @@ impl Inner {
                     .and_then(|t| t.get(i))
                     .and_then(|e| e.create_fk)
                     .or_else(|| inp.create_fk.get());
-                let Some(pid) = pid else {
+                if pid.is_none() {
                     return false; // unstamped create_fk
-                };
-                let vout = thin
-                    .and_then(|t| t.get(i))
-                    .map(|e| e.prev_index)
-                    .unwrap_or(inp.prev_index);
-                if wave_ids.contains(&pid) {
-                    continue; // same-block create; wave resolves
                 }
-                external.entry(pid).or_default().insert(vout);
-            }
-        }
-        for (pid, vouts) in &external {
-            let Some(e) = self.by_fk.get(pid) else {
-                return false;
-            };
-            // Must be spent-filtered for every needed vout.
-            if e.checked.is_empty() || !vouts.iter().all(|v| e.checked.contains(v)) {
-                return false;
             }
         }
         true
     }
 
-    /// Drop body_range entries not referenced by live cache bodies or parent pins.
-    ///
-    /// Parent pin used to insert ranges forever (never tied to a height plan),
-    /// so body_range grew O(unique parents ever seen) across IBD.
+    /// Drop body_range entries not referenced by live cache bodies.
     fn gc_body_ranges(&mut self) {
         if self.body_range.is_empty() {
             return;
         }
-        self.body_range.retain(|id, _| {
-            self.by_body.contains_key(id) || self.by_fk.contains_key(id)
-        });
+        self.body_range
+            .retain(|id, _| self.by_body.contains_key(id));
+    }
+
+    /// Resolve legacy reserve waiters when a create body lands (by txid).
+    fn fill_reserve_waiters_from_body(
+        &mut self,
+        id: u64,
+        txid: [u8; 32],
+        _height: u32,
+        n_outputs: u32,
+    ) {
+        if self.reserve_waiters.is_empty() {
+            return;
+        }
+        for v in 0..n_outputs {
+            let key = (txid, v);
+            let Some(waiters) = self.reserve_waiters.remove(&key) else {
+                continue;
+            };
+            for h in waiters {
+                if let Some(plan) = self.plans.get_mut(&h) {
+                    plan.reserved.remove(&key);
+                    plan.need_fk.insert((id, v));
+                }
+            }
+        }
     }
 
     /// Drop mlocks whose needing heights are all ≤ tip.
@@ -2250,42 +1499,6 @@ impl Inner {
         unlocks
     }
 
-    fn gc_orphaned_parents(&mut self) {
-        // Parents still referenced by open plans.
-        let live: HashSet<u64> = self
-            .plans
-            .values()
-            .flat_map(|p| p.need_fk.iter().map(|(id, _)| *id))
-            .collect();
-        let tip = self.tip;
-        let has_waiters = !self.reserve_waiters.is_empty();
-        let mut drop_ids: Vec<u64> = Vec::new();
-        for (&id, e) in &self.by_fk {
-            if live.contains(&id) {
-                continue;
-            }
-            // Load pipeline lag: keep until last needing height confirms.
-            if e.keep_until > tip {
-                continue;
-            }
-            // Keep by_fk until tip passes create height (runway creates).
-            if let Some(ch) = e.create_height {
-                if ch > tip {
-                    continue;
-                }
-            }
-            if has_waiters {
-                let txid = e.tx.txid;
-                if self.reserve_waiters.keys().any(|(t, _)| *t == txid) {
-                    continue;
-                }
-            }
-            drop_ids.push(id);
-        }
-        for id in drop_ids {
-            self.by_fk.remove(&id);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2348,22 +1561,6 @@ mod tests {
         c.mark_scanned(height);
     }
 
-    #[test]
-    fn utxo_parent_marks_ready() {
-        let c = ConfirmParentCache::new();
-        c.advance_tip(10);
-        let hash = [9u8; 32];
-        // Ready = full package (coinbase body), not mark_scanned alone.
-        seed_coinbase_package(&c, 11, hash, 1001);
-        // External parent pin is orthogonal to package for coinbase-only height.
-        let t = tx(1);
-        c.put_utxo_parent(11, Fk(7), t, 0, out(100));
-        assert!(c.is_ready(11));
-        assert_eq!(c.ready_through(), 11);
-        let (tx, o) = c.get_parent_out(Fk(7), 0).unwrap();
-        assert_eq!(tx.txid[0], 1);
-        assert_eq!(o.value, 100);
-    }
 
     #[test]
     fn hollow_mark_scanned_is_not_package_ready() {
@@ -2413,129 +1610,6 @@ mod tests {
             12,
             "scanned watermark ignores content drain (wave store-fallbacks)"
         );
-    }
-
-    /// Retiring the last live out must not delete spent-filtered `checked` coverage
-    /// or leave ready_through above a now-incomplete height (cache cursor skip).
-    #[test]
-    fn retire_last_live_out_keeps_checked_and_recomputes_watermark() {
-        let c = ConfirmParentCache::new();
-        c.advance_tip(10);
-        seed_coinbase_package(&c, 11, [0x11; 32], 1100);
-        // Height 12 spends parent 42:0 — pin with checked+live.
-        let h12 = [0x12u8; 32];
-        c.ensure_plan(12, h12);
-        let mut t12 = tx(12);
-        t12.txid = h12;
-        t12.input_count = 1;
-        t12.output_count = 1;
-        let spend_in = vec![InputRecord {
-            prev_txid: [0x42; 32],
-            create_fk: Fk(42),
-            prev_index: 0,
-            sequence: 0xffff_ffff,
-            script_sig: vec![],
-            witness: vec![],
-        }];
-        c.put_header_plan(12, Fk(12), header_rec(h12), vec![Fk(1200)], [0x11; 32]);
-        c.put_body(Fk(1200), 12, t12, vec![out(49)], spend_in);
-        c.put_thin_inputs(
-            Fk(1200),
-            vec![crate::wave_prevout::ThinInput {
-                create_fk: Some(42),
-                prev_index: 0,
-            }],
-        );
-        let parent_tx = tx(42);
-        c.put_parent_outs_resolved(
-            12,
-            Fk(42),
-            parent_tx.clone(),
-            &[(0, out(100))],
-            &[0],
-            Some(None),
-        );
-        c.mark_scanned(12);
-        assert!(c.package_ready(12));
-        assert_eq!(c.ready_through(), 12);
-
-        // Confirm spent 42:0 — old code dropped the whole by_fk row when outs empty.
-        c.retire_spends(&[(Fk(42), 0)]);
-        // Spent-filtered identity remains (checked kept); package still content-ready
-        // for re-queue / headroom (vout is checked, not necessarily live).
-        assert!(
-            c.parent_pin_covered(Fk(42), &[0]),
-            "checked coverage must survive last-live retire"
-        );
-        // If a later height needed a different vout that was never pinned, watermark
-        // recompute still ran (no panic / stale atomic).
-        assert_eq!(c.ready_through(), 12);
-    }
-
-    /// Regression: same-bite create@11 + spend@12 must pin create into spent-filtered
-    /// `by_fk`. Bare `by_body` is not enough for package_ready / cache-only wave —
-    /// skipping pin left ready_through at tip+1/+2 after multi-block cache bites.
-    #[test]
-    fn cross_height_spend_needs_parent_pin_for_package_ready() {
-        let c = ConfirmParentCache::new();
-        c.advance_tip(10);
-        let h11 = [0x11u8; 32];
-        let h12 = [0x12u8; 32];
-        // Create body at 11 (not coinbase-only seed — height 12 will spend it).
-        seed_coinbase_package(&c, 11, h11, 1100);
-        assert!(c.package_ready(11));
-        assert_eq!(c.ready_through(), 11);
-
-        // Height 12 spends create 1100:0 — external to wave_ids of 12.
-        c.ensure_plan(12, h12);
-        let mut t12 = tx(12);
-        t12.txid = h12;
-        t12.input_count = 1;
-        t12.output_count = 1;
-        let spend_in = vec![InputRecord {
-            prev_txid: h11,
-            create_fk: Fk(1100),
-            prev_index: 0,
-            sequence: 0xffff_ffff,
-            script_sig: vec![],
-            witness: vec![],
-        }];
-        c.put_header_plan(
-            12,
-            Fk(12),
-            header_rec(h12),
-            vec![Fk(1200)],
-            h11,
-        );
-        c.put_body(Fk(1200), 12, t12, vec![out(49)], spend_in);
-        c.put_thin_inputs(
-            Fk(1200),
-            vec![crate::wave_prevout::ThinInput {
-                create_fk: Some(1100),
-                prev_index: 0,
-            }],
-        );
-        c.mark_scanned(12);
-        // Wait unblocks on scanned (2-stage); content package still incomplete.
-        assert!(c.is_ready(12));
-        assert_eq!(c.ready_through(), 12);
-        assert!(
-            !c.package_ready(12),
-            "spend of same-bite create without by_fk pin must not be package_ready"
-        );
-
-        // Pin from cache body (what cache does for batch_create_ids).
-        let (create_h, tx, outs, _ins) = c.get_body_for_pin(Fk(1100)).expect("cache body");
-        assert_eq!(create_h, 11);
-        c.put_parent_outs_resolved(
-            12,
-            Fk(1100),
-            tx,
-            &[(0, outs[0].clone())],
-            &[0],
-            Some(Some(11)),
-        );
-        assert!(c.package_ready(12));
     }
 
     /// ensure_plans ignores heights ≤ tip; after advance_tip, batch heights seed.
@@ -2612,23 +1686,6 @@ mod tests {
     }
 
 
-    #[test]
-    fn reserve_then_register_create_fills() {
-        let c = ConfirmParentCache::new();
-        c.advance_tip(0);
-        let hash = [2u8; 32];
-        // Coinbase package is ready even with open reserves on the plan.
-        seed_coinbase_package(&c, 2, hash, 2002);
-        let t = tx(5);
-        c.reserve(2, t.txid, 0);
-        assert!(c.is_ready(2));
-        assert!(c.has_open_reserves(2));
-        // Create appears from height 1 body — fills cache for wave/connect.
-        c.register_cache_creates(Fk(50), &t, &[out(42), out(43)], 1);
-        assert!(c.is_ready(2));
-        assert!(!c.has_open_reserves(2));
-        assert_eq!(c.get_parent_out(Fk(50), 0).unwrap().1.value, 42);
-    }
 
     #[test]
     fn open_reserves_do_not_block_ready_or_watermark() {
@@ -2645,28 +1702,11 @@ mod tests {
         assert!(c.all_ready(&[1, 2]));
         assert_eq!(c.ready_through(), 2);
         assert!(c.headroom_ready(2, 0));
-        c.register_cache_creates(Fk(90), &t, &[out(1)], 1);
+        c.put_body_and_creates(Fk(90), 1, t, vec![out(1)], vec![]);
         assert!(!c.has_open_reserves(2));
         assert_eq!(c.ready_through(), 2);
     }
 
-    #[test]
-    fn phase1_register_keeps_all_outs_for_later_spend() {
-        // Bodies first: create height registers all outs; spend height hits cache.
-        let c = ConfirmParentCache::new();
-        c.advance_tip(0);
-        seed_coinbase_package(&c, 1, [1u8; 32], 1001);
-        let t = tx(5);
-        c.register_cache_creates(Fk(50), &t, &[out(42), out(43)], 1);
-        assert!(c.is_ready(1));
-        assert!(c.has_parent_out(Fk(50), 0));
-        assert_eq!(c.get_parent_out(Fk(50), 1).unwrap().1.value, 43);
-
-        seed_coinbase_package(&c, 2, [2u8; 32], 1002);
-        c.put_utxo_parent(2, Fk(50), t.clone(), 1, out(43));
-        assert!(c.is_ready(2));
-        assert_eq!(c.ready_through(), 2);
-    }
 
     #[test]
     fn body_cache_survives_past_tip_in_lru() {
@@ -2691,36 +1731,6 @@ mod tests {
     }
 
     /// Parent pin body_range must not accumulate forever across tip advances.
-    #[test]
-    fn body_range_gc_drops_orphaned_parent_ranges() {
-        let c = ConfirmParentCache::new();
-        c.set_pin_keep_grace(0); // exclusive need+1 only for this GC test
-        c.advance_tip(0);
-        c.ensure_plan(1, [1u8; 32]);
-        // Parent pin range only (no by_body / by_fk keep-alive after tip).
-        c.put_body_range(Fk(999), 1000, 50);
-        assert_eq!(c.body_range_count(), 1);
-        // Live parent keeps range.
-        c.put_parent_outs_resolved(
-            1,
-            Fk(999),
-            tx(9),
-            &[(0, out(1))],
-            &[0],
-            Some(None),
-        );
-        assert_eq!(c.body_range_count(), 1);
-        c.mark_scanned(1);
-        // tip == need still retains (keep_until = need+1); tip past exclusive end drops.
-        c.advance_tip(1);
-        assert_eq!(c.body_range_count(), 1, "grace=0 still holds at tip == need");
-        c.advance_tip(2);
-        assert_eq!(
-            c.body_range_count(),
-            0,
-            "orphaned parent body_range must not leak across tip"
-        );
-    }
 
     #[test]
     fn body_prevout_edges_prefers_create_fk_without_soft_txid() {
@@ -2758,7 +1768,7 @@ mod tests {
 
 
     #[test]
-    fn body_create_resolves_without_by_fk_dual_copy() {
+    fn body_create_resolves_from_by_body() {
         // Bodies-first: put_body only; get_parent_out/has_parent_out use body outs.
         let c = ConfirmParentCache::new();
         c.advance_tip(0);
@@ -2774,11 +1784,8 @@ mod tests {
         assert_eq!(c.get_parent_txid(Fk(70)), Some(t.txid));
         assert!(c.has_parent_out(Fk(70), 1));
         assert_eq!(c.get_parent_out(Fk(70), 1).unwrap().1.value, 20);
-        // Sparse external path still works alongside body.
-        c.put_utxo_parent(2, Fk(99), tx(9), 0, out(5));
-        assert_eq!(c.get_parent_out(Fk(99), 0).unwrap().1.value, 5);
-        // parent_count is sparse externals only (not every body create).
-        assert_eq!(c.parent_count(), 1);
+        // No sparse by_fk — external pins are per-batch BatchParents.
+        assert!(c.get_parent_out(Fk(99), 0).is_none());
     }
 
     #[test]
@@ -2809,94 +1816,8 @@ mod tests {
         assert!(c.get_thin_inputs(Fk(10)).is_none());
     }
 
-    #[test]
-    fn parent_outs_resolved_skips_spent_recheck() {
-        // Runway stashes live outs + checked set; wave must see spent_filtered.
-        let c = ConfirmParentCache::new();
-        c.advance_tip(0);
-        c.ensure_plan(1, [1u8; 32]);
-        let t = tx(9);
-        // vout 0 live, vout 1 spent (checked but not live).
-        c.put_parent_outs_resolved(
-            1,
-            Fk(90),
-            t.clone(),
-            &[(0, out(100))],
-            &[0, 1],
-            Some(None), // not a coinbase
-        );
-        let (txr, live, filtered) = c.get_parent_outs_needed(Fk(90), &[0, 1]).unwrap();
-        assert!(filtered);
-        assert_eq!(txr.txid, t.txid);
-        assert_eq!(live.len(), 1);
-        assert_eq!(live[0].0, 0);
-        assert_eq!(live[0].1.value, 100);
-        assert_eq!(c.get_parent_coinbase_height(Fk(90)), Some(None));
-        // Partial request still complete.
-        let (_, live0, f0) = c.get_parent_outs_needed(Fk(90), &[0]).unwrap();
-        assert!(f0);
-        assert_eq!(live0.len(), 1);
-        // Unknown vout 2 → not complete → None (wave falls back to store).
-        assert!(c.get_parent_outs_needed(Fk(90), &[0, 2]).is_none());
-    }
 
-    #[test]
-    fn parent_pin_covered_and_touch_skip_redecode() {
-        // Sliding-window re-pin: already-stashed outs → covered; touch keep-alive.
-        let c = ConfirmParentCache::new();
-        c.advance_tip(0);
-        c.ensure_plan(1, [1u8; 32]);
-        c.ensure_plan(2, [2u8; 32]);
-        let t = tx(42);
-        c.put_parent_outs_resolved(
-            1,
-            Fk(42),
-            t,
-            &[(0, out(50)), (1, out(60))],
-            &[0, 1],
-            Some(None),
-        );
-        assert!(c.parent_pin_covered(Fk(42), &[0]));
-        assert!(c.parent_pin_covered(Fk(42), &[0, 1]));
-        assert!(!c.parent_pin_covered(Fk(42), &[0, 2])); // missing checked vout
-        assert!(!c.parent_pin_covered(Fk(99), &[0])); // unknown parent
 
-        let batch = c.parent_pins_covered(&[(42, vec![0, 1]), (99, vec![0])]);
-        assert_eq!(batch, vec![true, false]);
-
-        // Touch for a later height (sliding window) without re-put.
-        c.touch_parent_needs(2, Fk(42), &[0, 1]);
-        // Wave still serves spent-filtered outs after touch.
-        let (_, live, filtered) = c.get_parent_outs_needed(Fk(42), &[0, 1]).unwrap();
-        assert!(filtered);
-        assert_eq!(live.len(), 2);
-
-        // Bare by_body does **not** count as pin-covered (need spent-filtered by_fk).
-        c.put_body(Fk(70), 1, tx(70), vec![out(1), out(2)], vec![]);
-        assert!(
-            !c.parent_pin_covered(Fk(70), &[0, 1]),
-            "cache body alone must not skip external parent pin"
-        );
-    }
-
-    #[test]
-    fn parent_coinbase_height_stashed_for_wave() {
-        let c = ConfirmParentCache::new();
-        c.advance_tip(0);
-        c.ensure_plan(1, [1u8; 32]);
-        let t = tx(11);
-        c.put_parent_outs_resolved(
-            1,
-            Fk(11),
-            t,
-            &[(0, out(50))],
-            &[0],
-            Some(Some(100)), // coinbase at height 100
-        );
-        assert_eq!(c.get_parent_coinbase_height(Fk(11)), Some(Some(100)));
-        // Unknown fk.
-        assert!(c.get_parent_coinbase_height(Fk(99)).is_none());
-    }
 
     #[test]
     fn take_bodies_batch_keeps_for_parent_lru() {
@@ -3009,7 +1930,6 @@ mod tests {
         let c = ConfirmParentCache::new();
         c.advance_tip(0);
         c.ensure_plan(1, [1u8; 32]);
-        c.put_utxo_parent(1, Fk(1), tx(1), 0, out(1));
         c.mark_scanned(1);
         c.advance_tip(1);
         assert!(!c.is_ready(1)); // pruned
@@ -3192,87 +2112,6 @@ mod tests {
         assert!(c.has_body(Fk(1000)));
     }
 
-    /// keep_until must retain by_fk after tip advances past create_height until
-    /// the exclusive retention end (need+1 with grace=0).
-    #[test]
-    fn pin_keep_until_survives_tip_gc_until_spender_confirms() {
-        let c = ConfirmParentCache::new();
-        c.set_pin_keep_grace(0); // exclusive need+1 only
-        c.advance_tip(10);
-        // Parent create at height 5 (already confirmed), pinned for spender at 100.
-        let t = tx(9);
-        c.put_parent_outs_resolved(
-            100,
-            Fk(99),
-            t.clone(),
-            &[(0, out(1))],
-            &[0],
-            Some(None),
-        );
-        // keep_until = 101 (need+1); create_height None.
-        assert!(c.parent_pin_covered(Fk(99), &[0]));
-        c.advance_tip(50); // past create, but keep_until still ahead
-        assert!(
-            c.parent_pin_covered(Fk(99), &[0]),
-            "by_fk must survive tip GC while keep_until > tip"
-        );
-        // tip == need still retains (exclusive end = need+1).
-        c.advance_tip(100);
-        assert!(
-            c.parent_pin_covered(Fk(99), &[0]),
-            "retain at tip == need with grace=0"
-        );
-        // Touch later batch needing height 120 → keep_until = 121.
-        c.touch_parent_needs(120, Fk(99), &[0]);
-        c.advance_tip(120);
-        assert!(
-            c.parent_pin_covered(Fk(99), &[0]),
-            "retain at tip == need after touch"
-        );
-        c.advance_tip(121);
-        assert!(
-            !c.parent_pin_covered(Fk(99), &[0]),
-            "drop when tip >= keep_until"
-        );
-    }
-
-    /// Grace keeps by_fk across tip == need so empty conf_q still gets pin_cached.
-    #[test]
-    fn pin_keep_grace_survives_cross_batch_without_load_depth() {
-        let c = ConfirmParentCache::new();
-        c.set_pin_keep_grace(32);
-        c.advance_tip(10);
-        let t = tx(3);
-        c.put_parent_outs_resolved(
-            100,
-            Fk(55),
-            t,
-            &[(0, out(1))],
-            &[0],
-            Some(None),
-        );
-        // keep_until = 100 + 1 + 32 = 133
-        c.advance_tip(100);
-        assert!(
-            c.parent_pin_covered(Fk(55), &[0]),
-            "grace retains after tip reaches last known need"
-        );
-        c.advance_tip(132);
-        assert!(c.parent_pin_covered(Fk(55), &[0]));
-        c.advance_tip(133);
-        assert!(
-            !c.parent_pin_covered(Fk(55), &[0]),
-            "drop after tip passes need+1+grace"
-        );
-    }
-
-    #[test]
-    fn pin_keep_until_for_math() {
-        assert_eq!(pin_keep_until_for(100, 0), 101);
-        assert_eq!(pin_keep_until_for(100, 256), 357);
-        assert_eq!(pin_keep_until_for(u32::MAX, 10), u32::MAX);
-    }
-
     #[test]
     fn note_mlock_ranges_for_heights_unions_needs() {
         let c = ConfirmParentCache::new();
@@ -3293,63 +2132,9 @@ mod tests {
         assert!(!c.is_range_pinned(&r));
     }
 
-    /// One-lock prepare: Covered / Body / Miss + same-batch-friendly already_checked.
-    #[test]
-    fn prepare_pin_batch_classifies_cover_body_miss() {
-        let c = ConfirmParentCache::new();
-        c.advance_tip(0);
-        let mut t = tx(9);
-        t.input_count = 1;
-        let coinbase_in = InputRecord {
-            prev_txid: [0u8; 32],
-            create_fk: Fk::NULL,
-            prev_index: u32::MAX,
-            sequence: u32::MAX,
-            script_sig: vec![1],
-            witness: vec![],
-        };
-        c.put_body(
-            Fk(90),
-            3,
-            t.clone(),
-            vec![out(1), out(2), out(3)],
-            vec![coinbase_in],
-        );
-        c.put_body_range(Fk(90), 500, 40);
-
-        // Body hit, no by_fk yet.
-        let prep = c.prepare_pin_batch(&[(90, vec![0, 2]), (99, vec![0])]);
-        assert_eq!(prep.kinds.len(), 2);
-        assert!(matches!(prep.kinds[0], PinPrepareKind::Body { .. }));
-        assert!(matches!(prep.kinds[1], PinPrepareKind::Miss { .. }));
-        assert_eq!(prep.miss_no_fk, 2); // neither had by_fk cover
-
-        // Spent-filter put → Covered on next prepare.
-        if let PinPrepareKind::Body {
-            create_h,
-            tx: txr,
-            outs,
-            ..
-        } = &prep.kinds[0]
-        {
-            c.put_parent_outs_resolved(
-                4,
-                Fk(90),
-                txr.clone(),
-                &[(0, outs[0].1.clone()), (2, outs[1].1.clone())],
-                &[0, 2],
-                Some(Some(*create_h)),
-            );
-        }
-        let prep2 = c.prepare_pin_batch(&[(90, vec![0, 2])]);
-        assert!(matches!(prep2.kinds[0], PinPrepareKind::Covered));
-        assert_eq!(prep2.miss_no_fk, 0);
-        assert_eq!(prep2.miss_partial, 0);
-    }
-
     /// Slim batch pin: only requested outs, one lock, coinbase hint; no full input clone.
     #[test]
-    fn get_bodies_for_pin_batch_slims_outs_and_covers_after_put() {
+    fn get_bodies_for_pin_batch_slims_outs() {
         let c = ConfirmParentCache::new();
         c.advance_tip(0);
         let mut t = tx(7);
@@ -3380,27 +2165,17 @@ mod tests {
         assert_eq!(outs[1].0, 2);
         assert_eq!(*cb, Some(true));
         assert_eq!(*range, Some((1000, 64)));
-
-        // After spent-filtered put, same vouts are pin_covered (cheap path).
-        c.put_parent_outs_resolved(
-            6,
+        // Spent-filtered pin lives on BatchParents (not shared by_fk).
+        let mut bp = crate::BatchParents::new();
+        bp.put_resolved(
             Fk(77),
             txr.clone(),
-            &[(0, outs[0].1.clone())],
+            &[(0, outs[0].1.clone()), (2, outs[1].1.clone())],
             &[0, 2],
             Some(Some(5)),
-        );
-        // create_height via batch put path
-        c.put_parent_outs_resolved_batch(&[(
-            6,
-            Fk(77),
-            txr.clone(),
-            vec![(0, outs[0].1.clone())],
-            vec![0, 2],
-            Some(Some(5)),
             Some(5),
-        )]);
-        assert!(c.parent_pin_covered(Fk(77), &[0, 2]));
-        assert!(!c.parent_pin_covered(Fk(77), &[0, 1])); // vout 1 never checked
+        );
+        assert!(bp.pin_covered(Fk(77), &[0, 2]));
+        assert!(!bp.pin_covered(Fk(77), &[0, 1]));
     }
 }

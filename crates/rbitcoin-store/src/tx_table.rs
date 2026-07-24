@@ -607,7 +607,15 @@ struct HeadResize {
 }
 
 /// Class A fks the background resize thread advances per `head_resize_poll`.
-const RESIZE_BG_POLL_BUDGET: u64 = 1_048_576;
+/// Override with `RBITCOIN_TX_HEAD_RESIZE_WAVE` (default **1 048 576**).
+fn resize_bg_poll_budget() -> u64 {
+    std::env::var("RBITCOIN_TX_HEAD_RESIZE_WAVE")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1_048_576)
+        .clamp(1_024, 16_777_216)
+}
 
 pub struct TxTable {
     body: VarTable,
@@ -744,8 +752,12 @@ impl TxTable {
             .spawn(move || {
                 // SAFETY: `this` is a live TxTable for the lifetime of this join.
                 let table = unsafe { &*(this as *const TxTable) };
+                let wave = resize_bg_poll_budget();
                 rbitcoin_log::info!(
-                    "store: tx.head resize background fill started (budget={RESIZE_BG_POLL_BUDGET}/wave)"
+                    "store: tx.head resize background fill started (budget={wave}/wave \
+                     read_batch={} write_chunk={})",
+                    Self::head_resize_read_batch(),
+                    Self::head_resize_write_chunk()
                 );
                 loop {
                     if table.resize_bg_gen.load(AtomicOrdering::Acquire) != gen {
@@ -754,7 +766,7 @@ impl TxTable {
                     if !table.head_resize_in_progress() {
                         break;
                     }
-                    match table.head_resize_poll(RESIZE_BG_POLL_BUDGET) {
+                    match table.head_resize_poll(resize_bg_poll_budget()) {
                         Ok(()) => {}
                         Err(e) => {
                             rbitcoin_log::error!(
@@ -2399,20 +2411,31 @@ impl TxTable {
 
     /// Class A fks per bulk body-txid read during head resize (`tx.idx` range +
     /// io_uring / parallel body prefixes). Override with
-    /// `RBITCOIN_TX_HEAD_RESIZE_READ_BATCH` (default **8000**).
+    /// `RBITCOIN_TX_HEAD_RESIZE_READ_BATCH` (default **65536**).
     fn head_resize_read_batch() -> u64 {
         std::env::var("RBITCOIN_TX_HEAD_RESIZE_READ_BATCH")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(8_000)
+            .unwrap_or(65_536)
             .clamp(1, 1_000_000)
+    }
+
+    /// Shadow `insert_many` group size (one SeqCst fence per group). Override with
+    /// `RBITCOIN_TX_HEAD_RESIZE_WRITE_CHUNK` (default **4096**).
+    fn head_resize_write_chunk() -> usize {
+        std::env::var("RBITCOIN_TX_HEAD_RESIZE_WRITE_CHUNK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(4_096)
+            .clamp(64, 65_536)
     }
 
     /// Fill shadow head for consecutive Class A ids using bulk idx + body reads.
     ///
-    /// Chunks body IO by [`Self::head_resize_read_batch`]; writes via existing
-    /// `insert_many` in smaller write groups (probe locality / fence cost).
+    /// Chunks body IO by [`Self::head_resize_read_batch`]; writes via
+    /// `insert_many` in [`Self::head_resize_write_chunk`] groups (one fence each).
     fn shadow_fill_fk_range(
         &self,
         shadow: &AddressHead,
@@ -2422,17 +2445,17 @@ impl TxTable {
         if last < first {
             return Ok(());
         }
-        const WRITE_CHUNK: usize = 256;
+        let write_chunk = Self::head_resize_write_chunk();
         let read_batch = Self::head_resize_read_batch();
         let mut cur = first;
         while cur <= last {
             let end = (cur + read_batch - 1).min(last);
             let txids = self.body_txid_range(cur, end)?;
             debug_assert_eq!(txids.len() as u64, end - cur + 1);
-            let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(WRITE_CHUNK);
+            let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(write_chunk);
             for (i, txid) in txids.into_iter().enumerate() {
                 batch.push((txid, Fk(cur + i as u64)));
-                if batch.len() >= WRITE_CHUNK {
+                if batch.len() >= write_chunk {
                     shadow.insert_many(&batch)?;
                     batch.clear();
                 }
@@ -2673,7 +2696,7 @@ mod tests {
                 t.head_bits(),
                 t.count()
             );
-            t.head_resize_poll(RESIZE_BG_POLL_BUDGET)
+            t.head_resize_poll(resize_bg_poll_budget())
                 .expect("head_resize_poll during wait");
             // Yield if still in progress (e.g. exclusive lock contention on swap).
             if t.head_resize_in_progress() {
@@ -3199,7 +3222,7 @@ mod tests {
                 .unwrap();
 
             // Poll on a side thread: shadow fill completes, then blocks in try_write.
-            let poller = s.spawn(|| t.head_resize_poll(RESIZE_BG_POLL_BUDGET));
+            let poller = s.spawn(|| t.head_resize_poll(resize_bg_poll_budget()));
             // Wait until fill is done and swap is blocked on exclusive lock
             // (in_progress still true under held head.read).
             let wait = Instant::now();

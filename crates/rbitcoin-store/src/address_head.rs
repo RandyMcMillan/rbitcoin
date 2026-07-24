@@ -1259,7 +1259,15 @@ mod tests {
         if !batch.is_empty() {
             h.insert_many(&batch).unwrap();
         }
-        prober.join().unwrap();
+        // Deadline: infinite join if prober/barrier stuck (panic-before-wait).
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            prober.join().unwrap();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("concurrent address_head prober timed out (hang?)");
 
         assert_eq!(h.occupied(), n);
         for i in 1..=n {

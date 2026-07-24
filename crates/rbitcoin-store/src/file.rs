@@ -945,9 +945,17 @@ mod advise_tests {
             }));
         }
 
-        for h in handles {
-            h.join().unwrap();
-        }
+        // Hard deadline: barrier+join used to hang forever if a worker panicked early.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for h in handles {
+                h.join().unwrap();
+            }
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("concurrent TableFile workers timed out (hang?)");
         let final_len = f.logical_len();
         assert!(final_len > FILE_HEADER_LEN as u64 + 64);
         let mut head = [0u8; 8];

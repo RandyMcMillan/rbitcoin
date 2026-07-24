@@ -6,10 +6,25 @@ use rbitcoin_query::Query;
 use rbitcoin_test::build_mature_regtest_with_spend;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Duration;
 use rbitcoin_test::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
+
+/// Bound every Electrum line read — unbounded `read_line` hangs the suite if the
+/// server never answers (deadlock / dropped task).
+async fn read_line_timeout(
+    reader: &mut BufReader<&mut TcpStream>,
+    buf: &mut String,
+    label: &str,
+) {
+    buf.clear();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(buf))
+        .await
+        .unwrap_or_else(|_| panic!("electrum {label}: read_line timed out"))
+        .unwrap_or_else(|e| panic!("electrum {label}: read_line io: {e}"));
+}
 
 #[tokio::test]
 async fn electrum_server_version_history_balance() {
@@ -38,7 +53,7 @@ async fn electrum_server_version_history_balance() {
     }
     let mut reader = BufReader::new(&mut stream);
     let mut resp_line = String::new();
-    reader.read_line(&mut resp_line).await.unwrap();
+    read_line_timeout(&mut reader, &mut resp_line, "server.version").await;
     let v: Value = serde_json::from_str(&resp_line).unwrap();
     assert!(v.get("result").is_some(), "{v}");
     let ver = v["result"].as_array().unwrap();
@@ -57,8 +72,7 @@ async fn electrum_server_version_history_balance() {
     let stream = reader.into_inner();
     stream.write_all(line.as_bytes()).await.unwrap();
     let mut reader = BufReader::new(stream);
-    resp_line.clear();
-    reader.read_line(&mut resp_line).await.unwrap();
+    read_line_timeout(&mut reader, &mut resp_line, "get_history").await;
     let v: Value = serde_json::from_str(&resp_line).unwrap();
     let hist = v["result"].as_array().expect("history array");
     assert!(!hist.is_empty());
@@ -74,8 +88,7 @@ async fn electrum_server_version_history_balance() {
     let stream = reader.into_inner();
     stream.write_all(line.as_bytes()).await.unwrap();
     let mut reader = BufReader::new(stream);
-    resp_line.clear();
-    reader.read_line(&mut resp_line).await.unwrap();
+    read_line_timeout(&mut reader, &mut resp_line, "get_balance").await;
     let v: Value = serde_json::from_str(&resp_line).unwrap();
     assert!(v["result"]["confirmed"].as_i64().unwrap_or(0) > 0);
 
@@ -90,8 +103,7 @@ async fn electrum_server_version_history_balance() {
     let stream = reader.into_inner();
     stream.write_all(line.as_bytes()).await.unwrap();
     let mut reader = BufReader::new(stream);
-    resp_line.clear();
-    reader.read_line(&mut resp_line).await.unwrap();
+    read_line_timeout(&mut reader, &mut resp_line, "get_mempool").await;
     let v: Value = serde_json::from_str(&resp_line).unwrap();
     assert_eq!(v["result"], json!([]));
 
@@ -106,8 +118,7 @@ async fn electrum_server_version_history_balance() {
     let stream = reader.into_inner();
     stream.write_all(line.as_bytes()).await.unwrap();
     let mut reader = BufReader::new(stream);
-    resp_line.clear();
-    reader.read_line(&mut resp_line).await.unwrap();
+    read_line_timeout(&mut reader, &mut resp_line, "headers.subscribe").await;
     let v: Value = serde_json::from_str(&resp_line).unwrap();
     assert!(v["result"]["height"].as_u64().unwrap() > 0);
     assert!(v["result"]["hex"].as_str().unwrap().len() == 160); // 80-byte header hex
@@ -121,12 +132,8 @@ async fn electrum_server_version_history_balance() {
             header_hex: tip_hex.clone(),
         })
         .expect("tip push");
-    resp_line.clear();
     // Notification has no id — wait for one line.
-    tokio::time::timeout(std::time::Duration::from_secs(2), reader.read_line(&mut resp_line))
-        .await
-        .expect("tip notification timeout")
-        .unwrap();
+    read_line_timeout(&mut reader, &mut resp_line, "tip notification").await;
     let push: Value = serde_json::from_str(&resp_line).unwrap();
     assert_eq!(
         push["method"].as_str(),
@@ -169,7 +176,10 @@ async fn electrum_more_methods_and_errors() {
         stream.write_all(line.as_bytes()).await.unwrap();
         let mut reader = BufReader::new(&mut *stream);
         let mut resp_line = String::new();
-        reader.read_line(&mut resp_line).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut resp_line))
+            .await
+            .unwrap_or_else(|_| panic!("electrum rpc {method}: read_line timed out"))
+            .unwrap_or_else(|e| panic!("electrum rpc {method}: io {e}"));
         serde_json::from_str(&resp_line).unwrap()
     }
 

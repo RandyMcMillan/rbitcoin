@@ -371,9 +371,17 @@ mod tests {
             }));
         }
 
-        for h in handles {
-            h.join().unwrap();
-        }
+        // Hard deadline: a panic-before-barrier used to hang join forever.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for h in handles {
+                h.join().unwrap();
+            }
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("concurrent var_table workers timed out (hang?)");
         assert_eq!(t.count(), 200);
         let _ = std::fs::remove_dir_all(&dir);
     }

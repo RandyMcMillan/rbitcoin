@@ -634,10 +634,16 @@ impl Drop for TxTable {
 
 impl TxTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
+        Self::create_with_head_layout(dir, crate::address_head::default_layout())
+    }
+
+    /// Create with an explicit head geometry (tests / recovery). Avoids racing on
+    /// process-global `RBITCOIN_TX_HEAD_BITS` / `RBITCOIN_HEAD_SCALE`.
+    pub fn create_with_head_layout(dir: &Path, layout: HeadLayout) -> Result<Self, StoreError> {
         let head_path = dir.join("tx.head");
         Ok(Self {
             body: VarTable::create(dir, "tx", TableKind::Tx)?,
-            head: RwLock::new(AddressHead::create(&head_path)?),
+            head: RwLock::new(AddressHead::create_with_layout(&head_path, layout)?),
             head_path,
             resize: Mutex::new(None),
             resize_bg: Mutex::new(None),
@@ -2676,6 +2682,33 @@ mod tests {
         }
     }
 
+    fn tiny_layout() -> HeadLayout {
+        HeadLayout::new(crate::address_head::TINY_BITS).unwrap()
+    }
+
+    fn layout_bits(bits: u32) -> HeadLayout {
+        HeadLayout::new(bits).unwrap()
+    }
+
+    fn create_tiny(dir: &Path) -> TxTable {
+        TxTable::create_with_head_layout(dir, tiny_layout()).unwrap()
+    }
+
+    fn create_bits(dir: &Path, bits: u32) -> TxTable {
+        TxTable::create_with_head_layout(dir, layout_bits(bits)).unwrap()
+    }
+
+    /// Process-global env knobs still used by a few tests (read-batch / bulk IO).
+    /// Hold this while mutating so parallel tests cannot race.
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env_lock<R>(f: impl FnOnce() -> R) -> R {
+        let _g = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
     #[test]
     fn decode_prevout_at_skips_script_and_witness() {
         let rec = InputRecord {
@@ -2812,8 +2845,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        let t = TxTable::create(&dir).unwrap();
+        let t = create_tiny(&dir);
         let txid = [0x55u8; 32];
         let mk = |fk_hint: u8| {
             let rec = TxRecord {
@@ -2871,9 +2903,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // Tiny head: 2^10 = 1024 slots.
-        std::env::set_var("RBITCOIN_TX_HEAD_BITS", "10");
-        let t = TxTable::create(&dir).unwrap();
+        // Tiny head: 2^10 = 1024 slots (explicit layout — no env race).
+        let t = create_bits(&dir, 10);
         assert_eq!(t.head_bits(), 10);
         assert_eq!(t.head_entry_bytes(), 4);
 
@@ -2928,7 +2959,6 @@ mod tests {
             assert_eq!(fk, Some(Fk(i)), "txid {i} missing after resize");
         }
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::remove_var("RBITCOIN_TX_HEAD_BITS");
     }
 
     #[test]
@@ -2943,8 +2973,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // 2^8 = 256 slots; trigger at ceil(0.75*256)=192.
-        std::env::set_var("RBITCOIN_TX_HEAD_BITS", "8");
-        let t = TxTable::create(&dir).unwrap();
+        let t = create_bits(&dir, 8);
         assert_eq!(t.head_slots(), 256);
         let mk = |i: u64| {
             let mut txid = [0u8; 32];
@@ -2985,7 +3014,6 @@ mod tests {
             assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)));
         }
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::remove_var("RBITCOIN_TX_HEAD_BITS");
     }
 
     /// Bulk body_txid_range matches serial body_txid (idx batch + bulk pread).
@@ -3000,8 +3028,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        let t = TxTable::create(&dir).unwrap();
+        let t = create_tiny(&dir);
         let mk = |i: u64| {
             let mut txid = [0u8; 32];
             txid[0..8].copy_from_slice(&i.to_le_bytes());
@@ -3046,63 +3073,62 @@ mod tests {
             assert_eq!(tail[j], t.body_txid(Fk(id)).unwrap());
         }
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::remove_var("RBITCOIN_HEAD_SCALE");
     }
 
     /// Resize with a tiny bulk-read batch still fills shadow correctly.
     #[test]
     fn head_resize_with_small_read_batch() {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-tx-head-resize-batch-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("RBITCOIN_TX_HEAD_BITS", "10");
-        // Force multi-chunk bulk reads inside each poll budget.
-        std::env::set_var("RBITCOIN_TX_HEAD_RESIZE_READ_BATCH", "7");
-        let t = TxTable::create(&dir).unwrap();
-        let mk = |i: u64| {
-            let mut txid = [0u8; 32];
-            txid[0..8].copy_from_slice(&i.to_le_bytes());
-            let rec = TxRecord {
-                txid,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
+        with_env_lock(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "rbitcoin-tx-head-resize-batch-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            // Force multi-chunk bulk reads inside each poll budget.
+            std::env::set_var("RBITCOIN_TX_HEAD_RESIZE_READ_BATCH", "7");
+            let t = create_bits(&dir, 10);
+            let mk = |i: u64| {
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&i.to_le_bytes());
+                let rec = TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                };
+                let inputs = vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    create_fk: Fk::NULL,
+                    prev_index: u32::MAX,
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![],
+                }];
+                let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+                (rec, inputs, outputs)
             };
-            let inputs = vec![InputRecord {
-                prev_txid: [0u8; 32],
-                create_fk: Fk::NULL,
-                prev_index: u32::MAX,
-                sequence: u32::MAX,
-                script_sig: vec![],
-                witness: vec![],
-            }];
-            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
-            (rec, inputs, outputs)
-        };
-        for i in 1..=60u64 {
-            let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
-        }
-        t.start_head_resize(crate::address_head::HeadLayout::new(11).unwrap())
-            .unwrap();
-        wait_head_resize_done(&t, Duration::from_secs(10));
-        assert_eq!(t.head_bits(), 11);
-        for i in 1..=60u64 {
-            let mut txid = [0u8; 32];
-            txid[0..8].copy_from_slice(&i.to_le_bytes());
-            assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)));
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-        std::env::remove_var("RBITCOIN_TX_HEAD_BITS");
-        std::env::remove_var("RBITCOIN_TX_HEAD_RESIZE_READ_BATCH");
+            for i in 1..=60u64 {
+                let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
+            }
+            t.start_head_resize(crate::address_head::HeadLayout::new(11).unwrap())
+                .unwrap();
+            wait_head_resize_done(&t, Duration::from_secs(10));
+            assert_eq!(t.head_bits(), 11);
+            for i in 1..=60u64 {
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&i.to_le_bytes());
+                assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            std::env::remove_var("RBITCOIN_TX_HEAD_RESIZE_READ_BATCH");
+        });
     }
 
     /// Exclusive-lock wait in `try_complete` must abort when `resize_bg_gen`
@@ -3118,8 +3144,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("RBITCOIN_TX_HEAD_BITS", "10");
-        let t = TxTable::create(&dir).unwrap();
+        let t = create_bits(&dir, 10);
         let mk = |i: u64| {
             let mut txid = [0u8; 32];
             txid[0..8].copy_from_slice(&i.to_le_bytes());
@@ -3175,8 +3200,17 @@ mod tests {
 
             // Poll on a side thread: shadow fill completes, then blocks in try_write.
             let poller = s.spawn(|| t.head_resize_poll(RESIZE_BG_POLL_BUDGET));
-            // Let poller / bg reach the exclusive-lock wait.
-            std::thread::sleep(Duration::from_millis(80));
+            // Wait until fill is done and swap is blocked on exclusive lock
+            // (in_progress still true under held head.read).
+            let wait = Instant::now();
+            while wait.elapsed() < Duration::from_secs(2) {
+                if t.head_resize_in_progress() {
+                    // Give bg/poller a slice to enter try_write after fill.
+                    std::thread::sleep(Duration::from_millis(20));
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
             assert!(
                 t.head_resize_in_progress(),
                 "resize should still be blocked on exclusive head lock"
@@ -3207,7 +3241,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::remove_var("RBITCOIN_TX_HEAD_BITS");
     }
 
     /// Fat packed body: body_txid must match full-record path without needing
@@ -3223,8 +3256,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        let t = TxTable::create(&dir).unwrap();
+        let t = create_tiny(&dir);
         let mut txid = [0xabu8; 32];
         txid[0] = 0x7e;
         let tx = TxRecord {
@@ -3257,7 +3289,6 @@ mod tests {
         // Head resolve still works.
         assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(fk));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::remove_var("RBITCOIN_HEAD_SCALE");
     }
 
     /// Bulk body_range + get_full_batch_at agree with sequential paths.
@@ -3272,8 +3303,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        let t = TxTable::create(&dir).unwrap();
+        let t = create_tiny(&dir);
         let mut fks = Vec::new();
         for i in 0u8..12 {
             let mut txid = [0u8; 32];
@@ -3327,12 +3357,12 @@ mod tests {
             assert_eq!(b.1.len(), seq.1.len());
         }
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::remove_var("RBITCOIN_HEAD_SCALE");
     }
 
     /// Depth-max match: foreigners + two same-txid creates; batch prefers deepest.
     #[test]
     fn get_fk_by_txid_batch_depth_wins_with_workers() {
+        with_env_lock(|| {
         std::env::set_var("RBITCOIN_BULK_IO_WORKERS", "4");
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-tx-batch-depth-{}",
@@ -3343,8 +3373,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        let t = TxTable::create(&dir).unwrap();
+        let t = create_tiny(&dir);
         let txid = [0xab; 32];
         let mk = |hint: u8| {
             let rec = TxRecord {
@@ -3410,8 +3439,8 @@ mod tests {
         }
         assert!(batch.iter().any(|(t, f)| *t == [0xff; 32] && f.is_none()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::remove_var("RBITCOIN_HEAD_SCALE");
         std::env::remove_var("RBITCOIN_BULK_IO_WORKERS");
+        });
     }
 
     #[test]
@@ -3425,8 +3454,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        let t = TxTable::create(&dir).unwrap();
+        let t = create_tiny(&dir);
         let mut items = Vec::new();
         for i in 0u8..5 {
             let mut txid = [0u8; 32];
@@ -3479,8 +3507,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        let t = TxTable::create(&dir).unwrap();
+        let t = create_tiny(&dir);
         let a = [1u8; 32];
         let b = [2u8; 32];
         let sa = t.head_primary_slot(&a);
@@ -3492,104 +3519,109 @@ mod tests {
         keys.sort_unstable_by_key(|k| t.head_primary_slot(k));
         assert!(t.head_primary_slot(&keys[0]) <= t.head_primary_slot(&keys[1]));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::remove_var("RBITCOIN_HEAD_SCALE");
     }
 
     /// Operator recovery: delete `tx.head` → open rebuilds from Class A bodies.
     #[test]
     fn missing_tx_head_rebuilds_from_bodies_on_open() {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-tx-head-rebuild-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        // Open recreates via default_layout() (env scale); lock so parallel tests
+        // cannot flip HEAD_SCALE mid-rebuild to mainnet (256 MiB sparse).
+        with_env_lock(|| {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            let dir = std::env::temp_dir().join(format!(
+                "rbitcoin-tx-head-rebuild-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
 
-        let mk = |i: u64| {
-            let mut txid = [0u8; 32];
-            txid[0..8].copy_from_slice(&i.to_le_bytes());
-            let rec = TxRecord {
-                txid,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
+            let mk = |i: u64| {
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&i.to_le_bytes());
+                let rec = TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                };
+                let inputs = vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    create_fk: Fk::NULL,
+                    prev_index: u32::MAX,
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![],
+                }];
+                let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+                (rec, inputs, outputs)
             };
-            let inputs = vec![InputRecord {
-                prev_txid: [0u8; 32],
-                create_fk: Fk::NULL,
-                prev_index: u32::MAX,
-                sequence: u32::MAX,
-                script_sig: vec![],
-                witness: vec![],
-            }];
-            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
-            (rec, inputs, outputs)
-        };
 
-        {
-            let t = TxTable::create(&dir).unwrap();
-            for i in 1..=20u64 {
-                let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
+            {
+                let t = create_tiny(&dir);
+                for i in 1..=20u64 {
+                    let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
+                }
+                assert_eq!(t.count(), 20);
+                // Sanity: head resolves before delete.
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&7u64.to_le_bytes());
+                assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(7)));
+                t.flush().unwrap();
             }
+
+            // Simulate operator: wipe head (layout is in the file footer).
+            let head = dir.join("tx.head");
+            assert!(head.exists());
+            std::fs::remove_file(&head).unwrap();
+
+            // Reopen must recreate head and rebuild from bodies.
+            let t = TxTable::open(&dir).unwrap();
             assert_eq!(t.count(), 20);
-            // Sanity: head resolves before delete.
-            let mut txid = [0u8; 32];
-            txid[0..8].copy_from_slice(&7u64.to_le_bytes());
-            assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(7)));
-            t.flush().unwrap();
-        }
-
-        // Simulate operator: wipe head (layout is in the file footer).
-        let head = dir.join("tx.head");
-        assert!(head.exists());
-        std::fs::remove_file(&head).unwrap();
-
-        // Reopen must recreate head and rebuild from bodies.
-        let t = TxTable::open(&dir).unwrap();
-        assert_eq!(t.count(), 20);
-        assert!(dir.join("tx.head").exists());
-        for i in 1..=20u64 {
-            let mut txid = [0u8; 32];
-            txid[0..8].copy_from_slice(&i.to_le_bytes());
-            assert_eq!(
-                t.get_fk_by_txid(&txid).unwrap(),
-                Some(Fk(i)),
-                "txid {i} missing after head rebuild"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-        std::env::remove_var("RBITCOIN_HEAD_SCALE");
+            assert!(dir.join("tx.head").exists());
+            for i in 1..=20u64 {
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&i.to_le_bytes());
+                assert_eq!(
+                    t.get_fk_by_txid(&txid).unwrap(),
+                    Some(Fk(i)),
+                    "txid {i} missing after head rebuild"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            std::env::remove_var("RBITCOIN_HEAD_SCALE");
+        });
     }
 
     #[test]
     fn missing_tx_head_with_no_bodies_creates_empty() {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-tx-head-empty-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        {
-            let t = TxTable::create(&dir).unwrap();
-            t.flush().unwrap();
-        }
-        std::fs::remove_file(dir.join("tx.head")).unwrap();
-        let t = TxTable::open(&dir).unwrap();
-        assert_eq!(t.count(), 0);
-        assert!(dir.join("tx.head").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-        std::env::remove_var("RBITCOIN_HEAD_SCALE");
+        with_env_lock(|| {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            let dir = std::env::temp_dir().join(format!(
+                "rbitcoin-tx-head-empty-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            {
+                let t = create_tiny(&dir);
+                t.flush().unwrap();
+            }
+            std::fs::remove_file(dir.join("tx.head")).unwrap();
+            let t = TxTable::open(&dir).unwrap();
+            assert_eq!(t.count(), 0);
+            assert!(dir.join("tx.head").exists());
+            let _ = std::fs::remove_dir_all(&dir);
+            std::env::remove_var("RBITCOIN_HEAD_SCALE");
+        });
     }
 
     #[test]
@@ -3603,8 +3635,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        let t = TxTable::create(&dir).unwrap();
+        let t = create_tiny(&dir);
         let spenders = crate::spender_table::SpenderTable::create(&dir).unwrap();
         let tx = TxRecord {
             txid: [0xcd; 32],
@@ -3656,8 +3687,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        let t = TxTable::create(&dir).unwrap();
+        let t = create_tiny(&dir);
         let spenders = crate::spender_table::SpenderTable::create(&dir).unwrap();
         let tx = TxRecord {
             txid: [0xab; 32],
@@ -3894,8 +3924,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Force tiny address width for the test process.
-        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-        let t = TxTable::create(&dir).unwrap();
+        let t = create_tiny(&dir);
         let tx = TxRecord {
             txid: [0x42u8; 32],
             version: 1,

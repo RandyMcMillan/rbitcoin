@@ -847,6 +847,76 @@ impl TxTable {
         Self::txid_from_body_prefix(&prefix[..n])
     }
 
+    /// Bulk Class A body txids for consecutive ids `first..=last` (1-based).
+    ///
+    /// 1. One sequential `tx.idx` pread for the range ([`VarTable::record_ranges`]).
+    /// 2. Parallel / io_uring preads of the leading **33** body bytes per record
+    ///    ([`crate::bulk_io::pread_batch`]).
+    /// 3. Parse each prefix to a txid (same rules as [`Self::body_txid`]).
+    ///
+    /// Used by online `tx.head` shadow fill so resize is not one pread per fk.
+    pub fn body_txid_range(&self, first: u64, last: u64) -> Result<Vec<[u8; 32]>, StoreError> {
+        use crate::bulk_io::{self, ReadOp};
+        if last < first {
+            return Ok(Vec::new());
+        }
+        let ranges = self.body.record_ranges(first, last)?;
+        let n = ranges.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let body_fd = self.body.body_read_fd();
+        let body_pub = self.body.body_published_len();
+        let body_path = self.body.body_file_path();
+
+        // Fixed 33-byte prefix buffers (packed magic+txid, or bare txid).
+        let mut prefixes: Vec<[u8; 33]> = vec![[0u8; 33]; n];
+        let mut prefix_lens: Vec<usize> = vec![0; n];
+        for (i, &(off, len)) in ranges.iter().enumerate() {
+            let want = (len as usize).min(33);
+            if want == 0 {
+                return Err(StoreError::Corrupt("empty body for txid"));
+            }
+            if off.saturating_add(want as u64) > body_pub {
+                return Err(StoreError::Corrupt("body past published"));
+            }
+            prefix_lens[i] = want;
+        }
+
+        // SAFETY: each `prefixes[i]` is a distinct stack-slot allocation in the
+        // vec; submitted indices are unique so mut slices do not alias.
+        let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let want = prefix_lens[i];
+            let ptr = prefixes[i].as_mut_ptr();
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, want) };
+            read_ops.push(ReadOp {
+                fd: body_fd,
+                offset: ranges[i].0,
+                buf: slice,
+                result: i32::MIN,
+            });
+        }
+        bulk_io::pread_batch(&mut read_ops);
+
+        let mut out = Vec::with_capacity(n);
+        for (i, ro) in read_ops.iter().enumerate() {
+            let want = prefix_lens[i];
+            if ro.result < 0 {
+                return Err(StoreError::io(
+                    body_path,
+                    std::io::Error::from_raw_os_error(-ro.result),
+                ));
+            }
+            if ro.result as usize != want {
+                return Err(StoreError::Corrupt("bulk body_txid pread short"));
+            }
+            out.push(Self::txid_from_body_prefix(&prefixes[i][..want])?);
+        }
+        crate::head_resolve_stats::add_body_lookups(n as u64);
+        Ok(out)
+    }
+
     /// Parse txid from the leading bytes of a Class A body payload.
     #[inline]
     fn txid_from_body_prefix(raw: &[u8]) -> Result<[u8; 32], StoreError> {
@@ -2260,9 +2330,59 @@ impl TxTable {
         Ok(())
     }
 
+    /// Class A fks per bulk body-txid read during head resize (`tx.idx` range +
+    /// io_uring / parallel body prefixes). Override with
+    /// `RBITCOIN_TX_HEAD_RESIZE_READ_BATCH` (default **8000**).
+    fn head_resize_read_batch() -> u64 {
+        std::env::var("RBITCOIN_TX_HEAD_RESIZE_READ_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(8_000)
+            .clamp(1, 1_000_000)
+    }
+
+    /// Fill shadow head for consecutive Class A ids using bulk idx + body reads.
+    ///
+    /// Chunks body IO by [`Self::head_resize_read_batch`]; writes via existing
+    /// `insert_many` in smaller write groups (probe locality / fence cost).
+    fn shadow_fill_fk_range(
+        &self,
+        shadow: &AddressHead,
+        first: u64,
+        last: u64,
+    ) -> Result<(), StoreError> {
+        if last < first {
+            return Ok(());
+        }
+        const WRITE_CHUNK: usize = 256;
+        let read_batch = Self::head_resize_read_batch();
+        let mut cur = first;
+        while cur <= last {
+            let end = (cur + read_batch - 1).min(last);
+            let txids = self.body_txid_range(cur, end)?;
+            debug_assert_eq!(txids.len() as u64, end - cur + 1);
+            let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(WRITE_CHUNK);
+            for (i, txid) in txids.into_iter().enumerate() {
+                batch.push((txid, Fk(cur + i as u64)));
+                if batch.len() >= WRITE_CHUNK {
+                    shadow.insert_many(&batch)?;
+                    batch.clear();
+                }
+            }
+            if !batch.is_empty() {
+                shadow.insert_many(&batch)?;
+            }
+            cur = end + 1;
+        }
+        Ok(())
+    }
+
     /// Advance sequential shadow fill by up to `budget` Class A fks; swap when caught up.
     ///
     /// Does **not** dual-write live inserts — only `tx.idx` order into shadow.
+    /// Body txids are read in bulk (io_uring / parallel pread); shadow inserts
+    /// remain ordered `insert_many` on `tx.head.new`.
     pub fn head_resize_poll(&self, budget: u64) -> Result<(), StoreError> {
         if budget == 0 {
             return Ok(());
@@ -2283,19 +2403,7 @@ impl TxTable {
             } else {
                 let start = r.cursor;
                 let end = (r.cursor + budget - 1).min(n);
-                let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(256);
-                for id in r.cursor..=end {
-                    let fk = Fk(id);
-                    let txid = self.body_txid(fk)?;
-                    batch.push((txid, fk));
-                    if batch.len() >= 256 {
-                        r.shadow.insert_many(&batch)?;
-                        batch.clear();
-                    }
-                }
-                if !batch.is_empty() {
-                    r.shadow.insert_many(&batch)?;
-                }
+                self.shadow_fill_fk_range(&r.shadow, r.cursor, end)?;
                 r.cursor = end + 1;
                 write_resize_control(
                     &self.head_path,
@@ -2352,36 +2460,12 @@ impl TxTable {
                 return Ok(());
             };
             if r.cursor <= n {
-                let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(256);
-                for id in r.cursor..=n {
-                    let fk = Fk(id);
-                    let txid = self.body_txid(fk)?;
-                    batch.push((txid, fk));
-                    if batch.len() >= 256 {
-                        r.shadow.insert_many(&batch)?;
-                        batch.clear();
-                    }
-                }
-                if !batch.is_empty() {
-                    r.shadow.insert_many(&batch)?;
-                }
+                self.shadow_fill_fk_range(&r.shadow, r.cursor, n)?;
                 r.cursor = n + 1;
             }
             let n2 = self.count();
             if r.cursor <= n2 {
-                let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(256);
-                for id in r.cursor..=n2 {
-                    let fk = Fk(id);
-                    let txid = self.body_txid(fk)?;
-                    batch.push((txid, fk));
-                    if batch.len() >= 256 {
-                        r.shadow.insert_many(&batch)?;
-                        batch.clear();
-                    }
-                }
-                if !batch.is_empty() {
-                    r.shadow.insert_many(&batch)?;
-                }
+                self.shadow_fill_fk_range(&r.shadow, r.cursor, n2)?;
                 r.cursor = n2 + 1;
             }
             rbitcoin_log::info!(
@@ -2428,19 +2512,7 @@ impl TxTable {
             return Ok(());
         };
         if r.cursor <= n3 {
-            let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(256);
-            for id in r.cursor..=n3 {
-                let fk = Fk(id);
-                let txid = self.body_txid(fk)?;
-                batch.push((txid, fk));
-                if batch.len() >= 256 {
-                    r.shadow.insert_many(&batch)?;
-                    batch.clear();
-                }
-            }
-            if !batch.is_empty() {
-                r.shadow.insert_many(&batch)?;
-            }
+            self.shadow_fill_fk_range(&r.shadow, r.cursor, n3)?;
             r.cursor = n3 + 1;
             r.shadow.flush()?;
         }
@@ -2839,6 +2911,129 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         std::env::remove_var("RBITCOIN_TX_HEAD_BITS");
+    }
+
+    /// Bulk body_txid_range matches serial body_txid (idx batch + bulk pread).
+    #[test]
+    fn body_txid_range_matches_serial() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-txid-range-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        let t = TxTable::create(&dir).unwrap();
+        let mk = |i: u64| {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            txid[8] = 0xce;
+            let rec = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+            (rec, inputs, outputs)
+        };
+        for i in 1..=40u64 {
+            let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
+        }
+        assert!(t.body_txid_range(5, 4).unwrap().is_empty());
+        let bulk = t.body_txid_range(1, 40).unwrap();
+        assert_eq!(bulk.len(), 40);
+        for i in 1..=40u64 {
+            assert_eq!(bulk[(i - 1) as usize], t.body_txid(Fk(i)).unwrap());
+        }
+        let mid = t.body_txid_range(10, 25).unwrap();
+        for (j, id) in (10..=25).enumerate() {
+            assert_eq!(mid[j], t.body_txid(Fk(id)).unwrap());
+        }
+        // Through last published id (body-end path for last length).
+        let tail = t.body_txid_range(38, 40).unwrap();
+        assert_eq!(tail.len(), 3);
+        for (j, id) in (38..=40).enumerate() {
+            assert_eq!(tail[j], t.body_txid(Fk(id)).unwrap());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("RBITCOIN_HEAD_SCALE");
+    }
+
+    /// Resize with a tiny bulk-read batch still fills shadow correctly.
+    #[test]
+    fn head_resize_with_small_read_batch() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-head-resize-batch-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("RBITCOIN_TX_HEAD_BITS", "10");
+        // Force multi-chunk bulk reads inside each poll budget.
+        std::env::set_var("RBITCOIN_TX_HEAD_RESIZE_READ_BATCH", "7");
+        let t = TxTable::create(&dir).unwrap();
+        let mk = |i: u64| {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            let rec = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+            (rec, inputs, outputs)
+        };
+        for i in 1..=60u64 {
+            let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
+        }
+        t.start_head_resize(crate::address_head::HeadLayout::new(11).unwrap())
+            .unwrap();
+        for _ in 0..64 {
+            if !t.head_resize_in_progress() {
+                break;
+            }
+            t.head_resize_poll(17).unwrap();
+        }
+        assert!(!t.head_resize_in_progress());
+        assert_eq!(t.head_bits(), 11);
+        for i in 1..=60u64 {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("RBITCOIN_TX_HEAD_BITS");
+        std::env::remove_var("RBITCOIN_TX_HEAD_RESIZE_READ_BATCH");
     }
 
     /// Fat packed body: body_txid must match full-record path without needing

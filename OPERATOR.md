@@ -54,7 +54,7 @@ At **info**, you only get progress + slim perf. Enable **debug** when diagnosing
 | Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` (`0` = full scripts) |
 | Archive queue RAM | **512 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
-| Bulk store reads | **io_uring** (Linux) | Head resolve + confirm bodies (**pread**). Archive `tx.head` insert stays **mmap** (uring pwrite measured slower). `RBITCOIN_IO_URING=0` → pread fallback; `RBITCOIN_BULK_IO_WORKERS` for fallback parallelism |
+| Bulk store reads | **io_uring** (Linux) | Head resolve + confirm bodies + **`tx.head` resize body-txid fill** (**pread**). Archive `tx.head` insert stays **mmap** (uring pwrite measured slower). `RBITCOIN_IO_URING=0` → pread fallback; `RBITCOIN_BULK_IO_WORKERS` for fallback parallelism; `RBITCOIN_TX_HEAD_RESIZE_READ_BATCH` (default **8000**) chunks resize idx+txid bulk reads |
 | Confirm stages | **load · scripts · write** | Pipeline queues cap **2** each (`conf_q load=n/2 write=m/2`; `name<0/cap` when the next worker is waiting on an empty queue) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 | Inhibit auto-suspend | **off** | `--inhibit-suspend` (uses `systemd-inhibit` if available) |
@@ -87,7 +87,8 @@ pre-size; not 256-way), **scripthash** 16 shards, **tx.head** = single address f
 starting at mainnet **BITS=28** (~**1 GiB** sparse, `2^28` × **4 B** create_fk;
 override with `RBITCOIN_TX_HEAD_BITS` in `8..=34` / tiny scale). **Online sequential
 resize** when `txs.count()/slots ≥ 0.75`: rebuild shadow from dense `tx.idx` order
-(no dual-write on archive), then atomic rename. BITS **33+** use **8 B** entries.
+(batch idx pread + io_uring/parallel body-txid prefixes, ordered `insert_many` into
+`tx.head.new`; no dual-write on archive), then atomic rename. BITS **33+** use **8 B** entries.
 Legacy heads without `tx.head.meta` open as 4 B and may grow upward only.
 **tx_height** uses 4 B height slots (not fk width). Dense Class A fk + **tx.idx**
 retained. Packed Class A only. Spends are schema-v5 annotations on create outputs

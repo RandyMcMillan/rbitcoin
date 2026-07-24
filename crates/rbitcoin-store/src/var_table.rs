@@ -86,6 +86,52 @@ impl VarTable {
         Ok((start, end - start))
     }
 
+    /// Contiguous `(offset, len)` for Class A ids `first..=last` (1-based).
+    ///
+    /// One sequential `tx.idx` pread of the start offsets (plus the next start
+    /// when `last < count`); lengths are adjacent-start deltas, or body end for
+    /// the last published record. Used by head-resize bulk `body_txid` fill.
+    pub fn record_ranges(&self, first: u64, last: u64) -> Result<Vec<(u64, u64)>, StoreError> {
+        if first == 0 {
+            return Err(StoreError::InvalidFk);
+        }
+        if last < first {
+            return Ok(Vec::new());
+        }
+        let count = self.count.load(Ordering::Acquire);
+        if last > count {
+            return Err(StoreError::NotFound);
+        }
+        let n = (last - first + 1) as usize;
+        // Starts for first..=last; if last is not the last published record we
+        // also need start(last+1) for its exclusive end.
+        let need_next = last < count;
+        let n_starts = n + usize::from(need_next);
+        let mut raw = vec![0u8; n_starts * 8];
+        let idx_off = FILE_HEADER_LEN as u64 + (first - 1) * 8;
+        self.idx.read_at(idx_off, &mut raw)?;
+        let mut starts = Vec::with_capacity(n_starts);
+        for i in 0..n_starts {
+            let s = i * 8;
+            starts.push(u64::from_le_bytes(raw[s..s + 8].try_into().unwrap()));
+        }
+        let body_end = self.body.logical_len().max(FILE_HEADER_LEN as u64);
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let start = starts[i];
+            let end = if i + 1 < starts.len() {
+                starts[i + 1]
+            } else {
+                body_end
+            };
+            if end < start {
+                return Err(StoreError::Corrupt("var record end < start"));
+            }
+            out.push((start, end - start));
+        }
+        Ok(out)
+    }
+
     #[inline]
     pub(crate) fn idx_read_fd(&self) -> std::os::fd::RawFd {
         self.idx.read_fd()
@@ -329,6 +375,48 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(t.count(), 200);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_ranges_matches_record_range() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-var-ranges-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = VarTable::create(&dir, "tx", TableKind::Tx).unwrap();
+        for batch in 0..10u8 {
+            let payload = vec![batch; 16 + batch as usize];
+            t.put_batch_encode(3, 128, |_i, buf| {
+                buf.extend_from_slice(&payload);
+            })
+            .unwrap();
+        }
+        assert_eq!(t.count(), 30);
+        // Interior range.
+        let bulk = t.record_ranges(5, 12).unwrap();
+        assert_eq!(bulk.len(), 8);
+        for (i, (off, len)) in bulk.iter().enumerate() {
+            let (o, l) = t.record_range(Fk(5 + i as u64)).unwrap();
+            assert_eq!((*off, *len), (o, l), "id={}", 5 + i);
+        }
+        // Through last published id.
+        let bulk_end = t.record_ranges(28, 30).unwrap();
+        for (i, (off, len)) in bulk_end.iter().enumerate() {
+            let (o, l) = t.record_range(Fk(28 + i as u64)).unwrap();
+            assert_eq!((*off, *len), (o, l));
+        }
+        // Empty / single.
+        assert!(t.record_ranges(4, 3).unwrap().is_empty());
+        assert_eq!(
+            t.record_ranges(1, 1).unwrap()[0],
+            t.record_range(Fk(1)).unwrap()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

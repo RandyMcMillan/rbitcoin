@@ -154,9 +154,10 @@ pub fn confirm_load_phase(
 
     let t_work = Instant::now();
 
-    // Decode bodies, pin parents into batch map.
+    // Decode bodies, pin parents + thin edges (batch-local).
     let t_load = Instant::now();
-    let batch_parents = load_confirm_batch(query, &heights, &items, batch_end)?;
+    let (batch_parents, batch_thin) =
+        load_confirm_batch(query, &heights, &items, batch_end)?;
     let load_ns = t_load.elapsed().as_nanos() as u64;
     confirm_phase_stats::LOAD_NS.fetch_add(load_ns, Ordering::Relaxed);
 
@@ -168,8 +169,15 @@ pub fn confirm_load_phase(
     );
 
     let wire_blocks = wire_rebuild(query, &metas)?;
-    let prepared =
-        assemble_run(query, params, milestone, metas, &wire_blocks, &batch_parents)?;
+    let prepared = assemble_run(
+        query,
+        params,
+        milestone,
+        metas,
+        &wire_blocks,
+        &batch_parents,
+        &batch_thin,
+    )?;
 
     let work_ns = t_work.elapsed().as_nanos() as u64;
     Ok(ConfirmLoadOutcome {
@@ -361,23 +369,23 @@ mod write_idempotent_tests {
 
 // ─── phases ───────────────────────────────────────────────────────────────────
 
-/// Load Class A + pin parents for the claimed batch.
-///
-/// Inline only: decode bodies, thin edges, sparse parent pin into
-/// [`rbitcoin_query::BatchParents`].
+/// Load Class A + pin parents + thin edges for the claimed batch.
 fn load_confirm_batch(
     query: &Query,
     heights: &[u32],
     items: &[(u32, [u8; 32])],
     _batch_end: u32,
-) -> Result<rbitcoin_query::BatchParents, ConsensusError> {
+) -> Result<(rbitcoin_query::BatchParents, rbitcoin_query::BatchThin), ConsensusError> {
     if heights.is_empty() {
-        return Ok(rbitcoin_query::BatchParents::new());
+        return Ok((
+            rbitcoin_query::BatchParents::new(),
+            rbitcoin_query::BatchThin::new(),
+        ));
     }
-    let (_st, batch_parents) = query
+    let (_st, batch_parents, batch_thin) = query
         .load_confirm_parents(items)
         .map_err(ConsensusError::Store)?;
-    Ok(batch_parents)
+    Ok((batch_parents, batch_thin))
 }
 
 fn resolve_body_metas(
@@ -455,6 +463,7 @@ fn assemble_run(
     metas: Vec<BodyMeta>,
     wire_blocks: &[Block],
     batch_parents: &rbitcoin_query::BatchParents,
+    batch_thin: &rbitcoin_query::BatchThin,
 ) -> Result<Vec<Prepared>, ConsensusError> {
     // Provisional same-run double-spend only (not durable spentness).
     let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
@@ -605,6 +614,7 @@ fn assemble_run(
             &mut pending_spent,
             &mut pending_creates,
             batch_parents,
+            batch_thin,
         )?;
         confirm_phase_stats::CONNECT_NS
             .fetch_add(t_connect.elapsed().as_nanos() as u64, Ordering::Relaxed);

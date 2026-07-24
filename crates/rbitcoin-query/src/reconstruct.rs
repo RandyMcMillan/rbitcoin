@@ -42,16 +42,11 @@ impl Query {
             .is_some_and(|(fk, v)| fk.is_null() && *v == 0xffff_ffff))
     }
 
-    /// Body for wire rebuild / RPC: clone from parent cache if present, else store.
+    /// Body for wire rebuild / RPC: store via tx.idx (outs FIFO has no full body).
     fn load_body_from_cache(
         &self,
         fk: Fk,
     ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<InputRecord>), QueryError> {
-        if let Some((tx, outs, inputs)) = self.confirm_parents.get_body(fk) {
-            use crate::wave_fill_stats::{self as wf, add_count as wf_count};
-            wf_count(&wf::BODY_CACHE_MOVE, 1);
-            return Ok((tx, outs, inputs));
-        }
         self.load_body_from_store(fk)
     }
 
@@ -62,7 +57,6 @@ impl Query {
         use crate::wave_fill_stats::{self as wf, add as wf_add, add_count as wf_count};
         let t0 = Instant::now();
         wf_count(&wf::BODY_STORE, 1);
-        // create_fk → body via tx.idx (no process-local range cache).
         let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
         wf_add(&wf::BODY_STORE_NS, t0.elapsed().as_nanos() as u64);
         Ok((tx, outs, inputs))

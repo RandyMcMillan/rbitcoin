@@ -313,8 +313,9 @@ pub fn validate_block_connect(
     // Pending until assemble+scripts+structural succeed — no durable writes on failure.
     let mut pending = std::collections::HashSet::new();
     let mut pending_creates = std::collections::HashMap::new();
-    // Tip/connect path: no separate pin stage; resolve from body cache + store.
+    // Tip/connect path: no separate pin stage; resolve from outs FIFO + store.
     let batch_parents = rbitcoin_query::BatchParents::new();
+    let batch_thin = rbitcoin_query::BatchThin::new();
     let (script_jobs, spends, fees) = assemble_block_prevouts(
         query,
         block,
@@ -323,6 +324,7 @@ pub fn validate_block_connect(
         &mut pending,
         &mut pending_creates,
         &batch_parents,
+        &batch_thin,
     )?;
     if check_scripts && !script_jobs.is_empty() {
         verify_scripts_pool(&script_jobs)?;
@@ -409,8 +411,8 @@ pub struct ScriptCheckJob {
 ///
 /// `pending_spent` / `pending_creates`: run-local same-run tracking.
 ///
-/// Prevouts resolve from per-batch [`rbitcoin_query::BatchParents`] (spent-filtered
-/// pin) + shared body cache (thin create_fk / by_body), then durable store.
+/// Prevouts resolve from per-batch [`rbitcoin_query::BatchParents`] +
+/// [`rbitcoin_query::BatchThin`], then shared outs FIFO / durable store.
 ///
 /// Returns `(script_jobs, spends, fees)` — fees for coinbase subsidy check on structural.
 pub(crate) fn assemble_block_prevouts(
@@ -421,6 +423,7 @@ pub(crate) fn assemble_block_prevouts(
     pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
     pending_creates: &mut std::collections::HashMap<([u8; 32], u32), rbitcoin_primitives::Fk>,
     batch_parents: &rbitcoin_query::BatchParents,
+    batch_thin: &rbitcoin_query::BatchThin,
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
@@ -444,6 +447,7 @@ pub(crate) fn assemble_block_prevouts(
         pending_creates,
         AssembleMode::Optimistic,
         batch_parents,
+        batch_thin,
     )
 }
 
@@ -456,6 +460,7 @@ fn assemble_block_prevouts_mode(
     pending_creates: &mut std::collections::HashMap<([u8; 32], u32), rbitcoin_primitives::Fk>,
     mode: AssembleMode,
     batch_parents: &rbitcoin_query::BatchParents,
+    batch_thin: &rbitcoin_query::BatchThin,
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
@@ -544,8 +549,8 @@ fn assemble_block_prevouts_mode(
             } else {
                 Vec::new()
             };
-            // Thin create_fk edges stashed at load (clone once per spender).
-            let thin = spend_fk.and_then(|fk| cache.get_thin_inputs(fk));
+            // Thin create_fk edges from this confirm batch (batch-local).
+            let thin = spend_fk.and_then(|fk| fk.get().and_then(|id| batch_thin.get(&id)));
 
             for (ii, input) in tx.input.iter().enumerate() {
                 let op = input.previous_output;

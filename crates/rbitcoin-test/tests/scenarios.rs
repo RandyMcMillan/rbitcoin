@@ -1135,7 +1135,7 @@ fn confirm_structural_rejects_already_spent_prevout() {
     let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
     accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     let spend_hash = b_spend.block_hash().to_byte_array();
-    let (_st, batch_parents) = q.load_confirm_parents(&[(spend_h, spend_hash)]).unwrap();
+    let (_st, batch_parents, _thin) = q.load_confirm_parents(&[(spend_h, spend_hash)]).unwrap();
     let create_fk = q
         .tx_fk_by_txid(cb1.as_byte_array())
         .unwrap()
@@ -1851,26 +1851,6 @@ fn three_stage_confirm_and_parent_pin_surface() {
     let params = ChainParams::regtest();
     let maturity = params.coinbase_maturity();
 
-    // Timeout / cancel paths on load-ready wait (tests only; production is inline).
-    q.wait_confirm_load_ready(&[], std::time::Duration::from_millis(1))
-        .unwrap();
-    let wait_err = q
-        .wait_confirm_load_ready(&[9_999], std::time::Duration::from_millis(5))
-        .expect_err("missing plan must timeout");
-    assert!(
-        wait_err.to_string().contains("load incomplete"),
-        "{wait_err}"
-    );
-    q.request_confirm_cancel();
-    let cancel_err = q
-        .wait_confirm_load_ready(&[9_998], std::time::Duration::from_secs(1))
-        .expect_err("cancel aborts wait");
-    assert!(
-        cancel_err.to_string().to_lowercase().contains("cancel"),
-        "{cancel_err}"
-    );
-    q.clear_confirm_cancel();
-
     let genesis = regtest_genesis();
     accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
     let mut tip = genesis.block_hash();
@@ -1900,8 +1880,8 @@ fn three_stage_confirm_and_parent_pin_surface() {
 
     // Inline confirm load (parent pin).
     let items: Vec<(u32, [u8; 32])> = run.iter().map(|(h, hash)| (h.0, *hash)).collect();
-    let (st, _bp) = q.load_confirm_parents(&items).unwrap();
-    assert!(st.blocks > 0 || st.already_ready > 0);
+    let (st, _bp, _thin) = q.load_confirm_parents(&items).unwrap();
+    assert!(st.blocks > 0);
     let _ = q.load_confirm_parents_for_hashes(&[b_spend.block_hash().to_byte_array()]);
     let snap = q.parent_cache_perf_snapshot();
     assert!(snap.4 > 0, "plans after load");
@@ -1931,9 +1911,9 @@ fn three_stage_confirm_and_parent_pin_surface() {
     let empty = confirm_script_phase(&q, &params, ms, &[]);
     assert!(empty.is_err());
 
-    // Idempotent re-load of already-ready batch.
-    let (st2, _) = q.load_confirm_parents(&items).unwrap();
-    assert!(st2.already_ready > 0 || st2.blocks == 0);
+    // Heights ≤ tip are not re-loaded (work filtered out).
+    let (st2, _, _) = q.load_confirm_parents(&items).unwrap();
+    assert_eq!(st2.blocks, 0);
 }
 
 /// Load may claim tip+1 while earlier heights are still in-flight (not written).

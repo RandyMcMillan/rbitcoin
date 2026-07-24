@@ -1,20 +1,19 @@
 //! Confirm **load** stage: Class A decode + parent pin for one claimed batch.
 //!
 //! For each height in the batch (ascending):
-//! 1. **Cache** header + `header_txs`.
-//! 2. **Full Class A decode** into the outs FIFO (wire/assemble use store + outs).
-//! 3. **Thin edges** (stamped create_fk) + **sparse parent pin** into a
-//!    per-batch [`BatchParents`] map (spent-filtered outs; dropped after write).
-//!
-//! Create outs stay in the shared FIFO for later pin hits. Body ranges come
-//! from `tx.idx` on demand (no process-local range map). Sparse parents live
-//! only on the confirm batch object.
+//! 1. **Cache** header + `header_txs` (process-local, tip-GCed).
+//! 2. **Full Class A decode** into the outs FIFO (pin hits); wire uses store.
+//! 3. **Thin edges** + **sparse parent pin** as **batch-local** maps.
+//! Body ranges from `tx.idx` on demand.
 
 use super::*;
 use crate::batch_parents::BatchParents;
-use crate::confirm_parent_cache::StashedThinInput;
+use crate::wave_prevout::ThinInput;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
+
+/// Spend-fk → thin create_fk edges for one confirm batch (assemble only).
+pub type BatchThin = HashMap<u64, Vec<ThinInput>>;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ConfirmLoadStats {
@@ -22,7 +21,6 @@ pub struct ConfirmLoadStats {
     pub utxo_parents: u32,
     pub reserved: u32,
     pub creates_registered: u32,
-    pub already_ready: u32,
     /// Unique parent create fks pinned this call (after dedup).
     pub parent_unique: u32,
     /// Of `parent_unique`: filled from outs FIFO (no Class A re-decode).
@@ -96,50 +94,29 @@ impl Query {
         self.confirm_parents.ensure_plans(items);
     }
 
+    /// True when every height has been load-scanned (watermark / tests).
     pub fn is_confirm_load_ready(&self, heights: &[u32]) -> bool {
         self.confirm_parents.all_ready(heights)
     }
 
-    /// Wait until every height is load-ready (Condvar). Used by tests / cancel;
-    /// production load is inline ([`Self::load_confirm_parents`]), not wait-based.
-    pub fn wait_confirm_load_ready(
-        &self,
-        heights: &[u32],
-        timeout: std::time::Duration,
-    ) -> Result<(), QueryError> {
-        if heights.is_empty() {
-            return Ok(());
-        }
-        match self.confirm_parents.wait_heights_ready(heights, timeout, || {
-            self.confirm_cancelled()
-        }) {
-            Ok(()) => Ok(()),
-            Err(true) => Err(StoreError::Cancelled("confirm cancelled")),
-            // Message must contain "load incomplete" so the confirm engine
-            // re-queues the batch instead of treating a wait timeout as a
-            // permanent reject.
-            Err(false) => Err(StoreError::Corrupt(
-                "confirm: load incomplete (parent package not ready, timeout)",
-            )),
-        }
-    }
-
-    /// Load Class A for heights into the confirm parent cache (load stage / tests).
+    /// Load Class A for heights: outs FIFO + **per-batch** parent pin + thin edges.
     ///
-    /// Full-decode bodies + parent pin. Pins every parent needed by heights in `items`
-    /// into a **per-batch** [`BatchParents`] map (caller carries it to write).
+    /// Returns `(stats, batch_parents, batch_thin)`. Thin edges are assemble-only
+    /// and must not be stored on the process parent cache.
     pub fn load_confirm_parents(
         &self,
         items: &[(u32, [u8; 32])],
-    ) -> Result<(ConfirmLoadStats, BatchParents), QueryError> {
+    ) -> Result<(ConfirmLoadStats, BatchParents, BatchThin), QueryError> {
         let t0 = Instant::now();
         let mut st = ConfirmLoadStats::default();
         let mut batch_parents = BatchParents::new();
+        let mut batch_thin = BatchThin::new();
         if items.is_empty() {
-            return Ok((st, batch_parents));
+            return Ok((st, batch_parents, batch_thin));
         }
         let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
 
+        // Always re-decode / re-pin claimed heights (batch-local thin + parents).
         let mut work: Vec<(u32, [u8; 32])> = Vec::new();
         for &(height, hash) in items {
             if self.confirm_cancelled() {
@@ -149,23 +126,11 @@ impl Query {
             if height <= tip {
                 continue;
             }
-            // Skip if already scanned this height (2-stage ready) with matching hash.
-            if self.confirm_parents.is_ready(height) {
-                if self
-                    .confirm_parents
-                    .get_header_plan(height)
-                    .is_some_and(|p| p.header_rec.hash == hash)
-                {
-                    st.already_ready = st.already_ready.saturating_add(1);
-                    continue;
-                }
-            }
-            // Incomplete or hash mismatch: re-decode / re-pin.
             work.push((height, hash));
         }
         if work.is_empty() {
             crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
-            return Ok((st, batch_parents));
+            return Ok((st, batch_parents, batch_thin));
         }
         self.confirm_parents.ensure_plans(&work);
 
@@ -185,7 +150,7 @@ impl Query {
         let mut parent_need: HashMap<u64, Vec<u32>> = HashMap::new(); // parent_fk → need heights
         // parent_fk → needed prev_index (vouts) for sparse outs stash.
         let mut parent_vouts: HashMap<u64, Vec<u32>> = HashMap::new();
-        let mut thin_by_spend: HashMap<u64, Vec<StashedThinInput>> = HashMap::new();
+        let mut thin_by_spend: BatchThin = BatchThin::new();
         let mut batch_create_ids: HashSet<u64> = HashSet::new();
 
         for &(height, hash) in &work {
@@ -281,13 +246,6 @@ impl Query {
                 let Some(id) = fk.get() else {
                     continue;
                 };
-                // Sliding-window re-touch: body still in cache → no store re-decode.
-                if let Some((txid, prevouts)) = self.confirm_parents.body_prevout_edges(fk) {
-                    batch_create_ids.insert(id);
-                    body_prevouts.insert(id, (txid, prevouts));
-                    st.creates_registered = st.creates_registered.saturating_add(1);
-                    continue;
-                }
                 if let Some((off, len)) = range {
                     need_full_meta.push((i, fk));
                     need_full.push((fk, off, len));
@@ -364,10 +322,10 @@ impl Query {
                 let Some((_txid, prevouts)) = body_prevouts.get(&id) else {
                     continue;
                 };
-                let mut edges: Vec<StashedThinInput> = Vec::with_capacity(prevouts.len());
+                let mut edges: Vec<ThinInput> = Vec::with_capacity(prevouts.len());
                 for &(create_fk_opt, _prev_txid, prev_index) in prevouts {
                     if create_fk_opt.is_none() && prev_index == u32::MAX {
-                        edges.push(StashedThinInput {
+                        edges.push(ThinInput {
                             create_fk: None,
                             prev_index,
                         });
@@ -375,7 +333,7 @@ impl Query {
                         continue;
                     }
                     if let Some(pid) = create_fk_opt {
-                        edges.push(StashedThinInput {
+                        edges.push(ThinInput {
                             create_fk: Some(pid),
                             prev_index,
                         });
@@ -391,7 +349,7 @@ impl Query {
                         continue;
                     }
                     // Unstamped non-coinbase: corrupt / pre-v10 body.
-                    edges.push(StashedThinInput {
+                    edges.push(ThinInput {
                         create_fk: None,
                         prev_index,
                     });
@@ -607,17 +565,13 @@ impl Query {
             .pin_new_meta_ns
             .saturating_add(t_new.elapsed().as_nanos() as u64);
 
-        // Parents already moved into BatchParents; no shared body_range put.
+        // Parents already moved into BatchParents; thin stays batch-local.
         st.pin_put_ns = 0;
         st.parent_pin_ns = st
             .parent_pin_ns
             .saturating_add(t_par.elapsed().as_nanos() as u64);
 
-        let thin_items: Vec<(Fk, Vec<StashedThinInput>)> = thin_by_spend
-            .into_iter()
-            .map(|(id, edges)| (Fk(id), edges))
-            .collect();
-        self.confirm_parents.put_thin_inputs_batch(thin_items);
+        batch_thin = thin_by_spend;
 
         let scanned: Vec<u32> = height_tx_fks.iter().map(|(h, _)| *h).collect();
         if !scanned.is_empty() {
@@ -625,13 +579,13 @@ impl Query {
         }
 
         crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
-        Ok((st, batch_parents))
+        Ok((st, batch_parents, batch_thin))
     }
 
     pub fn load_confirm_parents_for_hashes(
         &self,
         hashes: &[[u8; 32]],
-    ) -> Result<(ConfirmLoadStats, BatchParents), QueryError> {
+    ) -> Result<(ConfirmLoadStats, BatchParents, BatchThin), QueryError> {
         let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
         let mut items = Vec::with_capacity(hashes.len());
         for (i, hash) in hashes.iter().enumerate() {

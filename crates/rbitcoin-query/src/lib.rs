@@ -36,6 +36,7 @@ use std::sync::Mutex;
 pub type QueryError = StoreError;
 
 pub use batch_parents::BatchParents;
+pub use confirm_load::BatchThin;
 pub use catchup::IndexMode;
 pub use connect::ConfirmPrepared;
 pub use confirm_load::ConfirmLoadStats;
@@ -183,7 +184,6 @@ pub mod confirm_load_stats {
         add!(blocks, BLOCKS);
         add!(utxo_parents, UTXO_PARENTS);
         add!(creates_registered, CREATES);
-        add!(already_ready, ALREADY_READY);
         add!(parent_unique, PARENT_UNIQUE);
         add!(pin_cache_body, PIN_CACHE_BODY);
         add!(pin_new, PIN_NEW);
@@ -755,8 +755,6 @@ impl Query {
     pub fn request_confirm_cancel(&self) {
         self.confirm_cancel
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        // Wake any thread blocked on cache ready (tests / cancel path).
-        self.confirm_parents.notify_ready_waiters();
     }
 
     /// Clear cancel before a new confirm/IBD session.

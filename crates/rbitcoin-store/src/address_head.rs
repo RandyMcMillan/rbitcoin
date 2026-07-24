@@ -30,7 +30,7 @@
 //!
 //! **Mainnet default:** BITS=**26** → **256 MiB** sparse @ 4 B (`2^16` pages × 4 KiB).
 //! Online resize widens BITS; entry width becomes 8 B at BITS ≥ 33 (page then 8 KiB —
-//! two OS pages; future tuning). Load trigger: [`HEAD_LOAD_START`] (0.75).
+//! two OS pages; future tuning). Load trigger: [`HEAD_LOAD_START`] (0.80).
 
 use crate::error::StoreError;
 use crate::file::{TableFile, TRAILING_FOOTER_LEN};
@@ -78,7 +78,7 @@ pub const MAX_BITS: u32 = 34;
 pub const MIN_BITS: u32 = 8;
 
 /// Start sequential rebuild when `txs.count() / slots >=` this.
-pub const HEAD_LOAD_START: f64 = 0.75;
+pub const HEAD_LOAD_START: f64 = 0.80;
 /// Warn while resizing if load reaches this.
 pub const HEAD_LOAD_WARN: f64 = 0.85;
 /// Soft ceiling (align open-address 7/8); avoid dwelling here.
@@ -1037,10 +1037,10 @@ mod tests {
     }
 
     #[test]
-    fn load_trigger_at_75_percent() {
+    fn load_trigger_at_80_percent() {
         let slots = 1024u64;
         let thr = ((slots as f64) * HEAD_LOAD_START).ceil() as u64;
-        assert_eq!(thr, 768); // ceil(0.75 * 1024)
+        assert_eq!(thr, 820); // ceil(0.80 * 1024)
         assert!(!load_needs_resize(thr - 1, slots));
         assert!(load_needs_resize(thr, slots));
         assert!(load_needs_resize(slots, slots));

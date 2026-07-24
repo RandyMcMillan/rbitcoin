@@ -2115,7 +2115,7 @@ impl TxTable {
         if !entries.is_empty() {
             self.head_insert_many_with_resize_retry(entries)?;
         }
-        // First insert past PROBE_DEPTH_WARN requests early widen (before load 0.75
+        // First insert past PROBE_DEPTH_WARN requests early widen (before load 0.80
         // or probe exhaust).
         if take_probe_depth_resize_request() && !self.head_resize_in_progress() {
             self.ensure_head_resize_for_probe_exhaust()?;
@@ -3091,7 +3091,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // 2^8 = 256 slots; trigger at ceil(0.75*256)=192.
+        // 2^8 = 256 slots; trigger at ceil(0.80*256)=205.
         let t = create_bits(&dir, 8);
         assert_eq!(t.head_slots(), 256);
         let mk = |i: u64| {
@@ -3117,7 +3117,7 @@ mod tests {
             let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
             (rec, inputs, outputs)
         };
-        for i in 1..=200u64 {
+        for i in 1..=210u64 {
             let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
         }
         // head_insert_many should have started resize; drive fill to completion.
@@ -3127,7 +3127,7 @@ mod tests {
         }
         assert!(t.head_bits() >= 9, "bits={}", t.head_bits());
         // Spot-check resolves.
-        for i in [1u64, 100, 200] {
+        for i in [1u64, 100, 210] {
             let mut txid = [0u8; 32];
             txid[0..8].copy_from_slice(&i.to_le_bytes());
             assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)));

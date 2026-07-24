@@ -88,7 +88,7 @@ pre-size; not 256-way), **scripthash** 16 shards, **tx.head** = single address f
 starting at mainnet **BITS=26** (~**256 MiB** sparse, `2^26` × **4 B** create_fk;
 override with `RBITCOIN_TX_HEAD_BITS` in `8..=34` / tiny scale). Probe is **page-local**:
 high txid bits select a 1024-slot page, double-hash within the page (one 4 KiB IO @ 4 B).
-**Online sequential resize** when `txs.count()/slots ≥ 0.75` or first deep insert
+**Online sequential resize** when `txs.count()/slots ≥ 0.80` or first deep insert
 (depth>128) / probe exhaust: shadow rebuild on a **dedicated OS thread**
 (`rbitcoin-tx-head-resize`). BITS **33+** use **8 B** entries. Layout (**v5**) lives in the
 `tx.head` **trailing footer** (page-local probe, slots at offset 0); no `tx.head.meta`

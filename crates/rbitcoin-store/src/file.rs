@@ -63,8 +63,12 @@ pub struct TableFile {
     read_file: File,
     /// Always non-null after construction. Loaded with Arc refcount bump.
     epoch: AtomicPtr<MapEpoch>,
-    /// Logical length including header (published HWM).
+    /// Logical length including header/trailer (published HWM).
     published_len: AtomicU64,
+    /// When true: 16-byte magic+HWM trailer is at **end** of published range;
+    /// data starts at offset 0 (page-aligned open-address tables).
+    trailing_header: bool,
+    kind: TableKind,
 }
 
 impl Drop for TableFile {
@@ -144,14 +148,127 @@ impl TableFile {
         let epoch = Arc::new(MapEpoch { map });
         let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
 
-        let _ = kind;
         Ok(Self {
             path,
             file: Mutex::new(file),
             read_file,
             epoch: Self::install_epoch(epoch),
             published_len: AtomicU64::new(FILE_HEADER_LEN as u64),
+            trailing_header: false,
+            kind,
         })
+    }
+
+    /// Create a table whose **data starts at offset 0** and the 16-byte
+    /// magic/schema/kind/HWM trailer sits at the **end** of the published length.
+    ///
+    /// Used by page-local `tx.head` so probe pages are OS-page-aligned.
+    pub fn create_trailing_header(
+        path: impl Into<PathBuf>,
+        kind: TableKind,
+    ) -> Result<Self, StoreError> {
+        let path = path.into();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| StoreError::io(&path, e))?;
+        // Minimal size: trailer only until caller sets body+trailer length.
+        let initial = FILE_HEADER_LEN as u64;
+        file.set_len(initial)
+            .map_err(|e| StoreError::io(&path, e))?;
+        let map = unsafe { MmapMut::map_mut(&file) }.map_err(|e| StoreError::io(&path, e))?;
+        let epoch = Arc::new(MapEpoch { map });
+        let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
+        let s = Self {
+            path,
+            file: Mutex::new(file),
+            read_file,
+            epoch: Self::install_epoch(epoch),
+            published_len: AtomicU64::new(initial),
+            trailing_header: true,
+            kind,
+        };
+        s.write_trailer(initial)?;
+        Ok(s)
+    }
+
+    /// Open a trailing-header table (magic at end). `data_bytes` is the slot/body
+    /// length (excluding the 16-byte trailer); total published = data_bytes + 16.
+    pub fn open_trailing_header(
+        path: impl Into<PathBuf>,
+        kind: TableKind,
+        data_bytes: u64,
+    ) -> Result<Self, StoreError> {
+        let path = path.into();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| StoreError::io(&path, e))?;
+        let file_len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
+        let expect = data_bytes.saturating_add(FILE_HEADER_LEN as u64);
+        if file_len < expect {
+            return Err(StoreError::Corrupt("trailing-header table short"));
+        }
+        // Trailer at end of logical data region.
+        let mut trailer = [0u8; FILE_HEADER_LEN];
+        file.seek(SeekFrom::Start(data_bytes))
+            .map_err(|e| StoreError::io(&path, e))?;
+        file.read_exact(&mut trailer)
+            .map_err(|e| StoreError::io(&path, e))?;
+        if trailer[0..4] != STORE_MAGIC {
+            // Leading-header legacy looks like BadMagic here → rebuild via meta.
+            return Err(StoreError::BadMagic);
+        }
+        let ver = u16::from_le_bytes([trailer[4], trailer[5]]);
+        if ver != SCHEMA_VERSION {
+            return Err(StoreError::BadSchema(ver));
+        }
+        let got = u16::from_le_bytes([trailer[6], trailer[7]]);
+        if got != kind.as_u16() {
+            return Err(StoreError::BadKind {
+                expected: kind.as_u16(),
+                got,
+            });
+        }
+        let logical = expect;
+        let map = unsafe { MmapMut::map_mut(&file) }.map_err(|e| StoreError::io(&path, e))?;
+        let epoch = Arc::new(MapEpoch { map });
+        let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
+        Ok(Self {
+            path,
+            file: Mutex::new(file),
+            read_file,
+            epoch: Self::install_epoch(epoch),
+            published_len: AtomicU64::new(logical),
+            trailing_header: true,
+            kind,
+        })
+    }
+
+    fn write_trailer(&self, logical: u64) -> Result<(), StoreError> {
+        if logical < FILE_HEADER_LEN as u64 {
+            return Err(StoreError::Corrupt("trailing header logical short"));
+        }
+        let base = logical - FILE_HEADER_LEN as u64;
+        let mut trailer = [0u8; FILE_HEADER_LEN];
+        trailer[0..4].copy_from_slice(&STORE_MAGIC);
+        trailer[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
+        trailer[6..8].copy_from_slice(&self.kind.as_u16().to_le_bytes());
+        trailer[8..16].copy_from_slice(&logical.to_le_bytes());
+        // Ensure capacity then write via mmap path.
+        self.ensure_capacity(logical)?;
+        let pin = self.pin();
+        if pin.epoch.cap() < logical {
+            return Err(StoreError::Corrupt("trailer past map"));
+        }
+        unsafe {
+            let dst = pin.epoch.as_ptr().add(base as usize) as *mut u8;
+            ptr::copy_nonoverlapping(trailer.as_ptr(), dst, FILE_HEADER_LEN);
+        }
+        Ok(())
     }
 
     pub fn open(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
@@ -198,12 +315,16 @@ impl TableFile {
             read_file,
             epoch: Self::install_epoch(epoch),
             published_len: AtomicU64::new(logical),
+            trailing_header: false,
+            kind,
         })
     }
 
     pub fn logical_len(&self) -> u64 {
         self.published_len.load(Ordering::Acquire)
     }
+
+
 
     pub fn path(&self) -> &std::path::Path {
         &self.path
@@ -217,15 +338,27 @@ impl TableFile {
 
 
 
-    /// Shrink or set logical length (must be ≥ header size). Does not zero freed bytes.
+    /// Shrink or set logical length (must be ≥ header/trailer size). Does not zero freed bytes.
     pub fn set_logical_len(&self, logical: u64) -> Result<(), StoreError> {
         if logical < FILE_HEADER_LEN as u64 {
             return Err(StoreError::Corrupt("logical length below header"));
         }
         self.ensure_capacity(logical)?;
         self.published_len.store(logical, Ordering::Release);
-        self.write_hwm_mmap(logical);
+        if self.trailing_header {
+            self.write_trailer(logical)?;
+        } else {
+            self.write_hwm_mmap(logical);
+        }
         Ok(())
+    }
+
+    /// Slot/data length excluding the 16-byte header or trailer.
+    #[inline]
+    pub fn data_len(&self) -> u64 {
+        self.published_len
+            .load(Ordering::Acquire)
+            .saturating_sub(FILE_HEADER_LEN as u64)
     }
 
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
@@ -457,12 +590,20 @@ impl TableFile {
 
     fn write_hwm_mmap(&self, logical: u64) {
         let pin = self.pin();
-        if pin.epoch.cap() < 16 {
+        if pin.epoch.cap() < logical.max(FILE_HEADER_LEN as u64) {
             return;
         }
         let bytes = logical.to_le_bytes();
+        let hwm_off = if self.trailing_header {
+            logical.saturating_sub(FILE_HEADER_LEN as u64).saturating_add(8)
+        } else {
+            8
+        };
+        if hwm_off + 8 > pin.epoch.cap() {
+            return;
+        }
         unsafe {
-            let dst = pin.epoch.as_ptr().add(8) as *mut u8;
+            let dst = pin.epoch.as_ptr().add(hwm_off as usize) as *mut u8;
             ptr::copy_nonoverlapping(bytes.as_ptr(), dst, 8);
         }
     }
@@ -470,7 +611,12 @@ impl TableFile {
     fn persist_logical_len(&self, logical: u64) -> Result<(), StoreError> {
         self.write_hwm_mmap(logical);
         let mut file = self.file.lock().unwrap();
-        file.seek(SeekFrom::Start(8))
+        let seek = if self.trailing_header {
+            logical.saturating_sub(FILE_HEADER_LEN as u64).saturating_add(8)
+        } else {
+            8
+        };
+        file.seek(SeekFrom::Start(seek))
             .map_err(|e| StoreError::io(&self.path, e))?;
         file.write_all(&logical.to_le_bytes())
             .map_err(|e| StoreError::io(&self.path, e))?;

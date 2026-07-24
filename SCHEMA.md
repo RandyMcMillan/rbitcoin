@@ -187,7 +187,8 @@ Keyless open-address table: **txid → dense create_fk**.
 | Env | `RBITCOIN_TX_HEAD_BITS` in **8..=34**; tiny scale uses BITS=16 |
 | Entry | LE create_fk; **0 = empty**; **no HAS_NEXT** |
 | Entry width | **4 B** for BITS ≤ 32; **8 B** for BITS ≥ 33 (page then 8 KiB) |
-| Meta | `tx.head.meta`: bits, entry_bytes, generation; **version 3** = page-local probe |
+| Meta | `tx.head.meta`: bits, entry_bytes, generation; **version 4** = page-local + trailing file magic |
+| File layout | Slots at **offset 0** (page-aligned); 16-byte store magic/HWM **trailer at end** |
 | Probe | **Page** from high txid bits; **10-bit** in-page double-hash; one page load (4 KiB @ 4 B); max depth **1024**; first insert depth **>128** starts online resize if not already running |
 | Insert | First empty in-page (or same fk idempotent); second same-txid goes **deeper** in-page |
 | Lookup | Body-verify from **last occupied → first** (newest BIP30-shaped create wins) |

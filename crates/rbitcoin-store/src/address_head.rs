@@ -20,8 +20,11 @@
 //! first, body-verify — so the deepest same-txid create wins (newest under
 //! append-deeper insert).
 //!
-//! **Probe:** double hashing from the txid (`h1` / odd `h2`), capped at
-//! [`MAX_PROBE`]. Foreign occupants are normal on lookup: body mismatch ⇒ continue.
+//! **Probe:** **linear** from primary slot `h1(txid)` (`slot = (h1 + d) mod 2^bits`),
+//! capped at [`MAX_PROBE`]. Consecutive depths stay on adjacent slots (page locality
+//! for cold mmap). Foreign occupants are normal on lookup: body mismatch ⇒ continue.
+//! (Keyless entries cannot Robin-Hood: foreigner probe depth is unknown without a
+//! body read.)
 //!
 //! **Mainnet default:** BITS=28 → **1 GiB** sparse @ 4 B entries. Online resize
 //! widens BITS (sequential rebuild from `tx.idx`); entry width becomes 8 B at
@@ -113,7 +116,9 @@ fn note_probe_exhausted() {
 }
 
 const META_MAGIC: &[u8; 4] = b"THM1";
-const META_VERSION: u16 = 1;
+/// `2` = linear probe from `h1`. Version `1` was double-hash (`h1 + d·h2`); open
+/// refuses v1 so [`crate::tx_table::TxTable::open`] recreates + rebuilds.
+const META_VERSION: u16 = 2;
 
 /// On-disk / in-memory address-head geometry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,6 +179,7 @@ pub fn entry_bytes_for_bits(bits: u32) -> u8 {
 }
 
 /// Leading `bits` of the txid as a big-endian bit stream (supports bits up to 34).
+/// Primary home slot for linear probing.
 #[inline]
 pub fn h1(txid: &[u8; 32], bits: u32) -> u64 {
     debug_assert!((MIN_BITS..=MAX_BITS).contains(&bits));
@@ -184,25 +190,14 @@ pub fn h1(txid: &[u8; 32], bits: u32) -> u64 {
     v >> (64 - bits)
 }
 
-/// Odd step in `0..2^bits` from bytes after the h1 region.
-#[inline]
-pub fn h2(txid: &[u8; 32], bits: u32) -> u64 {
-    debug_assert!((MIN_BITS..=MAX_BITS).contains(&bits));
-    let mask = (1u64 << bits) - 1;
-    // Use bytes 4..12 so low-bit tables still get entropy when h1 took top of 0..8.
-    let v = u64::from_be_bytes([
-        txid[4], txid[5], txid[6], txid[7], txid[8], txid[9], txid[10], txid[11],
-    ]);
-    (v | 1) & mask
-}
-
-/// Probe index at depth `d` (double hashing).
+/// Probe index at depth `d` (**linear** from [`h1`]).
+///
+/// `slot(d) = (h1(txid) + d) mod 2^bits`. Adjacent depths are consecutive slots
+/// (wrap at table end), matching `HashHead` / `ScriptHashHead` locality.
 #[inline]
 pub fn probe_index(txid: &[u8; 32], d: u32, bits: u32) -> u64 {
     let mask = (1u64 << bits) - 1;
-    let h1 = h1(txid, bits);
-    let h2 = h2(txid, bits);
-    h1.wrapping_add(u64::from(d).wrapping_mul(h2)) & mask
+    h1(txid, bits).wrapping_add(u64::from(d)) & mask
 }
 
 /// Resolve address width for new creates.
@@ -274,7 +269,10 @@ pub fn read_head_meta(head_path: &Path) -> Result<Option<(HeadLayout, u64)>, Sto
     }
     let ver = u16::from_le_bytes([raw[4], raw[5]]);
     if ver != META_VERSION {
-        return Err(StoreError::Corrupt("tx.head.meta version"));
+        // v1 = double-hash layout; linear probe is incompatible without rebuild.
+        return Err(StoreError::Corrupt(
+            "tx.head.meta version (linear probe; rebuild tx.head)",
+        ));
     }
     let bits = u32::from(raw[6]);
     let entry_bytes = raw[7];
@@ -353,31 +351,23 @@ impl AddressHead {
             return Err(StoreError::Corrupt("address head size"));
         }
 
-        let (layout, generation) = if let Some((layout, gen)) = read_head_meta(&path)? {
-            let expect = layout.body_bytes();
-            if body != expect {
+        // Require current meta (probe algorithm is part of the layout). Missing or
+        // v1 meta → error so TxTable::open can recreate + rebuild from Class A.
+        let (layout, generation) = match read_head_meta(&path)? {
+            Some((layout, gen)) => {
+                let expect = layout.body_bytes();
+                if body != expect {
+                    return Err(StoreError::Corrupt(
+                        "address head size mismatch vs tx.head.meta",
+                    ));
+                }
+                (layout, gen)
+            }
+            None => {
                 return Err(StoreError::Corrupt(
-                    "address head size mismatch vs tx.head.meta",
+                    "tx.head.meta missing (linear probe; rebuild tx.head)",
                 ));
             }
-            (layout, gen)
-        } else {
-            // Legacy: 4 B entries, infer bits from body.
-            if body % 4 != 0 {
-                return Err(StoreError::Corrupt("address head size (legacy 4B)"));
-            }
-            let slots = body / 4;
-            if !slots.is_power_of_two() || slots < 256 {
-                return Err(StoreError::Corrupt("address head slots not power of two"));
-            }
-            let bits = slots.trailing_zeros();
-            if !(MIN_BITS..=MAX_BITS).contains(&bits) {
-                return Err(StoreError::Corrupt("address head bits out of range"));
-            }
-            // Write meta so future opens are unambiguous.
-            let layout = HeadLayout::with_entry_bytes(bits, 4)?;
-            write_head_meta(&path, layout, 0)?;
-            (layout, 0)
         };
 
         let slots = layout.slots();
@@ -704,6 +694,31 @@ mod tests {
     }
 
     #[test]
+    fn probe_is_linear_from_h1() {
+        let k = [0xabu8; 32];
+        let bits = 16u32;
+        let mask = (1u64 << bits) - 1;
+        let home = h1(&k, bits);
+        assert_eq!(probe_index(&k, 0, bits), home);
+        for d in 0..32u32 {
+            let expect = home.wrapping_add(u64::from(d)) & mask;
+            assert_eq!(probe_index(&k, d, bits), expect, "d={d}");
+        }
+        // Wrap: last slot then 0.
+        let near_end = mask;
+        // Craft txid whose h1 is near_end via top bits of first 8 bytes.
+        // h1 = first 8 bytes BE >> (64-bits).
+        let mut k2 = [0u8; 32];
+        // For bits=16, top 16 bits of first 8 bytes = 0xffff → h1 = 0xffff.
+        k2[0] = 0xff;
+        k2[1] = 0xff;
+        assert_eq!(h1(&k2, 16), near_end);
+        assert_eq!(probe_index(&k2, 0, 16), near_end);
+        assert_eq!(probe_index(&k2, 1, 16), 0);
+        assert_eq!(probe_index(&k2, 2, 16), 1);
+    }
+
+    #[test]
     fn probe_bits_28_to_34_in_range() {
         let k = [0x11u8; 32];
         for bits in [28u32, 31, 32, 33, 34] {
@@ -711,7 +726,31 @@ mod tests {
             assert!(idx < (1u64 << bits), "bits={bits} idx={idx}");
             let idx2 = probe_index(&k, 7, bits);
             assert!(idx2 < (1u64 << bits));
+            // Consecutive depths differ by 1 (mod 2^bits).
+            let mask = (1u64 << bits) - 1;
+            assert_eq!(idx2, idx.wrapping_add(7) & mask);
         }
+    }
+
+    #[test]
+    fn meta_v1_refused_linear_probe() {
+        let path = tmp("meta_v1");
+        let h = AddressHead::create_with_bits(&path, 12).unwrap();
+        drop(h);
+        // Rewrite meta as v1 (double-hash era).
+        let mut meta = path.as_os_str().to_os_string();
+        meta.push(".meta");
+        let meta = PathBuf::from(meta);
+        let mut buf = std::fs::read(&meta).unwrap();
+        buf[4..6].copy_from_slice(&1u16.to_le_bytes());
+        std::fs::write(&meta, &buf).unwrap();
+        match AddressHead::open(&path) {
+            Err(StoreError::Corrupt(m)) if m.contains("linear probe") => {}
+            Err(e) => panic!("expected linear-probe meta error, got {e}"),
+            Ok(_) => panic!("expected open failure for meta v1"),
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&meta);
     }
 
     #[test]

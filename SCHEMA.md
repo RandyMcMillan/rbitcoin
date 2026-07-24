@@ -187,10 +187,12 @@ Keyless open-address table: **txid → dense create_fk**.
 | Env | `RBITCOIN_TX_HEAD_BITS` in **8..=34**; tiny scale uses BITS=16 |
 | Entry | LE create_fk; **0 = empty**; **no HAS_NEXT** |
 | Entry width | **4 B** for BITS ≤ 32; **8 B** for BITS ≥ 33 |
-| Meta | `tx.head.meta`: bits, entry_bytes, generation |
-| Probe | Double-hash from txid; max depth 128; stop at empty |
-| Insert | First empty (or same fk idempotent); second same-txid create goes **deeper** |
+| Meta | `tx.head.meta`: bits, entry_bytes, generation; **version 2** = linear probe |
+| Probe | **Linear** from primary `h1(txid)`: `slot = (h1 + d) mod 2^bits`; max depth 128; stop at empty |
+| Insert | First empty (or same fk idempotent); second same-txid create goes **deeper** on the run |
 | Lookup | Body-verify from **last occupied → first** (newest BIP30-shaped create wins) |
+
+**Probe note:** same locality model as key-prefix hash heads (`header.head`, `scripthash.head`). Keyless slots cannot Robin-Hood (foreigner depth unknown without a body read). Meta **v1** (double-hash) is refused on open → recreate + rebuild from Class A.
 
 ### Online sequential resize
 

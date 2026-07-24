@@ -85,11 +85,13 @@ prefer a **fresh datadir**.
 New stores (schema **v10**): **header.head** = **single** open-address file (~24 MiB
 pre-size; not 256-way), **scripthash** 16 shards, **tx.head** = single address file
 starting at mainnet **BITS=28** (~**1 GiB** sparse, `2^28` × **4 B** create_fk;
-override with `RBITCOIN_TX_HEAD_BITS` in `8..=34` / tiny scale). **Online sequential
+override with `RBITCOIN_TX_HEAD_BITS` in `8..=34` / tiny scale). Probe is **linear**
+from primary `h1(txid)` (adjacent slots; page-friendly). **Online sequential
 resize** when `txs.count()/slots ≥ 0.75`: rebuild shadow from dense `tx.idx` order
 (batch idx pread + io_uring/parallel body-txid prefixes, ordered `insert_many` into
 `tx.head.new`; no dual-write on archive), then atomic rename. BITS **33+** use **8 B** entries.
-Legacy heads without `tx.head.meta` open as 4 B and may grow upward only.
+`tx.head.meta` **v2** marks linear probe; older meta / missing meta forces recreate +
+rebuild from Class A on open.
 **tx_height** uses 4 B height slots (not fk width). Dense Class A fk + **tx.idx**
 retained. Packed Class A only. Spends are schema-v5 annotations on create outputs
 (no `point.head`).

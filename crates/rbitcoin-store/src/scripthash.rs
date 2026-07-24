@@ -695,11 +695,11 @@ impl ScriptHashTable {
 
     /// Start a buffered cold bulk session (historical migration builder path).
     ///
-    /// Pre-sizes **empty** head shards for `expected_keys` so each shard can be
-    /// bulk-filled from RAM once at [`ScriptHashBulkSession::finish`]. Head
-    /// values are deferred (per-shard buckets) until finish — no intermediate
-    /// open-address RMW. Continues from the current alloc bump. Exclusive until
-    /// finish.
+    /// Pre-sizes **empty** head shards for `expected_keys`. Callers stream
+    /// **scripthash-sorted** chains via [`ScriptHashBulkSession::put_chain`]:
+    /// with prefix sharding, lex order is contiguous per shard, so the session
+    /// bulk-fills each head as the stream crosses a shard boundary (only one
+    /// shard's head values in RAM). Exclusive until finish.
     pub fn bulk_session(&self, expected_keys: u64) -> Result<ScriptHashBulkSession<'_>, StoreError> {
         if !self.head.is_empty() {
             return Err(StoreError::Corrupt(
@@ -712,7 +712,8 @@ impl ScriptHashTable {
         let n_shards = self.head.shard_count().max(1);
         let per_cap = (expected_keys as usize)
             .div_ceil(n_shards)
-            .saturating_add(1);
+            .saturating_add(1)
+            .min(1 << 20);
         let (bump, live_count) = {
             let a = self.alloc.lock().unwrap();
             (a.bump, a.live_count)
@@ -721,34 +722,43 @@ impl ScriptHashTable {
             table: self,
             bump,
             live_count,
-            head_shards: (0..n_shards)
-                .map(|_| Vec::with_capacity(per_cap.min(1 << 20)))
-                .collect(),
+            active_shard: None,
+            head_buf: Vec::with_capacity(per_cap),
+            head_cap_hint: per_cap,
             body_buf: Vec::with_capacity(BULK_BODY_FLUSH.min(4 << 20)),
             body_write_off: bump,
             finished: false,
             keys_written: 0,
+            shards_flushed: 0,
         })
+    }
+
+    /// Number of SH head shards (1 on Tiny, 16 on mainnet).
+    pub fn head_shard_count(&self) -> usize {
+        self.head.shard_count()
     }
 }
 
-/// Buffered bulk writer for cold SH materialize (revived from migration
-/// `ScriptHashBulkBuilder`).
+/// Buffered bulk writer for cold SH materialize.
 ///
-/// Streams complete per-key create chains via [`put_chain`]: body slabs buffer
-/// (~16 MiB); **heads are deferred** into per-shard buckets and written once at
-/// [`finish`] with a single empty-table bulk fill per shard (full shard image
-/// in RAM, one sequential write).
+/// Stream **scripthash-sorted** [`put_chain`] calls (as sorted runs produce).
+/// Prefix sharding makes that order contiguous per head shard: body slabs
+/// buffer (~16 MiB); when the stream enters a new shard, the previous shard's
+/// head is written with one empty-table bulk fill and the head buffer is
+/// freed. Peak head RAM ≈ one shard only.
 pub struct ScriptHashBulkSession<'a> {
     table: &'a ScriptHashTable,
     bump: u64,
     live_count: u64,
-    /// Per-shard deferred heads (index = [`ShardedScriptHashHead::shard_index`]).
-    head_shards: Vec<Vec<([u8; 32], ShHeadValue)>>,
+    active_shard: Option<usize>,
+    /// Deferred heads for `active_shard` only.
+    head_buf: Vec<([u8; 32], ShHeadValue)>,
+    head_cap_hint: usize,
     body_buf: Vec<u8>,
     body_write_off: u64,
     finished: bool,
     keys_written: u64,
+    shards_flushed: u32,
 }
 
 const BULK_BODY_FLUSH: usize = 16 * 1024 * 1024;
@@ -764,12 +774,34 @@ impl<'a> ScriptHashBulkSession<'a> {
         self.keys_written
     }
 
+    /// Head shards fully bulk-filled so far.
+    pub fn shards_flushed(&self) -> u32 {
+        self.shards_flushed
+    }
+
     /// Pack one key's live creates (oldest→newest). Empty chains are skipped.
+    ///
+    /// Keys must be presented in **non-decreasing scripthash order** (sorted-run
+    /// merge). Crossing a prefix-shard boundary flushes the previous shard head.
     pub fn put_chain(&mut self, key: [u8; 32], entries: &[ShEntry]) -> Result<(), StoreError> {
         let n = entries.len() as u32;
         if n == 0 {
             return Ok(());
         }
+        let si = self.table.head.shard_index(&key);
+        if self.active_shard != Some(si) {
+            if let Some(prev) = self.active_shard {
+                if si < prev {
+                    return Err(StoreError::Corrupt(
+                        "scripthash bulk put_chain: keys not sorted by scripthash (shard went backwards)",
+                    ));
+                }
+                self.flush_active_shard()?;
+            }
+            self.active_shard = Some(si);
+            self.head_buf = Vec::with_capacity(self.head_cap_hint);
+        }
+
         self.live_count = self.live_count.saturating_add(u64::from(n));
         self.keys_written = self.keys_written.saturating_add(1);
 
@@ -786,16 +818,13 @@ impl<'a> ScriptHashBulkSession<'a> {
             let need = slab_bytes(class);
             let off = self.bump;
             self.bump = self.bump.saturating_add(need);
-            // Pad gap if body_buf is contiguous from body_write_off.
             let pending_end = self.body_write_off + self.body_buf.len() as u64;
             if pending_end < off {
-                // Should not happen with sequential bump alloc.
                 self.flush_body()?;
             }
             for e in entries {
                 self.body_buf.extend_from_slice(&e.encode());
             }
-            // Zero-fill remainder of slab so freelist size classes stay aligned.
             let live_bytes = entries.len() * SH_ENTRY_LEN;
             let pad = need as usize - live_bytes;
             if pad > 0 {
@@ -811,9 +840,7 @@ impl<'a> ScriptHashBulkSession<'a> {
             }
         };
 
-        // Defer head durable write until finish (one bulk_fill_empty per shard).
-        let si = self.table.head.shard_index(&key);
-        self.head_shards[si].push((key, val));
+        self.head_buf.push((key, val));
         Ok(())
     }
 
@@ -874,17 +901,28 @@ impl<'a> ScriptHashBulkSession<'a> {
         Ok(())
     }
 
-    fn flush_heads_cold(&mut self) -> Result<(), StoreError> {
-        if self.head_shards.iter().all(|b| b.is_empty()) {
+    /// Flush body buffer, bulk-fill active shard head, free head RAM.
+    fn flush_active_shard(&mut self) -> Result<(), StoreError> {
+        let Some(si) = self.active_shard else {
             return Ok(());
+        };
+        // Body slabs for this shard's keys must be durable before head points at them.
+        self.flush_body()?;
+        if !self.head_buf.is_empty() {
+            self.table
+                .head
+                .bulk_fill_one_shard_cold(si, &mut self.head_buf)?;
+            self.shards_flushed = self.shards_flushed.saturating_add(1);
         }
-        self.table.head.bulk_fill_shards_cold(&mut self.head_shards)
+        self.head_buf.clear();
+        self.head_buf.shrink_to_fit();
+        self.active_shard = None;
+        Ok(())
     }
 
-    /// Flush body + deferred heads (one bulk fill per empty shard) + alloc header.
+    /// Flush last shard head + alloc header.
     pub fn finish(mut self) -> Result<(u64, u64), StoreError> {
-        self.flush_body()?;
-        self.flush_heads_cold()?;
+        self.flush_active_shard()?;
         if self.bump > self.table.body.logical_len() {
             self.table.body.set_logical_len(self.bump)?;
         }
@@ -905,9 +943,7 @@ impl Drop for ScriptHashBulkSession<'_> {
         if self.finished {
             return;
         }
-        // Best-effort publish of partial state so reinit/entry_count stay honest.
-        let _ = self.flush_body();
-        let _ = self.flush_heads_cold();
+        let _ = self.flush_active_shard();
         if self.bump > self.table.body.logical_len() {
             let _ = self.table.body.set_logical_len(self.bump);
         }
@@ -1318,11 +1354,11 @@ mod tests {
             session
                 .put_chain(sh, &[ShEntry::new(Fk(u64::from(i) + 1))])
                 .unwrap();
-            // Mid-session: durable head still empty (deferred).
+            // Active shard not yet bulk-filled: this key is only in the head buffer.
             if i == 70_000 {
                 assert!(
                     t.head_value(&sh).unwrap().is_none(),
-                    "heads must not land before finish"
+                    "active-shard heads must not land until shard boundary"
                 );
             }
         }

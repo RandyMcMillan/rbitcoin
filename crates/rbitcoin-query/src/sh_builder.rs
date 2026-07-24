@@ -273,16 +273,17 @@ impl ShRunBuilder {
             claimed.len()
         );
         let t0 = Instant::now();
-        // One buffered bulk session: pre-size empty head shards, 16 MiB body
-        // buffer, deferred heads → one bulk_fill_empty per shard at finish.
-        // Stream k-way merge into complete put_chain calls (key changes).
-        // expected_keys ≈ total creates (overestimate unique keys; reserve is cheap).
+        // Prefix-sharded heads: lex-sorted runs are already contiguous per shard.
+        // One k-way stream: body buffer + accumulate heads for the active shard;
+        // on shard boundary, bulk-fill that head (one RAM table write) and free it.
+        let n_shards = store.scripthash.head_shard_count();
         let mut session = store.scripthash.bulk_session(total_recs.max(1))?;
         let mut cur_key: Option<[u8; 32]> = None;
         let mut chain: Vec<ScriptHashEntry> = Vec::new();
         let mut seen: Vec<Fk> = Vec::new();
         let mut unique_in = 0u64;
         let mut last_log_keys = 0u64;
+        let mut last_shards = 0u32;
 
         for_each_merged_rec(&claimed, |rec| {
             if rec.len() < SH_RUN_REC_LEN as usize {
@@ -300,10 +301,15 @@ impl ShRunBuilder {
                         chain.clear();
                         seen.clear();
                         let keys = session.keys_written();
-                        if keys == 1 || keys.saturating_sub(last_log_keys) >= 100_000 {
+                        let shards = session.shards_flushed();
+                        if keys == 1
+                            || keys.saturating_sub(last_log_keys) >= 100_000
+                            || shards > last_shards
+                        {
                             last_log_keys = keys;
+                            last_shards = shards;
                             info!(
-                                "node: scripthash materialize progress keys≈{} creates≈{} elapsed={:?}",
+                                "node: scripthash materialize progress keys≈{} creates≈{} shards={shards}/{n_shards} elapsed={:?}",
                                 keys,
                                 session.creates_written(),
                                 t0.elapsed()
@@ -333,7 +339,7 @@ impl ShRunBuilder {
         }
         clear_runs_dir(&runs_dir);
         info!(
-            "node: scripthash bulk materialize done creates≈{n_total} keys≈{n_keys} unique_in≈{unique_in} elapsed={:?}",
+            "node: scripthash bulk materialize done creates≈{n_total} keys≈{n_keys} unique_in≈{unique_in} shards={n_shards} elapsed={:?}",
             t0.elapsed()
         );
         Ok(n_total)

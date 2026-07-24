@@ -50,6 +50,7 @@ pub use point_table::PointRecord;
 pub use scripthash::{
     script_hash, ScriptHashBulkSession, ScriptHashEntry, ScriptHashRecord, ScriptHashTable,
 };
+pub use scripthash_head::prefix_shard_of;
 pub use scripthash_layout::ShHeadValue;
 pub use sorted_run::{
     claim_run_for_materialize, crc32, detach_run, for_each_merged_rec, list_materialize_claims,

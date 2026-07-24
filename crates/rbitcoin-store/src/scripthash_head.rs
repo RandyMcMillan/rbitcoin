@@ -23,6 +23,28 @@ const DEFAULT_SLOTS: u64 = 64;
 const SLOTS_PER_CHUNK: u64 = 128; // 128 × 32 B = 4 KiB
 const CHUNK_CACHE_MAX: usize = 256;
 
+/// Shard index from the **high bits** of `scripthash[0]` (power-of-two `n_shards`).
+///
+/// Unlike `key[0] % n`, this makes lexicographic order of full scripthashes
+/// contiguous per shard: for 16 shards, bytes `0x00–0x0f` → shard 0,
+/// `0x10–0x1f` → 1, … So sorted runs already stream one complete shard at a
+/// time — cold materialize can bulk-fill each head without multipass.
+///
+/// `n_shards` must be 1 or a power of two ≤ 256 (mainnet SH uses 16).
+#[inline]
+pub fn prefix_shard_of(full: &[u8; 32], n_shards: usize) -> usize {
+    let n = n_shards.max(1);
+    if n == 1 {
+        return 0;
+    }
+    debug_assert!(
+        n.is_power_of_two() && n <= 256,
+        "scripthash prefix shards must be power-of-two ≤ 256, got {n}"
+    );
+    let bits = n.trailing_zeros() as usize; // log2(n)
+    (full[0] as usize) >> (8 - bits)
+}
+
 pub struct ScriptHashHead {
     file: TableFile,
     state: Mutex<HashState>,
@@ -675,12 +697,7 @@ impl ShardedScriptHashHead {
 
     #[inline]
     fn shard_of(&self, full: &[u8; 32]) -> usize {
-        let n = self.shards.len();
-        if n == 1 {
-            0
-        } else {
-            (full[0] as usize) % n
-        }
+        prefix_shard_of(full, self.shards.len())
     }
 
     pub fn get(&self, key: &[u8; 32]) -> Result<Option<ShHeadValue>, StoreError> {
@@ -726,9 +743,8 @@ impl ShardedScriptHashHead {
     /// Pre-size every **empty** shard so a single RAM [`ScriptHashHead::insert_many`]
     /// bulk-fill can place `expected_keys` (global) without mid-fill rehash.
     ///
-    /// Inflates by 25% then even-splits across shards (margin for `key[0] % n` skew).
-    /// Slot table bytes = `slots × 32`; that is the peak RAM for one
-    /// `bulk_fill_empty` (one shard at a time at finish).
+    /// Inflates by 25% then even-splits across shards (hash skew margin).
+    /// Slot table bytes = `slots × 32`; peak RAM for one `bulk_fill_empty`.
     pub fn reserve_for_cold_bulk(&self, expected_keys: u64) -> Result<(), StoreError> {
         if expected_keys == 0 {
             return Ok(());
@@ -742,40 +758,34 @@ impl ShardedScriptHashHead {
         self.reserve_additional(inflated)
     }
 
-    /// Cold materialize: one empty-table bulk fill per shard, releasing each
-    /// bucket before the next so only one full shard image is in RAM.
+    /// Empty-table bulk fill for **one** shard: full slot image in RAM, one write.
     ///
-    /// `buckets[i]` must contain only keys for shard `i`. Consumes the vectors.
-    /// Requires every shard to be empty (call after reinit / fresh create and
-    /// [`reserve_for_cold_bulk`]).
-    pub fn bulk_fill_shards_cold(
+    /// `entries` must all belong to `shard`. Requires that shard empty. Frees
+    /// the caller's vector via `std::mem::take` after insert.
+    pub fn bulk_fill_one_shard_cold(
         &self,
-        buckets: &mut [Vec<([u8; 32], ShHeadValue)>],
+        shard: usize,
+        entries: &mut Vec<([u8; 32], ShHeadValue)>,
     ) -> Result<(), StoreError> {
-        if buckets.len() != self.shards.len() {
+        if shard >= self.shards.len() {
             return Err(StoreError::Corrupt(
-                "scripthash bulk_fill_shards_cold: bucket/shard count mismatch",
+                "scripthash bulk_fill_one_shard_cold: shard out of range",
             ));
         }
-        for (i, s) in self.shards.iter().enumerate() {
-            if s.occupied() != 0 {
-                return Err(StoreError::Corrupt(
-                    "scripthash bulk_fill_shards_cold: shard not empty",
-                ));
-            }
-            let mut bucket = std::mem::take(&mut buckets[i]);
-            if bucket.is_empty() {
-                continue;
-            }
-            // Ensure capacity for this shard's actual key count (skew).
-            s.reserve_additional(bucket.len() as u64)?;
-            // insert_many → bulk_fill_empty while occupied==0: one RAM table + write.
-            s.insert_many(&bucket)?;
-            // Drop entries before building the next shard image.
-            bucket.clear();
-            bucket.shrink_to_fit();
-            drop(bucket);
+        let s = &self.shards[shard];
+        if s.occupied() != 0 {
+            return Err(StoreError::Corrupt(
+                "scripthash bulk_fill_one_shard_cold: shard not empty",
+            ));
         }
+        let bucket = std::mem::take(entries);
+        if bucket.is_empty() {
+            return Ok(());
+        }
+        s.reserve_additional(bucket.len() as u64)?;
+        // insert_many → bulk_fill_empty while occupied==0.
+        s.insert_many(&bucket)?;
+        drop(bucket);
         Ok(())
     }
 
@@ -851,6 +861,31 @@ mod tests {
     use super::*;
     use crate::scripthash_layout::ShEntry;
     use rbitcoin_primitives::Fk;
+
+    #[test]
+    fn prefix_shard_of_high_bits_contiguous() {
+        // 16 shards: first nibble of byte 0.
+        assert_eq!(prefix_shard_of(&[0x00; 32], 16), 0);
+        assert_eq!(prefix_shard_of(&[0x0f; 32], 16), 0);
+        let mut k = [0u8; 32];
+        k[0] = 0x10;
+        assert_eq!(prefix_shard_of(&k, 16), 1);
+        k[0] = 0x1f;
+        assert_eq!(prefix_shard_of(&k, 16), 1);
+        k[0] = 0xf0;
+        assert_eq!(prefix_shard_of(&k, 16), 15);
+        k[0] = 0xff;
+        assert_eq!(prefix_shard_of(&k, 16), 15);
+        // Lex order of first byte maps to non-decreasing shard ids.
+        let mut prev = 0usize;
+        for b in 0u16..=255 {
+            k[0] = b as u8;
+            let s = prefix_shard_of(&k, 16);
+            assert!(s >= prev, "b={b:#x} shard={s} prev={prev}");
+            prev = s;
+        }
+        assert_eq!(prefix_shard_of(&[0xab; 32], 1), 0);
+    }
 
     #[test]
     fn head_insert_get_clear() {

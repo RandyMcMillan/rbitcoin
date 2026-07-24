@@ -139,9 +139,6 @@ pub fn confirm_load_phase(
     if blocks.is_empty() {
         return Err(ConsensusError::BadBlock("empty confirm batch"));
     }
-    query
-        .ensure_spent_oracle_ready()
-        .map_err(ConsensusError::Store)?;
     for w in blocks.windows(2) {
         if w[1].0 .0 != w[0].0 .0.saturating_add(1) {
             return Err(ConsensusError::BadBlock("confirm run not contiguous"));

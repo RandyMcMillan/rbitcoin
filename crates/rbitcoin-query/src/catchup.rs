@@ -105,11 +105,6 @@ impl Query {
         Ok(())
     }
 
-    /// Spent oracle is always durable heads/spends — no separate light UTXO.
-    pub fn ensure_spent_oracle_ready(&self) -> Result<(), QueryError> {
-        Ok(())
-    }
-
     /// Flush/compact SH runs and load durable scripthash tables (tip mode).
     ///
     /// Direct IBD only flush/merges; tip does cold bulk-load after full merge.

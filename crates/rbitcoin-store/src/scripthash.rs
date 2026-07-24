@@ -121,24 +121,6 @@ impl ScriptHashTable {
         })
     }
 
-    /// True when `scripthash.body` looks like hybrid (SHAL magic).
-    pub fn body_is_hybrid(dir: &std::path::Path) -> Result<bool, StoreError> {
-        let path = dir.join("scripthash.body");
-        if !path.exists() {
-            return Ok(false);
-        }
-        let mut f = std::fs::File::open(&path).map_err(|e| StoreError::io(&path, e))?;
-        use std::io::{Read, Seek, SeekFrom};
-        f.seek(SeekFrom::Start(FILE_HEADER_LEN as u64))
-            .map_err(|e| StoreError::io(&path, e))?;
-        let mut magic = [0u8; 4];
-        match f.read_exact(&mut magic) {
-            Ok(()) => Ok(magic == SH_ALLOC_MAGIC),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
-            Err(e) => Err(StoreError::io(&path, e)),
-        }
-    }
-
     pub fn entry_count(&self) -> u64 {
         self.alloc.lock().unwrap().live_count
     }
@@ -262,14 +244,6 @@ impl ScriptHashTable {
         Ok(false)
     }
 
-    /// Deprecated alias: true if the key has any live creates.
-    pub fn live_head(&self, scripthash: &[u8; 32]) -> Result<Fk, StoreError> {
-        match self.head.get(scripthash)? {
-            Some(v) if !v.is_empty() => Ok(Fk(1)), // non-null sentinel
-            _ => Ok(Fk::NULL),
-        }
-    }
-
     /// Append a create (idempotent on create_tx_fk).
     pub fn put_create(&self, rec: &ScriptHashRecord) -> Result<(), StoreError> {
         if rec.create_tx_fk.is_null() {
@@ -322,12 +296,13 @@ impl ScriptHashTable {
 
     /// Forward-append creates (no durable chain walk). Process-local `heads` map.
     ///
-    /// Returns `(written_count, timing)`.
+    /// Tip-mode / steady-state path (not cold bulk materialize). Returns
+    /// `(written_count, timing)`.
     ///
     /// Creates for the **same scripthash** are applied in one body write (after
     /// sorting). Head upserts are applied **per shard**; when `recs.len()` is
-    /// ≥ [`Self::LARGE_BATCH_ROWS`], each shard is flushed before the next so a
-    /// multi-million-row materialize does not keep every head shard dirty.
+    /// ≥ [`Self::LARGE_BATCH_ROWS`], each shard is flushed before the next to
+    /// limit dirty head pages on large tip batches.
     pub fn put_create_batch_append(
         &self,
         recs: &[ScriptHashRecord],
@@ -631,66 +606,6 @@ impl ScriptHashTable {
         self.body.flush_async()?;
         self.head.flush_async()?;
         Ok(())
-    }
-
-    /// Cold bulk load of **scripthash-sorted** creates (migration-style).
-    ///
-    /// When the table is empty: no per-key head probes, bump-only slab alloc,
-    /// batched `insert_many` for heads, **one** alloc-header write at the end.
-    /// When non-empty: falls back to [`Self::put_create_batch_append`].
-    ///
-    /// For tip materialize prefer [`Self::bulk_session`] + stream `put_chain`
-    /// (one session, buffered body/head). This one-shot API is for tests and
-    /// small batches.
-    ///
-    /// `recs` should be sorted by `scripthash` (as sorted-run materialize produces).
-    pub fn bulk_load_sorted_creates(
-        &self,
-        recs: &[ScriptHashRecord],
-    ) -> Result<usize, StoreError> {
-        if recs.is_empty() {
-            return Ok(0);
-        }
-        if self.entry_count() > 0 {
-            let mut heads = HashMap::new();
-            let (n, _) = self.put_create_batch_append(recs, &mut heads)?;
-            return Ok(n);
-        }
-        self.bulk_load_sorted_creates_cold(recs)
-    }
-
-    /// One-shot cold load of a scripthash-sorted batch via [`ScriptHashBulkSession`].
-    ///
-    /// Safe only when each scripthash appears in a single contiguous span and
-    /// is not already present. Never falls back to append.
-    ///
-    /// Production multi-run materialize should hold **one**
-    /// [`Self::bulk_session`] across the whole k-way stream instead of calling
-    /// this per chunk (avoids per-chunk alloc-header RMW and small body writes).
-    pub fn bulk_load_sorted_creates_cold(
-        &self,
-        recs: &[ScriptHashRecord],
-    ) -> Result<usize, StoreError> {
-        if recs.is_empty() {
-            return Ok(0);
-        }
-        let mut n_keys = 0u64;
-        {
-            let mut prev: Option<[u8; 32]> = None;
-            for r in recs {
-                if r.create_tx_fk.is_null() {
-                    continue;
-                }
-                if prev != Some(r.scripthash) {
-                    n_keys = n_keys.saturating_add(1);
-                    prev = Some(r.scripthash);
-                }
-            }
-        }
-        let mut session = self.bulk_session(n_keys)?;
-        let written = session.put_sorted_creates(recs)?;
-        let _ = session.finish()?;
-        Ok(written)
     }
 
     /// Start a buffered cold bulk session (historical migration builder path).
@@ -1315,7 +1230,9 @@ mod tests {
             rec(sh, 2, 0),
             rec(sh, 3, 0),
         ];
-        let n = t.bulk_load_sorted_creates_cold(&recs).unwrap();
+        let mut session = t.bulk_session(1).unwrap();
+        let n = session.put_sorted_creates(&recs).unwrap();
+        let _ = session.finish().unwrap();
         assert_eq!(n, 3);
         assert_eq!(t.entries(&sh).unwrap().len(), 3);
         assert_eq!(t.entry_count(), 3);
@@ -1355,9 +1272,9 @@ mod tests {
     }
 
     #[test]
-    fn bulk_session_defers_heads_past_old_flush_threshold() {
-        // Regression: heads must stay empty until finish so every shard uses
-        // bulk_fill_empty once (not open-address RMW after a 65k intermediate flush).
+    fn bulk_session_flushes_head_on_prefix_shard_boundary() {
+        // Active-shard heads stay in RAM until the stream crosses a prefix-shard
+        // boundary (or finish); each boundary does one bulk_fill_empty.
         let dir = tmp();
         let t = ScriptHashTable::create(&dir).unwrap();
         const N: u32 = 80_000;

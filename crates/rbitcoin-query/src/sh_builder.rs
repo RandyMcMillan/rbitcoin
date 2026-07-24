@@ -716,27 +716,17 @@ mod tests {
     }
 
     #[test]
-    fn same_key_bulk_materialize() {
+    fn same_key_append_preserves_chain() {
+        // Tip-mode append path: many creates for one scripthash.
         let n = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-bulk-{n}"));
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-append-same-{n}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::open_or_create(&dir).unwrap();
         let sh = [0xabu8; 32];
-        // One run, many creates for same key (already sorted by SH).
-        let mut body = Vec::new();
-        for i in 1..=20u64 {
-            body.extend_from_slice(&encode_rec(&sh, Fk(i)));
-        }
-        let path = next_run_path(&dir, 1);
-        let _run = write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body).unwrap();
-        // Bulk path (production tip materialize) via builder finalize.
-        let b = ShRunBuilder::new(&dir);
-        // Run already on disk under builder's expected runs dir — open under store root.
-        // Direct append for same-key regression (run body already written).
         let mut batch = Vec::new();
         for i in 1..=20u64 {
             batch.push(ScriptHashRecord::from_fk(sh, Fk(i)));
@@ -748,7 +738,33 @@ mod tests {
             .unwrap();
         assert_eq!(n, 20);
         assert_eq!(store.scripthash.entries(&sh).unwrap().len(), 20);
-        let _ = b; // silence
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_key_run_finalize_materialize() {
+        // Production path: one sorted run with many creates for one key → bulk session.
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-sh-run-same-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_or_create(&dir).unwrap();
+        let b = ShRunBuilder::new(&dir);
+        let runs_dir = dir.join("scripthash.runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let sh = [0xabu8; 32];
+        let mut body = Vec::new();
+        for i in 1..=20u64 {
+            body.extend_from_slice(&encode_rec(&sh, Fk(i)));
+        }
+        let path = next_run_path(&runs_dir, 1);
+        write_sorted_run(&path, SH_RUN_KEY_LEN, SH_RUN_REC_LEN, &body).unwrap();
+        let n = b.finalize_and_bulk_materialize(&store).unwrap();
+        assert_eq!(n, 20);
+        assert_eq!(store.scripthash.entries(&sh).unwrap().len(), 20);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

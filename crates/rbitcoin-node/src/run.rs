@@ -167,15 +167,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     info!(
         "ibd: IndexMode::Direct (archive tx.head; confirm spend batch; SH runs merge-only; bulk SH at tip)"
     );
-    handle
-        .query
-        .ensure_spent_oracle_ready()
-        .map_err(|e| NodeError::Config(format!("spent oracle: {e}")))?;
-    info!(
-        "ibd: spent oracle ready (durable spends + tx.head, mode={:?})",
-        handle.query.index_mode()
-    );
-
     let listen = config
         .p2p_listen
         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], default_port(config.network))));

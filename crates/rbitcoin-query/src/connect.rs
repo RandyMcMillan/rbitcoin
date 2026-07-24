@@ -67,7 +67,6 @@ impl Query {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        self.ensure_spent_oracle_ready()?;
         for w in items.windows(2) {
             if w[1].height.0 != w[0].height.0.saturating_add(1) {
                 return Err(StoreError::Corrupt("confirm run not contiguous heights"));

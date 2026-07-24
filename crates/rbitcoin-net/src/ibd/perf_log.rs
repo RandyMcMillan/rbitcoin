@@ -5,19 +5,26 @@
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
-//! | INFO  | `ibd: progress …` | Tip/arch rates over the **last 5s**, confirm pipeline queue depths, horizon, **1h tip ETA** (bold on TTY) |
-//! | INFO  | `ibd: perf …` | Download queue, archive pressure, confirm cost, load phases, conf_q, loop mix |
-//! | DEBUG | `ibd: perf_dbg …` | µs/blk phases, wave/SH subs, caches, pipe |
+//! | INFO  | `ibd: progress …` | Tip/arch rates over the **last 5s**, conf_q, horizon, **1h tip ETA** |
+//! | INFO  | `ibd: perf …` | Download pressure, confirm cost (script/load/…), pin_hit, coarse load phases, sh_runs |
+//! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail, archive pipe (prep/write/sticky), contig park |
 //!
 //! Sample **once** per tick and reset all atomics, then format INFO always and
 //! DEBUG only when enabled — so DEBUG never sees an empty window after INFO.
+//!
+//! Formatters omit ghost columns from deleted paths (wave-fill stubs, Direct SH
+//! seed/body/head RMW, thin col/run/head).
 
 use super::archive::{ArchivePipelineSample, ArchivePipelineStats};
 use super::status::LoopStats;
 use rbitcoin_log::{debug, enabled, info, Level};
 
 /// One 5s window of IBD counters (post sample-and-reset).
+///
+/// Some fields are still sampled but omitted from formatters when always zero
+/// on Direct IBD (ghost paths). Kept until a follow-up deletes the atomics.
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // formatter triage: unused fields pending counter cleanup
 pub(crate) struct IbdPerfSample {
     // Pipeline health (not from atomics).
     pub inflight: usize,
@@ -639,57 +646,66 @@ pub(crate) fn sample(
     }
 }
 
-/// Stable INFO line for production grepping.
+/// Append ` key=value` only when `v != 0` (keeps DEBUG free of ghost columns).
+#[inline]
+fn append_nz(out: &mut String, key: &str, v: u64) {
+    if v != 0 {
+        out.push_str(&format!(" {key}={v}"));
+    }
+}
+
+/// Stable INFO line for production grepping (live architecture only).
 pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     // Download / archive pressure (what blocks the tip).
     let mut out = format!(
-        "ibd: perf inflight={}/{} arch_q={} arch={}/{}MiB pending={} known_arch={} ordered={} lead={} hole={} peers={}",
+        "ibd: perf inflight={}/{} arch_q={} arch={}/{}MiB pending={} lead={} hole={} peers={}",
         s.inflight,
         s.inflight_cap,
         s.arch_q,
         s.arch_mb,
         s.arch_budget_mb,
         s.pending,
-        s.known_arch,
-        s.ordered,
         s.ahead,
         s.hole,
         s.peers,
     );
     // Confirm cost this window (ms totals + block count).
+    // recon/wire folded: prefetch/wave are dead on Direct; show recon only if useful.
     out.push_str(&format!(
-        " | conf blks={} recon={}ms(p={} w={} wire={}) connect={}ms script={}ms class_c={}ms strong={}ms sh={}ms tip={}ms spend={}ms(r={} i={} skip={}) | ovh resolve={}ms load={}ms unpin={}ms tip_gc={}ms",
+        " | conf blks={} script={}ms load={}ms connect={}ms class_c={}ms sh={}ms spend={}ms tip_gc={}ms",
         s.phase_blks,
-        s.recon_ms,
-        s.prefetch_ms,
-        s.wave_ms,
-        s.wire_ms,
-        s.connect_ms,
         s.script_ms,
-        s.class_c_ms,
-        s.strong_ms,
-        s.sh_ms,
-        s.tip_ms,
-        s.utxo_ms,
-        s.spend_ranged,
-        s.spend_idx,
-        s.spend_skip,
-        s.resolve_ms,
         s.load_ms,
-        s.unpin_ms,
+        s.connect_ms,
+        s.class_c_ms,
+        s.sh_ms,
+        s.utxo_ms,
         s.cache_tip_ms,
     ));
+    append_nz(&mut out, "recon_ms", s.recon_ms);
+    append_nz(&mut out, "wire_ms", s.wire_ms);
+    append_nz(&mut out, "strong_ms", s.strong_ms);
+    append_nz(&mut out, "resolve_ms", s.resolve_ms);
+    // Spend path mix only when non-ranged paths fire.
+    if s.spend_idx > 0 || s.spend_skip > 0 {
+        out.push_str(&format!(
+            " spend_mix(r={} i={} skip={})",
+            s.spend_ranged, s.spend_idx, s.spend_skip
+        ));
+    }
     out.push_str(&format!(
-        " | loop {} conf={}ms assign={}ms getdata={} drain={}ms",
-        s.dominant, s.confirm_ms, s.assign_ms, s.assign_issued, s.drain_ms,
+        " | loop {} conf={}ms assign={}ms",
+        s.dominant, s.confirm_ms, s.assign_ms,
     ));
+    append_nz(&mut out, "getdata", s.assign_issued);
+    append_nz(&mut out, "drain_ms", s.drain_ms);
     if s.confirm_reject_stops > 0 {
         out.push_str(&format!(" reject={}", s.confirm_reject_stops));
     }
     if let Some((first, n, elapsed_ms)) = s.live {
         out.push_str(&format!(" | live h={first} n={n} {elapsed_ms}ms"));
     }
-    // Body-LRU pin vs store pin_new (unique parents).
+    // OutFifo pin vs store pin_new (unique parents).
     let pin_hit_pct = {
         let hits = s.load_pin_cache_body;
         let tot = hits.saturating_add(s.load_pin_new);
@@ -705,33 +721,20 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.conf_load_q_cap,
         s.conf_write_q_cap,
     );
+    // Coarse load phases only (thin is edge-only; drop col/run/head/put/head H/L).
     out.push_str(&format!(
-        " | {conf_q} | parents thru={} bodies={} plans={} blks={} body_io={} parent_io={} pin_cache={} pin_new={} pin_hit%={} {}ms (hdr={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={}) spent={}ms pin_sub body={} new={} put={} head={}/{} sh_runs={}",
+        " | {conf_q} | parents thru={} pin_hit%={} pin_cache={} pin_new={} win={}ms blks={} (hdr={} dec={} thin={} pin={} spent={}) sh_runs={}",
         s.load_ready_through,
-        s.cache_bodies,
-        s.cache_plans,
-        s.load_blocks,
-        s.load_body_tx_reads,
-        s.load_parent_tx_reads,
+        pin_hit_pct,
         s.load_pin_cache_body,
         s.load_pin_new,
-        pin_hit_pct,
         s.load_win_ms,
+        s.load_blocks,
         s.load_hdr_ms,
         s.load_decode_ms,
         s.load_thin_ms,
-        s.load_thin_collect_ms,
-        s.load_thin_cache_ms,
-        s.load_thin_head_ms,
-        s.load_thin_edge_ms,
         s.load_parent_pin_ms,
-        s.load_cache_put_ms,
         s.load_pin_spent_ms,
-        s.load_pin_body_ms,
-        s.load_pin_new_meta_ms,
-        s.load_pin_put_ms,
-        s.load_head_hits,
-        s.load_head_lookups,
         s.sh_runs,
     ));
     if s.load_missing_parents > 0 {
@@ -743,57 +746,46 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     out
 }
 
-/// DEBUG detail line (former multi-line phase/cache/pipe dump).
+/// DEBUG detail: µs/blk + pin/edge + archive pipe + contig (no ghost columns).
 pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let denom = s.phase_blks.max(1);
     let us = |ns: u64| (ns / denom) / 1000;
     let mut out = format!(
-        "ibd: perf_dbg us/blk recon={} prefetch={} wave={} wire={} connect={} script={} class_c={} strong={} sh={} tip={} spend={}(r={} i={} skip={}) | ovh resolve={} load={} unpin={} tip_gc={}",
+        "ibd: perf_dbg us/blk recon={} wire={} connect={} script={} class_c={} sh={} spend={}(r={} i={} skip={}) load={} tip_gc={}",
         us(s.recon_ns),
-        us(s.prefetch_ns),
-        us(s.wave_ns),
         us(s.wire_ns),
         us(s.connect_ns),
         us(s.script_ns),
         us(s.class_c_ns),
-        us(s.strong_ns),
         us(s.sh_ns),
-        us(s.tip_ns),
         us(s.utxo_apply_ns),
         s.spend_ranged,
         s.spend_idx,
         s.spend_skip,
-        us(s.resolve_ns),
         us(s.load_ns),
-        us(s.unpin_ns),
         us(s.cache_tip_ns),
     );
-    out.push_str(&format!(
-        " | wave body={} ptx={} pout={} spent={} cb={} cache={} store={} thin={} rebuild={} store_ms={} lock_ms={}",
-        s.wf_body_ms,
-        s.wf_ptx_ms,
-        s.wf_pout_ms,
-        s.wf_spent_ms,
-        s.wf_cb_ms,
-        s.wf_body_cache,
-        s.wf_body_store,
-        s.wf_thin_cache,
-        s.wf_thin_rebuild,
-        s.wf_store_body_ms,
-        s.wf_cache_lock_ms,
-    ));
-    out.push_str(&format!(
-        " | sh warm={} filter={} collect={} sort={} seed={} body={} head={} index={}",
-        s.sh_warm_ms,
-        s.sh_filter_ms,
-        s.sh_collect_ms,
-        s.sh_sort_ms,
-        s.sh_seed_ms,
-        s.sh_body_ms,
-        s.sh_head_ms,
-        s.sh_index_ms,
-    ));
-    let cp_tot = s.cp_wave + s.cp_class_a + s.cp_store;
+    append_nz(&mut out, "resolve_us", us(s.resolve_ns));
+    append_nz(&mut out, "strong_us", us(s.strong_ns));
+    append_nz(&mut out, "tip_us", us(s.tip_ns));
+    // Wire rebuild store cost (live); omit stub wave-fill zeros.
+    if s.wf_body_store > 0 || s.wf_body_cache > 0 || s.wf_store_body_ms > 0 || s.wf_cache_lock_ms > 0
+    {
+        out.push_str(&format!(
+            " | wire_body cache={} store={} store_ms={} lock_ms={}",
+            s.wf_body_cache, s.wf_body_store, s.wf_store_body_ms, s.wf_cache_lock_ms,
+        ));
+    }
+    // SH: Direct only accrues collect; tip-append fields only if non-zero.
+    out.push_str(&format!(" | sh collect={}", s.sh_collect_ms));
+    append_nz(&mut out, "warm", s.sh_warm_ms);
+    append_nz(&mut out, "filter", s.sh_filter_ms);
+    append_nz(&mut out, "sort", s.sh_sort_ms);
+    append_nz(&mut out, "seed", s.sh_seed_ms);
+    append_nz(&mut out, "body", s.sh_body_ms);
+    append_nz(&mut out, "head", s.sh_head_ms);
+    append_nz(&mut out, "index", s.sh_index_ms);
+
     let conf_q = super::confirm::format_conf_q(
         s.conf_load_q,
         s.conf_write_q,
@@ -801,7 +793,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.conf_write_q_cap,
     );
     out.push_str(&format!(
-        " | {conf_q} | parents thru={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} skip={} uniq_p={} pin_cache={} pin_new={} body_io={} parent_io={} miss_p={} phases_ms hdr={} dec={} thin={}[col={} run={} head={} edge={}] pin={} put={} spent={}ms pin_sub body={} new={} put={} head={}/{} edges same={} cache={} fk={} head={} cb={} sh_runs={} | connect wave%={} parent%={} store%={}",
+        " | {conf_q} | parents thru={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} uniq_p={} pin_cache={} pin_new={} body_io={} parent_io={}",
         s.load_ready_through,
         s.cache_bodies,
         s.cache_plans,
@@ -809,50 +801,35 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.load_blocks,
         s.load_utxo_parents,
         s.load_creates,
-        s.load_already_ready,
         s.load_parent_unique,
         s.load_pin_cache_body,
         s.load_pin_new,
         s.load_body_tx_reads,
         s.load_parent_tx_reads,
-        s.load_missing_parents,
+    ));
+    append_nz(&mut out, "skip", s.load_already_ready);
+    append_nz(&mut out, "miss_p", s.load_missing_parents);
+    out.push_str(&format!(
+        " phases hdr={} dec={} thin={} pin={} put={} spent={}ms pin_sub body={} new={}",
         s.load_hdr_ms,
         s.load_decode_ms,
         s.load_thin_ms,
-        s.load_thin_collect_ms,
-        s.load_thin_cache_ms,
-        s.load_thin_head_ms,
-        s.load_thin_edge_ms,
         s.load_parent_pin_ms,
         s.load_cache_put_ms,
         s.load_pin_spent_ms,
         s.load_pin_body_ms,
         s.load_pin_new_meta_ms,
-        s.load_pin_put_ms,
-        s.load_head_hits,
-        s.load_head_lookups,
-        s.load_edge_same,
-        s.load_edge_cache,
-        s.load_edge_fk,
-        s.load_edge_head,
-        s.load_edge_cb,
-        s.sh_runs,
-        if cp_tot > 0 {
-            (100 * s.cp_wave) / cp_tot
-        } else {
-            0
-        },
-        if cp_tot > 0 {
-            (100 * s.cp_class_a) / cp_tot
-        } else {
-            0
-        },
-        if cp_tot > 0 {
-            (100 * s.cp_store) / cp_tot
-        } else {
-            0
-        },
     ));
+    append_nz(&mut out, "pin_put", s.load_pin_put_ms);
+    // Edges: same/fk/cb are live; cache/head kinds dropped when zero.
+    out.push_str(&format!(
+        " edges same={} fk={} cb={}",
+        s.load_edge_same, s.load_edge_fk, s.load_edge_cb,
+    ));
+    append_nz(&mut out, "edge_cache", s.load_edge_cache);
+    append_nz(&mut out, "edge_head", s.load_edge_head);
+    out.push_str(&format!(" sh_runs={}", s.sh_runs));
+
     let busy = s.pipe.write_busy_ms();
     let idle = s.pipe.write_idle_ms();
     let total_w = busy.saturating_add(idle).max(1);
@@ -867,14 +844,9 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     } else {
         0
     };
-    let prep_gap = s
-        .arch_prep_total_ms
-        .saturating_sub(s.arch_prep_sum_ms);
-    let write_gap = s
-        .arch_write_total_ms
-        .saturating_sub(s.arch_write_sum_ms);
+    // Archive pipe: keep full detail (real long pole on mainnet).
     out.push_str(&format!(
-        " | pipe prep_us/blk={} prep_blks={} write_us/blk={} write_blks={} batch_avg={} writer_busy%={} idle_ms={} coalesce_ms={} prep_ms={} | arch_prep total={} sum={} gap={} struct={} filter={} assign={} collect={} sticky={} inflight={} head={} (probe={} idx={} body={} keys={} cands={} lookups={}) stamp={} finish={} publish={} qwait={} blks={} | arch_write total={} sum={} gap={} reserve={} body={} head={} spend={} htxs={} sticky={} dontneed={} flush={} blks={} | arch_res resolve_us/blk={} ext={} sticky={}/{} ({}%) head={}/{} stamp batch={} res={} sticky_map={}/{} | contig next_h={} parked={} ready={}",
+        " | pipe prep_us/blk={} prep_blks={} write_us/blk={} write_blks={} batch_avg={} writer_busy%={} idle_ms={} coalesce_ms={} prep_ms={}",
         s.pipe.prep_us_per_block(),
         s.pipe.prep_blocks,
         s.pipe.write_us_per_block(),
@@ -884,11 +856,11 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         idle,
         s.pipe.write_coalesce_ms(),
         s.pipe.prep_ms(),
+    ));
+    out.push_str(&format!(
+        " | arch_prep total={} struct={} assign={} collect={} sticky={} inflight={} head={} (probe={} idx={} body={} keys={} cands={} lookups={}) stamp={} finish={} publish={} qwait={} blks={}",
         s.arch_prep_total_ms,
-        s.arch_prep_sum_ms,
-        prep_gap,
         s.arch_prep_struct_ms,
-        s.arch_prep_filter_ms,
         s.arch_prep_assign_ms,
         s.arch_prep_collect_ms,
         s.arch_prep_sticky_ms,
@@ -905,18 +877,23 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.arch_prep_publish_ms,
         s.arch_prep_qwait_ms,
         s.arch_prep_blocks,
+    ));
+    append_nz(&mut out, "prep_filter", s.arch_prep_filter_ms);
+    out.push_str(&format!(
+        " | arch_write total={} body={} head={} sticky={} dontneed={} flush={} blks={}",
         s.arch_write_total_ms,
-        s.arch_write_sum_ms,
-        write_gap,
-        s.arch_write_reserve_ms,
         s.arch_write_body_ms,
         s.arch_write_head_ms,
-        s.arch_write_spend_ms,
-        s.arch_write_htxs_ms,
         s.arch_write_sticky_ms,
         s.arch_write_dontneed_ms,
         s.arch_write_flush_ms,
         s.arch_write_blocks,
+    ));
+    append_nz(&mut out, "write_reserve", s.arch_write_reserve_ms);
+    append_nz(&mut out, "write_spend", s.arch_write_spend_ms);
+    append_nz(&mut out, "write_htxs", s.arch_write_htxs_ms);
+    out.push_str(&format!(
+        " | arch_res resolve_us/blk={} ext={} sticky={}/{} ({}%) head={}/{} stamp batch={} res={} sticky_map={}/{}",
         resolve_us_blk,
         s.arch_ext_need,
         s.arch_sticky_hit,
@@ -928,18 +905,17 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.arch_resolved_stamp,
         s.arch_sticky_len,
         s.arch_sticky_cap,
-        s.contig_next_h,
-        s.contig_parked,
-        s.contig_ready,
     ));
     out.push_str(&format!(
-        " | loop confirm_blks={} confirm_us/blk={} reject_stops={} events={} status_scan_ms={}",
-        s.confirm_blocks,
-        s.confirm_us_per_block,
-        s.confirm_reject_stops,
-        s.drain_events,
-        s.status_scan_ms,
+        " | contig next_h={} parked={} ready={}",
+        s.contig_next_h, s.contig_parked, s.contig_ready,
     ));
+    out.push_str(&format!(
+        " | loop confirm_blks={} confirm_us/blk={} events={}",
+        s.confirm_blocks, s.confirm_us_per_block, s.drain_events,
+    ));
+    append_nz(&mut out, "reject_stops", s.confirm_reject_stops);
+    append_nz(&mut out, "status_scan_ms", s.status_scan_ms);
     out
 }
 
@@ -987,6 +963,7 @@ mod tests {
         s.phase_blks = 32;
         s.recon_ms = 100;
         s.script_ms = 20;
+        s.load_ms = 30;
         s.class_c_ms = 40;
         s.utxo_ms = 25;
         s.dominant = "confirm";
@@ -998,9 +975,13 @@ mod tests {
         assert!(line.contains("arch_q=10"), "{line}");
         assert!(line.contains("lead=224"), "{line}");
         assert!(line.contains("conf blks=32"), "{line}");
-        assert!(line.contains("recon=100ms"), "{line}");
+        assert!(line.contains("script=20ms"), "{line}");
+        assert!(line.contains("load=30ms"), "{line}");
         assert!(line.contains("class_c=40ms"), "{line}");
-        assert!(line.contains("spend=25ms(r=0 i=0 skip=0)"), "{line}");
+        assert!(line.contains("spend=25ms"), "{line}");
+        assert!(line.contains("recon_ms=100"), "{line}"); // non-zero only
+        assert!(!line.contains("prefetch"), "{line}");
+        assert!(!line.contains("unpin"), "{line}");
         assert!(line.contains("loop confirm"), "{line}");
         assert!(line.contains("reject=2"), "{line}");
         assert!(line.contains("live h=100 n=32 1500ms"), "{line}");
@@ -1009,31 +990,26 @@ mod tests {
         s.conf_load_q_cap = 2;
         s.conf_write_q_cap = 2;
         s.load_ready_through = 200;
-        s.cache_bodies = 48;
-        s.cache_plans = 80;
         s.load_blocks = 32;
-        s.load_body_tx_reads = 400;
-        s.load_parent_tx_reads = 120;
-        s.load_parent_unique = 20;
         s.load_pin_cache_body = 8;
         s.load_pin_new = 12;
         s.load_win_ms = 40;
+        s.load_thin_ms = 5;
         s.sh_runs = 3;
         let line = format_info(&s);
         assert!(line.contains("conf_q load=1/2 write=2/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
-        assert!(line.contains("bodies=48 plans=80"), "{line}");
-        assert!(!line.contains("by_fk="), "{line}");
-        assert!(!line.contains("pin_cached="), "{line}");
-        assert!(line.contains("body_io=400 parent_io=120"), "{line}");
         assert!(line.contains("pin_cache=8 pin_new=12"), "{line}");
         // pin_hit% = 8/(8+12) = 40
         assert!(line.contains("pin_hit%=40"), "{line}");
-        assert!(!line.contains("cache%="), "{line}");
+        assert!(line.contains("thin=5"), "{line}");
+        assert!(!line.contains("thin[col="), "{line}");
+        assert!(!line.contains("pin_sub"), "{line}");
+        assert!(!line.contains("by_fk="), "{line}");
+        assert!(!line.contains("pin_cached="), "{line}");
+        assert!(!line.contains("body_io="), "{line}"); // dbg-only
         assert!(line.contains("sh_runs=3"), "{line}");
         assert!(!line.contains("reserved"), "{line}");
-        assert!(!line.contains("confirm_phases"), "{line}");
-        assert!(!line.contains("mat="), "{line}");
         assert!(!line.contains("runway"), "{line}");
     }
 
@@ -1046,7 +1022,8 @@ mod tests {
         s.spend_ranged = 10;
         s.spend_idx = 2;
         s.spend_skip = 0;
-        s.wf_spent_ms = 50;
+        s.wf_body_store = 3;
+        s.wf_store_body_ms = 50;
         s.conf_load_q = 0;
         s.conf_write_q = 1;
         s.conf_load_q_cap = 2;
@@ -1059,21 +1036,27 @@ mod tests {
         s.load_parent_tx_reads = 50;
         s.load_pin_cache_body = 0;
         s.load_pin_new = 38;
+        s.load_edge_same = 10;
+        s.load_edge_fk = 5;
+        s.load_edge_cb = 1;
+        s.sh_collect_ms = 12;
         s.pipe.write_blocks = 5;
         s.pipe.write_ns = 5_000_000;
         s.sh_runs = 2;
+        s.arch_ext_need = 100;
+        s.arch_sticky_hit = 80;
         let line = format_debug(&s);
         assert!(line.starts_with("ibd: perf_dbg "), "{line}");
         assert!(line.contains("us/blk recon="), "{line}");
-        assert!(line.contains("spend=500(r=10 i=2 skip=0)"), "{line}"); // us/blk wall
-        assert!(line.contains("wave body="), "{line}");
-        assert!(line.contains("spent=50"), "{line}");
+        assert!(line.contains("spend=500(r=10 i=2 skip=0)"), "{line}");
+        assert!(!line.contains("prefetch="), "{line}");
+        assert!(!line.contains("wave body="), "{line}");
+        assert!(!line.contains("sh seed="), "{line}");
+        assert!(!line.contains("thin[col="), "{line}");
+        assert!(line.contains("wire_body"), "{line}");
+        assert!(line.contains("store_ms=50"), "{line}");
+        assert!(line.contains("sh collect=12"), "{line}");
         assert!(line.contains("pin_sub body="), "{line}");
-        assert!(!line.contains("pin_sub cover="), "{line}");
-        assert!(line.contains("cache="), "{line}");
-        assert!(line.contains("store="), "{line}");
-        assert!(line.contains("thin="), "{line}");
-        assert!(line.contains("rebuild="), "{line}");
         // Depth 0 → `<` (scripts waiting on empty load queue).
         assert!(line.contains("conf_q load<0/2 write=1/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
@@ -1082,22 +1065,20 @@ mod tests {
         assert!(line.contains("body_io=200 parent_io=50"), "{line}");
         assert!(line.contains("pin_cache=0 pin_new=38"), "{line}");
         assert!(!line.contains("pin_cached="), "{line}");
+        assert!(line.contains("edges same=10 fk=5 cb=1"), "{line}");
         assert!(line.contains("sh_runs=2"), "{line}");
         assert!(line.contains("arch_res resolve_us/blk="), "{line}");
         assert!(line.contains("arch_prep total="), "{line}");
         assert!(line.contains("probe="), "{line}");
         assert!(line.contains("lookups="), "{line}");
         assert!(line.contains("arch_write total="), "{line}");
-        assert!(line.contains("gap="), "{line}");
         assert!(line.contains("sticky_map="), "{line}");
-        assert!(line.contains("store_ms="), "{line}");
-        assert!(line.contains("lock_ms="), "{line}");
-        assert!(!line.contains("majflt="), "{line}");
+        assert!(line.contains("sticky=80/100"), "{line}");
         assert!(line.contains("contig next_h="), "{line}");
-        assert!(!line.contains("reserved"), "{line}");
         assert!(line.contains("pipe "), "{line}");
         assert!(line.contains("loop "), "{line}");
         assert!(!line.contains("runway"), "{line}");
+        assert!(!line.contains("connect wave%="), "{line}");
     }
 
     #[test]

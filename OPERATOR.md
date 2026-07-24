@@ -44,8 +44,6 @@ Default: **info**. CLI wins over env.
 | Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` (`0` = full scripts) |
 | Archive queue RAM | **512 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
-
-| Parent pin keep-alive grace | **256** heights past last known need | `RBITCOIN_CONFIRM_PIN_KEEP_GRACE` (`0` = need+1 only) |
 | Bulk store reads | **io_uring** (Linux) | Head resolve + confirm bodies (**pread**). Archive `tx.head` insert stays **mmap** (uring pwrite measured slower). `RBITCOIN_IO_URING=0` → pread fallback; `RBITCOIN_BULK_IO_WORKERS` for fallback parallelism |
 | Confirm stages | **load · scripts · write** | Pipeline queues cap **2** each (`conf_q load=n/2 write=m/2`; `name<0/cap` when the next worker is waiting on an empty queue) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |

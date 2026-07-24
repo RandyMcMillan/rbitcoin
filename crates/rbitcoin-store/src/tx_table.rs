@@ -649,9 +649,10 @@ impl TxTable {
         let head_path = dir.join("tx.head");
         let body = VarTable::open(dir, "tx", TableKind::Tx)?;
         let n_bodies = body.count();
-        // Operator recovery: delete `tx.head` (+ optional `.meta`) → empty create
-        // + full rebuild from Class A bodies on next open. Incomplete heads that
-        // still open successfully are *not* auto-rebuilt (delete to force).
+        // Operator recovery: delete `tx.head` → empty create + full rebuild from
+        // Class A bodies on next open. Incomplete heads that still open
+        // successfully are *not* auto-rebuilt (delete to force). Layout lives in
+        // the trailing footer (no sidecar).
         let mut need_rebuild = false;
         let head = if !head_path.exists() {
             need_rebuild = n_bodies > 0;
@@ -667,9 +668,7 @@ impl TxTable {
                             "store: tx.head open failed ({e}) with {n_bodies} Class A bodies — recreating and rebuilding"
                         );
                         let _ = std::fs::remove_file(&head_path);
-                        let mut meta = head_path.as_os_str().to_os_string();
-                        meta.push(".meta");
-                        let _ = std::fs::remove_file(PathBuf::from(meta));
+                        crate::address_head::remove_legacy_meta_sidecar(&head_path);
                         need_rebuild = true;
                         Self::prepare_fresh_head(&head_path, n_bodies)?
                     } else {
@@ -774,24 +773,12 @@ impl TxTable {
         clear_resize_control(head_path);
         let shadow = shadow_head_path(head_path);
         let _ = std::fs::remove_file(&shadow);
-        {
-            let mut p = shadow.as_os_str().to_os_string();
-            p.push(".meta");
-            let _ = std::fs::remove_file(PathBuf::from(p));
-        }
+        crate::address_head::remove_legacy_meta_sidecar(&shadow);
         let bak = bak_head_path(head_path);
         let _ = std::fs::remove_file(&bak);
-        {
-            let mut p = bak.as_os_str().to_os_string();
-            p.push(".meta");
-            let _ = std::fs::remove_file(PathBuf::from(p));
-        }
-        // Stale meta from a deleted head would confuse layout; drop it.
-        {
-            let mut meta = head_path.as_os_str().to_os_string();
-            meta.push(".meta");
-            let _ = std::fs::remove_file(PathBuf::from(meta));
-        }
+        crate::address_head::remove_legacy_meta_sidecar(&bak);
+        // Pre-v5 sidecar (layout is in the footer now).
+        crate::address_head::remove_legacy_meta_sidecar(head_path);
         if n_bodies > 0 {
             rbitcoin_log::warn!(
                 "store: tx.head missing/recreated — rebuilding from {n_bodies} Class A bodies (this can take a while)"
@@ -2250,14 +2237,7 @@ impl TxTable {
             let shadow = shadow_head_path(&self.head_path);
             if shadow.exists() {
                 let _ = std::fs::remove_file(&shadow);
-                let mut m = shadow.clone();
-                m.set_extension("new.meta"); // not used; meta is path+".meta"
-                let meta = {
-                    let mut p = shadow.as_os_str().to_os_string();
-                    p.push(".meta");
-                    PathBuf::from(p)
-                };
-                let _ = std::fs::remove_file(meta);
+                crate::address_head::remove_legacy_meta_sidecar(&shadow);
             }
             return Ok(());
         };
@@ -2380,11 +2360,7 @@ impl TxTable {
         }
         let shadow_path = shadow_head_path(&self.head_path);
         let _ = std::fs::remove_file(&shadow_path);
-        {
-            let mut p = shadow_path.as_os_str().to_os_string();
-            p.push(".meta");
-            let _ = std::fs::remove_file(PathBuf::from(p));
-        }
+        crate::address_head::remove_legacy_meta_sidecar(&shadow_path);
         let shadow = AddressHead::create_with_layout(&shadow_path, target)?;
         let gen = self.head.read().unwrap().generation();
         let ctrl = ResizeControl {
@@ -2564,13 +2540,24 @@ impl TxTable {
 
         // Phase 2: exclusive head ownership for rename + reopen. Use try_write so
         // we log while waiting (std RwLock write can starve under continuous reads).
+        // Capture gen so Drop / worker-respawn (`resize_bg_gen` bump) can abort this
+        // wait — otherwise Drop's join hangs forever behind an infinite try_write loop.
         rbitcoin_log::info!("store: tx.head resize acquiring exclusive head lock for swap…");
         let t_lock = Instant::now();
+        let gen_at_start = self.resize_bg_gen.load(AtomicOrdering::Acquire);
         let mut waited = 0u32;
         let mut head_w = loop {
             match self.head.try_write() {
                 Ok(g) => break g,
                 Err(_) => {
+                    if self.resize_bg_gen.load(AtomicOrdering::Acquire) != gen_at_start {
+                        rbitcoin_log::info!(
+                            "store: tx.head resize exclusive lock wait cancelled \
+                             (bg gen changed after {:?})",
+                            t_lock.elapsed()
+                        );
+                        return Ok(());
+                    }
                     waited = waited.saturating_add(1);
                     if waited == 1 || waited % 40 == 0 {
                         rbitcoin_log::warn!(
@@ -2624,24 +2611,13 @@ impl TxTable {
         std::fs::rename(&self.head_path, &bak).map_err(|e| StoreError::io(&self.head_path, e))?;
         std::fs::rename(&shadow_path, &self.head_path)
             .map_err(|e| StoreError::io(&shadow_path, e))?;
-        {
-            let mut old_meta = shadow_path.as_os_str().to_os_string();
-            old_meta.push(".meta");
-            let old_meta = PathBuf::from(old_meta);
-            let mut new_meta = self.head_path.as_os_str().to_os_string();
-            new_meta.push(".meta");
-            let new_meta = PathBuf::from(new_meta);
-            let _ = std::fs::rename(&old_meta, &new_meta);
-        }
+        // Layout lives in the file footer (renamed with shadow); bump generation.
         write_head_meta(&self.head_path, target, new_gen)?;
         clear_resize_control(&self.head_path);
         *head_w = AddressHead::open(&self.head_path)?;
         let _ = std::fs::remove_file(&bak);
-        {
-            let mut bak_meta = bak.as_os_str().to_os_string();
-            bak_meta.push(".meta");
-            let _ = std::fs::remove_file(PathBuf::from(bak_meta));
-        }
+        crate::address_head::remove_legacy_meta_sidecar(&bak);
+        crate::address_head::remove_legacy_meta_sidecar(&shadow_path);
         rbitcoin_log::info!(
             "store: tx.head resize complete bits={} entry={}B slots={} gen={}",
             target.bits,
@@ -2674,6 +2650,31 @@ impl TxTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    /// Drive head resize to completion with a hard deadline.
+    ///
+    /// Actively calls [`TxTable::head_resize_poll`] so progress does not depend
+    /// solely on the background fill thread (sleep-only waits stall when the bg
+    /// worker is slow to start, starved, or mid exclusive-lock wait).
+    fn wait_head_resize_done(t: &TxTable, deadline: Duration) {
+        let start = Instant::now();
+        while t.head_resize_in_progress() {
+            assert!(
+                start.elapsed() < deadline,
+                "tx.head resize stalled after {:?} (bits={} count={})",
+                start.elapsed(),
+                t.head_bits(),
+                t.count()
+            );
+            t.head_resize_poll(RESIZE_BG_POLL_BUDGET)
+                .expect("head_resize_poll during wait");
+            // Yield if still in progress (e.g. exclusive lock contention on swap).
+            if t.head_resize_in_progress() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
 
     #[test]
     fn decode_prevout_at_skips_script_and_witness() {
@@ -2916,17 +2917,8 @@ mod tests {
         for i in 51..=80u64 {
             let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
         }
-        // Background fill thread owns progress; optional poll still OK.
-        for _ in 0..200 {
-            if !t.head_resize_in_progress() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(
-            !t.head_resize_in_progress(),
-            "resize should complete via bg thread"
-        );
+        // Drive fill (bg + poll); hard deadline — no open-ended sleep loop.
+        wait_head_resize_done(&t, Duration::from_secs(10));
         assert_eq!(t.head_bits(), 11);
         assert_eq!(t.count(), 80);
         for i in 1..=80u64 {
@@ -2980,13 +2972,10 @@ mod tests {
         for i in 1..=200u64 {
             let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
         }
-        // head_insert_many should have started resize; bg thread fills.
-        for _ in 0..400 {
-            if !t.head_resize_in_progress() && t.head_bits() >= 9 {
-                break;
-            }
-            t.maybe_start_head_resize().unwrap();
-            std::thread::sleep(Duration::from_millis(5));
+        // head_insert_many should have started resize; drive fill to completion.
+        t.maybe_start_head_resize().unwrap();
+        if t.head_resize_in_progress() {
+            wait_head_resize_done(&t, Duration::from_secs(10));
         }
         assert!(t.head_bits() >= 9, "bits={}", t.head_bits());
         // Spot-check resolves.
@@ -3104,13 +3093,7 @@ mod tests {
         }
         t.start_head_resize(crate::address_head::HeadLayout::new(11).unwrap())
             .unwrap();
-        for _ in 0..400 {
-            if !t.head_resize_in_progress() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(!t.head_resize_in_progress());
+        wait_head_resize_done(&t, Duration::from_secs(10));
         assert_eq!(t.head_bits(), 11);
         for i in 1..=60u64 {
             let mut txid = [0u8; 32];
@@ -3120,6 +3103,111 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::env::remove_var("RBITCOIN_TX_HEAD_BITS");
         std::env::remove_var("RBITCOIN_TX_HEAD_RESIZE_READ_BATCH");
+    }
+
+    /// Exclusive-lock wait in `try_complete` must abort when `resize_bg_gen`
+    /// advances (Drop / worker respawn) — otherwise `join` hangs forever.
+    #[test]
+    fn head_resize_exclusive_lock_wait_cancels_on_gen_bump() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-head-gen-cancel-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("RBITCOIN_TX_HEAD_BITS", "10");
+        let t = TxTable::create(&dir).unwrap();
+        let mk = |i: u64| {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            let rec = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+            (rec, inputs, outputs)
+        };
+        for i in 1..=20u64 {
+            let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
+        }
+
+        use std::sync::atomic::AtomicBool;
+        let held = AtomicBool::new(false);
+        let release = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            // Hold head.read **before** resize starts so bg/poll cannot slip a
+            // swap through before the exclusive-lock wait is contended.
+            s.spawn(|| {
+                let _guard = t.head.read().unwrap();
+                held.store(true, AtomicOrdering::Release);
+                while !release.load(AtomicOrdering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                drop(_guard);
+            });
+            let wait_held = Instant::now();
+            while !held.load(AtomicOrdering::Acquire) {
+                assert!(
+                    wait_held.elapsed() < Duration::from_secs(2),
+                    "reader never acquired head.read"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+
+            t.start_head_resize(crate::address_head::HeadLayout::new(11).unwrap())
+                .unwrap();
+
+            // Poll on a side thread: shadow fill completes, then blocks in try_write.
+            let poller = s.spawn(|| t.head_resize_poll(RESIZE_BG_POLL_BUDGET));
+            // Let poller / bg reach the exclusive-lock wait.
+            std::thread::sleep(Duration::from_millis(80));
+            assert!(
+                t.head_resize_in_progress(),
+                "resize should still be blocked on exclusive head lock"
+            );
+
+            // Same signal Drop uses before join — try_write must observe and exit.
+            t.resize_bg_gen
+                .fetch_add(1, AtomicOrdering::AcqRel);
+
+            let t0 = Instant::now();
+            let _ = poller.join();
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "head_resize_poll stuck in exclusive lock wait for {:?}",
+                t0.elapsed()
+            );
+
+            release.store(true, AtomicOrdering::Release);
+        });
+
+        // Drop joins any leftover bg worker; must also finish promptly.
+        let t0 = Instant::now();
+        drop(t);
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "TxTable Drop hung for {:?}",
+            t0.elapsed()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("RBITCOIN_TX_HEAD_BITS");
     }
 
     /// Fat packed body: body_txid must match full-record path without needing
@@ -3458,13 +3546,10 @@ mod tests {
             t.flush().unwrap();
         }
 
-        // Simulate operator: wipe head (+ meta).
+        // Simulate operator: wipe head (layout is in the file footer).
         let head = dir.join("tx.head");
         assert!(head.exists());
         std::fs::remove_file(&head).unwrap();
-        let mut meta = head.as_os_str().to_os_string();
-        meta.push(".meta");
-        let _ = std::fs::remove_file(std::path::PathBuf::from(meta));
 
         // Reopen must recreate head and rebuild from bodies.
         let t = TxTable::open(&dir).unwrap();

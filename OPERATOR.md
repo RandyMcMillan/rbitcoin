@@ -89,9 +89,9 @@ override with `RBITCOIN_TX_HEAD_BITS` in `8..=34` / tiny scale). Probe is **page
 high txid bits select a 1024-slot page, double-hash within the page (one 4 KiB IO @ 4 B).
 **Online sequential resize** when `txs.count()/slots ≥ 0.75` or first deep insert
 (depth>128) / probe exhaust: shadow rebuild on a **dedicated OS thread**
-(`rbitcoin-tx-head-resize`). BITS **33+** use **8 B** entries. `tx.head.meta` **v4** =
-page-local probe + trailing file magic (slots page-aligned at offset 0); older meta
-forces recreate + rebuild from Class A.
+(`rbitcoin-tx-head-resize`). BITS **33+** use **8 B** entries. Layout (**v5**) lives in the
+`tx.head` **trailing footer** (page-local probe, slots at offset 0); no `tx.head.meta`
+sidecar. Older footers/meta force recreate + rebuild from Class A.
 **tx_height** uses 4 B height slots (not fk width). Dense Class A fk + **tx.idx**
 retained. Packed Class A only. Spends are schema-v5 annotations on create outputs
 (no `point.head`).

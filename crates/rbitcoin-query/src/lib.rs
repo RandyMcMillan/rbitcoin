@@ -802,7 +802,7 @@ impl Query {
 
     /// Rebuild durable `tx.head` from every Class A body (idempotent).
     ///
-    /// Prefer **deleting `tx.head` (+ `tx.head.meta`)** and reopening the store:
+    /// Prefer **deleting `tx.head`** and reopening the store:
     /// [`Store::open`] / [`Query::open_or_create`] recreates an empty head and
     /// runs a full rebuild automatically. This method is for in-process recovery
     /// without a reopen (inserts only missing probe entries).

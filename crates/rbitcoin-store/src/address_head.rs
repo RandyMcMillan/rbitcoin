@@ -33,7 +33,7 @@
 //! two OS pages; future tuning). Load trigger: [`HEAD_LOAD_START`] (0.75).
 
 use crate::error::StoreError;
-use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::file::{TableFile, TRAILING_FOOTER_LEN};
 use crate::hashhead::HeadScale;
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::{Path, PathBuf};
@@ -140,9 +140,10 @@ fn note_probe_exhausted() {
 }
 
 const META_MAGIC: &[u8; 4] = b"THM1";
-/// `4` = page-local double-hash + **trailing** 16-byte file magic (slots at offset 0).
-/// Older versions refused so open recreates + rebuilds.
-const META_VERSION: u16 = 4;
+/// `5` = page-local double-hash; layout (bits/entry/generation) lives in the
+/// **trailing footer** next to store magic (no `tx.head.meta` sidecar). Slots at
+/// offset 0 remain page-aligned. Older versions refused → open recreates + rebuilds.
+const META_VERSION: u16 = 5;
 
 /// On-disk / in-memory address-head geometry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -417,44 +418,70 @@ pub fn load_ratio(tx_count: u64, slots: u64) -> f64 {
     tx_count as f64 / slots as f64
 }
 
+/// Legacy sidecar path (`tx.head.meta`) — only for best-effort cleanup of old datadirs.
 fn meta_path(head_path: &Path) -> PathBuf {
     let mut p = head_path.as_os_str().to_os_string();
     p.push(".meta");
     PathBuf::from(p)
 }
 
-pub fn write_head_meta(head_path: &Path, layout: HeadLayout, generation: u64) -> Result<(), StoreError> {
-    let path = meta_path(head_path);
+/// Drop leftover sidecar meta from pre-v5 layouts (layout is now in the footer).
+pub fn remove_legacy_meta_sidecar(head_path: &Path) {
+    let _ = std::fs::remove_file(meta_path(head_path));
+}
+
+/// Pack layout + generation into the 16-byte trailing-footer extension.
+#[inline]
+pub fn encode_layout_ext(layout: HeadLayout, generation: u64) -> [u8; 16] {
     let mut buf = [0u8; 16];
     buf[0..4].copy_from_slice(META_MAGIC);
     buf[4..6].copy_from_slice(&META_VERSION.to_le_bytes());
     buf[6] = layout.bits as u8;
     buf[7] = layout.entry_bytes;
     buf[8..16].copy_from_slice(&generation.to_le_bytes());
-    std::fs::write(&path, buf).map_err(|e| StoreError::io(&path, e))
+    buf
 }
 
-pub fn read_head_meta(head_path: &Path) -> Result<Option<(HeadLayout, u64)>, StoreError> {
-    let path = meta_path(head_path);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = std::fs::read(&path).map_err(|e| StoreError::io(&path, e))?;
-    if raw.len() < 16 || &raw[0..4] != META_MAGIC {
-        return Err(StoreError::Corrupt("tx.head.meta magic"));
-    }
-    let ver = u16::from_le_bytes([raw[4], raw[5]]);
-    if ver != META_VERSION {
-        // Older probe/layout (leading magic, linear, …) — rebuild.
+/// Decode layout extension from the trailing footer (or fail for rebuild).
+pub fn decode_layout_ext(ext: &[u8; 16]) -> Result<(HeadLayout, u64), StoreError> {
+    if &ext[0..4] != META_MAGIC {
         return Err(StoreError::Corrupt(
-            "tx.head.meta version (trailing-magic page probe; rebuild tx.head)",
+            "tx.head footer layout magic (rebuild tx.head)",
         ));
     }
-    let bits = u32::from(raw[6]);
-    let entry_bytes = raw[7];
-    let generation = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    let ver = u16::from_le_bytes([ext[4], ext[5]]);
+    if ver != META_VERSION {
+        return Err(StoreError::Corrupt(
+            "tx.head footer layout version (footer-embedded meta; rebuild tx.head)",
+        ));
+    }
+    let bits = u32::from(ext[6]);
+    let entry_bytes = ext[7];
+    let generation = u64::from_le_bytes(ext[8..16].try_into().unwrap());
     let layout = HeadLayout::with_entry_bytes(bits, entry_bytes)?;
-    Ok(Some((layout, generation)))
+    Ok((layout, generation))
+}
+
+/// Rewrite layout+generation into an existing head file's trailing footer.
+///
+/// Used after resize swap to bump generation without reopening for write.
+pub fn write_head_meta(
+    head_path: &Path,
+    layout: HeadLayout,
+    generation: u64,
+) -> Result<(), StoreError> {
+    let (mut file, _) =
+        TableFile::open_trailing_header_from_end(head_path, TableKind::HashHead)?;
+    let body = file.data_len();
+    if body != layout.body_bytes() {
+        return Err(StoreError::Corrupt(
+            "tx.head size mismatch writing footer layout",
+        ));
+    }
+    file.set_trailing_ext(encode_layout_ext(layout, generation))?;
+    // Best-effort: drop any pre-v5 sidecar so operators are not confused.
+    remove_legacy_meta_sidecar(head_path);
+    Ok(())
 }
 
 /// Fixed-width keyless txid → dense create_fk table.
@@ -487,23 +514,21 @@ impl AddressHead {
             ));
         }
         let slots = layout.slots();
-        // Trailing magic: slots at offset 0 so each 4 KiB probe page is OS-aligned.
-        let file = TableFile::create_trailing_header(&path, TableKind::HashHead)?;
+        // Trailing footer: slots at offset 0 so each 4 KiB probe page is OS-aligned.
+        // Layout (bits/entry/generation) lives in the footer extension — no sidecar.
+        let mut file = TableFile::create_trailing_header(&path, TableKind::HashHead)?;
         let body_bytes = layout.body_bytes();
-        let need = body_bytes + FILE_HEADER_LEN as u64;
+        let need = body_bytes + TRAILING_FOOTER_LEN as u64;
         file.ensure_capacity(need)?;
-        // Zero slot array first (do not clobber trailer until logical len set).
-        file.ensure_capacity(need)?;
-        {
-            // Temporarily publish full length, zero slots, rewrite trailer.
-            file.set_logical_len(need)?;
-            file.zero_range(0, body_bytes)?;
-            // set_logical_len already wrote trailer at end.
-        }
-        write_head_meta(&path, layout, 0)?;
+        // Layout ext must be set before set_logical_len so the footer at EOF
+        // carries bits/generation (no sidecar).
+        file.set_trailing_ext(encode_layout_ext(layout, 0))?;
+        file.set_logical_len(need)?;
+        file.zero_range(0, body_bytes)?;
+        remove_legacy_meta_sidecar(&path);
         if layout.bits >= 24 {
             rbitcoin_log::info!(
-                "store: address-head create path={} bits={} slots={} entry={}B (~{:.2} GiB sparse, trailing magic)",
+                "store: address-head create path={} bits={} slots={} entry={}B (~{:.2} GiB sparse, footer layout)",
                 file.path().display(),
                 layout.bits,
                 slots,
@@ -528,27 +553,22 @@ impl AddressHead {
                 "tx.head is a directory (legacy shards); wipe datadir for address head",
             ));
         }
-        // Require current meta (probe algorithm + trailing magic layout).
-        let (layout, generation) = match read_head_meta(&path)? {
-            Some((layout, gen)) => (layout, gen),
-            None => {
-                return Err(StoreError::Corrupt(
-                    "tx.head.meta missing (page-local probe; rebuild tx.head)",
-                ));
-            }
-        };
+        // Layout is in the trailing footer (v5). Sidecar-only or older footers fail
+        // here → TxTable recreates + rebuilds from Class A.
+        let (file, ext) =
+            TableFile::open_trailing_header_from_end(&path, TableKind::HashHead)?;
+        let (layout, generation) = decode_layout_ext(&ext)?;
         let expect_body = layout.body_bytes();
-        let file =
-            TableFile::open_trailing_header(&path, TableKind::HashHead, expect_body)?;
         let body = file.data_len();
         if body == 0 {
             return Err(StoreError::Corrupt("address head size"));
         }
         if body != expect_body {
             return Err(StoreError::Corrupt(
-                "address head size mismatch vs tx.head.meta",
+                "address head size mismatch vs footer layout",
             ));
         }
+        remove_legacy_meta_sidecar(&path);
 
         let slots = layout.slots();
         let occupied = count_occupied(&file, slots, layout.entry_bytes)?;
@@ -991,21 +1011,21 @@ mod tests {
         let path = tmp("meta_v1");
         let h = AddressHead::create_with_bits(&path, 12).unwrap();
         drop(h);
-        // Rewrite meta as v1 (double-hash era).
-        let mut meta = path.as_os_str().to_os_string();
-        meta.push(".meta");
-        let meta = PathBuf::from(meta);
-        let mut buf = std::fs::read(&meta).unwrap();
-        buf[4..6].copy_from_slice(&1u16.to_le_bytes());
-        std::fs::write(&meta, &buf).unwrap();
+        // Corrupt footer layout version (v1 = double-hash era / pre-footer meta).
+        let mut raw = std::fs::read(&path).unwrap();
+        let n = raw.len();
+        assert!(n >= TRAILING_FOOTER_LEN);
+        // Footer layout ext at [n-16..n): version at bytes 4..6 of ext.
+        let ver_off = n - 16 + 4;
+        raw[ver_off..ver_off + 2].copy_from_slice(&1u16.to_le_bytes());
+        std::fs::write(&path, &raw).unwrap();
         match AddressHead::open(&path) {
             Err(StoreError::Corrupt(m))
-                if m.contains("page-local") || m.contains("rebuild") => {}
-            Err(e) => panic!("expected page-local meta error, got {e}"),
+                if m.contains("footer") || m.contains("rebuild") || m.contains("version") => {}
+            Err(e) => panic!("expected footer layout version error, got {e}"),
             Ok(_) => panic!("expected open failure for meta v1"),
         }
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&meta);
     }
 
     #[test]
@@ -1277,7 +1297,7 @@ mod tests {
     }
 
     #[test]
-    fn trailing_magic_page_aligned_slots() {
+    fn trailing_footer_page_aligned_slots_and_layout() {
         let path = tmp("trail_align");
         let h = AddressHead::create_with_bits(&path, 16).unwrap();
         // Slot 0 at file offset 0; page boundaries on 4 KiB.
@@ -1285,15 +1305,23 @@ mod tests {
         assert_eq!(entry_file_off(1024, 4), 4096);
         let body = HeadLayout::new(16).unwrap().body_bytes();
         assert_eq!(body % 4096, 0);
-        let meta = std::fs::metadata(&path).unwrap();
-        assert_eq!(meta.len(), body + FILE_HEADER_LEN as u64);
-        // Trailer not overlapping first page.
-        assert!(meta.len() >= 4096 + FILE_HEADER_LEN as u64 || body < 4096);
+        let st = std::fs::metadata(&path).unwrap();
+        assert_eq!(st.len(), body + TRAILING_FOOTER_LEN as u64);
+        // Footer not overlapping first page.
+        assert!(st.len() >= 4096 + TRAILING_FOOTER_LEN as u64 || body < 4096);
+        // No sidecar meta file.
+        assert!(!meta_path(&path).exists());
         h.insert(&[1u8; 32], Fk(1)).unwrap();
         drop(h);
         let h2 = AddressHead::open(&path).unwrap();
         assert!(h2.probe_fks(&[1u8; 32]).unwrap().contains(&Fk(1)));
+        assert_eq!(h2.bits(), 16);
+        assert_eq!(h2.generation(), 0);
+        // Footer layout round-trips after generation bump.
+        write_head_meta(&path, HeadLayout::new(16).unwrap(), 7).unwrap();
+        let h3 = AddressHead::open(&path).unwrap();
+        assert_eq!(h3.generation(), 7);
+        assert!(h3.probe_fks(&[1u8; 32]).unwrap().contains(&Fk(1)));
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(meta_path(&path));
     }
 }

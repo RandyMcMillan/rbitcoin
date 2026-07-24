@@ -26,6 +26,11 @@ use std::sync::{Arc, Mutex};
 
 pub const FILE_HEADER_LEN: usize = 16;
 
+/// Trailing-header tables (`tx.head`): 16-byte store identity + 16-byte layout
+/// extension (bits / entry_bytes / generation). Slots still start at file offset 0
+/// so probe pages stay OS-page-aligned.
+pub const TRAILING_FOOTER_LEN: usize = 32;
+
 /// One mmap window over the table file. Shared via [`Arc`]; bytes are accessed
 /// with role-disciplined pointer IO (not `DerefMut` under shared refs).
 struct MapEpoch {
@@ -65,9 +70,12 @@ pub struct TableFile {
     epoch: AtomicPtr<MapEpoch>,
     /// Logical length including header/trailer (published HWM).
     published_len: AtomicU64,
-    /// When true: 16-byte magic+HWM trailer is at **end** of published range;
-    /// data starts at offset 0 (page-aligned open-address tables).
+    /// When true: [`TRAILING_FOOTER_LEN`]-byte magic+HWM+layout trailer is at
+    /// **end** of published range; data starts at offset 0 (page-aligned probes).
     trailing_header: bool,
+    /// Layout extension for trailing footers (address-head bits/gen). Zero for
+    /// other tables; rewritten with the trailer on every `set_logical_len`.
+    trailing_ext: [u8; 16],
     kind: TableKind,
 }
 
@@ -155,12 +163,14 @@ impl TableFile {
             epoch: Self::install_epoch(epoch),
             published_len: AtomicU64::new(FILE_HEADER_LEN as u64),
             trailing_header: false,
+            trailing_ext: [0u8; 16],
             kind,
         })
     }
 
-    /// Create a table whose **data starts at offset 0** and the 16-byte
-    /// magic/schema/kind/HWM trailer sits at the **end** of the published length.
+    /// Create a table whose **data starts at offset 0** and a
+    /// [`TRAILING_FOOTER_LEN`]-byte footer (store identity + layout ext) sits at
+    /// the **end** of the published length.
     ///
     /// Used by page-local `tx.head` so probe pages are OS-page-aligned.
     pub fn create_trailing_header(
@@ -174,8 +184,8 @@ impl TableFile {
             .create_new(true)
             .open(&path)
             .map_err(|e| StoreError::io(&path, e))?;
-        // Minimal size: trailer only until caller sets body+trailer length.
-        let initial = FILE_HEADER_LEN as u64;
+        // Minimal size: footer only until caller sets body+footer length.
+        let initial = TRAILING_FOOTER_LEN as u64;
         file.set_len(initial)
             .map_err(|e| StoreError::io(&path, e))?;
         let map = unsafe { MmapMut::map_mut(&file) }.map_err(|e| StoreError::io(&path, e))?;
@@ -188,19 +198,23 @@ impl TableFile {
             epoch: Self::install_epoch(epoch),
             published_len: AtomicU64::new(initial),
             trailing_header: true,
+            trailing_ext: [0u8; 16],
             kind,
         };
         s.write_trailer(initial)?;
         Ok(s)
     }
 
-    /// Open a trailing-header table (magic at end). `data_bytes` is the slot/body
-    /// length (excluding the 16-byte trailer); total published = data_bytes + 16.
+    /// Open a trailing-header table. `data_bytes` is the slot/body length
+    /// (excluding the [`TRAILING_FOOTER_LEN`] footer).
+    ///
+    /// Returns `(file, layout_ext)` — the 16-byte address-head meta after the
+    /// store identity (zeros if unused).
     pub fn open_trailing_header(
         path: impl Into<PathBuf>,
         kind: TableKind,
         data_bytes: u64,
-    ) -> Result<Self, StoreError> {
+    ) -> Result<(Self, [u8; 16]), StoreError> {
         let path = path.into();
         let mut file = OpenOptions::new()
             .read(true)
@@ -208,57 +222,116 @@ impl TableFile {
             .open(&path)
             .map_err(|e| StoreError::io(&path, e))?;
         let file_len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
-        let expect = data_bytes.saturating_add(FILE_HEADER_LEN as u64);
+        let expect = data_bytes.saturating_add(TRAILING_FOOTER_LEN as u64);
         if file_len < expect {
             return Err(StoreError::Corrupt("trailing-header table short"));
         }
-        // Trailer at end of logical data region.
-        let mut trailer = [0u8; FILE_HEADER_LEN];
+        let mut footer = [0u8; TRAILING_FOOTER_LEN];
         file.seek(SeekFrom::Start(data_bytes))
             .map_err(|e| StoreError::io(&path, e))?;
-        file.read_exact(&mut trailer)
+        file.read_exact(&mut footer)
             .map_err(|e| StoreError::io(&path, e))?;
-        if trailer[0..4] != STORE_MAGIC {
-            // Leading-header legacy looks like BadMagic here → rebuild via meta.
+        if footer[0..4] != STORE_MAGIC {
+            // Leading-header legacy / pre-footer-meta → rebuild.
             return Err(StoreError::BadMagic);
         }
-        let ver = u16::from_le_bytes([trailer[4], trailer[5]]);
+        let ver = u16::from_le_bytes([footer[4], footer[5]]);
         if ver != SCHEMA_VERSION {
             return Err(StoreError::BadSchema(ver));
         }
-        let got = u16::from_le_bytes([trailer[6], trailer[7]]);
+        let got = u16::from_le_bytes([footer[6], footer[7]]);
         if got != kind.as_u16() {
             return Err(StoreError::BadKind {
                 expected: kind.as_u16(),
                 got,
             });
         }
+        let mut trailing_ext = [0u8; 16];
+        trailing_ext.copy_from_slice(&footer[16..32]);
         let logical = expect;
         let map = unsafe { MmapMut::map_mut(&file) }.map_err(|e| StoreError::io(&path, e))?;
         let epoch = Arc::new(MapEpoch { map });
         let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
-        Ok(Self {
-            path,
-            file: Mutex::new(file),
-            read_file,
-            epoch: Self::install_epoch(epoch),
-            published_len: AtomicU64::new(logical),
-            trailing_header: true,
-            kind,
-        })
+        Ok((
+            Self {
+                path,
+                file: Mutex::new(file),
+                read_file,
+                epoch: Self::install_epoch(epoch),
+                published_len: AtomicU64::new(logical),
+                trailing_header: true,
+                trailing_ext,
+                kind,
+            },
+            trailing_ext,
+        ))
+    }
+
+    /// Open trailing-header by reading the footer at EOF (no sidecar needed for
+    /// layout — bits/generation live in the footer extension).
+    pub fn open_trailing_header_from_end(
+        path: impl Into<PathBuf>,
+        kind: TableKind,
+    ) -> Result<(Self, [u8; 16]), StoreError> {
+        let path = path.into();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| StoreError::io(&path, e))?;
+        let file_len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
+        if file_len < TRAILING_FOOTER_LEN as u64 {
+            return Err(StoreError::Corrupt("trailing-header table short"));
+        }
+        let mut footer = [0u8; TRAILING_FOOTER_LEN];
+        file.seek(SeekFrom::Start(file_len - TRAILING_FOOTER_LEN as u64))
+            .map_err(|e| StoreError::io(&path, e))?;
+        file.read_exact(&mut footer)
+            .map_err(|e| StoreError::io(&path, e))?;
+        if footer[0..4] != STORE_MAGIC {
+            return Err(StoreError::BadMagic);
+        }
+        let ver = u16::from_le_bytes([footer[4], footer[5]]);
+        if ver != SCHEMA_VERSION {
+            return Err(StoreError::BadSchema(ver));
+        }
+        let got = u16::from_le_bytes([footer[6], footer[7]]);
+        if got != kind.as_u16() {
+            return Err(StoreError::BadKind {
+                expected: kind.as_u16(),
+                got,
+            });
+        }
+        let logical = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+        if logical < TRAILING_FOOTER_LEN as u64 || logical > file_len {
+            return Err(StoreError::Corrupt("trailing-header logical length"));
+        }
+        let data_bytes = logical - TRAILING_FOOTER_LEN as u64;
+        drop(file);
+        Self::open_trailing_header(path, kind, data_bytes)
+    }
+
+    /// Update the 16-byte trailing layout extension and rewrite the footer.
+    pub fn set_trailing_ext(&mut self, ext: [u8; 16]) -> Result<(), StoreError> {
+        if !self.trailing_header {
+            return Err(StoreError::Corrupt("set_trailing_ext on leading-header file"));
+        }
+        self.trailing_ext = ext;
+        let logical = self.published_len.load(Ordering::Acquire);
+        self.write_trailer(logical)
     }
 
     fn write_trailer(&self, logical: u64) -> Result<(), StoreError> {
-        if logical < FILE_HEADER_LEN as u64 {
+        if logical < TRAILING_FOOTER_LEN as u64 {
             return Err(StoreError::Corrupt("trailing header logical short"));
         }
-        let base = logical - FILE_HEADER_LEN as u64;
-        let mut trailer = [0u8; FILE_HEADER_LEN];
-        trailer[0..4].copy_from_slice(&STORE_MAGIC);
-        trailer[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
-        trailer[6..8].copy_from_slice(&self.kind.as_u16().to_le_bytes());
-        trailer[8..16].copy_from_slice(&logical.to_le_bytes());
-        // Ensure capacity then write via mmap path.
+        let base = logical - TRAILING_FOOTER_LEN as u64;
+        let mut footer = [0u8; TRAILING_FOOTER_LEN];
+        footer[0..4].copy_from_slice(&STORE_MAGIC);
+        footer[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
+        footer[6..8].copy_from_slice(&self.kind.as_u16().to_le_bytes());
+        footer[8..16].copy_from_slice(&logical.to_le_bytes());
+        footer[16..32].copy_from_slice(&self.trailing_ext);
         self.ensure_capacity(logical)?;
         let pin = self.pin();
         if pin.epoch.cap() < logical {
@@ -266,7 +339,7 @@ impl TableFile {
         }
         unsafe {
             let dst = pin.epoch.as_ptr().add(base as usize) as *mut u8;
-            ptr::copy_nonoverlapping(trailer.as_ptr(), dst, FILE_HEADER_LEN);
+            ptr::copy_nonoverlapping(footer.as_ptr(), dst, TRAILING_FOOTER_LEN);
         }
         Ok(())
     }
@@ -316,6 +389,7 @@ impl TableFile {
             epoch: Self::install_epoch(epoch),
             published_len: AtomicU64::new(logical),
             trailing_header: false,
+            trailing_ext: [0u8; 16],
             kind,
         })
     }
@@ -340,7 +414,12 @@ impl TableFile {
 
     /// Shrink or set logical length (must be ≥ header/trailer size). Does not zero freed bytes.
     pub fn set_logical_len(&self, logical: u64) -> Result<(), StoreError> {
-        if logical < FILE_HEADER_LEN as u64 {
+        let min = if self.trailing_header {
+            TRAILING_FOOTER_LEN as u64
+        } else {
+            FILE_HEADER_LEN as u64
+        };
+        if logical < min {
             return Err(StoreError::Corrupt("logical length below header"));
         }
         self.ensure_capacity(logical)?;
@@ -353,12 +432,17 @@ impl TableFile {
         Ok(())
     }
 
-    /// Slot/data length excluding the 16-byte header or trailer.
+    /// Slot/data length excluding the header or trailing footer.
     #[inline]
     pub fn data_len(&self) -> u64 {
+        let overhead = if self.trailing_header {
+            TRAILING_FOOTER_LEN as u64
+        } else {
+            FILE_HEADER_LEN as u64
+        };
         self.published_len
             .load(Ordering::Acquire)
-            .saturating_sub(FILE_HEADER_LEN as u64)
+            .saturating_sub(overhead)
     }
 
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
@@ -595,7 +679,9 @@ impl TableFile {
         }
         let bytes = logical.to_le_bytes();
         let hwm_off = if self.trailing_header {
-            logical.saturating_sub(FILE_HEADER_LEN as u64).saturating_add(8)
+            logical
+                .saturating_sub(TRAILING_FOOTER_LEN as u64)
+                .saturating_add(8)
         } else {
             8
         };
@@ -612,7 +698,9 @@ impl TableFile {
         self.write_hwm_mmap(logical);
         let mut file = self.file.lock().unwrap();
         let seek = if self.trailing_header {
-            logical.saturating_sub(FILE_HEADER_LEN as u64).saturating_add(8)
+            logical
+                .saturating_sub(TRAILING_FOOTER_LEN as u64)
+                .saturating_add(8)
         } else {
             8
         };

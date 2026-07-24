@@ -28,8 +28,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
   store/
     meta                         # store magic + schema version
     header.body / header.head    # Class A headers + hash index
-    tx.body / tx.idx / tx.head   # Class A txs + address head
-    tx.head.meta                 # address layout (bits, entry_bytes, generation)
+    tx.body / tx.idx / tx.head   # Class A txs + address head (layout in footer)
     tx.head.resize / tx.head.new # online head rebuild (transient)
     spenders.body                # multi-spender list nodes only
     confirmed.body               # Class C: height → header_fk
@@ -187,13 +186,13 @@ Keyless open-address table: **txid → dense create_fk**.
 | Env | `RBITCOIN_TX_HEAD_BITS` in **8..=34**; tiny scale uses BITS=16 |
 | Entry | LE create_fk; **0 = empty**; **no HAS_NEXT** |
 | Entry width | **4 B** for BITS ≤ 32; **8 B** for BITS ≥ 33 (page then 8 KiB) |
-| Meta | `tx.head.meta`: bits, entry_bytes, generation; **version 4** = page-local + trailing file magic |
-| File layout | Slots at **offset 0** (page-aligned); 16-byte store magic/HWM **trailer at end** |
+| Meta | Embedded in **trailing footer** (no sidecar): bits, entry_bytes, generation; **version 5** |
+| File layout | Slots at **offset 0** (page-aligned); **32-byte** footer at end (16-byte store magic/HWM + 16-byte layout) |
 | Probe | **Page** from high txid bits; **10-bit** in-page double-hash; one page load (4 KiB @ 4 B); max depth **1024**; first insert depth **>128** starts online resize if not already running |
 | Insert | First empty in-page (or same fk idempotent); second same-txid goes **deeper** in-page |
 | Lookup | Body-verify from **last occupied → first** (newest BIP30-shaped create wins) |
 
-**Probe note:** all candidates for a key share one page (single IO). Keyless slots cannot Robin-Hood. Meta **&lt; v3** refused on open → recreate + rebuild from Class A.
+**Probe note:** all candidates for a key share one page (single IO). Keyless slots cannot Robin-Hood. Footer layout **≠ v5** (or missing magic) refused on open → recreate + rebuild from Class A.
 
 ### Online sequential resize
 

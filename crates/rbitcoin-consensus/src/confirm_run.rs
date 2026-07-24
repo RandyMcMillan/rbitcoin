@@ -471,43 +471,34 @@ fn assemble_run(
         if i == 0 {
             // MTP + prev link for the first height of a load batch.
             //
-            // IBD pipelines load(N+1) ∥ scripts(N) ∥ write(N−1), so this batch may
-            // start above the durable tip while earlier batches still hold header
-            // plans for unconfirmed parents. Tip GC drops plans at/below tip, so
-            // the MTP window is often a mix of store (≤ tip) and plans (> tip).
-            //
-            // The old all-or-nothing path fell back to store-only on the first
-            // missing plan (usually genesis / tip-GC'd heights), then hit
-            // confirmed[prev] = None while prev was still in-flight → permanent
-            // BadPrev at tip+1 (signet @11 with load queue depth ≥ 2).
+            // IBD pipelines load(N+1) ∥ scripts(N) ∥ write(N−1). Tip GC drops
+            // header plans for h ≤ tip when write advances tip. Assemble must
+            // not snapshot tip once: a concurrent tip_gc can drop plans while
+            // our tip read is still the pre-write value → false "plan missing
+            // above tip" (retryable load incomplete spam on restart / dense
+            // pipeline). Prefer plan when present; else **store** if confirmed.
             if height.0 >= 1 {
                 let prev_h = Height(height.0 - 1);
                 let start = prev_h.0.saturating_sub(10);
-                let tip = query.tip_height().map(|h| h.0);
+                let prev_hash = block.header.prev_blockhash.to_byte_array();
                 let mut times = Vec::with_capacity(11);
                 for h in start..=prev_h.0 {
                     if let Some(plan) = query.confirm_parent_cache().get_header_plan(h) {
                         times.push(plan.header_rec.timestamp);
-                        if h == prev_h.0
-                            && plan.header_rec.hash != block.header.prev_blockhash.to_byte_array()
-                        {
+                        if h == prev_h.0 && plan.header_rec.hash != prev_hash {
                             return Err(ConsensusError::BadPrev);
                         }
-                    } else if tip.is_some_and(|t| h <= t) {
-                        // Confirmed height — store is authoritative (plans tip-GC'd).
-                        let (_fk, rec) = query
-                            .header_at_height(Height(h))
-                            .map_err(ConsensusError::Store)?
-                            .ok_or(ConsensusError::BadPrev)?;
+                    } else if let Some((_fk, rec)) = query
+                        .header_at_height(Height(h))
+                        .map_err(ConsensusError::Store)?
+                    {
+                        // Confirmed (plan tip-GC'd or never cached) — store wins.
                         times.push(rec.timestamp);
-                        if h == prev_h.0
-                            && rec.hash != block.header.prev_blockhash.to_byte_array()
-                        {
+                        if h == prev_h.0 && rec.hash != prev_hash {
                             return Err(ConsensusError::BadPrev);
                         }
                     } else {
-                        // Unconfirmed parent with no plan: earlier load batch not
-                        // ready yet. Retryable (not a permanent consensus reject).
+                        // Unconfirmed parent with no plan: earlier load not ready.
                         return Err(ConsensusError::Store(StoreError::Corrupt(
                             "confirm: load incomplete (parent header plan missing above tip)",
                         )));
@@ -519,17 +510,16 @@ fn assemble_run(
                 }
                 time_window = times;
 
-                // Bits / PoW / checkpoint: store path when parent is confirmed;
-                // otherwise mirror the i>0 path from the parent header plan.
-                if tip.is_some_and(|t| prev_h.0 <= t) {
+                // Bits / PoW / checkpoint: store when parent is confirmed; else plan.
+                if query
+                    .header_at_height(prev_h)
+                    .map_err(ConsensusError::Store)?
+                    .is_some()
+                {
                     validate_header(query, params, height, &block.header)?;
-                } else {
-                    let prev_plan = query
-                        .confirm_parent_cache()
-                        .get_header_plan(prev_h.0)
-                        .ok_or(ConsensusError::Store(StoreError::Corrupt(
-                            "confirm: load incomplete (parent header plan missing above tip)",
-                        )))?;
+                } else if let Some(prev_plan) =
+                    query.confirm_parent_cache().get_header_plan(prev_h.0)
+                {
                     if let Some(cp) = params.checkpoint_at(height) {
                         if cp != block.header.block_hash() {
                             return Err(ConsensusError::BadHeader("checkpoint mismatch"));
@@ -555,6 +545,10 @@ fn assemble_run(
                         .header
                         .validate_pow(target)
                         .map_err(|_| ConsensusError::InvalidPow)?;
+                } else {
+                    return Err(ConsensusError::Store(StoreError::Corrupt(
+                        "confirm: load incomplete (parent header plan missing above tip)",
+                    )));
                 }
             } else {
                 validate_header(query, params, height, &block.header)?;

@@ -2002,6 +2002,57 @@ fn confirm_load_ahead_of_write_does_not_badprev() {
     assert_eq!(q.tip_height(), Some(Height(20)));
 }
 
+/// Tip GC drops header plans for h ≤ tip while load-ahead assembles the next
+/// batch. Assemble must use store for confirmed parents when the plan is gone
+/// (not a tip-snapshot race that yields "load incomplete" on restart / dense
+/// pipeline). Signet log: incomplete @ mid-heights while tip still advances.
+#[test]
+fn confirm_assemble_after_tip_gc_uses_store_for_mtp() {
+    use rbitcoin_consensus::{
+        accept_and_archive_block, accept_and_connect_block, confirm_load_phase,
+        confirm_scripts_phase, confirm_write_phase, ChainParams, Milestone,
+    };
+    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.enter_direct_index_mode().unwrap();
+    let ms = Milestone::NONE;
+    let params = ChainParams::regtest();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    let mut all: Vec<(Height, [u8; 32])> = Vec::with_capacity(24);
+    for h in 1u32..=24 {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+        all.push((Height(h), b.block_hash().to_byte_array()));
+    }
+
+    // Load+write first 12 so tip=12 and tip_gc drops plans ≤ 12.
+    let batch_a: Vec<(Height, [u8; 32])> = all[..12].to_vec();
+    let mat_a = confirm_load_phase(&q, &params, ms, &batch_a).expect("load A");
+    let ok_a = confirm_scripts_phase(mat_a.batch).expect("scripts A");
+    confirm_write_phase(&q, &params, ms, ok_a.batch).expect("write A");
+    assert_eq!(q.tip_height(), Some(Height(12)));
+
+    // Load 13..=24: MTP window for height 13 is 2..=12 — plans tip-GC'd, must
+    // come from confirmed[] store (not retryable load incomplete).
+    let batch_b: Vec<(Height, [u8; 32])> = all[12..].to_vec();
+    let mat_b = confirm_load_phase(&q, &params, ms, &batch_b).unwrap_or_else(|e| {
+        panic!("load after tip_gc must use store for MTP parents (got {e})");
+    });
+    assert_eq!(mat_b.batch.heights_hashes()[0].0, 13);
+    let ok_b = confirm_scripts_phase(mat_b.batch).expect("scripts B");
+    confirm_write_phase(&q, &params, ms, ok_b.batch).expect("write B");
+    assert_eq!(q.tip_height(), Some(Height(24)));
+}
+
 /// BlockCache + MempoolHub public surfaces used by P2P tip mode / Electrum.
 #[test]
 fn block_cache_and_mempool_hub_surface() {

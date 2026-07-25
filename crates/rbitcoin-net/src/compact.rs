@@ -348,4 +348,34 @@ mod tests {
         assert_eq!(recon.txdata[1].compute_txid(), b1.compute_txid());
         assert_eq!(recon.txdata[2].compute_txid(), b2.compute_txid());
     }
+
+    #[test]
+    fn version1_txid_shortids_fill() {
+        let b1 = spend(7);
+        let block = Block {
+            header: dummy_header(),
+            txdata: vec![coinbase(), b1.clone()],
+        };
+        let hsi = HeaderAndShortIds::from_block(&block, 4, 1, &[]).unwrap();
+        let avail = shortid_map_from_txs(&block.header, hsi.nonce, 1, [&b1]);
+        let recon = try_reconstruct(&hsi, &avail, 1).expect("v1 fill");
+        assert_eq!(recon.txdata[1].compute_txid(), b1.compute_txid());
+    }
+
+    #[test]
+    fn wrong_count_blocktxn_errors() {
+        let b1 = spend(8);
+        let block = Block {
+            header: dummy_header(),
+            txdata: vec![coinbase(), b1],
+        };
+        let hsi = HeaderAndShortIds::from_block(&block, 5, 2, &[]).unwrap();
+        let empty: HashMap<ShortId, Vec<&Transaction>> = HashMap::new();
+        let missing = try_reconstruct(&hsi, &empty, 2).unwrap_err();
+        let txn = BlockTransactions {
+            block_hash: block.block_hash(),
+            transactions: vec![], // wrong count
+        };
+        assert!(apply_block_transactions(&hsi, &missing, &txn, &empty, 2).is_err());
+    }
 }

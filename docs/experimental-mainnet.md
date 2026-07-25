@@ -58,7 +58,7 @@ Electrum is for **after** catch-up completes:
 
 After tip: few outbound follow peers, getheaders / inv / block accept.
 
-**Compact blocks (BIP152 v2):** we advertise `sendcmpct` high-bandwidth version 2. Incoming `cmpctblock` is reconstructed from the mempool short-id map; missing txs use `getblocktxn` / `blocktxn`. Full `getdata` MSG_WITNESS_BLOCK remains the fallback when mempool is cold or fill fails. We also serve `getblocktxn` from store/cache.
+**Compact blocks (BIP152 v2):** we advertise `sendcmpct` high-bandwidth version 2. Incoming `cmpctblock` is reconstructed from the mempool short-id map; missing txs use `getblocktxn` / `blocktxn`. Full `getdata` MSG_WITNESS_BLOCK remains the fallback when mempool is cold or fill fails. We serve `getblocktxn` and `MSG_CMPCT_BLOCK` getdata from store/cache, and announce tips as `cmpctblock` when the peer enabled high-bandwidth mode.
 
 **WTx (BIP339):** handshake sends `wtxidrelay` (protocol ≥70016). When the peer also sends it, we announce and request `MSG_WTX` inventory.
 

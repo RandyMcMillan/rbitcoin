@@ -12,7 +12,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::p2p::address::Address;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
-use bitcoin::p2p::message_compact_blocks::{BlockTxn, GetBlockTxn, SendCmpct};
+use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, GetBlockTxn, SendCmpct};
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Magic, ServiceFlags, PROTOCOL_VERSION};
 use bitcoin::bip152::{BlockTransactions, HeaderAndShortIds};
@@ -230,6 +230,9 @@ pub async fn peer_session_with(
     let mut peer_wants_headers = false;
     // BIP339: peer sent `wtxidrelay` (we announce/request MSG_WTX when true).
     let mut peer_wtxid_relay = false;
+    // BIP152: peer asked for high-bandwidth compact announces (`sendcmpct`).
+    let mut peer_send_cmpct = false;
+    let mut peer_cmpct_version: u32 = 2;
     // Headers received while assembling a potential reorg branch (hash → header).
     let mut pending_headers: HashMap<BlockHash, bitcoin::block::Header> = HashMap::new();
     // Blocks waiting for in-order accept (hash → block).
@@ -252,6 +255,29 @@ pub async fn peer_session_with(
                 tip = tip_rx.recv() => {
                     match tip {
                         Ok(ev) => {
+                            if peer_send_cmpct {
+                                if let Ok(Some(block)) = block_for_peer(
+                                    hub.cache.as_ref(),
+                                    hub.query.as_ref(),
+                                    &ev.hash,
+                                ) {
+                                    let nonce = rand_nonce();
+                                    if let Ok(hsi) = HeaderAndShortIds::from_block(
+                                        &block,
+                                        nonce,
+                                        peer_cmpct_version.max(1).min(2),
+                                        &[],
+                                    ) {
+                                        queue_out(
+                                            &out_tx,
+                                            NetworkMessage::CmpctBlock(CmpctBlock {
+                                                compact_block: hsi,
+                                            }),
+                                        )?;
+                                        continue;
+                                    }
+                                }
+                            }
                             queue_out(&out_tx, tip_announce_msg(&ev, peer_wants_headers))?;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -320,6 +346,8 @@ pub async fn peer_session_with(
                         &out_tx,
                         &mut peer_wants_headers,
                         &mut peer_wtxid_relay,
+                        &mut peer_send_cmpct,
+                        &mut peer_cmpct_version,
                         &mut pending_headers,
                         &mut pending_blocks,
                         &mut pending_cmpct,
@@ -450,6 +478,8 @@ async fn handle_peer_frame(
     out_tx: &mpsc::UnboundedSender<NetworkMessage>,
     peer_wants_headers: &mut bool,
     peer_wtxid_relay: &mut bool,
+    peer_send_cmpct: &mut bool,
+    peer_cmpct_version: &mut u32,
     pending_headers: &mut HashMap<BlockHash, bitcoin::block::Header>,
     pending_blocks: &mut HashMap<BlockHash, bitcoin::Block>,
     pending_cmpct: &mut HashMap<BlockHash, PendingCmpct>,
@@ -465,8 +495,12 @@ async fn handle_peer_frame(
         NetworkMessage::SendHeaders => {
             *peer_wants_headers = true;
         }
-        NetworkMessage::SendCmpct(_) => {
-            // Peer may send us compact blocks; we reconstruct when mempool is warm.
+        NetworkMessage::SendCmpct(sc) => {
+            // High-bandwidth mode: announce new tips as cmpctblock (version 1 or 2).
+            if sc.version == 1 || sc.version == 2 {
+                *peer_send_cmpct = sc.send_compact;
+                *peer_cmpct_version = sc.version as u32;
+            }
         }
         NetworkMessage::WtxidRelay => {
             // BIP339 mutual: we already sent wtxidrelay pre-verack; remember theirs.
@@ -484,6 +518,23 @@ async fn handle_peer_frame(
                             block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), h)?
                         {
                             queue_out(out_tx, NetworkMessage::Block(block))?;
+                        }
+                    }
+                    Inventory::CompactBlock(h) => {
+                        if let Some(block) =
+                            block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), h)?
+                        {
+                            let ver = (*peer_cmpct_version).max(1).min(2);
+                            if let Ok(hsi) =
+                                HeaderAndShortIds::from_block(&block, rand_nonce(), ver, &[])
+                            {
+                                queue_out(
+                                    out_tx,
+                                    NetworkMessage::CmpctBlock(CmpctBlock {
+                                        compact_block: hsi,
+                                    }),
+                                )?;
+                            }
                         }
                     }
                     Inventory::Transaction(txid)

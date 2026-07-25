@@ -42,7 +42,7 @@ pub struct AcceptResult {
     pub slot: u32,
 }
 
-/// Why accept failed (policy / graph / durable).
+/// Why accept failed (policy / graph / durable / consensus script).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcceptError {
     Policy(&'static str),
@@ -57,6 +57,8 @@ pub enum AcceptError {
     Coinbase,
     NotFound(Txid),
     Durable(String),
+    /// Consensus script verification failed for one or more inputs.
+    Script(String),
 }
 
 impl std::fmt::Display for AcceptError {
@@ -77,6 +79,7 @@ impl std::fmt::Display for AcceptError {
             AcceptError::Coinbase => f.write_str("coinbase"),
             AcceptError::NotFound(t) => write!(f, "not found {t}"),
             AcceptError::Durable(s) => write!(f, "durable: {s}"),
+            AcceptError::Script(s) => write!(f, "script: {s}"),
         }
     }
 }
@@ -87,6 +90,17 @@ impl From<MempoolError> for AcceptError {
     fn from(e: MempoolError) -> Self {
         AcceptError::Durable(e.to_string())
     }
+}
+
+/// Run consensus script verification for every input (mempool / tip height assumed
+/// post-all-softforks: BIP16/65/66/112 active).
+fn verify_tx_scripts(tx: &Transaction, prevouts: Vec<TxOut>) -> Result<(), AcceptError> {
+    if prevouts.len() != tx.input.len() {
+        return Err(AcceptError::Script("prevout count mismatch".into()));
+    }
+    // `script_bench` mirrors production `ScriptCheckJob` with softfork flags on.
+    let job = rbitcoin_consensus::script_bench::JobBytes::new(prevouts, tx.clone());
+    rbitcoin_consensus::script_bench::verify_job(&job).map_err(|e| AcceptError::Script(e.to_string()))
 }
 
 /// Mempool with RAM TxGraph layered on durable store.
@@ -249,7 +263,6 @@ impl ActiveMempool {
             input_value = input_value.saturating_add(txout.value.to_sat());
             prevouts.push(txout);
         }
-        let _ = prevouts; // reserved for future script verify
 
         let output_value: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
         if output_value > input_value {
@@ -261,6 +274,13 @@ impl ActiveMempool {
         match policy::check_libre_admission(tx, fee_sat, weight) {
             PolicyResult::Standard => {}
             PolicyResult::NonStandard(s) => return Err(AcceptError::Policy(s)),
+        }
+
+        // Consensus script checks (same interpreter as block connect). Policy
+        // alone is not enough — invalid scripts must never enter the pool or
+        // be announced / Electrum-broadcast.
+        if let Err(e) = verify_tx_scripts(tx, prevouts) {
+            return Err(e);
         }
 
         // Full RBF (Libre): replace conflicts if replacement pays enough.
@@ -597,6 +617,42 @@ mod tests {
             let e = mp.graph.get(&txid).unwrap();
             assert_eq!(e.fee_sat, 1000);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Consensus script check must reject spends of real templates with empty witness.
+    /// (Regression: accept used to skip verify and only apply Libre policy.)
+    #[test]
+    fn reject_invalid_p2wpkh_script() {
+        use bitcoin::WPubkeyHash;
+
+        let dir = tmp_dir();
+        // Standard P2WPKH spk — not anyone-can-spend; empty witness fails.
+        let wpkh = WPubkeyHash::from_byte_array([0x11; 20]);
+        let spk = ScriptBuf::new_p2wpkh(&wpkh);
+        let op = OutPoint {
+            txid: Txid::from_byte_array([0xab; 32]),
+            vout: 0,
+        };
+        let txout = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: spk,
+        };
+        let mut map = HashMap::new();
+        map.insert(op, txout);
+        let utxos = MapUtxoProvider { map };
+        let tx = spend_tx(op, 99_000); // empty scriptSig + empty witness
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let err = mp.accept_tx(&tx, &utxos).unwrap_err();
+        assert!(
+            matches!(err, AcceptError::Script(_)),
+            "expected Script reject, got {err}"
+        );
+        assert_eq!(mp.live_count(), 0);
+        // Sanity: ACS still accepted (Libre + consensus anyone-can-spend).
+        let (op2, _, utxos2) = chain_utxo(50_000);
+        let ok = spend_tx(op2, 49_000);
+        mp.accept_tx(&ok, &utxos2).expect("ACS still ok");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

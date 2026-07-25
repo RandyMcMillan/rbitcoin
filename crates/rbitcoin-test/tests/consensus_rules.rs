@@ -145,6 +145,34 @@ fn h6_target_above_pow_limit_is_detectable() {
     assert!(t > main.pow_limit, "fixture target should exceed mainnet pow limit");
 }
 
+#[test]
+fn h8_rejects_timestamp_too_far_in_future() {
+    let (_td, q, params) = regtest_q();
+    connect_genesis(&q, &params);
+    let g = regtest_genesis();
+    // Far beyond 2h network-adjusted (we use wall clock) allowance.
+    let far = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(1_700_000_000)
+        .saturating_add(3 * 60 * 60);
+    let mut bad = mine_regtest_block(g.block_hash(), far, 1, vec![]);
+    let expected = expected_next_bits(&q, &params, Height(1)).unwrap();
+    bad.header.bits = expected;
+    let target = bitcoin::Target::from_compact(expected);
+    for nonce in 0..u32::MAX {
+        bad.header.nonce = nonce;
+        if bad.header.validate_pow(target).is_ok() {
+            break;
+        }
+    }
+    let err = validate_header(&q, &params, Height(1), &bad.header).unwrap_err();
+    assert!(
+        matches!(err, ConsensusError::BadHeader(s) if s.contains("future")),
+        "{err:?}"
+    );
+}
+
 // ─── Connect / economic rules ───────────────────────────────────────────────
 
 #[test]

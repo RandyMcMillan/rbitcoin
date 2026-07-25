@@ -7,7 +7,7 @@
 
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
-use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_mempool::{AcceptError, AcceptResult, ActiveMempool, UtxoProvider};
 use rbitcoin_query::Query;
 use rbitcoin_store::OutputRecord;
@@ -113,6 +113,24 @@ impl MempoolHub {
 
     pub fn get_tx(&self, txid: &Txid) -> Option<Transaction> {
         self.inner.lock().unwrap().get_tx(txid).cloned()
+    }
+
+    /// Look up a live mempool tx by wtxid (BIP339 / compact v2).
+    pub fn get_tx_by_wtxid(&self, wtxid: &Wtxid) -> Option<Transaction> {
+        let g = self.inner.lock().unwrap();
+        for (txid, e) in g.graph.iter() {
+            if e.wtxid == *wtxid {
+                return g.get_tx(txid).cloned();
+            }
+        }
+        None
+    }
+
+    /// True if a live mempool entry has this wtxid (BIP339 inv filter).
+    pub fn contains_wtxid(&self, wtxid: &Wtxid) -> bool {
+        let g = self.inner.lock().unwrap();
+        let found = g.graph.iter().any(|(_, e)| e.wtxid == *wtxid);
+        found
     }
 
     /// Accept a peer (or local) transaction when relay is enabled.
@@ -438,6 +456,8 @@ mod tests {
         assert!(hub.scripthash_mempool(&[0u8; 32]).is_empty());
         assert_eq!(hub.scripthash_unconfirmed_delta(&[0u8; 32]), 0);
         assert!(hub.list_live().is_empty());
+        assert!(!hub.contains_wtxid(&Wtxid::from_byte_array([0u8; 32])));
+        assert!(hub.get_tx_by_wtxid(&Wtxid::from_byte_array([0u8; 32])).is_none());
         assert_eq!(hub.remove_for_block(&[]), 0);
         assert_eq!(hub.reorg_reaccept(&[]), 0);
         hub.flush().unwrap();

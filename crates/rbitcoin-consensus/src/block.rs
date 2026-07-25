@@ -1769,6 +1769,44 @@ mod structure_rule_tests {
         assert!(default_milestone_height(Network::Mainnet) > 0);
         assert!(default_milestone_height(Network::Signet) > 0);
     }
+
+    #[test]
+    fn s9_rejects_bad_cb_length_short() {
+        let mut cb = coinbase(0);
+        cb.input[0].script_sig = ScriptBuf::from_bytes(vec![0x01]); // len 1
+        let b = block_with(vec![cb]);
+        let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
+        assert_bad_block(err, "bad-cb-length");
+    }
+
+    #[test]
+    fn s9_rejects_bad_cb_length_long() {
+        let mut cb = coinbase(0);
+        cb.input[0].script_sig = ScriptBuf::from_bytes(vec![0x01; 101]);
+        let b = block_with(vec![cb]);
+        let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
+        assert_bad_block(err, "bad-cb-length");
+    }
+
+    #[test]
+    fn s10_rejects_vout_toolarge() {
+        let mut cb = coinbase(0);
+        // MAX_MONEY + 1 sat.
+        cb.output[0].value = Amount::from_sat(21_000_000 * 100_000_000 + 1);
+        let b = block_with(vec![cb]);
+        let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
+        assert_bad_block(err, "toolarge");
+    }
+
+    #[test]
+    fn s11_rejects_excessive_legacy_sigops() {
+        let mut cb = coinbase(0);
+        // 20_001 × OP_CHECKSIG × WITNESS_SCALE(4) = 80_004 > MAX 80_000.
+        cb.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0xac; 20_001]);
+        let b = block_with(vec![cb]);
+        let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
+        assert_bad_block(err, "sigops");
+    }
 }
 
 

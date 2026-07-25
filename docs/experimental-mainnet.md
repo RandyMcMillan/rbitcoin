@@ -56,7 +56,15 @@ Electrum is for **after** catch-up completes:
 
 ## Tip follow
 
-After tip: few outbound follow peers, getheaders / inv / block accept. Compact-block reconstruction and package wire are improving; full getdata fallback remains.
+After tip: few outbound follow peers, getheaders / inv / block accept.
+
+**Compact blocks (BIP152 v2):** we advertise `sendcmpct` high-bandwidth version 2. Incoming `cmpctblock` is reconstructed from the mempool short-id map; missing txs use `getblocktxn` / `blocktxn`. Full `getdata` MSG_WITNESS_BLOCK remains the fallback when mempool is cold or fill fails. We also serve `getblocktxn` from store/cache.
+
+**WTx (BIP339):** handshake sends `wtxidrelay` (protocol ≥70016). When the peer also sends it, we announce and request `MSG_WTX` inventory.
+
+**Packages:** `accept_package` is implemented; experimental wire command `rbtpkg` (len-prefixed). Full BIP331 `NetworkMessage` needs a rust-bitcoin upgrade.
+
+**Misbehavior:** per-session ban score (threshold 100) for unsolicited/bad compact payloads and oversized pending-cmpct pressure; disconnects the peer.
 
 **BIP324 v2 only** — many seed peers speak v1 only and will not connect.
 

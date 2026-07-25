@@ -3,6 +3,7 @@
 mod cache;
 mod chain;
 mod codec;
+mod compact;
 mod error;
 mod ibd;
 mod msg_decode;

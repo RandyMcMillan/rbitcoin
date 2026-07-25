@@ -8,6 +8,7 @@
 - **Post-IBD durability** (epoch finalize + tip wire ring) per [`libbitcoin-durable-archive-variant.md`](./libbitcoin-durable-archive-variant.md)
 - **Electrum** TCP (confirmed + unconfirmed when mempool attached); TLS via reverse proxy
 - **Libre-class mempool** (cluster, full RBF, 0.1 sat/vB min; **scripts verified on accept**)
+- **BIP152 compact blocks (v2)** + **BIP339 wtxidrelay** on tip-follow sessions
 - **No** pruning, GUI, wallet, or mining
 
 **Not** a production Bitcoin Core or Fulcrum replacement. See [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).

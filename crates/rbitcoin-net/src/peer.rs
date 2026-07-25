@@ -12,10 +12,11 @@ use bitcoin::hashes::Hash;
 use bitcoin::p2p::address::Address;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
-use bitcoin::p2p::message_compact_blocks::SendCmpct;
+use bitcoin::p2p::message_compact_blocks::{BlockTxn, GetBlockTxn, SendCmpct};
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Magic, ServiceFlags, PROTOCOL_VERSION};
-use bitcoin::BlockHash;
+use bitcoin::bip152::{BlockTransactions, HeaderAndShortIds};
+use bitcoin::{Block, BlockHash, Transaction};
 use rbitcoin_query::Query;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -32,6 +33,11 @@ const OUR_PROTOCOL_VERSION: u32 = 70016;
 /// How often an established session re-issues `getheaders` so a quiet peer or
 /// a gap opened while we were offline still gets filled (signet ~10m blocks).
 const HEADERS_POLL_SECS: u64 = 120;
+
+/// Per-session misbehavior score that triggers disconnect (Core-like order).
+const BAN_SCORE_THRESHOLD: u32 = 100;
+/// Cap on incomplete compact blocks awaiting `blocktxn` (DoS).
+const MAX_PENDING_CMPCT: usize = 8;
 
 /// Services we advertise once store-backed reconstruct serve is available.
 pub fn local_service_flags() -> ServiceFlags {
@@ -193,14 +199,14 @@ pub async fn peer_session_with(
         .map(|p| p.to_string())
         .unwrap_or_else(|| "peer".into());
 
-    // Prefer headers announcements from peer; we do not send compact by default
-    // (no mempool short-ids). Advertise we understand cmpct v1/v2 but request full blocks.
+    // Prefer headers; accept high-bandwidth compact v2 (witness short-ids) with
+    // mempool reconstruction — fall back to full getdata when fill fails.
     // (wtxidrelay is negotiated pre-verack in the handshake — BIP339.)
     let _ = write_v2_msg(&mut writer, NetworkMessage::SendHeaders).await;
     let _ = write_v2_msg(
         &mut writer,
         NetworkMessage::SendCmpct(SendCmpct {
-            send_compact: false,
+            send_compact: true,
             version: 2,
         }),
     )
@@ -222,12 +228,18 @@ pub async fn peer_session_with(
     }
 
     let mut peer_wants_headers = false;
+    // BIP339: peer sent `wtxidrelay` (we announce/request MSG_WTX when true).
+    let mut peer_wtxid_relay = false;
     // Headers received while assembling a potential reorg branch (hash → header).
     let mut pending_headers: HashMap<BlockHash, bitcoin::block::Header> = HashMap::new();
     // Blocks waiting for in-order accept (hash → block).
     let mut pending_blocks: HashMap<BlockHash, bitcoin::Block> = HashMap::new();
+    // Incomplete compact blocks awaiting `blocktxn` (hash → state).
+    let mut pending_cmpct: HashMap<BlockHash, PendingCmpct> = HashMap::new();
     // Txids we received from this peer (origin exclusion for announce).
     let mut from_this_peer: HashMap<bitcoin::Txid, ()> = HashMap::new();
+    // Session misbehavior score (disconnect at BAN_SCORE_THRESHOLD).
+    let mut ban_score: u32 = 0;
     let mut tx_announce_rx = hub.mempool().map(|m| m.subscribe_announces());
     let mut headers_poll = tokio::time::interval(Duration::from_secs(HEADERS_POLL_SECS));
     // First tick completes immediately — skip so we don't double the bootstrap send.
@@ -266,15 +278,19 @@ pub async fn peer_session_with(
                                 if from_this_peer.contains_key(&txid) {
                                     continue;
                                 }
-                                if hub
-                                    .mempool()
-                                    .map(|m| m.relay_enabled() && m.contains(&txid))
-                                    .unwrap_or(false)
-                                {
-                                    queue_out(
-                                        &out_tx,
-                                        NetworkMessage::Inv(vec![Inventory::Transaction(txid)]),
-                                    )?;
+                                if let Some(mp) = hub.mempool() {
+                                    if mp.relay_enabled() && mp.contains(&txid) {
+                                        let inv = if peer_wtxid_relay {
+                                            if let Some(tx) = mp.get_tx(&txid) {
+                                                Inventory::WTx(tx.compute_wtxid())
+                                            } else {
+                                                Inventory::WitnessTransaction(txid)
+                                            }
+                                        } else {
+                                            Inventory::WitnessTransaction(txid)
+                                        };
+                                        queue_out(&out_tx, NetworkMessage::Inv(vec![inv]))?;
+                                    }
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -303,11 +319,20 @@ pub async fn peer_session_with(
                         hub.as_ref(),
                         &out_tx,
                         &mut peer_wants_headers,
+                        &mut peer_wtxid_relay,
                         &mut pending_headers,
                         &mut pending_blocks,
+                        &mut pending_cmpct,
                         &mut from_this_peer,
+                        &mut ban_score,
                     )
                     .await?;
+                    if ban_score >= BAN_SCORE_THRESHOLD {
+                        rbitcoin_log::warn!(
+                            "p2p: {peer_s} ban score {ban_score} ≥ {BAN_SCORE_THRESHOLD} — disconnect"
+                        );
+                        return Err(NetError::Protocol("peer ban score threshold"));
+                    }
                 }
             }
         }
@@ -353,14 +378,83 @@ fn queue_getheaders(
     queue_out(out, NetworkMessage::GetHeaders(gh))
 }
 
+/// Incomplete compact block waiting for `blocktxn`.
+struct PendingCmpct {
+    hsi: HeaderAndShortIds,
+    missing: Vec<u64>,
+    /// BIP152 version (1 = txid short-ids, 2 = wtxid).
+    version: u32,
+}
+
+/// Snapshot live mempool txs for short-id fill (owned so map can borrow them).
+fn mempool_live_txs(hub: &ChainHub) -> Vec<Transaction> {
+    hub.mempool()
+        .map(|mp| {
+            mp.list_live()
+                .into_iter()
+                .map(|(_, _, _, tx)| tx)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Reconstruct a compact block fully from mempool short-ids (version 1/2).
+fn try_fill_cmpct(hub: &ChainHub, hsi: &HeaderAndShortIds, version: u32) -> Option<Block> {
+    if hub.mempool().is_none() {
+        return None;
+    }
+    let live = mempool_live_txs(hub);
+    let avail =
+        crate::compact::shortid_map_from_txs(&hsi.header, hsi.nonce, version, live.iter());
+    crate::compact::try_reconstruct(hsi, &avail, version).ok()
+}
+
+/// Absolute indexes still missing after mempool fill (for `getblocktxn`).
+///
+/// Returns `None` when there is no mempool hub (caller should full-getdata).
+/// Returns `Some(empty)` only when reconstruct claimed success with no txs
+/// (degenerate); peer path treats empty as getdata fallback.
+fn try_cmpct_missing(hub: &ChainHub, hsi: &HeaderAndShortIds, version: u32) -> Option<Vec<u64>> {
+    if hub.mempool().is_none() {
+        return None;
+    }
+    let live = mempool_live_txs(hub);
+    let avail =
+        crate::compact::shortid_map_from_txs(&hsi.header, hsi.nonce, version, live.iter());
+    match crate::compact::try_reconstruct(hsi, &avail, version) {
+        Ok(_) => Some(Vec::new()),
+        Err(m) => Some(m),
+    }
+}
+
+/// Finish a pending compact block with a `blocktxn` payload.
+fn apply_cmpct_blocktxn(
+    hub: &ChainHub,
+    pc: &PendingCmpct,
+    bt: &BlockTransactions,
+) -> Result<Block, ()> {
+    let live = mempool_live_txs(hub);
+    let avail = crate::compact::shortid_map_from_txs(
+        &pc.hsi.header,
+        pc.hsi.nonce,
+        pc.version,
+        live.iter(),
+    );
+    crate::compact::apply_block_transactions(&pc.hsi, &pc.missing, bt, &avail, pc.version)
+        .map_err(|_| ())
+}
+
 async fn handle_peer_frame(
     frame: FramedMessage,
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<NetworkMessage>,
     peer_wants_headers: &mut bool,
+    peer_wtxid_relay: &mut bool,
     pending_headers: &mut HashMap<BlockHash, bitcoin::block::Header>,
     pending_blocks: &mut HashMap<BlockHash, bitcoin::Block>,
+    pending_cmpct: &mut HashMap<BlockHash, PendingCmpct>,
     from_this_peer: &mut HashMap<bitcoin::Txid, ()>,
+    ban_score: &mut u32,
 ) -> Result<(), NetError> {
     let msg = decode_framed_offload(frame).await?;
     match msg.payload() {
@@ -372,10 +466,11 @@ async fn handle_peer_frame(
             *peer_wants_headers = true;
         }
         NetworkMessage::SendCmpct(_) => {
-            // Peer may send us compact blocks; we always fall back to getdata.
+            // Peer may send us compact blocks; we reconstruct when mempool is warm.
         }
         NetworkMessage::WtxidRelay => {
-            // We already advertise wtxidrelay; acknowledge by no-op.
+            // BIP339 mutual: we already sent wtxidrelay pre-verack; remember theirs.
+            *peer_wtxid_relay = true;
         }
         NetworkMessage::GetHeaders(gh) => {
             let headers = headers_for_peer(hub.cache.as_ref(), hub.query.as_ref(), gh)?;
@@ -399,10 +494,45 @@ async fn handle_peer_frame(
                             }
                         }
                     }
-                    Inventory::WTx(_wtxid) => {
-                        // WTxid index lands with full wtxidrelay; peers can use txid inv.
+                    Inventory::WTx(wtxid) => {
+                        if let Some(mp) = hub.mempool() {
+                            if let Some(tx) = mp.get_tx_by_wtxid(wtxid) {
+                                queue_out(out_tx, NetworkMessage::Tx(tx))?;
+                            }
+                        }
                     }
                     _ => {}
+                }
+            }
+        }
+        NetworkMessage::GetBlockTxn(GetBlockTxn { txs_request }) => {
+            // Serve missing txs for a compact block we hold (BIP152).
+            let hash = txs_request.block_hash;
+            if let Some(block) = block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), &hash)? {
+                let mut transactions = Vec::with_capacity(txs_request.indexes.len());
+                let mut bad = false;
+                for idx in &txs_request.indexes {
+                    let i = *idx as usize;
+                    match block.txdata.get(i) {
+                        Some(tx) => transactions.push(tx.clone()),
+                        None => {
+                            bad = true;
+                            break;
+                        }
+                    }
+                }
+                if bad {
+                    *ban_score = ban_score.saturating_add(20);
+                } else {
+                    queue_out(
+                        out_tx,
+                        NetworkMessage::BlockTxn(BlockTxn {
+                            transactions: BlockTransactions {
+                                block_hash: hash,
+                                transactions,
+                            },
+                        }),
+                    )?;
                 }
             }
         }
@@ -421,7 +551,18 @@ async fn handle_peer_frame(
                         if relay {
                             if let Some(mp) = hub.mempool() {
                                 if !mp.contains(txid) {
+                                    // MSG_TX / MSG_WITNESS_TX inv: fetch by txid (wtxid only
+                                    // when the inv type is MSG_WTX — handled below).
                                     want.push(Inventory::WitnessTransaction(*txid));
+                                }
+                            }
+                        }
+                    }
+                    Inventory::WTx(wtxid) => {
+                        if relay {
+                            if let Some(mp) = hub.mempool() {
+                                if !mp.contains_wtxid(wtxid) {
+                                    want.push(Inventory::WTx(*wtxid));
                                 }
                             }
                         }
@@ -455,17 +596,75 @@ async fn handle_peer_frame(
             }
         }
         NetworkMessage::Block(block) => {
+            pending_cmpct.remove(&block.block_hash());
             pending_blocks.insert(block.block_hash(), block.clone());
             drain_pending(hub, pending_blocks, pending_headers)?;
         }
         NetworkMessage::CmpctBlock(cb) => {
-            // No mempool short-id reconstruction — request full witness block.
-            let hash = cb.compact_block.header.block_hash();
-            if !hub.has_block(&hash) {
+            let hsi = cb.compact_block.clone();
+            let hash = hsi.header.block_hash();
+            if hub.has_block(&hash) {
+                // already have
+            } else if let Some(block) = try_fill_cmpct(hub, &hsi, 2) {
+                pending_blocks.insert(hash, block);
+                drain_pending(hub, pending_blocks, pending_headers)?;
+            } else if let Some(missing) = try_cmpct_missing(hub, &hsi, 2) {
+                if missing.is_empty() {
+                    // Should not happen; fall back.
+                    queue_out(
+                        out_tx,
+                        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+                    )?;
+                } else if pending_cmpct.len() >= MAX_PENDING_CMPCT
+                    && !pending_cmpct.contains_key(&hash)
+                {
+                    *ban_score = ban_score.saturating_add(10);
+                    queue_out(
+                        out_tx,
+                        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+                    )?;
+                } else {
+                    pending_cmpct.insert(
+                        hash,
+                        PendingCmpct {
+                            hsi: hsi.clone(),
+                            missing: missing.clone(),
+                            version: 2,
+                        },
+                    );
+                    queue_out(
+                        out_tx,
+                        NetworkMessage::GetBlockTxn(GetBlockTxn {
+                            txs_request: crate::compact::missing_request(hash, &missing),
+                        }),
+                    )?;
+                }
+            } else {
                 queue_out(
                     out_tx,
                     NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
                 )?;
+            }
+        }
+        NetworkMessage::BlockTxn(BlockTxn { transactions: bt }) => {
+            let hash = bt.block_hash;
+            if let Some(pc) = pending_cmpct.remove(&hash) {
+                match apply_cmpct_blocktxn(hub, &pc, bt) {
+                    Ok(block) => {
+                        pending_blocks.insert(hash, block);
+                        drain_pending(hub, pending_blocks, pending_headers)?;
+                    }
+                    Err(()) => {
+                        *ban_score = ban_score.saturating_add(10);
+                        queue_out(
+                            out_tx,
+                            NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+                        )?;
+                    }
+                }
+            } else {
+                // Unsolicited or late blocktxn — mild penalty.
+                *ban_score = ban_score.saturating_add(5);
             }
         }
         NetworkMessage::Tx(tx) => {

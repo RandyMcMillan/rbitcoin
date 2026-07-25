@@ -26,6 +26,9 @@ cargo test -p rbitcoin-test --test scenarios consensus_
 | S6 | Merkle root matches txids | `BadBlock("merkle root mismatch")` | `structure_rule_tests::s6_rejects_merkle_root_mismatch` (+ `merkle_root_bytes_single_and_odd`) |
 | S7 | BIP34 height in coinbase (h≥1) | `BadBlock("bip34…")` | `s7_rejects_bip34_missing_at_height_1`, `s7_bip34_not_required_at_height_0` |
 | S8 | Witness commitment when any witness | missing / mismatch | `s8_rejects_missing_witness_commitment`, `s8_rejects_wrong_witness_commitment` |
+| S9 | Coinbase scriptSig length 2..=100 | `bad-cb-length` | `s9_rejects_bad_cb_length_short`, `s9_rejects_bad_cb_length_long` |
+| S10 | Output value / sum ≤ MAX_MONEY | `toolarge` | `s10_rejects_vout_toolarge` |
+| S11 | Legacy sigops cost ≤ 80_000 | `bad-blk-sigops` | `s11_rejects_excessive_legacy_sigops` |
 
 Location: `crates/rbitcoin-consensus/src/block.rs` (`structure_rule_tests`).
 
@@ -40,6 +43,7 @@ Location: `crates/rbitcoin-consensus/src/block.rs` (`structure_rule_tests`).
 | H5 | `bits == expected_next_bits` | `incorrect proof of work bits` | `h5_regtest_rejects_wrong_bits` (regtest: must equal prev) |
 | H6 | Target ≤ `pow_limit` | `target above pow limit` | `h6_target_above_pow_limit_is_detectable` |
 | H7 | PoW valid for claimed bits | `InvalidPow` | **rust-bitcoin** `validate_pow` — smoke via any successful `mine_regtest_block` accept |
+| H8 | Time not > now + 2h | `timestamp too far in future` | `h8_rejects_timestamp_too_far_in_future` |
 
 Location: `crates/rbitcoin-test/tests/consensus_rules.rs`. Helpers: `median_time_past`, `expected_next_bits` exported from `rbitcoin_consensus`.
 
@@ -56,6 +60,12 @@ Location: `crates/rbitcoin-test/tests/consensus_rules.rs`. Helpers: `median_time
 | C7 | Coinbase ≤ subsidy + fees | `BadBlock("coinbase excess value")` | `c7_coinbase_excess_subsidy_rejected` |
 | C8 | Overflows on value/fee sums | `… overflow` | optional; not crafted |
 | C9 | Scripts via pure-Rust backend | `Script(…)` | `script::tests_verify` (P2WPKH/P2PKH/P2WSH/P2SH-P2WPKH) + `script::p2tr::bip341_tests` (key-path + script-path BIP341 tweak) + mature spend scenarios |
+| C10 | BIP68 relative sequence locks (CSV package) | not final / lock fail | `block::locktime_tests::bip68_height_relative_lock`, `bip68_disabled_by_version_1` |
+| C11 | BIP113 locktime cutoff (MTP) | `is_final_tx` time path | `block::locktime_tests::time_locktime_uses_cutoff` |
+| C12 | BIP147 NULLDUMMY | CHECKMULTISIG dummy | `script::interpreter::tests::nulldummy_rejects_nonempty_dummy` |
+| C13 | Pre-taproot v1 WP is ACS | anyone-can-spend | `script::tests_verify::pretaproot_v1_witness_program_anyone_can_spend` |
+| C14 | Empty scriptPubKey fails | not ACS | `script::tests_verify` empty-spk case |
+| C15 | Core tx_valid / tx_invalid fixtures | parse + smoke | `rbitcoin-consensus/tests/tx_core_vectors.rs` |
 
 ## D. Params / policy we define
 

@@ -12,3 +12,7 @@ lcov.info
 /datadir/
 /datadir-*/
 /tmp/
+# Operator IBD / soak logs (keep out of commits)
+*-ibd.log
+mainnet*.log
+signet*.log

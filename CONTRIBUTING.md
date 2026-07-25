@@ -5,7 +5,7 @@
 1. Follow [`IMPLEMENTATION-PLAN.md`](./IMPLEMENTATION-PLAN.md).
 2. Prefer **high-level functional/integration tests** over unit tests ([`COVERAGE.md`](./COVERAGE.md), [`TESTING.md`](./TESTING.md)).
 3. Every PR must keep **100% line and 100% branch** coverage on first-party code.
-4. Do not reintroduce mempool/wallet/tx-relay scope without an explicit plan change; no pruning/GUI.
+4. Tip-mode mempool + tx relay are **in scope**; no pruning/GUI/wallet/mining without an explicit plan change.
 5. Store durability follows [`libbitcoin-durable-archive-variant.md`](./libbitcoin-durable-archive-variant.md).
 
 ## Workflow

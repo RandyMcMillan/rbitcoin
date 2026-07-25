@@ -18,6 +18,8 @@ wallet / mining parity.
 | Transport | **BIP324 v2 only** | v1 + v2 |
 | Mempool structure | Cluster graph + chunks | Cluster mempool (same lineage) |
 | Admission policy | **Libre-relay-class** (0.1 sat/vB, no dust, full RBF) | Standardness + policy knobs |
+| Compact blocks | BIP152 **v2** receive + reconstruct + `getblocktxn` serve | v1/v2 high-bandwidth |
+| WTx inventory | BIP339 when peer also sends `wtxidrelay` | BIP339 |
 | Package relay wire | `accept_package` + experimental `rbtpkg` | BIP331 |
 | Pruning / GUI / mining | Not supported | Supported |
 | Wallets | Electrum clients | Descriptor + legacy |

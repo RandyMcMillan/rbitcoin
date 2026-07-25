@@ -124,6 +124,10 @@ Policy lives in `rbitcoin-consensus::policy` and is **never** applied on block c
 
 - **BIP324 v2 only** — plaintext v1 peers disconnect (`peer does not speak BIP324 v2`).
 - Tx inv/getdata/tx relay is **off during IBD**; enabled in tip mode after catch-up.
+- **BIP152 compact blocks v2:** `sendcmpct` high-bandwidth; mempool short-id fill +
+  `getblocktxn` / `blocktxn`; full witness getdata fallback. We also **serve** `getblocktxn`.
+- **BIP339 wtxidrelay:** sent when peer version ≥70016; mutual negotiation uses `MSG_WTX`.
+- Session **ban score** (threshold 100) disconnects peers that spam bad compact payloads.
 - Package accept: `ActiveMempool::accept_package`; experimental wire command `rbtpkg`
   (BIP331 not yet in rust-bitcoin 0.32 `NetworkMessage`).
 

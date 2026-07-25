@@ -513,6 +513,13 @@ pub(crate) fn spawn_confirm_engine(
                         } else {
                             // Permanent failure on multi-block: re-queue tail only;
                             // first height stays inflight for the single-block retry.
+                            // Always log — silent split was hiding BIP68 MTP store-only
+                            // BadPrev (n=32 claim → n=1 prepared, tip ~1 blk/cycle).
+                            warn!(
+                                "ibd: confirm load multi-block fail @ {expect_h} n={} — \
+                                 retry first alone, re-queue tail: {msg}",
+                                batch.len()
+                            );
                             let tail: Vec<(u32, BlockHash)> = batch
                                 .iter()
                                 .skip(1)
@@ -547,6 +554,14 @@ pub(crate) fn spawn_confirm_engine(
                     Ok(None) => {}
                     Ok(Some(outcome)) => {
                         let work_ms = outcome.work_ns / 1_000_000;
+                        // prepared.len(), not claim size (multi-split can shrink need).
+                        let prepared_n = outcome.batch.len();
+                        if prepared_n != batch.len() {
+                            warn!(
+                                "ibd: confirm load prepared_n={prepared_n} != claim_n={} first={expect_h}",
+                                batch.len()
+                            );
+                        }
                         if mat_tx
                             .send((outcome.batch, outcome.work_ns))
                             .is_err()
@@ -557,7 +572,7 @@ pub(crate) fn spawn_confirm_engine(
                         queues_load.note_load_send();
                         if work_ms > 2_000 {
                             info!(
-                                "ibd: confirm load slow batch={} first={expect_h} work_ms={work_ms}",
+                                "ibd: confirm load slow batch={prepared_n} claim={} first={expect_h} work_ms={work_ms}",
                                 batch.len(),
                             );
                         }
@@ -781,8 +796,15 @@ mod tests {
         assert!(is_confirm_load_retryable(
             "confirm: load incomplete (wave body missing from cache)"
         ));
+        // Plan-miss MTP (after hybrid median_time_past) must re-queue, not
+        // permanent multi-block → n=1 split.
+        assert!(is_confirm_load_retryable(
+            "confirm: load incomplete (parent header plan missing above tip)"
+        ));
         assert!(!is_confirm_load_retryable("script failed: false"));
         assert!(!is_confirm_load_retryable("prevout already spent"));
+        // Store-only MTP BadPrev used to hit the silent multi-split path.
+        assert!(!is_confirm_load_retryable("unexpected previous header"));
     }
 
     /// offer re-note must not re-queue heights already claimed (duplicate scripts bug).

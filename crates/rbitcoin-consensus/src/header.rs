@@ -70,14 +70,31 @@ pub fn validate_header(
 }
 
 /// Median timestamp of up to 11 blocks ending at `height` (inclusive).
+///
+/// **Confirm load path:** BIP68/BIP113 run during multi-block assemble while
+/// mid-batch heights are not yet in `confirmed[]`. Prefer the durable confirmed
+/// chain, then load-stage header plans (same hybrid as [`crate::confirm_run`]
+/// header MTP). Heights still above tip with no plan are retryable load
+/// incomplete — not permanent `BadPrev` (that silently split batches to n=1).
 pub fn median_time_past(query: &Query, height: Height) -> Result<u32, ConsensusError> {
     let mut times = Vec::with_capacity(11);
     let start = height.0.saturating_sub(10);
+    let tip = query.tip_height().map(|h| h.0).unwrap_or(0);
     for h in start..=height.0 {
-        let (_fk, rec) = query
-            .header_at_height(Height(h))?
-            .ok_or(ConsensusError::BadPrev)?;
-        times.push(rec.timestamp);
+        if let Some((_fk, rec)) = query.header_at_height(Height(h))? {
+            times.push(rec.timestamp);
+            continue;
+        }
+        if let Some(plan) = query.confirm_parent_cache().get_header_plan(h) {
+            times.push(plan.header_rec.timestamp);
+            continue;
+        }
+        if h > tip {
+            return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                "confirm: load incomplete (parent header plan missing above tip)",
+            )));
+        }
+        return Err(ConsensusError::BadPrev);
     }
     Ok(median_time_past_times(&times))
 }
@@ -88,6 +105,19 @@ pub fn median_time_past_times(times: &[u32]) -> u32 {
     let mut sorted = times.to_vec();
     sorted.sort_unstable();
     sorted[sorted.len() / 2]
+}
+
+#[cfg(test)]
+mod median_time_past_tests {
+    use super::median_time_past_times;
+
+    #[test]
+    fn mtp_times_picks_middle_of_sorted() {
+        assert_eq!(median_time_past_times(&[3, 1, 2]), 2);
+        assert_eq!(median_time_past_times(&[10]), 10);
+        // Even length: Core takes sorted[len/2] (upper middle).
+        assert_eq!(median_time_past_times(&[1, 2, 3, 4]), 3);
+    }
 }
 
 /// Expected `nBits` for a new header at `height`.

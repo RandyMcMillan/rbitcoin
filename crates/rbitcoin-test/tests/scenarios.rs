@@ -1917,6 +1917,67 @@ fn three_stage_confirm_and_parent_pin_surface() {
     assert_eq!(st2.blocks, 0);
 }
 
+/// Multi-block confirm load with a non-coinbase spend must not permanent-BadPrev
+/// on mid-batch BIP68/BIP113 MTP (store `confirmed[]` only sees tip).
+///
+/// Regression: after BIP68 assemble checks, multi-block batches failed on the
+/// second height with spends (`median_time_past` → BadPrev), IBD silently
+/// retried n=1, tip ~0.2/s, CPUs idle, no slow-batch logs.
+#[test]
+fn confirm_multi_block_spend_uses_header_plan_mtp() {
+    use rbitcoin_consensus::{
+        accept_and_archive_block, accept_and_connect_block, confirm_load_phase,
+        confirm_scripts_phase, confirm_write_phase, ChainParams, Milestone,
+    };
+    use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.enter_direct_index_mode().unwrap();
+    let ms = Milestone::NONE;
+    let params = ChainParams::regtest();
+    // CSV package active from height 1 on regtest — exercises BIP113 MTP path.
+    assert!(params.csv_active_at(1));
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    let maturity = params.coinbase_maturity();
+    let mut all: Vec<(Height, [u8; 32])> = Vec::new();
+    let mut cb1 = None;
+    for h in 1u32..=maturity + 2 {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        if h == 1 {
+            cb1 = Some(b.txdata[0].compute_txid());
+        }
+        accept_and_archive_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+        all.push((Height(h), b.block_hash().to_byte_array()));
+    }
+    let spend_h = maturity + 3;
+    let spend = spend_anyone_can_spend(cb1.unwrap(), 0, Amount::from_sat(49_0000_0000));
+    // Second spend height in the *same* load batch (mid-batch BIP68 MTP).
+    let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
+    accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
+    all.push((Height(spend_h), b_spend.block_hash().to_byte_array()));
+    assert_eq!(q.tip_height(), Some(Height::GENESIS));
+
+    // One multi-block load of the whole run while tip is still genesis.
+    let mat = confirm_load_phase(&q, &params, ms, &all).unwrap_or_else(|e| {
+        panic!(
+            "multi-block load with mid-batch spend must not fail BIP68 MTP (got {e}); \
+             store-only median_time_past would BadPrev on unconfirmed prev heights"
+        );
+    });
+    assert_eq!(mat.batch.len(), all.len(), "full batch must stay assembled");
+    let ok = confirm_scripts_phase(mat.batch).expect("scripts");
+    confirm_write_phase(&q, &params, ms, ok.batch).expect("write");
+    assert_eq!(q.tip_height(), Some(Height(spend_h)));
+}
+
 /// Load may claim tip+1 while earlier heights are still in-flight (not written).
 ///
 /// Signet IBD failed at height 11 with permanent BadPrev: assemble_run fell back

@@ -8,7 +8,9 @@ impl Query {
     /// Resolve create maturity: `None` = not coinbase, `Some(h)` = coinbase height.
     ///
     /// Only true coinbases (1-in + null prev), not every 1-in tx. Prevout scan
-    /// skips script/witness. Load stashes this on parent pin when possible.
+    /// skips script/witness. Confirm load no longer calls this on pin (structural
+    /// write resolves maturity); kept for RPC/tests and Full assemble callers.
+    #[allow(dead_code)] // pin path deferred coinbase to structural write
     pub(crate) fn resolve_parent_coinbase_height(
         &self,
         fk: Fk,
@@ -25,6 +27,7 @@ impl Query {
     }
 
     /// True if Class A body is a coinbase (1-in, null prevout). Prevout-only decode.
+    #[allow(dead_code)]
     fn parent_is_coinbase_at(
         &self,
         fk: Fk,

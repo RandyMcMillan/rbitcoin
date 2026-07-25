@@ -367,8 +367,10 @@ impl Query {
         }
         batch_parents = BatchParents::with_capacity(pin_jobs.len());
 
-        let mut pin_new_jobs: Vec<(u64, Vec<u32>, Option<(u64, u64)>)> = Vec::new();
-
+        // ── FIFO hits (pin_cache) ──────────────────────────────────────────
+        // Coinbase height: only free hints already on the FIFO entry. Store
+        // resolve is deferred to structural write (maturity). Unset (`None`)
+        // means write must look up if needed.
         let t_body = Instant::now();
         let body_keys: Vec<(u64, &[u32])> = pin_jobs
             .iter()
@@ -379,117 +381,105 @@ impl Query {
             .confirm_parents
             .get_bodies_for_pin_batch(&body_keys);
 
+        let mut pin_new_pending: Vec<(u64, Vec<u32>)> = Vec::new();
         for (pid, need_vouts) in pin_jobs {
             if self.confirm_cancelled() {
                 crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Cancelled("confirm cancelled"));
             }
             let fk = Fk(pid);
-            if !need_vouts.is_empty() {
-                if let Some((create_h, tx, outs, cb_hint)) = body_hits.remove(&pid) {
-                    st.pin_cache_body = st.pin_cache_body.saturating_add(1);
-                    // Slim to needed vouts only. Do **not** store-filter spentness
-                    // here: optimistic assemble needs script values; durable
-                    // spentness is structural after scripts. `unspent_create_vouts`
-                    // on every pin was dominating load wall on dense mainnet.
-                    let live = slim_outs_to_need(outs, &need_vouts);
-                    let cb_stash = match cb_hint {
-                        Some(true) => Some(Some(create_h)),
-                        Some(false) => Some(None),
-                        None => {
-                            let range = self.store.tx_body_range(fk).ok();
-                            match self.resolve_parent_coinbase_height(
-                                fk,
-                                tx.input_count,
-                                range,
-                            ) {
-                                Ok(v) => Some(v),
-                                Err(_) => Some(None),
-                            }
-                        }
-                    };
-                    // Move tx/live/need_vouts into batch map (single insert).
-                    batch_parents.insert_owned(fk, tx, live, need_vouts, cb_stash);
-                    st.utxo_parents = st.utxo_parents.saturating_add(1);
-                    continue;
-                }
+            if need_vouts.is_empty() {
+                continue;
+            }
+            if let Some((create_h, tx, outs, cb_hint)) = body_hits.remove(&pid) {
+                st.pin_cache_body = st.pin_cache_body.saturating_add(1);
+                let live = slim_outs_to_need(outs, &need_vouts);
+                // Free coinbase hint only — never re-walk body / tx_height here.
+                let cb_stash = match cb_hint {
+                    Some(true) => Some(Some(create_h)),
+                    Some(false) => Some(None),
+                    None => None,
+                };
+                batch_parents.insert_owned(fk, tx, live, need_vouts, cb_stash);
+                st.utxo_parents = st.utxo_parents.saturating_add(1);
+                continue;
             }
             st.pin_new = st.pin_new.saturating_add(1);
-            let range = self.store.tx_body_range(fk).ok();
-            pin_new_jobs.push((pid, need_vouts, range));
+            pin_new_pending.push((pid, need_vouts));
         }
         st.pin_body_ns = st
             .pin_body_ns
             .saturating_add(t_body.elapsed().as_nanos() as u64);
 
+        // ── pin_new: bulk idx ranges + bulk body preads ───────────────────
         let t_new = Instant::now();
         if self.confirm_cancelled() {
             crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
             return Err(StoreError::Cancelled("confirm cancelled"));
         }
-        let mut bulk_idx: Vec<usize> = Vec::new();
-        let mut bulk_ranges: Vec<(u64, u64)> = Vec::new();
-        for (i, (_pid, need_vouts, range)) in pin_new_jobs.iter().enumerate() {
-            if let Some((off, len)) = range {
-                if !need_vouts.is_empty() {
-                    bulk_idx.push(i);
-                    bulk_ranges.push((*off, *len));
+        if !pin_new_pending.is_empty() {
+            let fks: Vec<Fk> = pin_new_pending.iter().map(|(pid, _)| Fk(*pid)).collect();
+            // Batched tx.idx preads (io_uring) — was scalar per-parent before.
+            let ranges = self.store.tx_body_range_batch(&fks)?;
+
+            let mut bulk_idx: Vec<usize> = Vec::new();
+            let mut bulk_ranges: Vec<(u64, u64)> = Vec::new();
+            let mut pin_new_jobs: Vec<(u64, Vec<u32>, Option<(u64, u64)>)> =
+                Vec::with_capacity(pin_new_pending.len());
+            for (i, ((pid, need_vouts), range_opt)) in
+                pin_new_pending.into_iter().zip(ranges.into_iter()).enumerate()
+            {
+                if let Some((off, len)) = range_opt {
+                    if !need_vouts.is_empty() {
+                        bulk_idx.push(i);
+                        bulk_ranges.push((off, len));
+                    }
+                    pin_new_jobs.push((pid, need_vouts, Some((off, len))));
+                } else {
+                    pin_new_jobs.push((pid, need_vouts, None));
                 }
             }
-        }
-        let bulk_decoded = if bulk_ranges.is_empty() {
-            Vec::new()
-        } else {
-            self.store
-                .get_tx_meta_and_outputs_batch_at(&bulk_ranges)?
-        };
-        let mut bulk_by_job: HashMap<
-            usize,
-            (rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>),
-        > = HashMap::with_capacity(bulk_idx.len());
-        for (ji, got) in bulk_idx.into_iter().zip(bulk_decoded.into_iter()) {
-            if let Some(v) = got {
-                bulk_by_job.insert(ji, v);
-            }
-        }
 
-        for (ji, (pid, need_vouts, range)) in pin_new_jobs.into_iter().enumerate() {
-            if self.confirm_cancelled() {
-                crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
-                return Err(StoreError::Cancelled("confirm cancelled"));
+            let bulk_decoded = if bulk_ranges.is_empty() {
+                Vec::new()
+            } else {
+                self.store
+                    .get_tx_meta_and_outputs_batch_at(&bulk_ranges)?
+            };
+            let mut bulk_by_job: HashMap<
+                usize,
+                (rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>),
+            > = HashMap::with_capacity(bulk_idx.len());
+            for (ji, got) in bulk_idx.into_iter().zip(bulk_decoded.into_iter()) {
+                if let Some(v) = got {
+                    bulk_by_job.insert(ji, v);
+                }
             }
-            let fk = Fk(pid);
-            if let Some((off, len)) = range {
-                if !need_vouts.is_empty() {
-                    if let Some((tx, outs)) = bulk_by_job.remove(&ji) {
-                        // Need-vouts only; spentness is structural (see FIFO hit path).
+
+            for (ji, (pid, need_vouts, range)) in pin_new_jobs.into_iter().enumerate() {
+                if self.confirm_cancelled() {
+                    crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                    return Err(StoreError::Cancelled("confirm cancelled"));
+                }
+                let fk = Fk(pid);
+                if range.is_some() {
+                    if !need_vouts.is_empty() {
+                        if let Some((tx, outs)) = bulk_by_job.remove(&ji) {
+                            // Need-vouts only; spentness + coinbase height = structural.
+                            let live = slim_dense_outs_to_need(&outs, &need_vouts);
+                            batch_parents.insert_owned(fk, tx, live, need_vouts, None);
+                            st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+                        }
+                    }
+                } else if !need_vouts.is_empty() {
+                    if let Ok((tx, outs)) = self.store.get_tx_meta_and_outputs(fk) {
                         let live = slim_dense_outs_to_need(&outs, &need_vouts);
-                        let cb_stash = match self.resolve_parent_coinbase_height(
-                            fk,
-                            tx.input_count,
-                            Some((off, len)),
-                        ) {
-                            Ok(v) => Some(v),
-                            Err(_) => None,
-                        };
-                        batch_parents.insert_owned(fk, tx, live, need_vouts, cb_stash);
+                        batch_parents.insert_owned(fk, tx, live, need_vouts, None);
                         st.full_tx_reads = st.full_tx_reads.saturating_add(1);
                     }
                 }
-            } else if !need_vouts.is_empty() {
-                if let Ok((tx, outs)) = self.store.get_tx_meta_and_outputs(fk) {
-                    let live = slim_dense_outs_to_need(&outs, &need_vouts);
-                    let cb_stash = match self
-                        .resolve_parent_coinbase_height(fk, tx.input_count, None)
-                    {
-                        Ok(v) => Some(v),
-                        Err(_) => None,
-                    };
-                    batch_parents.insert_owned(fk, tx, live, need_vouts, cb_stash);
-                    st.full_tx_reads = st.full_tx_reads.saturating_add(1);
-                }
+                st.utxo_parents = st.utxo_parents.saturating_add(1);
             }
-            st.utxo_parents = st.utxo_parents.saturating_add(1);
         }
         st.pin_new_meta_ns = st
             .pin_new_meta_ns

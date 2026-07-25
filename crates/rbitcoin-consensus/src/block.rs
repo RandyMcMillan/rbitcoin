@@ -605,9 +605,11 @@ pub struct ScriptCheckJob {
 
 /// Sequential assemble: resolve prevout **content**, build script jobs, collect spends.
 ///
-/// [`AssembleMode::Optimistic`] (confirm path): no durable spentness / maturity —
-/// those run in [`structural_validate_spends`] after scripts.
-/// [`AssembleMode::Full`]: spentness + maturity during the walk (tests / legacy).
+/// [`AssembleMode::Optimistic`] (confirm IBD path): no durable spentness / maturity /
+/// BIP68 create-height resolution — those run in [`structural_validate_spends`] after
+/// scripts (load must not walk `tx_height` per parent). Absolute nLockTime finality
+/// (BIP113 MTP of prev block) still runs here — it only needs header MTP.
+/// [`AssembleMode::Full`]: spentness + maturity + BIP68 during the walk (legacy).
 ///
 /// `pending_spent` / `pending_creates`: run-local same-run tracking.
 ///
@@ -803,6 +805,8 @@ fn assemble_block_prevouts_mode(
                         return Err(ConsensusError::PrevoutSpent);
                     }
                 }
+                // Optimistic: skip create_height / coinbase store lookups (BIP68 +
+                // maturity run in structural). Full: resolve for in-walk BIP68.
                 let prev_out = resolve_prevout(
                     query,
                     block,
@@ -812,6 +816,7 @@ fn assemble_block_prevouts_mode(
                     &mut coinbase_height_cache,
                     batch_parents,
                     ctx.height.0,
+                    mode == AssembleMode::Full,
                 )?;
                 if mode == AssembleMode::Full {
                     if let Some(created) = prev_out.coinbase_height {
@@ -833,7 +838,9 @@ fn assemble_block_prevouts_mode(
                 value_in = value_in
                     .checked_add(prev_out.txout.value.to_sat() as i64)
                     .ok_or(ConsensusError::BadTx("value in overflow"))?;
-                input_create_heights.push(prev_out.create_height);
+                if mode == AssembleMode::Full {
+                    input_create_heights.push(prev_out.create_height);
+                }
                 prevouts.push(prev_out.txout);
             }
 
@@ -846,7 +853,7 @@ fn assemble_block_prevouts_mode(
                 return Err(ConsensusError::BadBlock("bad-blk-sigops"));
             }
 
-            // BIP113 absolute finality + BIP68 relative sequence locks (CSV package).
+            // BIP113 absolute finality (prev-block MTP only — cheap; stays on load).
             let lock_time_cutoff = if ctx.params.csv_active_at(ctx.height.0) {
                 if ctx.height.0 == 0 {
                     block.header.time
@@ -859,7 +866,9 @@ fn assemble_block_prevouts_mode(
             if !is_final_tx(tx, ctx.height.0, lock_time_cutoff) {
                 return Err(ConsensusError::BadTx("not final"));
             }
-            if ctx.params.csv_active_at(ctx.height.0) {
+            // BIP68 relative locks need per-input create heights (`tx_height`).
+            // Optimistic/confirm defers that IO to structural write; Full does it here.
+            if mode == AssembleMode::Full && ctx.params.csv_active_at(ctx.height.0) {
                 let mut coin_mtps = Vec::with_capacity(input_create_heights.len());
                 for &ch in &input_create_heights {
                     let mtp = if ch == 0 {
@@ -954,10 +963,13 @@ fn check_coinbase_subsidy(
     Ok(())
 }
 
-/// Post-script structural checks: durable spentness, maturity, coinbase subsidy.
+/// Post-script structural checks: durable spentness, maturity, BIP68, coinbase subsidy.
 ///
-/// Runs in height order on the write path (Phase 1: same thread after scripts).
-/// `pending_spent` is write-local across a multi-height run.
+/// Runs in height order on the write path (after scripts). `pending_spent` is
+/// write-local across a multi-height run.
+///
+/// **BIP68** create-height / coin-MTP IO lives here (not optimistic load assemble)
+/// so confirm load does not walk `tx_height` for every parent.
 pub(crate) fn structural_validate_spends(
     query: &Query,
     block: &Block,
@@ -977,6 +989,9 @@ pub(crate) fn structural_validate_spends(
         rbitcoin_primitives::Fk,
         Option<u32>,
     > = std::collections::HashMap::with_capacity(64);
+    // create_fk → create height (BIP68), filled while walking spends.
+    let mut create_height_by_fk: std::collections::HashMap<rbitcoin_primitives::Fk, u32> =
+        std::collections::HashMap::with_capacity(spends.len().min(256));
     let maturity = ctx.params.coinbase_maturity();
     let cache = query.confirm_parent_cache();
 
@@ -1000,7 +1015,7 @@ pub(crate) fn structural_validate_spends(
         if spent {
             return Err(ConsensusError::PrevoutSpent);
         }
-        // Coinbase maturity (need create Class A meta).
+        // Coinbase maturity + record create height for BIP68 (same store work).
         if !create_fk.is_null() {
             let prev_rec = match batch_parents
                 .get_parent_tx(create_fk)
@@ -1023,8 +1038,61 @@ pub(crate) fn structural_validate_spends(
                     return Err(ConsensusError::BadTx("coinbase immature"));
                 }
             }
+            let ch = create_height_for_fk(query, create_fk, created)?;
+            create_height_by_fk.insert(create_fk, ch);
         }
         pending_spent.insert(key);
+    }
+
+    // BIP68 relative sequence locks (CSV package). Create heights from above.
+    if ctx.params.csv_active_at(ctx.height.0) {
+        let prev_mtp = if ctx.height.0 == 0 {
+            0
+        } else {
+            crate::header::median_time_past(query, Height(ctx.height.0 - 1))?
+        };
+        let mut si = 0usize;
+        for tx in block.txdata.iter().skip(1) {
+            let n_in = tx.input.len();
+            if si + n_in > spends.len() {
+                return Err(ConsensusError::BadBlock("structural spends/tx input mismatch"));
+            }
+            let tx_spends = &spends[si..si + n_in];
+            si += n_in;
+
+            let mut prev_heights = Vec::with_capacity(n_in);
+            let mut coin_mtps = Vec::with_capacity(n_in);
+            for &(_ptid, _vout, _sfk, create_fk) in tx_spends {
+                let ch = if create_fk.is_null() {
+                    // Same-block create (no Class A fk yet): Core uses spend height.
+                    ctx.height.0
+                } else {
+                    create_height_by_fk
+                        .get(&create_fk)
+                        .copied()
+                        .unwrap_or(0)
+                };
+                prev_heights.push(ch);
+                let mtp = if ch == 0 {
+                    0
+                } else {
+                    crate::header::median_time_past(query, Height(ch.saturating_sub(1)))?
+                };
+                coin_mtps.push(mtp);
+            }
+            if !sequence_locks_satisfied(
+                tx,
+                &prev_heights,
+                &coin_mtps,
+                ctx.height.0,
+                prev_mtp,
+            ) {
+                return Err(ConsensusError::BadTx("bad-txns-nonfinal"));
+            }
+        }
+        if si != spends.len() {
+            return Err(ConsensusError::BadBlock("structural spends/tx input mismatch"));
+        }
     }
 
     let _ = archived_tx_fks;
@@ -1185,6 +1253,9 @@ fn resolve_prevout(
     batch_parents: &rbitcoin_query::BatchParents,
     // Height of the block being validated (same-block BIP68 coin height).
     spend_height: u32,
+    // When false (optimistic confirm load): only prevout value/script — no
+    // `tx_height` / coinbase body walks. BIP68 + maturity run in structural.
+    resolve_create_heights: bool,
 ) -> Result<ResolvedPrevout, ConsensusError> {
     use rbitcoin_query::connect_prevout_stats;
     use std::sync::atomic::Ordering;
@@ -1204,7 +1275,11 @@ fn resolve_prevout(
         return Ok(ResolvedPrevout {
             txout: o.clone(),
             coinbase_height: None,
-            create_height: spend_height,
+            create_height: if resolve_create_heights {
+                spend_height
+            } else {
+                0
+            },
         });
     }
 
@@ -1219,14 +1294,21 @@ fn resolve_prevout(
         if let Some((prev_rec, out)) = hit {
             if prev_rec.txid == prev_txid {
                 connect_prevout_stats::WAVE_HIT.fetch_add(1, Ordering::Relaxed);
-                let cb_h = coinbase_height_for_maturity(
-                    query,
-                    prev_fk,
-                    &prev_rec,
-                    batch_parents,
-                    coinbase_height_cache,
-                )?;
-                let create_height = create_height_for_fk(query, prev_fk, cb_h)?;
+                let (cb_h, create_height) = if resolve_create_heights {
+                    let cb_h = coinbase_height_for_maturity(
+                        query,
+                        prev_fk,
+                        &prev_rec,
+                        batch_parents,
+                        coinbase_height_cache,
+                    )?;
+                    (
+                        cb_h,
+                        create_height_for_fk(query, prev_fk, cb_h)?,
+                    )
+                } else {
+                    (None, 0)
+                };
                 return Ok(ResolvedPrevout {
                     txout: TxOut {
                         value: Amount::from_sat(out.value as u64),
@@ -1270,14 +1352,21 @@ fn resolve_prevout(
             Err(ConsensusError::MissingPrevout) => continue,
             Err(e) => return Err(e),
         };
-        let cb_h = coinbase_height_for_maturity(
-            query,
-            prev_fk,
-            &prev_rec,
-            batch_parents,
-            coinbase_height_cache,
-        )?;
-        let create_height = create_height_for_fk(query, prev_fk, cb_h)?;
+        let (cb_h, create_height) = if resolve_create_heights {
+            let cb_h = coinbase_height_for_maturity(
+                query,
+                prev_fk,
+                &prev_rec,
+                batch_parents,
+                coinbase_height_cache,
+            )?;
+            (
+                cb_h,
+                create_height_for_fk(query, prev_fk, cb_h)?,
+            )
+        } else {
+            (None, 0)
+        };
         return Ok(ResolvedPrevout {
             txout: TxOut {
                 value: Amount::from_sat(out.value as u64),

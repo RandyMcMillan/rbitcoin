@@ -399,6 +399,8 @@ pub struct ScriptCheckJob {
     pub(crate) bip66_active: bool,
     /// BIP16 P2SH active (false → `OP_HASH160 … OP_EQUAL` is bare, not redeem).
     pub(crate) bip16_active: bool,
+    /// BIP341/342 taproot active (false → v1 witness program is anyone-can-spend).
+    pub(crate) taproot_active: bool,
 }
 
 
@@ -662,6 +664,7 @@ fn assemble_block_prevouts_mode(
                     bip112_active: ctx.params.csv_active_at(ctx.height.0),
                     bip66_active: ctx.params.bip66_active_at(ctx.height.0),
                     bip16_active: bip16_for_jobs,
+                    taproot_active: ctx.params.taproot_active_at(ctx.height.0),
                 });
             }
         }

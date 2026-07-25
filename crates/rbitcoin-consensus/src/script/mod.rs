@@ -97,7 +97,13 @@ pub(crate) fn verify_input(
             nested::verify_p2sh_legacy(job, input_index, tx)
         }
         ScriptKind::P2wsh => p2wsh::verify(job, input_index, tx),
-        ScriptKind::P2tr => p2tr::verify(job, input_index, tx, cache),
+        ScriptKind::P2tr => {
+            // Pre-activation: witness v1 is anyone-can-spend (BIP141 unknown version).
+            if !job.taproot_active {
+                return Ok(());
+            }
+            p2tr::verify(job, input_index, tx, cache)
+        }
         ScriptKind::Bare => verify_bare(job, input_index, tx, prevout),
     }
 }

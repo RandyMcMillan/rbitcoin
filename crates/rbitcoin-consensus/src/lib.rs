@@ -27,6 +27,8 @@ pub mod script_bench {
         pub bip66_active: bool,
         /// When false, P2SH template is bare HASH160/EQUAL (pre-BIP16).
         pub bip16_active: bool,
+        /// When false, v1 witness program is anyone-can-spend (pre-taproot).
+        pub taproot_active: bool,
     }
 
     impl JobBytes {
@@ -36,6 +38,7 @@ pub mod script_bench {
                 tx,
                 bip66_active: true,
                 bip16_active: true,
+                taproot_active: true,
             }
         }
     }
@@ -49,6 +52,7 @@ pub mod script_bench {
             bip112_active: true,
             bip66_active: job.bip66_active,
             bip16_active: job.bip16_active,
+            taproot_active: job.taproot_active,
         };
         script::verify_job_all_inputs(&j)
     }
@@ -63,6 +67,7 @@ pub mod script_bench {
                 bip112_active: true,
                 bip66_active: j.bip66_active,
                 bip16_active: j.bip16_active,
+                taproot_active: j.taproot_active,
             })
             .collect()
     }

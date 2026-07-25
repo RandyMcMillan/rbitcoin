@@ -206,6 +206,7 @@ mod bip341_tests {
             bip112_active: true,
         bip66_active: true,
         bip16_active: true,
+        taproot_active: true,
         };
         (job, control)
     }
@@ -289,6 +290,7 @@ mod bip341_tests {
             bip112_active: true,
         bip66_active: true,
         bip16_active: true,
+        taproot_active: true,
         };
         script::verify_job_all_inputs(&job).expect("p2tr key path");
     }
@@ -343,6 +345,7 @@ mod bip341_tests {
             bip112_active: true,
         bip66_active: true,
         bip16_active: true,
+        taproot_active: true,
         };
         script::verify_job_all_inputs(&job).expect("two-leaf script path");
     }
@@ -450,6 +453,7 @@ mod bip341_tests {
             bip112_active: true,
         bip66_active: true,
         bip16_active: true,
+        taproot_active: true,
         };
         script::verify_job_all_inputs(&job).expect("CODESEPARATOR chain must verify");
     }
@@ -488,6 +492,7 @@ mod bip341_tests {
             bip112_active: true,
         bip66_active: true,
         bip16_active: true,
+        taproot_active: true,
         };
         assert!(script::verify_job_all_inputs(&job).is_err());
     }

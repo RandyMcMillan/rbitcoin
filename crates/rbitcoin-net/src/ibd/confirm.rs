@@ -883,4 +883,19 @@ mod tests {
             "loadq<0/2 writeq<0/2"
         );
     }
+
+    /// Live defaults (OPERATOR.md / experimental-mainnet loadq=*/5 writeq=*/5).
+    #[test]
+    fn confirm_pipeline_queue_caps_are_five() {
+        assert_eq!(super::LOAD_QUEUE_CAP, 5);
+        assert_eq!(super::WRITE_QUEUE_CAP, 5);
+        assert_eq!(
+            format_conf_q(0, 0, super::LOAD_QUEUE_CAP, super::WRITE_QUEUE_CAP),
+            "loadq<0/5 writeq<0/5"
+        );
+        assert_eq!(
+            format_conf_q(5, 5, super::LOAD_QUEUE_CAP, super::WRITE_QUEUE_CAP),
+            "loadq=5/5 writeq=5/5"
+        );
+    }
 }

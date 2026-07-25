@@ -587,8 +587,10 @@ mod confirm_reject_tests {
         BlockHash::from_byte_array(b)
     }
 
+    /// Confirm reject blacklist: zero-hash + prevout-spent race stay soft;
+    /// real script failures permanent-blacklist. Mainnet tip=362595 regression.
     #[test]
-    fn zero_hash_reject_is_not_blacklisted() {
+    fn confirm_reject_blacklist_surface() {
         let mut st = IbdWorkState::new(Vec::new(), None, Some(100));
         let zero = BlockHash::from_byte_array([0u8; 32]);
         apply_confirm_reject(
@@ -598,13 +600,9 @@ mod confirm_reject_tests {
             "consensus: prevout already spent on best chain",
         );
         assert!(!st.body.is_rejected(&zero));
-    }
 
-    #[test]
-    fn prevout_spent_reject_is_not_blacklisted() {
-        // Pipeline race: second write of the same tip+1 after the first
-        // already committed. Blacklisting freezes IBD forever (mainnet log
-        // tip=362595 stuck after "prevout already spent").
+        // Pipeline race: second write of same tip+1 after first committed —
+        // blacklisting freezes IBD forever.
         let mut st = IbdWorkState::new(Vec::new(), None, Some(362_594));
         let hash = h(0x29);
         st.body.mark_archived(hash);
@@ -624,10 +622,7 @@ mod confirm_reject_tests {
             st.ordered_set.contains(&hash),
             "transient race must leave ordered path intact"
         );
-    }
 
-    #[test]
-    fn real_script_reject_is_blacklisted() {
         let mut st = IbdWorkState::new(Vec::new(), None, Some(50));
         let hash = h(7);
         st.body.mark_archived(hash);

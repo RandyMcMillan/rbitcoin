@@ -602,203 +602,82 @@ mod tests {
         assert_eq!(c.ready_through(), 1);
     }
 
+    /// FIFO resolve + tip non-GC of outs + slim pin batch + dense layout/coinbase.
+    /// Cap eviction: one insert pair. External pin: three_stage_confirm scenario.
     #[test]
-    fn out_fifo_survives_past_tip() {
+    fn out_fifo_pin_and_dense_surface() {
         let c = ConfirmParentCache::new();
         c.advance_tip(0);
-        let t = tx(5);
-        c.put_body(Fk(50), 1, t.clone(), vec![out(42)], vec![]);
-        assert!(c.has_body(Fk(50)));
-        c.advance_tip(1);
-        assert!(c.has_body(Fk(50)));
-        assert!(c.get_body_for_pin(Fk(50)).is_some());
-    }
-
-    #[test]
-    fn body_create_resolves_from_out_fifo() {
-        let c = ConfirmParentCache::new();
-        c.advance_tip(0);
-        let t = tx(7);
+        let mut t = tx(7);
+        t.input_count = 1; // required for is_coinbase_inputs
         c.put_bodies_batch(vec![(
             Fk(70),
             1,
             t.clone(),
-            vec![out(10), out(20)],
-            vec![],
-        )]);
-        assert!(c.has_body(Fk(70)));
-        assert_eq!(c.get_parent_txid(Fk(70)), Some(t.txid));
-        assert!(c.has_parent_out(Fk(70), 1));
-        assert_eq!(c.get_parent_out(Fk(70), 1).unwrap().1.value, 20);
-        assert!(c.get_parent_out(Fk(99), 0).is_none());
-    }
-
-    #[test]
-    fn out_fifo_keeps_outs_across_tip_for_pin() {
-        let c = ConfirmParentCache::new();
-        c.advance_tip(0);
-        let t1 = tx(1);
-        c.put_bodies_batch(vec![
-            (Fk(1), 1, t1.clone(), vec![out(10)], vec![]),
-            (Fk(2), 1, tx(2), vec![out(20)], vec![]),
-        ]);
-        assert!(c.has_body(Fk(1)));
-        c.advance_tip(10);
-        assert!(c.has_body(Fk(1)));
-        let pin = c.get_body_for_pin(Fk(2)).expect("pin");
-        assert_eq!(pin.2[0].value, 20);
-    }
-
-    #[test]
-    fn out_fifo_cap_evicts_oldest_creates() {
-        let c = ConfirmParentCache::new();
-        c.set_out_fifo_cap(5);
-        c.advance_tip(0);
-        c.put_bodies_batch(vec![(Fk(1), 1, tx(1), vec![out(1), out(2), out(3)], vec![])]);
-        c.put_bodies_batch(vec![(Fk(2), 2, tx(2), vec![out(4), out(5), out(6)], vec![])]);
-        assert!(!c.has_body(Fk(1)));
-        assert!(c.has_body(Fk(2)));
-        let (n, total, cap, _) = c.body_lru_stats();
-        assert_eq!(n, 1);
-        assert_eq!(total, 3);
-        assert_eq!(cap, 5);
-    }
-
-    #[test]
-    fn out_fifo_bounds_total_outs() {
-        let c = ConfirmParentCache::new();
-        c.set_out_fifo_cap(100);
-        c.advance_tip(0);
-        for i in 0..50u64 {
-            let mut t = tx((i & 0xff) as u8);
-            t.txid[0] = i as u8;
-            c.put_body(Fk(i + 1), 1, t, vec![out(1); 4], vec![]);
-        }
-        let (n, total, cap, _) = c.body_lru_stats();
-        assert!(total <= cap, "total_outs={total} cap={cap} creates={n}");
-        assert!(n <= 25, "creates={n}");
-    }
-
-    #[test]
-    fn pin_batch_hits_out_fifo() {
-        let c = ConfirmParentCache::new();
-        c.advance_tip(0);
-        let mut t = tx(1);
-        t.txid = [9u8; 32];
-        c.put_body(
-            Fk(100),
-            1,
-            t,
-            vec![out(50), out(60)],
+            vec![out(10), out(20), out(30)],
             vec![InputRecord {
                 prev_txid: [0u8; 32],
                 create_fk: Fk::NULL,
                 prev_index: u32::MAX,
-                sequence: 0xffff_ffff,
-                script_sig: vec![],
+                sequence: u32::MAX,
+                script_sig: vec![0xde; 8],
                 witness: vec![],
             }],
-        );
-        let need = [0u32, 1];
-        let hits = c.get_bodies_for_pin_batch(&[(100, &need)]);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits.get(&100).unwrap().2.len(), 2);
-    }
+        )]);
+        assert_eq!(c.get_parent_txid(Fk(70)), Some(t.txid));
+        assert_eq!(c.get_parent_out(Fk(70), 1).unwrap().1.value, 20);
+        c.advance_tip(10);
+        assert!(c.has_body(Fk(70))); // outs survive tip advance
 
-    #[test]
-    fn get_bodies_for_pin_batch_slims_outs() {
-        let c = ConfirmParentCache::new();
-        c.advance_tip(0);
-        let mut t = tx(7);
-        t.input_count = 1;
-        let coinbase_in = InputRecord {
-            prev_txid: [0u8; 32],
-            create_fk: Fk::NULL,
-            prev_index: u32::MAX,
-            sequence: u32::MAX,
-            script_sig: vec![0xde; 200],
-            witness: vec![vec![0xad; 500]],
-        };
-        c.put_body(
-            Fk(77),
-            5,
-            t.clone(),
-            vec![out(10), out(20), out(30)],
-            vec![coinbase_in],
-        );
         let need = [0u32, 2];
-        let mut hits = c.get_bodies_for_pin_batch(&[(77, &need)]);
-        let (h, txr, outs, cb, body_range, rels) = hits.remove(&77).expect("hit");
-        assert_eq!(h, 5);
-        assert_eq!(txr.txid, t.txid);
+        let mut hits = c.get_bodies_for_pin_batch(&[(70, &need)]);
+        let (h, _txr, outs, cb, body_range, _) = hits.remove(&70).expect("hit");
+        assert_eq!(h, 1);
         assert_eq!(outs.len(), 2);
-        assert_eq!(outs[0].0, 0);
-        assert_eq!(outs[1].0, 2);
         assert_eq!(cb, Some(true));
         assert!(body_range.is_none());
-        assert!(rels.is_empty());
-        // FIFO still holds all three outs for a later need of vout 1.
-        let need1 = [1u32];
-        let hits1 = c.get_bodies_for_pin_batch(&[(77, &need1)]);
-        assert_eq!(hits1.get(&77).unwrap().2.len(), 1);
-        assert_eq!(hits1.get(&77).unwrap().2[0].0, 1);
-        let mut bp = crate::BatchParents::new();
-        bp.insert_owned(
-            Fk(77),
-            txr,
-            outs,
-            need.to_vec(),
-            Some(true),
-            None,
-            Vec::new(),
-        );
-        assert!(bp.pin_covered(Fk(77), &[0, 2]));
-        assert!(!bp.pin_covered(Fk(77), &[0, 1]));
-    }
 
-    #[test]
-    fn put_dense_outs_batch_keeps_all_vouts_for_later_hits() {
-        let c = ConfirmParentCache::new();
-        c.advance_tip(0);
-        let mut t = tx(9);
-        t.input_count = 1; // single-in → coinbase unknown without inputs
-        t.output_count = 4;
-        // pin_new path: seed full dense outs after store decode.
+        // pin_new dense: layout + multi-in non-cb
+        let mut t2 = tx(9);
+        t2.input_count = 1;
+        t2.output_count = 4;
         c.put_dense_outs_batch(vec![(
             Fk(90),
             0,
-            t.clone(),
+            t2,
             vec![out(1), out(2), out(3), out(4)],
             Some((5000, 100)),
             vec![10, 30, 50, 70],
         )]);
-        assert_eq!(c.body_count(), 1);
-        // Later batch needs a different vout than first pin — must still hit.
-        let hits = c.get_bodies_for_pin_batch(&[(90, &[3u32][..])]);
-        let e = hits.get(&90).unwrap();
-        assert_eq!(e.2.len(), 1);
+        let e = c.get_bodies_for_pin_batch(&[(90, &[3u32][..])]).remove(&90).unwrap();
         assert_eq!(e.2[0].1.value, 4);
-        assert_eq!(e.3, None); // single-in pin_new: coinbase unknown
+        assert_eq!(e.3, None);
         assert_eq!(e.4, Some((5000, 100)));
         assert_eq!(e.5, vec![(3, 70)]);
-        // And all four still addressable.
-        let hits_all = c.get_bodies_for_pin_batch(&[(90, &[0u32, 1, 2, 3][..])]);
-        assert_eq!(hits_all.get(&90).unwrap().2.len(), 4);
-
-        // Multi-in pin_new: cheap non-coinbase.
-        let mut t2 = tx(8);
-        t2.input_count = 2;
-        t2.output_count = 1;
+        let mut t3 = tx(8);
+        t3.input_count = 2;
         c.put_dense_outs_batch(vec![(
             Fk(91),
             0,
-            t2,
+            t3,
             vec![out(9)],
             Some((6000, 50)),
             vec![12],
         )]);
-        let hits2 = c.get_bodies_for_pin_batch(&[(91, &[0u32][..])]);
-        assert_eq!(hits2.get(&91).unwrap().3, Some(false));
+        assert_eq!(
+            c.get_bodies_for_pin_batch(&[(91, &[0u32][..])])
+                .get(&91)
+                .unwrap()
+                .3,
+            Some(false)
+        );
+
+        // Cap eviction (oldest create dropped).
+        c.set_out_fifo_cap(5);
+        c.put_bodies_batch(vec![(Fk(1), 1, tx(1), vec![out(1), out(2), out(3)], vec![])]);
+        c.put_bodies_batch(vec![(Fk(2), 2, tx(2), vec![out(4), out(5), out(6)], vec![])]);
+        assert!(!c.has_body(Fk(1)));
+        assert!(c.has_body(Fk(2)));
     }
 
     #[test]

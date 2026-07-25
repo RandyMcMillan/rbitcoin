@@ -104,42 +104,25 @@ mod tests {
     };
     use std::time::Duration;
 
+    /// Batch sizing + coalesce wait policy in one surface (pure helpers).
     #[test]
-    fn batch_sizes_ignore_confirm_lag() {
+    fn batch_and_coalesce_wait_surface() {
         assert_eq!(max_batch_for_lag(0), max_batch_for_lag(100_000));
         assert_eq!(min_batch_for_lag(0), min_batch_for_lag(100_000));
         assert!(max_batch_for_lag(0) >= 64);
         assert!(min_batch_for_lag(0) >= 1);
         assert!(min_batch_for_lag(0) <= max_batch_for_lag(0));
-    }
 
-    #[test]
-    fn min_batch_shrinks_with_deep_queue() {
         let base = min_batch_for_lag(0);
-        assert!(min_batch_for_queue(0, 0) >= base.min(base));
         assert_eq!(min_batch_for_queue(0, 0), base);
         assert!(min_batch_for_queue(ARCH_Q_FLUSH_ASAP, 0) <= 8);
         assert!(min_batch_for_queue(ARCH_Q_FLUSH_AGGRESSIVE, 0) <= 4);
-    }
 
-    #[test]
-    fn no_wait_when_batch_already_large() {
         let min = min_batch_for_lag(0);
         assert_eq!(coalesce_wait(min, 0, 0, 0), Duration::ZERO);
         assert_eq!(coalesce_wait(min, 0, 0, 600), Duration::ZERO);
-    }
-
-    #[test]
-    fn deep_queue_flushes_small_ready_prefix() {
         // One ready height + deep arch_q → no coalesce wait.
-        assert_eq!(
-            coalesce_wait(1, 0, ARCH_Q_FLUSH_ASAP, 0),
-            Duration::ZERO
-        );
-    }
-
-    #[test]
-    fn dry_pipeline_is_short() {
+        assert_eq!(coalesce_wait(1, 0, ARCH_Q_FLUSH_ASAP, 0), Duration::ZERO);
         assert_eq!(coalesce_wait(1, 0, 0, 0), Duration::from_millis(1));
     }
 }

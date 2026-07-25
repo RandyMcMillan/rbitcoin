@@ -779,16 +779,13 @@ mod tests {
         run
     }
 
+    /// Contiguous claim + skip already-confirmed (pure claim helper).
     #[test]
-    fn claim_feed_takes_contiguous_wave() {
+    fn claim_feed_wave_and_skip_confirmed() {
         let run = claim_feed_run(101, 32, |h| h >= 101 && h < 101 + 40, |_| false);
         assert_eq!(run.len(), 32);
         assert_eq!(run[0], 101);
         assert_eq!(*run.last().unwrap(), 132);
-    }
-
-    #[test]
-    fn claim_feed_skips_already_confirmed() {
         let run = claim_feed_run(
             10,
             32,
@@ -818,9 +815,9 @@ mod tests {
         assert!(!is_confirm_load_retryable("unexpected previous header"));
     }
 
-    /// offer re-note must not re-queue heights already claimed (duplicate scripts bug).
+    /// note / requeue / finish lifecycle (duplicate scripts bug + re-queue).
     #[test]
-    fn note_skips_inflight_heights() {
+    fn feed_note_requeue_finish_surface() {
         let feed = ConfirmFeed::new();
         feed.note(100, bh(1));
         {
@@ -831,29 +828,25 @@ mod tests {
         }
         // Main loop offer would re-note tip+1 every tick — must be ignored.
         feed.note(100, bh(1));
-        let g = feed.inner.lock().unwrap();
-        assert!(g.ready.is_empty(), "inflight height must not re-enter ready");
-        assert!(g.inflight.contains(&100));
-    }
+        {
+            let g = feed.inner.lock().unwrap();
+            assert!(g.ready.is_empty(), "inflight height must not re-enter ready");
+            assert!(g.inflight.contains(&100));
+        }
 
-    #[test]
-    fn requeue_returns_to_ready_and_clears_inflight() {
-        let feed = ConfirmFeed::new();
         {
             let mut g = feed.inner.lock().unwrap();
             g.inflight.insert(50);
             g.inflight.insert(51);
         }
         feed.requeue(&[(50, bh(5)), (51, bh(6))]);
-        let g = feed.inner.lock().unwrap();
-        assert!(!g.inflight.contains(&50));
-        assert_eq!(g.ready.get(&50), Some(&bh(5)));
-        assert_eq!(g.ready.get(&51), Some(&bh(6)));
-    }
+        {
+            let g = feed.inner.lock().unwrap();
+            assert!(!g.inflight.contains(&50));
+            assert_eq!(g.ready.get(&50), Some(&bh(5)));
+            assert_eq!(g.ready.get(&51), Some(&bh(6)));
+        }
 
-    #[test]
-    fn finish_clears_inflight() {
-        let feed = ConfirmFeed::new();
         {
             let mut g = feed.inner.lock().unwrap();
             g.inflight.insert(10);
@@ -861,32 +854,21 @@ mod tests {
         }
         feed.finish([10, 11]);
         let g = feed.inner.lock().unwrap();
-        assert!(g.inflight.is_empty());
+        assert!(!g.inflight.contains(&10));
+        assert!(!g.inflight.contains(&11));
     }
 
+    /// Log tokens + live caps (OPERATOR.md / experimental-mainnet loadq=*/5 writeq=*/5).
     #[test]
-    fn queue_depth_log_uses_lt_when_empty() {
+    fn queue_depth_log_and_caps_surface() {
         assert_eq!(format_queue_depth("load", 0, 2), "load<0/2");
         assert_eq!(format_queue_depth("write", 0, 2), "write<0/2");
         assert_eq!(format_queue_depth("load", 1, 2), "load=1/2");
         assert_eq!(format_queue_depth("write", 2, 2), "write=2/2");
-        assert_eq!(
-            format_conf_q(0, 1, 2, 2),
-            "loadq<0/2 writeq=1/2"
-        );
-        assert_eq!(
-            format_conf_q(1, 0, 2, 2),
-            "loadq=1/2 writeq<0/2"
-        );
-        assert_eq!(
-            format_conf_q(0, 0, 2, 2),
-            "loadq<0/2 writeq<0/2"
-        );
-    }
+        assert_eq!(format_conf_q(0, 1, 2, 2), "loadq<0/2 writeq=1/2");
+        assert_eq!(format_conf_q(1, 0, 2, 2), "loadq=1/2 writeq<0/2");
+        assert_eq!(format_conf_q(0, 0, 2, 2), "loadq<0/2 writeq<0/2");
 
-    /// Live defaults (OPERATOR.md / experimental-mainnet loadq=*/5 writeq=*/5).
-    #[test]
-    fn confirm_pipeline_queue_caps_are_five() {
         assert_eq!(super::LOAD_QUEUE_CAP, 5);
         assert_eq!(super::WRITE_QUEUE_CAP, 5);
         assert_eq!(

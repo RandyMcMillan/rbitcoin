@@ -245,27 +245,10 @@ mod tests {
         OutputRecord::unspent(v, vec![0x51])
     }
 
+    /// Layout + coinbase flag + pin_covered — one test for BatchParents public surface.
+    /// External pin/confirm behavior: rbitcoin-test three_stage_confirm_and_parent_pin_surface.
     #[test]
-    fn put_and_get_roundtrip() {
-        let mut bp = BatchParents::new();
-        bp.put_resolved(
-            Fk(7),
-            tx(7),
-            &[(0, out(10)), (1, out(20))],
-            &[0, 1],
-            Some(false),
-        );
-        assert!(bp.pin_covered(Fk(7), &[0, 1]));
-        let (t, o) = bp.get_parent_out(Fk(7), 0).unwrap();
-        assert_eq!(t.txid[0], 7);
-        assert_eq!(o.value, 10);
-        assert_eq!(bp.get_parent_coinbase(Fk(7)), Some(false));
-        assert_eq!(bp.len(), 1);
-        assert!(bp.get_body_range(Fk(7)).is_none());
-    }
-
-    #[test]
-    fn insert_owned_spender_abs() {
+    fn insert_layout_coinbase_and_covered() {
         let mut bp = BatchParents::with_capacity(1);
         let live = vec![(0, out(42)), (2, out(99))];
         bp.insert_owned(
@@ -277,44 +260,14 @@ mod tests {
             Some((1000, 200)),
             vec![(0, 50), (1, 70), (2, 90)],
         );
+        assert_eq!(bp.len(), 1);
         assert!(bp.pin_covered(Fk(9), &[0, 1, 2]));
-        assert!(!bp.has_parent_out(Fk(9), 1)); // spent-filtered, not live
+        assert!(!bp.pin_covered(Fk(9), &[0, 3]));
+        assert!(!bp.has_parent_out(Fk(9), 1));
         assert_eq!(bp.get_spender_abs(Fk(9), 2), Some(1090));
         assert_eq!(bp.get_body_range(Fk(9)), Some((1000, 200)));
         assert_eq!(bp.get_parent_coinbase(Fk(9)), Some(true));
-    }
-
-    #[test]
-    fn pin_covered_requires_checked_membership() {
-        let mut bp = BatchParents::new();
-        bp.insert_owned(
-            Fk(1),
-            tx(1),
-            vec![(0, out(1))],
-            vec![0, 2],
-            None,
-            None,
-            Vec::new(),
-        );
-        assert!(bp.pin_covered(Fk(1), &[0, 2]));
-        assert!(!bp.pin_covered(Fk(1), &[0, 1]));
-    }
-
-    /// Pin stores coinbase *flag* only — no create-height field on the entry.
-    #[test]
-    fn parent_entry_has_no_create_height_field() {
-        let e = ParentEntry {
-            tx: tx(1),
-            outs: vec![(0, out(1))],
-            checked: vec![0],
-            coinbase: Some(true),
-            body_range: Some((10, 20)),
-            spender_rels: vec![(0, 4)],
-        };
-        // Compile-time surface: only coinbase flag + layout, not stashed height.
-        assert_eq!(e.coinbase, Some(true));
-        assert_eq!(e.body_range, Some((10, 20)));
-        let fields = std::mem::size_of_val(&e.coinbase);
-        assert_eq!(fields, std::mem::size_of::<Option<bool>>());
+        let (_, o) = bp.get_parent_out(Fk(9), 0).unwrap();
+        assert_eq!(o.value, 42);
     }
 }

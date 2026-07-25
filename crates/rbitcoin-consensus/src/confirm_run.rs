@@ -358,8 +358,10 @@ mod write_idempotent_tests {
 
     /// Heights at or below tip must be stripped before structural write
     /// (dup pipeline race after scripts claim the same tip+1 twice).
+    /// Write filter + stage entry points + empty scripts purity (one surface).
+    /// External three-stage path: rbitcoin-test three_stage_confirm_and_parent_pin_surface.
     #[test]
-    fn filter_keeps_only_heights_above_tip() {
+    fn three_stage_write_filter_and_scripts_surface() {
         let tip = 100u32;
         let heights = [98u32, 99, 100, 101, 102];
         let kept: Vec<u32> = heights
@@ -370,21 +372,14 @@ mod write_idempotent_tests {
         assert!(!write_height_needed(tip, tip));
         assert!(!write_height_needed(0, 0));
         assert!(write_height_needed(0, 1));
-    }
 
-    #[test]
-    fn three_stage_entry_points_exist() {
         // Load / scripts / write are separate public surfaces for IBD.
         let _m = super::confirm_load_phase;
         let _s = super::confirm_scripts_phase;
         let _w = super::confirm_write_phase;
         let _combined = super::confirm_script_phase;
         let _sync = super::confirm_archived_run;
-    }
 
-    /// Scripts stage accepts an empty LoadedBatch without a Query (pure API).
-    #[test]
-    fn scripts_phase_is_pure_no_query_arg() {
         use super::{confirm_scripts_phase, LoadedBatch};
         let batch = LoadedBatch {
             prepared: Vec::new(),

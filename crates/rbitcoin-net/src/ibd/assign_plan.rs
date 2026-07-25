@@ -90,26 +90,20 @@ mod tests {
         BlockHash::from_byte_array(b)
     }
 
+    /// far_slots / feed_cap scale / soft-cap density (pure policy helpers).
     #[test]
-    fn far_slots_simple() {
+    fn assign_policy_helpers_surface() {
         assert_eq!(far_slots_per_peer(16, true), 2);
         assert_eq!(far_slots_per_peer(16, false), 8);
         assert_eq!(far_slots_per_peer(8, false), 4);
-    }
 
-    /// Pressure / feed_scale=0 → no densify slots (tip hole + park race only).
-    #[test]
-    fn zero_feed_scale_means_zero_feed_cap() {
         use super::super::assign::scale_feed_cap;
         assert_eq!(scale_feed_cap(8, 0.0), 0);
         assert_eq!(scale_feed_cap(8, 0.5), 4);
         assert_eq!(scale_feed_cap(8, 1.0), 8);
         // Tiny residual headroom still drips one densify slot.
         assert_eq!(scale_feed_cap(8, 0.01), 1);
-    }
 
-    #[test]
-    fn header_soft_cap_density_gate() {
         // Sparse: 4k known of 120k live → no bypass
         assert!(!want_headers_beyond_soft_cap(120_000, 4_000, 100, 2048));
         // Dense + short cache → bypass
@@ -120,17 +114,15 @@ mod tests {
         assert!(want_headers_beyond_soft_cap(0, 0, 0, 2048));
     }
 
+    /// ordered set remove + compact ghosts (one surface).
     #[test]
-    fn remove_pops_front_match() {
+    fn ordered_set_remove_and_compact_surface() {
         let mut ordered: VecDeque<_> = [h(1), h(2), h(3)].into_iter().collect();
         let mut set: HashSet<_> = ordered.iter().copied().collect();
         remove_from_ordered(&mut ordered, &mut set, h(1));
         assert_eq!(ordered.front().copied(), Some(h(2)));
         assert!(!set.contains(&h(1)));
-    }
 
-    #[test]
-    fn remove_middle_then_front_trims_ghost() {
         let mut ordered: VecDeque<_> = [h(1), h(2), h(3)].into_iter().collect();
         let mut set: HashSet<_> = ordered.iter().copied().collect();
         remove_from_ordered(&mut ordered, &mut set, h(2));
@@ -139,10 +131,7 @@ mod tests {
         remove_from_ordered(&mut ordered, &mut set, h(1));
         assert_eq!(ordered.front().copied(), Some(h(3)));
         assert_eq!(ordered.len(), 1);
-    }
 
-    #[test]
-    fn compact_drops_middle_ghosts_when_bloated() {
         let mut ordered = VecDeque::new();
         let mut set = HashSet::new();
         for i in 1u16..=100 {
@@ -156,10 +145,8 @@ mod tests {
         for x in &ordered {
             assert!(set.contains(x));
         }
-    }
 
-    #[test]
-    fn compact_skips_small_deques() {
+        // Small deques are left alone (compact threshold).
         let mut ordered: VecDeque<_> = [h(1), h(2)].into_iter().collect();
         let set: HashSet<_> = [h(1)].into_iter().collect();
         compact_ordered(&mut ordered, &set);

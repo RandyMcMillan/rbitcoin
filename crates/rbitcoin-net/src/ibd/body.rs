@@ -259,67 +259,29 @@ mod tests {
         BlockHash::from_byte_array(b)
     }
 
+    /// skip_download / mark_pending / archived / missing / demote / counts / hygiene.
     #[test]
-    fn pending_skips_without_store() {
+    fn presence_lifecycle_surface() {
         let mut body = BodyPresence::new();
-        let hash = h(1);
-        body.mark_pending(hash);
-        assert_eq!(body.skip_download_cached(&hash), Some(true));
-        // Still not ready for confirm (pending ≠ archived).
-        assert!(!body.known.contains(&hash));
-    }
+        assert_eq!(body.skip_download_cached(&h(9)), None); // unknown → probe
 
-    #[test]
-    fn archived_skips_and_is_known() {
-        let mut body = BodyPresence::new();
-        let hash = h(2);
-        body.mark_archived(hash);
-        assert_eq!(body.skip_download_cached(&hash), Some(true));
-        assert!(body.known.contains(&hash));
-        assert!(!body.pending.contains(&hash));
-        assert!(!body.missing.contains(&hash));
-    }
-
-    #[test]
-    fn missing_does_not_skip() {
-        let mut body = BodyPresence::new();
-        let hash = h(3);
-        body.mark_missing(hash);
-        assert_eq!(body.skip_download_cached(&hash), Some(false));
-    }
-
-    #[test]
-    fn known_and_pending_counts() {
-        let mut body = BodyPresence::new();
-        assert_eq!(body.known_len(), 0);
-        assert_eq!(body.pending_len(), 0);
         body.mark_pending(h(1));
+        assert_eq!(body.skip_download_cached(&h(1)), Some(true));
+        assert!(!body.known.contains(&h(1))); // pending ≠ archived
+
         body.mark_archived(h(2));
+        assert_eq!(body.skip_download_cached(&h(2)), Some(true));
+        assert!(body.known.contains(&h(2)));
+        assert!(!body.pending.contains(&h(2)));
+        assert!(!body.missing.contains(&h(2)));
+
+        body.mark_missing(h(3));
+        assert_eq!(body.skip_download_cached(&h(3)), Some(false));
+
         assert_eq!(body.pending_len(), 1);
         assert_eq!(body.known_len(), 1);
-    }
 
-    #[test]
-    fn hygiene_retain_drops_stale_known_keeps_rejected() {
-        let mut body = BodyPresence::new();
-        body.mark_archived(h(1));
-        body.mark_missing(h(2));
-        body.mark_rejected(h(3));
-        body.hygiene_retain(|x| *x == h(1));
-        assert!(body.is_known_archived(&h(1)));
-        assert_eq!(body.skip_download_cached(&h(2)), None); // missing dropped
-        assert!(body.is_rejected(&h(3)));
-    }
-
-    #[test]
-    fn unknown_needs_probe() {
-        let body = BodyPresence::new();
-        assert_eq!(body.skip_download_cached(&h(9)), None);
-    }
-
-    #[test]
-    fn mark_archived_clears_pending_and_missing() {
-        let mut body = BodyPresence::new();
+        // archived clears pending; missing clears known; re-archive clears missing
         let hash = h(4);
         body.mark_pending(hash);
         body.mark_archived(hash);
@@ -331,60 +293,51 @@ mod tests {
         body.mark_archived(hash);
         assert!(body.known.contains(&hash));
         assert!(!body.missing.contains(&hash));
+
+        body.demote_known(h(2));
+        assert!(!body.is_known_archived(&h(2)));
+        assert_eq!(body.skip_download_cached(&h(2)), None);
+
+        body.mark_archived(h(10));
+        body.mark_missing(h(11));
+        body.mark_rejected(h(12));
+        body.hygiene_retain(|x| *x == h(10));
+        assert!(body.is_known_archived(&h(10)));
+        assert_eq!(body.skip_download_cached(&h(11)), None); // missing dropped
+        assert!(body.is_rejected(&h(12)));
     }
 
+    /// rejected sticky + archive_charged through pending-stale pipeline.
     #[test]
-    fn demote_known_allows_reprobe_without_missing() {
+    fn rejected_and_archive_charged_surface() {
         let mut body = BodyPresence::new();
-        let hash = h(6);
-        body.mark_archived(hash);
-        assert!(body.is_known_archived(&hash));
-        body.demote_known(hash);
-        assert!(!body.is_known_archived(&hash));
-        // Not in missing — ready() may re-probe store.
-        assert_eq!(body.skip_download_cached(&hash), None);
-    }
+        let rej = h(5);
+        body.mark_archived(rej);
+        body.mark_rejected(rej);
+        assert!(body.is_rejected(&rej));
+        assert_eq!(body.skip_download_cached(&rej), Some(true));
+        body.mark_archived(rej); // must not resurrect rejected
+        assert!(body.is_rejected(&rej));
+        assert!(!body.known.contains(&rej));
 
-    #[test]
-    fn rejected_skips_download_and_is_not_ready() {
-        let mut body = BodyPresence::new();
-        let hash = h(5);
-        body.mark_archived(hash);
-        body.mark_rejected(hash);
-        assert!(body.is_rejected(&hash));
-        assert_eq!(body.skip_download_cached(&hash), Some(true));
-        // mark_archived must not resurrect a rejected hash.
-        body.mark_archived(hash);
-        assert!(body.is_rejected(&hash));
-        assert!(!body.known.contains(&hash));
-    }
+        let charge = h(7);
+        body.mark_pending(charge);
+        assert!(!body.is_archive_charged(&charge));
+        body.mark_archive_charged(charge);
+        assert!(body.is_archive_charged(&charge));
+        body.mark_missing(charge);
+        assert!(
+            body.is_archive_charged(&charge),
+            "must not re-charge while in pipeline"
+        );
+        assert_eq!(body.skip_download_cached(&charge), Some(false));
+        body.clear_archive_charged(&charge);
+        assert!(!body.is_archive_charged(&charge));
 
-    #[test]
-    fn archive_charged_survives_pending_stale_missing() {
-        let mut body = BodyPresence::new();
-        let hash = h(7);
-        // BlockFramed: pending before charge.
-        body.mark_pending(hash);
-        assert!(!body.is_archive_charged(&hash));
-        // Block: charge once.
-        body.mark_archive_charged(hash);
-        assert!(body.is_archive_charged(&hash));
-        // Pending-stale expire → missing, but charge still held (body in job q).
-        body.mark_missing(hash);
-        assert!(body.is_archive_charged(&hash), "must not re-charge while in pipeline");
-        assert_eq!(body.skip_download_cached(&hash), Some(false)); // missing
-        // Pipeline result releases charge.
-        body.clear_archive_charged(&hash);
-        assert!(!body.is_archive_charged(&hash));
-    }
-
-    #[test]
-    fn mark_archived_clears_archive_charged() {
-        let mut body = BodyPresence::new();
-        let hash = h(8);
-        body.mark_archive_charged(hash);
-        body.mark_pending(hash);
-        body.mark_archived(hash);
-        assert!(!body.is_archive_charged(&hash));
+        let done = h(8);
+        body.mark_archive_charged(done);
+        body.mark_pending(done);
+        body.mark_archived(done);
+        assert!(!body.is_archive_charged(&done));
     }
 }

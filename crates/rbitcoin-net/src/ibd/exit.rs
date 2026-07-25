@@ -81,56 +81,51 @@ pub fn all_peers_dead_action(
 mod tests {
     use super::*;
 
+    /// all_peers_dead + catchup_complete edge matrix (mid-chain / caught-up / tip-0).
     #[test]
-    fn mid_chain_all_dead_does_not_complete() {
-        let mut st = IbdWorkState::new(Vec::new(), None, Some(161_249));
-        st.max_peer_height = 958_820;
-        st.max_archived_height = 161_000;
-        let a = all_peers_dead_action(&st, 161_249, 0, false, 0);
-        assert_eq!(a, AllPeersDead::GiveUpMidCatchup);
-    }
+    fn exit_and_catchup_complete_surface() {
+        // Mid-chain, all dead, no redial → give up.
+        let mut mid = IbdWorkState::new(Vec::new(), None, Some(161_249));
+        mid.max_peer_height = 958_820;
+        mid.max_archived_height = 161_000;
+        assert_eq!(
+            all_peers_dead_action(&mid, 161_249, 0, false, 0),
+            AllPeersDead::GiveUpMidCatchup
+        );
+        assert_eq!(
+            all_peers_dead_action(&mid, 161_249, 0, true, 0),
+            AllPeersDead::WaitRedial
+        );
 
-    #[test]
-    fn mid_chain_waits_for_redial() {
-        let mut st = IbdWorkState::new(Vec::new(), None, Some(161_249));
-        st.max_peer_height = 958_820;
-        st.max_archived_height = 161_000;
-        let a = all_peers_dead_action(&st, 161_249, 0, true, 0);
-        assert_eq!(a, AllPeersDead::WaitRedial);
-    }
+        // Caught up with no peers → complete.
+        let mut done = IbdWorkState::new(Vec::new(), None, Some(100));
+        done.max_peer_height = 100;
+        done.max_archived_height = 100;
+        done.headers_done = true;
+        assert_eq!(
+            all_peers_dead_action(&done, 100, 0, false, 0),
+            AllPeersDead::CatchupComplete
+        );
 
-    #[test]
-    fn caught_up_completes_with_no_peers() {
-        let mut st = IbdWorkState::new(Vec::new(), None, Some(100));
-        st.max_peer_height = 100;
-        st.max_archived_height = 100;
-        st.headers_done = true;
-        let a = all_peers_dead_action(&st, 100, 0, false, 0);
-        assert_eq!(a, AllPeersDead::CatchupComplete);
-    }
+        // Path drain complete requires near peer tip (headers_done alone is not enough).
+        let mut path = IbdWorkState::new(Vec::new(), None, Some(2000));
+        path.max_peer_height = 313_000;
+        path.max_archived_height = 2000;
+        path.headers_done = true;
+        assert!(!catchup_complete_after_drain(&path, 2000, 0));
+        path.max_peer_height = 2001;
+        assert!(catchup_complete_after_drain(&path, 2000, 0));
 
-    #[test]
-    fn path_drain_complete_requires_near_peer_tip() {
-        let mut st = IbdWorkState::new(Vec::new(), None, Some(2000));
-        st.max_peer_height = 313_000;
-        st.max_archived_height = 2000;
-        st.headers_done = true; // false positive alone is not enough
-        assert!(!catchup_complete_after_drain(&st, 2000, 0));
-        st.max_peer_height = 2001;
-        assert!(catchup_complete_after_drain(&st, 2000, 0));
-    }
-
-    /// Regression (mainnet log): tip=0, empty path, peers at ~958k must **not**
-    /// look "complete" after a progress stall — that entered false tip mode.
-    #[test]
-    fn tip_zero_with_peer_horizon_is_not_complete() {
-        let mut st = IbdWorkState::new(Vec::new(), None, Some(0));
-        st.max_peer_height = 958_900;
-        st.max_archived_height = 0;
-        st.headers_done = false;
-        assert!(!catchup_complete_after_drain(&st, 0, 0));
-        assert!(!peer_caught_up(&st, 0));
-        let a = all_peers_dead_action(&st, 0, 0, false, 0);
-        assert_eq!(a, AllPeersDead::GiveUpMidCatchup);
+        // Regression: tip=0 + peer horizon must not look complete (false tip mode).
+        let mut zero = IbdWorkState::new(Vec::new(), None, Some(0));
+        zero.max_peer_height = 958_900;
+        zero.max_archived_height = 0;
+        zero.headers_done = false;
+        assert!(!catchup_complete_after_drain(&zero, 0, 0));
+        assert!(!peer_caught_up(&zero, 0));
+        assert_eq!(
+            all_peers_dead_action(&zero, 0, 0, false, 0),
+            AllPeersDead::GiveUpMidCatchup
+        );
     }
 }

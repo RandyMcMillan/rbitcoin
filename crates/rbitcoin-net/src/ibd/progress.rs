@@ -213,107 +213,83 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
+    /// Pure helpers for progress lines (pct / tip-hole / duration formatting).
     #[test]
-    fn pct_basic() {
+    fn pct_tip_hole_and_format_surface() {
         assert_eq!(ibd_pct(0, 100), 0);
         assert_eq!(ibd_pct(50, 100), 50);
         assert_eq!(ibd_pct(100, 100), 100);
-    }
-
-    #[test]
-    fn pct_tip_above_horizon() {
-        // ((200 * 100) / 200) when denom = max(tip, horizon) = 200
+        // denom = max(tip, horizon)
         assert_eq!(ibd_pct(200, 100), 100);
-    }
-
-    #[test]
-    fn pct_zero_horizon() {
         assert_eq!(ibd_pct(0, 0), 0);
         assert_eq!(ibd_pct(5, 0), 100);
-    }
 
-    #[test]
-    fn tip_hole_contiguous_front() {
         assert_eq!(tip_hole_from_ready(&[]), 0);
         assert_eq!(tip_hole_from_ready(&[true, false, false]), 0);
         assert_eq!(tip_hole_from_ready(&[false, false, true, false]), 2);
         assert_eq!(tip_hole_from_ready(&[false, false, false]), 3);
-    }
 
-    #[test]
-    fn eta_and_format() {
         assert_eq!(format_duration_short(45), "45s");
         assert_eq!(format_duration_short(120), "2m");
         assert_eq!(format_rate(2.4), "2.4");
         assert_eq!(format_rate(31.2), "31");
-        let mut t = TipRateTracker::new();
-        let t0 = Instant::now();
-        // Steady 1 blk/s for a few minutes (5s ticks).
-        for i in 0u32..=60 {
-            t.push(t0 + Duration::from_secs(u64::from(i) * 5), 100 + i * 5);
-        }
-        let now = t0 + Duration::from_secs(300);
-        let rate = t.eta_rate(now).unwrap();
-        assert!((rate - 1.0).abs() < 0.05, "rate={rate}");
-        let eta = t.eta_string(now, 100 + 300, 100 + 300 + 7200);
-        assert!(eta.contains("eta="), "{eta}");
-        assert!(eta.contains("2.0h") || eta.contains("2h"), "{eta}");
     }
 
+    /// EWMA tip-rate: warmup gate, steady ETA, spike resistance, sustained slowdown.
     #[test]
-    fn eta_needs_warmup() {
-        let mut t = TipRateTracker::new();
+    fn tip_rate_tracker_eta_surface() {
         let t0 = Instant::now();
-        t.push(t0, 0);
-        t.push(t0 + Duration::from_secs(5), 50);
-        // Only 5s of history — hide ETA until min elapsed.
-        assert!(t.eta_rate(t0 + Duration::from_secs(5)).is_none());
+
+        // Warmup: only 5s of history — hide ETA until min elapsed.
+        let mut cold = TipRateTracker::new();
+        cold.push(t0, 0);
+        cold.push(t0 + Duration::from_secs(5), 50);
+        assert!(cold.eta_rate(t0 + Duration::from_secs(5)).is_none());
         assert_eq!(
-            t.eta_string(t0 + Duration::from_secs(5), 50, 1_000_000),
+            cold.eta_string(t0 + Duration::from_secs(5), 50, 1_000_000),
             "eta=?"
         );
-    }
 
-    #[test]
-    fn eta_brief_spike_does_not_dominate() {
-        let mut t = TipRateTracker::new();
-        let t0 = Instant::now();
-        // ~5 minutes at 10 blk/s (5s ticks: +50 tip each).
+        // Steady 1 blk/s → ~2h ETA for 7200 remaining.
+        let mut steady = TipRateTracker::new();
         for i in 0u32..=60 {
-            t.push(t0 + Duration::from_secs(u64::from(i) * 5), i * 50);
+            steady.push(t0 + Duration::from_secs(u64::from(i) * 5), 100 + i * 5);
         }
-        let before = t.eta_rate(t0 + Duration::from_secs(300)).unwrap();
+        let now = t0 + Duration::from_secs(300);
+        let rate = steady.eta_rate(now).unwrap();
+        assert!((rate - 1.0).abs() < 0.05, "rate={rate}");
+        let eta = steady.eta_string(now, 100 + 300, 100 + 300 + 7200);
+        assert!(eta.contains("eta="), "{eta}");
+        assert!(eta.contains("2.0h") || eta.contains("2h"), "{eta}");
+
+        // Spike: ~5 min at 10 blk/s, then one wild tick — EWMA must not jump near spike.
+        let mut spike = TipRateTracker::new();
+        for i in 0u32..=60 {
+            spike.push(t0 + Duration::from_secs(u64::from(i) * 5), i * 50);
+        }
+        let before = spike.eta_rate(t0 + Duration::from_secs(300)).unwrap();
         assert!((before - 10.0).abs() < 0.5, "before={before}");
-        // One wild 5s interval at 500 blk/s.
-        t.push(t0 + Duration::from_secs(305), 60 * 50 + 2500);
-        let after = t.eta_rate(t0 + Duration::from_secs(305)).unwrap();
-        // EWMA half-life ~90s: one tick cannot pull rate near the spike.
+        spike.push(t0 + Duration::from_secs(305), 60 * 50 + 2500);
+        let after = spike.eta_rate(t0 + Duration::from_secs(305)).unwrap();
         assert!(after < 30.0, "after spike rate should stay near 10, got {after}");
         assert!(after > 8.0, "after={after}");
-    }
 
-    #[test]
-    fn eta_tracks_sustained_slowdown() {
-        let mut t = TipRateTracker::new();
-        let t0 = Instant::now();
-        // Fast early: 100 blk/s for 1 minute.
+        // Sustained slowdown: fast early, then dense pace for several minutes.
+        let mut slow = TipRateTracker::new();
         for i in 0u32..=12 {
-            t.push(t0 + Duration::from_secs(u64::from(i) * 5), i * 500);
+            slow.push(t0 + Duration::from_secs(u64::from(i) * 5), i * 500);
         }
-        let fast = t.eta_rate(t0 + Duration::from_secs(60)).unwrap();
+        let fast = slow.eta_rate(t0 + Duration::from_secs(60)).unwrap();
         assert!(fast > 50.0, "fast={fast}");
-        // Then dense chain at 10 blk/s for several minutes — present bias
-        // should leave the early hour-style optimism behind.
         let tip0 = 12u32 * 500;
         for i in 1u32..=72 {
-            t.push(
+            slow.push(
                 t0 + Duration::from_secs(60 + u64::from(i) * 5),
                 tip0 + i * 50,
             );
         }
-        let slow = t.eta_rate(t0 + Duration::from_secs(60 + 72 * 5)).unwrap();
-        // ~6 min of dense pace with 90s half-life → well below early 100 blk/s.
-        assert!(slow < 18.0, "should track denser pace, got {slow}");
-        assert!(slow > 5.0, "slow={slow}");
+        let dense = slow.eta_rate(t0 + Duration::from_secs(60 + 72 * 5)).unwrap();
+        assert!(dense < 18.0, "should track denser pace, got {dense}");
+        assert!(dense > 5.0, "dense={dense}");
     }
 }

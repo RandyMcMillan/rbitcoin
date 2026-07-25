@@ -33,6 +33,16 @@ pub fn validate_header(
         if header.time <= mtp {
             return Err(ConsensusError::BadHeader("timestamp <= median-time-past"));
         }
+        // Core: block time must not be more than 2 hours ahead of adjusted network time.
+        // We use wall-clock UTC (no peer-time adjustment).
+        const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if u64::from(header.time) > now.saturating_add(MAX_FUTURE_BLOCK_TIME) {
+            return Err(ConsensusError::BadHeader("timestamp too far in future"));
+        }
     }
 
     if let Some(cp) = params.checkpoint_at(height) {

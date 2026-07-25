@@ -12,9 +12,9 @@ use crate::var_table::VarTable;
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Class A tx row (no wire blob — reconstruct from inputs/outputs + witness).
 ///
@@ -647,6 +647,9 @@ pub struct TxTable {
     resize_bg: Mutex<Option<JoinHandle<()>>>,
     /// Generation of the live bg worker; bump to ask a previous worker to exit.
     resize_bg_gen: AtomicU64,
+    /// Wakes archive/tip writers parked on probe-exhaust for the duration of a resize.
+    /// Pair with [`Self::resize`] (waiters hold that mutex).
+    resize_cv: Condvar,
 }
 
 impl Drop for TxTable {
@@ -657,6 +660,10 @@ impl Drop for TxTable {
         if let Some(h) = self.resize_bg.lock().unwrap().take() {
             let _ = h.join();
         }
+        // Unblock any insert waiters (tests / early drop mid-resize).
+        self.resize_active.store(false, AtomicOrdering::Release);
+        *self.resize.lock().unwrap() = None;
+        self.resize_cv.notify_all();
     }
 }
 
@@ -677,6 +684,7 @@ impl TxTable {
             resize_active: AtomicBool::new(false),
             resize_bg: Mutex::new(None),
             resize_bg_gen: AtomicU64::new(0),
+            resize_cv: Condvar::new(),
         })
     }
 
@@ -723,6 +731,7 @@ impl TxTable {
             resize_active: AtomicBool::new(false),
             resize_bg: Mutex::new(None),
             resize_bg_gen: AtomicU64::new(0),
+            resize_cv: Condvar::new(),
         };
         if need_rebuild {
             // Sized head + rebuild inserts only — do not interleave online resize
@@ -2155,8 +2164,10 @@ impl TxTable {
     /// **No body_txid** on insert. May start sequential online resize (background
     /// thread fills the shadow continuously).
     ///
-    /// On open-address **probe exhaust**, blocks the writer until the bg resize
-    /// swaps a wider primary, then retries the batch.
+    /// On open-address **probe exhaust**, the archive/tip writer **sleeps** until
+    /// the background resize finishes (shadow filled + primary swapped), then
+    /// retries the batch. No wall-clock deadline — mainnet 29→30 rehashes can
+    /// take longer than a fixed timeout and must not kill the archive pipeline.
     pub fn head_insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if !entries.is_empty() {
             self.head_insert_many_with_resize_retry(entries)?;
@@ -2172,25 +2183,13 @@ impl TxTable {
         Ok(())
     }
 
-    /// Insert batch; if the primary probe chain is full, wait for bg resize.
+    /// Insert batch; if the primary probe chain is full, sleep until bg resize completes.
     fn head_insert_many_with_resize_retry(
         &self,
         entries: &[([u8; 32], Fk)],
     ) -> Result<(), StoreError> {
-        use std::time::Instant;
-
-        /// How often the blocked writer re-checks whether resize finished.
-        const WAIT_SLICE: Duration = Duration::from_millis(250);
-        /// Safety valve — operator can restart if resize is truly stuck.
-        const MAX_WAIT: Duration = Duration::from_secs(30 * 60);
-        /// How often to emit a wait-progress WARN.
-        const LOG_EVERY: Duration = Duration::from_secs(30);
-
         let t0 = Instant::now();
-        let mut attempts = 0u32;
-        let mut last_log = Instant::now()
-            .checked_sub(LOG_EVERY)
-            .unwrap_or_else(Instant::now);
+        let mut slept_for_resize = false;
         loop {
             // Drop the read guard **before** resize/swap. Matching on
             // `head.read().insert_many(...)` would keep the guard through the
@@ -2202,10 +2201,10 @@ impl TxTable {
             };
             match insert_result {
                 Ok(()) => {
-                    if attempts > 0 {
+                    if slept_for_resize {
                         rbitcoin_log::info!(
                             "store: tx.head insert resumed after probe exhaust \
-                             (attempts={attempts} waited={:?} batch={})",
+                             (waited={:?} batch={})",
                             t0.elapsed(),
                             entries.len()
                         );
@@ -2213,51 +2212,99 @@ impl TxTable {
                     return Ok(());
                 }
                 Err(e) if is_probe_exhausted_error(&e) => {
-                    attempts = attempts.saturating_add(1);
                     // Ensure a widen is running (force start even if under load
                     // threshold — probe exhaust is a hard capacity signal).
                     self.ensure_head_resize_for_probe_exhaust()?;
-                    // Background thread owns continuous fill — do **not** do
-                    // small sleep-poll chunks on the archive writer.
                     self.ensure_resize_bg_running();
-                    if t0.elapsed() > MAX_WAIT {
-                        let (cursor, n, _, _) = self.head_resize_progress();
+                    if !self.head_resize_in_progress() {
+                        // Cannot widen further (e.g. MAX_BITS) — surface the exhaust.
+                        let (cursor, n, bits, slots) = self.head_resize_progress();
                         rbitcoin_log::error!(
-                            "store: tx.head probe exhausted — resize did not free capacity \
-                             within {MAX_WAIT:?} (attempts={attempts} cursor={cursor}/{n})"
+                            "store: tx.head probe exhausted with no resize in progress \
+                             (bits={bits} slots={slots} n={n} cursor={cursor} batch={})",
+                            entries.len()
                         );
                         return Err(e);
                     }
-                    if self.head_resize_in_progress() {
-                        let should_log =
-                            attempts == 1 || last_log.elapsed() >= LOG_EVERY;
-                        if should_log {
-                            let (cursor, n, target_bits, slots) = self.head_resize_progress();
-                            let (deep, exh) =
-                                crate::address_head::probe_depth_stats_snapshot();
-                            let pct = if n > 0 {
-                                100.0 * (cursor.saturating_sub(1) as f64) / (n as f64)
-                            } else {
-                                100.0
-                            };
-                            rbitcoin_log::warn!(
-                                "store: tx.head probe exhausted — waiting on bg resize \
-                                 (attempt={attempts} \
-                                 cursor={}/{n} ({pct:.1}%) target_bits={target_bits} \
-                                 slots={slots} deep_warn={deep} exhaust={exh} \
-                                 batch={} elapsed={:?})",
-                                cursor.saturating_sub(1),
-                                entries.len(),
-                                t0.elapsed()
-                            );
-                            last_log = Instant::now();
-                        }
-                        std::thread::sleep(WAIT_SLICE);
+                    if !slept_for_resize {
+                        let (cursor, n, target_bits, slots) = self.head_resize_progress();
+                        let (deep, exh) = crate::address_head::probe_depth_stats_snapshot();
+                        let pct = if n > 0 {
+                            100.0 * (cursor.saturating_sub(1) as f64) / (n as f64)
+                        } else {
+                            100.0
+                        };
+                        rbitcoin_log::warn!(
+                            "store: tx.head probe exhausted — archiver sleeping until \
+                             resize completes (cursor={}/{n} ({pct:.1}%) \
+                             target_bits={target_bits} slots={slots} \
+                             deep_warn={deep} exhaust={exh} batch={})",
+                            cursor.saturating_sub(1),
+                            entries.len()
+                        );
+                        slept_for_resize = true;
                     }
+                    // Park until swap (or drop) notifies — no 30‑minute hard fail.
+                    self.wait_for_head_resize_idle();
                 }
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /// Block the calling thread until online head resize is idle.
+    ///
+    /// Progress is logged every 30s while parked. Wakes on
+    /// [`Self::notify_head_resize_idle`] after a successful swap (or Drop).
+    ///
+    /// Lock order: never hold `resize` while taking `head` (swap holds
+    /// `head.write` then notifies under `resize` — reverse order deadlocks).
+    fn wait_for_head_resize_idle(&self) {
+        /// How often a parked archiver logs resize progress.
+        const LOG_EVERY: Duration = Duration::from_secs(30);
+
+        let t0 = Instant::now();
+        let mut last_log = Instant::now()
+            .checked_sub(LOG_EVERY)
+            .unwrap_or_else(Instant::now);
+        loop {
+            if !self.head_resize_in_progress() {
+                break;
+            }
+            if last_log.elapsed() >= LOG_EVERY {
+                // Snapshot without holding `resize` across `head.read`.
+                let (cursor, n, target_bits, slots) = self.head_resize_progress();
+                let pct = if n > 0 {
+                    100.0 * (cursor.saturating_sub(1) as f64) / (n as f64)
+                } else {
+                    100.0
+                };
+                rbitcoin_log::info!(
+                    "store: tx.head archiver still sleeping on resize \
+                     (cursor={}/{n} ({pct:.1}%) target_bits={target_bits} \
+                     slots={slots} elapsed={:?})",
+                    cursor.saturating_sub(1),
+                    t0.elapsed()
+                );
+                last_log = Instant::now();
+            }
+            let guard = self.resize.lock().unwrap();
+            if !self.head_resize_in_progress() {
+                break;
+            }
+            let (_g, _) = self
+                .resize_cv
+                .wait_timeout(guard, LOG_EVERY)
+                .expect("tx.head resize wait mutex not poisoned");
+        }
+    }
+
+    /// Wake writers parked in [`Self::wait_for_head_resize_idle`].
+    fn notify_head_resize_idle(&self) {
+        // Hold `resize` so waiters re-check `head_resize_in_progress` after wake
+        // without missing the notify between the check and wait.
+        let _g = self.resize.lock().unwrap();
+        self.resize_cv.notify_all();
     }
 
     /// `(shadow_cursor, class_a_count, target_bits, primary_slots)` for logs.
@@ -2797,6 +2844,9 @@ impl TxTable {
         crate::address_head::remove_legacy_meta_sidecar(&bak);
         crate::address_head::remove_legacy_meta_sidecar(&shadow_path);
         self.resize_active.store(false, AtomicOrdering::Release);
+        // Archive writers may be parked on probe-exhaust for the whole fill;
+        // wake them now that the wider primary is live.
+        self.notify_head_resize_idle();
         rbitcoin_log::info!(
             "store: tx.head resize complete bits={} entry={}B slots={} gen={}",
             target.bits,
@@ -3236,6 +3286,90 @@ mod tests {
             let fk = t.get_fk_by_txid(&txid).unwrap();
             assert_eq!(fk, Some(Fk(i)), "txid {i} missing after resize");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Probe-exhaust wait path: park until resize completes (no wall-clock fail).
+    ///
+    /// Regression for the mainnet 29→30 case where a 30‑minute `MAX_WAIT` killed
+    /// the archive pipeline while a healthy bg resize was still ~79% done.
+    #[test]
+    fn archiver_sleeps_until_resize_notifies() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-head-sleep-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = create_bits(&dir, 10);
+        let mk = |i: u64| {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            let rec = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+            (rec, inputs, outputs)
+        };
+        // Enough bodies that fill is not instantaneous, so the waiter can park.
+        for i in 1..=2_000u64 {
+            let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
+        }
+        // Bump gen so any auto-started worker exits; we drive fill on the main
+        // thread so the waiter is guaranteed a window to sleep.
+        t.resize_bg_gen.fetch_add(1, AtomicOrdering::AcqRel);
+        if let Some(h) = t.resize_bg.lock().unwrap().take() {
+            let _ = h.join();
+        }
+        t.start_head_resize(crate::address_head::HeadLayout::new(11).unwrap())
+            .unwrap();
+        // Do not start bg fill — main thread owns progress (ensures sleep window).
+        t.resize_bg_gen.fetch_add(1, AtomicOrdering::AcqRel);
+        if let Some(h) = t.resize_bg.lock().unwrap().take() {
+            let _ = h.join();
+        }
+        assert!(t.head_resize_in_progress());
+
+        let this = &t as *const TxTable as usize;
+        let waiter = std::thread::Builder::new()
+            .name("test-tx-head-sleep".into())
+            .spawn(move || {
+                // SAFETY: `t` lives until join below.
+                let table = unsafe { &*(this as *const TxTable) };
+                table.wait_for_head_resize_idle();
+            })
+            .unwrap();
+
+        // Park window: waiter should still be blocked before we complete fill.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !waiter.is_finished(),
+            "waiter must still be sleeping while resize is in progress"
+        );
+
+        // Drive fill to completion (bg gen bumped so auto worker stays off).
+        wait_head_resize_done(&t, Duration::from_secs(15));
+        assert!(!t.head_resize_in_progress());
+
+        waiter.join().expect("archiver sleep thread panicked");
+        // If notify_head_resize_idle were missing, join would hang.
         let _ = std::fs::remove_dir_all(&dir);
     }
 

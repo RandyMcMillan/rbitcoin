@@ -55,7 +55,7 @@ pub const PROBE_REGION_BYTES: usize = (PAGE_SLOTS as usize) * 8;
 /// Cumulative counter for lagging/retry logs; WARN only once at first event.
 static PROBE_INSERT_DEPTH_WARN_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Inserts that exhausted [`MAX_PROBE`] (sleep-retry through resize).
+/// Inserts that exhausted [`MAX_PROBE`] (archiver sleeps until resize completes).
 /// Counter only — the retry loop owns operator-facing logs.
 static PROBE_INSERT_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 

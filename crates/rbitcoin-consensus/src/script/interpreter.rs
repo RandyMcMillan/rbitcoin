@@ -910,7 +910,14 @@ fn op_checkmultisig(
         sigs.push(pop(stack)?);
     }
     sigs.reverse();
-    let _dummy = pop(stack)?;
+    let dummy = pop(stack)?;
+    // BIP147 NULLDUMMY: extra stack element must be empty. Softfork co-activated
+    // with CSV on mainnet; always required for Witness v0 (segwit).
+    if !dummy.is_empty()
+        && (ctx.sig_version == SigVersion::WitnessV0 || ctx.bip112_active)
+    {
+        return Err(ConsensusError::Script("NULLDUMMY".into()));
+    }
 
     // Core Base: FindAndDelete **all** sigs from scriptCode before the loop.
     let script_code_owned: Option<Vec<u8>> = if ctx.sig_version == SigVersion::Base {
@@ -1529,6 +1536,23 @@ mod success_and_disabled_tests {
                 "0x{code:02x}: {msg}"
             );
         }
+    }
+
+    /// BIP147: non-empty CHECKMULTISIG dummy fails when NULLDUMMY active.
+    #[test]
+    fn nulldummy_rejects_nonempty_dummy() {
+        // 0-of-0 multisig: n=0, m=0, dummy non-empty → should fail NULLDUMMY.
+        // Stack build (pushed first → deep): dummy=0x01, m=0, n=0 then OP_CHECKMULTISIG
+        // After pops: n, keys, m, sigs, dummy — for 0/0: push dummy, 0, 0, CHECKMULTISIG
+        let script = vec![0x01, 0xff, 0x00, 0x00, 0xae, 0x51]; // dummy, 0, 0, CMS, TRUE won't run
+        let err = eval(&script, SigVersion::WitnessV0).unwrap_err();
+        assert!(
+            format!("{err}").contains("NULLDUMMY"),
+            "expected NULLDUMMY, got {err}"
+        );
+        // Empty dummy 0-of-0 succeeds (CMS pushes true), then need true top — CMS pushes 1.
+        let script_ok = vec![0x00, 0x00, 0x00, 0xae]; // empty dummy, m=0, n=0, CMS
+        eval(&script_ok, SigVersion::WitnessV0).expect("0-of-0 empty dummy");
     }
 
     /// BIP112: OP_CSV is a no-op when tx.nVersion < 2 (even if softfork active).

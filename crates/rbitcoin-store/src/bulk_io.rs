@@ -1,10 +1,9 @@
 //! Bulk table IO via **io_uring** (Linux): pipelined preads and pwrites so the
 //! kernel can keep many independent ops in flight.
 //!
-//! Used by archive head-resolve (`probe → idx → body_txid`), confirm load body
-//! batches, and **page-grouped `tx.head` insert** (read page → mutate → write-back).
-//! Completions are unordered within a submit batch; callers apply a
-//! depth-aware / id-aligned state machine after each wave.
+//! Used by archive head-resolve (`probe → idx → body_txid`) and confirm load
+//! body batches. Completions are unordered within a submit batch; callers apply
+//! a depth-aware / id-aligned state machine after each wave.
 //!
 //! # Controls
 //!
@@ -43,6 +42,7 @@ pub struct WriteOp<'a> {
 }
 
 /// One page RMW slot for [`page_rmw_pipelined`]: pread into `buf`, apply, pwrite.
+#[allow(dead_code)]
 pub struct PageRmw<'a> {
     pub fd: RawFd,
     pub offset: u64,
@@ -150,6 +150,9 @@ pub fn pwrite_batch(ops: &mut [WriteOp<'_>]) {
 /// When `apply` returns `false` (clean / abort), that page is not written.
 ///
 /// On non-Linux or `RBITCOIN_IO_URING=0`, returns `false` immediately.
+///
+/// Kept as a reusable primitive (tests); `tx.head` insert is per-txid mmap path.
+#[allow(dead_code)]
 pub fn page_rmw_pipelined(
     pages: &mut [PageRmw<'_>],
     apply: impl FnMut(usize, &mut [u8]) -> bool,
@@ -677,6 +680,7 @@ fn pwrite_one(op: &mut WriteOp<'_>) {
 }
 
 /// Sequential page RMW (pread → apply → pwrite). Used when io_uring is off.
+#[allow(dead_code)]
 pub fn page_rmw_serial(
     pages: &mut [PageRmw<'_>],
     mut apply: impl FnMut(usize, &mut [u8]) -> bool,

@@ -5,46 +5,6 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 impl Query {
-    /// Resolve create maturity: `None` = not coinbase, `Some(h)` = coinbase height.
-    ///
-    /// Only true coinbases (1-in + null prev), not every 1-in tx. Prevout scan
-    /// skips script/witness. Confirm load no longer calls this on pin (structural
-    /// write resolves maturity); kept for RPC/tests and Full assemble callers.
-    #[allow(dead_code)] // pin path deferred coinbase to structural write
-    pub(crate) fn resolve_parent_coinbase_height(
-        &self,
-        fk: Fk,
-        input_count: u32,
-        body_range: Option<(u64, u64)>,
-    ) -> Result<Option<u32>, QueryError> {
-        if input_count != 1 {
-            return Ok(None);
-        }
-        if !self.parent_is_coinbase_at(fk, body_range)? {
-            return Ok(None);
-        }
-        Ok(self.store.tx_height.get(fk)?)
-    }
-
-    /// True if Class A body is a coinbase (1-in, null prevout). Prevout-only decode.
-    #[allow(dead_code)]
-    fn parent_is_coinbase_at(
-        &self,
-        fk: Fk,
-        body_range: Option<(u64, u64)>,
-    ) -> Result<bool, QueryError> {
-        let (meta, prevouts) = match body_range {
-            Some((off, len)) => self.store.get_tx_meta_and_prevouts_at(off, len)?,
-            None => self.store.get_tx_meta_and_prevouts(fk)?,
-        };
-        if meta.input_count != 1 {
-            return Ok(false);
-        }
-        Ok(prevouts
-            .first()
-            .is_some_and(|(fk, v)| fk.is_null() && *v == 0xffff_ffff))
-    }
-
     /// Body for wire rebuild / RPC.
     ///
     /// Prefer batch-local full decode from confirm load ([`BatchFullBodies`]);

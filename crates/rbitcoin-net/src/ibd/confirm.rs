@@ -113,10 +113,8 @@ const CONFIRM_RUN_MAX: usize = 32;
 const OFFER_AHEAD: u32 = 96;
 
 /// Loaded batches waiting for scripts (load can run ahead of scripts).
-/// Temporary experiment: balanced 5/5 with write (was load=8 write=2).
 pub(crate) const LOAD_QUEUE_CAP: usize = 5;
 /// Script-ok batches buffered for write (scripts(N+1) may run while N writes).
-/// Temporary experiment: 5 (was 2) so write backlog can absorb load/scripts bursts.
 pub(crate) const WRITE_QUEUE_CAP: usize = 5;
 
 /// Live depths of the two bounded confirm pipeline queues (0..=cap).

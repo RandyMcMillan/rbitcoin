@@ -748,10 +748,9 @@ mod tests {
             txr,
             outs,
             need.to_vec(),
-            Some(Some(5)),
+            Some(true),
             None,
             Vec::new(),
-            Some(5),
         );
         assert!(bp.pin_covered(Fk(77), &[0, 2]));
         assert!(!bp.pin_covered(Fk(77), &[0, 1]));

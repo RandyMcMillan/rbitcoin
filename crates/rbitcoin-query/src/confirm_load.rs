@@ -391,27 +391,21 @@ impl Query {
             if need_vouts.is_empty() {
                 continue;
             }
-            if let Some((create_h, tx, outs, cb_hint, body_range, sparse_rels)) =
+            if let Some((_create_h, tx, outs, cb_hint, body_range, sparse_rels)) =
                 body_hits.remove(&pid)
             {
                 st.pin_cache_body = st.pin_cache_body.saturating_add(1);
                 let live = slim_outs_to_need(outs, &need_vouts);
-                // Free coinbase hint only — never re-walk body / tx_height here.
-                let cb_stash = match cb_hint {
-                    Some(true) => Some(Some(create_h)),
-                    Some(false) => Some(None),
-                    None => None,
-                };
-                // FIFO: create height + optional spender layout for write spentness.
+                // Coinbase flag only — write re-reads Class C height (authority).
+                // FIFO: optional spender layout for write spentness/annotate.
                 batch_parents.insert_owned(
                     fk,
                     tx,
                     live,
                     need_vouts,
-                    cb_stash,
+                    cb_hint,
                     body_range,
                     sparse_rels,
-                    Some(create_h),
                 );
                 st.utxo_parents = st.utxo_parents.saturating_add(1);
                 continue;
@@ -519,22 +513,21 @@ impl Query {
                     let live = slim_dense_outs_to_need(&outs, &need_vouts);
                     let sparse = crate::batch_parents::sparse_spender_rels(&dense_rels, &need_vouts);
                     // Cheap coinbase: multi-in ⇒ not cb. Single-in left unknown.
-                    let cb_stash = if tx.input_count != 1 {
-                        Some(None)
+                    let cb = if tx.input_count != 1 {
+                        Some(false)
                     } else {
                         None
                     };
                     fifo_seed.push((fk, 0, tx.clone(), outs, range, dense_rels));
-                    // pin_new: body layout for write spentness; create height deferred.
+                    // pin_new: body layout for write spentness/annotate.
                     batch_parents.insert_owned(
                         fk,
                         tx,
                         live,
                         need_vouts,
-                        cb_stash,
+                        cb,
                         range,
                         sparse,
-                        None,
                     );
                     st.full_tx_reads = st.full_tx_reads.saturating_add(1);
                     if fifo_seed.len() >= FIFO_FLUSH {

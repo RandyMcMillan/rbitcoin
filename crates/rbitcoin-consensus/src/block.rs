@@ -1154,9 +1154,8 @@ pub(crate) fn structural_validate_spends(
     }
     let spent_ns = t_spent.elapsed().as_nanos() as u64;
 
-    // ── Create height + coinbase maturity (durable Class C, not pin heights) ─
-    // Pin may stash coinbase *flag* (multi-in ⇒ not cb) but heights always come
-    // from bulk `tx_height` re-read — pin heights are not authority.
+    // ── Create height + coinbase maturity (durable Class C) ───────────────
+    // Pin may stash coinbase *flag* only; heights from bulk `tx_height` pread.
     let t_create = Instant::now();
     let unique_create_fks: Vec<rbitcoin_primitives::Fk> = {
         let mut v: Vec<rbitcoin_primitives::Fk> = vouts_by_create
@@ -1193,12 +1192,12 @@ pub(crate) fn structural_validate_spends(
         let durable_h = height_by_id.get(&id).copied().unwrap_or(0);
 
         // Proven non-coinbase (multi-in pin): height only.
-        if batch_parents.get_parent_coinbase_height(create_fk) == Some(None) {
+        if batch_parents.get_parent_coinbase(create_fk) == Some(false) {
             create_height_by_fk.insert(create_fk, durable_h);
             continue;
         }
-        // Proven coinbase (archive path): maturity from durable height.
-        if let Some(Some(_)) = batch_parents.get_parent_coinbase_height(create_fk) {
+        // Proven coinbase: maturity from durable Class C height (not pin).
+        if batch_parents.get_parent_coinbase(create_fk) == Some(true) {
             if durable_h > 0 && ctx.height.0 < durable_h.saturating_add(maturity) {
                 return Err(ConsensusError::BadTx("coinbase immature"));
             }
@@ -1660,10 +1659,21 @@ fn coinbase_info(
         // 1-in parent in one spending tx).
         return Ok((h.is_some(), h));
     }
-    // Batch pin may stash coinbase height (no tx_height / input-run disk).
-    if let Some(cached) = batch_parents.get_parent_coinbase_height(prev_fk) {
-        cache.insert(prev_fk, cached);
-        return Ok((cached.is_some(), cached));
+    // Batch pin may stash coinbase *flag* only (heights from durable Class C).
+    if let Some(is_cb) = batch_parents.get_parent_coinbase(prev_fk) {
+        if !is_cb {
+            cache.insert(prev_fk, None);
+            return Ok((false, None));
+        }
+        let h = query
+            .store()
+            .tx_height
+            .get(prev_fk)
+            .map_err(ConsensusError::Store)?;
+        if h.is_some() {
+            cache.insert(prev_fk, h);
+        }
+        return Ok((true, h));
     }
     if prev_rec.input_count != 1 {
         cache.insert(prev_fk, None);

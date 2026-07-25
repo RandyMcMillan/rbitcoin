@@ -12,6 +12,9 @@
 //! **Spentness / annotate layout:** optional packed `body_range` + per-need-vout
 //! relative offsets of the 9-byte durable spender meta so write structural can
 //! bulk-pread and spend annotate can skip per-create idx.
+//!
+//! Create **heights** are not stashed here — write re-reads Class C `tx_height`
+//! (authority). Pin may only stash coinbase **flag** (multi-in ⇒ not coinbase).
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};
@@ -26,15 +29,14 @@ pub struct ParentEntry {
     /// Vouts fully spent-filtered for this batch (wave skips durable re-check).
     /// Sorted unique (from pin need_vouts).
     pub checked: Vec<u32>,
-    /// Coinbase maturity: `None` unset; `Some(None)` not cb; `Some(Some(h))` height.
-    pub coinbase_height: Option<Option<u32>>,
+    /// Coinbase flag: `None` unknown; `Some(false)` not cb; `Some(true)` is cb.
+    /// Height always comes from durable `tx_height` on write, not from pin.
+    pub coinbase: Option<bool>,
     /// Packed Class A `(body_off, body_len)` when known (pin_new / FIFO).
     pub body_range: Option<(u64, u64)>,
     /// Sorted unique `(vout, rel)` for need vouts when layout known.
     /// `abs = body_off + rel` is the 9-byte spender meta.
     pub spender_rels: Vec<(u32, u32)>,
-    /// Create block height when known from pin (FIFO `CreateOuts.height`).
-    pub create_height: Option<u32>,
 }
 
 /// Spent-filtered parents for **one** confirm batch (load → write).
@@ -72,10 +74,9 @@ impl BatchParents {
         tx: TxRecord,
         live: Vec<(u32, OutputRecord)>,
         checked: Vec<u32>,
-        coinbase_height: Option<Option<u32>>,
+        coinbase: Option<bool>,
         body_range: Option<(u64, u64)>,
         spender_rels: Vec<(u32, u32)>,
-        create_height: Option<u32>,
     ) {
         let Some(id) = fk.get() else {
             return;
@@ -86,10 +87,9 @@ impl BatchParents {
                 tx,
                 outs: live,
                 checked,
-                coinbase_height,
+                coinbase,
                 body_range,
                 spender_rels,
-                create_height,
             },
         );
     }
@@ -101,17 +101,16 @@ impl BatchParents {
         tx: TxRecord,
         live: &[(u32, OutputRecord)],
         checked: &[u32],
-        coinbase_height: Option<Option<u32>>,
+        coinbase: Option<bool>,
     ) {
         self.insert_owned(
             fk,
             tx,
             live.to_vec(),
             checked.to_vec(),
-            coinbase_height,
+            coinbase,
             None,
             Vec::new(),
-            None,
         );
     }
 
@@ -127,20 +126,16 @@ impl BatchParents {
         self.by_fk.get(&id).map(|e| e.tx.clone())
     }
 
-    pub fn get_parent_coinbase_height(&self, fk: Fk) -> Option<Option<u32>> {
+    /// Coinbase flag from pin when known (`None` = write must resolve).
+    pub fn get_parent_coinbase(&self, fk: Fk) -> Option<bool> {
         let id = fk.get()?;
-        self.by_fk.get(&id)?.coinbase_height
+        self.by_fk.get(&id)?.coinbase
     }
 
     /// Packed body `(off, len)` when known.
     pub fn get_body_range(&self, fk: Fk) -> Option<(u64, u64)> {
         let id = fk.get()?;
         self.by_fk.get(&id)?.body_range
-    }
-
-    /// Absolute body start when known.
-    pub fn get_body_off(&self, fk: Fk) -> Option<u64> {
-        self.get_body_range(fk).map(|(off, _)| off)
     }
 
     /// Absolute 9-byte spender meta offset for `vout`, if layout known.
@@ -150,12 +145,6 @@ impl BatchParents {
         let (off, _) = e.body_range?;
         let i = e.spender_rels.binary_search_by_key(&vout, |(v, _)| *v).ok()?;
         Some(off.saturating_add(u64::from(e.spender_rels[i].1)))
-    }
-
-    /// Create height stashed at pin (FIFO height), if known.
-    pub fn get_create_height(&self, fk: Fk) -> Option<u32> {
-        let id = fk.get()?;
-        self.by_fk.get(&id)?.create_height
     }
 
     pub fn has_parent_out(&self, fk: Fk, vout: u32) -> bool {
@@ -264,16 +253,15 @@ mod tests {
             tx(7),
             &[(0, out(10)), (1, out(20))],
             &[0, 1],
-            Some(None),
+            Some(false),
         );
         assert!(bp.pin_covered(Fk(7), &[0, 1]));
         let (t, o) = bp.get_parent_out(Fk(7), 0).unwrap();
         assert_eq!(t.txid[0], 7);
         assert_eq!(o.value, 10);
-        assert_eq!(bp.get_parent_coinbase_height(Fk(7)), Some(None));
+        assert_eq!(bp.get_parent_coinbase(Fk(7)), Some(false));
         assert_eq!(bp.len(), 1);
         assert!(bp.get_body_range(Fk(7)).is_none());
-        assert!(bp.get_create_height(Fk(7)).is_none());
     }
 
     #[test]
@@ -285,16 +273,15 @@ mod tests {
             tx(9),
             live,
             vec![0, 1, 2],
-            Some(Some(3)),
+            Some(true),
             Some((1000, 200)),
             vec![(0, 50), (1, 70), (2, 90)],
-            Some(3),
         );
         assert!(bp.pin_covered(Fk(9), &[0, 1, 2]));
         assert!(!bp.has_parent_out(Fk(9), 1)); // spent-filtered, not live
         assert_eq!(bp.get_spender_abs(Fk(9), 2), Some(1090));
         assert_eq!(bp.get_body_range(Fk(9)), Some((1000, 200)));
-        assert_eq!(bp.get_create_height(Fk(9)), Some(3));
+        assert_eq!(bp.get_parent_coinbase(Fk(9)), Some(true));
     }
 
     #[test]
@@ -308,9 +295,26 @@ mod tests {
             None,
             None,
             Vec::new(),
-            None,
         );
         assert!(bp.pin_covered(Fk(1), &[0, 2]));
         assert!(!bp.pin_covered(Fk(1), &[0, 1]));
+    }
+
+    /// Pin stores coinbase *flag* only — no create-height field on the entry.
+    #[test]
+    fn parent_entry_has_no_create_height_field() {
+        let e = ParentEntry {
+            tx: tx(1),
+            outs: vec![(0, out(1))],
+            checked: vec![0],
+            coinbase: Some(true),
+            body_range: Some((10, 20)),
+            spender_rels: vec![(0, 4)],
+        };
+        // Compile-time surface: only coinbase flag + layout, not stashed height.
+        assert_eq!(e.coinbase, Some(true));
+        assert_eq!(e.body_range, Some((10, 20)));
+        let fields = std::mem::size_of_val(&e.coinbase);
+        assert_eq!(fields, std::mem::size_of::<Option<bool>>());
     }
 }

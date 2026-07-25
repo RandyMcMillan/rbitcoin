@@ -504,6 +504,8 @@ impl TableFile {
     }
 
     /// Atomic little-endian `u32` load (Acquire). Head probe path.
+    /// Single-slot load (tests / diagnostics). Prefer bulk [`Self::read_at`] for pages.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn load_u32_le(&self, offset: u64) -> Result<u32, StoreError> {
         if offset % 4 != 0 {
             return Err(StoreError::Corrupt("load_u32 unaligned"));
@@ -525,7 +527,8 @@ impl TableFile {
         Ok(v)
     }
 
-    /// Atomic little-endian `u64` load (Acquire). Head probe path.
+    /// Atomic little-endian `u64` load (Acquire). Tests / single-slot diagnostics.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn load_u64_le(&self, offset: u64) -> Result<u64, StoreError> {
         if offset % 8 != 0 {
             return Err(StoreError::Corrupt("load_u64 unaligned"));

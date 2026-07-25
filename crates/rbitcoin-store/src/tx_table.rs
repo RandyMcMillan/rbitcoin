@@ -1177,13 +1177,14 @@ impl TxTable {
 
         // Snapshot head geometry + fd under a **brief** read lock, then drop.
         // Holding `head.read()` for the whole batch starves resize swap.
-        let (bits, entry_bytes, head_fd, head_pub, head_path, head_slots) = {
+        // Cap page preads to **slot region** (not published_len — that includes footer).
+        let (bits, entry_bytes, head_fd, slot_region, head_path, head_slots) = {
             let head = self.head.read().unwrap();
             (
                 head.bits(),
                 head.entry_bytes(),
                 head.read_fd(),
-                head.published_len(),
+                head.slot_region_len(),
                 head.path_str().to_path_buf(),
                 head.slots(),
             )
@@ -1203,7 +1204,7 @@ impl TxTable {
         let t_probe = Instant::now();
         let wants: Vec<usize> = txids
             .iter()
-            .map(|t| page_pread_len(t, bits, es, head_slots, head_pub))
+            .map(|t| page_pread_len(t, bits, es, head_slots, slot_region))
             .collect();
         let offs: Vec<u64> = txids
             .iter()
@@ -1241,6 +1242,9 @@ impl TxTable {
                 });
             }
             bulk_io::pread_batch(&mut read_ops);
+            // Syscall batch is a compiler barrier; Acquire pairs with sole-writer
+            // Release stores the same way mmap load_page_slots does.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
             for (ro, &(key_i, want, a)) in read_ops.iter().zip(spans.iter()) {
                 if ro.result < 0 {
                     return Err(StoreError::io(
@@ -1251,11 +1255,17 @@ impl TxTable {
                 let got = (ro.result as usize).min(want);
                 let esz = es as usize;
                 let n = (got / esz) * esz;
+                if n < esz {
+                    continue;
+                }
                 let buf = &arena[a..a + n];
                 let txid = &txids[key_i];
                 let h1p = h1_in_page(txid, bits);
                 let h2p = h2_in_page(txid, bits);
-                let scan = hop_scan_page(buf, es, h1p, h2p, page_slots, MAX_PROBE);
+                // Use slots present in this buffer (not nominal page_slots) so a
+                // short pread never double-hashes past the end of `buf`.
+                let nslots = (n / esz) as u64;
+                let scan = hop_scan_page(buf, es, h1p, h2p, nslots.min(page_slots), MAX_PROBE);
                 for &(d, fk) in &scan.cands {
                     cands_by_key[key_i].push((d, fk));
                     cands_total = cands_total.saturating_add(1);
@@ -2976,6 +2986,111 @@ mod tests {
             assert!(raw.len() >= fo + 9);
             assert_eq!(&raw[fo..fo + 8], &[0u8; 8]);
         }
+    }
+
+    /// All page-local head paths agree: insert_many, probe_fks, single resolve,
+    /// batch resolve, BIP30 depth-win, and post-resize lookup.
+    #[test]
+    fn page_local_head_paths_insert_probe_batch_resize() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-page-paths-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // BITS=12 → multi-page table (2^12 slots, 1024/page) so page select matters.
+        let t = create_bits(&dir, 12);
+        assert_eq!(t.head_bits(), 12);
+        assert!(t.head_slots() > crate::address_head::PAGE_SLOTS);
+
+        let mk = |i: u64, txid: [u8; 32]| {
+            let rec = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![(i & 0xff) as u8],
+                witness: vec![],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+            (rec, inputs, outputs)
+        };
+
+        // Distinct txids across pages + one BIP30 pair.
+        let mut keys = Vec::new();
+        for i in 1..=40u64 {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            txid[8] = 0xa1;
+            keys.push(txid);
+            let _ = t.put_full_batch_indexed(&[mk(i, txid)], true).unwrap();
+        }
+        // BIP30: second create for keys[0].
+        let bip = keys[0];
+        let fk_old = t.get_fk_by_txid(&bip).unwrap().unwrap();
+        let fk_new = t.put_full_batch_indexed(&[mk(100, bip)], true).unwrap()[0];
+        assert!(fk_new.0 > fk_old.0);
+
+        // Single resolve matches batch; BIP30 prefers deeper (newer).
+        assert_eq!(t.get_fk_by_txid(&bip).unwrap(), Some(fk_new));
+        let batch = t.get_fk_by_txid_batch(&keys).unwrap();
+        assert_eq!(batch.len(), keys.len());
+        for (txid, fk) in &batch {
+            let single = t.get_fk_by_txid(txid).unwrap();
+            assert_eq!(*fk, single, "batch/single mismatch for {txid:?}");
+        }
+        assert_eq!(
+            batch.iter().find(|(t, _)| *t == bip).unwrap().1,
+            Some(fk_new)
+        );
+
+        // probe_fks lists older then newer; reverse body-verify wins newest.
+        let cands = t.head.read().unwrap().probe_fks(&bip).unwrap();
+        assert!(cands.contains(&fk_old) && cands.contains(&fk_new));
+        assert_eq!(cands[0], fk_old);
+
+        // Online resize shadow fill must preserve all mappings.
+        t.start_head_resize(crate::address_head::HeadLayout::new(13).unwrap())
+            .unwrap();
+        wait_head_resize_done(&t, Duration::from_secs(15));
+        assert_eq!(t.head_bits(), 13);
+        for txid in &keys {
+            assert!(
+                t.get_fk_by_txid(txid).unwrap().is_some(),
+                "missing after resize"
+            );
+        }
+        assert_eq!(t.get_fk_by_txid(&bip).unwrap(), Some(fk_new));
+        let batch2 = t.get_fk_by_txid_batch(&keys).unwrap();
+        for ((_, a), (_, b)) in batch.iter().zip(batch2.iter()) {
+            assert_eq!(a, b);
+        }
+
+        // Reopen path (footer layout + page probes).
+        drop(t);
+        let t2 = TxTable::open(&dir).unwrap();
+        assert_eq!(t2.head_bits(), 13);
+        assert_eq!(t2.get_fk_by_txid(&bip).unwrap(), Some(fk_new));
+        for txid in &keys {
+            assert_eq!(
+                t2.get_fk_by_txid(txid).unwrap(),
+                t2.get_fk_by_txid_batch(&[*txid]).unwrap()[0].1
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// After fast head insert (no write-time BIP30 displace), sole lookup must

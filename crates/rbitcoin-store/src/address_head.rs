@@ -356,14 +356,17 @@ pub fn hop_scan_page(
     }
 }
 
-/// Bytes to pread for the full probe page of `txid` (entry-aligned, published-capped).
+/// Bytes to pread for the full probe page of `txid`.
+///
+/// Caps to the **slot data region** (`slot_region_len` = `slots × entry_bytes`),
+/// never into the trailing footer.
 #[inline]
 pub fn page_pread_len(
     txid: &[u8; 32],
     bits: u32,
     entry_bytes: u8,
     table_slots: u64,
-    published_len: u64,
+    slot_region_len: u64,
 ) -> usize {
     let base = if bits <= PAGE_SLOT_BITS {
         0
@@ -373,7 +376,9 @@ pub fn page_pread_len(
     let nslots = page_slot_count(bits).min(table_slots.saturating_sub(base));
     let want = nslots.saturating_mul(u64::from(entry_bytes));
     let off = entry_file_off(base, entry_bytes);
-    let avail = published_len.saturating_sub(off);
+    let avail = slot_region_len.saturating_sub(off);
+    // Entry-align so hop_scan never sees a torn trailing slot.
+    let avail = (avail / u64::from(entry_bytes)) * u64::from(entry_bytes);
     want.min(avail) as usize
 }
 
@@ -627,7 +632,11 @@ impl AddressHead {
         entry_file_off(slot, self.layout.entry_bytes)
     }
 
-    /// Read one open-address entry (0 = empty). Used by sequential and bulk probe.
+    /// Read one open-address entry (0 = empty).
+    ///
+    /// Hot path uses [`Self::load_page_slots`] (one page `read_at`). This remains
+    /// for tests and rare single-slot diagnostics.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn read_entry(&self, slot: u64) -> Result<u64, StoreError> {
         let off = self.entry_off(slot);
         match self.layout.entry_bytes {
@@ -639,10 +648,14 @@ impl AddressHead {
 
     /// Load a full probe page starting at global `page_base` into `buf`.
     ///
-    /// **One** `read_at` of `n_slots × entry_bytes` (4 KiB @ 4 B / 1024 slots) —
+    /// **One** `read_at` of up to `n_slots × entry_bytes` (4 KiB @ 4 B / 1024 slots) —
     /// not 1024 individual `load_u32` pins (that made resize fill CPU-bound at
-    /// ~O(page_slots) per insert). Acquire fence so concurrent probes observe
-    /// prior sole-writer Release stores after the bulk copy.
+    /// ~O(page_slots) per insert). Caps to the slot data region (excludes trailing
+    /// footer). Acquire fence so concurrent probes observe prior sole-writer
+    /// Release stores after the bulk copy.
+    ///
+    /// Returns bytes filled (multiple of entry size). Callers must pass the
+    /// corresponding slot count into [`hop_scan_page`] (`bytes / entry_bytes`).
     fn load_page_slots(
         &self,
         page_base: u64,
@@ -654,11 +667,19 @@ impl AddressHead {
             return Err(StoreError::Corrupt("address head entry_bytes"));
         }
         let n = n_slots as usize;
-        let need = n.saturating_mul(es);
+        let mut need = n.saturating_mul(es);
         if need > buf.len() {
             return Err(StoreError::Corrupt("probe page buffer short"));
         }
         let off = self.entry_off(page_base);
+        // Never read into the trailing footer — only the create_fk slot array.
+        let data_end = self.file.data_len();
+        let avail = data_end.saturating_sub(off) as usize;
+        need = need.min(avail);
+        need = (need / es) * es;
+        if need == 0 {
+            return Ok(0);
+        }
         self.file.read_at(off, &mut buf[..need])?;
         // Pair with sole-writer Release stores + SeqCst fence after insert_many.
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
@@ -671,10 +692,16 @@ impl AddressHead {
         self.file.read_fd()
     }
 
-    /// Published head file length (bounds bulk reads).
+    /// Full published file length (slot body + trailing footer).
     #[inline]
     pub(crate) fn published_len(&self) -> u64 {
         self.file.logical_len()
+    }
+
+    /// Slot-array byte length only (excludes trailing footer) — batch pread cap.
+    #[inline]
+    pub(crate) fn slot_region_len(&self) -> u64 {
+        self.file.data_len()
     }
 
     #[inline]
@@ -734,7 +761,15 @@ impl AddressHead {
         let h2 = h2_in_page(txid, bits);
         let mut buf = [0u8; PROBE_REGION_BYTES];
         let n = self.load_page_slots(page_base, page_slots, &mut buf)?;
-        let scan = hop_scan_page(&buf[..n], es, h1, h2, page_slots, MAX_PROBE);
+        let es_u = es as usize;
+        if n < es_u {
+            note_probe_exhausted();
+            return Err(StoreError::Corrupt("address head probe page empty"));
+        }
+        // Slot count actually present in the loaded buffer (may be < page_slots
+        // only if the slot region is truncated — normal tables always fill).
+        let nslots = (n / es_u) as u64;
+        let scan = hop_scan_page(&buf[..n], es, h1, h2, nslots, MAX_PROBE);
         for &(_d, e) in &scan.cands {
             if e == new_u {
                 return Ok(());
@@ -796,7 +831,12 @@ impl AddressHead {
         let h2p = h2_in_page(txid, bits);
         let mut buf = [0u8; PROBE_REGION_BYTES];
         let n = self.load_page_slots(page_base, page_slots, &mut buf)?;
-        let scan = hop_scan_page(&buf[..n], es, h1p, h2p, page_slots, MAX_PROBE);
+        let es_u = es as usize;
+        if n < es_u {
+            return Ok(Vec::new());
+        }
+        let nslots = (n / es_u) as u64;
+        let scan = hop_scan_page(&buf[..n], es, h1p, h2p, nslots, MAX_PROBE);
         Ok(scan.cands.into_iter().map(|(_, e)| Fk(e)).collect())
     }
 
@@ -1224,18 +1264,24 @@ mod tests {
         let n = h
             .load_page_slots(page_base, page_slots, &mut bulk)
             .unwrap();
-        assert_eq!(n, (page_slots as usize) * es as usize);
+        let nslots = (n / es as usize) as u64;
+        assert!(nslots > 0);
+        assert_eq!(n, (nslots as usize) * es as usize);
+        // Full first page for a normal create (slot region only — no footer bytes).
+        assert_eq!(nslots, page_slots.min(h.slots()));
 
-        for local in 0..page_slots {
+        for local in 0..nslots {
             let slot = page_base + local;
             let expected = h.read_entry(slot).unwrap();
             let from_bulk = entry_from_page_buf(&bulk[..n], local, es).unwrap_or(0);
-            // empty slots: entry_from_page_buf returns Some(0)
             assert_eq!(
                 from_bulk, expected,
                 "slot {slot} bulk={from_bulk} serial={expected}"
             );
         }
+        // Slot region must not extend into trailing footer.
+        assert_eq!(h.slot_region_len(), h.slots() * u64::from(es));
+        assert!(h.published_len() > h.slot_region_len());
         // Probe path still finds inserts.
         for (txid, fk) in &entries {
             assert!(

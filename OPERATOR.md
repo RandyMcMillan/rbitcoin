@@ -2,9 +2,11 @@
 
 ## Status
 
-**Plan P0–P7 complete** (BIP324 v2-only P2P, cluster mempool, Libre admission, Electrum
-confirmed + unconfirmed; TLS via reverse proxy). Mainnet full validation (`--milestone 0`) is
-still **experimental**: exercise soak, reorgs, and disk headroom before production use.
+BIP324 v2-only P2P, cluster mempool (Libre admission + **consensus script checks on accept**),
+Electrum confirmed + unconfirmed (TLS via reverse proxy). **Mainnet is experimental** — see
+[`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md). Soak reorgs and disk headroom
+before any serious use. Default mainnet **`--milestone 840000` skips script/sig checks** at/below
+that height; use `--milestone 0` for full scripts.
 
 Architecture: **archive-before-confirm** — block bodies land in Class A as peers
 deliver them; tip **confirm** (Class C) walks contiguous archived runs. Download

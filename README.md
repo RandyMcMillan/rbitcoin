@@ -1,25 +1,22 @@
 # rbitcoin
 
-Bitcoin full node in Rust (active track: **blocks-only consensus + IBD + block relay + Electrum serve**):
+**Experimental** Bitcoin full node in Rust: multi-peer IBD, tip follow, block/tx relay (tip mode), and in-process Electrum.
 
 - **rust-bitcoin** types and protocol primitives at the edges
 - **libbitcoin-class** concurrent relational mmap archive for chain storage
-- **Historical blocks via reconstruct** from the archive (tip wire ring only for non-finalized soft zone)
+- **Historical blocks via reconstruct** from the archive (tip wire ring for soft zone)
 - **Post-IBD durability** (epoch finalize + tip wire ring) per [`libbitcoin-durable-archive-variant.md`](./libbitcoin-durable-archive-variant.md)
-- **Electrum protocol** clients (confirmed history; in-process TCP server)
-- **No pruning, no GUI**
-- **Deferred:** full mempool/policy, fee estimation quality, descriptor wallets, mining GBT
-- **High-level functional/integration tests** (scenarios + multi-node); coverage scripts available
+- **Electrum** TCP (confirmed + unconfirmed when mempool attached); TLS via reverse proxy
+- **Libre-class mempool** (cluster, full RBF, 0.1 sat/vB min; **scripts verified on accept**)
+- **No** pruning, GUI, wallet, or mining
 
-See [`IMPLEMENTATION-PLAN.md`](./IMPLEMENTATION-PLAN.md) for the roadmap and current status, and [`docs/concurrency.md`](./docs/concurrency.md) for store/IBD write roles.
+**Not** a production Bitcoin Core or Fulcrum replacement. See [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
 
 ## Status
 
-**Phases 0–7 core complete** (store, consensus, P2P IBD, tip follow, durability, scripthash, Electrum TCP).
+Core pipelines exist (store, consensus, P2P IBD, tip follow, scripthash, Electrum). **Mainnet is experimental** — signet lab first ([`OPERATOR.md`](./OPERATOR.md)).
 
-**Public-chain IBD:** experimental — not production-ready for full mainnet. Follow the ladder in [`OPERATOR.md`](./OPERATOR.md): **signet lab first**, then mainnet experimental.
-
-**Milestone policy:** at/below `--milestone`, **script/sig checks are skipped**; prevouts and spend marking still run on tip confirm.
+**Milestone (default mainnet 840000):** at/below `--milestone`, **script/sig checks are skipped** on block connect (assumevalid-style speed tradeoff). Prevouts, double-spend, maturity, and fees still run. Use **`--milestone 0`** for full script validation.
 
 ```bash
 # Signet lab (time-boxed)

@@ -637,8 +637,12 @@ impl AddressHead {
         }
     }
 
-    /// Load a full probe page starting at global `page_base` into `buf` (Acquire
-    /// loads). Returns bytes filled.
+    /// Load a full probe page starting at global `page_base` into `buf`.
+    ///
+    /// **One** `read_at` of `n_slots × entry_bytes` (4 KiB @ 4 B / 1024 slots) —
+    /// not 1024 individual `load_u32` pins (that made resize fill CPU-bound at
+    /// ~O(page_slots) per insert). Acquire fence so concurrent probes observe
+    /// prior sole-writer Release stores after the bulk copy.
     fn load_page_slots(
         &self,
         page_base: u64,
@@ -646,20 +650,19 @@ impl AddressHead {
         buf: &mut [u8],
     ) -> Result<usize, StoreError> {
         let es = self.layout.entry_bytes as usize;
+        if es != 4 && es != 8 {
+            return Err(StoreError::Corrupt("address head entry_bytes"));
+        }
         let n = n_slots as usize;
         let need = n.saturating_mul(es);
-        debug_assert!(need <= buf.len());
-        let mut filled = 0usize;
-        for i in 0..n {
-            let e = self.read_entry(page_base + i as u64)?;
-            match es {
-                4 => buf[filled..filled + 4].copy_from_slice(&(e as u32).to_le_bytes()),
-                8 => buf[filled..filled + 8].copy_from_slice(&e.to_le_bytes()),
-                _ => return Err(StoreError::Corrupt("address head entry_bytes")),
-            }
-            filled += es;
+        if need > buf.len() {
+            return Err(StoreError::Corrupt("probe page buffer short"));
         }
-        Ok(filled)
+        let off = self.entry_off(page_base);
+        self.file.read_at(off, &mut buf[..need])?;
+        // Pair with sole-writer Release stores + SeqCst fence after insert_many.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        Ok(need)
     }
 
     /// FD for bulk io_uring / pread of head entries.
@@ -1194,6 +1197,54 @@ mod tests {
             Ok(_) => panic!("expected error opening v7 directory"),
         }
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Bulk page load must match per-slot reads (regression: load_page_slots
+    /// used to call load_u32 once per slot — ~1024× cost on every insert/probe).
+    #[test]
+    fn load_page_slots_matches_per_slot_reads() {
+        let path = tmp("page_bulk");
+        let h = AddressHead::create_with_bits(&path, 14).unwrap();
+        // Pack many inserts so some pages are multi-occupied.
+        let mut entries = Vec::new();
+        for i in 1..=200u64 {
+            let mut txid = [0u8; 32];
+            txid[0] = (i & 0xff) as u8;
+            txid[1] = ((i >> 8) & 0xff) as u8;
+            txid[2] = 0xee;
+            entries.push((txid, Fk(i)));
+        }
+        h.insert_many(&entries).unwrap();
+
+        let es = h.entry_bytes();
+        let page_slots = page_slot_count(h.bits());
+        // Page 0 for bits=14 is the whole table when bits<=10; for 14 use page 0.
+        let page_base = 0u64;
+        let mut bulk = [0u8; PROBE_REGION_BYTES];
+        let n = h
+            .load_page_slots(page_base, page_slots, &mut bulk)
+            .unwrap();
+        assert_eq!(n, (page_slots as usize) * es as usize);
+
+        for local in 0..page_slots {
+            let slot = page_base + local;
+            let expected = h.read_entry(slot).unwrap();
+            let from_bulk = entry_from_page_buf(&bulk[..n], local, es).unwrap_or(0);
+            // empty slots: entry_from_page_buf returns Some(0)
+            assert_eq!(
+                from_bulk, expected,
+                "slot {slot} bulk={from_bulk} serial={expected}"
+            );
+        }
+        // Probe path still finds inserts.
+        for (txid, fk) in &entries {
+            assert!(
+                h.probe_fks(txid).unwrap().contains(fk),
+                "missing {fk:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(meta_path(&path));
     }
 
     #[test]

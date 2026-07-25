@@ -153,6 +153,10 @@ pub fn confirm_load_phase(
     let t_work = Instant::now();
 
     // Decode bodies once, pin parents + thin edges (batch-local).
+    // Residency after this returns / after wire:
+    //   • pin_new dense outs live only in process OutFifo (not on the batch)
+    //   • BatchParents holds need-vouts only (rides load→scripts→write queues)
+    //   • BatchFullBodies (creates) is used for wire then dropped — not queued
     let t_load = Instant::now();
     let (batch_parents, batch_thin, batch_bodies) =
         load_confirm_batch(query, &heights, &items, batch_end)?;
@@ -166,7 +170,11 @@ pub fn confirm_load_phase(
         Ordering::Relaxed,
     );
 
+    // Wire rebuild needs full create Class A; free it before assemble so the
+    // queued LoadedBatch does not retain create full-bodies (only wire blocks).
     let wire_blocks = wire_rebuild(query, &metas, &batch_bodies)?;
+    drop(batch_bodies);
+
     let prepared = assemble_run(
         query,
         params,
@@ -176,6 +184,8 @@ pub fn confirm_load_phase(
         &batch_parents,
         &batch_thin,
     )?;
+    // batch_thin only needed for assemble; drop before queue handoff.
+    drop(batch_thin);
 
     let work_ns = t_work.elapsed().as_nanos() as u64;
     Ok(ConfirmLoadOutcome {

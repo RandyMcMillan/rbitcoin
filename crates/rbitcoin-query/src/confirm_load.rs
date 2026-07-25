@@ -462,13 +462,18 @@ impl Query {
                 bulk_slot_for_job.insert(job_i, slot);
             }
 
-            // Full dense outs for OutFifo (hit rate); BatchParents only need slim.
+            // Residency after each parent is processed:
+            //   • dense outs → OutFifo only (process cache; not on LoadedBatch)
+            //   • need-vouts → BatchParents only (rides load→scripts→write queue)
+            // Flush FIFO seed in sub-batches so we never hold bulk_decoded *and*
+            // a full-chunk fifo_seed of dense outs at once.
+            const FIFO_FLUSH: usize = 256;
             let mut fifo_seed: Vec<(
                 Fk,
                 u32,
                 rbitcoin_store::TxRecord,
                 Vec<rbitcoin_store::OutputRecord>,
-            )> = Vec::with_capacity(jobs.len());
+            )> = Vec::with_capacity(FIFO_FLUSH);
 
             for (ji, (pid, need_vouts, range)) in jobs.into_iter().enumerate() {
                 if self.confirm_cancelled() {
@@ -476,30 +481,38 @@ impl Query {
                     return Err(StoreError::Cancelled("confirm cancelled"));
                 }
                 let fk = Fk(pid);
-                if range.is_some() {
-                    if !need_vouts.is_empty() {
-                        if let Some(&slot) = bulk_slot_for_job.get(&ji) {
-                            if let Some((tx, outs)) = bulk_decoded[slot].take() {
-                                let live = slim_dense_outs_to_need(&outs, &need_vouts);
-                                // Seed FIFO with **all** outs before consuming dense vec.
-                                fifo_seed.push((fk, 0, tx.clone(), outs));
-                                batch_parents.insert_owned(fk, tx, live, need_vouts, None);
-                                st.full_tx_reads = st.full_tx_reads.saturating_add(1);
-                            }
-                        }
+                let dense = if range.is_some() {
+                    if need_vouts.is_empty() {
+                        None
+                    } else {
+                        bulk_slot_for_job
+                            .get(&ji)
+                            .and_then(|&slot| bulk_decoded[slot].take())
                     }
                 } else if !need_vouts.is_empty() {
-                    if let Ok((tx, outs)) = self.store.get_tx_meta_and_outputs(fk) {
-                        let live = slim_dense_outs_to_need(&outs, &need_vouts);
-                        fifo_seed.push((fk, 0, tx.clone(), outs));
-                        batch_parents.insert_owned(fk, tx, live, need_vouts, None);
-                        st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+                    self.store.get_tx_meta_and_outputs(fk).ok()
+                } else {
+                    None
+                };
+
+                if let Some((tx, outs)) = dense {
+                    // Clone only the few need-vouts for the batch; move dense → FIFO.
+                    let live = slim_dense_outs_to_need(&outs, &need_vouts);
+                    fifo_seed.push((fk, 0, tx.clone(), outs));
+                    batch_parents.insert_owned(fk, tx, live, need_vouts, None);
+                    st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+                    if fifo_seed.len() >= FIFO_FLUSH {
+                        self.confirm_parents
+                            .put_dense_outs_batch(std::mem::take(&mut fifo_seed));
                     }
                 }
                 st.utxo_parents = st.utxo_parents.saturating_add(1);
             }
-            // One lock for the chunk: future pin batches hit these parents.
-            self.confirm_parents.put_dense_outs_batch(fifo_seed);
+            if !fifo_seed.is_empty() {
+                self.confirm_parents.put_dense_outs_batch(fifo_seed);
+            }
+            // Drop any leftover decoded dense outs (should be none if all taken).
+            drop(bulk_decoded);
         }
         st.pin_new_meta_ns = st
             .pin_new_meta_ns
@@ -570,7 +583,10 @@ fn slim_outs_to_need(
         .collect()
 }
 
-/// Dense `outs[vout]` → sparse need list (clone).
+/// Dense `outs[vout]` → sparse need list (clone of need only).
+///
+/// Caller should move `outs` into OutFifo after this so the only residual
+/// batch-local copies of scripts are the need-vouts in [`BatchParents`].
 fn slim_dense_outs_to_need(
     outs: &[rbitcoin_store::OutputRecord],
     need: &[u32],
@@ -582,6 +598,29 @@ fn slim_dense_outs_to_need(
         }
     }
     live
+}
+
+#[cfg(test)]
+mod pin_new_residency_tests {
+    use super::slim_dense_outs_to_need;
+    use rbitcoin_store::OutputRecord;
+
+    #[test]
+    fn slim_does_not_retain_unneeded_vouts() {
+        let dense = vec![
+            OutputRecord::unspent(1, vec![1; 64]),
+            OutputRecord::unspent(2, vec![2; 64]),
+            OutputRecord::unspent(3, vec![3; 256]), // large unneeded
+        ];
+        let live = slim_dense_outs_to_need(&dense, &[0, 1]);
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[0].1.script.len(), 64);
+        assert_eq!(live[1].1.script.len(), 64);
+        // dense still owned by caller for FIFO; after move to FIFO only need stays in batch.
+        assert_eq!(dense.len(), 3);
+        let _fifo = dense; // move away — batch would only keep `live`
+        assert_eq!(live.len(), 2);
+    }
 }
 
 #[cfg(test)]

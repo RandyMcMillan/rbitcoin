@@ -31,6 +31,9 @@ pub(crate) use classify::is_anyone_can_spend;
 /// P2TR key-path / nested). Interpreter paths own a cache for the script eval so
 /// multi-CHECKSIG (multisig) reuses midstate. Signet-heavy path is 1-input txs —
 /// that case avoids the multi-input loop overhead.
+///
+/// On failure, [`ConsensusError::Script`] messages are annotated with `txid=` and
+/// `vin=` so IBD logs name the failing spend (batch-first height alone is not enough).
 pub(crate) fn verify_job_all_inputs(job: &ScriptCheckJob) -> Result<(), ConsensusError> {
     use bitcoin::sighash::SighashCache;
     let tx = &job.tx;
@@ -40,12 +43,24 @@ pub(crate) fn verify_job_all_inputs(job: &ScriptCheckJob) -> Result<(), Consensu
     }
     let mut cache = SighashCache::new(tx);
     if n == 1 {
-        return verify_input(job, 0, tx, &mut cache);
+        return verify_input(job, 0, tx, &mut cache)
+            .map_err(|e| annotate_script_err(e, tx, 0));
     }
     for ii in 0..n {
-        verify_input(job, ii, tx, &mut cache)?;
+        verify_input(job, ii, tx, &mut cache).map_err(|e| annotate_script_err(e, tx, ii))?;
     }
     Ok(())
+}
+
+/// Append `txid=… vin=…` to script errors for operator diagnosis.
+fn annotate_script_err(err: ConsensusError, tx: &Transaction, input_index: usize) -> ConsensusError {
+    match err {
+        ConsensusError::Script(msg) if !msg.contains("txid=") => {
+            let txid = tx.compute_txid();
+            ConsensusError::Script(format!("{msg} txid={txid} vin={input_index}"))
+        }
+        other => other,
+    }
 }
 
 /// Verify one input: classify `scriptPubKey`, then typed path or interpreter.

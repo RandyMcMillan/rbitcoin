@@ -367,7 +367,11 @@ pub(crate) fn spawn_confirm_engine(
                         loop_stats_sc
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
-                        warn!("ibd: confirm scripts reject @ {height}: {e}");
+                        // `e` may include `txid=… vin=…` from script verify annotation.
+                        // Height/hash here are batch-first (not necessarily the failing block).
+                        warn!(
+                            "ibd: confirm scripts reject @ {height} (batch first {hash}): {e}"
+                        );
                         let _ = event_tx_sc.send(ConfirmEvent::Reject {
                             height,
                             hash,

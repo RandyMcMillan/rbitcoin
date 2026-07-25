@@ -84,7 +84,18 @@ fn p2wpkh_bad_signature_rejects() {
     sig[n - 2] ^= 0xff;
     let pk = job.tx.input[0].witness.nth(1).unwrap().to_vec();
     job.tx.input[0].witness = Witness::from_slice(&[sig.as_slice(), pk.as_slice()]);
-    assert!(script::verify_job_all_inputs(&job).is_err());
+    let err = script::verify_job_all_inputs(&job).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("p2wpkh ecdsa"),
+        "expected ecdsa failure, got {msg}"
+    );
+    // Operator diagnosis: failing spend identity on IBD logs.
+    let txid = job.tx.compute_txid();
+    assert!(
+        msg.contains(&format!("txid={txid}")) && msg.contains("vin=0"),
+        "expected txid/vin annotation, got {msg}"
+    );
 }
 
 #[test]

@@ -4,7 +4,7 @@ use crate::cache::BlockCache;
 use crate::error::NetError;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
-use bitcoin::{Block, BlockHash, Work};
+use bitcoin::{Block, BlockHash, Transaction, Work};
 use std::sync::RwLock;
 use rbitcoin_consensus::{
     accept_and_archive_block, accept_and_connect_block, confirm_archived_run,
@@ -537,6 +537,8 @@ impl ChainHub {
     }
 
     fn disconnect_to(&self, keep_height: u32) -> Result<(), NetError> {
+        // Collect disconnected block bodies for mempool re-accept (best-effort).
+        let mut disconnected_txs: Vec<Transaction> = Vec::new();
         loop {
             let tip = match self.query.tip_height() {
                 Some(h) => h.0,
@@ -544,6 +546,11 @@ impl ChainHub {
             };
             if tip <= keep_height {
                 break;
+            }
+            if let Ok(Some(b)) = self.block_at_height(tip) {
+                for tx in b.txdata.iter().skip(1) {
+                    disconnected_txs.push(tx.clone());
+                }
             }
             if let Some(th) = self.tip_hash() {
                 self.confirmed.write().unwrap().remove(&th);
@@ -553,6 +560,17 @@ impl ChainHub {
                 .map_err(|e| NetError::Consensus(e.to_string()))?;
         }
         self.cache.truncate_to_height(keep_height);
+        if let Some(mp) = self.mempool() {
+            if !disconnected_txs.is_empty() {
+                let n = mp.reorg_reaccept(&disconnected_txs);
+                if n > 0 {
+                    rbitcoin_log::debug!(
+                        "mempool: re-accepted {n}/{} tx(s) after reorg disconnect to {keep_height}",
+                        disconnected_txs.len()
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

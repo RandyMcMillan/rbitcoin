@@ -709,7 +709,8 @@ pub(crate) fn eval_script(
                     }
                     0xb2 => {
                         // OP_CHECKSEQUENCEVERIFY (BIP112). Pre-activation: NOP.
-                        if !ctx.bip112_active {
+                        // Core: also a no-op when tx.nVersion < 2 (even if softfork active).
+                        if !ctx.bip112_active || ctx.tx.version.0 < 2 {
                             continue;
                         }
                         require_n(stack, 1)?;
@@ -759,7 +760,7 @@ pub(crate) fn eval_script(
 }
 
 fn sequence_csv_ok(seq: Sequence, csv: u32) -> bool {
-    // BIP112 simplified: require tx version >= 2 handled by caller chain; sequence comparison.
+    // BIP112 sequence comparison (tx.nVersion >= 2 checked at opcode).
     let seq_n = seq.to_consensus_u32();
     if seq_n & (1 << 31) != 0 {
         return false; // SEQUENCE_LOCKTIME_DISABLE_FLAG on input
@@ -1528,5 +1529,67 @@ mod success_and_disabled_tests {
                 "0x{code:02x}: {msg}"
             );
         }
+    }
+
+    /// BIP112: OP_CSV is a no-op when tx.nVersion < 2 (even if softfork active).
+    #[test]
+    fn csv_nop_when_tx_version_below_2() {
+        // Script: push 1, CSV, DROP, OP_TRUE — fails on v2 with seq=0, succeeds as NOP on v1.
+        let script_bytes = [0x51u8, 0xb2, 0x75, 0x51]; // 1 CSV DROP TRUE
+        let script = Script::from_bytes(&script_bytes);
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }];
+        let mk = |ver: i32| Transaction {
+            version: bitcoin::transaction::Version(ver),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::from_consensus(0), // would fail real CSV
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        // v1: CSV is NOP → script ends with TRUE
+        let tx1 = mk(1);
+        let ctx1 = EvalContext::new_with_flags(
+            &tx1,
+            0,
+            Amount::from_sat(50_000),
+            &prevouts,
+            script,
+            SigVersion::Base,
+            true,
+            true, // bip112 active
+            true,
+        );
+        let mut stack1 = Vec::new();
+        assert!(eval_script(script, &mut stack1, &ctx1).unwrap());
+        require_true_top(&stack1).expect("v1 CSV nop leaves TRUE");
+
+        // v2: CSV enforces → fails with seq=0 vs csv=1
+        let tx2 = mk(2);
+        let ctx2 = EvalContext::new_with_flags(
+            &tx2,
+            0,
+            Amount::from_sat(50_000),
+            &prevouts,
+            script,
+            SigVersion::Base,
+            true,
+            true,
+            true,
+        );
+        let mut stack2 = Vec::new();
+        let err = eval_script(script, &mut stack2, &ctx2).unwrap_err();
+        assert!(
+            format!("{err}").contains("CSV"),
+            "v2 should enforce CSV, got {err}"
+        );
     }
 }

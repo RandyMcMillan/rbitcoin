@@ -391,7 +391,9 @@ impl Query {
             if need_vouts.is_empty() {
                 continue;
             }
-            if let Some((create_h, tx, outs, cb_hint)) = body_hits.remove(&pid) {
+            if let Some((create_h, tx, outs, cb_hint, body_off, sparse_rels)) =
+                body_hits.remove(&pid)
+            {
                 st.pin_cache_body = st.pin_cache_body.saturating_add(1);
                 let live = slim_outs_to_need(outs, &need_vouts);
                 // Free coinbase hint only — never re-walk body / tx_height here.
@@ -400,7 +402,17 @@ impl Query {
                     Some(false) => Some(None),
                     None => None,
                 };
-                batch_parents.insert_owned(fk, tx, live, need_vouts, cb_stash);
+                // FIFO: create height + optional spender layout for write spentness.
+                batch_parents.insert_owned(
+                    fk,
+                    tx,
+                    live,
+                    need_vouts,
+                    cb_stash,
+                    body_off,
+                    sparse_rels,
+                    Some(create_h),
+                );
                 st.utxo_parents = st.utxo_parents.saturating_add(1);
                 continue;
             }
@@ -473,6 +485,8 @@ impl Query {
                 u32,
                 rbitcoin_store::TxRecord,
                 Vec<rbitcoin_store::OutputRecord>,
+                Option<u64>,
+                Vec<u32>,
             )> = Vec::with_capacity(FIFO_FLUSH);
 
             for (ji, (pid, need_vouts, range)) in jobs.into_iter().enumerate() {
@@ -490,16 +504,33 @@ impl Query {
                             .and_then(|&slot| bulk_decoded[slot].take())
                     }
                 } else if !need_vouts.is_empty() {
-                    self.store.get_tx_meta_and_outputs(fk).ok()
+                    // Rare: no idx range — content only, no spender layout.
+                    self.store.get_tx_meta_and_outputs(fk).ok().map(|(tx, outs)| {
+                        let mut outs = outs;
+                        rbitcoin_store::clear_output_spender_fields(&mut outs);
+                        (tx, outs, Vec::new())
+                    })
                 } else {
                     None
                 };
 
-                if let Some((tx, outs)) = dense {
+                if let Some((tx, outs, dense_rels)) = dense {
                     // Clone only the few need-vouts for the batch; move dense → FIFO.
                     let live = slim_dense_outs_to_need(&outs, &need_vouts);
-                    fifo_seed.push((fk, 0, tx.clone(), outs));
-                    batch_parents.insert_owned(fk, tx, live, need_vouts, None);
+                    let body_off = range.map(|(off, _)| off);
+                    let sparse = crate::batch_parents::sparse_spender_rels(&dense_rels, &need_vouts);
+                    fifo_seed.push((fk, 0, tx.clone(), outs, body_off, dense_rels));
+                    // pin_new: body layout for write spentness; create height deferred.
+                    batch_parents.insert_owned(
+                        fk,
+                        tx,
+                        live,
+                        need_vouts,
+                        None,
+                        body_off,
+                        sparse,
+                        None,
+                    );
                     st.full_tx_reads = st.full_tx_reads.saturating_add(1);
                     if fifo_seed.len() >= FIFO_FLUSH {
                         self.confirm_parents

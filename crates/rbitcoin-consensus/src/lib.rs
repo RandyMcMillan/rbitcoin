@@ -128,8 +128,10 @@ pub mod confirm_phase_stats {
     pub static SCRIPT_NS: AtomicU64 = AtomicU64::new(0);
     /// Post-script durable spentness + maturity + BIP68 + subsidy (write).
     pub static STRUCTURAL_NS: AtomicU64 = AtomicU64::new(0);
-    /// Spentness + coinbase maturity + create-height resolve (subset of structural).
+    /// Durable spentness probes only (subset of structural).
     pub static STRUCTURAL_SPENT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Create-height + coinbase maturity resolve (subset of structural).
+    pub static STRUCTURAL_CREATE_H_NS: AtomicU64 = AtomicU64::new(0);
     /// BIP68 relative locks + coin MTP (subset of structural; write path).
     pub static STRUCTURAL_BIP68_NS: AtomicU64 = AtomicU64::new(0);
     /// Class C wall (`confirm_blocks_run` total).
@@ -159,6 +161,7 @@ pub mod confirm_phase_stats {
     static LAST_WRITE_N: AtomicU64 = AtomicU64::new(0);
     static LAST_WRITE_STRUCTURAL_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_WRITE_SPENT_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_WRITE_CREATE_H_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_WRITE_BIP68_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_WRITE_CLASS_C_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_WRITE_SPEND_ANN_NS: AtomicU64 = AtomicU64::new(0);
@@ -172,6 +175,7 @@ pub mod confirm_phase_stats {
         pub wall_ns: u64,
         pub structural_ns: u64,
         pub spent_ns: u64,
+        pub create_h_ns: u64,
         pub bip68_ns: u64,
         pub class_c_ns: u64,
         pub spend_ann_ns: u64,
@@ -191,6 +195,7 @@ pub mod confirm_phase_stats {
         LAST_WRITE_WALL_NS.store(p.wall_ns, Ordering::Relaxed);
         LAST_WRITE_STRUCTURAL_NS.store(p.structural_ns, Ordering::Relaxed);
         LAST_WRITE_SPENT_NS.store(p.spent_ns, Ordering::Relaxed);
+        LAST_WRITE_CREATE_H_NS.store(p.create_h_ns, Ordering::Relaxed);
         LAST_WRITE_BIP68_NS.store(p.bip68_ns, Ordering::Relaxed);
         LAST_WRITE_CLASS_C_NS.store(p.class_c_ns, Ordering::Relaxed);
         LAST_WRITE_SPEND_ANN_NS.store(p.spend_ann_ns, Ordering::Relaxed);
@@ -203,6 +208,7 @@ pub mod confirm_phase_stats {
             wall_ns: LAST_WRITE_WALL_NS.load(Ordering::Relaxed),
             structural_ns: LAST_WRITE_STRUCTURAL_NS.load(Ordering::Relaxed),
             spent_ns: LAST_WRITE_SPENT_NS.load(Ordering::Relaxed),
+            create_h_ns: LAST_WRITE_CREATE_H_NS.load(Ordering::Relaxed),
             bip68_ns: LAST_WRITE_BIP68_NS.load(Ordering::Relaxed),
             class_c_ns: LAST_WRITE_CLASS_C_NS.load(Ordering::Relaxed),
             spend_ann_ns: LAST_WRITE_SPEND_ANN_NS.load(Ordering::Relaxed),
@@ -216,13 +222,14 @@ pub mod confirm_phase_stats {
     /// `(recon, wire, connect, script, class_c, strong, scripthash, tip,
     ///   utxo_apply, blocks, resolve, load, unpin, cache_tip,
     ///   spend_ranged, spend_idx, spend_skip, structural, structural_spent,
-    ///   structural_bip68)`.
+    ///   structural_create_h, structural_bip68)`.
     /// `strong` / `scripthash` / `tip` come from [`rbitcoin_query::class_c_phase_stats`].
     /// `recon` prefers wire sub-timer, else legacy total.
     /// `connect` is **load assemble**, not write structural — see `structural`.
     #[allow(clippy::type_complexity)]
     pub fn sample_and_reset()
     -> (
+        u64,
         u64,
         u64,
         u64,
@@ -268,6 +275,7 @@ pub mod confirm_phase_stats {
             SPEND_ANNOTATE_SKIP.swap(0, Ordering::Relaxed),
             STRUCTURAL_NS.swap(0, Ordering::Relaxed),
             STRUCTURAL_SPENT_NS.swap(0, Ordering::Relaxed),
+            STRUCTURAL_CREATE_H_NS.swap(0, Ordering::Relaxed),
             STRUCTURAL_BIP68_NS.swap(0, Ordering::Relaxed),
         )
     }

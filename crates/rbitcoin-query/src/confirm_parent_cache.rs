@@ -168,18 +168,21 @@ impl ConfirmParentCache {
     }
 
     /// Insert create outs into the FIFO (meta + outputs only; inputs used only for coinbase flag).
+    ///
+    /// Clears spender fields on outs. Layout (`body_off` / rels) unknown here.
     pub fn put_body(
         &self,
         fk: Fk,
         height: u32,
         tx: TxRecord,
-        outputs: Vec<OutputRecord>,
+        mut outputs: Vec<OutputRecord>,
         inputs: Vec<InputRecord>,
     ) {
         let Some(id) = fk.get() else {
             return;
         };
         let is_coinbase = is_coinbase_inputs(&tx, &inputs);
+        rbitcoin_store::clear_output_spender_fields(&mut outputs);
         let mut g = self.inner.lock().unwrap();
         let _ = g.outs.insert(
             id,
@@ -188,6 +191,8 @@ impl ConfirmParentCache {
                 tx,
                 outputs,
                 is_coinbase,
+                body_off: None,
+                spender_rels: Vec::new(),
             },
         );
     }
@@ -203,11 +208,12 @@ impl ConfirmParentCache {
             return;
         }
         let mut g = self.inner.lock().unwrap();
-        for (fk, height, tx, outputs, inputs) in items {
+        for (fk, height, tx, mut outputs, inputs) in items {
             let Some(id) = fk.get() else {
                 continue;
             };
             let is_coinbase = is_coinbase_inputs(&tx, &inputs);
+            rbitcoin_store::clear_output_spender_fields(&mut outputs);
             let _ = g.outs.insert(
                 id,
                 CreateOuts {
@@ -215,6 +221,8 @@ impl ConfirmParentCache {
                     tx,
                     outputs,
                     is_coinbase,
+                    body_off: None,
+                    spender_rels: Vec::new(),
                 },
             );
         }
@@ -223,6 +231,9 @@ impl ConfirmParentCache {
     /// Outs FIFO put from batch-local full bodies (load → wire keeps full Class A
     /// separately). Clones **all** outs (not need-vouts only) so later batches
     /// that spend other vouts of the same create hit the FIFO.
+    ///
+    /// Body layout not recorded here (wire decode path); pin_new re-seeds with
+    /// offsets when cold parents are loaded later.
     pub fn put_bodies_from_batch_full(&self, bodies: &crate::BatchFullBodies) {
         if bodies.is_empty() {
             return;
@@ -233,13 +244,17 @@ impl ConfirmParentCache {
                 continue;
             };
             let is_coinbase = is_coinbase_inputs(tx, inputs);
+            let mut outputs = outs.to_vec();
+            rbitcoin_store::clear_output_spender_fields(&mut outputs);
             let _ = g.outs.insert(
                 id,
                 CreateOuts {
                     height,
                     tx: tx.clone(),
-                    outputs: outs.to_vec(), // dense: full output_count
+                    outputs,
                     is_coinbase,
+                    body_off: None,
+                    spender_rels: Vec::new(),
                 },
             );
         }
@@ -248,19 +263,28 @@ impl ConfirmParentCache {
     /// Seed FIFO with dense outs from pin_new store loads (no inputs available).
     ///
     /// `is_coinbase` is false when unknown (1-in without prevout scan); maturity
-    /// still runs in structural write. Callers must pass **all** outs, not slim.
+    /// still runs in structural write. Callers must pass **all** outs, not slim,
+    /// plus `body_off` + dense `spender_rels` from packed decode.
     pub fn put_dense_outs_batch(
         &self,
-        items: Vec<(Fk, u32, TxRecord, Vec<OutputRecord>)>,
+        items: Vec<(
+            Fk,
+            u32,
+            TxRecord,
+            Vec<OutputRecord>,
+            Option<u64>,
+            Vec<u32>,
+        )>,
     ) {
         if items.is_empty() {
             return;
         }
         let mut g = self.inner.lock().unwrap();
-        for (fk, height, tx, outputs) in items {
+        for (fk, height, tx, mut outputs, body_off, spender_rels) in items {
             let Some(id) = fk.get() else {
                 continue;
             };
+            rbitcoin_store::clear_output_spender_fields(&mut outputs);
             // Without inputs we cannot prove coinbase; leave false (structural
             // write still does maturity). Multi-in is never coinbase.
             let _ = g.outs.insert(
@@ -270,6 +294,8 @@ impl ConfirmParentCache {
                     tx,
                     outputs,
                     is_coinbase: false,
+                    body_off,
+                    spender_rels,
                 },
             );
         }
@@ -296,11 +322,22 @@ impl ConfirmParentCache {
 
     /// Slim pin hits under **one** lock: only clone requested outs + tx meta.
     ///
-    /// Returns `id → (create_height, tx, outs, coinbase_hint)`.
+    /// Returns
+    /// `id → (create_height, tx, outs, coinbase_hint, body_off, sparse_spender_rels)`.
     pub fn get_bodies_for_pin_batch(
         &self,
         items: &[(u64, &[u32])],
-    ) -> HashMap<u64, (u32, TxRecord, Vec<(u32, OutputRecord)>, Option<bool>)> {
+    ) -> HashMap<
+        u64,
+        (
+            u32,
+            TxRecord,
+            Vec<(u32, OutputRecord)>,
+            Option<bool>,
+            Option<u64>,
+            Vec<(u32, u32)>,
+        ),
+    > {
         if items.is_empty() {
             return HashMap::new();
         }
@@ -323,7 +360,18 @@ impl ConfirmParentCache {
             } else {
                 Some(false)
             };
-            out.insert(id, (e.height, e.tx.clone(), outs, cb_hint));
+            let sparse = crate::batch_parents::sparse_spender_rels(&e.spender_rels, vouts);
+            out.insert(
+                id,
+                (
+                    e.height,
+                    e.tx.clone(),
+                    outs,
+                    cb_hint,
+                    e.body_off,
+                    sparse,
+                ),
+            );
         }
         out
     }
@@ -681,20 +729,31 @@ mod tests {
         );
         let need = [0u32, 2];
         let mut hits = c.get_bodies_for_pin_batch(&[(77, &need)]);
-        let (h, txr, outs, cb) = hits.remove(&77).expect("hit");
+        let (h, txr, outs, cb, body_off, rels) = hits.remove(&77).expect("hit");
         assert_eq!(h, 5);
         assert_eq!(txr.txid, t.txid);
         assert_eq!(outs.len(), 2);
         assert_eq!(outs[0].0, 0);
         assert_eq!(outs[1].0, 2);
         assert_eq!(cb, Some(true));
+        assert!(body_off.is_none());
+        assert!(rels.is_empty());
         // FIFO still holds all three outs for a later need of vout 1.
         let need1 = [1u32];
         let hits1 = c.get_bodies_for_pin_batch(&[(77, &need1)]);
         assert_eq!(hits1.get(&77).unwrap().2.len(), 1);
         assert_eq!(hits1.get(&77).unwrap().2[0].0, 1);
         let mut bp = crate::BatchParents::new();
-        bp.insert_owned(Fk(77), txr, outs, need.to_vec(), Some(Some(5)));
+        bp.insert_owned(
+            Fk(77),
+            txr,
+            outs,
+            need.to_vec(),
+            Some(Some(5)),
+            None,
+            Vec::new(),
+            Some(5),
+        );
         assert!(bp.pin_covered(Fk(77), &[0, 2]));
         assert!(!bp.pin_covered(Fk(77), &[0, 1]));
     }
@@ -710,12 +769,17 @@ mod tests {
             0,
             t.clone(),
             vec![out(1), out(2), out(3), out(4)],
+            Some(5000),
+            vec![10, 30, 50, 70],
         )]);
         assert_eq!(c.body_count(), 1);
         // Later batch needs a different vout than first pin — must still hit.
         let hits = c.get_bodies_for_pin_batch(&[(90, &[3u32][..])]);
-        assert_eq!(hits.get(&90).unwrap().2.len(), 1);
-        assert_eq!(hits.get(&90).unwrap().2[0].1.value, 4);
+        let e = hits.get(&90).unwrap();
+        assert_eq!(e.2.len(), 1);
+        assert_eq!(e.2[0].1.value, 4);
+        assert_eq!(e.4, Some(5000));
+        assert_eq!(e.5, vec![(3, 70)]);
         // And all four still addressable.
         let hits_all = c.get_bodies_for_pin_batch(&[(90, &[0u32, 1, 2, 3][..])]);
         assert_eq!(hits_all.get(&90).unwrap().2.len(), 4);

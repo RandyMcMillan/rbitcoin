@@ -64,8 +64,9 @@ pub use store::Store;
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};
 pub use head_resolve_stats::Sample as HeadResolveSample;
 pub use tx_table::{
-    encode_packed_tx, is_packed_tx_payload, scan_packed_meta_and_prevouts, InputRecord,
-    OutputRecord, TxRecord, PACKED_TX_V1,
+    clear_output_spender_fields, decode_packed_tx_outs_with_spender_rels, encode_packed_tx,
+    is_packed_tx_payload, scan_packed_meta_and_prevouts, InputRecord, OutputRecord, TxRecord,
+    PACKED_TX_V1,
 };
 
 /// Crate identity for diagnostics and coverage scenarios.

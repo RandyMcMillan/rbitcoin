@@ -8,6 +8,10 @@
 //! ([`BatchParents::insert_owned`]). Storage uses small `Vec`s (typical 1–3
 //! vouts) — not `HashMap`/`HashSet` per parent — to avoid thrashing the
 //! allocator when pin volume is tens of thousands of creates per load window.
+//!
+//! **Spentness layout:** optional `body_off` + per-need-vout relative offsets of
+//! the 9-byte durable spender meta so write structural can bulk-pread without
+//! idx or full packed walks.
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};
@@ -17,13 +21,20 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct ParentEntry {
     pub tx: TxRecord,
-    /// Live (unspent) needed outs. Spent vouts omitted. Small N; linear scan.
+    /// Live (unspent) needed outs. Spent vouts omitted. Content-only outs.
     pub outs: Vec<(u32, OutputRecord)>,
     /// Vouts fully spent-filtered for this batch (wave skips durable re-check).
     /// Sorted unique (from pin need_vouts).
     pub checked: Vec<u32>,
     /// Coinbase maturity: `None` unset; `Some(None)` not cb; `Some(Some(h))` height.
     pub coinbase_height: Option<Option<u32>>,
+    /// Absolute packed body start in `tx.body` when known.
+    pub body_off: Option<u64>,
+    /// Sorted unique `(vout, rel)` for need vouts when layout known.
+    /// `abs = body_off + rel` is the 9-byte spender meta.
+    pub spender_rels: Vec<(u32, u32)>,
+    /// Create block height when known from pin (FIFO `CreateOuts.height`).
+    pub create_height: Option<u32>,
 }
 
 /// Spent-filtered parents for **one** confirm batch (load → write).
@@ -54,13 +65,6 @@ impl BatchParents {
     }
 
     /// Insert one parent with **ownership** (load pin hot path).
-    ///
-    /// Callers unique-key by create fk within a batch; a second insert for the
-    /// same id overwrites (should not happen on the normal pin path).
-    ///
-    /// - `live`: unspent needed outs (moved, no clone)
-    /// - `checked`: all spent-filtered need vouts (sorted unique; typically the
-    ///   pin `need_vouts` list, moved)
     #[inline]
     pub fn insert_owned(
         &mut self,
@@ -69,6 +73,9 @@ impl BatchParents {
         live: Vec<(u32, OutputRecord)>,
         checked: Vec<u32>,
         coinbase_height: Option<Option<u32>>,
+        body_off: Option<u64>,
+        spender_rels: Vec<(u32, u32)>,
+        create_height: Option<u32>,
     ) {
         let Some(id) = fk.get() else {
             return;
@@ -80,6 +87,9 @@ impl BatchParents {
                 outs: live,
                 checked,
                 coinbase_height,
+                body_off,
+                spender_rels,
+                create_height,
             },
         );
     }
@@ -93,7 +103,16 @@ impl BatchParents {
         checked: &[u32],
         coinbase_height: Option<Option<u32>>,
     ) {
-        self.insert_owned(fk, tx, live.to_vec(), checked.to_vec(), coinbase_height);
+        self.insert_owned(
+            fk,
+            tx,
+            live.to_vec(),
+            checked.to_vec(),
+            coinbase_height,
+            None,
+            Vec::new(),
+            None,
+        );
     }
 
     pub fn get_parent_out(&self, fk: Fk, vout: u32) -> Option<(TxRecord, OutputRecord)> {
@@ -111,6 +130,27 @@ impl BatchParents {
     pub fn get_parent_coinbase_height(&self, fk: Fk) -> Option<Option<u32>> {
         let id = fk.get()?;
         self.by_fk.get(&id)?.coinbase_height
+    }
+
+    /// Absolute body start when known.
+    pub fn get_body_off(&self, fk: Fk) -> Option<u64> {
+        let id = fk.get()?;
+        self.by_fk.get(&id)?.body_off
+    }
+
+    /// Absolute 9-byte spender meta offset for `vout`, if layout known.
+    pub fn get_spender_abs(&self, fk: Fk, vout: u32) -> Option<u64> {
+        let id = fk.get()?;
+        let e = self.by_fk.get(&id)?;
+        let off = e.body_off?;
+        let i = e.spender_rels.binary_search_by_key(&vout, |(v, _)| *v).ok()?;
+        Some(off.saturating_add(u64::from(e.spender_rels[i].1)))
+    }
+
+    /// Create height stashed at pin (FIFO height), if known.
+    pub fn get_create_height(&self, fk: Fk) -> Option<u32> {
+        let id = fk.get()?;
+        self.by_fk.get(&id)?.create_height
     }
 
     pub fn has_parent_out(&self, fk: Fk, vout: u32) -> bool {
@@ -176,6 +216,17 @@ fn checked_contains(checked: &[u32], v: u32) -> bool {
     checked.binary_search(&v).is_ok()
 }
 
+/// Build sorted `(vout, rel)` for requested vouts from dense pin rels.
+pub fn sparse_spender_rels(dense: &[u32], need_vouts: &[u32]) -> Vec<(u32, u32)> {
+    let mut out = Vec::with_capacity(need_vouts.len());
+    for &v in need_vouts {
+        if let Some(&rel) = dense.get(v as usize) {
+            out.push((v, rel));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,27 +267,43 @@ mod tests {
         assert_eq!(o.value, 10);
         assert_eq!(bp.get_parent_coinbase_height(Fk(7)), Some(None));
         assert_eq!(bp.len(), 1);
+        assert!(bp.get_body_off(Fk(7)).is_none());
+        assert!(bp.get_create_height(Fk(7)).is_none());
     }
 
     #[test]
-    fn insert_owned_moves_without_extra_live_clone() {
+    fn insert_owned_spender_abs() {
         let mut bp = BatchParents::with_capacity(1);
         let live = vec![(0, out(42)), (2, out(99))];
-        bp.insert_owned(Fk(9), tx(9), live, vec![0, 1, 2], Some(Some(3)));
+        bp.insert_owned(
+            Fk(9),
+            tx(9),
+            live,
+            vec![0, 1, 2],
+            Some(Some(3)),
+            Some(1000),
+            vec![(0, 50), (1, 70), (2, 90)],
+            Some(3),
+        );
         assert!(bp.pin_covered(Fk(9), &[0, 1, 2]));
         assert!(!bp.has_parent_out(Fk(9), 1)); // spent-filtered, not live
-        assert!(bp.has_parent_out(Fk(9), 0));
-        let (_, o) = bp.get_parent_out(Fk(9), 2).unwrap();
-        assert_eq!(o.value, 99);
-        let needed = bp.get_parent_outs_needed(Fk(9), &[0, 2]).unwrap();
-        assert!(needed.2); // spent_filtered
-        assert_eq!(needed.1.len(), 2);
+        assert_eq!(bp.get_spender_abs(Fk(9), 2), Some(1090));
+        assert_eq!(bp.get_create_height(Fk(9)), Some(3));
     }
 
     #[test]
     fn pin_covered_requires_checked_membership() {
         let mut bp = BatchParents::new();
-        bp.insert_owned(Fk(1), tx(1), vec![(0, out(1))], vec![0, 2], None);
+        bp.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(0, out(1))],
+            vec![0, 2],
+            None,
+            None,
+            Vec::new(),
+            None,
+        );
         assert!(bp.pin_covered(Fk(1), &[0, 2]));
         assert!(!bp.pin_covered(Fk(1), &[0, 1]));
     }

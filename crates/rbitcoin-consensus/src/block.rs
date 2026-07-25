@@ -529,7 +529,7 @@ pub fn validate_block_connect(
     }
     // Structural: re-walk with durable spentness (fresh pending for this single block).
     let mut structural_pending = std::collections::HashSet::new();
-    structural_validate_spends(
+    let _ = structural_validate_spends(
         query,
         block,
         ctx,
@@ -963,6 +963,17 @@ fn check_coinbase_subsidy(
     Ok(())
 }
 
+/// Local wall times for one block's structural pass (write path diagnostics).
+///
+/// Measured with `Instant` — **not** deltas of window atomics (those race with
+/// `sample_and_reset` mid-batch and produced false `spent=0` on slow writes).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StructuralPhaseNs {
+    pub spent_ns: u64,
+    pub create_h_ns: u64,
+    pub bip68_ns: u64,
+}
+
 /// Post-script structural checks: durable spentness, maturity, BIP68, coinbase subsidy.
 ///
 /// Runs in height order on the write path (after scripts). `pending_spent` is
@@ -970,6 +981,9 @@ fn check_coinbase_subsidy(
 ///
 /// **BIP68** create-height / coin-MTP IO lives here (not optimistic load assemble)
 /// so confirm load does not walk `tx_height` for every parent.
+///
+/// **Spentness:** prefer pin-stashed absolute 9-byte spender offsets + one
+/// bulk io_uring pread; fall back to body-range / idx for cold parents.
 pub(crate) fn structural_validate_spends(
     query: &Query,
     block: &Block,
@@ -984,74 +998,237 @@ pub(crate) fn structural_validate_spends(
     fees: i64,
     pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
     batch_parents: &rbitcoin_query::BatchParents,
-) -> Result<(), ConsensusError> {
-    use crate::confirm_phase_stats;
-    use std::sync::atomic::Ordering;
+) -> Result<StructuralPhaseNs, ConsensusError> {
+    use std::collections::{HashMap, HashSet};
     use std::time::Instant;
 
-    let mut coinbase_height_cache: std::collections::HashMap<
-        rbitcoin_primitives::Fk,
-        Option<u32>,
-    > = std::collections::HashMap::with_capacity(64);
-    // create_fk → create height (BIP68), filled while walking spends.
-    let mut create_height_by_fk: std::collections::HashMap<rbitcoin_primitives::Fk, u32> =
-        std::collections::HashMap::with_capacity(spends.len().min(256));
+    let mut coinbase_height_cache: HashMap<rbitcoin_primitives::Fk, Option<u32>> =
+        HashMap::with_capacity(64);
+    // create_fk → create height (BIP68), filled in create-height phase.
+    let mut create_height_by_fk: HashMap<rbitcoin_primitives::Fk, u32> =
+        HashMap::with_capacity(spends.len().min(256));
     let maturity = ctx.params.coinbase_maturity();
     let cache = query.confirm_parent_cache();
 
+    // ── Spentness (durable + same-run pending) ─────────────────────────────
     let t_spent = Instant::now();
+
+    // Unique create_fk → sorted unique vouts.
+    let mut vouts_by_create: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut null_create_keys: Vec<([u8; 32], u32)> = Vec::new();
+    for &(prev_txid, vout, _sfk, create_fk) in spends {
+        if create_fk.is_null() {
+            null_create_keys.push((prev_txid, vout));
+            continue;
+        }
+        if let Some(id) = create_fk.get() {
+            vouts_by_create.entry(id).or_default().push(vout);
+        }
+    }
+    for vouts in vouts_by_create.values_mut() {
+        vouts.sort_unstable();
+        vouts.dedup();
+    }
+
+    // Partition: pin-layout absolute offsets (bulk 9-byte pread) vs cold fallback.
+    // abs_jobs: (create_id, vout, abs_off)
+    let mut abs_jobs: Vec<(u64, u32, u64)> = Vec::with_capacity(spends.len());
+    let mut fallback_by_create: HashMap<u64, Vec<u32>> = HashMap::new();
+    for (id, vouts) in &vouts_by_create {
+        let fk = rbitcoin_primitives::Fk(*id);
+        let mut cold: Vec<u32> = Vec::new();
+        for &v in vouts {
+            if let Some(abs) = batch_parents.get_spender_abs(fk, v) {
+                abs_jobs.push((*id, v, abs));
+            } else {
+                cold.push(v);
+            }
+        }
+        if !cold.is_empty() {
+            fallback_by_create.insert(*id, cold);
+        }
+    }
+
+    // Durable unspent: (create_id, vout) present ⇒ not confirmed-strong spent.
+    let mut durable_unspent: HashSet<(u64, u32)> = HashSet::with_capacity(spends.len());
+    let tip = query.tip_height().map(|h| h.0);
+
+    // Hot path: bulk 9-byte spender meta at pin offsets.
+    if !abs_jobs.is_empty() {
+        let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a)| *a).collect();
+        let metas = query
+            .store()
+            .get_spender_meta_at_abs_batch(&abs_offs)
+            .map_err(ConsensusError::Store)?;
+        for (i, &(id, vout, _)) in abs_jobs.iter().enumerate() {
+            let Some((multi, field)) = metas[i] else {
+                // Short/failed pread: treat as not live (fail closed).
+                continue;
+            };
+            if field.is_null() {
+                durable_unspent.insert((id, vout));
+                continue;
+            }
+            if multi {
+                // Rare multi-list: cold path for this one out.
+                fallback_by_create.entry(id).or_default().push(vout);
+                continue;
+            }
+            let strong = query
+                .store()
+                .is_confirmed_strong_at(field, tip)
+                .map_err(ConsensusError::Store)?;
+            if !strong {
+                durable_unspent.insert((id, vout));
+            }
+        }
+    }
+
+    // Cold: bulk idx ranges once, then unspent_create_vouts per create.
+    if !fallback_by_create.is_empty() {
+        let need_range: Vec<rbitcoin_primitives::Fk> = fallback_by_create
+            .keys()
+            .map(|id| rbitcoin_primitives::Fk(*id))
+            .collect();
+        let ranges = query
+            .store()
+            .tx_body_range_batch(&need_range)
+            .map_err(ConsensusError::Store)?;
+        let mut range_by_create: HashMap<u64, (u64, u64)> =
+            HashMap::with_capacity(need_range.len());
+        for (fk, opt) in need_range.iter().zip(ranges.into_iter()) {
+            if let (Some(id), Some(r)) = (fk.get(), opt) {
+                range_by_create.insert(id, r);
+            }
+        }
+        for (id, mut vouts) in fallback_by_create {
+            vouts.sort_unstable();
+            vouts.dedup();
+            let range = range_by_create.get(&id).copied();
+            let unspent = query
+                .store()
+                .unspent_create_vouts(rbitcoin_primitives::Fk(id), &vouts, range)
+                .map_err(ConsensusError::Store)?;
+            for v in unspent {
+                durable_unspent.insert((id, v));
+            }
+        }
+    }
+
+    // Null create_fk (rare): txid path, one probe each.
+    let mut durable_null_spent: HashSet<([u8; 32], u32)> = HashSet::new();
+    null_create_keys.sort_unstable();
+    null_create_keys.dedup();
+    for &(prev_txid, vout) in &null_create_keys {
+        if query
+            .store()
+            .has_confirmed_strong_spender(&prev_txid, vout)
+            .map_err(ConsensusError::Store)?
+        {
+            durable_null_spent.insert((prev_txid, vout));
+        }
+    }
+
+    // Order-sensitive pending double-spend + durable rejection.
     for &(prev_txid, vout, _spend_fk, create_fk) in spends {
         let key = (prev_txid, vout);
         if pending_spent.contains(&key) {
             return Err(ConsensusError::PrevoutSpent);
         }
-        // Durable confirmed-strong spender (always re-check; pin is not authority).
-        let spent = if !create_fk.is_null() {
-            query
-                .store()
-                .has_confirmed_strong_spender_create(create_fk, vout, None)
-                .map_err(ConsensusError::Store)?
+        let spent = if create_fk.is_null() {
+            durable_null_spent.contains(&key)
+        } else if let Some(id) = create_fk.get() {
+            // Missing from durable_unspent ⇒ confirmed-strong spent (or OOB).
+            !durable_unspent.contains(&(id, vout))
         } else {
-            query
-                .store()
-                .has_confirmed_strong_spender(&prev_txid, vout)
-                .map_err(ConsensusError::Store)?
+            false
         };
         if spent {
             return Err(ConsensusError::PrevoutSpent);
         }
-        // Coinbase maturity + record create height for BIP68 (same store work).
-        if !create_fk.is_null() {
-            let prev_rec = match batch_parents
-                .get_parent_tx(create_fk)
-                .or_else(|| cache.get_parent_tx(create_fk))
-            {
-                Some(r) => r,
-                None => query
-                    .get_tx_class_a(create_fk)
-                    .map_err(ConsensusError::Store)?,
-            };
-            let created = coinbase_height_for_maturity(
-                query,
-                create_fk,
-                &prev_rec,
-                batch_parents,
-                &mut coinbase_height_cache,
-            )?;
-            if let Some(ch) = created {
-                if ctx.height.0 < ch.saturating_add(maturity) {
-                    return Err(ConsensusError::BadTx("coinbase immature"));
-                }
-            }
-            let ch = create_height_for_fk(query, create_fk, created)?;
-            create_height_by_fk.insert(create_fk, ch);
-        }
         pending_spent.insert(key);
     }
-    confirm_phase_stats::STRUCTURAL_SPENT_NS
-        .fetch_add(t_spent.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let spent_ns = t_spent.elapsed().as_nanos() as u64;
 
-    // BIP68 relative sequence locks (CSV package). Create heights from above.
+    // ── Create height + coinbase maturity (prefer pin stashes) ─────────────
+    let t_create = Instant::now();
+    let mut seen_create: HashSet<u64> = HashSet::with_capacity(vouts_by_create.len());
+    for &(_ptid, _vout, _sfk, create_fk) in spends {
+        if create_fk.is_null() {
+            continue;
+        }
+        let Some(id) = create_fk.get() else {
+            continue;
+        };
+        if !seen_create.insert(id) {
+            continue;
+        }
+        // Already resolved (should not happen with seen_create).
+        if create_height_by_fk.contains_key(&create_fk) {
+            continue;
+        }
+
+        // Pin coinbase flag + height: skip store maturity / input walk.
+        if let Some(cb_opt) = batch_parents.get_parent_coinbase_height(create_fk) {
+            match cb_opt {
+                Some(ch) => {
+                    if ctx.height.0 < ch.saturating_add(maturity) {
+                        return Err(ConsensusError::BadTx("coinbase immature"));
+                    }
+                    create_height_by_fk.insert(create_fk, ch);
+                    continue;
+                }
+                None => {
+                    // Not a coinbase — BIP68 height from pin or tx_height only.
+                    let ch = if let Some(h) = batch_parents.get_create_height(create_fk) {
+                        h
+                    } else {
+                        query
+                            .store()
+                            .tx_height
+                            .get(create_fk)
+                            .map_err(ConsensusError::Store)?
+                            .unwrap_or(0)
+                    };
+                    create_height_by_fk.insert(create_fk, ch);
+                    continue;
+                }
+            }
+        }
+
+        // Pin create height without coinbase flag (pin_new): still need maturity.
+        let pin_ch = batch_parents.get_create_height(create_fk);
+        let prev_rec = match batch_parents
+            .get_parent_tx(create_fk)
+            .or_else(|| cache.get_parent_tx(create_fk))
+        {
+            Some(r) => r,
+            None => query
+                .get_tx_class_a(create_fk)
+                .map_err(ConsensusError::Store)?,
+        };
+        let created = coinbase_height_for_maturity(
+            query,
+            create_fk,
+            &prev_rec,
+            batch_parents,
+            &mut coinbase_height_cache,
+        )?;
+        if let Some(ch) = created {
+            if ctx.height.0 < ch.saturating_add(maturity) {
+                return Err(ConsensusError::BadTx("coinbase immature"));
+            }
+        }
+        let ch = if let Some(h) = pin_ch {
+            h
+        } else {
+            create_height_for_fk(query, create_fk, created)?
+        };
+        create_height_by_fk.insert(create_fk, ch);
+    }
+    let create_h_ns = t_create.elapsed().as_nanos() as u64;
+
+    // ── BIP68 relative sequence locks (CSV package) ────────────────────────
     let t_bip68 = Instant::now();
     if ctx.params.csv_active_at(ctx.height.0) {
         let prev_mtp = if ctx.height.0 == 0 {
@@ -1102,11 +1279,15 @@ pub(crate) fn structural_validate_spends(
             return Err(ConsensusError::BadBlock("structural spends/tx input mismatch"));
         }
     }
-    confirm_phase_stats::STRUCTURAL_BIP68_NS
-        .fetch_add(t_bip68.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let bip68_ns = t_bip68.elapsed().as_nanos() as u64;
 
     let _ = archived_tx_fks;
-    check_coinbase_subsidy(block, ctx, fees)
+    check_coinbase_subsidy(block, ctx, fees)?;
+    Ok(StructuralPhaseNs {
+        spent_ns,
+        create_h_ns,
+        bip68_ns,
+    })
 }
 
 /// Parallel script checks for an owned job slice (preferred entry — no ref `Vec`).

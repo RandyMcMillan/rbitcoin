@@ -5,7 +5,10 @@
 //! dropped whole when the next insert would exceed the budget. A `HashMap` maps
 //! create fk → entry for O(1) pin lookups.
 //!
-//! This replaces the old full-body byte-LRU + tip GC reaccount/scan path.
+//! Outs are **content-only** (value + script). Durable spender annotations are
+//! **not** cached here — pin-time fields are stale by write. Instead we stash
+//! `body_off` + per-vout relative offsets of the 9-byte spender meta so write
+//! structural spentness can bulk-`pread` current durable state (io_uring).
 
 use rbitcoin_store::{OutputRecord, TxRecord};
 use std::collections::{HashMap, VecDeque};
@@ -33,10 +36,15 @@ pub fn out_fifo_cap_from_env() -> u64 {
 pub struct CreateOuts {
     pub height: u32,
     pub tx: TxRecord,
-    /// Dense: `outputs[vout]`.
+    /// Dense: `outputs[vout]`. Content-only (spender fields cleared).
     pub outputs: Vec<OutputRecord>,
     /// True when archive-time inputs showed a coinbase (stored at put; no inputs kept).
     pub is_coinbase: bool,
+    /// Absolute file offset of the packed Class A body in `tx.body` (when known).
+    pub body_off: Option<u64>,
+    /// Dense: `spender_rels[vout]` = relative offset of 9-byte spender meta in body.
+    /// Empty when body layout was not recorded (cold fallback path).
+    pub spender_rels: Vec<u32>,
 }
 
 /// FIFO create-outs cache.
@@ -122,7 +130,6 @@ impl OutFifo {
         }
         evicted
     }
-
 }
 
 /// Derive coinbase flag from decoded inputs (called once at put).
@@ -161,27 +168,22 @@ mod tests {
             .collect()
     }
 
+    fn entry(height: u32, id: u8, n: usize, cb: bool) -> CreateOuts {
+        CreateOuts {
+            height,
+            tx: tx(id, n as u32),
+            outputs: outs(n),
+            is_coinbase: cb,
+            body_off: Some(1000),
+            spender_rels: (0..n as u32).map(|i| 40 + i * 20).collect(),
+        }
+    }
+
     #[test]
     fn fifo_evicts_oldest_when_over_out_cap() {
         let mut f = OutFifo::new(5);
-        f.insert(
-            1,
-            CreateOuts {
-                height: 1,
-                tx: tx(1, 3),
-                outputs: outs(3),
-                is_coinbase: true,
-            },
-        );
-        f.insert(
-            2,
-            CreateOuts {
-                height: 2,
-                tx: tx(2, 3),
-                outputs: outs(3),
-                is_coinbase: false,
-            },
-        );
+        f.insert(1, entry(1, 1, 3, true));
+        f.insert(2, entry(2, 2, 3, false));
         // 3+3 > 5 → first create gone
         assert!(!f.contains(1));
         assert!(f.contains(2));
@@ -191,43 +193,22 @@ mod tests {
     #[test]
     fn replace_in_place_keeps_entry() {
         let mut f = OutFifo::new(10);
-        f.insert(
-            7,
-            CreateOuts {
-                height: 1,
-                tx: tx(7, 2),
-                outputs: outs(2),
-                is_coinbase: false,
-            },
-        );
-        f.insert(
-            7,
-            CreateOuts {
-                height: 1,
-                tx: tx(7, 4),
-                outputs: outs(4),
-                is_coinbase: false,
-            },
-        );
+        f.insert(7, entry(1, 7, 2, false));
+        f.insert(7, entry(1, 7, 4, false));
         assert_eq!(f.len(), 1);
         assert_eq!(f.get(7).unwrap().outputs.len(), 4);
         assert_eq!(f.total_outs(), 4);
     }
 
     #[test]
-    fn pin_lookup_by_vout() {
+    fn pin_lookup_by_vout_and_spender_abs() {
         let mut f = OutFifo::new(100);
-        f.insert(
-            9,
-            CreateOuts {
-                height: 5,
-                tx: tx(9, 2),
-                outputs: outs(2),
-                is_coinbase: false,
-            },
-        );
+        f.insert(9, entry(5, 9, 2, false));
         let e = f.get(9).unwrap();
         assert_eq!(e.outputs[1].value, 1);
         assert_eq!(e.height, 5);
+        assert_eq!(e.body_off, Some(1000));
+        assert_eq!(e.spender_rels[1], 60);
+        assert!(e.outputs[0].spender_field.is_null());
     }
 }

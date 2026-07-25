@@ -280,12 +280,9 @@ pub fn confirm_write_phase(
     batch.wire_blocks = wires;
 
     let t_wall = Instant::now();
-    // Snapshot sub-counters before this batch so last-write phases are accurate
-    // even when concurrent windows also sample (write is single-threaded).
-    let spent0 = confirm_phase_stats::STRUCTURAL_SPENT_NS.load(Ordering::Relaxed);
-    let bip68_0 = confirm_phase_stats::STRUCTURAL_BIP68_NS.load(Ordering::Relaxed);
+    // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
     let t_struct = Instant::now();
-    structural_run(
+    let struct_ph = structural_run(
         query,
         params,
         milestone,
@@ -294,27 +291,13 @@ pub fn confirm_write_phase(
         &batch.batch_parents,
     )?;
     let structural_ns = t_struct.elapsed().as_nanos() as u64;
-    let spent_ns = confirm_phase_stats::STRUCTURAL_SPENT_NS
-        .load(Ordering::Relaxed)
-        .saturating_sub(spent0);
-    let bip68_ns = confirm_phase_stats::STRUCTURAL_BIP68_NS
-        .load(Ordering::Relaxed)
-        .saturating_sub(bip68_0);
 
     let n_blocks = batch.prepared.len();
     let t_cc = Instant::now();
     let out = class_c_commit(query, &mut batch.prepared)?;
     let class_c_ns = t_cc.elapsed().as_nanos() as u64;
 
-    let spend0 = confirm_phase_stats::UTXO_APPLY_NS.load(Ordering::Relaxed);
-    let tip0 = confirm_phase_stats::CACHE_TIP_NS.load(Ordering::Relaxed);
-    post_commit(query, &batch.prepared)?;
-    let spend_ann_ns = confirm_phase_stats::UTXO_APPLY_NS
-        .load(Ordering::Relaxed)
-        .saturating_sub(spend0);
-    let tip_gc_ns = confirm_phase_stats::CACHE_TIP_NS
-        .load(Ordering::Relaxed)
-        .saturating_sub(tip0);
+    let (spend_ann_ns, tip_gc_ns) = post_commit(query, &batch.prepared)?;
 
     // batch_parents dropped here with ScriptOkBatch — no tip GC of sparse pins.
     confirm_phase_stats::BLOCKS.fetch_add(n_blocks as u64, Ordering::Relaxed);
@@ -322,8 +305,9 @@ pub fn confirm_write_phase(
         n_blocks: n_blocks as u32,
         wall_ns: t_wall.elapsed().as_nanos() as u64,
         structural_ns,
-        spent_ns,
-        bip68_ns,
+        spent_ns: struct_ph.spent_ns,
+        create_h_ns: struct_ph.create_h_ns,
+        bip68_ns: struct_ph.bip68_ns,
         class_c_ns,
         spend_ann_ns,
         tip_gc_ns,
@@ -710,12 +694,14 @@ fn structural_run(
     prepared: &[Prepared],
     wire_blocks: &[Block],
     batch_parents: &rbitcoin_query::BatchParents,
-) -> Result<(), ConsensusError> {
+) -> Result<crate::block::StructuralPhaseNs, ConsensusError> {
+    use crate::block::StructuralPhaseNs;
     let t0 = Instant::now();
     let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
+    let mut tot = StructuralPhaseNs::default();
     for (i, p) in prepared.iter().enumerate() {
         let ctx = ValidationContext::at(params, p.height, milestone);
-        structural_validate_spends(
+        let ph = structural_validate_spends(
             query,
             &wire_blocks[i],
             &ctx,
@@ -725,10 +711,18 @@ fn structural_run(
             &mut pending_spent,
             batch_parents,
         )?;
+        tot.spent_ns = tot.spent_ns.saturating_add(ph.spent_ns);
+        tot.create_h_ns = tot.create_h_ns.saturating_add(ph.create_h_ns);
+        tot.bip68_ns = tot.bip68_ns.saturating_add(ph.bip68_ns);
     }
+    // Window counters (may race with sampler; last-write uses `tot` instead).
     confirm_phase_stats::STRUCTURAL_NS
         .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    Ok(())
+    confirm_phase_stats::STRUCTURAL_SPENT_NS.fetch_add(tot.spent_ns, Ordering::Relaxed);
+    confirm_phase_stats::STRUCTURAL_CREATE_H_NS
+        .fetch_add(tot.create_h_ns, Ordering::Relaxed);
+    confirm_phase_stats::STRUCTURAL_BIP68_NS.fetch_add(tot.bip68_ns, Ordering::Relaxed);
+    Ok(tot)
 }
 
 /// Verify all script jobs in `prepared` (CPU only; jobs are self-contained).
@@ -785,7 +779,8 @@ fn class_c_commit(
     Ok(out)
 }
 
-fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusError> {
+/// Returns `(spend_ann_ns, tip_gc_ns)` measured with local `Instant`s.
+fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(u64, u64), ConsensusError> {
     // Direct IBD: batch durable spend annotations for the whole run **before**
     // the next confirm batch (spentness = confirmed-strong + annotation).
     // Tip mode usually writes spends on archive; still safe if spend_index on.
@@ -861,8 +856,8 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
                 .map_err(ConsensusError::Store)?;
         }
     }
-    confirm_phase_stats::UTXO_APPLY_NS
-        .fetch_add(t_spent.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let spend_ann_ns = t_spent.elapsed().as_nanos() as u64;
+    confirm_phase_stats::UTXO_APPLY_NS.fetch_add(spend_ann_ns, Ordering::Relaxed);
 
     // IBD (Direct): skip per-spend unpin — tip GC drops the same parent outs.
     // Tip mode: still retire spent sparse parents so long-lived cache stays lean.
@@ -888,15 +883,14 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(), ConsensusErro
     );
 
     // Prune confirm-parent cache for heights at/below new tip.
+    let mut tip_gc_ns = 0u64;
     if let Some(tip) = prepared.last().map(|p| p.height.0) {
         let t_tip = Instant::now();
         query.advance_parent_cache_tip(tip);
-        confirm_phase_stats::CACHE_TIP_NS.fetch_add(
-            t_tip.elapsed().as_nanos() as u64,
-            Ordering::Relaxed,
-        );
+        tip_gc_ns = t_tip.elapsed().as_nanos() as u64;
+        confirm_phase_stats::CACHE_TIP_NS.fetch_add(tip_gc_ns, Ordering::Relaxed);
     }
-    Ok(())
+    Ok((spend_ann_ns, tip_gc_ns))
 }
 
 fn check_bip34(block: &Block, height: u32) -> Result<(), ConsensusError> {

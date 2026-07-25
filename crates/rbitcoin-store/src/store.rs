@@ -383,12 +383,23 @@ impl Store {
         self.txs.get_full_batch_at(ranges)
     }
 
-    /// Bulk meta+outputs from known ranges (confirm pin_new).
+    /// Bulk meta+outputs+spender_rels from known ranges (confirm pin_new).
+    ///
+    /// Outs are content-only (spender fields cleared). `spender_rels[v]` is the
+    /// relative offset of the 9-byte annotation within the packed body.
     pub fn get_tx_meta_and_outputs_batch_at(
         &self,
         ranges: &[(u64, u64)],
-    ) -> Result<Vec<Option<(TxRecord, Vec<OutputRecord>)>>, StoreError> {
+    ) -> Result<Vec<Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>>, StoreError> {
         self.txs.get_meta_and_outputs_batch_at(ranges)
+    }
+
+    /// Bulk 9-byte spender meta at absolute `tx.body` offsets (io_uring).
+    pub fn get_spender_meta_at_abs_batch(
+        &self,
+        abs_offs: &[u64],
+    ) -> Result<Vec<Option<(bool, Fk)>>, StoreError> {
+        self.txs.get_spender_meta_at_abs_batch(abs_offs)
     }
 
     /// Spentness by create fk (no `tx.head`). Prefer known body range when available.

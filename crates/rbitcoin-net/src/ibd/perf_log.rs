@@ -61,8 +61,10 @@ pub(crate) struct IbdPerfSample {
     pub utxo_ms: u64,
     /// Write structural total (spentness+maturity+BIP68+subsidy); not load `connect`.
     pub structural_ms: u64,
-    /// Structural sub: spentness + maturity + create-height.
+    /// Structural sub: durable spentness probes.
     pub structural_spent_ms: u64,
+    /// Structural sub: create-height + coinbase maturity.
+    pub structural_create_h_ms: u64,
     /// Structural sub: BIP68 + coin MTP.
     pub structural_bip68_ms: u64,
     pub spend_ranged: u64,
@@ -83,6 +85,7 @@ pub(crate) struct IbdPerfSample {
     pub utxo_apply_ns: u64,
     pub structural_ns: u64,
     pub structural_spent_ns: u64,
+    pub structural_create_h_ns: u64,
     pub structural_bip68_ns: u64,
     pub resolve_ns: u64,
     pub load_ns: u64,
@@ -215,6 +218,7 @@ impl Default for IbdPerfSample {
             utxo_ms: 0,
             structural_ms: 0,
             structural_spent_ms: 0,
+            structural_create_h_ms: 0,
             structural_bip68_ms: 0,
             spend_ranged: 0,
             spend_idx: 0,
@@ -233,6 +237,7 @@ impl Default for IbdPerfSample {
             utxo_apply_ns: 0,
             structural_ns: 0,
             structural_spent_ns: 0,
+            structural_create_h_ns: 0,
             structural_bip68_ns: 0,
             resolve_ns: 0,
             load_ns: 0,
@@ -366,6 +371,7 @@ pub(crate) fn sample(
         spend_skip,
         structural_ns,
         structural_spent_ns,
+        structural_create_h_ns,
         structural_bip68_ns,
     ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
     let (sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head) =
@@ -416,6 +422,7 @@ pub(crate) fn sample(
         utxo_ms: ns_ms(utxo_apply_ns),
         structural_ms: ns_ms(structural_ns),
         structural_spent_ms: ns_ms(structural_spent_ns),
+        structural_create_h_ms: ns_ms(structural_create_h_ns),
         structural_bip68_ms: ns_ms(structural_bip68_ns),
         spend_ranged,
         spend_idx,
@@ -434,6 +441,7 @@ pub(crate) fn sample(
         utxo_apply_ns,
         structural_ns,
         structural_spent_ns,
+        structural_create_h_ns,
         structural_bip68_ns,
         resolve_ns,
         load_ns,
@@ -552,13 +560,14 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     // recon/wire folded: prefetch/wave are dead on Direct; show recon only if useful.
     // Write phases: struct/bip68/class_c/sh/spend/tip_gc. `connect` is load assemble.
     out.push_str(&format!(
-        " | conf blks={} script={}ms load={}ms connect={}ms struct={}ms(spent={} bip68={}) class_c={}ms sh={}ms spend={}ms tip_gc={}ms",
+        " | conf blks={} script={}ms load={}ms connect={}ms struct={}ms(spent={} create_h={} bip68={}) class_c={}ms sh={}ms spend={}ms tip_gc={}ms",
         s.phase_blks,
         s.script_ms,
         s.load_ms,
         s.connect_ms,
         s.structural_ms,
         s.structural_spent_ms,
+        s.structural_create_h_ms,
         s.structural_bip68_ms,
         s.class_c_ms,
         s.sh_ms,
@@ -634,13 +643,14 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let denom = s.phase_blks.max(1);
     let us = |ns: u64| (ns / denom) / 1000;
     let mut out = format!(
-        "ibd: perf_dbg us/blk recon={} wire={} connect={} script={} struct={} spent={} bip68={} class_c={} sh={} spend={}(r={} i={} skip={}) load={} tip_gc={}",
+        "ibd: perf_dbg us/blk recon={} wire={} connect={} script={} struct={} spent={} create_h={} bip68={} class_c={} sh={} spend={}(r={} i={} skip={}) load={} tip_gc={}",
         us(s.recon_ns),
         us(s.wire_ns),
         us(s.connect_ns),
         us(s.script_ns),
         us(s.structural_ns),
         us(s.structural_spent_ns),
+        us(s.structural_create_h_ns),
         us(s.structural_bip68_ns),
         us(s.class_c_ns),
         us(s.sh_ns),
@@ -877,12 +887,16 @@ mod tests {
         s.sh_runs = 3;
         s.structural_ms = 50;
         s.structural_spent_ms = 30;
+        s.structural_create_h_ms = 5;
         s.structural_bip68_ms = 20;
         let line = format_info(&s);
         assert!(line.contains("loadq=1/2 writeq=2/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
         assert!(line.contains("pin_cache=8 pin_new=12"), "{line}");
-        assert!(line.contains("struct=50ms(spent=30 bip68=20)"), "{line}");
+        assert!(
+            line.contains("struct=50ms(spent=30 create_h=5 bip68=20)"),
+            "{line}"
+        );
         // pin_hit% = 8/(8+12) = 40
         assert!(line.contains("pin_hit%=40"), "{line}");
         assert!(line.contains("thin=5"), "{line}");

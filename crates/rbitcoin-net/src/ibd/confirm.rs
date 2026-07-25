@@ -256,10 +256,12 @@ pub(crate) fn spawn_confirm_engine(
                             let ms = rbitcoin_consensus::confirm_phase_stats::LastWritePhases::ms;
                             info!(
                                 "ibd: confirm write slow batch={n} first={first_h} wall={:?} \
-                                 struct={}ms spent={}ms bip68={}ms class_c={}ms spend_ann={}ms tip_gc={}ms",
+                                 struct={}ms spent={}ms create_h={}ms bip68={}ms class_c={}ms \
+                                 spend_ann={}ms tip_gc={}ms",
                                 elapsed,
                                 ms(p.structural_ns),
                                 ms(p.spent_ns),
+                                ms(p.create_h_ns),
                                 ms(p.bip68_ns),
                                 ms(p.class_c_ns),
                                 ms(p.spend_ann_ns),

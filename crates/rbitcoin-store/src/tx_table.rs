@@ -570,6 +570,19 @@ pub fn scan_packed_meta_and_prevouts(
 pub fn decode_packed_tx_outs_only(
     raw: &[u8],
 ) -> Result<(TxRecord, Vec<OutputRecord>), StoreError> {
+    let (meta, outs, _rels) = decode_packed_tx_outs_with_spender_rels(raw)?;
+    Ok((meta, outs))
+}
+
+/// Like [`decode_packed_tx_outs_only`], plus dense relative offsets of each
+/// output's 9-byte spender meta (field + flags) within the packed payload.
+///
+/// **Spender fields on returned outs are cleared** (`NULL` / not multi): pin /
+/// OutFifo must not treat pin-time annotations as durable authority; write-path
+/// structural re-reads via absolute `body_off + rel` preads.
+pub fn decode_packed_tx_outs_with_spender_rels(
+    raw: &[u8],
+) -> Result<(TxRecord, Vec<OutputRecord>, Vec<u32>), StoreError> {
     if raw.first().copied() != Some(PACKED_TX_V1) {
         return Err(StoreError::Corrupt("not a packed Class A tx"));
     }
@@ -583,15 +596,38 @@ pub fn decode_packed_tx_outs_only(
         let (_txid, _vout, used) = InputRecord::decode_prevout_at(&raw[off..])?;
         off += used;
     }
-    let (outputs, out_used) = decode_output_run_prefix(&raw[off..], meta.output_count)?;
-    off += out_used;
+    let n_out = meta.output_count as usize;
+    let mut outputs = Vec::with_capacity(n_out);
+    let mut spender_rels = Vec::with_capacity(n_out);
+    for _ in 0..n_out {
+        if off >= raw.len() {
+            return Err(StoreError::Corrupt("packed outputs short"));
+        }
+        // Spender meta is the first 9 bytes of each output record.
+        spender_rels.push(off as u32);
+        let (mut rec, used) = OutputRecord::decode_at(&raw[off..])?;
+        off += used;
+        // Content-only for pin/FIFO (value + script).
+        rec.spender_field = Fk::NULL;
+        rec.multi_spender = false;
+        outputs.push(rec);
+    }
     if off != raw.len() {
         return Err(StoreError::Corrupt("packed Class A trailing bytes"));
     }
     if outputs.len() as u32 != meta.output_count {
         return Err(StoreError::Corrupt("packed Class A count mismatch"));
     }
-    Ok((meta, outputs))
+    Ok((meta, outputs, spender_rels))
+}
+
+/// Strip durable spender annotation from outs (pin / OutFifo content-only).
+#[inline]
+pub fn clear_output_spender_fields(outs: &mut [OutputRecord]) {
+    for o in outs {
+        o.spender_field = Fk::NULL;
+        o.multi_spender = false;
+    }
 }
 
 #[inline]
@@ -1742,11 +1778,14 @@ impl TxTable {
         Ok(out)
     }
 
-    /// Bulk meta+outputs from known ranges (confirm pin_new). io_uring body preads.
+    /// Bulk meta+outputs+spender_rels from known ranges (confirm pin_new).
+    ///
+    /// io_uring body preads. Spender fields on outs are cleared; use dense
+    /// `spender_rels` (relative to `body_off`) for later 9-byte re-reads.
     pub fn get_meta_and_outputs_batch_at(
         &self,
         ranges: &[(u64, u64)],
-    ) -> Result<Vec<Option<(TxRecord, Vec<OutputRecord>)>>, StoreError> {
+    ) -> Result<Vec<Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>>, StoreError> {
         use crate::bulk_io::{self, ReadOp};
         if ranges.is_empty() {
             return Ok(Vec::new());
@@ -1790,17 +1829,68 @@ impl TxTable {
         }
         drop(read_ops);
 
-        let mut out: Vec<Option<(TxRecord, Vec<OutputRecord>)>> = vec![None; ranges.len()];
+        let mut out: Vec<Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>> =
+            vec![None; ranges.len()];
         // Free each raw body as soon as it is decoded so peak is not
         // (all raw bodies) + (all dense outs) at once.
         for (i, slot) in bufs.into_iter().enumerate() {
             if !ok[i] || slot.is_empty() {
                 continue;
             }
-            if let Ok(v) = decode_packed_tx_outs_only(&slot) {
+            if let Ok(v) = decode_packed_tx_outs_with_spender_rels(&slot) {
                 out[i] = Some(v);
             }
             // `slot` dropped at end of iteration.
+        }
+        Ok(out)
+    }
+
+    /// Bulk 9-byte spender meta preads at absolute `tx.body` file offsets.
+    ///
+    /// Each entry is the absolute offset of an output's spender_field (8) + flags (1).
+    /// Uses io_uring / parallel pread. Failed or short reads yield `None`.
+    pub fn get_spender_meta_at_abs_batch(
+        &self,
+        abs_offs: &[u64],
+    ) -> Result<Vec<Option<(bool, Fk)>>, StoreError> {
+        use crate::bulk_io::{self, ReadOp};
+        const META_LEN: usize = 9;
+        if abs_offs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body_fd = self.body.body_read_fd();
+        let body_pub = self.body.body_published_len();
+
+        let submitted: Vec<usize> = abs_offs
+            .iter()
+            .enumerate()
+            .filter(|(_, &off)| off.saturating_add(META_LEN as u64) <= body_pub)
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut bufs: Vec<[u8; META_LEN]> = vec![[0u8; META_LEN]; abs_offs.len()];
+        let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(submitted.len());
+        for &i in &submitted {
+            let ptr = bufs[i].as_mut_ptr();
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, META_LEN) };
+            read_ops.push(ReadOp {
+                fd: body_fd,
+                offset: abs_offs[i],
+                buf: slice,
+                result: i32::MIN,
+            });
+        }
+        bulk_io::pread_batch(&mut read_ops);
+
+        let mut out: Vec<Option<(bool, Fk)>> = vec![None; abs_offs.len()];
+        for (ro, &i) in read_ops.iter().zip(submitted.iter()) {
+            if ro.result != META_LEN as i32 {
+                continue;
+            }
+            let b = &bufs[i];
+            let field = Fk(u64::from_le_bytes(b[0..8].try_into().unwrap()));
+            let multi = b[8] & output_flags::MULTI_SPENDER != 0;
+            out[i] = Some((multi, field));
         }
         Ok(out)
     }
@@ -3780,6 +3870,12 @@ mod tests {
             let b = got.as_ref().expect("meta bulk");
             assert_eq!(b.0, seq.0);
             assert_eq!(b.1.len(), seq.1.len());
+            assert_eq!(b.2.len(), b.1.len()); // dense spender_rels
+            // Content-only outs (spender fields cleared for pin/FIFO).
+            for o in &b.1 {
+                assert!(o.spender_field.is_null());
+                assert!(!o.multi_spender);
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4098,6 +4194,24 @@ mod tests {
         assert!(!metas[0].1 && metas[0].2 == s1);
         assert!(!metas[1].1 && metas[1].2.is_null());
         assert!(!metas[2].1 && metas[2].2 == Fk(20));
+
+        // Bulk 9-byte abs preads match the packed walk (pin → write spentness path).
+        let decoded = t.get_meta_and_outputs_batch_at(&[(off, len)]).unwrap();
+        let (_meta, outs, rels) = decoded[0].as_ref().expect("decode with rels");
+        assert_eq!(outs.len(), 3);
+        assert_eq!(rels.len(), 3);
+        for o in outs {
+            assert!(o.spender_field.is_null());
+        }
+        let abs: Vec<u64> = rels
+            .iter()
+            .map(|r| off.saturating_add(u64::from(*r)))
+            .collect();
+        let bulk = t.get_spender_meta_at_abs_batch(&abs).unwrap();
+        assert_eq!(bulk.len(), 3);
+        assert_eq!(bulk[0], Some((false, s1)));
+        assert_eq!(bulk[1], Some((false, Fk::NULL)));
+        assert_eq!(bulk[2], Some((false, Fk(20))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

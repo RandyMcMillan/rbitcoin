@@ -35,7 +35,8 @@ pub use file::{
 };
 pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush};
 pub use address_head::{
-    bits_for_scale, entry_bytes_for_bits, is_probe_exhausted_error, load_needs_resize,
+    bits_for_scale, entry_bytes_for_bits, is_probe_exhausted_error, layout_for_count,
+    load_needs_resize,
     page_index, probe_depth_stats_snapshot, probe_index, sample_probe_depth_stats,
     take_probe_depth_resize_request, AddressHead, HeadLayout, HEAD_LOAD_CEILING,
     HEAD_LOAD_START, HEAD_LOAD_WARN, MAINNET_BITS, MAX_BITS, MAX_PROBE, PAGE_SLOTS,

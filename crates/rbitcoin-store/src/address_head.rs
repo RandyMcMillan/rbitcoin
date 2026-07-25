@@ -399,6 +399,22 @@ pub fn default_layout() -> HeadLayout {
     HeadLayout::new(bits_for_scale()).expect("default bits in range")
 }
 
+/// Head geometry large enough that `n` Class A rows sit **below**
+/// [`HEAD_LOAD_START`] (so a recovery rebuild does not immediately start online
+/// resize). Starts from [`bits_for_scale`] and widens until load is OK or
+/// [`MAX_BITS`].
+pub fn layout_for_count(n: u64) -> HeadLayout {
+    let mut bits = bits_for_scale();
+    while bits < MAX_BITS {
+        let layout = HeadLayout::new(bits).expect("bits in range");
+        if n == 0 || !load_needs_resize(n, layout.slots()) {
+            return layout;
+        }
+        bits += 1;
+    }
+    HeadLayout::new(MAX_BITS).expect("MAX_BITS in range")
+}
+
 /// True when dense Class A count warrants a BITS widen.
 #[inline]
 pub fn load_needs_resize(tx_count: u64, slots: u64) -> bool {
@@ -1044,6 +1060,18 @@ mod tests {
         assert!(!load_needs_resize(thr - 1, slots));
         assert!(load_needs_resize(thr, slots));
         assert!(load_needs_resize(slots, slots));
+    }
+
+    #[test]
+    fn layout_for_count_avoids_immediate_resize() {
+        // ~103M Class A: default MAINNET 26 is too small; need at least 27.
+        let n = 102_956_483u64;
+        let layout = layout_for_count(n);
+        assert!(layout.bits >= 27, "bits={}", layout.bits);
+        assert!(!load_needs_resize(n, layout.slots()));
+        // Empty / tiny stays at scale default.
+        let empty = layout_for_count(0);
+        assert_eq!(empty.bits, bits_for_scale());
     }
 
     #[test]

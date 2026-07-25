@@ -685,9 +685,12 @@ impl TxTable {
                 Err(e) => {
                     // Unreadable head with live Class A: recreate rather than
                     // refuse the whole store (same recovery as a deliberate delete).
+                    // Common after mid-resize kill or footer-layout upgrade.
                     if n_bodies > 0 {
                         rbitcoin_log::warn!(
-                            "store: tx.head open failed ({e}) with {n_bodies} Class A bodies — recreating and rebuilding"
+                            "store: tx.head unreadable ({e}) with {n_bodies} Class A bodies — \
+                             will recreate head sized for count and rebuild mappings \
+                             (online resize leftovers cleared; expect a long open)"
                         );
                         let _ = std::fs::remove_file(&head_path);
                         crate::address_head::remove_legacy_meta_sidecar(&head_path);
@@ -709,6 +712,14 @@ impl TxTable {
             resize_bg_gen: AtomicU64::new(0),
         };
         if need_rebuild {
+            // Sized head + rebuild inserts only — do not interleave online resize
+            // (that produced dual "rebuild progress" + "resize progress" on open).
+            let bits = t.head_bits();
+            let slots = t.head_slots();
+            rbitcoin_log::info!(
+                "store: tx.head rebuild begin n={n_bodies} bits={bits} slots={slots} \
+                 (no concurrent online resize)"
+            );
             let inserted = t.rebuild_head_from_bodies(|done, total, ins| {
                 if done == total || done % 1_000_000 == 0 {
                     rbitcoin_log::info!(
@@ -717,9 +728,10 @@ impl TxTable {
                 }
             })?;
             t.head.read().unwrap().flush()?;
-            rbitcoin_log::warn!(
-                "store: tx.head rebuild complete inserted={inserted} bodies={}",
-                t.count()
+            rbitcoin_log::info!(
+                "store: tx.head rebuild complete inserted={inserted} bodies={} bits={}",
+                t.count(),
+                t.head_bits()
             );
         } else {
             t.resume_head_resize_if_needed()?;
@@ -795,7 +807,11 @@ impl TxTable {
         *slot = Some(handle);
     }
 
-    /// Create empty `tx.head` (default layout), drop resize leftovers.
+    /// Create empty `tx.head`, drop resize leftovers.
+    ///
+    /// When `n_bodies > 0`, size the head so load stays under [`HEAD_LOAD_START`]
+    /// for that count — otherwise the first rebuild insert wave immediately starts
+    /// a concurrent online resize (confusing dual progress logs).
     fn prepare_fresh_head(head_path: &Path, n_bodies: u64) -> Result<AddressHead, StoreError> {
         clear_resize_control(head_path);
         let shadow = shadow_head_path(head_path);
@@ -806,14 +822,21 @@ impl TxTable {
         crate::address_head::remove_legacy_meta_sidecar(&bak);
         // Pre-v5 sidecar (layout is in the footer now).
         crate::address_head::remove_legacy_meta_sidecar(head_path);
-        if n_bodies > 0 {
-            rbitcoin_log::warn!(
-                "store: tx.head missing/recreated — rebuilding from {n_bodies} Class A bodies (this can take a while)"
+        let layout = if n_bodies > 0 {
+            let layout = crate::address_head::layout_for_count(n_bodies);
+            rbitcoin_log::info!(
+                "store: tx.head recreate bits={} slots={} entry={}B for {n_bodies} Class A bodies \
+                 (full mapping rebuild next)",
+                layout.bits,
+                layout.slots(),
+                layout.entry_bytes
             );
+            layout
         } else {
             rbitcoin_log::info!("store: tx.head missing — creating empty address head");
-        }
-        AddressHead::create(head_path)
+            crate::address_head::default_layout()
+        };
+        AddressHead::create_with_layout(head_path, layout)
     }
 
     pub fn count(&self) -> u64 {
@@ -2318,45 +2341,49 @@ impl TxTable {
         {
             let rg = self.resize.lock().unwrap();
             if let Some(r) = rg.as_ref() {
-                // Warn if primary load is high while resizing.
-                let (slots, n) = {
-                    let h = self.head.read().unwrap();
-                    (h.slots(), self.count())
-                };
-                let ratio = load_ratio(n, slots);
-                if ratio >= HEAD_LOAD_WARN {
-                    // Rate-limit: maybe_start is called on every head batch.
-                    static LAST_LAG_LOG_MS: std::sync::atomic::AtomicU64 =
-                        std::sync::atomic::AtomicU64::new(0);
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    let prev = LAST_LAG_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
-                    if now_ms.saturating_sub(prev) >= 60_000
-                        && LAST_LAG_LOG_MS
-                            .compare_exchange(
-                                prev,
-                                now_ms,
-                                std::sync::atomic::Ordering::Relaxed,
-                                std::sync::atomic::Ordering::Relaxed,
-                            )
-                            .is_ok()
-                    {
-                        let pct = if n > 0 {
-                            100.0 * (r.cursor.saturating_sub(1) as f64) / (n as f64)
-                        } else {
-                            100.0
-                        };
-                        let (deep, exh) = crate::address_head::probe_depth_stats_snapshot();
-                        rbitcoin_log::warn!(
-                            "store: tx.head resize lagging load={ratio:.3} n={n} slots={slots} \
-                             shadow_cursor={}/{} ({pct:.1}%) target_bits={} \
-                             deep_warn={deep} exhaust={exh}",
-                            r.cursor.saturating_sub(1),
-                            n,
-                            r.target.bits
-                        );
+                // Warn if primary load is high while resizing — skip the first
+                // moments (cursor still near 0) so open/start is not a false lag.
+                let cursor = r.cursor;
+                let target_bits = r.target.bits;
+                if cursor > 1 {
+                    let (slots, n) = {
+                        let h = self.head.read().unwrap();
+                        (h.slots(), self.count())
+                    };
+                    let ratio = load_ratio(n, slots);
+                    if ratio >= HEAD_LOAD_WARN {
+                        // Rate-limit: maybe_start is called on every head batch.
+                        static LAST_LAG_LOG_MS: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let prev = LAST_LAG_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+                        if now_ms.saturating_sub(prev) >= 60_000
+                            && LAST_LAG_LOG_MS
+                                .compare_exchange(
+                                    prev,
+                                    now_ms,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                )
+                                .is_ok()
+                        {
+                            let pct = if n > 0 {
+                                100.0 * (cursor.saturating_sub(1) as f64) / (n as f64)
+                            } else {
+                                100.0
+                            };
+                            let (deep, exh) = crate::address_head::probe_depth_stats_snapshot();
+                            rbitcoin_log::warn!(
+                                "store: tx.head resize lagging load={ratio:.3} n={n} slots={slots} \
+                                 shadow_cursor={}/{} ({pct:.1}%) target_bits={target_bits} \
+                                 deep_warn={deep} exhaust={exh}",
+                                cursor.saturating_sub(1),
+                                n
+                            );
+                        }
                     }
                 }
                 return Ok(());

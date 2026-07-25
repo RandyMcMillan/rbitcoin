@@ -822,14 +822,15 @@ pub async fn ibd_cancellable(
             let arch_lead = prog.archived.saturating_sub(prog.tip);
             let peers_n = st.slots.iter().filter(|s| s.alive).count();
             let (load_q, write_q) = confirm_queues.snap();
-            let sh_runs = hub.query.scripthash_run_count();
+            // Class A fks published in tx.idx (dense create_fk high-water).
+            let txs = hub.query.tx_body_count();
             let pct = ibd_pct(prog.tip, prog.headers);
 
             tip_rate_tracker.push(now, prog.tip);
             let eta = tip_rate_tracker.eta_string(now, prog.tip, prog.headers);
 
             // Bold on a TTY so the 5s progress line stands out among perf/debug noise.
-            // conf_q: load→scripts / scripts→write depth; `name<0/cap` = consumer waiting.
+            // loadq/writeq: confirm load→scripts / scripts→write; `name<0/cap` = empty.
             let conf_q = confirm::format_conf_q(
                 load_q,
                 write_q,
@@ -837,7 +838,7 @@ pub async fn ibd_cancellable(
                 confirm::WRITE_QUEUE_CAP,
             );
             info_bold!(
-                "ibd: progress {pct}% tip={} ({}/s) arch_hwm={} ({}/s lead={arch_lead}) hole={} peers={peers_n} {conf_q} sh_runs={sh_runs} horizon={} {eta}",
+                "ibd: progress {pct}% tip={} ({}/s) arch_hwm={} ({}/s lead={arch_lead}) hole={} peers={peers_n} {conf_q} txs={txs} horizon={} {eta}",
                 prog.tip,
                 format_rate(tip_rate),
                 prog.archived,

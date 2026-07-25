@@ -5,7 +5,7 @@
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
-//! | INFO  | `ibd: progress …` | Tip/arch rates over the **last 5s**, conf_q, horizon, **1h tip ETA** |
+//! | INFO  | `ibd: progress …` | Tip/arch rates over the **last 5s**, loadq/writeq, txs=, horizon, **1h tip ETA** |
 //! | INFO  | `ibd: perf …` | Download pressure, confirm cost (script/load/…), pin_hit, coarse load phases, sh_runs |
 //! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail, archive pipe (prep/write/sticky), contig park |
 //!
@@ -844,7 +844,7 @@ mod tests {
         s.load_thin_ms = 5;
         s.sh_runs = 3;
         let line = format_info(&s);
-        assert!(line.contains("conf_q load=1/2 write=2/2"), "{line}");
+        assert!(line.contains("loadq=1/2 writeq=2/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
         assert!(line.contains("pin_cache=8 pin_new=12"), "{line}");
         // pin_hit% = 8/(8+12) = 40
@@ -906,7 +906,7 @@ mod tests {
         assert!(line.contains("sh collect=12"), "{line}");
         assert!(line.contains("pin_sub body="), "{line}");
         // Depth 0 → `<` (scripts waiting on empty load queue).
-        assert!(line.contains("conf_q load<0/2 write=1/2"), "{line}");
+        assert!(line.contains("loadq<0/2 writeq=1/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
         assert!(line.contains("utxo_p=100"), "{line}");
         assert!(line.contains("creates=50"), "{line}");

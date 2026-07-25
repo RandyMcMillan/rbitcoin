@@ -142,13 +142,15 @@ pub(crate) fn format_queue_depth(name: &str, depth: usize, cap: usize) -> String
     }
 }
 
-/// `conf_q load… write…` fragment used by progress and perf lines.
+/// Confirm pipeline queue depths for progress/perf: `loadq… writeq…`.
+///
+/// Depth 0 uses `name<0/cap` (consumer waiting on empty queue).
 #[inline]
 pub(crate) fn format_conf_q(load: usize, write: usize, load_cap: usize, write_cap: usize) -> String {
     format!(
-        "conf_q {} {}",
-        format_queue_depth("load", load, load_cap),
-        format_queue_depth("write", write, write_cap),
+        "{} {}",
+        format_queue_depth("loadq", load, load_cap),
+        format_queue_depth("writeq", write, write_cap),
     )
 }
 
@@ -833,15 +835,15 @@ mod tests {
         assert_eq!(format_queue_depth("write", 2, 2), "write=2/2");
         assert_eq!(
             format_conf_q(0, 1, 2, 2),
-            "conf_q load<0/2 write=1/2"
+            "loadq<0/2 writeq=1/2"
         );
         assert_eq!(
             format_conf_q(1, 0, 2, 2),
-            "conf_q load=1/2 write<0/2"
+            "loadq=1/2 writeq<0/2"
         );
         assert_eq!(
             format_conf_q(0, 0, 2, 2),
-            "conf_q load<0/2 write<0/2"
+            "loadq<0/2 writeq<0/2"
         );
     }
 }

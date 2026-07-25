@@ -63,34 +63,33 @@ Living snapshot. Older Phase-3 gap tables are historical; see phase checklists b
 
 | ID | Gap | Severity |
 |----|-----|----------|
-| G7 | Mainnet consensus parity (retarget edge cases, full policy) | experimental mainnet |
-| G13 | Electrum tx broadcast / mempool product | deferred |
+| G7 | Mainnet retarget golden vectors vs Core; long soak under full scripts | experimental mainnet |
+| G13 | Electrum / mempool product polish | mostly shipped; fee estimator quality deferred |
 | G16 | Full node JSON-RPC surface | stub |
-| — | Production-hardening, adversarial P2P, long soak | ongoing |
+| — | Production-hardening, adversarial P2P, multi-day soak | ongoing |
+| — | IBD load pin still long pole on dense chain (FIFO cold parents) | perf |
 
 Concurrency write roles: [`docs/concurrency.md`](./docs/concurrency.md).
 
-### 0.4 Consensus completeness (mainnet)
+### 0.4 Consensus completeness (mainnet) — 2026-07-25
 
-Core structure/connect/scripts path exists; treat public mainnet as **experimental** until retarget/MTP/subsidy parity is operator-validated. Historical checklist:
+Structure/connect/scripts path is **in tree** and covered by [`docs/consensus-tests.md`](./docs/consensus-tests.md). Treat public mainnet as **experimental** until operator soak under `--milestone 0` past tip.
 
-
-Present today vs needed for public-chain accept:
-
-| Check | Today | Needed |
-|-------|-------|--------|
-| Structure / merkle / weight / BIP34 | yes | keep |
-| Header prev + PoW ≤ limit | yes | keep |
-| Difficulty retarget (2016) + testnet rules | **no** | yes |
-| Median-time-past | **no** | yes |
-| Coinbase maturity (100) | **no** | yes |
-| Subsidy / coinbase value | **no** | yes |
-| Witness commitment (segwit) | **no** | yes |
-| Locktime / CSV / CLTV full context | partial (lib flags) | parity |
-| Sigops / standardness for blocks | no | consensus sigops |
-| BIP9 / taproot / deployment windows | no | yes |
-| Checkpoints + assumevalid/milestone | hooks empty | populate |
-| Header tree / most-work (not linear tip-only) | no | yes for reorg/IBD |
+| Check | Status |
+|-------|--------|
+| Structure / merkle / weight / BIP34 / witness commitment | **yes** |
+| Header prev + PoW ≤ limit + future-time | **yes** |
+| Difficulty retarget (2016) via `CompactTarget::from_next_work_required` | **yes** (regtest bits tests; mainnet golden soak open) |
+| Median-time-past (header + BIP113) | **yes** (store + load header plans for multi-block) |
+| Coinbase maturity (100) | **yes** (structural) |
+| Subsidy / coinbase value | **yes** |
+| Locktime / BIP68 / BIP112 / BIP113 | **yes** (CSV package) |
+| BIP16/BIP141 sigops cost | **yes** |
+| BIP147 NULLDUMMY, empty spk, pre-taproot v1 ACS | **yes** |
+| Pure-Rust scripts (P2PKH/P2WPKH/P2WSH/P2TR + Core tx vectors) | **yes** |
+| Checkpoints (sparse Core map) + milestone assumevalid | **yes** (mainnet default milestone 840k) |
+| Header tree / most-work reorg | **yes** (`accept_branch` / peer reorg path) |
+| Full policy / standardness for *relay* | libre-relay-class (intentional) |
 
 ### 0.5 Reconstruct-serve (locked)
 

@@ -76,6 +76,7 @@ After tip: few outbound follow peers, getheaders / inv / block accept.
 | `tx.head` resize lag | Deep load can block inserts while shadow fills — watch logs for probe-exhaust |
 | Peer scarcity | v2-only + experimental software |
 | Mempool | Libre policy (0.1 sat/vB, full RBF, no dust ban); **scripts verified on accept** |
+| Confirm load | Dense heights are pin-bound; expect `conf blks=32` with `loadq<0/8`. If tip ~1 blk/s and scripts idle, check for `confirm load multi-block fail` (should be rare after BIP68 plan-MTP fix) |
 
 ## Signet lab first
 

@@ -28,7 +28,7 @@ pub struct ConfirmLoadStats {
     pub pin_cache_body: u32,
     /// Of `parent_unique`: first-time sparse pin (store decode).
     pub pin_new: u32,
-    /// Wall ns in `unspent_create_vouts` during pin (store spent-filter).
+    /// Historical: spent-filter during pin (now always 0 — structural owns spentness).
     pub pin_spent_ns: u64,
     /// FIFO hit path resolve (excludes spent timer).
     pub pin_body_ns: u64,
@@ -388,31 +388,11 @@ impl Query {
             if !need_vouts.is_empty() {
                 if let Some((create_h, tx, outs, cb_hint)) = body_hits.remove(&pid) {
                     st.pin_cache_body = st.pin_cache_body.saturating_add(1);
-                    // Same-batch creates: no durable spenders yet — all body
-                    // outs for need_vouts are live (move, no re-clone).
-                    let same_batch = batch_create_ids.contains(&pid);
-                    let live = if same_batch {
-                        outs
-                    } else {
-                        // Range from tx.idx (no process-local body_range cache).
-                        let range = self.store.tx_body_range(fk).ok();
-                        let t_sp = Instant::now();
-                        let unspent = self
-                            .store
-                            .unspent_create_vouts(fk, &need_vouts, range)
-                            .unwrap_or_else(|_| need_vouts.clone());
-                        st.pin_spent_ns = st
-                            .pin_spent_ns
-                            .saturating_add(t_sp.elapsed().as_nanos() as u64);
-                        let unspent_set: HashSet<u32> = unspent.into_iter().collect();
-                        let mut live = Vec::with_capacity(outs.len());
-                        for (v, o) in outs {
-                            if unspent_set.contains(&v) {
-                                live.push((v, o));
-                            }
-                        }
-                        live
-                    };
+                    // Slim to needed vouts only. Do **not** store-filter spentness
+                    // here: optimistic assemble needs script values; durable
+                    // spentness is structural after scripts. `unspent_create_vouts`
+                    // on every pin was dominating load wall on dense mainnet.
+                    let live = slim_outs_to_need(outs, &need_vouts);
                     let cb_stash = match cb_hint {
                         Some(true) => Some(Some(create_h)),
                         Some(false) => Some(None),
@@ -482,23 +462,8 @@ impl Query {
             if let Some((off, len)) = range {
                 if !need_vouts.is_empty() {
                     if let Some((tx, outs)) = bulk_by_job.remove(&ji) {
-                        let t_sp = Instant::now();
-                        let unspent = self
-                            .store
-                            .unspent_create_vouts(fk, &need_vouts, Some((off, len)))
-                            .unwrap_or_default();
-                        st.pin_spent_ns = st
-                            .pin_spent_ns
-                            .saturating_add(t_sp.elapsed().as_nanos() as u64);
-                        let unspent_set: HashSet<u32> = unspent.into_iter().collect();
-                        let mut live = Vec::with_capacity(unspent_set.len());
-                        for &v in &need_vouts {
-                            if unspent_set.contains(&v) {
-                                if let Some(o) = outs.get(v as usize) {
-                                    live.push((v, o.clone()));
-                                }
-                            }
-                        }
+                        // Need-vouts only; spentness is structural (see FIFO hit path).
+                        let live = slim_dense_outs_to_need(&outs, &need_vouts);
                         let cb_stash = match self.resolve_parent_coinbase_height(
                             fk,
                             tx.input_count,
@@ -513,23 +478,7 @@ impl Query {
                 }
             } else if !need_vouts.is_empty() {
                 if let Ok((tx, outs)) = self.store.get_tx_meta_and_outputs(fk) {
-                    let t_sp = Instant::now();
-                    let unspent = self
-                        .store
-                        .unspent_create_vouts(fk, &need_vouts, None)
-                        .unwrap_or_default();
-                    st.pin_spent_ns = st
-                        .pin_spent_ns
-                        .saturating_add(t_sp.elapsed().as_nanos() as u64);
-                    let unspent_set: HashSet<u32> = unspent.into_iter().collect();
-                    let mut live = Vec::with_capacity(unspent_set.len());
-                    for &v in &need_vouts {
-                        if unspent_set.contains(&v) {
-                            if let Some(o) = outs.get(v as usize) {
-                                live.push((v, o.clone()));
-                            }
-                        }
-                    }
+                    let live = slim_dense_outs_to_need(&outs, &need_vouts);
                     let cb_stash = match self
                         .resolve_parent_coinbase_height(fk, tx.input_count, None)
                     {
@@ -588,4 +537,74 @@ impl Query {
 #[inline]
 fn tx_fks_is_sorted_ascending(fks: &[Fk]) -> bool {
     fks.windows(2).all(|w| w[0].0 <= w[1].0)
+}
+
+/// Keep only outs whose vout is in `need` (sparse pin map for assemble).
+///
+/// Does not consult spenders — load is optimistic for scripts; structural
+/// rejects already-spent prevouts after verification.
+fn slim_outs_to_need(
+    outs: Vec<(u32, rbitcoin_store::OutputRecord)>,
+    need: &[u32],
+) -> Vec<(u32, rbitcoin_store::OutputRecord)> {
+    if need.is_empty() {
+        return Vec::new();
+    }
+    if need.len() == 1 {
+        let v = need[0];
+        return outs.into_iter().filter(|(vout, _)| *vout == v).collect();
+    }
+    let need_set: HashSet<u32> = need.iter().copied().collect();
+    outs.into_iter()
+        .filter(|(vout, _)| need_set.contains(vout))
+        .collect()
+}
+
+/// Dense `outs[vout]` → sparse need list (clone).
+fn slim_dense_outs_to_need(
+    outs: &[rbitcoin_store::OutputRecord],
+    need: &[u32],
+) -> Vec<(u32, rbitcoin_store::OutputRecord)> {
+    let mut live = Vec::with_capacity(need.len());
+    for &v in need {
+        if let Some(o) = outs.get(v as usize) {
+            live.push((v, o.clone()));
+        }
+    }
+    live
+}
+
+#[cfg(test)]
+mod slim_outs_tests {
+    use super::{slim_dense_outs_to_need, slim_outs_to_need};
+    use rbitcoin_store::OutputRecord;
+
+    fn o(n: u8) -> OutputRecord {
+        OutputRecord::unspent(n as i64, vec![n])
+    }
+
+    #[test]
+    fn slim_outs_keeps_need_even_if_would_be_spent() {
+        // Regression: pin must not drop needed vouts via spenders filter.
+        // Spentness is structural; scripts need the value/script here.
+        let outs = vec![(0, o(10)), (1, o(11)), (2, o(12))];
+        let live = slim_outs_to_need(outs, &[1, 2]);
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[0].0, 1);
+        assert_eq!(live[1].0, 2);
+    }
+
+    #[test]
+    fn slim_dense_maps_vout_index() {
+        let outs = vec![o(0), o(1), o(2)];
+        let live = slim_dense_outs_to_need(&outs, &[0, 2]);
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[0].1.value, 0);
+        assert_eq!(live[1].1.value, 2);
+    }
+
+    #[test]
+    fn slim_outs_empty_need() {
+        assert!(slim_outs_to_need(vec![(0, o(1))], &[]).is_empty());
+    }
 }

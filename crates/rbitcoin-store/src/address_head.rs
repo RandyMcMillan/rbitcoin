@@ -694,6 +694,7 @@ impl AddressHead {
 
     /// Full published file length (slot body + trailing footer).
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn published_len(&self) -> u64 {
         self.file.logical_len()
     }

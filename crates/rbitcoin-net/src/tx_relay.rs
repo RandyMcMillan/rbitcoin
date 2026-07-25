@@ -170,6 +170,19 @@ impl MempoolHub {
             .collect()
     }
 
+    /// Outpoints spent by any live mempool transaction (confirmed or mempool parents).
+    pub fn spent_outpoints(&self) -> std::collections::HashSet<OutPoint> {
+        let g = self.inner.lock().unwrap();
+        let mut set = std::collections::HashSet::new();
+        for (txid, _) in g.graph.iter() {
+            let Some(tx) = g.get_tx(txid) else { continue };
+            for inp in &tx.input {
+                set.insert(inp.previous_output);
+            }
+        }
+        set
+    }
+
     /// Electrum `blockchain.scripthash.get_mempool` rows for `scripthash` (internal order).
     pub fn scripthash_mempool(&self, scripthash: &[u8; 32]) -> Vec<ElectrumMempoolItem> {
         use rbitcoin_store::script_hash;
@@ -279,7 +292,9 @@ impl MempoolHub {
 
     /// Rough `estimatefee` in BTC/kB for target blocks (mempool feerate percentile).
     /// Returns negative if empty (Electrum convention for “unavailable”).
-    pub fn estimate_fee_btc_per_kb(&self, _target_blocks: u32) -> f64 {
+    ///
+    /// `target_blocks`: 1–2 → ~90th percentile (high fee), 3–6 → median, else ~20th.
+    pub fn estimate_fee_btc_per_kb(&self, target_blocks: u32) -> f64 {
         let g = self.inner.lock().unwrap();
         if g.graph.is_empty() {
             return -1.0;
@@ -290,9 +305,16 @@ impl MempoolHub {
             .map(|(_, e)| e.fee_rate_sat_per_kvb())
             .collect();
         rates.sort_unstable();
-        // Median feerate (sat/kvB) → BTC/kB
-        let med = rates[rates.len() / 2];
-        (med as f64) / 100_000_000.0
+        let pct = if target_blocks <= 2 {
+            90
+        } else if target_blocks <= 6 {
+            50
+        } else {
+            20
+        };
+        let idx = ((rates.len().saturating_sub(1)) * pct) / 100;
+        let pick = rates[idx.min(rates.len() - 1)];
+        (pick as f64) / 100_000_000.0
     }
 
     /// Relay fee in BTC/kB (Libre 0.1 sat/vB = 100 sat/kvB).

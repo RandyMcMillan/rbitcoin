@@ -316,8 +316,20 @@ fn dispatch(
         "blockchain.scripthash.listunspent" => {
             let sh = param_scripthash(params, 0)?;
             let u = query.scripthash_listunspent(&sh).map_err(|e| e.to_string())?;
+            // Outpoints spent by mempool txs (confirmed or other mempool parents).
+            let spent = mempool
+                .map(|m| m.spent_outpoints())
+                .unwrap_or_default();
             let mut arr: Vec<Value> = u
                 .iter()
+                .filter(|x| {
+                    // Drop confirmed UTXOs spent by a live mempool tx.
+                    let op = bitcoin::OutPoint {
+                        txid: bitcoin::Txid::from_byte_array(x.tx_hash),
+                        vout: x.tx_pos,
+                    };
+                    !spent.contains(&op)
+                })
                 .map(|x| {
                     json!({
                         "tx_hash": txid_hex(&x.tx_hash),
@@ -327,11 +339,18 @@ fn dispatch(
                     })
                 })
                 .collect();
-            // Mempool outputs matching scripthash (unconfirmed UTXOs).
+            // Mempool outputs matching scripthash that are not spent by another mempool tx.
             if let Some(mp) = mempool {
                 for (txid, _fee, _w, tx) in mp.list_live() {
                     for (vout, o) in tx.output.iter().enumerate() {
                         if script_hash(o.script_pubkey.as_bytes()) != sh {
+                            continue;
+                        }
+                        let op = bitcoin::OutPoint {
+                            txid,
+                            vout: vout as u32,
+                        };
+                        if spent.contains(&op) {
                             continue;
                         }
                         arr.push(json!({

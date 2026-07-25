@@ -59,6 +59,12 @@ pub(crate) struct IbdPerfSample {
     pub sh_ms: u64,
     /// Post–Class C durable spend annotate wall (logged as `spend=` ms).
     pub utxo_ms: u64,
+    /// Write structural total (spentness+maturity+BIP68+subsidy); not load `connect`.
+    pub structural_ms: u64,
+    /// Structural sub: spentness + maturity + create-height.
+    pub structural_spent_ms: u64,
+    /// Structural sub: BIP68 + coin MTP.
+    pub structural_bip68_ms: u64,
     pub spend_ranged: u64,
     pub spend_idx: u64,
     pub spend_skip: u64,
@@ -75,6 +81,9 @@ pub(crate) struct IbdPerfSample {
     pub sh_ns: u64,
     pub tip_ns: u64,
     pub utxo_apply_ns: u64,
+    pub structural_ns: u64,
+    pub structural_spent_ns: u64,
+    pub structural_bip68_ns: u64,
     pub resolve_ns: u64,
     pub load_ns: u64,
     pub cache_tip_ns: u64,
@@ -204,6 +213,9 @@ impl Default for IbdPerfSample {
             strong_ms: 0,
             sh_ms: 0,
             utxo_ms: 0,
+            structural_ms: 0,
+            structural_spent_ms: 0,
+            structural_bip68_ms: 0,
             spend_ranged: 0,
             spend_idx: 0,
             spend_skip: 0,
@@ -219,6 +231,9 @@ impl Default for IbdPerfSample {
             sh_ns: 0,
             tip_ns: 0,
             utxo_apply_ns: 0,
+            structural_ns: 0,
+            structural_spent_ns: 0,
+            structural_bip68_ns: 0,
             resolve_ns: 0,
             load_ns: 0,
             cache_tip_ns: 0,
@@ -349,6 +364,9 @@ pub(crate) fn sample(
         spend_ranged,
         spend_idx,
         spend_skip,
+        structural_ns,
+        structural_spent_ns,
+        structural_bip68_ns,
     ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
     let (sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head) =
         rbitcoin_query::class_c_phase_stats::sample_sh_sub_and_reset();
@@ -396,6 +414,9 @@ pub(crate) fn sample(
         strong_ms: ns_ms(strong_ns),
         sh_ms: ns_ms(sh_ns),
         utxo_ms: ns_ms(utxo_apply_ns),
+        structural_ms: ns_ms(structural_ns),
+        structural_spent_ms: ns_ms(structural_spent_ns),
+        structural_bip68_ms: ns_ms(structural_bip68_ns),
         spend_ranged,
         spend_idx,
         spend_skip,
@@ -411,6 +432,9 @@ pub(crate) fn sample(
         sh_ns,
         tip_ns,
         utxo_apply_ns,
+        structural_ns,
+        structural_spent_ns,
+        structural_bip68_ns,
         resolve_ns,
         load_ns,
         cache_tip_ns,
@@ -526,12 +550,16 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     );
     // Confirm cost this window (ms totals + block count).
     // recon/wire folded: prefetch/wave are dead on Direct; show recon only if useful.
+    // Write phases: struct/bip68/class_c/sh/spend/tip_gc. `connect` is load assemble.
     out.push_str(&format!(
-        " | conf blks={} script={}ms load={}ms connect={}ms class_c={}ms sh={}ms spend={}ms tip_gc={}ms",
+        " | conf blks={} script={}ms load={}ms connect={}ms struct={}ms(spent={} bip68={}) class_c={}ms sh={}ms spend={}ms tip_gc={}ms",
         s.phase_blks,
         s.script_ms,
         s.load_ms,
         s.connect_ms,
+        s.structural_ms,
+        s.structural_spent_ms,
+        s.structural_bip68_ms,
         s.class_c_ms,
         s.sh_ms,
         s.utxo_ms,
@@ -606,11 +634,14 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let denom = s.phase_blks.max(1);
     let us = |ns: u64| (ns / denom) / 1000;
     let mut out = format!(
-        "ibd: perf_dbg us/blk recon={} wire={} connect={} script={} class_c={} sh={} spend={}(r={} i={} skip={}) load={} tip_gc={}",
+        "ibd: perf_dbg us/blk recon={} wire={} connect={} script={} struct={} spent={} bip68={} class_c={} sh={} spend={}(r={} i={} skip={}) load={} tip_gc={}",
         us(s.recon_ns),
         us(s.wire_ns),
         us(s.connect_ns),
         us(s.script_ns),
+        us(s.structural_ns),
+        us(s.structural_spent_ns),
+        us(s.structural_bip68_ns),
         us(s.class_c_ns),
         us(s.sh_ns),
         us(s.utxo_apply_ns),
@@ -826,6 +857,7 @@ mod tests {
         assert!(line.contains("load=30ms"), "{line}");
         assert!(line.contains("class_c=40ms"), "{line}");
         assert!(line.contains("spend=25ms"), "{line}");
+        assert!(line.contains("struct=0ms"), "{line}");
         assert!(line.contains("recon_ms=100"), "{line}"); // non-zero only
         assert!(!line.contains("prefetch"), "{line}");
         assert!(!line.contains("unpin"), "{line}");
@@ -843,10 +875,14 @@ mod tests {
         s.load_win_ms = 40;
         s.load_thin_ms = 5;
         s.sh_runs = 3;
+        s.structural_ms = 50;
+        s.structural_spent_ms = 30;
+        s.structural_bip68_ms = 20;
         let line = format_info(&s);
         assert!(line.contains("loadq=1/2 writeq=2/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
         assert!(line.contains("pin_cache=8 pin_new=12"), "{line}");
+        assert!(line.contains("struct=50ms(spent=30 bip68=20)"), "{line}");
         // pin_hit% = 8/(8+12) = 40
         assert!(line.contains("pin_hit%=40"), "{line}");
         assert!(line.contains("thin=5"), "{line}");

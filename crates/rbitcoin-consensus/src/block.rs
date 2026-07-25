@@ -985,6 +985,10 @@ pub(crate) fn structural_validate_spends(
     pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
     batch_parents: &rbitcoin_query::BatchParents,
 ) -> Result<(), ConsensusError> {
+    use crate::confirm_phase_stats;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
     let mut coinbase_height_cache: std::collections::HashMap<
         rbitcoin_primitives::Fk,
         Option<u32>,
@@ -995,6 +999,7 @@ pub(crate) fn structural_validate_spends(
     let maturity = ctx.params.coinbase_maturity();
     let cache = query.confirm_parent_cache();
 
+    let t_spent = Instant::now();
     for &(prev_txid, vout, _spend_fk, create_fk) in spends {
         let key = (prev_txid, vout);
         if pending_spent.contains(&key) {
@@ -1043,8 +1048,11 @@ pub(crate) fn structural_validate_spends(
         }
         pending_spent.insert(key);
     }
+    confirm_phase_stats::STRUCTURAL_SPENT_NS
+        .fetch_add(t_spent.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
     // BIP68 relative sequence locks (CSV package). Create heights from above.
+    let t_bip68 = Instant::now();
     if ctx.params.csv_active_at(ctx.height.0) {
         let prev_mtp = if ctx.height.0 == 0 {
             0
@@ -1094,6 +1102,8 @@ pub(crate) fn structural_validate_spends(
             return Err(ConsensusError::BadBlock("structural spends/tx input mismatch"));
         }
     }
+    confirm_phase_stats::STRUCTURAL_BIP68_NS
+        .fetch_add(t_bip68.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
     let _ = archived_tx_fks;
     check_coinbase_subsidy(block, ctx, fees)

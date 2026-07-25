@@ -252,9 +252,18 @@ pub(crate) fn spawn_confirm_engine(
                         feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                         let elapsed = t0.elapsed();
                         if elapsed.as_millis() > 2_000 {
+                            let p = rbitcoin_consensus::confirm_phase_stats::last_write_phases();
+                            let ms = rbitcoin_consensus::confirm_phase_stats::LastWritePhases::ms;
                             info!(
-                                "ibd: confirm write slow batch={n} first={first_h} {:?}",
-                                elapsed
+                                "ibd: confirm write slow batch={n} first={first_h} wall={:?} \
+                                 struct={}ms spent={}ms bip68={}ms class_c={}ms spend_ann={}ms tip_gc={}ms",
+                                elapsed,
+                                ms(p.structural_ns),
+                                ms(p.spent_ns),
+                                ms(p.bip68_ns),
+                                ms(p.class_c_ns),
+                                ms(p.spend_ann_ns),
+                                ms(p.tip_gc_ns),
                             );
                         }
                     }

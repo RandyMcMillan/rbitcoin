@@ -239,6 +239,9 @@ fn write_height_needed(tip: u32, height: u32) -> bool {
 }
 
 /// WRITE STAGE: structural → class_c → spend annotate → tip GC (FIFO caller).
+///
+/// Accrues window timers in [`confirm_phase_stats`] and snapshots the last batch
+/// for slow-write logs via [`confirm_phase_stats::last_write_phases`].
 pub fn confirm_write_phase(
     query: &Query,
     params: &ChainParams,
@@ -266,6 +269,12 @@ pub fn confirm_write_phase(
     batch.prepared = prep;
     batch.wire_blocks = wires;
 
+    let t_wall = Instant::now();
+    // Snapshot sub-counters before this batch so last-write phases are accurate
+    // even when concurrent windows also sample (write is single-threaded).
+    let spent0 = confirm_phase_stats::STRUCTURAL_SPENT_NS.load(Ordering::Relaxed);
+    let bip68_0 = confirm_phase_stats::STRUCTURAL_BIP68_NS.load(Ordering::Relaxed);
+    let t_struct = Instant::now();
     structural_run(
         query,
         params,
@@ -274,11 +283,41 @@ pub fn confirm_write_phase(
         &batch.wire_blocks,
         &batch.batch_parents,
     )?;
+    let structural_ns = t_struct.elapsed().as_nanos() as u64;
+    let spent_ns = confirm_phase_stats::STRUCTURAL_SPENT_NS
+        .load(Ordering::Relaxed)
+        .saturating_sub(spent0);
+    let bip68_ns = confirm_phase_stats::STRUCTURAL_BIP68_NS
+        .load(Ordering::Relaxed)
+        .saturating_sub(bip68_0);
+
     let n_blocks = batch.prepared.len();
+    let t_cc = Instant::now();
     let out = class_c_commit(query, &mut batch.prepared)?;
+    let class_c_ns = t_cc.elapsed().as_nanos() as u64;
+
+    let spend0 = confirm_phase_stats::UTXO_APPLY_NS.load(Ordering::Relaxed);
+    let tip0 = confirm_phase_stats::CACHE_TIP_NS.load(Ordering::Relaxed);
     post_commit(query, &batch.prepared)?;
+    let spend_ann_ns = confirm_phase_stats::UTXO_APPLY_NS
+        .load(Ordering::Relaxed)
+        .saturating_sub(spend0);
+    let tip_gc_ns = confirm_phase_stats::CACHE_TIP_NS
+        .load(Ordering::Relaxed)
+        .saturating_sub(tip0);
+
     // batch_parents dropped here with ScriptOkBatch — no tip GC of sparse pins.
     confirm_phase_stats::BLOCKS.fetch_add(n_blocks as u64, Ordering::Relaxed);
+    confirm_phase_stats::note_last_write(confirm_phase_stats::LastWritePhases {
+        n_blocks: n_blocks as u32,
+        wall_ns: t_wall.elapsed().as_nanos() as u64,
+        structural_ns,
+        spent_ns,
+        bip68_ns,
+        class_c_ns,
+        spend_ann_ns,
+        tip_gc_ns,
+    });
     Ok(out)
 }
 

@@ -126,13 +126,17 @@ pub mod confirm_phase_stats {
     /// Optimistic assemble (prevout content + jobs; no durable spentness).
     pub static CONNECT_NS: AtomicU64 = AtomicU64::new(0);
     pub static SCRIPT_NS: AtomicU64 = AtomicU64::new(0);
-    /// Post-script durable spentness + maturity + subsidy.
+    /// Post-script durable spentness + maturity + BIP68 + subsidy (write).
     pub static STRUCTURAL_NS: AtomicU64 = AtomicU64::new(0);
+    /// Spentness + coinbase maturity + create-height resolve (subset of structural).
+    pub static STRUCTURAL_SPENT_NS: AtomicU64 = AtomicU64::new(0);
+    /// BIP68 relative locks + coin MTP (subset of structural; write path).
+    pub static STRUCTURAL_BIP68_NS: AtomicU64 = AtomicU64::new(0);
     /// Class C wall (`confirm_blocks_run` total).
     pub static CLASS_C_NS: AtomicU64 = AtomicU64::new(0);
     /// Post–Class C durable spend annotation batch.
     ///
-    /// Historical name `UTXO_APPLY_NS` / log field `utxo_ms` — this is **not** a
+    /// Historical name `UTXO_APPLY_NS` / log field `spend=` ms — this is **not** a
     /// light-UTXO map apply (Catchup removed). Wall time for all annotate paths.
     pub static UTXO_APPLY_NS: AtomicU64 = AtomicU64::new(0);
     /// Annotate edges using cache-held body range (no idx).
@@ -151,17 +155,77 @@ pub mod confirm_phase_stats {
     pub static CACHE_TIP_NS: AtomicU64 = AtomicU64::new(0);
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
 
+    // ── Last completed write batch (for slow-write logs; not window-summed) ──
+    static LAST_WRITE_N: AtomicU64 = AtomicU64::new(0);
+    static LAST_WRITE_STRUCTURAL_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_WRITE_SPENT_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_WRITE_BIP68_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_WRITE_CLASS_C_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_WRITE_SPEND_ANN_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_WRITE_TIP_GC_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_WRITE_WALL_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// Snapshot of the most recent successful [`super::confirm_write_phase`].
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct LastWritePhases {
+        pub n_blocks: u32,
+        pub wall_ns: u64,
+        pub structural_ns: u64,
+        pub spent_ns: u64,
+        pub bip68_ns: u64,
+        pub class_c_ns: u64,
+        pub spend_ann_ns: u64,
+        pub tip_gc_ns: u64,
+    }
+
+    impl LastWritePhases {
+        #[inline]
+        pub fn ms(ns: u64) -> u64 {
+            ns / 1_000_000
+        }
+    }
+
+    /// Record per-batch write phases (called from write stage; overwrites prior).
+    pub fn note_last_write(p: LastWritePhases) {
+        LAST_WRITE_N.store(u64::from(p.n_blocks), Ordering::Relaxed);
+        LAST_WRITE_WALL_NS.store(p.wall_ns, Ordering::Relaxed);
+        LAST_WRITE_STRUCTURAL_NS.store(p.structural_ns, Ordering::Relaxed);
+        LAST_WRITE_SPENT_NS.store(p.spent_ns, Ordering::Relaxed);
+        LAST_WRITE_BIP68_NS.store(p.bip68_ns, Ordering::Relaxed);
+        LAST_WRITE_CLASS_C_NS.store(p.class_c_ns, Ordering::Relaxed);
+        LAST_WRITE_SPEND_ANN_NS.store(p.spend_ann_ns, Ordering::Relaxed);
+        LAST_WRITE_TIP_GC_NS.store(p.tip_gc_ns, Ordering::Relaxed);
+    }
+
+    pub fn last_write_phases() -> LastWritePhases {
+        LastWritePhases {
+            n_blocks: LAST_WRITE_N.load(Ordering::Relaxed) as u32,
+            wall_ns: LAST_WRITE_WALL_NS.load(Ordering::Relaxed),
+            structural_ns: LAST_WRITE_STRUCTURAL_NS.load(Ordering::Relaxed),
+            spent_ns: LAST_WRITE_SPENT_NS.load(Ordering::Relaxed),
+            bip68_ns: LAST_WRITE_BIP68_NS.load(Ordering::Relaxed),
+            class_c_ns: LAST_WRITE_CLASS_C_NS.load(Ordering::Relaxed),
+            spend_ann_ns: LAST_WRITE_SPEND_ANN_NS.load(Ordering::Relaxed),
+            tip_gc_ns: LAST_WRITE_TIP_GC_NS.load(Ordering::Relaxed),
+        }
+    }
+
     /// Sample and reset all confirm phases.
     ///
     /// Returns
     /// `(recon, wire, connect, script, class_c, strong, scripthash, tip,
     ///   utxo_apply, blocks, resolve, load, unpin, cache_tip,
-    ///   spend_ranged, spend_idx, spend_skip)`.
+    ///   spend_ranged, spend_idx, spend_skip, structural, structural_spent,
+    ///   structural_bip68)`.
     /// `strong` / `scripthash` / `tip` come from [`rbitcoin_query::class_c_phase_stats`].
     /// `recon` prefers wire sub-timer, else legacy total.
+    /// `connect` is **load assemble**, not write structural — see `structural`.
     #[allow(clippy::type_complexity)]
     pub fn sample_and_reset()
     -> (
+        u64,
+        u64,
+        u64,
         u64,
         u64,
         u64,
@@ -202,6 +266,9 @@ pub mod confirm_phase_stats {
             SPEND_ANNOTATE_RANGED.swap(0, Ordering::Relaxed),
             SPEND_ANNOTATE_IDX.swap(0, Ordering::Relaxed),
             SPEND_ANNOTATE_SKIP.swap(0, Ordering::Relaxed),
+            STRUCTURAL_NS.swap(0, Ordering::Relaxed),
+            STRUCTURAL_SPENT_NS.swap(0, Ordering::Relaxed),
+            STRUCTURAL_BIP68_NS.swap(0, Ordering::Relaxed),
         )
     }
 }

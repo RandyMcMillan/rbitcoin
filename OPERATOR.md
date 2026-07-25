@@ -54,7 +54,7 @@ At **info**, you only get progress + slim perf. Enable **debug** when diagnosing
 | Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` (`0` = full scripts) |
 | Archive queue RAM | **512 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
-| Bulk store reads | **io_uring** (Linux) | Head resolve + confirm bodies + **`tx.head` resize body-txid fill** (**pread**). Archive `tx.head` insert stays **mmap** (uring pwrite measured slower). `RBITCOIN_IO_URING=0` → pread fallback; `RBITCOIN_BULK_IO_WORKERS` for fallback parallelism |
+| Bulk store IO | **io_uring** (Linux) | Head resolve + confirm bodies + **`tx.head` resize body-txid fill** (**pread**). **`tx.head` insert_many**: group by probe page → pipeline page RMW (pread → in-memory hop inserts → pwrite write-back; ring kept full). `RBITCOIN_IO_URING=0` → serial pread/pwrite (or per-slot mmap fallback); `RBITCOIN_BULK_IO_WORKERS` for pread fallback parallelism |
 | `tx.head` fill (rebuild + online resize) | shared knobs | `RBITCOIN_TX_HEAD_READ_BATCH` (default **65536**, max 1e6) — Class A fks per idx+txid bulk read; `RBITCOIN_TX_HEAD_WRITE_CHUNK` (default **4096**, max 65536) — `insert_many` size (one fence/group); `RBITCOIN_TX_HEAD_FILL_WAVE` (default **1048576**) — fks per bg resize poll wave / progress log. Legacy `RBITCOIN_TX_HEAD_RESIZE_*` names still accepted |
 | Confirm stages | **load · scripts · write** | Pipeline queues cap **2** each (`loadq=n/2 writeq=m/2`; `name<0/cap` when the next worker is waiting on an empty queue) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |

@@ -307,6 +307,36 @@ pub fn entry_from_page_buf(buf: &[u8], local: u64, entry_bytes: u8) -> Option<u6
     })
 }
 
+/// Encode create_fk into a page buffer at local slot index (in-memory insert).
+#[inline]
+fn store_entry_in_page(
+    buf: &mut [u8],
+    local: u64,
+    entry_bytes: u8,
+    new_u: u64,
+) -> Result<(), StoreError> {
+    let es = entry_bytes as usize;
+    let off = (local as usize)
+        .checked_mul(es)
+        .ok_or(StoreError::Corrupt("address head page store OOB"))?;
+    if off + es > buf.len() {
+        return Err(StoreError::Corrupt("address head page store OOB"));
+    }
+    match entry_bytes {
+        4 => {
+            if new_u > u64::from(u32::MAX) {
+                return Err(StoreError::InvalidFk);
+            }
+            buf[off..off + 4].copy_from_slice(&(new_u as u32).to_le_bytes());
+        }
+        8 => {
+            buf[off..off + 8].copy_from_slice(&new_u.to_le_bytes());
+        }
+        _ => return Err(StoreError::Corrupt("address head entry_bytes")),
+    }
+    Ok(())
+}
+
 /// Result of hopping through one loaded page.
 #[derive(Debug, Clone)]
 pub struct ProbeRegionScan {
@@ -747,7 +777,7 @@ impl AddressHead {
     /// Sole-writer insert into first empty **in-page** probe slot (no CAS).
     ///
     /// Idempotent if `new_fk` is already on the chain. Loads **one page**, then
-    /// double-hash hops in memory.
+    /// double-hash hops in memory. Prefer [`Self::insert_many`] (page-grouped RMW).
     fn insert_one(&self, txid: &[u8; 32], new_fk: Fk) -> Result<(), StoreError> {
         let new_u = self.encode_fk(new_fk)?;
         let bits = self.layout.bits;
@@ -787,22 +817,190 @@ impl AddressHead {
         Err(StoreError::Corrupt("address head probe exhausted on insert"))
     }
 
-    /// Bulk insert in **call order** (no sort). Plain Release mmap stores;
-    /// **SeqCst fence** at end so concurrent Acquire probes observe the batch.
+    /// Apply all inserts for one loaded page buffer. Returns whether the buffer
+    /// was modified (needs write-back). Updates `occupied_delta` for new slots.
+    fn apply_page_inserts(
+        &self,
+        page_buf: &mut [u8],
+        inserts: &[([u8; 32], Fk)],
+        occupied_delta: &mut u64,
+    ) -> Result<bool, StoreError> {
+        let bits = self.layout.bits;
+        let es = self.layout.entry_bytes;
+        let es_u = es as usize;
+        if page_buf.len() < es_u {
+            note_probe_exhausted();
+            return Err(StoreError::Corrupt("address head probe page empty"));
+        }
+        let nslots = (page_buf.len() / es_u) as u64;
+        let mut dirty = false;
+        for (txid, fk) in inserts {
+            let new_u = self.encode_fk(*fk)?;
+            let h1 = h1_in_page(txid, bits);
+            let h2 = h2_in_page(txid, bits);
+            let scan = hop_scan_page(page_buf, es, h1, h2, nslots, MAX_PROBE);
+            let mut already = false;
+            for &(_d, e) in &scan.cands {
+                if e == new_u {
+                    already = true;
+                    break;
+                }
+            }
+            if already {
+                continue;
+            }
+            if !scan.hit_empty {
+                note_probe_exhausted();
+                return Err(StoreError::Corrupt("address head probe exhausted on insert"));
+            }
+            note_probe_depth_on_insert(scan.depth_end);
+            store_entry_in_page(page_buf, scan.empty_local, es, new_u)?;
+            *occupied_delta += 1;
+            dirty = true;
+        }
+        Ok(dirty)
+    }
+
+    /// Bulk insert: **group by probe page**, pipeline page RMW (pread → mutate →
+    /// pwrite). With io_uring, reads refill as CQEs free slots and each completed
+    /// page is write-back submitted immediately. Without uring, serial pread/pwrite.
+    ///
+    /// Cross-page order is not preserved (page-local probing is independent).
+    /// Within a page, inserts run in call order. **SeqCst fence** at end so
+    /// concurrent Acquire probes observe the batch.
     ///
     /// Does **not** take [`lock_writes`] — that is only for resize swap.
-    ///
-    /// Note: io_uring pwrite inserts were measured slower than mmap on warm
-    /// `tx.head` (~5× head ms/blk); archive write stays on this path.
     pub fn insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
         }
+        self.insert_many_by_page(entries)?;
+        std::sync::atomic::fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Page-grouped RMW insert (no final fence — caller publishes).
+    fn insert_many_by_page(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
+        let bits = self.layout.bits;
+        let es = self.layout.entry_bytes;
+        let es_u = es as usize;
+        let page_slots = page_slot_count(bits);
+        let data_end = self.file.data_len();
+        let fd = self.file.read_fd();
+
+        // Group inserts by page_base, preserving first-seen page order and
+        // within-page call order.
+        let mut page_order: Vec<u64> = Vec::new();
+        let mut groups: std::collections::HashMap<u64, Vec<([u8; 32], Fk)>> =
+            std::collections::HashMap::new();
+        for (txid, fk) in entries {
+            let page_base = if bits <= PAGE_SLOT_BITS {
+                0
+            } else {
+                page_index(txid, bits) << PAGE_SLOT_BITS
+            };
+            match groups.entry(page_base) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    e.get_mut().push((*txid, *fk));
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    page_order.push(page_base);
+                    e.insert(vec![(*txid, *fk)]);
+                }
+            }
+        }
+
+        let n_pages = page_order.len();
+        // One heap buffer per unique page (≤ 8 KiB each @ 8 B entries).
+        let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(n_pages);
+        let mut insert_lists: Vec<Vec<([u8; 32], Fk)>> = Vec::with_capacity(n_pages);
+        let mut offsets: Vec<u64> = Vec::with_capacity(n_pages);
+
+        for page_base in page_order {
+            let inserts = groups.remove(&page_base).expect("grouped");
+            let off = self.entry_off(page_base);
+            let mut need = (page_slots as usize).saturating_mul(es_u);
+            let avail = data_end.saturating_sub(off) as usize;
+            need = need.min(avail);
+            need = (need / es_u) * es_u;
+            if need == 0 {
+                note_probe_exhausted();
+                return Err(StoreError::Corrupt("address head probe page empty"));
+            }
+            bufs.push(vec![0u8; need]);
+            insert_lists.push(inserts);
+            offsets.push(off);
+        }
+
+        let mut occupied_delta = 0u64;
+        let mut apply_err: Option<StoreError> = None;
+
+        let mut pages: Vec<crate::bulk_io::PageRmw<'_>> = bufs
+            .iter_mut()
+            .zip(offsets.iter())
+            .map(|(buf, &offset)| crate::bulk_io::PageRmw {
+                fd,
+                offset,
+                buf: buf.as_mut_slice(),
+            })
+            .collect();
+
+        // Closure dropped before fallback so `apply_err` / `occupied_delta` are free.
+        let pipelined_ok = crate::bulk_io::io_uring_enabled()
+            && crate::bulk_io::page_rmw_pipelined(&mut pages, |i, buf| {
+                if apply_err.is_some() {
+                    return false;
+                }
+                match self.apply_page_inserts(buf, &insert_lists[i], &mut occupied_delta) {
+                    Ok(dirty) => dirty,
+                    Err(e) => {
+                        apply_err = Some(e);
+                        true // write back any partial applies on this page
+                    }
+                }
+            });
+
+        let ok = if pipelined_ok {
+            true
+        } else if apply_err.is_none() && occupied_delta == 0 {
+            crate::bulk_io::page_rmw_serial(&mut pages, |i, buf| {
+                if apply_err.is_some() {
+                    return false;
+                }
+                match self.apply_page_inserts(buf, &insert_lists[i], &mut occupied_delta) {
+                    Ok(dirty) => dirty,
+                    Err(e) => {
+                        apply_err = Some(e);
+                        true
+                    }
+                }
+            })
+        } else {
+            false
+        };
+
+        if occupied_delta > 0 {
+            self.occupied.fetch_add(occupied_delta, Ordering::Relaxed);
+        }
+        if let Some(e) = apply_err {
+            return Err(e);
+        }
+        if !ok {
+            // RMW IO failed: remaining inserts via per-entry mmap (idempotent
+            // for pages already write-backed).
+            return self.insert_many_mmap_fallback(entries);
+        }
+        Ok(())
+    }
+
+    /// Per-entry mmap insert (legacy path / RMW IO failure fallback).
+    fn insert_many_mmap_fallback(
+        &self,
+        entries: &[([u8; 32], Fk)],
+    ) -> Result<(), StoreError> {
         for (txid, fk) in entries {
             self.insert_one(txid, *fk)?;
         }
-        // Publish the batch for readers (pairs with Acquire loads in read_entry).
-        std::sync::atomic::fence(Ordering::SeqCst);
         Ok(())
     }
 
@@ -1311,6 +1509,45 @@ mod tests {
         for (txid, fk) in &entries {
             assert!(h.probe_fks(txid).unwrap().contains(fk));
         }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(meta_path(&path));
+    }
+
+    /// Many inserts spanning multiple pages + multi-hit same page; page RMW path.
+    #[test]
+    fn insert_many_page_rmw_multi_page() {
+        let path = tmp("page_rmw");
+        // bits=14 → 16 pages × 1024 slots (page-local at bits>10).
+        let h = AddressHead::create_with_bits(&path, 14).unwrap();
+        let mut entries = Vec::new();
+        for i in 1..=400u64 {
+            let mut txid = [0u8; 32];
+            // Spread across page-index bits and collide some within a page.
+            txid[0] = (i & 0xff) as u8;
+            txid[1] = ((i >> 8) & 0xff) as u8;
+            txid[2] = ((i * 17) & 0xff) as u8;
+            txid[3] = ((i * 31) & 0xff) as u8;
+            txid[4] = 0xa5;
+            entries.push((txid, Fk(i)));
+        }
+        h.insert_many(&entries).unwrap();
+        assert_eq!(h.occupied(), 400);
+        // Idempotent second wave (same fk on chain).
+        h.insert_many(&entries[..50]).unwrap();
+        assert_eq!(h.occupied(), 400);
+        for (txid, fk) in &entries {
+            assert!(
+                h.probe_fks(txid).unwrap().contains(fk),
+                "missing {fk:?} after page RMW insert"
+            );
+        }
+        // Mixed with single insert path still works.
+        let mut extra = [0u8; 32];
+        extra[0] = 0xee;
+        extra[1] = 0xff;
+        h.insert(&extra, Fk(9001)).unwrap();
+        assert!(h.probe_fks(&extra).unwrap().contains(&Fk(9001)));
+        assert_eq!(h.occupied(), 401);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(meta_path(&path));
     }

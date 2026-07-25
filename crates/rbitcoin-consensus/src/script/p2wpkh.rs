@@ -45,9 +45,14 @@ pub(crate) fn verify(
 
     let amount = job.prevouts[input_index].value;
     let spk_script = job.prevouts[input_index].script_pubkey.as_script();
-    // Raw hashtype (not from_consensus→to_u32): non-standard bytes e.g. 0x65.
-    let _ = cache; // keep signature for callers that share a cache across inputs
-    let sighash = crypto::bip143_p2wpkh_signature_hash(tx, input_index, spk_script, amount, sighash_ty)?;
+    let sighash = crypto::bip143_p2wpkh_signature_hash(
+        tx,
+        input_index,
+        spk_script,
+        amount,
+        sighash_ty,
+        cache,
+    )?;
     if crypto::verify_ecdsa(sighash, &sig, &pubkey) {
         Ok(())
     } else {
@@ -87,9 +92,14 @@ pub(crate) fn verify_with_keyhash(
 
     let amount = job.prevouts[input_index].value;
     let spk = bitcoin::script::Script::from_bytes(witness_program);
-    let _ = cache;
-    let sighash =
-        crypto::bip143_p2wpkh_signature_hash(tx, input_index, spk, amount, sighash_ty)?;
+    let sighash = crypto::bip143_p2wpkh_signature_hash(
+        tx,
+        input_index,
+        spk,
+        amount,
+        sighash_ty,
+        cache,
+    )?;
     if crypto::verify_ecdsa(sighash, &sig, &pubkey) {
         Ok(())
     } else {

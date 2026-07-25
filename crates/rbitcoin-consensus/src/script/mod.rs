@@ -394,17 +394,49 @@ pub(crate) mod crypto {
     }
 
     /// P2WPKH BIP143 hash: `script_pubkey` is native spk **or** nested redeem (`00 14 <20>`).
+    ///
+    /// Fast path: when `raw_ty` round-trips through [`EcdsaSighashType`] (standard
+    /// 0x01/02/03/81/82/83), use rust-bitcoin's [`SighashCache`] midstate
+    /// (hashPrevouts/hashSequence/hashOutputs once per tx). Slow path: non-standard
+    /// raw types (e.g. mainnet `0x65`) need our raw-uint32 encoder.
     pub fn bip143_p2wpkh_signature_hash(
         tx: &bitcoin::Transaction,
         input_index: usize,
         script_pubkey: &bitcoin::Script,
         amount: bitcoin::Amount,
         raw_ty: u32,
+        cache: &mut bitcoin::sighash::SighashCache<&bitcoin::Transaction>,
     ) -> Result<[u8; 32], ConsensusError> {
+        let mapped = EcdsaSighashType::from_consensus(raw_ty);
+        if mapped.to_u32() == raw_ty {
+            return cache
+                .p2wpkh_signature_hash(input_index, script_pubkey, amount, mapped)
+                .map(|h| h.to_byte_array())
+                .map_err(|_| ConsensusError::Script("p2wpkh sighash".into()));
+        }
         let script_code = script_pubkey
             .p2wpkh_script_code()
             .ok_or_else(|| ConsensusError::Script("bip143 not p2wpkh".into()))?;
         bip143_signature_hash(tx, input_index, script_code.as_script(), amount, raw_ty)
+    }
+
+    /// P2WSH / tapscript-free WitnessV0 BIP143 with the same fast/slow split.
+    pub fn bip143_p2wsh_signature_hash(
+        tx: &bitcoin::Transaction,
+        input_index: usize,
+        witness_script: &bitcoin::Script,
+        amount: bitcoin::Amount,
+        raw_ty: u32,
+        cache: &mut bitcoin::sighash::SighashCache<&bitcoin::Transaction>,
+    ) -> Result<[u8; 32], ConsensusError> {
+        let mapped = EcdsaSighashType::from_consensus(raw_ty);
+        if mapped.to_u32() == raw_ty {
+            return cache
+                .p2wsh_signature_hash(input_index, witness_script, amount, mapped)
+                .map(|h| h.to_byte_array())
+                .map_err(|_| ConsensusError::Script("p2wsh sighash".into()));
+        }
+        bip143_signature_hash(tx, input_index, witness_script, amount, raw_ty)
     }
 
     /// Verify ECDSA under **Bitcoin consensus** rules.

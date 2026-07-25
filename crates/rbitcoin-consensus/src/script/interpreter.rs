@@ -1209,13 +1209,14 @@ fn sighash_for_script(
             Ok(h.to_byte_array())
         }
         SigVersion::WitnessV0 => {
-            // Raw nHashType in BIP143 final uint32 (not enum to_u32).
-            crypto::bip143_signature_hash(
+            let mut cache = ctx.cache.borrow_mut();
+            crypto::bip143_p2wsh_signature_hash(
                 ctx.tx,
                 ctx.input_index,
                 script_code,
                 ctx.amount,
                 ty_raw,
+                &mut cache,
             )
         }
         SigVersion::TapScript => unreachable!(),

@@ -462,6 +462,14 @@ impl Query {
                 bulk_slot_for_job.insert(job_i, slot);
             }
 
+            // Full dense outs for OutFifo (hit rate); BatchParents only need slim.
+            let mut fifo_seed: Vec<(
+                Fk,
+                u32,
+                rbitcoin_store::TxRecord,
+                Vec<rbitcoin_store::OutputRecord>,
+            )> = Vec::with_capacity(jobs.len());
+
             for (ji, (pid, need_vouts, range)) in jobs.into_iter().enumerate() {
                 if self.confirm_cancelled() {
                     crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
@@ -473,7 +481,8 @@ impl Query {
                         if let Some(&slot) = bulk_slot_for_job.get(&ji) {
                             if let Some((tx, outs)) = bulk_decoded[slot].take() {
                                 let live = slim_dense_outs_to_need(&outs, &need_vouts);
-                                drop(outs);
+                                // Seed FIFO with **all** outs before consuming dense vec.
+                                fifo_seed.push((fk, 0, tx.clone(), outs));
                                 batch_parents.insert_owned(fk, tx, live, need_vouts, None);
                                 st.full_tx_reads = st.full_tx_reads.saturating_add(1);
                             }
@@ -482,12 +491,15 @@ impl Query {
                 } else if !need_vouts.is_empty() {
                     if let Ok((tx, outs)) = self.store.get_tx_meta_and_outputs(fk) {
                         let live = slim_dense_outs_to_need(&outs, &need_vouts);
+                        fifo_seed.push((fk, 0, tx.clone(), outs));
                         batch_parents.insert_owned(fk, tx, live, need_vouts, None);
                         st.full_tx_reads = st.full_tx_reads.saturating_add(1);
                     }
                 }
                 st.utxo_parents = st.utxo_parents.saturating_add(1);
             }
+            // One lock for the chunk: future pin batches hit these parents.
+            self.confirm_parents.put_dense_outs_batch(fifo_seed);
         }
         st.pin_new_meta_ns = st
             .pin_new_meta_ns

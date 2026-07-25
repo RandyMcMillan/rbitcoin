@@ -221,7 +221,8 @@ impl ConfirmParentCache {
     }
 
     /// Outs FIFO put from batch-local full bodies (load → wire keeps full Class A
-    /// separately). Clones meta+outs into the FIFO; does not retain inputs.
+    /// separately). Clones **all** outs (not need-vouts only) so later batches
+    /// that spend other vouts of the same create hit the FIFO.
     pub fn put_bodies_from_batch_full(&self, bodies: &crate::BatchFullBodies) {
         if bodies.is_empty() {
             return;
@@ -237,8 +238,38 @@ impl ConfirmParentCache {
                 CreateOuts {
                     height,
                     tx: tx.clone(),
-                    outputs: outs.to_vec(),
+                    outputs: outs.to_vec(), // dense: full output_count
                     is_coinbase,
+                },
+            );
+        }
+    }
+
+    /// Seed FIFO with dense outs from pin_new store loads (no inputs available).
+    ///
+    /// `is_coinbase` is false when unknown (1-in without prevout scan); maturity
+    /// still runs in structural write. Callers must pass **all** outs, not slim.
+    pub fn put_dense_outs_batch(
+        &self,
+        items: Vec<(Fk, u32, TxRecord, Vec<OutputRecord>)>,
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        for (fk, height, tx, outputs) in items {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            // Without inputs we cannot prove coinbase; leave false (structural
+            // write still does maturity). Multi-in is never coinbase.
+            let _ = g.outs.insert(
+                id,
+                CreateOuts {
+                    height,
+                    tx,
+                    outputs,
+                    is_coinbase: false,
                 },
             );
         }
@@ -657,10 +688,37 @@ mod tests {
         assert_eq!(outs[0].0, 0);
         assert_eq!(outs[1].0, 2);
         assert_eq!(cb, Some(true));
+        // FIFO still holds all three outs for a later need of vout 1.
+        let need1 = [1u32];
+        let hits1 = c.get_bodies_for_pin_batch(&[(77, &need1)]);
+        assert_eq!(hits1.get(&77).unwrap().2.len(), 1);
+        assert_eq!(hits1.get(&77).unwrap().2[0].0, 1);
         let mut bp = crate::BatchParents::new();
         bp.insert_owned(Fk(77), txr, outs, need.to_vec(), Some(Some(5)));
         assert!(bp.pin_covered(Fk(77), &[0, 2]));
         assert!(!bp.pin_covered(Fk(77), &[0, 1]));
+    }
+
+    #[test]
+    fn put_dense_outs_batch_keeps_all_vouts_for_later_hits() {
+        let c = ConfirmParentCache::new();
+        c.advance_tip(0);
+        let t = tx(9);
+        // pin_new path: seed full dense outs after store decode.
+        c.put_dense_outs_batch(vec![(
+            Fk(90),
+            0,
+            t.clone(),
+            vec![out(1), out(2), out(3), out(4)],
+        )]);
+        assert_eq!(c.body_count(), 1);
+        // Later batch needs a different vout than first pin — must still hit.
+        let hits = c.get_bodies_for_pin_batch(&[(90, &[3u32][..])]);
+        assert_eq!(hits.get(&90).unwrap().2.len(), 1);
+        assert_eq!(hits.get(&90).unwrap().2[0].1.value, 4);
+        // And all four still addressable.
+        let hits_all = c.get_bodies_for_pin_batch(&[(90, &[0u32, 1, 2, 3][..])]);
+        assert_eq!(hits_all.get(&90).unwrap().2.len(), 4);
     }
 
     #[test]

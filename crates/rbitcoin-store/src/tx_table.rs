@@ -2489,15 +2489,15 @@ impl TxTable {
     }
 
     /// `insert_many` group size when filling a head (one SeqCst fence per group).
-    /// `RBITCOIN_TX_HEAD_WRITE_CHUNK` (default **4096**); legacy
+    /// `RBITCOIN_TX_HEAD_WRITE_CHUNK` (default **65536**, same as read batch); legacy
     /// `RBITCOIN_TX_HEAD_RESIZE_WRITE_CHUNK` still accepted.
     fn head_fill_write_chunk() -> usize {
         env_u64(
             "RBITCOIN_TX_HEAD_WRITE_CHUNK",
             "RBITCOIN_TX_HEAD_RESIZE_WRITE_CHUNK",
-            4_096,
-            64,
             65_536,
+            64,
+            1_000_000,
         ) as usize
     }
 

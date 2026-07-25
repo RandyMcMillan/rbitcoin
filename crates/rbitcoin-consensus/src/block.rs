@@ -1,7 +1,6 @@
 use crate::error::ConsensusError;
 use crate::milestone::Milestone;
 use crate::params::ChainParams;
-use bitcoin::absolute::LockTime;
 use bitcoin::block::Block;
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::script::{Script, ScriptBuf};
@@ -551,6 +550,7 @@ fn assemble_block_prevouts_mode(
             } else {
                 Vec::new()
             };
+            let mut input_create_heights: Vec<u32> = Vec::with_capacity(tx.input.len());
             // Thin create_fk edges from this confirm batch (batch-local).
             let thin = spend_fk.and_then(|fk| fk.get().and_then(|id| batch_thin.get(&id)));
 
@@ -612,6 +612,7 @@ fn assemble_block_prevouts_mode(
                     &same_block,
                     &mut coinbase_height_cache,
                     batch_parents,
+                    ctx.height.0,
                 )?;
                 if mode == AssembleMode::Full {
                     if let Some(created) = prev_out.coinbase_height {
@@ -633,8 +634,48 @@ fn assemble_block_prevouts_mode(
                 value_in = value_in
                     .checked_add(prev_out.txout.value.to_sat() as i64)
                     .ok_or(ConsensusError::BadTx("value in overflow"))?;
+                input_create_heights.push(prev_out.create_height);
                 if build_script_jobs {
                     prevouts.push(prev_out.txout);
+                }
+            }
+
+            // BIP113 absolute finality + BIP68 relative sequence locks (CSV package).
+            let lock_time_cutoff = if ctx.params.csv_active_at(ctx.height.0) {
+                if ctx.height.0 == 0 {
+                    block.header.time
+                } else {
+                    crate::header::median_time_past(query, Height(ctx.height.0 - 1))?
+                }
+            } else {
+                block.header.time
+            };
+            if !is_final_tx(tx, ctx.height.0, lock_time_cutoff) {
+                return Err(ConsensusError::BadTx("not final"));
+            }
+            if ctx.params.csv_active_at(ctx.height.0) {
+                let mut coin_mtps = Vec::with_capacity(input_create_heights.len());
+                for &ch in &input_create_heights {
+                    let mtp = if ch == 0 {
+                        0
+                    } else {
+                        crate::header::median_time_past(query, Height(ch.saturating_sub(1)))?
+                    };
+                    coin_mtps.push(mtp);
+                }
+                let prev_mtp = if ctx.height.0 == 0 {
+                    0
+                } else {
+                    crate::header::median_time_past(query, Height(ctx.height.0 - 1))?
+                };
+                if !sequence_locks_satisfied(
+                    tx,
+                    &input_create_heights,
+                    &coin_mtps,
+                    ctx.height.0,
+                    prev_mtp,
+                ) {
+                    return Err(ConsensusError::BadTx("bad-txns-nonfinal"));
                 }
             }
 
@@ -683,7 +724,6 @@ fn assemble_block_prevouts_mode(
         same_block.insert(txid, ti);
     }
 
-    let _ = LockTime::ZERO;
     Ok((script_jobs, spends, fees))
 }
 
@@ -855,6 +895,77 @@ struct ResolvedPrevout {
     txout: TxOut,
     /// `Some(create_height)` when prev is a confirmed coinbase (maturity check).
     coinbase_height: Option<u32>,
+    /// Block height that created this UTXO (BIP68). Same-block → spending height.
+    create_height: u32,
+}
+
+/// BIP65/113 nLockTime threshold: values below are block heights, above are unix times.
+pub const LOCKTIME_THRESHOLD: u32 = 500_000_000;
+
+/// Core `IsFinalTx`: absolute locktime vs block height / time cutoff.
+///
+/// `lock_time_cutoff` is the comparison time: **MTP of the previous block** after
+/// BIP113 (CSV package), else the block header timestamp.
+pub fn is_final_tx(tx: &Transaction, block_height: u32, lock_time_cutoff: u32) -> bool {
+    let lt = tx.lock_time.to_consensus_u32();
+    if lt == 0 {
+        return true;
+    }
+    if lt < LOCKTIME_THRESHOLD {
+        if lt < block_height {
+            return true;
+        }
+    } else if lt < lock_time_cutoff {
+        return true;
+    }
+    // Still final if every input sequence is SEQUENCE_FINAL (0xffffffff).
+    tx.input.iter().all(|i| i.sequence.is_final())
+}
+
+/// BIP68 relative locks when `tx.version >= 2`.
+///
+/// `prev_heights[i]` / `prev_mtps[i]`: create height and MTP of the block *before*
+/// the creating block (for time-based locks; use 0 when create height is 0).
+/// `block_height` = containing block; `block_prev_mtp` = MTP of previous block.
+pub fn sequence_locks_satisfied(
+    tx: &Transaction,
+    prev_heights: &[u32],
+    prev_coin_mtps: &[u32],
+    block_height: u32,
+    block_prev_mtp: u32,
+) -> bool {
+    if tx.version.0 < 2 {
+        return true;
+    }
+    const DISABLE: u32 = 1 << 31;
+    const TYPE_FLAG: u32 = 1 << 22;
+    const MASK: u32 = 0x0000_ffff;
+    const GRANULARITY: u32 = 9;
+
+    let mut min_height: i64 = -1;
+    let mut min_time: i64 = -1;
+    for (i, inp) in tx.input.iter().enumerate() {
+        let seq = inp.sequence.to_consensus_u32();
+        if seq & DISABLE != 0 {
+            continue;
+        }
+        let coin_h = prev_heights.get(i).copied().unwrap_or(0);
+        let rel = (seq & MASK) as i64;
+        if seq & TYPE_FLAG != 0 {
+            let coin_mtp = prev_coin_mtps.get(i).copied().unwrap_or(0) as i64;
+            min_time = min_time.max(coin_mtp + (rel << GRANULARITY) - 1);
+        } else {
+            min_height = min_height.max(i64::from(coin_h) + rel - 1);
+        }
+    }
+    // Core EvaluateSequenceLocks: fail if minHeight >= block.nHeight or minTime >= prev MTP.
+    if min_height >= i64::from(block_height) {
+        return false;
+    }
+    if min_time >= i64::from(block_prev_mtp) {
+        return false;
+    }
+    true
 }
 
 fn resolve_prevout(
@@ -866,6 +977,8 @@ fn resolve_prevout(
     same_block: &std::collections::HashMap<[u8; 32], usize>,
     coinbase_height_cache: &mut std::collections::HashMap<rbitcoin_primitives::Fk, Option<u32>>,
     batch_parents: &rbitcoin_query::BatchParents,
+    // Height of the block being validated (same-block BIP68 coin height).
+    spend_height: u32,
 ) -> Result<ResolvedPrevout, ConsensusError> {
     use rbitcoin_query::connect_prevout_stats;
     use std::sync::atomic::Ordering;
@@ -881,9 +994,11 @@ fn resolve_prevout(
             .ok_or(ConsensusError::MissingPrevout)?;
         let v = op.vout as usize;
         let o = tx.output.get(v).ok_or(ConsensusError::MissingPrevout)?;
+        // Same-block: Core uses the spending block's height as the coin height.
         return Ok(ResolvedPrevout {
             txout: o.clone(),
             coinbase_height: None,
+            create_height: spend_height,
         });
     }
 
@@ -905,12 +1020,14 @@ fn resolve_prevout(
                     batch_parents,
                     coinbase_height_cache,
                 )?;
+                let create_height = create_height_for_fk(query, prev_fk, cb_h)?;
                 return Ok(ResolvedPrevout {
                     txout: TxOut {
                         value: Amount::from_sat(out.value as u64),
                         script_pubkey: ScriptBuf::from_bytes(out.script),
                     },
                     coinbase_height: cb_h,
+                    create_height,
                 });
             }
         }
@@ -954,16 +1071,35 @@ fn resolve_prevout(
             batch_parents,
             coinbase_height_cache,
         )?;
+        let create_height = create_height_for_fk(query, prev_fk, cb_h)?;
         return Ok(ResolvedPrevout {
             txout: TxOut {
                 value: Amount::from_sat(out.value as u64),
                 script_pubkey: ScriptBuf::from_bytes(out.script),
             },
             coinbase_height: cb_h,
+            create_height,
         });
     }
 
     Err(ConsensusError::MissingPrevout)
+}
+
+/// Height of the block that created `prev_fk` (for BIP68).
+fn create_height_for_fk(
+    query: &Query,
+    prev_fk: rbitcoin_primitives::Fk,
+    coinbase_height: Option<u32>,
+) -> Result<u32, ConsensusError> {
+    if let Some(h) = coinbase_height {
+        return Ok(h);
+    }
+    Ok(query
+        .store()
+        .tx_height
+        .get(prev_fk)
+        .map_err(ConsensusError::Store)?
+        .unwrap_or(0))
 }
 
 /// Coinbase create height for maturity, or `None` if not a coinbase / unknown.
@@ -1090,6 +1226,81 @@ mod bip34_tests {
     fn height_128_sign_byte() {
         // 128 = 0x80 needs trailing 0x00 so it is not negative
         assert_eq!(bip34_height_script(128), vec![0x02, 0x80, 0x00]);
+    }
+}
+
+#[cfg(test)]
+mod finality_tests {
+    use super::{is_final_tx, sequence_locks_satisfied, LOCKTIME_THRESHOLD};
+    use bitcoin::absolute::LockTime;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::{
+        Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness,
+    };
+
+    fn bare_tx(version: i32, lock_time: LockTime, sequence: Sequence) -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version(version),
+            lock_time,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    }
+
+    #[test]
+    fn final_when_locktime_zero() {
+        let tx = bare_tx(1, LockTime::ZERO, Sequence::MAX);
+        assert!(is_final_tx(&tx, 100, 1_000_000));
+    }
+
+    #[test]
+    fn height_locktime_not_final_until_height() {
+        let tx = bare_tx(1, LockTime::from_height(100).unwrap(), Sequence::ZERO);
+        assert!(!is_final_tx(&tx, 100, 1_000_000)); // need lt < height
+        assert!(is_final_tx(&tx, 101, 1_000_000));
+    }
+
+    #[test]
+    fn sequence_final_ignores_locktime() {
+        let tx = bare_tx(1, LockTime::from_height(100).unwrap(), Sequence::MAX);
+        assert!(is_final_tx(&tx, 50, 1_000_000));
+    }
+
+    #[test]
+    fn time_locktime_uses_cutoff() {
+        let t = LOCKTIME_THRESHOLD + 1000;
+        let tx = bare_tx(1, LockTime::from_time(t).unwrap(), Sequence::ZERO);
+        assert!(!is_final_tx(&tx, 1, t)); // need lt < cutoff
+        assert!(is_final_tx(&tx, 1, t + 1));
+    }
+
+    #[test]
+    fn bip68_height_relative_lock() {
+        // version 2, seq = 10 (height), coin at height 100 → minHeight = 100+10-1 = 109
+        // needs block_height > 109
+        let tx = bare_tx(2, LockTime::ZERO, Sequence::from_consensus(10));
+        assert!(!sequence_locks_satisfied(
+            &tx,
+            &[100],
+            &[0],
+            109,
+            0
+        ));
+        assert!(sequence_locks_satisfied(&tx, &[100], &[0], 110, 0));
+    }
+
+    #[test]
+    fn bip68_disabled_by_version_1() {
+        let tx = bare_tx(1, LockTime::ZERO, Sequence::from_consensus(10));
+        assert!(sequence_locks_satisfied(&tx, &[100], &[0], 50, 0));
     }
 }
 

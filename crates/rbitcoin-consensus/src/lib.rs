@@ -92,8 +92,9 @@ pub mod script_bench {
 pub use block::ScriptCheckJob;
 
 pub use block::{
-    bip34_height_script, block_subsidy, validate_block_connect, validate_block_structure,
-    validate_block_structure_hashed, ValidationContext,
+    bip34_height_script, block_subsidy, is_final_tx, sequence_locks_satisfied,
+    validate_block_connect, validate_block_structure, validate_block_structure_hashed,
+    ValidationContext, LOCKTIME_THRESHOLD,
 };
 pub use convert::{block_to_apply, block_to_apply_with_txids, header_to_record};
 pub use error::ConsensusError;

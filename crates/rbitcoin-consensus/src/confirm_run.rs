@@ -794,8 +794,9 @@ fn post_commit(
     // Tip mode usually writes spends on archive; still safe if spend_index on.
     let t_spent = Instant::now();
     if query.spend_index_enabled() && query.index_mode().uses_durable_spends() {
-        // Prefer pin body_range, then one bulk idx for the rest (not per-create
-        // sequential `tx_body_range`).
+        // 1) Pin abs 9-byte offsets → mmap sole first-spend patches
+        // 2) Remaining: pin body_range / bulk idx → ranged packed walk
+        // 3) No range: per-create idx cold path
         use std::collections::{HashMap, HashSet};
         let mut pending: Vec<(
             rbitcoin_primitives::Fk,
@@ -816,10 +817,46 @@ fn post_commit(
                 }
             }
         }
+
+        // Absolute pin layout path (mmap annotate; no full body walk).
+        let mut abs_edges: Vec<(
+            u64,
+            rbitcoin_primitives::Fk,
+            u32,
+            rbitcoin_primitives::Fk,
+        )> = Vec::new();
+        let mut rest: Vec<(
+            rbitcoin_primitives::Fk,
+            u32,
+            rbitcoin_primitives::Fk,
+        )> = Vec::new();
+        for (cfk, vout, sfk) in pending {
+            if let Some(abs) = batch_parents.get_spender_abs(cfk, vout) {
+                abs_edges.push((abs, cfk, vout, sfk));
+            } else {
+                rest.push((cfk, vout, sfk));
+            }
+        }
+        if !abs_edges.is_empty() {
+            let cold = query
+                .store()
+                .put_spend_batch_by_abs_meta(&abs_edges)
+                .map_err(ConsensusError::Store)?;
+            confirm_phase_stats::SPEND_ANNOTATE_RANGED
+                .fetch_add(abs_edges.len().saturating_sub(cold.len()) as u64, Ordering::Relaxed);
+            rest.extend(cold);
+        }
+
         let mut range_by_create: HashMap<u64, (u64, u64)> =
             HashMap::with_capacity(unique_creates.len());
         let mut need_range: Vec<rbitcoin_primitives::Fk> = Vec::new();
-        for &id in &unique_creates {
+        let mut rest_creates: HashSet<u64> = HashSet::new();
+        for &(cfk, _, _) in &rest {
+            if let Some(id) = cfk.get() {
+                rest_creates.insert(id);
+            }
+        }
+        for &id in &rest_creates {
             let fk = rbitcoin_primitives::Fk(id);
             if let Some(r) = batch_parents.get_body_range(fk) {
                 range_by_create.insert(id, r);
@@ -844,20 +881,19 @@ fn post_commit(
             rbitcoin_primitives::Fk,
             u64,
             u64,
-        )> = Vec::with_capacity(pending.len());
+        )> = Vec::with_capacity(rest.len());
         let mut by_create: Vec<(
             rbitcoin_primitives::Fk,
             u32,
             rbitcoin_primitives::Fk,
         )> = Vec::new();
-        for (cfk, vout, sfk) in pending {
+        for (cfk, vout, sfk) in rest {
             if let Some(id) = cfk.get() {
                 if let Some(&(off, len)) = range_by_create.get(&id) {
                     ranged.push((cfk, vout, sfk, off, len));
                     continue;
                 }
             }
-            // Still no range (corrupt / missing body) — fall back to idx path.
             by_create.push((cfk, vout, sfk));
         }
         confirm_phase_stats::SPEND_ANNOTATE_RANGED

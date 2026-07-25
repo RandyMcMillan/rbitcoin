@@ -311,6 +311,23 @@ impl Store {
         Ok(())
     }
 
+    /// Bulk Class C create heights (confirm write). io_uring 4 B slot preads.
+    pub fn tx_height_get_batch(&self, fks: &[Fk]) -> Result<Vec<Option<u32>>, StoreError> {
+        self.tx_height.get_batch(fks)
+    }
+
+    /// Annotate spends using absolute 9-byte spender-meta offsets (pin layout).
+    ///
+    /// Tuple: `(abs_off, create_tx_fk, vout, spending_tx_fk)`.
+    /// Sole first-spend (null field): mmap patch of field+flags (not io_uring).
+    /// Returns edges that need multi-list / full-body cold path.
+    pub fn put_spend_batch_by_abs_meta(
+        &self,
+        abs_edges: &[(u64, Fk, u32, Fk)],
+    ) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
+        self.txs.put_spend_batch_by_abs_meta(abs_edges)
+    }
+
     /// Like [`Self::put_spend_batch_by_create`] with cache-held body ranges.
     /// Tuple: `(create_tx_fk, vout, spending_tx_fk, body_off, body_len)`.
     ///

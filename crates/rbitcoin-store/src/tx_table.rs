@@ -1845,6 +1845,69 @@ impl TxTable {
         Ok(out)
     }
 
+    /// Annotate spends at known absolute spender-meta offsets (confirm write).
+    ///
+    /// Hot path (IBD): sole first-spend → read 9 B at abs (mmap), then
+    /// [`Self::write_body_abs`] (mmap) for field+flags — **not** io_uring pwrite
+    /// (small random writes into a shared map are better as mmap stores).
+    /// Returns edges that need multi-list / full-body cold path.
+    pub fn put_spend_batch_by_abs_meta(
+        &self,
+        abs_edges: &[(u64, Fk, u32, Fk)],
+    ) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
+        const META_LEN: u64 = 9;
+        if abs_edges.is_empty() {
+            return Ok(Vec::new());
+        }
+        for &(_, _, _, sfk) in abs_edges {
+            if sfk.is_null() {
+                return Err(StoreError::InvalidFk);
+            }
+        }
+        let body_pub = self.body.body_published_len();
+        let mut cold: Vec<(Fk, u32, Fk)> = Vec::new();
+        for &(abs, create_fk, vout, spend_fk) in abs_edges {
+            if abs.saturating_add(META_LEN) > body_pub {
+                cold.push((create_fk, vout, spend_fk));
+                continue;
+            }
+            // Read current meta via mmap (same as write path).
+            let cur = self.body.with_bytes_at(abs, META_LEN, |raw| {
+                if raw.len() < 9 {
+                    return Err(StoreError::Corrupt("spender meta short"));
+                }
+                let field = Fk(u64::from_le_bytes(raw[0..8].try_into().unwrap()));
+                let flags = raw[8];
+                Ok((field, flags))
+            });
+            let Ok((field, flags)) = cur else {
+                cold.push((create_fk, vout, spend_fk));
+                continue;
+            };
+            let multi = flags & output_flags::MULTI_SPENDER != 0;
+            if multi {
+                cold.push((create_fk, vout, spend_fk));
+                continue;
+            }
+            if !field.is_null() {
+                if field == spend_fk {
+                    continue; // already annotated
+                }
+                // Second sole spender → multi-list cold path.
+                cold.push((create_fk, vout, spend_fk));
+                continue;
+            }
+            // First sole spend: mmap-store field + clear multi bit.
+            let mut meta = [0u8; 9];
+            meta[0..8].copy_from_slice(&spend_fk.0.to_le_bytes());
+            meta[8] = flags & !output_flags::MULTI_SPENDER;
+            if let Err(_) = self.body.write_body_abs(abs, &meta) {
+                cold.push((create_fk, vout, spend_fk));
+            }
+        }
+        Ok(cold)
+    }
+
     /// Bulk 9-byte spender meta preads at absolute `tx.body` file offsets.
     ///
     /// Each entry is the absolute offset of an output's spender_field (8) + flags (1).

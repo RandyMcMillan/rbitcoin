@@ -1154,8 +1154,31 @@ pub(crate) fn structural_validate_spends(
     }
     let spent_ns = t_spent.elapsed().as_nanos() as u64;
 
-    // ── Create height + coinbase maturity (prefer pin stashes) ─────────────
+    // ── Create height + coinbase maturity (durable Class C, not pin heights) ─
+    // Pin may stash coinbase *flag* (multi-in ⇒ not cb) but heights always come
+    // from bulk `tx_height` re-read — pin heights are not authority.
     let t_create = Instant::now();
+    let unique_create_fks: Vec<rbitcoin_primitives::Fk> = {
+        let mut v: Vec<rbitcoin_primitives::Fk> = vouts_by_create
+            .keys()
+            .map(|id| rbitcoin_primitives::Fk(*id))
+            .collect();
+        v.sort_unstable_by_key(|f| f.0);
+        v
+    };
+    let durable_heights = query
+        .store()
+        .tx_height_get_batch(&unique_create_fks)
+        .map_err(ConsensusError::Store)?;
+    let height_by_id: HashMap<u64, u32> = unique_create_fks
+        .iter()
+        .zip(durable_heights.into_iter())
+        .filter_map(|(fk, h)| {
+            let id = fk.get()?;
+            Some((id, h.unwrap_or(0)))
+        })
+        .collect();
+
     let mut seen_create: HashSet<u64> = HashSet::with_capacity(vouts_by_create.len());
     for &(_ptid, _vout, _sfk, create_fk) in spends {
         if create_fk.is_null() {
@@ -1167,41 +1190,23 @@ pub(crate) fn structural_validate_spends(
         if !seen_create.insert(id) {
             continue;
         }
-        // Already resolved (should not happen with seen_create).
-        if create_height_by_fk.contains_key(&create_fk) {
+        let durable_h = height_by_id.get(&id).copied().unwrap_or(0);
+
+        // Proven non-coinbase (multi-in pin): height only.
+        if batch_parents.get_parent_coinbase_height(create_fk) == Some(None) {
+            create_height_by_fk.insert(create_fk, durable_h);
+            continue;
+        }
+        // Proven coinbase (archive path): maturity from durable height.
+        if let Some(Some(_)) = batch_parents.get_parent_coinbase_height(create_fk) {
+            if durable_h > 0 && ctx.height.0 < durable_h.saturating_add(maturity) {
+                return Err(ConsensusError::BadTx("coinbase immature"));
+            }
+            create_height_by_fk.insert(create_fk, durable_h);
             continue;
         }
 
-        // Pin coinbase flag + height: skip store maturity / input walk.
-        if let Some(cb_opt) = batch_parents.get_parent_coinbase_height(create_fk) {
-            match cb_opt {
-                Some(ch) => {
-                    if ctx.height.0 < ch.saturating_add(maturity) {
-                        return Err(ConsensusError::BadTx("coinbase immature"));
-                    }
-                    create_height_by_fk.insert(create_fk, ch);
-                    continue;
-                }
-                None => {
-                    // Not a coinbase — BIP68 height from pin or tx_height only.
-                    let ch = if let Some(h) = batch_parents.get_create_height(create_fk) {
-                        h
-                    } else {
-                        query
-                            .store()
-                            .tx_height
-                            .get(create_fk)
-                            .map_err(ConsensusError::Store)?
-                            .unwrap_or(0)
-                    };
-                    create_height_by_fk.insert(create_fk, ch);
-                    continue;
-                }
-            }
-        }
-
-        // Pin create height without coinbase flag (pin_new): still need maturity.
-        let pin_ch = batch_parents.get_create_height(create_fk);
+        // Unknown coinbase: multi-in parent meta ⇒ not cb; 1-in needs maturity walk.
         let prev_rec = match batch_parents
             .get_parent_tx(create_fk)
             .or_else(|| cache.get_parent_tx(create_fk))
@@ -1211,6 +1216,10 @@ pub(crate) fn structural_validate_spends(
                 .get_tx_class_a(create_fk)
                 .map_err(ConsensusError::Store)?,
         };
+        if prev_rec.input_count != 1 {
+            create_height_by_fk.insert(create_fk, durable_h);
+            continue;
+        }
         let created = coinbase_height_for_maturity(
             query,
             create_fk,
@@ -1222,13 +1231,14 @@ pub(crate) fn structural_validate_spends(
             if ctx.height.0 < ch.saturating_add(maturity) {
                 return Err(ConsensusError::BadTx("coinbase immature"));
             }
-        }
-        let ch = if let Some(h) = pin_ch {
-            h
+            // Prefer durable Class C height when set; else maturity-resolved.
+            create_height_by_fk.insert(
+                create_fk,
+                if durable_h > 0 { durable_h } else { ch },
+            );
         } else {
-            create_height_for_fk(query, create_fk, created)?
-        };
-        create_height_by_fk.insert(create_fk, ch);
+            create_height_by_fk.insert(create_fk, durable_h);
+        }
     }
     let create_h_ns = t_create.elapsed().as_nanos() as u64;
 

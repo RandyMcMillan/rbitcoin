@@ -193,6 +193,60 @@ impl TxHeightTable {
         }
     }
 
+    /// Bulk `get` for many tx fks (confirm write create-height). io_uring / pread.
+    ///
+    /// Returns one `Option<height>` per input fk (invalid/null fk → `None`).
+    pub fn get_batch(&self, fks: &[Fk]) -> Result<Vec<Option<u32>>, StoreError> {
+        use crate::bulk_io::{self, ReadOp};
+        use std::sync::atomic::Ordering;
+        if fks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let nslots = self.len.load(Ordering::Acquire);
+        let fd = self.file.read_fd();
+        let mut out: Vec<Option<u32>> = vec![None; fks.len()];
+        let mut bufs: Vec<[u8; 4]> = vec![[0u8; 4]; fks.len()];
+        let mut submitted: Vec<usize> = Vec::with_capacity(fks.len());
+        for (i, fk) in fks.iter().enumerate() {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            let index = id - 1;
+            if index >= nslots {
+                continue;
+            }
+            submitted.push(i);
+            let _ = index;
+        }
+        if submitted.is_empty() {
+            return Ok(out);
+        }
+        let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(submitted.len());
+        for &i in &submitted {
+            let id = fks[i].get().unwrap();
+            let index = id - 1;
+            let ptr = bufs[i].as_mut_ptr();
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, 4) };
+            read_ops.push(ReadOp {
+                fd,
+                offset: Self::offset(index),
+                buf: slice,
+                result: i32::MIN,
+            });
+        }
+        bulk_io::pread_batch(&mut read_ops);
+        for (ro, &i) in read_ops.iter().zip(submitted.iter()) {
+            if ro.result != 4 {
+                continue;
+            }
+            let v = u32::from_le_bytes(bufs[i]);
+            if v != 0 {
+                out[i] = Some(v - 1);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn set(&self, tx_fk: Fk, height: Height) -> Result<(), StoreError> {
         let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
         self.set_slot(id - 1, height.0.saturating_add(1))

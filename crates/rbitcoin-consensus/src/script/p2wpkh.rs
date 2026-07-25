@@ -1,6 +1,5 @@
 //! Native P2WPKH verification (SegWit v0).
 
-use bitcoin::hashes::Hash;
 use bitcoin::sighash::SighashCache;
 use bitcoin::Transaction;
 
@@ -46,15 +45,10 @@ pub(crate) fn verify(
 
     let amount = job.prevouts[input_index].value;
     let spk_script = job.prevouts[input_index].script_pubkey.as_script();
-    let sighash = cache
-        .p2wpkh_signature_hash(
-            input_index,
-            spk_script,
-            amount,
-            crypto::ecdsa_sighash_type(sighash_ty),
-        )
-        .map_err(|_| ConsensusError::Script("p2wpkh sighash".into()))?;
-    if crypto::verify_ecdsa(sighash.to_byte_array(), &sig, &pubkey) {
+    // Raw hashtype (not from_consensus→to_u32): non-standard bytes e.g. 0x65.
+    let _ = cache; // keep signature for callers that share a cache across inputs
+    let sighash = crypto::bip143_p2wpkh_signature_hash(tx, input_index, spk_script, amount, sighash_ty)?;
+    if crypto::verify_ecdsa(sighash, &sig, &pubkey) {
         Ok(())
     } else {
         Err(ConsensusError::Script("p2wpkh ecdsa".into()))
@@ -93,11 +87,10 @@ pub(crate) fn verify_with_keyhash(
 
     let amount = job.prevouts[input_index].value;
     let spk = bitcoin::script::Script::from_bytes(witness_program);
-    let sighash_ty = crypto::ecdsa_sighash_type(sighash_ty);
-    let sighash = cache
-        .p2wpkh_signature_hash(input_index, spk, amount, sighash_ty)
-        .map_err(|_| ConsensusError::Script("p2wpkh sighash".into()))?;
-    if crypto::verify_ecdsa(sighash.to_byte_array(), &sig, &pubkey) {
+    let _ = cache;
+    let sighash =
+        crypto::bip143_p2wpkh_signature_hash(tx, input_index, spk, amount, sighash_ty)?;
+    if crypto::verify_ecdsa(sighash, &sig, &pubkey) {
         Ok(())
     } else {
         Err(ConsensusError::Script("p2wpkh ecdsa".into()))

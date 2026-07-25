@@ -1,0 +1,6 @@
+value_sat=99830000
+script_hex=a914e93f9e95f6d5cb1736a94de992d0d18819072fa587
+txid=969c4f116f0a68406d30dc80bf17991fb8fe7fa1b240382baefa2c324b79d50d
+vin=0
+block_height=508011
+note=P2SH-P2WPKH nested; witness sighash type byte 0x65 (non-standard raw)

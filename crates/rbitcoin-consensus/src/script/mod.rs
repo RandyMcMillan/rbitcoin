@@ -285,18 +285,126 @@ pub(crate) mod crypto {
         true
     }
 
-    /// BIP143 APIs want [`EcdsaSighashType`]; preserve raw `0` via a private path.
-    ///
-    /// rust-bitcoin's `from_consensus(0)` becomes `All` (`to_u32()==1`). For BIP143
-    /// we currently only see standard types; still prefer encoding the raw byte
-    /// when the API allows a `u32`.
-    #[inline]
-    pub fn ecdsa_sighash_type(raw: u32) -> EcdsaSighashType {
-        EcdsaSighashType::from_consensus(raw)
-    }
-
     pub fn parse_pubkey(raw: &[u8]) -> Result<PublicKey, ConsensusError> {
         PublicKey::from_slice(raw).map_err(|_| ConsensusError::Script("pubkey".into()))
+    }
+
+    /// BIP143 signature hash with **raw** `nHashType` (last byte of the sig push).
+    ///
+    /// `script_code` is the BIP143 scriptCode (for P2WPKH: the
+    /// `OP_DUP OP_HASH160 <keyhash> OP_EQUALVERIFY OP_CHECKSIG` template; for
+    /// P2WSH: the witness script).
+    pub fn bip143_signature_hash(
+        tx: &bitcoin::Transaction,
+        input_index: usize,
+        script_code: &bitcoin::Script,
+        amount: bitcoin::Amount,
+        raw_ty: u32,
+    ) -> Result<[u8; 32], ConsensusError> {
+        use bitcoin::consensus::Encodable;
+        use bitcoin::hashes::{sha256d, Hash, HashEngine};
+        use bitcoin::sighash::EcdsaSighashType;
+
+        if input_index >= tx.input.len() {
+            return Err(ConsensusError::Script("bip143 input index".into()));
+        }
+        use EcdsaSighashType::*;
+        let mapped = EcdsaSighashType::from_consensus(raw_ty);
+        // `split_anyonecanpay_flag` is crate-private in rust-bitcoin 0.32.
+        let anyone_can_pay = matches!(
+            mapped,
+            AllPlusAnyoneCanPay | NonePlusAnyoneCanPay | SinglePlusAnyoneCanPay
+        );
+        let base = match mapped {
+            None | NonePlusAnyoneCanPay => None,
+            Single | SinglePlusAnyoneCanPay => Single,
+            _ => All,
+        };
+        let zero = [0u8; 32];
+
+        let hash_prevouts: [u8; 32] = if !anyone_can_pay {
+            let mut eng = sha256d::Hash::engine();
+            for i in &tx.input {
+                i.previous_output
+                    .consensus_encode(&mut eng)
+                    .map_err(|_| ConsensusError::Script("bip143 prevouts".into()))?;
+            }
+            sha256d::Hash::from_engine(eng).to_byte_array()
+        } else {
+            zero
+        };
+
+        let hash_sequence: [u8; 32] = if !anyone_can_pay && base != Single && base != None {
+            let mut eng = sha256d::Hash::engine();
+            for i in &tx.input {
+                i.sequence
+                    .consensus_encode(&mut eng)
+                    .map_err(|_| ConsensusError::Script("bip143 sequences".into()))?;
+            }
+            sha256d::Hash::from_engine(eng).to_byte_array()
+        } else {
+            zero
+        };
+
+        let hash_outputs: [u8; 32] = if base != Single && base != None {
+            let mut eng = sha256d::Hash::engine();
+            for o in &tx.output {
+                o.consensus_encode(&mut eng)
+                    .map_err(|_| ConsensusError::Script("bip143 outputs".into()))?;
+            }
+            sha256d::Hash::from_engine(eng).to_byte_array()
+        } else if base == Single && input_index < tx.output.len() {
+            let mut eng = sha256d::Hash::engine();
+            tx.output[input_index]
+                .consensus_encode(&mut eng)
+                .map_err(|_| ConsensusError::Script("bip143 single output".into()))?;
+            sha256d::Hash::from_engine(eng).to_byte_array()
+        } else {
+            zero
+        };
+
+        let mut eng = sha256d::Hash::engine();
+        tx.version
+            .consensus_encode(&mut eng)
+            .map_err(|_| ConsensusError::Script("bip143 version".into()))?;
+        eng.input(&hash_prevouts);
+        eng.input(&hash_sequence);
+        {
+            let txin = &tx.input[input_index];
+            txin.previous_output
+                .consensus_encode(&mut eng)
+                .map_err(|_| ConsensusError::Script("bip143 outpoint".into()))?;
+            script_code
+                .consensus_encode(&mut eng)
+                .map_err(|_| ConsensusError::Script("bip143 scriptCode".into()))?;
+            amount
+                .consensus_encode(&mut eng)
+                .map_err(|_| ConsensusError::Script("bip143 amount".into()))?;
+            txin.sequence
+                .consensus_encode(&mut eng)
+                .map_err(|_| ConsensusError::Script("bip143 nSequence".into()))?;
+        }
+        eng.input(&hash_outputs);
+        tx.lock_time
+            .consensus_encode(&mut eng)
+            .map_err(|_| ConsensusError::Script("bip143 locktime".into()))?;
+        // Core: raw nHashType as uint32 LE — not the normalized enum value.
+        eng.input(&raw_ty.to_le_bytes());
+        Ok(sha256d::Hash::from_engine(eng).to_byte_array())
+    }
+
+    /// P2WPKH BIP143 hash: `script_pubkey` is native spk **or** nested redeem (`00 14 <20>`).
+    pub fn bip143_p2wpkh_signature_hash(
+        tx: &bitcoin::Transaction,
+        input_index: usize,
+        script_pubkey: &bitcoin::Script,
+        amount: bitcoin::Amount,
+        raw_ty: u32,
+    ) -> Result<[u8; 32], ConsensusError> {
+        let script_code = script_pubkey
+            .p2wpkh_script_code()
+            .ok_or_else(|| ConsensusError::Script("bip143 not p2wpkh".into()))?;
+        bip143_signature_hash(tx, input_index, script_code.as_script(), amount, raw_ty)
     }
 
     /// Verify ECDSA under **Bitcoin consensus** rules.

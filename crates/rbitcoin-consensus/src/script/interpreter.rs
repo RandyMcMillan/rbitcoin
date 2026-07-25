@@ -1194,7 +1194,6 @@ fn sighash_for_script(
     ty_raw: u32,
     script_bytes: &[u8],
 ) -> Result<[u8; 32], ConsensusError> {
-    let mut cache = ctx.cache.borrow_mut();
     let script_code = Script::from_bytes(script_bytes);
     match ctx.sig_version {
         SigVersion::Base => {
@@ -1202,17 +1201,22 @@ fn sighash_for_script(
             // Strip OP_CODESEPARATOR from scriptCode (Core SerializeScriptCode).
             let stripped = strip_op_codeseparator(script_bytes);
             let script_code = Script::from_bytes(&stripped);
-            let h = cache
+            let h = ctx
+                .cache
+                .borrow_mut()
                 .legacy_signature_hash(ctx.input_index, script_code, ty_raw)
                 .map_err(|_| ConsensusError::Script("legacy sighash".into()))?;
             Ok(h.to_byte_array())
         }
         SigVersion::WitnessV0 => {
-            let ty = crypto::ecdsa_sighash_type(ty_raw);
-            let h = cache
-                .p2wsh_signature_hash(ctx.input_index, script_code, ctx.amount, ty)
-                .map_err(|_| ConsensusError::Script("p2wsh sighash".into()))?;
-            Ok(h.to_byte_array())
+            // Raw nHashType in BIP143 final uint32 (not enum to_u32).
+            crypto::bip143_signature_hash(
+                ctx.tx,
+                ctx.input_index,
+                script_code,
+                ctx.amount,
+                ty_raw,
+            )
         }
         SigVersion::TapScript => unreachable!(),
     }

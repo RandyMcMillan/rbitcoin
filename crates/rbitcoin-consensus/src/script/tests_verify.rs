@@ -98,6 +98,59 @@ fn p2wpkh_bad_signature_rejects() {
     );
 }
 
+/// Mainnet block 508011 tip-stall: nested P2SH-P2WPKH with **non-standard** sighash
+/// type byte `0x65`. Core hashes the raw `nHashType`; rust-bitcoin's
+/// `p2wpkh_signature_hash` encodes `from_consensus(0x65).to_u32() == 1`, which
+/// fails ECDSA. Fixture is consensus-valid on mainnet (confirmed).
+///
+/// Log: `p2wpkh ecdsa txid=969c4f11…d50d vin=0` (2026-07-25 mainnet IBD).
+#[test]
+fn mainnet_508011_nested_p2wpkh_raw_sighash_0x65() {
+    use bitcoin::consensus::encode::deserialize;
+
+    fn decode_hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    // Wire hex from mempool.space for confirmed mainnet tx.
+    let hex = include_str!("../../tests/fixtures/mainnet_508011_p2sh_p2wpkh_tx.hex").trim();
+    let raw = decode_hex(hex);
+    let tx: Transaction = deserialize(&raw).expect("tx decode");
+    assert_eq!(
+        tx.compute_txid().to_string(),
+        "969c4f116f0a68406d30dc80bf17991fb8fe7fa1b240382baefa2c324b79d50d"
+    );
+    assert_eq!(tx.input.len(), 1);
+    // Witness hashtype is the last byte of the DER push.
+    let sig = tx.input[0].witness.nth(0).unwrap();
+    assert_eq!(*sig.last().unwrap(), 0x65, "fixture must use raw type 0x65");
+
+    let prevout = TxOut {
+        value: Amount::from_sat(99_830_000),
+        script_pubkey: ScriptBuf::from_bytes(decode_hex(
+            "a914e93f9e95f6d5cb1736a94de992d0d18819072fa587",
+        )),
+    };
+    let job = ScriptCheckJob {
+        prevouts: vec![prevout],
+        tx,
+        bip65_active: true,
+        bip112_active: true,
+        bip66_active: true,
+        bip16_active: true,
+        taproot_active: true,
+    };
+    script::verify_job_all_inputs(&job).unwrap_or_else(|e| {
+        panic!(
+            "mainnet-valid nested P2WPKH must accept (got {e}); \
+             if this fails, BIP143 raw nHashType is still wrong"
+        )
+    });
+}
+
 #[test]
 fn anyone_can_spend_accepts() {
     let prevout = TxOut {

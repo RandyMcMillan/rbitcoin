@@ -169,7 +169,7 @@ impl ConfirmParentCache {
 
     /// Insert create outs into the FIFO (meta + outputs only; inputs used only for coinbase flag).
     ///
-    /// Clears spender fields on outs. Layout (`body_off` / rels) unknown here.
+    /// Clears spender fields on outs. Layout (`body_range` / rels) unknown here.
     pub fn put_body(
         &self,
         fk: Fk,
@@ -181,7 +181,7 @@ impl ConfirmParentCache {
         let Some(id) = fk.get() else {
             return;
         };
-        let is_coinbase = is_coinbase_inputs(&tx, &inputs);
+        let coinbase = Some(is_coinbase_inputs(&tx, &inputs));
         rbitcoin_store::clear_output_spender_fields(&mut outputs);
         let mut g = self.inner.lock().unwrap();
         let _ = g.outs.insert(
@@ -190,8 +190,8 @@ impl ConfirmParentCache {
                 height,
                 tx,
                 outputs,
-                is_coinbase,
-                body_off: None,
+                coinbase,
+                body_range: None,
                 spender_rels: Vec::new(),
             },
         );
@@ -212,7 +212,7 @@ impl ConfirmParentCache {
             let Some(id) = fk.get() else {
                 continue;
             };
-            let is_coinbase = is_coinbase_inputs(&tx, &inputs);
+            let coinbase = Some(is_coinbase_inputs(&tx, &inputs));
             rbitcoin_store::clear_output_spender_fields(&mut outputs);
             let _ = g.outs.insert(
                 id,
@@ -220,8 +220,8 @@ impl ConfirmParentCache {
                     height,
                     tx,
                     outputs,
-                    is_coinbase,
-                    body_off: None,
+                    coinbase,
+                    body_range: None,
                     spender_rels: Vec::new(),
                 },
             );
@@ -243,7 +243,7 @@ impl ConfirmParentCache {
             let Some(id) = fk.get() else {
                 continue;
             };
-            let is_coinbase = is_coinbase_inputs(tx, inputs);
+            let coinbase = Some(is_coinbase_inputs(tx, inputs));
             let mut outputs = outs.to_vec();
             rbitcoin_store::clear_output_spender_fields(&mut outputs);
             let _ = g.outs.insert(
@@ -252,8 +252,8 @@ impl ConfirmParentCache {
                     height,
                     tx: tx.clone(),
                     outputs,
-                    is_coinbase,
-                    body_off: None,
+                    coinbase,
+                    body_range: None,
                     spender_rels: Vec::new(),
                 },
             );
@@ -262,9 +262,9 @@ impl ConfirmParentCache {
 
     /// Seed FIFO with dense outs from pin_new store loads (no inputs available).
     ///
-    /// `is_coinbase` is false when unknown (1-in without prevout scan); maturity
-    /// still runs in structural write. Callers must pass **all** outs, not slim,
-    /// plus `body_off` + dense `spender_rels` from packed decode.
+    /// Multi-in → `coinbase = Some(false)` (cheap). Single-in → `None` (write
+    /// may still resolve maturity). Callers pass **all** outs + packed
+    /// `body_range` + dense `spender_rels`.
     pub fn put_dense_outs_batch(
         &self,
         items: Vec<(
@@ -272,7 +272,7 @@ impl ConfirmParentCache {
             u32,
             TxRecord,
             Vec<OutputRecord>,
-            Option<u64>,
+            Option<(u64, u64)>,
             Vec<u32>,
         )>,
     ) {
@@ -280,21 +280,25 @@ impl ConfirmParentCache {
             return;
         }
         let mut g = self.inner.lock().unwrap();
-        for (fk, height, tx, mut outputs, body_off, spender_rels) in items {
+        for (fk, height, tx, mut outputs, body_range, spender_rels) in items {
             let Some(id) = fk.get() else {
                 continue;
             };
             rbitcoin_store::clear_output_spender_fields(&mut outputs);
-            // Without inputs we cannot prove coinbase; leave false (structural
-            // write still does maturity). Multi-in is never coinbase.
+            // Multi-in is never coinbase; single-in unknown without inputs.
+            let coinbase = if tx.input_count != 1 {
+                Some(false)
+            } else {
+                None
+            };
             let _ = g.outs.insert(
                 id,
                 CreateOuts {
                     height,
                     tx,
                     outputs,
-                    is_coinbase: false,
-                    body_off,
+                    coinbase,
+                    body_range,
                     spender_rels,
                 },
             );
@@ -323,7 +327,9 @@ impl ConfirmParentCache {
     /// Slim pin hits under **one** lock: only clone requested outs + tx meta.
     ///
     /// Returns
-    /// `id → (create_height, tx, outs, coinbase_hint, body_off, sparse_spender_rels)`.
+    /// `id → (create_height, tx, outs, coinbase_hint, body_range, sparse_spender_rels)`.
+    ///
+    /// `coinbase_hint` mirrors [`CreateOuts::coinbase`] (`None` = unknown).
     pub fn get_bodies_for_pin_batch(
         &self,
         items: &[(u64, &[u32])],
@@ -334,7 +340,7 @@ impl ConfirmParentCache {
             TxRecord,
             Vec<(u32, OutputRecord)>,
             Option<bool>,
-            Option<u64>,
+            Option<(u64, u64)>,
             Vec<(u32, u32)>,
         ),
     > {
@@ -353,13 +359,6 @@ impl ConfirmParentCache {
                     outs.push((v, o.clone()));
                 }
             }
-            let cb_hint = if e.tx.input_count != 1 {
-                Some(false)
-            } else if e.is_coinbase {
-                Some(true)
-            } else {
-                Some(false)
-            };
             let sparse = crate::batch_parents::sparse_spender_rels(&e.spender_rels, vouts);
             out.insert(
                 id,
@@ -367,8 +366,8 @@ impl ConfirmParentCache {
                     e.height,
                     e.tx.clone(),
                     outs,
-                    cb_hint,
-                    e.body_off,
+                    e.coinbase,
+                    e.body_range,
                     sparse,
                 ),
             );
@@ -729,14 +728,14 @@ mod tests {
         );
         let need = [0u32, 2];
         let mut hits = c.get_bodies_for_pin_batch(&[(77, &need)]);
-        let (h, txr, outs, cb, body_off, rels) = hits.remove(&77).expect("hit");
+        let (h, txr, outs, cb, body_range, rels) = hits.remove(&77).expect("hit");
         assert_eq!(h, 5);
         assert_eq!(txr.txid, t.txid);
         assert_eq!(outs.len(), 2);
         assert_eq!(outs[0].0, 0);
         assert_eq!(outs[1].0, 2);
         assert_eq!(cb, Some(true));
-        assert!(body_off.is_none());
+        assert!(body_range.is_none());
         assert!(rels.is_empty());
         // FIFO still holds all three outs for a later need of vout 1.
         let need1 = [1u32];
@@ -762,14 +761,16 @@ mod tests {
     fn put_dense_outs_batch_keeps_all_vouts_for_later_hits() {
         let c = ConfirmParentCache::new();
         c.advance_tip(0);
-        let t = tx(9);
+        let mut t = tx(9);
+        t.input_count = 1; // single-in → coinbase unknown without inputs
+        t.output_count = 4;
         // pin_new path: seed full dense outs after store decode.
         c.put_dense_outs_batch(vec![(
             Fk(90),
             0,
             t.clone(),
             vec![out(1), out(2), out(3), out(4)],
-            Some(5000),
+            Some((5000, 100)),
             vec![10, 30, 50, 70],
         )]);
         assert_eq!(c.body_count(), 1);
@@ -778,11 +779,27 @@ mod tests {
         let e = hits.get(&90).unwrap();
         assert_eq!(e.2.len(), 1);
         assert_eq!(e.2[0].1.value, 4);
-        assert_eq!(e.4, Some(5000));
+        assert_eq!(e.3, None); // single-in pin_new: coinbase unknown
+        assert_eq!(e.4, Some((5000, 100)));
         assert_eq!(e.5, vec![(3, 70)]);
         // And all four still addressable.
         let hits_all = c.get_bodies_for_pin_batch(&[(90, &[0u32, 1, 2, 3][..])]);
         assert_eq!(hits_all.get(&90).unwrap().2.len(), 4);
+
+        // Multi-in pin_new: cheap non-coinbase.
+        let mut t2 = tx(8);
+        t2.input_count = 2;
+        t2.output_count = 1;
+        c.put_dense_outs_batch(vec![(
+            Fk(91),
+            0,
+            t2,
+            vec![out(9)],
+            Some((6000, 50)),
+            vec![12],
+        )]);
+        let hits2 = c.get_bodies_for_pin_batch(&[(91, &[0u32][..])]);
+        assert_eq!(hits2.get(&91).unwrap().3, Some(false));
     }
 
     #[test]

@@ -7,8 +7,8 @@
 //!
 //! Outs are **content-only** (value + script). Durable spender annotations are
 //! **not** cached here — pin-time fields are stale by write. Instead we stash
-//! `body_off` + per-vout relative offsets of the 9-byte spender meta so write
-//! structural spentness can bulk-`pread` current durable state (io_uring).
+//! packed `body_range` + per-vout relative offsets of the 9-byte spender meta so
+//! write structural spentness can bulk-`pread` current durable state (io_uring).
 
 use rbitcoin_store::{OutputRecord, TxRecord};
 use std::collections::{HashMap, VecDeque};
@@ -38,10 +38,12 @@ pub struct CreateOuts {
     pub tx: TxRecord,
     /// Dense: `outputs[vout]`. Content-only (spender fields cleared).
     pub outputs: Vec<OutputRecord>,
-    /// True when archive-time inputs showed a coinbase (stored at put; no inputs kept).
-    pub is_coinbase: bool,
-    /// Absolute file offset of the packed Class A body in `tx.body` (when known).
-    pub body_off: Option<u64>,
+    /// Proven coinbase flag when known.
+    /// - `Some(true)` / `Some(false)` from archive inputs or multi-in meta
+    /// - `None` = unknown (pin_new single-in; write may still check maturity)
+    pub coinbase: Option<bool>,
+    /// Packed Class A `(body_off, body_len)` in `tx.body` (when known).
+    pub body_range: Option<(u64, u64)>,
     /// Dense: `spender_rels[vout]` = relative offset of 9-byte spender meta in body.
     /// Empty when body layout was not recorded (cold fallback path).
     pub spender_rels: Vec<u32>,
@@ -173,8 +175,8 @@ mod tests {
             height,
             tx: tx(id, n as u32),
             outputs: outs(n),
-            is_coinbase: cb,
-            body_off: Some(1000),
+            coinbase: Some(cb),
+            body_range: Some((1000, 500)),
             spender_rels: (0..n as u32).map(|i| 40 + i * 20).collect(),
         }
     }
@@ -207,7 +209,7 @@ mod tests {
         let e = f.get(9).unwrap();
         assert_eq!(e.outputs[1].value, 1);
         assert_eq!(e.height, 5);
-        assert_eq!(e.body_off, Some(1000));
+        assert_eq!(e.body_range, Some((1000, 500)));
         assert_eq!(e.spender_rels[1], 60);
         assert!(e.outputs[0].spender_field.is_null());
     }

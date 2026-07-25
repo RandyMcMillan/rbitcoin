@@ -529,6 +529,7 @@ pub fn validate_block_connect(
     }
     // Structural: re-walk with durable spentness (fresh pending for this single block).
     let mut structural_pending = std::collections::HashSet::new();
+    let mut mtp_cache = std::collections::HashMap::new();
     let _ = structural_validate_spends(
         query,
         block,
@@ -538,6 +539,7 @@ pub fn validate_block_connect(
         fees,
         &mut structural_pending,
         &batch_parents,
+        &mut mtp_cache,
     )?;
     Ok(())
 }
@@ -998,6 +1000,8 @@ pub(crate) fn structural_validate_spends(
     fees: i64,
     pending_spent: &mut std::collections::HashSet<([u8; 32], u32)>,
     batch_parents: &rbitcoin_query::BatchParents,
+    // MTP by end-height, shared across blocks in one write run.
+    mtp_cache: &mut std::collections::HashMap<u32, u32>,
 ) -> Result<StructuralPhaseNs, ConsensusError> {
     use std::collections::{HashMap, HashSet};
     use std::time::Instant;
@@ -1234,7 +1238,7 @@ pub(crate) fn structural_validate_spends(
         let prev_mtp = if ctx.height.0 == 0 {
             0
         } else {
-            crate::header::median_time_past(query, Height(ctx.height.0 - 1))?
+            mtp_at(query, Height(ctx.height.0 - 1), mtp_cache)?
         };
         let mut si = 0usize;
         for tx in block.txdata.iter().skip(1) {
@@ -1261,7 +1265,7 @@ pub(crate) fn structural_validate_spends(
                 let mtp = if ch == 0 {
                     0
                 } else {
-                    crate::header::median_time_past(query, Height(ch.saturating_sub(1)))?
+                    mtp_at(query, Height(ch.saturating_sub(1)), mtp_cache)?
                 };
                 coin_mtps.push(mtp);
             }
@@ -1288,6 +1292,20 @@ pub(crate) fn structural_validate_spends(
         create_h_ns,
         bip68_ns,
     })
+}
+
+/// [`crate::header::median_time_past`] with a write-run cache keyed by end height.
+fn mtp_at(
+    query: &Query,
+    height: Height,
+    cache: &mut std::collections::HashMap<u32, u32>,
+) -> Result<u32, ConsensusError> {
+    if let Some(&t) = cache.get(&height.0) {
+        return Ok(t);
+    }
+    let t = crate::header::median_time_past(query, height)?;
+    cache.insert(height.0, t);
+    Ok(t)
 }
 
 /// Parallel script checks for an owned job slice (preferred entry — no ref `Vec`).

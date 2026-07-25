@@ -297,7 +297,8 @@ pub fn confirm_write_phase(
     let out = class_c_commit(query, &mut batch.prepared)?;
     let class_c_ns = t_cc.elapsed().as_nanos() as u64;
 
-    let (spend_ann_ns, tip_gc_ns) = post_commit(query, &batch.prepared)?;
+    let (spend_ann_ns, tip_gc_ns) =
+        post_commit(query, &batch.prepared, &batch.batch_parents)?;
 
     // batch_parents dropped here with ScriptOkBatch — no tip GC of sparse pins.
     confirm_phase_stats::BLOCKS.fetch_add(n_blocks as u64, Ordering::Relaxed);
@@ -698,6 +699,8 @@ fn structural_run(
     use crate::block::StructuralPhaseNs;
     let t0 = Instant::now();
     let mut pending_spent: HashSet<([u8; 32], u32)> = HashSet::new();
+    // MTP of height H reused across blocks/spends in this write run.
+    let mut mtp_cache: HashMap<u32, u32> = HashMap::new();
     let mut tot = StructuralPhaseNs::default();
     for (i, p) in prepared.iter().enumerate() {
         let ctx = ValidationContext::at(params, p.height, milestone);
@@ -710,6 +713,7 @@ fn structural_run(
             p.fees,
             &mut pending_spent,
             batch_parents,
+            &mut mtp_cache,
         )?;
         tot.spent_ns = tot.spent_ns.saturating_add(ph.spent_ns);
         tot.create_h_ns = tot.create_h_ns.saturating_add(ph.create_h_ns);
@@ -780,14 +784,18 @@ fn class_c_commit(
 }
 
 /// Returns `(spend_ann_ns, tip_gc_ns)` measured with local `Instant`s.
-fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(u64, u64), ConsensusError> {
+fn post_commit(
+    query: &Query,
+    prepared: &[Prepared],
+    batch_parents: &rbitcoin_query::BatchParents,
+) -> Result<(u64, u64), ConsensusError> {
     // Direct IBD: batch durable spend annotations for the whole run **before**
     // the next confirm batch (spentness = confirmed-strong + annotation).
     // Tip mode usually writes spends on archive; still safe if spend_index on.
     let t_spent = Instant::now();
     if query.spend_index_enabled() && query.index_mode().uses_durable_spends() {
-        // Prefer create_fk + body range from tx.idx (no process-local range cache).
-        // Resolve ranges once per unique create, then annotate via ranged batch.
+        // Prefer pin body_range, then one bulk idx for the rest (not per-create
+        // sequential `tx_body_range`).
         use std::collections::{HashMap, HashSet};
         let mut pending: Vec<(
             rbitcoin_primitives::Fk,
@@ -810,10 +818,24 @@ fn post_commit(query: &Query, prepared: &[Prepared]) -> Result<(u64, u64), Conse
         }
         let mut range_by_create: HashMap<u64, (u64, u64)> =
             HashMap::with_capacity(unique_creates.len());
-        for id in unique_creates {
+        let mut need_range: Vec<rbitcoin_primitives::Fk> = Vec::new();
+        for &id in &unique_creates {
             let fk = rbitcoin_primitives::Fk(id);
-            if let Ok(r) = query.store().tx_body_range(fk) {
+            if let Some(r) = batch_parents.get_body_range(fk) {
                 range_by_create.insert(id, r);
+            } else {
+                need_range.push(fk);
+            }
+        }
+        if !need_range.is_empty() {
+            let ranges = query
+                .store()
+                .tx_body_range_batch(&need_range)
+                .map_err(ConsensusError::Store)?;
+            for (fk, opt) in need_range.iter().zip(ranges.into_iter()) {
+                if let (Some(id), Some(r)) = (fk.get(), opt) {
+                    range_by_create.insert(id, r);
+                }
             }
         }
         let mut ranged: Vec<(

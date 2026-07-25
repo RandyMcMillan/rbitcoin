@@ -391,7 +391,7 @@ impl Query {
             if need_vouts.is_empty() {
                 continue;
             }
-            if let Some((create_h, tx, outs, cb_hint, body_off, sparse_rels)) =
+            if let Some((create_h, tx, outs, cb_hint, body_range, sparse_rels)) =
                 body_hits.remove(&pid)
             {
                 st.pin_cache_body = st.pin_cache_body.saturating_add(1);
@@ -409,7 +409,7 @@ impl Query {
                     live,
                     need_vouts,
                     cb_stash,
-                    body_off,
+                    body_range,
                     sparse_rels,
                     Some(create_h),
                 );
@@ -485,7 +485,7 @@ impl Query {
                 u32,
                 rbitcoin_store::TxRecord,
                 Vec<rbitcoin_store::OutputRecord>,
-                Option<u64>,
+                Option<(u64, u64)>,
                 Vec<u32>,
             )> = Vec::with_capacity(FIFO_FLUSH);
 
@@ -517,17 +517,22 @@ impl Query {
                 if let Some((tx, outs, dense_rels)) = dense {
                     // Clone only the few need-vouts for the batch; move dense → FIFO.
                     let live = slim_dense_outs_to_need(&outs, &need_vouts);
-                    let body_off = range.map(|(off, _)| off);
                     let sparse = crate::batch_parents::sparse_spender_rels(&dense_rels, &need_vouts);
-                    fifo_seed.push((fk, 0, tx.clone(), outs, body_off, dense_rels));
+                    // Cheap coinbase: multi-in ⇒ not cb. Single-in left unknown.
+                    let cb_stash = if tx.input_count != 1 {
+                        Some(None)
+                    } else {
+                        None
+                    };
+                    fifo_seed.push((fk, 0, tx.clone(), outs, range, dense_rels));
                     // pin_new: body layout for write spentness; create height deferred.
                     batch_parents.insert_owned(
                         fk,
                         tx,
                         live,
                         need_vouts,
-                        None,
-                        body_off,
+                        cb_stash,
+                        range,
                         sparse,
                         None,
                     );

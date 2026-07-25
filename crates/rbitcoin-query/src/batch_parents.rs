@@ -9,9 +9,9 @@
 //! vouts) — not `HashMap`/`HashSet` per parent — to avoid thrashing the
 //! allocator when pin volume is tens of thousands of creates per load window.
 //!
-//! **Spentness layout:** optional `body_off` + per-need-vout relative offsets of
-//! the 9-byte durable spender meta so write structural can bulk-pread without
-//! idx or full packed walks.
+//! **Spentness / annotate layout:** optional packed `body_range` + per-need-vout
+//! relative offsets of the 9-byte durable spender meta so write structural can
+//! bulk-pread and spend annotate can skip per-create idx.
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};
@@ -28,8 +28,8 @@ pub struct ParentEntry {
     pub checked: Vec<u32>,
     /// Coinbase maturity: `None` unset; `Some(None)` not cb; `Some(Some(h))` height.
     pub coinbase_height: Option<Option<u32>>,
-    /// Absolute packed body start in `tx.body` when known.
-    pub body_off: Option<u64>,
+    /// Packed Class A `(body_off, body_len)` when known (pin_new / FIFO).
+    pub body_range: Option<(u64, u64)>,
     /// Sorted unique `(vout, rel)` for need vouts when layout known.
     /// `abs = body_off + rel` is the 9-byte spender meta.
     pub spender_rels: Vec<(u32, u32)>,
@@ -73,7 +73,7 @@ impl BatchParents {
         live: Vec<(u32, OutputRecord)>,
         checked: Vec<u32>,
         coinbase_height: Option<Option<u32>>,
-        body_off: Option<u64>,
+        body_range: Option<(u64, u64)>,
         spender_rels: Vec<(u32, u32)>,
         create_height: Option<u32>,
     ) {
@@ -87,7 +87,7 @@ impl BatchParents {
                 outs: live,
                 checked,
                 coinbase_height,
-                body_off,
+                body_range,
                 spender_rels,
                 create_height,
             },
@@ -132,17 +132,22 @@ impl BatchParents {
         self.by_fk.get(&id)?.coinbase_height
     }
 
+    /// Packed body `(off, len)` when known.
+    pub fn get_body_range(&self, fk: Fk) -> Option<(u64, u64)> {
+        let id = fk.get()?;
+        self.by_fk.get(&id)?.body_range
+    }
+
     /// Absolute body start when known.
     pub fn get_body_off(&self, fk: Fk) -> Option<u64> {
-        let id = fk.get()?;
-        self.by_fk.get(&id)?.body_off
+        self.get_body_range(fk).map(|(off, _)| off)
     }
 
     /// Absolute 9-byte spender meta offset for `vout`, if layout known.
     pub fn get_spender_abs(&self, fk: Fk, vout: u32) -> Option<u64> {
         let id = fk.get()?;
         let e = self.by_fk.get(&id)?;
-        let off = e.body_off?;
+        let (off, _) = e.body_range?;
         let i = e.spender_rels.binary_search_by_key(&vout, |(v, _)| *v).ok()?;
         Some(off.saturating_add(u64::from(e.spender_rels[i].1)))
     }
@@ -267,7 +272,7 @@ mod tests {
         assert_eq!(o.value, 10);
         assert_eq!(bp.get_parent_coinbase_height(Fk(7)), Some(None));
         assert_eq!(bp.len(), 1);
-        assert!(bp.get_body_off(Fk(7)).is_none());
+        assert!(bp.get_body_range(Fk(7)).is_none());
         assert!(bp.get_create_height(Fk(7)).is_none());
     }
 
@@ -281,13 +286,14 @@ mod tests {
             live,
             vec![0, 1, 2],
             Some(Some(3)),
-            Some(1000),
+            Some((1000, 200)),
             vec![(0, 50), (1, 70), (2, 90)],
             Some(3),
         );
         assert!(bp.pin_covered(Fk(9), &[0, 1, 2]));
         assert!(!bp.has_parent_out(Fk(9), 1)); // spent-filtered, not live
         assert_eq!(bp.get_spender_abs(Fk(9), 2), Some(1090));
+        assert_eq!(bp.get_body_range(Fk(9)), Some((1000, 200)));
         assert_eq!(bp.get_create_height(Fk(9)), Some(3));
     }
 

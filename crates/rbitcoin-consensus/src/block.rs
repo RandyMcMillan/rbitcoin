@@ -230,6 +230,115 @@ fn script_sigop_count(script: &[u8], accurate: bool) -> u64 {
     n
 }
 
+/// Last data push in a script (P2SH redeem / witness script).
+fn last_script_push(script: &[u8]) -> Option<&[u8]> {
+    let mut i = 0usize;
+    let mut last: Option<(usize, usize)> = None;
+    while i < script.len() {
+        let opcode = script[i];
+        i += 1;
+        let (start, len) = if opcode <= 0x4b {
+            let push = opcode as usize;
+            let s = i;
+            i = i.saturating_add(push);
+            (s, push)
+        } else if opcode == 0x4c && i < script.len() {
+            let push = script[i] as usize;
+            i += 1;
+            let s = i;
+            i = i.saturating_add(push);
+            (s, push)
+        } else if opcode == 0x4d && i + 1 < script.len() {
+            let push = u16::from_le_bytes([script[i], script[i + 1]]) as usize;
+            i += 2;
+            let s = i;
+            i = i.saturating_add(push);
+            (s, push)
+        } else if opcode == 0x4e && i + 3 < script.len() {
+            let push = u32::from_le_bytes(script[i..i + 4].try_into().unwrap_or([0; 4])) as usize;
+            i += 4;
+            let s = i;
+            i = i.saturating_add(push);
+            (s, push)
+        } else {
+            continue;
+        };
+        if start + len <= script.len() {
+            last = Some((start, len));
+        }
+    }
+    last.map(|(s, l)| &script[s..s + l])
+}
+
+fn is_p2sh_script(spk: &[u8]) -> bool {
+    spk.len() == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87
+}
+
+fn is_p2wpkh_program(prog: &[u8]) -> bool {
+    prog.len() == 22 && prog[0] == 0x00 && prog[1] == 0x14
+}
+
+fn is_p2wsh_program(prog: &[u8]) -> bool {
+    prog.len() == 34 && prog[0] == 0x00 && prog[1] == 0x20
+}
+
+/// BIP16 P2SH sigops from redeem scripts (accurate CHECKMULTISIG count).
+fn p2sh_sigop_count(tx: &Transaction, prevouts: &[TxOut]) -> u64 {
+    let mut n = 0u64;
+    for (i, inp) in tx.input.iter().enumerate() {
+        let Some(prev) = prevouts.get(i) else {
+            continue;
+        };
+        if !is_p2sh_script(prev.script_pubkey.as_bytes()) {
+            continue;
+        }
+        if let Some(redeem) = last_script_push(inp.script_sig.as_bytes()) {
+            n = n.saturating_add(script_sigop_count(redeem, true));
+        }
+    }
+    n
+}
+
+/// BIP141 witness sigop count (not witness-scaled).
+fn witness_sigop_count(tx: &Transaction, prevouts: &[TxOut]) -> u64 {
+    let mut n = 0u64;
+    for (i, inp) in tx.input.iter().enumerate() {
+        let Some(prev) = prevouts.get(i) else {
+            continue;
+        };
+        let mut program = prev.script_pubkey.as_bytes();
+        // Nested P2SH-P2W*: redeem in scriptSig is the witness program.
+        if is_p2sh_script(program) {
+            if let Some(redeem) = last_script_push(inp.script_sig.as_bytes()) {
+                program = redeem;
+            } else {
+                continue;
+            }
+        }
+        if is_p2wpkh_program(program) {
+            n = n.saturating_add(1);
+        } else if is_p2wsh_program(program) {
+            // Witness script is last stack item.
+            let wit = &inp.witness;
+            if let Some(ws) = wit.last() {
+                n = n.saturating_add(script_sigop_count(ws, true));
+            }
+        }
+    }
+    n
+}
+
+/// Full Core-style sigop cost for one tx given prevouts (BIP16 + BIP141).
+fn tx_sigop_cost(tx: &Transaction, prevouts: &[TxOut], bip16: bool) -> u64 {
+    const WITNESS_SCALE: u64 = 4;
+    let mut cost = legacy_sigop_count(tx).saturating_mul(WITNESS_SCALE);
+    if bip16 {
+        cost = cost.saturating_add(p2sh_sigop_count(tx, prevouts).saturating_mul(WITNESS_SCALE));
+    }
+    cost = cost.saturating_add(witness_sigop_count(tx, prevouts));
+    cost
+}
+
 /// BIP141: coinbase must commit to witness merkle root when segwit is used.
 ///
 /// `precomputed_non_cb` is wtxids for non-coinbase txs (same order as `txdata[1..]`).
@@ -588,14 +697,18 @@ fn assemble_block_prevouts_mode(
     let mut same_block: std::collections::HashMap<[u8; 32], usize> =
         std::collections::HashMap::with_capacity(n_tx);
     let mut fees = 0i64;
-    // Skip job materialization (tx clone + prevout retention) when scripts are
-    // skipped — pure waste below the milestone.
+    // Skip job materialization (tx clone) when scripts are skipped — pure waste
+    // below the milestone. Prevouts still resolve for fees + full sigop cost.
     let build_script_jobs = !ctx.milestone.skips_scripts_at(ctx.height.0);
     let mut script_jobs: Vec<ScriptCheckJob> = if build_script_jobs {
         Vec::with_capacity(n_tx.saturating_sub(1))
     } else {
         Vec::new()
     };
+    // BIP141/BIP16 full block sigop cost (structure only counts legacy×4).
+    const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
+    let mut block_sigops_cost =
+        legacy_sigop_count(&block.txdata[0]).saturating_mul(4);
     // (prev_txid, vout, spending_tx_fk, create_tx_fk).
     let mut spends: Vec<(
         [u8; 32],
@@ -634,12 +747,8 @@ fn assemble_block_prevouts_mode(
             }
 
             let mut value_in = 0i64;
-            // Only retain prevouts when scripts will run; otherwise drop after fee add.
-            let mut prevouts: Vec<TxOut> = if build_script_jobs {
-                Vec::with_capacity(tx.input.len())
-            } else {
-                Vec::new()
-            };
+            // Prevouts for fees, sigop cost, and (optionally) script jobs.
+            let mut prevouts: Vec<TxOut> = Vec::with_capacity(tx.input.len());
             let mut input_create_heights: Vec<u32> = Vec::with_capacity(tx.input.len());
             // Thin create_fk edges from this confirm batch (batch-local).
             let thin = spend_fk.and_then(|fk| fk.get().and_then(|id| batch_thin.get(&id)));
@@ -725,9 +834,16 @@ fn assemble_block_prevouts_mode(
                     .checked_add(prev_out.txout.value.to_sat() as i64)
                     .ok_or(ConsensusError::BadTx("value in overflow"))?;
                 input_create_heights.push(prev_out.create_height);
-                if build_script_jobs {
-                    prevouts.push(prev_out.txout);
-                }
+                prevouts.push(prev_out.txout);
+            }
+
+            block_sigops_cost = block_sigops_cost.saturating_add(tx_sigop_cost(
+                tx,
+                &prevouts,
+                bip16_for_jobs,
+            ));
+            if block_sigops_cost > MAX_BLOCK_SIGOPS_COST {
+                return Err(ConsensusError::BadBlock("bad-blk-sigops"));
             }
 
             // BIP113 absolute finality + BIP68 relative sequence locks (CSV package).
@@ -1806,6 +1922,120 @@ mod structure_rule_tests {
         let b = block_with(vec![cb]);
         let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
         assert_bad_block(err, "sigops");
+    }
+}
+
+#[cfg(test)]
+mod sigop_cost_tests {
+    use super::{
+        is_p2sh_script, last_script_push, p2sh_sigop_count, script_sigop_count, tx_sigop_cost,
+        witness_sigop_count,
+    };
+    use bitcoin::absolute::LockTime;
+    use bitcoin::hashes::Hash;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+    };
+
+    #[test]
+    fn last_push_and_p2sh_shape() {
+        // OP_1 push of 0xac (CHECKSIG) as redeem
+        let ss = [0x01, 0xac];
+        assert_eq!(last_script_push(&ss), Some(&[0xacu8][..]));
+        let p2sh = {
+            let mut v = vec![0xa9, 0x14];
+            v.extend([0u8; 20]);
+            v.push(0x87);
+            v
+        };
+        assert!(is_p2sh_script(&p2sh));
+        assert!(!is_p2sh_script(&[0x51]));
+    }
+
+    #[test]
+    fn accurate_multisig_count() {
+        // OP_2 <key> <key> <key> OP_3 OP_CHECKMULTISIG → 3 when accurate
+        let redeem = vec![
+            0x52, // OP_2
+            0x21, // push 33
+        ];
+        let mut r = redeem;
+        r.extend([0x02; 33]);
+        r.push(0x21);
+        r.extend([0x02; 33]);
+        r.push(0x21);
+        r.extend([0x02; 33]);
+        r.push(0x53); // OP_3
+        r.push(0xae); // CHECKMULTISIG
+        assert_eq!(script_sigop_count(&r, true), 3);
+        assert_eq!(script_sigop_count(&r, false), 20);
+    }
+
+    #[test]
+    fn p2sh_sigops_from_redeem() {
+        let mut p2sh_spk = vec![0xa9, 0x14];
+        p2sh_spk.extend([0u8; 20]);
+        p2sh_spk.push(0x87);
+        // redeem = single CHECKSIG
+        let redeem = [0xac];
+        let mut ss = vec![0x01]; // push 1 byte
+        ss.extend_from_slice(&redeem);
+        let tx = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([1; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::from_bytes(ss),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(10),
+            script_pubkey: ScriptBuf::from_bytes(p2sh_spk),
+        }];
+        assert_eq!(p2sh_sigop_count(&tx, &prevouts), 1);
+        // legacy×4 + p2sh×4 = 0 + 4 (no legacy CHECKSIG in ss/spk for bare count of redeem)
+        let cost = tx_sigop_cost(&tx, &prevouts, true);
+        // scriptSig has push only (0 legacy), output OP_1 (0), p2sh redeem 1×4 = 4
+        assert_eq!(cost, 4);
+    }
+
+    #[test]
+    fn witness_p2wpkh_counts_one() {
+        let mut spk = vec![0x00, 0x14];
+        spk.extend([0u8; 20]);
+        let tx = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([2; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[vec![0x30], vec![0x02; 33]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(10),
+            script_pubkey: ScriptBuf::from_bytes(spk),
+        }];
+        assert_eq!(witness_sigop_count(&tx, &prevouts), 1);
     }
 }
 

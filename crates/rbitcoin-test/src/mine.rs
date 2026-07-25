@@ -16,11 +16,16 @@ pub fn bip34_script(height: u32) -> ScriptBuf {
 }
 
 pub fn coinbase_tx(height: u32, value: Amount) -> Transaction {
-    let script_sig = if height == 0 {
-        ScriptBuf::from_bytes(vec![0x00])
+    // Consensus: coinbase scriptSig length must be in 2..=100.
+    let mut ss = if height == 0 {
+        vec![0x00]
     } else {
-        bip34_script(height)
+        rbitcoin_consensus::bip34_height_script(height)
     };
+    while ss.len() < 2 {
+        ss.push(0x00);
+    }
+    let script_sig = ScriptBuf::from_bytes(ss);
     Transaction {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,

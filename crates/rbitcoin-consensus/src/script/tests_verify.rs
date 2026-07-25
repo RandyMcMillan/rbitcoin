@@ -117,6 +117,41 @@ fn anyone_can_spend_accepts() {
     script::verify_job_all_inputs(&job).expect("op_true");
 }
 
+/// Empty scriptPubKey is not anyone-can-spend (Core: empty stack after eval → fail).
+#[test]
+fn empty_script_pubkey_rejects() {
+    let prevout = TxOut {
+        value: Amount::from_sat(1_000),
+        script_pubkey: ScriptBuf::new(),
+    };
+    let tx = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(900),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let job = ScriptCheckJob {
+        prevouts: vec![prevout],
+        tx: tx.clone(),
+        bip65_active: true,
+        bip112_active: true,
+        bip66_active: true,
+        bip16_active: true,
+    };
+    assert!(
+        script::verify_job_all_inputs(&job).is_err(),
+        "empty spk + empty scriptSig must fail"
+    );
+}
+
 #[test]
 fn p2pkh_valid_signature_accepts() {
     let secp = Secp256k1::new();

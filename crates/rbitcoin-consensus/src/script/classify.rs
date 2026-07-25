@@ -14,14 +14,14 @@ pub(crate) enum ScriptKind {
     P2pkh,
     /// OP_HASH160 OP_PUSHBYTES_20 <20> OP_EQUAL
     P2sh,
-    /// Non-empty bare (P2PK, custom) — run interpreter
+    /// Bare (P2PK, custom, empty spk) — run interpreter
     Bare,
-    Unknown,
 }
 
+/// Core anyone-can-spend templates only. **Empty** `scriptPubKey` is **not** ACS
+/// (EvalScript leaves empty stack → fail without TRUE). Only explicit `OP_TRUE`.
 pub(crate) fn is_anyone_can_spend(script: &Script) -> bool {
-    let b = script.as_bytes();
-    b.is_empty() || b == [0x51] // OP_TRUE
+    script.as_bytes() == [0x51] // OP_TRUE
 }
 
 pub(crate) fn classify(script: &Script) -> ScriptKind {
@@ -52,8 +52,9 @@ pub(crate) fn classify(script: &Script) -> ScriptKind {
     if b.len() == 23 && b[0] == 0xa9 && b[1] == 0x14 && b[22] == 0x87 {
         return ScriptKind::P2sh;
     }
+    // Empty: bare EvalScript(scriptSig)+EvalScript(empty spk) — not ACS.
     if b.is_empty() {
-        return ScriptKind::Unknown;
+        return ScriptKind::Bare;
     }
     // Bare P2PK or other: treat as bare if it looks like a script (not witness program).
     if b[0] > 0x51 && b[0] < 0x60 {
@@ -107,6 +108,8 @@ mod tests {
         assert_eq!(classify(p2sh.as_script()), ScriptKind::P2sh);
 
         assert!(is_anyone_can_spend(ScriptBuf::from_bytes(vec![0x51]).as_script()));
-        assert!(is_anyone_can_spend(ScriptBuf::new().as_script()));
+        // Empty is bare consensus-eval, not anyone-can-spend (Core parity).
+        assert!(!is_anyone_can_spend(ScriptBuf::new().as_script()));
+        assert_eq!(classify(ScriptBuf::new().as_script()), ScriptKind::Bare);
     }
 }

@@ -99,7 +99,6 @@ pub(crate) fn verify_input(
         ScriptKind::P2wsh => p2wsh::verify(job, input_index, tx),
         ScriptKind::P2tr => p2tr::verify(job, input_index, tx, cache),
         ScriptKind::Bare => verify_bare(job, input_index, tx, prevout),
-        ScriptKind::Unknown => Err(ConsensusError::Script("unsupported scriptPubKey".into())),
     }
 }
 

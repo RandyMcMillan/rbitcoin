@@ -411,52 +411,58 @@ impl Query {
             .pin_body_ns
             .saturating_add(t_body.elapsed().as_nanos() as u64);
 
-        // ── pin_new: bulk idx ranges + bulk body preads ───────────────────
+        // ── pin_new: bulk idx + body preads in **chunks** ─────────────────
+        // Holding ~90k full packed bodies + dense outs at once blew RSS
+        // (appeared as a leak once load filled ahead of write). Chunk so peak
+        // is O(PIN_NEW_CHUNK) bodies, not O(all cold parents).
+        const PIN_NEW_CHUNK: usize = 4096;
         let t_new = Instant::now();
         if self.confirm_cancelled() {
             crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
             return Err(StoreError::Cancelled("confirm cancelled"));
         }
-        if !pin_new_pending.is_empty() {
-            let fks: Vec<Fk> = pin_new_pending.iter().map(|(pid, _)| Fk(*pid)).collect();
-            // Batched tx.idx preads (io_uring) — was scalar per-parent before.
+        for chunk in pin_new_pending.chunks(PIN_NEW_CHUNK) {
+            if self.confirm_cancelled() {
+                crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                return Err(StoreError::Cancelled("confirm cancelled"));
+            }
+            let fks: Vec<Fk> = chunk.iter().map(|(pid, _)| Fk(*pid)).collect();
             let ranges = self.store.tx_body_range_batch(&fks)?;
 
-            let mut bulk_idx: Vec<usize> = Vec::new();
+            // job_i → bulk_ranges slot (only jobs with a range + need_vouts).
+            let mut bulk_job_i: Vec<usize> = Vec::new();
             let mut bulk_ranges: Vec<(u64, u64)> = Vec::new();
-            let mut pin_new_jobs: Vec<(u64, Vec<u32>, Option<(u64, u64)>)> =
-                Vec::with_capacity(pin_new_pending.len());
-            for (i, ((pid, need_vouts), range_opt)) in
-                pin_new_pending.into_iter().zip(ranges.into_iter()).enumerate()
-            {
+            let mut jobs: Vec<(u64, Vec<u32>, Option<(u64, u64)>)> =
+                Vec::with_capacity(chunk.len());
+            for ((pid, need_vouts), range_opt) in chunk.iter().zip(ranges.into_iter()) {
+                let need_vouts = need_vouts.clone();
                 if let Some((off, len)) = range_opt {
                     if !need_vouts.is_empty() {
-                        bulk_idx.push(i);
+                        bulk_job_i.push(jobs.len());
                         bulk_ranges.push((off, len));
                     }
-                    pin_new_jobs.push((pid, need_vouts, Some((off, len))));
+                    jobs.push((*pid, need_vouts, Some((off, len))));
                 } else {
-                    pin_new_jobs.push((pid, need_vouts, None));
+                    jobs.push((*pid, need_vouts, None));
                 }
             }
 
-            let bulk_decoded = if bulk_ranges.is_empty() {
+            let mut bulk_decoded = if bulk_ranges.is_empty() {
                 Vec::new()
             } else {
                 self.store
                     .get_tx_meta_and_outputs_batch_at(&bulk_ranges)?
             };
-            let mut bulk_by_job: HashMap<
-                usize,
-                (rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>),
-            > = HashMap::with_capacity(bulk_idx.len());
-            for (ji, got) in bulk_idx.into_iter().zip(bulk_decoded.into_iter()) {
-                if let Some(v) = got {
-                    bulk_by_job.insert(ji, v);
-                }
+            drop(bulk_ranges);
+
+            // Map job index → bulk_decoded slot for O(1) take while walking jobs.
+            let mut bulk_slot_for_job: HashMap<usize, usize> =
+                HashMap::with_capacity(bulk_job_i.len());
+            for (slot, &job_i) in bulk_job_i.iter().enumerate() {
+                bulk_slot_for_job.insert(job_i, slot);
             }
 
-            for (ji, (pid, need_vouts, range)) in pin_new_jobs.into_iter().enumerate() {
+            for (ji, (pid, need_vouts, range)) in jobs.into_iter().enumerate() {
                 if self.confirm_cancelled() {
                     crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                     return Err(StoreError::Cancelled("confirm cancelled"));
@@ -464,11 +470,13 @@ impl Query {
                 let fk = Fk(pid);
                 if range.is_some() {
                     if !need_vouts.is_empty() {
-                        if let Some((tx, outs)) = bulk_by_job.remove(&ji) {
-                            // Need-vouts only; spentness + coinbase height = structural.
-                            let live = slim_dense_outs_to_need(&outs, &need_vouts);
-                            batch_parents.insert_owned(fk, tx, live, need_vouts, None);
-                            st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+                        if let Some(&slot) = bulk_slot_for_job.get(&ji) {
+                            if let Some((tx, outs)) = bulk_decoded[slot].take() {
+                                let live = slim_dense_outs_to_need(&outs, &need_vouts);
+                                drop(outs);
+                                batch_parents.insert_owned(fk, tx, live, need_vouts, None);
+                                st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+                            }
                         }
                     }
                 } else if !need_vouts.is_empty() {

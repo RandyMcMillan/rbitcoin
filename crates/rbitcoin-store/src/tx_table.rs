@@ -1780,14 +1780,27 @@ impl TxTable {
         }
         bulk_io::pread_batch(&mut read_ops);
 
-        let mut out: Vec<Option<(TxRecord, Vec<OutputRecord>)>> = vec![None; ranges.len()];
+        // Which preads completed for the full length (must record before we
+        // release `read_ops` / free buffers).
+        let mut ok = vec![false; ranges.len()];
         for (ro, &i) in read_ops.iter().zip(submitted.iter()) {
-            if ro.result < 0 || ro.result as u64 != ranges[i].1 {
+            if ro.result >= 0 && ro.result as u64 == ranges[i].1 {
+                ok[i] = true;
+            }
+        }
+        drop(read_ops);
+
+        let mut out: Vec<Option<(TxRecord, Vec<OutputRecord>)>> = vec![None; ranges.len()];
+        // Free each raw body as soon as it is decoded so peak is not
+        // (all raw bodies) + (all dense outs) at once.
+        for (i, slot) in bufs.into_iter().enumerate() {
+            if !ok[i] || slot.is_empty() {
                 continue;
             }
-            if let Ok(v) = decode_packed_tx_outs_only(&bufs[i]) {
+            if let Ok(v) = decode_packed_tx_outs_only(&slot) {
                 out[i] = Some(v);
             }
+            // `slot` dropped at end of iteration.
         }
         Ok(out)
     }

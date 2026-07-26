@@ -628,43 +628,14 @@ mod contig_park_tests {
         assert_eq!(budget.bytes(), 0);
     }
 
-    /// Bounded arch_job queue: when full, production releases charge (same
-    /// meter as Ok/Err/Dropped). Unbounded queue retained full Blocks for the
-    /// whole `tx.head` resize stall.
+    /// Cap is modest (process-owned Block FIFO bound under resize stall).
     #[test]
-    fn arch_job_queue_full_releases_charge() {
-        use super::{ArchiveQueueBudget, ARCH_JOB_QUEUE_CAP};
+    fn arch_job_queue_cap_is_modest() {
+        use super::ARCH_JOB_QUEUE_CAP;
         assert!(
             ARCH_JOB_QUEUE_CAP > 0 && ARCH_JOB_QUEUE_CAP <= 1024,
             "arch job queue must be a modest bound, got {ARCH_JOB_QUEUE_CAP}"
         );
-        let budget = ArchiveQueueBudget::new(64 * 1024 * 1024);
-        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-        // Fill channel.
-        for h in 0..2u32 {
-            let j = job(h);
-            budget.charge(j.wire_bytes);
-            tx.try_send(j).unwrap();
-        }
-        assert_eq!(budget.count(), 2);
-        // Next job would Full — production releases charge without retaining Block.
-        let j = job(99);
-        let wire = j.wire_bytes;
-        budget.charge(wire);
-        assert_eq!(budget.count(), 3);
-        match tx.try_send(j) {
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_dropped)) => {
-                budget.release(wire);
-            }
-            other => panic!("expected Full, got {other:?}"),
-        }
-        assert_eq!(budget.count(), 2, "Full path must release the rejected charge");
-        // Drain retained jobs and release (pipeline Ok/Err).
-        while let Ok(j) = rx.try_recv() {
-            budget.release(j.wire_bytes);
-        }
-        assert_eq!(budget.count(), 0);
-        assert_eq!(budget.bytes(), 0);
     }
 
     /// Forwarder drain helper: charged jobs left on job_rx must emit Err and

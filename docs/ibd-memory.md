@@ -76,10 +76,11 @@ cargo test -p rbitcoin-net --lib contig_park_tests
 cargo test -p rbitcoin-net --lib presence_lifecycle
 ```
 
-Honest coverage (reverting emit/apply / queue bound would fail):
+Honest coverage (reverting emit/apply / Full release would fail):
 
-- `arch_job_queue_full_releases_charge` — Full `try_send` releases budget
-- `multi_block_ibd_like_growth_then_production_abort_plateau` — N=128 large charges, WriterDead path, plateau budget==0
+- `apply_peer_event_arch_job_full_plateau` — **production** `apply_peer_event(Block)` Full path; budget plateaus at Q
+- `apply_peer_event_flood_respects_arch_job_cap` — flood at `ARCH_JOB_QUEUE_CAP`; peak ≤ CAP; drain → 0
+- `multi_block_ibd_like_growth_then_production_abort_plateau` — WriterDead path, plateau budget==0
 - `multi_block_park_abort_releases_all_charges` — `emit_writer_dead_outcomes` + `release_remaining_jobs` + `apply_archive_result`
 - `drain_job_rx_as_err_releases_via_apply` — forwarder stop drain + apply
 - `force_advance_returns_parked_jobs_for_charge_release` — Dropped emit + apply

@@ -94,6 +94,8 @@ that shows a clear change after.
 5. **Tests** must tear down intentional caches with **production** APIs (table
    below) — not a secret free-all that masks production leaks.
 6. **Regression filters:**
+   `apply_peer_event_arch_job_full_plateau`,
+   `apply_peer_event_flood_respects_arch_job_cap`,
    `force_advance_returns_parked_jobs_for_charge_release`,
    `multi_block_park_abort_releases_all_charges`,
    `multi_block_ibd_like_growth_then_production_abort_plateau`,

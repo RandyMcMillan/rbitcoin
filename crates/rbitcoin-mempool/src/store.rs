@@ -543,8 +543,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        // Prefer /tmp so mmap works (workspace may be 9p without MAP_SHARED write).
-        let p = PathBuf::from(format!("/tmp/rbitcoin-mempool-test-{n}"));
+        // Prefer process temp dir so mmap works (workspace may be 9p without MAP_SHARED write).
+        let p = std::env::temp_dir().join(format!("rbitcoin-mempool-test-{n}"));
         let _ = fs::remove_dir_all(&p);
         p
     }

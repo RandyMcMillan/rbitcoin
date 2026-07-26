@@ -387,7 +387,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::path::PathBuf::from(format!("/tmp/rbitcoin-txrelay-{n}"))
+        std::env::temp_dir().join(format!("rbitcoin-txrelay-{n}"))
     }
 
     #[test]

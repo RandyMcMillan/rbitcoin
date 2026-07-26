@@ -559,7 +559,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::path::PathBuf::from(format!("/tmp/rbitcoin-mempool-accept-{n}"));
+        let p = std::env::temp_dir().join(format!("rbitcoin-mempool-accept-{n}"));
         let _ = std::fs::remove_dir_all(&p);
         p
     }

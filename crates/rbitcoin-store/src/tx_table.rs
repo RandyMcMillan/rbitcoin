@@ -683,6 +683,13 @@ pub struct TxTable {
     resize_bg: Mutex<Option<JoinHandle<()>>>,
     /// Generation of the live bg worker; bump to ask a previous worker to exit.
     resize_bg_gen: AtomicU64,
+    /// Sticky abort for exclusive swap waits (Drop / tests). Distinct from gen
+    /// bump alone: gen kill of the bg worker must still allow main-thread
+    /// `head_resize_poll` to complete the swap.
+    resize_abort: AtomicBool,
+    /// Only one thread may run the exclusive rename/swap path at a time.
+    /// Without this, bg poll + main-thread poll race double-close mmaps/FDs.
+    resize_completing: AtomicBool,
     /// Wakes archive/tip writers parked on probe-exhaust for the duration of a resize.
     /// Pair with [`Self::resize`] (waiters hold that mutex).
     resize_cv: Condvar,
@@ -690,7 +697,9 @@ pub struct TxTable {
 
 impl Drop for TxTable {
     fn drop(&mut self) {
-        // Stop + join bg fill so we never outlive `self` (worker holds `*const TxTable`).
+        // Sticky abort first so exclusive-lock waiters exit even if they enter
+        // the wait *after* the gen bump (gen_at_start would already match).
+        self.resize_abort.store(true, AtomicOrdering::Release);
         self.resize_bg_gen
             .fetch_add(1, AtomicOrdering::AcqRel);
         if let Some(h) = self.resize_bg.lock().unwrap().take() {
@@ -720,6 +729,8 @@ impl TxTable {
             resize_active: AtomicBool::new(false),
             resize_bg: Mutex::new(None),
             resize_bg_gen: AtomicU64::new(0),
+            resize_abort: AtomicBool::new(false),
+            resize_completing: AtomicBool::new(false),
             resize_cv: Condvar::new(),
         })
     }
@@ -767,6 +778,8 @@ impl TxTable {
             resize_active: AtomicBool::new(false),
             resize_bg: Mutex::new(None),
             resize_bg_gen: AtomicU64::new(0),
+            resize_abort: AtomicBool::new(false),
+            resize_completing: AtomicBool::new(false),
             resize_cv: Condvar::new(),
         };
         if need_rebuild {
@@ -2540,6 +2553,7 @@ impl TxTable {
                 cursor: ctrl.cursor.max(1),
                 target: ctrl.target,
             });
+            self.resize_abort.store(false, AtomicOrdering::Release);
             self.resize_active.store(true, AtomicOrdering::Release);
             rbitcoin_log::info!(
                 "store: resume tx.head resize bits={} entry={}B cursor={}",
@@ -2561,6 +2575,7 @@ impl TxTable {
             cursor: ctrl.cursor.max(1),
             target: ctrl.target,
         });
+        self.resize_abort.store(false, AtomicOrdering::Release);
         self.resize_active.store(true, AtomicOrdering::Release);
         rbitcoin_log::info!(
             "store: resume tx.head resize bits={} entry={}B cursor={}",
@@ -2682,6 +2697,7 @@ impl TxTable {
             cursor: 1,
             target,
         });
+        self.resize_abort.store(false, AtomicOrdering::Release);
         self.resize_active.store(true, AtomicOrdering::Release);
         drop(rg);
         self.ensure_resize_bg_running();
@@ -2845,6 +2861,28 @@ impl TxTable {
     fn try_complete_head_resize(&self) -> Result<(), StoreError> {
         use std::time::{Duration, Instant};
 
+        // Single completer: bg wave + main-thread poll must not both rename/drop
+        // the shadow (IO Safety: owned FD already closed).
+        if self
+            .resize_completing
+            .compare_exchange(
+                false,
+                true,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .is_err()
+        {
+            return Ok(());
+        }
+        struct CompletingGuard<'a>(&'a AtomicBool);
+        impl Drop for CompletingGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, AtomicOrdering::Release);
+            }
+        }
+        let _completing_guard = CompletingGuard(&self.resize_completing);
+
         rbitcoin_log::info!(
             "store: tx.head resize fill done — final catch-up + swap (shadow → primary)"
         );
@@ -2898,24 +2936,49 @@ impl TxTable {
 
         // Phase 2: exclusive head ownership for rename + reopen. Use try_write so
         // we log while waiting (std RwLock write can starve under continuous reads).
-        // Capture gen so Drop / worker-respawn (`resize_bg_gen` bump) can abort this
-        // wait — otherwise Drop's join hangs forever behind an infinite try_write loop.
+        // Cancel if: sticky abort (Drop), or `resize_bg_gen` changes after we enter
+        // this wait (worker kill / respawn while blocked). Gen bump alone before
+        // entering the wait must *not* cancel — main-thread poll may complete after
+        // killing the bg worker (archiver sleep test).
         rbitcoin_log::info!("store: tx.head resize acquiring exclusive head lock for swap…");
         let t_lock = Instant::now();
+        if self.resize_abort.load(AtomicOrdering::Acquire) {
+            rbitcoin_log::info!(
+                "store: tx.head resize exclusive lock wait cancelled (abort before try_write)"
+            );
+            return Ok(());
+        }
         let gen_at_start = self.resize_bg_gen.load(AtomicOrdering::Acquire);
         let mut waited = 0u32;
         let mut head_w = loop {
+            if self.resize_abort.load(AtomicOrdering::Acquire)
+                || self.resize_bg_gen.load(AtomicOrdering::Acquire) != gen_at_start
+            {
+                rbitcoin_log::info!(
+                    "store: tx.head resize exclusive lock wait cancelled \
+                     (abort/gen after {:?})",
+                    t_lock.elapsed()
+                );
+                return Ok(());
+            }
             match self.head.try_write() {
-                Ok(g) => break g,
-                Err(_) => {
-                    if self.resize_bg_gen.load(AtomicOrdering::Acquire) != gen_at_start {
+                Ok(g) => {
+                    // Re-check after acquiring: Drop may have set abort while we
+                    // raced into the write lock.
+                    if self.resize_abort.load(AtomicOrdering::Acquire)
+                        || self.resize_bg_gen.load(AtomicOrdering::Acquire) != gen_at_start
+                    {
                         rbitcoin_log::info!(
                             "store: tx.head resize exclusive lock wait cancelled \
-                             (bg gen changed after {:?})",
+                             (abort after try_write, {:?})",
                             t_lock.elapsed()
                         );
+                        drop(g);
                         return Ok(());
                     }
+                    break g;
+                }
+                Err(_) => {
                     waited = waited.saturating_add(1);
                     if waited == 1 || waited % 40 == 0 {
                         rbitcoin_log::warn!(
@@ -2973,6 +3036,7 @@ impl TxTable {
         };
         let wait_arc = Instant::now();
         let mut spins = 0u32;
+        let gen_arc = self.resize_bg_gen.load(AtomicOrdering::Acquire);
         while Arc::strong_count(&hr.shadow) > 1 {
             spins = spins.saturating_add(1);
             if spins == 1 || spins % 200 == 0 {
@@ -2983,7 +3047,9 @@ impl TxTable {
                     wait_arc.elapsed()
                 );
             }
-            if self.resize_bg_gen.load(AtomicOrdering::Acquire) != gen_at_start {
+            if self.resize_abort.load(AtomicOrdering::Acquire)
+                || self.resize_bg_gen.load(AtomicOrdering::Acquire) != gen_arc
+            {
                 // Put resize back so Drop/resume can clean up; abandon swap.
                 *self.resize.lock().unwrap() = Some(hr);
                 return Ok(());
@@ -3794,15 +3860,21 @@ mod tests {
                 "resize should still be blocked on exclusive head lock"
             );
 
-            // Same signal Drop uses before join — try_write must observe and exit.
+            // Same signal Drop uses before join — sticky abort + gen so waiters
+            // exit even if they enter try_write *after* this line.
+            t.resize_abort.store(true, AtomicOrdering::Release);
             t.resize_bg_gen
                 .fetch_add(1, AtomicOrdering::AcqRel);
 
             let t0 = Instant::now();
             let _ = poller.join();
+            // Also join bg fill so it cannot complete a swap after we release head.read.
+            if let Some(h) = t.resize_bg.lock().unwrap().take() {
+                let _ = h.join();
+            }
             assert!(
                 t0.elapsed() < Duration::from_secs(5),
-                "head_resize_poll stuck in exclusive lock wait for {:?}",
+                "head_resize_poll/bg stuck in exclusive lock wait for {:?}",
                 t0.elapsed()
             );
 

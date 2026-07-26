@@ -23,6 +23,10 @@ pub struct VarTable {
     body: TableFile,
     idx: TableFile,
     count: AtomicU64,
+    /// Body exclusive-end of the last **published** record (Release with `count`).
+    /// Must not use live `body.logical_len()` for last-record length: the single
+    /// appender may extend body for the *next* batch before publishing count.
+    published_body_end: AtomicU64,
 }
 
 impl VarTable {
@@ -33,6 +37,7 @@ impl VarTable {
             body,
             idx,
             count: AtomicU64::new(0),
+            published_body_end: AtomicU64::new(FILE_HEADER_LEN as u64),
         })
     }
 
@@ -44,10 +49,12 @@ impl VarTable {
             return Err(StoreError::Corrupt("var idx size"));
         }
         let count = idx_body / 8;
+        let body_end = body.logical_len().max(FILE_HEADER_LEN as u64);
         Ok(Self {
             body,
             idx,
             count: AtomicU64::new(count),
+            published_body_end: AtomicU64::new(body_end),
         })
     }
 
@@ -77,9 +84,9 @@ impl VarTable {
     /// Absolute `(offset, len)` of the unframed payload for `fk`.
     pub fn record_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
-        let count = self.count.load(Ordering::Acquire);
+        let (count, body_end) = self.published_meta();
         let start = self.record_start(id, count)?;
-        let end = self.record_end(id, count)?;
+        let end = self.record_end_with(id, count, body_end)?;
         if end < start {
             return Err(StoreError::Corrupt("var record end < start"));
         }
@@ -98,7 +105,7 @@ impl VarTable {
         if last < first {
             return Ok(Vec::new());
         }
-        let count = self.count.load(Ordering::Acquire);
+        let (count, body_end) = self.published_meta();
         if last > count {
             return Err(StoreError::NotFound);
         }
@@ -115,7 +122,6 @@ impl VarTable {
             let s = i * 8;
             starts.push(u64::from_le_bytes(raw[s..s + 8].try_into().unwrap()));
         }
-        let body_end = self.body.logical_len().max(FILE_HEADER_LEN as u64);
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let start = starts[i];
@@ -159,7 +165,9 @@ impl VarTable {
 
     #[inline]
     pub(crate) fn body_published_len(&self) -> u64 {
-        self.body.logical_len()
+        self.published_body_end
+            .load(Ordering::Acquire)
+            .max(FILE_HEADER_LEN as u64)
     }
 
 
@@ -240,7 +248,10 @@ impl VarTable {
         self.body.write_at(start, &body_blob)?;
         let off_pos = FILE_HEADER_LEN as u64 + base_count * 8;
         self.idx.write_at(off_pos, &idx_blob)?;
-        // Publish complete records.
+        // Publish complete records: body_end before count so last-record readers
+        // never see a body tail that belongs to a not-yet-published batch.
+        let new_end = start.saturating_add(body_blob.len() as u64);
+        self.published_body_end.store(new_end, Ordering::Release);
         self.count
             .store(base_count + n as u64, Ordering::Release);
         Ok(fks)
@@ -257,21 +268,45 @@ impl VarTable {
         Ok(u64::from_le_bytes(off_buf))
     }
 
-    /// Exclusive end offset of record `id` (start of next, or body logical end).
-    fn record_end(&self, id: u64, count: u64) -> Result<u64, StoreError> {
+    /// Consistent `(count, published_body_end)` snapshot (writer publishes end then count).
+    fn published_meta(&self) -> (u64, u64) {
+        loop {
+            let c1 = self.count.load(Ordering::Acquire);
+            let end = self
+                .published_body_end
+                .load(Ordering::Acquire)
+                .max(FILE_HEADER_LEN as u64);
+            let c2 = self.count.load(Ordering::Acquire);
+            if c1 == c2 {
+                return (c1, end);
+            }
+        }
+    }
+
+    /// Exclusive end offset of record `id` given a consistent `(count, body_end)`.
+    fn record_end_with(
+        &self,
+        id: u64,
+        count: u64,
+        published_body_end: u64,
+    ) -> Result<u64, StoreError> {
         if id < count {
             self.record_start(id + 1, count)
+        } else if id == count {
+            Ok(published_body_end)
         } else {
-            Ok(self.body.logical_len().max(FILE_HEADER_LEN as u64))
+            Err(StoreError::NotFound)
         }
     }
 
     /// Raw unframed payload for `fk`.
     pub fn get_raw(&self, fk: Fk) -> Result<Vec<u8>, StoreError> {
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
-        let count = self.count.load(Ordering::Acquire);
+        // Pair count with published_body_end so last-record length cannot span a
+        // later batch's body tail (concurrent appender).
+        let (count, body_end) = self.published_meta();
         let start = self.record_start(id, count)?;
-        let end = self.record_end(id, count)?;
+        let end = self.record_end_with(id, count, body_end)?;
         if end < start {
             return Err(StoreError::Corrupt("var record end < start"));
         }

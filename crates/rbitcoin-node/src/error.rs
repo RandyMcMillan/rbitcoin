@@ -49,3 +49,38 @@ impl From<StoreError> for NodeError {
         NodeError::Store(e)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rbitcoin_primitives::ParseNetworkError;
+    use std::error::Error;
+    use std::io;
+    use std::path::PathBuf;
+
+    #[test]
+    fn display_source_and_from() {
+        let cfg = NodeError::Config("bad".into());
+        assert_eq!(format!("{cfg}"), "configuration error: bad");
+        assert!(cfg.source().is_none());
+
+        let net: NodeError = ParseNetworkError {
+            input: "x".into(),
+        }
+        .into();
+        assert!(format!("{net}").contains("unknown network"));
+        assert!(net.source().is_some());
+
+        let dd = NodeError::Datadir {
+            path: PathBuf::from("/nope"),
+            source: io::Error::new(io::ErrorKind::NotFound, "missing"),
+        };
+        assert!(format!("{dd}").contains("datadir error at /nope"));
+        assert!(dd.source().is_some());
+
+        let store: NodeError = StoreError::Corrupt("x").into();
+        assert!(format!("{store}").contains("x"));
+        // StoreError itself is the source for NodeError::Store.
+        assert!(store.source().is_some());
+    }
+}

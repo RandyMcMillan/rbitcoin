@@ -61,3 +61,45 @@ impl std::error::Error for StoreError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn display_and_source_arms() {
+        let io = StoreError::io("/tmp/x", io::Error::new(io::ErrorKind::NotFound, "nope"));
+        let s = io.to_string();
+        assert!(s.contains("io error"));
+        assert!(s.contains("/tmp/x"));
+        assert!(io.source().is_some());
+
+        let arms: Vec<StoreError> = vec![
+            StoreError::BadMagic,
+            StoreError::BadSchema(9),
+            StoreError::BadKind {
+                expected: 1,
+                got: 2,
+            },
+            StoreError::NotFound,
+            StoreError::InvalidFk,
+            StoreError::NotDirectory(PathBuf::from("/not/a/dir")),
+            StoreError::Corrupt("broken"),
+            StoreError::Cancelled("stop"),
+        ];
+        let texts: Vec<String> = arms.iter().map(|e| e.to_string()).collect();
+        assert_eq!(texts[0], "invalid store magic");
+        assert!(texts[1].contains("unsupported schema version 9"));
+        assert!(texts[2].contains("expected 1"));
+        assert!(texts[2].contains("got 2"));
+        assert_eq!(texts[3], "record not found");
+        assert_eq!(texts[4], "invalid foreign key");
+        assert!(texts[5].contains("not a directory"));
+        assert!(texts[6].contains("corrupt record: broken"));
+        assert!(texts[7].contains("cancelled: stop"));
+        for e in &arms {
+            assert!(e.source().is_none());
+        }
+    }
+}

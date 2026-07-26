@@ -286,3 +286,20 @@ pub fn magic_for(network: RNetwork) -> Magic {
         RNetwork::Regtest => bitcoin::Network::Regtest,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn magic_for_all_networks_and_regtest_config() {
+        assert_eq!(magic_for(RNetwork::Mainnet), Magic::from(bitcoin::Network::Bitcoin));
+        assert_eq!(magic_for(RNetwork::Testnet), Magic::from(bitcoin::Network::Testnet));
+        assert_eq!(magic_for(RNetwork::Signet), Magic::from(bitcoin::Network::Signet));
+        assert_eq!(magic_for(RNetwork::Regtest), Magic::REGTEST);
+        let cfg = NetConfig::for_regtest(None);
+        assert_eq!(cfg.magic, Magic::REGTEST);
+        assert!(cfg.listen.is_none());
+        assert!(cfg.user_agent.contains("rbitcoin"));
+    }
+}

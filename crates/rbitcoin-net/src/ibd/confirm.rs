@@ -974,4 +974,81 @@ mod tests {
             "loadq=5/5 writeq=5/5"
         );
     }
+
+    #[test]
+    fn feed_stop_size_snap_and_empty_requeue() {
+        let feed = ConfirmFeed::new();
+        assert!(!feed.stopped());
+        assert_eq!(feed.size_snap(), (0, 0));
+        feed.note(1, bh(1));
+        feed.note(2, bh(2));
+        {
+            let mut g = feed.inner.lock().unwrap();
+            g.inflight.insert(3);
+        }
+        assert_eq!(feed.size_snap(), (2, 1));
+        feed.requeue(&[]); // no-op empty
+        assert_eq!(feed.size_snap(), (2, 1));
+        feed.request_stop();
+        assert!(feed.stopped());
+    }
+
+    #[test]
+    fn claim_feed_stops_at_gap() {
+        let run = claim_feed_run(5, 10, |h| h == 5 || h == 6 || h == 8, |_| false);
+        // Contiguous only — gap at 7 stops.
+        assert_eq!(run, vec![5, 6]);
+        let empty = claim_feed_run(1, 8, |_| false, |_| false);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn offer_confirm_ready_walks_height_map() {
+        use super::offer_confirm_ready;
+        use super::super::body::BodyPresence;
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_query::Query;
+        use std::collections::HashMap;
+        use std::sync::atomic::AtomicU32;
+
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-offer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+
+        let feed = ConfirmFeed::new();
+        let mut body = BodyPresence::new();
+        let mut h2h = HashMap::new();
+        // Tip is 0; expect tip+1 = 1. Provide archived height 1.
+        let h1 = bh(0x11);
+        h2h.insert(1u32, h1);
+        body.mark_archived(h1);
+        let mut max_arch = 0u32;
+        let shared = AtomicU32::new(0);
+        let n = offer_confirm_ready(&feed, &h2h, &mut body, &hub, &mut max_arch, &shared);
+        assert_eq!(n, 1);
+        assert_eq!(max_arch, 1);
+        assert_eq!(shared.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(feed.size_snap().0, 1);
+
+        // Rejected tip+1 stops and notes zero new.
+        body.mark_rejected(h1);
+        feed.finish([1]);
+        let n2 = offer_confirm_ready(&feed, &h2h, &mut body, &hub, &mut max_arch, &shared);
+        assert_eq!(n2, 0);
+
+        // Gap in height map stops.
+        let h2h2 = HashMap::new();
+        let n3 = offer_confirm_ready(&feed, &h2h2, &mut body, &hub, &mut max_arch, &shared);
+        assert_eq!(n3, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

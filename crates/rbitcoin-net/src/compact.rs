@@ -378,4 +378,48 @@ mod tests {
         };
         assert!(apply_block_transactions(&hsi, &missing, &txn, &empty, 2).is_err());
     }
+
+    #[test]
+    fn empty_compact_and_ambiguous_shortid() {
+        // total=0 → empty error.
+        let hsi = HeaderAndShortIds {
+            header: dummy_header(),
+            nonce: 0,
+            short_ids: vec![],
+            prefilled_txs: vec![],
+        };
+        assert!(try_reconstruct(&hsi, &HashMap::new(), 2).unwrap_err().is_empty());
+        assert!(apply_block_transactions(
+            &hsi,
+            &[],
+            &BlockTransactions {
+                block_hash: BlockHash::from_byte_array([0; 32]),
+                transactions: vec![],
+            },
+            &HashMap::new(),
+            2
+        )
+        .unwrap_err()
+        .is_empty());
+
+        // Ambiguous short-id collision → missing.
+        let b1 = spend(9);
+        let block = Block {
+            header: dummy_header(),
+            txdata: vec![coinbase(), b1.clone()],
+        };
+        let hsi = HeaderAndShortIds::from_block(&block, 9, 2, &[]).unwrap();
+        let keys = ShortId::calculate_siphash_keys(&block.header, hsi.nonce);
+        let sid = ShortId::with_siphash_keys(&b1.compute_wtxid().to_raw_hash(), keys);
+        let b_alt = spend(10);
+        let mut avail: HashMap<ShortId, Vec<&Transaction>> = HashMap::new();
+        avail.insert(sid, vec![&b1, &b_alt]);
+        let missing = try_reconstruct(&hsi, &avail, 2).unwrap_err();
+        assert_eq!(missing, vec![1]);
+
+        // prefilled absolute indexes differential walk.
+        let idxs = prefilled_absolute_indexes(&hsi);
+        assert!(!idxs.is_empty());
+        assert_eq!(idxs[0].0, 0); // coinbase at abs 0
+    }
 }

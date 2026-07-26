@@ -110,3 +110,112 @@ where
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spender_table::SpenderTable;
+    use crate::tx_table::{InputRecord, OutputRecord, TxRecord, TxTable};
+    use crate::address_head::HeadLayout;
+
+    fn tmp() -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "rbitcoin-point-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn put_create(txs: &TxTable, txid: [u8; 32], n_out: u32) -> Fk {
+        let outs: Vec<_> = (0..n_out)
+            .map(|i| OutputRecord::unspent(i as i64 + 1, vec![0x51]))
+            .collect();
+        let item = (
+            TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: n_out,
+            },
+            vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+            outs,
+        );
+        txs.put_full_batch_indexed(&[item], true).unwrap()[0]
+    }
+
+    #[test]
+    fn spend_annotate_sole_multi_and_visit() {
+        let dir = tmp();
+        let layout = HeadLayout::new(crate::address_head::TINY_BITS).unwrap();
+        let txs = TxTable::create_with_head_layout(&dir, layout).unwrap();
+        let spenders = SpenderTable::create(&dir).unwrap();
+        let create = put_create(&txs, [1u8; 32], 2);
+        let s1 = put_create(&txs, [2u8; 32], 1);
+        let s2 = put_create(&txs, [3u8; 32], 1);
+        let s3 = put_create(&txs, [4u8; 32], 1);
+
+        assert!(matches!(
+            put_spend_on_create(&txs, &spenders, Fk::NULL, 0, s1),
+            Err(StoreError::InvalidFk)
+        ));
+        assert!(matches!(
+            put_spend_on_create(&txs, &spenders, create, 0, Fk::NULL),
+            Err(StoreError::InvalidFk)
+        ));
+
+        // Sole first spend.
+        put_spend_on_create(&txs, &spenders, create, 0, s1).unwrap();
+        // Idempotent.
+        put_spend_on_create(&txs, &spenders, create, 0, s1).unwrap();
+        // Promote to multi.
+        put_spend_on_create(&txs, &spenders, create, 0, s2).unwrap();
+        // Prepend multi.
+        put_spend_on_create(&txs, &spenders, create, 0, s3).unwrap();
+
+        let mut visited = Vec::new();
+        for_each_spender_create(&txs, &spenders, create, 0, |fk| {
+            visited.push(fk);
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(visited.len(), 3);
+        assert_eq!(visited[0], s3); // newest head
+        // Early stop.
+        let mut n = 0;
+        for_each_spender_create(&txs, &spenders, create, 0, |_| {
+            n += 1;
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(n, 1);
+        // Null create / missing / unspent.
+        for_each_spender_create(&txs, &spenders, Fk::NULL, 0, |_| unreachable!())
+            .unwrap();
+        for_each_spender_create(&txs, &spenders, Fk(9999), 0, |_| unreachable!())
+            .unwrap();
+        for_each_spender_create(&txs, &spenders, create, 1, |_| unreachable!())
+            .unwrap();
+
+        // body_range path
+        let (off, len) = txs.body_range(create).unwrap();
+        put_spend_on_create_at(&txs, &spenders, create, 1, s1, Some((off, len)))
+            .unwrap();
+        let mut one = None;
+        for_each_spender_create(&txs, &spenders, create, 1, |fk| {
+            one = Some(fk);
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(one, Some(s1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

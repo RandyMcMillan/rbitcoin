@@ -287,4 +287,96 @@ mod tests {
         assert_eq!(k.len(), 16);
         assert_eq!(&k[..], &full[..16]);
     }
+
+    #[test]
+    fn layout_error_and_edge_paths() {
+        // class_for_count saturates at max class capacity.
+        assert_eq!(class_for_count(slab_cap(SH_MAX_CLASS)), Some(SH_MAX_CLASS));
+        assert_eq!(class_for_count(slab_cap(SH_MAX_CLASS) + 1), None);
+
+        assert!(matches!(
+            ShEntry::decode(&[0u8; 4]),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(ShEntry::new(Fk::NULL).is_null());
+        assert!(!ShEntry::new(Fk(1)).is_null());
+
+        assert!(matches!(
+            ShHeadValue::decode(&[0u8; 8]),
+            Err(StoreError::Corrupt(_))
+        ));
+        // Bad slab class
+        let mut bad = [0u8; 16];
+        let w0 = SH_SLAB_MARKER | (u64::from(SH_MAX_CLASS + 1) << 32) | 1;
+        bad[0..8].copy_from_slice(&w0.to_le_bytes());
+        bad[8..16].copy_from_slice(&4112u64.to_le_bytes());
+        assert!(matches!(
+            ShHeadValue::decode(&bad),
+            Err(StoreError::Corrupt(_))
+        ));
+        // used == 0 with slab marker
+        let mut bad = [0u8; 16];
+        bad[0..8].copy_from_slice(&SH_SLAB_MARKER.to_le_bytes());
+        bad[8..16].copy_from_slice(&4112u64.to_le_bytes());
+        assert!(matches!(
+            ShHeadValue::decode(&bad),
+            Err(StoreError::Corrupt(_))
+        ));
+        // used > cap
+        let mut bad = ShHeadValue::Slab {
+            class: 0,
+            used: 99,
+            slab_off: 4112,
+        }
+        .encode();
+        // force bad used via re-encode with hacked word
+        let mut w0 = SH_SLAB_MARKER;
+        w0 |= 99; // used
+        bad[0..8].copy_from_slice(&w0.to_le_bytes());
+        assert!(matches!(
+            ShHeadValue::decode(&bad),
+            Err(StoreError::Corrupt(_))
+        ));
+        // null slab offset
+        let mut bad = ShHeadValue::Slab {
+            class: 0,
+            used: 1,
+            slab_off: 1,
+        }
+        .encode();
+        bad[8..16].copy_from_slice(&0u64.to_le_bytes());
+        assert!(matches!(
+            ShHeadValue::decode(&bad),
+            Err(StoreError::Corrupt(_))
+        ));
+        // inline null first
+        let mut bad = [0u8; 16];
+        bad[0..8].copy_from_slice(&0u64.to_le_bytes());
+        bad[8..16].copy_from_slice(&1u64.to_le_bytes());
+        // w0==0 && w1!=0 is not Empty — first is null → corrupt
+        // Actually Empty is only when both zero. So this hits inline null first.
+        assert!(matches!(
+            ShHeadValue::decode(&bad),
+            Err(StoreError::Corrupt(_))
+        ));
+        // inline used paths: one entry
+        let one = ShHeadValue::inline_one(ShEntry::new(Fk(9)));
+        assert_eq!(one.used(), 1);
+        assert!(!one.is_empty());
+        assert_eq!(one.inline_fks(), vec![Fk(9)]);
+        // empty / slab inline_entries empty
+        assert!(ShHeadValue::Empty.inline_entries().is_empty());
+        assert!(ShHeadValue::Empty.inline_fks().is_empty());
+        let slab = ShHeadValue::Slab {
+            class: 0,
+            used: 3,
+            slab_off: 4112,
+        };
+        assert!(slab.inline_entries().is_empty());
+        assert_eq!(slab.used(), 3);
+        // Inline encode with used < 2 leaves w1=0
+        let enc = one.encode();
+        assert_eq!(ShHeadValue::decode(&enc).unwrap(), one);
+        assert_eq!(payload_start(16), 16 + SH_ALLOC_HEADER_LEN as u64);
+    }
 }

@@ -85,3 +85,40 @@ pub fn sample_and_reset() -> Sample {
         body_lookups: BODY_LOOKUPS.swap(0, Ordering::Relaxed),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_sample_reset_and_sum() {
+        // Zeroes are no-ops (still exercise the `if ns > 0` false branch).
+        add_probe(0);
+        add_idx(0);
+        add_body(0);
+        add_keys(0);
+        add_cands(0);
+        add_body_lookups(0);
+        // Drain any prior residue from parallel tests.
+        let _ = sample_and_reset();
+
+        add_probe(10);
+        add_idx(20);
+        add_body(30);
+        add_keys(4);
+        add_cands(5);
+        add_body_lookups(6);
+        let s = sample_and_reset();
+        assert_eq!(s.probe_ns, 10);
+        assert_eq!(s.idx_ns, 20);
+        assert_eq!(s.body_ns, 30);
+        assert_eq!(s.keys, 4);
+        assert_eq!(s.cands, 5);
+        assert_eq!(s.body_lookups, 6);
+        assert_eq!(s.sum_ns(), 60);
+
+        let empty = sample_and_reset();
+        assert_eq!(empty.sum_ns(), 0);
+        assert_eq!(empty.keys, 0);
+    }
+}

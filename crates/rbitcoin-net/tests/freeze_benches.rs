@@ -3,7 +3,7 @@
 //! Run with:
 //!   cargo test -p rbitcoin-net freeze_bench --release -- --nocapture --test-threads=1
 
-use crate::chain::ChainHub;
+use rbitcoin_net::ChainHub;
 use bitcoin::block::{Header, Version};
 use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, CompactTarget, Network};

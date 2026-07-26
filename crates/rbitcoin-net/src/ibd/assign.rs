@@ -724,3 +724,137 @@ pub(crate) fn park_race_need(
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::status::LoopStats;
+    use bitcoin::hashes::Hash;
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_query::Query;
+    use std::collections::HashSet;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn h(n: u32) -> BlockHash {
+        let mut b = [0u8; 32];
+        b[0..4].copy_from_slice(&n.to_le_bytes());
+        BlockHash::from_byte_array(b)
+    }
+
+    fn dummy_slot(id: usize) -> PeerSlot {
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        let task = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .spawn(async {});
+        PeerSlot {
+            id,
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444 + id as u16),
+            cmd_tx,
+            in_flight: HashSet::new(),
+            block_progress_ms: Arc::new(AtomicU64::new(0)),
+            peer_height: 100,
+            connected_ms: 1,
+            first_data_ms: AtomicU64::new(0),
+            bytes_rx: AtomicU64::new(0),
+            alive: true,
+            task,
+        }
+    }
+
+    fn tmp_hub() -> (std::path::PathBuf, ChainHub) {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-assign-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        (
+            dir,
+            ChainHub::new(q, ChainParams::regtest(), Milestone::NONE),
+        )
+    }
+
+    #[test]
+    fn clear_inflight_add_peer_pop_need_and_tip_holes() {
+        let (dir, hub) = tmp_hub();
+        let mut st = IbdWorkState::new(vec![dummy_slot(0), dummy_slot(1)], None, Some(0));
+        let hash = h(10);
+        st.slots[0].in_flight.insert(hash);
+        st.slots[1].in_flight.insert(hash);
+        inflight_add_peer(&mut st.inflight, hash, 0);
+        inflight_add_peer(&mut st.inflight, hash, 1);
+        assert_eq!(st.inflight[&hash].len(), 2);
+        clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+        assert!(st.inflight.is_empty());
+        assert!(st.slots[0].in_flight.is_empty());
+        assert!(st.slots[1].in_flight.is_empty());
+
+        // pop_need skips pending / takes first ready missing.
+        let mut q = VecDeque::from([h(1), h(2)]);
+        st.body.mark_pending(h(1));
+        st.body.mark_missing(h(2));
+        assert_eq!(pop_need(&mut q, &mut st, &hub), Some(h(2)));
+        assert!(pop_need(&mut q, &mut st, &hub).is_none());
+
+        // Tip holes: ghost skip, then unready, then ready breaks.
+        st.ordered.clear();
+        st.ordered_set.clear();
+        let ghost = h(20);
+        let hole = h(21);
+        let ready = h(22);
+        st.ordered.extend([ghost, hole, ready]);
+        st.ordered_set.insert(hole);
+        st.ordered_set.insert(ready);
+        st.body.mark_missing(hole);
+        st.body.mark_archived(ready);
+        let holes = contiguous_tip_holes(&mut st, &hub, 8);
+        assert_eq!(holes, vec![hole]);
+
+        // issue_one with empty batch / dead peer.
+        let mut room = 10usize;
+        let mut issued = 0u64;
+        assert!(!issue_one(&mut st, 99, h(30), &mut room, &mut issued));
+        assert!(!issue_batch(&mut st, 0, vec![], &mut room, &mut issued));
+        st.body.mark_missing(h(30));
+        assert!(issue_one(&mut st, 0, h(30), &mut room, &mut issued));
+        assert!(issued >= 1);
+        assert!(st.inflight.contains_key(&h(30)));
+        assert!(st.slots[0].in_flight.contains(&h(30)));
+
+        // assign with no alive peers is a no-op.
+        st.slots.iter_mut().for_each(|s| s.alive = false);
+        let stats = LoopStats::default();
+        let cfg = IbdConfig::for_test();
+        assign_work_ordered(
+            &mut st,
+            &hub,
+            &cfg,
+            &stats,
+            1.0,
+            1,
+            AssignDepth::Full,
+            true,
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scale_and_saturated_helpers() {
+        assert_eq!(scale_feed_cap(0, 1.0), 0);
+        assert_eq!(scale_feed_cap(10, 0.0), 0);
+        assert_eq!(scale_feed_cap(10, 1.0), 10);
+        assert_eq!(scale_feed_cap(10, 0.25), 3); // ceil
+        assert!(!archive_pipeline_saturated(0, 20, 1.0));
+        assert!(archive_pipeline_saturated(96, 0, 0.0));
+    }
+}

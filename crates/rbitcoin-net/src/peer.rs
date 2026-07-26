@@ -971,6 +971,33 @@ mod tests {
             assert_eq!(c.load(Ordering::SeqCst), 2);
         }
         assert_eq!(c.load(Ordering::SeqCst), 1);
+        // None branch is a no-op drop.
+        let _ = LiveFollowDec(None);
+    }
+
+    #[test]
+    fn local_service_flags_include_network_witness_v2() {
+        let f = local_service_flags();
+        assert!(f.has(ServiceFlags::NETWORK));
+        assert!(f.has(ServiceFlags::WITNESS));
+        assert!(f.has(ServiceFlags::P2P_V2));
+    }
+
+    #[test]
+    fn rand_nonce_changes() {
+        let a = rand_nonce();
+        let b = rand_nonce();
+        // Counter component makes back-to-back nonces distinct.
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn block_for_peer_empty_store_none() {
+        let (dir, q) = tmp_store("block-none");
+        let cache = BlockCache::new();
+        let miss = BlockHash::from_byte_array([0xab; 32]);
+        assert!(block_for_peer(&cache, &q, &miss).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

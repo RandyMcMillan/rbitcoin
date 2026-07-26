@@ -574,6 +574,204 @@ mod strong_tests {
         assert!(!t.is_strong(Fk(5)).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn strong_partial_bytes_unstrong_range_and_errors() {
+        let dir = tmp();
+        let t = StrongTxTable::create(&dir).unwrap();
+        // Unaligned start so partial-first-byte path runs.
+        t.set_strong_range(Fk(3), 20, Fk(1)).unwrap();
+        for i in 3..23 {
+            assert!(t.is_strong(Fk(i)).unwrap(), "i={i}");
+        }
+        assert!(!t.is_strong(Fk(2)).unwrap());
+        // count==0 no-op
+        t.set_strong_range(Fk(1), 0, Fk(1)).unwrap();
+        t.set_unstrong_range(Fk(1), 0).unwrap();
+        // Clear a mid-range with partial ends.
+        t.set_unstrong_range(Fk(5), 10).unwrap();
+        for i in 5..15 {
+            assert!(!t.is_strong(Fk(i)).unwrap());
+        }
+        assert!(t.is_strong(Fk(4)).unwrap());
+        assert!(t.is_strong(Fk(15)).unwrap());
+        // past allocated → no-op
+        t.set_unstrong(Fk(9999)).unwrap();
+        t.set_unstrong_range(Fk(9000), 10).unwrap();
+        assert!(matches!(
+            t.set_strong(Fk::NULL, Fk(1)),
+            Err(StoreError::InvalidFk)
+        ));
+        assert!(matches!(
+            t.set_strong(Fk(1), Fk::NULL),
+            Err(StoreError::InvalidFk)
+        ));
+        assert!(matches!(
+            t.set_strong_range(Fk::NULL, 1, Fk(1)),
+            Err(StoreError::InvalidFk)
+        ));
+        assert!(matches!(
+            t.set_strong_range(Fk(1), 1, Fk::NULL),
+            Err(StoreError::InvalidFk)
+        ));
+        assert!(matches!(t.is_strong(Fk::NULL), Err(StoreError::InvalidFk)));
+        t.flush_async().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod chain_table_tests {
+    use super::*;
+
+    fn tmp() -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "rbitcoin-chain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn confirmed_tx_height_header_txs_surface() {
+        let dir = tmp();
+        // Confirmed
+        let c = ConfirmedTable::create(&dir).unwrap();
+        assert!(c.tip_height().is_none());
+        c.set(Height(0), Fk(1)).unwrap();
+        c.set(Height(1), Fk(2)).unwrap();
+        assert_eq!(c.tip_height(), Some(Height(1)));
+        assert_eq!(c.get(Height(0)).unwrap(), Some(Fk(1)));
+        c.set_many(&[]).unwrap();
+        c.set_many(&[(Height(2), Fk(3)), (Height(3), Fk(4))])
+            .unwrap();
+        assert_eq!(c.tip_height(), Some(Height(3)));
+        assert!(matches!(
+            c.set(Height(4), Fk::NULL),
+            Err(StoreError::InvalidFk)
+        ));
+        assert!(matches!(
+            c.set_many(&[(Height(5), Fk::NULL)]),
+            Err(StoreError::InvalidFk)
+        ));
+        c.disconnect_tip(Height(3)).unwrap();
+        assert_eq!(c.tip_height(), Some(Height(2)));
+        assert!(matches!(
+            c.disconnect_tip(Height(0)),
+            Err(StoreError::Corrupt(_))
+        ));
+        c.disconnect_tip(Height(2)).unwrap();
+        c.disconnect_tip(Height(1)).unwrap();
+        c.disconnect_tip(Height(0)).unwrap();
+        assert!(c.tip_height().is_none());
+        assert!(matches!(
+            c.disconnect_tip(Height(0)),
+            Err(StoreError::Corrupt(_))
+        ));
+        c.flush().unwrap();
+        c.flush_async().unwrap();
+
+        // TxHeight
+        let th = TxHeightTable::create(&dir).unwrap();
+        assert_eq!(th.len(), 0);
+        th.set(Fk(1), Height(0)).unwrap();
+        th.set(Fk(5), Height(10)).unwrap();
+        assert_eq!(th.get(Fk(1)).unwrap(), Some(0));
+        assert_eq!(th.get(Fk(5)).unwrap(), Some(10));
+        assert_eq!(th.get(Fk(2)).unwrap(), None);
+        assert!(matches!(th.get(Fk::NULL), Err(StoreError::InvalidFk)));
+        th.set_range(Fk(10), 0, Height(1)).unwrap();
+        th.set_range(Fk(10), 5, Height(7)).unwrap();
+        for i in 10..15 {
+            assert_eq!(th.get(Fk(i)).unwrap(), Some(7));
+        }
+        let batch = th
+            .get_batch(&[Fk::NULL, Fk(1), Fk(5), Fk(9999)])
+            .unwrap();
+        assert_eq!(batch, vec![None, Some(0), Some(10), None]);
+        assert!(th.get_batch(&[]).unwrap().is_empty());
+        th.clear(Fk(1)).unwrap();
+        assert_eq!(th.get(Fk(1)).unwrap(), None);
+        th.clear(Fk(9999)).unwrap(); // past end
+        th.clear_range(Fk(10), 0).unwrap();
+        th.clear_range(Fk(10), 3).unwrap();
+        assert_eq!(th.get(Fk(10)).unwrap(), None);
+        assert_eq!(th.get(Fk(13)).unwrap(), Some(7));
+        th.clear_range(Fk(9000), 5).unwrap();
+        let mut seen = Vec::new();
+        th.for_each_set(|fk, h| {
+            seen.push((fk.0, h));
+            Ok(())
+        })
+        .unwrap();
+        assert!(seen.contains(&(5, 10)));
+        th.flush().unwrap();
+        th.flush_async().unwrap();
+        drop(th);
+        let th = TxHeightTable::open(&dir).unwrap();
+        assert_eq!(th.get(Fk(5)).unwrap(), Some(10));
+
+        // HeaderTxs
+        let ht = HeaderTxsTable::create(&dir).unwrap();
+        assert!(ht.get_range(Fk(1)).unwrap().is_none());
+        ht.put_range(Fk(1), Fk(100), 3).unwrap();
+        assert_eq!(ht.get_range(Fk(1)).unwrap(), Some((Fk(100), 3)));
+        assert_eq!(
+            ht.get_list(Fk(1)).unwrap().unwrap(),
+            vec![Fk(100), Fk(101), Fk(102)]
+        );
+        assert!(ht.has_body(Fk(1)).unwrap());
+        assert!(!ht.has_body(Fk(2)).unwrap());
+        ht.put_list(Fk(2), &[Fk(200), Fk(201)]).unwrap();
+        assert!(matches!(
+            ht.put_list(Fk(3), &[]),
+            Err(StoreError::Corrupt(_))
+        ));
+        // Non-contiguous triggers debug_assert in debug builds; only empty is a
+        // stable Err path under RUSTFLAGS=-Dwarnings debug tests.
+        assert!(matches!(
+            ht.put_range(Fk::NULL, Fk(1), 1),
+            Err(StoreError::InvalidFk)
+        ));
+        assert!(matches!(
+            ht.put_range(Fk(3), Fk::NULL, 1),
+            Err(StoreError::InvalidFk)
+        ));
+        assert!(matches!(
+            ht.put_range(Fk(3), Fk(1), 0),
+            Err(StoreError::InvalidFk)
+        ));
+        ht.put_lists_batch(&[]).unwrap();
+        ht.put_lists_batch(&[(Fk(3), &[Fk(300)] as &[_]), (Fk(4), &[Fk(400), Fk(401)])])
+            .unwrap();
+        assert!(matches!(
+            ht.put_lists_batch(&[(Fk(5), &[] as &[_])]),
+            Err(StoreError::Corrupt(_))
+        ));
+        ht.put_ranges_batch(&[]).unwrap();
+        ht.put_ranges_batch(&[(Fk(5), Fk(500), 2)]).unwrap();
+        assert!(matches!(
+            ht.put_ranges_batch(&[(Fk::NULL, Fk(1), 1)]),
+            Err(StoreError::InvalidFk)
+        ));
+        assert!(matches!(
+            ht.put_ranges_batch(&[(Fk(6), Fk::NULL, 1)]),
+            Err(StoreError::InvalidFk)
+        ));
+        assert_eq!(ht.count_bodies().unwrap(), 5);
+        assert!(matches!(ht.get_range(Fk::NULL), Err(StoreError::InvalidFk)));
+        ht.flush().unwrap();
+        ht.flush_async().unwrap();
+        drop(ht);
+        let ht = HeaderTxsTable::open(&dir).unwrap();
+        assert_eq!(ht.get_range(Fk(5)).unwrap(), Some((Fk(500), 2)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Per-header **contiguous** tx_fk range (Class A archive body association).

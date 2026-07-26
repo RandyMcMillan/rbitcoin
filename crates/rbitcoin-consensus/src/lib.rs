@@ -445,3 +445,205 @@ pub fn prepare_block_for_archive_ibd(
         &txids,
     )
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::hashes::Hash;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, Block, BlockHash, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn,
+        TxOut, TxMerkleNode, Witness,
+    };
+    use rbitcoin_primitives::Height;
+    use rbitcoin_query::Query;
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
+    use std::sync::Once;
+
+    static HEAD_SCALE: Once = Once::new();
+
+    fn ensure_tiny_heads() {
+        HEAD_SCALE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                // SAFETY: tests only; process-local config.
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+    }
+
+    fn temp_store() -> (PathBuf, Query) {
+        ensure_tiny_heads();
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-consensus-cov-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let q = Query::open_or_create(&path).expect("open store");
+        (path, q)
+    }
+
+    fn mine_regtest(prev: BlockHash, time: u32, height: u32, extras: Vec<Transaction>) -> Block {
+        let mut ss = if height == 0 {
+            vec![0x00]
+        } else {
+            bip34_height_script(height)
+        };
+        while ss.len() < 2 {
+            ss.push(0x00);
+        }
+        let mut txdata = vec![Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(ss),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }];
+        txdata.extend(extras);
+        let bits = CompactTarget::from_consensus(0x207f_ffff);
+        let mut block = Block {
+            header: Header {
+                version: Version::ONE,
+                prev_blockhash: prev,
+                merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+                time,
+                bits,
+                nonce: 0,
+            },
+            txdata,
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let target = Target::from_compact(bits);
+        for nonce in 0..u32::MAX {
+            block.header.nonce = nonce;
+            if block.header.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        block
+    }
+
+    #[test]
+    fn crate_name_and_phase_stats() {
+        assert_eq!(crate_name(), "rbitcoin-consensus");
+        use confirm_phase_stats::*;
+        note_last_write(LastWritePhases {
+            n_blocks: 2,
+            wall_ns: 3_000_000,
+            structural_ns: 1_000_000,
+            spent_ns: 100_000,
+            create_h_ns: 200_000,
+            bip68_ns: 50_000,
+            class_c_ns: 400_000,
+            spend_ann_ns: 300_000,
+            tip_gc_ns: 10_000,
+        });
+        let p = last_write_phases();
+        assert_eq!(p.n_blocks, 2);
+        assert_eq!(LastWritePhases::ms(p.wall_ns), 3);
+        RECONSTRUCT_NS.store(5, Ordering::Relaxed);
+        RECONSTRUCT_WIRE_NS.store(7, Ordering::Relaxed);
+        CONNECT_NS.store(1, Ordering::Relaxed);
+        SCRIPT_NS.store(1, Ordering::Relaxed);
+        CLASS_C_NS.store(1, Ordering::Relaxed);
+        UTXO_APPLY_NS.store(1, Ordering::Relaxed);
+        BLOCKS.store(1, Ordering::Relaxed);
+        RESOLVE_NS.store(1, Ordering::Relaxed);
+        LOAD_NS.store(1, Ordering::Relaxed);
+        UNPIN_NS.store(1, Ordering::Relaxed);
+        CACHE_TIP_NS.store(1, Ordering::Relaxed);
+        SPEND_ANNOTATE_RANGED.store(1, Ordering::Relaxed);
+        SPEND_ANNOTATE_IDX.store(1, Ordering::Relaxed);
+        SPEND_ANNOTATE_SKIP.store(1, Ordering::Relaxed);
+        STRUCTURAL_NS.store(1, Ordering::Relaxed);
+        STRUCTURAL_SPENT_NS.store(1, Ordering::Relaxed);
+        STRUCTURAL_CREATE_H_NS.store(1, Ordering::Relaxed);
+        STRUCTURAL_BIP68_NS.store(1, Ordering::Relaxed);
+        let s = sample_and_reset();
+        assert_eq!(s.0, 7); // wire preferred over recon total
+        assert_eq!(s.1, 7);
+        // second sample zeros
+        let s2 = sample_and_reset();
+        assert_eq!(s2.0, 0);
+    }
+
+    #[test]
+    fn script_bench_helpers_on_acs_job() {
+        use script_bench::{owned_jobs, verify_job, verify_jobs_pool, verify_one_job, verify_owned_pool, JobBytes};
+        let tx = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([1; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(10),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }];
+        let jb = JobBytes::new(prevouts, tx);
+        verify_job(&jb).unwrap();
+        verify_jobs_pool(std::slice::from_ref(&jb)).unwrap();
+        let owned = owned_jobs(std::slice::from_ref(&jb));
+        verify_owned_pool(&owned).unwrap();
+        verify_one_job(&owned[0]).unwrap();
+    }
+
+    #[test]
+    fn regtest_connect_archive_and_confirm_path() {
+        let (path, q) = temp_store();
+        let params = ChainParams::regtest();
+        let ms = Milestone { height: 1_000_000 };
+        let genesis = genesis_block(&params);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+
+        let b1 = mine_regtest(genesis.block_hash(), genesis.header.time + 600, 1, vec![]);
+        // prepare + archive paths
+        let (_hr, _txs) = prepare_block_for_archive(&q, &params, &b1).unwrap();
+        let (_hr2, _txs2) = prepare_block_for_archive_new(&q, &params, &b1).unwrap();
+        let (_hr3, _txs3) = prepare_block_for_archive_ibd(&params, &b1).unwrap();
+        accept_and_archive_block(&q, &params, Height(1), &b1, ms).unwrap();
+        // already archived branch
+        let _ = prepare_block_for_archive(&q, &params, &b1).unwrap();
+        confirm_archived_at(
+            &q,
+            &params,
+            Height(1),
+            &b1.block_hash().to_byte_array(),
+            ms,
+        )
+        .unwrap();
+
+        // Bad pow limit on prepare_ibd
+        let mut bad = b1.clone();
+        bad.header.bits = CompactTarget::from_consensus(0x1d00_ffff); // mainnet-ish, above regtest limit often
+        // May fail pow or pow limit depending on params — either is fine.
+        let _ = prepare_block_for_archive_ibd(&params, &bad);
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+}

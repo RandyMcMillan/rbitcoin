@@ -111,5 +111,10 @@ mod tests {
         // Empty is bare consensus-eval, not anyone-can-spend (Core parity).
         assert!(!is_anyone_can_spend(ScriptBuf::new().as_script()));
         assert_eq!(classify(ScriptBuf::new().as_script()), ScriptKind::Bare);
+        // OP_2..OP_15 bare branch (not ACS).
+        assert_eq!(
+            classify(ScriptBuf::from_bytes(vec![0x52]).as_script()),
+            ScriptKind::Bare
+        );
     }
 }

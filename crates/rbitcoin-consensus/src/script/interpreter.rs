@@ -1621,4 +1621,205 @@ mod success_and_disabled_tests {
             "v2 should enforce CSV, got {err}"
         );
     }
+
+    #[test]
+    fn cleanstack_and_true_top_helpers() {
+        assert!(require_clean_true(&[vec![0x01]]).is_ok());
+        assert!(require_clean_true(&[]).is_err());
+        assert!(require_clean_true(&[vec![0x01], vec![0x01]]).is_err());
+        assert!(require_clean_true(&[vec![]]).is_err());
+        assert!(require_true_top(&[vec![], vec![0x01]]).is_ok());
+        assert!(require_true_top(&[]).is_err());
+        assert!(require_true_top(&[vec![]]).is_err());
+    }
+
+    #[test]
+    fn script_sig_pushes_op_n_and_1negate() {
+        let mut stack = Vec::new();
+        // OP_0, OP_1NEGATE, OP_1, push bytes
+        let ss = Script::from_bytes(&[0x00, 0x4f, 0x51, 0x01, 0xaa]);
+        eval_script_sig_pushes(ss, &mut stack).unwrap();
+        assert_eq!(stack.len(), 4);
+        assert_eq!(stack[0], Vec::<u8>::new());
+        assert_eq!(stack[1], vec![0x81]);
+        assert_eq!(stack[2], vec![0x01]);
+        assert_eq!(stack[3], vec![0xaa]);
+        // Non-push opcode fails.
+        let mut s2 = Vec::new();
+        assert!(eval_script_sig_pushes(Script::from_bytes(&[0xac]), &mut s2).is_err());
+    }
+
+    #[test]
+    fn find_and_delete_pushdata_lengths() {
+        // Direct push
+        let data = vec![0x11u8; 3];
+        let mut script = vec![0x03];
+        script.extend_from_slice(&data);
+        script.push(0x51);
+        let out = find_and_delete(&script, &data);
+        assert_eq!(out, vec![0x51]);
+        assert_eq!(find_and_delete(&script, &[]), script);
+
+        // PUSHDATA1 needle
+        let big = vec![0x22u8; 80];
+        let mut sc = vec![0x4c, 80];
+        sc.extend_from_slice(&big);
+        sc.push(0x52);
+        let out2 = find_and_delete(&sc, &big);
+        assert_eq!(out2, vec![0x52]);
+
+        // PUSHDATA2
+        let bigger = vec![0x33u8; 300];
+        let mut sc2 = vec![0x4d];
+        sc2.extend_from_slice(&(300u16).to_le_bytes());
+        sc2.extend_from_slice(&bigger);
+        sc2.push(0x53);
+        assert_eq!(find_and_delete(&sc2, &bigger), vec![0x53]);
+
+        // Non-matching copy through PUSHDATA encodings
+        let passthrough = vec![0x4c, 0x01, 0xaa, 0x4d, 0x01, 0x00, 0xbb];
+        assert_eq!(find_and_delete(&passthrough, &[0xff]), passthrough);
+    }
+
+    #[test]
+    fn strip_codeseparator_keeps_pushdata() {
+        // OP_1, CODESEPARATOR, PUSHDATA1 payload, OP_TRUE
+        let sc = vec![0x51, 0xab, 0x4c, 0x02, 0xde, 0xad, 0x51];
+        let stripped = strip_op_codeseparator(&sc);
+        assert!(!stripped.contains(&0xab));
+        assert!(stripped.windows(2).any(|w| w == [0xde, 0xad]));
+
+        let sc2 = vec![0x4d, 0x01, 0x00, 0xee, 0xab, 0x51];
+        let s2 = strip_op_codeseparator(&sc2);
+        assert_eq!(s2.last(), Some(&0x51));
+        assert!(!s2.contains(&0xab));
+
+        let sc3 = vec![0x4e, 0x01, 0x00, 0x00, 0x00, 0x01, 0xab];
+        let s3 = strip_op_codeseparator(&sc3);
+        assert!(!s3.contains(&0xab));
+        let _ = (sc, sc2, sc3);
+    }
+
+    #[test]
+    fn tapscript_has_op_success_pushdata_scan() {
+        // OP_SUCCESS via direct byte after PUSHDATA1 skip
+        let leaf = vec![0x4c, 0x02, 0x00, 0x00, 0x7e]; // push 2 then OP_SUCCESS126
+        assert!(tapscript_has_op_success(Script::from_bytes(&leaf)));
+        let leaf2 = vec![0x4d, 0x01, 0x00, 0xff, 0x7e];
+        assert!(tapscript_has_op_success(Script::from_bytes(&leaf2)));
+        let leaf3 = vec![0x4e, 0x01, 0x00, 0x00, 0x00, 0xaa, 0x7e];
+        assert!(tapscript_has_op_success(Script::from_bytes(&leaf3)));
+        // Truncated pushdata — no success past end
+        assert!(!tapscript_has_op_success(Script::from_bytes(&[0x4c])));
+        assert!(!tapscript_has_op_success(Script::from_bytes(&[0x4d, 0x01])));
+        assert!(!tapscript_has_op_success(Script::from_bytes(&[0x4e, 0x01, 0x00])));
+        let _ = (leaf, leaf2, leaf3);
+    }
+
+    #[test]
+    fn cltv_type_mismatch_and_final_sequence() {
+        // locktime height vs time type mismatch
+        let script_bytes = [0x51u8, 0xb1, 0x75, 0x51]; // 1 CLTV DROP TRUE
+        let script = Script::from_bytes(&script_bytes);
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }];
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: LockTime::from_time(500_000_001).unwrap(),
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::from_consensus(0),
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let ctx = EvalContext::new_with_flags(
+            &tx,
+            0,
+            Amount::from_sat(1),
+            &prevouts,
+            script,
+            SigVersion::Base,
+            true,
+            true,
+            true,
+        );
+        let mut stack = Vec::new();
+        let err = eval_script(script, &mut stack, &ctx).unwrap_err();
+        assert!(format!("{err}").contains("CLTV"), "got {err}");
+
+        // Final sequence rejects CLTV even when locktime ok
+        let script2 = Script::from_bytes(&[0x00, 0xb1, 0x75, 0x51]); // 0 CLTV DROP TRUE
+        let tx2 = Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: LockTime::from_height(10).unwrap(),
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let ctx2 = EvalContext::new_with_flags(
+            &tx2,
+            0,
+            Amount::from_sat(1),
+            &prevouts,
+            script2,
+            SigVersion::Base,
+            true,
+            true,
+            true,
+        );
+        let mut stack2 = Vec::new();
+        let err2 = eval_script(script2, &mut stack2, &ctx2).unwrap_err();
+        assert!(
+            format!("{err2}").contains("CLTV") || format!("{err2}").contains("final"),
+            "got {err2}"
+        );
+    }
+
+    #[test]
+    fn checkmultisig_verify_fail_and_tapscript_disabled() {
+        // 1-of-1 CMSVERIFY with empty sigs fails
+        // stack: dummy empty, sig empty, m=1, pk empty, n=1 → will fail verify
+        let script = vec![0x00, 0x00, 0x51, 0x00, 0x51, 0xaf];
+        let err = eval(&script, SigVersion::WitnessV0).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("CHECKMULTISIG") || msg.contains("NULLDUMMY") || msg.contains("stack"),
+            "{msg}"
+        );
+        // Tapscript: CHECKMULTISIG disabled
+        let err2 = eval(&[0x00, 0x00, 0x00, 0xae], SigVersion::TapScript).unwrap_err();
+        assert!(
+            format!("{err2}").contains("CHECKMULTISIG") || format!("{err2}").contains("disabled"),
+            "{err2}"
+        );
+        let err3 = eval(&[0x00, 0x00, 0x00, 0xaf], SigVersion::TapScript).unwrap_err();
+        assert!(format!("{err3}").to_lowercase().contains("checkmultisig") || format!("{err3}").contains("disabled"), "{err3}");
+    }
+
+    #[test]
+    fn minimal_if_and_cast_bool_negzero() {
+        assert!(is_minimal_if_arg(&[]));
+        assert!(is_minimal_if_arg(&[0x01]));
+        assert!(!is_minimal_if_arg(&[0x00]));
+        assert!(!is_minimal_if_arg(&[0x01, 0x00]));
+        // negative zero is false
+        assert!(!cast_to_bool(&[0x80]));
+        assert!(cast_to_bool(&[0x01]));
+        assert!(!cast_to_bool(&[]));
+        assert!(!cast_to_bool(&[0x00, 0x00]));
+    }
 }

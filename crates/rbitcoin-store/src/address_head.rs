@@ -1085,6 +1085,78 @@ mod tests {
     }
 
     #[test]
+    fn layout_helpers_stats_and_entry_bytes() {
+        // Drain stats
+        let _ = sample_probe_depth_stats();
+        let _ = take_probe_depth_resize_request();
+        assert!(!take_probe_depth_resize_request());
+        let _ = probe_depth_stats_snapshot();
+
+        assert!(matches!(
+            HeadLayout::new(1),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(matches!(
+            HeadLayout::with_entry_bytes(16, 3),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(matches!(
+            HeadLayout::with_entry_bytes(33, 4),
+            Err(StoreError::Corrupt(_))
+        ));
+        let l = HeadLayout::with_entry_bytes(16, 8).unwrap();
+        assert_eq!(l.slots(), 1 << 16);
+        assert_eq!(l.entry_size(), 8);
+        assert_eq!(l.body_bytes(), (1u64 << 16) * 8);
+        assert_eq!(entry_bytes_for_bits(16), 4);
+        assert_eq!(entry_bytes_for_bits(33), 8);
+
+        let k = [0xCDu8; 32];
+        let bits = 12u32;
+        let pi = page_index(&k, bits);
+        let h1 = h1_in_page(&k, bits);
+        let h2 = h2_in_page(&k, bits);
+        assert!(h1 < page_slot_count(bits));
+        assert!(h2 < page_slot_count(bits) || page_slot_count(bits) > 0);
+        let _ = (pi, h1, h2);
+        assert_eq!(
+            page_base_for_txid(&k, bits),
+            page_index(&k, bits) * page_slot_count(bits)
+        );
+        let off = page_file_off(&k, bits, 4);
+        assert_eq!(off, entry_file_off(page_base_for_txid(&k, bits), 4));
+        assert!(page_pread_len(&k, bits, 4, 1 << bits, (1 << bits) * 4) > 0);
+        // Empty / OOB local → None; zero fk may still decode as 0 depending on layout.
+        assert!(entry_from_page_buf(&[0u8; 4], 9, 4).is_none());
+        let mut buf = [0u8; 8];
+        buf[0..4].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(entry_from_page_buf(&buf, 0, 4), Some(7));
+
+        assert!(load_needs_resize(100, 64));
+        assert!(!load_needs_resize(1, 1024));
+        assert!(load_ratio(50, 100) > 0.0);
+        let _ = bits_for_scale();
+        let _ = default_layout();
+        let _ = layout_for_count(0);
+        let _ = layout_for_count(1_000_000);
+
+        let ext = encode_layout_ext(HeadLayout::new(10).unwrap(), 3);
+        let (dec, gen) = decode_layout_ext(&ext).unwrap();
+        assert_eq!(dec.bits, 10);
+        assert_eq!(gen, 3);
+        assert!(decode_layout_ext(&[0xff; 16]).is_err());
+
+        assert!(is_probe_exhausted_error(&StoreError::Corrupt(
+            "address head probe exhausted on insert"
+        )));
+        assert!(!is_probe_exhausted_error(&StoreError::NotFound));
+
+        let p = tmp("legacy-meta");
+        remove_legacy_meta_sidecar(&p); // no-op missing
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn probe_stable() {
         let k = [0xabu8; 32];
         assert_eq!(probe_index(&k, 0, 16), probe_index(&k, 0, 16));

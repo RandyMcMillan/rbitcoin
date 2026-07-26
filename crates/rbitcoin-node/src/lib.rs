@@ -15,3 +15,11 @@ pub use run::{run_node, run_p2p, NodeHandle};
 pub fn crate_name() -> &'static str {
     "rbitcoin-node"
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn crate_name_stable() {
+        assert_eq!(crate::crate_name(), "rbitcoin-node");
+    }
+}

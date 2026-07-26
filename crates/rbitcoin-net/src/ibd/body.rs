@@ -359,4 +359,50 @@ mod tests {
         body.mark_archived(done);
         assert!(!body.is_archive_charged(&done));
     }
+
+    #[test]
+    fn expire_stale_pending_and_size_snapshot() {
+        use std::time::Duration;
+        let mut body = BodyPresence::new();
+        body.mark_pending(h(1));
+        body.mark_pending(h(2));
+        body.mark_archive_charged(h(2));
+        // Zero age → everything older than 0 is stale immediately.
+        let expired = body.expire_stale_pending(Duration::ZERO);
+        assert_eq!(expired.len(), 2);
+        assert!(body.missing.contains(&h(1)));
+        assert!(body.missing.contains(&h(2)));
+        // Charge survives pending→missing transition.
+        assert!(body.is_archive_charged(&h(2)));
+
+        body.mark_pending(h(3));
+        body.mark_pending(h(4));
+        let only3 = body.expire_stale_pending_if(Duration::ZERO, |x| *x == h(3));
+        assert_eq!(only3, vec![h(3)]);
+        assert!(body.is_pending(&h(4)));
+
+        body.mark_archived(h(10));
+        body.mark_rejected(h(11));
+        let snap = body.size_snapshot();
+        assert_eq!(snap.known, 1);
+        assert_eq!(snap.pending, 1); // h(4)
+        assert!(snap.missing >= 2);
+        assert_eq!(snap.rejected, 1);
+        assert_eq!(snap.archive_charged, 1); // h(2)
+    }
+
+    #[test]
+    fn rejected_blocks_mark_ops() {
+        let mut body = BodyPresence::new();
+        let r = h(20);
+        body.mark_rejected(r);
+        body.mark_pending(r);
+        body.mark_archive_charged(r);
+        body.mark_missing(r);
+        body.mark_archived(r);
+        assert!(body.is_rejected(&r));
+        assert!(!body.is_pending(&r));
+        assert!(!body.is_archive_charged(&r));
+        assert!(!body.known.contains(&r));
+    }
 }

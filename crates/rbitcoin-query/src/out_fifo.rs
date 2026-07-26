@@ -373,6 +373,25 @@ mod tests {
         assert_eq!(c.dense_spender_rels(), vec![CachedOut::REL_UNKNOWN]);
         assert!(c.body_range().is_none());
     }
+
+    #[test]
+    fn out_fifo_cap_env_default() {
+        // Unset / garbage → default. Do not assert env mutation across suite.
+        let c = out_fifo_cap_from_env();
+        assert!(c >= 1);
+        assert_eq!(DEFAULT_OUT_FIFO_CAP, 1 << 24);
+        let prev = std::env::var_os("RBITCOIN_CONFIRM_OUT_FIFO");
+        std::env::set_var("RBITCOIN_CONFIRM_OUT_FIFO", "0");
+        assert_eq!(out_fifo_cap_from_env(), DEFAULT_OUT_FIFO_CAP);
+        std::env::set_var("RBITCOIN_CONFIRM_OUT_FIFO", "12345");
+        assert_eq!(out_fifo_cap_from_env(), 12345);
+        std::env::set_var("RBITCOIN_CONFIRM_OUT_FIFO", "not-a-number");
+        assert_eq!(out_fifo_cap_from_env(), DEFAULT_OUT_FIFO_CAP);
+        match prev {
+            Some(v) => std::env::set_var("RBITCOIN_CONFIRM_OUT_FIFO", v),
+            None => std::env::remove_var("RBITCOIN_CONFIRM_OUT_FIFO"),
+        }
+    }
 }
 
 // FIFO eviction / pin layout: covered via ConfirmParentCache out_fifo_* + put_dense tests

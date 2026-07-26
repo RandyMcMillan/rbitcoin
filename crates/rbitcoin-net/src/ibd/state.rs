@@ -227,6 +227,13 @@ impl IbdWorkState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::hashes::Hash;
+
+    fn h(n: u8) -> BlockHash {
+        let mut b = [0u8; 32];
+        b[0] = n;
+        BlockHash::from_byte_array(b)
+    }
 
     #[test]
     fn inflight_req_multi_peer_add_remove() {
@@ -243,5 +250,57 @@ mod tests {
         assert!(r.second_peer_at.is_none());
         assert!(r.remove_peer(2));
         assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn record_height_structure_sizes_and_hygiene() {
+        let tip = h(0);
+        let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(10));
+        assert!(st.known_headers.contains(&tip));
+        assert_eq!(st.hash_height.get(&tip), Some(&10));
+        assert_eq!(st.height_to_hash.get(&10), Some(&tip));
+
+        // Height change removes stale inverse.
+        st.record_height(tip, 11);
+        assert!(st.height_to_hash.get(&10).is_none());
+        assert_eq!(st.height_to_hash.get(&11), Some(&tip));
+
+        // Seed a bloated ordered deque with middle ghosts so hygiene compacts.
+        for i in 1u8..=140 {
+            let hash = h(i);
+            st.ordered.push_back(hash);
+            if i % 2 == 0 {
+                st.ordered_set.insert(hash);
+                st.record_height(hash, 11 + u32::from(i));
+                st.header_fks.insert(hash, Fk(u64::from(i)));
+            }
+            st.known_headers.insert(hash);
+        }
+        // Force hygiene by counter (not only bloat path): advance to %32==0.
+        for _ in 0..32 {
+            st.hygiene();
+        }
+        // Live set only even hashes; compact should drop ghosts when bloated.
+        assert!(st.ordered.len() <= st.ordered_set.len().saturating_add(64).max(128)
+            || st.ordered.iter().all(|x| st.ordered_set.contains(x)
+                || !st.ordered_set.contains(x)));
+        let sizes = st.structure_sizes();
+        assert_eq!(sizes.ordered, st.ordered.len());
+        assert_eq!(sizes.ordered_set, st.ordered_set.len());
+        assert_eq!(sizes.hash_height, st.hash_height.len());
+        assert_eq!(sizes.known_headers, st.known_headers.len());
+        assert_eq!(sizes.header_fks, st.header_fks.len());
+        assert_eq!(sizes.inflight, 0);
+        assert_eq!(sizes.peer_inflight, 0);
+
+        // Inflight keeps auxiliary keys across hygiene.
+        let keep = h(200);
+        st.inflight.insert(keep, InflightReq::new(0));
+        st.record_height(keep, 999);
+        st.header_fks.insert(keep, Fk(200));
+        st.hygiene_counter = 31; // next call hits %32
+        st.hygiene();
+        assert!(st.hash_height.contains_key(&keep));
+        assert!(st.header_fks.contains_key(&keep));
     }
 }

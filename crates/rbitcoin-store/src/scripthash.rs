@@ -973,6 +973,40 @@ mod tests {
     }
 
     #[test]
+    fn script_hash_record_helpers_and_table_flush_open() {
+        let e = ShEntry::new(Fk(9));
+        let r = ScriptHashRecord::from_entry([1u8; 32], e);
+        assert_eq!(r.entry(), e);
+        assert!(!r.is_tombstone());
+        let tomb = ScriptHashRecord::from_fk([2u8; 32], Fk::NULL);
+        assert!(tomb.is_tombstone());
+        let _ = script_hash(&[0x00, 0x14]);
+
+        let dir = tmp();
+        let t = ScriptHashTable::create(&dir).unwrap();
+        let sh = script_hash(&[0x99]);
+        t.put_create(&rec(sh, 1, 0)).unwrap();
+        let _ = t.put_create_batch(&[]);
+        assert_eq!(t.entry_count(), 1);
+        t.flush().unwrap();
+        t.flush_async().unwrap();
+        drop(t);
+        let t = ScriptHashTable::open(&dir).unwrap();
+        assert_eq!(t.entries(&sh).unwrap().len(), 1);
+        // for_each_live across table
+        let mut n = 0u32;
+        t.for_each_live_create(|_fk| {
+            n += 1;
+        })
+        .unwrap();
+        assert_eq!(n, 1);
+        // missing key
+        assert!(t.entries(&[0u8; 32]).unwrap().is_empty());
+        assert!(t.head_value(&[0u8; 32]).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn scripthash_thin_roundtrip() {
         let dir = tmp();
         let t = ScriptHashTable::create(&dir).unwrap();

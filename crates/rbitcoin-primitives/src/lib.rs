@@ -175,3 +175,56 @@ impl TableKind {
         self as u16
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fk_display_and_get() {
+        assert!(Fk::NULL.is_null());
+        assert_eq!(Fk::NULL.get(), None);
+        assert_eq!(format!("{}", Fk::NULL), "Fk(null)");
+        assert_eq!(Fk::new(0), None);
+        let f = Fk::new(7).unwrap();
+        assert_eq!(f.get(), Some(7));
+        assert_eq!(format!("{f}"), "Fk(7)");
+    }
+
+    #[test]
+    fn height_display_and_next() {
+        assert_eq!(Height::GENESIS.0, 0);
+        assert_eq!(format!("{}", Height(42)), "42");
+        assert_eq!(Height(u32::MAX).next(), None);
+        assert_eq!(Height(0).next(), Some(Height(1)));
+    }
+
+    #[test]
+    fn network_parse_display_and_error() {
+        assert_eq!(Network::parse("mainnet").unwrap(), Network::Mainnet);
+        assert_eq!(Network::parse("TESTNET3").unwrap(), Network::Testnet);
+        assert_eq!(Network::parse("signet").unwrap().as_str(), "signet");
+        assert_eq!(format!("{}", Network::Regtest), "regtest");
+        let err = Network::parse("bogus").unwrap_err();
+        assert_eq!(format!("{err}"), "unknown network `bogus`");
+        let _ = &err as &dyn std::error::Error;
+    }
+
+    #[test]
+    fn table_kind_roundtrip() {
+        for v in 1u16..=13 {
+            let k = TableKind::from_u16(v).expect("kind");
+            assert_eq!(k.as_u16(), v);
+        }
+        assert!(TableKind::from_u16(0).is_none());
+        assert!(TableKind::from_u16(99).is_none());
+        assert_eq!(TableKind::Spender.as_u16(), 13);
+    }
+
+    #[test]
+    fn constants_stable() {
+        assert_eq!(STORE_MAGIC, *b"RBT1");
+        assert_eq!(SCHEMA_VERSION, 10);
+        assert!(!VERSION.is_empty());
+    }
+}

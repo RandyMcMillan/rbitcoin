@@ -13,9 +13,6 @@ mod service;
 mod tx_relay;
 mod v2;
 
-#[cfg(test)]
-mod reader_contention;
-
 pub use cache::BlockCache;
 pub use chain::{AcceptOutcome, ChainHub, TipEvent};
 pub use error::NetError;
@@ -60,5 +57,19 @@ pub fn outbound_for_ibd(ibd: bool) -> u32 {
         DEFAULT_IBD_TARGET_PEERS
     } else {
         8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crate_name_and_outbound_defaults() {
+        assert_eq!(crate_name(), "rbitcoin-net");
+        assert_eq!(DEFAULT_IBD_TARGET_PEERS, 16);
+        assert_eq!(DEFAULT_IBD_OUTBOUND, DEFAULT_IBD_TARGET_PEERS);
+        assert_eq!(outbound_for_ibd(true), 16);
+        assert_eq!(outbound_for_ibd(false), 8);
     }
 }

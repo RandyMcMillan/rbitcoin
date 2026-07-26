@@ -134,3 +134,62 @@ impl NodeConfig {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp() -> PathBuf {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("rbitcoin-node-cfg-{n}"))
+    }
+
+    #[test]
+    fn builders_paths_milestone_and_ensure() {
+        let dir = tmp();
+        let cfg = NodeConfig::default()
+            .with_datadir(&dir)
+            .with_network(Network::Regtest)
+            .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+        assert_eq!(cfg.network, Network::Regtest);
+        assert_eq!(cfg.store_path(), dir.join("store"));
+        assert_eq!(cfg.mempool_path(), dir.join("mempool"));
+        assert!(cfg.p2p_listen.is_some());
+        assert_eq!(cfg.milestone(), rbitcoin_consensus::Milestone::NONE);
+
+        let mut with_ms = cfg.clone();
+        with_ms.milestone_height = 100;
+        assert_eq!(with_ms.milestone().height, 100);
+
+        cfg.ensure_datadir().unwrap();
+        assert!(dir.join("store").is_dir());
+        assert!(dir.join("mempool").is_dir());
+        assert!(dir.join("wire").is_dir());
+
+        // Re-ensure is idempotent.
+        cfg.ensure_datadir().unwrap();
+
+        let empty = NodeConfig {
+            datadir: PathBuf::new(),
+            ..NodeConfig::default()
+        };
+        assert!(empty.validate().is_err());
+
+        // File-as-datadir: create_dir_all fails with io/datadir error.
+        let file_path = tmp();
+        std::fs::write(&file_path, b"not a dir").unwrap();
+        let bad = NodeConfig::default().with_datadir(&file_path);
+        let err = bad.ensure_datadir().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("datadir") || msg.contains("not a directory") || msg.contains("File exists"),
+            "unexpected: {msg}"
+        );
+        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

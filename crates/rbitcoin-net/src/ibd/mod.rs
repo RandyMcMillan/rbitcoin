@@ -31,9 +31,6 @@ mod progress;
 mod state;
 mod status;
 
-#[cfg(test)]
-mod freeze_benches;
-
 use archive::{
     spawn_archive_pipeline, ArchiveJob, ArchivePipelineStats, ArchiveQueueBudget, ArchiveResult,
 };

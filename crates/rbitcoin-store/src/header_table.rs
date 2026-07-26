@@ -143,3 +143,78 @@ impl HeaderTable {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp() -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "rbitcoin-header-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn sample(hash: [u8; 32]) -> HeaderRecord {
+        HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 100,
+            bits: 0x1d00ffff,
+            nonce: 7,
+            merkle_root: [2u8; 32],
+            hash,
+        }
+    }
+
+    #[test]
+    fn header_put_get_by_hash_open_flush() {
+        let dir = tmp();
+        let t = HeaderTable::create(&dir).unwrap();
+        let h1 = [1u8; 32];
+        let h2 = [2u8; 32];
+        let fk1 = t.put(&sample(h1)).unwrap();
+        let fk2 = t.put(&sample(h2)).unwrap();
+        assert_eq!(t.count(), 2);
+        assert_eq!(t.get(fk1).unwrap().hash, h1);
+        assert_eq!(t.get(fk2).unwrap().hash, h2);
+        assert_eq!(t.get_by_hash(&h1).unwrap().unwrap().0, fk1);
+        assert!(t.get_by_hash(&[9u8; 32]).unwrap().is_none());
+        assert!(matches!(t.get(Fk::NULL), Err(StoreError::InvalidFk)));
+        assert!(matches!(t.get(Fk(99)), Err(StoreError::NotFound)));
+        // short decode
+        assert!(matches!(
+            HeaderRecord::decode(&[0u8; 10]),
+            Err(StoreError::Corrupt(_))
+        ));
+        t.flush().unwrap();
+        t.flush_async().unwrap();
+        drop(t);
+        let t = HeaderTable::open(&dir).unwrap();
+        assert_eq!(t.count(), 2);
+        assert_eq!(t.get_by_hash(&h2).unwrap().unwrap().1.nonce, 7);
+        // Shrink OS file below HWM so open clamps logical to a non-record size.
+        {
+            use crate::file::FILE_HEADER_LEN;
+            let body = dir.join("header.body");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&body)
+                .unwrap()
+                .set_len((FILE_HEADER_LEN + 3) as u64)
+                .unwrap();
+        }
+        assert!(matches!(
+            HeaderTable::open(&dir),
+            Err(StoreError::Corrupt(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

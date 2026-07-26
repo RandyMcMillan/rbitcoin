@@ -38,3 +38,32 @@ impl MempoolError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+    use std::io;
+
+    #[test]
+    fn display_and_source_all_variants() {
+        let io_err = MempoolError::io(
+            "/tmp/mp",
+            io::Error::new(io::ErrorKind::NotFound, "nope"),
+        );
+        assert!(format!("{io_err}").contains("io /tmp/mp"));
+        assert!(io_err.source().is_some());
+
+        let magic = MempoolError::BadMagic;
+        assert_eq!(format!("{magic}"), "mempool bad magic");
+        assert!(magic.source().is_none());
+
+        let schema = MempoolError::BadSchema(3);
+        assert_eq!(format!("{schema}"), "mempool bad schema 3");
+        assert!(schema.source().is_none());
+
+        let corrupt = MempoolError::Corrupt("slot OOB");
+        assert_eq!(format!("{corrupt}"), "mempool corrupt: slot OOB");
+        assert!(corrupt.source().is_none());
+    }
+}

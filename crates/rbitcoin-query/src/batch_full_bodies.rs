@@ -119,4 +119,16 @@ mod tests {
         b.insert(Fk(2), 2, sample_tx(2), vec![], vec![]);
         assert_eq!(b.iter().count(), 2);
     }
+
+    #[test]
+    fn with_capacity_and_null_fk() {
+        let mut b = BatchFullBodies::with_capacity(4);
+        assert_eq!(b.len(), 0);
+        assert!(b.is_empty());
+        b.insert(Fk::NULL, 0, sample_tx(0), vec![], vec![]);
+        assert!(b.is_empty());
+        b.insert(Fk(5), 3, sample_tx(5), vec![], vec![]);
+        assert!(!b.is_empty());
+        assert_eq!(b.len(), 1);
+    }
 }

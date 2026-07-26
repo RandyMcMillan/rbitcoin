@@ -124,5 +124,28 @@ mod tests {
         // One ready height + deep arch_q → no coalesce wait.
         assert_eq!(coalesce_wait(1, 0, ARCH_Q_FLUSH_ASAP, 0), Duration::ZERO);
         assert_eq!(coalesce_wait(1, 0, 0, 0), Duration::from_millis(1));
+
+        // write_q can fill the min batch → short wait (fill_ms).
+        if min > 1 {
+            let w = coalesce_wait(min - 1, 1, 0, 0);
+            assert_eq!(w, Duration::from_millis(8));
+        }
+        // write_q large enough to complete min_batch alone → fill path (8ms),
+        // not heavy_ms — fill is checked first.
+        if min <= 32 {
+            assert_eq!(coalesce_wait(0, 32, 0, 0), Duration::from_millis(8));
+        }
+        // Heavy path: arch_q ≥ 2048 with empty batch (no fill shortcut).
+        assert_eq!(coalesce_wait(0, 0, 2048, 0), Duration::from_millis(12));
+        // Mid / light pressure.
+        assert_eq!(coalesce_wait(0, 8, 0, 0), Duration::from_millis(4));
+        assert_eq!(coalesce_wait(0, 0, 128, 0), Duration::from_millis(4));
+        assert_eq!(coalesce_wait(0, 1, 0, 0), Duration::from_millis(2));
+        assert_eq!(coalesce_wait(0, 0, 32, 0), Duration::from_millis(2));
+
+        // Queue-depth shrinks of min batch.
+        let m128 = min_batch_for_queue(128, 0);
+        assert!(m128 <= base);
+        assert!(m128 >= 8.min(base));
     }
 }

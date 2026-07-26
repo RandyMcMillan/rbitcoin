@@ -20,3 +20,19 @@ pub fn set_defer_durable_flush(defer: bool) {
 pub fn defer_durable_flush() -> bool {
     DEFER_DURABLE_FLUSH.load(Ordering::Relaxed)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defer_flag_roundtrip() {
+        // Restore default afterward so other tests see production policy.
+        let prev = defer_durable_flush();
+        set_defer_durable_flush(true);
+        assert!(defer_durable_flush());
+        set_defer_durable_flush(false);
+        assert!(!defer_durable_flush());
+        set_defer_durable_flush(prev);
+    }
+}

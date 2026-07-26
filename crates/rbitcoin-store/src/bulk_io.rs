@@ -732,6 +732,132 @@ mod tests {
     use std::io::Write;
     use std::os::fd::AsRawFd;
 
+    /// Dense surface: empty ops, empty bufs, serial RMW, multi-worker fallback,
+    /// workers/io_uring helpers (without racing env with parallel tests for mode).
+    #[test]
+    fn bulk_io_edges_empty_serial_rmw_workers() {
+        let _ = io_uring_enabled(); // may probe once
+        let w = bulk_io_workers();
+        assert!(w >= 1);
+
+        // Empty batches
+        pread_batch(&mut []);
+        pwrite_batch(&mut []);
+        assert!(page_rmw_pipelined(&mut [], |_, _| true));
+        assert!(page_rmw_serial(&mut [], |_, _| true));
+
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-bulk-edge-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("blob");
+        let mut f = std::fs::File::create(&path).unwrap();
+        let data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        f.write_all(&data).unwrap();
+        f.flush().unwrap();
+        // Read+write so serial page RMW pwrite succeeds.
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let fd = f.as_raw_fd();
+
+        // Empty bufs
+        let mut empty = [];
+        let mut ops = [ReadOp {
+            fd,
+            offset: 0,
+            buf: &mut empty[..],
+            result: i32::MIN,
+        }];
+        pread_batch(&mut ops);
+        assert_eq!(ops[0].result, 0);
+
+        let mut wops = [WriteOp {
+            fd,
+            offset: 0,
+            buf: &[],
+            result: i32::MIN,
+        }];
+        pwrite_batch(&mut wops);
+        assert_eq!(wops[0].result, 0);
+
+        // Force fallback multi-worker path: many preads (≥8)
+        let mut bufs: Vec<[u8; 64]> = vec![[0u8; 64]; 16];
+        let mut read_ops: Vec<ReadOp<'_>> = Vec::new();
+        for (i, b) in bufs.iter_mut().enumerate() {
+            read_ops.push(ReadOp {
+                fd,
+                offset: (i * 64) as u64,
+                buf: b.as_mut_slice(),
+                result: i32::MIN,
+            });
+        }
+        pread_batch_fallback(&mut read_ops);
+        for op in &read_ops {
+            assert_eq!(op.result, 64, "result={}", op.result);
+        }
+        assert_eq!(&bufs[0][..], &data[0..64]);
+
+        // Serial page RMW with clean (apply false) + dirty pages
+        let mut p0 = vec![0u8; 32];
+        let mut p1 = vec![0u8; 32];
+        let mut p_empty: Vec<u8> = vec![];
+        let mut pages = [
+            PageRmw {
+                fd,
+                offset: 0,
+                buf: &mut p0,
+            },
+            PageRmw {
+                fd,
+                offset: 32,
+                buf: &mut p1,
+            },
+            PageRmw {
+                fd,
+                offset: 64,
+                buf: &mut p_empty,
+            },
+        ];
+        assert!(page_rmw_serial(&mut pages, |i, buf| {
+            if i == 0 {
+                buf[0] ^= 0xff;
+                true
+            } else {
+                false // clean — no write
+            }
+        }));
+        // Verify dirty page written
+        let mut check = [0u8; 1];
+        let mut ro = ReadOp {
+            fd,
+            offset: 0,
+            buf: &mut check,
+            result: i32::MIN,
+        };
+        pread_one(&mut ro);
+        assert_eq!(check[0], data[0] ^ 0xff);
+
+        // pread_one short read past EOF
+        let mut past = [0u8; 16];
+        let mut ro = ReadOp {
+            fd,
+            offset: 10_000,
+            buf: &mut past,
+            result: i32::MIN,
+        };
+        pread_one(&mut ro);
+        assert_eq!(ro.result, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn pread_batch_roundtrip_tmpfile() {
         let dir = std::env::temp_dir().join(format!(

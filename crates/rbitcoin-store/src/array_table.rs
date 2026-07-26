@@ -126,3 +126,70 @@ impl ArrayTable {
         self.file.flush_async()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rbitcoin_primitives::TableKind;
+
+    fn tmp_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "rbitcoin-array-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn array_set_get_grow_set_many_truncate_flush() {
+        let path = tmp_path();
+        let _ = std::fs::remove_file(&path);
+        let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
+        assert_eq!(t.len(), 0);
+        assert_eq!(t.get(0).unwrap(), 0);
+        // Grow with zero-fill gap.
+        t.set(3, 30).unwrap();
+        assert_eq!(t.len(), 4);
+        assert_eq!(t.get(0).unwrap(), 0);
+        assert_eq!(t.get(3).unwrap(), 30);
+        // Overwrite existing.
+        t.set(1, 11).unwrap();
+        assert_eq!(t.get(1).unwrap(), 11);
+        // Empty set_many is no-op.
+        t.set_many(&[]).unwrap();
+        // Grow via set_many past current len.
+        t.set_many(&[(10, 100), (5, 50)]).unwrap();
+        assert_eq!(t.len(), 11);
+        assert_eq!(t.get(5).unwrap(), 50);
+        assert_eq!(t.get(10).unwrap(), 100);
+        t.flush().unwrap();
+        t.flush_async().unwrap();
+        drop(t);
+        let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
+        assert_eq!(t.len(), 11);
+        assert_eq!(t.get(3).unwrap(), 30);
+        t.truncate(4).unwrap();
+        assert_eq!(t.len(), 4);
+        assert!(matches!(
+            t.truncate(99),
+            Err(StoreError::Corrupt(_))
+        ));
+        // Corrupt size on open: clamp below HWM to non-multiple of 8.
+        {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(FILE_HEADER_LEN as u64 + 3)
+                .unwrap();
+        }
+        assert!(matches!(
+            ArrayTable::open(&path, TableKind::Confirmed),
+            Err(StoreError::Corrupt(_))
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+}

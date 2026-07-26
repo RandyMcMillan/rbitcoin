@@ -331,3 +331,90 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp_datadir() -> PathBuf {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("rbitcoin-cli-{n}"))
+    }
+
+    #[test]
+    fn help_and_version_exit_success() {
+        assert_eq!(
+            cli_main(["rbitcoin-node", "--help"]),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            cli_main(["rbitcoin-node", "-V"]),
+            ExitCode::SUCCESS
+        );
+    }
+
+    #[test]
+    fn unknown_and_missing_value_errors() {
+        assert_eq!(
+            cli_main(["rbitcoin-node", "--nope"]),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            cli_main(["rbitcoin-node", "--network"]),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            cli_main(["rbitcoin-node", "--network", "bogus"]),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            cli_main(["rbitcoin-node", "--datadir"]),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            cli_main(["rbitcoin-node", "--listen", "not-an-addr"]),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            cli_main(["rbitcoin-node", "--log-level", "wat"]),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            cli_main(["rbitcoin-node", "--max-outbound", "0"]),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            cli_main(["rbitcoin-node", "--mempool-size-mb", "0"]),
+            ExitCode::from(2)
+        );
+    }
+
+    #[test]
+    fn smoke_open_and_shutdown() {
+        let dir = tmp_datadir();
+        let code = cli_main([
+            "rbitcoin-node",
+            "--smoke",
+            "--network",
+            "regtest",
+            "--datadir",
+            dir.to_str().unwrap(),
+            "--no-seeds",
+            "--log-level",
+            "error",
+            "--milestone",
+            "0",
+            "--max-outbound",
+            "2",
+            "--mempool-size-mb",
+            "10",
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(dir.join("store").is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

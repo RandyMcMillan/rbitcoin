@@ -151,5 +151,30 @@ mod tests {
         let set: HashSet<_> = [h(1)].into_iter().collect();
         compact_ordered(&mut ordered, &set);
         assert_eq!(ordered.len(), 2);
+
+        // Ghost budget: live=80, len=100 → within budget, no compact.
+        let mut ordered = VecDeque::new();
+        let mut set = HashSet::new();
+        for i in 1u16..=80 {
+            ordered.push_back(h(i));
+            set.insert(h(i));
+        }
+        for i in 1u16..=20 {
+            ordered.push_back(h(2000 + i)); // ghosts
+        }
+        let before = ordered.len();
+        compact_ordered(&mut ordered, &set);
+        assert_eq!(ordered.len(), before);
+
+        // remove front chain of ghosts after middle remove already did set.
+        let mut ordered: VecDeque<_> = [h(1), h(2), h(3), h(4)].into_iter().collect();
+        let mut set: HashSet<_> = [h(3), h(4)].into_iter().collect();
+        remove_from_ordered(&mut ordered, &mut set, h(3));
+        // Front 1,2 not in set → popped; 3 removed; 4 remains.
+        assert_eq!(ordered.front().copied(), Some(h(4)));
+        assert_eq!(ordered.len(), 1);
+
+        assert_eq!(far_slots_per_peer(1, false), 1); // max(0,1)=1
+        assert_eq!(far_slots_per_peer(3, false), 1);
     }
 }

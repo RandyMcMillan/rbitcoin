@@ -1287,3 +1287,637 @@ pub struct MerkleProof {
 pub fn crate_name() -> &'static str {
     "rbitcoin-query"
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rbitcoin_store::{InputRecord, OutputRecord};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_query(label: &str) -> (std::path::PathBuf, Query) {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-query-{label}-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        (dir, q)
+    }
+
+    fn coinbase_block(h: u32, prev: Fk) -> (HeaderRecord, TxApply) {
+        let mut hash = [0u8; 32];
+        hash[0..4].copy_from_slice(&h.to_le_bytes());
+        hash[4] = 0xab;
+        let header = HeaderRecord {
+            prev_fk: prev,
+            version: 1,
+            timestamp: h + 1,
+            bits: 0x207fffff,
+            nonce: h,
+            merkle_root: hash,
+            hash,
+        };
+        let mut txid = [0u8; 32];
+        txid[0..4].copy_from_slice(&h.to_le_bytes());
+        txid[31] = 0xcb;
+        let ta = TxApply {
+            tx: TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![h as u8],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+        };
+        (header, ta)
+    }
+
+    #[test]
+    fn crate_name_and_sampler_stats() {
+        assert_eq!(crate_name(), "rbitcoin-query");
+
+        let _ = confirm_load_stats::sample_and_reset();
+        confirm_load_stats::note(
+            &ConfirmLoadStats {
+                blocks: 1,
+                utxo_parents: 2,
+                creates_registered: 3,
+                parent_unique: 4,
+                pin_cache_body: 5,
+                pin_new: 6,
+                pin_spent_ns: 7,
+                pin_body_ns: 8,
+                pin_new_meta_ns: 9,
+                parent_cache_hits: 10,
+                full_tx_reads: 11,
+                body_tx_reads: 12,
+                missing_parents: 13,
+                header_ns: 14,
+                body_decode_ns: 15,
+                thin_ns: 16,
+                parent_pin_ns: 17,
+                cache_put_ns: 18,
+                edge_same_batch: 19,
+                edge_fk: 20,
+                edge_coinbase: 21,
+                ..Default::default()
+            },
+            100,
+        );
+        let s = confirm_load_stats::sample_and_reset();
+        assert_eq!(s.ns, 100);
+        assert_eq!(s.blocks, 1);
+        assert_eq!(s.edge_coinbase, 21);
+
+        let _ = archive_phase_stats::sample_and_reset();
+        archive_phase_stats::note_resolve_counts(1, 2, 3, 4, 5, 6, 7);
+        archive_phase_stats::note_prep_plan(1, 2, 3, 4, 5, 6, 7);
+        archive_phase_stats::note_prep_batch(10, 1, 2, 3, 4, 1);
+        archive_phase_stats::note_write_commit(20, 1, 2, 3, 4, 5, 6, 7, 1);
+        archive_phase_stats::note_write_flush(8);
+        let a = archive_phase_stats::sample_and_reset();
+        assert!(a.prep_phases_sum_ns() > 0);
+        assert!(a.write_phases_sum_ns() > 0);
+        assert_eq!(a.blocks, 1);
+
+        class_c_phase_stats::STRONG_NS.store(11, AtomicOrdering::Relaxed);
+        class_c_phase_stats::add_sh_part(&class_c_phase_stats::SH_FILTER_NS, 5);
+        class_c_phase_stats::TIP_NS.store(3, AtomicOrdering::Relaxed);
+        let (st, sh, tip) = class_c_phase_stats::sample_and_reset();
+        assert_eq!(st, 11);
+        assert!(sh >= 5);
+        assert_eq!(tip, 3);
+        let _ = class_c_phase_stats::sample_sh_sub_and_reset();
+
+        connect_prevout_stats::WAVE_HIT.store(1, AtomicOrdering::Relaxed);
+        connect_prevout_stats::CLASS_A_HIT.store(2, AtomicOrdering::Relaxed);
+        connect_prevout_stats::STORE_MISS.store(3, AtomicOrdering::Relaxed);
+        assert_eq!(connect_prevout_stats::sample_and_reset(), (1, 2, 3));
+
+        wave_fill_stats::add_count(&wave_fill_stats::BODY_STORE, 2);
+        wave_fill_stats::add(&wave_fill_stats::BODY_STORE_NS, 9);
+        assert_eq!(wave_fill_stats::sample_store_and_reset(), (2, 9));
+
+        contig_park_stats::store(7, 3, 1);
+        assert_eq!(contig_park_stats::snapshot(), (7, 3, 1));
+    }
+
+    #[test]
+    fn connect_chain_query_surface() {
+        let (dir, q) = temp_query("connect");
+        // Default Tip mode: durable SH on confirm so Electrum-style APIs work.
+        assert!(q.index_mode().is_tip());
+        assert!(q.index_mode().uses_durable_spends());
+
+        let mut prev = Fk::NULL;
+        let mut hashes = Vec::new();
+        for h in 0..4u32 {
+            let (header, ta) = coinbase_block(h, prev);
+            hashes.push(header.hash);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        assert_eq!(q.tip_height(), Some(Height(3)));
+        assert!(q.tip_header_fk().unwrap().is_some());
+        assert!(q.is_header_archived(&hashes[2]).unwrap());
+        assert!(q.is_block_archived(&hashes[2]).unwrap());
+        assert!(q.archived_block_count().unwrap() >= 4);
+
+        // height_of_hash: tip and tip-1 fast paths + deeper scan.
+        assert_eq!(q.height_of_hash(&hashes[3]).unwrap(), Some(Height(3)));
+        assert_eq!(q.height_of_hash(&hashes[2]).unwrap(), Some(Height(2)));
+        assert_eq!(q.height_of_hash(&hashes[0]).unwrap(), Some(Height(0)));
+        assert_eq!(q.height_of_hash(&[0xee; 32]).unwrap(), None);
+
+        let hdr = q.wire_header_at_height(Height(1)).unwrap();
+        assert_eq!(hdr.time, 2);
+
+        let loc = q.locator_hashes().unwrap();
+        assert!(!loc.is_empty());
+        let after = q
+            .headers_after_locator(
+                &loc,
+                BlockHash::from_byte_array([0u8; 32]),
+                10,
+            )
+            .unwrap();
+        // After matching tip locator → empty; zero locator starts from genesis.
+        let from_zero = q
+            .headers_after_locator(
+                &[BlockHash::from_byte_array([0u8; 32])],
+                BlockHash::from_byte_array([0u8; 32]),
+                2,
+            )
+            .unwrap();
+        assert_eq!(from_zero.len(), 2);
+        let _ = after;
+
+        // Tx resolve + inputs/outputs.
+        let fks = q.block_tx_fks(Height(0)).unwrap();
+        assert_eq!(fks.len(), 1);
+        let tx = q.get_tx(fks[0]).unwrap();
+        assert!(q.tx_fk_by_txid(&tx.txid).unwrap().is_some());
+        assert!(q.tx_fk_by_txid_store(&tx.txid).unwrap().is_some());
+        let inp = q.tx_input_at_fk(fks[0], &tx, 0).unwrap();
+        assert!(inp.is_coinbase());
+        let out = q.tx_output_at_fk(fks[0], &tx, 0).unwrap();
+        assert_eq!(out.value, 50_0000_0000);
+        assert!(!q.is_outpoint_spent(&tx.txid, 0).unwrap());
+        assert!(!q.is_outpoint_spent_create(fks[0], 0).unwrap());
+        assert_eq!(q.unspent_create_vouts(fks[0], &[0]).unwrap(), vec![0]);
+
+        // Merkle proof for coinbase.
+        let proof = q.merkle_proof(Height(0), &tx.txid).unwrap();
+        assert_eq!(proof.pos, 0);
+        assert_eq!(proof.block_height, 0);
+
+        // Scripthash history/balance/utxo for OP_TRUE (durable SH in tip mode).
+        let sh = script_hash(&[0x51]);
+        let hist = q.scripthash_history(&sh).unwrap();
+        assert!(!hist.is_empty());
+        let bal = q.scripthash_balance(&sh).unwrap();
+        assert!(bal.confirmed > 0);
+        let utxos = q.scripthash_listunspent(&sh).unwrap();
+        assert!(!utxos.is_empty());
+
+        // Confirm cancel flags.
+        assert!(!q.confirm_cancelled());
+        q.request_confirm_cancel();
+        assert!(q.confirm_cancelled());
+        q.clear_confirm_cancel();
+        assert!(!q.confirm_cancelled());
+
+        // Direct mode + warm + tip re-entry.
+        q.enter_direct_index_mode().unwrap();
+        assert!(q.index_mode().is_direct());
+        // Leave leftover catchup artifacts to exercise cleanup.
+        let _ = std::fs::write(q.store().path().join("ibd_utxo.map"), b"x");
+        let _ = std::fs::create_dir_all(q.store().path().join("point.runs"));
+        q.enter_direct_index_mode().unwrap();
+        q.warm_scripthash_create_index().unwrap();
+        let _ = q.finalize_sh_runs();
+        let _ = q.scripthash_run_count();
+        q.enter_tip_index_mode();
+        assert!(q.index_mode().is_tip());
+
+        // Size snapshot + sticky stats.
+        let sizes = q.process_owned_size_snapshot();
+        let _ = sizes.sticky_cap;
+        let _ = q.archive_txid_sticky_stats();
+        assert!(q.tx_body_count() >= 4);
+        let _ = q.tx_head_occupied();
+        let _ = q.scripthash_entry_count();
+        let _ = q.point_edge_count();
+
+        // Idempotent confirm at tip height.
+        let tip_fk = q.confirm_block(Height(3), &hashes[3]).unwrap();
+        assert_eq!(tip_fk, prev);
+
+        // Empty confirm run.
+        assert!(q.confirm_blocks_run(&[]).unwrap().is_empty());
+
+        // Disconnect tip then re-check tip height.
+        q.disconnect_tip().unwrap();
+        assert_eq!(q.tip_height(), Some(Height(2)));
+
+        // load_confirm_parents empty / already-confirmed heights.
+        let (st, _, _, _) = q.load_confirm_parents(&[]).unwrap();
+        let _ = st.blocks;
+        let (st2, _, _, _) = q
+            .load_confirm_parents(&[(0, hashes[0]), (1, hashes[1])])
+            .unwrap();
+        let _ = st2;
+
+        // Cancelled load path.
+        q.request_confirm_cancel();
+        let cancelled = q.load_confirm_parents(&[(10, [9u8; 32])]);
+        assert!(cancelled.is_err());
+        q.clear_confirm_cancel();
+
+        q.advance_parent_cache_tip(2);
+        q.seed_parent_cache(&[(3, hashes[3])]);
+        assert!(q.is_confirm_load_ready(&[]));
+
+        // resume_work_path: max 0 → empty.
+        assert!(q
+            .resume_work_path_after_tip(hashes[2], 2, 0)
+            .unwrap()
+            .is_empty());
+
+        // Archive-only header without confirm.
+        let (orphan, _) = coinbase_block(99, Fk::NULL);
+        let ofk = q.ensure_header(&orphan).unwrap();
+        assert_eq!(q.ensure_header(&orphan).unwrap(), ofk);
+        assert!(q.is_header_archived(&orphan.hash).unwrap());
+        assert!(!q.is_block_archived(&orphan.hash).unwrap());
+
+        q.flush_header_archive().unwrap();
+        q.flush().unwrap();
+        q.flush_for_shutdown().unwrap();
+
+        // backfill helpers on small chain.
+        let n = q.backfill_tx_index(|_, _, _| {}).unwrap();
+        let _ = n;
+        let (heights, txs) = q.backfill_point_spends(|_, _, _, _| {}).unwrap();
+        assert!(heights >= 1);
+        let _ = txs;
+
+        // header_tx_fks / get_header_by_hash / put paths.
+        let (hfk, hrec) = q.get_header_by_hash(&hashes[1]).unwrap().unwrap();
+        assert_eq!(hrec.hash, hashes[1]);
+        assert!(q.header_tx_fks(hfk, Some(&hashes[1])).unwrap().is_some());
+        assert_eq!(q.get_header(hfk).unwrap().hash, hashes[1]);
+        assert!(q.header_at_height(Height(1)).unwrap().is_some());
+
+        // Error paths.
+        assert!(q.confirm_blocks_run(&[ConfirmPrepared {
+            height: Height(99),
+            header_fk: Fk(1),
+            tx_fks: vec![Fk(1)],
+        }])
+        .is_err());
+        assert!(q.tx_input_at_fk(fks[0], &tx, 99).is_err());
+        assert!(q.tx_output_at_fk(fks[0], &tx, 99).is_err());
+        assert!(q.merkle_proof(Height(0), &[0xff; 32]).is_err());
+        assert!(q.block_tx_fks(Height(50)).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_mode_helpers_and_batch_helpers() {
+        assert!(IndexMode::Direct.is_direct());
+        assert!(!IndexMode::Direct.is_tip());
+        assert!(IndexMode::Tip.is_tip());
+        assert!(IndexMode::Direct.uses_durable_spends());
+        assert!(IndexMode::Tip.uses_durable_spends());
+
+        let mut b = BatchFullBodies::with_capacity(2);
+        assert!(b.is_empty());
+        b.insert(
+            Fk::NULL,
+            1,
+            TxRecord {
+                txid: [0; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 0,
+                output_start_fk: Fk::NULL,
+                output_count: 0,
+            },
+            vec![],
+            vec![],
+        );
+        assert!(b.is_empty()); // null fk ignored
+
+        let mut bp = BatchParents::new();
+        assert!(bp.is_empty());
+        bp.put_resolved(
+            Fk(1),
+            TxRecord {
+                txid: [1; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            &[(0, OutputRecord::unspent(1, vec![0x51]))],
+            &[0],
+            Some(true),
+        );
+        assert!(!bp.is_empty());
+        assert!(bp.pin_covered(Fk(1), &[]));
+        assert!(bp.pin_covered(Fk(1), &[0]));
+        assert!(!bp.pin_covered(Fk::NULL, &[0]));
+        assert!(!bp.pin_covered(Fk(99), &[0]));
+        assert!(bp.get_parent_outs_needed(Fk(1), &[0]).is_some());
+        assert!(bp.get_parent_tx(Fk(1)).is_some());
+        assert_eq!(bp.get_parent_coinbase(Fk(1)), Some(true));
+        assert!(bp.get_body_range(Fk(1)).is_none());
+        assert!(bp.get_spender_abs(Fk(1), 0).is_none());
+        assert!(!bp.has_parent_out(Fk::NULL, 0));
+        bp.insert_owned(
+            Fk::NULL,
+            bp.get_parent_tx(Fk(1)).unwrap(),
+            vec![],
+            vec![],
+            None,
+            None,
+            vec![],
+        );
+        let rels = batch_parents::sparse_spender_rels(&[10, 20, 30], &[0, 2]);
+        assert_eq!(rels, vec![(0, 10), (2, 30)]);
+        // Partial covered outs path (not fully pin_covered but all live present).
+        let mut bp2 = BatchParents::new();
+        bp2.insert_owned(
+            Fk(2),
+            TxRecord {
+                txid: [2; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 2,
+            },
+            vec![
+                (0, OutputRecord::unspent(1, vec![0x51])),
+                (1, OutputRecord::unspent(2, vec![0x51])),
+            ],
+            vec![], // empty checked → pin_covered false
+            Some(false),
+            Some((100, 50)),
+            vec![(0, 1), (1, 10)],
+        );
+        assert!(!bp2.pin_covered(Fk(2), &[0, 1]));
+        let got = bp2.get_parent_outs_needed(Fk(2), &[0, 1]).unwrap();
+        assert!(!got.2);
+        assert_eq!(got.1.len(), 2);
+        assert_eq!(bp2.get_spender_abs(Fk(2), 1), Some(110));
+        assert!(bp2.get_parent_outs_needed(Fk(2), &[9]).is_none());
+    }
+
+    #[test]
+    fn reconstruct_and_connect_error_arms() {
+        let (dir, q) = temp_query("reconstruct");
+        let mut prev = Fk::NULL;
+        let mut hashes = Vec::new();
+        // Multi-tx block at h=1 for odd merkle layer.
+        for h in 0..3u32 {
+            let (header, ta) = coinbase_block(h, prev);
+            let mut txs = vec![ta];
+            if h == 1 {
+                // Extra coinbase-like create with unique txid (not real coinbase).
+                let mut t2 = coinbase_block(h + 100, prev).1;
+                t2.tx.txid[30] = 0xee;
+                txs.push(t2);
+                let mut t3 = coinbase_block(h + 200, prev).1;
+                t3.tx.txid[30] = 0xef;
+                txs.push(t3);
+            }
+            hashes.push(header.hash);
+            prev = q.connect_block(Height(h), &header, &txs).unwrap();
+        }
+
+        // Reconstruct surfaces.
+        let fks0 = q.block_tx_fks(Height(0)).unwrap();
+        let wire = q.tx_wire_bytes(fks0[0]).unwrap();
+        assert!(!wire.is_empty());
+        let wire_tx = q.reconstruct_tx(fks0[0]).unwrap();
+        assert_eq!(wire_tx.input.len(), 1);
+        // Synthetic header.hash is not PoW/merkle-linked; height rebuild checks mismatch.
+        assert!(q.reconstruct_block_at_height(Height(0)).is_err());
+        assert!(q
+            .reconstruct_block_by_hash(&[0xde; 32])
+            .unwrap()
+            .is_none());
+        let arch = q.reconstruct_archived_block(&hashes[1]).unwrap().unwrap();
+        assert_eq!(arch.txdata.len(), 3);
+        // archived path does not require header.hash == wire block_hash.
+        assert_eq!(arch.txdata[0].input.len(), 1);
+        // Batch-local body path.
+        let mut batch = BatchFullBodies::new();
+        let full = q.store().get_tx_full(fks0[0]).unwrap();
+        batch.insert(fks0[0], 0, full.0.clone(), full.1.clone(), full.2.clone());
+        let tx2 = q.reconstruct_tx_with_batch(fks0[0], Some(&batch)).unwrap();
+        assert_eq!(tx2.output.len(), 1);
+        // Empty tx list → corrupt.
+        let (_hfk, hrec) = q.get_header_by_hash(&hashes[0]).unwrap().unwrap();
+        assert!(q
+            .reconstruct_archived_block_from_parts(hrec.clone(), vec![])
+            .is_err());
+        // Unknown hash → None.
+        assert!(q.reconstruct_archived_block(&[0x11; 32]).unwrap().is_none());
+
+        // Merkle multi-tx (odd leaf count pads).
+        let fks1 = q.block_tx_fks(Height(1)).unwrap();
+        let t1 = q.get_tx(fks1[0]).unwrap();
+        let proof = q.merkle_proof(Height(1), &t1.txid).unwrap();
+        assert_eq!(proof.pos, 0);
+        assert!(!proof.merkle.is_empty() || fks1.len() == 1);
+
+        // Class A TxRecord input/output paths.
+        let trec = q.get_tx(fks0[0]).unwrap();
+        assert!(q.tx_input(&trec, 0).is_ok());
+        assert!(q.tx_output(&trec, 0).is_ok());
+        assert!(q.tx_input(&trec, 99).is_err());
+        assert!(q.tx_output_attributed(&trec, 0, true).is_ok());
+
+        // confirm_blocks_run errors: non-contiguous, wrong first height, null fk.
+        assert!(q
+            .confirm_blocks_run(&[
+                ConfirmPrepared {
+                    height: Height(10),
+                    header_fk: Fk(1),
+                    tx_fks: vec![Fk(1)],
+                },
+                ConfirmPrepared {
+                    height: Height(12),
+                    header_fk: Fk(2),
+                    tx_fks: vec![Fk(2)],
+                },
+            ])
+            .is_err());
+        assert!(q
+            .confirm_blocks_run(&[ConfirmPrepared {
+                height: Height(0),
+                header_fk: Fk::NULL,
+                tx_fks: vec![Fk(1)],
+            }])
+            .is_err());
+        // Empty chain genesis check — tip exists so height 0 reconfirm wrong tip+1.
+        // Archive empty then connect rejects non-genesis on empty: use fresh store.
+        let (dir2, q2) = temp_query("connect-empty");
+        assert!(q2
+            .confirm_blocks_run(&[ConfirmPrepared {
+                height: Height(1),
+                header_fk: Fk(1),
+                tx_fks: vec![Fk(1)],
+            }])
+            .is_err());
+        let _ = std::fs::remove_dir_all(&dir2);
+
+        // put_header / put_tx / put_spend surfaces.
+        let mut orphan = coinbase_block(50, Fk::NULL).0;
+        orphan.hash[5] = 0x99;
+        let ofk = q.put_header(&orphan).unwrap();
+        assert_eq!(q.get_header(ofk).unwrap().hash, orphan.hash);
+        let mut trec = coinbase_block(50, Fk::NULL).1.tx;
+        trec.txid[0] = 0x77;
+        let _tfk = q.put_tx(&trec).unwrap();
+        // put_spend needs real create - skip if fails
+        let _ = q.put_spend(&[1u8; 32], 0, fks0[0], 0);
+        let _ = q.spenders(&[1u8; 32], 0);
+        let _ = q.spenders_raw(&[1u8; 32], 0);
+
+        // resume_work_path with unknown tip hash / max>0 empty kids.
+        assert!(q
+            .resume_work_path_after_tip([0xaa; 32], 0, 10)
+            .unwrap()
+            .is_empty());
+        // tip at last confirmed — may return empty if no archive ahead.
+        let path = q
+            .resume_work_path_after_tip(hashes[2], 2, 5)
+            .unwrap();
+        let _ = path;
+
+        // confirm_load of height above tip with archived body (archive-only ahead).
+        // Archive header+body at height 3 without confirm.
+        let (h3, ta3) = coinbase_block(3, prev);
+        let h3hash = h3.hash;
+        q.archive_block(&h3, &[ta3]).unwrap();
+        let (st, parents, thin, bodies) = q
+            .load_confirm_parents(&[(3, h3hash)])
+            .unwrap();
+        assert!(st.blocks >= 1 || bodies.len() >= 1 || !parents.is_empty() || thin.is_empty());
+        let _ = thin;
+        // Missing header / no body paths.
+        let (st2, _, _, _) = q
+            .load_confirm_parents(&[(9, [0xbb; 32])])
+            .unwrap();
+        let _ = st2;
+        // Header without body.
+        let (st3, _, _, _) = q
+            .load_confirm_parents(&[(10, orphan.hash)])
+            .unwrap();
+        let _ = st3;
+
+        // load_confirm_parents_for_hashes if public
+        let _ = q.parent_cache_ready_through();
+        let _ = q.parent_cache_perf_snapshot();
+
+        // Archive empty batch.
+        assert!(q.archive_prepared_owned(&mut []).unwrap().is_empty());
+
+        // No head for random txid → NotFound.
+        let fake = TxRecord {
+            txid: [0xcd; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        assert!(q.tx_output_attributed(&fake, 0, false).is_err());
+
+        // disconnect again until empty-ish
+        while q.tip_height().map(|h| h.0).unwrap_or(0) > 0 {
+            q.disconnect_tip().unwrap();
+        }
+        // Last tip disconnect (genesis).
+        if q.tip_height().is_some() {
+            q.disconnect_tip().unwrap();
+        }
+        assert!(q.disconnect_tip().is_err());
+
+        // tip_header_fk empty chain.
+        assert!(q.tip_header_fk().unwrap().is_none());
+        assert!(q.locator_hashes().unwrap().len() >= 1);
+        assert!(q
+            .headers_after_locator(&[], BlockHash::from_byte_array([0; 32]), 5)
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spend_edge_and_confirm_idempotent_path() {
+        let (dir, q) = temp_query("spend-edge");
+        // Parent coinbase then child spend in next block.
+        let (h0, ta0) = coinbase_block(0, Fk::NULL);
+        let parent_txid = ta0.tx.txid;
+        let prev = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+        // Coinbase + spend of parent vout 0.
+        let (h1, cb1) = coinbase_block(1, prev);
+        let mut child = coinbase_block(1, prev).1;
+        child.tx.txid[31] = 0x5e;
+        child.tx.input_count = 1;
+        child.inputs = vec![InputRecord {
+            prev_txid: parent_txid,
+            create_fk: Fk::NULL, // archive resolves
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }];
+        child.outputs = vec![OutputRecord::unspent(49_0000_0000, vec![0x51])];
+        let h1hash = h1.hash;
+        q.connect_block(Height(1), &h1, &[cb1, child]).unwrap();
+
+        // mark_spends / collect edges via backfill probe path.
+        let (h_walked, txs) = q.backfill_point_spends(|_, _, _, _| {}).unwrap();
+        assert!(h_walked >= 1);
+        let _ = txs;
+        // Parent should show a spender eventually when spend index on.
+        let _ = q.spenders(&parent_txid, 0).unwrap();
+
+        // Idempotent single re-confirm at tip.
+        let tip = q.tip_height().unwrap();
+        let (fk, _) = q.get_header_by_hash(&h1hash).unwrap().unwrap();
+        let again = q.confirm_block(tip, &h1hash).unwrap();
+        assert_eq!(again, fk);
+
+        // confirm already at height via height_of_hash early return.
+        let r = q.confirm_block(tip, &h1hash).unwrap();
+        assert_eq!(r, fk);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

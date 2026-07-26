@@ -595,3 +595,699 @@ pub fn electrum_scripthash_hex(script: &[u8]) -> String {
     let h = script_hash(script);
     hash_hex_rev(&h)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rbitcoin_consensus::ChainParams;
+    use rbitcoin_query::Query;
+    use std::collections::HashSet;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpStream;
+
+    fn tmp_store() -> (std::path::PathBuf, Query) {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-electrum-ut-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        (dir, q)
+    }
+
+    #[test]
+    fn config_helpers_and_param_parsers() {
+        let params = ChainParams::regtest();
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        assert!(!cfg.genesis_hash_hex.is_empty());
+        assert!(cfg.banner.contains("rbitcoin"));
+
+        let sh = electrum_scripthash_hex(&[0x51]);
+        assert_eq!(sh.len(), 64);
+
+        assert_eq!(param_u32(&json!([3]), 0).unwrap(), 3);
+        assert_eq!(param_u32(&json!(["7"]), 0).unwrap(), 7);
+        assert!(param_u32(&json!([]), 0).is_err());
+        assert_eq!(param_str(&json!(["hi"]), 0).unwrap(), "hi");
+        assert!(param_str(&json!([1]), 0).is_err());
+
+        let mut sh_bytes = [0u8; 32];
+        sh_bytes[0] = 0xaa;
+        let sh_hex = hash_hex_rev(&sh_bytes);
+        let parsed = param_scripthash(&json!([sh_hex]), 0).unwrap();
+        assert_eq!(parsed, sh_bytes);
+        assert!(param_scripthash(&json!(["aa"]), 0).is_err());
+
+        let tid = param_txid(&json!([sh_hex]), 0).unwrap();
+        assert_eq!(tid, sh_bytes);
+
+        let empty_status = scripthash_status(&[]);
+        assert!(empty_status.is_empty());
+        let status = scripthash_status(&[rbitcoin_query::ScriptHashHistoryItem {
+            height: 1,
+            txid: [1u8; 32],
+        }]);
+        assert_eq!(status.len(), 64);
+
+        use bitcoin::hashes::Hash;
+        let hdr = bitcoin::block::Header {
+            version: bitcoin::block::Version::ONE,
+            prev_blockhash: bitcoin::BlockHash::from_byte_array([0; 32]),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0; 32]),
+            time: 0,
+            bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+            nonce: 0,
+        };
+        let hex = header_hex(&hdr);
+        assert_eq!(hex.len(), 160);
+    }
+
+    #[test]
+    fn dispatch_static_methods_and_errors() {
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let mut header_sub = false;
+        let mut sh_subs = HashSet::new();
+
+        let v = dispatch(
+            "server.version",
+            &json!([]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(v.as_array().unwrap().len() == 2);
+
+        assert!(dispatch(
+            "server.ping",
+            &json!([]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs
+        )
+        .unwrap()
+        .is_null());
+
+        assert_eq!(
+            dispatch(
+                "server.banner",
+                &json!([]),
+                &q,
+                &cfg,
+                &params,
+                None,
+                &mut header_sub,
+                &mut sh_subs
+            )
+            .unwrap()
+            .as_str()
+            .unwrap(),
+            cfg.banner
+        );
+
+        let features = dispatch(
+            "server.features",
+            &json!([]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert_eq!(features["protocol_min"], PROTOCOL_MIN);
+
+        assert!(dispatch(
+            "server.donation_address",
+            &json!([]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs
+        )
+        .unwrap()
+        .as_str()
+        .is_some());
+
+        assert_eq!(
+            dispatch(
+                "server.peers.subscribe",
+                &json!([]),
+                &q,
+                &cfg,
+                &params,
+                None,
+                &mut header_sub,
+                &mut sh_subs
+            )
+            .unwrap(),
+            json!([])
+        );
+
+        let fee = dispatch(
+            "blockchain.relayfee",
+            &json!([]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(fee.as_f64().is_some());
+
+        let est = dispatch(
+            "blockchain.estimatefee",
+            &json!([6]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert_eq!(est.as_f64(), Some(-1.0));
+
+        let hist = dispatch(
+            "mempool.get_fee_histogram",
+            &json!([]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert_eq!(hist, json!([]));
+
+        // No tip → headers.subscribe errors.
+        assert!(dispatch(
+            "blockchain.headers.subscribe",
+            &json!([]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs
+        )
+        .is_err());
+
+        assert!(dispatch(
+            "no.such.method",
+            &json!([]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs
+        )
+        .unwrap_err()
+        .contains("unknown method"));
+
+        // Empty-chain scripthash methods.
+        let sh = electrum_scripthash_hex(&[0x51]);
+        let empty_hist = dispatch(
+            "blockchain.scripthash.get_history",
+            &json!([sh]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert_eq!(empty_hist, json!([]));
+
+        let bal = dispatch(
+            "blockchain.scripthash.get_balance",
+            &json!([sh]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert_eq!(bal["confirmed"], 0);
+
+        let unspent = dispatch(
+            "blockchain.scripthash.listunspent",
+            &json!([sh]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert_eq!(unspent, json!([]));
+
+        let sub = dispatch(
+            "blockchain.scripthash.subscribe",
+            &json!([sh]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(sub.as_str().is_some());
+        assert_eq!(sh_subs.len(), 1);
+
+        let mem = dispatch(
+            "blockchain.scripthash.get_mempool",
+            &json!([sh]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert_eq!(mem, json!([]));
+
+        // Broadcast: bad hex fails before mempool gate.
+        assert!(dispatch(
+            "blockchain.transaction.broadcast",
+            &json!(["zz"]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs
+        )
+        .is_err());
+
+        // Non-empty hex that may fail deserialize or mempool gate — either is fine.
+        assert!(dispatch(
+            "blockchain.transaction.broadcast",
+            &json!(["01000000000000000000"]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn accept_client_ping_and_shutdown() {
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        let q = std::sync::Arc::new(q);
+        let (tip_tx, _) = broadcast::channel(4);
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let handle = run_electrum(cfg, q, params, tip_tx, None)
+            .await
+            .expect("listen");
+
+        let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
+        let req = json!({"jsonrpc":"2.0","id":1,"method":"server.ping","params":[]});
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        stream.write_all(line.as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(&mut stream);
+        let mut resp = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(3), reader.read_line(&mut resp))
+            .await
+            .expect("timeout")
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["id"], 1);
+        assert!(v.get("result").is_some());
+
+        // Empty line ignored; malformed JSON ignored; then version.
+        let stream = reader.into_inner();
+        stream.write_all(b"\n").await.unwrap();
+        stream.write_all(b"{not json\n").await.unwrap();
+        let mut line = serde_json::to_string(&json!({
+            "jsonrpc":"2.0","id":2,"method":"server.version","params":[]
+        }))
+        .unwrap();
+        line.push('\n');
+        stream.write_all(line.as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(stream);
+        resp.clear();
+        tokio::time::timeout(std::time::Duration::from_secs(3), reader.read_line(&mut resp))
+            .await
+            .expect("timeout")
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["id"], 2);
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dispatch_on_connected_chain() {
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        // Build 2-block synthetic chain.
+        let mut prev = Fk::NULL;
+        let mut hashes = Vec::new();
+        let mut first_txid = [0u8; 32];
+        for h in 0..2u32 {
+            let mut hash = [0u8; 32];
+            hash[0..4].copy_from_slice(&h.to_le_bytes());
+            hash[5] = 0xec;
+            let header = HeaderRecord {
+                prev_fk: prev,
+                version: 1,
+                timestamp: h + 1,
+                bits: 0x207fffff,
+                nonce: h,
+                merkle_root: hash,
+                hash,
+            };
+            let mut txid = [0u8; 32];
+            txid[0..4].copy_from_slice(&h.to_le_bytes());
+            txid[31] = 0xcb;
+            if h == 0 {
+                first_txid = txid;
+            }
+            let ta = TxApply {
+                tx: TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    create_fk: Fk::NULL,
+                    prev_index: u32::MAX,
+                    sequence: u32::MAX,
+                    script_sig: vec![h as u8],
+                    witness: vec![],
+                }],
+                outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+            };
+            hashes.push(hash);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+
+        let mut header_sub = false;
+        let mut sh_subs = HashSet::new();
+        let tip = dispatch(
+            "blockchain.headers.subscribe",
+            &json!([]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(header_sub);
+        assert_eq!(tip["height"], 1);
+
+        let hdr = dispatch(
+            "blockchain.block.header",
+            &json!([0]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert_eq!(hdr.as_str().unwrap().len(), 160);
+
+        let headers = dispatch(
+            "blockchain.block.headers",
+            &json!([0, 10]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(headers["count"].as_u64().unwrap() >= 2);
+
+        let txid_hex = {
+            let mut r = first_txid;
+            r.reverse();
+            rbitcoin_primitives::hex_encode(r)
+        };
+        let raw = dispatch(
+            "blockchain.transaction.get",
+            &json!([txid_hex]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(raw.as_str().unwrap().len() > 10);
+        let verbose = dispatch(
+            "blockchain.transaction.get",
+            &json!([txid_hex, true]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(verbose.get("hex").is_some());
+
+        let merkle = dispatch(
+            "blockchain.transaction.get_merkle",
+            &json!([txid_hex, 0]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert_eq!(merkle["block_height"], 0);
+
+        let idpos = dispatch(
+            "blockchain.transaction.id_from_pos",
+            &json!([0, 0]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert_eq!(idpos.as_str().unwrap(), txid_hex);
+
+        // Missing tx.
+        let miss = [0xeeu8; 32];
+        let mut miss_hex = miss;
+        miss_hex.reverse();
+        let miss_s = rbitcoin_primitives::hex_encode(miss_hex);
+        assert!(dispatch(
+            "blockchain.transaction.get",
+            &json!([miss_s]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs
+        )
+        .is_err());
+
+        // pos OOB
+        assert!(dispatch(
+            "blockchain.transaction.id_from_pos",
+            &json!([0, 99]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs
+        )
+        .is_err());
+
+        let sh = electrum_scripthash_hex(&[0x51]);
+        let hist = dispatch(
+            "blockchain.scripthash.get_history",
+            &json!([sh]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(!hist.as_array().unwrap().is_empty());
+        let bal = dispatch(
+            "blockchain.scripthash.get_balance",
+            &json!([sh]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(bal["confirmed"].as_i64().unwrap() > 0);
+        let unspent = dispatch(
+            "blockchain.scripthash.listunspent",
+            &json!([sh]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(!unspent.as_array().unwrap().is_empty());
+        let status = dispatch(
+            "blockchain.scripthash.subscribe",
+            &json!([sh]),
+            &q,
+            &cfg,
+            &params,
+            None,
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(!status.as_str().unwrap().is_empty());
+
+        let _ = hashes;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn tip_push_and_lagged_client() {
+        let (dir, q) = tmp_store();
+        // Need a tip for headers.subscribe; empty chain errors on subscribe.
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+        let mut hash = [0u8; 32];
+        hash[0] = 1;
+        let header = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 0,
+            merkle_root: hash,
+            hash,
+        };
+        let mut txid = [0u8; 32];
+        txid[31] = 0xcb;
+        let ta = TxApply {
+            tx: TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        q.connect_block(Height(0), &header, &[ta]).unwrap();
+
+        let params = ChainParams::regtest();
+        let q = std::sync::Arc::new(q);
+        let (tip_tx, _) = broadcast::channel(2);
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let handle = run_electrum(cfg, q, params, tip_tx.clone(), None)
+            .await
+            .unwrap();
+        let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
+        let mut line = serde_json::to_string(&json!({
+            "jsonrpc":"2.0","id":1,"method":"blockchain.headers.subscribe","params":[]
+        }))
+        .unwrap();
+        line.push('\n');
+        stream.write_all(line.as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(&mut stream);
+        let mut resp = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(3), reader.read_line(&mut resp))
+            .await
+            .unwrap()
+            .unwrap();
+        // Push tip notify.
+        tip_tx
+            .send(TipNotify {
+                height: 1,
+                header_hex: "aa".repeat(80),
+            })
+            .unwrap();
+        resp.clear();
+        tokio::time::timeout(std::time::Duration::from_secs(3), reader.read_line(&mut resp))
+            .await
+            .unwrap()
+            .unwrap();
+        let push: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(
+            push["method"].as_str(),
+            Some("blockchain.headers.subscribe")
+        );
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

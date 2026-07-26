@@ -506,3 +506,102 @@ fn usable_dial_addr(sa: &SocketAddr) -> bool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::sync::atomic::Ordering;
+
+    fn dummy_slot(id: usize) -> PeerSlot {
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        let task = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .spawn(async {});
+        PeerSlot {
+            id,
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 18444),
+            cmd_tx,
+            in_flight: HashSet::new(),
+            block_progress_ms: Arc::new(AtomicU64::new(0)),
+            peer_height: 100,
+            connected_ms: 1,
+            first_data_ms: AtomicU64::new(0),
+            bytes_rx: AtomicU64::new(0),
+            alive: true,
+            task,
+        }
+    }
+
+    #[test]
+    fn usable_dial_and_services_filters() {
+        assert!(services_useful_for_ibd(ServiceFlags::NETWORK));
+        assert!(services_useful_for_ibd(ServiceFlags::NETWORK_LIMITED));
+        assert!(!services_useful_for_ibd(ServiceFlags::NONE));
+
+        let good = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
+        assert!(usable_dial_addr(&good));
+        let zero_port = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 0);
+        assert!(!usable_dial_addr(&zero_port));
+        let unspec = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8333);
+        assert!(!usable_dial_addr(&unspec));
+        let bcast = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 8333);
+        assert!(!usable_dial_addr(&bcast));
+        let multi = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)), 8333);
+        assert!(!usable_dial_addr(&multi));
+        let v6_good = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8333);
+        assert!(usable_dial_addr(&v6_good));
+        let v6_unspec = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 8333);
+        assert!(!usable_dial_addr(&v6_unspec));
+    }
+
+    #[test]
+    fn speed_sample_and_progress_helpers() {
+        let mut s = dummy_slot(7);
+        assert!(s.speed_sample().is_none());
+        s.note_rx_bytes(0); // no-op
+        // first_data_ms==0 is treated as "no sample yet"; wait so mono ms > 0.
+        while ibd_mono_ms() == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        s.note_rx_bytes(32 * 1024);
+        assert!(s.speed_sample().is_none()); // need ≥64 KiB
+        s.note_rx_bytes(64 * 1024);
+        assert!(s.first_data_ms.load(Ordering::Relaxed) > 0);
+        let sample = s.speed_sample().expect("bps after ≥64KiB");
+        assert!(sample.1 > 0);
+
+        touch_block_progress(&s.block_progress_ms);
+        assert!(s.block_progress_ms.load(Ordering::Relaxed) > 0);
+        note_block_progress(std::slice::from_mut(&mut s), 7);
+        note_block_rx(std::slice::from_mut(&mut s), 7, 1000);
+        note_block_progress(std::slice::from_mut(&mut s), 99); // missing peer
+        note_block_rx(std::slice::from_mut(&mut s), 99, 1);
+        assert!(ibd_mono_ms() > 0);
+    }
+
+    #[test]
+    fn event_sinks_send_body_and_ctrl() {
+        let (body_tx, mut body_rx) = mpsc::unbounded_channel();
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+        let sinks = PeerEventSinks {
+            body: body_tx,
+            ctrl: ctrl_tx,
+        };
+        sinks.send_body(PeerEvent::Dead {
+            peer: 1,
+            reason: "x".into(),
+        });
+        sinks.send_ctrl(PeerEvent::Headers {
+            peer: 1,
+            headers: vec![],
+        });
+        assert!(matches!(body_rx.try_recv().unwrap(), PeerEvent::Dead { .. }));
+        assert!(matches!(
+            ctrl_rx.try_recv().unwrap(),
+            PeerEvent::Headers { .. }
+        ));
+    }
+}

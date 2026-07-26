@@ -133,4 +133,45 @@ mod tests {
             assert_eq!(used, buf.len());
         }
     }
+
+    #[test]
+    fn compact_and_uleb_error_paths() {
+        assert!(matches!(
+            read_compact_size(&[]),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(matches!(
+            read_compact_size(&[253, 1]),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(matches!(
+            read_compact_size(&[254, 1, 2, 3]),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(matches!(
+            read_compact_size(&[255, 1, 2, 3, 4, 5, 6, 7]),
+            Err(StoreError::Corrupt(_))
+        ));
+        // truncated multi-byte uleb128
+        assert!(matches!(
+            read_uleb128(&[0x80]),
+            Err(StoreError::Corrupt(_))
+        ));
+        // overflow: more than 10 continuation groups
+        let mut over = vec![0x80u8; 10];
+        over.push(0x01);
+        assert!(matches!(
+            read_uleb128(&over),
+            Err(StoreError::Corrupt(_))
+        ));
+        // happy truncated-size boundaries still parse when full
+        let (v, n) = read_compact_size(&[253, 0, 1]).unwrap();
+        assert_eq!((v, n), (256, 3));
+        let (v, n) = read_compact_size(&[254, 0, 0, 1, 0]).unwrap();
+        assert_eq!((v, n), (1 << 16, 5));
+        let mut u64b = vec![255u8];
+        u64b.extend_from_slice(&u64::MAX.to_le_bytes());
+        let (v, n) = read_compact_size(&u64b).unwrap();
+        assert_eq!((v, n), (u64::MAX, 9));
+    }
 }

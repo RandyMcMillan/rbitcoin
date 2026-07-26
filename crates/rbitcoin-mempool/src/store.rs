@@ -585,4 +585,47 @@ mod tests {
         assert_eq!(mp.generation(), 5);
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn append_mark_dead_stats_and_bad_magic() {
+        use bitcoin::hashes::Hash;
+        use bitcoin::Txid;
+
+        let dir = tmp_dir();
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        let txid = Txid::from_byte_array([0x11; 32]);
+        let slot = mp
+            .append_live_tx(&[0x01, 0x00, 0x00, 0x00], &txid, 10, 400)
+            .unwrap();
+        assert_eq!(mp.live_count(), 1);
+        let (free, live, dead) = mp.slot_stats();
+        assert_eq!(live, 1);
+        assert!(free + live + dead >= 1);
+        mp.mark_slot_dead(slot).unwrap();
+        assert_eq!(mp.live_count(), 0);
+        // OOB dead is corrupt.
+        assert!(mp.mark_slot_dead(u32::MAX).is_err());
+        drop(mp);
+
+        // Corrupt magic on meta.
+        let dir2 = tmp_dir();
+        {
+            let _ = Mempool::open_or_create(&dir2).unwrap();
+        }
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .open(dir2.join("meta"))
+                .unwrap();
+            f.write_all(b"BAD!").unwrap();
+        }
+        match Mempool::open_or_create(&dir2) {
+            Err(MempoolError::BadMagic) => {}
+            Ok(_) => panic!("expected BadMagic, got Ok"),
+            Err(e) => panic!("expected BadMagic, got {e}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
 }

@@ -149,4 +149,67 @@ mod tests {
         assert_eq!(apply.inputs.len(), 1);
         assert_eq!(apply.outputs[0].value, 50_0000_0000);
     }
+
+    #[test]
+    fn txid_count_mismatch_and_prev_null_genesis() {
+        use bitcoin::block::{Header, Version};
+        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
+
+        let tx = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x00, 0x01]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let header = Header {
+            version: Version::ONE,
+            prev_blockhash: BlockHash::from_byte_array([0; 32]),
+            merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+            time: 1,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        };
+        let txid = tx.compute_txid().to_byte_array();
+        // Mismatch paths.
+        assert!(matches!(
+            block_to_apply_with_txids_prev(Fk::NULL, &header, &[tx.clone()], &[]),
+            Err(ConsensusError::BadBlock(_))
+        ));
+        assert!(matches!(
+            block_to_apply_with_txids_prev(Fk::NULL, &header, &[], &[[0u8; 32]]),
+            Err(ConsensusError::BadBlock(_))
+        ));
+        let (rec, apps) =
+            block_to_apply_with_txids_prev(Fk::NULL, &header, &[tx], &[txid]).unwrap();
+        assert!(rec.prev_fk.is_null());
+        assert_eq!(apps.len(), 1);
+        // Coinbase-like max vout on null prev with MAX index.
+        let non_cb = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([1; 32]),
+                    vout: 3,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let apply = tx_to_apply(&non_cb, non_cb.compute_txid().to_byte_array()).unwrap();
+        assert_eq!(apply.inputs[0].prev_index, 3);
+    }
 }

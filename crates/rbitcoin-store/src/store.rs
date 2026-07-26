@@ -806,3 +806,345 @@ fn check_meta(dir: &Path) -> Result<(), StoreError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tx_table::{InputRecord, OutputRecord, TxRecord};
+
+    fn tmp() -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "rbitcoin-store-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    fn coinbase_item(txid: [u8; 32], outs: Vec<OutputRecord>) -> (TxRecord, Vec<InputRecord>, Vec<OutputRecord>) {
+        let n_out = outs.len() as u32;
+        (
+            TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: n_out,
+            },
+            vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+            outs,
+        )
+    }
+
+    #[test]
+    fn store_create_open_archive_spend_and_meta_errors() {
+        let dir = tmp();
+        // Not a directory when path is a file.
+        {
+            std::fs::write(&dir, b"x").unwrap();
+            assert!(matches!(
+                Store::create(&dir),
+                Err(StoreError::NotDirectory(_))
+            ));
+            let _ = std::fs::remove_file(&dir);
+        }
+        assert!(matches!(
+            Store::open(&dir),
+            Err(StoreError::NotDirectory(_))
+        ));
+
+        let s = Store::create(&dir).unwrap();
+        assert_eq!(s.path(), dir.as_path());
+        assert!(s.tip_height().is_none());
+        assert_eq!(s.header_count(), 0);
+        assert_eq!(s.archived_block_count().unwrap(), 0);
+        assert_eq!(s.spender_list_count(), 0);
+        assert!(!s.epoch().archive_mode);
+        s.set_archive_mode(true).unwrap();
+        assert!(s.epoch().archive_mode);
+
+        let hdr = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x1d00ffff,
+            nonce: 1,
+            merkle_root: [3u8; 32],
+            hash: [4u8; 32],
+        };
+        let hfk = s.put_header(&hdr).unwrap();
+        assert_eq!(s.get_header(hfk).unwrap().hash, [4u8; 32]);
+        assert_eq!(
+            s.get_header_by_hash(&[4u8; 32]).unwrap().unwrap().0,
+            hfk
+        );
+
+        let create = coinbase_item(
+            [10u8; 32],
+            vec![
+                OutputRecord::unspent(50, vec![0x51]),
+                OutputRecord::unspent(25, vec![0x51]),
+            ],
+        );
+        let fks = s.put_tx_full_batch_indexed(&[create], true).unwrap();
+        let create_fk = fks[0];
+        let (meta, outs) = s.get_tx_meta_and_outputs(create_fk).unwrap();
+        assert_eq!(meta.txid, [10u8; 32]);
+        assert_eq!(outs.len(), 2);
+        let full = s.get_tx_full(create_fk).unwrap();
+        assert_eq!(full.2.len(), 2);
+        let (m2, prevs) = s.get_tx_meta_and_prevouts(create_fk).unwrap();
+        assert_eq!(m2.txid, [10u8; 32]);
+        assert_eq!(prevs.len(), 1);
+        let (off, len) = s.tx_body_range(create_fk).unwrap();
+        assert_eq!(
+            s.get_tx_full_at(off, len).unwrap().0.txid,
+            [10u8; 32]
+        );
+        assert_eq!(
+            s.get_tx_meta_and_prevouts_at(off, len)
+                .unwrap()
+                .1
+                .len(),
+            1
+        );
+        assert_eq!(
+            s.get_tx_meta_and_outputs_at(off, len).unwrap().1.len(),
+            2
+        );
+        assert_eq!(s.get_fk_by_txid(&[10u8; 32]).unwrap(), Some(create_fk));
+        assert_eq!(
+            s.get_tx_by_txid(&[10u8; 32]).unwrap().unwrap().0,
+            create_fk
+        );
+
+        // Second tx spends create vout 0.
+        let spend = (
+            TxRecord {
+                txid: [11u8; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![InputRecord {
+                prev_txid: [10u8; 32],
+                create_fk,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            vec![OutputRecord::unspent(49, vec![0x51])],
+        );
+        let spend_fk = s.put_tx_full_batch_indexed(&[spend], true).unwrap()[0];
+        s.put_spend_create(create_fk, 0, spend_fk).unwrap();
+        // Idempotent re-annotate same sole spender.
+        s.put_spend_create(create_fk, 0, spend_fk).unwrap();
+        // Multi promote: second spender.
+        let spend2 = (
+            TxRecord {
+                txid: [12u8; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![InputRecord {
+                prev_txid: [10u8; 32],
+                create_fk,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        );
+        let spend2_fk = s.put_tx_full_batch_indexed(&[spend2], true).unwrap()[0];
+        s.put_spend_create(create_fk, 0, spend2_fk).unwrap();
+        assert!(s.spender_list_count() >= 2);
+
+        // Third spender prepends multi list.
+        let spend3 = (
+            TxRecord {
+                txid: [13u8; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![InputRecord {
+                prev_txid: [10u8; 32],
+                create_fk,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        );
+        let spend3_fk = s.put_tx_full_batch_indexed(&[spend3], true).unwrap()[0];
+        s.put_spend(&[10u8; 32], 0, spend3_fk, 0).unwrap();
+        s.put_spend_batch(&[([10u8; 32], 1, spend_fk, 0)]).unwrap();
+        s.put_spend_batch_by_create(&[(create_fk, 1, spend2_fk)])
+            .unwrap();
+        let (off, len) = s.tx_body_range(create_fk).unwrap();
+        s.put_spend_create_at(create_fk, 1, spend3_fk, off, len)
+            .unwrap();
+        s.put_spend_batch_by_create_ranged(&[]).unwrap();
+        // Re-annotate vout1 with ranged multi path already multi.
+        s.put_spend_batch_by_create_ranged(&[(create_fk, 1, spend_fk, off, len)])
+            .unwrap();
+
+        // Class C: confirm spenders + heights.
+        s.confirmed.set(Height(0), hfk).unwrap();
+        s.strong_tx.set_strong(spend_fk, hfk).unwrap();
+        s.tx_height.set(spend_fk, Height(0)).unwrap();
+        assert!(s.is_confirmed_strong(spend_fk).unwrap());
+        assert!(!s.is_confirmed_strong(spend2_fk).unwrap());
+        assert!(s
+            .has_confirmed_strong_spender_create(create_fk, 0, Some((off, len)))
+            .unwrap());
+        assert!(s
+            .has_confirmed_strong_spender(&[10u8; 32], 0)
+            .unwrap());
+        let unspent = s
+            .unspent_create_vouts(create_fk, &[0, 1], Some((off, len)))
+            .unwrap();
+        // vout 0 has confirmed strong spender; vout1 multi without strong may still be unspent
+        assert!(!unspent.contains(&0));
+        let raw = s.spenders_raw(&[10u8; 32], 0).unwrap();
+        assert!(raw.len() >= 2);
+        let strong_sp = s.spenders(&[10u8; 32], 0).unwrap();
+        assert_eq!(strong_sp.len(), 1);
+        assert_eq!(strong_sp[0].spending_tx_fk, spend_fk);
+
+        // Batch helpers
+        let ranges = s.tx_body_range_batch(&[create_fk, spend_fk]).unwrap();
+        assert_eq!(ranges.len(), 2);
+        let full_b = s
+            .get_tx_full_batch_at(&[(create_fk, off, len)])
+            .unwrap();
+        assert!(full_b[0].is_some());
+        let outs_b = s.get_tx_meta_and_outputs_batch_at(&[(off, len)]).unwrap();
+        assert!(outs_b[0].is_some());
+        let heights = s.tx_height_get_batch(&[spend_fk, create_fk]).unwrap();
+        assert_eq!(heights[0], Some(0));
+
+        s.header_txs
+            .put_range(hfk, create_fk, 1)
+            .unwrap();
+        assert_eq!(s.archived_block_count().unwrap(), 1);
+        s.flush_header_archive().unwrap();
+        s.flush_index_tables().unwrap();
+        s.flush_for_shutdown().unwrap();
+        s.finalize_through(0).unwrap();
+        assert_eq!(s.epoch().finalized_height, Some(0));
+
+        // repair: strong above tip
+        s.strong_tx.set_strong(spend2_fk, hfk).unwrap();
+        s.tx_height.set(spend2_fk, Height(99)).unwrap();
+        let cleared = s.repair_class_c_above_tip().unwrap();
+        assert!(cleared >= 1);
+        assert!(!s.is_confirmed_strong(spend2_fk).unwrap());
+
+        s.flush().unwrap();
+        drop(s);
+
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.header_count(), 1);
+        let s2 = Store::open_or_create(&dir).unwrap();
+        assert_eq!(s2.header_count(), 1);
+        drop(s2);
+
+        // open_or_create on fresh path
+        let dir2 = tmp();
+        let s3 = Store::open_or_create(&dir2).unwrap();
+        assert_eq!(s3.header_count(), 0);
+        drop(s3);
+
+        // meta errors
+        assert!(matches!(
+            check_meta(std::path::Path::new("/no/such")),
+            Err(StoreError::Io { .. })
+        ));
+        {
+            let bad = tmp();
+            std::fs::create_dir_all(&bad).unwrap();
+            std::fs::write(bad.join("meta"), b"xx").unwrap();
+            assert!(matches!(
+                check_meta(&bad),
+                Err(StoreError::Corrupt(_))
+            ));
+            std::fs::write(bad.join("meta"), b"XXXX\x00\x00").unwrap();
+            assert!(matches!(check_meta(&bad), Err(StoreError::BadMagic)));
+            let mut good_magic = STORE_MAGIC.to_vec();
+            good_magic.extend_from_slice(&0u16.to_le_bytes());
+            // wrong schema if 0 != SCHEMA_VERSION
+            if SCHEMA_VERSION != 0 {
+                std::fs::write(bad.join("meta"), &good_magic).unwrap();
+                assert!(matches!(
+                    check_meta(&bad),
+                    Err(StoreError::BadSchema(_))
+                ));
+            }
+            let _ = std::fs::remove_dir_all(&bad);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// Upgrade open paths: missing optional tables recreated; unspent without range.
+    #[test]
+    fn store_open_upgrade_missing_tables_and_unspent_no_range() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            let create = coinbase_item(
+                [20u8; 32],
+                vec![OutputRecord::unspent(10, vec![0x51])],
+            );
+            let fk = s.put_tx_full_batch_indexed(&[create], true).unwrap()[0];
+            s.flush().unwrap();
+            drop(s);
+            // Remove optional tables so open recreate branches run.
+            let _ = std::fs::remove_file(dir.join("scripthash.body"));
+            let _ = std::fs::remove_dir_all(dir.join("scripthash.head"));
+            let _ = std::fs::remove_file(dir.join("scripthash.head"));
+            let _ = std::fs::remove_file(dir.join("header_txs_first.body"));
+            let _ = std::fs::remove_file(dir.join("header_txs_count.body"));
+            let _ = std::fs::remove_file(dir.join("tx_height.body"));
+            let s = Store::open(&dir).unwrap();
+            assert_eq!(s.get_tx(fk).unwrap().txid, [20u8; 32]);
+            // unspent without body_range
+            let u = s
+                .unspent_create_vouts(fk, &[0], None)
+                .unwrap();
+            assert_eq!(u, vec![0]);
+            // empty vouts
+            assert!(s.unspent_create_vouts(fk, &[], None).unwrap().is_empty());
+            // has_confirmed without range, no spender
+            assert!(!s
+                .has_confirmed_strong_spender_create(fk, 0, None)
+                .unwrap());
+            assert!(!s.has_confirmed_strong_spender(&[20u8; 32], 0).unwrap());
+            assert!(s.spenders_raw(&[20u8; 32], 0).unwrap().is_empty());
+            assert!(s.spenders(&[9u8; 32], 0).unwrap().is_empty());
+            assert_eq!(s.repair_class_c_above_tip().unwrap(), 0);
+            drop(s);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

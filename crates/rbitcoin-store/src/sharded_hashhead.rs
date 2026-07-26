@@ -317,4 +317,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn shard_helpers_and_error_paths() {
+        // Under cfg(test) / cargo-test binary default scale is Tiny → 1 shard.
+        assert_eq!(shard_count_for_scale(), 1);
+        assert_eq!(shard_count_for_role(HeadRole::Header), 1);
+        assert_eq!(shard_count_for_role(HeadRole::ScriptHash), 1);
+        assert_eq!(initial_slots_per_shard(HeadRole::Header), 64);
+
+        let dir = tmp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        // create_sharded n==1 uses single file.
+        let path = dir.join("one");
+        let h = ShardedHashHead::create_sharded(&path, 1, 32).unwrap();
+        assert_eq!(h.shards.len(), 1);
+        assert!(path.is_file());
+        h.insert_many(&[]).unwrap();
+        h.flush().unwrap();
+        h.flush_async().unwrap();
+        drop(h);
+
+        // create_sharded path exists
+        let path2 = dir.join("exists");
+        std::fs::create_dir_all(&path2).unwrap();
+        assert!(ShardedHashHead::create_sharded(&path2, 4, 64).is_err());
+
+        // empty dir open
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(matches!(
+            ShardedHashHead::open_for_role(&empty, HeadRole::Header),
+            Err(StoreError::Corrupt(_))
+        ));
+
+        // missing path
+        let missing = dir.join("nope");
+        assert!(ShardedHashHead::open_for_role(&missing, HeadRole::Header).is_err());
+
+        // create_for_role under tiny (single-file header head)
+        let role_path = dir.join("role");
+        let h = ShardedHashHead::create_for_role(&role_path, HeadRole::Header).unwrap();
+        assert_eq!(h.shards.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -482,4 +482,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
+
+    #[test]
+    fn package_codec_errors_and_query_utxo_miss() {
+        // Truncated length prefix.
+        assert!(decode_len_prefixed_package(&[1, 2, 3]).is_err());
+        // Length claims more than remaining.
+        let mut bad = 100u32.to_le_bytes().to_vec();
+        bad.extend_from_slice(&[0u8; 4]);
+        assert!(decode_len_prefixed_package(&bad).is_err());
+        // Empty package ok.
+        assert!(decode_len_prefixed_package(&[]).unwrap().is_empty());
+        // Garbage tx body.
+        let mut junk = 4u32.to_le_bytes().to_vec();
+        junk.extend_from_slice(&[0xff; 4]);
+        assert!(decode_len_prefixed_package(&junk).is_err());
+
+        let store_dir = tmp();
+        let q = Query::open_or_create(&store_dir).unwrap();
+        let provider = QueryUtxoProvider { query: &q };
+        let op = OutPoint {
+            txid: Txid::from_byte_array([0xcd; 32]),
+            vout: 0,
+        };
+        assert!(provider.get_txout(&op).is_none());
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
 }

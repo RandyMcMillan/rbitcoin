@@ -270,4 +270,124 @@ mod tests {
             PolicyResult::NonStandard("libre annex")
         );
     }
+
+    #[test]
+    fn policy_result_is_ok_alias() {
+        assert!(PolicyResult::Standard.is_ok());
+        assert!(!PolicyResult::NonStandard("x").is_ok());
+    }
+
+    #[test]
+    fn push_only_allows_op_n_and_rejects_decode_error() {
+        // OP_1NEGATE (0x4f) and OP_1 (0x51) are push-like.
+        assert!(is_push_only(ScriptBuf::from_bytes(vec![0x4f, 0x51]).as_script()));
+        // Truncated push: instruction decode fails → not push-only.
+        assert!(!is_push_only(ScriptBuf::from_bytes(vec![0x02, 0xaa]).as_script()));
+        // OP_CHECKSIG is not push-only.
+        assert!(!is_push_only(ScriptBuf::from_bytes(vec![0xac]).as_script()));
+    }
+
+    #[test]
+    fn standard_script_pubkey_templates_and_rejects() {
+        assert_eq!(
+            is_standard_script_pubkey(ScriptBuf::new().as_script()),
+            PolicyResult::NonStandard("empty scriptPubKey")
+        );
+        // P2WSH
+        let mut p2wsh = vec![0x00, 0x20];
+        p2wsh.extend([0u8; 32]);
+        assert!(is_standard_script_pubkey(ScriptBuf::from_bytes(p2wsh).as_script()).is_standard());
+        // P2TR
+        let mut p2tr = vec![0x51, 0x20];
+        p2tr.extend([0u8; 32]);
+        assert!(is_standard_script_pubkey(ScriptBuf::from_bytes(p2tr).as_script()).is_standard());
+        // P2PKH
+        let mut p2pkh = vec![0x76, 0xa9, 0x14];
+        p2pkh.extend([0u8; 20]);
+        p2pkh.extend([0x88, 0xac]);
+        assert!(is_standard_script_pubkey(ScriptBuf::from_bytes(p2pkh).as_script()).is_standard());
+        // P2SH
+        let mut p2sh = vec![0xa9, 0x14];
+        p2sh.extend([0u8; 20]);
+        p2sh.push(0x87);
+        assert!(is_standard_script_pubkey(ScriptBuf::from_bytes(p2sh).as_script()).is_standard());
+        // Bare OP_NOP
+        assert_eq!(
+            is_standard_script_pubkey(ScriptBuf::from_bytes(vec![0x61]).as_script()),
+            PolicyResult::NonStandard("nonstandard scriptPubKey")
+        );
+    }
+
+    #[test]
+    fn check_tx_standard_scriptsig_and_op_return() {
+        // Non-push scriptSig on non-coinbase → NonStandard.
+        let mut tx = bare_tx(1);
+        tx.input[0].script_sig = ScriptBuf::from_bytes(vec![0xac]);
+        assert_eq!(
+            check_tx_standard(&tx),
+            PolicyResult::NonStandard("scriptSig not push-only")
+        );
+        // OP_RETURN outputs allowed even when nonstandard template.
+        let mut ok = bare_tx(1);
+        ok.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x6a, 0x01, 0xff]);
+        assert!(check_tx_standard(&ok).is_standard());
+        // Empty OP_TRUE was already nonstandard under Core-style; OP_TRUE alone rejected.
+        let bad = bare_tx(1);
+        assert!(!check_tx_standard(&bad).is_standard());
+    }
+
+    #[test]
+    fn vsize_fee_zero_and_libre_gates() {
+        assert!(!meets_min_relay_fee(1, 0));
+        assert_eq!(fee_rate_sat_per_kvb(100, 0), 0);
+        assert_eq!(get_virtual_size(1), 1);
+
+        // Coinbase rejected.
+        let cb = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x00, 0x01]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(50),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        assert_eq!(
+            check_libre_admission(&cb, 0, 100),
+            PolicyResult::NonStandard("coinbase")
+        );
+
+        // No inputs / no outputs.
+        let mut no_in = bare_tx(1);
+        no_in.input.clear();
+        assert_eq!(
+            check_libre_admission(&no_in, 1000, 100),
+            PolicyResult::NonStandard("no inputs")
+        );
+        let mut no_out = bare_tx(1);
+        no_out.output.clear();
+        assert_eq!(
+            check_libre_admission(&no_out, 1000, 100),
+            PolicyResult::NonStandard("no outputs")
+        );
+
+        // Weight cap.
+        let tx = bare_tx(1);
+        assert_eq!(
+            check_libre_admission(&tx, 1_000_000, MAX_STANDARD_TX_WEIGHT + 1),
+            PolicyResult::NonStandard("tx weight")
+        );
+
+        // Annex not tagged 0x50 is ignored by is_annex_standard.
+        assert!(is_annex_standard(&[0x01, 0x02]));
+        // Libre annex scan: non-annex last item is fine.
+        let mut ok = bare_tx(1);
+        ok.input[0].witness = Witness::from_slice(&[vec![0x01], vec![0x02]]);
+        assert!(check_libre_annex(&ok).is_standard());
+    }
 }

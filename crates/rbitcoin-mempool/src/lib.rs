@@ -38,3 +38,11 @@ pub use store::{Mempool, MempoolMeta, MEM_MAGIC, MEM_SCHEMA};
 pub fn crate_name() -> &'static str {
     "rbitcoin-mempool"
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn crate_name_stable() {
+        assert_eq!(crate::crate_name(), "rbitcoin-mempool");
+    }
+}

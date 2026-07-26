@@ -84,3 +84,99 @@ pub(crate) fn work_path_tips(st: &IbdWorkState) -> Vec<BlockHash> {
     tips
 }
 
+#[cfg(test)]
+mod tests {
+    use super::work_path_tips;
+    use super::super::state::IbdWorkState;
+    use bitcoin::hashes::Hash;
+    use bitcoin::BlockHash;
+
+    fn h(n: u8) -> BlockHash {
+        let mut b = [0u8; 32];
+        b[0] = n;
+        BlockHash::from_byte_array(b)
+    }
+
+    #[test]
+    fn work_path_tips_from_ordered_newest_first() {
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(10));
+        // ordered is tip→far (front near tip); tips take from the back (highest).
+        for n in 1u8..=6 {
+            let hash = h(n);
+            st.ordered.push_back(hash);
+            st.ordered_set.insert(hash);
+            st.record_height(hash, 10 + u32::from(n));
+        }
+        let tips = work_path_tips(&st);
+        assert_eq!(tips.len(), 4);
+        assert_eq!(tips[0], h(6));
+        assert_eq!(tips[1], h(5));
+        assert_eq!(tips[2], h(4));
+        assert_eq!(tips[3], h(3));
+    }
+
+    #[test]
+    fn work_path_tips_skips_ghosts_and_falls_back_to_hash_height() {
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(0));
+        // Ghost: in deque but not ordered_set.
+        st.ordered.push_back(h(1));
+        st.ordered.push_back(h(2));
+        // No live ordered members → fall back to max height in hash_height.
+        st.record_height(h(9), 99);
+        st.record_height(h(8), 50);
+        let tips = work_path_tips(&st);
+        assert_eq!(tips, vec![h(9)]);
+
+        // Empty everything → empty tips.
+        let empty = IbdWorkState::new(Vec::new(), None, None);
+        assert!(work_path_tips(&empty).is_empty());
+    }
+
+    #[test]
+    fn work_path_tips_respects_live_set_only() {
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(1));
+        st.ordered.push_back(h(1));
+        st.ordered.push_back(h(2));
+        st.ordered.push_back(h(3));
+        st.ordered_set.insert(h(1));
+        st.ordered_set.insert(h(3)); // h(2) is a middle ghost
+        let tips = work_path_tips(&st);
+        // rev walk: 3 (live), 2 (ghost skip), 1 (live) — only set members.
+        assert_eq!(tips, vec![h(3), h(1)]);
+    }
+
+    #[test]
+    fn seed_work_path_from_empty_and_genesis_store() {
+        use super::seed_work_path_from_store;
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_query::Query;
+
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-path-seed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        // Empty store: tip_hash is None → seed returns immediately.
+        let mut st = IbdWorkState::new(Vec::new(), None, None);
+        seed_work_path_from_store(&mut st, &hub);
+        assert!(st.ordered.is_empty());
+
+        hub.ensure_genesis().unwrap();
+        let mut st2 = IbdWorkState::new(
+            Vec::new(),
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        seed_work_path_from_store(&mut st2, &hub);
+        // Resume path after tip may be empty (no headers beyond tip).
+        assert!(!st2.headers_done); // always left open for peer tip
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+

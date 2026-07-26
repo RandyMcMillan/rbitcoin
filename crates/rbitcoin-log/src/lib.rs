@@ -315,4 +315,73 @@ mod tests {
     fn crate_name_stable() {
         assert_eq!(crate_name(), "rbitcoin-log");
     }
+
+    #[test]
+    fn level_as_str_all_variants() {
+        assert_eq!(Level::Error.as_str(), "ERROR");
+        assert_eq!(Level::Debug.as_str(), "DEBUG");
+        assert_eq!(Level::Trace.as_str(), "TRACE");
+        assert_eq!(Level::parse("off"), None);
+        assert_eq!(Level::parse("none"), None);
+        assert_eq!(Level::parse("0"), None);
+        assert_eq!(Level::parse("e"), Some(Level::Error));
+        assert_eq!(Level::parse("w"), Some(Level::Warn));
+        assert_eq!(Level::parse("i"), Some(Level::Info));
+        assert_eq!(Level::parse("d"), Some(Level::Debug));
+    }
+
+    #[test]
+    fn max_level_maps_all_stored_values() {
+        init(Level::Error);
+        assert_eq!(max_level(), Some(Level::Error));
+        init(Level::Debug);
+        assert_eq!(max_level(), Some(Level::Debug));
+        init(Level::Trace);
+        assert_eq!(max_level(), Some(Level::Trace));
+        assert!(enabled(Level::Trace));
+        init(Level::Info);
+    }
+
+    #[test]
+    fn init_from_env_off_and_level() {
+        // Save/restore around env mutation for process safety.
+        let prev_rb = std::env::var_os("RBITCOIN_LOG");
+        let prev_rust = std::env::var_os("RUST_LOG");
+        std::env::remove_var("RUST_LOG");
+        std::env::set_var("RBITCOIN_LOG", "debug");
+        assert!(init_from_env());
+        assert_eq!(max_level(), Some(Level::Debug));
+        std::env::set_var("RBITCOIN_LOG", "off");
+        assert!(init_from_env());
+        assert_eq!(max_level(), None);
+        std::env::set_var("RBITCOIN_LOG", "none");
+        assert!(init_from_env());
+        std::env::set_var("RBITCOIN_LOG", "0");
+        assert!(init_from_env());
+        std::env::set_var("RBITCOIN_LOG", "not-a-level");
+        assert!(!init_from_env());
+        std::env::remove_var("RBITCOIN_LOG");
+        // RUST_LOG fallback.
+        std::env::set_var("RUST_LOG", "warn");
+        assert!(init_from_env());
+        assert_eq!(max_level(), Some(Level::Warn));
+        std::env::remove_var("RBITCOIN_LOG");
+        std::env::remove_var("RUST_LOG");
+        assert!(!init_from_env());
+        match prev_rb {
+            Some(v) => std::env::set_var("RBITCOIN_LOG", v),
+            None => std::env::remove_var("RBITCOIN_LOG"),
+        }
+        match prev_rust {
+            Some(v) => std::env::set_var("RUST_LOG", v),
+            None => std::env::remove_var("RUST_LOG"),
+        }
+        // max_level maps Warn branch explicitly.
+        init(Level::Warn);
+        assert_eq!(max_level(), Some(Level::Warn));
+        // Bold style path (non-TTY → plain write arm still executed).
+        init(Level::Error);
+        log_at_style(Level::Error, Style::Bold, format_args!("bold-err"));
+        init(Level::Info);
+    }
 }

@@ -578,10 +578,17 @@ pub(crate) fn apply_confirm_reject(st: &mut IbdWorkState, height: u32, hash: Blo
 
 #[cfg(test)]
 mod confirm_reject_tests {
-    use super::apply_confirm_reject;
+    use super::{
+        apply_archive_result, apply_confirm_reject, parent_height, update_confirm_lag,
+        disconnect_all_peers,
+    };
+    use super::super::archive::{ArchiveQueueBudget, ArchiveResult};
     use super::super::state::IbdWorkState;
+    use super::super::status::LoopStats;
     use bitcoin::hashes::Hash;
     use bitcoin::BlockHash;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     fn h(n: u8) -> BlockHash {
         let mut b = [0u8; 32];
@@ -638,6 +645,333 @@ mod confirm_reject_tests {
         );
         assert!(st.body.is_rejected(&hash));
         assert!(!st.ordered_set.contains(&hash));
+    }
+
+    #[test]
+    fn parent_height_zero_map_and_unknown() {
+        let mut map = HashMap::new();
+        let zero = BlockHash::from_byte_array([0u8; 32]);
+        assert_eq!(parent_height(&map, &dummy_hub(), zero), Some(0));
+        map.insert(h(1), 40);
+        assert_eq!(parent_height(&map, &dummy_hub(), h(1)), Some(41));
+        assert_eq!(parent_height(&map, &dummy_hub(), h(99)), None);
+    }
+
+    fn dummy_hub() -> crate::chain::ChainHub {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-ev-parent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = rbitcoin_query::Query::open_or_create(dir.join("store")).unwrap();
+        // Leak dir for process lifetime of test (cleaned by OS tmp).
+        crate::chain::ChainHub::new(
+            q,
+            rbitcoin_consensus::ChainParams::regtest(),
+            rbitcoin_consensus::Milestone::NONE,
+        )
+    }
+
+    #[test]
+    fn apply_archive_result_ok_dropped_err_and_lag() {
+        let budget = ArchiveQueueBudget::new(16 * 1024 * 1024);
+        let stats = LoopStats::default();
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(10));
+        let ok_h = h(1);
+        st.record_height(ok_h, 20);
+        st.body.mark_archive_charged(ok_h);
+        budget.charge(1000);
+        apply_archive_result(
+            &mut st,
+            ArchiveResult::Ok {
+                hash: ok_h,
+                wire_bytes: 1000,
+            },
+            &budget,
+            &stats,
+        );
+        assert!(st.body.is_known_archived(&ok_h));
+        assert!(!st.body.is_archive_charged(&ok_h));
+        assert_eq!(st.max_archived_height, 20);
+        assert_eq!(budget.count(), 0);
+        assert_eq!(stats.archived_bodies.load(Ordering::Relaxed), 1);
+        // Second Ok does not double-count first-archive.
+        budget.charge(1000);
+        st.body.mark_archive_charged(ok_h);
+        apply_archive_result(
+            &mut st,
+            ArchiveResult::Ok {
+                hash: ok_h,
+                wire_bytes: 1000,
+            },
+            &budget,
+            &stats,
+        );
+        assert_eq!(stats.archived_bodies.load(Ordering::Relaxed), 1);
+
+        let drop_h = h(2);
+        st.body.mark_archive_charged(drop_h);
+        budget.charge(500);
+        apply_archive_result(
+            &mut st,
+            ArchiveResult::Dropped {
+                hash: drop_h,
+                wire_bytes: 500,
+                requeue: true,
+            },
+            &budget,
+            &stats,
+        );
+        assert_eq!(st.body.skip_download_cached(&drop_h), Some(false)); // missing
+
+        let err_h = h(3);
+        st.body.mark_archive_charged(err_h);
+        budget.charge(200);
+        apply_archive_result(
+            &mut st,
+            ArchiveResult::Err {
+                hash: err_h,
+                err: "boom".into(),
+                wire_bytes: 200,
+            },
+            &budget,
+            &stats,
+        );
+        assert_eq!(st.body.skip_download_cached(&err_h), Some(false));
+
+        let lag = AtomicU32::new(0);
+        update_confirm_lag(&lag, Some(5), 20);
+        assert_eq!(lag.load(Ordering::Relaxed), 15);
+        update_confirm_lag(&lag, None, 3);
+        assert_eq!(lag.load(Ordering::Relaxed), 3);
+
+        // No peers → disconnect is a no-op.
+        disconnect_all_peers(&mut st);
+        assert!(st.slots.is_empty());
+    }
+
+    #[test]
+    fn apply_peer_event_body_and_control_surface() {
+        use super::{apply_peer_event, inject_learned_addrs, drain_ready_peer_and_archive_events};
+        use super::super::archive::ArchiveQueueBudget;
+        use super::super::peer_io::{PeerEvent, PeerSlot};
+        use super::super::state::InflightReq;
+        use crate::seeds::AddrMan;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::CompactTarget;
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_query::Query;
+        use std::collections::HashSet;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::atomic::{AtomicU32, AtomicU64};
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        fn addr(o: u8) -> SocketAddr {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 0, o)), 18444)
+        }
+        fn dummy_slot(id: usize, a: SocketAddr) -> PeerSlot {
+            let (cmd_tx, _rx) = mpsc::unbounded_channel();
+            let task = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .spawn(async {});
+            PeerSlot {
+                id,
+                addr: a,
+                cmd_tx,
+                in_flight: HashSet::new(),
+                block_progress_ms: Arc::new(AtomicU64::new(0)),
+                peer_height: 10,
+                connected_ms: 1,
+                first_data_ms: AtomicU64::new(0),
+                bytes_rx: AtomicU64::new(0),
+                alive: true,
+                task,
+            }
+        }
+        fn dummy_header(prev: BlockHash, n: u8) -> Header {
+            Header {
+                version: Version::ONE,
+                prev_blockhash: prev,
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([n; 32]),
+                time: 1_300_000_000 + u32::from(n),
+                bits: CompactTarget::from_consensus(0x207fffff),
+                nonce: u32::from(n),
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-ev-apply-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+
+        let mut st = IbdWorkState::new(vec![dummy_slot(1, addr(1))], Some(gen), Some(0));
+        st.slots[0].in_flight.insert(h(9));
+        st.inflight.insert(h(9), InflightReq::new(1));
+
+        let (arch_tx, _arch_job_rx) = mpsc::unbounded_channel();
+        let (_arch_res_tx, mut arch_res_rx) = mpsc::unbounded_channel();
+        let budget = ArchiveQueueBudget::new(16 * 1024 * 1024);
+        let write_next = AtomicU32::new(1);
+        let mut book = AddrMan::new();
+        let local = addr(99);
+
+        // BlockFramed frees inflight + marks pending.
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::BlockFramed {
+                peer: 1,
+                hash: h(9),
+                wire_bytes: 100,
+            },
+            &arch_tx,
+            &budget,
+            &write_next,
+            &mut book,
+            local,
+        );
+        assert!(st.inflight.is_empty());
+        assert!(st.body.is_pending(&h(9)));
+
+        // Decode fail → missing so re-getdata allowed.
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::BlockDecodeFailed {
+                peer: 1,
+                hash: h(9),
+            },
+            &arch_tx,
+            &budget,
+            &write_next,
+            &mut book,
+            local,
+        );
+        assert!(!st.body.is_pending(&h(9)));
+
+        // Headers: attach height from tip parent and order.
+        let hdr = dummy_header(gen, 1);
+        let hash = hdr.block_hash();
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::Headers {
+                peer: 1,
+                headers: vec![hdr],
+            },
+            &arch_tx,
+            &budget,
+            &write_next,
+            &mut book,
+            local,
+        );
+        assert!(st.known_headers.contains(&hash));
+        assert!(st.ordered_set.contains(&hash) || st.hash_height.contains_key(&hash));
+
+        // Empty headers with lag → keep headers_done false.
+        st.max_peer_height = 100;
+        st.empty_header_streak = 0;
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::Headers {
+                peer: 1,
+                headers: vec![],
+            },
+            &arch_tx,
+            &budget,
+            &write_next,
+            &mut book,
+            local,
+        );
+        assert!(!st.headers_done);
+
+        // NotFound clears peer inflight.
+        st.slots[0].in_flight.insert(h(3));
+        st.inflight.insert(h(3), InflightReq::new(1));
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::NotFound {
+                peer: 1,
+                hashes: vec![h(3)],
+            },
+            &arch_tx,
+            &budget,
+            &write_next,
+            &mut book,
+            local,
+        );
+        assert!(!st.inflight.contains_key(&h(3)));
+
+        // Addrs + inject filter.
+        inject_learned_addrs(&mut book, &[], local, 1);
+        inject_learned_addrs(
+            &mut book,
+            &[addr(2), local, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1)],
+            local,
+            1,
+        );
+        assert!(book.entry(&addr(2)).is_some());
+
+        // Dead releases work.
+        st.slots[0].in_flight.insert(h(4));
+        st.inflight.insert(h(4), InflightReq::new(1));
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::Dead {
+                peer: 1,
+                reason: "bye".into(),
+            },
+            &arch_tx,
+            &budget,
+            &write_next,
+            &mut book,
+            local,
+        );
+        assert!(!st.slots[0].alive);
+        assert!(!st.inflight.contains_key(&h(4)));
+
+        // Drain empty channels.
+        let (body_tx, mut body_rx) = mpsc::unbounded_channel();
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+        let stats = LoopStats::default();
+        let ok = drain_ready_peer_and_archive_events(
+            &mut st,
+            &hub,
+            &mut body_rx,
+            &mut ctrl_rx,
+            &mut arch_res_rx,
+            &arch_tx,
+            &budget,
+            &write_next,
+            &stats,
+            &mut book,
+            local,
+        )
+        .unwrap();
+        assert!(ok);
+        drop(body_tx);
+        drop(ctrl_tx);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

@@ -1826,6 +1826,36 @@ mod finality_tests {
         let tx = bare_tx(1, LockTime::ZERO, Sequence::from_consensus(10));
         assert!(sequence_locks_satisfied(&tx, &[100], &[0], 50, 0));
     }
+
+    #[test]
+    fn bip68_disable_flag_and_time_type() {
+        // DISABLE bit → ignore relative lock.
+        let disable = 1u32 << 31;
+        let tx = bare_tx(2, LockTime::ZERO, Sequence::from_consensus(disable | 10));
+        assert!(sequence_locks_satisfied(&tx, &[100], &[0], 50, 0));
+
+        // Time-based: TYPE_FLAG | n, granularity 512s.
+        let type_flag = 1u32 << 22;
+        let n = 2u32; // 2 × 512s relative
+        let tx = bare_tx(2, LockTime::ZERO, Sequence::from_consensus(type_flag | n));
+        // coin MTP = 1000; minTime ≈ 1000 + (2<<9) - 1
+        let coin_mtp = 1000u32;
+        let min_time = coin_mtp as i64 + ((n as i64) << 9) - 1;
+        assert!(!sequence_locks_satisfied(
+            &tx,
+            &[100],
+            &[coin_mtp],
+            200,
+            (min_time as u32).saturating_sub(1)
+        ));
+        assert!(sequence_locks_satisfied(
+            &tx,
+            &[100],
+            &[coin_mtp],
+            200,
+            min_time as u32 + 1
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -2241,6 +2271,62 @@ mod structure_rule_tests {
         let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
         assert_bad_block(err, "sigops");
     }
+
+    #[test]
+    fn s10_rejects_txouttotal_toolarge() {
+        // Two outputs each under MAX_MONEY but sum over.
+        let half = 11_000_000 * 100_000_000u64; // 11M BTC each
+        let mut cb = coinbase(0);
+        cb.output = vec![
+            TxOut {
+                value: Amount::from_sat(half),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+            TxOut {
+                value: Amount::from_sat(half),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+        ];
+        let b = block_with(vec![cb]);
+        let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
+        assert_bad_block(err, "txouttotal");
+    }
+
+    #[test]
+    fn s8_accepts_witness_commitment_with_reserved_value() {
+        // Build a valid commitment using non-zero witness reserved in coinbase witness.
+        let mut spend = non_coinbase_spend(11);
+        spend.input[0].witness = Witness::from_slice(&[vec![0xab]]);
+        let mut cb = coinbase(1);
+        // Place reserved value as last coinbase witness stack item.
+        let reserved = [0x42u8; 32];
+        cb.input[0].witness = Witness::from_slice(&[reserved.as_slice()]);
+        // Compute expected commitment: SHA256D(witness_root || reserved)
+        let wtxid = spend.compute_wtxid().to_byte_array();
+        let leaves = vec![[0u8; 32], wtxid];
+        let witness_root = merkle_root_bytes(&leaves);
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(&witness_root);
+        buf[32..].copy_from_slice(&reserved);
+        use bitcoin::hashes::{sha256d, Hash};
+        let committed = sha256d::Hash::hash(&buf).to_byte_array();
+        let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        spk.extend_from_slice(&committed);
+        cb.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(spk),
+        });
+        let b = block_with(vec![cb, spend]);
+        validate_block_structure(&b, &ctx_h(1)).expect("reserved witness commitment");
+        let _ = leaves;
+    }
+
+    #[test]
+    fn bip34_height_script_large_values() {
+        // 0x80 high bit needs pad; larger multi-byte.
+        assert_eq!(bip34_height_script(255), vec![0x02, 0xff, 0x00]);
+        assert_eq!(bip34_height_script(256), vec![0x02, 0x00, 0x01]);
+    }
 }
 
 #[cfg(test)]
@@ -2354,6 +2440,147 @@ mod sigop_cost_tests {
             script_pubkey: ScriptBuf::from_bytes(spk),
         }];
         assert_eq!(witness_sigop_count(&tx, &prevouts), 1);
+    }
+
+    #[test]
+    fn script_sigop_pushdata_encodings_and_checksigverify() {
+        // PUSHDATA1 / 2 / 4 skip payload without counting ops inside.
+        let mut s = vec![0x4c, 0x02, 0xac, 0xad]; // push 2 bytes that look like CHECKSIG
+        s.push(0xac); // real CHECKSIG after
+        assert_eq!(script_sigop_count(&s, false), 1);
+
+        let mut s2 = vec![0x4d, 0x02, 0x00, 0xac, 0xad];
+        s2.push(0xad); // CHECKSIGVERIFY
+        assert_eq!(script_sigop_count(&s2, false), 1);
+
+        let mut s3 = vec![0x4e, 0x01, 0x00, 0x00, 0x00, 0xac];
+        s3.push(0xae); // CHECKMULTISIG → 20
+        assert_eq!(script_sigop_count(&s3, false), 20);
+
+        // last_script_push with PUSHDATA*
+        let lp = vec![0x4c, 0x01, 0xab];
+        assert_eq!(last_script_push(&lp), Some(&[0xabu8][..]));
+        let lp2 = vec![0x4d, 0x01, 0x00, 0xcd];
+        assert_eq!(last_script_push(&lp2), Some(&[0xcdu8][..]));
+        let lp3 = vec![0x4e, 0x01, 0x00, 0x00, 0x00, 0xef];
+        assert_eq!(last_script_push(&lp3), Some(&[0xefu8][..]));
+        let _ = (lp, lp2, lp3);
+    }
+
+    #[test]
+    fn witness_p2wsh_and_nested_p2sh() {
+        // Native P2WSH: last witness item is script with CHECKSIG.
+        let ws = vec![0xac];
+        let scripthash = {
+            use bitcoin::hashes::{sha256, Hash};
+            *sha256::Hash::hash(&ws).as_byte_array()
+        };
+        let mut spk = vec![0x00, 0x20];
+        spk.extend_from_slice(&scripthash);
+        let tx = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([3; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[vec![0x01], ws.clone()]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(10),
+            script_pubkey: ScriptBuf::from_bytes(spk),
+        }];
+        assert_eq!(witness_sigop_count(&tx, &prevouts), 1);
+
+        // Nested P2SH-P2WPKH: redeem in scriptSig.
+        let mut redeem = vec![0x00, 0x14];
+        redeem.extend([0u8; 20]);
+        let mut ss = vec![redeem.len() as u8];
+        ss.extend_from_slice(&redeem);
+        let mut p2sh = vec![0xa9, 0x14];
+        p2sh.extend([0u8; 20]);
+        p2sh.push(0x87);
+        let tx2 = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([4; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::from_bytes(ss),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[vec![0x30], vec![0x02; 33]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let prevouts2 = vec![TxOut {
+            value: Amount::from_sat(10),
+            script_pubkey: ScriptBuf::from_bytes(p2sh),
+        }];
+        assert_eq!(witness_sigop_count(&tx2, &prevouts2), 1);
+
+        // p2sh_sigop prevouts short / non-p2sh skip
+        assert_eq!(p2sh_sigop_count(&tx2, &[]), 0);
+        assert_eq!(
+            p2sh_sigop_count(
+                &tx2,
+                &[TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }]
+            ),
+            0
+        );
+        // witness_sigop missing prevout
+        assert_eq!(witness_sigop_count(&tx, &[]), 0);
+    }
+
+    #[test]
+    fn verify_scripts_pool_empty_and_anyone_can_spend() {
+        use super::{verify_scripts_pool, verify_scripts_pool_jobs, ScriptCheckJob};
+        assert!(verify_scripts_pool(&[]).is_ok());
+        assert!(verify_scripts_pool_jobs(&[]).is_ok());
+        let job = ScriptCheckJob {
+            prevouts: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]), // OP_TRUE ACS
+            }],
+            tx: Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid::from_byte_array([9; 32]),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            },
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+        };
+        assert!(verify_scripts_pool(&[job]).is_ok());
     }
 }
 

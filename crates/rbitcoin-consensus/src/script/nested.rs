@@ -176,3 +176,211 @@ fn split_script_sig_redeem(script: &Script) -> Result<(Vec<Vec<u8>>, Vec<u8>), C
     let redeem = items.pop().unwrap();
     Ok((items, redeem))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::hashes::Hash;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::{
+        Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness,
+    };
+    use crate::block::ScriptCheckJob;
+
+    fn dummy_tx() -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([1; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    }
+
+    fn p2sh_spk(redeem: &[u8]) -> ScriptBuf {
+        let h = crypto::hash160(redeem);
+        let mut v = vec![0xa9, 0x14];
+        v.extend_from_slice(&h);
+        v.push(0x87);
+        ScriptBuf::from_bytes(v)
+    }
+
+    #[test]
+    fn single_push_and_split_helpers() {
+        // Multi-push → None
+        let multi = ScriptBuf::from_bytes(vec![0x01, 0xaa, 0x01, 0xbb]);
+        assert!(matches!(single_push_script_sig(&multi), Ok(None)));
+        // OP → None
+        let op = ScriptBuf::from_bytes(vec![0x51]);
+        assert!(matches!(single_push_script_sig(&op), Ok(None)));
+        // Single push
+        let one = ScriptBuf::from_bytes(vec![0x02, 0xde, 0xad]);
+        assert_eq!(
+            single_push_script_sig(&one).unwrap().unwrap(),
+            vec![0xde, 0xad]
+        );
+        // Malformed truncated push → Err
+        let bad = ScriptBuf::from_bytes(vec![0x05, 0x01]);
+        assert!(single_push_script_sig(&bad).is_err());
+
+        // split: OP_0 and OP_1 as stack items
+        let ss = Script::from_bytes(&[0x00, 0x51, 0x01, 0xac]);
+        let (stack, redeem) = split_script_sig_redeem(ss).unwrap();
+        assert_eq!(stack, vec![vec![], vec![0x01]]);
+        assert_eq!(redeem, vec![0xac]);
+        // empty
+        assert!(split_script_sig_redeem(Script::from_bytes(&[])).is_err());
+        // unexpected op
+        assert!(split_script_sig_redeem(Script::from_bytes(&[0xac])).is_err());
+    }
+
+    #[test]
+    fn try_nested_error_paths() {
+        let mut tx = dummy_tx();
+        // Redeem looks like P2WPKH program but wrong outer P2SH hash / spk length
+        let redeem = {
+            let mut r = vec![0x00, 0x14];
+            r.extend([0u8; 20]);
+            r
+        };
+        let mut ss = vec![redeem.len() as u8];
+        ss.extend_from_slice(&redeem);
+        tx.input[0].script_sig = ScriptBuf::from_bytes(ss);
+        let job = ScriptCheckJob {
+            prevouts: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]), // not 23-byte P2SH
+            }],
+            tx: tx.clone(),
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+        };
+        let mut cache = SighashCache::new(&job.tx);
+        let r = try_p2sh_p2wpkh(&job, 0, &job.tx, &mut cache);
+        assert!(matches!(r, Some(Err(_))));
+
+        // Wrong redeem hash
+        let job2 = ScriptCheckJob {
+            prevouts: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: p2sh_spk(&[0xff]),
+            }],
+            tx: tx.clone(),
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+        };
+        let mut cache2 = SighashCache::new(&job2.tx);
+        assert!(matches!(
+            try_p2sh_p2wpkh(&job2, 0, &job2.tx, &mut cache2),
+            Some(Err(_))
+        ));
+
+        // P2WSH redeem shape
+        let redeem_wsh = {
+            let mut r = vec![0x00, 0x20];
+            r.extend([0u8; 32]);
+            r
+        };
+        let mut ss2 = vec![redeem_wsh.len() as u8];
+        ss2.extend_from_slice(&redeem_wsh);
+        let mut tx3 = dummy_tx();
+        tx3.input[0].script_sig = ScriptBuf::from_bytes(ss2);
+        let job3 = ScriptCheckJob {
+            prevouts: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x00]), // short spk
+            }],
+            tx: tx3.clone(),
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+        };
+        assert!(matches!(try_p2sh_p2wsh(&job3, 0, &job3.tx), Some(Err(_))));
+        // wrong hash
+        let job4 = ScriptCheckJob {
+            prevouts: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: p2sh_spk(&[0x01]),
+            }],
+            tx: tx3.clone(),
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+        };
+        assert!(matches!(try_p2sh_p2wsh(&job4, 0, &job4.tx), Some(Err(_))));
+
+        // Multi-push → None (fallthrough)
+        let mut tx5 = dummy_tx();
+        tx5.input[0].script_sig = ScriptBuf::from_bytes(vec![0x01, 0xaa, 0x01, 0xbb]);
+        let job5 = ScriptCheckJob {
+            prevouts: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: p2sh_spk(&[0xaa]),
+            }],
+            tx: tx5.clone(),
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+        };
+        let mut c5 = SighashCache::new(&job5.tx);
+        assert!(try_p2sh_p2wpkh(&job5, 0, &job5.tx, &mut c5).is_none());
+        assert!(try_p2sh_p2wsh(&job5, 0, &job5.tx).is_none());
+
+        // Legacy wrong spk / hash / empty
+        assert!(verify_p2sh_legacy(&job3, 0, &job3.tx).is_err());
+        let mut tx_empty = dummy_tx();
+        tx_empty.input[0].script_sig = ScriptBuf::new();
+        let job_e = ScriptCheckJob {
+            prevouts: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: p2sh_spk(&[0x51]),
+            }],
+            tx: tx_empty.clone(),
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+        };
+        assert!(verify_p2sh_legacy(&job_e, 0, &job_e.tx).is_err());
+        // Hash mismatch on legacy
+        let mut tx_leg = dummy_tx();
+        tx_leg.input[0].script_sig = ScriptBuf::from_bytes(vec![0x01, 0x51]);
+        let job_h = ScriptCheckJob {
+            prevouts: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: p2sh_spk(&[0xff]),
+            }],
+            tx: tx_leg.clone(),
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+        };
+        assert!(verify_p2sh_legacy(&job_h, 0, &job_h.tx).is_err());
+    }
+}

@@ -8,8 +8,8 @@
 //! Run with:
 //!   cargo test -p rbitcoin-net reader_contention -- --nocapture --test-threads=1
 
-use crate::codec::MAX_PROTOCOL_MESSAGE_LENGTH;
-use crate::error::NetError;
+use rbitcoin_net::MAX_PROTOCOL_MESSAGE_LENGTH;
+use rbitcoin_net::NetError;
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header, Version};
 use bitcoin::consensus::{deserialize, serialize};

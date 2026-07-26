@@ -584,4 +584,108 @@ mod tests {
         assert!(merged.flags(&a).is_fast());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn network_ports_and_seed_lists() {
+        assert_eq!(default_port(Network::Mainnet), 8333);
+        assert_eq!(default_port(Network::Testnet), 18333);
+        assert_eq!(default_port(Network::Signet), 38333);
+        assert_eq!(default_port(Network::Regtest), 18444);
+        assert!(!dns_seeds(Network::Mainnet).is_empty());
+        assert!(!dns_seeds(Network::Testnet).is_empty());
+        assert_eq!(dns_seeds(Network::Signet).len(), 1);
+        assert!(dns_seeds(Network::Regtest).is_empty());
+        assert!(!fixed_seed_hosts(Network::Mainnet).is_empty());
+        assert!(fixed_seed_hosts(Network::Regtest).is_empty());
+    }
+
+    #[test]
+    fn peer_flags_set_remove_and_mid_range_speed() {
+        let mut f = PeerFlags::empty();
+        assert!(f.is_untried());
+        f.set(PeerFlags::HAS_CONNECTED, true);
+        assert!(f.has_connected());
+        f.set(PeerFlags::HAS_CONNECTED, false);
+        assert!(!f.has_connected());
+        // Mid-range sample leaves prior classification alone.
+        f.insert(PeerFlags::FAST);
+        f.apply_speed_sample(150, PeerFlags::FAST_BPS_MIN / 2);
+        assert!(f.is_fast());
+        assert!(!f.is_slow());
+    }
+
+    #[test]
+    fn addrman_merge_offset_and_ipv4_sort() {
+        use std::net::{IpAddr, Ipv6Addr};
+        let v4 = addr(1);
+        let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8333);
+        let mut a = AddrMan::new();
+        a.add(v6);
+        a.add(v4);
+        a.inject([v6, v4]); // already present no-op + re-sort
+        assert_eq!(a.peers()[0], v4, "IPv4 preferred over IPv6");
+
+        let mut b = AddrMan::new();
+        b.add_with_flags(addr(9), {
+            let mut f = PeerFlags::empty();
+            f.insert(PeerFlags::SLOW);
+            f
+        });
+        a.merge_from(&b);
+        assert!(a.flags(&addr(9)).is_slow());
+        assert!(a.entry(&addr(9)).is_some());
+        assert!(!a.is_empty());
+
+        // Ranked outbound + offset wrap.
+        let ranked = a.take_outbound(2);
+        assert_eq!(ranked.len(), 2);
+        let offset = a.take_outbound_offset(3, 1);
+        assert_eq!(offset.len(), 3.min(a.len()));
+        assert!(a.take_outbound_offset(0, 0).is_empty());
+        assert!(a.take_dial_candidates(0, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn peers_file_load_errors_and_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-peers-err-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let missing = dir.join("no-such-peers");
+        assert!(AddrMan::load(&missing).unwrap().is_empty());
+
+        // Bad magic.
+        let bad = dir.join("bad");
+        std::fs::write(&bad, "not-magic\n1.2.3.4:8333 0\n").unwrap();
+        assert!(AddrMan::load(&bad).is_err());
+
+        // Comment-only / empty after trim → empty book.
+        let emptyish = dir.join("emptyish");
+        std::fs::write(&emptyish, "# just a comment\n\n").unwrap();
+        assert!(AddrMan::load(&emptyish).unwrap().is_empty());
+
+        // Hex + decimal flags parse.
+        let ok = dir.join("ok");
+        std::fs::write(
+            &ok,
+            format!(
+                "{}\n{} 0x03\n{} 16\n# trailing\n",
+                AddrMan::PEERS_FILE_MAGIC,
+                addr(1),
+                addr(2)
+            ),
+        )
+        .unwrap();
+        let loaded = AddrMan::load(&ok).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.flags(&addr(1)).has_connected());
+        assert!(loaded.flags(&addr(1)).is_fast()); // bits 0|1
+        assert!(loaded.flags(&addr(2)).failed_last_connect()); // bit 4 = 16
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

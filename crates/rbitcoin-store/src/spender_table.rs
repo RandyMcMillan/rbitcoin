@@ -113,6 +113,53 @@ mod tests {
         let b = t.append(Fk(11), a).unwrap();
         assert_eq!(t.get(a).unwrap(), (Fk(10), Fk::NULL));
         assert_eq!(t.get(b).unwrap(), (Fk(11), a));
+        assert_eq!(t.count(), 2);
+        assert!(matches!(t.append(Fk::NULL, Fk::NULL), Err(StoreError::InvalidFk)));
+        assert!(matches!(t.get(Fk::NULL), Err(StoreError::InvalidFk)));
+        assert!(matches!(t.get(Fk(99)), Err(StoreError::NotFound)));
+        t.flush().unwrap();
+        t.flush_async().unwrap();
+        drop(t);
+        // open existing
+        let t = SpenderTable::open(&dir).unwrap();
+        assert_eq!(t.count(), 2);
+        assert_eq!(t.get(a).unwrap(), (Fk(10), Fk::NULL));
+        // open creates when body missing
+        let dir2 = dir.with_extension("empty");
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir2).unwrap();
+        let t2 = SpenderTable::open(&dir2).unwrap();
+        assert_eq!(t2.count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn open_rejects_bad_body_size() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-spender-bad-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = SpenderTable::create(&dir).unwrap();
+        t.append(Fk(1), Fk::NULL).unwrap();
+        drop(t);
+        // Shrink below HWM so open clamps logical_len to a non-multiple of 16.
+        let body = dir.join("spenders.body");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&body)
+            .unwrap()
+            .set_len((FILE_HEADER_LEN + 3) as u64)
+            .unwrap();
+        assert!(matches!(
+            SpenderTable::open(&dir),
+            Err(StoreError::Corrupt(_))
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

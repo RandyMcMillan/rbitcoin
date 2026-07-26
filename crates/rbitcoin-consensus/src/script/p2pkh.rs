@@ -64,3 +64,60 @@ fn parse_two_pushes(script: &Script) -> Result<(Vec<u8>, Vec<u8>), ConsensusErro
     }
     Ok((items[0].clone(), items[1].clone()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::{Amount, OutPoint, Sequence, TxIn, TxOut, Witness};
+    use crate::block::ScriptCheckJob;
+
+    #[test]
+    fn parse_two_pushes_errors() {
+        assert!(parse_two_pushes(Script::from_bytes(&[0x51])).is_err()); // OP_1
+        assert!(parse_two_pushes(Script::from_bytes(&[0x00])).is_err()); // OP_0 unexpected
+        assert!(parse_two_pushes(Script::from_bytes(&[0x01, 0xaa])).is_err()); // len
+        assert!(parse_two_pushes(Script::from_bytes(&[0x05, 0x01])).is_err()); // decode
+        let ok = parse_two_pushes(Script::from_bytes(&[0x01, 0xaa, 0x01, 0xbb])).unwrap();
+        assert_eq!(ok, (vec![0xaa], vec![0xbb]));
+    }
+
+    #[test]
+    fn verify_pubkey_hash_mismatch() {
+        let mut spk = vec![0x76, 0xa9, 0x14];
+        spk.extend([0u8; 20]);
+        spk.extend([0x88, 0xac]);
+        let mut ss = vec![0x01, 0x30, 0x21];
+        ss.extend([0x02; 33]); // fake compressed pubkey
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(ss),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let job = ScriptCheckJob {
+            prevouts: vec![TxOut {
+                value: Amount::from_sat(10),
+                script_pubkey: ScriptBuf::from_bytes(spk),
+            }],
+            tx: tx.clone(),
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+        };
+        let mut cache = SighashCache::new(&job.tx);
+        let err = verify(&job, 0, &job.tx, &mut cache).unwrap_err();
+        assert!(format!("{err}").contains("p2pkh"));
+    }
+}

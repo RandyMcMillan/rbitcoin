@@ -755,4 +755,155 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn shutdown_flag_and_node_handle_smoke() {
+        let sd = Shutdown::new();
+        assert!(!sd.requested());
+        sd.request();
+        assert!(sd.requested());
+        // Second request is idempotent.
+        sd.request();
+        assert!(sd.requested());
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-run-node-{nanos}"));
+        let cfg = NodeConfig::default()
+            .with_datadir(&dir)
+            .with_network(rbitcoin_primitives::Network::Regtest);
+        let handle = run_node(cfg).expect("run_node");
+        assert_eq!(handle.network_name(), "regtest");
+        assert!(handle.mempool.is_none());
+        let _ = format!("{:?}", handle);
+        handle.shutdown().expect("shutdown flush");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_p2p_no_peers_exits_after_catchup() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-{nanos}"));
+        let mut cfg = NodeConfig::default()
+            .with_datadir(&dir)
+            .with_network(rbitcoin_primitives::Network::Regtest)
+            .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+        cfg.use_seeds = false;
+        cfg.connect.clear();
+        cfg.max_run_secs = Some(0); // exit after catch-up / tip mode
+        cfg.smoke = false;
+        // Bound runtime so a hang fails the test suite instead of blocking.
+        let result = tokio::time::timeout(Duration::from_secs(30), run_p2p(cfg)).await;
+        assert!(result.is_ok(), "run_p2p timed out");
+        result.unwrap().expect("run_p2p ok with no peers");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cancelled_completes_after_request() {
+        let sd = Shutdown::new();
+        // Already-requested path returns immediately.
+        sd.request();
+        sd.cancelled().await;
+
+        let sd2 = Shutdown::new();
+        let s2 = Arc::clone(&sd2);
+        let j = tokio::spawn(async move {
+            s2.cancelled().await;
+        });
+        // Give the task a chance to park on notify.
+        tokio::task::yield_now().await;
+        sd2.request();
+        j.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_p2p_milestone_and_electrum() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-el-{nanos}"));
+        let mut cfg = NodeConfig::default()
+            .with_datadir(&dir)
+            .with_network(rbitcoin_primitives::Network::Regtest)
+            .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+        cfg.use_seeds = false;
+        cfg.connect.clear();
+        cfg.milestone_height = 100; // exercise milestone log branch
+        cfg.electrum_listen = Some("127.0.0.1:0".parse().unwrap());
+        // max_run_secs=0 exits after catch-up/tip (tip-follow loop uses 60s poll sleeps).
+        cfg.max_run_secs = Some(0);
+        let result = tokio::time::timeout(Duration::from_secs(45), run_p2p(cfg)).await;
+        assert!(result.is_ok(), "run_p2p timed out");
+        result.unwrap().expect("run_p2p with electrum");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_p2p_bad_connect_peer_still_exits() {
+        // Explicit dead --connect so IBD/follow attempts are exercised, then exit.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-conn-{nanos}"));
+        let mut cfg = NodeConfig::default()
+            .with_datadir(&dir)
+            .with_network(rbitcoin_primitives::Network::Regtest)
+            .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+        cfg.use_seeds = false;
+        // Blackhole / closed port: connect fails fast under FOLLOW_CONNECT_SECS.
+        cfg.connect = vec!["127.0.0.1:1".parse().unwrap()];
+        cfg.max_run_secs = Some(0);
+        let result = tokio::time::timeout(Duration::from_secs(60), run_p2p(cfg)).await;
+        assert!(result.is_ok(), "run_p2p timed out");
+        // Incomplete IBD is ok (warn path); should not hang.
+        let _ = result.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enter_tip_mode_warns_on_leftover_runs_dir() {
+        use rbitcoin_query::IndexMode;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-tip-leftover-{nanos}"));
+        std::fs::create_dir_all(dir.join("store")).unwrap();
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        q.enter_direct_index_mode().unwrap();
+        // Empty store: finalize has no runs; still flips to tip.
+        enter_tip_mode(&q);
+        assert_eq!(q.index_mode(), IndexMode::Tip);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn node_handle_shutdown_with_mempool() {
+        use rbitcoin_net::MempoolHub;
+        use std::sync::Arc;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-handle-mp-{nanos}"));
+        let cfg = NodeConfig::default()
+            .with_datadir(&dir)
+            .with_network(rbitcoin_primitives::Network::Regtest);
+        let mut handle = run_node(cfg).expect("run_node");
+        // Dual-open same store under /tmp for MempoolHub's Arc<Query> (flush only).
+        let q = Arc::new(Query::open_or_create(handle.config.store_path()).unwrap());
+        let mp = MempoolHub::open(handle.config.mempool_path(), q).expect("mempool");
+        handle.mempool = Some(mp);
+        let _ = format!("{:?}", handle);
+        handle.shutdown().expect("flush query+mempool");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

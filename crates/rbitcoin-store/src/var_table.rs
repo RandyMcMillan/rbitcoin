@@ -394,6 +394,9 @@ mod tests {
     /// (regression: raw.len() 640 vs expected 128 from torn (old_count, new_end)).
     #[test]
     fn put_batch_publish_visible_to_concurrent_readers() {
+        let _stress = crate::file::TEST_MMAP_STRESS_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, AtomicOrdering::Relaxed);
         let dir = std::env::temp_dir().join(format!("rbitcoin-var-pub-{id}"));
@@ -554,6 +557,92 @@ mod tests {
             t.record_ranges(1, 1).unwrap()[0],
             t.record_range(Fk(1)).unwrap()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn var_table_surface_helpers_and_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-var-surface-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = VarTable::create(&dir, "tx", TableKind::Tx).unwrap();
+        assert_eq!(t.count(), 0);
+        assert!(t.body_logical_len() >= FILE_HEADER_LEN as u64);
+        t.advise_body_dont_need(0, 0);
+        assert_eq!(t.put_batch_encode(0, 0, |_, _| {}).unwrap().len(), 0);
+        t.reserve_append(1024, 8).unwrap();
+        let fks = t
+            .put_batch_encode(3, 64, |i, buf| {
+                buf.extend_from_slice(&[i as u8; 16]);
+            })
+            .unwrap();
+        assert_eq!(fks.len(), 3);
+        assert_eq!(t.count(), 3);
+        let raw = t.get_raw(fks[1]).unwrap();
+        assert_eq!(raw, vec![1u8; 16]);
+        let via = t
+            .with_raw(fks[1], |b| {
+                assert_eq!(b.len(), 16);
+                Ok(b[0])
+            })
+            .unwrap();
+        assert_eq!(via, 1);
+        let (off, len) = t.record_range(fks[0]).unwrap();
+        let mut prefix = [0u8; 4];
+        assert_eq!(t.read_prefix_at(off, len, &mut prefix).unwrap(), 4);
+        assert_eq!(prefix, [0, 0, 0, 0]);
+        assert_eq!(t.read_prefix_at(off, len, &mut []).unwrap(), 0);
+        t.with_bytes_at(off, len, |b| {
+            assert_eq!(b.len(), 16);
+            Ok(())
+        })
+        .unwrap();
+        // Patch first byte of first record.
+        t.write_body_abs(off, &[0xff]).unwrap();
+        assert_eq!(t.get_raw(fks[0]).unwrap()[0], 0xff);
+        assert!(matches!(
+            t.record_range(Fk::NULL),
+            Err(StoreError::InvalidFk)
+        ));
+        assert!(matches!(
+            t.record_range(Fk(99)),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            t.record_ranges(0, 1),
+            Err(StoreError::InvalidFk)
+        ));
+        assert!(matches!(
+            t.record_ranges(1, 99),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(t.get_raw(Fk::NULL), Err(StoreError::InvalidFk)));
+        t.flush().unwrap();
+        t.flush_async().unwrap();
+        drop(t);
+        let t = VarTable::open(&dir, "tx", TableKind::Tx).unwrap();
+        assert_eq!(t.count(), 3);
+        assert_eq!(t.get_raw(Fk(2)).unwrap().len(), 16);
+        // Corrupt idx size: clamp logical below HWM to non-multiple of 8.
+        {
+            let idx = dir.join("tx.idx");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&idx)
+                .unwrap()
+                .set_len((FILE_HEADER_LEN + 3) as u64)
+                .unwrap();
+        }
+        assert!(matches!(
+            VarTable::open(&dir, "tx", TableKind::Tx),
+            Err(StoreError::Corrupt(_))
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

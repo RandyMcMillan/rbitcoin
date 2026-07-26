@@ -77,4 +77,13 @@ mod tests {
         assert!(decode("0").is_err());
         assert!(decode("zz").is_err());
     }
+
+    #[test]
+    fn hex_error_display_and_0x_prefix() {
+        let e = decode("0").unwrap_err();
+        assert_eq!(format!("{e}"), "odd hex length");
+        let _ = &e as &dyn std::error::Error;
+        assert_eq!(decode("0Xff").unwrap(), vec![0xff]);
+        assert_eq!(encode([]), "");
+    }
 }

@@ -127,5 +127,33 @@ mod tests {
             all_peers_dead_action(&zero, 0, 0, false, 0),
             AllPeersDead::GiveUpMidCatchup
         );
+
+        // Dark redial budget exhausted while redial still marked in-flight.
+        assert_eq!(
+            all_peers_dead_action(&mid, 161_249, 0, true, MAX_DARK_EMPTY_REDIALS),
+            AllPeersDead::GiveUpMidCatchup
+        );
+
+        // path_drained false when archive queue non-empty or ordered non-empty.
+        let mut busy = IbdWorkState::new(Vec::new(), None, Some(10));
+        busy.max_peer_height = 10;
+        busy.max_archived_height = 10;
+        busy.headers_done = true;
+        assert!(!path_drained(&busy, 1));
+        assert!(!catchup_complete_after_drain(&busy, 10, 1));
+        use bitcoin::hashes::Hash;
+        use bitcoin::BlockHash;
+        busy.ordered
+            .push_back(BlockHash::from_byte_array([1u8; 32]));
+        assert!(!path_drained(&busy, 0));
+
+        // peer_caught_up: tip near horizon and not behind archive.
+        let mut near = IbdWorkState::new(Vec::new(), None, Some(100));
+        near.max_peer_height = 101;
+        near.max_archived_height = 100;
+        assert!(peer_caught_up(&near, 100));
+        near.max_archived_height = 105;
+        assert!(!peer_caught_up(&near, 100));
+        assert_eq!(header_lag_behind_peers(&near, 100), 0); // archived ≥ peer
     }
 }

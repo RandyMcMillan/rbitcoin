@@ -460,4 +460,191 @@ mod tests {
         let ss = to_spend.input[0].script_sig.as_bytes();
         assert_eq!(ss[0], 0x00, "Core CScript(OP_0) then push(block_data)");
     }
+
+    #[test]
+    fn genesis_prev_skips_challenge() {
+        let raw = include_bytes!("../tests/fixtures/signet_block_1.bin");
+        let mut block: Block = deserialize(raw).unwrap();
+        block.header.prev_blockhash = bitcoin::BlockHash::from_byte_array([0u8; 32]);
+        // Empty txs would fail for non-genesis; genesis path returns Ok first.
+        block.txdata.clear();
+        validate_signet_block_solution(&block, Script::from_bytes(&[0x51])).unwrap();
+    }
+
+    #[test]
+    fn empty_block_and_missing_commitment_errors() {
+        let challenge = default_signet_challenge();
+        let raw = include_bytes!("../tests/fixtures/signet_block_1.bin");
+        let mut block: Block = deserialize(raw).unwrap();
+        block.txdata.clear();
+        assert!(matches!(
+            build_signet_txs(&block, challenge.as_script()),
+            Err(ConsensusError::BadBlock(_))
+        ));
+        let mut block: Block = deserialize(raw).unwrap();
+        // Strip commitment-looking outputs from coinbase.
+        block.txdata[0].output.clear();
+        block.txdata[0].output.push(TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        });
+        assert!(matches!(
+            build_signet_txs(&block, challenge.as_script()),
+            Err(ConsensusError::BadBlock(_))
+        ));
+    }
+
+    #[test]
+    fn op_true_challenge_allows_missing_signet_section() {
+        // Coinbase with bare witness commitment (no SIGNET_HEADER) + OP_TRUE challenge.
+        let cb = Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x00, 0x01]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes({
+                    let mut v = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+                    v.extend([0u8; 32]);
+                    v
+                }),
+            }],
+        };
+        let block = Block {
+            header: bitcoin::block::Header {
+                version: bitcoin::block::Version::ONE,
+                prev_blockhash: bitcoin::BlockHash::from_byte_array([1u8; 32]),
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                time: 1,
+                bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![cb.clone()],
+        };
+        // No SIGNET_HEADER → error for real challenge.
+        assert!(build_signet_txs(&block, default_signet_challenge().as_script()).is_err());
+        // OP_TRUE challenge allows empty solution.
+        let challenge = ScriptBuf::from_bytes(vec![0x51]);
+        let (to_spend, to_sign) = build_signet_txs(&block, challenge.as_script()).unwrap();
+        assert!(to_sign.input[0].script_sig.is_empty());
+        assert_eq!(to_spend.output[0].script_pubkey.as_bytes(), &[0x51]);
+        let _ = cb;
+    }
+
+    #[test]
+    fn push_data_all_length_encodings() {
+        let mut short = Vec::new();
+        push_data(&mut short, &[0xab]);
+        assert_eq!(short, vec![0x01, 0xab]);
+
+        let mid = vec![0u8; 0x4c];
+        let mut out = Vec::new();
+        push_data(&mut out, &mid);
+        assert_eq!(out[0], 0x4c);
+        assert_eq!(out[1], 0x4c);
+        assert_eq!(&out[2..], mid.as_slice());
+
+        let long = vec![0x11u8; 300];
+        let mut out2 = Vec::new();
+        push_data(&mut out2, &long);
+        assert_eq!(out2[0], 0x4d);
+        assert_eq!(u16::from_le_bytes([out2[1], out2[2]]), 300);
+        assert_eq!(&out2[3..], long.as_slice());
+    }
+
+    #[test]
+    fn fetch_and_clear_pushdata1_and_pushdata2() {
+        // OP_RETURN + PUSHDATA1(header||payload)
+        let mut payload = SIGNET_HEADER.to_vec();
+        payload.extend_from_slice(&[0xde, 0xad]);
+        let mut spk = vec![0x6a, 0x4c, payload.len() as u8];
+        spk.extend_from_slice(&payload);
+        let (sol, stripped) = fetch_and_clear_signet_section(&spk).unwrap();
+        assert_eq!(sol, vec![0xde, 0xad]);
+        assert_eq!(stripped[0], 0x6a);
+
+        // PUSHDATA2 path
+        let mut payload2 = SIGNET_HEADER.to_vec();
+        payload2.push(0xbe);
+        let mut spk2 = vec![0x6a, 0x4d];
+        spk2.extend_from_slice(&(payload2.len() as u16).to_le_bytes());
+        spk2.extend_from_slice(&payload2);
+        let (sol2, _) = fetch_and_clear_signet_section(&spk2).unwrap();
+        assert_eq!(sol2, vec![0xbe]);
+
+        // Truncated push → None
+        assert!(fetch_and_clear_signet_section(&[0x05, 0x01]).is_none());
+        assert!(fetch_and_clear_signet_section(&[0x4c, 0x05, 0x01]).is_none());
+        assert!(fetch_and_clear_signet_section(&[0x4d, 0x05, 0x00, 0x01]).is_none());
+        // OP_0 pass-through without solution
+        assert!(fetch_and_clear_signet_section(&[0x00, 0x51]).is_none());
+        // Non-header push retained
+        let no_hdr = vec![0x03, 0xaa, 0xbb, 0xcc];
+        assert!(fetch_and_clear_signet_section(&no_hdr).is_none());
+        let _ = no_hdr;
+    }
+
+    #[test]
+    fn compact_size_and_solution_parse_errors() {
+        assert_eq!(read_compact_size(&mut (&[0u8][..])).unwrap(), 0);
+        assert_eq!(read_compact_size(&mut (&[252u8][..])).unwrap(), 252);
+        // 253 + u16 LE
+        let mut r = &[253u8, 0x01, 0x00][..];
+        assert_eq!(read_compact_size(&mut r).unwrap(), 1);
+        // 254 + u32
+        let mut r = &[254u8, 0x02, 0x00, 0x00, 0x00][..];
+        assert_eq!(read_compact_size(&mut r).unwrap(), 2);
+        // 255 + u64
+        let mut r = &[255u8, 0x03, 0, 0, 0, 0, 0, 0, 0][..];
+        assert_eq!(read_compact_size(&mut r).unwrap(), 3);
+
+        assert!(read_compact_size(&mut (&[][..])).is_err());
+        assert!(read_compact_size(&mut (&[253u8][..])).is_err());
+        assert!(read_compact_size(&mut (&[254u8, 0][..])).is_err());
+        assert!(read_compact_size(&mut (&[255u8, 0, 0, 0][..])).is_err());
+
+        // Empty solution: scriptSig compact 0 + witness count 0.
+        let (ss, wit) = parse_signet_solution(&[0x00, 0x00]).unwrap();
+        assert!(ss.is_empty());
+        assert_eq!(wit.len(), 0);
+        // Extraneous tail.
+        assert!(parse_signet_solution(&[0x00, 0x00, 0xff]).is_err());
+        // Short script.
+        assert!(parse_signet_solution(&[0x02, 0xaa]).is_err());
+        // Short witness item.
+        assert!(parse_signet_solution(&[0x00, 0x01, 0x02, 0xaa]).is_err());
+    }
+
+    #[test]
+    fn modified_merkle_odd_leaf_count() {
+        let raw = include_bytes!("../tests/fixtures/signet_block_1.bin");
+        let block: Block = deserialize(raw).unwrap();
+        // Two non-coinbase leaves force at least one pairing; invent a second dummy tx leaf
+        // by cloning block with an extra empty-ish tx for merkle shape.
+        let cb = block.txdata[0].clone();
+        let root = modified_merkle_root(&cb, &block).unwrap();
+        assert_ne!(root.to_byte_array(), [0u8; 32]);
+        // Odd: only coinbase
+        let solo = Block {
+            header: block.header,
+            txdata: vec![cb.clone()],
+        };
+        let r2 = modified_merkle_root(&cb, &solo).unwrap();
+        assert_eq!(r2.to_byte_array(), cb.compute_txid().to_byte_array());
+        let _ = cb;
+    }
+
+    #[test]
+    fn witness_commitment_index_finds_magic() {
+        let raw = include_bytes!("../tests/fixtures/signet_block_1.bin");
+        let block: Block = deserialize(raw).unwrap();
+        assert!(witness_commitment_index(&block.txdata[0]).is_some());
+        assert!(find_subslice(b"hello world", b"world").is_some());
+        assert!(find_subslice(b"abc", b"xyz").is_none());
+    }
 }

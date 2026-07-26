@@ -67,3 +67,48 @@ pub(crate) fn verify_with_scripthash(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::{Amount, OutPoint, Sequence, TxIn, TxOut, Witness};
+    use crate::block::ScriptCheckJob;
+
+    #[test]
+    fn empty_witness_and_hash_mismatch() {
+        let mut spk = vec![0x00, 0x20];
+        spk.extend([0u8; 32]);
+        let job = ScriptCheckJob {
+            prevouts: vec![TxOut {
+                value: Amount::from_sat(10),
+                script_pubkey: ScriptBuf::from_bytes(spk),
+            }],
+            tx: Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            },
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+        };
+        assert!(verify(&job, 0, &job.tx).is_err());
+
+        let mut job2 = job;
+        job2.tx.input[0].witness = Witness::from_slice(&[vec![0x51]]); // OP_TRUE script
+        assert!(verify_with_scripthash(&job2, 0, &job2.tx, &[0u8; 32]).is_err());
+    }
+}

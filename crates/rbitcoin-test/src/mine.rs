@@ -158,3 +158,47 @@ pub fn mine_regtest_block(
 pub fn regtest_genesis() -> Block {
     bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bip34_and_coinbase_height_zero_and_pow() {
+        // height 0 pads scriptSig to min length 2.
+        let cb0 = coinbase_tx(0, Amount::from_sat(50));
+        assert!(cb0.is_coinbase());
+        assert!(cb0.input[0].script_sig.len() >= 2);
+        // bip34_script is a thin wrapper — hit for several heights.
+        for h in [1u32, 16, 0x80, 0x8000, 100_000] {
+            let s = bip34_script(h);
+            assert!(!s.is_empty());
+        }
+        // Non-zero coinbase uses bip34 encoding path (not the height-0 pad branch).
+        let cb1 = coinbase_tx(1, Amount::from_sat(50));
+        assert!(cb1.input[0].script_sig.len() >= 2);
+        let g = regtest_genesis();
+        let b = mine_regtest_block(g.block_hash(), g.header.time + 1, 1, vec![]);
+        assert_eq!(b.header.prev_blockhash, g.block_hash());
+        assert!(!b.txdata.is_empty());
+        // POW found (regtest trivial).
+        let target = Target::from_compact(b.header.bits);
+        assert!(b.header.validate_pow(target).is_ok());
+
+        // Extra helpers: multi-vout + multi-in spends (fixture surface).
+        let prev = b.txdata[0].compute_txid();
+        let split = split_anyone_can_spend(
+            prev,
+            0,
+            &[Amount::from_sat(10), Amount::from_sat(10)],
+        );
+        assert_eq!(split.output.len(), 2);
+        let many = spend_many_anyone_can_spend(
+            &[(prev, 0), (prev, 0)],
+            Amount::from_sat(1),
+        );
+        assert_eq!(many.input.len(), 2);
+        let single = spend_anyone_can_spend(prev, 0, Amount::from_sat(1));
+        assert_eq!(single.input.len(), 1);
+    }
+}

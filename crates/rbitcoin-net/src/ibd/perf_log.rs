@@ -1068,6 +1068,7 @@ pub(crate) fn log_sample(s: &IbdPerfSample) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn format_info_has_stable_tokens() {
@@ -1305,5 +1306,76 @@ mod tests {
             skew <= 1024,
             "anon+file should ≈ rss (±1MiB): sum={sum} skew={skew} {r:?}"
         );
+    }
+
+    #[test]
+    fn sample_pulls_atomics_and_format_edge_arms() {
+        let loop_stats = LoopStats::default();
+        loop_stats.confirm_ns.store(2_000_000, Ordering::Relaxed);
+        loop_stats.confirm_blocks.store(1, Ordering::Relaxed);
+        loop_stats.assign_issued.store(7, Ordering::Relaxed);
+        let pipe_stats = ArchivePipelineStats::default();
+        pipe_stats.prep_ns.store(1_000_000, Ordering::Relaxed);
+        pipe_stats.prep_blocks.store(1, Ordering::Relaxed);
+
+        let work = WorkStructureSizes::default();
+        let owned = ProcessOwnedSizes::default();
+        let conf_pipe = ConfirmPipelineSizes::default();
+        let rss = read_proc_rss();
+        let s = sample(
+            &loop_stats,
+            &pipe_stats,
+            4,   // inflight
+            256, // cap
+            2,   // arch_q
+            10,  // arch_mb
+            512, // budget
+            3,   // pending
+            0,
+            0,
+            100, // ahead
+            1,   // hole
+            8,   // peers
+            true, // headers_done
+            (50, 10, 0, 0, 0),
+            0,
+            0,
+            1, // sh_runs
+            (0, 0),
+            work,
+            owned,
+            conf_pipe,
+            rss,
+        );
+        assert_eq!(s.inflight, 4);
+        assert_eq!(s.peers, 8);
+        assert!(s.headers_done);
+        assert_eq!(s.assign_issued, 7);
+        assert_eq!(s.confirm_blocks, 1);
+        assert_eq!(s.sh_runs, 1);
+
+        // Edge format arms: spend_mix, miss_p, headers_done, zero pin_hit.
+        let mut edge = s.clone();
+        edge.spend_idx = 2;
+        edge.spend_skip = 1;
+        edge.spend_ranged = 3;
+        edge.load_missing_parents = 4;
+        edge.load_pin_cache_body = 0;
+        edge.load_pin_new = 0;
+        edge.headers_done = true;
+        edge.wire_ms = 9;
+        edge.strong_ms = 1;
+        edge.resolve_ms = 2;
+        edge.drain_ms = 3;
+        let info = format_info(&edge);
+        assert!(info.contains("spend_mix"), "{info}");
+        assert!(info.contains("miss_p=4"), "{info}");
+        assert!(info.contains("headers_done"), "{info}");
+        assert!(info.contains("wire_ms=9"), "{info}");
+        assert!(info.contains("getdata=7"), "{info}");
+        assert!(info.contains("pin_hit%=0"), "{info}");
+
+        // log_sample should not panic (INFO path always; DEBUG optional).
+        log_sample(&edge);
     }
 }

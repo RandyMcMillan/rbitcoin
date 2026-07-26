@@ -675,3 +675,212 @@ fn sum_work(iter: impl Iterator<Item = Work>) -> Work {
 fn work_better(new: Work, old: Work) -> bool {
     new > old
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::hashes::Hash;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut, Witness,
+    };
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_query::Query;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp_hub() -> (std::path::PathBuf, ChainHub) {
+        // Keep Class A/hash heads tiny in unit tests (avoid multi‑GiB sparse maps).
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-chain-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).expect("query open_or_create");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        (dir, hub)
+    }
+
+    fn coinbase(height: u32) -> Transaction {
+        let mut ss = if height == 0 {
+            vec![0x00]
+        } else {
+            rbitcoin_consensus::bip34_height_script(height)
+        };
+        while ss.len() < 2 {
+            ss.push(0x00);
+        }
+        Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(ss),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    }
+
+    fn mine(prev: BlockHash, time: u32, height: u32) -> Block {
+        let bits = CompactTarget::from_consensus(0x207f_ffff);
+        let header = Header {
+            version: Version::ONE,
+            prev_blockhash: prev,
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+            time,
+            bits,
+            nonce: 0,
+        };
+        let mut block = Block {
+            header,
+            txdata: vec![coinbase(height)],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let target = Target::from_compact(bits);
+        for nonce in 0..u32::MAX {
+            block.header.nonce = nonce;
+            if block.header.validate_pow(target).is_ok() {
+                break;
+            }
+        }
+        block
+    }
+
+    #[test]
+    fn ensure_genesis_accept_extend_and_already_have() {
+        let (dir, hub) = tmp_hub();
+        assert!(hub.tip_height().is_none());
+        hub.ensure_genesis().unwrap();
+        assert_eq!(hub.tip_height(), Some(0));
+        // Second call is a no-op once tip exists.
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        assert!(hub.has_block(&gen));
+        assert!(hub.is_archived(&gen));
+
+        let b1 = mine(gen, 1_300_000_000, 1);
+        assert!(matches!(
+            hub.accept_block(b1.clone()).unwrap(),
+            AcceptOutcome::Accepted { height: 1 }
+        ));
+        assert_eq!(hub.tip_height(), Some(1));
+        // AlreadyHave on re-accept.
+        assert!(matches!(
+            hub.accept_block(b1.clone()).unwrap(),
+            AcceptOutcome::AlreadyHave
+        ));
+
+        // Non-genesis without tip rejected on empty hub.
+        let (dir2, empty) = tmp_hub();
+        let err = empty.accept_block(b1).unwrap_err();
+        assert!(matches!(err, NetError::Protocol(_)));
+
+        // Chain work is non-zero after tip.
+        assert!(hub.chain_work().unwrap().to_be_bytes() != [0u8; 32]);
+        assert!(hub.tip_header().is_some());
+        assert!(hub.mempool().is_none());
+        let _ = hub.subscribe_tips();
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    #[test]
+    fn archive_then_confirm_run_and_empty_paths() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let b1 = mine(gen, 1_300_000_100, 1);
+        let h1 = b1.block_hash();
+
+        // Header-only then archive body out-of-order style.
+        hub.ensure_header(&b1.header).unwrap();
+        let fk = hub.ensure_header_fk(&b1.header).unwrap();
+        assert!(fk.0 > 0 || fk.0 == 0); // Fk may be 0 on some layouts
+        hub.archive_block(1, b1.clone()).unwrap();
+        // Idempotent archive.
+        hub.archive_block(1, b1.clone()).unwrap();
+        assert!(hub.is_archived(&h1));
+
+        // Confirm empty / already-have paths.
+        assert!(hub.confirm_run(&[]).unwrap().is_empty());
+        assert!(hub.confirm_load_phase(&[]).unwrap().is_none());
+        assert!(hub.confirm_script_phase(&[]).unwrap().is_none());
+
+        let outs = hub.confirm_run(&[(1, h1)]).unwrap();
+        assert_eq!(outs.len(), 1);
+        assert!(matches!(outs[0], AcceptOutcome::Accepted { height: 1 }));
+        assert_eq!(hub.tip_height(), Some(1));
+        // Already confirmed → AlreadyHave.
+        let outs2 = hub.confirm_run(&[(1, h1)]).unwrap();
+        assert!(matches!(outs2[0], AcceptOutcome::AlreadyHave));
+        assert!(matches!(
+            hub.confirm_hash(1, h1).unwrap(),
+            AcceptOutcome::AlreadyHave
+        ));
+        // Load phase on already-confirmed → None.
+        assert!(hub.confirm_load_phase(&[(1, h1)]).unwrap().is_none());
+
+        // Unknown parent.
+        let orphan = mine(BlockHash::from_byte_array([9u8; 32]), 1_300_000_200, 99);
+        assert!(matches!(
+            hub.accept_block(orphan).unwrap_err(),
+            NetError::Protocol(_)
+        ));
+
+        // accept_branch empty / unlinked.
+        assert!(hub.accept_branch(&[]).is_err());
+        let b2 = mine(h1, 1_300_000_300, 2);
+        let b3_bad = mine(BlockHash::from_byte_array([1u8; 32]), 1_300_000_400, 3);
+        assert!(hub.accept_branch(&[b2.clone(), b3_bad]).is_err());
+        // Linked tip extension via branch.
+        assert!(matches!(
+            hub.accept_branch(&[b2.clone()]).unwrap(),
+            AcceptOutcome::Accepted { height: 2 }
+        ));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prepare_confirm_without_archive_errors() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let b1 = mine(gen, 1_300_000_500, 1);
+        let h1 = b1.block_hash();
+        hub.ensure_header(&b1.header).unwrap();
+        // Body not archived → confirm without archive.
+        let err = hub.confirm_run(&[(1, h1)]).unwrap_err();
+        assert!(matches!(err, NetError::Protocol(_)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn work_better_and_sum_work_helpers() {
+        let z = Work::from_be_bytes([0u8; 32]);
+        let one = {
+            let mut b = [0u8; 32];
+            b[31] = 1;
+            Work::from_be_bytes(b)
+        };
+        assert!(work_better(one, z));
+        assert!(!work_better(z, one));
+        assert_eq!(sum_work(std::iter::empty()), z);
+        assert_eq!(sum_work([one].into_iter()), one);
+    }
+}

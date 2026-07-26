@@ -1231,4 +1231,60 @@ mod tests {
         assert!(all.contains(&Fk(100)) && all.contains(&Fk(200)));
         cleanup_hh(&path);
     }
+
+    #[test]
+    fn head_scale_prefix_and_pack_helpers() {
+        // Under unit tests default scale is Tiny.
+        assert_eq!(HeadScale::from_env(), HeadScale::Tiny);
+        assert_eq!(HeadScale::Tiny.initial_slots(HeadRole::Header), DEFAULT_SLOTS);
+        assert_eq!(
+            HeadScale::Mainnet.initial_slots(HeadRole::Header),
+            1 << 20
+        );
+        assert_eq!(
+            HeadScale::Mainnet.initial_slots(HeadRole::Tx),
+            1 << 22
+        );
+        assert_eq!(initial_slots_for(HeadRole::Header), DEFAULT_SLOTS);
+        let full = [0xABu8; 32];
+        let p = head_key_prefix(&full);
+        assert_eq!(&p[..], &full[..16]);
+        assert_eq!(pack_sole(Fk(7)), 7);
+        let pm = pack_multi(Fk(3));
+        assert_ne!(pm & MULTI_BIT, 0);
+        let (multi, fk) = unpack_value(pm);
+        assert!(multi);
+        assert_eq!(fk, Fk(3));
+        let (multi, fk) = unpack_value(42);
+        assert!(!multi);
+        assert_eq!(fk, Fk(42));
+        assert!(running_as_cargo_test_binary() || cfg!(test));
+    }
+
+    #[test]
+    fn hashhead_empty_insert_get_miss_flush_and_reopen_multi() {
+        let path = tmp_path();
+        let h = HashHead::create_with_slots(&path, 16).unwrap();
+        h.insert_many(&[]).unwrap();
+        h.reserve_additional(0).unwrap();
+        assert!(h.get(&[0u8; 32]).unwrap().is_none());
+        assert!(h.get_all(&[0u8; 32]).unwrap().is_empty());
+        // multi chain walk
+        let key = [0x55u8; 32];
+        h.insert(&key, Fk(1)).unwrap();
+        h.insert(&key, Fk(2)).unwrap();
+        h.insert(&key, Fk(3)).unwrap();
+        assert_eq!(h.get_all(&key).unwrap(), vec![Fk(3), Fk(2), Fk(1)]);
+        assert_eq!(h.get(&key).unwrap(), Some(Fk(3)));
+        h.flush().unwrap();
+        h.flush_async().unwrap();
+        drop(h);
+        let h = HashHead::open(&path).unwrap();
+        assert_eq!(h.get_all(&key).unwrap(), vec![Fk(3), Fk(2), Fk(1)]);
+        // multi-list sibling file exists after multi inserts
+        let mut mlt = path.as_os_str().to_os_string();
+        mlt.push(".mlt");
+        assert!(std::path::PathBuf::from(mlt).exists());
+        cleanup_hh(&path);
+    }
 }

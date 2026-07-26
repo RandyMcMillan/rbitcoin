@@ -49,3 +49,36 @@ impl From<io::Error> for NetError {
         NetError::Io(e)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn display_and_source_surface() {
+        let cases: Vec<(NetError, &str)> = vec![
+            (NetError::Io(io::Error::other("x")), "io:"),
+            (NetError::Encode("e".into()), "encode: e"),
+            (NetError::Protocol("p"), "protocol: p"),
+            (NetError::V1Peer, "peer does not speak BIP324 v2"),
+            (NetError::Bip324("b".into()), "bip324: b"),
+            (NetError::Timeout, "timeout"),
+            (NetError::Disconnected, "peer disconnected"),
+            (NetError::MessageTooLarge(9), "message too large (9 bytes)"),
+            (NetError::BadMagic, "wrong network magic"),
+            (NetError::Consensus("c".into()), "consensus: c"),
+        ];
+        for (err, needle) in cases {
+            let s = err.to_string();
+            assert!(s.contains(needle), "display={s:?} needle={needle}");
+            // Only Io exposes a source.
+            match &err {
+                NetError::Io(_) => assert!(err.source().is_some()),
+                _ => assert!(err.source().is_none()),
+            }
+        }
+        let from_io: NetError = io::Error::other("z").into();
+        assert!(matches!(from_io, NetError::Io(_)));
+    }
+}

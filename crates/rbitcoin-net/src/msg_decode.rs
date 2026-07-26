@@ -105,3 +105,59 @@ where
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::p2p::message::NetworkMessage;
+    use bitcoin::p2p::Magic;
+    use bitcoin::Network;
+    use std::sync::{Arc, Mutex};
+
+    fn verack_frame() -> FramedMessage {
+        let magic = Magic::from(Network::Regtest);
+        let payload = Vec::<u8>::new();
+        let dig = bitcoin::hashes::sha256d::Hash::hash(&payload);
+        let ba = dig.to_byte_array();
+        FramedMessage {
+            magic,
+            command: *b"verack\0\0\0\0\0\0",
+            checksum: [ba[0], ba[1], ba[2], ba[3]],
+            payload,
+        }
+    }
+
+    #[test]
+    fn decode_offload_light_and_spawn() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let msg = rt
+            .block_on(decode_framed_offload(verack_frame()))
+            .unwrap();
+        assert!(matches!(msg.payload(), NetworkMessage::Verack));
+
+        let done = Arc::new(Mutex::new(false));
+        let d2 = done.clone();
+        rt.block_on(async {
+            spawn_decode_then_with_err(
+                verack_frame(),
+                move |_| {
+                    *d2.lock().unwrap() = true;
+                },
+                || panic!("should not err"),
+            );
+            // Yield so the spawned task can finish.
+            tokio::task::yield_now().await;
+            for _ in 0..50 {
+                if *done.lock().unwrap() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+        assert!(*done.lock().unwrap());
+    }
+}

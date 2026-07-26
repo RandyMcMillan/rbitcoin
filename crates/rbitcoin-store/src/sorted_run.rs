@@ -1289,4 +1289,109 @@ mod tests {
         assert!(!manifest_path(&d).exists());
         let _ = fs::remove_dir_all(&d);
     }
+
+    #[test]
+    fn manifest_bad_magic_truncated_and_merge_mismatch() {
+        let d = tmp_dir();
+        // truncated MANIFEST
+        fs::write(manifest_path(&d), b"short").unwrap();
+        assert!(load_manifest(&d).unwrap().is_none());
+        // bad magic
+        let mut bad = MANIFEST_MAGIC.to_vec();
+        bad[0] ^= 0xff;
+        bad.extend_from_slice(&MANIFEST_VERSION.to_le_bytes());
+        bad.extend_from_slice(&0u32.to_le_bytes());
+        fs::write(manifest_path(&d), &bad).unwrap();
+        assert!(load_manifest(&d).unwrap().is_none());
+        // unsupported version
+        let mut badv = MANIFEST_MAGIC.to_vec();
+        badv.extend_from_slice(&99u32.to_le_bytes());
+        badv.extend_from_slice(&0u32.to_le_bytes());
+        fs::write(manifest_path(&d), &badv).unwrap();
+        assert!(load_manifest(&d).unwrap().is_none());
+
+        // merge len mismatch
+        let p1 = next_run_path(&d, 1);
+        let p2 = next_run_path(&d, 2);
+        write_sorted_run(&p1, 32, 44, &rec(1, 1)).unwrap();
+        write_sorted_run(&p2, 16, 32, &[0u8; 32]).unwrap(); // different lens
+        let r1 = open_run(&p1).unwrap();
+        let r2 = open_run(&p2).unwrap();
+        assert!(matches!(
+            merge_runs(&[r1.clone(), r2.clone()], &next_run_path(&d, 3)),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(matches!(
+            for_each_merged_rec(&[r1, r2], |_| Ok(())),
+            Err(StoreError::Corrupt(_))
+        ));
+
+        // open bad magic run
+        let pbad = d.join("bad.run");
+        fs::write(&pbad, b"notasortrunfile!!!!!!!!!!!!!").unwrap();
+        assert!(open_run(&pbad).is_err());
+
+        // list_materialize_claims missing dir
+        assert!(list_materialize_claims(&d.join("nope")).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn detach_remove_next_path_and_opts() {
+        let d = tmp_dir();
+        assert_eq!(
+            next_run_path(&d, 1).file_name().unwrap(),
+            "000001.run"
+        );
+        let p1 = next_run_path(&d, 1);
+        let mut body = Vec::new();
+        body.extend_from_slice(&rec(1, 10));
+        body.extend_from_slice(&rec(2, 20));
+        body.extend_from_slice(&rec(3, 30));
+        write_sorted_run(&p1, 32, 44, &body).unwrap();
+        assert_eq!(list_runs(&d).unwrap().len(), 1);
+
+        // Empty body (cataloged as seq 2)
+        let p_empty = next_run_path(&d, 2);
+        write_sorted_run(&p_empty, 32, 44, &[]).unwrap();
+        let empty = open_run(&p_empty).unwrap();
+        assert_eq!(empty.count, 0);
+        assert!(read_run_body(&empty).unwrap().is_empty());
+        verify_run_body(&empty).unwrap();
+
+        // for_each_merged with opts
+        let r = open_run(&p1).unwrap();
+        let mut n = 0u32;
+        for_each_merged_rec_opts(&[r], false, |rec| {
+            n += 1;
+            assert_eq!(rec.len(), 44);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(n, 3);
+        for_each_merged_rec_opts(&[], true, |_| unreachable!()).unwrap();
+
+        // detach leaves file but drops catalog entry
+        let run = open_run(&p1).unwrap();
+        detach_run(&run).unwrap();
+        assert!(p1.exists());
+        // remove deletes file (+ detach again is fine)
+        remove_run(&run).unwrap();
+        assert!(!p1.exists());
+
+        // bad lens
+        assert!(matches!(
+            write_sorted_run(&d.join("bad.run"), 0, 44, &[]),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(matches!(
+            write_sorted_run(&d.join("bad2.run"), 32, 44, &[1, 2, 3]),
+            Err(StoreError::Corrupt(_))
+        ));
+        // merge empty inputs
+        let out = next_run_path(&d, 9);
+        let merged = merge_runs(&[], &out).unwrap();
+        assert_eq!(merged.count, 0);
+        let _ = fs::remove_dir_all(&d);
+    }
 }

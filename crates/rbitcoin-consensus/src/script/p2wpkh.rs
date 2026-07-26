@@ -106,3 +106,71 @@ pub(crate) fn verify_with_keyhash(
         Err(ConsensusError::Script("p2wpkh ecdsa".into()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::{Amount, OutPoint, Sequence, TxIn, TxOut, Witness};
+    use crate::block::ScriptCheckJob;
+
+    fn job_with_witness(items: &[&[u8]]) -> ScriptCheckJob {
+        let mut spk = vec![0x00, 0x14];
+        spk.extend([0u8; 20]);
+        ScriptCheckJob {
+            prevouts: vec![TxOut {
+                value: Amount::from_sat(10),
+                script_pubkey: ScriptBuf::from_bytes(spk),
+            }],
+            tx: Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::from_slice(items),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            },
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+        }
+    }
+
+    #[test]
+    fn witness_shape_errors() {
+        let job = job_with_witness(&[]);
+        let mut cache = SighashCache::new(&job.tx);
+        assert!(verify(&job, 0, &job.tx, &mut cache).is_err());
+
+        let job = job_with_witness(&[&[0x01]]);
+        let mut cache = SighashCache::new(&job.tx);
+        assert!(verify(&job, 0, &job.tx, &mut cache).is_err());
+
+        let job = job_with_witness(&[&[], &[0x02; 33]]);
+        let mut cache = SighashCache::new(&job.tx);
+        assert!(verify(&job, 0, &job.tx, &mut cache).is_err());
+
+        let job = job_with_witness(&[&[0x30, 0x01, 0x01, 0x01], &[0x02; 33]]);
+        let mut cache = SighashCache::new(&job.tx);
+        let err = verify(&job, 0, &job.tx, &mut cache).unwrap_err();
+        assert!(format!("{err}").contains("p2wpkh"));
+
+        let redeem = {
+            let mut r = vec![0x00, 0x14];
+            r.extend([0u8; 20]);
+            r
+        };
+        let job = job_with_witness(&[&[0x01]]);
+        let mut cache = SighashCache::new(&job.tx);
+        assert!(verify_with_keyhash(&job, 0, &job.tx, &[0u8; 20], &redeem, &mut cache).is_err());
+    }
+}

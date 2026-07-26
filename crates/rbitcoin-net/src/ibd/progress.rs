@@ -212,6 +212,7 @@ mod tests {
         format_duration_short, format_rate, ibd_pct, tip_hole_from_ready, TipRateTracker,
     };
     use std::time::{Duration, Instant};
+    // TipRateTracker used by both format and EWMA surfaces.
 
     /// Pure helpers for progress lines (pct / tip-hole / duration formatting).
     #[test]
@@ -230,9 +231,75 @@ mod tests {
         assert_eq!(tip_hole_from_ready(&[false, false, false]), 3);
 
         assert_eq!(format_duration_short(45), "45s");
+        assert_eq!(format_duration_short(59), "59s");
+        assert_eq!(format_duration_short(60), "1m");
         assert_eq!(format_duration_short(120), "2m");
+        assert_eq!(format_duration_short(3_600), "1.0h");
+        assert_eq!(format_duration_short(9 * 3600), "9.0h");
+        assert_eq!(format_duration_short(36_000), "10h");
+        assert_eq!(format_duration_short(86_400), "1d");
+        assert_eq!(format_duration_short(2 * 86_400), "2d");
+        assert_eq!(format_duration_short(90_000), "1d1h");
+        assert_eq!(format_rate(0.0), "0.0");
         assert_eq!(format_rate(2.4), "2.4");
+        assert_eq!(format_rate(9.9), "9.9");
+        assert_eq!(format_rate(10.0), "10");
         assert_eq!(format_rate(31.2), "31");
+        assert_eq!(format_rate(f64::NAN), "0");
+        assert_eq!(format_rate(f64::INFINITY), "0");
+        assert_eq!(format_rate(-1.0), "0");
+
+        // ETA done path.
+        let mut done = TipRateTracker::new();
+        let t0 = Instant::now();
+        done.push(t0, 100);
+        assert_eq!(done.eta_string(t0 + Duration::from_secs(30), 100, 100), "done");
+    }
+
+    #[test]
+    fn work_chain_progress_tip_hole_and_high_water() {
+        use super::work_chain_progress;
+        use super::super::body::BodyPresence;
+        use bitcoin::hashes::Hash;
+        use bitcoin::BlockHash;
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_query::Query;
+        use std::collections::{HashSet, VecDeque};
+
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-wcp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+
+        let mut ordered = VecDeque::new();
+        let mut set = HashSet::new();
+        let mut body = BodyPresence::new();
+        // Ghost entry + unready hole + ready stop.
+        let ghost = BlockHash::from_byte_array([1u8; 32]);
+        let hole = BlockHash::from_byte_array([2u8; 32]);
+        let ready = BlockHash::from_byte_array([3u8; 32]);
+        ordered.push_back(ghost); // not in set
+        ordered.push_back(hole);
+        ordered.push_back(ready);
+        set.insert(hole);
+        set.insert(ready);
+        body.mark_missing(hole);
+        body.mark_archived(ready);
+
+        let p = work_chain_progress(&hub, &ordered, &set, &mut body, 50, 10);
+        assert_eq!(p.tip, 0);
+        assert_eq!(p.archived, 10); // max(tip, max_archived)
+        assert_eq!(p.headers, 50);
+        assert_eq!(p.tip_hole, 1); // hole then ready breaks
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// EWMA tip-rate: warmup gate, steady ETA, spike resistance, sustained slowdown.

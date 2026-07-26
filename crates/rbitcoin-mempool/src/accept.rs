@@ -900,4 +900,127 @@ mod tests {
         assert_eq!(mp2.live_count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn accept_error_display_and_reject_paths() {
+        use std::error::Error;
+        let errs = [
+            AcceptError::Policy("x".into()),
+            AcceptError::MissingPrevout(OutPoint {
+                txid: Txid::from_byte_array([1; 32]),
+                vout: 0,
+            }),
+            AcceptError::Duplicate(Txid::from_byte_array([2; 32])),
+            AcceptError::ClusterTooLarge {
+                count: 3,
+                weight: 9,
+            },
+            AcceptError::PackageTooLarge {
+                count: 2,
+                weight: 8,
+            },
+            AcceptError::PackageEmpty,
+            AcceptError::PackageNotTopo,
+            AcceptError::RbfInsufficient,
+            AcceptError::Coinbase,
+            AcceptError::NotFound(Txid::from_byte_array([3; 32])),
+            AcceptError::Durable("d".into()),
+            AcceptError::Script("s".into()),
+        ];
+        for e in &errs {
+            assert!(!e.to_string().is_empty());
+            let _ = e as &dyn Error;
+        }
+        // From MempoolError.
+        let from_io: AcceptError = MempoolError::BadMagic.into();
+        assert!(from_io.to_string().contains("durable"));
+
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(100_000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+
+        // Coinbase reject.
+        let cb = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        assert!(matches!(
+            mp.accept_tx(&cb, &utxos),
+            Err(AcceptError::Coinbase)
+        ));
+
+        // Package empty / too large.
+        assert!(matches!(
+            mp.accept_package(&[], &utxos),
+            Err(AcceptError::PackageEmpty)
+        ));
+
+        let tx = spend_tx(op, 99_000);
+        mp.accept_tx(&tx, &utxos).unwrap();
+        // Duplicate.
+        assert!(matches!(
+            mp.accept_tx(&tx, &utxos),
+            Err(AcceptError::Duplicate(_))
+        ));
+
+        // Missing prevout.
+        let (op2, _, empty) = chain_utxo(50_000);
+        let missing = spend_tx(
+            OutPoint {
+                txid: Txid::from_byte_array([0xcd; 32]),
+                vout: 0,
+            },
+            1,
+        );
+        assert!(matches!(
+            mp.accept_tx(&missing, &empty),
+            Err(AcceptError::MissingPrevout(_))
+        ));
+        let _ = op2;
+
+        // maybe_compact with only live → None.
+        assert!(mp.maybe_compact().unwrap().is_none());
+
+        // Package coinbase / not topo / oversized count.
+        assert!(matches!(
+            mp.accept_package(&[cb], &utxos),
+            Err(AcceptError::Coinbase)
+        ));
+        let a = spend_tx(op, 98_000);
+        let b = spend_tx(
+            OutPoint {
+                txid: a.compute_txid(),
+                vout: 0,
+            },
+            97_000,
+        );
+        // Child before parent → not topo.
+        assert!(matches!(
+            mp.accept_package(&[b.clone(), a.clone()], &utxos),
+            Err(AcceptError::PackageNotTopo)
+        ));
+        // Duplicate in package.
+        assert!(matches!(
+            mp.accept_package(&[a.clone(), a.clone()], &utxos),
+            Err(AcceptError::Duplicate(_))
+        ));
+
+        // remove unknown.
+        assert!(matches!(
+            mp.remove_txid(&Txid::from_byte_array([0xee; 32])),
+            Err(AcceptError::NotFound(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

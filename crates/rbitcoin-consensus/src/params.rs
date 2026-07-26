@@ -361,4 +361,47 @@ mod tests {
             "00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983"
         );
     }
+
+    #[test]
+    fn for_network_and_helpers() {
+        use rbitcoin_primitives::Network;
+        assert_eq!(
+            ChainParams::for_network(Network::Mainnet).network,
+            bitcoin::Network::Bitcoin
+        );
+        assert_eq!(
+            ChainParams::for_network(Network::Testnet).network,
+            bitcoin::Network::Testnet
+        );
+        assert_eq!(
+            ChainParams::for_network(Network::Signet).network,
+            bitcoin::Network::Signet
+        );
+        assert_eq!(
+            ChainParams::for_network(Network::Regtest).network,
+            bitcoin::Network::Regtest
+        );
+
+        let tn = ChainParams::testnet();
+        assert_eq!(tn.csv_height(), 770_112);
+        assert_eq!(tn.segwit_height(), 834_624);
+        assert_eq!(tn.taproot_height(), 2_011_968);
+        assert_eq!(tn.coinbase_maturity(), 100);
+        assert!(!tn.no_pow_retargeting());
+        let _ = tn.min_difficulty_target();
+        assert!(tn.difficulty_adjustment_interval() > 0);
+        assert!(tn.bip34_active_at(tn.btc.bip34_height));
+        assert!(tn.bip65_active_at(tn.btc.bip65_height));
+        assert!(tn.bip66_active_at(tn.btc.bip66_height));
+        assert!(tn.csv_active_at(tn.csv_height()));
+        assert!(tn.taproot_active_at(tn.taproot_height()));
+        assert!(check_genesis_hash(&tn, tn.genesis_hash));
+        let g = genesis_block(&tn);
+        assert_eq!(g.block_hash(), tn.genesis_hash);
+
+        let rt = ChainParams::regtest();
+        assert!(rt.no_pow_retargeting() || rt.difficulty_adjustment_interval() > 0);
+        // Missing checkpoint → None.
+        assert!(rt.checkpoint_at(Height(1)).is_none());
+    }
 }

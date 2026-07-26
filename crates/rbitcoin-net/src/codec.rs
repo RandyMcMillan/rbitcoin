@@ -246,4 +246,78 @@ mod tests {
         // Stricter than rust-bitcoin's 5MB
         assert!(MAX_PROTOCOL_MESSAGE_LENGTH < bitcoin::p2p::message::MAX_MSG_SIZE);
     }
+
+    #[test]
+    fn frame_helpers_ping_headers_notfound_and_encode_cost() {
+        use bitcoin::hashes::Hash as _;
+        let magic = signet_magic();
+        let nonce: u64 = 0x1122_3344_5566_7788;
+        let payload = nonce.to_le_bytes().to_vec();
+        let dig = bitcoin::hashes::sha256d::Hash::hash(&payload);
+        let ba = dig.to_byte_array();
+        let ping = FramedMessage {
+            magic,
+            command: *b"ping\0\0\0\0\0\0\0\0",
+            checksum: [ba[0], ba[1], ba[2], ba[3]],
+            payload: payload.clone(),
+        };
+        assert!(ping.is_ping());
+        assert_eq!(ping.ping_nonce(), Some(nonce));
+        assert!(!ping.decode_is_cpu_heavy());
+
+        let short = FramedMessage {
+            magic,
+            command: *b"ping\0\0\0\0\0\0\0\0",
+            checksum: [0; 4],
+            payload: vec![1, 2, 3],
+        };
+        assert!(short.ping_nonce().is_none());
+
+        let headers = FramedMessage {
+            magic,
+            command: *b"headers\0\0\0\0\0",
+            checksum: [0; 4],
+            payload: vec![],
+        };
+        assert!(headers.is_headers());
+        assert!(headers.decode_is_cpu_heavy());
+        assert!(headers.block_hash_from_header().is_none());
+
+        let nf = FramedMessage {
+            magic,
+            command: *b"notfound\0\0\0\0",
+            checksum: [0; 4],
+            payload: vec![],
+        };
+        assert!(nf.is_notfound());
+        assert!(nf.decode_is_cpu_heavy());
+
+        // Corrupt payload → Unknown path (not a panic).
+        let bad = FramedMessage {
+            magic,
+            command: *b"block\0\0\0\0\0\0\0",
+            checksum: [0; 4],
+            payload: vec![0u8; 10],
+        };
+        match bad.decode().payload() {
+            NetworkMessage::Unknown { command, .. } => {
+                assert_eq!(command.to_string(), "block");
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+
+        assert!(!encode_is_cpu_heavy(&NetworkMessage::Verack));
+        assert!(encode_is_cpu_heavy(&NetworkMessage::Headers(vec![])));
+        // Small inv is cheap; large is heavy.
+        use bitcoin::p2p::message_blockdata::Inventory;
+        let small = NetworkMessage::Inv(vec![Inventory::Block(
+            bitcoin::BlockHash::from_byte_array([0; 32]),
+        )]);
+        assert!(!encode_is_cpu_heavy(&small));
+        let large = NetworkMessage::Inv(vec![
+            Inventory::Block(bitcoin::BlockHash::from_byte_array([0; 32]));
+            65
+        ]);
+        assert!(encode_is_cpu_heavy(&large));
+    }
 }

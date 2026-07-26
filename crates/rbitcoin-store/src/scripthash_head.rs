@@ -908,4 +908,81 @@ mod tests {
         assert!(h.get(&key).unwrap().is_none());
         let _ = std::fs::remove_file(&path);
     }
+
+    /// Rehash, bulk_fill_empty, empty insert_many, clear miss, for_each, open.
+    #[test]
+    fn scripthash_head_rehash_bulk_and_for_each() {
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-shhead-rehash-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let h = ScriptHashHead::create_with_slots(&path, 8).unwrap(); // tiny → force rehash
+        h.insert_many(&[]).unwrap();
+        // Empty values clear path
+        let mut k0 = [0u8; 32];
+        k0[0] = 1;
+        h.insert(&k0, &ShHeadValue::Empty).unwrap();
+        assert!(!h.clear_key(&k0).unwrap()); // miss
+
+        let mut batch = Vec::new();
+        for i in 0u64..40 {
+            let mut key = [0u8; 32];
+            key[0..8].copy_from_slice(&i.to_le_bytes());
+            let val = if i % 3 == 0 {
+                ShHeadValue::inline_two(ShEntry::new(Fk(i + 1)), ShEntry::new(Fk(i + 100)))
+            } else if i % 3 == 1 {
+                ShHeadValue::inline_one(ShEntry::new(Fk(i + 1)))
+            } else {
+                ShHeadValue::Slab {
+                    class: 0,
+                    used: 3,
+                    slab_off: 4112 + i,
+                }
+            };
+            batch.push((key, val));
+        }
+        h.insert_many(&batch).unwrap();
+        // bulk path already used on first fill; re-insert more for rehash
+        let mut more = Vec::new();
+        for i in 40u64..80 {
+            let mut key = [0u8; 32];
+            key[0..8].copy_from_slice(&i.to_le_bytes());
+            more.push((key, ShHeadValue::inline_one(ShEntry::new(Fk(i + 1)))));
+        }
+        h.insert_many(&more).unwrap();
+        let mut seen = 0u64;
+        h.for_each_occupied(|full, val| {
+            assert!(!val.is_empty());
+            assert!(full.iter().any(|&b| b != 0) || full == [0u8; 32]);
+            seen += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert!(seen >= 70);
+        h.flush().unwrap();
+        h.flush_async().unwrap();
+        drop(h);
+        let h2 = ScriptHashHead::open(&path).unwrap();
+        let mut key = [0u8; 32];
+        key[0..8].copy_from_slice(&5u64.to_le_bytes());
+        assert!(h2.get(&key).unwrap().is_some());
+        // corrupt size open
+        {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len((FILE_HEADER_LEN + 3) as u64)
+                .unwrap();
+        }
+        assert!(matches!(
+            ScriptHashHead::open(&path),
+            Err(StoreError::Corrupt(_))
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
 }

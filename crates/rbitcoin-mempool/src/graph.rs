@@ -535,4 +535,55 @@ mod tests {
         let parents: BTreeSet<Txid> = [last].into_iter().collect();
         assert!(g.cluster_would_exceed(&parents, 1, 100));
     }
+
+    #[test]
+    fn conflict_set_fee_weight_remove_and_worst() {
+        let mut g = TxGraph::new();
+        let parent = make_tx(None, 1, 10);
+        let pe = entry_for(&parent, 100, 0);
+        let pid = pe.txid;
+        g.insert(pe, &parent);
+
+        let child = make_tx(Some((pid, 0)), 1, 11);
+        let ce = entry_for(&child, 50, 1);
+        let cid = ce.txid;
+        g.insert(ce, &child);
+
+        // Missing cluster.
+        assert!(g.cluster_of(&txid_n(0xff)).is_none());
+
+        let direct = vec![pid];
+        let set = g.conflict_set(&direct);
+        assert!(set.contains(&pid));
+        assert!(set.contains(&cid));
+        let (fee, w) = g.set_fee_weight(&set);
+        assert_eq!(fee, 150);
+        assert!(w > 0);
+
+        assert!(g.worst_chunk().is_some());
+
+        // Remove child then parent.
+        assert!(g.remove(&cid, &child).is_some());
+        assert!(!g.contains(&cid));
+        assert!(g.remove(&pid, &parent).is_some());
+        assert!(g.worst_chunk().is_none());
+        assert!(g.remove(&pid, &parent).is_none());
+    }
+
+    #[test]
+    fn rebuild_from_orders_parents_first() {
+        let mut g = TxGraph::new();
+        let parent = make_tx(None, 1, 20);
+        let child = make_tx(Some((parent.compute_txid(), 0)), 1, 21);
+        // Deliberately child-first in input list.
+        let items = vec![
+            (entry_for(&child, 10, 1), child.clone()),
+            (entry_for(&parent, 10, 0), parent.clone()),
+        ];
+        g.rebuild_from(items);
+        assert!(g.contains(&parent.compute_txid()));
+        assert!(g.contains(&child.compute_txid()));
+        let c = g.cluster_of(&parent.compute_txid()).unwrap();
+        assert_eq!(c.members.len(), 2);
+    }
 }

@@ -44,3 +44,37 @@ impl From<StoreError> for ConsensusError {
         ConsensusError::Store(e)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn display_and_source_cover_all_variants() {
+        let store = ConsensusError::Store(StoreError::NotFound);
+        assert!(store.to_string().contains("store:"));
+        assert!(store.source().is_some());
+
+        let cases: &[(ConsensusError, &str)] = &[
+            (ConsensusError::BadHeader("bits"), "bad header: bits"),
+            (ConsensusError::BadBlock("empty"), "bad block: empty"),
+            (ConsensusError::BadTx("fee"), "bad transaction: fee"),
+            (ConsensusError::Script("sig".into()), "script verification failed: sig"),
+            (ConsensusError::MissingPrevout, "missing prevout"),
+            (ConsensusError::PrevoutSpent, "prevout already spent on best chain"),
+            (ConsensusError::InvalidPow, "pow invalid"),
+            (ConsensusError::BadPrev, "unexpected previous header"),
+        ];
+        for (err, needle) in cases {
+            assert_eq!(err.to_string(), *needle);
+            assert!(err.source().is_none());
+        }
+    }
+
+    #[test]
+    fn from_store_error() {
+        let e: ConsensusError = StoreError::NotFound.into();
+        assert!(matches!(e, ConsensusError::Store(StoreError::NotFound)));
+    }
+}

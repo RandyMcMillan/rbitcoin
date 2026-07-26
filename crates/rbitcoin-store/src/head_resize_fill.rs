@@ -88,6 +88,79 @@ pub fn run_shadow_fill_uring(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address_head::{AddressHead, HeadLayout};
+    use crate::tx_table::{
+        encode_packed_tx, InputRecord, OutputRecord, TxRecord,
+    };
+    use rbitcoin_primitives::TableKind;
+
+    #[test]
+    fn shadow_fill_empty_range_and_pack_ud() {
+        assert_eq!(pack_ud(KIND_BODY, 7) >> KIND_SHIFT, KIND_BODY);
+        let (k, s) = unpack_ud(pack_ud(KIND_IDX, 42));
+        assert_eq!((k, s), (KIND_IDX, 42));
+
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-hfill-range-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = VarTable::create(&dir, "tx", TableKind::Tx).unwrap();
+        let shadow = AddressHead::create_with_layout(
+            dir.join("shadow"),
+            HeadLayout::new(12).unwrap(),
+        )
+        .unwrap();
+        // last < first always Ok
+        assert!(run_shadow_fill_uring(&body, &shadow, 5, 4).is_ok());
+
+        if !bulk_io::io_uring_enabled() {
+            // empty body + range → unavailable / not found
+            assert!(run_shadow_fill_uring(&body, &shadow, 1, 1).is_err());
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        // Build many packed Class A bodies directly in VarTable (> IDX_BATCH).
+        const N: u64 = 1100;
+        body
+            .put_batch_encode(N as usize, N as usize * 80, |i, buf| {
+                let mut txid = [0u8; 32];
+                let i = i as u64;
+                txid[0..8].copy_from_slice(&i.to_le_bytes());
+                txid[8] = (i % 17) as u8;
+                let tx = TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                };
+                let inputs = [InputRecord::coinbase(u32::MAX, vec![], vec![])];
+                let outputs = [OutputRecord::unspent(1, vec![0x51])];
+                encode_packed_tx(&tx, &inputs, &outputs, buf);
+            })
+            .unwrap();
+        assert_eq!(body.count(), N);
+        run_shadow_fill_uring(&body, &shadow, 1, N).unwrap();
+        assert_eq!(shadow.occupied(), N);
+        assert!(matches!(
+            run_shadow_fill_uring(&body, &shadow, 1, N + 50),
+            Err(StoreError::NotFound)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn run_linux(
     body: &VarTable,

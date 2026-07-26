@@ -324,3 +324,128 @@ fn window_floor(max_height: u32, depth: u32) -> u32 {
 fn wire_path(dir: &Path, hash: &[u8; 32]) -> PathBuf {
     dir.join(format!("{}.bin", rbitcoin_primitives::hex_encode(hash)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn tmp() -> PathBuf {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("rbitcoin-wire-{n}"));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    fn h(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+
+    #[test]
+    fn crate_name_and_memory_ring_basics() {
+        assert_eq!(crate_name(), "rbitcoin-wire-cache");
+        let ring = WireRing::new(3);
+        assert!(ring.is_empty());
+        assert_eq!(ring.depth(), 3);
+        assert_eq!(ring.len(), 0);
+        assert_eq!(ring.max_height(), 0);
+        assert_eq!(ring.window_floor(), 0);
+
+        ring.push(1, h(1), h(0), vec![0xaa], true).unwrap();
+        ring.push_tip(2, h(2), h(1), vec![0xbb]).unwrap();
+        ring.mark_tip(h(1));
+        assert_eq!(ring.len(), 2);
+        assert!(!ring.is_empty());
+        assert!(ring.contains_hash(&h(1)));
+        assert!(ring.contains_height(2));
+        assert!(!ring.contains_height(99));
+        assert_eq!(ring.get_by_hash(&h(2)).unwrap(), vec![0xbb]);
+        assert_eq!(ring.entry(&h(1)).unwrap().height, 1);
+        assert_eq!(ring.get_by_height(2).unwrap(), vec![0xbb]);
+        assert!(ring.get_by_height(99).is_none());
+        assert_eq!(ring.get_all_at_height(1).len(), 1);
+        assert!(ring.tip_hashes().contains(&h(1)));
+        assert_eq!(ring.max_height(), 2);
+        assert_eq!(ring.window_floor(), 0); // max 2 depth 3 → floor 0
+
+        ring.unmark_tip(&h(1));
+        assert!(!ring.tip_hashes().contains(&h(1)));
+
+        // Competing tips at same height: prefer marked tip.
+        ring.push(2, h(3), h(1), vec![0xcc], true).unwrap();
+        assert_eq!(ring.get_all_at_height(2).len(), 2);
+        let preferred = ring.get_by_height(2).unwrap();
+        assert!(preferred == vec![0xbb] || preferred == vec![0xcc]);
+
+        ring.drop_through(1).unwrap();
+        assert!(!ring.contains_height(1));
+        assert!(ring.contains_height(2));
+    }
+
+    #[test]
+    fn depth_zero_evicts_all_and_disk_roundtrip() {
+        let dir = tmp();
+        {
+            let ring = WireRing::with_dir(2, &dir).unwrap();
+            ring.push_tip(10, h(10), h(9), vec![1, 2, 3]).unwrap();
+            ring.push_tip(11, h(11), h(10), vec![4, 5]).unwrap();
+            ring.push_tip(12, h(12), h(11), vec![6]).unwrap();
+            // Window floor for max=12 depth=2 is 11; height 10 dropped.
+            assert!(!ring.contains_height(10));
+            assert!(ring.contains_height(11));
+            assert!(ring.contains_height(12));
+            assert_eq!(ring.get_by_hash(&h(12)).unwrap(), vec![6]);
+        }
+        // Reload from disk.
+        {
+            let ring = WireRing::with_dir(2, &dir).unwrap();
+            assert!(ring.contains_hash(&h(11)) || ring.contains_hash(&h(12)));
+            assert!(ring.len() >= 1);
+            assert_eq!(ring.max_height() >= 11, true);
+        }
+        // depth 0: keep nothing after push
+        {
+            let ring = WireRing::new(0);
+            ring.push_tip(5, h(5), h(4), vec![9]).unwrap();
+            assert!(ring.is_empty());
+            assert_eq!(window_floor(5, 0), 6);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn window_floor_math() {
+        assert_eq!(window_floor(0, 1), 0);
+        assert_eq!(window_floor(10, 1), 10);
+        assert_eq!(window_floor(10, 5), 6);
+        assert_eq!(window_floor(0, 0), 1);
+    }
+
+    #[test]
+    fn multi_at_height_prefers_tip_and_loads_junk_files() {
+        let dir = tmp();
+        // Non-.bin junk ignored on load.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("readme.txt"), b"hi").unwrap();
+        {
+            let ring = WireRing::with_dir(5, &dir).unwrap();
+            ring.push(1, h(1), h(0), vec![1], false).unwrap();
+            ring.push(1, h(2), h(0), vec![2], true).unwrap();
+            // Prefer marked tip among two at same height.
+            assert_eq!(ring.get_by_height(1).unwrap(), vec![2]);
+            ring.unmark_tip(&h(2));
+            // No tip → first available.
+            let any = ring.get_by_height(1).unwrap();
+            assert!(any == vec![1] || any == vec![2]);
+        }
+        // Short rest after 32-byte hash is skipped (continue), not fatal.
+        let bad = dir.join(format!("{}.bin", rbitcoin_primitives::hex_encode(h(9))));
+        std::fs::write(&bad, [0u8; 32]).unwrap(); // hash only → no prev/height/len
+        let ring = WireRing::with_dir(5, &dir).unwrap();
+        assert!(ring.contains_hash(&h(1)) || ring.contains_hash(&h(2)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

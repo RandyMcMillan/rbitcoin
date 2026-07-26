@@ -1,13 +1,15 @@
 //! Growable mmap-backed table files with a common header.
 //!
-//! # Concurrency (lock-free hot path)
+//! # Concurrency (brief epoch pin, no long map mutex)
 //!
 //! - **Published logical length** is an `AtomicU64` (Acquire/Release).
 //! - **Map capacity** uses epochs: grow fallocates + maps a new window on the
-//!   same file, then swaps an `Arc` pointer. Readers pin the epoch they load;
-//!   old epochs live until the last pin drops (same idea as `tx.head` shadow
-//!   swap — no reader pause for capacity).
-//! - Steady-state **read / write** do **not** take a map mutex.
+//!   same file, then swaps an `Arc` under a short write lock. Readers pin by
+//!   cloning that `Arc` under a shared read lock (no load/increment UAF window).
+//!   Old epochs live until the last pin drops (same idea as `tx.head` shadow
+//!   swap — readers never pause for capacity *mapping* work).
+//! - Steady-state **read / write** memcpy does **not** hold the epoch lock past
+//!   the pin clone.
 //! - `File` is only locked for grow (`fallocate`/`set_len`), fsync, and fadvise.
 //!
 //! Roles (see `AGENTS.md` / `docs/concurrency.md`): at most one appender and one
@@ -21,8 +23,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 pub const FILE_HEADER_LEN: usize = 16;
 
@@ -66,8 +68,9 @@ pub struct TableFile {
     /// Cloned FD for lock-free [`pread`](Self::pread_at) / io_uring bulk reads.
     /// Same inode as `file`; concurrent pread is safe with the role protocol.
     read_file: File,
-    /// Always non-null after construction. Loaded with Arc refcount bump.
-    epoch: AtomicPtr<MapEpoch>,
+    /// Current map epoch. Pin clones under a short shared lock; grow replaces
+    /// under a write lock. Avoids the AtomicPtr load/increment free race.
+    epoch: RwLock<Arc<MapEpoch>>,
     /// Logical length including header/trailer (published HWM).
     published_len: AtomicU64,
     /// When true: [`TRAILING_FOOTER_LEN`]-byte magic+HWM+layout trailer is at
@@ -79,56 +82,29 @@ pub struct TableFile {
     kind: TableKind,
 }
 
-impl Drop for TableFile {
-    fn drop(&mut self) {
-        let p = self.epoch.load(Ordering::Acquire);
-        if !p.is_null() {
-            // SAFETY: we own the last "stored" strong ref installed at create/open/grow.
-            unsafe {
-                drop(Arc::from_raw(p));
-            }
-        }
-    }
-}
-
 impl TableFile {
-    fn install_epoch(epoch: Arc<MapEpoch>) -> AtomicPtr<MapEpoch> {
-        let ptr = Arc::into_raw(epoch) as *mut MapEpoch;
-        AtomicPtr::new(ptr)
+    fn install_epoch(epoch: Arc<MapEpoch>) -> RwLock<Arc<MapEpoch>> {
+        RwLock::new(epoch)
     }
 
-    /// Load a pin of the current epoch (lock-free).
+    /// Pin the current map epoch (shared read lock only for the Arc clone).
     fn pin(&self) -> EpochPin {
-        loop {
-            let p = self.epoch.load(Ordering::Acquire);
-            if p.is_null() {
-                std::hint::spin_loop();
-                continue;
-            }
-            // SAFETY: p is a live Arc allocation; we bump then re-check.
-            unsafe {
-                Arc::increment_strong_count(p);
-                if self.epoch.load(Ordering::Acquire) != p {
-                    Arc::decrement_strong_count(p);
-                    continue;
-                }
-                return EpochPin {
-                    epoch: Arc::from_raw(p),
-                };
-            }
+        EpochPin {
+            epoch: Arc::clone(
+                &self
+                    .epoch
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner()),
+            ),
         }
     }
 
     /// Publish a new map epoch; old epoch freed when last pin drops.
     fn publish_epoch(&self, new: Arc<MapEpoch>) {
-        let new_ptr = Arc::into_raw(new) as *mut MapEpoch;
-        let old = self.epoch.swap(new_ptr, Ordering::AcqRel);
-        if !old.is_null() {
-            // SAFETY: drops the stored strong ref on the previous epoch.
-            unsafe {
-                drop(Arc::from_raw(old));
-            }
-        }
+        *self
+            .epoch
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = new;
     }
 
     pub fn create(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
@@ -882,6 +858,9 @@ mod advise_tests {
         use std::sync::Barrier;
         use std::thread;
 
+        let _stress = TEST_MMAP_STRESS_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("rbitcoin-epoch-stress-{id}"));
@@ -967,9 +946,140 @@ mod advise_tests {
         assert_ne!(head, [0u8; 8]);
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn load_store_u32_u64_zero_range_trailing_and_open_errors() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("rbitcoin-file-atomics-{id}"));
+        let _ = std::fs::remove_file(&path);
+        let f = TableFile::create(&path, TableKind::Tx).unwrap();
+        // Grow published range for atomics
+        let payload = [0u8; 64];
+        f.write_at(FILE_HEADER_LEN as u64, &payload).unwrap();
+        let off32 = FILE_HEADER_LEN as u64; // aligned
+        let off64 = FILE_HEADER_LEN as u64 + 8;
+        f.store_u32_le(off32, 0x1122_3344).unwrap();
+        assert_eq!(f.load_u32_le(off32).unwrap(), 0x1122_3344);
+        f.store_u64_le(off64, 0x0102_0304_0506_0708).unwrap();
+        assert_eq!(f.load_u64_le(off64).unwrap(), 0x0102_0304_0506_0708);
+        assert!(matches!(
+            f.load_u32_le(off32 + 1),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(matches!(
+            f.store_u64_le(off64 + 1, 0),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(matches!(
+            f.load_u32_le(10_000),
+            Err(StoreError::Corrupt(_))
+        ));
+        f.zero_range(0, 0).unwrap();
+        f.zero_range(FILE_HEADER_LEN as u64 + 32, 16).unwrap();
+        f.set_logical_len(FILE_HEADER_LEN as u64 + 48).unwrap();
+        assert!(matches!(
+            f.set_logical_len(0),
+            Err(StoreError::Corrupt(_))
+        ));
+        // with_bytes past end
+        assert!(matches!(
+            f.with_bytes(FILE_HEADER_LEN as u64, 10_000, |_| ()),
+            Err(StoreError::Corrupt(_))
+        ));
+        drop(f);
+
+        // Bad magic / schema / kind
+        {
+            let bad = std::env::temp_dir().join(format!("rbitcoin-file-bad-{id}"));
+            let _ = std::fs::remove_file(&bad);
+            std::fs::write(&bad, b"XXXX\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00").unwrap();
+            assert!(matches!(
+                TableFile::open(&bad, TableKind::Tx),
+                Err(StoreError::BadMagic)
+            ));
+            let _ = std::fs::remove_file(&bad);
+        }
+        // Trailing header create/open
+        {
+            let th = std::env::temp_dir().join(format!("rbitcoin-file-trail-{id}"));
+            let _ = std::fs::remove_file(&th);
+            let f = TableFile::create_trailing_header(&th, TableKind::HashHead).unwrap();
+            let data_bytes = 64u64;
+            f.set_logical_len(data_bytes + TRAILING_FOOTER_LEN as u64)
+                .unwrap();
+            f.write_at(0, &[0xABu8; 64]).unwrap();
+            f.flush().unwrap();
+            drop(f);
+            let (f2, _ext) =
+                TableFile::open_trailing_header(&th, TableKind::HashHead, data_bytes).unwrap();
+            let mut b = [0u8; 4];
+            f2.read_at(0, &mut b).unwrap();
+            assert_eq!(b, [0xAB; 4]);
+            // short table
+            assert!(matches!(
+                TableFile::open_trailing_header(&th, TableKind::HashHead, 1_000_000),
+                Err(StoreError::Corrupt(_))
+            ));
+            // wrong kind
+            assert!(matches!(
+                TableFile::open_trailing_header(&th, TableKind::Tx, data_bytes),
+                Err(StoreError::BadKind { .. })
+            ));
+            let _ = std::fs::remove_file(&th);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn table_file_surface_and_nofile_budget() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("rbitcoin-file-surface-{id}"));
+        let _ = std::fs::remove_file(&path);
+        let f = TableFile::create(&path, TableKind::Tx).unwrap();
+        assert!(f.logical_len() >= FILE_HEADER_LEN as u64);
+        let payload = b"hello-table";
+        f.write_at(FILE_HEADER_LEN as u64, payload).unwrap();
+        let mut buf = vec![0u8; payload.len()];
+        f.read_at(FILE_HEADER_LEN as u64, &mut buf).unwrap();
+        assert_eq!(&buf, payload);
+        f.with_bytes(FILE_HEADER_LEN as u64, payload.len() as u64, |b| {
+            assert_eq!(b, payload);
+        })
+        .unwrap();
+        f.ensure_capacity(f.logical_len() + 4096).unwrap();
+        f.flush().unwrap();
+        f.flush_async().unwrap();
+        let fd = f.read_fd();
+        assert!(fd >= 0);
+        drop(f);
+        let f = TableFile::open(&path, TableKind::Tx).unwrap();
+        let mut buf2 = vec![0u8; payload.len()];
+        f.read_at(FILE_HEADER_LEN as u64, &mut buf2).unwrap();
+        assert_eq!(&buf2, payload);
+        // Bad kind
+        assert!(matches!(
+            TableFile::open(&path, TableKind::Header),
+            Err(StoreError::BadKind { .. })
+        ));
+        drop(f);
+        // nofile budget is best-effort
+        let (soft, hard) = ensure_nofile_budget();
+        assert!(soft > 0 || hard > 0 || cfg!(not(unix)));
+        let (s2, _) = ensure_nofile_budget_at_least(64);
+        assert!(s2 >= 64 || cfg!(not(unix)) || soft == 0);
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 pub const NOFILE_SOFT_TARGET: u64 = 16_384;
+
+/// Process-wide lock for multi-thread mmap stress tests (grow / concurrent
+/// readers / online head resize). Tests still run their own workers; this only
+/// prevents *cross-test* overlap that has shown intermittent heap corruption.
+#[cfg(test)]
+pub(crate) static TEST_MMAP_STRESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 
 pub fn ensure_nofile_budget() -> (u64, u64) {

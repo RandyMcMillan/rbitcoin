@@ -299,4 +299,21 @@ mod tests {
         assert_eq!(len, 50);
         assert!(fifo >= 50 && fifo < 50 * 4, "fifo={fifo}");
     }
+
+    #[test]
+    fn empty_ops_null_fk_and_reserve() {
+        let s = ArchiveTxidSticky::new(2);
+        s.insert_many(&[]);
+        assert!(s.lookup_batch(&[]).is_empty());
+        s.reserve_for_prewarm(8);
+        let t1 = [1u8; 32];
+        let t2 = [2u8; 32];
+        let t3 = [3u8; 32];
+        s.insert_many(&[(t1, Fk::NULL), (t1, Fk(1)), (t2, Fk(2)), (t3, Fk(3))]);
+        assert!(s.len() <= 2);
+        // Update existing fk.
+        s.insert_many(&[(t3, Fk(30))]);
+        let hit = s.lookup_batch(&[t1, t2, t3]);
+        assert!(hit.len() <= 2);
+    }
 }

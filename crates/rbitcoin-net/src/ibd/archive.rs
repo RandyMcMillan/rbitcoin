@@ -1862,4 +1862,77 @@ mod tests {
         let b = ArchiveQueueBudget::new(1);
         assert_eq!(b.budget_bytes(), 16 * 1024 * 1024);
     }
+
+    #[test]
+    fn pipeline_sample_helpers_and_stats_reset() {
+        let stats = ArchivePipelineStats::default();
+        stats.prep_ns.store(5_000_000, Ordering::Relaxed);
+        stats.prep_blocks.store(2, Ordering::Relaxed);
+        stats.write_ns.store(8_000_000, Ordering::Relaxed);
+        stats.write_batches.store(2, Ordering::Relaxed);
+        stats.write_blocks.store(4, Ordering::Relaxed);
+        stats.write_batch_blocks.store(4, Ordering::Relaxed);
+        stats.write_idle_ns.store(1_000_000, Ordering::Relaxed);
+        stats.write_coalesce_ns.store(2_000_000, Ordering::Relaxed);
+        let s = stats.sample_and_reset();
+        assert_eq!(s.prep_us_per_block(), 2500);
+        assert_eq!(s.write_us_per_block(), 2000);
+        assert_eq!(s.avg_batch(), 2);
+        assert_eq!(s.write_busy_ms(), 8);
+        assert_eq!(s.write_idle_ms(), 1);
+        assert_eq!(s.write_coalesce_ms(), 2);
+        assert_eq!(s.prep_ms(), 5);
+        // Empty sample → zeros.
+        let z = ArchivePipelineSample::default();
+        assert_eq!(z.prep_us_per_block(), 0);
+        assert_eq!(z.write_us_per_block(), 0);
+        assert_eq!(z.avg_batch(), 0);
+        // Counters cleared.
+        let z2 = stats.sample_and_reset();
+        assert_eq!(z2.prep_ns, 0);
+    }
+}
+
+// ContigPark late/unknown height + force_advance n=0 (extra pure surface).
+#[cfg(test)]
+mod contig_park_edge_tests {
+    use super::{ArchiveJob, ContigPark, ParkInsert};
+    use bitcoin::blockdata::block::Header as BlockHeader;
+    use bitcoin::hashes::Hash;
+    use bitcoin::{Block, BlockHash};
+    use rbitcoin_primitives::Fk;
+
+    fn job(h: u32) -> ArchiveJob {
+        let header = BlockHeader {
+            version: bitcoin::blockdata::block::Version::from_consensus(1),
+            prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+            time: 0,
+            bits: bitcoin::CompactTarget::from_consensus(0),
+            nonce: 0,
+        };
+        ArchiveJob {
+            block: Block {
+                header,
+                txdata: vec![],
+            },
+            header_fk: Fk(1),
+            priority: false,
+            wire_bytes: 10,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn unknown_height_is_late_and_force_zero_is_noop() {
+        let mut p = ContigPark::new(5);
+        match p.insert(job(u32::MAX), 2048) {
+            ParkInsert::Late(j) => assert_eq!(j.height, u32::MAX),
+            _ => panic!("unknown height must be Late"),
+        }
+        assert!(p.force_advance(0).is_empty());
+        assert_eq!(p.next_h(), 5);
+        assert_eq!(p.ready_prefix_len(), 0);
+        assert!(p.take_contiguous(0).is_empty());
+    }
 }

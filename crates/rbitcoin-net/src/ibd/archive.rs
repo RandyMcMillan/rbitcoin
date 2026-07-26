@@ -658,6 +658,151 @@ mod contig_park_tests {
         assert_eq!(budget.count(), 0);
         assert_eq!(budget.bytes(), 0);
     }
+
+    /// Multi-block IBD-like growth loop: charge many large bodies into ContigPark
+    /// (process-owned retain), sample budget + `/proc` RSS, then production
+    /// WriterDead abort + `apply_archive_result`. Plateau: budget count/bytes → 0.
+    ///
+    /// Primary leak meter is **`ArchiveQueueBudget`** (exact process ownership).
+    /// VmRSS/RssAnon are logged for forensics; glibc often keeps peak RSS so we
+    /// do not assert whole-process RSS falls (see docs/ibd-memory.md).
+    ///
+    /// Reintroducing "drop park without emit" fails: residual budget ≫ 0.
+    #[test]
+    fn multi_block_ibd_like_growth_then_production_abort_plateau() {
+        use super::{
+            emit_writer_dead_outcomes, release_remaining_jobs, ArchiveQueueBudget,
+        };
+        use super::super::events::apply_archive_result;
+        use super::super::state::IbdWorkState;
+        use super::super::status::LoopStats;
+        use bitcoin::BlockHash;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        fn rss_snapshot() -> (u64, u64) {
+            // (VmRSS_kB, VmData_kB) from /proc/self/status; 0 if unavailable.
+            let Ok(s) = std::fs::read_to_string("/proc/self/status") else {
+                return (0, 0);
+            };
+            let mut rss = 0u64;
+            let mut data = 0u64;
+            for line in s.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    rss = rest
+                        .split_whitespace()
+                        .next()
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or(0);
+                } else if let Some(rest) = line.strip_prefix("VmData:") {
+                    data = rest
+                        .split_whitespace()
+                        .next()
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or(0);
+                }
+            }
+            (rss, data)
+        }
+
+        fn job_wire(h: u32, wire: usize) -> ArchiveJob {
+            let mut j = job(h);
+            j.wire_bytes = wire;
+            j
+        }
+
+        // Scratch under OS temp (non-9p); report for diagnosis after-run logs.
+        let scratch = std::env::temp_dir().join(format!(
+            "rbitcoin-ibd-leak-probe-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&scratch);
+
+        const N: u32 = 128;
+        /// ~1 MiB wire → ~1.5 MiB charged each (production charged_bytes formula).
+        const WIRE: usize = 1_000_000;
+        let budget = ArchiveQueueBudget::new(512 * 1024 * 1024);
+        let mut park = ContigPark::new(0);
+        const HORIZON: u32 = 2048;
+
+        let (rss0, data0) = rss_snapshot();
+        let budget0 = budget.bytes();
+
+        // Growth phase: retain N charged bodies in ContigPark (WriterDead stall shape).
+        for h in (0..N).rev() {
+            let j = job_wire(h, WIRE);
+            budget.charge(j.wire_bytes);
+            assert!(matches!(park.insert(j, HORIZON), super::ParkInsert::Parked));
+        }
+        let mid_count = budget.count();
+        let mid_bytes = budget.bytes();
+        let (rss_mid, data_mid) = rss_snapshot();
+        assert_eq!(mid_count, N as usize);
+        assert!(
+            mid_bytes >= ArchiveQueueBudget::charged_bytes(WIRE) * (N as usize),
+            "growth must accumulate charged bytes (got {mid_bytes})"
+        );
+        // Without production abort, residual would stay at mid_bytes forever.
+        assert!(mid_bytes > 0);
+
+        // Production abort: take a wave (in-flight batch) + drain park remainder.
+        let wave = park.take_contiguous(32);
+        assert_eq!(wave.len(), 32);
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let inflight = Mutex::new(HashMap::new());
+        let outcomes: Vec<(BlockHash, usize)> = wave
+            .iter()
+            .map(|j| (j.block.block_hash(), j.wire_bytes))
+            .collect();
+        emit_writer_dead_outcomes(&result_tx, &inflight, &[], outcomes);
+        let (_pri_tx, pri_rx) = std::sync::mpsc::sync_channel::<ArchiveJob>(1);
+        let (_far_tx, far_rx) = std::sync::mpsc::sync_channel::<ArchiveJob>(1);
+        release_remaining_jobs(
+            &mut park,
+            &pri_rx,
+            &far_rx,
+            &result_tx,
+            "archive writer dead",
+        );
+
+        let mut st = IbdWorkState::new(vec![], None, None);
+        let stats = LoopStats::default();
+        let mut applied = 0usize;
+        while let Ok(r) = result_rx.try_recv() {
+            apply_archive_result(&mut st, r, &budget, &stats);
+            applied += 1;
+        }
+
+        let after_count = budget.count();
+        let after_bytes = budget.bytes();
+        let (rss1, data1) = rss_snapshot();
+
+        // Plateau criteria (process-owned meter — not full-process RSS).
+        assert_eq!(applied, N as usize);
+        assert_eq!(after_count, 0, "after production abort budget count must be 0");
+        assert_eq!(after_bytes, 0, "after production abort budget bytes must be 0");
+        assert_eq!(park.parked_len(), 0);
+
+        let report = format!(
+            "ibd-leak multi-block plateau report\n\
+             N={N} wire={WIRE}\n\
+             budget_bytes before={budget0} mid={mid_bytes} after={after_bytes}\n\
+             budget_count mid={mid_count} after={after_count}\n\
+             VmRSS_kB before={rss0} mid={rss_mid} after={rss1}\n\
+             VmData_kB before={data0} mid={data_mid} after={data1}\n\
+             applied={applied} plateau=budget_count==0\n"
+        );
+        let report_path = scratch.join("plateau-report.txt");
+        let _ = std::fs::write(&report_path, &report);
+        // Also print for --nocapture / CI capture into ibd-leak-after.log.
+        eprintln!("{report}");
+        // Keep report for agent scratch copy if env points there.
+        if let Ok(dir) = std::env::var("RBITCOIN_LEAK_PROBE_OUT") {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(format!("{dir}/ibd-leak-plateau-report.txt"), &report);
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
 }
 
 pub(crate) enum ArchiveResult {

@@ -91,12 +91,27 @@ that shows a clear change after.
    pipeline result (prevents double-charge if ordered hygiene runs early).
 4. **Abort paths** (WriterDead, stop, prep exit) must drain ContigPark + job
    channels and emit results (`release_remaining_jobs`).
-5. **Tests** must tear down intentional caches with **production** APIs
-   (`advance_tip`, OutFifo eviction via insert, budget release via results,
-   drop owning `Query`/pipeline) — not a secret free-all that masks production
-   leaks.
+5. **Tests** must tear down intentional caches with **production** APIs (table
+   below) — not a secret free-all that masks production leaks.
 6. **Regression filters:**
    `force_advance_returns_parked_jobs_for_charge_release`,
    `multi_block_park_abort_releases_all_charges`,
+   `multi_block_ibd_like_growth_then_production_abort_plateau`,
+   `drain_job_rx_as_err_releases_via_apply`,
    `archive_budget_charge_release_symmetric`,
    `presence_lifecycle`.
+
+### Production clear / evict APIs (tests must call these)
+
+| Structure | Production API |
+|-----------|----------------|
+| Archive queue charge | `ArchiveQueueBudget::charge`; release only via **`apply_archive_result`** on `ArchiveResult` |
+| WriterDead batch | **`emit_writer_dead_outcomes`** then apply results |
+| ContigPark abort | **`release_remaining_jobs`** (or `force_advance` → **`emit_archive_job_dropped`**) |
+| Forwarder stop | **`emit_archive_job_err`** + **`drain_job_rx_as_err`** |
+| `archive_charged` marker | **`clear_archive_charged`** only (never hygiene-prune) |
+| Confirm plans/headers | **`ConfirmParentCache::advance_tip`** (write `post_commit`) |
+| OutFifo outs | FIFO eviction on **`OutFifo::insert`** (cap); not tip GC |
+| Archive sticky | FIFO + touch in **`ArchiveTxidSticky::insert_many` / `lookup_batch`** |
+| Ordered maps | **`IbdWorkState::hygiene`** |
+| Body presence | **`BodyPresence::hygiene_retain`** (rejected + charged retained by design) |

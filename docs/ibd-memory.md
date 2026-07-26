@@ -45,16 +45,28 @@ restart. Mainnet logs showed `arch=1487/512MiB` after writer/probe stalls.
 4. **Do not** “fix” high RSS by shrinking intentional caps (OutFifo, sticky,
    archive budget) without measuring **charge residual** and ContigPark ownership.
 
-### Regression tests (shipped)
+### Production helpers (call these — do not re-implement release)
+
+| Helper | Role |
+|--------|------|
+| `emit_archive_job_err` / `emit_archive_job_dropped` | One charged job → `ArchiveResult` |
+| `emit_writer_dead_outcomes` | Writer channel dead: sticky clear + Err per outcome |
+| `release_remaining_jobs` | ContigPark + pri/far drain as Err |
+| `drain_job_rx_as_err` | Forwarder stop: drain unbounded job channel |
+| `apply_archive_result` | Main loop: **only** place that `release`s the budget |
+
+### Regression tests (shipped path)
 
 ```text
-cargo test -p rbitcoin-net --lib force_advance_returns_parked_jobs_for_charge_release
-cargo test -p rbitcoin-net --lib archive_budget_charge_release_symmetric
-cargo test -p rbitcoin-net --lib multi_block_park_abort_releases_all_charges
+cargo test -p rbitcoin-net --lib contig_park_tests
 cargo test -p rbitcoin-net --lib presence_lifecycle
 ```
 
-These drive real `ArchiveQueueBudget` / `ContigPark` / `BodyPresence` APIs.
+Honest coverage (reverting emit/apply would fail):
+
+- `multi_block_park_abort_releases_all_charges` — `emit_writer_dead_outcomes` + `release_remaining_jobs` + `apply_archive_result`
+- `drain_job_rx_as_err_releases_via_apply` — forwarder stop drain + apply
+- `force_advance_returns_parked_jobs_for_charge_release` — Dropped emit + apply
 
 ## Process RSS vs true leak
 

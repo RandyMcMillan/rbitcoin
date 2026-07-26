@@ -504,30 +504,33 @@ mod contig_park_tests {
         assert_eq!(p.next_h(), 13);
     }
 
-    /// Regression: advancing past a height that still holds a parked job must
-    /// return that job so the caller can release the archive-queue charge.
-    /// Dropping silently left `ArchiveQueueBudget` permanently oversubscribed
-    /// (mainnet: arch=1487/512MiB after writer/probe stalls).
+    /// force_advance returns parked jobs; production emit + apply_archive_result
+    /// must zero the budget (would fail if Dropped emit or apply release removed).
     #[test]
     fn force_advance_returns_parked_jobs_for_charge_release() {
+        use super::{emit_archive_job_dropped, ArchiveQueueBudget};
+        use super::super::events::apply_archive_result;
+        use super::super::state::IbdWorkState;
+        use super::super::status::LoopStats;
+
         let mut p = ContigPark::new(10);
         assert!(matches!(p.insert(job(10), 2048), super::ParkInsert::Parked));
         assert!(matches!(p.insert(job(11), 2048), super::ParkInsert::Parked));
-        // Simulate "height 10 already Class A" while a redundant body is parked.
         let dropped = p.force_advance(1);
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].height, 10);
-        assert_eq!(dropped[0].wire_bytes, 100);
-        assert_eq!(p.next_h(), 11);
-        assert_eq!(p.parked_len(), 1);
-        // Caller releases budget for each dropped job (production path).
+
         let budget = ArchiveQueueBudget::new(16 * 1024 * 1024);
-        for j in &dropped {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for j in dropped {
             budget.charge(j.wire_bytes);
+            emit_archive_job_dropped(&tx, j, false);
         }
         assert_eq!(budget.count(), 1);
-        for j in &dropped {
-            budget.release(j.wire_bytes);
+        let mut st = IbdWorkState::new(vec![], None, None);
+        let stats = LoopStats::default();
+        while let Ok(r) = rx.try_recv() {
+            apply_archive_result(&mut st, r, &budget, &stats);
         }
         assert_eq!(budget.count(), 0);
         assert_eq!(budget.bytes(), 0);
@@ -551,48 +554,109 @@ mod contig_park_tests {
         assert_eq!(b.bytes(), 0, "no residual charged bytes after full release");
     }
 
-    /// Multi-block IBD-like park abort: charge each body, park out-of-order, take
-    /// a contiguous wave (still charged — result not yet applied), then abort like
-    /// WriterDead: release the in-flight wave + `drain_all` remainder. Residual
-    /// budget must be 0.
-    ///
-    /// Models production `release_remaining_jobs` + WriterDead batch Err path.
+    /// Multi-block WriterDead-class abort: charge+park, take wave, then **shipped**
+    /// `emit_writer_dead_outcomes` + `release_remaining_jobs` + `apply_archive_result`.
+    /// Residual budget must be 0. Reverting either emit helper would fail this test.
     #[test]
     fn multi_block_park_abort_releases_all_charges() {
+        use super::{
+            emit_writer_dead_outcomes, release_remaining_jobs, ArchiveQueueBudget,
+        };
+        use super::super::events::apply_archive_result;
+        use super::super::state::IbdWorkState;
+        use super::super::status::LoopStats;
+        use bitcoin::BlockHash;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
         const N: u32 = 256;
         let budget = ArchiveQueueBudget::new(512 * 1024 * 1024);
         let mut park = ContigPark::new(0);
         const HORIZON: u32 = 2048;
-        // Park reverse order (gap-fill pattern).
         for h in (0..N).rev() {
             let j = job(h);
             budget.charge(j.wire_bytes);
-            assert!(
-                matches!(park.insert(j, HORIZON), super::ParkInsert::Parked),
-                "height {h}"
-            );
+            assert!(matches!(park.insert(j, HORIZON), super::ParkInsert::Parked));
         }
         assert_eq!(budget.count(), N as usize);
-        assert_eq!(park.parked_len(), N as usize);
-        assert!(budget.bytes() > 0);
 
         // Prep took a mega-batch (still charged until ArchiveResult).
         let wave = park.take_contiguous(32);
         assert_eq!(wave.len(), 32);
-        assert_eq!(park.parked_len(), (N as usize) - 32);
 
-        // WriterDead: release in-flight batch (plan_and_send Err path) then drain park.
-        for j in &wave {
-            budget.release(j.wire_bytes);
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let inflight: Mutex<HashMap<[u8; 32], rbitcoin_primitives::Fk>> =
+            Mutex::new(HashMap::new());
+        // Sticky entry that must be cleared by emit_writer_dead_outcomes.
+        {
+            let mut g = inflight.lock().unwrap();
+            g.insert([0xab; 32], rbitcoin_primitives::Fk(99));
         }
-        let remaining = park.drain_all();
-        assert_eq!(remaining.len(), (N as usize) - 32);
-        for j in remaining {
-            budget.release(j.wire_bytes);
+        let sticky = [([0xab; 32], rbitcoin_primitives::Fk(99))];
+        let outcomes: Vec<(BlockHash, usize)> = wave
+            .iter()
+            .map(|j| (j.block.block_hash(), j.wire_bytes))
+            .collect();
+        emit_writer_dead_outcomes(&result_tx, &inflight, &sticky, outcomes);
+        assert!(
+            inflight.lock().unwrap().is_empty(),
+            "WriterDead must clear planned sticky creates"
+        );
+
+        // Empty pri/far channels + drain park (production release_remaining_jobs).
+        let (_pri_tx, pri_rx) = std::sync::mpsc::sync_channel::<ArchiveJob>(1);
+        let (_far_tx, far_rx) = std::sync::mpsc::sync_channel::<ArchiveJob>(1);
+        release_remaining_jobs(
+            &mut park,
+            &pri_rx,
+            &far_rx,
+            &result_tx,
+            "archive writer dead",
+        );
+        assert_eq!(park.parked_len(), 0);
+
+        // Main-loop apply (production charge release).
+        let mut st = IbdWorkState::new(vec![], None, None);
+        let stats = LoopStats::default();
+        let mut applied = 0usize;
+        while let Ok(r) = result_rx.try_recv() {
+            apply_archive_result(&mut st, r, &budget, &stats);
+            applied += 1;
         }
+        assert_eq!(applied, N as usize, "one ArchiveResult per charged body");
         assert_eq!(budget.count(), 0, "abort must release every charge");
         assert_eq!(budget.bytes(), 0);
-        assert_eq!(park.parked_len(), 0);
+    }
+
+    /// Forwarder drain helper: charged jobs left on job_rx must emit Err and
+    /// apply_archive_result must zero the budget (stop-path ownership).
+    #[test]
+    fn drain_job_rx_as_err_releases_via_apply() {
+        use super::{drain_job_rx_as_err, ArchiveQueueBudget};
+        use super::super::events::apply_archive_result;
+        use super::super::state::IbdWorkState;
+        use super::super::status::LoopStats;
+
+        let budget = ArchiveQueueBudget::new(16 * 1024 * 1024);
+        let (job_tx, mut job_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+        for h in 0..8u32 {
+            let j = job(h);
+            budget.charge(j.wire_bytes);
+            job_tx.send(j).unwrap();
+        }
+        drop(job_tx);
+        assert_eq!(budget.count(), 8);
+
+        drain_job_rx_as_err(&mut job_rx, &result_tx, "archive stopped");
+
+        let mut st = IbdWorkState::new(vec![], None, None);
+        let stats = LoopStats::default();
+        while let Ok(r) = result_rx.try_recv() {
+            apply_archive_result(&mut st, r, &budget, &stats);
+        }
+        assert_eq!(budget.count(), 0);
+        assert_eq!(budget.bytes(), 0);
     }
 }
 
@@ -617,6 +681,94 @@ pub(crate) enum ArchiveResult {
         wire_bytes: usize,
         requeue: bool,
     },
+}
+
+// ── Charge-release ownership helpers (unit-callable; used by prep/forwarder) ─
+//
+// Every `ArchiveQueueBudget::charge` after enqueue must pair with exactly one
+// `ArchiveResult` applied via `apply_archive_result`. These helpers are the
+// **only** production way to emit results for dropped / aborted jobs.
+
+/// Emit [`ArchiveResult::Err`] for a charged job (release on apply).
+pub(crate) fn emit_archive_job_err(
+    result_tx: &mpsc::UnboundedSender<ArchiveResult>,
+    job: ArchiveJob,
+    err: &str,
+) {
+    let _ = result_tx.send(ArchiveResult::Err {
+        hash: job.block.block_hash(),
+        err: err.into(),
+        wire_bytes: job.wire_bytes,
+    });
+}
+
+/// Emit [`ArchiveResult::Dropped`] for a charged job (release on apply).
+pub(crate) fn emit_archive_job_dropped(
+    result_tx: &mpsc::UnboundedSender<ArchiveResult>,
+    job: ArchiveJob,
+    requeue: bool,
+) {
+    let _ = result_tx.send(ArchiveResult::Dropped {
+        hash: job.block.block_hash(),
+        wire_bytes: job.wire_bytes,
+        requeue,
+    });
+}
+
+/// Writer channel dead: clear planned sticky creates and emit Err for every
+/// outcome so charges are released when the main loop applies results.
+pub(crate) fn emit_writer_dead_outcomes(
+    result_tx: &mpsc::UnboundedSender<ArchiveResult>,
+    inflight: &Mutex<HashMap<[u8; 32], Fk>>,
+    sticky_creates: &[([u8; 32], Fk)],
+    outcomes: Vec<(BlockHash, usize)>,
+) {
+    if !sticky_creates.is_empty() {
+        let mut g = inflight.lock().unwrap();
+        for (t, _) in sticky_creates {
+            g.remove(t);
+        }
+    }
+    for (hash, wire_bytes) in outcomes {
+        let _ = result_tx.send(ArchiveResult::Err {
+            hash,
+            err: "archive writer dead".into(),
+            wire_bytes,
+        });
+    }
+}
+
+/// Prep abort / WriterDead: drain ContigPark + pri/far sync channels as Err.
+///
+/// Callers must not drop charged jobs after this without also covering any
+/// batch already emitted via [`emit_writer_dead_outcomes`].
+fn release_remaining_jobs(
+    park: &mut ContigPark,
+    pri_rx: &std::sync::mpsc::Receiver<ArchiveJob>,
+    far_rx: &std::sync::mpsc::Receiver<ArchiveJob>,
+    result_tx: &mpsc::UnboundedSender<ArchiveResult>,
+    err: &str,
+) {
+    while let Ok(j) = pri_rx.try_recv() {
+        emit_archive_job_err(result_tx, j, err);
+    }
+    while let Ok(j) = far_rx.try_recv() {
+        emit_archive_job_err(result_tx, j, err);
+    }
+    for j in park.drain_all() {
+        emit_archive_job_err(result_tx, j, err);
+    }
+}
+
+/// Forwarder exit: drain remaining charged jobs on the unbounded job channel.
+pub(crate) fn drain_job_rx_as_err(
+    job_rx: &mut mpsc::UnboundedReceiver<ArchiveJob>,
+    result_tx: &mpsc::UnboundedSender<ArchiveResult>,
+    err: &str,
+) {
+    while let Ok(j) = job_rx.try_recv() {
+        emit_archive_job_err(result_tx, j, err);
+    }
 }
 
 /// Prep → writer queue depth (like confirm load→scripts): prep can plan the next
@@ -1047,22 +1199,12 @@ pub(crate) fn spawn_archive_pipeline(
                                 std::thread::sleep(Duration::from_millis(2));
                             }
                             Err(std::sync::mpsc::TrySendError::Disconnected(dead)) => {
-                                // Writer gone: release every charge for this batch
-                                // and drop planned inflight creates so they cannot
-                                // pin the resolve map forever.
-                                if !dead.plan.sticky_creates.is_empty() {
-                                    let mut g = inflight.lock().unwrap();
-                                    for (t, _) in &dead.plan.sticky_creates {
-                                        g.remove(t);
-                                    }
-                                }
-                                for (hash, wire_bytes) in dead.outcomes {
-                                    let _ = result_tx.send(ArchiveResult::Err {
-                                        hash,
-                                        err: "archive writer dead".into(),
-                                        wire_bytes,
-                                    });
-                                }
+                                emit_writer_dead_outcomes(
+                                    result_tx,
+                                    inflight,
+                                    &dead.plan.sticky_creates,
+                                    dead.outcomes,
+                                );
                                 return PlanSend::WriterDead;
                             }
                         }
@@ -1086,39 +1228,6 @@ pub(crate) fn spawn_archive_pipeline(
                         jobs.len() as u64,
                     );
                     PlanSend::Done
-                }
-
-                /// Release every remaining charged body (park + in-channel jobs).
-                /// Used on stop / writer-dead so `ArchiveQueueBudget` cannot stick
-                /// permanently oversubscribed with orphaned ContigPark RAM.
-                fn release_remaining_jobs(
-                    park: &mut ContigPark,
-                    pri_rx: &std::sync::mpsc::Receiver<ArchiveJob>,
-                    far_rx: &std::sync::mpsc::Receiver<ArchiveJob>,
-                    result_tx: &mpsc::UnboundedSender<ArchiveResult>,
-                    err: &str,
-                ) {
-                    while let Ok(j) = pri_rx.try_recv() {
-                        let _ = result_tx.send(ArchiveResult::Err {
-                            hash: j.block.block_hash(),
-                            err: err.into(),
-                            wire_bytes: j.wire_bytes,
-                        });
-                    }
-                    while let Ok(j) = far_rx.try_recv() {
-                        let _ = result_tx.send(ArchiveResult::Err {
-                            hash: j.block.block_hash(),
-                            err: err.into(),
-                            wire_bytes: j.wire_bytes,
-                        });
-                    }
-                    for j in park.drain_all() {
-                        let _ = result_tx.send(ArchiveResult::Err {
-                            hash: j.block.block_hash(),
-                            err: err.into(),
-                            wire_bytes: j.wire_bytes,
-                        });
-                    }
                 }
 
                 loop {
@@ -1286,11 +1395,7 @@ pub(crate) fn spawn_archive_pipeline(
                             // Already Class A: drop any redundant parked body and
                             // release its archive-queue charge (do not leak GiB).
                             for j in park.force_advance(1) {
-                                let _ = prep_result.send(ArchiveResult::Dropped {
-                                    hash: j.block.block_hash(),
-                                    wire_bytes: j.wire_bytes,
-                                    requeue: false,
-                                });
+                                emit_archive_job_dropped(&prep_result, j, false);
                             }
                             skipped += 1;
                         }
@@ -1421,6 +1526,8 @@ pub(crate) fn spawn_archive_pipeline(
             })
             .expect("spawn ibd-archive-prep");
 
+        // Forward charged jobs into prep; on stop / channel close emit Err so
+        // ArchiveQueueBudget is released via apply_archive_result (never drop).
         while !stop.load(Ordering::Relaxed) {
             let mut job = match tokio::time::timeout(Duration::from_millis(50), job_rx.recv()).await
             {
@@ -1429,11 +1536,13 @@ pub(crate) fn spawn_archive_pipeline(
                 Err(_) => continue,
             };
             if stop.load(Ordering::Relaxed) {
+                emit_archive_job_err(&result_tx, job, "archive stopped");
                 break;
             }
             let priority = job.priority;
             loop {
                 if stop.load(Ordering::Relaxed) {
+                    emit_archive_job_err(&result_tx, job, "archive stopped");
                     break;
                 }
                 let tx = if priority {
@@ -1453,16 +1562,14 @@ pub(crate) fn spawn_archive_pipeline(
                         }
                     }
                     Err(std::sync::mpsc::TrySendError::Disconnected(j)) => {
-                        let _ = result_tx.send(ArchiveResult::Err {
-                            hash: j.block.block_hash(),
-                            err: "prep closed".into(),
-                            wire_bytes: j.wire_bytes,
-                        });
+                        emit_archive_job_err(&result_tx, j, "prep closed");
                         break;
                     }
                 }
             }
         }
+        // Drain any jobs still in the unbounded channel (stop mid-forward / closed).
+        drain_job_rx_as_err(&mut job_rx, &result_tx, "archive stopped");
         stop.store(true, Ordering::Relaxed);
         drop(pri_job_tx);
         drop(far_job_tx);

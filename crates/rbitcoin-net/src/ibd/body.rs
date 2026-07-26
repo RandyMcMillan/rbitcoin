@@ -30,12 +30,11 @@ pub(crate) struct BodyPresenceSizes {
 pub(crate) struct BodyPresence {
     known: HashSet<BlockHash>,
     /// Received on the wire / in archive prep, not yet Class A.
-    pending: HashSet<BlockHash>,
-    /// When each pending hash was marked (for stuck-pipeline re-getdata).
+    /// Membership **is** the pending set; value is when marked (stale expire).
     pending_since: HashMap<BlockHash, Instant>,
     /// Budget-charged into the archive job pipeline (not yet Ok/Err/Dropped).
     ///
-    /// Distinct from [`pending`]: `BlockFramed` marks pending before decode, but
+    /// Distinct from pending: `BlockFramed` marks pending before decode, but
     /// charge happens only on `Block`. Redeliveries must not re-charge while this
     /// set still holds the hash (mainnet stacked tens of GiB of duplicate jobs).
     archive_charged: HashSet<BlockHash>,
@@ -49,7 +48,6 @@ impl BodyPresence {
     pub(crate) fn new() -> Self {
         Self {
             known: HashSet::new(),
-            pending: HashSet::new(),
             pending_since: HashMap::new(),
             archive_charged: HashSet::new(),
             missing: HashSet::new(),
@@ -57,14 +55,17 @@ impl BodyPresence {
         }
     }
 
+    #[inline]
+    fn is_pending_hash(&self, h: &BlockHash) -> bool {
+        self.pending_since.contains_key(h)
+    }
+
     pub(crate) fn mark_pending(&mut self, h: BlockHash) {
         if self.rejected.contains(&h) {
             return;
         }
         self.missing.remove(&h);
-        if self.pending.insert(h) {
-            self.pending_since.insert(h, Instant::now());
-        }
+        self.pending_since.entry(h).or_insert_with(Instant::now);
     }
 
     /// True if this hash already holds an archive-queue budget charge.
@@ -90,7 +91,6 @@ impl BodyPresence {
             return;
         }
         self.missing.remove(&h);
-        self.pending.remove(&h);
         self.pending_since.remove(&h);
         self.archive_charged.remove(&h);
         self.known.insert(h);
@@ -101,7 +101,6 @@ impl BodyPresence {
             return;
         }
         self.known.remove(&h);
-        self.pending.remove(&h);
         self.pending_since.remove(&h);
         // Keep `archive_charged` if still set: a body may still be in the job
         // queue after pending-stale expire. Charge is cleared only on pipeline
@@ -121,7 +120,6 @@ impl BodyPresence {
     /// and never re-getdata it (Class A may still hold the body).
     pub(crate) fn mark_rejected(&mut self, h: BlockHash) {
         self.known.remove(&h);
-        self.pending.remove(&h);
         self.pending_since.remove(&h);
         self.archive_charged.remove(&h);
         self.missing.remove(&h);
@@ -173,14 +171,14 @@ impl BodyPresence {
 
     /// Framed / archive-pipeline hashes not yet Class A.
     pub(crate) fn pending_len(&self) -> usize {
-        self.pending.len()
+        self.pending_since.len()
     }
 
-    /// Cheap occupancy for the 5s `ibd: sizes` line (all O(1) `HashSet::len`).
+    /// Cheap occupancy for the 5s `ibd: sizes` line (all O(1) lens).
     pub(crate) fn size_snapshot(&self) -> BodyPresenceSizes {
         BodyPresenceSizes {
             known: self.known.len(),
-            pending: self.pending.len(),
+            pending: self.pending_since.len(),
             missing: self.missing.len(),
             archive_charged: self.archive_charged.len(),
             rejected: self.rejected.len(),
@@ -189,7 +187,7 @@ impl BodyPresence {
 
     /// Wire frame received / archive pipeline owns this hash (not confirmable yet).
     pub(crate) fn is_pending(&self, h: &BlockHash) -> bool {
-        self.pending.contains(h)
+        self.is_pending_hash(h)
     }
 
     /// True if Class A body is present (confirmable). Does not treat pending as ready.
@@ -203,7 +201,7 @@ impl BodyPresence {
         if self.known.contains(h) || hub.has_block(h) {
             return true;
         }
-        if self.pending.contains(h) || self.missing.contains(h) {
+        if self.is_pending_hash(h) || self.missing.contains(h) {
             return false;
         }
         if hub.is_archived(h) {
@@ -221,7 +219,7 @@ impl BodyPresence {
     /// `missing` — assign walks tens of thousands of known-missing far hashes and
     /// used to re-take the confirmed-set lock on every one (multi-100ms assign).
     pub(crate) fn skip_download(&mut self, hub: &ChainHub, h: &BlockHash) -> bool {
-        if self.rejected.contains(h) || self.known.contains(h) || self.pending.contains(h) {
+        if self.rejected.contains(h) || self.known.contains(h) || self.is_pending_hash(h) {
             return true;
         }
         if self.missing.contains(h) {
@@ -236,16 +234,7 @@ impl BodyPresence {
     pub(crate) fn hygiene_retain(&mut self, mut keep: impl FnMut(&BlockHash) -> bool) {
         self.known.retain(|h| keep(h));
         self.missing.retain(|h| keep(h));
-        let drop_pending: Vec<BlockHash> = self
-            .pending
-            .iter()
-            .filter(|h| !keep(h))
-            .copied()
-            .collect();
-        for h in drop_pending {
-            self.pending.remove(&h);
-            self.pending_since.remove(&h);
-        }
+        self.pending_since.retain(|h, _| keep(h));
         // Do **not** hygiene-prune `archive_charged`. Markers clear only on
         // pipeline Ok/Err/Dropped via [`clear_archive_charged`]. Dropping them
         // while a job is still charged allows redelivery double-charge and loses
@@ -259,7 +248,7 @@ impl BodyPresence {
     /// the body is missing, `None` if a store probe would be required.
     #[cfg(test)]
     pub(crate) fn skip_download_cached(&self, h: &BlockHash) -> Option<bool> {
-        if self.rejected.contains(h) || self.known.contains(h) || self.pending.contains(h) {
+        if self.rejected.contains(h) || self.known.contains(h) || self.is_pending_hash(h) {
             return Some(true);
         }
         if self.missing.contains(h) {
@@ -294,7 +283,7 @@ mod tests {
         body.mark_archived(h(2));
         assert_eq!(body.skip_download_cached(&h(2)), Some(true));
         assert!(body.known.contains(&h(2)));
-        assert!(!body.pending.contains(&h(2)));
+        assert!(!body.is_pending(&h(2)));
         assert!(!body.missing.contains(&h(2)));
 
         body.mark_missing(h(3));
@@ -308,7 +297,7 @@ mod tests {
         body.mark_pending(hash);
         body.mark_archived(hash);
         assert!(body.known.contains(&hash));
-        assert!(!body.pending.contains(&hash));
+        assert!(!body.is_pending(&hash));
         body.mark_missing(hash);
         assert!(body.missing.contains(&hash));
         assert!(!body.known.contains(&hash));

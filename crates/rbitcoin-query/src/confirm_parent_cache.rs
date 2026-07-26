@@ -186,14 +186,7 @@ impl ConfirmParentCache {
         let mut g = self.inner.lock().unwrap();
         let _ = g.outs.insert(
             id,
-            CreateOuts {
-                height,
-                tx,
-                outputs,
-                coinbase,
-                body_range: None,
-                spender_rels: Vec::new(),
-            },
+            CreateOuts::from_store(height, tx, outputs, coinbase, None, Vec::new()),
         );
     }
 
@@ -216,14 +209,7 @@ impl ConfirmParentCache {
             rbitcoin_store::clear_output_spender_fields(&mut outputs);
             let _ = g.outs.insert(
                 id,
-                CreateOuts {
-                    height,
-                    tx,
-                    outputs,
-                    coinbase,
-                    body_range: None,
-                    spender_rels: Vec::new(),
-                },
+                CreateOuts::from_store(height, tx, outputs, coinbase, None, Vec::new()),
             );
         }
     }
@@ -248,14 +234,14 @@ impl ConfirmParentCache {
             rbitcoin_store::clear_output_spender_fields(&mut outputs);
             let _ = g.outs.insert(
                 id,
-                CreateOuts {
+                CreateOuts::from_store(
                     height,
-                    tx: tx.clone(),
+                    tx.clone(),
                     outputs,
                     coinbase,
-                    body_range: None,
-                    spender_rels: Vec::new(),
-                },
+                    None,
+                    Vec::new(),
+                ),
             );
         }
     }
@@ -293,14 +279,7 @@ impl ConfirmParentCache {
             };
             let _ = g.outs.insert(
                 id,
-                CreateOuts {
-                    height,
-                    tx,
-                    outputs,
-                    coinbase,
-                    body_range,
-                    spender_rels,
-                },
+                CreateOuts::from_store(height, tx, outputs, coinbase, body_range, spender_rels),
             );
         }
     }
@@ -321,7 +300,12 @@ impl ConfirmParentCache {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
         let e = g.outs.get(id)?;
-        Some((e.height, e.tx.clone(), e.outputs.clone(), Vec::new()))
+        Some((
+            e.height,
+            e.tx_record(),
+            e.all_output_records(),
+            Vec::new(),
+        ))
     }
 
     /// Slim pin hits under **one** lock: only clone requested outs + tx meta.
@@ -355,19 +339,20 @@ impl ConfirmParentCache {
             };
             let mut outs = Vec::with_capacity(vouts.len());
             for &v in vouts {
-                if let Some(o) = e.outputs.get(v as usize) {
-                    outs.push((v, o.clone()));
+                if let Some(o) = e.get_output(v) {
+                    outs.push((v, o));
                 }
             }
-            let sparse = crate::batch_parents::sparse_spender_rels(&e.spender_rels, vouts);
+            let dense = e.dense_spender_rels();
+            let sparse = crate::batch_parents::sparse_spender_rels(&dense, vouts);
             out.insert(
                 id,
                 (
                     e.height,
-                    e.tx.clone(),
+                    e.tx_record(),
                     outs,
-                    e.coinbase,
-                    e.body_range,
+                    e.coinbase(),
+                    e.body_range(),
                     sparse,
                 ),
             );
@@ -469,8 +454,8 @@ impl ConfirmParentCache {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
         let e = g.outs.get(id)?;
-        let o = e.outputs.get(vout as usize)?;
-        Some((e.tx.clone(), o.clone()))
+        let o = e.get_output(vout)?;
+        Some((e.tx_record(), o))
     }
 
     /// True if vout is present on a cached body — no record clone.
@@ -483,18 +468,18 @@ impl ConfirmParentCache {
             .unwrap()
             .outs
             .get(id)
-            .is_some_and(|e| (vout as usize) < e.outputs.len())
+            .is_some_and(|e| (vout as usize) < e.output_count())
     }
 
     pub fn get_parent_tx(&self, fk: Fk) -> Option<TxRecord> {
         let id = fk.get()?;
-        self.inner.lock().unwrap().outs.get(id).map(|e| e.tx.clone())
+        self.inner.lock().unwrap().outs.get(id).map(|e| e.tx_record())
     }
 
     /// Txid of a stashed parent create — no clone of outs.
     pub fn get_parent_txid(&self, fk: Fk) -> Option<[u8; 32]> {
         let id = fk.get()?;
-        self.inner.lock().unwrap().outs.get(id).map(|e| e.tx.txid)
+        self.inner.lock().unwrap().outs.get(id).map(|e| e.txid())
     }
 
     pub fn plan_count(&self) -> usize {

@@ -191,6 +191,8 @@ pub(crate) struct IbdPerfSample {
     pub rss_anon_kb: u64,
     pub rss_file_kb: u64,
     pub vm_hwm_kb: u64,
+    /// `mlock`ed pages only (usually 0); RSS is **not** limited to these.
+    pub rss_locked_kb: u64,
     /// Work-path + body presence occupancy (O(1) lens).
     pub work: WorkStructureSizes,
     /// Query-side process-owned caches (OutFifo, sticky, SH, tx.head resize).
@@ -342,6 +344,7 @@ impl Default for IbdPerfSample {
             rss_anon_kb: 0,
             rss_file_kb: 0,
             vm_hwm_kb: 0,
+            rss_locked_kb: 0,
             work: WorkStructureSizes::default(),
             owned: ProcessOwnedSizes::default(),
             conf_pipe: ConfirmPipelineSizes::default(),
@@ -351,17 +354,31 @@ impl Default for IbdPerfSample {
 
 /// Process memory from `/proc` (Linux). All fields kB; zeros if unavailable.
 ///
-/// Prefer `smaps_rollup` for anon vs file (mmap page cache). Fall back to
-/// `status` VmRSS alone when rollup is missing.
+/// **RSS includes all resident pages**, not only `mlock`ed ones. Ordinary
+/// anonymous heap and **file-backed mmap pages that have been faulted in**
+/// (e.g. store `tx.head` / table maps) both count toward VmRSS until the kernel
+/// reclaims them under pressure (or `MADV_DONTNEED` / unmap).
+///
+/// Split:
+/// - `anon_kb` — process-private anonymous (heap, stacks, MAP_ANON)
+/// - `file_kb` — file-backed resident (shared libs + **our table mmaps**)
+/// - `locked_kb` — `mlock`/`mlockall` only (usually 0 for us)
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ProcRss {
     pub rss_kb: u64,
     pub anon_kb: u64,
     pub file_kb: u64,
     pub hwm_kb: u64,
+    /// Pages locked into RAM (`Locked:` / mlock). Not required for RSS membership.
+    pub locked_kb: u64,
 }
 
 /// Cheap once-per-tick `/proc` read (not hot path).
+///
+/// Prefer `/proc/self/status` fields present on modern kernels (`RssAnon` /
+/// `RssFile` / `VmRSS`). Fall back to `smaps_rollup` (`Anonymous:`, `Rss:`,
+/// `Locked:`) when status split is missing — older rollups do **not** expose
+/// `RssAnon:` / `RssFile:` (that bug made `ibd: sizes` print `anon=0 file=0`).
 pub(crate) fn read_proc_rss() -> ProcRss {
     let mut out = ProcRss::default();
     if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
@@ -370,21 +387,46 @@ pub(crate) fn read_proc_rss() -> ProcRss {
                 out.rss_kb = parse_kb_field(rest);
             } else if let Some(rest) = line.strip_prefix("VmHWM:") {
                 out.hwm_kb = parse_kb_field(rest);
+            } else if let Some(rest) = line.strip_prefix("RssAnon:") {
+                out.anon_kb = parse_kb_field(rest);
+            } else if let Some(rest) = line.strip_prefix("RssFile:") {
+                out.file_kb = parse_kb_field(rest);
+            } else if let Some(rest) = line.strip_prefix("RssShmem:") {
+                // Shmem is neither classic anon nor file-backed table mmap; fold
+                // into file for operator "not heap" view if present.
+                let sh = parse_kb_field(rest);
+                if sh > 0 {
+                    out.file_kb = out.file_kb.saturating_add(sh);
+                }
             }
         }
     }
     if let Ok(s) = std::fs::read_to_string("/proc/self/smaps_rollup") {
         for line in s.lines() {
-            if let Some(rest) = line.strip_prefix("RssAnon:") {
-                out.anon_kb = parse_kb_field(rest);
-            } else if let Some(rest) = line.strip_prefix("RssFile:") {
-                out.file_kb = parse_kb_field(rest);
-            } else if out.rss_kb == 0 {
-                if let Some(rest) = line.strip_prefix("Rss:") {
-                    // Some kernels expose aggregate Rss: on the rollup.
+            if let Some(rest) = line.strip_prefix("Rss:") {
+                if out.rss_kb == 0 {
                     out.rss_kb = parse_kb_field(rest);
                 }
+            } else if let Some(rest) = line.strip_prefix("Anonymous:") {
+                // Rollup name when status RssAnon missing.
+                if out.anon_kb == 0 {
+                    out.anon_kb = parse_kb_field(rest);
+                }
+            } else if let Some(rest) = line.strip_prefix("RssAnon:") {
+                if out.anon_kb == 0 {
+                    out.anon_kb = parse_kb_field(rest);
+                }
+            } else if let Some(rest) = line.strip_prefix("RssFile:") {
+                if out.file_kb == 0 {
+                    out.file_kb = parse_kb_field(rest);
+                }
+            } else if let Some(rest) = line.strip_prefix("Locked:") {
+                out.locked_kb = parse_kb_field(rest);
             }
+        }
+        // If we have RSS + anon but no file split, residual is file-backed.
+        if out.file_kb == 0 && out.rss_kb > 0 && out.anon_kb > 0 && out.anon_kb <= out.rss_kb {
+            out.file_kb = out.rss_kb.saturating_sub(out.anon_kb);
         }
     }
     out
@@ -609,6 +651,7 @@ pub(crate) fn sample(
         rss_anon_kb: rss.anon_kb,
         rss_file_kb: rss.file_kb,
         vm_hwm_kb: rss.hwm_kb,
+        rss_locked_kb: rss.locked_kb,
         work,
         owned,
         conf_pipe,
@@ -897,8 +940,9 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
 /// Format process RSS + known retain-structure occupancy (leak triage).
 ///
 /// All counts are O(1) lens / brief mutex snaps taken on the 5s tick. Compare
-/// `rss=` / `anon=` growth to these maps: RSS climbing while sizes stay flat
-/// points at untracked retain (or kernel file pages under store mmaps).
+/// `anon=` growth to heap caches and `file=` growth to store mmaps (`tx.head`
+/// dual-map during resize). `locked=` is mlock only (usually 0) — **not** a
+/// filter on what enters RSS.
 pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let w = &s.work;
     let b = &w.body;
@@ -910,8 +954,14 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let shadow_mib = h.shadow_body_bytes / (1024 * 1024);
     let load_wire_mib = cp.load_wire_bytes / (1024 * 1024);
     let write_wire_mib = cp.write_wire_bytes / (1024 * 1024);
+    // file% of RSS: how much of process RSS is file-backed (mmap tables + .so).
+    let file_pct = if s.rss_kb > 0 {
+        (100 * s.rss_file_kb) / s.rss_kb
+    } else {
+        0
+    };
     format!(
-        "ibd: sizes rss={}MiB anon={}MiB file={}MiB hwm={}MiB \
+        "ibd: sizes rss={}MiB anon={}MiB file={}MiB({}%) hwm={}MiB locked={}MiB \
          | work ordered={}/set={} hash_h={} h2h={} hdr_fk={} known_hdr={} inflight={}/peer={} cooldown={} \
          | body known={} pend={} miss={} charged={} rej={} \
          | arch q={}/{}MiB budget={}MiB sticky={}/{} fifo={} contig parked={} ready={} next_h={} \
@@ -924,7 +974,9 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         kb_mib(s.rss_kb),
         kb_mib(s.rss_anon_kb),
         kb_mib(s.rss_file_kb),
+        file_pct,
         kb_mib(s.vm_hwm_kb),
+        kb_mib(s.rss_locked_kb),
         w.ordered,
         w.ordered_set,
         w.hash_height,
@@ -1171,8 +1223,9 @@ mod tests {
         let mut s = IbdPerfSample::default();
         s.rss_kb = 2 * 1024; // 2 MiB
         s.rss_anon_kb = 1024;
-        s.rss_file_kb = 512;
+        s.rss_file_kb = 512; // 0 MiB after integer MiB; still shows file=0MiB(25%)
         s.vm_hwm_kb = 3 * 1024;
+        s.rss_locked_kb = 0;
         s.arch_q = 12;
         s.arch_mb = 40;
         s.arch_budget_mb = 512;
@@ -1212,8 +1265,9 @@ mod tests {
         assert!(line.starts_with("ibd: sizes "), "{line}");
         assert!(line.contains("rss=2MiB"), "{line}");
         assert!(line.contains("anon=1MiB"), "{line}");
-        assert!(line.contains("file=0MiB"), "{line}"); // 512kB → 0 MiB integer
+        assert!(line.contains("file=0MiB(25%)"), "{line}"); // 512kB → 0 MiB; pct from kB
         assert!(line.contains("hwm=3MiB"), "{line}");
+        assert!(line.contains("locked=0MiB"), "{line}");
         assert!(line.contains("ordered=100/set=90"), "{line}");
         assert!(line.contains("pend=5"), "{line}");
         assert!(line.contains("charged=4"), "{line}");
@@ -1235,5 +1289,21 @@ mod tests {
         let r = read_proc_rss();
         // Agent VM is Linux with /proc; RSS should be readable for this process.
         assert!(r.rss_kb > 0, "expected VmRSS from /proc/self/status, got {r:?}");
+        // Modern kernels expose RssAnon/RssFile on status; at least one side
+        // of the split should be non-zero for a running process with heap+.text.
+        assert!(
+            r.anon_kb > 0 || r.file_kb > 0,
+            "expected anon/file split from status or smaps_rollup, got {r:?}"
+        );
+        // Parts should not wildly exceed total RSS.
+        assert!(r.anon_kb <= r.rss_kb.saturating_add(256), "{r:?}");
+        assert!(r.file_kb <= r.rss_kb.saturating_add(256), "{r:?}");
+        // anon+file ≈ rss (shmem folded into file; allow small accounting skew).
+        let sum = r.anon_kb.saturating_add(r.file_kb);
+        let skew = sum.abs_diff(r.rss_kb);
+        assert!(
+            skew <= 1024,
+            "anon+file should ≈ rss (±1MiB): sum={sum} skew={skew} {r:?}"
+        );
     }
 }

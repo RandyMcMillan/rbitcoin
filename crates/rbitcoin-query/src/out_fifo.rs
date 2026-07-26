@@ -77,6 +77,11 @@ impl OutFifo {
         self.by_fk.len()
     }
 
+    /// FIFO order length (should match [`len`] when map/order stay in sync).
+    pub fn order_len(&self) -> usize {
+        self.order.len()
+    }
+
     pub fn total_outs(&self) -> u64 {
         self.total_outs
     }

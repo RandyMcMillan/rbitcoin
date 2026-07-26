@@ -83,6 +83,12 @@ impl ConfirmFeed {
     pub(crate) fn stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
     }
+
+    /// `(ready_heights, inflight_heights)` — O(1) under feed mutex.
+    pub(crate) fn size_snap(&self) -> (usize, usize) {
+        let g = self.inner.lock().unwrap();
+        (g.ready.len(), g.inflight.len())
+    }
 }
 
 pub(crate) enum ConfirmEvent {
@@ -117,16 +123,41 @@ pub(crate) const LOAD_QUEUE_CAP: usize = 5;
 /// Script-ok batches buffered for write (scripts(N+1) may run while N writes).
 pub(crate) const WRITE_QUEUE_CAP: usize = 5;
 
-/// Live depths of the two bounded confirm pipeline queues (0..=cap).
+/// Live depths **and contents** of the two bounded confirm pipeline queues.
 ///
-/// Updated on successful send/recv so the status loop can log pressure without
-/// poking into the OS channels.
+/// Updated on successful send/recv so the status loop can log pressure and
+/// process-owned retain without peeking into the OS channels.
 #[derive(Debug, Default)]
 pub(crate) struct ConfirmQueueDepths {
     /// load → scripts (`SyncSender` capacity [`LOAD_QUEUE_CAP`]).
     load_to_scripts: AtomicUsize,
     /// scripts → write (`SyncSender` capacity [`WRITE_QUEUE_CAP`]).
     scripts_to_write: AtomicUsize,
+    /// Sum of `batch.len()` sitting in load→scripts.
+    load_blocks: AtomicUsize,
+    /// Sum of approx wire bytes of those batches.
+    load_wire_bytes: AtomicUsize,
+    /// Sum of `BatchParents` entries riding load→scripts batches.
+    load_parents: AtomicUsize,
+    /// Sum of `batch.len()` sitting in scripts→write.
+    write_blocks: AtomicUsize,
+    write_wire_bytes: AtomicUsize,
+    write_parents: AtomicUsize,
+}
+
+/// Snapshot of confirm pipeline retain (queue depths + batch contents + feed).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ConfirmPipelineSizes {
+    pub load_batches: usize,
+    pub load_blocks: usize,
+    pub load_wire_bytes: usize,
+    pub load_parents: usize,
+    pub write_batches: usize,
+    pub write_blocks: usize,
+    pub write_wire_bytes: usize,
+    pub write_parents: usize,
+    pub feed_ready: usize,
+    pub feed_inflight: usize,
 }
 
 /// Format one confirm pipeline queue slot for logs.
@@ -167,17 +198,71 @@ impl ConfirmQueueDepths {
         )
     }
 
-    fn note_load_send(&self) {
+    /// Full content snapshot (depths + blocks/wire/parents in each queue).
+    pub(crate) fn content_snap(&self) -> ConfirmPipelineSizes {
+        ConfirmPipelineSizes {
+            load_batches: self.load_to_scripts.load(Ordering::Relaxed),
+            load_blocks: self.load_blocks.load(Ordering::Relaxed),
+            load_wire_bytes: self.load_wire_bytes.load(Ordering::Relaxed),
+            load_parents: self.load_parents.load(Ordering::Relaxed),
+            write_batches: self.scripts_to_write.load(Ordering::Relaxed),
+            write_blocks: self.write_blocks.load(Ordering::Relaxed),
+            write_wire_bytes: self.write_wire_bytes.load(Ordering::Relaxed),
+            write_parents: self.write_parents.load(Ordering::Relaxed),
+            feed_ready: 0,
+            feed_inflight: 0,
+        }
+    }
+
+    fn note_load_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
         self.load_to_scripts.fetch_add(1, Ordering::Relaxed);
+        self.load_blocks.fetch_add(blocks, Ordering::Relaxed);
+        self.load_wire_bytes
+            .fetch_add(wire_bytes, Ordering::Relaxed);
+        self.load_parents.fetch_add(parents, Ordering::Relaxed);
     }
-    fn note_load_recv(&self) {
+    fn note_load_recv(&self, blocks: usize, wire_bytes: usize, parents: usize) {
         self.load_to_scripts.fetch_sub(1, Ordering::Relaxed);
+        self.load_blocks
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(blocks))
+            })
+            .ok();
+        self.load_wire_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(wire_bytes))
+            })
+            .ok();
+        self.load_parents
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(parents))
+            })
+            .ok();
     }
-    fn note_write_send(&self) {
+    fn note_write_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
         self.scripts_to_write.fetch_add(1, Ordering::Relaxed);
+        self.write_blocks.fetch_add(blocks, Ordering::Relaxed);
+        self.write_wire_bytes
+            .fetch_add(wire_bytes, Ordering::Relaxed);
+        self.write_parents.fetch_add(parents, Ordering::Relaxed);
     }
-    fn note_write_recv(&self) {
+    fn note_write_recv(&self, blocks: usize, wire_bytes: usize, parents: usize) {
         self.scripts_to_write.fetch_sub(1, Ordering::Relaxed);
+        self.write_blocks
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(blocks))
+            })
+            .ok();
+        self.write_wire_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(wire_bytes))
+            })
+            .ok();
+        self.write_parents
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(parents))
+            })
+            .ok();
     }
 }
 
@@ -224,11 +309,13 @@ pub(crate) fn spawn_confirm_engine(
         .spawn(move || {
             info!("ibd: confirm write on dedicated OS thread");
             while let Ok(batch) = write_rx.recv() {
-                q_wb.note_write_recv();
+                let n = batch.len();
+                let wire = batch.approx_wire_bytes();
+                let parents = batch.parent_count();
+                q_wb.note_write_recv(n, wire, parents);
                 if feed_wb.stopped() || hub_wb.query.confirm_cancelled() {
                     break;
                 }
-                let n = batch.len();
                 let first_h = batch.heights_hashes().first().map(|(h, _)| *h).unwrap_or(0);
                 let t0 = Instant::now();
                 let heights_hashes = batch.heights_hashes();
@@ -331,11 +418,13 @@ pub(crate) fn spawn_confirm_engine(
         .spawn(move || {
             info!("ibd: confirm scripts on dedicated OS thread (pure CPU; no store)");
             while let Ok((mat_batch, mat_ns)) = mat_rx.recv() {
-                q_sc.note_load_recv();
+                let n = mat_batch.len();
+                let load_wire = mat_batch.approx_wire_bytes();
+                let load_parents = mat_batch.parent_count();
+                q_sc.note_load_recv(n, load_wire, load_parents);
                 if feed_sc.stopped() || hub_sc.query.confirm_cancelled() {
                     break;
                 }
-                let n = mat_batch.len();
                 let first_h = mat_batch
                     .heights_hashes()
                     .first()
@@ -351,11 +440,14 @@ pub(crate) fn spawn_confirm_engine(
                             .fetch_add(mat_ns.saturating_add(outcome.work_ns), Ordering::Relaxed);
                         let script_ms = outcome.work_ns / 1_000_000;
                         let mat_ms = mat_ns / 1_000_000;
+                        let wb = outcome.batch.len();
+                        let ww = outcome.batch.approx_wire_bytes();
+                        let wp = outcome.batch.parent_count();
                         if write_tx.send(outcome.batch).is_err() {
                             info!("ibd: confirm write channel closed");
                             break;
                         }
-                        q_sc.note_write_send();
+                        q_sc.note_write_send(wb, ww, wp);
                         if script_ms > 2_000 || mat_ms > 2_000 {
                             info!(
                                 "ibd: confirm scripts slow batch={n} first={first_h} mat_ms={mat_ms} script_ms={script_ms} wall_ms={}",
@@ -573,6 +665,8 @@ pub(crate) fn spawn_confirm_engine(
                                 batch.len()
                             );
                         }
+                        let wire = outcome.batch.approx_wire_bytes();
+                        let parents = outcome.batch.parent_count();
                         if mat_tx
                             .send((outcome.batch, outcome.work_ns))
                             .is_err()
@@ -580,7 +674,7 @@ pub(crate) fn spawn_confirm_engine(
                             info!("ibd: confirm scripts channel closed");
                             return;
                         }
-                        queues_load.note_load_send();
+                        queues_load.note_load_send(prepared_n, wire, parents);
                         if work_ms > 2_000 {
                             info!(
                                 "ibd: confirm load slow batch={prepared_n} claim={} first={expect_h} work_ms={work_ms}",

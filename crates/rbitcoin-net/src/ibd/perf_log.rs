@@ -1,12 +1,13 @@
 //! Consolidated IBD performance sampling and logging.
 //!
-//! **Cadence:** one centralized ~5s status tick (see `ibd` main loop) emits both
-//! `ibd: progress` and `ibd: perf` together.
+//! **Cadence:** one centralized ~5s status tick (see `ibd` main loop) emits
+//! `ibd: progress`, `ibd: perf`, and `ibd: sizes` together.
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
 //! | INFO  | `ibd: progress …` | Tip/arch rates over the **last 5s**, loadq/writeq, txs=, horizon, **1h tip ETA** |
 //! | INFO  | `ibd: perf …` | Download pressure, confirm cost (script/load/…), pin_hit, coarse load phases, sh_runs |
+//! | INFO  | `ibd: sizes …` | Process RSS + occupancy of known retain structures (leak triage) |
 //! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail, archive pipe (prep/write/sticky), contig park |
 //!
 //! Sample **once** per tick and reset all atomics, then format INFO always and
@@ -16,8 +17,11 @@
 //! seed/body/head RMW, thin col/run/head).
 
 use super::archive::{ArchivePipelineSample, ArchivePipelineStats};
+use super::confirm::ConfirmPipelineSizes;
+use super::state::WorkStructureSizes;
 use super::status::LoopStats;
 use rbitcoin_log::{debug, enabled, info, Level};
+use rbitcoin_query::ProcessOwnedSizes;
 
 /// One 5s window of IBD counters (post sample-and-reset).
 #[derive(Clone, Debug)]
@@ -181,6 +185,18 @@ pub(crate) struct IbdPerfSample {
     pub contig_ready: usize,
 
     pub pipe: ArchivePipelineSample,
+
+    /// Process RSS / smaps (kB); 0 when `/proc` unavailable.
+    pub rss_kb: u64,
+    pub rss_anon_kb: u64,
+    pub rss_file_kb: u64,
+    pub vm_hwm_kb: u64,
+    /// Work-path + body presence occupancy (O(1) lens).
+    pub work: WorkStructureSizes,
+    /// Query-side process-owned caches (OutFifo, sticky, SH, tx.head resize).
+    pub owned: ProcessOwnedSizes,
+    /// Confirm load/scripts/write queue contents + feed.
+    pub conf_pipe: ConfirmPipelineSizes,
 }
 
 impl Default for IbdPerfSample {
@@ -322,8 +338,67 @@ impl Default for IbdPerfSample {
             contig_parked: 0,
             contig_ready: 0,
             pipe: ArchivePipelineSample::default(),
+            rss_kb: 0,
+            rss_anon_kb: 0,
+            rss_file_kb: 0,
+            vm_hwm_kb: 0,
+            work: WorkStructureSizes::default(),
+            owned: ProcessOwnedSizes::default(),
+            conf_pipe: ConfirmPipelineSizes::default(),
         }
     }
+}
+
+/// Process memory from `/proc` (Linux). All fields kB; zeros if unavailable.
+///
+/// Prefer `smaps_rollup` for anon vs file (mmap page cache). Fall back to
+/// `status` VmRSS alone when rollup is missing.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ProcRss {
+    pub rss_kb: u64,
+    pub anon_kb: u64,
+    pub file_kb: u64,
+    pub hwm_kb: u64,
+}
+
+/// Cheap once-per-tick `/proc` read (not hot path).
+pub(crate) fn read_proc_rss() -> ProcRss {
+    let mut out = ProcRss::default();
+    if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                out.rss_kb = parse_kb_field(rest);
+            } else if let Some(rest) = line.strip_prefix("VmHWM:") {
+                out.hwm_kb = parse_kb_field(rest);
+            }
+        }
+    }
+    if let Ok(s) = std::fs::read_to_string("/proc/self/smaps_rollup") {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("RssAnon:") {
+                out.anon_kb = parse_kb_field(rest);
+            } else if let Some(rest) = line.strip_prefix("RssFile:") {
+                out.file_kb = parse_kb_field(rest);
+            } else if out.rss_kb == 0 {
+                if let Some(rest) = line.strip_prefix("Rss:") {
+                    // Some kernels expose aggregate Rss: on the rollup.
+                    out.rss_kb = parse_kb_field(rest);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn parse_kb_field(rest: &str) -> u64 {
+    rest.split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+fn kb_mib(kb: u64) -> u64 {
+    kb / 1024
 }
 
 /// Sample every counter once and reset atomics.
@@ -349,6 +424,10 @@ pub(crate) fn sample(
     sh_runs: usize,
     // Live archive sticky (len, cap).
     arch_sticky: (usize, usize),
+    work: WorkStructureSizes,
+    owned: ProcessOwnedSizes,
+    conf_pipe: ConfirmPipelineSizes,
+    rss: ProcRss,
 ) -> IbdPerfSample {
     let hot = loop_stats.sample_and_reset();
     let (
@@ -526,6 +605,13 @@ pub(crate) fn sample(
         contig_parked,
         contig_ready,
         pipe,
+        rss_kb: rss.rss_kb,
+        rss_anon_kb: rss.anon_kb,
+        rss_file_kb: rss.file_kb,
+        vm_hwm_kb: rss.hwm_kb,
+        work,
+        owned,
+        conf_pipe,
     }
 }
 
@@ -808,9 +894,101 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     out
 }
 
+/// Format process RSS + known retain-structure occupancy (leak triage).
+///
+/// All counts are O(1) lens / brief mutex snaps taken on the 5s tick. Compare
+/// `rss=` / `anon=` growth to these maps: RSS climbing while sizes stay flat
+/// points at untracked retain (or kernel file pages under store mmaps).
+pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
+    let w = &s.work;
+    let b = &w.body;
+    let o = &s.owned;
+    let h = &o.head;
+    let cp = &s.conf_pipe;
+    let head_active = if h.active { 1 } else { 0 };
+    let primary_mib = h.primary_body_bytes / (1024 * 1024);
+    let shadow_mib = h.shadow_body_bytes / (1024 * 1024);
+    let load_wire_mib = cp.load_wire_bytes / (1024 * 1024);
+    let write_wire_mib = cp.write_wire_bytes / (1024 * 1024);
+    format!(
+        "ibd: sizes rss={}MiB anon={}MiB file={}MiB hwm={}MiB \
+         | work ordered={}/set={} hash_h={} h2h={} hdr_fk={} known_hdr={} inflight={}/peer={} cooldown={} \
+         | body known={} pend={} miss={} charged={} rej={} \
+         | arch q={}/{}MiB budget={}MiB sticky={}/{} fifo={} contig parked={} ready={} next_h={} \
+         | outfifo creates={} outs={}/{} order={} plans={} \
+         | conf loadq={}/{} blks={} wire={}MiB parents={} writeq={}/{} blks={} wire={}MiB parents={} \
+           feed ready={} inflight={} \
+         | txhead active={} bits={}/{} entry={}B slots={} occ={} body={}MiB \
+           shadow bits={} entry={}B slots={} occ={} body={}MiB cursor={}/{} \
+         | sh runs={} memtable={} heads={}",
+        kb_mib(s.rss_kb),
+        kb_mib(s.rss_anon_kb),
+        kb_mib(s.rss_file_kb),
+        kb_mib(s.vm_hwm_kb),
+        w.ordered,
+        w.ordered_set,
+        w.hash_height,
+        w.height_to_hash,
+        w.header_fks,
+        w.known_headers,
+        w.inflight,
+        w.peer_inflight,
+        w.addr_cooldown,
+        b.known,
+        b.pending,
+        b.missing,
+        b.archive_charged,
+        b.rejected,
+        s.arch_q,
+        s.arch_mb,
+        s.arch_budget_mb,
+        o.sticky_len,
+        o.sticky_cap,
+        o.sticky_fifo,
+        s.contig_parked,
+        s.contig_ready,
+        s.contig_next_h,
+        o.out_creates,
+        o.out_total,
+        o.out_cap,
+        o.out_order,
+        o.conf_plans,
+        cp.load_batches,
+        s.conf_load_q_cap,
+        cp.load_blocks,
+        load_wire_mib,
+        cp.load_parents,
+        cp.write_batches,
+        s.conf_write_q_cap,
+        cp.write_blocks,
+        write_wire_mib,
+        cp.write_parents,
+        cp.feed_ready,
+        cp.feed_inflight,
+        head_active,
+        h.primary_bits,
+        h.shadow_bits.max(h.primary_bits),
+        h.primary_entry_b,
+        h.primary_slots,
+        h.primary_occupied,
+        primary_mib,
+        h.shadow_bits,
+        h.shadow_entry_b,
+        h.shadow_slots,
+        h.shadow_occupied,
+        shadow_mib,
+        h.cursor,
+        h.class_a_n,
+        o.sh_runs,
+        o.sh_memtable,
+        o.sh_heads,
+    )
+}
+
 /// Emit consolidated INFO (+ DEBUG if enabled). Single stderr flush at end.
 pub(crate) fn log_sample(s: &IbdPerfSample) {
     info!("{}", format_info(s));
+    info!("{}", format_sizes(s));
     if enabled(Level::Debug) {
         debug!("{}", format_debug(s));
     }
@@ -986,5 +1164,76 @@ mod tests {
             rbitcoin_query::contig_park_stats::snapshot(),
             (42, 7, 3)
         );
+    }
+
+    #[test]
+    fn format_sizes_has_rss_and_structure_tokens() {
+        let mut s = IbdPerfSample::default();
+        s.rss_kb = 2 * 1024; // 2 MiB
+        s.rss_anon_kb = 1024;
+        s.rss_file_kb = 512;
+        s.vm_hwm_kb = 3 * 1024;
+        s.arch_q = 12;
+        s.arch_mb = 40;
+        s.arch_budget_mb = 512;
+        s.work.ordered = 100;
+        s.work.ordered_set = 90;
+        s.work.body.pending = 5;
+        s.work.body.archive_charged = 4;
+        s.owned.sticky_len = 1000;
+        s.owned.sticky_cap = 4_000_000;
+        s.owned.out_creates = 50;
+        s.owned.out_total = 500;
+        s.owned.out_cap = 16_777_216;
+        s.owned.head.active = true;
+        s.owned.head.primary_bits = 29;
+        s.owned.head.shadow_bits = 30;
+        s.owned.head.primary_entry_b = 4;
+        s.owned.head.shadow_entry_b = 4;
+        s.owned.head.primary_slots = 1 << 29;
+        s.owned.head.shadow_slots = 1 << 30;
+        s.owned.head.primary_body_bytes = (1u64 << 29) * 4;
+        s.owned.head.shadow_body_bytes = (1u64 << 30) * 4;
+        s.owned.head.cursor = 1_000_000;
+        s.owned.head.class_a_n = 2_000_000;
+        s.conf_pipe.load_batches = 2;
+        s.conf_pipe.load_blocks = 40;
+        s.conf_pipe.load_wire_bytes = 12 * 1024 * 1024;
+        s.conf_pipe.load_parents = 500;
+        s.conf_pipe.write_batches = 1;
+        s.conf_pipe.write_blocks = 16;
+        s.conf_pipe.write_wire_bytes = 4 * 1024 * 1024;
+        s.conf_pipe.feed_ready = 8;
+        s.conf_pipe.feed_inflight = 32;
+        s.conf_load_q_cap = 5;
+        s.conf_write_q_cap = 5;
+        s.contig_parked = 3;
+        let line = format_sizes(&s);
+        assert!(line.starts_with("ibd: sizes "), "{line}");
+        assert!(line.contains("rss=2MiB"), "{line}");
+        assert!(line.contains("anon=1MiB"), "{line}");
+        assert!(line.contains("file=0MiB"), "{line}"); // 512kB → 0 MiB integer
+        assert!(line.contains("hwm=3MiB"), "{line}");
+        assert!(line.contains("ordered=100/set=90"), "{line}");
+        assert!(line.contains("pend=5"), "{line}");
+        assert!(line.contains("charged=4"), "{line}");
+        assert!(line.contains("arch q=12/40MiB"), "{line}");
+        assert!(line.contains("sticky=1000/4000000"), "{line}");
+        assert!(line.contains("outfifo creates=50"), "{line}");
+        assert!(line.contains("outs=500/16777216"), "{line}");
+        assert!(line.contains("loadq=2/5 blks=40 wire=12MiB parents=500"), "{line}");
+        assert!(line.contains("writeq=1/5 blks=16 wire=4MiB"), "{line}");
+        assert!(line.contains("feed ready=8 inflight=32"), "{line}");
+        assert!(line.contains("txhead active=1"), "{line}");
+        assert!(line.contains("bits=29/30"), "{line}");
+        assert!(line.contains("cursor=1000000/2000000"), "{line}");
+        assert!(line.contains("contig parked=3"), "{line}");
+    }
+
+    #[test]
+    fn read_proc_rss_returns_nonzero_on_linux() {
+        let r = read_proc_rss();
+        // Agent VM is Linux with /proc; RSS should be readable for this process.
+        assert!(r.rss_kb > 0, "expected VmRSS from /proc/self/status, got {r:?}");
     }
 }

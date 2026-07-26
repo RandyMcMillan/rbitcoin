@@ -36,6 +36,27 @@ use std::sync::Mutex;
 
 pub type QueryError = StoreError;
 
+/// Cheap process-owned cache occupancy for IBD `ibd: sizes` (O(1) lens + brief locks).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProcessOwnedSizes {
+    pub sticky_len: usize,
+    pub sticky_cap: usize,
+    pub sticky_fifo: usize,
+    /// OutFifo create entries.
+    pub out_creates: usize,
+    /// OutFifo total outs (vs `out_cap`).
+    pub out_total: u64,
+    pub out_cap: u64,
+    pub out_order: usize,
+    pub conf_plans: usize,
+    pub conf_bodies: usize,
+    pub sh_runs: usize,
+    pub sh_memtable: usize,
+    pub sh_heads: usize,
+    /// Primary + shadow `tx.head` during online resize (logical table sizes).
+    pub head: rbitcoin_store::HeadResizeSizeSnapshot,
+}
+
 pub use batch_full_bodies::BatchFullBodies;
 pub use batch_parents::BatchParents;
 pub use confirm_load::BatchThin;
@@ -798,6 +819,31 @@ impl Query {
             self.archive_txid_sticky.len(),
             self.archive_txid_sticky.cap(),
         )
+    }
+
+    /// Cheap process-owned cache sizes for the IBD `ibd: sizes` line.
+    ///
+    /// A few brief mutex locks only (sticky / parent cache / SH memtable /
+    /// sh_heads). Call from the ~5s status tick — not the hot path.
+    pub fn process_owned_size_snapshot(&self) -> ProcessOwnedSizes {
+        let (sticky_len, sticky_cap, sticky_fifo) = self.archive_txid_sticky.size_stats();
+        let (out_creates, out_total, out_cap, out_order) = self.confirm_parents.body_lru_stats();
+        let conf_plans = self.confirm_parents.plan_count();
+        ProcessOwnedSizes {
+            sticky_len,
+            sticky_cap,
+            sticky_fifo,
+            out_creates,
+            out_total,
+            out_cap,
+            out_order,
+            conf_plans,
+            conf_bodies: out_creates,
+            sh_runs: self.sh_run.on_disk_run_count(),
+            sh_memtable: self.sh_run.memtable_len(),
+            sh_heads: self.sh_heads.lock().unwrap().len(),
+            head: self.store.txs.head_resize_size_snapshot(),
+        }
     }
 
     /// Rebuild durable `tx.head` from every Class A body (idempotent).

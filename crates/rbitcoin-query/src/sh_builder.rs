@@ -174,6 +174,11 @@ impl ShRunBuilder {
         on_disk_run_count(&dir, &io)
     }
 
+    /// In-memory memtable entry count (process-owned; for `ibd: sizes`).
+    pub fn memtable_len(&self) -> usize {
+        self.inner.lock().unwrap().pending.len()
+    }
+
     /// Enqueue thin creates from confirm. Blocks only if hard memtable cap
     /// until a flush frees space (sequential flush, not head RMW).
     pub fn enqueue(&self, creates: &[ScriptHashRecord]) {

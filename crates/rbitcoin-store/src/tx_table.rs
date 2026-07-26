@@ -646,6 +646,27 @@ struct HeadResize {
     target: HeadLayout,
 }
 
+/// Primary + optional shadow `tx.head` occupancy for IBD size logs.
+///
+/// Body sizes are **logical** table size (`slots × entry_bytes`), not faulted RSS.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HeadResizeSizeSnapshot {
+    pub active: bool,
+    /// Next Class A fk to fill into the shadow (0 if idle).
+    pub cursor: u64,
+    pub class_a_n: u64,
+    pub primary_bits: u32,
+    pub primary_slots: u64,
+    pub primary_entry_b: u8,
+    pub primary_occupied: u64,
+    pub primary_body_bytes: u64,
+    pub shadow_bits: u32,
+    pub shadow_slots: u64,
+    pub shadow_entry_b: u8,
+    pub shadow_occupied: u64,
+    pub shadow_body_bytes: u64,
+}
+
 /// Parse a positive u64 env (new name, then deprecated alias).
 fn env_u64(primary: &str, legacy: &str, default: u64, lo: u64, hi: u64) -> u64 {
     std::env::var(primary)
@@ -2488,12 +2509,67 @@ impl TxTable {
 
     /// `(shadow_cursor, class_a_count, target_bits, primary_slots)` for logs.
     fn head_resize_progress(&self) -> (u64, u64, u32, u64) {
-        let n = self.count();
-        let slots = self.head.read().unwrap().slots();
+        let snap = self.head_resize_size_snapshot();
+        (
+            snap.cursor,
+            snap.class_a_n,
+            if snap.active {
+                snap.shadow_bits
+            } else {
+                snap.primary_bits
+            },
+            snap.primary_slots,
+        )
+    }
+
+    /// Cheap occupancy of primary + in-progress shadow `tx.head` (for `ibd: sizes`).
+    ///
+    /// Body sizes are **sparse file** logical size (`slots × entry_bytes`), not
+    /// necessarily resident RSS — still the right meter for dual-mmap retain
+    /// during online resize.
+    pub fn head_resize_size_snapshot(&self) -> HeadResizeSizeSnapshot {
+        let class_a_n = self.count();
+        let head = self.head.read().unwrap();
+        let primary_bits = head.bits();
+        let primary_slots = head.slots();
+        let primary_entry_b = head.entry_bytes();
+        let primary_occupied = head.occupied();
+        let primary_body_bytes = head.layout().body_bytes();
+        drop(head);
+
         let g = self.resize.lock().unwrap();
+        let active = g.is_some() || self.resize_active.load(AtomicOrdering::Acquire);
         match g.as_ref() {
-            Some(r) => (r.cursor, n, r.target.bits, slots),
-            None => (0, n, self.head.read().unwrap().bits(), slots),
+            Some(r) => HeadResizeSizeSnapshot {
+                active: true,
+                cursor: r.cursor,
+                class_a_n,
+                primary_bits,
+                primary_slots,
+                primary_entry_b,
+                primary_occupied,
+                primary_body_bytes,
+                shadow_bits: r.shadow.bits(),
+                shadow_slots: r.shadow.slots(),
+                shadow_entry_b: r.shadow.entry_bytes(),
+                shadow_occupied: r.shadow.occupied(),
+                shadow_body_bytes: r.shadow.layout().body_bytes(),
+            },
+            None => HeadResizeSizeSnapshot {
+                active,
+                cursor: 0,
+                class_a_n,
+                primary_bits,
+                primary_slots,
+                primary_entry_b,
+                primary_occupied,
+                primary_body_bytes,
+                shadow_bits: 0,
+                shadow_slots: 0,
+                shadow_entry_b: 0,
+                shadow_occupied: 0,
+                shadow_body_bytes: 0,
+            },
         }
     }
 

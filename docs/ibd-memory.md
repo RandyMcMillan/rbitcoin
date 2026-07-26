@@ -108,11 +108,28 @@ Honest coverage (reverting emit/apply would fail):
 | `sh_runs` grows during Direct IBD | On-disk runs; bulk materialize at tip |
 | High `RssFile` with stable anon heap | Mmap page cache — not a Rust leak |
 
-Host check:
+Host check / in-process:
+
+Every ~5s IBD emits **`ibd: sizes`** (INFO) with process RSS and occupancy of
+known retain structures:
+
+| Token group | What it meters |
+|-------------|----------------|
+| `rss=` `anon=` `file=` `hwm=` | `/proc` process RSS (anon vs mmap file pages) |
+| `work` / `body` | IBD maps + body-presence sets |
+| `arch` / `sticky` / `contig` | Archive queue budget + sticky FIFO + ContigPark |
+| `outfifo` | Confirm OutFifo creates/outs/cap/order + height plans |
+| `conf loadq` / `writeq` | Confirm pipeline **queue contents** (batches, blocks, wire MiB, parents) + feed ready/inflight |
+| `txhead` | Primary + **shadow** `tx.head` during online resize (logical body MiB, cursor/n) |
+| `sh` | SH runs / memtable / tip heads |
+
+Grep:
 
 ```bash
+grep 'ibd: sizes' mainnet.log
+# Compare rss=/anon= growth to structure counts — RSS up while sizes flat ⇒
+# untracked retain or RssFile (mmap page cache / dual head during resize).
 grep -E 'VmRSS|RssAnon|RssFile' /proc/$PID/smaps_rollup
-# and IBD perf: arch=…/…MiB pending=… contig parked=…
 ```
 
 ## Agent / reviewer checklist

@@ -30,6 +30,7 @@ mod var_table;
 
 pub use epoch::ArchiveEpoch;
 pub use error::StoreError;
+pub use tx_table::HeadResizeSizeSnapshot;
 pub use file::{
     ensure_nofile_budget, ensure_nofile_budget_at_least, NOFILE_SOFT_TARGET,
 };

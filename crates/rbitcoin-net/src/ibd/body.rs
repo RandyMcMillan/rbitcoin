@@ -5,6 +5,16 @@ use bitcoin::BlockHash;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+/// O(1) occupancy of each [`BodyPresence`] set (for `ibd: sizes` logs).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BodyPresenceSizes {
+    pub known: usize,
+    pub pending: usize,
+    pub missing: usize,
+    pub archive_charged: usize,
+    pub rejected: usize,
+}
+
 /// Process-local Class A body presence cache.
 ///
 /// Assign/status used to call `is_archived` (store) for every ordered hash every
@@ -164,6 +174,17 @@ impl BodyPresence {
     /// Framed / archive-pipeline hashes not yet Class A.
     pub(crate) fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Cheap occupancy for the 5s `ibd: sizes` line (all O(1) `HashSet::len`).
+    pub(crate) fn size_snapshot(&self) -> BodyPresenceSizes {
+        BodyPresenceSizes {
+            known: self.known.len(),
+            pending: self.pending.len(),
+            missing: self.missing.len(),
+            archive_charged: self.archive_charged.len(),
+            rejected: self.rejected.len(),
+        }
     }
 
     /// Wire frame received / archive pipeline owns this hash (not confirmable yet).

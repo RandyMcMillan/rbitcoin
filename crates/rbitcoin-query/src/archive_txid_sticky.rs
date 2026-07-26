@@ -68,6 +68,13 @@ impl ArchiveTxidSticky {
         self.inner.lock().unwrap().cap
     }
 
+    /// `(map_len, cap, fifo_len)` under one lock — for `ibd: sizes` (fifo may
+    /// temporarily exceed map when touch duplicates exist pre-compact).
+    pub fn size_stats(&self) -> (usize, usize, usize) {
+        let g = self.inner.lock().unwrap();
+        (g.map.len(), g.cap, g.fifo.len())
+    }
+
     /// Grow map toward full cap before a linear prewarm (one rehash, not thrash).
     pub fn reserve_for_prewarm(&self, n: usize) {
         let mut g = self.inner.lock().unwrap();

@@ -332,6 +332,16 @@ impl LoadedBatch {
     pub fn is_empty(&self) -> bool {
         self.prepared.is_empty()
     }
+
+    /// Approx wire bytes retained in `wire_blocks` (for queue-content size logs).
+    pub fn approx_wire_bytes(&self) -> usize {
+        self.wire_blocks.iter().map(|b| b.total_size()).sum()
+    }
+
+    /// Sparse parent pin map entries riding this batch.
+    pub fn parent_count(&self) -> usize {
+        self.batch_parents.len()
+    }
 }
 
 impl ScriptOkBatch {
@@ -349,6 +359,16 @@ impl ScriptOkBatch {
 
     pub fn is_empty(&self) -> bool {
         self.prepared.is_empty()
+    }
+
+    /// Approx wire bytes retained in `wire_blocks` (for queue-content size logs).
+    pub fn approx_wire_bytes(&self) -> usize {
+        self.wire_blocks.iter().map(|b| b.total_size()).sum()
+    }
+
+    /// Sparse parent pin map entries riding this batch.
+    pub fn parent_count(&self) -> usize {
+        self.batch_parents.len()
     }
 }
 

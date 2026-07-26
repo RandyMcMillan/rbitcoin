@@ -382,7 +382,7 @@ impl ConfirmParentCache {
             g.outs.len(),
             g.outs.total_outs(),
             g.outs.cap_outs(),
-            g.outs.len(),
+            g.outs.order_len(),
         )
     }
 

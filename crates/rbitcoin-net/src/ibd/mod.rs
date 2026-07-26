@@ -861,9 +861,16 @@ pub async fn ibd_cancellable(
             let arch_budget_mb = archive_queued.budget_bytes() / (1024 * 1024);
             let arch_q_now = archive_queued.count();
 
-            // One sample/reset, then INFO `ibd: perf` (+ DEBUG `ibd: perf_dbg`).
+            // One sample/reset, then INFO `ibd: perf` + `ibd: sizes` (+ DEBUG `ibd: perf_dbg`).
             let parent_cache_snap = hub.query.parent_cache_perf_snapshot();
             let (load_q, write_q) = confirm_queues.snap();
+            let mut conf_pipe = confirm_queues.content_snap();
+            let (feed_ready, feed_inflight) = confirm_feed.size_snap();
+            conf_pipe.feed_ready = feed_ready;
+            conf_pipe.feed_inflight = feed_inflight;
+            let work_sizes = st.structure_sizes();
+            let owned_sizes = hub.query.process_owned_size_snapshot();
+            let rss = perf_log::read_proc_rss();
             let perf = perf_log::sample(
                 &loop_stats,
                 &pipe_stats,
@@ -884,6 +891,10 @@ pub async fn ibd_cancellable(
                 write_q,
                 hub.query.scripthash_run_count(),
                 hub.query.archive_txid_sticky_stats(),
+                work_sizes,
+                owned_sizes,
+                conf_pipe,
+                rss,
             );
             perf_log::log_sample(&perf);
 

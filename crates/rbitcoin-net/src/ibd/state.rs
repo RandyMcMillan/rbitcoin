@@ -9,7 +9,7 @@
 //!   so they do not grow unbounded past `MAX_ORDERED_HEADERS`.
 
 use super::assign_plan::compact_ordered;
-use super::body::BodyPresence;
+use super::body::{BodyPresence, BodyPresenceSizes};
 use bitcoin::BlockHash;
 use rbitcoin_primitives::Fk;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -17,6 +17,22 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use super::peer_io::PeerSlot;
+
+/// O(1) occupancy of [`IbdWorkState`] retain structures (for `ibd: sizes`).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WorkStructureSizes {
+    pub ordered: usize,
+    pub ordered_set: usize,
+    pub hash_height: usize,
+    pub height_to_hash: usize,
+    pub header_fks: usize,
+    pub known_headers: usize,
+    pub inflight: usize,
+    /// Sum of per-peer `in_flight` sets (may exceed unique `inflight` on tip races).
+    pub peer_inflight: usize,
+    pub addr_cooldown: usize,
+    pub body: BodyPresenceSizes,
+}
 
 /// Outstanding getdata for one block hash (one or more peers).
 ///
@@ -157,6 +173,23 @@ impl IbdWorkState {
             }
         }
         self.height_to_hash.insert(ht, hash);
+    }
+
+    /// Cheap occupancy of work-path maps/deques (for `ibd: sizes`; all O(1) lens).
+    pub(crate) fn structure_sizes(&self) -> WorkStructureSizes {
+        let peer_inflight: usize = self.slots.iter().map(|s| s.in_flight.len()).sum();
+        WorkStructureSizes {
+            ordered: self.ordered.len(),
+            ordered_set: self.ordered_set.len(),
+            hash_height: self.hash_height.len(),
+            height_to_hash: self.height_to_hash.len(),
+            header_fks: self.header_fks.len(),
+            known_headers: self.known_headers.len(),
+            inflight: self.inflight.len(),
+            peer_inflight,
+            addr_cooldown: self.addr_cooldown.len(),
+            body: self.body.size_snapshot(),
+        }
     }
 
     /// Compact ghost entries in `ordered` and drop auxiliary map keys no longer

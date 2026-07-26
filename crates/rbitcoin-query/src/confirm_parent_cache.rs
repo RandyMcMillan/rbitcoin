@@ -602,8 +602,8 @@ mod tests {
         assert_eq!(c.ready_through(), 1);
     }
 
-    /// FIFO resolve + tip non-GC of outs + slim pin batch + dense layout/coinbase.
-    /// Cap eviction: one insert pair. External pin: three_stage_confirm scenario.
+    /// FIFO resolve + tip non-GC + slim pin + dense layout + replace + bounds + eviction.
+    /// External pin path: rbitcoin-test three_stage_confirm_and_parent_pin_surface.
     #[test]
     fn out_fifo_pin_and_dense_surface() {
         let c = ConfirmParentCache::new();
@@ -629,15 +629,23 @@ mod tests {
         c.advance_tip(10);
         assert!(c.has_body(Fk(70))); // outs survive tip advance
 
+        // Slim pin: only requested vouts; FIFO still holds the rest for a later need.
         let need = [0u32, 2];
         let mut hits = c.get_bodies_for_pin_batch(&[(70, &need)]);
         let (h, _txr, outs, cb, body_range, _) = hits.remove(&70).expect("hit");
         assert_eq!(h, 1);
         assert_eq!(outs.len(), 2);
+        assert_eq!(outs[0].0, 0);
+        assert_eq!(outs[1].0, 2);
         assert_eq!(cb, Some(true));
         assert!(body_range.is_none());
+        let need1 = [1u32];
+        let hits1 = c.get_bodies_for_pin_batch(&[(70, &need1)]);
+        assert_eq!(hits1.get(&70).unwrap().2.len(), 1);
+        assert_eq!(hits1.get(&70).unwrap().2[0].0, 1);
+        assert_eq!(hits1.get(&70).unwrap().2[0].1.value, 20);
 
-        // pin_new dense: layout + multi-in non-cb
+        // pin_new dense: layout + multi-in non-cb; all vouts remain addressable after slim.
         let mut t2 = tx(9);
         t2.input_count = 1;
         t2.output_count = 4;
@@ -651,9 +659,12 @@ mod tests {
         )]);
         let e = c.get_bodies_for_pin_batch(&[(90, &[3u32][..])]).remove(&90).unwrap();
         assert_eq!(e.2[0].1.value, 4);
-        assert_eq!(e.3, None);
+        assert_eq!(e.3, None); // single-in pin_new: coinbase unknown without inputs
         assert_eq!(e.4, Some((5000, 100)));
         assert_eq!(e.5, vec![(3, 70)]);
+        let hits_all = c.get_bodies_for_pin_batch(&[(90, &[0u32, 1, 2, 3][..])]);
+        assert_eq!(hits_all.get(&90).unwrap().2.len(), 4);
+
         let mut t3 = tx(8);
         t3.input_count = 2;
         c.put_dense_outs_batch(vec![(
@@ -672,7 +683,36 @@ mod tests {
             Some(false)
         );
 
-        // Cap eviction (oldest create dropped).
+        // Replace-in-place: same create_fk re-put upgrades outs without extra entry.
+        c.put_bodies_batch(vec![(Fk(91), 0, {
+            let mut t = tx(8);
+            t.input_count = 2;
+            t
+        }, vec![out(9), out(10)], vec![])]);
+        assert_eq!(c.body_count(), 3); // 70, 90, 91 — not a fourth create
+        assert_eq!(
+            c.get_bodies_for_pin_batch(&[(91, &[0u32, 1][..])])
+                .get(&91)
+                .unwrap()
+                .2
+                .len(),
+            2
+        );
+
+        // Bounds: many small creates must keep total outs ≤ cap (not only hard 2-create eviction).
+        let c2 = ConfirmParentCache::new();
+        c2.set_out_fifo_cap(100);
+        c2.advance_tip(0);
+        for i in 0..50u64 {
+            let mut ti = tx((i & 0xff) as u8);
+            ti.txid[0] = i as u8;
+            c2.put_body(Fk(i + 1), 1, ti, vec![out(1); 4], vec![]);
+        }
+        let (n, total, cap, _) = c2.body_lru_stats();
+        assert!(total <= cap, "total_outs={total} cap={cap} creates={n}");
+        assert!(n <= 25, "creates={n}");
+
+        // Hard eviction: oldest create dropped when a second create exceeds cap.
         c.set_out_fifo_cap(5);
         c.put_bodies_batch(vec![(Fk(1), 1, tx(1), vec![out(1), out(2), out(3)], vec![])]);
         c.put_bodies_batch(vec![(Fk(2), 2, tx(2), vec![out(4), out(5), out(6)], vec![])]);

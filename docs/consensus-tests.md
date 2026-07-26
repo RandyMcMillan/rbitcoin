@@ -106,13 +106,15 @@ Location: `crates/rbitcoin-test/tests/consensus_rules.rs`. Helpers: `median_time
 | Height | Failure class (historical) | Test |
 |--------|----------------------------|------|
 | 1 | BIP325 signet challenge | `signet::tests::signet_block_1_solution_valid` |
-| 200001 | BIP342 CHECKSIGADD `0xba` / OP_SUCCESS | `signet_200001_checksigadd` |
-| 200945 | OP_1SUB `0x8c` unary arith | `signet_200945_op1sub` |
-| 201393 | Tapscript size > 10k (no legacy limit) | `signet_201393_large_tapscript` |
-| 204802 | P2SH multi-push must fall through nested probe | `signet_204802_p2sh` |
+| 200001 | BIP342 CHECKSIGADD `0xba` / OP_SUCCESS | `script_edge_fixtures::block_200001_*` |
+| 200945 | OP_1SUB `0x8c` unary arith | `script_edge_fixtures::block_200945_has_op_1sub_and_matches_hash` |
+| 201393 | Tapscript size > 10k (no legacy limit) | `script_edge_fixtures::block_201393_has_witness_script_over_10k` |
+| 204802 | P2SH multi-push must fall through nested probe | `script_edge_fixtures::block_204802_matches_reject_hash` |
 | 2148 | Archive point edges ≠ best-chain spent | `scenarios::confirm_with_spend_index_ignores_archive_only_point_edges` |
-| 90719 | BIP342 OP_CODESEPARATOR instruction index in tapscript sighash | `signet_90719_codeseparator` + `script_path_codeseparator_checksig_chain` |
-| 219477 | BIP16 true-top (not cleanstack) | `signet_219477_p2sh_true_top` + `p2sh_legacy_multi_push_op_true_accepts` |
+| 90719 | BIP342 OP_CODESEPARATOR instruction index in tapscript sighash | `script_edge_fixtures::block_90719_*` + `script_path_codeseparator_checksig_chain` |
+| 219477 | BIP16 true-top (not cleanstack) | `script_edge_fixtures::block_219477_matches_reject_hash` + `p2sh_legacy_multi_push_op_true_accepts` |
+| 277442 | CODESEPARATOR + P2WSH CSV leaf | `script_edge_fixtures::block_277442_matches_reject_hash` |
+| 290329 (mainnet) | P2SH FindAndDelete embedded sig | `script_edge_fixtures::mainnet_290329_p2sh_multisig_with_embedded_sig_accepts` |
 
 Benches: `cargo bench -p rbitcoin-consensus --bench script_verify` (real P2WPKH / P2TR key-path).
 

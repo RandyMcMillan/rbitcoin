@@ -12,6 +12,7 @@ mod compact;
 mod epoch;
 mod error;
 mod file;
+mod head_resize_fill;
 pub mod head_resolve_stats;
 mod ibd_io_policy;
 mod hashhead;

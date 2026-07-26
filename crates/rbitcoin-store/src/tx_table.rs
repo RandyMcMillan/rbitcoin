@@ -1138,7 +1138,7 @@ impl TxTable {
 
     /// Parse txid from the leading bytes of a Class A body payload.
     #[inline]
-    fn txid_from_body_prefix(raw: &[u8]) -> Result<[u8; 32], StoreError> {
+    pub(crate) fn txid_from_body_prefix(raw: &[u8]) -> Result<[u8; 32], StoreError> {
         if raw.first().copied() == Some(PACKED_TX_V1) {
             if raw.len() < 1 + 32 {
                 return Err(StoreError::Corrupt("short packed tx for txid"));
@@ -2806,11 +2806,11 @@ impl TxTable {
         ) as usize
     }
 
-    /// Fill shadow head for consecutive Class A ids using bulk idx + body reads.
+    /// Fill shadow head for consecutive Class A ids.
     ///
-    /// Chunks body IO by [`Self::head_fill_read_batch`]; writes via
-    /// `insert_many` in [`Self::head_fill_write_chunk`] groups (one fence each).
-    /// Same knobs as [`Self::backfill_head_inner`] (rebuild / recovery).
+    /// **Online path:** prefer io_uring pipeline ([`crate::head_resize_fill`]) so
+    /// `tx.head.new` is filled via pread/pwrite page RMW (no shadow mmap fault-in).
+    /// Falls back to bulk body reads + mmap `insert_many` if uring is unavailable.
     fn shadow_fill_fk_range(
         &self,
         shadow: &AddressHead,
@@ -2820,6 +2820,28 @@ impl TxTable {
         if last < first {
             return Ok(());
         }
+        match crate::head_resize_fill::run_shadow_fill_uring(&self.body, shadow, first, last) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                static ONCE: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    rbitcoin_log::warn!(
+                        "store: io_uring shadow fill unavailable ({e}) — falling back to mmap insert_many"
+                    );
+                }
+            }
+        }
+        self.shadow_fill_fk_range_mmap(shadow, first, last)
+    }
+
+    /// Mmap `insert_many` fill (rebuild / uring fallback).
+    fn shadow_fill_fk_range_mmap(
+        &self,
+        shadow: &AddressHead,
+        first: u64,
+        last: u64,
+    ) -> Result<(), StoreError> {
         let write_chunk = Self::head_fill_write_chunk();
         let read_batch = Self::head_fill_read_batch();
         let mut cur = first;
@@ -3728,6 +3750,68 @@ mod tests {
             let mut txid = [0u8; 32];
             txid[0..8].copy_from_slice(&i.to_le_bytes());
             assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// io_uring shadow fill matches mmap insert_many for a small Class A set.
+    #[test]
+    fn shadow_fill_uring_matches_insert_many() {
+        if !crate::bulk_io::io_uring_enabled() {
+            eprintln!("skip: io_uring unavailable");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-shadow-uring-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = create_tiny(&dir);
+        let mk = |i: u64| {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            let rec = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+            (rec, inputs, outputs)
+        };
+        const N: u64 = 80;
+        for i in 1..=N {
+            let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
+        }
+        let layout = crate::address_head::HeadLayout::new(12).unwrap();
+        let shadow_a = dir.join("shadow_a");
+        let shadow_b = dir.join("shadow_b");
+        let ha = AddressHead::create_with_layout(&shadow_a, layout).unwrap();
+        let hb = AddressHead::create_with_layout(&shadow_b, layout).unwrap();
+        // mmap path
+        t.shadow_fill_fk_range_mmap(&ha, 1, N).unwrap();
+        // uring path
+        crate::head_resize_fill::run_shadow_fill_uring(&t.body, &hb, 1, N).unwrap();
+        assert_eq!(ha.occupied(), hb.occupied(), "occupied mismatch");
+        for i in 1..=N {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            let ca = ha.probe_fks(&txid).unwrap();
+            let cb = hb.probe_fks(&txid).unwrap();
+            assert!(ca.contains(&Fk(i)), "mmap missing {i}");
+            assert!(cb.contains(&Fk(i)), "uring missing {i}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

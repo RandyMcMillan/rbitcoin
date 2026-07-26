@@ -356,6 +356,114 @@ pub fn hop_scan_page(
     }
 }
 
+/// Global first slot of the probe page that holds `txid`.
+#[inline]
+pub fn page_base_for_txid(txid: &[u8; 32], bits: u32) -> u64 {
+    if bits <= PAGE_SLOT_BITS {
+        0
+    } else {
+        page_index(txid, bits) << PAGE_SLOT_BITS
+    }
+}
+
+/// Outcome of [`insert_fk_into_page_buf`] (in-buffer only; no file IO).
+#[derive(Debug, Clone, Copy)]
+pub struct InsertPageOutcome {
+    /// Wrote a new empty→fk slot (false if `new_fk` already on the chain).
+    pub wrote_new: bool,
+    /// Probe depth of the empty slot written (or 0 if idempotent).
+    pub depth: u32,
+    /// Local slot index within the page (valid if `wrote_new`).
+    pub empty_local: u64,
+    /// Encoded create_fk value written (valid if `wrote_new`).
+    pub stored_fk: u64,
+}
+
+/// Insert `new_fk` into a **loaded** probe page buffer (online resize RMW path).
+///
+/// Idempotent if `new_fk` is already present. Does not touch the file or
+/// [`AddressHead::occupied`] — caller applies the buffer via pwrite / store and
+/// bumps occupied when `wrote_new`.
+pub fn insert_fk_into_page_buf(
+    page_buf: &mut [u8],
+    page_base: u64,
+    bits: u32,
+    entry_bytes: u8,
+    txid: &[u8; 32],
+    new_fk: Fk,
+) -> Result<InsertPageOutcome, StoreError> {
+    let _ = page_base;
+    if new_fk.is_null() {
+        return Err(StoreError::InvalidFk);
+    }
+    if entry_bytes == 4 && new_fk.0 > u64::from(u32::MAX) {
+        return Err(StoreError::InvalidFk);
+    }
+    let new_u = new_fk.0;
+    let es = entry_bytes as usize;
+    if es != 4 && es != 8 {
+        return Err(StoreError::Corrupt("address head entry_bytes"));
+    }
+    if page_buf.len() < es {
+        return Err(StoreError::Corrupt("address head probe page empty"));
+    }
+    let nslots = (page_buf.len() / es) as u64;
+    let h1 = h1_in_page(txid, bits);
+    let h2 = h2_in_page(txid, bits);
+    let scan = hop_scan_page(page_buf, entry_bytes, h1, h2, nslots, MAX_PROBE);
+    for &(_d, e) in &scan.cands {
+        if e == new_u {
+            return Ok(InsertPageOutcome {
+                wrote_new: false,
+                depth: 0,
+                empty_local: 0,
+                stored_fk: new_u,
+            });
+        }
+    }
+    if !scan.hit_empty {
+        note_probe_exhausted();
+        return Err(StoreError::Corrupt("address head probe exhausted on insert"));
+    }
+    store_entry_in_page_buf(page_buf, scan.empty_local, entry_bytes, new_u)?;
+    Ok(InsertPageOutcome {
+        wrote_new: true,
+        depth: scan.depth_end,
+        empty_local: scan.empty_local,
+        stored_fk: new_u,
+    })
+}
+
+/// Write LE create_fk into a page buffer at local slot index.
+#[inline]
+fn store_entry_in_page_buf(
+    page_buf: &mut [u8],
+    local: u64,
+    entry_bytes: u8,
+    new: u64,
+) -> Result<(), StoreError> {
+    let es = entry_bytes as usize;
+    let off = (local as usize)
+        .checked_mul(es)
+        .ok_or(StoreError::Corrupt("page buf slot overflow"))?;
+    if off + es > page_buf.len() {
+        return Err(StoreError::Corrupt("page buf slot out of range"));
+    }
+    match entry_bytes {
+        4 => {
+            if new > u64::from(u32::MAX) {
+                return Err(StoreError::InvalidFk);
+            }
+            page_buf[off..off + 4].copy_from_slice(&(new as u32).to_le_bytes());
+        }
+        8 => {
+            page_buf[off..off + 8].copy_from_slice(&new.to_le_bytes());
+        }
+        _ => return Err(StoreError::Corrupt("address head entry_bytes")),
+    }
+    Ok(())
+}
+
 /// Bytes to pread for the full probe page of `txid`.
 ///
 /// Caps to the **slot data region** (`slot_region_len` = `slots × entry_bytes`),
@@ -710,16 +818,6 @@ impl AddressHead {
         self.file.path()
     }
 
-    fn encode_fk(&self, fk: Fk) -> Result<u64, StoreError> {
-        if fk.is_null() {
-            return Err(StoreError::InvalidFk);
-        }
-        if self.layout.entry_bytes == 4 && fk.0 > u64::from(u32::MAX) {
-            return Err(StoreError::InvalidFk);
-        }
-        Ok(fk.0)
-    }
-
     pub fn reserve_additional(&self, _additional: u64) -> Result<(), StoreError> {
         Ok(())
     }
@@ -744,22 +842,23 @@ impl AddressHead {
         }
     }
 
+    /// Bump occupied after offline / RMW fills that wrote `n` new empty→fk slots.
+    #[inline]
+    pub(crate) fn note_inserts(&self, n: u64) {
+        if n > 0 {
+            self.occupied.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
     /// Sole-writer insert into first empty **in-page** probe slot (no CAS).
     ///
     /// Idempotent if `new_fk` is already on the chain. Loads **one page**, then
     /// double-hash hops in memory.
     fn insert_one(&self, txid: &[u8; 32], new_fk: Fk) -> Result<(), StoreError> {
-        let new_u = self.encode_fk(new_fk)?;
         let bits = self.layout.bits;
         let es = self.layout.entry_bytes;
         let page_slots = page_slot_count(bits);
-        let page_base = if bits <= PAGE_SLOT_BITS {
-            0
-        } else {
-            page_index(txid, bits) << PAGE_SLOT_BITS
-        };
-        let h1 = h1_in_page(txid, bits);
-        let h2 = h2_in_page(txid, bits);
+        let page_base = page_base_for_txid(txid, bits);
         let mut buf = [0u8; PROBE_REGION_BYTES];
         let n = self.load_page_slots(page_base, page_slots, &mut buf)?;
         let es_u = es as usize;
@@ -767,24 +866,14 @@ impl AddressHead {
             note_probe_exhausted();
             return Err(StoreError::Corrupt("address head probe page empty"));
         }
-        // Slot count actually present in the loaded buffer (may be < page_slots
-        // only if the slot region is truncated — normal tables always fill).
-        let nslots = (n / es_u) as u64;
-        let scan = hop_scan_page(&buf[..n], es, h1, h2, nslots, MAX_PROBE);
-        for &(_d, e) in &scan.cands {
-            if e == new_u {
-                return Ok(());
-            }
-        }
-        if scan.hit_empty {
-            note_probe_depth_on_insert(scan.depth_end);
-            let global = page_base + scan.empty_local;
-            self.store_entry(global, new_u)?;
+        let outcome = insert_fk_into_page_buf(&mut buf[..n], page_base, bits, es, txid, new_fk)?;
+        if outcome.wrote_new {
+            note_probe_depth_on_insert(outcome.depth);
+            let global = page_base + outcome.empty_local;
+            self.store_entry(global, outcome.stored_fk)?;
             self.occupied.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
         }
-        note_probe_exhausted();
-        Err(StoreError::Corrupt("address head probe exhausted on insert"))
+        Ok(())
     }
 
     /// Bulk insert in **call order** (no sort, no page coalescing). Each entry is
@@ -1016,6 +1105,25 @@ mod tests {
         assert_eq!(s.cands, vec![(0, 1), (1, 2)]);
         assert_eq!(s.depth_end, 2);
         assert_eq!(s.empty_local, 2);
+    }
+
+    #[test]
+    fn insert_fk_into_page_buf_empty_idempotent_and_second() {
+        let bits = 16u32;
+        let es = 4u8;
+        let mut txid = [0u8; 32];
+        txid[0] = 0x42;
+        let page_base = page_base_for_txid(&txid, bits);
+        let page_slots = page_slot_count(bits);
+        let mut buf = vec![0u8; (page_slots as usize) * es as usize];
+        let o1 = insert_fk_into_page_buf(&mut buf, page_base, bits, es, &txid, Fk(7)).unwrap();
+        assert!(o1.wrote_new);
+        assert_eq!(o1.stored_fk, 7);
+        let o2 = insert_fk_into_page_buf(&mut buf, page_base, bits, es, &txid, Fk(7)).unwrap();
+        assert!(!o2.wrote_new, "idempotent same fk");
+        let o3 = insert_fk_into_page_buf(&mut buf, page_base, bits, es, &txid, Fk(8)).unwrap();
+        assert!(o3.wrote_new, "second create deeper on chain");
+        assert_ne!(o3.empty_local, o1.empty_local);
     }
 
     #[test]

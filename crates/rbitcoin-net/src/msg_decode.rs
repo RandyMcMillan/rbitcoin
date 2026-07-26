@@ -68,7 +68,7 @@ pub async fn decode_framed_offload(frame: FramedMessage) -> Result<RawNetworkMes
     }
 }
 
-pub(crate) async fn decode_with_permit(
+async fn decode_with_permit(
     frame: FramedMessage,
     permit: OwnedSemaphorePermit,
 ) -> Result<RawNetworkMessage, NetError> {
@@ -82,45 +82,17 @@ pub(crate) async fn decode_with_permit(
     Ok(msg)
 }
 
-/// Acquire a **block** decode permit (process-owned multi-MB frame budget).
-///
-/// IBD readers must hold this **before** parking a framed block for off-thread
-/// decode and before reading the next frame. Otherwise fire-and-forget tasks
-/// wait on the semaphore while each retains a full wire payload (unbounded
-/// process RAM when peers outrun the decode pool — especially while archive
-/// is stalled on `tx.head` resize).
-pub async fn acquire_block_decode_permit() -> Result<OwnedSemaphorePermit, NetError> {
-    block_decode_semaphore()
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| NetError::Protocol("decode semaphore closed"))
-}
-
-/// Fire-and-forget decode with a **pre-acquired** permit (frame already budgeted).
-pub fn spawn_decode_with_permit<F, E>(
-    frame: FramedMessage,
-    permit: OwnedSemaphorePermit,
-    on_done: F,
-    on_err: E,
-) where
-    F: FnOnce(RawNetworkMessage) + Send + 'static,
-    E: FnOnce() + Send + 'static,
-{
-    tokio::spawn(async move {
-        match decode_with_permit(frame, permit).await {
-            Ok(msg) => on_done(msg),
-            Err(_) => on_err(),
-        }
-    });
-}
-
 /// Fire-and-forget heavy decode: free the reader immediately after framing.
 ///
-/// Prefer [`spawn_decode_with_permit`] + [`acquire_block_decode_permit`] for
-/// **block** frames so waiting multi-MB payloads cannot outrun the permit pool.
-/// This entry still acquires a permit **inside** the spawned task (safe for
-/// non-block ctrl messages; do not use for unbounded block fan-in).
+/// Used by IBD peer readers so one slow `block` deserialize never blocks the
+/// next TCP read on that peer. `on_done` runs on the async runtime after decode
+/// (keep it light — only channel sends). `on_err` runs if the blocking join /
+/// semaphore fails (optional re-request path for framed block hashes).
+///
+/// **Invariant:** readers must not await a decode permit (or any other soft
+/// archive-queue gate) before the next TCP read. Soft queue budget is enforced
+/// only by stopping new block *requests* (`can_assign` / getdata), never by
+/// refusing to read or decode data a peer already sends for a prior request.
 pub fn spawn_decode_then_with_err<F, E>(frame: FramedMessage, on_done: F, on_err: E)
 where
     F: FnOnce(RawNetworkMessage) + Send + 'static,

@@ -119,11 +119,12 @@ pub const ARCHIVE_PRESSURE_EXIT: f64 = 0.70;
 /// Charged when a decoded body is handed to the job channel; released when the
 /// writer (or prep error path) returns [`ArchiveResult`].
 ///
-/// **Assign gate (not receive gate):** [`Self::can_assign`] is false once charged
-/// fill ≥ budget — stop issuing new densify/cache getdata. Bodies already in
-/// flight still [`charge`] and enqueue (may briefly overshoot). Soft
-/// [`Self::far_admission_scale`] (proportional + 90%/70% hysteresis) scales
-/// densify capacity before the hard stop.
+/// **Assign gate only (never a receive / decode gate):** [`Self::can_assign`] is
+/// false once charged fill ≥ budget — stop issuing new densify/cache getdata.
+/// Bodies already requested must still be read from TCP, decoded, [`charge`]d,
+/// and enqueued (may briefly overshoot). Soft [`Self::far_admission_scale`]
+/// (proportional + 90%/70% hysteresis) scales densify capacity before the hard
+/// stop. Do **not** stall peer reads or Full-drop arch_job for soft budget.
 pub(crate) struct ArchiveQueueBudget {
     count: AtomicUsize,
     bytes: AtomicUsize,
@@ -628,16 +629,6 @@ mod contig_park_tests {
         assert_eq!(budget.bytes(), 0);
     }
 
-    /// Cap is modest (process-owned Block FIFO bound under resize stall).
-    #[test]
-    fn arch_job_queue_cap_is_modest() {
-        use super::ARCH_JOB_QUEUE_CAP;
-        assert!(
-            ARCH_JOB_QUEUE_CAP > 0 && ARCH_JOB_QUEUE_CAP <= 1024,
-            "arch job queue must be a modest bound, got {ARCH_JOB_QUEUE_CAP}"
-        );
-    }
-
     /// Forwarder drain helper: charged jobs left on job_rx must emit Err and
     /// apply_archive_result must zero the budget (stop-path ownership).
     #[test]
@@ -648,12 +639,12 @@ mod contig_park_tests {
         use super::super::status::LoopStats;
 
         let budget = ArchiveQueueBudget::new(16 * 1024 * 1024);
-        let (job_tx, mut job_rx) = tokio::sync::mpsc::channel(16);
+        let (job_tx, mut job_rx) = tokio::sync::mpsc::unbounded_channel();
         let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
         for h in 0..8u32 {
             let j = job(h);
             budget.charge(j.wire_bytes);
-            job_tx.try_send(j).unwrap();
+            job_tx.send(j).unwrap();
         }
         drop(job_tx);
         assert_eq!(budget.count(), 8);
@@ -915,9 +906,9 @@ fn release_remaining_jobs(
     }
 }
 
-/// Forwarder exit: drain remaining charged jobs on the job channel.
+/// Forwarder exit: drain remaining charged jobs on the unbounded job channel.
 pub(crate) fn drain_job_rx_as_err(
-    job_rx: &mut mpsc::Receiver<ArchiveJob>,
+    job_rx: &mut mpsc::UnboundedReceiver<ArchiveJob>,
     result_tx: &mpsc::UnboundedSender<ArchiveResult>,
     err: &str,
 ) {
@@ -932,15 +923,6 @@ pub(crate) fn drain_job_rx_as_err(
 /// durable `txs.count()` at commit time.
 pub(crate) const ARCHIVE_WRITE_QUEUE_CAP: usize = 2;
 
-/// Bound on decoded `ArchiveJob`s waiting to enter ContigPark / prep (main →
-/// pipeline). Must not be unbounded: while the Class A writer sleeps on
-/// `tx.head` resize, an unbounded queue retains full `Block` bodies forever.
-///
-/// Sized to absorb a short burst above ContigPark without multi-GiB backlog.
-/// When full, the IBD main loop **releases the charge** and mark_missing
-/// (production free path — same budget accounting as Ok/Err/Dropped).
-pub(crate) const ARCH_JOB_QUEUE_CAP: usize = 256;
-
 /// ContigPark → prep (structure + FK assign/resolve reads) → writer (Class A puts).
 ///
 /// **Park first:** out-of-order wire jobs sit in ContigPark without Class A work.
@@ -951,9 +933,14 @@ pub(crate) const ARCH_JOB_QUEUE_CAP: usize = 256;
 /// **Overlap:** prep→writer is a bounded queue ([`ARCHIVE_WRITE_QUEUE_CAP`]).
 /// Prep reserves create fks via a local HWM (`archive_plan_mega_from`) so a second
 /// plan can proceed while the first is still committing.
+///
+/// **arch_job channel is unbounded on purpose.** Soft archive RAM is gated only
+/// by stopping new getdata (`can_assign`). We always enqueue decoded blocks we
+/// already requested — never Full-drop or stall TCP/decode for budget pressure
+/// (that made healthy peers look stalled).
 pub(crate) fn spawn_archive_pipeline(
     hub: Arc<ChainHub>,
-    mut job_rx: mpsc::Receiver<ArchiveJob>,
+    mut job_rx: mpsc::UnboundedReceiver<ArchiveJob>,
     result_tx: mpsc::UnboundedSender<ArchiveResult>,
     stats: Arc<ArchivePipelineStats>,
     archive_queued: Arc<ArchiveQueueBudget>,

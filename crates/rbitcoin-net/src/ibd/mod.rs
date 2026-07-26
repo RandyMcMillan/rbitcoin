@@ -374,7 +374,7 @@ pub async fn ibd_cancellable(
     if store_arch_total > 0 {
         info!("ibd: store has {store_arch_total} Class A bodies (arch_total seed)");
     }
-    let (arch_job_tx, arch_job_rx) = mpsc::channel::<ArchiveJob>(archive::ARCH_JOB_QUEUE_CAP);
+    let (arch_job_tx, arch_job_rx) = mpsc::unbounded_channel::<ArchiveJob>();
     let (arch_res_tx, mut arch_res_rx) = mpsc::unbounded_channel::<ArchiveResult>();
     let archive_stop = Arc::new(AtomicBool::new(false));
     // Contiguous Class A writer starts just past the resume archive HWM (or 0).

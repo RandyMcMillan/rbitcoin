@@ -64,7 +64,7 @@ pub(crate) fn drain_ready_peer_and_archive_events(
     body_rx: &mut mpsc::UnboundedReceiver<PeerEvent>,
     ctrl_rx: &mut mpsc::UnboundedReceiver<PeerEvent>,
     arch_res_rx: &mut mpsc::UnboundedReceiver<ArchiveResult>,
-    arch_job_tx: &mpsc::Sender<ArchiveJob>,
+    arch_job_tx: &mpsc::UnboundedSender<ArchiveJob>,
     archive_queued: &ArchiveQueueBudget,
     archive_write_next: &AtomicU32,
     loop_stats: &LoopStats,
@@ -145,7 +145,7 @@ pub(crate) fn apply_peer_event(
     st: &mut IbdWorkState,
     hub: &ChainHub,
     ev: PeerEvent,
-    arch_job_tx: &mpsc::Sender<ArchiveJob>,
+    arch_job_tx: &mpsc::UnboundedSender<ArchiveJob>,
     archive_queued: &ArchiveQueueBudget,
     archive_write_next: &AtomicU32,
     peer_book: &mut AddrMan,
@@ -394,43 +394,29 @@ pub(crate) fn apply_peer_event(
                 })
                 .unwrap_or(false);
             // Approx wire size for RAM budget (already-decoded).
-            // First copy is charged then enqueued on a **bounded** arch_job queue.
-            // Assign stops densify via `can_assign`. When the queue is full (e.g.
-            // Class A writer sleeping on tx.head resize), release charge and
-            // mark_missing so process RAM for full `Block`s cannot grow unboundedly.
+            // Always enqueue the first copy (may overshoot soft budget). Assign
+            // stops new densify getdata via `can_assign`; never dump in-flight
+            // peer bytes or refuse to decode what a peer already sent. Soft
+            // queue size is bounded only by limiting block *requests*.
             let wire_bytes = block.total_size();
             archive_queued.charge(wire_bytes);
             st.body.mark_archive_charged(hash);
             // Prevent re-getdata while prep/writer owns this body.
             st.body.mark_pending(hash);
-            match arch_job_tx.try_send(ArchiveJob {
-                block,
-                header_fk,
-                priority,
-                wire_bytes,
-                height,
-            }) {
-                Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_job)) => {
-                    archive_queued.release(wire_bytes);
-                    st.body.clear_archive_charged(&hash);
-                    st.body.mark_missing(hash);
-                    static FULL: std::sync::atomic::AtomicU32 =
-                        std::sync::atomic::AtomicU32::new(0);
-                    let n = FULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if n <= 5 || n % 100 == 0 {
-                        warn!(
-                            "ibd: archive job queue full — drop {hash} (release charge; \
-                             re-get later; count={n})"
-                        );
-                    }
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_job)) => {
-                    archive_queued.release(wire_bytes);
-                    st.body.clear_archive_charged(&hash);
-                    st.body.mark_missing(hash);
-                    warn!("ibd: archive pipeline closed; drop {hash}");
-                }
+            if arch_job_tx
+                .send(ArchiveJob {
+                    block,
+                    header_fk,
+                    priority,
+                    wire_bytes,
+                    height,
+                })
+                .is_err()
+            {
+                archive_queued.release(wire_bytes);
+                st.body.clear_archive_charged(&hash);
+                st.body.mark_missing(hash);
+                warn!("ibd: archive pipeline closed; drop {hash}");
             }
         }
         PeerEvent::NotFound { peer, hashes } => {
@@ -587,277 +573,6 @@ pub(crate) fn apply_confirm_reject(st: &mut IbdWorkState, height: u32, hash: Blo
         warn!(
             "ibd: confirm reject applied {hash} @{height}: {err} (blacklisted, count={n})"
         );
-    }
-}
-
-#[cfg(test)]
-mod arch_job_queue_tests {
-    //! Honest regressions for bounded `arch_job` under writer stall (resize).
-    //! Drive **production** [`apply_peer_event`] Full path — not a local reimpl.
-
-    use super::{apply_archive_result, apply_peer_event};
-    use super::super::archive::{
-        ArchiveJob, ArchiveQueueBudget, ArchiveResult, ARCH_JOB_QUEUE_CAP,
-    };
-    use super::super::peer_io::PeerEvent;
-    use super::super::state::IbdWorkState;
-    use super::super::status::LoopStats;
-    use crate::chain::ChainHub;
-    use crate::seeds::AddrMan;
-    use bitcoin::absolute::LockTime;
-    use bitcoin::block::{Header, Version};
-    use bitcoin::hashes::Hash;
-    use bitcoin::transaction::Version as TxVersion;
-    use bitcoin::{
-        Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
-        TxOut, Witness,
-    };
-    use rbitcoin_consensus::{ChainParams, Milestone};
-    use rbitcoin_primitives::Fk;
-    use rbitcoin_query::Query;
-    use std::sync::atomic::AtomicU32;
-    use std::sync::Arc;
-
-    fn dummy_block(n: u32) -> Block {
-        let coinbase = Transaction {
-            version: TxVersion::ONE,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::from_bytes(vec![
-                    (n & 0xff) as u8,
-                    ((n >> 8) & 0xff) as u8,
-                    ((n >> 16) & 0xff) as u8,
-                    ((n >> 24) & 0xff) as u8,
-                ]),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(50_0000_0000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        };
-        let mut b = Block {
-            header: Header {
-                version: Version::ONE,
-                prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
-                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
-                time: 1_700_000_000 + n,
-                bits: CompactTarget::from_consensus(0x207fffff),
-                nonce: n,
-            },
-            txdata: vec![coinbase],
-        };
-        b.header.merkle_root = b.compute_merkle_root().unwrap();
-        b
-    }
-
-    fn tmp_hub(label: &str) -> (std::path::PathBuf, ChainHub) {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-arch-job-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let q = Query::open_or_create(&dir).unwrap();
-        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
-        (dir, hub)
-    }
-
-    /// Production Full path: fill arch_job to capacity via [`apply_peer_event`],
-    /// flood more Blocks, assert budget plateaus at enqueued count (not flood N)
-    /// and Full-path hashes are mark_missing + not archive_charged. Then drain
-    /// with production [`apply_archive_result`] → budget 0.
-    ///
-    /// Reverting Full→release in events.rs fails this test (budget grows past CAP).
-    #[test]
-    fn apply_peer_event_arch_job_full_plateau() {
-        let (dir, hub) = tmp_hub("full");
-        let hub = Arc::new(hub);
-        let mut st = IbdWorkState::new(Vec::new(), None, None);
-        let budget = ArchiveQueueBudget::new(512 * 1024 * 1024);
-        // Tiny queue so flood is cheap; still production try_send Full branch.
-        const Q: usize = 4;
-        assert!(Q <= ARCH_JOB_QUEUE_CAP);
-        let (arch_tx, mut arch_rx) = tokio::sync::mpsc::channel::<ArchiveJob>(Q);
-        let write_next = AtomicU32::new(0);
-        let mut book = AddrMan::new();
-        let local: std::net::SocketAddr = "127.0.0.1:18444".parse().unwrap();
-        let stats = LoopStats::default();
-
-        let before = budget.count();
-        assert_eq!(before, 0);
-
-        // Flood far past Q — only Q should stay charged+queued.
-        const FLOOD: u32 = 40;
-        let mut full_hashes = Vec::new();
-        let mut enqueued = 0u32;
-        for n in 1..=FLOOD {
-            let block = dummy_block(n);
-            let hash = block.block_hash();
-            // Seed header fk so apply does not need store put (empty store).
-            st.header_fks.insert(hash, Fk(n as u64));
-            // height MAX → horizon check skipped (parkable).
-            apply_peer_event(
-                &mut st,
-                &hub,
-                PeerEvent::Block { peer: 0, block },
-                &arch_tx,
-                &budget,
-                &write_next,
-                &mut book,
-                local,
-            );
-            if st.body.is_archive_charged(&hash) {
-                enqueued += 1;
-            } else {
-                // Full path: production released charge + mark_missing.
-                assert!(
-                    !st.body.is_archive_charged(&hash),
-                    "Full path must clear archive_charged"
-                );
-                // mark_missing puts in missing set (skip_download_cached false).
-                full_hashes.push(hash);
-            }
-        }
-
-        let mid_count = budget.count();
-        let mid_bytes = budget.bytes();
-        // Channel depth = budget.count() for charged-and-held jobs (Full released).
-        assert_eq!(
-            enqueued as usize, Q,
-            "only Q jobs should stay charged/enqueued, enqueued={enqueued}"
-        );
-        assert_eq!(
-            mid_count, Q,
-            "budget must plateau at queue depth Q={Q}, got count={mid_count} (if Full release \
-             removed, count would approach FLOOD={FLOOD})"
-        );
-        assert!(
-            mid_bytes > 0,
-            "enqueued jobs must hold charged bytes"
-        );
-        assert!(
-            full_hashes.len() >= (FLOOD as usize).saturating_sub(Q),
-            "most of flood must hit Full path, full_hashes={}",
-            full_hashes.len()
-        );
-        for h in &full_hashes {
-            assert!(
-                !st.body.is_archive_charged(h),
-                "Full-path hash must not stay charged"
-            );
-        }
-
-        // Production teardown: Err results for queued jobs (writer dead / stop).
-        let mut drained = 0usize;
-        while let Ok(j) = arch_rx.try_recv() {
-            apply_archive_result(
-                &mut st,
-                ArchiveResult::Err {
-                    hash: j.block.block_hash(),
-                    err: "test drain".into(),
-                    wire_bytes: j.wire_bytes,
-                },
-                &budget,
-                &stats,
-            );
-            drained += 1;
-        }
-        assert_eq!(drained, Q);
-        assert_eq!(budget.count(), 0, "after production apply_archive_result residual must be 0");
-        assert_eq!(budget.bytes(), 0);
-
-        let report = format!(
-            "arch_job Full plateau (production apply_peer_event)\n\
-             Q={Q} FLOOD={FLOOD} enqueued={enqueued} full_path={}\n\
-             budget mid_count={mid_count} mid_bytes={mid_bytes} after=0\n\
-             plateau=budget.count()==Q under flood, then 0 after apply_archive_result\n",
-            full_hashes.len()
-        );
-        eprintln!("{report}");
-        if let Ok(out) = std::env::var("RBITCOIN_LEAK_PROBE_OUT") {
-            let _ = std::fs::create_dir_all(&out);
-            let _ = std::fs::write(format!("{out}/arch-job-full-plateau-report.txt"), &report);
-        }
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// Growth loop at production [`ARCH_JOB_QUEUE_CAP`]: flood Blocks through
-    /// [`apply_peer_event`]; process-owned charged count never exceeds CAP.
-    #[test]
-    fn apply_peer_event_flood_respects_arch_job_cap() {
-        let (dir, hub) = tmp_hub("cap");
-        let hub = Arc::new(hub);
-        let mut st = IbdWorkState::new(Vec::new(), None, Some(0));
-        let budget = ArchiveQueueBudget::new(512 * 1024 * 1024);
-        let (arch_tx, mut arch_rx) =
-            tokio::sync::mpsc::channel::<ArchiveJob>(ARCH_JOB_QUEUE_CAP);
-        let write_next = AtomicU32::new(0);
-        let mut book = AddrMan::new();
-        let local: std::net::SocketAddr = "127.0.0.1:18444".parse().unwrap();
-        let stats = LoopStats::default();
-
-        let flood = ARCH_JOB_QUEUE_CAP.saturating_mul(3) as u32;
-        let mut peak = 0usize;
-        for n in 1..=flood {
-            let block = dummy_block(10_000 + n);
-            let hash = block.block_hash();
-            st.header_fks.insert(hash, Fk(n as u64));
-            apply_peer_event(
-                &mut st,
-                &hub,
-                PeerEvent::Block { peer: 0, block },
-                &arch_tx,
-                &budget,
-                &write_next,
-                &mut book,
-                local,
-            );
-            peak = peak.max(budget.count());
-            assert!(
-                budget.count() <= ARCH_JOB_QUEUE_CAP,
-                "charged count {} exceeded ARCH_JOB_QUEUE_CAP={ARCH_JOB_QUEUE_CAP}",
-                budget.count()
-            );
-        }
-        assert_eq!(
-            peak, ARCH_JOB_QUEUE_CAP,
-            "peak charged should reach CAP under flood"
-        );
-
-        // Drain via production apply_archive_result.
-        while let Ok(j) = arch_rx.try_recv() {
-            apply_archive_result(
-                &mut st,
-                ArchiveResult::Dropped {
-                    hash: j.block.block_hash(),
-                    wire_bytes: j.wire_bytes,
-                    requeue: false,
-                },
-                &budget,
-                &stats,
-            );
-        }
-        assert_eq!(budget.count(), 0);
-        assert_eq!(budget.bytes(), 0);
-
-        let report = format!(
-            "arch_job CAP growth loop\n\
-             CAP={ARCH_JOB_QUEUE_CAP} flood={flood} peak_charged={peak} after=0\n"
-        );
-        eprintln!("{report}");
-        if let Ok(out) = std::env::var("RBITCOIN_LEAK_PROBE_OUT") {
-            let _ = std::fs::create_dir_all(&out);
-            let _ = std::fs::write(format!("{out}/arch-job-cap-growth-report.txt"), &report);
-        }
-        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

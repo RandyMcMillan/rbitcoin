@@ -85,21 +85,28 @@ that shows a clear change after.
    by gutting intentional caches (OutFifo, sticky, ContigPark, archive budget).
 2. **Archive queue ownership:** `charge` on first body enqueue must pair with
    exactly one `release` via `ArchiveResult` applied in `apply_archive_result`
-   (or immediate release if `arch_job_tx.send` fails). Dropping an `ArchiveJob`
-   after charge without Ok/Err/Dropped is a **leak**.
+   (or immediate release if `arch_job_tx.send` fails because the pipeline is
+   **closed**). Dropping an `ArchiveJob` after charge without Ok/Err/Dropped is
+   a **leak**.
 3. **`archive_charged` is not hygiene-pruned** — only `clear_archive_charged` on
    pipeline result (prevents double-charge if ordered hygiene runs early).
 4. **Abort paths** (WriterDead, stop, prep exit) must drain ContigPark + job
    channels and emit results (`release_remaining_jobs`).
-5. **Tests** must tear down intentional caches with **production** APIs (table
+5. **Soft archive budget is request-limited only.** Always read peer data and
+   decode/enqueue blocks we already requested, even if that overshoots the soft
+   queue budget. Bound memory by stopping new block **requests**
+   (`can_assign` / getdata when archive is full) — never by stalling TCP reads,
+   awaiting a decode permit on the reader before the next frame, or Full-dropping
+   decoded bodies on a bounded `arch_job` channel. (That made healthy peers look
+   stalled and was not a real leak fix.)
+6. **Tests** must tear down intentional caches with **production** APIs (table
    below) — not a secret free-all that masks production leaks.
-6. **Regression filters:**
-   `apply_peer_event_arch_job_full_plateau`,
-   `apply_peer_event_flood_respects_arch_job_cap`,
+7. **Regression filters:**
    `force_advance_returns_parked_jobs_for_charge_release`,
    `multi_block_park_abort_releases_all_charges`,
    `multi_block_ibd_like_growth_then_production_abort_plateau`,
    `drain_job_rx_as_err_releases_via_apply`,
+   `can_assign_stops_at_budget_charge_may_overshoot`,
    `archive_budget_charge_release_symmetric`,
    `presence_lifecycle`.
 
@@ -107,9 +114,10 @@ that shows a clear change after.
 
 | Structure | Production API |
 |-----------|----------------|
-| Archive queue charge | `ArchiveQueueBudget::charge`; release only via **`apply_archive_result`** on `ArchiveResult` **or** Full/`try_send` fail on **`ARCH_JOB_QUEUE_CAP`** queue |
-| Arch job queue | Bound **`ARCH_JOB_QUEUE_CAP`** (256); never unbounded `Block` FIFO |
-| Block decode frames | **`acquire_block_decode_permit`** before next TCP read; **`spawn_decode_with_permit`** |
+| Archive queue charge | `ArchiveQueueBudget::charge`; release only via **`apply_archive_result`** on `ArchiveResult` **or** closed-pipeline `arch_job_tx.send` fail |
+| Soft queue size | Bound **only** via **`can_assign`** / densify stop — never receive-side Full-drop or reader decode-permit wait |
+| Arch job channel | **Unbounded** `arch_job` (always enqueue decoded first copy) |
+| Block decode | Fire-and-forget **`spawn_decode_then_with_err`** — never await permit on the peer reader before next TCP read |
 | WriterDead batch | **`emit_writer_dead_outcomes`** then apply results |
 | ContigPark abort | **`release_remaining_jobs`** (or `force_advance` → **`emit_archive_job_dropped`**) |
 | Forwarder stop | **`emit_archive_job_err`** + **`drain_job_rx_as_err`** |

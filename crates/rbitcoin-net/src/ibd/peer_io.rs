@@ -6,7 +6,9 @@
 
 use crate::codec::{MAX_HEADERS_RESULTS, MAX_INV_SIZE};
 use crate::error::NetError;
-use crate::msg_decode::spawn_decode_then_with_err;
+use crate::msg_decode::{
+    acquire_block_decode_permit, spawn_decode_then_with_err, spawn_decode_with_permit,
+};
 use crate::peer::connect_and_handshake;
 use crate::v2::{read_v2_frame_with_progress, write_v2_msg_offload};
 use bitcoin::block::Header;
@@ -246,6 +248,45 @@ pub(crate) async fn spawn_peer(
                         let sinks_d = sinks_r.clone();
                         let sinks_err = sinks_r.clone();
                         let framed_err_hash = framed_block_hash;
+                        // Block frames: acquire decode permit **before** reading the
+                        // next TCP frame so multi-MB payloads cannot queue unboundedly
+                        // while waiting on the decode pool (writer stall / head resize).
+                        if framed_block_hash.is_some() {
+                            let permit = match acquire_block_decode_permit().await {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    if let Some(hash) = framed_err_hash {
+                                        sinks_err.send_body(PeerEvent::BlockDecodeFailed {
+                                            peer: id,
+                                            hash,
+                                        });
+                                    }
+                                    continue;
+                                }
+                            };
+                            spawn_decode_with_permit(
+                                frame,
+                                permit,
+                                move |msg| {
+                                    if let NetworkMessage::Block(b) = msg.into_payload() {
+                                        touch_block_progress(&progress);
+                                        sinks_d.send_body(PeerEvent::Block {
+                                            peer: id,
+                                            block: b,
+                                        });
+                                    }
+                                },
+                                move || {
+                                    if let Some(hash) = framed_err_hash {
+                                        sinks_err.send_body(PeerEvent::BlockDecodeFailed {
+                                            peer: id,
+                                            hash,
+                                        });
+                                    }
+                                },
+                            );
+                            continue;
+                        }
                         spawn_decode_then_with_err(
                             frame,
                             move |msg| {
@@ -262,6 +303,8 @@ pub(crate) async fn spawn_peer(
                                         });
                                     }
                                     NetworkMessage::Block(b) => {
+                                        // Non-block path should not produce Block;
+                                        // keep for safety if classification races.
                                         touch_block_progress(&progress);
                                         sinks_d.send_body(PeerEvent::Block {
                                             peer: id,

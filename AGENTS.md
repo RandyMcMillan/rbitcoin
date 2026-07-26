@@ -105,7 +105,9 @@ that shows a clear change after.
 
 | Structure | Production API |
 |-----------|----------------|
-| Archive queue charge | `ArchiveQueueBudget::charge`; release only via **`apply_archive_result`** on `ArchiveResult` |
+| Archive queue charge | `ArchiveQueueBudget::charge`; release only via **`apply_archive_result`** on `ArchiveResult` **or** Full/`try_send` fail on **`ARCH_JOB_QUEUE_CAP`** queue |
+| Arch job queue | Bound **`ARCH_JOB_QUEUE_CAP`** (256); never unbounded `Block` FIFO |
+| Block decode frames | **`acquire_block_decode_permit`** before next TCP read; **`spawn_decode_with_permit`** |
 | WriterDead batch | **`emit_writer_dead_outcomes`** then apply results |
 | ContigPark abort | **`release_remaining_jobs`** (or `force_advance` → **`emit_archive_job_dropped`**) |
 | Forwarder stop | **`emit_archive_job_err`** + **`drain_job_rx_as_err`** |

@@ -64,7 +64,7 @@ pub(crate) fn drain_ready_peer_and_archive_events(
     body_rx: &mut mpsc::UnboundedReceiver<PeerEvent>,
     ctrl_rx: &mut mpsc::UnboundedReceiver<PeerEvent>,
     arch_res_rx: &mut mpsc::UnboundedReceiver<ArchiveResult>,
-    arch_job_tx: &mpsc::UnboundedSender<ArchiveJob>,
+    arch_job_tx: &mpsc::Sender<ArchiveJob>,
     archive_queued: &ArchiveQueueBudget,
     archive_write_next: &AtomicU32,
     loop_stats: &LoopStats,
@@ -145,7 +145,7 @@ pub(crate) fn apply_peer_event(
     st: &mut IbdWorkState,
     hub: &ChainHub,
     ev: PeerEvent,
-    arch_job_tx: &mpsc::UnboundedSender<ArchiveJob>,
+    arch_job_tx: &mpsc::Sender<ArchiveJob>,
     archive_queued: &ArchiveQueueBudget,
     archive_write_next: &AtomicU32,
     peer_book: &mut AddrMan,
@@ -394,27 +394,43 @@ pub(crate) fn apply_peer_event(
                 })
                 .unwrap_or(false);
             // Approx wire size for RAM budget (already-decoded).
-            // Always enqueue the first copy (may overshoot budget). Assign stops
-            // new densify getdata via `can_assign`; never dump in-flight peer bytes.
+            // First copy is charged then enqueued on a **bounded** arch_job queue.
+            // Assign stops densify via `can_assign`. When the queue is full (e.g.
+            // Class A writer sleeping on tx.head resize), release charge and
+            // mark_missing so process RAM for full `Block`s cannot grow unboundedly.
             let wire_bytes = block.total_size();
             archive_queued.charge(wire_bytes);
             st.body.mark_archive_charged(hash);
             // Prevent re-getdata while prep/writer owns this body.
             st.body.mark_pending(hash);
-            if arch_job_tx
-                .send(ArchiveJob {
-                    block,
-                    header_fk,
-                    priority,
-                    wire_bytes,
-                    height,
-                })
-                .is_err()
-            {
-                archive_queued.release(wire_bytes);
-                st.body.clear_archive_charged(&hash);
-                st.body.mark_missing(hash);
-                warn!("ibd: archive pipeline closed; drop {hash}");
+            match arch_job_tx.try_send(ArchiveJob {
+                block,
+                header_fk,
+                priority,
+                wire_bytes,
+                height,
+            }) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_job)) => {
+                    archive_queued.release(wire_bytes);
+                    st.body.clear_archive_charged(&hash);
+                    st.body.mark_missing(hash);
+                    static FULL: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let n = FULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n <= 5 || n % 100 == 0 {
+                        warn!(
+                            "ibd: archive job queue full — drop {hash} (release charge; \
+                             re-get later; count={n})"
+                        );
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_job)) => {
+                    archive_queued.release(wire_bytes);
+                    st.body.clear_archive_charged(&hash);
+                    st.body.mark_missing(hash);
+                    warn!("ibd: archive pipeline closed; drop {hash}");
+                }
             }
         }
         PeerEvent::NotFound { peer, hashes } => {

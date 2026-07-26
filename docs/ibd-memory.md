@@ -21,9 +21,9 @@ Tests that need a clean process must call these **same** entry points (or drop t
 owning `Query` / pipeline), not a secret test-only free-all that masks production
 leaks.
 
-## Leak class that bit us (fixed)
+## Leak classes fixed
 
-**Charged archive bodies dropped without `ArchiveResult`.**
+### A. Charged archive bodies dropped without `ArchiveResult`
 
 Ownership chain:
 
@@ -34,6 +34,18 @@ Ownership chain:
 If prep exits on writer death, or `force_advance` discards a parked job, without
 emitting a result, **budget bytes and `archive_charged` stick** until process
 restart. Mainnet logs showed `arch=1487/512MiB` after writer/probe stalls.
+
+### B. Unbounded `arch_job` + decode wait during `tx.head` resize stall
+
+While the Class A writer **sleeps on probe-exhaust** for online head resize,
+prep/forwarder back up. An **unbounded** `arch_job` channel retained every
+decoded `Block` for the multi-day stall. Separately, fire-and-forget block
+decode acquired the decode semaphore *after* spawn, so multi-MB framed
+payloads waited unboundedly for permits.
+
+**Fix:** `ARCH_JOB_QUEUE_CAP` (256) + `try_send` Full → release charge /
+`mark_missing`; block readers `acquire_block_decode_permit` before the next
+TCP frame; tip-follow pending maps capped.
 
 ### Production rules (do not regress)
 
@@ -52,8 +64,10 @@ restart. Mainnet logs showed `arch=1487/512MiB` after writer/probe stalls.
 | `emit_archive_job_err` / `emit_archive_job_dropped` | One charged job → `ArchiveResult` |
 | `emit_writer_dead_outcomes` | Writer channel dead: sticky clear + Err per outcome |
 | `release_remaining_jobs` | ContigPark + pri/far drain as Err |
-| `drain_job_rx_as_err` | Forwarder stop: drain unbounded job channel |
+| `drain_job_rx_as_err` | Forwarder stop: drain job channel |
 | `apply_archive_result` | Main loop: **only** place that `release`s the budget |
+| `ARCH_JOB_QUEUE_CAP` + `try_send` Full | Bound decoded Blocks into pipeline; Full → release charge |
+| `acquire_block_decode_permit` | Bound multi-MB frames waiting for decode |
 
 ### Regression tests (shipped path)
 
@@ -62,12 +76,14 @@ cargo test -p rbitcoin-net --lib contig_park_tests
 cargo test -p rbitcoin-net --lib presence_lifecycle
 ```
 
-Honest coverage (reverting emit/apply would fail):
+Honest coverage (reverting emit/apply / queue bound would fail):
 
-- `multi_block_ibd_like_growth_then_production_abort_plateau` — N=128 large charges, sample budget+RSS, WriterDead path, plateau budget==0
+- `arch_job_queue_full_releases_charge` — Full `try_send` releases budget
+- `multi_block_ibd_like_growth_then_production_abort_plateau` — N=128 large charges, WriterDead path, plateau budget==0
 - `multi_block_park_abort_releases_all_charges` — `emit_writer_dead_outcomes` + `release_remaining_jobs` + `apply_archive_result`
 - `drain_job_rx_as_err_releases_via_apply` — forwarder stop drain + apply
 - `force_advance_returns_parked_jobs_for_charge_release` — Dropped emit + apply
+- `sticky_map_stays_at_cap_under_unique_flood`
 
 ## Process RSS vs true leak
 

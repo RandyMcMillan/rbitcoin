@@ -157,16 +157,24 @@ impl Inner {
     }
 
     /// Drop stale fifo heads without removing live map entries.
+    ///
+    /// Keeps **at most one** live stamp per key (latest). Duplicate live stamps
+    /// for the same key cannot accumulate (important if stamps ever saturate
+    /// to `u64::MAX` — without dedupe, compact would keep every `(key, MAX)`).
     fn maybe_compact_fifo(&mut self) {
         // Allow some slack for touch dups; compact when fifo >> map.
         let limit = self.cap.saturating_mul(3).max(self.map.len().saturating_mul(2));
         if self.fifo.len() <= limit {
             return;
         }
+        // Walk newest-first so the first matching stamp per key is the latest.
         let mut kept = VecDeque::with_capacity(self.map.len().saturating_add(64));
-        while let Some((txid, stamp)) = self.fifo.pop_front() {
-            if self.map.get(&txid).is_some_and(|e| e.stamp == stamp) {
-                kept.push_back((txid, stamp));
+        let mut seen: HashMap<[u8; 32], ()> =
+            HashMap::with_capacity(self.map.len().saturating_add(64));
+        while let Some((txid, stamp)) = self.fifo.pop_back() {
+            if self.map.get(&txid).is_some_and(|e| e.stamp == stamp) && seen.insert(txid, ()).is_none()
+            {
+                kept.push_front((txid, stamp));
             }
         }
         self.fifo = kept;
@@ -260,5 +268,17 @@ mod tests {
         assert_eq!(s.len(), 1000);
         let keys: Vec<_> = entries.iter().map(|(t, _)| *t).collect();
         assert_eq!(s.lookup_batch(&keys).len(), 1000);
+    }
+
+    #[test]
+    fn sticky_map_stays_at_cap_under_unique_flood() {
+        let s = ArchiveTxidSticky::new(100_000);
+        for i in 0u32..300_000 {
+            let mut t = [0u8; 32];
+            t[0..4].copy_from_slice(&i.to_le_bytes());
+            s.insert_many(&[(t, Fk(i as u64 + 1))]);
+            assert!(s.len() <= s.cap(), "len {} > cap {}", s.len(), s.cap());
+        }
+        assert_eq!(s.len(), s.cap());
     }
 }

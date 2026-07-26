@@ -628,6 +628,45 @@ mod contig_park_tests {
         assert_eq!(budget.bytes(), 0);
     }
 
+    /// Bounded arch_job queue: when full, production releases charge (same
+    /// meter as Ok/Err/Dropped). Unbounded queue retained full Blocks for the
+    /// whole `tx.head` resize stall.
+    #[test]
+    fn arch_job_queue_full_releases_charge() {
+        use super::{ArchiveQueueBudget, ARCH_JOB_QUEUE_CAP};
+        assert!(
+            ARCH_JOB_QUEUE_CAP > 0 && ARCH_JOB_QUEUE_CAP <= 1024,
+            "arch job queue must be a modest bound, got {ARCH_JOB_QUEUE_CAP}"
+        );
+        let budget = ArchiveQueueBudget::new(64 * 1024 * 1024);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        // Fill channel.
+        for h in 0..2u32 {
+            let j = job(h);
+            budget.charge(j.wire_bytes);
+            tx.try_send(j).unwrap();
+        }
+        assert_eq!(budget.count(), 2);
+        // Next job would Full — production releases charge without retaining Block.
+        let j = job(99);
+        let wire = j.wire_bytes;
+        budget.charge(wire);
+        assert_eq!(budget.count(), 3);
+        match tx.try_send(j) {
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_dropped)) => {
+                budget.release(wire);
+            }
+            other => panic!("expected Full, got {other:?}"),
+        }
+        assert_eq!(budget.count(), 2, "Full path must release the rejected charge");
+        // Drain retained jobs and release (pipeline Ok/Err).
+        while let Ok(j) = rx.try_recv() {
+            budget.release(j.wire_bytes);
+        }
+        assert_eq!(budget.count(), 0);
+        assert_eq!(budget.bytes(), 0);
+    }
+
     /// Forwarder drain helper: charged jobs left on job_rx must emit Err and
     /// apply_archive_result must zero the budget (stop-path ownership).
     #[test]
@@ -638,12 +677,12 @@ mod contig_park_tests {
         use super::super::status::LoopStats;
 
         let budget = ArchiveQueueBudget::new(16 * 1024 * 1024);
-        let (job_tx, mut job_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (job_tx, mut job_rx) = tokio::sync::mpsc::channel(16);
         let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
         for h in 0..8u32 {
             let j = job(h);
             budget.charge(j.wire_bytes);
-            job_tx.send(j).unwrap();
+            job_tx.try_send(j).unwrap();
         }
         drop(job_tx);
         assert_eq!(budget.count(), 8);
@@ -905,9 +944,9 @@ fn release_remaining_jobs(
     }
 }
 
-/// Forwarder exit: drain remaining charged jobs on the unbounded job channel.
+/// Forwarder exit: drain remaining charged jobs on the job channel.
 pub(crate) fn drain_job_rx_as_err(
-    job_rx: &mut mpsc::UnboundedReceiver<ArchiveJob>,
+    job_rx: &mut mpsc::Receiver<ArchiveJob>,
     result_tx: &mpsc::UnboundedSender<ArchiveResult>,
     err: &str,
 ) {
@@ -922,6 +961,15 @@ pub(crate) fn drain_job_rx_as_err(
 /// durable `txs.count()` at commit time.
 pub(crate) const ARCHIVE_WRITE_QUEUE_CAP: usize = 2;
 
+/// Bound on decoded `ArchiveJob`s waiting to enter ContigPark / prep (main →
+/// pipeline). Must not be unbounded: while the Class A writer sleeps on
+/// `tx.head` resize, an unbounded queue retains full `Block` bodies forever.
+///
+/// Sized to absorb a short burst above ContigPark without multi-GiB backlog.
+/// When full, the IBD main loop **releases the charge** and mark_missing
+/// (production free path — same budget accounting as Ok/Err/Dropped).
+pub(crate) const ARCH_JOB_QUEUE_CAP: usize = 256;
+
 /// ContigPark → prep (structure + FK assign/resolve reads) → writer (Class A puts).
 ///
 /// **Park first:** out-of-order wire jobs sit in ContigPark without Class A work.
@@ -934,7 +982,7 @@ pub(crate) const ARCHIVE_WRITE_QUEUE_CAP: usize = 2;
 /// plan can proceed while the first is still committing.
 pub(crate) fn spawn_archive_pipeline(
     hub: Arc<ChainHub>,
-    mut job_rx: mpsc::UnboundedReceiver<ArchiveJob>,
+    mut job_rx: mpsc::Receiver<ArchiveJob>,
     result_tx: mpsc::UnboundedSender<ArchiveResult>,
     stats: Arc<ArchivePipelineStats>,
     archive_queued: Arc<ArchiveQueueBudget>,

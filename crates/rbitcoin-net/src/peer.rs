@@ -38,6 +38,10 @@ const HEADERS_POLL_SECS: u64 = 120;
 const BAN_SCORE_THRESHOLD: u32 = 100;
 /// Cap on incomplete compact blocks awaiting `blocktxn` (DoS).
 const MAX_PENDING_CMPCT: usize = 8;
+/// Cap on headers held while assembling tip/reorg work (DoS / process RAM).
+const MAX_PENDING_HEADERS: usize = 8_000;
+/// Cap on full blocks waiting for in-order tip accept (DoS / process RAM).
+const MAX_PENDING_BLOCKS: usize = 64;
 
 /// Services we advertise once store-backed reconstruct serve is available.
 pub fn local_service_flags() -> ServiceFlags {
@@ -630,6 +634,13 @@ async fn handle_peer_frame(
             let n = headers.len().min(MAX_HEADERS_RESULTS);
             for hdr in headers.iter().take(n) {
                 let hash = hdr.block_hash();
+                if pending_headers.len() >= MAX_PENDING_HEADERS
+                    && !pending_headers.contains_key(&hash)
+                {
+                    // Drop oldest-ish: clear all and restart (headers are cheap
+                    // to re-request; full history must not accumulate unboundedly).
+                    pending_headers.clear();
+                }
                 pending_headers.insert(hash, *hdr);
                 if !hub.has_block(&hash) {
                     want.push(Inventory::WitnessBlock(hash));
@@ -647,9 +658,15 @@ async fn handle_peer_frame(
             }
         }
         NetworkMessage::Block(block) => {
-            pending_cmpct.remove(&block.block_hash());
-            pending_blocks.insert(block.block_hash(), block.clone());
-            drain_pending(hub, pending_blocks, pending_headers)?;
+            let hash = block.block_hash();
+            pending_cmpct.remove(&hash);
+            if pending_blocks.len() >= MAX_PENDING_BLOCKS && !pending_blocks.contains_key(&hash) {
+                // Bound process RAM for out-of-order tip bodies.
+                *ban_score = ban_score.saturating_add(5);
+            } else {
+                pending_blocks.insert(hash, block.clone());
+                drain_pending(hub, pending_blocks, pending_headers)?;
+            }
         }
         NetworkMessage::CmpctBlock(cb) => {
             let hsi = cb.compact_block.clone();

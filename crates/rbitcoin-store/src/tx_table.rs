@@ -3560,23 +3560,18 @@ mod tests {
             let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
             (rec, inputs, outputs)
         };
-        // Enough bodies that fill is not instantaneous, so the waiter can park.
+        // Seed; auto-resize may complete 10→11→12. Settle, then start a controlled widen.
         for i in 1..=2_000u64 {
             let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
         }
-        // Bump gen so any auto-started worker exits; we drive fill on the main
-        // thread so the waiter is guaranteed a window to sleep.
-        t.resize_bg_gen.fetch_add(1, AtomicOrdering::AcqRel);
-        if let Some(h) = t.resize_bg.lock().unwrap().take() {
-            let _ = h.join();
-        }
-        t.start_head_resize(crate::address_head::HeadLayout::new(11).unwrap())
+        wait_head_resize_done(&t, Duration::from_secs(15));
+
+        // Hold head.read so exclusive swap cannot finish while the waiter parks.
+        // Fill of 2k is one wave; without the hold the bg worker finishes before sleep.
+        let head_hold = t.head.read().unwrap();
+        let next_bits = t.head_bits().saturating_add(1);
+        t.start_head_resize(crate::address_head::HeadLayout::new(next_bits).unwrap())
             .unwrap();
-        // Do not start bg fill — main thread owns progress (ensures sleep window).
-        t.resize_bg_gen.fetch_add(1, AtomicOrdering::AcqRel);
-        if let Some(h) = t.resize_bg.lock().unwrap().take() {
-            let _ = h.join();
-        }
         assert!(t.head_resize_in_progress());
 
         let this = &t as *const TxTable as usize;
@@ -3589,14 +3584,15 @@ mod tests {
             })
             .unwrap();
 
-        // Park window: waiter should still be blocked before we complete fill.
+        // Park window: waiter blocked while swap cannot finish under head.read.
         std::thread::sleep(Duration::from_millis(100));
         assert!(
             !waiter.is_finished(),
             "waiter must still be sleeping while resize is in progress"
         );
 
-        // Drive fill to completion (bg gen bumped so auto worker stays off).
+        // Release swap barrier; bg (or wait_head_resize_done) can complete + notify.
+        drop(head_hold);
         wait_head_resize_done(&t, Duration::from_secs(15));
         assert!(!t.head_resize_in_progress());
 

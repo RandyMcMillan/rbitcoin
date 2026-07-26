@@ -10,8 +10,9 @@
 //!
 //! # Publish order (lock-free)
 //!
-//! Single appender: **body bytes → idx slots → `count` Release**. Readers load
-//! `count` with Acquire and only observe complete records.
+//! Single appender: **body bytes → idx slots → `(count, body_end)` via seqlock**.
+//! Readers load a consistent `(count, published_body_end)` pair (never
+//! `(old_count, new_end)`).
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
@@ -23,10 +24,14 @@ pub struct VarTable {
     body: TableFile,
     idx: TableFile,
     count: AtomicU64,
-    /// Body exclusive-end of the last **published** record (Release with `count`).
+    /// Body exclusive-end of the last **published** record.
     /// Must not use live `body.logical_len()` for last-record length: the single
     /// appender may extend body for the *next* batch before publishing count.
     published_body_end: AtomicU64,
+    /// Seqlock for `(count, published_body_end)`: odd = writer critical section,
+    /// even = stable. Prevents readers from pairing a stale count with a newer end
+    /// (writer stores end then count; naive double-load of count alone is racy).
+    publish_seq: AtomicU64,
 }
 
 impl VarTable {
@@ -38,6 +43,7 @@ impl VarTable {
             idx,
             count: AtomicU64::new(0),
             published_body_end: AtomicU64::new(FILE_HEADER_LEN as u64),
+            publish_seq: AtomicU64::new(0),
         })
     }
 
@@ -55,6 +61,7 @@ impl VarTable {
             idx,
             count: AtomicU64::new(count),
             published_body_end: AtomicU64::new(body_end),
+            publish_seq: AtomicU64::new(0),
         })
     }
 
@@ -165,9 +172,7 @@ impl VarTable {
 
     #[inline]
     pub(crate) fn body_published_len(&self) -> u64 {
-        self.published_body_end
-            .load(Ordering::Acquire)
-            .max(FILE_HEADER_LEN as u64)
+        self.published_meta().1
     }
 
 
@@ -248,12 +253,15 @@ impl VarTable {
         self.body.write_at(start, &body_blob)?;
         let off_pos = FILE_HEADER_LEN as u64 + base_count * 8;
         self.idx.write_at(off_pos, &idx_blob)?;
-        // Publish complete records: body_end before count so last-record readers
-        // never see a body tail that belongs to a not-yet-published batch.
+        // Publish complete records under seqlock: enter (odd) → end+count → leave (even).
+        // Without the seqlock, a reader can observe (old_count, new_end) between the
+        // two stores and inflate last-record length (regression: left 640 right 128).
         let new_end = start.saturating_add(body_blob.len() as u64);
-        self.published_body_end.store(new_end, Ordering::Release);
-        self.count
-            .store(base_count + n as u64, Ordering::Release);
+        let new_count = base_count + n as u64;
+        self.publish_begin();
+        self.published_body_end.store(new_end, Ordering::Relaxed);
+        self.count.store(new_count, Ordering::Relaxed);
+        self.publish_end();
         Ok(fks)
     }
 
@@ -268,17 +276,39 @@ impl VarTable {
         Ok(u64::from_le_bytes(off_buf))
     }
 
-    /// Consistent `(count, published_body_end)` snapshot (writer publishes end then count).
+    #[inline]
+    fn publish_begin(&self) {
+        // Odd seq = writer in critical section. Single appender: no concurrent begin.
+        let prev = self.publish_seq.fetch_add(1, Ordering::Relaxed);
+        debug_assert_eq!(prev & 1, 0, "nested/concurrent publish_begin");
+        std::sync::atomic::fence(Ordering::Release);
+    }
+
+    #[inline]
+    fn publish_end(&self) {
+        // Even seq = stable; Release so readers' Acquire sees end+count stores.
+        let prev = self.publish_seq.fetch_add(1, Ordering::Release);
+        debug_assert_eq!(prev & 1, 1, "publish_end without begin");
+    }
+
+    /// Consistent `(count, published_body_end)` via seqlock (never torn pair).
     fn published_meta(&self) -> (u64, u64) {
         loop {
-            let c1 = self.count.load(Ordering::Acquire);
+            let s1 = self.publish_seq.load(Ordering::Acquire);
+            if s1 & 1 != 0 {
+                // Writer mid-publish.
+                std::hint::spin_loop();
+                continue;
+            }
             let end = self
                 .published_body_end
-                .load(Ordering::Acquire)
+                .load(Ordering::Relaxed)
                 .max(FILE_HEADER_LEN as u64);
-            let c2 = self.count.load(Ordering::Acquire);
-            if c1 == c2 {
-                return (c1, end);
+            let count = self.count.load(Ordering::Relaxed);
+            // Pair with Acquire load of seq so we observe stores before publish_end.
+            let s2 = self.publish_seq.load(Ordering::Acquire);
+            if s1 == s2 {
+                return (count, end);
             }
         }
     }
@@ -360,6 +390,8 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
+    /// Concurrent readers must never see last-record len spanning a later batch
+    /// (regression: raw.len() 640 vs expected 128 from torn (old_count, new_end)).
     #[test]
     fn put_batch_publish_visible_to_concurrent_readers() {
         static N: AtomicU64 = AtomicU64::new(0);
@@ -369,7 +401,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let t = Arc::new(VarTable::create(&dir, "tx", TableKind::Tx).unwrap());
 
-        let barrier = Arc::new(Barrier::new(4));
+        let barrier = Arc::new(Barrier::new(5));
         let mut handles = Vec::new();
 
         {
@@ -377,7 +409,8 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                for batch in 0..50u8 {
+                // Many small batches maximize the end-then-count publish window.
+                for batch in 0..200u8 {
                     let payload = vec![batch; 128];
                     t.put_batch_encode(4, 512, |_i, buf| {
                         buf.extend_from_slice(&payload);
@@ -387,20 +420,28 @@ mod tests {
             }));
         }
 
-        for _ in 0..3 {
+        for _ in 0..4 {
             let t = Arc::clone(&t);
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                for _ in 0..2000 {
+                for _ in 0..20_000 {
                     let c = t.count();
                     if c == 0 {
                         continue;
                     }
-                    // Every published fk must fully decode as raw of expected size.
-                    let fk = Fk(c); // last published
+                    // Seqlock pair: last published fk must fully decode as 128B.
+                    let (meta_c, meta_end) = t.published_meta();
+                    if meta_c == 0 {
+                        continue;
+                    }
+                    let fk = Fk(meta_c);
                     let raw = t.get_raw(fk).unwrap();
-                    assert_eq!(raw.len(), 128);
+                    assert_eq!(
+                        raw.len(),
+                        128,
+                        "torn publish meta_c={meta_c} meta_end={meta_end} count={c}"
+                    );
                     assert!(raw.iter().all(|&b| b == raw[0]));
                 }
             }));
@@ -417,7 +458,60 @@ mod tests {
         done_rx
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("concurrent var_table workers timed out (hang?)");
-        assert_eq!(t.count(), 200);
+        assert_eq!(t.count(), 800);
+        // Final last-record still consistent.
+        let raw = t.get_raw(Fk(t.count())).unwrap();
+        assert_eq!(raw.len(), 128);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// published_meta never returns a pair where end belongs to a later count.
+    #[test]
+    fn published_meta_seqlock_matches_last_record_len() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-var-seqlock-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = Arc::new(VarTable::create(&dir, "tx", TableKind::Tx).unwrap());
+        let stop = Arc::new(AtomicU64::new(0));
+        let t_w = Arc::clone(&t);
+        let stop_w = Arc::clone(&stop);
+        let writer = thread::spawn(move || {
+            let mut batch = 0u8;
+            while stop_w.load(AtomicOrdering::Acquire) == 0 {
+                let payload = vec![batch; 64];
+                t_w.put_batch_encode(8, 512, |_i, buf| {
+                    buf.extend_from_slice(&payload);
+                })
+                .unwrap();
+                batch = batch.wrapping_add(1);
+            }
+        });
+        for _ in 0..50_000 {
+            let (c, end) = t.published_meta();
+            if c == 0 {
+                continue;
+            }
+            let start = t.record_start(c, c).unwrap();
+            assert!(
+                end >= start + 64,
+                "end={end} start={start} c={c}"
+            );
+            // Exclusive end of last record is exactly one payload (64B) after start
+            // when all records in a batch share size — also true across batches of 64B.
+            assert_eq!(
+                end - start,
+                64,
+                "seqlock pair torn: c={c} end={end} start={start}"
+            );
+        }
+        stop.store(1, AtomicOrdering::Release);
+        writer.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

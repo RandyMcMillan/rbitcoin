@@ -3791,7 +3791,9 @@ mod tests {
             let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
             (rec, inputs, outputs)
         };
-        const N: u64 = 80;
+        // > FK_QUEUE_LOW (256) so refill/drain interaction is exercised (regression
+        // for queue-len==256 dead zone that stalled with no in-flight IO).
+        const N: u64 = 400;
         for i in 1..=N {
             let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
         }

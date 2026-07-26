@@ -219,7 +219,9 @@ fn run_linux(
                 break;
             }
 
-            // 1) idx: at most one, when queue low
+            // 1) idx: at most one, when queue is below low-water (strict <).
+            //    Prefer refill before body drain so the queue stays warm; never
+            //    block body submits when queue.len() >= FK_QUEUE_LOW (see body).
             let need_idx = next_idx_fk <= last
                 && !idx_in_flight
                 && fk_queue.len() < FK_QUEUE_LOW;
@@ -243,24 +245,19 @@ fn run_linux(
                 idx_batch_first = bf;
                 idx_batch_last = bl;
                 idx_need_next = need_next;
-                // Reserve progress of next_idx only on CQE success — track separately
                 ring_in_flight += 1;
                 continue;
             }
 
-            // 2) body reads: drain queue
+            // 2) body reads: drain queue as far as ring/pool allow.
+            //    Do **not** refuse body submits when len == FK_QUEUE_LOW: need_idx
+            //    uses strict `<`, so `len == 256` + can-refill used to hit a dead
+            //    zone (no idx, no body) → "stalled with no in-flight IO".
             let mut submitted_body = false;
             while !fk_queue.is_empty()
                 && !body_free.is_empty()
                 && ring_in_flight < RING_ENTRIES as usize
             {
-                // Prefer idx refill over draining below low-water if we can start idx
-                if fk_queue.len() <= FK_QUEUE_LOW
-                    && next_idx_fk <= last
-                    && !idx_in_flight
-                {
-                    break;
-                }
                 let w = fk_queue.pop_front().unwrap();
                 let slot = body_free.pop().unwrap();
                 let want = (w.body_len as usize).min(33).max(1);
@@ -282,20 +279,73 @@ fn run_linux(
             if submitted_body {
                 continue;
             }
+
+            // 3) Kick page RMWs for inserts parked only in page_wait (no free
+            //    page slot earlier, or arrived while another cycle was active).
+            let mut started_page = false;
+            let parked: Vec<u64> = page_wait.keys().copied().collect();
+            for pb in parked {
+                if ring_in_flight >= RING_ENTRIES as usize || page_free.is_empty() {
+                    break;
+                }
+                if page_active.contains_key(&pb) {
+                    continue;
+                }
+                let Some(mut q) = page_wait.remove(&pb) else {
+                    continue;
+                };
+                if q.is_empty() {
+                    continue;
+                }
+                let first_ins = q.pop_front().unwrap();
+                let ps = page_free.pop().unwrap();
+                let txid = first_ins.txid;
+                page_st[ps] = PageSt::Reading;
+                page_base_of[ps] = pb;
+                let plen =
+                    page_pread_len(&txid, bits, entry_bytes, slots, slot_region).min(page_bytes);
+                if plen == 0 {
+                    return Err(StoreError::Corrupt("page pread len 0"));
+                }
+                page_len_of[ps] = plen;
+                page_off_of[ps] = page_file_off(&txid, bits, entry_bytes);
+                page_pending[ps].clear();
+                page_pending[ps].push_back(first_ins);
+                page_pending[ps].append(&mut q);
+                page_active.insert(pb, ps);
+                page_bufs[ps][..plen].fill(0);
+                push_read(
+                    &mut ring,
+                    head_fd,
+                    page_off_of[ps],
+                    &mut page_bufs[ps][..plen],
+                    pack_ud(KIND_PAGE_RD, ps as u32),
+                )?;
+                page_in_flight += 1;
+                ring_in_flight += 1;
+                started_page = true;
+            }
+            if started_page {
+                continue;
+            }
             break;
         }
 
         ring.submission().sync();
         if ring_in_flight == 0 {
-            if done_fks >= target_fks {
-                break;
-            }
-            // Stuck? should not happen if queue empty and idx done
-            if next_idx_fk > last && fk_queue.is_empty() && body_in_flight == 0 && page_in_flight == 0
+            if done_fks >= target_fks
+                || (next_idx_fk > last
+                    && fk_queue.is_empty()
+                    && body_in_flight == 0
+                    && page_in_flight == 0
+                    && page_wait.is_empty()
+                    && page_active.is_empty())
             {
                 break;
             }
-            return Err(StoreError::Corrupt("shadow fill stalled with no in-flight IO"));
+            return Err(StoreError::Corrupt(
+                "shadow fill stalled with no in-flight IO",
+            ));
         }
 
         // Wait for ≥1 completion

@@ -184,7 +184,8 @@ impl IbdWorkState {
             self.known_headers
                 .retain(|h| live.contains(h) || inflight.contains_key(h));
         }
-        // Bound body presence cache to live work (rejected never pruned).
+        // Bound body presence cache to live work (rejected + archive_charged
+        // never hygiene-pruned — see BodyPresence::hygiene_retain).
         self.body
             .hygiene_retain(|h| live.contains(h) || inflight.contains_key(h));
     }

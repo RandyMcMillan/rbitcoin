@@ -75,3 +75,28 @@ test pass.
 
 For performance, ideally we'd have a benchmark before we begin development
 that shows a clear change after.
+
+## IBD / process memory leak prevention
+
+**Full rules:** `docs/ibd-memory.md`. Summary for agents:
+
+1. **Distinguish** process-owned heap (Rust structures, charged archive bodies)
+   from **kernel page cache** under store mmaps (`RssFile`). Do not “fix” RSS
+   by gutting intentional caches (OutFifo, sticky, ContigPark, archive budget).
+2. **Archive queue ownership:** `charge` on first body enqueue must pair with
+   exactly one `release` via `ArchiveResult` applied in `apply_archive_result`
+   (or immediate release if `arch_job_tx.send` fails). Dropping an `ArchiveJob`
+   after charge without Ok/Err/Dropped is a **leak**.
+3. **`archive_charged` is not hygiene-pruned** — only `clear_archive_charged` on
+   pipeline result (prevents double-charge if ordered hygiene runs early).
+4. **Abort paths** (WriterDead, stop, prep exit) must drain ContigPark + job
+   channels and emit results (`release_remaining_jobs`).
+5. **Tests** must tear down intentional caches with **production** APIs
+   (`advance_tip`, OutFifo eviction via insert, budget release via results,
+   drop owning `Query`/pipeline) — not a secret free-all that masks production
+   leaks.
+6. **Regression filters:**
+   `force_advance_returns_parked_jobs_for_charge_release`,
+   `multi_block_park_abort_releases_all_charges`,
+   `archive_budget_charge_release_symmetric`,
+   `presence_lifecycle`.

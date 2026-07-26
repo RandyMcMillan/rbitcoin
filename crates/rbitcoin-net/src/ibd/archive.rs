@@ -342,18 +342,26 @@ impl ContigPark {
 
     /// Advance `next_h` without writing (caller verified Class A already holds
     /// that height — e.g. Late path or resume HWM).
-    fn force_advance(&mut self, n: u32) {
+    ///
+    /// Returns any parked jobs that fell behind the new HWM. Callers **must**
+    /// emit [`ArchiveResult::Dropped`] (or Err) for each so
+    /// [`ArchiveQueueBudget`] charges and `archive_charged` markers are released.
+    fn force_advance(&mut self, n: u32) -> Vec<ArchiveJob> {
+        let mut dropped = Vec::new();
         if n == 0 {
-            return;
+            return dropped;
         }
         self.next_h = self.next_h.saturating_add(n);
         while let Some((&h, _)) = self.parked.first_key_value() {
             if h < self.next_h {
-                self.parked.remove(&h);
+                if let Some(j) = self.parked.remove(&h) {
+                    dropped.push(j);
+                }
             } else {
                 break;
             }
         }
+        dropped
     }
 
     /// Pop a contiguous run `[next_h, next_h+len)` of at most `max` blocks.
@@ -389,7 +397,7 @@ impl ContigPark {
 
 #[cfg(test)]
 mod contig_park_tests {
-    use super::{ArchiveJob, ContigPark};
+    use super::{ArchiveJob, ArchiveQueueBudget, ContigPark};
     use bitcoin::blockdata::block::Header as BlockHeader;
     use bitcoin::hashes::Hash;
     use bitcoin::{Block, BlockHash};
@@ -486,13 +494,105 @@ mod contig_park_tests {
         assert!(matches!(p.insert(job(12), 2048), super::ParkInsert::Parked));
         assert!(matches!(p.insert(job(11), 2048), super::ParkInsert::Parked));
         assert!(p.take_contiguous(8).is_empty());
-        p.force_advance(1);
+        let dropped = p.force_advance(1);
+        assert!(dropped.is_empty(), "gap height 10 had no parked job");
         assert_eq!(p.next_h(), 11);
         let run = p.take_contiguous(8);
         assert_eq!(run.len(), 2);
         assert_eq!(run[0].height, 11);
         assert_eq!(run[1].height, 12);
         assert_eq!(p.next_h(), 13);
+    }
+
+    /// Regression: advancing past a height that still holds a parked job must
+    /// return that job so the caller can release the archive-queue charge.
+    /// Dropping silently left `ArchiveQueueBudget` permanently oversubscribed
+    /// (mainnet: arch=1487/512MiB after writer/probe stalls).
+    #[test]
+    fn force_advance_returns_parked_jobs_for_charge_release() {
+        let mut p = ContigPark::new(10);
+        assert!(matches!(p.insert(job(10), 2048), super::ParkInsert::Parked));
+        assert!(matches!(p.insert(job(11), 2048), super::ParkInsert::Parked));
+        // Simulate "height 10 already Class A" while a redundant body is parked.
+        let dropped = p.force_advance(1);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].height, 10);
+        assert_eq!(dropped[0].wire_bytes, 100);
+        assert_eq!(p.next_h(), 11);
+        assert_eq!(p.parked_len(), 1);
+        // Caller releases budget for each dropped job (production path).
+        let budget = ArchiveQueueBudget::new(16 * 1024 * 1024);
+        for j in &dropped {
+            budget.charge(j.wire_bytes);
+        }
+        assert_eq!(budget.count(), 1);
+        for j in &dropped {
+            budget.release(j.wire_bytes);
+        }
+        assert_eq!(budget.count(), 0);
+        assert_eq!(budget.bytes(), 0);
+    }
+
+    /// Budget charge/release is symmetric for wire sizes (no residual after N
+    /// equal charge/release pairs) — pins the meter used by archive pipeline.
+    #[test]
+    fn archive_budget_charge_release_symmetric() {
+        let b = ArchiveQueueBudget::new(64 * 1024 * 1024);
+        let wires = [100usize, 1_000_000, 2_500_000, 50, 999_999];
+        for &w in &wires {
+            b.charge(w);
+        }
+        assert_eq!(b.count(), wires.len());
+        assert!(b.bytes() > 0);
+        for &w in &wires {
+            b.release(w);
+        }
+        assert_eq!(b.count(), 0, "all charges must be released");
+        assert_eq!(b.bytes(), 0, "no residual charged bytes after full release");
+    }
+
+    /// Multi-block IBD-like park abort: charge each body, park out-of-order, take
+    /// a contiguous wave (still charged — result not yet applied), then abort like
+    /// WriterDead: release the in-flight wave + `drain_all` remainder. Residual
+    /// budget must be 0.
+    ///
+    /// Models production `release_remaining_jobs` + WriterDead batch Err path.
+    #[test]
+    fn multi_block_park_abort_releases_all_charges() {
+        const N: u32 = 256;
+        let budget = ArchiveQueueBudget::new(512 * 1024 * 1024);
+        let mut park = ContigPark::new(0);
+        const HORIZON: u32 = 2048;
+        // Park reverse order (gap-fill pattern).
+        for h in (0..N).rev() {
+            let j = job(h);
+            budget.charge(j.wire_bytes);
+            assert!(
+                matches!(park.insert(j, HORIZON), super::ParkInsert::Parked),
+                "height {h}"
+            );
+        }
+        assert_eq!(budget.count(), N as usize);
+        assert_eq!(park.parked_len(), N as usize);
+        assert!(budget.bytes() > 0);
+
+        // Prep took a mega-batch (still charged until ArchiveResult).
+        let wave = park.take_contiguous(32);
+        assert_eq!(wave.len(), 32);
+        assert_eq!(park.parked_len(), (N as usize) - 32);
+
+        // WriterDead: release in-flight batch (plan_and_send Err path) then drain park.
+        for j in &wave {
+            budget.release(j.wire_bytes);
+        }
+        let remaining = park.drain_all();
+        assert_eq!(remaining.len(), (N as usize) - 32);
+        for j in remaining {
+            budget.release(j.wire_bytes);
+        }
+        assert_eq!(budget.count(), 0, "abort must release every charge");
+        assert_eq!(budget.bytes(), 0);
+        assert_eq!(park.parked_len(), 0);
     }
 }
 
@@ -946,7 +1046,23 @@ pub(crate) fn spawn_archive_pipeline(
                                 batch = b;
                                 std::thread::sleep(Duration::from_millis(2));
                             }
-                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                            Err(std::sync::mpsc::TrySendError::Disconnected(dead)) => {
+                                // Writer gone: release every charge for this batch
+                                // and drop planned inflight creates so they cannot
+                                // pin the resolve map forever.
+                                if !dead.plan.sticky_creates.is_empty() {
+                                    let mut g = inflight.lock().unwrap();
+                                    for (t, _) in &dead.plan.sticky_creates {
+                                        g.remove(t);
+                                    }
+                                }
+                                for (hash, wire_bytes) in dead.outcomes {
+                                    let _ = result_tx.send(ArchiveResult::Err {
+                                        hash,
+                                        err: "archive writer dead".into(),
+                                        wire_bytes,
+                                    });
+                                }
                                 return PlanSend::WriterDead;
                             }
                         }
@@ -972,17 +1088,48 @@ pub(crate) fn spawn_archive_pipeline(
                     PlanSend::Done
                 }
 
+                /// Release every remaining charged body (park + in-channel jobs).
+                /// Used on stop / writer-dead so `ArchiveQueueBudget` cannot stick
+                /// permanently oversubscribed with orphaned ContigPark RAM.
+                fn release_remaining_jobs(
+                    park: &mut ContigPark,
+                    pri_rx: &std::sync::mpsc::Receiver<ArchiveJob>,
+                    far_rx: &std::sync::mpsc::Receiver<ArchiveJob>,
+                    result_tx: &mpsc::UnboundedSender<ArchiveResult>,
+                    err: &str,
+                ) {
+                    while let Ok(j) = pri_rx.try_recv() {
+                        let _ = result_tx.send(ArchiveResult::Err {
+                            hash: j.block.block_hash(),
+                            err: err.into(),
+                            wire_bytes: j.wire_bytes,
+                        });
+                    }
+                    while let Ok(j) = far_rx.try_recv() {
+                        let _ = result_tx.send(ArchiveResult::Err {
+                            hash: j.block.block_hash(),
+                            err: err.into(),
+                            wire_bytes: j.wire_bytes,
+                        });
+                    }
+                    for j in park.drain_all() {
+                        let _ = result_tx.send(ArchiveResult::Err {
+                            hash: j.block.block_hash(),
+                            err: err.into(),
+                            wire_bytes: j.wire_bytes,
+                        });
+                    }
+                }
+
                 loop {
                     if prep_stop.load(Ordering::Relaxed) {
-                        while pri_job_rx.try_recv().is_ok() {}
-                        while far_job_rx.try_recv().is_ok() {}
-                        for j in park.drain_all() {
-                            let _ = prep_result.send(ArchiveResult::Err {
-                                hash: j.block.block_hash(),
-                                err: "archive stopped".into(),
-                                wire_bytes: j.wire_bytes,
-                            });
-                        }
+                        release_remaining_jobs(
+                            &mut park,
+                            &pri_job_rx,
+                            &far_job_rx,
+                            &prep_result,
+                            "archive stopped",
+                        );
                         break;
                     }
                     if !pri_open && !far_open && park.parked_len() == 0 {
@@ -1040,6 +1187,13 @@ pub(crate) fn spawn_archive_pipeline(
                             &prep_params,
                             &prep_stop,
                         ) {
+                            release_remaining_jobs(
+                                &mut park,
+                                &pri_job_rx,
+                                &far_job_rx,
+                                &prep_result,
+                                "archive writer dead",
+                            );
                             return;
                         }
                     }
@@ -1061,6 +1215,13 @@ pub(crate) fn spawn_archive_pipeline(
                                 &prep_params,
                                 &prep_stop,
                             ) {
+                                release_remaining_jobs(
+                                    &mut park,
+                                    &pri_job_rx,
+                                    &far_job_rx,
+                                    &prep_result,
+                                    "archive writer dead",
+                                );
                                 return;
                             }
                             got = true;
@@ -1078,6 +1239,13 @@ pub(crate) fn spawn_archive_pipeline(
                                 &prep_params,
                                 &prep_stop,
                             ) {
+                                release_remaining_jobs(
+                                    &mut park,
+                                    &pri_job_rx,
+                                    &far_job_rx,
+                                    &prep_result,
+                                    "archive writer dead",
+                                );
                                 return;
                             }
                             got = true;
@@ -1115,7 +1283,15 @@ pub(crate) fn spawn_archive_pipeline(
                             if !archived {
                                 break;
                             }
-                            park.force_advance(1);
+                            // Already Class A: drop any redundant parked body and
+                            // release its archive-queue charge (do not leak GiB).
+                            for j in park.force_advance(1) {
+                                let _ = prep_result.send(ArchiveResult::Dropped {
+                                    hash: j.block.block_hash(),
+                                    wire_bytes: j.wire_bytes,
+                                    requeue: false,
+                                });
+                            }
                             skipped += 1;
                         }
                         if skipped > 0 {
@@ -1152,6 +1328,13 @@ pub(crate) fn spawn_archive_pipeline(
                                             &prep_params,
                                             &prep_stop,
                                         ) {
+                                            release_remaining_jobs(
+                                                &mut park,
+                                                &pri_job_rx,
+                                                &far_job_rx,
+                                                &prep_result,
+                                                "archive writer dead",
+                                            );
                                             return;
                                         }
                                     }
@@ -1170,6 +1353,13 @@ pub(crate) fn spawn_archive_pipeline(
                                         &prep_params,
                                         &prep_stop,
                                     ) {
+                                        release_remaining_jobs(
+                                            &mut park,
+                                            &pri_job_rx,
+                                            &far_job_rx,
+                                            &prep_result,
+                                            "archive writer dead",
+                                        );
                                         return;
                                     }
                                 }
@@ -1212,8 +1402,17 @@ pub(crate) fn spawn_archive_pipeline(
                             prep_next.store(park.next_h(), Ordering::Relaxed);
                         }
                         PlanSend::WriterDead => {
+                            // Batch charges already released in plan_and_send_jobs.
+                            // Rewind HWM, then release every still-parked / channel job.
                             park.rewind(n);
                             prep_next.store(park.next_h(), Ordering::Relaxed);
+                            release_remaining_jobs(
+                                &mut park,
+                                &pri_job_rx,
+                                &far_job_rx,
+                                &prep_result,
+                                "archive writer dead",
+                            );
                             return;
                         }
                     }

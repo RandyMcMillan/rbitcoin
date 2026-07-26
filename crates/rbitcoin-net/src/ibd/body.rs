@@ -225,9 +225,10 @@ impl BodyPresence {
             self.pending.remove(&h);
             self.pending_since.remove(&h);
         }
-        // Drop charged markers only when the hash left the work path; if a body
-        // is still in the archive pipeline its charge is released via result.
-        self.archive_charged.retain(|h| keep(h));
+        // Do **not** hygiene-prune `archive_charged`. Markers clear only on
+        // pipeline Ok/Err/Dropped via [`clear_archive_charged`]. Dropping them
+        // while a job is still charged allows redelivery double-charge and loses
+        // the only process-local "in pipeline" bit (budget meter desync).
         // rejected: permanent blacklist
     }
 
@@ -301,10 +302,18 @@ mod tests {
         body.mark_archived(h(10));
         body.mark_missing(h(11));
         body.mark_rejected(h(12));
+        body.mark_archive_charged(h(11));
         body.hygiene_retain(|x| *x == h(10));
         assert!(body.is_known_archived(&h(10)));
         assert_eq!(body.skip_download_cached(&h(11)), None); // missing dropped
         assert!(body.is_rejected(&h(12)));
+        // Charged marker survives hygiene until pipeline result (no double-charge).
+        assert!(
+            body.is_archive_charged(&h(11)),
+            "archive_charged must not be hygiene-pruned while job may still be in flight"
+        );
+        body.clear_archive_charged(&h(11));
+        assert!(!body.is_archive_charged(&h(11)));
     }
 
     /// rejected sticky + archive_charged through pending-stale pipeline.

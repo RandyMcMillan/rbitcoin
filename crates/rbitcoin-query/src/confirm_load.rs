@@ -430,14 +430,34 @@ impl Query {
                 return Err(StoreError::Cancelled("confirm cancelled"));
             }
             let fks: Vec<Fk> = chunk.iter().map(|(pid, _)| Fk(*pid)).collect();
-            let ranges = self.store.tx_body_range_batch(&fks)?;
+            // Sticky create cache (archive prewarm/commit) may already have ranges
+            // — skip tx.idx for those parents.
+            let sticky_ranges = self.archive_txid_sticky.body_ranges_by_fk(&fks);
+            let mut need_idx: Vec<Fk> = Vec::new();
+            let mut need_idx_slot: Vec<usize> = Vec::new(); // index into chunk
+            let mut range_by_chunk_i: Vec<Option<(u64, u64)>> =
+                vec![None; chunk.len()];
+            for (i, (fk, sticky)) in fks.iter().zip(sticky_ranges.into_iter()).enumerate() {
+                if let Some(r) = sticky {
+                    range_by_chunk_i[i] = Some(r);
+                } else {
+                    need_idx_slot.push(i);
+                    need_idx.push(*fk);
+                }
+            }
+            if !need_idx.is_empty() {
+                let got = self.store.tx_body_range_batch(&need_idx)?;
+                for (slot, range_opt) in need_idx_slot.into_iter().zip(got.into_iter()) {
+                    range_by_chunk_i[slot] = range_opt;
+                }
+            }
 
             // job_i → bulk_ranges slot (only jobs with a range + need_vouts).
             let mut bulk_job_i: Vec<usize> = Vec::new();
             let mut bulk_ranges: Vec<(u64, u64)> = Vec::new();
             let mut jobs: Vec<(u64, Vec<u32>, Option<(u64, u64)>)> =
                 Vec::with_capacity(chunk.len());
-            for ((pid, need_vouts), range_opt) in chunk.iter().zip(ranges.into_iter()) {
+            for ((pid, need_vouts), range_opt) in chunk.iter().zip(range_by_chunk_i.into_iter()) {
                 let need_vouts = need_vouts.clone();
                 if let Some((off, len)) = range_opt {
                     if !need_vouts.is_empty() {

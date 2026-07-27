@@ -264,8 +264,14 @@ impl Query {
         let collect_ns = t_collect.elapsed().as_nanos() as u64;
 
         let t_sticky = Instant::now();
-        let mut resolved = self.archive_txid_sticky.lookup_batch(&need_vec);
-        let sticky_hit_n = resolved.len() as u64;
+        // Sticky hit ⇒ skip head; range on hit ⇒ skip idx for that create elsewhere.
+        let sticky_hits = self.archive_txid_sticky.lookup_batch(&need_vec);
+        let sticky_hit_n = sticky_hits.len() as u64;
+        let mut resolved: HashMap<[u8; 32], Fk> =
+            HashMap::with_capacity(sticky_hits.len().saturating_add(need_vec.len() / 4));
+        for (txid, hit) in sticky_hits {
+            resolved.insert(txid, hit.fk);
+        }
         let sticky_ns = t_sticky.elapsed().as_nanos() as u64;
 
         // Prior mega-batch(es) still in the write queue: not sticky/head yet.
@@ -415,12 +421,18 @@ impl Query {
             let end = (cur + CHUNK - 1).min(n);
             let txids = self.store.txs.body_txid_range(cur, end)?;
             debug_assert_eq!(txids.len() as u64, end - cur + 1);
-            let batch: Vec<([u8; 32], Fk)> = txids
+            let fks: Vec<Fk> = (cur..=end).map(Fk).collect();
+            let ranges = self.store.tx_body_range_batch(&fks)?;
+            let batch: Vec<([u8; 32], Fk, u64, u64)> = txids
                 .into_iter()
-                .enumerate()
-                .map(|(i, txid)| (txid, Fk(cur + i as u64)))
+                .zip(fks.into_iter())
+                .zip(ranges.into_iter())
+                .filter_map(|((txid, fk), range)| {
+                    let (off, len) = range?;
+                    Some((txid, fk, off, len))
+                })
                 .collect();
-            self.archive_txid_sticky.insert_many(&batch);
+            self.archive_txid_sticky.insert_many_with_ranges(&batch);
             loaded = loaded.saturating_add(batch.len());
             cur = end + 1;
         }
@@ -490,10 +502,23 @@ impl Query {
 
         // Sticky only after head batch is published (fence in head_insert_many).
         // Publish **this batch's creates only** — not parents just looked up from
-        // durable head (those thrash FIFO with cold long-tail keys).
-        // Writer then drops in-flight txid→fk so prep uses sticky/head next.
+        // durable head (those thrash FIFO with cold long-tail keys). Include body
+        // ranges (dense planned fks → cheap sequential idx) so later sticky hits
+        // skip head + idx in prep/confirm.
         let t = Instant::now();
-        self.archive_txid_sticky.insert_many(&plan.sticky_creates);
+        let ranges = self.store.tx_body_range_batch(&got_tx_fks)?;
+        let mut with_range: Vec<([u8; 32], Fk, u64, u64)> =
+            Vec::with_capacity(plan.sticky_creates.len());
+        let mut fk_only: Vec<([u8; 32], Fk)> = Vec::new();
+        for (&(txid, fk), range) in plan.sticky_creates.iter().zip(ranges.into_iter()) {
+            match range {
+                Some((off, len)) if len > 0 => with_range.push((txid, fk, off, len)),
+                _ => fk_only.push((txid, fk)),
+            }
+        }
+        self.archive_txid_sticky
+            .insert_many_with_ranges(&with_range);
+        self.archive_txid_sticky.insert_many(&fk_only);
         let sticky_ns = t.elapsed().as_nanos() as u64;
 
         let t = Instant::now();
@@ -822,7 +847,11 @@ mod tests {
             !hits.contains_key(&parent_txid),
             "head-resolved parent must not be sticky-published"
         );
-        assert_eq!(hits.get(&child_txid).copied(), Some(Fk(2)));
+        assert_eq!(hits.get(&child_txid).map(|h| h.fk), Some(Fk(2)));
+        assert!(
+            hits.get(&child_txid).and_then(|h| h.body_range).is_some(),
+            "commit should sticky-publish body range for new creates"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -854,7 +883,15 @@ mod tests {
         last_txid[0..8].copy_from_slice(&50u64.to_le_bytes());
         last_txid[8] = 0xcb;
         let hit = q.archive_txid_sticky.lookup_batch(&[last_txid]);
-        assert_eq!(hit.get(&last_txid), Some(&Fk(50)));
+        assert_eq!(hit.get(&last_txid).map(|h| h.fk), Some(Fk(50)));
+        assert!(
+            hit.get(&last_txid).and_then(|h| h.body_range).is_some(),
+            "prewarm should cache body range with fk"
+        );
+        assert_eq!(
+            q.archive_txid_sticky.body_ranges_by_fk(&[Fk(50)]),
+            vec![Some(hit[&last_txid].body_range.unwrap())]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -881,8 +918,10 @@ mod tests {
         let t1 = coinbase_apply(1).tx.txid;
         let t5 = coinbase_apply(5).tx.txid;
         let hits = q.archive_txid_sticky.lookup_batch(&[t1, t5]);
-        assert_eq!(hits.get(&t1), Some(&Fk(1)));
-        assert_eq!(hits.get(&t5), Some(&Fk(5)));
+        assert_eq!(hits.get(&t1).map(|h| h.fk), Some(Fk(1)));
+        assert_eq!(hits.get(&t5).map(|h| h.fk), Some(Fk(5)));
+        assert!(hits.get(&t1).and_then(|h| h.body_range).is_some());
+        assert!(hits.get(&t5).and_then(|h| h.body_range).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

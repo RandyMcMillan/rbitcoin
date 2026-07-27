@@ -1,35 +1,16 @@
-//! Process-local archive writer sticky: `txid → create_fk` (no outs).
+//! Process-local archive sticky: `txid → create_fk` (+ optional body range).
 //!
 //! Cross mega-batch RAM hit for parent resolve when packing create_fk into spends.
-//! Capacity-capped FIFO (~4 M default ≈ 192 MiB planning budget).
+//! Capacity-capped FIFO (~4 M default ≈ 192 MiB planning budget for fk-only;
+//! ranges add ~12 B/entry when present).
 //!
 //! **Hot path:** single Class A archive writer. `insert_many` / `lookup_batch` take
 //! the mutex once per call. Lookup hits and re-inserts **touch** FIFO recency so
 //! parents are not immediately evicted by a flood of new creates.
 //!
-//! **Layout:** map holds `txid → {fk, stamp}`; FIFO stores only `(stamp, txid_key
-//! ref is avoided)` — actually FIFO stores `(stamp)` is not enough for eviction.
-//! We store `(stamp)` + look up by walking... no that needs txid.
-//!
-//! FIFO stores **`(stamp: u32, map generation key index)`** is hard with HashMap.
-//! Instead: FIFO stores **only stamp+txid as packed**: keep txid in fifo but use
-//! **u32 stamp** (halves stamp field). Better: fifo of `(u32 stamp, [u8;32])` still
-//! has txid.
-//!
-//! **Chosen:** fifo entries are `(stamp: u32,)` is insufficient.
-//! Fifo: `VecDeque<u32>` of stamps only doesn't work for eviction matching.
-//!
-//! **Chosen design:** map `HashMap<[u8;32], Entry{fk:u64, stamp:u32}>` and fifo
-//! `VecDeque<([u8;32], u32)>` with **u32 stamp** — saves 4B per map entry + 4B
-//! per fifo. For larger win: fifo stores nothing but stamps if we use
-//! `Entry { fk, stamp, gen }` and fifo is just stamps that match — still need
-//! which key. **Fifo without txid:** store reverse `stamp → txid` only for live
-//! stamps: on insert push stamp to fifo; map has stamp; on evict pop stamp,
-//! need stamp→txid. Maintain `HashMap<u32, [u8;32]>` for live stamps only —
-//! one stamp per key after touch rewrite. On insert/touch: remove old stamp
-//! reverse, insert new. Fifo is `VecDeque<u32>` stamps only.
-//!
-//! Evict: pop stamp from fifo; if reverse still maps that stamp → remove map key.
+//! **Body ranges:** when known (prewarm sequential idx, or post-body commit), each
+//! entry also stores `(body_off, body_len)` so a hit skips both **`tx.head`** and
+//! **`tx.idx`** (confirm pin_new / any `body_range` consumer via [`body_ranges_by_fk`]).
 
 use rbitcoin_primitives::Fk;
 use std::collections::{HashMap, VecDeque};
@@ -46,16 +27,52 @@ pub fn archive_txid_sticky_cap_from_env() -> usize {
         .clamp(100_000, 20_000_000)
 }
 
+/// Lookup hit: create fk and optional packed body range (skip head + idx when set).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StickyHit {
+    pub fk: Fk,
+    /// `(absolute body off, len)` when known; `None` ⇒ fk only (still skips head).
+    pub body_range: Option<(u64, u64)>,
+}
+
 struct Entry {
     fk: u64,
+    /// 0 = range unknown.
+    body_off: u64,
+    body_len: u32,
     /// Monotonic stamp (u32); FIFO records carry stamp at push time.
     stamp: u32,
+}
+
+impl Entry {
+    fn range(&self) -> Option<(u64, u64)> {
+        if self.body_len == 0 {
+            None
+        } else {
+            Some((self.body_off, u64::from(self.body_len)))
+        }
+    }
+
+    fn set_range(&mut self, range: Option<(u64, u64)>) {
+        match range {
+            Some((off, len)) if len > 0 && len <= u64::from(u32::MAX) => {
+                self.body_off = off;
+                self.body_len = len as u32;
+            }
+            _ => {
+                self.body_off = 0;
+                self.body_len = 0;
+            }
+        }
+    }
 }
 
 struct Inner {
     map: HashMap<[u8; 32], Entry>,
     /// Live stamp → txid (one entry per live stamp; touch rewrites stamp).
     stamp_to_txid: HashMap<u32, [u8; 32]>,
+    /// create_fk → body range when known (confirm pin_new skips idx).
+    fk_to_range: HashMap<u64, (u64, u32)>,
     /// Eviction order: stamps only (no 32 B txid per fifo record).
     fifo: VecDeque<u32>,
     cap: usize,
@@ -75,6 +92,7 @@ impl ArchiveTxidSticky {
             inner: Mutex::new(Inner {
                 map: HashMap::with_capacity(init),
                 stamp_to_txid: HashMap::with_capacity(init),
+                fk_to_range: HashMap::with_capacity(init),
                 fifo: VecDeque::with_capacity(init),
                 cap,
                 next_stamp: 1,
@@ -106,8 +124,10 @@ impl ArchiveTxidSticky {
         let have = g.map.len();
         g.map.reserve(want.saturating_sub(have));
         g.stamp_to_txid.reserve(want.saturating_sub(have));
+        g.fk_to_range.reserve(want.saturating_sub(have));
     }
 
+    /// Insert fk-only mappings (body range unknown).
     pub fn insert_many(&self, entries: &[([u8; 32], Fk)]) {
         if entries.is_empty() {
             return;
@@ -117,11 +137,27 @@ impl ArchiveTxidSticky {
             if fk.is_null() {
                 continue;
             }
-            g.insert_one(txid, fk.0);
+            g.insert_one(txid, fk.0, None);
         }
     }
 
-    pub fn lookup_batch(&self, txids: &[[u8; 32]]) -> HashMap<[u8; 32], Fk> {
+    /// Insert mappings with packed body ranges (from idx at insert time).
+    pub fn insert_many_with_ranges(&self, entries: &[([u8; 32], Fk, u64, u64)]) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        for &(txid, fk, off, len) in entries {
+            if fk.is_null() {
+                continue;
+            }
+            let range = if len > 0 { Some((off, len)) } else { None };
+            g.insert_one(txid, fk.0, range);
+        }
+    }
+
+    /// Lookup by txid: hits skip head; range present ⇒ also skip idx for that create.
+    pub fn lookup_batch(&self, txids: &[[u8; 32]]) -> HashMap<[u8; 32], StickyHit> {
         if txids.is_empty() {
             return HashMap::new();
         }
@@ -131,12 +167,33 @@ impl ArchiveTxidSticky {
             let Some(e) = g.map.get(t) else {
                 continue;
             };
-            let fk = e.fk;
+            let hit = StickyHit {
+                fk: Fk(e.fk),
+                body_range: e.range(),
+            };
             g.touch(*t);
-            out.insert(*t, Fk(fk));
+            out.insert(*t, hit);
         }
         g.maybe_compact_fifo();
         out
+    }
+
+    /// Bulk body ranges by create fk (confirm pin_new). Misses are `None`.
+    pub fn body_ranges_by_fk(&self, fks: &[Fk]) -> Vec<Option<(u64, u64)>> {
+        if fks.is_empty() {
+            return Vec::new();
+        }
+        let g = self.inner.lock().unwrap();
+        fks.iter()
+            .map(|fk| {
+                let Some(id) = fk.get() else {
+                    return None;
+                };
+                g.fk_to_range
+                    .get(&id)
+                    .map(|&(off, len)| (off, u64::from(len)))
+            })
+            .collect()
     }
 
     /// Test-only: set the next stamp near wrap so the next alloc rewrites.
@@ -195,10 +252,23 @@ impl Inner {
         self.fifo.push_back(stamp);
     }
 
-    fn insert_one(&mut self, txid: [u8; 32], fk: u64) {
+    fn insert_one(&mut self, txid: [u8; 32], fk: u64, range: Option<(u64, u64)>) {
         if let Some(e) = self.map.get_mut(&txid) {
+            let old_fk = e.fk;
+            if old_fk != fk {
+                self.fk_to_range.remove(&old_fk);
+            }
             e.fk = fk;
-            // fall through to touch-like stamp update
+            // Prefer new range when provided; keep existing if update is fk-only.
+            if range.is_some() {
+                e.set_range(range);
+            }
+            if let Some(r) = e.range() {
+                self.fk_to_range
+                    .insert(fk, (r.0, r.1.min(u64::from(u32::MAX)) as u32));
+            } else {
+                self.fk_to_range.remove(&fk);
+            }
             let old = e.stamp;
             self.stamp_to_txid.remove(&old);
             let stamp = self.alloc_stamp();
@@ -214,7 +284,18 @@ impl Inner {
                 }
             }
             let stamp = self.alloc_stamp();
-            self.map.insert(txid, Entry { fk, stamp });
+            let mut e = Entry {
+                fk,
+                body_off: 0,
+                body_len: 0,
+                stamp,
+            };
+            e.set_range(range);
+            if let Some(r) = e.range() {
+                self.fk_to_range
+                    .insert(fk, (r.0, r.1.min(u64::from(u32::MAX)) as u32));
+            }
+            self.map.insert(txid, e);
             self.stamp_to_txid.insert(stamp, txid);
             self.fifo.push_back(stamp);
         }
@@ -226,28 +307,24 @@ impl Inner {
             let Some(txid) = self.stamp_to_txid.remove(&stamp) else {
                 continue; // stale fifo stamp
             };
-            // Only remove map if stamp still matches (should).
             match self.map.get(&txid) {
                 Some(e) if e.stamp == stamp => {
+                    let fk = e.fk;
                     self.map.remove(&txid);
+                    self.fk_to_range.remove(&fk);
                     return true;
                 }
-                _ => {
-                    // Map moved to a newer stamp; stamp_to_txid already removed.
-                }
+                _ => {}
             }
         }
         false
     }
 
     fn maybe_compact_fifo(&mut self) {
-        // Fifo should be ~map.len() live stamps + slack from races; compact if huge.
         let limit = self.cap.saturating_mul(2).max(self.map.len().saturating_mul(2));
         if self.fifo.len() <= limit {
             return;
         }
-        // Rebuild fifo from live stamps (newest-first order approximate via map).
-        // Preserve approx LRU: walk old fifo, keep stamps still in stamp_to_txid once.
         let mut kept = VecDeque::with_capacity(self.map.len().saturating_add(64));
         let mut seen: HashMap<u32, ()> = HashMap::with_capacity(self.map.len());
         while let Some(stamp) = self.fifo.pop_back() {
@@ -279,7 +356,7 @@ mod tests {
     fn lookup_touch_keeps_parent_under_flood() {
         let s = ArchiveTxidSticky::new(100);
         let mut parent = [0u8; 32];
-        parent[31] = 0xff; // high byte — no collision with cold[0..8] counters
+        parent[31] = 0xff;
         s.insert_many(&[(parent, Fk(42))]);
         for i in 0..1000u64 {
             let _ = s.lookup_batch(&[parent]);
@@ -288,13 +365,30 @@ mod tests {
             s.insert_many(&[(cold, Fk(i + 100))]);
         }
         let hit = s.lookup_batch(&[parent]);
-        assert_eq!(hit.get(&parent).copied(), Some(Fk(42)));
+        assert_eq!(hit.get(&parent).map(|h| h.fk), Some(Fk(42)));
+    }
+
+    #[test]
+    fn range_cached_on_insert_and_fk_lookup() {
+        let s = ArchiveTxidSticky::new(100);
+        let t = [9u8; 32];
+        s.insert_many_with_ranges(&[(t, Fk(7), 1000, 50)]);
+        let hit = s.lookup_batch(&[t]);
+        assert_eq!(hit[&t].fk, Fk(7));
+        assert_eq!(hit[&t].body_range, Some((1000, 50)));
+        let by_fk = s.body_ranges_by_fk(&[Fk(7), Fk(8)]);
+        assert_eq!(by_fk, vec![Some((1000, 50)), None]);
+        // fk-only update keeps range
+        s.insert_many(&[(t, Fk(7))]);
+        assert_eq!(s.lookup_batch(&[t])[&t].body_range, Some((1000, 50)));
+        // new range overwrites
+        s.insert_many_with_ranges(&[(t, Fk(7), 2000, 80)]);
+        assert_eq!(s.lookup_batch(&[t])[&t].body_range, Some((2000, 80)));
+        assert_eq!(s.body_ranges_by_fk(&[Fk(7)]), vec![Some((2000, 80))]);
     }
 
     #[test]
     fn fifo_does_not_store_txid_bytes_per_record() {
-        // Sanity: after inserts, fifo_len is O(map) not O(map * 32) storage —
-        // structural check that size_stats fifo is stamp queue.
         let s = ArchiveTxidSticky::new(100);
         for i in 0..50u64 {
             let mut t = [0u8; 32];
@@ -317,13 +411,11 @@ mod tests {
         let t3 = [3u8; 32];
         s.insert_many(&[(t1, Fk::NULL), (t1, Fk(1)), (t2, Fk(2)), (t3, Fk(3))]);
         assert!(s.len() <= 2);
-        // Update existing fk.
         s.insert_many(&[(t3, Fk(30))]);
         let hit = s.lookup_batch(&[t1, t2, t3]);
         assert!(hit.len() <= 2);
     }
 
-    /// Stamp wrap rewrites all live stamps; stale fifo stamps are skipped on evict.
     #[test]
     fn stamp_wrap_rewrite_and_stale_fifo_evict() {
         let s = ArchiveTxidSticky::new(4);
@@ -332,16 +424,13 @@ mod tests {
             t[0..8].copy_from_slice(&i.to_le_bytes());
             s.insert_many(&[(t, Fk(i + 1))]);
         }
-        // Next alloc wraps through 0 → rewrite_all_stamps.
         s.force_next_stamp(u32::MAX);
         let mut t = [0u8; 32];
         t[0] = 0xee;
-        s.insert_many(&[(t, Fk(99))]); // triggers wrap + maybe eviction
-        // Map still queryable after rewrite.
+        s.insert_many(&[(t, Fk(99))]);
         let hit = s.lookup_batch(&[t]);
         assert!(hit.get(&t).is_some() || s.len() <= 4);
 
-        // Touch existing keys many times to leave stale stamps in fifo, then flood.
         let parent = {
             let mut p = [0u8; 32];
             p[31] = 0xaa;
@@ -357,7 +446,6 @@ mod tests {
             s.insert_many(&[(cold, Fk(i + 1000))]);
         }
         assert!(s.len() <= s.cap());
-        // Parent may or may not survive; path exercises stale-stamp skip.
         let _ = s.lookup_batch(&[parent]);
         assert_eq!(s.cap(), 4);
         let _ = ArchiveTxidSticky::from_env();

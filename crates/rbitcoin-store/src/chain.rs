@@ -37,6 +37,15 @@ impl ConfirmedTable {
         Ok(Fk::new(v))
     }
 
+    /// Batch height → header_fk (0-based height indices). Missing/unset → `None`.
+    pub fn get_many(&self, heights: &[Height]) -> Result<Vec<Option<Fk>>, StoreError> {
+        let mut out = Vec::with_capacity(heights.len());
+        for &h in heights {
+            out.push(self.get(h)?);
+        }
+        Ok(out)
+    }
+
     pub fn set(&self, height: Height, header_fk: Fk) -> Result<(), StoreError> {
         if header_fk.is_null() {
             return Err(StoreError::InvalidFk);

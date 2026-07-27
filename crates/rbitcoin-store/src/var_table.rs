@@ -250,9 +250,21 @@ impl VarTable {
         if self.count.load(Ordering::Acquire) != base_count {
             return Err(StoreError::Corrupt("var put_batch_encode race"));
         }
-        self.body.write_at(start, &body_blob)?;
-        let off_pos = FILE_HEADER_LEN as u64 + base_count * 8;
-        self.idx.write_at(off_pos, &idx_blob)?;
+        // Linear archive append: pwrite body/idx (no multi‑GiB mmap dirty for the
+        // payload). Publish HWM inside write_at_pwrite; seqlock publishes count.
+        // Override with RBITCOIN_FD_APPEND=0 to use mmap write_at (debug / compare).
+        let use_fd = std::env::var("RBITCOIN_FD_APPEND")
+            .map(|s| s != "0" && s != "false" && s != "off")
+            .unwrap_or(true);
+        if use_fd {
+            self.body.write_at_pwrite(start, &body_blob)?;
+            let off_pos = FILE_HEADER_LEN as u64 + base_count * 8;
+            self.idx.write_at_pwrite(off_pos, &idx_blob)?;
+        } else {
+            self.body.write_at(start, &body_blob)?;
+            let off_pos = FILE_HEADER_LEN as u64 + base_count * 8;
+            self.idx.write_at(off_pos, &idx_blob)?;
+        }
         // Publish complete records under seqlock: enter (odd) → end+count → leave (even).
         // Without the seqlock, a reader can observe (old_count, new_end) between the
         // two stores and inflate last-record length (regression: left 640 right 128).
@@ -389,6 +401,30 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::sync::{Arc, Barrier};
     use std::thread;
+
+    /// FD append (`write_at_pwrite`) publishes records readable via mmap `get`.
+    #[test]
+    fn put_batch_fd_append_roundtrip() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, AtomicOrdering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rbitcoin-var-fd-{id}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Default is FD append on.
+        let t = VarTable::create(&dir, "tx", TableKind::Tx).unwrap();
+        let fks = t
+            .put_batch_encode(3, 64, |i, buf| {
+                buf.extend_from_slice(&[i as u8 + 1; 16]);
+            })
+            .unwrap();
+        assert_eq!(fks.len(), 3);
+        assert_eq!(t.count(), 3);
+        for (i, fk) in fks.iter().enumerate() {
+            let body = t.get_raw(*fk).unwrap();
+            assert_eq!(body, vec![i as u8 + 1; 16]);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Concurrent readers must never see last-record len spanning a later batch
     /// (regression: raw.len() 640 vs expected 128 from torn (old_count, new_end)).

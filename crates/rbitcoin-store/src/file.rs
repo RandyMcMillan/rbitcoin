@@ -460,7 +460,56 @@ impl TableFile {
                 ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
             }
         }
-        // Publish HWM after bytes are visible.
+        self.publish_logical_end(end);
+        Ok(())
+    }
+
+    /// Write `bytes` at `offset` via **`pwrite`** (page cache), then publish HWM.
+    ///
+    /// Same capacity / published-length rules as [`Self::write_at`], but does not
+    /// memcpy through the mmap for the payload. Intended for **linear archive
+    /// appends** of large body/idx blobs so the writer need not dirty multi‑GiB
+    /// map pages. MAP_SHARED readers still see data via the page cache.
+    ///
+    /// Sole appender role only (same as `write_at`).
+    pub fn write_at_pwrite(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let end = offset.saturating_add(bytes.len() as u64);
+        self.ensure_capacity(end)?;
+        let fd = self.read_file.as_raw_fd();
+        let mut done = 0usize;
+        while done < bytes.len() {
+            // SAFETY: sole appender; buf lives for the syscall; fd is the table file.
+            let rc = unsafe {
+                libc::pwrite(
+                    fd,
+                    bytes[done..].as_ptr() as *const libc::c_void,
+                    bytes.len() - done,
+                    (offset + done as u64) as libc::off_t,
+                )
+            };
+            if rc < 0 {
+                return Err(StoreError::io(
+                    &self.path,
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            if rc == 0 {
+                return Err(StoreError::io(
+                    &self.path,
+                    std::io::Error::new(std::io::ErrorKind::WriteZero, "pwrite returned 0"),
+                ));
+            }
+            done += rc as usize;
+        }
+        self.publish_logical_end(end);
+        Ok(())
+    }
+
+    /// Extend published HWM to at least `end` (Release) and refresh on-map HWM field.
+    fn publish_logical_end(&self, end: u64) {
         let mut cur = self.published_len.load(Ordering::Relaxed);
         while end > cur {
             match self.published_len.compare_exchange_weak(
@@ -476,7 +525,6 @@ impl TableFile {
                 Err(c) => cur = c,
             }
         }
-        Ok(())
     }
 
     /// Atomic little-endian `u32` load (Acquire). Head probe path.
@@ -1169,6 +1217,32 @@ mod advise_tests {
         let _ = f.path();
         let _ = f.data_len();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// pwrite payload must be visible to mmap `read_at` (page-cache coherency).
+    #[test]
+    fn write_at_pwrite_visible_via_mmap_read() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("rbitcoin-pwrite-vis-{id}"));
+        let _ = std::fs::remove_file(&path);
+        let f = TableFile::create(&path, TableKind::Tx).unwrap();
+        let payload = b"fd-append-payload-0123456789abcdef";
+        let off = FILE_HEADER_LEN as u64;
+        f.write_at_pwrite(off, payload).unwrap();
+        assert_eq!(f.logical_len(), off + payload.len() as u64);
+        let mut got = vec![0u8; payload.len()];
+        f.read_at(off, &mut got).unwrap();
+        assert_eq!(&got[..], payload);
+        let more = b"MORE";
+        let off2 = f.logical_len();
+        f.write_at_pwrite(off2, more).unwrap();
+        let mut got2 = [0u8; 4];
+        f.read_at(off2, &mut got2).unwrap();
+        assert_eq!(&got2, more);
+        drop(f);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

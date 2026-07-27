@@ -316,6 +316,37 @@ impl Store {
         self.tx_height.get_batch(fks)
     }
 
+    /// Coinbase Class A fk for each confirmed height (or `None` if tip/header missing).
+    ///
+    /// Uses only Class C dense tables (`confirmed` + `header_txs_first`) — **no**
+    /// `tx.body`. Used by confirm write `create_h` to detect coinbase without
+    /// decoding create inputs.
+    pub fn coinbase_fk_at_heights(
+        &self,
+        heights: &[u32],
+    ) -> Result<std::collections::HashMap<u32, Fk>, StoreError> {
+        use rbitcoin_primitives::Height;
+        use std::collections::HashMap;
+        if heights.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut uniq: Vec<u32> = heights.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        let hs: Vec<Height> = uniq.iter().map(|&h| Height(h)).collect();
+        let headers = self.confirmed.get_many(&hs)?;
+        let mut out = HashMap::with_capacity(uniq.len());
+        for (i, &h) in uniq.iter().enumerate() {
+            let Some(hfk) = headers[i] else {
+                continue;
+            };
+            if let Some((first, _)) = self.header_txs.get_range(hfk)? {
+                out.insert(h, first);
+            }
+        }
+        Ok(out)
+    }
+
     /// Annotate spends using absolute 9-byte spender-meta offsets (pin layout).
     ///
     /// Tuple: `(abs_off, create_tx_fk, vout, spending_tx_fk)`.
@@ -840,6 +871,76 @@ mod tests {
             vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
             outs,
         )
+    }
+
+    /// Class C only: coinbase fk at height is header_txs first — no body.
+    #[test]
+    fn coinbase_fk_at_heights_matches_first_tx() {
+        let dir = tmp();
+        let s = Store::create(&dir).unwrap();
+        let hdr = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x1d00ffff,
+            nonce: 1,
+            merkle_root: [1u8; 32],
+            hash: [2u8; 32],
+        };
+        let hfk = s.put_header(&hdr).unwrap();
+        // Two txs: coinbase + one non-cb (contiguous Class A ids).
+        let (cb_tx, cb_in, cb_out) = coinbase_item(
+            [10u8; 32],
+            vec![OutputRecord {
+                value: 50_0000_0000,
+                script: vec![0x51],
+                spender_field: Fk::NULL,
+                multi_spender: false,
+            }],
+        );
+        let cb_fks = s
+            .put_tx_full_batch_indexed(&[(cb_tx, cb_in, cb_out)], false)
+            .unwrap();
+        let non_tx = TxRecord {
+            txid: [11u8; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let non_in = vec![InputRecord {
+            prev_txid: [10u8; 32],
+            prev_index: 0,
+            create_fk: cb_fks[0],
+            script_sig: vec![],
+            sequence: 0xffff_ffff,
+            witness: vec![],
+        }];
+        let non_out = vec![OutputRecord {
+            value: 1,
+            script: vec![0x51],
+            spender_field: Fk::NULL,
+            multi_spender: false,
+        }];
+        let non_fks = s
+            .put_tx_full_batch_indexed(&[(non_tx, non_in, non_out)], false)
+            .unwrap();
+        let fks = vec![cb_fks[0], non_fks[0]];
+        assert_eq!(fks.len(), 2);
+        s.header_txs.put_range(hfk, fks[0], 2).unwrap();
+        s.confirmed.set(Height(0), hfk).unwrap();
+        s.tx_height.set(fks[0], Height(0)).unwrap();
+        s.tx_height.set(fks[1], Height(0)).unwrap();
+
+        let map = s.coinbase_fk_at_heights(&[0, 1, 99]).unwrap();
+        assert_eq!(map.get(&0).copied(), Some(fks[0]));
+        assert!(!map.contains_key(&1)); // no confirmed height 1
+        assert!(!map.contains_key(&99));
+        // Non-coinbase is not first.
+        assert_ne!(map.get(&0).copied().unwrap(), fks[1]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

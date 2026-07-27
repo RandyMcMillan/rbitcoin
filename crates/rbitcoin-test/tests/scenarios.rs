@@ -23,6 +23,11 @@ use rbitcoin_test::{
 use rbitcoin_wire_cache::WireRing;
 use std::process::{Command, ExitCode};
 
+/// This toolchain's `ExitCode` lacks `PartialEq`; compare via Debug.
+fn exit_success(c: ExitCode) -> bool {
+    format!("{c:?}") == format!("{:?}", ExitCode::SUCCESS)
+}
+
 // ─── Lifecycle / CLI / surface smoke (collapsed) ────────────────────────────
 
 #[test]
@@ -131,116 +136,46 @@ fn node_cli_and_surface_smoke() {
     // CLI entrypoints
     for net in ["mainnet", "testnet", "signet", "regtest"] {
         let d = td.path().join(net);
-        assert_eq!(
-            node_cli_main([
+        assert!(exit_success(node_cli_main([
                 "rbitcoin-node",
                 "--datadir",
                 d.to_str().unwrap(),
                 "--network",
                 net,
                 "--smoke",
-            ]),
-            ExitCode::SUCCESS
-        );
+            ])));
     }
     let _ = node_cli_main(["rbitcoin-node", "--help"]);
     let _ = node_cli_main(["rbitcoin-node", "--version"]);
     let _ = cli_cli_main(["rbitcoin-cli", "--help"]);
     let _ = cli_cli_main(["rbitcoin-cli", "--version"]);
-    assert_eq!(cli_cli_main(["rbitcoin-cli", "help"]), ExitCode::SUCCESS);
-    assert_ne!(cli_cli_main(["rbitcoin-cli"]), ExitCode::SUCCESS);
-    assert_ne!(
-        cli_cli_main(["rbitcoin-cli", "getblockchaininfo"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--not-a-real-option"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--datadir"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--network", "nope"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--listen"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--listen", "not-an-addr"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--connect"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--connect", "bad"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--milestone", "x"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--max-outbound", "0"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--max-outbound"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--max-outbound", "nope"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--mempool-size-mb"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--mempool-size-mb", "0"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--mempool-size-mb", "x"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--max-run-secs"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--max-run-secs", "x"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--log-level"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--log-level", "loud"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--electrum-listen"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--electrum-listen", "bad"]),
-        ExitCode::SUCCESS
-    );
-    assert_ne!(
-        node_cli_main(["rbitcoin-node", "--milestone"]),
-        ExitCode::SUCCESS
-    );
+    assert!(exit_success(cli_cli_main(["rbitcoin-cli", "help"])));
+    assert!(!exit_success(cli_cli_main(["rbitcoin-cli"])));
+    assert!(!exit_success(cli_cli_main(["rbitcoin-cli", "getblockchaininfo"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--not-a-real-option"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--datadir"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--network", "nope"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--listen"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--listen", "not-an-addr"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--connect"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--connect", "bad"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--milestone", "x"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--max-outbound", "0"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--max-outbound"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--max-outbound", "nope"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--mempool-size-mb"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--mempool-size-mb", "0"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--mempool-size-mb", "x"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--max-run-secs"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--max-run-secs", "x"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--log-level"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--log-level", "loud"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--electrum-listen"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--electrum-listen", "bad"])));
+    assert!(!exit_success(node_cli_main(["rbitcoin-node", "--milestone"])));
     // Happy-path flag combinations (smoke exits after open).
     let flags_ok = td.path().join("flags-ok");
-    assert_eq!(
-        node_cli_main([
+    assert!(exit_success(node_cli_main([
             "rbitcoin-node",
             "--datadir",
             flags_ok.to_str().unwrap(),
@@ -265,12 +200,9 @@ fn node_cli_and_surface_smoke() {
             "127.0.0.1:0",
             "--inhibit-suspend",
             "--smoke",
-        ]),
-        ExitCode::SUCCESS
-    );
+        ])));
     let flags_off = td.path().join("flags-log-off");
-    assert_eq!(
-        node_cli_main([
+    assert!(exit_success(node_cli_main([
             "rbitcoin-node",
             "--datadir",
             flags_off.to_str().unwrap(),
@@ -279,25 +211,20 @@ fn node_cli_and_surface_smoke() {
             "--log-level",
             "off",
             "--smoke",
-        ]),
-        ExitCode::SUCCESS
-    );
+        ])));
     let _ = node_cli_main([
         "rbitcoin-node",
         "--help",
     ]);
-    assert_ne!(cli_cli_main(["rbitcoin-cli", "a", "b"]), ExitCode::SUCCESS);
+    assert!(!exit_success(cli_cli_main(["rbitcoin-cli", "a", "b"])));
 
     std::env::set_var("RBITCOIN_TEST_DROP_STORE", "1");
-    assert_ne!(
-        node_cli_main([
+    assert!(!exit_success(node_cli_main([
             "rbitcoin-node",
             "--datadir",
             td.path().join("shutdown-fail").to_str().unwrap(),
             "--smoke",
-        ]),
-        ExitCode::SUCCESS
-    );
+        ])));
     std::env::remove_var("RBITCOIN_TEST_DROP_STORE");
 
     let node = workspace_bin("rbitcoin-node");

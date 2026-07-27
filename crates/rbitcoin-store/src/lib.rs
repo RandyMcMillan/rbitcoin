@@ -15,6 +15,7 @@ mod file;
 mod head_resize_fill;
 mod head_resolve_stream;
 pub mod head_resolve_stats;
+mod spend_annotate_uring;
 mod uring_session;
 mod ibd_io_policy;
 mod hashhead;

@@ -350,13 +350,15 @@ impl Store {
     /// Annotate spends using absolute 9-byte spender-meta offsets (pin layout).
     ///
     /// Tuple: `(abs_off, create_tx_fk, vout, spending_tx_fk)`.
-    /// Sole first-spend (null field): mmap patch of field+flags (not io_uring).
-    /// Returns edges that need multi-list / full-body cold path.
+    /// Prefer io_uring RMW (read → sole/multi/promote → write); multi-list nodes
+    /// go to `spenders.body` inline on read completion. Returns edges that still
+    /// need a full cold path (OOB abs).
     pub fn put_spend_batch_by_abs_meta(
         &self,
         abs_edges: &[(u64, Fk, u32, Fk)],
     ) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
-        self.txs.put_spend_batch_by_abs_meta(abs_edges)
+        self.txs
+            .put_spend_batch_by_abs_meta(&self.spenders, abs_edges)
     }
 
     /// Like [`Self::put_spend_batch_by_create`] with cache-held body ranges.

@@ -204,4 +204,23 @@ mod tests {
         assert!(cfg.ensure_datadir().is_err());
         let _ = std::fs::remove_dir_all(&parent);
     }
+
+    /// Subdir path is a regular file → `create_dir_all` Datadir error arm.
+    #[test]
+    fn ensure_datadir_rejects_file_as_subdir() {
+        let dir = tmp();
+        let cfg = NodeConfig::default().with_datadir(&dir);
+        cfg.ensure_datadir().unwrap();
+        // Replace `store` dir with a file.
+        let store = dir.join("store");
+        std::fs::remove_dir_all(&store).unwrap();
+        std::fs::write(&store, b"not-a-dir").unwrap();
+        let err = cfg.ensure_datadir().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("store") || msg.contains("datadir") || msg.contains("File exists"),
+            "unexpected: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

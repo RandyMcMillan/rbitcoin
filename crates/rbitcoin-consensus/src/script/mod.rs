@@ -681,6 +681,85 @@ mod verify_routing_tests {
     }
 
     #[test]
+    fn bip143_sighash_arms_single_acp_and_p2wsh() {
+        use bitcoin::script::Script;
+        use bitcoin::Amount;
+
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: bitcoin::Txid::from_byte_array([1; 32]),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: bitcoin::Txid::from_byte_array([2; 32]),
+                        vout: 1,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::from_consensus(1),
+                    witness: Witness::new(),
+                },
+            ],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(1000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+                TxOut {
+                    value: Amount::from_sat(2000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
+                },
+            ],
+        };
+        let sc = Script::from_bytes(&[0x51]);
+        let amt = Amount::from_sat(50_000);
+
+        // Bad index.
+        assert!(crypto::bip143_signature_hash(&tx, 9, sc, amt, 0x01).is_err());
+
+        // All / Single / None + AnyoneCanPay variants.
+        for ty in [0x01u32, 0x02, 0x03, 0x81, 0x82, 0x83] {
+            let h = crypto::bip143_signature_hash(&tx, 0, sc, amt, ty).expect("sighash");
+            assert_ne!(h, [0u8; 32]);
+        }
+        // Single at index with matching output (input 1 → output 1).
+        let h_single = crypto::bip143_signature_hash(&tx, 1, sc, amt, 0x03).unwrap();
+        // Single with no matching output (only 2 outs; index 1 ok; use 1-input for zero outputs arm).
+        let tx1 = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![tx.input[0].clone()],
+            output: vec![],
+        };
+        let h_none_out = crypto::bip143_signature_hash(&tx1, 0, sc, amt, 0x03).unwrap();
+        assert_ne!(h_single, h_none_out);
+
+        // Non-standard raw type 0x65 → slow path for p2wsh.
+        let mut cache = bitcoin::sighash::SighashCache::new(&tx);
+        let wscript = Script::from_bytes(&[0x51]);
+        let h_fast = crypto::bip143_p2wsh_signature_hash(
+            &tx, 0, wscript, amt, 0x01, &mut cache,
+        )
+        .unwrap();
+        let h_slow = crypto::bip143_p2wsh_signature_hash(
+            &tx, 0, wscript, amt, 0x65, &mut cache,
+        )
+        .unwrap();
+        assert_ne!(h_fast, [0u8; 32]);
+        assert_ne!(h_slow, [0u8; 32]);
+        // Standard and non-standard types must differ (raw_ty in digest).
+        assert_ne!(h_fast, h_slow);
+    }
+
+    #[test]
     fn bip16_inactive_treats_p2sh_as_bare() {
         // P2SH template spent as bare HASH160/EQUAL when bip16 off.
         let mut p2sh = vec![0xa9, 0x14];

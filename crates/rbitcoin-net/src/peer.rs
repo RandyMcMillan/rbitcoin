@@ -1425,6 +1425,94 @@ mod tests {
             let _ = std::fs::remove_dir_all(dir);
         });
     }
+
+    /// Compact helpers with a live mempool hub attached (fill/missing/blocktxn).
+    #[test]
+    fn cmpct_helpers_with_mempool_live_and_blocktxn() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::bip152::BlockTransactions;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, CompactTarget, OutPoint, Sequence, Transaction, TxIn, TxMerkleNode, TxOut,
+            Witness,
+        };
+
+        let (dir, q) = tmp_store("cmpct-mp");
+        let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+        assert!(hub.attach_mempool(mp).is_ok());
+        assert!(hub.mempool().is_some());
+
+        let spend = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([0x11; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[vec![1]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut block = bitcoin::Block {
+            header: Header {
+                version: Version::ONE,
+                prev_blockhash: hub.tip_hash().unwrap(),
+                merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
+                time: 1,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![
+                Transaction {
+                    version: TxVersion::ONE,
+                    lock_time: LockTime::ZERO,
+                    input: vec![TxIn {
+                        previous_output: OutPoint::null(),
+                        script_sig: ScriptBuf::from_bytes(vec![0x01, 0x01]),
+                        sequence: Sequence::MAX,
+                        witness: Witness::new(),
+                    }],
+                    output: vec![TxOut {
+                        value: Amount::from_sat(50_0000_0000),
+                        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                    }],
+                },
+                spend.clone(),
+            ],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        let hsi = HeaderAndShortIds::from_block(&block, 0xbeef, 2, &[]).unwrap();
+        // Mempool present but empty live → Some(missing) not None.
+        let missing = try_cmpct_missing(&hub, &hsi, 2).expect("mempool present");
+        assert_eq!(missing, vec![1]); // spend short-id missing
+        assert!(try_fill_cmpct(&hub, &hsi, 2).is_none());
+        assert!(mempool_live_txs(&hub).is_empty());
+
+        let pc = PendingCmpct {
+            hsi: hsi.clone(),
+            missing: missing.clone(),
+            version: 2,
+        };
+        let bt = BlockTransactions {
+            block_hash: block.block_hash(),
+            transactions: vec![spend],
+        };
+        let recon = apply_cmpct_blocktxn(&hub, &pc, &bt).expect("blocktxn fill");
+        assert_eq!(recon.txdata.len(), 2);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 

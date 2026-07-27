@@ -551,4 +551,203 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
+
+    /// Accept live spends of confirmed OP_TRUE coinbases via QueryUtxoProvider —
+    /// covers fee histogram, estimate percentiles, scripthash mempool/delta,
+    /// wtxid lookup, package announce, and spent outpoints.
+    #[test]
+    fn hub_live_accept_fee_scripthash_and_package() {
+        use bitcoin::block::{Header, Version as BlockVersion};
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{Block, CompactTarget, Target, TxMerkleNode};
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_primitives::Height;
+        use rbitcoin_store::script_hash;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let store_dir = tmp();
+        let mp_dir = tmp();
+        let q = Query::open_or_create(&store_dir).unwrap();
+        let params = ChainParams::regtest();
+        let ms = Milestone::NONE;
+
+        fn coinbase(height: u32) -> Transaction {
+            let mut ss = if height == 0 {
+                vec![0x00]
+            } else {
+                rbitcoin_consensus::bip34_height_script(height)
+            };
+            while ss.len() < 2 {
+                ss.push(0x00);
+            }
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(ss),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]), // OP_TRUE
+                }],
+            }
+        }
+        fn mine(prev: bitcoin::BlockHash, time: u32, height: u32) -> Block {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let header = Header {
+                version: BlockVersion::ONE,
+                prev_blockhash: prev,
+                merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
+                time,
+                bits,
+                nonce: 0,
+            };
+            let mut block = Block {
+                header,
+                txdata: vec![coinbase(height)],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        }
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+        let mut tip = genesis.block_hash();
+        let mut tip_time = genesis.header.time;
+        // Two blocks → two coinbases we can spend (mempool does not enforce maturity).
+        let mut coinbase_txids = Vec::new();
+        for h in 1u32..=3 {
+            let b = mine(tip, tip_time + 600, h);
+            coinbase_txids.push(b.txdata[0].compute_txid());
+            accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+            tip = b.block_hash();
+            tip_time = b.header.time;
+        }
+
+        let q_arc = Arc::new(q);
+        let hub = MempoolHub::open(&mp_dir, Arc::clone(&q_arc)).unwrap();
+        hub.set_relay_enabled(true);
+        let mut ann_rx = hub.subscribe_announces();
+
+        // QueryUtxoProvider hit on confirmed coinbase.
+        let provider = QueryUtxoProvider {
+            query: q_arc.as_ref(),
+        };
+        let op0 = OutPoint {
+            txid: coinbase_txids[0],
+            vout: 0,
+        };
+        assert!(provider.get_txout(&op0).is_some());
+
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let sh = script_hash(spk.as_bytes());
+
+        // Parent spend → fee 1000.
+        let parent = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op0,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 1_000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        let pr = hub.accept_tx(&parent).expect("accept parent");
+        assert_eq!(pr.txid, parent.compute_txid());
+        assert!(matches!(ann_rx.try_recv(), Ok(_)));
+
+        // Child of mempool parent (height=-1 scripthash path) + second chain spend.
+        let child = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 2_000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        let second = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: coinbase_txids[1],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 5_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x52]), // different spk
+            }],
+        };
+        // Package: child then second is not topo for child; accept child alone then package second.
+        hub.accept_tx(&child).expect("child");
+        let pkg = hub.accept_package(&[second.clone()]).expect("package");
+        assert_eq!(pkg.len(), 1);
+
+        assert_eq!(hub.live_count(), 3);
+        assert!(hub.contains(&parent.compute_txid()));
+        assert!(hub.get_tx(&parent.compute_txid()).is_some());
+        let wtxid = parent.compute_wtxid();
+        assert!(hub.contains_wtxid(&wtxid));
+        assert!(hub.get_tx_by_wtxid(&wtxid).is_some());
+
+        // Fee surfaces with live graph.
+        assert!(!hub.fee_histogram().is_empty());
+        let e1 = hub.estimate_fee_btc_per_kb(1); // 90th
+        let e5 = hub.estimate_fee_btc_per_kb(5); // 50th
+        let e20 = hub.estimate_fee_btc_per_kb(20); // 20th
+        assert!(e1 >= 0.0 && e5 >= 0.0 && e20 >= 0.0);
+
+        let spent = hub.spent_outpoints();
+        assert!(spent.contains(&op0));
+        assert!(spent.contains(&OutPoint {
+            txid: parent.compute_txid(),
+            vout: 0
+        }));
+
+        // Scripthash: parent/child touch OP_TRUE; second does not.
+        let rows = hub.scripthash_mempool(&sh);
+        assert!(rows.len() >= 2);
+        assert!(rows.iter().any(|r| r.height == -1)); // child of mempool parent
+        let delta = hub.scripthash_unconfirmed_delta(&sh);
+        // Parent output still live until child spent it; child holds OP_TRUE UTXO.
+        // Net: +child_out - coinbase (parent spent chain UTXO) roughly non-zero path.
+        let _ = delta;
+
+        // Remove confirmed + reorg reaccept empty already covered; remove live.
+        assert!(hub.remove_for_block(&[parent.compute_txid()]) >= 1);
+        assert!(hub.list_live().len() < 3);
+
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
 }

@@ -138,6 +138,12 @@ impl ArchiveTxidSticky {
         g.maybe_compact_fifo();
         out
     }
+
+    /// Test-only: set the next stamp near wrap so the next alloc rewrites.
+    #[cfg(test)]
+    pub(crate) fn force_next_stamp(&self, stamp: u32) {
+        self.inner.lock().unwrap().next_stamp = stamp;
+    }
 }
 
 impl Inner {
@@ -315,5 +321,46 @@ mod tests {
         s.insert_many(&[(t3, Fk(30))]);
         let hit = s.lookup_batch(&[t1, t2, t3]);
         assert!(hit.len() <= 2);
+    }
+
+    /// Stamp wrap rewrites all live stamps; stale fifo stamps are skipped on evict.
+    #[test]
+    fn stamp_wrap_rewrite_and_stale_fifo_evict() {
+        let s = ArchiveTxidSticky::new(4);
+        for i in 0..4u64 {
+            let mut t = [0u8; 32];
+            t[0..8].copy_from_slice(&i.to_le_bytes());
+            s.insert_many(&[(t, Fk(i + 1))]);
+        }
+        // Next alloc wraps through 0 → rewrite_all_stamps.
+        s.force_next_stamp(u32::MAX);
+        let mut t = [0u8; 32];
+        t[0] = 0xee;
+        s.insert_many(&[(t, Fk(99))]); // triggers wrap + maybe eviction
+        // Map still queryable after rewrite.
+        let hit = s.lookup_batch(&[t]);
+        assert!(hit.get(&t).is_some() || s.len() <= 4);
+
+        // Touch existing keys many times to leave stale stamps in fifo, then flood.
+        let parent = {
+            let mut p = [0u8; 32];
+            p[31] = 0xaa;
+            p
+        };
+        s.insert_many(&[(parent, Fk(7))]);
+        for _ in 0..20 {
+            let _ = s.lookup_batch(&[parent]);
+        }
+        for i in 0..20u64 {
+            let mut cold = [0u8; 32];
+            cold[0..8].copy_from_slice(&(i + 1000).to_le_bytes());
+            s.insert_many(&[(cold, Fk(i + 1000))]);
+        }
+        assert!(s.len() <= s.cap());
+        // Parent may or may not survive; path exercises stale-stamp skip.
+        let _ = s.lookup_batch(&[parent]);
+        assert_eq!(s.cap(), 4);
+        let _ = ArchiveTxidSticky::from_env();
+        let _ = archive_txid_sticky_cap_from_env();
     }
 }

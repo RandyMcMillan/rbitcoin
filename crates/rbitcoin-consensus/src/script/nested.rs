@@ -383,4 +383,87 @@ mod tests {
         };
         assert!(verify_p2sh_legacy(&job_h, 0, &job_h.tx).is_err());
     }
+
+    /// Matching outer hash routes into p2wsh/p2wpkh verify (covers scripthash copy path).
+    #[test]
+    fn try_nested_matching_hash_enters_witness_verify() {
+        let redeem_wsh = {
+            let mut r = vec![0x00, 0x20];
+            r.extend([0xab; 32]);
+            r
+        };
+        let mut ss = vec![redeem_wsh.len() as u8];
+        ss.extend_from_slice(&redeem_wsh);
+        let mut tx = dummy_tx();
+        tx.input[0].script_sig = ScriptBuf::from_bytes(ss);
+        let job = ScriptCheckJob {
+            prevouts: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: p2sh_spk(&redeem_wsh),
+            }],
+            tx: tx.clone(),
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+        };
+        // Empty witness → p2wsh fails, but try_p2sh_p2wsh reached scripthash copy + call.
+        assert!(matches!(try_p2sh_p2wsh(&job, 0, &job.tx), Some(Err(_))));
+
+        let redeem_wpkh = {
+            let mut r = vec![0x00, 0x14];
+            r.extend([0xcd; 20]);
+            r
+        };
+        let mut ss2 = vec![redeem_wpkh.len() as u8];
+        ss2.extend_from_slice(&redeem_wpkh);
+        let mut tx2 = dummy_tx();
+        tx2.input[0].script_sig = ScriptBuf::from_bytes(ss2);
+        let job2 = ScriptCheckJob {
+            prevouts: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: p2sh_spk(&redeem_wpkh),
+            }],
+            tx: tx2.clone(),
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+        };
+        let mut cache = SighashCache::new(&job2.tx);
+        assert!(matches!(
+            try_p2sh_p2wpkh(&job2, 0, &job2.tx, &mut cache),
+            Some(Err(_))
+        ));
+
+        // Legacy OP_TRUE redeem succeeds (require_true_top path).
+        let redeem = vec![0x51]; // OP_TRUE
+        let mut ss3 = vec![0x01, 0xaa, redeem.len() as u8];
+        ss3.extend_from_slice(&redeem);
+        // stack push 0xaa + redeem OP_TRUE
+        let mut tx3 = dummy_tx();
+        tx3.input[0].script_sig = ScriptBuf::from_bytes(ss3);
+        let job3 = ScriptCheckJob {
+            prevouts: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: p2sh_spk(&redeem),
+            }],
+            tx: tx3.clone(),
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+        };
+        assert!(verify_p2sh_legacy(&job3, 0, &job3.tx).is_ok());
+
+        // OP_0 as first stack item in split (covers n==0x00 branch already hit);
+        // also OP_16 small-int push.
+        let ss_op = Script::from_bytes(&[0x00, 0x60, 0x01, 0x51]);
+        let (stack, redeem) = split_script_sig_redeem(ss_op).unwrap();
+        assert_eq!(stack, vec![vec![], vec![0x10]]);
+        assert_eq!(redeem, vec![0x51]);
+    }
 }

@@ -596,7 +596,13 @@ mod tests {
         assert_eq!(dns_seeds(Network::Signet).len(), 1);
         assert!(dns_seeds(Network::Regtest).is_empty());
         assert!(!fixed_seed_hosts(Network::Mainnet).is_empty());
+        assert!(!fixed_seed_hosts(Network::Testnet).is_empty());
+        assert!(!fixed_seed_hosts(Network::Signet).is_empty());
         assert!(fixed_seed_hosts(Network::Regtest).is_empty());
+        // Regtest has no seeds → resolve paths stay empty (no network I/O).
+        assert!(resolve_dns_seeds(Network::Regtest).is_empty());
+        assert!(resolve_fixed_seeds(Network::Regtest).is_empty());
+        assert!(resolve_all_seeds(Network::Regtest).is_empty());
     }
 
     #[test]
@@ -686,6 +692,67 @@ mod tests {
         assert!(loaded.flags(&addr(1)).has_connected());
         assert!(loaded.flags(&addr(1)).is_fast()); // bits 0|1
         assert!(loaded.flags(&addr(2)).failed_last_connect()); // bit 4 = 16
+
+        // Bad address token.
+        let bad_addr = dir.join("bad-addr");
+        std::fs::write(
+            &bad_addr,
+            format!("{}\nnot-an-addr 0\n", AddrMan::PEERS_FILE_MAGIC),
+        )
+        .unwrap();
+        assert!(AddrMan::load(&bad_addr).is_err());
+
+        // Bad hex flags.
+        let bad_hex = dir.join("bad-hex");
+        std::fs::write(
+            &bad_hex,
+            format!(
+                "{}\n{} 0xZZ\n",
+                AddrMan::PEERS_FILE_MAGIC,
+                addr(1)
+            ),
+        )
+        .unwrap();
+        assert!(AddrMan::load(&bad_hex).is_err());
+
+        // Bad decimal flags + 0X uppercase hex prefix path.
+        let bad_dec = dir.join("bad-dec");
+        std::fs::write(
+            &bad_dec,
+            format!(
+                "{}\n{} not-a-number\n",
+                AddrMan::PEERS_FILE_MAGIC,
+                addr(1)
+            ),
+        )
+        .unwrap();
+        assert!(AddrMan::load(&bad_dec).is_err());
+
+        let ok_upper = dir.join("ok-upper");
+        std::fs::write(
+            &ok_upper,
+            format!(
+                "{}\n{} 0X01\n",
+                AddrMan::PEERS_FILE_MAGIC,
+                addr(7)
+            ),
+        )
+        .unwrap();
+        let u = AddrMan::load(&ok_upper).unwrap();
+        assert!(u.flags(&addr(7)).has_connected());
+
+        // Save creates parent dir; note_connected clears fail/incompat bits.
+        let nested = dir.join("nested").join("peers");
+        let mut am = AddrMan::new();
+        am.add(addr(3));
+        am.note_connect_failed(addr(3), true);
+        assert!(am.flags(&addr(3)).is_incompatible());
+        am.note_connected(addr(3));
+        assert!(am.flags(&addr(3)).has_connected());
+        assert!(!am.flags(&addr(3)).is_incompatible());
+        am.save(&nested).unwrap();
+        assert!(nested.is_file());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

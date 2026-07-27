@@ -734,7 +734,7 @@ mod tests {
     use rbitcoin_query::Query;
     use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
@@ -856,5 +856,168 @@ mod tests {
         assert_eq!(scale_feed_cap(10, 0.25), 3); // ceil
         assert!(!archive_pipeline_saturated(0, 20, 1.0));
         assert!(archive_pipeline_saturated(96, 0, 0.0));
+    }
+
+    /// Critical depth / can_assign_new=false / room=0 early exits, densify + cache
+    /// issue loop, pending expire under can_assign, and park_race_need filter.
+    #[test]
+    fn assign_depth_densify_cache_and_early_exits() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(vec![dummy_slot(0), dummy_slot(1)], None, Some(0));
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 64;
+        cfg.per_peer = 8;
+
+        // Map ordered heights 1..12 as missing bodies (tip=0).
+        for ht in 1u32..=12 {
+            let hash = h(ht);
+            st.record_height(hash, ht);
+            st.height_to_hash.insert(ht, hash);
+            st.ordered_set.insert(hash);
+            st.ordered.push_back(hash);
+            st.max_ordered_height = ht;
+            st.body.mark_missing(hash);
+        }
+
+        // Critical depth: only tip-hole + park race; densify skipped.
+        assign_work_ordered(
+            &mut st,
+            &hub,
+            &cfg,
+            &stats,
+            1.0,
+            1,
+            AssignDepth::Critical,
+            true,
+        );
+        let after_crit = st.inflight.len();
+        assert!(after_crit > 0, "critical should still issue tip/race");
+
+        // can_assign_new=false early exit after race (no densify growth path).
+        let n_before = st.inflight.len();
+        assign_work_ordered(
+            &mut st,
+            &hub,
+            &cfg,
+            &stats,
+            1.0,
+            1,
+            AssignDepth::Full,
+            false,
+        );
+        // May re-issue expired race only; must not explode densify.
+        assert!(st.inflight.len() <= n_before + 8);
+
+        // Clear inflight + pending so Full densify can issue.
+        let hashes: Vec<_> = st.inflight.keys().copied().collect();
+        for hash in hashes {
+            clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+            st.body.mark_missing(hash);
+        }
+        // Stale pending expire when can_assign_new (age zero).
+        st.body.mark_pending(h(5));
+        // Force age by expiring with Duration::ZERO via body API, then re-mark for assign path.
+        let _ = st.body.expire_stale_pending(std::time::Duration::ZERO);
+        st.body.mark_pending(h(5));
+        // Direct expire path already covered in body tests; assign uses PENDING_STALE (45s).
+        // Put a gap-expired race height into pending with age 0 via mark + expire_if.
+        st.body.mark_pending(h(1));
+        let expired = st
+            .body
+            .expire_stale_pending_if(std::time::Duration::ZERO, |_| true);
+        for hash in expired {
+            clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+            st.body.mark_missing(hash);
+        }
+
+        // Full assign with densify scale: write_next=1, densify starts after race.
+        assign_work_ordered(
+            &mut st,
+            &hub,
+            &cfg,
+            &stats,
+            1.0,
+            1,
+            AssignDepth::Full,
+            true,
+        );
+        assert!(
+            st.inflight.len() > 0,
+            "full densify/cache should issue getdata"
+        );
+        assert!(stats.assign_issued.load(Ordering::Relaxed) > 0);
+
+        // room=0 path: fill window with dummy inflight.
+        for ht in 20u32..20 + cfg.window as u32 {
+            let hash = h(ht + 100);
+            inflight_add_peer(&mut st.inflight, hash, 0);
+            st.slots[0].in_flight.insert(hash);
+        }
+        let n_full = st.inflight.len();
+        assign_work_ordered(
+            &mut st,
+            &hub,
+            &cfg,
+            &stats,
+            1.0,
+            5,
+            AssignDepth::Full,
+            true,
+        );
+        // room=0 → finish without growing densify much (may clear satisfied only).
+        assert!(st.inflight.len() <= n_full + 2);
+
+        // peer_has_slot / park_race_need: fill peer0, peer1 free.
+        st.inflight.clear();
+        st.slots[0].in_flight.clear();
+        st.slots[1].in_flight.clear();
+        for ht in 1u32..=4 {
+            let hash = h(ht);
+            st.body.mark_missing(hash);
+        }
+        // Saturate peer 0.
+        for i in 0..cfg.per_peer {
+            let hash = h(200 + i as u32);
+            st.slots[0].in_flight.insert(hash);
+            inflight_add_peer(&mut st.inflight, hash, 0);
+        }
+        let need = park_race_need(&mut st, &hub, 1);
+        assert!(!need.is_empty());
+        // Full assign should still place on peer 1 when peer 0 is full.
+        assign_work_ordered(
+            &mut st,
+            &hub,
+            &cfg,
+            &stats,
+            0.5, // partial densify scale
+            1,
+            AssignDepth::Full,
+            true,
+        );
+        assert!(st.slots[1].in_flight.len() > 0 || st.inflight.len() > cfg.per_peer);
+
+        // Empty densify/cache (all archived) early finish.
+        for ht in 1u32..=12 {
+            st.body.mark_archived(h(ht));
+        }
+        st.inflight.clear();
+        st.slots.iter_mut().for_each(|s| s.in_flight.clear());
+        st.max_archived_height = 12;
+        st.max_ordered_height = 12;
+        assign_work_ordered(
+            &mut st,
+            &hub,
+            &cfg,
+            &stats,
+            1.0,
+            13,
+            AssignDepth::Full,
+            true,
+        );
+        assert!(st.inflight.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

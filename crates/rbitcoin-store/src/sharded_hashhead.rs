@@ -354,6 +354,26 @@ mod tests {
         let missing = dir.join("nope");
         assert!(ShardedHashHead::open_for_role(&missing, HeadRole::Header).is_err());
 
+        // Unexpected shard file name (not sequential hex).
+        let bad_names = dir.join("bad-names");
+        std::fs::create_dir_all(&bad_names).unwrap();
+        // Create a valid shard 00 then a non-sequential name "ff" when only one expected order.
+        {
+            let _ = HashHead::create_with_slots(bad_names.join("00"), 32).unwrap();
+            let _ = HashHead::create_with_slots(bad_names.join("ff"), 32).unwrap();
+        }
+        // Sorted names: "00", "ff" — index 1 expects "01"/"1", not "ff" → Corrupt.
+        assert!(matches!(
+            ShardedHashHead::open_for_role(&bad_names, HeadRole::Header),
+            Err(StoreError::Corrupt(_))
+        ));
+
+        // RBITCOIN_HEAD_SLOTS_* override → initial_slots_per_shard power-of-two path.
+        std::env::set_var("RBITCOIN_HEAD_SLOTS_HEADER", "100");
+        let slots = initial_slots_per_shard(HeadRole::Header);
+        assert_eq!(slots, 128); // next_power_of_two(100.max(2))
+        std::env::remove_var("RBITCOIN_HEAD_SLOTS_HEADER");
+
         // create_for_role under tiny (single-file header head)
         let role_path = dir.join("role");
         let h = ShardedHashHead::create_for_role(&role_path, HeadRole::Header).unwrap();

@@ -964,6 +964,26 @@ mod tests {
             mp.accept_package(&[], &utxos),
             Err(AcceptError::PackageEmpty)
         ));
+        // Count over MAX_PACKAGE_COUNT (25).
+        let many: Vec<Transaction> = (0..MAX_PACKAGE_COUNT + 1)
+            .map(|i| {
+                spend_tx(
+                    OutPoint {
+                        txid: Txid::from_byte_array({
+                            let mut b = [0u8; 32];
+                            b[0] = i as u8;
+                            b
+                        }),
+                        vout: 0,
+                    },
+                    1,
+                )
+            })
+            .collect();
+        assert!(matches!(
+            mp.accept_package(&many, &utxos),
+            Err(AcceptError::PackageTooLarge { .. })
+        ));
 
         let tx = spend_tx(op, 99_000);
         mp.accept_tx(&tx, &utxos).unwrap();

@@ -573,52 +573,6 @@ impl TableFile {
         Ok(v)
     }
 
-    /// Unconditional little-endian `u32` store (Release). Head sole-writer path.
-    ///
-    /// Does **not** extend [`logical_len`] — slots must already be in range.
-    pub fn store_u32_le(&self, offset: u64, new: u32) -> Result<(), StoreError> {
-        if offset % 4 != 0 {
-            return Err(StoreError::Corrupt("store_u32 unaligned"));
-        }
-        let end = offset.saturating_add(4);
-        let len = self.published_len.load(Ordering::Acquire);
-        if end > len {
-            return Err(StoreError::Corrupt("store_u32 past logical end"));
-        }
-        let pin = self.pin();
-        if end > pin.epoch.cap() {
-            return Err(StoreError::Corrupt("store_u32 past map end"));
-        }
-        // SAFETY: aligned offset within published+capacity pin.
-        unsafe {
-            let p = pin.epoch.as_ptr().add(offset as usize) as *mut u32;
-            AtomicU32::from_ptr(p).store(new, Ordering::Release);
-        }
-        Ok(())
-    }
-
-    /// Unconditional little-endian `u64` store (Release). Head sole-writer path.
-    pub fn store_u64_le(&self, offset: u64, new: u64) -> Result<(), StoreError> {
-        if offset % 8 != 0 {
-            return Err(StoreError::Corrupt("store_u64 unaligned"));
-        }
-        let end = offset.saturating_add(8);
-        let len = self.published_len.load(Ordering::Acquire);
-        if end > len {
-            return Err(StoreError::Corrupt("store_u64 past logical end"));
-        }
-        let pin = self.pin();
-        if end > pin.epoch.cap() {
-            return Err(StoreError::Corrupt("store_u64 past map end"));
-        }
-        // SAFETY: aligned offset within published+capacity pin.
-        unsafe {
-            let p = pin.epoch.as_ptr().add(offset as usize) as *mut u64;
-            AtomicU64::from_ptr(p).store(new, Ordering::Release);
-        }
-        Ok(())
-    }
-
     /// Ensure the mmap covers at least `need` bytes.
     ///
     /// Capacity growth: fallocate (or set_len) then map a **new** epoch over the
@@ -1007,16 +961,14 @@ mod advise_tests {
         f.write_at(FILE_HEADER_LEN as u64, &payload).unwrap();
         let off32 = FILE_HEADER_LEN as u64; // aligned
         let off64 = FILE_HEADER_LEN as u64 + 8;
-        f.store_u32_le(off32, 0x1122_3344).unwrap();
+        // Plain mmap slot writes (head insert path uses write_at, not atomics).
+        f.write_at(off32, &0x1122_3344u32.to_le_bytes()).unwrap();
         assert_eq!(f.load_u32_le(off32).unwrap(), 0x1122_3344);
-        f.store_u64_le(off64, 0x0102_0304_0506_0708).unwrap();
+        f.write_at(off64, &0x0102_0304_0506_0708u64.to_le_bytes())
+            .unwrap();
         assert_eq!(f.load_u64_le(off64).unwrap(), 0x0102_0304_0506_0708);
         assert!(matches!(
             f.load_u32_le(off32 + 1),
-            Err(StoreError::Corrupt(_))
-        ));
-        assert!(matches!(
-            f.store_u64_le(off64 + 1, 0),
             Err(StoreError::Corrupt(_))
         ));
         assert!(matches!(
@@ -1208,9 +1160,13 @@ mod advise_tests {
             .unwrap();
         let u = f.load_u32_le(FILE_HEADER_LEN as u64).unwrap();
         assert_eq!(u, u32::from_le_bytes([1, 2, 3, 4]));
-        f.store_u32_le(FILE_HEADER_LEN as u64, 0x1122_3344).unwrap();
-        f.store_u64_le(FILE_HEADER_LEN as u64, 0x0102_0304_0506_0708)
+        f.write_at(FILE_HEADER_LEN as u64, &0x1122_3344u32.to_le_bytes())
             .unwrap();
+        f.write_at(
+            FILE_HEADER_LEN as u64,
+            &0x0102_0304_0506_0708u64.to_le_bytes(),
+        )
+        .unwrap();
         let _ = f.load_u64_le(FILE_HEADER_LEN as u64).unwrap();
         f.zero_range(FILE_HEADER_LEN as u64, 8).unwrap();
         f.set_logical_len(FILE_HEADER_LEN as u64 + 8).unwrap();

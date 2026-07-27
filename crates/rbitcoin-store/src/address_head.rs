@@ -5,16 +5,20 @@
 //! Callers verify identity via Class A body txid on **lookup**.
 //!
 //! **Insert (sole writer):** probe until the **same fk** is already present
-//! (idempotent) or an **empty** slot — plain **Release** store `0 → fk` (no CAS).
-//! **No body_txid** on insert (no BIP30 displacement on write). Foreigners and
-//! older same-txid creates are skipped blindly; a second Class A row for the same
-//! txid lands at the next empty slot (deeper on the probe chain).
+//! (idempotent) or an **empty** slot — plain mmap store `0 → fk` (no CAS, no
+//! per-slot atomics). **No body_txid** on insert (no BIP30 displacement on write).
+//! Foreigners and older same-txid creates are skipped blindly; a second Class A
+//! row for the same txid lands at the next empty slot (deeper on the probe chain).
+//!
+//! **`insert_many` batching:** stable-sort by probe **page** then original index
+//! (preserves call order within a page for rare same-batch duplicate txids). One
+//! page load + multi-insert in RAM + plain slot stores per dirty slot, then a
+//! **SeqCst fence** so concurrent page loads + Acquire fence observe the batch.
 //!
 //! **Concurrency:** at most **one** thread may insert into a given `tx.head`
 //! (archive writer in IBD; single tip accept path after). Multi-writer races are
-//! not supported. After each insert batch, a **SeqCst fence** publishes stores for
-//! concurrent readers (Acquire loads on probe). Online resize still uses
-//! `write_lock` only for final catch-up + file swap.
+//! not supported. Online resize still uses `write_lock` only for final catch-up
+//! + file swap.
 //!
 //! **Lookup:** walk candidates from the **last occupied** probe slot toward the
 //! first, body-verify — so the deepest same-txid create wins (newest under
@@ -789,7 +793,7 @@ impl AddressHead {
             return Ok(0);
         }
         self.file.read_at(off, &mut buf[..need])?;
-        // Pair with sole-writer Release stores + SeqCst fence after insert_many.
+        // Pair with sole-writer stores + SeqCst fence after insert_many.
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         Ok(need)
     }
@@ -822,22 +826,25 @@ impl AddressHead {
         Ok(())
     }
 
-    /// Insert one mapping (no body IO). Sole writer: Release store into empty slot.
+    /// Insert one mapping (no body IO). Sole writer.
     pub fn insert(&self, txid: &[u8; 32], new_fk: Fk) -> Result<(), StoreError> {
         self.insert_many(&[(*txid, new_fk)])
     }
 
-    /// Unconditional empty-slot store (Release). Sole-writer only.
-    fn store_entry(&self, slot: u64, new: u64) -> Result<(), StoreError> {
+    /// Plain mmap write of one create_fk slot (sole writer; no atomic RMW).
+    ///
+    /// Visibility for concurrent probes is via the **SeqCst fence** at the end of
+    /// [`Self::insert_many`] (paired with Acquire fence in [`Self::load_page_slots`]).
+    fn store_entry_plain(&self, slot: u64, new: u64) -> Result<(), StoreError> {
         let off = self.entry_off(slot);
         match self.layout.entry_bytes {
             4 => {
                 if new > u64::from(u32::MAX) {
                     return Err(StoreError::InvalidFk);
                 }
-                self.file.store_u32_le(off, new as u32)
+                self.file.write_at(off, &(new as u32).to_le_bytes())
             }
-            8 => self.file.store_u64_le(off, new),
+            8 => self.file.write_at(off, &new.to_le_bytes()),
             _ => Err(StoreError::Corrupt("address head entry_bytes")),
         }
     }
@@ -850,44 +857,62 @@ impl AddressHead {
         }
     }
 
-    /// Sole-writer insert into first empty **in-page** probe slot (no CAS).
+    /// Bulk insert: **stable sort by probe page**, then original index (preserves
+    /// call order within a page for rare same-batch duplicate txids).
     ///
-    /// Idempotent if `new_fk` is already on the chain. Loads **one page**, then
-    /// double-hash hops in memory.
-    fn insert_one(&self, txid: &[u8; 32], new_fk: Fk) -> Result<(), StoreError> {
-        let bits = self.layout.bits;
-        let es = self.layout.entry_bytes;
-        let page_slots = page_slot_count(bits);
-        let page_base = page_base_for_txid(txid, bits);
-        let mut buf = [0u8; PROBE_REGION_BYTES];
-        let n = self.load_page_slots(page_base, page_slots, &mut buf)?;
-        let es_u = es as usize;
-        if n < es_u {
-            note_probe_exhausted();
-            return Err(StoreError::Corrupt("address head probe page empty"));
-        }
-        let outcome = insert_fk_into_page_buf(&mut buf[..n], page_base, bits, es, txid, new_fk)?;
-        if outcome.wrote_new {
-            note_probe_depth_on_insert(outcome.depth);
-            let global = page_base + outcome.empty_local;
-            self.store_entry(global, outcome.stored_fk)?;
-            self.occupied.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(())
-    }
-
-    /// Bulk insert in **call order** (no sort, no page coalescing). Each entry is
-    /// one page load + in-page hop + Release store. **SeqCst fence** at end so
-    /// concurrent Acquire probes observe the batch.
+    /// Per page: one [`load_page_slots`], multi [`insert_fk_into_page_buf`], plain
+    /// slot stores for new empties. **SeqCst fence** once at end.
     ///
     /// Does **not** take [`lock_writes`] — that is only for resize swap.
     pub fn insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
         }
-        for (txid, fk) in entries {
-            self.insert_one(txid, *fk)?;
+        let bits = self.layout.bits;
+        let es = self.layout.entry_bytes;
+        let page_slots = page_slot_count(bits);
+        let es_u = es as usize;
+
+        // (page_base, orig_i, txid, fk) — stable by page then plan order.
+        let mut work: Vec<(u64, usize, [u8; 32], Fk)> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (txid, fk))| (page_base_for_txid(txid, bits), i, *txid, *fk))
+            .collect();
+        work.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut buf = [0u8; PROBE_REGION_BYTES];
+        let mut i = 0;
+        while i < work.len() {
+            let page_base = work[i].0;
+            let mut j = i + 1;
+            while j < work.len() && work[j].0 == page_base {
+                j += 1;
+            }
+
+            let n = self.load_page_slots(page_base, page_slots, &mut buf)?;
+            if n < es_u {
+                note_probe_exhausted();
+                return Err(StoreError::Corrupt("address head probe page empty"));
+            }
+
+            let mut n_new = 0u64;
+            for &(_, _, ref txid, fk) in &work[i..j] {
+                let outcome =
+                    insert_fk_into_page_buf(&mut buf[..n], page_base, bits, es, txid, fk)?;
+                if outcome.wrote_new {
+                    note_probe_depth_on_insert(outcome.depth);
+                    let global = page_base + outcome.empty_local;
+                    self.store_entry_plain(global, outcome.stored_fk)?;
+                    n_new = n_new.saturating_add(1);
+                }
+            }
+            if n_new > 0 {
+                self.occupied.fetch_add(n_new, Ordering::Relaxed);
+            }
+            i = j;
         }
+
         std::sync::atomic::fence(Ordering::SeqCst);
         Ok(())
     }
@@ -1502,7 +1527,7 @@ mod tests {
         let _ = std::fs::remove_file(meta_path(&path));
     }
 
-    /// Many inserts spanning multiple pages in batch order (no page coalescing).
+    /// Many inserts spanning multiple pages (page-coalesced; call order within page).
     #[test]
     fn insert_many_batch_order_multi_page() {
         let path = tmp("batch_order");
@@ -1538,12 +1563,41 @@ mod tests {
         let _ = std::fs::remove_file(meta_path(&path));
     }
 
+    /// Same txid twice in one batch: later fk is deeper; plan order preserved
+    /// under page sort (stable by orig_i).
+    #[test]
+    fn insert_many_same_txid_preserves_depth_order() {
+        let path = tmp("same_txid");
+        let h = AddressHead::create_with_bits(&path, 14).unwrap();
+        let txid = [0xab; 32];
+        // Interleave with other pages so sort reorders globally but keeps orig_i
+        // order within this page for the two same-txid inserts.
+        let mut other = [0xcd; 32];
+        other[0] = 0x11;
+        let entries = [
+            (txid, Fk(1)),
+            (other, Fk(99)),
+            (txid, Fk(2)),
+        ];
+        h.insert_many(&entries).unwrap();
+        assert_eq!(h.occupied(), 3);
+        let cands = h.probe_fks(&txid).unwrap();
+        assert_eq!(cands.len(), 2, "two creates on chain: {cands:?}");
+        // probe_fks is home→deep (hop order); first insert is shallower.
+        assert_eq!(cands[0], Fk(1));
+        assert_eq!(cands[1], Fk(2));
+        // Deepest wins for body resolve semantics.
+        assert_eq!(*cands.last().unwrap(), Fk(2));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(meta_path(&path));
+    }
+
     #[test]
     fn insert_many_sole_no_sort_roundtrip() {
         let path = tmp("sole");
         let h = AddressHead::create_with_bits(&path, 14).unwrap();
         let mut entries = Vec::new();
-        // Unsorted / reverse-ish order (no primary-slot sort on sole path).
+        // Reverse-ish order; page coalescing still finds all.
         for i in (1..=80u64).rev() {
             let mut txid = [0u8; 32];
             txid[0] = (i & 0xff) as u8;

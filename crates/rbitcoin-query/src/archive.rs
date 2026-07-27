@@ -24,8 +24,10 @@ pub struct ArchiveWritePlan {
     pub planned_fks: Vec<Fk>,
     pub per_header_ranges: Vec<(Fk, Fk, u32)>,
     pub spends: Vec<([u8; 32], u32, Fk, u32)>,
+    /// Creates from **this** batch only — published to sticky after head insert.
+    /// Parents resolved via durable `tx.head` are **not** sticky-published (they
+    /// thrash the FIFO with long-tail keys and evict recent creates).
     pub sticky_creates: Vec<([u8; 32], Fk)>,
-    pub head_resolved: Vec<([u8; 32], Fk)>,
     pub index_tx: bool,
     pub body_est: u64,
     /// Snapshot of “far ahead of confirm” at plan time.
@@ -40,7 +42,6 @@ impl ArchiveWritePlan {
             per_header_ranges: Vec::new(),
             spends: Vec::new(),
             sticky_creates: Vec::new(),
-            head_resolved: Vec::new(),
             index_tx: false,
             body_est: 0,
             advise_dont_need: false,
@@ -290,7 +291,6 @@ impl Query {
         }
         let head_need_n = need_head.len() as u64;
         let mut head_hit_n = 0u64;
-        let mut head_resolved: Vec<([u8; 32], Fk)> = Vec::new();
 
         if !need_head.is_empty() {
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
@@ -298,7 +298,6 @@ impl Query {
             for (txid, fk_opt) in hits {
                 if let Some(fk) = fk_opt {
                     resolved.insert(txid, fk);
-                    head_resolved.push((txid, fk));
                     head_hit_n = head_hit_n.saturating_add(1);
                 }
             }
@@ -385,7 +384,6 @@ impl Query {
             per_header_ranges,
             spends,
             sticky_creates,
-            head_resolved,
             index_tx,
             body_est,
             advise_dont_need,
@@ -491,13 +489,11 @@ impl Query {
         let htxs_ns = t.elapsed().as_nanos() as u64;
 
         // Sticky only after head batch is published (fence in head_insert_many).
+        // Publish **this batch's creates only** — not parents just looked up from
+        // durable head (those thrash FIFO with cold long-tail keys).
         // Writer then drops in-flight txid→fk so prep uses sticky/head next.
         let t = Instant::now();
         self.archive_txid_sticky.insert_many(&plan.sticky_creates);
-        if !plan.head_resolved.is_empty() {
-            self.archive_txid_sticky
-                .insert_many(&plan.head_resolved);
-        }
         let sticky_ns = t.elapsed().as_nanos() as u64;
 
         let t = Instant::now();
@@ -763,6 +759,71 @@ mod tests {
         q.archive_commit_plan(plan_a).unwrap();
         q.archive_commit_plan(plan_b).unwrap();
         assert_eq!(q.tx_body_count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sticky must only receive this batch's creates — not parents resolved via
+    /// durable `tx.head` (regression: head hits used to FIFO-pollute sticky).
+    #[test]
+    fn sticky_publish_creates_only_not_head_resolved_parents() {
+        use std::collections::HashMap;
+        let (dir, q) = temp_query("sticky-creates-only");
+        // Parent on disk + head, but **not** in sticky (direct store put).
+        let parent = coinbase_apply(1);
+        let parent_txid = parent.tx.txid;
+        q.store
+            .txs
+            .put_full_batch_indexed(
+                &[(parent.tx, parent.inputs, parent.outputs)],
+                /*index=*/ true,
+            )
+            .unwrap();
+        assert_eq!(q.tx_body_count(), 1);
+        assert_eq!(q.archive_txid_sticky_stats().0, 0);
+
+        let mut child_txid = [0u8; 32];
+        child_txid[0] = 0xcd;
+        let child = TxApply {
+            tx: TxRecord {
+                txid: child_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: parent_txid,
+                create_fk: Fk::NULL,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+        };
+        let mut need = vec![(Fk(2), vec![child])];
+        let plan = q
+            .archive_plan_mega_from(&mut need, 2, &HashMap::new())
+            .expect("parent via head");
+        assert_eq!(plan.planned_fks, vec![Fk(2)]);
+        assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
+        assert_eq!(plan.sticky_creates.len(), 1);
+        assert_eq!(plan.sticky_creates[0].0, child_txid);
+
+        q.archive_commit_plan(plan).unwrap();
+        let (len, _) = q.archive_txid_sticky_stats();
+        assert_eq!(len, 1, "sticky must hold only the new create");
+        let hits = q
+            .archive_txid_sticky
+            .lookup_batch(&[parent_txid, child_txid]);
+        assert!(
+            !hits.contains_key(&parent_txid),
+            "head-resolved parent must not be sticky-published"
+        );
+        assert_eq!(hits.get(&child_txid).copied(), Some(Fk(2)));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

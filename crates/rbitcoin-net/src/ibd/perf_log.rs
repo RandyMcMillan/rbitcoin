@@ -875,8 +875,10 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.pipe.write_coalesce_ms(),
         s.pipe.prep_ms(),
     ));
+    // head_rd = durable parent create_fk **reads** (get_fk_by_txid_batch + subtimers).
+    // head_wr = archive **inserts** of this batch's creates (head_insert_many).
     out.push_str(&format!(
-        " | arch_prep total={} struct={} assign={} collect={} sticky={} inflight={} head={} (probe={} idx={} body={} keys={} cands={} lookups={}) stamp={} finish={} publish={} qwait={} blks={}",
+        " | arch_prep total={} struct={} assign={} collect={} sticky={} inflight={} head_rd={} (probe={} idx={} body={} keys={} cands={} lookups={}) stamp={} finish={} publish={} qwait={} blks={}",
         s.arch_prep_total_ms,
         s.arch_prep_struct_ms,
         s.arch_prep_assign_ms,
@@ -898,7 +900,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     ));
     append_nz(&mut out, "prep_filter", s.arch_prep_filter_ms);
     out.push_str(&format!(
-        " | arch_write total={} body={} head={} sticky={} dontneed={} flush={} blks={}",
+        " | arch_write total={} body={} head_wr={} sticky={} dontneed={} flush={} blks={}",
         s.arch_write_total_ms,
         s.arch_write_body_ms,
         s.arch_write_head_ms,

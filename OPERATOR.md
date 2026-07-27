@@ -54,6 +54,11 @@ Default: **info**. CLI wins over env.
 
 At **info**, you only get progress + slim perf. Enable **debug** when diagnosing archive sticky, prep vs write, or pin body_io. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters.
 
+**Archive `tx.head` split (perf_dbg):** `arch_prep … head_rd=` is parent
+**read** resolve (`get_fk_by_txid_batch`, with `probe` / `idx` / `body` subtimers).
+`arch_write … head_wr=` is create **insert** (`head_insert_many`). Sticky only
+caches this batch’s creates (not head-resolved parents).
+
 ## Defaults and memory budgets
 
 | Knob | Default | Override |

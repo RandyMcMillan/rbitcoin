@@ -7,9 +7,9 @@
 use bitcoin::hashes::Hash;
 use bitcoin::key::XOnlyPublicKey;
 use bitcoin::secp256k1::Message;
-use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+use bitcoin::sighash::{Annex, Prevouts, SighashCache, TapSighashType};
 use bitcoin::taproot::ControlBlock;
-use bitcoin::Transaction;
+use bitcoin::{Transaction, Witness};
 
 use super::crypto;
 use super::interpreter::{self, EvalContext, SigVersion};
@@ -32,15 +32,27 @@ pub(crate) fn verify(
         return Err(ConsensusError::Script("p2tr empty witness".into()));
     }
 
-    // Key-path: one element, or sig + annex.
-    if wit_len == 1 || (wit_len == 2 && is_annex(input.witness.nth(wit_len - 1).unwrap_or(&[]))) {
+    // Key-path: one element, or sig + annex (BIP341: annex = last stack item
+    // starting with 0x50 when there are ≥2 items).
+    if wit_len == 1 || (wit_len == 2 && bip341_annex(&input.witness).is_some()) {
         return verify_key_path(job, input_index, tx, output_key, cache);
     }
     verify_script_path(job, input_index, tx, output_key)
 }
 
-fn is_annex(item: &[u8]) -> bool {
-    !item.is_empty() && item[0] == 0x50
+/// BIP341 annex: last witness item, only when `len ≥ 2` and first byte is `0x50`.
+///
+/// Shared with tapscript CHECKSIG sighash (must include annex when present).
+pub(crate) fn bip341_annex(witness: &Witness) -> Option<&[u8]> {
+    if witness.len() < 2 {
+        return None;
+    }
+    let last = witness.last()?;
+    if !last.is_empty() && last[0] == 0x50 {
+        Some(last)
+    } else {
+        None
+    }
 }
 
 fn verify_key_path(
@@ -50,7 +62,6 @@ fn verify_key_path(
     output_key: &[u8],
     cache: &mut SighashCache<&Transaction>,
 ) -> Result<(), ConsensusError> {
-    let _ = tx;
     let input = &tx.input[input_index];
     // Borrow witness sig bytes (no heap copy for the common 64/65-byte path).
     let sig_raw = input
@@ -74,8 +85,15 @@ fn verify_key_path(
         .map_err(|_| ConsensusError::Script("p2tr schnorr parse".into()))?;
 
     let prevouts = Prevouts::All(&job.prevouts);
+    // BIP341: when the annex is present it is part of spend_type / sighash.
+    // `taproot_key_spend_signature_hash` always passes annex=None — wrong for
+    // annex spends (mainnet 896078 / f859a4e6… style).
+    let annex = bip341_annex(&input.witness)
+        .map(Annex::new)
+        .transpose()
+        .map_err(|_| ConsensusError::Script("p2tr annex".into()))?;
     let sighash = cache
-        .taproot_key_spend_signature_hash(input_index, &prevouts, sighash_ty)
+        .taproot_signature_hash(input_index, &prevouts, annex, None, sighash_ty)
         .map_err(|_| ConsensusError::Script("p2tr sighash".into()))?;
     let msg = Message::from_digest(sighash.to_byte_array());
     crypto::SECP.with(|secp| {
@@ -95,7 +113,8 @@ fn verify_script_path(
         .filter_map(|i| input.witness.nth(i).map(|b| b.to_vec()))
         .collect();
 
-    if items.last().map(|x| is_annex(x)).unwrap_or(false) {
+    // Strip annex from the initial stack (still included in CHECKSIG sighash).
+    if bip341_annex(&input.witness).is_some() {
         items.pop();
     }
     if items.len() < 2 {
@@ -331,6 +350,263 @@ mod bip341_tests {
         taproot_active: true,
         };
         script::verify_job_all_inputs(&job).expect("p2tr key path");
+    }
+
+    /// BIP341: annex (last item starting with 0x50) is part of the key-path sighash.
+    /// Signing without annex while spending with annex must fail; with annex, pass.
+    #[test]
+    fn key_path_annex_must_enter_sighash() {
+        use bitcoin::sighash::Annex;
+
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        let tweaked: TweakedKeypair = kp.tap_tweak(&secp, None);
+        let output_key = tweaked.to_keypair().x_only_public_key().0;
+        let prevout = TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: p2tr_spk(output_key),
+        };
+        let mut tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let annex_bytes: &[u8] = &[0x50, 0x00, 0xde, 0xad]; // Libre-legal payload
+        let prevouts = Prevouts::All(std::slice::from_ref(&prevout));
+
+        // Sign WITHOUT annex, spend WITH annex → must fail (historical bug).
+        {
+            let mut cache = SighashCache::new(&tx);
+            let sh = cache
+                .taproot_key_spend_signature_hash(0, &prevouts, TapSighashType::Default)
+                .unwrap();
+            let sig = secp.sign_schnorr_no_aux_rand(
+                &Message::from_digest(sh.to_byte_array()),
+                &tweaked.to_keypair(),
+            );
+            let sig_v = sig.as_ref().to_vec();
+            let annex_v = annex_bytes.to_vec();
+            tx.input[0].witness = Witness::from_slice(&[sig_v.as_slice(), annex_v.as_slice()]);
+            let job = ScriptCheckJob {
+                prevouts: vec![prevout.clone()],
+                tx: tx.clone(),
+                bip65_active: true,
+                bip112_active: true,
+                bip66_active: true,
+                bip16_active: true,
+                taproot_active: true,
+            };
+            let err = script::verify_job_all_inputs(&job).unwrap_err();
+            assert!(
+                format!("{err}").contains("schnorr") || format!("{err}").contains("script"),
+                "missing annex in sighash should fail: {err}"
+            );
+        }
+
+        // Sign WITH annex → must pass.
+        {
+            let annex = Annex::new(annex_bytes).unwrap();
+            let mut cache = SighashCache::new(&tx);
+            let sh = cache
+                .taproot_signature_hash(
+                    0,
+                    &prevouts,
+                    Some(annex),
+                    None,
+                    TapSighashType::Default,
+                )
+                .unwrap();
+            let sig = secp.sign_schnorr_no_aux_rand(
+                &Message::from_digest(sh.to_byte_array()),
+                &tweaked.to_keypair(),
+            );
+            let sig_v = sig.as_ref().to_vec();
+            let annex_v = annex_bytes.to_vec();
+            tx.input[0].witness = Witness::from_slice(&[sig_v.as_slice(), annex_v.as_slice()]);
+            let job = ScriptCheckJob {
+                prevouts: vec![prevout],
+                tx: tx.clone(),
+                bip65_active: true,
+                bip112_active: true,
+                bip66_active: true,
+                bip16_active: true,
+                taproot_active: true,
+            };
+            script::verify_job_all_inputs(&job).expect("key path + annex");
+        }
+    }
+
+    /// Empty annex tag only (`[0x50]`) is still an annex for BIP341.
+    #[test]
+    fn key_path_empty_annex_payload() {
+        use bitcoin::sighash::Annex;
+
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[8u8; 32]).unwrap();
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        let tweaked: TweakedKeypair = kp.tap_tweak(&secp, None);
+        let output_key = tweaked.to_keypair().x_only_public_key().0;
+        let prevout = TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: p2tr_spk(output_key),
+        };
+        let annex_bytes: &[u8] = &[0x50];
+        let mut tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let prevouts = Prevouts::All(std::slice::from_ref(&prevout));
+        let annex = Annex::new(annex_bytes).unwrap();
+        let mut cache = SighashCache::new(&tx);
+        let sh = cache
+            .taproot_signature_hash(0, &prevouts, Some(annex), None, TapSighashType::Default)
+            .unwrap();
+        // Annex-less sighash differs.
+        let sh_no = cache
+            .taproot_key_spend_signature_hash(0, &prevouts, TapSighashType::Default)
+            .unwrap();
+        assert_ne!(sh, sh_no);
+        let sig = secp.sign_schnorr_no_aux_rand(
+            &Message::from_digest(sh.to_byte_array()),
+            &tweaked.to_keypair(),
+        );
+        let sig_v = sig.as_ref().to_vec();
+        let annex_v = annex_bytes.to_vec();
+        tx.input[0].witness = Witness::from_slice(&[sig_v.as_slice(), annex_v.as_slice()]);
+        let job = ScriptCheckJob {
+            prevouts: vec![prevout],
+            tx,
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+        };
+        script::verify_job_all_inputs(&job).expect("empty annex payload");
+    }
+
+    /// Script-path stack with annex: CHECKSIG must bind annex in sighash.
+    #[test]
+    fn script_path_annex_checksig() {
+        use bitcoin::sighash::Annex;
+        use bitcoin::taproot::LeafVersion;
+        use bitcoin::TapLeafHash;
+
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let kp = Keypair::from_secret_key(&secp, &sk);
+        let (xonly, _) = kp.x_only_public_key();
+        // leaf: <xonly> CHECKSIG
+        let mut leaf_bytes = vec![0x20];
+        leaf_bytes.extend_from_slice(&xonly.serialize());
+        leaf_bytes.push(0xac);
+        let leaf = ScriptBuf::from_bytes(leaf_bytes);
+
+        let internal_sk = SecretKey::from_slice(&[10u8; 32]).unwrap();
+        let internal_kp = Keypair::from_secret_key(&secp, &internal_sk);
+        let (internal_xonly, _) = internal_kp.x_only_public_key();
+        let builder = TaprootBuilder::new()
+            .add_leaf(0, leaf.clone())
+            .expect("leaf");
+        let spend_info = builder.finalize(&secp, internal_xonly).expect("finalize");
+        let output_key = spend_info.output_key().to_x_only_public_key();
+        let control = spend_info
+            .control_block(&(leaf.clone(), LeafVersion::TapScript))
+            .expect("control");
+
+        let prevout = TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: p2tr_spk(output_key),
+        };
+        let annex_bytes: &[u8] = &[0x50, 0x00];
+        let mut tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let leaf_hash = TapLeafHash::from_script(leaf.as_script(), LeafVersion::TapScript);
+        let prevouts = Prevouts::All(std::slice::from_ref(&prevout));
+        let annex = Annex::new(annex_bytes).unwrap();
+        let mut cache = SighashCache::new(&tx);
+        let sh = cache
+            .taproot_signature_hash(
+                0,
+                &prevouts,
+                Some(annex),
+                Some((leaf_hash, 0xFFFF_FFFF)),
+                TapSighashType::Default,
+            )
+            .unwrap();
+        let sig = secp.sign_schnorr_no_aux_rand(
+            &Message::from_digest(sh.to_byte_array()),
+            &kp,
+        );
+        let ctrl = control.serialize();
+        let sig_v = sig.as_ref().to_vec();
+        let leaf_v = leaf.as_bytes().to_vec();
+        let annex_v = annex_bytes.to_vec();
+        tx.input[0].witness = Witness::from_slice(&[
+            sig_v.as_slice(),
+            leaf_v.as_slice(),
+            ctrl.as_slice(),
+            annex_v.as_slice(),
+        ]);
+        let job = ScriptCheckJob {
+            prevouts: vec![prevout],
+            tx,
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+        };
+        script::verify_job_all_inputs(&job).expect("script path + annex CHECKSIG");
+    }
+
+    #[test]
+    fn bip341_annex_detection_edges() {
+        // <2 items: never annex
+        let w1 = Witness::from_slice(&[vec![0x50]]);
+        assert!(bip341_annex(&w1).is_none());
+        assert!(bip341_annex(&Witness::new()).is_none());
+        // 2 items, last not 0x50
+        let w2 = Witness::from_slice(&[vec![1], vec![0xc0, 1, 2]]);
+        assert!(bip341_annex(&w2).is_none());
+        // 2 items, last is annex
+        let w3 = Witness::from_slice(&[vec![1], vec![0x50]]);
+        assert_eq!(bip341_annex(&w3), Some(&[0x50][..]));
+        // empty last (no 0x50)
+        let w4 = Witness::from_slice(&[vec![1], vec![]]);
+        assert!(bip341_annex(&w4).is_none());
     }
 
     /// Two-leaf tree: spend the right leaf so the control block carries a

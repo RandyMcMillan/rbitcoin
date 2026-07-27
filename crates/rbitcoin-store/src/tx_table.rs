@@ -692,8 +692,8 @@ fn head_fill_wave() -> u64 {
 }
 
 pub struct TxTable {
-    body: VarTable,
-    head: RwLock<AddressHead>,
+    pub(crate) body: VarTable,
+    pub(crate) head: RwLock<AddressHead>,
     /// Directory containing `tx.head` (for rename / control paths).
     head_path: PathBuf,
     resize: Mutex<Option<HeadResize>>,
@@ -1267,12 +1267,43 @@ impl TxTable {
 
     /// Batch head resolve (archive prep bulk path).
     ///
-    /// **Probe:** one full **page** pread per key (io_uring / parallel), then
-    /// in-page double-hash hop in RAM. **Then** idx + body-prefix waves for all
-    /// candidates. BIP30: deepest matching body wins.
+    /// Default when io_uring is available: **streaming** resolve
+    /// ([`crate::head_resolve_stream`]) — mmap probe/idx + completion-driven
+    /// body prefix preads (deepest-cand-first early exit).  
+    /// Fallback / `RBITCOIN_HEAD_RESOLVE=batch`: classic phase-barrier
+    /// probe→idx→body via [`crate::bulk_io::pread_batch`].
     ///
-    /// Timers: [`crate::head_resolve_stats`] probe / idx / body (per-wave wall).
+    /// BIP30: deepest matching body wins.
+    /// Timers: [`crate::head_resolve_stats`] probe / idx / body.
     pub fn get_fk_by_txid_batch(
+        &self,
+        txids: &[[u8; 32]],
+    ) -> Result<Vec<([u8; 32], Option<Fk>)>, StoreError> {
+        if txids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prefer_batch = std::env::var("RBITCOIN_HEAD_RESOLVE")
+            .map(|s| {
+                let s = s.to_ascii_lowercase();
+                s == "batch" || s == "bulk" || s == "0"
+            })
+            .unwrap_or(false);
+        if !prefer_batch && crate::bulk_io::io_uring_enabled() {
+            match crate::head_resolve_stream::resolve_batch_streaming(self, txids) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    // Streaming setup failed (rare) — fall through to batch path.
+                    rbitcoin_log::debug!(
+                        "store: streaming head resolve unavailable ({e}); using batch path"
+                    );
+                }
+            }
+        }
+        self.get_fk_by_txid_batch_phased(txids)
+    }
+
+    /// Phase-barrier bulk pread path (probe all → idx all → body all).
+    pub(crate) fn get_fk_by_txid_batch_phased(
         &self,
         txids: &[[u8; 32]],
     ) -> Result<Vec<([u8; 32], Option<Fk>)>, StoreError> {
@@ -4234,6 +4265,62 @@ mod tests {
                 assert!(!o.multi_spender);
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Streaming early-exit: deepest match → fewer body_lookups than cand count.
+    #[test]
+    fn streaming_resolve_early_exit_fewer_body_lookups() {
+        if !crate::bulk_io::io_uring_enabled() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-stream-early-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = create_tiny(&dir);
+        let txid = [0xcd; 32];
+        let mk = |hint: u8| {
+            let rec = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![hint],
+                witness: vec![],
+            }];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+            (rec, inputs, outputs)
+        };
+        // Two creates of same txid → two cands; deepest (second) should match first try.
+        let _fk1 = t.put_full_batch_indexed(&[mk(1)], true).unwrap()[0];
+        let fk2 = t.put_full_batch_indexed(&[mk(2)], true).unwrap()[0];
+        let _ = crate::head_resolve_stats::sample_and_reset();
+        let batch = t.get_fk_by_txid_batch(&[txid]).unwrap();
+        assert_eq!(batch[0].1, Some(fk2));
+        let s = crate::head_resolve_stats::sample_and_reset();
+        // Deepest-first early exit: one body lookup even if probe returned 2 cands.
+        assert!(
+            s.body_lookups <= s.cands,
+            "body_lookups {} > cands {}",
+            s.body_lookups,
+            s.cands
+        );
+        assert_eq!(s.body_lookups, 1, "early exit should verify only deepest cand");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

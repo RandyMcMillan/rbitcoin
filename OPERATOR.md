@@ -59,6 +59,11 @@ At **info**, you only get progress + slim perf. Enable **debug** when diagnosing
 `arch_write … head_wr=` is create **insert** (`head_insert_many`). Sticky only
 caches this batch’s creates (not head-resolved parents).
 
+**Archive head resolve (default):** streaming — **mmap** probe + idx, **io_uring**
+body-prefix verify, deepest-cand-first early exit. Force the old phase-barrier
+bulk path with `RBITCOIN_HEAD_RESOLVE=batch`. `RBITCOIN_IO_URING=0` falls back to
+batch automatically.
+
 ## Defaults and memory budgets
 
 | Knob | Default | Override |

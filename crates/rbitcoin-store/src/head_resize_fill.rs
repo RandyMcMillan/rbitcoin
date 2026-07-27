@@ -21,34 +21,21 @@ use crate::tx_table::TxTable;
 use crate::var_table::VarTable;
 use rbitcoin_primitives::Fk;
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::RawFd;
 
 /// Prefer starting an idx refill when the ready FK queue is below this.
 const FK_QUEUE_LOW: usize = 256;
 /// Fks covered by one `tx.idx` pread (plus optional next-start for lengths).
 const IDX_BATCH: u64 = 1024;
-const RING_ENTRIES: u32 = 1024;
+const RING_ENTRIES: u32 = crate::uring_session::DEFAULT_ENTRIES;
 const BODY_POOL: usize = 512;
 const PAGE_POOL: usize = 256;
 
-// user_data: high 2 bits = kind, low bits = slot
-const KIND_SHIFT: u64 = 62;
 const KIND_IDX: u64 = 1;
 const KIND_BODY: u64 = 2;
 const KIND_PAGE_RD: u64 = 3;
 const KIND_PAGE_WR: u64 = 0; // 0 so write bit space is clear; use 0b00 with slot
 
-#[inline]
-fn pack_ud(kind: u64, slot: u32) -> u64 {
-    (kind << KIND_SHIFT) | (slot as u64 & ((1u64 << KIND_SHIFT) - 1))
-}
-
-#[inline]
-fn unpack_ud(ud: u64) -> (u64, u32) {
-    let kind = ud >> KIND_SHIFT;
-    let slot = (ud & ((1u64 << KIND_SHIFT) - 1)) as u32;
-    (kind, slot)
-}
+use crate::uring_session::{pack_ud, unpack_ud};
 
 struct BodyWork {
     fk: u64,
@@ -99,7 +86,8 @@ mod tests {
 
     #[test]
     fn shadow_fill_empty_range_and_pack_ud() {
-        assert_eq!(pack_ud(KIND_BODY, 7) >> KIND_SHIFT, KIND_BODY);
+        let (k, s) = unpack_ud(pack_ud(KIND_BODY, 7));
+        assert_eq!((k, s), (KIND_BODY, 7));
         let (k, s) = unpack_ud(pack_ud(KIND_IDX, 42));
         assert_eq!((k, s), (KIND_IDX, 42));
 
@@ -168,7 +156,7 @@ fn run_linux(
     first: u64,
     last: u64,
 ) -> Result<(), StoreError> {
-    use io_uring::{opcode, types, IoUring};
+    use crate::uring_session::UringSession;
 
     let (count_snap, body_end) = {
         // Snapshot for length of last record in a batch.
@@ -196,7 +184,7 @@ fn run_linux(
     let body_path = body.body_file_path().to_path_buf();
     let head_path = shadow.path_str().to_path_buf();
 
-    let mut ring = IoUring::new(RING_ENTRIES).map_err(|e| {
+    let mut session = UringSession::new(RING_ENTRIES).map_err(|e| {
         StoreError::io(
             &head_path,
             std::io::Error::new(std::io::ErrorKind::Other, format!("io_uring: {e}")),
@@ -241,53 +229,17 @@ fn run_linux(
     let mut page_in_flight = 0usize; // reading or writing
     let mut total_new_inserts = 0u64;
 
-    let mut ring_in_flight = 0usize;
     let mut done_fks = 0u64;
     let target_fks = last - first + 1;
 
-    // Push SQE helpers
-    let push_read = |ring: &mut IoUring,
-                     fd: RawFd,
-                     off: u64,
-                     buf: &mut [u8],
-                     ud: u64|
-     -> Result<(), StoreError> {
-        let sqe = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32)
-            .offset(off)
-            .build()
-            .user_data(ud);
-        unsafe {
-            ring.submission()
-                .push(&sqe)
-                .map_err(|_| StoreError::Corrupt("io_uring SQ full"))?;
-        }
-        Ok(())
-    };
-    let push_write = |ring: &mut IoUring,
-                      fd: RawFd,
-                      off: u64,
-                      buf: &[u8],
-                      ud: u64|
-     -> Result<(), StoreError> {
-        let sqe = opcode::Write::new(types::Fd(fd), buf.as_ptr(), buf.len() as u32)
-            .offset(off)
-            .build()
-            .user_data(ud);
-        unsafe {
-            ring.submission()
-                .push(&sqe)
-                .map_err(|_| StoreError::Corrupt("io_uring SQ full"))?;
-        }
-        Ok(())
-    };
-
-    // Closures need to be methods on state — use loop with manual fill
-
-    while done_fks < target_fks || ring_in_flight > 0 || body_in_flight > 0 || page_in_flight > 0
+    while done_fks < target_fks
+        || session.in_flight() > 0
+        || body_in_flight > 0
+        || page_in_flight > 0
     {
         // --- fill submissions ---
         loop {
-            let free_sq = RING_ENTRIES as usize - ring_in_flight;
+            let free_sq = session.free_sq();
             if free_sq == 0 {
                 break;
             }
@@ -307,8 +259,7 @@ fn run_linux(
                 let nbytes = n_starts * 8;
                 let idx_off = FILE_HEADER_LEN as u64 + (bf - 1) * 8;
                 idx_raw[..nbytes].fill(0);
-                push_read(
-                    &mut ring,
+                session.push_pread(
                     idx_fd,
                     idx_off,
                     &mut idx_raw[..nbytes],
@@ -318,7 +269,6 @@ fn run_linux(
                 idx_batch_first = bf;
                 idx_batch_last = bl;
                 idx_need_next = need_next;
-                ring_in_flight += 1;
                 continue;
             }
 
@@ -329,7 +279,7 @@ fn run_linux(
             let mut submitted_body = false;
             while !fk_queue.is_empty()
                 && !body_free.is_empty()
-                && ring_in_flight < RING_ENTRIES as usize
+                && session.free_sq() > 0
             {
                 let w = fk_queue.pop_front().unwrap();
                 let slot = body_free.pop().unwrap();
@@ -338,15 +288,13 @@ fn run_linux(
                 body_work[slot] = Some(w);
                 let buf = &mut body_bufs[slot][..want];
                 let off = body_work[slot].as_ref().unwrap().body_off;
-                push_read(
-                    &mut ring,
+                session.push_pread(
                     body_fd,
                     off,
                     buf,
                     pack_ud(KIND_BODY, slot as u32),
                 )?;
                 body_in_flight += 1;
-                ring_in_flight += 1;
                 submitted_body = true;
             }
             if submitted_body {
@@ -358,7 +306,7 @@ fn run_linux(
             let mut started_page = false;
             let parked: Vec<u64> = page_wait.keys().copied().collect();
             for pb in parked {
-                if ring_in_flight >= RING_ENTRIES as usize || page_free.is_empty() {
+                if session.free_sq() == 0 || page_free.is_empty() {
                     break;
                 }
                 if page_active.contains_key(&pb) {
@@ -387,15 +335,13 @@ fn run_linux(
                 page_pending[ps].append(&mut q);
                 page_active.insert(pb, ps);
                 page_bufs[ps][..plen].fill(0);
-                push_read(
-                    &mut ring,
+                session.push_pread(
                     head_fd,
                     page_off_of[ps],
                     &mut page_bufs[ps][..plen],
                     pack_ud(KIND_PAGE_RD, ps as u32),
                 )?;
                 page_in_flight += 1;
-                ring_in_flight += 1;
                 started_page = true;
             }
             if started_page {
@@ -404,8 +350,8 @@ fn run_linux(
             break;
         }
 
-        ring.submission().sync();
-        if ring_in_flight == 0 {
+        session.sync_submission();
+        if session.in_flight() == 0 {
             if done_fks >= target_fks
                 || (next_idx_fk > last
                     && fk_queue.is_empty()
@@ -422,16 +368,10 @@ fn run_linux(
         }
 
         // Wait for ≥1 completion
-        if ring.submit_and_wait(1).is_err() {
-            return Err(StoreError::Corrupt("io_uring submit_and_wait failed"));
-        }
-        ring.completion().sync();
-
-        let cqes: Vec<_> = ring.completion().map(|c| (c.user_data(), c.result())).collect();
-        ring.completion().sync();
+        session.submit_and_wait_one()?;
+        let cqes = session.harvest_ready();
 
         for (ud, res) in cqes {
-            ring_in_flight = ring_in_flight.saturating_sub(1);
             let (kind, slot) = unpack_ud(ud);
 
             if kind == KIND_IDX {
@@ -504,7 +444,7 @@ fn run_linux(
                 if page_active.contains_key(&pb) {
                     // RMW already active — queue for that page
                     page_wait.entry(pb).or_default().push_back(ins);
-                } else if page_free.is_empty() || ring_in_flight >= RING_ENTRIES as usize {
+                } else if page_free.is_empty() || session.free_sq() == 0 {
                     // No page slot — park on multimap; will start when a page frees
                     page_wait.entry(pb).or_default().push_back(ins);
                 } else {
@@ -523,15 +463,13 @@ fn run_linux(
                     page_pending[ps].push_back(ins);
                     page_active.insert(pb, ps);
                     page_bufs[ps][..plen].fill(0);
-                    push_read(
-                        &mut ring,
+                    session.push_pread(
                         head_fd,
                         page_off_of[ps],
                         &mut page_bufs[ps][..plen],
                         pack_ud(KIND_PAGE_RD, ps as u32),
                     )?;
                     page_in_flight += 1;
-                    ring_in_flight += 1;
                 }
                 continue;
             }
@@ -608,15 +546,13 @@ fn run_linux(
                 debug_assert!(new_n <= 1024);
                 page_len_of[ps] = plen | ((new_n as usize) << 16);
 
-                push_write(
-                    &mut ring,
+                session.push_pwrite(
                     head_fd,
                     page_off_of[ps],
                     &page_bufs[ps][..plen],
                     pack_ud(KIND_PAGE_WR, ps as u32),
                 )?;
                 // still page_in_flight (was reading, now writing)
-                ring_in_flight += 1;
                 continue;
             }
 
@@ -662,15 +598,13 @@ fn run_linux(
                         page_pending[ps2].append(&mut q);
                         page_active.insert(pb, ps2);
                         page_bufs[ps2][..plen2].fill(0);
-                        push_read(
-                            &mut ring,
+                        session.push_pread(
                             head_fd,
                             page_off_of[ps2],
                             &mut page_bufs[ps2][..plen2],
                             pack_ud(KIND_PAGE_RD, ps2 as u32),
                         )?;
                         page_in_flight += 1;
-                        ring_in_flight += 1;
                     } else if !q.is_empty() {
                         page_wait.insert(pb, q);
                     }
@@ -688,7 +622,7 @@ fn run_linux(
             if page_active.contains_key(&pb) {
                 continue;
             }
-            if page_free.is_empty() || ring_in_flight >= RING_ENTRIES as usize {
+            if page_free.is_empty() || session.free_sq() == 0 {
                 break;
             }
             let Some(mut q) = page_wait.remove(&pb) else {
@@ -711,15 +645,13 @@ fn run_linux(
             page_pending[ps].append(&mut q);
             page_active.insert(pb, ps);
             page_bufs[ps][..plen].fill(0);
-            push_read(
-                &mut ring,
+            session.push_pread(
                 head_fd,
                 page_off_of[ps],
                 &mut page_bufs[ps][..plen],
                 pack_ud(KIND_PAGE_RD, ps as u32),
             )?;
             page_in_flight += 1;
-            ring_in_flight += 1;
         }
     }
 

@@ -230,13 +230,10 @@ fn run_uring(
     });
 
     // Validate / pre-mark impossible jobs.
+    // Body-only (range already known) does not require a published fk id —
+    // callers may use synthetic ids when only `(off,len)` is known.
     for i in 0..n {
         let id = jobs[i].id;
-        if id == 0 || id > count {
-            stage[i] = 4;
-            jobs[i].ok = false;
-            continue;
-        }
         if let Some((off, len)) = jobs[i].range {
             let want = mode.body_len(len);
             if want == 0 || off.saturating_add(want) > body_end {
@@ -244,8 +241,10 @@ fn run_uring(
                 jobs[i].ok = false;
             }
             // else stage 0 → arm body only
+        } else if id == 0 || id > count {
+            stage[i] = 4;
+            jobs[i].ok = false;
         } else {
-            // need idx
             let nbytes: u8 = if id < count { 16 } else { 8 };
             idx_nbytes[i] = nbytes;
         }

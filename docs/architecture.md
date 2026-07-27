@@ -7,6 +7,9 @@ indexers.
 
 **Status:** experimental 0.x. On-disk format and APIs are **unstable until 1.0**.
 
+Recent tidy pass (what was deleted vs intentional dual paths):
+[`cleanup-2026-07-27.md`](./cleanup-2026-07-27.md).
+
 ---
 
 ## One-screen picture

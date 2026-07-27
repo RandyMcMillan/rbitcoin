@@ -1311,60 +1311,40 @@ fn mtp_at(
 }
 
 /// Parallel script checks for an owned job slice (preferred entry — no ref `Vec`).
+///
+/// Uses the **rayon global pool** for all non-empty waves. One job = one
+/// non-coinbase tx (shared [`bitcoin::sighash::SighashCache`] across its inputs).
 pub fn verify_scripts_pool(jobs: &[ScriptCheckJob]) -> Result<(), ConsensusError> {
-    verify_script_jobs(jobs)
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    use rayon::prelude::*;
+    jobs.par_iter().try_for_each(verify_one_script_job)
 }
 
-/// Parallel script/sig checks across jobs (possibly from multiple blocks).
-///
-/// Uses the **rayon global pool** for all non-empty waves (including a single
-/// job — one code path). One job = one non-coinbase tx (shared
-/// [`bitcoin::sighash::SighashCache`] across its inputs).
-///
-/// **Why rayon (not a custom tokio queue):** script verify is CPU-bound and
-/// runs on the confirm OS thread outside the async runtime; rayon’s work-stealing
-/// pool is built for that. Wire rebuild stays sequential (see `confirm_run`).
+/// Parallel script checks across borrowed jobs (multi-block wave).
 pub fn verify_scripts_pool_jobs(jobs: &[&ScriptCheckJob]) -> Result<(), ConsensusError> {
-    verify_script_job_refs(jobs)
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    use rayon::prelude::*;
+    jobs.par_iter().try_for_each(|job| verify_one_script_job(*job))
 }
 
+#[inline]
 fn job_needs_script_check(job: &ScriptCheckJob) -> bool {
     job.prevouts
         .iter()
         .any(|p| !is_anyone_can_spend(p.script_pubkey.as_script()))
 }
 
-/// Direct slice path (no intermediate `Vec<&_>`). Always rayon when non-empty.
-fn verify_script_jobs(jobs: &[ScriptCheckJob]) -> Result<(), ConsensusError> {
-    if jobs.is_empty() {
-        return Ok(());
+#[inline]
+fn verify_one_script_job(job: &ScriptCheckJob) -> Result<(), ConsensusError> {
+    if job_needs_script_check(job) {
+        crate::script::verify_job_all_inputs(job)
+    } else {
+        Ok(())
     }
-    use rayon::prelude::*;
-    jobs.par_iter().try_for_each(|job| {
-        if job_needs_script_check(job) {
-            verify_job_all_inputs(job)
-        } else {
-            Ok(())
-        }
-    })
-}
-
-fn verify_script_job_refs(jobs: &[&ScriptCheckJob]) -> Result<(), ConsensusError> {
-    if jobs.is_empty() {
-        return Ok(());
-    }
-    use rayon::prelude::*;
-    jobs.par_iter().try_for_each(|job| {
-        if job_needs_script_check(job) {
-            verify_job_all_inputs(job)
-        } else {
-            Ok(())
-        }
-    })
-}
-
-fn verify_job_all_inputs(job: &ScriptCheckJob) -> Result<(), ConsensusError> {
-    crate::script::verify_job_all_inputs(job)
 }
 
 /// Halving subsidy (mainnet schedule; regtest uses same formula with params).

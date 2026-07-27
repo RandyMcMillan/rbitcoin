@@ -1295,11 +1295,10 @@ impl TxTable {
 
     /// Batch head resolve (archive prep bulk path).
     ///
-    /// Default when io_uring is available: **streaming** resolve
-    /// ([`crate::head_resolve_stream`]) — mmap probe + completion-driven
-    /// **idx then body** preads (deepest-cand-first early exit).
-    /// Fallback / `RBITCOIN_HEAD_RESOLVE=batch`: mmap probe + idx→body pipeline
-    /// ([`crate::idx_body_pipeline`]) Prefix33 for all cands.
+    /// Primary: streaming resolve ([`crate::head_resolve_stream`]) when io_uring
+    /// is available — mmap probe + completion-driven idx→body preads (early exit).
+    /// Fallback (no uring / stream setup fail): phase barrier via
+    /// [`Self::get_fk_by_txid_batch_phased`] (idx→body pipeline Prefix33).
     ///
     /// BIP30: deepest matching body wins.
     /// Timers: [`crate::head_resolve_stats`] probe / idx / body.
@@ -1310,17 +1309,10 @@ impl TxTable {
         if txids.is_empty() {
             return Ok(Vec::new());
         }
-        let prefer_batch = std::env::var("RBITCOIN_HEAD_RESOLVE")
-            .map(|s| {
-                let s = s.to_ascii_lowercase();
-                s == "batch" || s == "bulk" || s == "0"
-            })
-            .unwrap_or(false);
-        if !prefer_batch && crate::bulk_io::io_uring_enabled() {
+        if crate::bulk_io::io_uring_enabled() {
             match crate::head_resolve_stream::resolve_batch_streaming(self, txids) {
                 Ok(v) => return Ok(v),
                 Err(e) => {
-                    // Streaming setup failed (rare) — fall through to batch path.
                     rbitcoin_log::debug!(
                         "store: streaming head resolve unavailable ({e}); using batch path"
                     );
@@ -1330,9 +1322,7 @@ impl TxTable {
         self.get_fk_by_txid_batch_phased(txids)
     }
 
-    /// Phase-barrier resolve: mmap head probe + mmap idx, then bulk body prefixes.
-    ///
-    /// mmap head probe + idx→body pipeline (Prefix33) for all cands; deepest match.
+    /// Phase-barrier resolve: mmap probe + idx→body pipeline (Prefix33) for all cands.
     pub(crate) fn get_fk_by_txid_batch_phased(
         &self,
         txids: &[[u8; 32]],
@@ -1428,10 +1418,10 @@ impl TxTable {
         self.body.record_range_batch(fks)
     }
 
-    /// Bulk full packed decode from known ranges (confirm load create bodies).
+    /// Bulk full packed decode from known ranges.
     ///
-    /// io_uring body preads, then CPU decode. Fourth field is dense spender_rels
-    /// (relative to body_off) for OutFifo pin layout without a second body read.
+    /// Thin decode wrapper over [`crate::idx_body_pipeline`] (body-only jobs).
+    /// Fourth field: dense spender_rels relative to body_off.
     pub fn get_full_batch_at(
         &self,
         ranges: &[(Fk, u64, u64)],
@@ -1439,117 +1429,55 @@ impl TxTable {
         Vec<Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>)>>,
         StoreError,
     > {
-        use crate::bulk_io::{self, ReadOp};
+        use crate::idx_body_pipeline::{run_idx_body_pipeline, BodyMode, IdxBodyJob};
         if ranges.is_empty() {
             return Ok(Vec::new());
         }
-        let body_fd = self.body.body_read_fd();
-        let body_pub = self.body.body_published_len();
-
-        let submitted: Vec<usize> = ranges
+        let mut jobs: Vec<IdxBodyJob> = ranges
             .iter()
-            .enumerate()
-            .filter(|(_, (_, off, len))| *len > 0 && off.saturating_add(*len) <= body_pub)
-            .map(|(i, _)| i)
+            .map(|(fk, off, len)| {
+                let id = fk.get().unwrap_or(0);
+                IdxBodyJob::new(id, Some((*off, *len)))
+            })
             .collect();
-
-        let mut bufs: Vec<Vec<u8>> = ranges
-            .iter()
-            .map(|(_, _, len)| vec![0u8; *len as usize])
-            .collect();
-
-        // SAFETY: each `bufs[i]` is a distinct allocation; submitted indices unique.
-        let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(submitted.len());
-        for &i in &submitted {
-            let off = ranges[i].1;
-            let len = ranges[i].2 as usize;
-            let ptr = bufs[i].as_mut_ptr();
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-            read_ops.push(ReadOp {
-                fd: body_fd,
-                offset: off,
-                buf: slice,
-                result: i32::MIN,
-            });
-        }
-        bulk_io::pread_batch(&mut read_ops);
-
-        let mut out: Vec<Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>)>> =
-            vec![None; ranges.len()];
-        for (ro, &i) in read_ops.iter().zip(submitted.iter()) {
-            if ro.result < 0 || ro.result as u64 != ranges[i].2 {
+        run_idx_body_pipeline(&self.body, &mut jobs, BodyMode::Full)?;
+        let mut out = Vec::with_capacity(jobs.len());
+        for j in jobs {
+            if !j.ok {
+                out.push(None);
                 continue;
             }
-            if let Ok(v) = decode_packed_tx_with_spender_rels(&bufs[i]) {
-                out[i] = Some(v);
-            }
+            out.push(decode_packed_tx_with_spender_rels(&j.body).ok());
         }
         Ok(out)
     }
 
-    /// Bulk meta+outputs+spender_rels from known ranges (confirm pin_new).
+    /// Bulk meta+outputs+spender_rels from known ranges.
     ///
-    /// io_uring body preads. Spender fields on outs are cleared; use dense
-    /// `spender_rels` (relative to `body_off`) for later 9-byte re-reads.
+    /// Thin decode wrapper over [`crate::idx_body_pipeline`] (body-only denserels).
     pub fn get_meta_and_outputs_batch_at(
         &self,
         ranges: &[(u64, u64)],
     ) -> Result<Vec<Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>>, StoreError> {
-        use crate::bulk_io::{self, ReadOp};
+        use crate::idx_body_pipeline::{run_idx_body_pipeline, BodyMode, IdxBodyJob};
         if ranges.is_empty() {
             return Ok(Vec::new());
         }
-        let body_fd = self.body.body_read_fd();
-        let body_pub = self.body.body_published_len();
-
-        let submitted: Vec<usize> = ranges
+        // Synthetic sequential ids: pipeline only needs range when known; id is
+        // unused for body-only jobs (bounds skipped when range is Some).
+        let mut jobs: Vec<IdxBodyJob> = ranges
             .iter()
             .enumerate()
-            .filter(|(_, (off, len))| *len > 0 && off.saturating_add(*len) <= body_pub)
-            .map(|(i, _)| i)
+            .map(|(i, &(off, len))| IdxBodyJob::new((i as u64).saturating_add(1), Some((off, len))))
             .collect();
-
-        let mut bufs: Vec<Vec<u8>> = ranges
-            .iter()
-            .map(|(_, len)| vec![0u8; *len as usize])
-            .collect();
-
-        let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(submitted.len());
-        for &i in &submitted {
-            let (off, len) = ranges[i];
-            let ptr = bufs[i].as_mut_ptr();
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len as usize) };
-            read_ops.push(ReadOp {
-                fd: body_fd,
-                offset: off,
-                buf: slice,
-                result: i32::MIN,
-            });
-        }
-        bulk_io::pread_batch(&mut read_ops);
-
-        // Which preads completed for the full length (must record before we
-        // release `read_ops` / free buffers).
-        let mut ok = vec![false; ranges.len()];
-        for (ro, &i) in read_ops.iter().zip(submitted.iter()) {
-            if ro.result >= 0 && ro.result as u64 == ranges[i].1 {
-                ok[i] = true;
-            }
-        }
-        drop(read_ops);
-
-        let mut out: Vec<Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>> =
-            vec![None; ranges.len()];
-        // Free each raw body as soon as it is decoded so peak is not
-        // (all raw bodies) + (all dense outs) at once.
-        for (i, slot) in bufs.into_iter().enumerate() {
-            if !ok[i] || slot.is_empty() {
+        run_idx_body_pipeline(&self.body, &mut jobs, BodyMode::OutsDenserels)?;
+        let mut out = Vec::with_capacity(jobs.len());
+        for j in jobs {
+            if !j.ok {
+                out.push(None);
                 continue;
             }
-            if let Ok(v) = decode_packed_tx_outs_with_spender_rels(&slot) {
-                out[i] = Some(v);
-            }
-            // `slot` dropped at end of iteration.
+            out.push(decode_packed_tx_outs_with_spender_rels(&j.body).ok());
         }
         Ok(out)
     }

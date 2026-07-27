@@ -1620,6 +1620,8 @@ mod tests {
             },
             vec![],
             vec![],
+            None,
+            vec![],
         );
         assert!(b.is_empty()); // null fk ignored
 
@@ -1733,7 +1735,15 @@ mod tests {
         // Batch-local body path.
         let mut batch = BatchFullBodies::new();
         let full = q.store().get_tx_full(fks0[0]).unwrap();
-        batch.insert(fks0[0], 0, full.0.clone(), full.1.clone(), full.2.clone());
+        batch.insert(
+            fks0[0],
+            0,
+            full.0.clone(),
+            full.1.clone(),
+            full.2.clone(),
+            None,
+            vec![],
+        );
         let tx2 = q.reconstruct_tx_with_batch(fks0[0], Some(&batch)).unwrap();
         assert_eq!(tx2.output.len(), 1);
         // Empty tx list → corrupt.

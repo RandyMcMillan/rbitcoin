@@ -425,11 +425,13 @@ impl Store {
     }
 
     /// Bulk full packed decode from known ranges (confirm load).
+    ///
+    /// Fourth field: dense spender_rels (rel to body_off) for pin/OutFifo layout.
     pub fn get_tx_full_batch_at(
         &self,
         ranges: &[(Fk, u64, u64)],
     ) -> Result<
-        Vec<Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)>>,
+        Vec<Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>)>>,
         StoreError,
     > {
         self.txs.get_full_batch_at(ranges)

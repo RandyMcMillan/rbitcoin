@@ -218,32 +218,66 @@ impl ConfirmParentCache {
     /// separately). Clones **all** outs (not need-vouts only) so later batches
     /// that spend other vouts of the same create hit the FIFO.
     ///
-    /// Body layout not recorded here (wire decode path); pin_new re-seeds with
-    /// offsets when cold parents are loaded later.
+    /// Seeds **body_range + denserels** when present so same-batch / later-window
+    /// spends hit pin_cache without re-reading `tx.idx` / denserels body.
     pub fn put_bodies_from_batch_full(&self, bodies: &crate::BatchFullBodies) {
         if bodies.is_empty() {
             return;
         }
         let mut g = self.inner.lock().unwrap();
-        for (fk, height, tx, inputs, outs) in bodies.iter() {
+        for (fk, body) in bodies.iter() {
             let Some(id) = fk.get() else {
                 continue;
             };
-            let coinbase = Some(is_coinbase_inputs(tx, inputs));
-            let mut outputs = outs.to_vec();
+            let coinbase = Some(is_coinbase_inputs(&body.tx, &body.inputs));
+            let mut outputs = body.outputs.clone();
             rbitcoin_store::clear_output_spender_fields(&mut outputs);
+            let denserels = body.denserels.clone();
             let _ = g.outs.insert(
                 id,
                 CreateOuts::from_store(
-                    height,
-                    tx.clone(),
+                    body.height,
+                    body.tx.clone(),
                     outputs,
                     coinbase,
-                    None,
-                    Vec::new(),
+                    body.body_range,
+                    denserels,
                 ),
             );
         }
+    }
+
+    /// Lookup create fks by txid from the confirm OutFifo (read-only cross-check
+    /// for archive prep). Does **not** write sticky or fill from archive.
+    pub fn lookup_fk_by_txid_batch(
+        &self,
+        txids: &[[u8; 32]],
+    ) -> HashMap<[u8; 32], Fk> {
+        if txids.is_empty() {
+            return HashMap::new();
+        }
+        let g = self.inner.lock().unwrap();
+        let mut out = HashMap::with_capacity(txids.len() / 4);
+        for t in txids {
+            if let Some(id) = g.outs.fk_by_txid(t) {
+                out.insert(*t, Fk(id));
+            }
+        }
+        out
+    }
+
+    /// Body ranges by create fk from OutFifo (read-only; confirm pin / cross-check).
+    pub fn body_ranges_by_fk(&self, fks: &[Fk]) -> Vec<Option<(u64, u64)>> {
+        if fks.is_empty() {
+            return Vec::new();
+        }
+        let g = self.inner.lock().unwrap();
+        fks.iter()
+            .map(|fk| {
+                let id = fk.get()?;
+                g.outs.get(id).and_then(|e| e.body_range())
+            })
+            .collect()
     }
 
     /// Seed FIFO with dense outs from pin_new store loads (no inputs available).
@@ -624,11 +658,57 @@ mod tests {
         assert_eq!(outs[1].0, 2);
         assert_eq!(cb, Some(true));
         assert!(body_range.is_none());
+        // put_bodies_batch has no layout; txid reverse index still works for archive cross-check.
+        assert_eq!(
+            c.lookup_fk_by_txid_batch(&[t.txid]).get(&t.txid).copied(),
+            Some(Fk(70))
+        );
+        assert_eq!(c.body_ranges_by_fk(&[Fk(70)]), vec![None]);
         let need1 = [1u32];
         let hits1 = c.get_bodies_for_pin_batch(&[(70, &need1)]);
         assert_eq!(hits1.get(&70).unwrap().2.len(), 1);
         assert_eq!(hits1.get(&70).unwrap().2[0].0, 1);
         assert_eq!(hits1.get(&70).unwrap().2[0].1.value, 20);
+
+        // Batch-full seed with denserels+range ⇒ pin_cache layout_covers_need.
+        {
+            let mut batch = crate::BatchFullBodies::new();
+            let mut t_layout = tx(71);
+            t_layout.input_count = 1;
+            t_layout.output_count = 2;
+            batch.insert(
+                Fk(71),
+                2,
+                t_layout.clone(),
+                vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    create_fk: Fk::NULL,
+                    prev_index: u32::MAX,
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![],
+                }],
+                vec![out(100), out(200)],
+                Some((9000, 120)),
+                vec![8, 40],
+            );
+            c.put_bodies_from_batch_full(&batch);
+            let hits = c.get_bodies_for_pin_batch(&[(71, &[0u32, 1][..])]);
+            let e = hits.get(&71).expect("layout seed");
+            assert_eq!(e.4, Some((9000, 120)));
+            assert_eq!(e.5, vec![(0, 8), (1, 40)]);
+            assert!(crate::batch_parents::layout_covers_need(e.4, &e.5, &[0, 1]));
+            assert_eq!(
+                c.lookup_fk_by_txid_batch(&[t_layout.txid])
+                    .get(&t_layout.txid)
+                    .copied(),
+                Some(Fk(71))
+            );
+            assert_eq!(
+                c.body_ranges_by_fk(&[Fk(71)]),
+                vec![Some((9000, 120))]
+            );
+        }
 
         // pin_new dense: layout + multi-in non-cb; all vouts remain addressable after slim.
         let mut t2 = tx(9);
@@ -674,7 +754,7 @@ mod tests {
             t.input_count = 2;
             t
         }, vec![out(9), out(10)], vec![])]);
-        assert_eq!(c.body_count(), 3); // 70, 90, 91 — not a fourth create
+        assert_eq!(c.body_count(), 4); // 70, 71, 90, 91 — replace-in-place, not a fifth
         assert_eq!(
             c.get_bodies_for_pin_batch(&[(91, &[0u32, 1][..])])
                 .get(&91)

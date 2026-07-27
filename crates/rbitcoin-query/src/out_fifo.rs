@@ -210,6 +210,8 @@ pub struct OutFifo {
     /// Oldest create fk at the front.
     order: VecDeque<u64>,
     by_fk: HashMap<u64, CreateOuts>,
+    /// Reverse index for archive-prep cross-check (txid → create fk).
+    by_txid: HashMap<[u8; 32], u64>,
     total_outs: u64,
     cap_outs: u64,
 }
@@ -219,6 +221,7 @@ impl OutFifo {
         Self {
             order: VecDeque::new(),
             by_fk: HashMap::new(),
+            by_txid: HashMap::new(),
             total_outs: 0,
             cap_outs: cap_outs.max(1),
         }
@@ -253,23 +256,35 @@ impl OutFifo {
         self.by_fk.get(&id)
     }
 
+    /// Create fk for `txid` if present (archive prep cross-check).
+    pub fn fk_by_txid(&self, txid: &[u8; 32]) -> Option<u64> {
+        self.by_txid.get(txid).copied()
+    }
+
     /// Insert or replace. Replaces in place (no FIFO re-order). New creates go
     /// to the back; eviction pops the front until `total_outs + n ≤ cap`.
     ///
     /// Returns create fks that were fully evicted.
     pub fn insert(&mut self, id: u64, entry: CreateOuts) -> Vec<u64> {
         let n = entry.outs.len() as u64;
+        let new_txid = entry.txid();
         if let Some(old) = self.by_fk.get_mut(&id) {
+            let old_txid = old.txid();
+            if old_txid != new_txid {
+                self.by_txid.remove(&old_txid);
+            }
             self.total_outs = self
                 .total_outs
                 .saturating_sub(old.outs.len() as u64)
                 .saturating_add(n);
             *old = entry;
+            self.by_txid.insert(new_txid, id);
             return self.evict_until_fits(0);
         }
         let mut evicted = self.evict_until_fits(n);
         self.order.push_back(id);
         self.total_outs = self.total_outs.saturating_add(n);
+        self.by_txid.insert(new_txid, id);
         self.by_fk.insert(id, entry);
         evicted.append(&mut self.evict_until_fits(0));
         evicted
@@ -282,6 +297,7 @@ impl OutFifo {
                 break;
             };
             if let Some(old) = self.by_fk.remove(&old_id) {
+                self.by_txid.remove(&old.txid());
                 self.total_outs = self.total_outs.saturating_sub(old.outs.len() as u64);
                 evicted.push(old_id);
             }

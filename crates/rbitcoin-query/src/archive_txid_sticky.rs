@@ -1,7 +1,7 @@
 //! Process-local archive sticky: `txid → create_fk` (+ optional body range).
 //!
 //! Cross mega-batch RAM hit for parent resolve when packing create_fk into spends.
-//! Capacity-capped FIFO (~4 M default ≈ 192 MiB planning budget for fk-only;
+//! Capacity-capped FIFO (~8 M default ≈ 384 MiB planning budget for fk-only;
 //! ranges add ~12 B/entry when present).
 //!
 //! **Hot path:** single Class A archive writer. `insert_many` / `lookup_batch` take
@@ -16,8 +16,8 @@ use rbitcoin_primitives::Fk;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
-/// Default sticky capacity (entries). ~48 B effective/entry → ~192 MiB planning budget.
-pub const DEFAULT_ARCHIVE_TXID_STICKY_CAP: usize = 4_000_000;
+/// Default sticky capacity (entries). ~48 B effective/entry → ~384 MiB planning budget.
+pub const DEFAULT_ARCHIVE_TXID_STICKY_CAP: usize = 8_000_000;
 
 pub fn archive_txid_sticky_cap_from_env() -> usize {
     std::env::var("RBITCOIN_ARCHIVE_TXID_STICKY_CAP")

@@ -191,6 +191,10 @@ fn decode_output_run(buf: &[u8], count: u32) -> Result<Vec<OutputRecord>, StoreE
 }
 
 /// Decode `count` outputs; returns records + bytes consumed (allows trailing data).
+///
+/// Production decode records denserels in [`decode_packed_tx_with_spender_rels`];
+/// this helper remains for unit tests of the output run format.
+#[cfg(test)]
 pub fn decode_output_run_prefix(
     buf: &[u8],
     count: u32,
@@ -518,6 +522,18 @@ pub fn encode_packed_tx(
 pub fn decode_packed_tx(
     raw: &[u8],
 ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>), StoreError> {
+    let (meta, inputs, outputs, _rels) = decode_packed_tx_with_spender_rels(raw)?;
+    Ok((meta, inputs, outputs))
+}
+
+/// Full packed decode plus dense relative offsets of each output's 9-byte
+/// spender meta (field + flags) within the payload.
+///
+/// **Spender fields on returned outs are cleared** (same as outs-only denserels
+/// path) so pin/OutFifo never treat pin-time annotations as durable authority.
+pub fn decode_packed_tx_with_spender_rels(
+    raw: &[u8],
+) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>), StoreError> {
     if raw.first().copied() != Some(PACKED_TX_V1) {
         return Err(StoreError::Corrupt("not a packed Class A tx"));
     }
@@ -528,15 +544,27 @@ pub fn decode_packed_tx(
     let mut off = 1 + TxRecord::ENCODED_LEN;
     let (inputs, in_used) = decode_input_run_prefix(&raw[off..], meta.input_count)?;
     off += in_used;
-    let (outputs, out_used) = decode_output_run_prefix(&raw[off..], meta.output_count)?;
-    off += out_used;
+    let n_out = meta.output_count as usize;
+    let mut outputs = Vec::with_capacity(n_out);
+    let mut spender_rels = Vec::with_capacity(n_out);
+    for _ in 0..n_out {
+        if off >= raw.len() {
+            return Err(StoreError::Corrupt("packed outputs short"));
+        }
+        spender_rels.push(off as u32);
+        let (mut rec, used) = OutputRecord::decode_at(&raw[off..])?;
+        off += used;
+        rec.spender_field = Fk::NULL;
+        rec.multi_spender = false;
+        outputs.push(rec);
+    }
     if off != raw.len() {
         return Err(StoreError::Corrupt("packed Class A trailing bytes"));
     }
     if inputs.len() as u32 != meta.input_count || outputs.len() as u32 != meta.output_count {
         return Err(StoreError::Corrupt("packed Class A count mismatch"));
     }
-    Ok((meta, inputs, outputs))
+    Ok((meta, inputs, outputs, spender_rels))
 }
 
 /// Packed meta + input create edges only (skip scripts, witnesses, and outputs).
@@ -1460,11 +1488,15 @@ impl TxTable {
 
     /// Bulk full packed decode from known ranges (confirm load create bodies).
     ///
-    /// io_uring body preads, then CPU decode.
+    /// io_uring body preads, then CPU decode. Fourth field is dense spender_rels
+    /// (relative to body_off) for OutFifo pin layout without a second body read.
     pub fn get_full_batch_at(
         &self,
         ranges: &[(Fk, u64, u64)],
-    ) -> Result<Vec<Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)>>, StoreError> {
+    ) -> Result<
+        Vec<Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>)>>,
+        StoreError,
+    > {
         use crate::bulk_io::{self, ReadOp};
         if ranges.is_empty() {
             return Ok(Vec::new());
@@ -1500,13 +1532,13 @@ impl TxTable {
         }
         bulk_io::pread_batch(&mut read_ops);
 
-        let mut out: Vec<Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)>> =
+        let mut out: Vec<Option<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>)>> =
             vec![None; ranges.len()];
         for (ro, &i) in read_ops.iter().zip(submitted.iter()) {
             if ro.result < 0 || ro.result as u64 != ranges[i].2 {
                 continue;
             }
-            if let Ok(v) = decode_packed_tx(&bufs[i]) {
+            if let Ok(v) = decode_packed_tx_with_spender_rels(&bufs[i]) {
                 out[i] = Some(v);
             }
         }
@@ -3927,6 +3959,10 @@ mod tests {
             let b = got.as_ref().expect("bulk decode");
             assert_eq!(b.0.txid, seq.0.txid);
             assert_eq!(b.0.txid, t.body_txid(*fk).unwrap());
+            assert_eq!(b.3.len(), b.2.len()); // denserels
+            for o in &b.2 {
+                assert!(o.spender_field.is_null());
+            }
         }
         let meta_ranges: Vec<(u64, u64)> = range_args.iter().map(|(_, o, l)| (*o, *l)).collect();
         let meta = t.get_meta_and_outputs_batch_at(&meta_ranges).unwrap();

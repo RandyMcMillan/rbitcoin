@@ -272,6 +272,22 @@ impl Query {
         for (txid, hit) in sticky_hits {
             resolved.insert(txid, hit.fk);
         }
+        // Cross-cache read: confirm OutFifo may already hold create fk (from load).
+        // Read-only — do not publish into sticky from confirm fills.
+        let mut need_after_sticky: Vec<[u8; 32]> = Vec::new();
+        for t in &need_vec {
+            if !resolved.contains_key(t) {
+                need_after_sticky.push(*t);
+            }
+        }
+        if !need_after_sticky.is_empty() {
+            let fifo_hits = self
+                .confirm_parents
+                .lookup_fk_by_txid_batch(&need_after_sticky);
+            for (txid, fk) in fifo_hits {
+                resolved.insert(txid, fk);
+            }
+        }
         let sticky_ns = t_sticky.elapsed().as_nanos() as u64;
 
         // Prior mega-batch(es) still in the write queue: not sticky/head yet.

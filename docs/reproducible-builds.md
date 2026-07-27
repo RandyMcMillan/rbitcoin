@@ -88,9 +88,11 @@ Two independent clean rebuilds must yield the same SHA-256 for each binary:
 
 What the script does:
 
-1. `nix build .#rbitcoin --rebuild` → hash `rbitcoin-node` / `rbitcoin-cli`
-2. Repeat rebuild → hash again
-3. `diff` the digest lists (exit non-zero if they diverge)
+1. Realize the package once (`nix build`) so a prior store path exists
+2. Run **`nix build --rebuild` twice** (re-executes the builder; logs must
+   contain `checking outputs of '….drv'…` — plain cache hits fail the check)
+3. SHA-256 `rbitcoin-node` / `rbitcoin-cli` after each rebuild and `diff`
+4. Never falls back to a plain `nix build` for the second pass (that would false-pass)
 
 You can also compare by hand:
 

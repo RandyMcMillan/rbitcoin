@@ -1,9 +1,13 @@
 //! Bulk table IO via **io_uring** (Linux): pipelined preads and pwrites so the
 //! kernel can keep many independent ops in flight.
 //!
-//! Used by archive head-resolve (`probe → idx → body_txid`) and confirm load
-//! body batches. Completions are unordered within a submit batch; callers apply
-//! a depth-aware / id-aligned state machine after each wave.
+//! All io_uring work is driven by [`crate::uring_session::UringSession`] (same
+//! type as archive streaming resolve and `tx.head` shadow fill). Each
+//! `pread_batch` / `pwrite_batch` / page-RMW call opens a short-lived session
+//! for that wave, then falls back to libc `pread`/`pwrite` when uring is off.
+//!
+//! Used by archive head-resolve body prefixes, confirm load body batches, and
+//! Class C bulk slots. Completions are unordered within a submit batch.
 //!
 //! # Controls
 //!
@@ -11,17 +15,15 @@
 //! - `RBITCOIN_BULK_IO_WORKERS` — parallel pread workers when uring is off
 //!   (default `min(CPUs, 16)`; `1` = serial). Writes fall back to serial pwrite.
 //!
-//! Ring entries: fixed **1024**. Large waves keep the ring full: submit up to
-//! 1024 outstanding ops, then refill as CQEs complete (pipelined, not
-//! stop-and-wait chunks). Each batch drains leftover CQEs first so `user_data`
-//! never collides across calls on the thread-local ring.
+//! Ring entries: [`crate::uring_session::DEFAULT_ENTRIES`] (1024). Large waves
+//! keep the ring full: submit up to depth outstanding ops, then refill as CQEs
+//! complete (pipelined, not stop-and-wait chunks).
 
-use std::cell::RefCell;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
-/// Thread-local io_uring SQ/CQ depth (and max outstanding ops per batch).
-const RING_ENTRIES: u32 = 1024;
+/// SQ/CQ depth for bulk batch sessions.
+const RING_ENTRIES: u32 = crate::uring_session::DEFAULT_ENTRIES;
 
 /// One independent pread. Caller owns `buf` for the full submit/wait.
 pub struct ReadOp<'a> {
@@ -80,14 +82,7 @@ pub fn io_uring_enabled() -> bool {
 }
 
 fn probe_uring() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        io_uring::IoUring::new(32).is_ok()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
+    crate::uring_session::UringSession::try_open(32).is_ok()
 }
 
 /// Worker count for pread fallback (cached).
@@ -166,250 +161,169 @@ pub fn page_rmw_pipelined(
     page_rmw_pipelined_uring(pages, apply)
 }
 
-#[cfg(target_os = "linux")]
-fn with_ring<R>(f: impl FnOnce(&mut io_uring::IoUring) -> R) -> Option<R> {
-    use io_uring::IoUring;
-    thread_local! {
-        static RING: RefCell<Option<IoUring>> = const { RefCell::new(None) };
-    }
-    RING.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            match IoUring::new(RING_ENTRIES) {
-                Ok(r) => *slot = Some(r),
-                Err(_) => {
-                    URING_MODE.store(2, Ordering::Relaxed);
-                    return None;
-                }
-            }
-        }
-        let ring = slot.as_mut().expect("ring installed");
-        Some(f(ring))
-    })
-}
-
-/// Pipelined bulk pread: keep up to [`RING_ENTRIES`] ops in flight, refill as
-/// CQEs free slots. Absolute `user_data = op index` for the whole batch.
+/// Pipelined bulk pread via [`crate::uring_session::UringSession`].
+/// `user_data = op index`. Returns false → caller uses pread fallback.
 #[cfg(target_os = "linux")]
 fn pread_batch_uring(ops: &mut [ReadOp<'_>]) -> bool {
-    use io_uring::{opcode, types};
-    const MAX_IN_FLIGHT: usize = RING_ENTRIES as usize;
-    with_ring(|ring| {
-        drain_cq_all(ring);
-        for op in ops.iter_mut() {
-            op.result = if op.buf.is_empty() { 0 } else { i32::MIN };
-        }
-        let n = ops.len();
-        let total_nonempty = ops.iter().filter(|o| !o.buf.is_empty()).count();
-        if total_nonempty == 0 {
-            return true;
-        }
+    use crate::uring_session::UringSession;
+    let Ok(mut session) = UringSession::try_open(RING_ENTRIES) else {
+        URING_MODE.store(2, Ordering::Relaxed);
+        return false;
+    };
+    for op in ops.iter_mut() {
+        op.result = if op.buf.is_empty() { 0 } else { i32::MIN };
+    }
+    let n = ops.len();
+    let total_nonempty = ops.iter().filter(|o| !o.buf.is_empty()).count();
+    if total_nonempty == 0 {
+        return true;
+    }
 
-        let mut next = 0usize;
-        let mut in_flight = 0usize;
-        let mut completed = 0usize;
+    let mut next = 0usize;
+    let mut completed = 0usize;
 
-        while completed < total_nonempty {
-            // 1) Fill free SQ slots up to ring depth.
-            while next < n && in_flight < MAX_IN_FLIGHT {
-                if ops[next].buf.is_empty() {
-                    next += 1;
-                    continue;
-                }
-                let sqe = opcode::Read::new(
-                    types::Fd(ops[next].fd),
-                    ops[next].buf.as_mut_ptr(),
-                    ops[next].buf.len() as u32,
-                )
-                .offset(ops[next].offset)
-                .build()
-                .user_data(next as u64);
-                // SAFETY: caller owns each `buf` until `pread_batch` returns;
-                // we do not return while any op is still in flight.
-                if unsafe { ring.submission().push(&sqe) }.is_err() {
-                    // SQ full of unsubmitted entries — submit/wait below.
-                    if in_flight == 0 {
-                        drain_cq_all(ring);
-                        return false;
-                    }
-                    break;
-                }
+    while completed < total_nonempty {
+        while next < n && session.free_sq() > 0 {
+            if ops[next].buf.is_empty() {
                 next += 1;
-                in_flight += 1;
+                continue;
             }
-            ring.submission().sync();
-
-            if in_flight == 0 {
-                // Only empty ops left (or nothing pushed).
+            let fd = ops[next].fd;
+            let offset = ops[next].offset;
+            let ud = next as u64;
+            // SAFETY: caller owns each `buf` until `pread_batch` returns.
+            if session
+                .push_pread(fd, offset, ops[next].buf, ud)
+                .is_err()
+            {
+                if session.in_flight() == 0 {
+                    session.drain_all();
+                    return false;
+                }
                 break;
             }
+            next += 1;
+        }
+        session.sync_submission();
 
-            // 2) Harvest ready CQEs without blocking; if none, submit pending
-            //    SQEs and wait for ≥1 completion so we can refill.
-            if harvest_ready(ring, ops, &mut in_flight, &mut completed) == 0 {
-                if ring.submit_and_wait(1).is_err() {
-                    drain_cq_all(ring);
-                    return false;
-                }
-                if harvest_ready(ring, ops, &mut in_flight, &mut completed) == 0 {
-                    drain_cq_all(ring);
-                    return false;
-                }
-            } else if ring.submit().is_err() {
-                // Had ready CQEs; still kick any unsubmitted SQEs before refill.
-                drain_cq_all(ring);
+        if session.in_flight() == 0 {
+            break;
+        }
+
+        let mut cqes = session.harvest_ready();
+        if cqes.is_empty() {
+            if session.submit_and_wait_one().is_err() {
+                session.drain_all();
                 return false;
             }
-        }
-
-        for op in ops.iter_mut() {
-            if !op.buf.is_empty() && op.result == i32::MIN {
-                op.result = -5; // EIO
+            cqes = session.harvest_ready();
+            if cqes.is_empty() {
+                session.drain_all();
+                return false;
             }
+        } else if session.submit().is_err() {
+            session.drain_all();
+            return false;
         }
-        drain_cq_all(ring);
-        true
-    })
-    .unwrap_or(false)
-}
 
-/// Harvest all currently available CQEs (non-blocking). Returns count taken.
-#[cfg(target_os = "linux")]
-fn harvest_ready(
-    ring: &mut io_uring::IoUring,
-    ops: &mut [ReadOp<'_>],
-    in_flight: &mut usize,
-    completed: &mut usize,
-) -> usize {
-    ring.completion().sync();
-    let mut got = 0usize;
-    for cqe in ring.completion() {
-        let i = cqe.user_data() as usize;
-        if i < ops.len() {
-            ops[i].result = cqe.result();
+        for (ud, res) in cqes {
+            let i = ud as usize;
+            if i < ops.len() {
+                ops[i].result = res;
+            }
+            completed += 1;
         }
-        if *in_flight > 0 {
-            *in_flight -= 1;
-        }
-        *completed += 1;
-        got += 1;
     }
-    if got > 0 {
-        ring.completion().sync();
-    }
-    got
-}
 
-#[cfg(target_os = "linux")]
-fn drain_cq_all(ring: &mut io_uring::IoUring) {
-    ring.completion().sync();
-    for _ in ring.completion() {}
-    ring.completion().sync();
+    for op in ops.iter_mut() {
+        if !op.buf.is_empty() && op.result == i32::MIN {
+            op.result = -5; // EIO
+        }
+    }
+    session.drain_all();
+    true
 }
 
 /// Pipelined bulk pwrite — same fill/harvest shape as [`pread_batch_uring`].
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 fn pwrite_batch_uring(ops: &mut [WriteOp<'_>]) -> bool {
-    use io_uring::{opcode, types};
-    const MAX_IN_FLIGHT: usize = RING_ENTRIES as usize;
-    with_ring(|ring| {
-        drain_cq_all(ring);
-        for op in ops.iter_mut() {
-            op.result = if op.buf.is_empty() { 0 } else { i32::MIN };
-        }
-        let n = ops.len();
-        let total_nonempty = ops.iter().filter(|o| !o.buf.is_empty()).count();
-        if total_nonempty == 0 {
-            return true;
-        }
+    use crate::uring_session::UringSession;
+    let Ok(mut session) = UringSession::try_open(RING_ENTRIES) else {
+        URING_MODE.store(2, Ordering::Relaxed);
+        return false;
+    };
+    for op in ops.iter_mut() {
+        op.result = if op.buf.is_empty() { 0 } else { i32::MIN };
+    }
+    let n = ops.len();
+    let total_nonempty = ops.iter().filter(|o| !o.buf.is_empty()).count();
+    if total_nonempty == 0 {
+        return true;
+    }
 
-        let mut next = 0usize;
-        let mut in_flight = 0usize;
-        let mut completed = 0usize;
+    let mut next = 0usize;
+    let mut completed = 0usize;
 
-        while completed < total_nonempty {
-            while next < n && in_flight < MAX_IN_FLIGHT {
-                if ops[next].buf.is_empty() {
-                    next += 1;
-                    continue;
-                }
-                let sqe = opcode::Write::new(
-                    types::Fd(ops[next].fd),
-                    ops[next].buf.as_ptr(),
-                    ops[next].buf.len() as u32,
-                )
-                .offset(ops[next].offset)
-                .build()
-                .user_data(next as u64);
-                // SAFETY: caller owns each `buf` until `pwrite_batch` returns.
-                if unsafe { ring.submission().push(&sqe) }.is_err() {
-                    if in_flight == 0 {
-                        drain_cq_all(ring);
-                        return false;
-                    }
-                    break;
-                }
+    while completed < total_nonempty {
+        while next < n && session.free_sq() > 0 {
+            if ops[next].buf.is_empty() {
                 next += 1;
-                in_flight += 1;
+                continue;
             }
-            ring.submission().sync();
-
-            if in_flight == 0 {
+            let fd = ops[next].fd;
+            let offset = ops[next].offset;
+            let ud = next as u64;
+            if session
+                .push_pwrite(fd, offset, ops[next].buf, ud)
+                .is_err()
+            {
+                if session.in_flight() == 0 {
+                    session.drain_all();
+                    return false;
+                }
                 break;
             }
+            next += 1;
+        }
+        session.sync_submission();
 
-            if harvest_ready_write(ring, ops, &mut in_flight, &mut completed) == 0 {
-                if ring.submit_and_wait(1).is_err() {
-                    drain_cq_all(ring);
-                    return false;
-                }
-                if harvest_ready_write(ring, ops, &mut in_flight, &mut completed) == 0 {
-                    drain_cq_all(ring);
-                    return false;
-                }
-            } else if ring.submit().is_err() {
-                drain_cq_all(ring);
+        if session.in_flight() == 0 {
+            break;
+        }
+
+        let mut cqes = session.harvest_ready();
+        if cqes.is_empty() {
+            if session.submit_and_wait_one().is_err() {
+                session.drain_all();
                 return false;
             }
-        }
-
-        for op in ops.iter_mut() {
-            if !op.buf.is_empty() && op.result == i32::MIN {
-                op.result = -5;
+            cqes = session.harvest_ready();
+            if cqes.is_empty() {
+                session.drain_all();
+                return false;
             }
+        } else if session.submit().is_err() {
+            session.drain_all();
+            return false;
         }
-        drain_cq_all(ring);
-        true
-    })
-    .unwrap_or(false)
-}
 
-#[cfg(target_os = "linux")]
-#[allow(dead_code)]
-fn harvest_ready_write(
-    ring: &mut io_uring::IoUring,
-    ops: &mut [WriteOp<'_>],
-    in_flight: &mut usize,
-    completed: &mut usize,
-) -> usize {
-    ring.completion().sync();
-    let mut got = 0usize;
-    for cqe in ring.completion() {
-        let i = cqe.user_data() as usize;
-        if i < ops.len() {
-            ops[i].result = cqe.result();
+        for (ud, res) in cqes {
+            let i = ud as usize;
+            if i < ops.len() {
+                ops[i].result = res;
+            }
+            completed += 1;
         }
-        if *in_flight > 0 {
-            *in_flight -= 1;
+    }
+
+    for op in ops.iter_mut() {
+        if !op.buf.is_empty() && op.result == i32::MIN {
+            op.result = -5;
         }
-        *completed += 1;
-        got += 1;
     }
-    if got > 0 {
-        ring.completion().sync();
-    }
-    got
+    session.drain_all();
+    true
 }
 
 /// user_data: low 63 bits = page index; bit 63 set ⇒ write completion.
@@ -421,152 +335,132 @@ fn page_rmw_pipelined_uring(
     pages: &mut [PageRmw<'_>],
     mut apply: impl FnMut(usize, &mut [u8]) -> bool,
 ) -> bool {
-    use io_uring::{opcode, types};
-    const MAX_IN_FLIGHT: usize = RING_ENTRIES as usize;
+    use crate::uring_session::UringSession;
+    let Ok(mut session) = UringSession::try_open(RING_ENTRIES) else {
+        return false;
+    };
     let n = pages.len();
     // 0 = need read, 1 = read in flight, 2 = need write, 3 = write in flight, 4 = done
     let mut state = vec![0u8; n];
     let mut need_read = n;
     let mut need_write = 0usize;
     let mut done = 0usize;
-    let mut in_flight = 0usize;
     let mut next_read = 0usize;
 
-    with_ring(|ring| {
-        drain_cq_all(ring);
+    while done < n {
+        let mut submitted = false;
 
-        while done < n {
-            // Prefer write-back of dirty pages, then fill remaining slots with reads.
-            let mut submitted = false;
-
-            // Writes first so completed pages free logical capacity promptly.
-            if need_write > 0 && in_flight < MAX_IN_FLIGHT {
-                for i in 0..n {
-                    if in_flight >= MAX_IN_FLIGHT {
-                        break;
-                    }
-                    if state[i] != 2 {
-                        continue;
-                    }
-                    if pages[i].buf.is_empty() {
-                        state[i] = 4;
-                        need_write -= 1;
-                        done += 1;
-                        continue;
-                    }
-                    let fd = pages[i].fd;
-                    let offset = pages[i].offset;
-                    let len = pages[i].buf.len() as u32;
-                    let ptr = pages[i].buf.as_ptr();
-                    let sqe = opcode::Write::new(types::Fd(fd), ptr, len)
-                        .offset(offset)
-                        .build()
-                        .user_data((i as u64) | RMW_WRITE_BIT);
-                    // SAFETY: buf lives until write CQE; we do not return early
-                    // while any op is in flight without draining.
-                    if unsafe { ring.submission().push(&sqe) }.is_err() {
-                        break;
-                    }
-                    state[i] = 3;
-                    need_write -= 1;
-                    in_flight += 1;
-                    submitted = true;
-                }
-            }
-
-            while need_read > 0 && in_flight < MAX_IN_FLIGHT && next_read < n {
-                while next_read < n && state[next_read] != 0 {
-                    next_read += 1;
-                }
-                if next_read >= n {
+        if need_write > 0 && session.free_sq() > 0 {
+            for i in 0..n {
+                if session.free_sq() == 0 {
                     break;
                 }
-                let i = next_read;
+                if state[i] != 2 {
+                    continue;
+                }
                 if pages[i].buf.is_empty() {
                     state[i] = 4;
-                    need_read -= 1;
+                    need_write -= 1;
                     done += 1;
-                    next_read += 1;
                     continue;
                 }
                 let fd = pages[i].fd;
                 let offset = pages[i].offset;
-                let len = pages[i].buf.len() as u32;
-                let ptr = pages[i].buf.as_mut_ptr();
-                let sqe = opcode::Read::new(types::Fd(fd), ptr, len)
-                    .offset(offset)
-                    .build()
-                    .user_data(i as u64);
-                // SAFETY: exclusive mut buf until read CQE then apply/write.
-                if unsafe { ring.submission().push(&sqe) }.is_err() {
+                if session
+                    .push_pwrite(fd, offset, pages[i].buf, (i as u64) | RMW_WRITE_BIT)
+                    .is_err()
+                {
                     break;
                 }
-                state[i] = 1;
-                need_read -= 1;
-                in_flight += 1;
-                next_read += 1;
+                state[i] = 3;
+                need_write -= 1;
                 submitted = true;
-            }
-
-            if submitted {
-                ring.submission().sync();
-            }
-
-            if in_flight == 0 {
-                // Nothing in flight: either done or stuck.
-                break;
-            }
-
-            // Harvest; wait if nothing ready. Collect CQEs first so we can
-            // fail/drain without holding the completion-queue borrow.
-            let mut events: Vec<(u64, i32)> = Vec::new();
-            ring.completion().sync();
-            for cqe in ring.completion() {
-                events.push((cqe.user_data(), cqe.result()));
-            }
-            if !events.is_empty() {
-                ring.completion().sync();
-            } else if ring.submit_and_wait(1).is_err() {
-                drain_cq_all(ring);
-                return false;
-            } else {
-                continue; // loop will harvest the waited CQE
-            }
-
-            for (ud, res) in events {
-                in_flight = in_flight.saturating_sub(1);
-                let i = (ud & !RMW_WRITE_BIT) as usize;
-                if i >= n {
-                    continue;
-                }
-                if ud & RMW_WRITE_BIT != 0 {
-                    if res < 0 || res as usize != pages[i].buf.len() {
-                        drain_cq_all(ring);
-                        return false;
-                    }
-                    state[i] = 4;
-                    done += 1;
-                } else {
-                    if res < 0 || res as usize != pages[i].buf.len() {
-                        drain_cq_all(ring);
-                        return false;
-                    }
-                    let dirty = apply(i, pages[i].buf);
-                    if dirty {
-                        state[i] = 2;
-                        need_write += 1;
-                    } else {
-                        state[i] = 4;
-                        done += 1;
-                    }
-                }
             }
         }
 
-        drain_cq_all(ring);
-        done == n && need_read == 0 && need_write == 0
-    })
-    .unwrap_or(false)
+        while need_read > 0 && session.free_sq() > 0 && next_read < n {
+            while next_read < n && state[next_read] != 0 {
+                next_read += 1;
+            }
+            if next_read >= n {
+                break;
+            }
+            let i = next_read;
+            if pages[i].buf.is_empty() {
+                state[i] = 4;
+                need_read -= 1;
+                done += 1;
+                next_read += 1;
+                continue;
+            }
+            let fd = pages[i].fd;
+            let offset = pages[i].offset;
+            if session
+                .push_pread(fd, offset, pages[i].buf, i as u64)
+                .is_err()
+            {
+                break;
+            }
+            state[i] = 1;
+            need_read -= 1;
+            next_read += 1;
+            submitted = true;
+        }
+
+        if submitted {
+            session.sync_submission();
+        }
+
+        if session.in_flight() == 0 {
+            break;
+        }
+
+        let mut events = session.harvest_ready();
+        if events.is_empty() {
+            if session.submit_and_wait_one().is_err() {
+                session.drain_all();
+                return false;
+            }
+            events = session.harvest_ready();
+            if events.is_empty() {
+                continue;
+            }
+        } else if session.submit().is_err() {
+            session.drain_all();
+            return false;
+        }
+
+        for (ud, res) in events {
+            let i = (ud & !RMW_WRITE_BIT) as usize;
+            if i >= n {
+                continue;
+            }
+            if ud & RMW_WRITE_BIT != 0 {
+                if res < 0 || res as usize != pages[i].buf.len() {
+                    session.drain_all();
+                    return false;
+                }
+                state[i] = 4;
+                done += 1;
+            } else {
+                if res < 0 || res as usize != pages[i].buf.len() {
+                    session.drain_all();
+                    return false;
+                }
+                let dirty = apply(i, pages[i].buf);
+                if dirty {
+                    state[i] = 2;
+                    need_write += 1;
+                } else {
+                    state[i] = 4;
+                    done += 1;
+                }
+            }
+        }
+    }
+
+    session.drain_all();
+    done == n && need_read == 0 && need_write == 0
 }
 
 #[cfg(not(target_os = "linux"))]

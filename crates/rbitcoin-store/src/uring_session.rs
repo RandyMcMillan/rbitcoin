@@ -1,9 +1,13 @@
-//! Owned io_uring session for completion-driven pipelines.
+//! Owned io_uring session — **the** ring abstraction for this crate.
 //!
-//! Used by online `tx.head` shadow fill and streaming archive head-resolve.
-//! Distinct from [`crate::bulk_io::pread_batch`]'s thread-local "submit all,
-//! wait for all" ring — this session is **owned** by one pipeline and must not
-//! be shared across concurrent call stacks on the same thread.
+//! All production io_uring work goes through [`UringSession`]:
+//! - streaming archive head-resolve
+//! - online `tx.head` shadow fill
+//! - [`crate::bulk_io`] pread/pwrite batches and page RMW
+//!
+//! A session is owned by one pipeline (or one `bulk_io` batch call) and must not
+//! be shared across concurrent call stacks. Nested `bulk_io` on the same thread
+//! creates a **separate** session for that call.
 
 use crate::error::StoreError;
 use std::os::fd::RawFd;
@@ -26,6 +30,14 @@ impl UringSession {
         if !crate::bulk_io::io_uring_enabled() {
             return Err(StoreError::Corrupt("io_uring unavailable"));
         }
+        Self::try_open(entries)
+    }
+
+    /// Create a ring without consulting [`crate::bulk_io::io_uring_enabled`].
+    ///
+    /// Used for capability probe and by `bulk_io` after the gate has already
+    /// passed (avoids recursion through `io_uring_enabled` → probe → here).
+    pub(crate) fn try_open(entries: u32) -> Result<Self, StoreError> {
         let entries = entries.max(32).min(4096);
         #[cfg(target_os = "linux")]
         {

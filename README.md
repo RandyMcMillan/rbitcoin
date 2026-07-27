@@ -56,19 +56,35 @@ cargo build -p rbitcoin-node --release
 
 ## Build
 
-Requires a recent Rust toolchain (workspace `rust-version` 1.74+) and, for the
-documented developer path, [Nix](https://nixos.org/) optional via `shell.nix`.
+### Reproducible release (recommended with Nix)
+
+Pinned **nixpkgs + Cargo.lock** produce **byte-identical** `rbitcoin-node` /
+`rbitcoin-cli` for a given revision and target. Not NixOS-specific — any machine
+with [Nix](https://nixos.org/download/) + flakes:
 
 ```bash
-nix-shell   # optional: pins tools / RUSTFLAGS
+nix build .#rbitcoin          # glibc (primary)
+nix build .#rbitcoin-musl     # static musl (second triple)
+./scripts/repro-check.sh both # two clean rebuilds; compare SHA-256
+```
+
+Details: [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
+
+### Dev / CI path
+
+Requires a recent Rust toolchain (workspace `rust-version` 1.74+). Prefer the
+**same pin** as release builds:
+
+```bash
+nix develop   # or: nix-shell  (both use flake.lock, not floating <nixpkgs>)
 cargo build --workspace
 cargo build -p rbitcoin-node --release
 cargo test --workspace
 ./scripts/coverage.sh   # PR bar: see CONTRIBUTING.md
 ```
 
-Binary: `./target/release/rbitcoin-node`. Operator knobs and logging:
-[`OPERATOR.md`](./OPERATOR.md). Experimental mainnet flags and risks:
+Binary: `./target/release/rbitcoin-node` (dev) or `./result/bin/rbitcoin-node`
+(Nix). Operator knobs: [`OPERATOR.md`](./OPERATOR.md). Experimental mainnet:
 [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
 
 ## Crate map
@@ -101,6 +117,7 @@ Binary: `./target/release/rbitcoin-node`. Operator knobs and logging:
 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) | Dev workflow and coverage bar |
 | [`SECURITY.md`](./SECURITY.md) | Vulnerability reporting |
 | [`CHANGELOG.md`](./CHANGELOG.md) | Release notes |
+| [`docs/reproducible-builds.md`](./docs/reproducible-builds.md) | Pinned Nix byte-identical builds |
 
 ## What this is not
 

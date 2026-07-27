@@ -21,15 +21,27 @@
 Matches [`.github/workflows/ci.yml`](./.github/workflows/ci.yml):
 
 ```bash
-nix-shell
+nix develop   # or nix-shell — both pin via flake.lock
 cargo fmt --all -- --check
-# rustc warnings are denied via workspace.lints + RUSTFLAGS=-Dwarnings (shell.nix)
+# rustc warnings are denied via workspace.lints + RUSTFLAGS=-Dwarnings
 cargo build --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build -p rbitcoin-node -p rbitcoin-cli
 cargo test --workspace
 ./scripts/coverage.sh
 ```
+
+### Release binaries (byte-identical)
+
+Do **not** treat host `cargo build --release` digests as canonical. Use the
+pinned flake package and the double-build check:
+
+```bash
+nix build .#rbitcoin
+./scripts/repro-check.sh both   # native glibc + musl
+```
+
+See [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
 
 ## Commits
 

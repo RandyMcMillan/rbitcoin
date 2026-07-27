@@ -12,6 +12,10 @@ lcov.info
 /datadir/
 /datadir-*/
 /tmp/
+# Nix build products / local repro scratch
+/result
+/result-*
+.repro-out/
 # Operator IBD / soak logs (keep out of commits)
 *-ibd.log
 mainnet*.log

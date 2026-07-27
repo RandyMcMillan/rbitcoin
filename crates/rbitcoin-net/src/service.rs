@@ -30,7 +30,7 @@ impl NetConfig {
         Self {
             magic: Magic::REGTEST,
             listen,
-            user_agent: "/rbitcoin:0.1.0-vibes/".into(),
+            user_agent: "/rbitcoin:0.1.0/".into(),
         }
     }
 }
@@ -300,6 +300,6 @@ mod tests {
         let cfg = NetConfig::for_regtest(None);
         assert_eq!(cfg.magic, Magic::REGTEST);
         assert!(cfg.listen.is_none());
-        assert!(cfg.user_agent.contains("rbitcoin"));
+        assert_eq!(cfg.user_agent, "/rbitcoin:0.1.0/");
     }
 }

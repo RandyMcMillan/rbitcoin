@@ -111,7 +111,7 @@ async fn application_handshake(
         receiver: Address::new(&their_addr, ServiceFlags::NONE),
         sender: Address::new(&our_addr, services),
         nonce: rand_nonce(),
-        user_agent: "/rbitcoin:0.1.0-vibes/".to_string(),
+        user_agent: "/rbitcoin:0.1.0/".to_string(),
         start_height,
         // Advertise willingness to receive tx inv when we have a mempool hub.
         // Actual inv processing is gated on MempoolHub::relay_enabled (tip mode).

@@ -1,23 +1,51 @@
 # rbitcoin
 
-**Experimental** Bitcoin full node in Rust: multi-peer IBD, tip follow, block/tx relay (tip mode), and in-process Electrum.
+**Experimental** Bitcoin full node in Rust: multi-peer IBD, tip follow, block/tx
+relay (tip mode), and in-process Electrum — built around a **libbitcoin-class
+relational mmap archive** and a **pure-Rust consensus/script** path.
 
-- **rust-bitcoin** types and protocol primitives at the edges
-- **libbitcoin-class** concurrent relational mmap archive for chain storage
-- **Historical blocks via reconstruct** from the archive (tip wire ring for soft zone)
-- **Post-IBD durability** (epoch finalize + tip wire ring) per [`libbitcoin-durable-archive-variant.md`](./libbitcoin-durable-archive-variant.md)
-- **Electrum** TCP (confirmed + unconfirmed when mempool attached); TLS via reverse proxy
-- **Libre-class mempool** (cluster, full RBF, 0.1 sat/vB min; **scripts verified on accept**)
-- **BIP152 compact blocks (v2)** + **BIP339 wtxidrelay** on tip-follow sessions
-- **No** pruning, GUI, wallet, or mining
+> **Not** a production Bitcoin Core or Fulcrum replacement. On-disk format and
+> APIs are **unstable until 1.0**. Lab / reckless mainnet only after a signet
+> soak. See [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
 
-**Not** a production Bitcoin Core or Fulcrum replacement. See [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
+| | |
+|--|--|
+| **License** | MIT OR Apache-2.0 ([`LICENSE-MIT`](./LICENSE-MIT), [`LICENSE-APACHE`](./LICENSE-APACHE)) |
+| **Version** | 0.1.0 experimental ([`CHANGELOG.md`](./CHANGELOG.md)) |
+| **Security** | [`SECURITY.md`](./SECURITY.md) |
+| **Design** | [`docs/architecture.md`](./docs/architecture.md) — why this node is different |
+
+## Why this node is different
+
+Most full nodes center a **UTXO set + block files** (Bitcoin Core). Most Electrum
+backends are **external indexers** of another node. rbitcoin does neither:
+
+1. **On-disk archive** — Class A/B/C memory-mapped tables: packed txs, keyless
+   `tx.head`, spend annotations, native scripthash. Historical blocks are
+   **reconstructed** from the archive; tip keeps a **wire ring** and **epoch**
+   durability after catch-up. Deep layout: [`SCHEMA.md`](./SCHEMA.md),
+   durability: [`libbitcoin-durable-archive-variant.md`](./libbitcoin-durable-archive-variant.md).
+2. **Concurrent IBD / IO** — fixed writer roles, allocate-then-publish HWMs,
+   lock-free map epochs on the hot path, confirm as load → scripts → write,
+   bulk **io_uring** where available. Map: [`docs/concurrency.md`](./docs/concurrency.md).
+3. **Pure-Rust consensus** — structure, connect, and **script verification in
+   Rust**; only **secp256k1** (via rust-bitcoin) as the crypto primitive — **no**
+   `libbitcoinconsensus` dual-eval. Tests: [`docs/consensus-tests.md`](./docs/consensus-tests.md).
+
+Full narrative and Core / Fulcrum contrasts: **[`docs/architecture.md`](./docs/architecture.md)**.
+Product surface: [`COMPAT.md`](./COMPAT.md).
 
 ## Status
 
-Core pipelines exist (store, consensus, P2P IBD, tip follow, scripthash, Electrum). **Mainnet is experimental** — signet lab first ([`OPERATOR.md`](./OPERATOR.md)).
+Core pipelines exist (store, consensus, P2P IBD, tip follow, scripthash,
+Electrum, libre mempool). **Mainnet is experimental** — run **signet lab first**
+([`OPERATOR.md`](./OPERATOR.md)). Finishing a particular operator’s first full
+mainnet sync is **not** a gate for using or packaging this tree.
 
-**Milestone (default mainnet 840000):** at/below `--milestone`, **script/sig checks are skipped** on block connect (assumevalid-style speed tradeoff). Prevouts, double-spend, maturity, and fees still run. Use **`--milestone 0`** for full script validation.
+**Milestone (default mainnet 840000):** at/below `--milestone`, **script/sig
+checks are skipped** on block connect (assumevalid-style speed tradeoff).
+Prevouts, double-spend, maturity, and fees still run. Use **`--milestone 0`**
+for full script validation.
 
 ```bash
 # Signet lab (time-boxed)
@@ -28,29 +56,73 @@ cargo build -p rbitcoin-node --release
 
 ## Build
 
+Requires a recent Rust toolchain (workspace `rust-version` 1.74+) and, for the
+documented developer path, [Nix](https://nixos.org/) optional via `shell.nix`.
+
 ```bash
-nix-shell
+nix-shell   # optional: pins tools / RUSTFLAGS
 cargo build --workspace
+cargo build -p rbitcoin-node --release
 cargo test --workspace
-./scripts/coverage.sh
+./scripts/coverage.sh   # PR bar: see CONTRIBUTING.md
 ```
+
+Binary: `./target/release/rbitcoin-node`. Operator knobs and logging:
+[`OPERATOR.md`](./OPERATOR.md). Experimental mainnet flags and risks:
+[`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
 
 ## Crate map
 
 | Crate | Role |
 |-------|------|
 | `rbitcoin-primitives` | Shared types / newtypes |
-| `rbitcoin-store` | mmap Class A/B/C tables, scripthash, epoch |
+| `rbitcoin-store` | mmap Class A/B/C tables, scripthash, epoch, bulk IO |
 | `rbitcoin-query` | Domain API (archive, confirm, reconstruct, Electrum joins) |
 | `rbitcoin-wire-cache` | Tip wire-format block ring |
-| `rbitcoin-consensus` | Validation / confirm; milestone = scripts only |
-| `rbitcoin-net` | P2P + IBD (modular `ibd/`), blocks-only |
+| `rbitcoin-consensus` | Validation / confirm; pure-Rust scripts; milestone = scripts only |
+| `rbitcoin-net` | P2P + IBD (modular `ibd/`), tip follow, relay |
+| `rbitcoin-mempool` | Cluster graph + libre admission |
 | `rbitcoin-electrum` | Electrum TCP server |
 | `rbitcoin-rpc` | Minimal node JSON-RPC (stub) |
 | `rbitcoin-cli` | CLI client |
 | `rbitcoin-node` | Node binary |
 | `rbitcoin-test` | High-level test harness |
 
+## Documentation index
+
+| Doc | Audience |
+|-----|----------|
+| [`docs/architecture.md`](./docs/architecture.md) | Design uniqueness (start here) |
+| [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md) | Lab mainnet runbook |
+| [`OPERATOR.md`](./OPERATOR.md) | Day-to-day ops, env knobs |
+| [`SCHEMA.md`](./SCHEMA.md) | On-disk schema |
+| [`docs/concurrency.md`](./docs/concurrency.md) | Writer roles / lock-free publish |
+| [`COMPAT.md`](./COMPAT.md) | Intentional differences vs Core / Electrum methods |
+| [`CONTRIBUTING.md`](./CONTRIBUTING.md) | Dev workflow and coverage bar |
+| [`SECURITY.md`](./SECURITY.md) | Vulnerability reporting |
+| [`CHANGELOG.md`](./CHANGELOG.md) | Release notes |
+
+## What this is not
+
+- Production multi-tenant Electrum or “drop-in Core”
+- Wallet, mining, GUI, or pruning
+- Full Core JSON-RPC surface
+- A claim of complete mainnet script validation under the **default** milestone
+
 ## License
 
-MIT OR Apache-2.0 (see `LICENSE-MIT` and `LICENSE-APACHE`).
+Licensed under either of:
+
+- Apache License, Version 2.0 ([`LICENSE-APACHE`](./LICENSE-APACHE) or
+  http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([`LICENSE-MIT`](./LICENSE-MIT) or
+  http://opensource.org/licenses/MIT)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions. See
+[`CONTRIBUTING.md`](./CONTRIBUTING.md).

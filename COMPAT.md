@@ -3,6 +3,10 @@
 Pinned reference version: **target Core ≥27** for BIP324 v2 interop; package wire
 tracks BIP331 when rust-bitcoin exposes the messages.
 
+**Experimental 0.x** — not a production Core or Fulcrum replacement. Design
+contrasts: [`docs/architecture.md`](./docs/architecture.md). Lab mainnet:
+[`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
+
 ## Active product track
 
 Full **P2P participant** (blocks + tip-mode tx relay) and **Electrum** backend

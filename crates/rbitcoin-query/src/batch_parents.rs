@@ -139,12 +139,19 @@ impl BatchParents {
     }
 
     /// Absolute 9-byte spender meta offset for `vout`, if layout known.
+    ///
+    /// Returns `None` when body range or denserels were not prepared (caller
+    /// should treat that as a prep invariant break on Direct confirm write).
     pub fn get_spender_abs(&self, fk: Fk, vout: u32) -> Option<u64> {
         let id = fk.get()?;
         let e = self.by_fk.get(&id)?;
         let (off, _) = e.body_range?;
         let i = e.spender_rels.binary_search_by_key(&vout, |(v, _)| *v).ok()?;
-        Some(off.saturating_add(u64::from(e.spender_rels[i].1)))
+        let rel = e.spender_rels[i].1;
+        if rel == SPENDER_REL_UNKNOWN {
+            return None;
+        }
+        Some(off.saturating_add(u64::from(rel)))
     }
 
     pub fn has_parent_out(&self, fk: Fk, vout: u32) -> bool {
@@ -210,15 +217,44 @@ fn checked_contains(checked: &[u32], v: u32) -> bool {
     checked.binary_search(&v).is_ok()
 }
 
+/// Relative offset sentinel: layout unknown for this out (FIFO seed without denserels).
+pub const SPENDER_REL_UNKNOWN: u32 = u32::MAX;
+
 /// Build sorted `(vout, rel)` for requested vouts from dense pin rels.
+///
+/// Skips missing denserels slots and [`SPENDER_REL_UNKNOWN`] so callers can
+/// treat `out.len() == need_vouts.len()` as “layout complete for need_vouts”.
 pub fn sparse_spender_rels(dense: &[u32], need_vouts: &[u32]) -> Vec<(u32, u32)> {
     let mut out = Vec::with_capacity(need_vouts.len());
     for &v in need_vouts {
         if let Some(&rel) = dense.get(v as usize) {
-            out.push((v, rel));
+            if rel != SPENDER_REL_UNKNOWN {
+                out.push((v, rel));
+            }
         }
     }
     out
+}
+
+/// True when pin layout can supply abs spender meta for every `need_vout`.
+pub fn layout_covers_need(
+    body_range: Option<(u64, u64)>,
+    sparse_rels: &[(u32, u32)],
+    need_vouts: &[u32],
+) -> bool {
+    if body_range.is_none() || need_vouts.is_empty() {
+        return body_range.is_some() && need_vouts.is_empty();
+    }
+    // sparse is sorted by vout from denserels walk order (need_vouts order).
+    if sparse_rels.len() != need_vouts.len() {
+        return false;
+    }
+    for (i, &v) in need_vouts.iter().enumerate() {
+        if sparse_rels[i].0 != v || sparse_rels[i].1 == SPENDER_REL_UNKNOWN {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -269,5 +305,34 @@ mod tests {
         assert_eq!(bp.get_parent_coinbase(Fk(9)), Some(true));
         let (_, o) = bp.get_parent_out(Fk(9), 0).unwrap();
         assert_eq!(o.value, 42);
+    }
+
+    #[test]
+    fn sparse_spender_rels_skips_unknown() {
+        let dense = vec![10, SPENDER_REL_UNKNOWN, 30];
+        let sparse = sparse_spender_rels(&dense, &[0, 1, 2]);
+        assert_eq!(sparse, vec![(0, 10), (2, 30)]);
+        assert!(!layout_covers_need(Some((0, 100)), &sparse, &[0, 1, 2]));
+        assert!(layout_covers_need(
+            Some((0, 100)),
+            &[(0, 10), (2, 30)],
+            &[0, 2]
+        ));
+        assert!(!layout_covers_need(None, &[(0, 10)], &[0]));
+    }
+
+    #[test]
+    fn get_spender_abs_rejects_unknown_rel() {
+        let mut bp = BatchParents::with_capacity(1);
+        bp.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(0, out(1))],
+            vec![0],
+            None,
+            Some((100, 50)),
+            vec![(0, SPENDER_REL_UNKNOWN)],
+        );
+        assert!(bp.get_spender_abs(Fk(1), 0).is_none());
     }
 }

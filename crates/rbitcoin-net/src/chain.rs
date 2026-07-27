@@ -7,7 +7,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, Transaction, Work};
 use std::sync::RwLock;
 use rbitcoin_consensus::{
-    accept_and_archive_block, accept_and_connect_block, confirm_archived_run,
+    accept_and_archive_block, accept_and_connect_block_preverified, confirm_archived_run,
     confirm_load_phase, confirm_script_phase, confirm_scripts_phase,
     confirm_write_phase, genesis_block, header_to_record,
     ChainParams, Milestone, ScriptOkBatch,
@@ -508,12 +508,19 @@ impl ChainHub {
     fn connect_at(&self, height: u32, block: Block) -> Result<(), NetError> {
         let hash = block.block_hash();
         let header = block.header;
-        accept_and_connect_block(
+        // Reorg disconnect is done before connect; confirm pipeline is tip+1 only.
+        // Live mempool txs already had scripts run at accept — skip re-verify.
+        let preverified = self
+            .mempool()
+            .map(|mp| mp.script_preverified_txids())
+            .unwrap_or_default();
+        accept_and_connect_block_preverified(
             &self.query,
             &self.params,
             Height(height),
             &block,
             self.milestone,
+            &preverified,
         )
         .map_err(|e| NetError::Consensus(e.to_string()))?;
         if let Some(mp) = self.mempool() {

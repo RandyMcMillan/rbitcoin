@@ -20,7 +20,7 @@ Prep never holds store write locks. The writer is the sole Class A producer for 
 
 | Role | Notes |
 |------|--------|
-| `peer_session` (split read/write) | Serve reconstruct + accept tip blocks; may write Class A+C via `accept_and_connect_block` / cache |
+| `peer_session` (split read/write) | Serve reconstruct + accept tip blocks; tip connect is archive + `confirm_archived_run` (same load pin denserels path as IBD) via `accept_and_connect_block` / cache |
 | Electrum | Read-mostly; joins Class A + scripthash under `Query` |
 | Epoch finalize | Single-threaded control path; flushes mmap |
 

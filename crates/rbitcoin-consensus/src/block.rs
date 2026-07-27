@@ -494,6 +494,11 @@ pub fn bip34_height_script(height: u32) -> Vec<u8> {
 ///
 /// `archived_tx_fks`: Class A fks for `block.txdata` (same order) when confirming
 /// archived bodies (thin create_fk / Class A rows in parent cache).
+///
+/// **Production tip / IBD:** use [`crate::accept_and_connect_block`] or
+/// [`crate::confirm_archived_run`] (load pin denserels → scripts → write). This
+/// helper is a **no-write** unit-test surface (empty pin → store cold spentness).
+/// It does not populate denserels and must not be the tip hot path.
 pub fn validate_block_connect(
     query: &Query,
     block: &Block,
@@ -511,7 +516,7 @@ pub fn validate_block_connect(
     // Pending until assemble+scripts+structural succeed — no durable writes on failure.
     let mut pending = std::collections::HashSet::new();
     let mut pending_creates = std::collections::HashMap::new();
-    // Tip/connect path: no separate pin stage; resolve from outs FIFO + store.
+    // Unit-test path: no load pin stage (production uses confirm_archived_run).
     let batch_parents = rbitcoin_query::BatchParents::new();
     let batch_thin = rbitcoin_query::BatchThin::new();
     let (script_jobs, spends, fees) = assemble_block_prevouts(
@@ -1031,16 +1036,27 @@ pub(crate) fn structural_validate_spends(
         vouts.dedup();
     }
 
-    // Partition: pin-layout absolute offsets (bulk 9-byte pread) vs cold fallback.
+    // Prefer pin denserels → absolute offsets (bulk 9-byte pread).
+    // When load pin inserted this create (`get_parent_tx` hit), abs is required
+    // (prep invariant). Missing pin entirely (unit-test `validate_block_connect`
+    // empty map) still uses body-range cold walk. Multi-list after meta read is
+    // protocol cold.
     // abs_jobs: (create_id, vout, abs_off)
     let mut abs_jobs: Vec<(u64, u32, u64)> = Vec::with_capacity(spends.len());
     let mut fallback_by_create: HashMap<u64, Vec<u32>> = HashMap::new();
     for (id, vouts) in &vouts_by_create {
         let fk = rbitcoin_primitives::Fk(*id);
+        let pinned = batch_parents.get_parent_tx(fk).is_some();
         let mut cold: Vec<u32> = Vec::new();
         for &v in vouts {
             if let Some(abs) = batch_parents.get_spender_abs(fk, v) {
                 abs_jobs.push((*id, v, abs));
+            } else if pinned {
+                return Err(ConsensusError::Store(
+                    rbitcoin_store::StoreError::Corrupt(
+                        "invariant: structural spentness missing pin denserels/abs",
+                    ),
+                ));
             } else {
                 cold.push(v);
             }

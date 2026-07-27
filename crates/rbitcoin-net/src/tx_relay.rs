@@ -95,6 +95,18 @@ impl MempoolHub {
         self.inner.lock().unwrap().live_count()
     }
 
+    /// Live mempool txids that passed consensus script verify at accept.
+    ///
+    /// Tip confirm may skip re-verifying these (same tip-era softfork flags).
+    pub fn script_preverified_txids(&self) -> std::collections::HashSet<[u8; 32]> {
+        use bitcoin::hashes::Hash;
+        let g = self.inner.lock().unwrap();
+        g.graph
+            .iter()
+            .map(|(txid, _)| txid.to_byte_array())
+            .collect()
+    }
+
     pub fn generation(&self) -> u64 {
         self.inner.lock().unwrap().generation()
     }

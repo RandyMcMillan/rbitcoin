@@ -73,6 +73,10 @@ struct Prepared {
     hash: [u8; 32],
 }
 
+/// Txids already consensus-script-verified under tip-era softforks (live mempool
+/// after accept). Empty = verify all jobs (IBD). Passed through load → scripts only.
+pub type ScriptPreverified = std::collections::HashSet<[u8; 32]>;
+
 /// Wire + assemble complete; script jobs still attached (not yet verified).
 ///
 /// `Send` so IBD can hand off load → scripts threads.
@@ -82,6 +86,8 @@ pub struct LoadedBatch {
     wire_blocks: Vec<Block>,
     /// Per-batch pin map: load → assemble → write structural, then drop.
     batch_parents: rbitcoin_query::BatchParents,
+    /// Mempool preverified txids for scripts stage (tip follow); empty on IBD.
+    script_preverified: ScriptPreverified,
 }
 
 /// Script-verified batch ready for ordered write (structural + Class C + spends).
@@ -96,13 +102,26 @@ pub struct ScriptOkBatch {
 /// Confirm a contiguous tip-extension run of archived bodies (sync all stages).
 ///
 /// Prefer the split phases in IBD for pipeline overlap.
+/// Script preverified set is empty (full verify).
 pub fn confirm_archived_run(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
     blocks: &[(Height, [u8; 32])],
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
-    let mat = confirm_load_phase(query, params, milestone, blocks)?;
+    confirm_archived_run_preverified(query, params, milestone, blocks, &ScriptPreverified::new())
+}
+
+/// Like [`confirm_archived_run`], skipping script verify for `preverified` txids
+/// (tip follow: live mempool txs already checked at accept).
+pub fn confirm_archived_run_preverified(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    blocks: &[(Height, [u8; 32])],
+    preverified: &ScriptPreverified,
+) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
+    let mat = confirm_load_phase_preverified(query, params, milestone, blocks, preverified)?;
     let ok = confirm_scripts_phase(mat.batch)?;
     confirm_write_phase(query, params, milestone, ok.batch)
 }
@@ -136,6 +155,17 @@ pub fn confirm_load_phase(
     params: &ChainParams,
     milestone: Milestone,
     blocks: &[(Height, [u8; 32])],
+) -> Result<ConfirmLoadOutcome, ConsensusError> {
+    confirm_load_phase_preverified(query, params, milestone, blocks, &ScriptPreverified::new())
+}
+
+/// Load with optional mempool script-preverified txids (tip follow).
+pub fn confirm_load_phase_preverified(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    blocks: &[(Height, [u8; 32])],
+    preverified: &ScriptPreverified,
 ) -> Result<ConfirmLoadOutcome, ConsensusError> {
     if blocks.is_empty() {
         return Err(ConsensusError::BadBlock("empty confirm batch"));
@@ -193,6 +223,7 @@ pub fn confirm_load_phase(
             prepared,
             wire_blocks,
             batch_parents,
+            script_preverified: preverified.clone(),
         },
         work_ns,
     })
@@ -210,7 +241,7 @@ pub fn confirm_scripts_phase(
     mut batch: LoadedBatch,
 ) -> Result<ConfirmScriptOutcome, ConsensusError> {
     let t_work = Instant::now();
-    script_wave(&batch.prepared)?;
+    script_wave(&batch.prepared, &batch.script_preverified)?;
     for p in &mut batch.prepared {
         p.jobs.clear();
         p.jobs.shrink_to_fit();
@@ -242,10 +273,15 @@ pub fn confirm_script_phase(
     Ok(ok)
 }
 
-/// Keep only heights strictly above the confirmed tip (dup write race).
+/// Keep heights not yet on the confirmed tip (dup write race).
+///
+/// `tip == None` means empty chain — genesis (and any load batch) still needs write.
 #[inline]
-fn write_height_needed(tip: u32, height: u32) -> bool {
-    height > tip
+fn write_height_needed(tip: Option<u32>, height: u32) -> bool {
+    match tip {
+        None => true,
+        Some(t) => height > t,
+    }
 }
 
 /// WRITE STAGE: structural → class_c → spend annotate → tip GC (FIFO caller).
@@ -259,7 +295,7 @@ pub fn confirm_write_phase(
     mut batch: ScriptOkBatch,
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
     // Idempotent: skip heights already on the confirmed tip (dup pipeline race).
-    let tip = query.tip_height().map(|h| h.0).unwrap_or(0);
+    let tip = query.tip_height().map(|h| h.0);
     let mut prep = Vec::with_capacity(batch.prepared.len());
     let mut wires = Vec::with_capacity(batch.wire_blocks.len());
     for (p, w) in batch
@@ -382,16 +418,19 @@ mod write_idempotent_tests {
     /// External three-stage path: rbitcoin-test three_stage_confirm_and_parent_pin_surface.
     #[test]
     fn three_stage_write_filter_and_scripts_surface() {
-        let tip = 100u32;
+        let tip = Some(100u32);
         let heights = [98u32, 99, 100, 101, 102];
         let kept: Vec<u32> = heights
             .into_iter()
             .filter(|&h| write_height_needed(tip, h))
             .collect();
         assert_eq!(kept, vec![101, 102]);
-        assert!(!write_height_needed(tip, tip));
-        assert!(!write_height_needed(0, 0));
-        assert!(write_height_needed(0, 1));
+        assert!(!write_height_needed(tip, 100));
+        assert!(!write_height_needed(Some(0), 0));
+        assert!(write_height_needed(Some(0), 1));
+        // Empty chain: genesis (and all heights) still need write.
+        assert!(write_height_needed(None, 0));
+        assert!(write_height_needed(None, 1));
 
         // Load / scripts / write are separate public surfaces for IBD.
         let _m = super::confirm_load_phase;
@@ -400,11 +439,12 @@ mod write_idempotent_tests {
         let _combined = super::confirm_script_phase;
         let _sync = super::confirm_archived_run;
 
-        use super::{confirm_scripts_phase, LoadedBatch};
+        use super::{confirm_scripts_phase, LoadedBatch, ScriptPreverified};
         let batch = LoadedBatch {
             prepared: Vec::new(),
             wire_blocks: Vec::new(),
             batch_parents: rbitcoin_query::BatchParents::new(),
+            script_preverified: ScriptPreverified::new(),
         };
         assert!(batch.is_empty());
         assert_eq!(batch.approx_wire_bytes(), 0);
@@ -606,11 +646,12 @@ mod write_idempotent_tests {
         assert_eq!(b, prev);
 
         // ScriptOkBatch empty surfaces (mirror LoadedBatch).
-        use super::{confirm_scripts_phase, LoadedBatch};
+        use super::{confirm_scripts_phase, LoadedBatch, ScriptPreverified};
         let loaded = LoadedBatch {
             prepared: Vec::new(),
             wire_blocks: Vec::new(),
             batch_parents: rbitcoin_query::BatchParents::new(),
+            script_preverified: ScriptPreverified::new(),
         };
         let ok = confirm_scripts_phase(loaded).unwrap();
         assert!(ok.batch.is_empty());
@@ -656,6 +697,138 @@ mod write_idempotent_tests {
         };
         assert!(check_bip34(&block, 17).is_err());
 
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Mempool-preverified txids skip script_wave verify (tip follow).
+    #[test]
+    fn script_wave_skips_preverified_txids() {
+        use super::{confirm_scripts_phase, LoadedBatch, Prepared, ScriptPreverified};
+        use crate::block::ScriptCheckJob;
+        use crate::confirm_phase_stats;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, CompactTarget, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness,
+        };
+        use rbitcoin_primitives::{Fk, Height};
+        use std::sync::atomic::Ordering;
+
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(50_0000_0000),
+            // P2PKH-shaped (not anyone-can-spend) so job_needs_script_check is true
+            // if we did not skip — invalid empty script_sig would fail without skip.
+            script_pubkey: ScriptBuf::from_bytes(vec![
+                0x76, 0xa9, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x88,
+                0xac,
+            ]),
+        }];
+        let tx = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([9; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let tid = tx.compute_txid().to_byte_array();
+        let mut pre = ScriptPreverified::new();
+        pre.insert(tid);
+
+        let job = ScriptCheckJob {
+            prevouts,
+            tx,
+            bip65_active: true,
+            bip112_active: true,
+            bip66_active: true,
+            bip16_active: true,
+            taproot_active: true,
+        };
+        let prepared = Prepared {
+            height: Height(1),
+            header_fk: Fk(1),
+            tx_fks: vec![Fk(1)],
+            jobs: vec![job],
+            spends: vec![],
+            fees: 0,
+            check_scripts: true,
+            time: 1,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            hash: [1u8; 32],
+        };
+        let batch = LoadedBatch {
+            prepared: vec![prepared],
+            wire_blocks: vec![],
+            batch_parents: rbitcoin_query::BatchParents::new(),
+            script_preverified: pre,
+        };
+        let before = confirm_phase_stats::SCRIPT_SKIP_MEMPOOL.load(Ordering::Relaxed);
+        confirm_scripts_phase(batch).expect("preverified skip avoids bad script fail");
+        let after = confirm_phase_stats::SCRIPT_SKIP_MEMPOOL.load(Ordering::Relaxed);
+        assert!(after > before, "skip counter should bump");
+    }
+
+    /// Prep miss: spend edges without pin denserels must hard-fail (no cold tier).
+    #[test]
+    fn post_commit_missing_denserels_is_invariant_error() {
+        use super::{post_commit, Prepared};
+        use crate::milestone::Milestone;
+        use crate::params::ChainParams;
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::{BatchParents, Query};
+        use std::sync::Once;
+
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-post-commit-inv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let q = Query::open_or_create(&path).unwrap();
+        q.enter_direct_index_mode().unwrap();
+        // Spend index on (default for Direct) so post_commit enters annotate.
+        let _ = (ChainParams::regtest(), Milestone::NONE);
+
+        let prepared = [Prepared {
+            height: Height(1),
+            header_fk: Fk(1),
+            tx_fks: vec![Fk(10)],
+            jobs: vec![],
+            spends: vec![([1u8; 32], 0, Fk(10), Fk(2))],
+            fees: 0,
+            check_scripts: false,
+            time: 1,
+            bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+            hash: [2u8; 32],
+        }];
+        // Empty BatchParents → get_spender_abs is None.
+        let bp = BatchParents::new();
+        let err = post_commit(&q, &prepared, &bp).expect_err("missing denserels");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invariant") && msg.contains("denserels"),
+            "unexpected err: {msg}"
+        );
         let _ = std::fs::remove_dir_all(&path);
     }
 }
@@ -992,33 +1165,34 @@ fn structural_run(
     Ok(tot)
 }
 
-/// Verify all script jobs in `prepared` (CPU only; jobs are self-contained).
-fn script_wave(prepared: &[Prepared]) -> Result<(), ConsensusError> {
+/// Verify script jobs in `prepared` (CPU only). Skips jobs whose txid is in
+/// `preverified` (mempool already consensus-checked at accept).
+fn script_wave(
+    prepared: &[Prepared],
+    preverified: &ScriptPreverified,
+) -> Result<(), ConsensusError> {
+    use bitcoin::hashes::Hash;
     let t_script = Instant::now();
-    {
-        let mut n_slices = 0usize;
-        let mut total_jobs = 0usize;
-        let mut only: Option<&[ScriptCheckJob]> = None;
-        for p in prepared {
-            if p.check_scripts && !p.jobs.is_empty() {
-                n_slices += 1;
-                total_jobs += p.jobs.len();
-                only = Some(p.jobs.as_slice());
-            }
+    let mut all_jobs: Vec<&ScriptCheckJob> = Vec::new();
+    let mut n_skip = 0u64;
+    for p in prepared {
+        if !p.check_scripts {
+            continue;
         }
-        match n_slices {
-            0 => {}
-            1 => crate::block::verify_scripts_pool(only.unwrap())?,
-            _ => {
-                let mut all_jobs: Vec<&ScriptCheckJob> = Vec::with_capacity(total_jobs);
-                for p in prepared {
-                    if p.check_scripts {
-                        all_jobs.extend(p.jobs.iter());
-                    }
-                }
-                crate::block::verify_scripts_pool_jobs(&all_jobs)?;
+        for job in &p.jobs {
+            let tid = job.tx.compute_txid().to_byte_array();
+            if preverified.contains(&tid) {
+                n_skip = n_skip.saturating_add(1);
+                continue;
             }
+            all_jobs.push(job);
         }
+    }
+    if n_skip > 0 {
+        confirm_phase_stats::SCRIPT_SKIP_MEMPOOL.fetch_add(n_skip, Ordering::Relaxed);
+    }
+    if !all_jobs.is_empty() {
+        crate::block::verify_scripts_pool_jobs(&all_jobs)?;
     }
     confirm_phase_stats::SCRIPT_NS
         .fetch_add(t_script.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1052,130 +1226,48 @@ fn post_commit(
     prepared: &[Prepared],
     batch_parents: &rbitcoin_query::BatchParents,
 ) -> Result<(u64, u64), ConsensusError> {
-    // Direct IBD: batch durable spend annotations for the whole run **before**
-    // the next confirm batch (spentness = confirmed-strong + annotation).
-    // Tip mode usually writes spends on archive; still safe if spend_index on.
+    // Confirm write (IBD + tip via accept_and_connect → confirm_archived_run):
+    // batch durable spend annotations after Class C. Load pin must supply
+    // denserels + body_range so every edge has abs layout — one path only.
     let t_spent = Instant::now();
     if query.spend_index_enabled() && query.index_mode().uses_durable_spends() {
-        // 1) Pin abs 9-byte offsets → mmap sole first-spend patches
-        // 2) Remaining: pin body_range / bulk idx → ranged packed walk
-        // 3) No range: per-create idx cold path
-        use std::collections::{HashMap, HashSet};
-        let mut pending: Vec<(
-            rbitcoin_primitives::Fk,
-            u32,
-            rbitcoin_primitives::Fk,
-        )> = Vec::new();
-        let mut n_skip = 0u64;
-        let mut unique_creates: HashSet<u64> = HashSet::new();
-        for p in prepared {
-            for &(_txid, vout, sfk, cfk) in &p.spends {
-                if sfk.is_null() || cfk.is_null() {
-                    n_skip = n_skip.saturating_add(1);
-                    continue;
-                }
-                pending.push((cfk, vout, sfk));
-                if let Some(id) = cfk.get() {
-                    unique_creates.insert(id);
-                }
-            }
-        }
-
-        // Absolute pin layout path (mmap annotate; no full body walk).
+        // Abs-only: no ranged/by_create cold tiers.
         let mut abs_edges: Vec<(
             u64,
             rbitcoin_primitives::Fk,
             u32,
             rbitcoin_primitives::Fk,
         )> = Vec::new();
-        let mut rest: Vec<(
-            rbitcoin_primitives::Fk,
-            u32,
-            rbitcoin_primitives::Fk,
-        )> = Vec::new();
-        for (cfk, vout, sfk) in pending {
-            if let Some(abs) = batch_parents.get_spender_abs(cfk, vout) {
+        let mut n_skip = 0u64;
+        for p in prepared {
+            for &(_txid, vout, sfk, cfk) in &p.spends {
+                if sfk.is_null() || cfk.is_null() {
+                    n_skip = n_skip.saturating_add(1);
+                    continue;
+                }
+                let Some(abs) = batch_parents.get_spender_abs(cfk, vout) else {
+                    return Err(ConsensusError::Store(StoreError::Corrupt(
+                        "invariant: spend annotate missing pin denserels/abs",
+                    )));
+                };
                 abs_edges.push((abs, cfk, vout, sfk));
-            } else {
-                rest.push((cfk, vout, sfk));
             }
         }
+        confirm_phase_stats::SPEND_ANNOTATE_SKIP.fetch_add(n_skip, Ordering::Relaxed);
         if !abs_edges.is_empty() {
             let cold = query
                 .store()
                 .put_spend_batch_by_abs_meta(&abs_edges)
                 .map_err(ConsensusError::Store)?;
+            if !cold.is_empty() {
+                return Err(ConsensusError::Store(StoreError::Corrupt(
+                    "invariant: spend annotate abs cold (OOB or IO); prep/layout bug",
+                )));
+            }
             confirm_phase_stats::SPEND_ANNOTATE_RANGED
-                .fetch_add(abs_edges.len().saturating_sub(cold.len()) as u64, Ordering::Relaxed);
-            rest.extend(cold);
+                .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
         }
-
-        let mut range_by_create: HashMap<u64, (u64, u64)> =
-            HashMap::with_capacity(unique_creates.len());
-        let mut need_range: Vec<rbitcoin_primitives::Fk> = Vec::new();
-        let mut rest_creates: HashSet<u64> = HashSet::new();
-        for &(cfk, _, _) in &rest {
-            if let Some(id) = cfk.get() {
-                rest_creates.insert(id);
-            }
-        }
-        for &id in &rest_creates {
-            let fk = rbitcoin_primitives::Fk(id);
-            if let Some(r) = batch_parents.get_body_range(fk) {
-                range_by_create.insert(id, r);
-            } else {
-                need_range.push(fk);
-            }
-        }
-        if !need_range.is_empty() {
-            let ranges = query
-                .store()
-                .tx_body_range_batch(&need_range)
-                .map_err(ConsensusError::Store)?;
-            for (fk, opt) in need_range.iter().zip(ranges.into_iter()) {
-                if let (Some(id), Some(r)) = (fk.get(), opt) {
-                    range_by_create.insert(id, r);
-                }
-            }
-        }
-        let mut ranged: Vec<(
-            rbitcoin_primitives::Fk,
-            u32,
-            rbitcoin_primitives::Fk,
-            u64,
-            u64,
-        )> = Vec::with_capacity(rest.len());
-        let mut by_create: Vec<(
-            rbitcoin_primitives::Fk,
-            u32,
-            rbitcoin_primitives::Fk,
-        )> = Vec::new();
-        for (cfk, vout, sfk) in rest {
-            if let Some(id) = cfk.get() {
-                if let Some(&(off, len)) = range_by_create.get(&id) {
-                    ranged.push((cfk, vout, sfk, off, len));
-                    continue;
-                }
-            }
-            by_create.push((cfk, vout, sfk));
-        }
-        confirm_phase_stats::SPEND_ANNOTATE_RANGED
-            .fetch_add(ranged.len() as u64, Ordering::Relaxed);
-        confirm_phase_stats::SPEND_ANNOTATE_IDX
-            .fetch_add(by_create.len() as u64, Ordering::Relaxed);
-        confirm_phase_stats::SPEND_ANNOTATE_SKIP.fetch_add(n_skip, Ordering::Relaxed);
-        if !ranged.is_empty() {
-            query
-                .store()
-                .put_spend_batch_by_create_ranged(&ranged)
-                .map_err(ConsensusError::Store)?;
-        }
-        if !by_create.is_empty() {
-            query
-                .store()
-                .put_spend_batch_by_create(&by_create)
-                .map_err(ConsensusError::Store)?;
-        }
+        // Cold tiers removed: SPEND_ANNOTATE_IDX stays 0 on healthy Direct IBD.
     }
     let spend_ann_ns = t_spent.elapsed().as_nanos() as u64;
     confirm_phase_stats::UTXO_APPLY_NS.fetch_add(spend_ann_ns, Ordering::Relaxed);

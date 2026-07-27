@@ -112,7 +112,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Block, Target};
 use rbitcoin_primitives::Height;
 use rbitcoin_query::{Query, TxApply};
-use rbitcoin_store::{HeaderRecord, StoreError};
+use rbitcoin_store::HeaderRecord;
 
 /// Confirm the next tip block if its body is already archived.
 ///
@@ -126,6 +126,8 @@ pub mod confirm_phase_stats {
     /// Optimistic assemble (prevout content + jobs; no durable spentness).
     pub static CONNECT_NS: AtomicU64 = AtomicU64::new(0);
     pub static SCRIPT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Script jobs skipped because mempool already verified the tx (tip follow).
+    pub static SCRIPT_SKIP_MEMPOOL: AtomicU64 = AtomicU64::new(0);
     /// Post-script durable spentness + maturity + BIP68 + subsidy (write).
     pub static STRUCTURAL_NS: AtomicU64 = AtomicU64::new(0);
     /// Durable spentness probes only (subset of structural).
@@ -141,9 +143,10 @@ pub mod confirm_phase_stats {
     /// Historical name `UTXO_APPLY_NS` / log field `spend=` ms — this is **not** a
     /// light-UTXO map apply (Catchup removed). Wall time for all annotate paths.
     pub static UTXO_APPLY_NS: AtomicU64 = AtomicU64::new(0);
-    /// Annotate edges using cache-held body range (no idx).
+    /// Annotate edges via abs pin denserels (`put_spend_batch_by_abs_meta`).
+    /// Historical name: formerly also counted ranged body walks (removed on Direct write).
     pub static SPEND_ANNOTATE_RANGED: AtomicU64 = AtomicU64::new(0);
-    /// Annotate edges with create_fk but no body_range (idx path).
+    /// Legacy cold idx annotate path (must stay 0 on Direct IBD after abs-only write).
     pub static SPEND_ANNOTATE_IDX: AtomicU64 = AtomicU64::new(0);
     /// Spends skipped (null create_fk or null spend_fk).
     pub static SPEND_ANNOTATE_SKIP: AtomicU64 = AtomicU64::new(0);
@@ -298,12 +301,22 @@ pub fn confirm_archived_at(
 /// See [`confirm_run`]: load → scripts → write. IBD uses the split
 /// phases for 3-stage pipeline overlap.
 pub use confirm_run::{
-    confirm_archived_run, confirm_load_phase, confirm_script_phase, confirm_scripts_phase,
+    confirm_archived_run, confirm_archived_run_preverified, confirm_load_phase,
+    confirm_load_phase_preverified, confirm_script_phase, confirm_scripts_phase,
     confirm_write_phase, ConfirmLoadOutcome, ConfirmScriptOutcome, LoadedBatch,
-    ScriptOkBatch,
+    ScriptOkBatch, ScriptPreverified,
 };
 
-/// Accept + archive + confirm in one step (genesis / tip extension tests).
+/// Accept + archive + confirm in one step (genesis / tip extension / tests).
+///
+/// **Same path as IBD confirm:** structure + header checks, then Class A
+/// archive, then [`confirm_archived_run`] (load pin denserels → scripts →
+/// structural → Class C → abs spend annotate). No empty-pin
+/// [`validate_block_connect`] and no separate `put_spend_batch_by_create`.
+///
+/// Idempotent when `height` is already confirmed for this block hash.
+/// Full script verify (no mempool skip) — use
+/// [`accept_and_connect_block_preverified`] on tip follow with a live mempool.
 pub fn accept_and_connect_block(
     query: &Query,
     params: &ChainParams,
@@ -311,53 +324,65 @@ pub fn accept_and_connect_block(
     block: &Block,
     milestone: Milestone,
 ) -> Result<rbitcoin_primitives::Fk, ConsensusError> {
-    let ctx = ValidationContext::at(params, height, milestone);
-    let txids = validate_block_structure_hashed(block, &ctx)?;
-    validate_header(query, params, height, &block.header)?;
-    validate_block_connect(query, block, &ctx, None)?;
-    let (header_rec, txs) = block_to_apply_with_txids(query, &block.header, &block.txdata, &txids)?;
-    let fk = query
-        .connect_block(height, &header_rec, &txs)
-        .map_err(ConsensusError::Store)?;
-    // Post Class C (same order as `confirm_archived_run`): durable spend annotate.
-    if query.spend_index_enabled() {
-        let tx_fks = query
-            .store()
-            .header_txs
-            .get_list(fk)
-            .map_err(ConsensusError::Store)?
-            .ok_or(ConsensusError::Store(StoreError::NotFound))?;
-        let mut by_create: Vec<(
-            rbitcoin_primitives::Fk,
-            u32,
-            rbitcoin_primitives::Fk,
-        )> = Vec::new();
-        for (ti, tx) in block.txdata.iter().enumerate() {
-            if ti == 0 {
-                continue;
+    accept_and_connect_block_preverified(
+        query,
+        params,
+        height,
+        block,
+        milestone,
+        &ScriptPreverified::new(),
+    )
+}
+
+/// Like [`accept_and_connect_block`], skipping script verify for `preverified`
+/// txids (tip follow: live mempool after accept). Reorg disconnect stays outside.
+pub fn accept_and_connect_block_preverified(
+    query: &Query,
+    params: &ChainParams,
+    height: Height,
+    block: &Block,
+    milestone: Milestone,
+    preverified: &ScriptPreverified,
+) -> Result<rbitcoin_primitives::Fk, ConsensusError> {
+    let hash = block.block_hash().to_byte_array();
+    // Already tip at this height — skip re-archive / re-confirm.
+    if let Some(h) = query
+        .height_of_hash(&hash)
+        .map_err(ConsensusError::Store)?
+    {
+        if h == height {
+            if let Some((fk, _)) = query
+                .get_header_by_hash(&hash)
+                .map_err(ConsensusError::Store)?
+            {
+                return Ok(fk);
             }
-            let spend_fk = tx_fks.get(ti).copied().unwrap_or(rbitcoin_primitives::Fk::NULL);
-            if spend_fk.is_null() {
-                continue;
-            }
-            for inp in &tx.input {
-                let op = inp.previous_output;
-                if let Some(cfk) = query
-                    .tx_fk_by_txid(op.txid.as_byte_array())
-                    .map_err(ConsensusError::Store)?
-                {
-                    by_create.push((cfk, op.vout, spend_fk));
-                }
-            }
-        }
-        if !by_create.is_empty() {
-            query
-                .store()
-                .put_spend_batch_by_create(&by_create)
-                .map_err(ConsensusError::Store)?;
         }
     }
-    Ok(fk)
+
+    // Fail closed on structure/header before durable Class A when possible.
+    // Softfork height gates + PoW/linkage; confirm re-checks mid-batch assemble.
+    let ctx = ValidationContext::at(params, height, milestone);
+    let _txids = validate_block_structure_hashed(block, &ctx)?;
+    validate_header(query, params, height, &block.header)?;
+
+    accept_and_archive_block(query, params, height, block, milestone)?;
+    let fks = confirm_archived_run_preverified(
+        query,
+        params,
+        milestone,
+        &[(height, hash)],
+        preverified,
+    )?;
+    if let Some(fk) = fks.into_iter().next() {
+        return Ok(fk);
+    }
+    // Write skipped heights ≤ tip (idempotent race after archive).
+    query
+        .get_header_by_hash(&hash)
+        .map_err(ConsensusError::Store)?
+        .map(|(fk, _)| fk)
+        .ok_or(ConsensusError::Store(rbitcoin_store::StoreError::NotFound))
 }
 
 /// Archive a block body (Class A) without confirming.

@@ -106,7 +106,8 @@ impl Query {
         if items.is_empty() {
             return Ok((st, batch_parents, batch_thin, batch_bodies));
         }
-        let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
+        // None tip: include genesis (height 0). `unwrap_or(0)` would skip h=0.
+        let tip = self.tip_height().map(|h| h.0);
 
         // Always re-decode / re-pin claimed heights (batch-local thin + parents).
         let mut work: Vec<(u32, [u8; 32])> = Vec::new();
@@ -115,8 +116,10 @@ impl Query {
                 crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Cancelled("confirm cancelled"));
             }
-            if height <= tip {
-                continue;
+            if let Some(t) = tip {
+                if height <= t {
+                    continue;
+                }
             }
             work.push((height, hash));
         }
@@ -228,31 +231,18 @@ impl Query {
                     crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                     return Err(StoreError::Cancelled("confirm cancelled"));
                 }
-                let Some(id) = fk.get() else {
+                if fk.get().is_none() {
                     continue;
-                };
+                }
                 if let Some((off, len)) = range {
                     need_full_meta.push((i, fk));
                     need_full.push((fk, off, len));
                 } else {
-                    // Rare: no range — sequential fallback.
-                    let (tx, inputs, outs) = self.store.get_tx_full(fk)?;
-                    st.body_tx_reads = st.body_tx_reads.saturating_add(1);
-                    let prevouts: Vec<(Option<u64>, [u8; 32], u32)> = inputs
-                        .iter()
-                        .map(|inp| {
-                            let soft = if inp.create_fk.is_null() {
-                                inp.prev_txid
-                            } else {
-                                [0u8; 32]
-                            };
-                            (inp.create_fk.get(), soft, inp.prev_index)
-                        })
-                        .collect();
-                    batch_create_ids.insert(id);
-                    body_prevouts.insert(id, (tx.txid, prevouts));
-                    batch_bodies.insert(fk, height, tx, inputs, outs);
-                    st.creates_registered = st.creates_registered.saturating_add(1);
+                    // Published create must have tx.idx range (prep invariant).
+                    return Err(StoreError::Corrupt(
+                        "invariant: confirm load create missing body range",
+                    )
+                    .into());
                 }
             }
             if !need_full.is_empty() {
@@ -394,21 +384,28 @@ impl Query {
             if let Some((_create_h, tx, outs, cb_hint, body_range, sparse_rels)) =
                 body_hits.remove(&pid)
             {
-                st.pin_cache_body = st.pin_cache_body.saturating_add(1);
-                let live = slim_outs_to_need(outs, &need_vouts);
-                // Coinbase flag only — write re-reads Class C height (authority).
-                // FIFO: optional spender layout for write spentness/annotate.
-                batch_parents.insert_owned(
-                    fk,
-                    tx,
-                    live,
-                    need_vouts,
-                    cb_hint,
+                // FIFO seed without denserels/body_range (e.g. put_bodies_from_batch_full)
+                // is not a valid pin hit for write annotate — re-pin via pin_new.
+                if crate::batch_parents::layout_covers_need(
                     body_range,
-                    sparse_rels,
-                );
-                st.utxo_parents = st.utxo_parents.saturating_add(1);
-                continue;
+                    &sparse_rels,
+                    &need_vouts,
+                ) {
+                    st.pin_cache_body = st.pin_cache_body.saturating_add(1);
+                    let live = slim_outs_to_need(outs, &need_vouts);
+                    // Coinbase flag only — write re-reads Class C height (authority).
+                    batch_parents.insert_owned(
+                        fk,
+                        tx,
+                        live,
+                        need_vouts,
+                        cb_hint,
+                        body_range,
+                        sparse_rels,
+                    );
+                    st.utxo_parents = st.utxo_parents.saturating_add(1);
+                    continue;
+                }
             }
             st.pin_new = st.pin_new.saturating_add(1);
             pin_new_pending.push((pid, need_vouts));
@@ -498,42 +495,54 @@ impl Query {
                             .and_then(|&slot| bulk_decoded[slot].take())
                     }
                 } else if !need_vouts.is_empty() {
-                    // Rare: no idx range — content only, no spender layout.
-                    self.store.get_tx_meta_and_outputs(fk).ok().map(|(tx, outs)| {
-                        let mut outs = outs;
-                        rbitcoin_store::clear_output_spender_fields(&mut outs);
-                        (tx, outs, Vec::new())
-                    })
+                    // Parent create must have tx.idx range for denserels/annotate.
+                    return Err(StoreError::Corrupt(
+                        "invariant: pin_new parent missing body range",
+                    )
+                    .into());
                 } else {
                     None
                 };
 
-                if let Some((tx, outs, dense_rels)) = dense {
-                    // Clone only the few need-vouts for the batch; move dense → FIFO.
-                    let live = slim_dense_outs_to_need(&outs, &need_vouts);
-                    let sparse = crate::batch_parents::sparse_spender_rels(&dense_rels, &need_vouts);
-                    // Cheap coinbase: multi-in ⇒ not cb. Single-in left unknown.
-                    let cb = if tx.input_count != 1 {
-                        Some(false)
-                    } else {
-                        None
-                    };
-                    fifo_seed.push((fk, 0, tx.clone(), outs, range, dense_rels));
-                    // pin_new: body layout for write spentness/annotate.
-                    batch_parents.insert_owned(
-                        fk,
-                        tx,
-                        live,
-                        need_vouts,
-                        cb,
-                        range,
-                        sparse,
-                    );
-                    st.full_tx_reads = st.full_tx_reads.saturating_add(1);
-                    if fifo_seed.len() >= FIFO_FLUSH {
-                        self.confirm_parents
-                            .put_dense_outs_batch(std::mem::take(&mut fifo_seed));
+                let Some((tx, outs, dense_rels)) = dense else {
+                    if !need_vouts.is_empty() {
+                        return Err(StoreError::Corrupt(
+                            "invariant: pin_new failed to decode parent denserels",
+                        )
+                        .into());
                     }
+                    continue;
+                };
+                // Clone only the few need-vouts for the batch; move dense → FIFO.
+                let live = slim_dense_outs_to_need(&outs, &need_vouts);
+                let sparse = crate::batch_parents::sparse_spender_rels(&dense_rels, &need_vouts);
+                if !crate::batch_parents::layout_covers_need(range, &sparse, &need_vouts) {
+                    return Err(StoreError::Corrupt(
+                        "invariant: pin_new denserels incomplete for need_vouts",
+                    )
+                    .into());
+                }
+                // Cheap coinbase: multi-in ⇒ not cb. Single-in left unknown.
+                let cb = if tx.input_count != 1 {
+                    Some(false)
+                } else {
+                    None
+                };
+                fifo_seed.push((fk, 0, tx.clone(), outs, range, dense_rels));
+                // pin_new: body layout for write spentness/annotate.
+                batch_parents.insert_owned(
+                    fk,
+                    tx,
+                    live,
+                    need_vouts,
+                    cb,
+                    range,
+                    sparse,
+                );
+                st.full_tx_reads = st.full_tx_reads.saturating_add(1);
+                if fifo_seed.len() >= FIFO_FLUSH {
+                    self.confirm_parents
+                        .put_dense_outs_batch(std::mem::take(&mut fifo_seed));
                 }
                 st.utxo_parents = st.utxo_parents.saturating_add(1);
             }

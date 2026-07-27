@@ -15,6 +15,7 @@ mod file;
 mod head_resize_fill;
 mod head_resolve_stream;
 pub mod head_resolve_stats;
+mod idx_body_pipeline;
 mod spend_annotate_uring;
 mod uring_session;
 mod ibd_io_policy;
@@ -68,10 +69,14 @@ pub use sorted_run::{
 pub use store::Store;
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};
 pub use head_resolve_stats::Sample as HeadResolveSample;
+pub use idx_body_pipeline::{
+    pipeline_enabled as idx_body_pipeline_enabled, run_idx_body_pipeline, BodyMode as IdxBodyMode,
+    IdxBodyJob,
+};
 pub use tx_table::{
-    clear_output_spender_fields, decode_packed_tx_outs_with_spender_rels, encode_packed_tx,
-    is_packed_tx_payload, scan_packed_meta_and_prevouts, InputRecord, OutputRecord, TxRecord,
-    PACKED_TX_V1,
+    clear_output_spender_fields, decode_packed_tx, decode_packed_tx_outs_with_spender_rels,
+    decode_packed_tx_with_spender_rels, encode_packed_tx, is_packed_tx_payload,
+    scan_packed_meta_and_prevouts, InputRecord, OutputRecord, TxRecord, PACKED_TX_V1,
 };
 
 /// Crate identity for diagnostics and coverage scenarios.

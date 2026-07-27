@@ -416,12 +416,24 @@ impl Store {
 
     /// Bulk Class A body ranges (archive sticky + confirm load).
     ///
-    /// Sorted mmap walk of `tx.idx` (contiguous runs coalesced).
+    /// Sorted mmap walk of `tx.idx` (contiguous runs coalesced). Prefer
+    /// [`Self::idx_body_pipeline`] when the caller also needs body bytes.
     pub fn tx_body_range_batch(
         &self,
         fks: &[Fk],
     ) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
         self.txs.body_range_batch(fks)
+    }
+
+    /// Completion-driven idx→body io_uring pipeline (confirm load / prep).
+    ///
+    /// Jobs with pre-known `range` skip idx. See [`crate::run_idx_body_pipeline`].
+    pub fn idx_body_pipeline(
+        &self,
+        jobs: &mut [crate::IdxBodyJob],
+        mode: crate::IdxBodyMode,
+    ) -> Result<(), StoreError> {
+        crate::run_idx_body_pipeline(&self.txs.body, jobs, mode)
     }
 
     /// Bulk full packed decode from known ranges (confirm load).

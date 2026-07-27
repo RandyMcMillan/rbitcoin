@@ -1296,11 +1296,10 @@ impl TxTable {
     /// Batch head resolve (archive prep bulk path).
     ///
     /// Default when io_uring is available: **streaming** resolve
-    /// ([`crate::head_resolve_stream`]) — mmap probe/idx + completion-driven
-    /// body prefix preads (deepest-cand-first early exit).  
-    /// Fallback / `RBITCOIN_HEAD_RESOLVE=batch`: phase-barrier with the **same
-    /// modalities** — mmap probe + mmap idx, then one [`crate::bulk_io::pread_batch`]
-    /// of body prefixes only (no io_uring/pread of `tx.head` or `tx.idx`).
+    /// ([`crate::head_resolve_stream`]) — mmap probe + completion-driven
+    /// **idx then body** preads (deepest-cand-first early exit).
+    /// Fallback / `RBITCOIN_HEAD_RESOLVE=batch`: mmap probe + idx→body pipeline
+    /// ([`crate::idx_body_pipeline`]) Prefix33 for all cands.
     ///
     /// BIP30: deepest matching body wins.
     /// Timers: [`crate::head_resolve_stats`] probe / idx / body.
@@ -1333,25 +1332,19 @@ impl TxTable {
 
     /// Phase-barrier resolve: mmap head probe + mmap idx, then bulk body prefixes.
     ///
-    /// Same modalities as streaming (no pread of `tx.head` / `tx.idx`); body
-    /// uses [`crate::bulk_io::pread_batch`] (io_uring or parallel pread). Checks
-    /// all candidates and keeps deepest match (BIP30).
+    /// mmap head probe + idx→body pipeline (Prefix33) for all cands; deepest match.
     pub(crate) fn get_fk_by_txid_batch_phased(
         &self,
         txids: &[[u8; 32]],
     ) -> Result<Vec<([u8; 32], Option<Fk>)>, StoreError> {
-        use crate::bulk_io::{self, ReadOp};
+        use crate::idx_body_pipeline::{run_idx_body_pipeline, BodyMode, IdxBodyJob};
         use std::time::Instant;
         if txids.is_empty() {
             return Ok(Vec::new());
         }
         crate::head_resolve_stats::add_keys(txids.len() as u64);
 
-        let body_fd = self.body.body_read_fd();
-        let body_path = self.body.body_file_path();
-        let body_pub = self.body.body_published_len();
-
-        // --- Phase 1: mmap probe (one page load + hop per key) ---
+        // --- Phase 1: mmap probe ---
         let t_probe = Instant::now();
         let mut cands_by_key: Vec<Vec<(u32, u64)>> = vec![Vec::new(); txids.len()];
         let mut cands_total = 0u64;
@@ -1360,8 +1353,6 @@ impl TxTable {
             for (i, txid) in txids.iter().enumerate() {
                 let cands = head.probe_fks(txid)?;
                 cands_total = cands_total.saturating_add(cands.len() as u64);
-                // probe_fks returns home→deep (hop order); depth = index so
-                // deeper slots win when picking best (BIP30 / streaming).
                 for (j, fk) in cands.into_iter().enumerate() {
                     cands_by_key[i].push((j as u32, fk.0));
                 }
@@ -1369,8 +1360,8 @@ impl TxTable {
         }
         crate::head_resolve_stats::add_probe(t_probe.elapsed().as_nanos() as u64);
 
-        // --- Phase 2: sorted mmap idx (same path as confirm load body_range_batch) ---
-        let t_idx = Instant::now();
+        // --- Phase 2+3: idx→body pipeline (Prefix33), sorted by fk ---
+        let t_pipe = Instant::now();
         struct CandRef {
             key_i: u32,
             depth: u8,
@@ -1386,84 +1377,35 @@ impl TxTable {
                 });
             }
         }
-        let cand_fks: Vec<Fk> = cand_refs.iter().map(|c| Fk(c.fk)).collect();
-        let cand_ranges = self.body.record_range_batch(&cand_fks)?;
-        struct BodyJob {
-            key_i: u32,
-            depth: u8,
-            fk: u64,
-            off: u64,
-            len: u64,
-        }
-        let mut jobs: Vec<BodyJob> = Vec::new();
-        for (c, range_opt) in cand_refs.into_iter().zip(cand_ranges.into_iter()) {
-            let Some((off, full_len)) = range_opt else {
-                continue;
-            };
-            if full_len == 0 {
-                continue;
-            }
-            let n = (full_len as usize).min(33);
-            if off.saturating_add(n as u64) > body_pub {
-                continue;
-            }
-            jobs.push(BodyJob {
-                key_i: c.key_i,
-                depth: c.depth,
-                fk: c.fk,
-                off,
-                len: n as u64,
-            });
-        }
-        crate::head_resolve_stats::add_idx(t_idx.elapsed().as_nanos() as u64);
+        let mut pipe_jobs: Vec<IdxBodyJob> = cand_refs
+            .iter()
+            .map(|c| IdxBodyJob::new(c.fk, None))
+            .collect();
+        run_idx_body_pipeline(&self.body, &mut pipe_jobs, BodyMode::Prefix33)?;
+        let pipe_ns = t_pipe.elapsed().as_nanos() as u64;
+        // Split wall roughly half for stats continuity.
+        crate::head_resolve_stats::add_idx(pipe_ns / 2);
+        crate::head_resolve_stats::add_body(pipe_ns.saturating_sub(pipe_ns / 2));
 
-        // --- Phase 3: bulk body prefix preads only ---
-        let t_body = Instant::now();
         let mut best: Vec<Option<(u64, u8)>> = vec![None; txids.len()];
         let mut body_lookups = 0u64;
-        if !jobs.is_empty() {
-            let mut prefixes: Vec<[u8; 33]> = vec![[0u8; 33]; jobs.len()];
-            let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(jobs.len());
-            // SAFETY: each prefixes[i] is a distinct element; unique indices.
-            for i in 0..jobs.len() {
-                let want = jobs[i].len as usize;
-                let ptr = prefixes[i].as_mut_ptr();
-                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, want) };
-                read_ops.push(ReadOp {
-                    fd: body_fd,
-                    offset: jobs[i].off,
-                    buf: slice,
-                    result: i32::MIN,
-                });
+        for (c, job) in cand_refs.iter().zip(pipe_jobs.iter()) {
+            if !job.ok || job.body.is_empty() {
+                continue;
             }
-            bulk_io::pread_batch(&mut read_ops);
-            for (i, ro) in read_ops.iter().enumerate() {
-                let job = &jobs[i];
-                let want = job.len as usize;
-                if ro.result < 0 {
-                    return Err(StoreError::io(
-                        body_path,
-                        std::io::Error::from_raw_os_error(-ro.result),
-                    ));
-                }
-                if ro.result as usize != want {
-                    return Err(StoreError::Corrupt("bulk body pread short"));
-                }
-                body_lookups = body_lookups.saturating_add(1);
-                let ki = job.key_i as usize;
-                let want_txid = &txids[ki];
-                match Self::txid_from_body_prefix(&prefixes[i][..want]) {
-                    Ok(got) if got == *want_txid => match best[ki] {
-                        Some((_, best_d)) if job.depth <= best_d => {}
-                        _ => best[ki] = Some((job.fk, job.depth)),
-                    },
-                    Ok(_) => {}
-                    Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {}
-                    Err(e) => return Err(e),
-                }
+            body_lookups = body_lookups.saturating_add(1);
+            let ki = c.key_i as usize;
+            let want_txid = &txids[ki];
+            match Self::txid_from_body_prefix(&job.body) {
+                Ok(got) if got == *want_txid => match best[ki] {
+                    Some((_, best_d)) if c.depth <= best_d => {}
+                    _ => best[ki] = Some((c.fk, c.depth)),
+                },
+                Ok(_) => {}
+                Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {}
+                Err(e) => return Err(e),
             }
         }
-        crate::head_resolve_stats::add_body(t_body.elapsed().as_nanos() as u64);
         crate::head_resolve_stats::add_cands(cands_total);
         crate::head_resolve_stats::add_body_lookups(body_lookups);
 

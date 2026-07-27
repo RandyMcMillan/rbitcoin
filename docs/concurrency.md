@@ -66,5 +66,17 @@ rehash** (especially large **header** / scripthash head shards when materializin
 audit history, mitigations, and operator levers (`ionice`, dedicated disk, rehash
 log lines). Spends no longer use a durable `point.head` (schema v5+).
 
+### Confirm load + archive prep read pipelines
+
+Cold `tx.idx` / `tx.body` on the **prep** and **confirm-load** threads use a
+completion-driven **idx→body io_uring pipeline** (`idx_body_pipeline`):
+
+- Idx CQE immediately arms the matching body pread (no full phase barrier).
+- Sticky / OutFifo range hits skip idx; same-batch pin skips store.
+- Each invocation owns a short-lived `UringSession` (prep and load may run two rings).
+- Fallback: `RBITCOIN_IO_URING=0` or `RBITCOIN_IDX_BODY_PIPELINE=0` → mmap
+  `record_range_batch` + `bulk_io::pread_batch` body.
+- Dense sticky commit ranges stay sequential mmap (`record_ranges`) — not forced uring.
+
 For **TB-scale store + Electrum on 16 GiB RAM**, the architectural plan (slim IBD,
 fat Electrum index, Class B redesign) is **[store-efficiency-plan.md](./store-efficiency-plan.md)**.

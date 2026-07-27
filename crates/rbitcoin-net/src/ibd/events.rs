@@ -973,6 +973,284 @@ mod confirm_reject_tests {
 
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    /// Block path charges budget + enqueues ArchiveJob; charged redelivery skips;
+    /// beyond-horizon marks missing; empty headers with idle path marks done.
+    #[test]
+    fn apply_peer_event_block_charge_horizon_and_headers_done() {
+        use super::{
+            apply_archive_result, apply_peer_event, drain_ready_peer_and_archive_events,
+            inject_learned_addrs,
+        };
+        use super::super::archive::{ArchiveQueueBudget, ArchiveResult};
+        use super::super::peer_io::{PeerEvent, PeerSlot};
+        use crate::seeds::AddrMan;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, Block, CompactTarget, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness,
+        };
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_query::Query;
+        use std::collections::HashSet;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::atomic::{AtomicU32, AtomicU64};
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        fn dummy_slot(id: usize) -> PeerSlot {
+            let (cmd_tx, _rx) = mpsc::unbounded_channel();
+            let task = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .spawn(async {});
+            PeerSlot {
+                id,
+                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 18444),
+                cmd_tx,
+                in_flight: HashSet::new(),
+                block_progress_ms: Arc::new(AtomicU64::new(0)),
+                peer_height: 5,
+                connected_ms: 1,
+                first_data_ms: AtomicU64::new(0),
+                bytes_rx: AtomicU64::new(0),
+                alive: true,
+                task,
+            }
+        }
+        fn coinbase(height: u32) -> Transaction {
+            let mut ss = if height == 0 {
+                vec![0x00]
+            } else {
+                rbitcoin_consensus::bip34_height_script(height)
+            };
+            while ss.len() < 2 {
+                ss.push(0x00);
+            }
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(ss),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        }
+        fn shell(prev: BlockHash, height: u32, n: u32) -> Block {
+            let header = Header {
+                version: Version::ONE,
+                prev_blockhash: prev,
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                time: 1_300_000_000 + n,
+                bits: CompactTarget::from_consensus(0x207fffff),
+                nonce: n,
+            };
+            let mut b = Block {
+                header,
+                txdata: vec![coinbase(height)],
+            };
+            b.header.merkle_root = b.compute_merkle_root().unwrap();
+            b
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-ev-block-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+
+        let mut st = IbdWorkState::new(vec![dummy_slot(1)], Some(gen), Some(0));
+        let (arch_tx, mut arch_rx) = mpsc::unbounded_channel();
+        let budget = ArchiveQueueBudget::new(16 * 1024 * 1024);
+        let write_next = AtomicU32::new(1);
+        let mut book = AddrMan::new();
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 1);
+
+        // Near block: charge + enqueue.
+        let b1 = shell(gen, 1, 1);
+        let h1 = b1.block_hash();
+        st.record_height(h1, 1);
+        st.header_fks
+            .insert(h1, hub.ensure_header_fk(&b1.header).unwrap());
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::Block {
+                peer: 1,
+                block: b1.clone(),
+            },
+            &arch_tx,
+            &budget,
+            &write_next,
+            &mut book,
+            local,
+        );
+        assert_eq!(budget.count(), 1);
+        assert!(st.body.is_archive_charged(&h1));
+        assert!(st.body.is_pending(&h1));
+        let job = arch_rx.try_recv().expect("ArchiveJob enqueued");
+        assert_eq!(job.block.block_hash(), h1);
+        assert!(job.priority, "height 1 is near tip/write_next");
+
+        // Redelivery while charged: no second charge.
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::Block {
+                peer: 1,
+                block: b1,
+            },
+            &arch_tx,
+            &budget,
+            &write_next,
+            &mut book,
+            local,
+        );
+        assert_eq!(budget.count(), 1);
+        assert!(arch_rx.try_recv().is_err());
+
+        // Beyond ContigPark horizon → mark_missing, no charge.
+        let far_h = 1u32 + super::super::CONTIG_DENSIFY_AHEAD + 10;
+        let far = shell(h1, far_h, far_h);
+        let far_hash = far.block_hash();
+        st.record_height(far_hash, far_h);
+        let before = budget.count();
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::Block {
+                peer: 1,
+                block: far,
+            },
+            &arch_tx,
+            &budget,
+            &write_next,
+            &mut book,
+            local,
+        );
+        assert_eq!(budget.count(), before);
+        assert_eq!(st.body.skip_download_cached(&far_hash), Some(false));
+
+        // Dropped without requeue leaves missing unset (charge only).
+        st.body.mark_archive_charged(h(0x55));
+        budget.charge(100);
+        apply_archive_result(
+            &mut st,
+            ArchiveResult::Dropped {
+                hash: h(0x55),
+                wire_bytes: 100,
+                requeue: false,
+            },
+            &budget,
+            &LoopStats::default(),
+        );
+        assert!(!st.body.is_archive_charged(&h(0x55)));
+        assert_eq!(st.body.skip_download_cached(&h(0x55)), None);
+
+        // Empty headers, path idle, lag ≤ 2 → headers_done.
+        st.max_peer_height = 0;
+        st.empty_header_streak = 0;
+        st.ordered.clear();
+        st.ordered_set.clear();
+        st.inflight.clear();
+        // Two empty messages (peers_n.max(2) = 2 with one alive peer).
+        for _ in 0..2 {
+            apply_peer_event(
+                &mut st,
+                &hub,
+                PeerEvent::Headers {
+                    peer: 1,
+                    headers: vec![],
+                },
+                &arch_tx,
+                &budget,
+                &write_next,
+                &mut book,
+                local,
+            );
+        }
+        assert!(st.headers_done, "idle empty-header streak marks done");
+
+        // inject at pool cap is a no-op.
+        use super::super::MAX_PEER_POOL;
+        for i in 0..MAX_PEER_POOL {
+            book.add(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(11, 0, (i / 256) as u8, (i % 256) as u8)),
+                8333,
+            ));
+        }
+        let n0 = book.len();
+        inject_learned_addrs(
+            &mut book,
+            &[SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 8333)],
+            local,
+            1,
+        );
+        assert_eq!(book.len(), n0);
+
+        // Drain with archive result + body event on channels.
+        let (body_tx, mut body_rx) = mpsc::unbounded_channel();
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+        let (arch_res_tx, mut arch_res_rx) = mpsc::unbounded_channel();
+        let drop_h = h(0x77);
+        st.body.mark_archive_charged(drop_h);
+        budget.charge(50);
+        arch_res_tx
+            .send(ArchiveResult::Ok {
+                hash: drop_h,
+                wire_bytes: 50,
+            })
+            .unwrap();
+        body_tx
+            .send(PeerEvent::BlockDecodeFailed {
+                peer: 1,
+                hash: h(0x88),
+            })
+            .unwrap();
+        ctrl_tx
+            .send(PeerEvent::Addrs {
+                peer: 1,
+                addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 8333)],
+            })
+            .unwrap();
+        // Book is full so addrs inject is no-op; still exercises drain path.
+        let stats = LoopStats::default();
+        drain_ready_peer_and_archive_events(
+            &mut st,
+            &hub,
+            &mut body_rx,
+            &mut ctrl_rx,
+            &mut arch_res_rx,
+            &arch_tx,
+            &budget,
+            &write_next,
+            &stats,
+            &mut book,
+            local,
+        )
+        .unwrap();
+        assert!(st.body.is_known_archived(&drop_h));
+        assert!(stats.drain_events.load(Ordering::Relaxed) >= 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 

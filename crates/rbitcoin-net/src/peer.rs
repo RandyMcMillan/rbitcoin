@@ -1422,6 +1422,337 @@ mod tests {
             .await
             .unwrap();
 
+            // SendCmpct with unsupported version is ignored.
+            handle_peer_frame(
+                frame_for(NetworkMessage::SendCmpct(SendCmpct {
+                    send_compact: false,
+                    version: 99,
+                })),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut ban,
+            )
+            .await
+            .unwrap();
+            assert!(send_cmpct); // still true from earlier v2
+            assert_eq!(cmpct_ver, 2);
+
+            // Inventory::Block (non-witness) for unknown → GetData WitnessBlock.
+            let want2 = BlockHash::from_byte_array([0xcc; 32]);
+            handle_peer_frame(
+                frame_for(NetworkMessage::Inv(vec![Inventory::Block(want2)])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut ban,
+            )
+            .await
+            .unwrap();
+            match out_rx.try_recv().unwrap() {
+                NetworkMessage::GetData(v) => {
+                    assert!(matches!(v[0], Inventory::WitnessBlock(h) if h == want2));
+                }
+                other => panic!("expected GetData, got {other:?}"),
+            }
+
+            // Inv for known tip → no GetData.
+            handle_peer_frame(
+                frame_for(NetworkMessage::Inv(vec![Inventory::WitnessBlock(tip)])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut ban,
+            )
+            .await
+            .unwrap();
+            assert!(out_rx.try_recv().is_err());
+
+            // GetData Inventory::Block for tip (non-witness arm).
+            handle_peer_frame(
+                frame_for(NetworkMessage::GetData(vec![Inventory::Block(tip)])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut ban,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(out_rx.try_recv().unwrap(), NetworkMessage::Block(_)));
+
+            // Full Block message path: pending + drain_pending (AlreadyHave for tip).
+            let gen_block2 = hub
+                .query
+                .reconstruct_block_by_hash(&tip.to_byte_array())
+                .unwrap()
+                .unwrap();
+            handle_peer_frame(
+                frame_for(NetworkMessage::Block(gen_block2)),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut ban,
+            )
+            .await
+            .unwrap();
+            // Tip already confirmed — drain accepts AlreadyHave and may leave empty pending.
+
+            // Tx without mempool is a no-op.
+            use bitcoin::absolute::LockTime;
+            use bitcoin::script::ScriptBuf;
+            use bitcoin::transaction::Version as TxVersion;
+            use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+            let dummy_tx = Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            handle_peer_frame(
+                frame_for(NetworkMessage::Tx(dummy_tx)),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut ban,
+            )
+            .await
+            .unwrap();
+
+            // Catch-all unknown command.
+            handle_peer_frame(
+                frame_for(NetworkMessage::Unknown {
+                    command: bitcoin::p2p::message::CommandString::try_from("zzzzzz").unwrap(),
+                    payload: vec![],
+                }),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut ban,
+            )
+            .await
+            .unwrap();
+
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    /// Mempool-backed inv/tx/getdata arms + cmpctblocktxn success.
+    #[test]
+    fn handle_peer_frame_mempool_tx_and_inv_paths() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness,
+        };
+        use tokio::runtime::Builder;
+
+        fn frame_for(msg: NetworkMessage) -> FramedMessage {
+            use bitcoin::p2p::message::RawNetworkMessage;
+            let magic = Magic::from(Network::Regtest);
+            let raw = RawNetworkMessage::new(magic, msg);
+            let full = serialize(&raw);
+            let command: [u8; 12] = full[4..16].try_into().unwrap();
+            let checksum: [u8; 4] = full[20..24].try_into().unwrap();
+            let payload = full[24..].to_vec();
+            FramedMessage {
+                magic,
+                command,
+                checksum,
+                payload,
+            }
+        }
+
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (dir, q) = tmp_store("handle-mp");
+            let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+            hub.ensure_genesis().unwrap();
+            let mp =
+                crate::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+            // Enable relay so Inv for txs triggers getdata.
+            mp.set_relay_enabled(true);
+            assert!(hub.attach_mempool(mp).is_ok());
+
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let mut wants_headers = false;
+            let mut wtxid = false;
+            let mut send_cmpct = false;
+            let mut cmpct_ver = 2u32;
+            let mut pending_headers = HashMap::new();
+            let mut pending_blocks = HashMap::new();
+            let mut pending_cmpct = HashMap::new();
+            let mut from_peer = HashMap::new();
+            let mut ban = 0u32;
+
+            let unknown_txid = bitcoin::Txid::from_byte_array([0x42; 32]);
+            handle_peer_frame(
+                frame_for(NetworkMessage::Inv(vec![
+                    Inventory::WitnessTransaction(unknown_txid),
+                    Inventory::WTx(bitcoin::Wtxid::from_byte_array([0x43; 32])),
+                ])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut ban,
+            )
+            .await
+            .unwrap();
+            match out_rx.try_recv().unwrap() {
+                NetworkMessage::GetData(v) => {
+                    assert!(v.len() >= 1);
+                }
+                other => panic!("expected GetData for unknown txs, got {other:?}"),
+            }
+
+            // GetData for missing tx → silent (no response).
+            handle_peer_frame(
+                frame_for(NetworkMessage::GetData(vec![
+                    Inventory::WitnessTransaction(unknown_txid),
+                    Inventory::WTx(bitcoin::Wtxid::from_byte_array([0x43; 32])),
+                ])),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut ban,
+            )
+            .await
+            .unwrap();
+            // No tx in mempool → no outbound.
+            assert!(out_rx.try_recv().is_err());
+
+            // Accept path with invalid prevout — still exercises Tx arm (inserts from_peer).
+            let junk = Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: bitcoin::Txid::from_byte_array([1u8; 32]),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::from_slice(&[vec![1]]),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            let junk_txid = junk.compute_txid();
+            handle_peer_frame(
+                frame_for(NetworkMessage::Tx(junk)),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut ban,
+            )
+            .await
+            .unwrap();
+            // Origin map is filled before accept result.
+            assert!(from_peer.contains_key(&junk_txid));
+
+            // rbtpkg with mempool + relay; empty/invalid payload is a quiet no-op.
+            handle_peer_frame(
+                frame_for(NetworkMessage::Unknown {
+                    command: bitcoin::p2p::message::CommandString::try_from("rbtpkg").unwrap(),
+                    payload: vec![0x00], // empty package count
+                }),
+                &hub,
+                &out_tx,
+                &mut wants_headers,
+                &mut wtxid,
+                &mut send_cmpct,
+                &mut cmpct_ver,
+                &mut pending_headers,
+                &mut pending_blocks,
+                &mut pending_cmpct,
+                &mut from_peer,
+                &mut ban,
+            )
+            .await
+            .unwrap();
+
             let _ = std::fs::remove_dir_all(dir);
         });
     }

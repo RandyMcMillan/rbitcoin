@@ -182,3 +182,56 @@ async fn ibd_no_peers_errors() {
     node.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Unreachable peer → dial fail / no peers connected (main-loop error arm).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ibd_unreachable_peer_errors() {
+    let dir = tmp_dir("unreachable");
+    let node = start_node(&dir).await;
+    let mut cfg = IbdConfig::for_test();
+    cfg.target_peers = 1;
+    cfg.connect_timeout = Duration::from_millis(150);
+    // TEST-NET-1 documentation address — closed / non-listening.
+    let dead: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let err = node.sync(&[dead], cfg).await.unwrap_err();
+    let s = err.to_string();
+    assert!(
+        s.contains("no peers") || s.contains("protocol") || s.contains("connect"),
+        "unexpected: {s}"
+    );
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Longer short chain (12 blocks) exercises multi-batch archive + confirm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn short_regtest_ibd_twelve_blocks() {
+    let seed_dir = tmp_dir("seed12");
+    let peer_dir = tmp_dir("peer12");
+
+    let seed = start_node(&seed_dir).await;
+    seed_chain(&seed, 12);
+    assert_eq!(seed.query.tip_height(), Some(Height(12)));
+
+    let peer = start_node(&peer_dir).await;
+    let mut cfg = IbdConfig::for_test();
+    cfg.target_peers = 1;
+    cfg.window = 32;
+    let n = peer
+        .sync(&[seed.local_addr], cfg)
+        .await
+        .expect("ibd sync 12");
+    assert!(n >= 12, "accepted={n}");
+    peer.wait_height(12, Duration::from_secs(30))
+        .await
+        .expect("tip 12");
+    assert_eq!(
+        peer.hub.tip_hash().unwrap(),
+        seed.hub.tip_hash().unwrap()
+    );
+
+    seed.shutdown().await;
+    peer.shutdown().await;
+    let _ = std::fs::remove_dir_all(&seed_dir);
+    let _ = std::fs::remove_dir_all(&peer_dir);
+}

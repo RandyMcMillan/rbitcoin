@@ -977,4 +977,53 @@ mod tests {
         sd.request();
         j.await.unwrap();
     }
+
+    /// `use_seeds=true` on regtest resolves empty seed set (covers seed inject path).
+    #[tokio::test]
+    async fn run_p2p_use_seeds_regtest_empty() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-seeds-{nanos}"));
+        let mut cfg = NodeConfig::default()
+            .with_datadir(&dir)
+            .with_network(rbitcoin_primitives::Network::Regtest)
+            .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+        cfg.use_seeds = true; // regtest: resolve_all_seeds → empty
+        cfg.connect.clear();
+        cfg.max_run_secs = Some(0);
+        cfg.milestone_height = 1; // log milestone branch
+        let result = tokio::time::timeout(Duration::from_secs(45), run_p2p(cfg)).await;
+        assert!(result.is_ok(), "run_p2p timed out");
+        result.unwrap().expect("run_p2p seeds regtest");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Electrum bind failure (port already taken / invalid) → warn path, still exits.
+    #[tokio::test]
+    async fn run_p2p_electrum_bind_fail_warns() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-el-fail-{nanos}"));
+        // Hold a port so electrum bind fails.
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = held.local_addr().unwrap();
+        let mut cfg = NodeConfig::default()
+            .with_datadir(&dir)
+            .with_network(rbitcoin_primitives::Network::Regtest)
+            .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+        cfg.use_seeds = false;
+        cfg.connect.clear();
+        cfg.electrum_listen = Some(addr); // already bound → fail
+        cfg.max_run_secs = Some(0);
+        let result = tokio::time::timeout(Duration::from_secs(45), run_p2p(cfg)).await;
+        assert!(result.is_ok(), "run_p2p timed out");
+        // Bind fail is non-fatal warn; run should still complete.
+        result.unwrap().expect("run_p2p despite electrum fail");
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

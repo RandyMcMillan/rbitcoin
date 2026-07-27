@@ -1494,4 +1494,276 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Live mempool txs: listunspent mempool outs, get_mempool rows, fee histogram,
+    /// estimatefee, transaction.get mempool path, broadcast accept, status_full.
+    #[test]
+    fn dispatch_live_mempool_surfaces() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version as BlockVersion};
+        use bitcoin::hashes::Hash;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, Block, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut,
+            TxMerkleNode, Witness,
+        };
+        use rbitcoin_consensus::{accept_and_connect_block, Milestone};
+        use rbitcoin_net::MempoolHub;
+        use rbitcoin_primitives::Height;
+        use rbitcoin_store::script_hash;
+        use std::sync::Arc;
+
+        if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+        }
+        let (dir, q) = tmp_store();
+        let params = ChainParams::regtest();
+        let ms = Milestone::NONE;
+
+        fn coinbase(height: u32) -> Transaction {
+            let mut ss = if height == 0 {
+                vec![0x00]
+            } else {
+                rbitcoin_consensus::bip34_height_script(height)
+            };
+            while ss.len() < 2 {
+                ss.push(0x00);
+            }
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(ss),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        }
+        fn mine(prev: bitcoin::BlockHash, time: u32, height: u32) -> Block {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let header = Header {
+                version: BlockVersion::ONE,
+                prev_blockhash: prev,
+                merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
+                time,
+                bits,
+                nonce: 0,
+            };
+            let mut block = Block {
+                header,
+                txdata: vec![coinbase(height)],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            block
+        }
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+        let mut tip = genesis.block_hash();
+        let mut tip_time = genesis.header.time;
+        let mut coinbase_txids = Vec::new();
+        for h in 1u32..=2 {
+            let b = mine(tip, tip_time + 600, h);
+            coinbase_txids.push(b.txdata[0].compute_txid());
+            accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+            tip = b.block_hash();
+            tip_time = b.header.time;
+        }
+
+        let q_arc = Arc::new(q);
+        let mp = MempoolHub::open(dir.join("mempool"), Arc::clone(&q_arc)).unwrap();
+        mp.set_relay_enabled(true);
+
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let sh = electrum_scripthash_hex(spk.as_bytes());
+        let parent = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: coinbase_txids[0],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 1_000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        mp.accept_tx(&parent).expect("accept parent");
+
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let mut header_sub = false;
+        let mut sh_subs = HashSet::new();
+
+        // History + mempool rows
+        let hist = dispatch(
+            "blockchain.scripthash.get_history",
+            &json!([sh]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(!hist.as_array().unwrap().is_empty());
+
+        let bal = dispatch(
+            "blockchain.scripthash.get_balance",
+            &json!([sh]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        let _ = bal["unconfirmed"].as_i64();
+
+        // listunspent: confirmed coinbases + mempool parent out (filter spent)
+        let unspent = dispatch(
+            "blockchain.scripthash.listunspent",
+            &json!([sh]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(!unspent.as_array().unwrap().is_empty());
+
+        let mem = dispatch(
+            "blockchain.scripthash.get_mempool",
+            &json!([sh]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(!mem.as_array().unwrap().is_empty());
+
+        let sub = dispatch(
+            "blockchain.scripthash.subscribe",
+            &json!([sh]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(sub.as_str().is_some());
+
+        let hist_fee = dispatch(
+            "mempool.get_fee_histogram",
+            &json!([]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(!hist_fee.as_array().unwrap().is_empty());
+
+        let est = dispatch(
+            "blockchain.estimatefee",
+            &json!([2]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(est.as_f64().unwrap() >= 0.0);
+
+        // Mempool transaction.get (parent not yet confirmed)
+        let parent_hex = {
+            let mut t = parent.compute_txid().to_byte_array();
+            t.reverse();
+            rbitcoin_primitives::hex_encode(t)
+        };
+        // Parent is live in mempool but also may resolve via chain if coinbase-related;
+        // get by parent txid — if not confirmed, hits mempool fallback.
+        let got = dispatch(
+            "blockchain.transaction.get",
+            &json!([parent_hex, true]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        );
+        // Either confirmed path or mempool — must succeed for live parent.
+        assert!(got.is_ok(), "{got:?}");
+
+        // Broadcast a second spend of coinbase[1]
+        let second = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: coinbase_txids[1],
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 2_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
+            }],
+        };
+        let raw = bitcoin::consensus::serialize(&second);
+        let raw_hex = rbitcoin_primitives::hex_encode(&raw);
+        let br = dispatch(
+            "blockchain.transaction.broadcast",
+            &json!([raw_hex]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .expect("broadcast");
+        assert!(br.as_str().unwrap().len() == 64);
+
+        // status_full with live mempool
+        let sh_bytes = script_hash(spk.as_bytes());
+        let st = scripthash_status_full(&q_arc, &mp, &sh_bytes).unwrap();
+        assert!(!st.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

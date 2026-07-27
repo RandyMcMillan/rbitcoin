@@ -604,4 +604,54 @@ mod tests {
             PeerEvent::Headers { .. }
         ));
     }
+
+    #[test]
+    fn socket_addrs_from_addr_and_addrv2_filter() {
+        use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
+        use bitcoin::p2p::ServiceFlags;
+
+        let good = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
+        let no_svc = Address::new(&good, ServiceFlags::NONE);
+        let net = Address::new(&good, ServiceFlags::NETWORK);
+        let limited = Address::new(
+            &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 8333),
+            ServiceFlags::NETWORK_LIMITED,
+        );
+        let unusable = Address::new(
+            &SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8333),
+            ServiceFlags::NETWORK,
+        );
+        let out = socket_addrs_from_addr(&[(1, no_svc), (2, net), (3, limited), (4, unusable)]);
+        assert_eq!(out.len(), 2);
+        assert!(out.contains(&good));
+        assert!(out.contains(&SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+            8333
+        )));
+
+        let v2_good = AddrV2Message {
+            time: 1,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 9)),
+            port: 18444,
+        };
+        let v2_bad_svc = AddrV2Message {
+            time: 1,
+            services: ServiceFlags::NONE,
+            addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 10)),
+            port: 18444,
+        };
+        let v2_zero_port = AddrV2Message {
+            time: 1,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 11)),
+            port: 0,
+        };
+        let out2 = socket_addrs_from_addrv2(&[v2_good, v2_bad_svc, v2_zero_port]);
+        assert_eq!(out2.len(), 1);
+        assert_eq!(
+            out2[0],
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 18444)
+        );
+    }
 }

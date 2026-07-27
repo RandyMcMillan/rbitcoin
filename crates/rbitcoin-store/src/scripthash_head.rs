@@ -910,6 +910,76 @@ mod tests {
     }
 
     /// Rehash, bulk_fill_empty, empty insert_many, clear miss, for_each, open.
+    /// reserve_additional / reserve_for_cold_bulk / bulk_fill error arms.
+    #[test]
+    fn scripthash_head_reserve_and_bulk_errors() {
+        // Single-file head: reserve_additional cold + rehash.
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-shhead-reserve-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let h = ScriptHashHead::create_with_slots(&path, 8).unwrap();
+        h.reserve_additional(0).unwrap();
+        h.reserve_additional(200).unwrap(); // cold grow empty
+        let mut k = [0u8; 32];
+        k[0] = 9;
+        h.insert(&k, &ShHeadValue::inline_one(ShEntry::new(Fk(1))))
+            .unwrap();
+        h.reserve_additional(50).unwrap(); // rehash when occupied
+        let _ = std::fs::remove_file(&path);
+
+        // Sharded facade: is_empty, cold bulk reserve, shard OOB.
+        let sh_path = std::env::temp_dir().join(format!(
+            "rbitcoin-shhead-sharded-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&sh_path);
+        let sh = ShardedScriptHashHead::create_sharded(&sh_path, 4, 16).unwrap();
+        assert!(sh.is_empty());
+        sh.reserve_additional(0).unwrap();
+        sh.reserve_for_cold_bulk(0).unwrap();
+        sh.reserve_for_cold_bulk(100).unwrap();
+        // Insert into one shard via insert_many if available, or single-key path
+        let mut k2 = [0u8; 32];
+        k2[0] = 0x10; // shard 1 of 4 when nibble-based
+        // Use first shard insert via sharded API if present
+        if let Ok(()) = sh.reserve_additional(1) {
+            // After cold reserve still empty until insert
+        }
+        // bulk_fill_one_shard_cold: shard OOB
+        let mut entries = Vec::new();
+        assert!(matches!(
+            sh.bulk_fill_one_shard_cold(9999, &mut entries),
+            Err(StoreError::Corrupt(_))
+        ));
+        // Non-empty: insert then cold bulk fails
+        // Prefer bulk_fill on empty shard 0
+        let mut fill = vec![(
+            {
+                let mut k = [0u8; 32];
+                k[0] = 0x00;
+                k
+            },
+            ShHeadValue::inline_one(ShEntry::new(Fk(3))),
+        )];
+        let _ = sh.bulk_fill_one_shard_cold(0, &mut fill);
+        if !sh.is_empty() {
+            assert!(matches!(
+                sh.reserve_for_cold_bulk(10),
+                Err(StoreError::Corrupt(_))
+            ));
+        }
+        let _ = std::fs::remove_dir_all(&sh_path);
+        let _ = std::fs::remove_file(&sh_path);
+    }
+
     #[test]
     fn scripthash_head_rehash_bulk_and_for_each() {
         let path = std::env::temp_dir().join(format!(

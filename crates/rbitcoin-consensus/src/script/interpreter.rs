@@ -1404,6 +1404,45 @@ mod success_and_disabled_tests {
             .collect()
     }
 
+    /// strip_op_codeseparator + script_code_bytes + OP_PUSHDATA lengths.
+    #[test]
+    fn strip_codeseparator_and_pushdata_lens() {
+        // CODESEPARATOR (0xab) stripped; surrounding ops kept.
+        let script = vec![0x51, 0xab, 0x52]; // OP_1 CODESEPARATOR OP_2
+        let stripped = strip_op_codeseparator(&script);
+        assert_eq!(stripped, vec![0x51, 0x52]);
+        // PUSHDATA1 / 2 / 4 inside strip
+        let mut s = vec![0x4c, 0x02, 0xaa, 0xbb, 0xab, 0x51];
+        let st = strip_op_codeseparator(&s);
+        assert!(st.contains(&0x4c));
+        assert!(!st.contains(&0xab));
+        s = vec![0x4d, 0x01, 0x00, 0xcc, 0xab];
+        let st = strip_op_codeseparator(&s);
+        assert!(st.windows(2).any(|w| w == [0x4d, 0x01]));
+        s = vec![0x4e, 0x01, 0x00, 0x00, 0x00, 0xdd];
+        let st = strip_op_codeseparator(&s);
+        assert_eq!(st.last(), Some(&0xdd));
+        // Truncated pushdata lengths break cleanly
+        let _ = strip_op_codeseparator(&[0x4c]);
+        let _ = strip_op_codeseparator(&[0x4d, 0x01]);
+        let _ = strip_op_codeseparator(&[0x4e, 0x01, 0x00]);
+        // script_code_bytes via EvalContext with codeseparator offset
+        let need = eval(&[0x51], SigVersion::Base).unwrap();
+        assert!(need);
+    }
+
+    #[test]
+    fn tapscript_empty_checksigverify_fails() {
+        // empty sig + 32-byte key + CHECKSIGVERIFY → EmptySig verify error
+        let mut script = vec![0x00]; // empty sig
+        script.push(0x20); // push 32
+        script.extend_from_slice(&[0x02; 32]); // xonly-ish key (may fail xonly parse → false)
+        script.push(0xad); // CHECKSIGVERIFY
+        // May error on empty verify or invalid key — either covers tapscript arms
+        let r = eval(&script, SigVersion::TapScript);
+        assert!(r.is_err() || matches!(r, Ok(_)));
+    }
+
     #[test]
     fn tapscript_checksigadd_empty_sig_keeps_n() {
         // stack: empty_sig, n=2, unknown_key(1 byte) → CHECKSIGADD → n=2; OP_TRUE

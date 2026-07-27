@@ -1085,6 +1085,55 @@ mod tests {
         let h2h2 = HashMap::new();
         let n3 = offer_confirm_ready(&feed, &h2h2, &mut body, &hub, &mut max_arch, &shared);
         assert_eq!(n3, 0);
+
+        // Already-confirmed tip heights are skipped (continue walking).
+        // Archive+confirm height 1 so has_block is true; offer from tip=1 expects 2.
+        let h2 = bh(0x22);
+        // tip is still 0 (genesis only) — mark genesis-next already confirmed via
+        // has_block is only true for store tip; exercise the continue arm by
+        // re-running offer after feed has height 1 already noted (inflight path).
+        feed.note(1, h1); // already ready — note is idempotent when not inflight
+        {
+            let mut g = feed.inner.lock().unwrap();
+            g.inflight.insert(1);
+            g.ready.remove(&1);
+        }
+        // With tip+1 inflight, offer still notes if ready map empty for that height.
+        let n4 = offer_confirm_ready(&feed, &h2h, &mut body, &hub, &mut max_arch, &shared);
+        // rejected path already cleared h1 from ready; height 1 still rejected → 0.
+        assert_eq!(n4, 0);
+
+        // Non-rejected multi-height walk: height 1 ready+archived, height 2 missing → stop after 1.
+        body = BodyPresence::new();
+        let mut h2h3 = HashMap::new();
+        h2h3.insert(1u32, h1);
+        h2h3.insert(2u32, h2);
+        body.mark_archived(h1);
+        // h2 not archived → offer stops after noting h1.
+        feed.finish([1]);
+        max_arch = 0;
+        let n5 = offer_confirm_ready(&feed, &h2h3, &mut body, &hub, &mut max_arch, &shared);
+        assert_eq!(n5, 1);
+        assert_eq!(max_arch, 1);
+        assert_eq!(feed.size_snap().0, 1);
+
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn claim_feed_skips_inflight_and_confirmed_in_helper() {
+        // Pure claim helper: inflight-like skip is modeled by already_confirmed.
+        // Heights 1..=10 present; skip 1,2,5 → claim 3,4,6,7,8,9,10 (7).
+        let run = claim_feed_run(
+            1,
+            8,
+            |h| (1..=10).contains(&h),
+            |h| h == 1 || h == 2 || h == 5,
+        );
+        assert_eq!(run.first().copied(), Some(3));
+        assert!(!run.contains(&5));
+        assert_eq!(run, vec![3, 4, 6, 7, 8, 9, 10]);
+        // Max 0 → empty.
+        assert!(claim_feed_run(1, 0, |_| true, |_| false).is_empty());
     }
 }

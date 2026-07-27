@@ -1097,6 +1097,10 @@ mod tests {
             Err(StoreError::Corrupt(_))
         ));
         assert!(matches!(
+            HeadLayout::with_entry_bytes(1, 4),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert!(matches!(
             HeadLayout::with_entry_bytes(16, 3),
             Err(StoreError::Corrupt(_))
         ));
@@ -1112,12 +1116,18 @@ mod tests {
         assert_eq!(entry_bytes_for_bits(33), 8);
 
         let k = [0xCDu8; 32];
+        // bits ≤ PAGE_SLOT_BITS → page_index returns 0
+        assert_eq!(page_index(&k, PAGE_SLOT_BITS), 0);
+        assert_eq!(page_index(&k, PAGE_SLOT_BITS.saturating_sub(1).max(MIN_BITS)), 0);
         let bits = 12u32;
         let pi = page_index(&k, bits);
         let h1 = h1_in_page(&k, bits);
         let h2 = h2_in_page(&k, bits);
         assert!(h1 < page_slot_count(bits));
         assert!(h2 < page_slot_count(bits) || page_slot_count(bits) > 0);
+        // h1_in_page / h2 when bits ≤ PAGE_SLOT_BITS
+        let _ = h1_in_page(&k, PAGE_SLOT_BITS);
+        let _ = h2_in_page(&k, PAGE_SLOT_BITS);
         let _ = (pi, h1, h2);
         assert_eq!(
             page_base_for_txid(&k, bits),
@@ -1688,6 +1698,58 @@ mod tests {
         assert_eq!(entry_bytes_for_bits(MAINNET_BITS), 4);
         // 4 B × 1024 = 4 KiB pages at mainnet default.
         assert_eq!(PAGE_SLOTS as usize * 4, 4096);
+    }
+
+    /// insert_fk_into_page_buf / store_entry error arms + empty page / invalid fk.
+    #[test]
+    fn insert_fk_page_buf_error_arms() {
+        let txid = [0x11u8; 32];
+        // Null fk
+        let mut page = vec![0u8; 4096];
+        assert!(matches!(
+            insert_fk_into_page_buf(&mut page, 0, 12, 4, &txid, Fk::NULL),
+            Err(StoreError::InvalidFk)
+        ));
+        // 4-byte entry can't hold fk > u32::MAX
+        assert!(matches!(
+            insert_fk_into_page_buf(&mut page, 0, 12, 4, &txid, Fk(u64::from(u32::MAX) + 1)),
+            Err(StoreError::InvalidFk)
+        ));
+        // Bad entry_bytes
+        assert!(matches!(
+            insert_fk_into_page_buf(&mut page, 0, 12, 6, &txid, Fk(1)),
+            Err(StoreError::Corrupt(_))
+        ));
+        // Empty page buffer
+        let mut empty = vec![];
+        assert!(matches!(
+            insert_fk_into_page_buf(&mut empty, 0, 12, 4, &txid, Fk(1)),
+            Err(StoreError::Corrupt(_))
+        ));
+        // Happy path insert + idempotent
+        let r = insert_fk_into_page_buf(&mut page, 0, 12, 4, &txid, Fk(7)).unwrap();
+        assert!(r.wrote_new);
+        let r2 = insert_fk_into_page_buf(&mut page, 0, 12, 4, &txid, Fk(7)).unwrap();
+        assert!(!r2.wrote_new);
+        // 8-byte entries
+        let mut page8 = vec![0u8; 8192];
+        let r8 = insert_fk_into_page_buf(&mut page8, 0, 12, 8, &txid, Fk(u64::from(u32::MAX) + 9))
+            .unwrap();
+        assert!(r8.wrote_new);
+        // probe_index bits ≤ PAGE_SLOT_BITS branch
+        let _ = probe_index(&txid, 0, MIN_BITS);
+        let _ = probe_index(&txid, 3, PAGE_SLOT_BITS);
+        // load_ratio zero slots
+        assert_eq!(load_ratio(10, 0), 0.0);
+        assert!(!load_needs_resize(0, 100));
+        // bits_for_scale env out of range falls back
+        let prev = std::env::var_os("RBITCOIN_TX_HEAD_BITS");
+        std::env::set_var("RBITCOIN_TX_HEAD_BITS", "999");
+        let _ = bits_for_scale();
+        match prev {
+            Some(v) => std::env::set_var("RBITCOIN_TX_HEAD_BITS", v),
+            None => std::env::remove_var("RBITCOIN_TX_HEAD_BITS"),
+        }
     }
 
     #[test]

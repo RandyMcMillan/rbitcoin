@@ -1935,4 +1935,103 @@ mod contig_park_edge_tests {
         assert_eq!(p.ready_prefix_len(), 0);
         assert!(p.take_contiguous(0).is_empty());
     }
+
+    #[test]
+    fn rewind_undoes_take_contiguous_advance() {
+        let mut p = ContigPark::new(10);
+        for h in 10..14 {
+            assert!(matches!(p.insert(job(h), 2048), ParkInsert::Parked));
+        }
+        let run = p.take_contiguous(3);
+        assert_eq!(run.len(), 3);
+        assert_eq!(p.next_h(), 13);
+        p.rewind(3);
+        assert_eq!(p.next_h(), 10);
+        // rewound HWM can re-park / re-take after re-insert
+        for h in 10..13 {
+            let _ = p.insert(job(h), 2048);
+        }
+        let run2 = p.take_contiguous(3);
+        assert_eq!(run2.len(), 3);
+        assert_eq!(p.next_h(), 13);
+        // saturating: rewind past zero
+        let mut p0 = ContigPark::new(0);
+        p0.rewind(5);
+        assert_eq!(p0.next_h(), 0);
+    }
+
+    #[test]
+    fn release_remaining_drains_pri_far_channels_and_park() {
+        use super::{
+            emit_archive_job_dropped, emit_archive_job_err, release_remaining_jobs,
+            ArchiveQueueBudget,
+        };
+        use super::super::events::apply_archive_result;
+        use super::super::state::IbdWorkState;
+        use super::super::status::LoopStats;
+
+        let budget = ArchiveQueueBudget::new(16 * 1024 * 1024);
+        let mut park = ContigPark::new(0);
+        for h in 0..3u32 {
+            let j = job(h);
+            budget.charge(j.wire_bytes);
+            assert!(matches!(park.insert(j, 2048), ParkInsert::Parked));
+        }
+        let (pri_tx, pri_rx) = std::sync::mpsc::sync_channel(4);
+        let (far_tx, far_rx) = std::sync::mpsc::sync_channel(4);
+        for h in 10..12u32 {
+            let j = job(h);
+            budget.charge(j.wire_bytes);
+            pri_tx.try_send(j).unwrap();
+        }
+        for h in 20..22u32 {
+            let j = job(h);
+            budget.charge(j.wire_bytes);
+            far_tx.try_send(j).unwrap();
+        }
+        assert_eq!(budget.count(), 7);
+
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+        release_remaining_jobs(&mut park, &pri_rx, &far_rx, &result_tx, "test drain");
+        assert_eq!(park.parked_len(), 0);
+
+        // emit helpers also surface Err / Dropped
+        let j_err = job(99);
+        budget.charge(j_err.wire_bytes);
+        emit_archive_job_err(&result_tx, j_err, "emit err");
+        let j_drop = job(98);
+        budget.charge(j_drop.wire_bytes);
+        emit_archive_job_dropped(&result_tx, j_drop, false);
+
+        let mut st = IbdWorkState::new(vec![], None, None);
+        let stats = LoopStats::default();
+        let mut n = 0usize;
+        while let Ok(r) = result_rx.try_recv() {
+            apply_archive_result(&mut st, r, &budget, &stats);
+            n += 1;
+        }
+        assert_eq!(n, 9, "3 park + 2 pri + 2 far + 2 emit helpers");
+        assert_eq!(budget.count(), 0);
+        assert_eq!(budget.bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod budget_env_tests {
+    use super::{ArchiveQueueBudget, DEFAULT_ARCHIVE_QUEUE_BUDGET_BYTES};
+
+    #[test]
+    fn from_env_parses_mb_override_and_default() {
+        // Unset / garbage → default (or whatever the process already has).
+        // We only assert the successful parse path is stable.
+        std::env::set_var("RBITCOIN_ARCHIVE_QUEUE_MB", "64");
+        let b = ArchiveQueueBudget::from_env();
+        assert_eq!(b.budget_bytes(), 64 * 1024 * 1024);
+        std::env::set_var("RBITCOIN_ARCHIVE_QUEUE_MB", "not-a-number");
+        let d = ArchiveQueueBudget::from_env();
+        assert_eq!(d.budget_bytes(), DEFAULT_ARCHIVE_QUEUE_BUDGET_BYTES);
+        std::env::remove_var("RBITCOIN_ARCHIVE_QUEUE_MB");
+        let d2 = ArchiveQueueBudget::from_env();
+        assert_eq!(d2.budget_bytes(), DEFAULT_ARCHIVE_QUEUE_BUDGET_BYTES);
+    }
 }

@@ -1111,6 +1111,66 @@ mod advise_tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Trailing-header open error arms (short, bad magic, bad schema/kind).
+    #[test]
+    fn trailing_header_open_error_arms() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rbitcoin-trail-err-{id}"));
+        let _ = std::fs::create_dir_all(&dir);
+        // Too short for footer
+        let short = dir.join("short");
+        std::fs::write(&short, b"tiny").unwrap();
+        assert!(matches!(
+            TableFile::open_trailing_header_from_end(&short, TableKind::Tx),
+            Err(StoreError::Corrupt(_))
+        ));
+        // Footer-sized but bad magic
+        let bad_magic = dir.join("badmag");
+        std::fs::write(&bad_magic, vec![0u8; TRAILING_FOOTER_LEN]).unwrap();
+        assert!(matches!(
+            TableFile::open_trailing_header_from_end(&bad_magic, TableKind::Tx),
+            Err(StoreError::BadMagic)
+        ));
+        // Valid trailing create then wrong kind / open paths
+        let good = dir.join("good");
+        let f = TableFile::create_trailing_header(&good, TableKind::Tx).unwrap();
+        // Grow body and rewrite footer so open_from_end sees full layout
+        f.ensure_capacity(4096 + TRAILING_FOOTER_LEN as u64).unwrap();
+        f.set_logical_len(4096 + TRAILING_FOOTER_LEN as u64).unwrap();
+        drop(f);
+        let (_f2, _ext) = TableFile::open_trailing_header_from_end(&good, TableKind::Tx).unwrap();
+        assert!(matches!(
+            TableFile::open_trailing_header_from_end(&good, TableKind::Header),
+            Err(StoreError::BadKind { .. })
+        ));
+        // open_trailing_header with explicit data_bytes
+        let good2 = dir.join("good2");
+        let f = TableFile::create_trailing_header(&good2, TableKind::Tx).unwrap();
+        f.ensure_capacity(1024 + TRAILING_FOOTER_LEN as u64).unwrap();
+        f.set_logical_len(1024 + TRAILING_FOOTER_LEN as u64).unwrap();
+        drop(f);
+        let (_f3, _) = TableFile::open_trailing_header(&good2, TableKind::Tx, 1024).unwrap();
+        // Short data_bytes vs file
+        assert!(TableFile::open_trailing_header(&good2, TableKind::Tx, 50_000).is_err());
+        // zero_range / load_store helpers on normal file
+        let path = dir.join("normal");
+        let f = TableFile::create(&path, TableKind::Tx).unwrap();
+        f.write_at(FILE_HEADER_LEN as u64, &[1, 2, 3, 4, 5, 6, 7, 8])
+            .unwrap();
+        let u = f.load_u32_le(FILE_HEADER_LEN as u64).unwrap();
+        assert_eq!(u, u32::from_le_bytes([1, 2, 3, 4]));
+        f.store_u32_le(FILE_HEADER_LEN as u64, 0x1122_3344).unwrap();
+        f.store_u64_le(FILE_HEADER_LEN as u64, 0x0102_0304_0506_0708)
+            .unwrap();
+        let _ = f.load_u64_le(FILE_HEADER_LEN as u64).unwrap();
+        f.zero_range(FILE_HEADER_LEN as u64, 8).unwrap();
+        f.set_logical_len(FILE_HEADER_LEN as u64 + 8).unwrap();
+        let _ = f.path();
+        let _ = f.data_len();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn table_file_surface_and_nofile_budget() {
         static N: AtomicU64 = AtomicU64::new(0);

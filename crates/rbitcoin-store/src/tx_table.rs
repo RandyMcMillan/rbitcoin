@@ -5348,5 +5348,167 @@ mod tests {
             decode_output_run(&trail_run, 2),
             Err(StoreError::Corrupt(_))
         ));
+
+        // Output value > i64::MAX (uleb overflow)
+        {
+            let mut bad = vec![0u8; 8]; // spender_field
+            bad.push(output_flags::EMPTY_SCRIPT);
+            // uleb128 of value that exceeds i64::MAX: 0xFF… with enough bytes
+            for _ in 0..10 {
+                bad.push(0xff);
+            }
+            bad.push(0x01);
+            assert!(matches!(
+                OutputRecord::decode_at(&bad),
+                Err(StoreError::Corrupt(_))
+            ));
+        }
+        // decode_prevout_at: create_fk null, prev_index too large, truncated fk
+        {
+            let mut null_fk = vec![0u8]; // no NULL_PREV
+            null_fk.extend_from_slice(&0u64.to_le_bytes());
+            null_fk.push(0);
+            assert!(matches!(
+                InputRecord::decode_prevout_at(&null_fk),
+                Err(StoreError::Corrupt(_))
+            ));
+            // truncated create_fk (only 3 bytes after flags)
+            assert!(matches!(
+                InputRecord::decode_prevout_at(&[0u8, 1, 2, 3]),
+                Err(StoreError::Corrupt(_))
+            ));
+            // prev_index too large: compact_size > u32::MAX
+            let mut big_vout = vec![0u8];
+            big_vout.extend_from_slice(&1u64.to_le_bytes());
+            // compact size 0xFF → 8-byte length follows; use value > u32::MAX
+            big_vout.push(0xff);
+            big_vout.extend_from_slice(&(u64::from(u32::MAX) + 1).to_le_bytes());
+            assert!(matches!(
+                InputRecord::decode_prevout_at(&big_vout),
+                Err(StoreError::Corrupt(_))
+            ));
+            // same for full decode_at
+            assert!(matches!(
+                InputRecord::decode_at(&big_vout),
+                Err(StoreError::Corrupt(_))
+            ));
+            // sequence truncated on decode_prevout (flags without SEQ_FINAL)
+            let mut short_seq = vec![0u8];
+            short_seq.extend_from_slice(&1u64.to_le_bytes());
+            short_seq.push(0); // vout 0
+            // only 2 of 4 sequence bytes
+            short_seq.extend_from_slice(&[1, 2]);
+            assert!(matches!(
+                InputRecord::decode_prevout_at(&short_seq),
+                Err(StoreError::Corrupt(_))
+            ));
+            // witness item truncated
+            let mut short_wit = vec![
+                input_flags::SEQ_FINAL, // no EMPTY_WITNESS
+            ];
+            short_wit.extend_from_slice(&1u64.to_le_bytes());
+            short_wit.push(0); // vout
+            short_wit.push(0); // empty script via compact 0? flags don't have EMPTY_SCRIPT
+            // Actually EMPTY_SCRIPT not set → need script len
+            // Rebuild: SEQ_FINAL | no EMPTY_SCRIPT | no EMPTY_WITNESS
+            let mut short_wit = vec![input_flags::SEQ_FINAL];
+            short_wit.extend_from_slice(&1u64.to_le_bytes());
+            short_wit.push(0); // vout
+            short_wit.push(0); // script len 0
+            short_wit.push(1); // 1 witness item
+            short_wit.push(5); // item len 5
+            short_wit.extend_from_slice(&[1, 2]); // only 2 bytes
+            assert!(matches!(
+                InputRecord::decode_at(&short_wit),
+                Err(StoreError::Corrupt(_))
+            ));
+        }
+        // packed outs short / count mismatch / trailing on outs_with_spender
+        {
+            let tx = TxRecord {
+                txid: [0xcd; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 2, // claim 2 outs but only encode 1
+            };
+            let inputs = [InputRecord::coinbase(u32::MAX, vec![], vec![])];
+            let outputs = [OutputRecord::unspent(1, vec![0x51])];
+            let mut raw = Vec::new();
+            // Manually pack with wrong meta count
+            raw.push(PACKED_TX_V1);
+            let mut meta = tx;
+            meta.output_count = 2;
+            raw.extend_from_slice(&meta.encode());
+            encode_input_run(&inputs, &mut raw);
+            encode_output_run(&outputs, &mut raw);
+            // ends after 1 output but meta says 2
+            assert!(matches!(
+                decode_packed_tx(&raw),
+                Err(StoreError::Corrupt(_))
+            ));
+            assert!(matches!(
+                decode_packed_tx_outs_with_spender_rels(&raw),
+                Err(StoreError::Corrupt(_))
+            ));
+            // short scan
+            assert!(matches!(
+                scan_packed_meta_and_prevouts(&[PACKED_TX_V1]),
+                Err(StoreError::Corrupt(_))
+            ));
+            // trailing on outs_only path
+            let mut good = Vec::new();
+            encode_packed_tx(
+                &TxRecord {
+                    txid: [1; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                &inputs,
+                &outputs,
+                &mut good,
+            );
+            let mut trail = good.clone();
+            trail.push(0xee);
+            assert!(matches!(
+                decode_packed_tx_outs_with_spender_rels(&trail),
+                Err(StoreError::Corrupt(_))
+            ));
+        }
+        // input run trailing
+        {
+            let mut irun = Vec::new();
+            encode_input_run(&[InputRecord::coinbase(u32::MAX, vec![], vec![])], &mut irun);
+            irun.push(0);
+            assert!(matches!(
+                decode_input_run(&irun, 1),
+                Err(StoreError::Corrupt(_))
+            ));
+        }
+    }
+
+    /// body_txid_range edge / corrupt paths (empty body, inverted range).
+    #[test]
+    fn body_txid_range_edges() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-txid-range-edge-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = create_tiny(&dir);
+        assert!(t.body_txid_range(10, 5).unwrap().is_empty());
+        // Beyond count → NotFound or empty ranges
+        let _ = t.body_txid_range(1, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -517,6 +517,51 @@ mod write_idempotent_tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
+    /// load_confirm_batch empty + resolve_body_metas store fallback (no plan).
+    #[test]
+    fn load_batch_empty_and_resolve_metas_fallback() {
+        use super::{load_confirm_batch, resolve_body_metas};
+        use crate::accept_and_connect_block;
+        use crate::milestone::Milestone;
+        use crate::params::ChainParams;
+        use rbitcoin_primitives::Height;
+        use rbitcoin_query::Query;
+        use std::sync::Once;
+
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-confirm-loadbatch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let q = Query::open_or_create(&path).unwrap();
+        let (bp, bt, bb) = load_confirm_batch(&q, &[], &[], 0).unwrap();
+        let _ = (bp, bt, bb);
+
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE)
+            .unwrap();
+        use bitcoin::hashes::Hash;
+        let hash = genesis.block_hash().to_byte_array();
+        // No header plan in cache → store fallback in resolve_body_metas
+        let metas = resolve_body_metas(&q, &[(Height::GENESIS, hash)]).unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].hash, hash);
+        // Missing hash → NotFound
+        assert!(resolve_body_metas(&q, &[(Height(9), [0xee; 32])]).is_err());
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     #[test]
     fn expected_bits_extending_height0_and_no_retarget() {
         use super::expected_bits_extending;

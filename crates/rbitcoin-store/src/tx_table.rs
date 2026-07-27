@@ -1270,8 +1270,9 @@ impl TxTable {
     /// Default when io_uring is available: **streaming** resolve
     /// ([`crate::head_resolve_stream`]) — mmap probe/idx + completion-driven
     /// body prefix preads (deepest-cand-first early exit).  
-    /// Fallback / `RBITCOIN_HEAD_RESOLVE=batch`: classic phase-barrier
-    /// probe→idx→body via [`crate::bulk_io::pread_batch`].
+    /// Fallback / `RBITCOIN_HEAD_RESOLVE=batch`: phase-barrier with the **same
+    /// modalities** — mmap probe + mmap idx, then one [`crate::bulk_io::pread_batch`]
+    /// of body prefixes only (no io_uring/pread of `tx.head` or `tx.idx`).
     ///
     /// BIP30: deepest matching body wins.
     /// Timers: [`crate::head_resolve_stats`] probe / idx / body.
@@ -1302,15 +1303,15 @@ impl TxTable {
         self.get_fk_by_txid_batch_phased(txids)
     }
 
-    /// Phase-barrier bulk pread path (probe all → idx all → body all).
+    /// Phase-barrier resolve: mmap head probe + mmap idx, then bulk body prefixes.
+    ///
+    /// Same modalities as streaming (no pread of `tx.head` / `tx.idx`); body
+    /// uses [`crate::bulk_io::pread_batch`] (io_uring or parallel pread). Checks
+    /// all candidates and keeps deepest match (BIP30).
     pub(crate) fn get_fk_by_txid_batch_phased(
         &self,
         txids: &[[u8; 32]],
     ) -> Result<Vec<([u8; 32], Option<Fk>)>, StoreError> {
-        use crate::address_head::{
-            h1_in_page, h2_in_page, hop_scan_page, page_file_off, page_pread_len,
-            page_slot_count, MAX_PROBE,
-        };
         use crate::bulk_io::{self, ReadOp};
         use std::time::Instant;
         if txids.is_empty() {
@@ -1318,350 +1319,117 @@ impl TxTable {
         }
         crate::head_resolve_stats::add_keys(txids.len() as u64);
 
-        // Snapshot head geometry + fd under a **brief** read lock, then drop.
-        // Holding `head.read()` for the whole batch starves resize swap.
-        // Cap page preads to **slot region** (not published_len — that includes footer).
-        let (bits, entry_bytes, head_fd, slot_region, head_path, head_slots) = {
-            let head = self.head.read().unwrap();
-            (
-                head.bits(),
-                head.entry_bytes(),
-                head.read_fd(),
-                head.slot_region_len(),
-                head.path_str().to_path_buf(),
-                head.slots(),
-            )
-        };
-        let idx_fd = self.body.idx_read_fd();
         let body_fd = self.body.body_read_fd();
-        let idx_path = self.body.idx_file_path();
         let body_path = self.body.body_file_path();
         let body_pub = self.body.body_published_len();
-        let idx_pub = self.body.idx_published_len();
-        let count = self.body.count();
-        let body_logical = self.body.body_logical_len().max(crate::file::FILE_HEADER_LEN as u64);
-        let es = entry_bytes;
-        let page_slots = page_slot_count(bits);
 
-        // --- Phase 1: one page pread per key ---
+        // --- Phase 1: mmap probe (one page load + hop per key) ---
         let t_probe = Instant::now();
-        let wants: Vec<usize> = txids
-            .iter()
-            .map(|t| page_pread_len(t, bits, es, head_slots, slot_region))
-            .collect();
-        let offs: Vec<u64> = txids
-            .iter()
-            .map(|t| page_file_off(t, bits, es))
-            .collect();
-
         let mut cands_by_key: Vec<Vec<(u32, u64)>> = vec![Vec::new(); txids.len()];
         let mut cands_total = 0u64;
-
-        let io_keys: Vec<usize> = wants
-            .iter()
-            .enumerate()
-            .filter(|(_, w)| **w > 0)
-            .map(|(i, _)| i)
-            .collect();
-        if !io_keys.is_empty() {
-            let total: usize = io_keys.iter().map(|&i| wants[i]).sum();
-            let mut arena = vec![0u8; total.max(1)];
-            let mut spans: Vec<(usize, usize, usize)> = Vec::with_capacity(io_keys.len());
-            let mut aoff = 0usize;
-            for &i in &io_keys {
-                let w = wants[i];
-                spans.push((i, w, aoff));
-                aoff += w;
-            }
-            let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(spans.len());
-            for &(i, w, a) in &spans {
-                let ptr = arena[a..a + w].as_mut_ptr();
-                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, w) };
-                read_ops.push(ReadOp {
-                    fd: head_fd,
-                    offset: offs[i],
-                    buf: slice,
-                    result: i32::MIN,
-                });
-            }
-            bulk_io::pread_batch(&mut read_ops);
-            // Syscall batch is a compiler barrier; Acquire pairs with sole-writer
-            // Release stores the same way mmap load_page_slots does.
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-            for (ro, &(key_i, want, a)) in read_ops.iter().zip(spans.iter()) {
-                if ro.result < 0 {
-                    return Err(StoreError::io(
-                        &head_path,
-                        std::io::Error::from_raw_os_error(-ro.result),
-                    ));
-                }
-                let got = (ro.result as usize).min(want);
-                let esz = es as usize;
-                let n = (got / esz) * esz;
-                if n < esz {
-                    continue;
-                }
-                let buf = &arena[a..a + n];
-                let txid = &txids[key_i];
-                let h1p = h1_in_page(txid, bits);
-                let h2p = h2_in_page(txid, bits);
-                // Use slots present in this buffer (not nominal page_slots) so a
-                // short pread never double-hashes past the end of `buf`.
-                let nslots = (n / esz) as u64;
-                let scan = hop_scan_page(buf, es, h1p, h2p, nslots.min(page_slots), MAX_PROBE);
-                for &(d, fk) in &scan.cands {
-                    cands_by_key[key_i].push((d, fk));
-                    cands_total = cands_total.saturating_add(1);
+        {
+            let head = self.head.read().unwrap();
+            for (i, txid) in txids.iter().enumerate() {
+                let cands = head.probe_fks(txid)?;
+                cands_total = cands_total.saturating_add(cands.len() as u64);
+                // probe_fks returns home→deep (hop order); depth = index so
+                // deeper slots win when picking best (BIP30 / streaming).
+                for (j, fk) in cands.into_iter().enumerate() {
+                    cands_by_key[i].push((j as u32, fk.0));
                 }
             }
         }
         crate::head_resolve_stats::add_probe(t_probe.elapsed().as_nanos() as u64);
 
-        // --- Phase 2: idx + body for every candidate ---
-        #[derive(Clone, Copy)]
-        enum Stage {
-            Idx { depth: u8, fk: u64 },
-            Body {
-                depth: u8,
-                fk: u64,
-                off: u64,
-                len: u64,
-            },
-        }
-
-        struct Op {
+        // --- Phase 2: mmap idx → body (off,len) for every cand ---
+        let t_idx = Instant::now();
+        struct BodyJob {
             key_i: u32,
-            stage: Stage,
-            buf: [u8; 33],
-            buf_len: u8,
-            file_off: u64,
-            fd: std::os::fd::RawFd,
-            range: (u64, u64),
-            prefix_n: usize,
-            dead: bool,
-            err: Option<StoreError>,
+            depth: u8,
+            fk: u64,
+            off: u64,
+            len: u64,
         }
-
-        struct KeyState {
-            best: Option<(u64, u8)>,
-        }
-
-        let mut keys: Vec<KeyState> = (0..txids.len())
-            .map(|_| KeyState { best: None })
-            .collect();
-
-        let mut scheduled: Vec<Op> = Vec::new();
+        let mut jobs: Vec<BodyJob> = Vec::new();
         for (i, cands) in cands_by_key.iter().enumerate() {
-            for &(d, fk) in cands {
-                scheduled.push(Op {
+            for &(depth, fk) in cands {
+                let range = match self.body.record_range(Fk(fk)) {
+                    Ok(r) => r,
+                    Err(StoreError::InvalidFk) | Err(StoreError::NotFound) => continue,
+                    Err(e) => return Err(e),
+                };
+                let (off, len) = range;
+                if len == 0 {
+                    continue;
+                }
+                let n = (len as usize).min(33);
+                if off.saturating_add(n as u64) > body_pub {
+                    continue;
+                }
+                jobs.push(BodyJob {
                     key_i: i as u32,
-                    stage: Stage::Idx {
-                        depth: d as u8,
-                        fk,
-                    },
-                    buf: [0u8; 33],
-                    buf_len: 0,
-                    file_off: 0,
-                    fd: idx_fd,
-                    range: (0, 0),
-                    prefix_n: 0,
-                    dead: false,
-                    err: None,
+                    depth: depth as u8,
+                    fk,
+                    off,
+                    len: n as u64,
                 });
             }
         }
+        crate::head_resolve_stats::add_idx(t_idx.elapsed().as_nanos() as u64);
 
+        // --- Phase 3: bulk body prefix preads only ---
+        let t_body = Instant::now();
+        let mut best: Vec<Option<(u64, u8)>> = vec![None; txids.len()];
         let mut body_lookups = 0u64;
-        while !scheduled.is_empty() {
-            let t_wave = Instant::now();
-            let mut any_idx = false;
-            let mut any_body = false;
-
-            for op in scheduled.iter_mut() {
-                match op.stage {
-                    Stage::Idx { fk, .. } => {
-                        any_idx = true;
-                        let id = fk;
-                        if id == 0 || id > count {
-                            op.dead = true;
-                            op.buf_len = 0;
-                            continue;
-                        }
-                        let idx_off = crate::file::FILE_HEADER_LEN as u64 + (id - 1) * 8;
-                        let nbytes: u8 = if id < count { 16 } else { 8 };
-                        if idx_off.saturating_add(u64::from(nbytes)) > idx_pub {
-                            op.dead = true;
-                            op.buf_len = 0;
-                            continue;
-                        }
-                        op.fd = idx_fd;
-                        op.file_off = idx_off;
-                        op.buf_len = nbytes;
-                        op.buf[..nbytes as usize].fill(0);
-                    }
-                    Stage::Body { off, len, .. } => {
-                        any_body = true;
-                        let n = (len as usize).min(33);
-                        if n == 0 {
-                            op.err = Some(StoreError::Corrupt("empty body for txid"));
-                            continue;
-                        }
-                        if off.saturating_add(n as u64) > body_pub {
-                            op.err = Some(StoreError::Corrupt("body past published"));
-                            continue;
-                        }
-                        op.fd = body_fd;
-                        op.file_off = off;
-                        op.buf_len = n as u8;
-                        op.buf[..n].fill(0);
-                    }
+        if !jobs.is_empty() {
+            let mut prefixes: Vec<[u8; 33]> = vec![[0u8; 33]; jobs.len()];
+            let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(jobs.len());
+            // SAFETY: each prefixes[i] is a distinct element; unique indices.
+            for i in 0..jobs.len() {
+                let want = jobs[i].len as usize;
+                let ptr = prefixes[i].as_mut_ptr();
+                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, want) };
+                read_ops.push(ReadOp {
+                    fd: body_fd,
+                    offset: jobs[i].off,
+                    buf: slice,
+                    result: i32::MIN,
+                });
+            }
+            bulk_io::pread_batch(&mut read_ops);
+            for (i, ro) in read_ops.iter().enumerate() {
+                let job = &jobs[i];
+                let want = job.len as usize;
+                if ro.result < 0 {
+                    return Err(StoreError::io(
+                        body_path,
+                        std::io::Error::from_raw_os_error(-ro.result),
+                    ));
+                }
+                if ro.result as usize != want {
+                    return Err(StoreError::Corrupt("bulk body pread short"));
+                }
+                body_lookups = body_lookups.saturating_add(1);
+                let ki = job.key_i as usize;
+                let want_txid = &txids[ki];
+                match Self::txid_from_body_prefix(&prefixes[i][..want]) {
+                    Ok(got) if got == *want_txid => match best[ki] {
+                        Some((_, best_d)) if job.depth <= best_d => {}
+                        _ => best[ki] = Some((job.fk, job.depth)),
+                    },
+                    Ok(_) => {}
+                    Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {}
+                    Err(e) => return Err(e),
                 }
             }
-
-            let io_idx: Vec<usize> = scheduled
-                .iter()
-                .enumerate()
-                .filter(|(_, op)| op.err.is_none() && op.buf_len > 0)
-                .map(|(i, _)| i)
-                .collect();
-            if !io_idx.is_empty() {
-                let total: usize = io_idx.iter().map(|&i| scheduled[i].buf_len as usize).sum();
-                let mut arena = vec![0u8; total];
-                let spans: Vec<(usize, usize)> = io_idx
-                    .iter()
-                    .map(|&i| (i, scheduled[i].buf_len as usize))
-                    .collect();
-                let mut rest = arena.as_mut_slice();
-                let mut pieces: Vec<&mut [u8]> = Vec::with_capacity(spans.len());
-                for &(_, len) in &spans {
-                    let (left, right) = rest.split_at_mut(len);
-                    pieces.push(left);
-                    rest = right;
-                }
-                let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(spans.len());
-                for (piece, &(op_i, _)) in pieces.into_iter().zip(spans.iter()) {
-                    let s = &scheduled[op_i];
-                    read_ops.push(ReadOp {
-                        fd: s.fd,
-                        offset: s.file_off,
-                        buf: piece,
-                        result: i32::MIN,
-                    });
-                }
-                bulk_io::pread_batch(&mut read_ops);
-                for (ro, &(op_i, len)) in read_ops.iter().zip(spans.iter()) {
-                    let op = &mut scheduled[op_i];
-                    if ro.result < 0 {
-                        let path: &std::path::Path = match op.stage {
-                            Stage::Idx { .. } => idx_path.as_ref(),
-                            Stage::Body { .. } => body_path.as_ref(),
-                        };
-                        op.err = Some(StoreError::io(
-                            path,
-                            std::io::Error::from_raw_os_error(-ro.result),
-                        ));
-                        continue;
-                    }
-                    // Idx/body still require full length (known sizes).
-                    if ro.result as usize != len {
-                        op.err = Some(StoreError::Corrupt("bulk pread short"));
-                        continue;
-                    }
-                    op.buf[..len].copy_from_slice(&ro.buf[..len]);
-                    match op.stage {
-                        Stage::Idx { fk, .. } => {
-                            let start = u64::from_le_bytes(op.buf[..8].try_into().unwrap());
-                            let end = if fk < count {
-                                u64::from_le_bytes(op.buf[8..16].try_into().unwrap())
-                            } else {
-                                body_logical
-                            };
-                            if end < start {
-                                op.err = Some(StoreError::Corrupt("var record end < start"));
-                            } else {
-                                op.range = (start, end - start);
-                            }
-                        }
-                        Stage::Body { .. } => {
-                            op.prefix_n = len;
-                        }
-                    }
-                }
-            }
-
-            let wave_ns = t_wave.elapsed().as_nanos() as u64;
-            if any_body && !any_idx {
-                crate::head_resolve_stats::add_body(wave_ns);
-            } else if any_idx && !any_body {
-                crate::head_resolve_stats::add_idx(wave_ns);
-            } else {
-                let parts = u64::from(any_idx) + u64::from(any_body);
-                let share = if parts > 0 { wave_ns / parts } else { 0 };
-                if any_idx {
-                    crate::head_resolve_stats::add_idx(share);
-                }
-                if any_body {
-                    crate::head_resolve_stats::add_body(share);
-                }
-            }
-
-            let mut next: Vec<Op> = Vec::with_capacity(scheduled.len());
-            for op in scheduled {
-                if let Some(e) = op.err {
-                    return Err(e);
-                }
-                let ki = op.key_i as usize;
-                match op.stage {
-                    Stage::Idx { depth, fk } => {
-                        if op.dead {
-                            continue;
-                        }
-                        let (off, len) = op.range;
-                        if len == 0 {
-                            continue;
-                        }
-                        next.push(Op {
-                            key_i: op.key_i,
-                            stage: Stage::Body {
-                                depth,
-                                fk,
-                                off,
-                                len,
-                            },
-                            buf: [0u8; 33],
-                            buf_len: 0,
-                            file_off: 0,
-                            fd: body_fd,
-                            range: (0, 0),
-                            prefix_n: 0,
-                            dead: false,
-                            err: None,
-                        });
-                    }
-                    Stage::Body { depth, fk, .. } => {
-                        body_lookups = body_lookups.saturating_add(1);
-                        let want = &txids[ki];
-                        match Self::txid_from_body_prefix(&op.buf[..op.prefix_n]) {
-                            Ok(got) if got == *want => match keys[ki].best {
-                                Some((_, best_d)) if depth <= best_d => {}
-                                _ => keys[ki].best = Some((fk, depth)),
-                            },
-                            Ok(_) => {}
-                            Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {}
-                            Err(e) => return Err(e),
-                        }
-                    }
-                }
-            }
-            scheduled = next;
         }
-
+        crate::head_resolve_stats::add_body(t_body.elapsed().as_nanos() as u64);
         crate::head_resolve_stats::add_cands(cands_total);
         crate::head_resolve_stats::add_body_lookups(body_lookups);
 
         let mut out = Vec::with_capacity(txids.len());
         for (i, txid) in txids.iter().enumerate() {
-            let hit = keys[i].best.map(|(id, _)| Fk(id));
+            let hit = best[i].map(|(id, _)| Fk(id));
             out.push((*txid, hit));
         }
         Ok(out)

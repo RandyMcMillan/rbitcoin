@@ -60,9 +60,11 @@ At **info**, you only get progress + slim perf. Enable **debug** when diagnosing
 caches this batch’s creates (not head-resolved parents).
 
 **Archive head resolve (default):** streaming — **mmap** probe + idx, **io_uring**
-body-prefix verify, deepest-cand-first early exit. Force the old phase-barrier
-bulk path with `RBITCOIN_HEAD_RESOLVE=batch`. `RBITCOIN_IO_URING=0` falls back to
-batch automatically.
+body-prefix verify, deepest-cand-first early exit. `RBITCOIN_HEAD_RESOLVE=batch`
+uses the same modalities in a phase-barrier shape (mmap head/idx, one bulk
+body-prefix wave). Neither path preads `tx.head` or `tx.idx` via io_uring —
+only **`tx.body`** prefixes. `RBITCOIN_IO_URING=0` falls back to batch (body
+via parallel pread).
 
 ## Defaults and memory budgets
 

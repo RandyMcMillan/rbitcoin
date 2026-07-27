@@ -16,30 +16,38 @@ order + map epochs**, not `Mutex` around mmap.
 If a change introduces a new long-held store lock on the IBD/read path, it is the
 wrong design — fix the protocol. See `docs/concurrency.md`.
 
-## Commit + release build after code changes
+## Commit + static musl release after code changes
 
 Whenever a turn **changes code** (or you finish a multi-step coding task in that turn):
 
 1. **Commit** the working tree with a clear message (what + why). Prefer one commit per logical checkpoint — especially before starting a risky follow-on experiment, so we can roll back. Do **not** leave multi-hour IBD perf/refactor work uncommitted.
-2. **Rebuild the portable static release** so the user’s binary matches the tree.
-   Always use the **musl static** package — never `cargo build --release` under
-   `nix-shell` for the operator binary (that produces a Nix-glibc dynamic link
-   that fails with `No such file or directory` outside the store).
+2. **Rebuild and install the portable static musl release** so
+   `./target/release/rbitcoin-node` matches the tree. This is **mandatory every
+   code-changing turn** — not optional after tests.
+
+### Required recipe (only this)
 
 ```bash
 nix build .#rbitcoin-musl --out-link result
 mkdir -p target/release
 install -m 755 result/bin/rbitcoin-node result/bin/rbitcoin-cli target/release/
-# optional: file target/release/rbitcoin-node  # expect "statically linked"
+file target/release/rbitcoin-node   # must say "statically linked" (musl)
 ```
 
-Do this even if tests already ran in debug — the operator runs
-`./target/release/rbitcoin-node`. Skip commit/build only when the turn was pure
-discussion with no compile-affecting edits. Docs that change the release recipe
-still need a fresh static install so the tree binary matches the docs.
+### Forbidden for the operator binary
 
-If you cannot commit (hooks, secrets, user said not to), still rebuild release
-and say explicitly that the tree was **not** committed.
+| Do **not** run | Why |
+|----------------|-----|
+| `nix-shell --run 'cargo build -p rbitcoin-node --release'` | Dynamic **Nix glibc** link; dies off-store with `No such file or directory` |
+| `cargo build --release` (host toolchain) | Same class of non-portable binary |
+| Leaving `target/release/` as the last **debug** or glibc build | User restarts IBD from that path |
+
+`nix-shell` / `cargo test` for **tests** is fine. Only the **shipped** node/cli
+under `target/release/` must come from `nix build .#rbitcoin-musl`.
+
+Skip commit/build only when the turn was pure discussion with no
+compile-affecting edits. If you cannot commit (hooks, secrets, user said not
+to), still do the static musl install and say the tree was **not** committed.
 
 ## Tests required for code changes
 

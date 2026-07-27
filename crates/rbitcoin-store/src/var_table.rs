@@ -89,11 +89,50 @@ impl VarTable {
     }
 
     /// Absolute `(offset, len)` of the unframed payload for `fk`.
+    ///
+    /// **Interior records (`id < count`):** one **16 B** idx load of adjacent
+    /// starts (no `published_body_end` / seqlock). Idx slots are immutable once
+    /// published; only a bounds check against `count` is required.
+    ///
+    /// **Last record (`id == count`):** seqlock `(count, body_end)` + one 8 B
+    /// start (length from `published_body_end`).
     pub fn record_range(&self, fk: Fk) -> Result<(u64, u64), StoreError> {
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
-        let (count, body_end) = self.published_meta();
-        let start = self.record_start(id, count)?;
-        let end = self.record_end_with(id, count, body_end)?;
+        if id == 0 {
+            return Err(StoreError::InvalidFk);
+        }
+        // Cheap bounds: Acquire sees count published under seqlock Release.
+        let count = self.count.load(Ordering::Acquire);
+        if id > count {
+            return Err(StoreError::NotFound);
+        }
+        if id < count {
+            return self.record_range_interior(id);
+        }
+        // id == count at load time: need consistent body_end (or we raced into interior).
+        let (count2, body_end) = self.published_meta();
+        if id > count2 {
+            return Err(StoreError::NotFound);
+        }
+        if id < count2 {
+            return self.record_range_interior(id);
+        }
+        // True last published record.
+        let start = self.record_start(id, count2)?;
+        if body_end < start {
+            return Err(StoreError::Corrupt("var record end < start"));
+        }
+        Ok((start, body_end - start))
+    }
+
+    /// `id` and `id+1` starts are adjacent u64s; both slots already published.
+    #[inline]
+    fn record_range_interior(&self, id: u64) -> Result<(u64, u64), StoreError> {
+        let mut pair = [0u8; 16];
+        self.idx
+            .read_at(FILE_HEADER_LEN as u64 + (id - 1) * 8, &mut pair)?;
+        let start = u64::from_le_bytes(pair[0..8].try_into().unwrap());
+        let end = u64::from_le_bytes(pair[8..16].try_into().unwrap());
         if end < start {
             return Err(StoreError::Corrupt("var record end < start"));
         }
@@ -551,6 +590,47 @@ mod tests {
         }
         stop.store(1, AtomicOrdering::Release);
         writer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Interior records: 16 B dual-start path; adjacent ranges abut; match bulk.
+    #[test]
+    fn record_range_interior_matches_adjacent_starts() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-var-interior-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = VarTable::create(&dir, "tx", TableKind::Tx).unwrap();
+        // Variable sizes so start deltas are non-uniform.
+        t.put_batch_encode(5, 256, |i, buf| {
+            buf.extend_from_slice(&vec![i as u8; 8 + i * 3]);
+        })
+        .unwrap();
+        assert_eq!(t.count(), 5);
+        for id in 1..=5u64 {
+            let (off, len) = t.record_range(Fk(id)).unwrap();
+            let raw = t.get_raw(Fk(id)).unwrap();
+            assert_eq!(raw.len() as u64, len, "id={id}");
+            assert_eq!(raw[0], (id - 1) as u8);
+            if id < 5 {
+                let (next_off, _) = t.record_range(Fk(id + 1)).unwrap();
+                assert_eq!(off + len, next_off, "interior abut id={id}");
+            }
+        }
+        let bulk = t.record_ranges(1, 5).unwrap();
+        for (i, &(off, len)) in bulk.iter().enumerate() {
+            assert_eq!(
+                (off, len),
+                t.record_range(Fk(1 + i as u64)).unwrap(),
+                "bulk vs single id={}",
+                1 + i
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

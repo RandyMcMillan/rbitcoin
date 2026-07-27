@@ -31,14 +31,15 @@ cargo test --workspace
 ./scripts/coverage.sh
 ```
 
-### Release binaries (byte-identical)
+### Release binaries (portable static, byte-identical)
 
-Do **not** treat host `cargo build --release` digests as canonical. Use the
-pinned flake package and the double-build check:
+Do **not** treat host or nix-shell `cargo build --release` digests as canonical
+(and do not ship those binaries to operators — they are not portable). Use the
+pinned **musl static** flake package and the double-build check:
 
 ```bash
-nix build .#rbitcoin
-./scripts/repro-check.sh both   # native glibc + musl
+nix build .#rbitcoin-musl
+./scripts/repro-check.sh          # two clean musl rebuilds; compare SHA-256
 ```
 
 See [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).

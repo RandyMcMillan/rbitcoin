@@ -15,11 +15,19 @@ in transit per peer.
 
 ## Build
 
+Portable **static musl** binary (runs on ordinary Linux without Nix):
+
 ```bash
-nix-shell
-cargo build -p rbitcoin-node --release
+nix build .#rbitcoin-musl
+mkdir -p target/release
+install -m 755 result/bin/rbitcoin-node result/bin/rbitcoin-cli target/release/
 ./target/release/rbitcoin-node --help
 ```
+
+Do not use `cargo build --release` under `nix-shell` for the operator binary —
+that produces a Nix-glibc dynamic link that fails outside the store. Dev/test
+builds stay on `nix develop` / `cargo test`; release is always musl static.
+See [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
 
 ## Logging
 

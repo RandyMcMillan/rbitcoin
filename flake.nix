@@ -24,18 +24,19 @@
             config = { };
             overlays = [ ];
           };
-          rbitcoin = pkgs.callPackage ./nix/rbitcoin.nix { };
+          # Optional dynamic glibc package (Nix-store linked; not portable off-store).
+          rbitcoin-glibc = pkgs.callPackage ./nix/rbitcoin.nix { };
+          # Primary / default: fully static musl — portable operator binary.
+          rbitcoin-musl = pkgs.pkgsStatic.callPackage ./nix/rbitcoin.nix { };
         in
         {
-          default = rbitcoin;
-          rbitcoin = rbitcoin;
-          rbitcoin-node = rbitcoin;
-          rbitcoin-cli = rbitcoin;
-        }
-        // {
-          # Secondary platform (distinct Rust target triple): fully static musl.
-          # Same host CPU, different libc/target than the glibc primary package.
-          rbitcoin-musl = pkgs.pkgsStatic.callPackage ./nix/rbitcoin.nix { };
+          default = rbitcoin-musl;
+          rbitcoin = rbitcoin-musl;
+          rbitcoin-node = rbitcoin-musl;
+          rbitcoin-cli = rbitcoin-musl;
+          rbitcoin-musl = rbitcoin-musl;
+          # Kept for store-native Nix environments / optional dual-platform repro.
+          rbitcoin-glibc = rbitcoin-glibc;
         }
         // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
           # Optional third platform: aarch64-linux cross from x86_64 (heavy toolchain).
@@ -92,7 +93,7 @@
       checks = forAllSystems (
         system:
         {
-          rbitcoin = self.packages.${system}.rbitcoin;
+          rbitcoin = self.packages.${system}.rbitcoin-musl;
         }
       );
     };

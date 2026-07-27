@@ -21,15 +21,25 @@ wrong design — fix the protocol. See `docs/concurrency.md`.
 Whenever a turn **changes code** (or you finish a multi-step coding task in that turn):
 
 1. **Commit** the working tree with a clear message (what + why). Prefer one commit per logical checkpoint — especially before starting a risky follow-on experiment, so we can roll back. Do **not** leave multi-hour IBD perf/refactor work uncommitted.
-2. **Rebuild release** so the user’s binary matches the tree:
+2. **Rebuild the portable static release** so the user’s binary matches the tree.
+   Always use the **musl static** package — never `cargo build --release` under
+   `nix-shell` for the operator binary (that produces a Nix-glibc dynamic link
+   that fails with `No such file or directory` outside the store).
 
 ```bash
-nix-shell --run 'cargo build -p rbitcoin-node --release'
+nix build .#rbitcoin-musl --out-link result
+mkdir -p target/release
+install -m 755 result/bin/rbitcoin-node result/bin/rbitcoin-cli target/release/
+# optional: file target/release/rbitcoin-node  # expect "statically linked"
 ```
 
-Do the release build even if tests already ran in debug — the operator typically runs `target/release/rbitcoin-node`. Skip commit/build only when the turn was pure discussion / docs with no compile-affecting edits.
+Do this even if tests already ran in debug — the operator runs
+`./target/release/rbitcoin-node`. Skip commit/build only when the turn was pure
+discussion with no compile-affecting edits. Docs that change the release recipe
+still need a fresh static install so the tree binary matches the docs.
 
-If you cannot commit (hooks, secrets, user said not to), still rebuild release and say explicitly that the tree was **not** committed.
+If you cannot commit (hooks, secrets, user said not to), still rebuild release
+and say explicitly that the tree was **not** committed.
 
 ## Tests required for code changes
 

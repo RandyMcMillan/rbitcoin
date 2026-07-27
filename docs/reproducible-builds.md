@@ -1,17 +1,21 @@
 # Reproducible builds
 
 Contributors with **Nix** (not necessarily NixOS) can produce **byte-for-byte
-identical** release binaries of `rbitcoin-node` and `rbitcoin-cli` for a given
-git revision and target triple.
+identical**, **fully static (musl)** release binaries of `rbitcoin-node` and
+`rbitcoin-cli` for a given git revision and target triple. These run on ordinary
+Linux hosts without a Nix store or matching glibc.
 
-Host-installed `rustc` / floating `import <nixpkgs> {}` are **not** the
-reproducible path. Use the pinned flake (or `default.nix` + `flake.lock`).
+Host-installed `rustc`, floating `import <nixpkgs> {}`, and
+`cargo build --release` inside `nix-shell` / `nix develop` are **not** the
+release path. The latter links against the Nix-store glibc interpreter and fails
+with `No such file or directory` when run outside that environment. Use the
+pinned flake (or `default.nix` + `flake.lock`) musl package.
 
 ## What is pinned
 
 | Input | Mechanism |
 |-------|-----------|
-| nixpkgs (glibc, rustc, cargo, linker, …) | `flake.lock` → `nixpkgs` rev + `narHash` |
+| nixpkgs (rustc, cargo, musl, linker, …) | `flake.lock` → `nixpkgs` rev + `narHash` |
 | Rust crate graph | `Cargo.lock` (crates.io checksums) |
 | Source tree | Flake `self` filtered via `lib.cleanSourceWith` in `nix/rbitcoin.nix` |
 
@@ -25,47 +29,57 @@ depend on the builder’s checkout path or username.
 - Network access the first time a pin is fetched into the store
 - Linux (packages are Linux-only; primary CI/agent is `x86_64-linux`)
 
-## Build (primary / native)
+## Build (primary / portable static)
 
 From the repository root:
 
 ```bash
-# Preferred
-nix build .#rbitcoin
+# Preferred — fully static musl (also the flake default package)
+nix build .#rbitcoin-musl
 # Binaries:
 #   ./result/bin/rbitcoin-node
 #   ./result/bin/rbitcoin-cli
 
-# Helper (same attr)
-./scripts/repro-build.sh native
+# Install where operators typically look:
+mkdir -p target/release
+install -m 755 result/bin/rbitcoin-node result/bin/rbitcoin-cli target/release/
+
+# Helper (same attr; default target is musl)
+./scripts/repro-build.sh
+# or: ./scripts/repro-build.sh musl
 ```
 
 Non-flake equivalent (still uses **`flake.lock`**, not `<nixpkgs>`):
 
 ```bash
-nix-build -A rbitcoin
+nix-build -A rbitcoin-musl
 ```
 
-Dev shell with the **same** pin (for tests/clippy — not required for release digests):
+Target triple is host-CPU musl (`x86_64-unknown-linux-musl` on x86_64 hosts,
+`aarch64-unknown-linux-musl` on aarch64 hosts) via `pkgsStatic`.
+
+Dev shell with the **same** pin (for tests/clippy — **not** for operator release
+binaries):
 
 ```bash
 nix develop
 # or: nix-shell   # shell.nix reads flake.lock
+cargo test --workspace
 ```
 
-## Second platform (musl static)
+## Optional: glibc dynamic (Nix-store linked)
 
-Distinct Rust target triple (`x86_64-unknown-linux-musl` on x86_64 hosts,
-`aarch64-unknown-linux-musl` on aarch64 hosts) via `pkgsStatic`:
+Only needed if you intentionally want a dynamic glibc link for store-native
+Nix environments. **Not** portable off the Nix store; not the operator default.
 
 ```bash
-nix build .#rbitcoin-musl
-./scripts/repro-build.sh musl
-# or: nix-build -A rbitcoin-musl
+nix build .#rbitcoin
+./scripts/repro-build.sh glibc
+# or: nix-build -A rbitcoin
 ```
 
-Binaries are fully static (musl). **Bit-identity with the glibc build is not
-expected**; only same-target digests must match across two clean musl builds.
+**Bit-identity with the musl build is not expected**; only same-target digests
+must match across two clean builds of the same package.
 
 ### Optional: aarch64-linux cross (x86_64 host)
 
@@ -82,8 +96,9 @@ checks when disk or cache is limited.
 Two independent clean rebuilds must yield the same SHA-256 for each binary:
 
 ```bash
-./scripts/repro-check.sh          # native (glibc) only
-./scripts/repro-check.sh both     # native + musl
+./scripts/repro-check.sh          # musl static (primary)
+./scripts/repro-check.sh both     # musl + optional glibc
+./scripts/repro-check.sh glibc    # glibc only
 ```
 
 What the script does:
@@ -97,8 +112,8 @@ What the script does:
 You can also compare by hand:
 
 ```bash
-nix build .#rbitcoin --out-link /tmp/rbitcoin-a --rebuild
-nix build .#rbitcoin --out-link /tmp/rbitcoin-b --rebuild
+nix build .#rbitcoin-musl --out-link /tmp/rbitcoin-a --rebuild
+nix build .#rbitcoin-musl --out-link /tmp/rbitcoin-b --rebuild
 sha256sum /tmp/rbitcoin-a/bin/* /tmp/rbitcoin-b/bin/*
 ```
 
@@ -109,15 +124,16 @@ Identical store paths after two pure builds are also fine; always hash the
 
 | Path | Role |
 |------|------|
-| `flake.nix` / `flake.lock` | Pinned inputs + package outputs |
+| `flake.nix` / `flake.lock` | Pinned inputs + package outputs (`default` = musl) |
 | `nix/rbitcoin.nix` | `buildRustPackage` for node + CLI |
 | `default.nix` | Non-flake attrset using the same pin |
 | `shell.nix` | Dev shell from the same pin |
-| `scripts/repro-build.sh` | One-shot build + print digests |
-| `scripts/repro-check.sh` | Double clean build gate |
+| `scripts/repro-build.sh` | One-shot build + print digests (default: musl) |
+| `scripts/repro-check.sh` | Double clean build gate (default: musl) |
 
 ## Non-goals
 
 - Matching digests across different target triples or OS/libc combinations
 - Reproducibility with an arbitrary host Rust toolchain outside Nix
 - Guix-style bootstrap of the compiler itself
+- Shipping nix-shell `cargo build --release` binaries as the operator product

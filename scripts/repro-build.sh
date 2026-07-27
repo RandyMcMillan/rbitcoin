@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# Build release rbitcoin-node + rbitcoin-cli via the pinned Nix path.
+# Build portable static (musl) rbitcoin-node + rbitcoin-cli via the pinned Nix path.
 # Usage:
-#   ./scripts/repro-build.sh                 # native package → ./result
+#   ./scripts/repro-build.sh                 # musl static → ./result
+#   ./scripts/repro-build.sh musl            # same
+#   ./scripts/repro-build.sh glibc           # optional dynamic glibc (not portable)
 #   ./scripts/repro-build.sh aarch64         # cross aarch64 (x86_64 host)
-#   ./scripts/repro-build.sh native ./out    # custom out-link path
+#   ./scripts/repro-build.sh musl ./out      # custom out-link path
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-TARGET="${1:-native}"
+TARGET="${1:-musl}"
 OUT_LINK="${2:-$ROOT/result}"
 
 if ! command -v nix >/dev/null 2>&1; then
@@ -18,17 +20,17 @@ if ! command -v nix >/dev/null 2>&1; then
 fi
 
 case "$TARGET" in
-  native|x86_64|default|gnu)
-    ATTR=".#rbitcoin"
-    ;;
-  musl|static|secondary)
+  musl|static|default|native|primary)
     ATTR=".#rbitcoin-musl"
+    ;;
+  glibc|gnu|dynamic)
+    ATTR=".#rbitcoin-glibc"
     ;;
   aarch64|aarch64-linux)
     ATTR=".#rbitcoin-aarch64"
     ;;
   *)
-    echo "usage: $0 [native|musl|aarch64] [out-link]" >&2
+    echo "usage: $0 [musl|glibc|aarch64] [out-link]" >&2
     exit 2
     ;;
 esac

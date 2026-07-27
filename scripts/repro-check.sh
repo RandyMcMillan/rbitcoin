@@ -3,15 +3,16 @@
 # or if Nix does not re-execute the builder (cache-hit theater).
 #
 # Usage:
-#   ./scripts/repro-check.sh              # native only
-#   ./scripts/repro-check.sh both         # native + musl (secondary triple)
-#   ./scripts/repro-check.sh musl         # musl only
+#   ./scripts/repro-check.sh              # musl static only (primary / default)
+#   ./scripts/repro-check.sh both         # musl + optional glibc
+#   ./scripts/repro-check.sh glibc        # glibc only
+#   ./scripts/repro-check.sh musl         # same as default
 #   REPRO_OUT=/path ./scripts/repro-check.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-MODE="${1:-native}"
+MODE="${1:-musl}"
 OUT="${REPRO_OUT:-${ROOT}/.repro-out}"
 rm -rf "$OUT"
 mkdir -p "$OUT"
@@ -118,14 +119,35 @@ check_target() {
   echo "OK: $tag outPath=$(cat "$OUT/${tag}-a.outPath")"
 }
 
-check_target ".#rbitcoin" "primary"
+run_musl=0
+run_glibc=0
+case "$MODE" in
+  musl|static|default|native|primary|"")
+    run_musl=1
+    ;;
+  glibc|gnu|dynamic)
+    run_glibc=1
+    ;;
+  both|all)
+    run_musl=1
+    run_glibc=1
+    ;;
+  *)
+    echo "usage: $0 [musl|glibc|both]" >&2
+    exit 2
+    ;;
+esac
 
-if [[ "$MODE" == "both" || "$MODE" == "musl" || "$MODE" == "secondary" ]]; then
+if [[ "$run_musl" -eq 1 ]]; then
   if ! nix eval --raw ".#rbitcoin-musl.name" >/dev/null 2>&1; then
-    echo "rbitcoin-musl attr unavailable on this flake/system" | tee "$OUT/repro-secondary-env-limit.txt"
+    echo "rbitcoin-musl attr unavailable on this flake/system" | tee "$OUT/repro-primary-env-limit.txt"
     exit 1
   fi
-  check_target ".#rbitcoin-musl" "secondary"
+  check_target ".#rbitcoin-musl" "primary"
+fi
+
+if [[ "$run_glibc" -eq 1 ]]; then
+  check_target ".#rbitcoin-glibc" "secondary"
 fi
 
 echo "=== all checks passed ==="

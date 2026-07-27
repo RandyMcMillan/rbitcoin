@@ -20,11 +20,13 @@ before trusting Electrum.
 ## Build
 
 ```bash
-nix-shell
-cargo build -p rbitcoin-node --release
+nix build .#rbitcoin-musl
+mkdir -p target/release
+install -m 755 result/bin/rbitcoin-node result/bin/rbitcoin-cli target/release/
 ```
 
-Binary: `./target/release/rbitcoin-node`. More knobs: [`OPERATOR.md`](../OPERATOR.md).
+Binary: `./target/release/rbitcoin-node` (fully static). More knobs:
+[`OPERATOR.md`](../OPERATOR.md).
 
 ## Signet lab first
 

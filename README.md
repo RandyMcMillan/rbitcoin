@@ -48,44 +48,51 @@ Prevouts, double-spend, maturity, and fees still run. Use **`--milestone 0`**
 for full script validation.
 
 ```bash
+# Portable static release (preferred)
+nix build .#rbitcoin-musl
+install -m 755 result/bin/rbitcoin-node result/bin/rbitcoin-cli target/release/
+
 # Signet lab (time-boxed)
-cargo build -p rbitcoin-node --release
 ./target/release/rbitcoin-node --datadir ./datadir-signet --network signet \
   --listen 127.0.0.1:38333 --milestone 200000 --max-run-secs 120
 ```
 
 ## Build
 
-### Reproducible release (recommended with Nix)
+### Portable static release (recommended)
 
-Pinned **nixpkgs + Cargo.lock** produce **byte-identical** `rbitcoin-node` /
-`rbitcoin-cli` for a given revision and target. Not NixOS-specific — any machine
-with [Nix](https://nixos.org/download/) + flakes:
+Pinned **nixpkgs + Cargo.lock** produce a **fully static, portable**
+`rbitcoin-node` / `rbitcoin-cli` (musl) that runs on ordinary Linux hosts without
+Nix or a matching glibc. Byte-identical digests for a given revision + target.
+Not NixOS-specific — any machine with [Nix](https://nixos.org/download/) + flakes:
 
 ```bash
-nix build .#rbitcoin          # glibc (primary)
-nix build .#rbitcoin-musl     # static musl (second triple)
-./scripts/repro-check.sh both # two clean rebuilds; compare SHA-256
+nix build .#rbitcoin-musl          # default package; fully static
+# or: ./scripts/repro-build.sh
+install -m 755 result/bin/rbitcoin-node result/bin/rbitcoin-cli target/release/
+./scripts/repro-check.sh           # two clean rebuilds; compare SHA-256
 ```
 
-Details: [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
+Do **not** use `cargo build --release` inside `nix-shell` / `nix develop` as the
+operator binary — that links against the Nix store glibc and fails outside the
+store (`No such file or directory` at exec). Details:
+[`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
 
 ### Dev / CI path
 
 Requires a recent Rust toolchain (workspace `rust-version` 1.74+). Prefer the
-**same pin** as release builds:
+**same pin** as release builds for tests and clippy:
 
 ```bash
 nix develop   # or: nix-shell  (both use flake.lock, not floating <nixpkgs>)
 cargo build --workspace
-cargo build -p rbitcoin-node --release
 cargo test --workspace
 ./scripts/coverage.sh   # PR bar: see CONTRIBUTING.md
 ```
 
-Binary: `./target/release/rbitcoin-node` (dev) or `./result/bin/rbitcoin-node`
-(Nix). Operator knobs: [`OPERATOR.md`](./OPERATOR.md). Experimental mainnet:
-[`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
+Operator binary: always the static install under `./target/release/` (or
+`./result/bin/`). Operator knobs: [`OPERATOR.md`](./OPERATOR.md). Experimental
+mainnet: [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md).
 
 ## Crate map
 

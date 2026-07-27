@@ -1636,6 +1636,53 @@ mod tests {
     }
 
     #[test]
+    fn resize_control_roundtrip_corrupt_and_paths() {
+        let path = tmp("resize_ctrl");
+        // Create empty head so path exists as a parent identity.
+        let h = AddressHead::create_with_bits(&path, 12).unwrap();
+        drop(h);
+        assert!(read_resize_control(&path).unwrap().is_none());
+        let ctrl = ResizeControl {
+            target: HeadLayout::new(13).unwrap(),
+            cursor: 42,
+            generation: 7,
+        };
+        write_resize_control(&path, &ctrl).unwrap();
+        let got = read_resize_control(&path).unwrap().unwrap();
+        assert_eq!(got.cursor, 42);
+        assert_eq!(got.generation, 7);
+        assert_eq!(got.target.bits, 13);
+        // Corrupt magic
+        let rpath = resize_control_path(&path);
+        std::fs::write(&rpath, b"XXXX________________").unwrap();
+        assert!(matches!(
+            read_resize_control(&path),
+            Err(StoreError::Corrupt(_))
+        ));
+        clear_resize_control(&path);
+        assert!(read_resize_control(&path).unwrap().is_none());
+        // Path helpers
+        assert!(shadow_head_path(&path)
+            .to_string_lossy()
+            .ends_with(".new"));
+        assert!(bak_head_path(&path).to_string_lossy().ends_with(".bak"));
+        // note_probe helpers
+        let _ = take_probe_depth_resize_request(); // clear
+        note_probe_depth_on_insert(PROBE_DEPTH_WARN); // no-op at threshold
+        note_probe_depth_on_insert(PROBE_DEPTH_WARN + 1); // first deep
+        assert!(take_probe_depth_resize_request());
+        note_probe_exhausted();
+        let (deep, exh) = probe_depth_stats_snapshot();
+        assert!(deep >= 1 || exh >= 1);
+        assert!(is_probe_exhausted_error(&StoreError::Corrupt(
+            "address head probe exhausted on insert"
+        )));
+        assert!(!is_probe_exhausted_error(&StoreError::Corrupt("other")));
+        let _ = std::fs::remove_file(&path);
+        clear_resize_control(&path);
+    }
+
+    #[test]
     fn mainnet_default_bits_is_26() {
         assert_eq!(MAINNET_BITS, 26);
         assert_eq!(entry_bytes_for_bits(MAINNET_BITS), 4);

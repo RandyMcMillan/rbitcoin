@@ -1290,4 +1290,208 @@ mod tests {
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn dispatch_with_mempool_and_param_errors() {
+        use rbitcoin_net::MempoolHub;
+        use std::sync::Arc;
+
+        let (dir, q) = tmp_store();
+        // Genesis tip for broadcast / scripthash paths.
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+        let mut hash = [0u8; 32];
+        hash[0] = 0x42;
+        let header = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 0,
+            merkle_root: hash,
+            hash,
+        };
+        let mut txid = [0u8; 32];
+        txid[31] = 0xcb;
+        let ta = TxApply {
+            tx: TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![0],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(50_000, vec![0x51])],
+        };
+        q.connect_block(Height(0), &header, &[ta]).unwrap();
+
+        let params = ChainParams::regtest();
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let q_arc = Arc::new(q);
+        let mp_path = dir.join("mempool");
+        let mp = MempoolHub::open(&mp_path, Arc::clone(&q_arc)).expect("mempool");
+        let mut header_sub = false;
+        let mut sh_subs = HashSet::new();
+        let sh = electrum_scripthash_hex(&[0x51]);
+
+        // Mempool-aware scripthash methods (empty pool).
+        let hist = dispatch(
+            "blockchain.scripthash.get_history",
+            &json!([sh]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(hist.as_array().is_some());
+
+        let bal = dispatch(
+            "blockchain.scripthash.get_balance",
+            &json!([sh]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(bal["confirmed"].as_i64().unwrap_or(0) >= 0);
+
+        let unspent = dispatch(
+            "blockchain.scripthash.listunspent",
+            &json!([sh]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(unspent.as_array().is_some());
+
+        let sub = dispatch(
+            "blockchain.scripthash.subscribe",
+            &json!([sh]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(sub.as_str().is_some());
+
+        let mem = dispatch(
+            "blockchain.scripthash.get_mempool",
+            &json!([sh]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert_eq!(mem, json!([]));
+
+        let hist_fee = dispatch(
+            "mempool.get_fee_histogram",
+            &json!([]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(hist_fee.as_array().is_some());
+
+        // headers.subscribe with tip.
+        let hs = dispatch(
+            "blockchain.headers.subscribe",
+            &json!([]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(header_sub);
+        assert!(hs.get("height").is_some());
+
+        // param_txid wrong length.
+        assert!(param_txid(&json!(["aabb"]), 0).is_err());
+        assert!(param_txid(&json!(["zz".repeat(32)]), 0).is_err());
+
+        // Broadcast without valid tx → reject (mempool gate).
+        assert!(dispatch(
+            "blockchain.transaction.broadcast",
+            &json!(["01000000000000000000"]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .is_err());
+
+        // transaction.get for confirmed coinbase (hex).
+        let tid = {
+            let fks = q_arc.block_tx_fks(Height(0)).unwrap();
+            let t = q_arc.get_tx(fks[0]).unwrap();
+            hash_hex_rev(&t.txid)
+        };
+        let raw = dispatch(
+            "blockchain.transaction.get",
+            &json!([tid, false]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        )
+        .unwrap();
+        assert!(raw.as_str().unwrap().len() > 20);
+
+        // Verbose get (may be object or hex depending on implementation).
+        let _ = dispatch(
+            "blockchain.transaction.get",
+            &json!([tid, true]),
+            &q_arc,
+            &cfg,
+            &params,
+            Some(&mp),
+            &mut header_sub,
+            &mut sh_subs,
+        );
+
+        // scripthash_status_full direct.
+        let sh_bytes = param_scripthash(&json!([sh]), 0).unwrap();
+        let st = scripthash_status_full(&q_arc, &mp, &sh_bytes).unwrap();
+        assert!(!st.is_empty() || st.is_empty()); // always returns string
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

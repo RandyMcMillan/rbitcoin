@@ -1336,6 +1336,75 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    /// MANIFEST missing/bad entries, orphan scan, legacy rebuild without MANIFEST.
+    #[test]
+    fn list_runs_manifest_missing_bad_and_legacy_heal() {
+        let d = tmp_dir();
+        // Catalog two runs via normal write.
+        write_sorted_run(&next_run_path(&d, 1), 32, 44, &rec(1, 1)).unwrap();
+        write_sorted_run(&next_run_path(&d, 2), 32, 44, &rec(2, 2)).unwrap();
+        // Delete seq=2 file but leave MANIFEST entry → missing path arm.
+        fs::remove_file(next_run_path(&d, 2)).unwrap();
+        let listed = list_runs(&d).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].seq(), Some(1));
+
+        // Plant a corrupt run listed as seq=3: write MANIFEST with extra entry.
+        let mut mf = load_manifest(&d).unwrap().unwrap();
+        mf.entries.push(ManifestEntry {
+            seq: 3,
+            key_len: 32,
+            rec_len: 44,
+            count: 1,
+            body_crc32: 0xdead_beef,
+        });
+        save_manifest(&d, &mf).unwrap();
+        // Bad file that fails open (wrong magic)
+        fs::write(next_run_path(&d, 3), b"notasortrunfile!!!!!!!!!!!!!").unwrap();
+        let listed2 = list_runs(&d).unwrap();
+        assert_eq!(listed2.len(), 1); // only seq=1 valid
+
+        // CRC mismatch against manifest when body_crc32 both non-zero.
+        write_sorted_run(&next_run_path(&d, 4), 32, 44, &rec(4, 4)).unwrap();
+        let run4 = open_run(&next_run_path(&d, 4)).unwrap();
+        let mut mf = load_manifest(&d).unwrap().unwrap();
+        if let Some(e) = mf.entries.iter_mut().find(|e| e.seq == 4) {
+            e.body_crc32 = run4.body_crc32 ^ 0xffff_ffff;
+        }
+        save_manifest(&d, &mf).unwrap();
+        // open_and_check should fail CRC; list_runs skips bad.
+        let expect = ManifestEntry {
+            seq: 4,
+            key_len: 32,
+            rec_len: 44,
+            count: 1,
+            body_crc32: run4.body_crc32 ^ 0xffff_ffff,
+        };
+        assert!(open_and_check_against_entry(&next_run_path(&d, 4), &expect).is_err());
+        let listed3 = list_runs(&d).unwrap();
+        // seq=4 skipped due to CRC
+        assert!(!listed3.iter().any(|r| r.seq() == Some(4)));
+
+        // Legacy heal: remove MANIFEST, keep a valid run → rebuilds catalog.
+        let d2 = tmp_dir();
+        write_sorted_run_file(&next_run_path(&d2, 7), 32, 44, &rec(7, 7)).unwrap();
+        assert!(!manifest_path(&d2).exists());
+        let listed_legacy = list_runs(&d2).unwrap();
+        assert_eq!(listed_legacy.len(), 1);
+        assert!(manifest_path(&d2).exists());
+
+        // write errors: bad key/rec, body not multiple
+        assert!(write_sorted_run_file(&d.join("x.run"), 0, 44, &[]).is_err());
+        assert!(write_sorted_run_file(&d.join("y.run"), 32, 16, &[]).is_err());
+        assert!(write_sorted_run_file(&d.join("z.run"), 32, 44, &[1, 2, 3]).is_err());
+
+        // empty dir
+        assert!(list_runs(&d.join("nope")).unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&d);
+        let _ = fs::remove_dir_all(&d2);
+    }
+
     #[test]
     fn detach_remove_next_path_and_opts() {
         let d = tmp_dir();

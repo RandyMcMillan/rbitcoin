@@ -192,4 +192,16 @@ mod tests {
         let _ = std::fs::remove_file(&file_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn ensure_datadir_rejects_file_path_after_parent_exists() {
+        // When datadir path is an existing regular file, ensure fails.
+        let parent = tmp();
+        std::fs::create_dir_all(&parent).unwrap();
+        let file_as_dir = parent.join("notdir");
+        std::fs::write(&file_as_dir, b"x").unwrap();
+        let cfg = NodeConfig::default().with_datadir(&file_as_dir);
+        assert!(cfg.ensure_datadir().is_err());
+        let _ = std::fs::remove_dir_all(&parent);
+    }
 }

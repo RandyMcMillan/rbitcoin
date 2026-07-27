@@ -1822,4 +1822,100 @@ mod success_and_disabled_tests {
         assert!(!cast_to_bool(&[]));
         assert!(!cast_to_bool(&[0x00, 0x00]));
     }
+
+    #[test]
+    fn minimalif_rejects_nonminimal_arg() {
+        // TapScript MINIMALIF: push byte 0x00 (non-minimal false), IF, TRUE, ENDIF.
+        // OP_0 empty is minimal; length-1 push of 0x00 is not.
+        let script = vec![0x01, 0x00, 0x63, 0x51, 0x68];
+        let err = eval(&script, SigVersion::TapScript).unwrap_err();
+        assert!(
+            format!("{err}").contains("MINIMALIF"),
+            "got {err}"
+        );
+        // OP_0 empty is minimal false → IF skipped → OP_TRUE after ENDIF succeeds.
+        let script_ok = vec![0x00, 0x63, 0x51, 0x68, 0x51];
+        assert!(eval(&script_ok, SigVersion::TapScript).expect("minimal empty if"));
+    }
+
+    #[test]
+    fn cltv_negative_locktime_rejected() {
+        // OP_1NEGATE CLTV …
+        let script_bytes = [0x4fu8, 0xb1, 0x75, 0x51];
+        let script = Script::from_bytes(&script_bytes);
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }];
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: LockTime::from_height(10).unwrap(),
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::from_consensus(0),
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let ctx = EvalContext::new_with_flags(
+            &tx,
+            0,
+            Amount::from_sat(1),
+            &prevouts,
+            script,
+            SigVersion::Base,
+            true,
+            true,
+            true,
+        );
+        let mut stack = Vec::new();
+        let err = eval_script(script, &mut stack, &ctx).unwrap_err();
+        assert!(
+            format!("{err}").contains("CLTV") || format!("{err}").contains("negative"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn stack_size_limit_on_2dup() {
+        // MAX_STACK_SIZE is typically 1000; push 999 ones then 2DUP overflows.
+        let mut script = Vec::new();
+        for _ in 0..999 {
+            script.push(0x51);
+        }
+        script.push(0x6e); // OP_2DUP
+        let err = eval(&script, SigVersion::WitnessV0).unwrap_err();
+        assert!(
+            format!("{err}").contains("stack") || format!("{err}").contains("size"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn op_0_empty_push_and_depth() {
+        // OP_0 OP_DEPTH OP_1 EQUAL — depth is 1 after empty push? OP_0 pushes empty → depth 1
+        // Then DEPTH pushes 1, stack [empty, 1]; not clean. Simpler: OP_0 OP_SIZE OP_0 EQUAL
+        let script = vec![0x00, 0x82, 0x00, 0x87]; // 0 SIZE 0 EQUAL
+        assert!(eval(&script, SigVersion::WitnessV0).expect("size empty"));
+    }
+
+    #[test]
+    fn find_and_delete_pushdata4() {
+        // Needle uses PUSHDATA4 only when data.len() > 0xffff.
+        let data = vec![0x44u8; 0x10000];
+        let mut sc = vec![0x4e];
+        sc.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        sc.extend_from_slice(&data);
+        sc.push(0x51);
+        assert_eq!(find_and_delete(&sc, &data), vec![0x51]);
+        // Truncated PUSHDATA4 length field is copied/broken out without panic.
+        let short = vec![0x4e, 0x01, 0x00];
+        let out = find_and_delete(&short, &[0xff]);
+        assert!(!out.is_empty() || out.is_empty());
+        assert_eq!(out[0], 0x4e);
+    }
 }

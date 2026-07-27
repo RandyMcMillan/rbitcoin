@@ -985,4 +985,87 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
     }
+
+    /// Multi-shard create/open/insert/reinit/flush + error arms.
+    #[test]
+    fn sharded_scripthash_head_create_open_and_errors() {
+        let base = std::env::temp_dir().join(format!(
+            "rbitcoin-sh-sharded-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // n=1 uses single-file path
+        let single = base.join("single");
+        let h1 = ShardedScriptHashHead::create_sharded(&single, 1, 32).unwrap();
+        assert_eq!(h1.shard_count(), 1);
+        let mut k = [0u8; 32];
+        k[0] = 0xab;
+        h1.insert(&k, &ShHeadValue::inline_one(ShEntry::new(Fk(9))))
+            .unwrap();
+        assert!(h1.get(&k).unwrap().is_some());
+        h1.clear_key(&k).unwrap();
+        h1.reinit_empty().unwrap();
+        h1.flush().unwrap();
+        h1.flush_async().unwrap();
+        drop(h1);
+
+        // Multi-shard directory layout
+        let multi = base.join("multi");
+        let h = ShardedScriptHashHead::create_sharded(&multi, 4, 16).unwrap();
+        assert_eq!(h.shard_count(), 4);
+        // route inserts across shards
+        for i in 0u8..16 {
+            let mut key = [0u8; 32];
+            key[0] = i.wrapping_mul(0x40); // spread high bits
+            h.insert(&key, &ShHeadValue::inline_one(ShEntry::new(Fk(i as u64 + 1))))
+                .unwrap();
+            assert_eq!(h.shard_index(&key), prefix_shard_of(&key, 4));
+        }
+        h.flush().unwrap();
+        drop(h);
+        // open_for_role directory
+        let h2 = ShardedScriptHashHead::open_for_role(&multi, HeadRole::ScriptHash).unwrap();
+        assert_eq!(h2.shard_count(), 4);
+        let key0 = [0u8; 32];
+        assert!(h2.get(&key0).unwrap().is_some());
+        h2.reinit_empty().unwrap();
+        assert!(h2.get(&key0).unwrap().is_none());
+        drop(h2);
+
+        // create on existing path fails
+        assert!(ShardedScriptHashHead::create_sharded(&multi, 4, 16).is_err());
+
+        // open empty dir
+        let empty = base.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(matches!(
+            ShardedScriptHashHead::open_for_role(&empty, HeadRole::ScriptHash),
+            Err(StoreError::Corrupt(_))
+        ));
+        // open missing
+        assert!(ShardedScriptHashHead::open_for_role(
+            base.join("nope"),
+            HeadRole::ScriptHash
+        )
+        .is_err());
+        // open single file via open_for_role
+        let h3 = ShardedScriptHashHead::open_for_role(&single, HeadRole::ScriptHash).unwrap();
+        assert_eq!(h3.shard_count(), 1);
+
+        // unexpected shard name
+        let bad = base.join("badnames");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("zz"), b"x").unwrap();
+        assert!(matches!(
+            ShardedScriptHashHead::open_for_role(&bad, HeadRole::ScriptHash),
+            Err(StoreError::Corrupt(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

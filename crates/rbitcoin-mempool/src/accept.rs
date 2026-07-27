@@ -1021,6 +1021,35 @@ mod tests {
             Err(AcceptError::NotFound(_))
         ));
 
+        // Negative fee.
+        let fat = spend_tx(op, 200_000);
+        assert!(matches!(
+            mp.accept_tx(&fat, &utxos),
+            Err(AcceptError::Policy(_))
+        ));
+
+        // rbf_pays_for_replacement pure unit.
+        assert!(!rbf_pays_for_replacement(100, 400, 100, 400));
+        assert!(!rbf_pays_for_replacement(100, 400, 200, 400));
+        // Higher fee and rate with incremental cover.
+        assert!(rbf_pays_for_replacement(50_000, 400, 1_000, 400));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rbf_replaces_conflicting_spend() {
+        let dir = tmp_dir();
+        let (op, _, utxos) = chain_utxo(1_000_000);
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let low = spend_tx(op, 999_000); // fee 1000
+        mp.accept_tx(&low, &utxos).unwrap();
+        // Conflict: same prevout, higher fee.
+        let high = spend_tx(op, 900_000); // fee 100_000
+        let r = mp.accept_tx(&high, &utxos).expect("rbf");
+        assert_eq!(r.txid, high.compute_txid());
+        assert!(!mp.graph.contains(&low.compute_txid()));
+        assert!(mp.graph.contains(&high.compute_txid()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

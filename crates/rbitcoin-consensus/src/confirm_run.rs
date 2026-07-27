@@ -516,6 +516,103 @@ mod write_idempotent_tests {
         assert!(matches!(err2, crate::error::ConsensusError::BadBlock(_)));
         let _ = std::fs::remove_dir_all(&path);
     }
+
+    #[test]
+    fn expected_bits_extending_height0_and_no_retarget() {
+        use super::expected_bits_extending;
+        use crate::params::ChainParams;
+        use bitcoin::CompactTarget;
+        use rbitcoin_primitives::Height;
+        use rbitcoin_query::Query;
+        use std::sync::Once;
+
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-confirm-bits-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let q = Query::open_or_create(&path).unwrap();
+        let params = ChainParams::regtest();
+        let gbits = expected_bits_extending(
+            &q,
+            &params,
+            Height(0),
+            CompactTarget::from_consensus(0),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            gbits,
+            crate::params::genesis_block(&params).header.bits
+        );
+        // No-pow-retargeting: any height returns prev_bits.
+        let prev = CompactTarget::from_consensus(0x207f_ffff);
+        let b = expected_bits_extending(&q, &params, Height(2016), prev, 100).unwrap();
+        assert_eq!(b, prev);
+
+        // ScriptOkBatch empty surfaces (mirror LoadedBatch).
+        use super::{confirm_scripts_phase, LoadedBatch};
+        let loaded = LoadedBatch {
+            prepared: Vec::new(),
+            wire_blocks: Vec::new(),
+            batch_parents: rbitcoin_query::BatchParents::new(),
+        };
+        let ok = confirm_scripts_phase(loaded).unwrap();
+        assert!(ok.batch.is_empty());
+        assert_eq!(ok.batch.len(), 0);
+        assert!(ok.batch.heights_hashes().is_empty());
+        assert_eq!(ok.batch.approx_wire_bytes(), 0);
+        assert_eq!(ok.batch.parent_count(), 0);
+
+        // check_bip34 wrong encoding
+        use super::check_bip34;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::hashes::Hash;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::{
+            Amount, Block, BlockHash, OutPoint, Sequence, Transaction, TxIn, TxOut, TxMerkleNode,
+            Witness,
+        };
+        let cb = Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x99]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let block = Block {
+            header: Header {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::from_byte_array([0; 32]),
+                merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+                time: 1,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![cb],
+        };
+        assert!(check_bip34(&block, 17).is_err());
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }
 
 

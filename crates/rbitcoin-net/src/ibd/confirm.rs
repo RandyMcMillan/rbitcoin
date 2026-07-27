@@ -1003,6 +1003,42 @@ mod tests {
     }
 
     #[test]
+    fn confirm_queue_depths_content_snap_and_notes() {
+        use super::ConfirmQueueDepths;
+        let q = ConfirmQueueDepths::new();
+        assert_eq!(q.snap(), (0, 0));
+        let c0 = q.content_snap();
+        assert_eq!(c0.load_batches, 0);
+        assert_eq!(c0.write_batches, 0);
+        assert_eq!(c0.feed_ready, 0);
+        assert_eq!(c0.feed_inflight, 0);
+
+        q.note_load_send(3, 1000, 2);
+        q.note_write_send(2, 500, 1);
+        let c1 = q.content_snap();
+        assert_eq!(c1.load_batches, 1);
+        assert_eq!(c1.load_blocks, 3);
+        assert_eq!(c1.load_wire_bytes, 1000);
+        assert_eq!(c1.load_parents, 2);
+        assert_eq!(c1.write_batches, 1);
+        assert_eq!(c1.write_blocks, 2);
+        assert_eq!(c1.write_wire_bytes, 500);
+        assert_eq!(c1.write_parents, 1);
+        assert_eq!(q.snap(), (1, 1));
+
+        q.note_load_recv(3, 1000, 2);
+        q.note_write_recv(2, 500, 1);
+        let c2 = q.content_snap();
+        assert_eq!(c2.load_batches, 0);
+        assert_eq!(c2.write_batches, 0);
+        assert_eq!(c2.load_blocks, 0);
+        assert_eq!(c2.write_blocks, 0);
+        // saturating sub: over-recv is safe
+        q.note_load_recv(99, 99, 99);
+        assert_eq!(q.content_snap().load_blocks, 0);
+    }
+
+    #[test]
     fn offer_confirm_ready_walks_height_map() {
         use super::offer_confirm_ready;
         use super::super::body::BodyPresence;

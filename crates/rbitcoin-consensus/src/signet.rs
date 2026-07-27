@@ -647,4 +647,50 @@ mod tests {
         assert!(find_subslice(b"hello world", b"world").is_some());
         assert!(find_subslice(b"abc", b"xyz").is_none());
     }
+
+    #[test]
+    fn push_data_mid_and_unknown_op_passthrough() {
+        // push_data uses PUSHDATA2 for len > 0xff (no PUSHDATA4 branch).
+        let mid = vec![0u8; 300];
+        let mut out = Vec::new();
+        push_data(&mut out, &mid);
+        assert_eq!(out[0], 0x4d);
+        assert_eq!(u16::from_le_bytes([out[1], out[2]]), 300);
+        // Bare 0x4e is treated as a non-push opcode (no solution).
+        assert!(fetch_and_clear_signet_section(&[0x4e, 0x05, 0x00, 0x00, 0x00, 0x01]).is_none());
+        // OP_RETURN + OP_TRUE: no signet header → None.
+        assert!(fetch_and_clear_signet_section(&[0x6a, 0x51]).is_none());
+    }
+
+    #[test]
+    fn modified_merkle_three_leaves() {
+        let raw = include_bytes!("../tests/fixtures/signet_block_1.bin");
+        let block: Block = deserialize(raw).unwrap();
+        let cb = block.txdata[0].clone();
+        // Build block with coinbase + 2 dummy non-cb (odd non-cb count after strip).
+        let dummy = |n: u8| Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([n; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let multi = Block {
+            header: block.header,
+            txdata: vec![cb.clone(), dummy(1), dummy(2)],
+        };
+        let root = modified_merkle_root(&cb, &multi).unwrap();
+        assert_ne!(root.to_byte_array(), [0u8; 32]);
+        let _ = cb;
+    }
 }

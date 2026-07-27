@@ -871,6 +871,60 @@ mod tests {
     }
 
     #[test]
+    fn accept_competing_tip_and_block_at_height_paths() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let b1 = mine(gen, 1_300_001_000, 1);
+        hub.accept_block(b1.clone()).unwrap();
+        assert_eq!(hub.tip_height(), Some(1));
+
+        // Competing tip at same height with more work reorgs (or IgnoredWeaker if equal).
+        // Mine many nonces for a sibling of b1 with higher work is hard on regtest
+        // equal-bits; exercise IgnoredWeaker via accept of a different equal-work sibling.
+        let mut sibling = mine(gen, 1_300_001_001, 1);
+        // Ensure different hash than b1.
+        if sibling.block_hash() == b1.block_hash() {
+            sibling.header.nonce = sibling.header.nonce.wrapping_add(1);
+            // re-mine pow
+            let target = Target::from_compact(sibling.header.bits);
+            for nonce in sibling.header.nonce..u32::MAX {
+                sibling.header.nonce = nonce;
+                if sibling.header.validate_pow(target).is_ok()
+                    && sibling.block_hash() != b1.block_hash()
+                {
+                    break;
+                }
+            }
+        }
+        let out = hub.accept_block(sibling).unwrap();
+        assert!(matches!(
+            out,
+            AcceptOutcome::IgnoredWeaker | AcceptOutcome::Accepted { .. }
+        ));
+
+        // block_at_height via reconstruct after tip extend.
+        let b2 = mine(hub.tip_hash().unwrap(), 1_300_001_100, 2);
+        hub.accept_block(b2.clone()).unwrap();
+        let got = hub.block_at_height(2).unwrap().unwrap();
+        assert_eq!(got.block_hash(), b2.block_hash());
+        // Far height → None.
+        assert!(hub.block_at_height(9_999).unwrap().is_none());
+
+        // attach_mempool + accept_block removes confirmed txs (empty mempool).
+        let mp_dir = dir.join("mp");
+        let mp = crate::tx_relay::MempoolHub::open(&mp_dir, Arc::clone(&hub.query)).unwrap();
+        assert!(hub.attach_mempool(mp).is_ok());
+        assert!(hub.mempool().is_some());
+        let tip = hub.tip_hash().unwrap();
+        let tip_h = hub.tip_height().unwrap();
+        let b_next = mine(tip, 1_300_001_200, tip_h + 1);
+        hub.accept_block(b_next).unwrap();
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn work_better_and_sum_work_helpers() {
         let z = Work::from_be_bytes([0u8; 32]);
         let one = {

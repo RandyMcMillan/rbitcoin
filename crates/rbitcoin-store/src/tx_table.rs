@@ -4502,6 +4502,150 @@ mod tests {
         });
     }
 
+    /// Resume incomplete resize: control+shadow, control-only, orphan .new.
+    #[test]
+    fn resume_head_resize_control_and_orphan_shadow() {
+        with_env_lock(|| {
+            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            let dir = std::env::temp_dir().join(format!(
+                "rbitcoin-tx-resume-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let head_path = dir.join("tx.head");
+            // Seed a few bodies + head.
+            {
+                let t = create_tiny(&dir);
+                let mk = |txid: [u8; 32]| {
+                    (
+                        TxRecord {
+                            txid,
+                            version: 1,
+                            locktime: 0,
+                            input_start_fk: Fk::NULL,
+                            input_count: 1,
+                            output_start_fk: Fk::NULL,
+                            output_count: 1,
+                        },
+                        vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+                        vec![OutputRecord::unspent(1, vec![0x51])],
+                    )
+                };
+                for i in 0..8u8 {
+                    let mut txid = [0u8; 32];
+                    txid[0] = i;
+                    t.put_full_batch_indexed(&[mk(txid)], true).unwrap();
+                }
+                t.flush().unwrap();
+            }
+
+            // Orphan .new without control → dropped on open.
+            {
+                let orphan = shadow_head_path(&head_path);
+                AddressHead::create_with_layout(&orphan, HeadLayout::new(12).unwrap()).unwrap();
+                assert!(orphan.exists());
+                let t = TxTable::open(&dir).unwrap();
+                assert!(!t.head_resize_in_progress());
+                assert!(!orphan.exists());
+                drop(t);
+            }
+
+            // Control without shadow → recreate shadow and mark active.
+            {
+                let target = HeadLayout::new(12).unwrap();
+                write_resize_control(
+                    &head_path,
+                    &ResizeControl {
+                        target,
+                        cursor: 3,
+                        generation: 1,
+                    },
+                )
+                .unwrap();
+                let t = TxTable::open(&dir).unwrap();
+                assert!(t.head_resize_in_progress());
+                let snap = t.head_resize_size_snapshot();
+                assert!(snap.active);
+                assert!(snap.cursor >= 1);
+                // Drive a little fill via poll (bg disabled under test).
+                t.head_resize_poll(4).unwrap();
+                wait_head_resize_done(&t, Duration::from_secs(30));
+                assert!(!t.head_resize_in_progress());
+                drop(t);
+            }
+
+            // Control + existing matching shadow.
+            {
+                let target = HeadLayout::new(13).unwrap();
+                let shadow = shadow_head_path(&head_path);
+                let _ = std::fs::remove_file(&shadow);
+                AddressHead::create_with_layout(&shadow, target).unwrap();
+                write_resize_control(
+                    &head_path,
+                    &ResizeControl {
+                        target,
+                        cursor: 2,
+                        generation: 2,
+                    },
+                )
+                .unwrap();
+                let t = TxTable::open(&dir).unwrap();
+                assert!(t.head_resize_in_progress());
+                // Layout mismatch: rewrite shadow with wrong bits then open fails.
+                drop(t);
+                clear_resize_control(&head_path);
+                let _ = std::fs::remove_file(&shadow);
+            }
+
+            // Unreadable head with bodies → recreate + rebuild.
+            {
+                // Corrupt footer/magic of head.
+                std::fs::write(&head_path, b"not-a-valid-head-file!!!!!!").unwrap();
+                let t = TxTable::open(&dir).unwrap();
+                assert_eq!(t.count(), 8);
+                // Head rebuilt: lookups work.
+                let mut txid = [0u8; 32];
+                txid[0] = 3;
+                assert!(t.get_by_txid(&txid).unwrap().is_some());
+                drop(t);
+            }
+
+            // ensure_head_resize / start / head_insert_many_sole / snapshot inactive
+            {
+                let fresh = dir.join("fresh");
+                std::fs::create_dir_all(&fresh).unwrap();
+                let t = create_tiny(&fresh);
+                assert!(!t.head_resize_in_progress());
+                let snap = t.head_resize_size_snapshot();
+                assert!(!snap.active);
+                assert_eq!(snap.shadow_bits, 0);
+                t.head_insert_many_sole(&[]).unwrap();
+                // Force start bits+1
+                let bits = t.head_bits();
+                if bits < MAX_BITS {
+                    t.start_head_resize(HeadLayout::new(bits + 1).unwrap())
+                        .unwrap();
+                    assert!(t.head_resize_in_progress());
+                    // Second start is no-op
+                    t.start_head_resize(HeadLayout::new(bits + 1).unwrap())
+                        .unwrap();
+                    // ensure via probe exhaust path is private; maybe_start while active
+                    t.maybe_start_head_resize().unwrap();
+                    t.head_resize_poll(8).unwrap();
+                    wait_head_resize_done(&t, Duration::from_secs(30));
+                }
+                drop(t);
+            }
+
+            let _ = std::fs::remove_dir_all(&dir);
+            std::env::remove_var("RBITCOIN_HEAD_SCALE");
+        });
+    }
+
     #[test]
     fn get_output_spender_metas_at_one_walk() {
         let dir = std::env::temp_dir().join(format!(

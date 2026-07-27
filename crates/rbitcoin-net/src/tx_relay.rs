@@ -497,6 +497,32 @@ mod tests {
         let mut junk = 4u32.to_le_bytes().to_vec();
         junk.extend_from_slice(&[0xff; 4]);
         assert!(decode_len_prefixed_package(&junk).is_err());
+        // Trailing bytes after valid package.
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([1u8; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let raw = serialize(&tx);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&raw);
+        payload.push(0xff); // trailing
+        assert!(decode_len_prefixed_package(&payload)
+            .unwrap_err()
+            .contains("trailing"));
 
         let store_dir = tmp();
         let q = Query::open_or_create(&store_dir).unwrap();
@@ -506,6 +532,23 @@ mod tests {
             vout: 0,
         };
         assert!(provider.get_txout(&op).is_none());
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn estimate_fee_percentiles_and_spent_outpoints_empty() {
+        let dir = tmp();
+        let store_dir = tmp();
+        let q = Query::open_or_create(&store_dir).unwrap();
+        let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+        // Empty → negative estimate for all targets.
+        assert!(hub.estimate_fee_btc_per_kb(1) < 0.0);
+        assert!(hub.estimate_fee_btc_per_kb(5) < 0.0);
+        assert!(hub.estimate_fee_btc_per_kb(100) < 0.0);
+        assert!(hub.spent_outpoints().is_empty());
+        assert!(hub.contains(&Txid::from_byte_array([0u8; 32])) == false);
+        assert!(hub.get_tx(&Txid::from_byte_array([0u8; 32])).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 }

@@ -1920,4 +1920,103 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn confirm_load_cancel_and_zero_io_paths() {
+        let (dir, q) = temp_query("load-cancel");
+        let mut prev = Fk::NULL;
+        let mut hashes = Vec::new();
+        for h in 0..2u32 {
+            let (header, ta) = coinbase_block(h, prev);
+            hashes.push(header.hash);
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+        }
+        // Cancel before load of archived-ahead body.
+        let (h2, ta2) = coinbase_block(2, prev);
+        let h2hash = h2.hash;
+        q.archive_block(&h2, &[ta2]).unwrap();
+        q.request_confirm_cancel();
+        let err = q.load_confirm_parents(&[(2, h2hash)]);
+        assert!(err.is_err(), "cancel must abort load");
+        q.clear_confirm_cancel();
+
+        // Empty input/output run helpers.
+        let empty_tx = TxRecord {
+            txid: [0xab; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 0,
+            output_start_fk: Fk::NULL,
+            output_count: 0,
+        };
+        assert!(q.tx_input_run(&empty_tx).unwrap().is_empty());
+        assert!(q
+            .tx_input_run_class_a(Fk(1), &empty_tx)
+            .unwrap()
+            .is_empty());
+
+        // ArchiveWritePlan empty helper.
+        let plan = ArchiveWritePlan::empty();
+        assert!(plan.is_empty());
+
+        // disconnect with zero-output tx: already covered via coinbase; ensure
+        // confirm_block NotFound for unknown hash.
+        assert!(q.confirm_block(Height(9), &[0xde; 32]).is_err());
+
+        // header_tx_fks / flush_for_shutdown / flush_header_archive.
+        let tip_fk = q.tip_header_fk().unwrap().unwrap();
+        let fks = q.header_tx_fks(tip_fk, None).unwrap().unwrap_or_default();
+        assert!(!fks.is_empty());
+        q.flush_for_shutdown().unwrap();
+        q.flush_header_archive().unwrap();
+
+        // sample sh sub after work.
+        let _ = class_c_phase_stats::sample_sh_sub_and_reset();
+
+        let _ = hashes;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_run_non_tip_and_tx_runs() {
+        let (dir, q) = temp_query("confirm-run");
+        let mut prev = Fk::NULL;
+        let mut prepared = Vec::new();
+        for h in 0..3u32 {
+            let (header, ta) = coinbase_block(h, prev);
+            let hash = header.hash;
+            prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+            let (fk, _) = q.get_header_by_hash(&hash).unwrap().unwrap();
+            let tx_fks = q.header_tx_fks(fk, Some(&hash)).unwrap().unwrap();
+            prepared.push(ConfirmPrepared {
+                height: Height(h),
+                header_fk: fk,
+                tx_fks,
+            });
+        }
+        // Re-confirm tip only (idempotent single).
+        let tip = prepared.last().unwrap().clone();
+        let again = q.confirm_blocks_run(&[tip]).unwrap();
+        assert_eq!(again.len(), 1);
+
+        // Non-contiguous rejected.
+        assert!(q
+            .confirm_blocks_run(&[prepared[0].clone(), prepared[2].clone()])
+            .is_err());
+
+        // Full packed body input/output runs.
+        let fks = q.block_tx_fks(Height(0)).unwrap();
+        let tx = q.get_tx_class_a(fks[0]).unwrap();
+        let ins = q.tx_input_run_class_a(fks[0], &tx).unwrap();
+        assert_eq!(ins.len(), 1);
+        let outs = q.tx_output_run_class_a(fks[0], &tx).unwrap();
+        assert_eq!(outs.len(), 1);
+
+        // collect_spend_edges for coinbase → empty (no non-cb inputs).
+        let edges = q.collect_spend_edges(fks[0], true).unwrap();
+        assert!(edges.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -1026,8 +1026,88 @@ mod advise_tests {
                 TableFile::open_trailing_header(&th, TableKind::Tx, data_bytes),
                 Err(StoreError::BadKind { .. })
             ));
+            // set_trailing_ext on trailing-header file
+            let (mut f3, _ext) =
+                TableFile::open_trailing_header(&th, TableKind::HashHead, data_bytes).unwrap();
+            f3.set_trailing_ext([0x11; 16]).unwrap();
+            f3.flush().unwrap();
+            drop(f3);
+            // from_end requires file length == logical (no spare capacity). Build
+            // a tightly-sized trailing file so EOF holds the footer.
+            {
+                let tight = std::env::temp_dir().join(format!("rbitcoin-file-trail-tight-{id}"));
+                let _ = std::fs::remove_file(&tight);
+                let data = [0xCDu8; 32];
+                let logical = data.len() as u64 + TRAILING_FOOTER_LEN as u64;
+                let mut footer = [0u8; TRAILING_FOOTER_LEN];
+                footer[0..4].copy_from_slice(&STORE_MAGIC);
+                footer[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
+                footer[6..8]
+                    .copy_from_slice(&TableKind::HashHead.as_u16().to_le_bytes());
+                footer[8..16].copy_from_slice(&logical.to_le_bytes());
+                footer[16..32].copy_from_slice(&[0x22; 16]);
+                let mut raw = Vec::with_capacity(logical as usize);
+                raw.extend_from_slice(&data);
+                raw.extend_from_slice(&footer);
+                std::fs::write(&tight, &raw).unwrap();
+                let (f4, ext) =
+                    TableFile::open_trailing_header_from_end(&tight, TableKind::HashHead).unwrap();
+                assert_eq!(ext, [0x22; 16]);
+                let mut b = [0u8; 4];
+                f4.read_at(0, &mut b).unwrap();
+                assert_eq!(b, [0xCD; 4]);
+                drop(f4);
+                let _ = std::fs::remove_file(&tight);
+            }
+            // short file
+            let short = std::env::temp_dir().join(format!("rbitcoin-file-trail-short-{id}"));
+            let _ = std::fs::remove_file(&short);
+            std::fs::write(&short, b"tiny").unwrap();
+            assert!(matches!(
+                TableFile::open_trailing_header_from_end(&short, TableKind::HashHead),
+                Err(StoreError::Corrupt(_))
+            ));
+            let _ = std::fs::remove_file(&short);
+            // bad magic at EOF
+            let badm = std::env::temp_dir().join(format!("rbitcoin-file-trail-badm-{id}"));
+            let _ = std::fs::remove_file(&badm);
+            let raw = vec![0u8; 64 + TRAILING_FOOTER_LEN];
+            // leave footer magic wrong
+            std::fs::write(&badm, &raw).unwrap();
+            assert!(matches!(
+                TableFile::open_trailing_header_from_end(&badm, TableKind::HashHead),
+                Err(StoreError::BadMagic)
+            ));
+            let _ = std::fs::remove_file(&badm);
             let _ = std::fs::remove_file(&th);
         }
+        // set_trailing_ext on leading-header fails
+        {
+            let lead = std::env::temp_dir().join(format!("rbitcoin-file-lead-{id}"));
+            let _ = std::fs::remove_file(&lead);
+            let mut f = TableFile::create(&lead, TableKind::Tx).unwrap();
+            assert!(matches!(
+                f.set_trailing_ext([0; 16]),
+                Err(StoreError::Corrupt(_))
+            ));
+            drop(f);
+            let _ = std::fs::remove_file(&lead);
+        }
+        // read past logical end
+        {
+            let p = std::env::temp_dir().join(format!("rbitcoin-file-readpast-{id}"));
+            let _ = std::fs::remove_file(&p);
+            let f = TableFile::create(&p, TableKind::Tx).unwrap();
+            let mut big = [0u8; 8];
+            assert!(matches!(
+                f.read_at(FILE_HEADER_LEN as u64 + 1000, &mut big),
+                Err(StoreError::Corrupt(_))
+            ));
+            drop(f);
+            let _ = std::fs::remove_file(&p);
+        }
+        let _ = ensure_nofile_budget();
+        let _ = ensure_nofile_budget_at_least(64);
         let _ = std::fs::remove_file(&path);
     }
 

@@ -2327,6 +2327,108 @@ mod structure_rule_tests {
         assert_eq!(bip34_height_script(255), vec![0x02, 0xff, 0x00]);
         assert_eq!(bip34_height_script(256), vec![0x02, 0x00, 0x01]);
     }
+
+    #[test]
+    fn bip34_height_script_small_and_op_n() {
+        assert_eq!(bip34_height_script(0), vec![0x00]);
+        for h in 1u32..=16 {
+            assert_eq!(bip34_height_script(h), vec![0x50 + h as u8]);
+        }
+        // First multi-byte form (17).
+        assert_eq!(bip34_height_script(17), vec![0x01, 0x11]);
+        // Wrong encoding rejected after activation (signet height 1).
+        let p = Box::leak(Box::new(ChainParams::signet()));
+        let ctx = ValidationContext::at(p, Height(1), Milestone::NONE);
+        let mut cb = coinbase(1);
+        // Height 1 must be OP_1 (0x51); push-length form is wrong.
+        cb.input[0].script_sig = ScriptBuf::from_bytes(vec![0x01, 0x01, 0x00]);
+        let b = block_with(vec![cb]);
+        let err = validate_block_structure(&b, &ctx).unwrap_err();
+        assert_bad_block(err, "bip34");
+    }
+
+    #[test]
+    fn assemble_rejects_empty_and_fk_mismatch() {
+        use super::assemble_block_prevouts;
+        use rbitcoin_query::{BatchParents, BatchThin, Query};
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-assemble-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let q = Query::open_or_create(&path).unwrap();
+        let ctx = ctx_h(1);
+        let empty = block_with(vec![]);
+        let parents = BatchParents::new();
+        let thin = BatchThin::new();
+        let mut spent = HashSet::new();
+        let mut creates = HashMap::new();
+        let err = assemble_block_prevouts(
+            &q, &empty, &ctx, None, &mut spent, &mut creates, &parents, &thin,
+        )
+        .err()
+        .expect("empty");
+        assert_bad_block(err, "empty");
+        // Wrong archived fk count: coinbase alone needs 1 fk; pass empty slice.
+        let b = block_with(vec![coinbase(1)]);
+        spent.clear();
+        creates.clear();
+        let err2 = assemble_block_prevouts(
+            &q, &b, &ctx, Some(&[]), &mut spent, &mut creates, &parents, &thin,
+        )
+        .err()
+        .expect("fk mismatch");
+        assert_bad_block(err2, "archived tx fk");
+        // first tx not coinbase
+        let bad = block_with(vec![non_coinbase_spend(1)]);
+        spent.clear();
+        creates.clear();
+        let err3 = assemble_block_prevouts(
+            &q, &bad, &ctx, None, &mut spent, &mut creates, &parents, &thin,
+        )
+        .err()
+        .expect("not coinbase");
+        assert_bad_block(err3, "coinbase");
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn check_witness_wtxid_count_mismatch_via_structure() {
+        // Direct unit path for wtxid count: call internal helper via structure
+        // with inconsistent precomputed length is not public — exercise
+        // missing commitment + reserved-mismatch already covered; cover odd
+        // merkle witness leaf + wrong commitment without reserved stack item.
+        let mut spend = non_coinbase_spend(12);
+        spend.input[0].witness = Witness::from_slice(&[vec![0xcd]]);
+        let mut cb = coinbase(1);
+        // Commitment magic with zeros; coinbase witness empty → mismatch (no reserved).
+        let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        spk.extend([0u8; 32]);
+        cb.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(spk),
+        });
+        // Non-32 reserved last item cannot rescue.
+        cb.input[0].witness = Witness::from_slice(&[vec![0x01, 0x02]]);
+        let b = block_with(vec![cb, spend]);
+        let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::BadBlock(s) if s.contains("witness")),
+            "got {err:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2342,6 +2444,130 @@ mod sigop_cost_tests {
     use bitcoin::{
         Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
     };
+
+    #[test]
+    fn last_push_pushdata_and_non_push_skip() {
+        // OP_PUSHDATA1 / 2 / 4 last push + non-push opcode continues.
+        let mut sc = vec![0x51]; // OP_1 (not a data push for last_script_push)
+        sc.extend_from_slice(&[0x4c, 0x02, 0xab, 0xcd]); // PUSHDATA1 2
+        assert_eq!(last_script_push(&sc), Some(&[0xabu8, 0xcd][..]));
+
+        let mut sc2 = vec![0x4d, 0x02, 0x00, 0x11, 0x22]; // PUSHDATA2
+        sc2.extend_from_slice(&[0xac]); // CHECKSIG after
+        assert_eq!(last_script_push(&sc2), Some(&[0x11u8, 0x22][..]));
+
+        let sc3 = vec![0x4e, 0x01, 0x00, 0x00, 0x00, 0xee]; // PUSHDATA4 len=1
+        assert_eq!(last_script_push(&sc3), Some(&[0xeeu8][..]));
+
+        // Truncated push ignored.
+        assert!(last_script_push(&[0x4c, 0x05, 0x01]).is_none());
+        assert!(last_script_push(&[0x4e, 0x10, 0x00, 0x00, 0x00]).is_none());
+        assert!(is_p2sh_script(&[
+            0xa9, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x87
+        ]));
+        assert!(!is_p2sh_script(&[0x51]));
+    }
+
+    #[test]
+    fn p2sh_and_witness_sigop_paths() {
+        // Nested P2SH-P2WPKH: redeem is 0x0014||20, scriptSig last push = redeem.
+        let redeem = {
+            let mut r = vec![0x00, 0x14];
+            r.extend([0x11u8; 20]);
+            r
+        };
+        let mut ss = vec![redeem.len() as u8];
+        ss.extend_from_slice(&redeem);
+        let p2sh_spk = {
+            use bitcoin::hashes::{hash160, Hash};
+            let h = hash160::Hash::hash(&redeem);
+            let mut spk = vec![0xa9, 0x14];
+            spk.extend_from_slice(h.as_byte_array());
+            spk.push(0x87);
+            spk
+        };
+        let tx = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([1; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::from_bytes(ss),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[vec![0x00], vec![0x01; 33]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(p2sh_spk),
+        }];
+        assert!(witness_sigop_count(&tx, &prevouts) >= 1);
+        // P2SH bare redeem with CHECKSIG
+        let redeem2 = vec![0xac];
+        let mut ss2 = vec![0x01];
+        ss2.extend_from_slice(&redeem2);
+        let mut spk2 = vec![0xa9, 0x14];
+        {
+            use bitcoin::hashes::{hash160, Hash};
+            let h = hash160::Hash::hash(&redeem2);
+            spk2.extend_from_slice(h.as_byte_array());
+        }
+        spk2.push(0x87);
+        let tx2 = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([2; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::from_bytes(ss2),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let prev2 = vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(spk2),
+        }];
+        assert!(p2sh_sigop_count(&tx2, &prev2) >= 1);
+        assert!(tx_sigop_cost(&tx2, &prev2, true) >= 4);
+        // Nested P2SH without redeem push → continue (0 witness sigops).
+        let tx3 = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([3; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let prev3 = vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![
+                0xa9, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x87,
+            ]),
+        }];
+        assert_eq!(witness_sigop_count(&tx3, &prev3), 0);
+    }
 
     #[test]
     fn last_push_and_p2sh_shape() {

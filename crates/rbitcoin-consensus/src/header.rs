@@ -109,7 +109,12 @@ pub fn median_time_past_times(times: &[u32]) -> u32 {
 
 #[cfg(test)]
 mod median_time_past_tests {
-    use super::median_time_past_times;
+    use super::*;
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_query::{Query, TxApply};
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+    use std::sync::Once;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn mtp_times_picks_middle_of_sorted() {
@@ -117,6 +122,126 @@ mod median_time_past_tests {
         assert_eq!(median_time_past_times(&[10]), 10);
         // Even length: Core takes sorted[len/2] (upper middle).
         assert_eq!(median_time_past_times(&[1, 2, 3, 4]), 3);
+    }
+
+    fn temp_q() -> (std::path::PathBuf, Query) {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-hdr-mtp-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        (dir, q)
+    }
+
+    fn coinbase(h: u32, prev: Fk) -> (HeaderRecord, TxApply) {
+        let mut hash = [0u8; 32];
+        hash[0..4].copy_from_slice(&h.to_le_bytes());
+        hash[4] = 0xcd;
+        let header = HeaderRecord {
+            prev_fk: prev,
+            version: 1,
+            timestamp: 1_000 + h * 10,
+            bits: 0x207fffff,
+            nonce: h,
+            merkle_root: hash,
+            hash,
+        };
+        let mut txid = [0u8; 32];
+        txid[0..4].copy_from_slice(&h.to_le_bytes());
+        txid[31] = 0xcb;
+        let ta = TxApply {
+            tx: TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![h as u8],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(50, vec![0x51])],
+        };
+        (header, ta)
+    }
+
+    #[test]
+    fn mtp_from_confirmed_chain_and_missing_above_tip() {
+        let (dir, q) = temp_q();
+        let mut prev = Fk::NULL;
+        for h in 0..3u32 {
+            let (hdr, ta) = coinbase(h, prev);
+            prev = q.connect_block(Height(h), &hdr, &[ta]).unwrap();
+        }
+        let mtp = median_time_past(&q, Height(2)).unwrap();
+        // times: 1000, 1010, 1020 → middle 1010
+        assert_eq!(mtp, 1010);
+
+        // Height above tip with no plan → incomplete load error (not BadPrev).
+        let err = median_time_past(&q, Height(5)).unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::Store(_)) || matches!(err, ConsensusError::BadPrev),
+            "got {err:?}"
+        );
+
+        // expected_next_bits: height 0 + regtest no-retarget.
+        let params = ChainParams::regtest();
+        let gbits = expected_next_bits(&q, &params, Height(0)).unwrap();
+        assert_eq!(gbits, crate::params::genesis_block(&params).header.bits);
+        let b1 = expected_next_bits(&q, &params, Height(1)).unwrap();
+        let (_fk, rec0) = q.header_at_height(Height(0)).unwrap().unwrap();
+        assert_eq!(b1.to_consensus(), rec0.bits);
+
+        // Bad prev header height.
+        assert!(expected_next_bits(&q, &params, Height(99)).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_header_genesis_and_bad_prev() {
+        let (dir, q) = temp_q();
+        let params = ChainParams::regtest();
+        let g = crate::params::genesis_block(&params);
+        // Wrong genesis hash at height 0.
+        let mut bad = g.header;
+        bad.nonce ^= 1;
+        let err = validate_header(&q, &params, Height(0), &bad).unwrap_err();
+        assert!(matches!(err, ConsensusError::BadHeader(_)), "{err:?}");
+
+        // Synthetic tip for prev linkage.
+        let (h0, ta0) = coinbase(0, Fk::NULL);
+        let prev = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+        let (h1, ta1) = coinbase(1, prev);
+        q.connect_block(Height(1), &h1, &[ta1]).unwrap();
+
+        // Header with wrong prev hash at height 1.
+        let mut hdr = g.header;
+        hdr.prev_blockhash = bitcoin::BlockHash::from_byte_array([0xee; 32]);
+        hdr.time = 2_000;
+        hdr.bits = bitcoin::CompactTarget::from_consensus(0x207fffff);
+        let err = validate_header(&q, &params, Height(1), &hdr).unwrap_err();
+        assert!(
+            matches!(err, ConsensusError::BadPrev | ConsensusError::BadHeader(_)),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

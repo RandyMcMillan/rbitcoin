@@ -906,4 +906,75 @@ mod tests {
         handle.shutdown().expect("flush query+mempool");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test]
+    async fn run_p2p_with_peers_file_and_electrum() {
+        use rbitcoin_net::AddrMan;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-peers-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Non-empty peers book so load path logs address count.
+        let mut am = AddrMan::new();
+        am.add("127.0.0.1:18444".parse().unwrap());
+        am.add("127.0.0.1:18445".parse().unwrap());
+        am.save(&dir.join("peers")).unwrap();
+
+        let mut cfg = NodeConfig::default()
+            .with_datadir(&dir)
+            .with_network(rbitcoin_primitives::Network::Regtest)
+            .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+        cfg.use_seeds = false;
+        // Peers file is loaded for bookkeeping; do not dial those addrs as --connect
+        // (would stall IBD). Empty connect + no seeds → catch-up complete immediately.
+        cfg.connect.clear();
+        cfg.max_run_secs = Some(0);
+        cfg.electrum_listen = Some("127.0.0.1:0".parse().unwrap());
+        cfg.milestone_height = 50;
+        let result = tokio::time::timeout(Duration::from_secs(45), run_p2p(cfg)).await;
+        assert!(result.is_ok(), "run_p2p timed out");
+        result.unwrap().expect("run_p2p peers+electrum");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn run_p2p_corrupt_peers_and_dead_connect() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-run-p2p-badpeers-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Corrupt peers file → load error branch starts empty book.
+        std::fs::write(dir.join("peers"), b"not-a-valid-peers-blob\xff\x00").unwrap();
+
+        let mut cfg = NodeConfig::default()
+            .with_datadir(&dir)
+            .with_network(rbitcoin_primitives::Network::Regtest)
+            .with_p2p_listen("127.0.0.1:0".parse().unwrap());
+        cfg.use_seeds = false;
+        cfg.connect = vec!["127.0.0.1:1".parse().unwrap()];
+        cfg.max_run_secs = Some(0);
+        let result = tokio::time::timeout(Duration::from_secs(60), run_p2p(cfg)).await;
+        assert!(result.is_ok(), "run_p2p timed out");
+        let _ = result.unwrap(); // incomplete IBD ok
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cancelled_waits_for_request_race() {
+        // Cover the while !requested re-check after spurious notify.
+        let sd = Shutdown::new();
+        let s = Arc::clone(&sd);
+        let j = tokio::spawn(async move {
+            s.cancelled().await;
+        });
+        tokio::task::yield_now().await;
+        // Double request is idempotent; first wakes waiters.
+        sd.request();
+        sd.request();
+        j.await.unwrap();
+    }
 }

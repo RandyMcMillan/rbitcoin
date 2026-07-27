@@ -414,7 +414,9 @@ impl Store {
         self.txs.get_fk_by_txid_batch(txids)
     }
 
-    /// Bulk Class A body ranges (confirm load). Concurrent idx reads.
+    /// Bulk Class A body ranges (archive sticky + confirm load).
+    ///
+    /// Sorted mmap walk of `tx.idx` (contiguous runs coalesced).
     pub fn tx_body_range_batch(
         &self,
         fks: &[Fk],

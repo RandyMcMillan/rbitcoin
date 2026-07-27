@@ -184,6 +184,69 @@ impl VarTable {
         Ok(out)
     }
 
+    /// Bulk body ranges for arbitrary fks — **sorted mmap** walk of `tx.idx`.
+    ///
+    /// Output order matches `fks`. Null / OOB ids yield `None` (not an error).
+    /// Contiguous id runs use one sequential mmap load via [`Self::record_ranges`];
+    /// sparse singles use [`Self::record_range`] (16 B interior / 8 B last).
+    /// Same modality as archive head-resolve idx and confirm load pin — **not**
+    /// scatter io_uring/pread of idx.
+    pub fn record_range_batch(
+        &self,
+        fks: &[Fk],
+    ) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
+        if fks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let count = self.count.load(Ordering::Acquire);
+        let mut out: Vec<Option<(u64, u64)>> = vec![None; fks.len()];
+        // (orig_index, id) for published ids only.
+        let mut jobs: Vec<(usize, u64)> = Vec::with_capacity(fks.len());
+        for (i, fk) in fks.iter().enumerate() {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            if id == 0 || id > count {
+                continue;
+            }
+            jobs.push((i, id));
+        }
+        if jobs.is_empty() {
+            return Ok(out);
+        }
+        // Sequential idx locality: page walk beats scatter pread on multi-GiB idx.
+        jobs.sort_unstable_by_key(|(_, id)| *id);
+
+        let mut run_start = 0usize;
+        while run_start < jobs.len() {
+            let first_id = jobs[run_start].1;
+            let mut last_unique = first_id;
+            let mut run_end = run_start + 1;
+            while run_end < jobs.len() {
+                let id = jobs[run_end].1;
+                if id == last_unique {
+                    run_end += 1;
+                    continue;
+                }
+                if id == last_unique + 1 {
+                    last_unique = id;
+                    run_end += 1;
+                    continue;
+                }
+                break;
+            }
+            // One mmap load for the contiguous unique span (dup ids share slots).
+            let ranges = self.record_ranges(first_id, last_unique)?;
+            for j in run_start..run_end {
+                let (orig_i, id) = jobs[j];
+                let slot = (id - first_id) as usize;
+                out[orig_i] = Some(ranges[slot]);
+            }
+            run_start = run_end;
+        }
+        Ok(out)
+    }
+
     #[inline]
     pub(crate) fn idx_read_fd(&self) -> std::os::fd::RawFd {
         self.idx.read_fd()
@@ -202,11 +265,6 @@ impl VarTable {
     #[inline]
     pub(crate) fn body_file_path(&self) -> &Path {
         self.body.path()
-    }
-
-    #[inline]
-    pub(crate) fn idx_published_len(&self) -> u64 {
-        self.idx.logical_len()
     }
 
     #[inline]
@@ -631,6 +689,61 @@ mod tests {
                 1 + i
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sorted mmap batch: sparse + unsorted + dups match serial; OOB → None.
+    #[test]
+    fn record_range_batch_sorted_mmap_matches_serial() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-var-range-batch-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = VarTable::create(&dir, "tx", TableKind::Tx).unwrap();
+        t.put_batch_encode(20, 256, |i, buf| {
+            buf.extend_from_slice(&vec![i as u8; 10 + (i % 5)]);
+        })
+        .unwrap();
+        assert_eq!(t.count(), 20);
+
+        // Unsorted, sparse, duplicates, null, OOB.
+        let fks = vec![
+            Fk(15),
+            Fk(3),
+            Fk(3),
+            Fk(1),
+            Fk::NULL,
+            Fk(20), // last published
+            Fk(99), // OOB
+            Fk(10),
+            Fk(11),
+            Fk(12), // contiguous run
+        ];
+        let batch = t.record_range_batch(&fks).unwrap();
+        assert_eq!(batch.len(), fks.len());
+        assert_eq!(batch[4], None); // NULL
+        assert_eq!(batch[6], None); // OOB
+        for (i, fk) in fks.iter().enumerate() {
+            if batch[i].is_none() {
+                continue;
+            }
+            let seq = t.record_range(*fk).unwrap();
+            assert_eq!(batch[i], Some(seq), "fk={fk:?} i={i}");
+        }
+        // Duplicates share the same range.
+        assert_eq!(batch[1], batch[2]);
+        // Contiguous 10..=12 match record_ranges.
+        let contig = t.record_ranges(10, 12).unwrap();
+        assert_eq!(batch[7], Some(contig[0]));
+        assert_eq!(batch[8], Some(contig[1]));
+        assert_eq!(batch[9], Some(contig[2]));
+        // Empty.
+        assert!(t.record_range_batch(&[]).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

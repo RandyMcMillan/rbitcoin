@@ -1341,8 +1341,25 @@ impl TxTable {
         }
         crate::head_resolve_stats::add_probe(t_probe.elapsed().as_nanos() as u64);
 
-        // --- Phase 2: mmap idx → body (off,len) for every cand ---
+        // --- Phase 2: sorted mmap idx (same path as confirm load body_range_batch) ---
         let t_idx = Instant::now();
+        struct CandRef {
+            key_i: u32,
+            depth: u8,
+            fk: u64,
+        }
+        let mut cand_refs: Vec<CandRef> = Vec::new();
+        for (i, cands) in cands_by_key.iter().enumerate() {
+            for &(depth, fk) in cands {
+                cand_refs.push(CandRef {
+                    key_i: i as u32,
+                    depth: depth as u8,
+                    fk,
+                });
+            }
+        }
+        let cand_fks: Vec<Fk> = cand_refs.iter().map(|c| Fk(c.fk)).collect();
+        let cand_ranges = self.body.record_range_batch(&cand_fks)?;
         struct BodyJob {
             key_i: u32,
             depth: u8,
@@ -1351,29 +1368,24 @@ impl TxTable {
             len: u64,
         }
         let mut jobs: Vec<BodyJob> = Vec::new();
-        for (i, cands) in cands_by_key.iter().enumerate() {
-            for &(depth, fk) in cands {
-                let range = match self.body.record_range(Fk(fk)) {
-                    Ok(r) => r,
-                    Err(StoreError::InvalidFk) | Err(StoreError::NotFound) => continue,
-                    Err(e) => return Err(e),
-                };
-                let (off, len) = range;
-                if len == 0 {
-                    continue;
-                }
-                let n = (len as usize).min(33);
-                if off.saturating_add(n as u64) > body_pub {
-                    continue;
-                }
-                jobs.push(BodyJob {
-                    key_i: i as u32,
-                    depth: depth as u8,
-                    fk,
-                    off,
-                    len: n as u64,
-                });
+        for (c, range_opt) in cand_refs.into_iter().zip(cand_ranges.into_iter()) {
+            let Some((off, full_len)) = range_opt else {
+                continue;
+            };
+            if full_len == 0 {
+                continue;
             }
+            let n = (full_len as usize).min(33);
+            if off.saturating_add(n as u64) > body_pub {
+                continue;
+            }
+            jobs.push(BodyJob {
+                key_i: c.key_i,
+                depth: c.depth,
+                fk: c.fk,
+                off,
+                len: n as u64,
+            });
         }
         crate::head_resolve_stats::add_idx(t_idx.elapsed().as_nanos() as u64);
 
@@ -1435,145 +1447,15 @@ impl TxTable {
         Ok(out)
     }
 
-    /// Bulk `body_range` for many fks (confirm load). io_uring idx preads.
+    /// Bulk `body_range` for many fks (archive sticky + confirm load).
+    ///
+    /// **Sorted mmap** walk of `tx.idx` via [`VarTable::record_range_batch`] —
+    /// same modality as archive head-resolve idx (not scatter io_uring/pread).
     pub fn body_range_batch(
         &self,
         fks: &[Fk],
     ) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
-        use crate::bulk_io::{self, ReadOp};
-        if fks.is_empty() {
-            return Ok(Vec::new());
-        }
-        let count = self.body.count();
-        let body_logical = self.body.body_logical_len().max(crate::file::FILE_HEADER_LEN as u64);
-        let idx_fd = self.body.idx_read_fd();
-        let idx_path = self.body.idx_file_path();
-        let idx_pub = self.body.idx_published_len();
-
-        // Prepare: for each valid fk, 8 or 16 byte idx read.
-        struct Job {
-            id: u64,
-            off: u64,
-            nbytes: u8,
-            buf: [u8; 16],
-            out: Option<(u64, u64)>,
-            skip: bool,
-            err: Option<StoreError>,
-        }
-        let mut jobs: Vec<Job> = fks
-            .iter()
-            .map(|fk| {
-                let Some(id) = fk.get() else {
-                    return Job {
-                        id: 0,
-                        off: 0,
-                        nbytes: 0,
-                        buf: [0u8; 16],
-                        out: None,
-                        skip: true,
-                        err: None,
-                    };
-                };
-                if id == 0 || id > count {
-                    return Job {
-                        id,
-                        off: 0,
-                        nbytes: 0,
-                        buf: [0u8; 16],
-                        out: None,
-                        skip: true,
-                        err: None,
-                    };
-                }
-                let off = crate::file::FILE_HEADER_LEN as u64 + (id - 1) * 8;
-                let nbytes: u8 = if id < count { 16 } else { 8 };
-                if off.saturating_add(u64::from(nbytes)) > idx_pub {
-                    return Job {
-                        id,
-                        off,
-                        nbytes,
-                        buf: [0u8; 16],
-                        out: None,
-                        skip: true,
-                        err: Some(StoreError::Corrupt("idx past published")),
-                    };
-                }
-                Job {
-                    id,
-                    off,
-                    nbytes,
-                    buf: [0u8; 16],
-                    out: None,
-                    skip: false,
-                    err: None,
-                }
-            })
-            .collect();
-
-        // Arena submit for non-skip jobs.
-        let active: Vec<usize> = jobs
-            .iter()
-            .enumerate()
-            .filter(|(_, j)| !j.skip && j.err.is_none())
-            .map(|(i, _)| i)
-            .collect();
-        if !active.is_empty() {
-            let mut arena = vec![0u8; active.iter().map(|&i| jobs[i].nbytes as usize).sum()];
-            let mut spans: Vec<(usize, usize)> = Vec::with_capacity(active.len()); // (job_i, len)
-            let mut rest = arena.as_mut_slice();
-            let mut pieces: Vec<&mut [u8]> = Vec::with_capacity(active.len());
-            for &ji in &active {
-                let len = jobs[ji].nbytes as usize;
-                let (left, right) = rest.split_at_mut(len);
-                pieces.push(left);
-                rest = right;
-                spans.push((ji, len));
-            }
-            let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(active.len());
-            for (piece, &(ji, _)) in pieces.into_iter().zip(spans.iter()) {
-                read_ops.push(ReadOp {
-                    fd: idx_fd,
-                    offset: jobs[ji].off,
-                    buf: piece,
-                    result: i32::MIN,
-                });
-            }
-            bulk_io::pread_batch(&mut read_ops);
-            for (ro, &(ji, len)) in read_ops.iter().zip(spans.iter()) {
-                if ro.result < 0 {
-                    jobs[ji].err = Some(StoreError::io(
-                        idx_path,
-                        std::io::Error::from_raw_os_error(-ro.result),
-                    ));
-                    continue;
-                }
-                if ro.result as usize != len {
-                    jobs[ji].err = Some(StoreError::Corrupt("bulk idx pread short"));
-                    continue;
-                }
-                jobs[ji].buf[..len].copy_from_slice(&ro.buf[..len]);
-                let start = u64::from_le_bytes(jobs[ji].buf[..8].try_into().unwrap());
-                let end = if jobs[ji].id < count {
-                    u64::from_le_bytes(jobs[ji].buf[8..16].try_into().unwrap())
-                } else {
-                    body_logical
-                };
-                if end < start {
-                    jobs[ji].err = Some(StoreError::Corrupt("var record end < start"));
-                } else {
-                    jobs[ji].out = Some((start, end - start));
-                }
-            }
-        }
-
-        let mut out = Vec::with_capacity(jobs.len());
-        for job in jobs {
-            if let Some(e) = job.err {
-                return Err(e);
-            }
-            out.push(job.out);
-        }
-        Ok(out)
+        self.body.record_range_batch(fks)
     }
 
     /// Bulk full packed decode from known ranges (confirm load create bodies).
@@ -3980,7 +3862,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Bulk body_range + get_full_batch_at agree with sequential paths.
+    /// Bulk body_range (sorted mmap) + get_full_batch_at agree with sequential paths.
     #[test]
     fn bulk_body_range_and_full_match_sequential() {
         let dir = std::env::temp_dir().join(format!(
@@ -4019,6 +3901,15 @@ mod tests {
                 t.put_full_batch_indexed(&[(tx, inputs, outputs)], true)
                     .unwrap()[0],
             );
+        }
+        // Unsorted + sparse sample still matches serial body_range.
+        let mut shuffled = fks.clone();
+        shuffled.reverse();
+        let sparse = vec![shuffled[0], shuffled[3], shuffled[3], shuffled[7]];
+        let batch_sparse = t.body_range_batch(&sparse).unwrap();
+        for (fk, br) in sparse.iter().zip(batch_sparse.iter()) {
+            let seq = t.body_range(*fk).unwrap();
+            assert_eq!(*br, Some(seq), "fk={fk:?}");
         }
         let batch_ranges = t.body_range_batch(&fks).unwrap();
         for (fk, br) in fks.iter().zip(batch_ranges.iter()) {

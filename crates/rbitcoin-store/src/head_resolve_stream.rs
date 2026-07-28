@@ -3,7 +3,7 @@
 //! Completion-driven loop (one outstanding op per in-flight key):
 //! 1. mmap `probe_fks` → candidates deepest-first (BIP30)
 //! 2. io_uring pread 8/16 B `tx.idx` for next cand
-//! 3. on idx CQE → io_uring pread ≤33 body bytes; match → done; else next cand
+//! 3. on idx CQE → io_uring pread ≤32 body bytes (txid); match → done; else next cand
 //!
 //! Falls back to the caller when io_uring is unavailable.
 
@@ -29,7 +29,7 @@ struct KeyWork {
     /// Next cand index to try.
     cand_i: usize,
     /// Body pread buffer (stable while in flight — lives in `slots[slot]`).
-    buf: [u8; 33],
+    buf: [u8; 32],
     buf_len: usize,
     /// Idx pread scratch (8 or 16 bytes).
     idx_buf: [u8; 16],
@@ -174,7 +174,7 @@ pub fn resolve_batch_streaming(
                     continue;
                 }
                 let full_len = end - start;
-                let n = (full_len as usize).min(33);
+                let n = (full_len as usize).min(32);
                 if n == 0 || start.saturating_add(n as u64) > body_pub {
                     let submitted = {
                         let w = slots[slot].as_mut().unwrap();
@@ -343,7 +343,7 @@ fn arm_keys(
             key_i: key_i as u32,
             cands,
             cand_i: 0,
-            buf: [0u8; 33],
+            buf: [0u8; 32],
             buf_len: 0,
             idx_buf: [0u8; 16],
             idx_nbytes: 0,

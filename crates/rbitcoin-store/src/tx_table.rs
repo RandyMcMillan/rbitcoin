@@ -18,10 +18,9 @@ use std::time::{Duration, Instant};
 
 /// Class A tx row (no wire blob — reconstruct from inputs/outputs + witness).
 ///
-/// On-disk bodies are **packed-only** ([`PACKED_TX_V1`]): inputs and outputs are
-/// embedded in the same `tx.body` payload. `input_start_fk` / `output_start_fk`
-/// are always [`Fk::NULL`] on write and ignored on read (kept in the fixed meta
-/// layout for encoding stability).
+/// On-disk bodies are **packed-only** (schema v11+): record starts with this
+/// meta (txid first); inputs and outputs follow; trailing zero pad allowed.
+/// `input_start_fk` / `output_start_fk` are always [`Fk::NULL`] on write.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxRecord {
     pub txid: [u8; 32],
@@ -490,16 +489,26 @@ pub fn decode_input_run_prefix(
     Ok((out, off))
 }
 
-/// Packed Class A payload tag (first byte of `tx.body` record).
-///
-/// Layout: `PACKED_V1 || TxRecord(64) || input_run || output_run`
-/// so one `get_raw(fk)` returns the full transaction body (single body IO).
-///
-/// **All Class A bodies are packed** (schema current). Non-packed payloads are
-/// rejected as corrupt on read.
-pub const PACKED_TX_V1: u8 = 0x01;
+/// OS page size used for on-disk **txid must not straddle page** rule (fixed).
+pub const BODY_PAGE_SIZE: u64 = 4096;
+/// Max offset within a page for a 32-byte txid start: `S % 4096 <= 4064`.
+pub const TXID_PAGE_MAX_OFF: u64 = BODY_PAGE_SIZE - 32;
 
-/// Encode a full Class A tx as one var payload.
+/// Next absolute body offset for a Class A packed record (8-byte aligned, txid
+/// does not cross a 4 KiB page).
+#[inline]
+pub fn next_tx_body_start(cursor: u64) -> u64 {
+    let mut s = cursor.saturating_add(7) & !7u64;
+    // Avoid page straddle of [S, S+32).
+    while s % BODY_PAGE_SIZE > TXID_PAGE_MAX_OFF {
+        s = s.saturating_add(8);
+    }
+    s
+}
+
+/// Encode a full Class A tx as one var payload (schema 11+: no leading magic).
+///
+/// Layout: `TxRecord(64) || input_run || output_run` — txid at bytes [0, 32).
 pub fn encode_packed_tx(
     tx: &TxRecord,
     inputs: &[InputRecord],
@@ -508,7 +517,6 @@ pub fn encode_packed_tx(
 ) {
     debug_assert_eq!(inputs.len() as u32, tx.input_count);
     debug_assert_eq!(outputs.len() as u32, tx.output_count);
-    out.push(PACKED_TX_V1);
     // I/O fks are unused for packed rows (body is self-contained).
     let mut meta = tx.clone();
     meta.input_start_fk = Fk::NULL;
@@ -518,7 +526,19 @@ pub fn encode_packed_tx(
     encode_output_run(outputs, out);
 }
 
-/// Decode packed Class A; `raw` is the full var payload including tag.
+/// After walking a packed payload to `logical_end`, accept only zero pad to `raw.len()`.
+#[inline]
+fn check_trailing_zero_pad(raw: &[u8], logical_end: usize) -> Result<(), StoreError> {
+    if logical_end > raw.len() {
+        return Err(StoreError::Corrupt("packed Class A short payload"));
+    }
+    if raw[logical_end..].iter().any(|&b| b != 0) {
+        return Err(StoreError::Corrupt("packed Class A trailing non-zero"));
+    }
+    Ok(())
+}
+
+/// Decode packed Class A; `raw` is the full var payload (may include zero pad).
 pub fn decode_packed_tx(
     raw: &[u8],
 ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>), StoreError> {
@@ -534,14 +554,11 @@ pub fn decode_packed_tx(
 pub fn decode_packed_tx_with_spender_rels(
     raw: &[u8],
 ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>), StoreError> {
-    if raw.first().copied() != Some(PACKED_TX_V1) {
-        return Err(StoreError::Corrupt("not a packed Class A tx"));
-    }
-    if raw.len() < 1 + TxRecord::ENCODED_LEN {
+    if raw.len() < TxRecord::ENCODED_LEN {
         return Err(StoreError::Corrupt("short packed Class A tx"));
     }
-    let meta = TxRecord::decode(&raw[1..1 + TxRecord::ENCODED_LEN])?;
-    let mut off = 1 + TxRecord::ENCODED_LEN;
+    let meta = TxRecord::decode(&raw[..TxRecord::ENCODED_LEN])?;
+    let mut off = TxRecord::ENCODED_LEN;
     let (inputs, in_used) = decode_input_run_prefix(&raw[off..], meta.input_count)?;
     off += in_used;
     let n_out = meta.output_count as usize;
@@ -558,9 +575,7 @@ pub fn decode_packed_tx_with_spender_rels(
         rec.multi_spender = false;
         outputs.push(rec);
     }
-    if off != raw.len() {
-        return Err(StoreError::Corrupt("packed Class A trailing bytes"));
-    }
+    check_trailing_zero_pad(raw, off)?;
     if inputs.len() as u32 != meta.input_count || outputs.len() as u32 != meta.output_count {
         return Err(StoreError::Corrupt("packed Class A count mismatch"));
     }
@@ -573,14 +588,11 @@ pub fn decode_packed_tx_with_spender_rels(
 pub fn scan_packed_meta_and_prevouts(
     raw: &[u8],
 ) -> Result<(TxRecord, Vec<(Fk, u32)>), StoreError> {
-    if raw.first().copied() != Some(PACKED_TX_V1) {
-        return Err(StoreError::Corrupt("not a packed Class A tx"));
-    }
-    if raw.len() < 1 + TxRecord::ENCODED_LEN {
+    if raw.len() < TxRecord::ENCODED_LEN {
         return Err(StoreError::Corrupt("short packed Class A tx"));
     }
-    let meta = TxRecord::decode(&raw[1..1 + TxRecord::ENCODED_LEN])?;
-    let mut off = 1 + TxRecord::ENCODED_LEN;
+    let meta = TxRecord::decode(&raw[..TxRecord::ENCODED_LEN])?;
+    let mut off = TxRecord::ENCODED_LEN;
     let mut prevouts = Vec::with_capacity(meta.input_count as usize);
     for _ in 0..meta.input_count {
         let (create_fk, prev_index, used) = InputRecord::decode_prevout_at(&raw[off..])?;
@@ -592,9 +604,6 @@ pub fn scan_packed_meta_and_prevouts(
 }
 
 /// Decode packed Class A **meta + outputs only** (skip allocating parent inputs).
-///
-/// Same body IO as [`decode_packed_tx`]; cheaper CPU for cache parent loads
-/// that only need prevout script/value.
 pub fn decode_packed_tx_outs_only(
     raw: &[u8],
 ) -> Result<(TxRecord, Vec<OutputRecord>), StoreError> {
@@ -603,23 +612,15 @@ pub fn decode_packed_tx_outs_only(
 }
 
 /// Like [`decode_packed_tx_outs_only`], plus dense relative offsets of each
-/// output's 9-byte spender meta (field + flags) within the packed payload.
-///
-/// **Spender fields on returned outs are cleared** (`NULL` / not multi): pin /
-/// OutFifo must not treat pin-time annotations as durable authority; write-path
-/// structural re-reads via absolute `body_off + rel` preads.
+/// output's 9-byte spender meta within the packed payload.
 pub fn decode_packed_tx_outs_with_spender_rels(
     raw: &[u8],
 ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<u32>), StoreError> {
-    if raw.first().copied() != Some(PACKED_TX_V1) {
-        return Err(StoreError::Corrupt("not a packed Class A tx"));
-    }
-    if raw.len() < 1 + TxRecord::ENCODED_LEN {
+    if raw.len() < TxRecord::ENCODED_LEN {
         return Err(StoreError::Corrupt("short packed Class A tx"));
     }
-    let meta = TxRecord::decode(&raw[1..1 + TxRecord::ENCODED_LEN])?;
-    let mut off = 1 + TxRecord::ENCODED_LEN;
-    // Walk inputs without keeping records (witness can be large).
+    let meta = TxRecord::decode(&raw[..TxRecord::ENCODED_LEN])?;
+    let mut off = TxRecord::ENCODED_LEN;
     for _ in 0..meta.input_count {
         let (_txid, _vout, used) = InputRecord::decode_prevout_at(&raw[off..])?;
         off += used;
@@ -631,18 +632,14 @@ pub fn decode_packed_tx_outs_with_spender_rels(
         if off >= raw.len() {
             return Err(StoreError::Corrupt("packed outputs short"));
         }
-        // Spender meta is the first 9 bytes of each output record.
         spender_rels.push(off as u32);
         let (mut rec, used) = OutputRecord::decode_at(&raw[off..])?;
         off += used;
-        // Content-only for pin/FIFO (value + script).
         rec.spender_field = Fk::NULL;
         rec.multi_spender = false;
         outputs.push(rec);
     }
-    if off != raw.len() {
-        return Err(StoreError::Corrupt("packed Class A trailing bytes"));
-    }
+    check_trailing_zero_pad(raw, off)?;
     if outputs.len() as u32 != meta.output_count {
         return Err(StoreError::Corrupt("packed Class A count mismatch"));
     }
@@ -658,9 +655,10 @@ pub fn clear_output_spender_fields(outs: &mut [OutputRecord]) {
     }
 }
 
+/// True when `raw` looks like a schema-11+ packed Class A payload (txid-first).
 #[inline]
 pub fn is_packed_tx_payload(raw: &[u8]) -> bool {
-    raw.len() > TxRecord::ENCODED_LEN && raw.first().copied() == Some(PACKED_TX_V1)
+    raw.len() >= TxRecord::ENCODED_LEN
 }
 
 /// In-progress sequential `tx.head` rebuild (shadow filled from `tx.idx` order).
@@ -1071,8 +1069,9 @@ impl TxTable {
         if recs.is_empty() {
             return Ok(Vec::new());
         }
-        let est: usize = recs.len() * TxRecord::ENCODED_LEN;
-        let fks = self.body.put_batch_encode(recs.len(), est, |i, buf| {
+        // Align bare-meta rows the same way as full packed appends (schema 11).
+        let est: usize = recs.len() * (TxRecord::ENCODED_LEN + 16);
+        let fks = self.body.put_batch_encode_aligned(recs.len(), est, |i, buf| {
             recs[i].encode_into(buf);
         })?;
         if index {
@@ -1092,22 +1091,16 @@ impl TxTable {
         Ok(tx)
     }
 
-    /// Read Class A body **txid only** (packed prefix or bare TxRecord).
+    /// Read Class A body **txid only** (first 32 bytes at record start).
     ///
-    /// Thin I/O: idx range + first **33** body bytes (magic+txid) — does **not**
-    /// load scripts/inputs/witness. Used by head resolve (`get_fk_by_txid*`) and
-    /// archive sticky prewarm.
-    ///
-    /// Public for wire rebuild / archive sticky: schema v10 inputs store
-    /// `create_fk` only; callers fill soft `prev_txid` from the create body.
+    /// Thin I/O: idx range + **32** body bytes — no scripts/witness.
     pub fn body_txid(&self, fk: Fk) -> Result<[u8; 32], StoreError> {
         use std::time::Instant;
-        // Packed: [PACKED_TX_V1][txid;32]…  Bare legacy: [txid;32]…
         let t_idx = Instant::now();
         let (off, len) = self.body.record_range(fk)?;
         crate::head_resolve_stats::add_idx(t_idx.elapsed().as_nanos() as u64);
         let t_body = Instant::now();
-        let mut prefix = [0u8; 33];
+        let mut prefix = [0u8; 32];
         let n = self.body.read_prefix_at(off, len, &mut prefix)?;
         crate::head_resolve_stats::add_body(t_body.elapsed().as_nanos() as u64);
         crate::head_resolve_stats::add_body_lookups(1);
@@ -1116,12 +1109,7 @@ impl TxTable {
 
     /// Bulk Class A body txids for consecutive ids `first..=last` (1-based).
     ///
-    /// 1. One sequential `tx.idx` pread for the range ([`VarTable::record_ranges`]).
-    /// 2. Parallel / io_uring preads of the leading **33** body bytes per record
-    ///    ([`crate::bulk_io::pread_batch`]).
-    /// 3. Parse each prefix to a txid (same rules as [`Self::body_txid`]).
-    ///
-    /// Used by online `tx.head` shadow fill so resize is not one pread per fk.
+    /// Contiguous idx + bulk **32**-byte body prefixes (txid at record start).
     pub fn body_txid_range(&self, first: u64, last: u64) -> Result<Vec<[u8; 32]>, StoreError> {
         use crate::bulk_io::{self, ReadOp};
         if last < first {
@@ -1136,27 +1124,20 @@ impl TxTable {
         let body_pub = self.body.body_published_len();
         let body_path = self.body.body_file_path();
 
-        // Fixed 33-byte prefix buffers (packed magic+txid, or bare txid).
-        let mut prefixes: Vec<[u8; 33]> = vec![[0u8; 33]; n];
-        let mut prefix_lens: Vec<usize> = vec![0; n];
-        for (i, &(off, len)) in ranges.iter().enumerate() {
-            let want = (len as usize).min(33);
-            if want == 0 {
+        let mut prefixes: Vec<[u8; 32]> = vec![[0u8; 32]; n];
+        for &(off, len) in &ranges {
+            if len < 32 {
                 return Err(StoreError::Corrupt("empty body for txid"));
             }
-            if off.saturating_add(want as u64) > body_pub {
+            if off.saturating_add(32) > body_pub {
                 return Err(StoreError::Corrupt("body past published"));
             }
-            prefix_lens[i] = want;
         }
 
-        // SAFETY: each `prefixes[i]` is a distinct stack-slot allocation in the
-        // vec; submitted indices are unique so mut slices do not alias.
         let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(n);
         for i in 0..n {
-            let want = prefix_lens[i];
             let ptr = prefixes[i].as_mut_ptr();
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, want) };
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, 32) };
             read_ops.push(ReadOp {
                 fd: body_fd,
                 offset: ranges[i].0,
@@ -1168,32 +1149,24 @@ impl TxTable {
 
         let mut out = Vec::with_capacity(n);
         for (i, ro) in read_ops.iter().enumerate() {
-            let want = prefix_lens[i];
             if ro.result < 0 {
                 return Err(StoreError::io(
                     body_path,
                     std::io::Error::from_raw_os_error(-ro.result),
                 ));
             }
-            if ro.result as usize != want {
+            if ro.result as usize != 32 {
                 return Err(StoreError::Corrupt("bulk body_txid pread short"));
             }
-            out.push(Self::txid_from_body_prefix(&prefixes[i][..want])?);
+            out.push(Self::txid_from_body_prefix(&prefixes[i])?);
         }
         crate::head_resolve_stats::add_body_lookups(n as u64);
         Ok(out)
     }
 
-    /// Parse txid from the leading bytes of a Class A body payload.
+    /// Parse txid from the leading bytes of a Class A body payload (txid-first).
     #[inline]
     pub(crate) fn txid_from_body_prefix(raw: &[u8]) -> Result<[u8; 32], StoreError> {
-        if raw.first().copied() == Some(PACKED_TX_V1) {
-            if raw.len() < 1 + 32 {
-                return Err(StoreError::Corrupt("short packed tx for txid"));
-            }
-            return Ok(raw[1..33].try_into().unwrap());
-        }
-        // Bare meta (legacy test paths): TxRecord starts with txid[32].
         if raw.len() < 32 {
             return Err(StoreError::Corrupt("short tx record for txid"));
         }
@@ -1217,16 +1190,13 @@ impl TxTable {
     /// `vouts` need not be sorted; results are returned in ascending vout order.
     /// Missing vouts are omitted (caller treats as NotFound).
     fn packed_output_spender_rels(raw: &[u8], vouts: &[u32]) -> Result<Vec<(u32, u64)>, StoreError> {
-        if raw.first().copied() != Some(PACKED_TX_V1) {
-            return Err(StoreError::Corrupt("not a packed Class A tx"));
-        }
-        if raw.len() < 1 + TxRecord::ENCODED_LEN {
+        if raw.len() < TxRecord::ENCODED_LEN {
             return Err(StoreError::Corrupt("short packed tx"));
         }
         if vouts.is_empty() {
             return Ok(Vec::new());
         }
-        let meta = TxRecord::decode(&raw[1..1 + TxRecord::ENCODED_LEN])?;
+        let meta = TxRecord::decode(&raw[..TxRecord::ENCODED_LEN])?;
         let mut want: Vec<u32> = vouts.to_vec();
         want.sort_unstable();
         want.dedup();
@@ -1234,7 +1204,7 @@ impl TxTable {
         if max_v >= meta.output_count {
             return Err(StoreError::NotFound);
         }
-        let mut off = 1 + TxRecord::ENCODED_LEN;
+        let mut off = TxRecord::ENCODED_LEN;
         // Skip inputs without materializing script/witness.
         for _ in 0..meta.input_count {
             let (_txid, _vout, used) = InputRecord::decode_prevout_at(&raw[off..])?;
@@ -1259,9 +1229,9 @@ impl TxTable {
         Ok(out)
     }
 
-    /// Read Class A body txid from a known range (no idx). Thin: first 33 bytes only.
+    /// Read Class A body txid from a known range (no idx). Thin: first 32 bytes.
     pub fn body_txid_at(&self, offset: u64, len: u64) -> Result<[u8; 32], StoreError> {
-        let mut prefix = [0u8; 33];
+        let mut prefix = [0u8; 32];
         let n = self.body.read_prefix_at(offset, len, &mut prefix)?;
         Self::txid_from_body_prefix(&prefix[..n])
     }
@@ -1740,15 +1710,16 @@ impl TxTable {
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        // Worst-case pad ≤ 8 + page-skip gap before each record.
         let est: usize = items
             .iter()
             .map(|(_tx, ins, outs)| {
-                1 + TxRecord::ENCODED_LEN
+                16 + TxRecord::ENCODED_LEN
                     + ins.iter().map(|i| i.encoded_len()).sum::<usize>()
                     + outs.iter().map(|o| o.encoded_len()).sum::<usize>()
             })
             .sum();
-        let fks = self.body.put_batch_encode(items.len(), est, |i, buf| {
+        let fks = self.body.put_batch_encode_aligned(items.len(), est, |i, buf| {
             let (tx, ins, outs) = &items[i];
             encode_packed_tx(tx, ins, outs, buf);
         })?;
@@ -4599,8 +4570,15 @@ mod tests {
     }
 
     #[test]
-    fn non_packed_tx_body_rejected() {
-        // Bare TxRecord meta without PACKED_TX_V1 tag (legacy 3-table layout).
+    fn short_or_truncated_packed_body_rejected() {
+        // Too short for TxRecord meta.
+        assert!(!is_packed_tx_payload(&[]));
+        assert!(!is_packed_tx_payload(&[0u8; 63]));
+        assert!(matches!(
+            decode_packed_tx(&[0u8; 63]),
+            Err(StoreError::Corrupt(_))
+        ));
+        // Meta claims inputs/outputs but payload ends after meta.
         let rec = TxRecord {
             txid: [1u8; 32],
             version: 1,
@@ -4611,7 +4589,7 @@ mod tests {
             output_count: 1,
         };
         let raw = rec.encode();
-        assert!(!is_packed_tx_payload(&raw));
+        assert!(is_packed_tx_payload(&raw));
         assert!(matches!(
             decode_packed_tx(&raw),
             Err(StoreError::Corrupt(_))
@@ -4960,7 +4938,8 @@ mod tests {
         encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
         assert!(is_packed_tx_payload(&raw));
         assert!(!is_packed_tx_payload(&[]));
-        assert!(!is_packed_tx_payload(&[0u8; 70]));
+        assert!(!is_packed_tx_payload(&[0u8; 63]));
+        assert!(is_packed_tx_payload(&[0u8; 64])); // length gate only; decode may still fail
         let (m, ins, outs) = decode_packed_tx(&raw).unwrap();
         assert_eq!(m.txid, tx.txid);
         assert_eq!(m.input_start_fk, Fk::NULL);
@@ -4984,13 +4963,13 @@ mod tests {
         assert!(cleared[0].spender_field.is_null());
         assert!(!cleared[0].multi_spender);
 
-        // Packed error arms
+        // Packed error arms (short / truncated)
         assert!(matches!(
             decode_packed_tx(&[0x02, 0, 0]),
             Err(StoreError::Corrupt(_))
         ));
         assert!(matches!(
-            decode_packed_tx(&[PACKED_TX_V1]),
+            decode_packed_tx(&[0x01]),
             Err(StoreError::Corrupt(_))
         ));
         assert!(matches!(
@@ -4998,12 +4977,17 @@ mod tests {
             Err(StoreError::Corrupt(_))
         ));
         assert!(matches!(
-            decode_packed_tx_outs_with_spender_rels(&[PACKED_TX_V1]),
+            decode_packed_tx_outs_with_spender_rels(&[0x01]),
             Err(StoreError::Corrupt(_))
         ));
-        // trailing bytes on packed
+        // trailing zero pad is accepted (schema 11 alignment gap)
+        let mut trail_z = raw.clone();
+        trail_z.extend_from_slice(&[0u8; 7]);
+        let (mz, _, _) = decode_packed_tx(&trail_z).unwrap();
+        assert_eq!(mz.txid, tx.txid);
+        // non-zero trailing garbage is rejected
         let mut trail = raw.clone();
-        trail.push(0);
+        trail.push(0x01);
         assert!(matches!(
             decode_packed_tx(&trail),
             Err(StoreError::Corrupt(_))
@@ -5113,8 +5097,7 @@ mod tests {
             let inputs = [InputRecord::coinbase(u32::MAX, vec![], vec![])];
             let outputs = [OutputRecord::unspent(1, vec![0x51])];
             let mut raw = Vec::new();
-            // Manually pack with wrong meta count
-            raw.push(PACKED_TX_V1);
+            // Manually pack with wrong meta count (txid-first, no magic).
             let mut meta = tx;
             meta.output_count = 2;
             raw.extend_from_slice(&meta.encode());
@@ -5131,10 +5114,10 @@ mod tests {
             ));
             // short scan
             assert!(matches!(
-                scan_packed_meta_and_prevouts(&[PACKED_TX_V1]),
+                scan_packed_meta_and_prevouts(&[0u8; 8]),
                 Err(StoreError::Corrupt(_))
             ));
-            // trailing on outs_only path
+            // non-zero trailing on outs_only path
             let mut good = Vec::new();
             encode_packed_tx(
                 &TxRecord {
@@ -5156,6 +5139,12 @@ mod tests {
                 decode_packed_tx_outs_with_spender_rels(&trail),
                 Err(StoreError::Corrupt(_))
             ));
+            // zero pad accepted on outs path
+            let mut zpad = good.clone();
+            zpad.extend_from_slice(&[0u8; 5]);
+            let (m, outs, _) = decode_packed_tx_outs_with_spender_rels(&zpad).unwrap();
+            assert_eq!(m.txid, [1; 32]);
+            assert_eq!(outs.len(), 1);
         }
         // input run trailing
         {
@@ -5185,6 +5174,112 @@ mod tests {
         assert!(t.body_txid_range(10, 5).unwrap().is_empty());
         // Beyond count → NotFound or empty ranges
         let _ = t.body_txid_range(1, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_tx_body_start_8_align_and_page_rule() {
+        assert_eq!(next_tx_body_start(0), 0);
+        assert_eq!(next_tx_body_start(1), 8);
+        assert_eq!(next_tx_body_start(8), 8);
+        assert_eq!(next_tx_body_start(9), 16);
+        // Near page end: S % 4096 must be ≤ 4064 so txid [S,S+32) fits.
+        assert_eq!(next_tx_body_start(4096 - 31), 4096); // 4065 → skip to next page
+        assert_eq!(next_tx_body_start(4096 - 32), 4064); // 4064 ok
+        assert_eq!(next_tx_body_start(4064), 4064);
+        assert_eq!(next_tx_body_start(4065), 4096);
+        for c in [0u64, 1, 7, 15, 100, 4090, 4095, 4096, 8191, 100_003] {
+            let s = next_tx_body_start(c);
+            assert_eq!(s % 8, 0, "c={c} s={s}");
+            assert!(s % BODY_PAGE_SIZE <= TXID_PAGE_MAX_OFF, "c={c} s={s}");
+            assert!(s >= c);
+        }
+    }
+
+    /// Appended Class A records start 8-aligned; body_txid is first 32 bytes at S.
+    #[test]
+    fn put_full_aligns_record_starts_and_txid_prefix() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-align-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = create_tiny(&dir);
+
+        let mut items = Vec::new();
+        for i in 0u8..40 {
+            let mut txid = [0u8; 32];
+            txid[0] = i;
+            txid[1] = 0xA5;
+            let tx = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            // Vary sizes so pad between records is non-trivial.
+            let script: Vec<u8> = (0..((i as usize % 17) + 1)).map(|b| b as u8).collect();
+            items.push((
+                tx,
+                vec![InputRecord::coinbase(u32::MAX, vec![], vec![])],
+                vec![OutputRecord::unspent(1000 + i as i64, script)],
+            ));
+        }
+        let fks = t.put_full_batch_indexed(&items, true).unwrap();
+        assert_eq!(fks.len(), 40);
+        for (j, fk) in fks.iter().enumerate() {
+            let (off, len) = t.body.record_range(*fk).unwrap();
+            assert_eq!(off % 8, 0, "fk={} off={}", fk.0, off);
+            assert!(
+                off % BODY_PAGE_SIZE <= TXID_PAGE_MAX_OFF,
+                "fk={} off={} page-straddle risk",
+                fk.0,
+                off
+            );
+            assert!(len >= 64);
+            let txid = t.body_txid(*fk).unwrap();
+            assert_eq!(txid, items[j].0.txid);
+            let (meta, ins, outs) = t.get_full(*fk).unwrap();
+            assert_eq!(meta.txid, items[j].0.txid);
+            assert_eq!(ins.len(), 1);
+            assert_eq!(outs.len(), 1);
+            // Absolute body: first 32 bytes are the txid.
+            let mut prefix = [0u8; 32];
+            t.body.read_prefix_at(off, len, &mut prefix).unwrap();
+            assert_eq!(prefix, items[j].0.txid);
+        }
+        // Multi-batch: second batch pads from previous end.
+        let mut more = Vec::new();
+        for i in 40u8..55 {
+            let mut txid = [0u8; 32];
+            txid[0] = i;
+            more.push((
+                TxRecord {
+                    txid,
+                    version: 2,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                vec![InputRecord::coinbase(u32::MAX, vec![], vec![])],
+                vec![OutputRecord::unspent(1, vec![0x51])],
+            ));
+        }
+        let fks2 = t.put_full_batch_indexed(&more, true).unwrap();
+        for (j, fk) in fks2.iter().enumerate() {
+            let (off, _) = t.body.record_range(*fk).unwrap();
+            assert_eq!(off % 8, 0);
+            assert_eq!(t.body_txid(*fk).unwrap(), more[j].0.txid);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

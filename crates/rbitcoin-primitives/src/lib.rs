@@ -17,7 +17,7 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
-pub const SCHEMA_VERSION: u16 = 10;
+pub const SCHEMA_VERSION: u16 = 11;
 
 /// 1-based foreign key into a store table body. Zero means null / absent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -224,7 +224,7 @@ mod tests {
     #[test]
     fn constants_stable() {
         assert_eq!(STORE_MAGIC, *b"RBT1");
-        assert_eq!(SCHEMA_VERSION, 10);
+        assert_eq!(SCHEMA_VERSION, 11);
         assert!(!VERSION.is_empty());
     }
 }

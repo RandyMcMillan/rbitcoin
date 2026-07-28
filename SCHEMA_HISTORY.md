@@ -1,7 +1,7 @@
 # Schema history
 
 Historic on-disk layouts for the rbitcoin chain store.  
-**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 10`).
+**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 11`).
 
 Until 1.0 there is **no in-place migration**: a new major layout generally means wipe the store and redo IBD. This file is for archaeology, code archaeology, and understanding why the current design looks the way it does.
 
@@ -13,7 +13,8 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **10** | Packed inputs: `create_fk:u64` + vout (not `prev_txid[32]`); online `tx.head` resize; default BITS=28 | **Current** |
+| **11** | Txid-first packed body (no `0x01` magic); 8-byte align + page non-straddle; trailing zero pad | **Current** |
+| **10** | Packed inputs: `create_fk:u64` + vout (not `prev_txid[32]`); online `tx.head` resize; default BITS=28 | Prior packed layout |
 | **9** | Keyless `tx.head` 4 B entries (no HAS_NEXT); `tx_height` u32 slots | `tx.head` layout family (evolved) |
 | **8** | Keyless `tx.head` 8 B (fk + HAS_NEXT); `tx_height` u64 | Superseded by v9 packing |
 | **7** | Hash heads: 16 B key prefix + multi-fk `.mlt` lists | `header.head` / generic `HashHead` |
@@ -24,9 +25,22 @@ Versions below are listed **newest → oldest** after the summary table.
 
 ---
 
-## v10 (current)
+## v11 (current)
 
 See [`SCHEMA.md`](./SCHEMA.md).
+
+**Relative to v10:**
+
+- Drop leading **`PACKED_TX_V1` (0x01)** magic; record starts with **TxRecord** so **txid is at absolute offset `S`** (bytes `[S, S+32)`).
+- Record starts are **8-byte aligned**; a 32-byte txid **must not cross a 4 KiB page** (`S % 4096 ≤ 4064`).
+- Writer **zero-pads** between records so the next start meets alignment; pad is included in the previous record’s idx span; decode accepts **trailing zeros** only.
+- Thin `body_txid` / head-resolve prefixes are **32 B at `S`** (was 33 B magic+txid).
+- **Wipe datadir from v10** (packed payload layout incompatible).
+- `tx.head` algorithm unchanged (still page-then-open keyless); see design notes in session plan / this history for page-cost rationale.
+
+---
+
+## v10
 
 **Relative to v9:**
 
@@ -35,6 +49,7 @@ See [`SCHEMA.md`](./SCHEMA.md).
 - Archive resolves parent fks once (batch map → sticky → durable `tx.head`).
 - `tx.head` gains **online sequential resize**, **meta** (`bits` / `entry_bytes` / `generation`), default **BITS=28**, **8 B entries from BITS ≥ 33**.
 - **Wipe datadir from v9** (input stream incompatible).
+- Packed layout was `0x01 | TxRecord | inputs | outputs` (strict length, no trailing pad).
 
 ---
 

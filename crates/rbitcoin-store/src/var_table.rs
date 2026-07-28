@@ -20,6 +20,20 @@ use rbitcoin_primitives::{Fk, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Fixed 4 KiB page for on-disk txid non-straddle rule (must match `tx_table`).
+const TX_BODY_PAGE: u64 = 4096;
+const TXID_PAGE_MAX_OFF: u64 = TX_BODY_PAGE - 32;
+
+/// Next 8-byte-aligned body start where a 32-byte txid does not cross a page.
+#[inline]
+fn next_aligned_tx_start(cursor: u64) -> u64 {
+    let mut s = cursor.saturating_add(7) & !7u64;
+    while s % TX_BODY_PAGE > TXID_PAGE_MAX_OFF {
+        s = s.saturating_add(8);
+    }
+    s
+}
+
 pub struct VarTable {
     body: TableFile,
     idx: TableFile,
@@ -325,6 +339,28 @@ impl VarTable {
         &self,
         n: usize,
         estimate_bytes: usize,
+        encode: impl FnMut(usize, &mut Vec<u8>),
+    ) -> Result<Vec<Fk>, StoreError> {
+        self.put_batch_encode_inner(n, estimate_bytes, false, encode)
+    }
+
+    /// Like [`put_batch_encode`], but **8-byte-align** each record start and ensure
+    /// a 32-byte prefix at that start does not straddle a 4 KiB page (Class A txs).
+    /// Zero-pad between records is included in the previous span for idx length.
+    pub fn put_batch_encode_aligned(
+        &self,
+        n: usize,
+        estimate_bytes: usize,
+        encode: impl FnMut(usize, &mut Vec<u8>),
+    ) -> Result<Vec<Fk>, StoreError> {
+        self.put_batch_encode_inner(n, estimate_bytes, true, encode)
+    }
+
+    fn put_batch_encode_inner(
+        &self,
+        n: usize,
+        estimate_bytes: usize,
+        align_tx: bool,
         mut encode: impl FnMut(usize, &mut Vec<u8>),
     ) -> Result<Vec<Fk>, StoreError> {
         if n == 0 {
@@ -338,6 +374,14 @@ impl VarTable {
         let mut cursor = start;
         for i in 0..n {
             fks.push(Fk(base_count + 1 + i as u64));
+            if align_tx {
+                let aligned = next_aligned_tx_start(cursor);
+                let pad = aligned.saturating_sub(cursor) as usize;
+                if pad > 0 {
+                    body_blob.resize(body_blob.len() + pad, 0);
+                    cursor = aligned;
+                }
+            }
             idx_blob.extend_from_slice(&cursor.to_le_bytes());
             let before = body_blob.len();
             encode(i, &mut body_blob);

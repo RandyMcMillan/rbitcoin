@@ -76,7 +76,8 @@ pub use idx_body_pipeline::{
 pub use tx_table::{
     clear_output_spender_fields, decode_packed_tx, decode_packed_tx_outs_with_spender_rels,
     decode_packed_tx_with_spender_rels, encode_packed_tx, is_packed_tx_payload,
-    scan_packed_meta_and_prevouts, InputRecord, OutputRecord, TxRecord, PACKED_TX_V1,
+    scan_packed_meta_and_prevouts, InputRecord, OutputRecord, TxRecord, BODY_PAGE_SIZE,
+    TXID_PAGE_MAX_OFF, next_tx_body_start,
 };
 
 /// Crate identity for diagnostics and coverage scenarios.

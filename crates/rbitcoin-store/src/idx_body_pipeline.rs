@@ -26,7 +26,7 @@ pub enum BodyMode {
     Full,
     /// Full packed payload for denserels/outs-only decode (pin_new).
     OutsDenserels,
-    /// Leading ≤33 body bytes (txid prefix / head resolve).
+    /// Leading ≤32 body bytes (txid at record start / head resolve).
     Prefix33,
 }
 
@@ -35,7 +35,7 @@ impl BodyMode {
     fn body_len(self, range_len: u64) -> u64 {
         match self {
             BodyMode::Full | BodyMode::OutsDenserels => range_len,
-            BodyMode::Prefix33 => range_len.min(33),
+            BodyMode::Prefix33 => range_len.min(32),
         }
     }
 }

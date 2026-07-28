@@ -1,6 +1,6 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 10` (`rbitcoin_primitives`).  
+**Version:** `SCHEMA_VERSION = 11` (`rbitcoin_primitives`).  
 **Status:** unstable until 1.0 — incompatible layout changes are reindex-only (wipe store / redo IBD).  
 **Endianness:** little-endian for all multi-byte integers.
 
@@ -118,15 +118,28 @@ Open-address hash head (see [Hash heads](#hash-heads-headerhead--generic)): key 
 
 ## Class A — transactions
 
-### Packed body (`PACKED_TX_V1`)
+### Packed body (schema 11+)
 
-Each `tx.body` payload:
+Each `tx.body` record starts at an absolute offset `S` with:
 
 ```text
-0x01 | TxRecord (64 B fixed meta) | inputs… | outputs…
+S (8-byte aligned; txid does not cross a 4 KiB page):
+  TxRecord (64 B fixed meta)   # txid = bytes [S, S+32)
+  inputs…
+  outputs…
+  [optional 0x00 …]            # pad to next record start (included in idx length)
 ```
 
-There are **no** standalone `input.body` / `output.body` tables.
+There is **no** leading magic byte (schema ≤10 used `PACKED_TX_V1 = 0x01`). There are **no** standalone `input.body` / `output.body` tables.
+
+**Alignment invariants** (fixed 4 KiB pages):
+
+```text
+S % 8 == 0
+(S % 4096) + 32 <= 4096   ⇔  S % 4096 <= 4064
+```
+
+Decode walks meta + runs to a logical end; any remaining bytes in the idx span must be **all zeros**. Non-zero trailing garbage is corrupt. Thin `body_txid` reads are **32 bytes at `S`**.
 
 **TxRecord (64 B):** txid, version, locktime, `input_start_fk`, `input_count`, `output_start_fk`, `output_count`.  
 On packed rows, `input_start_fk` / `output_start_fk` are always null (layout reserved; I/O lives in the same payload).

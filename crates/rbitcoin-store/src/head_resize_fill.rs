@@ -205,7 +205,7 @@ fn run_linux(
 
     // body pool
     let mut body_free: Vec<usize> = (0..BODY_POOL).collect();
-    let mut body_bufs: Vec<[u8; 33]> = vec![[0u8; 33]; BODY_POOL];
+    let mut body_bufs: Vec<[u8; 32]> = vec![[0u8; 32]; BODY_POOL];
     let mut body_work: Vec<Option<BodyWork>> = (0..BODY_POOL).map(|_| None).collect();
     let mut body_want: Vec<usize> = vec![0; BODY_POOL];
     let mut body_in_flight = 0usize;
@@ -283,7 +283,7 @@ fn run_linux(
             {
                 let w = fk_queue.pop_front().unwrap();
                 let slot = body_free.pop().unwrap();
-                let want = (w.body_len as usize).min(33).max(1);
+                let want = (w.body_len as usize).min(32).max(1);
                 body_want[slot] = want;
                 body_work[slot] = Some(w);
                 let buf = &mut body_bufs[slot][..want];

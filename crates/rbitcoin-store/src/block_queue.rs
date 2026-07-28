@@ -254,6 +254,34 @@ impl BlockQueue {
         Ok(true)
     }
 
+    /// Dequeue all records for a confirmed height (may be 0 or 1 in normal path).
+    pub fn dequeue_height(&mut self, height: u32) -> Result<usize, StoreError> {
+        let ids: Vec<u64> = self
+            .index
+            .iter()
+            .filter(|(_, e)| e.height == height)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut n = 0usize;
+        for id in ids {
+            if self.dequeue(id)? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Load every queued block (restart replay, ascending id).
+    pub fn load_all(&self) -> Result<Vec<QueuedBlock>, StoreError> {
+        let mut out = Vec::with_capacity(self.index.len());
+        for &id in self.index.keys() {
+            if let Some(b) = self.get(id)? {
+                out.push(b);
+            }
+        }
+        Ok(out)
+    }
+
     /// Heights currently on the durable queue.
     pub fn heights(&self) -> Vec<u32> {
         self.index.values().map(|e| e.height).collect()

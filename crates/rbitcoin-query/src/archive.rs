@@ -264,16 +264,27 @@ impl Query {
         let collect_ns = t_collect.elapsed().as_nanos() as u64;
 
         let t_sticky = Instant::now();
-        // Sticky hit ⇒ skip head; range on hit ⇒ skip idx for that create elsewhere.
+        // Unified residency first (shared with confirm load), then legacy sticky,
+        // then OutFifo — one map is the hot hit path for parent fk/range.
+        let mut resolved: HashMap<[u8; 32], Fk> =
+            HashMap::with_capacity(need_vec.len() / 2);
+        for t in &need_vec {
+            if let Some(fk) = self.create_residency.lookup_fk_by_txid(t) {
+                resolved.insert(*t, fk);
+            }
+        }
         let sticky_hits = self.archive_txid_sticky.lookup_batch(&need_vec);
         let sticky_hit_n = sticky_hits.len() as u64;
-        let mut resolved: HashMap<[u8; 32], Fk> =
-            HashMap::with_capacity(sticky_hits.len().saturating_add(need_vec.len() / 4));
         for (txid, hit) in sticky_hits {
-            resolved.insert(txid, hit.fk);
+            resolved.entry(txid).or_insert(hit.fk);
+            // Bridge sticky → unified residency (range skips idx on confirm pin).
+            self.create_residency.insert_fk_txid_range(
+                hit.fk,
+                txid,
+                hit.body_range,
+            );
         }
         // Cross-cache read: confirm OutFifo may already hold create fk (from load).
-        // Read-only — do not publish into sticky from confirm fills.
         let mut need_after_sticky: Vec<[u8; 32]> = Vec::new();
         for t in &need_vec {
             if !resolved.contains_key(t) {
@@ -535,6 +546,14 @@ impl Query {
         self.archive_txid_sticky
             .insert_many_with_ranges(&with_range);
         self.archive_txid_sticky.insert_many(&fk_only);
+        // Unified residency: same creates for confirm pin (range hits skip idx).
+        for &(txid, fk, off, len) in &with_range {
+            self.create_residency
+                .insert_fk_txid_range(fk, txid, Some((off, len)));
+        }
+        for &(txid, fk) in &fk_only {
+            self.create_residency.insert_fk_txid_range(fk, txid, None);
+        }
         let sticky_ns = t.elapsed().as_nanos() as u64;
 
         let t = Instant::now();

@@ -19,7 +19,7 @@ mod sh_builder;
 mod wave_prevout;
 
 pub use combined_stage::{
-    body_ok_reads, load_creates_once, pin_from_residency, reset_body_ok_reads, CombinedCreate,
+    body_ok_reads, load_creates_once, reset_body_ok_reads, CombinedCreate,
 };
 pub use create_residency::{CreateResidency, DEFAULT_CREATE_CAP, DEFAULT_OUT_CAP};
 
@@ -634,6 +634,12 @@ pub struct Query {
     confirm_parents: confirm_parent_cache::ConfirmParentCache,
     /// Archive writer sticky: txid → create_fk for packing spends (cross mega-batch).
     archive_txid_sticky: archive_txid_sticky::ArchiveTxidSticky,
+    /// Unified create residency (fk/range/outs) — single parent-body path for
+    /// combined archive prep + confirm load. Dual-written with sticky/OutFifo
+    /// during migration; pin/range lookups prefer this map.
+    create_residency: create_residency::CreateResidency,
+    /// Durable multi‑GiB on-disk block payload queue (IBD restart without re-download).
+    block_queue: Mutex<rbitcoin_store::BlockQueue>,
     /// Direct IBD SH: memtable → sorted runs (bulk materialize at tip).
     sh_run: sh_builder::ShRunBuilder,
     /// Explicit [`IndexMode`] (Direct / Tip).
@@ -669,6 +675,10 @@ impl Query {
             sh_indexed_through: AtomicU64::new(sh_through),
             confirm_parents: confirm_parent_cache::ConfirmParentCache::from_env(),
             archive_txid_sticky: archive_txid_sticky::ArchiveTxidSticky::from_env(),
+            create_residency: create_residency::CreateResidency::from_env(),
+            block_queue: Mutex::new(rbitcoin_store::BlockQueue::open_or_create(
+                &store_path,
+            )?),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
             // Open as Tip until IBD selects Direct.
             index_mode_cell: std::sync::atomic::AtomicU8::new(IndexMode::Tip as u8),
@@ -826,6 +836,49 @@ impl Query {
             self.archive_txid_sticky.len(),
             self.archive_txid_sticky.cap(),
         )
+    }
+
+    /// Sticky body ranges by create fk (tests / diagnostics; production prefers residency).
+    pub fn archive_txid_sticky_body_ranges(
+        &self,
+        fks: &[Fk],
+    ) -> Vec<Option<(u64, u64)>> {
+        self.archive_txid_sticky.body_ranges_by_fk(fks)
+    }
+
+    /// Unified create residency (shared archive prep + confirm load).
+    pub fn create_residency(&self) -> &create_residency::CreateResidency {
+        &self.create_residency
+    }
+
+    /// Durable block queue budget/count for status.
+    pub fn block_queue_stats(&self) -> (u64, u64, usize) {
+        let g = self.block_queue.lock().unwrap();
+        (g.budget(), g.bytes(), g.count())
+    }
+
+    /// Persist a decoded block payload (IBD receive path). Survives restart.
+    pub fn block_queue_enqueue(
+        &self,
+        height: u32,
+        hash: [u8; 32],
+        header_fk: u64,
+        payload: &[u8],
+    ) -> Result<u64, QueryError> {
+        let mut g = self.block_queue.lock().unwrap();
+        Ok(g.enqueue(height, hash, header_fk, payload)?)
+    }
+
+    /// Remove durable queue entry after combined confirm-write (or permanent drop).
+    pub fn block_queue_dequeue_height(&self, height: u32) -> Result<usize, QueryError> {
+        let mut g = self.block_queue.lock().unwrap();
+        Ok(g.dequeue_height(height)?)
+    }
+
+    /// Load all durable queued blocks (IBD restart replay).
+    pub fn block_queue_load_all(&self) -> Result<Vec<rbitcoin_store::QueuedBlock>, QueryError> {
+        let g = self.block_queue.lock().unwrap();
+        Ok(g.load_all()?)
     }
 
     /// Cheap process-owned cache sizes for the IBD `ibd: sizes` line.

@@ -205,25 +205,26 @@ impl Query {
                 std::borrow::Cow::Owned(v)
             };
 
-            // Sticky ranges first; residual cold creates go through idx→body
-            // pipeline (completion-driven uring; mmap+pread fallback).
+            // Combined path: residency ranges + one idx→body wave seeds residency
+            // (archive prep + confirm pin share the same map — no dual thrash).
             let range_fks: Vec<Fk> = fks_work
                 .iter()
                 .copied()
                 .filter(|fk| fk.get().is_some())
                 .collect();
-            let sticky_ranges = self.archive_txid_sticky.body_ranges_by_fk(&range_fks);
-            let mut pipe_jobs: Vec<rbitcoin_store::IdxBodyJob> =
-                Vec::with_capacity(range_fks.len());
-            for (fk, sticky) in range_fks.iter().zip(sticky_ranges.into_iter()) {
-                let id = fk.get().unwrap_or(0);
-                pipe_jobs.push(rbitcoin_store::IdxBodyJob::new(id, sticky));
+            let creates = crate::combined_stage::load_creates_once(
+                &self.store,
+                &self.create_residency,
+                &range_fks,
+                rbitcoin_store::IdxBodyMode::Full,
+            )?;
+            // Map fk → raw for this block's create decode.
+            let mut by_fk: HashMap<u64, crate::combined_stage::CombinedCreate> =
+                HashMap::with_capacity(creates.len());
+            for c in creates {
+                by_fk.insert(c.fk.get().unwrap_or(0), c);
             }
-            if !pipe_jobs.is_empty() {
-                self.store
-                    .idx_body_pipeline(&mut pipe_jobs, rbitcoin_store::IdxBodyMode::Full)?;
-            }
-            for (fk, job) in range_fks.iter().zip(pipe_jobs.into_iter()) {
+            for fk in &range_fks {
                 if self.confirm_cancelled() {
                     crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                     return Err(StoreError::Cancelled("confirm cancelled"));
@@ -231,18 +232,21 @@ impl Query {
                 let Some(id) = fk.get() else {
                     continue;
                 };
-                if !job.ok || job.range.is_none() {
+                let Some(c) = by_fk.remove(&id) else {
                     return Err(StoreError::Corrupt(
                         "invariant: confirm load create missing body range",
                     )
                     .into());
-                }
+                };
                 let Ok((tx, inputs, outs, denserels)) =
-                    rbitcoin_store::decode_packed_tx_with_spender_rels(&job.body)
+                    rbitcoin_store::decode_packed_tx_with_spender_rels_secret(
+                        &c.raw,
+                        Some(self.store.txs.store_secret()),
+                    )
                 else {
                     continue;
                 };
-                let body_range = job.range;
+                let body_range = Some(c.body_range);
                 st.body_tx_reads = st.body_tx_reads.saturating_add(1);
                 let prevouts: Vec<(Option<u64>, [u8; 32], u32)> = inputs
                     .iter()
@@ -266,9 +270,19 @@ impl Query {
             height_tx_fks.push((height, tx_fks));
         }
 
-        // ── Cache put (create outs FIFO; outs only — wire uses batch_bodies) ─
+        // ── Cache put (OutFifo + unified residency for shared pin hits) ─
         let t_put = Instant::now();
         self.confirm_parents.put_bodies_from_batch_full(&batch_bodies);
+        // Dual-write outs into residency so later batches pin without re-IO.
+        for (fk, body) in batch_bodies.iter() {
+            self.create_residency.put_outs(
+                fk,
+                body.tx.clone(),
+                body.outputs.clone(),
+                body.denserels.clone(),
+                body.body_range,
+            );
+        }
         st.cache_put_ns = st
             .cache_put_ns
             .saturating_add(t_put.elapsed().as_nanos() as u64);
@@ -439,46 +453,54 @@ impl Query {
             crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
             return Err(StoreError::Cancelled("confirm cancelled"));
         }
-        // One-shot cross-cache ranges for all pin_new parents (skip idx when known).
-        let pin_new_fks: Vec<Fk> = pin_new_pending.iter().map(|(pid, _)| Fk(*pid)).collect();
-        let mut pin_new_ranges: Vec<Option<(u64, u64)>> =
-            self.archive_txid_sticky.body_ranges_by_fk(&pin_new_fks);
-        {
-            let mut need_fifo: Vec<Fk> = Vec::new();
-            let mut need_fifo_slot: Vec<usize> = Vec::new();
-            for (i, r) in pin_new_ranges.iter().enumerate() {
-                if r.is_none() {
-                    need_fifo_slot.push(i);
-                    need_fifo.push(pin_new_fks[i]);
+        // pin_new via combined residency: one denserels load seeds residency;
+        // OutFifo dual-write kept for legacy cross-checks.
+        // Prefer already-resident outs (same creates archive just published).
+        let mut still_need: Vec<(u64, Vec<u32>)> = Vec::new();
+        for (pid, need_vouts) in &pin_new_pending {
+            let fk = Fk(*pid);
+            if let Some((tx, outs, dense_rels, range)) = self.create_residency.get_outs(fk) {
+                let live = slim_dense_outs_to_need(&outs, need_vouts);
+                let sparse = crate::batch_parents::sparse_spender_rels(&dense_rels, need_vouts);
+                if crate::batch_parents::layout_covers_need(range, &sparse, need_vouts) {
+                    let cb = if tx.input_count != 1 {
+                        Some(false)
+                    } else {
+                        None
+                    };
+                    batch_parents.insert_owned(
+                        fk,
+                        tx,
+                        live,
+                        need_vouts.clone(),
+                        cb,
+                        range,
+                        sparse,
+                    );
+                    st.utxo_parents = st.utxo_parents.saturating_add(1);
+                    st.pin_cache_body = st.pin_cache_body.saturating_add(1);
+                    continue;
                 }
             }
-            if !need_fifo.is_empty() {
-                let fifo_ranges = self.confirm_parents.body_ranges_by_fk(&need_fifo);
-                for (slot, fr) in need_fifo_slot.into_iter().zip(fifo_ranges.into_iter()) {
-                    if fr.is_some() {
-                        pin_new_ranges[slot] = fr;
-                    }
-                }
-            }
+            still_need.push((*pid, need_vouts.clone()));
         }
-        for (chunk_i, chunk) in pin_new_pending.chunks(PIN_NEW_CHUNK).enumerate() {
+        for chunk in still_need.chunks(PIN_NEW_CHUNK) {
             if self.confirm_cancelled() {
                 crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                 return Err(StoreError::Cancelled("confirm cancelled"));
             }
-            let base = chunk_i.saturating_mul(PIN_NEW_CHUNK);
-            let mut pipe_jobs: Vec<rbitcoin_store::IdxBodyJob> =
-                Vec::with_capacity(chunk.len());
-            for (j, (pid, _)) in chunk.iter().enumerate() {
-                let range = pin_new_ranges.get(base + j).copied().flatten();
-                pipe_jobs.push(rbitcoin_store::IdxBodyJob::new(*pid, range));
-            }
-            self.store.idx_body_pipeline(
-                &mut pipe_jobs,
+            let fks: Vec<Fk> = chunk.iter().map(|(pid, _)| Fk(*pid)).collect();
+            let loaded = crate::combined_stage::load_creates_once(
+                &self.store,
+                &self.create_residency,
+                &fks,
                 rbitcoin_store::IdxBodyMode::OutsDenserels,
             )?;
-
-            // Residency: dense outs → OutFifo; need-vouts → BatchParents.
+            let mut by_id: HashMap<u64, crate::combined_stage::CombinedCreate> =
+                HashMap::with_capacity(loaded.len());
+            for c in loaded {
+                by_id.insert(c.fk.get().unwrap_or(0), c);
+            }
             const FIFO_FLUSH: usize = 256;
             let mut fifo_seed: Vec<(
                 Fk,
@@ -489,34 +511,36 @@ impl Query {
                 Vec<u32>,
             )> = Vec::with_capacity(FIFO_FLUSH);
 
-            for ((pid, need_vouts), job) in chunk.iter().zip(pipe_jobs.into_iter()) {
+            for (pid, need_vouts) in chunk {
                 if self.confirm_cancelled() {
                     crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
                     return Err(StoreError::Cancelled("confirm cancelled"));
                 }
                 let fk = Fk(*pid);
-                let need_vouts = need_vouts.clone();
                 if need_vouts.is_empty() {
                     continue;
                 }
-                if !job.ok || job.range.is_none() {
+                let Some(c) = by_id.remove(pid) else {
                     return Err(StoreError::Corrupt(
                         "invariant: pin_new parent missing body range",
                     )
                     .into());
-                }
-                let range = job.range;
+                };
+                let range = Some(c.body_range);
                 let Ok((tx, outs, dense_rels)) =
-                    rbitcoin_store::decode_packed_tx_outs_with_spender_rels(&job.body)
+                    rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
+                        &c.raw,
+                        Some(self.store.txs.store_secret()),
+                    )
                 else {
                     return Err(StoreError::Corrupt(
                         "invariant: pin_new failed to decode parent denserels",
                     )
                     .into());
                 };
-                let live = slim_dense_outs_to_need(&outs, &need_vouts);
-                let sparse = crate::batch_parents::sparse_spender_rels(&dense_rels, &need_vouts);
-                if !crate::batch_parents::layout_covers_need(range, &sparse, &need_vouts) {
+                let live = slim_dense_outs_to_need(&outs, need_vouts);
+                let sparse = crate::batch_parents::sparse_spender_rels(&dense_rels, need_vouts);
+                if !crate::batch_parents::layout_covers_need(range, &sparse, need_vouts) {
                     return Err(StoreError::Corrupt(
                         "invariant: pin_new denserels incomplete for need_vouts",
                     )
@@ -532,7 +556,7 @@ impl Query {
                     fk,
                     tx,
                     live,
-                    need_vouts,
+                    need_vouts.clone(),
                     cb,
                     range,
                     sparse,

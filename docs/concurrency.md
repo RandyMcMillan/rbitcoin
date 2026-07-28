@@ -6,19 +6,21 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 | Role | Threading | Store writes |
 |------|-----------|--------------|
-| Peer IO (N tasks) | tokio multi-thread | none (wire only); decoded bodies land on **durable `block_queue/`** |
-| Combined **load** (prep+confirm load) | 1 OS/thread stage | **none** — decode creates once, pin parents once via unified **CreateResidency** (`load_creates_once`) |
+| Peer IO (N tasks) | tokio multi-thread | none; decoded blocks **enqueue durable `store/block_queue/`** + RAM archive job |
+| Archive **prep** | 1 tokio task | **none** — parent fk resolve via **CreateResidency** then sticky/OutFifo/head |
+| Archive **writer** | 1 OS thread | **Class A exclusive**; publishes creates into sticky **and CreateResidency** |
+| Confirm **load** | 1 OS thread | **none** — create decode + pin_new via **`load_creates_once` → CreateResidency** (shared map) |
 | Confirm **scripts** | 1 OS thread | **none** — pure CPU (rayon); no store |
-| Combined **write** (archive+confirm write) | 1 OS thread | **Class A exclusive** then Class C / spend annotate; sole Class A appender + sole spend annotator |
+| Confirm **write** | 1 OS thread | Class C + spend annotate; **`block_queue_dequeue_height`** after success |
 | IBD main loop | 1 tokio task | none (orchestration only) |
 
-Legacy dual sticky + OutFifo paths remain for tip/Electrum compatibility during migration; the **combined** path uses one residency map so archive stamp and confirm pin do not each re-fetch the same parent body.
+**Single parent-body path:** confirm load seeds **CreateResidency** on create decode; pin hits residency outs/ranges before cold denserels IO. Archive commit dual-writes ranges into the same map.
 
-**Durable queue:** `store/block_queue/` multi‑GiB payload FIFO (`RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`, default 8 GiB). Dequeue only after combined confirm-write (or permanent reject). Restart reopens without re-download.
+**Durable queue:** `store/block_queue/` multi‑GiB payload FIFO (`RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`, default 8 GiB). Enqueue on peer Block; dequeue after confirm-write. `Query::block_queue_load_all` for restart.
 
-**tx.head overflow:** depth-exhausted inserts go to `tx.head.overflow` (probe overflow first, then primary) so the write path does not stall for multi‑GiB primary rehash.
+**tx.head overflow:** depth-exhausted inserts → `tx.head.overflow` (overflow-first lookup).
 
-**Datadir secret (schema 12):** `store/store.secret` CSPRNG at create. XOR scriptSig / witness / scriptPubKey at rest; `SHA256(secret||txid)` mixes head probe keys.
+**Datadir secret (schema 12):** `store/store.secret` CSPRNG at create. XOR scripts/witness at rest; keyed TXID mix for heads.
 
 ## Roles after IBD / tip follow
 

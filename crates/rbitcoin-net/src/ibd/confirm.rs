@@ -323,6 +323,14 @@ pub(crate) fn spawn_confirm_engine(
                     Ok(_outcomes) => {
                         for (height, raw) in &heights_hashes {
                             let hash = BlockHash::from_byte_array(*raw);
+                            // Durable queue: drop payload only after confirm-write.
+                            if let Err(e) =
+                                hub_wb.query.block_queue_dequeue_height(*height)
+                            {
+                                rbitcoin_log::debug!(
+                                    "ibd: block_queue dequeue h={height}: {e}"
+                                );
+                            }
                             loop_stats_wb
                                 .confirm_blocks
                                 .fetch_add(1, Ordering::Relaxed);
@@ -334,7 +342,6 @@ pub(crate) fn spawn_confirm_engine(
                                 feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                                 return;
                             }
-                            let _ = height;
                         }
                         feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                         let elapsed = t0.elapsed();

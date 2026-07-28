@@ -64,8 +64,9 @@ pub use scripthash_head::prefix_shard_of;
 pub use scripthash_layout::ShHeadValue;
 pub use sorted_run::{
     claim_run_for_materialize, crc32, detach_run, for_each_merged_rec, for_each_merged_rec_opts,
-    list_materialize_claims, list_runs, lookup_key, merge_runs, next_run_path, open_run,
-    read_run_body, remove_run, verify_run_body, write_sorted_run, SortedRunPath,
+    list_materialize_claims, list_runs, lookup_key, merge_runs, merge_runs_to_file,
+    next_run_path, open_run, read_run_body, reduce_runs_to_fanin, remove_run, verify_run_body,
+    write_sorted_run, SortedRunPath,
 };
 pub use store::Store;
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};

@@ -824,13 +824,163 @@ pub fn for_each_merged_rec_opts(
     Ok(())
 }
 
+/// Stream-merge `inputs` into `out_path` **without** MANIFEST updates or deleting
+/// inputs. Caller manages catalog / cleanup. At most open `|inputs|` cursors.
+///
+/// Equal keys: all records kept (SH multi-create). Streaming write (no full body RAM).
+pub fn merge_runs_to_file(
+    inputs: &[SortedRunPath],
+    out_path: &Path,
+) -> Result<SortedRunPath, StoreError> {
+    if inputs.is_empty() {
+        return write_sorted_run_file(out_path, 32, 40, &[]);
+    }
+    let key_len = inputs[0].key_len as usize;
+    let rec_len = inputs[0].rec_len;
+    for r in inputs {
+        if r.key_len as usize != key_len || r.rec_len != rec_len {
+            return Err(StoreError::Corrupt("sorted run: merge len mismatch"));
+        }
+    }
+
+    let mut heap: Vec<MergeHead> = Vec::new();
+    for (idx, run) in inputs.iter().enumerate() {
+        let mut cursor = RunCursor::open(run, false)?;
+        if cursor.fill_next()? {
+            heap.push(MergeHead { cursor, idx });
+        }
+    }
+    for i in (0..heap.len()).rev() {
+        sift_down(&mut heap, i, key_len);
+    }
+
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+    }
+    let tmp = out_path.with_extension("tmp");
+    let mut count = 0u64;
+    let mut body_crc = 0xFFFF_FFFFu32;
+    let table = crc32_table();
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| io_err(&tmp, e))?;
+        let hdr = [0u8; HEADER_LEN];
+        f.write_all(&hdr).map_err(|e| io_err(&tmp, e))?;
+        while !heap.is_empty() {
+            let mut min = heap.swap_remove(0);
+            if !heap.is_empty() {
+                sift_down(&mut heap, 0, key_len);
+            }
+            let rec = min.cursor.rec();
+            f.write_all(rec).map_err(|e| io_err(&tmp, e))?;
+            for &b in rec {
+                body_crc = table[((body_crc ^ u32::from(b)) & 0xFF) as usize] ^ (body_crc >> 8);
+            }
+            count = count.saturating_add(1);
+            if min.cursor.fill_next()? {
+                heap.push(min);
+                let last = heap.len() - 1;
+                sift_up(&mut heap, last, key_len);
+            }
+        }
+        body_crc ^= 0xFFFF_FFFF;
+        f.seek(SeekFrom::Start(0)).map_err(|e| io_err(&tmp, e))?;
+        let mut hdr = [0u8; HEADER_LEN];
+        hdr[0..8].copy_from_slice(&MAGIC);
+        hdr[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        hdr[12..16].copy_from_slice(&(key_len as u32).to_le_bytes());
+        hdr[16..20].copy_from_slice(&rec_len.to_le_bytes());
+        hdr[20..28].copy_from_slice(&count.to_le_bytes());
+        hdr[28..32].copy_from_slice(&body_crc.to_le_bytes());
+        f.write_all(&hdr).map_err(|e| io_err(&tmp, e))?;
+        f.sync_all().map_err(|e| io_err(&tmp, e))?;
+    }
+    fs::rename(&tmp, out_path).map_err(|e| io_err(out_path, e))?;
+    if let Some(parent) = out_path.parent() {
+        if let Ok(dirf) = File::open(parent) {
+            let _ = dirf.sync_all();
+        }
+    }
+    advise_file_dont_need(out_path);
+    Ok(SortedRunPath {
+        path: out_path.to_path_buf(),
+        count,
+        rec_len,
+        key_len: key_len as u32,
+        body_crc32: body_crc,
+    })
+}
+
+/// Reduce `inputs` to at most `fanin` runs via multi-pass tournament merge.
+///
+/// Intermediate files go under `work_dir`. Does **not** update MANIFEST; does not
+/// delete original `inputs` (caller deletes after successful materialize).
+/// Max open cursors per pass = `fanin` (clamped to ≥1).
+pub fn reduce_runs_to_fanin(
+    inputs: &[SortedRunPath],
+    work_dir: &Path,
+    fanin: usize,
+) -> Result<Vec<SortedRunPath>, StoreError> {
+    let fanin = fanin.max(1);
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    if inputs.len() <= fanin {
+        return Ok(inputs.to_vec());
+    }
+    fs::create_dir_all(work_dir).map_err(|e| io_err(work_dir, e))?;
+    // Clear prior incomplete intermediates.
+    if let Ok(rd) = fs::read_dir(work_dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("run")
+                || p.extension().and_then(|x| x.to_str()) == Some("tmp")
+            {
+                let _ = fs::remove_file(&p);
+            }
+        }
+    }
+    let mut level: Vec<SortedRunPath> = inputs.to_vec();
+    let mut gen = 0u32;
+    let mut seq = 1u64;
+    while level.len() > fanin {
+        let mut next = Vec::new();
+        let chunks: Vec<&[SortedRunPath]> = level.chunks(fanin).collect();
+        for chunk in chunks {
+            let out = work_dir.join(format!("g{gen}_{seq:06}.run"));
+            seq += 1;
+            let merged = merge_runs_to_file(chunk, &out)?;
+            next.push(merged);
+        }
+        // Drop previous generation intermediates (not original inputs).
+        if gen > 0 {
+            for r in &level {
+                if r.path.starts_with(work_dir) {
+                    let _ = fs::remove_file(&r.path);
+                }
+            }
+        }
+        level = next;
+        gen += 1;
+        rbitcoin_log::info!(
+            "store: sorted-run fanin reduce pass={gen} outputs={} fanin={fanin}",
+            level.len()
+        );
+    }
+    Ok(level)
+}
+
 /// K-way merge of sorted runs → new run at `out_path`. Deletes input files on success.
 ///
 /// Equal keys: all records are kept (multi-value multimap for SH creates).
 /// Single atomic MANIFEST update: drop inputs, add output.
 ///
 /// Streams the merge to disk (incremental CRC) — does **not** hold the full
-/// output body in RAM (needed for finalize compact of large SH runs).
+/// output body in RAM.
 pub fn merge_runs(inputs: &[SortedRunPath], out_path: &Path) -> Result<SortedRunPath, StoreError> {
     if inputs.is_empty() {
         return write_sorted_run(out_path, 32, 44, &[]);

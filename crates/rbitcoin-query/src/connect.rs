@@ -152,19 +152,30 @@ impl Query {
             let sh_slot = scope.spawn(|| -> Result<(), QueryError> {
                 use crate::class_c_phase_stats::{self as sh_stats, add_sh_part};
 
-                // Height watermark: skip heights already SH-indexed after prior tip commit.
-                // (Replaces unbounded sh_tx_indexed HashSet.)
+                // Direct runs: skip create_fks already in SEAL (durable spills).
+                // Tip durable SH: height watermark after tip commit.
                 let t_filter = std::time::Instant::now();
-                let through = self.sh_indexed_through_height();
                 let mut sh_new_txs: Vec<u64> = Vec::new();
                 let wave_tx_n: usize = items.iter().map(|i| i.tx_fks.len()).sum();
                 sh_new_txs.reserve(wave_tx_n);
-                for item in items {
-                    if through.map(|t| item.height.0 <= t).unwrap_or(false) {
-                        continue;
+                if self.sh_run.is_enabled() {
+                    let sealed = self.sh_run.sealed_max_create_fk();
+                    for item in items {
+                        for &tx_fk in &item.tx_fks {
+                            if tx_fk.0 > sealed {
+                                sh_new_txs.push(tx_fk.0);
+                            }
+                        }
                     }
-                    for &tx_fk in &item.tx_fks {
-                        sh_new_txs.push(tx_fk.0);
+                } else {
+                    let through = self.sh_indexed_through_height();
+                    for item in items {
+                        if through.map(|t| item.height.0 <= t).unwrap_or(false) {
+                            continue;
+                        }
+                        for &tx_fk in &item.tx_fks {
+                            sh_new_txs.push(tx_fk.0);
+                        }
                     }
                 }
                 add_sh_part(
@@ -237,9 +248,12 @@ impl Query {
         // Tip is the commit point (after strong + SH both finished).
         let t_tip = std::time::Instant::now();
         self.store.confirmed.set_many(&confirmed_pairs)?;
-        // SH height watermark only after tip — failed tip must re-enqueue SH.
-        if let Some(last) = items.last() {
-            self.set_sh_indexed_through_height(Some(last.height.0));
+        // Tip-mode durable SH: height watermark only after tip commit.
+        // Direct runs: durability is SEAL on cataloged spills (memtable may lag).
+        if !self.sh_run.is_enabled() {
+            if let Some(last) = items.last() {
+                self.set_sh_indexed_through_height(Some(last.height.0));
+            }
         }
         crate::class_c_phase_stats::TIP_NS.fetch_add(
             t_tip.elapsed().as_nanos() as u64,

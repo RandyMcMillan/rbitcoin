@@ -28,11 +28,11 @@ Prep never holds store write locks. The writer is the sole Class A producer for 
 
 | Mode | When | Spentness | Durable `tx.head` / spends | SH |
 |------|------|-----------|----------------------------|-----|
-| **Direct** | IBD (`enter_direct_index_mode`) | confirmed-strong annotations | archive live head; confirm spend batch | runs merge-only → bulk at tip |
+| **Direct** | IBD (`enter_direct_index_mode`) | confirmed-strong annotations | archive live head; confirm spend batch | append-only target-sized runs + SEAL → bulk at tip |
 | **Tip** | after IBD (`enter_tip_mode`) | confirmed-strong annotations | live heads + confirm spends (already written in Direct) | durable write-through after bulk |
 
-Do not enter Tip until tip ≈ peer height. Tip entry only bulk-materializes SH
-(runs → durable tables); it does **not** rebuild `tx.head` or spend annotations.
+Do not enter Tip until tip ≈ peer height. Tip entry bulk-materializes SH
+(runs → fan-in reduce → durable tables); it does **not** rebuild `tx.head` or spend annotations.
 
 ## Locks (exceptions only)
 

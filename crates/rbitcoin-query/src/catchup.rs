@@ -1,16 +1,17 @@
 //! Index modes: Direct (IBD live heads/spends) and Tip (steady-state).
 //!
 //! Spentness truth for both: durable confirmed-strong spend annotations.
-//! SH uses sorted runs (flush/merge) during Direct and bulk-loads at tip.
+//! SH uses append-only target-sized runs + SEAL during Direct; bulk-loads at tip.
 
 use super::*;
+use rbitcoin_primitives::{Fk, Height};
 use std::sync::atomic::Ordering;
 
 /// Index / spentness mode.
 ///
 /// | Mode | Durable `tx.head` | Durable spends | SH |
 /// |------|-------------------|----------------|-----|
-/// | [`Direct`](IndexMode::Direct) | archive live | confirm batch after Class C | runs merge-only → bulk at tip |
+/// | [`Direct`](IndexMode::Direct) | archive live | confirm batch after Class C | target-sized runs + SEAL → bulk at tip |
 /// | [`Tip`](IndexMode::Tip) | live | archive + connect | durable write-through after bulk |
 ///
 /// Open defaults to [`Tip`] until the node calls [`Query::enter_direct_index_mode`].
@@ -57,16 +58,18 @@ impl Query {
     }
 
     /// Enter **direct** IBD: durable `tx.head` on archive, spend annotations on
-    /// confirm (batch), SH runs merge-only (bulk at tip).
+    /// confirm (batch), SH target-sized runs + SEAL (bulk at tip).
     ///
     /// Best-effort removes leftover `ibd_utxo.map` / point+tx run dirs from old
-    /// Catchup datadirs.
+    /// Catchup datadirs. Re-enqueues Class A creates with `create_fk > SEAL`
+    /// through confirmed tip (kill after tip before spill).
     pub fn enter_direct_index_mode(&self) -> Result<(), QueryError> {
         self.set_index_mode(IndexMode::Direct);
         self.set_spend_index(true);
         self.set_tx_index(true);
         self.sh_run.enable();
         self.drop_legacy_catchup_artifacts()?;
+        self.rebuild_sh_unsealed_from_class_a()?;
         Ok(())
     }
 
@@ -105,15 +108,65 @@ impl Query {
         Ok(())
     }
 
-    /// Flush/compact SH runs and load durable scripthash tables (tip mode).
+    /// Drain SH spills and cold bulk-load durable scripthash tables (tip entry).
     ///
-    /// Direct IBD only flush/merges; tip does cold bulk-load after full merge.
+    /// Direct IBD: append-only target-sized runs + SEAL. Tip: fan-in reduce + bulk load.
     pub fn finalize_sh_runs(&self) -> Result<u64, QueryError> {
+        self.sh_run.refresh_seal();
+        self.rebuild_sh_unsealed_from_class_a()?;
         self.sh_run.finalize_and_bulk_materialize(&self.store)
     }
 
     /// On-disk scripthash sorted-run count (Direct IBD cache).
     pub fn scripthash_run_count(&self) -> usize {
         self.sh_run.on_disk_run_count()
+    }
+
+    /// Re-collect thin SH creates for confirmed txs with `create_fk > SEAL`.
+    ///
+    /// Covers kill after tip advance while memtable was still unspilled. Work is
+    /// O(crash window) when SEAL tracks near tip; full chain only if SEAL=0.
+    fn rebuild_sh_unsealed_from_class_a(&self) -> Result<(), QueryError> {
+        if !self.sh_run.is_enabled() {
+            return Ok(());
+        }
+        let sealed = self.sh_run.sealed_max_create_fk();
+        let Some(tip) = self.store.tip_height() else {
+            return Ok(());
+        };
+        let mut creates = Vec::new();
+        let mut n_txs = 0u64;
+        for h in 0..=tip.0 {
+            let Some(hfk) = self.store.confirmed.get(Height(h))? else {
+                continue;
+            };
+            let Some((first, count)) = self.store.header_txs.get_range(hfk)? else {
+                continue;
+            };
+            if count == 0 || first.is_null() {
+                continue;
+            }
+            let start = first.0;
+            let end = start.saturating_add(u64::from(count));
+            for fk in start..end {
+                if fk <= sealed {
+                    continue;
+                }
+                n_txs = n_txs.saturating_add(1);
+                self.collect_scripthash_creates(Fk(fk), &mut creates)?;
+            }
+        }
+        if creates.is_empty() {
+            return Ok(());
+        }
+        rbitcoin_log::info!(
+            "node: scripthash resume rebuild txs≈{n_txs} creates≈{} seal={sealed} tip={}",
+            creates.len(),
+            tip.0
+        );
+        self.sh_run.enqueue(&creates);
+        self.sh_run.drain_spills()?;
+        self.sh_run.refresh_seal();
+        Ok(())
     }
 }

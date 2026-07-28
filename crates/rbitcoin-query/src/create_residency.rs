@@ -80,6 +80,12 @@ impl CreateResidency {
         self.inner.lock().unwrap().total_outs
     }
 
+    /// `(creates, create_cap, total_outs, out_cap)` under one lock (IBD sizes).
+    pub fn size_stats(&self) -> (usize, usize, u64, u64) {
+        let g = self.inner.lock().unwrap();
+        (g.by_fk.len(), g.create_cap, g.total_outs, g.out_cap)
+    }
+
     /// Insert / update fk→txid (+ optional range). Raw FIFO: new creates only at back.
     pub fn insert_fk_txid_range(
         &self,

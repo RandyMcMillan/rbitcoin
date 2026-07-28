@@ -24,9 +24,11 @@ pub struct ConfirmLoadStats {
     pub creates_registered: u32,
     /// Unique parent create fks pinned this call (after dedup).
     pub parent_unique: u32,
-    /// Of `parent_unique`: filled from outs FIFO (no Class A re-decode).
+    /// Of `parent_unique`: filled without store denserels IO (FIFO / same-batch / residency).
     pub pin_cache_body: u32,
-    /// Of `parent_unique`: first-time sparse pin (store decode).
+    /// Subset of no-IO pins that came from CreateResidency (schema 12).
+    pub pin_residency: u32,
+    /// Of `parent_unique`: missed FIFO/same-batch (may still hit residency before store).
     pub pin_new: u32,
     /// Historical: spent-filter during pin (now always 0 — structural owns spentness).
     pub pin_spent_ns: u64,
@@ -478,7 +480,11 @@ impl Query {
                         sparse,
                     );
                     st.utxo_parents = st.utxo_parents.saturating_add(1);
+                    // No store denserels IO: count as cache + residency hit.
                     st.pin_cache_body = st.pin_cache_body.saturating_add(1);
+                    st.pin_residency = st.pin_residency.saturating_add(1);
+                    // Was classified pin_new before residency check — undo that.
+                    st.pin_new = st.pin_new.saturating_sub(1);
                     continue;
                 }
             }

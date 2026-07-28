@@ -5,16 +5,18 @@
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
-//! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, loadq/writeq, txs=, horizon, tip ETA, durable `bq=` (disk block queue) |
-//! | INFO  | `ibd: perf …` | Download pressure, confirm cost (script/load/…), pin_hit, coarse load phases, sh_runs |
-//! | INFO  | `ibd: sizes …` | Process RSS + occupancy of known retain structures (leak triage) |
-//! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail, archive pipe (prep/write/sticky), contig park |
+//! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, loadq/writeq, txs=, horizon, tip ETA, durable `bq=` |
+//! | INFO  | `ibd: perf …` | Download + durable queue pressure; **load / script / write** stage walls with load+write sub-phases; pin mix; queues |
+//! | INFO  | `ibd: sizes …` | RSS + work path + arch RAM queue + **bq** + residency + outfifo + conf pipe + tx.head |
+//! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail, archive Class A prep/write pipe, contig park |
 //!
 //! Sample **once** per tick and reset all atomics, then format INFO always and
 //! DEBUG only when enabled — so DEBUG never sees an empty window after INFO.
 //!
-//! Formatters omit ghost columns from deleted paths (wave-fill stubs, Direct SH
-//! seed/body/head RMW, thin col/run/head).
+//! Schema 12: more wall time sits in confirm **load** (Class A decode + parent
+//! pin / residency / denserels) and **write** (structural / Class C / spend
+//! annotate). INFO breaks those stages out so bottlenecks are visible without
+//! DEBUG. Formatters omit ghost columns from deleted paths.
 
 use super::archive::{ArchivePipelineSample, ArchivePipelineStats};
 use super::confirm::ConfirmPipelineSizes;
@@ -29,11 +31,17 @@ pub(crate) struct IbdPerfSample {
     // Pipeline health (not from atomics).
     pub inflight: usize,
     pub inflight_cap: usize,
+    /// RAM archive pipeline queue (decoded jobs waiting for Class A write).
     pub arch_q: usize,
     pub arch_mb: usize,
     pub arch_budget_mb: usize,
+    /// Durable on-disk block queue (schema 12): budget/used bytes + entry count.
+    pub bq_budget: u64,
+    pub bq_bytes: u64,
+    pub bq_count: usize,
     pub pending: usize,
-    pub ahead: u32,
+    /// Class A HWM (+ inflight) ahead of tip — densify / download headroom, not progress lead.
+    pub arch_ahead: u32,
     pub hole: usize,
     pub peers: usize,
     pub headers_done: bool,
@@ -116,6 +124,8 @@ pub(crate) struct IbdPerfSample {
     pub load_creates: u64,
     pub load_parent_unique: u64,
     pub load_pin_cache_body: u64,
+    /// Pin hits from CreateResidency (subset of pin_cache when residency filled).
+    pub load_pin_residency: u64,
     pub load_pin_new: u64,
     pub load_pin_spent_ms: u64,
     pub load_pin_body_ms: u64,
@@ -209,8 +219,11 @@ impl Default for IbdPerfSample {
             arch_q: 0,
             arch_mb: 0,
             arch_budget_mb: 0,
+            bq_budget: 0,
+            bq_bytes: 0,
+            bq_count: 0,
             pending: 0,
-            ahead: 0,
+            arch_ahead: 0,
             hole: 0,
             peers: 0,
             headers_done: false,
@@ -275,6 +288,7 @@ impl Default for IbdPerfSample {
             load_creates: 0,
             load_parent_unique: 0,
             load_pin_cache_body: 0,
+            load_pin_residency: 0,
             load_pin_new: 0,
             load_pin_spent_ms: 0,
             load_pin_body_ms: 0,
@@ -452,10 +466,12 @@ pub(crate) fn sample(
     arch_q: usize,
     arch_mb: usize,
     arch_budget_mb: usize,
+    // Durable block queue: (budget_bytes, used_bytes, count).
+    bq: (u64, u64, usize),
     pending: usize,
     _known_arch: usize,
     _ordered: usize,
-    ahead: u32,
+    arch_ahead: u32,
     hole: usize,
     peers: usize,
     headers_done: bool,
@@ -471,6 +487,7 @@ pub(crate) fn sample(
     conf_pipe: ConfirmPipelineSizes,
     rss: ProcRss,
 ) -> IbdPerfSample {
+    let (bq_budget, bq_bytes, bq_count) = bq;
     let hot = loop_stats.sample_and_reset();
     let (
         recon_ns,
@@ -516,8 +533,11 @@ pub(crate) fn sample(
         arch_q,
         arch_mb,
         arch_budget_mb,
+        bq_budget,
+        bq_bytes,
+        bq_count,
         pending,
-        ahead,
+        arch_ahead,
         hole,
         peers,
         headers_done,
@@ -582,6 +602,7 @@ pub(crate) fn sample(
         load_creates: pw.creates,
         load_parent_unique: pw.parent_unique,
         load_pin_cache_body: pw.pin_cache_body,
+        load_pin_residency: pw.pin_residency,
         load_pin_new: pw.pin_new,
         load_pin_spent_ms: ns_ms(pw.pin_spent_ns),
         load_pin_body_ms: ns_ms(pw.pin_body_ns),
@@ -670,30 +691,90 @@ fn append_nz(out: &mut String, key: &str, v: u64) {
     }
 }
 
-/// Stable INFO line for production grepping (live architecture only).
+/// Write-stage wall for this window (structural + class_c + spend annotate + tip GC).
+///
+/// SH collect is inside class_c wall on the write thread; `sh_ms` is a sub-slice
+/// and is **not** double-counted here.
+fn write_stage_ms(s: &IbdPerfSample) -> u64 {
+    s.structural_ms
+        .saturating_add(s.class_c_ms)
+        .saturating_add(s.utxo_ms)
+        .saturating_add(s.cache_tip_ms)
+}
+
+/// Stable INFO line for production grepping (schema-12 pipeline).
 pub(crate) fn format_info(s: &IbdPerfSample) -> String {
-    // Download / archive pressure (what blocks the tip).
+    let bq_mib = s.bq_bytes / (1024 * 1024);
+    let bq_budget_mib = s.bq_budget / (1024 * 1024);
+    let write_ms = write_stage_ms(s);
+    // Download / queue pressure (what starves tip advance).
     let mut out = format!(
-        "ibd: perf inflight={}/{} arch_q={} arch={}/{}MiB pending={} lead={} hole={} peers={}",
+        "ibd: perf inflight={}/{} arch_q={} arch={}/{}MiB bq={} ({}MiB/{}MiB) pending={} arch_ahead={} hole={} peers={}",
         s.inflight,
         s.inflight_cap,
         s.arch_q,
         s.arch_mb,
         s.arch_budget_mb,
+        s.bq_count,
+        bq_mib,
+        bq_budget_mib,
         s.pending,
-        s.ahead,
+        s.arch_ahead,
         s.hole,
         s.peers,
     );
-    // Confirm cost this window (ms totals + block count).
-    // recon/wire folded: prefetch/wave are dead on Direct; show recon only if useful.
-    // Write phases: struct/bip68/class_c/sh/spend/tip_gc. `connect` is load assemble.
+    // Three-stage confirm walls (load / script / write) — schema 12 long poles.
+    // `connect` is optimistic assemble on the load path (not write structural).
     out.push_str(&format!(
-        " | conf blks={} script={}ms load={}ms connect={}ms struct={}ms(spent={} create_h={} bip68={}) class_c={}ms sh={}ms spend={}ms tip_gc={}ms",
-        s.phase_blks,
-        s.script_ms,
-        s.load_ms,
-        s.connect_ms,
+        " | conf blks={} load={}ms script={}ms write={}ms connect={}ms",
+        s.phase_blks, s.load_ms, s.script_ms, write_ms, s.connect_ms,
+    ));
+    append_nz(&mut out, "recon_ms", s.recon_ms);
+    append_nz(&mut out, "wire_ms", s.wire_ms);
+    append_nz(&mut out, "resolve_ms", s.resolve_ms);
+
+    // Load stage detail: phase walls + pin mix + denserels IO.
+    // pin_hit% = (FIFO+same-batch+residency) / (those + cold pin_new after residency).
+    let pin_hit_pct = {
+        let hits = s.load_pin_cache_body;
+        let tot = hits.saturating_add(s.load_pin_new);
+        if tot > 0 {
+            (100 * hits) / tot
+        } else {
+            0
+        }
+    };
+    out.push_str(&format!(
+        " | load blks={} win={}ms phases hdr={} dec={} put={} thin={} pin={} (fifo={}ms new_io={}ms) pin_hit%={} pin_cache={} pin_res={} pin_new={} body_io={} parent_io={}",
+        s.load_blocks,
+        s.load_win_ms,
+        s.load_hdr_ms,
+        s.load_decode_ms,
+        s.load_cache_put_ms,
+        s.load_thin_ms,
+        s.load_parent_pin_ms,
+        s.load_pin_body_ms,
+        s.load_pin_new_meta_ms,
+        pin_hit_pct,
+        s.load_pin_cache_body,
+        s.load_pin_residency,
+        s.load_pin_new,
+        s.load_body_tx_reads,
+        s.load_parent_tx_reads,
+    ));
+    if s.load_edge_same > 0 || s.load_edge_fk > 0 || s.load_edge_cb > 0 {
+        out.push_str(&format!(
+            " edges same={} fk={} cb={}",
+            s.load_edge_same, s.load_edge_fk, s.load_edge_cb
+        ));
+    }
+    if s.load_missing_parents > 0 {
+        out.push_str(&format!(" miss_p={}", s.load_missing_parents));
+    }
+
+    // Write stage detail: structural subs + Class C / SH / spend annotate / tip GC.
+    out.push_str(&format!(
+        " | write struct={}ms(spent={} create_h={} bip68={}) class_c={}ms sh={}ms spend={}ms tip_gc={}ms",
         s.structural_ms,
         s.structural_spent_ms,
         s.structural_create_h_ms,
@@ -703,17 +784,25 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.utxo_ms,
         s.cache_tip_ms,
     ));
-    append_nz(&mut out, "recon_ms", s.recon_ms);
-    append_nz(&mut out, "wire_ms", s.wire_ms);
     append_nz(&mut out, "strong_ms", s.strong_ms);
-    append_nz(&mut out, "resolve_ms", s.resolve_ms);
-    // Spend path mix only when non-ranged paths fire.
     if s.spend_idx > 0 || s.spend_skip > 0 {
         out.push_str(&format!(
             " spend_mix(r={} i={} skip={})",
             s.spend_ranged, s.spend_idx, s.spend_skip
         ));
     }
+
+    let conf_q = super::confirm::format_conf_q(
+        s.conf_load_q,
+        s.conf_write_q,
+        s.conf_load_q_cap,
+        s.conf_write_q_cap,
+    );
+    out.push_str(&format!(
+        " | {conf_q} thru={} sh_runs={}",
+        s.load_ready_through, s.sh_runs,
+    ));
+
     out.push_str(&format!(
         " | loop {} conf={}ms assign={}ms",
         s.dominant, s.confirm_ms, s.assign_ms,
@@ -726,57 +815,27 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     if let Some((first, n, elapsed_ms)) = s.live {
         out.push_str(&format!(" | live h={first} n={n} {elapsed_ms}ms"));
     }
-    // OutFifo pin vs store pin_new (unique parents).
-    let pin_hit_pct = {
-        let hits = s.load_pin_cache_body;
-        let tot = hits.saturating_add(s.load_pin_new);
-        if tot > 0 {
-            (100 * hits) / tot
-        } else {
-            0
-        }
-    };
-    let conf_q = super::confirm::format_conf_q(
-        s.conf_load_q,
-        s.conf_write_q,
-        s.conf_load_q_cap,
-        s.conf_write_q_cap,
-    );
-    // Coarse load phases only (thin is edge-only; drop col/run/head/put/head H/L).
-    out.push_str(&format!(
-        " | {conf_q} | parents thru={} pin_hit%={} pin_cache={} pin_new={} win={}ms blks={} (hdr={} dec={} thin={} pin={} spent={}) sh_runs={}",
-        s.load_ready_through,
-        pin_hit_pct,
-        s.load_pin_cache_body,
-        s.load_pin_new,
-        s.load_win_ms,
-        s.load_blocks,
-        s.load_hdr_ms,
-        s.load_decode_ms,
-        s.load_thin_ms,
-        s.load_parent_pin_ms,
-        s.load_pin_spent_ms,
-        s.sh_runs,
-    ));
-    if s.load_missing_parents > 0 {
-        out.push_str(&format!(" miss_p={}", s.load_missing_parents));
-    }
     if s.headers_done {
         out.push_str(" headers_done");
     }
     out
 }
 
-/// DEBUG detail: µs/blk + pin/edge + archive pipe + contig (no ghost columns).
+/// DEBUG detail: µs/blk + pin/edge + archive Class A pipe + contig (no ghost columns).
 pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let denom = s.phase_blks.max(1);
     let us = |ns: u64| (ns / denom) / 1000;
+    let write_ns = s
+        .structural_ns
+        .saturating_add(s.class_c_ns)
+        .saturating_add(s.utxo_apply_ns)
+        .saturating_add(s.cache_tip_ns);
     let mut out = format!(
-        "ibd: perf_dbg us/blk recon={} wire={} connect={} script={} struct={} spent={} create_h={} bip68={} class_c={} sh={} spend={}(r={} i={} skip={}) load={} tip_gc={}",
-        us(s.recon_ns),
-        us(s.wire_ns),
+        "ibd: perf_dbg us/blk load={} connect={} script={} write={} struct={} spent={} create_h={} bip68={} class_c={} sh={} spend={}(r={} i={} skip={}) tip_gc={} recon={} wire={}",
+        us(s.load_ns),
         us(s.connect_ns),
         us(s.script_ns),
+        us(write_ns),
         us(s.structural_ns),
         us(s.structural_spent_ns),
         us(s.structural_create_h_ns),
@@ -787,8 +846,9 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.spend_ranged,
         s.spend_idx,
         s.spend_skip,
-        us(s.load_ns),
         us(s.cache_tip_ns),
+        us(s.recon_ns),
+        us(s.wire_ns),
     );
     append_nz(&mut out, "resolve_us", us(s.resolve_ns));
     append_nz(&mut out, "strong_us", us(s.strong_ns));
@@ -814,8 +874,13 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.conf_load_q_cap,
         s.conf_write_q_cap,
     );
+    let bq_mib = s.bq_bytes / (1024 * 1024);
+    let bq_budget_mib = s.bq_budget / (1024 * 1024);
     out.push_str(&format!(
-        " | {conf_q} | parents thru={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} uniq_p={} pin_cache={} pin_new={} body_io={} parent_io={}",
+        " | bq={} ({}MiB/{}MiB) | {conf_q} | parents thru={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} uniq_p={} pin_cache={} pin_res={} pin_new={} body_io={} parent_io={}",
+        s.bq_count,
+        bq_mib,
+        bq_budget_mib,
         s.load_ready_through,
         s.cache_bodies,
         s.cache_plans,
@@ -825,6 +890,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.load_creates,
         s.load_parent_unique,
         s.load_pin_cache_body,
+        s.load_pin_residency,
         s.load_pin_new,
         s.load_body_tx_reads,
         s.load_parent_tx_reads,
@@ -962,11 +1028,15 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     } else {
         0
     };
+    let bq_mib = s.bq_bytes / (1024 * 1024);
+    let bq_budget_mib = s.bq_budget / (1024 * 1024);
     format!(
         "ibd: sizes rss={}MiB anon={}MiB file={}MiB({}%) hwm={}MiB locked={}MiB \
          | work ordered={}/set={} hash_h={} h2h={} hdr_fk={} known_hdr={} inflight={}/peer={} cooldown={} \
          | body known={} pend={} miss={} charged={} rej={} \
          | arch q={}/{}MiB budget={}MiB sticky={}/{} fifo={} contig parked={} ready={} next_h={} \
+         | bq n={} {}MiB/{}MiB \
+         | residency creates={}/{} outs={}/{} \
          | outfifo creates={} outs={}/{} order={} plans={} \
          | conf loadq={}/{} blks={} wire={}MiB parents={} writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
@@ -1002,6 +1072,13 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         s.contig_parked,
         s.contig_ready,
         s.contig_next_h,
+        s.bq_count,
+        bq_mib,
+        bq_budget_mib,
+        o.residency_creates,
+        o.residency_create_cap,
+        o.residency_outs,
+        o.residency_out_cap,
         o.out_creates,
         o.out_total,
         o.out_cap,
@@ -1078,7 +1155,10 @@ mod tests {
         s.inflight = 3;
         s.inflight_cap = 256;
         s.arch_q = 10;
-        s.ahead = 224;
+        s.bq_count = 7;
+        s.bq_bytes = 128 * 1024 * 1024;
+        s.bq_budget = 4 * 1024 * 1024 * 1024;
+        s.arch_ahead = 224;
         s.hole = 0;
         s.peers = 16;
         s.phase_blks = 32;
@@ -1087,6 +1167,7 @@ mod tests {
         s.load_ms = 30;
         s.class_c_ms = 40;
         s.utxo_ms = 25;
+        s.cache_tip_ms = 5;
         s.dominant = "confirm";
         s.live = Some((100, 32, 1500));
         s.confirm_reject_stops = 2;
@@ -1094,10 +1175,15 @@ mod tests {
         assert!(line.starts_with("ibd: perf "), "{line}");
         assert!(line.contains("inflight=3/256"), "{line}");
         assert!(line.contains("arch_q=10"), "{line}");
-        assert!(line.contains("lead=224"), "{line}");
+        assert!(line.contains("bq=7 (128MiB/4096MiB)"), "{line}");
+        assert!(line.contains("arch_ahead=224"), "{line}");
+        assert!(!line.contains("lead="), "schema12: no Class A lead= on perf: {line}");
+        assert!(!line.contains("arch_hwm"), "{line}");
         assert!(line.contains("conf blks=32"), "{line}");
         assert!(line.contains("script=20ms"), "{line}");
         assert!(line.contains("load=30ms"), "{line}");
+        // write = class_c(40)+spend(25)+tip_gc(5) = 70
+        assert!(line.contains("write=70ms"), "{line}");
         assert!(line.contains("class_c=40ms"), "{line}");
         assert!(line.contains("spend=25ms"), "{line}");
         assert!(line.contains("struct=0ms"), "{line}");
@@ -1114,9 +1200,17 @@ mod tests {
         s.load_ready_through = 200;
         s.load_blocks = 32;
         s.load_pin_cache_body = 8;
+        s.load_pin_residency = 3;
         s.load_pin_new = 12;
+        s.load_body_tx_reads = 400;
+        s.load_parent_tx_reads = 12;
         s.load_win_ms = 40;
         s.load_thin_ms = 5;
+        s.load_decode_ms = 15;
+        s.load_cache_put_ms = 2;
+        s.load_parent_pin_ms = 18;
+        s.load_pin_body_ms = 4;
+        s.load_pin_new_meta_ms = 14;
         s.sh_runs = 3;
         s.structural_ms = 50;
         s.structural_spent_ms = 30;
@@ -1125,19 +1219,24 @@ mod tests {
         let line = format_info(&s);
         assert!(line.contains("loadq=1/2 writeq=2/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
-        assert!(line.contains("pin_cache=8 pin_new=12"), "{line}");
+        assert!(line.contains("pin_cache=8"), "{line}");
+        assert!(line.contains("pin_res=3"), "{line}");
+        assert!(line.contains("pin_new=12"), "{line}");
+        assert!(line.contains("body_io=400 parent_io=12"), "{line}");
         assert!(
             line.contains("struct=50ms(spent=30 create_h=5 bip68=20)"),
             "{line}"
         );
+        // write = 50+40+25+5 = 120
+        assert!(line.contains("write=120ms"), "{line}");
         // pin_hit% = 8/(8+12) = 40
         assert!(line.contains("pin_hit%=40"), "{line}");
         assert!(line.contains("thin=5"), "{line}");
+        assert!(line.contains("put=2"), "{line}");
+        assert!(line.contains("new_io=14ms"), "{line}");
         assert!(!line.contains("thin[col="), "{line}");
-        assert!(!line.contains("pin_sub"), "{line}");
         assert!(!line.contains("by_fk="), "{line}");
         assert!(!line.contains("pin_cached="), "{line}");
-        assert!(!line.contains("body_io="), "{line}"); // dbg-only
         assert!(line.contains("sh_runs=3"), "{line}");
         assert!(!line.contains("reserved"), "{line}");
         assert!(!line.contains("runway"), "{line}");
@@ -1166,6 +1265,7 @@ mod tests {
         s.load_body_tx_reads = 200;
         s.load_parent_tx_reads = 50;
         s.load_pin_cache_body = 0;
+        s.load_pin_residency = 2;
         s.load_pin_new = 38;
         s.load_edge_same = 10;
         s.load_edge_fk = 5;
@@ -1176,9 +1276,13 @@ mod tests {
         s.sh_runs = 2;
         s.arch_ext_need = 100;
         s.arch_sticky_hit = 80;
+        s.bq_count = 3;
+        s.bq_bytes = 64 * 1024 * 1024;
+        s.bq_budget = 1024 * 1024 * 1024;
         let line = format_debug(&s);
         assert!(line.starts_with("ibd: perf_dbg "), "{line}");
-        assert!(line.contains("us/blk recon="), "{line}");
+        assert!(line.contains("us/blk load="), "{line}");
+        assert!(line.contains("write="), "{line}");
         assert!(line.contains("spend=500(r=10 i=2 skip=0)"), "{line}");
         assert!(!line.contains("prefetch="), "{line}");
         assert!(!line.contains("wave body="), "{line}");
@@ -1188,13 +1292,16 @@ mod tests {
         assert!(line.contains("store_ms=50"), "{line}");
         assert!(line.contains("sh collect=12"), "{line}");
         assert!(line.contains("pin_sub body="), "{line}");
+        assert!(line.contains("bq=3 (64MiB/1024MiB)"), "{line}");
         // Depth 0 → `<` (scripts waiting on empty load queue).
         assert!(line.contains("loadq<0/2 writeq=1/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
         assert!(line.contains("utxo_p=100"), "{line}");
         assert!(line.contains("creates=50"), "{line}");
         assert!(line.contains("body_io=200 parent_io=50"), "{line}");
-        assert!(line.contains("pin_cache=0 pin_new=38"), "{line}");
+        assert!(line.contains("pin_cache=0"), "{line}");
+        assert!(line.contains("pin_res=2"), "{line}");
+        assert!(line.contains("pin_new=38"), "{line}");
         assert!(!line.contains("pin_cached="), "{line}");
         assert!(line.contains("edges same=10 fk=5 cb=1"), "{line}");
         assert!(line.contains("sh_runs=2"), "{line}");
@@ -1238,6 +1345,13 @@ mod tests {
         s.work.body.archive_charged = 4;
         s.owned.sticky_len = 1000;
         s.owned.sticky_cap = 4_000_000;
+        s.owned.residency_creates = 80;
+        s.owned.residency_create_cap = 8_000_000;
+        s.owned.residency_outs = 900;
+        s.owned.residency_out_cap = 16_777_216;
+        s.bq_count = 4;
+        s.bq_bytes = 32 * 1024 * 1024;
+        s.bq_budget = 512 * 1024 * 1024;
         s.owned.out_creates = 50;
         s.owned.out_total = 500;
         s.owned.out_cap = 16_777_216;
@@ -1276,6 +1390,8 @@ mod tests {
         assert!(line.contains("charged=4"), "{line}");
         assert!(line.contains("arch q=12/40MiB"), "{line}");
         assert!(line.contains("sticky=1000/4000000"), "{line}");
+        assert!(line.contains("bq n=4 32MiB/512MiB"), "{line}");
+        assert!(line.contains("residency creates=80/8000000 outs=900/16777216"), "{line}");
         assert!(line.contains("outfifo creates=50"), "{line}");
         assert!(line.contains("outs=500/16777216"), "{line}");
         assert!(line.contains("loadq=2/5 blks=40 wire=12MiB parents=500"), "{line}");
@@ -1332,10 +1448,11 @@ mod tests {
             2,   // arch_q
             10,  // arch_mb
             512, // budget
+            (512 * 1024 * 1024, 0, 0), // bq budget/bytes/count
             3,   // pending
             0,
             0,
-            100, // ahead
+            100, // arch_ahead
             1,   // hole
             8,   // peers
             true, // headers_done

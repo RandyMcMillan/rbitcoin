@@ -481,6 +481,7 @@ name = "rbitcoin-store"
 version = "0.1.0"
 dependencies = [
  "bitcoin_hashes 0.14.101",
+ "getrandom",
  "io-uring",
  "libc",
  "memmap2",

@@ -228,14 +228,33 @@ fn pread_batch_uring(ops: &mut [ReadOp<'_>]) -> bool {
         return true;
     }
 
-    let ok = with_bulk_session(|session| pread_batch_on_session(session, ops, total_nonempty));
-    match ok {
-        Some(true) => true,
-        Some(false) | None => {
-            URING_MODE.store(2, Ordering::Relaxed);
-            false
+    // Mid-wave false (push/submit/wait fail) → fall back for *this* batch only.
+    // Permanently disable uring only when the ring cannot be opened (None);
+    // with_bulk_session already stores mode 2 on try_open Err for the TL path.
+    match with_bulk_session(|session| {
+        #[cfg(test)]
+        if test_force_session_false() {
+            session.drain_all();
+            return false;
         }
+        pread_batch_on_session(session, ops, total_nonempty)
+    }) {
+        Some(true) => true,
+        Some(false) => false,
+        None => false,
     }
+}
+
+// Test-only: force `pread_batch_uring` to take the mid-wave `Some(false)` path
+// so we prove that does not permanently disable process-wide io_uring.
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static TEST_FORCE_SESSION_FALSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn test_force_session_false() -> bool {
+    TEST_FORCE_SESSION_FALSE.with(|c| c.get())
 }
 
 #[cfg(target_os = "linux")]
@@ -322,13 +341,11 @@ fn pwrite_batch_uring(ops: &mut [WriteOp<'_>]) -> bool {
         return true;
     }
 
-    let ok = with_bulk_session(|session| pwrite_batch_on_session(session, ops, total_nonempty));
-    match ok {
+    // Same policy as pread_batch_uring: mid-wave fail does not disable uring.
+    match with_bulk_session(|session| pwrite_batch_on_session(session, ops, total_nonempty)) {
         Some(true) => true,
-        Some(false) | None => {
-            URING_MODE.store(2, Ordering::Relaxed);
-            false
-        }
+        Some(false) => false,
+        None => false,
     }
 }
 
@@ -1046,6 +1063,76 @@ mod tests {
         assert_eq!(got2[0], 11);
         assert_eq!(got2[50], 12);
         assert_eq!(got2[100], 13);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mid-wave uring failure must fall back for that batch only — not flip
+    /// `URING_MODE` off for the rest of the process (regression for TL-ring
+    /// rewrite that wrongly stored mode 2 on `Some(false)`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mid_wave_false_does_not_disable_uring() {
+        if !io_uring_enabled() {
+            return;
+        }
+        assert_eq!(
+            URING_MODE.load(Ordering::Relaxed),
+            1,
+            "expected uring mode on after probe"
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-uring-mode-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("blob");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"abcdefghij").unwrap();
+            f.flush().unwrap();
+        }
+        let f = std::fs::File::open(&path).unwrap();
+        let fd = f.as_raw_fd();
+
+        // Inject Some(false) through the real pread_batch_uring match.
+        TEST_FORCE_SESSION_FALSE.with(|c| c.set(true));
+        let mut b = [0u8; 4];
+        let mut ops = [ReadOp {
+            fd,
+            offset: 0,
+            buf: &mut b[..],
+            result: i32::MIN,
+        }];
+        pread_batch(&mut ops); // uring false → fallback still fills
+        TEST_FORCE_SESSION_FALSE.with(|c| c.set(false));
+        drop(ops);
+        assert_eq!(&b, b"abcd", "fallback must still serve the forced-false wave");
+        assert_eq!(
+            URING_MODE.load(Ordering::Relaxed),
+            1,
+            "mid-wave false must not permanently disable io_uring"
+        );
+
+        // Next wave must still use uring (mode still 1) and read correctly.
+        let mut b2 = [0u8; 4];
+        let mut ops2 = [ReadOp {
+            fd,
+            offset: 4,
+            buf: &mut b2[..],
+            result: i32::MIN,
+        }];
+        assert!(
+            pread_batch_uring(&mut ops2),
+            "uring path must still succeed after mid-wave false"
+        );
+        drop(ops2);
+        assert_eq!(&b2, b"efgh");
+        assert_eq!(URING_MODE.load(Ordering::Relaxed), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

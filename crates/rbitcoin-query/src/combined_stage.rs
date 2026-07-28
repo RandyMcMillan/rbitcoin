@@ -201,6 +201,150 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Multi-block AC1: archive h0 creates + h1 spends h0; load_confirm_parents
+    /// on h0 seeds residency; load of h1 pins parent **without** a second denserels
+    /// body fetch (`full_tx_reads` stays 0 for the parent pin).
+    #[test]
+    fn multi_block_load_confirm_parents_single_parent_body() {
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+        use crate::TxApply;
+
+        let (dir, q) = temp_query();
+        // h0 coinbase
+        let mut h0hash = [0u8; 32];
+        h0hash[0] = 0xa0;
+        let h0 = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 0,
+            merkle_root: h0hash,
+            hash: h0hash,
+        };
+        let mut parent_txid = [0u8; 32];
+        parent_txid[0] = 0xcb;
+        let ta0 = TxApply {
+            tx: TxRecord {
+                txid: parent_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord::coinbase(u32::MAX, vec![0], vec![])],
+            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+        };
+        let hfk0 = q.archive_block(&h0, &[ta0]).unwrap();
+
+        // h1: coinbase + spend of parent vout 0
+        let mut h1hash = [0u8; 32];
+        h1hash[0] = 0xa1;
+        let h1 = HeaderRecord {
+            prev_fk: hfk0,
+            version: 1,
+            timestamp: 2,
+            bits: 0x207fffff,
+            nonce: 1,
+            merkle_root: h1hash,
+            hash: h1hash,
+        };
+        let mut cb_txid = [0u8; 32];
+        cb_txid[0] = 0xcc;
+        let cb1 = TxApply {
+            tx: TxRecord {
+                txid: cb_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord::coinbase(u32::MAX, vec![1], vec![])],
+            outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+        };
+        let mut child_txid = [0u8; 32];
+        child_txid[0] = 0x5e;
+        let child = TxApply {
+            tx: TxRecord {
+                txid: child_txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: parent_txid,
+                create_fk: Fk::NULL, // archive stamps
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x51])],
+        };
+        q.archive_block(&h1, &[cb1, child]).unwrap();
+
+        // Parent create is on residency after archive commit (range dual-write).
+        // Load h0 through **shipped** load_confirm_parents → seeds outs into residency.
+        reset_body_ok_reads();
+        let (st0, parents0, _thin0, bodies0) = q
+            .load_confirm_parents(&[(0, h0hash)])
+            .expect("load h0");
+        assert!(st0.blocks >= 1, "h0 load blocks={}", st0.blocks);
+        assert!(bodies0.len() >= 1, "h0 bodies");
+        let body_reads_after_h0 = body_ok_reads();
+        assert!(
+            body_reads_after_h0 >= 1,
+            "h0 must body-read creates, got {body_reads_after_h0}"
+        );
+        // Residency (or OutFifo dual-write) holds parent outs for pin.
+        let parent_fk = q
+            .store()
+            .txs
+            .get_fk_by_txid(&parent_txid)
+            .unwrap()
+            .expect("parent head");
+        assert!(
+            q.create_residency().get_outs(parent_fk).is_some(),
+            "load_creates_once must seed residency outs for parent create"
+        );
+        let _ = parents0;
+
+        // Load h1: child spends parent → pin path must NOT denserels-IO parent again.
+        let (st1, parents1, _thin1, bodies1) = q
+            .load_confirm_parents(&[(1, h1hash)])
+            .expect("load h1");
+        assert!(st1.blocks >= 1);
+        assert!(bodies1.len() >= 1);
+        // Parent pin from residency: pin_new denserels path uses full_tx_reads.
+        assert_eq!(
+            st1.full_tx_reads, 0,
+            "parent pin must not re-fetch denserels body (full_tx_reads={})",
+            st1.full_tx_reads
+        );
+        // pin_cache_body covers parent and/or batch_parents has the out.
+        assert!(
+            st1.pin_cache_body >= 1 || parents1.has_parent_out(parent_fk, 0),
+            "parent pin_cache_body={} has_parent_out={}",
+            st1.pin_cache_body,
+            parents1.has_parent_out(parent_fk, 0)
+        );
+        // Body reads for h1 are only for h1 creates (coinbase+child), not parent denserels.
+        let body_reads_h1 = body_ok_reads().saturating_sub(body_reads_after_h0);
+        assert!(
+            body_reads_h1 <= 2,
+            "h1 should only load its own creates (≤2), got extra body reads={body_reads_h1}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn obfuscation_on_disk_via_store_put() {
         let (dir, q) = temp_query();

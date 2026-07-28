@@ -176,6 +176,9 @@ impl BlockQueue {
     }
 
     /// Append a block payload. Returns queue id.
+    ///
+    /// Refuses when `bytes + payload.len()` would exceed [`Self::budget`]
+    /// ([`Self::can_enqueue`]) so the multi‑GiB cap is enforced, not parse-only.
     pub fn enqueue(
         &mut self,
         height: u32,
@@ -183,6 +186,11 @@ impl BlockQueue {
         header_fk: u64,
         payload: &[u8],
     ) -> Result<u64, StoreError> {
+        if !self.can_enqueue(payload.len()) {
+            return Err(StoreError::Corrupt(
+                "block_queue budget exceeded (raise RBITCOIN_BLOCK_QUEUE_GB / _BYTES)",
+            ));
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let path = self.dir.join(format!("rec.{id:08}"));
         let mut f = OpenOptions::new()
@@ -386,6 +394,21 @@ mod tests {
         assert_eq!(hs, vec![1, 2]);
         q.dequeue(id1).unwrap();
         assert_eq!(q.peek_oldest_id(), Some(id2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enqueue_rejects_when_over_budget() {
+        let dir = temp();
+        // Tiny budget: first small payload ok; second large fails.
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        // Force tiny budget after open (constructor clamps min 64MiB).
+        q.budget = 100;
+        q.bytes = 0;
+        q.enqueue(1, [1u8; 32], 1, b"small").unwrap();
+        assert!(!q.can_enqueue(200));
+        assert!(q.enqueue(2, [2u8; 32], 2, &vec![0u8; 200]).is_err());
+        assert_eq!(q.count(), 1, "failed enqueue must not leave a rec");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

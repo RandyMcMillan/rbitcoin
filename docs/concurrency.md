@@ -16,7 +16,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **Single parent-body path:** confirm load seeds **CreateResidency** on create decode; pin hits residency outs/ranges before cold denserels IO. Archive commit dual-writes ranges into the same map.
 
-**Durable queue:** `store/block_queue/` multi‑GiB payload FIFO (`RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`, default 8 GiB). Enqueue on peer Block; dequeue after confirm-write. `Query::block_queue_load_all` for restart.
+**Durable queue:** `store/block_queue/` multi‑GiB payload FIFO (`RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`, default 8 GiB). **Enqueue** on peer Block (budget-enforced via `can_enqueue`); **dequeue** after confirm-write. On IBD start, **`rehydrate_block_queue_into_archive`** loads `block_queue_load_all` into the arch_job channel (no re-getdata).
 
 **tx.head overflow:** depth-exhausted inserts → `tx.head.overflow` (overflow-first lookup).
 

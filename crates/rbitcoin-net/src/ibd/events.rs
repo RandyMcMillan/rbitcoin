@@ -399,8 +399,9 @@ pub(crate) fn apply_peer_event(
             // peer bytes or refuse to decode what a peer already sent. Soft
             // queue size is bounded only by limiting block *requests*.
             let wire_bytes = block.total_size();
-            // Durable multi‑GiB queue: survive restart without re-download.
-            // Best-effort — RAM pipeline still owns the decoded Block.
+            // Durable multi‑GiB queue (budget-enforced). Restart rehydrates via
+            // `rehydrate_block_queue_into_archive` → arch_job (no re-getdata).
+            // Decoded Block still goes on the RAM job channel for this process.
             {
                 use bitcoin::consensus::Encodable;
                 let mut payload = Vec::with_capacity(wire_bytes);
@@ -412,6 +413,7 @@ pub(crate) fn apply_peer_event(
                         header_fk.0,
                         &payload,
                     ) {
+                        // Budget full or IO: keep RAM path; densify may re-request later.
                         rbitcoin_log::debug!(
                             "ibd: durable block_queue enqueue skipped ({e}) h={height}"
                         );

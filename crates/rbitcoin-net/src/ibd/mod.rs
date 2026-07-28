@@ -32,7 +32,8 @@ mod state;
 mod status;
 
 use archive::{
-    spawn_archive_pipeline, ArchiveJob, ArchivePipelineStats, ArchiveQueueBudget, ArchiveResult,
+    rehydrate_block_queue_into_archive, spawn_archive_pipeline, ArchiveJob, ArchivePipelineStats,
+    ArchiveQueueBudget, ArchiveResult,
 };
 use assign_plan::{remove_from_ordered, want_headers_beyond_soft_cap};
 // compact_ordered used via IbdWorkState::hygiene
@@ -392,6 +393,21 @@ pub async fn ibd_cancellable(
         }
         Err(e) => {
             warn!("ibd: archive sticky prewarm failed (continuing cold): {e}");
+        }
+    }
+    // Rehydrate durable block_queue → arch_job channel (restart without re-download).
+    match rehydrate_block_queue_into_archive(
+        hub.as_ref(),
+        &mut st,
+        &arch_job_tx,
+        &archive_queued,
+    ) {
+        Ok(n) if n > 0 => {
+            info!("ibd: rehydrated {n} durable block_queue entries into archive pipeline");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!("ibd: block_queue rehydrate failed (continuing; may re-getdata): {e}");
         }
     }
     let mut pipeline = spawn_archive_pipeline(

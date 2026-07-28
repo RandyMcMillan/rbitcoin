@@ -48,7 +48,7 @@ Default: **info**. CLI wins over env.
 
 | Line | Level | Use |
 |------|-------|-----|
-| `ibd: progress` | INFO | Tip/arch rate, `loadq`/`writeq`, `txs=` (Class A / `tx.idx` count), horizon, ETA |
+| `ibd: progress` | INFO | Tip rate, `loadq`/`writeq`, `txs=` (Class A / `tx.idx` count), horizon, tip ETA, durable `bq=` (on-disk block queue count + MiB/budget) |
 | `ibd: perf` | INFO | Inflight/archive pressure, **script/load** cost, **pin_hit%**, coarse load phases |
 | `ibd: perf_dbg` | DEBUG | µs/blk, pin/edge detail, **archive prep/write/sticky**, contig park |
 

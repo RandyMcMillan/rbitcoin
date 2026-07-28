@@ -1,4 +1,7 @@
 //! Work-chain progress snapshot, percent helpers, and rate/ETA for IBD logs.
+//!
+//! The operator `ibd: progress` line reports tip pace and durable block-queue
+//! occupancy (schema 12), not a separate Class A HWM / archive lead story.
 
 use super::body::BodyPresence;
 use crate::chain::ChainHub;
@@ -9,8 +12,8 @@ use std::time::Instant;
 /// Work-chain progress for status / progress logs.
 ///
 /// - `tip`: confirmed best-chain height
-/// - `archived`: Class A **high-water** height on the work path (logged as
-///   `arch_hwm=`; gap-fills below do not move it — see `arch_total=` / `+arch=`)
+/// - `archived`: Class A high-water on the work path (used for download lead /
+///   densify bookkeeping; **not** printed as `arch_hwm=` on the progress line)
 /// - `headers`: max peer-advertised / learned header height
 /// - `tip_hole`: contiguous unarchived run at the ordered front (blocks tip)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,6 +22,52 @@ pub(crate) struct WorkChainProgress {
     pub archived: u32,
     pub headers: u32,
     pub tip_hole: usize,
+}
+
+/// Inputs for the pure `ibd: progress` line formatter (unit-tested).
+#[derive(Clone, Debug)]
+pub(crate) struct ProgressLineInput {
+    pub pct: u32,
+    pub tip: u32,
+    /// Tip advance rate over the last sample window (blocks/s).
+    pub tip_rate: f64,
+    pub tip_hole: usize,
+    pub peers: usize,
+    /// Confirm pipeline depths already formatted (`loadq… writeq…`).
+    pub conf_q: String,
+    pub txs: u64,
+    pub horizon: u32,
+    /// From [`TipRateTracker::eta_string`] (`eta=…` or `done`).
+    pub eta: String,
+    /// Durable on-disk block queue: (budget_bytes, used_bytes, entry_count).
+    pub bq_budget: u64,
+    pub bq_bytes: u64,
+    pub bq_count: usize,
+}
+
+/// Build the `ibd: progress …` message body (no log level prefix).
+///
+/// Tip percent/rate, download hole, peers, confirm queues, txs, header horizon,
+/// tip-rate ETA, and durable block-queue occupancy. Does **not** emit
+/// `arch_hwm=`, a separate archive rate, or Class A `lead=`.
+pub(crate) fn format_progress_line(i: &ProgressLineInput) -> String {
+    let bq_mib = i.bq_bytes / (1024 * 1024);
+    let bq_budget_mib = i.bq_budget / (1024 * 1024);
+    format!(
+        "ibd: progress {}% tip={} ({}/s) hole={} peers={} {} txs={} horizon={} {} bq={} ({}MiB/{}MiB)",
+        i.pct,
+        i.tip,
+        format_rate(i.tip_rate),
+        i.tip_hole,
+        i.peers,
+        i.conf_q,
+        i.txs,
+        i.horizon,
+        i.eta,
+        i.bq_count,
+        bq_mib,
+        bq_budget_mib,
+    )
 }
 
 /// Build a status snapshot without walking the full ordered path.
@@ -209,10 +258,65 @@ pub(crate) fn tip_hole_from_ready(ready_flags: &[bool]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_duration_short, format_rate, ibd_pct, tip_hole_from_ready, TipRateTracker,
+        format_duration_short, format_progress_line, format_rate, ibd_pct, tip_hole_from_ready,
+        ProgressLineInput, TipRateTracker,
     };
     use std::time::{Duration, Instant};
     // TipRateTracker used by both format and EWMA surfaces.
+
+    /// Shipped progress line: tip + durable bq; no Class A arch_hwm / arch rate / lead.
+    #[test]
+    fn format_progress_line_schema12_tokens() {
+        // tip_rate 12.5 → format_rate rounds to "12" (≥10).
+        let line = format_progress_line(&ProgressLineInput {
+            pct: 42,
+            tip: 100_000,
+            tip_rate: 12.5,
+            tip_hole: 3,
+            peers: 8,
+            conf_q: "loadq=1/2 writeq=0/2".into(),
+            txs: 50_000_000,
+            horizon: 900_000,
+            eta: "eta=18h".into(),
+            bq_budget: 4 * 1024 * 1024 * 1024,
+            bq_bytes: 256 * 1024 * 1024,
+            bq_count: 17,
+        });
+        assert_eq!(
+            line,
+            "ibd: progress 42% tip=100000 (12/s) hole=3 peers=8 loadq=1/2 writeq=0/2 txs=50000000 horizon=900000 eta=18h bq=17 (256MiB/4096MiB)"
+        );
+        // Legacy dual-pipeline columns must not appear.
+        assert!(
+            !line.contains("arch_hwm"),
+            "must not report Class A arch_hwm: {line}"
+        );
+        assert!(!line.contains("lead="), "must not report archive lead=: {line}");
+        // A second rate next to an arch column is gone; only tip (/s) remains.
+        assert_eq!(
+            line.matches("/s)").count(),
+            1,
+            "only tip rate on progress line: {line}"
+        );
+        // Low tip rate keeps one decimal (still a single /s).
+        let slow = format_progress_line(&ProgressLineInput {
+            pct: 1,
+            tip: 10,
+            tip_rate: 2.4,
+            tip_hole: 0,
+            peers: 1,
+            conf_q: "loadq<0/2 writeq<0/2".into(),
+            txs: 1,
+            horizon: 1000,
+            eta: "eta=?".into(),
+            bq_budget: 1024 * 1024,
+            bq_bytes: 0,
+            bq_count: 0,
+        });
+        assert!(slow.contains("tip=10 (2.4/s)"), "{slow}");
+        assert!(slow.contains("bq=0 (0MiB/1MiB)"), "{slow}");
+        assert!(!slow.contains("arch_hwm") && !slow.contains("lead="), "{slow}");
+    }
 
     /// Pure helpers for progress lines (pct / tip-hole / duration formatting).
     #[test]

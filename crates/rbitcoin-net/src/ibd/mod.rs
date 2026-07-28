@@ -48,7 +48,7 @@ use exit::{
     peer_caught_up, AllPeersDead,
 };
 use progress::{
-    format_rate, ibd_pct, work_chain_progress, TipRateTracker,
+    format_progress_line, ibd_pct, work_chain_progress, ProgressLineInput, TipRateTracker,
 };
 use state::IbdWorkState;
 use assign::{archive_pipeline_saturated, assign_work_ordered, AssignDepth};
@@ -332,7 +332,7 @@ pub async fn ibd_cancellable(
     let confirm_lag = Arc::new(AtomicU32::new(0));
     let mut last_progress = Instant::now();
     let mut last_status = Instant::now();
-    // Snapshot for genuine 5s rates (progress + perf share this tick).
+    // Snapshot for genuine 5s tip rate (progress + perf share this tick).
     let mut last_sample_tip = start_tip;
     let mut tip_rate_tracker = TipRateTracker::new();
     tip_rate_tracker.push(Instant::now(), start_tip);
@@ -343,7 +343,6 @@ pub async fn ibd_cancellable(
     // Reload post-tip headers + Class A from disk so restart does not re-getdata
     // bodies that are already archived (ordered path was process-local only).
     seed_work_path_from_store(&mut st, hub.as_ref());
-    let mut last_sample_arch_hwm = st.max_archived_height;
 
     // Kick header sync — try a few peers (channel may close if handshake race).
     for _ in 0..st.slots.len().min(4) {
@@ -827,42 +826,46 @@ pub async fn ibd_cancellable(
                 .status_scan_ns
                 .fetch_add(scan_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-            // Genuine rates over this 5s window (height deltas / wall).
+            // Genuine tip rate over this 5s window (height delta / wall).
             let tip_delta = prog.tip.saturating_sub(last_sample_tip);
-            let arch_delta = prog.archived.saturating_sub(last_sample_arch_hwm);
             let tip_rate = tip_delta as f64 / window_secs;
-            let arch_rate = arch_delta as f64 / window_secs;
-            let arch_lead = prog.archived.saturating_sub(prog.tip);
             let peers_n = st.slots.iter().filter(|s| s.alive).count();
             let (load_q, write_q) = confirm_queues.snap();
             // Class A fks published in tx.idx (dense create_fk high-water).
             let txs = hub.query.tx_body_count();
             let pct = ibd_pct(prog.tip, prog.headers);
+            let (bq_budget, bq_bytes, bq_count) = hub.query.block_queue_stats();
 
             tip_rate_tracker.push(now, prog.tip);
             let eta = tip_rate_tracker.eta_string(now, prog.tip, prog.headers);
 
             // Bold on a TTY so the 5s progress line stands out among perf/debug noise.
             // loadq/writeq: confirm load→scripts / scripts→write; `name<0/cap` = empty.
+            // bq=: durable on-disk block queue (schema 12), not Class A arch_hwm/lead.
             let conf_q = confirm::format_conf_q(
                 load_q,
                 write_q,
                 confirm::LOAD_QUEUE_CAP,
                 confirm::WRITE_QUEUE_CAP,
             );
-            info_bold!(
-                "ibd: progress {pct}% tip={} ({}/s) arch_hwm={} ({}/s lead={arch_lead}) hole={} peers={peers_n} {conf_q} txs={txs} horizon={} {eta}",
-                prog.tip,
-                format_rate(tip_rate),
-                prog.archived,
-                format_rate(arch_rate),
-                prog.tip_hole,
-                prog.headers,
-            );
+            let progress_line = format_progress_line(&ProgressLineInput {
+                pct,
+                tip: prog.tip,
+                tip_rate,
+                tip_hole: prog.tip_hole,
+                peers: peers_n,
+                conf_q,
+                txs,
+                horizon: prog.headers,
+                eta,
+                bq_budget,
+                bq_bytes,
+                bq_count,
+            });
+            info_bold!("{progress_line}");
             let _ = std::io::Write::flush(&mut std::io::stderr());
 
             last_sample_tip = prog.tip;
-            last_sample_arch_hwm = prog.archived;
 
             let peer_cap = peers_n.saturating_mul(cfg.per_peer);
             let inflight_cap = cfg.window.min(peer_cap).max(1);

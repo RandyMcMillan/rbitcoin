@@ -5,7 +5,7 @@
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
-//! | INFO  | `ibd: progress …` | Tip/arch rates over the **last 5s**, loadq/writeq, txs=, horizon, **1h tip ETA** |
+//! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, loadq/writeq, txs=, horizon, tip ETA, durable `bq=` (disk block queue) |
 //! | INFO  | `ibd: perf …` | Download pressure, confirm cost (script/load/…), pin_hit, coarse load phases, sh_runs |
 //! | INFO  | `ibd: sizes …` | Process RSS + occupancy of known retain structures (leak triage) |
 //! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail, archive pipe (prep/write/sticky), contig park |

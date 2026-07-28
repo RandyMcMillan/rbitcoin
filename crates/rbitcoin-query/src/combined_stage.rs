@@ -201,6 +201,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Full durable budget → offer buffers in RAM (no error); dequeue flushes.
+    #[test]
+    fn block_queue_offer_buffers_when_full_then_flush_on_dequeue() {
+        let (dir, q) = temp_query();
+        // Shrink durable budget after open (constructor clamps min 64 MiB).
+        q.block_queue_force_budget_for_test(64);
+        let p1 = vec![1u8; 40];
+        let p2 = vec![2u8; 40];
+        assert_eq!(
+            q.block_queue_offer(1, [1u8; 32], 1, &p1).unwrap(),
+            Some(1),
+            "first fits on disk"
+        );
+        assert_eq!(q.block_queue_stats().2, 1);
+        assert_eq!(
+            q.block_queue_offer(2, [2u8; 32], 2, &p2).unwrap(),
+            None,
+            "second held in RAM, not error"
+        );
+        assert_eq!(q.block_queue_pending_len(), 1);
+        assert_eq!(q.block_queue_stats().2, 1, "disk count unchanged");
+        assert!(!q.block_queue_can_request(), "effective fill ≥ budget");
+        // Free disk → flush pending.
+        assert_eq!(q.block_queue_dequeue_height(1).unwrap(), 1);
+        assert_eq!(q.block_queue_pending_len(), 0, "flushed after dequeue");
+        assert_eq!(q.block_queue_stats().2, 1, "h2 now on disk");
+        let all = q.block_queue_load_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].height, 2);
+        assert_eq!(all[0].payload, p2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn block_queue_hysteresis_scale() {
+        // Enter at 0.90, stay until ≤0.70.
+        let (s0, p0) = Query::block_queue_far_scale_from(0.5, false);
+        assert!((s0 - 0.5).abs() < 1e-9);
+        assert!(!p0);
+        let (s1, p1) = Query::block_queue_far_scale_from(0.91, false);
+        assert_eq!(s1, 0.0);
+        assert!(p1);
+        let (s2, p2) = Query::block_queue_far_scale_from(0.80, true);
+        assert_eq!(s2, 0.0, "still latched above exit");
+        assert!(p2);
+        let (s3, p3) = Query::block_queue_far_scale_from(0.70, true);
+        assert!(!p3);
+        assert!((s3 - 0.30).abs() < 1e-9);
+    }
+
     /// Multi-block AC1: archive h0 creates + h1 spends h0; load_confirm_parents
     /// on h0 seeds residency; load of h1 pins parent **without** a second denserels
     /// body fetch (`full_tx_reads` stays 0 for the parent pin).

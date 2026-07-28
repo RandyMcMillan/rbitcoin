@@ -36,12 +36,25 @@ use rbitcoin_store::{
     script_hash, HeaderRecord, InputRecord, OutputRecord, PointRecord, ScriptHashRecord, Store,
     StoreError, TxRecord,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 
 pub type QueryError = StoreError;
+
+/// One already-received block waiting for durable `block_queue` capacity.
+#[derive(Debug, Clone)]
+struct PendingDurableBlock {
+    height: u32,
+    hash: [u8; 32],
+    header_fk: u64,
+    payload: Vec<u8>,
+}
+
+/// Durable block_queue request-gating hysteresis (same band as archive RAM budget).
+pub const BLOCK_QUEUE_PRESSURE_ENTER: f64 = 0.90;
+pub const BLOCK_QUEUE_PRESSURE_EXIT: f64 = 0.70;
 
 /// Cheap process-owned cache occupancy for IBD `ibd: sizes` (O(1) lens + brief locks).
 #[derive(Clone, Copy, Debug, Default)]
@@ -57,6 +70,11 @@ pub struct ProcessOwnedSizes {
     pub out_order: usize,
     pub conf_plans: usize,
     pub conf_bodies: usize,
+    /// Unified create residency (schema 12): creates + outs vs caps.
+    pub residency_creates: usize,
+    pub residency_create_cap: usize,
+    pub residency_outs: u64,
+    pub residency_out_cap: u64,
     pub sh_runs: usize,
     pub sh_memtable: usize,
     pub sh_heads: usize,
@@ -89,9 +107,11 @@ pub mod confirm_load_stats {
     pub static UTXO_PARENTS: AtomicU64 = AtomicU64::new(0);
     pub static CREATES: AtomicU64 = AtomicU64::new(0);
     pub static PARENT_UNIQUE: AtomicU64 = AtomicU64::new(0);
-    /// Pin filled from outs FIFO (no Class A re-decode).
+    /// Pin filled from outs FIFO or same-batch (no Class A re-decode).
     pub static PIN_CACHE_BODY: AtomicU64 = AtomicU64::new(0);
-    /// Pin that had to load from store.
+    /// Of no-IO pins: filled from CreateResidency (schema 12 shared map).
+    pub static PIN_RESIDENCY: AtomicU64 = AtomicU64::new(0);
+    /// Pin candidates that missed FIFO/same-batch (may still hit residency before store).
     pub static PIN_NEW: AtomicU64 = AtomicU64::new(0);
     pub static PIN_SPENT_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_BODY_NS: AtomicU64 = AtomicU64::new(0);
@@ -120,6 +140,7 @@ pub mod confirm_load_stats {
         pub creates: u64,
         pub parent_unique: u64,
         pub pin_cache_body: u64,
+        pub pin_residency: u64,
         pub pin_new: u64,
         pub pin_spent_ns: u64,
         pub pin_body_ns: u64,
@@ -146,6 +167,7 @@ pub mod confirm_load_stats {
             creates: CREATES.swap(0, Ordering::Relaxed),
             parent_unique: PARENT_UNIQUE.swap(0, Ordering::Relaxed),
             pin_cache_body: PIN_CACHE_BODY.swap(0, Ordering::Relaxed),
+            pin_residency: PIN_RESIDENCY.swap(0, Ordering::Relaxed),
             pin_new: PIN_NEW.swap(0, Ordering::Relaxed),
             pin_spent_ns: PIN_SPENT_NS.swap(0, Ordering::Relaxed),
             pin_body_ns: PIN_BODY_NS.swap(0, Ordering::Relaxed),
@@ -182,6 +204,7 @@ pub mod confirm_load_stats {
         add!(creates_registered, CREATES);
         add!(parent_unique, PARENT_UNIQUE);
         add!(pin_cache_body, PIN_CACHE_BODY);
+        add!(pin_residency, PIN_RESIDENCY);
         add!(pin_new, PIN_NEW);
         add!(pin_spent_ns, PIN_SPENT_NS);
         add!(pin_body_ns, PIN_BODY_NS);
@@ -640,6 +663,11 @@ pub struct Query {
     create_residency: create_residency::CreateResidency,
     /// Durable multi‑GiB on-disk block payload queue (IBD restart without re-download).
     block_queue: Mutex<rbitcoin_store::BlockQueue>,
+    /// RAM overflow when durable queue is at budget (already-received blocks only).
+    /// Flushed into disk as confirm-write dequeues free space.
+    block_queue_pending: Mutex<VecDeque<PendingDurableBlock>>,
+    /// Hysteresis latch for new getdata: enter ≥90% effective fill, exit ≤70%.
+    block_queue_pressure: AtomicBool,
     /// Direct IBD SH: memtable → sorted runs (bulk materialize at tip).
     sh_run: sh_builder::ShRunBuilder,
     /// Explicit [`IndexMode`] (Direct / Tip).
@@ -679,6 +707,8 @@ impl Query {
             block_queue: Mutex::new(rbitcoin_store::BlockQueue::open_or_create(
                 &store_path,
             )?),
+            block_queue_pending: Mutex::new(VecDeque::new()),
+            block_queue_pressure: AtomicBool::new(false),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
             // Open as Tip until IBD selects Direct.
             index_mode_cell: std::sync::atomic::AtomicU8::new(IndexMode::Tip as u8),
@@ -851,13 +881,117 @@ impl Query {
         &self.create_residency
     }
 
-    /// Durable block queue budget/count for status.
+    /// Durable block queue budget/count for status: `(budget, disk_bytes, disk_count)`.
     pub fn block_queue_stats(&self) -> (u64, u64, usize) {
         let g = self.block_queue.lock().unwrap();
         (g.budget(), g.bytes(), g.count())
     }
 
-    /// Persist a decoded block payload (IBD receive path). Survives restart.
+    /// `(disk_bytes + pending_ram_bytes) / budget` for admission / logs.
+    ///
+    /// Lock order: `block_queue` then `block_queue_pending`.
+    pub fn block_queue_effective_fill(&self) -> f64 {
+        let g = self.block_queue.lock().unwrap();
+        let pend = self.block_queue_pending.lock().unwrap();
+        let pending_bytes: u64 = pend.iter().map(|p| p.payload.len() as u64).sum();
+        let b = g.budget().max(1) as f64;
+        (g.bytes().saturating_add(pending_bytes)) as f64 / b
+    }
+
+    /// RAM overflow depth (already-received blocks waiting for durable capacity).
+    pub fn block_queue_pending_len(&self) -> usize {
+        self.block_queue_pending.lock().unwrap().len()
+    }
+
+    /// Pure hysteresis: scale for new densify getdata from fill + latch.
+    ///
+    /// Enter pressure at ≥ [`BLOCK_QUEUE_PRESSURE_ENTER`], exit only at
+    /// ≤ [`BLOCK_QUEUE_PRESSURE_EXIT`]. Under pressure scale is 0.
+    pub fn block_queue_far_scale_from(fill: f64, mut pressure: bool) -> (f64, bool) {
+        if fill >= BLOCK_QUEUE_PRESSURE_ENTER {
+            pressure = true;
+        } else if fill <= BLOCK_QUEUE_PRESSURE_EXIT {
+            pressure = false;
+        }
+        let scale = if pressure {
+            0.0
+        } else {
+            (1.0 - fill).clamp(0.0, 1.0)
+        };
+        (scale, pressure)
+    }
+
+    /// Soft densify scale (0..=1) with 90%/70% hysteresis on effective fill.
+    pub fn block_queue_far_admission_scale(&self) -> f64 {
+        let fill = self.block_queue_effective_fill();
+        let was = self.block_queue_pressure.load(AtomicOrdering::Relaxed);
+        let (scale, pressure) = Self::block_queue_far_scale_from(fill, was);
+        self.block_queue_pressure
+            .store(pressure, AtomicOrdering::Relaxed);
+        scale
+    }
+
+    /// True while durable+pending is **strictly below** budget — issue densify
+    /// getdata. Already-in-flight peer bodies are still accepted into RAM.
+    pub fn block_queue_can_request(&self) -> bool {
+        let g = self.block_queue.lock().unwrap();
+        let pend = self.block_queue_pending.lock().unwrap();
+        let pending_bytes: u64 = pend.iter().map(|p| p.payload.len() as u64).sum();
+        g.bytes().saturating_add(pending_bytes) < g.budget()
+    }
+
+    /// Persist a decoded block payload when capacity allows; otherwise buffer in
+    /// process RAM until a later flush (after dequeue frees space).
+    ///
+    /// Always accepts the block for the live process (returns `Ok`). Disk
+    /// capacity full is **not** an error — do not spam-log it. Real IO errors
+    /// still return `Err`.
+    ///
+    /// Returns `Ok(Some(id))` when written to disk, `Ok(None)` when held in RAM.
+    pub fn block_queue_offer(
+        &self,
+        height: u32,
+        hash: [u8; 32],
+        header_fk: u64,
+        payload: &[u8],
+    ) -> Result<Option<u64>, QueryError> {
+        // Free as much disk as possible before deciding.
+        self.block_queue_flush_pending()?;
+        // Lock order: block_queue then pending.
+        let mut g = self.block_queue.lock().unwrap();
+        if g.can_enqueue(payload.len()) {
+            let id = g.enqueue(height, hash, header_fk, payload)?;
+            let fill = {
+                let pend = self.block_queue_pending.lock().unwrap();
+                let pb: u64 = pend.iter().map(|p| p.payload.len() as u64).sum();
+                (g.bytes().saturating_add(pb)) as f64 / g.budget().max(1) as f64
+            };
+            drop(g);
+            self.store_block_queue_pressure(fill);
+            return Ok(Some(id));
+        }
+        // Budget full: hold payload in RAM; assign stops new getdata via can_request.
+        {
+            let mut pend = self.block_queue_pending.lock().unwrap();
+            if !pend.iter().any(|p| p.height == height) {
+                pend.push_back(PendingDurableBlock {
+                    height,
+                    hash,
+                    header_fk,
+                    payload: payload.to_vec(),
+                });
+            }
+            let pb: u64 = pend.iter().map(|p| p.payload.len() as u64).sum();
+            let fill =
+                (g.bytes().saturating_add(pb)) as f64 / g.budget().max(1) as f64;
+            drop(pend);
+            drop(g);
+            self.store_block_queue_pressure(fill);
+        }
+        Ok(None)
+    }
+
+    /// Direct disk enqueue (tests / tools). Prefer [`Self::block_queue_offer`] on IBD.
     pub fn block_queue_enqueue(
         &self,
         height: u32,
@@ -869,16 +1003,70 @@ impl Query {
         Ok(g.enqueue(height, hash, header_fk, payload)?)
     }
 
-    /// Remove durable queue entry after combined confirm-write (or permanent drop).
-    pub fn block_queue_dequeue_height(&self, height: u32) -> Result<usize, QueryError> {
+    /// Drain RAM overflow into durable queue while capacity allows.
+    ///
+    /// Lock order: `block_queue` then `block_queue_pending` (never reverse).
+    pub fn block_queue_flush_pending(&self) -> Result<usize, QueryError> {
+        let mut flushed = 0usize;
         let mut g = self.block_queue.lock().unwrap();
-        Ok(g.dequeue_height(height)?)
+        loop {
+            let item = {
+                let mut pend = self.block_queue_pending.lock().unwrap();
+                let Some(front) = pend.front() else {
+                    break;
+                };
+                if !g.can_enqueue(front.payload.len()) {
+                    break;
+                }
+                pend.pop_front()
+            };
+            let Some(item) = item else {
+                break;
+            };
+            g.enqueue(item.height, item.hash, item.header_fk, &item.payload)?;
+            flushed += 1;
+        }
+        if flushed > 0 {
+            let fill = {
+                let pend = self.block_queue_pending.lock().unwrap();
+                let pb: u64 = pend.iter().map(|p| p.payload.len() as u64).sum();
+                (g.bytes().saturating_add(pb)) as f64 / g.budget().max(1) as f64
+            };
+            drop(g);
+            self.store_block_queue_pressure(fill);
+        }
+        Ok(flushed)
     }
 
-    /// Load all durable queued blocks (IBD restart replay).
+    fn store_block_queue_pressure(&self, fill: f64) {
+        let was = self.block_queue_pressure.load(AtomicOrdering::Relaxed);
+        let (_scale, pressure) = Self::block_queue_far_scale_from(fill, was);
+        self.block_queue_pressure
+            .store(pressure, AtomicOrdering::Relaxed);
+    }
+
+    /// Remove durable queue entry after combined confirm-write (or permanent drop).
+    /// Then flush any RAM overflow into freed capacity.
+    pub fn block_queue_dequeue_height(&self, height: u32) -> Result<usize, QueryError> {
+        let n = {
+            let mut g = self.block_queue.lock().unwrap();
+            g.dequeue_height(height)?
+        };
+        let _ = self.block_queue_flush_pending()?;
+        Ok(n)
+    }
+
+    /// Load all durable queued blocks (IBD restart replay). Disk only (not RAM pending).
     pub fn block_queue_load_all(&self) -> Result<Vec<rbitcoin_store::QueuedBlock>, QueryError> {
         let g = self.block_queue.lock().unwrap();
         Ok(g.load_all()?)
+    }
+
+    /// Test helper: force a tiny durable budget (bypasses open-time 64 MiB clamp).
+    #[cfg(test)]
+    pub fn block_queue_force_budget_for_test(&self, budget: u64) {
+        let mut g = self.block_queue.lock().unwrap();
+        g.force_budget_for_test(budget);
     }
 
     /// Cheap process-owned cache sizes for the IBD `ibd: sizes` line.
@@ -888,6 +1076,8 @@ impl Query {
     pub fn process_owned_size_snapshot(&self) -> ProcessOwnedSizes {
         let (sticky_len, sticky_cap, sticky_fifo) = self.archive_txid_sticky.size_stats();
         let (out_creates, out_total, out_cap, out_order) = self.confirm_parents.body_lru_stats();
+        let (res_creates, res_create_cap, res_outs, res_out_cap) =
+            self.create_residency.size_stats();
         let conf_plans = self.confirm_parents.plan_count();
         ProcessOwnedSizes {
             sticky_len,
@@ -899,6 +1089,10 @@ impl Query {
             out_order,
             conf_plans,
             conf_bodies: out_creates,
+            residency_creates: res_creates,
+            residency_create_cap: res_create_cap,
+            residency_outs: res_outs,
+            residency_out_cap: res_out_cap,
             sh_runs: self.sh_run.on_disk_run_count(),
             sh_memtable: self.sh_run.memtable_len(),
             sh_heads: self.sh_heads.lock().unwrap().len(),

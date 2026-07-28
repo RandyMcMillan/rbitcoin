@@ -15,6 +15,9 @@ pub enum StoreError {
     InvalidFk,
     NotDirectory(PathBuf),
     Corrupt(&'static str),
+    /// Soft capacity (e.g. durable block_queue budget) — not data corruption.
+    /// Caller should buffer in RAM and stop new requests; never spam-log.
+    BudgetFull(&'static str),
     /// Cooperative abort (SIGINT / IBD stop) — not data corruption.
     Cancelled(&'static str),
 }
@@ -48,6 +51,7 @@ impl fmt::Display for StoreError {
                 write!(f, "store path is not a directory: {}", p.display())
             }
             StoreError::Corrupt(m) => write!(f, "corrupt record: {m}"),
+            StoreError::BudgetFull(m) => write!(f, "budget full: {m}"),
             StoreError::Cancelled(m) => write!(f, "cancelled: {m}"),
         }
     }
@@ -86,6 +90,7 @@ mod tests {
             StoreError::InvalidFk,
             StoreError::NotDirectory(PathBuf::from("/not/a/dir")),
             StoreError::Corrupt("broken"),
+            StoreError::BudgetFull("block_queue"),
             StoreError::Cancelled("stop"),
         ];
         let texts: Vec<String> = arms.iter().map(|e| e.to_string()).collect();
@@ -97,7 +102,8 @@ mod tests {
         assert_eq!(texts[4], "invalid foreign key");
         assert!(texts[5].contains("not a directory"));
         assert!(texts[6].contains("corrupt record: broken"));
-        assert!(texts[7].contains("cancelled: stop"));
+        assert!(texts[7].contains("budget full: block_queue"));
+        assert!(texts[8].contains("cancelled: stop"));
         for e in &arms {
             assert!(e.source().is_none());
         }

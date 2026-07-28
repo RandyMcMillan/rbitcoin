@@ -175,10 +175,22 @@ impl BlockQueue {
         self.bytes.saturating_add(payload_len as u64) <= self.budget
     }
 
+    /// Override budget (constructor clamps min 64 MiB). For tests / diagnostics.
+    pub fn force_budget_for_test(&mut self, budget: u64) {
+        self.budget = budget.max(1);
+    }
+
+    /// `bytes / budget` (may be 0..1 under normal load; rarely >1 if forced).
+    pub fn fill_ratio(&self) -> f64 {
+        let b = self.budget.max(1) as f64;
+        self.bytes as f64 / b
+    }
+
     /// Append a block payload. Returns queue id.
     ///
     /// Refuses when `bytes + payload.len()` would exceed [`Self::budget`]
-    /// ([`Self::can_enqueue`]) so the multi‑GiB cap is enforced, not parse-only.
+    /// ([`Self::can_enqueue`]) with [`StoreError::BudgetFull`] — expected when
+    /// the multi‑GiB cap is hit; callers buffer in RAM and gate new getdata.
     pub fn enqueue(
         &mut self,
         height: u32,
@@ -187,8 +199,8 @@ impl BlockQueue {
         payload: &[u8],
     ) -> Result<u64, StoreError> {
         if !self.can_enqueue(payload.len()) {
-            return Err(StoreError::Corrupt(
-                "block_queue budget exceeded (raise RBITCOIN_BLOCK_QUEUE_GB / _BYTES)",
+            return Err(StoreError::BudgetFull(
+                "block_queue (raise RBITCOIN_BLOCK_QUEUE_GB / _BYTES only if too small)",
             ));
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -407,8 +419,13 @@ mod tests {
         q.bytes = 0;
         q.enqueue(1, [1u8; 32], 1, b"small").unwrap();
         assert!(!q.can_enqueue(200));
-        assert!(q.enqueue(2, [2u8; 32], 2, &vec![0u8; 200]).is_err());
+        let err = q.enqueue(2, [2u8; 32], 2, &vec![0u8; 200]).unwrap_err();
+        assert!(
+            matches!(err, StoreError::BudgetFull(_)),
+            "budget full is soft, not corrupt: {err}"
+        );
         assert_eq!(q.count(), 1, "failed enqueue must not leave a rec");
+        assert!(q.fill_ratio() > 0.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

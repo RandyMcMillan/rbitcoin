@@ -522,18 +522,25 @@ pub async fn ibd_cancellable(
         st.hygiene();
 
         // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
-        // ContigPark densify scaled by archive free headroom (proportional +
-        // 90%/70% hysteresis). Hard stop densify/cache when !can_assign (at
-        // budget); tip-hole + write_next race always run. In-flight bodies still
-        // enqueue (may overshoot). Saturated pipeline → Critical only (CPU).
-        let far_scale = archive_queued.far_admission_scale();
-        let can_assign_new = archive_queued.can_assign();
+        // ContigPark densify scaled by min(archive RAM, durable block_queue)
+        // free headroom (proportional + 90%/70% hysteresis each). Hard stop
+        // densify/cache when either is at budget; tip-hole + write_next race
+        // always run. In-flight bodies always accepted into RAM (durable may
+        // buffer overflow until dequeue). Saturated pipeline → Critical only.
+        let far_scale = archive_queued
+            .far_admission_scale()
+            .min(hub.query.block_queue_far_admission_scale());
+        let can_assign_new =
+            archive_queued.can_assign() && hub.query.block_queue_can_request();
         let write_next = archive_write_next.load(Ordering::Relaxed);
         let inflight_before = st.inflight.len();
+        let fill_for_sat = archive_queued
+            .fill_ratio()
+            .max(hub.query.block_queue_effective_fill());
         let depth = if archive_pipeline_saturated(
             st.body.pending_len(),
             st.inflight.len(),
-            archive_queued.fill_ratio(),
+            fill_for_sat,
         ) {
             AssignDepth::Critical
         } else {
@@ -597,13 +604,19 @@ pub async fn ibd_cancellable(
         // pipeline still runs Critical only (write_next race / tip hole).
         let freed = inflight_before.saturating_sub(st.inflight.len());
         if freed >= 8 || st.inflight.is_empty() {
-            let far_scale2 = archive_queued.far_admission_scale();
-            let can_assign2 = archive_queued.can_assign();
+            let far_scale2 = archive_queued
+                .far_admission_scale()
+                .min(hub.query.block_queue_far_admission_scale());
+            let can_assign2 =
+                archive_queued.can_assign() && hub.query.block_queue_can_request();
             let write_next2 = archive_write_next.load(Ordering::Relaxed);
+            let fill2 = archive_queued
+                .fill_ratio()
+                .max(hub.query.block_queue_effective_fill());
             let depth2 = if archive_pipeline_saturated(
                 st.body.pending_len(),
                 st.inflight.len(),
-                archive_queued.fill_ratio(),
+                fill2,
             ) {
                 AssignDepth::Critical
             } else {
@@ -895,6 +908,7 @@ pub async fn ibd_cancellable(
                 arch_q_now,
                 arch_mb,
                 arch_budget_mb,
+                (bq_budget, bq_bytes, bq_count),
                 st.body.pending_len(),
                 st.body.known_len(),
                 st.ordered.len(),

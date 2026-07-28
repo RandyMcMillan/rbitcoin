@@ -430,47 +430,48 @@ impl Query {
 
         // ── pin_new: idx→body pipeline in **chunks** ─────────────────────
         // Holding ~90k full packed bodies + dense outs at once blew RSS.
-        // Chunk so peak is O(PIN_NEW_CHUNK) bodies. Pipeline completion-drives
-        // idx CQE → body SQE (no full phase barrier).
+        // Chunk so peak is O(PIN_NEW_CHUNK) bodies. Range resolve is one sticky
+        // + one OutFifo batch for the whole pin_new set (two mutex takes), then
+        // body IO runs in chunks via idx→body pipeline.
         const PIN_NEW_CHUNK: usize = 4096;
         let t_new = Instant::now();
         if self.confirm_cancelled() {
             crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
             return Err(StoreError::Cancelled("confirm cancelled"));
         }
-        for chunk in pin_new_pending.chunks(PIN_NEW_CHUNK) {
-            if self.confirm_cancelled() {
-                crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
-                return Err(StoreError::Cancelled("confirm cancelled"));
-            }
-            let fks: Vec<Fk> = chunk.iter().map(|(pid, _)| Fk(*pid)).collect();
-            // Cross-cache ranges (read-only): sticky then OutFifo — skip idx.
-            let sticky_ranges = self.archive_txid_sticky.body_ranges_by_fk(&fks);
-            let mut range_by_i: Vec<Option<(u64, u64)>> = sticky_ranges;
+        // One-shot cross-cache ranges for all pin_new parents (skip idx when known).
+        let pin_new_fks: Vec<Fk> = pin_new_pending.iter().map(|(pid, _)| Fk(*pid)).collect();
+        let mut pin_new_ranges: Vec<Option<(u64, u64)>> =
+            self.archive_txid_sticky.body_ranges_by_fk(&pin_new_fks);
+        {
             let mut need_fifo: Vec<Fk> = Vec::new();
             let mut need_fifo_slot: Vec<usize> = Vec::new();
-            for (i, r) in range_by_i.iter().enumerate() {
+            for (i, r) in pin_new_ranges.iter().enumerate() {
                 if r.is_none() {
                     need_fifo_slot.push(i);
-                    need_fifo.push(fks[i]);
+                    need_fifo.push(pin_new_fks[i]);
                 }
             }
             if !need_fifo.is_empty() {
                 let fifo_ranges = self.confirm_parents.body_ranges_by_fk(&need_fifo);
                 for (slot, fr) in need_fifo_slot.into_iter().zip(fifo_ranges.into_iter()) {
                     if fr.is_some() {
-                        range_by_i[slot] = fr;
+                        pin_new_ranges[slot] = fr;
                     }
                 }
             }
-
+        }
+        for (chunk_i, chunk) in pin_new_pending.chunks(PIN_NEW_CHUNK).enumerate() {
+            if self.confirm_cancelled() {
+                crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
+                return Err(StoreError::Cancelled("confirm cancelled"));
+            }
+            let base = chunk_i.saturating_mul(PIN_NEW_CHUNK);
             let mut pipe_jobs: Vec<rbitcoin_store::IdxBodyJob> =
                 Vec::with_capacity(chunk.len());
-            for (fk, range) in fks.iter().zip(range_by_i.into_iter()) {
-                pipe_jobs.push(rbitcoin_store::IdxBodyJob::new(
-                    fk.get().unwrap_or(0),
-                    range,
-                ));
+            for (j, (pid, _)) in chunk.iter().enumerate() {
+                let range = pin_new_ranges.get(base + j).copied().flatten();
+                pipe_jobs.push(rbitcoin_store::IdxBodyJob::new(*pid, range));
             }
             self.store.idx_body_pipeline(
                 &mut pipe_jobs,

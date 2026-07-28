@@ -142,6 +142,6 @@ that shows a clear change after.
 | `archive_charged` marker | **`clear_archive_charged`** only (never hygiene-prune) |
 | Confirm plans/headers | **`ConfirmParentCache::advance_tip`** (write `post_commit`) |
 | OutFifo outs | FIFO eviction on **`OutFifo::insert`** (cap); not tip GC |
-| Archive sticky | FIFO + touch in **`ArchiveTxidSticky::insert_many` / `lookup_batch`** |
+| Archive sticky | raw FIFO in **`ArchiveTxidSticky`** (lookup read-only; no touch/LRU) |
 | Ordered maps | **`IbdWorkState::hygiene`** |
 | Body presence | **`BodyPresence::hygiene_retain`** (rejected + charged retained by design) |

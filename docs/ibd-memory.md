@@ -12,7 +12,7 @@ in RSS when faulted but are not Rust heap leaks).
 | **ContigPark** | horizon `CONTIG_DENSIFY_AHEAD` (2048 heights) | `take_contiguous` → writer; abort via `drain_all` + Err results; skip already-Class-A via `force_advance` + **Dropped** |
 | **`BodyPresence.archive_charged`** | one bit per in-flight archive body | **Only** `clear_archive_charged` on pipeline result — **never** hygiene-prune |
 | **OutFifo (confirm outs)** | `RBITCOIN_CONFIRM_OUT_FIFO` (default 2²⁴ outs) | FIFO whole-create eviction on insert; tip GC does **not** free outs |
-| **Archive txid sticky** | ~4M entries | FIFO + touch recency |
+| **Archive txid sticky** | `RBITCOIN_ARCHIVE_TXID_STICKY_CAP` (default 8 M) | raw FIFO (no touch/LRU); lookup read-only |
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |
 | **SH memtable / runs** | memtable env cap; runs on disk | spill + merge; bulk materialize at tip |
 | **Ordered work path** | `MAX_ORDERED_HEADERS` | `IbdWorkState::hygiene` |

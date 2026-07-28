@@ -94,8 +94,8 @@ Caches avoid disk only; they never replace publish order / SEAL / tip-as-commit:
 
 | Cache | Default | Cap / knob | Avoids |
 |-------|---------|------------|--------|
-| Archive sticky (`txid→fk` + optional body range) | 8 M entries (~384 MiB planning) | `RBITCOIN_ARCHIVE_TXID_STICKY_CAP` clamp 100 k–20 M (≤~1 GiB-class) | `tx.head` probe + often `tx.idx` |
-| Confirm OutFifo (outs + slim meta) | 2²⁴ outs | `RBITCOIN_CONFIRM_OUT_FIFO` | re-decode Class A for pin hits |
+| Archive sticky (`txid→fk` + optional body range) | 8 M entries (~384 MiB planning) | `RBITCOIN_ARCHIVE_TXID_STICKY_CAP` clamp 100 k–20 M (≤~1 GiB-class); **raw FIFO** (lookup read-only, no touch/LRU) | `tx.head` probe + often `tx.idx` |
+| Confirm OutFifo (outs + slim meta) | 2²⁴ outs | `RBITCOIN_CONFIRM_OUT_FIFO`; **raw FIFO** (no pin-hit touch) | re-decode Class A for pin hits |
 
 ### Cross-platform bulk IO
 

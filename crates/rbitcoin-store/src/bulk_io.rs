@@ -2,9 +2,11 @@
 //! kernel can keep many independent ops in flight.
 //!
 //! All io_uring work is driven by [`crate::uring_session::UringSession`] (same
-//! type as archive streaming resolve and `tx.head` shadow fill). Each
-//! `pread_batch` / `pwrite_batch` / page-RMW call opens a short-lived session
-//! for that wave, then falls back to libc `pread`/`pwrite` when uring is off.
+//! type as archive streaming resolve and `tx.head` shadow fill). Hot-path
+//! `pread_batch` / `pwrite_batch` / page-RMW reuse a **thread-local** ring so
+//! confirm-load and archive-prep waves do not `io_uring_setup`/`exit` per batch.
+//! Nested bulk_io on the same thread (re-entrant) opens a temporary ring.
+//! Falls back to libc `pread`/`pwrite` when uring is off.
 //!
 //! Used by archive head-resolve body prefixes, confirm load body batches, and
 //! Class C bulk slots. Completions are unordered within a submit batch.
@@ -18,6 +20,14 @@
 //! Ring entries: [`crate::uring_session::DEFAULT_ENTRIES`] (1024). Large waves
 //! keep the ring full: submit up to depth outstanding ops, then refill as CQEs
 //! complete (pipelined, not stop-and-wait chunks).
+//!
+//! # Non-Linux
+//!
+//! Windows/macOS use the same `pread_batch` / `pwrite_batch` API surface with
+//! libc (or equivalent) positional IO and optional worker threads. A native
+//! IOCP/kqueue backend is intentionally **not** wired: it would not unify
+//! execution with Linux's completion-driven ring and would add a second code
+//! path without a measured Linux-safe win. See `docs/concurrency.md`.
 
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -161,24 +171,80 @@ pub fn page_rmw_pipelined(
     page_rmw_pipelined_uring(pages, apply)
 }
 
-/// Pipelined bulk pread via [`crate::uring_session::UringSession`].
+/// Thread-local bulk ring: one owned session per thread, reused across waves.
+/// Nested `with_bulk_session` opens a temporary ring so re-entrancy stays safe.
+#[cfg(target_os = "linux")]
+fn with_bulk_session<R>(f: impl FnOnce(&mut crate::uring_session::UringSession) -> R) -> Option<R> {
+    use crate::uring_session::UringSession;
+    use std::cell::{Cell, RefCell};
+
+    thread_local! {
+        static SESSION: RefCell<Option<UringSession>> = const { RefCell::new(None) };
+        static DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    DEPTH.with(|depth| {
+        let d = depth.get();
+        depth.set(d + 1);
+        let out = if d == 0 {
+            SESSION.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                if slot.is_none() {
+                    match UringSession::try_open(RING_ENTRIES) {
+                        Ok(s) => *slot = Some(s),
+                        Err(_) => {
+                            URING_MODE.store(2, Ordering::Relaxed);
+                            return None;
+                        }
+                    }
+                }
+                let session = slot.as_mut().expect("session just ensured");
+                if session.in_flight() != 0 {
+                    session.drain_all();
+                }
+                Some(f(session))
+            })
+        } else {
+            // Re-entrant bulk_io on this thread: do not share the TL ring mid-wave.
+            match UringSession::try_open(RING_ENTRIES) {
+                Ok(mut s) => Some(f(&mut s)),
+                Err(_) => None,
+            }
+        };
+        depth.set(d);
+        out
+    })
+}
+
+/// Pipelined bulk pread via thread-local [`crate::uring_session::UringSession`].
 /// `user_data = op index`. Returns false → caller uses pread fallback.
 #[cfg(target_os = "linux")]
 fn pread_batch_uring(ops: &mut [ReadOp<'_>]) -> bool {
-    use crate::uring_session::UringSession;
-    let Ok(mut session) = UringSession::try_open(RING_ENTRIES) else {
-        URING_MODE.store(2, Ordering::Relaxed);
-        return false;
-    };
     for op in ops.iter_mut() {
         op.result = if op.buf.is_empty() { 0 } else { i32::MIN };
     }
-    let n = ops.len();
     let total_nonempty = ops.iter().filter(|o| !o.buf.is_empty()).count();
     if total_nonempty == 0 {
         return true;
     }
 
+    let ok = with_bulk_session(|session| pread_batch_on_session(session, ops, total_nonempty));
+    match ok {
+        Some(true) => true,
+        Some(false) | None => {
+            URING_MODE.store(2, Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pread_batch_on_session(
+    session: &mut crate::uring_session::UringSession,
+    ops: &mut [ReadOp<'_>],
+    total_nonempty: usize,
+) -> bool {
+    let n = ops.len();
     let mut next = 0usize;
     let mut completed = 0usize;
 
@@ -248,20 +314,31 @@ fn pread_batch_uring(ops: &mut [ReadOp<'_>]) -> bool {
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 fn pwrite_batch_uring(ops: &mut [WriteOp<'_>]) -> bool {
-    use crate::uring_session::UringSession;
-    let Ok(mut session) = UringSession::try_open(RING_ENTRIES) else {
-        URING_MODE.store(2, Ordering::Relaxed);
-        return false;
-    };
     for op in ops.iter_mut() {
         op.result = if op.buf.is_empty() { 0 } else { i32::MIN };
     }
-    let n = ops.len();
     let total_nonempty = ops.iter().filter(|o| !o.buf.is_empty()).count();
     if total_nonempty == 0 {
         return true;
     }
 
+    let ok = with_bulk_session(|session| pwrite_batch_on_session(session, ops, total_nonempty));
+    match ok {
+        Some(true) => true,
+        Some(false) | None => {
+            URING_MODE.store(2, Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pwrite_batch_on_session(
+    session: &mut crate::uring_session::UringSession,
+    ops: &mut [WriteOp<'_>],
+    total_nonempty: usize,
+) -> bool {
+    let n = ops.len();
     let mut next = 0usize;
     let mut completed = 0usize;
 
@@ -335,10 +412,15 @@ fn page_rmw_pipelined_uring(
     pages: &mut [PageRmw<'_>],
     mut apply: impl FnMut(usize, &mut [u8]) -> bool,
 ) -> bool {
-    use crate::uring_session::UringSession;
-    let Ok(mut session) = UringSession::try_open(RING_ENTRIES) else {
-        return false;
-    };
+    with_bulk_session(|session| page_rmw_on_session(session, pages, &mut apply)).unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn page_rmw_on_session(
+    session: &mut crate::uring_session::UringSession,
+    pages: &mut [PageRmw<'_>],
+    apply: &mut dyn FnMut(usize, &mut [u8]) -> bool,
+) -> bool {
     let n = pages.len();
     // 0 = need read, 1 = read in flight, 2 = need write, 3 = write in flight, 4 = done
     let mut state = vec![0u8; n];
@@ -964,6 +1046,79 @@ mod tests {
         assert_eq!(got2[0], 11);
         assert_eq!(got2[50], 12);
         assert_eq!(got2[100], 13);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Multiple sequential waves on one thread reuse the TL ring and match
+    /// libc pread for identical ranges (batch identity under reuse).
+    #[test]
+    fn pread_batch_thread_local_reuse_matches_fallback() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-uring-tl-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("blob");
+        let data: Vec<u8> = (0u16..512).map(|i| (i % 251) as u8).collect();
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&data).unwrap();
+            f.flush().unwrap();
+        }
+        let f = std::fs::File::open(&path).unwrap();
+        let fd = f.as_raw_fd();
+
+        // Three waves — first opens TL ring; later waves must reuse it correctly.
+        for wave in 0..3u64 {
+            let base = (wave * 64) as usize;
+            let mut b0 = [0u8; 32];
+            let mut b1 = [0u8; 32];
+            let mut ops = [
+                ReadOp {
+                    fd,
+                    offset: base as u64,
+                    buf: &mut b0[..],
+                    result: i32::MIN,
+                },
+                ReadOp {
+                    fd,
+                    offset: (base + 32) as u64,
+                    buf: &mut b1[..],
+                    result: i32::MIN,
+                },
+            ];
+            pread_batch(&mut ops);
+            assert_eq!(ops[0].result, 32, "wave={wave}");
+            assert_eq!(ops[1].result, 32, "wave={wave}");
+            drop(ops);
+            assert_eq!(&b0[..], &data[base..base + 32], "wave={wave}");
+            assert_eq!(&b1[..], &data[base + 32..base + 64], "wave={wave}");
+
+            // Fallback path must agree (same bytes, independent of ring).
+            let mut c0 = [0u8; 32];
+            let mut c1 = [0u8; 32];
+            let mut fops = [
+                ReadOp {
+                    fd,
+                    offset: base as u64,
+                    buf: &mut c0[..],
+                    result: i32::MIN,
+                },
+                ReadOp {
+                    fd,
+                    offset: (base + 32) as u64,
+                    buf: &mut c1[..],
+                    result: i32::MIN,
+                },
+            ];
+            pread_batch_fallback(&mut fops);
+            assert_eq!(&c0[..], &b0[..]);
+            assert_eq!(&c1[..], &b1[..]);
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

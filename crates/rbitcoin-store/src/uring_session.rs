@@ -1,13 +1,15 @@
 //! Owned io_uring session — **the** ring abstraction for this crate.
 //!
 //! All production io_uring work goes through [`UringSession`]:
-//! - streaming archive head-resolve
+//! - streaming archive head-resolve (one session per resolve batch)
+//! - spend annotate abs-meta RMW (one session per annotate batch)
 //! - online `tx.head` shadow fill
-//! - [`crate::bulk_io`] pread/pwrite batches and page RMW
+//! - [`crate::bulk_io`] pread/pwrite batches and page RMW (thread-local reuse)
 //!
-//! A session is owned by one pipeline (or one `bulk_io` batch call) and must not
-//! be shared across concurrent call stacks. Nested `bulk_io` on the same thread
-//! creates a **separate** session for that call.
+//! A session must not be shared across concurrent call stacks. `bulk_io` keeps a
+//! **thread-local** session across waves; nested bulk_io on the same thread opens
+//! a temporary session for that call. Multi-stage pipelines (head-resolve, spend
+//! annotate) own one session for the duration of the batch.
 
 use crate::error::StoreError;
 use std::os::fd::RawFd;

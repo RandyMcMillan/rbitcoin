@@ -120,8 +120,10 @@ budgets: [`docs/ibd-memory.md`](./ibd-memory.md).
    `getdata` assignment — **not** peer TCP read/decode of already-requested
    blocks (see ibd-memory).
 5. **Bulk IO.** Linux prefers **io_uring** for multi-read / RMW paths (confirm
-   bodies, head resolve, `tx.head` resize fill); `RBITCOIN_IO_URING=0` falls
-   back to pread/pwrite workers.
+   bodies, head resolve, spend annotate, `tx.head` resize fill) with a
+   **thread-local** bulk ring for batch pread/pwrite; `RBITCOIN_IO_URING=0`
+   (or non-Linux) falls back to pread/pwrite workers. No separate IOCP/kqueue
+   backend — same API surface, modality only.
 
 ### Map growth
 

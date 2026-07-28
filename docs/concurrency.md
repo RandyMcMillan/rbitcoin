@@ -69,14 +69,41 @@ log lines). Spends no longer use a durable `point.head` (schema v5+).
 ### Confirm load + archive prep read pipelines
 
 Cold `tx.idx` / `tx.body` on the **prep** and **confirm-load** threads use a
-completion-driven **idx→body io_uring pipeline** (`idx_body_pipeline`):
+single **mmap idx + bulk body** path (`idx_body_pipeline` → `bulk_io`):
 
-- Idx CQE immediately arms the matching body pread (no full phase barrier).
+- **Idx:** sorted mmap `record_range_batch` on segmented u32-stride `tx.idx`
+  (no scatter pread / no io_uring for idx — multi-file segments make multi-fd
+  uring a worse dual path).
+- **Body:** `bulk_io::pread_batch` — Linux io_uring with a **thread-local**
+  `UringSession` reused across waves (no per-batch `io_uring_setup`); nested
+  bulk_io on the same thread opens a temporary ring. Prep and load each have
+  their own TL ring (role threads).
 - Sticky / OutFifo range hits skip idx; same-batch pin skips store.
-- Each invocation owns a short-lived `UringSession` (prep and load may run two rings).
-- Fallback: `RBITCOIN_IO_URING=0` or `RBITCOIN_IDX_BODY_PIPELINE=0` → mmap
-  `record_range_batch` + `bulk_io::pread_batch` body.
-- Dense sticky commit ranges stay sequential mmap (`record_ranges`) — not forced uring.
+- Fallback: `RBITCOIN_IO_URING=0` or non-Linux → libc `pread`/`pwrite` (optional
+  `RBITCOIN_BULK_IO_WORKERS` for parallel pread). Same API surface; callers do
+  not branch.
+- Dense sticky commit ranges stay sequential mmap (`record_ranges`).
+
+Multi-stage streaming loops (archive **head-resolve**, **spend annotate** abs-meta
+RMW, `tx.head` shadow fill) own **one** `UringSession` for the batch duration —
+not short-lived per CQE.
+
+### RAM-for-IO budgets (process-local, kill-safe)
+
+Caches avoid disk only; they never replace publish order / SEAL / tip-as-commit:
+
+| Cache | Default | Cap / knob | Avoids |
+|-------|---------|------------|--------|
+| Archive sticky (`txid→fk` + optional body range) | 8 M entries (~384 MiB planning) | `RBITCOIN_ARCHIVE_TXID_STICKY_CAP` clamp 100 k–20 M (≤~1 GiB-class) | `tx.head` probe + often `tx.idx` |
+| Confirm OutFifo (outs + slim meta) | 2²⁴ outs | `RBITCOIN_CONFIRM_OUT_FIFO` | re-decode Class A for pin hits |
+
+### Cross-platform bulk IO
+
+Linux keeps io_uring for high-depth pipelined body/annotate/head-fill. **No**
+Windows IOCP or macOS kqueue bulk backend: those completion models do not match
+Linux ring fill/harvest shape, would not make prep/load code paths more similar
+across platforms, and would risk a second maintenance surface without a measured
+Linux-safe win. Non-Linux uses the shared pread/pwrite batch API only.
 
 For **TB-scale store + Electrum on 16 GiB RAM**, the architectural plan (slim IBD,
 fat Electrum index, Class B redesign) is **[store-efficiency-plan.md](./store-efficiency-plan.md)**.

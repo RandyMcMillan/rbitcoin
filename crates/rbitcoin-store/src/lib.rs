@@ -72,8 +72,7 @@ pub use store::Store;
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};
 pub use head_resolve_stats::Sample as HeadResolveSample;
 pub use idx_body_pipeline::{
-    pipeline_enabled as idx_body_pipeline_enabled, run_idx_body_pipeline, BodyMode as IdxBodyMode,
-    IdxBodyJob,
+    run_idx_body_pipeline, BodyMode as IdxBodyMode, IdxBodyJob,
 };
 pub use tx_table::{
     clear_output_spender_fields, decode_packed_tx, decode_packed_tx_outs_with_spender_rels,

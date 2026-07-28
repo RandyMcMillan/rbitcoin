@@ -1,11 +1,13 @@
 //! **tx.idx → tx.body** pipeline for confirm load and archive head-resolve.
 //!
-//! Idx is resolved via sorted mmap [`VarTable::record_range_batch`] (segmented
-//! u32 stride files). Body bytes use io_uring / bulk pread. Jobs with a
-//! pre-known range skip idx.
+//! Single path: idx via sorted mmap [`VarTable::record_range_batch`] (segmented
+//! u32 stride files); body via [`crate::bulk_io::pread_batch`] (thread-local
+//! io_uring on Linux, pread fallback otherwise). Jobs with a pre-known range
+//! skip idx entirely — no dual mmap+scatter path for the same work.
 //!
-//! **Concurrency:** read-only on published ranges; safe for prep + load
-//! concurrent rings. Caller owns job buffers until the call returns.
+//! **Concurrency:** read-only on published ranges; prep + confirm-load may run
+//! concurrent waves (each thread's bulk_io TL ring). Caller owns job buffers
+//! until the call returns.
 
 use crate::bulk_io::{self, ReadOp};
 use crate::error::StoreError;
@@ -65,17 +67,6 @@ impl IdxBodyJob {
             return None;
         }
         Some(Self::new(id, range))
-    }
-}
-
-/// Env escape hatch retained for A-B; pipeline always uses mmap idx + bulk body.
-pub fn pipeline_enabled() -> bool {
-    match std::env::var("RBITCOIN_IDX_BODY_PIPELINE") {
-        Ok(s) => {
-            let s = s.to_ascii_lowercase();
-            s != "0" && s != "false" && s != "off"
-        }
-        Err(_) => true,
     }
 }
 
@@ -267,21 +258,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Pre-known ranges skip idx; remaining jobs still resolve + body-read.
+    /// Identity: pipeline body bytes match sequential `record_range` + decode.
     #[test]
-    fn pipeline_fallback_with_env_off() {
+    fn pipeline_preknown_range_skips_idx_identity() {
         let (dir, t) = temp_tx();
-        let fks = put_n(&t, 4);
-        let prev = std::env::var_os("RBITCOIN_IDX_BODY_PIPELINE");
-        std::env::set_var("RBITCOIN_IDX_BODY_PIPELINE", "0");
-        let mut jobs: Vec<IdxBodyJob> = fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
+        let fks = put_n(&t, 8);
+        let mut jobs: Vec<IdxBodyJob> = fks
+            .iter()
+            .enumerate()
+            .map(|(i, fk)| {
+                let range = if i % 2 == 0 {
+                    Some(t.body.record_range(*fk).unwrap())
+                } else {
+                    None
+                };
+                IdxBodyJob::new(fk.0, range)
+            })
+            .collect();
         run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Full).unwrap();
         for j in &jobs {
-            assert!(j.ok, "fallback id={}", j.id);
-            assert_eq!(j.range, Some(t.body.record_range(Fk(j.id)).unwrap()));
+            assert!(j.ok, "id={}", j.id);
+            let seq = t.body.record_range(Fk(j.id)).unwrap();
+            assert_eq!(j.range, Some(seq));
+            let (tx, _ins, outs, rels) =
+                decode_packed_tx_with_spender_rels(&j.body).unwrap();
+            assert_eq!(outs.len(), rels.len());
+            assert_eq!(tx.output_count as usize, outs.len());
         }
-        match prev {
-            Some(v) => std::env::set_var("RBITCOIN_IDX_BODY_PIPELINE", v),
-            None => std::env::remove_var("RBITCOIN_IDX_BODY_PIPELINE"),
+        // Second wave reuses bulk_io TL ring; results stable.
+        let mut jobs2: Vec<IdxBodyJob> =
+            fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
+        run_idx_body_pipeline(&t.body, &mut jobs2, BodyMode::Full).unwrap();
+        for (a, b) in jobs.iter().zip(jobs2.iter()) {
+            assert_eq!(a.range, b.range);
+            assert_eq!(a.body, b.body);
+            assert!(b.ok);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -299,6 +311,60 @@ mod tests {
         assert!(!jobs[0].ok);
         assert!(jobs[1].ok);
         assert!(!jobs[2].ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Synthetic confirm-load-style cold batch: N Class A txs, mixed pre-known
+    /// ranges, timed multi-wave idx+body. Prints wall µs for evidence capture.
+    #[test]
+    fn synthetic_cold_batch_timed_identity() {
+        use std::time::Instant;
+        let (dir, t) = temp_tx();
+        let fks = put_n(&t, 64);
+        // Wave 1: cold idx+body for all
+        let mut jobs: Vec<IdxBodyJob> =
+            fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
+        let t0 = Instant::now();
+        run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Full).unwrap();
+        let cold_us = t0.elapsed().as_micros();
+        assert_eq!(jobs.iter().filter(|j| j.ok).count(), fks.len());
+        let bodies: Vec<Vec<u8>> = jobs.iter().map(|j| j.body.clone()).collect();
+        let ranges: Vec<_> = jobs.iter().map(|j| j.range).collect();
+
+        // Wave 2: all ranges pre-known (skip idx) — confirm pin_new-ish path
+        let mut jobs2: Vec<IdxBodyJob> = fks
+            .iter()
+            .zip(ranges.iter())
+            .map(|(fk, r)| IdxBodyJob::new(fk.0, *r))
+            .collect();
+        let t1 = Instant::now();
+        run_idx_body_pipeline(&t.body, &mut jobs2, BodyMode::Full).unwrap();
+        let warm_us = t1.elapsed().as_micros();
+        for (i, j) in jobs2.iter().enumerate() {
+            assert!(j.ok, "i={i}");
+            assert_eq!(j.body, bodies[i]);
+            assert_eq!(j.range, ranges[i]);
+        }
+
+        // Wave 3: Prefix33 head-resolve style
+        let mut jobs3: Vec<IdxBodyJob> =
+            fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
+        let t2 = Instant::now();
+        run_idx_body_pipeline(&t.body, &mut jobs3, BodyMode::Prefix33).unwrap();
+        let prefix_us = t2.elapsed().as_micros();
+        for j in &jobs3 {
+            assert!(j.ok);
+            assert!(j.body.len() <= 32 && !j.body.is_empty());
+        }
+
+        eprintln!(
+            "synthetic_cold_batch: n={} cold_full={}us preknown_full={}us prefix33={}us uring={}",
+            fks.len(),
+            cold_us,
+            warm_us,
+            prefix_us,
+            crate::bulk_io::io_uring_enabled()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

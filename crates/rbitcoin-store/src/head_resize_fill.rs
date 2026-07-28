@@ -4,11 +4,9 @@
 //! the shadow; primary inserts stay on the live head.
 //!
 //! Ring protocol (one private ring per fill wave on the resize thread):
-//! - **≤1** `tx.idx` batch in flight (1024 fks); FK queue absorbs latency
+//! - Sync mmap `record_ranges` batches (1024 fks) when FK queue is low
 //! - **Many** body prefix (txid) preads drained from the queue
 //! - **Many** page RMWs in parallel; **≤1** RMW cycle per shadow page
-//! - When FK queue would drop below 256 and more fks remain, prefer one idx
-//!   refill over another body read
 
 use crate::address_head::{
     insert_fk_into_page_buf, page_base_for_txid, page_file_off, page_pread_len, page_slot_count,
@@ -16,7 +14,6 @@ use crate::address_head::{
 };
 use crate::bulk_io;
 use crate::error::StoreError;
-use crate::file::FILE_HEADER_LEN;
 use crate::tx_table::TxTable;
 use crate::var_table::VarTable;
 use rbitcoin_primitives::Fk;
@@ -24,13 +21,12 @@ use std::collections::{HashMap, VecDeque};
 
 /// Prefer starting an idx refill when the ready FK queue is below this.
 const FK_QUEUE_LOW: usize = 256;
-/// Fks covered by one `tx.idx` pread (plus optional next-start for lengths).
+/// Fks covered by one mmap `record_ranges` batch.
 const IDX_BATCH: u64 = 1024;
 const RING_ENTRIES: u32 = crate::uring_session::DEFAULT_ENTRIES;
 const BODY_POOL: usize = 512;
 const PAGE_POOL: usize = 256;
 
-const KIND_IDX: u64 = 1;
 const KIND_BODY: u64 = 2;
 const KIND_PAGE_RD: u64 = 3;
 const KIND_PAGE_WR: u64 = 0; // 0 so write bit space is clear; use 0b00 with slot
@@ -88,8 +84,8 @@ mod tests {
     fn shadow_fill_empty_range_and_pack_ud() {
         let (k, s) = unpack_ud(pack_ud(KIND_BODY, 7));
         assert_eq!((k, s), (KIND_BODY, 7));
-        let (k, s) = unpack_ud(pack_ud(KIND_IDX, 42));
-        assert_eq!((k, s), (KIND_IDX, 42));
+        let (k, s) = unpack_ud(pack_ud(KIND_PAGE_RD, 42));
+        assert_eq!((k, s), (KIND_PAGE_RD, 42));
 
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-hfill-range-{}",
@@ -158,12 +154,7 @@ fn run_linux(
 ) -> Result<(), StoreError> {
     use crate::uring_session::UringSession;
 
-    let (count_snap, body_end) = {
-        // Snapshot for length of last record in a batch.
-        let c = body.count();
-        let end = body.body_published_len().max(FILE_HEADER_LEN as u64);
-        (c, end)
-    };
+    let count_snap = body.count();
     if last > count_snap {
         return Err(StoreError::NotFound);
     }
@@ -177,10 +168,8 @@ fn run_linux(
         return Err(StoreError::Corrupt("shadow page size"));
     }
 
-    let idx_fd = body.idx_read_fd();
     let body_fd = body.body_read_fd();
     let head_fd = shadow.read_fd();
-    let idx_path = body.idx_file_path().to_path_buf();
     let body_path = body.body_file_path().to_path_buf();
     let head_path = shadow.path_str().to_path_buf();
 
@@ -194,13 +183,6 @@ fn run_linux(
     // --- pools ---
     let mut fk_queue: VecDeque<BodyWork> = VecDeque::with_capacity(IDX_BATCH as usize * 2);
     let mut page_wait: HashMap<u64, VecDeque<PendingIns>> = HashMap::new();
-
-    // idx: one slot
-    let mut idx_raw = vec![0u8; (IDX_BATCH as usize + 1) * 8];
-    let mut idx_in_flight = false;
-    let mut idx_batch_first = 0u64;
-    let mut idx_batch_last = 0u64;
-    let mut idx_need_next = false;
     let mut next_idx_fk = first;
 
     // body pool
@@ -244,38 +226,25 @@ fn run_linux(
                 break;
             }
 
-            // 1) idx: at most one, when queue is below low-water (strict <).
-            //    Prefer refill before body drain so the queue stays warm; never
-            //    block body submits when queue.len() >= FK_QUEUE_LOW (see body).
-            let need_idx = next_idx_fk <= last
-                && !idx_in_flight
-                && fk_queue.len() < FK_QUEUE_LOW;
+            // 1) idx: mmap record_ranges when queue is below low-water.
+            let need_idx = next_idx_fk <= last && fk_queue.len() < FK_QUEUE_LOW;
             if need_idx {
                 let bf = next_idx_fk;
                 let bl = (next_idx_fk + IDX_BATCH - 1).min(last);
-                let n = (bl - bf + 1) as usize;
-                let need_next = bl < count_snap;
-                let n_starts = n + usize::from(need_next);
-                let nbytes = n_starts * 8;
-                let idx_off = FILE_HEADER_LEN as u64 + (bf - 1) * 8;
-                idx_raw[..nbytes].fill(0);
-                session.push_pread(
-                    idx_fd,
-                    idx_off,
-                    &mut idx_raw[..nbytes],
-                    pack_ud(KIND_IDX, 0),
-                )?;
-                idx_in_flight = true;
-                idx_batch_first = bf;
-                idx_batch_last = bl;
-                idx_need_next = need_next;
+                let ranges = body.record_ranges(bf, bl)?;
+                for (i, &(start, len)) in ranges.iter().enumerate() {
+                    let fk = bf + i as u64;
+                    fk_queue.push_back(BodyWork {
+                        fk,
+                        body_off: start,
+                        body_len: len,
+                    });
+                }
+                next_idx_fk = bl + 1;
                 continue;
             }
 
             // 2) body reads: drain queue as far as ring/pool allow.
-            //    Do **not** refuse body submits when len == FK_QUEUE_LOW: need_idx
-            //    uses strict `<`, so `len == 256` + can-refill used to hit a dead
-            //    zone (no idx, no body) → "stalled with no in-flight IO".
             let mut submitted_body = false;
             while !fk_queue.is_empty()
                 && !body_free.is_empty()
@@ -373,48 +342,6 @@ fn run_linux(
 
         for (ud, res) in cqes {
             let (kind, slot) = unpack_ud(ud);
-
-            if kind == KIND_IDX {
-                idx_in_flight = false;
-                if res < 0 {
-                    return Err(StoreError::io(
-                        &idx_path,
-                        std::io::Error::from_raw_os_error(-res),
-                    ));
-                }
-                let bf = idx_batch_first;
-                let bl = idx_batch_last;
-                let n = (bl - bf + 1) as usize;
-                let n_starts = n + usize::from(idx_need_next);
-                let need = (n_starts * 8) as i32;
-                if res < need {
-                    return Err(StoreError::Corrupt("idx batch pread short"));
-                }
-                let mut starts = Vec::with_capacity(n_starts);
-                for i in 0..n_starts {
-                    let s = i * 8;
-                    starts.push(u64::from_le_bytes(idx_raw[s..s + 8].try_into().unwrap()));
-                }
-                for i in 0..n {
-                    let start = starts[i];
-                    let end = if i + 1 < starts.len() {
-                        starts[i + 1]
-                    } else {
-                        body_end
-                    };
-                    if end < start {
-                        return Err(StoreError::Corrupt("var record end < start"));
-                    }
-                    let fk = bf + i as u64;
-                    fk_queue.push_back(BodyWork {
-                        fk,
-                        body_off: start,
-                        body_len: end - start,
-                    });
-                }
-                next_idx_fk = bl + 1;
-                continue;
-            }
 
             if kind == KIND_BODY {
                 body_in_flight = body_in_flight.saturating_sub(1);

@@ -30,6 +30,7 @@ mod scripthash_layout;
 mod sharded_hashhead;
 mod sorted_run;
 mod store;
+mod tx_idx;
 mod tx_table;
 mod var_table;
 

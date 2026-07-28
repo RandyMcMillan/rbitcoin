@@ -13,7 +13,7 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **11** | Txid-first packed body (no `0x01` magic); 8-byte align + page non-straddle; trailing zero pad | **Current** |
+| **11** | Txid-first packed body; 8-byte align + page rule; segmented u32 stride `tx.idx.*` | **Current** |
 | **10** | Packed inputs: `create_fk:u64` + vout (not `prev_txid[32]`); online `tx.head` resize; default BITS=28 | Prior packed layout |
 | **9** | Keyless `tx.head` 4 B entries (no HAS_NEXT); `tx_height` u32 slots | `tx.head` layout family (evolved) |
 | **8** | Keyless `tx.head` 8 B (fk + HAS_NEXT); `tx_height` u64 | Superseded by v9 packing |
@@ -35,8 +35,9 @@ See [`SCHEMA.md`](./SCHEMA.md).
 - Record starts are **8-byte aligned**; a 32-byte txid **must not cross a 4 KiB page** (`S % 4096 ≤ 4064`).
 - Writer **zero-pads** between records so the next start meets alignment; pad is included in the previous record’s idx span; decode accepts **trailing zeros** only.
 - Thin `body_txid` / head-resolve prefixes are **32 B at `S`** (was 33 B magic+txid).
-- **Wipe datadir from v10** (packed payload layout incompatible).
-- `tx.head` algorithm unchanged (still page-then-open keyless); see design notes in session plan / this history for page-cost rationale.
+- Replace single-file **u64 absolute** `tx.idx` with **segmented u32 stride-8** files (`tx.idx.meta` + `tx.idx.NNNNNN`) — ~50% smaller idx (~4 B/tx).
+- **Wipe datadir from v10** (packed payload + idx layout incompatible).
+- `tx.head` algorithm unchanged (still page-then-open keyless). Keyless lookups always walk unsuccessful probe depth then reverse body-check candidates; page-then-open costs **1+C** cold pages vs **U+C** for plain open (~1.7–1.9× worse for open at α=0.70–0.90).
 
 ---
 

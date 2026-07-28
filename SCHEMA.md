@@ -28,7 +28,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
   store/
     meta                         # store magic + schema version
     header.body / header.head    # Class A headers + hash index
-    tx.body / tx.idx / tx.head   # Class A txs + address head (layout in footer)
+    tx.body / tx.idx.meta / tx.idx.NNNNNN / tx.head  # Class A + segmented idx + address head
     tx.head.resize / tx.head.new # online head rebuild (transient)
     spenders.body                # multi-spender list nodes only
     confirmed.body               # Class C: height → header_fk
@@ -54,7 +54,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — **10** |
+| 4 | 2 | Schema version (u16) — **11** |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 
@@ -143,6 +143,31 @@ Decode walks meta + runs to a logical end; any remaining bytes in the idx span m
 
 **TxRecord (64 B):** txid, version, locktime, `input_start_fk`, `input_count`, `output_start_fk`, `output_count`.  
 On packed rows, `input_start_fk` / `output_start_fk` are always null (layout reserved; I/O lives in the same payload).
+
+### Segmented body index (`tx.idx.*`)
+
+```text
+tx.idx.meta                 # segment map
+tx.idx.000000               # dense u32 LE stride units
+tx.idx.000001
+…
+```
+
+Each segment covers a contiguous create_fk range with a fixed **8-aligned** `body_base`:
+
+```text
+abs_start = body_base + (u32_le[i] as u64) * 8
+i = fk - first_fk
+```
+
+| Segment field | Meaning |
+|---------------|---------|
+| `first_fk` | 1-based inclusive start of the range |
+| `count` | number of u32 slots in the segment file |
+| `body_base` | absolute body base (8-aligned) for relatives |
+| `file_id` | maps to `tx.idx.{file_id:06}` |
+
+Hard span per segment: `2^32 × 8` ≈ 32 GiB. Soft rollover earlier (default 16 GiB; `RBITCOIN_TX_IDX_SOFT_SPAN`). Length: `start(fk+1) − start(fk)` (may cross segments); last record uses published body end. ~**4 B/tx** vs prior 8 B absolute u64 index (~50% smaller).
 
 ### Input encoding (embedded)
 

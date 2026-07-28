@@ -6,15 +6,19 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 | Role | Threading | Store writes |
 |------|-----------|--------------|
-| Peer IO (N tasks) | tokio multi-thread | none (wire only) |
-| Archive **prep** | 1 tokio task | **none** (CPU encode only) |
-| Archive **writer** | 1 OS thread (`ibd-archive-writer`) | **Class A exclusive**: header body/head, tx body/idx/head, in/out runs; optional points when spend_index on |
-| Confirm **load** | 1 OS thread (`ibd-confirm-load`) | none (reads Class A / parent cache; pin parents) |
-| Confirm **scripts** | 1 OS thread (`ibd-confirm`) | **none** — pure CPU on `LoadedBatch` (rayon script verify only; **no store / Query reads or writes**) |
-| Confirm **write** | 1 OS thread (`ibd-confirm-write`) | **structural** spentness/maturity/subsidy, then **Class C** (`strong_tx` / `tx_height` / SH creates / `confirmed[]`), then spend annotate (Direct). FIFO by height |
+| Peer IO (N tasks) | tokio multi-thread | none (wire only); decoded bodies land on **durable `block_queue/`** |
+| Combined **load** (prep+confirm load) | 1 OS/thread stage | **none** — decode creates once, pin parents once via unified **CreateResidency** (`load_creates_once`) |
+| Confirm **scripts** | 1 OS thread | **none** — pure CPU (rayon); no store |
+| Combined **write** (archive+confirm write) | 1 OS thread | **Class A exclusive** then Class C / spend annotate; sole Class A appender + sole spend annotator |
 | IBD main loop | 1 tokio task | none (orchestration only) |
 
-Prep never holds store write locks. The writer is the sole Class A producer for a process during IBD; multi-peer delivery is idempotent (`header_txs` body already present → skip re-append).
+Legacy dual sticky + OutFifo paths remain for tip/Electrum compatibility during migration; the **combined** path uses one residency map so archive stamp and confirm pin do not each re-fetch the same parent body.
+
+**Durable queue:** `store/block_queue/` multi‑GiB payload FIFO (`RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`, default 8 GiB). Dequeue only after combined confirm-write (or permanent reject). Restart reopens without re-download.
+
+**tx.head overflow:** depth-exhausted inserts go to `tx.head.overflow` (probe overflow first, then primary) so the write path does not stall for multi‑GiB primary rehash.
+
+**Datadir secret (schema 12):** `store/store.secret` CSPRNG at create. XOR scriptSig / witness / scriptPubKey at rest; `SHA256(secret||txid)` mixes head probe keys.
 
 ## Roles after IBD / tip follow
 

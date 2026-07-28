@@ -16,6 +16,8 @@ bitcoin_hashes = { workspace = true }
 libc = "0.2"
 # Bulk pread submission for head-resolve / confirm body load (Linux).
 io-uring = "0.7"
+# Datadir store.secret CSPRNG.
+getrandom = "0.2"
 
 [[bench]]
 name = "spend_batch"

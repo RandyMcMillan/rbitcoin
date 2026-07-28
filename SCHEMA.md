@@ -1,6 +1,6 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 11` (`rbitcoin_primitives`).  
+**Version:** `SCHEMA_VERSION = 12` (`rbitcoin_primitives`).  
 **Status:** unstable until 1.0 — incompatible layout changes are reindex-only (wipe store / redo IBD).  
 **Endianness:** little-endian for all multi-byte integers.
 

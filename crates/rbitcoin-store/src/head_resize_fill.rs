@@ -46,11 +46,14 @@ struct PendingIns {
 
 /// Fill shadow for Class A ids `first..=last` via io_uring RMW (no shadow mmap touch).
 ///
+/// `secret` mixes body txids into open-hash probe keys (same as live inserts).
+///
 /// Returns `Err` if io_uring is unavailable or a hard IO/protocol error occurs;
 /// caller may fall back to mmap `insert_many`.
 pub fn run_shadow_fill_uring(
     body: &VarTable,
     shadow: &AddressHead,
+    secret: &crate::store_secret::StoreSecret,
     first: u64,
     last: u64,
 ) -> Result<(), StoreError> {
@@ -62,11 +65,11 @@ pub fn run_shadow_fill_uring(
     }
     #[cfg(target_os = "linux")]
     {
-        run_linux(body, shadow, first, last)
+        run_linux(body, shadow, secret, first, last)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (body, shadow, first, last);
+        let _ = (body, shadow, secret, first, last);
         Err(StoreError::Corrupt("io_uring shadow fill is Linux-only"))
     }
 }
@@ -102,12 +105,13 @@ mod tests {
             HeadLayout::new(12).unwrap(),
         )
         .unwrap();
+        let secret = crate::store_secret::StoreSecret::from_bytes([0x5Au8; 32]);
         // last < first always Ok
-        assert!(run_shadow_fill_uring(&body, &shadow, 5, 4).is_ok());
+        assert!(run_shadow_fill_uring(&body, &shadow, &secret, 5, 4).is_ok());
 
         if !bulk_io::io_uring_enabled() {
             // empty body + range → unavailable / not found
-            assert!(run_shadow_fill_uring(&body, &shadow, 1, 1).is_err());
+            assert!(run_shadow_fill_uring(&body, &shadow, &secret, 1, 1).is_err());
             let _ = std::fs::remove_dir_all(&dir);
             return;
         }
@@ -135,10 +139,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(body.count(), N);
-        run_shadow_fill_uring(&body, &shadow, 1, N).unwrap();
+        run_shadow_fill_uring(&body, &shadow, &secret, 1, N).unwrap();
         assert_eq!(shadow.occupied(), N);
         assert!(matches!(
-            run_shadow_fill_uring(&body, &shadow, 1, N + 50),
+            run_shadow_fill_uring(&body, &shadow, &secret, 1, N + 50),
             Err(StoreError::NotFound)
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -149,6 +153,7 @@ mod tests {
 fn run_linux(
     body: &VarTable,
     shadow: &AddressHead,
+    secret: &crate::store_secret::StoreSecret,
     first: u64,
     last: u64,
 ) -> Result<(), StoreError> {
@@ -359,8 +364,10 @@ fn run_linux(
                     body_free.push(slot);
                     return Err(StoreError::Corrupt("body txid pread short"));
                 }
-                let txid = TxTable::txid_from_body_prefix(&body_bufs[slot][..want])?;
+                let raw_txid = TxTable::txid_from_body_prefix(&body_bufs[slot][..want])?;
                 body_free.push(slot);
+                // Keyed head probes (same mix as live insert path).
+                let txid = secret.mix_txid(&raw_txid);
 
                 let pb = page_base_for_txid(&txid, bits);
                 let ins = PendingIns {

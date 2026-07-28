@@ -6,17 +6,20 @@
 
 mod address_head;
 mod array_table;
+mod block_queue;
 mod bulk_io;
 mod chain;
 mod compact;
 mod epoch;
 mod error;
 mod file;
+mod head_overflow;
 mod head_resize_fill;
 mod head_resolve_stream;
 pub mod head_resolve_stats;
 mod idx_body_pipeline;
 mod spend_annotate_uring;
+mod store_secret;
 mod uring_session;
 mod ibd_io_policy;
 mod hashhead;
@@ -70,15 +73,21 @@ pub use sorted_run::{
 };
 pub use store::Store;
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};
+pub use block_queue::{
+    BlockQueue, QueuedBlock, DEFAULT_BLOCK_QUEUE_BUDGET_BYTES,
+};
+pub use head_overflow::{HeadOverflow, DEFAULT_OVERFLOW_SLOTS};
+pub use store_secret::{StoreSecret, SECRET_FILE, SECRET_LEN};
 pub use head_resolve_stats::Sample as HeadResolveSample;
 pub use idx_body_pipeline::{
     run_idx_body_pipeline, BodyMode as IdxBodyMode, IdxBodyJob,
 };
 pub use tx_table::{
     clear_output_spender_fields, decode_packed_tx, decode_packed_tx_outs_with_spender_rels,
-    decode_packed_tx_with_spender_rels, encode_packed_tx, is_packed_tx_payload,
-    scan_packed_meta_and_prevouts, InputRecord, OutputRecord, TxRecord, BODY_PAGE_SIZE,
-    TXID_PAGE_MAX_OFF, next_tx_body_start,
+    decode_packed_tx_outs_with_spender_rels_secret, decode_packed_tx_with_spender_rels,
+    decode_packed_tx_with_spender_rels_secret, encode_packed_tx, encode_packed_tx_with_secret,
+    is_packed_tx_payload, scan_packed_meta_and_prevouts, InputRecord, OutputRecord, TxRecord,
+    BODY_PAGE_SIZE, TXID_PAGE_MAX_OFF, next_tx_body_start,
 };
 
 /// Crate identity for diagnostics and coverage scenarios.

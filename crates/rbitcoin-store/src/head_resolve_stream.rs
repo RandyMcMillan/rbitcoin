@@ -234,7 +234,37 @@ fn arm_keys(
         let slot = free_slots.pop().unwrap();
 
         let t_probe = Instant::now();
-        let raw = table.head.read().unwrap().probe_fks(&txids[key_i])?;
+        // Keyed probe: mix with datadir secret (never raw txid prefixes).
+        let mixed = table.secret.mix_txid(&txids[key_i]);
+        // Overflow-first (depth-exhausted inserts while primary resizes).
+        if let Some(fk) = table.overflow.lock().unwrap().get(&mixed) {
+            *probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
+            *cands_total = cands_total.saturating_add(1);
+            slots[slot] = Some(KeyWork {
+                key_i: key_i as u32,
+                cands: vec![fk.0],
+                cand_i: 0,
+                buf: [0u8; 32],
+                buf_len: 0,
+                pending_fk: 0,
+            });
+            let submitted = {
+                let w = slots[slot].as_mut().unwrap();
+                try_submit_body(
+                    table, w, session, body_fd, body_pub, count, slot as u32, idx_ns,
+                )?
+            };
+            if submitted {
+                *in_flight_keys += 1;
+            } else {
+                slots[slot] = None;
+                free_slots.push(slot);
+                done[key_i] = true;
+                results[key_i] = None;
+            }
+            continue;
+        }
+        let raw = table.head.read().unwrap().probe_fks(&mixed)?;
         *probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
         *cands_total = cands_total.saturating_add(raw.len() as u64);
         let cands: Vec<u64> = raw.into_iter().rev().map(|f| f.0).collect();

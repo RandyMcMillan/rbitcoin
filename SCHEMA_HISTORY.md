@@ -13,7 +13,8 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **11** | Txid-first packed body; 8-byte align + page rule; segmented u32 stride `tx.idx.*` | **Current** |
+| **12** | Datadir `store.secret`; script/witness XOR at rest; keyed `tx.head` mix; head overflow; durable `block_queue/` | **Current** |
+| **11** | Txid-first packed body; 8-byte align + page rule; segmented u32 stride `tx.idx.*` | Prior |
 | **10** | Packed inputs: `create_fk:u64` + vout (not `prev_txid[32]`); online `tx.head` resize; default BITS=28 | Prior packed layout |
 | **9** | Keyless `tx.head` 4 B entries (no HAS_NEXT); `tx_height` u32 slots | `tx.head` layout family (evolved) |
 | **8** | Keyless `tx.head` 8 B (fk + HAS_NEXT); `tx_height` u64 | Superseded by v9 packing |
@@ -25,9 +26,20 @@ Versions below are listed **newest → oldest** after the summary table.
 
 ---
 
-## v11 (current)
+## v12 (current)
 
 See [`SCHEMA.md`](./SCHEMA.md).
+
+**Relative to v11:**
+
+- **`store/store.secret`** (32 B CSPRNG) on datadir create; required on open.
+- Class A **scriptSig / witness / scriptPubKey** XOR-obfuscated on disk (amounts/txids clear).
+- **`tx.head` probe keys** = `SHA256(secret || txid)` (not raw prefixes).
+- **`tx.head.overflow`** sidecar for depth-exhausted inserts (overflow-first lookup).
+- Durable **`block_queue/`** for IBD payloads (dequeue after confirm-write).
+- **Wipe datadir from v11** (secret + mixed head keys + XOR incompatible).
+
+## v11
 
 **Relative to v10:**
 

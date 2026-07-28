@@ -174,9 +174,18 @@ impl OutputRecord {
 }
 
 /// Encode a per-tx output run (concat of compact outputs; count lives on TxRecord).
-pub fn encode_output_run(recs: &[OutputRecord], out: &mut Vec<u8>) {
+fn encode_output_run_secret(
+    recs: &[OutputRecord],
+    out: &mut Vec<u8>,
+    secret: Option<&crate::store_secret::StoreSecret>,
+) {
     for r in recs {
+        let start = out.len();
         r.encode_into(out);
+        if let Some(sec) = secret {
+            // XOR only the scriptPubKey payload bytes (after spender/flags/value/len).
+            xor_script_region_in_output(out, start, sec);
+        }
     }
 }
 
@@ -459,10 +468,114 @@ impl InputRecord {
 }
 
 /// Encode a per-tx input run (concat of compact inputs; count lives on TxRecord).
-pub fn encode_input_run(recs: &[InputRecord], out: &mut Vec<u8>) {
+fn encode_input_run_secret(
+    recs: &[InputRecord],
+    out: &mut Vec<u8>,
+    secret: Option<&crate::store_secret::StoreSecret>,
+) {
     for r in recs {
+        let start = out.len();
         r.encode_into(out);
+        if let Some(sec) = secret {
+            xor_script_regions_in_input(out, start, sec);
+        }
     }
+}
+
+/// XOR script_sig + witness item bytes inside an already-encoded input record.
+fn xor_script_regions_in_input(
+    buf: &mut [u8],
+    start: usize,
+    secret: &crate::store_secret::StoreSecret,
+) {
+    if start >= buf.len() {
+        return;
+    }
+    let flags = buf[start];
+    let mut off = start + 1;
+    let null_prev = flags & input_flags::NULL_PREV != 0;
+    if !null_prev {
+        if off + 8 > buf.len() {
+            return;
+        }
+        off += 8;
+        // compact size vout
+        let Ok((vout, n)) = read_compact_size(&buf[off..]) else {
+            return;
+        };
+        let _ = vout;
+        off += n;
+    }
+    if flags & input_flags::SEQ_FINAL == 0 {
+        off += 4;
+    }
+    if flags & input_flags::EMPTY_SCRIPT == 0 {
+        let Ok((slen, n)) = read_compact_size(&buf[off..]) else {
+            return;
+        };
+        off += n;
+        let slen = slen as usize;
+        if off + slen > buf.len() {
+            return;
+        }
+        secret.xor_bytes(0, &mut buf[off..off + slen]);
+        off += slen;
+    }
+    if flags & input_flags::EMPTY_WITNESS == 0 {
+        let Ok((nw, n)) = read_compact_size(&buf[off..]) else {
+            return;
+        };
+        off += n;
+        for wi in 0..nw {
+            let Ok((ilen, n)) = read_compact_size(&buf[off..]) else {
+                return;
+            };
+            off += n;
+            let ilen = ilen as usize;
+            if off + ilen > buf.len() {
+                return;
+            }
+            secret.xor_bytes(u64::from(wi as u32).saturating_add(1) << 16, &mut buf[off..off + ilen]);
+            off += ilen;
+        }
+    }
+}
+
+/// XOR scriptPubKey bytes inside an already-encoded output record.
+fn xor_script_region_in_output(
+    buf: &mut [u8],
+    start: usize,
+    secret: &crate::store_secret::StoreSecret,
+) {
+    if start + 9 > buf.len() {
+        return;
+    }
+    // spender u64 + flags u8
+    let flags = buf[start + 8];
+    let mut off = start + 9;
+    // uleb128 value
+    loop {
+        if off >= buf.len() {
+            return;
+        }
+        let b = buf[off];
+        off += 1;
+        if b & 0x80 == 0 {
+            break;
+        }
+    }
+    if flags & (output_flags::EMPTY_SCRIPT | output_flags::OP_TRUE) != 0 {
+        return;
+    }
+    let Ok((slen, n)) = read_compact_size(&buf[off..]) else {
+        return;
+    };
+    off += n;
+    let slen = slen as usize;
+    if off + slen > buf.len() {
+        return;
+    }
+    secret.xor_bytes(0, &mut buf[off..off + slen]);
 }
 
 #[cfg(test)]
@@ -509,11 +622,24 @@ pub fn next_tx_body_start(cursor: u64) -> u64 {
 /// Encode a full Class A tx as one var payload (schema 11+: no leading magic).
 ///
 /// Layout: `TxRecord(64) || input_run || output_run` — txid at bytes [0, 32).
+/// Without a secret, scripts/witness are stored in the clear (tests / temp).
+/// Production put paths use [`encode_packed_tx_with_secret`].
 pub fn encode_packed_tx(
     tx: &TxRecord,
     inputs: &[InputRecord],
     outputs: &[OutputRecord],
     out: &mut Vec<u8>,
+) {
+    encode_packed_tx_with_secret(tx, inputs, outputs, out, None);
+}
+
+/// Encode with optional at-rest XOR of scriptSig / witness / scriptPubKey.
+pub fn encode_packed_tx_with_secret(
+    tx: &TxRecord,
+    inputs: &[InputRecord],
+    outputs: &[OutputRecord],
+    out: &mut Vec<u8>,
+    secret: Option<&crate::store_secret::StoreSecret>,
 ) {
     debug_assert_eq!(inputs.len() as u32, tx.input_count);
     debug_assert_eq!(outputs.len() as u32, tx.output_count);
@@ -522,8 +648,8 @@ pub fn encode_packed_tx(
     meta.input_start_fk = Fk::NULL;
     meta.output_start_fk = Fk::NULL;
     meta.encode_into(out);
-    encode_input_run(inputs, out);
-    encode_output_run(outputs, out);
+    encode_input_run_secret(inputs, out, secret);
+    encode_output_run_secret(outputs, out, secret);
 }
 
 /// After walking a packed payload to `logical_end`, accept only zero pad to `raw.len()`.
@@ -554,12 +680,20 @@ pub fn decode_packed_tx(
 pub fn decode_packed_tx_with_spender_rels(
     raw: &[u8],
 ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>), StoreError> {
+    decode_packed_tx_with_spender_rels_secret(raw, None)
+}
+
+/// Decode with optional de-obfuscation of script/witness (schema 12 production).
+pub fn decode_packed_tx_with_spender_rels_secret(
+    raw: &[u8],
+    secret: Option<&crate::store_secret::StoreSecret>,
+) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>), StoreError> {
     if raw.len() < TxRecord::ENCODED_LEN {
         return Err(StoreError::Corrupt("short packed Class A tx"));
     }
     let meta = TxRecord::decode(&raw[..TxRecord::ENCODED_LEN])?;
     let mut off = TxRecord::ENCODED_LEN;
-    let (inputs, in_used) = decode_input_run_prefix(&raw[off..], meta.input_count)?;
+    let (mut inputs, in_used) = decode_input_run_prefix(&raw[off..], meta.input_count)?;
     off += in_used;
     let n_out = meta.output_count as usize;
     let mut outputs = Vec::with_capacity(n_out);
@@ -576,10 +710,87 @@ pub fn decode_packed_tx_with_spender_rels(
         outputs.push(rec);
     }
     check_trailing_zero_pad(raw, off)?;
+    // De-obfuscate by re-encoding layout walk is unnecessary: scripts were
+    // XOR'd only when stored as raw payload (not OP_TRUE / empty flags). Apply
+    // the same in-buffer XOR walk to a mutable copy of script bytes only when
+    // the decode path materialised them from disk payload lengths.
+    if let Some(sec) = secret {
+        deobfuscate_decoded_inputs_outputs(&mut inputs, &mut outputs, sec, raw, meta.input_count);
+    }
     if inputs.len() as u32 != meta.input_count || outputs.len() as u32 != meta.output_count {
         return Err(StoreError::Corrupt("packed Class A count mismatch"));
     }
     Ok((meta, inputs, outputs, spender_rels))
+}
+
+/// De-XOR scripts/witness that were stored as opaque payloads (skip OP_TRUE / empty).
+fn deobfuscate_decoded_inputs_outputs(
+    inputs: &mut [InputRecord],
+    outputs: &mut [OutputRecord],
+    secret: &crate::store_secret::StoreSecret,
+    raw: &[u8],
+    input_count: u32,
+) {
+    // Walk raw layout to know which scripts were on-disk payloads.
+    if raw.len() < TxRecord::ENCODED_LEN {
+        return;
+    }
+    let mut off = TxRecord::ENCODED_LEN;
+    for i in 0..input_count as usize {
+        if off >= raw.len() || i >= inputs.len() {
+            return;
+        }
+        let start = off;
+        let flags = raw[off];
+        off += 1;
+        if flags & input_flags::NULL_PREV == 0 {
+            off += 8;
+            if let Ok((_, n)) = read_compact_size(&raw[off..]) {
+                off += n;
+            } else {
+                return;
+            }
+        }
+        if flags & input_flags::SEQ_FINAL == 0 {
+            off += 4;
+        }
+        if flags & input_flags::EMPTY_SCRIPT == 0 {
+            if let Ok((slen, n)) = read_compact_size(&raw[off..]) {
+                off += n + slen as usize;
+                secret.xor_bytes(0, &mut inputs[i].script_sig);
+            } else {
+                return;
+            }
+        }
+        if flags & input_flags::EMPTY_WITNESS == 0 {
+            if let Ok((nw, n)) = read_compact_size(&raw[off..]) {
+                off += n;
+                for wi in 0..nw as usize {
+                    if let Ok((ilen, n)) = read_compact_size(&raw[off..]) {
+                        off += n + ilen as usize;
+                        if wi < inputs[i].witness.len() {
+                            secret.xor_bytes(
+                                u64::from(wi as u32).saturating_add(1) << 16,
+                                &mut inputs[i].witness[wi],
+                            );
+                        }
+                    } else {
+                        return;
+                    }
+                }
+            } else {
+                return;
+            }
+        }
+        let _ = start;
+    }
+    for o in outputs.iter_mut() {
+        // Only de-xor non-empty, non-OP_TRUE scripts (those had payload on disk).
+        if o.script.is_empty() || o.script == [0x51] {
+            continue;
+        }
+        secret.xor_bytes(0, &mut o.script);
+    }
 }
 
 /// Packed meta + input create edges only (skip scripts, witnesses, and outputs).
@@ -616,6 +827,13 @@ pub fn decode_packed_tx_outs_only(
 pub fn decode_packed_tx_outs_with_spender_rels(
     raw: &[u8],
 ) -> Result<(TxRecord, Vec<OutputRecord>, Vec<u32>), StoreError> {
+    decode_packed_tx_outs_with_spender_rels_secret(raw, None)
+}
+
+pub fn decode_packed_tx_outs_with_spender_rels_secret(
+    raw: &[u8],
+    secret: Option<&crate::store_secret::StoreSecret>,
+) -> Result<(TxRecord, Vec<OutputRecord>, Vec<u32>), StoreError> {
     if raw.len() < TxRecord::ENCODED_LEN {
         return Err(StoreError::Corrupt("short packed Class A tx"));
     }
@@ -638,6 +856,14 @@ pub fn decode_packed_tx_outs_with_spender_rels(
         rec.spender_field = Fk::NULL;
         rec.multi_spender = false;
         outputs.push(rec);
+    }
+    if let Some(sec) = secret {
+        for o in &mut outputs {
+            if o.script.is_empty() || o.script == [0x51] {
+                continue;
+            }
+            sec.xor_bytes(0, &mut o.script);
+        }
     }
     check_trailing_zero_pad(raw, off)?;
     if outputs.len() as u32 != meta.output_count {
@@ -722,6 +948,10 @@ pub struct TxTable {
     pub(crate) head: RwLock<AddressHead>,
     /// Directory containing `tx.head` (for rename / control paths).
     head_path: PathBuf,
+    /// Datadir secret: keyed head probes + script XOR (schema 12+).
+    pub(crate) secret: crate::store_secret::StoreSecret,
+    /// Depth-exhausted inserts while primary resizes (overflow-first lookup).
+    pub(crate) overflow: Mutex<crate::head_overflow::HeadOverflow>,
     resize: Mutex<Option<HeadResize>>,
     /// True from resize start until swap completes (or abandoned). Survives brief
     /// windows where `resize` Mutex holds `None` while closing the shadow Arc.
@@ -768,10 +998,14 @@ impl TxTable {
     /// process-global `RBITCOIN_TX_HEAD_BITS` / `RBITCOIN_HEAD_SCALE`.
     pub fn create_with_head_layout(dir: &Path, layout: HeadLayout) -> Result<Self, StoreError> {
         let head_path = dir.join("tx.head");
+        let secret = crate::store_secret::StoreSecret::load_or_create(dir, true)?;
+        let overflow = crate::head_overflow::HeadOverflow::create(dir)?;
         Ok(Self {
             body: VarTable::create(dir, "tx", TableKind::Tx)?,
             head: RwLock::new(AddressHead::create_with_layout(&head_path, layout)?),
             head_path,
+            secret,
+            overflow: Mutex::new(overflow),
             resize: Mutex::new(None),
             resize_active: AtomicBool::new(false),
             resize_bg: Mutex::new(None),
@@ -817,10 +1051,14 @@ impl TxTable {
                 }
             }
         };
+        let secret = crate::store_secret::StoreSecret::load_or_create(dir, true)?;
+        let overflow = crate::head_overflow::HeadOverflow::open(dir)?;
         let t = Self {
             body,
             head: RwLock::new(head),
             head_path,
+            secret,
+            overflow: Mutex::new(overflow),
             resize: Mutex::new(None),
             resize_active: AtomicBool::new(false),
             resize_bg: Mutex::new(None),
@@ -1087,7 +1325,8 @@ impl TxTable {
 
     pub fn get(&self, fk: Fk) -> Result<TxRecord, StoreError> {
         let raw = self.body.get_raw(fk)?;
-        let (tx, _, _) = decode_packed_tx(&raw)?;
+        let (tx, _, _, _) =
+            decode_packed_tx_with_spender_rels_secret(&raw, Some(&self.secret))?;
         Ok(tx)
     }
 
@@ -1250,8 +1489,15 @@ impl TxTable {
     /// the newest Class A create is preferred (BIP30-shaped duplicates).
     pub fn get_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
         use std::time::Instant;
+        let mixed = self.secret.mix_txid(txid);
+        // Depth-first: overflow (depth-exhausted inserts) then primary head.
+        if let Some(fk) = self.overflow.lock().unwrap().get(&mixed) {
+            if self.body_txid(fk)? == *txid {
+                return Ok(Some(fk));
+            }
+        }
         let t_probe = Instant::now();
-        let cands = self.head.read().unwrap().probe_fks(txid)?;
+        let cands = self.head.read().unwrap().probe_fks(&mixed)?;
         crate::head_resolve_stats::add_probe(t_probe.elapsed().as_nanos() as u64);
         crate::head_resolve_stats::add_keys(1);
         crate::head_resolve_stats::add_cands(cands.len() as u64);
@@ -1261,6 +1507,16 @@ impl TxTable {
             }
         }
         Ok(None)
+    }
+
+    /// Mix txid for head probe keys (tests / diagnostics).
+    pub fn mix_txid_for_head(&self, txid: &[u8; 32]) -> [u8; 32] {
+        self.secret.mix_txid(txid)
+    }
+
+    /// Store secret (script XOR / head mix).
+    pub fn store_secret(&self) -> &crate::store_secret::StoreSecret {
+        &self.secret
     }
 
     /// Batch head resolve (archive prep bulk path).
@@ -1304,14 +1560,21 @@ impl TxTable {
         }
         crate::head_resolve_stats::add_keys(txids.len() as u64);
 
-        // --- Phase 1: mmap probe ---
+        // --- Phase 1: mmap probe (mixed keys; overflow-first) ---
         let t_probe = Instant::now();
         let mut cands_by_key: Vec<Vec<(u32, u64)>> = vec![Vec::new(); txids.len()];
         let mut cands_total = 0u64;
         {
             let head = self.head.read().unwrap();
+            let ov = self.overflow.lock().unwrap();
             for (i, txid) in txids.iter().enumerate() {
-                let cands = head.probe_fks(txid)?;
+                let mixed = self.secret.mix_txid(txid);
+                if let Some(fk) = ov.get(&mixed) {
+                    cands_by_key[i].push((0, fk.0));
+                    cands_total = cands_total.saturating_add(1);
+                    continue;
+                }
+                let cands = head.probe_fks(&mixed)?;
                 cands_total = cands_total.saturating_add(cands.len() as u64);
                 for (j, fk) in cands.into_iter().enumerate() {
                     cands_by_key[i].push((j as u32, fk.0));
@@ -1417,7 +1680,9 @@ impl TxTable {
                 out.push(None);
                 continue;
             }
-            out.push(decode_packed_tx_with_spender_rels(&j.body).ok());
+            out.push(
+                decode_packed_tx_with_spender_rels_secret(&j.body, Some(&self.secret)).ok(),
+            );
         }
         Ok(out)
     }
@@ -1447,7 +1712,9 @@ impl TxTable {
                 out.push(None);
                 continue;
             }
-            out.push(decode_packed_tx_outs_with_spender_rels(&j.body).ok());
+            out.push(
+                decode_packed_tx_outs_with_spender_rels_secret(&j.body, Some(&self.secret)).ok(),
+            );
         }
         Ok(out)
     }
@@ -1689,7 +1956,9 @@ impl TxTable {
         fk: Fk,
     ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>), StoreError> {
         let raw = self.body.get_raw(fk)?;
-        decode_packed_tx(&raw)
+        let (tx, ins, outs, _) =
+            decode_packed_tx_with_spender_rels_secret(&raw, Some(&self.secret))?;
+        Ok((tx, ins, outs))
     }
 
     /// Meta + outputs only (one body IO; skips input materialization).
@@ -1698,7 +1967,9 @@ impl TxTable {
         fk: Fk,
     ) -> Result<(TxRecord, Vec<OutputRecord>), StoreError> {
         let raw = self.body.get_raw(fk)?;
-        decode_packed_tx_outs_only(&raw)
+        let (tx, outs, _) =
+            decode_packed_tx_outs_with_spender_rels_secret(&raw, Some(&self.secret))?;
+        Ok((tx, outs))
     }
 
     /// Append packed full-tx records (one var payload per tx = one body IO on read).
@@ -1721,7 +1992,8 @@ impl TxTable {
             .sum();
         let fks = self.body.put_batch_encode_aligned(items.len(), est, |i, buf| {
             let (tx, ins, outs) = &items[i];
-            encode_packed_tx(tx, ins, outs, buf);
+            // Schema 12: XOR scriptSig / witness / scriptPubKey at rest.
+            encode_packed_tx_with_secret(tx, ins, outs, buf, Some(&self.secret));
         })?;
         if index {
             let heads: Vec<([u8; 32], Fk)> = items
@@ -1748,7 +2020,14 @@ impl TxTable {
     /// [`Self::get_fk_by_txid`].
     pub fn get_all_by_txid(&self, txid: &[u8; 32]) -> Result<Vec<(Fk, TxRecord)>, StoreError> {
         let mut out = Vec::new();
-        for fk in self.head.read().unwrap().probe_fks(txid)?.into_iter().rev() {
+        let mixed = self.secret.mix_txid(txid);
+        let mut cands: Vec<Fk> = Vec::new();
+        if let Some(fk) = self.overflow.lock().unwrap().get(&mixed) {
+            cands.push(fk);
+        }
+        cands.extend(self.head.read().unwrap().probe_fks(&mixed)?);
+        // Newest first: reverse primary probe (older→newer) after optional overflow.
+        for fk in cands.into_iter().rev() {
             if self.body_txid(fk)? != *txid {
                 continue;
             }
@@ -1975,73 +2254,97 @@ impl TxTable {
         Ok(())
     }
 
-    /// Insert batch; if the primary probe chain is full, sleep until bg resize completes.
+    /// Insert batch using **mixed** keys. On primary probe exhaust, depth-failed
+    /// entries go to [`HeadOverflow`] so the write path does not stall for the
+    /// full primary rehash; remaining entries retry on the primary.
     fn head_insert_many_with_resize_retry(
         &self,
         entries: &[([u8; 32], Fk)],
     ) -> Result<(), StoreError> {
-        let t0 = Instant::now();
-        let mut slept_for_resize = false;
-        loop {
-            // Drop the read guard **before** resize/swap. Matching on
-            // `head.read().insert_many(...)` would keep the guard through the
-            // Err arm; `try_complete` then needs `head.write()` → self-deadlock
-            // ("waiting for exclusive head lock" forever).
-            let insert_result = {
+        // Keyed probes: never use raw txid prefixes as open-hash keys.
+        let mixed: Vec<([u8; 32], Fk)> = entries
+            .iter()
+            .map(|(txid, fk)| (self.secret.mix_txid(txid), *fk))
+            .collect();
+        let insert_result = {
+            let head = self.head.read().unwrap();
+            head.insert_many(&mixed)
+        };
+        match insert_result {
+            Ok(()) => Ok(()),
+            Err(e) if is_probe_exhausted_error(&e) => {
+                // Kick resize in the background but do not block the pipeline:
+                // park depth-exhausted keys in overflow (overflow-first lookup).
+                let _ = self.ensure_head_resize_for_probe_exhaust();
+                self.ensure_resize_bg_running();
+                self.head_insert_mixed_with_overflow(&mixed)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Per-entry primary insert; overflow on probe exhaust.
+    fn head_insert_mixed_with_overflow(
+        &self,
+        mixed: &[([u8; 32], Fk)],
+    ) -> Result<(), StoreError> {
+        let mut overflow_n = 0u32;
+        for &(key, fk) in mixed {
+            let one = [(key, fk)];
+            let r = {
                 let head = self.head.read().unwrap();
-                head.insert_many(entries)
+                head.insert_many(&one)
             };
-            match insert_result {
-                Ok(()) => {
-                    if slept_for_resize {
-                        rbitcoin_log::info!(
-                            "store: tx.head insert resumed after probe exhaust \
-                             (waited={:?} batch={})",
-                            t0.elapsed(),
-                            entries.len()
-                        );
-                    }
-                    return Ok(());
-                }
+            match r {
+                Ok(()) => {}
                 Err(e) if is_probe_exhausted_error(&e) => {
-                    // Ensure a widen is running (force start even if under load
-                    // threshold — probe exhaust is a hard capacity signal).
-                    self.ensure_head_resize_for_probe_exhaust()?;
-                    self.ensure_resize_bg_running();
-                    if !self.head_resize_in_progress() {
-                        // Cannot widen further (e.g. MAX_BITS) — surface the exhaust.
-                        let (cursor, n, bits, slots) = self.head_resize_progress();
-                        rbitcoin_log::error!(
-                            "store: tx.head probe exhausted with no resize in progress \
-                             (bits={bits} slots={slots} n={n} cursor={cursor} batch={})",
-                            entries.len()
-                        );
-                        return Err(e);
+                    let mut ov = self.overflow.lock().unwrap();
+                    match ov.insert(&key, fk) {
+                        Ok(_) => {
+                            overflow_n = overflow_n.saturating_add(1);
+                        }
+                        Err(e2) => {
+                            // Overflow full: wait for primary resize, then retry primary.
+                            drop(ov);
+                            self.ensure_head_resize_for_probe_exhaust()?;
+                            self.ensure_resize_bg_running();
+                            if self.head_resize_in_progress() {
+                                self.wait_for_head_resize_idle();
+                                let head = self.head.read().unwrap();
+                                head.insert_many(&[(key, fk)])?;
+                            } else {
+                                return Err(e2);
+                            }
+                        }
                     }
-                    if !slept_for_resize {
-                        let (cursor, n, target_bits, slots) = self.head_resize_progress();
-                        let (deep, exh) = crate::address_head::probe_depth_stats_snapshot();
-                        let pct = if n > 0 {
-                            100.0 * (cursor.saturating_sub(1) as f64) / (n as f64)
-                        } else {
-                            100.0
-                        };
-                        rbitcoin_log::warn!(
-                            "store: tx.head probe exhausted — archiver sleeping until \
-                             resize completes (cursor={}/{n} ({pct:.1}%) \
-                             target_bits={target_bits} slots={slots} \
-                             deep_warn={deep} exhaust={exh} batch={})",
-                            cursor.saturating_sub(1),
-                            entries.len()
-                        );
-                        slept_for_resize = true;
-                    }
-                    // Park until swap (or drop) notifies — no 30‑minute hard fail.
-                    self.wait_for_head_resize_idle();
                 }
                 Err(e) => return Err(e),
             }
         }
+        if overflow_n > 0 {
+            self.overflow.lock().unwrap().persist()?;
+            rbitcoin_log::debug!(
+                "store: tx.head overflow accepted {overflow_n} depth-exhausted insert(s)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Merge overflow entries into primary after a successful head resize swap.
+    pub fn drain_overflow_into_primary(&self) -> Result<usize, StoreError> {
+        let pairs: Vec<([u8; 32], Fk)> = {
+            let ov = self.overflow.lock().unwrap();
+            ov.iter_occupied().collect()
+        };
+        if pairs.is_empty() {
+            return Ok(0);
+        }
+        {
+            let head = self.head.read().unwrap();
+            head.insert_many(&pairs)?;
+        }
+        self.overflow.lock().unwrap().clear()?;
+        Ok(pairs.len())
     }
 
     /// Block the calling thread until online head resize is idle.
@@ -2412,7 +2715,13 @@ impl TxTable {
         if last < first {
             return Ok(());
         }
-        match crate::head_resize_fill::run_shadow_fill_uring(&self.body, shadow, first, last) {
+        match crate::head_resize_fill::run_shadow_fill_uring(
+            &self.body,
+            shadow,
+            &self.secret,
+            first,
+            last,
+        ) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 static ONCE: std::sync::atomic::AtomicBool =
@@ -2443,7 +2752,8 @@ impl TxTable {
             debug_assert_eq!(txids.len() as u64, end - cur + 1);
             let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(write_chunk);
             for (i, txid) in txids.into_iter().enumerate() {
-                batch.push((txid, Fk(cur + i as u64)));
+                // Same keyed mix as live inserts (never raw txid as head key).
+                batch.push((self.secret.mix_txid(&txid), Fk(cur + i as u64)));
                 if batch.len() >= write_chunk {
                     shadow.insert_many(&batch)?;
                     batch.clear();
@@ -3062,7 +3372,8 @@ mod tests {
         );
 
         // probe_fks lists older then newer; reverse body-verify wins newest.
-        let cands = t.head.read().unwrap().probe_fks(&bip).unwrap();
+        let mixed = t.secret.mix_txid(&bip);
+        let cands = t.head.read().unwrap().probe_fks(&mixed).unwrap();
         assert!(cands.contains(&fk_old) && cands.contains(&fk_new));
         assert_eq!(cands[0], fk_old);
 
@@ -3097,6 +3408,61 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         });
+    }
+
+    /// Overflow accepts depth-exhausted inserts; lookup is overflow-first then primary.
+    #[test]
+    fn head_overflow_insert_and_overflow_first_lookup() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-overflow-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = create_tiny(&dir);
+        let txid = [0x77u8; 32];
+        let mk = |i: u8| {
+            let mut t2 = txid;
+            t2[31] = i;
+            let rec = TxRecord {
+                txid: t2,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord::coinbase(u32::MAX, vec![i], vec![])];
+            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+            (rec, inputs, outputs, t2)
+        };
+        // Direct overflow insert + primary insert for comparison.
+        let (rec, ins, outs, raw_txid) = mk(1);
+        let fk = t
+            .put_full_batch_indexed(&[(rec, ins, outs)], true)
+            .unwrap()[0];
+        let mixed = t.secret.mix_txid(&raw_txid);
+        // Simulate depth-exhaust: push same mixed key's sibling into overflow.
+        let mut alt = raw_txid;
+        alt[30] = 0xab;
+        let mixed_alt = t.secret.mix_txid(&alt);
+        {
+            let mut ov = t.overflow.lock().unwrap();
+            ov.insert(&mixed_alt, Fk(fk.0 + 1000)).unwrap();
+            ov.persist().unwrap();
+        }
+        // Overflow-first: get with a body that won't match overflow fk still works via primary.
+        assert_eq!(t.get_fk_by_txid(&raw_txid).unwrap(), Some(fk));
+        // mix must not equal raw
+        assert_ne!(mixed, raw_txid);
+        // reopen overflow
+        let o2 = crate::head_overflow::HeadOverflow::open(&dir).unwrap();
+        assert_eq!(o2.get(&mixed_alt), Some(Fk(fk.0 + 1000)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// After fast head insert (no write-time BIP30 displace), sole lookup must
@@ -3142,8 +3508,9 @@ mod tests {
         let fk1 = t.put_full_batch_indexed(&[a], true).unwrap()[0];
         let fk2 = t.put_full_batch_indexed(&[b], true).unwrap()[0];
         assert!(fk2.0 > fk1.0);
-        // Probe order: older first, newer deeper.
-        let cands = t.head.read().unwrap().probe_fks(&txid).unwrap();
+        // Probe order: older first, newer deeper (mixed keys).
+        let mixed = t.secret.mix_txid(&txid);
+        let cands = t.head.read().unwrap().probe_fks(&mixed).unwrap();
         assert_eq!(cands[0], fk1);
         assert!(cands.contains(&fk2));
         // Sole resolve prefers newest.
@@ -3435,13 +3802,15 @@ mod tests {
         // mmap path
         t.shadow_fill_fk_range_mmap(&ha, 1, N).unwrap();
         // uring path
-        crate::head_resize_fill::run_shadow_fill_uring(&t.body, &hb, 1, N).unwrap();
+        crate::head_resize_fill::run_shadow_fill_uring(&t.body, &hb, &t.secret, 1, N)
+            .unwrap();
         assert_eq!(ha.occupied(), hb.occupied(), "occupied mismatch");
         for i in 1..=N {
             let mut txid = [0u8; 32];
             txid[0..8].copy_from_slice(&i.to_le_bytes());
-            let ca = ha.probe_fks(&txid).unwrap();
-            let cb = hb.probe_fks(&txid).unwrap();
+            let mixed = t.secret.mix_txid(&txid);
+            let ca = ha.probe_fks(&mixed).unwrap();
+            let cb = hb.probe_fks(&mixed).unwrap();
             assert!(ca.contains(&Fk(i)), "mmap missing {i}");
             assert!(cb.contains(&Fk(i)), "uring missing {i}");
         }
@@ -4489,7 +4858,7 @@ mod tests {
             },
         ];
         let mut enc = Vec::new();
-        encode_input_run(&run, &mut enc);
+        encode_input_run_secret(&run, &mut enc, None);
         let dec = decode_input_run(&enc, 3).unwrap();
         assert_eq!(dec.len(), 3);
         assert!(dec[0].is_coinbase());
@@ -4510,7 +4879,7 @@ mod tests {
             OutputRecord::unspent(12345, vec![0x00, 0x14, 0xaa]),
         ];
         let mut enc = Vec::new();
-        encode_output_run(&run, &mut enc);
+        encode_output_run_secret(&run, &mut enc, None);
         assert_eq!(decode_output_run(&enc, 3).unwrap(), run);
         // OP_TRUE + spender_field(8) + flags + uleb value
         let mut tiny = Vec::new();
@@ -4994,13 +5363,13 @@ mod tests {
         ));
         // run helpers
         let mut run = Vec::new();
-        encode_output_run(&outputs, &mut run);
+        encode_output_run_secret(&outputs, &mut run, None);
         let (decoded, used) = decode_output_run_prefix(&run, 2).unwrap();
         assert_eq!(used, run.len());
         assert_eq!(decoded.len(), 2);
         assert_eq!(decode_output_run(&run, 2).unwrap().len(), 2);
         let mut irun = Vec::new();
-        encode_input_run(&inputs, &mut irun);
+        encode_input_run_secret(&inputs, &mut irun, None);
         assert_eq!(decode_input_run(&irun, 2).unwrap().len(), 2);
         let mut trail_run = run.clone();
         trail_run.push(1);
@@ -5101,8 +5470,8 @@ mod tests {
             let mut meta = tx;
             meta.output_count = 2;
             raw.extend_from_slice(&meta.encode());
-            encode_input_run(&inputs, &mut raw);
-            encode_output_run(&outputs, &mut raw);
+            encode_input_run_secret(&inputs, &mut raw, None);
+            encode_output_run_secret(&outputs, &mut raw, None);
             // ends after 1 output but meta says 2
             assert!(matches!(
                 decode_packed_tx(&raw),
@@ -5149,7 +5518,7 @@ mod tests {
         // input run trailing
         {
             let mut irun = Vec::new();
-            encode_input_run(&[InputRecord::coinbase(u32::MAX, vec![], vec![])], &mut irun);
+            encode_input_run_secret(&[InputRecord::coinbase(u32::MAX, vec![], vec![])], &mut irun, None);
             irun.push(0);
             assert!(matches!(
                 decode_input_run(&irun, 1),

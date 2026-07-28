@@ -6,15 +6,22 @@ mod batch_full_bodies;
 mod batch_parents;
 mod catchup;
 mod chain_view;
+mod combined_stage;
 mod confirm_parent_cache;
 mod connect;
 mod confirm_load;
+mod create_residency;
 mod out_fifo;
 mod reconstruct;
 mod run_builder_core;
 mod scripthash;
 mod sh_builder;
 mod wave_prevout;
+
+pub use combined_stage::{
+    body_ok_reads, load_creates_once, pin_from_residency, reset_body_ok_reads, CombinedCreate,
+};
+pub use create_residency::{CreateResidency, DEFAULT_CREATE_CAP, DEFAULT_OUT_CAP};
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};

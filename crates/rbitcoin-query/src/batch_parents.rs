@@ -141,7 +141,19 @@ impl BatchParents {
     /// Set body range + dense spender rels after Class A commit (same-batch creates).
     ///
     /// Does not re-fetch outs; only fills layout for annotate/structural abs paths.
+    /// Merges `extra_need` into `checked` so spend-annotate abs covers those vouts.
     pub fn set_layout(&mut self, fk: Fk, body_range: (u64, u64), dense_rels: &[u32]) {
+        self.set_layout_for_need(fk, body_range, dense_rels, &[]);
+    }
+
+    /// Like [`set_layout`] but also ensure abs for `extra_need` vouts.
+    pub fn set_layout_for_need(
+        &mut self,
+        fk: Fk,
+        body_range: (u64, u64),
+        dense_rels: &[u32],
+        extra_need: &[u32],
+    ) {
         let Some(id) = fk.get() else {
             return;
         };
@@ -149,11 +161,15 @@ impl BatchParents {
             return;
         };
         e.body_range = Some(body_range);
-        let need: Vec<u32> = if e.checked.is_empty() {
+        let mut need: Vec<u32> = if e.checked.is_empty() && extra_need.is_empty() {
             (0..dense_rels.len() as u32).collect()
         } else {
             e.checked.clone()
         };
+        need.extend_from_slice(extra_need);
+        need.sort_unstable();
+        need.dedup();
+        e.checked = need.clone();
         e.spender_rels = sparse_spender_rels(dense_rels, &need);
     }
 
@@ -167,6 +183,12 @@ impl BatchParents {
             .filter(|(_, e)| e.body_range.is_none() || e.spender_rels.is_empty())
             .map(|(&id, _)| Fk(id))
             .collect()
+    }
+
+    /// True when this create is present in the pin map (any layout state).
+    #[inline]
+    pub fn contains(&self, fk: Fk) -> bool {
+        fk.get().is_some_and(|id| self.by_fk.contains_key(&id))
     }
 
     /// Absolute 9-byte spender meta offset for `vout`, if layout known.

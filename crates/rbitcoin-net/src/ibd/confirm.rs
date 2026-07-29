@@ -421,6 +421,9 @@ pub(crate) fn spawn_confirm_engine(
     let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<rbitcoin_consensus::ScriptOkBatch>(
         WRITE_QUEUE_CAP,
     );
+    // Write reject / soft denserels: prep drops reserved fks + last_prepped so
+    // re-prep after Class A partial commit does not drift next_tx_start.
+    let prep_ahead_reset = Arc::new(AtomicBool::new(false));
 
     // Write: structural + class_c + annotate; emits tip events.
     let hub_wb = Arc::clone(&hub);
@@ -429,6 +432,7 @@ pub(crate) fn spawn_confirm_engine(
     let accepted_wb = Arc::clone(&accepted);
     let loop_stats_wb = Arc::clone(&loop_stats);
     let q_wb = Arc::clone(&queues);
+    let prep_ahead_reset_wb = Arc::clone(&prep_ahead_reset);
     let write_thr = std::thread::Builder::new()
         .name("ibd-confirm-write".into())
         .spawn(move || {
@@ -520,8 +524,10 @@ pub(crate) fn spawn_confirm_engine(
                             feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                             continue;
                         }
-                        // Permanent write reject — clear inflight (do not re-queue;
-                        // reject event handles blacklist / operator path).
+                        // Write reject — clear inflight (reject event handles
+                        // soft-reget vs blacklist). Invalidate prep-ahead caches
+                        // so reserved create fks / last_prepped do not drift.
+                        prep_ahead_reset_wb.store(true, Ordering::Release);
                         feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                         loop_stats_wb
                             .confirm_reject_stops
@@ -624,6 +630,7 @@ pub(crate) fn spawn_confirm_engine(
     // Load: claim feed → load/wave/wire/assemble → scripts queue.
     // Capture queues for depth accounting (moved into this thread).
     let queues_load = Arc::clone(&queues);
+    let prep_ahead_reset_load = Arc::clone(&prep_ahead_reset);
     let load_join = std::thread::Builder::new()
         .name("ibd-confirm-load".into())
         .spawn(move || {
@@ -633,6 +640,9 @@ pub(crate) fn spawn_confirm_engine(
             loop {
                 if feed.stopped() {
                     break;
+                }
+                if prep_ahead_reset_load.swap(false, Ordering::AcqRel) {
+                    prep_ahead.clear_all(&hub);
                 }
                 prep_ahead.prune_committed(&hub);
 
@@ -881,11 +891,15 @@ pub(crate) fn spawn_confirm_engine(
                             .map(|(h, ha, _)| (*h, *ha, None))
                             .collect();
                         if !retry.is_empty() {
+                            // Pipeline claim ahead of store tip+1 (or brief race):
+                            // rate-limit; not a permanent error.
                             static N: AtomicU32 = AtomicU32::new(0);
                             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n <= 5 || n % 200 == 0 {
+                            if n <= 3 || n % 500 == 0 {
                                 debug!(
-                                    "ibd: confirm prep empty outcome first={expect_h} n={} — re-queue (count={n})",
+                                    "ibd: confirm prep empty outcome first={expect_h} n={} \
+                                     (path not contiguous from tip+1 / already confirmed; \
+                                      re-queue, count={n})",
                                     retry.len()
                                 );
                             }

@@ -2203,6 +2203,74 @@ fn unified_wire_pipeline_multi_block_to_tip() {
     }
 }
 
+/// Already-archived Class A (plan=None): wire prep must still pin denserels for
+/// same-batch creates. Regression: after write committed Class A then failed
+/// annotate, re-prep had empty plan and spend annotate missed denserels/abs
+/// (mainnet 20:15 rejects @219562+).
+#[test]
+fn wire_prep_already_archived_bodies_spend_annotate() {
+    use rbitcoin_consensus::{
+        accept_and_archive_block, accept_and_connect_block, confirm_scripts_phase,
+        confirm_wire_prep_phase, confirm_write_phase, ChainParams, Milestone,
+        ScriptPreverified,
+    };
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.enter_direct_index_mode().unwrap();
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+    let cb1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+    for h in 2..=maturity {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+
+    // Archive spend chain without confirming (Class A present, tip still maturity).
+    let ha = maturity + 1;
+    let spend_a = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
+    let ba = mine_regtest_block(tip, tip_time + 600, ha, vec![spend_a]);
+    let a_out = ba.txdata[1].compute_txid();
+    accept_and_archive_block(&q, &params, Height(ha), &ba, ms).unwrap();
+    tip = ba.block_hash();
+    tip_time = ba.header.time;
+
+    let hb = maturity + 2;
+    let spend_b = spend_anyone_can_spend(a_out, 0, Amount::from_sat(48_0000_0000));
+    let bb = mine_regtest_block(tip, tip_time + 600, hb, vec![spend_b]);
+    accept_and_archive_block(&q, &params, Height(hb), &bb, ms).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(maturity)));
+
+    // Wire prep both heights: need empty → plan None; must still annotate.
+    let batch = [(Height(ha), ba.clone()), (Height(hb), bb.clone())];
+    let mat = confirm_wire_prep_phase(&q, &params, ms, &batch, &ScriptPreverified::new())
+        .expect("wire prep already-archived");
+    assert!(
+        mat.batch.archive_plan.is_none() || mat.batch.archive_plan.as_ref().is_some_and(|p| p.is_empty()),
+        "bodies already archived → no Class A plan (or empty)"
+    );
+    let ok = confirm_scripts_phase(mat.batch).expect("scripts");
+    confirm_write_phase(&q, &params, ms, ok.batch).unwrap_or_else(|e| {
+        panic!(
+            "write of already-archived wire batch must fill denserels for same-batch creates (got {e})"
+        );
+    });
+    assert_eq!(q.tip_height(), Some(Height(hb)));
+}
+
 /// Prep(N+1) while N is still uncommitted pins parents from in-flight outs
 /// **without denserels**. Write of N+1 must fill layout after N commits, or
 /// structural spentness / spend annotate fails with

@@ -645,6 +645,9 @@ fn pin_for_wire_batch(
     let mut batch_parents = rbitcoin_query::BatchParents::with_capacity(
         parent_vouts.len().saturating_add(batch_create.len()),
     );
+    // Already-archived batch creates (plan=None): not in planned_outs — still
+    // need denserels for same-batch spends. Collect for store load below.
+    let mut still_need: HashMap<u64, Vec<u32>> = HashMap::new();
     for id in &batch_create {
         if let Some((tx, outs)) = planned_outs.get(id) {
             let checked: Vec<u32> = (0..outs.len() as u32).collect();
@@ -666,11 +669,13 @@ fn pin_for_wire_batch(
                 None,
                 Vec::new(),
             );
+        } else {
+            // Durable Class A create (re-prep after partial commit / need empty).
+            still_need.insert(*id, Vec::new());
         }
     }
 
     // Prefer pipeline / same-batch planned outs for external parents before denserels IO.
-    let mut still_need: HashMap<u64, Vec<u32>> = HashMap::new();
     for (id, need) in &parent_vouts {
         if batch_parents
             .get_parent_tx(rbitcoin_primitives::Fk(*id))
@@ -701,7 +706,10 @@ fn pin_for_wire_batch(
                 Vec::new(),
             );
         } else {
-            still_need.insert(*id, need.clone());
+            still_need
+                .entry(*id)
+                .or_default()
+                .extend(need.iter().copied());
         }
     }
 
@@ -731,6 +739,10 @@ fn pin_for_wire_batch(
             let mut need = need;
             need.sort_unstable();
             need.dedup();
+            // Empty need = full create (already-archived batch create).
+            if need.is_empty() {
+                need = (0..outs.len() as u32).collect();
+            }
             let live: Vec<(u32, rbitcoin_store::OutputRecord)> = need
                 .iter()
                 .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
@@ -872,10 +884,11 @@ pub fn confirm_write_phase(
             )?;
         }
     }
-    // Prep-ahead may have pinned parents from prior in-flight plans without
-    // denserels (those creates were not durable at prep). After ordered commit
-    // of earlier batches they are on disk — fill abs layout before structural.
-    fill_missing_parent_layouts(query, &mut batch.batch_parents)?;
+    // Ensure denserels/abs for every spend edge before structural + annotate:
+    // - prep-ahead in-flight parents (no denserels at pin time)
+    // - already-archived Class A (plan=None) same-batch creates never inserted
+    // - partial pin after prior write committed Class A then failed annotate
+    ensure_spend_abs_layouts(query, &mut batch.batch_parents, &batch.prepared)?;
 
     // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
     let t_struct = Instant::now();
@@ -956,21 +969,55 @@ fn fill_planned_create_layout_after_commit(
     Ok(())
 }
 
-/// Fill denserels/abs for parents pinned without layout (prep-ahead in-flight).
+/// Ensure denserels/abs for every spend edge on the write batch.
 ///
-/// Prep(N+1) may pin creates from plan(N) via `in_flight_outs` before N commits
-/// Class A — those pins carry outs for assemble/scripts but empty denserels.
-/// Ordered write guarantees N is durable before N+1 structural; load layout once.
-fn fill_missing_parent_layouts(
+/// Covers:
+/// 1. Prep-ahead: parents from plan(N) pinned without denserels while N uncommitted
+/// 2. Already-archived Class A (`archive_plan = None`): same-batch creates never
+///    entered `batch_parents` at pin (planned_outs empty) — annotate needs abs
+/// 3. Retry after Class A committed then annotate failed: pin map incomplete
+///
+/// Walks prepared spends (not only pin-map entries) and loads missing layout once.
+fn ensure_spend_abs_layouts(
     query: &Query,
     batch_parents: &mut rbitcoin_query::BatchParents,
+    prepared: &[Prepared],
 ) -> Result<(), ConsensusError> {
     use rbitcoin_store::IdxBodyMode;
+    use std::collections::HashMap;
 
-    let fks = batch_parents.fks_missing_layout();
-    if fks.is_empty() {
+    let mut need: HashMap<u64, Vec<u32>> = HashMap::new();
+    for p in prepared {
+        for &(_txid, vout, sfk, cfk) in &p.spends {
+            if sfk.is_null() || cfk.is_null() {
+                continue;
+            }
+            if batch_parents.get_spender_abs(cfk, vout).is_some() {
+                continue;
+            }
+            if let Some(id) = cfk.get() {
+                need.entry(id).or_default().push(vout);
+            }
+        }
+    }
+    // Also repair pins that have outs but no layout (structural cold path would
+    // skip unpinned; pinned-without-abs fails structural).
+    for fk in batch_parents.fks_missing_layout() {
+        if let Some(id) = fk.get() {
+            need.entry(id).or_default();
+        }
+    }
+    if need.is_empty() {
         return Ok(());
     }
+    for vouts in need.values_mut() {
+        vouts.sort_unstable();
+        vouts.dedup();
+    }
+    let fks: Vec<rbitcoin_primitives::Fk> = need
+        .keys()
+        .map(|id| rbitcoin_primitives::Fk(*id))
+        .collect();
     let loaded = rbitcoin_query::load_creates_once(
         query.store(),
         query.create_residency(),
@@ -980,12 +1027,42 @@ fn fill_missing_parent_layouts(
     .map_err(ConsensusError::Store)?;
     let secret = query.store().txs.store_secret();
     for c in loaded {
-        let Ok((_tx, _outs, dense_rels)) =
+        let Some(id) = c.fk.get() else { continue };
+        let need_v = need.get(&id).cloned().unwrap_or_default();
+        let Ok((tx, outs, dense_rels)) =
             rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(&c.raw, Some(secret))
         else {
             continue;
         };
-        batch_parents.set_layout(c.fk, c.body_range, &dense_rels);
+        if batch_parents.contains(c.fk) {
+            batch_parents.set_layout_for_need(c.fk, c.body_range, &dense_rels, &need_v);
+            continue;
+        }
+        // Not pinned at prep (e.g. already-archived same-batch create): insert
+        // with layout so annotate/structural abs paths work.
+        let mut checked = need_v;
+        if checked.is_empty() {
+            checked = (0..outs.len() as u32).collect();
+        }
+        let live: Vec<(u32, rbitcoin_store::OutputRecord)> = checked
+            .iter()
+            .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
+            .collect();
+        let sparse = rbitcoin_query::sparse_spender_rels(&dense_rels, &checked);
+        let cb = if tx.input_count != 1 {
+            Some(false)
+        } else {
+            None
+        };
+        batch_parents.insert_owned(
+            c.fk,
+            tx,
+            live,
+            checked,
+            cb,
+            Some(c.body_range),
+            sparse,
+        );
     }
     Ok(())
 }

@@ -688,7 +688,10 @@ pub(crate) fn apply_confirm_reject(
     //   freeze at 125653 blacklisted for this string).
     let soft_reget = err.contains("prevout already spent")
         || err.contains("unexpected previous header")
-        || err.contains("unexpected previous");
+        || err.contains("unexpected previous")
+        // Prep/layout bug after Class A commit: do not permanent-blacklist tip+1;
+        // drop body-queue wire and re-prep (write now re-fills denserels abs).
+        || err.contains("missing pin denserels");
     if soft_reget {
         release_confirm_archive_charge(st, &hash, archive_queued);
         clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
@@ -795,6 +798,26 @@ mod confirm_reject_tests {
         );
         assert!(st.body.is_rejected(&hash));
         assert!(!st.ordered_set.contains(&hash));
+
+        // Prep/layout denserels miss after Class A commit: soft re-get, not blacklist
+        // (mainnet restart freezes tip when blacklisted for denserels/abs).
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(219_561));
+        let hash = h(0x5b);
+        st.body.mark_archived(hash);
+        st.ordered.push_back(hash);
+        st.ordered_set.insert(hash);
+        apply_confirm_reject(
+            &mut st,
+            219_562,
+            hash,
+            "consensus: store: corrupt record: invariant: spend annotate missing pin denserels/abs",
+            None,
+            None,
+        );
+        assert!(
+            !st.body.is_rejected(&hash),
+            "denserels layout miss must soft-reget, not permanent-blacklist tip+1"
+        );
     }
 
     /// Wire-path soft budget charged on receive must release on script reject

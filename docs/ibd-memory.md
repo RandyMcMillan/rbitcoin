@@ -4,13 +4,25 @@ This document is the developer/AI contract for **process-owned** memory on the
 IBD path. It is **not** about kernel page cache under store mmaps (those count
 in RSS when faulted but are not Rust heap leaks).
 
-## Intentional, bounded structures (do not gut)
+## Primary IBD wire path (current)
 
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
-| **Archive queue budget** | default 512 MiB (`RBITCOIN_ARCHIVE_QUEUE_MB`) | `ArchiveQueueBudget::charge` on first body enqueue; **`release` only via** `apply_archive_result` on `ArchiveResult::{Ok,Err,Dropped}` (or immediate release if pipeline send fails because the channel is **closed**) |
-| **ContigPark** | horizon `CONTIG_DENSIFY_AHEAD` (2048 heights) | `take_contiguous` → writer; abort via `drain_all` + Err results; skip already-Class-A via `force_advance` + **Dropped** |
-| **`BodyPresence.archive_charged`** | one bit per in-flight archive body | **Only** `clear_archive_charged` on pipeline result — **never** hygiene-prune |
+| **Durable body queue** | default 8 GiB payload (`RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`) | Peer **offer** wire; confirm prep **reads** by height; confirm-write **dequeues** after tip advance. RAM overflow when disk full (same soft gate for densify). |
+| **Body densify height horizon** | `CONTIG_DENSIFY_AHEAD` (64 k past tip) | Safety only when the byte budget is nearly empty (early small blocks); primary stop is **byte fill** (90%/70% hysteresis). |
+| **Confirm feed** | readiness (height/hash), no wire retain | Prep claims tip-contiguous runs; requeue / finish on outcome |
+
+## Soft budgets / fallback archive job (not the primary Class A path)
+
+Unknown-height bodies and abort/charge release still use an archive-job
+pipeline + ContigPark. On the **unified** path, peers do **not** dual-append
+Class A far ahead of tip — confirm commit is the sole Class A appender.
+
+| Structure | Cap / bound | Production clear / evict |
+|-----------|-------------|---------------------------|
+| **Archive queue budget** | default 512 MiB (`RBITCOIN_ARCHIVE_QUEUE_MB`) | Soft-charge **RAM overflow / arch jobs only** (not multi‑GiB disk body queue). `charge` on overflow/job; **`release` only via** `apply_archive_result` on `ArchiveResult::{Ok,Err,Dropped}` (or immediate release if pipeline send fails because the channel is **closed**) |
+| **ContigPark** | horizon `CONTIG_DENSIFY_AHEAD` | Fallback contiguous park → prep/writer; abort via `drain_all` + Err; skip already-Class-A via `force_advance` + **Dropped** |
+| **`BodyPresence.archive_charged`** | one bit per charged fallback body | **Only** `clear_archive_charged` on pipeline result — **never** hygiene-prune |
 | **OutFifo (confirm outs)** | `RBITCOIN_CONFIRM_OUT_FIFO` (default 2²⁴ outs) | FIFO whole-create eviction on insert; tip GC does **not** free outs |
 | **Archive txid sticky** | `RBITCOIN_ARCHIVE_TXID_STICKY_CAP` (default 8 M) | raw FIFO (no touch/LRU); lookup read-only |
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |
@@ -21,24 +33,24 @@ Tests that need a clean process must call these **same** entry points (or drop t
 owning `Query` / pipeline), not a secret test-only free-all that masks production
 leaks.
 
-## Soft archive budget: request-limited only (invariant)
+## Soft budgets: request-limited only (invariant)
 
 **We never stop reading or decoding block data a peer sends for a block we
-already requested** just because the decoded body would push us over the soft
-archive queue budget (or any other soft queue meter).
+already requested** just because the decoded body would push us over the durable
+body-queue byte budget, soft archive RAM budget, or any other soft meter.
 
 | Allowed | Forbidden |
 |---------|-----------|
-| Stop **new densify / cache getdata** when `!can_assign` (fill ≥ budget) | Await a decode permit / soft gate **before** the next TCP read on a peer |
-| Scale far densify via `far_admission_scale` | `try_send` Full → drop a decoded `Block` we already received |
-| Overshoot budget while in-flight getdata completes | Make healthy peers look stalled by parking the reader on archive backpressure |
-| Unbounded `arch_job` channel (main → ContigPark) | Bound process RAM by refusing peer bytes already on the wire |
+| Stop **new densify getdata** when body-queue `!can_request` or soft `!can_assign` | Await a decode permit / soft gate **before** the next TCP read on a peer |
+| Scale densify via far-admission hysteresis on fill | Drop a decoded `Block` we already received solely for soft budget |
+| Overshoot budget while in-flight getdata completes | Make healthy peers look stalled by parking the reader on soft backpressure |
+| Buffer body-queue overflow in RAM (then gate requests) | Bound process RAM by refusing peer bytes already on the wire |
 
-**Why this is safe:** when archive stops accepting new work, assign stops issuing
-getdata. Outstanding requests are finite (per-peer in-flight window). Decoding
-and enqueueing those bodies cannot create a truly unbounded leak; the backlog
-drains when the writer resumes. Bound queue size by **not requesting**, not by
-**not reading**.
+**Why this is safe:** when either budget stops accepting new densify work, assign
+stops issuing getdata. Outstanding requests are finite (per-peer in-flight
+window). Decoding and enqueueing those bodies cannot create a truly unbounded
+leak; the backlog drains as confirm dequeues (or the fallback writer resumes).
+Bound queue size by **not requesting**, not by **not reading**.
 
 Historical regression (do not reintroduce): `ARCH_JOB_QUEUE_CAP` + Full-drop and
 `acquire_block_decode_permit` before the next frame made peers look dead while

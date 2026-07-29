@@ -837,7 +837,7 @@ mod tests {
         }
         st.inflight.clear();
         st.slots.iter_mut().for_each(|s| s.in_flight.clear());
-        st.max_archived_height = 12;
+        st.max_ready_height = 12;
         st.max_ordered_height = 12;
         assign_work_ordered(
             &mut st,

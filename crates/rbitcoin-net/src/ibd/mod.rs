@@ -333,7 +333,7 @@ pub async fn ibd_cancellable(
 
     let accepted = Arc::new(AtomicU32::new(0));
     let start_tip = hub.tip_height().unwrap_or(0);
-    let max_archived_shared = Arc::new(AtomicU32::new(start_tip));
+    let max_ready_shared = Arc::new(AtomicU32::new(start_tip));
     let confirm_lag = Arc::new(AtomicU32::new(0));
     let mut last_progress = Instant::now();
     let mut last_status = Instant::now();
@@ -368,20 +368,20 @@ pub async fn ibd_cancellable(
     );
     let pipe_stats = Arc::new(ArchivePipelineStats::default());
     let loop_stats = Arc::new(LoopStats::default());
-    // Seed arch_total from durable Class A on disk (not zero at restart).
-    let store_arch_total = hub.query.archived_block_count().unwrap_or(0);
+    // Seed Class A body count from disk (not zero at restart).
+    let store_class_a_bodies = hub.query.archived_block_count().unwrap_or(0);
     loop_stats
         .archived_bodies
-        .store(store_arch_total, Ordering::Relaxed);
-    if store_arch_total > 0 {
-        info!("ibd: store has {store_arch_total} Class A bodies (arch_total seed)");
+        .store(store_class_a_bodies, Ordering::Relaxed);
+    if store_class_a_bodies > 0 {
+        info!("ibd: store has {store_class_a_bodies} Class A bodies (seed)");
     }
     let (arch_job_tx, arch_job_rx) = mpsc::unbounded_channel::<ArchiveJob>();
     let (arch_res_tx, mut arch_res_rx) = mpsc::unbounded_channel::<ArchiveResult>();
     let archive_stop = Arc::new(AtomicBool::new(false));
     // Contiguous Class A writer starts just past the resume archive HWM (or 0).
     let archive_write_next = Arc::new(AtomicU32::new(if hub.tip_height().is_some() {
-        st.max_archived_height.saturating_add(1)
+        st.max_ready_height.saturating_add(1)
     } else {
         0
     }));
@@ -455,10 +455,10 @@ pub async fn ibd_cancellable(
         &st.height_to_hash,
         &mut st.body,
         hub.as_ref(),
-        &mut st.max_archived_height,
-        &max_archived_shared,
+        &mut st.max_ready_height,
+        &max_ready_shared,
     );
-    update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_archived_height);
+    update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_ready_height);
 
     let mut loop_n = 0u32;
     loop {
@@ -489,8 +489,8 @@ pub async fn ibd_cancellable(
                     st.body.mark_archived(hash);
                     let tip = hub.tip_height().unwrap_or(0);
                     archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
-                    st.max_archived_height = st.max_archived_height.max(tip);
-                    max_archived_shared.store(st.max_archived_height, Ordering::Relaxed);
+                    st.max_ready_height = st.max_ready_height.max(tip);
+                    max_ready_shared.store(st.max_ready_height, Ordering::Relaxed);
                 }
                 ConfirmEvent::BodyMissing { hash } => {
                     // No body queue / Class A for this hash — clear pending+known so
@@ -589,10 +589,10 @@ pub async fn ibd_cancellable(
             &st.height_to_hash,
             &mut st.body,
             hub.as_ref(),
-            &mut st.max_archived_height,
-            &max_archived_shared,
+            &mut st.max_ready_height,
+            &max_ready_shared,
         );
-        update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_archived_height);
+        update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_ready_height);
         // Apply confirm results without doing Class C on this task.
         while let Ok(ev) = confirm_ev_rx.try_recv() {
             match ev {
@@ -608,8 +608,8 @@ pub async fn ibd_cancellable(
                     st.body.mark_archived(hash);
                     let tip = hub.tip_height().unwrap_or(0);
                     archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
-                    st.max_archived_height = st.max_archived_height.max(tip);
-                    max_archived_shared.store(st.max_archived_height, Ordering::Relaxed);
+                    st.max_ready_height = st.max_ready_height.max(tip);
+                    max_ready_shared.store(st.max_ready_height, Ordering::Relaxed);
                 }
                 ConfirmEvent::BodyMissing { hash } => {
                     st.body.demote_known(hash);
@@ -681,17 +681,16 @@ pub async fn ibd_cancellable(
 
         // Header sync: soft-cap live work (`ordered_set`), not deque len (ghosts).
         //
-        // Sparse far-only archives used to push max_archived ≈ max_ordered while
-        // most bodies were still missing. That made `arch_cache` look empty and
-        // **bypassed the soft cap forever** → header floods, drain livelock,
-        // arch_q=0 / writer idle, ~5–10 unique Class A bodies/s despite high BW.
-        // Only bypass soft cap when the ordered path is **mostly archived** (dense).
+        // Sparse far-only readiness used to push max_ready ≈ max_ordered while
+        // most bodies were still missing. That made the soft-cap bypass look
+        // empty forever → header floods and drain livelock. Only bypass soft
+        // cap when the ordered path is **mostly claim-ready** (dense).
         {
             let live = st.ordered_set.len();
             let known_arch = st.body.known_len();
             let arch_cache = st
                 .max_ordered_height
-                .saturating_sub(st.max_archived_height);
+                .saturating_sub(st.max_ready_height);
             let need_arch_cache = want_headers_beyond_soft_cap(
                 live,
                 known_arch,
@@ -909,7 +908,7 @@ pub async fn ibd_cancellable(
                 &st.height_to_hash,
                 &mut st.body,
                 st.max_peer_height,
-                st.max_archived_height,
+                st.max_ready_height,
             );
             loop_stats
                 .status_scan_ns
@@ -959,7 +958,7 @@ pub async fn ibd_cancellable(
             let peer_cap = peers_n.saturating_mul(cfg.per_peer);
             let inflight_cap = cfg.window.min(peer_cap).max(1);
             let ahead = prog
-                .archived
+                .ready_hwm
                 .saturating_sub(prog.tip)
                 .saturating_add(st.inflight.len() as u32);
             let arch_mb = archive_queued.bytes() / (1024 * 1024);
@@ -1004,12 +1003,12 @@ pub async fn ibd_cancellable(
             );
             perf_log::log_sample(&perf);
 
-            // Stall watchdog: archive-complete + tip frozen is a confirm-path bug.
+            // Stall watchdog: body-ready ahead of tip + tip frozen is a confirm bug.
             if last_progress.elapsed() > Duration::from_secs(15)
                 && prog.tip_hole == 0
                 && st.inflight.is_empty()
                 && arch_q_now == 0
-                && prog.archived > prog.tip.saturating_add(1)
+                && prog.ready_hwm > prog.tip.saturating_add(1)
             {
                 let expect = prog.tip.saturating_add(1);
                 let hth = st.height_to_hash.get(&expect).copied();
@@ -1025,15 +1024,15 @@ pub async fn ibd_cancellable(
                     &st.height_to_hash,
                     &mut st.body,
                     hub.as_ref(),
-                    &mut st.max_archived_height,
-                    &max_archived_shared,
+                    &mut st.max_ready_height,
+                    &max_ready_shared,
                 );
-                update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_archived_height);
+                update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_ready_height);
                 warn!(
                     "ibd: tip stall tip={} expect={expect} hth={} ready={ready} has_block={has} in_ordered={in_set} offer_noted={noted} hwm={} ordered_len={} (idle {:?})",
                     prog.tip,
                     hth.is_some(),
-                    prog.archived,
+                    prog.ready_hwm,
                     st.ordered.len(),
                     last_progress.elapsed(),
                 );
@@ -1056,16 +1055,16 @@ pub async fn ibd_cancellable(
                 &st.height_to_hash,
                 &mut st.body,
                 hub.as_ref(),
-                &mut st.max_archived_height,
-                &max_archived_shared,
+                &mut st.max_ready_height,
+                &max_ready_shared,
             );
-            update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_archived_height);
+            update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_ready_height);
             let tip_h = hub.tip_height().unwrap_or(0);
             let arch_q = archive_queued.count();
             if catchup_complete_after_drain(&st, tip_h, arch_q) {
                 info!(
-                    "ibd: catch-up complete tip={tip_h} max_peer_height={} max_archived={} headers_done={} — exiting IBD",
-                    st.max_peer_height, st.max_archived_height, st.headers_done
+                    "ibd: catch-up complete tip={tip_h} max_peer_height={} max_ready={} headers_done={} — exiting IBD",
+                    st.max_peer_height, st.max_ready_height, st.headers_done
                 );
                 break;
             }
@@ -1089,8 +1088,8 @@ pub async fn ibd_cancellable(
             ) {
                 AllPeersDead::CatchupComplete => {
                     info!(
-                        "ibd: catch-up complete (no live peers) tip={tip_h} max_peer_height={} max_archived={} — exiting IBD",
-                        st.max_peer_height, st.max_archived_height
+                        "ibd: catch-up complete (no live peers) tip={tip_h} max_peer_height={} max_ready={} — exiting IBD",
+                        st.max_peer_height, st.max_ready_height
                     );
                     break;
                 }
@@ -1177,10 +1176,10 @@ pub async fn ibd_cancellable(
                     &st.height_to_hash,
                     &mut st.body,
                     hub.as_ref(),
-                    &mut st.max_archived_height,
-                    &max_archived_shared,
+                    &mut st.max_ready_height,
+                    &max_ready_shared,
                 );
-                update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_archived_height);
+                update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_ready_height);
                         while let Ok(ev) = confirm_ev_rx.try_recv() {
                     match ev {
                         ConfirmEvent::Accepted { hash } => {
@@ -1195,8 +1194,8 @@ pub async fn ibd_cancellable(
                             st.body.mark_archived(hash);
                             let tip = hub.tip_height().unwrap_or(0);
                             archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
-                            st.max_archived_height = st.max_archived_height.max(tip);
-                            max_archived_shared.store(st.max_archived_height, Ordering::Relaxed);
+                            st.max_ready_height = st.max_ready_height.max(tip);
+                            max_ready_shared.store(st.max_ready_height, Ordering::Relaxed);
                         }
                         ConfirmEvent::BodyMissing { hash } => {
                             st.body.demote_known(hash);

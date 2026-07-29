@@ -145,8 +145,8 @@ pub(crate) enum ConfirmEvent {
 }
 
 /// How many consecutive ready heights to confirm in one multi-block script wave.
-/// Larger waves keep rayon cores busy when archive leads tip. Fat single blocks
-/// still dominate wall time; this packs thin consecutive heights.
+/// Larger waves keep rayon cores busy when the body queue leads tip. Fat single
+/// blocks still dominate wall time; this packs thin consecutive heights.
 const CONFIRM_RUN_MAX: usize = 32;
 
 /// How far ahead of tip to pre-note ready bodies into the feed.
@@ -999,10 +999,10 @@ fn resolve_batch_wire_from_body_queue(
     }
 }
 
-/// Offer a run of ready archived heights starting at tip+1 into the confirm feed.
+/// Offer a run of claim-ready heights starting at tip+1 into the confirm feed.
 ///
 /// Pre-noting ahead of tip lets the engine batch multi-block script waves when
-/// archive leads (the post-milestone case). Caps at [`OFFER_AHEAD`].
+/// the body queue (or Class A fallback) leads tip. Caps at [`OFFER_AHEAD`].
 ///
 /// Uses `height_to_hash` for **O(OFFER_AHEAD)** work — never scans the full
 /// ordered path (that pegged a core at ~130k headers with tip frozen).
@@ -1015,8 +1015,8 @@ pub(crate) fn offer_confirm_ready(
     height_to_hash: &HashMap<u32, BlockHash>,
     body: &mut BodyPresence,
     hub: &ChainHub,
-    max_archived_height: &mut u32,
-    max_archived_shared: &AtomicU32,
+    max_ready_height: &mut u32,
+    max_ready_shared: &AtomicU32,
 ) -> u32 {
     let expect = match hub.tip_height() {
         None => 0u32,
@@ -1051,8 +1051,8 @@ pub(crate) fn offer_confirm_ready(
         if !body.ready(hub, &hash) {
             break;
         }
-        *max_archived_height = (*max_archived_height).max(ht);
-        max_archived_shared.store(*max_archived_height, Ordering::Relaxed);
+        *max_ready_height = (*max_ready_height).max(ht);
+        max_ready_shared.store(*max_ready_height, Ordering::Relaxed);
         feed.note(ht, hash);
         noted += 1;
     }

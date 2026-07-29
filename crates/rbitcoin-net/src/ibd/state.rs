@@ -101,8 +101,9 @@ pub(crate) struct IbdWorkState {
     pub header_fks: HashMap<BlockHash, Fk>,
     /// Best peer-advertised tip (version.start_height + learned header heights).
     pub max_peer_height: u32,
-    /// Contiguous / tracked Class A high-water on the work path.
-    pub max_archived_height: u32,
+    /// Highest claim-ready / offered body height on the work path (body queue
+    /// densify + confirm offer bookkeeping; not a dual-track Class A HWM).
+    pub max_ready_height: u32,
     /// Highest header height currently on the ordered work path.
     pub max_ordered_height: u32,
     pub headers_done: bool,
@@ -152,7 +153,7 @@ impl IbdWorkState {
             body: BodyPresence::new(),
             header_fks: HashMap::new(),
             max_peer_height,
-            max_archived_height: start_tip,
+            max_ready_height: start_tip,
             max_ordered_height: start_tip,
             headers_done: false,
             empty_header_streak: 0,

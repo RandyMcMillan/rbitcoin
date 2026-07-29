@@ -11,7 +11,7 @@ pub const MAX_DARK_EMPTY_REDIALS: u32 = 4;
 /// How far our known work path lags peer-advertised height.
 pub(crate) fn header_lag_behind_peers(st: &IbdWorkState, tip_h: u32) -> u32 {
     let known_hi = st
-        .max_archived_height
+        .max_ready_height
         .max(st.hash_height.values().copied().max().unwrap_or(0))
         .max(tip_h);
     st.max_peer_height.saturating_sub(known_hi)
@@ -27,7 +27,7 @@ pub fn path_drained(st: &IbdWorkState, archive_q_count: usize) -> bool {
 #[inline]
 pub fn peer_caught_up(st: &IbdWorkState, tip_h: u32) -> bool {
     let lag = header_lag_behind_peers(st, tip_h);
-    tip_h > 0 && lag <= 2 && tip_h >= st.max_archived_height
+    tip_h > 0 && lag <= 2 && tip_h >= st.max_ready_height
 }
 
 /// Success exit after path drain: headers_done or tip near max_peer_height.
@@ -87,7 +87,7 @@ mod tests {
         // Mid-chain, all dead, no redial → give up.
         let mut mid = IbdWorkState::new(Vec::new(), None, Some(161_249));
         mid.max_peer_height = 958_820;
-        mid.max_archived_height = 161_000;
+        mid.max_ready_height = 161_000;
         assert_eq!(
             all_peers_dead_action(&mid, 161_249, 0, false, 0),
             AllPeersDead::GiveUpMidCatchup
@@ -100,7 +100,7 @@ mod tests {
         // Caught up with no peers → complete.
         let mut done = IbdWorkState::new(Vec::new(), None, Some(100));
         done.max_peer_height = 100;
-        done.max_archived_height = 100;
+        done.max_ready_height = 100;
         done.headers_done = true;
         assert_eq!(
             all_peers_dead_action(&done, 100, 0, false, 0),
@@ -110,7 +110,7 @@ mod tests {
         // Path drain complete requires near peer tip (headers_done alone is not enough).
         let mut path = IbdWorkState::new(Vec::new(), None, Some(2000));
         path.max_peer_height = 313_000;
-        path.max_archived_height = 2000;
+        path.max_ready_height = 2000;
         path.headers_done = true;
         assert!(!catchup_complete_after_drain(&path, 2000, 0));
         path.max_peer_height = 2001;
@@ -119,7 +119,7 @@ mod tests {
         // Regression: tip=0 + peer horizon must not look complete (false tip mode).
         let mut zero = IbdWorkState::new(Vec::new(), None, Some(0));
         zero.max_peer_height = 958_900;
-        zero.max_archived_height = 0;
+        zero.max_ready_height = 0;
         zero.headers_done = false;
         assert!(!catchup_complete_after_drain(&zero, 0, 0));
         assert!(!peer_caught_up(&zero, 0));
@@ -137,7 +137,7 @@ mod tests {
         // path_drained false when archive queue non-empty or ordered non-empty.
         let mut busy = IbdWorkState::new(Vec::new(), None, Some(10));
         busy.max_peer_height = 10;
-        busy.max_archived_height = 10;
+        busy.max_ready_height = 10;
         busy.headers_done = true;
         assert!(!path_drained(&busy, 1));
         assert!(!catchup_complete_after_drain(&busy, 10, 1));
@@ -150,9 +150,9 @@ mod tests {
         // peer_caught_up: tip near horizon and not behind archive.
         let mut near = IbdWorkState::new(Vec::new(), None, Some(100));
         near.max_peer_height = 101;
-        near.max_archived_height = 100;
+        near.max_ready_height = 100;
         assert!(peer_caught_up(&near, 100));
-        near.max_archived_height = 105;
+        near.max_ready_height = 105;
         assert!(!peer_caught_up(&near, 100));
         assert_eq!(header_lag_behind_peers(&near, 100), 0); // archived ≥ peer
     }

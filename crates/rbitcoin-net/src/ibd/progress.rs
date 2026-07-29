@@ -1,7 +1,8 @@
 //! Work-chain progress snapshot, percent helpers, and rate/ETA for IBD logs.
 //!
 //! The operator `ibd: progress` line reports tip pace and durable block-queue
-//! occupancy (schema 12), not a separate Class A HWM / archive lead story.
+//! occupancy (schema 12). It does **not** print a retired dual-track Class A
+//! high-water or "archive lead" (`arch_hwm` / `lead=`).
 
 use super::body::BodyPresence;
 use crate::chain::ChainHub;
@@ -15,8 +16,8 @@ const TIP_HOLE_SCAN_MAX: u32 = 8192;
 /// Work-chain progress for status / progress logs.
 ///
 /// - `tip`: confirmed best-chain height
-/// - `archived`: Class A high-water on the work path (used for download lead /
-///   densify bookkeeping; **not** printed as `arch_hwm=` on the progress line)
+/// - `ready_hwm`: highest claim-ready / offered body height on the work path
+///   (body queue densify bookkeeping; **not** printed on the progress line)
 /// - `headers`: max peer-advertised / learned header height
 /// - `tip_hole`: count of heights from tip+1 until the next **claim-ready**
 ///   body (body queue / pending wire, or Class A fallback) — the fetch gap
@@ -24,7 +25,7 @@ const TIP_HOLE_SCAN_MAX: u32 = 8192;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WorkChainProgress {
     pub tip: u32,
-    pub archived: u32,
+    pub ready_hwm: u32,
     pub headers: u32,
     pub tip_hole: usize,
 }
@@ -140,13 +141,13 @@ pub(crate) fn work_chain_progress(
     height_to_hash: &HashMap<u32, BlockHash>,
     body: &mut BodyPresence,
     max_peer_height: u32,
-    max_archived_height: u32,
+    max_ready_height: u32,
 ) -> WorkChainProgress {
     let tip = hub.tip_height().unwrap_or(0);
     let tip_hole = tip_fetch_hole(hub, height_to_hash, body);
     WorkChainProgress {
         tip,
-        archived: tip.max(max_archived_height),
+        ready_hwm: tip.max(max_ready_height),
         headers: tip.max(max_peer_height),
         tip_hole,
     }
@@ -306,7 +307,7 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
-    /// Shipped progress line: tip + durable bq; no Class A arch_hwm / arch rate / lead.
+    /// Shipped progress line: tip + durable bq; forbid retired dual-track tokens.
     #[test]
     fn format_progress_line_schema12_tokens() {
         // tip_rate 12.5 → format_rate rounds to "12" (≥10).
@@ -328,11 +329,20 @@ mod tests {
             line,
             "ibd: progress 42% tip=100000 (12/s) hole=3 peers=8 prepq=1/2 writeq=0/2 txs=50000000 horizon=900000 eta=18h bq=17 (256MiB/4096MiB)"
         );
+        // Current schema tokens present.
+        assert!(line.contains(" hole="), "{line}");
+        assert!(line.contains(" bq="), "{line}");
+        assert!(line.contains("prepq"), "{line}");
+        // Retired dual-track progress tokens forbidden.
         assert!(
             !line.contains("arch_hwm"),
-            "must not report Class A arch_hwm: {line}"
+            "must not report retired arch_hwm: {line}"
         );
-        assert!(!line.contains("lead="), "must not report archive lead=: {line}");
+        assert!(!line.contains("lead="), "must not report retired lead=: {line}");
+        assert!(
+            !line.contains("arch="),
+            "must not report retired arch= rate token: {line}"
+        );
         assert_eq!(
             line.matches("/s)").count(),
             1,
@@ -435,7 +445,7 @@ mod tests {
 
         let p = work_chain_progress(&hub, &h2h, &mut body, 50, 10);
         assert_eq!(p.tip, 0);
-        assert_eq!(p.archived, 10);
+        assert_eq!(p.ready_hwm, 10);
         assert_eq!(p.headers, 50);
         assert_eq!(
             p.tip_hole, 2,

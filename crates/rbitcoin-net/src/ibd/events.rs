@@ -245,7 +245,7 @@ pub(crate) fn apply_peer_event(
                 let need_arch_cache = want_headers_beyond_soft_cap(
                     live,
                     st.body.known_len(),
-                    st.max_ordered_height.saturating_sub(st.max_archived_height),
+                    st.max_ordered_height.saturating_sub(st.max_ready_height),
                     4096,
                 );
                 if batch_len >= MAX_HEADERS_RESULTS
@@ -278,7 +278,7 @@ pub(crate) fn apply_peer_event(
                         warn!(
                             "ibd: empty headers but lag={lag} behind max_peer_height={} (known≈{}, tip={tip_h}) — keep header sync",
                             st.max_peer_height,
-                            st.max_archived_height
+                            st.max_ready_height
                                 .max(st.hash_height.values().copied().max().unwrap_or(0)),
                         );
                     }
@@ -304,7 +304,7 @@ pub(crate) fn apply_peer_event(
                 let need_arch_cache = want_headers_beyond_soft_cap(
                     live,
                     st.body.known_len(),
-                    st.max_ordered_height.saturating_sub(st.max_archived_height),
+                    st.max_ordered_height.saturating_sub(st.max_ready_height),
                     4096,
                 );
                 if live < MAX_ORDERED_HEADERS
@@ -478,8 +478,8 @@ pub(crate) fn apply_peer_event(
             // Prevent re-getdata while body queue owns this body (disk or RAM).
             st.body.mark_pending(hash);
             // Unified path: readiness only → confirm prep pulls wire from body queue.
-            // Skip dual archive-lead Class A writer when feed is present so
-            // one Class A appender (confirm write) owns the height.
+            // Unified path: confirm feed present → confirm commit is sole Class A
+            // appender (do not dual-write via archive job for known heights).
             if let Some(feed) = confirm_feed {
                 if height != u32::MAX {
                     feed.note(height, hash);
@@ -602,7 +602,7 @@ pub(crate) fn apply_archive_result(
                     .fetch_add(1, Ordering::Relaxed);
             }
             if let Some(&ht) = st.hash_height.get(&hash) {
-                st.max_archived_height = st.max_archived_height.max(ht);
+                st.max_ready_height = st.max_ready_height.max(ht);
             }
         }
         ArchiveResult::Dropped {
@@ -639,9 +639,9 @@ pub(crate) fn apply_archive_result(
 /// Without this, `offer_confirm_ready` re-noted ghost/re-queued hashes and the
 /// confirm engine spun on the same BadPrev / missing-prevout tip+1 (signet log:
 /// same hash every ~30s with tip frozen).
-pub(crate) fn update_confirm_lag(lag: &AtomicU32, tip: Option<u32>, max_archived: u32) {
+pub(crate) fn update_confirm_lag(lag: &AtomicU32, tip: Option<u32>, max_ready: u32) {
     let t = tip.unwrap_or(0);
-    lag.store(max_archived.saturating_sub(t), Ordering::Relaxed);
+    lag.store(max_ready.saturating_sub(t), Ordering::Relaxed);
 }
 
 /// Drop soft `archive_queued` charge for `hash` (wire path budget on receive).
@@ -945,7 +945,7 @@ mod confirm_reject_tests {
         );
         assert!(st.body.is_known_archived(&ok_h));
         assert!(!st.body.is_archive_charged(&ok_h));
-        assert_eq!(st.max_archived_height, 20);
+        assert_eq!(st.max_ready_height, 20);
         assert_eq!(budget.count(), 0);
         assert_eq!(stats.archived_bodies.load(Ordering::Relaxed), 1);
         // Second Ok does not double-count first-archive.

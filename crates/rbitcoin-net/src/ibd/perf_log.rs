@@ -40,7 +40,7 @@ pub(crate) struct IbdPerfSample {
     pub bq_bytes: u64,
     pub bq_count: usize,
     pub pending: usize,
-    /// Class A HWM (+ inflight) ahead of tip — densify / download headroom, not progress lead.
+    /// Claim-ready HWM (+ inflight) ahead of tip — densify headroom (not a progress lead token).
     pub arch_ahead: u32,
     pub hole: usize,
     pub peers: usize,

@@ -12,7 +12,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 | Confirm **commit** | 1 OS thread | **sole Class A appender** + structural + Class C + spend annotate + tip GC; **`block_queue_dequeue_height`** |
 | IBD main loop | 1 tokio task | none (orchestration only) |
 
-**Height-ordered unified pipeline:** peer → **body queue** → prep (plan+pin+assemble) → scripts → single commit era. **No** peer→confirm-feed wire retain, and **no** separate archive-lead track that appends Class A far ahead and reloads bodies for confirm. Optional archive job path remains only for unknown-height / legacy fallback.
+**Height-ordered unified pipeline (current):** peer → **body queue** → prep (plan+pin+assemble) → scripts → single commit era. **No** peer→confirm-feed wire retain. **No** primary dual track that appends Class A far ahead of tip and reloads bodies for confirm (retired; do not resurrect as the main IBD story). Optional **archive-job + ContigPark** remains only for unknown-height bodies and charge/abort release — not the tip densify path.
 
 **Wire retained on the pipeline batch only:** prep pulls `bitcoin::Block` from the body queue; that wire rides through scripts; **no Class-A wire rebuild** on the unified path. Class A packed form is planned once and committed in the write stage.
 

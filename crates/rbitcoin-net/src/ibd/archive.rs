@@ -252,7 +252,7 @@ pub(crate) struct ArchiveJob {
     /// Header row fk from ensure_header (writer skips hash-head re-lookup).
     pub header_fk: Fk,
     /// Tip-near body: prep/writer jump the FIFO so confirm is not stuck behind
-    /// far archive-lead blocks.
+    /// far densify heights (fallback archive-job path).
     pub priority: bool,
     /// Approx serialized size charged against [`ArchiveQueueBudget`].
     pub wire_bytes: usize,
@@ -1729,7 +1729,7 @@ pub(crate) fn spawn_archive_pipeline(
                         continue;
                     }
                     let n = batch.len() as u32;
-                    // Publish park HWM for assign densify (may be ahead of arch_hwm
+                    // Publish ContigPark HWM for densify (fallback path; may lead
                     // until commit Ok marks archived).
                     prep_next.store(park.next_h(), Ordering::Relaxed);
 

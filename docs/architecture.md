@@ -15,16 +15,28 @@ Recent tidy pass (what was deleted vs intentional dual paths):
 ## One-screen picture
 
 ```text
-  Peers (BIP324 v2) ──► IBD / tip P2P ──► Archive Class A (bodies, heads)
-                              │                    │
-                              │                    ▼
-                              │           Confirm (scripts CPU) ──► Class C tip
-                              │                    │
-                              └──── Mempool / relay ─┘
-                                                   │
-                              Reconstruct wire ◄───┤
-                              Electrum joins  ◄────┘ Class A + SH + mempool
+  Peers (BIP324 v2)
+        │
+        ▼
+  IBD densify getdata ──► durable body queue (store/block_queue/)
+        │                              │
+        │                              ▼
+        │                    Confirm prep → scripts → commit
+        │                    (sole Class A appender + Class C tip)
+        │                              │
+        └──── Mempool / tip follow ────┘
+                                       │
+                 Reconstruct wire ◄────┤
+                 Electrum joins   ◄────┘  Class A + SH + mempool
 ```
+
+**IBD height-ordered path (current):** peer decode **offers wire into the body
+queue** and notes readiness on the confirm feed; confirm **prep** reloads wire
+by height, **scripts** are pure CPU, **commit** is the only Class A appender
+and dequeues the body-queue entry after tip advance. There is **no** primary
+“archive Class A far ahead of tip, then reload for confirm” dual track.
+Unknown-height / abort-only archive-job + ContigPark remains a **fallback**
+(see [`concurrency.md`](./concurrency.md)).
 
 - **Storage center** is a **transaction-relational mmap archive**, not a UTXO
   set + LevelDB chainstate.
@@ -113,11 +125,13 @@ budgets: [`docs/ibd-memory.md`](./ibd-memory.md).
    spend annotator per process; **N readers** of published ranges are free.
 2. **Allocate-then-publish.** Write body → idx → count/HWM (Release); readers
    use Acquire. Incomplete records are invisible.
-3. **Confirm pipeline** splits **load → scripts (CPU only) → write** so disk
-   pin/load, script verify, and Class C publish overlap without pausing
-   queries under a map lock.
-4. **Request-bounded archive memory.** Soft archive queue budget limits new
-   `getdata` assignment — **not** peer TCP read/decode of already-requested
+3. **Confirm pipeline** splits **prep (body-queue wire + plan/pin) → scripts
+   (CPU only) → commit** so disk work, script verify, and Class A/C publish
+   overlap without pausing queries under a map lock. Confirm commit is the
+   **sole Class A appender** on the unified IBD path.
+4. **Request-bounded wire memory.** Durable **body-queue byte budget** (and a
+   soft RAM overflow / archive-job budget for the fallback path) limit new
+   densify `getdata` — **not** peer TCP read/decode of already-requested
    blocks (see ibd-memory).
 5. **Bulk IO.** Linux prefers **io_uring** for multi-read / RMW paths (confirm
    bodies, head resolve, spend annotate, `tx.head` resize fill) with a

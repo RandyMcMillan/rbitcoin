@@ -50,7 +50,7 @@ pub(crate) fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
             arch_prefix = false;
         }
     }
-    st.max_archived_height = st.max_archived_height.max(contiguous_arch);
+    st.max_ready_height = st.max_ready_height.max(contiguous_arch);
     // Peers may still advertise a higher tip; keep header sync open.
     st.headers_done = false;
     info!(
@@ -282,7 +282,7 @@ mod tests {
             st.ordered.len()
         );
         assert!(st.max_ordered_height >= 2);
-        assert!(st.max_archived_height >= 2); // contiguous body prefix
+        assert!(st.max_ready_height >= 2); // contiguous body prefix
         assert!(!st.headers_done);
         // Duplicates on re-seed only insert once into ordered_set.
         let n = st.ordered.len();

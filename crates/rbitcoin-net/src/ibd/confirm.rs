@@ -807,19 +807,18 @@ pub(crate) fn spawn_confirm_engine(
                             let n = *tries;
                             if n == 1 {
                                 debug!(
-                                    "ibd: confirm without archive {hash} @ {expect} (will re-offer when Class A lands)"
+                                    "ibd: confirm prep missing body @{expect} {hash} \
+                                     (need body queue / getdata; not re-queuing hash-only)"
                                 );
                             } else if n == 10 || n % 100 == 0 {
                                 warn!(
-                                    "ibd: confirm without archive still missing {hash} @ {expect} (n={n})"
+                                    "ibd: confirm prep still missing body @{expect} {hash} (n={n})"
                                 );
                             }
-                            let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
-                                .iter()
-                                .filter(|(_, ha, _)| !hub.has_block(ha))
-                                .map(|(h, ha, _)| (*h, *ha, None))
-                                .collect();
-                            feed.requeue_wire(&retry);
+                            // Do **not** requeue onto the feed: that spins prep with no
+                            // progress while soft budget is full and densify is gated.
+                            // Finish inflight + BodyMissing so assign can re-getdata tip+1.
+                            feed.finish(batch.iter().map(|(h, _, _)| *h));
                             if missing_tries.len() > 256 {
                                 missing_tries.retain(|&h, _| h.saturating_add(64) > expect);
                             }

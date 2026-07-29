@@ -918,19 +918,19 @@ pub(crate) fn drain_job_rx_as_err(
 }
 
 /// Restart path: re-note durable body-queue heights into the **confirm feed**
-/// (readiness only). Wire stays on disk / RAM pending until confirm **prep**
-/// pulls it — same as the live peer path. No dual Class-A archive-lead.
+/// (readiness only). Wire stays on disk until confirm **prep** pulls it.
 ///
-/// Already confirmed heights are dequeued (stale queue residue). Each rehydrated
-/// body is charged against [`ArchiveQueueBudget`] like a live peer Block and
-/// released on confirm accept/reject.
+/// Disk payloads do **not** charge [`ArchiveQueueBudget`] (that soft budget is
+/// only for RAM overflow / dual-track arch jobs). Charging GiB of disk against
+/// the ~512 MiB soft budget freezes densify getdata for tip holes.
 ///
+/// Already confirmed heights are dequeued (stale queue residue).
 /// Returns the number of heights noted into the feed.
 pub(crate) fn rehydrate_block_queue_into_confirm(
     hub: &ChainHub,
     st: &mut super::state::IbdWorkState,
     confirm_feed: &super::confirm::ConfirmFeed,
-    archive_queued: &ArchiveQueueBudget,
+    _archive_queued: &ArchiveQueueBudget,
 ) -> Result<usize, String> {
     use rbitcoin_log::{debug, info, warn};
 
@@ -961,8 +961,7 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
             continue;
         }
         let wire_bytes = qb.payload.len();
-        archive_queued.charge(wire_bytes);
-        st.body.mark_archive_charged_bytes(hash, wire_bytes);
+        // Disk-owned: pending so densify will not re-getdata; no soft charge.
         st.body.mark_pending(hash);
         if qb.height != u32::MAX {
             st.record_height(hash, qb.height);
@@ -975,9 +974,7 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
             // Readiness only — prep reloads wire from body queue.
             confirm_feed.note(qb.height, hash);
         } else {
-            // Unknown height: cannot feed confirm path; drop charge.
-            archive_queued.release(wire_bytes);
-            st.body.clear_archive_charged(&hash);
+            // Unknown height: cannot feed confirm path.
             st.body.mark_missing(hash);
             continue;
         }
@@ -2174,7 +2171,11 @@ mod rehydrate_tests {
         let mut st = super::super::state::IbdWorkState::new(vec![], None, None);
         let n = rehydrate_block_queue_into_confirm(&hub, &mut st, &feed, &budget).unwrap();
         assert_eq!(n, 1, "one height rehydrated as feed-ready");
-        assert_eq!(budget.count(), 1);
+        assert_eq!(
+            budget.count(),
+            0,
+            "disk rehydrate must not soft-charge archive budget (would freeze densify)"
+        );
         {
             let g = feed.inner.lock().unwrap();
             let (h, w) = g.ready.get(&height).expect("noted on feed");
@@ -2187,7 +2188,14 @@ mod rehydrate_tests {
         // Prep pulls wire from body queue (not from feed).
         let from_q = hub.query.block_queue_payload(height).unwrap().unwrap();
         assert_eq!(from_q, payload);
-        assert!(st.body.is_archive_charged(&hash) || st.body.is_pending(&hash));
+        assert!(
+            st.body.is_pending(&hash),
+            "pending so densify will not re-getdata"
+        );
+        assert!(
+            !st.body.is_archive_charged(&hash),
+            "disk path is not soft-charged"
+        );
         // Disk queue until confirm-write dequeue.
         assert_eq!(hub.query.block_queue_stats().2, 1);
 

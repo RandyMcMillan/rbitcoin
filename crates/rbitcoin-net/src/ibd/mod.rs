@@ -485,8 +485,10 @@ pub async fn ibd_cancellable(
                     max_archived_shared.store(st.max_archived_height, Ordering::Relaxed);
                 }
                 ConfirmEvent::BodyMissing { hash } => {
-                    // Stale known vs store: re-probe on next offer (do not mark missing).
+                    // No body queue / Class A for this hash — clear pending+known so
+                    // densify can re-getdata tip holes (do not leave soft-stall).
                     st.body.demote_known(hash);
+                    st.body.mark_missing(hash);
                 }
                 ConfirmEvent::Reject { height, hash, err } => {
                     apply_confirm_reject(
@@ -602,6 +604,7 @@ pub async fn ibd_cancellable(
                 }
                 ConfirmEvent::BodyMissing { hash } => {
                     st.body.demote_known(hash);
+                    st.body.mark_missing(hash);
                 }
                 ConfirmEvent::Reject { height, hash, err } => {
                     apply_confirm_reject(
@@ -1156,6 +1159,7 @@ pub async fn ibd_cancellable(
                         }
                         ConfirmEvent::BodyMissing { hash } => {
                             st.body.demote_known(hash);
+                            st.body.mark_missing(hash);
                         }
                         ConfirmEvent::Reject { height, hash, err } => {
                             apply_confirm_reject(

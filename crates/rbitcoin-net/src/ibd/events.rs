@@ -409,7 +409,12 @@ pub(crate) fn apply_peer_event(
             // full state. Assign gates new getdata via hysteresis.
             // ConfirmFeed only notes readiness (height/hash); prep reloads wire
             // from the body queue (no peer→feed Block retain).
-            let mut offered = false;
+            // Body queue holds wire: disk (Some(id)) or RAM overflow (None).
+            // Soft archive_queued budget is **only** for RAM overflow — charging
+            // multi‑GiB durable disk against the ~512 MiB soft budget freezes
+            // densify getdata (tip hole + inflight=0 while bq full of far heights).
+            let mut offered_disk = false;
+            let mut offered_ram = false;
             {
                 use bitcoin::consensus::Encodable;
                 let mut payload = Vec::with_capacity(wire_bytes);
@@ -419,7 +424,8 @@ pub(crate) fn apply_peer_event(
                         .query
                         .block_queue_offer(height, raw, header_fk.0, &payload)
                     {
-                        Ok(_) => offered = true,
+                        Ok(Some(_)) => offered_disk = true,
+                        Ok(None) => offered_ram = true,
                         Err(e) => {
                             // Real IO/corrupt only — BudgetFull is handled as RAM buffer.
                             rbitcoin_log::warn!(
@@ -429,14 +435,16 @@ pub(crate) fn apply_peer_event(
                     }
                 }
             }
-            if !offered {
+            if !offered_disk && !offered_ram {
                 // Body not retained — leave missing so densify can re-get.
                 st.body.mark_missing(hash);
                 return;
             }
-            archive_queued.charge(wire_bytes);
-            st.body.mark_archive_charged_bytes(hash, wire_bytes);
-            // Prevent re-getdata while pipeline owns this body.
+            if offered_ram {
+                archive_queued.charge(wire_bytes);
+                st.body.mark_archive_charged_bytes(hash, wire_bytes);
+            }
+            // Prevent re-getdata while body queue owns this body (disk or RAM).
             st.body.mark_pending(hash);
             // Unified path: readiness only → confirm prep pulls wire from body queue.
             // Skip dual archive-lead Class A writer when feed is present so

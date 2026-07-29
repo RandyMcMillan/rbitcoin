@@ -663,11 +663,22 @@ pub(crate) fn spawn_confirm_engine(
                 // until confirm-write dequeues after tip advance.
                 let mut batch = batch;
                 if let Err(missing) = resolve_batch_wire_from_body_queue(&hub, &mut batch) {
-                    // Body not in queue yet — demote and re-offer later.
-                    for (h, hash, _) in &missing {
+                    // Ghost readiness (noted without payload) or race before bq
+                    // offer. Do not WARN every claim tick — that flooded mainnet
+                    // logs after restart (~100 WARNs/s). Rate-limit; BodyMissing
+                    // clears optimistic pending so densify can re-getdata.
+                    static MISS_LOG: AtomicU32 = AtomicU32::new(0);
+                    let n = MISS_LOG.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 3 || n % 200 == 0 {
+                        let (h0, hash0, _) = missing[0];
                         warn!(
-                            "ibd: confirm prep missing body queue @{h} {hash} (will re-offer)"
+                            "ibd: confirm prep missing body queue first=@{h0} {hash0} \
+                             miss_n={} batch={} (count={n}; BodyMissing → re-getdata)",
+                            missing.len(),
+                            batch.len()
                         );
+                    }
+                    for (_, hash, _) in &missing {
                         let _ = event_tx.send(ConfirmEvent::BodyMissing { hash: *hash });
                     }
                     // Return claimed-with-payload heights to feed as readiness only
@@ -680,6 +691,8 @@ pub(crate) fn spawn_confirm_engine(
                     // Missing ones: finish inflight so offer can re-note after re-get.
                     feed.finish(missing.iter().map(|(h, _, _)| *h));
                     feed.requeue_wire(&req);
+                    // Avoid busy-spin when feed is full of ghost readiness notes.
+                    std::thread::sleep(Duration::from_millis(5));
                     continue;
                 }
 

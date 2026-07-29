@@ -392,18 +392,16 @@ pub(crate) fn apply_peer_event(
                 return;
             }
             // Already have wire for this height — keep first copy only.
+            // Do **not** early-return on `is_pending` alone: `BlockFramed` marks
+            // pending before decode (to suppress re-getdata), long before wire is
+            // offered to the body queue. Returning here used to note ConfirmFeed
+            // without a payload → confirm prep WARN-spam `missing body queue`
+            // after restart (mainnet: ~2.5k WARNs in 24s, tip+1 with bq≈0 while
+            // feed ready≈2k / body pend≈2k).
             if height != u32::MAX && hub.query.block_queue_has_height(height) {
                 st.body.mark_pending(hash);
                 if let Some(feed) = confirm_feed {
                     feed.note(height, hash);
-                }
-                return;
-            }
-            if st.body.is_pending(&hash) {
-                if let Some(feed) = confirm_feed {
-                    if height != u32::MAX {
-                        feed.note(height, hash);
-                    }
                 }
                 return;
             }
@@ -1498,6 +1496,200 @@ mod confirm_reject_tests {
         .unwrap();
         assert!(st.body.is_known_archived(&drop_h));
         assert!(stats.drain_events.load(Ordering::Relaxed) >= 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Regression: `BlockFramed` marks pending before decode. The first `Block`
+    /// must still offer wire into the body queue and note ConfirmFeed — not
+    /// early-return on `is_pending` alone (that ghost-noted feed readiness and
+    /// caused post-restart `missing body queue` WARN spam).
+    #[test]
+    fn block_framed_then_block_offers_body_queue_with_confirm_feed() {
+        use super::apply_peer_event;
+        use super::super::archive::ArchiveQueueBudget;
+        use super::super::confirm::ConfirmFeed;
+        use super::super::peer_io::{PeerEvent, PeerSlot};
+        use super::super::state::InflightReq;
+        use crate::seeds::AddrMan;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::hashes::Hash;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, Block, BlockHash, CompactTarget, OutPoint, Sequence, Transaction, TxIn, TxOut,
+            Witness,
+        };
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_query::Query;
+        use std::collections::HashSet;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::atomic::{AtomicU32, AtomicU64};
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        fn dummy_slot(id: usize) -> PeerSlot {
+            let (cmd_tx, _rx) = mpsc::unbounded_channel();
+            let task = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .spawn(async {});
+            PeerSlot {
+                id,
+                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 18444),
+                cmd_tx,
+                in_flight: HashSet::new(),
+                block_progress_ms: Arc::new(AtomicU64::new(0)),
+                peer_height: 5,
+                connected_ms: 1,
+                first_data_ms: AtomicU64::new(0),
+                bytes_rx: AtomicU64::new(0),
+                alive: true,
+                task,
+            }
+        }
+        fn coinbase(height: u32) -> Transaction {
+            let mut ss = if height == 0 {
+                vec![0x00]
+            } else {
+                rbitcoin_consensus::bip34_height_script(height)
+            };
+            while ss.len() < 2 {
+                ss.push(0x00);
+            }
+            Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(ss),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }
+        }
+        fn shell(prev: BlockHash, height: u32, n: u32) -> Block {
+            let header = Header {
+                version: Version::ONE,
+                prev_blockhash: prev,
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                time: 1_300_000_000 + n,
+                bits: CompactTarget::from_consensus(0x207fffff),
+                nonce: n,
+            };
+            let mut b = Block {
+                header,
+                txdata: vec![coinbase(height)],
+            };
+            b.header.merkle_root = b.compute_merkle_root().unwrap();
+            b
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-ev-framed-bq-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+
+        let mut st = IbdWorkState::new(vec![dummy_slot(1)], Some(gen), Some(0));
+        let (arch_tx, mut arch_rx) = mpsc::unbounded_channel();
+        let budget = ArchiveQueueBudget::new(16 * 1024 * 1024);
+        let write_next = AtomicU32::new(1);
+        let mut book = AddrMan::new();
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 1);
+        let feed = ConfirmFeed::new();
+
+        let b1 = shell(gen, 1, 1);
+        let h1 = b1.block_hash();
+        st.record_height(h1, 1);
+        st.header_fks
+            .insert(h1, hub.ensure_header_fk(&b1.header).unwrap());
+        st.slots[0].in_flight.insert(h1);
+        st.inflight.insert(h1, InflightReq::new(1));
+
+        // Frame first (production order) — pending, no body queue yet.
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::BlockFramed {
+                peer: 1,
+                hash: h1,
+                wire_bytes: b1.total_size(),
+            },
+            &arch_tx,
+            &budget,
+            &write_next,
+            &mut book,
+            local,
+            Some(&feed),
+        );
+        assert!(st.body.is_pending(&h1));
+        assert!(
+            !hub.query.block_queue_has_height(1),
+            "frame alone must not invent a body-queue rec"
+        );
+        assert_eq!(feed.size_snap().0, 0, "frame must not note confirm feed");
+
+        // Decoded Block after Frame must offer wire + note feed (not skip on pending).
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::Block {
+                peer: 1,
+                block: b1.clone(),
+            },
+            &arch_tx,
+            &budget,
+            &write_next,
+            &mut book,
+            local,
+            Some(&feed),
+        );
+        assert!(
+            hub.query.block_queue_has_height(1),
+            "first Block after Frame must land in body queue"
+        );
+        assert!(
+            hub.query
+                .block_queue_payload(1)
+                .unwrap()
+                .is_some_and(|p| !p.is_empty()),
+            "body-queue payload must be non-empty for confirm prep"
+        );
+        assert_eq!(feed.size_snap().0, 1, "confirm feed noted after bq offer");
+        assert!(arch_rx.try_recv().is_err(), "confirm feed owns Class A path");
+
+        // Redelivery: still only one rec, still feed-ready.
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::Block {
+                peer: 1,
+                block: b1,
+            },
+            &arch_tx,
+            &budget,
+            &write_next,
+            &mut book,
+            local,
+            Some(&feed),
+        );
+        assert!(hub.query.block_queue_has_height(1));
+        assert_eq!(feed.size_snap().0, 1);
 
         let _ = std::fs::remove_dir_all(dir);
     }

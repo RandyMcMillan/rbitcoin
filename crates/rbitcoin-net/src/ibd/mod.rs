@@ -96,11 +96,15 @@ pub(crate) const NEAR_DEPTH: u32 = 4096;
 /// Max contiguous tip+1.. holes to cover per assign.
 pub(crate) const TIP_HOLE_MAX: usize = 32;
 /// Max concurrent getdata peers for one tip-hole hash.
-pub(crate) const TIP_HOLE_MAX_PEERS: usize = 3;
-/// Immediate tip-hole race size (first + second peer).
-pub(crate) const TIP_HOLE_IMMEDIATE_PEERS: usize = 2;
-/// After the second tip-hole peer is issued, wait this long before a third.
-pub(crate) const TIP_HOLE_THIRD_PEER_AFTER: Duration = Duration::from_secs(10);
+///
+/// Tip+1 freezes confirm while densify can run ahead; race enough peers so a
+/// single slow peer cannot pin hole=1 for minutes (mainnet: tip stuck with
+/// hole=1, conf_blks=0, bq growing).
+pub(crate) const TIP_HOLE_MAX_PEERS: usize = 4;
+/// Immediate tip-hole race size — full race up front (no 10s third-peer delay).
+pub(crate) const TIP_HOLE_IMMEDIATE_PEERS: usize = 4;
+/// Kept for API/tests: extra peers beyond immediate (unused when IMMEDIATE==MAX).
+pub(crate) const TIP_HOLE_THIRD_PEER_AFTER: Duration = Duration::from_secs(5);
 /// Cap on IBD dial pool after getaddr learning (seeds + discovered).
 pub(crate) const MAX_PEER_POOL: usize = 256;
 /// Pending (framed, not Class A) longer than this → re-getdata.
@@ -1414,27 +1418,33 @@ mod peer_book_and_config_tests {
 #[cfg(test)]
 mod tip_hole_race_tests {
     use super::assign::tip_hole_peer_target;
+    use super::{TIP_HOLE_IMMEDIATE_PEERS, TIP_HOLE_MAX_PEERS};
     use std::time::{Duration, Instant};
 
     #[test]
-    fn tip_hole_targets_two_immediately() {
+    fn tip_hole_targets_full_race_immediately() {
         let now = Instant::now();
-        assert_eq!(tip_hole_peer_target(0, None, now), 2);
-        assert_eq!(tip_hole_peer_target(1, None, now), 2);
+        // Full multi-peer race for tip+1 — do not wait 10s while densify fills bq.
+        assert_eq!(tip_hole_peer_target(0, None, now), TIP_HOLE_IMMEDIATE_PEERS);
+        assert_eq!(tip_hole_peer_target(1, None, now), TIP_HOLE_IMMEDIATE_PEERS);
+        assert_eq!(
+            tip_hole_peer_target(TIP_HOLE_IMMEDIATE_PEERS - 1, None, now),
+            TIP_HOLE_IMMEDIATE_PEERS
+        );
+        assert_eq!(TIP_HOLE_IMMEDIATE_PEERS, TIP_HOLE_MAX_PEERS);
     }
 
     #[test]
-    fn tip_hole_third_only_after_grace() {
+    fn tip_hole_caps_at_max_peers() {
         let t0 = Instant::now();
         assert_eq!(
-            tip_hole_peer_target(2, Some(t0), t0 + Duration::from_secs(9)),
-            2
+            tip_hole_peer_target(TIP_HOLE_MAX_PEERS, Some(t0), t0 + Duration::from_secs(60)),
+            TIP_HOLE_MAX_PEERS
         );
         assert_eq!(
-            tip_hole_peer_target(2, Some(t0), t0 + Duration::from_secs(10)),
-            3
+            tip_hole_peer_target(TIP_HOLE_MAX_PEERS + 5, Some(t0), t0 + Duration::from_secs(60)),
+            TIP_HOLE_MAX_PEERS
         );
-        assert_eq!(tip_hole_peer_target(3, Some(t0), t0 + Duration::from_secs(60)), 3);
     }
 }
 

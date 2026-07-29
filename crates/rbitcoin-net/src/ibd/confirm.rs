@@ -1048,7 +1048,12 @@ pub(crate) fn offer_confirm_ready(
             }
             break;
         }
-        if !body.ready(hub, &hash) {
+        // Claim-ready = body queue / pending / Class A — not Class A alone.
+        // Peer path also notes feed on offer; this fills Class A fallback and
+        // re-notes after restart hygiene. Break on first fetch hole so we do
+        // not pretip far heights while tip+1 is missing (confirm still claims
+        // tip-first; noting far without tip is harmless but wastes map RAM).
+        if !super::progress::claim_ready(hub, body, ht, &hash) {
             break;
         }
         *max_ready_height = (*max_ready_height).max(ht);

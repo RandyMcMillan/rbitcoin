@@ -53,7 +53,11 @@ pub(crate) fn compact_ordered(
 }
 
 /// Densify slots per peer: drip while a tip hole exists, else half of `per_peer`.
-#[cfg(test)]
+///
+/// When tip+1 is a fetch hole, densify must **not** fill every peer to
+/// `per_peer` (16) or tip multi-peer getdata has nowhere to land — mainnet
+/// sat hole=1 with conf_blks=0 while bq/feed grew tens of thousands of far
+/// bodies and peers kept making densify progress (never stall-disconnect).
 pub(crate) fn far_slots_per_peer(per_peer: usize, tip_hole: bool) -> usize {
     if tip_hole {
         2

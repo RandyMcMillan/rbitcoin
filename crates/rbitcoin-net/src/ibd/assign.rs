@@ -2,16 +2,17 @@
 //!
 //! Policy (operator-facing):
 //! - **Tip batch** (tip+1 .. tip+[`TIP_HOLE_MAX`]=32, one confirm run): always
-//!   request missing hashes (even if durable bq is full). Multi-peer race; extra
-//!   peers if still in-flight after [`TIP_HOLE_THIRD_PEER_AFTER`].
+//!   request missing hashes (even if durable bq is full). Multi-peer race up to
+//!   [`TIP_HOLE_MAX_PEERS`] immediately — confirm is frozen until tip+1 is
+//!   claim-ready.
 //! - **Densify** (tip+1 outward, closest first): while durable body queue has
-//!   **byte** headroom (`block_queue_can_request`), fill missing heights up to
-//!   [`CONTIG_DENSIFY_AHEAD`] (height safety cap — not a second count budget on
-//!   the queue itself). Early small blocks can therefore buffer tens of
-//!   thousands of heights until the multi‑GiB byte budget is the limiter.
+//!   **byte** headroom, fill missing heights up to [`CONTIG_DENSIFY_AHEAD`].
+//!   When a tip hole exists, densify is capped to
+//!   [`super::assign_plan::far_slots_per_peer`] so tip races keep peer slots.
 //! - Never request beyond densify horizon; events refuse far bodies too.
 //! - One body-queue copy per height (receive path drops duplicates).
 
+use super::assign_plan::far_slots_per_peer;
 use super::peer_io::{touch_block_progress, PeerCmd, PeerSlot};
 use super::state::{self, IbdWorkState};
 use super::status::LoopStats;
@@ -157,6 +158,9 @@ pub(crate) fn assign_work_ordered(
         return;
     }
 
+    // Leave per-peer headroom for tip races while hole>0.
+    let densify_per_peer = far_slots_per_peer(cfg.per_peer, !tip_holes.is_empty());
+
     // Closest-to-tip first: tip+1 .. tip+densify_ahead.
     let densify_hi = path_lo.saturating_add(CONTIG_DENSIFY_AHEAD);
     let densify = collect_height_band(st, hub, path_lo, densify_hi, room.max(1));
@@ -176,7 +180,7 @@ pub(crate) fn assign_work_ordered(
             }
             let pid = alive[peer_i % alive.len()];
             peer_i += 1;
-            if !peer_has_slot(st, pid, cfg.per_peer) {
+            if !peer_has_slot(st, pid, densify_per_peer) {
                 continue;
             }
             let Some(h) = pop_need(&mut densify_q, st, hub) else {
@@ -626,6 +630,25 @@ mod tests {
         assert!(!archive_pipeline_saturated(96, 0, 0.0));
         assert!(archive_pipeline_saturated(0, 0, 0.85));
         assert!(archive_pipeline_saturated(200, 15, 0.9));
+    }
+
+    /// When tip+1 is a hole, densify must leave per-peer headroom so tip multi-
+    /// peer race can attach (mainnet: hole=1 + conf_blks=0 while densify filled
+    /// every peer to 16 and bq grew).
+    #[test]
+    fn densify_yields_peer_slots_while_tip_hole_open() {
+        use super::super::assign_plan::far_slots_per_peer;
+        assert_eq!(
+            far_slots_per_peer(16, true),
+            2,
+            "tip hole → densify at most 2 in-flight per peer"
+        );
+        assert!(
+            far_slots_per_peer(16, true) < 16,
+            "must leave room for tip race up to TIP_HOLE_MAX_PEERS"
+        );
+        // Without tip hole, densify may use half of per_peer (still < full).
+        assert_eq!(far_slots_per_peer(16, false), 8);
     }
 
     /// Densify must request past the legacy 2048 height cap when the body-queue

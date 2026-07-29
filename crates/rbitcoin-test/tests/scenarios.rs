@@ -2462,10 +2462,19 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
     {
         let creates = std::sync::Arc::make_mut(&mut pipe.in_flight_creates);
         let outs = std::sync::Arc::make_mut(&mut pipe.in_flight_outs);
-        for ((tx, _ins, o), fk) in plan_a.packed.iter().zip(plan_a.planned_fks.iter()) {
+        let secret = q.store().txs.store_secret();
+        for ((tx, ins, o), fk) in plan_a.packed.iter().zip(plan_a.planned_fks.iter()) {
             creates.insert(tx.txid, *fk);
             if let Some(id) = fk.get() {
-                outs.insert(id, (tx.clone(), o.clone()));
+                let mut raw = Vec::new();
+                rbitcoin_store::encode_packed_tx_with_secret(tx, ins, o, &mut raw, Some(secret));
+                let denserels = rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
+                    &raw,
+                    Some(secret),
+                )
+                .map(|(_, _, r)| r)
+                .unwrap_or_default();
+                outs.insert(id, (tx.clone(), o.clone(), denserels));
             }
         }
     }

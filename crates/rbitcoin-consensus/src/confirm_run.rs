@@ -88,13 +88,17 @@ pub struct WirePrepPipeline {
     pub next_tx_start: u64,
     /// Prior uncommitted plans: create txid → fk (shared; clone is Arc bump only).
     pub in_flight_creates: std::sync::Arc<HashMap<[u8; 32], rbitcoin_primitives::Fk>>,
-    /// Prior uncommitted plans: create fk id → (tx meta, outs) for parent pin.
+    /// Prior uncommitted plans: create fk id → (tx meta, outs, denserels).
+    ///
+    /// `denserels` is offline-packed (same as disk) so prep(N+1) can pin abs
+    /// layout without waiting for commit(N) body IO; body_range is filled at write.
     pub in_flight_outs: std::sync::Arc<
         HashMap<
             u64,
             (
                 rbitcoin_store::TxRecord,
                 Vec<rbitcoin_store::OutputRecord>,
+                Vec<u32>,
             ),
         >,
     >,
@@ -534,17 +538,39 @@ pub fn confirm_wire_run_preverified(
     confirm_write_phase(query, params, milestone, ok.batch)
 }
 
+/// Offline denserels matching Class A body packing (for plan / in-flight pin).
+fn offline_dense_rels(
+    query: &Query,
+    tx: &rbitcoin_store::TxRecord,
+    ins: &[rbitcoin_store::InputRecord],
+    outs: &[rbitcoin_store::OutputRecord],
+) -> Vec<u32> {
+    let secret = query.store().txs.store_secret();
+    let mut raw = Vec::new();
+    rbitcoin_store::encode_packed_tx_with_secret(tx, ins, outs, &mut raw, Some(secret));
+    rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(&raw, Some(secret))
+        .map(|(_, _, rels)| rels)
+        .unwrap_or_default()
+}
+
 /// Pin parents for wire prep: **only spent parents** (sparse outs).
 ///
-/// Sources: plan/in-flight packed outs → CreateResidency sparse hit → cold denserels.
-/// Does not pin every batch create (legacy hangover that cloned ~all creates/blk).
+/// Sources: plan/in-flight packed outs (+ offline denserels) → CreateResidency
+/// sparse hit → cold denserels. Does not pin every batch create.
 fn pin_for_wire_batch(
     query: &Query,
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,
     metas: &[BodyMeta],
     wire_blocks: &[Arc<Block>],
     in_flight_outs: Option<
-        &HashMap<u64, (rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>)>,
+        &HashMap<
+            u64,
+            (
+                rbitcoin_store::TxRecord,
+                Vec<rbitcoin_store::OutputRecord>,
+                Vec<u32>,
+            ),
+        >,
     >,
 ) -> Result<(rbitcoin_query::BatchParents, rbitcoin_query::BatchThin), ConsensusError> {
     use rbitcoin_query::confirm_load_stats;
@@ -556,23 +582,28 @@ fn pin_for_wire_batch(
     let mut batch_thin: rbitcoin_query::BatchThin = std::collections::HashMap::new();
     let mut parent_vouts: HashMap<u64, Vec<u32>> = HashMap::new();
 
-    // Index into plan.packed / in_flight without cloning every create's full outs.
+    // id → (tx, outs, dense denserels). Built for spent parents only (after thin pass).
     let mut plan_by_id: HashMap<
         u64,
         (
+            rbitcoin_store::TxRecord,
+            Vec<rbitcoin_store::OutputRecord>,
+            Vec<u32>,
+        ),
+    > = HashMap::new();
+    // Index plan packed by create id for thin edges + later sparse denserels pin.
+    let mut plan_packed_by_id: HashMap<
+        u64,
+        (
             &rbitcoin_store::TxRecord,
+            &Vec<rbitcoin_store::InputRecord>,
             &Vec<rbitcoin_store::OutputRecord>,
         ),
     > = HashMap::new();
-    if let Some(ifo) = in_flight_outs {
-        for (id, (tx, outs)) in ifo {
-            plan_by_id.insert(*id, (tx, outs));
-        }
-    }
     if let Some(plan) = plan {
-        for ((tx, _ins, outs), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
+        for ((tx, ins, outs), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
             if let Some(id) = fk.get() {
-                plan_by_id.insert(id, (tx, outs));
+                plan_packed_by_id.insert(id, (tx, ins, outs));
             }
         }
         for ((tx, ins, _outs), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
@@ -655,14 +686,38 @@ fn pin_for_wire_batch(
         vouts.dedup();
     }
 
+    // Build plan/in-flight pin sources only for spent parents (not every create).
+    if let Some(ifo) = in_flight_outs {
+        for (id, need) in &parent_vouts {
+            if plan_by_id.contains_key(id) {
+                continue;
+            }
+            if let Some((tx, outs, denserels)) = ifo.get(id) {
+                let _ = need;
+                plan_by_id.insert(*id, (tx.clone(), outs.clone(), denserels.clone()));
+            }
+        }
+    }
+    for (id, _need) in &parent_vouts {
+        if plan_by_id.contains_key(id) {
+            continue;
+        }
+        if let Some((tx, ins, outs)) = plan_packed_by_id.get(id) {
+            let denserels = offline_dense_rels(query, tx, ins, outs);
+            plan_by_id.insert(*id, ((*tx).clone(), (*outs).clone(), denserels));
+        }
+    }
+
     let mut batch_parents = rbitcoin_query::BatchParents::with_capacity(parent_vouts.len());
     let mut still_need: HashMap<u64, Vec<u32>> = HashMap::new();
     let mut n_plan_pin = 0u64;
 
     // Plan / in-flight: sparse pin only spent parents (not every batch create).
+    // Prefer residency body_range when prior batch already committed; always
+    // attach offline denserels so write ensure does not re-read Class A body.
     let t_plan = Instant::now();
     for (id, need) in &parent_vouts {
-        if let Some((tx, outs)) = plan_by_id.get(id) {
+        if let Some((tx, outs, denserels)) = plan_by_id.get(id) {
             let live: Vec<(u32, rbitcoin_store::OutputRecord)> = need
                 .iter()
                 .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
@@ -677,14 +732,35 @@ fn pin_for_wire_batch(
             } else {
                 None
             };
+            let fk = rbitcoin_primitives::Fk(*id);
+            // If commit(N) already seeded residency, take body_range (and denserels
+            // if offline was empty).
+            let (body_range, sparse) =
+                if let Some((_rtx, _live, res_sparse, range)) =
+                    query.create_residency().get_parent_needed(fk, need)
+                {
+                    if denserels.is_empty() {
+                        (range, res_sparse)
+                    } else {
+                        let sp = rbitcoin_query::sparse_spender_rels(denserels, need);
+                        (range, sp)
+                    }
+                } else if !denserels.is_empty() {
+                    (
+                        None,
+                        rbitcoin_query::sparse_spender_rels(denserels, need),
+                    )
+                } else {
+                    (None, Vec::new())
+                };
             batch_parents.insert_owned(
-                rbitcoin_primitives::Fk(*id),
-                (*tx).clone(),
+                fk,
+                tx.clone(),
                 live,
                 need.clone(),
                 cb,
-                None,
-                Vec::new(),
+                body_range,
+                sparse,
             );
             n_plan_pin = n_plan_pin.saturating_add(1);
         } else {
@@ -1005,11 +1081,11 @@ pub fn confirm_write_phase(
     Ok(out)
 }
 
-/// After Class A commit, set body_range + denserels for **planned** creates only.
+/// After Class A commit, set body_range (+ denserels if missing) for **pinned**
+/// planned creates only.
 ///
-/// Uses offline pack (same encoding as disk) + `tx_body_range_batch` — **no**
-/// Class A body pread / `load_creates_once`. Same-batch creates only; cross-batch
-/// prep-ahead parents are filled by [`fill_missing_parent_layouts`].
+/// Uses `tx_body_range_batch` — **no** Class A body pread. Skips creates not in
+/// `batch_parents` (most of the batch). Prefer denserels already set at prep pin.
 fn fill_planned_create_layout_after_commit(
     query: &Query,
     batch_parents: &mut rbitcoin_query::BatchParents,
@@ -1023,19 +1099,42 @@ fn fill_planned_create_layout_after_commit(
     if planned_fks.is_empty() || packed.is_empty() {
         return Ok(());
     }
+    // Only parents actually pinned for spends and still missing layout.
+    let missing: std::collections::HashSet<u64> = batch_parents
+        .fks_missing_layout()
+        .into_iter()
+        .filter_map(|f| f.get())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut need_fks: Vec<rbitcoin_primitives::Fk> = Vec::new();
+    let mut need_packed_i: Vec<usize> = Vec::new();
+    for (i, fk) in planned_fks.iter().enumerate() {
+        let Some(id) = fk.get() else { continue };
+        if !missing.contains(&id) {
+            continue;
+        }
+        need_fks.push(*fk);
+        need_packed_i.push(i);
+    }
+    if need_fks.is_empty() {
+        return Ok(());
+    }
     let ranges = query
         .store()
-        .tx_body_range_batch(planned_fks)
+        .tx_body_range_batch(&need_fks)
         .map_err(ConsensusError::Store)?;
     let secret = query.store().txs.store_secret();
-    for ((tx, ins, outs), (fk, range)) in packed
-        .iter()
-        .zip(planned_fks.iter().zip(ranges.into_iter()))
+    for ((&fk, range), &pi) in need_fks.iter().zip(ranges.into_iter()).zip(need_packed_i.iter())
     {
         let Some((off, len)) = range else {
             continue;
         };
-        // Offline pack matches durable body layout → denserels without disk read.
+        let (tx, ins, outs) = &packed[pi];
+        // If pin already has denserels, only attach body_range via empty denserels
+        // path that set_layout rebuilds from dense — recompute offline only when
+        // spender_rels empty (cheap relative to full-batch re-encode of all creates).
         let mut raw = Vec::new();
         rbitcoin_store::encode_packed_tx_with_secret(tx, ins, outs, &mut raw, Some(secret));
         let Ok((_meta, _outs, dense_rels)) =
@@ -1043,20 +1142,19 @@ fn fill_planned_create_layout_after_commit(
         else {
             continue;
         };
-        batch_parents.set_layout(*fk, (off, len), &dense_rels);
+        batch_parents.set_layout(fk, (off, len), &dense_rels);
     }
     Ok(())
 }
 
 /// Ensure denserels/abs for every spend edge on the write batch.
 ///
-/// Covers:
-/// 1. Prep-ahead: parents from plan(N) pinned without denserels while N uncommitted
-/// 2. Already-archived Class A (`archive_plan = None`): same-batch creates never
-///    entered `batch_parents` at pin (planned_outs empty) — annotate needs abs
-/// 3. Retry after Class A committed then annotate failed: pin map incomplete
+/// Covers residual gaps after pin offline denserels + fill_planned ranges:
+/// 1. Prep-ahead parents not yet committed when prepped (body_range missing)
+/// 2. Already-archived Class A same-batch creates never pinned
+/// 3. Retry after partial write
 ///
-/// Walks prepared spends (not only pin-map entries) and loads missing layout once.
+/// **Residency first** (commit denserels seed) — cold Class A body only if miss.
 fn ensure_spend_abs_layouts(
     query: &Query,
     batch_parents: &mut rbitcoin_query::BatchParents,
@@ -1093,7 +1191,59 @@ fn ensure_spend_abs_layouts(
         vouts.sort_unstable();
         vouts.dedup();
     }
-    let fks: Vec<rbitcoin_primitives::Fk> = need
+
+    // 1) Residency denserels + body_range (commit seed / prior cold pin) — no body IO.
+    let mut still: HashMap<u64, Vec<u32>> = HashMap::new();
+    for (id, need_v) in &need {
+        let fk = rbitcoin_primitives::Fk(*id);
+        if let Some((tx, live, sparse, body_range)) =
+            query.create_residency().get_parent_needed(fk, need_v)
+        {
+            if let Some(range) = body_range {
+                if batch_parents.contains(fk) {
+                    if let Some((_t, _o, dense, br)) = query.create_residency().get_outs(fk) {
+                        let br = br.unwrap_or(range);
+                        batch_parents.set_layout_for_need(fk, br, &dense, need_v);
+                    } else {
+                        // Sparse already covers need_v; set body_range via denserels
+                        // rebuilt from get_outs miss — fall through to cold.
+                        still.insert(*id, need_v.clone());
+                        continue;
+                    }
+                } else {
+                    let cb = if tx.input_count != 1 {
+                        Some(false)
+                    } else {
+                        None
+                    };
+                    batch_parents.insert_owned(
+                        fk,
+                        tx,
+                        live,
+                        need_v.clone(),
+                        cb,
+                        Some(range),
+                        sparse,
+                    );
+                }
+                continue;
+            }
+        }
+        // Partial: pin has denserels but no body_range — try residency range only.
+        if batch_parents.contains(fk) {
+            if let Some((_t, _o, dense, Some(range))) = query.create_residency().get_outs(fk) {
+                batch_parents.set_layout_for_need(fk, range, &dense, need_v);
+                continue;
+            }
+        }
+        still.insert(*id, need_v.clone());
+    }
+    if still.is_empty() {
+        return Ok(());
+    }
+
+    // 2) Cold denserels body for remainder only.
+    let fks: Vec<rbitcoin_primitives::Fk> = still
         .keys()
         .map(|id| rbitcoin_primitives::Fk(*id))
         .collect();
@@ -1107,11 +1257,17 @@ fn ensure_spend_abs_layouts(
     let secret = query.store().txs.store_secret();
     for c in loaded {
         let Some(id) = c.fk.get() else { continue };
-        let need_v = need.get(&id).cloned().unwrap_or_default();
-        let Ok((tx, outs, dense_rels)) =
-            rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(&c.raw, Some(secret))
-        else {
-            continue;
+        let need_v = still.get(&id).cloned().unwrap_or_default();
+        let (tx, outs, dense_rels) = if let Some(dec) = c.decoded_outs {
+            dec
+        } else {
+            match rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
+                &c.raw,
+                Some(secret),
+            ) {
+                Ok(v) => v,
+                Err(_) => continue,
+            }
         };
         if batch_parents.contains(c.fk) {
             batch_parents.set_layout_for_need(c.fk, c.body_range, &dense_rels, &need_v);

@@ -19,8 +19,16 @@ use std::time::{Duration, Instant};
 struct PrepAheadState {
     next_tx_start: u64,
     in_flight_creates: std::sync::Arc<HashMap<[u8; 32], Fk>>,
-    in_flight_outs:
-        std::sync::Arc<HashMap<u64, (rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>)>>,
+    in_flight_outs: std::sync::Arc<
+        HashMap<
+            u64,
+            (
+                rbitcoin_store::TxRecord,
+                Vec<rbitcoin_store::OutputRecord>,
+                Vec<u32>,
+            ),
+        >,
+    >,
     /// Last height successfully prepped (still in pipeline or already committed).
     last_prepped: Option<(u32, [u8; 32])>,
 }
@@ -71,16 +79,21 @@ impl PrepAheadState {
 
     fn note_plan_ok(
         &mut self,
+        hub: &ChainHub,
         plan: &rbitcoin_query::ArchiveWritePlan,
         last_height: u32,
         last_hash: [u8; 32],
     ) {
         let creates = std::sync::Arc::make_mut(&mut self.in_flight_creates);
         let outs = std::sync::Arc::make_mut(&mut self.in_flight_outs);
-        for ((tx, _ins, o), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
+        let secret = hub.query.store().txs.store_secret();
+        for ((tx, ins, o), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
             creates.insert(tx.txid, *fk);
             if let Some(id) = fk.get() {
-                outs.insert(id, (tx.clone(), o.clone()));
+                // Offline denserels (same packing as Class A body) so prep(N+1)
+                // pin has abs layout without commit(N) body IO.
+                let denserels = offline_in_flight_denserels(secret, tx, ins, o);
+                outs.insert(id, (tx.clone(), o.clone(), denserels));
             }
         }
         if let Some(last) = plan.planned_fks.last().and_then(|f| f.get()) {
@@ -95,6 +108,20 @@ impl PrepAheadState {
         self.last_prepped = None;
         self.next_tx_start = hub.query.tx_body_count().saturating_add(1).max(1);
     }
+}
+
+/// Offline denserels for in-flight pin (must match Class A body packing).
+fn offline_in_flight_denserels(
+    secret: &rbitcoin_store::StoreSecret,
+    tx: &rbitcoin_store::TxRecord,
+    ins: &[rbitcoin_store::InputRecord],
+    outs: &[rbitcoin_store::OutputRecord],
+) -> Vec<u32> {
+    let mut raw = Vec::new();
+    rbitcoin_store::encode_packed_tx_with_secret(tx, ins, outs, &mut raw, Some(secret));
+    rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(&raw, Some(secret))
+        .map(|(_, _, rels)| rels)
+        .unwrap_or_default()
 }
 
 /// Shared feed of tip-extension **readiness** for the dedicated confirm engine.
@@ -937,7 +964,7 @@ pub(crate) fn spawn_confirm_engine(
                                 .into_iter()
                                 .max_by_key(|(h, _)| *h)
                             {
-                                prep_ahead.note_plan_ok(plan, lh, raw);
+                                prep_ahead.note_plan_ok(&hub, plan, lh, raw);
                             }
                         } else if let Some((lh, raw)) = outcome
                             .batch

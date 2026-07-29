@@ -158,6 +158,15 @@ pub(crate) const LOAD_QUEUE_CAP: usize = 5;
 /// Script-ok batches buffered for write (scripts(N+1) may run while N writes).
 pub(crate) const WRITE_QUEUE_CAP: usize = 5;
 
+/// Max heights claimable ahead of tip+1 (pipeline depth).
+///
+/// Prep may start the next run while scripts/write hold earlier ones, but must
+/// **not** skip a stuck tip+1 and claim thousands of far heights. Far claims
+/// with `confirm_wire_prep` path_lo=tip+1 return `Ok(None)` and used to leave
+/// those heights stuck in `feed.inflight` forever (mainnet: tip=86, inflight=2049).
+const MAX_CLAIM_AHEAD: u32 =
+    (LOAD_QUEUE_CAP + WRITE_QUEUE_CAP + 1) as u32 * CONFIRM_RUN_MAX as u32;
+
 /// Live depths **and contents** of the two bounded confirm pipeline queues.
 ///
 /// Updated on successful send/recv so the status loop can log pressure and
@@ -565,24 +574,32 @@ pub(crate) fn spawn_confirm_engine(
                         g.ready.retain(|&h, _| h >= path_lo);
                         g.inflight.retain(|&h| h >= path_lo);
 
-                        // Next claim start: walk from tip+1, skip heights already
-                        // in-flight (pipeline overlap: load N+1 while scripts N).
-                        // Stop at a hole (neither ready nor inflight).
+                        // Claim start = tip+1, or first height after a short
+                        // contiguous inflight prefix (prep∥scripts∥write). Never
+                        // jump past a hole or past MAX_CLAIM_AHEAD — otherwise
+                        // far batches return Ok(None) from wire prep and used to
+                        // pin inflight forever while tip stalls.
                         let mut claim_at = path_lo;
-                        let claim_start = loop {
-                            if g.inflight.contains(&claim_at) {
-                                claim_at = claim_at.saturating_add(1);
-                                continue;
-                            }
-                            if g.ready.contains_key(&claim_at) {
-                                break Some(claim_at);
-                            }
-                            break None; // hole or nothing ready
+                        while g.inflight.contains(&claim_at)
+                            && claim_at < path_lo.saturating_add(MAX_CLAIM_AHEAD)
+                        {
+                            claim_at = claim_at.saturating_add(1);
+                        }
+                        let claim_start = if claim_at > path_lo.saturating_add(MAX_CLAIM_AHEAD)
+                        {
+                            None // tip-near pipeline full — wait for write finish
+                        } else if g.inflight.contains(&claim_at) {
+                            None
+                        } else if g.ready.contains_key(&claim_at) {
+                            Some(claim_at)
+                        } else {
+                            None // tip+1 hole (or gap after inflight prefix)
                         };
                         if let Some(expect) = claim_start {
+                            let claim_hi = path_lo.saturating_add(MAX_CLAIM_AHEAD);
                             let mut run = Vec::with_capacity(CONFIRM_RUN_MAX);
                             let mut h = expect;
-                            while run.len() < CONFIRM_RUN_MAX {
+                            while run.len() < CONFIRM_RUN_MAX && h <= claim_hi {
                                 if g.inflight.contains(&h) {
                                     break; // don't merge into another claimed run
                                 }
@@ -744,16 +761,58 @@ pub(crate) fn spawn_confirm_engine(
                 }
 
                 match mat_res {
-                    Ok(None) => {}
+                    Ok(None) => {
+                        // Wire prep skipped (not contiguous from tip+1, already
+                        // confirmed, empty). Must release claim — leaving heights
+                        // in feed.inflight blocks re-note and freezes tip forever.
+                        let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
+                            .iter()
+                            .filter(|(_, ha, _)| !hub.has_block(ha))
+                            .map(|(h, ha, _)| (*h, *ha, None))
+                            .collect();
+                        if !retry.is_empty() {
+                            static N: AtomicU32 = AtomicU32::new(0);
+                            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n <= 5 || n % 200 == 0 {
+                                debug!(
+                                    "ibd: confirm prep empty outcome first={expect_h} n={} — re-queue (count={n})",
+                                    retry.len()
+                                );
+                            }
+                            feed.requeue_wire(&retry);
+                            // Avoid busy-spin when tip+1 is not yet claimable as contig.
+                            std::thread::sleep(Duration::from_millis(5));
+                        } else {
+                            feed.finish(batch.iter().map(|(h, _, _)| *h));
+                        }
+                    }
                     Ok(Some(outcome)) => {
                         let work_ms = outcome.work_ns / 1_000_000;
                         // prepared.len(), not claim size (multi-split can shrink need).
                         let prepared_n = outcome.batch.len();
+                        let prepared_heights: std::collections::HashSet<u32> = outcome
+                            .batch
+                            .heights_hashes()
+                            .into_iter()
+                            .map(|(h, _)| h)
+                            .collect();
                         if prepared_n != batch.len() {
-                            warn!(
-                                "ibd: confirm prep prepared_n={prepared_n} != claim_n={} first={expect_h}",
-                                batch.len()
-                            );
+                            // Re-queue claim heights prep dropped (write only finishes prepared).
+                            let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
+                                .iter()
+                                .filter(|(h, ha, _)| {
+                                    !prepared_heights.contains(h) && !hub.has_block(ha)
+                                })
+                                .map(|(h, ha, _)| (*h, *ha, None))
+                                .collect();
+                            if !tail.is_empty() {
+                                warn!(
+                                    "ibd: confirm prep prepared_n={prepared_n} != claim_n={} first={expect_h} re-queue tail={}",
+                                    batch.len(),
+                                    tail.len()
+                                );
+                                feed.requeue_wire(&tail);
+                            }
                         }
                         let wire = outcome.batch.approx_wire_bytes();
                         let parents = outcome.batch.parent_count();
@@ -997,16 +1056,17 @@ mod tests {
         BlockHash::from_byte_array([b; 32])
     }
 
-    /// Contiguous feed claim (2-stage): up to max heights, skip already-confirmed.
+    /// Contiguous feed claim from `expect`, optional skip of already-confirmed.
     fn claim_feed_run(
         expect: u32,
         max: usize,
+        claim_hi: u32,
         feed_has: impl Fn(u32) -> bool,
         already_confirmed: impl Fn(u32) -> bool,
     ) -> Vec<u32> {
         let mut run = Vec::with_capacity(max.min(32));
         let mut h = expect;
-        while run.len() < max {
+        while run.len() < max && h <= claim_hi {
             if !feed_has(h) {
                 break;
             }
@@ -1023,18 +1083,63 @@ mod tests {
     /// Contiguous claim + skip already-confirmed (pure claim helper).
     #[test]
     fn claim_feed_wave_and_skip_confirmed() {
-        let run = claim_feed_run(101, 32, |h| h >= 101 && h < 101 + 40, |_| false);
+        let run = claim_feed_run(101, 32, 200, |h| h >= 101 && h < 101 + 40, |_| false);
         assert_eq!(run.len(), 32);
         assert_eq!(run[0], 101);
         assert_eq!(*run.last().unwrap(), 132);
         let run = claim_feed_run(
             10,
             32,
+            200,
             |h| h >= 10 && h <= 50,
             |h| h == 10 || h == 11,
         );
         assert_eq!(run.first().copied(), Some(12));
         assert_eq!(run.len(), 32);
+    }
+
+    /// Claim must not jump thousands past tip when near pipeline is full.
+    #[test]
+    fn claim_ahead_cap_blocks_far_skip() {
+        assert!(super::MAX_CLAIM_AHEAD >= super::CONFIRM_RUN_MAX as u32);
+        assert!(
+            super::MAX_CLAIM_AHEAD <= 512,
+            "keep claim window modest: {}",
+            super::MAX_CLAIM_AHEAD
+        );
+        let path_lo = 87u32;
+        // Within window: claim a short run only (not the whole far feed).
+        let run = claim_feed_run(
+            path_lo,
+            super::CONFIRM_RUN_MAX,
+            path_lo + super::MAX_CLAIM_AHEAD,
+            |h| h >= path_lo && h < path_lo + 1000,
+            |_| false,
+        );
+        assert_eq!(run.len(), super::CONFIRM_RUN_MAX);
+        assert_eq!(run[0], path_lo);
+        assert!(*run.last().unwrap() <= path_lo + super::MAX_CLAIM_AHEAD);
+    }
+
+    /// requeue_wire after empty prep must clear inflight (Ok(None) leak regression).
+    #[test]
+    fn requeue_clears_inflight_so_tip_can_retry() {
+        let feed = ConfirmFeed::new();
+        feed.note(87, bh(1));
+        feed.note(88, bh(2));
+        {
+            let mut g = feed.inner.lock().unwrap();
+            g.ready.remove(&87);
+            g.ready.remove(&88);
+            g.inflight.insert(87);
+            g.inflight.insert(88);
+        }
+        feed.requeue_wire(&[(87, bh(1), None), (88, bh(2), None)]);
+        let g = feed.inner.lock().unwrap();
+        assert!(!g.inflight.contains(&87));
+        assert!(!g.inflight.contains(&88));
+        assert!(g.ready.contains_key(&87));
+        assert!(g.ready.contains_key(&88));
     }
 
     #[test]
@@ -1143,10 +1248,10 @@ mod tests {
 
     #[test]
     fn claim_feed_stops_at_gap() {
-        let run = claim_feed_run(5, 10, |h| h == 5 || h == 6 || h == 8, |_| false);
+        let run = claim_feed_run(5, 10, 100, |h| h == 5 || h == 6 || h == 8, |_| false);
         // Contiguous only — gap at 7 stops.
         assert_eq!(run, vec![5, 6]);
-        let empty = claim_feed_run(1, 8, |_| false, |_| false);
+        let empty = claim_feed_run(1, 8, 100, |_| false, |_| false);
         assert!(empty.is_empty());
     }
 
@@ -1275,6 +1380,7 @@ mod tests {
         let run = claim_feed_run(
             1,
             8,
+            100,
             |h| (1..=10).contains(&h),
             |h| h == 1 || h == 2 || h == 5,
         );
@@ -1282,6 +1388,6 @@ mod tests {
         assert!(!run.contains(&5));
         assert_eq!(run, vec![3, 4, 6, 7, 8, 9, 10]);
         // Max 0 → empty.
-        assert!(claim_feed_run(1, 0, |_| true, |_| false).is_empty());
+        assert!(claim_feed_run(1, 0, 100, |_| true, |_| false).is_empty());
     }
 }

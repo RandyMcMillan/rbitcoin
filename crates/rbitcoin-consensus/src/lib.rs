@@ -138,6 +138,13 @@ pub mod confirm_phase_stats {
     pub static STRUCTURAL_BIP68_NS: AtomicU64 = AtomicU64::new(0);
     /// Class C wall (`confirm_blocks_run` total).
     pub static CLASS_C_NS: AtomicU64 = AtomicU64::new(0);
+    /// Write-stage Class A append (`archive_commit_plan`) wall.
+    ///
+    /// Body/head/header_txs + residency denserels seed. Also mirrored in
+    /// [`rbitcoin_query::archive_phase_stats`] write_* subtimers.
+    pub static CLASS_A_NS: AtomicU64 = AtomicU64::new(0);
+    /// Write-stage denserels/abs ensure after Class A (fill planned + ensure spends).
+    pub static ENSURE_LAYOUT_NS: AtomicU64 = AtomicU64::new(0);
     /// Post–Class C durable spend annotation batch.
     ///
     /// Historical name `UTXO_APPLY_NS` / log field `spend=` ms — this is **not** a
@@ -152,7 +159,10 @@ pub mod confirm_phase_stats {
     pub static SPEND_ANNOTATE_SKIP: AtomicU64 = AtomicU64::new(0);
     /// Header + body-fk resolve for the batch.
     pub static RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
-    /// Confirm load wall (Class A + parent pin) on the load thread.
+    /// Prep pre-assemble wall on the prep/load thread.
+    ///
+    /// Wire path: structure + plan Class A + pin parents (stops before assemble).
+    /// Full prep wall ≈ `LOAD_NS` + [`CONNECT_NS`] (assemble).
     pub static LOAD_NS: AtomicU64 = AtomicU64::new(0);
     /// Unpin spent outs from ConfirmParentCache after Class C.
     pub static UNPIN_NS: AtomicU64 = AtomicU64::new(0);
@@ -162,6 +172,8 @@ pub mod confirm_phase_stats {
 
     // ── Last completed write batch (for slow-write logs; not window-summed) ──
     static LAST_WRITE_N: AtomicU64 = AtomicU64::new(0);
+    static LAST_WRITE_CLASS_A_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_WRITE_ENSURE_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_WRITE_STRUCTURAL_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_WRITE_SPENT_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_WRITE_CREATE_H_NS: AtomicU64 = AtomicU64::new(0);
@@ -176,6 +188,10 @@ pub mod confirm_phase_stats {
     pub struct LastWritePhases {
         pub n_blocks: u32,
         pub wall_ns: u64,
+        /// Class A append (`archive_commit_plan`).
+        pub class_a_ns: u64,
+        /// fill planned layout + ensure denserels/abs for spends.
+        pub ensure_ns: u64,
         pub structural_ns: u64,
         pub spent_ns: u64,
         pub create_h_ns: u64,
@@ -196,6 +212,8 @@ pub mod confirm_phase_stats {
     pub fn note_last_write(p: LastWritePhases) {
         LAST_WRITE_N.store(u64::from(p.n_blocks), Ordering::Relaxed);
         LAST_WRITE_WALL_NS.store(p.wall_ns, Ordering::Relaxed);
+        LAST_WRITE_CLASS_A_NS.store(p.class_a_ns, Ordering::Relaxed);
+        LAST_WRITE_ENSURE_NS.store(p.ensure_ns, Ordering::Relaxed);
         LAST_WRITE_STRUCTURAL_NS.store(p.structural_ns, Ordering::Relaxed);
         LAST_WRITE_SPENT_NS.store(p.spent_ns, Ordering::Relaxed);
         LAST_WRITE_CREATE_H_NS.store(p.create_h_ns, Ordering::Relaxed);
@@ -209,6 +227,8 @@ pub mod confirm_phase_stats {
         LastWritePhases {
             n_blocks: LAST_WRITE_N.load(Ordering::Relaxed) as u32,
             wall_ns: LAST_WRITE_WALL_NS.load(Ordering::Relaxed),
+            class_a_ns: LAST_WRITE_CLASS_A_NS.load(Ordering::Relaxed),
+            ensure_ns: LAST_WRITE_ENSURE_NS.load(Ordering::Relaxed),
             structural_ns: LAST_WRITE_STRUCTURAL_NS.load(Ordering::Relaxed),
             spent_ns: LAST_WRITE_SPENT_NS.load(Ordering::Relaxed),
             create_h_ns: LAST_WRITE_CREATE_H_NS.load(Ordering::Relaxed),
@@ -217,6 +237,15 @@ pub mod confirm_phase_stats {
             spend_ann_ns: LAST_WRITE_SPEND_ANN_NS.load(Ordering::Relaxed),
             tip_gc_ns: LAST_WRITE_TIP_GC_NS.load(Ordering::Relaxed),
         }
+    }
+
+    /// Sample and reset write-only Class A + ensure layout windows.
+    #[inline]
+    pub fn sample_class_a_ensure_and_reset() -> (u64, u64) {
+        (
+            CLASS_A_NS.swap(0, Ordering::Relaxed),
+            ENSURE_LAYOUT_NS.swap(0, Ordering::Relaxed),
+        )
     }
 
     /// Sample and reset all confirm phases.
@@ -565,6 +594,8 @@ mod coverage_tests {
         note_last_write(LastWritePhases {
             n_blocks: 2,
             wall_ns: 3_000_000,
+            class_a_ns: 500_000,
+            ensure_ns: 50_000,
             structural_ns: 1_000_000,
             spent_ns: 100_000,
             create_h_ns: 200_000,
@@ -576,11 +607,15 @@ mod coverage_tests {
         let p = last_write_phases();
         assert_eq!(p.n_blocks, 2);
         assert_eq!(LastWritePhases::ms(p.wall_ns), 3);
+        assert_eq!(LastWritePhases::ms(p.class_a_ns), 0); // 500_000 ns → 0 ms
+        assert_eq!(p.class_a_ns, 500_000);
         RECONSTRUCT_NS.store(5, Ordering::Relaxed);
         RECONSTRUCT_WIRE_NS.store(7, Ordering::Relaxed);
         CONNECT_NS.store(1, Ordering::Relaxed);
         SCRIPT_NS.store(1, Ordering::Relaxed);
         CLASS_C_NS.store(1, Ordering::Relaxed);
+        CLASS_A_NS.store(9, Ordering::Relaxed);
+        ENSURE_LAYOUT_NS.store(11, Ordering::Relaxed);
         UTXO_APPLY_NS.store(1, Ordering::Relaxed);
         BLOCKS.store(1, Ordering::Relaxed);
         RESOLVE_NS.store(1, Ordering::Relaxed);
@@ -597,9 +632,12 @@ mod coverage_tests {
         let s = sample_and_reset();
         assert_eq!(s.0, 7); // wire preferred over recon total
         assert_eq!(s.1, 7);
+        let (ca, en) = sample_class_a_ensure_and_reset();
+        assert_eq!((ca, en), (9, 11));
         // second sample zeros
         let s2 = sample_and_reset();
         assert_eq!(s2.0, 0);
+        assert_eq!(sample_class_a_ensure_and_reset(), (0, 0));
     }
 
     #[test]

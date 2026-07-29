@@ -485,9 +485,11 @@ pub(crate) fn spawn_confirm_engine(
                             let ms = rbitcoin_consensus::confirm_phase_stats::LastWritePhases::ms;
                             info!(
                                 "ibd: confirm write slow batch={n} first={first_h} wall={:?} \
-                                 struct={}ms spent={}ms create_h={}ms bip68={}ms class_c={}ms \
-                                 spend_ann={}ms tip_gc={}ms",
+                                 class_a={}ms ensure={}ms struct={}ms spent={}ms create_h={}ms \
+                                 bip68={}ms class_c={}ms spend_ann={}ms tip_gc={}ms",
                                 elapsed,
+                                ms(p.class_a_ns),
+                                ms(p.ensure_ns),
                                 ms(p.structural_ns),
                                 ms(p.spent_ns),
                                 ms(p.create_h_ns),
@@ -579,9 +581,10 @@ pub(crate) fn spawn_confirm_engine(
                 // Pure: LoadedBatch → ScriptOkBatch; no Query/store.
                 match rbitcoin_consensus::confirm_scripts_phase(mat_batch) {
                     Ok(outcome) => {
+                        // Script-stage work only (prep wall is in LOAD/CONNECT phase stats).
                         loop_stats_sc
                             .confirm_ns
-                            .fetch_add(mat_ns.saturating_add(outcome.work_ns), Ordering::Relaxed);
+                            .fetch_add(outcome.work_ns, Ordering::Relaxed);
                         let script_ms = outcome.work_ns / 1_000_000;
                         let mat_ms = mat_ns / 1_000_000;
                         let wb = outcome.batch.len();

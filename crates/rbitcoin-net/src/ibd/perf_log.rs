@@ -8,15 +8,21 @@
 //! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, prepq/writeq, txs=, horizon, tip ETA, body `bq=` |
 //! | INFO  | `ibd: perf …` | Download + body-queue pressure; **prep / script / write** stage walls + sub-phases; pin mix; queues |
 //! | INFO  | `ibd: sizes …` | RSS + work path + body soft budget + **bq** + residency + conf pipe + tx.head |
-//! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; dual-track archive pipe only if non-zero; contig park |
+//! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; class_a body/head when non-zero; dual-track archive pipe only if active |
 //!
 //! Sample **once** per tick and reset all atomics, then format INFO always and
 //! DEBUG only when enabled — so DEBUG never sees an empty window after INFO.
 //!
 //! Unified path: peer → **body queue** → confirm **prep** (plan+pin+assemble) →
 //! **scripts** → **write** (sole Class A append + Class C / spends / tip).
-//! INFO names stages that way. Ghost dual-track columns (`recon`/`wire` rebuild,
-//! separate arch prep/write) appear only when non-zero (legacy/fallback).
+//!
+//! Stage walls (window sums; stages overlap on OS threads):
+//! - **prep** = pre-assemble (`LOAD_NS`: structure+plan+pin) + assemble (`CONNECT_NS`)
+//! - **script** = `SCRIPT_NS`
+//! - **write** = Class A commit + ensure layouts + structural + class_c + spend + tip GC
+//!
+//! Ghost dual-track columns (`recon`/`wire` rebuild, separate arch dual pipe)
+//! appear only when non-zero (legacy/fallback).
 
 use super::archive::{ArchivePipelineSample, ArchivePipelineStats};
 use super::confirm::ConfirmPipelineSizes;
@@ -67,6 +73,10 @@ pub(crate) struct IbdPerfSample {
     pub connect_ms: u64,
     pub script_ms: u64,
     pub class_c_ms: u64,
+    /// Write-stage Class A append wall (`archive_commit_plan`).
+    pub class_a_ms: u64,
+    /// Write-stage denserels/abs ensure (fill planned + ensure spends).
+    pub ensure_ms: u64,
     pub strong_ms: u64,
     pub sh_ms: u64,
     /// Post–Class C durable spend annotate wall (logged as `spend=` ms).
@@ -91,6 +101,8 @@ pub(crate) struct IbdPerfSample {
     pub connect_ns: u64,
     pub script_ns: u64,
     pub class_c_ns: u64,
+    pub class_a_ns: u64,
+    pub ensure_ns: u64,
     pub strong_ns: u64,
     pub sh_ns: u64,
     pub tip_ns: u64,
@@ -250,6 +262,8 @@ impl Default for IbdPerfSample {
             connect_ms: 0,
             script_ms: 0,
             class_c_ms: 0,
+            class_a_ms: 0,
+            ensure_ms: 0,
             strong_ms: 0,
             sh_ms: 0,
             utxo_ms: 0,
@@ -268,6 +282,8 @@ impl Default for IbdPerfSample {
             connect_ns: 0,
             script_ns: 0,
             class_c_ns: 0,
+            class_a_ns: 0,
+            ensure_ns: 0,
             strong_ns: 0,
             sh_ns: 0,
             tip_ns: 0,
@@ -523,6 +539,8 @@ pub(crate) fn sample(
         structural_create_h_ns,
         structural_bip68_ns,
     ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
+    let (class_a_ns, ensure_ns) =
+        rbitcoin_consensus::confirm_phase_stats::sample_class_a_ensure_and_reset();
     let (sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head) =
         rbitcoin_query::class_c_phase_stats::sample_sh_sub_and_reset();
     let (wf_body_store, wf_store_body_ns) =
@@ -569,6 +587,8 @@ pub(crate) fn sample(
         connect_ms: ns_ms(connect_ns),
         script_ms: ns_ms(script_ns),
         class_c_ms: ns_ms(class_c_ns),
+        class_a_ms: ns_ms(class_a_ns),
+        ensure_ms: ns_ms(ensure_ns),
         strong_ms: ns_ms(strong_ns),
         sh_ms: ns_ms(sh_ns),
         utxo_ms: ns_ms(utxo_apply_ns),
@@ -587,6 +607,8 @@ pub(crate) fn sample(
         connect_ns,
         script_ns,
         class_c_ns,
+        class_a_ns,
+        ensure_ns,
         strong_ns,
         sh_ns,
         tip_ns,
@@ -707,12 +729,34 @@ fn append_nz(out: &mut String, key: &str, v: u64) {
     }
 }
 
-/// Write-stage wall for this window (structural + class_c + spend annotate + tip GC).
+/// Full prep-stage wall (pre-assemble + assemble).
 ///
+/// `load_ms` = structure+plan+pin; `connect_ms` = assemble. Together they are
+/// the prep OS-thread work for the window.
+fn prep_stage_ms(s: &IbdPerfSample) -> u64 {
+    s.load_ms.saturating_add(s.connect_ms)
+}
+
+/// Plan-mega sub-wall sum (assign/collect/sticky/head/stamp/finish) when present.
+fn plan_mega_ms(s: &IbdPerfSample) -> u64 {
+    s.arch_prep_assign_ms
+        .saturating_add(s.arch_prep_collect_ms)
+        .saturating_add(s.arch_prep_sticky_ms)
+        .saturating_add(s.arch_prep_inflight_ms)
+        .saturating_add(s.arch_prep_head_ms)
+        .saturating_add(s.arch_prep_stamp_ms)
+        .saturating_add(s.arch_prep_finish_ms)
+}
+
+/// Write-stage wall for this window.
+///
+/// Class A commit + denserels ensure + structural + class_c + spend annotate + tip GC.
 /// SH collect is inside class_c wall on the write thread; `sh_ms` is a sub-slice
 /// and is **not** double-counted here.
 fn write_stage_ms(s: &IbdPerfSample) -> u64 {
-    s.structural_ms
+    s.class_a_ms
+        .saturating_add(s.ensure_ms)
+        .saturating_add(s.structural_ms)
         .saturating_add(s.class_c_ms)
         .saturating_add(s.utxo_ms)
         .saturating_add(s.cache_tip_ms)
@@ -740,16 +784,17 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.peers,
     );
     // Three-stage confirm walls (prep / script / write).
-    // `connect` is assemble on the prep path (not write structural).
+    // prep = structure+plan+pin (`load`) + assemble (`connect`).
+    let prep_ms = prep_stage_ms(s);
     out.push_str(&format!(
-        " | conf blks={} prep={}ms script={}ms write={}ms connect={}ms",
-        s.phase_blks, s.load_ms, s.script_ms, write_ms, s.connect_ms,
+        " | conf blks={} prep={}ms script={}ms write={}ms",
+        s.phase_blks, prep_ms, s.script_ms, write_ms,
     ));
     append_nz(&mut out, "recon_ms", s.recon_ms);
     append_nz(&mut out, "wire_ms", s.wire_ms);
     append_nz(&mut out, "resolve_ms", s.resolve_ms);
 
-    // Prep stage detail: pin mix + denserels IO.
+    // Prep stage detail: plan mega + pin mix + assemble.
     // pin_hit% = (plan+res) / (plan+res+cold). denserels_hit% = res / (res+cold).
     let pin_hit_pct = {
         let hits = s.load_pin_cache_body;
@@ -770,7 +815,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         }
     };
     // Prefer wire pin sub-timers when present; fall back to aggregate pin body/new_io.
-    let plan_ms = if s.load_plan_pin_ms > 0 {
+    let plan_pin_ms = if s.load_plan_pin_ms > 0 {
         s.load_plan_pin_ms
     } else {
         s.load_pin_body_ms
@@ -782,13 +827,20 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.load_pin_new_meta_ms
     };
     let cold_dec_ms = s.load_cold_decode_ms;
+    let plan_mega = plan_mega_ms(s);
+    // Non-pin residual inside pre-assemble: LOAD − pin (structure + plan mega + …).
+    let pre_assemble = s.load_ms;
     out.push_str(&format!(
-        " | prep blks={} win={}ms pin={}ms (plan={}ms res={}ms cold_io={}ms cold_dec={}ms) \
+        " | prep blks={} total={}ms pre_asm={}ms(plan_mega={}ms pin={}ms) assemble={}ms \
+         pin(plan={}ms res={}ms cold_io={}ms cold_dec={}ms) \
          pin_hit%={} denserels_hit%={} pin_plan={} pin_res={} pin_new={} body_io={} parent_io={}",
         s.load_blocks,
-        s.load_win_ms,
+        prep_ms,
+        pre_assemble,
+        plan_mega,
         s.load_parent_pin_ms,
-        plan_ms,
+        s.connect_ms,
+        plan_pin_ms,
         res_ms,
         cold_io_ms,
         cold_dec_ms,
@@ -800,6 +852,9 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.load_body_tx_reads,
         s.load_parent_tx_reads,
     ));
+    if s.load_win_ms > 0 {
+        out.push_str(&format!(" pin_win={}ms", s.load_win_ms));
+    }
     if s.load_edge_same > 0 || s.load_edge_fk > 0 || s.load_edge_cb > 0 {
         out.push_str(&format!(
             " edges same={} fk={} cb={}",
@@ -810,10 +865,12 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         out.push_str(&format!(" miss_p={}", s.load_missing_parents));
     }
 
-    // Write stage detail: structural subs + Class C / SH / spend annotate / tip GC.
-    // Class A append is inside this write stage on the unified path.
+    // Write stage detail: Class A + ensure + structural + Class C / SH / spend / tip GC.
     out.push_str(&format!(
-        " | write struct={}ms(spent={} create_h={} bip68={}) class_c={}ms sh={}ms spend={}ms tip_gc={}ms",
+        " | write class_a={}ms ensure={}ms struct={}ms(spent={} create_h={} bip68={}) \
+         class_c={}ms sh={}ms spend={}ms tip_gc={}ms",
+        s.class_a_ms,
+        s.ensure_ms,
         s.structural_ms,
         s.structural_spent_ms,
         s.structural_create_h_ms,
@@ -823,6 +880,21 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.utxo_ms,
         s.cache_tip_ms,
     ));
+    // Class A body/head/residency-seed detail when present (from archive commit).
+    if s.arch_write_body_ms > 0
+        || s.arch_write_head_ms > 0
+        || s.arch_write_sticky_ms > 0
+        || s.arch_write_htxs_ms > 0
+    {
+        out.push_str(&format!(
+            " class_a_sub(body={} head={} htxs={} res_seed={} reserve={})",
+            s.arch_write_body_ms,
+            s.arch_write_head_ms,
+            s.arch_write_htxs_ms,
+            s.arch_write_sticky_ms,
+            s.arch_write_reserve_ms,
+        ));
+    }
     append_nz(&mut out, "strong_ms", s.strong_ms);
     if s.spend_idx > 0 || s.spend_skip > 0 {
         out.push_str(&format!(
@@ -860,21 +932,29 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     out
 }
 
-/// DEBUG detail: µs/blk + pin/edge; dual-track archive pipe only if active.
+/// DEBUG detail: µs/blk + pin/edge; class_a / dual-track only if active.
 pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let denom = s.phase_blks.max(1);
     let us = |ns: u64| (ns / denom) / 1000;
+    let prep_ns = s.load_ns.saturating_add(s.connect_ns);
     let write_ns = s
-        .structural_ns
+        .class_a_ns
+        .saturating_add(s.ensure_ns)
+        .saturating_add(s.structural_ns)
         .saturating_add(s.class_c_ns)
         .saturating_add(s.utxo_apply_ns)
         .saturating_add(s.cache_tip_ns);
     let mut out = format!(
-        "ibd: perf_dbg us/blk prep={} connect={} script={} write={} struct={} spent={} create_h={} bip68={} class_c={} sh={} spend={}(r={} i={} skip={}) tip_gc={}",
+        "ibd: perf_dbg us/blk prep={} (pre_asm={} assemble={}) script={} write={} \
+         class_a={} ensure={} struct={} spent={} create_h={} bip68={} class_c={} sh={} \
+         spend={}(r={} i={} skip={}) tip_gc={}",
+        us(prep_ns),
         us(s.load_ns),
         us(s.connect_ns),
         us(s.script_ns),
         us(write_ns),
+        us(s.class_a_ns),
+        us(s.ensure_ns),
         us(s.structural_ns),
         us(s.structural_spent_ns),
         us(s.structural_create_h_ns),
@@ -952,22 +1032,82 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     ));
     out.push_str(&format!(" sh_runs={}", s.sh_runs));
 
-    // Dual-track archive fallback pipe — omit when idle (unified path normal).
-    if s.pipe.prep_blocks > 0 || s.pipe.write_blocks > 0 || s.arch_prep_blocks > 0 || s.arch_write_blocks > 0 {
-        let busy = s.pipe.write_busy_ms();
-        let idle = s.pipe.write_idle_ms();
-        let total_w = busy.saturating_add(idle).max(1);
-        let writer_busy_pct = (100 * busy) / total_w;
-        let resolve_us_blk = if s.arch_resolve_blocks > 0 {
-            (s.arch_resolve_ns / s.arch_resolve_blocks) / 1000
-        } else {
-            0
-        };
+    // Plan-mega resolve mix (unified path still notes assign/sticky/head during prep).
+    if s.arch_ext_need > 0 || s.arch_prep_assign_ms > 0 {
         let sticky_pct = if s.arch_ext_need > 0 {
             (100 * s.arch_sticky_hit) / s.arch_ext_need
         } else {
             0
         };
+        let resolve_us_blk = if s.arch_resolve_blocks > 0 {
+            (s.arch_resolve_ns / s.arch_resolve_blocks) / 1000
+        } else {
+            0
+        };
+        out.push_str(&format!(
+            " | plan_mega assign={} collect={} sticky={} inflight={} head={} stamp={} finish={} \
+             resolve_us/blk={} ext={} sticky_hit={}/{} ({}%) head_hit={}/{} stamp_n batch={} res={} \
+             sticky_map={}/{}",
+            s.arch_prep_assign_ms,
+            s.arch_prep_collect_ms,
+            s.arch_prep_sticky_ms,
+            s.arch_prep_inflight_ms,
+            s.arch_prep_head_ms,
+            s.arch_prep_stamp_ms,
+            s.arch_prep_finish_ms,
+            resolve_us_blk,
+            s.arch_ext_need,
+            s.arch_sticky_hit,
+            s.arch_ext_need,
+            sticky_pct,
+            s.arch_head_hit,
+            s.arch_head_need,
+            s.arch_batch_stamp,
+            s.arch_resolved_stamp,
+            s.arch_sticky_len,
+            s.arch_sticky_cap,
+        ));
+        // Head resolve probe detail when cold head lookups ran.
+        if s.arch_prep_probe_ms > 0
+            || s.arch_prep_idx_ms > 0
+            || s.arch_prep_body_txid_ms > 0
+            || s.arch_prep_head_keys > 0
+        {
+            out.push_str(&format!(
+                " head_rd(probe={} idx={} body={} keys={} cands={} lookups={})",
+                s.arch_prep_probe_ms,
+                s.arch_prep_idx_ms,
+                s.arch_prep_body_txid_ms,
+                s.arch_prep_head_keys,
+                s.arch_prep_head_cands,
+                s.arch_prep_body_lookups,
+            ));
+        }
+    }
+    // Class A commit subtimers (also on INFO when non-zero); keep DEBUG complete.
+    if s.arch_write_blocks > 0 || s.arch_write_total_ms > 0 {
+        out.push_str(&format!(
+            " | class_a_commit total={} body={} head={} sticky={} htxs={} reserve={} spend={} dontneed={} flush={} blks={}",
+            s.arch_write_total_ms,
+            s.arch_write_body_ms,
+            s.arch_write_head_ms,
+            s.arch_write_sticky_ms,
+            s.arch_write_htxs_ms,
+            s.arch_write_reserve_ms,
+            s.arch_write_spend_ms,
+            s.arch_write_dontneed_ms,
+            s.arch_write_flush_ms,
+            s.arch_write_blocks,
+        ));
+    }
+    // True dual-track archive pipe only (legacy/fallback OS threads).
+    let dual_active =
+        s.pipe.prep_blocks > 0 || s.pipe.write_blocks > 0 || s.arch_prep_blocks > 0;
+    if dual_active {
+        let busy = s.pipe.write_busy_ms();
+        let idle = s.pipe.write_idle_ms();
+        let total_w = busy.saturating_add(idle).max(1);
+        let writer_busy_pct = (100 * busy) / total_w;
         out.push_str(&format!(
             " | dual_pipe prep_us/blk={} prep_blks={} write_us/blk={} write_blks={} batch_avg={} writer_busy%={} idle_ms={} coalesce_ms={} prep_ms={}",
             s.pipe.prep_us_per_block(),
@@ -981,54 +1121,14 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             s.pipe.prep_ms(),
         ));
         out.push_str(&format!(
-            " | arch_prep total={} struct={} assign={} collect={} sticky={} inflight={} head_rd={} (probe={} idx={} body={} keys={} cands={} lookups={}) stamp={} finish={} publish={} qwait={} blks={}",
+            " | arch_prep total={} struct={} publish={} qwait={} blks={}",
             s.arch_prep_total_ms,
             s.arch_prep_struct_ms,
-            s.arch_prep_assign_ms,
-            s.arch_prep_collect_ms,
-            s.arch_prep_sticky_ms,
-            s.arch_prep_inflight_ms,
-            s.arch_prep_head_ms,
-            s.arch_prep_probe_ms,
-            s.arch_prep_idx_ms,
-            s.arch_prep_body_txid_ms,
-            s.arch_prep_head_keys,
-            s.arch_prep_head_cands,
-            s.arch_prep_body_lookups,
-            s.arch_prep_stamp_ms,
-            s.arch_prep_finish_ms,
             s.arch_prep_publish_ms,
             s.arch_prep_qwait_ms,
             s.arch_prep_blocks,
         ));
         append_nz(&mut out, "prep_filter", s.arch_prep_filter_ms);
-        out.push_str(&format!(
-            " | arch_write total={} body={} head_wr={} sticky={} dontneed={} flush={} blks={}",
-            s.arch_write_total_ms,
-            s.arch_write_body_ms,
-            s.arch_write_head_ms,
-            s.arch_write_sticky_ms,
-            s.arch_write_dontneed_ms,
-            s.arch_write_flush_ms,
-            s.arch_write_blocks,
-        ));
-        append_nz(&mut out, "write_reserve", s.arch_write_reserve_ms);
-        append_nz(&mut out, "write_spend", s.arch_write_spend_ms);
-        append_nz(&mut out, "write_htxs", s.arch_write_htxs_ms);
-        out.push_str(&format!(
-            " | arch_res resolve_us/blk={} ext={} sticky={}/{} ({}%) head={}/{} stamp batch={} res={} sticky_map={}/{}",
-            resolve_us_blk,
-            s.arch_ext_need,
-            s.arch_sticky_hit,
-            s.arch_ext_need,
-            sticky_pct,
-            s.arch_head_hit,
-            s.arch_head_need,
-            s.arch_batch_stamp,
-            s.arch_resolved_stamp,
-            s.arch_sticky_len,
-            s.arch_sticky_cap,
-        ));
     }
     if s.contig_parked > 0 || s.contig_ready > 0 {
         out.push_str(&format!(
@@ -1167,12 +1267,15 @@ pub(crate) fn log_sample(s: &IbdPerfSample) {
     if s.phase_blks > 0 {
         let c_ms = s.class_c_ms / s.phase_blks.max(1);
         let sh_ms = s.sh_ms / s.phase_blks.max(1);
-        let prep_ms = s.load_ms / s.phase_blks.max(1);
-        if c_ms >= 1000 || sh_ms >= 1000 || prep_ms >= 5000 {
+        let prep_ms = prep_stage_ms(s) / s.phase_blks.max(1);
+        let write_ms = write_stage_ms(s) / s.phase_blks.max(1);
+        if c_ms >= 1000 || sh_ms >= 1000 || prep_ms >= 5000 || write_ms >= 5000 {
             rbitcoin_log::warn!(
-                "ibd: slow confirm phase ms/blk prep={} script={} class_c={} sh={} (sh_collect={}ms window) store_body={}ms blks={}",
+                "ibd: slow confirm phase ms/blk prep={} script={} write={} class_a={} class_c={} sh={} (sh_collect={}ms window) store_body={}ms blks={}",
                 prep_ms,
                 s.script_ms / s.phase_blks.max(1),
+                write_ms,
+                s.class_a_ms / s.phase_blks.max(1),
                 c_ms,
                 sh_ms,
                 s.sh_collect_ms,
@@ -1190,6 +1293,21 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     #[test]
+    fn prep_and_write_stage_walls_sum_parts() {
+        let mut s = IbdPerfSample::default();
+        s.load_ms = 30;
+        s.connect_ms = 8;
+        assert_eq!(prep_stage_ms(&s), 38);
+        s.class_a_ms = 15;
+        s.ensure_ms = 2;
+        s.structural_ms = 50;
+        s.class_c_ms = 40;
+        s.utxo_ms = 25;
+        s.cache_tip_ms = 5;
+        assert_eq!(write_stage_ms(&s), 137);
+    }
+
+    #[test]
     fn format_info_has_stable_tokens() {
         let mut s = IbdPerfSample::default();
         s.inflight = 3;
@@ -1205,6 +1323,9 @@ mod tests {
         s.recon_ms = 100;
         s.script_ms = 20;
         s.load_ms = 30;
+        s.connect_ms = 8;
+        s.class_a_ms = 12;
+        s.ensure_ms = 3;
         s.class_c_ms = 40;
         s.utxo_ms = 25;
         s.cache_tip_ms = 5;
@@ -1222,9 +1343,13 @@ mod tests {
         assert!(!line.contains("arch_q="), "{line}");
         assert!(line.contains("conf blks=32"), "{line}");
         assert!(line.contains("script=20ms"), "{line}");
-        assert!(line.contains("prep=30ms"), "{line}");
-        // write = class_c(40)+spend(25)+tip_gc(5) = 70
-        assert!(line.contains("write=70ms"), "{line}");
+        // prep = load(30)+assemble(8) = 38
+        assert!(line.contains("prep=38ms"), "{line}");
+        assert!(!line.contains("connect="), "assemble is inside prep, not a peer stage: {line}");
+        // write = class_a(12)+ensure(3)+class_c(40)+spend(25)+tip_gc(5) = 85
+        assert!(line.contains("write=85ms"), "{line}");
+        assert!(line.contains("class_a=12ms"), "{line}");
+        assert!(line.contains("ensure=3ms"), "{line}");
         assert!(line.contains("class_c=40ms"), "{line}");
         assert!(line.contains("spend=25ms"), "{line}");
         assert!(line.contains("struct=0ms"), "{line}");
@@ -1257,6 +1382,8 @@ mod tests {
         s.structural_spent_ms = 30;
         s.structural_create_h_ms = 5;
         s.structural_bip68_ms = 20;
+        s.arch_write_body_ms = 7;
+        s.arch_write_head_ms = 2;
         let line = format_info(&s);
         assert!(line.contains("prepq=1/2 writeq=2/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
@@ -1267,8 +1394,12 @@ mod tests {
             line.contains("struct=50ms(spent=30 create_h=5 bip68=20)"),
             "{line}"
         );
-        // write = 50+40+25+5 = 120
-        assert!(line.contains("write=120ms"), "{line}");
+        // write = 12+3+50+40+25+5 = 135
+        assert!(line.contains("write=135ms"), "{line}");
+        assert!(line.contains("class_a_sub(body=7 head=2"), "{line}");
+        assert!(line.contains("pre_asm=30ms"), "{line}");
+        assert!(line.contains("assemble=8ms"), "{line}");
+        assert!(line.contains("pin_win=40ms"), "{line}");
         // pin_hit% = 8/(8+12) = 40; denserels_hit% = 3/(3+12) = 20
         assert!(line.contains("pin_hit%=40"), "{line}");
         assert!(line.contains("denserels_hit%=20"), "{line}");
@@ -1321,6 +1452,10 @@ mod tests {
         let line = format_debug(&s);
         assert!(line.starts_with("ibd: perf_dbg "), "{line}");
         assert!(line.contains("us/blk prep="), "{line}");
+        assert!(line.contains("pre_asm="), "{line}");
+        assert!(line.contains("assemble="), "{line}");
+        assert!(line.contains("class_a="), "{line}");
+        assert!(line.contains("ensure="), "{line}");
         assert!(line.contains("write="), "{line}");
         assert!(line.contains("spend=500(r=10 i=2 skip=0)"), "{line}");
         assert!(!line.contains("prefetch="), "{line}");
@@ -1344,16 +1479,29 @@ mod tests {
         assert!(!line.contains("pin_cached="), "{line}");
         assert!(line.contains("edges same=10 fk=5 cb=1"), "{line}");
         assert!(line.contains("sh_runs=2"), "{line}");
-        // Dual-track archive columns only when pipe active (write_blocks=5).
-        assert!(line.contains("arch_res resolve_us/blk="), "{line}");
-        assert!(line.contains("arch_prep total="), "{line}");
-        assert!(line.contains("arch_write total="), "{line}");
-        assert!(line.contains("sticky_map="), "{line}");
-        assert!(line.contains("sticky=80/100"), "{line}");
+        // Plan mega resolve mix (unified path).
+        assert!(line.contains("plan_mega "), "{line}");
+        assert!(line.contains("sticky_hit=80/100"), "{line}");
+        // Dual-track archive columns only when dual OS pipe active (write_blocks=5).
         assert!(line.contains("dual_pipe "), "{line}");
+        assert!(line.contains("arch_prep total="), "{line}");
         assert!(line.contains("loop "), "{line}");
         assert!(!line.contains("runway"), "{line}");
         assert!(!line.contains("connect wave%="), "{line}");
+    }
+
+    #[test]
+    fn format_debug_no_dual_pipe_on_unified_class_a_only() {
+        let mut s = IbdPerfSample::default();
+        s.phase_blks = 4;
+        // Unified path: Class A commit stats without dual-track pipe.
+        s.arch_write_blocks = 4;
+        s.arch_write_total_ms = 20;
+        s.class_a_ns = 20_000_000;
+        let line = format_debug(&s);
+        assert!(!line.contains("dual_pipe "), "unified Class A is not dual_pipe: {line}");
+        assert!(line.contains("class_a="), "{line}");
+        assert!(line.contains("class_a_commit total=20"), "{line}");
     }
 
     #[test]

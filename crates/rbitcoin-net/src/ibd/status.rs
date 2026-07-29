@@ -9,12 +9,12 @@ use std::time::Instant;
 /// Used to see whether the pegged core is Class C confirm, getdata assign,
 /// event drain, or the status scan itself.
 ///
-/// **Live confirm:** `confirm_ns` only accrues when a **script** batch finishes.
-/// It counts pure script-stage work, **not** confirm load Class A work and
-/// **not** blocking on the write channel. During a multi-second batch,
-/// [`Self::confirm_live`] is set so status can show in-progress wall.
+/// **Live confirm:** `confirm_ns` accrues when a **script** batch finishes.
+/// It is **script-stage work only** (not prep plan/pin/assemble, not write).
+/// Prep/write walls live in `confirm_phase_stats` (sampled by `perf_log`).
+/// During prep claim, [`Self::confirm_live`] shows in-progress prep wall.
 pub(crate) struct LoopStats {
-    /// Pure script-stage wall for completed batches (excludes load/write waits).
+    /// Pure script-stage wall for completed script batches (excludes prep/write).
     pub(crate) confirm_ns: AtomicU64,
     /// Successful tip accepts this window.
     pub(crate) confirm_blocks: AtomicU64,

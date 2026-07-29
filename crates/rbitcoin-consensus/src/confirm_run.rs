@@ -818,6 +818,8 @@ fn pin_for_wire_batch(
     if pin_ns > 0 {
         confirm_load_stats::PARENT_PIN_NS.fetch_add(pin_ns, Ordering::Relaxed);
         confirm_load_stats::PIN_BODY_NS.fetch_add(pin_ns, Ordering::Relaxed);
+        // Wire path: `NS` is pin wall (legacy load path uses full load_confirm wall).
+        confirm_load_stats::NS.fetch_add(pin_ns, Ordering::Relaxed);
     }
     let n_blks = metas.len() as u64;
     if n_blks > 0 {
@@ -921,6 +923,8 @@ pub fn confirm_write_phase(
     let t_wall = Instant::now();
 
     // Single commit era: durable Class A for this batch before spentness RMW.
+    let mut class_a_ns = 0u64;
+    let mut ensure_ns = 0u64;
     if let Some(plan) = batch.archive_plan.take() {
         if !plan.is_empty() {
             // Snapshot planned fks + packed outs for offline denserels (no Class-A re-read).
@@ -930,24 +934,38 @@ pub fn confirm_write_phase(
                 .iter()
                 .map(|(tx, ins, outs)| (tx.clone(), ins.clone(), outs.clone()))
                 .collect::<Vec<_>>();
+            let t_ca = Instant::now();
             query
                 .archive_commit_plan(plan)
                 .map_err(ConsensusError::Store)?;
+            class_a_ns = t_ca.elapsed().as_nanos() as u64;
             // Layout only for planned creates (same-batch): encode offline +
             // body ranges from commit — zero additional Class A body preads.
+            let t_ens = Instant::now();
             fill_planned_create_layout_after_commit(
                 query,
                 &mut batch.batch_parents,
                 &planned_fks,
                 &packed,
             )?;
+            ensure_ns = ensure_ns.saturating_add(t_ens.elapsed().as_nanos() as u64);
         }
     }
     // Ensure denserels/abs for every spend edge before structural + annotate:
     // - prep-ahead in-flight parents (no denserels at pin time)
     // - already-archived Class A (plan=None) same-batch creates never inserted
     // - partial pin after prior write committed Class A then failed annotate
-    ensure_spend_abs_layouts(query, &mut batch.batch_parents, &batch.prepared)?;
+    {
+        let t_ens = Instant::now();
+        ensure_spend_abs_layouts(query, &mut batch.batch_parents, &batch.prepared)?;
+        ensure_ns = ensure_ns.saturating_add(t_ens.elapsed().as_nanos() as u64);
+    }
+    if class_a_ns > 0 {
+        confirm_phase_stats::CLASS_A_NS.fetch_add(class_a_ns, Ordering::Relaxed);
+    }
+    if ensure_ns > 0 {
+        confirm_phase_stats::ENSURE_LAYOUT_NS.fetch_add(ensure_ns, Ordering::Relaxed);
+    }
 
     // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
     let t_struct = Instant::now();
@@ -974,6 +992,8 @@ pub fn confirm_write_phase(
     confirm_phase_stats::note_last_write(confirm_phase_stats::LastWritePhases {
         n_blocks: n_blocks as u32,
         wall_ns: t_wall.elapsed().as_nanos() as u64,
+        class_a_ns,
+        ensure_ns,
         structural_ns,
         spent_ns: struct_ph.spent_ns,
         create_h_ns: struct_ph.create_h_ns,

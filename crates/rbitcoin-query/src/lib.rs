@@ -101,7 +101,7 @@ pub use wave_prevout::ThinInput;
 pub mod confirm_load_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Wall time in `load_confirm_parents`.
+    /// Pin/load wall: full `load_confirm_parents` on hash path; pin wall on wire path.
     pub static NS: AtomicU64 = AtomicU64::new(0);
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
     pub static UTXO_PARENTS: AtomicU64 = AtomicU64::new(0);

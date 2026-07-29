@@ -403,38 +403,49 @@ pub(crate) fn apply_peer_event(
             // peer bytes or refuse to decode what a peer already sent. Soft
             // queue size is bounded only by limiting block *requests*.
             let wire_bytes = block.total_size();
-            // Durable multi‑GiB queue. When at budget, payload sits in Query RAM
-            // overflow until confirm-write dequeue frees space — never spam-log
-            // that expected full state. Assign gates new getdata via hysteresis.
-            // Decoded Block still always goes on the RAM arch_job channel.
+            // Body queue is the sole wire store between peer receive and confirm
+            // prep. When at budget, payload sits in Query RAM overflow until
+            // confirm-write dequeue frees space — never spam-log that expected
+            // full state. Assign gates new getdata via hysteresis.
+            // ConfirmFeed only notes readiness (height/hash); prep reloads wire
+            // from the body queue (no peer→feed Block retain).
+            let mut offered = false;
             {
                 use bitcoin::consensus::Encodable;
                 let mut payload = Vec::with_capacity(wire_bytes);
                 if block.consensus_encode(&mut payload).is_ok() {
                     let raw = hash.to_byte_array();
-                    if let Err(e) =
-                        hub.query
-                            .block_queue_offer(height, raw, header_fk.0, &payload)
+                    match hub
+                        .query
+                        .block_queue_offer(height, raw, header_fk.0, &payload)
                     {
-                        // Real IO/corrupt only — BudgetFull is handled as RAM buffer.
-                        rbitcoin_log::warn!(
-                            "ibd: durable block_queue offer failed ({e}) h={height}"
-                        );
+                        Ok(_) => offered = true,
+                        Err(e) => {
+                            // Real IO/corrupt only — BudgetFull is handled as RAM buffer.
+                            rbitcoin_log::warn!(
+                                "ibd: body queue offer failed ({e}) h={height}"
+                            );
+                        }
                     }
                 }
+            }
+            if !offered {
+                // Body not retained — leave missing so densify can re-get.
+                st.body.mark_missing(hash);
+                return;
             }
             archive_queued.charge(wire_bytes);
             st.body.mark_archive_charged_bytes(hash, wire_bytes);
             // Prevent re-getdata while pipeline owns this body.
             st.body.mark_pending(hash);
-            // Unified path: feed raw wire into confirm prep→scripts→commit.
+            // Unified path: readiness only → confirm prep pulls wire from body queue.
             // Skip dual archive-lead Class A writer when feed is present so
             // one Class A appender (confirm write) owns the height.
             if let Some(feed) = confirm_feed {
                 if height != u32::MAX {
-                    feed.note_wire(height, hash, Some(block));
+                    feed.note(height, hash);
                 } else {
-                    // Unknown height: fall back to archive job.
+                    // Unknown height: fall back to archive job (still has wire).
                     if arch_job_tx
                         .send(ArchiveJob {
                             block,

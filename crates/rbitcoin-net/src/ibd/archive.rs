@@ -917,22 +917,21 @@ pub(crate) fn drain_job_rx_as_err(
     }
 }
 
-/// Restart path: load durable `store/block_queue/` payloads into the **unified
-/// confirm wire feed** so IBD does not re-getdata and does not dual Class-A
-/// archive-lead those heights.
+/// Restart path: re-note durable body-queue heights into the **confirm feed**
+/// (readiness only). Wire stays on disk / RAM pending until confirm **prep**
+/// pulls it — same as the live peer path. No dual Class-A archive-lead.
 ///
 /// Already confirmed heights are dequeued (stale queue residue). Each rehydrated
 /// body is charged against [`ArchiveQueueBudget`] like a live peer Block and
 /// released on confirm accept/reject.
 ///
-/// Returns the number of blocks noted into the feed.
+/// Returns the number of heights noted into the feed.
 pub(crate) fn rehydrate_block_queue_into_confirm(
     hub: &ChainHub,
     st: &mut super::state::IbdWorkState,
     confirm_feed: &super::confirm::ConfirmFeed,
     archive_queued: &ArchiveQueueBudget,
 ) -> Result<usize, String> {
-    use bitcoin::consensus::Decodable;
     use rbitcoin_log::{debug, info, warn};
 
     let queued = hub
@@ -952,19 +951,16 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
             dropped_done = dropped_done.saturating_add(1);
             continue;
         }
-        let mut cursor = std::io::Cursor::new(qb.payload.as_slice());
-        let block = match Block::consensus_decode(&mut cursor) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(
-                    "ibd: block_queue rec id={} corrupt ({e}); dequeue and skip",
-                    qb.id
-                );
-                let _ = hub.query.block_queue_dequeue_height(qb.height);
-                continue;
-            }
-        };
-        let wire_bytes = qb.payload.len().max(block.total_size());
+        // Minimal integrity: rec must have a non-empty payload; full decode at prep.
+        if qb.payload.is_empty() {
+            warn!(
+                "ibd: body queue rec id={} empty; dequeue and skip",
+                qb.id
+            );
+            let _ = hub.query.block_queue_dequeue_height(qb.height);
+            continue;
+        }
+        let wire_bytes = qb.payload.len();
         archive_queued.charge(wire_bytes);
         st.body.mark_archive_charged_bytes(hash, wire_bytes);
         st.body.mark_pending(hash);
@@ -976,7 +972,8 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
             st.header_fks.insert(hash, header_fk);
         }
         if qb.height != u32::MAX {
-            confirm_feed.note_wire(qb.height, hash, Some(block));
+            // Readiness only — prep reloads wire from body queue.
+            confirm_feed.note(qb.height, hash);
         } else {
             // Unknown height: cannot feed confirm path; drop charge.
             archive_queued.release(wire_bytes);
@@ -986,13 +983,13 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
         }
         n = n.saturating_add(1);
         debug!(
-            "ibd: rehydrate queue id={} h={} hash={hash} wire={wire_bytes} → confirm feed",
+            "ibd: rehydrate body queue id={} h={} hash={hash} wire={wire_bytes} → feed ready",
             qb.id, qb.height
         );
     }
     if dropped_done > 0 {
         info!(
-            "ibd: block_queue dropped {dropped_done} already-confirmed residues on rehydrate"
+            "ibd: body queue dropped {dropped_done} already-confirmed residues on rehydrate"
         );
     }
     Ok(n)
@@ -2157,7 +2154,7 @@ mod rehydrate_tests {
         }
     }
 
-    /// Shipped restart path: durable payload → confirm wire feed (no re-getdata).
+    /// Shipped restart path: durable body queue → feed readiness (wire stays on disk).
     #[test]
     fn rehydrate_notes_confirm_wire_from_disk_queue() {
         let (dir, hub) = temp_hub();
@@ -2176,14 +2173,20 @@ mod rehydrate_tests {
         let budget = ArchiveQueueBudget::new(64 * 1024 * 1024);
         let mut st = super::super::state::IbdWorkState::new(vec![], None, None);
         let n = rehydrate_block_queue_into_confirm(&hub, &mut st, &feed, &budget).unwrap();
-        assert_eq!(n, 1, "one wire block rehydrated");
+        assert_eq!(n, 1, "one height rehydrated as feed-ready");
         assert_eq!(budget.count(), 1);
         {
             let g = feed.inner.lock().unwrap();
             let (h, w) = g.ready.get(&height).expect("noted on feed");
             assert_eq!(*h, hash);
-            assert!(w.is_some(), "wire body present for unified prep");
+            assert!(
+                w.is_none(),
+                "feed holds readiness only; wire stays in body queue"
+            );
         }
+        // Prep pulls wire from body queue (not from feed).
+        let from_q = hub.query.block_queue_payload(height).unwrap().unwrap();
+        assert_eq!(from_q, payload);
         assert!(st.body.is_archive_charged(&hash) || st.body.is_pending(&hash));
         // Disk queue until confirm-write dequeue.
         assert_eq!(hub.query.block_queue_stats().2, 1);

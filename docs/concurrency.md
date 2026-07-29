@@ -6,17 +6,17 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 | Role | Threading | Store writes |
 |------|-----------|--------------|
-| Peer IO (N tasks) | tokio multi-thread | none; decoded blocks **offer durable `store/block_queue/`** + **confirm feed (wire)** |
-| Confirm **prep** | 1 OS thread | headers only; **plan** Class A (stamp create_fk, no body append) + pin parents once |
+| Peer IO (N tasks) | tokio multi-thread | none; decoded blocks **offer body queue only**; note height/hash readiness on confirm feed |
+| Confirm **prep** | 1 OS thread | load wire from **body queue**; **plan** Class A (stamp create_fk, no body append) + pin parents once |
 | Confirm **scripts** | 1 OS thread + rayon | **none** — pure CPU |
 | Confirm **commit** | 1 OS thread | **sole Class A appender** + structural + Class C + spend annotate + tip GC; **`block_queue_dequeue_height`** |
 | IBD main loop | 1 tokio task | none (orchestration only) |
 
-**Height-ordered unified pipeline:** peer wire → prep (plan+pin+assemble with intake wire) → scripts → single commit era. **No** separate archive-lead track that appends Class A far ahead and reloads bodies for confirm. Optional archive job path remains only for unknown-height / legacy fallback.
+**Height-ordered unified pipeline:** peer → **body queue** → prep (plan+pin+assemble) → scripts → single commit era. **No** peer→confirm-feed wire retain, and **no** separate archive-lead track that appends Class A far ahead and reloads bodies for confirm. Optional archive job path remains only for unknown-height / legacy fallback.
 
-**Wire retained:** batch creates use the peer `bitcoin::Block` through scripts; **no Class-A wire rebuild** on the unified path. Class A packed form is planned once and committed in the write stage.
+**Wire retained on the pipeline batch only:** prep pulls `bitcoin::Block` from the body queue; that wire rides through scripts; **no Class-A wire rebuild** on the unified path. Class A packed form is planned once and committed in the write stage.
 
-**Durable queue:** `store/block_queue/` multi‑GiB payload FIFO (`RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`, default 8 GiB). **Offer** on peer Block; **dequeue** after confirm-commit. Restart rehydrates into the **same** confirm feed (wire), not a second pipeline.
+**Body queue:** `store/block_queue/` multi‑GiB payload FIFO + RAM overflow when full (`RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`, default 8 GiB). **Offer** on peer Block; prep **reads** by height; **dequeue** after confirm-commit. Restart re-notes feed readiness only (wire stays on disk until prep).
 
 **CreateResidency:** process-local fk/range/outs map shared for parent pin hits (raw FIFO). Prep seeds ranges/outs once per create on the pin path.
 

@@ -1062,6 +1062,34 @@ impl Query {
         Ok(g.load_all()?)
     }
 
+    /// Body-queue intake for confirm prep: payload for `height` without dequeue.
+    ///
+    /// Order: RAM overflow (`block_queue_pending`) first, then durable disk.
+    /// Peer → body queue is the only source of wire for the unified path;
+    /// ConfirmFeed carries readiness (height/hash), not retained `Block`s.
+    pub fn block_queue_payload(&self, height: u32) -> Result<Option<Vec<u8>>, QueryError> {
+        {
+            let pend = self.block_queue_pending.lock().unwrap();
+            if let Some(p) = pend.iter().find(|p| p.height == height) {
+                return Ok(Some(p.payload.clone()));
+            }
+        }
+        let g = self.block_queue.lock().unwrap();
+        Ok(g.get_by_height(height)?.map(|q| q.payload))
+    }
+
+    /// True if body queue (disk or RAM pending) holds `height`.
+    pub fn block_queue_has_height(&self, height: u32) -> bool {
+        {
+            let pend = self.block_queue_pending.lock().unwrap();
+            if pend.iter().any(|p| p.height == height) {
+                return true;
+            }
+        }
+        let g = self.block_queue.lock().unwrap();
+        g.contains_height(height)
+    }
+
     /// Test helper: force a tiny durable budget (bypasses open-time 64 MiB clamp).
     #[cfg(test)]
     pub fn block_queue_force_budget_for_test(&self, budget: u64) {

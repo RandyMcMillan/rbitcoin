@@ -11,15 +11,20 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Shared feed of tip-extension work for the dedicated confirm engine.
+/// Shared feed of tip-extension **readiness** for the dedicated confirm engine.
 ///
-/// Preferred: raw **wire** `Block` from peer/bq (unified prep→scripts→commit).
-/// Hash-only notes remain for already-archived Class A fallback.
+/// Live path: peer/rehydrate enqueues wire into the **body queue**
+/// (`store/block_queue/` + RAM pending), then notes height/hash here. Prep
+/// reloads wire from the body queue — the feed does **not** retain `Block`s.
+/// Optional wire slots remain for rare in-process requeue; production requeues
+/// strip wire so RAM stays in the body queue + pipeline stage batches only.
 ///
-/// **In-flight tracking:** once load claims a contiguous run, those heights sit in
-/// `inflight` until write finishes (or load re-queues). `note` will not re-insert
-/// them — otherwise offer re-notes tip+1 every main-loop tick and load re-claims
-/// the same batch into the load→scripts queue (duplicate script work).
+/// Hash-only notes also cover already-archived Class A fallback (no bq payload).
+///
+/// **In-flight tracking:** once prep claims a contiguous run, those heights sit in
+/// `inflight` until write finishes (or prep re-queues). `note` will not re-insert
+/// them — otherwise offer re-notes tip+1 every main-loop tick and prep re-claims
+/// the same batch into the prep→scripts queue (duplicate script work).
 pub(crate) struct ConfirmFeed {
     pub(crate) inner: std::sync::Mutex<ConfirmFeedInner>,
     cv: std::sync::Condvar,
@@ -27,9 +32,9 @@ pub(crate) struct ConfirmFeed {
 }
 
 pub(crate) struct ConfirmFeedInner {
-    /// height → (hash, optional wire block for unified prep)
+    /// height → (hash, optional wire — normally `None`; body queue holds payloads)
     pub(crate) ready: std::collections::BTreeMap<u32, (BlockHash, Option<bitcoin::Block>)>,
-    /// Claimed by load; not yet written or released. Offer must not re-note.
+    /// Claimed by prep; not yet written or released. Offer must not re-note.
     pub(crate) inflight: std::collections::HashSet<u32>,
 }
 
@@ -50,13 +55,14 @@ impl ConfirmFeed {
         self.note_wire(height, hash, None);
     }
 
-    /// Note with raw wire block for unified prep (preferred IBD path).
+    /// Note readiness; optional wire is only for tests / rare in-process paths.
+    /// Production peer path uses [`Self::note`] (wire lives in the body queue).
     pub(crate) fn note_wire(&self, height: u32, hash: BlockHash, block: Option<bitcoin::Block>) {
         let mut g = self.inner.lock().unwrap();
         if g.inflight.contains(&height) {
             return;
         }
-        // Prefer keeping wire if we already have it.
+        // Prefer keeping wire if we already have it (test helpers only).
         match g.ready.get_mut(&height) {
             Some(e) => {
                 if e.1.is_none() && block.is_some() {
@@ -202,14 +208,15 @@ pub(crate) fn format_queue_depth(name: &str, depth: usize, cap: usize) -> String
     }
 }
 
-/// Confirm pipeline queue depths for progress/perf: `loadq… writeq…`.
+/// Confirm pipeline queue depths for progress/perf: `prepq… writeq…`.
 ///
 /// Depth 0 uses `name<0/cap` (consumer waiting on empty queue).
+/// `prepq` = prep→scripts; `writeq` = scripts→write.
 #[inline]
-pub(crate) fn format_conf_q(load: usize, write: usize, load_cap: usize, write_cap: usize) -> String {
+pub(crate) fn format_conf_q(prep: usize, write: usize, prep_cap: usize, write_cap: usize) -> String {
     format!(
         "{} {}",
-        format_queue_depth("loadq", load, load_cap),
+        format_queue_depth("prepq", prep, prep_cap),
         format_queue_depth("writeq", write, write_cap),
     )
 }
@@ -303,13 +310,13 @@ pub(crate) fn is_confirm_load_retryable(msg: &str) -> bool {
         || msg.contains("load not ready")
 }
 
-/// Spawn confirm **load** + **scripts** + **write** OS threads.
+/// Spawn confirm **prep** + **scripts** + **write** OS threads.
 ///
-/// Load (Class A + pin parents → wire → assemble) on
-/// `ibd-confirm-load`; scripts on `ibd-confirm`; structural + Class C +
-/// spend annotate on `ibd-confirm-write`.
-/// Overlap: load(N+1) ∥ scripts(N) ∥ write(N−1).
-/// Returns the load-thread join handle and shared queue-depth counters.
+/// Prep (body queue → plan Class A + pin parents + assemble) on
+/// `ibd-confirm-load`; scripts on `ibd-confirm`; sole Class A append +
+/// structural + Class C + spend annotate on `ibd-confirm-write`.
+/// Overlap: prep(N+1) ∥ scripts(N) ∥ write(N−1).
+/// Returns the prep-thread join handle and shared queue-depth counters.
 pub(crate) fn spawn_confirm_engine(
     hub: Arc<ChainHub>,
     feed: Arc<ConfirmFeed>,
@@ -486,7 +493,7 @@ pub(crate) fn spawn_confirm_engine(
                         q_sc.note_write_send(wb, ww, wp);
                         if script_ms > 2_000 || mat_ms > 2_000 {
                             info!(
-                                "ibd: confirm scripts slow batch={n} first={first_h} mat_ms={mat_ms} script_ms={script_ms} wall_ms={}",
+                                "ibd: confirm scripts slow batch={n} first={first_h} prep_ms={mat_ms} script_ms={script_ms} wall_ms={}",
                                 t0.elapsed().as_millis()
                             );
                         }
@@ -531,7 +538,7 @@ pub(crate) fn spawn_confirm_engine(
     let load_join = std::thread::Builder::new()
         .name("ibd-confirm-load".into())
         .spawn(move || {
-            info!("ibd: confirm load on dedicated OS thread (wave/wire/assemble)");
+            info!("ibd: confirm prep on dedicated OS thread (body queue → plan+pin+assemble)");
             let mut missing_tries: HashMap<u32, u32> = HashMap::new();
             loop {
                 if feed.stopped() {
@@ -634,7 +641,32 @@ pub(crate) fn spawn_confirm_engine(
                     return;
                 }
 
-                // Prefer unified wire prep when every claimed height still has wire.
+                // Resolve wire from the body queue (peer/rehydrate intake).
+                // ConfirmFeed only tracks readiness; payloads live in block_queue
+                // until confirm-write dequeues after tip advance.
+                let mut batch = batch;
+                if let Err(missing) = resolve_batch_wire_from_body_queue(&hub, &mut batch) {
+                    // Body not in queue yet — demote and re-offer later.
+                    for (h, hash, _) in &missing {
+                        warn!(
+                            "ibd: confirm prep missing body queue @{h} {hash} (will re-offer)"
+                        );
+                        let _ = event_tx.send(ConfirmEvent::BodyMissing { hash: *hash });
+                    }
+                    // Return claimed-with-payload heights to feed as readiness only
+                    // (wire stays in body queue — never retain Block on the feed).
+                    let req: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
+                        .iter()
+                        .filter(|(h, _, _)| !missing.iter().any(|(mh, _, _)| mh == h))
+                        .map(|(h, ha, _)| (*h, *ha, None))
+                        .collect();
+                    // Missing ones: finish inflight so offer can re-note after re-get.
+                    feed.finish(missing.iter().map(|(h, _, _)| *h));
+                    feed.requeue_wire(&req);
+                    continue;
+                }
+
+                // Prefer unified wire prep when every claimed height has wire.
                 let all_wire = batch.iter().all(|(_, _, w)| w.is_some());
                 let mat_res = if all_wire {
                     let wire_batch: Vec<(rbitcoin_primitives::Height, bitcoin::Block)> = batch
@@ -648,6 +680,7 @@ pub(crate) fn spawn_confirm_engine(
                         .collect();
                     hub.confirm_wire_prep_phase(&wire_batch)
                 } else {
+                    // Fallback: already-archived Class A without body-queue payload.
                     let hash_batch: Vec<(u32, BlockHash)> =
                         batch.iter().map(|(h, ha, _)| (*h, *ha)).collect();
                     hub.confirm_load_phase(&hash_batch)
@@ -670,7 +703,7 @@ pub(crate) fn spawn_confirm_engine(
                             // Permanent failure on multi-block: re-queue tail only;
                             // first height stays inflight for the single-block retry.
                             warn!(
-                                "ibd: confirm load multi-block fail @ {expect_h} n={} — \
+                                "ibd: confirm prep multi-block fail @ {expect_h} n={} — \
                                  retry first alone, re-queue tail: {msg}",
                                 batch.len()
                             );
@@ -678,7 +711,7 @@ pub(crate) fn spawn_confirm_engine(
                                 .iter()
                                 .skip(1)
                                 .filter(|(_, ha, _)| !hub.has_block(ha))
-                                .cloned()
+                                .map(|(h, ha, _)| (*h, *ha, None))
                                 .collect();
                             feed.requeue_wire(&tail);
                             loop_stats.confirm_begin(expect_h, 1);
@@ -700,9 +733,9 @@ pub(crate) fn spawn_confirm_engine(
                     if let Err(e) = &mat_res {
                         let msg = e.to_string();
                         if msg.contains("cancelled") || msg.contains("confirm cancelled") {
-                            info!("ibd: confirm load aborted after stop (cancelled)");
+                            info!("ibd: confirm prep aborted after stop (cancelled)");
                         } else {
-                            info!("ibd: confirm load aborted after stop: {e}");
+                            info!("ibd: confirm prep aborted after stop: {e}");
                         }
                     }
                     drop(mat_tx);
@@ -718,7 +751,7 @@ pub(crate) fn spawn_confirm_engine(
                         let prepared_n = outcome.batch.len();
                         if prepared_n != batch.len() {
                             warn!(
-                                "ibd: confirm load prepared_n={prepared_n} != claim_n={} first={expect_h}",
+                                "ibd: confirm prep prepared_n={prepared_n} != claim_n={} first={expect_h}",
                                 batch.len()
                             );
                         }
@@ -734,7 +767,7 @@ pub(crate) fn spawn_confirm_engine(
                         queues_load.note_load_send(prepared_n, wire, parents);
                         if work_ms > 2_000 {
                             info!(
-                                "ibd: confirm load slow batch={prepared_n} claim={} first={expect_h} work_ms={work_ms}",
+                                "ibd: confirm prep slow batch={prepared_n} claim={} first={expect_h} work_ms={work_ms}",
                                 batch.len(),
                             );
                         }
@@ -743,7 +776,7 @@ pub(crate) fn spawn_confirm_engine(
                         let (expect, hash, _) = batch[0];
                         let msg = e.to_string();
                         if msg.contains("confirm cancelled") {
-                            info!("ibd: confirm load cancelled @ {expect}");
+                            info!("ibd: confirm prep cancelled @ {expect}");
                             drop(mat_tx);
                             let _ = scripts.join();
                             return;
@@ -752,14 +785,14 @@ pub(crate) fn spawn_confirm_engine(
                             let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
                                 .iter()
                                 .filter(|(_, ha, _)| !hub.has_block(ha))
-                                .cloned()
+                                .map(|(h, ha, _)| (*h, *ha, None))
                                 .collect();
                             feed.requeue_wire(&retry);
                             static N: AtomicU32 = AtomicU32::new(0);
                             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
                             if n <= 3 || n % 200 == 0 {
                                 warn!(
-                                    "ibd: confirm load incomplete @ {expect} {hash} — re-queue (n={n}): {msg}"
+                                    "ibd: confirm prep incomplete @ {expect} {hash} — re-queue (n={n}): {msg}"
                                 );
                             }
                             std::thread::sleep(Duration::from_millis(50));
@@ -784,7 +817,7 @@ pub(crate) fn spawn_confirm_engine(
                             let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
                                 .iter()
                                 .filter(|(_, ha, _)| !hub.has_block(ha))
-                                .cloned()
+                                .map(|(h, ha, _)| (*h, *ha, None))
                                 .collect();
                             feed.requeue_wire(&retry);
                             if missing_tries.len() > 256 {
@@ -804,7 +837,7 @@ pub(crate) fn spawn_confirm_engine(
                                 .iter()
                                 .skip(1)
                                 .filter(|(_, ha, _)| !hub.has_block(ha))
-                                .cloned()
+                                .map(|(h, ha, _)| (*h, *ha, None))
                                 .collect();
                             feed.requeue_wire(&tail);
                         }
@@ -815,7 +848,7 @@ pub(crate) fn spawn_confirm_engine(
                         loop_stats
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
-                        warn!("ibd: confirm load reject {hash} @ {expect}: {e}");
+                        warn!("ibd: confirm prep reject {hash} @ {expect}: {e}");
                         if event_tx
                             .send(ConfirmEvent::Reject {
                                 height: expect,
@@ -835,6 +868,64 @@ pub(crate) fn spawn_confirm_engine(
         })
         .expect("spawn ibd-confirm-load");
     (load_join, queues)
+}
+
+/// Fill missing wire slots from the durable/pending body queue.
+///
+/// Returns `Err(missing)` with the heights that had no payload (and no pre-filled
+/// wire). Entries that already have `Some(block)` are left untouched.
+fn resolve_batch_wire_from_body_queue(
+    hub: &ChainHub,
+    batch: &mut [(u32, BlockHash, Option<bitcoin::Block>)],
+) -> Result<(), Vec<(u32, BlockHash, Option<bitcoin::Block>)>> {
+    use bitcoin::consensus::Decodable;
+    let mut missing = Vec::new();
+    for entry in batch.iter_mut() {
+        if entry.2.is_some() {
+            continue;
+        }
+        let height = entry.0;
+        let hash = entry.1;
+        match hub.query.block_queue_payload(height) {
+            Ok(Some(payload)) => {
+                let mut cursor = std::io::Cursor::new(payload.as_slice());
+                match bitcoin::Block::consensus_decode(&mut cursor) {
+                    Ok(block) => {
+                        // Sanity: payload hash should match feed hash.
+                        if block.block_hash() != hash {
+                            warn!(
+                                "ibd: body queue hash mismatch @{height}: feed={hash} payload={}",
+                                block.block_hash()
+                            );
+                            missing.push((height, hash, None));
+                            continue;
+                        }
+                        entry.2 = Some(block);
+                    }
+                    Err(e) => {
+                        warn!("ibd: body queue decode fail @{height} {hash}: {e}");
+                        missing.push((height, hash, None));
+                    }
+                }
+            }
+            Ok(None) => {
+                // No body-queue payload: allow Class A hash-only fallback later.
+                // Only treat as missing if the block is also not Class-A ready.
+                if !hub.query.is_block_archived(&hash.to_byte_array()).unwrap_or(false) {
+                    missing.push((height, hash, None));
+                }
+            }
+            Err(e) => {
+                warn!("ibd: body queue read fail @{height} {hash}: {e}");
+                missing.push((height, hash, None));
+            }
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(missing)
+    }
 }
 
 /// Offer a run of ready archived heights starting at tip+1 into the confirm feed.
@@ -1010,26 +1101,26 @@ mod tests {
         assert!(!g.inflight.contains(&11));
     }
 
-    /// Log tokens + live caps (OPERATOR.md / experimental-mainnet loadq=*/5 writeq=*/5).
+    /// Log tokens + live caps (OPERATOR.md / experimental-mainnet prepq=*/5 writeq=*/5).
     #[test]
     fn queue_depth_log_and_caps_surface() {
-        assert_eq!(format_queue_depth("load", 0, 2), "load<0/2");
+        assert_eq!(format_queue_depth("prep", 0, 2), "prep<0/2");
         assert_eq!(format_queue_depth("write", 0, 2), "write<0/2");
-        assert_eq!(format_queue_depth("load", 1, 2), "load=1/2");
+        assert_eq!(format_queue_depth("prep", 1, 2), "prep=1/2");
         assert_eq!(format_queue_depth("write", 2, 2), "write=2/2");
-        assert_eq!(format_conf_q(0, 1, 2, 2), "loadq<0/2 writeq=1/2");
-        assert_eq!(format_conf_q(1, 0, 2, 2), "loadq=1/2 writeq<0/2");
-        assert_eq!(format_conf_q(0, 0, 2, 2), "loadq<0/2 writeq<0/2");
+        assert_eq!(format_conf_q(0, 1, 2, 2), "prepq<0/2 writeq=1/2");
+        assert_eq!(format_conf_q(1, 0, 2, 2), "prepq=1/2 writeq<0/2");
+        assert_eq!(format_conf_q(0, 0, 2, 2), "prepq<0/2 writeq<0/2");
 
         assert_eq!(super::LOAD_QUEUE_CAP, 5);
         assert_eq!(super::WRITE_QUEUE_CAP, 5);
         assert_eq!(
             format_conf_q(0, 0, super::LOAD_QUEUE_CAP, super::WRITE_QUEUE_CAP),
-            "loadq<0/5 writeq<0/5"
+            "prepq<0/5 writeq<0/5"
         );
         assert_eq!(
             format_conf_q(5, 5, super::LOAD_QUEUE_CAP, super::WRITE_QUEUE_CAP),
-            "loadq=5/5 writeq=5/5"
+            "prepq=5/5 writeq=5/5"
         );
     }
 

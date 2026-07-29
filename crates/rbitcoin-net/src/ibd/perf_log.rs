@@ -5,18 +5,18 @@
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
-//! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, loadq/writeq, txs=, horizon, tip ETA, durable `bq=` |
-//! | INFO  | `ibd: perf …` | Download + durable queue pressure; **load / script / write** stage walls with load+write sub-phases; pin mix; queues |
-//! | INFO  | `ibd: sizes …` | RSS + work path + arch RAM queue + **bq** + residency + outfifo + conf pipe + tx.head |
-//! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail, archive Class A prep/write pipe, contig park |
+//! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, prepq/writeq, txs=, horizon, tip ETA, body `bq=` |
+//! | INFO  | `ibd: perf …` | Download + body-queue pressure; **prep / script / write** stage walls + sub-phases; pin mix; queues |
+//! | INFO  | `ibd: sizes …` | RSS + work path + body soft budget + **bq** + residency + conf pipe + tx.head |
+//! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; dual-track archive pipe only if non-zero; contig park |
 //!
 //! Sample **once** per tick and reset all atomics, then format INFO always and
 //! DEBUG only when enabled — so DEBUG never sees an empty window after INFO.
 //!
-//! Schema 12: more wall time sits in confirm **load** (Class A decode + parent
-//! pin / residency / denserels) and **write** (structural / Class C / spend
-//! annotate). INFO breaks those stages out so bottlenecks are visible without
-//! DEBUG. Formatters omit ghost columns from deleted paths.
+//! Unified path: peer → **body queue** → confirm **prep** (plan+pin+assemble) →
+//! **scripts** → **write** (sole Class A append + Class C / spends / tip).
+//! INFO names stages that way. Ghost dual-track columns (`recon`/`wire` rebuild,
+//! separate arch prep/write) appear only when non-zero (legacy/fallback).
 
 use super::archive::{ArchivePipelineSample, ArchivePipelineStats};
 use super::confirm::ConfirmPipelineSizes;
@@ -702,19 +702,19 @@ fn write_stage_ms(s: &IbdPerfSample) -> u64 {
         .saturating_add(s.cache_tip_ms)
 }
 
-/// Stable INFO line for production grepping (schema-12 pipeline).
+/// Stable INFO line for production grepping (unified prep→scripts→write).
 pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     let bq_mib = s.bq_bytes / (1024 * 1024);
     let bq_budget_mib = s.bq_budget / (1024 * 1024);
     let write_ms = write_stage_ms(s);
-    // Download / queue pressure (what starves tip advance).
+    // Download / body-queue pressure (what starves tip advance).
+    // `body_soft` = soft charged budget (assign hysteresis); `bq` = durable body queue.
     let mut out = format!(
-        "ibd: perf inflight={}/{} arch_q={} arch={}/{}MiB bq={} ({}MiB/{}MiB) pending={} arch_ahead={} hole={} peers={}",
+        "ibd: perf inflight={}/{} body_soft={}/{}MiB bq={} ({}MiB/{}MiB) pending={} buf_ahead={} hole={} peers={}",
         s.inflight,
         s.inflight_cap,
         s.arch_q,
         s.arch_mb,
-        s.arch_budget_mb,
         s.bq_count,
         bq_mib,
         bq_budget_mib,
@@ -723,17 +723,17 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.hole,
         s.peers,
     );
-    // Three-stage confirm walls (load / script / write) — schema 12 long poles.
-    // `connect` is optimistic assemble on the load path (not write structural).
+    // Three-stage confirm walls (prep / script / write).
+    // `connect` is assemble on the prep path (not write structural).
     out.push_str(&format!(
-        " | conf blks={} load={}ms script={}ms write={}ms connect={}ms",
+        " | conf blks={} prep={}ms script={}ms write={}ms connect={}ms",
         s.phase_blks, s.load_ms, s.script_ms, write_ms, s.connect_ms,
     ));
     append_nz(&mut out, "recon_ms", s.recon_ms);
     append_nz(&mut out, "wire_ms", s.wire_ms);
     append_nz(&mut out, "resolve_ms", s.resolve_ms);
 
-    // Load stage detail: phase walls + pin mix + denserels IO.
+    // Prep stage detail: phase walls + pin mix + denserels IO.
     // pin_hit% = (FIFO+same-batch+residency) / (those + cold pin_new after residency).
     let pin_hit_pct = {
         let hits = s.load_pin_cache_body;
@@ -745,7 +745,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         }
     };
     out.push_str(&format!(
-        " | load blks={} win={}ms phases hdr={} dec={} put={} thin={} pin={} (fifo={}ms new_io={}ms) pin_hit%={} pin_cache={} pin_res={} pin_new={} body_io={} parent_io={}",
+        " | prep blks={} win={}ms phases hdr={} dec={} put={} thin={} pin={} (fifo={}ms new_io={}ms) pin_hit%={} pin_cache={} pin_res={} pin_new={} body_io={} parent_io={}",
         s.load_blocks,
         s.load_win_ms,
         s.load_hdr_ms,
@@ -773,6 +773,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     }
 
     // Write stage detail: structural subs + Class C / SH / spend annotate / tip GC.
+    // Class A append is inside this write stage on the unified path.
     out.push_str(&format!(
         " | write struct={}ms(spent={} create_h={} bip68={}) class_c={}ms sh={}ms spend={}ms tip_gc={}ms",
         s.structural_ms,
@@ -821,7 +822,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     out
 }
 
-/// DEBUG detail: µs/blk + pin/edge + archive Class A pipe + contig (no ghost columns).
+/// DEBUG detail: µs/blk + pin/edge; dual-track archive pipe only if active.
 pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let denom = s.phase_blks.max(1);
     let us = |ns: u64| (ns / denom) / 1000;
@@ -831,7 +832,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         .saturating_add(s.utxo_apply_ns)
         .saturating_add(s.cache_tip_ns);
     let mut out = format!(
-        "ibd: perf_dbg us/blk load={} connect={} script={} write={} struct={} spent={} create_h={} bip68={} class_c={} sh={} spend={}(r={} i={} skip={}) tip_gc={} recon={} wire={}",
+        "ibd: perf_dbg us/blk prep={} connect={} script={} write={} struct={} spent={} create_h={} bip68={} class_c={} sh={} spend={}(r={} i={} skip={}) tip_gc={}",
         us(s.load_ns),
         us(s.connect_ns),
         us(s.script_ns),
@@ -847,13 +848,13 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.spend_idx,
         s.spend_skip,
         us(s.cache_tip_ns),
-        us(s.recon_ns),
-        us(s.wire_ns),
     );
+    append_nz(&mut out, "recon_us", us(s.recon_ns));
+    append_nz(&mut out, "wire_us", us(s.wire_ns));
     append_nz(&mut out, "resolve_us", us(s.resolve_ns));
     append_nz(&mut out, "strong_us", us(s.strong_ns));
     append_nz(&mut out, "tip_us", us(s.tip_ns));
-    // Wire rebuild store cost (live).
+    // Wire rebuild store cost (legacy hash-only path only).
     if s.wf_body_store > 0 || s.wf_store_body_ms > 0 {
         out.push_str(&format!(
             " | wire_body store={} store_ms={}",
@@ -877,7 +878,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let bq_mib = s.bq_bytes / (1024 * 1024);
     let bq_budget_mib = s.bq_budget / (1024 * 1024);
     out.push_str(&format!(
-        " | bq={} ({}MiB/{}MiB) | {conf_q} | parents thru={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} uniq_p={} pin_cache={} pin_res={} pin_new={} body_io={} parent_io={}",
+        " | bq={} ({}MiB/{}MiB) | {conf_q} | prep thru={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} uniq_p={} pin_cache={} pin_res={} pin_new={} body_io={} parent_io={}",
         s.bq_count,
         bq_mib,
         bq_budget_mib,
@@ -907,95 +908,96 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         s.load_pin_body_ms,
         s.load_pin_new_meta_ms,
     ));
-    // Edges: same/fk/cb are live.
     out.push_str(&format!(
         " edges same={} fk={} cb={}",
         s.load_edge_same, s.load_edge_fk, s.load_edge_cb,
     ));
     out.push_str(&format!(" sh_runs={}", s.sh_runs));
 
-    let busy = s.pipe.write_busy_ms();
-    let idle = s.pipe.write_idle_ms();
-    let total_w = busy.saturating_add(idle).max(1);
-    let writer_busy_pct = (100 * busy) / total_w;
-    let resolve_us_blk = if s.arch_resolve_blocks > 0 {
-        (s.arch_resolve_ns / s.arch_resolve_blocks) / 1000
-    } else {
-        0
-    };
-    let sticky_pct = if s.arch_ext_need > 0 {
-        (100 * s.arch_sticky_hit) / s.arch_ext_need
-    } else {
-        0
-    };
-    // Archive pipe: keep full detail (real long pole on mainnet).
-    out.push_str(&format!(
-        " | pipe prep_us/blk={} prep_blks={} write_us/blk={} write_blks={} batch_avg={} writer_busy%={} idle_ms={} coalesce_ms={} prep_ms={}",
-        s.pipe.prep_us_per_block(),
-        s.pipe.prep_blocks,
-        s.pipe.write_us_per_block(),
-        s.pipe.write_blocks,
-        s.pipe.avg_batch(),
-        writer_busy_pct,
-        idle,
-        s.pipe.write_coalesce_ms(),
-        s.pipe.prep_ms(),
-    ));
-    // head_rd = durable parent create_fk **reads** (get_fk_by_txid_batch + subtimers).
-    // head_wr = archive **inserts** of this batch's creates (head_insert_many).
-    out.push_str(&format!(
-        " | arch_prep total={} struct={} assign={} collect={} sticky={} inflight={} head_rd={} (probe={} idx={} body={} keys={} cands={} lookups={}) stamp={} finish={} publish={} qwait={} blks={}",
-        s.arch_prep_total_ms,
-        s.arch_prep_struct_ms,
-        s.arch_prep_assign_ms,
-        s.arch_prep_collect_ms,
-        s.arch_prep_sticky_ms,
-        s.arch_prep_inflight_ms,
-        s.arch_prep_head_ms,
-        s.arch_prep_probe_ms,
-        s.arch_prep_idx_ms,
-        s.arch_prep_body_txid_ms,
-        s.arch_prep_head_keys,
-        s.arch_prep_head_cands,
-        s.arch_prep_body_lookups,
-        s.arch_prep_stamp_ms,
-        s.arch_prep_finish_ms,
-        s.arch_prep_publish_ms,
-        s.arch_prep_qwait_ms,
-        s.arch_prep_blocks,
-    ));
-    append_nz(&mut out, "prep_filter", s.arch_prep_filter_ms);
-    out.push_str(&format!(
-        " | arch_write total={} body={} head_wr={} sticky={} dontneed={} flush={} blks={}",
-        s.arch_write_total_ms,
-        s.arch_write_body_ms,
-        s.arch_write_head_ms,
-        s.arch_write_sticky_ms,
-        s.arch_write_dontneed_ms,
-        s.arch_write_flush_ms,
-        s.arch_write_blocks,
-    ));
-    append_nz(&mut out, "write_reserve", s.arch_write_reserve_ms);
-    append_nz(&mut out, "write_spend", s.arch_write_spend_ms);
-    append_nz(&mut out, "write_htxs", s.arch_write_htxs_ms);
-    out.push_str(&format!(
-        " | arch_res resolve_us/blk={} ext={} sticky={}/{} ({}%) head={}/{} stamp batch={} res={} sticky_map={}/{}",
-        resolve_us_blk,
-        s.arch_ext_need,
-        s.arch_sticky_hit,
-        s.arch_ext_need,
-        sticky_pct,
-        s.arch_head_hit,
-        s.arch_head_need,
-        s.arch_batch_stamp,
-        s.arch_resolved_stamp,
-        s.arch_sticky_len,
-        s.arch_sticky_cap,
-    ));
-    out.push_str(&format!(
-        " | contig next_h={} parked={} ready={}",
-        s.contig_next_h, s.contig_parked, s.contig_ready,
-    ));
+    // Dual-track archive fallback pipe — omit when idle (unified path normal).
+    if s.pipe.prep_blocks > 0 || s.pipe.write_blocks > 0 || s.arch_prep_blocks > 0 || s.arch_write_blocks > 0 {
+        let busy = s.pipe.write_busy_ms();
+        let idle = s.pipe.write_idle_ms();
+        let total_w = busy.saturating_add(idle).max(1);
+        let writer_busy_pct = (100 * busy) / total_w;
+        let resolve_us_blk = if s.arch_resolve_blocks > 0 {
+            (s.arch_resolve_ns / s.arch_resolve_blocks) / 1000
+        } else {
+            0
+        };
+        let sticky_pct = if s.arch_ext_need > 0 {
+            (100 * s.arch_sticky_hit) / s.arch_ext_need
+        } else {
+            0
+        };
+        out.push_str(&format!(
+            " | dual_pipe prep_us/blk={} prep_blks={} write_us/blk={} write_blks={} batch_avg={} writer_busy%={} idle_ms={} coalesce_ms={} prep_ms={}",
+            s.pipe.prep_us_per_block(),
+            s.pipe.prep_blocks,
+            s.pipe.write_us_per_block(),
+            s.pipe.write_blocks,
+            s.pipe.avg_batch(),
+            writer_busy_pct,
+            idle,
+            s.pipe.write_coalesce_ms(),
+            s.pipe.prep_ms(),
+        ));
+        out.push_str(&format!(
+            " | arch_prep total={} struct={} assign={} collect={} sticky={} inflight={} head_rd={} (probe={} idx={} body={} keys={} cands={} lookups={}) stamp={} finish={} publish={} qwait={} blks={}",
+            s.arch_prep_total_ms,
+            s.arch_prep_struct_ms,
+            s.arch_prep_assign_ms,
+            s.arch_prep_collect_ms,
+            s.arch_prep_sticky_ms,
+            s.arch_prep_inflight_ms,
+            s.arch_prep_head_ms,
+            s.arch_prep_probe_ms,
+            s.arch_prep_idx_ms,
+            s.arch_prep_body_txid_ms,
+            s.arch_prep_head_keys,
+            s.arch_prep_head_cands,
+            s.arch_prep_body_lookups,
+            s.arch_prep_stamp_ms,
+            s.arch_prep_finish_ms,
+            s.arch_prep_publish_ms,
+            s.arch_prep_qwait_ms,
+            s.arch_prep_blocks,
+        ));
+        append_nz(&mut out, "prep_filter", s.arch_prep_filter_ms);
+        out.push_str(&format!(
+            " | arch_write total={} body={} head_wr={} sticky={} dontneed={} flush={} blks={}",
+            s.arch_write_total_ms,
+            s.arch_write_body_ms,
+            s.arch_write_head_ms,
+            s.arch_write_sticky_ms,
+            s.arch_write_dontneed_ms,
+            s.arch_write_flush_ms,
+            s.arch_write_blocks,
+        ));
+        append_nz(&mut out, "write_reserve", s.arch_write_reserve_ms);
+        append_nz(&mut out, "write_spend", s.arch_write_spend_ms);
+        append_nz(&mut out, "write_htxs", s.arch_write_htxs_ms);
+        out.push_str(&format!(
+            " | arch_res resolve_us/blk={} ext={} sticky={}/{} ({}%) head={}/{} stamp batch={} res={} sticky_map={}/{}",
+            resolve_us_blk,
+            s.arch_ext_need,
+            s.arch_sticky_hit,
+            s.arch_ext_need,
+            sticky_pct,
+            s.arch_head_hit,
+            s.arch_head_need,
+            s.arch_batch_stamp,
+            s.arch_resolved_stamp,
+            s.arch_sticky_len,
+            s.arch_sticky_cap,
+        ));
+    }
+    if s.contig_parked > 0 || s.contig_ready > 0 {
+        out.push_str(&format!(
+            " | contig next_h={} parked={} ready={}",
+            s.contig_next_h, s.contig_parked, s.contig_ready,
+        ));
+    }
     out.push_str(&format!(
         " | loop confirm_blks={} confirm_us/blk={} events={}",
         s.confirm_blocks, s.confirm_us_per_block, s.drain_events,
@@ -1034,11 +1036,11 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         "ibd: sizes rss={}MiB anon={}MiB file={}MiB({}%) hwm={}MiB locked={}MiB \
          | work ordered={}/set={} hash_h={} h2h={} hdr_fk={} known_hdr={} inflight={}/peer={} cooldown={} \
          | body known={} pend={} miss={} charged={} rej={} \
-         | arch q={}/{}MiB budget={}MiB sticky={}/{} fifo={} contig parked={} ready={} next_h={} \
+         | body_soft q={}/{}MiB budget={}MiB sticky={}/{} fifo={} contig parked={} ready={} next_h={} \
          | bq n={} {}MiB/{}MiB \
          | residency creates={}/{} outs={}/{} \
          | outfifo creates={} outs={}/{} order={} plans={} \
-         | conf loadq={}/{} blks={} wire={}MiB parents={} writeq={}/{} blks={} wire={}MiB parents={} \
+         | conf prepq={}/{} blks={} wire={}MiB parents={} writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
          | txhead active={} bits={}/{} entry={}B slots={} occ={} body={}MiB \
            shadow bits={} entry={}B slots={} occ={} body={}MiB cursor={}/{} \
@@ -1127,11 +1129,11 @@ pub(crate) fn log_sample(s: &IbdPerfSample) {
     if s.phase_blks > 0 {
         let c_ms = s.class_c_ms / s.phase_blks.max(1);
         let sh_ms = s.sh_ms / s.phase_blks.max(1);
-        let recon_ms = s.recon_ms / s.phase_blks.max(1);
-        if c_ms >= 1000 || sh_ms >= 1000 || recon_ms >= 5000 {
+        let prep_ms = s.load_ms / s.phase_blks.max(1);
+        if c_ms >= 1000 || sh_ms >= 1000 || prep_ms >= 5000 {
             rbitcoin_log::warn!(
-                "ibd: slow confirm phase ms/blk recon={} script={} class_c={} sh={} (sh_collect={}ms window) store_body={}ms blks={}",
-                recon_ms,
+                "ibd: slow confirm phase ms/blk prep={} script={} class_c={} sh={} (sh_collect={}ms window) store_body={}ms blks={}",
+                prep_ms,
                 s.script_ms / s.phase_blks.max(1),
                 c_ms,
                 sh_ms,
@@ -1174,14 +1176,15 @@ mod tests {
         let line = format_info(&s);
         assert!(line.starts_with("ibd: perf "), "{line}");
         assert!(line.contains("inflight=3/256"), "{line}");
-        assert!(line.contains("arch_q=10"), "{line}");
+        assert!(line.contains("body_soft=10/"), "{line}");
         assert!(line.contains("bq=7 (128MiB/4096MiB)"), "{line}");
-        assert!(line.contains("arch_ahead=224"), "{line}");
+        assert!(line.contains("buf_ahead=224"), "{line}");
         assert!(!line.contains("lead="), "schema12: no Class A lead= on perf: {line}");
         assert!(!line.contains("arch_hwm"), "{line}");
+        assert!(!line.contains("arch_q="), "{line}");
         assert!(line.contains("conf blks=32"), "{line}");
         assert!(line.contains("script=20ms"), "{line}");
-        assert!(line.contains("load=30ms"), "{line}");
+        assert!(line.contains("prep=30ms"), "{line}");
         // write = class_c(40)+spend(25)+tip_gc(5) = 70
         assert!(line.contains("write=70ms"), "{line}");
         assert!(line.contains("class_c=40ms"), "{line}");
@@ -1217,7 +1220,7 @@ mod tests {
         s.structural_create_h_ms = 5;
         s.structural_bip68_ms = 20;
         let line = format_info(&s);
-        assert!(line.contains("loadq=1/2 writeq=2/2"), "{line}");
+        assert!(line.contains("prepq=1/2 writeq=2/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
         assert!(line.contains("pin_cache=8"), "{line}");
         assert!(line.contains("pin_res=3"), "{line}");
@@ -1281,7 +1284,7 @@ mod tests {
         s.bq_budget = 1024 * 1024 * 1024;
         let line = format_debug(&s);
         assert!(line.starts_with("ibd: perf_dbg "), "{line}");
-        assert!(line.contains("us/blk load="), "{line}");
+        assert!(line.contains("us/blk prep="), "{line}");
         assert!(line.contains("write="), "{line}");
         assert!(line.contains("spend=500(r=10 i=2 skip=0)"), "{line}");
         assert!(!line.contains("prefetch="), "{line}");
@@ -1293,8 +1296,8 @@ mod tests {
         assert!(line.contains("sh collect=12"), "{line}");
         assert!(line.contains("pin_sub body="), "{line}");
         assert!(line.contains("bq=3 (64MiB/1024MiB)"), "{line}");
-        // Depth 0 → `<` (scripts waiting on empty load queue).
-        assert!(line.contains("loadq<0/2 writeq=1/2"), "{line}");
+        // Depth 0 → `<` (scripts waiting on empty prep queue).
+        assert!(line.contains("prepq<0/2 writeq=1/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
         assert!(line.contains("utxo_p=100"), "{line}");
         assert!(line.contains("creates=50"), "{line}");
@@ -1305,15 +1308,13 @@ mod tests {
         assert!(!line.contains("pin_cached="), "{line}");
         assert!(line.contains("edges same=10 fk=5 cb=1"), "{line}");
         assert!(line.contains("sh_runs=2"), "{line}");
+        // Dual-track archive columns only when pipe active (write_blocks=5).
         assert!(line.contains("arch_res resolve_us/blk="), "{line}");
         assert!(line.contains("arch_prep total="), "{line}");
-        assert!(line.contains("probe="), "{line}");
-        assert!(line.contains("lookups="), "{line}");
         assert!(line.contains("arch_write total="), "{line}");
         assert!(line.contains("sticky_map="), "{line}");
         assert!(line.contains("sticky=80/100"), "{line}");
-        assert!(line.contains("contig next_h="), "{line}");
-        assert!(line.contains("pipe "), "{line}");
+        assert!(line.contains("dual_pipe "), "{line}");
         assert!(line.contains("loop "), "{line}");
         assert!(!line.contains("runway"), "{line}");
         assert!(!line.contains("connect wave%="), "{line}");
@@ -1388,13 +1389,13 @@ mod tests {
         assert!(line.contains("ordered=100/set=90"), "{line}");
         assert!(line.contains("pend=5"), "{line}");
         assert!(line.contains("charged=4"), "{line}");
-        assert!(line.contains("arch q=12/40MiB"), "{line}");
+        assert!(line.contains("body_soft q=12/40MiB"), "{line}");
         assert!(line.contains("sticky=1000/4000000"), "{line}");
         assert!(line.contains("bq n=4 32MiB/512MiB"), "{line}");
         assert!(line.contains("residency creates=80/8000000 outs=900/16777216"), "{line}");
         assert!(line.contains("outfifo creates=50"), "{line}");
         assert!(line.contains("outs=500/16777216"), "{line}");
-        assert!(line.contains("loadq=2/5 blks=40 wire=12MiB parents=500"), "{line}");
+        assert!(line.contains("prepq=2/5 blks=40 wire=12MiB parents=500"), "{line}");
         assert!(line.contains("writeq=1/5 blks=16 wire=4MiB"), "{line}");
         assert!(line.contains("feed ready=8 inflight=32"), "{line}");
         assert!(line.contains("txhead active=1"), "{line}");

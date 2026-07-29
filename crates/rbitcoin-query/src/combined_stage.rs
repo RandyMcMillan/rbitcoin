@@ -250,6 +250,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Confirm prep intake: payload by height from disk or RAM pending (no dequeue).
+    #[test]
+    fn block_queue_payload_peek_disk_and_pending() {
+        let (dir, q) = temp_query();
+        let disk = b"disk-payload".to_vec();
+        q.block_queue_enqueue(10, [0xAAu8; 32], 1, &disk).unwrap();
+        assert_eq!(
+            q.block_queue_payload(10).unwrap().as_deref(),
+            Some(disk.as_slice())
+        );
+        assert!(q.block_queue_has_height(10));
+        assert_eq!(q.block_queue_stats().2, 1, "peek does not dequeue");
+
+        q.block_queue_force_budget_for_test(32);
+        let ram = vec![9u8; 40];
+        assert_eq!(
+            q.block_queue_offer(11, [0xBBu8; 32], 2, &ram).unwrap(),
+            None,
+            "held in RAM pending"
+        );
+        assert_eq!(
+            q.block_queue_payload(11).unwrap().as_deref(),
+            Some(ram.as_slice())
+        );
+        assert!(q.block_queue_has_height(11));
+        assert!(q.block_queue_payload(99).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn block_queue_hysteresis_scale() {
         // Enter at 0.90, stay until ≤0.70.

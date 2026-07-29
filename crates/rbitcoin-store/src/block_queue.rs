@@ -302,6 +302,21 @@ impl BlockQueue {
         Ok(out)
     }
 
+    /// Load payload for a height (confirm prep intake). First match by height.
+    ///
+    /// Does **not** dequeue — confirm-write / permanent reject removes the rec.
+    pub fn get_by_height(&self, height: u32) -> Result<Option<QueuedBlock>, StoreError> {
+        let Some((&id, _)) = self.index.iter().find(|(_, e)| e.height == height) else {
+            return Ok(None);
+        };
+        self.get(id)
+    }
+
+    /// True if any durable rec exists for `height` (O(n) index walk).
+    pub fn contains_height(&self, height: u32) -> bool {
+        self.index.values().any(|e| e.height == height)
+    }
+
     /// Heights currently on the durable queue.
     pub fn heights(&self) -> Vec<u32> {
         self.index.values().map(|e| e.height).collect()
@@ -349,6 +364,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn get_by_height_peek_without_dequeue() {
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let payload = b"wire-bytes-height-42".to_vec();
+        q.enqueue(42, [0x11u8; 32], 3, &payload).unwrap();
+        let got = q.get_by_height(42).unwrap().expect("by height");
+        assert_eq!(got.payload, payload);
+        assert_eq!(got.height, 42);
+        assert!(q.contains_height(42));
+        assert!(q.get_by_height(99).unwrap().is_none());
+        assert_eq!(q.count(), 1, "peek must not dequeue");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

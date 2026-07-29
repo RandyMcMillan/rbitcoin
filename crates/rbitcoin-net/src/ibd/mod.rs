@@ -404,7 +404,7 @@ pub async fn ibd_cancellable(
         &archive_queued,
     ) {
         Ok(n) if n > 0 => {
-            info!("ibd: rehydrated {n} durable block_queue entries into confirm wire feed");
+            info!("ibd: rehydrated {n} body-queue entries into confirm feed (readiness)");
         }
         Ok(_) => {}
         Err(e) => {
@@ -885,8 +885,8 @@ pub async fn ibd_cancellable(
             let eta = tip_rate_tracker.eta_string(now, prog.tip, prog.headers);
 
             // Bold on a TTY so the 5s progress line stands out among perf/debug noise.
-            // loadq/writeq: confirm load→scripts / scripts→write; `name<0/cap` = empty.
-            // bq=: durable on-disk block queue (schema 12), not Class A arch_hwm/lead.
+            // prepq/writeq: confirm prep→scripts / scripts→write; `name<0/cap` = empty.
+            // bq=: durable body queue (schema 12); wire lives there until write dequeues.
             let conf_q = confirm::format_conf_q(
                 load_q,
                 write_q,

@@ -5,7 +5,7 @@
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
-//! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, prepq/writeq, txs=, horizon, tip ETA, body `bq=` |
+//! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, prepq/writeq, txs=, horizon, tip ETA, body `bq=` |
 //! | INFO  | `ibd: perf …` | Download + body-queue pressure; **prep / script / write** stage walls + sub-phases; pin mix; queues |
 //! | INFO  | `ibd: sizes …` | RSS + work path + body soft budget + **bq** + residency + conf pipe + tx.head |
 //! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; dual-track archive pipe only if non-zero; contig park |

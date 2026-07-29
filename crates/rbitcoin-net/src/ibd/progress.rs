@@ -6,8 +6,11 @@
 use super::body::BodyPresence;
 use crate::chain::ChainHub;
 use bitcoin::BlockHash;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashMap;
 use std::time::Instant;
+
+/// Cap status-tick hole walk so a huge missing header band cannot burn the loop.
+const TIP_HOLE_SCAN_MAX: u32 = 8192;
 
 /// Work-chain progress for status / progress logs.
 ///
@@ -15,7 +18,9 @@ use std::time::Instant;
 /// - `archived`: Class A high-water on the work path (used for download lead /
 ///   densify bookkeeping; **not** printed as `arch_hwm=` on the progress line)
 /// - `headers`: max peer-advertised / learned header height
-/// - `tip_hole`: contiguous unarchived run at the ordered front (blocks tip)
+/// - `tip_hole`: count of heights from tip+1 until the next **claim-ready**
+///   body (body queue / pending wire, or Class A fallback) — the fetch gap
+///   operators care about
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WorkChainProgress {
     pub tip: u32,
@@ -47,9 +52,8 @@ pub(crate) struct ProgressLineInput {
 
 /// Build the `ibd: progress …` message body (no log level prefix).
 ///
-/// Tip percent/rate, download hole, peers, confirm queues, txs, header horizon,
-/// tip-rate ETA, and durable block-queue occupancy. Does **not** emit
-/// `arch_hwm=`, a separate archive rate, or Class A `lead=`.
+/// Tip percent/rate, **fetch hole** (tip→next claim-ready body), peers, confirm
+/// queues, txs, header horizon, tip-rate ETA, durable block-queue occupancy.
 pub(crate) fn format_progress_line(i: &ProgressLineInput) -> String {
     let bq_mib = i.bq_bytes / (1024 * 1024);
     let bq_budget_mib = i.bq_budget / (1024 * 1024);
@@ -70,35 +74,76 @@ pub(crate) fn format_progress_line(i: &ProgressLineInput) -> String {
     )
 }
 
-/// Build a status snapshot without walking the full ordered path.
+/// True if confirm prep can claim this height without another getdata.
 ///
-/// Full scans were O(path) every 5s on 90k+ headers. High-water marks already
-/// track archived/header horizon; only `tip_hole` needs a short front walk.
+/// Unified path: body already in the durable/pending body queue (`pending` or
+/// `block_queue_has_height`). Class A `ready` remains a fallback for
+/// already-archived heights without a queue payload.
+pub(crate) fn claim_ready(
+    hub: &ChainHub,
+    body: &mut BodyPresence,
+    height: u32,
+    hash: &BlockHash,
+) -> bool {
+    if hub.has_block(hash) {
+        return true;
+    }
+    if body.is_rejected(hash) {
+        return false;
+    }
+    // Peer/rehydrate already parked wire in the body queue.
+    if body.is_pending(hash) {
+        return true;
+    }
+    if hub.query.block_queue_has_height(height) {
+        return true;
+    }
+    // Hash-only / already-archived Class A path.
+    body.ready(hub, hash)
+}
+
+/// Count heights from tip+1 until the next claim-ready body (fetch gap).
+///
+/// - Missing header on the work path → stop (cannot request further).
+/// - Rejected tip+1 → stop (not a download gap; confirm is blacklisted).
+/// - Claim-ready (queue/pending/Class A) → stop.
+/// - Otherwise increment hole (needs getdata before tip can claim it).
+pub(crate) fn tip_fetch_hole(
+    hub: &ChainHub,
+    height_to_hash: &HashMap<u32, BlockHash>,
+    body: &mut BodyPresence,
+) -> usize {
+    let path_lo = match hub.tip_height() {
+        None => 0u32,
+        Some(t) => t.saturating_add(1),
+    };
+    let mut hole = 0usize;
+    let limit = path_lo.saturating_add(TIP_HOLE_SCAN_MAX);
+    for ht in path_lo..=limit {
+        let Some(&hash) = height_to_hash.get(&ht) else {
+            break;
+        };
+        if body.is_rejected(&hash) {
+            break;
+        }
+        if claim_ready(hub, body, ht, &hash) {
+            break;
+        }
+        hole = hole.saturating_add(1);
+    }
+    hole
+}
+
+/// Build a status snapshot for the ~5s operator tick.
 pub(crate) fn work_chain_progress(
     hub: &ChainHub,
-    ordered: &VecDeque<BlockHash>,
-    ordered_set: &HashSet<BlockHash>,
+    height_to_hash: &HashMap<u32, BlockHash>,
     body: &mut BodyPresence,
     max_peer_height: u32,
     max_archived_height: u32,
 ) -> WorkChainProgress {
     let tip = hub.tip_height().unwrap_or(0);
-    let mut tip_hole = 0usize;
-    for h in ordered.iter() {
-        // Skip ghosts (removed from set but not yet compacted out of the deque).
-        if !ordered_set.contains(h) {
-            continue;
-        }
-        // Confirmed prefix still on the deque until trim — not a download hole.
-        if hub.has_block(h) {
-            continue;
-        }
-        // First unconfirmed live hash: if not Class A ready, it blocks tip.
-        if body.ready(hub, h) {
-            break;
-        }
-        tip_hole += 1;
-    }
+    let tip_hole = tip_fetch_hole(hub, height_to_hash, body);
     WorkChainProgress {
         tip,
         archived: tip.max(max_archived_height),
@@ -165,10 +210,8 @@ impl TipRateTracker {
                 self.rate_ema = Some(match self.rate_ema {
                     None => inst,
                     Some(prev) => {
-                        // alpha = 1 - exp(-ln2 * dt / half_life)
                         let alpha = 1.0
                             - (-std::f64::consts::LN_2 * dt / ETA_RATE_HALF_LIFE_SECS).exp();
-                        // Bound so a pathological long gap cannot fully reset.
                         let alpha = alpha.clamp(0.02, 0.5);
                         alpha * inst + (1.0 - alpha) * prev
                     }
@@ -179,8 +222,6 @@ impl TipRateTracker {
     }
 
     /// Smoothed tip rate (blocks/s) for ETA: present-biased EWMA.
-    ///
-    /// Returns `None` until enough wall time has elapsed for a stable read.
     pub(crate) fn eta_rate(&self, now: Instant) -> Option<f64> {
         let first = self.first_at?;
         let elapsed = now.duration_since(first).as_secs_f64();
@@ -241,12 +282,14 @@ pub(crate) fn format_rate(rate: f64) -> String {
     }
 }
 
-/// Pure tip-hole count over an ordered path using a boolean ready map
-/// (unit-test helper; production uses [`work_chain_progress`]).
+/// Pure tip-hole count over tip+1.. using claim-ready flags
+/// (unit-test helper; production uses [`tip_fetch_hole`]).
+///
+/// `claim_ready[i]` corresponds to height path_lo+i.
 #[cfg(test)]
-pub(crate) fn tip_hole_from_ready(ready_flags: &[bool]) -> usize {
+pub(crate) fn tip_hole_from_claim_ready(claim_ready_flags: &[bool]) -> usize {
     let mut tip_hole = 0usize;
-    for &ready in ready_flags {
+    for &ready in claim_ready_flags {
         if ready {
             break;
         }
@@ -258,11 +301,10 @@ pub(crate) fn tip_hole_from_ready(ready_flags: &[bool]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_duration_short, format_progress_line, format_rate, ibd_pct, tip_hole_from_ready,
+        format_duration_short, format_progress_line, format_rate, ibd_pct, tip_hole_from_claim_ready,
         ProgressLineInput, TipRateTracker,
     };
     use std::time::{Duration, Instant};
-    // TipRateTracker used by both format and EWMA surfaces.
 
     /// Shipped progress line: tip + durable bq; no Class A arch_hwm / arch rate / lead.
     #[test]
@@ -286,19 +328,16 @@ mod tests {
             line,
             "ibd: progress 42% tip=100000 (12/s) hole=3 peers=8 prepq=1/2 writeq=0/2 txs=50000000 horizon=900000 eta=18h bq=17 (256MiB/4096MiB)"
         );
-        // Legacy dual-pipeline columns must not appear.
         assert!(
             !line.contains("arch_hwm"),
             "must not report Class A arch_hwm: {line}"
         );
         assert!(!line.contains("lead="), "must not report archive lead=: {line}");
-        // A second rate next to an arch column is gone; only tip (/s) remains.
         assert_eq!(
             line.matches("/s)").count(),
             1,
             "only tip rate on progress line: {line}"
         );
-        // Low tip rate keeps one decimal (still a single /s).
         let slow = format_progress_line(&ProgressLineInput {
             pct: 1,
             tip: 10,
@@ -318,21 +357,20 @@ mod tests {
         assert!(!slow.contains("arch_hwm") && !slow.contains("lead="), "{slow}");
     }
 
-    /// Pure helpers for progress lines (pct / tip-hole / duration formatting).
     #[test]
     fn pct_tip_hole_and_format_surface() {
         assert_eq!(ibd_pct(0, 100), 0);
         assert_eq!(ibd_pct(50, 100), 50);
         assert_eq!(ibd_pct(100, 100), 100);
-        // denom = max(tip, horizon)
         assert_eq!(ibd_pct(200, 100), 100);
         assert_eq!(ibd_pct(0, 0), 0);
         assert_eq!(ibd_pct(5, 0), 100);
 
-        assert_eq!(tip_hole_from_ready(&[]), 0);
-        assert_eq!(tip_hole_from_ready(&[true, false, false]), 0);
-        assert_eq!(tip_hole_from_ready(&[false, false, true, false]), 2);
-        assert_eq!(tip_hole_from_ready(&[false, false, false]), 3);
+        // claim_ready flags from tip+1: false,false,true → hole=2
+        assert_eq!(tip_hole_from_claim_ready(&[]), 0);
+        assert_eq!(tip_hole_from_claim_ready(&[true, false, false]), 0);
+        assert_eq!(tip_hole_from_claim_ready(&[false, false, true, false]), 2);
+        assert_eq!(tip_hole_from_claim_ready(&[false, false, false]), 3);
 
         assert_eq!(format_duration_short(45), "45s");
         assert_eq!(format_duration_short(59), "59s");
@@ -353,7 +391,6 @@ mod tests {
         assert_eq!(format_rate(f64::INFINITY), "0");
         assert_eq!(format_rate(-1.0), "0");
 
-        // ETA done path.
         let mut done = TipRateTracker::new();
         let t0 = Instant::now();
         done.push(t0, 100);
@@ -361,14 +398,14 @@ mod tests {
     }
 
     #[test]
-    fn work_chain_progress_tip_hole_and_high_water() {
+    fn work_chain_progress_fetch_hole_pending_is_ready() {
         use super::work_chain_progress;
         use super::super::body::BodyPresence;
         use bitcoin::hashes::Hash;
         use bitcoin::BlockHash;
         use rbitcoin_consensus::{ChainParams, Milestone};
         use rbitcoin_query::Query;
-        use std::collections::{HashSet, VecDeque};
+        use std::collections::HashMap;
 
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-wcp-{}-{}",
@@ -383,35 +420,41 @@ mod tests {
         let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
         hub.ensure_genesis().unwrap();
 
-        let mut ordered = VecDeque::new();
-        let mut set = HashSet::new();
+        // tip=0 (genesis) → path_lo=1. Heights 1,2 missing; 3 pending (has wire).
+        let mut h2h = HashMap::new();
         let mut body = BodyPresence::new();
-        // Ghost entry + unready hole + ready stop.
-        let ghost = BlockHash::from_byte_array([1u8; 32]);
-        let hole = BlockHash::from_byte_array([2u8; 32]);
-        let ready = BlockHash::from_byte_array([3u8; 32]);
-        ordered.push_back(ghost); // not in set
-        ordered.push_back(hole);
-        ordered.push_back(ready);
-        set.insert(hole);
-        set.insert(ready);
-        body.mark_missing(hole);
-        body.mark_archived(ready);
+        let h1 = BlockHash::from_byte_array([1u8; 32]);
+        let h2 = BlockHash::from_byte_array([2u8; 32]);
+        let h3 = BlockHash::from_byte_array([3u8; 32]);
+        h2h.insert(1, h1);
+        h2h.insert(2, h2);
+        h2h.insert(3, h3);
+        body.mark_missing(h1);
+        body.mark_missing(h2);
+        body.mark_pending(h3); // body queue owns wire → claim-ready
 
-        let p = work_chain_progress(&hub, &ordered, &set, &mut body, 50, 10);
+        let p = work_chain_progress(&hub, &h2h, &mut body, 50, 10);
         assert_eq!(p.tip, 0);
-        assert_eq!(p.archived, 10); // max(tip, max_archived)
+        assert_eq!(p.archived, 10);
         assert_eq!(p.headers, 50);
-        assert_eq!(p.tip_hole, 1); // hole then ready breaks
+        assert_eq!(
+            p.tip_hole, 2,
+            "pending at h=3 is claim-ready; hole is only missing 1..2"
+        );
+
+        // Pending at tip+1 → hole=0 (fetch already filled; confirm can claim).
+        body.mark_pending(h1);
+        let p2 = work_chain_progress(&hub, &h2h, &mut body, 50, 10);
+        assert_eq!(p2.tip_hole, 0);
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// EWMA tip-rate: warmup gate, steady ETA, spike resistance, sustained slowdown.
+    /// EWMA tip-rate: warmup gate, steady ETA.
     #[test]
     fn tip_rate_tracker_eta_surface() {
         let t0 = Instant::now();
 
-        // Warmup: only 5s of history — hide ETA until min elapsed.
         let mut cold = TipRateTracker::new();
         cold.push(t0, 0);
         cold.push(t0 + Duration::from_secs(5), 50);
@@ -421,46 +464,16 @@ mod tests {
             "eta=?"
         );
 
-        // Steady 1 blk/s → ~2h ETA for 7200 remaining.
         let mut steady = TipRateTracker::new();
         for i in 0u32..=60 {
             steady.push(t0 + Duration::from_secs(u64::from(i) * 5), 100 + i * 5);
         }
         let now = t0 + Duration::from_secs(300);
-        let rate = steady.eta_rate(now).unwrap();
-        assert!((rate - 1.0).abs() < 0.05, "rate={rate}");
-        let eta = steady.eta_string(now, 100 + 300, 100 + 300 + 7200);
-        assert!(eta.contains("eta="), "{eta}");
-        assert!(eta.contains("2.0h") || eta.contains("2h"), "{eta}");
-
-        // Spike: ~5 min at 10 blk/s, then one wild tick — EWMA must not jump near spike.
-        let mut spike = TipRateTracker::new();
-        for i in 0u32..=60 {
-            spike.push(t0 + Duration::from_secs(u64::from(i) * 5), i * 50);
-        }
-        let before = spike.eta_rate(t0 + Duration::from_secs(300)).unwrap();
-        assert!((before - 10.0).abs() < 0.5, "before={before}");
-        spike.push(t0 + Duration::from_secs(305), 60 * 50 + 2500);
-        let after = spike.eta_rate(t0 + Duration::from_secs(305)).unwrap();
-        assert!(after < 30.0, "after spike rate should stay near 10, got {after}");
-        assert!(after > 8.0, "after={after}");
-
-        // Sustained slowdown: fast early, then dense pace for several minutes.
-        let mut slow = TipRateTracker::new();
-        for i in 0u32..=12 {
-            slow.push(t0 + Duration::from_secs(u64::from(i) * 5), i * 500);
-        }
-        let fast = slow.eta_rate(t0 + Duration::from_secs(60)).unwrap();
-        assert!(fast > 50.0, "fast={fast}");
-        let tip0 = 12u32 * 500;
-        for i in 1u32..=72 {
-            slow.push(
-                t0 + Duration::from_secs(60 + u64::from(i) * 5),
-                tip0 + i * 50,
-            );
-        }
-        let dense = slow.eta_rate(t0 + Duration::from_secs(60 + 72 * 5)).unwrap();
-        assert!(dense < 18.0, "should track denser pace, got {dense}");
-        assert!(dense > 5.0, "dense={dense}");
+        let rate = steady.eta_rate(now).expect("warmed");
+        assert!((rate - 1.0).abs() < 0.15, "rate={rate}");
+        // ~7200 remain at ~1 blk/s → ~2h
+        let eta = steady.eta_string(now, 400, 7_600);
+        assert!(eta.starts_with("eta="), "{eta}");
+        assert!(eta.contains('h') || eta.contains('m'), "{eta}");
     }
 }

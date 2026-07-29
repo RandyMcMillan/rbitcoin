@@ -867,8 +867,7 @@ pub async fn ibd_cancellable(
             let scan_t0 = Instant::now();
             let prog = work_chain_progress(
                 hub.as_ref(),
-                &st.ordered,
-                &st.ordered_set,
+                &st.height_to_hash,
                 &mut st.body,
                 st.max_peer_height,
                 st.max_archived_height,

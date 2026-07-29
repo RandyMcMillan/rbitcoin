@@ -449,27 +449,37 @@ pub(crate) fn issue_batch(
     true
 }
 
-/// Contiguous unready hashes at the ordered front (status `hole=`).
+/// Contiguous tip+1.. hashes that still need getdata (assign tip-hole race).
+///
+/// Stops at the first **claim-ready** body (pending / body queue / Class A) so
+/// densify priority matches operator `hole=` (fetch gap, not confirm backlog).
 pub(crate) fn contiguous_tip_holes(
     st: &mut IbdWorkState,
     hub: &ChainHub,
     max: usize,
 ) -> Vec<BlockHash> {
+    use super::progress::claim_ready;
+    let path_lo = match hub.tip_height() {
+        None => 0u32,
+        Some(t) => t.saturating_add(1),
+    };
     let mut holes = Vec::new();
-    for h in st.ordered.iter().copied() {
-        if !st.ordered_set.contains(&h) {
-            continue;
-        }
-        if st.body.is_rejected(&h) {
-            continue;
-        }
-        if hub.has_block(&h) || st.body.ready(hub, &h) {
-            break;
-        }
-        holes.push(h);
+    let limit = path_lo.saturating_add(max as u32 * 4).max(path_lo.saturating_add(max as u32));
+    for ht in path_lo..=limit {
         if holes.len() >= max {
             break;
         }
+        let Some(&hash) = st.height_to_hash.get(&ht) else {
+            break;
+        };
+        if st.body.is_rejected(&hash) {
+            break;
+        }
+        if claim_ready(hub, &mut st.body, ht, &hash) {
+            break;
+        }
+        // Need getdata (and not already inflight — cover_tip_holes filters that).
+        holes.push(hash);
     }
     holes
 }
@@ -805,17 +815,14 @@ mod tests {
         assert_eq!(pop_need(&mut q, &mut st, &hub), Some(h(2)));
         assert!(pop_need(&mut q, &mut st, &hub).is_none());
 
-        // Tip holes: ghost skip, then unready, then ready breaks.
-        st.ordered.clear();
-        st.ordered_set.clear();
-        let ghost = h(20);
+        // Tip holes: from tip+1 (empty hub tip → path_lo=0). Missing then pending stops.
+        st.height_to_hash.clear();
         let hole = h(21);
         let ready = h(22);
-        st.ordered.extend([ghost, hole, ready]);
-        st.ordered_set.insert(hole);
-        st.ordered_set.insert(ready);
+        st.height_to_hash.insert(0, hole);
+        st.height_to_hash.insert(1, ready);
         st.body.mark_missing(hole);
-        st.body.mark_archived(ready);
+        st.body.mark_pending(ready); // body queue owns wire → not a fetch hole
         let holes = contiguous_tip_holes(&mut st, &hub, 8);
         assert_eq!(holes, vec![hole]);
 

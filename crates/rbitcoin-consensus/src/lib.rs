@@ -303,6 +303,7 @@ pub fn confirm_archived_at(
 pub use confirm_run::{
     confirm_archived_run, confirm_archived_run_preverified, confirm_load_phase,
     confirm_load_phase_preverified, confirm_script_phase, confirm_scripts_phase,
+    confirm_wire_prep_phase, confirm_wire_run, confirm_wire_run_preverified,
     confirm_write_phase, ConfirmLoadOutcome, ConfirmScriptOutcome, LoadedBatch,
     ScriptOkBatch, ScriptPreverified,
 };
@@ -360,24 +361,19 @@ pub fn accept_and_connect_block_preverified(
         }
     }
 
-    // Fail closed on structure/header before durable Class A when possible.
-    // Softfork height gates + PoW/linkage; confirm re-checks mid-batch assemble.
-    let ctx = ValidationContext::at(params, height, milestone);
-    let _txids = validate_block_structure_hashed(block, &ctx)?;
-    validate_header(query, params, height, &block.header)?;
-
-    accept_and_archive_block(query, params, height, block, milestone)?;
-    let fks = confirm_archived_run_preverified(
+    // Unified height-ordered path: wire → prep (plan+pin+assemble) → scripts →
+    // commit (Class A + structural + Class C + annotate). No archive-then-reload.
+    let fks = confirm_wire_run_preverified(
         query,
         params,
         milestone,
-        &[(height, hash)],
+        &[(height, block.clone())],
         preverified,
     )?;
     if let Some(fk) = fks.into_iter().next() {
         return Ok(fk);
     }
-    // Write skipped heights ≤ tip (idempotent race after archive).
+    // Write skipped heights ≤ tip (idempotent race).
     query
         .get_header_by_hash(&hash)
         .map_err(ConsensusError::Store)?

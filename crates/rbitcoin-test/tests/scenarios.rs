@@ -2138,3 +2138,138 @@ fn block_cache_and_mempool_hub_surface() {
     let cb2 = b2.txdata[0].compute_txid().to_byte_array();
     assert!(q_arc.get_tx_by_txid(&cb2).unwrap().is_some());
 }
+
+// ─── Unified wire pipeline (raw block → validated tip) ───────────────────────
+
+/// Multi-height raw wire → tip via split prep/scripts/commit (no pre-archive reload).
+#[test]
+fn unified_wire_pipeline_multi_block_to_tip() {
+    use rbitcoin_consensus::{
+        confirm_scripts_phase, confirm_wire_prep_phase, confirm_write_phase, ChainParams,
+        Milestone, ScriptPreverified,
+    };
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.enter_direct_index_mode().unwrap();
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    let mut batch: Vec<(Height, bitcoin::Block)> = Vec::new();
+    for h in 1u32..=4 {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        tip = b.block_hash();
+        tip_time = b.header.time;
+        batch.push((Height(h), b));
+    }
+
+    rbitcoin_query::reset_body_ok_reads();
+    let mat = confirm_wire_prep_phase(&q, &params, ms, &batch, &ScriptPreverified::new())
+        .expect("wire prep");
+    assert_eq!(mat.batch.len(), 4);
+    assert!(
+        mat.batch.archive_plan.is_some(),
+        "wire prep carries Class A plan for single commit era"
+    );
+    // Coinbase-only extension: no external parent denserels IO at prep.
+    assert_eq!(
+        rbitcoin_query::body_ok_reads(),
+        0,
+        "batch creates planned from wire — no Class-A body re-fetch for creates"
+    );
+
+    let ok = confirm_scripts_phase(mat.batch).expect("scripts");
+    assert!(ok.batch.archive_plan.is_some());
+    let fks = confirm_write_phase(&q, &params, ms, ok.batch).expect("commit");
+    assert_eq!(fks.len(), 4);
+    assert_eq!(q.tip_height(), Some(Height(4)));
+    for (h, b) in &batch {
+        assert!(
+            q.is_block_archived(&b.block_hash().to_byte_array()).unwrap(),
+            "h={} archived after unified commit",
+            h.0
+        );
+    }
+}
+
+/// Structural double-spend still rejects on the wire path.
+#[test]
+fn unified_wire_pipeline_rejects_double_spend() {
+    use rbitcoin_consensus::{confirm_wire_run, ChainParams, Milestone};
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.enter_direct_index_mode().unwrap();
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+    let cb1 = b1.txdata[0].compute_txid();
+    confirm_wire_run(&q, &params, ms, &[(Height(1), b1.clone())]).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+
+    for h in 2..=maturity {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        confirm_wire_run(&q, &params, ms, &[(Height(h), b.clone())]).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+
+    let spend_h = maturity + 1;
+    let spend = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
+    let b_spend = mine_regtest_block(tip, tip_time + 600, spend_h, vec![spend]);
+    confirm_wire_run(&q, &params, ms, &[(Height(spend_h), b_spend.clone())]).unwrap();
+    tip = b_spend.block_hash();
+    tip_time = b_spend.header.time;
+    assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
+
+    let spend2 = spend_anyone_can_spend(cb1, 0, Amount::from_sat(48_0000_0000));
+    let b_dup = mine_regtest_block(tip, tip_time + 600, spend_h + 1, vec![spend2]);
+    let err = confirm_wire_run(&q, &params, ms, &[(Height(spend_h + 1), b_dup)])
+        .expect_err("double spend");
+    let msg = format!("{err}").to_lowercase();
+    assert!(
+        msg.contains("spent") || msg.contains("double") || msg.contains("bad"),
+        "unexpected: {msg}"
+    );
+    assert_eq!(q.tip_height(), Some(Height(spend_h)));
+}
+
+/// Structural: wire prep path must not call wire_rebuild-from-Class-A for batch creates.
+#[test]
+fn unified_wire_prep_source_has_no_wire_rebuild() {
+    let src = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../rbitcoin-consensus/src/confirm_run.rs"
+    ));
+    // confirm_wire_prep_phase body must not invoke wire_rebuild.
+    let start = src
+        .find("pub fn confirm_wire_prep_phase")
+        .expect("confirm_wire_prep_phase");
+    let rest = &src[start..];
+    let end = rest
+        .find("\npub fn confirm_wire_run")
+        .or_else(|| rest.find("\npub fn confirm_scripts_phase"))
+        .expect("end of wire prep");
+    let body = &rest[..end];
+    assert!(
+        !body.contains("wire_rebuild("),
+        "wire prep must not call wire_rebuild for batch creates"
+    );
+    assert!(
+        body.contains("assemble_run(") && body.contains("&wire_blocks"),
+        "wire prep must assemble from intake wire_blocks"
+    );
+}

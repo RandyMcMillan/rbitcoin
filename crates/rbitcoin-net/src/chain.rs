@@ -8,9 +8,9 @@ use bitcoin::{Block, BlockHash, Transaction, Work};
 use std::sync::RwLock;
 use rbitcoin_consensus::{
     accept_and_archive_block, accept_and_connect_block_preverified, confirm_archived_run,
-    confirm_load_phase, confirm_script_phase, confirm_scripts_phase,
-    confirm_write_phase, genesis_block, header_to_record,
-    ChainParams, Milestone, ScriptOkBatch,
+    confirm_load_phase, confirm_script_phase, confirm_scripts_phase, confirm_wire_prep_phase,
+    confirm_write_phase, genesis_block, header_to_record, ChainParams, Milestone, ScriptOkBatch,
+    ScriptPreverified,
 };
 use rbitcoin_log::info;
 use rbitcoin_primitives::{Fk, Height};
@@ -244,6 +244,55 @@ impl ChainHub {
         }
         let ok = confirm_load_phase(&self.query, &self.params, self.milestone, &need)
             .map_err(|e| NetError::Consensus(e.to_string()))?;
+        Ok(Some(ok))
+    }
+
+    /// Unified PREP from raw wire blocks (no Class-A wire rebuild).
+    /// Skips heights already confirmed. Does **not** require prior archive.
+    pub fn confirm_wire_prep_phase(
+        &self,
+        blocks: &[(Height, Block)],
+    ) -> Result<Option<rbitcoin_consensus::ConfirmLoadOutcome>, NetError> {
+        if blocks.is_empty() {
+            return Ok(None);
+        }
+        let need: Vec<(Height, Block)> = blocks
+            .iter()
+            .filter(|(h, b)| {
+                let hash = b.block_hash();
+                !self.has_block(&hash)
+                    && self
+                        .tip_height()
+                        .map(|t| h.0 == t.saturating_add(1) || h.0 > t)
+                        .unwrap_or(h.0 == 0 || h.0 >= 1)
+            })
+            .cloned()
+            .collect();
+        // Keep only contiguous from tip+1.
+        let tip = self.tip_height().unwrap_or(0);
+        let path_lo = if self.tip_height().is_none() {
+            0u32
+        } else {
+            tip.saturating_add(1)
+        };
+        let mut contig = Vec::new();
+        for (h, b) in need {
+            if h.0 != path_lo.saturating_add(contig.len() as u32) {
+                break;
+            }
+            contig.push((h, b));
+        }
+        if contig.is_empty() {
+            return Ok(None);
+        }
+        let ok = confirm_wire_prep_phase(
+            &self.query,
+            &self.params,
+            self.milestone,
+            &contig,
+            &ScriptPreverified::new(),
+        )
+        .map_err(|e| NetError::Consensus(e.to_string()))?;
         Ok(Some(ok))
     }
 

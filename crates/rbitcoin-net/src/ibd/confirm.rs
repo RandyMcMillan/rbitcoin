@@ -11,7 +11,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Shared feed of archived (height, hash) pairs for the dedicated confirm engine.
+/// Shared feed of tip-extension work for the dedicated confirm engine.
+///
+/// Preferred: raw **wire** `Block` from peer/bq (unified prep→scripts→commit).
+/// Hash-only notes remain for already-archived Class A fallback.
 ///
 /// **In-flight tracking:** once load claims a contiguous run, those heights sit in
 /// `inflight` until write finishes (or load re-queues). `note` will not re-insert
@@ -24,7 +27,8 @@ pub(crate) struct ConfirmFeed {
 }
 
 struct ConfirmFeedInner {
-    ready: std::collections::BTreeMap<u32, BlockHash>,
+    /// height → (hash, optional wire block for unified prep)
+    ready: std::collections::BTreeMap<u32, (BlockHash, Option<bitcoin::Block>)>,
     /// Claimed by load; not yet written or released. Offer must not re-note.
     inflight: std::collections::HashSet<u32>,
 }
@@ -41,25 +45,50 @@ impl ConfirmFeed {
         }
     }
 
-    /// Note a ready archived body. No-op if height is already claimed (in-flight).
+    /// Note a ready height (hash only — Class A already on disk).
     pub(crate) fn note(&self, height: u32, hash: BlockHash) {
+        self.note_wire(height, hash, None);
+    }
+
+    /// Note with raw wire block for unified prep (preferred IBD path).
+    pub(crate) fn note_wire(&self, height: u32, hash: BlockHash, block: Option<bitcoin::Block>) {
         let mut g = self.inner.lock().unwrap();
         if g.inflight.contains(&height) {
             return;
         }
-        g.ready.insert(height, hash);
+        // Prefer keeping wire if we already have it.
+        match g.ready.get_mut(&height) {
+            Some(e) => {
+                if e.1.is_none() && block.is_some() {
+                    e.1 = block;
+                }
+            }
+            None => {
+                g.ready.insert(height, (hash, block));
+            }
+        }
         self.cv.notify_one();
     }
 
-    /// Return heights to the ready map (load incomplete / without-archive retry).
-    pub(crate) fn requeue(&self, batch: &[(u32, BlockHash)]) {
+    /// Return heights to the ready map (optionally with wire bodies).
+    pub(crate) fn requeue_wire(&self, batch: &[(u32, BlockHash, Option<bitcoin::Block>)]) {
         if batch.is_empty() {
             return;
         }
         let mut g = self.inner.lock().unwrap();
-        for &(h, hash) in batch {
+        for &(h, hash, ref block) in batch {
             g.inflight.remove(&h);
-            g.ready.insert(h, hash);
+            let b = block.clone();
+            match g.ready.get_mut(&h) {
+                Some(e) => {
+                    if e.1.is_none() {
+                        e.1 = b;
+                    }
+                }
+                None => {
+                    g.ready.insert(h, (hash, b));
+                }
+            }
         }
         self.cv.notify_one();
     }
@@ -509,7 +538,7 @@ pub(crate) fn spawn_confirm_engine(
                     break;
                 }
 
-                let batch: Vec<(u32, BlockHash)> = {
+                let batch: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = {
                     let mut g = feed.inner.lock().unwrap();
                     let found = loop {
                         if feed.stopped() {
@@ -550,13 +579,13 @@ pub(crate) fn spawn_confirm_engine(
                                 if g.inflight.contains(&h) {
                                     break; // don't merge into another claimed run
                                 }
-                                let Some(hash) = g.ready.remove(&h) else { break };
+                                let Some((hash, wire)) = g.ready.remove(&h) else { break };
                                 if hub.has_block(&hash) {
                                     h = h.saturating_add(1);
                                     continue;
                                 }
                                 g.inflight.insert(h);
-                                run.push((h, hash));
+                                run.push((h, hash, wire));
                                 h = h.saturating_add(1);
                             }
                             if !run.is_empty() {
@@ -605,7 +634,24 @@ pub(crate) fn spawn_confirm_engine(
                     return;
                 }
 
-                let mat_res = hub.confirm_load_phase(&batch);
+                // Prefer unified wire prep when every claimed height still has wire.
+                let all_wire = batch.iter().all(|(_, _, w)| w.is_some());
+                let mat_res = if all_wire {
+                    let wire_batch: Vec<(rbitcoin_primitives::Height, bitcoin::Block)> = batch
+                        .iter()
+                        .map(|(h, _, w)| {
+                            (
+                                rbitcoin_primitives::Height(*h),
+                                w.clone().expect("all_wire"),
+                            )
+                        })
+                        .collect();
+                    hub.confirm_wire_prep_phase(&wire_batch)
+                } else {
+                    let hash_batch: Vec<(u32, BlockHash)> =
+                        batch.iter().map(|(h, ha, _)| (*h, *ha)).collect();
+                    hub.confirm_load_phase(&hash_batch)
+                };
                 let mat_res = match mat_res {
                     Err(e) if batch.len() > 1 => {
                         let msg = e.to_string();
@@ -623,23 +669,27 @@ pub(crate) fn spawn_confirm_engine(
                         } else {
                             // Permanent failure on multi-block: re-queue tail only;
                             // first height stays inflight for the single-block retry.
-                            // Always log — silent split was hiding BIP68 MTP store-only
-                            // BadPrev (n=32 claim → n=1 prepared, tip ~1 blk/cycle).
                             warn!(
                                 "ibd: confirm load multi-block fail @ {expect_h} n={} — \
                                  retry first alone, re-queue tail: {msg}",
                                 batch.len()
                             );
-                            let tail: Vec<(u32, BlockHash)> = batch
+                            let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
                                 .iter()
                                 .skip(1)
-                                .filter(|(_, ha)| !hub.has_block(ha))
-                                .copied()
+                                .filter(|(_, ha, _)| !hub.has_block(ha))
+                                .cloned()
                                 .collect();
-                            feed.requeue(&tail);
-                            // first stays inflight for the single-height retry below
+                            feed.requeue_wire(&tail);
                             loop_stats.confirm_begin(expect_h, 1);
-                            hub.confirm_load_phase(&batch[..1])
+                            if let Some((_, _, Some(w))) = batch.first() {
+                                hub.confirm_wire_prep_phase(&[(
+                                    rbitcoin_primitives::Height(expect_h),
+                                    w.clone(),
+                                )])
+                            } else {
+                                hub.confirm_load_phase(&[(expect_h, batch[0].1)])
+                            }
                         }
                     }
                     other => other,
@@ -690,7 +740,7 @@ pub(crate) fn spawn_confirm_engine(
                         }
                     }
                     Err(e) => {
-                        let (expect, hash) = batch[0];
+                        let (expect, hash, _) = batch[0];
                         let msg = e.to_string();
                         if msg.contains("confirm cancelled") {
                             info!("ibd: confirm load cancelled @ {expect}");
@@ -699,12 +749,12 @@ pub(crate) fn spawn_confirm_engine(
                             return;
                         }
                         if is_confirm_load_retryable(&msg) {
-                            let retry: Vec<(u32, BlockHash)> = batch
+                            let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
                                 .iter()
-                                .filter(|(_, ha)| !hub.has_block(ha))
-                                .copied()
+                                .filter(|(_, ha, _)| !hub.has_block(ha))
+                                .cloned()
                                 .collect();
-                            feed.requeue(&retry);
+                            feed.requeue_wire(&retry);
                             static N: AtomicU32 = AtomicU32::new(0);
                             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
                             if n <= 3 || n % 200 == 0 {
@@ -731,12 +781,12 @@ pub(crate) fn spawn_confirm_engine(
                                     "ibd: confirm without archive still missing {hash} @ {expect} (n={n})"
                                 );
                             }
-                            let retry: Vec<(u32, BlockHash)> = batch
+                            let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
                                 .iter()
-                                .filter(|(_, ha)| !hub.has_block(ha))
-                                .copied()
+                                .filter(|(_, ha, _)| !hub.has_block(ha))
+                                .cloned()
                                 .collect();
-                            feed.requeue(&retry);
+                            feed.requeue_wire(&retry);
                             if missing_tries.len() > 256 {
                                 missing_tries.retain(|&h, _| h.saturating_add(64) > expect);
                             }
@@ -750,13 +800,13 @@ pub(crate) fn spawn_confirm_engine(
                             continue;
                         }
                         if batch.len() > 1 {
-                            let tail: Vec<(u32, BlockHash)> = batch
+                            let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
                                 .iter()
                                 .skip(1)
-                                .filter(|(_, ha)| !hub.has_block(ha))
-                                .copied()
+                                .filter(|(_, ha, _)| !hub.has_block(ha))
+                                .cloned()
                                 .collect();
-                            feed.requeue(&tail);
+                            feed.requeue_wire(&tail);
                         }
                         // Permanent reject on first height — drop inflight so tip can move
                         // only after operator/event handling; do not re-queue first.
@@ -923,9 +973,10 @@ mod tests {
         feed.note(100, bh(1));
         {
             let mut g = feed.inner.lock().unwrap();
-            let hash = g.ready.remove(&100).unwrap();
+            let (hash, wire) = g.ready.remove(&100).unwrap();
             g.inflight.insert(100);
             assert_eq!(hash, bh(1));
+            assert!(wire.is_none());
         }
         // Main loop offer would re-note tip+1 every tick — must be ignored.
         feed.note(100, bh(1));
@@ -940,12 +991,12 @@ mod tests {
             g.inflight.insert(50);
             g.inflight.insert(51);
         }
-        feed.requeue(&[(50, bh(5)), (51, bh(6))]);
+        feed.requeue_wire(&[(50, bh(5), None), (51, bh(6), None)]);
         {
             let g = feed.inner.lock().unwrap();
             assert!(!g.inflight.contains(&50));
-            assert_eq!(g.ready.get(&50), Some(&bh(5)));
-            assert_eq!(g.ready.get(&51), Some(&bh(6)));
+            assert_eq!(g.ready.get(&50).map(|(h, _)| *h), Some(bh(5)));
+            assert_eq!(g.ready.get(&51).map(|(h, _)| *h), Some(bh(6)));
         }
 
         {

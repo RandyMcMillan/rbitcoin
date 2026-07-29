@@ -70,6 +70,7 @@ pub(crate) fn drain_ready_peer_and_archive_events(
     loop_stats: &LoopStats,
     peer_book: &mut AddrMan,
     local_addr: SocketAddr,
+    confirm_feed: Option<&super::confirm::ConfirmFeed>,
 ) -> Result<bool, NetError> {
     let t0 = Instant::now();
     let mut events = 0u64;
@@ -103,6 +104,7 @@ pub(crate) fn drain_ready_peer_and_archive_events(
                     archive_write_next,
                     peer_book,
                     local_addr,
+                    confirm_feed,
                 );
             }
             Err(_) => break,
@@ -126,6 +128,7 @@ pub(crate) fn drain_ready_peer_and_archive_events(
                     archive_write_next,
                     peer_book,
                     local_addr,
+                    confirm_feed,
                 );
             }
             Err(_) => break,
@@ -150,6 +153,7 @@ pub(crate) fn apply_peer_event(
     archive_write_next: &AtomicU32,
     peer_book: &mut AddrMan,
     local_addr: SocketAddr,
+    confirm_feed: Option<&super::confirm::ConfirmFeed>,
 ) {
     match ev {
         PeerEvent::Headers { peer, headers } => {
@@ -420,10 +424,34 @@ pub(crate) fn apply_peer_event(
                 }
             }
             archive_queued.charge(wire_bytes);
-            st.body.mark_archive_charged(hash);
-            // Prevent re-getdata while prep/writer owns this body.
+            st.body.mark_archive_charged_bytes(hash, wire_bytes);
+            // Prevent re-getdata while pipeline owns this body.
             st.body.mark_pending(hash);
-            if arch_job_tx
+            // Unified path: feed raw wire into confirm prep→scripts→commit.
+            // Skip dual archive-lead Class A writer when feed is present so
+            // one Class A appender (confirm write) owns the height.
+            if let Some(feed) = confirm_feed {
+                if height != u32::MAX {
+                    feed.note_wire(height, hash, Some(block));
+                } else {
+                    // Unknown height: fall back to archive job.
+                    if arch_job_tx
+                        .send(ArchiveJob {
+                            block,
+                            header_fk,
+                            priority,
+                            wire_bytes,
+                            height,
+                        })
+                        .is_err()
+                    {
+                        archive_queued.release(wire_bytes);
+                        st.body.clear_archive_charged(&hash);
+                        st.body.mark_missing(hash);
+                        warn!("ibd: archive pipeline closed; drop {hash}");
+                    }
+                }
+            } else if arch_job_tx
                 .send(ArchiveJob {
                     block,
                     header_fk,
@@ -865,6 +893,7 @@ mod confirm_reject_tests {
             &write_next,
             &mut book,
             local,
+            None,
         );
         assert!(st.inflight.is_empty());
         assert!(st.body.is_pending(&h(9)));
@@ -882,6 +911,7 @@ mod confirm_reject_tests {
             &write_next,
             &mut book,
             local,
+            None,
         );
         assert!(!st.body.is_pending(&h(9)));
 
@@ -900,6 +930,7 @@ mod confirm_reject_tests {
             &write_next,
             &mut book,
             local,
+            None,
         );
         assert!(st.known_headers.contains(&hash));
         assert!(st.ordered_set.contains(&hash) || st.hash_height.contains_key(&hash));
@@ -919,6 +950,7 @@ mod confirm_reject_tests {
             &write_next,
             &mut book,
             local,
+            None,
         );
         assert!(!st.headers_done);
 
@@ -937,6 +969,7 @@ mod confirm_reject_tests {
             &write_next,
             &mut book,
             local,
+            None,
         );
         assert!(!st.inflight.contains_key(&h(3)));
 
@@ -965,6 +998,7 @@ mod confirm_reject_tests {
             &write_next,
             &mut book,
             local,
+            None,
         );
         assert!(!st.slots[0].alive);
         assert!(!st.inflight.contains_key(&h(4)));
@@ -985,6 +1019,7 @@ mod confirm_reject_tests {
             &stats,
             &mut book,
             local,
+            None,
         )
         .unwrap();
         assert!(ok);
@@ -1121,6 +1156,7 @@ mod confirm_reject_tests {
             &write_next,
             &mut book,
             local,
+            None,
         );
         assert_eq!(budget.count(), 1);
         assert!(st.body.is_archive_charged(&h1));
@@ -1142,6 +1178,7 @@ mod confirm_reject_tests {
             &write_next,
             &mut book,
             local,
+            None,
         );
         assert_eq!(budget.count(), 1);
         assert!(arch_rx.try_recv().is_err());
@@ -1164,6 +1201,7 @@ mod confirm_reject_tests {
             &write_next,
             &mut book,
             local,
+            None,
         );
         assert_eq!(budget.count(), before);
         assert_eq!(st.body.skip_download_cached(&far_hash), Some(false));
@@ -1204,6 +1242,7 @@ mod confirm_reject_tests {
                 &write_next,
                 &mut book,
                 local,
+            None,
             );
         }
         assert!(st.headers_done, "idle empty-header streak marks done");
@@ -1264,6 +1303,7 @@ mod confirm_reject_tests {
             &stats,
             &mut book,
             local,
+            None,
         )
         .unwrap();
         assert!(st.body.is_known_archived(&drop_h));

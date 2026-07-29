@@ -25,12 +25,19 @@ pub fn body_ok_reads() -> u64 {
     BODY_OK_READS.load(Ordering::Relaxed)
 }
 
-/// One create decoded for the combined path.
+/// One create loaded for the combined path.
 #[derive(Debug, Clone)]
 pub struct CombinedCreate {
     pub fk: Fk,
     pub body_range: (u64, u64),
     pub raw: Vec<u8>,
+    /// When `mode == Full`, one full decode lives here so callers do not re-decode.
+    pub decoded_full: Option<(
+        rbitcoin_store::TxRecord,
+        Vec<rbitcoin_store::InputRecord>,
+        Vec<rbitcoin_store::OutputRecord>,
+        Vec<u32>,
+    )>,
 }
 
 /// Load creates by fk (and optional known ranges from residency), decode once,
@@ -63,12 +70,20 @@ pub fn load_creates_once(
             continue;
         };
         BODY_OK_READS.fetch_add(1, Ordering::Relaxed);
+        let mut decoded_full = None;
         match mode {
             IdxBodyMode::Full => {
-                if let Ok((tx, _ins, outs, rels)) =
+                if let Ok((tx, ins, outs, rels)) =
                     decode_packed_tx_with_spender_rels_secret(&job.body, Some(secret))
                 {
-                    residency.put_outs(*fk, tx, outs, rels, Some(range));
+                    residency.put_outs(
+                        *fk,
+                        tx.clone(),
+                        outs.clone(),
+                        rels.clone(),
+                        Some(range),
+                    );
+                    decoded_full = Some((tx, ins, outs, rels));
                 } else {
                     let mut txid = [0u8; 32];
                     if job.body.len() >= 32 {
@@ -93,6 +108,7 @@ pub fn load_creates_once(
             fk: *fk,
             body_range: range,
             raw: job.body,
+            decoded_full,
         });
     }
     Ok(out)

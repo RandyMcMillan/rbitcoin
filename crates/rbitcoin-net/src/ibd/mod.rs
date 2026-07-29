@@ -474,7 +474,17 @@ pub async fn ibd_cancellable(
                 ConfirmEvent::Accepted { hash } => {
                     last_progress = Instant::now();
                     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
+                    // Unified wire path charged archive_queued on receive; release here.
+                    if let Some(wb) = st.body.take_archive_charge_bytes(&hash) {
+                        archive_queued.release(wb);
+                    } else {
+                        st.body.clear_archive_charged(&hash);
+                    }
                     st.body.mark_archived(hash);
+                    let tip = hub.tip_height().unwrap_or(0);
+                    archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
+                    st.max_archived_height = st.max_archived_height.max(tip);
+                    max_archived_shared.store(st.max_archived_height, Ordering::Relaxed);
                 }
                 ConfirmEvent::BodyMissing { hash } => {
                     // Stale known vs store: re-probe on next offer (do not mark missing).
@@ -499,6 +509,7 @@ pub async fn ibd_cancellable(
             &loop_stats,
             peer_sess.book_mut(),
             local_addr,
+            Some(confirm_feed.as_ref()),
         )? {
             break;
         }
@@ -573,7 +584,17 @@ pub async fn ibd_cancellable(
                 ConfirmEvent::Accepted { hash } => {
                     last_progress = Instant::now();
                     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
+                    // Unified wire path charged archive_queued on receive; release here.
+                    if let Some(wb) = st.body.take_archive_charge_bytes(&hash) {
+                        archive_queued.release(wb);
+                    } else {
+                        st.body.clear_archive_charged(&hash);
+                    }
                     st.body.mark_archived(hash);
+                    let tip = hub.tip_height().unwrap_or(0);
+                    archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
+                    st.max_archived_height = st.max_archived_height.max(tip);
+                    max_archived_shared.store(st.max_archived_height, Ordering::Relaxed);
                 }
                 ConfirmEvent::BodyMissing { hash } => {
                     st.body.demote_known(hash);
@@ -596,6 +617,7 @@ pub async fn ibd_cancellable(
             &loop_stats,
             peer_sess.book_mut(),
             local_addr,
+            Some(confirm_feed.as_ref()),
         )? {
             break;
         }
@@ -1057,6 +1079,7 @@ pub async fn ibd_cancellable(
                     &archive_write_next,
                     peer_sess.book_mut(),
                     local_addr,
+                    Some(confirm_feed.as_ref()),
                 );
             }
             peer_ev = ctrl_rx.recv() => {
@@ -1074,6 +1097,7 @@ pub async fn ibd_cancellable(
                     &archive_write_next,
                     peer_sess.book_mut(),
                     local_addr,
+                    Some(confirm_feed.as_ref()),
                 );
             }
             arch = arch_res_rx.recv() => {

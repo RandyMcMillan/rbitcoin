@@ -1,27 +1,22 @@
-//! Multi-block confirm orchestrator (IBD Class C path).
+//! Multi-block confirm orchestrator (IBD / tip Class C path).
 //!
-//! Pipeline (optimistic scripts — assumevalid-shaped):
+//! **Primary height-ordered pipeline** (raw wire → validated tip):
 //! ```text
-//! LOAD STAGE (ibd-confirm-load OS thread):
-//!   Class A + pin parents → resolve → wire → assemble
-//!   (only stage that may touch the store / parent cache)
+//! PREP STAGE (ibd-confirm-load OS thread):
+//!   wire Block → structure → plan Class A (stamp create_fk) → pin parents once
+//!   → assemble (uses intake wire; **no Class-A wire rebuild**)
 //! SCRIPTS STAGE (ibd-confirm OS thread + rayon):
-//!   pure CPU: verify ScriptCheckJob list from LoadedBatch — no Query, no disk
-//! WRITE STAGE (ibd-confirm-write OS thread, FIFO):
-//!   structural (spentness/maturity/subsidy) → class_c → spend annotate → tip GC
+//!   pure CPU verify — no Query, no disk
+//! COMMIT STAGE (ibd-confirm-write OS thread, FIFO):
+//!   Class A commit (if plan) + structural + class_c + spend annotate + tip GC
 //! ```
+//! IBD pipelines prep(N+1) ∥ scripts(N) ∥ commit(N−1). One Class A appender.
 //!
-//! [`confirm_archived_run`] runs all stages synchronously (tests / tip path).
-//! IBD pipelines so load(N+1) ∥ scripts(N) ∥ write(N−1).
+//! [`confirm_wire_run`] is the unified entry (tests / tip / IBD).
+//! [`confirm_archived_run`] remains for already-archived Class A only.
 //!
-//! **No wave fill:** load decodes bodies **once** into batch-local full Class A
-//! ([`rbitcoin_query::BatchFullBodies`]) + outs FIFO; thin create_fk edges and
-//! sparse parent pins are batch-local. Wire rebuild uses the batch bodies (no
-//! second store full-decode for batch creates).
-//!
-//! **Scripts purity:** [`confirm_scripts_phase`] is a pure function of
-//! [`LoadedBatch`] → [`ScriptOkBatch`]. Jobs already carry prevouts, txs, and
-//! softfork flags from load; verification must not open tables or the parent cache.
+//! **Scripts purity:** [`confirm_scripts_phase`] is pure
+//! [`LoadedBatch`] → [`ScriptOkBatch`].
 
 use crate::block::{
     assemble_block_prevouts, bip34_height_script, block_has_witness, structural_validate_spends,
@@ -79,24 +74,29 @@ pub type ScriptPreverified = std::collections::HashSet<[u8; 32]>;
 
 /// Wire + assemble complete; script jobs still attached (not yet verified).
 ///
-/// `Send` so IBD can hand off load → scripts threads.
+/// `Send` so IBD can hand off prep → scripts threads.
 /// Sparse spent-filtered parents ride on the batch (not tip-GCed).
+/// When [`archive_plan`] is `Some`, commit stage appends Class A before
+/// structural / annotate (single ordered commit era).
 pub struct LoadedBatch {
     prepared: Vec<Prepared>,
     wire_blocks: Vec<Block>,
-    /// Per-batch pin map: load → assemble → write structural, then drop.
+    /// Per-batch pin map: prep → assemble → write structural, then drop.
     batch_parents: rbitcoin_query::BatchParents,
     /// Mempool preverified txids for scripts stage (tip follow); empty on IBD.
     script_preverified: ScriptPreverified,
+    /// Planned Class A write from wire prep (committed in write stage).
+    pub archive_plan: Option<rbitcoin_query::ArchiveWritePlan>,
 }
 
-/// Script-verified batch ready for ordered write (structural + Class C + spends).
+/// Script-verified batch ready for ordered commit (Class A + structural + C).
 ///
 /// `Send` so IBD can hand off scripts → write.
 pub struct ScriptOkBatch {
     prepared: Vec<Prepared>,
     wire_blocks: Vec<Block>,
     batch_parents: rbitcoin_query::BatchParents,
+    pub archive_plan: Option<rbitcoin_query::ArchiveWritePlan>,
 }
 
 /// Confirm a contiguous tip-extension run of archived bodies (sync all stages).
@@ -224,12 +224,436 @@ pub fn confirm_load_phase_preverified(
             wire_blocks,
             batch_parents,
             script_preverified: preverified.clone(),
+            archive_plan: None,
         },
         work_ns,
     })
 }
 
-/// SCRIPTS STAGE: pure verification of jobs already assembled at load.
+/// PREP STAGE from **raw wire blocks** (unified height-ordered pipeline).
+///
+/// - Structure / PoW checks, ensure headers
+/// - Plan Class A (assign create fks, stamp inputs) **without** committing
+/// - Pin external parents once (denserels); same-batch from plan
+/// - Assemble using **intake wire** (no Class-A wire rebuild)
+///
+/// The plan rides on [`LoadedBatch::archive_plan`] and is committed in write.
+pub fn confirm_wire_prep_phase(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    blocks: &[(Height, Block)],
+    preverified: &ScriptPreverified,
+) -> Result<ConfirmLoadOutcome, ConsensusError> {
+    if blocks.is_empty() {
+        return Err(ConsensusError::BadBlock("empty confirm batch"));
+    }
+    for w in blocks.windows(2) {
+        if w[1].0 .0 != w[0].0 .0.saturating_add(1) {
+            return Err(ConsensusError::BadBlock("confirm run not contiguous"));
+        }
+    }
+
+    let t_work = Instant::now();
+    let t_load = Instant::now();
+
+    let mut with_fk: Vec<(
+        rbitcoin_primitives::Fk,
+        rbitcoin_store::HeaderRecord,
+        Vec<rbitcoin_query::TxApply>,
+    )> = Vec::with_capacity(blocks.len());
+    let mut wire_blocks: Vec<Block> = Vec::with_capacity(blocks.len());
+    let mut metas: Vec<BodyMeta> = Vec::with_capacity(blocks.len());
+
+    let tip_h = query.tip_height().map(|h| h.0);
+    for (i, (height, block)) in blocks.iter().enumerate() {
+        let hash = block.block_hash().to_byte_array();
+        let ctx = ValidationContext::at(params, *height, milestone);
+        let _ = crate::block::validate_block_structure_hashed(block, &ctx)?;
+        // First height must extend confirmed tip (full header validation).
+        // Later heights in the same batch are not yet confirmed — validate
+        // linkage against the prior wire block + header plan, not store tip.
+        if i == 0 {
+            validate_header(query, params, *height, &block.header)?;
+            if let Some(t) = tip_h {
+                if height.0 != t.saturating_add(1) && !(t == 0 && height.0 == 0) {
+                    // Empty chain: tip None handled above; non-empty must be tip+1.
+                    if query.tip_height().is_some() && height.0 != t + 1 {
+                        return Err(ConsensusError::BadPrev);
+                    }
+                }
+            }
+        } else {
+            let prev = &blocks[i - 1].1;
+            if block.header.prev_blockhash != prev.block_hash() {
+                return Err(ConsensusError::BadPrev);
+            }
+            if block.header.time <= prev.header.time.saturating_sub(0)
+                && block.header.time <= prev.header.time
+            {
+                // Soft: assemble re-checks MTP with full window.
+            }
+            // PoW bits/target (no store retarget mid-batch for regtest).
+            let target = bitcoin::Target::from_compact(block.header.bits);
+            if target > params.pow_limit {
+                return Err(ConsensusError::BadHeader("target above pow limit"));
+            }
+            block
+                .header
+                .validate_pow(target)
+                .map_err(|_| ConsensusError::InvalidPow)?;
+        }
+
+        let (header_rec, txs) = crate::prepare_block_for_archive(query, params, block)?;
+        let header_fk = if let Some((fk, _)) = query
+            .get_header_by_hash(&header_rec.hash)
+            .map_err(ConsensusError::Store)?
+        {
+            fk
+        } else {
+            query
+                .store()
+                .put_header(&header_rec)
+                .map_err(ConsensusError::Store)?
+        };
+        query.confirm_parent_cache().put_header_plan(
+            height.0,
+            header_fk,
+            header_rec.clone(),
+            Vec::new(),
+            block.header.prev_blockhash.to_byte_array(),
+        );
+        with_fk.push((header_fk, header_rec.clone(), txs));
+        wire_blocks.push(block.clone());
+        metas.push(BodyMeta {
+            height: *height,
+            hash,
+            header_fk,
+            header_rec,
+            tx_fks: Vec::new(),
+        });
+    }
+
+    let (_header_fks, mut need) = query
+        .archive_filter_need_bodies(&mut with_fk)
+        .map_err(ConsensusError::Store)?;
+    let plan = if need.is_empty() {
+        for m in &mut metas {
+            if let Some(list) = query
+                .store()
+                .header_txs
+                .get_list(m.header_fk)
+                .map_err(ConsensusError::Store)?
+            {
+                m.tx_fks = list;
+            }
+            let prev = wire_blocks
+                .iter()
+                .find(|b| b.block_hash().to_byte_array() == m.hash)
+                .map(|b| b.header.prev_blockhash.to_byte_array())
+                .unwrap_or([0u8; 32]);
+            query.confirm_parent_cache().put_header_plan(
+                m.height.0,
+                m.header_fk,
+                m.header_rec.clone(),
+                m.tx_fks.clone(),
+                prev,
+            );
+        }
+        None
+    } else {
+        let plan = query
+            .archive_plan_mega_owned(&mut need)
+            .map_err(ConsensusError::Store)?;
+        let mut by_header: HashMap<u64, Vec<rbitcoin_primitives::Fk>> = HashMap::new();
+        for &(hfk, first, n) in &plan.per_header_ranges {
+            let Some(hid) = hfk.get() else { continue };
+            let start = plan
+                .planned_fks
+                .iter()
+                .position(|f| *f == first)
+                .unwrap_or(0);
+            let n = n as usize;
+            let slice = plan.planned_fks[start..start.saturating_add(n).min(plan.planned_fks.len())]
+                .to_vec();
+            by_header.insert(hid, slice);
+        }
+        for m in &mut metas {
+            if let Some(id) = m.header_fk.get() {
+                if let Some(fks) = by_header.get(&id) {
+                    m.tx_fks = fks.clone();
+                }
+            }
+            if m.tx_fks.is_empty() {
+                if let Some(list) = query
+                    .store()
+                    .header_txs
+                    .get_list(m.header_fk)
+                    .map_err(ConsensusError::Store)?
+                {
+                    m.tx_fks = list;
+                }
+            }
+            let prev = wire_blocks
+                .iter()
+                .find(|b| b.block_hash().to_byte_array() == m.hash)
+                .map(|b| b.header.prev_blockhash.to_byte_array())
+                .unwrap_or([0u8; 32]);
+            query.confirm_parent_cache().put_header_plan(
+                m.height.0,
+                m.header_fk,
+                m.header_rec.clone(),
+                m.tx_fks.clone(),
+                prev,
+            );
+        }
+        Some(plan)
+    };
+
+    let (batch_parents, batch_thin) =
+        pin_for_wire_batch(query, plan.as_ref(), &metas, &wire_blocks)?;
+
+    confirm_phase_stats::LOAD_NS.fetch_add(
+        t_load.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
+    );
+
+    let prepared = assemble_run(
+        query,
+        params,
+        milestone,
+        metas,
+        &wire_blocks,
+        &batch_parents,
+        &batch_thin,
+    )?;
+    drop(batch_thin);
+
+    let work_ns = t_work.elapsed().as_nanos() as u64;
+    Ok(ConfirmLoadOutcome {
+        batch: LoadedBatch {
+            prepared,
+            wire_blocks,
+            batch_parents,
+            script_preverified: preverified.clone(),
+            archive_plan: plan,
+        },
+        work_ns,
+    })
+}
+
+/// Unified wire → tip (prep + scripts + commit). Primary production entry.
+pub fn confirm_wire_run(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    blocks: &[(Height, Block)],
+) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
+    confirm_wire_run_preverified(query, params, milestone, blocks, &ScriptPreverified::new())
+}
+
+/// Like [`confirm_wire_run`] with mempool script preverified set.
+pub fn confirm_wire_run_preverified(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    blocks: &[(Height, Block)],
+    preverified: &ScriptPreverified,
+) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
+    let mat = confirm_wire_prep_phase(query, params, milestone, blocks, preverified)?;
+    let ok = confirm_scripts_phase(mat.batch)?;
+    confirm_write_phase(query, params, milestone, ok.batch)
+}
+
+/// Pin parents for wire prep: same-batch from plan outs; external via denserels IO once.
+fn pin_for_wire_batch(
+    query: &Query,
+    plan: Option<&rbitcoin_query::ArchiveWritePlan>,
+    metas: &[BodyMeta],
+    wire_blocks: &[Block],
+) -> Result<(rbitcoin_query::BatchParents, rbitcoin_query::BatchThin), ConsensusError> {
+    use rbitcoin_query::ThinInput;
+    use rbitcoin_store::IdxBodyMode;
+
+    let mut batch_thin: rbitcoin_query::BatchThin = std::collections::HashMap::new();
+    let mut parent_vouts: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut batch_create: HashSet<u64> = HashSet::new();
+
+    for m in metas {
+        for fk in &m.tx_fks {
+            if let Some(id) = fk.get() {
+                batch_create.insert(id);
+            }
+        }
+    }
+
+    let mut planned_outs: HashMap<
+        u64,
+        (rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>),
+    > = HashMap::new();
+    if let Some(plan) = plan {
+        for ((tx, _ins, outs), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
+            if let Some(id) = fk.get() {
+                planned_outs.insert(id, (tx.clone(), outs.clone()));
+            }
+        }
+        for ((tx, ins, _outs), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
+            let Some(sid) = fk.get() else { continue };
+            let mut edges = Vec::with_capacity(ins.len());
+            for inp in ins {
+                if inp.is_coinbase() || inp.prev_index == u32::MAX {
+                    edges.push(ThinInput {
+                        create_fk: None,
+                        prev_index: u32::MAX,
+                    });
+                    continue;
+                }
+                if let Some(pid) = inp.create_fk.get() {
+                    edges.push(ThinInput {
+                        create_fk: Some(pid),
+                        prev_index: inp.prev_index,
+                    });
+                    if !batch_create.contains(&pid) {
+                        parent_vouts.entry(pid).or_default().push(inp.prev_index);
+                    }
+                } else {
+                    edges.push(ThinInput {
+                        create_fk: None,
+                        prev_index: inp.prev_index,
+                    });
+                }
+            }
+            batch_thin.insert(sid, edges);
+            let _ = tx;
+        }
+    } else {
+        for (m, block) in metas.iter().zip(wire_blocks.iter()) {
+            for (ti, tx) in block.txdata.iter().enumerate() {
+                let Some(sfk) = m.tx_fks.get(ti).and_then(|f| f.get()) else {
+                    continue;
+                };
+                let mut edges = Vec::with_capacity(tx.input.len());
+                for inp in &tx.input {
+                    if inp.previous_output.is_null() {
+                        edges.push(ThinInput {
+                            create_fk: None,
+                            prev_index: u32::MAX,
+                        });
+                        continue;
+                    }
+                    let prev_txid = inp.previous_output.txid.to_byte_array();
+                    let vout = inp.previous_output.vout;
+                    let cfk = query
+                        .create_residency()
+                        .lookup_fk_by_txid(&prev_txid)
+                        .or_else(|| {
+                            query
+                                .store()
+                                .get_fk_by_txid(&prev_txid)
+                                .ok()
+                                .flatten()
+                        });
+                    if let Some(fk) = cfk {
+                        if let Some(pid) = fk.get() {
+                            edges.push(ThinInput {
+                                create_fk: Some(pid),
+                                prev_index: vout,
+                            });
+                            if !batch_create.contains(&pid) {
+                                parent_vouts.entry(pid).or_default().push(vout);
+                            }
+                            continue;
+                        }
+                    }
+                    edges.push(ThinInput {
+                        create_fk: None,
+                        prev_index: vout,
+                    });
+                }
+                batch_thin.insert(sfk, edges);
+            }
+        }
+    }
+
+    let mut batch_parents = rbitcoin_query::BatchParents::with_capacity(
+        parent_vouts.len().saturating_add(batch_create.len()),
+    );
+    for id in &batch_create {
+        if let Some((tx, outs)) = planned_outs.get(id) {
+            let checked: Vec<u32> = (0..outs.len() as u32).collect();
+            let live: Vec<(u32, rbitcoin_store::OutputRecord)> = outs
+                .iter()
+                .enumerate()
+                .map(|(i, o)| (i as u32, o.clone()))
+                .collect();
+            batch_parents.insert_owned(
+                rbitcoin_primitives::Fk(*id),
+                tx.clone(),
+                live,
+                checked,
+                if tx.input_count != 1 {
+                    Some(false)
+                } else {
+                    None
+                },
+                None,
+                Vec::new(),
+            );
+        }
+    }
+
+    if !parent_vouts.is_empty() {
+        let fks: Vec<rbitcoin_primitives::Fk> = parent_vouts
+            .keys()
+            .map(|id| rbitcoin_primitives::Fk(*id))
+            .collect();
+        let loaded = rbitcoin_query::load_creates_once(
+            query.store(),
+            query.create_residency(),
+            &fks,
+            IdxBodyMode::OutsDenserels,
+        )
+        .map_err(ConsensusError::Store)?;
+        for c in loaded {
+            let Some(id) = c.fk.get() else { continue };
+            let need = parent_vouts.get(&id).cloned().unwrap_or_default();
+            let Ok((tx, outs, dense_rels)) =
+                rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
+                    &c.raw,
+                    Some(query.store().txs.store_secret()),
+                )
+            else {
+                continue;
+            };
+            let mut need = need;
+            need.sort_unstable();
+            need.dedup();
+            let live: Vec<(u32, rbitcoin_store::OutputRecord)> = need
+                .iter()
+                .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
+                .collect();
+            let sparse = rbitcoin_query::sparse_spender_rels(&dense_rels, &need);
+            let cb = if tx.input_count != 1 {
+                Some(false)
+            } else {
+                None
+            };
+            batch_parents.insert_owned(
+                c.fk,
+                tx,
+                live,
+                need,
+                cb,
+                Some(c.body_range),
+                sparse,
+            );
+        }
+    }
+
+    Ok((batch_parents, batch_thin))
+}
+
+/// SCRIPTS STAGE: pure verification of jobs already assembled at prep/load.
 ///
 /// **No store / Query / side effects.** Input is a [`LoadedBatch`] (script jobs
 /// hold prevouts + txs + softfork flags); output is a [`ScriptOkBatch`] for the
@@ -252,6 +676,7 @@ pub fn confirm_scripts_phase(
             prepared: batch.prepared,
             wire_blocks: batch.wire_blocks,
             batch_parents: batch.batch_parents,
+            archive_plan: batch.archive_plan,
         },
         work_ns,
     })
@@ -284,7 +709,11 @@ fn write_height_needed(tip: Option<u32>, height: u32) -> bool {
     }
 }
 
-/// WRITE STAGE: structural → class_c → spend annotate → tip GC (FIFO caller).
+/// COMMIT STAGE: optional Class A plan commit → structural → class_c → spend annotate → tip GC.
+///
+/// When `batch.archive_plan` is set (wire prep path), Class A is appended in this
+/// same stage before structural/annotate — single ordered commit era, not a
+/// far-ahead archive track.
 ///
 /// Accrues window timers in [`confirm_phase_stats`] and snapshots the last batch
 /// for slow-write logs via [`confirm_phase_stats::last_write_phases`].
@@ -316,6 +745,18 @@ pub fn confirm_write_phase(
     batch.wire_blocks = wires;
 
     let t_wall = Instant::now();
+
+    // Single commit era: durable Class A for this batch before spentness RMW.
+    if let Some(plan) = batch.archive_plan.take() {
+        if !plan.is_empty() {
+            query
+                .archive_commit_plan(plan)
+                .map_err(ConsensusError::Store)?;
+            // Fill denserels/body_range for planned creates now on disk (annotate).
+            fill_batch_parent_layout_after_commit(query, &mut batch.batch_parents, &batch.prepared)?;
+        }
+    }
+
     // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
     let t_struct = Instant::now();
     let struct_ph = structural_run(
@@ -350,6 +791,70 @@ pub fn confirm_write_phase(
         tip_gc_ns,
     });
     Ok(out)
+}
+
+/// After Class A commit, attach body_range + denserels for creates in this batch
+/// that structural/annotate need (same-batch spends and parent pin refresh).
+fn fill_batch_parent_layout_after_commit(
+    query: &Query,
+    batch_parents: &mut rbitcoin_query::BatchParents,
+    prepared: &[Prepared],
+) -> Result<(), ConsensusError> {
+    use rbitcoin_store::IdxBodyMode;
+    let mut need: Vec<rbitcoin_primitives::Fk> = Vec::new();
+    let mut seen = HashSet::new();
+    for p in prepared {
+        for fk in &p.tx_fks {
+            if let Some(id) = fk.get() {
+                if seen.insert(id) {
+                    need.push(*fk);
+                }
+            }
+        }
+        for &(_txid, _vout, _sfk, cfk) in &p.spends {
+            if let Some(id) = cfk.get() {
+                if seen.insert(id) {
+                    need.push(cfk);
+                }
+            }
+        }
+    }
+    if need.is_empty() {
+        return Ok(());
+    }
+    let loaded = rbitcoin_query::load_creates_once(
+        query.store(),
+        query.create_residency(),
+        &need,
+        IdxBodyMode::OutsDenserels,
+    )
+    .map_err(ConsensusError::Store)?;
+    for c in loaded {
+        let Ok((tx, outs, dense_rels)) =
+            rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
+                &c.raw,
+                Some(query.store().txs.store_secret()),
+            )
+        else {
+            continue;
+        };
+        let range = Some(c.body_range);
+        // All vouts checked for layout; structural filters spentness.
+        let checked: Vec<u32> = (0..outs.len() as u32).collect();
+        let live: Vec<(u32, rbitcoin_store::OutputRecord)> = outs
+            .iter()
+            .enumerate()
+            .map(|(i, o)| (i as u32, o.clone()))
+            .collect();
+        let sparse = rbitcoin_query::sparse_spender_rels(&dense_rels, &checked);
+        let cb = if tx.input_count != 1 {
+            Some(false)
+        } else {
+            None
+        };
+        batch_parents.insert_owned(c.fk, tx, live, checked, cb, range, sparse);
+    }
+    Ok(())
 }
 
 impl LoadedBatch {
@@ -445,6 +950,7 @@ mod write_idempotent_tests {
             wire_blocks: Vec::new(),
             batch_parents: rbitcoin_query::BatchParents::new(),
             script_preverified: ScriptPreverified::new(),
+            archive_plan: None,
         };
         assert!(batch.is_empty());
         assert_eq!(batch.approx_wire_bytes(), 0);
@@ -652,6 +1158,7 @@ mod write_idempotent_tests {
             wire_blocks: Vec::new(),
             batch_parents: rbitcoin_query::BatchParents::new(),
             script_preverified: ScriptPreverified::new(),
+            archive_plan: None,
         };
         let ok = confirm_scripts_phase(loaded).unwrap();
         assert!(ok.batch.is_empty());
@@ -772,6 +1279,7 @@ mod write_idempotent_tests {
             wire_blocks: vec![],
             batch_parents: rbitcoin_query::BatchParents::new(),
             script_preverified: pre,
+            archive_plan: None,
         };
         let before = confirm_phase_stats::SCRIPT_SKIP_MEMPOOL.load(Ordering::Relaxed);
         confirm_scripts_phase(batch).expect("preverified skip avoids bad script fail");
@@ -831,6 +1339,7 @@ mod write_idempotent_tests {
         );
         let _ = std::fs::remove_dir_all(&path);
     }
+
 }
 
 

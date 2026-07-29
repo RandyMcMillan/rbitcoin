@@ -37,7 +37,8 @@ pub(crate) struct BodyPresence {
     /// Distinct from pending: `BlockFramed` marks pending before decode, but
     /// charge happens only on `Block`. Redeliveries must not re-charge while this
     /// set still holds the hash (mainnet stacked tens of GiB of duplicate jobs).
-    archive_charged: HashSet<BlockHash>,
+    /// hash → charged wire_bytes (for release).
+    archive_charged: HashMap<BlockHash, usize>,
     /// Store-probed and not archived yet (safe to request getdata).
     missing: HashSet<BlockHash>,
     /// Confirm rejected this hash; do not re-offer or re-download.
@@ -49,7 +50,7 @@ impl BodyPresence {
         Self {
             known: HashSet::new(),
             pending_since: HashMap::new(),
-            archive_charged: HashSet::new(),
+            archive_charged: HashMap::new(),
             missing: HashSet::new(),
             rejected: HashSet::new(),
         }
@@ -70,20 +71,30 @@ impl BodyPresence {
 
     /// True if this hash already holds an archive-queue budget charge.
     pub(crate) fn is_archive_charged(&self, h: &BlockHash) -> bool {
-        self.archive_charged.contains(h)
+        self.archive_charged.contains_key(h)
     }
 
-    /// Record that `h` was charged into the archive job pipeline (first copy).
+    /// Record that `h` was charged into the pipeline (first copy).
     pub(crate) fn mark_archive_charged(&mut self, h: BlockHash) {
+        self.mark_archive_charged_bytes(h, 0);
+    }
+
+    /// Record charge with wire byte size for later release.
+    pub(crate) fn mark_archive_charged_bytes(&mut self, h: BlockHash, wire_bytes: usize) {
         if self.rejected.contains(&h) {
             return;
         }
-        self.archive_charged.insert(h);
+        self.archive_charged.entry(h).or_insert(wire_bytes);
     }
 
     /// Drop the charged marker after budget [`release`] (Ok / Err / Dropped).
     pub(crate) fn clear_archive_charged(&mut self, h: &BlockHash) {
         self.archive_charged.remove(h);
+    }
+
+    /// Remove charge and return stored wire_bytes (if any).
+    pub(crate) fn take_archive_charge_bytes(&mut self, h: &BlockHash) -> Option<usize> {
+        self.archive_charged.remove(h)
     }
 
     pub(crate) fn mark_archived(&mut self, h: BlockHash) {
@@ -125,6 +136,8 @@ impl BodyPresence {
         self.missing.remove(&h);
         self.rejected.insert(h);
     }
+
+    // archive_charged is HashMap; len for sizes snap uses .len() still.
 
     /// Pending hashes older than `max_age` → mark missing so getdata can retry.
     ///

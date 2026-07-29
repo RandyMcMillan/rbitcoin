@@ -214,13 +214,13 @@ impl Query {
                 .copied()
                 .filter(|fk| fk.get().is_some())
                 .collect();
+            // Idx→body + one full decode (in load_creates_once); no re-decode of raw.
             let creates = crate::combined_stage::load_creates_once(
                 &self.store,
                 &self.create_residency,
                 &range_fks,
                 rbitcoin_store::IdxBodyMode::Full,
             )?;
-            // Map fk → raw for this block's create decode.
             let mut by_fk: HashMap<u64, crate::combined_stage::CombinedCreate> =
                 HashMap::with_capacity(creates.len());
             for c in creates {
@@ -240,12 +240,7 @@ impl Query {
                     )
                     .into());
                 };
-                let Ok((tx, inputs, outs, denserels)) =
-                    rbitcoin_store::decode_packed_tx_with_spender_rels_secret(
-                        &c.raw,
-                        Some(self.store.txs.store_secret()),
-                    )
-                else {
+                let Some((tx, inputs, outs, denserels)) = c.decoded_full else {
                     continue;
                 };
                 let body_range = Some(c.body_range);
@@ -272,19 +267,10 @@ impl Query {
             height_tx_fks.push((height, tx_fks));
         }
 
-        // ── Cache put (OutFifo + unified residency for shared pin hits) ─
+        // ── Cache put (OutFifo only) ─
+        // Residency outs already seeded by load_creates_once (single decode).
         let t_put = Instant::now();
         self.confirm_parents.put_bodies_from_batch_full(&batch_bodies);
-        // Dual-write outs into residency so later batches pin without re-IO.
-        for (fk, body) in batch_bodies.iter() {
-            self.create_residency.put_outs(
-                fk,
-                body.tx.clone(),
-                body.outputs.clone(),
-                body.denserels.clone(),
-                body.body_range,
-            );
-        }
         st.cache_put_ns = st
             .cache_put_ns
             .saturating_add(t_put.elapsed().as_nanos() as u64);

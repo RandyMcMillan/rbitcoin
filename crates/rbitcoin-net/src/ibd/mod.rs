@@ -404,7 +404,10 @@ pub async fn ibd_cancellable(
         &archive_queued,
     ) {
         Ok(n) if n > 0 => {
-            info!("ibd: rehydrated {n} body-queue entries into confirm feed (readiness)");
+            // Summary already logged inside rehydrate (n / height range / MiB).
+            if n == 0 {
+                rbitcoin_log::debug!("ibd: rehydrate: body queue empty or fully confirmed");
+            }
         }
         Ok(_) => {}
         Err(e) => {

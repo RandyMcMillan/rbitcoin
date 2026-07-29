@@ -932,7 +932,7 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
     confirm_feed: &super::confirm::ConfirmFeed,
     _archive_queued: &ArchiveQueueBudget,
 ) -> Result<usize, String> {
-    use rbitcoin_log::{debug, info, warn};
+    use rbitcoin_log::{info, warn};
 
     let queued = hub
         .query
@@ -942,7 +942,12 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
         return Ok(0);
     }
     let mut n = 0usize;
+    let mut bytes = 0u64;
+    let mut h_min = u32::MAX;
+    let mut h_max = 0u32;
     let mut dropped_done = 0usize;
+    let mut empty_skip = 0usize;
+    let mut unknown_h = 0usize;
     for qb in queued {
         let hash = BlockHash::from_byte_array(qb.hash);
         // Already confirmed tip → drop queue entry.
@@ -953,14 +958,11 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
         }
         // Minimal integrity: rec must have a non-empty payload; full decode at prep.
         if qb.payload.is_empty() {
-            warn!(
-                "ibd: body queue rec id={} empty; dequeue and skip",
-                qb.id
-            );
+            empty_skip = empty_skip.saturating_add(1);
             let _ = hub.query.block_queue_dequeue_height(qb.height);
             continue;
         }
-        let wire_bytes = qb.payload.len();
+        let wire_bytes = qb.payload.len() as u64;
         // Disk-owned: pending so densify will not re-getdata; no soft charge.
         st.body.mark_pending(hash);
         if qb.height != u32::MAX {
@@ -973,21 +975,35 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
         if qb.height != u32::MAX {
             // Readiness only — prep reloads wire from body queue.
             confirm_feed.note(qb.height, hash);
+            bytes = bytes.saturating_add(wire_bytes);
+            h_min = h_min.min(qb.height);
+            h_max = h_max.max(qb.height);
+            n = n.saturating_add(1);
         } else {
             // Unknown height: cannot feed confirm path.
             st.body.mark_missing(hash);
-            continue;
+            unknown_h = unknown_h.saturating_add(1);
         }
-        n = n.saturating_add(1);
-        debug!(
-            "ibd: rehydrate body queue id={} h={} hash={hash} wire={wire_bytes} → feed ready",
-            qb.id, qb.height
-        );
     }
-    if dropped_done > 0 {
-        info!(
-            "ibd: body queue dropped {dropped_done} already-confirmed residues on rehydrate"
-        );
+    // One summary line for partial-IBD restart (no per-rec spam).
+    if n > 0 || dropped_done > 0 || empty_skip > 0 || unknown_h > 0 {
+        let mib = bytes / (1024 * 1024);
+        if n > 0 {
+            info!(
+                "ibd: rehydrate body queue → feed ready n={n} h={h_min}..{h_max} \
+                 {mib}MiB (dropped_confirmed={dropped_done} empty={empty_skip} unknown_h={unknown_h})"
+            );
+        } else {
+            info!(
+                "ibd: rehydrate body queue: no ready entries \
+                 (dropped_confirmed={dropped_done} empty={empty_skip} unknown_h={unknown_h})"
+            );
+        }
+        if empty_skip > 0 {
+            warn!(
+                "ibd: rehydrate dropped {empty_skip} empty body-queue rec(s)"
+            );
+        }
     }
     Ok(n)
 }

@@ -119,7 +119,7 @@ known retain structures:
 | `work` / `body` | IBD maps + body-presence sets |
 | `arch` / `sticky` / `contig` | Archive queue budget + sticky FIFO + ContigPark |
 | `outfifo` | Confirm OutFifo creates/outs/cap/order + height plans |
-| `conf loadq` / `writeq` | Confirm pipeline **queue contents** (batches, blocks, wire MiB, parents) + feed ready/inflight |
+| `conf prepq` / `writeq` | Confirm pipeline **queue contents** (batches, blocks, wire MiB, parents) + feed ready/inflight |
 | `txhead` | Primary + **shadow** `tx.head` during online resize (logical body MiB, cursor/n) |
 | `sh` | SH runs / memtable / tip heads |
 

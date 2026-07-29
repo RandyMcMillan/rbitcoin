@@ -64,7 +64,13 @@ There is **no** global “pause queries during confirm write.” Tip-as-commit +
 1. Do **not** spawn a second Class A writer while IBD confirm commit is running.
 2. Pipeline depth: prep(N+1) ∥ scripts(N) ∥ commit(N−1) via bounded load/write queues.
 3. Scripts for batch N may run while prep does N+1 and commit does N−1. Scripts never touch disk.
-4. On SIGINT, IBD cancels cooperatively — do not drop nested runtimes mid-await.
+4. **Prep ahead of store tip:** prep may plan batch N+1 while commit has not advanced tip.
+   Prep holds a **reserved create-fk HWM** and **in-flight create/out maps** from
+   uncommitted plans (`WirePrepPipeline` / `archive_plan_mega_from`). First height
+   of a batch is the **pipeline path_lo** (tip+1 or last-prepped+1), not only store tip.
+   Commit still applies batches in height order; on permanent reject, prep clears
+   reserved state and re-syncs from `txs.count()`.
+5. On SIGINT, IBD cancels cooperatively — do not drop nested runtimes mid-await.
 
 ## Host freezes / IO storms
 

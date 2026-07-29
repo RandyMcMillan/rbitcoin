@@ -5,11 +5,91 @@ use super::status::LoopStats;
 use crate::chain::ChainHub;
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
+use rbitcoin_consensus::WirePrepPipeline;
 use rbitcoin_log::{debug, info, warn};
+use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Prep-thread state so prep(N+1) can plan while commit(N) has not advanced tip.
+struct PrepAheadState {
+    next_tx_start: u64,
+    in_flight_creates: HashMap<[u8; 32], Fk>,
+    in_flight_outs: HashMap<u64, (rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>)>,
+    /// Last height successfully prepped (still in pipeline or already committed).
+    last_prepped: Option<(u32, [u8; 32])>,
+}
+
+impl PrepAheadState {
+    fn new(hub: &ChainHub) -> Self {
+        let next = hub.query.tx_body_count().saturating_add(1).max(1);
+        Self {
+            next_tx_start: next,
+            in_flight_creates: HashMap::new(),
+            in_flight_outs: HashMap::new(),
+            last_prepped: None,
+        }
+    }
+
+    /// Drop creates already durable in Class A (after commits).
+    fn prune_committed(&mut self, hub: &ChainHub) {
+        let durable = hub.query.tx_body_count();
+        self.in_flight_creates
+            .retain(|_, fk| fk.get().map(|id| id > durable).unwrap_or(false));
+        self.in_flight_outs.retain(|id, _| *id > durable);
+        self.next_tx_start = self.next_tx_start.max(durable.saturating_add(1).max(1));
+        if let Some((h, _)) = self.last_prepped {
+            let tip = hub.tip_height().unwrap_or(0);
+            if h <= tip {
+                self.last_prepped = None;
+            }
+        }
+    }
+
+    fn pipeline_for(&self, path_lo: u32, store_path_lo: u32) -> WirePrepPipeline {
+        let parent_hash = if path_lo == store_path_lo {
+            None
+        } else {
+            self.last_prepped
+                .filter(|(h, _)| *h + 1 == path_lo)
+                .map(|(_, hash)| hash)
+        };
+        WirePrepPipeline {
+            path_lo,
+            parent_hash,
+            next_tx_start: self.next_tx_start,
+            in_flight_creates: self.in_flight_creates.clone(),
+            in_flight_outs: self.in_flight_outs.clone(),
+        }
+    }
+
+    fn note_plan_ok(
+        &mut self,
+        plan: &rbitcoin_query::ArchiveWritePlan,
+        last_height: u32,
+        last_hash: [u8; 32],
+    ) {
+        for ((tx, _ins, outs), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
+            self.in_flight_creates.insert(tx.txid, *fk);
+            if let Some(id) = fk.get() {
+                self.in_flight_outs.insert(id, (tx.clone(), outs.clone()));
+            }
+        }
+        if let Some(last) = plan.planned_fks.last().and_then(|f| f.get()) {
+            self.next_tx_start = last.saturating_add(1).max(1);
+        }
+        self.last_prepped = Some((last_height, last_hash));
+    }
+
+    fn clear_all(&mut self, hub: &ChainHub) {
+        self.in_flight_creates.clear();
+        self.in_flight_outs.clear();
+        self.last_prepped = None;
+        self.next_tx_start = hub.query.tx_body_count().saturating_add(1).max(1);
+    }
+}
 
 /// Shared feed of tip-extension **readiness** for the dedicated confirm engine.
 ///
@@ -549,10 +629,12 @@ pub(crate) fn spawn_confirm_engine(
         .spawn(move || {
             info!("ibd: confirm prep on dedicated OS thread (body queue → plan+pin+assemble)");
             let mut missing_tries: HashMap<u32, u32> = HashMap::new();
+            let mut prep_ahead = PrepAheadState::new(&hub);
             loop {
                 if feed.stopped() {
                     break;
                 }
+                prep_ahead.prune_committed(&hub);
 
                 let batch: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = {
                     let mut g = feed.inner.lock().unwrap();
@@ -697,6 +779,15 @@ pub(crate) fn spawn_confirm_engine(
                 }
 
                 // Prefer unified wire prep when every claimed height has wire.
+                // path_lo = first claimed height (tip+1 or after in-flight prep prefix).
+                let store_path_lo = match hub.tip_height() {
+                    None => 0u32,
+                    Some(t) => t.saturating_add(1),
+                };
+                let pipe = prep_ahead.pipeline_for(expect_h, store_path_lo);
+                // Only use pipeline caches when claiming at/after store tip with
+                // reserved HWM (always safe; enables prep ahead of tip).
+                let use_pipe = pipe.path_lo >= store_path_lo;
                 let all_wire = batch.iter().all(|(_, _, w)| w.is_some());
                 let mat_res = if all_wire {
                     let wire_batch: Vec<(rbitcoin_primitives::Height, bitcoin::Block)> = batch
@@ -708,7 +799,11 @@ pub(crate) fn spawn_confirm_engine(
                             )
                         })
                         .collect();
-                    hub.confirm_wire_prep_phase(&wire_batch)
+                    if use_pipe {
+                        hub.confirm_wire_prep_phase_pipelined(&wire_batch, Some(&pipe))
+                    } else {
+                        hub.confirm_wire_prep_phase(&wire_batch)
+                    }
                 } else {
                     // Fallback: already-archived Class A without body-queue payload.
                     let hash_batch: Vec<(u32, BlockHash)> =
@@ -746,10 +841,12 @@ pub(crate) fn spawn_confirm_engine(
                             feed.requeue_wire(&tail);
                             loop_stats.confirm_begin(expect_h, 1);
                             if let Some((_, _, Some(w))) = batch.first() {
-                                hub.confirm_wire_prep_phase(&[(
-                                    rbitcoin_primitives::Height(expect_h),
-                                    w.clone(),
-                                )])
+                                let one = [(rbitcoin_primitives::Height(expect_h), w.clone())];
+                                if use_pipe {
+                                    hub.confirm_wire_prep_phase_pipelined(&one, Some(&pipe))
+                                } else {
+                                    hub.confirm_wire_prep_phase(&one)
+                                }
                             } else {
                                 hub.confirm_load_phase(&[(expect_h, batch[0].1)])
                             }
@@ -809,6 +906,24 @@ pub(crate) fn spawn_confirm_engine(
                             .into_iter()
                             .map(|(h, _)| h)
                             .collect();
+                        // Reserve create fks + outs for prep(N+1) while this batch is in-flight.
+                        if let Some(plan) = outcome.batch.archive_plan.as_ref() {
+                            if let Some((lh, raw)) = outcome
+                                .batch
+                                .heights_hashes()
+                                .into_iter()
+                                .max_by_key(|(h, _)| *h)
+                            {
+                                prep_ahead.note_plan_ok(plan, lh, raw);
+                            }
+                        } else if let Some((lh, raw)) = outcome
+                            .batch
+                            .heights_hashes()
+                            .into_iter()
+                            .max_by_key(|(h, _)| *h)
+                        {
+                            prep_ahead.last_prepped = Some((lh, raw));
+                        }
                         if prepared_n != batch.len() {
                             // Re-queue claim heights prep dropped (write only finishes prepared).
                             let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
@@ -914,6 +1029,8 @@ pub(crate) fn spawn_confirm_engine(
                         }
                         // Permanent reject on first height — drop inflight so tip can move
                         // only after operator/event handling; do not re-queue first.
+                        // Invalidate reserved fks / in-flight creates past this height.
+                        prep_ahead.clear_all(&hub);
                         feed.finish(std::iter::once(expect));
                         missing_tries.remove(&expect);
                         loop_stats

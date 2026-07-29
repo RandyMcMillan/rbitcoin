@@ -8,9 +8,9 @@ use bitcoin::{Block, BlockHash, Transaction, Work};
 use std::sync::RwLock;
 use rbitcoin_consensus::{
     accept_and_archive_block, accept_and_connect_block_preverified, confirm_archived_run,
-    confirm_load_phase, confirm_script_phase, confirm_scripts_phase, confirm_wire_prep_phase,
-    confirm_write_phase, genesis_block, header_to_record, ChainParams, Milestone, ScriptOkBatch,
-    ScriptPreverified,
+    confirm_load_phase, confirm_script_phase, confirm_scripts_phase,
+    confirm_wire_prep_phase_pipelined, confirm_write_phase, genesis_block, header_to_record,
+    ChainParams, Milestone, ScriptOkBatch, ScriptPreverified, WirePrepPipeline,
 };
 use rbitcoin_log::info;
 use rbitcoin_primitives::{Fk, Height};
@@ -249,32 +249,40 @@ impl ChainHub {
 
     /// Unified PREP from raw wire blocks (no Class-A wire rebuild).
     /// Skips heights already confirmed. Does **not** require prior archive.
+    ///
+    /// When `pipeline` is `None`, first height must be store tip+1 (legacy).
+    /// When `Some`, first height is `pipeline.path_lo` so prep(N+1) can run
+    /// while commit(N) has not advanced tip.
     pub fn confirm_wire_prep_phase(
         &self,
         blocks: &[(Height, Block)],
     ) -> Result<Option<rbitcoin_consensus::ConfirmLoadOutcome>, NetError> {
+        self.confirm_wire_prep_phase_pipelined(blocks, None)
+    }
+
+    /// Prep with optional pipeline caches (reserved create fks + in-flight creates).
+    pub fn confirm_wire_prep_phase_pipelined(
+        &self,
+        blocks: &[(Height, Block)],
+        pipeline: Option<&WirePrepPipeline>,
+    ) -> Result<Option<rbitcoin_consensus::ConfirmLoadOutcome>, NetError> {
         if blocks.is_empty() {
             return Ok(None);
         }
+        let store_path_lo = match self.tip_height() {
+            None => 0u32,
+            Some(t) => t.saturating_add(1),
+        };
+        let path_lo = pipeline.map(|p| p.path_lo).unwrap_or(store_path_lo);
         let need: Vec<(Height, Block)> = blocks
             .iter()
             .filter(|(h, b)| {
                 let hash = b.block_hash();
-                !self.has_block(&hash)
-                    && self
-                        .tip_height()
-                        .map(|t| h.0 == t.saturating_add(1) || h.0 > t)
-                        .unwrap_or(h.0 == 0 || h.0 >= 1)
+                !self.has_block(&hash) && h.0 >= path_lo
             })
             .cloned()
             .collect();
-        // Keep only contiguous from tip+1.
-        let tip = self.tip_height().unwrap_or(0);
-        let path_lo = if self.tip_height().is_none() {
-            0u32
-        } else {
-            tip.saturating_add(1)
-        };
+        // Contiguous run starting at pipeline path_lo (not only store tip+1).
         let mut contig = Vec::new();
         for (h, b) in need {
             if h.0 != path_lo.saturating_add(contig.len() as u32) {
@@ -285,12 +293,13 @@ impl ChainHub {
         if contig.is_empty() {
             return Ok(None);
         }
-        let ok = confirm_wire_prep_phase(
+        let ok = confirm_wire_prep_phase_pipelined(
             &self.query,
             &self.params,
             self.milestone,
             &contig,
             &ScriptPreverified::new(),
+            pipeline,
         )
         .map_err(|e| NetError::Consensus(e.to_string()))?;
         Ok(Some(ok))
@@ -853,6 +862,85 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    /// Prep batch N+1 must succeed while N is only prepped (not committed).
+    /// Regression: hub used store tip+1 only → Ok(None) "empty outcome" thrash.
+    #[test]
+    fn wire_prep_ahead_of_store_tip_with_pipeline() {
+        use rbitcoin_consensus::WirePrepPipeline;
+        use std::collections::HashMap;
+
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        hub.query.enter_direct_index_mode().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let b1 = mine(gen, 1_300_000_200, 1);
+        let b2 = mine(b1.block_hash(), 1_300_000_800, 2);
+        let h1 = b1.block_hash();
+        let h2 = b2.block_hash();
+
+        // Batch 1 at store tip+1 (path_lo=1).
+        let batch1 = [(
+            rbitcoin_primitives::Height(1),
+            b1.clone(),
+        )];
+        let mut pipe = WirePrepPipeline {
+            path_lo: 1,
+            parent_hash: None,
+            next_tx_start: hub.query.tx_body_count().saturating_add(1).max(1),
+            in_flight_creates: HashMap::new(),
+            in_flight_outs: HashMap::new(),
+        };
+        let mat1 = hub
+            .confirm_wire_prep_phase_pipelined(&batch1, Some(&pipe))
+            .expect("prep1")
+            .expect("prep1 some");
+        assert_eq!(mat1.batch.len(), 1);
+        assert!(mat1.batch.archive_plan.is_some());
+        assert_eq!(hub.tip_height(), Some(0), "tip must not advance on prep alone");
+
+        // Update pipeline caches from plan (prep-thread note_plan_ok).
+        let plan = mat1.batch.archive_plan.as_ref().unwrap();
+        for ((tx, _ins, outs), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
+            pipe.in_flight_creates.insert(tx.txid, *fk);
+            if let Some(id) = fk.get() {
+                pipe.in_flight_outs.insert(id, (tx.clone(), outs.clone()));
+            }
+        }
+        if let Some(last) = plan.planned_fks.last().and_then(|f| f.get()) {
+            pipe.next_tx_start = last.saturating_add(1).max(1);
+        }
+        pipe.path_lo = 2;
+        pipe.parent_hash = Some(h1.to_byte_array());
+
+        // Batch 2 while tip still 0 — must NOT Ok(None).
+        let batch2 = [(rbitcoin_primitives::Height(2), b2.clone())];
+        let mat2 = hub
+            .confirm_wire_prep_phase_pipelined(&batch2, Some(&pipe))
+            .expect("prep2 err")
+            .expect("prep2 must Some — pipeline path_lo=2 with tip=0");
+        assert_eq!(mat2.batch.len(), 1);
+        assert!(mat2.batch.archive_plan.is_some());
+        // Reserved fks for batch2 start after batch1's plan.
+        let p1_last = plan.planned_fks.last().unwrap().get().unwrap();
+        let p2_first = mat2
+            .batch
+            .archive_plan
+            .as_ref()
+            .unwrap()
+            .planned_fks
+            .first()
+            .unwrap()
+            .get()
+            .unwrap();
+        assert!(
+            p2_first > p1_last,
+            "batch2 fks must not collide with batch1 reserved fks ({p2_first} <= {p1_last})"
+        );
+        assert_eq!(hub.tip_height(), Some(0));
+        let _ = (h2,);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

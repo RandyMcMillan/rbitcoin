@@ -303,9 +303,9 @@ pub fn confirm_archived_at(
 pub use confirm_run::{
     confirm_archived_run, confirm_archived_run_preverified, confirm_load_phase,
     confirm_load_phase_preverified, confirm_script_phase, confirm_scripts_phase,
-    confirm_wire_prep_phase, confirm_wire_run, confirm_wire_run_preverified,
-    confirm_write_phase, ConfirmLoadOutcome, ConfirmScriptOutcome, LoadedBatch,
-    ScriptOkBatch, ScriptPreverified,
+    confirm_wire_prep_phase, confirm_wire_prep_phase_pipelined, confirm_wire_run,
+    confirm_wire_run_preverified, confirm_write_phase, ConfirmLoadOutcome, ConfirmScriptOutcome,
+    LoadedBatch, ScriptOkBatch, ScriptPreverified, WirePrepPipeline,
 };
 
 /// Accept + archive + confirm in one step (genesis / tip extension / tests).

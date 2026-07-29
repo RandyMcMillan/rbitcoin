@@ -138,6 +138,25 @@ impl BatchParents {
         self.by_fk.get(&id)?.body_range
     }
 
+    /// Set body range + dense spender rels after Class A commit (same-batch creates).
+    ///
+    /// Does not re-fetch outs; only fills layout for annotate/structural abs paths.
+    pub fn set_layout(&mut self, fk: Fk, body_range: (u64, u64), dense_rels: &[u32]) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        let Some(e) = self.by_fk.get_mut(&id) else {
+            return;
+        };
+        e.body_range = Some(body_range);
+        let need: Vec<u32> = if e.checked.is_empty() {
+            (0..dense_rels.len() as u32).collect()
+        } else {
+            e.checked.clone()
+        };
+        e.spender_rels = sparse_spender_rels(dense_rels, &need);
+    }
+
     /// Absolute 9-byte spender meta offset for `vout`, if layout known.
     ///
     /// Returns `None` when body range or denserels were not prepared (caller

@@ -21,16 +21,16 @@ use std::time::{Duration, Instant};
 /// them — otherwise offer re-notes tip+1 every main-loop tick and load re-claims
 /// the same batch into the load→scripts queue (duplicate script work).
 pub(crate) struct ConfirmFeed {
-    inner: std::sync::Mutex<ConfirmFeedInner>,
+    pub(crate) inner: std::sync::Mutex<ConfirmFeedInner>,
     cv: std::sync::Condvar,
     stop: AtomicBool,
 }
 
-struct ConfirmFeedInner {
+pub(crate) struct ConfirmFeedInner {
     /// height → (hash, optional wire block for unified prep)
-    ready: std::collections::BTreeMap<u32, (BlockHash, Option<bitcoin::Block>)>,
+    pub(crate) ready: std::collections::BTreeMap<u32, (BlockHash, Option<bitcoin::Block>)>,
     /// Claimed by load; not yet written or released. Offer must not re-note.
-    inflight: std::collections::HashSet<u32>,
+    pub(crate) inflight: std::collections::HashSet<u32>,
 }
 
 impl ConfirmFeed {
@@ -1045,7 +1045,7 @@ mod tests {
             g.inflight.insert(3);
         }
         assert_eq!(feed.size_snap(), (2, 1));
-        feed.requeue(&[]); // no-op empty
+        feed.requeue_wire(&[]); // no-op empty
         assert_eq!(feed.size_snap(), (2, 1));
         feed.request_stop();
         assert!(feed.stopped());

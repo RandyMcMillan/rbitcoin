@@ -917,17 +917,19 @@ pub(crate) fn drain_job_rx_as_err(
     }
 }
 
-/// Restart path: load durable `store/block_queue/` payloads and push them onto
-/// the archive job channel so IBD does **not** re-getdata those blocks.
+/// Restart path: load durable `store/block_queue/` payloads into the **unified
+/// confirm wire feed** so IBD does not re-getdata and does not dual Class-A
+/// archive-lead those heights.
 ///
-/// Already Class-A-archived heights are dequeued (stale queue residue). Each
-/// rehydrated job is charged against [`ArchiveQueueBudget`] like a live peer Block.
+/// Already confirmed heights are dequeued (stale queue residue). Each rehydrated
+/// body is charged against [`ArchiveQueueBudget`] like a live peer Block and
+/// released on confirm accept/reject.
 ///
-/// Returns the number of jobs enqueued.
-pub(crate) fn rehydrate_block_queue_into_archive(
+/// Returns the number of blocks noted into the feed.
+pub(crate) fn rehydrate_block_queue_into_confirm(
     hub: &ChainHub,
     st: &mut super::state::IbdWorkState,
-    arch_job_tx: &mpsc::UnboundedSender<ArchiveJob>,
+    confirm_feed: &super::confirm::ConfirmFeed,
     archive_queued: &ArchiveQueueBudget,
 ) -> Result<usize, String> {
     use bitcoin::consensus::Decodable;
@@ -940,15 +942,14 @@ pub(crate) fn rehydrate_block_queue_into_archive(
     if queued.is_empty() {
         return Ok(0);
     }
-    let tip_h = hub.tip_height().unwrap_or(0);
     let mut n = 0usize;
-    let mut dropped_archived = 0usize;
+    let mut dropped_done = 0usize;
     for qb in queued {
         let hash = BlockHash::from_byte_array(qb.hash);
-        // Already durable Class A → drop queue entry (confirm will not re-run).
+        // Already confirmed tip → drop queue entry.
         if hub.has_block(&hash) || st.body.is_known_archived(&hash) {
             let _ = hub.query.block_queue_dequeue_height(qb.height);
-            dropped_archived = dropped_archived.saturating_add(1);
+            dropped_done = dropped_done.saturating_add(1);
             continue;
         }
         let mut cursor = std::io::Cursor::new(qb.payload.as_slice());
@@ -964,9 +965,8 @@ pub(crate) fn rehydrate_block_queue_into_archive(
             }
         };
         let wire_bytes = qb.payload.len().max(block.total_size());
-        // Soft RAM budget: still charge; overshoot ok for restart recovery.
         archive_queued.charge(wire_bytes);
-        st.body.mark_archive_charged(hash);
+        st.body.mark_archive_charged_bytes(hash, wire_bytes);
         st.body.mark_pending(hash);
         if qb.height != u32::MAX {
             st.record_height(hash, qb.height);
@@ -975,41 +975,30 @@ pub(crate) fn rehydrate_block_queue_into_archive(
         if !header_fk.is_null() {
             st.header_fks.insert(hash, header_fk);
         }
-        let priority = qb.height != u32::MAX
-            && (qb.height <= tip_h.saturating_add(super::NEAR_DEPTH)
-                || qb.height
-                    <= st
-                        .max_archived_height
-                        .saturating_add(1)
-                        .saturating_add(super::CONTIG_DENSIFY_AHEAD));
-        if arch_job_tx
-            .send(ArchiveJob {
-                block,
-                header_fk,
-                priority,
-                wire_bytes,
-                height: qb.height,
-            })
-            .is_err()
-        {
+        if qb.height != u32::MAX {
+            confirm_feed.note_wire(qb.height, hash, Some(block));
+        } else {
+            // Unknown height: cannot feed confirm path; drop charge.
             archive_queued.release(wire_bytes);
             st.body.clear_archive_charged(&hash);
             st.body.mark_missing(hash);
-            return Err("archive job channel closed during rehydrate".into());
+            continue;
         }
         n = n.saturating_add(1);
         debug!(
-            "ibd: rehydrate queue id={} h={} hash={hash} wire={wire_bytes}",
+            "ibd: rehydrate queue id={} h={} hash={hash} wire={wire_bytes} → confirm feed",
             qb.id, qb.height
         );
     }
-    if dropped_archived > 0 {
+    if dropped_done > 0 {
         info!(
-            "ibd: block_queue dropped {dropped_archived} already-archived residues on rehydrate"
+            "ibd: block_queue dropped {dropped_done} already-confirmed residues on rehydrate"
         );
     }
     Ok(n)
 }
+
+
 
 /// Prep → writer queue depth (like confirm load→scripts): prep can plan the next
 /// mega-batch while the prior commit is still running. Blocking `send` when full
@@ -2132,7 +2121,7 @@ mod budget_env_tests {
 
 #[cfg(test)]
 mod rehydrate_tests {
-    use super::{rehydrate_block_queue_into_archive, ArchiveJob, ArchiveQueueBudget};
+    use super::{rehydrate_block_queue_into_confirm, ArchiveQueueBudget};
     use crate::chain::ChainHub;
     use bitcoin::blockdata::block::Header as BlockHeader;
     use bitcoin::consensus::Encodable;
@@ -2168,10 +2157,9 @@ mod rehydrate_tests {
         }
     }
 
-    /// Shipped restart path: enqueue durable payload → rehydrate → ArchiveJob
-    /// on channel (no peer getdata).
+    /// Shipped restart path: durable payload → confirm wire feed (no re-getdata).
     #[test]
-    fn rehydrate_sends_archive_jobs_from_disk_queue() {
+    fn rehydrate_notes_confirm_wire_from_disk_queue() {
         let (dir, hub) = temp_hub();
         let block = empty_block(42);
         let hash = block.block_hash();
@@ -2184,23 +2172,20 @@ mod rehydrate_tests {
             .unwrap();
         assert_eq!(hub.query.block_queue_stats().2, 1);
 
-        // Simulate process restart: load_all still has the payload.
-        let loaded = hub.query.block_queue_load_all().unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].height, height);
-
-        let (arch_tx, mut arch_rx) = tokio::sync::mpsc::unbounded_channel::<ArchiveJob>();
+        let feed = super::super::confirm::ConfirmFeed::new();
         let budget = ArchiveQueueBudget::new(64 * 1024 * 1024);
         let mut st = super::super::state::IbdWorkState::new(vec![], None, None);
-        let n = rehydrate_block_queue_into_archive(&hub, &mut st, &arch_tx, &budget).unwrap();
-        assert_eq!(n, 1, "one job rehydrated");
+        let n = rehydrate_block_queue_into_confirm(&hub, &mut st, &feed, &budget).unwrap();
+        assert_eq!(n, 1, "one wire block rehydrated");
         assert_eq!(budget.count(), 1);
-        let job = arch_rx.try_recv().expect("ArchiveJob from rehydrate");
-        assert_eq!(job.height, height);
-        assert_eq!(job.block.block_hash(), hash);
-        assert_eq!(job.header_fk.0, header_fk);
+        {
+            let g = feed.inner.lock().unwrap();
+            let (h, w) = g.ready.get(&height).expect("noted on feed");
+            assert_eq!(*h, hash);
+            assert!(w.is_some(), "wire body present for unified prep");
+        }
         assert!(st.body.is_archive_charged(&hash) || st.body.is_pending(&hash));
-        // Queue still holds disk copy until confirm_write dequeue (rehydrate does not drop).
+        // Disk queue until confirm-write dequeue.
         assert_eq!(hub.query.block_queue_stats().2, 1);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2209,7 +2194,6 @@ mod rehydrate_tests {
     #[test]
     fn rehydrate_drops_already_archived_residue() {
         let (dir, hub) = temp_hub();
-        // Enqueue a payload whose hash we mark known-archived → must dequeue, not job.
         let block = empty_block(99);
         let hash = block.block_hash();
         let mut payload = Vec::new();
@@ -2217,13 +2201,13 @@ mod rehydrate_tests {
         hub.query
             .block_queue_enqueue(3, hash.to_byte_array(), 1, &payload)
             .unwrap();
-        let (arch_tx, mut arch_rx) = tokio::sync::mpsc::unbounded_channel::<ArchiveJob>();
+        let feed = super::super::confirm::ConfirmFeed::new();
         let budget = ArchiveQueueBudget::new(64 * 1024 * 1024);
         let mut st = super::super::state::IbdWorkState::new(vec![], None, None);
         st.body.mark_archived(hash);
-        let n = rehydrate_block_queue_into_archive(&hub, &mut st, &arch_tx, &budget).unwrap();
+        let n = rehydrate_block_queue_into_confirm(&hub, &mut st, &feed, &budget).unwrap();
         assert_eq!(n, 0);
-        assert!(arch_rx.try_recv().is_err());
+        assert!(feed.inner.lock().unwrap().ready.is_empty());
         assert_eq!(hub.query.block_queue_stats().2, 0, "residue dequeued");
         let _ = std::fs::remove_dir_all(&dir);
     }

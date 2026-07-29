@@ -594,7 +594,13 @@ pub(crate) fn update_confirm_lag(lag: &AtomicU32, tip: Option<u32>, max_archived
     lag.store(max_archived.saturating_sub(t), Ordering::Relaxed);
 }
 
-pub(crate) fn apply_confirm_reject(st: &mut IbdWorkState, height: u32, hash: BlockHash, err: &str) {
+pub(crate) fn apply_confirm_reject(
+    st: &mut IbdWorkState,
+    height: u32,
+    hash: BlockHash,
+    err: &str,
+    archive_queued: Option<&ArchiveQueueBudget>,
+) {
     // Never blacklist the all-zero sentinel (write used to emit this on
     // mis-attributed rejects). Never freeze tip on pipeline "already spent"
     // races that race a successful commit.
@@ -610,6 +616,14 @@ pub(crate) fn apply_confirm_reject(st: &mut IbdWorkState, height: u32, hash: Blo
             "ibd: confirm reject not blacklisted @{height} {hash}: {err} (treat as transient)"
         );
         return;
+    }
+    // Wire path charged soft budget on receive — release before drop marker.
+    if let Some(q) = archive_queued {
+        if let Some(wb) = st.body.take_archive_charge_bytes(&hash) {
+            q.release(wb);
+        }
+    } else {
+        st.body.clear_archive_charged(&hash);
     }
     st.body.mark_rejected(hash);
     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
@@ -655,6 +669,7 @@ mod confirm_reject_tests {
             101,
             zero,
             "consensus: prevout already spent on best chain",
+            None,
         );
         assert!(!st.body.is_rejected(&zero));
 
@@ -670,6 +685,7 @@ mod confirm_reject_tests {
             362_595,
             hash,
             "consensus: prevout already spent on best chain",
+            None,
         );
         assert!(
             !st.body.is_rejected(&hash),
@@ -690,6 +706,7 @@ mod confirm_reject_tests {
             51,
             hash,
             "consensus: script verification failed: script false",
+            None,
         );
         assert!(st.body.is_rejected(&hash));
         assert!(!st.ordered_set.contains(&hash));
@@ -731,7 +748,7 @@ mod confirm_reject_tests {
         let mut st = IbdWorkState::new(Vec::new(), None, Some(10));
         let ok_h = h(1);
         st.record_height(ok_h, 20);
-        st.body.mark_archive_charged(ok_h);
+        st.body.mark_archive_charged_bytes(ok_h, 0);
         budget.charge(1000);
         apply_archive_result(
             &mut st,
@@ -749,7 +766,7 @@ mod confirm_reject_tests {
         assert_eq!(stats.archived_bodies.load(Ordering::Relaxed), 1);
         // Second Ok does not double-count first-archive.
         budget.charge(1000);
-        st.body.mark_archive_charged(ok_h);
+        st.body.mark_archive_charged_bytes(ok_h, 0);
         apply_archive_result(
             &mut st,
             ArchiveResult::Ok {
@@ -762,7 +779,7 @@ mod confirm_reject_tests {
         assert_eq!(stats.archived_bodies.load(Ordering::Relaxed), 1);
 
         let drop_h = h(2);
-        st.body.mark_archive_charged(drop_h);
+        st.body.mark_archive_charged_bytes(drop_h, 0);
         budget.charge(500);
         apply_archive_result(
             &mut st,
@@ -777,7 +794,7 @@ mod confirm_reject_tests {
         assert_eq!(st.body.skip_download_cached(&drop_h), Some(false)); // missing
 
         let err_h = h(3);
-        st.body.mark_archive_charged(err_h);
+        st.body.mark_archive_charged_bytes(err_h, 0);
         budget.charge(200);
         apply_archive_result(
             &mut st,
@@ -1207,7 +1224,7 @@ mod confirm_reject_tests {
         assert_eq!(st.body.skip_download_cached(&far_hash), Some(false));
 
         // Dropped without requeue leaves missing unset (charge only).
-        st.body.mark_archive_charged(h(0x55));
+        st.body.mark_archive_charged_bytes(h(0x55), 0);
         budget.charge(100);
         apply_archive_result(
             &mut st,
@@ -1269,7 +1286,7 @@ mod confirm_reject_tests {
         let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
         let (arch_res_tx, mut arch_res_rx) = mpsc::unbounded_channel();
         let drop_h = h(0x77);
-        st.body.mark_archive_charged(drop_h);
+        st.body.mark_archive_charged_bytes(drop_h, 0);
         budget.charge(50);
         arch_res_tx
             .send(ArchiveResult::Ok {

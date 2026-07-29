@@ -749,11 +749,24 @@ pub fn confirm_write_phase(
     // Single commit era: durable Class A for this batch before spentness RMW.
     if let Some(plan) = batch.archive_plan.take() {
         if !plan.is_empty() {
+            // Snapshot planned fks + packed outs for offline denserels (no Class-A re-read).
+            let planned_fks = plan.planned_fks.clone();
+            let packed = plan
+                .packed
+                .iter()
+                .map(|(tx, ins, outs)| (tx.clone(), ins.clone(), outs.clone()))
+                .collect::<Vec<_>>();
             query
                 .archive_commit_plan(plan)
                 .map_err(ConsensusError::Store)?;
-            // Fill denserels/body_range for planned creates now on disk (annotate).
-            fill_batch_parent_layout_after_commit(query, &mut batch.batch_parents, &batch.prepared)?;
+            // Layout only for planned creates (same-batch): encode offline +
+            // body ranges from commit — zero additional Class A body preads.
+            fill_planned_create_layout_after_commit(
+                query,
+                &mut batch.batch_parents,
+                &planned_fks,
+                &packed,
+            )?;
         }
     }
 
@@ -793,66 +806,45 @@ pub fn confirm_write_phase(
     Ok(out)
 }
 
-/// After Class A commit, attach body_range + denserels for creates in this batch
-/// that structural/annotate need (same-batch spends and parent pin refresh).
-fn fill_batch_parent_layout_after_commit(
+/// After Class A commit, set body_range + denserels for **planned** creates only.
+///
+/// Uses offline pack (same encoding as disk) + `tx_body_range_batch` — **no**
+/// Class A body pread / `load_creates_once`. External parents were already
+/// pinned with denserels at prep.
+fn fill_planned_create_layout_after_commit(
     query: &Query,
     batch_parents: &mut rbitcoin_query::BatchParents,
-    prepared: &[Prepared],
+    planned_fks: &[rbitcoin_primitives::Fk],
+    packed: &[(
+        rbitcoin_store::TxRecord,
+        Vec<rbitcoin_store::InputRecord>,
+        Vec<rbitcoin_store::OutputRecord>,
+    )],
 ) -> Result<(), ConsensusError> {
-    use rbitcoin_store::IdxBodyMode;
-    let mut need: Vec<rbitcoin_primitives::Fk> = Vec::new();
-    let mut seen = HashSet::new();
-    for p in prepared {
-        for fk in &p.tx_fks {
-            if let Some(id) = fk.get() {
-                if seen.insert(id) {
-                    need.push(*fk);
-                }
-            }
-        }
-        for &(_txid, _vout, _sfk, cfk) in &p.spends {
-            if let Some(id) = cfk.get() {
-                if seen.insert(id) {
-                    need.push(cfk);
-                }
-            }
-        }
-    }
-    if need.is_empty() {
+    if planned_fks.is_empty() || packed.is_empty() {
         return Ok(());
     }
-    let loaded = rbitcoin_query::load_creates_once(
-        query.store(),
-        query.create_residency(),
-        &need,
-        IdxBodyMode::OutsDenserels,
-    )
-    .map_err(ConsensusError::Store)?;
-    for c in loaded {
-        let Ok((tx, outs, dense_rels)) =
-            rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
-                &c.raw,
-                Some(query.store().txs.store_secret()),
-            )
+    let ranges = query
+        .store()
+        .tx_body_range_batch(planned_fks)
+        .map_err(ConsensusError::Store)?;
+    let secret = query.store().txs.store_secret();
+    for ((tx, ins, outs), (fk, range)) in packed
+        .iter()
+        .zip(planned_fks.iter().zip(ranges.into_iter()))
+    {
+        let Some((off, len)) = range else {
+            continue;
+        };
+        // Offline pack matches durable body layout → denserels without disk read.
+        let mut raw = Vec::new();
+        rbitcoin_store::encode_packed_tx_with_secret(tx, ins, outs, &mut raw, Some(secret));
+        let Ok((_meta, _outs, dense_rels)) =
+            rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(&raw, Some(secret))
         else {
             continue;
         };
-        let range = Some(c.body_range);
-        // All vouts checked for layout; structural filters spentness.
-        let checked: Vec<u32> = (0..outs.len() as u32).collect();
-        let live: Vec<(u32, rbitcoin_store::OutputRecord)> = outs
-            .iter()
-            .enumerate()
-            .map(|(i, o)| (i as u32, o.clone()))
-            .collect();
-        let sparse = rbitcoin_query::sparse_spender_rels(&dense_rels, &checked);
-        let cb = if tx.input_count != 1 {
-            Some(false)
-        } else {
-            None
-        };
-        batch_parents.insert_owned(c.fk, tx, live, checked, cb, range, sparse);
+        batch_parents.set_layout(*fk, (off, len), &dense_rels);
     }
     Ok(())
 }

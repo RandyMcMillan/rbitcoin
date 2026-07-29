@@ -2187,6 +2187,12 @@ fn unified_wire_pipeline_multi_block_to_tip() {
     assert!(ok.batch.archive_plan.is_some());
     let fks = confirm_write_phase(&q, &params, ms, ok.batch).expect("commit");
     assert_eq!(fks.len(), 4);
+    // Commit must not re-pread Class A bodies for layout (offline denserels).
+    assert_eq!(
+        rbitcoin_query::body_ok_reads(),
+        0,
+        "no Class-A body pipeline read across prep+scripts+commit for coinbase batch"
+    );
     assert_eq!(q.tip_height(), Some(Height(4)));
     for (h, b) in &batch {
         assert!(

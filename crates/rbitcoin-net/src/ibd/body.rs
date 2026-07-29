@@ -74,11 +74,6 @@ impl BodyPresence {
         self.archive_charged.contains_key(h)
     }
 
-    /// Record that `h` was charged into the pipeline (first copy).
-    pub(crate) fn mark_archive_charged(&mut self, h: BlockHash) {
-        self.mark_archive_charged_bytes(h, 0);
-    }
-
     /// Record charge with wire byte size for later release.
     pub(crate) fn mark_archive_charged_bytes(&mut self, h: BlockHash, wire_bytes: usize) {
         if self.rejected.contains(&h) {
@@ -325,7 +320,7 @@ mod tests {
         body.mark_archived(h(10));
         body.mark_missing(h(11));
         body.mark_rejected(h(12));
-        body.mark_archive_charged(h(11));
+        body.mark_archive_charged_bytes(h(11), 0);
         body.hygiene_retain(|x| *x == h(10));
         assert!(body.is_known_archived(&h(10)));
         assert_eq!(body.skip_download_cached(&h(11)), None); // missing dropped
@@ -355,7 +350,7 @@ mod tests {
         let charge = h(7);
         body.mark_pending(charge);
         assert!(!body.is_archive_charged(&charge));
-        body.mark_archive_charged(charge);
+        body.mark_archive_charged_bytes(charge, 0);
         assert!(body.is_archive_charged(&charge));
         body.mark_missing(charge);
         assert!(
@@ -367,7 +362,7 @@ mod tests {
         assert!(!body.is_archive_charged(&charge));
 
         let done = h(8);
-        body.mark_archive_charged(done);
+        body.mark_archive_charged_bytes(done, 0);
         body.mark_pending(done);
         body.mark_archived(done);
         assert!(!body.is_archive_charged(&done));
@@ -379,7 +374,7 @@ mod tests {
         let mut body = BodyPresence::new();
         body.mark_pending(h(1));
         body.mark_pending(h(2));
-        body.mark_archive_charged(h(2));
+        body.mark_archive_charged_bytes(h(2), 0);
         // Zero age → everything older than 0 is stale immediately.
         let expired = body.expire_stale_pending(Duration::ZERO);
         assert_eq!(expired.len(), 2);
@@ -410,7 +405,7 @@ mod tests {
         let r = h(20);
         body.mark_rejected(r);
         body.mark_pending(r);
-        body.mark_archive_charged(r);
+        body.mark_archive_charged_bytes(r, 0);
         body.mark_missing(r);
         body.mark_archived(r);
         assert!(body.is_rejected(&r));

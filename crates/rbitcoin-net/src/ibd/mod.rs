@@ -32,7 +32,7 @@ mod state;
 mod status;
 
 use archive::{
-    rehydrate_block_queue_into_archive, spawn_archive_pipeline, ArchiveJob, ArchivePipelineStats,
+    rehydrate_block_queue_into_confirm, spawn_archive_pipeline, ArchiveJob, ArchivePipelineStats,
     ArchiveQueueBudget, ArchiveResult,
 };
 use assign_plan::{remove_from_ordered, want_headers_beyond_soft_cap};
@@ -394,21 +394,24 @@ pub async fn ibd_cancellable(
             warn!("ibd: archive sticky prewarm failed (continuing cold): {e}");
         }
     }
-    // Rehydrate durable block_queue → arch_job channel (restart without re-download).
-    match rehydrate_block_queue_into_archive(
+    // Dedicated confirm path — never blocks the network/archive event loop.
+    let confirm_feed = Arc::new(ConfirmFeed::new());
+    // Rehydrate durable block_queue → unified confirm wire feed (same pipeline).
+    match rehydrate_block_queue_into_confirm(
         hub.as_ref(),
         &mut st,
-        &arch_job_tx,
+        confirm_feed.as_ref(),
         &archive_queued,
     ) {
         Ok(n) if n > 0 => {
-            info!("ibd: rehydrated {n} durable block_queue entries into archive pipeline");
+            info!("ibd: rehydrated {n} durable block_queue entries into confirm wire feed");
         }
         Ok(_) => {}
         Err(e) => {
             warn!("ibd: block_queue rehydrate failed (continuing; may re-getdata): {e}");
         }
     }
+    // Archive pipeline retained for unknown-height / legacy fallback only.
     let mut pipeline = spawn_archive_pipeline(
         hub.clone(),
         arch_job_rx,
@@ -425,14 +428,9 @@ pub async fn ibd_cancellable(
     // Fresh cancel state for this IBD session (may have been set on prior stop).
     hub.query.clear_confirm_cancel();
 
-    // Load stage owns Class A + parent pin for each claimed batch.
     info!(
-        "ibd: confirm pipeline load+scripts+write (Class A load inline; \
-         parent pin for write annotate)"
+        "ibd: confirm pipeline prep+scripts+commit (wire intake; single Class A commit)"
     );
-
-    // Dedicated confirm path — never blocks the network/archive event loop.
-    let confirm_feed = Arc::new(ConfirmFeed::new());
     // Unbounded: SyncSender(512) deadlocked the confirm OS thread when the main
     // loop lagged on header drain (send blocks → tip frozen, hole=0, confirm_blks=0).
     let (confirm_ev_tx, confirm_ev_rx) = std::sync::mpsc::channel::<ConfirmEvent>();
@@ -491,7 +489,13 @@ pub async fn ibd_cancellable(
                     st.body.demote_known(hash);
                 }
                 ConfirmEvent::Reject { height, hash, err } => {
-                    apply_confirm_reject(&mut st, height, hash, &err);
+                    apply_confirm_reject(
+                        &mut st,
+                        height,
+                        hash,
+                        &err,
+                        Some(&archive_queued),
+                    );
                 }
             }
         }
@@ -600,7 +604,13 @@ pub async fn ibd_cancellable(
                     st.body.demote_known(hash);
                 }
                 ConfirmEvent::Reject { height, hash, err } => {
-                    apply_confirm_reject(&mut st, height, hash, &err);
+                    apply_confirm_reject(
+                        &mut st,
+                        height,
+                        hash,
+                        &err,
+                        Some(&archive_queued),
+                    );
                 }
             }
         }
@@ -1132,13 +1142,29 @@ pub async fn ibd_cancellable(
                         ConfirmEvent::Accepted { hash } => {
                             last_progress = Instant::now();
                             remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
+                            // Same release as main-loop drains (wire-path charge).
+                            if let Some(wb) = st.body.take_archive_charge_bytes(&hash) {
+                                archive_queued.release(wb);
+                            } else {
+                                st.body.clear_archive_charged(&hash);
+                            }
                             st.body.mark_archived(hash);
+                            let tip = hub.tip_height().unwrap_or(0);
+                            archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
+                            st.max_archived_height = st.max_archived_height.max(tip);
+                            max_archived_shared.store(st.max_archived_height, Ordering::Relaxed);
                         }
                         ConfirmEvent::BodyMissing { hash } => {
                             st.body.demote_known(hash);
                         }
                         ConfirmEvent::Reject { height, hash, err } => {
-                            apply_confirm_reject(&mut st, height, hash, &err);
+                            apply_confirm_reject(
+                                &mut st,
+                                height,
+                                hash,
+                                &err,
+                                Some(&archive_queued),
+                            );
                         }
                     }
                 }

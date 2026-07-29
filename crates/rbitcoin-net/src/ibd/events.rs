@@ -455,8 +455,21 @@ pub(crate) fn apply_peer_event(
                         .query
                         .block_queue_offer(height, raw, header_fk.0, &payload)
                     {
-                        Ok(Some(_)) => offered_disk = true,
-                        Ok(None) => offered_ram = true,
+                        Ok(offer) => {
+                            // RAM→disk spill: soft budget was for process-held
+                            // wire; release as soon as durable (not only on tip).
+                            for fh in &offer.flushed_to_disk {
+                                let h = BlockHash::from_byte_array(*fh);
+                                if let Some(wb) = st.body.take_archive_charge_bytes(&h) {
+                                    archive_queued.release(wb);
+                                }
+                            }
+                            if offer.disk_id.is_some() {
+                                offered_disk = true;
+                            } else {
+                                offered_ram = true;
+                            }
+                        }
                         Err(e) => {
                             // Real IO/corrupt only — BudgetFull is handled as RAM buffer.
                             rbitcoin_log::warn!(
@@ -664,6 +677,27 @@ fn release_confirm_archive_charge(
     }
 }
 
+/// Soft budget is for **process-held** wire only. When RAM pending spills to
+/// durable disk, drop those charges so densify can use free `bq` headroom.
+pub(crate) fn release_flushed_soft_charges(
+    st: &mut IbdWorkState,
+    archive_queued: Option<&ArchiveQueueBudget>,
+    flushed_hashes: &[[u8; 32]],
+) {
+    let Some(q) = archive_queued else {
+        for fh in flushed_hashes {
+            st.body.clear_archive_charged(&BlockHash::from_byte_array(*fh));
+        }
+        return;
+    };
+    for fh in flushed_hashes {
+        let h = BlockHash::from_byte_array(*fh);
+        if let Some(wb) = st.body.take_archive_charge_bytes(&h) {
+            q.release(wb);
+        }
+    }
+}
+
 pub(crate) fn apply_confirm_reject(
     st: &mut IbdWorkState,
     height: u32,
@@ -697,7 +731,9 @@ pub(crate) fn apply_confirm_reject(
         clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
         // Evict bad wire so claim_ready is false until a good body arrives.
         if let Some(q) = query {
-            let _ = q.block_queue_dequeue_height(height);
+            if let Ok((_n, flushed)) = q.block_queue_dequeue_height(height) {
+                release_flushed_soft_charges(st, archive_queued, &flushed);
+            }
         }
         st.body.mark_missing(hash);
         warn!(
@@ -708,7 +744,9 @@ pub(crate) fn apply_confirm_reject(
     // Wire path charged soft budget on receive — release before drop marker.
     release_confirm_archive_charge(st, &hash, archive_queued);
     if let Some(q) = query {
-        let _ = q.block_queue_dequeue_height(height);
+        if let Ok((_n, flushed)) = q.block_queue_dequeue_height(height) {
+            release_flushed_soft_charges(st, archive_queued, &flushed);
+        }
     }
     st.body.mark_rejected(hash);
     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
@@ -818,6 +856,38 @@ mod confirm_reject_tests {
             !st.body.is_rejected(&hash),
             "denserels layout miss must soft-reget, not permanent-blacklist tip+1"
         );
+    }
+
+    /// RAM→disk flush must drop soft charges (densify resume while bq has room).
+    #[test]
+    fn ram_flush_releases_soft_archive_charge() {
+        let budget = ArchiveQueueBudget::new(16 * 1024 * 1024);
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(50));
+        let h_ram = h(0xAA);
+        let wire = 100_000usize;
+        budget.charge(wire);
+        st.body.mark_archive_charged_bytes(h_ram, wire);
+        assert_eq!(budget.count(), 1);
+        assert!(budget.bytes() >= wire);
+        // Simulate spill: hash left process RAM for durable disk.
+        super::release_flushed_soft_charges(
+            &mut st,
+            Some(&budget),
+            &[h_ram.to_byte_array()],
+        );
+        assert_eq!(budget.count(), 0, "flush must release soft charge");
+        assert_eq!(budget.bytes(), 0);
+        assert!(
+            st.body.take_archive_charge_bytes(&h_ram).is_none(),
+            "marker consumed on flush"
+        );
+        // Idempotent: second flush of same hash is a no-op.
+        super::release_flushed_soft_charges(
+            &mut st,
+            Some(&budget),
+            &[h_ram.to_byte_array()],
+        );
+        assert_eq!(budget.count(), 0);
     }
 
     /// Wire-path soft budget charged on receive must release on script reject

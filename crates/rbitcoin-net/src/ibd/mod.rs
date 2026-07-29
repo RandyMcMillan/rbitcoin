@@ -34,6 +34,7 @@ use archive::{
 use assign_plan::{remove_from_ordered, want_headers_beyond_soft_cap};
 // compact_ordered used via IbdWorkState::hygiene
 use confirm::{offer_confirm_ready, spawn_confirm_engine, ConfirmEvent, ConfirmFeed};
+use events::release_flushed_soft_charges;
 use dial::{
     apply_dial_result, dial_batch, dial_blocked_addrs, disconnect_stalled_block_peers,
     expire_addr_cooldown, request_headers,
@@ -58,6 +59,7 @@ use status::LoopStats;
 use crate::chain::ChainHub;
 use crate::codec::MAX_HEADERS_RESULTS;
 use crate::error::NetError;
+use bitcoin::hashes::Hash;
 use bitcoin::p2p::Magic;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -507,6 +509,14 @@ pub async fn ibd_cancellable(
                         Some(hub.query.as_ref()),
                     );
                 }
+                ConfirmEvent::RamFlushed { hashes } => {
+                    let raw: Vec<[u8; 32]> = hashes.iter().map(|h| h.to_byte_array()).collect();
+                    release_flushed_soft_charges(
+                        &mut st,
+                        Some(archive_queued.as_ref()),
+                        &raw,
+                    );
+                }
             }
         }
 
@@ -622,6 +632,14 @@ pub async fn ibd_cancellable(
                         &err,
                         Some(&archive_queued),
                         Some(hub.query.as_ref()),
+                    );
+                }
+                ConfirmEvent::RamFlushed { hashes } => {
+                    let raw: Vec<[u8; 32]> = hashes.iter().map(|h| h.to_byte_array()).collect();
+                    release_flushed_soft_charges(
+                        &mut st,
+                        Some(archive_queued.as_ref()),
+                        &raw,
                     );
                 }
             }
@@ -1208,6 +1226,15 @@ pub async fn ibd_cancellable(
                                 &err,
                                 Some(&archive_queued),
                                 Some(hub.query.as_ref()),
+                            );
+                        }
+                        ConfirmEvent::RamFlushed { hashes } => {
+                            let raw: Vec<[u8; 32]> =
+                                hashes.iter().map(|h| h.to_byte_array()).collect();
+                            release_flushed_soft_charges(
+                                &mut st,
+                                Some(archive_queued.as_ref()),
+                                &raw,
                             );
                         }
                     }

@@ -225,7 +225,7 @@ mod tests {
         assert_eq!(all[0].height, 42);
         assert_eq!(all[0].payload, payload);
         // Confirm-write hook: dequeue by height.
-        assert_eq!(q2.block_queue_dequeue_height(42).unwrap(), 1);
+        assert_eq!(q2.block_queue_dequeue_height(42).unwrap().0, 1);
         assert_eq!(q2.block_queue_stats().2, 0);
         drop(q2);
         let q3 = Query::open_or_create(dir.join("store")).unwrap();
@@ -241,22 +241,19 @@ mod tests {
         q.block_queue_force_budget_for_test(64);
         let p1 = vec![1u8; 40];
         let p2 = vec![2u8; 40];
-        assert_eq!(
-            q.block_queue_offer(1, [1u8; 32], 1, &p1).unwrap(),
-            Some(1),
-            "first fits on disk"
-        );
+        let o1 = q.block_queue_offer(1, [1u8; 32], 1, &p1).unwrap();
+        assert!(o1.disk_id.is_some(), "first fits on disk");
+        assert!(o1.flushed_to_disk.is_empty());
         assert_eq!(q.block_queue_stats().2, 1);
-        assert_eq!(
-            q.block_queue_offer(2, [2u8; 32], 2, &p2).unwrap(),
-            None,
-            "second held in RAM, not error"
-        );
+        let o2 = q.block_queue_offer(2, [2u8; 32], 2, &p2).unwrap();
+        assert!(o2.disk_id.is_none(), "second held in RAM, not error");
         assert_eq!(q.block_queue_pending_len(), 1);
         assert_eq!(q.block_queue_stats().2, 1, "disk count unchanged");
         assert!(!q.block_queue_can_request(), "effective fill ≥ budget");
-        // Free disk → flush pending.
-        assert_eq!(q.block_queue_dequeue_height(1).unwrap(), 1);
+        // Free disk → flush pending; report flushed hash for soft-charge release.
+        let (n, flushed) = q.block_queue_dequeue_height(1).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(flushed, vec![[2u8; 32]], "RAM h2 spilled to disk");
         assert_eq!(q.block_queue_pending_len(), 0, "flushed after dequeue");
         assert_eq!(q.block_queue_stats().2, 1, "h2 now on disk");
         let all = q.block_queue_load_all().unwrap();
@@ -281,11 +278,8 @@ mod tests {
 
         q.block_queue_force_budget_for_test(32);
         let ram = vec![9u8; 40];
-        assert_eq!(
-            q.block_queue_offer(11, [0xBBu8; 32], 2, &ram).unwrap(),
-            None,
-            "held in RAM pending"
-        );
+        let o = q.block_queue_offer(11, [0xBBu8; 32], 2, &ram).unwrap();
+        assert!(o.disk_id.is_none(), "held in RAM pending");
         assert_eq!(
             q.block_queue_payload(11).unwrap().as_deref(),
             Some(ram.as_slice())

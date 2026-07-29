@@ -952,7 +952,7 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
         let hash = BlockHash::from_byte_array(qb.hash);
         // Already confirmed tip → drop queue entry.
         if hub.has_block(&hash) || st.body.is_known_archived(&hash) {
-            let _ = hub.query.block_queue_dequeue_height(qb.height);
+            let _ = hub.query.block_queue_dequeue_height(qb.height); // ignore flush list at rehydrate
             dropped_done = dropped_done.saturating_add(1);
             continue;
         }

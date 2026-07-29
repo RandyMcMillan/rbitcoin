@@ -838,6 +838,19 @@ impl Query {
     }
 }
 
+/// Outcome of [`Query::block_queue_offer`].
+///
+/// Soft wire budget (IBD `archive_queued`) must **release** charges for
+/// [`Self::flushed_to_disk`] — those bodies are no longer in process RAM.
+/// Charge only while `disk_id` is `None` (still in RAM pending).
+#[derive(Debug, Clone)]
+pub struct BlockQueueOffer {
+    /// `Some(rec_id)` when **this** body is on durable disk; `None` = RAM pending.
+    pub disk_id: Option<u64>,
+    /// Prior RAM-pending bodies spilled to disk during this call.
+    pub flushed_to_disk: Vec<[u8; 32]>,
+}
+
 impl Query {
     /// True if this outpoint is spent on the **best chain** (durable confirmed-strong).
     ///
@@ -964,16 +977,18 @@ impl Query {
     /// capacity full is **not** an error — do not spam-log it. Real IO errors
     /// still return `Err`.
     ///
-    /// Returns `Ok(Some(id))` when written to disk, `Ok(None)` when held in RAM.
+    /// Soft wire budget (IBD `archive_queued`) must **release** charges for
+    /// [`BlockQueueOffer::flushed_to_disk`] — those bodies are no longer in
+    /// process RAM. Charge only while `disk_id` is `None` (still in RAM).
     pub fn block_queue_offer(
         &self,
         height: u32,
         hash: [u8; 32],
         header_fk: u64,
         payload: &[u8],
-    ) -> Result<Option<u64>, QueryError> {
+    ) -> Result<BlockQueueOffer, QueryError> {
         // Free as much disk as possible before deciding.
-        self.block_queue_flush_pending()?;
+        let flushed_to_disk = self.block_queue_flush_pending()?;
         // Lock order: block_queue then pending.
         let mut g = self.block_queue.lock().unwrap();
         if g.can_enqueue(payload.len()) {
@@ -985,7 +1000,10 @@ impl Query {
             };
             drop(g);
             self.store_block_queue_pressure(fill);
-            return Ok(Some(id));
+            return Ok(BlockQueueOffer {
+                disk_id: Some(id),
+                flushed_to_disk,
+            });
         }
         // Budget full: hold payload in RAM; assign stops new getdata via can_request.
         {
@@ -1005,7 +1023,10 @@ impl Query {
             drop(g);
             self.store_block_queue_pressure(fill);
         }
-        Ok(None)
+        Ok(BlockQueueOffer {
+            disk_id: None,
+            flushed_to_disk,
+        })
     }
 
     /// Direct disk enqueue (tests / tools). Prefer [`Self::block_queue_offer`] on IBD.
@@ -1022,9 +1043,11 @@ impl Query {
 
     /// Drain RAM overflow into durable queue while capacity allows.
     ///
+    /// Returns hashes that left RAM (caller must release soft wire charges).
+    ///
     /// Lock order: `block_queue` then `block_queue_pending` (never reverse).
-    pub fn block_queue_flush_pending(&self) -> Result<usize, QueryError> {
-        let mut flushed = 0usize;
+    pub fn block_queue_flush_pending(&self) -> Result<Vec<[u8; 32]>, QueryError> {
+        let mut flushed_hashes = Vec::new();
         let mut g = self.block_queue.lock().unwrap();
         loop {
             let item = {
@@ -1041,9 +1064,9 @@ impl Query {
                 break;
             };
             g.enqueue(item.height, item.hash, item.header_fk, &item.payload)?;
-            flushed += 1;
+            flushed_hashes.push(item.hash);
         }
-        if flushed > 0 {
+        if !flushed_hashes.is_empty() {
             let fill = {
                 let pend = self.block_queue_pending.lock().unwrap();
                 let pb: u64 = pend.iter().map(|p| p.payload.len() as u64).sum();
@@ -1052,7 +1075,7 @@ impl Query {
             drop(g);
             self.store_block_queue_pressure(fill);
         }
-        Ok(flushed)
+        Ok(flushed_hashes)
     }
 
     fn store_block_queue_pressure(&self, fill: f64) {
@@ -1064,13 +1087,19 @@ impl Query {
 
     /// Remove durable queue entry after combined confirm-write (or permanent drop).
     /// Then flush any RAM overflow into freed capacity.
-    pub fn block_queue_dequeue_height(&self, height: u32) -> Result<usize, QueryError> {
+    ///
+    /// Returns `(removed_count, hashes_flushed_from_ram)` — soft charges for
+    /// flushed hashes should be released (payload no longer in process RAM).
+    pub fn block_queue_dequeue_height(
+        &self,
+        height: u32,
+    ) -> Result<(usize, Vec<[u8; 32]>), QueryError> {
         let n = {
             let mut g = self.block_queue.lock().unwrap();
             g.dequeue_height(height)?
         };
-        let _ = self.block_queue_flush_pending()?;
-        Ok(n)
+        let flushed = self.block_queue_flush_pending()?;
+        Ok((n, flushed))
     }
 
     /// Load all durable queued blocks (IBD restart replay). Disk only (not RAM pending).

@@ -2203,6 +2203,115 @@ fn unified_wire_pipeline_multi_block_to_tip() {
     }
 }
 
+/// Wire pin must hit CreateResidency denserels for a parent already pinned by a
+/// prior batch (no second Class A denserels body fetch). Steady-state IBD prep
+/// residual was almost all cold denserels IO.
+#[test]
+fn wire_prep_residency_pin_avoids_second_denserels_io() {
+    use rbitcoin_consensus::{
+        confirm_scripts_phase, confirm_wire_prep_phase, confirm_write_phase, ChainParams,
+        Milestone, ScriptPreverified,
+    };
+    use rbitcoin_query::{body_ok_reads, reset_body_ok_reads};
+    use rbitcoin_test::mine::split_anyone_can_spend;
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.enter_direct_index_mode().unwrap();
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+    let cb1 = b1.txdata[0].compute_txid();
+    rbitcoin_consensus::confirm_wire_run(&q, &params, ms, &[(Height(1), b1.clone())]).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+    for h in 2..=maturity {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        rbitcoin_consensus::confirm_wire_run(&q, &params, ms, &[(Height(h), b.clone())]).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+
+    // Split coinbase into two vouts so two later blocks spend the same parent create.
+    let h_split = maturity + 1;
+    let split = split_anyone_can_spend(
+        cb1,
+        0,
+        &[
+            Amount::from_sat(25_0000_0000),
+            Amount::from_sat(24_0000_0000),
+        ],
+    );
+    let b_split = mine_regtest_block(tip, tip_time + 600, h_split, vec![split]);
+    let parent_txid = b_split.txdata[1].compute_txid();
+    rbitcoin_consensus::confirm_wire_run(
+        &q,
+        &params,
+        ms,
+        &[(Height(h_split), b_split.clone())],
+    )
+    .unwrap();
+    tip = b_split.block_hash();
+    tip_time = b_split.header.time;
+
+    let h_a = maturity + 2;
+    let spend_a = spend_anyone_can_spend(parent_txid, 0, Amount::from_sat(24_0000_0000));
+    let ba = mine_regtest_block(tip, tip_time + 600, h_a, vec![spend_a]);
+    let h_b = maturity + 3;
+    let spend_b = spend_anyone_can_spend(parent_txid, 1, Amount::from_sat(23_0000_0000));
+    let bb = mine_regtest_block(ba.block_hash(), tip_time + 1200, h_b, vec![spend_b]);
+
+    // Prep+write A: cold denserels pin of parent seeds residency.
+    reset_body_ok_reads();
+    let mat_a = confirm_wire_prep_phase(
+        &q,
+        &params,
+        ms,
+        &[(Height(h_a), ba.clone())],
+        &ScriptPreverified::new(),
+    )
+    .expect("prep A");
+    let reads_a = body_ok_reads();
+    assert!(reads_a >= 1, "prep A must denserels-IO parent once, got {reads_a}");
+    let parent_fk = q
+        .store()
+        .get_fk_by_txid(parent_txid.as_byte_array())
+        .unwrap()
+        .expect("parent head");
+    assert!(
+        q.create_residency().get_outs(parent_fk).is_some(),
+        "cold pin must seed residency outs+denserels"
+    );
+    let ok_a = confirm_scripts_phase(mat_a.batch).expect("scripts A");
+    confirm_write_phase(&q, &params, ms, ok_a.batch).expect("write A");
+
+    // Prep B: same parent create, other vout — residency hit, no denserels re-fetch.
+    reset_body_ok_reads();
+    let mat_b = confirm_wire_prep_phase(
+        &q,
+        &params,
+        ms,
+        &[(Height(h_b), bb.clone())],
+        &ScriptPreverified::new(),
+    )
+    .expect("prep B");
+    let reads_b = body_ok_reads();
+    assert_eq!(
+        reads_b, 0,
+        "prep B must pin parent from residency (no denserels body IO), got body_ok_reads={reads_b}"
+    );
+    let ok_b = confirm_scripts_phase(mat_b.batch).expect("scripts B");
+    confirm_write_phase(&q, &params, ms, ok_b.batch).expect("write B");
+    assert_eq!(q.tip_height(), Some(Height(h_b)));
+}
+
 /// Already-archived Class A (plan=None): wire prep must still pin denserels for
 /// same-batch creates. Regression: after write committed Class A then failed
 /// annotate, re-prep had empty plan and spend annotate missed denserels/abs
@@ -2331,8 +2440,8 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
         path_lo: ha,
         parent_hash: None,
         next_tx_start: q.tx_body_count().saturating_add(1).max(1),
-        in_flight_creates: HashMap::new(),
-        in_flight_outs: HashMap::new(),
+        in_flight_creates: std::sync::Arc::new(HashMap::new()),
+        in_flight_outs: std::sync::Arc::new(HashMap::new()),
     };
     let mat_a = confirm_wire_prep_phase_pipelined(
         &q,
@@ -2346,10 +2455,14 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
     assert_eq!(q.tip_height(), Some(Height(maturity)), "prep must not tip");
 
     let plan_a = mat_a.batch.archive_plan.as_ref().expect("plan A");
-    for ((tx, _ins, outs), fk) in plan_a.packed.iter().zip(plan_a.planned_fks.iter()) {
-        pipe.in_flight_creates.insert(tx.txid, *fk);
-        if let Some(id) = fk.get() {
-            pipe.in_flight_outs.insert(id, (tx.clone(), outs.clone()));
+    {
+        let creates = std::sync::Arc::make_mut(&mut pipe.in_flight_creates);
+        let outs = std::sync::Arc::make_mut(&mut pipe.in_flight_outs);
+        for ((tx, _ins, o), fk) in plan_a.packed.iter().zip(plan_a.planned_fks.iter()) {
+            creates.insert(tx.txid, *fk);
+            if let Some(id) = fk.get() {
+                outs.insert(id, (tx.clone(), o.clone()));
+            }
         }
     }
     if let Some(last) = plan_a.planned_fks.last().and_then(|f| f.get()) {

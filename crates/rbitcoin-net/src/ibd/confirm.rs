@@ -14,10 +14,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Prep-thread state so prep(N+1) can plan while commit(N) has not advanced tip.
+///
+/// In-flight maps are `Arc` so each claim only bumps refcounts (no deep clone).
 struct PrepAheadState {
     next_tx_start: u64,
-    in_flight_creates: HashMap<[u8; 32], Fk>,
-    in_flight_outs: HashMap<u64, (rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>)>,
+    in_flight_creates: std::sync::Arc<HashMap<[u8; 32], Fk>>,
+    in_flight_outs:
+        std::sync::Arc<HashMap<u64, (rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>)>>,
     /// Last height successfully prepped (still in pipeline or already committed).
     last_prepped: Option<(u32, [u8; 32])>,
 }
@@ -27,8 +30,8 @@ impl PrepAheadState {
         let next = hub.query.tx_body_count().saturating_add(1).max(1);
         Self {
             next_tx_start: next,
-            in_flight_creates: HashMap::new(),
-            in_flight_outs: HashMap::new(),
+            in_flight_creates: std::sync::Arc::new(HashMap::new()),
+            in_flight_outs: std::sync::Arc::new(HashMap::new()),
             last_prepped: None,
         }
     }
@@ -36,9 +39,10 @@ impl PrepAheadState {
     /// Drop creates already durable in Class A (after commits).
     fn prune_committed(&mut self, hub: &ChainHub) {
         let durable = hub.query.tx_body_count();
-        self.in_flight_creates
-            .retain(|_, fk| fk.get().map(|id| id > durable).unwrap_or(false));
-        self.in_flight_outs.retain(|id, _| *id > durable);
+        let creates = std::sync::Arc::make_mut(&mut self.in_flight_creates);
+        creates.retain(|_, fk| fk.get().map(|id| id > durable).unwrap_or(false));
+        let outs = std::sync::Arc::make_mut(&mut self.in_flight_outs);
+        outs.retain(|id, _| *id > durable);
         self.next_tx_start = self.next_tx_start.max(durable.saturating_add(1).max(1));
         if let Some((h, _)) = self.last_prepped {
             let tip = hub.tip_height().unwrap_or(0);
@@ -60,8 +64,8 @@ impl PrepAheadState {
             path_lo,
             parent_hash,
             next_tx_start: self.next_tx_start,
-            in_flight_creates: self.in_flight_creates.clone(),
-            in_flight_outs: self.in_flight_outs.clone(),
+            in_flight_creates: std::sync::Arc::clone(&self.in_flight_creates),
+            in_flight_outs: std::sync::Arc::clone(&self.in_flight_outs),
         }
     }
 
@@ -71,10 +75,12 @@ impl PrepAheadState {
         last_height: u32,
         last_hash: [u8; 32],
     ) {
-        for ((tx, _ins, outs), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
-            self.in_flight_creates.insert(tx.txid, *fk);
+        let creates = std::sync::Arc::make_mut(&mut self.in_flight_creates);
+        let outs = std::sync::Arc::make_mut(&mut self.in_flight_outs);
+        for ((tx, _ins, o), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
+            creates.insert(tx.txid, *fk);
             if let Some(id) = fk.get() {
-                self.in_flight_outs.insert(id, (tx.clone(), outs.clone()));
+                outs.insert(id, (tx.clone(), o.clone()));
             }
         }
         if let Some(last) = plan.planned_fks.last().and_then(|f| f.get()) {
@@ -84,8 +90,8 @@ impl PrepAheadState {
     }
 
     fn clear_all(&mut self, hub: &ChainHub) {
-        self.in_flight_creates.clear();
-        self.in_flight_outs.clear();
+        self.in_flight_creates = std::sync::Arc::new(HashMap::new());
+        self.in_flight_outs = std::sync::Arc::new(HashMap::new());
         self.last_prepped = None;
         self.next_tx_start = hub.query.tx_body_count().saturating_add(1).max(1);
     }

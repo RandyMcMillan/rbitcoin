@@ -889,8 +889,8 @@ mod tests {
             path_lo: 1,
             parent_hash: None,
             next_tx_start: hub.query.tx_body_count().saturating_add(1).max(1),
-            in_flight_creates: HashMap::new(),
-            in_flight_outs: HashMap::new(),
+            in_flight_creates: std::sync::Arc::new(HashMap::new()),
+            in_flight_outs: std::sync::Arc::new(HashMap::new()),
         };
         let mat1 = hub
             .confirm_wire_prep_phase_pipelined(&batch1, Some(&pipe))
@@ -902,10 +902,14 @@ mod tests {
 
         // Update pipeline caches from plan (prep-thread note_plan_ok).
         let plan = mat1.batch.archive_plan.as_ref().unwrap();
-        for ((tx, _ins, outs), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
-            pipe.in_flight_creates.insert(tx.txid, *fk);
-            if let Some(id) = fk.get() {
-                pipe.in_flight_outs.insert(id, (tx.clone(), outs.clone()));
+        {
+            let creates = std::sync::Arc::make_mut(&mut pipe.in_flight_creates);
+            let outs = std::sync::Arc::make_mut(&mut pipe.in_flight_outs);
+            for ((tx, _ins, o), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
+                creates.insert(tx.txid, *fk);
+                if let Some(id) = fk.get() {
+                    outs.insert(id, (tx.clone(), o.clone()));
+                }
             }
         }
         if let Some(last) = plan.planned_fks.last().and_then(|f| f.get()) {

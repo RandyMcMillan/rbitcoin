@@ -85,15 +85,17 @@ pub struct WirePrepPipeline {
     pub parent_hash: Option<[u8; 32]>,
     /// Inclusive create-fk start for [`Query::archive_plan_mega_from`].
     pub next_tx_start: u64,
-    /// Prior uncommitted plans: create txid → fk.
-    pub in_flight_creates: HashMap<[u8; 32], rbitcoin_primitives::Fk>,
+    /// Prior uncommitted plans: create txid → fk (shared; clone is Arc bump only).
+    pub in_flight_creates: std::sync::Arc<HashMap<[u8; 32], rbitcoin_primitives::Fk>>,
     /// Prior uncommitted plans: create fk id → (tx meta, outs) for parent pin.
-    pub in_flight_outs: HashMap<
-        u64,
-        (
-            rbitcoin_store::TxRecord,
-            Vec<rbitcoin_store::OutputRecord>,
-        ),
+    pub in_flight_outs: std::sync::Arc<
+        HashMap<
+            u64,
+            (
+                rbitcoin_store::TxRecord,
+                Vec<rbitcoin_store::OutputRecord>,
+            ),
+        >,
     >,
 }
 
@@ -416,7 +418,11 @@ pub fn confirm_wire_prep_phase_pipelined(
     } else {
         let plan = match pipeline {
             Some(p) => query
-                .archive_plan_mega_from(&mut need, p.next_tx_start.max(1), &p.in_flight_creates)
+                .archive_plan_mega_from(
+                    &mut need,
+                    p.next_tx_start.max(1),
+                    p.in_flight_creates.as_ref(),
+                )
                 .map_err(ConsensusError::Store)?,
             None => query
                 .archive_plan_mega_owned(&mut need)
@@ -467,7 +473,7 @@ pub fn confirm_wire_prep_phase_pipelined(
         Some(plan)
     };
 
-    let inflight_outs = pipeline.map(|p| &p.in_flight_outs);
+    let inflight_outs = pipeline.map(|p| p.in_flight_outs.as_ref());
     let (batch_parents, batch_thin) =
         pin_for_wire_batch(query, plan.as_ref(), &metas, &wire_blocks, inflight_outs)?;
 
@@ -524,7 +530,7 @@ pub fn confirm_wire_run_preverified(
 }
 
 /// Pin parents for wire prep: same-batch from plan outs; prior pipeline plans;
-/// external via denserels IO once.
+/// CreateResidency denserels hit; external denserels IO only on miss.
 fn pin_for_wire_batch(
     query: &Query,
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,
@@ -534,9 +540,12 @@ fn pin_for_wire_batch(
         &HashMap<u64, (rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>)>,
     >,
 ) -> Result<(rbitcoin_query::BatchParents, rbitcoin_query::BatchThin), ConsensusError> {
+    use rbitcoin_query::confirm_load_stats;
     use rbitcoin_query::ThinInput;
     use rbitcoin_store::IdxBodyMode;
+    use std::sync::atomic::Ordering;
 
+    let t_pin = Instant::now();
     let mut batch_thin: rbitcoin_query::BatchThin = std::collections::HashMap::new();
     let mut parent_vouts: HashMap<u64, Vec<u32>> = HashMap::new();
     let mut batch_create: HashSet<u64> = HashSet::new();
@@ -648,6 +657,7 @@ fn pin_for_wire_batch(
     // Already-archived batch creates (plan=None): not in planned_outs — still
     // need denserels for same-batch spends. Collect for store load below.
     let mut still_need: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut n_plan_pin = 0u64;
     for id in &batch_create {
         if let Some((tx, outs)) = planned_outs.get(id) {
             let checked: Vec<u32> = (0..outs.len() as u32).collect();
@@ -669,6 +679,7 @@ fn pin_for_wire_batch(
                 None,
                 Vec::new(),
             );
+            n_plan_pin = n_plan_pin.saturating_add(1);
         } else {
             // Durable Class A create (re-prep after partial commit / need empty).
             still_need.insert(*id, Vec::new());
@@ -705,6 +716,7 @@ fn pin_for_wire_batch(
                 None,
                 Vec::new(),
             );
+            n_plan_pin = n_plan_pin.saturating_add(1);
         } else {
             still_need
                 .entry(*id)
@@ -713,56 +725,128 @@ fn pin_for_wire_batch(
         }
     }
 
+    // CreateResidency denserels hit (same map archived load seeds) before Class A IO.
+    let mut n_res_hit = 0u64;
+    let mut n_cold = 0u64;
     if !still_need.is_empty() {
-        let fks: Vec<rbitcoin_primitives::Fk> = still_need
-            .keys()
-            .map(|id| rbitcoin_primitives::Fk(*id))
-            .collect();
-        let loaded = rbitcoin_query::load_creates_once(
-            query.store(),
-            query.create_residency(),
-            &fks,
-            IdxBodyMode::OutsDenserels,
-        )
-        .map_err(ConsensusError::Store)?;
-        for c in loaded {
-            let Some(id) = c.fk.get() else { continue };
-            let need = still_need.get(&id).cloned().unwrap_or_default();
-            let Ok((tx, outs, dense_rels)) =
-                rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
-                    &c.raw,
-                    Some(query.store().txs.store_secret()),
-                )
-            else {
-                continue;
-            };
-            let mut need = need;
+        let mut cold: HashMap<u64, Vec<u32>> = HashMap::new();
+        for (id, need) in &still_need {
+            let mut need = need.clone();
             need.sort_unstable();
             need.dedup();
-            // Empty need = full create (already-archived batch create).
-            if need.is_empty() {
-                need = (0..outs.len() as u32).collect();
+            let fk = rbitcoin_primitives::Fk(*id);
+            if let Some((tx, outs, dense_rels, body_range)) = query.create_residency().get_outs(fk)
+            {
+                if need.is_empty() {
+                    need = (0..outs.len() as u32).collect();
+                }
+                let sparse = rbitcoin_query::sparse_spender_rels(&dense_rels, &need);
+                if !dense_rels.is_empty()
+                    && rbitcoin_query::layout_covers_need(body_range, &sparse, &need)
+                {
+                    let live: Vec<(u32, rbitcoin_store::OutputRecord)> = need
+                        .iter()
+                        .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
+                        .collect();
+                    let cb = if tx.input_count != 1 {
+                        Some(false)
+                    } else {
+                        None
+                    };
+                    batch_parents.insert_owned(fk, tx, live, need, cb, body_range, sparse);
+                    n_res_hit = n_res_hit.saturating_add(1);
+                    continue;
+                }
             }
-            let live: Vec<(u32, rbitcoin_store::OutputRecord)> = need
-                .iter()
-                .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
-                .collect();
-            let sparse = rbitcoin_query::sparse_spender_rels(&dense_rels, &need);
-            let cb = if tx.input_count != 1 {
-                Some(false)
-            } else {
-                None
-            };
-            batch_parents.insert_owned(
-                c.fk,
-                tx,
-                live,
-                need,
-                cb,
-                Some(c.body_range),
-                sparse,
-            );
+            cold.insert(*id, need);
         }
+        if !cold.is_empty() {
+            let t_io = Instant::now();
+            let fks: Vec<rbitcoin_primitives::Fk> = cold
+                .keys()
+                .map(|id| rbitcoin_primitives::Fk(*id))
+                .collect();
+            n_cold = fks.len() as u64;
+            let loaded = rbitcoin_query::load_creates_once(
+                query.store(),
+                query.create_residency(),
+                &fks,
+                IdxBodyMode::OutsDenserels,
+            )
+            .map_err(ConsensusError::Store)?;
+            for c in loaded {
+                let Some(id) = c.fk.get() else { continue };
+                let need = cold.get(&id).cloned().unwrap_or_default();
+                let Ok((tx, outs, dense_rels)) =
+                    rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
+                        &c.raw,
+                        Some(query.store().txs.store_secret()),
+                    )
+                else {
+                    continue;
+                };
+                let mut need = need;
+                need.sort_unstable();
+                need.dedup();
+                // Empty need = full create (already-archived batch create).
+                if need.is_empty() {
+                    need = (0..outs.len() as u32).collect();
+                }
+                let live: Vec<(u32, rbitcoin_store::OutputRecord)> = need
+                    .iter()
+                    .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
+                    .collect();
+                let sparse = rbitcoin_query::sparse_spender_rels(&dense_rels, &need);
+                let cb = if tx.input_count != 1 {
+                    Some(false)
+                } else {
+                    None
+                };
+                batch_parents.insert_owned(
+                    c.fk,
+                    tx,
+                    live,
+                    need,
+                    cb,
+                    Some(c.body_range),
+                    sparse,
+                );
+            }
+            let io_ns = t_io.elapsed().as_nanos() as u64;
+            if io_ns > 0 {
+                confirm_load_stats::PIN_NEW_META_NS.fetch_add(io_ns, Ordering::Relaxed);
+            }
+            confirm_load_stats::BODY_TX_READS.fetch_add(n_cold, Ordering::Relaxed);
+            confirm_load_stats::FULL_TX_READS.fetch_add(n_cold, Ordering::Relaxed);
+        }
+    }
+
+    // Surface wire pin mix on the same counters as archived load (perf pin_hit%).
+    let n_unique = parent_vouts.len() as u64;
+    if n_unique > 0 {
+        confirm_load_stats::PARENT_UNIQUE.fetch_add(n_unique, Ordering::Relaxed);
+        confirm_load_stats::UTXO_PARENTS.fetch_add(n_unique, Ordering::Relaxed);
+    }
+    if n_plan_pin > 0 {
+        // Plan / in-flight outs: no Class A re-read (same class as pin_cache).
+        confirm_load_stats::PIN_CACHE_BODY.fetch_add(n_plan_pin, Ordering::Relaxed);
+    }
+    if n_res_hit > 0 {
+        confirm_load_stats::PIN_RESIDENCY.fetch_add(n_res_hit, Ordering::Relaxed);
+        confirm_load_stats::PIN_CACHE_BODY.fetch_add(n_res_hit, Ordering::Relaxed);
+        confirm_load_stats::PARENT_CACHE_HITS.fetch_add(n_res_hit, Ordering::Relaxed);
+    }
+    if n_cold > 0 {
+        confirm_load_stats::PIN_NEW.fetch_add(n_cold, Ordering::Relaxed);
+    }
+    let pin_ns = t_pin.elapsed().as_nanos() as u64;
+    if pin_ns > 0 {
+        confirm_load_stats::PARENT_PIN_NS.fetch_add(pin_ns, Ordering::Relaxed);
+        confirm_load_stats::PIN_BODY_NS.fetch_add(pin_ns, Ordering::Relaxed);
+    }
+    let n_blks = metas.len() as u64;
+    if n_blks > 0 {
+        confirm_load_stats::BLOCKS.fetch_add(n_blks, Ordering::Relaxed);
     }
 
     Ok((batch_parents, batch_thin))

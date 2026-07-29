@@ -159,36 +159,46 @@ pub(crate) fn apply_peer_event(
         PeerEvent::Headers { peer, headers } => {
             let batch_len = headers.len();
             let mut added = 0usize;
+            // Sequential height walk: after tip drains `ordered` + hygiene, mid-batch
+            // parents are often only known via the previous header in this message.
+            let mut batch_prev: Option<(BlockHash, u32)> = None;
             for hdr in headers {
                 let hash = hdr.block_hash();
+                let prev = hdr.prev_blockhash;
                 // Multi-peer overlap re-sends the same 2000-header windows. Full
                 // ensure_header_fk (hash-head lookup + maybe put) on every repeat
                 // made drain cost climb from ~µs to ~ms per event and froze the
                 // main loop for tens of seconds with no status lines.
-                if st.known_headers.contains(&hash) && st.header_fks.contains_key(&hash) {
-                    if let Some(h) = parent_height(&st.hash_height, hub, hdr.prev_blockhash) {
-                        if !st.hash_height.contains_key(&hash) {
-                            st.record_height(hash, h);
+                let already_known =
+                    st.known_headers.contains(&hash) && st.header_fks.contains_key(&hash);
+                let height = parent_height(&st.hash_height, hub, prev).or_else(|| {
+                    batch_prev.and_then(|(ph, pht)| {
+                        if ph == prev {
+                            Some(pht.saturating_add(1))
+                        } else {
+                            None
                         }
-                        st.max_ordered_height = st.max_ordered_height.max(h);
-                    }
-                    continue;
-                }
-                let prev = hdr.prev_blockhash;
-                if let Some(h) = parent_height(&st.hash_height, hub, prev) {
+                    })
+                });
+                if let Some(h) = height {
                     if !st.hash_height.contains_key(&hash) {
                         st.record_height(hash, h);
                     }
                     st.max_peer_height = st.max_peer_height.max(h);
                     st.max_ordered_height = st.max_ordered_height.max(h);
+                    batch_prev = Some((hash, h));
                 }
-                // Persist header row once and cache fk — Block path must not re-hit store.
-                if !st.header_fks.contains_key(&hash) {
-                    if let Ok(fk) = hub.ensure_header_fk(&hdr) {
-                        st.header_fks.insert(hash, fk);
+                if !already_known {
+                    // Persist header row once and cache fk — Block path must not re-hit store.
+                    if !st.header_fks.contains_key(&hash) {
+                        if let Ok(fk) = hub.ensure_header_fk(&hdr) {
+                            st.header_fks.insert(hash, fk);
+                        }
                     }
                 }
                 if hub.has_block(&hash) {
+                    // Still record height (above) so the next header in the batch can
+                    // chain parent_height after hygiene wiped hash_height of past tip.
                     st.known_headers.insert(hash);
                     continue;
                 }
@@ -209,6 +219,10 @@ pub(crate) fn apply_peer_event(
                 if !st.hash_height.contains_key(&hash) {
                     continue;
                 }
+                // Re-admit even when already known: tip drain + hygiene empty
+                // `ordered` while peers re-serve the same window; early-return without
+                // this froze mainnet at tip=292000 (ordered=0, known_hdr=4000, hole=0,
+                // bq=0, hard path reset every 180s).
                 if st.ordered.len() >= MAX_ORDERED_HEADERS {
                     continue;
                 }
@@ -1690,6 +1704,130 @@ mod confirm_reject_tests {
         );
         assert!(hub.query.block_queue_has_height(1));
         assert_eq!(feed.size_snap().0, 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Regression: tip drain empties `ordered` while headers stay in
+    /// `known_headers`. Re-delivered Headers must re-admit to ordered (mainnet
+    /// tip=292000 freeze: ordered=0, known_hdr=4000, hole=0, bq=0).
+    #[test]
+    fn known_headers_re_admit_to_ordered_after_tip_drain() {
+        use super::apply_peer_event;
+        use super::super::archive::ArchiveQueueBudget;
+        use super::super::peer_io::{PeerEvent, PeerSlot};
+        use crate::seeds::AddrMan;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::hashes::Hash;
+        use bitcoin::{BlockHash, CompactTarget};
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_query::Query;
+        use std::collections::HashSet;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::atomic::{AtomicU32, AtomicU64};
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        fn dummy_slot(id: usize) -> PeerSlot {
+            let (cmd_tx, _rx) = mpsc::unbounded_channel();
+            let task = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .spawn(async {});
+            PeerSlot {
+                id,
+                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 18444),
+                cmd_tx,
+                in_flight: HashSet::new(),
+                block_progress_ms: Arc::new(AtomicU64::new(0)),
+                peer_height: 5,
+                connected_ms: 1,
+                first_data_ms: AtomicU64::new(0),
+                bytes_rx: AtomicU64::new(0),
+                alive: true,
+                task,
+            }
+        }
+        fn dummy_header(prev: BlockHash, n: u32) -> Header {
+            Header {
+                version: Version::ONE,
+                prev_blockhash: prev,
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([n as u8; 32]),
+                time: 1_300_000_000 + n,
+                bits: CompactTarget::from_consensus(0x207fffff),
+                nonce: n,
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-ev-readmit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+
+        let mut st = IbdWorkState::new(vec![dummy_slot(1)], Some(gen), Some(0));
+        let (arch_tx, _arch_rx) = mpsc::unbounded_channel();
+        let budget = ArchiveQueueBudget::new(16 * 1024 * 1024);
+        let write_next = AtomicU32::new(1);
+        let mut book = AddrMan::new();
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 1);
+
+        let hdr = dummy_header(gen, 1);
+        let hash = hdr.block_hash();
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::Headers {
+                peer: 1,
+                headers: vec![hdr.clone()],
+            },
+            &arch_tx,
+            &budget,
+            &write_next,
+            &mut book,
+            local,
+            None,
+        );
+        assert!(st.ordered_set.contains(&hash), "first admit");
+        assert_eq!(st.hash_height.get(&hash), Some(&1));
+
+        // Tip-drain shape: drop ordered membership; keep known + height (hygiene
+        // now also retains those — simulate post-confirm empty path).
+        st.ordered.clear();
+        st.ordered_set.clear();
+        st.height_to_hash.clear();
+        assert!(st.known_headers.contains(&hash));
+        assert!(st.ordered.is_empty());
+
+        // Peer re-serves the same window (overlap). Must re-admit.
+        apply_peer_event(
+            &mut st,
+            &hub,
+            PeerEvent::Headers {
+                peer: 1,
+                headers: vec![hdr],
+            },
+            &arch_tx,
+            &budget,
+            &write_next,
+            &mut book,
+            local,
+            None,
+        );
+        assert!(
+            st.ordered_set.contains(&hash),
+            "known header must re-enter ordered after tip drain"
+        );
+        assert_eq!(st.ordered.len(), 1);
 
         let _ = std::fs::remove_dir_all(dir);
     }

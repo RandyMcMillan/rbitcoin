@@ -203,10 +203,15 @@ impl IbdWorkState {
         compact_ordered(&mut self.ordered, &self.ordered_set);
         let live = &self.ordered_set;
         let inflight = &self.inflight;
-        self.header_fks
-            .retain(|h, _| live.contains(h) || inflight.contains_key(h));
-        self.hash_height
-            .retain(|h, _| live.contains(h) || inflight.contains_key(h));
+        // Keep header_fks / hash_height for known_headers too: when tip drains
+        // `ordered`, re-getheaders must re-resolve height and re-admit without a
+        // full store walk. Wiping them left known_hdr=N with hash_h=0 and freeze.
+        self.header_fks.retain(|h, _| {
+            live.contains(h) || inflight.contains_key(h) || self.known_headers.contains(h)
+        });
+        self.hash_height.retain(|h, _| {
+            live.contains(h) || inflight.contains_key(h) || self.known_headers.contains(h)
+        });
         self.height_to_hash.clear();
         for (&h, &ht) in &self.hash_height {
             if live.contains(&h) || inflight.contains_key(&h) {
@@ -216,6 +221,11 @@ impl IbdWorkState {
         if self.known_headers.len() > live.len().saturating_add(4096) {
             self.known_headers
                 .retain(|h| live.contains(h) || inflight.contains_key(h));
+            // Drop height/fk for headers we just pruned from known.
+            self.header_fks
+                .retain(|h, _| live.contains(h) || inflight.contains_key(h) || self.known_headers.contains(h));
+            self.hash_height
+                .retain(|h, _| live.contains(h) || inflight.contains_key(h) || self.known_headers.contains(h));
         }
         // Bound body presence cache to live work (rejected + archive_charged
         // never hygiene-pruned — see BodyPresence::hygiene_retain).

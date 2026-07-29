@@ -733,11 +733,43 @@ pub async fn ibd_cancellable(
             && st.ordered.is_empty()
             && st.inflight.is_empty()
         {
+            // Rebuild ordered from any retained hash_height above tip (known
+            // headers that lost ordered membership after tip drain / hygiene).
+            let tip_now = hub.tip_height().unwrap_or(0);
+            let mut above: Vec<(u32, bitcoin::BlockHash)> = st
+                .hash_height
+                .iter()
+                .filter(|(_, &ht)| ht > tip_now)
+                .filter(|(h, _)| !hub.has_block(h) && !st.body.is_rejected(h))
+                .map(|(&h, &ht)| (ht, h))
+                .collect();
+            above.sort_by_key(|(ht, _)| *ht);
+            let mut rebuilt = 0usize;
+            for (_ht, h) in above {
+                if st.ordered.len() >= MAX_ORDERED_HEADERS {
+                    break;
+                }
+                if st.ordered_set.insert(h) {
+                    st.ordered.push_back(h);
+                    rebuilt += 1;
+                }
+            }
+            // Store may still hold unconfirmed headers past tip (ensure_header_fk).
+            let before_seed = st.ordered.len();
+            seed_work_path_from_store(&mut st, hub.as_ref());
+            let seeded = st.ordered.len().saturating_sub(before_seed);
             info!(
-                "ibd: hard path reset (stall {:?}, st.ordered empty)",
-                last_progress.elapsed()
+                "ibd: hard path reset (stall {:?}, st.ordered empty) rebuilt={rebuilt} store_seeded={seeded} ordered={}",
+                last_progress.elapsed(),
+                st.ordered.len()
             );
             st.headers_done = false;
+            // Refresh height_to_hash for densify/offer after rebuild.
+            for (&h, &ht) in &st.hash_height {
+                if st.ordered_set.contains(&h) {
+                    st.height_to_hash.insert(ht, h);
+                }
+            }
             let tips = work_path_tips(&st);
             let _ = request_headers(&st.slots, &hub, &mut st.header_req_seq, &tips);
             last_progress = Instant::now();

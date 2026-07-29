@@ -16,7 +16,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **Wire retained on the pipeline batch only:** prep pulls `bitcoin::Block` from the body queue; that wire rides through scripts; **no Class-A wire rebuild** on the unified path. Class A packed form is planned once and committed in the write stage.
 
-**Body queue:** `store/block_queue/` multi‑GiB payload FIFO + RAM overflow when full (`RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`, default 8 GiB). **Offer** on peer Block; prep **reads** by height; **dequeue** after confirm-commit. Restart re-notes feed readiness only (wire stays on disk until prep).
+**Body queue:** `store/block_queue/` multi‑GiB payload FIFO + RAM overflow when full (`RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`, default 8 GiB). **Capacity is bytes only** — densify getdata stops when effective fill hits the budget (90%/70% hysteresis). A separate **height horizon** (`CONTIG_DENSIFY_AHEAD`, 64 k past tip) only bounds how far ahead of tip densify/receive may walk when the byte budget is still nearly empty (early small blocks). **Offer** on peer Block; prep **reads** by height; **dequeue** after confirm-commit. Restart re-notes feed readiness only (wire stays on disk until prep).
 
 **CreateResidency:** process-local fk/range/outs map shared for parent pin hits (raw FIFO). Prep seeds ranges/outs once per create on the pin path.
 

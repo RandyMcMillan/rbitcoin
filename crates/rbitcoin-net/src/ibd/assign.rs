@@ -5,7 +5,10 @@
 //!   request missing hashes (even if durable bq is full). Multi-peer race; extra
 //!   peers if still in-flight after [`TIP_HOLE_THIRD_PEER_AFTER`].
 //! - **Densify** (tip+1 outward, closest first): while durable body queue has
-//!   free capacity, fill missing contiguous heights up to [`CONTIG_DENSIFY_AHEAD`].
+//!   **byte** headroom (`block_queue_can_request`), fill missing heights up to
+//!   [`CONTIG_DENSIFY_AHEAD`] (height safety cap — not a second count budget on
+//!   the queue itself). Early small blocks can therefore buffer tens of
+//!   thousands of heights until the multi‑GiB byte budget is the limiter.
 //! - Never request beyond densify horizon; events refuse far bodies too.
 //! - One body-queue copy per height (receive path drops duplicates).
 
@@ -201,6 +204,12 @@ pub(crate) fn finish_assign(loop_stats: &LoopStats, t0: Instant, issued: u64) {
 }
 
 /// Single-peer need list over an inclusive height band.
+///
+/// Walks closest-to-tip first. Already-pending / body-queue / archived heights
+/// are skipped without consuming [`FAR_SCAN_BUDGET`] “need” slots — only the
+/// raw walk length is capped — so a full ~2 k tip buffer no longer blocks
+/// densify from seeing the rest of the [`CONTIG_DENSIFY_AHEAD`] band when the
+/// durable queue still has byte room.
 fn collect_height_band(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -213,12 +222,12 @@ fn collect_height_band(
         return out;
     }
     let hi = hi.min(st.max_ordered_height.max(lo));
-    let mut inspected = 0usize;
+    let mut walked = 0usize;
     for ht in lo..=hi {
-        if out.len() >= cap || inspected >= FAR_SCAN_BUDGET {
+        if out.len() >= cap || walked >= FAR_SCAN_BUDGET {
             break;
         }
-        inspected += 1;
+        walked += 1;
         if let Some(h) = need_hash_at(st, hub, ht) {
             out.push_back(h);
         }
@@ -617,6 +626,69 @@ mod tests {
         assert!(!archive_pipeline_saturated(96, 0, 0.0));
         assert!(archive_pipeline_saturated(0, 0, 0.85));
         assert!(archive_pipeline_saturated(200, 15, 0.9));
+    }
+
+    /// Densify must request past the legacy 2048 height cap when the body-queue
+    /// byte budget still has room (early small blocks).
+    #[test]
+    fn densify_requests_beyond_legacy_2k_when_bq_has_byte_room() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut st = IbdWorkState::new(vec![dummy_slot(0), dummy_slot(1)], None, Some(0));
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 128;
+        cfg.per_peer = 16;
+
+        // Tip path: heights 1..4096 mapped; first 2500 already pending (in bq),
+        // further missing need densify getdata.
+        const HI: u32 = 4096;
+        for ht in 1u32..=HI {
+            let hash = h(ht);
+            st.record_height(hash, ht);
+            st.height_to_hash.insert(ht, hash);
+            st.ordered_set.insert(hash);
+            st.ordered.push_back(hash);
+            st.max_ordered_height = ht;
+            if ht <= 2500 {
+                st.body.mark_pending(hash);
+            } else {
+                st.body.mark_missing(hash);
+            }
+        }
+
+        assign_work_ordered(
+            &mut st,
+            &hub,
+            &cfg,
+            &stats,
+            1.0,
+            1,
+            AssignDepth::Full,
+            true, // can_assign_new: byte budget free
+        );
+
+        // Must have issued getdata for something past height 2500 (beyond old 2k).
+        let far: Vec<u32> = st
+            .inflight
+            .keys()
+            .filter_map(|hash| st.hash_height.get(hash).copied())
+            .filter(|&ht| ht > 2500)
+            .collect();
+        assert!(
+            !far.is_empty(),
+            "expected densify past filled 2.5k prefix; inflight heights={:?}",
+            st.inflight
+                .keys()
+                .filter_map(|hash| st.hash_height.get(hash).copied())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            far.iter().any(|&ht| ht > 2048),
+            "legacy CONTIG_DENSIFY_AHEAD=2048 must not be the ceiling; far={far:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Critical depth / can_assign_new=false / room=0 early exits, densify + cache

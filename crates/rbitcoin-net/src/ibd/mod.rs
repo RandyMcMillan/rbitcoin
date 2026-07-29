@@ -109,10 +109,23 @@ pub(crate) const TIP_HOLE_THIRD_PEER_AFTER: Duration = Duration::from_secs(10);
 pub(crate) const MAX_PEER_POOL: usize = 256;
 /// Pending (framed, not Class A) longer than this → re-getdata.
 pub(crate) const PENDING_STALE: Duration = Duration::from_secs(45);
-/// Cap height scan for densify candidates per assign tick.
-pub(crate) const FAR_SCAN_BUDGET: usize = 16_384;
-/// Body-queue densify horizon past tip+1. Also hard receive horizon past tip.
-pub(crate) const CONTIG_DENSIFY_AHEAD: u32 = 2048;
+/// Cap height walk for densify candidates per assign tick (safety; filled
+/// heights do not consume this — only the walk range does).
+///
+/// Must be ≥ [`CONTIG_DENSIFY_AHEAD`] so one assign can see the full densify
+/// band when the body-queue byte budget still has room.
+pub(crate) const FAR_SCAN_BUDGET: usize = 65_536;
+/// Body-queue densify / receive horizon past tip+1 (height count).
+///
+/// **Primary capacity is still the durable body-queue byte budget** (default
+/// 8 GiB via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`). This height cap only stops
+/// unbounded far getdata when the queue is still nearly empty in bytes — e.g.
+/// early mainnet blocks are a few hundred bytes each, so an 8 GiB byte budget
+/// alone would admit hundreds of thousands of heights. 64 k heights is ~1–2 GiB
+/// of early wire and aligns with [`ORDERED_HEADERS_SOFT_CAP`].
+///
+/// Also used as the hard receive refuse horizon past tip (and ContigPark).
+pub(crate) const CONTIG_DENSIFY_AHEAD: u32 = 65_536;
 
 /// Tunables for IBD (defaults lean libbitcoin/Core-ish).
 #[derive(Clone, Debug)]

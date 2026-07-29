@@ -242,7 +242,7 @@ pub(crate) fn apply_peer_event(
                 st.empty_header_streak = 0;
                 st.headers_done = false;
                 let live = st.ordered_set.len();
-                let need_arch_cache = want_headers_beyond_soft_cap(
+                let need_ready_headroom = want_headers_beyond_soft_cap(
                     live,
                     st.body.known_len(),
                     st.max_ordered_height.saturating_sub(st.max_ready_height),
@@ -250,7 +250,7 @@ pub(crate) fn apply_peer_event(
                 );
                 if batch_len >= MAX_HEADERS_RESULTS
                     && live < MAX_ORDERED_HEADERS
-                    && (live < ORDERED_HEADERS_SOFT_CAP || need_arch_cache)
+                    && (live < ORDERED_HEADERS_SOFT_CAP || need_ready_headroom)
                 {
                     let tips = work_path_tips(st);
                     let _ = request_headers_from(
@@ -272,8 +272,8 @@ pub(crate) fn apply_peer_event(
                     st.headers_done = true;
                 } else if lag > 2 {
                     // Peers advertise a higher tip than our work path — empty is a
-                    // false EOF (often locator stuck at confirmed tip while archive
-                    // leads). Keep requesting with work-path locator; never mark done.
+                    // false EOF (locator stuck at confirmed tip while headers lead).
+                    // Keep requesting with work-path locator; never mark done.
                     if st.empty_header_streak == 1 || st.empty_header_streak % 16 == 0 {
                         warn!(
                             "ibd: empty headers but lag={lag} behind max_peer_height={} (known≈{}, tip={tip_h}) — keep header sync",
@@ -301,17 +301,17 @@ pub(crate) fn apply_peer_event(
                 // (do **not** count toward headers_done — multi-peer overlap was
                 // marking done after one 2000-header window).
                 let live = st.ordered_set.len();
-                let need_arch_cache = want_headers_beyond_soft_cap(
+                let need_ready_headroom = want_headers_beyond_soft_cap(
                     live,
                     st.body.known_len(),
                     st.max_ordered_height.saturating_sub(st.max_ready_height),
                     4096,
                 );
                 if live < MAX_ORDERED_HEADERS
-                    && (live < ORDERED_HEADERS_SOFT_CAP || need_arch_cache)
+                    && (live < ORDERED_HEADERS_SOFT_CAP || need_ready_headroom)
                     && (batch_len >= MAX_HEADERS_RESULTS
                         || header_lag_behind_peers(st, hub.tip_height().unwrap_or(0)) > 2
-                        || need_arch_cache)
+                        || need_ready_headroom)
                 {
                     let tips = work_path_tips(st);
                     let _ = request_headers_from(

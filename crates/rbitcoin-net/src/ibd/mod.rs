@@ -1,18 +1,14 @@
 //! Concurrent multi-peer block download (libbitcoin-class windowed IBD).
 //!
-//! Architecture:
-//! - N outbound peer workers (each: own TCP stream, command + event channels)
-//! - Shared ordered work queue of block hashes after the local tip
-//! - **In-flight cap** (`window`): max concurrent unique getdata; **not** a tip-distance
-//!   limit — any unarchived hash on the known header path may be requested so archive
-//!   can race to the end of headers while tip waits on holes
-//! - Tip-hole hashes race 2 peers immediately; a 3rd only after 10s without body
-//! - Near/far densify stay single-peer; at most `per_peer` blocks per peer (Core = 16)
-//! - Peers send `getaddr`; learned addrs grow the redial pool beyond seeds
-//! - Archive pipeline: dedicated OS **prep** thread → dedicated OS **writer** thread
-//! - Tip **confirm** walks contiguous archived runs (Class C) on a dedicated thread
-//! - Peer IO: concurrent read/write halves; **frame-only** on socket tasks, block
-//!   decode on Tokio blocking pool (never multi-MB deserialize on async workers)
+//! **Unified height-ordered path (current):**
+//! - N outbound peer workers (TCP + cmd/event channels); decode on blocking pool
+//! - Peer offers wire into the durable **body queue** and notes height/hash readiness
+//! - **Confirm** pipeline: prep (reload wire by height + plan/pin) → scripts (CPU) →
+//!   **commit** as sole Class A appender + Class C tip; dequeue body queue after tip
+//! - **Densify getdata** fills missing heights tip-first while body-queue bytes have
+//!   room (`window` = in-flight cap, not tip-distance); tip-batch multi-peer race
+//! - Optional archive-job + ContigPark remains only for **unknown-height / abort**
+//!   fallback — not a primary “Class A far ahead of tip” dual track
 //! - Stall: 30s with no block-download progress on a peer → disconnect + cooldown
 
 mod archive;
@@ -357,13 +353,12 @@ pub async fn ibd_cancellable(
         }
     }
 
-    // Archive pipeline: multi-core prep + exclusive writer (mmap Class A).
-    // Byte budget (default via RBITCOIN_ARCHIVE_QUEUE_MB) caps decoded blocks
-    // waiting for archive; far getdata scales with free headroom (hysteresis
-    // 90%/70%) — never drops in-flight, only throttles new far densify.
+    // Soft RAM budget for body-queue overflow + unknown-height archive-job fallback
+    // (not multi‑GiB disk body queue). Densify getdata scales with free headroom
+    // (90%/70% hysteresis) — never drops in-flight, only throttles new densify.
     let archive_queued = ArchiveQueueBudget::from_env();
     info!(
-        "ibd: archive queue budget={} MiB (RBITCOIN_ARCHIVE_QUEUE_MB)",
+        "ibd: soft wire budget={} MiB (RBITCOIN_ARCHIVE_QUEUE_MB; RAM overflow / fallback jobs)",
         archive_queued.budget_bytes() / (1024 * 1024)
     );
     let pipe_stats = Arc::new(ArchivePipelineStats::default());
@@ -419,7 +414,7 @@ pub async fn ibd_cancellable(
             warn!("ibd: block_queue rehydrate failed (continuing; may re-getdata): {e}");
         }
     }
-    // Archive pipeline retained for unknown-height / legacy fallback only.
+    // Fallback archive-job pipeline (unknown-height only; not primary Class A path).
     let mut pipeline = spawn_archive_pipeline(
         hub.clone(),
         arch_job_rx,
@@ -583,7 +578,7 @@ pub async fn ibd_cancellable(
             can_assign_new,
         );
 
-        // Offer archived bodies to the dedicated confirm engine (non-blocking).
+        // Note claim-ready heights into the confirm feed (body queue / Class A fallback).
         offer_confirm_ready(
             &confirm_feed,
             &st.height_to_hash,
@@ -687,25 +682,25 @@ pub async fn ibd_cancellable(
         // cap when the ordered path is **mostly claim-ready** (dense).
         {
             let live = st.ordered_set.len();
-            let known_arch = st.body.known_len();
-            let arch_cache = st
+            let known_ready = st.body.known_len();
+            let ready_gap = st
                 .max_ordered_height
                 .saturating_sub(st.max_ready_height);
-            let need_arch_cache = want_headers_beyond_soft_cap(
+            let need_ready_headroom = want_headers_beyond_soft_cap(
                 live,
-                known_arch,
-                arch_cache,
+                known_ready,
+                ready_gap,
                 (window as u32).saturating_mul(4).max(2048),
             );
             let under_hard = live < MAX_ORDERED_HEADERS;
             let under_soft = live < ORDERED_HEADERS_SOFT_CAP;
-            if !st.headers_done && under_hard && (under_soft || need_arch_cache) {
+            if !st.headers_done && under_hard && (under_soft || need_ready_headroom) {
                 let tip_h = hub.tip_height().unwrap_or(0);
                 let min_cache = window.saturating_mul(8).max(4096);
                 let want_more = live == 0
                     || live < min_cache
                     || header_lag_behind_peers(&st, tip_h) > 0
-                    || need_arch_cache;
+                    || need_ready_headroom;
                 if want_more {
                     let tips = work_path_tips(&st);
                     // Cold start / empty path: fan getheaders to several peers so a

@@ -64,19 +64,20 @@ pub(crate) fn far_slots_per_peer(per_peer: usize, tip_hole: bool) -> usize {
 
 /// Whether to request more headers past the soft cap.
 ///
-/// Only when the ordered path is **mostly archived** (dense Class A) and the
-/// height cache to max_ordered is short — never for sparse far-only archives.
+/// Only when the ordered path is **mostly claim-ready** (dense body-queue /
+/// Class A readiness) and the gap from max_ready to max_ordered is short —
+/// never for sparse far-only header floods without bodies.
 pub(crate) fn want_headers_beyond_soft_cap(
     live: usize,
-    known_arch: usize,
-    arch_cache: u32,
-    cache_need: u32,
+    known_ready: usize,
+    ready_gap: u32,
+    gap_need: u32,
 ) -> bool {
     if live == 0 {
         return true;
     }
-    let mostly_archived = known_arch >= live.saturating_mul(3) / 4;
-    mostly_archived && arch_cache < cache_need
+    let mostly_ready = known_ready >= live.saturating_mul(3) / 4;
+    mostly_ready && ready_gap < gap_need
 }
 
 #[cfg(test)]
@@ -105,11 +106,11 @@ mod tests {
         // Tiny residual headroom still drips one densify slot.
         assert_eq!(scale_feed_cap(8, 0.01), 1);
 
-        // Sparse: 4k known of 120k live → no bypass
+        // Sparse: 4k claim-ready of 120k live → no bypass
         assert!(!want_headers_beyond_soft_cap(120_000, 4_000, 100, 2048));
-        // Dense + short cache → bypass
+        // Dense + short ready_gap → bypass
         assert!(want_headers_beyond_soft_cap(64_000, 50_000, 100, 2048));
-        // Dense but long cache → no need
+        // Dense but long ready_gap → no need
         assert!(!want_headers_beyond_soft_cap(64_000, 50_000, 10_000, 2048));
         // Empty path
         assert!(want_headers_beyond_soft_cap(0, 0, 0, 2048));

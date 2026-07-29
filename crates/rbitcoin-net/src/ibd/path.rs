@@ -29,8 +29,8 @@ pub(crate) fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
         return;
     }
     let mut with_body = 0u32;
-    let mut contiguous_arch = tip_h;
-    let mut arch_prefix = true;
+    let mut ready_prefix_to = tip_h;
+    let mut ready_prefix = true;
     for e in &path {
         let hash = BlockHash::from_byte_array(e.hash);
         st.known_headers.insert(hash);
@@ -41,23 +41,24 @@ pub(crate) fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
             st.ordered.push_back(hash);
         }
         if e.has_body {
+            // Class A on disk from a prior run → claim-ready without getdata.
             st.body.mark_archived(hash);
             with_body = with_body.saturating_add(1);
-            if arch_prefix {
-                contiguous_arch = e.height;
+            if ready_prefix {
+                ready_prefix_to = e.height;
             }
         } else {
-            arch_prefix = false;
+            ready_prefix = false;
         }
     }
-    st.max_ready_height = st.max_ready_height.max(contiguous_arch);
+    st.max_ready_height = st.max_ready_height.max(ready_prefix_to);
     // Peers may still advertise a higher tip; keep header sync open.
     st.headers_done = false;
     info!(
-        "ibd: resume seed ordered={} archived_bodies={} archived_to={} (store walk {:?})",
+        "ibd: resume seed ordered={} class_a_bodies={} ready_to={} (store walk {:?})",
         st.ordered.len(),
         with_body,
-        contiguous_arch,
+        ready_prefix_to,
         t0.elapsed()
     );
 }
@@ -272,17 +273,17 @@ mod tests {
         }
         let b3 = mine(tip, time + 3 * 600, 3);
         hub.ensure_header(&b3.header).unwrap();
-        // no archive for h=3 → arch_prefix breaks
+        // no Class A body for h=3 → ready_prefix breaks
 
         let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
         seed_work_path_from_store(&mut st, &hub);
         assert!(
             st.ordered.len() >= 2,
-            "resume should seed archived path, got {}",
+            "resume should seed work path after tip, got {}",
             st.ordered.len()
         );
         assert!(st.max_ordered_height >= 2);
-        assert!(st.max_ready_height >= 2); // contiguous body prefix
+        assert!(st.max_ready_height >= 2); // contiguous claim-ready prefix
         assert!(!st.headers_done);
         // Duplicates on re-seed only insert once into ordered_set.
         let n = st.ordered.len();

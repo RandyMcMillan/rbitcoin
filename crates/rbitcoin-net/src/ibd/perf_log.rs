@@ -31,7 +31,7 @@ pub(crate) struct IbdPerfSample {
     // Pipeline health (not from atomics).
     pub inflight: usize,
     pub inflight_cap: usize,
-    /// RAM archive pipeline queue (decoded jobs waiting for Class A write).
+    /// Soft RAM queue meter (body-queue overflow / fallback archive jobs).
     pub arch_q: usize,
     pub arch_mb: usize,
     pub arch_budget_mb: usize,
@@ -469,7 +469,7 @@ pub(crate) fn sample(
     // Durable block queue: (budget_bytes, used_bytes, count).
     bq: (u64, u64, usize),
     pending: usize,
-    _known_arch: usize,
+    _known_ready: usize,
     _ordered: usize,
     arch_ahead: u32,
     hole: usize,

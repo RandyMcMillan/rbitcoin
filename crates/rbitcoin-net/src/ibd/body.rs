@@ -194,7 +194,7 @@ impl BodyPresence {
         }
     }
 
-    /// Wire frame received / archive pipeline owns this hash (not confirmable yet).
+    /// Wire framed or body-queue / fallback job owns this hash (not tip-confirmed yet).
     pub(crate) fn is_pending(&self, h: &BlockHash) -> bool {
         self.is_pending_hash(h)
     }
@@ -222,7 +222,7 @@ impl BodyPresence {
         }
     }
 
-    /// Skip getdata: already confirmed, archived, rejected, or in the archive pipeline.
+    /// Skip getdata: already confirmed, Class A ready, rejected, or pending in body queue.
     ///
     /// Hot path: local sets first. Do **not** call `has_block` before checking
     /// `missing` — assign walks tens of thousands of known-missing far hashes and

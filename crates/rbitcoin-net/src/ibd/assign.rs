@@ -1,20 +1,20 @@
-//! Getdata assign: tip-hole race, parent cache, ContigPark feed.
+//! Getdata assign for the **unified body-queue → prep → scripts → write** path.
 //!
-//! Height ownership (single policy):
-//! - **Tip holes:** ordered front unready → multi-peer race
-//! - **Parent cache:** tip+1‥min(near_hi, write_next−1) → single peer
-//! - **ContigPark feed:** write_next‥write_next+W → multi-peer on write_next‥+R−1,
-//!   single peer on the rest; capacity scaled by archive budget admission
-//! - **Beyond write_next+W:** never request (events also refuse park)
+//! Policy (operator-facing):
+//! - **Tip batch** (tip+1 .. tip+[`TIP_HOLE_MAX`]=32, one confirm run): always
+//!   request missing hashes (even if durable bq is full). Multi-peer race; extra
+//!   peers if still in-flight after [`TIP_HOLE_THIRD_PEER_AFTER`].
+//! - **Densify** (tip+1 outward, closest first): while durable body queue has
+//!   free capacity, fill missing contiguous heights up to [`CONTIG_DENSIFY_AHEAD`].
+//! - Never request beyond densify horizon; events refuse far bodies too.
+//! - One body-queue copy per height (receive path drops duplicates).
 
-use super::assign_plan::far_slots_per_peer;
 use super::peer_io::{touch_block_progress, PeerCmd, PeerSlot};
 use super::state::{self, IbdWorkState};
 use super::status::LoopStats;
 use super::{
-    IbdConfig, CONTIG_DENSIFY_AHEAD, CONTIG_PARK_PENDING_STALE, CONTIG_PARK_RACE,
-    FAR_BATCH_MAX, FAR_SCAN_BUDGET, NEAR_DEPTH, PENDING_STALE, TIP_HOLE_IMMEDIATE_PEERS,
-    TIP_HOLE_MAX, TIP_HOLE_MAX_PEERS, TIP_HOLE_THIRD_PEER_AFTER,
+    IbdConfig, CONTIG_DENSIFY_AHEAD, FAR_SCAN_BUDGET, PENDING_STALE,
+    TIP_HOLE_IMMEDIATE_PEERS, TIP_HOLE_MAX, TIP_HOLE_MAX_PEERS, TIP_HOLE_THIRD_PEER_AFTER,
 };
 use crate::chain::ChainHub;
 use bitcoin::BlockHash;
@@ -25,10 +25,9 @@ use std::time::Instant;
 /// How much assign work to do this call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AssignDepth {
-    /// Tip holes + ContigPark `write_next` multi-peer race only (cheap).
-    /// Used when archive pipeline is saturated so we do not spin full scans.
+    /// Tip-batch multi-peer only (durable body queue at budget).
     Critical,
-    /// Critical + parent cache + ContigPark densify band.
+    /// Tip batch + densify toward filling the body queue.
     Full,
 }
 
@@ -68,7 +67,7 @@ pub(crate) fn inflight_add_peer(
         .add_peer(peer);
 }
 
-/// Scale ContigPark densify per-peer slots by archive admission (`0.0`..=`1.0`).
+/// Scale densify per-peer slots by admission (`0.0`..=`1.0`). Kept for tests / plan helpers.
 pub(crate) fn scale_feed_cap(base: usize, scale: f64) -> usize {
     if base == 0 || scale <= 0.0 {
         return 0;
@@ -80,34 +79,29 @@ pub(crate) fn scale_feed_cap(base: usize, scale: f64) -> usize {
     scaled.max(1).min(base)
 }
 
-/// True when the archive pipeline is full of work and getdata inflight is low.
+/// True when durable body queue is at pressure and getdata inflight is low.
 ///
-/// Full assign scans are wasteful here — bodies are pending/queued, not missing
-/// on the wire. Critical assign (tip hole + write_next race) still runs.
+/// Only restricts **densify** (tip batch always runs). High `pending` alone is
+/// **not** saturated — pending means we already hold wire.
 pub(crate) fn archive_pipeline_saturated(
-    pending_len: usize,
+    _pending_len: usize,
     inflight_len: usize,
     fill_ratio: f64,
 ) -> bool {
-    inflight_len < 16 && (pending_len >= 96 || fill_ratio >= 0.85)
+    inflight_len < 16 && fill_ratio >= 0.85
 }
 
-/// Assign getdata for bodies not yet Class A.
+/// Assign getdata for the body-queue pipeline.
 ///
-/// `archive_feed_scale` is [`super::archive::ArchiveQueueBudget::far_admission_scale`]
-/// (0 = no densify; multi-peer tip/park race still on; 1 = full densify).
-///
-/// `can_assign_new`: [`super::archive::ArchiveQueueBudget::can_assign`] — when
-/// false, only tip-hole + ContigPark race run (fill contig / tip). Densify and
-/// confirm-cache getdata stop so charged RAM stays near the budget; bodies
-/// already in flight still enqueue (may overshoot).
+/// `can_assign_new`: durable body queue has headroom for densify. Tip-batch
+/// multi-peer always runs regardless.
 pub(crate) fn assign_work_ordered(
     st: &mut IbdWorkState,
     hub: &ChainHub,
     cfg: &IbdConfig,
     loop_stats: &LoopStats,
-    archive_feed_scale: f64,
-    archive_write_next: u32,
+    _archive_feed_scale: f64,
+    _archive_write_next: u32,
     depth: AssignDepth,
     can_assign_new: bool,
 ) {
@@ -125,37 +119,29 @@ pub(crate) fn assign_work_ordered(
 
     prune_satisfied_inflight(&mut st.slots, &mut st.inflight, hub);
 
-    // ContigPark race band: always re-request stuck holes so the writer can
-    // advance even when the queue is at budget (only first copy is enqueued).
-    let wn = archive_write_next;
-    let race_hi = wn.saturating_add(CONTIG_PARK_RACE.saturating_sub(1) as u32);
-    let gap_expired = st.body.expire_stale_pending_if(CONTIG_PARK_PENDING_STALE, |h| {
+    let tip = hub.tip_height().unwrap_or(0);
+    let path_lo = if hub.tip_height().is_none() {
+        0u32
+    } else {
+        tip.saturating_add(1)
+    };
+    let tip_batch_hi = path_lo.saturating_add(TIP_HOLE_MAX.saturating_sub(1) as u32);
+
+    // Stale pending in tip batch only → re-get (don't thrash far pending).
+    let tip_expired = st.body.expire_stale_pending_if(PENDING_STALE, |h| {
         st.hash_height
             .get(h)
-            .is_some_and(|&ht| ht >= wn && ht <= race_hi)
+            .is_some_and(|&ht| ht >= path_lo && ht <= tip_batch_hi)
     });
-    for h in gap_expired {
+    for h in tip_expired {
         clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
     }
-    // Global pending-stale only when we have assign room for densify re-get —
-    // otherwise thrash bandwidth while the pipeline is full.
-    if can_assign_new {
-        let expired = st.body.expire_stale_pending(PENDING_STALE);
-        for h in expired {
-            clear_hash_inflight(&mut st.slots, &mut st.inflight, h);
-        }
-    }
 
-    let tip = hub.tip_height().unwrap_or(0);
-    let near_hi = tip.saturating_add(NEAR_DEPTH);
+    // 1) Always cover tip confirm batch (≤32) with multi-peer race.
     let tip_holes = contiguous_tip_holes(st, hub, TIP_HOLE_MAX);
-
     issued += cover_tip_holes(st, hub, cfg, &alive, &tip_holes);
 
-    // Multi-peer race only on write_next .. write_next+R-1 (not a long band).
-    issued += cover_park_race(st, hub, cfg, &alive, archive_write_next);
-
-    // At budget or critical: no densify / confirm-cache assign.
+    // 2) Densify only when body queue has room and not Critical.
     if !can_assign_new || matches!(depth, AssignDepth::Critical) {
         finish_assign(loop_stats, t0, issued);
         return;
@@ -166,83 +152,17 @@ pub(crate) fn assign_work_ordered(
         finish_assign(loop_stats, t0, issued);
         return;
     }
-    if st.inflight.is_empty()
-        && tip_holes.is_empty()
-        && st.max_archived_height > 0
-        && st.max_archived_height >= st.max_ordered_height
-    {
-        finish_assign(loop_stats, t0, issued);
-        return;
-    }
 
-    let feed_scale = archive_feed_scale.clamp(0.0, 1.0);
-    // Densify capacity in the ContigPark band (beyond the race prefix).
-    // scale=0 → zero densify slots (no drip under pressure); cache may still run.
-    let tip_hole = !tip_holes.is_empty();
-    let base_feed = far_slots_per_peer(cfg.per_peer, tip_hole);
-    let feed_cap = scale_feed_cap(base_feed, feed_scale);
-
-    // Parent cache: tip+1 .. min(near_hi, write_next-1). Park feed owns ≥ write_next.
-    let cache_hi = if archive_write_next > tip.saturating_add(1) {
-        near_hi.min(archive_write_next.saturating_sub(1))
-    } else {
-        // write_next at/behind tip+1 → park feed covers the near window.
-        tip
-    };
-
-    let feed_reserve = alive
-        .len()
-        .saturating_mul(feed_cap)
-        .min(room.saturating_mul(3) / 4)
-        .max(feed_cap.min(room));
-    let cache_cap = room.saturating_sub(feed_reserve);
-
-    let cache = collect_height_window(st, hub, tip, cache_hi, cache_cap);
-    // Densify: write_next+R .. write_next+W (race prefix already multi-peered).
-    let densify_lo = archive_write_next.saturating_add(CONTIG_PARK_RACE as u32);
-    let densify_hi = archive_write_next.saturating_add(CONTIG_DENSIFY_AHEAD);
-    let densify = collect_height_band(
-        st,
-        hub,
-        densify_lo,
-        densify_hi,
-        room.saturating_sub(cache.len()).max(1),
-    );
-
-    if cache.is_empty() && densify.is_empty() {
+    // Closest-to-tip first: tip+1 .. tip+densify_ahead.
+    let densify_hi = path_lo.saturating_add(CONTIG_DENSIFY_AHEAD);
+    let densify = collect_height_band(st, hub, path_lo, densify_hi, room.max(1));
+    if densify.is_empty() {
         finish_assign(loop_stats, t0, issued);
         return;
     }
 
     let mut peer_i = st.assign_rot;
     st.assign_rot = st.assign_rot.wrapping_add(1);
-
-    // Issue parent cache (single peer), leaving feed_reserve for densify.
-    let mut cache_q = cache;
-    while room > feed_reserve && !cache_q.is_empty() {
-        let mut any = false;
-        for _ in 0..alive.len() {
-            if room <= feed_reserve || cache_q.is_empty() {
-                break;
-            }
-            let pid = alive[peer_i % alive.len()];
-            peer_i += 1;
-            if !peer_has_slot(st, pid, cfg.per_peer) {
-                continue;
-            }
-            let Some(h) = pop_need(&mut cache_q, st, hub) else {
-                break;
-            };
-            if issue_one(st, pid, h, &mut room, &mut issued) {
-                any = true;
-            }
-        }
-        if !any {
-            break;
-        }
-    }
-
-    // ContigPark densify band (single peer per hash, feed_cap slots/peer).
     let mut densify_q = densify;
     while room > 0 && !densify_q.is_empty() {
         let mut any = false;
@@ -252,21 +172,13 @@ pub(crate) fn assign_work_ordered(
             }
             let pid = alive[peer_i % alive.len()];
             peer_i += 1;
-            let Some(n) = peer_feed_free(st, pid, cfg.per_peer, feed_cap) else {
+            if !peer_has_slot(st, pid, cfg.per_peer) {
                 continue;
+            }
+            let Some(h) = pop_need(&mut densify_q, st, hub) else {
+                break;
             };
-            let take = n.min(room).min(FAR_BATCH_MAX);
-            let mut batch = Vec::with_capacity(take);
-            while batch.len() < take {
-                let Some(h) = pop_need(&mut densify_q, st, hub) else {
-                    break;
-                };
-                batch.push(h);
-            }
-            if batch.is_empty() {
-                continue;
-            }
-            if issue_batch(st, pid, batch, &mut room, &mut issued) {
+            if issue_one(st, pid, h, &mut room, &mut issued) {
                 any = true;
             }
         }
@@ -285,29 +197,6 @@ pub(crate) fn finish_assign(loop_stats: &LoopStats, t0: Instant, issued: u64) {
     if issued > 0 {
         loop_stats.assign_issued.fetch_add(issued, Ordering::Relaxed);
     }
-}
-
-/// Parent cache: tip+1 ‥ cache_hi (exclusive of ContigPark write_next and above).
-fn collect_height_window(
-    st: &mut IbdWorkState,
-    hub: &ChainHub,
-    tip: u32,
-    cache_hi: u32,
-    cap: usize,
-) -> VecDeque<BlockHash> {
-    let mut out = VecDeque::new();
-    if cache_hi <= tip || cap == 0 {
-        return out;
-    }
-    for ht in tip.saturating_add(1)..=cache_hi {
-        if out.len() >= cap {
-            break;
-        }
-        if let Some(h) = need_hash_at(st, hub, ht) {
-            out.push_back(h);
-        }
-    }
-    out
 }
 
 /// Single-peer need list over an inclusive height band.
@@ -339,7 +228,7 @@ fn collect_height_band(
 /// Hash at `ht` that still needs a new single-peer getdata (not inflight/pending/done).
 fn need_hash_at(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> Option<BlockHash> {
     let &h = st.height_to_hash.get(&ht)?;
-    if !st.ordered_set.contains(&h) || st.inflight.contains_key(&h) {
+    if st.inflight.contains_key(&h) {
         return None;
     }
     if st.body.is_known_archived(&h)
@@ -347,6 +236,10 @@ fn need_hash_at(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> Option<BlockH
         || st.body.is_archive_charged(&h)
         || st.body.is_rejected(&h)
     {
+        return None;
+    }
+    // Body queue already holds wire for this height.
+    if hub.query.block_queue_has_height(ht) {
         return None;
     }
     if st.body.skip_download(hub, &h) {
@@ -379,23 +272,6 @@ fn peer_has_slot(st: &IbdWorkState, pid: usize, per_peer: usize) -> bool {
         .is_some_and(|s| s.in_flight.len() < per_peer)
 }
 
-/// Free densify slots on peer (cap how many ContigPark-feed hashes per peer).
-fn peer_feed_free(
-    st: &IbdWorkState,
-    pid: usize,
-    per_peer: usize,
-    feed_cap: usize,
-) -> Option<usize> {
-    let s = st.slots.iter().find(|s| s.id == pid && s.alive)?;
-    let free_total = per_peer.saturating_sub(s.in_flight.len());
-    if free_total == 0 || feed_cap == 0 {
-        return None;
-    }
-    // Count how many of this peer's inflight are already densify/race (not tip cache).
-    // Approximate: any hash with height > tip+NEAR is feed; also height >= write_next
-    // is hard without write_next here — use free_total.min(feed_cap) as simple bound.
-    Some(free_total.min(feed_cap))
-}
 
 pub(crate) fn issue_one(
     st: &mut IbdWorkState,
@@ -507,129 +383,6 @@ pub(crate) fn tip_hole_peer_target(
     }
 }
 
-/// Multi-peer race for ContigPark `write_next`‥`write_next+R-1` only.
-pub(crate) fn cover_park_race(
-    st: &mut IbdWorkState,
-    hub: &ChainHub,
-    cfg: &IbdConfig,
-    alive: &[usize],
-    write_next: u32,
-) -> u64 {
-    if alive.is_empty() || CONTIG_PARK_RACE == 0 {
-        return 0;
-    }
-    let mut issued = 0u64;
-    let mut peer_i = st.assign_rot;
-    st.assign_rot = st.assign_rot.wrapping_add(1);
-    let now = Instant::now();
-    let hi = write_next.saturating_add(CONTIG_PARK_RACE.saturating_sub(1) as u32);
-
-    for ht in write_next..=hi {
-        let Some(&h) = st.height_to_hash.get(&ht) else {
-            continue;
-        };
-        if !st.ordered_set.contains(&h) {
-            continue;
-        }
-        if hub.has_block(&h)
-            || st.body.is_pending(&h)
-            || st.body.is_archive_charged(&h)
-            || st.body.is_rejected(&h)
-            || st.body.ready(hub, &h)
-        {
-            // Already in archive pipeline (charged) or pending: never multi-queue.
-            // Multi-peer race is only for hashes not yet enqueued.
-            continue;
-        }
-        // Not known/pending: either need first peer or more race peers.
-        if !st.inflight.contains_key(&h) && st.body.skip_download(hub, &h) {
-            continue;
-        }
-        let (already, second_at) = st
-            .inflight
-            .get(&h)
-            .map(|e| (e.len(), e.second_peer_at))
-            .unwrap_or((0, None));
-        let want = tip_hole_peer_target(already, second_at, now);
-        if already >= want {
-            continue;
-        }
-        let mut need_peers = want - already;
-        let mut placed_any = false;
-        for _ in 0..alive.len() {
-            if need_peers == 0 {
-                break;
-            }
-            let pid = alive[peer_i % alive.len()];
-            peer_i += 1;
-            let Some(idx) = st.slots.iter().position(|s| s.id == pid && s.alive) else {
-                continue;
-            };
-            if st.slots[idx].in_flight.contains(&h) {
-                continue;
-            }
-            if st
-                .inflight
-                .get(&h)
-                .map(|e| e.contains_peer(pid))
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            if st.slots[idx].in_flight.len() >= cfg.per_peer {
-                continue;
-            }
-            let mut room = 1usize;
-            if issue_one(st, pid, h, &mut room, &mut issued) {
-                placed_any = true;
-                need_peers = need_peers.saturating_sub(1);
-            }
-        }
-        // write_next with zero coverage and no free peer — stop.
-        if ht == write_next && already == 0 && !placed_any {
-            break;
-        }
-    }
-    if issued > 0 {
-        // Empty-block phase advances write_next every few ms; per-call / per-wn
-        // lines drown the log. Aggregate into a periodic summary instead.
-        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrd};
-        static TOTAL_ISSUED: AtomicU64 = AtomicU64::new(0);
-        static TOTAL_WAVES: AtomicU32 = AtomicU32::new(0);
-        static MIN_WN: AtomicU32 = AtomicU32::new(u32::MAX);
-        static MAX_WN: AtomicU32 = AtomicU32::new(0);
-        static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
-        const SUMMARY_MS: u64 = 5_000;
-
-        TOTAL_ISSUED.fetch_add(issued, AtomicOrd::Relaxed);
-        TOTAL_WAVES.fetch_add(1, AtomicOrd::Relaxed);
-        MIN_WN.fetch_min(write_next, AtomicOrd::Relaxed);
-        MAX_WN.fetch_max(write_next, AtomicOrd::Relaxed);
-
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let prev_ms = LAST_LOG_MS.load(AtomicOrd::Relaxed);
-        if now_ms.saturating_sub(prev_ms) >= SUMMARY_MS
-            && LAST_LOG_MS
-                .compare_exchange(prev_ms, now_ms, AtomicOrd::Relaxed, AtomicOrd::Relaxed)
-                .is_ok()
-        {
-            let total = TOTAL_ISSUED.swap(0, AtomicOrd::Relaxed);
-            let waves = TOTAL_WAVES.swap(0, AtomicOrd::Relaxed);
-            let min_wn = MIN_WN.swap(u32::MAX, AtomicOrd::Relaxed);
-            let max_wn = MAX_WN.swap(0, AtomicOrd::Relaxed);
-            if total > 0 {
-                rbitcoin_log::debug!(
-                    "ibd: park-race getdata summary issued={total} waves={waves} write_next={min_wn}..{max_wn}"
-                );
-            }
-        }
-    }
-    issued
-}
-
 /// Cover each tip-hole hash with staged multi-peer getdata (2 now, 3 after 10s).
 pub(crate) fn cover_tip_holes(
     st: &mut IbdWorkState,
@@ -700,7 +453,7 @@ pub(crate) fn cover_tip_holes(
     issued
 }
 
-/// Hashes in ContigPark race band that still need coverage (tests).
+/// Tip-batch hashes that still need getdata coverage (tests).
 #[cfg(test)]
 pub(crate) fn park_race_need(
     st: &mut IbdWorkState,
@@ -708,14 +461,11 @@ pub(crate) fn park_race_need(
     write_next: u32,
 ) -> Vec<BlockHash> {
     let mut out = Vec::new();
-    let hi = write_next.saturating_add(CONTIG_PARK_RACE.saturating_sub(1) as u32);
+    let hi = write_next.saturating_add(TIP_HOLE_MAX.saturating_sub(1) as u32);
     for ht in write_next..=hi {
         let Some(&h) = st.height_to_hash.get(&ht) else {
             continue;
         };
-        if !st.ordered_set.contains(&h) {
-            continue;
-        }
         if st.body.is_known_archived(&h)
             || st.body.is_pending(&h)
             || st.body.is_archive_charged(&h)
@@ -861,8 +611,11 @@ mod tests {
         assert_eq!(scale_feed_cap(10, 0.0), 0);
         assert_eq!(scale_feed_cap(10, 1.0), 10);
         assert_eq!(scale_feed_cap(10, 0.25), 3); // ceil
+        // Saturated only on high bq fill + low inflight (pending alone is not).
         assert!(!archive_pipeline_saturated(0, 20, 1.0));
-        assert!(archive_pipeline_saturated(96, 0, 0.0));
+        assert!(!archive_pipeline_saturated(96, 0, 0.0));
+        assert!(archive_pipeline_saturated(0, 0, 0.85));
+        assert!(archive_pipeline_saturated(200, 15, 0.9));
     }
 
     /// Critical depth / can_assign_new=false / room=0 early exits, densify + cache

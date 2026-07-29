@@ -382,10 +382,29 @@ pub(crate) fn apply_peer_event(
             // mark_missing (not pending) so densify can re-get once write_next
             // advances; densify is capped to write_next+CONTIG_DENSIFY_AHEAD so
             // this does not thrash re-download of far heights every tick.
-            if height != u32::MAX
-                && height > write_next.saturating_add(CONTIG_DENSIFY_AHEAD)
-            {
+            // Accept bodies useful for tip+confirm feed (tip-near) or densify
+            // horizon past write_next. Tip-based so a stale write_next cannot
+            // drop tip-extension blocks.
+            let tip_hi = tip_h.saturating_add(CONTIG_DENSIFY_AHEAD);
+            let densify_hi = write_next.saturating_add(CONTIG_DENSIFY_AHEAD);
+            if height != u32::MAX && height > tip_hi && height > densify_hi {
                 st.body.mark_missing(hash);
+                return;
+            }
+            // Already have wire for this height — keep first copy only.
+            if height != u32::MAX && hub.query.block_queue_has_height(height) {
+                st.body.mark_pending(hash);
+                if let Some(feed) = confirm_feed {
+                    feed.note(height, hash);
+                }
+                return;
+            }
+            if st.body.is_pending(&hash) {
+                if let Some(feed) = confirm_feed {
+                    if height != u32::MAX {
+                        feed.note(height, hash);
+                    }
+                }
                 return;
             }
             // Priority: parent cache + ContigPark densify horizon (parkable soon).
@@ -639,6 +658,8 @@ pub(crate) fn apply_confirm_reject(
     hash: BlockHash,
     err: &str,
     archive_queued: Option<&ArchiveQueueBudget>,
+    // When set, drop bad body-queue payload so densify can re-getdata a good block.
+    query: Option<&rbitcoin_query::Query>,
 ) {
     // Never blacklist the all-zero sentinel (write used to emit this on
     // mis-attributed rejects). Never freeze tip on pipeline "already spent"
@@ -648,20 +669,32 @@ pub(crate) fn apply_confirm_reject(
         warn!("ibd: confirm reject ignored zero-hash @{height}: {err}");
         return;
     }
-    if err.contains("prevout already spent") {
-        // Likely dup write after claim race (write path prefers Accepted when
-        // has_block). Do not permanent-blacklist a valid tip extension — but
-        // **always** release wire soft budget: write still emits Reject when
-        // has_block is false (genuine PrevoutSpent / structural), and a stuck
-        // charge blocks assign + offer ready.
+    // Soft / re-get paths: do **not** permanent-blacklist tip+1.
+    // - prevout spent: claim race after successful commit
+    // - unexpected previous header: wrong/corrupt wire for this height (peer
+    //   or bq mismatch) — drop body-queue payload and re-getdata (mainnet tip
+    //   freeze at 125653 blacklisted for this string).
+    let soft_reget = err.contains("prevout already spent")
+        || err.contains("unexpected previous header")
+        || err.contains("unexpected previous");
+    if soft_reget {
         release_confirm_archive_charge(st, &hash, archive_queued);
+        clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+        // Evict bad wire so claim_ready is false until a good body arrives.
+        if let Some(q) = query {
+            let _ = q.block_queue_dequeue_height(height);
+        }
+        st.body.mark_missing(hash);
         warn!(
-            "ibd: confirm reject not blacklisted @{height} {hash}: {err} (treat as transient)"
+            "ibd: confirm reject soft @{height} {hash}: {err} (re-getdata, not blacklisted)"
         );
         return;
     }
     // Wire path charged soft budget on receive — release before drop marker.
     release_confirm_archive_charge(st, &hash, archive_queued);
+    if let Some(q) = query {
+        let _ = q.block_queue_dequeue_height(height);
+    }
     st.body.mark_rejected(hash);
     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
@@ -707,6 +740,7 @@ mod confirm_reject_tests {
             zero,
             "consensus: prevout already spent on best chain",
             None,
+            None,
         );
         assert!(!st.body.is_rejected(&zero));
 
@@ -722,6 +756,7 @@ mod confirm_reject_tests {
             362_595,
             hash,
             "consensus: prevout already spent on best chain",
+            None,
             None,
         );
         assert!(
@@ -743,6 +778,7 @@ mod confirm_reject_tests {
             51,
             hash,
             "consensus: script verification failed: script false",
+            None,
             None,
         );
         assert!(st.body.is_rejected(&hash));
@@ -772,6 +808,7 @@ mod confirm_reject_tests {
                 hash,
                 "consensus: script verification failed: script false",
                 Some(&budget),
+                None,
             );
             assert_eq!(
                 budget.count(),
@@ -802,6 +839,7 @@ mod confirm_reject_tests {
                 hash,
                 "consensus: prevout already spent on best chain",
                 Some(&budget),
+                None,
             );
             assert_eq!(
                 budget.count(),
@@ -816,9 +854,32 @@ mod confirm_reject_tests {
                 !st.body.is_rejected(&hash),
                 "prevout-spent remains soft (not permanent blacklist)"
             );
+        }
+
+        // Unexpected previous header (bad wire for tip+1) must re-getdata, not freeze.
+        {
+            let mut st = IbdWorkState::new(Vec::new(), None, Some(50));
+            let hash = h(0x44);
+            budget.charge(wire);
+            st.body.mark_archive_charged_bytes(hash, wire);
+            st.ordered.push_back(hash);
+            st.ordered_set.insert(hash);
+            apply_confirm_reject(
+                &mut st,
+                51,
+                hash,
+                "consensus: unexpected previous header",
+                Some(&budget),
+                None,
+            );
+            assert_eq!(budget.count(), 0);
             assert!(
-                st.ordered_set.contains(&hash),
-                "soft path leaves ordered for re-offer / operator path"
+                !st.body.is_rejected(&hash),
+                "unexpected prev must not permanent-blacklist tip+1"
+            );
+            assert!(
+                !st.body.is_pending(&hash),
+                "bad body cleared so densify can re-get"
             );
         }
     }
@@ -1286,14 +1347,15 @@ mod confirm_reject_tests {
             local,
             None,
         );
-        assert_eq!(budget.count(), 1);
-        assert!(st.body.is_archive_charged(&h1));
+        // Disk body-queue path: pending, no soft charge; arch_job when no confirm feed.
+        assert_eq!(budget.count(), 0, "disk offer is not soft-charged");
+        assert!(!st.body.is_archive_charged(&h1));
         assert!(st.body.is_pending(&h1));
-        let job = arch_rx.try_recv().expect("ArchiveJob enqueued");
+        assert!(hub.query.block_queue_has_height(1));
+        let job = arch_rx.try_recv().expect("ArchiveJob enqueued (no confirm feed)");
         assert_eq!(job.block.block_hash(), h1);
-        assert!(job.priority, "height 1 is near tip/write_next");
 
-        // Redelivery while charged: no second charge.
+        // Redelivery while pending / already in body queue: no second job.
         apply_peer_event(
             &mut st,
             &hub,
@@ -1308,7 +1370,7 @@ mod confirm_reject_tests {
             local,
             None,
         );
-        assert_eq!(budget.count(), 1);
+        assert_eq!(budget.count(), 0);
         assert!(arch_rx.try_recv().is_err());
 
         // Beyond ContigPark horizon → mark_missing, no charge.

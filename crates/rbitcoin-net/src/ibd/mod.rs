@@ -109,17 +109,9 @@ pub(crate) const TIP_HOLE_THIRD_PEER_AFTER: Duration = Duration::from_secs(10);
 pub(crate) const MAX_PEER_POOL: usize = 256;
 /// Pending (framed, not Class A) longer than this → re-getdata.
 pub(crate) const PENDING_STALE: Duration = Duration::from_secs(45);
-/// ContigPark race-band pending: re-getdata much sooner (slow peer / stuck prep).
-pub(crate) const CONTIG_PARK_PENDING_STALE: Duration = Duration::from_secs(5);
-/// Max hashes per densify getdata batch.
-pub(crate) const FAR_BATCH_MAX: usize = 16;
 /// Cap height scan for densify candidates per assign tick.
 pub(crate) const FAR_SCAN_BUDGET: usize = 16_384;
-/// Multi-peer race only on ContigPark `write_next`‥`write_next+R-1` (rest of
-/// densify band is single-peer).
-pub(crate) const CONTIG_PARK_RACE: usize = 8;
-/// ContigPark densify horizon past `write_next` (single-peer feed). Also hard
-/// park horizon: refuse to charge/park bodies further ahead.
+/// Body-queue densify horizon past tip+1. Also hard receive horizon past tip.
 pub(crate) const CONTIG_DENSIFY_AHEAD: u32 = 2048;
 
 /// Tunables for IBD (defaults lean libbitcoin/Core-ish).
@@ -500,6 +492,7 @@ pub async fn ibd_cancellable(
                         hash,
                         &err,
                         Some(&archive_queued),
+                        Some(hub.query.as_ref()),
                     );
                 }
             }
@@ -616,6 +609,7 @@ pub async fn ibd_cancellable(
                         hash,
                         &err,
                         Some(&archive_queued),
+                        Some(hub.query.as_ref()),
                     );
                 }
             }
@@ -1170,6 +1164,7 @@ pub async fn ibd_cancellable(
                                 hash,
                                 &err,
                                 Some(&archive_queued),
+                                Some(hub.query.as_ref()),
                             );
                         }
                     }
@@ -1408,7 +1403,7 @@ mod tip_hole_race_tests {
 mod park_race_assign_tests {
     use super::assign::{archive_pipeline_saturated, park_race_need};
     use super::state::IbdWorkState;
-    use super::CONTIG_PARK_RACE;
+
     use bitcoin::hashes::Hash;
     use bitcoin::BlockHash;
     use rbitcoin_consensus::{ChainParams, Milestone};
@@ -1421,7 +1416,7 @@ mod park_race_assign_tests {
     }
 
     #[test]
-    fn park_race_need_only_write_next_prefix() {
+    fn park_race_need_tip_batch_window() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-park-race-{}",
             std::time::SystemTime::now()
@@ -1434,33 +1429,29 @@ mod park_race_assign_tests {
         let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
 
         let mut st = IbdWorkState::new(vec![], None, None);
-        // Heights 100..=120 on the ordered path; race is write_next..+R-1 only.
-        for ht in 100u32..=120 {
+        // Heights 100..=140; tip batch is write_next..+TIP_HOLE_MAX-1 (32).
+        for ht in 100u32..=140 {
             let hash = h(ht);
             st.record_height(hash, ht);
             st.ordered_set.insert(hash);
             st.ordered.push_back(hash);
             st.max_ordered_height = ht;
         }
-        // 100 pending (in pipeline), 101 known archived, 102 inflight → race keeps it.
         st.body.mark_pending(h(100));
         st.body.mark_archived(h(101));
         st.inflight
             .insert(h(102), super::state::InflightReq::new(0));
 
         let need = park_race_need(&mut st, &hub, 100);
-        assert!(!need.is_empty(), "expected park-race need");
-        // 100 pending + 101 archived skipped; 102 inflight is kept for multi-peer race.
-        assert_eq!(need[0], h(102), "inflight kept for race prefix");
+        assert!(!need.is_empty(), "expected tip-batch need");
+        assert_eq!(need[0], h(102), "inflight kept for multi-peer race");
         assert!(need.iter().all(|x| *x != h(100) && *x != h(101)));
-        // Densify-only heights beyond race prefix must not appear.
-        let race_hi = 100 + CONTIG_PARK_RACE as u32 - 1;
+        let batch_hi = 100 + super::TIP_HOLE_MAX as u32 - 1;
         for hash in &need {
             let ht = st.hash_height[hash];
-            assert!((100..=race_hi).contains(&ht), "ht={ht} outside race");
+            assert!((100..=batch_hi).contains(&ht), "ht={ht} outside tip batch");
         }
-        // Height just past race prefix is densify, not multi-peer race need.
-        assert!(!need.contains(&h(race_hi + 1)));
+        assert!(!need.contains(&h(batch_hi + 1)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1468,7 +1459,8 @@ mod park_race_assign_tests {
     fn archive_pipeline_saturated_gates_full_assign() {
         assert!(!archive_pipeline_saturated(0, 0, 0.0));
         assert!(!archive_pipeline_saturated(200, 32, 0.95)); // inflight still high
-        assert!(archive_pipeline_saturated(96, 0, 0.0));
+        // Pending alone does **not** gate densify (body-queue model).
+        assert!(!archive_pipeline_saturated(96, 0, 0.0));
         assert!(archive_pipeline_saturated(0, 0, 0.85));
         assert!(archive_pipeline_saturated(200, 15, 0.9));
     }

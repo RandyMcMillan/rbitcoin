@@ -872,6 +872,10 @@ pub fn confirm_write_phase(
             )?;
         }
     }
+    // Prep-ahead may have pinned parents from prior in-flight plans without
+    // denserels (those creates were not durable at prep). After ordered commit
+    // of earlier batches they are on disk — fill abs layout before structural.
+    fill_missing_parent_layouts(query, &mut batch.batch_parents)?;
 
     // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
     let t_struct = Instant::now();
@@ -912,8 +916,8 @@ pub fn confirm_write_phase(
 /// After Class A commit, set body_range + denserels for **planned** creates only.
 ///
 /// Uses offline pack (same encoding as disk) + `tx_body_range_batch` — **no**
-/// Class A body pread / `load_creates_once`. External parents were already
-/// pinned with denserels at prep.
+/// Class A body pread / `load_creates_once`. Same-batch creates only; cross-batch
+/// prep-ahead parents are filled by [`fill_missing_parent_layouts`].
 fn fill_planned_create_layout_after_commit(
     query: &Query,
     batch_parents: &mut rbitcoin_query::BatchParents,
@@ -948,6 +952,40 @@ fn fill_planned_create_layout_after_commit(
             continue;
         };
         batch_parents.set_layout(*fk, (off, len), &dense_rels);
+    }
+    Ok(())
+}
+
+/// Fill denserels/abs for parents pinned without layout (prep-ahead in-flight).
+///
+/// Prep(N+1) may pin creates from plan(N) via `in_flight_outs` before N commits
+/// Class A — those pins carry outs for assemble/scripts but empty denserels.
+/// Ordered write guarantees N is durable before N+1 structural; load layout once.
+fn fill_missing_parent_layouts(
+    query: &Query,
+    batch_parents: &mut rbitcoin_query::BatchParents,
+) -> Result<(), ConsensusError> {
+    use rbitcoin_store::IdxBodyMode;
+
+    let fks = batch_parents.fks_missing_layout();
+    if fks.is_empty() {
+        return Ok(());
+    }
+    let loaded = rbitcoin_query::load_creates_once(
+        query.store(),
+        query.create_residency(),
+        &fks,
+        IdxBodyMode::OutsDenserels,
+    )
+    .map_err(ConsensusError::Store)?;
+    let secret = query.store().txs.store_secret();
+    for c in loaded {
+        let Ok((_tx, _outs, dense_rels)) =
+            rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(&c.raw, Some(secret))
+        else {
+            continue;
+        };
+        batch_parents.set_layout(c.fk, c.body_range, &dense_rels);
     }
     Ok(())
 }

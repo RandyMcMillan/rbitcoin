@@ -2203,6 +2203,121 @@ fn unified_wire_pipeline_multi_block_to_tip() {
     }
 }
 
+/// Prep(N+1) while N is still uncommitted pins parents from in-flight outs
+/// **without denserels**. Write of N+1 must fill layout after N commits, or
+/// structural spentness / spend annotate fails with
+/// `missing pin denserels/abs` (mainnet IBD after prep-ahead: reject@tip+1).
+#[test]
+fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
+    use rbitcoin_consensus::{
+        confirm_scripts_phase, confirm_wire_prep_phase_pipelined, confirm_write_phase,
+        ChainParams, Milestone, ScriptPreverified, WirePrepPipeline,
+    };
+    use std::collections::HashMap;
+
+    let td = TestDatadir::new().unwrap();
+    let q = Query::open_or_create(td.store_path()).unwrap();
+    q.enter_direct_index_mode().unwrap();
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+
+    let genesis = regtest_genesis();
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+
+    let b1 = mine_regtest_block(tip, tip_time + 600, 1, vec![]);
+    let cb1 = b1.txdata[0].compute_txid();
+    rbitcoin_consensus::confirm_wire_run(
+        &q,
+        &params,
+        ms,
+        &[(Height(1), b1.clone())],
+    )
+    .unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+    for h in 2..=maturity {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        rbitcoin_consensus::confirm_wire_run(&q, &params, ms, &[(Height(h), b.clone())])
+            .unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+    assert_eq!(q.tip_height(), Some(Height(maturity)));
+
+    // Batch A: spend mature coinbase → new anyone-can-spend out.
+    let ha = maturity + 1;
+    let spend_a = spend_anyone_can_spend(cb1, 0, Amount::from_sat(49_0000_0000));
+    let ba = mine_regtest_block(tip, tip_time + 600, ha, vec![spend_a]);
+    let a_out_txid = ba.txdata[1].compute_txid();
+    let ha_hash = ba.block_hash();
+
+    // Batch B: spend A's non-coinbase out (parent create is only in plan A).
+    let hb = maturity + 2;
+    let spend_b = spend_anyone_can_spend(a_out_txid, 0, Amount::from_sat(48_0000_0000));
+    let bb = mine_regtest_block(ha_hash, tip_time + 1200, hb, vec![spend_b]);
+
+    let mut pipe = WirePrepPipeline {
+        path_lo: ha,
+        parent_hash: None,
+        next_tx_start: q.tx_body_count().saturating_add(1).max(1),
+        in_flight_creates: HashMap::new(),
+        in_flight_outs: HashMap::new(),
+    };
+    let mat_a = confirm_wire_prep_phase_pipelined(
+        &q,
+        &params,
+        ms,
+        &[(Height(ha), ba.clone())],
+        &ScriptPreverified::new(),
+        Some(&pipe),
+    )
+    .expect("prep A");
+    assert_eq!(q.tip_height(), Some(Height(maturity)), "prep must not tip");
+
+    let plan_a = mat_a.batch.archive_plan.as_ref().expect("plan A");
+    for ((tx, _ins, outs), fk) in plan_a.packed.iter().zip(plan_a.planned_fks.iter()) {
+        pipe.in_flight_creates.insert(tx.txid, *fk);
+        if let Some(id) = fk.get() {
+            pipe.in_flight_outs.insert(id, (tx.clone(), outs.clone()));
+        }
+    }
+    if let Some(last) = plan_a.planned_fks.last().and_then(|f| f.get()) {
+        pipe.next_tx_start = last.saturating_add(1).max(1);
+    }
+    pipe.path_lo = hb;
+    pipe.parent_hash = Some(ha_hash.to_byte_array());
+
+    // Prep B while A is still uncommitted — parent pin uses in_flight_outs
+    // (no denserels). This is the IBD prep∥write pipeline shape.
+    let mat_b = confirm_wire_prep_phase_pipelined(
+        &q,
+        &params,
+        ms,
+        &[(Height(hb), bb.clone())],
+        &ScriptPreverified::new(),
+        Some(&pipe),
+    )
+    .expect("prep B while tip still at maturity");
+    assert_eq!(q.tip_height(), Some(Height(maturity)));
+
+    let ok_a = confirm_scripts_phase(mat_a.batch).expect("scripts A");
+    confirm_write_phase(&q, &params, ms, ok_a.batch).expect("write A");
+    assert_eq!(q.tip_height(), Some(Height(ha)));
+
+    // Regression: without fill_missing_parent_layouts after A commits, write B
+    // fails: "structural spentness missing pin denserels/abs".
+    let ok_b = confirm_scripts_phase(mat_b.batch).expect("scripts B");
+    confirm_write_phase(&q, &params, ms, ok_b.batch).unwrap_or_else(|e| {
+        panic!(
+            "write B after prep-ahead must fill parent denserels from committed A (got {e})"
+        );
+    });
+    assert_eq!(q.tip_height(), Some(Height(hb)));
+}
+
 /// Structural double-spend still rejects on the wire path.
 #[test]
 fn unified_wire_pipeline_rejects_double_spend() {

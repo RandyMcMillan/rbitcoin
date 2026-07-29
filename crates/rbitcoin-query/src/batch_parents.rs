@@ -157,6 +157,18 @@ impl BatchParents {
         e.spender_rels = sparse_spender_rels(dense_rels, &need);
     }
 
+    /// Create fks pinned without body_range / spender rels (prep-ahead in-flight parents).
+    ///
+    /// Write fills these after prior pipeline batches have committed Class A so
+    /// structural spentness and spend annotate can bulk-pread denserels abs.
+    pub fn fks_missing_layout(&self) -> Vec<Fk> {
+        self.by_fk
+            .iter()
+            .filter(|(_, e)| e.body_range.is_none() || e.spender_rels.is_empty())
+            .map(|(&id, _)| Fk(id))
+            .collect()
+    }
+
     /// Absolute 9-byte spender meta offset for `vout`, if layout known.
     ///
     /// Returns `None` when body range or denserels were not prepared (caller

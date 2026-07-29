@@ -126,10 +126,16 @@ pub(crate) struct IbdPerfSample {
     pub load_pin_cache_body: u64,
     /// Pin hits from CreateResidency (subset of pin_cache when residency filled).
     pub load_pin_residency: u64,
+    /// Wire plan / in-flight parent pins (not denserels hits).
+    pub load_pin_plan: u64,
     pub load_pin_new: u64,
     pub load_pin_spent_ms: u64,
     pub load_pin_body_ms: u64,
     pub load_pin_new_meta_ms: u64,
+    pub load_plan_pin_ms: u64,
+    pub load_res_hit_ms: u64,
+    pub load_cold_io_ms: u64,
+    pub load_cold_decode_ms: u64,
     pub load_body_tx_reads: u64,
     pub load_parent_tx_reads: u64,
     pub load_missing_parents: u64,
@@ -289,10 +295,15 @@ impl Default for IbdPerfSample {
             load_parent_unique: 0,
             load_pin_cache_body: 0,
             load_pin_residency: 0,
+            load_pin_plan: 0,
             load_pin_new: 0,
             load_pin_spent_ms: 0,
             load_pin_body_ms: 0,
             load_pin_new_meta_ms: 0,
+            load_plan_pin_ms: 0,
+            load_res_hit_ms: 0,
+            load_cold_io_ms: 0,
+            load_cold_decode_ms: 0,
             load_body_tx_reads: 0,
             load_parent_tx_reads: 0,
             load_missing_parents: 0,
@@ -603,10 +614,15 @@ pub(crate) fn sample(
         load_parent_unique: pw.parent_unique,
         load_pin_cache_body: pw.pin_cache_body,
         load_pin_residency: pw.pin_residency,
+        load_pin_plan: pw.pin_plan,
         load_pin_new: pw.pin_new,
         load_pin_spent_ms: ns_ms(pw.pin_spent_ns),
         load_pin_body_ms: ns_ms(pw.pin_body_ns),
         load_pin_new_meta_ms: ns_ms(pw.pin_new_meta_ns),
+        load_plan_pin_ms: ns_ms(pw.plan_pin_ns),
+        load_res_hit_ms: ns_ms(pw.res_hit_ns),
+        load_cold_io_ms: ns_ms(pw.cold_io_ns),
+        load_cold_decode_ms: ns_ms(pw.cold_decode_ns),
         load_body_tx_reads: pw.body_tx,
         load_parent_tx_reads: pw.parent_tx,
         load_missing_parents: pw.missing,
@@ -733,8 +749,8 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     append_nz(&mut out, "wire_ms", s.wire_ms);
     append_nz(&mut out, "resolve_ms", s.resolve_ms);
 
-    // Prep stage detail: phase walls + pin mix + denserels IO.
-    // pin_hit% = (FIFO+same-batch+residency) / (those + cold pin_new after residency).
+    // Prep stage detail: pin mix + denserels IO.
+    // pin_hit% = (plan+res) / (plan+res+cold). denserels_hit% = res / (res+cold).
     let pin_hit_pct = {
         let hits = s.load_pin_cache_body;
         let tot = hits.saturating_add(s.load_pin_new);
@@ -744,19 +760,41 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             0
         }
     };
+    let denserels_hit_pct = {
+        let hits = s.load_pin_residency;
+        let tot = hits.saturating_add(s.load_pin_new);
+        if tot > 0 {
+            (100 * hits) / tot
+        } else {
+            0
+        }
+    };
+    // Prefer wire pin sub-timers when present; fall back to aggregate pin body/new_io.
+    let plan_ms = if s.load_plan_pin_ms > 0 {
+        s.load_plan_pin_ms
+    } else {
+        s.load_pin_body_ms
+    };
+    let res_ms = s.load_res_hit_ms;
+    let cold_io_ms = if s.load_cold_io_ms > 0 {
+        s.load_cold_io_ms
+    } else {
+        s.load_pin_new_meta_ms
+    };
+    let cold_dec_ms = s.load_cold_decode_ms;
     out.push_str(&format!(
-        " | prep blks={} win={}ms phases hdr={} dec={} put={} thin={} pin={} (fifo={}ms new_io={}ms) pin_hit%={} pin_cache={} pin_res={} pin_new={} body_io={} parent_io={}",
+        " | prep blks={} win={}ms pin={}ms (plan={}ms res={}ms cold_io={}ms cold_dec={}ms) \
+         pin_hit%={} denserels_hit%={} pin_plan={} pin_res={} pin_new={} body_io={} parent_io={}",
         s.load_blocks,
         s.load_win_ms,
-        s.load_hdr_ms,
-        s.load_decode_ms,
-        s.load_cache_put_ms,
-        s.load_thin_ms,
         s.load_parent_pin_ms,
-        s.load_pin_body_ms,
-        s.load_pin_new_meta_ms,
+        plan_ms,
+        res_ms,
+        cold_io_ms,
+        cold_dec_ms,
         pin_hit_pct,
-        s.load_pin_cache_body,
+        denserels_hit_pct,
+        s.load_pin_plan,
         s.load_pin_residency,
         s.load_pin_new,
         s.load_body_tx_reads,
@@ -1222,7 +1260,6 @@ mod tests {
         let line = format_info(&s);
         assert!(line.contains("prepq=1/2 writeq=2/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
-        assert!(line.contains("pin_cache=8"), "{line}");
         assert!(line.contains("pin_res=3"), "{line}");
         assert!(line.contains("pin_new=12"), "{line}");
         assert!(line.contains("body_io=400 parent_io=12"), "{line}");
@@ -1232,11 +1269,10 @@ mod tests {
         );
         // write = 50+40+25+5 = 120
         assert!(line.contains("write=120ms"), "{line}");
-        // pin_hit% = 8/(8+12) = 40
+        // pin_hit% = 8/(8+12) = 40; denserels_hit% = 3/(3+12) = 20
         assert!(line.contains("pin_hit%=40"), "{line}");
-        assert!(line.contains("thin=5"), "{line}");
-        assert!(line.contains("put=2"), "{line}");
-        assert!(line.contains("new_io=14ms"), "{line}");
+        assert!(line.contains("denserels_hit%=20"), "{line}");
+        assert!(line.contains("cold_io=14ms"), "{line}");
         assert!(!line.contains("thin[col="), "{line}");
         assert!(!line.contains("by_fk="), "{line}");
         assert!(!line.contains("pin_cached="), "{line}");

@@ -111,11 +111,18 @@ pub mod confirm_load_stats {
     pub static PIN_CACHE_BODY: AtomicU64 = AtomicU64::new(0);
     /// Of no-IO pins: filled from CreateResidency (schema 12 shared map).
     pub static PIN_RESIDENCY: AtomicU64 = AtomicU64::new(0);
+    /// Wire plan / in-flight parent pins (subset of pin_cache; not denserels hits).
+    pub static PIN_PLAN: AtomicU64 = AtomicU64::new(0);
     /// Pin candidates that missed FIFO/same-batch (may still hit residency before store).
     pub static PIN_NEW: AtomicU64 = AtomicU64::new(0);
     pub static PIN_SPENT_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_BODY_NS: AtomicU64 = AtomicU64::new(0);
     pub static PIN_NEW_META_NS: AtomicU64 = AtomicU64::new(0);
+    /// Wire pin sub-walls (ns).
+    pub static PLAN_PIN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static RES_HIT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static COLD_IO_NS: AtomicU64 = AtomicU64::new(0);
+    pub static COLD_DECODE_NS: AtomicU64 = AtomicU64::new(0);
     pub static PARENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
     pub static FULL_TX_READS: AtomicU64 = AtomicU64::new(0);
     pub static BODY_TX_READS: AtomicU64 = AtomicU64::new(0);
@@ -141,10 +148,15 @@ pub mod confirm_load_stats {
         pub parent_unique: u64,
         pub pin_cache_body: u64,
         pub pin_residency: u64,
+        pub pin_plan: u64,
         pub pin_new: u64,
         pub pin_spent_ns: u64,
         pub pin_body_ns: u64,
         pub pin_new_meta_ns: u64,
+        pub plan_pin_ns: u64,
+        pub res_hit_ns: u64,
+        pub cold_io_ns: u64,
+        pub cold_decode_ns: u64,
         pub cache_hits: u64,
         pub body_tx: u64,
         pub parent_tx: u64,
@@ -168,10 +180,15 @@ pub mod confirm_load_stats {
             parent_unique: PARENT_UNIQUE.swap(0, Ordering::Relaxed),
             pin_cache_body: PIN_CACHE_BODY.swap(0, Ordering::Relaxed),
             pin_residency: PIN_RESIDENCY.swap(0, Ordering::Relaxed),
+            pin_plan: PIN_PLAN.swap(0, Ordering::Relaxed),
             pin_new: PIN_NEW.swap(0, Ordering::Relaxed),
             pin_spent_ns: PIN_SPENT_NS.swap(0, Ordering::Relaxed),
             pin_body_ns: PIN_BODY_NS.swap(0, Ordering::Relaxed),
             pin_new_meta_ns: PIN_NEW_META_NS.swap(0, Ordering::Relaxed),
+            plan_pin_ns: PLAN_PIN_NS.swap(0, Ordering::Relaxed),
+            res_hit_ns: RES_HIT_NS.swap(0, Ordering::Relaxed),
+            cold_io_ns: COLD_IO_NS.swap(0, Ordering::Relaxed),
+            cold_decode_ns: COLD_DECODE_NS.swap(0, Ordering::Relaxed),
             cache_hits: PARENT_CACHE_HITS.swap(0, Ordering::Relaxed),
             body_tx: BODY_TX_READS.swap(0, Ordering::Relaxed),
             parent_tx: FULL_TX_READS.swap(0, Ordering::Relaxed),

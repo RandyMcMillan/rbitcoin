@@ -193,6 +193,52 @@ impl CreateResidency {
         let rels = e.denserels.clone().unwrap_or_default();
         Some((tx, outs, rels, e.body_range))
     }
+
+    /// Sparse pin hit: clone only `need_vouts` scripts + denserel slots (not full outs).
+    ///
+    /// Returns `None` when row missing, denserels incomplete, or a need vout is OOB.
+    /// Holds the map lock only while copying the sparse projection.
+    pub fn get_parent_needed(
+        &self,
+        fk: Fk,
+        need_vouts: &[u32],
+    ) -> Option<(
+        TxRecord,
+        Vec<(u32, OutputRecord)>,
+        Vec<(u32, u32)>,
+        Option<(u64, u64)>,
+    )> {
+        use crate::batch_parents::{layout_covers_need, sparse_spender_rels, SPENDER_REL_UNKNOWN};
+
+        let id = fk.get()?;
+        let g = self.inner.lock().unwrap();
+        let e = g.by_fk.get(&id)?;
+        let tx = e.tx.as_ref()?;
+        let outs = e.outs.as_ref()?;
+        let denserels = e.denserels.as_ref()?;
+        if denserels.is_empty() && !need_vouts.is_empty() {
+            return None;
+        }
+        let mut need: Vec<u32> = if need_vouts.is_empty() {
+            (0..outs.len() as u32).collect()
+        } else {
+            need_vouts.to_vec()
+        };
+        need.sort_unstable();
+        need.dedup();
+        let sparse = sparse_spender_rels(denserels, &need);
+        if !layout_covers_need(e.body_range, &sparse, &need) {
+            return None;
+        }
+        let mut live = Vec::with_capacity(need.len());
+        for &v in &need {
+            let o = outs.get(v as usize)?;
+            // denserels slot already validated by layout_covers_need
+            let _ = denserels.get(v as usize).filter(|&&r| r != SPENDER_REL_UNKNOWN)?;
+            live.push((v, o.clone()));
+        }
+        Some((tx.clone(), live, sparse, e.body_range))
+    }
 }
 
 impl Inner {

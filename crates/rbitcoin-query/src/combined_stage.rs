@@ -38,6 +38,12 @@ pub struct CombinedCreate {
         Vec<rbitcoin_store::OutputRecord>,
         Vec<u32>,
     )>,
+    /// When `mode == OutsDenserels`, decoded meta/outs/denserels (avoid re-decode on pin).
+    pub decoded_outs: Option<(
+        rbitcoin_store::TxRecord,
+        Vec<rbitcoin_store::OutputRecord>,
+        Vec<u32>,
+    )>,
 }
 
 /// Load creates by fk (and optional known ranges from residency), decode once,
@@ -71,6 +77,7 @@ pub fn load_creates_once(
         };
         BODY_OK_READS.fetch_add(1, Ordering::Relaxed);
         let mut decoded_full = None;
+        let mut decoded_outs = None;
         match mode {
             IdxBodyMode::Full => {
                 if let Ok((tx, ins, outs, rels)) =
@@ -96,7 +103,15 @@ pub fn load_creates_once(
                 if let Ok((tx, outs, rels)) =
                     decode_packed_tx_outs_with_spender_rels_secret(&job.body, Some(secret))
                 {
-                    residency.put_outs(*fk, tx, outs, rels, Some(range));
+                    // Clone into residency; keep decoded for pin without re-decode.
+                    residency.put_outs(
+                        *fk,
+                        tx.clone(),
+                        outs.clone(),
+                        rels.clone(),
+                        Some(range),
+                    );
+                    decoded_outs = Some((tx, outs, rels));
                 } else if job.body.len() >= 32 {
                     let mut txid = [0u8; 32];
                     txid.copy_from_slice(&job.body[..32]);
@@ -109,6 +124,7 @@ pub fn load_creates_once(
             body_range: range,
             raw: job.body,
             decoded_full,
+            decoded_outs,
         });
     }
     Ok(out)

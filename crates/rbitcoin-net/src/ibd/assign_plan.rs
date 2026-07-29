@@ -53,6 +53,7 @@ pub(crate) fn compact_ordered(
 }
 
 /// Densify slots per peer: drip while a tip hole exists, else half of `per_peer`.
+#[cfg(test)]
 pub(crate) fn far_slots_per_peer(per_peer: usize, tip_hole: bool) -> usize {
     if tip_hole {
         2

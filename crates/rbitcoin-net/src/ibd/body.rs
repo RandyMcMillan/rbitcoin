@@ -138,6 +138,7 @@ impl BodyPresence {
     ///
     /// Covers stuck decode/archive after [`mark_pending`] (tip hole otherwise
     /// never re-requests because `skip_download` treats pending as done).
+    #[cfg(test)]
     pub(crate) fn expire_stale_pending(&mut self, max_age: Duration) -> Vec<BlockHash> {
         self.expire_stale_pending_if(max_age, |_| true)
     }

@@ -67,7 +67,8 @@ pub(crate) fn inflight_add_peer(
         .add_peer(peer);
 }
 
-/// Scale densify per-peer slots by admission (`0.0`..=`1.0`). Kept for tests / plan helpers.
+/// Scale densify per-peer slots by admission (`0.0`..=`1.0`).
+#[cfg(test)]
 pub(crate) fn scale_feed_cap(base: usize, scale: f64) -> usize {
     if base == 0 || scale <= 0.0 {
         return 0;

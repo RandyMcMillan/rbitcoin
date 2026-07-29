@@ -594,6 +594,26 @@ pub(crate) fn update_confirm_lag(lag: &AtomicU32, tip: Option<u32>, max_archived
     lag.store(max_archived.saturating_sub(t), Ordering::Relaxed);
 }
 
+/// Drop soft `archive_queued` charge for `hash` (wire path budget on receive).
+///
+/// Called from every confirm terminal path that will not later emit Accepted
+/// for the same charge — permanent reject **and** soft prevout-spent (write
+/// still sends `Reject` when `has_block` is false; leaving the charge stuck
+/// stalls getdata / assign forever).
+fn release_confirm_archive_charge(
+    st: &mut IbdWorkState,
+    hash: &BlockHash,
+    archive_queued: Option<&ArchiveQueueBudget>,
+) {
+    if let Some(q) = archive_queued {
+        if let Some(wb) = st.body.take_archive_charge_bytes(hash) {
+            q.release(wb);
+        }
+    } else {
+        st.body.clear_archive_charged(hash);
+    }
+}
+
 pub(crate) fn apply_confirm_reject(
     st: &mut IbdWorkState,
     height: u32,
@@ -610,21 +630,19 @@ pub(crate) fn apply_confirm_reject(
         return;
     }
     if err.contains("prevout already spent") {
-        // Likely dup write after claim race (fixed separately). Do not
-        // permanent-blacklist a valid tip extension.
+        // Likely dup write after claim race (write path prefers Accepted when
+        // has_block). Do not permanent-blacklist a valid tip extension — but
+        // **always** release wire soft budget: write still emits Reject when
+        // has_block is false (genuine PrevoutSpent / structural), and a stuck
+        // charge blocks assign + offer ready.
+        release_confirm_archive_charge(st, &hash, archive_queued);
         warn!(
             "ibd: confirm reject not blacklisted @{height} {hash}: {err} (treat as transient)"
         );
         return;
     }
     // Wire path charged soft budget on receive — release before drop marker.
-    if let Some(q) = archive_queued {
-        if let Some(wb) = st.body.take_archive_charge_bytes(&hash) {
-            q.release(wb);
-        }
-    } else {
-        st.body.clear_archive_charged(&hash);
-    }
+    release_confirm_archive_charge(st, &hash, archive_queued);
     st.body.mark_rejected(hash);
     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
@@ -713,35 +731,77 @@ mod confirm_reject_tests {
     }
 
     /// Wire-path soft budget charged on receive must release on script reject
-    /// (otherwise archive_queued leaks forever and getdata stalls).
+    /// **and** on soft prevout-spent (write emits Reject when has_block is false;
+    /// early-return must not leak charge — mainnet tip-stall regression).
     #[test]
     fn confirm_reject_releases_archive_queued_budget() {
-        let mut st = IbdWorkState::new(Vec::new(), None, Some(50));
-        let hash = h(0x42);
         let budget = ArchiveQueueBudget::new(16 * 1024 * 1024);
         let wire = 250_000usize;
-        budget.charge(wire);
-        st.body.mark_archive_charged_bytes(hash, wire);
-        st.ordered.push_back(hash);
-        st.ordered_set.insert(hash);
-        assert_eq!(budget.count(), 1);
-        apply_confirm_reject(
-            &mut st,
-            51,
-            hash,
-            "consensus: script verification failed: script false",
-            Some(&budget),
-        );
-        assert_eq!(
-            budget.count(),
-            0,
-            "reject must release soft archive_queued charge"
-        );
-        assert!(
-            st.body.take_archive_charge_bytes(&hash).is_none(),
-            "charge marker consumed on reject"
-        );
-        assert!(st.body.is_rejected(&hash));
+
+        // Permanent script reject.
+        {
+            let mut st = IbdWorkState::new(Vec::new(), None, Some(50));
+            let hash = h(0x42);
+            budget.charge(wire);
+            st.body.mark_archive_charged_bytes(hash, wire);
+            st.ordered.push_back(hash);
+            st.ordered_set.insert(hash);
+            assert_eq!(budget.count(), 1);
+            apply_confirm_reject(
+                &mut st,
+                51,
+                hash,
+                "consensus: script verification failed: script false",
+                Some(&budget),
+            );
+            assert_eq!(
+                budget.count(),
+                0,
+                "script reject must release soft archive_queued charge"
+            );
+            assert!(
+                st.body.take_archive_charge_bytes(&hash).is_none(),
+                "charge marker consumed on reject"
+            );
+            assert!(st.body.is_rejected(&hash));
+        }
+
+        // Soft prevout-spent: not blacklisted, but charge **must** still drop.
+        // Write path only converts to Accepted when has_block; otherwise Reject
+        // reaches here with the wire charge still held (skeptic: tip stall).
+        {
+            let mut st = IbdWorkState::new(Vec::new(), None, Some(50));
+            let hash = h(0x43);
+            budget.charge(wire);
+            st.body.mark_archive_charged_bytes(hash, wire);
+            st.ordered.push_back(hash);
+            st.ordered_set.insert(hash);
+            assert_eq!(budget.count(), 1);
+            apply_confirm_reject(
+                &mut st,
+                51,
+                hash,
+                "consensus: prevout already spent on best chain",
+                Some(&budget),
+            );
+            assert_eq!(
+                budget.count(),
+                0,
+                "prevout-spent soft path must release archive_queued (no tip stall)"
+            );
+            assert!(
+                st.body.take_archive_charge_bytes(&hash).is_none(),
+                "charge marker consumed on soft prevout-spent"
+            );
+            assert!(
+                !st.body.is_rejected(&hash),
+                "prevout-spent remains soft (not permanent blacklist)"
+            );
+            assert!(
+                st.ordered_set.contains(&hash),
+                "soft path leaves ordered for re-offer / operator path"
+            );
+        }
     }
 
     #[test]

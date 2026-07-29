@@ -45,7 +45,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 **Height → txs:** `confirmed[h]` → `header_fk` → contiguous Class A range  
 `[header_txs_first[h−1], header_txs_first[h−1] + header_txs_count[h−1])`.
 
-**Who writes what:** see [`docs/concurrency.md`](./docs/concurrency.md). IBD: dedicated archive thread owns Class A; confirm owns Class C; peer IO does not write the store.
+**Who writes what:** see [`docs/concurrency.md`](./docs/concurrency.md). IBD unified pipeline: confirm **commit** stage is the sole Class A appender (+ Class C / spends / tip); prep only plans Class A; peer IO does not write the store.
 
 ---
 

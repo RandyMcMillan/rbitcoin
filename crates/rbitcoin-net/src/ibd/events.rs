@@ -712,6 +712,38 @@ mod confirm_reject_tests {
         assert!(!st.ordered_set.contains(&hash));
     }
 
+    /// Wire-path soft budget charged on receive must release on script reject
+    /// (otherwise archive_queued leaks forever and getdata stalls).
+    #[test]
+    fn confirm_reject_releases_archive_queued_budget() {
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(50));
+        let hash = h(0x42);
+        let budget = ArchiveQueueBudget::new(16 * 1024 * 1024);
+        let wire = 250_000usize;
+        budget.charge(wire);
+        st.body.mark_archive_charged_bytes(hash, wire);
+        st.ordered.push_back(hash);
+        st.ordered_set.insert(hash);
+        assert_eq!(budget.count(), 1);
+        apply_confirm_reject(
+            &mut st,
+            51,
+            hash,
+            "consensus: script verification failed: script false",
+            Some(&budget),
+        );
+        assert_eq!(
+            budget.count(),
+            0,
+            "reject must release soft archive_queued charge"
+        );
+        assert!(
+            st.body.take_archive_charge_bytes(&hash).is_none(),
+            "charge marker consumed on reject"
+        );
+        assert!(st.body.is_rejected(&hash));
+    }
+
     #[test]
     fn parent_height_zero_map_and_unknown() {
         let mut map = HashMap::new();

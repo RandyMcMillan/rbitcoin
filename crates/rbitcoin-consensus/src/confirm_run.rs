@@ -34,6 +34,7 @@ use rbitcoin_query::Query;
 use rbitcoin_store::StoreError;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// One height resolved for the confirm wave (header + Class A body fks).
@@ -107,7 +108,8 @@ pub struct WirePrepPipeline {
 /// structural / annotate (single ordered commit era).
 pub struct LoadedBatch {
     prepared: Vec<Prepared>,
-    wire_blocks: Vec<Block>,
+    /// Shared wire (Arc) so prep→scripts→write does not deep-clone full blocks.
+    wire_blocks: Vec<Arc<Block>>,
     /// Per-batch pin map: prep → assemble → write structural, then drop.
     batch_parents: rbitcoin_query::BatchParents,
     /// Mempool preverified txids for scripts stage (tip follow); empty on IBD.
@@ -121,7 +123,7 @@ pub struct LoadedBatch {
 /// `Send` so IBD can hand off scripts → write.
 pub struct ScriptOkBatch {
     prepared: Vec<Prepared>,
-    wire_blocks: Vec<Block>,
+    wire_blocks: Vec<Arc<Block>>,
     batch_parents: rbitcoin_query::BatchParents,
     pub archive_plan: Option<rbitcoin_query::ArchiveWritePlan>,
 }
@@ -304,7 +306,7 @@ pub fn confirm_wire_prep_phase_pipelined(
         rbitcoin_store::HeaderRecord,
         Vec<rbitcoin_query::TxApply>,
     )> = Vec::with_capacity(blocks.len());
-    let mut wire_blocks: Vec<Block> = Vec::with_capacity(blocks.len());
+    let mut wire_blocks: Vec<Arc<Block>> = Vec::with_capacity(blocks.len());
     let mut metas: Vec<BodyMeta> = Vec::with_capacity(blocks.len());
 
     let tip_h = query.tip_height().map(|h| h.0);
@@ -315,9 +317,11 @@ pub fn confirm_wire_prep_phase_pipelined(
     let path_lo = pipeline.map(|p| p.path_lo).unwrap_or(store_path_lo);
 
     for (i, (height, block)) in blocks.iter().enumerate() {
+        // One owned clone into Arc; later pipeline stages only bump the refcount.
+        let block = Arc::new(block.clone());
         let hash = block.block_hash().to_byte_array();
         let ctx = ValidationContext::at(params, *height, milestone);
-        let _ = crate::block::validate_block_structure_hashed(block, &ctx)?;
+        let _ = crate::block::validate_block_structure_hashed(block.as_ref(), &ctx)?;
         // First height must sit at pipeline path_lo (store tip+1, or last prepped+1).
         // Later heights in the same batch validate against prior wire, not store tip.
         if i == 0 {
@@ -343,7 +347,7 @@ pub fn confirm_wire_prep_phase_pipelined(
                     .map_err(|_| ConsensusError::InvalidPow)?;
             }
         } else {
-            let prev = &blocks[i - 1].1;
+            let prev = &wire_blocks[i - 1];
             if block.header.prev_blockhash != prev.block_hash() {
                 return Err(ConsensusError::BadPrev);
             }
@@ -358,7 +362,8 @@ pub fn confirm_wire_prep_phase_pipelined(
                 .map_err(|_| ConsensusError::InvalidPow)?;
         }
 
-        let (header_rec, txs) = crate::prepare_block_for_archive(query, params, block)?;
+        let (header_rec, txs) =
+            crate::prepare_block_for_archive(query, params, block.as_ref())?;
         let header_fk = if let Some((fk, _)) = query
             .get_header_by_hash(&header_rec.hash)
             .map_err(ConsensusError::Store)?
@@ -378,7 +383,7 @@ pub fn confirm_wire_prep_phase_pipelined(
             block.header.prev_blockhash.to_byte_array(),
         );
         with_fk.push((header_fk, header_rec.clone(), txs));
-        wire_blocks.push(block.clone());
+        wire_blocks.push(block);
         metas.push(BodyMeta {
             height: *height,
             hash,
@@ -537,7 +542,7 @@ fn pin_for_wire_batch(
     query: &Query,
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,
     metas: &[BodyMeta],
-    wire_blocks: &[Block],
+    wire_blocks: &[Arc<Block>],
     in_flight_outs: Option<
         &HashMap<u64, (rbitcoin_store::TxRecord, Vec<rbitcoin_store::OutputRecord>)>,
     >,
@@ -1682,7 +1687,7 @@ fn wire_rebuild(
     query: &Query,
     metas: &[BodyMeta],
     batch_bodies: &rbitcoin_query::BatchFullBodies,
-) -> Result<Vec<Block>, ConsensusError> {
+) -> Result<Vec<Arc<Block>>, ConsensusError> {
     // Sequential by design: `rayon_audit` benches show par_iter reconstruct is
     // *slower* than sequential for 1–128 blocks. Load decoded Class A once into
     // `batch_bodies` — wire builds `bitcoin::Transaction` from that map (store
@@ -1694,7 +1699,7 @@ fn wire_rebuild(
             .confirm_parent_cache()
             .get_header_plan(m.height.0)
             .map(|p| p.prev_hash);
-        blks.push(
+        blks.push(Arc::new(
             query
                 .reconstruct_archived_block_from_parts_cached(
                     m.header_rec.clone(),
@@ -1703,7 +1708,7 @@ fn wire_rebuild(
                     Some(batch_bodies),
                 )
                 .map_err(ConsensusError::Store)?,
-        );
+        ));
     }
     let ns = t0.elapsed().as_nanos() as u64;
     confirm_phase_stats::RECONSTRUCT_WIRE_NS.fetch_add(ns, Ordering::Relaxed);
@@ -1716,7 +1721,7 @@ fn assemble_run(
     params: &ChainParams,
     milestone: Milestone,
     metas: Vec<BodyMeta>,
-    wire_blocks: &[Block],
+    wire_blocks: &[Arc<Block>],
     batch_parents: &rbitcoin_query::BatchParents,
     batch_thin: &rbitcoin_query::BatchThin,
 ) -> Result<Vec<Prepared>, ConsensusError> {
@@ -1902,7 +1907,7 @@ fn structural_run(
     params: &ChainParams,
     milestone: Milestone,
     prepared: &[Prepared],
-    wire_blocks: &[Block],
+    wire_blocks: &[Arc<Block>],
     batch_parents: &rbitcoin_query::BatchParents,
 ) -> Result<crate::block::StructuralPhaseNs, ConsensusError> {
     use crate::block::StructuralPhaseNs;
@@ -1915,7 +1920,7 @@ fn structural_run(
         let ctx = ValidationContext::at(params, p.height, milestone);
         let ph = structural_validate_spends(
             query,
-            &wire_blocks[i],
+            wire_blocks[i].as_ref(),
             &ctx,
             Some(&p.tx_fks),
             &p.spends,

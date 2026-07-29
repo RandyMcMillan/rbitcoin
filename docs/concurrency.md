@@ -18,7 +18,10 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **Body queue:** `store/block_queue/` multi‑GiB payload FIFO + RAM overflow when full (`RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`, default 8 GiB). **Capacity is bytes only** — densify getdata stops when effective fill hits the budget (90%/70% hysteresis). A separate **height horizon** (`CONTIG_DENSIFY_AHEAD`, 64 k past tip) only bounds how far ahead of tip densify/receive may walk when the byte budget is still nearly empty (early small blocks). **Offer** on peer Block; prep **reads** by height; **dequeue** after confirm-commit. Restart re-notes feed readiness only (wire stays on disk until prep).
 
-**CreateResidency:** process-local fk/range/outs map shared for parent pin hits (raw FIFO). Prep seeds ranges/outs once per create on the pin path.
+**CreateResidency:** sole process-local create map for wire plan + pin (txid→fk,
+range, outs, denserels; raw FIFO). Class A commit seeds denserels offline so
+prep(N+1) hits without body re-read. Legacy archive sticky is a prewarm/stats
+mirror only (not on the plan hot path); OutFifo is not used on wire plan.
 
 **tx.head overflow:** depth-exhausted inserts → `tx.head.overflow` (overflow-first lookup).
 

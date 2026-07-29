@@ -152,6 +152,8 @@ impl ArchiveTxidSticky {
 
     /// Lookup by txid: hits skip head; range present ⇒ also skip idx for that create.
     /// Read-only — does **not** reorder the FIFO.
+    /// Legacy mirror lookup (wire plan uses CreateResidency only; kept for tests/prewarm stats).
+    #[allow(dead_code)]
     pub fn lookup_batch(&self, txids: &[[u8; 32]]) -> HashMap<[u8; 32], StickyHit> {
         if txids.is_empty() {
             return HashMap::new();

@@ -264,39 +264,15 @@ impl Query {
         let collect_ns = t_collect.elapsed().as_nanos() as u64;
 
         let t_sticky = Instant::now();
-        // Unified residency first (shared with confirm load), then legacy sticky,
-        // then OutFifo — one map is the hot hit path for parent fk/range.
+        // Single process-local create map (CreateResidency). Legacy sticky + OutFifo
+        // are no longer consulted on the wire plan path (dual-write hangover removed).
         let mut resolved: HashMap<[u8; 32], Fk> =
             HashMap::with_capacity(need_vec.len() / 2);
+        let mut sticky_hit_n = 0u64;
         for t in &need_vec {
             if let Some(fk) = self.create_residency.lookup_fk_by_txid(t) {
                 resolved.insert(*t, fk);
-            }
-        }
-        let sticky_hits = self.archive_txid_sticky.lookup_batch(&need_vec);
-        let sticky_hit_n = sticky_hits.len() as u64;
-        for (txid, hit) in sticky_hits {
-            resolved.entry(txid).or_insert(hit.fk);
-            // Bridge sticky → unified residency (range skips idx on confirm pin).
-            self.create_residency.insert_fk_txid_range(
-                hit.fk,
-                txid,
-                hit.body_range,
-            );
-        }
-        // Cross-cache read: confirm OutFifo may already hold create fk (from load).
-        let mut need_after_sticky: Vec<[u8; 32]> = Vec::new();
-        for t in &need_vec {
-            if !resolved.contains_key(t) {
-                need_after_sticky.push(*t);
-            }
-        }
-        if !need_after_sticky.is_empty() {
-            let fifo_hits = self
-                .confirm_parents
-                .lookup_fk_by_txid_batch(&need_after_sticky);
-            for (txid, fk) in fifo_hits {
-                resolved.insert(txid, fk);
+                sticky_hit_n = sticky_hit_n.saturating_add(1);
             }
         }
         let sticky_ns = t_sticky.elapsed().as_nanos() as u64;
@@ -423,15 +399,20 @@ impl Query {
         })
     }
 
-    /// Linear sticky prewarm: last `cap` Class A bodies via sequential `tx.idx`
-    /// order (bulk `body_txid_range` — no full decode / head probe).
+    /// Prewarm CreateResidency (and legacy sticky stats mirror) with last `cap`
+    /// Class A bodies via sequential `tx.idx` (bulk `body_txid_range`).
     ///
-    /// Call once before the IBD archive pipeline so cold restarts avoid a head
-    /// resolve storm. Returns `(loaded, elapsed_ms)`.
+    /// Call once before IBD so cold restarts avoid a head resolve storm.
+    /// Returns `(loaded, elapsed_ms)`.
     pub fn archive_sticky_prewarm(&self) -> Result<(usize, u64), QueryError> {
         use std::time::Instant;
         let t0 = Instant::now();
-        let cap = self.archive_txid_sticky.cap();
+        // Prefer residency cap (sole hot map); fall back to sticky cap for size.
+        let cap = self
+            .create_residency
+            .size_stats()
+            .1
+            .max(self.archive_txid_sticky.cap());
         let n = self.store.txs.count();
         if n == 0 || cap == 0 {
             return Ok((0, t0.elapsed().as_millis() as u64));
@@ -440,7 +421,6 @@ impl Query {
         let start = n.saturating_sub(cap as u64).saturating_add(1).max(1);
         let expect = (n.saturating_sub(start).saturating_add(1)) as usize;
         self.archive_txid_sticky.reserve_for_prewarm(expect);
-        // Same ballpark as head-resize bulk waves; sticky insert is cheap.
         const CHUNK: u64 = 8192;
         let mut loaded = 0usize;
         let mut cur = start;
@@ -459,6 +439,12 @@ impl Query {
                     Some((txid, fk, off, len))
                 })
                 .collect();
+            // Sole hot map for plan/pin.
+            for &(txid, fk, off, len) in &batch {
+                self.create_residency
+                    .insert_fk_txid_range(fk, txid, Some((off, len)));
+            }
+            // Legacy sticky mirror (size logs / older tests); not consulted on plan.
             self.archive_txid_sticky.insert_many_with_ranges(&batch);
             loaded = loaded.saturating_add(batch.len());
             cur = end + 1;
@@ -527,33 +513,57 @@ impl Query {
         }
         let htxs_ns = t.elapsed().as_nanos() as u64;
 
-        // Sticky only after head batch is published (fence in head_insert_many).
-        // Publish **this batch's creates only** — not parents just looked up from
-        // durable head (those thrash FIFO with cold long-tail keys). Include body
-        // ranges (dense planned fks → cheap sequential idx) so later sticky hits
-        // skip head + idx in prep/confirm.
+        // Publish **this batch's creates only** into CreateResidency (sole hot map)
+        // after head is durable. Seed denserels offline so prep(N+1) pin hits without
+        // Class A body re-read. Legacy sticky mirror kept for size logs only.
         let t = Instant::now();
         let ranges = self.store.tx_body_range_batch(&got_tx_fks)?;
+        let secret = self.store.txs.store_secret();
         let mut with_range: Vec<([u8; 32], Fk, u64, u64)> =
             Vec::with_capacity(plan.sticky_creates.len());
         let mut fk_only: Vec<([u8; 32], Fk)> = Vec::new();
-        for (&(txid, fk), range) in plan.sticky_creates.iter().zip(ranges.into_iter()) {
-            match range {
-                Some((off, len)) if len > 0 => with_range.push((txid, fk, off, len)),
-                _ => fk_only.push((txid, fk)),
+        for (((tx, ins, outs), fk), range) in plan
+            .packed
+            .iter()
+            .zip(got_tx_fks.iter())
+            .zip(ranges.into_iter())
+        {
+            let txid = tx.txid;
+            let body_range = match range {
+                Some((off, len)) if len > 0 => {
+                    with_range.push((txid, *fk, off, len));
+                    Some((off, len))
+                }
+                _ => {
+                    fk_only.push((txid, *fk));
+                    None
+                }
+            };
+            // Offline denserels (same packing as disk) → pin hit without body IO.
+            let mut raw = Vec::new();
+            rbitcoin_store::encode_packed_tx_with_secret(
+                tx,
+                ins,
+                outs,
+                &mut raw,
+                Some(secret),
+            );
+            if let Ok((meta, outs_dec, denserels)) =
+                rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
+                    &raw,
+                    Some(secret),
+                )
+            {
+                self.create_residency
+                    .put_outs(*fk, meta, outs_dec, denserels, body_range);
+            } else {
+                self.create_residency
+                    .insert_fk_txid_range(*fk, txid, body_range);
             }
         }
         self.archive_txid_sticky
             .insert_many_with_ranges(&with_range);
         self.archive_txid_sticky.insert_many(&fk_only);
-        // Unified residency: same creates for confirm pin (range hits skip idx).
-        for &(txid, fk, off, len) in &with_range {
-            self.create_residency
-                .insert_fk_txid_range(fk, txid, Some((off, len)));
-        }
-        for &(txid, fk) in &fk_only {
-            self.create_residency.insert_fk_txid_range(fk, txid, None);
-        }
         let sticky_ns = t.elapsed().as_nanos() as u64;
 
         let t = Instant::now();
@@ -875,6 +885,22 @@ mod tests {
         q.archive_commit_plan(plan).unwrap();
         let (len, _) = q.archive_txid_sticky_stats();
         assert_eq!(len, 1, "sticky must hold only the new create");
+        // Sole hot map: residency holds child with denserels; not the head parent.
+        assert_eq!(
+            q.create_residency().lookup_fk_by_txid(&child_txid),
+            Some(Fk(2))
+        );
+        assert!(
+            q.create_residency().get_outs(Fk(2)).is_some(),
+            "commit must seed denserels into residency for pin hits"
+        );
+        assert!(
+            q.create_residency()
+                .lookup_fk_by_txid(&parent_txid)
+                .is_none()
+                || q.create_residency().get_outs(Fk(1)).is_none(),
+            "head-resolved parent must not be denserels-published as a new create"
+        );
         let hits = q
             .archive_txid_sticky
             .lookup_batch(&[parent_txid, child_txid]);
@@ -883,10 +909,6 @@ mod tests {
             "head-resolved parent must not be sticky-published"
         );
         assert_eq!(hits.get(&child_txid).map(|h| h.fk), Some(Fk(2)));
-        assert!(
-            hits.get(&child_txid).and_then(|h| h.body_range).is_some(),
-            "commit should sticky-publish body range for new creates"
-        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

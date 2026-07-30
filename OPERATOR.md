@@ -106,25 +106,25 @@ tables before Electrum (the only deferred index work). On enter Direct, leftover
 `ibd_utxo.map` / `point.runs` / `tx.runs` from old Catchup datadirs are removed —
 prefer a **fresh datadir**.
 
-New stores (schema **v10**): **header.head** = **single** open-address file (~24 MiB
-pre-size; not 256-way), **scripthash** 16 shards, **tx.head** = single address file
-starting at mainnet **BITS=26** (~**256 MiB** sparse, `2^26` × **4 B** create_fk;
-override with `RBITCOIN_TX_HEAD_BITS` in `8..=34` / tiny scale). Probe is **page-local**:
-high txid bits select a 1024-slot page, double-hash within the page (one 4 KiB IO @ 4 B).
-**Online sequential resize** when `txs.count()/slots ≥ 0.80` or first deep insert
-(depth>128) / probe exhaust: shadow rebuild on a **dedicated OS thread**
-(`rbitcoin-tx-head-resize`). BITS **33+** use **8 B** entries. Layout (**v5**) lives in the
-`tx.head` **trailing footer** (page-local probe, slots at offset 0); no `tx.head.meta`
-sidecar. Older footers/meta force recreate + rebuild from Class A.
-**tx_height** uses 4 B height slots (not fk width). Dense Class A fk + **tx.idx**
-retained. Packed Class A only. Spends are schema-v5 annotations on create outputs
-(no `point.head`).
+New stores: **header.head** = **single** open-address file (~24 MiB pre-size; not
+256-way), **scripthash** 16 shards, **tx.head** = **segmented** fixed **25-bit**
+heads (`tx.head.meta` + `tx.head.NNNNNN`, **4 B relative** create ids, 128 MiB per
+segment). Probe is **page-local**: high mixed-txid bits select a 1024-slot page,
+double-hash within the page (one 4 KiB IO @ 4 B). Capacity ends at
+**`MIN(body soft span ~16 GiB, 80% of head slots)`**: seal builds **binary fuse8**
+(~9 bits/key) then opens a new segment (no mono-file bits-widen, no shadow
+resize thread). Open segment has **no** filter (always probed); sealed segments
+are fuse-gated newest→oldest. Legacy monolithic `tx.head` / `.new` / `.resize` /
+`.overflow` are **refused** — reindex. **tx_height** uses 4 B height slots.
+Dense Class A fk + segmented **tx.idx** retained. Packed Class A only. Spends are
+schema-v5 annotations on create outputs (no `point.head`).
 
-**Memory rule:** Direct IBD writes durable `tx.head` live and spend annotations
-on confirm. Class A is packed full-tx bodies; inputs always store **external**
-`prev_txid`. Parent resolve uses parent cache + `tx.head`. SH create dedupe is
-an **O(1) height watermark**; durable SH tables bulk-load at tip. Do not raise
-archive queues without watching RSS vs page cache.
+**Memory rule:** Direct IBD writes durable segmented `tx.head.*` live and spend
+annotations on confirm. Class A is packed full-tx bodies; inputs always store
+**external** `prev_txid`. Parent resolve uses parent cache + `tx.head` (open +
+fuse-gated sealed). SH create dedupe is an **O(1) height watermark**; durable SH
+tables bulk-load at tip. Do not raise archive queues without watching RSS vs
+page cache.
 
 ## Libre-relay-class policy (mempool + Electrum broadcast)
 

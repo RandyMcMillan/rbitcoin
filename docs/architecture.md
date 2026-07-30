@@ -86,7 +86,7 @@ Crash / tip commit: [`docs/crash-recovery.md`](./crash-recovery.md).
 
 | Class | Role | Mutation style |
 |-------|------|----------------|
-| **A** | Canonical archive: headers, packed txs (`tx.body` / `tx.idx` / `tx.head`) | Append bodies; publish via HWM / heads (**allocate-then-publish**) |
+| **A** | Canonical archive: headers, packed txs (`tx.body` / `tx.idx` / segmented `tx.head.*`) | Append bodies; publish via HWM / heads (**allocate-then-publish**) |
 | **B** | Forever-open indexes (e.g. Electrum scripthash) | Append + head updates; may grow forever per key |
 | **C** | Tip / confirmation: `confirmed[]`, `strong_tx`, `tx_height` | Tip advance is the **commit**; may lead/lag slightly across crash |
 
@@ -106,10 +106,11 @@ a LevelDB bag.
 
 ### Identity without fat keys
 
-`tx.head` is a **keyless address table** of dense create foreign keys (txid
-identity verified against body). Online **sequential resize** (shadow file +
-background fill) grows capacity without multi-writer open-hash chaos. See
-SCHEMA and operator notes on resize lag.
+`tx.head.*` is a **segmented keyless address table** of dense create foreign
+keys (txid identity verified against body): fixed **25-bit** open-address heads
+with **4 B relative** ids, roll at 80% load / body soft span, and **binary fuse8**
+built only on seal. Open segments always probe; sealed segments are fuse-gated.
+See SCHEMA.
 
 ---
 
@@ -134,10 +135,11 @@ budgets: [`docs/ibd-memory.md`](./ibd-memory.md).
    densify `getdata` — **not** peer TCP read/decode of already-requested
    blocks (see ibd-memory).
 5. **Bulk IO.** Linux prefers **io_uring** for multi-read / RMW paths (confirm
-   bodies, head resolve, spend annotate, `tx.head` resize fill) with a
-   **thread-local** bulk ring for batch pread/pwrite; `RBITCOIN_IO_URING=0`
-   (or non-Linux) falls back to pread/pwrite workers. No separate IOCP/kqueue
-   backend — same API surface, modality only.
+   bodies, head resolve, spend annotate) with a **thread-local** bulk ring for
+   batch pread/pwrite; `RBITCOIN_IO_URING=0` (or non-Linux) falls back to
+   pread/pwrite workers. Segmented `tx.head` insert stays mmap; fuse8 is built
+   in process RAM on seal. No separate IOCP/kqueue backend — same API surface,
+   modality only.
 
 ### Map growth
 

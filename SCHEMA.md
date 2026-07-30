@@ -215,23 +215,31 @@ Contiguous assignment required: block membership is an arithmetic range.
 
 ## Tx address head (segmented `tx.head.*`)
 
-Keyless open-address tables: **txid → dense create_fk**, one **fixed-bits** head per segment.
+Keyless open-address tables: **txid → dense create_fk**, one **fixed-bits** head
+per segment. There is **no** monolithic growing single `tx.head` file and **no**
+bits-widen / shadow-resize path.
 
 | Property | Current |
 |----------|---------|
 | Files | `tx.head.meta` + `tx.head.NNNNNN` (+ `tx.head.NNNNNN.fuse8` when sealed) |
 | Default | **BITS=25**, **4 B relative** entries → **128 MiB** per segment (`2^25` slots) |
-| Env | `RBITCOIN_TX_HEAD_BITS` in **8..=34** (tests/tiny); product default 25 |
+| Env | `RBITCOIN_TX_HEAD_BITS` in **8..=34** (tests/tiny only); product default **25** |
 | Entry | LE **relative** create id; **0 = empty**; `fk = first_fk + rel − 1` |
-| Capacity | Roll at **`MIN(body soft span ~16 GiB, 80% of head slots)`** — seal + new open (no bits-widen) |
-| Seal filter | **Binary fuse8** (~9 bits/key, no FN, FP ≈ 0.39%) built once on seal; open has **no** filter |
-| Probe | Page-local double-hash (1024 slots/page); one page load (4 KiB @ 4 B) |
-| Lookup | **Open always** → sealed **newest→oldest** (fuse gate) → body-verify candidates |
-| Legacy | Monolithic `tx.head` / `.new` / `.resize` / `.overflow` **refused** — reindex |
+| Capacity | Segment ends at **`MIN(body soft span ~16 GiB, 80% of head slots)`** → seal + new open |
+| Seal filter | **Binary fuse8** (~9 bits/key, no false negatives, FP ≈ 0.39%) built **once on seal**; open segment has **no** filter |
+| Probe | Page-local double-hash (1024 slots/page); one page load (4 KiB @ 4 B); max depth 1024 |
+| Insert | First empty in-page (or same relative id idempotent); second same-txid goes **deeper** |
+| Lookup | **Open always** → sealed **newest→oldest** (fuse gate) → body-verify candidates (deepest match wins, BIP30-shaped) |
+| Legacy | Monolithic `tx.head` / `tx.head.new` / `tx.head.resize` / `tx.head.overflow` **refused on open** — reindex |
 
-**Probe note:** all candidates for a key share one page (single IO). Keyless slots cannot Robin-Hood. Legacy mono-head datadirs must reindex.
+**Publish order on seal:** write fuse8 file durable → mark segment sealed in
+`tx.head.meta` → open next head for subsequent creates.
 
-**Capacity @ 0.80 load (25-bit):** ≈ **26.8 M creates/segment**, ~29 MiB fuse8 when sealed.
+**Probe note:** all candidates for a key share one page (single IO). Keyless
+slots cannot Robin-Hood. Incomplete seal after kill: delete incomplete
+segment/meta and rebuild from Class A, or reindex.
+
+**Capacity @ 0.80 load (25-bit):** ≈ **26.8 M creates/segment**, ~29 MiB fuse8 when sealed (~6.1 B total sealed storage per create including head slots).
 
 ---
 
@@ -316,7 +324,7 @@ Small control file (~32 B): magic, schema version, archive_mode flag, optional
 
 - `spenders(outpoint)`: confirmed-strong only; `spenders_raw` for full annotation multimap.
 - Electrum history / balance / listunspent: join thin SH rows → Class A → spends → Class C.
-- Optional manual `backfill_tx_index` rebuilds primary `tx.head` mappings (not part of tip entry).
+- Optional manual `backfill_tx_index` rebuilds segmented `tx.head.*` mappings from Class A (not part of tip entry).
 
 ---
 
@@ -326,5 +334,5 @@ Small control file (~32 B): magic, schema version, archive_mode flag, optional
 |-----|--------|
 | [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md) | Prior schema versions |
 | [`docs/concurrency.md`](./docs/concurrency.md) | Writer ownership, IBD vs tip |
-| [`docs/crash-recovery.md`](./docs/crash-recovery.md) | Kill safety, reorg, resize control |
+| [`docs/crash-recovery.md`](./docs/crash-recovery.md) | Kill safety, reorg, segmented head seal |
 | [`OPERATOR.md`](./OPERATOR.md) | Datadir ops, env knobs |

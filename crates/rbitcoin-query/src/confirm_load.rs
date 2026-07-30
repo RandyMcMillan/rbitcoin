@@ -623,6 +623,174 @@ mod pin_new_residency_tests {
     }
 }
 
+/// Drive shipped `load_confirm_parents` pin_new path with prep-miss facts.
+#[cfg(test)]
+mod pin_new_invariant_tests {
+    use crate::Query;
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+    use std::sync::Once;
+
+    fn temp_q(label: &str) -> (std::path::PathBuf, Query) {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-pin-new-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        q.enter_direct_index_mode().unwrap();
+        (dir, q)
+    }
+
+    /// Ghost create_fk on spend → pin_new cannot load parent body range.
+    #[test]
+    fn pin_new_missing_parent_body_is_invariant_error() {
+        let (dir, q) = temp_q("missing-parent");
+        let ghost_parent = Fk(999_999);
+        let mut hash = [0u8; 32];
+        hash[0] = 0x11;
+        let header = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207f_ffff,
+            nonce: 1,
+            merkle_root: hash,
+            hash,
+        };
+        let spend_tx = TxRecord {
+            txid: [0x22; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let spend_ins = vec![InputRecord {
+            prev_txid: [0x33; 32],
+            create_fk: ghost_parent,
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }];
+        let spend_outs = vec![OutputRecord::unspent(1, vec![0x51])];
+        let fks = q
+            .store()
+            .put_tx_full_batch_indexed(&[(spend_tx, spend_ins, spend_outs)], true)
+            .unwrap();
+        let hfk = q.put_header(&header).unwrap();
+        q.store()
+            .header_txs
+            .put_ranges_batch(&[(hfk, fks[0], 1)])
+            .unwrap();
+
+        let err = q
+            .load_confirm_parents(&[(1, hash)])
+            .expect_err("ghost parent must hard-fail pin_new");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invariant") && msg.contains("pin_new") && msg.contains("body range"),
+            "unexpected err: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spend needs OOB vout → pin denserels/outs cannot cover need_vouts.
+    #[test]
+    fn pin_new_incomplete_need_vouts_is_invariant_error() {
+        let (dir, q) = temp_q("oob-vout");
+        // Parent create with a single out.
+        let parent_tx = TxRecord {
+            txid: [0x44; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let parent_ins = vec![InputRecord {
+            prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![0x01],
+            witness: vec![],
+        }];
+        let parent_outs = vec![OutputRecord::unspent(50, vec![0x51])];
+        let parent_fks = q
+            .store()
+            .put_tx_full_batch_indexed(&[(parent_tx, parent_ins, parent_outs)], true)
+            .unwrap();
+        let parent_fk = parent_fks[0];
+
+        // Spend block needs vout 7 (OOB for parent with 1 out).
+        let mut hash = [0u8; 32];
+        hash[0] = 0x55;
+        let header = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 2,
+            bits: 0x207f_ffff,
+            nonce: 2,
+            merkle_root: hash,
+            hash,
+        };
+        let spend_tx = TxRecord {
+            txid: [0x66; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let spend_ins = vec![InputRecord {
+            prev_txid: [0x44; 32],
+            create_fk: parent_fk,
+            prev_index: 7, // OOB
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }];
+        let spend_outs = vec![OutputRecord::unspent(1, vec![0x51])];
+        let spend_fks = q
+            .store()
+            .put_tx_full_batch_indexed(&[(spend_tx, spend_ins, spend_outs)], true)
+            .unwrap();
+        let hfk = q.put_header(&header).unwrap();
+        q.store()
+            .header_txs
+            .put_ranges_batch(&[(hfk, spend_fks[0], 1)])
+            .unwrap();
+
+        let err = q
+            .load_confirm_parents(&[(1, hash)])
+            .expect_err("OOB need_vouts must hard-fail pin_new");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invariant")
+                && msg.contains("pin_new")
+                && (msg.contains("incomplete") || msg.contains("denserels") || msg.contains("body")),
+            "unexpected err: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(test)]
 mod slim_outs_tests {
     use super::slim_dense_outs_to_need;

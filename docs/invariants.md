@@ -68,7 +68,10 @@ structural cold spentness).
 
 | Test | Entry |
 |------|--------|
+| `pin_for_wire_missing_parent_is_invariant_error` | `pin_for_wire_batch` missing spent parent |
+| `pin_for_wire_incomplete_outs_is_invariant_error` | `pin_for_wire_batch` incomplete outs → cold miss |
 | `post_commit_missing_denserels_is_invariant_error` | `post_commit` abs-only annotate |
 | `ensure_spend_abs_incomplete_is_invariant_error` | `ensure_spend_abs_layouts` post-condition |
 | `structural_pinned_without_abs_is_invariant_error` | `structural_validate_spends` pin without denserels |
-| `confirm_load` pin_new invariants | missing body range / denserels incomplete (query crate) |
+| `pin_new_missing_parent_body_is_invariant_error` | `load_confirm_parents` pin_new ghost create_fk |
+| `pin_new_incomplete_need_vouts_is_invariant_error` | `load_confirm_parents` pin_new OOB need_vouts |

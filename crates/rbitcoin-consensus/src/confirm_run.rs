@@ -1860,6 +1860,160 @@ mod write_idempotent_tests {
         assert!(after > before, "skip counter should bump");
     }
 
+    /// Wire pin: spend parent not loadable → hard invariant (no silent skip).
+    #[test]
+    fn pin_for_wire_missing_parent_is_invariant_error() {
+        use super::pin_for_wire_batch;
+        use rbitcoin_primitives::Fk;
+        use rbitcoin_query::{ArchiveWritePlan, Query};
+        use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+        use std::sync::Once;
+
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-pin-wire-inv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let q = Query::open_or_create(&path).unwrap();
+        q.enter_direct_index_mode().unwrap();
+
+        // Plan create spends external create_fk that has no Class A body / residency.
+        let missing_parent = Fk(999_999);
+        let spend_tx = TxRecord {
+            txid: [0xAAu8; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let spend_ins = vec![InputRecord {
+            prev_txid: [0xBBu8; 32],
+            create_fk: missing_parent,
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }];
+        let spend_outs = vec![OutputRecord::unspent(1, vec![0x51])];
+        let plan = ArchiveWritePlan {
+            packed: vec![(spend_tx, spend_ins, spend_outs)],
+            planned_fks: vec![Fk(1)],
+            per_header_ranges: vec![],
+            spends: vec![],
+            batch_creates: vec![],
+            index_tx: false,
+            body_est: 0,
+            advise_dont_need: false,
+        };
+
+        let err = pin_for_wire_batch(&q, Some(&plan), &[], &[], None)
+            .expect_err("missing parent must hard-fail pin");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invariant") && msg.contains("wire pin"),
+            "unexpected err: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Wire pin: in-flight outs shorter than need → cold miss → hard invariant.
+    #[test]
+    fn pin_for_wire_incomplete_outs_is_invariant_error() {
+        use super::pin_for_wire_batch;
+        use rbitcoin_primitives::Fk;
+        use rbitcoin_query::{ArchiveWritePlan, Query};
+        use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+        use std::collections::HashMap;
+        use std::sync::Once;
+
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-pin-wire-outs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let q = Query::open_or_create(&path).unwrap();
+        q.enter_direct_index_mode().unwrap();
+
+        let parent_id = 77u64;
+        let parent_fk = Fk(parent_id);
+        // Spend needs vout 0 from parent_id.
+        let spend_tx = TxRecord {
+            txid: [0xCCu8; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let spend_ins = vec![InputRecord {
+            prev_txid: [0xDDu8; 32],
+            create_fk: parent_fk,
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }];
+        let plan = ArchiveWritePlan {
+            packed: vec![(
+                spend_tx,
+                spend_ins,
+                vec![OutputRecord::unspent(1, vec![0x51])],
+            )],
+            planned_fks: vec![Fk(2)],
+            per_header_ranges: vec![],
+            spends: vec![],
+            batch_creates: vec![],
+            index_tx: false,
+            body_est: 0,
+            advise_dont_need: false,
+        };
+        // In-flight "parent" with **empty** outs → live.len() != need → cold path;
+        // no Class A body either → end pin contract fails.
+        let mut ifo = HashMap::new();
+        let parent_tx = TxRecord {
+            txid: [0xDDu8; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 0,
+        };
+        ifo.insert(parent_id, (parent_tx, Vec::new(), Vec::new()));
+
+        let err = pin_for_wire_batch(&q, Some(&plan), &[], &[], Some(&ifo))
+            .expect_err("incomplete outs must hard-fail pin");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invariant") && msg.contains("wire pin"),
+            "unexpected err: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     /// Prep miss: spend edges without pin denserels must hard-fail (no cold tier).
     #[test]
     fn post_commit_missing_denserels_is_invariant_error() {

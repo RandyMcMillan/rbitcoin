@@ -209,6 +209,12 @@ impl VarTable {
         self.published_meta().1
     }
 
+    /// Pin body map once; `f(map_bytes, published_len)`.
+    #[inline]
+    pub(crate) fn with_body_map_pin<R>(&self, f: impl FnOnce(&[u8], u64) -> R) -> R {
+        self.body.with_map_pin(f)
+    }
+
     /// Inspect record bytes without copying into a `Vec`.
     pub fn with_raw<R>(
         &self,

@@ -751,6 +751,21 @@ impl TableFile {
         Ok(f(slice))
     }
 
+    /// Pin the map once and run `f(map_bytes, published_len)`.
+    ///
+    /// `map_bytes` may be longer than published; only `[0..published)` is valid
+    /// to read. Used for bulk random fixed-size peeks (e.g. 9-byte spender meta)
+    /// without a pread/io_uring op per offset.
+    #[inline]
+    pub(crate) fn with_map_pin<R>(&self, f: impl FnOnce(&[u8], u64) -> R) -> R {
+        let published = self.published_len.load(Ordering::Acquire);
+        let pin = self.pin();
+        let map_len = pin.epoch.map.len();
+        // SAFETY: pin holds the epoch Arc; map covers capacity.
+        let map = unsafe { std::slice::from_raw_parts(pin.epoch.as_ptr(), map_len) };
+        f(map, published)
+    }
+
     pub fn advise_dont_need(&self, offset: u64, len: u64) {
         if len == 0 {
             return;

@@ -1676,54 +1676,37 @@ impl TxTable {
         Ok(cold)
     }
 
-    /// Bulk 9-byte spender meta preads at absolute `tx.body` file offsets.
+    /// Bulk 9-byte spender meta reads at absolute `tx.body` file offsets.
     ///
     /// Each entry is the absolute offset of an output's spender_field (8) + flags (1).
-    /// Uses io_uring / parallel pread. Failed or short reads yield `None`.
+    /// **Mmap path** (one map pin, no per-offset pread/io_uring) — same durable
+    /// Class A body bytes as pread. Out-of-range / short yields `None` (fail closed).
     pub fn get_spender_meta_at_abs_batch(
         &self,
         abs_offs: &[u64],
     ) -> Result<Vec<Option<(bool, Fk)>>, StoreError> {
-        use crate::bulk_io::{self, ReadOp};
         const META_LEN: usize = 9;
         if abs_offs.is_empty() {
             return Ok(Vec::new());
         }
-        let body_fd = self.body.body_read_fd();
-        let body_pub = self.body.body_published_len();
-
-        let submitted: Vec<usize> = abs_offs
-            .iter()
-            .enumerate()
-            .filter(|(_, &off)| off.saturating_add(META_LEN as u64) <= body_pub)
-            .map(|(i, _)| i)
-            .collect();
-
-        let mut bufs: Vec<[u8; META_LEN]> = vec![[0u8; META_LEN]; abs_offs.len()];
-        let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(submitted.len());
-        for &i in &submitted {
-            let ptr = bufs[i].as_mut_ptr();
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, META_LEN) };
-            read_ops.push(ReadOp {
-                fd: body_fd,
-                offset: abs_offs[i],
-                buf: slice,
-                result: i32::MIN,
-            });
-        }
-        bulk_io::pread_batch(&mut read_ops);
-
-        let mut out: Vec<Option<(bool, Fk)>> = vec![None; abs_offs.len()];
-        for (ro, &i) in read_ops.iter().zip(submitted.iter()) {
-            if ro.result != META_LEN as i32 {
-                continue;
+        // Shared mmap walk — write structural spentness issues tens of thousands
+        // of 9-byte peeks per window; pread/io_uring-per-offset was the wall.
+        Ok(self.body.with_body_map_pin(|map, published| {
+            let mut out: Vec<Option<(bool, Fk)>> = vec![None; abs_offs.len()];
+            let map_len = map.len() as u64;
+            for (i, &off) in abs_offs.iter().enumerate() {
+                let end = off.saturating_add(META_LEN as u64);
+                if end > published || end > map_len {
+                    continue;
+                }
+                let o = off as usize;
+                let b = &map[o..o + META_LEN];
+                let field = Fk(u64::from_le_bytes(b[0..8].try_into().unwrap()));
+                let multi = b[8] & output_flags::MULTI_SPENDER != 0;
+                out[i] = Some((multi, field));
             }
-            let b = &bufs[i];
-            let field = Fk(u64::from_le_bytes(b[0..8].try_into().unwrap()));
-            let multi = b[8] & output_flags::MULTI_SPENDER != 0;
-            out[i] = Some((multi, field));
-        }
-        Ok(out)
+            out
+        }))
     }
 
     /// Read multi + spender_field for create tx output (packed Class A body).

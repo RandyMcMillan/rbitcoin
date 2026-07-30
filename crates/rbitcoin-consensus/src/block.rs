@@ -735,6 +735,19 @@ fn assemble_block_prevouts_mode(
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
+    // BIP113 absolute finality cutoff: **once per block**, not per tx.
+    // (Was re-resolving median_time_past for every non-coinbase tx — dominated
+    // assemble `final=` on dense mid-mainnet blocks.)
+    let lock_time_cutoff = if ctx.params.csv_active_at(ctx.height.0) {
+        if ctx.height.0 == 0 {
+            block.header.time
+        } else {
+            crate::header::median_time_past(query, Height(ctx.height.0 - 1))?
+        }
+    } else {
+        block.header.time
+    };
+
     // Spent checks: pending_spent (this run) + durable confirmed-strong annotations.
     for (ti, tx) in block.txdata.iter().enumerate() {
         let spend_fk = archived_tx_fks.map(|fks| fks[ti]);
@@ -870,22 +883,15 @@ fn assemble_block_prevouts_mode(
             confirm_phase_stats::ASM_SIGOP_NS
                 .fetch_add(t_sig.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-            // BIP113 absolute finality (prev-block MTP only — cheap; stays on load).
+            // BIP113 absolute finality (uses block-level lock_time_cutoff).
             let t_fin = Instant::now();
-            let lock_time_cutoff = if ctx.params.csv_active_at(ctx.height.0) {
-                if ctx.height.0 == 0 {
-                    block.header.time
-                } else {
-                    crate::header::median_time_past(query, Height(ctx.height.0 - 1))?
-                }
-            } else {
-                block.header.time
-            };
             if !is_final_tx(tx, ctx.height.0, lock_time_cutoff) {
                 return Err(ConsensusError::BadTx("not final"));
             }
             // BIP68 relative locks need per-input create heights (`tx_height`).
             // Optimistic/confirm defers that IO to structural write; Full does it here.
+            // Reuse the same prev-block MTP as BIP113 when CSV is active (already
+            // computed once as lock_time_cutoff for height > 0).
             if mode == AssembleMode::Full && ctx.params.csv_active_at(ctx.height.0) {
                 let mut coin_mtps = Vec::with_capacity(input_create_heights.len());
                 for &ch in &input_create_heights {
@@ -899,7 +905,7 @@ fn assemble_block_prevouts_mode(
                 let prev_mtp = if ctx.height.0 == 0 {
                     0
                 } else {
-                    crate::header::median_time_past(query, Height(ctx.height.0 - 1))?
+                    lock_time_cutoff
                 };
                 if !sequence_locks_satisfied(
                     tx,

@@ -924,7 +924,16 @@ pub(crate) fn drain_job_rx_as_err(
 /// only for RAM overflow / dual-track arch jobs). Charging GiB of disk against
 /// the ~512 MiB soft budget freezes densify getdata for tip holes.
 ///
-/// Already confirmed heights are dequeued (stale queue residue).
+/// **Drop rule (critical):** only dequeue heights at or **below a confirmed tip**.
+/// Never drop `height > tip` solely because `has_block` / RAM `known` look set —
+/// that opened a tip+1..bq_min hole (mainnet: tip=459539 / 375294, bq min ahead,
+/// prep `missing body` spam + slow getdata crawl while densify thought pending).
+/// Empty chain (`tip_height() == None`) keeps every height.
+///
+/// After rehydrate, if `bq_min > tip+1`, mark the **non-Class-A** gap missing so
+/// densify re-gets immediately (do not demote heights already claimable from
+/// Class A / known_archived).
+///
 /// Returns the number of heights noted into the feed.
 pub(crate) fn rehydrate_block_queue_into_confirm(
     hub: &ChainHub,
@@ -933,6 +942,12 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
     _archive_queued: &ArchiveQueueBudget,
 ) -> Result<usize, String> {
     use rbitcoin_log::{info, warn};
+
+    let tip_opt = hub.tip_height();
+    let path_lo = match tip_opt {
+        None => 0u32,
+        Some(t) => t.saturating_add(1),
+    };
 
     let queued = hub
         .query
@@ -948,13 +963,25 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
     let mut dropped_done = 0usize;
     let mut empty_skip = 0usize;
     let mut unknown_h = 0usize;
+    let mut kept_above_tip_flag = 0usize;
     for qb in queued {
         let hash = BlockHash::from_byte_array(qb.hash);
-        // Already confirmed tip → drop queue entry.
-        if hub.has_block(&hash) || st.body.is_known_archived(&hash) {
-            let _ = hub.query.block_queue_dequeue_height(qb.height); // ignore flush list at rehydrate
+        // Only drop residue at/below confirmed tip (write may have missed dequeue).
+        // Heights above tip always keep wire — even if has_block/known looks set
+        // (stale RAM or Class A ahead of tip must not erase confirm payload).
+        // No tip yet → keep every height (including 0).
+        let at_or_below_tip = match tip_opt {
+            Some(tip) if qb.height != u32::MAX && qb.height <= tip => true,
+            _ => false,
+        };
+        if at_or_below_tip {
+            let _ = hub.query.block_queue_dequeue_height(qb.height);
             dropped_done = dropped_done.saturating_add(1);
             continue;
+        }
+        if hub.has_block(&hash) || st.body.is_known_archived(&hash) {
+            // height > tip but already flagged done — keep payload, still note feed.
+            kept_above_tip_flag = kept_above_tip_flag.saturating_add(1);
         }
         // Minimal integrity: rec must have a non-empty payload; full decode at prep.
         if qb.payload.is_empty() {
@@ -985,18 +1012,47 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
             unknown_h = unknown_h.saturating_add(1);
         }
     }
+
+    // Tip+1..bq_min gap: wire was dequeued/never filled while tip lagged → densify.
+    // Skip heights already claimable from confirmed set or Class A (resume seed).
+    let mut gap_marked = 0u32;
+    if n > 0 && h_min > path_lo {
+        for ht in path_lo..h_min {
+            let Some(&hash) = st.height_to_hash.get(&ht) else {
+                continue;
+            };
+            if hub.has_block(&hash)
+                || st.body.is_known_archived(&hash)
+                || hub.is_archived(&hash)
+            {
+                continue;
+            }
+            st.body.mark_missing(hash);
+            gap_marked = gap_marked.saturating_add(1);
+        }
+        if gap_marked > 0 {
+            warn!(
+                "ibd: body queue gap tip+1={path_lo}..{} (bq starts {h_min}) — \
+                 marked {gap_marked} missing for densify re-getdata",
+                h_min.saturating_sub(1)
+            );
+        }
+    }
+
     // One summary line for partial-IBD restart (no per-rec spam).
-    if n > 0 || dropped_done > 0 || empty_skip > 0 || unknown_h > 0 {
+    if n > 0 || dropped_done > 0 || empty_skip > 0 || unknown_h > 0 || gap_marked > 0 {
         let mib = bytes / (1024 * 1024);
         if n > 0 {
             info!(
                 "ibd: rehydrate body queue → feed ready n={n} h={h_min}..{h_max} \
-                 {mib}MiB (dropped_confirmed={dropped_done} empty={empty_skip} unknown_h={unknown_h})"
+                 {mib}MiB (dropped_le_tip={dropped_done} empty={empty_skip} unknown_h={unknown_h} \
+                 gap_marked={gap_marked} kept_above_tip_flag={kept_above_tip_flag})"
             );
         } else {
             info!(
                 "ibd: rehydrate body queue: no ready entries \
-                 (dropped_confirmed={dropped_done} empty={empty_skip} unknown_h={unknown_h})"
+                 (dropped_le_tip={dropped_done} empty={empty_skip} unknown_h={unknown_h} \
+                 gap_marked={gap_marked})"
             );
         }
         if empty_skip > 0 {
@@ -2219,23 +2275,163 @@ mod rehydrate_tests {
     }
 
     #[test]
-    fn rehydrate_drops_already_archived_residue() {
+    fn rehydrate_drops_only_at_or_below_tip() {
         let (dir, hub) = temp_hub();
-        let block = empty_block(99);
+        hub.ensure_genesis().unwrap();
+        assert_eq!(hub.tip_height(), Some(0));
+
+        // Residue at tip height 0 — should dequeue.
+        let block_low = empty_block(1);
+        let hash_low = block_low.block_hash();
+        let mut payload_low = Vec::new();
+        block_low.consensus_encode(&mut payload_low).unwrap();
+        hub.query
+            .block_queue_enqueue(0, hash_low.to_byte_array(), 1, &payload_low)
+            .unwrap();
+
+        // Height > tip even if RAM marks "archived" — must keep wire (regression:
+        // old code dequeued on known_archived / has_block and opened tip+1 holes).
+        let block_hi = empty_block(99);
+        let hash_hi = block_hi.block_hash();
+        let mut payload_hi = Vec::new();
+        block_hi.consensus_encode(&mut payload_hi).unwrap();
+        hub.query
+            .block_queue_enqueue(3, hash_hi.to_byte_array(), 2, &payload_hi)
+            .unwrap();
+
+        let feed = super::super::confirm::ConfirmFeed::new();
+        let budget = ArchiveQueueBudget::new(64 * 1024 * 1024);
+        let mut st = super::super::state::IbdWorkState::new(
+            vec![],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        st.body.mark_archived(hash_hi);
+        let n = rehydrate_block_queue_into_confirm(&hub, &mut st, &feed, &budget).unwrap();
+        assert_eq!(n, 1, "height>tip kept despite known_archived");
+        assert!(feed.inner.lock().unwrap().ready.contains_key(&3));
+        assert_eq!(
+            hub.query
+                .block_queue_payload(3)
+                .unwrap()
+                .as_ref()
+                .map(|p| p.len()),
+            Some(payload_hi.len())
+        );
+        assert!(
+            hub.query.block_queue_payload(0).unwrap().is_none(),
+            "height at tip must drop as residue"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Empty chain (no tip) must not drop height 0 as "≤ tip".
+    #[test]
+    fn rehydrate_keeps_height_zero_when_no_tip() {
+        let (dir, hub) = temp_hub();
+        assert!(hub.tip_height().is_none());
+        let block = empty_block(7);
         let hash = block.block_hash();
         let mut payload = Vec::new();
         block.consensus_encode(&mut payload).unwrap();
         hub.query
-            .block_queue_enqueue(3, hash.to_byte_array(), 1, &payload)
+            .block_queue_enqueue(0, hash.to_byte_array(), 1, &payload)
             .unwrap();
         let feed = super::super::confirm::ConfirmFeed::new();
         let budget = ArchiveQueueBudget::new(64 * 1024 * 1024);
         let mut st = super::super::state::IbdWorkState::new(vec![], None, None);
-        st.body.mark_archived(hash);
         let n = rehydrate_block_queue_into_confirm(&hub, &mut st, &feed, &budget).unwrap();
-        assert_eq!(n, 0);
-        assert!(feed.inner.lock().unwrap().ready.is_empty());
-        assert_eq!(hub.query.block_queue_stats().2, 0, "residue dequeued");
+        assert_eq!(n, 1);
+        assert!(feed.inner.lock().unwrap().ready.contains_key(&0));
+        assert_eq!(
+            hub.query.block_queue_payload(0).unwrap().as_ref().map(|p| p.len()),
+            Some(payload.len())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rehydrate_marks_tip_plus_one_gap_missing() {
+        let (dir, hub) = temp_hub();
+        hub.ensure_genesis().unwrap();
+        assert_eq!(hub.tip_height(), Some(0));
+        // Only far body-queue entry (tip+1..9 absent) — densify must re-get gap.
+        let block = empty_block(50);
+        let hash = block.block_hash();
+        let mut payload = Vec::new();
+        block.consensus_encode(&mut payload).unwrap();
+        hub.query
+            .block_queue_enqueue(10, hash.to_byte_array(), 1, &payload)
+            .unwrap();
+        let feed = super::super::confirm::ConfirmFeed::new();
+        let budget = ArchiveQueueBudget::new(64 * 1024 * 1024);
+        let mut st = super::super::state::IbdWorkState::new(
+            vec![],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        // path_lo=1; gap 1..9 (height 0 is tip, not gap).
+        for ht in 1u32..10 {
+            let mut hb = [0u8; 32];
+            hb[0] = ht as u8;
+            st.record_height(BlockHash::from_byte_array(hb), ht);
+        }
+        st.record_height(hash, 10);
+        let n = rehydrate_block_queue_into_confirm(&hub, &mut st, &feed, &budget).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            st.body.size_snapshot().missing,
+            9,
+            "tip+1..bq_min-1 must be marked missing for densify"
+        );
+        // Pending on the rehydrated height so densify does not re-get it.
+        assert!(st.body.is_pending(&hash));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Class A / known_archived gap heights stay claimable — do not demote to missing.
+    #[test]
+    fn rehydrate_gap_skips_known_archived() {
+        let (dir, hub) = temp_hub();
+        hub.ensure_genesis().unwrap();
+        let block = empty_block(60);
+        let hash = block.block_hash();
+        let mut payload = Vec::new();
+        block.consensus_encode(&mut payload).unwrap();
+        hub.query
+            .block_queue_enqueue(5, hash.to_byte_array(), 1, &payload)
+            .unwrap();
+        let feed = super::super::confirm::ConfirmFeed::new();
+        let budget = ArchiveQueueBudget::new(64 * 1024 * 1024);
+        let mut st = super::super::state::IbdWorkState::new(
+            vec![],
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        // Gap 1..4; height 2 is Class A claimable.
+        let mut known_h = BlockHash::from_byte_array([0u8; 32]);
+        for ht in 1u32..5 {
+            let mut hb = [0u8; 32];
+            hb[0] = ht as u8;
+            let h = BlockHash::from_byte_array(hb);
+            st.record_height(h, ht);
+            if ht == 2 {
+                st.body.mark_archived(h);
+                known_h = h;
+            }
+        }
+        st.record_height(hash, 5);
+        let n = rehydrate_block_queue_into_confirm(&hub, &mut st, &feed, &budget).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            st.body.size_snapshot().missing,
+            3,
+            "gap 1,3,4 missing; 2 stays known_archived"
+        );
+        assert!(
+            st.body.is_known_archived(&known_h),
+            "Class A gap height must not be demoted"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

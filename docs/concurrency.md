@@ -23,7 +23,9 @@ range, outs, denserels; raw FIFO). Class A commit seeds denserels offline so
 prep(N+1) hits without body re-read. Sole process map is CreateResidency
 (plan resolve + pin denserels + prewarm).
 
-**tx.head overflow:** depth-exhausted inserts → `tx.head.overflow` (overflow-first lookup).
+**tx.head overflow:** depth-exhausted inserts → `tx.head.overflow` (overflow-first
+lookup). Cleared on successful primary head swap (shadow already holds Class A
+mappings; overflow was only a sidecar for the old table).
 
 **Datadir secret (schema 12):** `store/store.secret` CSPRNG at create. XOR scripts/witness at rest; keyed TXID mix for heads.
 

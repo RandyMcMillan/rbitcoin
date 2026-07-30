@@ -7,6 +7,10 @@
 //! Keys are whatever the caller passes (callers should pass **mixed** txids from
 //! [`crate::store_secret::StoreSecret::mix_txid`]).
 //!
+//! **Lifetime swap:** when a wider `tx.head` replaces the overflowing primary, the
+//! shadow was filled from Class A and already holds every create. Overflow is
+//! **cleared** (not drained/re-inserted) — it was a sidecar of the old head only.
+//!
 //! Layout: process-local dense table (default 1 M slots × 8 B fk + 32 B key) —
 //! bounded RAM for “failed primary insert” volume, not a second full mainnet head.
 //! Persisted under `tx.head.overflow` as a simple array of `(key32, fk8)` occupied

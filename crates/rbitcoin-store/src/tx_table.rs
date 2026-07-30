@@ -2330,21 +2330,19 @@ impl TxTable {
         Ok(())
     }
 
-    /// Merge overflow entries into primary after a successful head resize swap.
-    pub fn drain_overflow_into_primary(&self) -> Result<usize, StoreError> {
-        let pairs: Vec<([u8; 32], Fk)> = {
-            let ov = self.overflow.lock().unwrap();
-            ov.iter_occupied().collect()
-        };
-        if pairs.is_empty() {
-            return Ok(0);
+    /// Drop overflow after a successful primary head swap.
+    ///
+    /// Overflow is the depth-exhausted sidecar for the **old** primary while it
+    /// is full/resizing. The replacement head is filled from Class A (`tx.idx`
+    /// order), so every overflow mapping is already on the new primary — do
+    /// **not** re-insert (drain) into the new head; just clear the sidecar.
+    fn clear_overflow_after_head_swap(&self) -> Result<usize, StoreError> {
+        let mut ov = self.overflow.lock().unwrap();
+        let n = ov.occupied();
+        if n > 0 {
+            ov.clear()?;
         }
-        {
-            let head = self.head.read().unwrap();
-            head.insert_many(&pairs)?;
-        }
-        self.overflow.lock().unwrap().clear()?;
-        Ok(pairs.len())
+        Ok(n)
     }
 
     /// Block the calling thread until online head resize is idle.
@@ -3075,6 +3073,13 @@ impl TxTable {
         let _ = std::fs::remove_file(&bak);
         crate::address_head::remove_legacy_meta_sidecar(&bak);
         crate::address_head::remove_legacy_meta_sidecar(&shadow_path);
+        // Old primary is gone — overflow was only for that table's probe exhaust.
+        let cleared = self.clear_overflow_after_head_swap()?;
+        if cleared > 0 {
+            rbitcoin_log::info!(
+                "store: tx.head.overflow cleared {cleared} entries after head swap"
+            );
+        }
         self.resize_active.store(false, AtomicOrdering::Release);
         // Archive writers may be parked on probe-exhaust for the whole fill;
         // wake them now that the wider primary is live.
@@ -3463,6 +3468,89 @@ mod tests {
         let o2 = crate::head_overflow::HeadOverflow::open(&dir).unwrap();
         assert_eq!(o2.get(&mixed_alt), Some(Fk(fk.0 + 1000)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After head swap, `tx.head.overflow` must be empty — it belonged to the
+    /// old primary; the new head already holds Class A mappings from shadow fill.
+    #[test]
+    fn head_overflow_cleared_after_resize_swap() {
+        with_resize_stress_lock(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "rbitcoin-tx-overflow-clear-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let t = create_tiny(&dir);
+            let mk = |i: u64| {
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&i.to_le_bytes());
+                txid[8] = 0xef;
+                let rec = TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                };
+                let inputs = vec![InputRecord::coinbase(u32::MAX, vec![i as u8], vec![])];
+                let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
+                (rec, inputs, outputs, txid)
+            };
+            let mut keys = Vec::new();
+            for i in 1..=30u64 {
+                let (rec, ins, outs, txid) = mk(i);
+                let _ = t
+                    .put_full_batch_indexed(&[(rec, ins, outs)], true)
+                    .unwrap();
+                keys.push(txid);
+            }
+            // Simulate depth-exhausted sidecar while old primary is still live.
+            {
+                let mut ov = t.overflow.lock().unwrap();
+                for (i, txid) in keys.iter().enumerate().take(5) {
+                    let mixed = t.secret.mix_txid(txid);
+                    ov.insert(&mixed, Fk(1000 + i as u64)).unwrap();
+                }
+                ov.persist().unwrap();
+                assert!(ov.occupied() >= 5);
+            }
+            assert!(
+                !t.overflow.lock().unwrap().is_empty(),
+                "precondition: overflow occupied before swap"
+            );
+
+            let from_bits = t.head_bits();
+            let to_bits = from_bits + 1;
+            t.start_head_resize(crate::address_head::HeadLayout::new(to_bits).unwrap())
+                .unwrap();
+            wait_head_resize_done(&t, Duration::from_secs(15));
+            assert_eq!(t.head_bits(), to_bits);
+            assert!(
+                t.overflow.lock().unwrap().is_empty(),
+                "overflow must clear when old head is swapped out"
+            );
+            // Class A mappings live on the new primary (not overflow).
+            for txid in &keys {
+                assert!(
+                    t.get_fk_by_txid(txid).unwrap().is_some(),
+                    "txid missing after resize+overflow clear"
+                );
+            }
+            // Durable empty overflow survives reopen.
+            drop(t);
+            let t2 = TxTable::open(&dir).unwrap();
+            assert!(t2.overflow.lock().unwrap().is_empty());
+            for txid in &keys {
+                assert!(t2.get_fk_by_txid(txid).unwrap().is_some());
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     /// After fast head insert (no write-time BIP30 displace), sole lookup must

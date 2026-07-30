@@ -45,7 +45,8 @@ use exit::{
     peer_caught_up, AllPeersDead,
 };
 use progress::{
-    format_progress_line, ibd_pct, work_chain_progress, ProgressLineInput, TipRateTracker,
+    claim_ready, format_progress_line, ibd_pct, work_chain_progress, ProgressLineInput,
+    TipRateTracker,
 };
 use state::IbdWorkState;
 use assign::{archive_pipeline_saturated, assign_work_ordered, AssignDepth};
@@ -1019,17 +1020,29 @@ pub async fn ibd_cancellable(
             );
             perf_log::log_sample(&perf);
 
-            // Stall watchdog: body-ready ahead of tip + tip frozen is a confirm bug.
+            // Stall watchdog: tip frozen while path looks claim-ready — real confirm
+            // bug only when the **confirm pipeline is idle**. Mid-mainnet 32-block
+            // prep+scripts+write often takes 8–15s (and cold restart first batch
+            // longer); peer `inflight` empty is normal with a full body queue.
+            // Do **not** WARN while feed has claims or prep/scripts/write queues
+            // hold work (post-rehydrate cold start used to spam tip stall with
+            // ready=false even though prep was live on tip+1).
+            let conf_busy = feed_inflight > 0
+                || load_q > 0
+                || write_q > 0
+                || loop_stats.confirm_live_snap().is_some();
             if last_progress.elapsed() > Duration::from_secs(15)
                 && prog.tip_hole == 0
+                && !conf_busy
                 && st.inflight.is_empty()
                 && arch_q_now == 0
                 && prog.ready_hwm > prog.tip.saturating_add(1)
             {
                 let expect = prog.tip.saturating_add(1);
                 let hth = st.height_to_hash.get(&expect).copied();
+                // Claim-ready includes body-queue pending (not only Class A).
                 let ready = hth
-                    .map(|h| st.body.is_known_archived(&h) || hub.is_archived(&h))
+                    .map(|h| claim_ready(hub.as_ref(), &mut st.body, expect, &h))
                     .unwrap_or(false);
                 let has = hth.map(|h| hub.has_block(&h)).unwrap_or(false);
                 let in_set = hth
@@ -1045,11 +1058,14 @@ pub async fn ibd_cancellable(
                 );
                 update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_ready_height);
                 warn!(
-                    "ibd: tip stall tip={} expect={expect} hth={} ready={ready} has_block={has} in_ordered={in_set} offer_noted={noted} hwm={} ordered_len={} (idle {:?})",
+                    "ibd: tip stall tip={} expect={expect} hth={} claim_ready={ready} has_block={has} \
+                     in_ordered={in_set} offer_noted={noted} hwm={} ordered_len={} feed_ready={} \
+                     (idle {:?})",
                     prog.tip,
                     hth.is_some(),
                     prog.ready_hwm,
                     st.ordered.len(),
+                    feed_ready,
                     last_progress.elapsed(),
                 );
             }

@@ -7,11 +7,10 @@
 //! hot pin map). Thin edges and sparse parent pins are **batch-local**
 //! ([`crate::confirm_load::BatchThin`], [`crate::BatchParents`]).
 //!
-//! With `RBITCOIN_CONFIRM_CACHE=0`, header denserels cache inserts are no-ops
-//! (trust store mmaps / OS page cache). Scan watermarks (`plans`) still track
-//! load readiness.
+//! Header plans stay **on** even when `RBITCOIN_CONFIRM_CACHE=0` (that flag
+//! only shrinks CreateResidency denserels history + skips prewarm). Scan
+//! watermarks (`plans`) track load readiness.
 
-use crate::create_residency::confirm_cache_enabled;
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::HeaderRecord;
 use std::collections::{BTreeMap, HashMap};
@@ -59,20 +58,19 @@ struct Inner {
 }
 
 /// Process-local confirm parent cache (headers + scan watermarks only).
+///
+/// **Always active** — multi-block wire prep needs tip-ahead header plans for
+/// MTP / bits (not optional denserels history). `RBITCOIN_CONFIRM_CACHE=0` only
+/// shrinks CreateResidency + skips denserels prewarm; it does **not** disable
+/// this map (mainnet tip freeze: `parent header plan missing above tip`).
 pub struct ConfirmParentCache {
     inner: Mutex<Inner>,
     /// Mirror of `Inner::ready_through` for lock-free reads.
     ready_through: AtomicU32,
-    /// When false (`RBITCOIN_CONFIRM_CACHE=0`), skip storing header denserels.
-    cache_enabled: bool,
 }
 
 impl ConfirmParentCache {
     pub fn new() -> Self {
-        Self::new_with_cache(true)
-    }
-
-    pub fn new_with_cache(cache_enabled: bool) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 tip: 0,
@@ -82,16 +80,11 @@ impl ConfirmParentCache {
                 hash_to_height: HashMap::new(),
             }),
             ready_through: AtomicU32::new(0),
-            cache_enabled,
         }
     }
 
     pub fn from_env() -> Self {
-        Self::new_with_cache(confirm_cache_enabled())
-    }
-
-    pub fn cache_enabled(&self) -> bool {
-        self.cache_enabled
+        Self::new()
     }
 
     /// Highest height such that every plan in `(tip, ready_through]` is ready.
@@ -129,10 +122,7 @@ impl ConfirmParentCache {
             .store(g.ready_through, Ordering::Relaxed);
     }
 
-    /// Cache header + tx list for a cache height.
-    ///
-    /// No-op when confirm cache is disabled — callers fall through to store IO
-    /// (OS page cache holds hot header/header_txs pages).
+    /// Cache header + tx list for a cache height (tip-GCed; required for multi-block MTP).
     pub fn put_header_plan(
         &self,
         height: u32,
@@ -141,9 +131,6 @@ impl ConfirmParentCache {
         tx_fks: Vec<Fk>,
         prev_hash: [u8; 32],
     ) {
-        if !self.cache_enabled {
-            return;
-        }
         let mut g = self.inner.lock().unwrap();
         let hash = header_rec.hash;
         g.hash_to_height.insert(hash, height);
@@ -332,12 +319,14 @@ mod tests {
         assert_eq!(c.ready_through(), 3);
     }
 
+    /// Header plans must work regardless of denserels cache env (regression for
+    /// mainnet tip freeze: `parent header plan missing above tip`).
     #[test]
-    fn put_header_plan_noop_when_cache_disabled() {
-        let c = ConfirmParentCache::new_with_cache(false);
-        assert!(!c.cache_enabled());
+    fn put_header_plan_always_stores_for_mtp() {
+        let c = ConfirmParentCache::new();
         c.put_header_plan(1, Fk(1), header_rec([9u8; 32]), vec![Fk(1)], [0u8; 32]);
-        assert!(c.get_header_plan(1).is_none());
-        assert_eq!(c.header_plan_count(), 0);
+        let p = c.get_header_plan(1).expect("header plan required for multi-block MTP");
+        assert_eq!(p.header_rec.hash, [9u8; 32]);
+        assert_eq!(c.header_plan_count(), 1);
     }
 }

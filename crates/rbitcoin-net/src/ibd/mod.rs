@@ -392,9 +392,9 @@ pub async fn ibd_cancellable(
     if !hub.query.create_residency().cache_enabled() {
         let (_len, create_cap0, _outs, out_cap0) = hub.query.create_residency().size_stats();
         info!(
-            "ibd: confirm cache off (RBITCOIN_CONFIRM_CACHE=0) — residency \
+            "ibd: confirm denserels cache off (RBITCOIN_CONFIRM_CACHE=0) — residency \
              in-flight FIFO only creates_cap={create_cap0} out_cap={out_cap0} \
-             (skip prewarm; commit res_seed + pin still populate the window)"
+             (skip denserels prewarm; header plans still on; res_seed+pin fill window)"
         );
     } else {
         match hub.query.archive_residency_prewarm() {

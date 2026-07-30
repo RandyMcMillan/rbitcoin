@@ -21,13 +21,14 @@
 //! 65–70% hit rate. Optimize: (1) keep **recent** commit-seed / offline denserels
 //! working, (2) make **cold** denserels loads cheap (batch once, no double ensure).
 //!
-//! # `RBITCOIN_CONFIRM_CACHE=0` — no long-lived confirm cache
+//! # `RBITCOIN_CONFIRM_CACHE=0` — no long-lived denserels history
 //!
 //! When confirm cache is off, caps collapse to a **pipeline / just-committed
 //! window** ([`NO_CACHE_CREATE_CAP`] / [`NO_CACHE_OUT_CAP`]). Commit `res_seed`
 //! and pin still populate residency so in-flight batches work; FIFO drops
 //! history quickly and cold denserels trust OS page cache on Class A mmaps.
-//! Startup prewarm and header-plan denserels cache are skipped separately.
+//! Startup denserels/range **prewarm** is skipped. **Header plans stay on**
+//! (multi-block MTP) — they are tip-GCed working state, not multi‑GiB history.
 //!
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};

@@ -304,14 +304,17 @@ impl Query {
         if !need_head.is_empty() {
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
             let hits = self.store.get_fk_by_txid_batch(&need_head)?;
-            // Seed residency with fk+range for head hits so confirm pin cold denserels
-            // can skip idx (range-only rows survive out-cap slim).
-            let mut head_pairs: Vec<([u8; 32], Fk)> = Vec::with_capacity(hits.len() / 2);
+            // Seed residency range only for **misses** (not already prewarmed) so
+            // pin cold denserels can skip idx — without insert storm under full
+            // create_cap (prewarm already holds last N Class A).
+            let mut head_pairs: Vec<([u8; 32], Fk)> = Vec::new();
             for (txid, fk_opt) in hits {
                 if let Some(fk) = fk_opt {
                     resolved.insert(txid, fk);
                     head_hit_n = head_hit_n.saturating_add(1);
-                    head_pairs.push((txid, fk));
+                    if self.create_residency.lookup_fk_by_txid(&txid).is_none() {
+                        head_pairs.push((txid, fk));
+                    }
                 }
             }
             if !head_pairs.is_empty() {

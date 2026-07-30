@@ -6,11 +6,12 @@
 //!
 //! # Eviction: raw FIFO only (no read-LRU)
 //!
-//! - **Create cap:** oldest inserts are **hard-dropped** (entire row).
-//! - **Out cap:** oldest **out-bearing** rows are **slimmed** first (strip
-//!   outs/denserels/tx, **keep** fk/txid/body_range). Range-only prewarm rows
-//!   are never destroyed to free out budget (they free 0 outs and would thrash).
-//! Lookups **never** reorder the FIFO. Do not reintroduce touch-on-hit.
+//! - **Create cap:** oldest inserts are **hard-dropped** (entire row) via `order`.
+//! - **Out cap:** oldest **out-bearing** rows are **slimmed** first via a separate
+//!   `outs_order` deque (strip outs/denserels/tx, **keep** fk/txid/body_range).
+//!   Range-only prewarm rows are never scanned for out pressure (O(out-bearing)
+//!   only — never O(create_cap)).
+//! Lookups **never** reorder either FIFO. Do not reintroduce touch-on-hit.
 //!
 //! # Denserels hit rate is largely structural
 //!
@@ -42,7 +43,11 @@ pub struct ResidentCreate {
 struct Inner {
     by_fk: HashMap<u64, ResidentCreate>,
     by_txid: HashMap<[u8; 32], u64>,
+    /// Insert-order of all creates (range-only + denserels).
     order: VecDeque<u64>,
+    /// Insert-order of creates that **currently hold outs** (for O(1) out slim).
+    /// Stale ids (hard-evicted or already slimmed) are skipped at pop.
+    outs_order: VecDeque<u64>,
     create_cap: usize,
     out_cap: u64,
     total_outs: u64,
@@ -63,6 +68,7 @@ impl CreateResidency {
                 by_fk: HashMap::with_capacity(init),
                 by_txid: HashMap::with_capacity(init),
                 order: VecDeque::with_capacity(init),
+                outs_order: VecDeque::new(),
                 create_cap,
                 out_cap,
                 total_outs: 0,
@@ -134,7 +140,7 @@ impl CreateResidency {
         g.order.push_back(id);
     }
 
-    /// Attach outs (pin denserels) — in-place; may evict by out budget.
+    /// Attach outs (pin denserels) — in-place; may slim by out budget.
     pub fn put_outs(
         &self,
         fk: Fk,
@@ -158,6 +164,10 @@ impl CreateResidency {
             }
             let new_total = g.total_outs.saturating_sub(old_n).saturating_add(n);
             g.total_outs = new_total;
+            // First time this create gains outs → track for O(1) out slim.
+            if old_n == 0 && n > 0 {
+                g.outs_order.push_back(id);
+            }
             let cap = g.out_cap;
             g.evict_until_outs(cap);
             return;
@@ -179,6 +189,9 @@ impl CreateResidency {
         );
         g.by_txid.insert(txid, id);
         g.order.push_back(id);
+        if n > 0 {
+            g.outs_order.push_back(id);
+        }
         g.total_outs = g.total_outs.saturating_add(n);
     }
 
@@ -306,30 +319,27 @@ impl Inner {
     }
 
     /// Free out budget without discarding prewarm fk/range rows.
-    ///
-    /// Walk FIFO oldest→newest; **slim** the first entry that still holds outs
-    /// (drop outs/denserels/tx, keep fk/txid/body_range + order slot). Hard-drop
-    /// only if nothing left to slim (should not happen while `total_outs > 0`).
     fn evict_until_outs(&mut self, max_outs: u64) {
         while self.total_outs > max_outs {
             if !self.slim_oldest_outs() {
                 // No out-bearing row left but total_outs > max — repair and stop.
                 self.total_outs = 0;
+                self.outs_order.clear();
                 break;
             }
         }
     }
 
-    /// Strip denserels/outs from the oldest out-bearing create. Returns false if none.
+    /// Slim the oldest **out-bearing** create (O(1) amortized via `outs_order`).
     fn slim_oldest_outs(&mut self) -> bool {
-        // Collect ids to avoid holding a borrow across mut by_fk.
-        let ids: Vec<u64> = self.order.iter().copied().collect();
-        for id in ids {
+        while let Some(id) = self.outs_order.pop_front() {
             let Some(e) = self.by_fk.get_mut(&id) else {
+                // Hard-evicted or never present — skip stale.
                 continue;
             };
             let n = e.outs.as_ref().map(|o| o.len() as u64).unwrap_or(0);
             if n == 0 {
+                // Already slimmed (duplicate push or race) — skip.
                 continue;
             }
             e.outs = None;
@@ -348,6 +358,7 @@ impl Inner {
                 self.by_txid.remove(&e.txid);
                 let n = e.outs.as_ref().map(|o| o.len() as u64).unwrap_or(0);
                 self.total_outs = self.total_outs.saturating_sub(n);
+                // Leave id in outs_order if present — slim skips missing keys.
                 return true;
             }
         }
@@ -358,6 +369,7 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn tx(id: u8) -> TxRecord {
         let mut txid = [0u8; 32];
@@ -404,16 +416,9 @@ mod tests {
     }
 
     /// Regression: out-cap pressure must not hard-drop prewarm range-only rows.
-    ///
-    /// Prewarm inserts many fk/range entries (0 outs). Flood denserels on a
-    /// **later** subset until out_cap is exceeded. Old hard-evict wiped the
-    /// prewarm FIFO front without freeing outs; slim-on-out-evict must keep
-    /// prewarm txid→fk and body_range.
     #[test]
     fn out_pressure_slims_denserels_keeps_prewarm_ranges() {
-        // create_cap large; out_cap tiny so denserels flood forces out eviction.
         let r = CreateResidency::new(100, 10);
-        // Prewarm: 20 range-only creates (like archive_residency_prewarm).
         for i in 1u8..=20 {
             let mut txid = [0u8; 32];
             txid[0] = i;
@@ -422,7 +427,6 @@ mod tests {
         assert_eq!(r.len(), 20);
         assert_eq!(r.total_outs(), 0);
 
-        // Attach denserels to the *newest* 5 creates (10 outs each → 50 outs >> cap 10).
         for i in 16u8..=20 {
             let mut t = tx(i);
             t.output_count = 10;
@@ -444,23 +448,14 @@ mod tests {
             total_outs <= out_cap,
             "outs must respect cap: total={total_outs} cap={out_cap}"
         );
-        // Prewarm rows must still be present (not hard-evicted for out budget).
         assert_eq!(
             creates, 20,
             "out pressure must not drop create count below prewarm fill"
         );
-        // Oldest prewarm still resolves (plan path + cold idx skip).
         let mut t1 = [0u8; 32];
         t1[0] = 1;
         assert_eq!(r.lookup_fk_by_txid(&t1), Some(Fk(1)));
         assert_eq!(r.body_ranges_by_fk(&[Fk(1)]), vec![Some((100, 50))]);
-        let mut t10 = [0u8; 32];
-        t10[0] = 10;
-        assert_eq!(r.lookup_fk_by_txid(&t10), Some(Fk(10)));
-        let mut t20 = [0u8; 32];
-        t20[0] = 20;
-        assert_eq!(r.lookup_fk_by_txid(&t20), Some(Fk(20)));
-        // Range survives for every prewarm id (denserels may be slimmed).
         for i in 1u8..=20 {
             assert!(
                 r.get_txid(Fk(i as u64)).is_some(),
@@ -473,20 +468,66 @@ mod tests {
         }
     }
 
+    /// Regression: out slim must not scan prewarm size (tip-stall peg).
+    ///
+    /// With 200k range-only + denserels flood under small out_cap, must finish
+    /// quickly. The O(creates) walk would take seconds+.
+    #[test]
+    fn out_slim_is_fast_with_large_prewarm() {
+        const PREWARM: u64 = 200_000;
+        let r = CreateResidency::new(PREWARM as usize + 1000, 100);
+        for i in 1..=PREWARM {
+            let mut txid = [0u8; 32];
+            txid[..8].copy_from_slice(&i.to_le_bytes());
+            r.insert_fk_txid_range(Fk(i), txid, Some((i * 10, 20)));
+        }
+        let t0 = Instant::now();
+        // Flood denserels: each create 50 outs → forces many slims.
+        for i in 0u64..500 {
+            let id = PREWARM + 1 + i;
+            let mut txid = [0u8; 32];
+            txid[..8].copy_from_slice(&id.to_le_bytes());
+            let mut t = tx((i & 0xff) as u8);
+            t.txid = txid;
+            t.output_count = 50;
+            let outs: Vec<_> = (0..50)
+                .map(|v| OutputRecord::unspent(v as i64, vec![v as u8]))
+                .collect();
+            let denserels: Vec<u32> = (0..50).map(|v| v * 4).collect();
+            r.put_outs(Fk(id), t, outs, denserels, Some((id * 10, 20)));
+        }
+        let ms = t0.elapsed().as_millis();
+        assert!(
+            ms < 2_000,
+            "out slim with {PREWARM} prewarm must be O(out-bearing), took {ms}ms"
+        );
+        let (creates, _, total_outs, out_cap) = r.size_stats();
+        assert!(total_outs <= out_cap);
+        // Prewarm still largely present (create_cap not exceeded by much).
+        assert!(creates >= PREWARM as usize, "creates={creates}");
+        // Oldest prewarm range still resolvable.
+        let mut t1 = [0u8; 32];
+        t1[..8].copy_from_slice(&1u64.to_le_bytes());
+        assert_eq!(r.lookup_fk_by_txid(&t1), Some(Fk(1)));
+    }
+
     #[test]
     fn create_cap_still_hard_evicts_oldest() {
-        // Out room plenty; create_cap forces hard drop of oldest range-only.
         let r = CreateResidency::new(3, 10_000);
         for i in 1u8..=3 {
             let mut txid = [0u8; 32];
             txid[0] = i;
             r.insert_fk_txid_range(Fk(i as u64), txid, Some((i as u64, 1)));
         }
-        r.insert_fk_txid_range(Fk(4), {
-            let mut t = [0u8; 32];
-            t[0] = 4;
-            t
-        }, Some((4, 1)));
+        r.insert_fk_txid_range(
+            Fk(4),
+            {
+                let mut t = [0u8; 32];
+                t[0] = 4;
+                t
+            },
+            Some((4, 1)),
+        );
         assert_eq!(r.len(), 3);
         let mut t1 = [0u8; 32];
         t1[0] = 1;

@@ -1,4 +1,4 @@
-# Reproducible release package for rbitcoin-node + rbitcoin-cli.
+# Reproducible release package for rbitcoin-node + rbitcoin-cli (+ store utils).
 # Called from flake.nix with a pinned nixpkgs; do not import <nixpkgs> here.
 {
   lib,
@@ -38,11 +38,15 @@ rustPlatform.buildRustPackage rec {
   # Release product only — full workspace tests stay on the CI/dev path.
   doCheck = false;
 
+  # Build each package fully (do not pass a global --bin: that filters the whole
+  # workspace down to one binary and drops node/cli).
   cargoBuildFlags = [
     "-p"
     "rbitcoin-node"
     "-p"
     "rbitcoin-cli"
+    "-p"
+    "rbitcoin-store"
   ];
 
   # Deterministic path remapping for any debuginfo; align with fixed SOURCE_DATE_EPOCH.

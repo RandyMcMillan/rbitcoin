@@ -262,8 +262,8 @@ impl ChainHub {
 
     /// Prep with optional pipeline caches (reserved create fks + in-flight creates).
     ///
-    /// Cold denserels **allowed** (tests / tip). IBD prep after denserels stage
-    /// uses [`Self::confirm_wire_prep_phase_pipelined_cold`] with `Forbid`.
+    /// Cold denserels **allowed** (tests). IBD denserels→prep uses
+    /// [`Self::confirm_wire_prep_phase_pipelined_cold`] with `Forbid`.
     pub fn confirm_wire_prep_phase_pipelined(
         &self,
         blocks: &[(Height, Block)],

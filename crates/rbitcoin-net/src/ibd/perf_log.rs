@@ -1032,7 +1032,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     append_nz(&mut out, "resolve_us", us(s.resolve_ns));
     append_nz(&mut out, "strong_us", us(s.strong_ns));
     append_nz(&mut out, "tip_us", us(s.tip_ns));
-    // Wire rebuild store cost (legacy hash-only path only).
+    // Wire-body store cost (nonzero only on non-unified residual paths).
     if s.wf_body_store > 0 || s.wf_store_body_ms > 0 {
         out.push_str(&format!(
             " | wire_body store={} store_ms={}",

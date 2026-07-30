@@ -222,20 +222,28 @@ impl BodyPresence {
         }
     }
 
-    /// Skip getdata: already confirmed, Class A ready, rejected, or pending in body queue.
+    /// Skip getdata: confirmed, rejected, or **body-queue owns wire** (pending).
+    ///
+    /// Class A / `known` alone does **not** skip getdata — confirm requires bq wire
+    /// (bq → denserels → prep). Re-fetching when Class A exists but bq is empty is
+    /// intentional after resume/crash residue.
     ///
     /// Hot path: local sets first. Do **not** call `has_block` before checking
     /// `missing` — assign walks tens of thousands of known-missing far hashes and
     /// used to re-take the confirmed-set lock on every one (multi-100ms assign).
     pub(crate) fn skip_download(&mut self, hub: &ChainHub, h: &BlockHash) -> bool {
-        if self.rejected.contains(h) || self.known.contains(h) || self.is_pending_hash(h) {
+        if self.rejected.contains(h) || self.is_pending_hash(h) {
             return true;
         }
         if self.missing.contains(h) {
             return false;
         }
-        // One-shot store / confirmed probe; caches into known or missing.
-        self.ready(hub, h)
+        // Confirmed tip body: no getdata. Class A without tip is not enough.
+        if hub.has_block(h) {
+            self.known.insert(*h);
+            return true;
+        }
+        false
     }
 
     /// Drop cache entries that are no longer on the live work path.
@@ -254,15 +262,16 @@ impl BodyPresence {
     /// Local decision without store probe (for tests / hot short-circuit).
     ///
     /// Returns `Some(true)` if we must skip getdata, `Some(false)` if we know
-    /// the body is missing, `None` if a store probe would be required.
+    /// the body is missing, `None` if confirmed-store probe would be required.
     #[cfg(test)]
     pub(crate) fn skip_download_cached(&self, h: &BlockHash) -> Option<bool> {
-        if self.rejected.contains(h) || self.known.contains(h) || self.is_pending_hash(h) {
+        if self.rejected.contains(h) || self.is_pending_hash(h) {
             return Some(true);
         }
         if self.missing.contains(h) {
             return Some(false);
         }
+        // Class A `known` alone is not skip — need confirmed or pending.
         None
     }
 }
@@ -290,7 +299,8 @@ mod tests {
         assert!(!body.known.contains(&h(1))); // pending ≠ archived
 
         body.mark_archived(h(2));
-        assert_eq!(body.skip_download_cached(&h(2)), Some(true));
+        // Class A known alone does not skip getdata (bq wire required for confirm).
+        assert_eq!(body.skip_download_cached(&h(2)), None);
         assert!(body.known.contains(&h(2)));
         assert!(!body.is_pending(&h(2)));
         assert!(!body.missing.contains(&h(2)));

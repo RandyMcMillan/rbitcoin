@@ -604,10 +604,11 @@ fn offline_dense_rels(
 /// Whether wire pin may cold-load denserels from Class A body.
 ///
 /// IBD denserels stage warms CreateResidency first; prep then uses [`ColdPinMode::Forbid`]
-/// so cold denserels is never duplicated on the prep thread.
+/// so cold denserels is never duplicated on the prep thread. Tests / one-shot
+/// [`confirm_wire_prep_phase`] use [`ColdPinMode::Allow`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColdPinMode {
-    /// Residency miss → `load_creates_once(OutsDenserels)` (tests / tip / hash-only).
+    /// Residency miss → `load_creates_once(OutsDenserels)` (unit tests / tip-follow wire prep).
     Allow,
     /// Residency miss → hard `invariant: denserels stage miss` (IBD prep after denserels stage).
     Forbid,

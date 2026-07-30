@@ -41,7 +41,8 @@ pub(crate) fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
             st.ordered.push_back(hash);
         }
         if e.has_body {
-            // Class A on disk from a prior run → claim-ready without getdata.
+            // Class A on disk: remember for densify bookkeeping. Confirm still
+            // needs body-queue wire (rehydrate or re-getdata) — not claim-ready alone.
             st.body.mark_archived(hash);
             with_body = with_body.saturating_add(1);
             if ready_prefix {

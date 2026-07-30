@@ -20,8 +20,7 @@ const TIP_HOLE_SCAN_MAX: u32 = 8192;
 ///   (body queue densify bookkeeping; **not** printed on the progress line)
 /// - `headers`: max peer-advertised / learned header height
 /// - `tip_hole`: count of heights from tip+1 until the next **claim-ready**
-///   body (body queue / pending wire, or Class A fallback) — the fetch gap
-///   operators care about
+///   body (body queue / pending wire only) — the fetch gap operators care about
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WorkChainProgress {
     pub tip: u32,
@@ -75,11 +74,11 @@ pub(crate) fn format_progress_line(i: &ProgressLineInput) -> String {
     )
 }
 
-/// True if confirm prep can claim this height without another getdata.
+/// True if confirm denserels/prep can claim this height without another getdata.
 ///
-/// Unified path: body already in the durable/pending body queue (`pending` or
-/// `block_queue_has_height`). Class A `ready` remains a fallback for
-/// already-archived heights without a queue payload.
+/// **Only** body-queue / pending wire. Class A alone is not claim-ready — the
+/// sole confirm intake is bq → denserels → prep (wire). Tip-follow reorgs use
+/// peer wire via [`crate::chain::ChainHub::accept_block`], not this feed.
 pub(crate) fn claim_ready(
     hub: &ChainHub,
     body: &mut BodyPresence,
@@ -96,18 +95,14 @@ pub(crate) fn claim_ready(
     if body.is_pending(hash) {
         return true;
     }
-    if hub.query.block_queue_has_height(height) {
-        return true;
-    }
-    // Hash-only / already-archived Class A path.
-    body.ready(hub, hash)
+    hub.query.block_queue_has_height(height)
 }
 
 /// Count heights from tip+1 until the next claim-ready body (fetch gap).
 ///
 /// - Missing header on the work path → stop (cannot request further).
 /// - Rejected tip+1 → stop (not a download gap; confirm is blacklisted).
-/// - Claim-ready (queue/pending/Class A) → stop.
+/// - Claim-ready (queue/pending wire) → stop.
 /// - Otherwise increment hole (needs getdata before tip can claim it).
 pub(crate) fn tip_fetch_hole(
     hub: &ChainHub,

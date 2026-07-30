@@ -12,9 +12,11 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 | Confirm **commit** | 1 OS thread | **sole Class A appender** + structural + Class C + spend annotate + tip GC; **`block_queue_dequeue_height`** |
 | IBD main loop | 1 tokio task | none (orchestration only) |
 
-**Height-ordered unified pipeline (current):** peer → **body queue** → prep (plan+pin+assemble) → scripts → single commit era. **No** peer→confirm-feed wire retain. **No** primary dual track that appends Class A far ahead of tip and reloads bodies for confirm (retired; do not resurrect as the main IBD story). Optional **archive-job + ContigPark** remains only for unknown-height bodies and charge/abort release — not the tip densify path.
+**Height-ordered unified pipeline (current):** peer → **body queue** → denserels (parent OutsDenserels into CreateResidency) → prep (plan+pin+assemble, cold denserels forbidden) → scripts → single commit era. **No** peer→confirm-feed wire retain. **No** hash-only / Class-A-only confirm (bq wire required). **No** primary dual track that appends Class A far ahead of tip and reloads bodies for confirm (retired). Optional **archive-job + ContigPark** remains only for unknown-height bodies and charge/abort release — not the tip densify path.
 
-**Wire retained on the pipeline batch only:** prep pulls `bitcoin::Block` from the body queue; that wire rides through scripts; **no Class-A wire rebuild** on the unified path. Class A packed form is planned once and committed in the write stage.
+**Tip follow / reorg:** peer wire via `ChainHub::accept_block` / `accept_branch` → `accept_and_connect_block` (same wire prep path with cold denserels allowed on the one-shot call). Disconnect keeps Class A archive; re-extension always supplies **wire** from the peer, not hash-only load.
+
+**Wire retained on the pipeline batch only:** denserels/prep pull `bitcoin::Block` from the body queue; that wire rides through scripts; **no Class-A wire rebuild**. Class A packed form is planned once and committed in the write stage.
 
 **Body queue:** `store/block_queue/` multi‑GiB payload FIFO + RAM overflow when full (`RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`, default 8 GiB). **Capacity is bytes only** — densify getdata stops when effective fill hits the budget (90%/70% hysteresis). A separate **height horizon** (`CONTIG_DENSIFY_AHEAD`, 64 k past tip) only bounds how far ahead of tip densify/receive may walk when the byte budget is still nearly empty (early small blocks). **Offer** on peer Block; prep **reads** by height; **dequeue** after confirm-commit. Restart re-notes feed readiness only (wire stays on disk until prep).
 

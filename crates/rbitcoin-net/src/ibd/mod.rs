@@ -605,7 +605,7 @@ pub async fn ibd_cancellable(
             can_assign_new,
         );
 
-        // Note claim-ready heights into the confirm feed (body queue / Class A fallback).
+        // Note claim-ready heights into the confirm feed (body queue / pending wire only).
         offer_confirm_ready(
             &confirm_feed,
             &st.height_to_hash,

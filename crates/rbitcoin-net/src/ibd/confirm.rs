@@ -126,18 +126,18 @@ fn offline_in_flight_denserels(
 
 /// Shared feed of tip-extension **readiness** for the dedicated confirm engine.
 ///
-/// Live path: peer/rehydrate enqueues wire into the **body queue**
-/// (`store/block_queue/` + RAM pending), then notes height/hash here. Prep
-/// reloads wire from the body queue — the feed does **not** retain `Block`s.
+/// **Sole intake:** peer/rehydrate enqueues wire into the **body queue**, then
+/// notes height/hash here. Denserels/prep reload wire from the body queue — the
+/// feed does **not** retain `Block`s. Class A alone is never enough (no hash-only
+/// confirm). Tip-follow reorgs use peer wire via `ChainHub::accept_block`.
+///
 /// Optional wire slots remain for rare in-process requeue; production requeues
 /// strip wire so RAM stays in the body queue + pipeline stage batches only.
 ///
-/// Hash-only notes also cover already-archived Class A fallback (no bq payload).
-///
-/// **In-flight tracking:** once prep claims a contiguous run, those heights sit in
-/// `inflight` until write finishes (or prep re-queues). `note` will not re-insert
-/// them — otherwise offer re-notes tip+1 every main-loop tick and prep re-claims
-/// the same batch into the prep→scripts queue (duplicate script work).
+/// **In-flight tracking:** once denserels claims a contiguous run, those heights
+/// sit in `inflight` until write finishes (or re-queue). `note` will not re-insert
+/// them — otherwise offer re-notes tip+1 every main-loop tick and denserels
+/// re-claims the same batch (duplicate work).
 pub(crate) struct ConfirmFeed {
     pub(crate) inner: std::sync::Mutex<ConfirmFeedInner>,
     cv: std::sync::Condvar,
@@ -163,7 +163,7 @@ impl ConfirmFeed {
         }
     }
 
-    /// Note a ready height (hash only — Class A already on disk).
+    /// Note readiness (wire lives in the body queue — denserels reloads it).
     pub(crate) fn note(&self, height: u32, hash: BlockHash) {
         self.note_wire(height, hash, None);
     }
@@ -288,11 +288,10 @@ pub(crate) const WRITE_QUEUE_CAP: usize = 5;
 const MAX_CLAIM_AHEAD: u32 = (DENSERELS_QUEUE_CAP + LOAD_QUEUE_CAP + WRITE_QUEUE_CAP + 1) as u32
     * CONFIRM_RUN_MAX as u32;
 
-/// One denserels-stage output: claim resolved, parents warmed into CreateResidency.
+/// One denserels-stage output: bq wire resolved, parents warmed into CreateResidency.
 struct DenserelsDone {
-    batch: Vec<(u32, BlockHash, Option<bitcoin::Block>)>,
-    /// Wire path: prep must not cold-load denserels. Hash-only: cold still allowed.
-    cold_forbid: bool,
+    /// Every entry has `Some(Block)` from the body queue.
+    batch: Vec<(u32, BlockHash, bitcoin::Block)>,
     warm_ns: u64,
 }
 
@@ -741,7 +740,6 @@ pub(crate) fn spawn_confirm_engine(
             info!(
                 "ibd: confirm prep on dedicated OS thread (denserels queue → plan+pin+assemble)"
             );
-            let mut missing_tries: HashMap<u32, u32> = HashMap::new();
             let mut prep_ahead = PrepAheadState::new(&hub_prep);
             while let Ok(done) = denserels_rx.recv() {
                 let n = done.batch.len();
@@ -755,11 +753,6 @@ pub(crate) fn spawn_confirm_engine(
                 prep_ahead.prune_committed(&hub_prep);
 
                 let warm_ns = done.warm_ns;
-                let cold_mode = if done.cold_forbid {
-                    rbitcoin_consensus::ColdPinMode::Forbid
-                } else {
-                    rbitcoin_consensus::ColdPinMode::Allow
-                };
                 let batch = done.batch;
                 if batch.is_empty() {
                     continue;
@@ -785,36 +778,16 @@ pub(crate) fn spawn_confirm_engine(
                 };
                 let pipe = prep_ahead.pipeline_for(expect_h, store_path_lo);
                 let use_pipe = pipe.path_lo >= store_path_lo;
-                let all_wire = batch.iter().all(|(_, _, w)| w.is_some());
-                let mat_res = if all_wire {
-                    let wire_batch: Vec<(rbitcoin_primitives::Height, bitcoin::Block)> = batch
-                        .iter()
-                        .map(|(h, _, w)| {
-                            (
-                                rbitcoin_primitives::Height(*h),
-                                w.clone().expect("all_wire"),
-                            )
-                        })
-                        .collect();
-                    if use_pipe {
-                        hub_prep.confirm_wire_prep_phase_pipelined_cold(
-                            &wire_batch,
-                            Some(&pipe),
-                            cold_mode,
-                        )
-                    } else {
-                        hub_prep.confirm_wire_prep_phase_pipelined_cold(
-                            &wire_batch,
-                            None,
-                            cold_mode,
-                        )
-                    }
-                } else {
-                    // Hash-only Class A fallback: denserels stage did not warm wire parents.
-                    let hash_batch: Vec<(u32, BlockHash)> =
-                        batch.iter().map(|(h, ha, _)| (*h, *ha)).collect();
-                    hub_prep.confirm_load_phase(&hash_batch)
-                };
+                // Sole path: denserels-warmed wire → plan/pin with cold denserels forbidden.
+                let wire_batch: Vec<(rbitcoin_primitives::Height, bitcoin::Block)> = batch
+                    .iter()
+                    .map(|(h, _, w)| (rbitcoin_primitives::Height(*h), w.clone()))
+                    .collect();
+                let mat_res = hub_prep.confirm_wire_prep_phase_pipelined_cold(
+                    &wire_batch,
+                    if use_pipe { Some(&pipe) } else { None },
+                    rbitcoin_consensus::ColdPinMode::Forbid,
+                );
                 let mat_res = match mat_res {
                     Err(e) if batch.len() > 1 => {
                         let msg = e.to_string();
@@ -844,16 +817,15 @@ pub(crate) fn spawn_confirm_engine(
                                 .collect();
                             feed_prep.requeue_wire(&tail);
                             loop_stats_prep.confirm_begin(expect_h, 1);
-                            if let Some((_, _, Some(w))) = batch.first() {
-                                let one = [(rbitcoin_primitives::Height(expect_h), w.clone())];
-                                hub_prep.confirm_wire_prep_phase_pipelined_cold(
-                                    &one,
-                                    if use_pipe { Some(&pipe) } else { None },
-                                    cold_mode,
-                                )
-                            } else {
-                                hub_prep.confirm_load_phase(&[(expect_h, batch[0].1)])
-                            }
+                            let one = [(
+                                rbitcoin_primitives::Height(expect_h),
+                                batch[0].2.clone(),
+                            )];
+                            hub_prep.confirm_wire_prep_phase_pipelined_cold(
+                                &one,
+                                if use_pipe { Some(&pipe) } else { None },
+                                rbitcoin_consensus::ColdPinMode::Forbid,
+                            )
                         }
                     }
                     other => other,
@@ -977,36 +949,8 @@ pub(crate) fn spawn_confirm_engine(
                             std::thread::sleep(Duration::from_millis(50));
                             continue;
                         }
-                        if msg.contains("confirm without archive")
-                            || msg.contains("NotFound")
-                            || msg.contains("not found")
-                        {
-                            let tries = missing_tries.entry(expect).or_insert(0);
-                            *tries = tries.saturating_add(1);
-                            let n = *tries;
-                            if n == 1 {
-                                debug!(
-                                    "ibd: confirm prep missing body @{expect} {hash} \
-                                     (need body queue / getdata; not re-queuing hash-only)"
-                                );
-                            } else if n == 10 || n % 100 == 0 {
-                                warn!(
-                                    "ibd: confirm prep still missing body @{expect} {hash} (n={n})"
-                                );
-                            }
-                            feed_prep.finish(batch.iter().map(|(h, _, _)| *h));
-                            if missing_tries.len() > 256 {
-                                missing_tries.retain(|&h, _| h.saturating_add(64) > expect);
-                            }
-                            if event_tx_prep
-                                .send(ConfirmEvent::BodyMissing { hash })
-                                .is_err()
-                            {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(5));
-                            continue;
-                        }
+                        // No body-queue / wire: denserels should not have handed this off.
+                        // Permanent reject or BodyMissing only via denserels stage.
                         if batch.len() > 1 {
                             let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
                                 .iter()
@@ -1018,7 +962,6 @@ pub(crate) fn spawn_confirm_engine(
                         }
                         prep_ahead.clear_all(&hub_prep);
                         feed_prep.finish(std::iter::once(expect));
-                        missing_tries.remove(&expect);
                         loop_stats_prep
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
@@ -1166,65 +1109,58 @@ pub(crate) fn spawn_confirm_engine(
                     continue;
                 }
 
-                let all_wire = batch.iter().all(|(_, _, w)| w.is_some());
-                let (warm_ns, cold_forbid) = if all_wire {
-                    let wire_batch: Vec<(rbitcoin_primitives::Height, bitcoin::Block)> = batch
-                        .iter()
-                        .map(|(h, _, w)| {
-                            (
-                                rbitcoin_primitives::Height(*h),
-                                w.clone().expect("all_wire"),
-                            )
-                        })
-                        .collect();
-                    match rbitcoin_consensus::warm_parent_denserels_for_wire(
-                        &hub.query,
-                        &wire_batch,
-                    ) {
-                        Ok(st) => {
-                            if st.work_ns / 1_000_000 > 2_000 {
-                                info!(
-                                    "ibd: confirm denserels slow first={expect_h} n={} parents={} cold={} already={} unresolved={} ms={}",
-                                    batch.len(),
-                                    st.parents,
-                                    st.cold,
-                                    st.already,
-                                    st.unresolved,
-                                    st.work_ns / 1_000_000,
-                                );
-                            }
-                            (st.work_ns, true)
-                        }
-                        Err(e) => {
-                            let msg = e.to_string();
-                            if msg.contains("confirm cancelled") || feed.stopped() {
-                                drop(denserels_tx);
-                                let _ = prep_join.join();
-                                return;
-                            }
-                            warn!(
-                                "ibd: confirm denserels warm fail first={expect_h}: {e} — re-queue"
+                // resolve_batch_wire requires every height has bq payload — sole intake.
+                let wire_batch: Vec<(u32, BlockHash, bitcoin::Block)> = batch
+                    .into_iter()
+                    .map(|(h, ha, w)| (h, ha, w.expect("bq wire after resolve")))
+                    .collect();
+                let warm_items: Vec<(rbitcoin_primitives::Height, bitcoin::Block)> = wire_batch
+                    .iter()
+                    .map(|(h, _, w)| (rbitcoin_primitives::Height(*h), w.clone()))
+                    .collect();
+                let warm_ns = match rbitcoin_consensus::warm_parent_denserels_for_wire(
+                    &hub.query,
+                    &warm_items,
+                ) {
+                    Ok(st) => {
+                        if st.work_ns / 1_000_000 > 2_000 {
+                            info!(
+                                "ibd: confirm denserels slow first={expect_h} n={} parents={} cold={} already={} unresolved={} ms={}",
+                                wire_batch.len(),
+                                st.parents,
+                                st.cold,
+                                st.already,
+                                st.unresolved,
+                                st.work_ns / 1_000_000,
                             );
-                            let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
-                                .iter()
-                                .filter(|(_, ha, _)| !hub.has_block(ha))
-                                .map(|(h, ha, _)| (*h, *ha, None))
-                                .collect();
-                            feed.requeue_wire(&retry);
-                            std::thread::sleep(Duration::from_millis(20));
-                            continue;
                         }
+                        st.work_ns
                     }
-                } else {
-                    // Class A hash-only: prep may still cold-pin.
-                    (0, false)
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("confirm cancelled") || feed.stopped() {
+                            drop(denserels_tx);
+                            let _ = prep_join.join();
+                            return;
+                        }
+                        warn!(
+                            "ibd: confirm denserels warm fail first={expect_h}: {e} — re-queue"
+                        );
+                        let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = wire_batch
+                            .iter()
+                            .filter(|(_, ha, _)| !hub.has_block(ha))
+                            .map(|(h, ha, _)| (*h, *ha, None))
+                            .collect();
+                        feed.requeue_wire(&retry);
+                        std::thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
                 };
 
-                let n = batch.len();
+                let n = wire_batch.len();
                 if denserels_tx
                     .send(DenserelsDone {
-                        batch,
-                        cold_forbid,
+                        batch: wire_batch,
                         warm_ns,
                     })
                     .is_err()
@@ -1278,11 +1214,8 @@ fn resolve_batch_wire_from_body_queue(
                 }
             }
             Ok(None) => {
-                // No body-queue payload: allow Class A hash-only fallback later.
-                // Only treat as missing if the block is also not Class-A ready.
-                if !hub.query.is_block_archived(&hash.to_byte_array()).unwrap_or(false) {
-                    missing.push((height, hash, None));
-                }
+                // Sole confirm intake is body-queue wire — Class A alone is not enough.
+                missing.push((height, hash, None));
             }
             Err(e) => {
                 warn!("ibd: body queue read fail @{height} {hash}: {e}");
@@ -1299,15 +1232,13 @@ fn resolve_batch_wire_from_body_queue(
 
 /// Offer a run of claim-ready heights starting at tip+1 into the confirm feed.
 ///
-/// Pre-noting ahead of tip lets the engine batch multi-block script waves when
-/// the body queue (or Class A fallback) leads tip. Caps at [`OFFER_AHEAD`].
+/// Pre-noting ahead of tip lets the engine batch multi-block waves when the
+/// **body queue** leads tip. Caps at [`OFFER_AHEAD`].
+///
+/// Claim-ready = bq / pending wire only (not Class A alone).
 ///
 /// Uses `height_to_hash` for **O(OFFER_AHEAD)** work — never scans the full
 /// ordered path (that pegged a core at ~130k headers with tip frozen).
-///
-/// Does **not** require `ordered_set` membership: after resume seed + tip trim,
-/// height_to_hash is the source of truth for the parent cache. Gating on
-/// ordered_set left tip frozen with hole=0 when the set lagged the height map.
 pub(crate) fn offer_confirm_ready(
     feed: &ConfirmFeed,
     height_to_hash: &HashMap<u32, BlockHash>,
@@ -1346,11 +1277,7 @@ pub(crate) fn offer_confirm_ready(
             }
             break;
         }
-        // Claim-ready = body queue / pending / Class A — not Class A alone.
-        // Peer path also notes feed on offer; this fills Class A fallback and
-        // re-notes after restart hygiene. Break on first fetch hole so we do
-        // not pretip far heights while tip+1 is missing (confirm still claims
-        // tip-first; noting far without tip is harmless but wastes map RAM).
+        // bq / pending only — break on first hole so tip densify is not starved.
         if !super::progress::claim_ready(hub, body, ht, &hash) {
             break;
         }
@@ -1656,10 +1583,10 @@ mod tests {
         let feed = ConfirmFeed::new();
         let mut body = BodyPresence::new();
         let mut h2h = HashMap::new();
-        // Tip is 0; expect tip+1 = 1. Provide archived height 1.
+        // Tip is 0; expect tip+1 = 1. Claim-ready = body-queue pending wire only.
         let h1 = bh(0x11);
         h2h.insert(1u32, h1);
-        body.mark_archived(h1);
+        body.mark_pending(h1);
         let mut max_arch = 0u32;
         let shared = AtomicU32::new(0);
         let n = offer_confirm_ready(&feed, &h2h, &mut body, &hub, &mut max_arch, &shared);
@@ -1696,17 +1623,21 @@ mod tests {
         // rejected path already cleared h1 from ready; height 1 still rejected → 0.
         assert_eq!(n4, 0);
 
-        // Non-rejected multi-height walk: height 1 ready+archived, height 2 missing → stop after 1.
+        // Class A alone is not claim-ready: height 1 archived without bq → offer 0.
         body = BodyPresence::new();
         let mut h2h3 = HashMap::new();
         h2h3.insert(1u32, h1);
         h2h3.insert(2u32, h2);
         body.mark_archived(h1);
-        // h2 not archived → offer stops after noting h1.
         feed.finish([1]);
         max_arch = 0;
         let n5 = offer_confirm_ready(&feed, &h2h3, &mut body, &hub, &mut max_arch, &shared);
-        assert_eq!(n5, 1);
+        assert_eq!(n5, 0, "Class A without body queue must not note confirm feed");
+
+        // Pending wire (bq) is claim-ready.
+        body.mark_pending(h1);
+        let n6 = offer_confirm_ready(&feed, &h2h3, &mut body, &hub, &mut max_arch, &shared);
+        assert_eq!(n6, 1);
         assert_eq!(max_arch, 1);
         assert_eq!(feed.size_snap().0, 1);
 

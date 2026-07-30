@@ -68,12 +68,11 @@ pub struct ArchiveWritePlan {
         (TxRecord, Vec<OutputRecord>, Vec<u32>),
     >,
     /// Prep-ahead pin material for **this batch's creates**, parallel to
-    /// [`Self::planned_fks`]: `(TxRecord, outs, denserels)`.
+    /// [`Self::planned_fks`]: `Arc<(TxRecord, outs, denserels)>`.
     ///
-    /// Built once at plan finish via layout denserels (no second encode/decode).
-    /// Confirm `note_plan_ok` inserts these into in-flight outs without
-    /// re-packing Class A wire.
-    pub batch_pin: Vec<(TxRecord, Vec<OutputRecord>, Vec<u32>)>,
+    /// Built once at plan finish via layout denserels. Confirm `note_plan_ok`
+    /// only `Arc::clone`s into in-flight outs (no deep clone / re-pack).
+    pub batch_pin: Vec<std::sync::Arc<(TxRecord, Vec<OutputRecord>, Vec<u32>)>>,
     pub index_tx: bool,
     pub body_est: u64,
     /// Snapshot of “far ahead of confirm” at plan time.
@@ -433,12 +432,12 @@ impl Query {
             .collect();
 
         // Prep-ahead pin denserels once (layout offsets = Class A packing).
-        // Confirm note_plan_ok must not re-encode every create.
-        let batch_pin: Vec<(TxRecord, Vec<OutputRecord>, Vec<u32>)> = packed
+        // Arc so note_plan_ok only bumps refcounts into in_flight_outs.
+        let batch_pin: Vec<std::sync::Arc<(TxRecord, Vec<OutputRecord>, Vec<u32>)>> = packed
             .iter()
             .map(|(tx, ins, outs)| {
                 let dens = rbitcoin_store::denserels_from_packed_records(tx, ins, outs);
-                (tx.clone(), outs.clone(), dens)
+                std::sync::Arc::new((tx.clone(), outs.clone(), dens))
             })
             .collect();
 
@@ -883,6 +882,42 @@ mod tests {
             }],
             outputs: vec![OutputRecord::unspent(50 * 100_000_000, vec![0x51])],
         }
+    }
+
+    /// batch_pin Arc denserels match encode+decode layout (PR-A/B pin handoff).
+    #[test]
+    fn plan_batch_pin_arc_denserels_match_layout() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let (dir, q) = temp_query("batch-pin-arc");
+        let mut need = vec![(Fk(1), vec![coinbase_apply(1), coinbase_apply(2)])];
+        let plan = q
+            .archive_plan_mega_from(&mut need, 1, &HashMap::new())
+            .unwrap();
+        assert_eq!(plan.batch_pin.len(), plan.planned_fks.len());
+        assert_eq!(plan.batch_pin.len(), plan.packed.len());
+        // Simulated note_plan_ok: Arc::clone only (strong_count rises, no deep clone).
+        let mut ifo: HashMap<u64, Arc<(TxRecord, Vec<OutputRecord>, Vec<u32>)>> = HashMap::new();
+        for (fk, pin) in plan.planned_fks.iter().zip(plan.batch_pin.iter()) {
+            if let Some(id) = fk.get() {
+                assert_eq!(Arc::strong_count(pin), 1);
+                ifo.insert(id, Arc::clone(pin));
+                assert_eq!(Arc::strong_count(pin), 2);
+            }
+        }
+        for ((tx, ins, outs), pin) in plan.packed.iter().zip(plan.batch_pin.iter()) {
+            assert_eq!(pin.0.txid, tx.txid);
+            assert_eq!(pin.1, *outs);
+            let layout = rbitcoin_store::denserels_from_packed_records(tx, ins, outs);
+            assert_eq!(pin.2, layout);
+            let mut raw = Vec::new();
+            rbitcoin_store::encode_packed_tx(tx, ins, outs, &mut raw);
+            let (_, _, decode_rels) =
+                rbitcoin_store::decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
+            assert_eq!(pin.2, decode_rels);
+        }
+        assert_eq!(ifo.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -19,14 +19,15 @@ use std::time::{Duration, Instant};
 struct PrepAheadState {
     next_tx_start: u64,
     in_flight_creates: std::sync::Arc<HashMap<[u8; 32], Fk>>,
+    /// Pin values are Arc so `note_plan_ok` only bumps refcounts (no deep clone).
     in_flight_outs: std::sync::Arc<
         HashMap<
             u64,
-            (
+            std::sync::Arc<(
                 rbitcoin_store::TxRecord,
                 Vec<rbitcoin_store::OutputRecord>,
                 Vec<u32>,
-            ),
+            )>,
         >,
     >,
     /// Last height successfully prepped (still in pipeline or already committed).
@@ -89,29 +90,31 @@ impl PrepAheadState {
 
     fn note_plan_ok(
         &mut self,
-        hub: &ChainHub,
+        _hub: &ChainHub,
         plan: &rbitcoin_query::ArchiveWritePlan,
         last_height: u32,
         last_hash: [u8; 32],
     ) {
         let creates = std::sync::Arc::make_mut(&mut self.in_flight_creates);
         let outs = std::sync::Arc::make_mut(&mut self.in_flight_outs);
-        // Prefer plan-time denserels (no re-encode). Fall back only if lengths
+        // Prefer plan-time Arc pin (layout denserels). Fall back only if lengths
         // mismatch (tests constructing partial ArchiveWritePlan).
         if plan.batch_pin.len() == plan.planned_fks.len() {
-            for (fk, (tx, o, dens)) in plan.planned_fks.iter().zip(plan.batch_pin.iter()) {
-                creates.insert(tx.txid, *fk);
+            for (fk, pin) in plan.planned_fks.iter().zip(plan.batch_pin.iter()) {
+                creates.insert(pin.0.txid, *fk);
                 if let Some(id) = fk.get() {
-                    outs.insert(id, (tx.clone(), o.clone(), dens.clone()));
+                    outs.insert(id, std::sync::Arc::clone(pin));
                 }
             }
         } else {
-            let secret = hub.query.store().txs.store_secret();
             for ((tx, ins, o), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
                 creates.insert(tx.txid, *fk);
                 if let Some(id) = fk.get() {
-                    let denserels = offline_in_flight_denserels(secret, tx, ins, o);
-                    outs.insert(id, (tx.clone(), o.clone(), denserels));
+                    let denserels = offline_in_flight_denserels(tx, ins, o);
+                    outs.insert(
+                        id,
+                        std::sync::Arc::new((tx.clone(), o.clone(), denserels)),
+                    );
                 }
             }
         }
@@ -139,11 +142,11 @@ fn prune_inflight_maps(
     creates: &mut HashMap<[u8; 32], Fk>,
     outs: &mut HashMap<
         u64,
-        (
+        std::sync::Arc<(
             rbitcoin_store::TxRecord,
             Vec<rbitcoin_store::OutputRecord>,
             Vec<u32>,
-        ),
+        )>,
     >,
     next_tx_start: &mut u64,
 ) {
@@ -154,16 +157,11 @@ fn prune_inflight_maps(
 
 /// Offline denserels for in-flight pin (must match Class A body packing).
 fn offline_in_flight_denserels(
-    secret: &rbitcoin_store::StoreSecret,
     tx: &rbitcoin_store::TxRecord,
     ins: &[rbitcoin_store::InputRecord],
     outs: &[rbitcoin_store::OutputRecord],
 ) -> Vec<u32> {
-    let mut raw = Vec::new();
-    rbitcoin_store::encode_packed_tx_with_secret(tx, ins, outs, &mut raw, Some(secret));
-    rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(&raw, Some(secret))
-        .map(|(_, _, rels)| rels)
-        .unwrap_or_default()
+    rbitcoin_store::denserels_from_packed_records(tx, ins, outs)
 }
 
 /// Shared feed of tip-extension **readiness** for the dedicated confirm engine.
@@ -1604,7 +1602,7 @@ mod tests {
         for id in 85u64..=100 {
             outs.insert(
                 id,
-                (
+                std::sync::Arc::new((
                     rbitcoin_store::TxRecord {
                         txid: {
                             let mut t = [0u8; 32];
@@ -1620,7 +1618,7 @@ mod tests {
                     },
                     Vec::new(),
                     Vec::new(),
-                ),
+                )),
             );
         }
         let mut next = 50u64;

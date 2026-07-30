@@ -160,8 +160,27 @@ impl OutputRecord {
         Ok(rec)
     }
 
+    /// Capacity upper bound for encode buffers (not byte-exact).
     pub fn encoded_len(&self) -> usize {
         8 + 1 + 10 + 9 + self.script.len()
+    }
+
+    /// Exact on-wire length matching [`Self::encode_into`] (for denserels layout).
+    #[inline]
+    pub fn encoded_len_exact(&self) -> usize {
+        use crate::compact::{compact_size_len, uleb128_len};
+        let v = if self.value < 0 {
+            0u64
+        } else {
+            self.value as u64
+        };
+        let mut n = 8 + 1 + uleb128_len(v);
+        if self.script.is_empty() || self.script == [0x51] {
+            // EMPTY_SCRIPT / OP_TRUE — no script payload.
+        } else {
+            n += compact_size_len(self.script.len() as u64) + self.script.len();
+        }
+        n
     }
 }
 
@@ -452,10 +471,36 @@ impl InputRecord {
         Ok(rec)
     }
 
+    /// Capacity upper bound for encode buffers (not byte-exact).
     pub fn encoded_len(&self) -> usize {
         // flags + create_fk(8) + vout + sequence + script + witness (upper bound)
         1 + 8 + 9 + 4 + 9 + self.script_sig.len() + 9
             + self.witness.iter().map(|i| 9 + i.len()).sum::<usize>()
+    }
+
+    /// Exact on-wire length matching [`Self::encode_into`] (for denserels layout).
+    #[inline]
+    pub fn encoded_len_exact(&self) -> usize {
+        use crate::compact::compact_size_len;
+        let null_prev = self.create_fk.is_null() && self.prev_index == u32::MAX;
+        let mut n = 1usize; // flags
+        if !null_prev {
+            n += 8; // create_fk
+            n += compact_size_len(u64::from(self.prev_index));
+        }
+        if self.sequence != u32::MAX {
+            n += 4;
+        }
+        if !self.script_sig.is_empty() {
+            n += compact_size_len(self.script_sig.len() as u64) + self.script_sig.len();
+        }
+        if !self.witness.is_empty() {
+            n += compact_size_len(self.witness.len() as u64);
+            for item in &self.witness {
+                n += compact_size_len(item.len() as u64) + item.len();
+            }
+        }
+        n
     }
 }
 
@@ -646,23 +691,27 @@ pub fn encode_packed_tx_with_secret(
 
 /// Dense relative offsets of each output's start within a packed Class A payload.
 ///
-/// Matches [`decode_packed_tx_with_spender_rels`] denserels. Encodes once without
-/// secret (XOR does not change field lengths). Used at plan finish so confirm
-/// prep-ahead pin does not re-encode every create in `note_plan_ok`.
+/// Matches [`decode_packed_tx_with_spender_rels`] denserels. Computed from exact
+/// encode layout (`encoded_len_exact`) — no full encode+decode. Secret XOR does
+/// not change field lengths. Used at plan finish for prep-ahead pin.
 pub fn denserels_from_packed_records(
     tx: &TxRecord,
     inputs: &[InputRecord],
     outputs: &[OutputRecord],
 ) -> Vec<u32> {
-    let mut raw = Vec::with_capacity(
-        TxRecord::ENCODED_LEN
-            + inputs.iter().map(|i| i.encoded_len()).sum::<usize>()
-            + outputs.iter().map(|o| o.encoded_len()).sum::<usize>(),
-    );
-    encode_packed_tx(tx, inputs, outputs, &mut raw);
-    decode_packed_tx_outs_with_spender_rels(&raw)
-        .map(|(_, _, rels)| rels)
-        .unwrap_or_default()
+    debug_assert_eq!(inputs.len() as u32, tx.input_count);
+    debug_assert_eq!(outputs.len() as u32, tx.output_count);
+    // TxRecord meta is fixed-width; fk NULLs on encode do not change length.
+    let mut off = TxRecord::ENCODED_LEN;
+    for inp in inputs {
+        off = off.saturating_add(inp.encoded_len_exact());
+    }
+    let mut dens = Vec::with_capacity(outputs.len());
+    for out in outputs {
+        dens.push(off as u32);
+        off = off.saturating_add(out.encoded_len_exact());
+    }
+    dens
 }
 
 /// After walking a packed payload to `logical_end`, accept only zero pad to `raw.len()`.
@@ -2335,6 +2384,89 @@ mod tests {
             let fo = rel as usize;
             assert!(raw.len() >= fo + 9);
             assert_eq!(&raw[fo..fo + 8], &[0u8; 8]);
+        }
+    }
+
+    /// Exact layout denserels (no encode) match encode+decode for varied shapes.
+    #[test]
+    fn denserels_layout_exact_matches_encode_decode_shapes() {
+        let cases: Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> = vec![
+            // Coinbase + OP_TRUE out
+            (
+                TxRecord {
+                    txid: [1u8; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                vec![InputRecord::coinbase(u32::MAX, vec![0x01, 0x02], vec![])],
+                vec![OutputRecord::unspent(50, vec![0x51])],
+            ),
+            // Non-final sequence, long script, multi-witness, multi-vout
+            (
+                TxRecord {
+                    txid: [2u8; 32],
+                    version: 2,
+                    locktime: 100,
+                    input_start_fk: Fk::NULL,
+                    input_count: 2,
+                    output_start_fk: Fk::NULL,
+                    output_count: 3,
+                },
+                vec![
+                    InputRecord {
+                        prev_txid: [9u8; 32],
+                        create_fk: Fk(42),
+                        prev_index: 0,
+                        sequence: 1,
+                        script_sig: vec![0xab; 40],
+                        witness: vec![vec![0x01], vec![0x02; 33]],
+                    },
+                    InputRecord {
+                        prev_txid: [8u8; 32],
+                        create_fk: Fk(99),
+                        prev_index: 300, // compact size 3 bytes
+                        sequence: u32::MAX,
+                        script_sig: vec![],
+                        witness: vec![],
+                    },
+                ],
+                vec![
+                    OutputRecord::unspent(0, vec![]),
+                    OutputRecord::unspent(1, vec![0x51]),
+                    OutputRecord::unspent(21_000_000 * 100_000_000, vec![0x00; 25]),
+                ],
+            ),
+        ];
+        for (tx, inputs, outputs) in cases {
+            assert_eq!(inputs.len() as u32, tx.input_count);
+            assert_eq!(outputs.len() as u32, tx.output_count);
+            for i in &inputs {
+                let mut buf = Vec::new();
+                i.encode_into(&mut buf);
+                assert_eq!(
+                    i.encoded_len_exact(),
+                    buf.len(),
+                    "input exact len vs encode"
+                );
+            }
+            for o in &outputs {
+                let mut buf = Vec::new();
+                o.encode_into(&mut buf);
+                assert_eq!(
+                    o.encoded_len_exact(),
+                    buf.len(),
+                    "output exact len vs encode"
+                );
+            }
+            let layout = denserels_from_packed_records(&tx, &inputs, &outputs);
+            let mut raw = Vec::new();
+            encode_packed_tx(&tx, &inputs, &outputs, &mut raw);
+            let (_, _, decode_rels) = decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
+            assert_eq!(layout, decode_rels, "layout denserels vs encode+decode");
         }
     }
 

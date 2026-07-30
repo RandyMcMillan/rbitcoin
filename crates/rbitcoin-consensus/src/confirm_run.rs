@@ -88,19 +88,18 @@ pub struct WirePrepPipeline {
     pub next_tx_start: u64,
     /// Prior uncommitted plans: create txid → fk (shared; clone is Arc bump only).
     pub in_flight_creates: std::sync::Arc<HashMap<[u8; 32], rbitcoin_primitives::Fk>>,
-    /// Prior uncommitted plans: create fk id → (tx meta, outs, denserels).
+    /// Prior uncommitted plans: create fk id → Arc pin material
+    /// `(tx meta, outs, denserels)`.
     ///
     /// `denserels` is offline-packed (same as disk) so prep(N+1) can pin abs
     /// layout without waiting for commit(N) body IO; body_range is filled at write.
+    /// Values are `Arc` so plan-thread `note_plan_ok` only bumps refcounts.
     pub in_flight_outs: std::sync::Arc<
-        HashMap<
-            u64,
-            (
-                rbitcoin_store::TxRecord,
-                Vec<rbitcoin_store::OutputRecord>,
-                Vec<u32>,
-            ),
-        >,
+        HashMap<u64, std::sync::Arc<(
+            rbitcoin_store::TxRecord,
+            Vec<rbitcoin_store::OutputRecord>,
+            Vec<u32>,
+        )>>,
     >,
 }
 
@@ -588,17 +587,13 @@ pub fn confirm_wire_run_preverified(
 
 /// Offline denserels matching Class A body packing (for plan / in-flight pin).
 fn offline_dense_rels(
-    query: &Query,
+    _query: &Query,
     tx: &rbitcoin_store::TxRecord,
     ins: &[rbitcoin_store::InputRecord],
     outs: &[rbitcoin_store::OutputRecord],
 ) -> Vec<u32> {
-    let secret = query.store().txs.store_secret();
-    let mut raw = Vec::new();
-    rbitcoin_store::encode_packed_tx_with_secret(tx, ins, outs, &mut raw, Some(secret));
-    rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(&raw, Some(secret))
-        .map(|(_, _, rels)| rels)
-        .unwrap_or_default()
+    // Layout offsets — secret XOR does not change lengths.
+    rbitcoin_store::denserels_from_packed_records(tx, ins, outs)
 }
 
 /// Whether wire pin may cold-load denserels from Class A body.
@@ -642,11 +637,11 @@ pub fn ensure_external_parent_denserels_from_plan(
     in_flight_outs: Option<
         &HashMap<
             u64,
-            (
+            std::sync::Arc<(
                 rbitcoin_store::TxRecord,
                 Vec<rbitcoin_store::OutputRecord>,
                 Vec<u32>,
-            ),
+            )>,
         >,
     >,
 ) -> Result<DenserelsWarmStats, ConsensusError> {
@@ -698,7 +693,7 @@ pub fn ensure_external_parent_denserels_from_plan(
         let fk = rbitcoin_primitives::Fk(*id);
         // In-flight offline denserels already available for pin.
         if let Some(ifo) = in_flight_outs {
-            if ifo.get(id).is_some_and(|(_, _, d)| !d.is_empty()) {
+            if ifo.get(id).is_some_and(|pin| !pin.2.is_empty()) {
                 st.already = st.already.saturating_add(1);
                 continue;
             }
@@ -1250,11 +1245,11 @@ fn pin_for_wire_batch(
     in_flight_outs: Option<
         &HashMap<
             u64,
-            (
+            std::sync::Arc<(
                 rbitcoin_store::TxRecord,
                 Vec<rbitcoin_store::OutputRecord>,
                 Vec<u32>,
-            ),
+            )>,
         >,
     >,
     cold_mode: ColdPinMode,
@@ -1270,16 +1265,16 @@ fn pin_for_wire_batch(
     let mut parent_vouts: HashMap<u64, Vec<u32>> = HashMap::new();
     let mut n_same_batch = 0u32;
 
-    // id → (tx, outs, dense denserels). Built for spent parents only (after thin pass).
+    // id → Arc pin (tx, outs, dense denserels). Spent parents only (after thin pass).
     let mut plan_by_id: HashMap<
         u64,
-        (
+        std::sync::Arc<(
             rbitcoin_store::TxRecord,
             Vec<rbitcoin_store::OutputRecord>,
             Vec<u32>,
-        ),
+        )>,
     > = HashMap::new();
-    // Index plan packed by create id for thin edges + later sparse denserels pin.
+    // Index plan packed by create id for thin edges + batch_pin fallback.
     let mut plan_packed_by_id: HashMap<
         u64,
         (
@@ -1288,10 +1283,26 @@ fn pin_for_wire_batch(
             &Vec<rbitcoin_store::OutputRecord>,
         ),
     > = HashMap::new();
+    // batch_pin by create id (Arc — preferred same-batch pin source).
+    let mut batch_pin_by_id: HashMap<
+        u64,
+        &std::sync::Arc<(
+            rbitcoin_store::TxRecord,
+            Vec<rbitcoin_store::OutputRecord>,
+            Vec<u32>,
+        )>,
+    > = HashMap::new();
     if let Some(plan) = plan {
         for ((tx, ins, outs), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
             if let Some(id) = fk.get() {
                 plan_packed_by_id.insert(id, (tx, ins, outs));
+            }
+        }
+        if plan.batch_pin.len() == plan.planned_fks.len() {
+            for (fk, pin) in plan.planned_fks.iter().zip(plan.batch_pin.iter()) {
+                if let Some(id) = fk.get() {
+                    batch_pin_by_id.insert(id, pin);
+                }
             }
         }
         for ((tx, ins, _outs), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
@@ -1375,15 +1386,15 @@ fn pin_for_wire_batch(
     }
 
     // Build plan/in-flight pin sources only for spent parents (not every create).
-    // 1) Prior uncommitted plans (offline denserels).
+    // 1) Prior uncommitted plans (Arc pin — no deep clone).
     if let Some(ifo) = in_flight_outs {
         for (id, need) in &parent_vouts {
             if plan_by_id.contains_key(id) {
                 continue;
             }
-            if let Some((tx, outs, denserels)) = ifo.get(id) {
+            if let Some(pin) = ifo.get(id) {
                 let _ = need;
-                plan_by_id.insert(*id, (tx.clone(), outs.clone(), denserels.clone()));
+                plan_by_id.insert(*id, std::sync::Arc::clone(pin));
             }
         }
     }
@@ -1395,18 +1406,29 @@ fn pin_for_wire_batch(
             }
             if let Some((tx, outs, denserels)) = plan.external_parent_outs.get(id) {
                 let _ = need;
-                plan_by_id.insert(*id, (tx.clone(), outs.clone(), denserels.clone()));
+                plan_by_id.insert(
+                    *id,
+                    std::sync::Arc::new((tx.clone(), outs.clone(), denserels.clone())),
+                );
             }
         }
     }
-    // 3) Same-batch creates (offline denserels from packed plan).
+    // 3) Same-batch creates: prefer batch_pin Arc, else layout denserels from packed.
     for (id, _need) in &parent_vouts {
         if plan_by_id.contains_key(id) {
             continue;
         }
+        if let Some(pin) = batch_pin_by_id.get(id) {
+            plan_by_id.insert(*id, std::sync::Arc::clone(pin));
+            n_same_batch = n_same_batch.saturating_add(1);
+            continue;
+        }
         if let Some((tx, ins, outs)) = plan_packed_by_id.get(id) {
             let denserels = offline_dense_rels(query, tx, ins, outs);
-            plan_by_id.insert(*id, ((*tx).clone(), (*outs).clone(), denserels));
+            plan_by_id.insert(
+                *id,
+                std::sync::Arc::new(((*tx).clone(), (*outs).clone(), denserels)),
+            );
             n_same_batch = n_same_batch.saturating_add(1);
         }
     }
@@ -1420,7 +1442,8 @@ fn pin_for_wire_batch(
     // attach offline denserels so write ensure does not re-read Class A body.
     let t_plan = Instant::now();
     for (id, need) in &parent_vouts {
-        if let Some((tx, outs, denserels)) = plan_by_id.get(id) {
+        if let Some(pin) = plan_by_id.get(id) {
+            let (tx, outs, denserels) = pin.as_ref();
             let live: Vec<(u32, rbitcoin_store::OutputRecord)> = need
                 .iter()
                 .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
@@ -2797,7 +2820,10 @@ mod write_idempotent_tests {
             output_start_fk: Fk::NULL,
             output_count: 0,
         };
-        ifo.insert(parent_id, (parent_tx, Vec::new(), Vec::new()));
+        ifo.insert(
+            parent_id,
+            std::sync::Arc::new((parent_tx, Vec::new(), Vec::new())),
+        );
 
         let err = pin_for_wire_batch(
             &q,

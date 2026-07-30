@@ -6,6 +6,20 @@
 
 use crate::error::StoreError;
 
+/// Byte length of a Bitcoin CompactSize encoding of `n` (no write).
+#[inline]
+pub fn compact_size_len(n: u64) -> usize {
+    if n < 253 {
+        1
+    } else if n <= u16::MAX as u64 {
+        3
+    } else if n <= u32::MAX as u64 {
+        5
+    } else {
+        9
+    }
+}
+
 /// Write Bitcoin CompactSize (unsigned).
 pub fn write_compact_size(out: &mut Vec<u8>, n: u64) {
     if n < 253 {
@@ -51,6 +65,17 @@ pub fn read_compact_size(buf: &[u8]) -> Result<(u64, usize), StoreError> {
             Ok((v, 9))
         }
     }
+}
+
+/// Byte length of an unsigned LEB128 encoding of `n` (no write).
+#[inline]
+pub fn uleb128_len(mut n: u64) -> usize {
+    let mut len = 1usize;
+    while n >= 0x80 {
+        n >>= 7;
+        len += 1;
+    }
+    len
 }
 
 /// Unsigned LEB128 (7-bit groups, MSB continuation).

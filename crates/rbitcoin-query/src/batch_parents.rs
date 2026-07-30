@@ -233,6 +233,19 @@ impl BatchParents {
             .is_some_and(|e| e.body_range.is_some() && !e.spender_rels.is_empty())
     }
 
+    /// True when sparse denserels (spender_rels) are present — body_range may still be missing.
+    ///
+    /// Write ensure uses this to fetch **idx range only** instead of reloading Class A denserels.
+    #[inline]
+    pub fn has_spender_rels(&self, fk: Fk) -> bool {
+        let Some(id) = fk.get() else {
+            return false;
+        };
+        self.by_fk
+            .get(&id)
+            .is_some_and(|e| !e.spender_rels.is_empty())
+    }
+
     /// Create fks pinned without body_range / spender rels (prep-ahead in-flight parents).
     ///
     /// Write fills these after prior pipeline batches have committed Class A so
@@ -434,6 +447,7 @@ mod tests {
             vec![(0, 40)],
         );
         assert!(!bp.has_abs_layout(Fk(3)));
+        assert!(bp.has_spender_rels(Fk(3)));
         bp.set_body_range_only(Fk(3), (500, 80));
         assert!(bp.has_abs_layout(Fk(3)));
         assert_eq!(bp.get_spender_abs(Fk(3), 0), Some(540));

@@ -1907,7 +1907,6 @@ fn fill_planned_create_layout_after_commit(
         .store()
         .tx_body_range_batch(&need_fks)
         .map_err(ConsensusError::Store)?;
-    let secret = query.store().txs.store_secret();
     for ((&fk, range), &pi) in need_fks.iter().zip(ranges.into_iter()).zip(need_packed_i.iter())
     {
         let Some((off, len)) = range else {
@@ -1918,15 +1917,12 @@ fn fill_planned_create_layout_after_commit(
         if batch_parents.has_abs_layout(fk) {
             continue;
         }
-        // No denserels on pin yet — offline pack once (same packing as disk).
+        // No denserels on pin yet — layout denserels (no encode+decode).
         let (tx, ins, outs) = &packed[pi];
-        let mut raw = Vec::new();
-        rbitcoin_store::encode_packed_tx_with_secret(tx, ins, outs, &mut raw, Some(secret));
-        let Ok((_meta, _outs, dense_rels)) =
-            rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(&raw, Some(secret))
-        else {
+        let dense_rels = rbitcoin_store::denserels_from_packed_records(tx, ins, outs);
+        if dense_rels.is_empty() && outs.is_empty() {
             continue;
-        };
+        }
         batch_parents.set_layout(fk, (off, len), &dense_rels);
     }
     Ok(())
@@ -1980,40 +1976,56 @@ fn ensure_spend_abs_layouts(
     }
 
     // 1) Residency denserels + body_range (commit seed / prior cold pin) — no body IO.
-    let mut still: HashMap<u64, Vec<u32>> = HashMap::new();
+    // 1a) Batch residency range lookup for pins that already have denserels (range-only gap).
     let mut ensure_res = 0u64;
+    let range_gap_fks: Vec<rbitcoin_primitives::Fk> = need
+        .keys()
+        .filter_map(|&id| {
+            let fk = rbitcoin_primitives::Fk(id);
+            if batch_parents.has_spender_rels(fk) && !batch_parents.has_abs_layout(fk) {
+                Some(fk)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !range_gap_fks.is_empty() {
+        let res_ranges = query.create_residency().body_ranges_by_fk(&range_gap_fks);
+        for (fk, opt) in range_gap_fks.iter().zip(res_ranges.into_iter()) {
+            if let Some(range) = opt.or_else(|| batch_parents.get_body_range(*fk)) {
+                batch_parents.set_body_range_only(*fk, range);
+            }
+        }
+    }
+
+    let mut still: HashMap<u64, Vec<u32>> = HashMap::new();
+    // Pin has denserels but still no body_range after residency — idx only (not denserels IO).
+    let mut range_only: Vec<rbitcoin_primitives::Fk> = Vec::new();
     for (id, need_v) in &need {
         let fk = rbitcoin_primitives::Fk(*id);
         // Pin already complete for this create — skip.
         if batch_parents.has_abs_layout(fk)
-            && need_v
-                .iter()
-                .all(|&v| batch_parents.get_spender_abs(fk, v).is_some())
+            && (need_v.is_empty()
+                || need_v
+                    .iter()
+                    .all(|&v| batch_parents.get_spender_abs(fk, v).is_some()))
         {
             ensure_res = ensure_res.saturating_add(1);
             continue;
         }
-        // Range-only gap: pin has denserels, residency has range (or pin range later).
-        if batch_parents.contains(fk) {
-            if let Some(range) = query
-                .create_residency()
-                .body_ranges_by_fk(&[fk])
-                .into_iter()
-                .next()
-                .flatten()
-                .or_else(|| batch_parents.get_body_range(fk))
+        // Range-only: denserels already on pin — do not cold-load Class A denserels body.
+        if batch_parents.has_spender_rels(fk) {
+            if batch_parents.has_abs_layout(fk)
+                && (need_v.is_empty()
+                    || need_v
+                        .iter()
+                        .all(|&v| batch_parents.get_spender_abs(fk, v).is_some()))
             {
-                batch_parents.set_body_range_only(fk, range);
-                if batch_parents.has_abs_layout(fk)
-                    && (need_v.is_empty()
-                        || need_v
-                            .iter()
-                            .all(|&v| batch_parents.get_spender_abs(fk, v).is_some()))
-                {
-                    ensure_res = ensure_res.saturating_add(1);
-                    continue;
-                }
+                ensure_res = ensure_res.saturating_add(1);
+                continue;
             }
+            range_only.push(fk);
+            continue;
         }
         if let Some((tx, live, sparse, body_range)) =
             query.create_residency().get_parent_needed(fk, need_v)
@@ -2044,9 +2056,41 @@ fn ensure_spend_abs_layouts(
         }
         still.insert(*id, need_v.clone());
     }
+
+    // 1b) Idx body ranges for pin denserels without range (cheap; no denserels body).
+    if !range_only.is_empty() {
+        range_only.sort_unstable_by_key(|f| f.0);
+        range_only.dedup();
+        let ranges = query
+            .store()
+            .tx_body_range_batch(&range_only)
+            .map_err(ConsensusError::Store)?;
+        for (fk, opt) in range_only.iter().zip(ranges.into_iter()) {
+            let Some(range) = opt else {
+                // No idx range yet (e.g. parent not committed) — hard fail at post-condition
+                // if spend still needs abs; leave for invariant.
+                continue;
+            };
+            batch_parents.set_body_range_only(*fk, range);
+            let id = fk.get().unwrap_or(0);
+            let need_v = need.get(&id).cloned().unwrap_or_default();
+            if batch_parents.has_abs_layout(*fk)
+                && (need_v.is_empty()
+                    || need_v
+                        .iter()
+                        .all(|&v| batch_parents.get_spender_abs(*fk, v).is_some()))
+            {
+                ensure_res = ensure_res.saturating_add(1);
+            } else {
+                // denserels present but need_v not covered — should not happen if pin sparse
+                // was built for need; fall through to cold denserels as last resort.
+                still.entry(id).or_insert(need_v);
+            }
+        }
+    }
     confirm_phase_stats::ENSURE_RES_HIT.fetch_add(ensure_res, Ordering::Relaxed);
 
-    // 2) Class A denserels body for remainder only (must not re-load pin hits).
+    // 2) Class A denserels body for remainder only (must not re-load pin denserels hits).
     if !still.is_empty() {
         let fks: Vec<rbitcoin_primitives::Fk> = still
             .keys()
@@ -2892,6 +2936,102 @@ mod write_idempotent_tests {
             msg.contains("invariant") && msg.contains("denserels"),
             "unexpected err: {msg}"
         );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// W3: pin already has denserels — ensure only attaches body_range (no denserels cold).
+    #[test]
+    fn ensure_range_only_when_pin_has_denserels_skips_cold_body() {
+        use super::{ensure_spend_abs_layouts, Prepared};
+        use crate::confirm_phase_stats;
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::{BatchParents, Query};
+        use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+        use std::sync::atomic::Ordering;
+        use std::sync::Once;
+
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-ensure-range-only-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let q = Query::open_or_create(&path).unwrap();
+        q.enter_direct_index_mode().unwrap();
+
+        let parent_tx = TxRecord {
+            txid: [0x11u8; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let parent_ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+        let parent_outs = vec![OutputRecord::unspent(50, vec![0x51])];
+        let dens = rbitcoin_store::denserels_from_packed_records(
+            &parent_tx,
+            &parent_ins,
+            &parent_outs,
+        );
+        let fks = q
+            .store()
+            .put_tx_full_batch_indexed(
+                &[(parent_tx.clone(), parent_ins, parent_outs.clone())],
+                /*index=*/ true,
+            )
+            .unwrap();
+        let parent_fk = fks[0];
+        let (body_off, body_len) = q.store().txs.body_range(parent_fk).unwrap();
+
+        // Pin denserels without body_range (prep-ahead shape before commit).
+        let mut bp = BatchParents::new();
+        bp.insert_owned(
+            parent_fk,
+            parent_tx,
+            vec![(0, parent_outs[0].clone())],
+            vec![0],
+            Some(true),
+            None,
+            dens.iter().enumerate().map(|(i, r)| (i as u32, *r)).collect(),
+        );
+        assert!(bp.has_spender_rels(parent_fk));
+        assert!(!bp.has_abs_layout(parent_fk));
+
+        let prepared = [Prepared {
+            height: Height(1),
+            header_fk: Fk(1),
+            tx_fks: vec![Fk(2)],
+            jobs: vec![],
+            spends: vec![([0x11u8; 32], 0, Fk(2), parent_fk)],
+            fees: 0,
+            check_scripts: false,
+            time: 1,
+            bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+            hash: [4u8; 32],
+        }];
+
+        let _ = confirm_phase_stats::ENSURE_COLD_N.swap(0, Ordering::Relaxed);
+        let _ = confirm_phase_stats::ENSURE_RES_HIT.swap(0, Ordering::Relaxed);
+        ensure_spend_abs_layouts(&q, &mut bp, &prepared).expect("range-only ensure");
+        let cold = confirm_phase_stats::ENSURE_COLD_N.swap(0, Ordering::Relaxed);
+        assert_eq!(cold, 0, "must not denserels-body cold when pin has denserels");
+        assert!(bp.has_abs_layout(parent_fk));
+        assert_eq!(
+            bp.get_spender_abs(parent_fk, 0),
+            Some(body_off.saturating_add(u64::from(dens[0])))
+        );
+        let _ = body_len;
         let _ = std::fs::remove_dir_all(&path);
     }
 

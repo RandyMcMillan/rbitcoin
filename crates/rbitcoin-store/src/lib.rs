@@ -49,7 +49,7 @@ pub use address_head::{
     load_needs_resize,
     page_index, probe_depth_stats_snapshot, probe_index, sample_probe_depth_stats,
     take_probe_depth_resize_request, AddressHead, HeadLayout, RamAddressHead, HEAD_LOAD_CEILING,
-    HEAD_LOAD_START, HEAD_LOAD_WARN, MAINNET_BITS, MAX_BITS, MAX_PROBE, PAGE_SLOTS,
+    HEAD_LOAD_START, HEAD_LOAD_WARN, MAINNET_BITS, MAX_BITS, MAX_PROBE, MIN_BITS, PAGE_SLOTS,
     PAGE_SLOT_BITS, PROBE_DEPTH_WARN, PROBE_REGION_BYTES, TINY_BITS,
 };
 pub use hashhead::{

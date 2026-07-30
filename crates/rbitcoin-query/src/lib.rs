@@ -743,6 +743,11 @@ impl Query {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// True while store runs a **blocking RAM** `tx.head` resize (confirm should pause).
+    pub fn tx_head_resize_in_progress(&self) -> bool {
+        self.store.txs.head_resize_in_progress()
+    }
+
     /// Last height with SH creates committed (after tip). `None` if empty chain.
     pub(crate) fn sh_indexed_through_height(&self) -> Option<u32> {
         let v = self.sh_indexed_through.load(AtomicOrdering::Acquire);

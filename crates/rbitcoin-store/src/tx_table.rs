@@ -2,7 +2,7 @@ use crate::address_head::{
     bak_head_path, clear_resize_control, is_probe_exhausted_error, load_needs_resize,
     load_ratio, read_resize_control, shadow_head_path, take_probe_depth_resize_request,
     write_head_meta, write_resize_control, AddressHead, HeadLayout, ResizeControl,
-    HEAD_LOAD_WARN, MAX_BITS,
+    MAX_BITS,
 };
 use crate::compact::{
     input_flags, output_flags, read_compact_size, read_uleb128, write_compact_size, write_uleb128,
@@ -930,9 +930,9 @@ fn env_u64(primary: &str, legacy: &str, default: u64, lo: u64, hi: u64) -> u64 {
         .clamp(lo, hi)
 }
 
-/// Class A fks the background fill thread advances per `head_resize_poll`.
-/// `RBITCOIN_TX_HEAD_FILL_WAVE` (default **1 048 576**); legacy
-/// `RBITCOIN_TX_HEAD_RESIZE_WAVE` still accepted.
+/// Class A fks per poll wave (tests for legacy online `head_resize_poll` only).
+/// `RBITCOIN_TX_HEAD_FILL_WAVE` (default **1 048 576**).
+#[cfg(test)]
 fn head_fill_wave() -> u64 {
     env_u64(
         "RBITCOIN_TX_HEAD_FILL_WAVE",
@@ -1093,94 +1093,6 @@ impl TxTable {
             t.resume_head_resize_if_needed()?;
         }
         Ok(t)
-    }
-
-    /// Ensure a dedicated OS thread is continuously filling `tx.head.new`.
-    ///
-    /// Fill must **not** depend on the archive writer sleeping between probe-exhaust
-    /// retries — that made multi‑hour resizes crawl at a few k fks/s of wall time.
-    fn ensure_resize_bg_running(&self) {
-        if !self.head_resize_in_progress() {
-            return;
-        }
-        // Under `cargo test`, drive fill only via `head_resize_poll` (tests already
-        // call it). Concurrent bg + main try_complete races mmap/FD teardown
-        // ("owned file descriptor already closed"). Production IBD keeps the worker.
-        if cfg!(test) {
-            return;
-        }
-        let mut slot = self.resize_bg.lock().unwrap();
-        if let Some(h) = slot.as_ref() {
-            if !h.is_finished() {
-                return;
-            }
-            if let Some(h) = slot.take() {
-                let _ = h.join();
-            }
-        }
-        if !self.head_resize_in_progress() {
-            return;
-        }
-        // fetch_add returns previous; worker watches for this generation.
-        let gen = self
-            .resize_bg_gen
-            .fetch_add(1, AtomicOrdering::AcqRel)
-            + 1;
-
-        // SAFETY: worker exits when gen changes or resize completes; Drop joins
-        // before TxTable is deallocated (Store owns TxTable for process life).
-        let this = self as *const TxTable as usize;
-        let handle = std::thread::Builder::new()
-            .name("rbitcoin-tx-head-resize".into())
-            .spawn(move || {
-                // SAFETY: `this` is a live TxTable for the lifetime of this join.
-                let table = unsafe { &*(this as *const TxTable) };
-                let wave = head_fill_wave();
-                rbitcoin_log::info!(
-                    "store: tx.head resize background fill started (budget={wave}/wave \
-                     read_batch={} write_chunk={})",
-                    Self::head_fill_read_batch(),
-                    Self::head_fill_write_chunk()
-                );
-                loop {
-                    if table.resize_bg_gen.load(AtomicOrdering::Acquire) != gen {
-                        break;
-                    }
-                    if !table.head_resize_in_progress() {
-                        break;
-                    }
-                    match table.head_resize_poll(head_fill_wave()) {
-                        Ok(()) => {}
-                        Err(e) => {
-                            if table.resize_abort.load(AtomicOrdering::Acquire)
-                                || table.resize_bg_gen.load(AtomicOrdering::Acquire) != gen
-                            {
-                                break;
-                            }
-                            rbitcoin_log::error!(
-                                "store: tx.head resize background fill error: {e} — retry in 1s"
-                            );
-                            // Short sleeps so Drop's join is not stuck for a full second
-                            // after abort/gen bump (tests remove datadirs promptly).
-                            for _ in 0..10 {
-                                if table.resize_abort.load(AtomicOrdering::Acquire)
-                                    || table.resize_bg_gen.load(AtomicOrdering::Acquire) != gen
-                                {
-                                    break;
-                                }
-                                std::thread::sleep(Duration::from_millis(100));
-                            }
-                            continue;
-                        }
-                    }
-                    // Continuous: no sleep between successful waves.
-                }
-                rbitcoin_log::info!("store: tx.head resize background fill exited");
-            })
-            .unwrap_or_else(|e| {
-                panic!("store: failed to spawn tx.head resize thread: {e}");
-            });
-        *slot = Some(handle);
     }
 
     /// Create empty `tx.head`, drop resize leftovers.
@@ -2210,23 +2122,35 @@ impl TxTable {
     /// Build a **complete** sized `tx.head` in RAM from every Class A body, then
     /// write it to `out_path` (e.g. `store/tx.head.test`).
     ///
-    /// Does **not** touch the live primary/shadow head or start online resize.
-    /// Timing comparison: pure sequential body-prefix reads + RAM probe insert +
-    /// one sequential file write vs background io_uring shadow fill.
+    /// Does **not** touch the live primary/shadow head. Keys are
+    /// [`StoreSecret::mix_txid`] (same as live insert / online shadow fill).
     ///
-    /// Layout = [`layout_for_count`](crate::address_head::layout_for_count) for
-    /// current body count (same sizing policy as open-time recreate). Progress:
-    /// `on_progress(done, total, occupied)`.
+    /// Layout defaults to [`layout_for_count`](crate::address_head::layout_for_count).
+    /// Pass `layout_override` to force a wider bits (operator early resize).
+    /// Progress: `on_progress(done, total, occupied)`.
     pub fn build_head_file_in_ram(
         &self,
         out_path: impl AsRef<std::path::Path>,
+        on_progress: impl FnMut(u64, u64, u64),
+    ) -> Result<crate::address_head::RamAddressHead, StoreError> {
+        self.build_head_file_in_ram_with_layout(out_path, None, on_progress)
+    }
+
+    /// Like [`Self::build_head_file_in_ram`] with optional forced layout.
+    pub fn build_head_file_in_ram_with_layout(
+        &self,
+        out_path: impl AsRef<std::path::Path>,
+        layout_override: Option<HeadLayout>,
         mut on_progress: impl FnMut(u64, u64, u64),
     ) -> Result<crate::address_head::RamAddressHead, StoreError> {
         use crate::address_head::{layout_for_count, RamAddressHead};
         use std::time::Instant;
 
         let n = self.count();
-        let layout = layout_for_count(n);
+        let layout = match layout_override {
+            Some(l) => l,
+            None => layout_for_count(n),
+        };
         let t0 = Instant::now();
         let mut ram = RamAddressHead::new(layout)?;
         rbitcoin_log::info!(
@@ -2256,7 +2180,8 @@ impl TxTable {
             debug_assert_eq!(txids.len() as u64, end - cur + 1);
             for (i, txid) in txids.into_iter().enumerate() {
                 let id = cur + i as u64;
-                batch.push((txid, Fk(id)));
+                // Same keyed mix as live head_insert_many / online shadow fill.
+                batch.push((self.secret.mix_txid(&txid), Fk(id)));
                 if batch.len() >= write_chunk {
                     ram.insert_many(&batch)?;
                     batch.clear();
@@ -2315,13 +2240,12 @@ impl TxTable {
     /// Bulk-insert head entries (archive / tip / rebuild).
     ///
     /// Sole writer: plain store empty→fk, call order, SeqCst fence after batch.
-    /// **No body_txid** on insert. May start sequential online resize (background
-    /// thread fills the shadow continuously).
+    /// **No body_txid** on insert.
     ///
-    /// On open-address **probe exhaust**, the archive/tip writer **sleeps** until
-    /// the background resize finishes (shadow filled + primary swapped), then
-    /// retries the batch. No wall-clock deadline — mainnet 29→30 rehashes can
-    /// take longer than a fixed timeout and must not kill the archive pipeline.
+    /// When load hits [`crate::address_head::HEAD_LOAD_START`] (or probe exhaust),
+    /// runs a **blocking RAM rebuild** (pause-friendly): full Class A → new head
+    /// in process RAM → swap. Online io_uring shadow fill is no longer used for
+    /// production resizes.
     pub fn head_insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if !entries.is_empty() {
             self.head_insert_many_with_resize_retry(entries)?;
@@ -2333,7 +2257,6 @@ impl TxTable {
         }
         // After live inserts into primary only — never dual-write to shadow.
         self.maybe_start_head_resize()?;
-        self.ensure_resize_bg_running();
         Ok(())
     }
 
@@ -2356,61 +2279,13 @@ impl TxTable {
         match insert_result {
             Ok(()) => Ok(()),
             Err(e) if is_probe_exhausted_error(&e) => {
-                // Kick resize in the background but do not block the pipeline:
-                // park depth-exhausted keys in overflow (overflow-first lookup).
-                let _ = self.ensure_head_resize_for_probe_exhaust();
-                self.ensure_resize_bg_running();
-                self.head_insert_mixed_with_overflow(&mixed)
+                // Blocking RAM widen, then retry the whole batch on the new primary.
+                self.ensure_head_resize_for_probe_exhaust()?;
+                let head = self.head.read().unwrap();
+                head.insert_many(&mixed)
             }
             Err(e) => Err(e),
         }
-    }
-
-    /// Per-entry primary insert; overflow on probe exhaust.
-    fn head_insert_mixed_with_overflow(
-        &self,
-        mixed: &[([u8; 32], Fk)],
-    ) -> Result<(), StoreError> {
-        let mut overflow_n = 0u32;
-        for &(key, fk) in mixed {
-            let one = [(key, fk)];
-            let r = {
-                let head = self.head.read().unwrap();
-                head.insert_many(&one)
-            };
-            match r {
-                Ok(()) => {}
-                Err(e) if is_probe_exhausted_error(&e) => {
-                    let mut ov = self.overflow.lock().unwrap();
-                    match ov.insert(&key, fk) {
-                        Ok(_) => {
-                            overflow_n = overflow_n.saturating_add(1);
-                        }
-                        Err(e2) => {
-                            // Overflow full: wait for primary resize, then retry primary.
-                            drop(ov);
-                            self.ensure_head_resize_for_probe_exhaust()?;
-                            self.ensure_resize_bg_running();
-                            if self.head_resize_in_progress() {
-                                self.wait_for_head_resize_idle();
-                                let head = self.head.read().unwrap();
-                                head.insert_many(&[(key, fk)])?;
-                            } else {
-                                return Err(e2);
-                            }
-                        }
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        if overflow_n > 0 {
-            self.overflow.lock().unwrap().persist()?;
-            rbitcoin_log::debug!(
-                "store: tx.head overflow accepted {overflow_n} depth-exhausted insert(s)"
-            );
-        }
-        Ok(())
     }
 
     /// Drop overflow after a successful primary head swap.
@@ -2549,9 +2424,10 @@ impl TxTable {
         }
     }
 
-    /// Start a BITS+1 rebuild if none is running (probe-exhaust path).
+    /// Start a BITS+1 **RAM** rebuild if none is running (probe-exhaust path).
     fn ensure_head_resize_for_probe_exhaust(&self) -> Result<(), StoreError> {
         if self.head_resize_in_progress() {
+            self.wait_for_head_resize_idle();
             return Ok(());
         }
         let bits = self.head.read().unwrap().bits();
@@ -2560,14 +2436,12 @@ impl TxTable {
         }
         let target = HeadLayout::new(bits + 1)?;
         rbitcoin_log::info!(
-            "store: tx.head probe exhausted — forcing resize start {}→{} bits (n={})",
+            "store: tx.head probe exhausted — RAM resize {}→{} bits (n={})",
             bits,
             target.bits,
             self.count()
         );
-        self.start_head_resize(target)?;
-        self.ensure_resize_bg_running();
-        Ok(())
+        self.perform_ram_head_resize(target)
     }
 
     /// Same as [`Self::head_insert_many`] (sole-writer path is the only path).
@@ -2582,115 +2456,43 @@ impl TxTable {
             || self.resize.lock().unwrap().is_some()
     }
 
-    /// Resume incomplete resize from `tx.head.resize` control file (on open).
+    /// On open: abandon incomplete **online** shadow resize (legacy). Production
+    /// resizes are synchronous RAM rebuilds; partial `.new` is not resumed.
+    /// If load still needs a widen, run RAM resize immediately.
     fn resume_head_resize_if_needed(&self) -> Result<(), StoreError> {
-        let Some(ctrl) = read_resize_control(&self.head_path)? else {
-            // Orphan .new without control → drop it.
-            let shadow = shadow_head_path(&self.head_path);
-            if shadow.exists() {
-                let _ = std::fs::remove_file(&shadow);
-                crate::address_head::remove_legacy_meta_sidecar(&shadow);
-            }
-            return Ok(());
-        };
-        let shadow_path = shadow_head_path(&self.head_path);
-        if !shadow_path.exists() {
-            // Control without shadow: restart shadow create.
-            let shadow = Arc::new(AddressHead::create_with_layout(
-                &shadow_path,
-                ctrl.target,
-            )?);
-            *self.resize.lock().unwrap() = Some(HeadResize {
-                shadow,
-                cursor: ctrl.cursor.max(1),
-                target: ctrl.target,
-            });
-            self.resize_abort.store(false, AtomicOrdering::Release);
-            self.resize_active.store(true, AtomicOrdering::Release);
+        let had_online = read_resize_control(&self.head_path)?.is_some()
+            || shadow_head_path(&self.head_path).exists();
+        if had_online {
             rbitcoin_log::info!(
-                "store: resume tx.head resize bits={} entry={}B cursor={}",
-                ctrl.target.bits,
-                ctrl.target.entry_bytes,
-                ctrl.cursor
+                "store: abandoning incomplete online tx.head resize leftovers on open \
+                 (RAM resize policy)"
             );
-            self.ensure_resize_bg_running();
-            return Ok(());
+            self.abandon_online_resize_leftovers()?;
         }
-        let shadow = Arc::new(AddressHead::open(&shadow_path)?);
-        if shadow.layout() != ctrl.target {
-            return Err(StoreError::Corrupt(
-                "tx.head.resize layout mismatch vs shadow",
-            ));
+        // If primary is still past load threshold, widen now (blocks open ~minutes).
+        let (bits, slots, n) = {
+            let h = self.head.read().unwrap();
+            (h.bits(), h.slots(), self.count())
+        };
+        if bits < MAX_BITS && load_needs_resize(n, slots) {
+            let target = HeadLayout::new(bits + 1)?;
+            rbitcoin_log::info!(
+                "store: open-time RAM resize {}→{} bits (n={n} load={:.3})",
+                bits,
+                target.bits,
+                load_ratio(n, slots)
+            );
+            self.perform_ram_head_resize(target)?;
         }
-        *self.resize.lock().unwrap() = Some(HeadResize {
-            shadow,
-            cursor: ctrl.cursor.max(1),
-            target: ctrl.target,
-        });
-        self.resize_abort.store(false, AtomicOrdering::Release);
-        self.resize_active.store(true, AtomicOrdering::Release);
-        rbitcoin_log::info!(
-            "store: resume tx.head resize bits={} entry={}B cursor={}",
-            ctrl.target.bits,
-            ctrl.target.entry_bytes,
-            ctrl.cursor
-        );
-        self.ensure_resize_bg_running();
         Ok(())
     }
 
-    /// Start BITS+1 sequential rebuild when load ≥ [`crate::address_head::HEAD_LOAD_START`].
+    /// When load ≥ [`crate::address_head::HEAD_LOAD_START`], run a **blocking RAM**
+    /// rebuild (bits+1). Confirm / other threads see [`Self::head_resize_in_progress`]
+    /// for the whole fill+swap (pause-friendly).
     pub fn maybe_start_head_resize(&self) -> Result<(), StoreError> {
-        {
-            let rg = self.resize.lock().unwrap();
-            if let Some(r) = rg.as_ref() {
-                // Warn if primary load is high while resizing — skip the first
-                // moments (cursor still near 0) so open/start is not a false lag.
-                let cursor = r.cursor;
-                let target_bits = r.target.bits;
-                if cursor > 1 {
-                    let (slots, n) = {
-                        let h = self.head.read().unwrap();
-                        (h.slots(), self.count())
-                    };
-                    let ratio = load_ratio(n, slots);
-                    if ratio >= HEAD_LOAD_WARN {
-                        // Rate-limit: maybe_start is called on every head batch.
-                        static LAST_LAG_LOG_MS: std::sync::atomic::AtomicU64 =
-                            std::sync::atomic::AtomicU64::new(0);
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        let prev = LAST_LAG_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
-                        if now_ms.saturating_sub(prev) >= 60_000
-                            && LAST_LAG_LOG_MS
-                                .compare_exchange(
-                                    prev,
-                                    now_ms,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                )
-                                .is_ok()
-                        {
-                            let pct = if n > 0 {
-                                100.0 * (cursor.saturating_sub(1) as f64) / (n as f64)
-                            } else {
-                                100.0
-                            };
-                            let (deep, exh) = crate::address_head::probe_depth_stats_snapshot();
-                            rbitcoin_log::warn!(
-                                "store: tx.head resize lagging load={ratio:.3} n={n} slots={slots} \
-                                 shadow_cursor={}/{} ({pct:.1}%) target_bits={target_bits} \
-                                 deep_warn={deep} exhaust={exh}",
-                                cursor.saturating_sub(1),
-                                n
-                            );
-                        }
-                    }
-                }
-                return Ok(());
-            }
+        if self.head_resize_in_progress() {
+            return Ok(());
         }
         let (bits, slots, n) = {
             let h = self.head.read().unwrap();
@@ -2702,57 +2504,192 @@ impl TxTable {
         if !load_needs_resize(n, slots) {
             return Ok(());
         }
-        let new_bits = bits + 1;
-        let target = HeadLayout::new(new_bits)?;
-        self.start_head_resize(target)
+        let target = HeadLayout::new(bits + 1)?;
+        rbitcoin_log::info!(
+            "store: tx.head load={:.3} ≥ threshold — RAM resize {}→{} bits (n={n} slots={slots})",
+            load_ratio(n, slots),
+            bits,
+            target.bits
+        );
+        self.perform_ram_head_resize(target)
     }
 
-    /// Force start of sequential rebuild to `target` (tests / operator).
+    /// Force a **blocking RAM** rebuild to `target` (tests / operator / load trigger).
+    ///
+    /// Online shadow fill is **not** started. Any incomplete online resize is abandoned.
     pub fn start_head_resize(&self, target: HeadLayout) -> Result<(), StoreError> {
-        let mut rg = self.resize.lock().unwrap();
-        if rg.is_some() {
-            return Ok(());
+        self.perform_ram_head_resize(target)
+    }
+
+    /// Blocking: build a complete wider head in RAM and atomically swap as primary.
+    ///
+    /// Sets [`Self::head_resize_in_progress`] for the whole operation so IBD confirm
+    /// can pause (poll) and archive writers can wait on probe-exhaust.
+    pub fn perform_ram_head_resize(&self, target: HeadLayout) -> Result<(), StoreError> {
+        // Single-flight: if another thread is already resizing, wait it out.
+        if self.head_resize_in_progress() {
+            self.wait_for_head_resize_idle();
+            // After wait, re-check whether we still need to widen.
+            let bits = self.head.read().unwrap().bits();
+            if target.bits <= bits {
+                return Ok(());
+            }
+            // Fall through only if still too narrow (rare race).
         }
         let cur_bits = self.head.read().unwrap().bits();
-        if target.bits <= cur_bits && target.entry_bytes <= self.head.read().unwrap().entry_bytes()
+        if target.bits < cur_bits {
+            return Err(StoreError::Corrupt("tx.head resize must not shrink bits"));
+        }
+        if target.bits == cur_bits {
+            return Ok(());
+        }
+        if target.bits > MAX_BITS {
+            return Err(StoreError::Corrupt("tx.head resize bits above MAX_BITS"));
+        }
+
+        // Claim the resize slot (abort any legacy online fill leftovers first).
+        self.abandon_online_resize_leftovers()?;
+        if self
+            .resize_active
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_err()
         {
-            // Only widen.
-            if target.bits < cur_bits {
-                return Err(StoreError::Corrupt("tx.head resize must widen bits"));
+            self.wait_for_head_resize_idle();
+            return Ok(());
+        }
+        struct ActiveGuard<'a>(&'a AtomicBool, &'a Condvar, &'a Mutex<Option<HeadResize>>);
+        impl Drop for ActiveGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, AtomicOrdering::Release);
+                let _g = self.2.lock().unwrap();
+                self.1.notify_all();
             }
         }
-        let shadow_path = shadow_head_path(&self.head_path);
-        let _ = std::fs::remove_file(&shadow_path);
-        crate::address_head::remove_legacy_meta_sidecar(&shadow_path);
-        let shadow = Arc::new(AddressHead::create_with_layout(&shadow_path, target)?);
-        let gen = self.head.read().unwrap().generation();
-        let ctrl = ResizeControl {
-            target,
-            cursor: 1,
-            generation: gen,
-        };
-        write_resize_control(&self.head_path, &ctrl)?;
-        let slots_old = self.head.read().unwrap().slots();
+        let _active = ActiveGuard(&self.resize_active, &self.resize_cv, &self.resize);
+
         let n = self.count();
+        let slots_old = self.head.read().unwrap().slots();
         let load = load_ratio(n, slots_old);
         rbitcoin_log::info!(
-            "store: tx.head resize start {}→{} bits entry={}B n={n} slots_old={slots_old} \
-             load={load:.3} slots_new={} (threshold={})",
+            "store: tx.head RAM resize begin {}→{} bits entry={}B n={n} \
+             slots_old={slots_old} load={load:.3} slots_new={} (confirm should pause)",
             cur_bits,
             target.bits,
             target.entry_bytes,
-            target.slots(),
-            crate::address_head::HEAD_LOAD_START
+            target.slots()
         );
-        *rg = Some(HeadResize {
-            shadow,
-            cursor: 1,
-            target,
-        });
+
+        // Write side file, then swap under exclusive head lock (same renames as
+        // online complete, but source is a full RAM build, not a partial shadow).
+        let ram_path = {
+            let mut p = self.head_path.as_os_str().to_os_string();
+            p.push(".ramnew");
+            PathBuf::from(p)
+        };
+        let _ = std::fs::remove_file(&ram_path);
+        let t0 = Instant::now();
+        let mut last_log = Instant::now();
+        self.build_head_file_in_ram_with_layout(&ram_path, Some(target), |done, total, occ| {
+            if last_log.elapsed() >= Duration::from_secs(30) || done == total {
+                let pct = if total > 0 {
+                    (100 * done) / total
+                } else {
+                    100
+                };
+                rbitcoin_log::info!(
+                    "store: tx.head RAM resize progress {done}/{total} ({pct}%) occupied={occ} \
+                     elapsed={:?}",
+                    t0.elapsed()
+                );
+                last_log = Instant::now();
+            }
+        })?;
+
+        // Exclusive swap: primary → .bak, ramnew → primary.
+        rbitcoin_log::info!(
+            "store: tx.head RAM resize fill done in {:?} — exclusive swap",
+            t0.elapsed()
+        );
+        let t_lock = Instant::now();
+        let mut head_w = loop {
+            if self.resize_abort.load(AtomicOrdering::Acquire) {
+                let _ = std::fs::remove_file(&ram_path);
+                return Err(StoreError::Corrupt("tx.head RAM resize aborted"));
+            }
+            match self.head.try_write() {
+                Ok(g) => break g,
+                Err(_) => {
+                    if t_lock.elapsed() > Duration::from_secs(1)
+                        && t_lock.elapsed().as_millis() % 5000 < 50
+                    {
+                        rbitcoin_log::warn!(
+                            "store: tx.head RAM resize waiting for exclusive head lock ({:?})",
+                            t_lock.elapsed()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        let primary_writes = head_w.lock_writes();
+        let new_gen = head_w.generation().saturating_add(1);
+        let bak = bak_head_path(&self.head_path);
+        let _ = std::fs::remove_file(&bak);
+        drop(primary_writes);
+
+        std::fs::rename(&self.head_path, &bak).map_err(|e| StoreError::io(&self.head_path, e))?;
+        if let Err(e) = std::fs::rename(&ram_path, &self.head_path) {
+            // Best-effort restore primary.
+            let _ = std::fs::rename(&bak, &self.head_path);
+            return Err(StoreError::io(&ram_path, e));
+        }
+        write_head_meta(&self.head_path, target, new_gen)?;
+        clear_resize_control(&self.head_path);
+        *head_w = AddressHead::open(&self.head_path)?;
+        let _ = std::fs::remove_file(&bak);
+        crate::address_head::remove_legacy_meta_sidecar(&bak);
+        // Drop any leftover online shadow path.
+        let shadow = shadow_head_path(&self.head_path);
+        let _ = std::fs::remove_file(&shadow);
+        crate::address_head::remove_legacy_meta_sidecar(&shadow);
+        let cleared = self.clear_overflow_after_head_swap()?;
+        if cleared > 0 {
+            rbitcoin_log::info!(
+                "store: tx.head.overflow cleared {cleared} entries after RAM resize"
+            );
+        }
+        rbitcoin_log::info!(
+            "store: tx.head RAM resize complete {}→{} bits entry={}B slots={} gen={} total={:?}",
+            cur_bits,
+            target.bits,
+            target.entry_bytes,
+            head_w.slots(),
+            new_gen,
+            t0.elapsed()
+        );
+        // ActiveGuard drop clears resize_active + notifies waiters.
+        Ok(())
+    }
+
+    /// Stop bg online fill and drop incomplete shadow/control (switch to RAM policy).
+    fn abandon_online_resize_leftovers(&self) -> Result<(), StoreError> {
+        self.resize_abort.store(true, AtomicOrdering::Release);
+        self.resize_bg_gen.fetch_add(1, AtomicOrdering::AcqRel);
+        if let Some(h) = self.resize_bg.lock().unwrap().take() {
+            let _ = h.join();
+        }
+        *self.resize.lock().unwrap() = None;
+        clear_resize_control(&self.head_path);
+        let shadow = shadow_head_path(&self.head_path);
+        if shadow.exists() {
+            let _ = std::fs::remove_file(&shadow);
+            crate::address_head::remove_legacy_meta_sidecar(&shadow);
+            rbitcoin_log::info!(
+                "store: abandoned incomplete online tx.head shadow {}",
+                shadow.display()
+            );
+        }
         self.resize_abort.store(false, AtomicOrdering::Release);
-        self.resize_active.store(true, AtomicOrdering::Release);
-        drop(rg);
-        self.ensure_resize_bg_running();
         Ok(())
     }
 
@@ -3695,8 +3632,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Sequential online resize: shadow filled from dense fk order; primary-only
-    /// inserts during fill; post-swap all txids resolve.
+    /// Blocking RAM resize: full Class A → wider head; post-swap all txids resolve.
     #[test]
     fn head_sequential_resize_widens_bits() {
         with_resize_stress_lock(|| {
@@ -3745,41 +3681,23 @@ mod tests {
         assert_eq!(t.count(), 50);
         assert!(!t.head_resize_in_progress());
 
-        // Force widen 10 → 11.
+        // Force widen 10 → 11 (blocking RAM rebuild completes before return).
         t.start_head_resize(crate::address_head::HeadLayout::new(11).unwrap())
             .unwrap();
-        assert!(t.head_resize_in_progress());
+        assert!(!t.head_resize_in_progress());
+        assert_eq!(t.head_bits(), 11);
 
-        // Concurrent primary inserts while resizing (no dual-write to shadow).
-        // Run inserts on a worker so they overlap fill IO, then join before
-        // waiting for swap — mirrors archive+resize without leaving puts in
-        // flight across the exclusive rename barrier.
-        let t_ins = {
-            // TxTable is not Clone; share via raw pointer is wrong — just insert
-            // on this thread after a short poll so the bg worker is started.
-            t.head_resize_poll(head_fill_wave()).expect("kick fill");
-            t
-        };
+        // More creates after swap land on the new primary.
         for i in 51..=80u64 {
-            let _ = t_ins.put_full_batch_indexed(&[mk(i)], true).unwrap();
+            let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
         }
-        // Drive fill (bg + poll); hard deadline — no open-ended sleep loop.
-        wait_head_resize_done(&t_ins, Duration::from_secs(10));
-        assert_eq!(t_ins.head_bits(), 11);
-        assert_eq!(t_ins.count(), 80);
-        // After swap, every seeded txid must resolve. Retry once: final catch-up
-        // may still be publishing under extreme host load (mmap rename).
+        assert_eq!(t.count(), 80);
         for i in 1..=80u64 {
             let mut txid = [0u8; 32];
             txid[0..8].copy_from_slice(&i.to_le_bytes());
-            let mut fk = t_ins.get_fk_by_txid(&txid).unwrap();
-            if fk.is_none() {
-                std::thread::sleep(Duration::from_millis(5));
-                fk = t_ins.get_fk_by_txid(&txid).unwrap();
-            }
+            let fk = t.get_fk_by_txid(&txid).unwrap();
             assert_eq!(fk, Some(Fk(i)), "txid {i} missing after resize");
         }
-        drop(t_ins);
         let _ = std::fs::remove_dir_all(&dir);
         });
     }
@@ -3824,41 +3742,16 @@ mod tests {
             let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
             (rec, inputs, outputs)
         };
-        // Seed a small set, start a controlled widen, park a waiter, then complete
-        // via poll (tests do not spawn the production bg filler — see
-        // `ensure_resize_bg_running`).
+        // Seed, then blocking RAM widen. wait_for_head_resize_idle is a no-op when idle.
         for i in 1..=50u64 {
             let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
         }
-        wait_head_resize_done(&t, Duration::from_secs(15));
-
         let next_bits = t.head_bits().saturating_add(1);
         t.start_head_resize(crate::address_head::HeadLayout::new(next_bits).unwrap())
             .unwrap();
-        assert!(t.head_resize_in_progress());
-
-        let this = &t as *const TxTable as usize;
-        let waiter = std::thread::Builder::new()
-            .name("test-tx-head-sleep".into())
-            .spawn(move || {
-                // SAFETY: `t` lives until join below.
-                let table = unsafe { &*(this as *const TxTable) };
-                table.wait_for_head_resize_idle();
-            })
-            .unwrap();
-
-        // Park window: waiter blocked until we finish fill+swap and notify.
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(
-            !waiter.is_finished(),
-            "waiter must still be sleeping while resize is in progress"
-        );
-
-        wait_head_resize_done(&t, Duration::from_secs(15));
         assert!(!t.head_resize_in_progress());
-
-        waiter.join().expect("archiver sleep thread panicked");
-        // If notify_head_resize_idle were missing, join would hang.
+        assert_eq!(t.head_bits(), next_bits);
+        t.wait_for_head_resize_idle(); // must return immediately when idle
         drop(t);
         let _ = std::fs::remove_dir_all(&dir);
         });
@@ -4149,80 +4042,37 @@ mod tests {
             let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
         }
 
+        // Concurrent head.read holder: RAM resize waits for exclusive write, then
+        // completes once the reader drops.
         use std::sync::atomic::AtomicBool;
         let held = AtomicBool::new(false);
         let release = AtomicBool::new(false);
         std::thread::scope(|s| {
-            // Hold head.read **before** resize starts so bg/poll cannot slip a
-            // swap through before the exclusive-lock wait is contended.
             s.spawn(|| {
                 let _guard = t.head.read().unwrap();
                 held.store(true, AtomicOrdering::Release);
-                while !release.load(AtomicOrdering::Acquire) {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                // Hold briefly so resize hits try_write contention, then release.
+                std::thread::sleep(Duration::from_millis(80));
+                release.store(true, AtomicOrdering::Release);
                 drop(_guard);
             });
-            let wait_held = Instant::now();
             while !held.load(AtomicOrdering::Acquire) {
-                assert!(
-                    wait_held.elapsed() < Duration::from_secs(2),
-                    "reader never acquired head.read"
-                );
                 std::thread::sleep(Duration::from_millis(1));
             }
-
+            let t0 = Instant::now();
             t.start_head_resize(crate::address_head::HeadLayout::new(11).unwrap())
                 .unwrap();
-
-            // Poll on a side thread: shadow fill completes, then blocks in try_write.
-            let poller = s.spawn(|| t.head_resize_poll(head_fill_wave()));
-            // Wait until fill is done and swap is blocked on exclusive lock
-            // (in_progress still true under held head.read).
-            let wait = Instant::now();
-            while wait.elapsed() < Duration::from_secs(2) {
-                if t.head_resize_in_progress() {
-                    // Give bg/poller a slice to enter try_write after fill.
-                    std::thread::sleep(Duration::from_millis(20));
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            assert!(
-                t.head_resize_in_progress(),
-                "resize should still be blocked on exclusive head lock"
-            );
-
-            // Same signal Drop uses before join — sticky abort + gen so waiters
-            // exit even if they enter try_write *after* this line.
-            t.resize_abort.store(true, AtomicOrdering::Release);
-            t.resize_bg_gen
-                .fetch_add(1, AtomicOrdering::AcqRel);
-
-            let t0 = Instant::now();
-            let _ = poller.join();
-            // Also join bg fill so it cannot complete a swap after we release head.read.
-            if let Some(h) = t.resize_bg.lock().unwrap().take() {
-                let _ = h.join();
-            }
             assert!(
                 t0.elapsed() < Duration::from_secs(5),
-                "head_resize_poll/bg stuck in exclusive lock wait for {:?}",
+                "RAM resize hung on exclusive lock for {:?}",
                 t0.elapsed()
             );
-
-            release.store(true, AtomicOrdering::Release);
+            assert!(!t.head_resize_in_progress());
+            assert_eq!(t.head_bits(), 11);
+            assert!(release.load(AtomicOrdering::Acquire));
         });
 
-        // Drop joins any leftover bg worker; must also finish promptly.
-        let t0 = Instant::now();
         drop(t);
-        assert!(
-            t0.elapsed() < Duration::from_secs(5),
-            "TxTable Drop hung for {:?}",
-            t0.elapsed()
-        );
-
         let _ = std::fs::remove_dir_all(&dir);
         });
     }
@@ -4683,7 +4533,7 @@ mod tests {
         });
     }
 
-    /// Resume incomplete resize: control+shadow, control-only, orphan .new.
+    /// On open: incomplete online resize leftovers are abandoned (RAM policy).
     #[test]
     fn resume_head_resize_control_and_orphan_shadow() {
         with_env_lock(|| {
@@ -4735,7 +4585,7 @@ mod tests {
                 drop(t);
             }
 
-            // Control without shadow → recreate shadow and mark active.
+            // Control without shadow → abandoned (no online resume).
             {
                 let target = HeadLayout::new(12).unwrap();
                 write_resize_control(
@@ -4748,18 +4598,12 @@ mod tests {
                 )
                 .unwrap();
                 let t = TxTable::open(&dir).unwrap();
-                assert!(t.head_resize_in_progress());
-                let snap = t.head_resize_size_snapshot();
-                assert!(snap.active);
-                assert!(snap.cursor >= 1);
-                // Drive a little fill via poll (bg disabled under test).
-                t.head_resize_poll(4).unwrap();
-                wait_head_resize_done(&t, Duration::from_secs(30));
                 assert!(!t.head_resize_in_progress());
+                assert!(!read_resize_control(&head_path).unwrap().is_some());
                 drop(t);
             }
 
-            // Control + existing matching shadow.
+            // Control + existing matching shadow → both dropped on open.
             {
                 let target = HeadLayout::new(13).unwrap();
                 let shadow = shadow_head_path(&head_path);
@@ -4774,12 +4618,12 @@ mod tests {
                     },
                 )
                 .unwrap();
+                assert!(shadow.exists());
                 let t = TxTable::open(&dir).unwrap();
-                assert!(t.head_resize_in_progress());
-                // Layout mismatch: rewrite shadow with wrong bits then open fails.
+                assert!(!t.head_resize_in_progress());
+                assert!(!shadow.exists());
+                assert!(!read_resize_control(&head_path).unwrap().is_some());
                 drop(t);
-                clear_resize_control(&head_path);
-                let _ = std::fs::remove_file(&shadow);
             }
 
             // Unreadable head with bodies → recreate + rebuild.
@@ -4805,19 +4649,17 @@ mod tests {
                 assert!(!snap.active);
                 assert_eq!(snap.shadow_bits, 0);
                 t.head_insert_many_sole(&[]).unwrap();
-                // Force start bits+1
+                // Force start bits+1 (blocking RAM — complete before return)
                 let bits = t.head_bits();
                 if bits < MAX_BITS {
                     t.start_head_resize(HeadLayout::new(bits + 1).unwrap())
                         .unwrap();
-                    assert!(t.head_resize_in_progress());
-                    // Second start is no-op
+                    assert!(!t.head_resize_in_progress());
+                    assert_eq!(t.head_bits(), bits + 1);
+                    // Second start (same width) is no-op
                     t.start_head_resize(HeadLayout::new(bits + 1).unwrap())
                         .unwrap();
-                    // ensure via probe exhaust path is private; maybe_start while active
                     t.maybe_start_head_resize().unwrap();
-                    t.head_resize_poll(8).unwrap();
-                    wait_head_resize_done(&t, Duration::from_secs(30));
                 }
                 drop(t);
             }

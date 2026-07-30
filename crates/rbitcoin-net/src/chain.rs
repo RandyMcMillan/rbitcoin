@@ -261,10 +261,27 @@ impl ChainHub {
     }
 
     /// Prep with optional pipeline caches (reserved create fks + in-flight creates).
+    ///
+    /// Cold denserels **allowed** (tests / tip). IBD prep after denserels stage
+    /// uses [`Self::confirm_wire_prep_phase_pipelined_cold`] with `Forbid`.
     pub fn confirm_wire_prep_phase_pipelined(
         &self,
         blocks: &[(Height, Block)],
         pipeline: Option<&WirePrepPipeline>,
+    ) -> Result<Option<rbitcoin_consensus::ConfirmLoadOutcome>, NetError> {
+        self.confirm_wire_prep_phase_pipelined_cold(
+            blocks,
+            pipeline,
+            rbitcoin_consensus::ColdPinMode::Allow,
+        )
+    }
+
+    /// Prep with explicit cold denserels policy (IBD: `Forbid` after denserels stage).
+    pub fn confirm_wire_prep_phase_pipelined_cold(
+        &self,
+        blocks: &[(Height, Block)],
+        pipeline: Option<&WirePrepPipeline>,
+        cold_mode: rbitcoin_consensus::ColdPinMode,
     ) -> Result<Option<rbitcoin_consensus::ConfirmLoadOutcome>, NetError> {
         if blocks.is_empty() {
             return Ok(None);
@@ -300,6 +317,7 @@ impl ChainHub {
             &contig,
             &ScriptPreverified::new(),
             pipeline,
+            cold_mode,
         )
         .map_err(|e| NetError::Consensus(e.to_string()))?;
         Ok(Some(ok))

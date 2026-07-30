@@ -281,10 +281,20 @@ pub fn confirm_wire_prep_phase(
     blocks: &[(Height, Block)],
     preverified: &ScriptPreverified,
 ) -> Result<ConfirmLoadOutcome, ConsensusError> {
-    confirm_wire_prep_phase_pipelined(query, params, milestone, blocks, preverified, None)
+    confirm_wire_prep_phase_pipelined(
+        query,
+        params,
+        milestone,
+        blocks,
+        preverified,
+        None,
+        ColdPinMode::Allow,
+    )
 }
 
 /// Like [`confirm_wire_prep_phase`] with optional pipeline caches for prep-ahead.
+///
+/// `cold_mode`: IBD prep after denserels stage uses [`ColdPinMode::Forbid`].
 pub fn confirm_wire_prep_phase_pipelined(
     query: &Query,
     params: &ChainParams,
@@ -292,6 +302,7 @@ pub fn confirm_wire_prep_phase_pipelined(
     blocks: &[(Height, Block)],
     preverified: &ScriptPreverified,
     pipeline: Option<&WirePrepPipeline>,
+    cold_mode: ColdPinMode,
 ) -> Result<ConfirmLoadOutcome, ConsensusError> {
     if blocks.is_empty() {
         return Err(ConsensusError::BadBlock("empty confirm batch"));
@@ -499,8 +510,14 @@ pub fn confirm_wire_prep_phase_pipelined(
     let ns_filter_plan = t_fp.elapsed().as_nanos() as u64;
 
     let inflight_outs = pipeline.map(|p| p.in_flight_outs.as_ref());
-    let (batch_parents, batch_thin) =
-        pin_for_wire_batch(query, plan.as_ref(), &metas, &wire_blocks, inflight_outs)?;
+    let (batch_parents, batch_thin) = pin_for_wire_batch(
+        query,
+        plan.as_ref(),
+        &metas,
+        &wire_blocks,
+        inflight_outs,
+        cold_mode,
+    )?;
 
     confirm_phase_stats::LOAD_NS.fetch_add(
         t_load.elapsed().as_nanos() as u64,
@@ -584,10 +601,156 @@ fn offline_dense_rels(
         .unwrap_or_default()
 }
 
+/// Whether wire pin may cold-load denserels from Class A body.
+///
+/// IBD denserels stage warms CreateResidency first; prep then uses [`ColdPinMode::Forbid`]
+/// so cold denserels is never duplicated on the prep thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColdPinMode {
+    /// Residency miss → `load_creates_once(OutsDenserels)` (tests / tip / hash-only).
+    Allow,
+    /// Residency miss → hard `invariant: denserels stage miss` (IBD prep after denserels stage).
+    Forbid,
+}
+
+/// Stats from [`warm_parent_denserels_for_wire`] (denserels pipeline stage).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DenserelsWarmStats {
+    /// Unique external parent creates considered.
+    pub parents: u32,
+    /// Already had denserels in CreateResidency (skip IO).
+    pub already: u32,
+    /// Cold denserels body loads.
+    pub cold: u32,
+    /// Unresolved prev_txid (no residency/head fk) — plan may stamp later.
+    pub unresolved: u32,
+    pub work_ns: u64,
+}
+
+/// **Denserels stage:** resolve spent parent create fks from wire prev_txid and
+/// load denserels into CreateResidency once (OutsDenserels).
+///
+/// Does not plan Class A or assemble. Prep must follow with
+/// [`ColdPinMode::Forbid`] so this is the sole cold denserels path for wire IBD.
+pub fn warm_parent_denserels_for_wire(
+    query: &Query,
+    blocks: &[(Height, Block)],
+) -> Result<DenserelsWarmStats, ConsensusError> {
+    use rbitcoin_query::confirm_load_stats;
+    use rbitcoin_store::IdxBodyMode;
+    use std::sync::atomic::Ordering;
+
+    let t0 = Instant::now();
+    let mut st = DenserelsWarmStats::default();
+    if blocks.is_empty() {
+        return Ok(st);
+    }
+
+    // create_fk id → need vouts
+    let mut parent_vouts: HashMap<u64, Vec<u32>> = HashMap::new();
+    for (_h, block) in blocks {
+        for tx in &block.txdata {
+            for inp in &tx.input {
+                if inp.previous_output.is_null() {
+                    continue;
+                }
+                let prev_txid = inp.previous_output.txid.to_byte_array();
+                let vout = inp.previous_output.vout;
+                let cfk = query
+                    .create_residency()
+                    .lookup_fk_by_txid(&prev_txid)
+                    .or_else(|| {
+                        query
+                            .store()
+                            .get_fk_by_txid(&prev_txid)
+                            .ok()
+                            .flatten()
+                    });
+                if let Some(fk) = cfk {
+                    if let Some(pid) = fk.get() {
+                        parent_vouts.entry(pid).or_default().push(vout);
+                        continue;
+                    }
+                }
+                st.unresolved = st.unresolved.saturating_add(1);
+            }
+        }
+    }
+    for vouts in parent_vouts.values_mut() {
+        vouts.sort_unstable();
+        vouts.dedup();
+    }
+    st.parents = parent_vouts.len() as u32;
+
+    let mut cold_fks: Vec<rbitcoin_primitives::Fk> = Vec::new();
+    for (id, need) in &parent_vouts {
+        let fk = rbitcoin_primitives::Fk(*id);
+        if query
+            .create_residency()
+            .get_parent_needed(fk, need)
+            .is_some()
+        {
+            st.already = st.already.saturating_add(1);
+        } else {
+            cold_fks.push(fk);
+        }
+    }
+    // Stable IO order: ascending create fk ≈ body order when Class A is append-only.
+    cold_fks.sort_unstable_by_key(|f| f.0);
+    cold_fks.dedup();
+    st.cold = cold_fks.len() as u32;
+
+    if !cold_fks.is_empty() {
+        let t_io = Instant::now();
+        let loaded = rbitcoin_query::load_creates_once(
+            query.store(),
+            query.create_residency(),
+            &cold_fks,
+            IdxBodyMode::OutsDenserels,
+        )
+        .map_err(ConsensusError::Store)?;
+        let io_ns = t_io.elapsed().as_nanos() as u64;
+        if io_ns > 0 {
+            confirm_load_stats::COLD_IO_NS.fetch_add(io_ns, Ordering::Relaxed);
+            confirm_load_stats::PIN_NEW_META_NS.fetch_add(io_ns, Ordering::Relaxed);
+        }
+        confirm_load_stats::BODY_TX_READS.fetch_add(loaded.len() as u64, Ordering::Relaxed);
+        confirm_load_stats::FULL_TX_READS.fetch_add(loaded.len() as u64, Ordering::Relaxed);
+        confirm_load_stats::PIN_NEW.fetch_add(loaded.len() as u64, Ordering::Relaxed);
+        // load_creates_once seeds residency; verify each cold parent is pin-ready.
+        for fk in &cold_fks {
+            let need = parent_vouts
+                .get(&fk.get().unwrap_or(0))
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            if query.create_residency().get_parent_needed(*fk, need).is_none() {
+                // Soft: parent body missing / corrupt — prep will surface invariant.
+                // Do not hard-fail stage so body missing can re-getdata.
+                continue;
+            }
+        }
+    }
+
+    st.work_ns = t0.elapsed().as_nanos() as u64;
+    if st.work_ns > 0 {
+        confirm_load_stats::PARENT_PIN_NS.fetch_add(st.work_ns, Ordering::Relaxed);
+        confirm_load_stats::NS.fetch_add(st.work_ns, Ordering::Relaxed);
+    }
+    if st.parents > 0 {
+        confirm_load_stats::PARENT_UNIQUE.fetch_add(st.parents as u64, Ordering::Relaxed);
+    }
+    if st.already > 0 {
+        confirm_load_stats::PIN_RESIDENCY.fetch_add(st.already as u64, Ordering::Relaxed);
+        confirm_load_stats::PIN_CACHE_BODY.fetch_add(st.already as u64, Ordering::Relaxed);
+    }
+    Ok(st)
+}
+
 /// Pin parents for wire prep: **only spent parents** (sparse outs).
 ///
 /// Sources: plan/in-flight packed outs (+ offline denserels) → CreateResidency
-/// sparse hit → cold denserels. Does not pin every batch create.
+/// sparse hit → cold denserels (when [`ColdPinMode::Allow`]). Does not pin every
+/// batch create.
 fn pin_for_wire_batch(
     query: &Query,
     plan: Option<&rbitcoin_query::ArchiveWritePlan>,
@@ -603,6 +766,7 @@ fn pin_for_wire_batch(
             ),
         >,
     >,
+    cold_mode: ColdPinMode,
 ) -> Result<(rbitcoin_query::BatchParents, rbitcoin_query::BatchThin), ConsensusError> {
     use rbitcoin_query::confirm_load_stats;
     use rbitcoin_query::ThinInput;
@@ -828,6 +992,11 @@ fn pin_for_wire_batch(
         res_hit_ns = t_res.elapsed().as_nanos() as u64;
 
         if !cold.is_empty() {
+            if cold_mode == ColdPinMode::Forbid {
+                return Err(ConsensusError::Store(StoreError::Corrupt(
+                    "invariant: denserels stage miss (prep cold denserels forbidden)",
+                )));
+            }
             let t_io = Instant::now();
             let fks: Vec<rbitcoin_primitives::Fk> = cold
                 .keys()
@@ -1860,6 +2029,126 @@ mod write_idempotent_tests {
         assert!(after > before, "skip counter should bump");
     }
 
+    /// Denserels warm + Forbid: cold path must not run on prep after stage filled residency.
+    #[test]
+    fn denserels_warm_then_forbid_skips_cold_io() {
+        use super::{pin_for_wire_batch, warm_parent_denserels_for_wire, ColdPinMode};
+        use bitcoin::hashes::Hash;
+        use bitcoin::{Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::Query;
+        use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+        use std::sync::Once;
+
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-denserels-warm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let q = Query::open_or_create(&path).unwrap();
+
+        let parent_tx = TxRecord {
+            txid: [0xab; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let parent_outs = vec![OutputRecord::unspent(50_0000_0000, vec![0x51])];
+        let parent_ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+        let pfk = q
+            .store()
+            .txs
+            .put_full_batch_indexed(&[(parent_tx.clone(), parent_ins, parent_outs)], true)
+            .unwrap()[0];
+
+        // Spender wire that points at parent by txid.
+        let mut spend = Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array(parent_tx.txid),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let _ = &mut spend;
+        let block = Block {
+            header: bitcoin::block::Header {
+                version: bitcoin::block::Version::ONE,
+                prev_blockhash: bitcoin::BlockHash::from_byte_array([0u8; 32]),
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([1u8; 32]),
+                time: 1,
+                bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 1,
+            },
+            txdata: vec![spend],
+        };
+
+        rbitcoin_query::reset_body_ok_reads();
+        let st = warm_parent_denserels_for_wire(&q, &[(Height(1), block.clone())]).unwrap();
+        assert!(st.cold >= 1 || st.already >= 1, "st={st:?}");
+        assert!(
+            q.create_residency().has_outs(pfk),
+            "warm must seed denserels for parent"
+        );
+        let reads_after_warm = rbitcoin_query::body_ok_reads();
+
+        // Forbid cold: pin should hit residency only (no extra body IO).
+        let mut plan = rbitcoin_query::ArchiveWritePlan::empty();
+        plan.packed = vec![(
+            TxRecord {
+                txid: [0xcd; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![InputRecord {
+                prev_txid: parent_tx.txid,
+                create_fk: pfk,
+                prev_index: 0,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }],
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        )];
+        plan.planned_fks = vec![Fk(2)];
+        let (parents, _thin) =
+            pin_for_wire_batch(&q, Some(&plan), &[], &[], None, ColdPinMode::Forbid).unwrap();
+        assert!(parents.contains(pfk));
+        assert_eq!(
+            rbitcoin_query::body_ok_reads(),
+            reads_after_warm,
+            "Forbid must not cold denserels again"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     /// Wire pin: spend parent not loadable → hard invariant (no silent skip).
     #[test]
     fn pin_for_wire_missing_parent_is_invariant_error() {
@@ -1918,7 +2207,7 @@ mod write_idempotent_tests {
             advise_dont_need: false,
         };
 
-        let err = pin_for_wire_batch(&q, Some(&plan), &[], &[], None)
+        let err = pin_for_wire_batch(&q, Some(&plan), &[], &[], None, super::ColdPinMode::Allow)
             .expect_err("missing parent must hard-fail pin");
         let msg = format!("{err}");
         assert!(
@@ -2004,7 +2293,14 @@ mod write_idempotent_tests {
         };
         ifo.insert(parent_id, (parent_tx, Vec::new(), Vec::new()));
 
-        let err = pin_for_wire_batch(&q, Some(&plan), &[], &[], Some(&ifo))
+        let err = pin_for_wire_batch(
+            &q,
+            Some(&plan),
+            &[],
+            &[],
+            Some(&ifo),
+            super::ColdPinMode::Allow,
+        )
             .expect_err("incomplete outs must hard-fail pin");
         let msg = format!("{err}");
         assert!(

@@ -2453,6 +2453,7 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
         &[(Height(ha), ba.clone())],
         &ScriptPreverified::new(),
         Some(&pipe),
+        rbitcoin_consensus::ColdPinMode::Allow,
     )
     .expect("prep A");
     assert_eq!(q.tip_height(), Some(Height(maturity)), "prep must not tip");
@@ -2492,6 +2493,7 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
         &[(Height(hb), bb.clone())],
         &ScriptPreverified::new(),
         Some(&pipe),
+        rbitcoin_consensus::ColdPinMode::Allow,
     )
     .expect("prep B while tip still at maturity");
     assert_eq!(q.tip_height(), Some(Height(maturity)));

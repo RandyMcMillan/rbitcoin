@@ -948,7 +948,7 @@ pub async fn ibd_cancellable(
             let tip_delta = prog.tip.saturating_sub(last_sample_tip);
             let tip_rate = tip_delta as f64 / window_secs;
             let peers_n = st.slots.iter().filter(|s| s.alive).count();
-            let (load_q, write_q) = confirm_queues.snap();
+            let (denserels_q, load_q, write_q) = confirm_queues.snap();
             // Class A fks published in tx.idx (dense create_fk high-water).
             let txs = hub.query.tx_body_count();
             let pct = ibd_pct(prog.tip, prog.headers);
@@ -958,11 +958,13 @@ pub async fn ibd_cancellable(
             let eta = tip_rate_tracker.eta_string(now, prog.tip, prog.headers);
 
             // Bold on a TTY so the 5s progress line stands out among perf/debug noise.
-            // prepq/writeq: confirm prep→scripts / scripts→write; `name<0/cap` = empty.
+            // denserels_q/prepq/writeq; `name<0/cap` = empty.
             // bq=: durable body queue (schema 12); wire lives there until write dequeues.
             let conf_q = confirm::format_conf_q(
+                denserels_q,
                 load_q,
                 write_q,
+                confirm::DENSERELS_QUEUE_CAP,
                 confirm::LOAD_QUEUE_CAP,
                 confirm::WRITE_QUEUE_CAP,
             );
@@ -997,7 +999,7 @@ pub async fn ibd_cancellable(
 
             // One sample/reset, then INFO `ibd: perf` + `ibd: sizes` (+ DEBUG `ibd: perf_dbg`).
             let parent_cache_snap = hub.query.parent_cache_perf_snapshot();
-            let (load_q, write_q) = confirm_queues.snap();
+            let (denserels_q, load_q, write_q) = confirm_queues.snap();
             let mut conf_pipe = confirm_queues.content_snap();
             let (feed_ready, feed_inflight) = confirm_feed.size_snap();
             conf_pipe.feed_ready = feed_ready;
@@ -1022,6 +1024,7 @@ pub async fn ibd_cancellable(
                 peers_n,
                 st.headers_done,
                 parent_cache_snap,
+                denserels_q,
                 load_q,
                 write_q,
                 hub.query.scripthash_run_count(),
@@ -1036,10 +1039,11 @@ pub async fn ibd_cancellable(
             // bug only when the **confirm pipeline is idle**. Mid-mainnet 32-block
             // prep+scripts+write often takes 8–15s (and cold restart first batch
             // longer); peer `inflight` empty is normal with a full body queue.
-            // Do **not** WARN while feed has claims or prep/scripts/write queues
-            // hold work (post-rehydrate cold start used to spam tip stall with
+            // Do **not** WARN while feed has claims or denserels/prep/scripts/write
+            // queues hold work (post-rehydrate cold start used to spam tip stall with
             // ready=false even though prep was live on tip+1).
             let conf_busy = feed_inflight > 0
+                || denserels_q > 0
                 || load_q > 0
                 || write_q > 0
                 || loop_stats.confirm_live_snap().is_some();

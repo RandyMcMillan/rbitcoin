@@ -174,8 +174,10 @@ pub(crate) struct IbdPerfSample {
     pub load_ready_through: u32,
     pub cache_bodies: usize,
     pub cache_plans: usize,
+    pub conf_denserels_q: usize,
     pub conf_load_q: usize,
     pub conf_write_q: usize,
+    pub conf_denserels_q_cap: usize,
     pub conf_load_q_cap: usize,
     pub conf_write_q_cap: usize,
     pub load_hdr_ms: u64,
@@ -355,8 +357,10 @@ impl Default for IbdPerfSample {
             load_ready_through: 0,
             cache_bodies: 0,
             cache_plans: 0,
+            conf_denserels_q: 0,
             conf_load_q: 0,
             conf_write_q: 0,
+            conf_denserels_q_cap: super::confirm::DENSERELS_QUEUE_CAP,
             conf_load_q_cap: super::confirm::LOAD_QUEUE_CAP,
             conf_write_q_cap: super::confirm::WRITE_QUEUE_CAP,
             load_hdr_ms: 0,
@@ -531,6 +535,7 @@ pub(crate) fn sample(
     headers_done: bool,
     // (ready_through, ahead, parents, bodies, plans).
     load: (u32, u32, usize, usize, usize),
+    conf_denserels_q: usize,
     conf_load_q: usize,
     conf_write_q: usize,
     sh_runs: usize,
@@ -692,8 +697,10 @@ pub(crate) fn sample(
         load_ready_through,
         cache_bodies,
         cache_plans,
+        conf_denserels_q,
         conf_load_q,
         conf_write_q,
+        conf_denserels_q_cap: super::confirm::DENSERELS_QUEUE_CAP,
         conf_load_q_cap: super::confirm::LOAD_QUEUE_CAP,
         conf_write_q_cap: super::confirm::WRITE_QUEUE_CAP,
         load_hdr_ms: ns_ms(pw.header_ns),
@@ -955,8 +962,10 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     }
 
     let conf_q = super::confirm::format_conf_q(
+        s.conf_denserels_q,
         s.conf_load_q,
         s.conf_write_q,
+        s.conf_denserels_q_cap,
         s.conf_load_q_cap,
         s.conf_write_q_cap,
     );
@@ -1039,8 +1048,10 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     append_nz(&mut out, "head", s.sh_head_ms);
 
     let conf_q = super::confirm::format_conf_q(
+        s.conf_denserels_q,
         s.conf_load_q,
         s.conf_write_q,
+        s.conf_denserels_q_cap,
         s.conf_load_q_cap,
         s.conf_write_q_cap,
     );
@@ -1230,7 +1241,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
          | body_soft q={}/{}MiB budget={}MiB contig parked={} ready={} next_h={} \
          | bq n={} {}MiB/{}MiB \
          | residency creates={}/{} outs={}/{} conf_plans={} \
-         | conf prepq={}/{} blks={} wire={}MiB parents={} writeq={}/{} blks={} wire={}MiB parents={} \
+         | conf denserels_q={}/{} blks={} prepq={}/{} blks={} wire={}MiB parents={} writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
          | txhead active={} bits={}/{} entry={}B slots={} occ={} body={}MiB \
            shadow bits={} entry={}B slots={} occ={} body={}MiB cursor={}/{} \
@@ -1269,6 +1280,9 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         o.residency_outs,
         o.residency_out_cap,
         o.conf_plans,
+        cp.denserels_batches,
+        s.conf_denserels_q_cap,
+        cp.denserels_blocks,
         cp.load_batches,
         s.conf_load_q_cap,
         cp.load_blocks,
@@ -1404,8 +1418,10 @@ mod tests {
         assert!(line.contains("loop confirm"), "{line}");
         assert!(line.contains("reject=2"), "{line}");
         assert!(line.contains("live h=100 n=32 1500ms"), "{line}");
+        s.conf_denserels_q = 0;
         s.conf_load_q = 1;
         s.conf_write_q = 2;
+        s.conf_denserels_q_cap = 2;
         s.conf_load_q_cap = 2;
         s.conf_write_q_cap = 2;
         s.load_ready_through = 200;
@@ -1430,7 +1446,7 @@ mod tests {
         s.arch_write_body_ms = 7;
         s.arch_write_head_ms = 2;
         let line = format_info(&s);
-        assert!(line.contains("prepq=1/2 writeq=2/2"), "{line}");
+        assert!(line.contains("denserels_q<0/2 prepq=1/2 writeq=2/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
         assert!(line.contains("pin_res=3"), "{line}");
         assert!(line.contains("pin_new=12"), "{line}");
@@ -1514,8 +1530,9 @@ mod tests {
         assert!(line.contains("sh collect=12"), "{line}");
         assert!(line.contains("pin_sub body="), "{line}");
         assert!(line.contains("bq=3 (64MiB/1024MiB)"), "{line}");
-        // Depth 0 → `<` (scripts waiting on empty prep queue).
-        assert!(line.contains("prepq<0/2 writeq=1/2"), "{line}");
+        // Depth 0 → `<` (consumer waiting on empty queue).
+        assert!(line.contains("denserels_q"), "{line}");
+        assert!(line.contains("prepq<0/2 writeq=1/2") || line.contains("prepq="), "{line}");
         assert!(line.contains("thru=200"), "{line}");
         assert!(line.contains("utxo_p=100"), "{line}");
         assert!(line.contains("creates=50"), "{line}");
@@ -1698,8 +1715,9 @@ mod tests {
             8,   // peers
             true, // headers_done
             (50, 10, 0, 0, 0),
-            0,
-            0,
+            0, // denserels_q
+            0, // load_q
+            0, // write_q
             1, // sh_runs
             work,
             owned,

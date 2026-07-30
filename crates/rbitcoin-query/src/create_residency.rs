@@ -18,17 +18,14 @@
 //! 65–70% hit rate. Optimize: (1) keep **recent** commit-seed / offline denserels
 //! working, (2) make **cold** denserels loads cheap (batch once, no double ensure).
 //!
-//! Legacy **archive sticky** (fk/range mirror) and **OutFifo** are not the wire
-//! pin path; see plan / IBD sizes logging (residency primary).
-
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
-/// Default max creates in residency (~same planning band as prior sticky).
+/// Default max creates in residency (~same planning band as prior sticky cap).
 pub const DEFAULT_CREATE_CAP: usize = 8_000_000;
-/// Default max outputs held (same as prior OutFifo default).
+/// Default max outputs held.
 pub const DEFAULT_OUT_CAP: u64 = 1 << 24;
 
 #[derive(Debug, Clone)]
@@ -76,8 +73,10 @@ impl CreateResidency {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_CREATE_CAP);
-        let out_cap = std::env::var("RBITCOIN_CONFIRM_OUT_FIFO")
+        // Prefer residency-named env; accept legacy CONFIRM_OUT_FIFO as alias.
+        let out_cap = std::env::var("RBITCOIN_CREATE_RESIDENCY_OUT_CAP")
             .ok()
+            .or_else(|| std::env::var("RBITCOIN_CONFIRM_OUT_FIFO").ok())
             .and_then(|s| s.parse().ok())
             .filter(|&n| n > 0)
             .unwrap_or(DEFAULT_OUT_CAP);
@@ -194,6 +193,48 @@ impl CreateResidency {
     pub fn lookup_fk_by_txid(&self, txid: &[u8; 32]) -> Option<Fk> {
         let g = self.inner.lock().unwrap();
         g.by_txid.get(txid).map(|&id| Fk(id))
+    }
+
+    /// Txid for a create fk (fk-only / range rows and full outs rows).
+    pub fn get_txid(&self, fk: Fk) -> Option<[u8; 32]> {
+        let id = fk.get()?;
+        self.inner.lock().unwrap().by_fk.get(&id).map(|e| e.txid)
+    }
+
+    /// Tx meta when outs have been attached (`put_outs`); `None` for fk-only rows.
+    pub fn get_tx(&self, fk: Fk) -> Option<TxRecord> {
+        let id = fk.get()?;
+        self.inner
+            .lock()
+            .unwrap()
+            .by_fk
+            .get(&id)
+            .and_then(|e| e.tx.clone())
+    }
+
+    /// Single out by vout when denserels/outs are resident.
+    pub fn get_parent_out(&self, fk: Fk, vout: u32) -> Option<(TxRecord, OutputRecord)> {
+        let id = fk.get()?;
+        let g = self.inner.lock().unwrap();
+        let e = g.by_fk.get(&id)?;
+        let tx = e.tx.as_ref()?;
+        let outs = e.outs.as_ref()?;
+        let o = outs.get(vout as usize)?;
+        Some((tx.clone(), o.clone()))
+    }
+
+    /// True if vout is present on a resident create with outs — no record clone.
+    pub fn has_parent_out(&self, fk: Fk, vout: u32) -> bool {
+        let Some(id) = fk.get() else {
+            return false;
+        };
+        self.inner
+            .lock()
+            .unwrap()
+            .by_fk
+            .get(&id)
+            .and_then(|e| e.outs.as_ref())
+            .is_some_and(|outs| (vout as usize) < outs.len())
     }
 
     pub fn get_outs(&self, fk: Fk) -> Option<(TxRecord, Vec<OutputRecord>, Vec<u32>, Option<(u64, u64)>)> {

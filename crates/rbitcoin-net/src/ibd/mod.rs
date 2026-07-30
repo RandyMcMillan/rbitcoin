@@ -386,18 +386,18 @@ pub async fn ibd_cancellable(
     } else {
         0
     }));
-    // Linear sticky prewarm from last N Class A tx.idx rows before any archive work.
+    // Linear residency prewarm from last N Class A tx.idx rows before any archive work.
     // Avoids multi-second head resolve storms after cold restart.
-    match hub.query.archive_sticky_prewarm() {
+    match hub.query.archive_residency_prewarm() {
         Ok((loaded, ms)) => {
-            let (len, cap) = hub.query.archive_txid_sticky_stats();
+            let (len, create_cap, outs, out_cap) = hub.query.create_residency().size_stats();
             info!(
-                "ibd: archive sticky prewarm loaded={loaded} map={len}/{cap} in {ms}ms \
+                "ibd: residency prewarm loaded={loaded} creates={len}/{create_cap} outs={outs}/{out_cap} in {ms}ms \
                  (last min(cap,tx_count) via sequential tx.idx)"
             );
         }
         Err(e) => {
-            warn!("ibd: archive sticky prewarm failed (continuing cold): {e}");
+            warn!("ibd: residency prewarm failed (continuing cold): {e}");
         }
     }
     // Dedicated confirm path — never blocks the network/archive event loop.
@@ -1012,7 +1012,6 @@ pub async fn ibd_cancellable(
                 load_q,
                 write_q,
                 hub.query.scripthash_run_count(),
-                hub.query.archive_txid_sticky_stats(),
                 work_sizes,
                 owned_sizes,
                 conf_pipe,

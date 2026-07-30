@@ -861,17 +861,17 @@ pub(crate) fn emit_archive_job_dropped(
     });
 }
 
-/// Writer channel dead: clear planned sticky creates and emit Err for every
+/// Writer channel dead: clear planned in-flight creates and emit Err for every
 /// outcome so charges are released when the main loop applies results.
 pub(crate) fn emit_writer_dead_outcomes(
     result_tx: &mpsc::UnboundedSender<ArchiveResult>,
     inflight: &Mutex<HashMap<[u8; 32], Fk>>,
-    sticky_creates: &[([u8; 32], Fk)],
+    batch_creates: &[([u8; 32], Fk)],
     outcomes: Vec<(BlockHash, usize)>,
 ) {
-    if !sticky_creates.is_empty() {
+    if !batch_creates.is_empty() {
         let mut g = inflight.lock().unwrap();
-        for (t, _) in sticky_creates {
+        for (t, _) in batch_creates {
             g.remove(t);
         }
     }
@@ -1091,9 +1091,9 @@ pub(crate) fn spawn_archive_pipeline(
                     // only if stop was false at recv — re-check before heavy put.
                     if write_stop.load(Ordering::Relaxed) {
                         let WriteReadyBatch { outcomes, plan } = batch;
-                        if !plan.sticky_creates.is_empty() {
+                        if !plan.batch_creates.is_empty() {
                             let mut g = write_inflight.lock().unwrap();
-                            for (t, _) in &plan.sticky_creates {
+                            for (t, _) in &plan.batch_creates {
                                 g.remove(t);
                             }
                         }
@@ -1115,7 +1115,7 @@ pub(crate) fn spawn_archive_pipeline(
                     // Drop inflight creates after this batch either way — on Ok sticky
                     // has them; on Err they must not be used for later resolve.
                     let clear_inflight: Vec<[u8; 32]> =
-                        plan.sticky_creates.iter().map(|(t, _)| *t).collect();
+                        plan.batch_creates.iter().map(|(t, _)| *t).collect();
                     let write_t0 = Instant::now();
                     let write_res = if plan.is_empty() {
                         Ok(())
@@ -1188,9 +1188,9 @@ pub(crate) fn spawn_archive_pipeline(
                             }
                             while let Ok(rest) = write_rx.try_recv() {
                                 // Drop their inflight creates too.
-                                if !rest.plan.sticky_creates.is_empty() {
+                                if !rest.plan.batch_creates.is_empty() {
                                     let mut g = write_inflight.lock().unwrap();
-                                    for (t, _) in &rest.plan.sticky_creates {
+                                    for (t, _) in &rest.plan.batch_creates {
                                         g.remove(t);
                                     }
                                 }
@@ -1211,9 +1211,9 @@ pub(crate) fn spawn_archive_pipeline(
                 }
                 // Abandon any remaining queued plans without committing (SIGINT).
                 while let Ok(rest) = write_rx.try_recv() {
-                    if !rest.plan.sticky_creates.is_empty() {
+                    if !rest.plan.batch_creates.is_empty() {
                         let mut g = write_inflight.lock().unwrap();
-                        for (t, _) in &rest.plan.sticky_creates {
+                        for (t, _) in &rest.plan.batch_creates {
                             g.remove(t);
                         }
                     }
@@ -1406,9 +1406,9 @@ pub(crate) fn spawn_archive_pipeline(
                         *next_plan_fk = last.0.saturating_add(1);
                     }
                     // Publish planned creates for the next overlapping plan's resolve.
-                    if !plan.sticky_creates.is_empty() {
+                    if !plan.batch_creates.is_empty() {
                         let mut g = inflight.lock().unwrap();
-                        for &(txid, fk) in &plan.sticky_creates {
+                        for &(txid, fk) in &plan.batch_creates {
                             g.insert(txid, fk);
                         }
                     }
@@ -1421,9 +1421,9 @@ pub(crate) fn spawn_archive_pipeline(
                     loop {
                         if stop.load(Ordering::Relaxed) {
                             // Drop planned batch — writer will not commit after stop.
-                            if !batch.plan.sticky_creates.is_empty() {
+                            if !batch.plan.batch_creates.is_empty() {
                                 let mut g = inflight.lock().unwrap();
-                                for (t, _) in &batch.plan.sticky_creates {
+                                for (t, _) in &batch.plan.batch_creates {
                                     g.remove(t);
                                 }
                             }
@@ -1446,7 +1446,7 @@ pub(crate) fn spawn_archive_pipeline(
                                 emit_writer_dead_outcomes(
                                     result_tx,
                                     inflight,
-                                    &dead.plan.sticky_creates,
+                                    &dead.plan.batch_creates,
                                     dead.outcomes,
                                 );
                                 return PlanSend::WriterDead;

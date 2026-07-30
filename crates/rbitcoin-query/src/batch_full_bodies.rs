@@ -1,7 +1,7 @@
 //! Batch-local full Class A bodies for confirm load → wire.
 //!
 //! Load decodes each create once into this map. Wire rebuild reads from here
-//! instead of re-`get_tx_full` from the store. Long-lived OutFifo still holds
+//! instead of re-`get_tx_full` from the store. CreateResidency holds
 //! **outs only** (inputs are not retained process-wide) plus body layout for pin.
 
 use rbitcoin_primitives::Fk;

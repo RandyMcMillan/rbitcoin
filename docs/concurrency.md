@@ -20,8 +20,8 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **CreateResidency:** sole process-local create map for wire plan + pin (txid→fk,
 range, outs, denserels; raw FIFO). Class A commit seeds denserels offline so
-prep(N+1) hits without body re-read. Legacy archive sticky is a prewarm/stats
-mirror only (not on the plan hot path); OutFifo is not used on wire plan.
+prep(N+1) hits without body re-read. Sole process map is CreateResidency
+(plan resolve + pin denserels + prewarm).
 
 **tx.head overflow:** depth-exhausted inserts → `tx.head.overflow` (overflow-first lookup).
 

@@ -732,17 +732,14 @@ fn assemble_block_prevouts_mode(
     > = std::collections::HashMap::with_capacity(64);
 
     // Spent checks: pending_spent (this run) + durable confirmed-strong annotations.
-    let cache = query.confirm_parent_cache();
     for (ti, tx) in block.txdata.iter().enumerate() {
         let spend_fk = archived_tx_fks.map(|fks| fks[ti]);
-        // Txid only — prefer cache body meta (no full Class A re-decode).
+        // Txid only — prefer residency / Class A meta (no full body re-decode).
         let archived_txid: Option<[u8; 32]> = if let Some(fk) = spend_fk {
-            cache.get_parent_txid(fk).or_else(|| {
-                query
-                    .get_tx_class_a(fk)
-                    .ok()
-                    .map(|r| r.txid)
-            })
+            query
+                .create_residency()
+                .get_txid(fk)
+                .or_else(|| query.get_tx_class_a(fk).ok().map(|r| r.txid))
         } else {
             None
         };
@@ -787,7 +784,7 @@ fn assemble_block_prevouts_mode(
                 let pin_live = prev_fk
                     .map(|fk| {
                         batch_parents.has_parent_out(fk, op.vout)
-                            || cache.has_parent_out(fk, op.vout)
+                            || query.create_residency().has_parent_out(fk, op.vout)
                     })
                     .unwrap_or(false);
                 // Durable spentness: Full mode only. Optimistic defers to structural
@@ -1474,14 +1471,12 @@ fn resolve_prevout(
         });
     }
 
-    let cache = query.confirm_parent_cache();
-
-    // Batch pin map first, then shared body cache. Wire prev_txid is
+    // Batch pin map first, then CreateResidency. Wire prev_txid is
     // authoritative — reject wrong create_fk hits.
     if let Some(prev_fk) = prev_fk_hint {
         let hit = batch_parents
             .get_parent_out(prev_fk, op.vout)
-            .or_else(|| cache.get_parent_out(prev_fk, op.vout));
+            .or_else(|| query.create_residency().get_parent_out(prev_fk, op.vout));
         if let Some((prev_rec, out)) = hit {
             if prev_rec.txid == prev_txid {
                 connect_prevout_stats::WAVE_HIT.fetch_add(1, Ordering::Relaxed);

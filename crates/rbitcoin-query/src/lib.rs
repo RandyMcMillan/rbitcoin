@@ -1,7 +1,6 @@
 //! Domain query layer over [`rbitcoin_store::Store`].
 
 mod archive;
-mod archive_txid_sticky;
 mod batch_full_bodies;
 mod batch_parents;
 mod catchup;
@@ -11,7 +10,6 @@ mod confirm_parent_cache;
 mod connect;
 mod confirm_load;
 mod create_residency;
-mod out_fifo;
 mod reconstruct;
 mod run_builder_core;
 mod scripthash;
@@ -58,23 +56,11 @@ pub const BLOCK_QUEUE_PRESSURE_EXIT: f64 = 0.70;
 
 /// Cheap process-owned cache occupancy for IBD `ibd: sizes` (O(1) lens + brief locks).
 ///
-/// **Primary pin map:** `residency_*`. Legacy `sticky_*` (archive txid sticky
-/// dual-write) and `out_*` (OutFifo) are hangover occupancy — wire pin does not
-/// use them; INFO sizes omits empty OutFifo.
+/// Sole pin map is `residency_*` (CreateResidency FIFO). `conf_plans` is header
+/// plan occupancy in ConfirmParentCache.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProcessOwnedSizes {
-    /// Legacy archive sticky (fk/range mirror); not the wire pin map.
-    pub sticky_len: usize,
-    pub sticky_cap: usize,
-    pub sticky_fifo: usize,
-    /// Legacy OutFifo create entries (wire IBD typically 0).
-    pub out_creates: usize,
-    /// Legacy OutFifo total outs (vs `out_cap`).
-    pub out_total: u64,
-    pub out_cap: u64,
-    pub out_order: usize,
     pub conf_plans: usize,
-    pub conf_bodies: usize,
     /// Sole hot create map: creates + outs vs caps (FIFO).
     pub residency_creates: usize,
     pub residency_create_cap: usize,
@@ -677,10 +663,7 @@ pub struct Query {
     sh_indexed_through: AtomicU64,
     /// Block-structured confirm parent cache.
     confirm_parents: confirm_parent_cache::ConfirmParentCache,
-    /// Legacy archive sticky (fk/range dual-write + prewarm). Not wire pin.
-    archive_txid_sticky: archive_txid_sticky::ArchiveTxidSticky,
     /// Sole hot create map (fk/range/outs) for archive prep + confirm pin.
-    /// Legacy sticky/OutFifo may dual-write; wire pin reads this only.
     create_residency: create_residency::CreateResidency,
     /// Durable multi‑GiB on-disk block payload queue (IBD restart without re-download).
     block_queue: Mutex<rbitcoin_store::BlockQueue>,
@@ -723,7 +706,6 @@ impl Query {
             sh_heads: Mutex::new(HashMap::new()),
             sh_indexed_through: AtomicU64::new(sh_through),
             confirm_parents: confirm_parent_cache::ConfirmParentCache::from_env(),
-            archive_txid_sticky: archive_txid_sticky::ArchiveTxidSticky::from_env(),
             create_residency: create_residency::CreateResidency::from_env(),
             block_queue: Mutex::new(rbitcoin_store::BlockQueue::open_or_create(
                 &store_path,
@@ -894,23 +876,7 @@ impl Query {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Archive writer sticky map occupancy `(len, cap)` for IBD diagnostics.
-    pub fn archive_txid_sticky_stats(&self) -> (usize, usize) {
-        (
-            self.archive_txid_sticky.len(),
-            self.archive_txid_sticky.cap(),
-        )
-    }
-
-    /// Sticky body ranges by create fk (tests / diagnostics; production prefers residency).
-    pub fn archive_txid_sticky_body_ranges(
-        &self,
-        fks: &[Fk],
-    ) -> Vec<Option<(u64, u64)>> {
-        self.archive_txid_sticky.body_ranges_by_fk(fks)
-    }
-
-    /// Unified create residency (shared archive prep + confirm load).
+    /// Sole hot create map (archive prep + confirm pin).
     pub fn create_residency(&self) -> &create_residency::CreateResidency {
         &self.create_residency
     }
@@ -1149,25 +1115,14 @@ impl Query {
 
     /// Cheap process-owned cache sizes for the IBD `ibd: sizes` line.
     ///
-    /// Brief mutex locks only (residency / legacy sticky / OutFifo / SH / heads).
-    /// Call from the ~5s status tick — not the hot path. Prefer residency fields;
-    /// sticky/outfifo are legacy dual-write occupancy.
+    /// Brief mutex locks only (residency / header plans / SH / heads). Call from
+    /// the ~5s status tick — not the hot path.
     pub fn process_owned_size_snapshot(&self) -> ProcessOwnedSizes {
-        let (sticky_len, sticky_cap, sticky_fifo) = self.archive_txid_sticky.size_stats();
-        let (out_creates, out_total, out_cap, out_order) = self.confirm_parents.out_fifo_stats();
         let (res_creates, res_create_cap, res_outs, res_out_cap) =
             self.create_residency.size_stats();
         let conf_plans = self.confirm_parents.plan_count();
         ProcessOwnedSizes {
-            sticky_len,
-            sticky_cap,
-            sticky_fifo,
-            out_creates,
-            out_total,
-            out_cap,
-            out_order,
             conf_plans,
-            conf_bodies: out_creates,
             residency_creates: res_creates,
             residency_create_cap: res_create_cap,
             residency_outs: res_outs,
@@ -1340,9 +1295,9 @@ impl Query {
         self.get_tx_class_a(fk)
     }
 
-    /// Load tx row: confirm-parent cache → store (no generic Class A cache).
+    /// Load tx row: CreateResidency → store (no generic Class A cache).
     pub fn get_tx_class_a(&self, fk: Fk) -> Result<TxRecord, QueryError> {
-        if let Some(tx) = self.confirm_parents.get_parent_tx(fk) {
+        if let Some(tx) = self.create_residency.get_tx(fk) {
             return Ok(tx);
         }
         self.store.get_tx(fk)
@@ -1433,7 +1388,7 @@ impl Query {
         if vout >= tx.output_count {
             return Err(StoreError::NotFound);
         }
-        if let Some((_, o)) = self.confirm_parents.get_parent_out(create_fk, vout) {
+        if let Some((_, o)) = self.create_residency.get_parent_out(create_fk, vout) {
             if count_connect {
                 connect_prevout_stats::CLASS_A_HIT.fetch_add(1, Ordering::Relaxed);
             }
@@ -1845,10 +1800,9 @@ mod tests {
         q.enter_tip_index_mode();
         assert!(q.index_mode().is_tip());
 
-        // Size snapshot + sticky stats.
+        // Size snapshot (residency occupancy).
         let sizes = q.process_owned_size_snapshot();
-        let _ = sizes.sticky_cap;
-        let _ = q.archive_txid_sticky_stats();
+        let _ = sizes.residency_create_cap;
         assert!(q.tx_body_count() >= 4);
         let _ = q.tx_head_occupied();
         let _ = q.scripthash_entry_count();

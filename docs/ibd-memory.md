@@ -23,9 +23,7 @@ Class A far ahead of tip — confirm commit is the sole Class A appender.
 | **Archive queue budget** | default 512 MiB (`RBITCOIN_ARCHIVE_QUEUE_MB`) | Soft-charge **RAM overflow / arch jobs only** (not multi‑GiB disk body queue). `charge` on overflow/job; **`release` only via** `apply_archive_result` on `ArchiveResult::{Ok,Err,Dropped}` (or immediate release if pipeline send fails because the channel is **closed**) |
 | **ContigPark** | horizon `CONTIG_DENSIFY_AHEAD` | Fallback contiguous park → prep/writer; abort via `drain_all` + Err; skip already-Class-A via `force_advance` + **Dropped** |
 | **`BodyPresence.archive_charged`** | one bit per charged fallback body | **Only** `clear_archive_charged` on pipeline result — **never** hygiene-prune |
-| **CreateResidency (sole pin map)** | create/out caps (`RBITCOIN_CREATE_RESIDENCY_*`) | **Insert-order FIFO** only (no read-LRU). denserels_hit% ~35–50% mid/late mainnet is structural |
-| **OutFifo (legacy)** | `RBITCOIN_CONFIRM_OUT_FIFO` (default 2²⁴ outs) | Hash-path dual-write hangover; **not** wire pin. Empty on wire IBD is expected |
-| **Archive txid sticky (legacy)** | `RBITCOIN_ARCHIVE_TXID_STICKY_CAP` (default 8 M) | Dual-write / prewarm mirror; plan resolve uses CreateResidency |
+| **CreateResidency (sole pin map)** | create/out caps (`RBITCOIN_CREATE_RESIDENCY_CAP`, `RBITCOIN_CREATE_RESIDENCY_OUT_CAP`; legacy alias `RBITCOIN_CONFIRM_OUT_FIFO`) | **Insert-order FIFO** only (no read-LRU). denserels_hit% ~35–50% mid/late mainnet is structural |
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |
 | **SH memtable / runs** | memtable env cap; runs on disk | spill + merge; bulk materialize at tip |
 | **Ordered work path** | `MAX_ORDERED_HEADERS` | `IbdWorkState::hygiene` |
@@ -109,7 +107,6 @@ Honest coverage (reverting emit/apply would fail):
 - `drain_job_rx_as_err_releases_via_apply` — forwarder stop drain + apply
 - `force_advance_returns_parked_jobs_for_charge_release` — Dropped emit + apply
 - `can_assign_stops_at_budget_charge_may_overshoot` — request gate only; charge may overshoot
-- `sticky_map_stays_at_cap_under_unique_flood`
 
 ## Process RSS vs true leak
 
@@ -120,7 +117,6 @@ Honest coverage (reverting emit/apply would fail):
 | `residency creates=` near create cap, oscillates | Intentional CreateResidency fill |
 | `sh_runs` grows during Direct IBD | On-disk runs; bulk materialize at tip |
 | High `RssFile` with stable anon heap | Mmap page cache — not a Rust leak |
-| `outfifo` absent on sizes | Normal on wire IBD (legacy dual-write empty) |
 
 Host check / in-process:
 
@@ -131,9 +127,8 @@ known retain structures:
 |-------------|----------------|
 | `rss=` `anon=` `file=` `hwm=` | `/proc` process RSS (anon vs mmap file pages) |
 | `work` / `body` | IBD maps + body-presence sets |
-| `body_soft` / `sticky_fk` / `contig` | Soft archive RAM + **legacy** sticky FIFO + ContigPark |
+| `body_soft` / `contig` | Soft archive RAM + ContigPark |
 | `residency` | **Sole** pin map: creates/outs vs caps + conf_plans |
-| `outfifo(legacy)` | Only when non-empty (hash-path dual-write hangover) |
 | `conf prepq` / `writeq` | Confirm pipeline **queue contents** (batches, blocks, wire MiB, parents) + feed ready/inflight |
 | `txhead` | Primary + **shadow** `tx.head` during online resize (logical body MiB, cursor/n) |
 | `sh` | SH runs / memtable / tip heads |

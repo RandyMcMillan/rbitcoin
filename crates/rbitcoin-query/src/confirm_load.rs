@@ -73,7 +73,7 @@ impl Query {
             through,
             ahead,
             0,
-            self.confirm_parents.body_count(),
+            self.create_residency.len(),
             self.confirm_parents.plan_count(),
         )
     }
@@ -267,16 +267,11 @@ impl Query {
             height_tx_fks.push((height, tx_fks));
         }
 
-        // ── Legacy OutFifo dual-write (hash path / SH collect warmouts only) ─
-        // Wire pin uses CreateResidency (seeded by load_creates_once).
-        let t_put = Instant::now();
-        self.confirm_parents.put_bodies_from_batch_full(&batch_bodies);
-        st.cache_put_ns = st
-            .cache_put_ns
-            .saturating_add(t_put.elapsed().as_nanos() as u64);
+        // Residency outs already seeded by load_creates_once (no second map).
+        st.cache_put_ns = 0;
 
         // ── Thin edges: stamped create_fk only (schema v10) ────────────────
-        // Soft prev_txid / sticky / head resolve removed — archive stamps create_fk.
+        // Soft prev_txid / head resolve removed — archive stamps create_fk.
         let t_thin = Instant::now();
         for (height, tx_fks) in &height_tx_fks {
             for fk in tx_fks {
@@ -347,23 +342,11 @@ impl Query {
         }
         batch_parents = BatchParents::with_capacity(pin_jobs.len());
 
-        // ── FIFO / same-batch hits (pin_cache) ────────────────────────────
-        // Coinbase height: only free hints already on the FIFO entry. Store
-        // resolve is deferred to structural write (maturity). Unset (`None`)
-        // means write must look up if needed.
-        //
-        // Same-batch creates are in batch_bodies (and residency) with denserels;
-        // if FIFO missed (cap eviction) fall back to batch_bodies layout without idx.
+        // ── Residency / same-batch hits (pin_cache) ────────────────────────
+        // Coinbase height: free hints when known. Store resolve is deferred to
+        // structural write (maturity). Unset (`None`) means write must look up.
+        // Same-batch creates are in batch_bodies (and residency) with denserels.
         let t_body = Instant::now();
-        let body_keys: Vec<(u64, &[u32])> = pin_jobs
-            .iter()
-            .filter(|(_, vouts)| !vouts.is_empty())
-            .map(|(pid, vouts)| (*pid, vouts.as_slice()))
-            .collect();
-        let mut body_hits = self
-            .confirm_parents
-            .get_bodies_for_pin_batch(&body_keys);
-
         let mut pin_new_pending: Vec<(u64, Vec<u32>)> = Vec::new();
         for (pid, need_vouts) in pin_jobs {
             if self.confirm_cancelled() {
@@ -374,28 +357,27 @@ impl Query {
             if need_vouts.is_empty() {
                 continue;
             }
-            if let Some((_create_h, tx, outs, cb_hint, body_range, sparse_rels)) =
-                body_hits.remove(&pid)
+            if let Some((tx, live, sparse_rels, body_range)) =
+                self.create_residency.get_parent_needed(fk, &need_vouts)
             {
-                if crate::batch_parents::layout_covers_need(
+                st.pin_cache_body = st.pin_cache_body.saturating_add(1);
+                st.pin_residency = st.pin_residency.saturating_add(1);
+                let cb = if tx.input_count != 1 {
+                    Some(false)
+                } else {
+                    None
+                };
+                batch_parents.insert_owned(
+                    fk,
+                    tx,
+                    live,
+                    need_vouts,
+                    cb,
                     body_range,
-                    &sparse_rels,
-                    &need_vouts,
-                ) {
-                    st.pin_cache_body = st.pin_cache_body.saturating_add(1);
-                    let live = slim_outs_to_need(outs, &need_vouts);
-                    batch_parents.insert_owned(
-                        fk,
-                        tx,
-                        live,
-                        need_vouts,
-                        cb_hint,
-                        body_range,
-                        sparse_rels,
-                    );
-                    st.utxo_parents = st.utxo_parents.saturating_add(1);
-                    continue;
-                }
+                    sparse_rels,
+                );
+                st.utxo_parents = st.utxo_parents.saturating_add(1);
+                continue;
             }
             // Same-batch create: pin from batch_bodies (no idx / body re-read).
             if let Some(body) = batch_bodies.get(fk) {
@@ -409,7 +391,7 @@ impl Query {
                     st.pin_cache_body = st.pin_cache_body.saturating_add(1);
                     st.parent_cache_hits = st.parent_cache_hits.saturating_add(1);
                     let live = slim_dense_outs_to_need(&body.outputs, &need_vouts);
-                    let cb = Some(crate::out_fifo::is_coinbase_inputs(&body.tx, &body.inputs));
+                    let cb = Some(is_coinbase_inputs(&body.tx, &body.inputs));
                     batch_parents.insert_owned(
                         fk,
                         body.tx.clone(),
@@ -433,15 +415,14 @@ impl Query {
         // ── pin_new: idx→body pipeline in **chunks** ─────────────────────
         // Holding ~90k full packed bodies + dense outs at once blew RSS.
         // Chunk so peak is O(PIN_NEW_CHUNK) bodies. Prefer CreateResidency; cold
-        // path is one denserels load that seeds residency (+ legacy OutFifo dual-write).
+        // path is one denserels load that seeds residency.
         const PIN_NEW_CHUNK: usize = 4096;
         let t_new = Instant::now();
         if self.confirm_cancelled() {
             crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
             return Err(StoreError::Cancelled("confirm cancelled"));
         }
-        // pin_new via combined residency: one denserels load seeds residency;
-        // OutFifo dual-write kept for legacy SH collect / reconstruct warmouts.
+        // pin_new via combined residency: one denserels load seeds residency.
         // Prefer already-resident outs (same creates archive just published).
         let mut still_need: Vec<(u64, Vec<u32>)> = Vec::new();
         for (pid, need_vouts) in &pin_new_pending {
@@ -492,16 +473,6 @@ impl Query {
             for c in loaded {
                 by_id.insert(c.fk.get().unwrap_or(0), c);
             }
-            const FIFO_FLUSH: usize = 256;
-            let mut fifo_seed: Vec<(
-                Fk,
-                u32,
-                rbitcoin_store::TxRecord,
-                Vec<rbitcoin_store::OutputRecord>,
-                Option<(u64, u64)>,
-                Vec<u32>,
-            )> = Vec::with_capacity(FIFO_FLUSH);
-
             for (pid, need_vouts) in chunk {
                 if self.confirm_cancelled() {
                     crate::confirm_load_stats::note(&st, t0.elapsed().as_nanos() as u64);
@@ -542,7 +513,6 @@ impl Query {
                 } else {
                     None
                 };
-                fifo_seed.push((fk, 0, tx.clone(), outs, range, dense_rels));
                 batch_parents.insert_owned(
                     fk,
                     tx,
@@ -553,14 +523,7 @@ impl Query {
                     sparse,
                 );
                 st.full_tx_reads = st.full_tx_reads.saturating_add(1);
-                if fifo_seed.len() >= FIFO_FLUSH {
-                    self.confirm_parents
-                        .put_dense_outs_batch(std::mem::take(&mut fifo_seed));
-                }
                 st.utxo_parents = st.utxo_parents.saturating_add(1);
-            }
-            if !fifo_seed.is_empty() {
-                self.confirm_parents.put_dense_outs_batch(fifo_seed);
             }
         }
         st.pin_new_meta_ns = st
@@ -611,31 +574,10 @@ fn tx_fks_is_sorted_ascending(fks: &[Fk]) -> bool {
     fks.windows(2).all(|w| w[0].0 <= w[1].0)
 }
 
-/// Keep only outs whose vout is in `need` (sparse pin map for assemble).
-///
-/// Does not consult spenders — load is optimistic for scripts; structural
-/// rejects already-spent prevouts after verification.
-fn slim_outs_to_need(
-    outs: Vec<(u32, rbitcoin_store::OutputRecord)>,
-    need: &[u32],
-) -> Vec<(u32, rbitcoin_store::OutputRecord)> {
-    if need.is_empty() {
-        return Vec::new();
-    }
-    if need.len() == 1 {
-        let v = need[0];
-        return outs.into_iter().filter(|(vout, _)| *vout == v).collect();
-    }
-    let need_set: HashSet<u32> = need.iter().copied().collect();
-    outs.into_iter()
-        .filter(|(vout, _)| need_set.contains(vout))
-        .collect()
-}
-
 /// Dense `outs[vout]` → sparse need list (clone of need only).
 ///
-/// Caller should move `outs` into OutFifo after this so the only residual
-/// batch-local copies of scripts are the need-vouts in [`BatchParents`].
+/// Residual batch-local copies of scripts are the need-vouts in [`BatchParents`];
+/// full denserels/outs live in CreateResidency when seeded.
 fn slim_dense_outs_to_need(
     outs: &[rbitcoin_store::OutputRecord],
     need: &[u32],
@@ -647,6 +589,16 @@ fn slim_dense_outs_to_need(
         }
     }
     live
+}
+
+/// Derive coinbase flag from decoded inputs (called once at pin).
+fn is_coinbase_inputs(tx: &rbitcoin_store::TxRecord, inputs: &[rbitcoin_store::InputRecord]) -> bool {
+    if tx.input_count != 1 {
+        return false;
+    }
+    inputs
+        .first()
+        .is_some_and(|i| i.is_coinbase() || i.prev_index == u32::MAX)
 }
 
 #[cfg(test)]
@@ -665,20 +617,38 @@ mod pin_new_residency_tests {
         assert_eq!(live.len(), 2);
         assert_eq!(live[0].1.script.len(), 64);
         assert_eq!(live[1].1.script.len(), 64);
-        // dense still owned by caller for FIFO; after move to FIFO only need stays in batch.
         assert_eq!(dense.len(), 3);
-        let _fifo = dense; // move away — batch would only keep `live`
+        let _owned = dense;
         assert_eq!(live.len(), 2);
     }
 }
 
 #[cfg(test)]
 mod slim_outs_tests {
-    use super::{slim_dense_outs_to_need, slim_outs_to_need};
+    use super::slim_dense_outs_to_need;
     use rbitcoin_store::OutputRecord;
+    use std::collections::HashSet;
 
     fn o(n: u8) -> OutputRecord {
         OutputRecord::unspent(n as i64, vec![n])
+    }
+
+    /// Keep only outs whose vout is in `need` (unit-test helper for pin slim).
+    fn slim_outs_to_need(
+        outs: Vec<(u32, OutputRecord)>,
+        need: &[u32],
+    ) -> Vec<(u32, OutputRecord)> {
+        if need.is_empty() {
+            return Vec::new();
+        }
+        if need.len() == 1 {
+            let v = need[0];
+            return outs.into_iter().filter(|(vout, _)| *vout == v).collect();
+        }
+        let need_set: HashSet<u32> = need.iter().copied().collect();
+        outs.into_iter()
+            .filter(|(vout, _)| need_set.contains(vout))
+            .collect()
     }
 
     #[test]

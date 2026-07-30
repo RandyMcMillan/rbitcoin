@@ -20,11 +20,11 @@ wrong design — fix the protocol. See `docs/concurrency.md`.
 
 | Rule | Detail |
 |------|--------|
-| Hot pin map | **`CreateResidency`** only on the unified wire path (plan pin + commit denserels seed) |
+| Hot pin map | **`CreateResidency`** only (plan pin + commit denserels seed + prewarm) |
 | Eviction | **Insert-order FIFO** — never read-touch / LRU reorder (one spend ⇏ next spend on same create) |
 | denserels_hit% | **~35–50% is normal** mid/late mainnet IBD (old UTXO spends). Do not chase ≥65% or inflate cache caps for it |
-| OutFifo / sticky | Legacy hangover: not wire pin; sticky may still dual-write fk/range for mirror/prewarm — logs should not present them as the pin cache |
-| IBD sizes | Prefer **residency creates/outs**; do not treat zero `outfifo` as a bug |
+| Removed | **OutFifo** and **archive sticky** are gone — do not reintroduce dual maps |
+| IBD sizes | **`residency creates=/outs=`** is the pin occupancy meter |
 
 See `crates/rbitcoin-query/src/create_residency.rs` module docs.
 
@@ -153,8 +153,6 @@ that shows a clear change after.
 | Forwarder stop | **`emit_archive_job_err`** + **`drain_job_rx_as_err`** |
 | `archive_charged` marker | **`clear_archive_charged`** only (never hygiene-prune) |
 | Confirm plans/headers | **`ConfirmParentCache::advance_tip`** (write `post_commit`) |
-| CreateResidency | FIFO on **`CreateResidency::put_*`** (create/out caps); sole wire pin map |
-| OutFifo outs (legacy) | FIFO on **`OutFifo::insert`** — dual-write hangover; not wire pin |
-| Archive sticky (legacy) | raw FIFO dual-write/prewarm; plan resolve uses CreateResidency |
+| CreateResidency | FIFO on **`CreateResidency::put_*` / `insert_fk_txid_range`** (create/out caps); sole pin map |
 | Ordered maps | **`IbdWorkState::hygiene`** |
 | Body presence | **`BodyPresence::hygiene_retain`** (rejected + charged retained by design) |

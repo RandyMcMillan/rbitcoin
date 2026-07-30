@@ -48,5 +48,5 @@ See the plan catalog (clusters A–K) for the full inventory.
 ## Related code
 
 - Confirm write annotate: `rbitcoin-consensus` `confirm_run::post_commit`
-- Pin / denserels: `rbitcoin-query` `confirm_load`, `BatchParents`, `OutFifo`
+- Pin / denserels: `rbitcoin-query` `confirm_load`, `BatchParents`, `CreateResidency`
 - Abs annotate: `rbitcoin-store` `put_spend_batch_by_abs_meta`

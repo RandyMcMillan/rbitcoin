@@ -676,7 +676,7 @@ pub fn decode_packed_tx(
 /// spender meta (field + flags) within the payload.
 ///
 /// **Spender fields on returned outs are cleared** (same as outs-only denserels
-/// path) so pin/OutFifo never treat pin-time annotations as durable authority.
+/// path) so pin/residency never treat pin-time annotations as durable authority.
 pub fn decode_packed_tx_with_spender_rels(
     raw: &[u8],
 ) -> Result<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>), StoreError> {
@@ -872,7 +872,7 @@ pub fn decode_packed_tx_outs_with_spender_rels_secret(
     Ok((meta, outputs, spender_rels))
 }
 
-/// Strip durable spender annotation from outs (pin / OutFifo content-only).
+/// Strip durable spender annotation from outs (pin / residency content-only).
 #[inline]
 pub fn clear_output_spender_fields(outs: &mut [OutputRecord]) {
     for o in outs {

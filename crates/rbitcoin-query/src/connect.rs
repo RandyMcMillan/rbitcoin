@@ -329,14 +329,8 @@ impl Query {
         tx_fk: Fk,
         out: &mut Vec<ScriptHashRecord>,
     ) -> Result<(), QueryError> {
-        // Prefer CreateResidency outs (sole hot map); legacy OutFifo as fallback.
+        // Prefer CreateResidency outs (sole hot map).
         if let Some((_tx, outputs, _rels, _range)) = self.create_residency.get_outs(tx_fk) {
-            for o in outputs.iter() {
-                out.push(ScriptHashRecord::from_fk(script_hash(&o.script), tx_fk));
-            }
-            return Ok(());
-        }
-        if let Some((_h, _tx, outputs, _ins)) = self.confirm_parents.get_body_for_pin(tx_fk) {
             for o in outputs.iter() {
                 out.push(ScriptHashRecord::from_fk(script_hash(&o.script), tx_fk));
             }

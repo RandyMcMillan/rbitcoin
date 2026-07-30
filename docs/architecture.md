@@ -86,7 +86,7 @@ Crash / tip commit: [`docs/crash-recovery.md`](./crash-recovery.md).
 
 | Class | Role | Mutation style |
 |-------|------|----------------|
-| **A** | Canonical archive: headers, packed txs (`tx.body` / `tx.idx` / segmented `tx.head.*`) | Append bodies; publish via HWM / heads (**allocate-then-publish**) |
+| **A** | Canonical archive: headers, packed txs (`tx.body` / `tx.idx/` / `tx.head/`) | Append bodies; publish via HWM / heads (**allocate-then-publish**) |
 | **B** | Forever-open indexes (e.g. Electrum scripthash) | Append + head updates; may grow forever per key |
 | **C** | Tip / confirmation: `confirmed[]`, `strong_tx`, `tx_height` | Tip advance is the **commit**; may lead/lag slightly across crash |
 
@@ -106,7 +106,7 @@ a LevelDB bag.
 
 ### Identity without fat keys
 
-`tx.head.*` is a **segmented keyless address table** of dense create foreign
+`tx.head/` is a **segmented keyless address table** of dense create foreign
 keys (txid identity verified against body): fixed **25-bit** open-address heads
 with **4 B relative** ids, roll at 80% load / body soft span, and **binary fuse8**
 built only on seal. Open segments always probe; sealed segments are fuse-gated.

@@ -1002,13 +1002,12 @@ impl TxTable {
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         let body = VarTable::open(dir, "tx", TableKind::Tx)?;
         let n_bodies = body.count();
-        let meta = dir.join("tx.head.meta");
         let mut need_rebuild = false;
-        let head = if !meta.exists() {
+        let head = if !crate::segmented_head::head_meta_exists(dir) {
             need_rebuild = n_bodies > 0;
             if need_rebuild {
                 rbitcoin_log::info!(
-                    "store: tx.head.meta missing with {n_bodies} Class A bodies — rebuild segmented head"
+                    "store: tx.head meta missing with {n_bodies} Class A bodies — rebuild segmented head"
                 );
             }
             // Wipe legacy mono head if present so create does not refuse after wipe intent.
@@ -1026,14 +1025,7 @@ impl TxTable {
                             "store: segmented tx.head unreadable ({e}) with {n_bodies} Class A \
                              bodies — recreate + rebuild"
                         );
-                        if let Ok(rd) = std::fs::read_dir(dir) {
-                            for ent in rd.flatten() {
-                                let s = ent.file_name().to_string_lossy().into_owned();
-                                if s == "tx.head.meta" || s.starts_with("tx.head.") {
-                                    let _ = std::fs::remove_file(ent.path());
-                                }
-                            }
-                        }
+                        crate::segmented_head::wipe_segmented_head_files(dir);
                         need_rebuild = true;
                         SegmentedTxHead::create(dir, crate::address_head::default_layout())?
                     } else {
@@ -2865,7 +2857,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Operator recovery: delete `tx.head.meta` (+ segment files) → open rebuilds.
+    /// Operator recovery: delete `tx.head/` (+ legacy flat files) → open rebuilds.
     #[test]
     fn missing_tx_head_rebuilds_from_bodies_on_open() {
         with_env_lock(|| {
@@ -2917,19 +2909,12 @@ mod tests {
             }
 
             // Wipe segmented head meta + files.
-            assert!(dir.join("tx.head.meta").exists());
-            if let Ok(rd) = std::fs::read_dir(&dir) {
-                for ent in rd.flatten() {
-                    let s = ent.file_name().to_string_lossy().into_owned();
-                    if s == "tx.head.meta" || s.starts_with("tx.head.") {
-                        let _ = std::fs::remove_file(ent.path());
-                    }
-                }
-            }
+            assert!(crate::segmented_head::head_meta_exists(&dir));
+            crate::segmented_head::wipe_segmented_head_files(&dir);
 
             let t = TxTable::open(&dir).unwrap();
             assert_eq!(t.count(), 20);
-            assert!(dir.join("tx.head.meta").exists());
+            assert!(crate::segmented_head::head_meta_exists(&dir));
             for i in 1..=20u64 {
                 let mut txid = [0u8; 32];
                 txid[0..8].copy_from_slice(&i.to_le_bytes());
@@ -2961,18 +2946,10 @@ mod tests {
                 let t = create_tiny(&dir);
                 t.flush().unwrap();
             }
-            let _ = std::fs::remove_file(dir.join("tx.head.meta"));
-            if let Ok(rd) = std::fs::read_dir(&dir) {
-                for ent in rd.flatten() {
-                    let s = ent.file_name().to_string_lossy().into_owned();
-                    if s.starts_with("tx.head.") {
-                        let _ = std::fs::remove_file(ent.path());
-                    }
-                }
-            }
+            crate::segmented_head::wipe_segmented_head_files(&dir);
             let t = TxTable::open(&dir).unwrap();
             assert_eq!(t.count(), 0);
-            assert!(dir.join("tx.head.meta").exists());
+            assert!(crate::segmented_head::head_meta_exists(&dir));
             let _ = std::fs::remove_dir_all(&dir);
             std::env::remove_var("RBITCOIN_HEAD_SCALE");
         });

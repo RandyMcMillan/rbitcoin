@@ -1,14 +1,18 @@
 //! Segmented Class A body index (`tx.idx.*`): u32 stride-8 offsets from a
 //! per-segment `body_base`.
 //!
-//! Layout:
+//! Layout (schema 12+ after layout migration):
 //! ```text
 //! store/
-//!   tx.idx.meta              # segment map
-//!   tx.idx.000000            # dense u32 LE stride units
-//!   tx.idx.000001
-//!   …
+//!   tx.idx/
+//!     meta                   # segment map
+//!     000000                 # dense u32 LE stride units
+//!     000001
+//!     …
 //! ```
+//!
+//! **Migration:** flat `tx.idx.meta` + `tx.idx.NNNNNN` are renamed into `tx.idx/`
+//! on open (same meta bytes).
 //!
 //! ```text
 //! abs_start = body_base + (u32_le[i] as u64) * STRIDE
@@ -62,6 +66,7 @@ impl TxIdx {
     pub fn create(dir: &Path, stem: &str) -> Result<Self, StoreError> {
         let dir = dir.to_path_buf();
         let stem = stem.to_string();
+        ensure_idx_layout(&dir, &stem)?;
         // Empty meta (0 segments).
         write_meta(&dir, &stem, &[])?;
         Ok(Self {
@@ -75,6 +80,7 @@ impl TxIdx {
     pub fn open(dir: &Path, stem: &str) -> Result<Self, StoreError> {
         let dir = dir.to_path_buf();
         let stem = stem.to_string();
+        ensure_idx_layout(&dir, &stem)?;
         let descs = read_meta(&dir, &stem)?;
         let mut segs = Vec::with_capacity(descs.len());
         let mut max_id = 0u32;
@@ -468,16 +474,86 @@ struct SegDesc {
     file_id: u32,
 }
 
+/// Directory holding `{stem}.idx` segments + meta (`store/tx.idx/…`).
+#[inline]
+fn idx_root(dir: &Path, stem: &str) -> PathBuf {
+    dir.join(format!("{stem}.idx"))
+}
+
 fn segment_path(dir: &Path, stem: &str, file_id: u32) -> PathBuf {
-    dir.join(format!("{stem}.idx.{file_id:06}"))
+    idx_root(dir, stem).join(format!("{file_id:06}"))
 }
 
 fn meta_path(dir: &Path, stem: &str) -> PathBuf {
+    idx_root(dir, stem).join("meta")
+}
+
+fn flat_meta_path(dir: &Path, stem: &str) -> PathBuf {
     dir.join(format!("{stem}.idx.meta"))
+}
+
+fn flat_segment_path(dir: &Path, stem: &str, file_id: u32) -> PathBuf {
+    dir.join(format!("{stem}.idx.{file_id:06}"))
+}
+
+/// Ensure `tx.idx/` exists; migrate flat `tx.idx.meta` + segment files if present.
+fn ensure_idx_layout(dir: &Path, stem: &str) -> Result<(), StoreError> {
+    let root = idx_root(dir, stem);
+    let new_meta = meta_path(dir, stem);
+    if new_meta.is_file() {
+        return Ok(());
+    }
+    let flat_meta = flat_meta_path(dir, stem);
+    std::fs::create_dir_all(&root).map_err(|e| StoreError::io(&root, e))?;
+    if !flat_meta.is_file() {
+        return Ok(());
+    }
+    // Read flat meta before rename so we know which segment files to move.
+    let descs = read_meta_buf(
+        &std::fs::read(&flat_meta).map_err(|e| StoreError::io(&flat_meta, e))?,
+    )?;
+    let mut moved = 0u32;
+    for d in &descs {
+        let src = flat_segment_path(dir, stem, d.file_id);
+        let dst = segment_path(dir, stem, d.file_id);
+        if src.is_file() {
+            std::fs::rename(&src, &dst).map_err(|e| StoreError::io(&dst, e))?;
+            moved = moved.saturating_add(1);
+        }
+    }
+    // Catch any leftover flat segments (e.g. empty trailing file).
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        let prefix = format!("{stem}.idx.");
+        for ent in rd.flatten() {
+            let name = ent.file_name();
+            let s = name.to_string_lossy();
+            if s == format!("{stem}.idx.meta") {
+                continue;
+            }
+            if let Some(rest) = s.strip_prefix(&prefix) {
+                if rest.chars().all(|c| c.is_ascii_digit()) && rest.len() == 6 {
+                    let dst = root.join(rest);
+                    if !dst.exists() && ent.path().is_file() {
+                        let _ = std::fs::rename(ent.path(), &dst);
+                        moved = moved.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+    std::fs::rename(&flat_meta, &new_meta).map_err(|e| StoreError::io(&new_meta, e))?;
+    rbitcoin_log::info!(
+        "store: migrated {stem}.idx layout → {}/ (segments_moved={moved})",
+        root.display()
+    );
+    Ok(())
 }
 
 fn write_meta(dir: &Path, stem: &str, descs: &[SegDesc]) -> Result<(), StoreError> {
     let path = meta_path(dir, stem);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| StoreError::io(parent, e))?;
+    }
     let mut buf = Vec::with_capacity(META_HEADER_LEN + descs.len() * SEG_DESC_LEN);
     buf.extend_from_slice(&STORE_MAGIC);
     buf.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
@@ -493,7 +569,7 @@ fn write_meta(dir: &Path, stem: &str, descs: &[SegDesc]) -> Result<(), StoreErro
         buf.extend_from_slice(&0u32.to_le_bytes());
     }
     // Atomic-ish replace: write temp + rename.
-    let tmp = path.with_extension("meta.tmp");
+    let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, &buf).map_err(|e| StoreError::io(&tmp, e))?;
     std::fs::rename(&tmp, &path).map_err(|e| StoreError::io(&path, e))?;
     Ok(())
@@ -515,6 +591,10 @@ fn write_meta_from_segs(dir: &Path, stem: &str, segs: &[Segment]) -> Result<(), 
 fn read_meta(dir: &Path, stem: &str) -> Result<Vec<SegDesc>, StoreError> {
     let path = meta_path(dir, stem);
     let buf = std::fs::read(&path).map_err(|e| StoreError::io(&path, e))?;
+    read_meta_buf(&buf)
+}
+
+fn read_meta_buf(buf: &[u8]) -> Result<Vec<SegDesc>, StoreError> {
     if buf.len() < META_HEADER_LEN {
         return Err(StoreError::Corrupt("tx.idx.meta short"));
     }
@@ -595,6 +675,54 @@ mod tests {
         let ranges = idx.record_ranges(1, 6, 6, 16 + 128 + 16 + 8).unwrap();
         assert_eq!(ranges.len(), 6);
         assert_eq!(ranges[0].0, 16);
+        std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
+        // New layout lives under tx.idx/
+        assert!(dir.join("tx.idx").join("meta").is_file());
+        assert!(!dir.join("tx.idx.meta").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrates_flat_idx_layout_on_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-txidx-migrate-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("RBITCOIN_TX_IDX_SOFT_SPAN", "64");
+        {
+            let idx = TxIdx::create(&dir, "tx").unwrap();
+            idx.append_starts(0, &[16u64, 24, 32, 40]).unwrap();
+            idx.append_starts(4, &[16 + 128, 16 + 128 + 16]).unwrap();
+            idx.flush().unwrap();
+        }
+        // Flatten layout back to legacy paths (simulate old datadir).
+        let root = dir.join("tx.idx");
+        assert!(root.is_dir());
+        let meta_new = root.join("meta");
+        let meta_flat = dir.join("tx.idx.meta");
+        std::fs::rename(&meta_new, &meta_flat).unwrap();
+        for ent in std::fs::read_dir(&root).unwrap().flatten() {
+            let name = ent.file_name();
+            let s = name.to_string_lossy();
+            if s.chars().all(|c| c.is_ascii_digit()) {
+                let dst = dir.join(format!("tx.idx.{s}"));
+                std::fs::rename(ent.path(), &dst).unwrap();
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(meta_flat.is_file());
+        assert!(!dir.join("tx.idx").join("meta").exists());
+
+        let idx = TxIdx::open(&dir, "tx").unwrap();
+        assert_eq!(idx.slot_count(), 6);
+        assert_eq!(idx.record_start(1).unwrap(), 16);
+        assert!(dir.join("tx.idx").join("meta").is_file());
+        assert!(!meta_flat.exists());
         std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
         let _ = std::fs::remove_dir_all(&dir);
     }

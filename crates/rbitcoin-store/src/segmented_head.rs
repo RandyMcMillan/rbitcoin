@@ -1,13 +1,17 @@
 //! Segmented Class A `tx.head`: fixed-bits open-address tables + seal-time fuse8.
 //!
-//! Layout:
+//! Layout (after on-open migration from flat files):
 //! ```text
 //! store/
-//!   tx.head.meta                 # segment descriptors
-//!   tx.head.000000               # fixed-bits 4 B relative create ids
-//!   tx.head.000000.fuse8         # sealed binary fuse8 (absent while open)
-//!   …
+//!   tx.head/
+//!     meta                       # segment descriptors
+//!     000000                     # fixed-bits 4 B relative create ids
+//!     000000.fuse8               # sealed binary fuse8 (absent while open)
+//!     …
 //! ```
+//!
+//! **Migration:** flat `tx.head.meta` + `tx.head.NNNNNN`(+`.fuse8`) rename into
+//! `tx.head/` on open.
 //!
 //! **Relative fks:** slot stores `rel` where `0` = empty and
 //! `fk = first_fk + rel - 1` (1-based relative within the segment).
@@ -604,6 +608,12 @@ fn max_keys_for_layout(layout: HeadLayout) -> u64 {
     ((slots as f64) * HEAD_LOAD_START).floor() as u64
 }
 
+/// `store/tx.head/` — segment files + meta live here.
+#[inline]
+fn head_root(dir: &Path) -> PathBuf {
+    dir.join("tx.head")
+}
+
 fn refuse_legacy_mono_head(dir: &Path) -> Result<(), StoreError> {
     let mono = dir.join("tx.head");
     if mono.is_file() {
@@ -611,10 +621,20 @@ fn refuse_legacy_mono_head(dir: &Path) -> Result<(), StoreError> {
             "legacy monolithic tx.head present — reindex required (segmented 25-bit heads)",
         ));
     }
+    // Directory is the **new** segment home. Reject only non-empty dirs that are
+    // not our layout (no `meta`, no pending flat migration).
     if mono.is_dir() {
-        return Err(StoreError::Corrupt(
-            "legacy sharded tx.head/ dir — reindex required",
-        ));
+        let new_meta = mono.join("meta");
+        if !new_meta.is_file() && !dir.join("tx.head.meta").is_file() {
+            let non_empty = std::fs::read_dir(&mono)
+                .map(|rd| rd.filter_map(|e| e.ok()).next().is_some())
+                .unwrap_or(false);
+            if non_empty {
+                return Err(StoreError::Corrupt(
+                    "legacy sharded tx.head/ dir — reindex required",
+                ));
+            }
+        }
     }
     for name in [
         "tx.head.new",
@@ -631,23 +651,109 @@ fn refuse_legacy_mono_head(dir: &Path) -> Result<(), StoreError> {
             let _ = std::fs::remove_file(&p);
         }
     }
+    ensure_head_layout(dir)?;
+    Ok(())
+}
+
+/// Ensure `tx.head/` exists; migrate flat `tx.head.meta` + segment/fuse files.
+fn ensure_head_layout(dir: &Path) -> Result<(), StoreError> {
+    let root = head_root(dir);
+    let new_meta = meta_path(dir);
+    if new_meta.is_file() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&root).map_err(|e| StoreError::io(&root, e))?;
+    let flat_meta = dir.join("tx.head.meta");
+    if !flat_meta.is_file() {
+        return Ok(());
+    }
+    let buf = std::fs::read(&flat_meta).map_err(|e| StoreError::io(&flat_meta, e))?;
+    let (_bits, descs) = read_meta_buf(&buf)?;
+    let mut moved = 0u32;
+    for d in &descs {
+        let src = dir.join(format!("tx.head.{:06}", d.file_id));
+        let dst = segment_head_path(dir, d.file_id);
+        if src.is_file() {
+            std::fs::rename(&src, &dst).map_err(|e| StoreError::io(&dst, e))?;
+            moved = moved.saturating_add(1);
+        }
+        let fsrc = dir.join(format!("tx.head.{:06}.fuse8", d.file_id));
+        let fdst = segment_fuse_path(dir, d.file_id);
+        if fsrc.is_file() {
+            std::fs::rename(&fsrc, &fdst).map_err(|e| StoreError::io(&fdst, e))?;
+        }
+    }
+    // Leftover flat segments not listed (shouldn't happen; best-effort).
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for ent in rd.flatten() {
+            let name = ent.file_name();
+            let s = name.to_string_lossy();
+            if s == "tx.head.meta" {
+                continue;
+            }
+            if let Some(rest) = s.strip_prefix("tx.head.") {
+                let base = rest.strip_suffix(".fuse8").unwrap_or(rest);
+                if base.chars().all(|c| c.is_ascii_digit()) && base.len() == 6 {
+                    let dst = if rest.ends_with(".fuse8") {
+                        root.join(format!("{base}.fuse8"))
+                    } else {
+                        root.join(base)
+                    };
+                    if !dst.exists() && ent.path().is_file() {
+                        let _ = std::fs::rename(ent.path(), &dst);
+                        moved = moved.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+    std::fs::rename(&flat_meta, &new_meta).map_err(|e| StoreError::io(&new_meta, e))?;
+    rbitcoin_log::info!(
+        "store: migrated tx.head layout → {}/ (segments_moved={moved})",
+        root.display()
+    );
     Ok(())
 }
 
 fn segment_head_path(dir: &Path, file_id: u32) -> PathBuf {
-    dir.join(format!("tx.head.{file_id:06}"))
+    head_root(dir).join(format!("{file_id:06}"))
 }
 
 fn segment_fuse_path(dir: &Path, file_id: u32) -> PathBuf {
-    dir.join(format!("tx.head.{file_id:06}.fuse8"))
+    head_root(dir).join(format!("{file_id:06}.fuse8"))
 }
 
 fn meta_path(dir: &Path) -> PathBuf {
-    dir.join("tx.head.meta")
+    head_root(dir).join("meta")
+}
+
+/// True when segmented head meta exists (subdir or pre-migration flat).
+pub fn head_meta_exists(dir: &Path) -> bool {
+    meta_path(dir).is_file() || dir.join("tx.head.meta").is_file()
+}
+
+/// Remove all segmented head files (subdir layout + any leftover flat files).
+pub fn wipe_segmented_head_files(dir: &Path) {
+    let root = head_root(dir);
+    if root.is_dir() {
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    let _ = std::fs::remove_file(dir.join("tx.head.meta"));
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for ent in rd.flatten() {
+            let s = ent.file_name().to_string_lossy().into_owned();
+            if s.starts_with("tx.head.") {
+                let _ = std::fs::remove_file(ent.path());
+            }
+        }
+    }
 }
 
 fn write_meta(dir: &Path, bits: u32, segs: &[(u64, u64, u32, u32)]) -> Result<(), StoreError> {
     let path = meta_path(dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| StoreError::io(parent, e))?;
+    }
     let mut buf = Vec::with_capacity(META_HEADER_LEN + segs.len() * SEG_DESC_LEN);
     buf.extend_from_slice(&STORE_MAGIC);
     buf.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
@@ -663,7 +769,9 @@ fn write_meta(dir: &Path, bits: u32, segs: &[(u64, u64, u32, u32)]) -> Result<()
         buf.extend_from_slice(&flags.to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes());
     }
-    std::fs::write(&path, &buf).map_err(|e| StoreError::io(&path, e))?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &buf).map_err(|e| StoreError::io(&tmp, e))?;
+    std::fs::rename(&tmp, &path).map_err(|e| StoreError::io(&path, e))?;
     Ok(())
 }
 
@@ -680,6 +788,10 @@ fn read_meta(dir: &Path) -> Result<(u32, Vec<SegDesc>), StoreError> {
         return Ok((SEGMENT_HEAD_BITS, Vec::new()));
     }
     let buf = std::fs::read(&path).map_err(|e| StoreError::io(&path, e))?;
+    read_meta_buf(&buf)
+}
+
+fn read_meta_buf(buf: &[u8]) -> Result<(u32, Vec<SegDesc>), StoreError> {
     if buf.len() < META_HEADER_LEN {
         return Err(StoreError::Corrupt("tx.head.meta short"));
     }
@@ -730,6 +842,44 @@ mod tests {
         m[0..8].copy_from_slice(&i.to_le_bytes());
         m[8] = 0xA5;
         m
+    }
+
+    #[test]
+    fn migrates_flat_head_layout_on_open() {
+        let dir = tmp();
+        let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
+        {
+            let h = SegmentedTxHead::create(&dir, layout).unwrap();
+            let mut entries = Vec::new();
+            for i in 0..50u64 {
+                entries.push((mixed(i + 1), Fk(i + 1)));
+            }
+            h.insert_many(&entries, false).unwrap();
+            h.flush().unwrap();
+        }
+        assert!(dir.join("tx.head").join("meta").is_file());
+        // Flatten to legacy flat paths.
+        let root = dir.join("tx.head");
+        std::fs::rename(root.join("meta"), dir.join("tx.head.meta")).unwrap();
+        for ent in std::fs::read_dir(&root).unwrap().flatten() {
+            let name = ent.file_name();
+            let s = name.to_string_lossy();
+            if s == "meta" || s == "meta.tmp" {
+                continue;
+            }
+            let dst = dir.join(format!("tx.head.{s}"));
+            std::fs::rename(ent.path(), &dst).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(dir.join("tx.head.meta").is_file());
+        assert!(!dir.join("tx.head").join("meta").exists());
+
+        let h = SegmentedTxHead::open(&dir).unwrap();
+        let cands = h.probe_candidates(&mixed(7)).unwrap();
+        assert!(cands.iter().any(|f| f.0 == 7), "cands={cands:?}");
+        assert!(dir.join("tx.head").join("meta").is_file());
+        assert!(!dir.join("tx.head.meta").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -824,7 +824,7 @@ mod tests {
         assert!(t.get_raw(Fk(2)).unwrap().len() >= 16);
         // Corrupt meta magic.
         {
-            let meta = dir.join("tx.idx.meta");
+            let meta = dir.join("tx.idx").join("meta");
             std::fs::write(&meta, b"XXXX").unwrap();
         }
         assert!(matches!(

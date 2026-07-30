@@ -387,14 +387,26 @@ pub async fn ibd_cancellable(
     } else {
         0
     }));
-    // Linear residency prewarm from last N Class A tx.idx rows before any archive work.
-    // Avoids multi-second head resolve storms after cold restart.
+    // Startup caches: Class A ranges + bounded denserels + tip-ahead header plans.
+    // Avoids head-resolve storms and cold first confirm batches after restart.
     match hub.query.archive_residency_prewarm() {
-        Ok((loaded, ms)) => {
+        Ok(st) => {
             let (len, create_cap, outs, out_cap) = hub.query.create_residency().size_stats();
             info!(
-                "ibd: residency prewarm loaded={loaded} creates={len}/{create_cap} outs={outs}/{out_cap} in {ms}ms \
-                 (last min(cap,tx_count) via sequential tx.idx)"
+                "ibd: residency prewarm ranges={ranges} denserels={den_c} outs={outs}/{out_cap} \
+                 header_plans={hdr} creates={len}/{create_cap} in {ms}ms \
+                 (range={rms}ms denserels={dms}ms headers={hms}ms)",
+                ranges = st.ranges,
+                den_c = st.denserels_creates,
+                outs = outs,
+                out_cap = out_cap,
+                hdr = st.header_plans,
+                len = len,
+                create_cap = create_cap,
+                ms = st.ms,
+                rms = st.range_ms,
+                dms = st.denserels_ms,
+                hms = st.headers_ms,
             );
         }
         Err(e) => {

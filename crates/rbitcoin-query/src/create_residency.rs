@@ -262,6 +262,19 @@ impl CreateResidency {
         Some((tx, outs, rels, e.body_range))
     }
 
+    /// True if denserels/outs are resident (no clone). Used by prewarm skip.
+    pub fn has_outs(&self, fk: Fk) -> bool {
+        let Some(id) = fk.get() else {
+            return false;
+        };
+        self.inner
+            .lock()
+            .unwrap()
+            .by_fk
+            .get(&id)
+            .is_some_and(|e| e.outs.is_some())
+    }
+
     /// Sparse pin hit: clone only `need_vouts` scripts + denserel slots (not full outs).
     ///
     /// Returns `None` when row missing, denserels incomplete, or a need vout is OOB.

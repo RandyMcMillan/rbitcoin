@@ -229,6 +229,11 @@ impl ConfirmParentCache {
     pub fn plan_count(&self) -> usize {
         self.inner.lock().unwrap().plans.len()
     }
+
+    /// Number of cached header + tx_fks plans (prewarm / load occupancy).
+    pub fn header_plan_count(&self) -> usize {
+        self.inner.lock().unwrap().headers.len()
+    }
 }
 
 impl Inner {

@@ -6,13 +6,42 @@
 //!   **CreateResidency** + in-flight planned creates + `tx.head` resolve, stamp inputs.
 //! - **Commit** ([`Query::archive_commit_plan`]): store **writes** — body append,
 //!   head index, header_txs, residency denserels seed.
-//! - **Prewarm** ([`Query::archive_residency_prewarm`]): bulk last-N `body_txid_range`
-//!   fill of CreateResidency before the pipeline starts.
+//! - **Prewarm** ([`Query::archive_residency_prewarm`]): startup cache fill —
+//!   last-N `body_txid_range` ranges, bounded denserels (`OutsDenserels`), and
+//!   tip-ahead confirm header plans — before the IBD pipeline starts.
 //!
 //! Overlap requires the in-flight map: a later mega-batch may spend outputs from a
 //! prior plan that is still queued/committing (not yet in residency/head).
 
 use super::*;
+
+/// Cap on denserels body loads during startup prewarm (not full create_cap).
+///
+/// Full denserels for 8M creates is multi-minute IO + RAM; mid/late mainnet pin
+/// miss rate is structural (~35–50%). Bound recent denserels so first batches
+/// are warm without a multi-GiB startup tax.
+pub const PREWARM_DENSERELS_MAX_CREATES: usize = 262_144;
+
+/// Max tip-ahead header plans seeded at startup (MTP / header_txs cache).
+pub const PREWARM_HEADER_PLANS_MAX: usize = 4_096;
+
+/// Stats from [`Query::archive_residency_prewarm`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ResidencyPrewarmStats {
+    /// Range-only CreateResidency rows (fk/txid/body_range).
+    pub ranges: usize,
+    /// Creates that received denserels/outs this prewarm.
+    pub denserels_creates: usize,
+    /// Residency `total_outs` after denserels phase.
+    pub denserels_outs: u64,
+    /// Confirm header plans cached (tip-ahead Class A prefix).
+    pub header_plans: usize,
+    pub range_ms: u64,
+    pub denserels_ms: u64,
+    pub headers_ms: u64,
+    /// End-to-end wall.
+    pub ms: u64,
+}
 
 /// Write-ready mega-batch from plan (prep) to commit (writer).
 ///
@@ -414,45 +443,196 @@ impl Query {
         })
     }
 
-    /// Prewarm CreateResidency with last `cap` Class A bodies via sequential
-    /// `tx.idx` (bulk `body_txid_range`).
+    /// Startup cache prewarm: ranges + bounded denserels + tip-ahead header plans.
     ///
-    /// Call once before IBD so cold restarts avoid a head resolve storm.
-    /// Returns `(loaded, elapsed_ms)`.
-    pub fn archive_residency_prewarm(&self) -> Result<(usize, u64), QueryError> {
+    /// Call once before IBD so cold restarts avoid head-resolve storms and the
+    /// first confirm batches are not fully cold.
+    ///
+    /// Phases (all process-local; no durable writes):
+    /// 1. **Ranges** — last `create_cap` Class A via sequential `tx.idx`
+    ///    (`body_txid_range` + body range batch). Cheap, fills create_cap.
+    /// 2. **Header plans** — tip+1..tip+N work path with Class A bodies into
+    ///    [`ConfirmParentCache`] (header + `header_txs` + prev_hash).
+    /// 3. **Denserels** — `OutsDenserels` body decode into CreateResidency for
+    ///    tip-window creates first, then newest Class A fill. Stops at
+    ///    [`PREWARM_DENSERELS_MAX_CREATES`] or ~⅞ of `out_cap` (leave headroom
+    ///    for commit seed). Never loads full create_cap denserels.
+    pub fn archive_residency_prewarm(&self) -> Result<ResidencyPrewarmStats, QueryError> {
         use std::time::Instant;
         let t0 = Instant::now();
+        let mut st = ResidencyPrewarmStats::default();
+
+        // ── 1. Range-only CreateResidency fill ────────────────────────────
+        let t_range = Instant::now();
         let cap = self.create_residency.size_stats().1;
         let n = self.store.txs.count();
-        if n == 0 || cap == 0 {
-            return Ok((0, t0.elapsed().as_millis() as u64));
-        }
-        // Last `min(cap, n)` fks: (n-cap+1)..=n (1-based).
-        let start = n.saturating_sub(cap as u64).saturating_add(1).max(1);
-        const CHUNK: u64 = 8192;
-        let mut loaded = 0usize;
-        let mut cur = start;
-        while cur <= n {
-            let end = (cur + CHUNK - 1).min(n);
-            let txids = self.store.txs.body_txid_range(cur, end)?;
-            debug_assert_eq!(txids.len() as u64, end - cur + 1);
-            let fks: Vec<Fk> = (cur..=end).map(Fk).collect();
-            let ranges = self.store.tx_body_range_batch(&fks)?;
-            for ((txid, fk), range) in txids
-                .into_iter()
-                .zip(fks.into_iter())
-                .zip(ranges.into_iter())
-            {
-                let Some((off, len)) = range else {
-                    continue;
-                };
-                self.create_residency
-                    .insert_fk_txid_range(fk, txid, Some((off, len)));
-                loaded = loaded.saturating_add(1);
+        if n > 0 && cap > 0 {
+            // Last `min(cap, n)` fks: (n-cap+1)..=n (1-based).
+            let start = n.saturating_sub(cap as u64).saturating_add(1).max(1);
+            const CHUNK: u64 = 8192;
+            let mut cur = start;
+            while cur <= n {
+                let end = (cur + CHUNK - 1).min(n);
+                let txids = self.store.txs.body_txid_range(cur, end)?;
+                debug_assert_eq!(txids.len() as u64, end - cur + 1);
+                let fks: Vec<Fk> = (cur..=end).map(Fk).collect();
+                let ranges = self.store.tx_body_range_batch(&fks)?;
+                for ((txid, fk), range) in txids
+                    .into_iter()
+                    .zip(fks.into_iter())
+                    .zip(ranges.into_iter())
+                {
+                    let Some((off, len)) = range else {
+                        continue;
+                    };
+                    self.create_residency
+                        .insert_fk_txid_range(fk, txid, Some((off, len)));
+                    st.ranges = st.ranges.saturating_add(1);
+                }
+                cur = end + 1;
             }
-            cur = end + 1;
         }
-        Ok((loaded, t0.elapsed().as_millis() as u64))
+        st.range_ms = t_range.elapsed().as_millis() as u64;
+
+        // ── 2. Tip-ahead header plans ─────────────────────────────────────
+        let t_hdr = Instant::now();
+        let mut tip_window_fks: Vec<Fk> = Vec::new();
+        if let Some(tip_h) = self.tip_height().map(|h| h.0) {
+            if let Some(tip_fk) = self.tip_header_fk()? {
+                let tip_rec = self.store.get_header(tip_fk)?;
+                let path = self.resume_work_path_after_tip(
+                    tip_rec.hash,
+                    tip_h,
+                    PREWARM_HEADER_PLANS_MAX,
+                )?;
+                // Seed tip so advance GC baseline matches confirmed tip.
+                self.confirm_parents.advance_tip(tip_h);
+                for e in &path {
+                    if !e.has_body {
+                        // Contiguous Class A prefix only — stop at first hole.
+                        break;
+                    }
+                    if !self.store.header_txs.has_body(e.header_fk)? {
+                        break;
+                    }
+                    let Some(tx_fks) = self.store.header_txs.get_list(e.header_fk)? else {
+                        break;
+                    };
+                    if tx_fks.is_empty() {
+                        break;
+                    }
+                    let header_rec = self.store.get_header(e.header_fk)?;
+                    let prev_hash = if header_rec.prev_fk.is_null() {
+                        [0u8; 32]
+                    } else {
+                        match self.store.get_header(header_rec.prev_fk) {
+                            Ok(prev) => prev.hash,
+                            Err(_) => break,
+                        }
+                    };
+                    self.confirm_parents.put_header_plan(
+                        e.height,
+                        e.header_fk,
+                        header_rec,
+                        tx_fks.clone(),
+                        prev_hash,
+                    );
+                    self.confirm_parents.ensure_plan(e.height, e.hash);
+                    tip_window_fks.extend(tx_fks.into_iter().filter(|f| f.get().is_some()));
+                    st.header_plans = st.header_plans.saturating_add(1);
+                }
+            }
+        }
+        st.headers_ms = t_hdr.elapsed().as_millis() as u64;
+
+        // ── 3. Bounded denserels (tip-window first, then recent fill) ──────
+        let t_den = Instant::now();
+        let mut denserels_budget = PREWARM_DENSERELS_MAX_CREATES;
+        let out_stop = {
+            let (_, _, _, out_cap) = self.create_residency.size_stats();
+            // Leave ~⅛ out_cap for commit seed; never thrash the out FIFO full.
+            out_cap.saturating_mul(7) / 8
+        };
+
+        // Prefer creates that first confirm batches will touch.
+        tip_window_fks.sort_unstable_by_key(|f| f.0);
+        tip_window_fks.dedup();
+        denserels_budget = denserels_budget.saturating_sub(self.prewarm_denserels_fks(
+            &tip_window_fks,
+            denserels_budget,
+            out_stop,
+            &mut st,
+        )?);
+
+        // Fill remaining budget with newest Class A (oldest→newest in window so
+        // newest lands last on outs_order and survives out slim longer).
+        if denserels_budget > 0 && n > 0 {
+            let fill_n = denserels_budget.min(n as usize) as u64;
+            let start = n.saturating_sub(fill_n).saturating_add(1).max(1);
+            const CHUNK: u64 = 4096;
+            let mut cur = start;
+            while cur <= n && denserels_budget > 0 {
+                let (_, _, total_outs, _) = self.create_residency.size_stats();
+                if total_outs >= out_stop {
+                    break;
+                }
+                let end = (cur + CHUNK - 1).min(n);
+                let fks: Vec<Fk> = (cur..=end).map(Fk).collect();
+                let used = self.prewarm_denserels_fks(&fks, denserels_budget, out_stop, &mut st)?;
+                denserels_budget = denserels_budget.saturating_sub(used);
+                cur = end + 1;
+            }
+        }
+        st.denserels_ms = t_den.elapsed().as_millis() as u64;
+        let (_, _, total_outs, _) = self.create_residency.size_stats();
+        st.denserels_outs = total_outs;
+        st.ms = t0.elapsed().as_millis() as u64;
+        Ok(st)
+    }
+
+    /// Load denserels for `fks` via combined path until budget or out stop.
+    /// Returns how many creates successfully received denserels this call.
+    fn prewarm_denserels_fks(
+        &self,
+        fks: &[Fk],
+        budget: usize,
+        out_stop: u64,
+        st: &mut ResidencyPrewarmStats,
+    ) -> Result<usize, QueryError> {
+        if fks.is_empty() || budget == 0 {
+            return Ok(0);
+        }
+        let (_, _, total_outs, _) = self.create_residency.size_stats();
+        if total_outs >= out_stop {
+            return Ok(0);
+        }
+        // Skip creates that already hold denserels (commit seed / prior chunk).
+        let need: Vec<Fk> = fks
+            .iter()
+            .copied()
+            .filter(|fk| fk.get().is_some() && !self.create_residency.has_outs(*fk))
+            .take(budget)
+            .collect();
+        if need.is_empty() {
+            return Ok(0);
+        }
+        const CHUNK: usize = 4096;
+        let mut loaded = 0usize;
+        for chunk in need.chunks(CHUNK) {
+            let (_, _, total_outs, _) = self.create_residency.size_stats();
+            if total_outs >= out_stop {
+                break;
+            }
+            let creates = crate::combined_stage::load_creates_once(
+                &self.store,
+                &self.create_residency,
+                chunk,
+                rbitcoin_store::IdxBodyMode::OutsDenserels,
+            )?;
+            loaded = loaded.saturating_add(creates.len());
+            st.denserels_creates = st.denserels_creates.saturating_add(creates.len());
+        }
+        Ok(loaded)
     }
 
     /// **Writer / write path:** durable Class A put + residency denserels seed.
@@ -919,9 +1099,21 @@ mod tests {
         assert_eq!(q.tx_body_count(), 50);
         assert_eq!(q.create_residency().len(), 0);
 
-        let (loaded, _ms) = q.archive_residency_prewarm().unwrap();
-        assert_eq!(loaded, 50);
+        let st = q.archive_residency_prewarm().unwrap();
+        assert_eq!(st.ranges, 50);
         assert_eq!(q.create_residency().len(), 50);
+        // No tip → no header plans; denserels still fill recent creates.
+        assert_eq!(st.header_plans, 0);
+        assert!(
+            st.denserels_creates > 0 && st.denserels_outs > 0,
+            "prewarm must load denserels: denserels_creates={} outs={}",
+            st.denserels_creates,
+            st.denserels_outs
+        );
+        assert!(
+            q.create_residency().has_outs(Fk(50)),
+            "newest create should hold denserels after prewarm"
+        );
 
         let mut last_txid = [0u8; 32];
         last_txid[0..8].copy_from_slice(&50u64.to_le_bytes());
@@ -951,14 +1143,87 @@ mod tests {
             .txs
             .put_full_batch_indexed(&packed, false)
             .unwrap();
-        let (loaded, _) = q.archive_residency_prewarm().unwrap();
-        assert_eq!(loaded, 5);
+        let st = q.archive_residency_prewarm().unwrap();
+        assert_eq!(st.ranges, 5);
         let t1 = coinbase_apply(1).tx.txid;
         let t5 = coinbase_apply(5).tx.txid;
         assert_eq!(q.create_residency().lookup_fk_by_txid(&t1), Some(Fk(1)));
         assert_eq!(q.create_residency().lookup_fk_by_txid(&t5), Some(Fk(5)));
         assert!(q.create_residency().body_ranges_by_fk(&[Fk(1)])[0].is_some());
         assert!(q.create_residency().body_ranges_by_fk(&[Fk(5)])[0].is_some());
+        assert!(q.create_residency().has_outs(Fk(1)));
+        assert!(q.create_residency().has_outs(Fk(5)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tip-ahead Class A path must seed ConfirmParentCache header plans.
+    #[test]
+    fn residency_prewarm_seeds_tip_ahead_header_plans() {
+        use crate::Height;
+        use rbitcoin_store::HeaderRecord;
+
+        let (dir, q) = temp_query("prewarm-hdr-plans");
+        // Confirm genesis.
+        let mut hash0 = [0u8; 32];
+        hash0[0] = 0xa0;
+        let h0 = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207f_ffff,
+            nonce: 0,
+            merkle_root: hash0,
+            hash: hash0,
+        };
+        q.connect_block(Height(0), &h0, &[coinbase_apply(1)])
+            .expect("connect genesis");
+        assert_eq!(q.tip_height(), Some(Height(0)));
+        let mut prev = q.tip_header_fk().unwrap().unwrap();
+
+        // Archive tip+1 and tip+2 without confirming (Class A ahead of tip).
+        for h in 1..=2u32 {
+            let mut hash = [0u8; 32];
+            hash[0] = 0xa0 + h as u8;
+            let header = HeaderRecord {
+                prev_fk: prev,
+                version: 1,
+                timestamp: 1 + h,
+                bits: 0x207f_ffff,
+                nonce: h,
+                merkle_root: hash,
+                hash,
+            };
+            prev = q
+                .archive_block(&header, &[coinbase_apply((h as u64) + 10)])
+                .expect("archive ahead");
+        }
+
+        let st = q.archive_residency_prewarm().unwrap();
+        assert!(
+            st.header_plans >= 2,
+            "expected tip-ahead header plans, got {}",
+            st.header_plans
+        );
+        assert!(
+            q.confirm_parent_cache().get_header_plan(1).is_some(),
+            "height 1 plan missing"
+        );
+        assert!(
+            q.confirm_parent_cache().get_header_plan(2).is_some(),
+            "height 2 plan missing"
+        );
+        // Archive commit already denserels-seeds its creates; prewarm may load 0
+        // additional denserels but residency outs must be non-zero either way.
+        assert!(
+            st.denserels_outs > 0,
+            "residency outs after prewarm must be >0 (got denserels_creates={} outs={})",
+            st.denserels_creates,
+            st.denserels_outs
+        );
+        assert!(
+            st.ranges >= 3,
+            "range prewarm should cover genesis + ahead creates"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

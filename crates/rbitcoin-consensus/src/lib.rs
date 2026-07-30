@@ -164,6 +164,16 @@ pub mod confirm_phase_stats {
     /// Wire path: structure + plan Class A + pin parents (stops before assemble).
     /// Full prep wall ≈ `LOAD_NS` + [`CONNECT_NS`] (assemble).
     pub static LOAD_NS: AtomicU64 = AtomicU64::new(0);
+    /// Wire prep sub: `Arc::new(block.clone())` (target for Arc handoff).
+    pub static PREP_WIRE_ARC_NS: AtomicU64 = AtomicU64::new(0);
+    /// Wire prep sub: structure + softfork shape checks.
+    pub static PREP_STRUCT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Wire prep sub: header validate/put + parent-cache header plan seed.
+    pub static PREP_HEADER_NS: AtomicU64 = AtomicU64::new(0);
+    /// Wire prep sub: `prepare_block_for_archive` (tx apply packing).
+    pub static PREP_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Wire prep sub: filter need + plan mega + meta/tx_fks wiring (not pin).
+    pub static PREP_FILTER_PLAN_NS: AtomicU64 = AtomicU64::new(0);
     /// Unpin spent outs from ConfirmParentCache after Class C.
     pub static UNPIN_NS: AtomicU64 = AtomicU64::new(0);
     /// `advance_parent_cache_tip` (drop bodies / GC parents).
@@ -245,6 +255,21 @@ pub mod confirm_phase_stats {
         (
             CLASS_A_NS.swap(0, Ordering::Relaxed),
             ENSURE_LAYOUT_NS.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    /// Wire-prep residual subtimers (ns): `(wire_arc, struct, header, prepare, filter_plan)`.
+    ///
+    /// These sit inside [`LOAD_NS`] but outside pin (confirm_load_stats). Pin and
+    /// assemble remain separate (`PARENT_PIN_NS` / [`CONNECT_NS`]).
+    #[inline]
+    pub fn sample_prep_residual_and_reset() -> (u64, u64, u64, u64, u64) {
+        (
+            PREP_WIRE_ARC_NS.swap(0, Ordering::Relaxed),
+            PREP_STRUCT_NS.swap(0, Ordering::Relaxed),
+            PREP_HEADER_NS.swap(0, Ordering::Relaxed),
+            PREP_PREPARE_NS.swap(0, Ordering::Relaxed),
+            PREP_FILTER_PLAN_NS.swap(0, Ordering::Relaxed),
         )
     }
 
@@ -634,10 +659,20 @@ mod coverage_tests {
         assert_eq!(s.1, 7);
         let (ca, en) = sample_class_a_ensure_and_reset();
         assert_eq!((ca, en), (9, 11));
+        PREP_WIRE_ARC_NS.store(3, Ordering::Relaxed);
+        PREP_STRUCT_NS.store(4, Ordering::Relaxed);
+        PREP_HEADER_NS.store(5, Ordering::Relaxed);
+        PREP_PREPARE_NS.store(6, Ordering::Relaxed);
+        PREP_FILTER_PLAN_NS.store(7, Ordering::Relaxed);
+        assert_eq!(
+            sample_prep_residual_and_reset(),
+            (3, 4, 5, 6, 7)
+        );
         // second sample zeros
         let s2 = sample_and_reset();
         assert_eq!(s2.0, 0);
         assert_eq!(sample_class_a_ensure_and_reset(), (0, 0));
+        assert_eq!(sample_prep_residual_and_reset(), (0, 0, 0, 0, 0));
     }
 
     #[test]

@@ -94,6 +94,16 @@ pub(crate) struct IbdPerfSample {
     pub spend_skip: u64,
     pub resolve_ms: u64,
     pub load_ms: u64,
+    /// Wire prep residual (inside load/pre_asm, outside pin): Arc clone.
+    pub prep_wire_arc_ms: u64,
+    /// Structure validate.
+    pub prep_struct_ms: u64,
+    /// Header validate/put + cache seed.
+    pub prep_header_ms: u64,
+    /// prepare_block_for_archive.
+    pub prep_prepare_ms: u64,
+    /// filter need + plan mega + tx_fks wiring.
+    pub prep_filter_plan_ms: u64,
     pub cache_tip_ms: u64,
     // raw ns for us/blk
     pub recon_ns: u64,
@@ -276,6 +286,11 @@ impl Default for IbdPerfSample {
             spend_skip: 0,
             resolve_ms: 0,
             load_ms: 0,
+            prep_wire_arc_ms: 0,
+            prep_struct_ms: 0,
+            prep_header_ms: 0,
+            prep_prepare_ms: 0,
+            prep_filter_plan_ms: 0,
             cache_tip_ms: 0,
             recon_ns: 0,
             wire_ns: 0,
@@ -541,6 +556,8 @@ pub(crate) fn sample(
     ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
     let (class_a_ns, ensure_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_class_a_ensure_and_reset();
+    let (prep_wire_arc_ns, prep_struct_ns, prep_header_ns, prep_prepare_ns, prep_filter_plan_ns) =
+        rbitcoin_consensus::confirm_phase_stats::sample_prep_residual_and_reset();
     let (sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head) =
         rbitcoin_query::class_c_phase_stats::sample_sh_sub_and_reset();
     let (wf_body_store, wf_store_body_ns) =
@@ -601,6 +618,11 @@ pub(crate) fn sample(
         spend_skip,
         resolve_ms: ns_ms(resolve_ns),
         load_ms: ns_ms(load_ns),
+        prep_wire_arc_ms: ns_ms(prep_wire_arc_ns),
+        prep_struct_ms: ns_ms(prep_struct_ns),
+        prep_header_ms: ns_ms(prep_header_ns),
+        prep_prepare_ms: ns_ms(prep_prepare_ns),
+        prep_filter_plan_ms: ns_ms(prep_filter_plan_ns),
         cache_tip_ms: ns_ms(cache_tip_ns),
         recon_ns,
         wire_ns,
@@ -831,12 +853,18 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     // Non-pin residual inside pre-assemble: LOAD − pin (structure + plan mega + …).
     let pre_assemble = s.load_ms;
     out.push_str(&format!(
-        " | prep blks={} total={}ms pre_asm={}ms(plan_mega={}ms pin={}ms) assemble={}ms \
+        " | prep blks={} total={}ms pre_asm={}ms(wire_arc={}ms struct={}ms header={}ms prepare={}ms \
+         filter_plan={}ms plan_mega={}ms pin={}ms) assemble={}ms \
          pin(plan={}ms res={}ms cold_io={}ms cold_dec={}ms) \
          pin_hit%={} denserels_hit%={} pin_plan={} pin_res={} pin_new={} body_io={} parent_io={}",
         s.load_blocks,
         prep_ms,
         pre_assemble,
+        s.prep_wire_arc_ms,
+        s.prep_struct_ms,
+        s.prep_header_ms,
+        s.prep_prepare_ms,
+        s.prep_filter_plan_ms,
         plan_mega,
         s.load_parent_pin_ms,
         s.connect_ms,
@@ -1399,6 +1427,8 @@ mod tests {
         assert!(line.contains("class_a_sub(body=7 head=2"), "{line}");
         assert!(line.contains("pre_asm=30ms"), "{line}");
         assert!(line.contains("assemble=8ms"), "{line}");
+        assert!(line.contains("wire_arc="), "{line}");
+        assert!(line.contains("prepare="), "{line}");
         assert!(line.contains("pin_win=40ms"), "{line}");
         // pin_hit% = 8/(8+12) = 40; denserels_hit% = 3/(3+12) = 20
         assert!(line.contains("pin_hit%=40"), "{line}");

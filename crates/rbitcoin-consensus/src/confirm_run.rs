@@ -304,6 +304,10 @@ pub fn confirm_wire_prep_phase_pipelined(
 
     let t_work = Instant::now();
     let t_load = Instant::now();
+    let mut ns_wire_arc = 0u64;
+    let mut ns_struct = 0u64;
+    let mut ns_header = 0u64;
+    let mut ns_prepare = 0u64;
 
     let mut with_fk: Vec<(
         rbitcoin_primitives::Fk,
@@ -322,12 +326,17 @@ pub fn confirm_wire_prep_phase_pipelined(
 
     for (i, (height, block)) in blocks.iter().enumerate() {
         // One owned clone into Arc; later pipeline stages only bump the refcount.
+        let t = Instant::now();
         let block = Arc::new(block.clone());
+        ns_wire_arc = ns_wire_arc.saturating_add(t.elapsed().as_nanos() as u64);
         let hash = block.block_hash().to_byte_array();
         let ctx = ValidationContext::at(params, *height, milestone);
+        let t = Instant::now();
         let _ = crate::block::validate_block_structure_hashed(block.as_ref(), &ctx)?;
+        ns_struct = ns_struct.saturating_add(t.elapsed().as_nanos() as u64);
         // First height must sit at pipeline path_lo (store tip+1, or last prepped+1).
         // Later heights in the same batch validate against prior wire, not store tip.
+        let t = Instant::now();
         if i == 0 {
             if height.0 != path_lo {
                 return Err(ConsensusError::BadPrev);
@@ -365,9 +374,13 @@ pub fn confirm_wire_prep_phase_pipelined(
                 .validate_pow(target)
                 .map_err(|_| ConsensusError::InvalidPow)?;
         }
+        ns_header = ns_header.saturating_add(t.elapsed().as_nanos() as u64);
 
+        let t = Instant::now();
         let (header_rec, txs) =
             crate::prepare_block_for_archive(query, params, block.as_ref())?;
+        ns_prepare = ns_prepare.saturating_add(t.elapsed().as_nanos() as u64);
+        let t = Instant::now();
         let header_fk = if let Some((fk, _)) = query
             .get_header_by_hash(&header_rec.hash)
             .map_err(ConsensusError::Store)?
@@ -386,6 +399,7 @@ pub fn confirm_wire_prep_phase_pipelined(
             Vec::new(),
             block.header.prev_blockhash.to_byte_array(),
         );
+        ns_header = ns_header.saturating_add(t.elapsed().as_nanos() as u64);
         with_fk.push((header_fk, header_rec.clone(), txs));
         wire_blocks.push(block);
         metas.push(BodyMeta {
@@ -397,6 +411,7 @@ pub fn confirm_wire_prep_phase_pipelined(
         });
     }
 
+    let t_fp = Instant::now();
     let (_header_fks, mut need) = query
         .archive_filter_need_bodies(&mut with_fk)
         .map_err(ConsensusError::Store)?;
@@ -481,6 +496,7 @@ pub fn confirm_wire_prep_phase_pipelined(
         }
         Some(plan)
     };
+    let ns_filter_plan = t_fp.elapsed().as_nanos() as u64;
 
     let inflight_outs = pipeline.map(|p| p.in_flight_outs.as_ref());
     let (batch_parents, batch_thin) =
@@ -490,6 +506,21 @@ pub fn confirm_wire_prep_phase_pipelined(
         t_load.elapsed().as_nanos() as u64,
         Ordering::Relaxed,
     );
+    if ns_wire_arc > 0 {
+        confirm_phase_stats::PREP_WIRE_ARC_NS.fetch_add(ns_wire_arc, Ordering::Relaxed);
+    }
+    if ns_struct > 0 {
+        confirm_phase_stats::PREP_STRUCT_NS.fetch_add(ns_struct, Ordering::Relaxed);
+    }
+    if ns_header > 0 {
+        confirm_phase_stats::PREP_HEADER_NS.fetch_add(ns_header, Ordering::Relaxed);
+    }
+    if ns_prepare > 0 {
+        confirm_phase_stats::PREP_PREPARE_NS.fetch_add(ns_prepare, Ordering::Relaxed);
+    }
+    if ns_filter_plan > 0 {
+        confirm_phase_stats::PREP_FILTER_PLAN_NS.fetch_add(ns_filter_plan, Ordering::Relaxed);
+    }
 
     let prepared = assemble_run(
         query,

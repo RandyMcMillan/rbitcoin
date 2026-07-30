@@ -79,7 +79,7 @@ pub use sorted_run::{
 pub use store::Store;
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};
 pub use block_queue::{
-    BlockQueue, QueuedBlock, DEFAULT_BLOCK_QUEUE_BUDGET_BYTES,
+    BlockQueue, QueuedBlock, QueuedBlockMeta, DEFAULT_BLOCK_QUEUE_BUDGET_BYTES,
 };
 pub use store_secret::{StoreSecret, SECRET_FILE, SECRET_LEN};
 pub use head_resolve_stats::Sample as HeadResolveSample;

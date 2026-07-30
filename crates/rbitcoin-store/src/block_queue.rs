@@ -28,7 +28,7 @@ const REC_MAGIC: &[u8; 4] = b"BQR1";
 /// Default durable queue budget: 8 GiB of payload.
 pub const DEFAULT_BLOCK_QUEUE_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-/// One durable queued block.
+/// One durable queued block (full payload — expensive for multi‑GiB queues).
 #[derive(Debug, Clone)]
 pub struct QueuedBlock {
     pub id: u64,
@@ -36,6 +36,19 @@ pub struct QueuedBlock {
     pub hash: [u8; 32],
     pub header_fk: u64,
     pub payload: Vec<u8>,
+}
+
+/// Index-only view of a durable queue entry (no payload IO).
+///
+/// Prefer this for restart rehydrate / status: height/hash/header_fk/payload_len
+/// live in the in-memory index after open (headers only on disk scan).
+#[derive(Debug, Clone, Copy)]
+pub struct QueuedBlockMeta {
+    pub id: u64,
+    pub height: u32,
+    pub hash: [u8; 32],
+    pub header_fk: u64,
+    pub payload_len: u64,
 }
 
 /// On-disk FIFO of block payloads (append + delete-by-id).
@@ -290,7 +303,29 @@ impl BlockQueue {
         Ok(n)
     }
 
-    /// Load every queued block (restart replay, ascending id).
+    /// Index-only listing (ascending id). **No payload read** — O(n) over the
+    /// in-memory index after open.
+    ///
+    /// Production IBD restart must use this (or equivalent meta walk), **not**
+    /// [`Self::load_all`], which materializes multi‑GiB of wire into heap.
+    pub fn list_meta(&self) -> Vec<QueuedBlockMeta> {
+        self.index
+            .iter()
+            .map(|(&id, e)| QueuedBlockMeta {
+                id,
+                height: e.height,
+                hash: e.hash,
+                header_fk: e.header_fk,
+                payload_len: e.payload_len,
+            })
+            .collect()
+    }
+
+    /// Load every queued block with full payload (tests / tools only).
+    ///
+    /// **Do not call on production multi‑GiB queues** — peak RAM ≈ disk fill.
+    /// Prefer [`Self::list_meta`] + [`Self::get`] / [`Self::get_by_height`] for
+    /// single heights (confirm prep).
     pub fn load_all(&self) -> Result<Vec<QueuedBlock>, StoreError> {
         let mut out = Vec::with_capacity(self.index.len());
         for &id in self.index.keys() {
@@ -460,6 +495,24 @@ mod tests {
         assert_eq!(hs, vec![1, 2]);
         q.dequeue(id1).unwrap();
         assert_eq!(q.peek_oldest_id(), Some(id2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_meta_no_payload_io() {
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let big = vec![0xABu8; 2 * 1024 * 1024];
+        let id = q.enqueue(9, [0x11u8; 32], 3, &big).unwrap();
+        let meta = q.list_meta();
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].id, id);
+        assert_eq!(meta[0].height, 9);
+        assert_eq!(meta[0].hash, [0x11u8; 32]);
+        assert_eq!(meta[0].header_fk, 3);
+        assert_eq!(meta[0].payload_len, big.len() as u64);
+        // Still on disk; get still works for prep path.
+        assert_eq!(q.get(id).unwrap().unwrap().payload, big);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1092,7 +1092,20 @@ impl Query {
         Ok((n, flushed))
     }
 
-    /// Load all durable queued blocks (IBD restart replay). Disk only (not RAM pending).
+    /// Index-only durable queue entries (no payload IO). Prefer for IBD restart.
+    ///
+    /// Disk only (not RAM pending). Production rehydrate must use this — not
+    /// [`Self::block_queue_load_all`].
+    pub fn block_queue_list_meta(&self) -> Vec<rbitcoin_store::QueuedBlockMeta> {
+        let g = self.block_queue.lock().unwrap();
+        g.list_meta()
+    }
+
+    /// Load all durable queued blocks **with full payloads** (tests / tools).
+    ///
+    /// Disk only (not RAM pending). **Do not use on production multi‑GiB
+    /// queues** — peak RAM ≈ disk fill. Use [`Self::block_queue_list_meta`] for
+    /// rehydrate and [`Self::block_queue_payload`] for single-height prep.
     pub fn block_queue_load_all(&self) -> Result<Vec<rbitcoin_store::QueuedBlock>, QueryError> {
         let g = self.block_queue.lock().unwrap();
         Ok(g.load_all()?)

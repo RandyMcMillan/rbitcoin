@@ -920,6 +920,9 @@ pub(crate) fn drain_job_rx_as_err(
 /// Restart path: re-note durable body-queue heights into the **confirm feed**
 /// (readiness only). Wire stays on disk until confirm **prep** pulls it.
 ///
+/// **Memory:** walks **index meta only** (`block_queue_list_meta`) — never loads
+/// multi‑GiB of payloads into heap (mainnet restarts had ~7 GiB `load_all` spikes).
+///
 /// Disk payloads do **not** charge [`ArchiveQueueBudget`] (that soft budget is
 /// only for RAM overflow / dual-track arch jobs). Charging GiB of disk against
 /// the ~512 MiB soft budget freezes densify getdata for tip holes.
@@ -949,10 +952,9 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
         Some(t) => t.saturating_add(1),
     };
 
-    let queued = hub
-        .query
-        .block_queue_load_all()
-        .map_err(|e| format!("load_all: {e}"))?;
+    // Meta only — never `block_queue_load_all` (that materializes multi‑GiB of
+    // wire into heap at every restart; feed only needs height/hash readiness).
+    let queued = hub.query.block_queue_list_meta();
     if queued.is_empty() {
         return Ok(0);
     }
@@ -983,13 +985,13 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
             // height > tip but already flagged done — keep payload, still note feed.
             kept_above_tip_flag = kept_above_tip_flag.saturating_add(1);
         }
-        // Minimal integrity: rec must have a non-empty payload; full decode at prep.
-        if qb.payload.is_empty() {
+        // Minimal integrity: rec must have non-empty payload_len; full decode at prep.
+        if qb.payload_len == 0 {
             empty_skip = empty_skip.saturating_add(1);
             let _ = hub.query.block_queue_dequeue_height(qb.height);
             continue;
         }
-        let wire_bytes = qb.payload.len() as u64;
+        let wire_bytes = qb.payload_len;
         // Disk-owned: pending so densify will not re-getdata; no soft charge.
         st.body.mark_pending(hash);
         if qb.height != u32::MAX {
@@ -2221,6 +2223,50 @@ mod rehydrate_tests {
             header,
             txdata: vec![],
         }
+    }
+
+    /// Meta-only rehydrate must note feed without materializing all payloads.
+    ///
+    /// Regression for startup Memory spike: old path called `load_all` and held
+    /// sum(payload) in a Vec (~7 GiB on mainnet restart) before dropping it.
+    #[test]
+    fn rehydrate_uses_meta_not_load_all_for_large_payloads() {
+        let (dir, hub) = temp_hub();
+        // Two multi-MiB recs — if rehydrate load_all'd them, peak would retain both.
+        let p1 = vec![0x11u8; 3 * 1024 * 1024];
+        let p2 = vec![0x22u8; 3 * 1024 * 1024];
+        let h1 = [0xAAu8; 32];
+        let h2 = [0xBBu8; 32];
+        hub.query
+            .block_queue_enqueue(10, h1, 1, &p1)
+            .unwrap();
+        hub.query
+            .block_queue_enqueue(11, h2, 2, &p2)
+            .unwrap();
+        let meta = hub.query.block_queue_list_meta();
+        assert_eq!(meta.len(), 2);
+        assert_eq!(meta[0].payload_len, p1.len() as u64);
+        assert_eq!(meta[1].payload_len, p2.len() as u64);
+
+        let feed = super::super::confirm::ConfirmFeed::new();
+        let budget = ArchiveQueueBudget::new(64 * 1024 * 1024);
+        let mut st = super::super::state::IbdWorkState::new(vec![], None, None);
+        let n = rehydrate_block_queue_into_confirm(&hub, &mut st, &feed, &budget).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(budget.count(), 0);
+        // Wire still only on disk; prep can load one height at a time.
+        assert_eq!(
+            hub.query.block_queue_payload(10).unwrap().as_deref(),
+            Some(p1.as_slice())
+        );
+        assert_eq!(
+            hub.query.block_queue_payload(11).unwrap().as_deref(),
+            Some(p2.as_slice())
+        );
+        let g = feed.inner.lock().unwrap();
+        assert!(g.ready.contains_key(&10) && g.ready.contains_key(&11));
+        assert!(g.ready.get(&10).unwrap().1.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Shipped restart path: durable body queue → feed readiness (wire stays on disk).

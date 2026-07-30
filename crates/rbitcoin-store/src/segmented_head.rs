@@ -520,19 +520,21 @@ impl SegmentedTxHead {
             .open_keys
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // Dedupe keys (rare BIP30 double insert of same mixed key).
-        keys.sort_unstable();
-        keys.dedup();
-        let key_n = keys.len();
-        // Must cover every open create — incomplete after restart without
-        // [`Self::replace_open_keys`] rebuild would produce FN on seal.
-        if key_n as u64 != count {
+        // Completeness is on the raw append stream (one fuse key per create insert),
+        // not unique keys — BIP30 same-txid pushes the same mixed key twice.
+        let raw_n = keys.len();
+        if raw_n as u64 != count {
             return Err(StoreError::Corrupt(
                 "tx.head seal open_keys incomplete (reopen mid-segment without rebuild)",
             ));
         }
+        // Dedupe only for BinaryFuse8 construction (duplicate keys can fail build).
+        keys.sort_unstable();
+        keys.dedup();
+        let unique_n = keys.len();
         rbitcoin_log::info!(
-            "store: tx.head seal begin file_id={} first_fk={} count={count} fuse_keys={key_n}",
+            "store: tx.head seal begin file_id={} first_fk={} count={count} \
+             fuse_keys_raw={raw_n} fuse_keys_unique={unique_n}",
             last.file_id,
             last.first_fk
         );
@@ -562,7 +564,7 @@ impl SegmentedTxHead {
         SEALS.fetch_add(1, Ordering::Relaxed);
         let dt = t0.elapsed();
         rbitcoin_log::info!(
-            "store: tx.head seal done file_id={} count={count} fuse_keys={key_n} \
+            "store: tx.head seal done file_id={} count={count} fuse_keys_unique={unique_n} \
              fuse_bytes={fuse_bytes} duration_ms={}",
             last.file_id,
             dt.as_millis()

@@ -3698,6 +3698,76 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// BIP30 same-txid twice → duplicate fuse keys; seal must still succeed (dedup for build only).
+    #[test]
+    fn bip30_duplicate_txid_seal_succeeds_and_resolves() {
+        with_env_lock(|| {
+            SegmentedTxHead::test_set_soft_span_bytes(0);
+            std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
+            let dir = tempfile_dir("bip30-seal");
+            // 10-bit: max_keys = 819
+            let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
+            let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+            let mut shared = [0u8; 32];
+            shared[0..8].copy_from_slice(&1u64.to_le_bytes());
+            // Two Class A creates with the same txid (BIP30-shaped).
+            let r1 = TxRecord {
+                txid: shared,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 0,
+                output_start_fk: Fk::NULL,
+                output_count: 0,
+            };
+            let r2 = r1.clone();
+            let fks = t.put_batch(&[r1, r2]).unwrap();
+            assert_eq!(fks.len(), 2);
+            assert_ne!(fks[0], fks[1]);
+            // Fill remaining to force seal of first segment (819 creates).
+            let mut rest = Vec::new();
+            for i in 3..=819u64 {
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&i.to_le_bytes());
+                rest.push(TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 0,
+                    output_start_fk: Fk::NULL,
+                    output_count: 0,
+                });
+            }
+            t.put_batch(&rest).unwrap();
+            // Next create forces roll/seal of the full segment.
+            let mut more = [0u8; 32];
+            more[0..8].copy_from_slice(&820u64.to_le_bytes());
+            t.put_batch(&[TxRecord {
+                txid: more,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 0,
+                output_start_fk: Fk::NULL,
+                output_count: 0,
+            }])
+            .unwrap();
+            assert!(
+                t.head.sealed_segment_count() >= 1,
+                "seal must succeed despite BIP30 duplicate fuse keys"
+            );
+            // Newest BIP30 create wins (deeper probe).
+            let hit = t.get_fk_by_txid(&shared).unwrap();
+            assert_eq!(hit, Some(fks[1]), "newest same-txid create");
+            let all = t.get_all_by_txid(&shared).unwrap();
+            assert_eq!(all.len(), 2, "both BIP30 creates body-verify");
+            assert_eq!(all[0].0, fks[1]);
+            assert_eq!(all[1].0, fks[0]);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
     /// Reopen mid-open-segment, then fill to seal: pre-reopen creates must not FN.
     #[test]
     fn reopen_mid_segment_then_seal_no_fuse_fn() {

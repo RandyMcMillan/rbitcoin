@@ -708,32 +708,23 @@ pub(crate) fn apply_confirm_reject(
     query: Option<&rbitcoin_query::Query>,
 ) {
     // Never blacklist the all-zero sentinel (write used to emit this on
-    // mis-attributed rejects). Never freeze tip on pipeline "already spent"
-    // races that race a successful commit.
+    // mis-attributed rejects).
     use bitcoin::hashes::Hash;
     if hash.to_byte_array() == [0u8; 32] {
         warn!("ibd: confirm reject ignored zero-hash @{height}: {err}");
         return;
     }
-    // Soft / re-get paths: do **not** permanent-blacklist tip+1.
-    // - prevout spent: claim race after successful commit
-    // - unexpected previous header: wrong/corrupt wire for this height (peer
-    //   or bq mismatch) — drop body-queue payload and re-getdata (mainnet tip
-    //   freeze at 125653 blacklisted for this string).
-    let soft_reget = err.contains("prevout already spent")
-        || err.contains("unexpected previous header")
-        || err.contains("unexpected previous")
-        // Prep/layout bug after Class A commit: do not permanent-blacklist tip+1;
-        // drop body-queue wire and re-prep (write now re-fills denserels abs).
-        || err.contains("missing pin denserels")
-        // Plan/prep denserels race or transient residency miss — re-get, never freeze tip.
-        || err.contains("plan stage miss")
-        || err.contains("denserels stage miss")
-        || err.contains("plan stage failed to load")
-        // Body-ahead-of-head during tx.head seal/roll: parent not in residency,
-        // in-flight, or head yet. Transient — never permanent-blacklist tip+1
-        // (mainnet freeze @269050 first segment seal).
-        || err.contains("parent create_fk unresolved");
+    // Soft re-getdata: **wire-only**. Wrong/corrupt body for this height (peer
+    // or bq mismatch) — drop payload and densify. Mainnet tip freeze at 125653
+    // was blacklisting `unexpected previous header`.
+    //
+    // Internal pipeline races (prevout already spent, denserels pin, plan stage
+    // miss, parent create_fk unresolved, load incomplete) are **permanent**.
+    // Fix the root cause; write already skip-accepts when tip already has the
+    // block / prevout-spent after commit. Soft-looping hid bugs and livelocked
+    // or froze tip.
+    let soft_reget = err.contains("unexpected previous header")
+        || err.contains("unexpected previous");
     if soft_reget {
         release_confirm_archive_charge(st, &hash, archive_queued);
         clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
@@ -789,8 +780,9 @@ mod confirm_reject_tests {
         BlockHash::from_byte_array(b)
     }
 
-    /// Confirm reject blacklist: zero-hash + prevout-spent race stay soft;
-    /// real script failures permanent-blacklist. Mainnet tip=362595 regression.
+    /// Soft re-get is wire-only (`unexpected previous header`). Internal
+    /// invariants permanent-blacklist. Zero-hash ignored. Mainnet regressions
+    /// documented in comments (125653 wire, 219562 denserels, 269050 seal).
     #[test]
     fn confirm_reject_blacklist_surface() {
         let mut st = IbdWorkState::new(Vec::new(), None, Some(100));
@@ -805,30 +797,7 @@ mod confirm_reject_tests {
         );
         assert!(!st.body.is_rejected(&zero));
 
-        // Pipeline race: second write of same tip+1 after first committed —
-        // blacklisting freezes IBD forever.
-        let mut st = IbdWorkState::new(Vec::new(), None, Some(362_594));
-        let hash = h(0x29);
-        st.body.mark_archived(hash);
-        st.ordered.push_back(hash);
-        st.ordered_set.insert(hash);
-        apply_confirm_reject(
-            &mut st,
-            362_595,
-            hash,
-            "consensus: prevout already spent on best chain",
-            None,
-            None,
-        );
-        assert!(
-            !st.body.is_rejected(&hash),
-            "prevout-spent race must not permanent-blacklist tip+1"
-        );
-        assert!(
-            st.ordered_set.contains(&hash),
-            "transient race must leave ordered path intact"
-        );
-
+        // Script fail → permanent.
         let mut st = IbdWorkState::new(Vec::new(), None, Some(50));
         let hash = h(7);
         st.body.mark_archived(hash);
@@ -845,8 +814,7 @@ mod confirm_reject_tests {
         assert!(st.body.is_rejected(&hash));
         assert!(!st.ordered_set.contains(&hash));
 
-        // Prep/layout denserels miss after Class A commit: soft re-get, not blacklist
-        // (mainnet restart freezes tip when blacklisted for denserels/abs).
+        // Internal denserels invariant → permanent (fix pin/res_seed, not soft).
         let mut st = IbdWorkState::new(Vec::new(), None, Some(219_561));
         let hash = h(0x5b);
         st.body.mark_archived(hash);
@@ -861,11 +829,11 @@ mod confirm_reject_tests {
             None,
         );
         assert!(
-            !st.body.is_rejected(&hash),
-            "denserels layout miss must soft-reget, not permanent-blacklist tip+1"
+            st.body.is_rejected(&hash),
+            "denserels layout miss is permanent (fix pipeline, not soft-reget)"
         );
 
-        // Body-ahead-of-head during tx.head seal: soft, not blacklist (mainnet @269050).
+        // parent create_fk unresolved → permanent (fix head prune / in-flight).
         let mut st = IbdWorkState::new(Vec::new(), None, Some(269_049));
         let hash = h(0x53);
         st.body.mark_archived(hash);
@@ -880,12 +848,51 @@ mod confirm_reject_tests {
             None,
         );
         assert!(
+            st.body.is_rejected(&hash),
+            "parent create_fk unresolved is permanent after root fix"
+        );
+
+        // Wire-only soft: unexpected previous header → re-getdata, not blacklist.
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(125_652));
+        let hash = h(0x44);
+        st.body.mark_archived(hash);
+        st.ordered.push_back(hash);
+        st.ordered_set.insert(hash);
+        apply_confirm_reject(
+            &mut st,
+            125_653,
+            hash,
+            "consensus: unexpected previous header",
+            None,
+            None,
+        );
+        assert!(
             !st.body.is_rejected(&hash),
-            "parent create_fk unresolved during head seal must soft-reget, not blacklist tip+1"
+            "bad wire must soft re-getdata, not permanent-blacklist tip+1"
         );
         assert!(
             st.ordered_set.contains(&hash),
-            "soft path must leave ordered path intact"
+            "soft path leaves ordered path intact"
+        );
+
+        // prevout-spent: permanent if it reaches here (write should skip-accept
+        // when already committed; soft was a race bandaid).
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(362_594));
+        let hash = h(0x29);
+        st.body.mark_archived(hash);
+        st.ordered.push_back(hash);
+        st.ordered_set.insert(hash);
+        apply_confirm_reject(
+            &mut st,
+            362_595,
+            hash,
+            "consensus: prevout already spent on best chain",
+            None,
+            None,
+        );
+        assert!(
+            st.body.is_rejected(&hash),
+            "prevout-spent is permanent at reject layer (write skip-if-committed)"
         );
     }
 
@@ -958,9 +965,7 @@ mod confirm_reject_tests {
             assert!(st.body.is_rejected(&hash));
         }
 
-        // Soft prevout-spent: not blacklisted, but charge **must** still drop.
-        // Write path only converts to Accepted when has_block; otherwise Reject
-        // reaches here with the wire charge still held (skeptic: tip stall).
+        // Permanent prevout-spent: charge still released (no soft-stall leak).
         {
             let mut st = IbdWorkState::new(Vec::new(), None, Some(50));
             let hash = h(0x43);
@@ -980,16 +985,13 @@ mod confirm_reject_tests {
             assert_eq!(
                 budget.count(),
                 0,
-                "prevout-spent soft path must release archive_queued (no tip stall)"
+                "permanent prevout-spent must still release archive_queued"
             );
             assert!(
                 st.body.take_archive_charge_bytes(&hash).is_none(),
-                "charge marker consumed on soft prevout-spent"
+                "charge marker consumed on permanent reject"
             );
-            assert!(
-                !st.body.is_rejected(&hash),
-                "prevout-spent remains soft (not permanent blacklist)"
-            );
+            assert!(st.body.is_rejected(&hash));
         }
 
         // Unexpected previous header (bad wire for tip+1) must re-getdata, not freeze.

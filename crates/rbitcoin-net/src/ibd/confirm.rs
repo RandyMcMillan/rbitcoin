@@ -506,15 +506,20 @@ impl ConfirmQueueDepths {
     }
 }
 
-/// True when a load/script error should re-queue the batch (not permanent reject).
+/// True when a plan/prep error should re-queue the batch (not permanent reject).
+///
+/// **Policy:** internal confirm invariants are permanent failures — fix the
+/// root cause (in-flight prune, denserels pin, claim readiness). Soft-looping
+/// hid pipeline bugs and either livelocked tip (requeue forever) or froze it
+/// after a hard blacklist. Wire recovery uses soft re-getdata in
+/// [`super::events::apply_confirm_reject`] (`unexpected previous header` only)
+/// or [`ConfirmEvent::BodyMissing`] — not this path.
+///
+/// Kept as a named hook so multi-block / prep error handling stays uniform;
+/// always returns false.
 #[inline]
-pub(crate) fn is_confirm_load_retryable(msg: &str) -> bool {
-    msg.contains("load incomplete")
-        || msg.contains("parent package not ready")
-        || msg.contains("load not ready")
-        // Body-ahead-of-head during tx.head seal/roll (or prune race): wait for
-        // head insert + residency, do not permanent-reject tip+1.
-        || msg.contains("parent create_fk unresolved")
+pub(crate) fn is_confirm_load_retryable(_msg: &str) -> bool {
+    false
 }
 
 /// Spawn confirm **plan** + **prep** + **scripts** + **write** OS threads.
@@ -665,8 +670,9 @@ pub(crate) fn spawn_confirm_engine(
                             continue;
                         }
                         // Write reject — clear inflight (reject event handles
-                        // soft-reget vs blacklist). Invalidate prep-ahead caches
-                        // so reserved create fks / last_prepped do not drift.
+                        // wire soft re-get vs permanent blacklist). Invalidate
+                        // prep-ahead caches so reserved create fks / last_prepped
+                        // do not drift.
                         prep_ahead_reset_wb.store(true, Ordering::Release);
                         feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                         loop_stats_wb
@@ -1499,28 +1505,25 @@ mod tests {
     }
 
     #[test]
-    fn wait_timeout_is_confirm_load_retryable_not_reject() {
-        assert!(is_confirm_load_retryable(
+    fn is_confirm_load_retryable_always_false() {
+        // Policy: no plan/prep soft-requeue. Internal errors permanent; wire
+        // recovery is soft re-getdata / BodyMissing only.
+        assert!(!is_confirm_load_retryable(
             "confirm: load incomplete (parent package not ready, timeout)"
         ));
-        assert!(is_confirm_load_retryable(
+        assert!(!is_confirm_load_retryable(
             "confirm: load incomplete (wave body missing from cache)"
         ));
-        // Plan-miss MTP (after hybrid median_time_past) must re-queue, not
-        // permanent multi-block → n=1 split.
-        assert!(is_confirm_load_retryable(
+        assert!(!is_confirm_load_retryable(
             "confirm: load incomplete (parent header plan missing above tip)"
         ));
-        assert!(
-            is_confirm_load_retryable(
-                "archive: parent create_fk unresolved (contiguous batch required)"
-            ),
-            "head seal race must re-queue, not permanent reject"
-        );
+        assert!(!is_confirm_load_retryable(
+            "archive: parent create_fk unresolved (contiguous batch required)"
+        ));
         assert!(!is_confirm_load_retryable("script failed: false"));
         assert!(!is_confirm_load_retryable("prevout already spent"));
-        // Store-only MTP BadPrev used to hit the silent multi-split path.
         assert!(!is_confirm_load_retryable("unexpected previous header"));
+        assert!(!is_confirm_load_retryable("invariant: plan stage miss"));
     }
 
     /// note / requeue / finish lifecycle (duplicate scripts bug + re-queue).

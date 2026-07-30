@@ -120,7 +120,7 @@ impl HeadOverflow {
             return Err(StoreError::Corrupt("tx.head.overflow load too high"));
         }
         let mask = self.slots - 1;
-        let mut i = primary(key, self.slots);
+        let mut i = crate::open_address::primary_slot_32(key, self.slots);
         for _ in 0..self.slots {
             if self.keys[i] == [0u8; 32] {
                 self.keys[i] = *key;
@@ -146,7 +146,7 @@ impl HeadOverflow {
             return None;
         }
         let mask = self.slots - 1;
-        let mut i = primary(key, self.slots);
+        let mut i = crate::open_address::primary_slot_32(key, self.slots);
         for _ in 0..self.slots {
             if self.keys[i] == [0u8; 32] {
                 return None;
@@ -196,16 +196,6 @@ impl HeadOverflow {
         self.occupied = 0;
         self.persist()
     }
-}
-
-#[inline]
-fn primary(key: &[u8; 32], slots: usize) -> usize {
-    let mut h = 0xcbf29ce484222325u64;
-    for b in key {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    (h as usize) & (slots - 1)
 }
 
 #[inline]

@@ -1806,11 +1806,10 @@ fn three_stage_confirm_and_parent_pin_surface() {
     accept_and_archive_block(&q, &params, Height(spend_h), &b_spend, ms).unwrap();
     run.push((Height(spend_h), b_spend.block_hash().to_byte_array()));
 
-    // Inline confirm load (parent pin).
+    // Inline confirm load (parent pin). Production path is height+hash items only.
     let items: Vec<(u32, [u8; 32])> = run.iter().map(|(h, hash)| (h.0, *hash)).collect();
     let (st, _bp, _thin, _bodies) = q.load_confirm_parents(&items).unwrap();
     assert!(st.blocks > 0);
-    let _ = q.load_confirm_parents_for_hashes(&[b_spend.block_hash().to_byte_array()]);
     let snap = q.parent_cache_perf_snapshot();
     assert!(snap.4 > 0, "plans after load");
     assert!(q.is_confirm_load_ready(&items.iter().map(|(h, _)| *h).collect::<Vec<_>>()));

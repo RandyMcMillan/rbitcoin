@@ -175,11 +175,6 @@ impl BlockQueue {
         self.bytes.saturating_add(payload_len as u64) <= self.budget
     }
 
-    /// Override budget (constructor clamps min 64 MiB). For tests / diagnostics.
-    pub fn force_budget_for_test(&mut self, budget: u64) {
-        self.budget = budget.max(1);
-    }
-
     /// `bytes / budget` (may be 0..1 under normal load; rarely >1 if forced).
     pub fn fill_ratio(&self) -> f64 {
         let b = self.budget.max(1) as f64;

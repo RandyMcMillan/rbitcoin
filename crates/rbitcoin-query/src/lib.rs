@@ -1106,13 +1106,6 @@ impl Query {
         g.contains_height(height)
     }
 
-    /// Test helper: force a tiny durable budget (bypasses open-time 64 MiB clamp).
-    #[cfg(test)]
-    pub fn block_queue_force_budget_for_test(&self, budget: u64) {
-        let mut g = self.block_queue.lock().unwrap();
-        g.force_budget_for_test(budget);
-    }
-
     /// Cheap process-owned cache sizes for the IBD `ibd: sizes` line.
     ///
     /// Brief mutex locks only (residency / header plans / SH / heads). Call from
@@ -2134,7 +2127,6 @@ mod tests {
             .unwrap();
         let _ = st3;
 
-        // load_confirm_parents_for_hashes if public
         let _ = q.parent_cache_ready_through();
         let _ = q.parent_cache_perf_snapshot();
 

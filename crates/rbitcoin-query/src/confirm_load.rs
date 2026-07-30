@@ -240,8 +240,13 @@ impl Query {
                     )
                     .into());
                 };
+                // Body was fetched (job.ok + range); Full mode must yield a decode.
+                // Silent skip hid corrupt packed creates and left tip with holes.
                 let Some((tx, inputs, outs, denserels)) = c.decoded_full else {
-                    continue;
+                    return Err(StoreError::Corrupt(
+                        "invariant: confirm load create body decode failed",
+                    )
+                    .into());
                 };
                 let body_range = Some(c.body_range);
                 st.body_tx_reads = st.body_tx_reads.saturating_add(1);
@@ -546,19 +551,6 @@ impl Query {
         Ok((st, batch_parents, batch_thin, batch_bodies))
     }
 
-    pub fn load_confirm_parents_for_hashes(
-        &self,
-        hashes: &[[u8; 32]],
-    ) -> Result<(ConfirmLoadStats, BatchParents, BatchThin, BatchFullBodies), QueryError> {
-        let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
-        let mut items = Vec::with_capacity(hashes.len());
-        for (i, hash) in hashes.iter().enumerate() {
-            let h = tip.saturating_add(1).saturating_add(i as u32);
-            items.push((h, *hash));
-        }
-        self.load_confirm_parents(&items)
-    }
-
     /// No-op: sparse parents are batch-local and drop with the confirm batch.
     pub fn unpin_spent_parent_outs(
         &self,
@@ -606,20 +598,134 @@ mod pin_new_residency_tests {
     use super::slim_dense_outs_to_need;
     use rbitcoin_store::OutputRecord;
 
+    /// Production slim: index dense outs by need vouts; drop unneeded (incl. large).
     #[test]
-    fn slim_does_not_retain_unneeded_vouts() {
+    fn slim_dense_outs_to_need_maps_and_drops() {
         let dense = vec![
+            OutputRecord::unspent(0, vec![0; 64]),
             OutputRecord::unspent(1, vec![1; 64]),
-            OutputRecord::unspent(2, vec![2; 64]),
-            OutputRecord::unspent(3, vec![3; 256]), // large unneeded
+            OutputRecord::unspent(2, vec![2; 256]), // unneeded large
         ];
-        let live = slim_dense_outs_to_need(&dense, &[0, 1]);
+        let live = slim_dense_outs_to_need(&dense, &[0, 2]);
         assert_eq!(live.len(), 2);
+        assert_eq!(live[0].0, 0);
+        assert_eq!(live[0].1.value, 0);
         assert_eq!(live[0].1.script.len(), 64);
-        assert_eq!(live[1].1.script.len(), 64);
+        assert_eq!(live[1].0, 2);
+        assert_eq!(live[1].1.value, 2);
+        assert_eq!(live[1].1.script.len(), 256);
+        // Dense source unchanged (callers still own full decode for denserels).
         assert_eq!(dense.len(), 3);
-        let _owned = dense;
-        assert_eq!(live.len(), 2);
+        assert!(slim_dense_outs_to_need(&dense, &[]).is_empty());
+    }
+}
+
+/// Drive shipped `load_confirm_parents` prep-miss invariants (body decode / pin_new).
+#[cfg(test)]
+mod load_confirm_invariant_tests {
+    use crate::Query;
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+    use std::sync::Once;
+
+    fn temp_q(label: &str) -> (std::path::PathBuf, Query) {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-load-inv-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        q.enter_direct_index_mode().unwrap();
+        (dir, q)
+    }
+
+    /// Body present but Full decode fails → hard invariant (no silent skip).
+    #[test]
+    fn confirm_load_body_decode_fail_is_invariant() {
+        let (dir, q) = temp_q("decode-fail");
+        // Minimal valid packed create so put succeeds.
+        let tx = TxRecord {
+            txid: [0x71; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let ins = vec![InputRecord {
+            prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![0x01],
+            witness: vec![],
+        }];
+        let outs = vec![OutputRecord::unspent(1, vec![0x51])];
+        let fks = q
+            .store()
+            .put_tx_full_batch_indexed(&[(tx, ins, outs)], true)
+            .unwrap();
+        // Overwrite packed body with meta claiming input_count=1 but no input
+        // bytes → Full decode fails short (safe, no OOM) while idx range stays.
+        let (off, len) = q.store().tx_body_range(fks[0]).unwrap();
+        assert!(len >= 64, "need full TxRecord header room");
+        let mut trash = vec![0u8; len as usize];
+        // TxRecord layout: txid[32] version[4] locktime[4] in_start[8] in_count[4] …
+        trash[48..52].copy_from_slice(&1u32.to_le_bytes()); // input_count = 1
+        let body_path = q.store().path().join("tx.body");
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&body_path)
+                .unwrap();
+            f.seek(SeekFrom::Start(off)).unwrap();
+            f.write_all(&trash).unwrap();
+            f.sync_all().unwrap();
+        }
+        drop(q);
+        let q = Query::open_or_create(dir.join("store")).unwrap();
+        q.enter_direct_index_mode().unwrap();
+
+        let mut hash = [0u8; 32];
+        hash[0] = 0x71;
+        let header = HeaderRecord {
+            prev_fk: Fk::NULL,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207f_ffff,
+            nonce: 1,
+            merkle_root: hash,
+            hash,
+        };
+        // Header may already exist from first open — put_header is fine / idempotent hash.
+        let hfk = q.put_header(&header).unwrap();
+        q.store()
+            .header_txs
+            .put_ranges_batch(&[(hfk, fks[0], 1)])
+            .unwrap();
+
+        let err = q
+            .load_confirm_parents(&[(1, hash)])
+            .expect_err("corrupt body must hard-fail load");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invariant") && msg.contains("decode"),
+            "unexpected err: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -791,56 +897,4 @@ mod pin_new_invariant_tests {
     }
 }
 
-#[cfg(test)]
-mod slim_outs_tests {
-    use super::slim_dense_outs_to_need;
-    use rbitcoin_store::OutputRecord;
-    use std::collections::HashSet;
 
-    fn o(n: u8) -> OutputRecord {
-        OutputRecord::unspent(n as i64, vec![n])
-    }
-
-    /// Keep only outs whose vout is in `need` (unit-test helper for pin slim).
-    fn slim_outs_to_need(
-        outs: Vec<(u32, OutputRecord)>,
-        need: &[u32],
-    ) -> Vec<(u32, OutputRecord)> {
-        if need.is_empty() {
-            return Vec::new();
-        }
-        if need.len() == 1 {
-            let v = need[0];
-            return outs.into_iter().filter(|(vout, _)| *vout == v).collect();
-        }
-        let need_set: HashSet<u32> = need.iter().copied().collect();
-        outs.into_iter()
-            .filter(|(vout, _)| need_set.contains(vout))
-            .collect()
-    }
-
-    #[test]
-    fn slim_outs_keeps_need_even_if_would_be_spent() {
-        // Regression: pin must not drop needed vouts via spenders filter.
-        // Spentness is structural; scripts need the value/script here.
-        let outs = vec![(0, o(10)), (1, o(11)), (2, o(12))];
-        let live = slim_outs_to_need(outs, &[1, 2]);
-        assert_eq!(live.len(), 2);
-        assert_eq!(live[0].0, 1);
-        assert_eq!(live[1].0, 2);
-    }
-
-    #[test]
-    fn slim_dense_maps_vout_index() {
-        let outs = vec![o(0), o(1), o(2)];
-        let live = slim_dense_outs_to_need(&outs, &[0, 2]);
-        assert_eq!(live.len(), 2);
-        assert_eq!(live[0].1.value, 0);
-        assert_eq!(live[1].1.value, 2);
-    }
-
-    #[test]
-    fn slim_outs_empty_need() {
-        assert!(slim_outs_to_need(vec![(0, o(1))], &[]).is_empty());
-    }
-}

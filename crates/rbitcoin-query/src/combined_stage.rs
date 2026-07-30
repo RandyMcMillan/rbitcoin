@@ -8,7 +8,7 @@ use crate::create_residency::CreateResidency;
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
     decode_packed_tx_outs_with_spender_rels_secret, decode_packed_tx_with_spender_rels_secret,
-    IdxBodyJob, IdxBodyMode, Store, StoreSecret,
+    IdxBodyJob, IdxBodyMode, Store, StoreError, StoreSecret,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -92,11 +92,11 @@ pub fn load_creates_once(
                     );
                     decoded_full = Some((tx, ins, outs, rels));
                 } else {
-                    let mut txid = [0u8; 32];
-                    if job.body.len() >= 32 {
-                        txid.copy_from_slice(&job.body[..32]);
-                    }
-                    residency.insert_fk_txid_range(*fk, txid, Some(range));
+                    // Body loaded (job.ok) but packed decode failed — prep miss, not
+                    // a soft range-only row (that hid corrupt Class A from confirm).
+                    return Err(StoreError::Corrupt(
+                        "invariant: packed create Full decode failed after body load",
+                    ));
                 }
             }
             IdxBodyMode::OutsDenserels | IdxBodyMode::Prefix33 => {
@@ -112,10 +112,10 @@ pub fn load_creates_once(
                         Some(range),
                     );
                     decoded_outs = Some((tx, outs, rels));
-                } else if job.body.len() >= 32 {
-                    let mut txid = [0u8; 32];
-                    txid.copy_from_slice(&job.body[..32]);
-                    residency.insert_fk_txid_range(*fk, txid, Some(range));
+                } else {
+                    return Err(StoreError::Corrupt(
+                        "invariant: packed create denserels decode failed after body load",
+                    ));
                 }
             }
         }
@@ -146,6 +146,9 @@ mod tests {
         let q = Query::open_or_create(dir.join("store")).unwrap();
         (dir, q)
     }
+
+    /// Serialise env budget knobs across parallel tests.
+    static BQ_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn put_tx(q: &Query, seed: u8) -> Fk {
         let mut txid = [0u8; 32];
@@ -234,13 +237,18 @@ mod tests {
     }
 
     /// Full durable budget → offer buffers in RAM (no error); dequeue flushes.
+    ///
+    /// Production budget via `RBITCOIN_BLOCK_QUEUE_BYTES` (min 64 MiB clamp) —
+    /// no production `*_for_test` budget backdoor.
     #[test]
     fn block_queue_offer_buffers_when_full_then_flush_on_dequeue() {
+        let _env = BQ_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("RBITCOIN_BLOCK_QUEUE_BYTES");
+        std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", format!("{}", 64 * 1024 * 1024));
         let (dir, q) = temp_query();
-        // Shrink durable budget after open (constructor clamps min 64 MiB).
-        q.block_queue_force_budget_for_test(64);
-        let p1 = vec![1u8; 40];
-        let p2 = vec![2u8; 40];
+        // Two ~40 MiB payloads with 64 MiB budget: first disk, second RAM.
+        let p1 = vec![1u8; 40 * 1024 * 1024];
+        let p2 = vec![2u8; 40 * 1024 * 1024];
         let o1 = q.block_queue_offer(1, [1u8; 32], 1, &p1).unwrap();
         assert!(o1.disk_id.is_some(), "first fits on disk");
         assert!(o1.flushed_to_disk.is_empty());
@@ -250,7 +258,6 @@ mod tests {
         assert_eq!(q.block_queue_pending_len(), 1);
         assert_eq!(q.block_queue_stats().2, 1, "disk count unchanged");
         assert!(!q.block_queue_can_request(), "effective fill ≥ budget");
-        // Free disk → flush pending; report flushed hash for soft-charge release.
         let (n, flushed) = q.block_queue_dequeue_height(1).unwrap();
         assert_eq!(n, 1);
         assert_eq!(flushed, vec![[2u8; 32]], "RAM h2 spilled to disk");
@@ -260,12 +267,19 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].height, 2);
         assert_eq!(all[0].payload, p2);
+        match prev {
+            Some(v) => std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", v),
+            None => std::env::remove_var("RBITCOIN_BLOCK_QUEUE_BYTES"),
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Confirm prep intake: payload by height from disk or RAM pending (no dequeue).
     #[test]
     fn block_queue_payload_peek_disk_and_pending() {
+        let _env = BQ_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("RBITCOIN_BLOCK_QUEUE_BYTES");
+        std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", format!("{}", 64 * 1024 * 1024));
         let (dir, q) = temp_query();
         let disk = b"disk-payload".to_vec();
         q.block_queue_enqueue(10, [0xAAu8; 32], 1, &disk).unwrap();
@@ -276,16 +290,21 @@ mod tests {
         assert!(q.block_queue_has_height(10));
         assert_eq!(q.block_queue_stats().2, 1, "peek does not dequeue");
 
-        q.block_queue_force_budget_for_test(32);
-        let ram = vec![9u8; 40];
+        let fill = vec![9u8; 60 * 1024 * 1024];
+        q.block_queue_offer(20, [0xCCu8; 32], 3, &fill).unwrap();
+        let ram = vec![7u8; 8 * 1024 * 1024];
         let o = q.block_queue_offer(11, [0xBBu8; 32], 2, &ram).unwrap();
-        assert!(o.disk_id.is_none(), "held in RAM pending");
+        assert!(o.disk_id.is_none(), "held in RAM pending after budget full");
         assert_eq!(
             q.block_queue_payload(11).unwrap().as_deref(),
             Some(ram.as_slice())
         );
         assert!(q.block_queue_has_height(11));
-        assert!(q.block_queue_payload(99).unwrap().is_none());
+        assert!(q.block_queue_payload(999).unwrap().is_none());
+        match prev {
+            Some(v) => std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", v),
+            None => std::env::remove_var("RBITCOIN_BLOCK_QUEUE_BYTES"),
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

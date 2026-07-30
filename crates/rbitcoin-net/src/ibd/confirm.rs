@@ -44,14 +44,24 @@ impl PrepAheadState {
         }
     }
 
-    /// Drop creates already durable in Class A (after commits).
+    /// Drop creates that are already **head-findable** (and thus resolvable
+    /// without the pipeline map).
+    ///
+    /// **Must not use body count alone.** Class A commit is body → head →
+    /// residency; during `tx.head` seal/roll the body count jumps while head
+    /// insert is blocked for seconds. Pruning on body count drops in-flight
+    /// parents that head cannot resolve yet → `parent create_fk unresolved`
+    /// and a permanent tip blacklist (mainnet ~269050 first segment seal).
+    ///
+    /// `next_tx_start` still tracks body count (next free create fk).
     fn prune_committed(&mut self, hub: &ChainHub) {
-        let durable = hub.query.tx_body_count();
+        let body_n = hub.query.tx_body_count();
+        // Head-occupied ≈ highest create_fk published into the segmented head
+        // (dense 1..N inserts). Keep anything body-ahead-of-head in-flight.
+        let head_n = hub.query.tx_head_occupied();
         let creates = std::sync::Arc::make_mut(&mut self.in_flight_creates);
-        creates.retain(|_, fk| fk.get().map(|id| id > durable).unwrap_or(false));
         let outs = std::sync::Arc::make_mut(&mut self.in_flight_outs);
-        outs.retain(|id, _| *id > durable);
-        self.next_tx_start = self.next_tx_start.max(durable.saturating_add(1).max(1));
+        prune_inflight_maps(head_n, body_n, creates, outs, &mut self.next_tx_start);
         if let Some((h, _)) = self.last_prepped {
             let tip = hub.tip_height().unwrap_or(0);
             if h <= tip {
@@ -108,6 +118,29 @@ impl PrepAheadState {
         self.last_prepped = None;
         self.next_tx_start = hub.query.tx_body_count().saturating_add(1).max(1);
     }
+}
+
+/// Prune pipeline in-flight maps after commits.
+///
+/// Keep creates/outs with id **> head_occupied** (not yet head-findable).
+/// Advance `next_tx_start` from **body_count** (next free Class A fk).
+fn prune_inflight_maps(
+    head_occupied: u64,
+    body_count: u64,
+    creates: &mut HashMap<[u8; 32], Fk>,
+    outs: &mut HashMap<
+        u64,
+        (
+            rbitcoin_store::TxRecord,
+            Vec<rbitcoin_store::OutputRecord>,
+            Vec<u32>,
+        ),
+    >,
+    next_tx_start: &mut u64,
+) {
+    creates.retain(|_, fk| fk.get().map(|id| id > head_occupied).unwrap_or(false));
+    outs.retain(|id, _| *id > head_occupied);
+    *next_tx_start = (*next_tx_start).max(body_count.saturating_add(1).max(1));
 }
 
 /// Offline denserels for in-flight pin (must match Class A body packing).
@@ -479,6 +512,9 @@ pub(crate) fn is_confirm_load_retryable(msg: &str) -> bool {
     msg.contains("load incomplete")
         || msg.contains("parent package not ready")
         || msg.contains("load not ready")
+        // Body-ahead-of-head during tx.head seal/roll (or prune race): wait for
+        // head insert + residency, do not permanent-reject tip+1.
+        || msg.contains("parent create_fk unresolved")
 }
 
 /// Spawn confirm **plan** + **prep** + **scripts** + **write** OS threads.
@@ -1310,9 +1346,67 @@ pub(crate) fn offer_confirm_ready(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_conf_q, format_queue_depth, is_confirm_load_retryable, ConfirmFeed};
+    use super::{
+        format_conf_q, format_queue_depth, is_confirm_load_retryable, prune_inflight_maps,
+        ConfirmFeed,
+    };
     use bitcoin::hashes::Hash;
     use bitcoin::BlockHash;
+    use rbitcoin_primitives::Fk;
+    use std::collections::HashMap;
+
+    /// Body-ahead-of-head (seal window): keep in-flight fks head cannot resolve yet.
+    ///
+    /// Regression for mainnet tip freeze @269050 — first `tx.head` segment seal
+    /// (~3.5s) with body count already past head occupied; pruning on body count
+    /// dropped parents and plan failed with `parent create_fk unresolved`.
+    #[test]
+    fn prune_inflight_keeps_body_ahead_of_head() {
+        let mut creates = HashMap::new();
+        // head has 1..90; body already wrote 91..100 (seal mid head_insert_many).
+        for id in 85u64..=100 {
+            let mut txid = [0u8; 32];
+            txid[0] = id as u8;
+            creates.insert(txid, Fk(id));
+        }
+        let mut outs = HashMap::new();
+        for id in 85u64..=100 {
+            outs.insert(
+                id,
+                (
+                    rbitcoin_store::TxRecord {
+                        txid: {
+                            let mut t = [0u8; 32];
+                            t[0] = id as u8;
+                            t
+                        },
+                        version: 1,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 0,
+                        output_start_fk: Fk::NULL,
+                        output_count: 0,
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            );
+        }
+        let mut next = 50u64;
+        prune_inflight_maps(90, 100, &mut creates, &mut outs, &mut next);
+        // Head-findable (≤90) dropped; body-ahead (91..100) retained.
+        assert_eq!(creates.len(), 10);
+        assert_eq!(outs.len(), 10);
+        for id in 91u64..=100 {
+            assert!(creates.values().any(|f| f.get() == Some(id)), "keep {id}");
+            assert!(outs.contains_key(&id), "keep outs {id}");
+        }
+        for id in 85u64..=90 {
+            assert!(!creates.values().any(|f| f.get() == Some(id)), "drop {id}");
+        }
+        // next_tx_start advances from body, not head.
+        assert_eq!(next, 101);
+    }
 
     fn bh(b: u8) -> BlockHash {
         BlockHash::from_byte_array([b; 32])
@@ -1417,6 +1511,12 @@ mod tests {
         assert!(is_confirm_load_retryable(
             "confirm: load incomplete (parent header plan missing above tip)"
         ));
+        assert!(
+            is_confirm_load_retryable(
+                "archive: parent create_fk unresolved (contiguous batch required)"
+            ),
+            "head seal race must re-queue, not permanent reject"
+        );
         assert!(!is_confirm_load_retryable("script failed: false"));
         assert!(!is_confirm_load_retryable("prevout already spent"));
         // Store-only MTP BadPrev used to hit the silent multi-split path.

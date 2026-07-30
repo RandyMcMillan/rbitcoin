@@ -729,7 +729,11 @@ pub(crate) fn apply_confirm_reject(
         // Plan/prep denserels race or transient residency miss — re-get, never freeze tip.
         || err.contains("plan stage miss")
         || err.contains("denserels stage miss")
-        || err.contains("plan stage failed to load");
+        || err.contains("plan stage failed to load")
+        // Body-ahead-of-head during tx.head seal/roll: parent not in residency,
+        // in-flight, or head yet. Transient — never permanent-blacklist tip+1
+        // (mainnet freeze @269050 first segment seal).
+        || err.contains("parent create_fk unresolved");
     if soft_reget {
         release_confirm_archive_charge(st, &hash, archive_queued);
         clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
@@ -859,6 +863,29 @@ mod confirm_reject_tests {
         assert!(
             !st.body.is_rejected(&hash),
             "denserels layout miss must soft-reget, not permanent-blacklist tip+1"
+        );
+
+        // Body-ahead-of-head during tx.head seal: soft, not blacklist (mainnet @269050).
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(269_049));
+        let hash = h(0x53);
+        st.body.mark_archived(hash);
+        st.ordered.push_back(hash);
+        st.ordered_set.insert(hash);
+        apply_confirm_reject(
+            &mut st,
+            269_050,
+            hash,
+            "consensus: store: corrupt record: archive: parent create_fk unresolved (contiguous batch required)",
+            None,
+            None,
+        );
+        assert!(
+            !st.body.is_rejected(&hash),
+            "parent create_fk unresolved during head seal must soft-reget, not blacklist tip+1"
+        );
+        assert!(
+            st.ordered_set.contains(&hash),
+            "soft path must leave ordered path intact"
         );
     }
 

@@ -733,40 +733,53 @@ impl Query {
         // Publish **this batch's creates only** into CreateResidency after head is
         // durable. Seed denserels offline so prep(N+1) pin hits without Class A
         // body re-read. Timer logged as res_seed (write_sticky_ns atom).
+        //
+        // Prefer plan-time `batch_pin` (layout denserels) — no secret encode+decode.
+        // Fallback: layout denserels from packed records (still no full re-pack).
         let t = Instant::now();
         let ranges = self.store.tx_body_range_batch(&got_tx_fks)?;
-        let secret = self.store.txs.store_secret();
-        for (((tx, ins, outs), fk), range) in plan
-            .packed
-            .iter()
-            .zip(got_tx_fks.iter())
-            .zip(ranges.into_iter())
-        {
-            let txid = tx.txid;
-            let body_range = match range {
-                Some((off, len)) if len > 0 => Some((off, len)),
-                _ => None,
-            };
-            // Offline denserels (same packing as disk) → pin hit without body IO.
-            let mut raw = Vec::new();
-            rbitcoin_store::encode_packed_tx_with_secret(
-                tx,
-                ins,
-                outs,
-                &mut raw,
-                Some(secret),
-            );
-            if let Ok((meta, outs_dec, denserels)) =
-                rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
-                    &raw,
-                    Some(secret),
-                )
+        let use_pin = plan.batch_pin.len() == plan.packed.len()
+            && plan.batch_pin.len() == got_tx_fks.len();
+        if use_pin {
+            for ((pin, fk), range) in plan
+                .batch_pin
+                .iter()
+                .zip(got_tx_fks.iter())
+                .zip(ranges.into_iter())
             {
-                self.create_residency
-                    .put_outs(*fk, meta, outs_dec, denserels, body_range);
-            } else {
-                self.create_residency
-                    .insert_fk_txid_range(*fk, txid, body_range);
+                let body_range = match range {
+                    Some((off, len)) if len > 0 => Some((off, len)),
+                    _ => None,
+                };
+                let (tx, outs, denserels) = pin.as_ref();
+                self.create_residency.put_outs(
+                    *fk,
+                    tx.clone(),
+                    outs.clone(),
+                    denserels.clone(),
+                    body_range,
+                );
+            }
+        } else {
+            for (((tx, ins, outs), fk), range) in plan
+                .packed
+                .iter()
+                .zip(got_tx_fks.iter())
+                .zip(ranges.into_iter())
+            {
+                let body_range = match range {
+                    Some((off, len)) if len > 0 => Some((off, len)),
+                    _ => None,
+                };
+                let denserels =
+                    rbitcoin_store::denserels_from_packed_records(tx, ins, outs);
+                self.create_residency.put_outs(
+                    *fk,
+                    tx.clone(),
+                    outs.clone(),
+                    denserels,
+                    body_range,
+                );
             }
         }
         let sticky_ns = t.elapsed().as_nanos() as u64;
@@ -917,6 +930,37 @@ mod tests {
             assert_eq!(pin.2, decode_rels);
         }
         assert_eq!(ifo.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W1: commit res_seed from batch_pin denserels lands in CreateResidency
+    /// (no encode+decode path required for pin hit).
+    #[test]
+    fn commit_res_seed_from_batch_pin_hits_residency() {
+        use std::collections::HashMap;
+        let (dir, q) = temp_query("res-seed-pin");
+        let mut need = vec![(Fk(1), vec![coinbase_apply(7), coinbase_apply(8)])];
+        let plan = q
+            .archive_plan_mega_from(&mut need, 1, &HashMap::new())
+            .unwrap();
+        assert_eq!(plan.batch_pin.len(), 2);
+        let pin0 = plan.batch_pin[0].clone();
+        let fk0 = plan.planned_fks[0];
+        q.archive_commit_plan(plan).unwrap();
+        let need_v = vec![0u32];
+        let got = q
+            .create_residency()
+            .get_parent_needed(fk0, &need_v)
+            .expect("residency should have denserels after res_seed");
+        let (tx, live, sparse, _range) = got;
+        assert_eq!(tx.txid, pin0.0.txid);
+        assert_eq!(live.len(), 1);
+        assert!(!sparse.is_empty() || pin0.2.is_empty());
+        // Dense rel for vout 0 matches plan pin.
+        if !pin0.2.is_empty() {
+            let expected = crate::sparse_spender_rels(&pin0.2, &need_v);
+            assert_eq!(sparse, expected);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

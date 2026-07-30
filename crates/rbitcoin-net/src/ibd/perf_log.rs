@@ -100,6 +100,14 @@ pub(crate) struct IbdPerfSample {
     pub structural_ms: u64,
     /// Structural sub: durable spentness probes.
     pub structural_spent_ms: u64,
+    /// Spent sub: pin abs + on-disk 9-byte meta pread.
+    pub spent_abs_ms: u64,
+    /// Spent sub: is_confirmed_strong_at on non-null fields.
+    pub spent_strong_ms: u64,
+    /// Spent sub: cold unspent / null-create path.
+    pub spent_cold_ms: u64,
+    /// Spent sub: pending_spent order gate.
+    pub spent_pending_ms: u64,
     /// Structural sub: create-height + coinbase maturity.
     pub structural_create_h_ms: u64,
     /// Structural sub: BIP68 + coin MTP.
@@ -341,6 +349,10 @@ impl Default for IbdPerfSample {
             utxo_ms: 0,
             structural_ms: 0,
             structural_spent_ms: 0,
+            spent_abs_ms: 0,
+            spent_strong_ms: 0,
+            spent_cold_ms: 0,
+            spent_pending_ms: 0,
             structural_create_h_ms: 0,
             structural_bip68_ms: 0,
             spend_ranged: 0,
@@ -656,6 +668,8 @@ pub(crate) fn sample(
     ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
     let (class_a_ns, ensure_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_class_a_ensure_and_reset();
+    let (spent_abs_ns, spent_strong_ns, spent_cold_ns, spent_pending_ns) =
+        rbitcoin_consensus::confirm_phase_stats::sample_spent_sub_and_reset();
     let (ensure_res_hit, ensure_cold_n) =
         rbitcoin_consensus::confirm_phase_stats::sample_ensure_mix_and_reset();
     let (asm_prevout_ns, asm_sigop_ns, asm_final_ns, asm_job_ns) =
@@ -721,6 +735,10 @@ pub(crate) fn sample(
         utxo_ms: ns_ms(utxo_apply_ns),
         structural_ms: ns_ms(structural_ns),
         structural_spent_ms: ns_ms(structural_spent_ns),
+        spent_abs_ms: ns_ms(spent_abs_ns),
+        spent_strong_ms: ns_ms(spent_strong_ns),
+        spent_cold_ms: ns_ms(spent_cold_ns),
+        spent_pending_ms: ns_ms(spent_pending_ns),
         structural_create_h_ms: ns_ms(structural_create_h_ns),
         structural_bip68_ms: ns_ms(structural_bip68_ns),
         spend_ranged,
@@ -1124,6 +1142,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     // Write stage detail: Class A + ensure + structural + Class C / SH / spend / tip GC.
     out.push_str(&format!(
         " | write class_a={}ms ensure={}ms(res={} cold={}) struct={}ms(spent={} create_h={} bip68={}) \
+         spent_sub(abs={} strong={} cold={} pending={}) \
          class_c={}ms sh={}ms spend={}ms tip_gc={}ms",
         s.class_a_ms,
         s.ensure_ms,
@@ -1133,6 +1152,10 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.structural_spent_ms,
         s.structural_create_h_ms,
         s.structural_bip68_ms,
+        s.spent_abs_ms,
+        s.spent_strong_ms,
+        s.spent_cold_ms,
+        s.spent_pending_ms,
         s.class_c_ms,
         s.sh_ms,
         s.utxo_ms,
@@ -1642,8 +1665,17 @@ mod tests {
         assert!(line.contains("pin_res=3"), "{line}");
         assert!(line.contains("pin_new=12"), "{line}");
         assert!(line.contains("body_io=400 parent_io=12"), "{line}");
+        s.spent_abs_ms = 20;
+        s.spent_strong_ms = 5;
+        s.spent_cold_ms = 3;
+        s.spent_pending_ms = 2;
+        let line = format_info(&s);
         assert!(
             line.contains("struct=50ms(spent=30 create_h=5 bip68=20)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("spent_sub(abs=20 strong=5 cold=3 pending=2)"),
             "{line}"
         );
         // write = 12+3+50+40+25+5 = 135

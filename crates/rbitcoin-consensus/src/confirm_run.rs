@@ -3383,6 +3383,10 @@ fn structural_run(
             &mut mtp_cache,
         )?;
         tot.spent_ns = tot.spent_ns.saturating_add(ph.spent_ns);
+        tot.spent_abs_ns = tot.spent_abs_ns.saturating_add(ph.spent_abs_ns);
+        tot.spent_strong_ns = tot.spent_strong_ns.saturating_add(ph.spent_strong_ns);
+        tot.spent_cold_ns = tot.spent_cold_ns.saturating_add(ph.spent_cold_ns);
+        tot.spent_pending_ns = tot.spent_pending_ns.saturating_add(ph.spent_pending_ns);
         tot.create_h_ns = tot.create_h_ns.saturating_add(ph.create_h_ns);
         tot.bip68_ns = tot.bip68_ns.saturating_add(ph.bip68_ns);
     }
@@ -3390,6 +3394,12 @@ fn structural_run(
     confirm_phase_stats::STRUCTURAL_NS
         .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
     confirm_phase_stats::STRUCTURAL_SPENT_NS.fetch_add(tot.spent_ns, Ordering::Relaxed);
+    confirm_phase_stats::STRUCTURAL_SPENT_ABS_NS.fetch_add(tot.spent_abs_ns, Ordering::Relaxed);
+    confirm_phase_stats::STRUCTURAL_SPENT_STRONG_NS
+        .fetch_add(tot.spent_strong_ns, Ordering::Relaxed);
+    confirm_phase_stats::STRUCTURAL_SPENT_COLD_NS.fetch_add(tot.spent_cold_ns, Ordering::Relaxed);
+    confirm_phase_stats::STRUCTURAL_SPENT_PENDING_NS
+        .fetch_add(tot.spent_pending_ns, Ordering::Relaxed);
     confirm_phase_stats::STRUCTURAL_CREATE_H_NS
         .fetch_add(tot.create_h_ns, Ordering::Relaxed);
     confirm_phase_stats::STRUCTURAL_BIP68_NS.fetch_add(tot.bip68_ns, Ordering::Relaxed);

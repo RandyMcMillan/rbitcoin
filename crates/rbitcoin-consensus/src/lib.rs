@@ -132,6 +132,14 @@ pub mod confirm_phase_stats {
     pub static STRUCTURAL_NS: AtomicU64 = AtomicU64::new(0);
     /// Durable spentness probes only (subset of structural).
     pub static STRUCTURAL_SPENT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Spent sub: pin abs collect + bulk 9-byte on-disk meta pread.
+    pub static STRUCTURAL_SPENT_ABS_NS: AtomicU64 = AtomicU64::new(0);
+    /// Spent sub: `is_confirmed_strong_at` on non-null spender fields.
+    pub static STRUCTURAL_SPENT_STRONG_NS: AtomicU64 = AtomicU64::new(0);
+    /// Spent sub: cold unspent_create_vouts / null-create path.
+    pub static STRUCTURAL_SPENT_COLD_NS: AtomicU64 = AtomicU64::new(0);
+    /// Spent sub: order-sensitive pending_spent gate (CPU).
+    pub static STRUCTURAL_SPENT_PENDING_NS: AtomicU64 = AtomicU64::new(0);
     /// Create-height + coinbase maturity resolve (subset of structural).
     pub static STRUCTURAL_CREATE_H_NS: AtomicU64 = AtomicU64::new(0);
     /// BIP68 relative locks + coin MTP (subset of structural; write path).
@@ -256,6 +264,20 @@ pub mod confirm_phase_stats {
             spend_ann_ns: LAST_WRITE_SPEND_ANN_NS.load(Ordering::Relaxed),
             tip_gc_ns: LAST_WRITE_TIP_GC_NS.load(Ordering::Relaxed),
         }
+    }
+
+    /// Spent subtimers (on-disk abs pread / strong / cold / pending). Sample + reset.
+    ///
+    /// Sum may be ≤ [`STRUCTURAL_SPENT_NS`] (setup residual). Authority remains
+    /// durable Class A meta — these only rank the probe.
+    #[inline]
+    pub fn sample_spent_sub_and_reset() -> (u64, u64, u64, u64) {
+        (
+            STRUCTURAL_SPENT_ABS_NS.swap(0, Ordering::Relaxed),
+            STRUCTURAL_SPENT_STRONG_NS.swap(0, Ordering::Relaxed),
+            STRUCTURAL_SPENT_COLD_NS.swap(0, Ordering::Relaxed),
+            STRUCTURAL_SPENT_PENDING_NS.swap(0, Ordering::Relaxed),
+        )
     }
 
     /// Sample and reset write-only Class A + ensure layout windows.

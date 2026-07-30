@@ -993,6 +993,14 @@ fn check_coinbase_subsidy(
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct StructuralPhaseNs {
     pub spent_ns: u64,
+    /// Pin abs collect + bulk on-disk 9-byte spender meta pread.
+    pub spent_abs_ns: u64,
+    /// `is_confirmed_strong_at` on non-null fields (still durable authority).
+    pub spent_strong_ns: u64,
+    /// Cold unspent_create_vouts / null-create probes.
+    pub spent_cold_ns: u64,
+    /// pending_spent order gate (CPU).
+    pub spent_pending_ns: u64,
     pub create_h_ns: u64,
     pub bip68_ns: u64,
 }
@@ -1033,6 +1041,8 @@ pub(crate) fn structural_validate_spends(
     let maturity = ctx.params.coinbase_maturity();
 
     // ── Spentness (durable + same-run pending) ─────────────────────────────
+    // Authority is always on-disk spender meta (bulk pread / cold). Pin only
+    // supplies abs offsets. Subtimers rank the probe — not cache spentness.
     let t_spent = Instant::now();
 
     // Unique create_fk → sorted unique vouts.
@@ -1058,6 +1068,7 @@ pub(crate) fn structural_validate_spends(
     // empty map) still uses body-range cold walk. Multi-list after meta read is
     // protocol cold.
     // abs_jobs: (create_id, vout, abs_off)
+    let t_abs = Instant::now();
     let mut abs_jobs: Vec<(u64, u32, u64)> = Vec::with_capacity(spends.len());
     let mut fallback_by_create: HashMap<u64, Vec<u32>> = HashMap::new();
     for (id, vouts) in &vouts_by_create {
@@ -1086,13 +1097,15 @@ pub(crate) fn structural_validate_spends(
     let mut durable_unspent: HashSet<(u64, u32)> = HashSet::with_capacity(spends.len());
     let tip = query.tip_height().map(|h| h.0);
 
-    // Hot path: bulk 9-byte spender meta at pin offsets.
+    // Hot path: bulk 9-byte spender meta at pin offsets (on-disk authority).
+    let mut spent_strong_ns = 0u64;
     if !abs_jobs.is_empty() {
         let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a)| *a).collect();
         let metas = query
             .store()
             .get_spender_meta_at_abs_batch(&abs_offs)
             .map_err(ConsensusError::Store)?;
+        let t_strong = Instant::now();
         for (i, &(id, vout, _)) in abs_jobs.iter().enumerate() {
             let Some((multi, field)) = metas[i] else {
                 // Short/failed pread: treat as not live (fail closed).
@@ -1115,9 +1128,14 @@ pub(crate) fn structural_validate_spends(
                 durable_unspent.insert((id, vout));
             }
         }
+        spent_strong_ns = t_strong.elapsed().as_nanos() as u64;
     }
+    let spent_abs_ns = t_abs.elapsed().as_nanos() as u64;
+    // abs timer includes strong loop above — subtract so abs ≈ collect+pread.
+    let spent_abs_ns = spent_abs_ns.saturating_sub(spent_strong_ns);
 
     // Cold: bulk idx ranges once, then unspent_create_vouts per create.
+    let t_cold = Instant::now();
     if !fallback_by_create.is_empty() {
         let need_range: Vec<rbitcoin_primitives::Fk> = fallback_by_create
             .keys()
@@ -1161,8 +1179,10 @@ pub(crate) fn structural_validate_spends(
             durable_null_spent.insert((prev_txid, vout));
         }
     }
+    let spent_cold_ns = t_cold.elapsed().as_nanos() as u64;
 
     // Order-sensitive pending double-spend + durable rejection.
+    let t_pending = Instant::now();
     for &(prev_txid, vout, _spend_fk, create_fk) in spends {
         let key = (prev_txid, vout);
         if pending_spent.contains(&key) {
@@ -1181,6 +1201,7 @@ pub(crate) fn structural_validate_spends(
         }
         pending_spent.insert(key);
     }
+    let spent_pending_ns = t_pending.elapsed().as_nanos() as u64;
     let spent_ns = t_spent.elapsed().as_nanos() as u64;
 
     // ── Create height + coinbase maturity (durable Class C only) ──────────
@@ -1307,6 +1328,10 @@ pub(crate) fn structural_validate_spends(
     check_coinbase_subsidy(block, ctx, fees)?;
     Ok(StructuralPhaseNs {
         spent_ns,
+        spent_abs_ns,
+        spent_strong_ns,
+        spent_cold_ns,
+        spent_pending_ns,
         create_h_ns,
         bip68_ns,
     })

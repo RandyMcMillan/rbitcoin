@@ -69,7 +69,7 @@ pub struct ProcessOwnedSizes {
     pub sh_runs: usize,
     pub sh_memtable: usize,
     pub sh_heads: usize,
-    /// Primary + shadow `tx.head` during online resize (logical table sizes).
+    /// Segmented `tx.head.*` occupancy (logical sizes; no shadow resize).
     pub head: rbitcoin_store::HeadResizeSizeSnapshot,
 }
 

@@ -879,9 +879,13 @@ pub fn is_packed_tx_payload(raw: &[u8]) -> bool {
     raw.len() >= TxRecord::ENCODED_LEN
 }
 
-/// Segmented `tx.head` occupancy for IBD size logs (no mono-head shadow resize).
+/// Segmented `tx.head` occupancy for IBD size logs.
+///
+/// Name is historical (`HeadResizeSizeSnapshot`); there is no shadow resize.
+/// `shadow_*` fields are always zero (compat with older size-log parsers).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HeadResizeSizeSnapshot {
+    /// Always false — segment roll is synchronous on insert.
     pub active: bool,
     pub cursor: u64,
     pub class_a_n: u64,
@@ -889,7 +893,9 @@ pub struct HeadResizeSizeSnapshot {
     pub primary_slots: u64,
     pub primary_entry_b: u8,
     pub primary_occupied: u64,
+    /// Logical size of one segment head file (`slots × entry_bytes`).
     pub primary_body_bytes: u64,
+    /// Deprecated (always 0) — was mono-head shadow geometry.
     pub shadow_bits: u32,
     pub shadow_slots: u64,
     pub shadow_entry_b: u8,
@@ -992,8 +998,40 @@ impl TxTable {
                 t.head_bits(),
                 t.head.segment_count()
             );
+        } else {
+            // Open segment may have creates from a prior process; rebuild fuse
+            // keys from Class A so a later seal never FN pre-restart members.
+            t.rebuild_open_segment_fuse_keys()?;
         }
         Ok(t)
+    }
+
+    /// Rebuild open-tail fuse keys from Class A body txids (crash/restart safe).
+    fn rebuild_open_segment_fuse_keys(&self) -> Result<(), StoreError> {
+        let Some((first_fk, count)) = self.head.open_tail_range() else {
+            return Ok(());
+        };
+        if count == 0 {
+            return Ok(());
+        }
+        let last_fk = first_fk.saturating_add(count).saturating_sub(1);
+        let txids = self.body_txid_range(first_fk, last_fk)?;
+        if txids.len() as u64 != count {
+            return Err(StoreError::Corrupt(
+                "tx.head open-tail body range count mismatch",
+            ));
+        }
+        let keys: Vec<u64> = txids
+            .iter()
+            .map(|txid| {
+                crate::fuse8_filter::fuse_key_from_mixed(&self.secret.mix_txid(txid))
+            })
+            .collect();
+        self.head.replace_open_keys(keys)?;
+        rbitcoin_log::info!(
+            "store: tx.head open-tail fuse keys rebuilt first_fk={first_fk} count={count}"
+        );
+        Ok(())
     }
 
 
@@ -1992,6 +2030,10 @@ impl TxTable {
     }
 
     /// Insert txid→fk into the segmented head (mixes keys; may seal/roll).
+    ///
+    /// Splits the batch so each open segment respects
+    /// `MIN(body soft span, 80% head slots)` — soft-span is measured from the
+    /// **open segment's first_fk** (not only the first segment in the store).
     pub fn head_insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
@@ -2000,54 +2042,60 @@ impl TxTable {
             .iter()
             .map(|(txid, fk)| (self.secret.mix_txid(txid), *fk))
             .collect();
-        // Body soft-span: if open segment's body span exceeds soft span, force roll.
-        let force_roll = self.head_should_force_roll_for_body(&mixed)?;
-        self.head.insert_many(&mixed, force_roll)?;
+        let soft = SegmentedTxHead::soft_span_bytes();
+        let mut i = 0usize;
+        while i < mixed.len() {
+            // Seal open tail first if it already soft-overflows for the next create.
+            let force_roll = self.open_soft_span_exceeded(mixed[i].1 .0)?;
+            // After an optional seal, the open first_fk for this wave is either
+            // the existing open first_fk or the first fk of this sub-batch.
+            let wave_first = if force_roll {
+                mixed[i].1 .0
+            } else {
+                self.head
+                    .open_tail_range()
+                    .map(|(f, _)| f)
+                    .unwrap_or(mixed[i].1 .0)
+            };
+            // Take consecutive entries while body span from wave_first stays ≤ soft.
+            let mut j = i;
+            while j < mixed.len() {
+                if j > i && self.body_span_bytes(wave_first, mixed[j].1 .0)? > soft {
+                    break;
+                }
+                j += 1;
+            }
+            if j == i {
+                j = i + 1; // always make progress (single oversized create)
+            }
+            self.head.insert_many(&mixed[i..j], force_roll)?;
+            i = j;
+        }
         Ok(())
     }
 
-    fn head_should_force_roll_for_body(
-        &self,
-        entries: &[([u8; 32], Fk)],
-    ) -> Result<bool, StoreError> {
-        if entries.is_empty() {
-            return Ok(false);
-        }
-        // If we have an open segment with creates, check body span of that segment
-        // plus incoming would exceed soft span — caller uses first open first_fk.
-        // Cheap approx: if total body published already large relative to soft span
-        // from fk=1, we still rely on load roll. Soft-span coupling:
-        // when the first fk of the batch is not continuing a short segment body.
+    /// True when open segment body span from `open.first_fk` to `next_fk` exceeds soft span.
+    fn open_soft_span_exceeded(&self, next_fk: u64) -> Result<bool, StoreError> {
         let soft = SegmentedTxHead::soft_span_bytes();
-        // Look at body range of first create that would land in current open
-        // after insert — use body end of last existing and start of first open.
-        // Without open first_fk public, use: if body of latest create minus
-        // body of (latest - max_keys) > soft — approximate via last entry.
-        let last_fk = entries.last().unwrap().1 .0;
-        if last_fk == 0 {
+        let Some((first_fk, count)) = self.head.open_tail_range() else {
+            return Ok(false);
+        };
+        if count == 0 {
             return Ok(false);
         }
-        // When class A body file spans more than soft from the first fk of the
-        // current open segment, force roll. We estimate open first as
-        // max(1, last_published - max_keys + 1) when segments not yet rolled.
-        let segs = self.head.segment_count();
-        if segs == 0 {
+        if next_fk < first_fk {
             return Ok(false);
         }
-        // Use body span of the whole table's last soft window only when single segment.
-        if segs == 1 && last_fk > 1 {
-            if let (Ok((off0, _)), Ok((off1, len1))) = (
-                self.body.record_range(Fk(1)),
-                self.body.record_range(Fk(last_fk)),
-            ) {
-                let end = off1.saturating_add(len1);
-                if end.saturating_sub(off0) > soft {
-                    return Ok(true);
-                }
-            }
+        Ok(self.body_span_bytes(first_fk, next_fk)? > soft)
+    }
+
+    fn body_span_bytes(&self, first_fk: u64, last_fk: u64) -> Result<u64, StoreError> {
+        if first_fk == 0 || last_fk < first_fk {
+            return Ok(0);
         }
-        let _ = soft;
-        Ok(false)
+        let (off0, _) = self.body.record_range(Fk(first_fk))?;
+        let (off1, len1) = self.body.record_range(Fk(last_fk))?;
+        Ok(off1.saturating_add(len1).saturating_sub(off0))
     }
 
     pub fn head_insert_many_sole(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
@@ -2106,6 +2154,7 @@ impl TxTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::segmented_head::SegmentedTxHead;
 
     fn tempfile_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -3649,6 +3698,140 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// Reopen mid-open-segment, then fill to seal: pre-reopen creates must not FN.
+    #[test]
+    fn reopen_mid_segment_then_seal_no_fuse_fn() {
+        with_env_lock(|| {
+            // Only load@80% rolls — clear soft-span override from sibling tests.
+            SegmentedTxHead::test_set_soft_span_bytes(0);
+            std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
+            let dir = tempfile_dir("reopen-seal-fn");
+            // 10-bit: max_keys = floor(0.8*1024) = 819
+            let layout = HeadLayout::with_entry_bytes(10, 4).unwrap();
+            let half = 400u64;
+            {
+                let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+                let recs: Vec<TxRecord> = (0..half)
+                    .map(|i| {
+                        let mut txid = [0u8; 32];
+                        txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+                        TxRecord {
+                            txid,
+                            version: 1,
+                            locktime: 0,
+                            input_start_fk: Fk::NULL,
+                            input_count: 0,
+                            output_start_fk: Fk::NULL,
+                            output_count: 0,
+                        }
+                    })
+                    .collect();
+                t.put_batch(&recs).unwrap();
+                assert_eq!(t.head_segment_count(), 1);
+                assert_eq!(t.head.sealed_segment_count(), 0);
+                assert_eq!(t.head.open_keys_len() as u64, half);
+                t.flush().unwrap();
+            }
+            // Reopen: open_keys must rebuild from Class A.
+            let t = TxTable::open(&dir).unwrap();
+            assert_eq!(t.head.open_keys_len() as u64, half, "open keys rebuilt");
+            // Fill past 819 so first segment seals.
+            let more: Vec<TxRecord> = (half..900)
+                .map(|i| {
+                    let mut txid = [0u8; 32];
+                    txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+                    TxRecord {
+                        txid,
+                        version: 1,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 0,
+                        output_start_fk: Fk::NULL,
+                        output_count: 0,
+                    }
+                })
+                .collect();
+            t.put_batch(&more).unwrap();
+            assert!(t.head.sealed_segment_count() >= 1, "must have sealed");
+            // Pre-reopen members must resolve through sealed fuse (no FN).
+            for i in [1u64, 50, 200, 400] {
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&i.to_le_bytes());
+                assert_eq!(
+                    t.get_fk_by_txid(&txid).unwrap(),
+                    Some(Fk(i)),
+                    "pre-reopen fk={i} FN after seal"
+                );
+            }
+            for i in [401u64, 820, 900] {
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&i.to_le_bytes());
+                assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)), "fk={i}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// Soft-span force_roll uses **open** segment first_fk (after a prior roll).
+    #[test]
+    fn soft_span_roll_on_open_segment_not_only_first() {
+        with_env_lock(|| {
+            let dir = tempfile_dir("soft-span-open");
+            let layout = HeadLayout::with_entry_bytes(14, 4).unwrap();
+            let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+            let mk = |i: u64| {
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&i.to_le_bytes());
+                let tx = TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                };
+                let inputs = vec![InputRecord {
+                    prev_txid: [0u8; 32],
+                    create_fk: Fk::NULL,
+                    prev_index: u32::MAX,
+                    sequence: u32::MAX,
+                    script_sig: vec![0xab; 64],
+                    witness: vec![vec![0xcd; 400]],
+                }];
+                let outputs = vec![OutputRecord::unspent(1, vec![0x51; 32])];
+                (tx, inputs, outputs)
+            };
+            // ~2 fat creates per soft window (test override, not env).
+            SegmentedTxHead::test_set_soft_span_bytes(800);
+            for i in 1..=6u64 {
+                t.put_full_batch_indexed(&[mk(i)], true).unwrap();
+            }
+            let segs_mid = t.head_segment_count();
+            let sealed_mid = t.head.sealed_segment_count();
+            assert!(
+                segs_mid >= 2 && sealed_mid >= 1,
+                "first soft rolls segs={segs_mid} sealed={sealed_mid}"
+            );
+            for i in 7..=12u64 {
+                t.put_full_batch_indexed(&[mk(i)], true).unwrap();
+            }
+            let sealed = t.head.sealed_segment_count();
+            assert!(
+                sealed > sealed_mid,
+                "open-segment soft-span must seal again sealed={sealed} mid={sealed_mid} segs={}",
+                t.head_segment_count()
+            );
+            for i in [1u64, 6, 9, 12] {
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&i.to_le_bytes());
+                assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)));
+            }
+            SegmentedTxHead::test_set_soft_span_bytes(0);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
     #[test]
     fn segmented_head_roll_and_lookup_via_tx_table() {
         let dir = tempfile_dir("seg-roll");

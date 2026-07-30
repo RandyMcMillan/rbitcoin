@@ -1256,8 +1256,8 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
 /// Format process RSS + known retain-structure occupancy (leak triage).
 ///
 /// All counts are O(1) lens / brief mutex snaps taken on the 5s tick. Compare
-/// `anon=` growth to heap caches and `file=` growth to store mmaps (`tx.head`
-/// dual-map during resize). `locked=` is mlock only (usually 0) — **not** a
+/// `anon=` growth to heap caches and `file=` growth to store mmaps (segmented
+/// `tx.head.*` + fuse8). `locked=` is mlock only (usually 0) — **not** a
 /// filter on what enters RSS.
 ///
 /// Create pin occupancy is **`residency creates=/outs=`** only.
@@ -1267,9 +1267,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let o = &s.owned;
     let h = &o.head;
     let cp = &s.conf_pipe;
-    let head_active = if h.active { 1 } else { 0 };
     let primary_mib = h.primary_body_bytes / (1024 * 1024);
-    let shadow_mib = h.shadow_body_bytes / (1024 * 1024);
     let load_wire_mib = cp.load_wire_bytes / (1024 * 1024);
     let write_wire_mib = cp.write_wire_bytes / (1024 * 1024);
     // file% of RSS: how much of process RSS is file-backed (mmap tables + .so).
@@ -1289,8 +1287,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
          | residency creates={}/{} outs={}/{} conf_plans={} \
          | conf planq={}/{} blks={} prepq={}/{} blks={} wire={}MiB parents={} writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
-         | txhead active={} bits={}/{} entry={}B slots={} occ={} body={}MiB \
-           shadow bits={} entry={}B slots={} occ={} body={}MiB cursor={}/{} \
+         | txhead bits={} entry={}B slots={} occ={} body={}MiB segs={} sealed={} class_a={} \
          | sh runs={} memtable={} heads={}",
         kb_mib(s.rss_kb),
         kb_mib(s.rss_anon_kb),
@@ -1341,19 +1338,13 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         cp.write_parents,
         cp.feed_ready,
         cp.feed_inflight,
-        head_active,
         h.primary_bits,
-        h.shadow_bits.max(h.primary_bits),
         h.primary_entry_b,
         h.primary_slots,
         h.primary_occupied,
         primary_mib,
-        h.shadow_bits,
-        h.shadow_entry_b,
-        h.shadow_slots,
-        h.shadow_occupied,
-        shadow_mib,
-        h.cursor,
+        h.segment_count,
+        h.sealed_segments,
         h.class_a_n,
         o.sh_runs,
         o.sh_memtable,
@@ -1646,16 +1637,13 @@ mod tests {
         s.bq_count = 4;
         s.bq_bytes = 32 * 1024 * 1024;
         s.bq_budget = 512 * 1024 * 1024;
-        s.owned.head.active = true;
-        s.owned.head.primary_bits = 29;
-        s.owned.head.shadow_bits = 30;
+        s.owned.head.primary_bits = 25;
         s.owned.head.primary_entry_b = 4;
-        s.owned.head.shadow_entry_b = 4;
-        s.owned.head.primary_slots = 1 << 29;
-        s.owned.head.shadow_slots = 1 << 30;
-        s.owned.head.primary_body_bytes = (1u64 << 29) * 4;
-        s.owned.head.shadow_body_bytes = (1u64 << 30) * 4;
-        s.owned.head.cursor = 1_000_000;
+        s.owned.head.primary_slots = 1 << 25;
+        s.owned.head.primary_body_bytes = (1u64 << 25) * 4;
+        s.owned.head.primary_occupied = 1_000_000;
+        s.owned.head.segment_count = 3;
+        s.owned.head.sealed_segments = 2;
         s.owned.head.class_a_n = 2_000_000;
         s.conf_pipe.load_batches = 2;
         s.conf_pipe.load_blocks = 40;
@@ -1687,9 +1675,10 @@ mod tests {
         assert!(line.contains("prepq=2/5 blks=40 wire=12MiB parents=500"), "{line}");
         assert!(line.contains("writeq=1/5 blks=16 wire=4MiB"), "{line}");
         assert!(line.contains("feed ready=8 inflight=32"), "{line}");
-        assert!(line.contains("txhead active=1"), "{line}");
-        assert!(line.contains("bits=29/30"), "{line}");
-        assert!(line.contains("cursor=1000000/2000000"), "{line}");
+        assert!(line.contains("txhead bits=25"), "{line}");
+        assert!(line.contains("segs=3 sealed=2"), "{line}");
+        assert!(line.contains("class_a=2000000"), "{line}");
+        assert!(!line.contains("shadow"), "{line}");
         assert!(line.contains("contig parked=3"), "{line}");
     }
 

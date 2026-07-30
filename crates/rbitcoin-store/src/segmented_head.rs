@@ -54,6 +54,9 @@ static LOOKUP_SEALED_PROBE: AtomicU64 = AtomicU64::new(0);
 static ROLLS: AtomicU64 = AtomicU64::new(0);
 static SEALS: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+static TEST_SOFT_SPAN_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
 pub fn sample_lookup_stats() -> HeadLookupStats {
     HeadLookupStats {
         open_probes: LOOKUP_OPEN.swap(0, Ordering::Relaxed),
@@ -215,12 +218,83 @@ impl SegmentedTxHead {
             .sum()
     }
 
+    /// Open (unsealed) tail: `(first_fk, count)`. `None` if no segments or tail sealed.
+    pub fn open_tail_range(&self) -> Option<(u64, u64)> {
+        let segs = self.segments_snapshot();
+        let last = segs.last()?;
+        if last.sealed {
+            return None;
+        }
+        Some((last.first_fk, last.count.load(Ordering::Relaxed)))
+    }
+
+    /// Replace fuse keys for the open tail (e.g. rebuild from Class A after reopen).
+    ///
+    /// Required before seal when this process did not insert every open create
+    /// (crash/restart mid-segment). `keys.len()` must equal open `count`.
+    pub fn replace_open_keys(&self, keys: Vec<u64>) -> Result<(), StoreError> {
+        let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        let segs = self.segments_snapshot();
+        let last = segs
+            .last()
+            .ok_or(StoreError::Corrupt("tx.head replace_open_keys: no segment"))?;
+        if last.sealed {
+            return Err(StoreError::Corrupt(
+                "tx.head replace_open_keys: tail sealed",
+            ));
+        }
+        let count = last.count.load(Ordering::Relaxed);
+        if keys.len() as u64 != count {
+            return Err(StoreError::Corrupt(
+                "tx.head replace_open_keys: key count mismatch",
+            ));
+        }
+        *last
+            .open_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = keys;
+        Ok(())
+    }
+
+    /// Number of fuse keys buffered for the open tail (diagnostics / tests).
+    pub fn open_keys_len(&self) -> usize {
+        let segs = self.segments_snapshot();
+        let Some(last) = segs.last() else {
+            return 0;
+        };
+        if last.sealed {
+            return 0;
+        }
+        let n = last
+            .open_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        n
+    }
+
+    /// Body soft-span roll threshold (bytes). Same default as `tx.idx`.
+    ///
+    /// Under test, [`test_set_soft_span_bytes`] overrides env when non-zero.
     pub fn soft_span_bytes() -> u64 {
+        #[cfg(test)]
+        {
+            let o = TEST_SOFT_SPAN_OVERRIDE.load(Ordering::Relaxed);
+            if o > 0 {
+                return o;
+            }
+        }
         std::env::var("RBITCOIN_TX_IDX_SOFT_SPAN")
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|&v| v >= 8)
             .unwrap_or(DEFAULT_SOFT_SPAN)
+    }
+
+    /// Test-only soft-span override (`0` = use env/default).
+    #[cfg(test)]
+    pub fn test_set_soft_span_bytes(bytes: u64) {
+        TEST_SOFT_SPAN_OVERRIDE.store(bytes, Ordering::Relaxed);
     }
 
     fn segments_snapshot(&self) -> Arc<Vec<Arc<Segment>>> {
@@ -450,6 +524,13 @@ impl SegmentedTxHead {
         keys.sort_unstable();
         keys.dedup();
         let key_n = keys.len();
+        // Must cover every open create — incomplete after restart without
+        // [`Self::replace_open_keys`] rebuild would produce FN on seal.
+        if key_n as u64 != count {
+            return Err(StoreError::Corrupt(
+                "tx.head seal open_keys incomplete (reopen mid-segment without rebuild)",
+            ));
+        }
         rbitcoin_log::info!(
             "store: tx.head seal begin file_id={} first_fk={} count={count} fuse_keys={key_n}",
             last.file_id,

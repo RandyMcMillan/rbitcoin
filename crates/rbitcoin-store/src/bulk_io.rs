@@ -2,7 +2,7 @@
 //! kernel can keep many independent ops in flight.
 //!
 //! All io_uring work is driven by [`crate::uring_session::UringSession`] (same
-//! type as archive streaming resolve and `tx.head` shadow fill). Hot-path
+//! type as archive streaming head-resolve). Hot-path
 //! `pread_batch` / `pwrite_batch` / page-RMW reuse a **thread-local** ring so
 //! confirm-load and archive-prep waves do not `io_uring_setup`/`exit` per batch.
 //! Nested bulk_io on the same thread (re-entrant) opens a temporary ring.

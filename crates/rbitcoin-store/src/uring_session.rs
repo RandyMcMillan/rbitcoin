@@ -3,7 +3,6 @@
 //! All production io_uring work goes through [`UringSession`]:
 //! - streaming archive head-resolve (one session per resolve batch)
 //! - spend annotate abs-meta RMW (one session per annotate batch)
-//! - online `tx.head` shadow fill
 //! - [`crate::bulk_io`] pread/pwrite batches and page RMW (thread-local reuse)
 //!
 //! A session must not be shared across concurrent call stacks. `bulk_io` keeps a
@@ -15,7 +14,7 @@ use crate::error::StoreError;
 use std::os::fd::RawFd;
 use std::path::Path;
 
-/// Default SQ/CQ depth (matches bulk_io / shadow fill).
+/// Default SQ/CQ depth (matches bulk_io).
 pub const DEFAULT_ENTRIES: u32 = 1024;
 
 /// Owned io_uring for multi-stage submit/complete loops.

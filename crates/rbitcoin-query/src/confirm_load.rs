@@ -267,8 +267,8 @@ impl Query {
             height_tx_fks.push((height, tx_fks));
         }
 
-        // ── Cache put (OutFifo only) ─
-        // Residency outs already seeded by load_creates_once (single decode).
+        // ── Legacy OutFifo dual-write (hash path / SH collect warmouts only) ─
+        // Wire pin uses CreateResidency (seeded by load_creates_once).
         let t_put = Instant::now();
         self.confirm_parents.put_bodies_from_batch_full(&batch_bodies);
         st.cache_put_ns = st
@@ -352,7 +352,7 @@ impl Query {
         // resolve is deferred to structural write (maturity). Unset (`None`)
         // means write must look up if needed.
         //
-        // Same-batch creates are in OutFifo with denserels after put_bodies_from_batch_full;
+        // Same-batch creates are in batch_bodies (and residency) with denserels;
         // if FIFO missed (cap eviction) fall back to batch_bodies layout without idx.
         let t_body = Instant::now();
         let body_keys: Vec<(u64, &[u32])> = pin_jobs
@@ -432,9 +432,8 @@ impl Query {
 
         // ── pin_new: idx→body pipeline in **chunks** ─────────────────────
         // Holding ~90k full packed bodies + dense outs at once blew RSS.
-        // Chunk so peak is O(PIN_NEW_CHUNK) bodies. Range resolve is one sticky
-        // + one OutFifo batch for the whole pin_new set (two mutex takes), then
-        // body IO runs in chunks via idx→body pipeline.
+        // Chunk so peak is O(PIN_NEW_CHUNK) bodies. Prefer CreateResidency; cold
+        // path is one denserels load that seeds residency (+ legacy OutFifo dual-write).
         const PIN_NEW_CHUNK: usize = 4096;
         let t_new = Instant::now();
         if self.confirm_cancelled() {
@@ -442,7 +441,7 @@ impl Query {
             return Err(StoreError::Cancelled("confirm cancelled"));
         }
         // pin_new via combined residency: one denserels load seeds residency;
-        // OutFifo dual-write kept for legacy cross-checks.
+        // OutFifo dual-write kept for legacy SH collect / reconstruct warmouts.
         // Prefer already-resident outs (same creates archive just published).
         let mut still_need: Vec<(u64, Vec<u32>)> = Vec::new();
         for (pid, need_vouts) in &pin_new_pending {

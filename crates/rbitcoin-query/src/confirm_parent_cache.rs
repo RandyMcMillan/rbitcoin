@@ -1,8 +1,10 @@
 //! Process-local confirm parent cache (load stage).
 //!
 //! - **Header plans** (`headers` / `hash_to_height`): tip-GCed header + tx_fks.
-//! - **Create outs FIFO** ([`crate::out_fifo::OutFifo`]): pin hits (cap 2²⁴ outs).
 //! - **Plans / ready_through**: load-scanned watermark for diagnostics.
+//! - **Legacy OutFifo** ([`crate::out_fifo::OutFifo`]): dual-write hangover on the
+//!   hash load path only. **Wire IBD pin uses [`crate::CreateResidency`]**, not
+//!   this map. Do not treat empty OutFifo as a bug.
 //!
 //! Thin edges and sparse parent pins are **batch-local**
 //! ([`crate::confirm_load::BatchThin`], [`crate::BatchParents`]) — not stored
@@ -395,7 +397,10 @@ impl ConfirmParentCache {
     }
 
     /// `(create_count, total_outs, cap_outs, fifo_order_len)` for perf/tests.
-    pub fn body_lru_stats(&self) -> (usize, u64, u64, usize) {
+    ///
+    /// Name is historical; eviction is **FIFO**, not LRU. Prefer
+    /// [`Self::out_fifo_stats`]. Wire IBD pin uses CreateResidency, not this map.
+    pub fn out_fifo_stats(&self) -> (usize, u64, u64, usize) {
         let g = self.inner.lock().unwrap();
         (
             g.outs.len(),
@@ -403,6 +408,11 @@ impl ConfirmParentCache {
             g.outs.cap_outs(),
             g.outs.order_len(),
         )
+    }
+
+    #[deprecated(note = "renamed to out_fifo_stats (FIFO, not LRU)")]
+    pub fn body_lru_stats(&self) -> (usize, u64, u64, usize) {
+        self.out_fifo_stats()
     }
 
     pub fn body_count(&self) -> usize {
@@ -773,7 +783,7 @@ mod tests {
             ti.txid[0] = i as u8;
             c2.put_body(Fk(i + 1), 1, ti, vec![out(1); 4], vec![]);
         }
-        let (n, total, cap, _) = c2.body_lru_stats();
+        let (n, total, cap, _) = c2.out_fifo_stats();
         assert!(total <= cap, "total_outs={total} cap={cap} creates={n}");
         assert!(n <= 25, "creates={n}");
 

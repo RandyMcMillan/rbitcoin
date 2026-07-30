@@ -1,13 +1,25 @@
-//! Unified create residency for the combined archive/confirm path.
+//! Unified create residency — **sole hot create map** for wire IBD pin / plan.
 //!
-//! Replaces the dual thrashing pair **archive sticky** + **confirm OutFifo** with
-//! one bounded map: `create_fk → (txid, body range, optional outs)`.
+//! # Map shape
 //!
-//! **Raw FIFO** eviction (no touch/LRU): oldest inserts drop first when the
-//! create-count or out-count budget is exceeded.
+//! `create_fk → (txid, body range, optional outs + denserels)`.
 //!
-//! Used by the combined load stage so parent bodies needed for archive stamp and
-//! confirm pin are resolved **once**.
+//! # Eviction: raw FIFO only (no read-LRU)
+//!
+//! Oldest inserts drop first when create-count or out-count budget is exceeded.
+//! Lookups **never** reorder the FIFO (spend of one out does not predict another
+//! out of the same create). Do not reintroduce touch-on-hit.
+//!
+//! # Denserels hit rate is largely structural
+//!
+//! Mid/late mainnet IBD often sees **~35–50%** denserels pin hits. Many spends
+//! reference **old UTXOs** that left any process cache long ago — that miss rate
+//! is expected, not a residency bug. Do **not** grow multi‑GiB caps hoping for
+//! 65–70% hit rate. Optimize: (1) keep **recent** commit-seed / offline denserels
+//! working, (2) make **cold** denserels loads cheap (batch once, no double ensure).
+//!
+//! Legacy **archive sticky** (fk/range mirror) and **OutFifo** are not the wire
+//! pin path; see plan / IBD sizes logging (residency primary).
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};

@@ -50,15 +50,16 @@ Default: **info**. CLI wins over env.
 |------|-------|-----|
 | `ibd: progress` | INFO | Tip rate, `loadq`/`writeq`, `txs=` (Class A / `tx.idx` count), horizon, tip ETA, durable `bq=` (on-disk block queue count + MiB/budget) |
 | `ibd: perf` | INFO | Inflight + RAM `arch_q` + durable `bq=`; **load / script / write** walls; load phases (hdr/dec/put/thin/pin + pin_hit%/pin_res/body_io); write (struct/class_c/sh/spend/tip_gc) |
-| `ibd: sizes` | INFO | RSS + work path + arch RAM queue + **bq** + **residency** + outfifo + confirm pipe |
-| `ibd: perf_dbg` | DEBUG | µs/blk load/write, pin/edge detail, **archive Class A prep/write/sticky**, contig park |
+| `ibd: sizes` | INFO | RSS + work path + arch RAM queue + **bq** + **residency** + confirm pipe (`sticky_fk=` legacy; empty OutFifo omitted) |
+| `ibd: perf_dbg` | DEBUG | µs/blk load/write, pin/edge detail, **plan_mega res_txid** + **class_a res_seed**, contig park |
 
-At **info**, progress + perf already expose load/write bottlenecks (schema 12). Enable **debug** for archive sticky/prep/write pipe and per-block µs. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters.
+At **info**, progress + perf already expose load/write bottlenecks (schema 12). Enable **debug** for plan-mega / Class A commit subtimers and per-block µs. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters.
 
-**Archive `tx.head` split (perf_dbg):** `arch_prep … head_rd=` is parent
+**Create pin map:** sole hot map is **CreateResidency** (`residency creates=/outs=` on sizes; `res_txid_hit` / `res_seed` on perf_dbg). Legacy archive sticky (`sticky_fk=`) is dual-write/prewarm only — not the pin cache. Empty `outfifo` is normal on wire IBD.
+
+**Archive `tx.head` split (perf_dbg):** `plan_mega … head_rd=` is parent
 **read** resolve (`get_fk_by_txid_batch`, with `probe` / `idx` / `body` subtimers).
-`arch_write … head_wr=` is create **insert** (`head_insert_many`). Sticky only
-caches this batch’s creates (not head-resolved parents).
+`class_a_commit … head=` is create **insert** (`head_insert_many`). `res_seed` is CreateResidency denserels seed for this batch’s creates.
 
 **Archive head resolve:** streaming — **mmap** probe + **io_uring** idx→body
 prefix verify (deepest-cand-first early exit). `RBITCOIN_IO_URING=0` (or stream

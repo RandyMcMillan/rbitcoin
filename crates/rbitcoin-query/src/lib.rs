@@ -57,20 +57,25 @@ pub const BLOCK_QUEUE_PRESSURE_ENTER: f64 = 0.90;
 pub const BLOCK_QUEUE_PRESSURE_EXIT: f64 = 0.70;
 
 /// Cheap process-owned cache occupancy for IBD `ibd: sizes` (O(1) lens + brief locks).
+///
+/// **Primary pin map:** `residency_*`. Legacy `sticky_*` (archive txid sticky
+/// dual-write) and `out_*` (OutFifo) are hangover occupancy — wire pin does not
+/// use them; INFO sizes omits empty OutFifo.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProcessOwnedSizes {
+    /// Legacy archive sticky (fk/range mirror); not the wire pin map.
     pub sticky_len: usize,
     pub sticky_cap: usize,
     pub sticky_fifo: usize,
-    /// OutFifo create entries.
+    /// Legacy OutFifo create entries (wire IBD typically 0).
     pub out_creates: usize,
-    /// OutFifo total outs (vs `out_cap`).
+    /// Legacy OutFifo total outs (vs `out_cap`).
     pub out_total: u64,
     pub out_cap: u64,
     pub out_order: usize,
     pub conf_plans: usize,
     pub conf_bodies: usize,
-    /// Unified create residency (schema 12): creates + outs vs caps.
+    /// Sole hot create map: creates + outs vs caps (FIFO).
     pub residency_creates: usize,
     pub residency_create_cap: usize,
     pub residency_outs: u64,
@@ -672,11 +677,10 @@ pub struct Query {
     sh_indexed_through: AtomicU64,
     /// Block-structured confirm parent cache.
     confirm_parents: confirm_parent_cache::ConfirmParentCache,
-    /// Archive writer sticky: txid → create_fk for packing spends (cross mega-batch).
+    /// Legacy archive sticky (fk/range dual-write + prewarm). Not wire pin.
     archive_txid_sticky: archive_txid_sticky::ArchiveTxidSticky,
-    /// Unified create residency (fk/range/outs) — single parent-body path for
-    /// combined archive prep + confirm load. Dual-written with sticky/OutFifo
-    /// during migration; pin/range lookups prefer this map.
+    /// Sole hot create map (fk/range/outs) for archive prep + confirm pin.
+    /// Legacy sticky/OutFifo may dual-write; wire pin reads this only.
     create_residency: create_residency::CreateResidency,
     /// Durable multi‑GiB on-disk block payload queue (IBD restart without re-download).
     block_queue: Mutex<rbitcoin_store::BlockQueue>,
@@ -1145,11 +1149,12 @@ impl Query {
 
     /// Cheap process-owned cache sizes for the IBD `ibd: sizes` line.
     ///
-    /// A few brief mutex locks only (sticky / parent cache / SH memtable /
-    /// sh_heads). Call from the ~5s status tick — not the hot path.
+    /// Brief mutex locks only (residency / legacy sticky / OutFifo / SH / heads).
+    /// Call from the ~5s status tick — not the hot path. Prefer residency fields;
+    /// sticky/outfifo are legacy dual-write occupancy.
     pub fn process_owned_size_snapshot(&self) -> ProcessOwnedSizes {
         let (sticky_len, sticky_cap, sticky_fifo) = self.archive_txid_sticky.size_stats();
-        let (out_creates, out_total, out_cap, out_order) = self.confirm_parents.body_lru_stats();
+        let (out_creates, out_total, out_cap, out_order) = self.confirm_parents.out_fifo_stats();
         let (res_creates, res_create_cap, res_outs, res_out_cap) =
             self.create_residency.size_stats();
         let conf_plans = self.confirm_parents.plan_count();

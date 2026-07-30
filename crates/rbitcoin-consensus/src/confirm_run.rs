@@ -217,7 +217,7 @@ pub fn confirm_load_phase_preverified(
 
     // Decode bodies once, pin parents + thin edges (batch-local).
     // Residency after this returns / after wire:
-    //   • pin_new dense outs live only in process OutFifo (not on the batch)
+    //   • pin denserels live in CreateResidency (not on the batch; OutFifo is legacy)
     //   • BatchParents holds need-vouts only (rides load→scripts→write queues)
     //   • BatchFullBodies (creates) is used for wire then dropped — not queued
     let t_load = Instant::now();

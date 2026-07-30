@@ -264,8 +264,8 @@ impl Query {
         let collect_ns = t_collect.elapsed().as_nanos() as u64;
 
         let t_sticky = Instant::now();
-        // Single process-local create map (CreateResidency). Legacy sticky + OutFifo
-        // are no longer consulted on the wire plan path (dual-write hangover removed).
+        // CreateResidency txid→fk (sole hot map). Counter/timer still named sticky_*
+        // in archive_phase_stats; IBD logs label them res_txid / res_txid_hit.
         let mut resolved: HashMap<[u8; 32], Fk> =
             HashMap::with_capacity(need_vec.len() / 2);
         let mut sticky_hit_n = 0u64;
@@ -515,7 +515,8 @@ impl Query {
 
         // Publish **this batch's creates only** into CreateResidency (sole hot map)
         // after head is durable. Seed denserels offline so prep(N+1) pin hits without
-        // Class A body re-read. Legacy sticky mirror kept for size logs only.
+        // Class A body re-read. Timer logged as res_seed (still write_sticky_ns atom).
+        // Legacy sticky mirror kept for prewarm / size diagnostics only.
         let t = Instant::now();
         let ranges = self.store.tx_body_range_batch(&got_tx_fks)?;
         let secret = self.store.txs.store_secret();

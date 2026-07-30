@@ -16,6 +16,18 @@ order + map epochs**, not `Mutex` around mmap.
 If a change introduces a new long-held store lock on the IBD/read path, it is the
 wrong design — fix the protocol. See `docs/concurrency.md`.
 
+## Create caches: residency sole map, FIFO only
+
+| Rule | Detail |
+|------|--------|
+| Hot pin map | **`CreateResidency`** only on the unified wire path (plan pin + commit denserels seed) |
+| Eviction | **Insert-order FIFO** — never read-touch / LRU reorder (one spend ⇏ next spend on same create) |
+| denserels_hit% | **~35–50% is normal** mid/late mainnet IBD (old UTXO spends). Do not chase ≥65% or inflate cache caps for it |
+| OutFifo / sticky | Legacy hangover: not wire pin; sticky may still dual-write fk/range for mirror/prewarm — logs should not present them as the pin cache |
+| IBD sizes | Prefer **residency creates/outs**; do not treat zero `outfifo` as a bug |
+
+See `crates/rbitcoin-query/src/create_residency.rs` module docs.
+
 ## Commit + static musl release after code changes
 
 Whenever a turn **changes code** (or you finish a multi-step coding task in that turn):
@@ -100,7 +112,7 @@ that shows a clear change after.
 
 1. **Distinguish** process-owned heap (Rust structures, charged archive bodies)
    from **kernel page cache** under store mmaps (`RssFile`). Do not “fix” RSS
-   by gutting intentional caches (OutFifo, sticky, ContigPark, archive budget).
+   by gutting intentional caches (CreateResidency, ContigPark, archive budget).
 2. **Archive queue ownership:** `charge` on first body enqueue must pair with
    exactly one `release` via `ArchiveResult` applied in `apply_archive_result`
    (or immediate release if `arch_job_tx.send` fails because the pipeline is
@@ -141,7 +153,8 @@ that shows a clear change after.
 | Forwarder stop | **`emit_archive_job_err`** + **`drain_job_rx_as_err`** |
 | `archive_charged` marker | **`clear_archive_charged`** only (never hygiene-prune) |
 | Confirm plans/headers | **`ConfirmParentCache::advance_tip`** (write `post_commit`) |
-| OutFifo outs | FIFO eviction on **`OutFifo::insert`** (cap); not tip GC |
-| Archive sticky | raw FIFO in **`ArchiveTxidSticky`** (lookup read-only; no touch/LRU) |
+| CreateResidency | FIFO on **`CreateResidency::put_*`** (create/out caps); sole wire pin map |
+| OutFifo outs (legacy) | FIFO on **`OutFifo::insert`** — dual-write hangover; not wire pin |
+| Archive sticky (legacy) | raw FIFO dual-write/prewarm; plan resolve uses CreateResidency |
 | Ordered maps | **`IbdWorkState::hygiene`** |
 | Body presence | **`BodyPresence::hygiene_retain`** (rejected + charged retained by design) |

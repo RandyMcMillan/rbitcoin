@@ -7,8 +7,12 @@
 //! |-------|---------|----------|
 //! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, prepq/writeq, txs=, horizon, tip ETA, body `bq=` |
 //! | INFO  | `ibd: perf …` | Download + body-queue pressure; **prep / script / write** stage walls + sub-phases; pin mix; queues |
-//! | INFO  | `ibd: sizes …` | RSS + work path + body soft budget + **bq** + residency + conf pipe + tx.head |
-//! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; class_a body/head when non-zero; dual-track archive pipe only if active |
+//! | INFO  | `ibd: sizes …` | RSS + work path + body soft budget + **bq** + **residency** + conf pipe + tx.head |
+//! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; plan_mega res_txid; class_a res_seed; dual-track pipe only if active |
+//!
+//! **Create pin map:** sole hot map is **CreateResidency** (`residency creates=/outs=`).
+//! Legacy archive sticky (`sticky_fk=`) and OutFifo are dual-write hangover — not
+//! wire pin; OutFifo is omitted from INFO sizes when empty.
 //!
 //! Sample **once** per tick and reset all atomics, then format INFO always and
 //! DEBUG only when enabled — so DEBUG never sees an empty window after INFO.
@@ -233,7 +237,7 @@ pub(crate) struct IbdPerfSample {
     pub rss_locked_kb: u64,
     /// Work-path + body presence occupancy (O(1) lens).
     pub work: WorkStructureSizes,
-    /// Query-side process-owned caches (OutFifo, sticky, SH, tx.head resize).
+    /// Query-side process-owned caches (residency primary; sticky/OutFifo legacy).
     pub owned: ProcessOwnedSizes,
     /// Confirm load/scripts/write queue contents + feed.
     pub conf_pipe: ConfirmPipelineSizes,
@@ -759,7 +763,7 @@ fn prep_stage_ms(s: &IbdPerfSample) -> u64 {
     s.load_ms.saturating_add(s.connect_ms)
 }
 
-/// Plan-mega sub-wall sum (assign/collect/sticky/head/stamp/finish) when present.
+/// Plan-mega sub-wall sum (assign/collect/res_txid/head/stamp/finish) when present.
 fn plan_mega_ms(s: &IbdPerfSample) -> u64 {
     s.arch_prep_assign_ms
         .saturating_add(s.arch_prep_collect_ms)
@@ -1060,9 +1064,10 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     ));
     out.push_str(&format!(" sh_runs={}", s.sh_runs));
 
-    // Plan-mega resolve mix (unified path still notes assign/sticky/head during prep).
+    // Plan-mega resolve mix: res_txid = CreateResidency txid→fk (sole hot map).
+    // sticky_fk = legacy archive sticky occupancy (dual-write / prewarm only).
     if s.arch_ext_need > 0 || s.arch_prep_assign_ms > 0 {
-        let sticky_pct = if s.arch_ext_need > 0 {
+        let res_txid_pct = if s.arch_ext_need > 0 {
             (100 * s.arch_sticky_hit) / s.arch_ext_need
         } else {
             0
@@ -1073,9 +1078,9 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             0
         };
         out.push_str(&format!(
-            " | plan_mega assign={} collect={} sticky={} inflight={} head={} stamp={} finish={} \
-             resolve_us/blk={} ext={} sticky_hit={}/{} ({}%) head_hit={}/{} stamp_n batch={} res={} \
-             sticky_map={}/{}",
+            " | plan_mega assign={} collect={} res_txid={} inflight={} head={} stamp={} finish={} \
+             resolve_us/blk={} ext={} res_txid_hit={}/{} ({}%) head_hit={}/{} stamp_n batch={} res={} \
+             sticky_fk={}/{}",
             s.arch_prep_assign_ms,
             s.arch_prep_collect_ms,
             s.arch_prep_sticky_ms,
@@ -1087,7 +1092,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             s.arch_ext_need,
             s.arch_sticky_hit,
             s.arch_ext_need,
-            sticky_pct,
+            res_txid_pct,
             s.arch_head_hit,
             s.arch_head_need,
             s.arch_batch_stamp,
@@ -1112,10 +1117,10 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             ));
         }
     }
-    // Class A commit subtimers (also on INFO when non-zero); keep DEBUG complete.
+    // Class A commit: res_seed = CreateResidency denserels seed (+ legacy sticky mirror).
     if s.arch_write_blocks > 0 || s.arch_write_total_ms > 0 {
         out.push_str(&format!(
-            " | class_a_commit total={} body={} head={} sticky={} htxs={} reserve={} spend={} dontneed={} flush={} blks={}",
+            " | class_a_commit total={} body={} head={} res_seed={} htxs={} reserve={} spend={} dontneed={} flush={} blks={}",
             s.arch_write_total_ms,
             s.arch_write_body_ms,
             s.arch_write_head_ms,
@@ -1179,6 +1184,10 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
 /// `anon=` growth to heap caches and `file=` growth to store mmaps (`tx.head`
 /// dual-map during resize). `locked=` is mlock only (usually 0) — **not** a
 /// filter on what enters RSS.
+///
+/// Create pin occupancy is **`residency creates=/outs=`** only. Legacy
+/// `sticky_fk=` (archive sticky dual-write) stays under body_soft for prewarm
+/// diagnostics. Empty OutFifo is omitted (not a bug on wire IBD).
 pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let w = &s.work;
     let b = &w.body;
@@ -1198,14 +1207,13 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     };
     let bq_mib = s.bq_bytes / (1024 * 1024);
     let bq_budget_mib = s.bq_budget / (1024 * 1024);
-    format!(
+    let mut line = format!(
         "ibd: sizes rss={}MiB anon={}MiB file={}MiB({}%) hwm={}MiB locked={}MiB \
          | work ordered={}/set={} hash_h={} h2h={} hdr_fk={} known_hdr={} inflight={}/peer={} cooldown={} \
          | body known={} pend={} miss={} charged={} rej={} \
-         | body_soft q={}/{}MiB budget={}MiB sticky={}/{} fifo={} contig parked={} ready={} next_h={} \
+         | body_soft q={}/{}MiB budget={}MiB sticky_fk={}/{} fifo={} contig parked={} ready={} next_h={} \
          | bq n={} {}MiB/{}MiB \
-         | residency creates={}/{} outs={}/{} \
-         | outfifo creates={} outs={}/{} order={} plans={} \
+         | residency creates={}/{} outs={}/{} conf_plans={} \
          | conf prepq={}/{} blks={} wire={}MiB parents={} writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
          | txhead active={} bits={}/{} entry={}B slots={} occ={} body={}MiB \
@@ -1247,10 +1255,6 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         o.residency_create_cap,
         o.residency_outs,
         o.residency_out_cap,
-        o.out_creates,
-        o.out_total,
-        o.out_cap,
-        o.out_order,
         o.conf_plans,
         cp.load_batches,
         s.conf_load_q_cap,
@@ -1281,7 +1285,15 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         o.sh_runs,
         o.sh_memtable,
         o.sh_heads,
-    )
+    );
+    // Legacy OutFifo — only when non-empty (hash/legacy load path dual-write).
+    if o.out_creates > 0 || o.out_total > 0 {
+        line.push_str(&format!(
+            " | outfifo(legacy) creates={} outs={}/{} order={}",
+            o.out_creates, o.out_total, o.out_cap, o.out_order,
+        ));
+    }
+    line
 }
 
 /// Emit consolidated INFO (+ DEBUG if enabled). Single stderr flush at end.
@@ -1509,9 +1521,10 @@ mod tests {
         assert!(!line.contains("pin_cached="), "{line}");
         assert!(line.contains("edges same=10 fk=5 cb=1"), "{line}");
         assert!(line.contains("sh_runs=2"), "{line}");
-        // Plan mega resolve mix (unified path).
+        // Plan mega resolve mix: residency txid→fk (not legacy sticky map).
         assert!(line.contains("plan_mega "), "{line}");
-        assert!(line.contains("sticky_hit=80/100"), "{line}");
+        assert!(line.contains("res_txid_hit=80/100"), "{line}");
+        assert!(!line.contains("sticky_hit="), "{line}");
         // Dual-track archive columns only when dual OS pipe active (write_blocks=5).
         assert!(line.contains("dual_pipe "), "{line}");
         assert!(line.contains("arch_prep total="), "{line}");
@@ -1604,10 +1617,12 @@ mod tests {
         assert!(line.contains("pend=5"), "{line}");
         assert!(line.contains("charged=4"), "{line}");
         assert!(line.contains("body_soft q=12/40MiB"), "{line}");
-        assert!(line.contains("sticky=1000/4000000"), "{line}");
+        assert!(line.contains("sticky_fk=1000/4000000"), "{line}");
+        assert!(!line.contains("sticky=1000/"), "{line}");
         assert!(line.contains("bq n=4 32MiB/512MiB"), "{line}");
         assert!(line.contains("residency creates=80/8000000 outs=900/16777216"), "{line}");
-        assert!(line.contains("outfifo creates=50"), "{line}");
+        // OutFifo only when non-empty (legacy dual-write hangover).
+        assert!(line.contains("outfifo(legacy) creates=50"), "{line}");
         assert!(line.contains("outs=500/16777216"), "{line}");
         assert!(line.contains("prepq=2/5 blks=40 wire=12MiB parents=500"), "{line}");
         assert!(line.contains("writeq=1/5 blks=16 wire=4MiB"), "{line}");
@@ -1616,6 +1631,21 @@ mod tests {
         assert!(line.contains("bits=29/30"), "{line}");
         assert!(line.contains("cursor=1000000/2000000"), "{line}");
         assert!(line.contains("contig parked=3"), "{line}");
+    }
+
+    #[test]
+    fn format_sizes_omits_empty_outfifo() {
+        let mut s = IbdPerfSample::default();
+        s.rss_kb = 1024;
+        s.owned.residency_creates = 10;
+        s.owned.residency_create_cap = 100;
+        s.owned.residency_outs = 20;
+        s.owned.residency_out_cap = 200;
+        s.owned.out_creates = 0;
+        s.owned.out_total = 0;
+        let line = format_sizes(&s);
+        assert!(line.contains("residency creates=10/100 outs=20/200"), "{line}");
+        assert!(!line.contains("outfifo"), "{line}");
     }
 
     #[test]

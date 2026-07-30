@@ -23,8 +23,9 @@ Class A far ahead of tip — confirm commit is the sole Class A appender.
 | **Archive queue budget** | default 512 MiB (`RBITCOIN_ARCHIVE_QUEUE_MB`) | Soft-charge **RAM overflow / arch jobs only** (not multi‑GiB disk body queue). `charge` on overflow/job; **`release` only via** `apply_archive_result` on `ArchiveResult::{Ok,Err,Dropped}` (or immediate release if pipeline send fails because the channel is **closed**) |
 | **ContigPark** | horizon `CONTIG_DENSIFY_AHEAD` | Fallback contiguous park → prep/writer; abort via `drain_all` + Err; skip already-Class-A via `force_advance` + **Dropped** |
 | **`BodyPresence.archive_charged`** | one bit per charged fallback body | **Only** `clear_archive_charged` on pipeline result — **never** hygiene-prune |
-| **OutFifo (confirm outs)** | `RBITCOIN_CONFIRM_OUT_FIFO` (default 2²⁴ outs) | FIFO whole-create eviction on insert; tip GC does **not** free outs |
-| **Archive txid sticky** | `RBITCOIN_ARCHIVE_TXID_STICKY_CAP` (default 8 M) | raw FIFO (no touch/LRU); lookup read-only |
+| **CreateResidency (sole pin map)** | create/out caps (`RBITCOIN_CREATE_RESIDENCY_*`) | **Insert-order FIFO** only (no read-LRU). denserels_hit% ~35–50% mid/late mainnet is structural |
+| **OutFifo (legacy)** | `RBITCOIN_CONFIRM_OUT_FIFO` (default 2²⁴ outs) | Hash-path dual-write hangover; **not** wire pin. Empty on wire IBD is expected |
+| **Archive txid sticky (legacy)** | `RBITCOIN_ARCHIVE_TXID_STICKY_CAP` (default 8 M) | Dual-write / prewarm mirror; plan resolve uses CreateResidency |
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |
 | **SH memtable / runs** | memtable env cap; runs on disk | spill + merge; bulk materialize at tip |
 | **Ordered work path** | `MAX_ORDERED_HEADERS` | `IbdWorkState::hygiene` |
@@ -78,7 +79,7 @@ restart. Mainnet logs showed `arch=1487/512MiB` after writer/probe stalls.
 2. **Any drop of an `ArchiveJob` after charge** must send `Ok` / `Err` / `Dropped`
    (see `release_remaining_jobs` and `force_advance` → `Dropped`).
 3. **`archive_charged` is not hygiene-pruned** — only `clear_archive_charged`.
-4. **Do not** “fix” high RSS by shrinking intentional caps (OutFifo, sticky,
+4. **Do not** “fix” high RSS by shrinking intentional caps (CreateResidency,
    archive budget) without measuring **charge residual** and ContigPark ownership.
 5. **Do not** reintroduce receive-side backpressure (bounded arch_job Full-drop,
    reader-side decode-permit wait) to “fix” soft-budget overshoot.
@@ -116,9 +117,10 @@ Honest coverage (reverting emit/apply would fail):
 |-------------|----------------|
 | `arch=` climbs while ContigPark/pending hold bodies, then falls on Ok/Err | Working budget (may overshoot while getdata in flight) |
 | `arch=` stays ≫ budget after pipeline stop / writer death | **Leak** — missing result/release |
-| `bodies=` near OutFifo cap, oscillates | Intentional cache fill |
+| `residency creates=` near create cap, oscillates | Intentional CreateResidency fill |
 | `sh_runs` grows during Direct IBD | On-disk runs; bulk materialize at tip |
 | High `RssFile` with stable anon heap | Mmap page cache — not a Rust leak |
+| `outfifo` absent on sizes | Normal on wire IBD (legacy dual-write empty) |
 
 Host check / in-process:
 
@@ -129,8 +131,9 @@ known retain structures:
 |-------------|----------------|
 | `rss=` `anon=` `file=` `hwm=` | `/proc` process RSS (anon vs mmap file pages) |
 | `work` / `body` | IBD maps + body-presence sets |
-| `arch` / `sticky` / `contig` | Archive queue budget + sticky FIFO + ContigPark |
-| `outfifo` | Confirm OutFifo creates/outs/cap/order + height plans |
+| `body_soft` / `sticky_fk` / `contig` | Soft archive RAM + **legacy** sticky FIFO + ContigPark |
+| `residency` | **Sole** pin map: creates/outs vs caps + conf_plans |
+| `outfifo(legacy)` | Only when non-empty (hash-path dual-write hangover) |
 | `conf prepq` / `writeq` | Confirm pipeline **queue contents** (batches, blocks, wire MiB, parents) + feed ready/inflight |
 | `txhead` | Primary + **shadow** `tx.head` during online resize (logical body MiB, cursor/n) |
 | `sh` | SH runs / memtable / tip heads |

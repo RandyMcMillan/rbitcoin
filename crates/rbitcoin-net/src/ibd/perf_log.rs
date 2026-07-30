@@ -196,6 +196,18 @@ pub(crate) struct IbdPerfSample {
     pub thr_plan_stamp_ms: u64,
     pub thr_plan_other_ms: u64,
     pub thr_plan_send_wait_ms: u64,
+    /// Stamp sub-walls (structure / prepare / filter / plan_mega).
+    pub stamp_struct_ms: u64,
+    pub stamp_prepare_ms: u64,
+    pub stamp_filter_ms: u64,
+    pub stamp_mega_ms: u64,
+    /// plan_mega internals (from archive_phase_stats).
+    pub stamp_mega_assign_ms: u64,
+    pub stamp_mega_collect_ms: u64,
+    pub stamp_mega_res_ms: u64,
+    pub stamp_mega_head_ms: u64,
+    pub stamp_mega_stamp_ms: u64,
+    pub stamp_mega_finish_ms: u64,
     pub thr_prep_recv_wait_ms: u64,
     pub thr_prep_work_ms: u64,
     pub thr_prep_send_wait_ms: u64,
@@ -406,6 +418,16 @@ impl Default for IbdPerfSample {
             thr_plan_stamp_ms: 0,
             thr_plan_other_ms: 0,
             thr_plan_send_wait_ms: 0,
+            stamp_struct_ms: 0,
+            stamp_prepare_ms: 0,
+            stamp_filter_ms: 0,
+            stamp_mega_ms: 0,
+            stamp_mega_assign_ms: 0,
+            stamp_mega_collect_ms: 0,
+            stamp_mega_res_ms: 0,
+            stamp_mega_head_ms: 0,
+            stamp_mega_stamp_ms: 0,
+            stamp_mega_finish_ms: 0,
             thr_prep_recv_wait_ms: 0,
             thr_prep_work_ms: 0,
             thr_prep_send_wait_ms: 0,
@@ -608,6 +630,7 @@ pub(crate) fn sample(
     let (bq_budget, bq_bytes, bq_count) = bq;
     let hot = loop_stats.sample_and_reset();
     let thr = super::confirm::confirm_thr_stats::sample_and_reset();
+    let stamp_sub = rbitcoin_consensus::plan_stamp_sub_stats::sample_and_reset();
     let (
         recon_ns,
         wire_ns,
@@ -775,6 +798,20 @@ pub(crate) fn sample(
         thr_plan_stamp_ms: ns_ms(thr.plan_stamp_ns),
         thr_plan_other_ms: ns_ms(thr.plan_other_ns),
         thr_plan_send_wait_ms: ns_ms(thr.plan_send_wait_ns),
+        stamp_struct_ms: ns_ms(stamp_sub.struct_ns),
+        stamp_prepare_ms: ns_ms(stamp_sub.prepare_ns),
+        stamp_filter_ms: ns_ms(stamp_sub.filter_ns),
+        stamp_mega_ms: ns_ms(stamp_sub.mega_ns),
+        stamp_mega_assign_ms: ns_ms(arch_res.prep_assign_ns),
+        stamp_mega_collect_ms: ns_ms(arch_res.prep_collect_ns),
+        stamp_mega_res_ms: ns_ms(
+            arch_res
+                .prep_sticky_ns
+                .saturating_add(arch_res.prep_inflight_ns),
+        ),
+        stamp_mega_head_ms: ns_ms(arch_res.prep_head_ns),
+        stamp_mega_stamp_ms: ns_ms(arch_res.prep_stamp_ns),
+        stamp_mega_finish_ms: ns_ms(arch_res.prep_finish_ns),
         thr_prep_recv_wait_ms: ns_ms(thr.prep_recv_wait_ns),
         thr_prep_work_ms: ns_ms(thr.prep_work_ns),
         thr_prep_send_wait_ms: ns_ms(thr.prep_send_wait_ns),
@@ -966,6 +1003,26 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.conf_write_q_cap,
     ));
     let _ = thr_plan_wait; // claim+send already in plan_thr fields
+    if s.stamp_struct_ms > 0
+        || s.stamp_prepare_ms > 0
+        || s.stamp_mega_ms > 0
+        || s.thr_plan_stamp_ms > 0
+    {
+        out.push_str(&format!(
+            " stamp_sub(struct={}ms prepare={}ms filter={}ms mega={}ms \
+             mega_assign={}ms collect={}ms res={}ms head={}ms stamp={}ms finish={}ms)",
+            s.stamp_struct_ms,
+            s.stamp_prepare_ms,
+            s.stamp_filter_ms,
+            s.stamp_mega_ms,
+            s.stamp_mega_assign_ms,
+            s.stamp_mega_collect_ms,
+            s.stamp_mega_res_ms,
+            s.stamp_mega_head_ms,
+            s.stamp_mega_stamp_ms,
+            s.stamp_mega_finish_ms,
+        ));
+    }
     if s.plan_blks > 0 || s.plan_ms > 0 {
         out.push_str(&format!(
             " plan_sub(blks={} parents={} already={} cold={} same={} collect={}ms head={}ms cold_io={}ms)",

@@ -67,6 +67,13 @@ pub struct ArchiveWritePlan {
         u64,
         (TxRecord, Vec<OutputRecord>, Vec<u32>),
     >,
+    /// Prep-ahead pin material for **this batch's creates**, parallel to
+    /// [`Self::planned_fks`]: `(TxRecord, outs, denserels)`.
+    ///
+    /// Built once at plan finish via layout denserels (no second encode/decode).
+    /// Confirm `note_plan_ok` inserts these into in-flight outs without
+    /// re-packing Class A wire.
+    pub batch_pin: Vec<(TxRecord, Vec<OutputRecord>, Vec<u32>)>,
     pub index_tx: bool,
     pub body_est: u64,
     /// Snapshot of “far ahead of confirm” at plan time.
@@ -82,6 +89,7 @@ impl ArchiveWritePlan {
             spends: Vec::new(),
             batch_creates: Vec::new(),
             external_parent_outs: std::collections::HashMap::new(),
+            batch_pin: Vec::new(),
             index_tx: false,
             body_est: 0,
             advise_dont_need: false,
@@ -424,6 +432,16 @@ impl Query {
             .map(|((tx, _, _), fk)| (tx.txid, *fk))
             .collect();
 
+        // Prep-ahead pin denserels once (layout offsets = Class A packing).
+        // Confirm note_plan_ok must not re-encode every create.
+        let batch_pin: Vec<(TxRecord, Vec<OutputRecord>, Vec<u32>)> = packed
+            .iter()
+            .map(|(tx, ins, outs)| {
+                let dens = rbitcoin_store::denserels_from_packed_records(tx, ins, outs);
+                (tx.clone(), outs.clone(), dens)
+            })
+            .collect();
+
         let advise_dont_need = self.archive_far_ahead_of_confirm()?;
         let finish_ns = t_finish.elapsed().as_nanos() as u64;
 
@@ -453,6 +471,7 @@ impl Query {
             spends,
             batch_creates,
             external_parent_outs,
+            batch_pin,
             index_tx,
             body_est,
             advise_dont_need,

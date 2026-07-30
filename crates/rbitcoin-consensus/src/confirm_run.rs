@@ -790,11 +790,14 @@ pub struct PlanStampOutcome {
 }
 
 /// IBD **plan** stage: structure + stamp create_fk only (no denserels pin).
+///
+/// Wire blocks are `Arc` so IBD resolve can decode once and hand off without
+/// cloning full `Block` payloads into stamp.
 pub fn confirm_wire_plan_stamp(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
-    blocks: &[(Height, Block)],
+    blocks: &[(Height, Arc<Block>)],
     pipeline: Option<&WirePrepPipeline>,
 ) -> Result<PlanStampOutcome, ConsensusError> {
     let t0 = Instant::now();
@@ -876,7 +879,7 @@ pub fn confirm_wire_plan_and_ensure_denserels(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
-    blocks: &[(Height, Block)],
+    blocks: &[(Height, Arc<Block>)],
     pipeline: Option<&WirePrepPipeline>,
 ) -> Result<(Option<rbitcoin_query::ArchiveWritePlan>, DenserelsWarmStats, u64), ConsensusError>
 {
@@ -898,7 +901,7 @@ fn wire_plan_phase(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
-    blocks: &[(Height, Block)],
+    blocks: &[(Height, Arc<Block>)],
     pipeline: Option<&WirePrepPipeline>,
 ) -> Result<
     (
@@ -933,10 +936,15 @@ fn wire_plan_phase(
     };
     let path_lo = pipeline.map(|p| p.path_lo).unwrap_or(store_path_lo);
 
+    // Stamp sub-walls (structure + prepare summed over batch; mega below).
+    let mut struct_ns = 0u64;
+    let mut prepare_ns = 0u64;
+
     for (i, (height, block)) in blocks.iter().enumerate() {
-        let block = Arc::new(block.clone());
+        let block = Arc::clone(block);
         let hash = block.block_hash().to_byte_array();
         let ctx = ValidationContext::at(params, *height, milestone);
+        let t_struct = Instant::now();
         let _ = crate::block::validate_block_structure_hashed(block.as_ref(), &ctx)?;
         if i == 0 {
             if height.0 != path_lo {
@@ -972,7 +980,9 @@ fn wire_plan_phase(
                 .validate_pow(target)
                 .map_err(|_| ConsensusError::InvalidPow)?;
         }
+        struct_ns = struct_ns.saturating_add(t_struct.elapsed().as_nanos() as u64);
 
+        let t_prep = Instant::now();
         let (header_rec, txs) =
             crate::prepare_block_for_archive(query, params, block.as_ref())?;
         let header_fk = if let Some((fk, _)) = query
@@ -993,6 +1003,7 @@ fn wire_plan_phase(
             Vec::new(),
             block.header.prev_blockhash.to_byte_array(),
         );
+        prepare_ns = prepare_ns.saturating_add(t_prep.elapsed().as_nanos() as u64);
         with_fk.push((header_fk, header_rec.clone(), txs));
         wire_blocks.push(block);
         metas.push(BodyMeta {
@@ -1004,10 +1015,12 @@ fn wire_plan_phase(
         });
     }
 
-    let t_fp = Instant::now();
+    let t_filter = Instant::now();
     let (_header_fks, mut need) = query
         .archive_filter_need_bodies(&mut with_fk)
         .map_err(ConsensusError::Store)?;
+    let filter_ns = t_filter.elapsed().as_nanos() as u64;
+    let t_mega = Instant::now();
     let plan = if need.is_empty() {
         for m in &mut metas {
             if let Some(list) = query
@@ -1089,8 +1102,57 @@ fn wire_plan_phase(
         }
         Some(plan)
     };
-    let plan_ns = t_fp.elapsed().as_nanos() as u64;
+    let mega_ns = t_mega.elapsed().as_nanos() as u64;
+    // plan_ns for HEAD_NS: filter + mega (legacy “plan wall” without struct/prepare).
+    let plan_ns = filter_ns.saturating_add(mega_ns);
+    plan_stamp_sub_stats::note(struct_ns, prepare_ns, filter_ns, mega_ns);
     Ok((plan, metas, wire_blocks, plan_ns))
+}
+
+/// Stamp-phase sub-walls for plan_thr diagnosis (structure / prepare / filter / mega).
+///
+/// Mega is the archive plan_mega wall (assign+collect+res+head+stamp+finish
+/// already timed in `archive_phase_stats`). Head **read** denserels for external
+/// parents lives in mega/head — not Class A body/idx **write** (write stage).
+pub mod plan_stamp_sub_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static STRUCT_NS: AtomicU64 = AtomicU64::new(0);
+    static PREPARE_NS: AtomicU64 = AtomicU64::new(0);
+    static FILTER_NS: AtomicU64 = AtomicU64::new(0);
+    static MEGA_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn note(struct_ns: u64, prepare_ns: u64, filter_ns: u64, mega_ns: u64) {
+        if struct_ns > 0 {
+            STRUCT_NS.fetch_add(struct_ns, Ordering::Relaxed);
+        }
+        if prepare_ns > 0 {
+            PREPARE_NS.fetch_add(prepare_ns, Ordering::Relaxed);
+        }
+        if filter_ns > 0 {
+            FILTER_NS.fetch_add(filter_ns, Ordering::Relaxed);
+        }
+        if mega_ns > 0 {
+            MEGA_NS.fetch_add(mega_ns, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct Sample {
+        pub struct_ns: u64,
+        pub prepare_ns: u64,
+        pub filter_ns: u64,
+        pub mega_ns: u64,
+    }
+
+    pub fn sample_and_reset() -> Sample {
+        Sample {
+            struct_ns: STRUCT_NS.swap(0, Ordering::Relaxed),
+            prepare_ns: PREPARE_NS.swap(0, Ordering::Relaxed),
+            filter_ns: FILTER_NS.swap(0, Ordering::Relaxed),
+            mega_ns: MEGA_NS.swap(0, Ordering::Relaxed),
+        }
+    }
 }
 
 /// Accumulators for the **plan** pipeline stage (plan+stamp + denserels ensure).
@@ -2643,6 +2705,7 @@ mod write_idempotent_tests {
             spends: vec![],
             batch_creates: vec![],
             external_parent_outs: Default::default(),
+            batch_pin: vec![],
             index_tx: false,
             body_est: 0,
             advise_dont_need: false,
@@ -2717,6 +2780,7 @@ mod write_idempotent_tests {
             spends: vec![],
             batch_creates: vec![],
             external_parent_outs: Default::default(),
+            batch_pin: vec![],
             index_tx: false,
             body_est: 0,
             advise_dont_need: false,

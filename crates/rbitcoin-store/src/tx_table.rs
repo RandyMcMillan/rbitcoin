@@ -644,6 +644,27 @@ pub fn encode_packed_tx_with_secret(
     encode_output_run_secret(outputs, out, secret);
 }
 
+/// Dense relative offsets of each output's start within a packed Class A payload.
+///
+/// Matches [`decode_packed_tx_with_spender_rels`] denserels. Encodes once without
+/// secret (XOR does not change field lengths). Used at plan finish so confirm
+/// prep-ahead pin does not re-encode every create in `note_plan_ok`.
+pub fn denserels_from_packed_records(
+    tx: &TxRecord,
+    inputs: &[InputRecord],
+    outputs: &[OutputRecord],
+) -> Vec<u32> {
+    let mut raw = Vec::with_capacity(
+        TxRecord::ENCODED_LEN
+            + inputs.iter().map(|i| i.encoded_len()).sum::<usize>()
+            + outputs.iter().map(|o| o.encoded_len()).sum::<usize>(),
+    );
+    encode_packed_tx(tx, inputs, outputs, &mut raw);
+    decode_packed_tx_outs_with_spender_rels(&raw)
+        .map(|(_, _, rels)| rels)
+        .unwrap_or_default()
+}
+
 /// After walking a packed payload to `logical_end`, accept only zero pad to `raw.len()`.
 #[inline]
 fn check_trailing_zero_pad(raw: &[u8], logical_end: usize) -> Result<(), StoreError> {
@@ -2303,6 +2324,12 @@ mod tests {
         assert_eq!(multi.len(), 2);
         assert_eq!(multi[0], (0, single0));
         assert_eq!(multi[1], (3, single3));
+        // Layout denserels match encode+decode denserels (prep-ahead pin path).
+        let layout = denserels_from_packed_records(&tx, &inputs, &outputs);
+        let (_, _, decode_rels) = decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
+        assert_eq!(layout, decode_rels);
+        assert_eq!(layout[0] as u64, single0);
+        assert_eq!(layout[3] as u64, single3);
         // Each rel points at a 9-byte spender field (null fk + flags).
         for (_, rel) in multi {
             let fo = rel as usize;

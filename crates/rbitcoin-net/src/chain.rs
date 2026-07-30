@@ -248,7 +248,43 @@ impl ChainHub {
         Ok(Some(ok))
     }
 
-    /// Contiguous tip-extension slice for plan/prep (skip already confirmed).
+    /// Contiguous tip-extension slice for plan (Arc wire; skip already confirmed).
+    fn confirm_wire_contig_arc(
+        &self,
+        blocks: &[(Height, std::sync::Arc<Block>)],
+        pipeline: Option<&WirePrepPipeline>,
+    ) -> Option<Vec<(Height, std::sync::Arc<Block>)>> {
+        if blocks.is_empty() {
+            return None;
+        }
+        let store_path_lo = match self.tip_height() {
+            None => 0u32,
+            Some(t) => t.saturating_add(1),
+        };
+        let path_lo = pipeline.map(|p| p.path_lo).unwrap_or(store_path_lo);
+        let need: Vec<(Height, std::sync::Arc<Block>)> = blocks
+            .iter()
+            .filter(|(h, b)| {
+                let hash = b.block_hash();
+                !self.has_block(&hash) && h.0 >= path_lo
+            })
+            .map(|(h, b)| (*h, std::sync::Arc::clone(b)))
+            .collect();
+        let mut contig = Vec::new();
+        for (h, b) in need {
+            if h.0 != path_lo.saturating_add(contig.len() as u32) {
+                break;
+            }
+            contig.push((h, b));
+        }
+        if contig.is_empty() {
+            None
+        } else {
+            Some(contig)
+        }
+    }
+
+    /// Contiguous tip-extension slice for one-shot prep (owned Block).
     fn confirm_wire_contig(
         &self,
         blocks: &[(Height, Block)],
@@ -285,12 +321,14 @@ impl ChainHub {
     }
 
     /// IBD **plan** stage: structure + stamp create_fk only (no denserels pin).
+    ///
+    /// Wire is `Arc<Block>` so body-queue decode is not re-cloned into stamp.
     pub fn confirm_wire_plan_phase(
         &self,
-        blocks: &[(Height, Block)],
+        blocks: &[(Height, std::sync::Arc<Block>)],
         pipeline: Option<&WirePrepPipeline>,
     ) -> Result<Option<PlanStampOutcome>, NetError> {
-        let Some(contig) = self.confirm_wire_contig(blocks, pipeline) else {
+        let Some(contig) = self.confirm_wire_contig_arc(blocks, pipeline) else {
             return Ok(None);
         };
         let out = confirm_wire_plan_stamp(

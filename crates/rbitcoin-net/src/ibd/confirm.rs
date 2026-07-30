@@ -96,14 +96,23 @@ impl PrepAheadState {
     ) {
         let creates = std::sync::Arc::make_mut(&mut self.in_flight_creates);
         let outs = std::sync::Arc::make_mut(&mut self.in_flight_outs);
-        let secret = hub.query.store().txs.store_secret();
-        for ((tx, ins, o), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
-            creates.insert(tx.txid, *fk);
-            if let Some(id) = fk.get() {
-                // Offline denserels (same packing as Class A body) so prep(N+1)
-                // pin has abs layout without commit(N) body IO.
-                let denserels = offline_in_flight_denserels(secret, tx, ins, o);
-                outs.insert(id, (tx.clone(), o.clone(), denserels));
+        // Prefer plan-time denserels (no re-encode). Fall back only if lengths
+        // mismatch (tests constructing partial ArchiveWritePlan).
+        if plan.batch_pin.len() == plan.planned_fks.len() {
+            for (fk, (tx, o, dens)) in plan.planned_fks.iter().zip(plan.batch_pin.iter()) {
+                creates.insert(tx.txid, *fk);
+                if let Some(id) = fk.get() {
+                    outs.insert(id, (tx.clone(), o.clone(), dens.clone()));
+                }
+            }
+        } else {
+            let secret = hub.query.store().txs.store_secret();
+            for ((tx, ins, o), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
+                creates.insert(tx.txid, *fk);
+                if let Some(id) = fk.get() {
+                    let denserels = offline_in_flight_denserels(secret, tx, ins, o);
+                    outs.insert(id, (tx.clone(), o.clone(), denserels));
+                }
             }
         }
         if let Some(last) = plan.planned_fks.last().and_then(|f| f.get()) {
@@ -1254,9 +1263,12 @@ pub(crate) fn spawn_confirm_engine(
                 confirm_thr_stats::add_plan_resolve(t_resolve.elapsed());
 
                 // resolve_batch_wire requires every height has bq payload — sole intake.
-                let wire_batch: Vec<(u32, BlockHash, bitcoin::Block)> = batch
+                // Arc once: stamp/prep share without full Block clones.
+                let wire_batch: Vec<(u32, BlockHash, std::sync::Arc<bitcoin::Block>)> = batch
                     .into_iter()
-                    .map(|(h, ha, w)| (h, ha, w.expect("bq wire after resolve")))
+                    .map(|(h, ha, w)| {
+                        (h, ha, std::sync::Arc::new(w.expect("bq wire after resolve")))
+                    })
                     .collect();
                 let store_path_lo = match hub.tip_height() {
                     None => 0u32,
@@ -1266,9 +1278,12 @@ pub(crate) fn spawn_confirm_engine(
                 let use_pipe = pipe.path_lo >= store_path_lo;
                 let mut wire_batch = wire_batch;
                 let t_clone = Instant::now();
-                let plan_items: Vec<(rbitcoin_primitives::Height, bitcoin::Block)> = wire_batch
+                let plan_items: Vec<(
+                    rbitcoin_primitives::Height,
+                    std::sync::Arc<bitcoin::Block>,
+                )> = wire_batch
                     .iter()
-                    .map(|(h, _, w)| (rbitcoin_primitives::Height(*h), w.clone()))
+                    .map(|(h, _, w)| (rbitcoin_primitives::Height(*h), std::sync::Arc::clone(w)))
                     .collect();
                 confirm_thr_stats::add_plan_clone(t_clone.elapsed());
                 let t_stamp = Instant::now();
@@ -1309,7 +1324,7 @@ pub(crate) fn spawn_confirm_engine(
                             loop_stats.confirm_begin(expect_h, 1);
                             let one = [(
                                 rbitcoin_primitives::Height(expect_h),
-                                wire_batch[0].2.clone(),
+                                std::sync::Arc::clone(&wire_batch[0].2),
                             )];
                             hub.confirm_wire_plan_phase(
                                 &one,

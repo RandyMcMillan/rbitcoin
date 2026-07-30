@@ -89,7 +89,8 @@ pub use idx_body_pipeline::{
 pub use tx_table::{
     clear_output_spender_fields, decode_packed_tx, decode_packed_tx_outs_with_spender_rels,
     decode_packed_tx_outs_with_spender_rels_secret, decode_packed_tx_with_spender_rels,
-    decode_packed_tx_with_spender_rels_secret, encode_packed_tx, encode_packed_tx_with_secret,
+    decode_packed_tx_with_spender_rels_secret, denserels_from_packed_records, encode_packed_tx,
+    encode_packed_tx_with_secret,
     is_packed_tx_payload, scan_packed_meta_and_prevouts, InputRecord, OutputRecord, TxRecord,
     BODY_PAGE_SIZE, TXID_PAGE_MAX_OFF, next_tx_body_start,
 };

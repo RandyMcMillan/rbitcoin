@@ -23,6 +23,11 @@
 //! - **script** = `SCRIPT_NS`
 //! - **write** = Class A commit + ensure layouts + structural + class_c + spend + tip GC
 //!
+//! **Long-pole diagnosis:** do **not** rank stages by work-sum alone when
+//! `planq`/`prepq` stay empty. Prefer `plan_thr busy=` / `thr prep=busy/wait=` /
+//! `planq_hwm=` (OS-thread occupancy + queue high-water). High prep_recv_wait
+//! + empty planq_hwm ⇒ plan is the production pole.
+//!
 //! Ghost dual-track columns (`recon`/`wire` rebuild, separate arch dual pipe)
 //! appear only when non-zero (legacy/fallback).
 
@@ -180,6 +185,25 @@ pub(crate) struct IbdPerfSample {
     pub conf_plan_q_cap: usize,
     pub conf_load_q_cap: usize,
     pub conf_write_q_cap: usize,
+    /// Max plan→prep depth since last 5s sample (not instantaneous).
+    pub conf_plan_q_hwm: usize,
+    pub conf_load_q_hwm: usize,
+    pub conf_write_q_hwm: usize,
+    // OS-thread occupancy (ms) — wait vs busy; explains empty planq vs work sums.
+    pub thr_plan_claim_ms: u64,
+    pub thr_plan_resolve_ms: u64,
+    pub thr_plan_clone_ms: u64,
+    pub thr_plan_stamp_ms: u64,
+    pub thr_plan_other_ms: u64,
+    pub thr_plan_send_wait_ms: u64,
+    pub thr_prep_recv_wait_ms: u64,
+    pub thr_prep_work_ms: u64,
+    pub thr_prep_send_wait_ms: u64,
+    pub thr_script_recv_wait_ms: u64,
+    pub thr_script_work_ms: u64,
+    pub thr_script_send_wait_ms: u64,
+    pub thr_write_recv_wait_ms: u64,
+    pub thr_write_work_ms: u64,
     // Plan stage (bq → plan+denserels ensure → prep queue)
     pub plan_blks: u64,
     pub plan_ms: u64,
@@ -373,6 +397,23 @@ impl Default for IbdPerfSample {
             conf_plan_q_cap: super::confirm::PLAN_QUEUE_CAP,
             conf_load_q_cap: super::confirm::LOAD_QUEUE_CAP,
             conf_write_q_cap: super::confirm::WRITE_QUEUE_CAP,
+            conf_plan_q_hwm: 0,
+            conf_load_q_hwm: 0,
+            conf_write_q_hwm: 0,
+            thr_plan_claim_ms: 0,
+            thr_plan_resolve_ms: 0,
+            thr_plan_clone_ms: 0,
+            thr_plan_stamp_ms: 0,
+            thr_plan_other_ms: 0,
+            thr_plan_send_wait_ms: 0,
+            thr_prep_recv_wait_ms: 0,
+            thr_prep_work_ms: 0,
+            thr_prep_send_wait_ms: 0,
+            thr_script_recv_wait_ms: 0,
+            thr_script_work_ms: 0,
+            thr_script_send_wait_ms: 0,
+            thr_write_recv_wait_ms: 0,
+            thr_write_work_ms: 0,
             plan_blks: 0,
             plan_ms: 0,
             plan_collect_ms: 0,
@@ -557,6 +598,7 @@ pub(crate) fn sample(
     conf_plan_q: usize,
     conf_load_q: usize,
     conf_write_q: usize,
+    conf_q_hwm: (usize, usize, usize),
     sh_runs: usize,
     work: WorkStructureSizes,
     owned: ProcessOwnedSizes,
@@ -565,6 +607,7 @@ pub(crate) fn sample(
 ) -> IbdPerfSample {
     let (bq_budget, bq_bytes, bq_count) = bq;
     let hot = loop_stats.sample_and_reset();
+    let thr = super::confirm::confirm_thr_stats::sample_and_reset();
     let (
         recon_ns,
         wire_ns,
@@ -723,6 +766,23 @@ pub(crate) fn sample(
         conf_plan_q_cap: super::confirm::PLAN_QUEUE_CAP,
         conf_load_q_cap: super::confirm::LOAD_QUEUE_CAP,
         conf_write_q_cap: super::confirm::WRITE_QUEUE_CAP,
+        conf_plan_q_hwm: conf_q_hwm.0,
+        conf_load_q_hwm: conf_q_hwm.1,
+        conf_write_q_hwm: conf_q_hwm.2,
+        thr_plan_claim_ms: ns_ms(thr.plan_claim_ns),
+        thr_plan_resolve_ms: ns_ms(thr.plan_resolve_ns),
+        thr_plan_clone_ms: ns_ms(thr.plan_clone_ns),
+        thr_plan_stamp_ms: ns_ms(thr.plan_stamp_ns),
+        thr_plan_other_ms: ns_ms(thr.plan_other_ns),
+        thr_plan_send_wait_ms: ns_ms(thr.plan_send_wait_ns),
+        thr_prep_recv_wait_ms: ns_ms(thr.prep_recv_wait_ns),
+        thr_prep_work_ms: ns_ms(thr.prep_work_ns),
+        thr_prep_send_wait_ms: ns_ms(thr.prep_send_wait_ns),
+        thr_script_recv_wait_ms: ns_ms(thr.script_recv_wait_ns),
+        thr_script_work_ms: ns_ms(thr.script_work_ns),
+        thr_script_send_wait_ms: ns_ms(thr.script_send_wait_ns),
+        thr_write_recv_wait_ms: ns_ms(thr.write_recv_wait_ns),
+        thr_write_work_ms: ns_ms(thr.write_work_ns),
         plan_blks: dens.blocks,
         plan_ms: ns_ms(dens.total_ns),
         plan_collect_ms: ns_ms(dens.collect_ns),
@@ -858,17 +918,54 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.hole,
         s.peers,
     );
-    // Four-stage confirm walls: plan → prep → script → write.
-    // plan = structure + stamp create_fk + ensure denserels; prep = pin + assemble.
+    // Four-stage confirm **work** walls (sums; may mis-rank vs empty planq).
+    // Prefer thr busy/wait + planq_hwm for long-pole diagnosis.
     let prep_ms = prep_stage_ms(s);
+    let thr_plan_busy = s
+        .thr_plan_resolve_ms
+        .saturating_add(s.thr_plan_clone_ms)
+        .saturating_add(s.thr_plan_stamp_ms)
+        .saturating_add(s.thr_plan_other_ms);
+    let thr_plan_wait = s
+        .thr_plan_claim_ms
+        .saturating_add(s.thr_plan_send_wait_ms);
+    let thr_prep_wait = s
+        .thr_prep_recv_wait_ms
+        .saturating_add(s.thr_prep_send_wait_ms);
+    let thr_script_wait = s
+        .thr_script_recv_wait_ms
+        .saturating_add(s.thr_script_send_wait_ms);
     out.push_str(&format!(
-        " | conf blks={} plan={}ms prep={}ms script={}ms write={}ms",
+        " | conf blks={} plan={}ms prep={}ms script={}ms write={}ms \
+         plan_thr busy={}ms(claim={}ms resolve={}ms clone={}ms stamp={}ms other={}ms send_w={}ms) \
+         thr prep=busy/wait={}/{}ms script={}/{}ms write={}/{}ms \
+         planq_hwm={}/{} prepq_hwm={}/{} writeq_hwm={}/{}",
         s.phase_blks.max(s.plan_blks),
         s.plan_ms,
         prep_ms,
         s.script_ms,
         write_ms,
+        thr_plan_busy,
+        s.thr_plan_claim_ms,
+        s.thr_plan_resolve_ms,
+        s.thr_plan_clone_ms,
+        s.thr_plan_stamp_ms,
+        s.thr_plan_other_ms,
+        s.thr_plan_send_wait_ms,
+        s.thr_prep_work_ms,
+        thr_prep_wait,
+        s.thr_script_work_ms,
+        thr_script_wait,
+        s.thr_write_work_ms,
+        s.thr_write_recv_wait_ms,
+        s.conf_plan_q_hwm,
+        s.conf_plan_q_cap,
+        s.conf_load_q_hwm,
+        s.conf_load_q_cap,
+        s.conf_write_q_hwm,
+        s.conf_write_q_cap,
     ));
+    let _ = thr_plan_wait; // claim+send already in plan_thr fields
     if s.plan_blks > 0 || s.plan_ms > 0 {
         out.push_str(&format!(
             " plan_sub(blks={} parents={} already={} cold={} same={} collect={}ms head={}ms cold_io={}ms)",
@@ -1753,6 +1850,7 @@ mod tests {
             0, // planq
             0, // load_q
             0, // write_q
+            (0, 0, 0), // q hwm
             1, // sh_runs
             work,
             owned,
@@ -1765,6 +1863,11 @@ mod tests {
         assert_eq!(s.assign_issued, 7);
         assert_eq!(s.confirm_blocks, 1);
         assert_eq!(s.sh_runs, 1);
+        // thr / hwm fields present (zero when idle).
+        assert_eq!(s.conf_plan_q_hwm, 0);
+        let line = format_info(&s);
+        assert!(line.contains("plan_thr busy="), "{line}");
+        assert!(line.contains("planq_hwm="), "{line}");
 
         // Edge format arms: spend_mix, miss_p, headers_done, zero pin_hit.
         let mut edge = s.clone();

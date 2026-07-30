@@ -336,6 +336,10 @@ struct PlanDone {
 ///
 /// Updated on successful send/recv so the status loop can log pressure and
 /// process-owned retain without peeking into the OS channels.
+///
+/// High-water marks (`*_hwm`) track max depth since the last
+/// [`ConfirmQueueDepths::sample_hwm_and_reset`] (≈5s status tick). Point
+/// samples alone almost always show 0 under a plan-limited pipeline.
 #[derive(Debug, Default)]
 pub(crate) struct ConfirmQueueDepths {
     /// plan → prep (`SyncSender` capacity [`PLAN_QUEUE_CAP`]).
@@ -344,6 +348,12 @@ pub(crate) struct ConfirmQueueDepths {
     load_to_scripts: AtomicUsize,
     /// scripts → write (`SyncSender` capacity [`WRITE_QUEUE_CAP`]).
     scripts_to_write: AtomicUsize,
+    /// Max plan→prep depth since last HWM sample.
+    plan_hwm: AtomicUsize,
+    /// Max prep→scripts depth since last HWM sample.
+    load_hwm: AtomicUsize,
+    /// Max scripts→write depth since last HWM sample.
+    write_hwm: AtomicUsize,
     /// Sum of `batch.len()` sitting in plan→prep.
     plan_blocks: AtomicUsize,
     /// Sum of `batch.len()` sitting in prep→scripts.
@@ -423,6 +433,15 @@ impl ConfirmQueueDepths {
         )
     }
 
+    /// Max queue depths since last call; resets HWMs to 0.
+    pub(crate) fn sample_hwm_and_reset(&self) -> (usize, usize, usize) {
+        (
+            self.plan_hwm.swap(0, Ordering::Relaxed),
+            self.load_hwm.swap(0, Ordering::Relaxed),
+            self.write_hwm.swap(0, Ordering::Relaxed),
+        )
+    }
+
     /// Full content snapshot (depths + blocks/wire/parents in each queue).
     pub(crate) fn content_snap(&self) -> ConfirmPipelineSizes {
         ConfirmPipelineSizes {
@@ -441,8 +460,15 @@ impl ConfirmQueueDepths {
         }
     }
 
+    #[inline]
+    fn note_depth_hwm(hwm: &AtomicUsize, depth_after: usize) {
+        // AtomicUsize::fetch_max is stable; Relaxed is enough for perf.
+        let _ = hwm.fetch_max(depth_after, Ordering::Relaxed);
+    }
+
     fn note_plan_send(&self, blocks: usize) {
-        self.plan_to_prep.fetch_add(1, Ordering::Relaxed);
+        let d = self.plan_to_prep.fetch_add(1, Ordering::Relaxed) + 1;
+        Self::note_depth_hwm(&self.plan_hwm, d);
         self.plan_blocks.fetch_add(blocks, Ordering::Relaxed);
     }
     fn note_plan_recv(&self, blocks: usize) {
@@ -455,7 +481,8 @@ impl ConfirmQueueDepths {
     }
 
     fn note_load_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
-        self.load_to_scripts.fetch_add(1, Ordering::Relaxed);
+        let d = self.load_to_scripts.fetch_add(1, Ordering::Relaxed) + 1;
+        Self::note_depth_hwm(&self.load_hwm, d);
         self.load_blocks.fetch_add(blocks, Ordering::Relaxed);
         self.load_wire_bytes
             .fetch_add(wire_bytes, Ordering::Relaxed);
@@ -480,7 +507,8 @@ impl ConfirmQueueDepths {
             .ok();
     }
     fn note_write_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
-        self.scripts_to_write.fetch_add(1, Ordering::Relaxed);
+        let d = self.scripts_to_write.fetch_add(1, Ordering::Relaxed) + 1;
+        Self::note_depth_hwm(&self.write_hwm, d);
         self.write_blocks.fetch_add(blocks, Ordering::Relaxed);
         self.write_wire_bytes
             .fetch_add(wire_bytes, Ordering::Relaxed);
@@ -520,6 +548,139 @@ impl ConfirmQueueDepths {
 #[inline]
 pub(crate) fn is_confirm_load_retryable(_msg: &str) -> bool {
     false
+}
+
+/// OS-thread occupancy for the confirm pipeline (plan / prep / scripts / write).
+///
+/// Stage `plan_ms` / `script_ms` / … are **work** sums and mis-rank the long
+/// pole when planq is empty. These timers include **wait** (claim, recv, send
+/// block) so a 5s window can show who is busy vs idle.
+pub(crate) mod confirm_thr_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static PLAN_CLAIM_NS: AtomicU64 = AtomicU64::new(0);
+    static PLAN_RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
+    static PLAN_CLONE_NS: AtomicU64 = AtomicU64::new(0);
+    static PLAN_STAMP_NS: AtomicU64 = AtomicU64::new(0);
+    static PLAN_OTHER_NS: AtomicU64 = AtomicU64::new(0);
+    static PLAN_SEND_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+
+    static PREP_RECV_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    static PREP_WORK_NS: AtomicU64 = AtomicU64::new(0);
+    static PREP_SEND_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+
+    static SCRIPT_RECV_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    static SCRIPT_WORK_NS: AtomicU64 = AtomicU64::new(0);
+    static SCRIPT_SEND_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+
+    static WRITE_RECV_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    static WRITE_WORK_NS: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    fn add(a: &AtomicU64, d: Duration) {
+        let ns = d.as_nanos() as u64;
+        if ns > 0 {
+            a.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn add_plan_claim(d: Duration) {
+        add(&PLAN_CLAIM_NS, d);
+    }
+    #[inline]
+    pub fn add_plan_resolve(d: Duration) {
+        add(&PLAN_RESOLVE_NS, d);
+    }
+    #[inline]
+    pub fn add_plan_clone(d: Duration) {
+        add(&PLAN_CLONE_NS, d);
+    }
+    #[inline]
+    pub fn add_plan_stamp(d: Duration) {
+        add(&PLAN_STAMP_NS, d);
+    }
+    #[inline]
+    pub fn add_plan_other(d: Duration) {
+        add(&PLAN_OTHER_NS, d);
+    }
+    #[inline]
+    pub fn add_plan_send_wait(d: Duration) {
+        add(&PLAN_SEND_WAIT_NS, d);
+    }
+
+    #[inline]
+    pub fn add_prep_recv_wait(d: Duration) {
+        add(&PREP_RECV_WAIT_NS, d);
+    }
+    #[inline]
+    pub fn add_prep_work(d: Duration) {
+        add(&PREP_WORK_NS, d);
+    }
+    #[inline]
+    pub fn add_prep_send_wait(d: Duration) {
+        add(&PREP_SEND_WAIT_NS, d);
+    }
+
+    #[inline]
+    pub fn add_script_recv_wait(d: Duration) {
+        add(&SCRIPT_RECV_WAIT_NS, d);
+    }
+    #[inline]
+    pub fn add_script_work(d: Duration) {
+        add(&SCRIPT_WORK_NS, d);
+    }
+    #[inline]
+    pub fn add_script_send_wait(d: Duration) {
+        add(&SCRIPT_SEND_WAIT_NS, d);
+    }
+
+    #[inline]
+    pub fn add_write_recv_wait(d: Duration) {
+        add(&WRITE_RECV_WAIT_NS, d);
+    }
+    #[inline]
+    pub fn add_write_work(d: Duration) {
+        add(&WRITE_WORK_NS, d);
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct Sample {
+        pub plan_claim_ns: u64,
+        pub plan_resolve_ns: u64,
+        pub plan_clone_ns: u64,
+        pub plan_stamp_ns: u64,
+        pub plan_other_ns: u64,
+        pub plan_send_wait_ns: u64,
+        pub prep_recv_wait_ns: u64,
+        pub prep_work_ns: u64,
+        pub prep_send_wait_ns: u64,
+        pub script_recv_wait_ns: u64,
+        pub script_work_ns: u64,
+        pub script_send_wait_ns: u64,
+        pub write_recv_wait_ns: u64,
+        pub write_work_ns: u64,
+    }
+
+    pub fn sample_and_reset() -> Sample {
+        Sample {
+            plan_claim_ns: PLAN_CLAIM_NS.swap(0, Ordering::Relaxed),
+            plan_resolve_ns: PLAN_RESOLVE_NS.swap(0, Ordering::Relaxed),
+            plan_clone_ns: PLAN_CLONE_NS.swap(0, Ordering::Relaxed),
+            plan_stamp_ns: PLAN_STAMP_NS.swap(0, Ordering::Relaxed),
+            plan_other_ns: PLAN_OTHER_NS.swap(0, Ordering::Relaxed),
+            plan_send_wait_ns: PLAN_SEND_WAIT_NS.swap(0, Ordering::Relaxed),
+            prep_recv_wait_ns: PREP_RECV_WAIT_NS.swap(0, Ordering::Relaxed),
+            prep_work_ns: PREP_WORK_NS.swap(0, Ordering::Relaxed),
+            prep_send_wait_ns: PREP_SEND_WAIT_NS.swap(0, Ordering::Relaxed),
+            script_recv_wait_ns: SCRIPT_RECV_WAIT_NS.swap(0, Ordering::Relaxed),
+            script_work_ns: SCRIPT_WORK_NS.swap(0, Ordering::Relaxed),
+            script_send_wait_ns: SCRIPT_SEND_WAIT_NS.swap(0, Ordering::Relaxed),
+            write_recv_wait_ns: WRITE_RECV_WAIT_NS.swap(0, Ordering::Relaxed),
+            write_work_ns: WRITE_WORK_NS.swap(0, Ordering::Relaxed),
+        }
+    }
 }
 
 /// Spawn confirm **plan** + **prep** + **scripts** + **write** OS threads.
@@ -562,7 +723,13 @@ pub(crate) fn spawn_confirm_engine(
         .name("ibd-confirm-write".into())
         .spawn(move || {
             info!("ibd: confirm write on dedicated OS thread");
-            while let Ok(batch) = write_rx.recv() {
+            loop {
+                let t_recv = Instant::now();
+                let batch = match write_rx.recv() {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                confirm_thr_stats::add_write_recv_wait(t_recv.elapsed());
                 let n = batch.len();
                 let wire = batch.approx_wire_bytes();
                 let parents = batch.parent_count();
@@ -617,6 +784,7 @@ pub(crate) fn spawn_confirm_engine(
                         }
                         feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                         let elapsed = t0.elapsed();
+                        confirm_thr_stats::add_write_work(elapsed);
                         if elapsed.as_millis() > 2_000 {
                             let p = rbitcoin_consensus::confirm_phase_stats::last_write_phases();
                             let ms = rbitcoin_consensus::confirm_phase_stats::LastWritePhases::ms;
@@ -638,6 +806,7 @@ pub(crate) fn spawn_confirm_engine(
                         }
                     }
                     Err(e) => {
+                        confirm_thr_stats::add_write_work(t0.elapsed());
                         let msg = e.to_string();
                         if msg.contains("confirm cancelled") || feed_wb.stopped() {
                             info!("ibd: confirm write aborted: {msg}");
@@ -701,7 +870,13 @@ pub(crate) fn spawn_confirm_engine(
         .name("ibd-confirm".into())
         .spawn(move || {
             info!("ibd: confirm scripts on dedicated OS thread (pure CPU; no store)");
-            while let Ok((mat_batch, mat_ns)) = mat_rx.recv() {
+            loop {
+                let t_recv = Instant::now();
+                let (mat_batch, mat_ns) = match mat_rx.recv() {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                confirm_thr_stats::add_script_recv_wait(t_recv.elapsed());
                 let n = mat_batch.len();
                 let load_wire = mat_batch.approx_wire_bytes();
                 let load_parents = mat_batch.parent_count();
@@ -723,15 +898,18 @@ pub(crate) fn spawn_confirm_engine(
                         loop_stats_sc
                             .confirm_ns
                             .fetch_add(outcome.work_ns, Ordering::Relaxed);
+                        confirm_thr_stats::add_script_work(t0.elapsed());
                         let script_ms = outcome.work_ns / 1_000_000;
                         let mat_ms = mat_ns / 1_000_000;
                         let wb = outcome.batch.len();
                         let ww = outcome.batch.approx_wire_bytes();
                         let wp = outcome.batch.parent_count();
+                        let t_send = Instant::now();
                         if write_tx.send(outcome.batch).is_err() {
                             info!("ibd: confirm write channel closed");
                             break;
                         }
+                        confirm_thr_stats::add_script_send_wait(t_send.elapsed());
                         q_sc.note_write_send(wb, ww, wp);
                         if script_ms > 2_000 || mat_ms > 2_000 {
                             info!(
@@ -741,6 +919,7 @@ pub(crate) fn spawn_confirm_engine(
                         }
                     }
                     Err(e) => {
+                        confirm_thr_stats::add_script_work(t0.elapsed());
                         let msg = e.to_string();
                         if msg.contains("confirm cancelled") || feed_sc.stopped() {
                             info!("ibd: confirm scripts aborted: {msg}");
@@ -786,7 +965,13 @@ pub(crate) fn spawn_confirm_engine(
             info!(
                 "ibd: confirm prep on dedicated OS thread (planq → pin denserels+assemble)"
             );
-            while let Ok(done) = plan_rx.recv() {
+            loop {
+                let t_recv = Instant::now();
+                let done = match plan_rx.recv() {
+                    Ok(d) => d,
+                    Err(_) => break,
+                };
+                confirm_thr_stats::add_prep_recv_wait(t_recv.elapsed());
                 let n = done.heights_hashes.len();
                 queues_prep.note_plan_recv(n);
                 if feed_prep.stopped() || hub_prep.query.confirm_cancelled() {
@@ -816,7 +1001,9 @@ pub(crate) fn spawn_confirm_engine(
                 };
 
                 // Pin denserels (Allow) + assemble using owned stamped plan — no re-plan.
+                let t_work = Instant::now();
                 let mat_res = hub_prep.confirm_wire_prep_from_plan(done.stamped, Some(&pipe));
+                confirm_thr_stats::add_prep_work(t_work.elapsed());
                 drop(_live_guard);
 
                 if feed_prep.stopped() || hub_prep.query.confirm_cancelled() {
@@ -831,6 +1018,7 @@ pub(crate) fn spawn_confirm_engine(
                         let prepared_n = outcome.batch.len();
                         let wire = outcome.batch.approx_wire_bytes();
                         let parents = outcome.batch.parent_count();
+                        let t_send = Instant::now();
                         if mat_tx
                             .send((outcome.batch, outcome.work_ns))
                             .is_err()
@@ -838,6 +1026,7 @@ pub(crate) fn spawn_confirm_engine(
                             info!("ibd: confirm scripts channel closed");
                             return;
                         }
+                        confirm_thr_stats::add_prep_send_wait(t_send.elapsed());
                         queues_prep.note_load_send(prepared_n, wire, parents);
                         if work_ms > 2_000 {
                             info!(
@@ -922,6 +1111,7 @@ pub(crate) fn spawn_confirm_engine(
                 if feed.stopped() {
                     break;
                 }
+                let t_claim = Instant::now();
                 let batch: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = {
                     let mut g = feed.inner.lock().unwrap();
                     let found = loop {
@@ -990,12 +1180,18 @@ pub(crate) fn spawn_confirm_engine(
                     };
                     match found {
                         Some(x) => x,
-                        None => continue,
+                        None => {
+                            confirm_thr_stats::add_plan_claim(t_claim.elapsed());
+                            continue;
+                        }
                     }
                 };
+                confirm_thr_stats::add_plan_claim(t_claim.elapsed());
 
                 if batch.is_empty() {
+                    let t_sleep = Instant::now();
                     std::thread::sleep(Duration::from_millis(20));
+                    confirm_thr_stats::add_plan_claim(t_sleep.elapsed());
                     continue;
                 }
 
@@ -1006,10 +1202,12 @@ pub(crate) fn spawn_confirm_engine(
                     return;
                 }
 
+                let t_other = Instant::now();
                 if prep_ahead_reset_plan.swap(false, Ordering::AcqRel) {
                     plan_ahead.clear_all(&hub);
                 }
                 plan_ahead.prune_committed(&hub);
+                confirm_thr_stats::add_plan_other(t_other.elapsed());
 
                 // Live wall for stall watchdog / perf while plan runs (often multi-s).
                 struct LiveGuard<'a> {
@@ -1026,7 +1224,9 @@ pub(crate) fn spawn_confirm_engine(
                 };
 
                 let mut batch = batch;
+                let t_resolve = Instant::now();
                 if let Err(missing) = resolve_batch_wire_from_body_queue(&hub, &mut batch) {
+                    confirm_thr_stats::add_plan_resolve(t_resolve.elapsed());
                     static MISS_LOG: AtomicU32 = AtomicU32::new(0);
                     let n = MISS_LOG.fetch_add(1, Ordering::Relaxed) + 1;
                     if n <= 3 || n % 200 == 0 {
@@ -1051,6 +1251,7 @@ pub(crate) fn spawn_confirm_engine(
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 }
+                confirm_thr_stats::add_plan_resolve(t_resolve.elapsed());
 
                 // resolve_batch_wire requires every height has bq payload — sole intake.
                 let wire_batch: Vec<(u32, BlockHash, bitcoin::Block)> = batch
@@ -1064,14 +1265,18 @@ pub(crate) fn spawn_confirm_engine(
                 let pipe = plan_ahead.pipeline_for(expect_h, store_path_lo);
                 let use_pipe = pipe.path_lo >= store_path_lo;
                 let mut wire_batch = wire_batch;
+                let t_clone = Instant::now();
                 let plan_items: Vec<(rbitcoin_primitives::Height, bitcoin::Block)> = wire_batch
                     .iter()
                     .map(|(h, _, w)| (rbitcoin_primitives::Height(*h), w.clone()))
                     .collect();
+                confirm_thr_stats::add_plan_clone(t_clone.elapsed());
+                let t_stamp = Instant::now();
                 let plan_res = hub.confirm_wire_plan_phase(
                     &plan_items,
                     if use_pipe { Some(&pipe) } else { None },
                 );
+                // stamp wall continues through multi-block split retry below.
                 let plan_res = match plan_res {
                     Err(e) if wire_batch.len() > 1 => {
                         let msg = e.to_string();
@@ -1114,6 +1319,7 @@ pub(crate) fn spawn_confirm_engine(
                     }
                     other => other,
                 };
+                confirm_thr_stats::add_plan_stamp(t_stamp.elapsed());
                 drop(_live_guard);
 
                 match plan_res {
@@ -1151,6 +1357,7 @@ pub(crate) fn spawn_confirm_engine(
                         }
                         // Reserve create fks for plan(N+1) while this batch is still
                         // in prep/scripts/write (prep-ahead in-flight).
+                        let t_note = Instant::now();
                         if let Some(ref p) = stamped.plan {
                             if let Some((lh, raw)) = wire_batch
                                 .iter()
@@ -1164,11 +1371,13 @@ pub(crate) fn spawn_confirm_engine(
                         }
                         // Pipeline after note_plan_ok: prep pin sees prior+this offline denserels.
                         let pipe_for_prep = plan_ahead.pipeline_for(expect_h, store_path_lo);
+                        confirm_thr_stats::add_plan_other(t_note.elapsed());
                         let heights_hashes: Vec<(u32, BlockHash)> = wire_batch
                             .iter()
                             .map(|(h, ha, _)| (*h, *ha))
                             .collect();
                         let n = heights_hashes.len();
+                        let t_send = Instant::now();
                         if plan_tx
                             .send(PlanDone {
                                 heights_hashes,
@@ -1181,6 +1390,7 @@ pub(crate) fn spawn_confirm_engine(
                             let _ = prep_join.join();
                             return;
                         }
+                        confirm_thr_stats::add_plan_send_wait(t_send.elapsed());
                         queues_plan.note_plan_send(n);
                     }
                     Err(e) => {
@@ -1354,7 +1564,7 @@ pub(crate) fn offer_confirm_ready(
 mod tests {
     use super::{
         format_conf_q, format_queue_depth, is_confirm_load_retryable, prune_inflight_maps,
-        ConfirmFeed,
+        ConfirmFeed, ConfirmQueueDepths,
     };
     use bitcoin::hashes::Hash;
     use bitcoin::BlockHash;
@@ -1502,6 +1712,44 @@ mod tests {
         assert!(!g.inflight.contains(&88));
         assert!(g.ready.contains_key(&87));
         assert!(g.ready.contains_key(&88));
+    }
+
+    #[test]
+    fn queue_hwm_tracks_max_depth() {
+        let q = ConfirmQueueDepths::new();
+        q.note_plan_send(32);
+        q.note_plan_send(32);
+        assert_eq!(q.snap().0, 2);
+        q.note_plan_recv(32);
+        assert_eq!(q.snap().0, 1);
+        let (ph, lh, wh) = q.sample_hwm_and_reset();
+        assert_eq!(ph, 2, "hwm keeps max even after recv");
+        assert_eq!(lh, 0);
+        assert_eq!(wh, 0);
+        let (ph2, _, _) = q.sample_hwm_and_reset();
+        assert_eq!(ph2, 0, "hwm resets each sample window");
+    }
+
+    #[test]
+    fn thr_stats_sample_and_reset() {
+        use super::confirm_thr_stats;
+        use std::time::Duration;
+        let _ = confirm_thr_stats::sample_and_reset(); // clear
+        confirm_thr_stats::add_plan_resolve(Duration::from_millis(10));
+        confirm_thr_stats::add_plan_clone(Duration::from_millis(5));
+        confirm_thr_stats::add_prep_recv_wait(Duration::from_millis(20));
+        let s = confirm_thr_stats::sample_and_reset();
+        assert!(s.plan_resolve_ns >= 10_000_000);
+        assert!(s.plan_clone_ns >= 5_000_000);
+        assert!(s.prep_recv_wait_ns >= 20_000_000);
+        let busy = s
+            .plan_resolve_ns
+            .saturating_add(s.plan_clone_ns)
+            .saturating_add(s.plan_stamp_ns)
+            .saturating_add(s.plan_other_ns);
+        assert_eq!(busy, s.plan_resolve_ns + s.plan_clone_ns);
+        let z = confirm_thr_stats::sample_and_reset();
+        assert_eq!(z.plan_resolve_ns, 0);
     }
 
     #[test]

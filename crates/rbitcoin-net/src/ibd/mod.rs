@@ -1000,6 +1000,7 @@ pub async fn ibd_cancellable(
             // One sample/reset, then INFO `ibd: perf` + `ibd: sizes` (+ DEBUG `ibd: perf_dbg`).
             let parent_cache_snap = hub.query.parent_cache_perf_snapshot();
             let (plan_q, load_q, write_q) = confirm_queues.snap();
+            let conf_q_hwm = confirm_queues.sample_hwm_and_reset();
             let mut conf_pipe = confirm_queues.content_snap();
             let (feed_ready, feed_inflight) = confirm_feed.size_snap();
             conf_pipe.feed_ready = feed_ready;
@@ -1027,6 +1028,7 @@ pub async fn ibd_cancellable(
                 plan_q,
                 load_q,
                 write_q,
+                conf_q_hwm,
                 hub.query.scripthash_run_count(),
                 work_sizes,
                 owned_sizes,

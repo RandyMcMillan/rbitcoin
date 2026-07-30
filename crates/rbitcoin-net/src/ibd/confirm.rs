@@ -288,11 +288,12 @@ pub(crate) const WRITE_QUEUE_CAP: usize = 5;
 const MAX_CLAIM_AHEAD: u32 = (PLAN_QUEUE_CAP + LOAD_QUEUE_CAP + WRITE_QUEUE_CAP + 1) as u32
     * CONFIRM_RUN_MAX as u32;
 
-/// Plan-stage output: stamp only. Prep pins denserels + assembles.
+/// Plan-stage output: stamp + pipeline-local parent denserels for prep pin.
 struct PlanDone {
     /// Heights/hashes for feed finish/requeue bookkeeping.
     heights_hashes: Vec<(u32, BlockHash)>,
-    /// Structure + plan_mega (create_fk stamped); no denserels pin yet.
+    /// Structure + plan_mega (create_fk stamped); head-miss parents carry
+    /// denserels on `ArchiveWritePlan::external_parent_outs`.
     stamped: PlanStampOutcome,
     /// In-flight creates/outs for prep pin (prior uncommitted batches).
     pipeline: WirePrepPipeline,

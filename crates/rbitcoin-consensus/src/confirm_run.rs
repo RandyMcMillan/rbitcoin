@@ -1313,6 +1313,7 @@ fn pin_for_wire_batch(
     }
 
     // Build plan/in-flight pin sources only for spent parents (not every create).
+    // 1) Prior uncommitted plans (offline denserels).
     if let Some(ifo) = in_flight_outs {
         for (id, need) in &parent_vouts {
             if plan_by_id.contains_key(id) {
@@ -1324,6 +1325,19 @@ fn pin_for_wire_batch(
             }
         }
     }
+    // 2) This plan's head-miss external parents (pipeline-local denserels from plan).
+    if let Some(plan) = plan {
+        for (id, need) in &parent_vouts {
+            if plan_by_id.contains_key(id) {
+                continue;
+            }
+            if let Some((tx, outs, denserels)) = plan.external_parent_outs.get(id) {
+                let _ = need;
+                plan_by_id.insert(*id, (tx.clone(), outs.clone(), denserels.clone()));
+            }
+        }
+    }
+    // 3) Same-batch creates (offline denserels from packed plan).
     for (id, _need) in &parent_vouts {
         if plan_by_id.contains_key(id) {
             continue;
@@ -2628,6 +2642,7 @@ mod write_idempotent_tests {
             per_header_ranges: vec![],
             spends: vec![],
             batch_creates: vec![],
+            external_parent_outs: Default::default(),
             index_tx: false,
             body_est: 0,
             advise_dont_need: false,
@@ -2701,6 +2716,7 @@ mod write_idempotent_tests {
             per_header_ranges: vec![],
             spends: vec![],
             batch_creates: vec![],
+            external_parent_outs: Default::default(),
             index_tx: false,
             body_est: 0,
             advise_dont_need: false,

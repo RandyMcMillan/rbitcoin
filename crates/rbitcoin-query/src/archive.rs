@@ -4,6 +4,8 @@
 //! - **Plan** ([`Query::archive_plan_mega_owned`] / [`Query::archive_plan_mega_from`]):
 //!   store **reads** — assign create fks (optionally from a reserved HWM),
 //!   **CreateResidency** + in-flight planned creates + `tx.head` resolve, stamp inputs.
+//!   Head-miss parents load **outs+denserels once** into
+//!   [`ArchiveWritePlan::external_parent_outs`] (pipeline-local; not residency FIFO).
 //! - **Commit** ([`Query::archive_commit_plan`]): store **writes** — body append,
 //!   head index, header_txs, residency denserels seed.
 //! - **Prewarm** ([`Query::archive_residency_prewarm`]): startup cache fill —
@@ -57,6 +59,14 @@ pub struct ArchiveWritePlan {
     /// Parents resolved via durable `tx.head` are **not** published (they thrash
     /// the FIFO with long-tail keys and evict recent creates).
     pub batch_creates: Vec<([u8; 32], Fk)>,
+    /// External parents that missed CreateResidency at plan (head-resolved): full
+    /// outs+denserels loaded once for prep pin. **Pipeline-local** — not written
+    /// into CreateResidency FIFO (long-tail thrash). Prep must consult this map
+    /// before cold denserels IO (a create_fk residency miss is also a denserels miss).
+    pub external_parent_outs: std::collections::HashMap<
+        u64,
+        (TxRecord, Vec<OutputRecord>, Vec<u32>),
+    >,
     pub index_tx: bool,
     pub body_est: u64,
     /// Snapshot of “far ahead of confirm” at plan time.
@@ -71,6 +81,7 @@ impl ArchiveWritePlan {
             per_header_ranges: Vec::new(),
             spends: Vec::new(),
             batch_creates: Vec::new(),
+            external_parent_outs: std::collections::HashMap::new(),
             index_tx: false,
             body_est: 0,
             advise_dont_need: false,
@@ -330,29 +341,33 @@ impl Query {
         let head_need_n = need_head.len() as u64;
         let mut head_hit_n = 0u64;
 
+        // External parents that miss CreateResidency (head path). Load full
+        // outs+denserels once into pipeline-local map — prep would denserels-miss
+        // the same creates, so range-only seed was a wasted half-load.
+        let mut external_parent_outs: std::collections::HashMap<
+            u64,
+            (TxRecord, Vec<OutputRecord>, Vec<u32>),
+        > = std::collections::HashMap::new();
         if !need_head.is_empty() {
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
             let hits = self.store.get_fk_by_txid_batch(&need_head)?;
-            // Seed residency range only for **misses** (not already prewarmed) so
-            // pin cold denserels can skip idx — without insert storm under full
-            // create_cap (prewarm already holds last N Class A).
             let mut head_pairs: Vec<([u8; 32], Fk)> = Vec::new();
             for (txid, fk_opt) in hits {
                 if let Some(fk) = fk_opt {
                     resolved.insert(txid, fk);
                     head_hit_n = head_hit_n.saturating_add(1);
-                    if self.create_residency.lookup_fk_by_txid(&txid).is_none() {
-                        head_pairs.push((txid, fk));
-                    }
+                    // Still residency-miss for denserels (create_fk was miss).
+                    head_pairs.push((txid, fk));
                 }
             }
             if !head_pairs.is_empty() {
                 let fks: Vec<Fk> = head_pairs.iter().map(|(_, f)| *f).collect();
-                let ranges = self.store.tx_body_range_batch(&fks)?;
-                for ((txid, fk), range) in head_pairs.into_iter().zip(ranges.into_iter()) {
-                    self.create_residency
-                        .insert_fk_txid_range(fk, txid, range);
-                }
+                external_parent_outs =
+                    crate::combined_stage::load_creates_outs_pipeline_local(
+                        &self.store,
+                        &self.create_residency,
+                        &fks,
+                    )?;
             }
         }
         let head_ns = t_head.elapsed().as_nanos() as u64;
@@ -437,6 +452,7 @@ impl Query {
             per_header_ranges,
             spends,
             batch_creates,
+            external_parent_outs,
             index_tx,
             body_est,
             advise_dont_need,
@@ -1004,8 +1020,8 @@ mod tests {
     }
 
     /// Commit denserels seed is for this batch's creates only.
-    /// Head-resolved parents may get **range-only** residency (cold denserels idx skip)
-    /// but must not receive denserels until pin/ensure loads them.
+    /// Head-resolved parents load outs+denserels into **pipeline-local**
+    /// `external_parent_outs` (not CreateResidency FIFO).
     #[test]
     fn residency_publish_creates_only_not_head_resolved_parents() {
         use std::collections::HashMap;
@@ -1053,18 +1069,22 @@ mod tests {
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
         assert_eq!(plan.batch_creates.len(), 1);
         assert_eq!(plan.batch_creates[0].0, child_txid);
-        // Plan head path seeds range-only for the parent (helps pin cold denserels).
-        assert_eq!(
-            q.create_residency().lookup_fk_by_txid(&parent_txid),
-            Some(Fk(1))
+        // Pipeline-local denserels for head-miss parent (prep pin source).
+        let (ptx, pouts, pdens) = plan
+            .external_parent_outs
+            .get(&1)
+            .expect("head-miss parent denserels on plan");
+        assert_eq!(ptx.txid, parent_txid);
+        assert!(!pouts.is_empty(), "outs loaded for pin");
+        assert!(!pdens.is_empty() || pouts.len() == 1, "denserels for outs");
+        // Must not thrash CreateResidency with long-tail head parents.
+        assert!(
+            q.create_residency().lookup_fk_by_txid(&parent_txid).is_none(),
+            "head path must not FIFO-seed parent into residency"
         );
         assert!(
             q.create_residency().get_outs(Fk(1)).is_none(),
-            "head path must not denserels-seed parents"
-        );
-        assert!(
-            q.create_residency().body_ranges_by_fk(&[Fk(1)])[0].is_some(),
-            "head path should cache body_range for parent"
+            "head path must not denserels-seed parents into residency"
         );
 
         q.archive_commit_plan(plan).unwrap();

@@ -845,19 +845,25 @@ fn pin_for_wire_batch(
 
             let t_dec = Instant::now();
             for c in loaded {
-                let Some(id) = c.fk.get() else { continue };
+                let Some(id) = c.fk.get() else {
+                    return Err(ConsensusError::Store(StoreError::Corrupt(
+                        "invariant: wire pin cold denserels null create_fk",
+                    )));
+                };
                 let need = cold.get(&id).cloned().unwrap_or_default();
-                // Prefer single-decode from load_creates_once; fall back to raw.
+                // Prefer single-decode from load_creates_once; raw is second chance only.
                 let (tx, outs, dense_rels) = if let Some(dec) = c.decoded_outs {
                     dec
                 } else {
-                    match rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
+                    rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
                         &c.raw,
                         Some(query.store().txs.store_secret()),
-                    ) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    }
+                    )
+                    .map_err(|_| {
+                        ConsensusError::Store(StoreError::Corrupt(
+                            "invariant: wire pin cold denserels decode failed",
+                        ))
+                    })?
                 };
                 let mut need = need;
                 need.sort_unstable();
@@ -869,7 +875,17 @@ fn pin_for_wire_batch(
                     .iter()
                     .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
                     .collect();
+                if live.len() != need.len() {
+                    return Err(ConsensusError::Store(StoreError::Corrupt(
+                        "invariant: wire pin cold denserels incomplete outs for need_vouts",
+                    )));
+                }
                 let sparse = rbitcoin_query::sparse_spender_rels(&dense_rels, &need);
+                if !rbitcoin_query::layout_covers_need(Some(c.body_range), &sparse, &need) {
+                    return Err(ConsensusError::Store(StoreError::Corrupt(
+                        "invariant: wire pin cold denserels incomplete for need_vouts",
+                    )));
+                }
                 let cb = if tx.input_count != 1 {
                     Some(false)
                 } else {
@@ -888,6 +904,31 @@ fn pin_for_wire_batch(
             cold_decode_ns = t_dec.elapsed().as_nanos() as u64;
             confirm_load_stats::BODY_TX_READS.fetch_add(n_cold, Ordering::Relaxed);
             confirm_load_stats::FULL_TX_READS.fetch_add(n_cold, Ordering::Relaxed);
+            // Every cold parent must have been loaded — silent miss is a prep/store bug.
+            for id in cold.keys() {
+                let fk = rbitcoin_primitives::Fk(*id);
+                if !batch_parents.contains(fk) {
+                    return Err(ConsensusError::Store(StoreError::Corrupt(
+                        "invariant: wire pin cold denserels missing parent after load",
+                    )));
+                }
+            }
+        }
+    }
+
+    // Pin contract: every spent parent is in BatchParents with need outs.
+    // Denserels/body_range may wait for write ensure (prep-ahead plan pin).
+    for (id, need) in &parent_vouts {
+        let fk = rbitcoin_primitives::Fk(*id);
+        if !batch_parents.contains(fk) {
+            return Err(ConsensusError::Store(StoreError::Corrupt(
+                "invariant: wire pin missing spent parent",
+            )));
+        }
+        if !need.is_empty() && !batch_parents.pin_covered(fk, need) {
+            return Err(ConsensusError::Store(StoreError::Corrupt(
+                "invariant: wire pin incomplete outs for spent parent",
+            )));
         }
     }
 
@@ -1188,7 +1229,9 @@ fn fill_planned_create_layout_after_commit(
 /// 2. Already-archived Class A same-batch creates never pinned
 /// 3. Retry after partial write
 ///
-/// **Residency first** (commit denserels seed) — cold Class A body only if miss.
+/// **Residency first** (commit denserels seed) — Class A denserels body load only
+/// when residency misses. After this function returns, every non-null spend edge
+/// **must** have abs layout — no silent leave-for-later / structural cold paper.
 fn ensure_spend_abs_layouts(
     query: &Query,
     batch_parents: &mut rbitcoin_query::BatchParents,
@@ -1292,68 +1335,97 @@ fn ensure_spend_abs_layouts(
         still.insert(*id, need_v.clone());
     }
     confirm_phase_stats::ENSURE_RES_HIT.fetch_add(ensure_res, Ordering::Relaxed);
-    if still.is_empty() {
-        return Ok(());
+
+    // 2) Class A denserels body for remainder only (must not re-load pin hits).
+    if !still.is_empty() {
+        let fks: Vec<rbitcoin_primitives::Fk> = still
+            .keys()
+            .map(|id| rbitcoin_primitives::Fk(*id))
+            .collect();
+        confirm_phase_stats::ENSURE_COLD_N.fetch_add(fks.len() as u64, Ordering::Relaxed);
+        let loaded = rbitcoin_query::load_creates_once(
+            query.store(),
+            query.create_residency(),
+            &fks,
+            IdxBodyMode::OutsDenserels,
+        )
+        .map_err(ConsensusError::Store)?;
+        let secret = query.store().txs.store_secret();
+        for c in loaded {
+            let Some(id) = c.fk.get() else {
+                return Err(ConsensusError::Store(StoreError::Corrupt(
+                    "invariant: ensure denserels null create_fk",
+                )));
+            };
+            let need_v = still.get(&id).cloned().unwrap_or_default();
+            let (tx, outs, dense_rels) = if let Some(dec) = c.decoded_outs {
+                dec
+            } else {
+                // load_creates_once OutsDenserels should always fill decoded_outs.
+                rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
+                    &c.raw,
+                    Some(secret),
+                )
+                .map_err(|_| {
+                    ConsensusError::Store(StoreError::Corrupt(
+                        "invariant: ensure denserels decode failed",
+                    ))
+                })?
+            };
+            if batch_parents.contains(c.fk) {
+                batch_parents.set_layout_for_need(c.fk, c.body_range, &dense_rels, &need_v);
+                continue;
+            }
+            // Not pinned at prep (e.g. already-archived same-batch create): insert
+            // with layout so annotate/structural abs paths work.
+            let mut checked = need_v;
+            if checked.is_empty() {
+                checked = (0..outs.len() as u32).collect();
+            }
+            let live: Vec<(u32, rbitcoin_store::OutputRecord)> = checked
+                .iter()
+                .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
+                .collect();
+            if live.len() != checked.len() {
+                return Err(ConsensusError::Store(StoreError::Corrupt(
+                    "invariant: ensure denserels incomplete outs for need_vouts",
+                )));
+            }
+            let sparse = rbitcoin_query::sparse_spender_rels(&dense_rels, &checked);
+            if !rbitcoin_query::layout_covers_need(Some(c.body_range), &sparse, &checked) {
+                return Err(ConsensusError::Store(StoreError::Corrupt(
+                    "invariant: ensure denserels incomplete for need_vouts",
+                )));
+            }
+            let cb = if tx.input_count != 1 {
+                Some(false)
+            } else {
+                None
+            };
+            batch_parents.insert_owned(
+                c.fk,
+                tx,
+                live,
+                checked,
+                cb,
+                Some(c.body_range),
+                sparse,
+            );
+        }
     }
 
-    // 2) Cold denserels body for remainder only (must not re-load pin hits).
-    let fks: Vec<rbitcoin_primitives::Fk> = still
-        .keys()
-        .map(|id| rbitcoin_primitives::Fk(*id))
-        .collect();
-    confirm_phase_stats::ENSURE_COLD_N.fetch_add(fks.len() as u64, Ordering::Relaxed);
-    let loaded = rbitcoin_query::load_creates_once(
-        query.store(),
-        query.create_residency(),
-        &fks,
-        IdxBodyMode::OutsDenserels,
-    )
-    .map_err(ConsensusError::Store)?;
-    let secret = query.store().txs.store_secret();
-    for c in loaded {
-        let Some(id) = c.fk.get() else { continue };
-        let need_v = still.get(&id).cloned().unwrap_or_default();
-        let (tx, outs, dense_rels) = if let Some(dec) = c.decoded_outs {
-            dec
-        } else {
-            // load_creates_once OutsDenserels should always fill decoded_outs.
-            match rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
-                &c.raw,
-                Some(secret),
-            ) {
-                Ok(v) => v,
-                Err(_) => continue,
+    // Post-condition: every non-null spend edge has abs — no structural cold paper.
+    for p in prepared {
+        for &(_txid, vout, sfk, cfk) in &p.spends {
+            if sfk.is_null() || cfk.is_null() {
+                continue;
             }
-        };
-        if batch_parents.contains(c.fk) {
-            batch_parents.set_layout_for_need(c.fk, c.body_range, &dense_rels, &need_v);
-            continue;
+            if batch_parents.get_spender_abs(cfk, vout).is_none() {
+                return Err(ConsensusError::Store(StoreError::Corrupt(
+                    "invariant: ensure denserels/abs incomplete for spend edge",
+                )));
+            }
         }
-        // Not pinned at prep (e.g. already-archived same-batch create): insert
-        // with layout so annotate/structural abs paths work.
-        let mut checked = need_v;
-        if checked.is_empty() {
-            checked = (0..outs.len() as u32).collect();
-        }
-        let live: Vec<(u32, rbitcoin_store::OutputRecord)> = checked
-            .iter()
-            .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
-            .collect();
-        let sparse = rbitcoin_query::sparse_spender_rels(&dense_rels, &checked);
-        let cb = if tx.input_count != 1 {
-            Some(false)
-        } else {
-            None
-        };
-        batch_parents.insert_owned(
-            c.fk,
-            tx,
-            live,
-            checked,
-            cb,
-            Some(c.body_range),
-            sparse,
-        );
     }
     Ok(())
 }
@@ -1833,6 +1905,173 @@ mod write_idempotent_tests {
         // Empty BatchParents → get_spender_abs is None.
         let bp = BatchParents::new();
         let err = post_commit(&q, &prepared, &bp).expect_err("missing denserels");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invariant") && msg.contains("denserels"),
+            "unexpected err: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Write-stage ensure must hard-fail when denserels/abs cannot be completed
+    /// (no silent leave-for structural cold or post_commit).
+    #[test]
+    fn ensure_spend_abs_incomplete_is_invariant_error() {
+        use super::{ensure_spend_abs_layouts, Prepared};
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::{BatchParents, Query};
+        use std::sync::Once;
+
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-ensure-abs-inv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let q = Query::open_or_create(&path).unwrap();
+        q.enter_direct_index_mode().unwrap();
+
+        let prepared = [Prepared {
+            height: Height(1),
+            header_fk: Fk(1),
+            tx_fks: vec![Fk(10)],
+            jobs: vec![],
+            // Non-null create_fk that does not exist in Class A → cold load miss.
+            spends: vec![([9u8; 32], 0, Fk(10), Fk(999_999))],
+            fees: 0,
+            check_scripts: false,
+            time: 1,
+            bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+            hash: [3u8; 32],
+        }];
+        let mut bp = BatchParents::new();
+        let err = ensure_spend_abs_layouts(&q, &mut bp, &prepared)
+            .expect_err("ensure must hard-fail without denserels");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invariant")
+                && (msg.contains("ensure denserels") || msg.contains("abs incomplete")),
+            "unexpected err: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Pin-covered parent without denserels/abs fails structural (no body-range cold).
+    #[test]
+    fn structural_pinned_without_abs_is_invariant_error() {
+        use crate::block::structural_validate_spends;
+        use crate::milestone::Milestone;
+        use crate::params::ChainParams;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version};
+        use bitcoin::hashes::Hash;
+        use bitcoin::script::ScriptBuf;
+        use bitcoin::transaction::Version as TxVersion;
+        use bitcoin::{
+            Amount, Block, BlockHash, CompactTarget, OutPoint, Sequence, Transaction, TxIn, TxOut,
+            Witness,
+        };
+        use rbitcoin_primitives::{Fk, Height};
+        use rbitcoin_query::{BatchParents, Query};
+        use rbitcoin_store::{OutputRecord, TxRecord};
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Once;
+
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-struct-pin-inv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let q = Query::open_or_create(&path).unwrap();
+        q.enter_direct_index_mode().unwrap();
+        let params = ChainParams::regtest();
+
+        // Minimal non-empty block (coinbase only) for structural entry.
+        let coinbase = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x00, 0x01]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut block = Block {
+            header: Header {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+                time: 1_300_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        // Parent pin present (outs) but denserels/body_range missing → abs None.
+        let mut bp = BatchParents::new();
+        let parent_fk = Fk(42);
+        let tx = TxRecord {
+            txid: [7u8; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let out = OutputRecord::unspent(1, vec![0x51]);
+        bp.insert_owned(
+            parent_fk,
+            tx,
+            vec![(0, out)],
+            vec![0],
+            Some(false),
+            None, // no body_range
+            vec![], // no denserels
+        );
+
+        let spends = vec![([7u8; 32], 0u32, Fk(100), parent_fk)];
+        let ctx = crate::block::ValidationContext::at(&params, Height(1), Milestone::NONE);
+        let mut pending = HashSet::new();
+        let mut mtp = HashMap::new();
+        let err = structural_validate_spends(
+            &q,
+            &block,
+            &ctx,
+            None,
+            &spends,
+            0,
+            &mut pending,
+            &bp,
+            &mut mtp,
+        )
+        .expect_err("pinned without abs must be invariant");
         let msg = format!("{err}");
         assert!(
             msg.contains("invariant") && msg.contains("denserels"),

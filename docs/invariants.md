@@ -14,7 +14,7 @@ with `Err(…Corrupt("invariant: …"))` (and `debug_assert!` where useful). Do
 
 | Kind | Examples | Policy |
 |------|----------|--------|
-| **Prep miss** | Spend annotate without pin denserels; body decode without `tx.idx` range; FIFO pin without `body_range` | Assert / hard Err; fix prep |
+| **Prep miss** | Spend annotate without pin denserels; body decode without `tx.idx` range; pin without outs for need_vouts; ensure without abs for a spend edge | Assert / hard Err; fix prep |
 | **Environment** | `io_uring` off → pread/mmap; `RBITCOIN_FD_APPEND=0` | Keep modality fallback |
 | **Protocol** | BIP30 multi-spender list; same-block spends; coinbase null create | Real branches |
 | **API / product** | RPC body from store; Electrum mempool after chain; compact → getdata | Keep |
@@ -29,24 +29,46 @@ Peer/wire corruption stays ordinary `Corrupt` / `BadBlock` — never assert on
 untrusted input. Invariants apply only to **our** prep (load pin, denserels,
 header plan after load planned it, stamped `create_fk`, etc.).
 
-## Direct IBD strictness (current focus)
+## Direct IBD stage table (enforced)
 
-| Stage | Invariant (examples) |
-|-------|----------------------|
-| Load body | Every published create has a body range (no sequential `get_tx_full` fallback) |
-| Load pin | Every needed parent has `body_range` + denserels for `need_vouts` (incomplete FIFO → re-pin) |
-| Write spend annotate | Every non-null spend edge has abs meta; only `put_spend_batch_by_abs_meta` |
-| Structural spentness | Abs required when parent was pin-loaded; cold only if no pin entry (unit-test `validate_block_connect`) or multi-list protocol |
-| Tip connect | Same as IBD: archive + `confirm_archived_run` (not empty-pin connect) |
-| Tip scripts | Optional `ScriptPreverified` (live mempool txids) skips re-verify; IBD empty set |
-| Reorg | Disconnect outside confirm; then connect tip+1 with the normal pipeline |
+```
+wire / body-queue
+  → plan (stamp create_fk, offline denserels when packed)
+  → pin (BatchParents: outs for need_vouts; denserels when available)
+  → scripts (pure CPU)
+  → Class A commit (if plan)
+  → ensure abs (residency → Class A denserels body; post-condition: every spend has abs)
+  → structural spentness (pin abs bulk pread; multi-list protocol cold only)
+  → Class C tip
+  → abs spend annotate (put_spend_batch_by_abs_meta only)
+```
+
+| Stage | Invariant | Soft path allowed? |
+|-------|-----------|--------------------|
+| Load body | Every published create has a body range | No sequential `get_tx_full` fallback |
+| Wire/load pin | Every spent parent in `BatchParents` with `pin_covered`; cold denserels decode fail is hard Err | Class A denserels body load **is** the pin cold tier (not a post-prep fallback) |
+| Ensure (write) | Every non-null spend edge has denserels/abs after ensure returns | Residency then denserels body to **complete** prep-ahead; incomplete → `invariant:` |
+| Structural spentness | Abs required when parent was pin-loaded | Cold body-range walk only if **not** pinned (unit-test empty pin) or multi-list after meta |
+| Spend annotate | Abs-only `put_spend_batch_by_abs_meta`; cold OOB/IO is hard Err | No ranged/by_create annotate tiers |
+| Tip scripts | Optional `ScriptPreverified` (mempool) | IBD empty set |
+| Reorg | Disconnect outside confirm; connect tip+1 with normal pipeline | — |
 
 RPC, Electrum, and standalone tools may still use store cold paths.
-`validate_block_connect` remains a no-write unit-test helper only.
-See the plan catalog (clusters A–K) for the full inventory.
+`validate_block_connect` remains a no-write unit-test helper only (empty pin →
+structural cold spentness).
 
 ## Related code
 
-- Confirm write annotate: `rbitcoin-consensus` `confirm_run::post_commit`
+- Confirm write annotate / ensure: `rbitcoin-consensus` `confirm_run::{post_commit,ensure_spend_abs_layouts,pin_for_wire_batch}`
+- Structural: `rbitcoin-consensus` `block::structural_validate_spends`
 - Pin / denserels: `rbitcoin-query` `confirm_load`, `BatchParents`, `CreateResidency`
 - Abs annotate: `rbitcoin-store` `put_spend_batch_by_abs_meta`
+
+## Regression tests (shipped)
+
+| Test | Entry |
+|------|--------|
+| `post_commit_missing_denserels_is_invariant_error` | `post_commit` abs-only annotate |
+| `ensure_spend_abs_incomplete_is_invariant_error` | `ensure_spend_abs_layouts` post-condition |
+| `structural_pinned_without_abs_is_invariant_error` | `structural_validate_spends` pin without denserels |
+| `confirm_load` pin_new invariants | missing body range / denserels incomplete (query crate) |

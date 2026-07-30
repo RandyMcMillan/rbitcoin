@@ -8,7 +8,7 @@ in RSS when faulted but are not Rust heap leaks).
 
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
-| **Durable body queue** | default 8 GiB payload (`RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`) | Peer **offer** wire; confirm prep **reads** by height; confirm-write **dequeues** after tip advance. RAM overflow when disk full (same soft gate for densify). |
+| **Durable body queue** | default 8 GiB **disk** payload (`RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`) | Peer **offer** wire; confirm prep **reads** by height; confirm-write **dequeues** after tip advance. Files get `POSIX_FADV_DONTNEED` after durable write (idle on disk — not process heap / not intended page-cache pin). RAM overflow when disk full (same soft gate for densify); sizes: `bq disk=` vs `pending_ram=`. |
 | **Body densify height horizon** | `CONTIG_DENSIFY_AHEAD` (64 k past tip) | Safety only when the byte budget is nearly empty (early small blocks); primary stop is **byte fill** (90%/70% hysteresis). |
 | **Confirm feed** | readiness (height/hash), no wire retain | Prep claims tip-contiguous runs; requeue / finish on outcome |
 
@@ -128,6 +128,7 @@ known retain structures:
 | `rss=` `anon=` `file=` `hwm=` | `/proc` process RSS (anon vs mmap file pages) |
 | `work` / `body` | IBD maps + body-presence sets |
 | `body_soft` / `contig` | Soft archive RAM + ContigPark |
+| `bq disk=` / `pending_ram=` | **Disk** payload fill vs **process** overflow only (do not equate disk MiB with RSS) |
 | `residency` | **Sole** pin map: creates/outs vs caps + conf_plans |
 | `conf planq` / `prepq` / `writeq` | Confirm pipeline **queue contents** (batches, blocks, wire MiB, parents) + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |

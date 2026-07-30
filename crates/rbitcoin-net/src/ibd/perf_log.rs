@@ -5,9 +5,9 @@
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
-//! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, planq/prepq/writeq, txs=, horizon, tip ETA, body `bq=` |
-//! | INFO  | `ibd: perf …` | Download + body-queue pressure; **prep / script / write** stage walls + sub-phases; pin mix; queues |
-//! | INFO  | `ibd: sizes …` | RSS + work path + body soft budget + **bq** + **residency** + conf pipe + tx.head |
+//! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, planq/prepq/writeq, txs=, horizon, tip ETA, body `bq n= disk=` |
+//! | INFO  | `ibd: perf …` | Download + body-queue pressure (`disk=` vs `pending_ram=`); **prep / script / write** stage walls + sub-phases; pin mix; queues |
+//! | INFO  | `ibd: sizes …` | RSS + work path + body soft budget + **bq disk/pending_ram** + **residency** + conf pipe + tx.head |
 //! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; plan_mega res_txid; class_a res_seed; dual-track pipe only if active |
 //!
 //! **Create pin map:** sole hot map is **CreateResidency** (`residency creates=/outs=`).
@@ -49,9 +49,13 @@ pub(crate) struct IbdPerfSample {
     pub arch_mb: usize,
     pub arch_budget_mb: usize,
     /// Durable on-disk block queue (schema 12): budget/used bytes + entry count.
+    /// **Disk only** — not process heap. See `bq_pending_*` for RAM overflow.
     pub bq_budget: u64,
     pub bq_bytes: u64,
     pub bq_count: usize,
+    /// Body-queue RAM overflow (already-received while disk at budget).
+    pub bq_pending_bytes: u64,
+    pub bq_pending_count: usize,
     pub pending: usize,
     /// Claim-ready HWM (+ inflight) ahead of tip — densify headroom (not a progress lead token).
     pub arch_ahead: u32,
@@ -314,6 +318,8 @@ impl Default for IbdPerfSample {
             bq_budget: 0,
             bq_bytes: 0,
             bq_count: 0,
+            bq_pending_bytes: 0,
+            bq_pending_count: 0,
             pending: 0,
             arch_ahead: 0,
             hole: 0,
@@ -618,8 +624,8 @@ pub(crate) fn sample(
     arch_q: usize,
     arch_mb: usize,
     arch_budget_mb: usize,
-    // Durable block queue: (budget_bytes, used_bytes, count).
-    bq: (u64, u64, usize),
+    // Durable block queue: (budget, disk_bytes, disk_count, pending_bytes, pending_count).
+    bq: (u64, u64, usize, u64, usize),
     pending: usize,
     _known_ready: usize,
     _ordered: usize,
@@ -639,7 +645,7 @@ pub(crate) fn sample(
     conf_pipe: ConfirmPipelineSizes,
     rss: ProcRss,
 ) -> IbdPerfSample {
-    let (bq_budget, bq_bytes, bq_count) = bq;
+    let (bq_budget, bq_bytes, bq_count, bq_pending_bytes, bq_pending_count) = bq;
     let hot = loop_stats.sample_and_reset();
     let thr = super::confirm::confirm_thr_stats::sample_and_reset();
     let stamp_sub = rbitcoin_consensus::plan_stamp_sub_stats::sample_and_reset();
@@ -700,6 +706,8 @@ pub(crate) fn sample(
         bq_budget,
         bq_bytes,
         bq_count,
+        bq_pending_bytes,
+        bq_pending_count,
         pending,
         arch_ahead,
         hole,
@@ -956,11 +964,13 @@ fn write_stage_ms(s: &IbdPerfSample) -> u64 {
 pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     let bq_mib = s.bq_bytes / (1024 * 1024);
     let bq_budget_mib = s.bq_budget / (1024 * 1024);
+    let bq_pend_mib = s.bq_pending_bytes / (1024 * 1024);
     let write_ms = write_stage_ms(s);
     // Download / body-queue pressure (what starves tip advance).
-    // `body_soft` = soft charged budget (assign hysteresis); `bq` = durable body queue.
+    // `body_soft` = soft charged budget (assign hysteresis);
+    // `bq disk=` = durable files (not heap); `pending_ram=` = process overflow only.
     let mut out = format!(
-        "ibd: perf inflight={}/{} body_soft={}/{}MiB bq={} ({}MiB/{}MiB) pending={} buf_ahead={} hole={} peers={}",
+        "ibd: perf inflight={}/{} body_soft={}/{}MiB bq n={} disk={}MiB/{}MiB pending_ram={}MiB body_pend={} buf_ahead={} hole={} peers={}",
         s.inflight,
         s.inflight_cap,
         s.arch_q,
@@ -968,6 +978,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.bq_count,
         bq_mib,
         bq_budget_mib,
+        bq_pend_mib,
         s.pending,
         s.arch_ahead,
         s.hole,
@@ -1280,11 +1291,13 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     );
     let bq_mib = s.bq_bytes / (1024 * 1024);
     let bq_budget_mib = s.bq_budget / (1024 * 1024);
+    let bq_pend_mib = s.bq_pending_bytes / (1024 * 1024);
     out.push_str(&format!(
-        " | bq={} ({}MiB/{}MiB) | {conf_q} | prep thru={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} uniq_p={} pin_cache={} pin_res={} pin_new={} body_io={} parent_io={}",
+        " | bq n={} disk={}MiB/{}MiB pending_ram={}MiB | {conf_q} | prep thru={} bodies={} plans={} win_ms={} blks={} utxo_p={} creates={} uniq_p={} pin_cache={} pin_res={} pin_new={} body_io={} parent_io={}",
         s.bq_count,
         bq_mib,
         bq_budget_mib,
+        bq_pend_mib,
         s.load_ready_through,
         s.cache_bodies,
         s.cache_plans,
@@ -1455,12 +1468,13 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     };
     let bq_mib = s.bq_bytes / (1024 * 1024);
     let bq_budget_mib = s.bq_budget / (1024 * 1024);
+    let bq_pend_mib = s.bq_pending_bytes / (1024 * 1024);
     format!(
         "ibd: sizes rss={}MiB anon={}MiB file={}MiB({}%) hwm={}MiB locked={}MiB \
          | work ordered={}/set={} hash_h={} h2h={} hdr_fk={} known_hdr={} inflight={}/peer={} cooldown={} \
          | body known={} pend={} miss={} charged={} rej={} \
          | body_soft q={}/{}MiB budget={}MiB contig parked={} ready={} next_h={} \
-         | bq n={} {}MiB/{}MiB \
+         | bq n={} disk={}MiB/{}MiB pending_ram={}MiB pend_n={} \
          | residency creates={}/{} outs={}/{} conf_plans={} \
          | conf planq={}/{} blks={} prepq={}/{} blks={} wire={}MiB parents={} writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
@@ -1495,6 +1509,8 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         s.bq_count,
         bq_mib,
         bq_budget_mib,
+        bq_pend_mib,
+        s.bq_pending_count,
         o.residency_creates,
         o.residency_create_cap,
         o.residency_outs,
@@ -1609,7 +1625,10 @@ mod tests {
         assert!(line.starts_with("ibd: perf "), "{line}");
         assert!(line.contains("inflight=3/256"), "{line}");
         assert!(line.contains("body_soft=10/"), "{line}");
-        assert!(line.contains("bq=7 (128MiB/4096MiB)"), "{line}");
+        assert!(
+            line.contains("bq n=7 disk=128MiB/4096MiB pending_ram=0MiB"),
+            "{line}"
+        );
         assert!(line.contains("buf_ahead=224"), "{line}");
         assert!(!line.contains("lead="), "schema12: no Class A lead= on perf: {line}");
         assert!(!line.contains("arch_hwm"), "{line}");
@@ -1752,7 +1771,10 @@ mod tests {
         assert!(line.contains("store_ms=50"), "{line}");
         assert!(line.contains("sh collect=12"), "{line}");
         assert!(line.contains("pin_sub body="), "{line}");
-        assert!(line.contains("bq=3 (64MiB/1024MiB)"), "{line}");
+        assert!(
+            line.contains("bq n=3 disk=64MiB/1024MiB pending_ram=0MiB"),
+            "{line}"
+        );
         // Depth 0 → `<` (consumer waiting on empty queue).
         assert!(line.contains("planq"), "{line}");
         assert!(line.contains("prepq<0/2 writeq=1/2") || line.contains("prepq="), "{line}");
@@ -1854,7 +1876,10 @@ mod tests {
         assert!(line.contains("pend=5"), "{line}");
         assert!(line.contains("charged=4"), "{line}");
         assert!(line.contains("body_soft q=12/40MiB"), "{line}");
-        assert!(line.contains("bq n=4 32MiB/512MiB"), "{line}");
+        assert!(
+            line.contains("bq n=4 disk=32MiB/512MiB pending_ram=0MiB"),
+            "{line}"
+        );
         assert!(line.contains("residency creates=80/8000000 outs=900/16777216"), "{line}");
         assert!(!line.contains("outfifo"), "{line}");
         assert!(!line.contains("sticky_fk="), "{line}");
@@ -1927,8 +1952,8 @@ mod tests {
             2,   // arch_q
             10,  // arch_mb
             512, // budget
-            (512 * 1024 * 1024, 0, 0), // bq budget/bytes/count
-            3,   // pending
+            (512 * 1024 * 1024, 0, 0, 0, 0), // bq budget/disk/count/pending_bytes/pend_n
+            3,   // body pending
             0,
             0,
             100, // arch_ahead

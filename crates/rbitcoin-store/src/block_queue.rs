@@ -216,6 +216,10 @@ impl BlockQueue {
             .map_err(|e| StoreError::io(&path, e))?;
         f.write_all(payload).map_err(|e| StoreError::io(&path, e))?;
         f.sync_all().map_err(|e| StoreError::io(&path, e))?;
+        // Idle on disk: drop page cache for this rec so multi‑GiB BQ lead does not
+        // pin OS cache (competes with Class A mmap). Plan `get` re-faults as needed.
+        advise_rec_dont_need(&f);
+        drop(f);
         self.bytes = self.bytes.saturating_add(payload.len() as u64);
         self.index.insert(
             id,
@@ -315,6 +319,31 @@ impl BlockQueue {
     /// Heights currently on the durable queue.
     pub fn heights(&self) -> Vec<u32> {
         self.index.values().map(|e| e.height).collect()
+    }
+}
+
+/// Best-effort `POSIX_FADV_DONTNEED` so durable BQ recs are idle files, not cache.
+///
+/// Linux only; no-op elsewhere. Failures are ignored (same spirit as store body advise).
+fn advise_rec_dont_need(f: &std::fs::File) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = f.as_raw_fd();
+        // offset=0, len=0 → whole file
+        let rc = unsafe {
+            libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED)
+        };
+        if rc != 0 {
+            rbitcoin_log::trace!(
+                "block_queue: posix_fadvise(DONTNEED) failed: {}",
+                std::io::Error::from_raw_os_error(rc)
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = f;
     }
 }
 
@@ -431,6 +460,19 @@ mod tests {
         assert_eq!(hs, vec![1, 2]);
         q.dequeue(id1).unwrap();
         assert_eq!(q.peek_oldest_id(), Some(id2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enqueue_dontneed_still_readable() {
+        // DONTNEED is best-effort; payload must remain durable and readable.
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        let payload = b"dontneed-still-on-disk-payload".to_vec();
+        let id = q.enqueue(7, [0xDEu8; 32], 1, &payload).unwrap();
+        let got = q.get(id).unwrap().expect("readable after DONTNEED");
+        assert_eq!(got.payload, payload);
+        assert_eq!(got.height, 7);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

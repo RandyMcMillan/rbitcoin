@@ -953,13 +953,14 @@ pub async fn ibd_cancellable(
             let txs = hub.query.tx_body_count();
             let pct = ibd_pct(prog.tip, prog.headers);
             let (bq_budget, bq_bytes, bq_count) = hub.query.block_queue_stats();
+            let (bq_pending_bytes, bq_pending_count) = hub.query.block_queue_pending_stats();
 
             tip_rate_tracker.push(now, prog.tip);
             let eta = tip_rate_tracker.eta_string(now, prog.tip, prog.headers);
 
             // Bold on a TTY so the 5s progress line stands out among perf/debug noise.
             // plan_q/prepq/writeq; `name<0/cap` = empty.
-            // bq=: durable body queue (schema 12); wire lives there until write dequeues.
+            // bq disk=: durable body queue files (not process heap); pending_ram is overflow only.
             let conf_q = confirm::format_conf_q(
                 plan_q,
                 load_q,
@@ -981,6 +982,7 @@ pub async fn ibd_cancellable(
                 bq_budget,
                 bq_bytes,
                 bq_count,
+                bq_pending_bytes,
             });
             info_bold!("{progress_line}");
             let _ = std::io::Write::flush(&mut std::io::stderr());
@@ -1016,7 +1018,13 @@ pub async fn ibd_cancellable(
                 arch_q_now,
                 arch_mb,
                 arch_budget_mb,
-                (bq_budget, bq_bytes, bq_count),
+                (
+                    bq_budget,
+                    bq_bytes,
+                    bq_count,
+                    bq_pending_bytes,
+                    bq_pending_count,
+                ),
                 st.body.pending_len(),
                 st.body.known_len(),
                 st.ordered.len(),

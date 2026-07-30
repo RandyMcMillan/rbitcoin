@@ -303,12 +303,22 @@ mod tests {
         let o2 = q.block_queue_offer(2, [2u8; 32], 2, &p2).unwrap();
         assert!(o2.disk_id.is_none(), "second held in RAM, not error");
         assert_eq!(q.block_queue_pending_len(), 1);
-        assert_eq!(q.block_queue_stats().2, 1, "disk count unchanged");
+        let (pend_b, pend_n) = q.block_queue_pending_stats();
+        assert_eq!(pend_n, 1);
+        assert_eq!(
+            pend_b,
+            p2.len() as u64,
+            "pending_stats meters process RAM only (not disk fill)"
+        );
+        let (_budget, disk_b, disk_n) = q.block_queue_stats();
+        assert_eq!(disk_n, 1, "disk count unchanged");
+        assert_eq!(disk_b, p1.len() as u64);
         assert!(!q.block_queue_can_request(), "effective fill ≥ budget");
         let (n, flushed) = q.block_queue_dequeue_height(1).unwrap();
         assert_eq!(n, 1);
         assert_eq!(flushed, vec![[2u8; 32]], "RAM h2 spilled to disk");
         assert_eq!(q.block_queue_pending_len(), 0, "flushed after dequeue");
+        assert_eq!(q.block_queue_pending_stats(), (0, 0));
         assert_eq!(q.block_queue_stats().2, 1, "h2 now on disk");
         let all = q.block_queue_load_all().unwrap();
         assert_eq!(all.len(), 1);

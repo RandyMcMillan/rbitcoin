@@ -890,9 +890,21 @@ impl Query {
     }
 
     /// Durable block queue budget/count for status: `(budget, disk_bytes, disk_count)`.
+    ///
+    /// Disk bytes are **not** process heap — see [`Self::block_queue_pending_stats`].
     pub fn block_queue_stats(&self) -> (u64, u64, usize) {
         let g = self.block_queue.lock().unwrap();
         (g.budget(), g.bytes(), g.count())
+    }
+
+    /// RAM overflow when durable queue is full: `(pending_bytes, pending_count)`.
+    ///
+    /// This is the only BQ-owned process heap. Disk fill lives in
+    /// [`Self::block_queue_stats`] and should not be read as RSS.
+    pub fn block_queue_pending_stats(&self) -> (u64, usize) {
+        let pend = self.block_queue_pending.lock().unwrap();
+        let bytes: u64 = pend.iter().map(|p| p.payload.len() as u64).sum();
+        (bytes, pend.len())
     }
 
     /// `(disk_bytes + pending_ram_bytes) / budget` for admission / logs.

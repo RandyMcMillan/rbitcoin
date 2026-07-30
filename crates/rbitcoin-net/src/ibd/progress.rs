@@ -44,21 +44,30 @@ pub(crate) struct ProgressLineInput {
     pub horizon: u32,
     /// From [`TipRateTracker::eta_string`] (`eta=…` or `done`).
     pub eta: String,
-    /// Durable on-disk block queue: (budget_bytes, used_bytes, entry_count).
+    /// Durable on-disk block queue: budget / disk used / entry count (not heap).
     pub bq_budget: u64,
     pub bq_bytes: u64,
     pub bq_count: usize,
+    /// Process-RAM overflow while disk at budget (0 under healthy densify gate).
+    pub bq_pending_bytes: u64,
 }
 
 /// Build the `ibd: progress …` message body (no log level prefix).
 ///
 /// Tip percent/rate, **fetch hole** (tip→next claim-ready body), peers, confirm
 /// queues, txs, header horizon, tip-rate ETA, durable block-queue occupancy.
+/// `bq disk=` is on-disk payload only; `pending_ram` appears only when non-zero.
 pub(crate) fn format_progress_line(i: &ProgressLineInput) -> String {
     let bq_mib = i.bq_bytes / (1024 * 1024);
     let bq_budget_mib = i.bq_budget / (1024 * 1024);
+    let pend_mib = i.bq_pending_bytes / (1024 * 1024);
+    let pend = if i.bq_pending_bytes > 0 {
+        format!(" pending_ram={pend_mib}MiB")
+    } else {
+        String::new()
+    };
     format!(
-        "ibd: progress {}% tip={} ({}/s) hole={} peers={} {} txs={} horizon={} {} bq={} ({}MiB/{}MiB)",
+        "ibd: progress {}% tip={} ({}/s) hole={} peers={} {} txs={} horizon={} {} bq n={} disk={}MiB/{}MiB{pend}",
         i.pct,
         i.tip,
         format_rate(i.tip_rate),
@@ -319,14 +328,17 @@ mod tests {
             bq_budget: 4 * 1024 * 1024 * 1024,
             bq_bytes: 256 * 1024 * 1024,
             bq_count: 17,
+            bq_pending_bytes: 0,
         });
         assert_eq!(
             line,
-            "ibd: progress 42% tip=100000 (12/s) hole=3 peers=8 planq=1/2 prepq=1/2 writeq=0/2 txs=50000000 horizon=900000 eta=18h bq=17 (256MiB/4096MiB)"
+            "ibd: progress 42% tip=100000 (12/s) hole=3 peers=8 planq=1/2 prepq=1/2 writeq=0/2 txs=50000000 horizon=900000 eta=18h bq n=17 disk=256MiB/4096MiB"
         );
         // Current schema tokens present.
         assert!(line.contains(" hole="), "{line}");
-        assert!(line.contains(" bq="), "{line}");
+        assert!(line.contains(" bq n="), "{line}");
+        assert!(line.contains(" disk="), "{line}");
+        assert!(!line.contains("pending_ram="), "omit pending when zero: {line}");
         assert!(line.contains("planq"), "{line}");
         assert!(line.contains("prepq"), "{line}");
         // Retired dual-track progress tokens forbidden.
@@ -357,10 +369,30 @@ mod tests {
             bq_budget: 1024 * 1024,
             bq_bytes: 0,
             bq_count: 0,
+            bq_pending_bytes: 0,
         });
         assert!(slow.contains("tip=10 (2.4/s)"), "{slow}");
-        assert!(slow.contains("bq=0 (0MiB/1MiB)"), "{slow}");
+        assert!(slow.contains("bq n=0 disk=0MiB/1MiB"), "{slow}");
         assert!(!slow.contains("arch_hwm") && !slow.contains("lead="), "{slow}");
+        let with_pend = format_progress_line(&ProgressLineInput {
+            pct: 1,
+            tip: 10,
+            tip_rate: 1.0,
+            tip_hole: 0,
+            peers: 1,
+            conf_q: "planq<0/2 prepq<0/2 writeq<0/2".into(),
+            txs: 1,
+            horizon: 1000,
+            eta: "eta=?".into(),
+            bq_budget: 1024 * 1024 * 1024,
+            bq_bytes: 1024 * 1024 * 1024,
+            bq_count: 2,
+            bq_pending_bytes: 64 * 1024 * 1024,
+        });
+        assert!(
+            with_pend.contains("pending_ram=64MiB"),
+            "surface RAM overflow when present: {with_pend}"
+        );
     }
 
     #[test]

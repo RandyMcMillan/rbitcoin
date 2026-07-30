@@ -26,9 +26,11 @@ range, outs, denserels; raw FIFO). Class A commit seeds denserels offline so
 prep(N+1) hits without body re-read. Sole process map is CreateResidency
 (plan resolve + pin denserels + prewarm).
 
-**tx.head overflow:** depth-exhausted inserts → `tx.head.overflow` (overflow-first
-lookup). Cleared on successful primary head swap (shadow already holds Class A
-mappings; overflow was only a sidecar for the old table).
+**tx.head (segmented):** fixed **25-bit** open-address head per segment with
+**4 B relative** create ids; roll at `MIN(body soft span, 80% slots)`. On seal,
+build **binary fuse8** (~9 bits/key). Open segment has no filter (always probed).
+Lookup: open → sealed newest→oldest (fuse gate) → body verify. No mono-head
+resize / overflow sidecar.
 
 **Datadir secret (schema 12):** `store/store.secret` CSPRNG at create. XOR scripts/witness at rest; keyed TXID mix for heads.
 
@@ -59,8 +61,8 @@ Do not enter Tip until tip ≈ peer height. Tip entry bulk-materializes SH
 | Map **epochs** (`TableFile`) | No map `Mutex` on read/write; capacity = new mmap window + pointer swap |
 | Atomic `count` / HWM | Publish barrier (Acquire readers / Release appender) |
 | Role exclusivity | One appender, one annotator — not a global store mutex |
-| `tx.head` insert | **Sole writer**: plain Release store empty→fk + SeqCst fence per batch (no CAS). Role exclusivity — not multi-inserter safe |
-| `tx.head` resize swap | Brief exclusive catch-up + rename (shadow fill unlocked; primary inserts pause via `head` write lock on final swap) |
+| `tx.head` insert | **Sole writer**: plain Release store empty→relative + SeqCst fence per batch (no CAS). Role exclusivity — not multi-inserter safe |
+| `tx.head` segment seal | Synchronous on roll: build fuse8 + mark sealed + open new head (no shadow resize) |
 | Process `rehash_gate` | Rare multi‑GiB open-hash rehash (host freeze prevention) |
 | `ChainHub::confirmed` | `RwLock<HashSet>` for O(1) `has_block` (IBD assign path) |
 

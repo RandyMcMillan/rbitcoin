@@ -744,13 +744,6 @@ pub(crate) fn spawn_confirm_engine(
                 "ibd: confirm prep on dedicated OS thread (planq → pin denserels+assemble)"
             );
             while let Ok(done) = plan_rx.recv() {
-                // Pause while store does a blocking RAM tx.head resize (~10–40 min).
-                while hub_prep.query.tx_head_resize_in_progress() {
-                    if feed_prep.stopped() || hub_prep.query.confirm_cancelled() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
                 let n = done.heights_hashes.len();
                 queues_prep.note_plan_recv(n);
                 if feed_prep.stopped() || hub_prep.query.confirm_cancelled() {
@@ -885,13 +878,6 @@ pub(crate) fn spawn_confirm_engine(
             loop {
                 if feed.stopped() {
                     break;
-                }
-                // Pause claims while store blocks on RAM tx.head resize.
-                while hub.query.tx_head_resize_in_progress() {
-                    if feed.stopped() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
                 }
                 let batch: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = {
                     let mut g = feed.inner.lock().unwrap();

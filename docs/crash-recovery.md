@@ -52,5 +52,5 @@ Clean shutdown flushes mmap tables. Kill may lose the last unflushed pages (same
 ## Operator
 
 - Direct IBD keeps **`tx.head`** (archive) and **spend annotations** (confirm) live; tip entry does **not** re-scan Class A to repair them. Corrupt head/spends ⇒ reindex (optional manual `backfill_tx_index` rebuilds primary head mappings).
-- **Online `tx.head` resize:** control file `tx.head.resize` + shadow `tx.head.new`. Kill mid-fill → open resumes fill from `cursor`. Successful swap clears control, **clears `tx.head.overflow`** (old-head sidecar only), and records `bits` / `entry_bytes` / `generation` in the trailing footer.
+- **Segmented `tx.head`:** `tx.head.meta` + per-segment head files (+ `.fuse8` when sealed). Seal publishes fuse then marks sealed in meta. Kill mid-seal may require deleting incomplete segment files / meta and rebuilding from Class A (or reindex). Legacy mono `tx.head` / `.new` / `.resize` are not opened — reindex.
 - Scripthash (Direct): thin creates → memtable → target-sized sorted spills + **SEAL** (`max_create_fk`). Memtable is not durable; on resume, re-enqueue creates with `create_fk > SEAL`. Tip: bounded-fan-in merge then bulk-load durable SH. Corrupt durable SH ⇒ reindex.

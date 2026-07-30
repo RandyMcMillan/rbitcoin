@@ -15,10 +15,9 @@
 //! page load + multi-insert in RAM + plain slot stores per dirty slot, then a
 //! **SeqCst fence** so concurrent page loads + Acquire fence observe the batch.
 //!
-//! **Concurrency:** at most **one** thread may insert into a given `tx.head`
+//! **Concurrency:** at most **one** thread may insert into a given head segment
 //! (archive writer in IBD; single tip accept path after). Multi-writer races are
-//! not supported. Online resize still uses `write_lock` only for final catch-up
-//! + file swap.
+//! not supported. Capacity growth is **segment roll** (seal + new open), not bits-widen.
 //!
 //! **Lookup:** walk candidates from the **last occupied** probe slot toward the
 //! first, body-verify — so the deepest same-txid create wins (newest under
@@ -30,11 +29,11 @@
 //! Lookup/insert load **one page** (4 KiB @ 4 B entries) then hop in RAM — one IO
 //! for all candidates. Foreign occupants: body mismatch ⇒ continue. Keyless slots
 //! cannot Robin-Hood. First insert at depth > [`PROBE_DEPTH_WARN`] requests online
-//! resize ([`take_probe_depth_resize_request`]).
 //!
-//! **Mainnet default:** BITS=**26** → **256 MiB** sparse @ 4 B (`2^16` pages × 4 KiB).
-//! Online resize widens BITS; entry width becomes 8 B at BITS ≥ 33 (page then 8 KiB —
-//! two OS pages; future tuning). Load trigger: [`HEAD_LOAD_START`] (0.80).
+//! **Segment default:** BITS=**25** → **128 MiB** @ 4 B relative create ids per
+//! segment (`2^15` pages × 4 KiB). Capacity ends at [`HEAD_LOAD_START`] (0.80);
+//! the segmented head seals (fuse8) and opens a new fixed-bits table — no
+//! global bits-widen.
 
 use crate::error::StoreError;
 use crate::file::{TableFile, TRAILING_FOOTER_LEN};
@@ -42,7 +41,7 @@ use crate::hashhead::HeadScale;
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+
 
 /// In-page slot index width (1024 slots / page @ any entry width).
 pub const PAGE_SLOT_BITS: u32 = 10;
@@ -63,17 +62,12 @@ static PROBE_INSERT_DEPTH_WARN_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Counter only — the retry loop owns operator-facing logs.
 static PROBE_INSERT_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 
-/// Set on the **first** insert that lands past [`PROBE_DEPTH_WARN`].
-/// [`take_probe_depth_resize_request`] clears it for the tx.head owner to start resize.
-static PROBE_DEPTH_RESIZE_REQUEST: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// Depth threshold above which inserts count as “deep” for ops visibility and
 /// trigger an early online resize request (first event only).
 pub const PROBE_DEPTH_WARN: u32 = 128;
 
-/// Mainnet address width (2^26 slots × 4 B = 256 MiB sparse). Online resize grows.
-pub const MAINNET_BITS: u32 = 26;
+/// Segment address width (2^25 slots × 4 B = 128 MiB). Fixed per segment; roll to grow.
+pub const MAINNET_BITS: u32 = 25;
 /// Tiny / unit-test width.
 pub const TINY_BITS: u32 = 16;
 /// Maximum supported address width (probe + create).
@@ -105,15 +99,8 @@ pub fn sample_probe_depth_stats() -> (u64, u64) {
     )
 }
 
-/// Consume a one-shot request from the first deep insert (depth > [`PROBE_DEPTH_WARN`]).
-/// Caller should start online resize if not already running.
-#[inline]
-pub fn take_probe_depth_resize_request() -> bool {
-    PROBE_DEPTH_RESIZE_REQUEST.swap(false, Ordering::AcqRel)
-}
-
 /// True when `err` is the sole-writer open-address insert failure (table full
-/// along the probe chain — wait for online resize, then retry).
+/// along the probe chain — should not happen when segment roll respects 80% load).
 #[inline]
 pub fn is_probe_exhausted_error(err: &StoreError) -> bool {
     matches!(
@@ -128,13 +115,12 @@ fn note_probe_depth_on_insert(depth: u32) {
         return;
     }
     let n = PROBE_INSERT_DEPTH_WARN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    // Once only — first deep insert requests resize; further events counted silently.
+    // Once only — first deep insert; further events counted silently.
     if n == 1 {
         rbitcoin_log::warn!(
             "store: tx.head insert probe depth>{PROBE_DEPTH_WARN} (first depth={depth}; \
-             requesting online resize if not already running; further deep inserts counted silently)"
+             segment may be overfull — roll policy should prevent this)"
         );
-        PROBE_DEPTH_RESIZE_REQUEST.store(true, Ordering::Release);
     }
 }
 
@@ -283,17 +269,6 @@ pub fn page_slot_count(bits: u32) -> u64 {
 #[inline]
 pub fn entry_file_off(slot: u64, entry_bytes: u8) -> u64 {
     slot * u64::from(entry_bytes)
-}
-
-/// File offset of the page that holds `txid`'s probe chain.
-#[inline]
-pub fn page_file_off(txid: &[u8; 32], bits: u32, entry_bytes: u8) -> u64 {
-    let base = if bits <= PAGE_SLOT_BITS {
-        0
-    } else {
-        page_index(txid, bits) << PAGE_SLOT_BITS
-    };
-    entry_file_off(base, entry_bytes)
 }
 
 /// Decode one LE create_fk from a page buffer at local slot index.
@@ -470,30 +445,6 @@ fn store_entry_in_page_buf(
 
 /// Bytes to pread for the full probe page of `txid`.
 ///
-/// Caps to the **slot data region** (`slot_region_len` = `slots × entry_bytes`),
-/// never into the trailing footer.
-#[inline]
-pub fn page_pread_len(
-    txid: &[u8; 32],
-    bits: u32,
-    entry_bytes: u8,
-    table_slots: u64,
-    slot_region_len: u64,
-) -> usize {
-    let base = if bits <= PAGE_SLOT_BITS {
-        0
-    } else {
-        page_index(txid, bits) << PAGE_SLOT_BITS
-    };
-    let nslots = page_slot_count(bits).min(table_slots.saturating_sub(base));
-    let want = nslots.saturating_mul(u64::from(entry_bytes));
-    let off = entry_file_off(base, entry_bytes);
-    let avail = slot_region_len.saturating_sub(off);
-    // Entry-align so hop_scan never sees a torn trailing slot.
-    let avail = (avail / u64::from(entry_bytes)) * u64::from(entry_bytes);
-    want.min(avail) as usize
-}
-
 /// Resolve address width for new creates.
 pub fn bits_for_scale() -> u32 {
     if let Ok(s) = std::env::var("RBITCOIN_TX_HEAD_BITS") {
@@ -516,34 +467,30 @@ pub fn default_layout() -> HeadLayout {
     HeadLayout::new(bits_for_scale()).expect("default bits in range")
 }
 
-/// Head geometry large enough that `n` Class A rows sit **below**
-/// [`HEAD_LOAD_START`] (so a recovery rebuild does not immediately start online
-/// resize). Starts from [`bits_for_scale`] and widens until load is OK or
-/// [`MAX_BITS`].
-pub fn layout_for_count(n: u64) -> HeadLayout {
-    let mut bits = bits_for_scale();
-    while bits < MAX_BITS {
-        let layout = HeadLayout::new(bits).expect("bits in range");
-        if n == 0 || !load_needs_resize(n, layout.slots()) {
-            return layout;
-        }
-        bits += 1;
-    }
-    HeadLayout::new(MAX_BITS).expect("MAX_BITS in range")
+/// Fixed segment geometry ([`bits_for_scale`]). `n` is ignored — capacity growth
+/// is segment roll, not bits-widen.
+pub fn layout_for_count(_n: u64) -> HeadLayout {
+    default_layout()
 }
 
-/// True when dense Class A count warrants a BITS widen.
+/// True when segment create count warrants a **roll** (seal + new open segment).
 #[inline]
-pub fn load_needs_resize(tx_count: u64, slots: u64) -> bool {
+pub fn load_needs_roll(tx_count: u64, slots: u64) -> bool {
     if slots == 0 {
         return false;
     }
-    // n >= ceil(slots * HEAD_LOAD_START)
-    let threshold = ((slots as f64) * HEAD_LOAD_START).ceil() as u64;
+    let threshold = ((slots as f64) * HEAD_LOAD_START).floor() as u64;
     tx_count >= threshold
 }
 
+/// Deprecated name for [`load_needs_roll`] (segment capacity, not bits-widen).
 #[inline]
+pub fn load_needs_resize(tx_count: u64, slots: u64) -> bool {
+    load_needs_roll(tx_count, slots)
+}
+
+#[inline]
+#[cfg(test)]
 pub fn load_ratio(tx_count: u64, slots: u64) -> f64 {
     if slots == 0 {
         return 0.0;
@@ -595,170 +542,12 @@ pub fn decode_layout_ext(ext: &[u8; 16]) -> Result<(HeadLayout, u64), StoreError
     Ok((layout, generation))
 }
 
-/// Rewrite layout+generation into an existing head file's trailing footer.
-///
-/// Used after resize swap to bump generation without reopening for write.
-pub fn write_head_meta(
-    head_path: &Path,
-    layout: HeadLayout,
-    generation: u64,
-) -> Result<(), StoreError> {
-    let (mut file, _) =
-        TableFile::open_trailing_header_from_end(head_path, TableKind::HashHead)?;
-    let body = file.data_len();
-    if body != layout.body_bytes() {
-        return Err(StoreError::Corrupt(
-            "tx.head size mismatch writing footer layout",
-        ));
-    }
-    file.set_trailing_ext(encode_layout_ext(layout, generation))?;
-    // Best-effort: drop any pre-v5 sidecar so operators are not confused.
-    remove_legacy_meta_sidecar(head_path);
-    Ok(())
-}
-
-/// Full `tx.head` slot array built entirely in process RAM (no mmap / no online
-/// resize shadow). Used for offline timing vs background `tx.head` resize.
-///
-/// Insert uses the same page-local probe as live [`AddressHead`]. After fill,
-/// [`Self::write_to`] writes a complete on-disk table (slots + trailing footer)
-/// that [`AddressHead::open`] can load.
-pub struct RamAddressHead {
-    layout: HeadLayout,
-    /// `slots × entry_bytes` create_fk array (offset 0 = slot 0).
-    slots: Vec<u8>,
-    occupied: u64,
-}
-
-impl RamAddressHead {
-    /// Allocate a zeroed slot array for `layout` (O(body size) RAM).
-    pub fn new(layout: HeadLayout) -> Result<Self, StoreError> {
-        let body = layout.body_bytes();
-        let size = usize::try_from(body).map_err(|_| {
-            StoreError::Corrupt("tx.head body larger than usize (cannot build in RAM)")
-        })?;
-        // Avoid trying multi‑TiB allocs from a bad bits env.
-        if size > 0 && size.saturating_mul(1) > (48usize << 30) {
-            return Err(StoreError::Corrupt(
-                "tx.head RAM build refuses >48 GiB allocation",
-            ));
-        }
-        Ok(Self {
-            layout,
-            slots: vec![0u8; size],
-            occupied: 0,
-        })
-    }
-
-    pub fn layout(&self) -> HeadLayout {
-        self.layout
-    }
-
-    pub fn occupied(&self) -> u64 {
-        self.occupied
-    }
-
-    pub fn body_bytes(&self) -> u64 {
-        self.slots.len() as u64
-    }
-
-    /// Insert mappings into the RAM table (same probe as live head).
-    ///
-    /// Page-sorted for cache locality; idempotent if `fk` already on the chain.
-    pub fn insert_many(&mut self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let bits = self.layout.bits;
-        let es = self.layout.entry_bytes;
-        let es_u = es as usize;
-        let page_slots = page_slot_count(bits);
-        let page_bytes = (page_slots as usize).saturating_mul(es_u);
-
-        let mut work: Vec<(u64, usize, [u8; 32], Fk)> = entries
-            .iter()
-            .enumerate()
-            .map(|(i, (txid, fk))| (page_base_for_txid(txid, bits), i, *txid, *fk))
-            .collect();
-        work.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-        let mut i = 0;
-        while i < work.len() {
-            let page_base = work[i].0;
-            let mut j = i + 1;
-            while j < work.len() && work[j].0 == page_base {
-                j += 1;
-            }
-            let page_off = entry_file_off(page_base, es) as usize;
-            if page_off.saturating_add(page_bytes) > self.slots.len() {
-                return Err(StoreError::Corrupt("ram head page out of range"));
-            }
-            let page = &mut self.slots[page_off..page_off + page_bytes];
-            for &(_, _, ref txid, fk) in &work[i..j] {
-                let outcome = insert_fk_into_page_buf(page, page_base, bits, es, txid, fk)?;
-                if outcome.wrote_new {
-                    self.occupied = self.occupied.saturating_add(1);
-                }
-            }
-            i = j;
-        }
-        Ok(())
-    }
-
-    /// Write a complete trailing-footer `tx.head` file (not mmap-based create).
-    ///
-    /// File layout matches live tables: slot body at offset 0, then 32-byte
-    /// trailing footer (magic + schema + kind + logical_len + layout ext).
-    pub fn write_to(&self, path: impl AsRef<Path>) -> Result<(), StoreError> {
-        use rbitcoin_primitives::{SCHEMA_VERSION, STORE_MAGIC, TableKind};
-        use std::io::Write;
-
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| StoreError::io(path, e))?;
-            }
-        }
-        let body = self.slots.len() as u64;
-        let logical = body.saturating_add(crate::file::TRAILING_FOOTER_LEN as u64);
-        let ext = encode_layout_ext(self.layout, 0);
-        let mut footer = [0u8; crate::file::TRAILING_FOOTER_LEN];
-        footer[0..4].copy_from_slice(&STORE_MAGIC);
-        footer[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
-        footer[6..8].copy_from_slice(&TableKind::HashHead.as_u16().to_le_bytes());
-        footer[8..16].copy_from_slice(&logical.to_le_bytes());
-        footer[16..32].copy_from_slice(&ext);
-
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)
-            .map_err(|e| StoreError::io(path, e))?;
-        // Single sequential write of the slot array (the comparison point vs
-        // online uring page RMW). Chunk to keep syscall sizes reasonable.
-        const CHUNK: usize = 16 * 1024 * 1024;
-        let mut off = 0usize;
-        while off < self.slots.len() {
-            let end = (off + CHUNK).min(self.slots.len());
-            f.write_all(&self.slots[off..end])
-                .map_err(|e| StoreError::io(path, e))?;
-            off = end;
-        }
-        f.write_all(&footer).map_err(|e| StoreError::io(path, e))?;
-        f.sync_all().map_err(|e| StoreError::io(path, e))?;
-        remove_legacy_meta_sidecar(path);
-        Ok(())
-    }
-}
-
 /// Fixed-width keyless txid → dense create_fk table.
 pub struct AddressHead {
     file: TableFile,
     layout: HeadLayout,
     slots: u64,
     occupied: AtomicU64,
-    write_lock: Mutex<()>,
     generation: u64,
 }
 
@@ -809,7 +598,6 @@ impl AddressHead {
             layout,
             slots,
             occupied: AtomicU64::new(0),
-            write_lock: Mutex::new(()),
             generation: 0,
         })
     }
@@ -845,7 +633,6 @@ impl AddressHead {
             layout,
             slots,
             occupied: AtomicU64::new(occupied),
-            write_lock: Mutex::new(()),
             generation,
         })
     }
@@ -933,30 +720,6 @@ impl AddressHead {
         Ok(need)
     }
 
-    /// FD for bulk io_uring / pread of head entries.
-    #[inline]
-    pub(crate) fn read_fd(&self) -> std::os::fd::RawFd {
-        self.file.read_fd()
-    }
-
-    /// Full published file length (slot body + trailing footer).
-    #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn published_len(&self) -> u64 {
-        self.file.logical_len()
-    }
-
-    /// Slot-array byte length only (excludes trailing footer) — batch pread cap.
-    #[inline]
-    pub(crate) fn slot_region_len(&self) -> u64 {
-        self.file.data_len()
-    }
-
-    #[inline]
-    pub(crate) fn path_str(&self) -> &std::path::Path {
-        self.file.path()
-    }
-
     pub fn reserve_additional(&self, _additional: u64) -> Result<(), StoreError> {
         Ok(())
     }
@@ -984,21 +747,11 @@ impl AddressHead {
         }
     }
 
-    /// Bump occupied after offline / RMW fills that wrote `n` new empty→fk slots.
-    #[inline]
-    pub(crate) fn note_inserts(&self, n: u64) {
-        if n > 0 {
-            self.occupied.fetch_add(n, Ordering::Relaxed);
-        }
-    }
-
     /// Bulk insert: **stable sort by probe page**, then original index (preserves
     /// call order within a page for rare same-batch duplicate txids).
     ///
     /// Per page: one [`load_page_slots`], multi [`insert_fk_into_page_buf`], plain
     /// slot stores for new empties. **SeqCst fence** once at end.
-    ///
-    /// Does **not** take [`lock_writes`] — that is only for resize swap.
     pub fn insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
@@ -1104,13 +857,6 @@ impl AddressHead {
     pub fn path(&self) -> &Path {
         self.file.path()
     }
-
-    /// Exclusive barrier for online resize final catch-up + swap only.
-    ///
-    /// Steady-state sole-writer inserts do **not** take this lock.
-    pub fn lock_writes(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.write_lock.lock().unwrap()
-    }
 }
 
 fn count_occupied(file: &TableFile, slots: u64, entry_bytes: u8) -> Result<u64, StoreError> {
@@ -1152,71 +898,6 @@ fn count_occupied(file: &TableFile, slots: u64, entry_bytes: u8) -> Result<u64, 
     Ok(occupied)
 }
 
-// ── Resize control file ─────────────────────────────────────────────────────
-
-/// In-progress sequential rebuild control (`tx.head.resize`).
-#[derive(Clone, Debug)]
-pub struct ResizeControl {
-    pub target: HeadLayout,
-    pub cursor: u64,
-    pub generation: u64,
-}
-
-fn resize_control_path(head_path: &Path) -> PathBuf {
-    let mut p = head_path.as_os_str().to_os_string();
-    p.push(".resize");
-    PathBuf::from(p)
-}
-
-pub fn write_resize_control(head_path: &Path, c: &ResizeControl) -> Result<(), StoreError> {
-    let path = resize_control_path(head_path);
-    // THR1 | ver:u16 | bits:u8 | entry:u8 | cursor:u64 | generation:u64
-    let mut buf = [0u8; 24];
-    buf[0..4].copy_from_slice(b"THR1");
-    buf[4..6].copy_from_slice(&1u16.to_le_bytes());
-    buf[6] = c.target.bits as u8;
-    buf[7] = c.target.entry_bytes;
-    buf[8..16].copy_from_slice(&c.cursor.to_le_bytes());
-    buf[16..24].copy_from_slice(&c.generation.to_le_bytes());
-    std::fs::write(&path, buf).map_err(|e| StoreError::io(&path, e))
-}
-
-pub fn read_resize_control(head_path: &Path) -> Result<Option<ResizeControl>, StoreError> {
-    let path = resize_control_path(head_path);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = std::fs::read(&path).map_err(|e| StoreError::io(&path, e))?;
-    if raw.len() < 24 || &raw[0..4] != b"THR1" {
-        return Err(StoreError::Corrupt("tx.head.resize magic"));
-    }
-    let target = HeadLayout::with_entry_bytes(u32::from(raw[6]), raw[7])?;
-    let cursor = u64::from_le_bytes(raw[8..16].try_into().unwrap());
-    let generation = u64::from_le_bytes(raw[16..24].try_into().unwrap());
-    Ok(Some(ResizeControl {
-        target,
-        cursor,
-        generation,
-    }))
-}
-
-pub fn clear_resize_control(head_path: &Path) {
-    let path = resize_control_path(head_path);
-    let _ = std::fs::remove_file(path);
-}
-
-pub fn shadow_head_path(head_path: &Path) -> PathBuf {
-    let mut p = head_path.as_os_str().to_os_string();
-    p.push(".new");
-    PathBuf::from(p)
-}
-
-pub fn bak_head_path(head_path: &Path) -> PathBuf {
-    let mut p = head_path.as_os_str().to_os_string();
-    p.push(".bak");
-    PathBuf::from(p)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1240,91 +921,10 @@ mod tests {
         assert_eq!(PAGE_SLOT_BITS, 10);
         assert_eq!(PROBE_REGION_BYTES, 8192);
         assert_eq!(PROBE_DEPTH_WARN, 128);
-        assert_eq!(MAINNET_BITS, 26);
+        assert_eq!(MAINNET_BITS, 25);
         assert!(PROBE_REGION_BYTES as u64 >= PAGE_SLOTS * 8);
     }
 
-    #[test]
-    fn layout_helpers_stats_and_entry_bytes() {
-        // Drain stats
-        let _ = sample_probe_depth_stats();
-        let _ = take_probe_depth_resize_request();
-        assert!(!take_probe_depth_resize_request());
-        let _ = probe_depth_stats_snapshot();
-
-        assert!(matches!(
-            HeadLayout::new(1),
-            Err(StoreError::Corrupt(_))
-        ));
-        assert!(matches!(
-            HeadLayout::with_entry_bytes(1, 4),
-            Err(StoreError::Corrupt(_))
-        ));
-        assert!(matches!(
-            HeadLayout::with_entry_bytes(16, 3),
-            Err(StoreError::Corrupt(_))
-        ));
-        assert!(matches!(
-            HeadLayout::with_entry_bytes(33, 4),
-            Err(StoreError::Corrupt(_))
-        ));
-        let l = HeadLayout::with_entry_bytes(16, 8).unwrap();
-        assert_eq!(l.slots(), 1 << 16);
-        assert_eq!(l.entry_size(), 8);
-        assert_eq!(l.body_bytes(), (1u64 << 16) * 8);
-        assert_eq!(entry_bytes_for_bits(16), 4);
-        assert_eq!(entry_bytes_for_bits(33), 8);
-
-        let k = [0xCDu8; 32];
-        // bits ≤ PAGE_SLOT_BITS → page_index returns 0
-        assert_eq!(page_index(&k, PAGE_SLOT_BITS), 0);
-        assert_eq!(page_index(&k, PAGE_SLOT_BITS.saturating_sub(1).max(MIN_BITS)), 0);
-        let bits = 12u32;
-        let pi = page_index(&k, bits);
-        let h1 = h1_in_page(&k, bits);
-        let h2 = h2_in_page(&k, bits);
-        assert!(h1 < page_slot_count(bits));
-        assert!(h2 < page_slot_count(bits) || page_slot_count(bits) > 0);
-        // h1_in_page / h2 when bits ≤ PAGE_SLOT_BITS
-        let _ = h1_in_page(&k, PAGE_SLOT_BITS);
-        let _ = h2_in_page(&k, PAGE_SLOT_BITS);
-        let _ = (pi, h1, h2);
-        assert_eq!(
-            page_base_for_txid(&k, bits),
-            page_index(&k, bits) * page_slot_count(bits)
-        );
-        let off = page_file_off(&k, bits, 4);
-        assert_eq!(off, entry_file_off(page_base_for_txid(&k, bits), 4));
-        assert!(page_pread_len(&k, bits, 4, 1 << bits, (1 << bits) * 4) > 0);
-        // Empty / OOB local → None; zero fk may still decode as 0 depending on layout.
-        assert!(entry_from_page_buf(&[0u8; 4], 9, 4).is_none());
-        let mut buf = [0u8; 8];
-        buf[0..4].copy_from_slice(&7u32.to_le_bytes());
-        assert_eq!(entry_from_page_buf(&buf, 0, 4), Some(7));
-
-        assert!(load_needs_resize(100, 64));
-        assert!(!load_needs_resize(1, 1024));
-        assert!(load_ratio(50, 100) > 0.0);
-        let _ = bits_for_scale();
-        let _ = default_layout();
-        let _ = layout_for_count(0);
-        let _ = layout_for_count(1_000_000);
-
-        let ext = encode_layout_ext(HeadLayout::new(10).unwrap(), 3);
-        let (dec, gen) = decode_layout_ext(&ext).unwrap();
-        assert_eq!(dec.bits, 10);
-        assert_eq!(gen, 3);
-        assert!(decode_layout_ext(&[0xff; 16]).is_err());
-
-        assert!(is_probe_exhausted_error(&StoreError::Corrupt(
-            "address head probe exhausted on insert"
-        )));
-        assert!(!is_probe_exhausted_error(&StoreError::NotFound));
-
-        let p = tmp("legacy-meta");
-        remove_legacy_meta_sidecar(&p); // no-op missing
-        let _ = std::fs::remove_file(&p);
-    }
 
     #[test]
     fn probe_stable() {
@@ -1446,21 +1046,20 @@ mod tests {
     #[test]
     fn load_trigger_at_80_percent() {
         let slots = 1024u64;
-        let thr = ((slots as f64) * HEAD_LOAD_START).ceil() as u64;
-        assert_eq!(thr, 820); // ceil(0.80 * 1024)
-        assert!(!load_needs_resize(thr - 1, slots));
-        assert!(load_needs_resize(thr, slots));
-        assert!(load_needs_resize(slots, slots));
+        // Segment roll uses floor(0.80 * slots).
+        let thr = ((slots as f64) * HEAD_LOAD_START).floor() as u64;
+        assert_eq!(thr, 819); // floor(0.80 * 1024)
+        assert!(!load_needs_roll(thr - 1, slots));
+        assert!(load_needs_roll(thr, slots));
+        assert!(load_needs_roll(slots, slots));
     }
 
     #[test]
-    fn layout_for_count_avoids_immediate_resize() {
-        // ~103M Class A: default MAINNET 26 is too small; need at least 27.
+    fn layout_for_count_is_fixed_segment_geometry() {
+        // Capacity growth is segment roll, not bits-widen.
         let n = 102_956_483u64;
         let layout = layout_for_count(n);
-        assert!(layout.bits >= 27, "bits={}", layout.bits);
-        assert!(!load_needs_resize(n, layout.slots()));
-        // Empty / tiny stays at scale default.
+        assert_eq!(layout.bits, bits_for_scale());
         let empty = layout_for_count(0);
         assert_eq!(empty.bits, bits_for_scale());
     }
@@ -1628,8 +1227,6 @@ mod tests {
             );
         }
         // Slot region must not extend into trailing footer.
-        assert_eq!(h.slot_region_len(), h.slots() * u64::from(es));
-        assert!(h.published_len() > h.slot_region_len());
         // Probe path still finds inserts.
         for (txid, fk) in &entries {
             assert!(
@@ -1662,40 +1259,6 @@ mod tests {
         let _ = std::fs::remove_file(meta_path(&path));
     }
 
-    /// RAM build + write must open as a live AddressHead with the same mappings.
-    #[test]
-    fn ram_head_build_write_open_roundtrip() {
-        let path = tmp("ram_build");
-        let layout = HeadLayout::new(14).unwrap();
-        let mut ram = RamAddressHead::new(layout).unwrap();
-        let mut entries = Vec::new();
-        for i in 1..=200u64 {
-            let mut txid = [0u8; 32];
-            txid[0] = (i & 0xff) as u8;
-            txid[1] = ((i >> 8) & 0xff) as u8;
-            txid[2] = ((i * 13) & 0xff) as u8;
-            txid[4] = 0x5a;
-            entries.push((txid, Fk(i)));
-        }
-        ram.insert_many(&entries).unwrap();
-        assert_eq!(ram.occupied(), 200);
-        // Idempotent re-insert.
-        ram.insert_many(&entries[..20]).unwrap();
-        assert_eq!(ram.occupied(), 200);
-        ram.write_to(&path).unwrap();
-
-        let h = AddressHead::open(&path).unwrap();
-        assert_eq!(h.bits(), 14);
-        assert_eq!(h.occupied(), 200);
-        for (txid, fk) in &entries {
-            assert!(
-                h.probe_fks(txid).unwrap().contains(fk),
-                "missing {fk:?} after RAM write"
-            );
-        }
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(meta_path(&path));
-    }
 
     /// Many inserts spanning multiple pages (page-coalesced; call order within page).
     #[test]
@@ -1869,56 +1432,10 @@ mod tests {
         let _ = std::fs::remove_file(meta_path(&path));
     }
 
-    #[test]
-    fn resize_control_roundtrip_corrupt_and_paths() {
-        let path = tmp("resize_ctrl");
-        // Create empty head so path exists as a parent identity.
-        let h = AddressHead::create_with_bits(&path, 12).unwrap();
-        drop(h);
-        assert!(read_resize_control(&path).unwrap().is_none());
-        let ctrl = ResizeControl {
-            target: HeadLayout::new(13).unwrap(),
-            cursor: 42,
-            generation: 7,
-        };
-        write_resize_control(&path, &ctrl).unwrap();
-        let got = read_resize_control(&path).unwrap().unwrap();
-        assert_eq!(got.cursor, 42);
-        assert_eq!(got.generation, 7);
-        assert_eq!(got.target.bits, 13);
-        // Corrupt magic
-        let rpath = resize_control_path(&path);
-        std::fs::write(&rpath, b"XXXX________________").unwrap();
-        assert!(matches!(
-            read_resize_control(&path),
-            Err(StoreError::Corrupt(_))
-        ));
-        clear_resize_control(&path);
-        assert!(read_resize_control(&path).unwrap().is_none());
-        // Path helpers
-        assert!(shadow_head_path(&path)
-            .to_string_lossy()
-            .ends_with(".new"));
-        assert!(bak_head_path(&path).to_string_lossy().ends_with(".bak"));
-        // note_probe helpers
-        let _ = take_probe_depth_resize_request(); // clear
-        note_probe_depth_on_insert(PROBE_DEPTH_WARN); // no-op at threshold
-        note_probe_depth_on_insert(PROBE_DEPTH_WARN + 1); // first deep
-        assert!(take_probe_depth_resize_request());
-        note_probe_exhausted();
-        let (deep, exh) = probe_depth_stats_snapshot();
-        assert!(deep >= 1 || exh >= 1);
-        assert!(is_probe_exhausted_error(&StoreError::Corrupt(
-            "address head probe exhausted on insert"
-        )));
-        assert!(!is_probe_exhausted_error(&StoreError::Corrupt("other")));
-        let _ = std::fs::remove_file(&path);
-        clear_resize_control(&path);
-    }
 
     #[test]
     fn mainnet_default_bits_is_26() {
-        assert_eq!(MAINNET_BITS, 26);
+        assert_eq!(MAINNET_BITS, 25);
         assert_eq!(entry_bytes_for_bits(MAINNET_BITS), 4);
         // 4 B × 1024 = 4 KiB pages at mainnet default.
         assert_eq!(PAGE_SLOTS as usize * 4, 4096);
@@ -1976,32 +1493,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn trailing_footer_page_aligned_slots_and_layout() {
-        let path = tmp("trail_align");
-        let h = AddressHead::create_with_bits(&path, 16).unwrap();
-        // Slot 0 at file offset 0; page boundaries on 4 KiB.
-        assert_eq!(entry_file_off(0, 4), 0);
-        assert_eq!(entry_file_off(1024, 4), 4096);
-        let body = HeadLayout::new(16).unwrap().body_bytes();
-        assert_eq!(body % 4096, 0);
-        let st = std::fs::metadata(&path).unwrap();
-        assert_eq!(st.len(), body + TRAILING_FOOTER_LEN as u64);
-        // Footer not overlapping first page.
-        assert!(st.len() >= 4096 + TRAILING_FOOTER_LEN as u64 || body < 4096);
-        // No sidecar meta file.
-        assert!(!meta_path(&path).exists());
-        h.insert(&[1u8; 32], Fk(1)).unwrap();
-        drop(h);
-        let h2 = AddressHead::open(&path).unwrap();
-        assert!(h2.probe_fks(&[1u8; 32]).unwrap().contains(&Fk(1)));
-        assert_eq!(h2.bits(), 16);
-        assert_eq!(h2.generation(), 0);
-        // Footer layout round-trips after generation bump.
-        write_head_meta(&path, HeadLayout::new(16).unwrap(), 7).unwrap();
-        let h3 = AddressHead::open(&path).unwrap();
-        assert_eq!(h3.generation(), 7);
-        assert!(h3.probe_fks(&[1u8; 32]).unwrap().contains(&Fk(1)));
-        let _ = std::fs::remove_file(&path);
-    }
 }

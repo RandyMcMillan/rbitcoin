@@ -13,8 +13,7 @@ mod compact;
 mod epoch;
 mod error;
 mod file;
-mod head_overflow;
-mod head_resize_fill;
+mod fuse8_filter;
 mod head_resolve_stream;
 pub mod head_resolve_stats;
 mod idx_body_pipeline;
@@ -30,6 +29,7 @@ mod spender_table;
 mod scripthash;
 mod scripthash_head;
 mod scripthash_layout;
+mod segmented_head;
 mod sharded_hashhead;
 mod sorted_run;
 mod store;
@@ -46,11 +46,16 @@ pub use file::{
 pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush};
 pub use address_head::{
     bits_for_scale, entry_bytes_for_bits, is_probe_exhausted_error, layout_for_count,
-    load_needs_resize,
+    load_needs_resize, load_needs_roll,
     page_index, probe_depth_stats_snapshot, probe_index, sample_probe_depth_stats,
-    take_probe_depth_resize_request, AddressHead, HeadLayout, RamAddressHead, HEAD_LOAD_CEILING,
+    AddressHead, HeadLayout, HEAD_LOAD_CEILING,
     HEAD_LOAD_START, HEAD_LOAD_WARN, MAINNET_BITS, MAX_BITS, MAX_PROBE, MIN_BITS, PAGE_SLOTS,
     PAGE_SLOT_BITS, PROBE_DEPTH_WARN, PROBE_REGION_BYTES, TINY_BITS,
+};
+pub use segmented_head::{
+    sample_lookup_stats as sample_head_lookup_stats,
+    snapshot_lookup_stats as snapshot_head_lookup_stats, HeadLookupStats, SegmentedTxHead,
+    SEGMENT_HEAD_BITS,
 };
 pub use hashhead::{
     initial_slots_for, HeadRole, HeadScale,
@@ -76,7 +81,6 @@ pub use bulk_io::{bulk_io_workers, io_uring_enabled};
 pub use block_queue::{
     BlockQueue, QueuedBlock, DEFAULT_BLOCK_QUEUE_BUDGET_BYTES,
 };
-pub use head_overflow::{HeadOverflow, DEFAULT_OVERFLOW_SLOTS};
 pub use store_secret::{StoreSecret, SECRET_FILE, SECRET_LEN};
 pub use head_resolve_stats::Sample as HeadResolveSample;
 pub use idx_body_pipeline::{

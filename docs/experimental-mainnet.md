@@ -120,8 +120,8 @@ fewer usable peers than a dual-stack Core node.
 
 | Risk | Notes |
 |------|--------|
-| Disk / RAM | Multi‑100 GiB Class A; `tx.head` sparse grow + online resize (primary + shadow can pressure page cache / swap) |
-| `tx.head` resize lag | Deep load can block inserts while shadow fills — watch logs for probe-exhaust / archiver sleeping |
+| Disk / RAM | Multi‑100 GiB Class A; segmented 25-bit `tx.head.*` + fuse8 (open head ~128 MiB; sealed fuses ~1 GiB class at mainnet scale) |
+| `tx.head` seal | Segment roll builds fuse8 on seal (~27 M keys); watch seal begin/done logs — not a mono-head shadow fill |
 | Peer scarcity | v2-only + experimental user-agent |
 | Mempool | Libre policy (0.1 sat/vB, full RBF, no dust ban); **scripts verified on accept** |
 | Confirm plan/prep | Dense heights are pin-bound; expect `conf blks=32` with `planq`/`prepq` low relative to cap (`planq=*/5 prepq=*/5`) |

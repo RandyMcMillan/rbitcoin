@@ -9,8 +9,8 @@ order + map epochs**, not `Mutex` around mmap.
 |------|--------|
 | Roles | At most **one Class A appender** and **one spend annotator** per process; **N readers** of published ranges always free |
 | Publish | body → idx → count/HWM (Release); then head / `header_txs` as visibility requires |
-| Capacity grow | fallocate + map a **new epoch** on the same file; swap pointer; old epoch lives until pins drop (readers never pause). Same *spirit* as online `tx.head` shadow fill + brief final swap |
-| Layout grow (`tx.head`) | shadow fill unlocked; exclusive **only** at final catch-up + rename + head swap |
+| Capacity grow | fallocate + map a **new epoch** on the same file; swap pointer; old epoch lives until pins drop (readers never pause) |
+| Layout grow (`tx.head`) | **segment roll**: seal open head (fuse8) + create new fixed 25-bit head — no mono-file bits-widen |
 | Not OK | Long-held map mutexes, “pause all queries during confirm”, multi appenders, dual-write to head shadow on every insert |
 
 If a change introduces a new long-held store lock on the IBD/read path, it is the

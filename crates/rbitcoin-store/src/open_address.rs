@@ -34,6 +34,7 @@ pub fn primary_slot(key: &[u8; 16], slots: u64) -> u64 {
 
 /// Primary slot for a 32-byte key (e.g. mixed txid in `tx.head.overflow`).
 #[inline]
+#[cfg(test)]
 pub fn primary_slot_32(key: &[u8; 32], slots: usize) -> usize {
     debug_assert!(slots.is_power_of_two() && slots >= 2);
     (fnv1a_64(key) as usize) & (slots - 1)

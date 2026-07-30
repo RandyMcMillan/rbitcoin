@@ -76,9 +76,9 @@ idx→body pipeline for body prefixes.
 | Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` (`0` = full scripts) |
 | Archive queue RAM | **512 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
-| Bulk store IO | **io_uring** (Linux) | Head resolve body prefixes, confirm body loads, **spend annotate** RMW (9 B meta pread→pwrite; multi-list appends mmap on read CQE), **`tx.head` resize** shadow fill. Archive `tx.head` **insert_many** stays mmap. `RBITCOIN_IO_URING=0` → pread/mmap fallbacks; `RBITCOIN_BULK_IO_WORKERS` for pread parallelism |
+| Bulk store IO | **io_uring** (Linux) | Head resolve body prefixes, confirm body loads, **spend annotate** RMW (9 B meta pread→pwrite; multi-list appends mmap on read CQE). Segmented `tx.head` **insert_many** stays mmap; seal builds fuse8 in process RAM. `RBITCOIN_IO_URING=0` → pread/mmap fallbacks; `RBITCOIN_BULK_IO_WORKERS` for pread parallelism |
 | Archive Class A append | **pwrite** (default) | `tx.body` / `tx.idx` mega-appends use `write_at_pwrite` (page cache; avoids dirtying multi‑GiB mmaps for sequential write). `RBITCOIN_FD_APPEND=0` → mmap `write_at` (debug/compare) |
-| `tx.head` fill (rebuild + online resize) | shared knobs | `RBITCOIN_TX_HEAD_READ_BATCH` (default **65536**, max 1e6) — Class A fks per idx+txid bulk read; `RBITCOIN_TX_HEAD_WRITE_CHUNK` (default **65536**, max 1e6) — `insert_many` size (one fence/group); `RBITCOIN_TX_HEAD_FILL_WAVE` (default **1048576**) — fks per bg resize poll wave / progress log. Legacy `RBITCOIN_TX_HEAD_RESIZE_*` names still accepted |
+| `tx.head` (segmented) | fixed geometry | Default **25-bit** heads (128 MiB) with **4 B relative** fks; roll at 80% load / body soft span; **binary fuse8** on seal. `RBITCOIN_TX_HEAD_BITS` for tests only. Legacy mono-head datadirs require reindex |
 | Confirm stages | **plan · prep · scripts · write** | Pipeline queues cap **5** each (`planq=n/5 prepq=m/5 writeq=k/5`; `name<0/cap` when the next worker is waiting on an empty queue) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 | Inhibit auto-suspend | **off** | `--inhibit-suspend` (uses `systemd-inhibit` if available) |

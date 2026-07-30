@@ -1,20 +1,12 @@
-use crate::address_head::{
-    bak_head_path, clear_resize_control, is_probe_exhausted_error, load_needs_resize,
-    load_ratio, read_resize_control, shadow_head_path, take_probe_depth_resize_request,
-    write_head_meta, write_resize_control, AddressHead, HeadLayout, ResizeControl,
-    MAX_BITS,
-};
+use crate::address_head::HeadLayout;
 use crate::compact::{
     input_flags, output_flags, read_compact_size, read_uleb128, write_compact_size, write_uleb128,
 };
 use crate::error::StoreError;
+use crate::segmented_head::SegmentedTxHead;
 use crate::var_table::VarTable;
 use rbitcoin_primitives::{Fk, TableKind};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::path::Path;
 
 /// Class A tx row (no wire blob — reconstruct from inputs/outputs + witness).
 ///
@@ -887,24 +879,10 @@ pub fn is_packed_tx_payload(raw: &[u8]) -> bool {
     raw.len() >= TxRecord::ENCODED_LEN
 }
 
-/// In-progress sequential `tx.head` rebuild (shadow filled from `tx.idx` order).
-///
-/// `shadow` is [`Arc`] so [`Self::head_resize_poll`] can fill **without** holding
-/// `resize` Mutex across body/idx IO — that lock is also taken by every archive
-/// `head_insert_many` (`maybe_start_head_resize` / `head_resize_in_progress`).
-struct HeadResize {
-    shadow: Arc<AddressHead>,
-    cursor: u64,
-    target: HeadLayout,
-}
-
-/// Primary + optional shadow `tx.head` occupancy for IBD size logs.
-///
-/// Body sizes are **logical** table size (`slots × entry_bytes`), not faulted RSS.
+/// Segmented `tx.head` occupancy for IBD size logs (no mono-head shadow resize).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HeadResizeSizeSnapshot {
     pub active: bool,
-    /// Next Class A fk to fill into the shadow (0 if idle).
     pub cursor: u64,
     pub class_a_n: u64,
     pub primary_bits: u32,
@@ -917,76 +895,16 @@ pub struct HeadResizeSizeSnapshot {
     pub shadow_entry_b: u8,
     pub shadow_occupied: u64,
     pub shadow_body_bytes: u64,
-}
-
-/// Parse a positive u64 env (new name, then deprecated alias).
-fn env_u64(primary: &str, legacy: &str, default: u64, lo: u64, hi: u64) -> u64 {
-    std::env::var(primary)
-        .or_else(|_| std::env::var(legacy))
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(default)
-        .clamp(lo, hi)
-}
-
-/// Class A fks per poll wave (tests for legacy online `head_resize_poll` only).
-/// `RBITCOIN_TX_HEAD_FILL_WAVE` (default **1 048 576**).
-#[cfg(test)]
-fn head_fill_wave() -> u64 {
-    env_u64(
-        "RBITCOIN_TX_HEAD_FILL_WAVE",
-        "RBITCOIN_TX_HEAD_RESIZE_WAVE",
-        1_048_576,
-        1_024,
-        16_777_216,
-    )
+    pub segment_count: u64,
+    pub sealed_segments: u64,
 }
 
 pub struct TxTable {
     pub(crate) body: VarTable,
-    pub(crate) head: RwLock<AddressHead>,
-    /// Directory containing `tx.head` (for rename / control paths).
-    head_path: PathBuf,
+    /// Segmented fixed-bits heads + seal-time fuse8.
+    pub(crate) head: SegmentedTxHead,
     /// Datadir secret: keyed head probes + script XOR (schema 12+).
     pub(crate) secret: crate::store_secret::StoreSecret,
-    /// Depth-exhausted inserts while primary resizes (overflow-first lookup).
-    pub(crate) overflow: Mutex<crate::head_overflow::HeadOverflow>,
-    resize: Mutex<Option<HeadResize>>,
-    /// True from resize start until swap completes (or abandoned). Survives brief
-    /// windows where `resize` Mutex holds `None` while closing the shadow Arc.
-    resize_active: AtomicBool,
-    /// Background sequential fill for `tx.head.new` (independent of archive inserts).
-    resize_bg: Mutex<Option<JoinHandle<()>>>,
-    /// Generation of the live bg worker; bump to ask a previous worker to exit.
-    resize_bg_gen: AtomicU64,
-    /// Sticky abort for exclusive swap waits (Drop / tests). Distinct from gen
-    /// bump alone: gen kill of the bg worker must still allow main-thread
-    /// `head_resize_poll` to complete the swap.
-    resize_abort: AtomicBool,
-    /// Only one thread may run the exclusive rename/swap path at a time.
-    /// Without this, bg poll + main-thread poll race double-close mmaps/FDs.
-    resize_completing: AtomicBool,
-    /// Wakes archive/tip writers parked on probe-exhaust for the duration of a resize.
-    /// Pair with [`Self::resize`] (waiters hold that mutex).
-    resize_cv: Condvar,
-}
-
-impl Drop for TxTable {
-    fn drop(&mut self) {
-        // Sticky abort first so exclusive-lock waiters exit even if they enter
-        // the wait *after* the gen bump (gen_at_start would already match).
-        self.resize_abort.store(true, AtomicOrdering::Release);
-        self.resize_bg_gen
-            .fetch_add(1, AtomicOrdering::AcqRel);
-        if let Some(h) = self.resize_bg.lock().unwrap().take() {
-            let _ = h.join();
-        }
-        // Unblock any insert waiters (tests / early drop mid-resize).
-        self.resize_active.store(false, AtomicOrdering::Release);
-        *self.resize.lock().unwrap() = None;
-        self.resize_cv.notify_all();
-    }
 }
 
 impl TxTable {
@@ -994,57 +912,54 @@ impl TxTable {
         Self::create_with_head_layout(dir, crate::address_head::default_layout())
     }
 
-    /// Create with an explicit head geometry (tests / recovery). Avoids racing on
-    /// process-global `RBITCOIN_TX_HEAD_BITS` / `RBITCOIN_HEAD_SCALE`.
+    /// Create with an explicit head geometry (tests / recovery).
     pub fn create_with_head_layout(dir: &Path, layout: HeadLayout) -> Result<Self, StoreError> {
-        let head_path = dir.join("tx.head");
         let secret = crate::store_secret::StoreSecret::load_or_create(dir, true)?;
-        let overflow = crate::head_overflow::HeadOverflow::create(dir)?;
+        let layout = HeadLayout::with_entry_bytes(layout.bits, 4)?;
         Ok(Self {
             body: VarTable::create(dir, "tx", TableKind::Tx)?,
-            head: RwLock::new(AddressHead::create_with_layout(&head_path, layout)?),
-            head_path,
+            head: SegmentedTxHead::create(dir, layout)?,
             secret,
-            overflow: Mutex::new(overflow),
-            resize: Mutex::new(None),
-            resize_active: AtomicBool::new(false),
-            resize_bg: Mutex::new(None),
-            resize_bg_gen: AtomicU64::new(0),
-            resize_abort: AtomicBool::new(false),
-            resize_completing: AtomicBool::new(false),
-            resize_cv: Condvar::new(),
         })
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
-        let head_path = dir.join("tx.head");
         let body = VarTable::open(dir, "tx", TableKind::Tx)?;
         let n_bodies = body.count();
-        // Operator recovery: delete `tx.head` → empty create + full rebuild from
-        // Class A bodies on next open. Incomplete heads that still open
-        // successfully are *not* auto-rebuilt (delete to force). Layout lives in
-        // the trailing footer (no sidecar).
+        let meta = dir.join("tx.head.meta");
         let mut need_rebuild = false;
-        let head = if !head_path.exists() {
+        let head = if !meta.exists() {
             need_rebuild = n_bodies > 0;
-            Self::prepare_fresh_head(&head_path, n_bodies)?
+            if need_rebuild {
+                rbitcoin_log::info!(
+                    "store: tx.head.meta missing with {n_bodies} Class A bodies — rebuild segmented head"
+                );
+            }
+            // Wipe legacy mono head if present so create does not refuse after wipe intent.
+            let mono = dir.join("tx.head");
+            if mono.is_file() {
+                let _ = std::fs::remove_file(&mono);
+            }
+            SegmentedTxHead::create(dir, crate::address_head::default_layout())?
         } else {
-            match AddressHead::open(&head_path) {
+            match SegmentedTxHead::open(dir) {
                 Ok(h) => h,
                 Err(e) => {
-                    // Unreadable head with live Class A: recreate rather than
-                    // refuse the whole store (same recovery as a deliberate delete).
-                    // Common after mid-resize kill or footer-layout upgrade.
                     if n_bodies > 0 {
                         rbitcoin_log::warn!(
-                            "store: tx.head unreadable ({e}) with {n_bodies} Class A bodies — \
-                             will recreate head sized for count and rebuild mappings \
-                             (online resize leftovers cleared; expect a long open)"
+                            "store: segmented tx.head unreadable ({e}) with {n_bodies} Class A \
+                             bodies — recreate + rebuild"
                         );
-                        let _ = std::fs::remove_file(&head_path);
-                        crate::address_head::remove_legacy_meta_sidecar(&head_path);
+                        if let Ok(rd) = std::fs::read_dir(dir) {
+                            for ent in rd.flatten() {
+                                let s = ent.file_name().to_string_lossy().into_owned();
+                                if s == "tx.head.meta" || s.starts_with("tx.head.") {
+                                    let _ = std::fs::remove_file(ent.path());
+                                }
+                            }
+                        }
                         need_rebuild = true;
-                        Self::prepare_fresh_head(&head_path, n_bodies)?
+                        SegmentedTxHead::create(dir, crate::address_head::default_layout())?
                     } else {
                         return Err(e);
                     }
@@ -1052,29 +967,16 @@ impl TxTable {
             }
         };
         let secret = crate::store_secret::StoreSecret::load_or_create(dir, true)?;
-        let overflow = crate::head_overflow::HeadOverflow::open(dir)?;
         let t = Self {
             body,
-            head: RwLock::new(head),
-            head_path,
+            head,
             secret,
-            overflow: Mutex::new(overflow),
-            resize: Mutex::new(None),
-            resize_active: AtomicBool::new(false),
-            resize_bg: Mutex::new(None),
-            resize_bg_gen: AtomicU64::new(0),
-            resize_abort: AtomicBool::new(false),
-            resize_completing: AtomicBool::new(false),
-            resize_cv: Condvar::new(),
         };
         if need_rebuild {
-            // Sized head + rebuild inserts only — do not interleave online resize
-            // (that produced dual "rebuild progress" + "resize progress" on open).
             let bits = t.head_bits();
             let slots = t.head_slots();
             rbitcoin_log::info!(
-                "store: tx.head rebuild begin n={n_bodies} bits={bits} slots={slots} \
-                 (no concurrent online resize)"
+                "store: tx.head rebuild begin n={n_bodies} bits={bits} slots={slots} (segmented)"
             );
             let inserted = t.rebuild_head_from_bodies(|done, total, ins| {
                 if done == total || done % 1_000_000 == 0 {
@@ -1083,49 +985,17 @@ impl TxTable {
                     );
                 }
             })?;
-            t.head.read().unwrap().flush()?;
+            t.head.flush()?;
             rbitcoin_log::info!(
-                "store: tx.head rebuild complete inserted={inserted} bodies={} bits={}",
+                "store: tx.head rebuild complete inserted={inserted} bodies={} bits={} segs={}",
                 t.count(),
-                t.head_bits()
+                t.head_bits(),
+                t.head.segment_count()
             );
-        } else {
-            t.resume_head_resize_if_needed()?;
         }
         Ok(t)
     }
 
-    /// Create empty `tx.head`, drop resize leftovers.
-    ///
-    /// When `n_bodies > 0`, size the head so load stays under [`HEAD_LOAD_START`]
-    /// for that count — otherwise the first rebuild insert wave immediately starts
-    /// a concurrent online resize (confusing dual progress logs).
-    fn prepare_fresh_head(head_path: &Path, n_bodies: u64) -> Result<AddressHead, StoreError> {
-        clear_resize_control(head_path);
-        let shadow = shadow_head_path(head_path);
-        let _ = std::fs::remove_file(&shadow);
-        crate::address_head::remove_legacy_meta_sidecar(&shadow);
-        let bak = bak_head_path(head_path);
-        let _ = std::fs::remove_file(&bak);
-        crate::address_head::remove_legacy_meta_sidecar(&bak);
-        // Pre-v5 sidecar (layout is in the footer now).
-        crate::address_head::remove_legacy_meta_sidecar(head_path);
-        let layout = if n_bodies > 0 {
-            let layout = crate::address_head::layout_for_count(n_bodies);
-            rbitcoin_log::info!(
-                "store: tx.head recreate bits={} slots={} entry={}B for {n_bodies} Class A bodies \
-                 (full mapping rebuild next)",
-                layout.bits,
-                layout.slots(),
-                layout.entry_bytes
-            );
-            layout
-        } else {
-            rbitcoin_log::info!("store: tx.head missing — creating empty address head");
-            crate::address_head::default_layout()
-        };
-        AddressHead::create_with_layout(head_path, layout)
-    }
 
     pub fn count(&self) -> u64 {
         self.body.count()
@@ -1390,30 +1260,23 @@ impl TxTable {
     /// Primary head probe slot for `txid` (sort key for locality-friendly batches).
     #[inline]
     pub fn head_primary_slot(&self, txid: &[u8; 32]) -> u64 {
-        let bits = self.head.read().unwrap().bits();
+        let bits = self.head.bits();
         crate::address_head::probe_index(txid, 0, bits)
     }
 
-    /// Probe address head and verify body **txid only** (no full packed decode).
+    /// Probe segmented address head and verify body **txid only**.
     ///
-    /// Body-check order is **last occupied probe slot → first** so that, after
-    /// fast inserts (second same-txid lands deeper, no newest-first displace),
-    /// the newest Class A create is preferred (BIP30-shaped duplicates).
+    /// Open segment first, then sealed newest→oldest (fuse-gated). Body-check
+    /// order prefers deeper probe slots (newest BIP30-shaped create).
     pub fn get_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
         use std::time::Instant;
         let mixed = self.secret.mix_txid(txid);
-        // Depth-first: overflow (depth-exhausted inserts) then primary head.
-        if let Some(fk) = self.overflow.lock().unwrap().get(&mixed) {
-            if self.body_txid(fk)? == *txid {
-                return Ok(Some(fk));
-            }
-        }
         let t_probe = Instant::now();
-        let cands = self.head.read().unwrap().probe_fks(&mixed)?;
+        let cands = self.head.probe_candidates(&mixed)?;
         crate::head_resolve_stats::add_probe(t_probe.elapsed().as_nanos() as u64);
         crate::head_resolve_stats::add_keys(1);
         crate::head_resolve_stats::add_cands(cands.len() as u64);
-        for fk in cands.into_iter().rev() {
+        for fk in cands {
             if self.body_txid(fk)? == *txid {
                 return Ok(Some(fk));
             }
@@ -1472,21 +1335,14 @@ impl TxTable {
         }
         crate::head_resolve_stats::add_keys(txids.len() as u64);
 
-        // --- Phase 1: mmap probe (mixed keys; overflow-first) ---
+        // --- Phase 1: segmented head probe (open → sealed fuse-gated) ---
         let t_probe = Instant::now();
         let mut cands_by_key: Vec<Vec<(u32, u64)>> = vec![Vec::new(); txids.len()];
         let mut cands_total = 0u64;
         {
-            let head = self.head.read().unwrap();
-            let ov = self.overflow.lock().unwrap();
             for (i, txid) in txids.iter().enumerate() {
                 let mixed = self.secret.mix_txid(txid);
-                if let Some(fk) = ov.get(&mixed) {
-                    cands_by_key[i].push((0, fk.0));
-                    cands_total = cands_total.saturating_add(1);
-                    continue;
-                }
-                let cands = head.probe_fks(&mixed)?;
+                let cands = self.head.probe_candidates(&mixed)?;
                 cands_total = cands_total.saturating_add(cands.len() as u64);
                 for (j, fk) in cands.into_iter().enumerate() {
                     cands_by_key[i].push((j as u32, fk.0));
@@ -1933,13 +1789,9 @@ impl TxTable {
     pub fn get_all_by_txid(&self, txid: &[u8; 32]) -> Result<Vec<(Fk, TxRecord)>, StoreError> {
         let mut out = Vec::new();
         let mixed = self.secret.mix_txid(txid);
-        let mut cands: Vec<Fk> = Vec::new();
-        if let Some(fk) = self.overflow.lock().unwrap().get(&mixed) {
-            cands.push(fk);
-        }
-        cands.extend(self.head.read().unwrap().probe_fks(&mixed)?);
-        // Newest first: reverse primary probe (older→newer) after optional overflow.
-        for fk in cands.into_iter().rev() {
+        // probe_candidates already open-first then sealed newest→oldest, deep-first within.
+        let cands = self.head.probe_candidates(&mixed)?;
+        for fk in cands {
             if self.body_txid(fk)? != *txid {
                 continue;
             }
@@ -2065,29 +1917,25 @@ impl TxTable {
             return Ok(0);
         }
         let mut inserted = 0u64;
-        // Same body-read / insert_many chunking as online shadow fill
-        // (`RBITCOIN_TX_HEAD_READ_BATCH` / `RBITCOIN_TX_HEAD_WRITE_CHUNK`).
-        let read_batch = Self::head_fill_read_batch();
-        let write_chunk = Self::head_fill_write_chunk();
+        let read_batch: u64 = 65_536;
+        let write_chunk: usize = 65_536;
         const PROGRESS_EVERY: u64 = 50_000;
         let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(write_chunk);
         let mut last_progress = 0u64;
         let mut cur = 1u64;
         while cur <= n {
             let end = (cur + read_batch - 1).min(n);
-            // Contiguous idx + bulk 33B prefixes — same as shadow_fill_fk_range.
             let txids = self.body_txid_range(cur, end)?;
-            debug_assert_eq!(txids.len() as u64, end - cur + 1);
             for (i, txid) in txids.into_iter().enumerate() {
                 let id = cur + i as u64;
                 let fk = Fk(id);
                 if !force_all {
+                    let mixed = self.secret.mix_txid(&txid);
                     let present = self
                         .head
-                        .read()
-                        .unwrap()
-                        .probe_fks(&txid)?
-                        .contains(&fk);
+                        .probe_candidates(&mixed)?
+                        .iter()
+                        .any(|c| c.0 == fk.0);
                     if present {
                         if id - last_progress >= PROGRESS_EVERY || id == n {
                             on_progress(id, n, inserted + batch.len() as u64);
@@ -2119,1069 +1967,165 @@ impl TxTable {
         Ok(inserted)
     }
 
-    /// Build a **complete** sized `tx.head` in RAM from every Class A body, then
-    /// write it to `out_path` (e.g. `store/tx.head.test`).
-    ///
-    /// Does **not** touch the live primary/shadow head. Keys are
-    /// [`StoreSecret::mix_txid`] (same as live insert / online shadow fill).
-    ///
-    /// Layout defaults to [`layout_for_count`](crate::address_head::layout_for_count).
-    /// Pass `layout_override` to force a wider bits (operator early resize).
-    /// Progress: `on_progress(done, total, occupied)`.
-    pub fn build_head_file_in_ram(
-        &self,
-        out_path: impl AsRef<std::path::Path>,
-        on_progress: impl FnMut(u64, u64, u64),
-    ) -> Result<crate::address_head::RamAddressHead, StoreError> {
-        self.build_head_file_in_ram_with_layout(out_path, None, on_progress)
-    }
-
-    /// Like [`Self::build_head_file_in_ram`] with optional forced layout.
-    pub fn build_head_file_in_ram_with_layout(
-        &self,
-        out_path: impl AsRef<std::path::Path>,
-        layout_override: Option<HeadLayout>,
-        mut on_progress: impl FnMut(u64, u64, u64),
-    ) -> Result<crate::address_head::RamAddressHead, StoreError> {
-        use crate::address_head::{layout_for_count, RamAddressHead};
-        use std::time::Instant;
-
-        let n = self.count();
-        let layout = match layout_override {
-            Some(l) => l,
-            None => layout_for_count(n),
-        };
-        let t0 = Instant::now();
-        let mut ram = RamAddressHead::new(layout)?;
-        rbitcoin_log::info!(
-            "store: tx.head RAM build begin n={n} bits={} slots={} entry={}B body={:.2} GiB → {}",
-            layout.bits,
-            layout.slots(),
-            layout.entry_bytes,
-            layout.body_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
-            out_path.as_ref().display()
-        );
-        if n == 0 {
-            ram.write_to(out_path.as_ref())?;
-            on_progress(0, 0, 0);
-            return Ok(ram);
-        }
-
-        let read_batch = Self::head_fill_read_batch();
-        let write_chunk = Self::head_fill_write_chunk();
-        const PROGRESS_EVERY: u64 = 1_000_000;
-        let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(write_chunk);
-        let mut last_progress = 0u64;
-        let mut cur = 1u64;
-        let t_read_insert = Instant::now();
-        while cur <= n {
-            let end = (cur + read_batch - 1).min(n);
-            let txids = self.body_txid_range(cur, end)?;
-            debug_assert_eq!(txids.len() as u64, end - cur + 1);
-            for (i, txid) in txids.into_iter().enumerate() {
-                let id = cur + i as u64;
-                // Same keyed mix as live head_insert_many / online shadow fill.
-                batch.push((self.secret.mix_txid(&txid), Fk(id)));
-                if batch.len() >= write_chunk {
-                    ram.insert_many(&batch)?;
-                    batch.clear();
-                }
-                if id - last_progress >= PROGRESS_EVERY || id == n {
-                    on_progress(id, n, ram.occupied());
-                    last_progress = id;
-                }
-            }
-            cur = end + 1;
-        }
-        if !batch.is_empty() {
-            ram.insert_many(&batch)?;
-        }
-        let fill_ms = t_read_insert.elapsed().as_millis();
-        if last_progress != n {
-            on_progress(n, n, ram.occupied());
-        }
-
-        let t_write = Instant::now();
-        ram.write_to(out_path.as_ref())?;
-        let write_ms = t_write.elapsed().as_millis();
-        let total_ms = t0.elapsed().as_millis();
-        rbitcoin_log::info!(
-            "store: tx.head RAM build done n={n} occupied={} bits={} \
-             fill_ms={fill_ms} write_ms={write_ms} total_ms={total_ms} path={}",
-            ram.occupied(),
-            layout.bits,
-            out_path.as_ref().display()
-        );
-        Ok(ram)
-    }
-
-    /// Approximate occupied slots in the hash head (for "needs backfill?" checks).
     pub fn head_occupied(&self) -> u64 {
-        self.head.read().unwrap().occupied()
+        self.head.occupied()
     }
 
     pub fn head_bits(&self) -> u32 {
-        self.head.read().unwrap().bits()
+        self.head.bits()
     }
 
     pub fn head_slots(&self) -> u64 {
-        self.head.read().unwrap().slots()
+        self.head.slots()
     }
 
     pub fn head_entry_bytes(&self) -> u8 {
-        self.head.read().unwrap().entry_bytes()
+        self.head.entry_bytes()
     }
 
-    /// No-op capacity reserve (growth is online sequential resize).
-    pub fn head_reserve_additional(&self, additional: u64) -> Result<(), StoreError> {
-        self.head.read().unwrap().reserve_additional(additional)
-    }
-
-    /// Bulk-insert head entries (archive / tip / rebuild).
-    ///
-    /// Sole writer: plain store empty→fk, call order, SeqCst fence after batch.
-    /// **No body_txid** on insert.
-    ///
-    /// When load hits [`crate::address_head::HEAD_LOAD_START`] (or probe exhaust),
-    /// runs a **blocking RAM rebuild** (pause-friendly): full Class A → new head
-    /// in process RAM → swap. Online io_uring shadow fill is no longer used for
-    /// production resizes.
-    pub fn head_insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
-        if !entries.is_empty() {
-            self.head_insert_many_with_resize_retry(entries)?;
-        }
-        // First insert past PROBE_DEPTH_WARN requests early widen (before load 0.80
-        // or probe exhaust).
-        if take_probe_depth_resize_request() && !self.head_resize_in_progress() {
-            self.ensure_head_resize_for_probe_exhaust()?;
-        }
-        // After live inserts into primary only — never dual-write to shadow.
-        self.maybe_start_head_resize()?;
+    pub fn head_reserve_additional(&self, _additional: u64) -> Result<(), StoreError> {
         Ok(())
     }
 
-    /// Insert batch using **mixed** keys. On primary probe exhaust, depth-failed
-    /// entries go to [`HeadOverflow`] so the write path does not stall for the
-    /// full primary rehash; remaining entries retry on the primary.
-    fn head_insert_many_with_resize_retry(
-        &self,
-        entries: &[([u8; 32], Fk)],
-    ) -> Result<(), StoreError> {
-        // Keyed probes: never use raw txid prefixes as open-hash keys.
+    pub fn head_segment_count(&self) -> usize {
+        self.head.segment_count()
+    }
+
+    /// Insert txid→fk into the segmented head (mixes keys; may seal/roll).
+    pub fn head_insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
         let mixed: Vec<([u8; 32], Fk)> = entries
             .iter()
             .map(|(txid, fk)| (self.secret.mix_txid(txid), *fk))
             .collect();
-        let insert_result = {
-            let head = self.head.read().unwrap();
-            head.insert_many(&mixed)
-        };
-        match insert_result {
-            Ok(()) => Ok(()),
-            Err(e) if is_probe_exhausted_error(&e) => {
-                // Blocking RAM widen, then retry the whole batch on the new primary.
-                self.ensure_head_resize_for_probe_exhaust()?;
-                let head = self.head.read().unwrap();
-                head.insert_many(&mixed)
+        // Body soft-span: if open segment's body span exceeds soft span, force roll.
+        let force_roll = self.head_should_force_roll_for_body(&mixed)?;
+        self.head.insert_many(&mixed, force_roll)?;
+        Ok(())
+    }
+
+    fn head_should_force_roll_for_body(
+        &self,
+        entries: &[([u8; 32], Fk)],
+    ) -> Result<bool, StoreError> {
+        if entries.is_empty() {
+            return Ok(false);
+        }
+        // If we have an open segment with creates, check body span of that segment
+        // plus incoming would exceed soft span — caller uses first open first_fk.
+        // Cheap approx: if total body published already large relative to soft span
+        // from fk=1, we still rely on load roll. Soft-span coupling:
+        // when the first fk of the batch is not continuing a short segment body.
+        let soft = SegmentedTxHead::soft_span_bytes();
+        // Look at body range of first create that would land in current open
+        // after insert — use body end of last existing and start of first open.
+        // Without open first_fk public, use: if body of latest create minus
+        // body of (latest - max_keys) > soft — approximate via last entry.
+        let last_fk = entries.last().unwrap().1 .0;
+        if last_fk == 0 {
+            return Ok(false);
+        }
+        // When class A body file spans more than soft from the first fk of the
+        // current open segment, force roll. We estimate open first as
+        // max(1, last_published - max_keys + 1) when segments not yet rolled.
+        let segs = self.head.segment_count();
+        if segs == 0 {
+            return Ok(false);
+        }
+        // Use body span of the whole table's last soft window only when single segment.
+        if segs == 1 && last_fk > 1 {
+            if let (Ok((off0, _)), Ok((off1, len1))) = (
+                self.body.record_range(Fk(1)),
+                self.body.record_range(Fk(last_fk)),
+            ) {
+                let end = off1.saturating_add(len1);
+                if end.saturating_sub(off0) > soft {
+                    return Ok(true);
+                }
             }
-            Err(e) => Err(e),
         }
+        let _ = soft;
+        Ok(false)
     }
 
-    /// Drop overflow after a successful primary head swap.
-    ///
-    /// Overflow is the depth-exhausted sidecar for the **old** primary while it
-    /// is full/resizing. The replacement head is filled from Class A (`tx.idx`
-    /// order), so every overflow mapping is already on the new primary — do
-    /// **not** re-insert (drain) into the new head; just clear the sidecar.
-    fn clear_overflow_after_head_swap(&self) -> Result<usize, StoreError> {
-        let mut ov = self.overflow.lock().unwrap();
-        let n = ov.occupied();
-        if n > 0 {
-            ov.clear()?;
-        }
-        Ok(n)
-    }
-
-    /// Block the calling thread until online head resize is idle.
-    ///
-    /// Progress is logged every 30s while parked. Wakes on
-    /// [`Self::notify_head_resize_idle`] after a successful swap (or Drop).
-    ///
-    /// Lock order: never hold `resize` while taking `head` (swap holds
-    /// `head.write` then notifies under `resize` — reverse order deadlocks).
-    fn wait_for_head_resize_idle(&self) {
-        /// How often a parked archiver logs resize progress.
-        const LOG_EVERY: Duration = Duration::from_secs(30);
-
-        let t0 = Instant::now();
-        let mut last_log = Instant::now()
-            .checked_sub(LOG_EVERY)
-            .unwrap_or_else(Instant::now);
-        loop {
-            if !self.head_resize_in_progress() {
-                break;
-            }
-            if last_log.elapsed() >= LOG_EVERY {
-                // Snapshot without holding `resize` across `head.read`.
-                let (cursor, n, target_bits, slots) = self.head_resize_progress();
-                let pct = if n > 0 {
-                    100.0 * (cursor.saturating_sub(1) as f64) / (n as f64)
-                } else {
-                    100.0
-                };
-                rbitcoin_log::info!(
-                    "store: tx.head archiver still sleeping on resize \
-                     (cursor={}/{n} ({pct:.1}%) target_bits={target_bits} \
-                     slots={slots} elapsed={:?})",
-                    cursor.saturating_sub(1),
-                    t0.elapsed()
-                );
-                last_log = Instant::now();
-            }
-            let guard = self.resize.lock().unwrap();
-            if !self.head_resize_in_progress() {
-                break;
-            }
-            let (_g, _) = self
-                .resize_cv
-                .wait_timeout(guard, LOG_EVERY)
-                .expect("tx.head resize wait mutex not poisoned");
-        }
-    }
-
-    /// Wake writers parked in [`Self::wait_for_head_resize_idle`].
-    fn notify_head_resize_idle(&self) {
-        // Hold `resize` so waiters re-check `head_resize_in_progress` after wake
-        // without missing the notify between the check and wait.
-        let _g = self.resize.lock().unwrap();
-        self.resize_cv.notify_all();
-    }
-
-    /// `(shadow_cursor, class_a_count, target_bits, primary_slots)` for logs.
-    fn head_resize_progress(&self) -> (u64, u64, u32, u64) {
-        let snap = self.head_resize_size_snapshot();
-        (
-            snap.cursor,
-            snap.class_a_n,
-            if snap.active {
-                snap.shadow_bits
-            } else {
-                snap.primary_bits
-            },
-            snap.primary_slots,
-        )
-    }
-
-    /// Cheap occupancy of primary + in-progress shadow `tx.head` (for `ibd: sizes`).
-    ///
-    /// Body sizes are **sparse file** logical size (`slots × entry_bytes`), not
-    /// necessarily resident RSS — still the right meter for dual-mmap retain
-    /// during online resize.
-    pub fn head_resize_size_snapshot(&self) -> HeadResizeSizeSnapshot {
-        let class_a_n = self.count();
-        let head = self.head.read().unwrap();
-        let primary_bits = head.bits();
-        let primary_slots = head.slots();
-        let primary_entry_b = head.entry_bytes();
-        let primary_occupied = head.occupied();
-        let primary_body_bytes = head.layout().body_bytes();
-        drop(head);
-
-        let g = self.resize.lock().unwrap();
-        let active = g.is_some() || self.resize_active.load(AtomicOrdering::Acquire);
-        match g.as_ref() {
-            Some(r) => HeadResizeSizeSnapshot {
-                active: true,
-                cursor: r.cursor,
-                class_a_n,
-                primary_bits,
-                primary_slots,
-                primary_entry_b,
-                primary_occupied,
-                primary_body_bytes,
-                shadow_bits: r.shadow.bits(),
-                shadow_slots: r.shadow.slots(),
-                shadow_entry_b: r.shadow.entry_bytes(),
-                shadow_occupied: r.shadow.occupied(),
-                shadow_body_bytes: r.shadow.layout().body_bytes(),
-            },
-            None => HeadResizeSizeSnapshot {
-                active,
-                cursor: 0,
-                class_a_n,
-                primary_bits,
-                primary_slots,
-                primary_entry_b,
-                primary_occupied,
-                primary_body_bytes,
-                shadow_bits: 0,
-                shadow_slots: 0,
-                shadow_entry_b: 0,
-                shadow_occupied: 0,
-                shadow_body_bytes: 0,
-            },
-        }
-    }
-
-    /// Start a BITS+1 **RAM** rebuild if none is running (probe-exhaust path).
-    fn ensure_head_resize_for_probe_exhaust(&self) -> Result<(), StoreError> {
-        if self.head_resize_in_progress() {
-            self.wait_for_head_resize_idle();
-            return Ok(());
-        }
-        let bits = self.head.read().unwrap().bits();
-        if bits >= MAX_BITS {
-            return Ok(());
-        }
-        let target = HeadLayout::new(bits + 1)?;
-        rbitcoin_log::info!(
-            "store: tx.head probe exhausted — RAM resize {}→{} bits (n={})",
-            bits,
-            target.bits,
-            self.count()
-        );
-        self.perform_ram_head_resize(target)
-    }
-
-    /// Same as [`Self::head_insert_many`] (sole-writer path is the only path).
-    #[inline]
     pub fn head_insert_many_sole(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         self.head_insert_many(entries)
     }
 
-    /// True if a sequential head rebuild is in progress.
+    /// Always false — mono-head resize removed (segment roll is synchronous on insert).
     pub fn head_resize_in_progress(&self) -> bool {
-        self.resize_active.load(AtomicOrdering::Acquire)
-            || self.resize.lock().unwrap().is_some()
+        false
     }
 
-    /// On open: abandon incomplete **online** shadow resize (legacy). Production
-    /// resizes are synchronous RAM rebuilds; partial `.new` is not resumed.
-    /// If load still needs a widen, run RAM resize immediately.
-    fn resume_head_resize_if_needed(&self) -> Result<(), StoreError> {
-        let had_online = read_resize_control(&self.head_path)?.is_some()
-            || shadow_head_path(&self.head_path).exists();
-        if had_online {
-            rbitcoin_log::info!(
-                "store: abandoning incomplete online tx.head resize leftovers on open \
-                 (RAM resize policy)"
-            );
-            self.abandon_online_resize_leftovers()?;
-        }
-        // If primary is still past load threshold, widen now (blocks open ~minutes).
-        let (bits, slots, n) = {
-            let h = self.head.read().unwrap();
-            (h.bits(), h.slots(), self.count())
-        };
-        if bits < MAX_BITS && load_needs_resize(n, slots) {
-            let target = HeadLayout::new(bits + 1)?;
-            rbitcoin_log::info!(
-                "store: open-time RAM resize {}→{} bits (n={n} load={:.3})",
-                bits,
-                target.bits,
-                load_ratio(n, slots)
-            );
-            self.perform_ram_head_resize(target)?;
-        }
-        Ok(())
-    }
-
-    /// When load ≥ [`crate::address_head::HEAD_LOAD_START`], run a **blocking RAM**
-    /// rebuild (bits+1). Confirm / other threads see [`Self::head_resize_in_progress`]
-    /// for the whole fill+swap (pause-friendly).
-    pub fn maybe_start_head_resize(&self) -> Result<(), StoreError> {
-        if self.head_resize_in_progress() {
-            return Ok(());
-        }
-        let (bits, slots, n) = {
-            let h = self.head.read().unwrap();
-            (h.bits(), h.slots(), self.count())
-        };
-        if bits >= MAX_BITS {
-            return Ok(());
-        }
-        if !load_needs_resize(n, slots) {
-            return Ok(());
-        }
-        let target = HeadLayout::new(bits + 1)?;
-        rbitcoin_log::info!(
-            "store: tx.head load={:.3} ≥ threshold — RAM resize {}→{} bits (n={n} slots={slots})",
-            load_ratio(n, slots),
-            bits,
-            target.bits
-        );
-        self.perform_ram_head_resize(target)
-    }
-
-    /// Force a **blocking RAM** rebuild to `target` (tests / operator / load trigger).
-    ///
-    /// Online shadow fill is **not** started. Any incomplete online resize is abandoned.
-    pub fn start_head_resize(&self, target: HeadLayout) -> Result<(), StoreError> {
-        self.perform_ram_head_resize(target)
-    }
-
-    /// Blocking: build a complete wider head in RAM and atomically swap as primary.
-    ///
-    /// Sets [`Self::head_resize_in_progress`] for the whole operation so IBD confirm
-    /// can pause (poll) and archive writers can wait on probe-exhaust.
-    pub fn perform_ram_head_resize(&self, target: HeadLayout) -> Result<(), StoreError> {
-        // Single-flight: if another thread is already resizing, wait it out.
-        if self.head_resize_in_progress() {
-            self.wait_for_head_resize_idle();
-            // After wait, re-check whether we still need to widen.
-            let bits = self.head.read().unwrap().bits();
-            if target.bits <= bits {
-                return Ok(());
-            }
-            // Fall through only if still too narrow (rare race).
-        }
-        let cur_bits = self.head.read().unwrap().bits();
-        if target.bits < cur_bits {
-            return Err(StoreError::Corrupt("tx.head resize must not shrink bits"));
-        }
-        if target.bits == cur_bits {
-            return Ok(());
-        }
-        if target.bits > MAX_BITS {
-            return Err(StoreError::Corrupt("tx.head resize bits above MAX_BITS"));
-        }
-
-        // Claim the resize slot (abort any legacy online fill leftovers first).
-        self.abandon_online_resize_leftovers()?;
-        if self
-            .resize_active
-            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
-            .is_err()
-        {
-            self.wait_for_head_resize_idle();
-            return Ok(());
-        }
-        struct ActiveGuard<'a>(&'a AtomicBool, &'a Condvar, &'a Mutex<Option<HeadResize>>);
-        impl Drop for ActiveGuard<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, AtomicOrdering::Release);
-                let _g = self.2.lock().unwrap();
-                self.1.notify_all();
-            }
-        }
-        let _active = ActiveGuard(&self.resize_active, &self.resize_cv, &self.resize);
-
+    pub fn head_resize_size_snapshot(&self) -> HeadResizeSizeSnapshot {
         let n = self.count();
-        let slots_old = self.head.read().unwrap().slots();
-        let load = load_ratio(n, slots_old);
-        rbitcoin_log::info!(
-            "store: tx.head RAM resize begin {}→{} bits entry={}B n={n} \
-             slots_old={slots_old} load={load:.3} slots_new={} (confirm should pause)",
-            cur_bits,
-            target.bits,
-            target.entry_bytes,
-            target.slots()
-        );
-
-        // Write side file, then swap under exclusive head lock (same renames as
-        // online complete, but source is a full RAM build, not a partial shadow).
-        let ram_path = {
-            let mut p = self.head_path.as_os_str().to_os_string();
-            p.push(".ramnew");
-            PathBuf::from(p)
-        };
-        let _ = std::fs::remove_file(&ram_path);
-        let t0 = Instant::now();
-        let mut last_log = Instant::now();
-        self.build_head_file_in_ram_with_layout(&ram_path, Some(target), |done, total, occ| {
-            if last_log.elapsed() >= Duration::from_secs(30) || done == total {
-                let pct = if total > 0 {
-                    (100 * done) / total
-                } else {
-                    100
-                };
-                rbitcoin_log::info!(
-                    "store: tx.head RAM resize progress {done}/{total} ({pct}%) occupied={occ} \
-                     elapsed={:?}",
-                    t0.elapsed()
-                );
-                last_log = Instant::now();
-            }
-        })?;
-
-        // Exclusive swap: primary → .bak, ramnew → primary.
-        rbitcoin_log::info!(
-            "store: tx.head RAM resize fill done in {:?} — exclusive swap",
-            t0.elapsed()
-        );
-        let t_lock = Instant::now();
-        let mut head_w = loop {
-            if self.resize_abort.load(AtomicOrdering::Acquire) {
-                let _ = std::fs::remove_file(&ram_path);
-                return Err(StoreError::Corrupt("tx.head RAM resize aborted"));
-            }
-            match self.head.try_write() {
-                Ok(g) => break g,
-                Err(_) => {
-                    if t_lock.elapsed() > Duration::from_secs(1)
-                        && t_lock.elapsed().as_millis() % 5000 < 50
-                    {
-                        rbitcoin_log::warn!(
-                            "store: tx.head RAM resize waiting for exclusive head lock ({:?})",
-                            t_lock.elapsed()
-                        );
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            }
-        };
-        let primary_writes = head_w.lock_writes();
-        let new_gen = head_w.generation().saturating_add(1);
-        let bak = bak_head_path(&self.head_path);
-        let _ = std::fs::remove_file(&bak);
-        drop(primary_writes);
-
-        std::fs::rename(&self.head_path, &bak).map_err(|e| StoreError::io(&self.head_path, e))?;
-        if let Err(e) = std::fs::rename(&ram_path, &self.head_path) {
-            // Best-effort restore primary.
-            let _ = std::fs::rename(&bak, &self.head_path);
-            return Err(StoreError::io(&ram_path, e));
+        let bits = self.head.bits();
+        let slots = self.head.slots();
+        let occ = self.head.occupied();
+        let body_bytes = slots.saturating_mul(u64::from(self.head.entry_bytes()));
+        HeadResizeSizeSnapshot {
+            active: false,
+            cursor: 0,
+            class_a_n: n,
+            primary_bits: bits,
+            primary_slots: slots,
+            primary_entry_b: self.head.entry_bytes(),
+            primary_occupied: occ,
+            primary_body_bytes: body_bytes,
+            shadow_bits: 0,
+            shadow_slots: 0,
+            shadow_entry_b: 0,
+            shadow_occupied: 0,
+            shadow_body_bytes: 0,
+            segment_count: self.head.segment_count() as u64,
+            sealed_segments: self.head.sealed_segment_count() as u64,
         }
-        write_head_meta(&self.head_path, target, new_gen)?;
-        clear_resize_control(&self.head_path);
-        *head_w = AddressHead::open(&self.head_path)?;
-        let _ = std::fs::remove_file(&bak);
-        crate::address_head::remove_legacy_meta_sidecar(&bak);
-        // Drop any leftover online shadow path.
-        let shadow = shadow_head_path(&self.head_path);
-        let _ = std::fs::remove_file(&shadow);
-        crate::address_head::remove_legacy_meta_sidecar(&shadow);
-        let cleared = self.clear_overflow_after_head_swap()?;
-        if cleared > 0 {
-            rbitcoin_log::info!(
-                "store: tx.head.overflow cleared {cleared} entries after RAM resize"
-            );
-        }
-        rbitcoin_log::info!(
-            "store: tx.head RAM resize complete {}→{} bits entry={}B slots={} gen={} total={:?}",
-            cur_bits,
-            target.bits,
-            target.entry_bytes,
-            head_w.slots(),
-            new_gen,
-            t0.elapsed()
-        );
-        // ActiveGuard drop clears resize_active + notifies waiters.
-        Ok(())
     }
 
-    /// Stop bg online fill and drop incomplete shadow/control (switch to RAM policy).
-    fn abandon_online_resize_leftovers(&self) -> Result<(), StoreError> {
-        self.resize_abort.store(true, AtomicOrdering::Release);
-        self.resize_bg_gen.fetch_add(1, AtomicOrdering::AcqRel);
-        if let Some(h) = self.resize_bg.lock().unwrap().take() {
-            let _ = h.join();
-        }
-        *self.resize.lock().unwrap() = None;
-        clear_resize_control(&self.head_path);
-        let shadow = shadow_head_path(&self.head_path);
-        if shadow.exists() {
-            let _ = std::fs::remove_file(&shadow);
-            crate::address_head::remove_legacy_meta_sidecar(&shadow);
-            rbitcoin_log::info!(
-                "store: abandoned incomplete online tx.head shadow {}",
-                shadow.display()
-            );
-        }
-        self.resize_abort.store(false, AtomicOrdering::Release);
-        Ok(())
-    }
-
-    /// Class A fks per bulk body-txid read when filling a head (rebuild or
-    /// online resize shadow). `RBITCOIN_TX_HEAD_READ_BATCH` (default **65536**);
-    /// legacy `RBITCOIN_TX_HEAD_RESIZE_READ_BATCH` still accepted.
-    fn head_fill_read_batch() -> u64 {
-        env_u64(
-            "RBITCOIN_TX_HEAD_READ_BATCH",
-            "RBITCOIN_TX_HEAD_RESIZE_READ_BATCH",
-            65_536,
-            1,
-            1_000_000,
-        )
-    }
-
-    /// `insert_many` group size when filling a head (one SeqCst fence per group).
-    /// `RBITCOIN_TX_HEAD_WRITE_CHUNK` (default **65536**, same as read batch); legacy
-    /// `RBITCOIN_TX_HEAD_RESIZE_WRITE_CHUNK` still accepted.
-    fn head_fill_write_chunk() -> usize {
-        env_u64(
-            "RBITCOIN_TX_HEAD_WRITE_CHUNK",
-            "RBITCOIN_TX_HEAD_RESIZE_WRITE_CHUNK",
-            65_536,
-            64,
-            1_000_000,
-        ) as usize
-    }
-
-    /// Fill shadow head for consecutive Class A ids.
-    ///
-    /// **Online path:** prefer io_uring pipeline ([`crate::head_resize_fill`]) so
-    /// `tx.head.new` is filled via pread/pwrite page RMW (no shadow mmap fault-in).
-    /// Falls back to bulk body reads + mmap `insert_many` if uring is unavailable.
-    fn shadow_fill_fk_range(
-        &self,
-        shadow: &AddressHead,
-        first: u64,
-        last: u64,
-    ) -> Result<(), StoreError> {
-        if last < first {
-            return Ok(());
-        }
-        match crate::head_resize_fill::run_shadow_fill_uring(
-            &self.body,
-            shadow,
-            &self.secret,
-            first,
-            last,
-        ) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                static ONCE: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    rbitcoin_log::warn!(
-                        "store: io_uring shadow fill unavailable ({e}) — falling back to mmap insert_many"
-                    );
-                }
-            }
-        }
-        self.shadow_fill_fk_range_mmap(shadow, first, last)
-    }
-
-    /// Mmap `insert_many` fill (rebuild / uring fallback).
-    fn shadow_fill_fk_range_mmap(
-        &self,
-        shadow: &AddressHead,
-        first: u64,
-        last: u64,
-    ) -> Result<(), StoreError> {
-        let write_chunk = Self::head_fill_write_chunk();
-        let read_batch = Self::head_fill_read_batch();
-        let mut cur = first;
-        while cur <= last {
-            let end = (cur + read_batch - 1).min(last);
-            let txids = self.body_txid_range(cur, end)?;
-            debug_assert_eq!(txids.len() as u64, end - cur + 1);
-            let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(write_chunk);
-            for (i, txid) in txids.into_iter().enumerate() {
-                // Same keyed mix as live inserts (never raw txid as head key).
-                batch.push((self.secret.mix_txid(&txid), Fk(cur + i as u64)));
-                if batch.len() >= write_chunk {
-                    shadow.insert_many(&batch)?;
-                    batch.clear();
-                }
-            }
-            if !batch.is_empty() {
-                shadow.insert_many(&batch)?;
-            }
-            cur = end + 1;
-        }
-        Ok(())
-    }
-
-    /// Advance sequential shadow fill by up to `budget` Class A fks; swap when caught up.
-    ///
-    /// Does **not** dual-write live inserts — only `tx.idx` order into shadow.
-    /// Body txids are read in bulk (io_uring / parallel pread); shadow inserts
-    /// remain ordered `insert_many` on `tx.head.new`.
-    ///
-    /// **Lock discipline:** `resize` Mutex is held only to snapshot `(shadow, cursor)`
-    /// and later to commit the cursor. Fill IO runs **without** the mutex so archive
-    /// `head_insert_many` → `maybe_start_head_resize` is not blocked for whole waves.
-    pub fn head_resize_poll(&self, budget: u64) -> Result<(), StoreError> {
-        if budget == 0 {
-            return Ok(());
-        }
-        let n = self.count();
-        // Snapshot under lock — do not hold across body_txid_range / insert_many.
-        let work: Option<(Arc<AddressHead>, u64, u64, HeadLayout)> = {
-            let mut rg = self.resize.lock().unwrap();
-            let Some(r) = rg.as_mut() else {
-                return Ok(());
-            };
-            if r.cursor == 0 {
-                r.cursor = 1;
-            }
-            if n == 0 || r.cursor > n {
-                None
-            } else {
-                let start = r.cursor;
-                let end = (r.cursor + budget - 1).min(n);
-                Some((Arc::clone(&r.shadow), start, end, r.target))
-            }
-        };
-
-        let done_fill = match work {
-            None => true,
-            Some((shadow, start, end, target)) => {
-                self.shadow_fill_fk_range(&shadow, start, end)?;
-                let mut progress_log: Option<(u64, u64, u32)> = None;
-                let mut done = false;
-                {
-                    let mut rg = self.resize.lock().unwrap();
-                    let Some(r) = rg.as_mut() else {
-                        return Ok(());
-                    };
-                    // Only one bg filler; still refuse to rewind if something advanced.
-                    if r.cursor != start {
-                        return Ok(());
-                    }
-                    r.cursor = end + 1;
-                    let gen = self.head.read().unwrap().generation();
-                    write_resize_control(
-                        &self.head_path,
-                        &ResizeControl {
-                            target,
-                            cursor: r.cursor,
-                            generation: gen,
-                        },
-                    )?;
-                    let advanced = r.cursor.saturating_sub(start);
-                    let n_now = self.count();
-                    let milestone = r.cursor > 1
-                        && (r.cursor / 1_000_000 > start.saturating_sub(1) / 1_000_000
-                            || r.cursor > n_now
-                            || advanced >= 1_000_000);
-                    if milestone {
-                        progress_log =
-                            Some((r.cursor.saturating_sub(1), n_now, r.target.bits));
-                    }
-                    if r.cursor > n_now {
-                        done = true;
-                    }
-                }
-                if let Some((cur, total, bits)) = progress_log {
-                    let pct = if total > 0 {
-                        100.0 * (cur as f64) / (total as f64)
-                    } else {
-                        100.0
-                    };
-                    rbitcoin_log::info!(
-                        "store: tx.head resize progress cursor={cur}/{total} ({pct:.1}%) target_bits={bits}"
-                    );
-                }
-                done
-            }
-        };
-        if done_fill {
-            self.try_complete_head_resize()?;
-        }
-        Ok(())
-    }
-
-    /// Final catch-up under primary insert lock, then atomic rename swap.
-    fn try_complete_head_resize(&self) -> Result<(), StoreError> {
-        use std::time::{Duration, Instant};
-
-        // Single completer: bg wave + main-thread poll must not both rename/drop
-        // the shadow (IO Safety: owned FD already closed).
-        if self
-            .resize_completing
-            .compare_exchange(
-                false,
-                true,
-                AtomicOrdering::AcqRel,
-                AtomicOrdering::Acquire,
-            )
-            .is_err()
-        {
-            return Ok(());
-        }
-        struct CompletingGuard<'a>(&'a AtomicBool);
-        impl Drop for CompletingGuard<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, AtomicOrdering::Release);
-            }
-        }
-        let _completing_guard = CompletingGuard(&self.resize_completing);
-
-        rbitcoin_log::info!(
-            "store: tx.head resize fill done — final catch-up + swap (shadow → primary)"
-        );
-
-        // Phase 1: catch-up + flush **without** exclusive `head.write()` and
-        // **without** holding `resize` across fill IO (same archive-stall fix as poll).
-        {
-            let n = self.count();
-            let snap = {
-                let rg = self.resize.lock().unwrap();
-                rg.as_ref().map(|r| (Arc::clone(&r.shadow), r.cursor, r.target))
-            };
-            let Some((shadow, mut cursor, target)) = snap else {
-                return Ok(());
-            };
-            if cursor == 0 {
-                cursor = 1;
-            }
-            if cursor <= n {
-                self.shadow_fill_fk_range(&shadow, cursor, n)?;
-                cursor = n + 1;
-            }
-            let n2 = self.count();
-            if cursor <= n2 {
-                self.shadow_fill_fk_range(&shadow, cursor, n2)?;
-                cursor = n2 + 1;
-            }
-            {
-                let mut rg = self.resize.lock().unwrap();
-                let Some(r) = rg.as_mut() else {
-                    return Ok(());
-                };
-                r.cursor = cursor;
-                let gen = self.head.read().unwrap().generation();
-                write_resize_control(
-                    &self.head_path,
-                    &ResizeControl {
-                        target,
-                        cursor: r.cursor,
-                        generation: gen,
-                    },
-                )?;
-            }
-            rbitcoin_log::info!(
-                "store: tx.head resize flushing shadow (cursor={}, n={})",
-                cursor.saturating_sub(1),
-                n2.max(n)
-            );
-            shadow.flush()?;
-        }
-
-        // Phase 2: exclusive head ownership for rename + reopen. Use try_write so
-        // we log while waiting (std RwLock write can starve under continuous reads).
-        // Cancel if: sticky abort (Drop), or `resize_bg_gen` changes after we enter
-        // this wait (worker kill / respawn while blocked). Gen bump alone before
-        // entering the wait must *not* cancel — main-thread poll may complete after
-        // killing the bg worker (archiver sleep test).
-        rbitcoin_log::info!("store: tx.head resize acquiring exclusive head lock for swap…");
-        let t_lock = Instant::now();
-        if self.resize_abort.load(AtomicOrdering::Acquire) {
-            rbitcoin_log::info!(
-                "store: tx.head resize exclusive lock wait cancelled (abort before try_write)"
-            );
-            return Ok(());
-        }
-        let gen_at_start = self.resize_bg_gen.load(AtomicOrdering::Acquire);
-        let mut waited = 0u32;
-        let mut head_w = loop {
-            if self.resize_abort.load(AtomicOrdering::Acquire)
-                || self.resize_bg_gen.load(AtomicOrdering::Acquire) != gen_at_start
-            {
-                rbitcoin_log::info!(
-                    "store: tx.head resize exclusive lock wait cancelled \
-                     (abort/gen after {:?})",
-                    t_lock.elapsed()
-                );
-                return Ok(());
-            }
-            match self.head.try_write() {
-                Ok(g) => {
-                    // Re-check after acquiring: Drop may have set abort while we
-                    // raced into the write lock.
-                    if self.resize_abort.load(AtomicOrdering::Acquire)
-                        || self.resize_bg_gen.load(AtomicOrdering::Acquire) != gen_at_start
-                    {
-                        rbitcoin_log::info!(
-                            "store: tx.head resize exclusive lock wait cancelled \
-                             (abort after try_write, {:?})",
-                            t_lock.elapsed()
-                        );
-                        drop(g);
-                        return Ok(());
-                    }
-                    break g;
-                }
-                Err(_) => {
-                    waited = waited.saturating_add(1);
-                    if waited == 1 || waited % 40 == 0 {
-                        rbitcoin_log::warn!(
-                            "store: tx.head resize waiting for exclusive head lock \
-                             ({:?}; other threads still hold head.read)",
-                            t_lock.elapsed()
-                        );
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            }
-        };
-        if waited > 0 {
-            rbitcoin_log::info!(
-                "store: tx.head resize exclusive lock acquired after {:?}",
-                t_lock.elapsed()
-            );
-        }
-
-        let primary_writes = head_w.lock_writes();
-        // One more catch-up under exclusive insert barrier (archive paused).
-        // Still avoid holding `resize` for the fill itself.
-        let n3 = self.count();
-        let (shadow, mut cursor, target) = {
-            let rg = self.resize.lock().unwrap();
-            let Some(r) = rg.as_ref() else {
-                return Ok(());
-            };
-            (Arc::clone(&r.shadow), r.cursor, r.target)
-        };
-        if cursor == 0 {
-            cursor = 1;
-        }
-        if cursor <= n3 {
-            self.shadow_fill_fk_range(&shadow, cursor, n3)?;
-            cursor = n3 + 1;
-            shadow.flush()?;
-        }
-        drop(shadow);
-        let new_gen = head_w.generation().saturating_add(1);
-        let shadow_path = shadow_head_path(&self.head_path);
-        let bak = bak_head_path(&self.head_path);
-        let _ = std::fs::remove_file(&bak);
-
-        // Take ownership of HeadResize and wait until we hold the **only** Arc to
-        // the shadow AddressHead. Concurrent `head_resize_poll` clones must drop
-        // before rename or mmap/FD is double-closed (IO Safety abort).
-        let hr = {
-            let mut rg = self.resize.lock().unwrap();
-            let Some(mut r) = rg.take() else {
-                return Ok(());
-            };
-            r.cursor = cursor;
-            r
-        };
-        let wait_arc = Instant::now();
-        let mut spins = 0u32;
-        let gen_arc = self.resize_bg_gen.load(AtomicOrdering::Acquire);
-        while Arc::strong_count(&hr.shadow) > 1 {
-            spins = spins.saturating_add(1);
-            if spins == 1 || spins % 200 == 0 {
-                rbitcoin_log::info!(
-                    "store: tx.head resize waiting for shadow Arc exclusive \
-                     (strong={}, {:?})",
-                    Arc::strong_count(&hr.shadow),
-                    wait_arc.elapsed()
-                );
-            }
-            if self.resize_abort.load(AtomicOrdering::Acquire)
-                || self.resize_bg_gen.load(AtomicOrdering::Acquire) != gen_arc
-            {
-                // Put resize back so Drop/resume can clean up; abandon swap.
-                *self.resize.lock().unwrap() = Some(hr);
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        drop(hr); // closes shadow mmap/FD on tx.head.new
-        drop(primary_writes);
-
-        rbitcoin_log::info!(
-            "store: tx.head resize renaming shadow → primary (bits={} slots={})",
-            target.bits,
-            target.slots()
-        );
-        // head_w still held — primary mmap open on old path; Linux allows rename.
-        std::fs::rename(&self.head_path, &bak).map_err(|e| StoreError::io(&self.head_path, e))?;
-        std::fs::rename(&shadow_path, &self.head_path)
-            .map_err(|e| StoreError::io(&shadow_path, e))?;
-        // Layout lives in the file footer (renamed with shadow); bump generation.
-        write_head_meta(&self.head_path, target, new_gen)?;
-        clear_resize_control(&self.head_path);
-        *head_w = AddressHead::open(&self.head_path)?;
-        let _ = std::fs::remove_file(&bak);
-        crate::address_head::remove_legacy_meta_sidecar(&bak);
-        crate::address_head::remove_legacy_meta_sidecar(&shadow_path);
-        // Old primary is gone — overflow was only for that table's probe exhaust.
-        let cleared = self.clear_overflow_after_head_swap()?;
-        if cleared > 0 {
-            rbitcoin_log::info!(
-                "store: tx.head.overflow cleared {cleared} entries after head swap"
-            );
-        }
-        self.resize_active.store(false, AtomicOrdering::Release);
-        // Archive writers may be parked on probe-exhaust for the whole fill;
-        // wake them now that the wider primary is live.
-        self.notify_head_resize_idle();
-        rbitcoin_log::info!(
-            "store: tx.head resize complete bits={} entry={}B slots={} gen={}",
-            target.bits,
-            target.entry_bytes,
-            head_w.slots(),
-            new_gen
-        );
-        Ok(())
+    /// Flush segmented heads only.
+    pub fn flush_head(&self) -> Result<(), StoreError> {
+        self.head.flush()
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
         self.body.flush()?;
-        self.head.read().unwrap().flush()?;
-        if let Some(r) = self.resize.lock().unwrap().as_ref() {
-            r.shadow.flush()?;
-        }
+        self.head.flush()?;
         Ok(())
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.body.flush_async()?;
-        self.head.read().unwrap().flush_async()?;
-        if let Some(r) = self.resize.lock().unwrap().as_ref() {
-            r.shadow.flush_async()?;
-        }
+        self.head.flush_async()?;
         Ok(())
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
-    /// Drive head resize to completion with a hard deadline.
-    ///
-    /// Actively calls [`TxTable::head_resize_poll`] so progress does not depend
-    /// solely on the background fill thread (sleep-only waits stall when the bg
-    /// worker is slow to start, starved, or mid exclusive-lock wait).
-    fn wait_head_resize_done(t: &TxTable, deadline: Duration) {
-        let start = Instant::now();
-        while t.head_resize_in_progress() {
-            assert!(
-                start.elapsed() < deadline,
-                "tx.head resize stalled after {:?} (bits={} count={})",
-                start.elapsed(),
-                t.head_bits(),
-                t.count()
-            );
-            t.head_resize_poll(head_fill_wave())
-                .expect("head_resize_poll during wait");
-            // Yield if still in progress (e.g. exclusive lock contention on swap).
-            if t.head_resize_in_progress() {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-        // Join finished bg worker before tests `remove_dir_all` — otherwise a late
-        // rename can ENOENT or race mmap teardown (tcache double-free under load).
-        let mut slot = t.resize_bg.lock().unwrap();
-        if let Some(h) = slot.take() {
-            let _ = h.join();
-        }
+    fn tempfile_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-tx-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     fn tiny_layout() -> HeadLayout {
         HeadLayout::new(crate::address_head::TINY_BITS).unwrap()
     }
 
-    fn layout_bits(bits: u32) -> HeadLayout {
-        HeadLayout::new(bits).unwrap()
-    }
-
     fn create_tiny(dir: &Path) -> TxTable {
         TxTable::create_with_head_layout(dir, tiny_layout()).unwrap()
-    }
-
-    fn create_bits(dir: &Path, bits: u32) -> TxTable {
-        TxTable::create_with_head_layout(dir, layout_bits(bits)).unwrap()
     }
 
     /// Process-global env knobs still used by a few tests (read-batch / bulk IO).
@@ -3190,15 +2134,6 @@ mod tests {
 
     fn with_env_lock<R>(f: impl FnOnce() -> R) -> R {
         let _g = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        f()
-    }
-
-    fn with_resize_stress_lock<R>(f: impl FnOnce() -> R) -> R {
-        // Share with concurrent file/var_table stress so bg resize and mmap grow
-        // never overlap across tests in one process.
-        let _g = crate::file::TEST_MMAP_STRESS_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         f()
@@ -3329,558 +2264,24 @@ mod tests {
 
     /// All page-local head paths agree: insert_many, probe_fks, single resolve,
     /// batch resolve, BIP30 depth-win, and post-resize lookup.
-    #[test]
-    fn page_local_head_paths_insert_probe_batch_resize() {
-        with_resize_stress_lock(|| {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-tx-page-paths-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // BITS=12 → multi-page table (2^12 slots, 1024/page) so page select matters.
-        let t = create_bits(&dir, 12);
-        assert_eq!(t.head_bits(), 12);
-        assert!(t.head_slots() > crate::address_head::PAGE_SLOTS);
-
-        let mk = |i: u64, txid: [u8; 32]| {
-            let rec = TxRecord {
-                txid,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            };
-            let inputs = vec![InputRecord {
-                prev_txid: [0u8; 32],
-                create_fk: Fk::NULL,
-                prev_index: u32::MAX,
-                sequence: u32::MAX,
-                script_sig: vec![(i & 0xff) as u8],
-                witness: vec![],
-            }];
-            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
-            (rec, inputs, outputs)
-        };
-
-        // Distinct txids across pages + one BIP30 pair.
-        let mut keys = Vec::new();
-        for i in 1..=40u64 {
-            let mut txid = [0u8; 32];
-            txid[0..8].copy_from_slice(&i.to_le_bytes());
-            txid[8] = 0xa1;
-            keys.push(txid);
-            let _ = t.put_full_batch_indexed(&[mk(i, txid)], true).unwrap();
-        }
-        // BIP30: second create for keys[0].
-        let bip = keys[0];
-        let fk_old = t.get_fk_by_txid(&bip).unwrap().unwrap();
-        let fk_new = t.put_full_batch_indexed(&[mk(100, bip)], true).unwrap()[0];
-        assert!(fk_new.0 > fk_old.0);
-
-        // Single resolve matches batch; BIP30 prefers deeper (newer).
-        assert_eq!(t.get_fk_by_txid(&bip).unwrap(), Some(fk_new));
-        let batch = t.get_fk_by_txid_batch(&keys).unwrap();
-        assert_eq!(batch.len(), keys.len());
-        for (txid, fk) in &batch {
-            let single = t.get_fk_by_txid(txid).unwrap();
-            assert_eq!(*fk, single, "batch/single mismatch for {txid:?}");
-        }
-        assert_eq!(
-            batch.iter().find(|(t, _)| *t == bip).unwrap().1,
-            Some(fk_new)
-        );
-
-        // probe_fks lists older then newer; reverse body-verify wins newest.
-        let mixed = t.secret.mix_txid(&bip);
-        let cands = t.head.read().unwrap().probe_fks(&mixed).unwrap();
-        assert!(cands.contains(&fk_old) && cands.contains(&fk_new));
-        assert_eq!(cands[0], fk_old);
-
-        // Online resize shadow fill must preserve all mappings.
-        t.start_head_resize(crate::address_head::HeadLayout::new(13).unwrap())
-            .unwrap();
-        wait_head_resize_done(&t, Duration::from_secs(15));
-        assert_eq!(t.head_bits(), 13);
-        for txid in &keys {
-            assert!(
-                t.get_fk_by_txid(txid).unwrap().is_some(),
-                "missing after resize"
-            );
-        }
-        assert_eq!(t.get_fk_by_txid(&bip).unwrap(), Some(fk_new));
-        let batch2 = t.get_fk_by_txid_batch(&keys).unwrap();
-        for ((_, a), (_, b)) in batch.iter().zip(batch2.iter()) {
-            assert_eq!(a, b);
-        }
-
-        // Reopen path (footer layout + page probes).
-        drop(t);
-        let t2 = TxTable::open(&dir).unwrap();
-        assert_eq!(t2.head_bits(), 13);
-        assert_eq!(t2.get_fk_by_txid(&bip).unwrap(), Some(fk_new));
-        for txid in &keys {
-            assert_eq!(
-                t2.get_fk_by_txid(txid).unwrap(),
-                t2.get_fk_by_txid_batch(&[*txid]).unwrap()[0].1
-            );
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-        });
-    }
 
     /// Overflow accepts depth-exhausted inserts; lookup is overflow-first then primary.
-    #[test]
-    fn head_overflow_insert_and_overflow_first_lookup() {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-tx-overflow-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let t = create_tiny(&dir);
-        let txid = [0x77u8; 32];
-        let mk = |i: u8| {
-            let mut t2 = txid;
-            t2[31] = i;
-            let rec = TxRecord {
-                txid: t2,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            };
-            let inputs = vec![InputRecord::coinbase(u32::MAX, vec![i], vec![])];
-            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
-            (rec, inputs, outputs, t2)
-        };
-        // Direct overflow insert + primary insert for comparison.
-        let (rec, ins, outs, raw_txid) = mk(1);
-        let fk = t
-            .put_full_batch_indexed(&[(rec, ins, outs)], true)
-            .unwrap()[0];
-        let mixed = t.secret.mix_txid(&raw_txid);
-        // Simulate depth-exhaust: push same mixed key's sibling into overflow.
-        let mut alt = raw_txid;
-        alt[30] = 0xab;
-        let mixed_alt = t.secret.mix_txid(&alt);
-        {
-            let mut ov = t.overflow.lock().unwrap();
-            ov.insert(&mixed_alt, Fk(fk.0 + 1000)).unwrap();
-            ov.persist().unwrap();
-        }
-        // Overflow-first: get with a body that won't match overflow fk still works via primary.
-        assert_eq!(t.get_fk_by_txid(&raw_txid).unwrap(), Some(fk));
-        // mix must not equal raw
-        assert_ne!(mixed, raw_txid);
-        // reopen overflow
-        let o2 = crate::head_overflow::HeadOverflow::open(&dir).unwrap();
-        assert_eq!(o2.get(&mixed_alt), Some(Fk(fk.0 + 1000)));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     /// After head swap, `tx.head.overflow` must be empty — it belonged to the
     /// old primary; the new head already holds Class A mappings from shadow fill.
-    #[test]
-    fn head_overflow_cleared_after_resize_swap() {
-        with_resize_stress_lock(|| {
-            let dir = std::env::temp_dir().join(format!(
-                "rbitcoin-tx-overflow-clear-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            let t = create_tiny(&dir);
-            let mk = |i: u64| {
-                let mut txid = [0u8; 32];
-                txid[0..8].copy_from_slice(&i.to_le_bytes());
-                txid[8] = 0xef;
-                let rec = TxRecord {
-                    txid,
-                    version: 1,
-                    locktime: 0,
-                    input_start_fk: Fk::NULL,
-                    input_count: 1,
-                    output_start_fk: Fk::NULL,
-                    output_count: 1,
-                };
-                let inputs = vec![InputRecord::coinbase(u32::MAX, vec![i as u8], vec![])];
-                let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
-                (rec, inputs, outputs, txid)
-            };
-            let mut keys = Vec::new();
-            for i in 1..=30u64 {
-                let (rec, ins, outs, txid) = mk(i);
-                let _ = t
-                    .put_full_batch_indexed(&[(rec, ins, outs)], true)
-                    .unwrap();
-                keys.push(txid);
-            }
-            // Simulate depth-exhausted sidecar while old primary is still live.
-            {
-                let mut ov = t.overflow.lock().unwrap();
-                for (i, txid) in keys.iter().enumerate().take(5) {
-                    let mixed = t.secret.mix_txid(txid);
-                    ov.insert(&mixed, Fk(1000 + i as u64)).unwrap();
-                }
-                ov.persist().unwrap();
-                assert!(ov.occupied() >= 5);
-            }
-            assert!(
-                !t.overflow.lock().unwrap().is_empty(),
-                "precondition: overflow occupied before swap"
-            );
-
-            let from_bits = t.head_bits();
-            let to_bits = from_bits + 1;
-            t.start_head_resize(crate::address_head::HeadLayout::new(to_bits).unwrap())
-                .unwrap();
-            wait_head_resize_done(&t, Duration::from_secs(15));
-            assert_eq!(t.head_bits(), to_bits);
-            assert!(
-                t.overflow.lock().unwrap().is_empty(),
-                "overflow must clear when old head is swapped out"
-            );
-            // Class A mappings live on the new primary (not overflow).
-            for txid in &keys {
-                assert!(
-                    t.get_fk_by_txid(txid).unwrap().is_some(),
-                    "txid missing after resize+overflow clear"
-                );
-            }
-            // Durable empty overflow survives reopen.
-            drop(t);
-            let t2 = TxTable::open(&dir).unwrap();
-            assert!(t2.overflow.lock().unwrap().is_empty());
-            for txid in &keys {
-                assert!(t2.get_fk_by_txid(txid).unwrap().is_some());
-            }
-            let _ = std::fs::remove_dir_all(&dir);
-        });
-    }
 
     /// After fast head insert (no write-time BIP30 displace), sole lookup must
     /// prefer the **newer** create (deeper on the probe chain).
-    #[test]
-    fn get_fk_by_txid_prefers_newer_bip30_duplicate() {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-tx-bip30-get-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let t = create_tiny(&dir);
-        let txid = [0x55u8; 32];
-        let mk = |fk_hint: u8| {
-            let rec = TxRecord {
-                txid,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            };
-            let inputs = vec![InputRecord {
-                prev_txid: [0u8; 32],
-            create_fk: Fk::NULL,
-                prev_index: u32::MAX,
-                sequence: u32::MAX,
-                script_sig: vec![fk_hint],
-                witness: vec![],
-            }];
-            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
-            (rec, inputs, outputs)
-        };
-        // Two packed bodies, same txid (BIP30-shaped). Distinct script_sig so
-        // bodies differ but body_txid still reads the shared txid prefix.
-        let a = mk(1);
-        let b = mk(2);
-        let fk1 = t.put_full_batch_indexed(&[a], true).unwrap()[0];
-        let fk2 = t.put_full_batch_indexed(&[b], true).unwrap()[0];
-        assert!(fk2.0 > fk1.0);
-        // Probe order: older first, newer deeper (mixed keys).
-        let mixed = t.secret.mix_txid(&txid);
-        let cands = t.head.read().unwrap().probe_fks(&mixed).unwrap();
-        assert_eq!(cands[0], fk1);
-        assert!(cands.contains(&fk2));
-        // Sole resolve prefers newest.
-        assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(fk2));
-        let batch = t.get_fk_by_txid_batch(&[txid]).unwrap();
-        assert_eq!(batch[0].1, Some(fk2));
-        let all = t.get_all_by_txid(&txid).unwrap();
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].0, fk2);
-        assert_eq!(all[1].0, fk1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     /// Blocking RAM resize: full Class A → wider head; post-swap all txids resolve.
-    #[test]
-    fn head_sequential_resize_widens_bits() {
-        with_resize_stress_lock(|| {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-tx-head-resize-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // Tiny head: 2^10 = 1024 slots (explicit layout — no env race).
-        let t = create_bits(&dir, 10);
-        assert_eq!(t.head_bits(), 10);
-        assert_eq!(t.head_entry_bytes(), 4);
-
-        let mk = |i: u64| {
-            let mut txid = [0u8; 32];
-            txid[0..8].copy_from_slice(&i.to_le_bytes());
-            let rec = TxRecord {
-                txid,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            };
-            let inputs = vec![InputRecord {
-                prev_txid: [0u8; 32],
-                create_fk: Fk::NULL,
-                prev_index: u32::MAX,
-                sequence: u32::MAX,
-                script_sig: vec![],
-                witness: vec![],
-            }];
-            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
-            (rec, inputs, outputs)
-        };
-
-        // Seed some bodies + head entries.
-        for i in 1..=50u64 {
-            let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
-        }
-        assert_eq!(t.count(), 50);
-        assert!(!t.head_resize_in_progress());
-
-        // Force widen 10 → 11 (blocking RAM rebuild completes before return).
-        t.start_head_resize(crate::address_head::HeadLayout::new(11).unwrap())
-            .unwrap();
-        assert!(!t.head_resize_in_progress());
-        assert_eq!(t.head_bits(), 11);
-
-        // More creates after swap land on the new primary.
-        for i in 51..=80u64 {
-            let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
-        }
-        assert_eq!(t.count(), 80);
-        for i in 1..=80u64 {
-            let mut txid = [0u8; 32];
-            txid[0..8].copy_from_slice(&i.to_le_bytes());
-            let fk = t.get_fk_by_txid(&txid).unwrap();
-            assert_eq!(fk, Some(Fk(i)), "txid {i} missing after resize");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-        });
-    }
 
     /// Probe-exhaust wait path: park until resize completes (no wall-clock fail).
     ///
     /// Regression for the mainnet 29→30 case where a 30‑minute `MAX_WAIT` killed
     /// the archive pipeline while a healthy bg resize was still ~79% done.
-    #[test]
-    fn archiver_sleeps_until_resize_notifies() {
-        with_resize_stress_lock(|| {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-tx-head-sleep-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let t = create_bits(&dir, 10);
-        let mk = |i: u64| {
-            let mut txid = [0u8; 32];
-            txid[0..8].copy_from_slice(&i.to_le_bytes());
-            let rec = TxRecord {
-                txid,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            };
-            let inputs = vec![InputRecord {
-                prev_txid: [0u8; 32],
-                create_fk: Fk::NULL,
-                prev_index: u32::MAX,
-                sequence: u32::MAX,
-                script_sig: vec![],
-                witness: vec![],
-            }];
-            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
-            (rec, inputs, outputs)
-        };
-        // Seed, then blocking RAM widen. wait_for_head_resize_idle is a no-op when idle.
-        for i in 1..=50u64 {
-            let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
-        }
-        let next_bits = t.head_bits().saturating_add(1);
-        t.start_head_resize(crate::address_head::HeadLayout::new(next_bits).unwrap())
-            .unwrap();
-        assert!(!t.head_resize_in_progress());
-        assert_eq!(t.head_bits(), next_bits);
-        t.wait_for_head_resize_idle(); // must return immediately when idle
-        drop(t);
-        let _ = std::fs::remove_dir_all(&dir);
-        });
-    }
 
-    #[test]
-    fn head_load_trigger_starts_resize() {
-        with_resize_stress_lock(|| {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-tx-head-load-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // 2^8 = 256 slots; trigger at ceil(0.80*256)=205.
-        let t = create_bits(&dir, 8);
-        assert_eq!(t.head_slots(), 256);
-        let mk = |i: u64| {
-            let mut txid = [0u8; 32];
-            txid[0..8].copy_from_slice(&i.to_le_bytes());
-            let rec = TxRecord {
-                txid,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            };
-            let inputs = vec![InputRecord {
-                prev_txid: [0u8; 32],
-                create_fk: Fk::NULL,
-                prev_index: u32::MAX,
-                sequence: u32::MAX,
-                script_sig: vec![],
-                witness: vec![],
-            }];
-            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
-            (rec, inputs, outputs)
-        };
-        for i in 1..=210u64 {
-            let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
-        }
-        // head_insert_many should have started resize; drive fill to completion.
-        t.maybe_start_head_resize().unwrap();
-        if t.head_resize_in_progress() {
-            wait_head_resize_done(&t, Duration::from_secs(10));
-        }
-        assert!(t.head_bits() >= 9, "bits={}", t.head_bits());
-        // Spot-check resolves.
-        for i in [1u64, 100, 210] {
-            let mut txid = [0u8; 32];
-            txid[0..8].copy_from_slice(&i.to_le_bytes());
-            assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)));
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-        });
-    }
 
     /// io_uring shadow fill matches mmap insert_many for a small Class A set.
-    #[test]
-    fn shadow_fill_uring_matches_insert_many() {
-        with_resize_stress_lock(|| {
-        if !crate::bulk_io::io_uring_enabled() {
-            eprintln!("skip: io_uring unavailable");
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-tx-shadow-uring-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let t = create_tiny(&dir);
-        let mk = |i: u64| {
-            let mut txid = [0u8; 32];
-            txid[0..8].copy_from_slice(&i.to_le_bytes());
-            let rec = TxRecord {
-                txid,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            };
-            let inputs = vec![InputRecord {
-                prev_txid: [0u8; 32],
-                create_fk: Fk::NULL,
-                prev_index: u32::MAX,
-                sequence: u32::MAX,
-                script_sig: vec![],
-                witness: vec![],
-            }];
-            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
-            (rec, inputs, outputs)
-        };
-        // > FK_QUEUE_LOW (256) so refill/drain interaction is exercised (regression
-        // for queue-len==256 dead zone that stalled with no in-flight IO).
-        const N: u64 = 400;
-        for i in 1..=N {
-            let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
-        }
-        let layout = crate::address_head::HeadLayout::new(12).unwrap();
-        let shadow_a = dir.join("shadow_a");
-        let shadow_b = dir.join("shadow_b");
-        let ha = AddressHead::create_with_layout(&shadow_a, layout).unwrap();
-        let hb = AddressHead::create_with_layout(&shadow_b, layout).unwrap();
-        // mmap path
-        t.shadow_fill_fk_range_mmap(&ha, 1, N).unwrap();
-        // uring path
-        crate::head_resize_fill::run_shadow_fill_uring(&t.body, &hb, &t.secret, 1, N)
-            .unwrap();
-        assert_eq!(ha.occupied(), hb.occupied(), "occupied mismatch");
-        for i in 1..=N {
-            let mut txid = [0u8; 32];
-            txid[0..8].copy_from_slice(&i.to_le_bytes());
-            let mixed = t.secret.mix_txid(&txid);
-            let ca = ha.probe_fks(&mixed).unwrap();
-            let cb = hb.probe_fks(&mixed).unwrap();
-            assert!(ca.contains(&Fk(i)), "mmap missing {i}");
-            assert!(cb.contains(&Fk(i)), "uring missing {i}");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-        });
-    }
 
     /// Bulk body_txid_range matches serial body_txid (idx batch + bulk pread).
     #[test]
@@ -3939,142 +2340,6 @@ mod tests {
             assert_eq!(tail[j], t.body_txid(Fk(id)).unwrap());
         }
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Resize with a tiny bulk-read batch still fills shadow correctly.
-    #[test]
-    fn head_resize_with_small_read_batch() {
-        with_env_lock(|| {
-        with_resize_stress_lock(|| {
-            let dir = std::env::temp_dir().join(format!(
-                "rbitcoin-tx-head-resize-batch-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            // Force multi-chunk bulk reads inside each poll budget.
-            std::env::set_var("RBITCOIN_TX_HEAD_READ_BATCH", "7");
-            let t = create_bits(&dir, 10);
-            let mk = |i: u64| {
-                let mut txid = [0u8; 32];
-                txid[0..8].copy_from_slice(&i.to_le_bytes());
-                let rec = TxRecord {
-                    txid,
-                    version: 1,
-                    locktime: 0,
-                    input_start_fk: Fk::NULL,
-                    input_count: 1,
-                    output_start_fk: Fk::NULL,
-                    output_count: 1,
-                };
-                let inputs = vec![InputRecord {
-                    prev_txid: [0u8; 32],
-                    create_fk: Fk::NULL,
-                    prev_index: u32::MAX,
-                    sequence: u32::MAX,
-                    script_sig: vec![],
-                    witness: vec![],
-                }];
-                let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
-                (rec, inputs, outputs)
-            };
-            for i in 1..=60u64 {
-                let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
-            }
-            t.start_head_resize(crate::address_head::HeadLayout::new(11).unwrap())
-                .unwrap();
-            wait_head_resize_done(&t, Duration::from_secs(10));
-            assert_eq!(t.head_bits(), 11);
-            for i in 1..=60u64 {
-                let mut txid = [0u8; 32];
-                txid[0..8].copy_from_slice(&i.to_le_bytes());
-                assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)));
-            }
-            drop(t);
-            let _ = std::fs::remove_dir_all(&dir);
-            std::env::remove_var("RBITCOIN_TX_HEAD_READ_BATCH");
-        });
-        });
-    }
-
-    /// Exclusive-lock wait in `try_complete` must abort when `resize_bg_gen`
-    /// advances (Drop / worker respawn) — otherwise `join` hangs forever.
-    #[test]
-    fn head_resize_exclusive_lock_wait_cancels_on_gen_bump() {
-        with_resize_stress_lock(|| {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-tx-head-gen-cancel-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let t = create_bits(&dir, 10);
-        let mk = |i: u64| {
-            let mut txid = [0u8; 32];
-            txid[0..8].copy_from_slice(&i.to_le_bytes());
-            let rec = TxRecord {
-                txid,
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            };
-            let inputs = vec![InputRecord {
-                prev_txid: [0u8; 32],
-                create_fk: Fk::NULL,
-                prev_index: u32::MAX,
-                sequence: u32::MAX,
-                script_sig: vec![],
-                witness: vec![],
-            }];
-            let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
-            (rec, inputs, outputs)
-        };
-        for i in 1..=20u64 {
-            let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
-        }
-
-        // Concurrent head.read holder: RAM resize waits for exclusive write, then
-        // completes once the reader drops.
-        use std::sync::atomic::AtomicBool;
-        let held = AtomicBool::new(false);
-        let release = AtomicBool::new(false);
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                let _guard = t.head.read().unwrap();
-                held.store(true, AtomicOrdering::Release);
-                // Hold briefly so resize hits try_write contention, then release.
-                std::thread::sleep(Duration::from_millis(80));
-                release.store(true, AtomicOrdering::Release);
-                drop(_guard);
-            });
-            while !held.load(AtomicOrdering::Acquire) {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            let t0 = Instant::now();
-            t.start_head_resize(crate::address_head::HeadLayout::new(11).unwrap())
-                .unwrap();
-            assert!(
-                t0.elapsed() < Duration::from_secs(5),
-                "RAM resize hung on exclusive lock for {:?}",
-                t0.elapsed()
-            );
-            assert!(!t.head_resize_in_progress());
-            assert_eq!(t.head_bits(), 11);
-            assert!(release.load(AtomicOrdering::Acquire));
-        });
-
-        drop(t);
-        let _ = std::fs::remove_dir_all(&dir);
-        });
     }
 
     /// Fat packed body: body_txid must match full-record path without needing
@@ -4430,11 +2695,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Operator recovery: delete `tx.head` → open rebuilds from Class A bodies.
+    /// Operator recovery: delete `tx.head.meta` (+ segment files) → open rebuilds.
     #[test]
     fn missing_tx_head_rebuilds_from_bodies_on_open() {
-        // Open recreates via default_layout() (env scale); lock so parallel tests
-        // cannot flip HEAD_SCALE mid-rebuild to mainnet (256 MiB sparse).
         with_env_lock(|| {
             std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
             let dir = std::env::temp_dir().join(format!(
@@ -4477,22 +2740,26 @@ mod tests {
                     let _ = t.put_full_batch_indexed(&[mk(i)], true).unwrap();
                 }
                 assert_eq!(t.count(), 20);
-                // Sanity: head resolves before delete.
                 let mut txid = [0u8; 32];
                 txid[0..8].copy_from_slice(&7u64.to_le_bytes());
                 assert_eq!(t.get_fk_by_txid(&txid).unwrap(), Some(Fk(7)));
                 t.flush().unwrap();
             }
 
-            // Simulate operator: wipe head (layout is in the file footer).
-            let head = dir.join("tx.head");
-            assert!(head.exists());
-            std::fs::remove_file(&head).unwrap();
+            // Wipe segmented head meta + files.
+            assert!(dir.join("tx.head.meta").exists());
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for ent in rd.flatten() {
+                    let s = ent.file_name().to_string_lossy().into_owned();
+                    if s == "tx.head.meta" || s.starts_with("tx.head.") {
+                        let _ = std::fs::remove_file(ent.path());
+                    }
+                }
+            }
 
-            // Reopen must recreate head and rebuild from bodies.
             let t = TxTable::open(&dir).unwrap();
             assert_eq!(t.count(), 20);
-            assert!(dir.join("tx.head").exists());
+            assert!(dir.join("tx.head.meta").exists());
             for i in 1..=20u64 {
                 let mut txid = [0u8; 32];
                 txid[0..8].copy_from_slice(&i.to_le_bytes());
@@ -4524,146 +2791,18 @@ mod tests {
                 let t = create_tiny(&dir);
                 t.flush().unwrap();
             }
-            std::fs::remove_file(dir.join("tx.head")).unwrap();
+            let _ = std::fs::remove_file(dir.join("tx.head.meta"));
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for ent in rd.flatten() {
+                    let s = ent.file_name().to_string_lossy().into_owned();
+                    if s.starts_with("tx.head.") {
+                        let _ = std::fs::remove_file(ent.path());
+                    }
+                }
+            }
             let t = TxTable::open(&dir).unwrap();
             assert_eq!(t.count(), 0);
-            assert!(dir.join("tx.head").exists());
-            let _ = std::fs::remove_dir_all(&dir);
-            std::env::remove_var("RBITCOIN_HEAD_SCALE");
-        });
-    }
-
-    /// On open: incomplete online resize leftovers are abandoned (RAM policy).
-    #[test]
-    fn resume_head_resize_control_and_orphan_shadow() {
-        with_env_lock(|| {
-            std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
-            let dir = std::env::temp_dir().join(format!(
-                "rbitcoin-tx-resume-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            let head_path = dir.join("tx.head");
-            // Seed a few bodies + head.
-            {
-                let t = create_tiny(&dir);
-                let mk = |txid: [u8; 32]| {
-                    (
-                        TxRecord {
-                            txid,
-                            version: 1,
-                            locktime: 0,
-                            input_start_fk: Fk::NULL,
-                            input_count: 1,
-                            output_start_fk: Fk::NULL,
-                            output_count: 1,
-                        },
-                        vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
-                        vec![OutputRecord::unspent(1, vec![0x51])],
-                    )
-                };
-                for i in 0..8u8 {
-                    let mut txid = [0u8; 32];
-                    txid[0] = i;
-                    t.put_full_batch_indexed(&[mk(txid)], true).unwrap();
-                }
-                t.flush().unwrap();
-            }
-
-            // Orphan .new without control → dropped on open.
-            {
-                let orphan = shadow_head_path(&head_path);
-                AddressHead::create_with_layout(&orphan, HeadLayout::new(12).unwrap()).unwrap();
-                assert!(orphan.exists());
-                let t = TxTable::open(&dir).unwrap();
-                assert!(!t.head_resize_in_progress());
-                assert!(!orphan.exists());
-                drop(t);
-            }
-
-            // Control without shadow → abandoned (no online resume).
-            {
-                let target = HeadLayout::new(12).unwrap();
-                write_resize_control(
-                    &head_path,
-                    &ResizeControl {
-                        target,
-                        cursor: 3,
-                        generation: 1,
-                    },
-                )
-                .unwrap();
-                let t = TxTable::open(&dir).unwrap();
-                assert!(!t.head_resize_in_progress());
-                assert!(!read_resize_control(&head_path).unwrap().is_some());
-                drop(t);
-            }
-
-            // Control + existing matching shadow → both dropped on open.
-            {
-                let target = HeadLayout::new(13).unwrap();
-                let shadow = shadow_head_path(&head_path);
-                let _ = std::fs::remove_file(&shadow);
-                AddressHead::create_with_layout(&shadow, target).unwrap();
-                write_resize_control(
-                    &head_path,
-                    &ResizeControl {
-                        target,
-                        cursor: 2,
-                        generation: 2,
-                    },
-                )
-                .unwrap();
-                assert!(shadow.exists());
-                let t = TxTable::open(&dir).unwrap();
-                assert!(!t.head_resize_in_progress());
-                assert!(!shadow.exists());
-                assert!(!read_resize_control(&head_path).unwrap().is_some());
-                drop(t);
-            }
-
-            // Unreadable head with bodies → recreate + rebuild.
-            {
-                // Corrupt footer/magic of head.
-                std::fs::write(&head_path, b"not-a-valid-head-file!!!!!!").unwrap();
-                let t = TxTable::open(&dir).unwrap();
-                assert_eq!(t.count(), 8);
-                // Head rebuilt: lookups work.
-                let mut txid = [0u8; 32];
-                txid[0] = 3;
-                assert!(t.get_by_txid(&txid).unwrap().is_some());
-                drop(t);
-            }
-
-            // ensure_head_resize / start / head_insert_many_sole / snapshot inactive
-            {
-                let fresh = dir.join("fresh");
-                std::fs::create_dir_all(&fresh).unwrap();
-                let t = create_tiny(&fresh);
-                assert!(!t.head_resize_in_progress());
-                let snap = t.head_resize_size_snapshot();
-                assert!(!snap.active);
-                assert_eq!(snap.shadow_bits, 0);
-                t.head_insert_many_sole(&[]).unwrap();
-                // Force start bits+1 (blocking RAM — complete before return)
-                let bits = t.head_bits();
-                if bits < MAX_BITS {
-                    t.start_head_resize(HeadLayout::new(bits + 1).unwrap())
-                        .unwrap();
-                    assert!(!t.head_resize_in_progress());
-                    assert_eq!(t.head_bits(), bits + 1);
-                    // Second start (same width) is no-op
-                    t.start_head_resize(HeadLayout::new(bits + 1).unwrap())
-                        .unwrap();
-                    t.maybe_start_head_resize().unwrap();
-                }
-                drop(t);
-            }
-
+            assert!(dir.join("tx.head.meta").exists());
             let _ = std::fs::remove_dir_all(&dir);
             std::env::remove_var("RBITCOIN_HEAD_SCALE");
         });
@@ -5025,160 +3164,6 @@ mod tests {
     }
 
     /// Production API surface: abs spender meta, get_all, head snapshot, flushes.
-    #[test]
-    fn tx_table_spend_meta_batch_snapshot_and_helpers() {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-tx-surface-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let t = create_tiny(&dir);
-        let mk = |txid: [u8; 32], outs: u32| {
-            let outputs: Vec<_> = (0..outs)
-                .map(|i| OutputRecord::unspent(i as i64 + 1, vec![0x51]))
-                .collect();
-            (
-                TxRecord {
-                    txid,
-                    version: 1,
-                    locktime: 0,
-                    input_start_fk: Fk::NULL,
-                    input_count: 1,
-                    output_start_fk: Fk::NULL,
-                    output_count: outs,
-                },
-                vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
-                outputs,
-            )
-        };
-        let create_fk = t
-            .put_full_batch_indexed(&[mk([1u8; 32], 3)], true)
-            .unwrap()[0];
-        let s1 = t
-            .put_full_batch_indexed(&[mk([2u8; 32], 1)], true)
-            .unwrap()[0];
-        let s2 = t
-            .put_full_batch_indexed(&[mk([3u8; 32], 1)], true)
-            .unwrap()[0];
-
-        t.advise_body_dont_need(0, 0);
-        assert!(t.body_logical_len() > 0);
-        t.reserve_append(256, 2).unwrap();
-        assert_eq!(t.count(), 3);
-
-        // put_batch_indexed without head index (body only bare meta — not used as get)
-        let bare = TxRecord {
-            txid: [9u8; 32],
-            version: 1,
-            locktime: 0,
-            input_start_fk: Fk::NULL,
-            input_count: 0,
-            output_start_fk: Fk::NULL,
-            output_count: 0,
-        };
-        let bare_fks = t.put_batch_indexed(&[bare], false).unwrap();
-        assert_eq!(bare_fks.len(), 1);
-        assert!(t.put_batch(&[]).unwrap().is_empty());
-
-        let (off, len) = t.body_range(create_fk).unwrap();
-        let decoded = t
-            .get_meta_and_outputs_batch_at(&[(off, len)])
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap()
-            .expect("create body");
-        let (_meta, _outs, rels) = decoded;
-        assert_eq!(rels.len(), 3);
-        let abs: Vec<(u64, Fk, u32, Fk)> = rels
-            .iter()
-            .enumerate()
-            .map(|(v, &rel)| (off + u64::from(rel), create_fk, v as u32, s1))
-            .collect();
-        let spenders = crate::spender_table::SpenderTable::create(&dir).unwrap();
-        // First sole spends via abs meta
-        let cold = t.put_spend_batch_by_abs_meta(&spenders, &abs).unwrap();
-        assert!(cold.is_empty());
-        // Idempotent
-        let cold2 = t
-            .put_spend_batch_by_abs_meta(&spenders, &abs[..1])
-            .unwrap();
-        assert!(cold2.is_empty());
-        // Second spender → multi in-place (not cold)
-        let abs2 = [(abs[0].0, create_fk, 0, s2)];
-        let cold3 = t.put_spend_batch_by_abs_meta(&spenders, &abs2).unwrap();
-        assert!(cold3.is_empty(), "multi promote handled in abs path");
-        let (m0, f0) = t.get_output_spender_meta(create_fk, 0).unwrap();
-        assert!(m0, "MULTI set after second spend");
-        assert!(!f0.is_null());
-        // InvalidFk
-        assert!(matches!(
-            t.put_spend_batch_by_abs_meta(&spenders, &[(abs[0].0, create_fk, 0, Fk::NULL)]),
-            Err(StoreError::InvalidFk)
-        ));
-        assert!(t.put_spend_batch_by_abs_meta(&spenders, &[]).unwrap().is_empty());
-        // OOB abs → cold
-        let cold4 = t
-            .put_spend_batch_by_abs_meta(&spenders, &[(u64::MAX - 4, create_fk, 0, s1)])
-            .unwrap();
-        assert_eq!(cold4.len(), 1);
-
-        let metas = t
-            .get_spender_meta_at_abs_batch(&[abs[0].0, abs[1].0, u64::MAX])
-            .unwrap();
-        assert_eq!(metas.len(), 3);
-        assert!(metas[0].is_some());
-        assert!(metas[2].is_none());
-        assert!(t.get_spender_meta_at_abs_batch(&[]).unwrap().is_empty());
-
-        // set/get output spender meta
-        t.set_output_spender_meta(create_fk, 2, false, s1).unwrap();
-        let (m, f) = t.get_output_spender_meta(create_fk, 2).unwrap();
-        assert!(!m);
-        assert_eq!(f, s1);
-        t.set_output_spender_meta_at(off, len, 2, true, s2).unwrap();
-        let (m2, f2) = t.get_output_spender_meta_at(off, len, 2).unwrap();
-        assert!(m2);
-        assert_eq!(f2, s2);
-
-        assert_eq!(t.body_txid(create_fk).unwrap(), [1u8; 32]);
-        assert_eq!(t.body_txid_at(off, len).unwrap(), [1u8; 32]);
-        let all = t.get_all_by_txid(&[1u8; 32]).unwrap();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].0, create_fk);
-
-        let snap = t.head_resize_size_snapshot();
-        assert!(!snap.active || snap.active);
-        assert_eq!(snap.class_a_n, t.count());
-        assert!(t.head_occupied() >= 3);
-        t.head_insert_many_sole(&[]).unwrap();
-        t.head_insert_many(&[]).unwrap();
-        t.maybe_start_head_resize().unwrap();
-
-        t.flush().unwrap();
-        t.flush_async().unwrap();
-        // decode error arms: truncated script/witness on input
-        {
-            let mut bad = vec![0u8]; // flags: no null, no final, has script
-            bad.extend_from_slice(&1u64.to_le_bytes());
-            bad.push(0); // vout 0
-            // no sequence (SEQ_FINAL not set) — short
-            assert!(InputRecord::decode_at(&bad).is_err());
-            // with sequence, truncated script
-            let mut bad2 = vec![input_flags::SEQ_FINAL];
-            bad2.extend_from_slice(&1u64.to_le_bytes());
-            bad2.push(0);
-            bad2.push(5); // compact len 5
-            bad2.extend_from_slice(&[1, 2]); // only 2 bytes
-            assert!(InputRecord::decode_at(&bad2).is_err());
-            assert!(InputRecord::decode_prevout_at(&bad2).is_err());
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     /// Dense encode/decode + error-arm coverage for packed Class A helpers.
     #[test]
@@ -5664,4 +3649,71 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn segmented_head_roll_and_lookup_via_tx_table() {
+        let dir = tempfile_dir("seg-roll");
+        let layout = HeadLayout::with_entry_bytes(10, 4).unwrap(); // max_keys=819
+        let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+        let n = 900u64;
+        let recs: Vec<TxRecord> = (0..n)
+            .map(|i| {
+                let mut txid = [0u8; 32];
+                txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+                TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 0,
+                    output_start_fk: Fk::NULL,
+                    output_count: 0,
+                }
+            })
+            .collect();
+        // insert in chunks
+        for chunk in recs.chunks(100) {
+            t.put_batch(chunk).unwrap();
+        }
+        assert!(t.head_segment_count() >= 2, "segs={}", t.head_segment_count());
+        // lookup first, mid, last
+        for i in [1u64, 400, 819, 820, 900] {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            let fk = t.get_fk_by_txid(&txid).unwrap();
+            assert_eq!(fk, Some(Fk(i)), "i={i}");
+        }
+        // miss (must not collide with LE u64 ids 1..=900)
+        let miss = [0xAAu8; 32];
+        assert_eq!(t.get_fk_by_txid(&miss).unwrap(), None);
+        t.flush().unwrap();
+        let t2 = TxTable::open(&dir).unwrap();
+        for i in [1u64, 500, 900] {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            assert_eq!(t2.get_fk_by_txid(&txid).unwrap(), Some(Fk(i)));
+        }
+        // twice
+        assert_eq!(
+            t2.get_fk_by_txid(&{
+                let mut x = [0u8; 32];
+                x[0..8].copy_from_slice(&1u64.to_le_bytes());
+                x
+            })
+            .unwrap(),
+            Some(Fk(1))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refuse_legacy_mono_head_on_create() {
+        let dir = tempfile_dir("legacy-mono");
+        std::fs::write(dir.join("tx.head"), b"mono").unwrap();
+        let err = TxTable::create(&dir).err().expect("must refuse mono head");
+        let s = format!("{err}");
+        assert!(s.contains("legacy") || s.contains("reindex"), "{s}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
 }

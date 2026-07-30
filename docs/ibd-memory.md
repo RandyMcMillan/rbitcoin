@@ -130,7 +130,7 @@ known retain structures:
 | `body_soft` / `contig` | Soft archive RAM + ContigPark |
 | `residency` | **Sole** pin map: creates/outs vs caps + conf_plans |
 | `conf planq` / `prepq` / `writeq` | Confirm pipeline **queue contents** (batches, blocks, wire MiB, parents) + feed ready/inflight |
-| `txhead` | Primary + **shadow** `tx.head` during online resize (logical body MiB, cursor/n) |
+| `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |
 | `sh` | SH runs / memtable / tip heads |
 
 Grep:

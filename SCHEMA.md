@@ -14,7 +14,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 |---------|--------|-----|
 | Class A body | **Packed** full tx in one `tx.body` record | One IO to reconstruct; no separate input/output tables |
 | Non-coinbase prevout | On-disk **`create_fk:u64` + CompactSize vout** | Smaller than `prev_txid[32]`; archive stamps fk once; wire fills soft `prev_txid` from create body |
-| Txid → create | Keyless **`tx.head`** (address table of dense fks) | No 16 B key material; online sequential resize; body verifies identity |
+| Txid → create | Segmented keyless **`tx.head.*`** (25-bit + fuse8) | Fixed-bits per segment; seal-time binary fuse8; body verifies identity |
 | Spentness | Annotation on **create output** (+ rare multi-list) | No multi-GiB `point.head` open-hash |
 | Electrum index | Thin **create_tx_fk only** (inline ≤2 or geometric slab) | Small index; expand vouts/value/height at query via Class A + Class C |
 | Best-chain commit | Advance **`confirmed[]` last** | Tip is the commit point; strong/height may lead tip after kill |
@@ -28,8 +28,8 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
   store/
     meta                         # store magic + schema version
     header.body / header.head    # Class A headers + hash index
-    tx.body / tx.idx.meta / tx.idx.NNNNNN / tx.head  # Class A + segmented idx + address head
-    tx.head.resize / tx.head.new # online head rebuild (transient)
+    tx.body / tx.idx.meta / tx.idx.NNNNNN           # Class A + segmented idx
+    tx.head.meta / tx.head.NNNNNN [/ .fuse8]        # segmented 25-bit heads + sealed fuse8
     spenders.body                # multi-spender list nodes only
     confirmed.body               # Class C: height → header_fk
     strong_tx.body               # Class C: bitset, bit (tx_fk-1) = strong
@@ -213,38 +213,25 @@ Contiguous assignment required: block membership is an arithmetic range.
 
 ---
 
-## Tx address head (`tx.head`)
+## Tx address head (segmented `tx.head.*`)
 
-Keyless open-address table: **txid → dense create_fk**.
+Keyless open-address tables: **txid → dense create_fk**, one **fixed-bits** head per segment.
 
 | Property | Current |
 |----------|---------|
-| File | Single `tx.head` (not sharded) |
-| Default | **BITS=26**, **4 B** entries → **256 MiB** sparse (`2^26` slots = 2¹⁶ pages × 1024) |
-| Env | `RBITCOIN_TX_HEAD_BITS` in **8..=34**; tiny scale uses BITS=16 |
-| Entry | LE create_fk; **0 = empty**; **no HAS_NEXT** |
-| Entry width | **4 B** for BITS ≤ 32; **8 B** for BITS ≥ 33 (page then 8 KiB) |
-| Meta | Embedded in **trailing footer** (no sidecar): bits, entry_bytes, generation; **version 5** |
-| File layout | Slots at **offset 0** (page-aligned); **32-byte** footer at end (16-byte store magic/HWM + 16-byte layout) |
-| Probe | **Page** from high txid bits; **10-bit** in-page double-hash; one page load (4 KiB @ 4 B); max depth **1024**; first insert depth **>128** starts online resize if not already running |
-| Insert | First empty in-page (or same fk idempotent); second same-txid goes **deeper** in-page |
-| Lookup | Body-verify from **last occupied → first** (newest BIP30-shaped create wins) |
+| Files | `tx.head.meta` + `tx.head.NNNNNN` (+ `tx.head.NNNNNN.fuse8` when sealed) |
+| Default | **BITS=25**, **4 B relative** entries → **128 MiB** per segment (`2^25` slots) |
+| Env | `RBITCOIN_TX_HEAD_BITS` in **8..=34** (tests/tiny); product default 25 |
+| Entry | LE **relative** create id; **0 = empty**; `fk = first_fk + rel − 1` |
+| Capacity | Roll at **`MIN(body soft span ~16 GiB, 80% of head slots)`** — seal + new open (no bits-widen) |
+| Seal filter | **Binary fuse8** (~9 bits/key, no FN, FP ≈ 0.39%) built once on seal; open has **no** filter |
+| Probe | Page-local double-hash (1024 slots/page); one page load (4 KiB @ 4 B) |
+| Lookup | **Open always** → sealed **newest→oldest** (fuse gate) → body-verify candidates |
+| Legacy | Monolithic `tx.head` / `.new` / `.resize` / `.overflow` **refused** — reindex |
 
-**Probe note:** all candidates for a key share one page (single IO). Keyless slots cannot Robin-Hood. Footer layout **≠ v5** (or missing magic) refused on open → recreate + rebuild from Class A.
+**Probe note:** all candidates for a key share one page (single IO). Keyless slots cannot Robin-Hood. Legacy mono-head datadirs must reindex.
 
-### Online sequential resize
-
-Trigger: `txs.count() / slots ≥ 0.80` (or probe exhaust → sleep-retry while resize runs).
-
-1. Create `tx.head.new` at `bits+1` (entry width from policy).
-2. Fill shadow **only** from dense Class A `fk = 1..=count` via `tx.idx` (deterministic order).
-3. Live archive inserts continue on **primary only** (no dual-write).
-4. Catch-up + brief exclusive insert lock → rename swap; control `tx.head.resize` for crash resume.
-
-**Capacity @ 0.80 load (approx):**  
-26→54 M · 27→107 M · 28→215 M · 29→429 M · 30→859 M · 31→1.72 B · 32→3.44 B · 33→6.87 B (8 B) · 34→13.7 B.
-
-**Decision:** start small (28) and resize during IBD rather than one fixed 8 GiB 31-bit cliff; sequential rebuild keeps the archiver hot path free of dual-write.
+**Capacity @ 0.80 load (25-bit):** ≈ **26.8 M creates/segment**, ~29 MiB fuse8 when sealed.
 
 ---
 

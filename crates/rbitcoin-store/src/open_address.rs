@@ -32,7 +32,7 @@ pub fn primary_slot(key: &[u8; 16], slots: u64) -> u64 {
     fnv1a_64(key) & (slots - 1)
 }
 
-/// Primary slot for a 32-byte key (e.g. mixed txid in `tx.head.overflow`).
+/// Primary slot for a 32-byte key (FNV-1a; tests / open-address helpers).
 #[inline]
 #[cfg(test)]
 pub fn primary_slot_32(key: &[u8; 32], slots: usize) -> usize {
@@ -61,8 +61,8 @@ mod tests {
     }
 
     #[test]
-    fn fnv1a_and_primary_slot_32_match_legacy_overflow() {
-        // Same FNV stream as historical head_overflow::primary (32-byte key).
+    fn fnv1a_and_primary_slot_32_match_stream() {
+        // Same FNV stream as other 32-byte open-address helpers.
         let k = [9u8; 32];
         let slots = 64usize;
         let mut h = FNV_OFFSET;

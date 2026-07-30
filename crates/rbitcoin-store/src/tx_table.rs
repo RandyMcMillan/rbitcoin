@@ -2311,27 +2311,6 @@ mod tests {
         }
     }
 
-    /// All page-local head paths agree: insert_many, probe_fks, single resolve,
-    /// batch resolve, BIP30 depth-win, and post-resize lookup.
-
-    /// Overflow accepts depth-exhausted inserts; lookup is overflow-first then primary.
-
-    /// After head swap, `tx.head.overflow` must be empty — it belonged to the
-    /// old primary; the new head already holds Class A mappings from shadow fill.
-
-    /// After fast head insert (no write-time BIP30 displace), sole lookup must
-    /// prefer the **newer** create (deeper on the probe chain).
-
-    /// Blocking RAM resize: full Class A → wider head; post-swap all txids resolve.
-
-    /// Probe-exhaust wait path: park until resize completes (no wall-clock fail).
-    ///
-    /// Regression for the mainnet 29→30 case where a 30‑minute `MAX_WAIT` killed
-    /// the archive pipeline while a healthy bg resize was still ~79% done.
-
-
-    /// io_uring shadow fill matches mmap insert_many for a small Class A set.
-
     /// Bulk body_txid_range matches serial body_txid (idx batch + bulk pread).
     #[test]
     fn body_txid_range_matches_serial() {

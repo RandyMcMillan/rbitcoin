@@ -1082,6 +1082,20 @@ pub(crate) fn spawn_confirm_engine(
                     return;
                 }
 
+                // Live wall for stall watchdog / perf while denserels runs (often multi-s).
+                struct LiveGuard<'a> {
+                    stats: &'a LoopStats,
+                }
+                impl Drop for LiveGuard<'_> {
+                    fn drop(&mut self) {
+                        self.stats.confirm_end();
+                    }
+                }
+                loop_stats.confirm_begin(expect_h, batch.len() as u32);
+                let _live_guard = LiveGuard {
+                    stats: &loop_stats,
+                };
+
                 let mut batch = batch;
                 if let Err(missing) = resolve_batch_wire_from_body_queue(&hub, &mut batch) {
                     static MISS_LOG: AtomicU32 = AtomicU32::new(0);
@@ -1123,15 +1137,18 @@ pub(crate) fn spawn_confirm_engine(
                     &warm_items,
                 ) {
                     Ok(st) => {
-                        if st.work_ns / 1_000_000 > 2_000 {
+                        // Always log stage subtimers when multi-second or large cold set.
+                        let ms = st.work_ns / 1_000_000;
+                        if ms > 500 || st.cold > 5_000 {
                             info!(
-                                "ibd: confirm denserels slow first={expect_h} n={} parents={} cold={} already={} unresolved={} ms={}",
+                                "ibd: confirm denserels first={expect_h} n={} parents={} cold={} already={} unresolved={} ms={} \
+                                 (batch head + OutsDenserels)",
                                 wire_batch.len(),
                                 st.parents,
                                 st.cold,
                                 st.already,
                                 st.unresolved,
-                                st.work_ns / 1_000_000,
+                                ms,
                             );
                         }
                         st.work_ns
@@ -1156,6 +1173,7 @@ pub(crate) fn spawn_confirm_engine(
                         continue;
                     }
                 };
+                drop(_live_guard);
 
                 let n = wire_batch.len();
                 if denserels_tx

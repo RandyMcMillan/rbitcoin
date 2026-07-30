@@ -180,6 +180,16 @@ pub(crate) struct IbdPerfSample {
     pub conf_denserels_q_cap: usize,
     pub conf_load_q_cap: usize,
     pub conf_write_q_cap: usize,
+    // Denserels stage (bq → parent denserels → prep queue)
+    pub denserels_blks: u64,
+    pub denserels_ms: u64,
+    pub denserels_collect_ms: u64,
+    pub denserels_head_ms: u64,
+    pub denserels_cold_io_ms: u64,
+    pub denserels_parents: u64,
+    pub denserels_already: u64,
+    pub denserels_cold: u64,
+    pub denserels_unresolved: u64,
     pub load_hdr_ms: u64,
     pub load_decode_ms: u64,
     pub load_thin_ms: u64,
@@ -363,6 +373,15 @@ impl Default for IbdPerfSample {
             conf_denserels_q_cap: super::confirm::DENSERELS_QUEUE_CAP,
             conf_load_q_cap: super::confirm::LOAD_QUEUE_CAP,
             conf_write_q_cap: super::confirm::WRITE_QUEUE_CAP,
+            denserels_blks: 0,
+            denserels_ms: 0,
+            denserels_collect_ms: 0,
+            denserels_head_ms: 0,
+            denserels_cold_io_ms: 0,
+            denserels_parents: 0,
+            denserels_already: 0,
+            denserels_cold: 0,
+            denserels_unresolved: 0,
             load_hdr_ms: 0,
             load_decode_ms: 0,
             load_thin_ms: 0,
@@ -584,6 +603,7 @@ pub(crate) fn sample(
     // Drain connect prevout counters (not displayed; avoid unbounded growth).
     let _ = rbitcoin_query::connect_prevout_stats::sample_and_reset();
     let pw = rbitcoin_query::confirm_load_stats::sample_and_reset();
+    let dens = rbitcoin_consensus::denserels_stage_stats::sample_and_reset();
     let arch_res = rbitcoin_query::archive_phase_stats::sample_and_reset();
     let head_res = rbitcoin_store::head_resolve_stats::sample_and_reset();
     let pipe = pipe_stats.sample_and_reset();
@@ -703,6 +723,15 @@ pub(crate) fn sample(
         conf_denserels_q_cap: super::confirm::DENSERELS_QUEUE_CAP,
         conf_load_q_cap: super::confirm::LOAD_QUEUE_CAP,
         conf_write_q_cap: super::confirm::WRITE_QUEUE_CAP,
+        denserels_blks: dens.blocks,
+        denserels_ms: ns_ms(dens.total_ns),
+        denserels_collect_ms: ns_ms(dens.collect_ns),
+        denserels_head_ms: ns_ms(dens.head_ns),
+        denserels_cold_io_ms: ns_ms(dens.cold_io_ns),
+        denserels_parents: dens.parents,
+        denserels_already: dens.already,
+        denserels_cold: dens.cold,
+        denserels_unresolved: dens.unresolved,
         load_hdr_ms: ns_ms(pw.header_ns),
         load_decode_ms: ns_ms(pw.body_decode_ns),
         load_thin_ms: ns_ms(pw.thin_ns),
@@ -829,13 +858,30 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.hole,
         s.peers,
     );
-    // Three-stage confirm walls (prep / script / write).
+    // Four-stage confirm walls: denserels → prep → script → write.
     // prep = structure+plan+pin (`load`) + assemble (`connect`).
     let prep_ms = prep_stage_ms(s);
     out.push_str(&format!(
-        " | conf blks={} prep={}ms script={}ms write={}ms",
-        s.phase_blks, prep_ms, s.script_ms, write_ms,
+        " | conf blks={} denserels={}ms prep={}ms script={}ms write={}ms",
+        s.phase_blks.max(s.denserels_blks),
+        s.denserels_ms,
+        prep_ms,
+        s.script_ms,
+        write_ms,
     ));
+    if s.denserels_blks > 0 || s.denserels_ms > 0 {
+        out.push_str(&format!(
+            " denserels_sub(blks={} parents={} already={} cold={} unres={} collect={}ms head={}ms cold_io={}ms)",
+            s.denserels_blks,
+            s.denserels_parents,
+            s.denserels_already,
+            s.denserels_cold,
+            s.denserels_unresolved,
+            s.denserels_collect_ms,
+            s.denserels_head_ms,
+            s.denserels_cold_io_ms,
+        ));
+    }
     append_nz(&mut out, "recon_ms", s.recon_ms);
     append_nz(&mut out, "wire_ms", s.wire_ms);
     append_nz(&mut out, "resolve_ms", s.resolve_ms);

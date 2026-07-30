@@ -631,6 +631,9 @@ pub struct DenserelsWarmStats {
 /// **Denserels stage:** resolve spent parent create fks from wire prev_txid and
 /// load denserels into CreateResidency once (OutsDenserels).
 ///
+/// Head resolve is **batched** ([`Store::get_fk_by_txid_batch`]) — never
+/// per-input `get_fk_by_txid` (that pegged mid-mainnet at ~5+ min / 32 blocks).
+///
 /// Does not plan Class A or assemble. Prep must follow with
 /// [`ColdPinMode::Forbid`] so this is the sole cold denserels path for wire IBD.
 pub fn warm_parent_denserels_for_wire(
@@ -647,8 +650,11 @@ pub fn warm_parent_denserels_for_wire(
         return Ok(st);
     }
 
-    // create_fk id → need vouts
+    // Pass 1: collect prev_txid → need vouts; residency-hit fks immediately.
+    // Head-miss txids go to a batch resolve (not N× single head probes).
     let mut parent_vouts: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut need_head: HashMap<[u8; 32], Vec<u32>> = HashMap::new();
+    let t_collect = Instant::now();
     for (_h, block) in blocks {
         for tx in &block.txdata {
             for inp in &tx.input {
@@ -657,26 +663,46 @@ pub fn warm_parent_denserels_for_wire(
                 }
                 let prev_txid = inp.previous_output.txid.to_byte_array();
                 let vout = inp.previous_output.vout;
-                let cfk = query
-                    .create_residency()
-                    .lookup_fk_by_txid(&prev_txid)
-                    .or_else(|| {
-                        query
-                            .store()
-                            .get_fk_by_txid(&prev_txid)
-                            .ok()
-                            .flatten()
-                    });
-                if let Some(fk) = cfk {
+                if let Some(fk) = query.create_residency().lookup_fk_by_txid(&prev_txid) {
                     if let Some(pid) = fk.get() {
                         parent_vouts.entry(pid).or_default().push(vout);
                         continue;
                     }
                 }
-                st.unresolved = st.unresolved.saturating_add(1);
+                need_head.entry(prev_txid).or_default().push(vout);
             }
         }
     }
+    let collect_ns = t_collect.elapsed().as_nanos() as u64;
+
+    // Pass 2: one batch head resolve for residency misses.
+    let t_head = Instant::now();
+    if !need_head.is_empty() {
+        let txids: Vec<[u8; 32]> = need_head.keys().copied().collect();
+        let resolved = query
+            .store()
+            .get_fk_by_txid_batch(&txids)
+            .map_err(ConsensusError::Store)?;
+        for (txid, fk_opt) in resolved {
+            let Some(vouts) = need_head.remove(&txid) else {
+                continue;
+            };
+            if let Some(fk) = fk_opt {
+                if let Some(pid) = fk.get() {
+                    parent_vouts.entry(pid).or_default().extend(vouts);
+                    continue;
+                }
+            }
+            // Still unresolved: same-batch / not yet in Class A — plan offline denserels.
+            st.unresolved = st.unresolved.saturating_add(vouts.len() as u32);
+        }
+        // Any leftovers (should be empty if batch returns all keys).
+        for (_txid, vouts) in need_head {
+            st.unresolved = st.unresolved.saturating_add(vouts.len() as u32);
+        }
+    }
+    let head_ns = t_head.elapsed().as_nanos() as u64;
+
     for vouts in parent_vouts.values_mut() {
         vouts.sort_unstable();
         vouts.dedup();
@@ -701,6 +727,7 @@ pub fn warm_parent_denserels_for_wire(
     cold_fks.dedup();
     st.cold = cold_fks.len() as u32;
 
+    let mut cold_io_ns = 0u64;
     if !cold_fks.is_empty() {
         let t_io = Instant::now();
         let loaded = rbitcoin_query::load_creates_once(
@@ -710,29 +737,29 @@ pub fn warm_parent_denserels_for_wire(
             IdxBodyMode::OutsDenserels,
         )
         .map_err(ConsensusError::Store)?;
-        let io_ns = t_io.elapsed().as_nanos() as u64;
-        if io_ns > 0 {
-            confirm_load_stats::COLD_IO_NS.fetch_add(io_ns, Ordering::Relaxed);
-            confirm_load_stats::PIN_NEW_META_NS.fetch_add(io_ns, Ordering::Relaxed);
+        cold_io_ns = t_io.elapsed().as_nanos() as u64;
+        if cold_io_ns > 0 {
+            confirm_load_stats::COLD_IO_NS.fetch_add(cold_io_ns, Ordering::Relaxed);
+            confirm_load_stats::PIN_NEW_META_NS.fetch_add(cold_io_ns, Ordering::Relaxed);
         }
         confirm_load_stats::BODY_TX_READS.fetch_add(loaded.len() as u64, Ordering::Relaxed);
         confirm_load_stats::FULL_TX_READS.fetch_add(loaded.len() as u64, Ordering::Relaxed);
         confirm_load_stats::PIN_NEW.fetch_add(loaded.len() as u64, Ordering::Relaxed);
-        // load_creates_once seeds residency; verify each cold parent is pin-ready.
-        for fk in &cold_fks {
-            let need = parent_vouts
-                .get(&fk.get().unwrap_or(0))
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-            if query.create_residency().get_parent_needed(*fk, need).is_none() {
-                // Soft: parent body missing / corrupt — prep will surface invariant.
-                // Do not hard-fail stage so body missing can re-getdata.
-                continue;
-            }
-        }
     }
 
     st.work_ns = t0.elapsed().as_nanos() as u64;
+    // Stage atomics for IBD perf (denserels wall + sub-phases).
+    denserels_stage_stats::note(
+        blocks.len() as u64,
+        st.parents as u64,
+        st.already as u64,
+        st.cold as u64,
+        st.unresolved as u64,
+        st.work_ns,
+        collect_ns,
+        head_ns,
+        cold_io_ns,
+    );
     if st.work_ns > 0 {
         confirm_load_stats::PARENT_PIN_NS.fetch_add(st.work_ns, Ordering::Relaxed);
         confirm_load_stats::NS.fetch_add(st.work_ns, Ordering::Relaxed);
@@ -745,6 +772,88 @@ pub fn warm_parent_denserels_for_wire(
         confirm_load_stats::PIN_CACHE_BODY.fetch_add(st.already as u64, Ordering::Relaxed);
     }
     Ok(st)
+}
+
+/// Accumulators for the denserels pipeline stage (sampled by IBD perf_log).
+pub mod denserels_stage_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
+    pub static PARENTS: AtomicU64 = AtomicU64::new(0);
+    pub static ALREADY: AtomicU64 = AtomicU64::new(0);
+    pub static COLD: AtomicU64 = AtomicU64::new(0);
+    pub static UNRESOLVED: AtomicU64 = AtomicU64::new(0);
+    pub static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static COLLECT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static HEAD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static COLD_IO_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn note(
+        blocks: u64,
+        parents: u64,
+        already: u64,
+        cold: u64,
+        unresolved: u64,
+        total_ns: u64,
+        collect_ns: u64,
+        head_ns: u64,
+        cold_io_ns: u64,
+    ) {
+        if blocks > 0 {
+            BLOCKS.fetch_add(blocks, Ordering::Relaxed);
+        }
+        if parents > 0 {
+            PARENTS.fetch_add(parents, Ordering::Relaxed);
+        }
+        if already > 0 {
+            ALREADY.fetch_add(already, Ordering::Relaxed);
+        }
+        if cold > 0 {
+            COLD.fetch_add(cold, Ordering::Relaxed);
+        }
+        if unresolved > 0 {
+            UNRESOLVED.fetch_add(unresolved, Ordering::Relaxed);
+        }
+        if total_ns > 0 {
+            TOTAL_NS.fetch_add(total_ns, Ordering::Relaxed);
+        }
+        if collect_ns > 0 {
+            COLLECT_NS.fetch_add(collect_ns, Ordering::Relaxed);
+        }
+        if head_ns > 0 {
+            HEAD_NS.fetch_add(head_ns, Ordering::Relaxed);
+        }
+        if cold_io_ns > 0 {
+            COLD_IO_NS.fetch_add(cold_io_ns, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct Sample {
+        pub blocks: u64,
+        pub parents: u64,
+        pub already: u64,
+        pub cold: u64,
+        pub unresolved: u64,
+        pub total_ns: u64,
+        pub collect_ns: u64,
+        pub head_ns: u64,
+        pub cold_io_ns: u64,
+    }
+
+    pub fn sample_and_reset() -> Sample {
+        Sample {
+            blocks: BLOCKS.swap(0, Ordering::Relaxed),
+            parents: PARENTS.swap(0, Ordering::Relaxed),
+            already: ALREADY.swap(0, Ordering::Relaxed),
+            cold: COLD.swap(0, Ordering::Relaxed),
+            unresolved: UNRESOLVED.swap(0, Ordering::Relaxed),
+            total_ns: TOTAL_NS.swap(0, Ordering::Relaxed),
+            collect_ns: COLLECT_NS.swap(0, Ordering::Relaxed),
+            head_ns: HEAD_NS.swap(0, Ordering::Relaxed),
+            cold_io_ns: COLD_IO_NS.swap(0, Ordering::Relaxed),
+        }
+    }
 }
 
 /// Pin parents for wire prep: **only spent parents** (sparse outs).

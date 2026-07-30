@@ -145,6 +145,15 @@ pub mod confirm_phase_stats {
     pub static CLASS_A_NS: AtomicU64 = AtomicU64::new(0);
     /// Write-stage denserels/abs ensure after Class A (fill planned + ensure spends).
     pub static ENSURE_LAYOUT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Ensure path: creates filled from residency / pin layout (no Class A body IO).
+    pub static ENSURE_RES_HIT: AtomicU64 = AtomicU64::new(0);
+    /// Ensure path: cold denserels body loads.
+    pub static ENSURE_COLD_N: AtomicU64 = AtomicU64::new(0);
+    /// Assemble subtimers (ns; inside CONNECT_NS).
+    pub static ASM_PREVOUT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ASM_SIGOP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ASM_FINAL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ASM_JOB_NS: AtomicU64 = AtomicU64::new(0);
     /// Post–Class C durable spend annotation batch.
     ///
     /// Historical name `UTXO_APPLY_NS` / log field `spend=` ms — this is **not** a
@@ -255,6 +264,26 @@ pub mod confirm_phase_stats {
         (
             CLASS_A_NS.swap(0, Ordering::Relaxed),
             ENSURE_LAYOUT_NS.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    /// `(ensure_res_hit, ensure_cold_n)` for write ensure mix.
+    #[inline]
+    pub fn sample_ensure_mix_and_reset() -> (u64, u64) {
+        (
+            ENSURE_RES_HIT.swap(0, Ordering::Relaxed),
+            ENSURE_COLD_N.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    /// Assemble subtimers (ns): `(prevout, sigop, finality, job_build)`.
+    #[inline]
+    pub fn sample_assemble_and_reset() -> (u64, u64, u64, u64) {
+        (
+            ASM_PREVOUT_NS.swap(0, Ordering::Relaxed),
+            ASM_SIGOP_NS.swap(0, Ordering::Relaxed),
+            ASM_FINAL_NS.swap(0, Ordering::Relaxed),
+            ASM_JOB_NS.swap(0, Ordering::Relaxed),
         )
     }
 
@@ -659,6 +688,10 @@ mod coverage_tests {
         assert_eq!(s.1, 7);
         let (ca, en) = sample_class_a_ensure_and_reset();
         assert_eq!((ca, en), (9, 11));
+        // Drain prep residual (other tests may have accrued), then set known values.
+        let _ = sample_prep_residual_and_reset();
+        let _ = sample_assemble_and_reset();
+        let _ = sample_ensure_mix_and_reset();
         PREP_WIRE_ARC_NS.store(3, Ordering::Relaxed);
         PREP_STRUCT_NS.store(4, Ordering::Relaxed);
         PREP_HEADER_NS.store(5, Ordering::Relaxed);
@@ -668,11 +701,21 @@ mod coverage_tests {
             sample_prep_residual_and_reset(),
             (3, 4, 5, 6, 7)
         );
+        ASM_PREVOUT_NS.store(10, Ordering::Relaxed);
+        ASM_SIGOP_NS.store(20, Ordering::Relaxed);
+        ASM_FINAL_NS.store(30, Ordering::Relaxed);
+        ASM_JOB_NS.store(40, Ordering::Relaxed);
+        assert_eq!(sample_assemble_and_reset(), (10, 20, 30, 40));
+        ENSURE_RES_HIT.store(8, Ordering::Relaxed);
+        ENSURE_COLD_N.store(9, Ordering::Relaxed);
+        assert_eq!(sample_ensure_mix_and_reset(), (8, 9));
         // second sample zeros
         let s2 = sample_and_reset();
         assert_eq!(s2.0, 0);
         assert_eq!(sample_class_a_ensure_and_reset(), (0, 0));
         assert_eq!(sample_prep_residual_and_reset(), (0, 0, 0, 0, 0));
+        assert_eq!(sample_assemble_and_reset(), (0, 0, 0, 0));
+        assert_eq!(sample_ensure_mix_and_reset(), (0, 0));
     }
 
     #[test]

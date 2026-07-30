@@ -1130,7 +1130,7 @@ fn fill_planned_create_layout_after_commit(
     if planned_fks.is_empty() || packed.is_empty() {
         return Ok(());
     }
-    // Only parents actually pinned for spends and still missing layout.
+    // Only parents actually pinned for spends and still missing abs layout.
     let missing: std::collections::HashSet<u64> = batch_parents
         .fks_missing_layout()
         .into_iter()
@@ -1162,10 +1162,13 @@ fn fill_planned_create_layout_after_commit(
         let Some((off, len)) = range else {
             continue;
         };
+        // Prep already attached sparse denserels: only body_range was missing.
+        batch_parents.set_body_range_only(fk, (off, len));
+        if batch_parents.has_abs_layout(fk) {
+            continue;
+        }
+        // No denserels on pin yet — offline pack once (same packing as disk).
         let (tx, ins, outs) = &packed[pi];
-        // If pin already has denserels, only attach body_range via empty denserels
-        // path that set_layout rebuilds from dense — recompute offline only when
-        // spender_rels empty (cheap relative to full-batch re-encode of all creates).
         let mut raw = Vec::new();
         rbitcoin_store::encode_packed_tx_with_secret(tx, ins, outs, &mut raw, Some(secret));
         let Ok((_meta, _outs, dense_rels)) =
@@ -1225,22 +1228,47 @@ fn ensure_spend_abs_layouts(
 
     // 1) Residency denserels + body_range (commit seed / prior cold pin) — no body IO.
     let mut still: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut ensure_res = 0u64;
     for (id, need_v) in &need {
         let fk = rbitcoin_primitives::Fk(*id);
+        // Pin already complete for this create — skip.
+        if batch_parents.has_abs_layout(fk)
+            && need_v
+                .iter()
+                .all(|&v| batch_parents.get_spender_abs(fk, v).is_some())
+        {
+            ensure_res = ensure_res.saturating_add(1);
+            continue;
+        }
+        // Range-only gap: pin has denserels, residency has range (or pin range later).
+        if batch_parents.contains(fk) {
+            if let Some(range) = query
+                .create_residency()
+                .body_ranges_by_fk(&[fk])
+                .into_iter()
+                .next()
+                .flatten()
+                .or_else(|| batch_parents.get_body_range(fk))
+            {
+                batch_parents.set_body_range_only(fk, range);
+                if batch_parents.has_abs_layout(fk)
+                    && (need_v.is_empty()
+                        || need_v
+                            .iter()
+                            .all(|&v| batch_parents.get_spender_abs(fk, v).is_some()))
+                {
+                    ensure_res = ensure_res.saturating_add(1);
+                    continue;
+                }
+            }
+        }
         if let Some((tx, live, sparse, body_range)) =
             query.create_residency().get_parent_needed(fk, need_v)
         {
             if let Some(range) = body_range {
                 if batch_parents.contains(fk) {
-                    if let Some((_t, _o, dense, br)) = query.create_residency().get_outs(fk) {
-                        let br = br.unwrap_or(range);
-                        batch_parents.set_layout_for_need(fk, br, &dense, need_v);
-                    } else {
-                        // Sparse already covers need_v; set body_range via denserels
-                        // rebuilt from get_outs miss — fall through to cold.
-                        still.insert(*id, need_v.clone());
-                        continue;
-                    }
+                    // One residency probe: sparse denserels already in hand.
+                    batch_parents.set_layout_sparse(fk, range, sparse, need_v);
                 } else {
                     let cb = if tx.input_count != 1 {
                         Some(false)
@@ -1257,27 +1285,23 @@ fn ensure_spend_abs_layouts(
                         sparse,
                     );
                 }
-                continue;
-            }
-        }
-        // Partial: pin has denserels but no body_range — try residency range only.
-        if batch_parents.contains(fk) {
-            if let Some((_t, _o, dense, Some(range))) = query.create_residency().get_outs(fk) {
-                batch_parents.set_layout_for_need(fk, range, &dense, need_v);
+                ensure_res = ensure_res.saturating_add(1);
                 continue;
             }
         }
         still.insert(*id, need_v.clone());
     }
+    confirm_phase_stats::ENSURE_RES_HIT.fetch_add(ensure_res, Ordering::Relaxed);
     if still.is_empty() {
         return Ok(());
     }
 
-    // 2) Cold denserels body for remainder only.
+    // 2) Cold denserels body for remainder only (must not re-load pin hits).
     let fks: Vec<rbitcoin_primitives::Fk> = still
         .keys()
         .map(|id| rbitcoin_primitives::Fk(*id))
         .collect();
+    confirm_phase_stats::ENSURE_COLD_N.fetch_add(fks.len() as u64, Ordering::Relaxed);
     let loaded = rbitcoin_query::load_creates_once(
         query.store(),
         query.create_residency(),
@@ -1292,6 +1316,7 @@ fn ensure_spend_abs_layouts(
         let (tx, outs, dense_rels) = if let Some(dec) = c.decoded_outs {
             dec
         } else {
+            // load_creates_once OutsDenserels should always fill decoded_outs.
             match rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
                 &c.raw,
                 Some(secret),

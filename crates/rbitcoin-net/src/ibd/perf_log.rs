@@ -79,6 +79,14 @@ pub(crate) struct IbdPerfSample {
     pub class_a_ms: u64,
     /// Write-stage denserels/abs ensure (fill planned + ensure spends).
     pub ensure_ms: u64,
+    /// Ensure mix: residency/pin hits vs cold denserels body loads.
+    pub ensure_res_hit: u64,
+    pub ensure_cold_n: u64,
+    /// Assemble subtimers (ms; sum ≈ connect/assemble).
+    pub asm_prevout_ms: u64,
+    pub asm_sigop_ms: u64,
+    pub asm_final_ms: u64,
+    pub asm_job_ms: u64,
     pub strong_ms: u64,
     pub sh_ms: u64,
     /// Post–Class C durable spend annotate wall (logged as `spend=` ms).
@@ -274,6 +282,12 @@ impl Default for IbdPerfSample {
             class_c_ms: 0,
             class_a_ms: 0,
             ensure_ms: 0,
+            ensure_res_hit: 0,
+            ensure_cold_n: 0,
+            asm_prevout_ms: 0,
+            asm_sigop_ms: 0,
+            asm_final_ms: 0,
+            asm_job_ms: 0,
             strong_ms: 0,
             sh_ms: 0,
             utxo_ms: 0,
@@ -552,6 +566,10 @@ pub(crate) fn sample(
     ) = rbitcoin_consensus::confirm_phase_stats::sample_and_reset();
     let (class_a_ns, ensure_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_class_a_ensure_and_reset();
+    let (ensure_res_hit, ensure_cold_n) =
+        rbitcoin_consensus::confirm_phase_stats::sample_ensure_mix_and_reset();
+    let (asm_prevout_ns, asm_sigop_ns, asm_final_ns, asm_job_ns) =
+        rbitcoin_consensus::confirm_phase_stats::sample_assemble_and_reset();
     let (prep_wire_arc_ns, prep_struct_ns, prep_header_ns, prep_prepare_ns, prep_filter_plan_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_prep_residual_and_reset();
     let (sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head) =
@@ -601,6 +619,12 @@ pub(crate) fn sample(
         class_c_ms: ns_ms(class_c_ns),
         class_a_ms: ns_ms(class_a_ns),
         ensure_ms: ns_ms(ensure_ns),
+        ensure_res_hit,
+        ensure_cold_n,
+        asm_prevout_ms: ns_ms(asm_prevout_ns),
+        asm_sigop_ms: ns_ms(asm_sigop_ns),
+        asm_final_ms: ns_ms(asm_final_ns),
+        asm_job_ms: ns_ms(asm_job_ns),
         strong_ms: ns_ms(strong_ns),
         sh_ms: ns_ms(sh_ns),
         utxo_ms: ns_ms(utxo_apply_ns),
@@ -847,7 +871,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     let pre_assemble = s.load_ms;
     out.push_str(&format!(
         " | prep blks={} total={}ms pre_asm={}ms(wire_arc={}ms struct={}ms header={}ms prepare={}ms \
-         filter_plan={}ms plan_mega={}ms pin={}ms) assemble={}ms \
+         filter_plan={}ms plan_mega={}ms pin={}ms) assemble={}ms(prevout={} sigop={} final={} job={}) \
          pin(plan={}ms res={}ms cold_io={}ms cold_dec={}ms) \
          pin_hit%={} denserels_hit%={} pin_plan={} pin_res={} pin_new={} body_io={} parent_io={}",
         s.load_blocks,
@@ -861,6 +885,10 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         plan_mega,
         s.load_parent_pin_ms,
         s.connect_ms,
+        s.asm_prevout_ms,
+        s.asm_sigop_ms,
+        s.asm_final_ms,
+        s.asm_job_ms,
         plan_pin_ms,
         res_ms,
         cold_io_ms,
@@ -888,10 +916,12 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
 
     // Write stage detail: Class A + ensure + structural + Class C / SH / spend / tip GC.
     out.push_str(&format!(
-        " | write class_a={}ms ensure={}ms struct={}ms(spent={} create_h={} bip68={}) \
+        " | write class_a={}ms ensure={}ms(res={} cold={}) struct={}ms(spent={} create_h={} bip68={}) \
          class_c={}ms sh={}ms spend={}ms tip_gc={}ms",
         s.class_a_ms,
         s.ensure_ms,
+        s.ensure_res_hit,
+        s.ensure_cold_n,
         s.structural_ms,
         s.structural_spent_ms,
         s.structural_create_h_ms,

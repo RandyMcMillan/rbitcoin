@@ -173,6 +173,66 @@ impl BatchParents {
         e.spender_rels = sparse_spender_rels(dense_rels, &need);
     }
 
+    /// Attach body_range only (pin already has sparse denserels from prep).
+    ///
+    /// Avoids re-encoding denserels on write for prep-ahead parents once Class A
+    /// commit publishes ranges.
+    pub fn set_body_range_only(&mut self, fk: Fk, body_range: (u64, u64)) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        if let Some(e) = self.by_fk.get_mut(&id) {
+            e.body_range = Some(body_range);
+        }
+    }
+
+    /// Set layout from precomputed sparse denserels (one residency probe, no dense re-walk).
+    pub fn set_layout_sparse(
+        &mut self,
+        fk: Fk,
+        body_range: (u64, u64),
+        sparse_rels: Vec<(u32, u32)>,
+        extra_need: &[u32],
+    ) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        let Some(e) = self.by_fk.get_mut(&id) else {
+            return;
+        };
+        e.body_range = Some(body_range);
+        if !extra_need.is_empty() {
+            let mut need = e.checked.clone();
+            need.extend_from_slice(extra_need);
+            need.sort_unstable();
+            need.dedup();
+            e.checked = need;
+        }
+        if e.spender_rels.is_empty() {
+            e.spender_rels = sparse_rels;
+        } else if !sparse_rels.is_empty() {
+            // Merge by vout (prefer new rel when present).
+            let mut m: HashMap<u32, u32> = e.spender_rels.iter().copied().collect();
+            for (v, r) in sparse_rels {
+                m.insert(v, r);
+            }
+            let mut merged: Vec<(u32, u32)> = m.into_iter().collect();
+            merged.sort_unstable_by_key(|(v, _)| *v);
+            e.spender_rels = merged;
+        }
+    }
+
+    /// True when body_range and at least one spender_rel are present.
+    #[inline]
+    pub fn has_abs_layout(&self, fk: Fk) -> bool {
+        let Some(id) = fk.get() else {
+            return false;
+        };
+        self.by_fk
+            .get(&id)
+            .is_some_and(|e| e.body_range.is_some() && !e.spender_rels.is_empty())
+    }
+
     /// Create fks pinned without body_range / spender rels (prep-ahead in-flight parents).
     ///
     /// Write fills these after prior pipeline batches have committed Class A so
@@ -356,8 +416,27 @@ mod tests {
         assert_eq!(bp.get_spender_abs(Fk(9), 2), Some(1090));
         assert_eq!(bp.get_body_range(Fk(9)), Some((1000, 200)));
         assert_eq!(bp.get_parent_coinbase(Fk(9)), Some(true));
+        assert!(bp.has_abs_layout(Fk(9)));
         let (_, o) = bp.get_parent_out(Fk(9), 0).unwrap();
         assert_eq!(o.value, 42);
+    }
+
+    #[test]
+    fn set_body_range_only_completes_layout_when_rels_present() {
+        let mut bp = BatchParents::with_capacity(1);
+        bp.insert_owned(
+            Fk(3),
+            tx(3),
+            vec![(0, out(1))],
+            vec![0],
+            None,
+            None,
+            vec![(0, 40)],
+        );
+        assert!(!bp.has_abs_layout(Fk(3)));
+        bp.set_body_range_only(Fk(3), (500, 80));
+        assert!(bp.has_abs_layout(Fk(3)));
+        assert_eq!(bp.get_spender_abs(Fk(3), 0), Some(540));
     }
 
     #[test]

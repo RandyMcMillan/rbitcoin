@@ -304,10 +304,22 @@ impl Query {
         if !need_head.is_empty() {
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
             let hits = self.store.get_fk_by_txid_batch(&need_head)?;
+            // Seed residency with fk+range for head hits so confirm pin cold denserels
+            // can skip idx (range-only rows survive out-cap slim).
+            let mut head_pairs: Vec<([u8; 32], Fk)> = Vec::with_capacity(hits.len() / 2);
             for (txid, fk_opt) in hits {
                 if let Some(fk) = fk_opt {
                     resolved.insert(txid, fk);
                     head_hit_n = head_hit_n.saturating_add(1);
+                    head_pairs.push((txid, fk));
+                }
+            }
+            if !head_pairs.is_empty() {
+                let fks: Vec<Fk> = head_pairs.iter().map(|(_, f)| *f).collect();
+                let ranges = self.store.tx_body_range_batch(&fks)?;
+                for ((txid, fk), range) in head_pairs.into_iter().zip(ranges.into_iter()) {
+                    self.create_residency
+                        .insert_fk_txid_range(fk, txid, range);
                 }
             }
         }
@@ -808,8 +820,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Residency seed must only receive this batch's creates — not parents
-    /// resolved via durable `tx.head` (regression: head hits used to FIFO-pollute).
+    /// Commit denserels seed is for this batch's creates only.
+    /// Head-resolved parents may get **range-only** residency (cold denserels idx skip)
+    /// but must not receive denserels until pin/ensure loads them.
     #[test]
     fn residency_publish_creates_only_not_head_resolved_parents() {
         use std::collections::HashMap;
@@ -857,13 +870,21 @@ mod tests {
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
         assert_eq!(plan.batch_creates.len(), 1);
         assert_eq!(plan.batch_creates[0].0, child_txid);
+        // Plan head path seeds range-only for the parent (helps pin cold denserels).
+        assert_eq!(
+            q.create_residency().lookup_fk_by_txid(&parent_txid),
+            Some(Fk(1))
+        );
+        assert!(
+            q.create_residency().get_outs(Fk(1)).is_none(),
+            "head path must not denserels-seed parents"
+        );
+        assert!(
+            q.create_residency().body_ranges_by_fk(&[Fk(1)])[0].is_some(),
+            "head path should cache body_range for parent"
+        );
 
         q.archive_commit_plan(plan).unwrap();
-        assert_eq!(
-            q.create_residency().len(),
-            1,
-            "residency must hold only the new create"
-        );
         assert_eq!(
             q.create_residency().lookup_fk_by_txid(&child_txid),
             Some(Fk(2))
@@ -873,10 +894,7 @@ mod tests {
             "commit must seed denserels into residency for pin hits"
         );
         assert!(
-            q.create_residency()
-                .lookup_fk_by_txid(&parent_txid)
-                .is_none()
-                || q.create_residency().get_outs(Fk(1)).is_none(),
+            q.create_residency().get_outs(Fk(1)).is_none(),
             "head-resolved parent must not be denserels-published as a new create"
         );
 

@@ -731,15 +731,22 @@ fn assemble_block_prevouts_mode(
         Option<u32>,
     > = std::collections::HashMap::with_capacity(64);
 
+    use crate::confirm_phase_stats;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
     // Spent checks: pending_spent (this run) + durable confirmed-strong annotations.
     for (ti, tx) in block.txdata.iter().enumerate() {
         let spend_fk = archived_tx_fks.map(|fks| fks[ti]);
-        // Txid only — prefer residency / Class A meta (no full body re-decode).
+        // Txid only — residency or body_txid (never full Class A decode).
         let archived_txid: Option<[u8; 32]> = if let Some(fk) = spend_fk {
-            query
-                .create_residency()
-                .get_txid(fk)
-                .or_else(|| query.get_tx_class_a(fk).ok().map(|r| r.txid))
+            query.create_residency().get_txid(fk).or_else(|| {
+                query
+                    .store()
+                    .txs
+                    .body_txid(fk)
+                    .ok()
+            })
         } else {
             None
         };
@@ -759,6 +766,7 @@ fn assemble_block_prevouts_mode(
             // Thin create_fk edges from this confirm batch (batch-local).
             let thin = spend_fk.and_then(|fk| fk.get().and_then(|id| batch_thin.get(&id)));
 
+            let t_prev = Instant::now();
             for (ii, input) in tx.input.iter().enumerate() {
                 let op = input.previous_output;
                 if !block_spends.insert(op) {
@@ -847,7 +855,10 @@ fn assemble_block_prevouts_mode(
                 }
                 prevouts.push(prev_out.txout);
             }
+            confirm_phase_stats::ASM_PREVOUT_NS
+                .fetch_add(t_prev.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+            let t_sig = Instant::now();
             block_sigops_cost = block_sigops_cost.saturating_add(tx_sigop_cost(
                 tx,
                 &prevouts,
@@ -856,8 +867,11 @@ fn assemble_block_prevouts_mode(
             if block_sigops_cost > MAX_BLOCK_SIGOPS_COST {
                 return Err(ConsensusError::BadBlock("bad-blk-sigops"));
             }
+            confirm_phase_stats::ASM_SIGOP_NS
+                .fetch_add(t_sig.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
             // BIP113 absolute finality (prev-block MTP only — cheap; stays on load).
+            let t_fin = Instant::now();
             let lock_time_cutoff = if ctx.params.csv_active_at(ctx.height.0) {
                 if ctx.height.0 == 0 {
                     block.header.time
@@ -897,6 +911,8 @@ fn assemble_block_prevouts_mode(
                     return Err(ConsensusError::BadTx("bad-txns-nonfinal"));
                 }
             }
+            confirm_phase_stats::ASM_FINAL_NS
+                .fetch_add(t_fin.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
             let mut value_out = 0i64;
             for o in &tx.output {
@@ -916,6 +932,7 @@ fn assemble_block_prevouts_mode(
                 .ok_or(ConsensusError::BadTx("fee overflow"))?;
 
             if build_script_jobs {
+                let t_job = Instant::now();
                 script_jobs.push(ScriptCheckJob {
                     prevouts,
                     // One deep clone beats encode-at-connect + deserialize-per-worker.
@@ -926,6 +943,8 @@ fn assemble_block_prevouts_mode(
                     bip16_active: bip16_for_jobs,
                     taproot_active: ctx.params.taproot_active_at(ctx.height.0),
                 });
+                confirm_phase_stats::ASM_JOB_NS
+                    .fetch_add(t_job.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
         }
 

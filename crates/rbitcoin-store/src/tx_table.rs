@@ -2207,6 +2207,89 @@ impl TxTable {
         Ok(inserted)
     }
 
+    /// Build a **complete** sized `tx.head` in RAM from every Class A body, then
+    /// write it to `out_path` (e.g. `store/tx.head.test`).
+    ///
+    /// Does **not** touch the live primary/shadow head or start online resize.
+    /// Timing comparison: pure sequential body-prefix reads + RAM probe insert +
+    /// one sequential file write vs background io_uring shadow fill.
+    ///
+    /// Layout = [`layout_for_count`](crate::address_head::layout_for_count) for
+    /// current body count (same sizing policy as open-time recreate). Progress:
+    /// `on_progress(done, total, occupied)`.
+    pub fn build_head_file_in_ram(
+        &self,
+        out_path: impl AsRef<std::path::Path>,
+        mut on_progress: impl FnMut(u64, u64, u64),
+    ) -> Result<crate::address_head::RamAddressHead, StoreError> {
+        use crate::address_head::{layout_for_count, RamAddressHead};
+        use std::time::Instant;
+
+        let n = self.count();
+        let layout = layout_for_count(n);
+        let t0 = Instant::now();
+        let mut ram = RamAddressHead::new(layout)?;
+        rbitcoin_log::info!(
+            "store: tx.head RAM build begin n={n} bits={} slots={} entry={}B body={:.2} GiB → {}",
+            layout.bits,
+            layout.slots(),
+            layout.entry_bytes,
+            layout.body_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+            out_path.as_ref().display()
+        );
+        if n == 0 {
+            ram.write_to(out_path.as_ref())?;
+            on_progress(0, 0, 0);
+            return Ok(ram);
+        }
+
+        let read_batch = Self::head_fill_read_batch();
+        let write_chunk = Self::head_fill_write_chunk();
+        const PROGRESS_EVERY: u64 = 1_000_000;
+        let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(write_chunk);
+        let mut last_progress = 0u64;
+        let mut cur = 1u64;
+        let t_read_insert = Instant::now();
+        while cur <= n {
+            let end = (cur + read_batch - 1).min(n);
+            let txids = self.body_txid_range(cur, end)?;
+            debug_assert_eq!(txids.len() as u64, end - cur + 1);
+            for (i, txid) in txids.into_iter().enumerate() {
+                let id = cur + i as u64;
+                batch.push((txid, Fk(id)));
+                if batch.len() >= write_chunk {
+                    ram.insert_many(&batch)?;
+                    batch.clear();
+                }
+                if id - last_progress >= PROGRESS_EVERY || id == n {
+                    on_progress(id, n, ram.occupied());
+                    last_progress = id;
+                }
+            }
+            cur = end + 1;
+        }
+        if !batch.is_empty() {
+            ram.insert_many(&batch)?;
+        }
+        let fill_ms = t_read_insert.elapsed().as_millis();
+        if last_progress != n {
+            on_progress(n, n, ram.occupied());
+        }
+
+        let t_write = Instant::now();
+        ram.write_to(out_path.as_ref())?;
+        let write_ms = t_write.elapsed().as_millis();
+        let total_ms = t0.elapsed().as_millis();
+        rbitcoin_log::info!(
+            "store: tx.head RAM build done n={n} occupied={} bits={} \
+             fill_ms={fill_ms} write_ms={write_ms} total_ms={total_ms} path={}",
+            ram.occupied(),
+            layout.bits,
+            out_path.as_ref().display()
+        );
+        Ok(ram)
+    }
+
     /// Approximate occupied slots in the hash head (for "needs backfill?" checks).
     pub fn head_occupied(&self) -> u64 {
         self.head.read().unwrap().occupied()

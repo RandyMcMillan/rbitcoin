@@ -23,5 +23,9 @@ getrandom = "0.2"
 name = "spend_batch"
 harness = false
 
+[[bin]]
+name = "rbitcoin-head-ram-build"
+path = "src/bin/rbitcoin-head-ram-build.rs"
+
 [lints]
 workspace = true

@@ -617,6 +617,141 @@ pub fn write_head_meta(
     Ok(())
 }
 
+/// Full `tx.head` slot array built entirely in process RAM (no mmap / no online
+/// resize shadow). Used for offline timing vs background `tx.head` resize.
+///
+/// Insert uses the same page-local probe as live [`AddressHead`]. After fill,
+/// [`Self::write_to`] writes a complete on-disk table (slots + trailing footer)
+/// that [`AddressHead::open`] can load.
+pub struct RamAddressHead {
+    layout: HeadLayout,
+    /// `slots × entry_bytes` create_fk array (offset 0 = slot 0).
+    slots: Vec<u8>,
+    occupied: u64,
+}
+
+impl RamAddressHead {
+    /// Allocate a zeroed slot array for `layout` (O(body size) RAM).
+    pub fn new(layout: HeadLayout) -> Result<Self, StoreError> {
+        let body = layout.body_bytes();
+        let size = usize::try_from(body).map_err(|_| {
+            StoreError::Corrupt("tx.head body larger than usize (cannot build in RAM)")
+        })?;
+        // Avoid trying multi‑TiB allocs from a bad bits env.
+        if size > 0 && size.saturating_mul(1) > (48usize << 30) {
+            return Err(StoreError::Corrupt(
+                "tx.head RAM build refuses >48 GiB allocation",
+            ));
+        }
+        Ok(Self {
+            layout,
+            slots: vec![0u8; size],
+            occupied: 0,
+        })
+    }
+
+    pub fn layout(&self) -> HeadLayout {
+        self.layout
+    }
+
+    pub fn occupied(&self) -> u64 {
+        self.occupied
+    }
+
+    pub fn body_bytes(&self) -> u64 {
+        self.slots.len() as u64
+    }
+
+    /// Insert mappings into the RAM table (same probe as live head).
+    ///
+    /// Page-sorted for cache locality; idempotent if `fk` already on the chain.
+    pub fn insert_many(&mut self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let bits = self.layout.bits;
+        let es = self.layout.entry_bytes;
+        let es_u = es as usize;
+        let page_slots = page_slot_count(bits);
+        let page_bytes = (page_slots as usize).saturating_mul(es_u);
+
+        let mut work: Vec<(u64, usize, [u8; 32], Fk)> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (txid, fk))| (page_base_for_txid(txid, bits), i, *txid, *fk))
+            .collect();
+        work.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut i = 0;
+        while i < work.len() {
+            let page_base = work[i].0;
+            let mut j = i + 1;
+            while j < work.len() && work[j].0 == page_base {
+                j += 1;
+            }
+            let page_off = entry_file_off(page_base, es) as usize;
+            if page_off.saturating_add(page_bytes) > self.slots.len() {
+                return Err(StoreError::Corrupt("ram head page out of range"));
+            }
+            let page = &mut self.slots[page_off..page_off + page_bytes];
+            for &(_, _, ref txid, fk) in &work[i..j] {
+                let outcome = insert_fk_into_page_buf(page, page_base, bits, es, txid, fk)?;
+                if outcome.wrote_new {
+                    self.occupied = self.occupied.saturating_add(1);
+                }
+            }
+            i = j;
+        }
+        Ok(())
+    }
+
+    /// Write a complete trailing-footer `tx.head` file (not mmap-based create).
+    ///
+    /// File layout matches live tables: slot body at offset 0, then 32-byte
+    /// trailing footer (magic + schema + kind + logical_len + layout ext).
+    pub fn write_to(&self, path: impl AsRef<Path>) -> Result<(), StoreError> {
+        use rbitcoin_primitives::{SCHEMA_VERSION, STORE_MAGIC, TableKind};
+        use std::io::Write;
+
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| StoreError::io(path, e))?;
+            }
+        }
+        let body = self.slots.len() as u64;
+        let logical = body.saturating_add(crate::file::TRAILING_FOOTER_LEN as u64);
+        let ext = encode_layout_ext(self.layout, 0);
+        let mut footer = [0u8; crate::file::TRAILING_FOOTER_LEN];
+        footer[0..4].copy_from_slice(&STORE_MAGIC);
+        footer[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
+        footer[6..8].copy_from_slice(&TableKind::HashHead.as_u16().to_le_bytes());
+        footer[8..16].copy_from_slice(&logical.to_le_bytes());
+        footer[16..32].copy_from_slice(&ext);
+
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|e| StoreError::io(path, e))?;
+        // Single sequential write of the slot array (the comparison point vs
+        // online uring page RMW). Chunk to keep syscall sizes reasonable.
+        const CHUNK: usize = 16 * 1024 * 1024;
+        let mut off = 0usize;
+        while off < self.slots.len() {
+            let end = (off + CHUNK).min(self.slots.len());
+            f.write_all(&self.slots[off..end])
+                .map_err(|e| StoreError::io(path, e))?;
+            off = end;
+        }
+        f.write_all(&footer).map_err(|e| StoreError::io(path, e))?;
+        f.sync_all().map_err(|e| StoreError::io(path, e))?;
+        remove_legacy_meta_sidecar(path);
+        Ok(())
+    }
+}
+
 /// Fixed-width keyless txid → dense create_fk table.
 pub struct AddressHead {
     file: TableFile,
@@ -1522,6 +1657,41 @@ mod tests {
         assert_eq!(h.occupied(), 50);
         for (txid, fk) in &entries {
             assert!(h.probe_fks(txid).unwrap().contains(fk));
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(meta_path(&path));
+    }
+
+    /// RAM build + write must open as a live AddressHead with the same mappings.
+    #[test]
+    fn ram_head_build_write_open_roundtrip() {
+        let path = tmp("ram_build");
+        let layout = HeadLayout::new(14).unwrap();
+        let mut ram = RamAddressHead::new(layout).unwrap();
+        let mut entries = Vec::new();
+        for i in 1..=200u64 {
+            let mut txid = [0u8; 32];
+            txid[0] = (i & 0xff) as u8;
+            txid[1] = ((i >> 8) & 0xff) as u8;
+            txid[2] = ((i * 13) & 0xff) as u8;
+            txid[4] = 0x5a;
+            entries.push((txid, Fk(i)));
+        }
+        ram.insert_many(&entries).unwrap();
+        assert_eq!(ram.occupied(), 200);
+        // Idempotent re-insert.
+        ram.insert_many(&entries[..20]).unwrap();
+        assert_eq!(ram.occupied(), 200);
+        ram.write_to(&path).unwrap();
+
+        let h = AddressHead::open(&path).unwrap();
+        assert_eq!(h.bits(), 14);
+        assert_eq!(h.occupied(), 200);
+        for (txid, fk) in &entries {
+            assert!(
+                h.probe_fks(txid).unwrap().contains(fk),
+                "missing {fk:?} after RAM write"
+            );
         }
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(meta_path(&path));

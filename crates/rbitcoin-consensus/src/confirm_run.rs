@@ -603,42 +603,52 @@ fn offline_dense_rels(
 
 /// Whether wire pin may cold-load denserels from Class A body.
 ///
-/// IBD denserels stage warms CreateResidency first; prep then uses [`ColdPinMode::Forbid`]
-/// so cold denserels is never duplicated on the prep thread. Tests / one-shot
-/// [`confirm_wire_prep_phase`] use [`ColdPinMode::Allow`].
+/// IBD **plan** stage ensures denserels into CreateResidency first; prep then
+/// uses [`ColdPinMode::Forbid`] so cold denserels is never duplicated on the
+/// prep thread. Tests / one-shot [`confirm_wire_prep_phase`] use [`ColdPinMode::Allow`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColdPinMode {
     /// Residency miss → `load_creates_once(OutsDenserels)` (unit tests / tip-follow wire prep).
     Allow,
-    /// Residency miss → hard `invariant: denserels stage miss` (IBD prep after denserels stage).
+    /// Residency miss → hard `invariant: denserels stage miss` (prep after plan).
     Forbid,
 }
 
-/// Stats from [`warm_parent_denserels_for_wire`] (denserels pipeline stage).
+/// Stats from plan-stage denserels ensure (external parents into CreateResidency).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DenserelsWarmStats {
-    /// Unique external parent creates considered.
+    /// Unique external parent creates considered (stamped create_fk, not same-batch).
     pub parents: u32,
-    /// Already had denserels in CreateResidency (skip IO).
+    /// Already had denserels in CreateResidency or in-flight offline.
     pub already: u32,
-    /// Cold denserels body loads.
+    /// Cold denserels body loads (`load_creates_once` OutsDenserels).
     pub cold: u32,
-    /// Unresolved prev_txid (no residency/head fk) — plan may stamp later.
-    pub unresolved: u32,
+    /// Same-batch plan creates (offline denserels at pin — no residency load).
+    pub same_batch: u32,
     pub work_ns: u64,
 }
 
-/// **Denserels stage:** resolve spent parent create fks from wire prev_txid and
-/// load denserels into CreateResidency once (OutsDenserels).
+/// **Old prep denserels residual** (external parents only): residency hit or one
+/// `OutsDenserels` cold load into CreateResidency.
 ///
-/// Head resolve is **batched** ([`Store::get_fk_by_txid_batch`]) — never
-/// per-input `get_fk_by_txid` (that pegged mid-mainnet at ~5+ min / 32 blocks).
+/// Parent create_fks come from **plan-stamped** inputs (and in-flight). No head
+/// resolve here — plan already stamped via batch head + residency caches.
+/// Same-batch creates are skipped (pin uses offline denserels).
 ///
-/// Does not plan Class A or assemble. Prep must follow with
-/// [`ColdPinMode::Forbid`] so this is the sole cold denserels path for wire IBD.
-pub fn warm_parent_denserels_for_wire(
+/// Prep pin with [`ColdPinMode::Forbid`] must see every external parent covered.
+pub fn ensure_external_parent_denserels_from_plan(
     query: &Query,
-    blocks: &[(Height, Block)],
+    plan: Option<&rbitcoin_query::ArchiveWritePlan>,
+    in_flight_outs: Option<
+        &HashMap<
+            u64,
+            (
+                rbitcoin_store::TxRecord,
+                Vec<rbitcoin_store::OutputRecord>,
+                Vec<u32>,
+            ),
+        >,
+    >,
 ) -> Result<DenserelsWarmStats, ConsensusError> {
     use rbitcoin_query::confirm_load_stats;
     use rbitcoin_store::IdxBodyMode;
@@ -646,72 +656,53 @@ pub fn warm_parent_denserels_for_wire(
 
     let t0 = Instant::now();
     let mut st = DenserelsWarmStats::default();
-    if blocks.is_empty() {
+    let Some(plan) = plan else {
+        st.work_ns = t0.elapsed().as_nanos() as u64;
         return Ok(st);
+    };
+
+    // Same-batch create ids (offline denserels at pin — do not cold-load Class A).
+    let mut batch_create_ids: HashMap<u64, ()> = HashMap::new();
+    for fk in &plan.planned_fks {
+        if let Some(id) = fk.get() {
+            batch_create_ids.insert(id, ());
+        }
     }
 
-    // Pass 1: collect prev_txid → need vouts; residency-hit fks immediately.
-    // Head-miss txids go to a batch resolve (not N× single head probes).
+    // Spent parent create_fk → need vouts (from stamped inputs only).
     let mut parent_vouts: HashMap<u64, Vec<u32>> = HashMap::new();
-    let mut need_head: HashMap<[u8; 32], Vec<u32>> = HashMap::new();
     let t_collect = Instant::now();
-    for (_h, block) in blocks {
-        for tx in &block.txdata {
-            for inp in &tx.input {
-                if inp.previous_output.is_null() {
-                    continue;
-                }
-                let prev_txid = inp.previous_output.txid.to_byte_array();
-                let vout = inp.previous_output.vout;
-                if let Some(fk) = query.create_residency().lookup_fk_by_txid(&prev_txid) {
-                    if let Some(pid) = fk.get() {
-                        parent_vouts.entry(pid).or_default().push(vout);
-                        continue;
-                    }
-                }
-                need_head.entry(prev_txid).or_default().push(vout);
-            }
-        }
-    }
-    let collect_ns = t_collect.elapsed().as_nanos() as u64;
-
-    // Pass 2: one batch head resolve for residency misses.
-    let t_head = Instant::now();
-    if !need_head.is_empty() {
-        let txids: Vec<[u8; 32]> = need_head.keys().copied().collect();
-        let resolved = query
-            .store()
-            .get_fk_by_txid_batch(&txids)
-            .map_err(ConsensusError::Store)?;
-        for (txid, fk_opt) in resolved {
-            let Some(vouts) = need_head.remove(&txid) else {
+    for ((_, ins, _), _) in plan.packed.iter().zip(plan.planned_fks.iter()) {
+        for inp in ins {
+            if inp.is_coinbase() || inp.prev_index == u32::MAX {
                 continue;
-            };
-            if let Some(fk) = fk_opt {
-                if let Some(pid) = fk.get() {
-                    parent_vouts.entry(pid).or_default().extend(vouts);
-                    continue;
-                }
             }
-            // Still unresolved: same-batch / not yet in Class A — plan offline denserels.
-            st.unresolved = st.unresolved.saturating_add(vouts.len() as u32);
-        }
-        // Any leftovers (should be empty if batch returns all keys).
-        for (_txid, vouts) in need_head {
-            st.unresolved = st.unresolved.saturating_add(vouts.len() as u32);
+            if let Some(pid) = inp.create_fk.get() {
+                parent_vouts.entry(pid).or_default().push(inp.prev_index);
+            }
         }
     }
-    let head_ns = t_head.elapsed().as_nanos() as u64;
-
     for vouts in parent_vouts.values_mut() {
         vouts.sort_unstable();
         vouts.dedup();
     }
-    st.parents = parent_vouts.len() as u32;
+    let collect_ns = t_collect.elapsed().as_nanos() as u64;
 
     let mut cold_fks: Vec<rbitcoin_primitives::Fk> = Vec::new();
     for (id, need) in &parent_vouts {
+        if batch_create_ids.contains_key(id) {
+            st.same_batch = st.same_batch.saturating_add(1);
+            continue;
+        }
+        st.parents = st.parents.saturating_add(1);
         let fk = rbitcoin_primitives::Fk(*id);
+        // In-flight offline denserels already available for pin.
+        if let Some(ifo) = in_flight_outs {
+            if ifo.get(id).is_some_and(|(_, _, d)| !d.is_empty()) {
+                st.already = st.already.saturating_add(1);
+                continue;
+            }
+        }
         if query
             .create_residency()
             .get_parent_needed(fk, need)
@@ -722,7 +713,6 @@ pub fn warm_parent_denserels_for_wire(
             cold_fks.push(fk);
         }
     }
-    // Stable IO order: ascending create fk ≈ body order when Class A is append-only.
     cold_fks.sort_unstable_by_key(|f| f.0);
     cold_fks.dedup();
     st.cold = cold_fks.len() as u32;
@@ -745,19 +735,31 @@ pub fn warm_parent_denserels_for_wire(
         confirm_load_stats::BODY_TX_READS.fetch_add(loaded.len() as u64, Ordering::Relaxed);
         confirm_load_stats::FULL_TX_READS.fetch_add(loaded.len() as u64, Ordering::Relaxed);
         confirm_load_stats::PIN_NEW.fetch_add(loaded.len() as u64, Ordering::Relaxed);
+        // Every cold parent must land in residency for prep Forbid.
+        for fk in &cold_fks {
+            let need = parent_vouts
+                .get(&fk.get().unwrap_or(0))
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            if query.create_residency().get_parent_needed(*fk, need).is_none() {
+                return Err(ConsensusError::Store(StoreError::Corrupt(
+                    "invariant: plan stage failed to load external parent denserels",
+                )));
+            }
+        }
     }
 
     st.work_ns = t0.elapsed().as_nanos() as u64;
-    // Stage atomics for IBD perf (denserels wall + sub-phases).
-    denserels_stage_stats::note(
-        blocks.len() as u64,
+    // Parent mix + subtimers; wall TOTAL_NS is owned by plan stage caller.
+    plan_stage_stats::note(
+        0, // blocks counted by caller
         st.parents as u64,
         st.already as u64,
         st.cold as u64,
-        st.unresolved as u64,
-        st.work_ns,
+        st.same_batch as u64,
+        0,
         collect_ns,
-        head_ns,
+        0,
         cold_io_ns,
     );
     if st.work_ns > 0 {
@@ -774,8 +776,313 @@ pub fn warm_parent_denserels_for_wire(
     Ok(st)
 }
 
-/// Accumulators for the denserels pipeline stage (sampled by IBD perf_log).
-pub mod denserels_stage_stats {
+/// IBD **plan** stage: structure + plan (stamp create_fk, batch head) + ensure
+/// external denserels into CreateResidency. Prep then pins with Forbid (no cold).
+///
+/// Plan uses the same residency + `get_fk_by_txid_batch` paths as old prep.
+pub fn confirm_wire_plan_and_ensure_denserels(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    blocks: &[(Height, Block)],
+    pipeline: Option<&WirePrepPipeline>,
+) -> Result<(Option<rbitcoin_query::ArchiveWritePlan>, DenserelsWarmStats, u64), ConsensusError>
+{
+    let t0 = Instant::now();
+    let (plan, _metas, _wire, plan_ns) =
+        wire_plan_phase(query, params, milestone, blocks, pipeline)?;
+    plan_stage_stats::BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
+    plan_stage_stats::HEAD_NS.fetch_add(plan_ns, Ordering::Relaxed);
+
+    let ifo = pipeline.map(|p| p.in_flight_outs.as_ref());
+    let warm = ensure_external_parent_denserels_from_plan(query, plan.as_ref(), ifo)?;
+    let work_ns = t0.elapsed().as_nanos() as u64;
+    plan_stage_stats::TOTAL_NS.fetch_add(work_ns, Ordering::Relaxed);
+    Ok((plan, warm, work_ns))
+}
+
+/// Prep after plan stage: pin with denserels already in residency ([`ColdPinMode::Forbid`])
+/// + assemble. Does **not** re-plan or re-stamp create_fks.
+pub fn confirm_wire_prep_after_plan(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    blocks: &[(Height, Block)],
+    plan: Option<rbitcoin_query::ArchiveWritePlan>,
+    pipeline: Option<&WirePrepPipeline>,
+    preverified: &ScriptPreverified,
+    cold_mode: ColdPinMode,
+) -> Result<ConfirmLoadOutcome, ConsensusError> {
+    if blocks.is_empty() {
+        return Err(ConsensusError::BadBlock("empty confirm batch"));
+    }
+    let t_work = Instant::now();
+    let t_load = Instant::now();
+
+    let mut wire_blocks: Vec<Arc<Block>> = Vec::with_capacity(blocks.len());
+    let mut metas: Vec<BodyMeta> = Vec::with_capacity(blocks.len());
+    for (height, block) in blocks {
+        let block = Arc::new(block.clone());
+        let hash = block.block_hash().to_byte_array();
+        let hp = query
+            .confirm_parent_cache()
+            .get_header_plan(height.0)
+            .ok_or_else(|| {
+                ConsensusError::Store(StoreError::Corrupt(
+                    "invariant: plan stage missing header plan for prep",
+                ))
+            })?;
+        metas.push(BodyMeta {
+            height: *height,
+            hash,
+            header_fk: hp.header_fk,
+            header_rec: hp.header_rec,
+            tx_fks: hp.tx_fks,
+        });
+        wire_blocks.push(block);
+    }
+
+    let inflight_outs = pipeline.map(|p| p.in_flight_outs.as_ref());
+    let (batch_parents, batch_thin) = pin_for_wire_batch(
+        query,
+        plan.as_ref(),
+        &metas,
+        &wire_blocks,
+        inflight_outs,
+        cold_mode,
+    )?;
+
+    confirm_phase_stats::LOAD_NS.fetch_add(
+        t_load.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
+    );
+
+    let prepared = assemble_run(
+        query,
+        params,
+        milestone,
+        metas,
+        &wire_blocks,
+        &batch_parents,
+        &batch_thin,
+    )?;
+    drop(batch_thin);
+
+    let work_ns = t_work.elapsed().as_nanos() as u64;
+    Ok(ConfirmLoadOutcome {
+        batch: LoadedBatch {
+            prepared,
+            wire_blocks,
+            batch_parents,
+            script_preverified: preverified.clone(),
+            archive_plan: plan,
+        },
+        work_ns,
+    })
+}
+
+/// Structure + prepare + plan_mega only (stamp create_fk). Shared by plan stage.
+fn wire_plan_phase(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    blocks: &[(Height, Block)],
+    pipeline: Option<&WirePrepPipeline>,
+) -> Result<
+    (
+        Option<rbitcoin_query::ArchiveWritePlan>,
+        Vec<BodyMeta>,
+        Vec<Arc<Block>>,
+        u64, // plan wall ns (filter+plan_mega dominate)
+    ),
+    ConsensusError,
+> {
+    if blocks.is_empty() {
+        return Err(ConsensusError::BadBlock("empty confirm batch"));
+    }
+    for w in blocks.windows(2) {
+        if w[1].0 .0 != w[0].0 .0.saturating_add(1) {
+            return Err(ConsensusError::BadBlock("confirm run not contiguous"));
+        }
+    }
+
+    let mut with_fk: Vec<(
+        rbitcoin_primitives::Fk,
+        rbitcoin_store::HeaderRecord,
+        Vec<rbitcoin_query::TxApply>,
+    )> = Vec::with_capacity(blocks.len());
+    let mut wire_blocks: Vec<Arc<Block>> = Vec::with_capacity(blocks.len());
+    let mut metas: Vec<BodyMeta> = Vec::with_capacity(blocks.len());
+
+    let tip_h = query.tip_height().map(|h| h.0);
+    let store_path_lo = match tip_h {
+        None => 0u32,
+        Some(t) => t.saturating_add(1),
+    };
+    let path_lo = pipeline.map(|p| p.path_lo).unwrap_or(store_path_lo);
+
+    for (i, (height, block)) in blocks.iter().enumerate() {
+        let block = Arc::new(block.clone());
+        let hash = block.block_hash().to_byte_array();
+        let ctx = ValidationContext::at(params, *height, milestone);
+        let _ = crate::block::validate_block_structure_hashed(block.as_ref(), &ctx)?;
+        if i == 0 {
+            if height.0 != path_lo {
+                return Err(ConsensusError::BadPrev);
+            }
+            if path_lo == store_path_lo {
+                validate_header(query, params, *height, &block.header)?;
+            } else {
+                let expect_prev = pipeline.and_then(|p| p.parent_hash).unwrap_or([0u8; 32]);
+                if block.header.prev_blockhash.to_byte_array() != expect_prev {
+                    return Err(ConsensusError::BadPrev);
+                }
+                let target = bitcoin::Target::from_compact(block.header.bits);
+                if target > params.pow_limit {
+                    return Err(ConsensusError::BadHeader("target above pow limit"));
+                }
+                block
+                    .header
+                    .validate_pow(target)
+                    .map_err(|_| ConsensusError::InvalidPow)?;
+            }
+        } else {
+            let prev = &wire_blocks[i - 1];
+            if block.header.prev_blockhash != prev.block_hash() {
+                return Err(ConsensusError::BadPrev);
+            }
+            let target = bitcoin::Target::from_compact(block.header.bits);
+            if target > params.pow_limit {
+                return Err(ConsensusError::BadHeader("target above pow limit"));
+            }
+            block
+                .header
+                .validate_pow(target)
+                .map_err(|_| ConsensusError::InvalidPow)?;
+        }
+
+        let (header_rec, txs) =
+            crate::prepare_block_for_archive(query, params, block.as_ref())?;
+        let header_fk = if let Some((fk, _)) = query
+            .get_header_by_hash(&header_rec.hash)
+            .map_err(ConsensusError::Store)?
+        {
+            fk
+        } else {
+            query
+                .store()
+                .put_header(&header_rec)
+                .map_err(ConsensusError::Store)?
+        };
+        query.confirm_parent_cache().put_header_plan(
+            height.0,
+            header_fk,
+            header_rec.clone(),
+            Vec::new(),
+            block.header.prev_blockhash.to_byte_array(),
+        );
+        with_fk.push((header_fk, header_rec.clone(), txs));
+        wire_blocks.push(block);
+        metas.push(BodyMeta {
+            height: *height,
+            hash,
+            header_fk,
+            header_rec,
+            tx_fks: Vec::new(),
+        });
+    }
+
+    let t_fp = Instant::now();
+    let (_header_fks, mut need) = query
+        .archive_filter_need_bodies(&mut with_fk)
+        .map_err(ConsensusError::Store)?;
+    let plan = if need.is_empty() {
+        for m in &mut metas {
+            if let Some(list) = query
+                .store()
+                .header_txs
+                .get_list(m.header_fk)
+                .map_err(ConsensusError::Store)?
+            {
+                m.tx_fks = list;
+            }
+            let prev = wire_blocks
+                .iter()
+                .find(|b| b.block_hash().to_byte_array() == m.hash)
+                .map(|b| b.header.prev_blockhash.to_byte_array())
+                .unwrap_or([0u8; 32]);
+            query.confirm_parent_cache().put_header_plan(
+                m.height.0,
+                m.header_fk,
+                m.header_rec.clone(),
+                m.tx_fks.clone(),
+                prev,
+            );
+        }
+        None
+    } else {
+        let plan = match pipeline {
+            Some(p) => query
+                .archive_plan_mega_from(
+                    &mut need,
+                    p.next_tx_start.max(1),
+                    p.in_flight_creates.as_ref(),
+                )
+                .map_err(ConsensusError::Store)?,
+            None => query
+                .archive_plan_mega_owned(&mut need)
+                .map_err(ConsensusError::Store)?,
+        };
+        let mut by_header: HashMap<u64, Vec<rbitcoin_primitives::Fk>> = HashMap::new();
+        for &(hfk, first, n) in &plan.per_header_ranges {
+            let Some(hid) = hfk.get() else { continue };
+            let start = plan
+                .planned_fks
+                .iter()
+                .position(|f| *f == first)
+                .unwrap_or(0);
+            let n = n as usize;
+            let slice = plan.planned_fks[start..start.saturating_add(n).min(plan.planned_fks.len())]
+                .to_vec();
+            by_header.insert(hid, slice);
+        }
+        for m in &mut metas {
+            if let Some(id) = m.header_fk.get() {
+                if let Some(fks) = by_header.get(&id) {
+                    m.tx_fks = fks.clone();
+                }
+            }
+            if m.tx_fks.is_empty() {
+                if let Some(list) = query
+                    .store()
+                    .header_txs
+                    .get_list(m.header_fk)
+                    .map_err(ConsensusError::Store)?
+                {
+                    m.tx_fks = list;
+                }
+            }
+            let prev = wire_blocks
+                .iter()
+                .find(|b| b.block_hash().to_byte_array() == m.hash)
+                .map(|b| b.header.prev_blockhash.to_byte_array())
+                .unwrap_or([0u8; 32]);
+            query.confirm_parent_cache().put_header_plan(
+                m.height.0,
+                m.header_fk,
+                m.header_rec.clone(),
+                m.tx_fks.clone(),
+                prev,
+            );
+        }
+        Some(plan)
+    };
+    let plan_ns = t_fp.elapsed().as_nanos() as u64;
+    Ok((plan, metas, wire_blocks, plan_ns))
+}
+
+/// Accumulators for the **plan** pipeline stage (plan+stamp + denserels ensure).
+pub mod plan_stage_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
@@ -1104,7 +1411,7 @@ fn pin_for_wire_batch(
         if !cold.is_empty() {
             if cold_mode == ColdPinMode::Forbid {
                 return Err(ConsensusError::Store(StoreError::Corrupt(
-                    "invariant: denserels stage miss (prep cold denserels forbidden)",
+                    "invariant: plan stage miss (prep cold denserels forbidden)",
                 )));
             }
             let t_io = Instant::now();
@@ -2139,13 +2446,13 @@ mod write_idempotent_tests {
         assert!(after > before, "skip counter should bump");
     }
 
-    /// Denserels warm + Forbid: cold path must not run on prep after stage filled residency.
+    /// Plan-stage denserels ensure + Forbid pin: cold path must not re-run on prep.
     #[test]
-    fn denserels_warm_then_forbid_skips_cold_io() {
-        use super::{pin_for_wire_batch, warm_parent_denserels_for_wire, ColdPinMode};
-        use bitcoin::hashes::Hash;
-        use bitcoin::{Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
-        use rbitcoin_primitives::{Fk, Height};
+    fn plan_ensure_denserels_then_forbid_skips_cold_io() {
+        use super::{
+            ensure_external_parent_denserels_from_plan, pin_for_wire_batch, ColdPinMode,
+        };
+        use rbitcoin_primitives::Fk;
         use rbitcoin_query::Query;
         use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
         use std::sync::Once;
@@ -2157,7 +2464,7 @@ mod write_idempotent_tests {
             }
         });
         let path = std::env::temp_dir().join(format!(
-            "rbitcoin-denserels-warm-{}-{}",
+            "rbitcoin-plan-ensure-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2183,48 +2490,12 @@ mod write_idempotent_tests {
             .txs
             .put_full_batch_indexed(&[(parent_tx.clone(), parent_ins, parent_outs)], true)
             .unwrap()[0];
+        let range = q.store().tx_body_range(pfk).unwrap();
+        // Residency range-only (prewarm shape) — plan stage loads denserels, not head.
+        q.create_residency()
+            .insert_fk_txid_range(pfk, parent_tx.txid, Some(range));
 
-        // Spender wire that points at parent by txid.
-        let mut spend = Transaction {
-            version: bitcoin::transaction::Version::ONE,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: bitcoin::Txid::from_byte_array(parent_tx.txid),
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(49_0000_0000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        };
-        let _ = &mut spend;
-        let block = Block {
-            header: bitcoin::block::Header {
-                version: bitcoin::block::Version::ONE,
-                prev_blockhash: bitcoin::BlockHash::from_byte_array([0u8; 32]),
-                merkle_root: bitcoin::TxMerkleNode::from_byte_array([1u8; 32]),
-                time: 1,
-                bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
-                nonce: 1,
-            },
-            txdata: vec![spend],
-        };
-
-        rbitcoin_query::reset_body_ok_reads();
-        let st = warm_parent_denserels_for_wire(&q, &[(Height(1), block.clone())]).unwrap();
-        assert!(st.cold >= 1 || st.already >= 1, "st={st:?}");
-        assert!(
-            q.create_residency().has_outs(pfk),
-            "warm must seed denserels for parent"
-        );
-        let reads_after_warm = rbitcoin_query::body_ok_reads();
-
-        // Forbid cold: pin should hit residency only (no extra body IO).
+        // Plan with stamped parent create_fk (plan stage already did batch head).
         let mut plan = rbitcoin_query::ArchiveWritePlan::empty();
         plan.packed = vec![(
             TxRecord {
@@ -2247,13 +2518,33 @@ mod write_idempotent_tests {
             vec![OutputRecord::unspent(1, vec![0x51])],
         )];
         plan.planned_fks = vec![Fk(2)];
+
+        rbitcoin_query::reset_body_ok_reads();
+        let st = ensure_external_parent_denserels_from_plan(&q, Some(&plan), None).unwrap();
+        assert!(st.cold >= 1, "parent missing denserels must cold-load: {st:?}");
+        assert!(
+            q.create_residency().has_outs(pfk),
+            "ensure must seed denserels for parent"
+        );
+        let reads_after = rbitcoin_query::body_ok_reads();
+
+        // Second ensure: denserels already present → no more body IO.
+        let st2 = ensure_external_parent_denserels_from_plan(&q, Some(&plan), None).unwrap();
+        assert!(st2.already >= 1 && st2.cold == 0, "st2={st2:?}");
+        assert_eq!(
+            rbitcoin_query::body_ok_reads(),
+            reads_after,
+            "already-warm denserels must not re-read body"
+        );
+
+        // Pin Forbid hits residency (no extra cold).
         let (parents, _thin) =
             pin_for_wire_batch(&q, Some(&plan), &[], &[], None, ColdPinMode::Forbid).unwrap();
         assert!(parents.contains(pfk));
         assert_eq!(
             rbitcoin_query::body_ok_reads(),
-            reads_after_warm,
-            "Forbid must not cold denserels again"
+            reads_after,
+            "pin after plan ensure must not cold denserels again"
         );
 
         let _ = std::fs::remove_dir_all(&path);

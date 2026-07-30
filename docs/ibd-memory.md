@@ -129,7 +129,7 @@ known retain structures:
 | `work` / `body` | IBD maps + body-presence sets |
 | `body_soft` / `contig` | Soft archive RAM + ContigPark |
 | `residency` | **Sole** pin map: creates/outs vs caps + conf_plans |
-| `conf prepq` / `writeq` | Confirm pipeline **queue contents** (batches, blocks, wire MiB, parents) + feed ready/inflight |
+| `conf planq` / `prepq` / `writeq` | Confirm pipeline **queue contents** (batches, blocks, wire MiB, parents) + feed ready/inflight |
 | `txhead` | Primary + **shadow** `tx.head` during online resize (logical body MiB, cursor/n) |
 | `sh` | SH runs / memtable / tip heads |
 

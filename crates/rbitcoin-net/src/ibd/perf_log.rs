@@ -5,7 +5,7 @@
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
-//! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, prepq/writeq, txs=, horizon, tip ETA, body `bq=` |
+//! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, planq/prepq/writeq, txs=, horizon, tip ETA, body `bq=` |
 //! | INFO  | `ibd: perf …` | Download + body-queue pressure; **prep / script / write** stage walls + sub-phases; pin mix; queues |
 //! | INFO  | `ibd: sizes …` | RSS + work path + body soft budget + **bq** + **residency** + conf pipe + tx.head |
 //! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; plan_mega res_txid; class_a res_seed; dual-track pipe only if active |
@@ -174,22 +174,22 @@ pub(crate) struct IbdPerfSample {
     pub load_ready_through: u32,
     pub cache_bodies: usize,
     pub cache_plans: usize,
-    pub conf_denserels_q: usize,
+    pub conf_plan_q: usize,
     pub conf_load_q: usize,
     pub conf_write_q: usize,
-    pub conf_denserels_q_cap: usize,
+    pub conf_plan_q_cap: usize,
     pub conf_load_q_cap: usize,
     pub conf_write_q_cap: usize,
-    // Denserels stage (bq → parent denserels → prep queue)
-    pub denserels_blks: u64,
-    pub denserels_ms: u64,
-    pub denserels_collect_ms: u64,
-    pub denserels_head_ms: u64,
-    pub denserels_cold_io_ms: u64,
-    pub denserels_parents: u64,
-    pub denserels_already: u64,
-    pub denserels_cold: u64,
-    pub denserels_unresolved: u64,
+    // Plan stage (bq → plan+denserels ensure → prep queue)
+    pub plan_blks: u64,
+    pub plan_ms: u64,
+    pub plan_collect_ms: u64,
+    pub plan_head_ms: u64,
+    pub plan_cold_io_ms: u64,
+    pub plan_parents: u64,
+    pub plan_already: u64,
+    pub plan_cold: u64,
+    pub plan_same_batch: u64,
     pub load_hdr_ms: u64,
     pub load_decode_ms: u64,
     pub load_thin_ms: u64,
@@ -367,21 +367,21 @@ impl Default for IbdPerfSample {
             load_ready_through: 0,
             cache_bodies: 0,
             cache_plans: 0,
-            conf_denserels_q: 0,
+            conf_plan_q: 0,
             conf_load_q: 0,
             conf_write_q: 0,
-            conf_denserels_q_cap: super::confirm::DENSERELS_QUEUE_CAP,
+            conf_plan_q_cap: super::confirm::PLAN_QUEUE_CAP,
             conf_load_q_cap: super::confirm::LOAD_QUEUE_CAP,
             conf_write_q_cap: super::confirm::WRITE_QUEUE_CAP,
-            denserels_blks: 0,
-            denserels_ms: 0,
-            denserels_collect_ms: 0,
-            denserels_head_ms: 0,
-            denserels_cold_io_ms: 0,
-            denserels_parents: 0,
-            denserels_already: 0,
-            denserels_cold: 0,
-            denserels_unresolved: 0,
+            plan_blks: 0,
+            plan_ms: 0,
+            plan_collect_ms: 0,
+            plan_head_ms: 0,
+            plan_cold_io_ms: 0,
+            plan_parents: 0,
+            plan_already: 0,
+            plan_cold: 0,
+            plan_same_batch: 0,
             load_hdr_ms: 0,
             load_decode_ms: 0,
             load_thin_ms: 0,
@@ -554,7 +554,7 @@ pub(crate) fn sample(
     headers_done: bool,
     // (ready_through, ahead, parents, bodies, plans).
     load: (u32, u32, usize, usize, usize),
-    conf_denserels_q: usize,
+    conf_plan_q: usize,
     conf_load_q: usize,
     conf_write_q: usize,
     sh_runs: usize,
@@ -603,7 +603,7 @@ pub(crate) fn sample(
     // Drain connect prevout counters (not displayed; avoid unbounded growth).
     let _ = rbitcoin_query::connect_prevout_stats::sample_and_reset();
     let pw = rbitcoin_query::confirm_load_stats::sample_and_reset();
-    let dens = rbitcoin_consensus::denserels_stage_stats::sample_and_reset();
+    let dens = rbitcoin_consensus::plan_stage_stats::sample_and_reset();
     let arch_res = rbitcoin_query::archive_phase_stats::sample_and_reset();
     let head_res = rbitcoin_store::head_resolve_stats::sample_and_reset();
     let pipe = pipe_stats.sample_and_reset();
@@ -717,21 +717,21 @@ pub(crate) fn sample(
         load_ready_through,
         cache_bodies,
         cache_plans,
-        conf_denserels_q,
+        conf_plan_q,
         conf_load_q,
         conf_write_q,
-        conf_denserels_q_cap: super::confirm::DENSERELS_QUEUE_CAP,
+        conf_plan_q_cap: super::confirm::PLAN_QUEUE_CAP,
         conf_load_q_cap: super::confirm::LOAD_QUEUE_CAP,
         conf_write_q_cap: super::confirm::WRITE_QUEUE_CAP,
-        denserels_blks: dens.blocks,
-        denserels_ms: ns_ms(dens.total_ns),
-        denserels_collect_ms: ns_ms(dens.collect_ns),
-        denserels_head_ms: ns_ms(dens.head_ns),
-        denserels_cold_io_ms: ns_ms(dens.cold_io_ns),
-        denserels_parents: dens.parents,
-        denserels_already: dens.already,
-        denserels_cold: dens.cold,
-        denserels_unresolved: dens.unresolved,
+        plan_blks: dens.blocks,
+        plan_ms: ns_ms(dens.total_ns),
+        plan_collect_ms: ns_ms(dens.collect_ns),
+        plan_head_ms: ns_ms(dens.head_ns),
+        plan_cold_io_ms: ns_ms(dens.cold_io_ns),
+        plan_parents: dens.parents,
+        plan_already: dens.already,
+        plan_cold: dens.cold,
+        plan_same_batch: dens.unresolved,
         load_hdr_ms: ns_ms(pw.header_ns),
         load_decode_ms: ns_ms(pw.body_decode_ns),
         load_thin_ms: ns_ms(pw.thin_ns),
@@ -858,28 +858,28 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.hole,
         s.peers,
     );
-    // Four-stage confirm walls: denserels → prep → script → write.
-    // prep = structure+plan+pin (`load`) + assemble (`connect`).
+    // Four-stage confirm walls: plan → prep → script → write.
+    // plan = structure + stamp create_fk + ensure denserels; prep = pin + assemble.
     let prep_ms = prep_stage_ms(s);
     out.push_str(&format!(
-        " | conf blks={} denserels={}ms prep={}ms script={}ms write={}ms",
-        s.phase_blks.max(s.denserels_blks),
-        s.denserels_ms,
+        " | conf blks={} plan={}ms prep={}ms script={}ms write={}ms",
+        s.phase_blks.max(s.plan_blks),
+        s.plan_ms,
         prep_ms,
         s.script_ms,
         write_ms,
     ));
-    if s.denserels_blks > 0 || s.denserels_ms > 0 {
+    if s.plan_blks > 0 || s.plan_ms > 0 {
         out.push_str(&format!(
-            " denserels_sub(blks={} parents={} already={} cold={} unres={} collect={}ms head={}ms cold_io={}ms)",
-            s.denserels_blks,
-            s.denserels_parents,
-            s.denserels_already,
-            s.denserels_cold,
-            s.denserels_unresolved,
-            s.denserels_collect_ms,
-            s.denserels_head_ms,
-            s.denserels_cold_io_ms,
+            " plan_sub(blks={} parents={} already={} cold={} same={} collect={}ms head={}ms cold_io={}ms)",
+            s.plan_blks,
+            s.plan_parents,
+            s.plan_already,
+            s.plan_cold,
+            s.plan_same_batch,
+            s.plan_collect_ms,
+            s.plan_head_ms,
+            s.plan_cold_io_ms,
         ));
     }
     append_nz(&mut out, "recon_ms", s.recon_ms);
@@ -1008,10 +1008,10 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     }
 
     let conf_q = super::confirm::format_conf_q(
-        s.conf_denserels_q,
+        s.conf_plan_q,
         s.conf_load_q,
         s.conf_write_q,
-        s.conf_denserels_q_cap,
+        s.conf_plan_q_cap,
         s.conf_load_q_cap,
         s.conf_write_q_cap,
     );
@@ -1094,10 +1094,10 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     append_nz(&mut out, "head", s.sh_head_ms);
 
     let conf_q = super::confirm::format_conf_q(
-        s.conf_denserels_q,
+        s.conf_plan_q,
         s.conf_load_q,
         s.conf_write_q,
-        s.conf_denserels_q_cap,
+        s.conf_plan_q_cap,
         s.conf_load_q_cap,
         s.conf_write_q_cap,
     );
@@ -1287,7 +1287,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
          | body_soft q={}/{}MiB budget={}MiB contig parked={} ready={} next_h={} \
          | bq n={} {}MiB/{}MiB \
          | residency creates={}/{} outs={}/{} conf_plans={} \
-         | conf denserels_q={}/{} blks={} prepq={}/{} blks={} wire={}MiB parents={} writeq={}/{} blks={} wire={}MiB parents={} \
+         | conf planq={}/{} blks={} prepq={}/{} blks={} wire={}MiB parents={} writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
          | txhead active={} bits={}/{} entry={}B slots={} occ={} body={}MiB \
            shadow bits={} entry={}B slots={} occ={} body={}MiB cursor={}/{} \
@@ -1326,9 +1326,9 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         o.residency_outs,
         o.residency_out_cap,
         o.conf_plans,
-        cp.denserels_batches,
-        s.conf_denserels_q_cap,
-        cp.denserels_blocks,
+        cp.plan_batches,
+        s.conf_plan_q_cap,
+        cp.plan_blocks,
         cp.load_batches,
         s.conf_load_q_cap,
         cp.load_blocks,
@@ -1464,10 +1464,10 @@ mod tests {
         assert!(line.contains("loop confirm"), "{line}");
         assert!(line.contains("reject=2"), "{line}");
         assert!(line.contains("live h=100 n=32 1500ms"), "{line}");
-        s.conf_denserels_q = 0;
+        s.conf_plan_q = 0;
         s.conf_load_q = 1;
         s.conf_write_q = 2;
-        s.conf_denserels_q_cap = 2;
+        s.conf_plan_q_cap = 2;
         s.conf_load_q_cap = 2;
         s.conf_write_q_cap = 2;
         s.load_ready_through = 200;
@@ -1492,7 +1492,7 @@ mod tests {
         s.arch_write_body_ms = 7;
         s.arch_write_head_ms = 2;
         let line = format_info(&s);
-        assert!(line.contains("denserels_q<0/2 prepq=1/2 writeq=2/2"), "{line}");
+        assert!(line.contains("planq<0/2 prepq=1/2 writeq=2/2"), "{line}");
         assert!(line.contains("thru=200"), "{line}");
         assert!(line.contains("pin_res=3"), "{line}");
         assert!(line.contains("pin_new=12"), "{line}");
@@ -1577,7 +1577,7 @@ mod tests {
         assert!(line.contains("pin_sub body="), "{line}");
         assert!(line.contains("bq=3 (64MiB/1024MiB)"), "{line}");
         // Depth 0 → `<` (consumer waiting on empty queue).
-        assert!(line.contains("denserels_q"), "{line}");
+        assert!(line.contains("planq"), "{line}");
         assert!(line.contains("prepq<0/2 writeq=1/2") || line.contains("prepq="), "{line}");
         assert!(line.contains("thru=200"), "{line}");
         assert!(line.contains("utxo_p=100"), "{line}");
@@ -1761,7 +1761,7 @@ mod tests {
             8,   // peers
             true, // headers_done
             (50, 10, 0, 0, 0),
-            0, // denserels_q
+            0, // planq
             0, // load_q
             0, // write_q
             1, // sh_runs

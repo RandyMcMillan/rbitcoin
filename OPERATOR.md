@@ -48,7 +48,7 @@ Default: **info**. CLI wins over env.
 
 | Line | Level | Use |
 |------|-------|-----|
-| `ibd: progress` | INFO | Tip rate, `loadq`/`writeq`, `txs=` (Class A / `tx.idx` count), horizon, tip ETA, durable `bq=` (on-disk block queue count + MiB/budget) |
+| `ibd: progress` | INFO | Tip rate, `planq`/`prepq`/`writeq`, `txs=` (Class A / `tx.idx` count), horizon, tip ETA, durable `bq=` (on-disk block queue count + MiB/budget) |
 | `ibd: perf` | INFO | Inflight + RAM `arch_q` + durable `bq=`; **load / script / write** walls; load phases (hdr/dec/put/thin/pin + pin_hit%/pin_res/body_io); write (struct/class_c/sh/spend/tip_gc) |
 | `ibd: sizes` | INFO | RSS + work path + arch RAM queue + **bq** + **residency** + confirm pipe |
 | `ibd: perf_dbg` | DEBUG | µs/blk load/write, pin/edge detail, **plan_mega res_txid** + **class_a res_seed**, contig park |
@@ -79,7 +79,7 @@ idx→body pipeline for body prefixes.
 | Bulk store IO | **io_uring** (Linux) | Head resolve body prefixes, confirm body loads, **spend annotate** RMW (9 B meta pread→pwrite; multi-list appends mmap on read CQE), **`tx.head` resize** shadow fill. Archive `tx.head` **insert_many** stays mmap. `RBITCOIN_IO_URING=0` → pread/mmap fallbacks; `RBITCOIN_BULK_IO_WORKERS` for pread parallelism |
 | Archive Class A append | **pwrite** (default) | `tx.body` / `tx.idx` mega-appends use `write_at_pwrite` (page cache; avoids dirtying multi‑GiB mmaps for sequential write). `RBITCOIN_FD_APPEND=0` → mmap `write_at` (debug/compare) |
 | `tx.head` fill (rebuild + online resize) | shared knobs | `RBITCOIN_TX_HEAD_READ_BATCH` (default **65536**, max 1e6) — Class A fks per idx+txid bulk read; `RBITCOIN_TX_HEAD_WRITE_CHUNK` (default **65536**, max 1e6) — `insert_many` size (one fence/group); `RBITCOIN_TX_HEAD_FILL_WAVE` (default **1048576**) — fks per bg resize poll wave / progress log. Legacy `RBITCOIN_TX_HEAD_RESIZE_*` names still accepted |
-| Confirm stages | **load · scripts · write** | Pipeline queues cap **5** each (`loadq=n/5 writeq=m/5`; `name<0/cap` when the next worker is waiting on an empty queue) |
+| Confirm stages | **plan · prep · scripts · write** | Pipeline queues cap **5** each (`planq=n/5 prepq=m/5 writeq=k/5`; `name<0/cap` when the next worker is waiting on an empty queue) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 | Inhibit auto-suspend | **off** | `--inhibit-suspend` (uses `systemd-inhibit` if available) |
 

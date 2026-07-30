@@ -21,7 +21,7 @@ wrong design — fix the protocol. See `docs/concurrency.md`.
 | Rule | Detail |
 |------|--------|
 | Hot pin map | **`CreateResidency`** only (plan pin + commit denserels seed + prewarm) |
-| IBD confirm intake | **body queue wire only** → denserels → prep (no hash-only / Class-A-only confirm) |
+| IBD confirm intake | **body queue wire only** → plan → prep (no hash-only / Class-A-only confirm) |
 | Eviction | **Insert-order FIFO** — never read-touch / LRU reorder (one spend ⇏ next spend on same create) |
 | denserels_hit% | **~35–50% is normal** mid/late mainnet IBD (old UTXO spends). Do not chase ≥65% or inflate cache caps for it |
 | Removed | **OutFifo** and **archive sticky** are gone — do not reintroduce dual maps |

@@ -124,7 +124,7 @@ fewer usable peers than a dual-stack Core node.
 | `tx.head` resize lag | Deep load can block inserts while shadow fills — watch logs for probe-exhaust / archiver sleeping |
 | Peer scarcity | v2-only + experimental user-agent |
 | Mempool | Libre policy (0.1 sat/vB, full RBF, no dust ban); **scripts verified on accept** |
-| Confirm prep | Dense heights are pin-bound; expect `conf blks=32` with `prepq` low relative to cap (`prepq=*/5`) |
+| Confirm plan/prep | Dense heights are pin-bound; expect `conf blks=32` with `planq`/`prepq` low relative to cap (`planq=*/5 prepq=*/5`) |
 | Not Core/Fulcrum | No production SLA; schema unstable until 1.0; reindex on incompatible layout changes |
 
 ## Related docs

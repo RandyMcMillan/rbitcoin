@@ -776,46 +776,64 @@ pub fn ensure_external_parent_denserels_from_plan(
     Ok(st)
 }
 
-/// Plan-stage output: structure + plan mega + **BatchParents pin** (cold denserels
-/// once on the plan thread). Prep only assembles — never re-pins via residency.
+/// Plan-stage output: structure + plan mega only (create_fk stamped).
 ///
-/// **Why pin on plan, not residency handoff:** CreateResidency is insert-FIFO.
-/// Plan(N+1) cold-loads while prep(N) still runs; FIFO eviction drops denserels
-/// plan(N) just seeded → prep Forbid `plan stage miss` + tip blacklist. Owning
-/// pin on the plan thread makes BatchParents ride the queue (no eviction race).
-pub struct PlanPinOutcome {
+/// Denserels pin + assemble stay on **prep** so the pipeline stays balanced:
+/// plan(N+1) head-stamp overlaps prep(N) denserels IO. Handoff is the owned
+/// [`ArchiveWritePlan`] + wire/metas — **not** CreateResidency (FIFO race).
+pub struct PlanStampOutcome {
     pub plan: Option<rbitcoin_query::ArchiveWritePlan>,
-    pub warm: DenserelsWarmStats,
-    /// Wall ns for plan+pin (structure + head + denserels cold).
+    /// Wall ns for structure + plan_mega (head stamp).
     pub work_ns: u64,
     metas: Vec<BodyMeta>,
     wire_blocks: Vec<Arc<Block>>,
-    batch_parents: rbitcoin_query::BatchParents,
-    batch_thin: rbitcoin_query::BatchThin,
 }
 
-/// IBD **plan** stage: structure + stamp create_fk + pin parents (cold denserels
-/// allowed once here). Prep assembles only — no second denserels pass.
-///
-/// Prefer this over residency seed + Forbid re-pin (FIFO race under full caps).
-pub fn confirm_wire_plan_and_pin(
+/// IBD **plan** stage: structure + stamp create_fk only (no denserels pin).
+pub fn confirm_wire_plan_stamp(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
     blocks: &[(Height, Block)],
     pipeline: Option<&WirePrepPipeline>,
-) -> Result<PlanPinOutcome, ConsensusError> {
+) -> Result<PlanStampOutcome, ConsensusError> {
     let t0 = Instant::now();
     let (plan, metas, wire_blocks, plan_ns) =
         wire_plan_phase(query, params, milestone, blocks, pipeline)?;
     plan_stage_stats::BLOCKS.fetch_add(blocks.len() as u64, Ordering::Relaxed);
     plan_stage_stats::HEAD_NS.fetch_add(plan_ns, Ordering::Relaxed);
+    let work_ns = t0.elapsed().as_nanos() as u64;
+    plan_stage_stats::TOTAL_NS.fetch_add(work_ns, Ordering::Relaxed);
+    Ok(PlanStampOutcome {
+        plan,
+        work_ns,
+        metas,
+        wire_blocks,
+    })
+}
+
+/// IBD **prep** after plan: pin denserels once (Allow) + assemble.
+///
+/// Uses the owned stamped plan — does **not** re-run plan_mega / head resolve.
+pub fn confirm_wire_prep_from_plan(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    stamped: PlanStampOutcome,
+    pipeline: Option<&WirePrepPipeline>,
+    preverified: &ScriptPreverified,
+) -> Result<ConfirmLoadOutcome, ConsensusError> {
+    let t_work = Instant::now();
+    let t_load = Instant::now();
+    let PlanStampOutcome {
+        plan,
+        metas,
+        wire_blocks,
+        ..
+    } = stamped;
 
     let ifo = pipeline.map(|p| p.in_flight_outs.as_ref());
-    // Single denserels path: pin with Allow (residency hit or one OutsDenserels load).
-    // Do **not** pre-ensure then re-pin Forbid — that double-walked parents and
-    // lost denserels to FIFO eviction between plan and prep.
-    let (batch_parents, batch_thin, warm) = pin_for_wire_batch(
+    let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),
         &metas,
@@ -823,48 +841,11 @@ pub fn confirm_wire_plan_and_pin(
         ifo,
         ColdPinMode::Allow,
     )?;
-    plan_stage_stats::note(
-        0,
-        warm.parents as u64,
-        warm.already as u64,
-        warm.cold as u64,
-        warm.same_batch as u64,
-        0,
-        0,
-        0,
-        warm.work_ns,
+
+    confirm_phase_stats::LOAD_NS.fetch_add(
+        t_load.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
     );
-
-    let work_ns = t0.elapsed().as_nanos() as u64;
-    plan_stage_stats::TOTAL_NS.fetch_add(work_ns, Ordering::Relaxed);
-    Ok(PlanPinOutcome {
-        plan,
-        warm,
-        work_ns,
-        metas,
-        wire_blocks,
-        batch_parents,
-        batch_thin,
-    })
-}
-
-/// IBD **prep** after plan: assemble only. Pin already completed on plan thread.
-pub fn confirm_wire_assemble_after_plan(
-    query: &Query,
-    params: &ChainParams,
-    milestone: Milestone,
-    outcome: PlanPinOutcome,
-    preverified: &ScriptPreverified,
-) -> Result<ConfirmLoadOutcome, ConsensusError> {
-    let t_work = Instant::now();
-    let PlanPinOutcome {
-        plan,
-        metas,
-        wire_blocks,
-        batch_parents,
-        batch_thin,
-        ..
-    } = outcome;
 
     let prepared = assemble_run(
         query,
@@ -891,8 +872,6 @@ pub fn confirm_wire_assemble_after_plan(
 }
 
 /// Plan + ensure denserels into residency only (no pin). Unit tests.
-///
-/// Prefer [`confirm_wire_plan_and_pin`] for IBD (avoids residency FIFO race).
 pub fn confirm_wire_plan_and_ensure_denserels(
     query: &Query,
     params: &ChainParams,

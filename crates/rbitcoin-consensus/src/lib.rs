@@ -386,12 +386,11 @@ pub fn confirm_archived_at(
 pub use confirm_run::{
     confirm_archived_run, confirm_archived_run_preverified, confirm_load_phase,
     confirm_load_phase_preverified, confirm_script_phase, confirm_scripts_phase,
-    confirm_wire_assemble_after_plan, confirm_wire_plan_and_ensure_denserels,
-    confirm_wire_plan_and_pin, confirm_wire_prep_phase, confirm_wire_prep_phase_pipelined,
-    confirm_wire_run, confirm_wire_run_preverified, confirm_write_phase,
-    ensure_external_parent_denserels_from_plan, plan_stage_stats, ColdPinMode, ConfirmLoadOutcome,
-    ConfirmScriptOutcome, DenserelsWarmStats, LoadedBatch, PlanPinOutcome, ScriptOkBatch,
-    ScriptPreverified, WirePrepPipeline,
+    confirm_wire_plan_and_ensure_denserels, confirm_wire_plan_stamp, confirm_wire_prep_from_plan,
+    confirm_wire_prep_phase, confirm_wire_prep_phase_pipelined, confirm_wire_run,
+    confirm_wire_run_preverified, confirm_write_phase, ensure_external_parent_denserels_from_plan,
+    plan_stage_stats, ColdPinMode, ConfirmLoadOutcome, ConfirmScriptOutcome, DenserelsWarmStats,
+    LoadedBatch, PlanStampOutcome, ScriptOkBatch, ScriptPreverified, WirePrepPipeline,
 };
 
 /// Accept + archive + confirm in one step (genesis / tip extension / tests).

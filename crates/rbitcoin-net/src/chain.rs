@@ -8,10 +8,10 @@ use bitcoin::{Block, BlockHash, Transaction, Work};
 use std::sync::RwLock;
 use rbitcoin_consensus::{
     accept_and_archive_block, accept_and_connect_block_preverified, confirm_archived_run,
-    confirm_load_phase, confirm_script_phase, confirm_scripts_phase,
-    confirm_wire_assemble_after_plan as consensus_assemble_after_plan, confirm_wire_plan_and_pin,
-    confirm_wire_prep_phase_pipelined, confirm_write_phase, genesis_block, header_to_record,
-    ChainParams, Milestone, PlanPinOutcome, ScriptOkBatch, ScriptPreverified, WirePrepPipeline,
+    confirm_load_phase, confirm_script_phase, confirm_scripts_phase, confirm_wire_plan_stamp,
+    confirm_wire_prep_from_plan as consensus_prep_from_plan, confirm_wire_prep_phase_pipelined,
+    confirm_write_phase, genesis_block, header_to_record, ChainParams, Milestone, PlanStampOutcome,
+    ScriptOkBatch, ScriptPreverified, WirePrepPipeline,
 };
 use rbitcoin_log::info;
 use rbitcoin_primitives::{Fk, Height};
@@ -284,17 +284,16 @@ impl ChainHub {
         }
     }
 
-    /// IBD **plan** stage: structure + stamp create_fk + pin parents (cold denserels
-    /// once). Returns owned [`PlanPinOutcome`] for assemble on the prep thread.
+    /// IBD **plan** stage: structure + stamp create_fk only (no denserels pin).
     pub fn confirm_wire_plan_phase(
         &self,
         blocks: &[(Height, Block)],
         pipeline: Option<&WirePrepPipeline>,
-    ) -> Result<Option<PlanPinOutcome>, NetError> {
+    ) -> Result<Option<PlanStampOutcome>, NetError> {
         let Some(contig) = self.confirm_wire_contig(blocks, pipeline) else {
             return Ok(None);
         };
-        let out = confirm_wire_plan_and_pin(
+        let out = confirm_wire_plan_stamp(
             &self.query,
             &self.params,
             self.milestone,
@@ -305,16 +304,18 @@ impl ChainHub {
         Ok(Some(out))
     }
 
-    /// IBD **prep** after plan: assemble only (pin already on plan thread).
-    pub fn confirm_wire_assemble_after_plan(
+    /// IBD **prep** after plan: pin denserels + assemble (does not re-plan).
+    pub fn confirm_wire_prep_from_plan(
         &self,
-        outcome: PlanPinOutcome,
+        stamped: PlanStampOutcome,
+        pipeline: Option<&WirePrepPipeline>,
     ) -> Result<rbitcoin_consensus::ConfirmLoadOutcome, NetError> {
-        consensus_assemble_after_plan(
+        consensus_prep_from_plan(
             &self.query,
             &self.params,
             self.milestone,
-            outcome,
+            stamped,
+            pipeline,
             &ScriptPreverified::new(),
         )
         .map_err(|e| NetError::Consensus(e.to_string()))
@@ -329,7 +330,7 @@ impl ChainHub {
     ///
     /// One-shot path (tests / tip-follow): plan+pin+assemble with cold denserels
     /// allowed. IBD uses [`Self::confirm_wire_plan_phase`] then
-    /// [`Self::confirm_wire_assemble_after_plan`].
+    /// [`Self::confirm_wire_prep_from_plan`].
     pub fn confirm_wire_prep_phase(
         &self,
         blocks: &[(Height, Block)],
@@ -339,7 +340,7 @@ impl ChainHub {
 
     /// Prep with optional pipeline caches (reserved create fks + in-flight creates).
     ///
-    /// Cold denserels **allowed** (tests / one-shot). IBD splits plan pin + assemble.
+    /// Cold denserels **allowed** (tests / one-shot). IBD: plan stamps, prep pins.
     pub fn confirm_wire_prep_phase_pipelined(
         &self,
         blocks: &[(Height, Block)],

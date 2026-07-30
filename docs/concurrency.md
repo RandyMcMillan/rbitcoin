@@ -7,13 +7,13 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 | Role | Threading | Store writes |
 |------|-----------|--------------|
 | Peer IO (N tasks) | tokio multi-thread | none; decoded blocks **offer body queue only**; note height/hash readiness on confirm feed |
-| Confirm **plan** | 1 OS thread | load wire from **body queue**; structure + **plan** Class A (stamp create_fk) + **pin** parents (cold denserels once; BatchParents owned) |
-| Confirm **prep** | 1 OS thread | **assemble only** (no re-plan, no denserels pin — avoids residency FIFO eviction race) |
+| Confirm **plan** | 1 OS thread | load wire from **body queue**; structure + **plan** Class A (stamp create_fk only) |
+| Confirm **prep** | 1 OS thread | pin denserels + assemble from owned stamped plan (no re-plan / no head resolve) |
 | Confirm **scripts** | 1 OS thread + rayon | **none** — pure CPU |
 | Confirm **commit** | 1 OS thread | **sole Class A appender** + structural + Class C + spend annotate + tip GC; **`block_queue_dequeue_height`** |
 | IBD main loop | 1 tokio task | none (orchestration only) |
 
-**Height-ordered unified pipeline (current):** peer → **body queue** → **plan** (structure + stamp create_fk + pin denserels once into BatchParents) → **prep** (assemble only) → scripts → single commit era. **No** peer→confirm-feed wire retain. **No** hash-only / Class-A-only confirm (bq wire required). Prep must **not** re-plan or re-pin denserels (FIFO residency handoff races under full caps). Optional **archive-job + ContigPark** remains only for unknown-height bodies.
+**Height-ordered unified pipeline (current):** peer → **body queue** → **plan** (structure + stamp create_fk) → **prep** (pin denserels + assemble) → scripts → single commit era. **No** peer→confirm-feed wire retain. **No** hash-only / Class-A-only confirm (bq wire required). Prep must **not** re-run plan head resolve; handoff is owned `ArchiveWritePlan` (not residency FIFO seed → Forbid). Optional **archive-job + ContigPark** remains only for unknown-height bodies.
 
 **Tip follow / reorg:** peer wire via `ChainHub::accept_block` / `accept_branch` → `accept_and_connect_block` (same wire prep path with cold denserels allowed on the one-shot call). Disconnect keeps Class A archive; re-extension always supplies **wire** from the peer, not hash-only load.
 

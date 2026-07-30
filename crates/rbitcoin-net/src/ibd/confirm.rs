@@ -5,7 +5,7 @@ use super::status::LoopStats;
 use crate::chain::ChainHub;
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
-use rbitcoin_consensus::{PlanPinOutcome, WirePrepPipeline};
+use rbitcoin_consensus::{PlanStampOutcome, WirePrepPipeline};
 use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
@@ -288,12 +288,14 @@ pub(crate) const WRITE_QUEUE_CAP: usize = 5;
 const MAX_CLAIM_AHEAD: u32 = (PLAN_QUEUE_CAP + LOAD_QUEUE_CAP + WRITE_QUEUE_CAP + 1) as u32
     * CONFIRM_RUN_MAX as u32;
 
-/// Plan-stage output: pin complete (BatchParents owned). Prep only assembles.
+/// Plan-stage output: stamp only. Prep pins denserels + assembles.
 struct PlanDone {
     /// Heights/hashes for feed finish/requeue bookkeeping.
     heights_hashes: Vec<(u32, BlockHash)>,
-    /// Full plan+pin outcome (wire Arc, parents, thin, archive plan).
-    outcome: PlanPinOutcome,
+    /// Structure + plan_mega (create_fk stamped); no denserels pin yet.
+    stamped: PlanStampOutcome,
+    /// In-flight creates/outs for prep pin (prior uncommitted batches).
+    pipeline: WirePrepPipeline,
 }
 
 /// Live depths **and contents** of the bounded confirm pipeline queues.
@@ -480,10 +482,10 @@ pub(crate) fn is_confirm_load_retryable(msg: &str) -> bool {
 
 /// Spawn confirm **plan** + **prep** + **scripts** + **write** OS threads.
 ///
-/// Plan (claim + structure/plan stamp + pin denserels once) → depth-5 →
-/// prep (assemble only) → scripts → write.
-/// Overlap: plan(N+2) ∥ prep(N+1) ∥ scripts(N) ∥ write(N−1).
-/// Pin lives on plan so denserels never rely on CreateResidency FIFO across the queue.
+/// Plan (claim + structure + stamp create_fk) → depth-5 →
+/// prep (pin denserels + assemble) → scripts → write.
+/// Overlap: plan(N+1) head-stamp ∥ prep(N) denserels ∥ scripts ∥ write.
+/// Handoff is owned [`PlanStampOutcome`] (not residency FIFO).
 /// Returns the plan-thread join handle and shared queue-depth counters.
 pub(crate) fn spawn_confirm_engine(
     hub: Arc<ChainHub>,
@@ -729,7 +731,7 @@ pub(crate) fn spawn_confirm_engine(
         })
         .expect("spawn ibd-confirm");
 
-    // Prep: plan-complete batches → assemble only → scripts. Pin already done.
+    // Prep: stamped batches → pin denserels + assemble → scripts.
     let hub_prep = Arc::clone(&hub);
     let feed_prep = Arc::clone(&feed);
     let event_tx_prep = event_tx.clone();
@@ -739,7 +741,7 @@ pub(crate) fn spawn_confirm_engine(
         .name("ibd-confirm-load".into())
         .spawn(move || {
             info!(
-                "ibd: confirm prep on dedicated OS thread (planq → assemble only)"
+                "ibd: confirm prep on dedicated OS thread (planq → pin denserels+assemble)"
             );
             while let Ok(done) = plan_rx.recv() {
                 let n = done.heights_hashes.len();
@@ -748,8 +750,9 @@ pub(crate) fn spawn_confirm_engine(
                     break;
                 }
 
-                let plan_ns = done.outcome.work_ns;
+                let plan_ns = done.stamped.work_ns;
                 let heights_hashes = done.heights_hashes;
+                let pipe = done.pipeline;
                 if heights_hashes.is_empty() {
                     continue;
                 }
@@ -769,7 +772,8 @@ pub(crate) fn spawn_confirm_engine(
                     stats: &loop_stats_prep,
                 };
 
-                let mat_res = hub_prep.confirm_wire_assemble_after_plan(done.outcome);
+                // Pin denserels (Allow) + assemble using owned stamped plan — no re-plan.
+                let mat_res = hub_prep.confirm_wire_prep_from_plan(done.stamped, Some(&pipe));
                 drop(_live_guard);
 
                 if feed_prep.stopped() || hub_prep.query.confirm_cancelled() {
@@ -868,7 +872,7 @@ pub(crate) fn spawn_confirm_engine(
         .name("ibd-confirm-plan".into())
         .spawn(move || {
             info!(
-                "ibd: confirm plan on dedicated OS thread (claim → plan+pin → prep queue/{PLAN_QUEUE_CAP})"
+                "ibd: confirm plan on dedicated OS thread (claim → stamp create_fk → prep queue/{PLAN_QUEUE_CAP})"
             );
             let mut plan_ahead = PrepAheadState::new(&hub);
             loop {
@@ -1092,24 +1096,19 @@ pub(crate) fn spawn_confirm_engine(
                             feed.finish(wire_batch.iter().map(|(h, _, _)| *h));
                         }
                     }
-                    Ok(Some(outcome)) => {
-                        let st = outcome.warm;
-                        let work_ns = outcome.work_ns;
+                    Ok(Some(stamped)) => {
+                        let work_ns = stamped.work_ns;
                         let ms = work_ns / 1_000_000;
-                        if ms > 500 || st.cold > 5_000 {
+                        if ms > 500 {
                             info!(
-                                "ibd: confirm plan first={expect_h} n={} parents={} cold={} already={} same_batch={} ms={}",
+                                "ibd: confirm plan first={expect_h} n={} stamp_ms={}",
                                 wire_batch.len(),
-                                st.parents,
-                                st.cold,
-                                st.already,
-                                st.same_batch,
                                 ms,
                             );
                         }
                         // Reserve create fks for plan(N+1) while this batch is still
                         // in prep/scripts/write (prep-ahead in-flight).
-                        if let Some(ref p) = outcome.plan {
+                        if let Some(ref p) = stamped.plan {
                             if let Some((lh, raw)) = wire_batch
                                 .iter()
                                 .map(|(h, ha, _)| (*h, ha.to_byte_array()))
@@ -1120,6 +1119,8 @@ pub(crate) fn spawn_confirm_engine(
                         } else if let Some((lh, ha, _)) = wire_batch.last() {
                             plan_ahead.last_prepped = Some((*lh, ha.to_byte_array()));
                         }
+                        // Pipeline after note_plan_ok: prep pin sees prior+this offline denserels.
+                        let pipe_for_prep = plan_ahead.pipeline_for(expect_h, store_path_lo);
                         let heights_hashes: Vec<(u32, BlockHash)> = wire_batch
                             .iter()
                             .map(|(h, ha, _)| (*h, *ha))
@@ -1128,7 +1129,8 @@ pub(crate) fn spawn_confirm_engine(
                         if plan_tx
                             .send(PlanDone {
                                 heights_hashes,
-                                outcome,
+                                stamped,
+                                pipeline: pipe_for_prep,
                             })
                             .is_err()
                         {

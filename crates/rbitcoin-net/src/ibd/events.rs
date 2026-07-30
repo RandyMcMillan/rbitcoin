@@ -725,7 +725,11 @@ pub(crate) fn apply_confirm_reject(
         || err.contains("unexpected previous")
         // Prep/layout bug after Class A commit: do not permanent-blacklist tip+1;
         // drop body-queue wire and re-prep (write now re-fills denserels abs).
-        || err.contains("missing pin denserels");
+        || err.contains("missing pin denserels")
+        // Plan/prep denserels race or transient residency miss — re-get, never freeze tip.
+        || err.contains("plan stage miss")
+        || err.contains("denserels stage miss")
+        || err.contains("plan stage failed to load");
     if soft_reget {
         release_confirm_archive_charge(st, &hash, archive_queued);
         clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);

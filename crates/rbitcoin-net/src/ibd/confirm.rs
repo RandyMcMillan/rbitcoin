@@ -5,7 +5,7 @@ use super::status::LoopStats;
 use crate::chain::ChainHub;
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
-use rbitcoin_consensus::WirePrepPipeline;
+use rbitcoin_consensus::{PlanPinOutcome, WirePrepPipeline};
 use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;
 use std::collections::HashMap;
@@ -288,16 +288,12 @@ pub(crate) const WRITE_QUEUE_CAP: usize = 5;
 const MAX_CLAIM_AHEAD: u32 = (PLAN_QUEUE_CAP + LOAD_QUEUE_CAP + WRITE_QUEUE_CAP + 1) as u32
     * CONFIRM_RUN_MAX as u32;
 
-/// Plan-stage output: bq wire + ArchiveWritePlan + denserels ensured in residency.
+/// Plan-stage output: pin complete (BatchParents owned). Prep only assembles.
 struct PlanDone {
-    /// Every entry has wire from the body queue.
-    batch: Vec<(u32, BlockHash, bitcoin::Block)>,
-    /// Class A plan (create_fk stamped); owned by prep for pin+write.
-    plan: Option<rbitcoin_query::ArchiveWritePlan>,
-    /// Wall ns for plan+ensure (perf / slow-batch logs).
-    warm_ns: u64,
-    /// In-flight creates/outs for prep pin (prior uncommitted + this batch).
-    pipeline: WirePrepPipeline,
+    /// Heights/hashes for feed finish/requeue bookkeeping.
+    heights_hashes: Vec<(u32, BlockHash)>,
+    /// Full plan+pin outcome (wire Arc, parents, thin, archive plan).
+    outcome: PlanPinOutcome,
 }
 
 /// Live depths **and contents** of the bounded confirm pipeline queues.
@@ -484,9 +480,10 @@ pub(crate) fn is_confirm_load_retryable(msg: &str) -> bool {
 
 /// Spawn confirm **plan** + **prep** + **scripts** + **write** OS threads.
 ///
-/// Plan (claim + structure/plan stamp + external denserels into CreateResidency)
-/// → depth-5 → prep (pin Forbid + assemble, no re-plan) → scripts → write.
+/// Plan (claim + structure/plan stamp + pin denserels once) → depth-5 →
+/// prep (assemble only) → scripts → write.
 /// Overlap: plan(N+2) ∥ prep(N+1) ∥ scripts(N) ∥ write(N−1).
+/// Pin lives on plan so denserels never rely on CreateResidency FIFO across the queue.
 /// Returns the plan-thread join handle and shared queue-depth counters.
 pub(crate) fn spawn_confirm_engine(
     hub: Arc<ChainHub>,
@@ -732,7 +729,7 @@ pub(crate) fn spawn_confirm_engine(
         })
         .expect("spawn ibd-confirm");
 
-    // Prep: plan-complete batches → pin (Forbid) + assemble → scripts. No re-plan.
+    // Prep: plan-complete batches → assemble only → scripts. Pin already done.
     let hub_prep = Arc::clone(&hub);
     let feed_prep = Arc::clone(&feed);
     let event_tx_prep = event_tx.clone();
@@ -742,23 +739,22 @@ pub(crate) fn spawn_confirm_engine(
         .name("ibd-confirm-load".into())
         .spawn(move || {
             info!(
-                "ibd: confirm prep on dedicated OS thread (planq → pin Forbid+assemble)"
+                "ibd: confirm prep on dedicated OS thread (planq → assemble only)"
             );
             while let Ok(done) = plan_rx.recv() {
-                let n = done.batch.len();
+                let n = done.heights_hashes.len();
                 queues_prep.note_plan_recv(n);
                 if feed_prep.stopped() || hub_prep.query.confirm_cancelled() {
                     break;
                 }
 
-                let plan_ns = done.warm_ns;
-                let plan = done.plan;
-                let pipe = done.pipeline;
-                let batch = done.batch;
-                if batch.is_empty() {
+                let plan_ns = done.outcome.work_ns;
+                let heights_hashes = done.heights_hashes;
+                if heights_hashes.is_empty() {
                     continue;
                 }
-                let expect_h = batch[0].0;
+                let expect_h = heights_hashes[0].0;
+                let first_hash = heights_hashes[0].1;
 
                 struct LiveGuard<'a> {
                     stats: &'a LoopStats,
@@ -768,23 +764,12 @@ pub(crate) fn spawn_confirm_engine(
                         self.stats.confirm_end();
                     }
                 }
-                loop_stats_prep.confirm_begin(expect_h, batch.len() as u32);
+                loop_stats_prep.confirm_begin(expect_h, heights_hashes.len() as u32);
                 let _live_guard = LiveGuard {
                     stats: &loop_stats_prep,
                 };
 
-                // Plan already stamped create_fks + ensured denserels into residency.
-                // Pin with Forbid (no cold denserels on prep thread).
-                let wire_batch: Vec<(rbitcoin_primitives::Height, bitcoin::Block)> = batch
-                    .iter()
-                    .map(|(h, _, w)| (rbitcoin_primitives::Height(*h), w.clone()))
-                    .collect();
-                let mat_res = hub_prep.confirm_wire_prep_after_plan(
-                    &wire_batch,
-                    plan,
-                    Some(&pipe),
-                    rbitcoin_consensus::ColdPinMode::Forbid,
-                );
+                let mat_res = hub_prep.confirm_wire_assemble_after_plan(done.outcome);
                 drop(_live_guard);
 
                 if feed_prep.stopped() || hub_prep.query.confirm_cancelled() {
@@ -794,55 +779,9 @@ pub(crate) fn spawn_confirm_engine(
                 }
 
                 match mat_res {
-                    Ok(None) => {
-                        let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
-                            .iter()
-                            .filter(|(_, ha, _)| !hub_prep.has_block(ha))
-                            .map(|(h, ha, _)| (*h, *ha, None))
-                            .collect();
-                        if !retry.is_empty() {
-                            static N: AtomicU32 = AtomicU32::new(0);
-                            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n <= 3 || n % 500 == 0 {
-                                debug!(
-                                    "ibd: confirm prep empty outcome first={expect_h} n={} \
-                                     (path not contiguous from tip+1 / already confirmed; \
-                                      re-queue, count={n})",
-                                    retry.len()
-                                );
-                            }
-                            feed_prep.requeue_wire(&retry);
-                            std::thread::sleep(Duration::from_millis(5));
-                        } else {
-                            feed_prep.finish(batch.iter().map(|(h, _, _)| *h));
-                        }
-                    }
-                    Ok(Some(outcome)) => {
+                    Ok(outcome) => {
                         let work_ms = outcome.work_ns / 1_000_000;
                         let prepared_n = outcome.batch.len();
-                        let prepared_heights: std::collections::HashSet<u32> = outcome
-                            .batch
-                            .heights_hashes()
-                            .into_iter()
-                            .map(|(h, _)| h)
-                            .collect();
-                        if prepared_n != batch.len() {
-                            let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
-                                .iter()
-                                .filter(|(h, ha, _)| {
-                                    !prepared_heights.contains(h) && !hub_prep.has_block(ha)
-                                })
-                                .map(|(h, ha, _)| (*h, *ha, None))
-                                .collect();
-                            if !tail.is_empty() {
-                                warn!(
-                                    "ibd: confirm prep prepared_n={prepared_n} != claim_n={} first={expect_h} re-queue tail={}",
-                                    batch.len(),
-                                    tail.len()
-                                );
-                                feed_prep.requeue_wire(&tail);
-                            }
-                        }
                         let wire = outcome.batch.approx_wire_bytes();
                         let parents = outcome.batch.parent_count();
                         if mat_tx
@@ -856,56 +795,56 @@ pub(crate) fn spawn_confirm_engine(
                         if work_ms > 2_000 {
                             info!(
                                 "ibd: confirm prep slow batch={prepared_n} claim={} first={expect_h} work_ms={work_ms} plan_ms={}",
-                                batch.len(),
+                                heights_hashes.len(),
                                 plan_ns / 1_000_000,
                             );
                         }
                     }
                     Err(e) => {
-                        let (expect, hash, _) = batch[0];
                         let msg = e.to_string();
                         if msg.contains("confirm cancelled") {
-                            info!("ibd: confirm prep cancelled @ {expect}");
+                            info!("ibd: confirm prep cancelled @ {expect_h}");
                             drop(mat_tx);
                             let _ = scripts.join();
                             return;
                         }
                         if is_confirm_load_retryable(&msg) {
-                            let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
-                                .iter()
-                                .filter(|(_, ha, _)| !hub_prep.has_block(ha))
-                                .map(|(h, ha, _)| (*h, *ha, None))
-                                .collect();
+                            let retry: Vec<(u32, BlockHash, Option<bitcoin::Block>)> =
+                                heights_hashes
+                                    .iter()
+                                    .filter(|(_, ha)| !hub_prep.has_block(ha))
+                                    .map(|(h, ha)| (*h, *ha, None))
+                                    .collect();
                             feed_prep.requeue_wire(&retry);
                             static N: AtomicU32 = AtomicU32::new(0);
                             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
                             if n <= 3 || n % 200 == 0 {
                                 warn!(
-                                    "ibd: confirm prep incomplete @ {expect} {hash} — re-queue (n={n}): {msg}"
+                                    "ibd: confirm prep incomplete @ {expect_h} {first_hash} — re-queue (n={n}): {msg}"
                                 );
                             }
                             std::thread::sleep(Duration::from_millis(50));
                             continue;
                         }
-                        // Plan should not have handed this off without denserels coverage.
-                        if batch.len() > 1 {
-                            let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> = batch
-                                .iter()
-                                .skip(1)
-                                .filter(|(_, ha, _)| !hub_prep.has_block(ha))
-                                .map(|(h, ha, _)| (*h, *ha, None))
-                                .collect();
+                        if heights_hashes.len() > 1 {
+                            let tail: Vec<(u32, BlockHash, Option<bitcoin::Block>)> =
+                                heights_hashes
+                                    .iter()
+                                    .skip(1)
+                                    .filter(|(_, ha)| !hub_prep.has_block(ha))
+                                    .map(|(h, ha)| (*h, *ha, None))
+                                    .collect();
                             feed_prep.requeue_wire(&tail);
                         }
-                        feed_prep.finish(std::iter::once(expect));
+                        feed_prep.finish(std::iter::once(expect_h));
                         loop_stats_prep
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
-                        warn!("ibd: confirm prep reject {hash} @ {expect}: {e}");
+                        warn!("ibd: confirm prep reject {first_hash} @ {expect_h}: {e}");
                         if event_tx_prep
                             .send(ConfirmEvent::Reject {
-                                height: expect,
-                                hash,
+                                height: expect_h,
+                                hash: first_hash,
                                 err: msg,
                             })
                             .is_err()
@@ -929,7 +868,7 @@ pub(crate) fn spawn_confirm_engine(
         .name("ibd-confirm-plan".into())
         .spawn(move || {
             info!(
-                "ibd: confirm plan on dedicated OS thread (claim → plan+denserels → prep queue/{PLAN_QUEUE_CAP})"
+                "ibd: confirm plan on dedicated OS thread (claim → plan+pin → prep queue/{PLAN_QUEUE_CAP})"
             );
             let mut plan_ahead = PrepAheadState::new(&hub);
             loop {
@@ -1153,7 +1092,9 @@ pub(crate) fn spawn_confirm_engine(
                             feed.finish(wire_batch.iter().map(|(h, _, _)| *h));
                         }
                     }
-                    Ok(Some((plan, st, work_ns))) => {
+                    Ok(Some(outcome)) => {
+                        let st = outcome.warm;
+                        let work_ns = outcome.work_ns;
                         let ms = work_ns / 1_000_000;
                         if ms > 500 || st.cold > 5_000 {
                             info!(
@@ -1168,7 +1109,7 @@ pub(crate) fn spawn_confirm_engine(
                         }
                         // Reserve create fks for plan(N+1) while this batch is still
                         // in prep/scripts/write (prep-ahead in-flight).
-                        if let Some(ref p) = plan {
+                        if let Some(ref p) = outcome.plan {
                             if let Some((lh, raw)) = wire_batch
                                 .iter()
                                 .map(|(h, ha, _)| (*h, ha.to_byte_array()))
@@ -1179,15 +1120,15 @@ pub(crate) fn spawn_confirm_engine(
                         } else if let Some((lh, ha, _)) = wire_batch.last() {
                             plan_ahead.last_prepped = Some((*lh, ha.to_byte_array()));
                         }
-                        // Pipeline snapshot for prep pin (in-flight after note_plan_ok).
-                        let pipe_for_prep = plan_ahead.pipeline_for(expect_h, store_path_lo);
-                        let n = wire_batch.len();
+                        let heights_hashes: Vec<(u32, BlockHash)> = wire_batch
+                            .iter()
+                            .map(|(h, ha, _)| (*h, *ha))
+                            .collect();
+                        let n = heights_hashes.len();
                         if plan_tx
                             .send(PlanDone {
-                                batch: wire_batch,
-                                plan,
-                                warm_ns: work_ns,
-                                pipeline: pipe_for_prep,
+                                heights_hashes,
+                                outcome,
                             })
                             .is_err()
                         {

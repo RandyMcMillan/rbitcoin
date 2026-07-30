@@ -496,6 +496,13 @@ impl Query {
         let t0 = Instant::now();
         let mut st = ResidencyPrewarmStats::default();
 
+        // No long-lived cache: skip multi‑GiB fill; commit res_seed + pin still
+        // populate a small FIFO for the in-flight window.
+        if !self.create_residency.cache_enabled() {
+            st.ms = t0.elapsed().as_millis() as u64;
+            return Ok(st);
+        }
+
         // ── 1. Range-only CreateResidency fill ────────────────────────────
         let t_range = Instant::now();
         let cap = self.create_residency.size_stats().1;

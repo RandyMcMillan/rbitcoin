@@ -19,7 +19,10 @@ mod wave_prevout;
 pub use combined_stage::{
     body_ok_reads, load_creates_once, reset_body_ok_reads, CombinedCreate,
 };
-pub use create_residency::{CreateResidency, DEFAULT_CREATE_CAP, DEFAULT_OUT_CAP};
+pub use create_residency::{
+    confirm_cache_enabled, CreateResidency, DEFAULT_CREATE_CAP, DEFAULT_OUT_CAP,
+    NO_CACHE_CREATE_CAP, NO_CACHE_OUT_CAP,
+};
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};
@@ -66,6 +69,8 @@ pub struct ProcessOwnedSizes {
     pub residency_create_cap: usize,
     pub residency_outs: u64,
     pub residency_out_cap: u64,
+    /// `RBITCOIN_CONFIRM_CACHE` effective (false = in-flight FIFO only).
+    pub confirm_cache: bool,
     pub sh_runs: usize,
     pub sh_memtable: usize,
     pub sh_heads: usize,
@@ -1153,6 +1158,7 @@ impl Query {
             residency_create_cap: res_create_cap,
             residency_outs: res_outs,
             residency_out_cap: res_out_cap,
+            confirm_cache: self.create_residency.cache_enabled(),
             sh_runs: self.sh_run.on_disk_run_count(),
             sh_memtable: self.sh_run.memtable_len(),
             sh_heads: self.sh_heads.lock().unwrap().len(),

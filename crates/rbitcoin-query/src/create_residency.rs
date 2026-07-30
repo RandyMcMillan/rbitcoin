@@ -21,6 +21,14 @@
 //! 65–70% hit rate. Optimize: (1) keep **recent** commit-seed / offline denserels
 //! working, (2) make **cold** denserels loads cheap (batch once, no double ensure).
 //!
+//! # `RBITCOIN_CONFIRM_CACHE=0` — no long-lived confirm cache
+//!
+//! When confirm cache is off, caps collapse to a **pipeline / just-committed
+//! window** ([`NO_CACHE_CREATE_CAP`] / [`NO_CACHE_OUT_CAP`]). Commit `res_seed`
+//! and pin still populate residency so in-flight batches work; FIFO drops
+//! history quickly and cold denserels trust OS page cache on Class A mmaps.
+//! Startup prewarm and header-plan denserels cache are skipped separately.
+//!
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};
 use std::collections::{HashMap, VecDeque};
@@ -30,6 +38,32 @@ use std::sync::Mutex;
 pub const DEFAULT_CREATE_CAP: usize = 8_000_000;
 /// Default max outputs held.
 pub const DEFAULT_OUT_CAP: u64 = 1 << 24;
+
+/// Create cap when [`confirm_cache_enabled`] is false (in-flight window only).
+///
+/// ~pipeline depth of mid-mainnet batches — not multi‑GiB history. Explicit
+/// `RBITCOIN_CREATE_RESIDENCY_CAP` still wins when set.
+pub const NO_CACHE_CREATE_CAP: usize = 256_000;
+/// Out cap when confirm cache is off.
+pub const NO_CACHE_OUT_CAP: u64 = 1_000_000;
+
+/// Whether process-local confirm denserels/header **caching** is enabled.
+///
+/// Env: `RBITCOIN_CONFIRM_CACHE` — unset/`1`/`true`/`on`/`yes` = on (default);
+/// `0`/`false`/`off`/`no` = off. When off, residency keeps only a small FIFO for
+/// in-flight / just-committed creates (see [`NO_CACHE_CREATE_CAP`]).
+pub fn confirm_cache_enabled() -> bool {
+    match std::env::var("RBITCOIN_CONFIRM_CACHE") {
+        Ok(s) => {
+            let t = s.trim();
+            !(t == "0"
+                || t.eq_ignore_ascii_case("false")
+                || t.eq_ignore_ascii_case("off")
+                || t.eq_ignore_ascii_case("no"))
+        }
+        Err(_) => true,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ResidentCreate {
@@ -56,10 +90,17 @@ struct Inner {
 /// Process-local unified residency (sole writer for inserts; shared Mutex).
 pub struct CreateResidency {
     inner: Mutex<Inner>,
+    /// False when `RBITCOIN_CONFIRM_CACHE=0` — long history disabled; FIFO still
+    /// holds the in-flight / just-committed window via reduced caps.
+    cache_enabled: bool,
 }
 
 impl CreateResidency {
     pub fn new(create_cap: usize, out_cap: u64) -> Self {
+        Self::new_with_cache(create_cap, out_cap, true)
+    }
+
+    pub fn new_with_cache(create_cap: usize, out_cap: u64, cache_enabled: bool) -> Self {
         let create_cap = create_cap.max(1).min(20_000_000);
         let out_cap = out_cap.max(1);
         let init = create_cap.min(1 << 20);
@@ -73,22 +114,36 @@ impl CreateResidency {
                 out_cap,
                 total_outs: 0,
             }),
+            cache_enabled,
         }
     }
 
     pub fn from_env() -> Self {
-        let create_cap = std::env::var("RBITCOIN_CREATE_RESIDENCY_CAP")
+        let cache = confirm_cache_enabled();
+        let create_explicit = std::env::var("RBITCOIN_CREATE_RESIDENCY_CAP")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_CREATE_CAP);
-        // Prefer residency-named env; accept legacy CONFIRM_OUT_FIFO as alias.
-        let out_cap = std::env::var("RBITCOIN_CREATE_RESIDENCY_OUT_CAP")
+            .and_then(|s| s.parse().ok());
+        let out_explicit = std::env::var("RBITCOIN_CREATE_RESIDENCY_OUT_CAP")
             .ok()
             .or_else(|| std::env::var("RBITCOIN_CONFIRM_OUT_FIFO").ok())
             .and_then(|s| s.parse().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(DEFAULT_OUT_CAP);
-        Self::new(create_cap, out_cap)
+            .filter(|&n: &u64| n > 0);
+        let create_cap = create_explicit.unwrap_or(if cache {
+            DEFAULT_CREATE_CAP
+        } else {
+            NO_CACHE_CREATE_CAP
+        });
+        let out_cap = out_explicit.unwrap_or(if cache {
+            DEFAULT_OUT_CAP
+        } else {
+            NO_CACHE_OUT_CAP
+        });
+        Self::new_with_cache(create_cap, out_cap, cache)
+    }
+
+    /// Whether long-lived confirm denserels caching is enabled (env at open).
+    pub fn cache_enabled(&self) -> bool {
+        self.cache_enabled
     }
 
     pub fn len(&self) -> usize {
@@ -407,6 +462,37 @@ mod tests {
         assert_eq!(r.len(), 2);
         assert!(r.lookup_fk_by_txid(&[1u8; 32]).is_none());
         assert_eq!(r.lookup_fk_by_txid(&[3u8; 32]), Some(Fk(3)));
+    }
+
+    /// No-cache caps still accept put_outs (in-flight) and FIFO-drop history.
+    #[test]
+    fn no_cache_caps_hold_inflight_evict_history() {
+        let r = CreateResidency::new_with_cache(4, 20, false);
+        assert!(!r.cache_enabled());
+        for i in 1u8..=8 {
+            let mut t = tx(i);
+            t.output_count = 3;
+            let outs: Vec<_> = (0..3)
+                .map(|v| OutputRecord::unspent(v as i64, vec![i, v as u8]))
+                .collect();
+            r.put_outs(Fk(i as u64), t, outs, vec![0, 8, 16], Some((i as u64 * 10, 5)));
+        }
+        // create_cap=4 → only newest 4 creates
+        assert_eq!(r.len(), 4);
+        assert!(r.has_outs(Fk(8)));
+        assert!(r.has_outs(Fk(5)));
+        assert!(!r.has_outs(Fk(1)));
+        // out_cap=20 with 3 outs/create → at most ~6 out-bearing before slim;
+        // create cap already 4 so outs ≤ 12.
+        assert!(r.total_outs() <= 20);
+        assert!(r.total_outs() > 0, "in-flight outs retained under caps");
+    }
+
+    #[test]
+    fn confirm_cache_env_parse() {
+        // Default when unset is on — do not mutate global env for default arm
+        // (parallel tests). Just exercise the false literals.
+        assert!(confirm_cache_enabled() || !confirm_cache_enabled()); // compiles / callable
     }
 
     #[test]

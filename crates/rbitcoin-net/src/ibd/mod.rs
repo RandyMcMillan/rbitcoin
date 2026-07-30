@@ -388,29 +388,38 @@ pub async fn ibd_cancellable(
         0
     }));
     // Startup caches: Class A ranges + bounded denserels + tip-ahead header plans.
-    // Avoids head-resolve storms and cold first confirm batches after restart.
-    match hub.query.archive_residency_prewarm() {
-        Ok(st) => {
-            let (len, create_cap, outs, out_cap) = hub.query.create_residency().size_stats();
-            info!(
-                "ibd: residency prewarm ranges={ranges} denserels={den_c} outs={outs}/{out_cap} \
-                 header_plans={hdr} creates={len}/{create_cap} in {ms}ms \
-                 (range={rms}ms denserels={dms}ms headers={hms}ms)",
-                ranges = st.ranges,
-                den_c = st.denserels_creates,
-                outs = outs,
-                out_cap = out_cap,
-                hdr = st.header_plans,
-                len = len,
-                create_cap = create_cap,
-                ms = st.ms,
-                rms = st.range_ms,
-                dms = st.denserels_ms,
-                hms = st.headers_ms,
-            );
-        }
-        Err(e) => {
-            warn!("ibd: residency prewarm failed (continuing cold): {e}");
+    // Skipped when RBITCOIN_CONFIRM_CACHE=0 (in-flight FIFO only; trust OS pages).
+    if !hub.query.create_residency().cache_enabled() {
+        let (_len, create_cap0, _outs, out_cap0) = hub.query.create_residency().size_stats();
+        info!(
+            "ibd: confirm cache off (RBITCOIN_CONFIRM_CACHE=0) — residency \
+             in-flight FIFO only creates_cap={create_cap0} out_cap={out_cap0} \
+             (skip prewarm; commit res_seed + pin still populate the window)"
+        );
+    } else {
+        match hub.query.archive_residency_prewarm() {
+            Ok(st) => {
+                let (len, create_cap, outs, out_cap) = hub.query.create_residency().size_stats();
+                info!(
+                    "ibd: residency prewarm ranges={ranges} denserels={den_c} outs={outs}/{out_cap} \
+                     header_plans={hdr} creates={len}/{create_cap} in {ms}ms \
+                     (range={rms}ms denserels={dms}ms headers={hms}ms)",
+                    ranges = st.ranges,
+                    den_c = st.denserels_creates,
+                    outs = outs,
+                    out_cap = out_cap,
+                    hdr = st.header_plans,
+                    len = len,
+                    create_cap = create_cap,
+                    ms = st.ms,
+                    rms = st.range_ms,
+                    dms = st.denserels_ms,
+                    hms = st.headers_ms,
+                );
+            }
+            Err(e) => {
+                warn!("ibd: residency prewarm failed (continuing cold): {e}");
+            }
         }
     }
     // Dedicated confirm path — never blocks the network/archive event loop.

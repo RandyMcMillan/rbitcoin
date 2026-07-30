@@ -1475,7 +1475,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
          | body known={} pend={} miss={} charged={} rej={} \
          | body_soft q={}/{}MiB budget={}MiB contig parked={} ready={} next_h={} \
          | bq n={} disk={}MiB/{}MiB pending_ram={}MiB pend_n={} \
-         | residency creates={}/{} outs={}/{} conf_plans={} \
+         | residency creates={}/{} outs={}/{} conf_plans={} cache={} \
          | conf planq={}/{} blks={} prepq={}/{} blks={} wire={}MiB parents={} writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
          | txhead bits={} entry={}B slots={} occ={} body={}MiB segs={} sealed={} class_a={} \
@@ -1516,6 +1516,7 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         o.residency_outs,
         o.residency_out_cap,
         o.conf_plans,
+        if o.confirm_cache { "on" } else { "off" },
         cp.plan_batches,
         s.conf_plan_q_cap,
         cp.plan_blocks,
@@ -1881,6 +1882,10 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("residency creates=80/8000000 outs=900/16777216"), "{line}");
+        assert!(
+            line.contains("cache=off") || line.contains("cache=on"),
+            "sizes must report confirm cache: {line}"
+        );
         assert!(!line.contains("outfifo"), "{line}");
         assert!(!line.contains("sticky_fk="), "{line}");
         assert!(line.contains("prepq=2/5 blks=40 wire=12MiB parents=500"), "{line}");
@@ -1903,6 +1908,7 @@ mod tests {
         s.owned.residency_out_cap = 200;
         let line = format_sizes(&s);
         assert!(line.contains("residency creates=10/100 outs=20/200"), "{line}");
+        assert!(line.contains("cache="), "{line}");
         assert!(!line.contains("outfifo"), "{line}");
         assert!(!line.contains("sticky_fk="), "{line}");
     }

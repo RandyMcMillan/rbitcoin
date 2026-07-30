@@ -23,7 +23,7 @@ Class A far ahead of tip — confirm commit is the sole Class A appender.
 | **Archive queue budget** | default 512 MiB (`RBITCOIN_ARCHIVE_QUEUE_MB`) | Soft-charge **RAM overflow / arch jobs only** (not multi‑GiB disk body queue). `charge` on overflow/job; **`release` only via** `apply_archive_result` on `ArchiveResult::{Ok,Err,Dropped}` (or immediate release if pipeline send fails because the channel is **closed**) |
 | **ContigPark** | horizon `CONTIG_DENSIFY_AHEAD` | Fallback contiguous park → prep/writer; abort via `drain_all` + Err; skip already-Class-A via `force_advance` + **Dropped** |
 | **`BodyPresence.archive_charged`** | one bit per charged fallback body | **Only** `clear_archive_charged` on pipeline result — **never** hygiene-prune |
-| **CreateResidency (sole pin map)** | create/out caps (`RBITCOIN_CREATE_RESIDENCY_CAP`, `RBITCOIN_CREATE_RESIDENCY_OUT_CAP`; legacy alias `RBITCOIN_CONFIRM_OUT_FIFO`) | **Insert-order FIFO** only (no read-LRU). denserels_hit% ~35–50% mid/late mainnet is structural |
+| **CreateResidency (sole pin map)** | create/out caps (`RBITCOIN_CREATE_RESIDENCY_CAP`, `RBITCOIN_CREATE_RESIDENCY_OUT_CAP`; legacy alias `RBITCOIN_CONFIRM_OUT_FIFO`). **`RBITCOIN_CONFIRM_CACHE=0`** forces small caps (256k creates / 1M outs unless CAP env set), skips startup prewarm, disables header-plan denserels cache | **Insert-order FIFO** only (no read-LRU). denserels_hit% ~35–50% mid/late mainnet is structural. Cache=off keeps **in-flight** res_seed/pin; drops multi‑GiB history so OS page cache can stay hot |
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |
 | **SH memtable / runs** | memtable env cap; runs on disk | spill + merge; bulk materialize at tip |
 | **Ordered work path** | `MAX_ORDERED_HEADERS` | `IbdWorkState::hygiene` |
@@ -129,7 +129,7 @@ known retain structures:
 | `work` / `body` | IBD maps + body-presence sets |
 | `body_soft` / `contig` | Soft archive RAM + ContigPark |
 | `bq disk=` / `pending_ram=` | **Disk** payload fill vs **process** overflow only (do not equate disk MiB with RSS) |
-| `residency` | **Sole** pin map: creates/outs vs caps + conf_plans |
+| `residency` | **Sole** pin map: creates/outs vs caps + conf_plans + `cache=on|off` |
 | `conf planq` / `prepq` / `writeq` | Confirm pipeline **queue contents** (batches, blocks, wire MiB, parents) + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |
 | `sh` | SH runs / memtable / tip heads |

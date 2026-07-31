@@ -1106,9 +1106,9 @@ fn wire_plan_phase(
 
 /// Stamp-phase sub-walls for plan_thr diagnosis (structure / prepare / filter / mega).
 ///
-/// Mega is the archive plan_mega wall (assign+collect+res+head+stamp+finish
-/// already timed in `archive_phase_stats`). Head **read** denserels for external
-/// parents lives in mega/head — not Class A body/idx **write** (write stage).
+/// Mega is the archive plan_mega wall (assign+collect+res+head_fk+head_dens+stamp+finish
+/// already timed in `archive_phase_stats`). `head_fk` = get_fk_by_txid_batch;
+/// `head_dens` = plan-time external-parent denserels load; `head` = sum.
 pub mod plan_stamp_sub_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 

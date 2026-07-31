@@ -338,7 +338,6 @@ impl Query {
         }
         let inflight_ns = t_inflight.elapsed().as_nanos() as u64;
 
-        let t_head = Instant::now();
         let mut need_head: Vec<[u8; 32]> = Vec::new();
         for t in &need_vec {
             if !resolved.contains_key(t) {
@@ -351,14 +350,18 @@ impl Query {
         // External parents that miss CreateResidency (head path). Load full
         // outs+denserels once into pipeline-local map — prep would denserels-miss
         // the same creates, so range-only seed was a wasted half-load.
+        //
+        // Timers split (P0): head_fk = pure resolve; head_dens = denserels wave.
+        // Historical `head=` = head_fk + head_dens.
         let mut external_parent_outs: std::collections::HashMap<
             u64,
             (TxRecord, Vec<OutputRecord>, Vec<u32>),
         > = std::collections::HashMap::new();
+        let mut head_pairs: Vec<([u8; 32], Fk)> = Vec::new();
+        let t_head_fk = Instant::now();
         if !need_head.is_empty() {
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
             let hits = self.store.get_fk_by_txid_batch(&need_head)?;
-            let mut head_pairs: Vec<([u8; 32], Fk)> = Vec::new();
             for (txid, fk_opt) in hits {
                 if let Some(fk) = fk_opt {
                     resolved.insert(txid, fk);
@@ -367,17 +370,20 @@ impl Query {
                     head_pairs.push((txid, fk));
                 }
             }
-            if !head_pairs.is_empty() {
-                let fks: Vec<Fk> = head_pairs.iter().map(|(_, f)| *f).collect();
-                external_parent_outs =
-                    crate::combined_stage::load_creates_outs_pipeline_local(
-                        &self.store,
-                        &self.create_residency,
-                        &fks,
-                    )?;
-            }
         }
-        let head_ns = t_head.elapsed().as_nanos() as u64;
+        let head_fk_ns = t_head_fk.elapsed().as_nanos() as u64;
+
+        let t_head_dens = Instant::now();
+        if !head_pairs.is_empty() {
+            let fks: Vec<Fk> = head_pairs.iter().map(|(_, f)| *f).collect();
+            external_parent_outs =
+                crate::combined_stage::load_creates_outs_pipeline_local(
+                    &self.store,
+                    &self.create_residency,
+                    &fks,
+                )?;
+        }
+        let head_dens_ns = t_head_dens.elapsed().as_nanos() as u64;
 
         // Pass 3: stamp create_fk on inputs; tip spends list.
         let t_stamp = Instant::now();
@@ -458,7 +464,8 @@ impl Query {
             collect_ns,
             sticky_ns,
             inflight_ns,
-            head_ns,
+            head_fk_ns,
+            head_dens_ns,
             stamp_ns,
             finish_ns,
         );

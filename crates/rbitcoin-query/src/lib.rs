@@ -268,7 +268,12 @@ pub mod archive_phase_stats {
     pub static PREP_COLLECT_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_STICKY_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_INFLIGHT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Combined head wall (fk resolve + plan denserels); = head_fk + head_dens.
     pub static PREP_HEAD_NS: AtomicU64 = AtomicU64::new(0);
+    /// `get_fk_by_txid_batch` only (probe/idx/body-txid).
+    pub static PREP_HEAD_FK_NS: AtomicU64 = AtomicU64::new(0);
+    /// `load_creates_outs_pipeline_local` for external parents (outs+denserels).
+    pub static PREP_HEAD_DENS_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_STAMP_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_FINISH_NS: AtomicU64 = AtomicU64::new(0);
     /// Reserved HWM + inflight create map publish after plan.
@@ -299,7 +304,7 @@ pub mod archive_phase_stats {
         pub head_hit: u64,
         pub batch_stamp: u64,
         pub resolved_stamp: u64,
-        /// Sticky+head resolve only (prep_sticky + prep_inflight + prep_head).
+        /// Sticky+inflight+head_fk only (not plan denserels load).
         pub resolve_ns: u64,
         pub prep_total_ns: u64,
         pub prep_struct_ns: u64,
@@ -308,7 +313,12 @@ pub mod archive_phase_stats {
         pub prep_collect_ns: u64,
         pub prep_sticky_ns: u64,
         pub prep_inflight_ns: u64,
+        /// head_fk + head_dens (legacy total).
         pub prep_head_ns: u64,
+        /// Pure tx.head resolve (`get_fk_by_txid_batch`).
+        pub prep_head_fk_ns: u64,
+        /// Plan-time denserels for external parents (`load_creates_outs_pipeline_local`).
+        pub prep_head_dens_ns: u64,
         pub prep_stamp_ns: u64,
         pub prep_finish_ns: u64,
         pub prep_publish_ns: u64,
@@ -358,7 +368,11 @@ pub mod archive_phase_stats {
     pub fn sample_and_reset() -> Sample {
         let prep_sticky = PREP_STICKY_NS.swap(0, Ordering::Relaxed);
         let prep_inflight = PREP_INFLIGHT_NS.swap(0, Ordering::Relaxed);
-        let prep_head = PREP_HEAD_NS.swap(0, Ordering::Relaxed);
+        let prep_head_fk = PREP_HEAD_FK_NS.swap(0, Ordering::Relaxed);
+        let prep_head_dens = PREP_HEAD_DENS_NS.swap(0, Ordering::Relaxed);
+        let prep_head = PREP_HEAD_NS
+            .swap(0, Ordering::Relaxed)
+            .max(prep_head_fk.saturating_add(prep_head_dens));
         Sample {
             blocks: BLOCKS.swap(0, Ordering::Relaxed),
             ext_need: EXT_NEED.swap(0, Ordering::Relaxed),
@@ -369,7 +383,7 @@ pub mod archive_phase_stats {
             resolved_stamp: RESOLVED_STAMP.swap(0, Ordering::Relaxed),
             resolve_ns: prep_sticky
                 .saturating_add(prep_inflight)
-                .saturating_add(prep_head),
+                .saturating_add(prep_head_fk),
             prep_total_ns: PREP_TOTAL_NS.swap(0, Ordering::Relaxed),
             prep_struct_ns: PREP_STRUCT_NS.swap(0, Ordering::Relaxed),
             prep_filter_ns: PREP_FILTER_NS.swap(0, Ordering::Relaxed),
@@ -378,6 +392,8 @@ pub mod archive_phase_stats {
             prep_sticky_ns: prep_sticky,
             prep_inflight_ns: prep_inflight,
             prep_head_ns: prep_head,
+            prep_head_fk_ns: prep_head_fk,
+            prep_head_dens_ns: prep_head_dens,
             prep_stamp_ns: PREP_STAMP_NS.swap(0, Ordering::Relaxed),
             prep_finish_ns: PREP_FINISH_NS.swap(0, Ordering::Relaxed),
             prep_publish_ns: PREP_PUBLISH_NS.swap(0, Ordering::Relaxed),
@@ -424,13 +440,18 @@ pub mod archive_phase_stats {
     }
 
     /// Prep sub-phases for one mega-batch plan (`archive_plan_mega_from`).
+    ///
+    /// `head_fk_ns`: pure `get_fk_by_txid_batch`.  
+    /// `head_dens_ns`: plan-time external-parent denserels load.  
+    /// `head` total = head_fk + head_dens (also stored on `PREP_HEAD_NS`).
     #[inline]
     pub fn note_prep_plan(
         assign_ns: u64,
         collect_ns: u64,
         sticky_ns: u64,
         inflight_ns: u64,
-        head_ns: u64,
+        head_fk_ns: u64,
+        head_dens_ns: u64,
         stamp_ns: u64,
         finish_ns: u64,
     ) {
@@ -438,7 +459,12 @@ pub mod archive_phase_stats {
         add(&PREP_COLLECT_NS, collect_ns);
         add(&PREP_STICKY_NS, sticky_ns);
         add(&PREP_INFLIGHT_NS, inflight_ns);
-        add(&PREP_HEAD_NS, head_ns);
+        add(&PREP_HEAD_FK_NS, head_fk_ns);
+        add(&PREP_HEAD_DENS_NS, head_dens_ns);
+        add(
+            &PREP_HEAD_NS,
+            head_fk_ns.saturating_add(head_dens_ns),
+        );
         add(&PREP_STAMP_NS, stamp_ns);
         add(&PREP_FINISH_NS, finish_ns);
     }
@@ -1704,7 +1730,7 @@ mod tests {
 
         let _ = archive_phase_stats::sample_and_reset();
         archive_phase_stats::note_resolve_counts(1, 2, 3, 4, 5, 6, 7);
-        archive_phase_stats::note_prep_plan(1, 2, 3, 4, 5, 6, 7);
+        archive_phase_stats::note_prep_plan(1, 2, 3, 4, 10, 20, 6, 7); // head_fk=10, head_dens=20
         archive_phase_stats::note_prep_batch(10, 1, 2, 3, 4, 1);
         archive_phase_stats::note_write_commit(20, 1, 2, 3, 4, 5, 6, 7, 1);
         archive_phase_stats::note_write_flush(8);
@@ -1712,6 +1738,9 @@ mod tests {
         assert!(a.prep_phases_sum_ns() > 0);
         assert!(a.write_phases_sum_ns() > 0);
         assert_eq!(a.blocks, 1);
+        assert_eq!(a.prep_head_fk_ns, 10);
+        assert_eq!(a.prep_head_dens_ns, 20);
+        assert_eq!(a.prep_head_ns, 30);
 
         class_c_phase_stats::STRONG_NS.store(11, AtomicOrdering::Relaxed);
         class_c_phase_stats::add_sh_part(&class_c_phase_stats::SH_FILTER_NS, 5);

@@ -217,7 +217,12 @@ pub(crate) struct IbdPerfSample {
     pub stamp_mega_assign_ms: u64,
     pub stamp_mega_collect_ms: u64,
     pub stamp_mega_res_ms: u64,
+    /// head_fk + head_dens (legacy total).
     pub stamp_mega_head_ms: u64,
+    /// Pure get_fk_by_txid_batch wall.
+    pub stamp_mega_head_fk_ms: u64,
+    /// Plan-time external-parent denserels load.
+    pub stamp_mega_head_dens_ms: u64,
     pub stamp_mega_stamp_ms: u64,
     pub stamp_mega_finish_ms: u64,
     pub thr_prep_recv_wait_ms: u64,
@@ -264,6 +269,8 @@ pub(crate) struct IbdPerfSample {
     pub arch_prep_sticky_ms: u64,
     pub arch_prep_inflight_ms: u64,
     pub arch_prep_head_ms: u64,
+    pub arch_prep_head_fk_ms: u64,
+    pub arch_prep_head_dens_ms: u64,
     pub arch_prep_probe_ms: u64,
     pub arch_prep_idx_ms: u64,
     pub arch_prep_body_txid_ms: u64,
@@ -444,6 +451,8 @@ impl Default for IbdPerfSample {
             stamp_mega_collect_ms: 0,
             stamp_mega_res_ms: 0,
             stamp_mega_head_ms: 0,
+            stamp_mega_head_fk_ms: 0,
+            stamp_mega_head_dens_ms: 0,
             stamp_mega_stamp_ms: 0,
             stamp_mega_finish_ms: 0,
             thr_prep_recv_wait_ms: 0,
@@ -487,6 +496,8 @@ impl Default for IbdPerfSample {
             arch_prep_sticky_ms: 0,
             arch_prep_inflight_ms: 0,
             arch_prep_head_ms: 0,
+            arch_prep_head_fk_ms: 0,
+            arch_prep_head_dens_ms: 0,
             arch_prep_probe_ms: 0,
             arch_prep_idx_ms: 0,
             arch_prep_body_txid_ms: 0,
@@ -836,6 +847,8 @@ pub(crate) fn sample(
                 .saturating_add(arch_res.prep_inflight_ns),
         ),
         stamp_mega_head_ms: ns_ms(arch_res.prep_head_ns),
+        stamp_mega_head_fk_ms: ns_ms(arch_res.prep_head_fk_ns),
+        stamp_mega_head_dens_ms: ns_ms(arch_res.prep_head_dens_ns),
         stamp_mega_stamp_ms: ns_ms(arch_res.prep_stamp_ns),
         stamp_mega_finish_ms: ns_ms(arch_res.prep_finish_ns),
         thr_prep_recv_wait_ms: ns_ms(thr.prep_recv_wait_ns),
@@ -879,6 +892,8 @@ pub(crate) fn sample(
         arch_prep_sticky_ms: ns_ms(arch_res.prep_sticky_ns),
         arch_prep_inflight_ms: ns_ms(arch_res.prep_inflight_ns),
         arch_prep_head_ms: ns_ms(arch_res.prep_head_ns),
+        arch_prep_head_fk_ms: ns_ms(arch_res.prep_head_fk_ns),
+        arch_prep_head_dens_ms: ns_ms(arch_res.prep_head_dens_ns),
         arch_prep_probe_ms: ns_ms(head_res.probe_ns),
         arch_prep_idx_ms: ns_ms(head_res.idx_ns),
         arch_prep_body_txid_ms: ns_ms(head_res.body_ns),
@@ -1039,7 +1054,8 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     {
         out.push_str(&format!(
             " stamp_sub(struct={}ms prepare={}ms filter={}ms mega={}ms \
-             mega_assign={}ms collect={}ms res={}ms head={}ms stamp={}ms finish={}ms)",
+             mega_assign={}ms collect={}ms res={}ms head_fk={}ms head_dens={}ms head={}ms \
+             stamp={}ms finish={}ms)",
             s.stamp_struct_ms,
             s.stamp_prepare_ms,
             s.stamp_filter_ms,
@@ -1047,6 +1063,8 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             s.stamp_mega_assign_ms,
             s.stamp_mega_collect_ms,
             s.stamp_mega_res_ms,
+            s.stamp_mega_head_fk_ms,
+            s.stamp_mega_head_dens_ms,
             s.stamp_mega_head_ms,
             s.stamp_mega_stamp_ms,
             s.stamp_mega_finish_ms,
@@ -1343,13 +1361,15 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             0
         };
         out.push_str(&format!(
-            " | plan_mega assign={} collect={} res_txid={} inflight={} head={} stamp={} finish={} \
-             resolve_us/blk={} ext={} res_txid_hit={}/{} ({}%) head_hit={}/{} stamp_n batch={} res={} \
-             residency={}/{}",
+            " | plan_mega assign={} collect={} res_txid={} inflight={} head_fk={} head_dens={} head={} \
+             stamp={} finish={} resolve_us/blk={} ext={} res_txid_hit={}/{} ({}%) head_hit={}/{} \
+             stamp_n batch={} res={} residency={}/{}",
             s.arch_prep_assign_ms,
             s.arch_prep_collect_ms,
             s.arch_prep_sticky_ms,
             s.arch_prep_inflight_ms,
+            s.arch_prep_head_fk_ms,
+            s.arch_prep_head_dens_ms,
             s.arch_prep_head_ms,
             s.arch_prep_stamp_ms,
             s.arch_prep_finish_ms,

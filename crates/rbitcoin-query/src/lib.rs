@@ -256,7 +256,7 @@ pub mod archive_phase_stats {
     pub static STICKY_HIT: AtomicU64 = AtomicU64::new(0);
     pub static HEAD_NEED: AtomicU64 = AtomicU64::new(0);
     pub static HEAD_HIT: AtomicU64 = AtomicU64::new(0);
-    /// Fks passed to plan denserels wave (`load_creates_outs_pipeline_local`).
+    /// Fks that received plan denserels in Shape A fused head resolve.
     pub static HEAD_DENS_FKS: AtomicU64 = AtomicU64::new(0);
     /// Sum of packed body lengths read in denserels wave (when ranges known).
     pub static HEAD_DENS_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -274,9 +274,9 @@ pub mod archive_phase_stats {
     pub static PREP_INFLIGHT_NS: AtomicU64 = AtomicU64::new(0);
     /// Combined head wall (fk resolve + plan denserels); = head_fk + head_dens.
     pub static PREP_HEAD_NS: AtomicU64 = AtomicU64::new(0);
-    /// `get_fk_by_txid_batch` only (probe/idx/body-txid).
+    /// Shape A Prefix33 select wall (head total − denserels).
     pub static PREP_HEAD_FK_NS: AtomicU64 = AtomicU64::new(0);
-    /// `load_creates_outs_pipeline_local` for external parents (outs+denserels).
+    /// Shape A denserels wave (single-cand denserels-only + multi-cand dens).
     pub static PREP_HEAD_DENS_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_STAMP_NS: AtomicU64 = AtomicU64::new(0);
     pub static PREP_FINISH_NS: AtomicU64 = AtomicU64::new(0);
@@ -323,7 +323,7 @@ pub mod archive_phase_stats {
         pub prep_head_ns: u64,
         /// Pure tx.head resolve (`get_fk_by_txid_batch`).
         pub prep_head_fk_ns: u64,
-        /// Plan-time denserels for external parents (`load_creates_outs_pipeline_local`).
+        /// Plan-time denserels for external parents (Shape A fused head resolve).
         pub prep_head_dens_ns: u64,
         pub prep_stamp_ns: u64,
         pub prep_finish_ns: u64,

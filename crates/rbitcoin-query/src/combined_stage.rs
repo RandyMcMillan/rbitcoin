@@ -46,53 +46,6 @@ pub struct CombinedCreate {
     )>,
 }
 
-/// Load outs+denserels for plan head-miss parents **without** seeding CreateResidency.
-///
-/// Long-tail external parents thrash residency FIFO; prep consumes the returned
-/// map as pipeline-local pin source instead. Ranges come from idx (or residency
-/// if a prior range-only seed exists).
-pub fn load_creates_outs_pipeline_local(
-    store: &Store,
-    residency: &CreateResidency,
-    fks: &[Fk],
-) -> Result<
-    std::collections::HashMap<
-        u64,
-        (
-            rbitcoin_store::TxRecord,
-            Vec<rbitcoin_store::OutputRecord>,
-            Vec<u32>,
-        ),
-    >,
-    StoreError,
-> {
-    use std::collections::HashMap;
-    if fks.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let ranges = residency.body_ranges_by_fk(fks);
-    let mut jobs: Vec<IdxBodyJob> = fks
-        .iter()
-        .zip(ranges.into_iter())
-        .map(|(fk, range)| IdxBodyJob::new(fk.get().unwrap_or(0), range))
-        .collect();
-    store.idx_body_pipeline(&mut jobs, IdxBodyMode::OutsDenserels)?;
-    let secret: &StoreSecret = store.txs.store_secret();
-    let mut out = HashMap::with_capacity(jobs.len());
-    for (fk, job) in fks.iter().zip(jobs.into_iter()) {
-        if !job.ok {
-            continue;
-        }
-        BODY_OK_READS.fetch_add(1, Ordering::Relaxed);
-        let (tx, outs, rels) =
-            decode_packed_tx_outs_with_spender_rels_secret(&job.body, Some(secret))?;
-        if let Some(id) = fk.get() {
-            out.insert(id, (tx, outs, rels));
-        }
-    }
-    Ok(out)
-}
-
 /// Load creates by fk (and optional known ranges from residency), decode once,
 /// seed residency. Each successful body fetch increments [`body_ok_reads`].
 ///

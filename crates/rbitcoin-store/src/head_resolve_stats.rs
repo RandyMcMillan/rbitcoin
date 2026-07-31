@@ -2,7 +2,7 @@
 //!
 //! Reset by the IBD ~5s sampler. Used to split archive prep `head_fk` cost into
 //! open-address probes vs `tx.idx` range vs thin `tx.body` txid prefix reads,
-//! and to measure **winning candidate rank** before denserels-merge work (PR-A).
+//! and to measure **winning candidate rank** (PR-0 gate for Shape A denserels merge).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

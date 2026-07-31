@@ -4,8 +4,8 @@
 //! - **Plan** ([`Query::archive_plan_mega_owned`] / [`Query::archive_plan_mega_from`]):
 //!   store **reads** — assign create fks (optionally from a reserved HWM),
 //!   **CreateResidency** + in-flight planned creates + `tx.head` resolve, stamp inputs.
-//!   Head-miss parents load **outs+denserels once** into
-//!   [`ArchiveWritePlan::external_parent_outs`] (pipeline-local; not residency FIFO).
+//!   Head-miss parents use Shape A resolve (Prefix33 select + one denserels)
+//!   into [`ArchiveWritePlan::external_parent_outs`] (pipeline-local; not FIFO).
 //! - **Commit** ([`Query::archive_commit_plan`]): store **writes** — body append,
 //!   head index, header_txs, residency denserels seed.
 //! - **Prewarm** ([`Query::archive_residency_prewarm`]): startup cache fill —
@@ -347,52 +347,44 @@ impl Query {
         let head_need_n = need_head.len() as u64;
         let mut head_hit_n = 0u64;
 
-        // External parents that miss CreateResidency (head path). Load full
-        // outs+denserels once into pipeline-local map — prep would denserels-miss
-        // the same creates, so range-only seed was a wasted half-load.
+        // External parents that miss CreateResidency (head path). Shape A:
+        // Prefix33 select + **one** denserels body per winner into
+        // pipeline-local `external_parent_outs` (not residency FIFO).
         //
-        // Timers split (P0): head_fk = pure resolve; head_dens = denserels wave.
-        // Historical `head=` = head_fk + head_dens.
+        // Timers: head_fk = wall − dens_ns; head_dens = denserels-wave ns from
+        // the fused resolve (single-cand denserels-only + multi-cand dens wave).
         let mut external_parent_outs: std::collections::HashMap<
             u64,
             (TxRecord, Vec<OutputRecord>, Vec<u32>),
         > = std::collections::HashMap::new();
-        let mut head_pairs: Vec<([u8; 32], Fk)> = Vec::new();
-        let t_head_fk = Instant::now();
+        let mut dens_fks_n = 0u64;
+        let mut dens_bytes = 0u64;
+        let t_head = Instant::now();
+        let mut head_dens_ns = 0u64;
         if !need_head.is_empty() {
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
-            let hits = self.store.get_fk_by_txid_batch(&need_head)?;
-            for (txid, fk_opt) in hits {
-                if let Some(fk) = fk_opt {
+            let (hits, dens_ns) = self.store.get_fk_and_outs_by_txid_batch(&need_head)?;
+            head_dens_ns = dens_ns;
+            for (txid, row) in hits {
+                if let Some((fk, outs_opt)) = row {
                     resolved.insert(txid, fk);
                     head_hit_n = head_hit_n.saturating_add(1);
-                    // Still residency-miss for denserels (create_fk was miss).
-                    head_pairs.push((txid, fk));
+                    if let Some((tx, outs, dens)) = outs_opt {
+                        dens_fks_n = dens_fks_n.saturating_add(1);
+                        dens_bytes = dens_bytes
+                            .saturating_add(dens.len() as u64 * 4)
+                            .saturating_add(
+                                outs.iter().map(|o| o.script.len() as u64 + 16).sum::<u64>(),
+                            );
+                        if let Some(id) = fk.get() {
+                            external_parent_outs.insert(id, (tx, outs, dens));
+                        }
+                    }
                 }
             }
         }
-        let head_fk_ns = t_head_fk.elapsed().as_nanos() as u64;
-
-        let t_head_dens = Instant::now();
-        let mut dens_fks_n = 0u64;
-        let mut dens_bytes = 0u64;
-        if !head_pairs.is_empty() {
-            let fks: Vec<Fk> = head_pairs.iter().map(|(_, f)| *f).collect();
-            dens_fks_n = fks.len() as u64;
-            external_parent_outs =
-                crate::combined_stage::load_creates_outs_pipeline_local(
-                    &self.store,
-                    &self.create_residency,
-                    &fks,
-                )?;
-            // Approximate payload weight from decoded outs (script lens) + denserels.
-            for (_tx, outs, dens) in external_parent_outs.values() {
-                dens_bytes = dens_bytes
-                    .saturating_add(dens.len() as u64 * 4)
-                    .saturating_add(outs.iter().map(|o| o.script.len() as u64 + 16).sum::<u64>());
-            }
-        }
-        let head_dens_ns = t_head_dens.elapsed().as_nanos() as u64;
+        let head_total_ns = t_head.elapsed().as_nanos() as u64;
+        let head_fk_ns = head_total_ns.saturating_sub(head_dens_ns);
         crate::archive_phase_stats::note_head_dens_wave(dens_fks_n, dens_bytes);
 
         // Pass 3: stamp create_fk on inputs; tip spends list.

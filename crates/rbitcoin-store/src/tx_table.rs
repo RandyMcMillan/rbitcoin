@@ -1426,7 +1426,224 @@ impl TxTable {
         self.get_fk_by_txid_batch_phased(txids)
     }
 
-    /// Phase-barrier resolve: mmap probe + idx→body pipeline (Prefix33) for all cands.
+    /// Shape A archive path: Prefix33 select + **one** denserels body per winner.
+    ///
+    /// - **Miss cands:** Prefix33 only (cheap identity rejects).
+    /// - **Multi-cand winners:** Prefix33 until match, then one OutsDenserels.
+    /// - **Single-cand keys:** denserels-only (identity + outs in one full pread).
+    ///
+    /// Never full-body-probes wrong cands (Shape B). Returns
+    /// `(txid, Option<(fk, Option<(tx, outs, denserels)>)>)` in input order —
+    /// fk may resolve even when denserels decode fails (stamp still works).
+    /// Second value is denserels-wave wall ns (archive `head_dens` timer).
+    pub fn get_fk_and_outs_by_txid_batch(
+        &self,
+        txids: &[[u8; 32]],
+    ) -> Result<
+        (
+            Vec<(
+                [u8; 32],
+                Option<(
+                    Fk,
+                    Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>,
+                )>,
+            )>,
+            u64, /* dens_ns */
+        ),
+        StoreError,
+    > {
+        use crate::idx_body_pipeline::{run_idx_body_pipeline, BodyMode, IdxBodyJob};
+        use std::time::Instant;
+        if txids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let t_probe = Instant::now();
+        let mut cands_by_key: Vec<Vec<Fk>> = Vec::with_capacity(txids.len());
+        let mut cands_total = 0u64;
+        for txid in txids {
+            let mixed = self.secret.mix_txid(txid);
+            let cands = self.head.probe_candidates(&mixed)?;
+            cands_total = cands_total.saturating_add(cands.len() as u64);
+            cands_by_key.push(cands);
+        }
+        crate::head_resolve_stats::add_probe(t_probe.elapsed().as_nanos() as u64);
+        crate::head_resolve_stats::add_keys(txids.len() as u64);
+        crate::head_resolve_stats::add_cands(cands_total);
+
+        let mut winner_fk: Vec<Option<Fk>> = vec![None; txids.len()];
+        let mut dens_decoded: std::collections::HashMap<
+            usize,
+            (TxRecord, Vec<OutputRecord>, Vec<u32>),
+        > = std::collections::HashMap::new();
+        // Multi-cand winners that still need a denserels body after Prefix33.
+        let mut need_dens: Vec<(usize, Fk)> = Vec::new();
+        let mut dens_ns_acc = 0u64;
+
+        // --- Single-cand: denserels-as-identity (one full body, no Prefix33) ---
+        {
+            let singles: Vec<(usize, Fk)> = cands_by_key
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| {
+                    // Avoid `then_some(c[0])` — it evaluates the index even when
+                    // len != 1 (panic on empty cand lists / miss keys).
+                    if c.len() == 1 {
+                        Some((i, c[0]))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !singles.is_empty() {
+                let t_dens = Instant::now();
+                let mut jobs: Vec<IdxBodyJob> = singles
+                    .iter()
+                    .map(|(_, fk)| IdxBodyJob::new(fk.0, None))
+                    .collect();
+                run_idx_body_pipeline(&self.body, &mut jobs, BodyMode::OutsDenserels)?;
+                dens_ns_acc = dens_ns_acc.saturating_add(t_dens.elapsed().as_nanos() as u64);
+                let mut body_lookups = 0u64;
+                for ((ki, fk), job) in singles.into_iter().zip(jobs.into_iter()) {
+                    if !job.ok || job.body.is_empty() {
+                        continue;
+                    }
+                    body_lookups = body_lookups.saturating_add(1);
+                    match Self::txid_from_body_prefix(&job.body) {
+                        Ok(got) if got == txids[ki] => {
+                            crate::head_resolve_stats::add_hit_rank(1);
+                            winner_fk[ki] = Some(fk);
+                            match decode_packed_tx_outs_with_spender_rels_secret(
+                                &job.body,
+                                Some(&self.secret),
+                            ) {
+                                Ok(decoded) => {
+                                    dens_decoded.insert(ki, decoded);
+                                }
+                                Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {}
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        Ok(_) => crate::head_resolve_stats::add_miss_peeks(1),
+                        Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {
+                            crate::head_resolve_stats::add_miss_peeks(1);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                crate::head_resolve_stats::add_body_lookups(body_lookups);
+            }
+        }
+
+        // --- Multi-cand: depth-round Prefix33 until hit (deep-first early exit) ---
+        let multi_keys: Vec<usize> = cands_by_key
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.len() > 1)
+            .map(|(i, _)| i)
+            .collect();
+        if !multi_keys.is_empty() {
+            let max_depth = multi_keys
+                .iter()
+                .map(|&i| cands_by_key[i].len())
+                .max()
+                .unwrap_or(0);
+            let mut unresolved: Vec<bool> = vec![false; txids.len()];
+            for &i in &multi_keys {
+                unresolved[i] = true;
+            }
+            for depth in 0..max_depth {
+                let mut round: Vec<(usize, Fk, u8)> = Vec::new();
+                for &ki in &multi_keys {
+                    if !unresolved[ki] {
+                        continue;
+                    }
+                    if let Some(&fk) = cands_by_key[ki].get(depth) {
+                        round.push((ki, fk, (depth as u8).saturating_add(1)));
+                    }
+                }
+                if round.is_empty() {
+                    break;
+                }
+                let t_pipe = Instant::now();
+                let mut jobs: Vec<IdxBodyJob> = round
+                    .iter()
+                    .map(|(_, fk, _)| IdxBodyJob::new(fk.0, None))
+                    .collect();
+                run_idx_body_pipeline(&self.body, &mut jobs, BodyMode::Prefix33)?;
+                let pipe_ns = t_pipe.elapsed().as_nanos() as u64;
+                crate::head_resolve_stats::add_idx(pipe_ns / 2);
+                crate::head_resolve_stats::add_body(pipe_ns.saturating_sub(pipe_ns / 2));
+
+                let mut body_lookups = 0u64;
+                let mut miss_peeks = 0u64;
+                for ((ki, fk, rank), job) in round.into_iter().zip(jobs.into_iter()) {
+                    if !job.ok || job.body.is_empty() {
+                        continue;
+                    }
+                    body_lookups = body_lookups.saturating_add(1);
+                    match Self::txid_from_body_prefix(&job.body) {
+                        Ok(got) if got == txids[ki] => {
+                            crate::head_resolve_stats::add_hit_rank(rank as u64);
+                            winner_fk[ki] = Some(fk);
+                            unresolved[ki] = false;
+                            need_dens.push((ki, fk));
+                        }
+                        Ok(_) => {
+                            miss_peeks = miss_peeks.saturating_add(1);
+                        }
+                        Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {
+                            miss_peeks = miss_peeks.saturating_add(1);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                crate::head_resolve_stats::add_body_lookups(body_lookups);
+                crate::head_resolve_stats::add_miss_peeks(miss_peeks);
+                if !unresolved.iter().any(|&u| u) {
+                    break;
+                }
+            }
+        }
+
+        // --- One denserels wave for multi-cand winners only ---
+        if !need_dens.is_empty() {
+            let t_dens = Instant::now();
+            let mut jobs: Vec<IdxBodyJob> = need_dens
+                .iter()
+                .map(|(_, fk)| IdxBodyJob::new(fk.0, None))
+                .collect();
+            run_idx_body_pipeline(&self.body, &mut jobs, BodyMode::OutsDenserels)?;
+            dens_ns_acc = dens_ns_acc.saturating_add(t_dens.elapsed().as_nanos() as u64);
+            for ((ki, _fk), job) in need_dens.into_iter().zip(jobs.into_iter()) {
+                if !job.ok || job.body.is_empty() {
+                    continue;
+                }
+                match decode_packed_tx_outs_with_spender_rels_secret(
+                    &job.body,
+                    Some(&self.secret),
+                ) {
+                    Ok(decoded) => {
+                        dens_decoded.insert(ki, decoded);
+                    }
+                    Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(txids.len());
+        for (i, txid) in txids.iter().enumerate() {
+            let row = winner_fk[i].map(|fk| (fk, dens_decoded.remove(&i)));
+            out.push((*txid, row));
+        }
+        Ok((out, dens_ns_acc))
+    }
+
+    /// Phase-barrier resolve: mmap probe + depth-round Prefix33 (early exit).
+    ///
+    /// Deep-first probe order: first match wins (BIP30). Body peeks track
+    /// hit_rank rather than loading every cand in one barrier.
     pub(crate) fn get_fk_by_txid_batch_phased(
         &self,
         txids: &[[u8; 32]],
@@ -1438,92 +1655,77 @@ impl TxTable {
         }
         crate::head_resolve_stats::add_keys(txids.len() as u64);
 
-        // --- Phase 1: segmented head probe (open → sealed fuse-gated) ---
         let t_probe = Instant::now();
-        let mut cands_by_key: Vec<Vec<(u32, u64)>> = vec![Vec::new(); txids.len()];
+        let mut cands_by_key: Vec<Vec<Fk>> = Vec::with_capacity(txids.len());
         let mut cands_total = 0u64;
-        {
-            for (i, txid) in txids.iter().enumerate() {
-                let mixed = self.secret.mix_txid(txid);
-                let cands = self.head.probe_candidates(&mixed)?;
-                cands_total = cands_total.saturating_add(cands.len() as u64);
-                for (j, fk) in cands.into_iter().enumerate() {
-                    cands_by_key[i].push((j as u32, fk.0));
-                }
-            }
+        for txid in txids.iter() {
+            let mixed = self.secret.mix_txid(txid);
+            let cands = self.head.probe_candidates(&mixed)?;
+            cands_total = cands_total.saturating_add(cands.len() as u64);
+            cands_by_key.push(cands);
         }
         crate::head_resolve_stats::add_probe(t_probe.elapsed().as_nanos() as u64);
+        crate::head_resolve_stats::add_cands(cands_total);
 
-        // --- Phase 2+3: idx→body pipeline (Prefix33), sorted by fk ---
-        let t_pipe = Instant::now();
-        struct CandRef {
-            key_i: u32,
-            depth: u8,
-            fk: u64,
-        }
-        let mut cand_refs: Vec<CandRef> = Vec::new();
-        for (i, cands) in cands_by_key.iter().enumerate() {
-            for &(depth, fk) in cands {
-                cand_refs.push(CandRef {
-                    key_i: i as u32,
-                    depth: depth as u8,
-                    fk,
-                });
-            }
-        }
-        let mut pipe_jobs: Vec<IdxBodyJob> = cand_refs
-            .iter()
-            .map(|c| IdxBodyJob::new(c.fk, None))
-            .collect();
-        run_idx_body_pipeline(&self.body, &mut pipe_jobs, BodyMode::Prefix33)?;
-        let pipe_ns = t_pipe.elapsed().as_nanos() as u64;
-        // Split wall roughly half for stats continuity.
-        crate::head_resolve_stats::add_idx(pipe_ns / 2);
-        crate::head_resolve_stats::add_body(pipe_ns.saturating_sub(pipe_ns / 2));
-
-        // BIP30: keep deepest matching cand; also track first-match rank in probe order.
-        let mut best: Vec<Option<(u64, u8)>> = vec![None; txids.len()];
-        let mut first_hit_rank: Vec<Option<u8>> = vec![None; txids.len()];
+        let max_depth = cands_by_key.iter().map(|c| c.len()).max().unwrap_or(0);
+        let mut best: Vec<Option<Fk>> = vec![None; txids.len()];
+        let mut unresolved: Vec<bool> = cands_by_key.iter().map(|c| !c.is_empty()).collect();
         let mut body_lookups = 0u64;
         let mut miss_peeks = 0u64;
-        for (c, job) in cand_refs.iter().zip(pipe_jobs.iter()) {
-            if !job.ok || job.body.is_empty() {
-                continue;
+
+        for depth in 0..max_depth {
+            let mut round: Vec<(usize, Fk, u8)> = Vec::new();
+            for (ki, cands) in cands_by_key.iter().enumerate() {
+                if !unresolved[ki] {
+                    continue;
+                }
+                if let Some(&fk) = cands.get(depth) {
+                    round.push((ki, fk, (depth as u8).saturating_add(1)));
+                }
             }
-            body_lookups = body_lookups.saturating_add(1);
-            let ki = c.key_i as usize;
-            let want_txid = &txids[ki];
-            let rank = c.depth.saturating_add(1); // depth is 0-based probe order
-            match Self::txid_from_body_prefix(&job.body) {
-                Ok(got) if got == *want_txid => {
-                    if first_hit_rank[ki].is_none() {
-                        first_hit_rank[ki] = Some(rank);
+            if round.is_empty() {
+                break;
+            }
+            let t_pipe = Instant::now();
+            let mut jobs: Vec<IdxBodyJob> = round
+                .iter()
+                .map(|(_, fk, _)| IdxBodyJob::new(fk.0, None))
+                .collect();
+            run_idx_body_pipeline(&self.body, &mut jobs, BodyMode::Prefix33)?;
+            let pipe_ns = t_pipe.elapsed().as_nanos() as u64;
+            crate::head_resolve_stats::add_idx(pipe_ns / 2);
+            crate::head_resolve_stats::add_body(pipe_ns.saturating_sub(pipe_ns / 2));
+
+            for ((ki, fk, rank), job) in round.into_iter().zip(jobs.into_iter()) {
+                if !job.ok || job.body.is_empty() {
+                    continue;
+                }
+                body_lookups = body_lookups.saturating_add(1);
+                match Self::txid_from_body_prefix(&job.body) {
+                    Ok(got) if got == txids[ki] => {
+                        crate::head_resolve_stats::add_hit_rank(rank as u64);
+                        best[ki] = Some(fk);
+                        unresolved[ki] = false;
                     }
-                    match best[ki] {
-                        Some((_, best_d)) if c.depth <= best_d => {}
-                        _ => best[ki] = Some((c.fk, c.depth)),
+                    Ok(_) => {
+                        miss_peeks = miss_peeks.saturating_add(1);
                     }
+                    Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {
+                        miss_peeks = miss_peeks.saturating_add(1);
+                    }
+                    Err(e) => return Err(e),
                 }
-                Ok(_) => {
-                    miss_peeks = miss_peeks.saturating_add(1);
-                }
-                Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {
-                    miss_peeks = miss_peeks.saturating_add(1);
-                }
-                Err(e) => return Err(e),
+            }
+            if !unresolved.iter().any(|&u| u) {
+                break;
             }
         }
-        crate::head_resolve_stats::add_cands(cands_total);
         crate::head_resolve_stats::add_body_lookups(body_lookups);
         crate::head_resolve_stats::add_miss_peeks(miss_peeks);
-        for rank in first_hit_rank.into_iter().flatten() {
-            crate::head_resolve_stats::add_hit_rank(rank as u64);
-        }
 
         let mut out = Vec::with_capacity(txids.len());
         for (i, txid) in txids.iter().enumerate() {
-            let hit = best[i].map(|(id, _)| Fk(id));
-            out.push((*txid, hit));
+            out.push((*txid, best[i]));
         }
         Ok(out)
     }
@@ -2656,6 +2858,98 @@ mod tests {
                 assert!(!o.multi_spender);
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Shape A: multi-cand Prefix33 select + one denserels for winner (outs present).
+    ///
+    /// Two creates of the same txid (foreigner + real); deepest wins; denserels
+    /// decode returns outs for pin without a second denserels wave on wrong cands.
+    #[test]
+    fn get_fk_and_outs_shape_a_multi_cand_one_denserels() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-shape-a-multi-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = create_tiny(&dir);
+        let txid = [0x5a; 32];
+        let mk = |hint: u8, value: i64| {
+            let rec = TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            };
+            let inputs = vec![InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk::NULL,
+                prev_index: u32::MAX,
+                sequence: u32::MAX,
+                script_sig: vec![hint],
+                witness: vec![],
+            }];
+            let outputs = vec![OutputRecord::unspent(value, vec![0x51, hint])];
+            (rec, inputs, outputs)
+        };
+        // Older create (shallower) then deeper BIP30 winner with distinct value.
+        let _fk_old = t.put_full_batch_indexed(&[mk(1, 11)], true).unwrap()[0];
+        let fk_new = t.put_full_batch_indexed(&[mk(2, 22)], true).unwrap()[0];
+
+        // Also a single-cand key (denserels-only path).
+        let mut solo = [0u8; 32];
+        solo[0] = 0x77;
+        let solo_rec = TxRecord {
+            txid: solo,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let solo_in = vec![InputRecord {
+            prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![0x01],
+            witness: vec![],
+        }];
+        let solo_out = vec![OutputRecord::unspent(33, vec![0x51])];
+        let fk_solo = t
+            .put_full_batch_indexed(&[(solo_rec, solo_in, solo_out)], true)
+            .unwrap()[0];
+
+        let (batch, _dens_ns) = t
+            .get_fk_and_outs_by_txid_batch(&[txid, solo, [0xff; 32]])
+            .unwrap();
+        assert_eq!(batch.len(), 3);
+
+        let multi = batch.iter().find(|(id, _)| *id == txid).unwrap();
+        let (fk, outs_opt) = multi.1.as_ref().expect("multi-cand hit");
+        assert_eq!(*fk, fk_new);
+        let (tx, outs, dens) = outs_opt.as_ref().expect("denserels for winner");
+        assert_eq!(tx.txid, txid);
+        assert_eq!(outs.len(), 1);
+        assert_eq!(outs[0].value, 22);
+        assert_eq!(dens.len(), outs.len());
+
+        let single = batch.iter().find(|(id, _)| *id == solo).unwrap();
+        let (fk_s, outs_s) = single.1.as_ref().expect("single-cand hit");
+        assert_eq!(*fk_s, fk_solo);
+        let (tx_s, outs_s, _) = outs_s.as_ref().expect("single denserels-only");
+        assert_eq!(tx_s.txid, solo);
+        assert_eq!(outs_s[0].value, 33);
+
+        assert!(batch.iter().any(|(id, r)| *id == [0xff; 32] && r.is_none()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

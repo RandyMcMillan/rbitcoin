@@ -414,6 +414,28 @@ impl Store {
         self.txs.get_fk_by_txid_batch(txids)
     }
 
+    /// Shape A archive path: Prefix33 select + one denserels per winner.
+    ///
+    /// See [`TxTable::get_fk_and_outs_by_txid_batch`].
+    pub fn get_fk_and_outs_by_txid_batch(
+        &self,
+        txids: &[[u8; 32]],
+    ) -> Result<
+        (
+            Vec<(
+                [u8; 32],
+                Option<(
+                    Fk,
+                    Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>,
+                )>,
+            )>,
+            u64,
+        ),
+        StoreError,
+    > {
+        self.txs.get_fk_and_outs_by_txid_batch(txids)
+    }
+
     /// Bulk Class A body ranges (archive sticky + confirm load).
     ///
     /// Sorted mmap walk of `tx.idx` (contiguous runs coalesced). Prefer

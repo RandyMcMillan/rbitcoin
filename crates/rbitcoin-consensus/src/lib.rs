@@ -184,6 +184,12 @@ pub mod confirm_phase_stats {
     pub static SPEND_ANN_PREAD_SKIP: AtomicU64 = AtomicU64::new(0);
     /// Body preads on annotate (must stay 0 on pure-write write path).
     pub static SPEND_ANN_PREAD: AtomicU64 = AtomicU64::new(0);
+    /// Structural spent meta bulk read: mmap backend wall (ns) / peek count.
+    pub static SPEND_META_MMAP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static SPEND_META_MMAP_N: AtomicU64 = AtomicU64::new(0);
+    /// Structural spent meta bulk read: uring/pread backend wall (ns) / peek count.
+    pub static SPEND_META_URING_NS: AtomicU64 = AtomicU64::new(0);
+    pub static SPEND_META_URING_N: AtomicU64 = AtomicU64::new(0);
     /// Header + body-fk resolve for the batch.
     pub static RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
     /// Prep pre-assemble wall on the prep/load thread.
@@ -408,6 +414,17 @@ pub mod confirm_phase_stats {
             SPEND_ANN_URING_N.swap(0, Ordering::Relaxed),
             SPEND_ANN_PREAD_SKIP.swap(0, Ordering::Relaxed),
             SPEND_ANN_PREAD.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    /// Structural meta A/B: (mmap_ns, mmap_n, uring_ns, uring_n).
+    #[inline]
+    pub fn sample_spend_meta_ab_and_reset() -> (u64, u64, u64, u64) {
+        (
+            SPEND_META_MMAP_NS.swap(0, Ordering::Relaxed),
+            SPEND_META_MMAP_N.swap(0, Ordering::Relaxed),
+            SPEND_META_URING_NS.swap(0, Ordering::Relaxed),
+            SPEND_META_URING_N.swap(0, Ordering::Relaxed),
         )
     }
 }

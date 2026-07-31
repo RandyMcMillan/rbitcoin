@@ -482,12 +482,24 @@ impl Store {
         self.txs.get_meta_and_outputs_batch_at(ranges)
     }
 
-    /// Bulk 9-byte spender meta at absolute `tx.body` offsets (io_uring).
+    /// Bulk 9-byte spender meta at absolute `tx.body` offsets.
+    ///
+    /// Backend from `RBITCOIN_SPEND_META` (see [`crate::spend_meta_backend_next`]).
     pub fn get_spender_meta_at_abs_batch(
         &self,
         abs_offs: &[u64],
     ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
         self.txs.get_spender_meta_at_abs_batch(abs_offs)
+    }
+
+    /// Explicit-backend bulk meta (tests / timed structural path).
+    pub fn get_spender_meta_at_abs_batch_backend(
+        &self,
+        abs_offs: &[u64],
+        backend: crate::SpendMetaBackend,
+    ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
+        self.txs
+            .get_spender_meta_at_abs_batch_backend(abs_offs, backend)
     }
 
     /// Pure-write annotate with structural-known meta (no body pread).

@@ -983,6 +983,36 @@ pub struct TxTable {
     pub(crate) secret: crate::store_secret::StoreSecret,
 }
 
+/// Backend for bulk structural 9-byte spender-meta reads on `tx.body`.
+///
+/// Selected via `RBITCOIN_SPEND_META=mmap|uring|alternate` (default alternate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpendMetaBackend {
+    /// One map pin + random peeks (`with_body_map_pin`).
+    Mmap,
+    /// io_uring / pread_batch 9B peeks (fd path).
+    Uring,
+}
+
+/// Next structural-meta backend (env + optional alternate counter).
+pub fn spend_meta_backend_next() -> SpendMetaBackend {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let mode = std::env::var("RBITCOIN_SPEND_META").unwrap_or_default();
+    match mode.as_str() {
+        "mmap" => SpendMetaBackend::Mmap,
+        "uring" => SpendMetaBackend::Uring,
+        _ => {
+            // alternate (default) — A/B soak
+            if N.fetch_add(1, Ordering::Relaxed) % 2 == 0 {
+                SpendMetaBackend::Mmap
+            } else {
+                SpendMetaBackend::Uring
+            }
+        }
+    }
+}
+
 impl TxTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Self::create_with_head_layout(dir, crate::address_head::default_layout())
@@ -1892,20 +1922,47 @@ impl TxTable {
 
     /// Bulk 9-byte spender meta reads at absolute `tx.body` file offsets.
     ///
-    /// Each entry is the absolute offset of an output's spender_field (8) + flags (1).
     /// Returns `(spender_field, flags)` — multi = `flags & MULTI_SPENDER`.
-    /// **Mmap path** (one map pin, no per-offset pread/io_uring). Out-of-range /
-    /// short yields `None` (caller fail-closed).
+    /// Backend from [`spend_meta_backend_next`] / `RBITCOIN_SPEND_META`
+    /// (`mmap` | `uring` | `alternate`). Out-of-range / short → `None`.
     pub fn get_spender_meta_at_abs_batch(
         &self,
         abs_offs: &[u64],
     ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
-        const META_LEN: usize = 9;
+        self.get_spender_meta_at_abs_batch_backend(abs_offs, spend_meta_backend_next())
+    }
+
+    /// Like [`Self::get_spender_meta_at_abs_batch`] with an explicit backend.
+    pub fn get_spender_meta_at_abs_batch_backend(
+        &self,
+        abs_offs: &[u64],
+        backend: SpendMetaBackend,
+    ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
         if abs_offs.is_empty() {
             return Ok(Vec::new());
         }
-        // Shared mmap walk — write structural spentness issues tens of thousands
-        // of 9-byte peeks per window; pread/io_uring-per-offset was the wall.
+        match backend {
+            SpendMetaBackend::Mmap => self.get_spender_meta_at_abs_batch_mmap(abs_offs),
+            SpendMetaBackend::Uring => {
+                match self.get_spender_meta_at_abs_batch_uring(abs_offs) {
+                    Ok(v) => Ok(v),
+                    Err(e) => {
+                        rbitcoin_log::debug!(
+                            "store: structural meta uring failed ({e}); mmap fallback"
+                        );
+                        self.get_spender_meta_at_abs_batch_mmap(abs_offs)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mmap pin + random 9B peeks (one map pin for the whole batch).
+    fn get_spender_meta_at_abs_batch_mmap(
+        &self,
+        abs_offs: &[u64],
+    ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
+        const META_LEN: usize = 9;
         Ok(self.body.with_body_map_pin(|map, published| {
             let mut out: Vec<Option<(Fk, u8)>> = vec![None; abs_offs.len()];
             let map_len = map.len() as u64;
@@ -1922,6 +1979,64 @@ impl TxTable {
             }
             out
         }))
+    }
+
+    /// io_uring / pread_batch 9B peeks (fd path; no map touch for payload).
+    fn get_spender_meta_at_abs_batch_uring(
+        &self,
+        abs_offs: &[u64],
+    ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
+        use crate::bulk_io::{self, ReadOp};
+        const META_LEN: usize = 9;
+        let body_fd = self.body.body_read_fd();
+        let body_pub = self.body.body_published_len();
+        let body_path = self.body.body_file_path();
+
+        // Stable 9B slots for the whole wave (uring holds bufs until complete).
+        let mut bufs: Vec<[u8; META_LEN]> = vec![[0u8; META_LEN]; abs_offs.len()];
+        let mut submitted: Vec<usize> = Vec::with_capacity(abs_offs.len());
+        for (i, &off) in abs_offs.iter().enumerate() {
+            let end = off.saturating_add(META_LEN as u64);
+            if end > body_pub {
+                continue;
+            }
+            submitted.push(i);
+        }
+        if submitted.is_empty() {
+            return Ok(vec![None; abs_offs.len()]);
+        }
+
+        // SAFETY: each bufs[i] is distinct; submitted indices unique.
+        let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(submitted.len());
+        for &i in &submitted {
+            let ptr = bufs[i].as_mut_ptr();
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, META_LEN) };
+            ops.push(ReadOp {
+                fd: body_fd,
+                offset: abs_offs[i],
+                buf: slice,
+                result: i32::MIN,
+            });
+        }
+        bulk_io::pread_batch(&mut ops);
+
+        let mut out: Vec<Option<(Fk, u8)>> = vec![None; abs_offs.len()];
+        for (ro, &i) in ops.iter().zip(submitted.iter()) {
+            if ro.result < 0 {
+                return Err(StoreError::io(
+                    body_path,
+                    std::io::Error::from_raw_os_error(-ro.result),
+                ));
+            }
+            if ro.result as usize != META_LEN {
+                continue; // short → None (fail-closed at structural)
+            }
+            let b = &bufs[i];
+            let field = Fk(u64::from_le_bytes(b[0..8].try_into().unwrap()));
+            let flags = b[8];
+            out[i] = Some((field, flags));
+        }
+        Ok(out)
     }
 
     /// Pure-write spend annotate using structural-known meta (no body pread).
@@ -3354,6 +3469,15 @@ mod tests {
         assert_eq!(bulk[0].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)), Some((s1, false)));
         assert_eq!(bulk[1].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)), Some((Fk::NULL, false)));
         assert_eq!(bulk[2].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)), Some((Fk(20), false)));
+        // Both backends must agree.
+        let mmap = t
+            .get_spender_meta_at_abs_batch_backend(&abs, SpendMetaBackend::Mmap)
+            .unwrap();
+        let uring = t
+            .get_spender_meta_at_abs_batch_backend(&abs, SpendMetaBackend::Uring)
+            .unwrap();
+        assert_eq!(mmap, bulk);
+        assert_eq!(uring, bulk);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

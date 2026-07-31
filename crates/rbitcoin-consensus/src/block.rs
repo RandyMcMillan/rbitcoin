@@ -1,3 +1,4 @@
+use crate::confirm_phase_stats;
 use crate::error::ConsensusError;
 use crate::milestone::Milestone;
 use crate::params::ChainParams;
@@ -7,6 +8,7 @@ use bitcoin::script::{Script, ScriptBuf};
 use bitcoin::{Amount, OutPoint, Transaction, TxOut};
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
+use std::sync::atomic::Ordering;
 
 pub struct ValidationContext<'a> {
     pub params: &'a ChainParams,
@@ -1098,13 +1100,28 @@ pub(crate) fn structural_validate_spends(
     let tip = query.tip_height().map(|h| h.0);
 
     // Hot path: bulk 9-byte spender meta at pin offsets (on-disk authority).
+    // Backend: RBITCOIN_SPEND_META=mmap|uring|alternate (default alternate).
     let mut spent_strong_ns = 0u64;
     if !abs_jobs.is_empty() {
         let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a)| *a).collect();
+        let meta_backend = rbitcoin_store::spend_meta_backend_next();
+        let t_meta = Instant::now();
         let metas = query
             .store()
-            .get_spender_meta_at_abs_batch(&abs_offs)
+            .get_spender_meta_at_abs_batch_backend(&abs_offs, meta_backend)
             .map_err(ConsensusError::Store)?;
+        let meta_ns = t_meta.elapsed().as_nanos() as u64;
+        let n_meta = abs_offs.len() as u64;
+        match meta_backend {
+            rbitcoin_store::SpendMetaBackend::Mmap => {
+                confirm_phase_stats::SPEND_META_MMAP_NS.fetch_add(meta_ns, Ordering::Relaxed);
+                confirm_phase_stats::SPEND_META_MMAP_N.fetch_add(n_meta, Ordering::Relaxed);
+            }
+            rbitcoin_store::SpendMetaBackend::Uring => {
+                confirm_phase_stats::SPEND_META_URING_NS.fetch_add(meta_ns, Ordering::Relaxed);
+                confirm_phase_stats::SPEND_META_URING_N.fetch_add(n_meta, Ordering::Relaxed);
+            }
+        }
         let t_strong = Instant::now();
         for (i, &(id, vout, abs)) in abs_jobs.iter().enumerate() {
             let Some((field, flags)) = metas[i] else {

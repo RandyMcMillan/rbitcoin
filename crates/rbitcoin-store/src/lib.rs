@@ -93,7 +93,8 @@ pub use tx_table::{
     decode_packed_tx_outs_with_spender_rels_secret, decode_packed_tx_with_spender_rels,
     decode_packed_tx_with_spender_rels_secret, denserels_from_packed_records, encode_packed_tx,
     encode_packed_tx_with_secret,
-    is_packed_tx_payload, scan_packed_meta_and_prevouts, InputRecord, OutputRecord, TxRecord,
+    is_packed_tx_payload, scan_packed_meta_and_prevouts, spend_meta_backend_next,
+    InputRecord, OutputRecord, SpendMetaBackend, TxRecord,
     BODY_PAGE_SIZE, TXID_PAGE_MAX_OFF, next_tx_body_start,
 };
 

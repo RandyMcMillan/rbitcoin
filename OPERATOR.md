@@ -75,7 +75,7 @@ idx→body pipeline for body prefixes.
 | Live IBD peers | **16** | `--max-outbound` |
 | Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` (`0` = full scripts) |
 | Archive queue RAM | **512 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
-| Confirm denserels **history** cache | **on** | `RBITCOIN_CONFIRM_CACHE=0` → small residency FIFO for **in-flight / just-committed** only (default 256k creates / 1M outs), skip denserels prewarm; cold pin trusts OS page cache. **Header plans always on** (multi-block MTP). Commit `res_seed` + pin still fill the window. Explicit `RBITCOIN_CREATE_RESIDENCY_CAP` / `_OUT_CAP` still override caps |
+| Confirm denserels **history** | **off (lean default)** | Small residency FIFO for **in-flight / just-committed** only (**256k creates / 1M outs**), skip denserels prewarm; cold pin trusts OS page cache. **Header plans always on** (multi-block MTP). `RBITCOIN_CONFIRM_CACHE=1` restores multi‑GiB history (8M/16M) + prewarm for experiments. Explicit `RBITCOIN_CREATE_RESIDENCY_CAP` / `_OUT_CAP` still override caps |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
 | Bulk store IO | **io_uring** (Linux) | Head resolve body prefixes, confirm body loads, **spend annotate** RMW (9 B meta pread→pwrite; multi-list appends mmap on read CQE). Segmented `tx.head` **insert_many** stays mmap; seal builds fuse8 in process RAM. `RBITCOIN_IO_URING=0` → pread/mmap fallbacks; `RBITCOIN_BULK_IO_WORKERS` for pread parallelism |
 | Archive Class A append | **pwrite** (default) | `tx.body` / `tx.idx` mega-appends use `write_at_pwrite` (page cache; avoids dirtying multi‑GiB mmaps for sequential write). `RBITCOIN_FD_APPEND=0` → mmap `write_at` (debug/compare) |

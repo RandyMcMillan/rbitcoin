@@ -864,7 +864,11 @@ mod tests {
     use crate::{Query, TxApply};
     use rbitcoin_primitives::Fk;
     use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Serialize `RBITCOIN_CONFIRM_CACHE` mutations across parallel tests.
+    static CACHE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_query(label: &str) -> (std::path::PathBuf, Query) {
         let n = SystemTime::now()
@@ -876,6 +880,25 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let q = Query::open_or_create(&dir).unwrap();
         (dir, q)
+    }
+
+    /// Open with multi‑GiB denserels history enabled (prewarm path tests).
+    fn temp_query_full_history(label: &str) -> (std::path::PathBuf, Query, std::sync::MutexGuard<'static, ()>) {
+        let g = CACHE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("RBITCOIN_CONFIRM_CACHE");
+        std::env::set_var("RBITCOIN_CONFIRM_CACHE", "1");
+        let (dir, q) = temp_query(label);
+        // Restore so other tests see process default after drop of guard… but
+        // env stays until we restore here so Query open already sampled it.
+        match prev {
+            Some(v) => std::env::set_var("RBITCOIN_CONFIRM_CACHE", v),
+            None => std::env::remove_var("RBITCOIN_CONFIRM_CACHE"),
+        }
+        assert!(
+            q.create_residency().cache_enabled(),
+            "full-history query must enable denserels cache"
+        );
+        (dir, q, g)
     }
 
     fn coinbase_apply(i: u64) -> TxApply {
@@ -1210,8 +1233,37 @@ mod tests {
     }
 
     #[test]
+    fn lean_default_skips_residency_prewarm() {
+        // Product default: no multi‑GiB denserels prewarm. Hold cache env lock so
+        // parallel full-history tests do not leave CONFIRM_CACHE=1 during open.
+        let _g = CACHE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("RBITCOIN_CONFIRM_CACHE");
+        std::env::remove_var("RBITCOIN_CONFIRM_CACHE");
+        let (dir, q) = temp_query("lean-skip-prewarm");
+        match prev {
+            Some(v) => std::env::set_var("RBITCOIN_CONFIRM_CACHE", v),
+            None => std::env::remove_var("RBITCOIN_CONFIRM_CACHE"),
+        }
+        assert!(!q.create_residency().cache_enabled());
+        let mut packed = Vec::new();
+        for i in 1u64..=10 {
+            let ta = coinbase_apply(i);
+            packed.push((ta.tx, ta.inputs, ta.outputs));
+        }
+        q.store
+            .txs
+            .put_full_batch_indexed(&packed, true)
+            .unwrap();
+        let st = q.archive_residency_prewarm().unwrap();
+        assert_eq!(st.ranges, 0);
+        assert_eq!(st.denserels_creates, 0);
+        assert_eq!(q.create_residency().len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn residency_prewarm_loads_last_n_via_idx_order() {
-        let (dir, q) = temp_query("residency-prewarm");
+        let (dir, q, _env) = temp_query_full_history("residency-prewarm");
         let mut packed = Vec::new();
         for i in 1u64..=50 {
             let ta = coinbase_apply(i);
@@ -1258,7 +1310,7 @@ mod tests {
 
     #[test]
     fn residency_prewarm_keeps_tail_when_under_cap() {
-        let (dir, q) = temp_query("residency-tail");
+        let (dir, q, _env) = temp_query_full_history("residency-tail");
         let mut packed = Vec::new();
         for i in 1u64..=5 {
             let ta = coinbase_apply(i);
@@ -1287,7 +1339,7 @@ mod tests {
         use crate::Height;
         use rbitcoin_store::HeaderRecord;
 
-        let (dir, q) = temp_query("prewarm-hdr-plans");
+        let (dir, q, _env) = temp_query_full_history("prewarm-hdr-plans");
         // Confirm genesis.
         let mut hash0 = [0u8; 32];
         hash0[0] = 0xa0;

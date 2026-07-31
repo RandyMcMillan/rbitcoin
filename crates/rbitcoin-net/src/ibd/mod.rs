@@ -389,14 +389,19 @@ pub async fn ibd_cancellable(
     }));
     // Startup caches: Class A ranges + bounded denserels + tip-ahead header plans.
     // Skipped when RBITCOIN_CONFIRM_CACHE=0 (in-flight FIFO only; trust OS pages).
+    // Lean denserels is the product default; full history only with CONFIRM_CACHE=1.
+    let (_len0, create_cap0, _outs0, out_cap0) = hub.query.create_residency().size_stats();
     if !hub.query.create_residency().cache_enabled() {
-        let (_len, create_cap0, _outs, out_cap0) = hub.query.create_residency().size_stats();
         info!(
-            "ibd: confirm denserels cache off (RBITCOIN_CONFIRM_CACHE=0) — residency \
-             in-flight FIFO only creates_cap={create_cap0} out_cap={out_cap0} \
-             (skip denserels prewarm; header plans still on; res_seed+pin fill window)"
+            "ibd: denserels lean default (cache=off) creates_cap={create_cap0} out_cap={out_cap0} \
+             — skip prewarm; header plans on; res_seed+pin fill window \
+             (RBITCOIN_CONFIRM_CACHE=1 for multi-GiB history)"
         );
     } else {
+        info!(
+            "ibd: denserels full history (RBITCOIN_CONFIRM_CACHE=1) creates_cap={create_cap0} \
+             out_cap={out_cap0} — running residency prewarm"
+        );
         match hub.query.archive_residency_prewarm() {
             Ok(st) => {
                 let (len, create_cap, outs, out_cap) = hub.query.create_residency().size_stats();

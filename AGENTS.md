@@ -23,7 +23,8 @@ wrong design — fix the protocol. See `docs/concurrency.md`.
 | Hot pin map | **`CreateResidency`** only (plan pin + commit denserels seed + prewarm) |
 | IBD confirm intake | **body queue wire only** → plan → prep (no hash-only / Class-A-only confirm) |
 | Eviction | **Insert-order FIFO** — never read-touch / LRU reorder (one spend ⇏ next spend on same create) |
-| denserels_hit% | **~35–50% is normal** mid/late mainnet IBD (old UTXO spends). Do not chase ≥65% or inflate cache caps for it |
+| denserels history | **Lean by default** (256k creates / 1M outs; skip prewarm). `RBITCOIN_CONFIRM_CACHE=1` for multi‑GiB experiment only |
+| denserels_hit% | Late lean IBD may be **~5%** while tip holds (cold denserels + OS page cache). Do not chase ≥65% by inflating caps |
 | Removed | **OutFifo** and **archive sticky** are gone — do not reintroduce dual maps |
 | IBD sizes | **`residency creates=/outs=`** is the pin occupancy meter |
 

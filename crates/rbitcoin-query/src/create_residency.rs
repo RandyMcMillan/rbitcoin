@@ -21,14 +21,13 @@
 //! 65–70% hit rate. Optimize: (1) keep **recent** commit-seed / offline denserels
 //! working, (2) make **cold** denserels loads cheap (batch once, no double ensure).
 //!
-//! # `RBITCOIN_CONFIRM_CACHE=0` — no long-lived denserels history
+//! # Denserels history: lean by default
 //!
-//! When confirm cache is off, caps collapse to a **pipeline / just-committed
-//! window** ([`NO_CACHE_CREATE_CAP`] / [`NO_CACHE_OUT_CAP`]). Commit `res_seed`
-//! and pin still populate residency so in-flight batches work; FIFO drops
-//! history quickly and cold denserels trust OS page cache on Class A mmaps.
-//! Startup denserels/range **prewarm** is skipped. **Header plans stay on**
-//! (multi-block MTP) — they are tip-GCed working state, not multi‑GiB history.
+//! **Default** residency is a **pipeline / just-committed window**
+//! ([`NO_CACHE_CREATE_CAP`] / [`NO_CACHE_OUT_CAP`]). Commit `res_seed` and pin
+//! still populate it; FIFO drops history quickly; cold denserels trust OS page
+//! cache. Startup denserels/range **prewarm** is skipped. Opt in to multi‑GiB
+//! history with `RBITCOIN_CONFIRM_CACHE=1`. **Header plans stay on** (MTP).
 //!
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};
@@ -48,21 +47,24 @@ pub const NO_CACHE_CREATE_CAP: usize = 256_000;
 /// Out cap when confirm cache is off.
 pub const NO_CACHE_OUT_CAP: u64 = 1_000_000;
 
-/// Whether process-local confirm denserels/header **caching** is enabled.
+/// Whether multi‑GiB confirm denserels **history** is enabled.
 ///
-/// Env: `RBITCOIN_CONFIRM_CACHE` — unset/`1`/`true`/`on`/`yes` = on (default);
-/// `0`/`false`/`off`/`no` = off. When off, residency keeps only a small FIFO for
-/// in-flight / just-committed creates (see [`NO_CACHE_CREATE_CAP`]).
+/// **Default off** (lean FIFO only — see [`NO_CACHE_CREATE_CAP`]).  
+/// Env `RBITCOIN_CONFIRM_CACHE`:
+/// - unset / `0` / `false` / `off` / `no` → **false** (product default)
+/// - `1` / `true` / `on` / `yes` → **true** (legacy 8M/16M caps + prewarm)
+///
+/// Header plans are **not** controlled here (always on for multi-block MTP).
 pub fn confirm_cache_enabled() -> bool {
     match std::env::var("RBITCOIN_CONFIRM_CACHE") {
         Ok(s) => {
             let t = s.trim();
-            !(t == "0"
-                || t.eq_ignore_ascii_case("false")
-                || t.eq_ignore_ascii_case("off")
-                || t.eq_ignore_ascii_case("no"))
+            t == "1"
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("on")
+                || t.eq_ignore_ascii_case("yes")
         }
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 
@@ -91,8 +93,8 @@ struct Inner {
 /// Process-local unified residency (sole writer for inserts; shared Mutex).
 pub struct CreateResidency {
     inner: Mutex<Inner>,
-    /// False when `RBITCOIN_CONFIRM_CACHE=0` — long history disabled; FIFO still
-    /// holds the in-flight / just-committed window via reduced caps.
+    /// True only when `RBITCOIN_CONFIRM_CACHE=1` (multi‑GiB denserels history).
+    /// Default false: small FIFO for in-flight / just-committed window.
     cache_enabled: bool,
 }
 
@@ -490,10 +492,22 @@ mod tests {
     }
 
     #[test]
-    fn confirm_cache_env_parse() {
-        // Default when unset is on — do not mutate global env for default arm
-        // (parallel tests). Just exercise the false literals.
-        assert!(confirm_cache_enabled() || !confirm_cache_enabled()); // compiles / callable
+    fn confirm_cache_default_is_lean() {
+        // Product default: multi‑GiB denserels history off unless explicitly enabled.
+        // Do not set RBITCOIN_CONFIRM_CACHE in this process for the assertion —
+        // if the agent env has CONFIRM_CACHE=1, skip.
+        if std::env::var_os("RBITCOIN_CONFIRM_CACHE").is_some() {
+            return;
+        }
+        assert!(
+            !confirm_cache_enabled(),
+            "unset RBITCOIN_CONFIRM_CACHE must default to lean denserels"
+        );
+        let r = CreateResidency::from_env();
+        assert!(!r.cache_enabled());
+        let (_n, create_cap, _o, out_cap) = r.size_stats();
+        assert_eq!(create_cap, NO_CACHE_CREATE_CAP);
+        assert_eq!(out_cap, NO_CACHE_OUT_CAP);
     }
 
     #[test]

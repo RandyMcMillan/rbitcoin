@@ -256,6 +256,10 @@ pub mod archive_phase_stats {
     pub static STICKY_HIT: AtomicU64 = AtomicU64::new(0);
     pub static HEAD_NEED: AtomicU64 = AtomicU64::new(0);
     pub static HEAD_HIT: AtomicU64 = AtomicU64::new(0);
+    /// Fks passed to plan denserels wave (`load_creates_outs_pipeline_local`).
+    pub static HEAD_DENS_FKS: AtomicU64 = AtomicU64::new(0);
+    /// Sum of packed body lengths read in denserels wave (when ranges known).
+    pub static HEAD_DENS_BYTES: AtomicU64 = AtomicU64::new(0);
     pub static BATCH_STAMP: AtomicU64 = AtomicU64::new(0);
     pub static RESOLVED_STAMP: AtomicU64 = AtomicU64::new(0);
 
@@ -302,6 +306,8 @@ pub mod archive_phase_stats {
         pub sticky_hit: u64,
         pub head_need: u64,
         pub head_hit: u64,
+        pub head_dens_fks: u64,
+        pub head_dens_bytes: u64,
         pub batch_stamp: u64,
         pub resolved_stamp: u64,
         /// Sticky+inflight+head_fk only (not plan denserels load).
@@ -379,6 +385,8 @@ pub mod archive_phase_stats {
             sticky_hit: STICKY_HIT.swap(0, Ordering::Relaxed),
             head_need: HEAD_NEED.swap(0, Ordering::Relaxed),
             head_hit: HEAD_HIT.swap(0, Ordering::Relaxed),
+            head_dens_fks: HEAD_DENS_FKS.swap(0, Ordering::Relaxed),
+            head_dens_bytes: HEAD_DENS_BYTES.swap(0, Ordering::Relaxed),
             batch_stamp: BATCH_STAMP.swap(0, Ordering::Relaxed),
             resolved_stamp: RESOLVED_STAMP.swap(0, Ordering::Relaxed),
             resolve_ns: prep_sticky
@@ -437,6 +445,13 @@ pub mod archive_phase_stats {
         add(&HEAD_HIT, head_hit);
         add(&BATCH_STAMP, batch_stamp);
         add(&RESOLVED_STAMP, resolved_stamp);
+    }
+
+    /// Plan denserels wave size (fks + optional body bytes read).
+    #[inline]
+    pub fn note_head_dens_wave(dens_fks: u64, dens_bytes: u64) {
+        add(&HEAD_DENS_FKS, dens_fks);
+        add(&HEAD_DENS_BYTES, dens_bytes);
     }
 
     /// Prep sub-phases for one mega-batch plan (`archive_plan_mega_from`).
@@ -1731,6 +1746,7 @@ mod tests {
         let _ = archive_phase_stats::sample_and_reset();
         archive_phase_stats::note_resolve_counts(1, 2, 3, 4, 5, 6, 7);
         archive_phase_stats::note_prep_plan(1, 2, 3, 4, 10, 20, 6, 7); // head_fk=10, head_dens=20
+        archive_phase_stats::note_head_dens_wave(9, 1024);
         archive_phase_stats::note_prep_batch(10, 1, 2, 3, 4, 1);
         archive_phase_stats::note_write_commit(20, 1, 2, 3, 4, 5, 6, 7, 1);
         archive_phase_stats::note_write_flush(8);
@@ -1741,6 +1757,8 @@ mod tests {
         assert_eq!(a.prep_head_fk_ns, 10);
         assert_eq!(a.prep_head_dens_ns, 20);
         assert_eq!(a.prep_head_ns, 30);
+        assert_eq!(a.head_dens_fks, 9);
+        assert_eq!(a.head_dens_bytes, 1024);
 
         class_c_phase_stats::STRONG_NS.store(11, AtomicOrdering::Relaxed);
         class_c_phase_stats::add_sh_part(&class_c_phase_stats::SH_FILTER_NS, 5);

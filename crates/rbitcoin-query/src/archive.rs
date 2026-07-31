@@ -374,16 +374,26 @@ impl Query {
         let head_fk_ns = t_head_fk.elapsed().as_nanos() as u64;
 
         let t_head_dens = Instant::now();
+        let mut dens_fks_n = 0u64;
+        let mut dens_bytes = 0u64;
         if !head_pairs.is_empty() {
             let fks: Vec<Fk> = head_pairs.iter().map(|(_, f)| *f).collect();
+            dens_fks_n = fks.len() as u64;
             external_parent_outs =
                 crate::combined_stage::load_creates_outs_pipeline_local(
                     &self.store,
                     &self.create_residency,
                     &fks,
                 )?;
+            // Approximate payload weight from decoded outs (script lens) + denserels.
+            for (_tx, outs, dens) in external_parent_outs.values() {
+                dens_bytes = dens_bytes
+                    .saturating_add(dens.len() as u64 * 4)
+                    .saturating_add(outs.iter().map(|o| o.script.len() as u64 + 16).sum::<u64>());
+            }
         }
         let head_dens_ns = t_head_dens.elapsed().as_nanos() as u64;
+        crate::archive_phase_stats::note_head_dens_wave(dens_fks_n, dens_bytes);
 
         // Pass 3: stamp create_fk on inputs; tip spends list.
         let t_stamp = Instant::now();

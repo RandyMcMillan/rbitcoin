@@ -1376,10 +1376,13 @@ impl TxTable {
         crate::head_resolve_stats::add_probe(t_probe.elapsed().as_nanos() as u64);
         crate::head_resolve_stats::add_keys(1);
         crate::head_resolve_stats::add_cands(cands.len() as u64);
-        for fk in cands {
+        for (i, fk) in cands.into_iter().enumerate() {
+            // body_txid increments body_lookups + body_ns.
             if self.body_txid(fk)? == *txid {
+                crate::head_resolve_stats::add_hit_rank((i as u64).saturating_add(1));
                 return Ok(Some(fk));
             }
+            crate::head_resolve_stats::add_miss_peeks(1);
         }
         Ok(None)
     }
@@ -1478,8 +1481,11 @@ impl TxTable {
         crate::head_resolve_stats::add_idx(pipe_ns / 2);
         crate::head_resolve_stats::add_body(pipe_ns.saturating_sub(pipe_ns / 2));
 
+        // BIP30: keep deepest matching cand; also track first-match rank in probe order.
         let mut best: Vec<Option<(u64, u8)>> = vec![None; txids.len()];
+        let mut first_hit_rank: Vec<Option<u8>> = vec![None; txids.len()];
         let mut body_lookups = 0u64;
+        let mut miss_peeks = 0u64;
         for (c, job) in cand_refs.iter().zip(pipe_jobs.iter()) {
             if !job.ok || job.body.is_empty() {
                 continue;
@@ -1487,18 +1493,32 @@ impl TxTable {
             body_lookups = body_lookups.saturating_add(1);
             let ki = c.key_i as usize;
             let want_txid = &txids[ki];
+            let rank = c.depth.saturating_add(1); // depth is 0-based probe order
             match Self::txid_from_body_prefix(&job.body) {
-                Ok(got) if got == *want_txid => match best[ki] {
-                    Some((_, best_d)) if c.depth <= best_d => {}
-                    _ => best[ki] = Some((c.fk, c.depth)),
-                },
-                Ok(_) => {}
-                Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {}
+                Ok(got) if got == *want_txid => {
+                    if first_hit_rank[ki].is_none() {
+                        first_hit_rank[ki] = Some(rank);
+                    }
+                    match best[ki] {
+                        Some((_, best_d)) if c.depth <= best_d => {}
+                        _ => best[ki] = Some((c.fk, c.depth)),
+                    }
+                }
+                Ok(_) => {
+                    miss_peeks = miss_peeks.saturating_add(1);
+                }
+                Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {
+                    miss_peeks = miss_peeks.saturating_add(1);
+                }
                 Err(e) => return Err(e),
             }
         }
         crate::head_resolve_stats::add_cands(cands_total);
         crate::head_resolve_stats::add_body_lookups(body_lookups);
+        crate::head_resolve_stats::add_miss_peeks(miss_peeks);
+        for rank in first_hit_rank.into_iter().flatten() {
+            crate::head_resolve_stats::add_hit_rank(rank as u64);
+        }
 
         let mut out = Vec::with_capacity(txids.len());
         for (i, txid) in txids.iter().enumerate() {

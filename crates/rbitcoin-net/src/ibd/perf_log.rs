@@ -276,6 +276,13 @@ pub(crate) struct IbdPerfSample {
     pub arch_prep_body_txid_ms: u64,
     pub arch_prep_head_keys: u64,
     pub arch_prep_head_cands: u64,
+    /// Mean winning cand rank (1 = first probe body peek).
+    pub arch_prep_hit_rank_avg_x100: u64,
+    pub arch_prep_hit_rank_n: u64,
+    pub arch_prep_miss_peeks: u64,
+    /// Plan denserels wave: fks + packed body bytes (approx).
+    pub arch_head_dens_fks: u64,
+    pub arch_head_dens_bytes: u64,
     pub arch_prep_body_lookups: u64,
     pub arch_prep_stamp_ms: u64,
     pub arch_prep_finish_ms: u64,
@@ -503,6 +510,11 @@ impl Default for IbdPerfSample {
             arch_prep_body_txid_ms: 0,
             arch_prep_head_keys: 0,
             arch_prep_head_cands: 0,
+            arch_prep_hit_rank_avg_x100: 0,
+            arch_prep_hit_rank_n: 0,
+            arch_prep_miss_peeks: 0,
+            arch_head_dens_fks: 0,
+            arch_head_dens_bytes: 0,
             arch_prep_body_lookups: 0,
             arch_prep_stamp_ms: 0,
             arch_prep_finish_ms: 0,
@@ -899,6 +911,11 @@ pub(crate) fn sample(
         arch_prep_body_txid_ms: ns_ms(head_res.body_ns),
         arch_prep_head_keys: head_res.keys,
         arch_prep_head_cands: head_res.cands,
+        arch_prep_hit_rank_avg_x100: (head_res.hit_rank_avg() * 100.0).round() as u64,
+        arch_prep_hit_rank_n: head_res.hit_rank_n,
+        arch_prep_miss_peeks: head_res.miss_peeks,
+        arch_head_dens_fks: arch_res.head_dens_fks,
+        arch_head_dens_bytes: arch_res.head_dens_bytes,
         arch_prep_body_lookups: head_res.body_lookups,
         arch_prep_stamp_ms: ns_ms(arch_res.prep_stamp_ns),
         arch_prep_finish_ms: ns_ms(arch_res.prep_finish_ns),
@@ -1391,14 +1408,39 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             || s.arch_prep_body_txid_ms > 0
             || s.arch_prep_head_keys > 0
         {
+            let avg_cands = if s.arch_prep_head_keys > 0 {
+                s.arch_prep_head_cands / s.arch_prep_head_keys
+            } else {
+                0
+            };
+            let avg_lookups = if s.arch_prep_head_keys > 0 {
+                s.arch_prep_body_lookups / s.arch_prep_head_keys
+            } else {
+                0
+            };
+            let hit_rank_avg = s.arch_prep_hit_rank_avg_x100 as f64 / 100.0;
             out.push_str(&format!(
-                " head_rd(probe={} idx={} body={} keys={} cands={} lookups={})",
+                " head_rd(probe={} idx={} body={} keys={} cands={} lookups={} \
+                 avg_cands={} avg_lookups={} hit_rank_avg={hit_rank_avg:.2} hit_n={} miss_peeks={})",
                 s.arch_prep_probe_ms,
                 s.arch_prep_idx_ms,
                 s.arch_prep_body_txid_ms,
                 s.arch_prep_head_keys,
                 s.arch_prep_head_cands,
                 s.arch_prep_body_lookups,
+                avg_cands,
+                avg_lookups,
+                s.arch_prep_hit_rank_n,
+                s.arch_prep_miss_peeks,
+            ));
+        }
+        if s.arch_head_dens_fks > 0 || s.arch_prep_head_dens_ms > 0 {
+            let dens_mib = s.arch_head_dens_bytes / (1024 * 1024);
+            out.push_str(&format!(
+                " dens_wave(fks={} bytes={}MiB dens_ms={})",
+                s.arch_head_dens_fks,
+                dens_mib,
+                s.arch_prep_head_dens_ms,
             ));
         }
     }

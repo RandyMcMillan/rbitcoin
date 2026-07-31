@@ -1,7 +1,8 @@
-//! Head resolve sub-timers (probe / idx / body prefix).
+//! Head resolve sub-timers (probe / idx / body prefix) + probe-depth metrics.
 //!
-//! Reset by the IBD ~5s sampler. Used to split archive prep `head=` cost into
-//! open-address probes vs `tx.idx` range vs thin `tx.body` txid prefix reads.
+//! Reset by the IBD ~5s sampler. Used to split archive prep `head_fk` cost into
+//! open-address probes vs `tx.idx` range vs thin `tx.body` txid prefix reads,
+//! and to measure **winning candidate rank** before denserels-merge work (PR-A).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,8 +13,14 @@ static BODY_NS: AtomicU64 = AtomicU64::new(0);
 static KEYS: AtomicU64 = AtomicU64::new(0);
 /// Candidate fks collected from probes (before body dedupe).
 static CANDS: AtomicU64 = AtomicU64::new(0);
-/// Unique fks that paid idx+body_txid.
+/// Unique fks that paid idx+body_txid (one per body peek attempt).
 static BODY_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+/// Sum of 1-based ranks of the matching cand in probe order (resolved keys only).
+static HIT_RANK_SUM: AtomicU64 = AtomicU64::new(0);
+/// Number of keys that resolved (contributed to HIT_RANK_SUM).
+static HIT_RANK_N: AtomicU64 = AtomicU64::new(0);
+/// Body peeks that did **not** match the wanted txid (wrong cand).
+static MISS_PEEKS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Sample {
@@ -23,6 +30,10 @@ pub struct Sample {
     pub keys: u64,
     pub cands: u64,
     pub body_lookups: u64,
+    /// Sum of hit ranks (use with [`Self::hit_rank_n`] for mean).
+    pub hit_rank_sum: u64,
+    pub hit_rank_n: u64,
+    pub miss_peeks: u64,
 }
 
 impl Sample {
@@ -30,6 +41,15 @@ impl Sample {
         self.probe_ns
             .saturating_add(self.idx_ns)
             .saturating_add(self.body_ns)
+    }
+
+    /// Mean 1-based rank of winning cand (0 if no hits).
+    pub fn hit_rank_avg(&self) -> f64 {
+        if self.hit_rank_n == 0 {
+            0.0
+        } else {
+            self.hit_rank_sum as f64 / self.hit_rank_n as f64
+        }
     }
 }
 
@@ -75,6 +95,22 @@ pub fn add_body_lookups(n: u64) {
     }
 }
 
+/// Record a resolved key: `rank` is 1-based index in probe/body order of the match.
+#[inline]
+pub fn add_hit_rank(rank: u64) {
+    if rank > 0 {
+        HIT_RANK_SUM.fetch_add(rank, Ordering::Relaxed);
+        HIT_RANK_N.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn add_miss_peeks(n: u64) {
+    if n > 0 {
+        MISS_PEEKS.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
 pub fn sample_and_reset() -> Sample {
     Sample {
         probe_ns: PROBE_NS.swap(0, Ordering::Relaxed),
@@ -83,6 +119,9 @@ pub fn sample_and_reset() -> Sample {
         keys: KEYS.swap(0, Ordering::Relaxed),
         cands: CANDS.swap(0, Ordering::Relaxed),
         body_lookups: BODY_LOOKUPS.swap(0, Ordering::Relaxed),
+        hit_rank_sum: HIT_RANK_SUM.swap(0, Ordering::Relaxed),
+        hit_rank_n: HIT_RANK_N.swap(0, Ordering::Relaxed),
+        miss_peeks: MISS_PEEKS.swap(0, Ordering::Relaxed),
     }
 }
 
@@ -92,14 +131,14 @@ mod tests {
 
     #[test]
     fn add_sample_reset_and_sum() {
-        // Zeroes are no-ops (still exercise the `if ns > 0` false branch).
         add_probe(0);
         add_idx(0);
         add_body(0);
         add_keys(0);
         add_cands(0);
         add_body_lookups(0);
-        // Drain any prior residue from parallel tests.
+        add_hit_rank(0);
+        add_miss_peeks(0);
         let _ = sample_and_reset();
 
         add_probe(10);
@@ -108,6 +147,9 @@ mod tests {
         add_keys(4);
         add_cands(5);
         add_body_lookups(6);
+        add_hit_rank(1);
+        add_hit_rank(3);
+        add_miss_peeks(2);
         let s = sample_and_reset();
         assert_eq!(s.probe_ns, 10);
         assert_eq!(s.idx_ns, 20);
@@ -115,10 +157,15 @@ mod tests {
         assert_eq!(s.keys, 4);
         assert_eq!(s.cands, 5);
         assert_eq!(s.body_lookups, 6);
+        assert_eq!(s.hit_rank_sum, 4);
+        assert_eq!(s.hit_rank_n, 2);
+        assert!((s.hit_rank_avg() - 2.0).abs() < 1e-9);
+        assert_eq!(s.miss_peeks, 2);
         assert_eq!(s.sum_ns(), 60);
 
         let empty = sample_and_reset();
         assert_eq!(empty.sum_ns(), 0);
         assert_eq!(empty.keys, 0);
+        assert_eq!(empty.hit_rank_n, 0);
     }
 }

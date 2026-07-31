@@ -31,6 +31,8 @@ struct KeyWork {
     buf_len: usize,
     /// Create_fk being verified by the outstanding body pread.
     pending_fk: u64,
+    /// 1-based probe order of `pending_fk` (for hit_rank on match).
+    pending_rank: u32,
 }
 
 /// Resolve many txids via mmap head/idx + streaming body preads.
@@ -145,11 +147,17 @@ pub fn resolve_batch_streaming(
             };
 
             if matched {
+                let rank = slots[slot]
+                    .as_ref()
+                    .map(|w| w.pending_rank as u64)
+                    .unwrap_or(1);
+                crate::head_resolve_stats::add_hit_rank(rank.max(1));
                 results[key_i] = Some(Fk(pending_fk));
                 done[key_i] = true;
                 slots[slot] = None;
                 free_slots.push(slot);
             } else {
+                crate::head_resolve_stats::add_miss_peeks(1);
                 let submitted = {
                     let w = slots[slot].as_mut().unwrap();
                     try_submit_body(
@@ -255,6 +263,7 @@ fn arm_keys(
             buf: [0u8; 32],
             buf_len: 0,
             pending_fk: 0,
+            pending_rank: 0,
         });
         let submitted = {
             let w = slots[slot].as_mut().unwrap();
@@ -286,6 +295,7 @@ fn try_submit_body(
     idx_ns: &mut u64,
 ) -> Result<bool, StoreError> {
     while work.cand_i < work.cands.len() {
+        let rank = (work.cand_i + 1) as u32; // 1-based before advance
         let fk = work.cands[work.cand_i];
         work.cand_i += 1;
         if fk == 0 || fk > count {
@@ -304,6 +314,7 @@ fn try_submit_body(
             continue;
         }
         work.pending_fk = fk;
+        work.pending_rank = rank;
         work.buf[..n].fill(0);
         work.buf_len = n;
         let ud = uring_session::pack_ud(STAGE_BODY, slot);

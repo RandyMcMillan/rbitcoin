@@ -979,9 +979,9 @@ pub async fn ibd_cancellable(
                 plan_q,
                 load_q,
                 write_q,
-                confirm::PLAN_QUEUE_CAP,
-                confirm::LOAD_QUEUE_CAP,
-                confirm::WRITE_QUEUE_CAP,
+                confirm::plan_queue_cap(),
+                confirm::load_queue_cap(),
+                confirm::write_queue_cap(),
             );
             let progress_line = format_progress_line(&ProgressLineInput {
                 pct,

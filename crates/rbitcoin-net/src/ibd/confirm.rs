@@ -314,19 +314,56 @@ const CONFIRM_RUN_MAX: usize = 32;
 /// ≥ [`CONFIRM_RUN_MAX`] so the engine can fill a full wave when bodies exist.
 const OFFER_AHEAD: u32 = 96;
 
-/// Plan-complete batches waiting for prep (plan can run ahead of prep).
-pub(crate) const PLAN_QUEUE_CAP: usize = 5;
-/// Loaded batches waiting for scripts (prep can run ahead of scripts).
-pub(crate) const LOAD_QUEUE_CAP: usize = 5;
-/// Script-ok batches buffered for write (scripts(N+1) may run while N writes).
-pub(crate) const WRITE_QUEUE_CAP: usize = 5;
+/// Default capacity for each of plan→prep, prep→scripts, scripts→write queues.
+pub(crate) const CONFIRM_QUEUE_CAP_DEFAULT: usize = 5;
+/// Hard clamp for [`confirm_queue_cap`] (env abuse / OOM guard).
+const CONFIRM_QUEUE_CAP_MAX: usize = 64;
+
+/// Shared confirm pipeline queue capacity (all three stage queues).
+///
+/// Env: `RBITCOIN_CONFIRM_QUEUE` (default **5**, clamp **1..=64**). One value
+/// sizes planq, prepq, and writeq together.
+pub(crate) fn confirm_queue_cap() -> usize {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let raw = std::env::var("RBITCOIN_CONFIRM_QUEUE").ok();
+        let n = raw
+            .as_deref()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(CONFIRM_QUEUE_CAP_DEFAULT);
+        let n = n.clamp(1, CONFIRM_QUEUE_CAP_MAX);
+        if raw.is_some() && n != CONFIRM_QUEUE_CAP_DEFAULT {
+            rbitcoin_log::info!(
+                "ibd: confirm pipeline queues planq/prepq/writeq cap={n} \
+                 (RBITCOIN_CONFIRM_QUEUE)"
+            );
+        }
+        n
+    })
+}
+
+/// Plan→prep `SyncSender` capacity (same as [`confirm_queue_cap`]).
+pub(crate) fn plan_queue_cap() -> usize {
+    confirm_queue_cap()
+}
+/// Prep→scripts capacity (same as [`confirm_queue_cap`]).
+pub(crate) fn load_queue_cap() -> usize {
+    confirm_queue_cap()
+}
+/// Scripts→write capacity (same as [`confirm_queue_cap`]).
+pub(crate) fn write_queue_cap() -> usize {
+    confirm_queue_cap()
+}
 
 /// Max heights claimable ahead of tip+1 (pipeline depth).
 ///
 /// Plan may start the next run while prep/scripts/write hold earlier ones,
 /// but must **not** skip a stuck tip+1 and claim thousands of far heights.
-const MAX_CLAIM_AHEAD: u32 = (PLAN_QUEUE_CAP + LOAD_QUEUE_CAP + WRITE_QUEUE_CAP + 1) as u32
-    * CONFIRM_RUN_MAX as u32;
+fn max_claim_ahead() -> u32 {
+    let q = confirm_queue_cap();
+    (q.saturating_mul(3).saturating_add(1) as u32).saturating_mul(CONFIRM_RUN_MAX as u32)
+}
 
 /// Plan-stage output: stamp + pipeline-local parent denserels for prep pin.
 struct PlanDone {
@@ -349,11 +386,11 @@ struct PlanDone {
 /// samples alone almost always show 0 under a plan-limited pipeline.
 #[derive(Debug, Default)]
 pub(crate) struct ConfirmQueueDepths {
-    /// plan → prep (`SyncSender` capacity [`PLAN_QUEUE_CAP`]).
+    /// plan → prep (`SyncSender` capacity [`confirm_queue_cap`]).
     plan_to_prep: AtomicUsize,
-    /// prep → scripts (`SyncSender` capacity [`LOAD_QUEUE_CAP`]).
+    /// prep → scripts (`SyncSender` capacity [`confirm_queue_cap`]).
     load_to_scripts: AtomicUsize,
-    /// scripts → write (`SyncSender` capacity [`WRITE_QUEUE_CAP`]).
+    /// scripts → write (`SyncSender` capacity [`confirm_queue_cap`]).
     scripts_to_write: AtomicUsize,
     /// Max plan→prep depth since last HWM sample.
     plan_hwm: AtomicUsize,
@@ -705,15 +742,14 @@ pub(crate) fn spawn_confirm_engine(
     loop_stats: Arc<LoopStats>,
 ) -> (std::thread::JoinHandle<()>, Arc<ConfirmQueueDepths>) {
     let queues = ConfirmQueueDepths::new();
-    let (plan_tx, plan_rx) =
-        std::sync::mpsc::sync_channel::<PlanDone>(PLAN_QUEUE_CAP);
+    let qcap = confirm_queue_cap();
+    let (plan_tx, plan_rx) = std::sync::mpsc::sync_channel::<PlanDone>(qcap);
     let (mat_tx, mat_rx) = std::sync::mpsc::sync_channel::<(
         rbitcoin_consensus::LoadedBatch,
         u64, // load work_ns
-    )>(LOAD_QUEUE_CAP);
-    let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<rbitcoin_consensus::ScriptOkBatch>(
-        WRITE_QUEUE_CAP,
-    );
+    )>(qcap);
+    let (write_tx, write_rx) =
+        std::sync::mpsc::sync_channel::<rbitcoin_consensus::ScriptOkBatch>(qcap);
     // Write reject: plan drops reserved fks + last_prepped so re-plan after
     // Class A partial commit does not drift next_tx_start.
     let prep_ahead_reset = Arc::new(AtomicBool::new(false));
@@ -1111,7 +1147,8 @@ pub(crate) fn spawn_confirm_engine(
         .name("ibd-confirm-plan".into())
         .spawn(move || {
             info!(
-                "ibd: confirm plan on dedicated OS thread (claim → stamp create_fk → prep queue/{PLAN_QUEUE_CAP})"
+                "ibd: confirm plan on dedicated OS thread (claim → stamp create_fk → prep queue/{})",
+                confirm_queue_cap()
             );
             let mut plan_ahead = PrepAheadState::new(&hub);
             loop {
@@ -1139,12 +1176,13 @@ pub(crate) fn spawn_confirm_engine(
                         g.inflight.retain(|&h| h >= path_lo);
 
                         let mut claim_at = path_lo;
+                        let claim_ahead = max_claim_ahead();
                         while g.inflight.contains(&claim_at)
-                            && claim_at < path_lo.saturating_add(MAX_CLAIM_AHEAD)
+                            && claim_at < path_lo.saturating_add(claim_ahead)
                         {
                             claim_at = claim_at.saturating_add(1);
                         }
-                        let claim_start = if claim_at > path_lo.saturating_add(MAX_CLAIM_AHEAD)
+                        let claim_start = if claim_at > path_lo.saturating_add(claim_ahead)
                         {
                             None
                         } else if g.inflight.contains(&claim_at) {
@@ -1155,7 +1193,7 @@ pub(crate) fn spawn_confirm_engine(
                             None
                         };
                         if let Some(expect) = claim_start {
-                            let claim_hi = path_lo.saturating_add(MAX_CLAIM_AHEAD);
+                            let claim_hi = path_lo.saturating_add(claim_ahead);
                             let mut run = Vec::with_capacity(CONFIRM_RUN_MAX);
                             let mut h = expect;
                             while run.len() < CONFIRM_RUN_MAX && h <= claim_hi {
@@ -1686,24 +1724,24 @@ mod tests {
     /// Claim must not jump thousands past tip when near pipeline is full.
     #[test]
     fn claim_ahead_cap_blocks_far_skip() {
-        assert!(super::MAX_CLAIM_AHEAD >= super::CONFIRM_RUN_MAX as u32);
+        let ahead = super::max_claim_ahead();
+        assert!(ahead >= super::CONFIRM_RUN_MAX as u32);
         assert!(
-            super::MAX_CLAIM_AHEAD <= 512,
-            "keep claim window modest: {}",
-            super::MAX_CLAIM_AHEAD
+            ahead <= 64 * 3 * super::CONFIRM_RUN_MAX as u32 + super::CONFIRM_RUN_MAX as u32,
+            "keep claim window within env clamp: {ahead}"
         );
         let path_lo = 87u32;
         // Within window: claim a short run only (not the whole far feed).
         let run = claim_feed_run(
             path_lo,
             super::CONFIRM_RUN_MAX,
-            path_lo + super::MAX_CLAIM_AHEAD,
+            path_lo + ahead,
             |h| h >= path_lo && h < path_lo + 1000,
             |_| false,
         );
         assert_eq!(run.len(), super::CONFIRM_RUN_MAX);
         assert_eq!(run[0], path_lo);
-        assert!(*run.last().unwrap() <= path_lo + super::MAX_CLAIM_AHEAD);
+        assert!(*run.last().unwrap() <= path_lo + ahead);
     }
 
     /// requeue_wire after empty prep must clear inflight (Ok(None) leak regression).
@@ -1851,30 +1889,23 @@ mod tests {
             "planq<0/2 prepq<0/2 writeq<0/2"
         );
 
-        assert_eq!(super::PLAN_QUEUE_CAP, 5);
-        assert_eq!(super::LOAD_QUEUE_CAP, 5);
-        assert_eq!(super::WRITE_QUEUE_CAP, 5);
+        let cap = super::confirm_queue_cap();
+        assert!(
+            (1..=super::CONFIRM_QUEUE_CAP_MAX).contains(&cap),
+            "confirm_queue_cap out of range: {cap}"
+        );
+        // Default when env unset is 5 (OnceLock: do not set RBITCOIN_CONFIRM_QUEUE in this test).
+        assert_eq!(cap, super::CONFIRM_QUEUE_CAP_DEFAULT);
+        assert_eq!(super::plan_queue_cap(), cap);
+        assert_eq!(super::load_queue_cap(), cap);
+        assert_eq!(super::write_queue_cap(), cap);
         assert_eq!(
-            format_conf_q(
-                0,
-                0,
-                0,
-                super::PLAN_QUEUE_CAP,
-                super::LOAD_QUEUE_CAP,
-                super::WRITE_QUEUE_CAP
-            ),
-            "planq<0/5 prepq<0/5 writeq<0/5"
+            format_conf_q(0, 0, 0, cap, cap, cap),
+            format!("planq<0/{cap} prepq<0/{cap} writeq<0/{cap}")
         );
         assert_eq!(
-            format_conf_q(
-                5,
-                5,
-                5,
-                super::PLAN_QUEUE_CAP,
-                super::LOAD_QUEUE_CAP,
-                super::WRITE_QUEUE_CAP
-            ),
-            "planq=5/5 prepq=5/5 writeq=5/5"
+            format_conf_q(cap, cap, cap, cap, cap, cap),
+            format!("planq={cap}/{cap} prepq={cap}/{cap} writeq={cap}/{cap}")
         );
     }
 

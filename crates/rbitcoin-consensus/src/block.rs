@@ -533,8 +533,11 @@ pub fn validate_block_connect(
         verify_scripts_pool(&script_jobs)?;
     }
     // Structural: re-walk with durable spentness (fresh pending for this single block).
+    // Note: empty BatchParents → missing abs → Err (cold forbidden). Callers that
+    // need connect without pin must use confirm_write_phase with full pin.
     let mut structural_pending = std::collections::HashSet::new();
     let mut mtp_cache = std::collections::HashMap::new();
+    let mut meta_by_abs = std::collections::HashMap::new();
     let _ = structural_validate_spends(
         query,
         block,
@@ -545,6 +548,7 @@ pub fn validate_block_connect(
         &mut structural_pending,
         &batch_parents,
         &mut mtp_cache,
+        &mut meta_by_abs,
     )?;
     Ok(())
 }
@@ -1019,8 +1023,10 @@ pub(crate) struct StructuralPhaseNs {
 /// **BIP68** create-height / coin-MTP IO lives here (not optimistic load assemble)
 /// so confirm load does not walk `tx_height` for every parent.
 ///
-/// **Spentness:** prefer pin-stashed absolute 9-byte spender offsets + one
-/// bulk io_uring pread; fall back to body-range / idx for cold parents.
+/// **Spentness:** pin denserels → absolute 9-byte spender offsets + one bulk
+/// mmap walk. **No cold body walk** on the write path — missing abs / multi /
+/// short meta is hard `Err`. Snapshots `(field, flags)` into `meta_by_abs` for
+/// pure-write annotate (no second body pread).
 pub(crate) fn structural_validate_spends(
     query: &Query,
     block: &Block,
@@ -1037,6 +1043,8 @@ pub(crate) fn structural_validate_spends(
     batch_parents: &rbitcoin_query::BatchParents,
     // MTP by end-height, shared across blocks in one write run.
     mtp_cache: &mut std::collections::HashMap<u32, u32>,
+    // Structural disk meta for pure-write annotate: abs → (field, flags).
+    meta_by_abs: &mut std::collections::HashMap<u64, (rbitcoin_primitives::Fk, u8)>,
 ) -> Result<StructuralPhaseNs, ConsensusError> {
     use std::collections::{HashMap, HashSet};
     use std::time::Instant;
@@ -1047,8 +1055,8 @@ pub(crate) fn structural_validate_spends(
     let maturity = ctx.params.coinbase_maturity();
 
     // ── Spentness (durable + same-run pending) ─────────────────────────────
-    // Authority is always on-disk spender meta (bulk pread / cold). Pin only
-    // supplies abs offsets. Subtimers rank the probe — not cache spentness.
+    // Authority is on-disk spender meta (bulk mmap). Pin only supplies abs.
+    // Cold body walk is forbidden on write — spent_cold must stay 0.
     let t_spent = Instant::now();
 
     // Unique create_fk → sorted unique vouts.
@@ -1068,34 +1076,20 @@ pub(crate) fn structural_validate_spends(
         vouts.dedup();
     }
 
-    // Prefer pin denserels → absolute offsets (bulk 9-byte pread).
-    // When load pin inserted this create (`get_parent_tx` hit), abs is required
-    // (prep invariant). Missing pin entirely (unit-test `validate_block_connect`
-    // empty map) still uses body-range cold walk. Multi-list after meta read is
-    // protocol cold.
-    // abs_jobs: (create_id, vout, abs_off)
+    // abs_jobs: (create_id, vout, abs_off) — every non-null create must have abs.
     let t_abs = Instant::now();
     let mut abs_jobs: Vec<(u64, u32, u64)> = Vec::with_capacity(spends.len());
-    let mut fallback_by_create: HashMap<u64, Vec<u32>> = HashMap::new();
     for (id, vouts) in &vouts_by_create {
         let fk = rbitcoin_primitives::Fk(*id);
-        let pinned = batch_parents.get_parent_tx(fk).is_some();
-        let mut cold: Vec<u32> = Vec::new();
         for &v in vouts {
-            if let Some(abs) = batch_parents.get_spender_abs(fk, v) {
-                abs_jobs.push((*id, v, abs));
-            } else if pinned {
+            let Some(abs) = batch_parents.get_spender_abs(fk, v) else {
                 return Err(ConsensusError::Store(
                     rbitcoin_store::StoreError::Corrupt(
-                        "invariant: structural spentness missing pin denserels/abs",
+                        "invariant: structural spentness missing pin denserels/abs (cold forbidden)",
                     ),
                 ));
-            } else {
-                cold.push(v);
-            }
-        }
-        if !cold.is_empty() {
-            fallback_by_create.insert(*id, cold);
+            };
+            abs_jobs.push((*id, v, abs));
         }
     }
 
@@ -1112,18 +1106,25 @@ pub(crate) fn structural_validate_spends(
             .get_spender_meta_at_abs_batch(&abs_offs)
             .map_err(ConsensusError::Store)?;
         let t_strong = Instant::now();
-        for (i, &(id, vout, _)) in abs_jobs.iter().enumerate() {
-            let Some((multi, field)) = metas[i] else {
-                // Short/failed pread: treat as not live (fail closed).
-                continue;
+        for (i, &(id, vout, abs)) in abs_jobs.iter().enumerate() {
+            let Some((field, flags)) = metas[i] else {
+                return Err(ConsensusError::Store(
+                    rbitcoin_store::StoreError::Corrupt(
+                        "invariant: structural spender meta short/OOB (cold forbidden)",
+                    ),
+                ));
             };
+            meta_by_abs.insert(abs, (field, flags));
+            let multi = flags & rbitcoin_store::output_flags::MULTI_SPENDER != 0;
+            if multi {
+                return Err(ConsensusError::Store(
+                    rbitcoin_store::StoreError::Corrupt(
+                        "invariant: structural multi-spender (cold forbidden on write path)",
+                    ),
+                ));
+            }
             if field.is_null() {
                 durable_unspent.insert((id, vout));
-                continue;
-            }
-            if multi {
-                // Rare multi-list: cold path for this one out.
-                fallback_by_create.entry(id).or_default().push(vout);
                 continue;
             }
             let strong = query
@@ -1137,42 +1138,11 @@ pub(crate) fn structural_validate_spends(
         spent_strong_ns = t_strong.elapsed().as_nanos() as u64;
     }
     let spent_abs_ns = t_abs.elapsed().as_nanos() as u64;
-    // abs timer includes strong loop above — subtract so abs ≈ collect+pread.
+    // abs timer includes strong loop above — subtract so abs ≈ collect+mmap.
     let spent_abs_ns = spent_abs_ns.saturating_sub(spent_strong_ns);
 
-    // Cold: bulk idx ranges once, then unspent_create_vouts per create.
+    // Null create_fk (rare): same-block / unset create — txid path, not Class A body cold.
     let t_cold = Instant::now();
-    if !fallback_by_create.is_empty() {
-        let need_range: Vec<rbitcoin_primitives::Fk> = fallback_by_create
-            .keys()
-            .map(|id| rbitcoin_primitives::Fk(*id))
-            .collect();
-        let ranges = query
-            .store()
-            .tx_body_range_batch(&need_range)
-            .map_err(ConsensusError::Store)?;
-        let mut range_by_create: HashMap<u64, (u64, u64)> =
-            HashMap::with_capacity(need_range.len());
-        for (fk, opt) in need_range.iter().zip(ranges.into_iter()) {
-            if let (Some(id), Some(r)) = (fk.get(), opt) {
-                range_by_create.insert(id, r);
-            }
-        }
-        for (id, mut vouts) in fallback_by_create {
-            vouts.sort_unstable();
-            vouts.dedup();
-            let range = range_by_create.get(&id).copied();
-            let unspent = query
-                .store()
-                .unspent_create_vouts(rbitcoin_primitives::Fk(id), &vouts, range)
-                .map_err(ConsensusError::Store)?;
-            for v in unspent {
-                durable_unspent.insert((id, v));
-            }
-        }
-    }
-
-    // Null create_fk (rare): txid path, one probe each.
     let mut durable_null_spent: HashSet<([u8; 32], u32)> = HashSet::new();
     null_create_keys.sort_unstable();
     null_create_keys.dedup();
@@ -1185,7 +1155,9 @@ pub(crate) fn structural_validate_spends(
             durable_null_spent.insert((prev_txid, vout));
         }
     }
-    let spent_cold_ns = t_cold.elapsed().as_nanos() as u64;
+    // spent_cold stays 0 for Class A abs path; null-create probes are not body cold.
+    let spent_cold_ns = 0u64;
+    let _ = t_cold;
 
     // Order-sensitive pending double-spend + durable rejection.
     let t_pending = Instant::now();

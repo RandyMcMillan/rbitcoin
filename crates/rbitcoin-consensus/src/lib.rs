@@ -167,13 +167,23 @@ pub mod confirm_phase_stats {
     /// Historical name `UTXO_APPLY_NS` / log field `spend=` ms — this is **not** a
     /// light-UTXO map apply (Catchup removed). Wall time for all annotate paths.
     pub static UTXO_APPLY_NS: AtomicU64 = AtomicU64::new(0);
-    /// Annotate edges via abs pin denserels (`put_spend_batch_by_abs_meta`).
+    /// Annotate edges via abs pin denserels (pure-write known meta).
     /// Historical name: formerly also counted ranged body walks (removed on Direct write).
     pub static SPEND_ANNOTATE_RANGED: AtomicU64 = AtomicU64::new(0);
     /// Legacy cold idx annotate path (must stay 0 on Direct IBD after abs-only write).
     pub static SPEND_ANNOTATE_IDX: AtomicU64 = AtomicU64::new(0);
     /// Spends skipped (null create_fk or null spend_fk).
     pub static SPEND_ANNOTATE_SKIP: AtomicU64 = AtomicU64::new(0);
+    /// Pure-write annotate: mmap backend wall (ns) / edge count.
+    pub static SPEND_ANN_MMAP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static SPEND_ANN_MMAP_N: AtomicU64 = AtomicU64::new(0);
+    /// Pure-write annotate: uring pwrite-only backend wall (ns) / edge count.
+    pub static SPEND_ANN_URING_NS: AtomicU64 = AtomicU64::new(0);
+    pub static SPEND_ANN_URING_N: AtomicU64 = AtomicU64::new(0);
+    /// Edges annotated without body pread (should equal all annotate edges).
+    pub static SPEND_ANN_PREAD_SKIP: AtomicU64 = AtomicU64::new(0);
+    /// Body preads on annotate (must stay 0 on pure-write write path).
+    pub static SPEND_ANN_PREAD: AtomicU64 = AtomicU64::new(0);
     /// Header + body-fk resolve for the batch.
     pub static RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
     /// Prep pre-assemble wall on the prep/load thread.
@@ -385,6 +395,19 @@ pub mod confirm_phase_stats {
             STRUCTURAL_SPENT_NS.swap(0, Ordering::Relaxed),
             STRUCTURAL_CREATE_H_NS.swap(0, Ordering::Relaxed),
             STRUCTURAL_BIP68_NS.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    /// Pure-write annotate A/B: (mmap_ns, mmap_n, uring_ns, uring_n, pread_skip, pread).
+    #[inline]
+    pub fn sample_spend_ann_ab_and_reset() -> (u64, u64, u64, u64, u64, u64) {
+        (
+            SPEND_ANN_MMAP_NS.swap(0, Ordering::Relaxed),
+            SPEND_ANN_MMAP_N.swap(0, Ordering::Relaxed),
+            SPEND_ANN_URING_NS.swap(0, Ordering::Relaxed),
+            SPEND_ANN_URING_N.swap(0, Ordering::Relaxed),
+            SPEND_ANN_PREAD_SKIP.swap(0, Ordering::Relaxed),
+            SPEND_ANN_PREAD.swap(0, Ordering::Relaxed),
         )
     }
 }

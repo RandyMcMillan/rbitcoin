@@ -1893,12 +1893,13 @@ impl TxTable {
     /// Bulk 9-byte spender meta reads at absolute `tx.body` file offsets.
     ///
     /// Each entry is the absolute offset of an output's spender_field (8) + flags (1).
-    /// **Mmap path** (one map pin, no per-offset pread/io_uring) — same durable
-    /// Class A body bytes as pread. Out-of-range / short yields `None` (fail closed).
+    /// Returns `(spender_field, flags)` — multi = `flags & MULTI_SPENDER`.
+    /// **Mmap path** (one map pin, no per-offset pread/io_uring). Out-of-range /
+    /// short yields `None` (caller fail-closed).
     pub fn get_spender_meta_at_abs_batch(
         &self,
         abs_offs: &[u64],
-    ) -> Result<Vec<Option<(bool, Fk)>>, StoreError> {
+    ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
         const META_LEN: usize = 9;
         if abs_offs.is_empty() {
             return Ok(Vec::new());
@@ -1906,7 +1907,7 @@ impl TxTable {
         // Shared mmap walk — write structural spentness issues tens of thousands
         // of 9-byte peeks per window; pread/io_uring-per-offset was the wall.
         Ok(self.body.with_body_map_pin(|map, published| {
-            let mut out: Vec<Option<(bool, Fk)>> = vec![None; abs_offs.len()];
+            let mut out: Vec<Option<(Fk, u8)>> = vec![None; abs_offs.len()];
             let map_len = map.len() as u64;
             for (i, &off) in abs_offs.iter().enumerate() {
                 let end = off.saturating_add(META_LEN as u64);
@@ -1916,11 +1917,28 @@ impl TxTable {
                 let o = off as usize;
                 let b = &map[o..o + META_LEN];
                 let field = Fk(u64::from_le_bytes(b[0..8].try_into().unwrap()));
-                let multi = b[8] & output_flags::MULTI_SPENDER != 0;
-                out[i] = Some((multi, field));
+                let flags = b[8];
+                out[i] = Some((field, flags));
             }
             out
         }))
+    }
+
+    /// Pure-write spend annotate using structural-known meta (no body pread).
+    ///
+    /// `known[i]` is `(field, flags)` at `abs_edges[i].0` from structural spentness.
+    /// Backend: `mmap` (map store) or `uring` (pwrite-only). Returns cold edges
+    /// (OOB) — production callers must treat non-empty as hard error.
+    pub fn put_spend_batch_by_abs_meta_known(
+        &self,
+        spenders: &crate::spender_table::SpenderTable,
+        abs_edges: &[(u64, Fk, u32, Fk)],
+        known: &[(Fk, u8)],
+        backend: crate::spend_annotate_uring::SpendAnnBackend,
+    ) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
+        crate::spend_annotate_uring::put_spend_batch_by_abs_meta_known(
+            self, spenders, abs_edges, known, backend,
+        )
     }
 
     /// Read multi + spender_field for create tx output (packed Class A body).
@@ -3333,9 +3351,9 @@ mod tests {
             .collect();
         let bulk = t.get_spender_meta_at_abs_batch(&abs).unwrap();
         assert_eq!(bulk.len(), 3);
-        assert_eq!(bulk[0], Some((false, s1)));
-        assert_eq!(bulk[1], Some((false, Fk::NULL)));
-        assert_eq!(bulk[2], Some((false, Fk(20))));
+        assert_eq!(bulk[0].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)), Some((s1, false)));
+        assert_eq!(bulk[1].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)), Some((Fk::NULL, false)));
+        assert_eq!(bulk[2].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)), Some((Fk(20), false)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

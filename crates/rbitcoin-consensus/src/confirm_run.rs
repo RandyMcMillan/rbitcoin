@@ -31,11 +31,30 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Block, Target};
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
-use rbitcoin_store::StoreError;
+use rbitcoin_store::{SpendAnnBackend, StoreError};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Alternate mmap/uring pure-write annotate (soak A/B). Override with
+/// `RBITCOIN_SPEND_ANN=mmap|uring|alternate`.
+fn spend_ann_backend_next() -> SpendAnnBackend {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let mode = std::env::var("RBITCOIN_SPEND_ANN").unwrap_or_default();
+    match mode.as_str() {
+        "mmap" => SpendAnnBackend::Mmap,
+        "uring" => SpendAnnBackend::Uring,
+        _ => {
+            // alternate (default)
+            if N.fetch_add(1, Ordering::Relaxed) % 2 == 0 {
+                SpendAnnBackend::Mmap
+            } else {
+                SpendAnnBackend::Uring
+            }
+        }
+    }
+}
 
 /// One height resolved for the confirm wave (header + Class A body fks).
 struct BodyMeta {
@@ -1826,6 +1845,9 @@ pub fn confirm_write_phase(
     }
 
     // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
+    // Structural fills meta_by_abs for pure-write annotate (no second body pread).
+    let mut meta_by_abs: std::collections::HashMap<u64, (rbitcoin_primitives::Fk, u8)> =
+        std::collections::HashMap::new();
     let t_struct = Instant::now();
     let struct_ph = structural_run(
         query,
@@ -1834,6 +1856,7 @@ pub fn confirm_write_phase(
         &batch.prepared,
         &batch.wire_blocks,
         &batch.batch_parents,
+        &mut meta_by_abs,
     )?;
     let structural_ns = t_struct.elapsed().as_nanos() as u64;
 
@@ -1843,7 +1866,7 @@ pub fn confirm_write_phase(
     let class_c_ns = t_cc.elapsed().as_nanos() as u64;
 
     let (spend_ann_ns, tip_gc_ns) =
-        post_commit(query, &batch.prepared, &batch.batch_parents)?;
+        post_commit(query, &batch.prepared, &batch.batch_parents, &meta_by_abs)?;
 
     // batch_parents dropped here with ScriptOkBatch — no tip GC of sparse pins.
     confirm_phase_stats::BLOCKS.fetch_add(n_blocks as u64, Ordering::Relaxed);
@@ -2930,7 +2953,8 @@ mod write_idempotent_tests {
         }];
         // Empty BatchParents → get_spender_abs is None.
         let bp = BatchParents::new();
-        let err = post_commit(&q, &prepared, &bp).expect_err("missing denserels");
+        let meta = std::collections::HashMap::new();
+        let err = post_commit(&q, &prepared, &bp, &meta).expect_err("missing denserels");
         let msg = format!("{err}");
         assert!(
             msg.contains("invariant") && msg.contains("denserels"),
@@ -3182,6 +3206,7 @@ mod write_idempotent_tests {
         let ctx = crate::block::ValidationContext::at(&params, Height(1), Milestone::NONE);
         let mut pending = HashSet::new();
         let mut mtp = HashMap::new();
+        let mut meta_by_abs = HashMap::new();
         let err = structural_validate_spends(
             &q,
             &block,
@@ -3192,6 +3217,7 @@ mod write_idempotent_tests {
             &mut pending,
             &bp,
             &mut mtp,
+            &mut meta_by_abs,
         )
         .expect_err("pinned without abs must be invariant");
         let msg = format!("{err}");
@@ -3502,6 +3528,7 @@ fn structural_run(
     prepared: &[Prepared],
     wire_blocks: &[Arc<Block>],
     batch_parents: &rbitcoin_query::BatchParents,
+    meta_by_abs: &mut std::collections::HashMap<u64, (rbitcoin_primitives::Fk, u8)>,
 ) -> Result<crate::block::StructuralPhaseNs, ConsensusError> {
     use crate::block::StructuralPhaseNs;
     let t0 = Instant::now();
@@ -3521,6 +3548,7 @@ fn structural_run(
             &mut pending_spent,
             batch_parents,
             &mut mtp_cache,
+            meta_by_abs,
         )?;
         tot.spent_ns = tot.spent_ns.saturating_add(ph.spent_ns);
         tot.spent_abs_ns = tot.spent_abs_ns.saturating_add(ph.spent_abs_ns);
@@ -3602,23 +3630,27 @@ fn class_c_commit(
 }
 
 /// Returns `(spend_ann_ns, tip_gc_ns)` measured with local `Instant`s.
+///
+/// Pure-write annotate: body meta from `meta_by_abs` (structural snapshot);
+/// no body pread. Backend alternates mmap vs uring for soak A/B.
 fn post_commit(
     query: &Query,
     prepared: &[Prepared],
     batch_parents: &rbitcoin_query::BatchParents,
+    meta_by_abs: &std::collections::HashMap<u64, (rbitcoin_primitives::Fk, u8)>,
 ) -> Result<(u64, u64), ConsensusError> {
     // Confirm write (IBD + tip via accept_and_connect → confirm_archived_run):
     // batch durable spend annotations after Class C. Load pin must supply
     // denserels + body_range so every edge has abs layout — one path only.
     let t_spent = Instant::now();
     if query.spend_index_enabled() && query.index_mode().uses_durable_spends() {
-        // Abs-only: no ranged/by_create cold tiers.
         let mut abs_edges: Vec<(
             u64,
             rbitcoin_primitives::Fk,
             u32,
             rbitcoin_primitives::Fk,
         )> = Vec::new();
+        let mut known: Vec<(rbitcoin_primitives::Fk, u8)> = Vec::new();
         let mut n_skip = 0u64;
         for p in prepared {
             for &(_txid, vout, sfk, cfk) in &p.spends {
@@ -3631,24 +3663,46 @@ fn post_commit(
                         "invariant: spend annotate missing pin denserels/abs",
                     )));
                 };
+                let Some(&(field, flags)) = meta_by_abs.get(&abs) else {
+                    return Err(ConsensusError::Store(StoreError::Corrupt(
+                        "invariant: spend annotate missing structural meta (cold forbidden)",
+                    )));
+                };
                 abs_edges.push((abs, cfk, vout, sfk));
+                known.push((field, flags));
             }
         }
         confirm_phase_stats::SPEND_ANNOTATE_SKIP.fetch_add(n_skip, Ordering::Relaxed);
         if !abs_edges.is_empty() {
+            let backend = spend_ann_backend_next();
+            let t_ann = Instant::now();
             let cold = query
                 .store()
-                .put_spend_batch_by_abs_meta(&abs_edges)
+                .put_spend_batch_by_abs_meta_known(&abs_edges, &known, backend)
                 .map_err(ConsensusError::Store)?;
             if !cold.is_empty() {
                 return Err(ConsensusError::Store(StoreError::Corrupt(
                     "invariant: spend annotate abs cold (OOB or IO); prep/layout bug",
                 )));
             }
+            let ann_ns = t_ann.elapsed().as_nanos() as u64;
+            match backend {
+                rbitcoin_store::spend_annotate_uring::SpendAnnBackend::Mmap => {
+                    confirm_phase_stats::SPEND_ANN_MMAP_NS.fetch_add(ann_ns, Ordering::Relaxed);
+                    confirm_phase_stats::SPEND_ANN_MMAP_N
+                        .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
+                }
+                rbitcoin_store::spend_annotate_uring::SpendAnnBackend::Uring => {
+                    confirm_phase_stats::SPEND_ANN_URING_NS.fetch_add(ann_ns, Ordering::Relaxed);
+                    confirm_phase_stats::SPEND_ANN_URING_N
+                        .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
+                }
+            }
             confirm_phase_stats::SPEND_ANNOTATE_RANGED
                 .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
+            confirm_phase_stats::SPEND_ANN_PREAD_SKIP
+                .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
         }
-        // Cold tiers removed: SPEND_ANNOTATE_IDX stays 0 on healthy Direct IBD.
     }
     let spend_ann_ns = t_spent.elapsed().as_nanos() as u64;
     confirm_phase_stats::UTXO_APPLY_NS.fetch_add(spend_ann_ns, Ordering::Relaxed);

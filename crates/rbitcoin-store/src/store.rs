@@ -486,8 +486,22 @@ impl Store {
     pub fn get_spender_meta_at_abs_batch(
         &self,
         abs_offs: &[u64],
-    ) -> Result<Vec<Option<(bool, Fk)>>, StoreError> {
+    ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
         self.txs.get_spender_meta_at_abs_batch(abs_offs)
+    }
+
+    /// Pure-write annotate with structural-known meta (no body pread).
+    ///
+    /// `abs_edges`: `(abs_off, create_tx_fk, vout, spending_tx_fk)`.
+    /// `known`: parallel `(field, flags)` from structural spentness.
+    pub fn put_spend_batch_by_abs_meta_known(
+        &self,
+        abs_edges: &[(u64, Fk, u32, Fk)],
+        known: &[(Fk, u8)],
+        backend: crate::spend_annotate_uring::SpendAnnBackend,
+    ) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
+        self.txs
+            .put_spend_batch_by_abs_meta_known(&self.spenders, abs_edges, known, backend)
     }
 
     /// Spentness by create fk (no `tx.head`). Prefer known body range when available.

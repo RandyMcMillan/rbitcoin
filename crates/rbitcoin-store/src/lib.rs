@@ -17,7 +17,7 @@ mod fuse8_filter;
 mod head_resolve_stream;
 pub mod head_resolve_stats;
 mod idx_body_pipeline;
-mod spend_annotate_uring;
+pub mod spend_annotate_uring;
 mod store_secret;
 mod uring_session;
 mod ibd_io_policy;
@@ -86,6 +86,8 @@ pub use head_resolve_stats::Sample as HeadResolveSample;
 pub use idx_body_pipeline::{
     run_idx_body_pipeline, BodyMode as IdxBodyMode, IdxBodyJob,
 };
+pub use crate::compact::output_flags;
+pub use spend_annotate_uring::SpendAnnBackend;
 pub use tx_table::{
     clear_output_spender_fields, decode_packed_tx, decode_packed_tx_outs_with_spender_rels,
     decode_packed_tx_outs_with_spender_rels_secret, decode_packed_tx_with_spender_rels,

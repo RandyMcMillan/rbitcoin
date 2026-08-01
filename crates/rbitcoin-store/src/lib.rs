@@ -8,6 +8,7 @@ mod address_head;
 mod array_table;
 mod block_queue;
 mod bulk_io;
+mod io_backend;
 mod chain;
 mod compact;
 mod epoch;
@@ -78,6 +79,10 @@ pub use sorted_run::{
 };
 pub use store::Store;
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};
+pub use io_backend::{
+    class_c_io_backend, head_resolve_io_backend, pin_io_backend, spend_ann_io_backend,
+    spend_meta_io_backend, ReadIoBackend, WriteIoBackend,
+};
 pub use block_queue::{
     BlockQueue, QueuedBlock, QueuedBlockMeta, DEFAULT_BLOCK_QUEUE_BUDGET_BYTES,
 };
@@ -87,13 +92,13 @@ pub use idx_body_pipeline::{
     run_idx_body_pipeline, BodyMode as IdxBodyMode, IdxBodyJob,
 };
 pub use crate::compact::output_flags;
-pub use spend_annotate_uring::SpendAnnBackend;
+pub use spend_annotate_uring::{spend_ann_backend, SpendAnnBackend};
 pub use tx_table::{
     clear_output_spender_fields, decode_packed_tx, decode_packed_tx_outs_with_spender_rels,
     decode_packed_tx_outs_with_spender_rels_secret, decode_packed_tx_with_spender_rels,
     decode_packed_tx_with_spender_rels_secret, denserels_from_packed_records, encode_packed_tx,
     encode_packed_tx_with_secret,
-    is_packed_tx_payload, scan_packed_meta_and_prevouts, spend_meta_backend_next,
+    is_packed_tx_payload, scan_packed_meta_and_prevouts, spend_meta_backend,
     InputRecord, OutputRecord, SpendMetaBackend, TxRecord,
     BODY_PAGE_SIZE, TXID_PAGE_MAX_OFF, next_tx_body_start,
 };

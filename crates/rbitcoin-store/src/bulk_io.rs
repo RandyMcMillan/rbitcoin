@@ -127,6 +127,27 @@ pub fn pread_batch(ops: &mut [ReadOp<'_>]) {
     pread_batch_fallback(ops);
 }
 
+/// Bulk pread with an explicit backend (`mmap` is not handled here — callers
+/// use map pins). `Uring` demotes to libc pread when the ring is unavailable.
+pub fn pread_batch_backend(ops: &mut [ReadOp<'_>], backend: crate::io_backend::ReadIoBackend) {
+    use crate::io_backend::ReadIoBackend;
+    if ops.is_empty() {
+        return;
+    }
+    match backend {
+        ReadIoBackend::Uring => {
+            if io_uring_enabled() && pread_batch_uring(ops) {
+                return;
+            }
+            pread_batch_fallback(ops);
+        }
+        ReadIoBackend::Pread | ReadIoBackend::Mmap => {
+            // Mmap bulk body is handled by the caller; if someone routes here, pread.
+            pread_batch_fallback(ops);
+        }
+    }
+}
+
 /// Submit all ops; fill [`WriteOp::result`]. Prefers io_uring; else serial pwrite.
 ///
 /// Public counterpart of [`pread_batch`]. Page RMW uses the mixed pipeline

@@ -498,7 +498,7 @@ impl Store {
 
     /// Bulk 9-byte spender meta at absolute `tx.body` offsets.
     ///
-    /// Backend from `RBITCOIN_SPEND_META` (see [`crate::spend_meta_backend_next`]).
+    /// Backend from `RBITCOIN_SPEND_META` / global `RBITCOIN_IO` (see [`crate::spend_meta_backend`]).
     pub fn get_spender_meta_at_abs_batch(
         &self,
         abs_offs: &[u64],

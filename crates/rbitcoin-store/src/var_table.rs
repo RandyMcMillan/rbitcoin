@@ -240,6 +240,11 @@ impl VarTable {
         self.body.write_at(abs_offset, data)
     }
 
+    /// Absolute write via **pwrite** (page cache; no mmap dirty for the payload).
+    pub fn write_body_abs_pwrite(&self, abs_offset: u64, data: &[u8]) -> Result<(), StoreError> {
+        self.body.write_at_pwrite(abs_offset, data)
+    }
+
     /// Pre-grow body (+ idx tail) capacity so a following mega `put_batch` does not
     /// remap mid-write.
     pub fn reserve_append(&self, body_bytes: u64, n_records: u64) -> Result<(), StoreError> {

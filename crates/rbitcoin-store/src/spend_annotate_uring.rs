@@ -299,13 +299,27 @@ fn next_ready(
 
 // ── Pure-write annotate (structural-known meta; no body pread) ─────────────
 
-/// Annotate backend for pure-write path (A/B soak).
+/// Annotate backend for pure-write path.
+///
+/// Selected via `RBITCOIN_SPEND_ANN` / global `RBITCOIN_IO` (see [`crate::io_backend`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpendAnnBackend {
     /// Store 9 B via mmap epoch pin (`write_at`).
     Mmap,
     /// Store 9 B via io_uring pwrite only (no pread).
     Uring,
+    /// Store 9 B via libc `pwrite` (positional, no ring).
+    Pwrite,
+}
+
+/// Resolve pure-write annotate backend from env hierarchy.
+#[inline]
+pub fn spend_ann_backend() -> SpendAnnBackend {
+    match crate::io_backend::spend_ann_io_backend() {
+        crate::io_backend::WriteIoBackend::Mmap => SpendAnnBackend::Mmap,
+        crate::io_backend::WriteIoBackend::Uring => SpendAnnBackend::Uring,
+        crate::io_backend::WriteIoBackend::Pwrite => SpendAnnBackend::Pwrite,
+    }
 }
 
 /// Decision from structural snapshot + spend_fk (no body read).
@@ -407,7 +421,23 @@ pub fn put_spend_batch_by_abs_meta_known(
             Ok(cold)
         }
         SpendAnnBackend::Uring => put_spend_batch_pure_write_uring(txs, &writes, cold),
+        SpendAnnBackend::Pwrite => put_spend_batch_pure_write_pwrite(txs, &writes, cold),
     }
+}
+
+/// libc pwrite-only (no pread, no ring) for prepared 9-byte metas.
+fn put_spend_batch_pure_write_pwrite(
+    txs: &TxTable,
+    writes: &[(u64, Fk, u32, Fk, [u8; META_LEN])],
+    mut cold: Vec<(Fk, u32, Fk)>,
+) -> Result<Vec<(Fk, u32, Fk)>, StoreError> {
+    for &(abs, cfk, vout, sfk, meta) in writes {
+        // write_at_pwrite on body file via VarTable path: use body write helper.
+        if let Err(_) = txs.body.write_body_abs_pwrite(abs, &meta) {
+            cold.push((cfk, vout, sfk));
+        }
+    }
+    Ok(cold)
 }
 
 /// io_uring pwrite-only (no pread) for prepared 9-byte metas.
@@ -571,7 +601,11 @@ mod tests {
 
     #[test]
     fn pure_write_known_null_mmap_and_uring() {
-        for backend in [SpendAnnBackend::Mmap, SpendAnnBackend::Uring] {
+        for backend in [
+            SpendAnnBackend::Mmap,
+            SpendAnnBackend::Uring,
+            SpendAnnBackend::Pwrite,
+        ] {
             let (dir, t, spenders) = temp_table();
             let (cfk, off, len) = put_one(&t);
             let decoded = t.get_meta_and_outputs_batch_at(&[(off, len)]).unwrap();

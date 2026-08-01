@@ -1100,11 +1100,11 @@ pub(crate) fn structural_validate_spends(
     let tip = query.tip_height().map(|h| h.0);
 
     // Hot path: bulk 9-byte spender meta at pin offsets (on-disk authority).
-    // Backend: RBITCOIN_SPEND_META=mmap|uring|alternate (default alternate).
+    // Backend: RBITCOIN_SPEND_META / RBITCOIN_IO (mmap|uring|pread).
     let mut spent_strong_ns = 0u64;
     if !abs_jobs.is_empty() {
         let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a)| *a).collect();
-        let meta_backend = rbitcoin_store::spend_meta_backend_next();
+        let meta_backend = rbitcoin_store::spend_meta_backend();
         let t_meta = Instant::now();
         let metas = query
             .store()
@@ -1117,7 +1117,8 @@ pub(crate) fn structural_validate_spends(
                 confirm_phase_stats::SPEND_META_MMAP_NS.fetch_add(meta_ns, Ordering::Relaxed);
                 confirm_phase_stats::SPEND_META_MMAP_N.fetch_add(n_meta, Ordering::Relaxed);
             }
-            rbitcoin_store::SpendMetaBackend::Uring => {
+            rbitcoin_store::SpendMetaBackend::Uring
+            | rbitcoin_store::SpendMetaBackend::Pread => {
                 confirm_phase_stats::SPEND_META_URING_NS.fetch_add(meta_ns, Ordering::Relaxed);
                 confirm_phase_stats::SPEND_META_URING_N.fetch_add(n_meta, Ordering::Relaxed);
             }

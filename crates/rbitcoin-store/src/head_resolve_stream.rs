@@ -1,13 +1,14 @@
-//! Streaming archive head-resolve: mmap probe + mmap idx + io_uring body.
+//! Streaming archive head-resolve: mmap probe + mmap idx + body prefix verify.
 //!
-//! Completion-driven loop (one outstanding body pread per in-flight key):
-//! 1. mmap `probe_fks` → candidates deepest-first (BIP30)
-//! 2. mmap segmented `tx.idx` `record_range` for next cand
-//! 3. io_uring pread ≤32 body bytes (txid); match → done; else next cand
+//! Body backend from [`crate::io_backend::head_resolve_io_backend`]:
+//! - **uring:** completion-driven io_uring pread (one outstanding body per key)
+//! - **mmap:** sequential deepest-cand body peeks under one map pin
+//! - **pread:** sequential libc pread of ≤32 body bytes
 //!
-//! Falls back to the caller when io_uring is unavailable.
+//! Shared steps: mmap probe → mmap idx range → body prefix txid match (BIP30).
 
 use crate::error::StoreError;
+use crate::io_backend::{self, ReadIoBackend};
 use crate::tx_table::TxTable;
 use crate::uring_session::{self, UringSession};
 use rbitcoin_primitives::Fk;
@@ -35,7 +36,7 @@ struct KeyWork {
     pending_rank: u32,
 }
 
-/// Resolve many txids via mmap head/idx + streaming body preads.
+/// Resolve many txids via mmap head/idx + body prefix verify (backend from env).
 ///
 /// Returns one `(txid, Option<Fk>)` per input in the same order as `txids`.
 /// Records [`crate::head_resolve_stats`] probe/idx/body walls and counts.
@@ -46,6 +47,180 @@ pub fn resolve_batch_streaming(
     if txids.is_empty() {
         return Ok(Vec::new());
     }
+    match io_backend::head_resolve_io_backend() {
+        ReadIoBackend::Uring => resolve_batch_streaming_uring(table, txids),
+        ReadIoBackend::Mmap => resolve_batch_sync(table, txids, BodyPeek::Mmap),
+        ReadIoBackend::Pread => resolve_batch_sync(table, txids, BodyPeek::Pread),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BodyPeek {
+    Mmap,
+    Pread,
+}
+
+/// Sequential deepest-cand body peeks (mmap pin or libc pread).
+fn resolve_batch_sync(
+    table: &TxTable,
+    txids: &[[u8; 32]],
+    peek: BodyPeek,
+) -> Result<Vec<([u8; 32], Option<Fk>)>, StoreError> {
+    crate::head_resolve_stats::add_keys(txids.len() as u64);
+    let body_pub = table.body.body_published_len();
+    let count = table.body.count();
+    let body_fd = table.body.body_read_fd();
+    let body_path = table.body.body_file_path().to_path_buf();
+
+    let mut results: Vec<Option<Fk>> = vec![None; txids.len()];
+    let mut cands_total = 0u64;
+    let mut body_lookups = 0u64;
+    let mut probe_ns = 0u64;
+    let mut idx_ns = 0u64;
+    let mut body_ns = 0u64;
+
+    // Mmap: pin once for all peeks in this batch.
+    match peek {
+        BodyPeek::Mmap => {
+            table.body.with_body_map_pin(|map, published| {
+                let map_len = map.len() as u64;
+                let published = published.min(body_pub);
+                for (key_i, txid) in txids.iter().enumerate() {
+                    let t_probe = Instant::now();
+                    let mixed = table.secret.mix_txid(txid);
+                    let raw = table.head.probe_candidates(&mixed)?;
+                    probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
+                    cands_total = cands_total.saturating_add(raw.len() as u64);
+                    let mut matched: Option<Fk> = None;
+                    for (ci, fk) in raw.into_iter().enumerate() {
+                        let id = fk.0;
+                        if id == 0 || id > count {
+                            continue;
+                        }
+                        let t_idx = Instant::now();
+                        let range = match table.body.record_range(fk) {
+                            Ok(r) => r,
+                            Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => continue,
+                            Err(e) => return Err(e),
+                        };
+                        idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
+                        let (start, full_len) = range;
+                        let n = (full_len as usize).min(32);
+                        if n == 0 || start.saturating_add(n as u64) > published {
+                            continue;
+                        }
+                        if start.saturating_add(n as u64) > map_len {
+                            continue;
+                        }
+                        let t_body = Instant::now();
+                        let o = start as usize;
+                        let buf = &map[o..o + n];
+                        body_ns = body_ns.saturating_add(t_body.elapsed().as_nanos() as u64);
+                        body_lookups = body_lookups.saturating_add(1);
+                        match TxTable::txid_from_body_prefix(buf) {
+                            Ok(got) if got == *txid => {
+                                crate::head_resolve_stats::add_hit_rank((ci + 1) as u64);
+                                matched = Some(fk);
+                                break;
+                            }
+                            Ok(_) => {
+                                crate::head_resolve_stats::add_miss_peeks(1);
+                            }
+                            Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {
+                                crate::head_resolve_stats::add_miss_peeks(1);
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    results[key_i] = matched;
+                }
+                Ok::<(), StoreError>(())
+            })?;
+        }
+        BodyPeek::Pread => {
+            for (key_i, txid) in txids.iter().enumerate() {
+                let t_probe = Instant::now();
+                let mixed = table.secret.mix_txid(txid);
+                let raw = table.head.probe_candidates(&mixed)?;
+                probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
+                cands_total = cands_total.saturating_add(raw.len() as u64);
+                let mut matched: Option<Fk> = None;
+                for (ci, fk) in raw.into_iter().enumerate() {
+                    let id = fk.0;
+                    if id == 0 || id > count {
+                        continue;
+                    }
+                    let t_idx = Instant::now();
+                    let range = match table.body.record_range(fk) {
+                        Ok(r) => r,
+                        Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => continue,
+                        Err(e) => return Err(e),
+                    };
+                    idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
+                    let (start, full_len) = range;
+                    let n = (full_len as usize).min(32);
+                    if n == 0 || start.saturating_add(n as u64) > body_pub {
+                        continue;
+                    }
+                    let mut buf = [0u8; 32];
+                    let t_body = Instant::now();
+                    // SAFETY: sole reader of own buf; body fd is read-only clone.
+                    let rc = unsafe {
+                        libc::pread(
+                            body_fd,
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            n,
+                            start as libc::off_t,
+                        )
+                    };
+                    body_ns = body_ns.saturating_add(t_body.elapsed().as_nanos() as u64);
+                    body_lookups = body_lookups.saturating_add(1);
+                    if rc < 0 {
+                        return Err(StoreError::io(
+                            &body_path,
+                            std::io::Error::last_os_error(),
+                        ));
+                    }
+                    if rc as usize != n {
+                        crate::head_resolve_stats::add_miss_peeks(1);
+                        continue;
+                    }
+                    match TxTable::txid_from_body_prefix(&buf[..n]) {
+                        Ok(got) if got == *txid => {
+                            crate::head_resolve_stats::add_hit_rank((ci + 1) as u64);
+                            matched = Some(fk);
+                            break;
+                        }
+                        Ok(_) => crate::head_resolve_stats::add_miss_peeks(1),
+                        Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {
+                            crate::head_resolve_stats::add_miss_peeks(1);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                results[key_i] = matched;
+            }
+        }
+    }
+
+    crate::head_resolve_stats::add_probe(probe_ns);
+    crate::head_resolve_stats::add_idx(idx_ns);
+    crate::head_resolve_stats::add_body(body_ns);
+    crate::head_resolve_stats::add_cands(cands_total);
+    crate::head_resolve_stats::add_body_lookups(body_lookups);
+
+    Ok(txids
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (*t, results[i]))
+        .collect())
+}
+
+/// io_uring completion-driven streaming resolve.
+fn resolve_batch_streaming_uring(
+    table: &TxTable,
+    txids: &[[u8; 32]],
+) -> Result<Vec<([u8; 32], Option<Fk>)>, StoreError> {
     crate::head_resolve_stats::add_keys(txids.len() as u64);
 
     let mut session = UringSession::new(uring_session::DEFAULT_ENTRIES)?;

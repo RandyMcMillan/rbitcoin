@@ -33,27 +33,14 @@ use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use rbitcoin_store::{SpendAnnBackend, StoreError};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Alternate mmap/uring pure-write annotate (soak A/B). Override with
-/// `RBITCOIN_SPEND_ANN=mmap|uring|alternate`.
+/// Pure-write annotate backend from `RBITCOIN_SPEND_ANN` / global `RBITCOIN_IO`.
+#[inline]
 fn spend_ann_backend_next() -> SpendAnnBackend {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let mode = std::env::var("RBITCOIN_SPEND_ANN").unwrap_or_default();
-    match mode.as_str() {
-        "mmap" => SpendAnnBackend::Mmap,
-        "uring" => SpendAnnBackend::Uring,
-        _ => {
-            // alternate (default)
-            if N.fetch_add(1, Ordering::Relaxed) % 2 == 0 {
-                SpendAnnBackend::Mmap
-            } else {
-                SpendAnnBackend::Uring
-            }
-        }
-    }
+    rbitcoin_store::spend_annotate_uring::spend_ann_backend()
 }
 
 /// One height resolved for the confirm wave (header + Class A body fks).
@@ -3744,7 +3731,7 @@ fn class_c_commit(
 /// Returns `(spend_ann_ns, tip_gc_ns)` measured with local `Instant`s.
 ///
 /// Pure-write annotate: body meta from `meta_by_abs` (structural snapshot);
-/// no body pread. Backend alternates mmap vs uring for soak A/B.
+/// no body pread. Backend from `RBITCOIN_SPEND_ANN` / global `RBITCOIN_IO`.
 fn post_commit(
     query: &Query,
     prepared: &[Prepared],
@@ -3805,6 +3792,12 @@ fn post_commit(
                         .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
                 }
                 rbitcoin_store::spend_annotate_uring::SpendAnnBackend::Uring => {
+                    confirm_phase_stats::SPEND_ANN_URING_NS.fetch_add(ann_ns, Ordering::Relaxed);
+                    confirm_phase_stats::SPEND_ANN_URING_N
+                        .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
+                }
+                rbitcoin_store::spend_annotate_uring::SpendAnnBackend::Pwrite => {
+                    // Count under uring token as "fd write" for log continuity, or mmap_n=0.
                     confirm_phase_stats::SPEND_ANN_URING_NS.fetch_add(ann_ns, Ordering::Relaxed);
                     confirm_phase_stats::SPEND_ANN_URING_N
                         .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);

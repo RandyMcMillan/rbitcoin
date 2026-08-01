@@ -985,32 +985,30 @@ pub struct TxTable {
 
 /// Backend for bulk structural 9-byte spender-meta reads on `tx.body`.
 ///
-/// Selected via `RBITCOIN_SPEND_META=mmap|uring|alternate` (default alternate).
+/// Selected via `RBITCOIN_SPEND_META` / global `RBITCOIN_IO` (see [`crate::io_backend`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpendMetaBackend {
     /// One map pin + random peeks (`with_body_map_pin`).
     Mmap,
-    /// io_uring / pread_batch 9B peeks (fd path).
+    /// io_uring pread_batch 9B peeks.
     Uring,
+    /// libc pread_batch (no ring).
+    Pread,
 }
 
-/// Next structural-meta backend (env + optional alternate counter).
-pub fn spend_meta_backend_next() -> SpendMetaBackend {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    let mode = std::env::var("RBITCOIN_SPEND_META").unwrap_or_default();
-    match mode.as_str() {
-        "mmap" => SpendMetaBackend::Mmap,
-        "uring" => SpendMetaBackend::Uring,
-        _ => {
-            // alternate (default) — A/B soak
-            if N.fetch_add(1, Ordering::Relaxed) % 2 == 0 {
-                SpendMetaBackend::Mmap
-            } else {
-                SpendMetaBackend::Uring
-            }
-        }
+/// Structural-meta backend from env hierarchy (no alternate).
+pub fn spend_meta_backend() -> SpendMetaBackend {
+    match crate::io_backend::spend_meta_io_backend() {
+        crate::io_backend::ReadIoBackend::Mmap => SpendMetaBackend::Mmap,
+        crate::io_backend::ReadIoBackend::Uring => SpendMetaBackend::Uring,
+        crate::io_backend::ReadIoBackend::Pread => SpendMetaBackend::Pread,
     }
+}
+
+/// Deprecated alias — use [`spend_meta_backend`].
+#[inline]
+pub fn spend_meta_backend_next() -> SpendMetaBackend {
+    spend_meta_backend()
 }
 
 impl TxTable {
@@ -1429,10 +1427,10 @@ impl TxTable {
 
     /// Batch head resolve (archive prep bulk path).
     ///
-    /// Primary: streaming resolve ([`crate::head_resolve_stream`]) when io_uring
-    /// is available — mmap probe + completion-driven idx→body preads (early exit).
-    /// Fallback (no uring / stream setup fail): phase barrier via
-    /// [`Self::get_fk_by_txid_batch_phased`] (idx→body pipeline Prefix33).
+    /// Streaming resolve ([`crate::head_resolve_stream`]) with body backend from
+    /// `RBITCOIN_HEAD_RESOLVE_IO` / global `RBITCOIN_IO` (mmap \| uring \| pread).
+    /// Fallback on hard stream failure: phase barrier
+    /// [`Self::get_fk_by_txid_batch_phased`].
     ///
     /// BIP30: deepest matching body wins.
     /// Timers: [`crate::head_resolve_stats`] probe / idx / body.
@@ -1443,17 +1441,15 @@ impl TxTable {
         if txids.is_empty() {
             return Ok(Vec::new());
         }
-        if crate::bulk_io::io_uring_enabled() {
-            match crate::head_resolve_stream::resolve_batch_streaming(self, txids) {
-                Ok(v) => return Ok(v),
-                Err(e) => {
-                    rbitcoin_log::debug!(
-                        "store: streaming head resolve unavailable ({e}); using batch path"
-                    );
-                }
+        match crate::head_resolve_stream::resolve_batch_streaming(self, txids) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                rbitcoin_log::debug!(
+                    "store: streaming head resolve unavailable ({e}); using batch path"
+                );
+                self.get_fk_by_txid_batch_phased(txids)
             }
         }
-        self.get_fk_by_txid_batch_phased(txids)
     }
 
     /// Shape A archive path: Prefix33 select + **one** denserels body per winner.
@@ -1923,8 +1919,8 @@ impl TxTable {
     /// Bulk 9-byte spender meta reads at absolute `tx.body` file offsets.
     ///
     /// Returns `(spender_field, flags)` — multi = `flags & MULTI_SPENDER`.
-    /// Backend from [`spend_meta_backend_next`] / `RBITCOIN_SPEND_META`
-    /// (`mmap` | `uring` | `alternate`). Out-of-range / short → `None`.
+    /// Backend from [`spend_meta_backend`] / `RBITCOIN_SPEND_META` /
+    /// global `RBITCOIN_IO` (`mmap` | `uring` | `pread`). Out-of-range / short → `None`.
     pub fn get_spender_meta_at_abs_batch(
         &self,
         abs_offs: &[u64],
@@ -1948,12 +1944,13 @@ impl TxTable {
                     Ok(v) => Ok(v),
                     Err(e) => {
                         rbitcoin_log::debug!(
-                            "store: structural meta uring failed ({e}); mmap fallback"
+                            "store: structural meta uring failed ({e}); pread fallback"
                         );
-                        self.get_spender_meta_at_abs_batch_mmap(abs_offs)
+                        self.get_spender_meta_at_abs_batch_pread(abs_offs)
                     }
                 }
             }
+            SpendMetaBackend::Pread => self.get_spender_meta_at_abs_batch_pread(abs_offs),
         }
     }
 
@@ -1981,10 +1978,32 @@ impl TxTable {
         }))
     }
 
-    /// io_uring / pread_batch 9B peeks (fd path; no map touch for payload).
+    /// io_uring pread_batch 9B peeks.
     fn get_spender_meta_at_abs_batch_uring(
         &self,
         abs_offs: &[u64],
+    ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
+        self.get_spender_meta_at_abs_batch_fd(
+            abs_offs,
+            crate::io_backend::ReadIoBackend::Uring,
+        )
+    }
+
+    /// libc pread_batch 9B peeks (no ring).
+    fn get_spender_meta_at_abs_batch_pread(
+        &self,
+        abs_offs: &[u64],
+    ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
+        self.get_spender_meta_at_abs_batch_fd(
+            abs_offs,
+            crate::io_backend::ReadIoBackend::Pread,
+        )
+    }
+
+    fn get_spender_meta_at_abs_batch_fd(
+        &self,
+        abs_offs: &[u64],
+        backend: crate::io_backend::ReadIoBackend,
     ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
         use crate::bulk_io::{self, ReadOp};
         const META_LEN: usize = 9;
@@ -1992,7 +2011,6 @@ impl TxTable {
         let body_pub = self.body.body_published_len();
         let body_path = self.body.body_file_path();
 
-        // Stable 9B slots for the whole wave (uring holds bufs until complete).
         let mut bufs: Vec<[u8; META_LEN]> = vec![[0u8; META_LEN]; abs_offs.len()];
         let mut submitted: Vec<usize> = Vec::with_capacity(abs_offs.len());
         for (i, &off) in abs_offs.iter().enumerate() {
@@ -2018,7 +2036,7 @@ impl TxTable {
                 result: i32::MIN,
             });
         }
-        bulk_io::pread_batch(&mut ops);
+        bulk_io::pread_batch_backend(&mut ops, backend);
 
         let mut out: Vec<Option<(Fk, u8)>> = vec![None; abs_offs.len()];
         for (ro, &i) in ops.iter().zip(submitted.iter()) {
@@ -2029,7 +2047,7 @@ impl TxTable {
                 ));
             }
             if ro.result as usize != META_LEN {
-                continue; // short → None (fail-closed at structural)
+                continue;
             }
             let b = &bufs[i];
             let field = Fk(u64::from_le_bytes(b[0..8].try_into().unwrap()));

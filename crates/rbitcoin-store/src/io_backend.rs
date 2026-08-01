@@ -13,6 +13,10 @@
 //!
 //! **No alternate modes.** When `uring` is selected but the ring is unavailable,
 //! demote to `pread` (reads) or `pwrite`/`mmap` (ann).
+//!
+//! ## Class A linear append (`tx.body` / `tx.idx`)
+//! Default is libc **pwrite** (`RBITCOIN_FD_APPEND` default on). When global
+//! `RBITCOIN_IO=mmap` (or `RBITCOIN_FD_APPEND=0`), appends use mmap `write_at`.
 
 use crate::bulk_io;
 use std::sync::OnceLock;
@@ -216,6 +220,32 @@ pub fn spend_ann_io_backend() -> WriteIoBackend {
     *B.get_or_init(|| resolve_write("RBITCOIN_SPEND_ANN"))
 }
 
+/// Whether Class A linear appends (`tx.body` mega put, `tx.idx` starts) use
+/// libc **pwrite** (`true`) or mmap **write_at** (`false`).
+///
+/// - `RBITCOIN_FD_APPEND=0|false|off` → mmap
+/// - else if global `RBITCOIN_IO=mmap` → mmap (all-IO mmap mode)
+/// - else → pwrite (default)
+#[inline]
+pub fn class_a_append_uses_pwrite() -> bool {
+    static B: OnceLock<bool> = OnceLock::new();
+    *B.get_or_init(|| {
+        if let Ok(s) = std::env::var("RBITCOIN_FD_APPEND") {
+            if s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off") {
+                return false;
+            }
+            // Explicit non-zero still allows IO=mmap to force mmap? Prefer FD_APPEND
+            // only when it disables; if set to "1" keep pwrite unless IO=mmap.
+        }
+        if let Ok(s) = std::env::var("RBITCOIN_IO") {
+            if parse_read_token(&s) == Some(ReadIoBackend::Mmap) {
+                return false;
+            }
+        }
+        true
+    })
+}
+
 /// Force a read backend for tests (does not re-read env; use before first call
 /// or call only from tests that set env before any resolve).
 #[cfg(test)]
@@ -300,6 +330,36 @@ mod tests {
         std::env::set_var("RBITCOIN_IO", "pread");
         let b = resolve_write_for_test("RBITCOIN_SPEND_ANN");
         assert_eq!(b, WriteIoBackend::Pwrite);
+        clear_io_envs();
+    }
+
+    #[test]
+    fn class_a_append_mmap_when_io_mmap_or_fd_append_off() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_io_envs();
+        std::env::remove_var("RBITCOIN_FD_APPEND");
+        // Uncached helper for tests (re-read env each call).
+        fn uses_pwrite_now() -> bool {
+            if let Ok(s) = std::env::var("RBITCOIN_FD_APPEND") {
+                if s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off") {
+                    return false;
+                }
+            }
+            if let Ok(s) = std::env::var("RBITCOIN_IO") {
+                if parse_read_token(&s) == Some(ReadIoBackend::Mmap) {
+                    return false;
+                }
+            }
+            true
+        }
+        assert!(uses_pwrite_now(), "default append is pwrite");
+        std::env::set_var("RBITCOIN_IO", "mmap");
+        assert!(!uses_pwrite_now(), "IO=mmap forces mmap append");
+        std::env::set_var("RBITCOIN_IO", "uring");
+        assert!(uses_pwrite_now());
+        std::env::remove_var("RBITCOIN_IO");
+        std::env::set_var("RBITCOIN_FD_APPEND", "0");
+        assert!(!uses_pwrite_now(), "FD_APPEND=0 forces mmap append");
         clear_io_envs();
     }
 }

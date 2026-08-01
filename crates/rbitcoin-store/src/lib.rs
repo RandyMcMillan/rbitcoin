@@ -80,8 +80,8 @@ pub use sorted_run::{
 pub use store::Store;
 pub use bulk_io::{bulk_io_workers, io_uring_enabled};
 pub use io_backend::{
-    class_c_io_backend, head_resolve_io_backend, pin_io_backend, spend_ann_io_backend,
-    spend_meta_io_backend, ReadIoBackend, WriteIoBackend,
+    class_a_append_uses_pwrite, class_c_io_backend, head_resolve_io_backend, pin_io_backend,
+    spend_ann_io_backend, spend_meta_io_backend, ReadIoBackend, WriteIoBackend,
 };
 pub use block_queue::{
     BlockQueue, QueuedBlock, QueuedBlockMeta, DEFAULT_BLOCK_QUEUE_BUDGET_BYTES,

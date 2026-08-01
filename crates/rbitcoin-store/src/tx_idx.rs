@@ -261,9 +261,7 @@ impl TxIdx {
             }
         }
         let soft = Self::soft_span();
-        let use_fd = std::env::var("RBITCOIN_FD_APPEND")
-            .map(|s| s != "0" && s != "false" && s != "off")
-            .unwrap_or(true);
+        let use_fd = crate::io_backend::class_a_append_uses_pwrite();
 
         let mut i = 0usize;
         while i < starts.len() {

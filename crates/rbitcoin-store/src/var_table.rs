@@ -310,10 +310,7 @@ impl VarTable {
         if self.count.load(Ordering::Acquire) != base_count {
             return Err(StoreError::Corrupt("var put_batch_encode race"));
         }
-        let use_fd = std::env::var("RBITCOIN_FD_APPEND")
-            .map(|s| s != "0" && s != "false" && s != "off")
-            .unwrap_or(true);
-        if use_fd {
+        if crate::io_backend::class_a_append_uses_pwrite() {
             self.body.write_at_pwrite(start, &body_blob)?;
         } else {
             self.body.write_at(start, &body_blob)?;

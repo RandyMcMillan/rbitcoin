@@ -80,8 +80,8 @@ the ring is available, else **pread**; pure-write annotate default **uring** els
 | `RBITCOIN_SPEND_ANN` | mmap \| uring \| **pwrite** | Pure-write annotate store (global `pread` → pwrite) |
 | `RBITCOIN_CLASS_C_IO` | mmap \| uring \| pread | Bulk create-height 4 B slots |
 
-- **mmap** — one map pin + memcpy/peeks (fast when the working set is resident; can thrash multi‑GiB cold body).
-- **uring** — io_uring bulk pread/pwrite (good scatter/gather; needs Linux ring).
+- **mmap** — map pin + memcpy/peeks for bulk reads; pure-write annotate via `write_at`; also forces **Class A linear appends** (`tx.body` / `tx.idx`) to mmap `write_at` when set as global `RBITCOIN_IO`.
+- **uring** — io_uring bulk pread/pwrite (good scatter/gather; needs Linux ring). Linear Class A appends stay pwrite unless `RBITCOIN_FD_APPEND=0`.
 - **pread** / **pwrite** — libc positional IO; `RBITCOIN_BULK_IO_WORKERS` parallelizes pread only.
 - Compat: `RBITCOIN_IO_URING=0` (deprecated) ≈ global `RBITCOIN_IO=pread` when `RBITCOIN_IO` is unset.
 
@@ -97,7 +97,7 @@ the ring is available, else **pread**; pure-write annotate default **uring** els
 | Confirm denserels **history** | **off (lean default)** | Small residency FIFO for **in-flight / just-committed** only (**256k creates / 1M outs**), skip denserels prewarm; cold pin trusts OS page cache. **Header plans always on** (multi-block MTP). `RBITCOIN_CONFIRM_CACHE=1` restores multi‑GiB history (8M/16M) + prewarm for experiments. Explicit `RBITCOIN_CREATE_RESIDENCY_CAP` / `_OUT_CAP` still override caps |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
 | Bulk store IO | **uring** (Linux) when available | See **Bulk store IO backends** above; `RBITCOIN_BULK_IO_WORKERS` for pread parallelism. Segmented `tx.head` **insert_many** stays mmap |
-| Archive Class A append | **pwrite** (default) | `tx.body` / `tx.idx` mega-appends use `write_at_pwrite` (page cache; avoids dirtying multi‑GiB mmaps for sequential write). `RBITCOIN_FD_APPEND=0` → mmap `write_at` (debug/compare) |
+| Archive Class A append | **pwrite** (default) | `tx.body` / `tx.idx` mega-appends use `write_at_pwrite` unless forced mmap. **`RBITCOIN_IO=mmap`** or `RBITCOIN_FD_APPEND=0` → mmap `write_at` for those linear appends too |
 | `tx.head` (segmented) | fixed geometry | Default **25-bit** heads (128 MiB) with **4 B relative** fks; roll at 80% load / body soft span; **binary fuse8** on seal. `RBITCOIN_TX_HEAD_BITS` for tests only. Legacy mono-head datadirs require reindex |
 | Confirm stages | **plan · prep · scripts · write** | Pipeline queues cap **5** each (`planq=n/5 prepq=m/5 writeq=k/5`; `name<0/cap` when the next worker is waiting on an empty queue) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |

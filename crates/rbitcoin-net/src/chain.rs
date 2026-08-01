@@ -1022,15 +1022,10 @@ mod tests {
                     }
                 }
             } else {
-                for ((tx, ins, o), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
-                    creates.insert(tx.txid, *fk);
+                for ((pin, _ins), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
+                    creates.insert(pin.0.txid, *fk);
                     if let Some(id) = fk.get() {
-                        let denserels =
-                            rbitcoin_store::denserels_from_packed_records(tx, ins, o);
-                        outs.insert(
-                            id,
-                            std::sync::Arc::new((tx.clone(), o.clone(), denserels)),
-                        );
+                        outs.insert(id, std::sync::Arc::clone(pin));
                     }
                 }
             }

@@ -107,14 +107,11 @@ impl PrepAheadState {
                 }
             }
         } else {
-            for ((tx, ins, o), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
-                creates.insert(tx.txid, *fk);
+            // Partial plans: pin half is already CreatePin Arc on packed.
+            for ((pin, _ins), fk) in plan.packed.iter().zip(plan.planned_fks.iter()) {
+                creates.insert(pin.0.txid, *fk);
                 if let Some(id) = fk.get() {
-                    let denserels = offline_in_flight_denserels(tx, ins, o);
-                    outs.insert(
-                        id,
-                        std::sync::Arc::new((tx.clone(), o.clone(), denserels)),
-                    );
+                    outs.insert(id, std::sync::Arc::clone(pin));
                 }
             }
         }
@@ -153,15 +150,6 @@ fn prune_inflight_maps(
     creates.retain(|_, fk| fk.get().map(|id| id > head_occupied).unwrap_or(false));
     outs.retain(|id, _| *id > head_occupied);
     *next_tx_start = (*next_tx_start).max(body_count.saturating_add(1).max(1));
-}
-
-/// Offline denserels for in-flight pin (must match Class A body packing).
-fn offline_in_flight_denserels(
-    tx: &rbitcoin_store::TxRecord,
-    ins: &[rbitcoin_store::InputRecord],
-    outs: &[rbitcoin_store::OutputRecord],
-) -> Vec<u32> {
-    rbitcoin_store::denserels_from_packed_records(tx, ins, outs)
 }
 
 /// Shared feed of tip-extension **readiness** for the dedicated confirm engine.

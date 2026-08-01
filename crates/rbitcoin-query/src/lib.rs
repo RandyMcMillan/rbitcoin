@@ -85,7 +85,7 @@ pub use catchup::IndexMode;
 pub use connect::ConfirmPrepared;
 pub use confirm_load::ConfirmLoadStats;
 pub use archive::{
-    ArchiveWritePlan, ResidencyPrewarmStats, PREWARM_DENSERELS_MAX_CREATES,
+    ArchiveWritePlan, CreatePin, ResidencyPrewarmStats, PREWARM_DENSERELS_MAX_CREATES,
     PREWARM_HEADER_PLANS_MAX,
 };
 pub use scripthash::{

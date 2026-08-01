@@ -2212,6 +2212,44 @@ impl TxTable {
         Ok(fks)
     }
 
+    /// Like [`Self::put_full_batch_indexed`], but outs live in a shared pin Arc
+    /// (tx + outs + denserels). Encode borrows pin fields — no outs deep clone.
+    pub fn put_full_batch_from_pins(
+        &self,
+        items: &[(
+            std::sync::Arc<(TxRecord, Vec<OutputRecord>, Vec<u32>)>,
+            Vec<InputRecord>,
+        )],
+        index: bool,
+    ) -> Result<Vec<Fk>, StoreError> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let est: usize = items
+            .iter()
+            .map(|(pin, ins)| {
+                let (_tx, outs, _dens) = pin.as_ref();
+                16 + TxRecord::ENCODED_LEN
+                    + ins.iter().map(|i| i.encoded_len()).sum::<usize>()
+                    + outs.iter().map(|o| o.encoded_len()).sum::<usize>()
+            })
+            .sum();
+        let fks = self.body.put_batch_encode_aligned(items.len(), est, |i, buf| {
+            let (pin, ins) = &items[i];
+            let (tx, outs, _dens) = pin.as_ref();
+            encode_packed_tx_with_secret(tx, ins, outs, buf, Some(&self.secret));
+        })?;
+        if index {
+            let heads: Vec<([u8; 32], Fk)> = items
+                .iter()
+                .zip(fks.iter())
+                .map(|((pin, _), fk)| (pin.0.txid, *fk))
+                .collect();
+            self.head_insert_many(&heads)?;
+        }
+        Ok(fks)
+    }
+
     pub fn get_by_txid(&self, txid: &[u8; 32]) -> Result<Option<(Fk, TxRecord)>, StoreError> {
         // Probe + body_txid only; full decode only on match.
         let Some(fk) = self.get_fk_by_txid(txid)? else {

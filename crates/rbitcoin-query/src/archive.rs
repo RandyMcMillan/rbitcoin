@@ -45,13 +45,21 @@ pub struct ResidencyPrewarmStats {
     pub ms: u64,
 }
 
+/// Shared immutable create pin: tx meta + full outs + layout denserels.
+///
+/// One Arc per create — plan `packed` pin half, `batch_pin`, and prep-ahead
+/// `in_flight_outs` all Arc-clone this (no deep outs clone between stages).
+pub type CreatePin = std::sync::Arc<(TxRecord, Vec<OutputRecord>, Vec<u32>)>;
+
 /// Write-ready mega-batch from plan (prep) to commit (writer).
 ///
 /// Planned create fks match `txs.count()+1…` at plan time; commit fails if the
 /// appender returns different fks (another writer interleave — must not happen).
 #[derive(Debug)]
 pub struct ArchiveWritePlan {
-    pub packed: Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)>,
+    /// Body-append rows: shared [`CreatePin`] (tx + outs + denserels) + inputs.
+    /// Outs live once in the pin Arc (not duplicated alongside inputs).
+    pub packed: Vec<(CreatePin, Vec<InputRecord>)>,
     pub planned_fks: Vec<Fk>,
     pub per_header_ranges: Vec<(Fk, Fk, u32)>,
     pub spends: Vec<([u8; 32], u32, Fk, u32)>,
@@ -63,16 +71,14 @@ pub struct ArchiveWritePlan {
     /// outs+denserels loaded once for prep pin. **Pipeline-local** — not written
     /// into CreateResidency FIFO (long-tail thrash). Prep must consult this map
     /// before cold denserels IO (a create_fk residency miss is also a denserels miss).
-    pub external_parent_outs: std::collections::HashMap<
-        u64,
-        (TxRecord, Vec<OutputRecord>, Vec<u32>),
-    >,
-    /// Prep-ahead pin material for **this batch's creates**, parallel to
-    /// [`Self::planned_fks`]: `Arc<(TxRecord, outs, denserels)>`.
     ///
-    /// Built once at plan finish via layout denserels. Confirm `note_plan_ok`
-    /// only `Arc::clone`s into in-flight outs (no deep clone / re-pack).
-    pub batch_pin: Vec<std::sync::Arc<(TxRecord, Vec<OutputRecord>, Vec<u32>)>>,
+    /// **Dropped after pin** ([`Self::clear_external_parent_outs`]) so prep→scripts
+    /// →write only carries sparse [`crate::BatchParents`] for those parents.
+    pub external_parent_outs: std::collections::HashMap<u64, CreatePin>,
+    /// Prep-ahead pin material for **this batch's creates**, parallel to
+    /// [`Self::planned_fks`]: same [`CreatePin`] Arcs as [`Self::packed`] (refcount
+    /// only). Confirm `note_plan_ok` only `Arc::clone`s into in-flight outs.
+    pub batch_pin: Vec<CreatePin>,
     pub index_tx: bool,
     pub body_est: u64,
     /// Snapshot of “far ahead of confirm” at plan time.
@@ -97,6 +103,15 @@ impl ArchiveWritePlan {
 
     pub fn is_empty(&self) -> bool {
         self.packed.is_empty()
+    }
+
+    /// Drop pipeline-local external full-outs after denserels pin.
+    ///
+    /// Sparse need-vouts already live in [`crate::BatchParents`]; commit never
+    /// reads this map.
+    pub fn clear_external_parent_outs(&mut self) {
+        self.external_parent_outs.clear();
+        self.external_parent_outs.shrink_to_fit();
     }
 }
 
@@ -353,10 +368,8 @@ impl Query {
         //
         // Timers: head_fk = wall − dens_ns; head_dens = denserels-wave ns from
         // the fused resolve (single-cand denserels-only + multi-cand dens wave).
-        let mut external_parent_outs: std::collections::HashMap<
-            u64,
-            (TxRecord, Vec<OutputRecord>, Vec<u32>),
-        > = std::collections::HashMap::new();
+        let mut external_parent_outs: std::collections::HashMap<u64, CreatePin> =
+            std::collections::HashMap::new();
         let mut dens_fks_n = 0u64;
         let mut dens_bytes = 0u64;
         let t_head = Instant::now();
@@ -377,7 +390,8 @@ impl Query {
                                 outs.iter().map(|o| o.script.len() as u64 + 16).sum::<u64>(),
                             );
                         if let Some(id) = fk.get() {
-                            external_parent_outs.insert(id, (tx, outs, dens));
+                            external_parent_outs
+                                .insert(id, std::sync::Arc::new((tx, outs, dens)));
                         }
                     }
                 }
@@ -387,10 +401,11 @@ impl Query {
         let head_fk_ns = head_total_ns.saturating_sub(head_dens_ns);
         crate::archive_phase_stats::note_head_dens_wave(dens_fks_n, dens_bytes);
 
-        // Pass 3: stamp create_fk on inputs; tip spends list.
+        // Pass 3: stamp create_fk on inputs; tip spends list; build shared CreatePin.
+        // Outs move into Arc once — packed pin half and batch_pin share that Arc.
         let t_stamp = Instant::now();
-        let mut packed: Vec<(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)> =
-            Vec::with_capacity(work.len());
+        let mut packed: Vec<(CreatePin, Vec<InputRecord>)> = Vec::with_capacity(work.len());
+        let mut batch_pin: Vec<CreatePin> = Vec::with_capacity(work.len());
         let mut planned_fks: Vec<Fk> = Vec::with_capacity(work.len());
         let mut batch_stamp = 0u64;
         let mut resolved_stamp = 0u64;
@@ -419,14 +434,19 @@ impl Query {
                 }
             }
             planned_fks.push(tx_fk);
-            packed.push((tx, inputs, outputs));
+            // Layout denserels once; move tx+outs into shared Arc (no second outs clone).
+            let dens = rbitcoin_store::denserels_from_packed_records(&tx, &inputs, &outputs);
+            let pin = std::sync::Arc::new((tx, outputs, dens));
+            batch_pin.push(std::sync::Arc::clone(&pin));
+            packed.push((pin, inputs));
         }
         let stamp_ns = t_stamp.elapsed().as_nanos() as u64;
 
         let t_finish = Instant::now();
         let body_est: u64 = packed
             .iter()
-            .map(|(_tx, ins, outs)| {
+            .map(|(pin, ins)| {
+                let (_tx, outs, _dens) = pin.as_ref();
                 (1 + TxRecord::ENCODED_LEN) as u64
                     + ins.iter().map(|x| x.encoded_len() as u64).sum::<u64>()
                     + outs.iter().map(|x| x.encoded_len() as u64).sum::<u64>()
@@ -436,17 +456,7 @@ impl Query {
         let batch_creates: Vec<([u8; 32], Fk)> = packed
             .iter()
             .zip(planned_fks.iter())
-            .map(|((tx, _, _), fk)| (tx.txid, *fk))
-            .collect();
-
-        // Prep-ahead pin denserels once (layout offsets = Class A packing).
-        // Arc so note_plan_ok only bumps refcounts into in_flight_outs.
-        let batch_pin: Vec<std::sync::Arc<(TxRecord, Vec<OutputRecord>, Vec<u32>)>> = packed
-            .iter()
-            .map(|(tx, ins, outs)| {
-                let dens = rbitcoin_store::denserels_from_packed_records(tx, ins, outs);
-                std::sync::Arc::new((tx.clone(), outs.clone(), dens))
-            })
+            .map(|((pin, _), fk)| (pin.0.txid, *fk))
             .collect();
 
         let advise_dont_need = self.archive_far_ahead_of_confirm()?;
@@ -705,10 +715,11 @@ impl Query {
 
         let body_off = self.store.txs.body_logical_len();
         // Body append first (no head), then head insert — separate timers.
+        // Encode from shared CreatePin + inputs (no deep outs reclone).
         let t = Instant::now();
         let got_tx_fks = self
             .store
-            .put_tx_full_batch_indexed(&plan.packed, /*index=*/ false)?;
+            .put_tx_full_batch_from_pins(&plan.packed, /*index=*/ false)?;
         let body_ns = t.elapsed().as_nanos() as u64;
         if got_tx_fks.len() != plan.packed.len() {
             return Err(StoreError::Corrupt("tx put_full_batch length"));
@@ -726,7 +737,7 @@ impl Query {
                 .packed
                 .iter()
                 .zip(got_tx_fks.iter())
-                .map(|((tx, _, _), fk)| (tx.txid, *fk))
+                .map(|((pin, _), fk)| (pin.0.txid, *fk))
                 .collect();
             self.store.txs.head_insert_many(&heads)?;
         }
@@ -777,7 +788,8 @@ impl Query {
                 );
             }
         } else {
-            for (((tx, ins, outs), fk), range) in plan
+            // Fallback when batch_pin length mismatched: denserels from pin+inputs.
+            for (((pin, ins), fk), range) in plan
                 .packed
                 .iter()
                 .zip(got_tx_fks.iter())
@@ -787,8 +799,12 @@ impl Query {
                     Some((off, len)) if len > 0 => Some((off, len)),
                     _ => None,
                 };
-                let denserels =
-                    rbitcoin_store::denserels_from_packed_records(tx, ins, outs);
+                let (tx, outs, dens) = pin.as_ref();
+                let denserels = if dens.is_empty() {
+                    rbitcoin_store::denserels_from_packed_records(tx, ins, outs)
+                } else {
+                    dens.clone()
+                };
                 self.create_residency.put_outs(
                     *fk,
                     tx.clone(),
@@ -948,25 +964,32 @@ mod tests {
             .unwrap();
         assert_eq!(plan.batch_pin.len(), plan.planned_fks.len());
         assert_eq!(plan.batch_pin.len(), plan.packed.len());
+        // packed pin half and batch_pin share the same Arc (no outs double-store).
+        for ((pin_packed, _), pin) in plan.packed.iter().zip(plan.batch_pin.iter()) {
+            assert!(
+                Arc::ptr_eq(pin_packed, pin),
+                "packed and batch_pin must share CreatePin Arc"
+            );
+            // plan construction: one Arc for packed + one for batch_pin.
+            assert_eq!(Arc::strong_count(pin), 2);
+        }
         // Simulated note_plan_ok: Arc::clone only (strong_count rises, no deep clone).
-        let mut ifo: HashMap<u64, Arc<(TxRecord, Vec<OutputRecord>, Vec<u32>)>> = HashMap::new();
+        let mut ifo: HashMap<u64, super::CreatePin> = HashMap::new();
         for (fk, pin) in plan.planned_fks.iter().zip(plan.batch_pin.iter()) {
             if let Some(id) = fk.get() {
-                assert_eq!(Arc::strong_count(pin), 1);
                 ifo.insert(id, Arc::clone(pin));
-                assert_eq!(Arc::strong_count(pin), 2);
+                assert_eq!(Arc::strong_count(pin), 3);
             }
         }
-        for ((tx, ins, outs), pin) in plan.packed.iter().zip(plan.batch_pin.iter()) {
-            assert_eq!(pin.0.txid, tx.txid);
-            assert_eq!(pin.1, *outs);
+        for ((pin, ins), _) in plan.packed.iter().zip(plan.batch_pin.iter()) {
+            let (tx, outs, dens) = pin.as_ref();
             let layout = rbitcoin_store::denserels_from_packed_records(tx, ins, outs);
-            assert_eq!(pin.2, layout);
+            assert_eq!(*dens, layout);
             let mut raw = Vec::new();
             rbitcoin_store::encode_packed_tx(tx, ins, outs, &mut raw);
             let (_, _, decode_rels) =
                 rbitcoin_store::decode_packed_tx_outs_with_spender_rels(&raw).unwrap();
-            assert_eq!(pin.2, decode_rels);
+            assert_eq!(*dens, decode_rels);
         }
         assert_eq!(ifo.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1207,10 +1230,11 @@ mod tests {
         assert_eq!(plan.batch_creates.len(), 1);
         assert_eq!(plan.batch_creates[0].0, child_txid);
         // Pipeline-local denserels for head-miss parent (prep pin source).
-        let (ptx, pouts, pdens) = plan
+        let pin = plan
             .external_parent_outs
             .get(&1)
             .expect("head-miss parent denserels on plan");
+        let (ptx, pouts, pdens) = pin.as_ref();
         assert_eq!(ptx.txid, parent_txid);
         assert!(!pouts.is_empty(), "outs loaded for pin");
         assert!(!pdens.is_empty() || pouts.len() == 1, "denserels for outs");
@@ -1222,6 +1246,15 @@ mod tests {
         assert!(
             q.create_residency().get_outs(Fk(1)).is_none(),
             "head path must not denserels-seed parents into residency"
+        );
+
+        // Commit does not need external full-outs (pipeline drops them after pin).
+        let mut plan = plan;
+        assert!(!plan.external_parent_outs.is_empty());
+        plan.clear_external_parent_outs();
+        assert!(
+            plan.external_parent_outs.is_empty(),
+            "clear must drop external full-outs before write queue"
         );
 
         q.archive_commit_plan(plan).unwrap();
@@ -1238,6 +1271,30 @@ mod tests {
             "head-resolved parent must not be denserels-published as a new create"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// packed pin half and batch_pin share one CreatePin Arc (no outs double-store).
+    #[test]
+    fn plan_packed_and_batch_pin_share_create_pin_arc() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let (dir, q) = temp_query("shared-create-pin");
+        let mut need = vec![(Fk(1), vec![coinbase_apply(1)])];
+        let plan = q
+            .archive_plan_mega_from(&mut need, 1, &HashMap::new())
+            .unwrap();
+        assert_eq!(plan.packed.len(), 1);
+        assert_eq!(plan.batch_pin.len(), 1);
+        assert!(
+            Arc::ptr_eq(&plan.packed[0].0, &plan.batch_pin[0]),
+            "outs must live in one Arc shared by packed and batch_pin"
+        );
+        // note_plan_ok only Arc-clones into in-flight.
+        let ifo_pin = Arc::clone(&plan.batch_pin[0]);
+        assert!(Arc::ptr_eq(&ifo_pin, &plan.batch_pin[0]));
+        assert_eq!(Arc::strong_count(&plan.batch_pin[0]), 3);
+        q.archive_commit_plan(plan).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

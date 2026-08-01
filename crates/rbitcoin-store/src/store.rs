@@ -224,6 +224,20 @@ impl Store {
         self.txs.put_full_batch_indexed(items, index)
     }
 
+    /// Append Class A rows from shared pin Arc + inputs (no outs reclone).
+    ///
+    /// `pin` is `(TxRecord, outs, denserels)`; denserels are ignored for encode.
+    pub fn put_tx_full_batch_from_pins(
+        &self,
+        items: &[(
+            std::sync::Arc<(TxRecord, Vec<OutputRecord>, Vec<u32>)>,
+            Vec<InputRecord>,
+        )],
+        index: bool,
+    ) -> Result<Vec<Fk>, StoreError> {
+        self.txs.put_full_batch_from_pins(items, index)
+    }
+
     pub fn get_tx_by_txid(&self, txid: &[u8; 32]) -> Result<Option<(Fk, TxRecord)>, StoreError> {
         self.txs.get_by_txid(txid)
     }

@@ -2459,6 +2459,19 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
     assert_eq!(q.tip_height(), Some(Height(maturity)), "prep must not tip");
 
     let plan_a = mat_a.batch.archive_plan.as_ref().expect("plan A");
+    // Prep drops external full-outs after pin; only sparse BatchParents remains.
+    assert!(
+        plan_a.external_parent_outs.is_empty(),
+        "post-pin plan must not retain external full-outs on prep→scripts→write handoff"
+    );
+    // packed pin half and batch_pin share CreatePin Arc (no outs double-store).
+    assert_eq!(plan_a.batch_pin.len(), plan_a.packed.len());
+    for ((pin_p, _), pin_b) in plan_a.packed.iter().zip(plan_a.batch_pin.iter()) {
+        assert!(
+            std::sync::Arc::ptr_eq(pin_p, pin_b),
+            "packed and batch_pin must share CreatePin"
+        );
+    }
     {
         let creates = std::sync::Arc::make_mut(&mut pipe.in_flight_creates);
         let outs = std::sync::Arc::make_mut(&mut pipe.in_flight_outs);
@@ -2470,15 +2483,10 @@ fn wire_prep_ahead_cross_batch_spend_fills_parent_layout() {
                 }
             }
         } else {
-            for ((tx, ins, o), fk) in plan_a.packed.iter().zip(plan_a.planned_fks.iter()) {
-                creates.insert(tx.txid, *fk);
+            for ((pin, _ins), fk) in plan_a.packed.iter().zip(plan_a.planned_fks.iter()) {
+                creates.insert(pin.0.txid, *fk);
                 if let Some(id) = fk.get() {
-                    let denserels =
-                        rbitcoin_store::denserels_from_packed_records(tx, ins, o);
-                    outs.insert(
-                        id,
-                        std::sync::Arc::new((tx.clone(), o.clone(), denserels)),
-                    );
+                    outs.insert(id, std::sync::Arc::clone(pin));
                 }
             }
         }

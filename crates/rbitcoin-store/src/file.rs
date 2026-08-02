@@ -233,6 +233,15 @@ impl TableFile {
         path: impl Into<PathBuf>,
         kind: TableKind,
     ) -> Result<Self, StoreError> {
+        Self::create_trailing_header_with_access(path, kind, TableAccess::for_kind(kind, true))
+    }
+
+    /// Create trailing-header with explicit [`TableAccess`] (FdOnly for head A/B).
+    pub fn create_trailing_header_with_access(
+        path: impl Into<PathBuf>,
+        kind: TableKind,
+        access: TableAccess,
+    ) -> Result<Self, StoreError> {
         let path = path.into();
         let file = OpenOptions::new()
             .read(true)
@@ -244,8 +253,17 @@ impl TableFile {
         let initial = TRAILING_FOOTER_LEN as u64;
         file.set_len(initial)
             .map_err(|e| StoreError::io(&path, e))?;
-        let access = TableAccess::for_kind(kind, true);
-        let map = unsafe { MmapMut::map_mut(&file) }.map_err(|e| StoreError::io(&path, e))?;
+        // FdOnly: pin a tiny window forever (not grown with body). MapFull: full map.
+        let map = if access.is_fd_only() {
+            unsafe {
+                memmap2::MmapOptions::new()
+                    .len(initial as usize)
+                    .map_mut(&file)
+            }
+            .map_err(|e| StoreError::io(&path, e))?
+        } else {
+            unsafe { MmapMut::map_mut(&file) }.map_err(|e| StoreError::io(&path, e))?
+        };
         let epoch = Arc::new(MapEpoch { map });
         let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
         let s = Self {
@@ -273,6 +291,21 @@ impl TableFile {
         path: impl Into<PathBuf>,
         kind: TableKind,
         data_bytes: u64,
+    ) -> Result<(Self, [u8; 16]), StoreError> {
+        Self::open_trailing_header_with_access(
+            path,
+            kind,
+            data_bytes,
+            TableAccess::for_kind(kind, true),
+        )
+    }
+
+    /// Open trailing-header with explicit [`TableAccess`].
+    pub fn open_trailing_header_with_access(
+        path: impl Into<PathBuf>,
+        kind: TableKind,
+        data_bytes: u64,
+        access: TableAccess,
     ) -> Result<(Self, [u8; 16]), StoreError> {
         let path = path.into();
         let mut file = OpenOptions::new()
@@ -308,8 +341,17 @@ impl TableFile {
         let mut trailing_ext = [0u8; 16];
         trailing_ext.copy_from_slice(&footer[16..32]);
         let logical = expect;
-        let access = TableAccess::for_kind(kind, true);
-        let map = unsafe { MmapMut::map_mut(&file) }.map_err(|e| StoreError::io(&path, e))?;
+        let map = if access.is_fd_only() {
+            let win = TRAILING_FOOTER_LEN.min(file_len as usize).max(TRAILING_FOOTER_LEN);
+            unsafe {
+                memmap2::MmapOptions::new()
+                    .len(win)
+                    .map_mut(&file)
+            }
+            .map_err(|e| StoreError::io(&path, e))?
+        } else {
+            unsafe { MmapMut::map_mut(&file) }.map_err(|e| StoreError::io(&path, e))?
+        };
         let epoch = Arc::new(MapEpoch { map });
         let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
         Ok((
@@ -319,7 +361,7 @@ impl TableFile {
                 read_file,
                 epoch: Self::install_epoch(epoch),
                 published_len: AtomicU64::new(logical),
-                file_cap: AtomicU64::new(logical),
+                file_cap: AtomicU64::new(file_len.max(logical)),
                 trailing_header: true,
                 trailing_ext,
                 kind,
@@ -335,6 +377,24 @@ impl TableFile {
         path: impl Into<PathBuf>,
         kind: TableKind,
     ) -> Result<(Self, [u8; 16]), StoreError> {
+        let (path, data_bytes) = Self::trailing_footer_data_bytes(path, kind)?;
+        Self::open_trailing_header(path, kind, data_bytes)
+    }
+
+    /// Open trailing-header from EOF with explicit [`TableAccess`].
+    pub fn open_trailing_header_from_end_with_access(
+        path: impl Into<PathBuf>,
+        kind: TableKind,
+        access: TableAccess,
+    ) -> Result<(Self, [u8; 16]), StoreError> {
+        let (path, data_bytes) = Self::trailing_footer_data_bytes(path, kind)?;
+        Self::open_trailing_header_with_access(path, kind, data_bytes, access)
+    }
+
+    fn trailing_footer_data_bytes(
+        path: impl Into<PathBuf>,
+        kind: TableKind,
+    ) -> Result<(PathBuf, u64), StoreError> {
         let path = path.into();
         let mut file = OpenOptions::new()
             .read(true)
@@ -369,8 +429,7 @@ impl TableFile {
             return Err(StoreError::Corrupt("trailing-header logical length"));
         }
         let data_bytes = logical - TRAILING_FOOTER_LEN as u64;
-        drop(file);
-        Self::open_trailing_header(path, kind, data_bytes)
+        Ok((path, data_bytes))
     }
 
     /// Update the 16-byte trailing layout extension and rewrite the footer.
@@ -395,6 +454,32 @@ impl TableFile {
         footer[8..16].copy_from_slice(&logical.to_le_bytes());
         footer[16..32].copy_from_slice(&self.trailing_ext);
         self.ensure_capacity(logical)?;
+        if self.is_fd_only() {
+            // Footer may sit far beyond the tiny FdOnly map window — always pwrite.
+            let fd = self.read_file.as_raw_fd();
+            let mut done = 0usize;
+            while done < TRAILING_FOOTER_LEN {
+                let rc = unsafe {
+                    libc::pwrite(
+                        fd,
+                        footer[done..].as_ptr() as *const libc::c_void,
+                        TRAILING_FOOTER_LEN - done,
+                        (base + done as u64) as libc::off_t,
+                    )
+                };
+                if rc < 0 {
+                    return Err(StoreError::io(&self.path, std::io::Error::last_os_error()));
+                }
+                if rc == 0 {
+                    return Err(StoreError::io(
+                        &self.path,
+                        std::io::Error::new(std::io::ErrorKind::WriteZero, "pwrite trailer short"),
+                    ));
+                }
+                done += rc as usize;
+            }
+            return Ok(());
+        }
         let pin = self.pin();
         if pin.epoch.cap() < logical {
             return Err(StoreError::Corrupt("trailer past map"));
@@ -851,17 +936,22 @@ impl TableFile {
 
     fn write_hwm_mmap(&self, logical: u64) {
         let bytes = logical.to_le_bytes();
-        // Class A body: header HWM only (offset 8) via pwrite — map may be header-only.
+        // FdOnly: HWM via pwrite (map is a tiny window, not body).
         if self.is_fd_only() {
-            // Leading-header FdOnly tables only (no trailing FdOnly yet).
-            debug_assert!(!self.trailing_header);
+            let hwm_off = if self.trailing_header {
+                logical
+                    .saturating_sub(TRAILING_FOOTER_LEN as u64)
+                    .saturating_add(8)
+            } else {
+                8
+            };
             let fd = self.read_file.as_raw_fd();
             let rc = unsafe {
                 libc::pwrite(
                     fd,
                     bytes.as_ptr() as *const libc::c_void,
                     8,
-                    8 as libc::off_t,
+                    hwm_off as libc::off_t,
                 )
             };
             if rc != 8 {

@@ -121,11 +121,31 @@ grep 'ibd: sizes' host.log       # rss= anon= file=
 SHA vs candidate SHA; compare tip rate, head ms/blk, RssFile. **Fail ship** on
 5×-class head regression or agreed **>+20%** head ms/blk without tip-rate win.
 
-### Store microbench (phase 2+ head insert)
+### Store microbench (phase 2 head insert A/B)
 
-Musl package currently ships node+cli only. Phase 2 adds a packaged bench or
-documented ignored test; operator runs **both modes** on the same disk. Agent
-only ensures harness compiles and unit tests pass.
+Binary: **`rbitcoin-store-bench`** (`crates/rbitcoin-store`).
+
+```bash
+# Dev / agent (glibc nix-shell) — correctness + rough order of magnitude only:
+cargo build -p rbitcoin-store --release --bin rbitcoin-store-bench
+./target/release/rbitcoin-store-bench --n 200000 --bits 18 --access both --dir /var/tmp/head-ab
+
+# Operator preferred: build via musl package (ships when -p rbitcoin-store is built):
+nix build .#rbitcoin-musl --out-link result
+# After install from result, or:
+find result -name 'rbitcoin-store-bench' 2>/dev/null
+# Run on local NVMe, not 9p:
+./target/release/rbitcoin-store-bench --n 500000 --bits 20 --access both --dir /var/tmp/head-ab
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--access map` | [`TableAccess::MapFull`](../crates/rbitcoin-store/src/file.rs) only |
+| `--access fd` | [`TableAccess::FdOnly`](../crates/rbitcoin-store/src/file.rs) only |
+| `--access both` | Sequential A/B (default) |
+
+Live node A/B (segmented production path): set **`RBITCOIN_TX_HEAD_ACCESS=fd`**
+before open/create (default `map`). Temporary dual until phase 3 cutover.
 
 ---
 
@@ -147,6 +167,25 @@ only ensures harness compiles and unit tests pass.
 - Correctness: store unit tests (multi-segment soft-span, reopen, range batch).
 - Host A/B: **optional** for tip-rate; not a hard gate (lower risk than heads).
 
-### Phase 2+ — (pending)
+### Phase 2 — Head FdOnly path + bench harness (landed; host A/B pending)
 
-_Host A/B tables for head demap go here after operator runs._
+- Trailing-header [`TableAccess::FdOnly`](../crates/rbitcoin-store/src/file.rs):
+  tiny map window, pread/pwrite payload, pwrite trailer/HWM, fallocate grow.
+- Address-head page-coalesce `insert_many` already used `read_at`/`write_at` —
+  FdOnly reuses that path (no second algorithm).
+- Env **`RBITCOIN_TX_HEAD_ACCESS=fd|map`** (default **map**).
+- Binary **`rbitcoin-store-bench`** for operator MapFull vs FdOnly.
+- Unit test: `fd_only_insert_many_probe_and_reopen`.
+- **Agent-side sample only** (not a ship gate; bits=16 n=50k on /tmp):
+
+  | access | insert_ns/key | probe_ns/key |
+  |--------|---------------|--------------|
+  | MapFull | ~190 | ~352 |
+  | FdOnly | ~453 (~2.4×) | ~586 (~1.7×) |
+
+  Host must re-run with larger bits/n on NVMe before phase 3 cutover. Gate:
+  not 5×-class; target ≤+20% tip-rate / head ms if IBD window used.
+
+### Phase 3+ — (pending)
+
+_Host musl A/B numbers + default FdOnly cutover after operator sign-off._

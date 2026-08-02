@@ -36,11 +36,31 @@
 //! global bits-widen.
 
 use crate::error::StoreError;
-use crate::file::{TableFile, TRAILING_FOOTER_LEN};
+use crate::file::{TableAccess, TableFile, TRAILING_FOOTER_LEN};
 use crate::hashhead::HeadScale;
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Table transport for address-head files (`tx.head` segments).
+///
+/// - default / unset / `map` → [`TableAccess::MapFull`] (production until phase 3)
+/// - `fd` / `fdonly` → [`TableAccess::FdOnly`] (host A/B; page-coalesce insert uses pread/pwrite)
+///
+/// Env: **`RBITCOIN_TX_HEAD_ACCESS`**. Temporary dual until host signs off FdOnly.
+pub fn head_table_access_from_env() -> TableAccess {
+    match std::env::var("RBITCOIN_TX_HEAD_ACCESS") {
+        Ok(s) => {
+            let t = s.trim().to_ascii_lowercase();
+            if t == "fd" || t == "fdonly" || t == "pread" {
+                TableAccess::FdOnly
+            } else {
+                TableAccess::MapFull
+            }
+        }
+        Err(_) => TableAccess::MapFull,
+    }
+}
 
 
 /// In-page slot index width (1024 slots / page @ any entry width).
@@ -555,16 +575,37 @@ impl AddressHead {
         path: impl Into<PathBuf>,
         layout: HeadLayout,
     ) -> Result<Self, StoreError> {
+        // Trailing footer: slots at offset 0 so each 4 KiB probe page is OS-aligned.
+        // Layout (bits/entry/generation) lives in the footer extension — no sidecar.
+        // Access: MapFull default; `RBITCOIN_TX_HEAD_ACCESS=fd` for host A/B FdOnly.
+        Self::create_with_table_access(path, layout, head_table_access_from_env())
+    }
+
+    /// Create with explicit table access (production uses env via [`Self::create`]).
+    pub fn create_with_table_access(
+        path: impl Into<PathBuf>,
+        layout: HeadLayout,
+        access: crate::file::TableAccess,
+    ) -> Result<Self, StoreError> {
+        use crate::file::TableAccess;
         let path = path.into();
-        if path.exists() && path.is_dir() {
+        if path.is_dir() {
             return Err(StoreError::Corrupt(
                 "tx.head is a directory (legacy shards); wipe datadir for address head",
             ));
         }
         let slots = layout.slots();
-        // Trailing footer: slots at offset 0 so each 4 KiB probe page is OS-aligned.
-        // Layout (bits/entry/generation) lives in the footer extension — no sidecar.
-        let mut file = TableFile::create_trailing_header(&path, TableKind::HashHead)?;
+        // Prefer default trailing APIs when access matches for_kind (keeps them on
+        // the production path); override only for A/B FdOnly.
+        let mut file = if access == TableAccess::for_kind(TableKind::HashHead, true) {
+            TableFile::create_trailing_header(&path, TableKind::HashHead)?
+        } else {
+            TableFile::create_trailing_header_with_access(
+                &path,
+                TableKind::HashHead,
+                access,
+            )?
+        };
         let body_bytes = layout.body_bytes();
         let need = body_bytes + TRAILING_FOOTER_LEN as u64;
         file.ensure_capacity(need)?;
@@ -574,13 +615,14 @@ impl AddressHead {
         file.set_logical_len(need)?;
         file.zero_range(0, body_bytes)?;
         remove_legacy_meta_sidecar(&path);
-        if layout.bits >= 24 {
+        if layout.bits >= 24 || access == TableAccess::FdOnly {
             rbitcoin_log::info!(
-                "store: address-head create path={} bits={} slots={} entry={}B (~{:.2} GiB sparse, footer layout)",
+                "store: address-head create path={} bits={} slots={} entry={}B access={:?} (~{:.2} GiB sparse, footer layout)",
                 file.path().display(),
                 layout.bits,
                 slots,
                 layout.entry_bytes,
+                access,
                 body_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
             );
         }
@@ -594,6 +636,14 @@ impl AddressHead {
     }
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        Self::open_with_table_access(path, head_table_access_from_env())
+    }
+
+    /// Open with explicit table access (must match how the file was created for FdOnly).
+    pub fn open_with_table_access(
+        path: impl Into<PathBuf>,
+        access: crate::file::TableAccess,
+    ) -> Result<Self, StoreError> {
         let path = path.into();
         if path.is_dir() {
             return Err(StoreError::Corrupt(
@@ -602,8 +652,15 @@ impl AddressHead {
         }
         // Layout is in the trailing footer (v5). Sidecar-only or older footers fail
         // here → TxTable recreates + rebuilds from Class A.
-        let (file, ext) =
-            TableFile::open_trailing_header_from_end(&path, TableKind::HashHead)?;
+        let (file, ext) = if access == TableAccess::for_kind(TableKind::HashHead, true) {
+            TableFile::open_trailing_header_from_end(&path, TableKind::HashHead)?
+        } else {
+            TableFile::open_trailing_header_from_end_with_access(
+                &path,
+                TableKind::HashHead,
+                access,
+            )?
+        };
         let (layout, generation) = decode_layout_ext(&ext)?;
         let expect_body = layout.body_bytes();
         let body = file.data_len();
@@ -646,6 +703,11 @@ impl AddressHead {
 
     pub fn occupied(&self) -> u64 {
         self.occupied.load(Ordering::Relaxed)
+    }
+
+    /// Table transport for this head file (MapFull vs FdOnly).
+    pub fn table_access(&self) -> TableAccess {
+        self.file.access()
     }
 
     pub fn generation(&self) -> u64 {
@@ -720,8 +782,9 @@ impl AddressHead {
         self.insert_many(&[(*txid, new_fk)])
     }
 
-    /// Plain mmap write of one create_fk slot (sole writer; no atomic RMW).
+    /// Plain slot write of one create_fk (sole writer; no atomic RMW).
     ///
+    /// Uses [`TableFile::write_at`] — MapFull memcpy or FdOnly pwrite.
     /// Visibility for concurrent probes is via the **SeqCst fence** at the end of
     /// [`Self::insert_many`] (paired with Acquire fence in [`Self::load_page_slots`]).
     fn store_entry_plain(&self, slot: u64, new: u64) -> Result<(), StoreError> {
@@ -1000,6 +1063,39 @@ mod tests {
         assert!(cands.contains(&Fk(1)));
         assert!(cands.contains(&Fk(2)));
         assert_eq!(cands[0], Fk(1));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(meta_path(&path));
+    }
+
+    /// FdOnly trailing head: page-coalesce insert uses pread/pwrite (phase 2 A/B path).
+    #[test]
+    fn fd_only_insert_many_probe_and_reopen() {
+        let path = tmp("fd_only_head");
+        let layout = HeadLayout::with_entry_bytes(14, 4).unwrap();
+        let h = AddressHead::create_with_table_access(&path, layout, TableAccess::FdOnly).unwrap();
+        assert_eq!(h.table_access(), TableAccess::FdOnly);
+        let mut batch = Vec::new();
+        for i in 1..=500u64 {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            batch.push((txid, Fk(i)));
+        }
+        h.insert_many(&batch).unwrap();
+        assert_eq!(h.occupied(), 500);
+        for i in [1u64, 250, 500] {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            let cands = h.probe_fks(&txid).unwrap();
+            assert!(cands.contains(&Fk(i)), "fk={i} cands={cands:?}");
+        }
+        drop(h);
+        let h2 =
+            AddressHead::open_with_table_access(&path, TableAccess::FdOnly).unwrap();
+        assert_eq!(h2.table_access(), TableAccess::FdOnly);
+        assert_eq!(h2.occupied(), 500);
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&42u64.to_le_bytes());
+        assert!(h2.probe_fks(&txid).unwrap().contains(&Fk(42)));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(meta_path(&path));
     }

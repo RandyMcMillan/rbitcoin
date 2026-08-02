@@ -171,20 +171,25 @@ before open/create (default `map`). Temporary dual until phase 3 cutover.
 
 - Trailing-header [`TableAccess::FdOnly`](../crates/rbitcoin-store/src/file.rs):
   tiny map window, pread/pwrite payload, pwrite trailer/HWM, fallocate grow.
-- Address-head page-coalesce `insert_many` already used `read_at`/`write_at` —
-  FdOnly reuses that path (no second algorithm).
 - Env **`RBITCOIN_TX_HEAD_ACCESS=fd|map`** (default **map**).
-- Binary **`rbitcoin-store-bench`** for operator MapFull vs FdOnly.
-- Unit test: `fd_only_insert_many_probe_and_reopen`.
-- **Agent-side sample only** (not a ship gate; bits=16 n=50k on /tmp):
+- Binary **`rbitcoin-store-bench`**.
+
+### Phase 2b — Page coalesce + resolve state machine (landed; host re-bench)
+
+| Path | Behavior |
+|------|----------|
+| **Head insert** | One **page read** + multi in-buffer hop; **one page write-back** if dirty (not per-slot pwrite). 4 KiB-aligned on trailing heads. |
+| **Idx reads** | **OS-page-aligned** preads (4096 B). Contiguous runs expand to page spans. Sparse `record_range_batch` → **one uring/pread SQE per distinct OS page**. Same-page interior range → single page pread. |
+| **Head resolve (uring)** | Per key: CPU **probe** → **STAGE_IDX** (idx OS-page pread) → **STAGE_BODY** (≤32 B body). Many keys mixed in flight — **not** “all idx then all body”. |
+
+- **Agent-side sample** after page write-back (bits=16 n=50k /tmp; not a ship gate):
 
   | access | insert_ns/key | probe_ns/key |
   |--------|---------------|--------------|
-  | MapFull | ~190 | ~352 |
-  | FdOnly | ~453 (~2.4×) | ~586 (~1.7×) |
+  | MapFull | ~111 | ~489 |
+  | FdOnly | ~100 | ~500 |
 
-  Host must re-run with larger bits/n on NVMe before phase 3 cutover. Gate:
-  not 5×-class; target ≤+20% tip-rate / head ms if IBD window used.
+  Host must re-run larger bits/n on NVMe. Gate: not 5×-class; target ≤+20% tip/head if IBD window used.
 
 ### Phase 3+ — (pending)
 

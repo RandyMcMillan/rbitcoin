@@ -137,8 +137,8 @@ impl VarTable {
     /// Bulk body ranges for arbitrary fks — **sorted** walk of segmented idx.
     ///
     /// Output order matches `fks`. Null / OOB ids yield `None` (not an error).
-    /// Contiguous id runs use one sequential load via [`Self::record_ranges`];
-    /// sparse singles use [`Self::record_range`].
+    /// Contiguous id runs use page-aligned sequential loads; sparse ids use
+    /// OS-page-coalesced bulk pread (`record_starts_batch_bulk`).
     pub fn record_range_batch(
         &self,
         fks: &[Fk],
@@ -146,7 +146,7 @@ impl VarTable {
         if fks.is_empty() {
             return Ok(Vec::new());
         }
-        let count = self.count.load(Ordering::Acquire);
+        let (count, body_end) = self.published_meta();
         let mut out: Vec<Option<(u64, u64)>> = vec![None; fks.len()];
         let mut jobs: Vec<(usize, u64)> = Vec::with_capacity(fks.len());
         for (i, fk) in fks.iter().enumerate() {
@@ -163,37 +163,56 @@ impl VarTable {
         }
         jobs.sort_unstable_by_key(|(_, id)| *id);
 
-        let mut run_start = 0usize;
-        while run_start < jobs.len() {
-            let first_id = jobs[run_start].1;
-            let mut last_unique = first_id;
-            let mut run_end = run_start + 1;
-            while run_end < jobs.len() {
-                let id = jobs[run_end].1;
-                if id == last_unique {
-                    run_end += 1;
-                    continue;
-                }
-                if id == last_unique + 1 {
-                    last_unique = id;
-                    run_end += 1;
-                    continue;
-                }
-                break;
+        // Collect unique start slots needed: id for all; id+1 when interior.
+        let mut start_ids: Vec<u64> = Vec::with_capacity(jobs.len() * 2);
+        for &(_, id) in &jobs {
+            start_ids.push(id);
+            if id < count {
+                start_ids.push(id + 1);
             }
-            let ranges = self.record_ranges(first_id, last_unique)?;
-            for j in run_start..run_end {
-                let (orig_i, id) = jobs[j];
-                let slot = (id - first_id) as usize;
-                out[orig_i] = Some(ranges[slot]);
+        }
+        start_ids.sort_unstable();
+        start_ids.dedup();
+
+        let starts = self.idx.record_starts_batch_bulk(
+            &start_ids,
+            crate::io_backend::pin_io_backend(),
+        )?;
+        let mut start_map: std::collections::HashMap<u64, u64> =
+            std::collections::HashMap::with_capacity(start_ids.len());
+        for (id, s) in start_ids.iter().zip(starts.iter()) {
+            if let Some(abs) = s {
+                start_map.insert(*id, *abs);
             }
-            run_start = run_end;
+        }
+
+        for &(orig_i, id) in &jobs {
+            let Some(&start) = start_map.get(&id) else {
+                continue;
+            };
+            let end = if id < count {
+                match start_map.get(&(id + 1)) {
+                    Some(&e) => e,
+                    None => continue,
+                }
+            } else {
+                body_end
+            };
+            if end < start {
+                return Err(StoreError::Corrupt("var record end < start"));
+            }
+            out[orig_i] = Some((start, end - start));
         }
         Ok(out)
     }
 
-    /// Segmented idx has no single fd — callers resolve ranges via
-    /// [`Self::record_range`] / batch APIs (mmap), then body pread.
+    /// OS-page pread plan for the idx slot of `fk` (uring head-resolve STAGE_IDX).
+    pub(crate) fn idx_page_plan(&self, fk: Fk) -> Result<crate::tx_idx::IdxPagePlan, StoreError> {
+        let id = fk.get().ok_or(StoreError::InvalidFk)?;
+        self.idx.page_plan_for_id(id)
+    }
+
+    /// Segmented idx: resolve ranges via page-coalesced batch APIs, then body pread.
     #[inline]
     pub(crate) fn body_read_fd(&self) -> std::os::fd::RawFd {
         self.body.read_fd()

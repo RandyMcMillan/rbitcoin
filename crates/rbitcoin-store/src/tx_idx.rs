@@ -37,6 +37,9 @@ pub const DEFAULT_SOFT_SPAN: u64 = 16 << 30;
 /// Hard max: `u32::MAX` stride units × 8.
 pub const HARD_SPAN: u64 = (u32::MAX as u64) * IDX_STRIDE;
 
+/// OS page size for idx coalesced reads (Linux default; matches head probe pages).
+pub const IDX_OS_PAGE: u64 = 4096;
+
 const META_VERSION: u32 = 1;
 /// magic4 + schema2 + kind2 + meta_ver4 + seg_count4 + reserved4
 const META_HEADER_LEN: usize = 20;
@@ -154,6 +157,31 @@ impl TxIdx {
             .min(HARD_SPAN)
     }
 
+    /// Plan a single OS-page pread covering the idx slot for 1-based `id`.
+    pub fn page_plan_for_id(&self, id: u64) -> Result<IdxPagePlan, StoreError> {
+        if id == 0 {
+            return Err(StoreError::NotFound);
+        }
+        let segs = self.segments_snapshot();
+        let si = find_segment_index(&segs, id).ok_or(StoreError::NotFound)?;
+        let seg = &segs[si];
+        let slot = id - seg.first_fk;
+        if slot >= seg.count {
+            return Err(StoreError::NotFound);
+        }
+        let page_off = align_down(slot_file_off(slot), IDX_OS_PAGE);
+        let file_end = seg.file.logical_len();
+        let page_len = (IDX_OS_PAGE as usize).min(file_end.saturating_sub(page_off) as usize);
+        if page_len < 4 {
+            return Err(StoreError::Corrupt("tx.idx page short"));
+        }
+        Ok(IdxPagePlan {
+            fd: seg.file.read_fd(),
+            page_off,
+            page_len,
+        })
+    }
+
     /// Absolute body start for 1-based `id` (must be ≤ published count).
     pub fn record_start(&self, id: u64) -> Result<u64, StoreError> {
         if id == 0 {
@@ -169,7 +197,39 @@ impl TxIdx {
     }
 
     /// `(offset, len)` for interior id (`id < count`); needs start(id+1).
+    ///
+    /// When both slots share one OS page, uses a **single** page pread.
     pub fn record_range_interior(&self, id: u64) -> Result<(u64, u64), StoreError> {
+        if id == 0 {
+            return Err(StoreError::NotFound);
+        }
+        let segs = self.segments_snapshot();
+        let seg = find_segment(&segs, id).ok_or(StoreError::NotFound)?;
+        let i = id - seg.first_fk;
+        if i + 1 >= seg.count {
+            // Need next segment or last-record path — fall back.
+            let start = self.record_start(id)?;
+            let end = self.record_start(id + 1)?;
+            if end < start {
+                return Err(StoreError::Corrupt("var record end < start"));
+            }
+            return Ok((start, end - start));
+        }
+        let off0 = slot_file_off(i);
+        let off1 = slot_file_off(i + 1);
+        let page0 = align_down(off0, IDX_OS_PAGE);
+        let page1 = align_down(off1, IDX_OS_PAGE);
+        if page0 == page1 {
+            let mut starts = Vec::with_capacity(2);
+            read_starts_page_aligned(seg, i, i + 1, &mut starts)?;
+            if starts.len() != 2 {
+                return Err(StoreError::Corrupt("tx.idx dual extract"));
+            }
+            if starts[1] < starts[0] {
+                return Err(StoreError::Corrupt("var record end < start"));
+            }
+            return Ok((starts[0], starts[1] - starts[0]));
+        }
         let start = self.record_start(id)?;
         let end = self.record_start(id + 1)?;
         if end < start {
@@ -229,24 +289,201 @@ impl TxIdx {
             let take_last = last.min(seg_last_fk);
             let i0 = id - seg.first_fk;
             let i1 = take_last - seg.first_fk;
-            // Bulk read u32 slots [i0..=i1].
-            let n = (i1 - i0 + 1) as usize;
-            let mut raw = vec![0u8; n * 4];
-            let off = FILE_HEADER_LEN as u64 + i0 * 4;
-            seg.file.read_at(off, &mut raw)?;
-            for k in 0..n {
-                let rel = u32::from_le_bytes(raw[k * 4..k * 4 + 4].try_into().unwrap());
-                let abs = seg
-                    .body_base
-                    .checked_add((rel as u64).checked_mul(IDX_STRIDE).ok_or(
-                        StoreError::Corrupt("tx.idx stride overflow"),
-                    )?)
-                    .ok_or(StoreError::Corrupt("tx.idx abs overflow"))?;
-                out.push(abs);
-            }
+            // OS-page-aligned bulk read covering [i0..=i1], then extract slots.
+            read_starts_page_aligned(seg, i0, i1, out)?;
             id = take_last + 1;
         }
         Ok(())
+    }
+
+    /// Absolute body starts for arbitrary 1-based ids (may be sparse).
+    ///
+    /// Coalesces to **one pread (or uring SQE) per OS page** touched across the
+    /// batch, then extracts the requested slots.
+    pub fn record_starts_batch(&self, ids: &[u64]) -> Result<Vec<Option<u64>>, StoreError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let segs = self.segments_snapshot();
+        let mut out: Vec<Option<u64>> = vec![None; ids.len()];
+        // (orig_i, file_id, slot_i, seg_index)
+        let mut jobs: Vec<(usize, u32, u64, usize)> = Vec::new();
+        for (oi, &id) in ids.iter().enumerate() {
+            if id == 0 {
+                continue;
+            }
+            let Some(si) = find_segment_index(&segs, id) else {
+                continue;
+            };
+            let seg = &segs[si];
+            let slot = id - seg.first_fk;
+            if slot >= seg.count {
+                continue;
+            }
+            jobs.push((oi, seg.file_id, slot, si));
+        }
+        if jobs.is_empty() {
+            return Ok(out);
+        }
+        // Group by (file_id, os_page) for one read per page.
+        jobs.sort_unstable_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| slot_file_off(a.2).cmp(&slot_file_off(b.2)))
+        });
+        let mut page_buf = vec![0u8; IDX_OS_PAGE as usize];
+        let mut p = 0usize;
+        while p < jobs.len() {
+            let file_id = jobs[p].1;
+            let si = jobs[p].3;
+            let page_off = align_down(slot_file_off(jobs[p].2), IDX_OS_PAGE);
+            let mut q = p + 1;
+            while q < jobs.len()
+                && jobs[q].1 == file_id
+                && align_down(slot_file_off(jobs[q].2), IDX_OS_PAGE) == page_off
+            {
+                q += 1;
+            }
+            let seg = &segs[si];
+            let file_end = seg.file.logical_len();
+            let want = (IDX_OS_PAGE as usize).min(file_end.saturating_sub(page_off) as usize);
+            if want < 4 {
+                p = q;
+                continue;
+            }
+            page_buf[..want].fill(0);
+            seg.file.read_at(page_off, &mut page_buf[..want])?;
+            for &(oi, _, slot, _) in &jobs[p..q] {
+                let abs_off = slot_file_off(slot);
+                let rel_off = (abs_off - page_off) as usize;
+                if rel_off + 4 > want {
+                    continue;
+                }
+                let rel = u32::from_le_bytes(page_buf[rel_off..rel_off + 4].try_into().unwrap());
+                match decode_abs(seg, rel) {
+                    Ok(a) => out[oi] = Some(a),
+                    Err(_) => out[oi] = None,
+                }
+            }
+            p = q;
+        }
+        Ok(out)
+    }
+
+    /// Like [`Self::record_starts_batch`] but uses uring/`pread_batch` when many
+    /// distinct OS pages are needed (one SQE per unique page).
+    pub fn record_starts_batch_bulk(
+        &self,
+        ids: &[u64],
+        backend: crate::io_backend::ReadIoBackend,
+    ) -> Result<Vec<Option<u64>>, StoreError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Small batches: serial page-coalesced path is enough.
+        if ids.len() < 8 {
+            return self.record_starts_batch(ids);
+        }
+        let segs = self.segments_snapshot();
+        let mut out: Vec<Option<u64>> = vec![None; ids.len()];
+        let mut jobs: Vec<(usize, u32, u64, usize)> = Vec::new();
+        for (oi, &id) in ids.iter().enumerate() {
+            if id == 0 {
+                continue;
+            }
+            let Some(si) = find_segment_index(&segs, id) else {
+                continue;
+            };
+            let seg = &segs[si];
+            let slot = id - seg.first_fk;
+            if slot >= seg.count {
+                continue;
+            }
+            jobs.push((oi, seg.file_id, slot, si));
+        }
+        if jobs.is_empty() {
+            return Ok(out);
+        }
+        jobs.sort_unstable_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| slot_file_off(a.2).cmp(&slot_file_off(b.2)))
+        });
+
+        // Unique pages: (si, page_off) → page buffer index
+        let mut page_keys: Vec<(usize, u64)> = Vec::new();
+        let mut page_job_ranges: Vec<(usize, usize)> = Vec::new(); // [p, q) into jobs
+        let mut p = 0usize;
+        while p < jobs.len() {
+            let si = jobs[p].3;
+            let page_off = align_down(slot_file_off(jobs[p].2), IDX_OS_PAGE);
+            let mut q = p + 1;
+            while q < jobs.len()
+                && jobs[q].3 == si
+                && align_down(slot_file_off(jobs[q].2), IDX_OS_PAGE) == page_off
+            {
+                q += 1;
+            }
+            page_keys.push((si, page_off));
+            page_job_ranges.push((p, q));
+            p = q;
+        }
+
+        // Allocate one 4 KiB buffer per unique page; bulk pread.
+        let mut pages: Vec<Vec<u8>> = page_keys
+            .iter()
+            .map(|(si, page_off)| {
+                let seg = &segs[*si];
+                let file_end = seg.file.logical_len();
+                let want = (IDX_OS_PAGE as usize).min(file_end.saturating_sub(*page_off) as usize);
+                vec![0u8; want]
+            })
+            .collect();
+
+        {
+            use crate::bulk_io::{self, ReadOp};
+            // SAFETY: each pages[i] is a distinct allocation.
+            let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(pages.len());
+            for (i, (si, page_off)) in page_keys.iter().enumerate() {
+                let fd = segs[*si].file.read_fd();
+                let len = pages[i].len();
+                let ptr = pages[i].as_mut_ptr();
+                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+                ops.push(ReadOp {
+                    fd,
+                    offset: *page_off,
+                    buf: slice,
+                    result: i32::MIN,
+                });
+            }
+            bulk_io::pread_batch_backend(&mut ops, backend);
+            for (i, op) in ops.iter().enumerate() {
+                if op.result < 0 {
+                    return Err(StoreError::io(
+                        segs[page_keys[i].0].file.path(),
+                        std::io::Error::from_raw_os_error(-op.result),
+                    ));
+                }
+            }
+        }
+
+        for (page_i, &(jp, jq)) in page_job_ranges.iter().enumerate() {
+            let (si, page_off) = page_keys[page_i];
+            let seg = &segs[si];
+            let want = pages[page_i].len();
+            for &(oi, _, slot, _) in &jobs[jp..jq] {
+                let abs_off = slot_file_off(slot);
+                let rel_off = (abs_off - page_off) as usize;
+                if rel_off + 4 > want {
+                    continue;
+                }
+                let rel = u32::from_le_bytes(
+                    pages[page_i][rel_off..rel_off + 4].try_into().unwrap(),
+                );
+                if let Ok(a) = decode_abs(seg, rel) {
+                    out[oi] = Some(a);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Append `n` absolute starts (must be 8-aligned, monotone, published after body).
@@ -430,19 +667,91 @@ impl TxIdx {
     }
 }
 
-fn read_start(seg: &Segment, i: u64) -> Result<u64, StoreError> {
-    let mut buf = [0u8; 4];
-    seg.file
-        .read_at(FILE_HEADER_LEN as u64 + i * 4, &mut buf)?;
-    let rel = u32::from_le_bytes(buf) as u64;
+/// One OS-page pread covering an idx slot (for uring head-resolve STAGE_IDX).
+#[derive(Clone, Debug)]
+pub struct IdxPagePlan {
+    pub fd: std::os::fd::RawFd,
+    pub page_off: u64,
+    pub page_len: usize,
+}
+
+#[inline]
+fn slot_file_off(slot_i: u64) -> u64 {
+    FILE_HEADER_LEN as u64 + slot_i * 4
+}
+
+#[inline]
+fn align_down(off: u64, page: u64) -> u64 {
+    off / page * page
+}
+
+#[inline]
+fn decode_abs(seg: &Segment, rel: u32) -> Result<u64, StoreError> {
     seg.body_base
-        .checked_add(rel.checked_mul(IDX_STRIDE).ok_or(StoreError::Corrupt(
-            "tx.idx stride overflow",
-        ))?)
+        .checked_add((rel as u64).checked_mul(IDX_STRIDE).ok_or(
+            StoreError::Corrupt("tx.idx stride overflow"),
+        )?)
         .ok_or(StoreError::Corrupt("tx.idx abs overflow"))
 }
 
+fn read_start(seg: &Segment, i: u64) -> Result<u64, StoreError> {
+    // Single slot: still go through page-aligned read (one OS page) so cold
+    // probes share the page cache with neighbors.
+    let mut out = Vec::with_capacity(1);
+    read_starts_page_aligned(seg, i, i, &mut out)?;
+    out.into_iter()
+        .next()
+        .ok_or(StoreError::Corrupt("tx.idx empty page extract"))
+}
+
+/// Read slots `[i0..=i1]` via OS-page-aligned preads (one read per page).
+fn read_starts_page_aligned(
+    seg: &Segment,
+    i0: u64,
+    i1: u64,
+    out: &mut Vec<u64>,
+) -> Result<(), StoreError> {
+    if i1 < i0 {
+        return Ok(());
+    }
+    let file_end = seg.file.logical_len();
+    let mut slot = i0;
+    while slot <= i1 {
+        let page_off = align_down(slot_file_off(slot), IDX_OS_PAGE);
+        let page_end = page_off + IDX_OS_PAGE;
+        let want = (IDX_OS_PAGE as usize).min(file_end.saturating_sub(page_off) as usize);
+        if want < 4 {
+            break;
+        }
+        let mut page = vec![0u8; want];
+        seg.file.read_at(page_off, &mut page)?;
+        // Extract slots that fall in this page and in [slot..=i1].
+        while slot <= i1 {
+            let off = slot_file_off(slot);
+            if off >= page_end {
+                break;
+            }
+            if off < page_off {
+                slot += 1;
+                continue;
+            }
+            let rel_off = (off - page_off) as usize;
+            if rel_off + 4 > want {
+                break;
+            }
+            let rel = u32::from_le_bytes(page[rel_off..rel_off + 4].try_into().unwrap());
+            out.push(decode_abs(seg, rel)?);
+            slot += 1;
+        }
+    }
+    Ok(())
+}
+
 fn find_segment(segs: &[Segment], id: u64) -> Option<&Segment> {
+    find_segment_index(segs, id).map(|i| &segs[i])
+}
+
+fn find_segment_index(segs: &[Segment], id: u64) -> Option<usize> {
     if segs.is_empty() || id == 0 {
         return None;
     }
@@ -458,7 +767,7 @@ fn find_segment(segs: &[Segment], id: u64) -> Option<&Segment> {
         } else if id >= end {
             lo = mid + 1;
         } else {
-            return Some(s);
+            return Some(mid);
         }
     }
     None

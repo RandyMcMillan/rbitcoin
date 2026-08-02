@@ -373,8 +373,11 @@ pub struct InsertPageOutcome {
     /// Probe depth of the empty slot written (or 0 if idempotent).
     pub depth: u32,
     /// Local slot index within the page (valid if `wrote_new`).
+    /// Local slot of the new empty (unit tests; insert_many uses full-page write-back).
+    #[allow(dead_code)]
     pub empty_local: u64,
-    /// Encoded create_fk value written (valid if `wrote_new`).
+    /// Encoded create_fk written when `wrote_new` (unit tests).
+    #[allow(dead_code)]
     pub stored_fk: u64,
 }
 
@@ -784,28 +787,12 @@ impl AddressHead {
 
     /// Plain slot write of one create_fk (sole writer; no atomic RMW).
     ///
-    /// Uses [`TableFile::write_at`] — MapFull memcpy or FdOnly pwrite.
-    /// Visibility for concurrent probes is via the **SeqCst fence** at the end of
-    /// [`Self::insert_many`] (paired with Acquire fence in [`Self::load_page_slots`]).
-    fn store_entry_plain(&self, slot: u64, new: u64) -> Result<(), StoreError> {
-        let off = self.entry_off(slot);
-        match self.layout.entry_bytes {
-            4 => {
-                if new > u64::from(u32::MAX) {
-                    return Err(StoreError::InvalidFk);
-                }
-                self.file.write_at(off, &(new as u32).to_le_bytes())
-            }
-            8 => self.file.write_at(off, &new.to_le_bytes()),
-            _ => Err(StoreError::Corrupt("address head entry_bytes")),
-        }
-    }
-
     /// Bulk insert: **stable sort by probe page**, then original index (preserves
     /// call order within a page for rare same-batch duplicate txids).
     ///
-    /// Per page: one [`load_page_slots`], multi [`insert_fk_into_page_buf`], plain
-    /// slot stores for new empties. **SeqCst fence** once at end.
+    /// Per page: one [`load_page_slots`], multi [`insert_fk_into_page_buf`] in
+    /// RAM, then **one page write-back** if dirty (not per-slot pwrite). **SeqCst
+    /// fence** once at end.
     pub fn insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
@@ -839,17 +826,20 @@ impl AddressHead {
             }
 
             let mut n_new = 0u64;
+            let mut dirty = false;
             for &(_, _, ref txid, fk) in &work[i..j] {
                 let outcome =
                     insert_fk_into_page_buf(&mut buf[..n], page_base, bits, es, txid, fk)?;
                 if outcome.wrote_new {
                     note_probe_depth_on_insert(outcome.depth);
-                    let global = page_base + outcome.empty_local;
-                    self.store_entry_plain(global, outcome.stored_fk)?;
+                    dirty = true;
                     n_new = n_new.saturating_add(1);
                 }
             }
-            if n_new > 0 {
+            if dirty {
+                // One OS-page-aligned write for the whole probe page (4 KiB @ 4 B).
+                let off = self.entry_off(page_base);
+                self.file.write_at(off, &buf[..n])?;
                 self.occupied.fetch_add(n_new, Ordering::Relaxed);
             }
             i = j;

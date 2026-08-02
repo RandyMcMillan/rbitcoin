@@ -102,6 +102,8 @@ pub fn run_idx_body_pipeline_backend(
             need_slot.push(i);
         }
     }
+    // Page-coalesced idx (one OS-page / uring SQE per distinct page), then body.
+    // Contiguous runs still use record_range_batch (page-aligned collect_starts).
     if !need_fk.is_empty() {
         let ranges = table.record_range_batch(&need_fk)?;
         for (slot, r) in need_slot.into_iter().zip(ranges.into_iter()) {
@@ -134,6 +136,8 @@ pub fn run_idx_body_pipeline_backend(
     // Sort by body offset for sequential page fault / pread locality.
     submitted.sort_unstable_by_key(|&i| jobs[i].range.map(|(o, _)| o).unwrap_or(0));
 
+    // Body bulk: one uring/pread SQE per job (distinct buffers). Idx was already
+    // page-coalesced above; body peeks are short and rarely share a page.
     // SAFETY: each jobs[i].body is a distinct allocation; submitted unique.
     let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(submitted.len());
     for &i in &submitted {

@@ -14,7 +14,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 use bitcoin::p2p::{Magic, ServiceFlags};
-use bitcoin::{Block, BlockHash};
+use bitcoin::BlockHash;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,16 +32,17 @@ pub(crate) enum PeerCmd {
 
 pub(crate) enum PeerEvent {
     Headers { peer: usize, headers: Vec<Header> },
-    /// Full `block` frame on the wire (hash from header only). Free getdata slots
-    /// immediately — full deserialize still in flight on the blocking pool.
+    /// Full `block` frame on the wire: hash from header bytes + **raw payload**.
+    ///
+    /// No full `Block` deserialize on the peer path — body queue stores these
+    /// bytes; confirm pack decodes. Free getdata slots immediately.
     BlockFramed {
         peer: usize,
         hash: BlockHash,
-        /// Payload size (for peer speed classification).
-        wire_bytes: usize,
+        /// Consensus-serialized block (frame payload).
+        payload: Vec<u8>,
     },
-    Block { peer: usize, block: Block },
-    /// Framed as `block` but deserialize failed / unexpected command — re-request.
+    /// Framed as `block` but unusable (e.g. truncated header) — re-request.
     BlockDecodeFailed { peer: usize, hash: BlockHash },
     /// Peer answered `notfound` for these block hashes (does not have them).
     NotFound { peer: usize, hashes: Vec<BlockHash> },
@@ -53,7 +54,7 @@ pub(crate) enum PeerEvent {
 
 /// Dual fan-out so body delivery is never stuck behind header floods on one FIFO.
 ///
-/// - **body**: `BlockFramed` / `Block` / decode fail / `NotFound` / `Dead` — drain first
+/// - **body**: `BlockFramed` / fail / `NotFound` / `Dead` — drain first
 /// - **ctrl**: `Headers` — budgeted so multi-peer header spam cannot livelock apply
 #[derive(Clone)]
 pub(crate) struct PeerEventSinks {
@@ -229,27 +230,36 @@ pub(crate) async fn spawn_peer(
                             touch_block_progress(&progress_io);
                         }
 
-                        let framed_block_hash = if frame.is_block() {
-                            frame.block_hash_from_header()
-                        } else {
-                            None
-                        };
-                        if let Some(hash) = framed_block_hash {
-                            sinks_r.send_body(PeerEvent::BlockFramed {
-                                peer: id,
-                                hash,
-                                wire_bytes: frame.payload.len(),
-                            });
+                        // Block frames: raw payload → body queue (no peer full decode).
+                        if frame.is_block() {
+                            match frame.block_hash_from_header() {
+                                Some(hash) if frame.payload.len() >= 80 => {
+                                    sinks_r.send_body(PeerEvent::BlockFramed {
+                                        peer: id,
+                                        hash,
+                                        payload: frame.payload,
+                                    });
+                                }
+                                Some(hash) => {
+                                    sinks_r.send_body(PeerEvent::BlockDecodeFailed {
+                                        peer: id,
+                                        hash,
+                                    });
+                                }
+                                None => {
+                                    // Truncated / unusable block frame — nothing to re-get by hash.
+                                    rbitcoin_log::debug!(
+                                        "ibd: peer[{id}] block frame without usable header hash"
+                                    );
+                                }
+                            }
+                            continue;
                         }
 
                         let progress = Arc::clone(&progress_io);
                         let sinks_d = sinks_r.clone();
-                        let sinks_err = sinks_r.clone();
-                        let framed_err_hash = framed_block_hash;
-                        // Always read + fire-and-forget decode. Never await a
-                        // decode permit on the reader: that stalls TCP and makes
-                        // healthy peers look dead. Soft archive budget is enforced
-                        // only by stopping new block *requests* (`can_assign`).
+                        // Non-block: decode off-thread. Never await a decode permit
+                        // on the reader (stalls TCP). Soft budgets gate *requests* only.
                         spawn_decode_then_with_err(
                             frame,
                             move |msg| {
@@ -263,13 +273,6 @@ pub(crate) async fn spawn_peer(
                                         sinks_d.send_ctrl(PeerEvent::Headers {
                                             peer: id,
                                             headers,
-                                        });
-                                    }
-                                    NetworkMessage::Block(b) => {
-                                        touch_block_progress(&progress);
-                                        sinks_d.send_body(PeerEvent::Block {
-                                            peer: id,
-                                            block: b,
                                         });
                                     }
                                     NetworkMessage::NotFound(inv) => {
@@ -308,25 +311,12 @@ pub(crate) async fn spawn_peer(
                                         }
                                     }
                                     NetworkMessage::SendAddrV2 => {}
-                                    other => {
-                                        if let Some(hash) = framed_err_hash {
-                                            let _ = other;
-                                            sinks_d.send_body(PeerEvent::BlockDecodeFailed {
-                                                peer: id,
-                                                hash,
-                                            });
-                                        }
-                                    }
+                                    // Blocks must not reach decode (handled above).
+                                    NetworkMessage::Block(_) => {}
+                                    _other => {}
                                 }
                             },
-                            move || {
-                                if let Some(hash) = framed_err_hash {
-                                    sinks_err.send_body(PeerEvent::BlockDecodeFailed {
-                                        peer: id,
-                                        hash,
-                                    });
-                                }
-                            },
+                            move || {},
                         );
                     }
                     Err(NetError::Io(e))

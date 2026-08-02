@@ -8,21 +8,20 @@ in RSS when faulted but are not Rust heap leaks).
 
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
-| **Durable body queue** | **Soft time-depth** ~5 min of tip-rate blocks on disk (hysteresis resume &lt;4 min); optional absolute byte ceiling via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` (default unlimited) | Peer **offer** wire always to disk; confirm prep **reads** by height; confirm-write **dequeues** after tip advance. Files get `POSIX_FADV_DONTNEED` after durable write (idle on disk — not process heap). **Restart rehydrate uses index meta only** (`list_meta`) — never `load_all`. No process RAM overflow for BQ. Logs: `bq n=` + `disk=` + `soft=n/stop`. |
+| **Durable body queue** | **Soft time-depth** ~5 min of tip-rate blocks on disk (hysteresis resume &lt;4 min); optional absolute byte ceiling via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` (default unlimited) | Peer **BlockFramed** writes **raw** frame payload (no full Block decode on peer); confirm pack **decodes** by height; confirm-write **dequeues** after tip advance. Files get `POSIX_FADV_DONTNEED` after durable write. **Restart rehydrate uses index meta only**. Logs: `bq n=` + `disk=` + `soft=n/stop`. |
 | **Body densify height horizon** | `CONTIG_DENSIFY_AHEAD` (64 k past tip) | Safety max walk/receive; primary stop is **soft time-depth**. Gaps inside on-disk max height always densify even under pressure. |
 | **Confirm feed** | readiness (height/hash), no wire retain | Plan **packs** tip-contiguous runs by decoding BQ wire one height at a time until soft **input** budget (`RBITCOIN_CONFIRM_BATCH_INPUTS`, default **8000**, overshoot block included) or hard **144** blocks; requeue / finish on outcome |
 
-## Soft budgets / fallback archive job (not the primary Class A path)
+## Soft budgets (unified body-queue path)
 
-Unknown-height bodies and abort/charge release still use an archive-job
-pipeline + ContigPark. On the **unified** path, peers do **not** dual-append
-Class A far ahead of tip — confirm commit is the sole Class A appender.
+Peers write **raw** framed block payloads into the durable body queue (no peer
+full-block decode). Confirm pack is the sole wire decode. Confirm commit is the
+sole Class A appender (no dual-track archive-job pipeline).
 
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
-| **Archive queue budget** | default 512 MiB (`RBITCOIN_ARCHIVE_QUEUE_MB`) | Soft-charge **RAM overflow / arch jobs only** (not multi‑GiB disk body queue). `charge` on overflow/job; **`release` only via** `apply_archive_result` on `ArchiveResult::{Ok,Err,Dropped}` (or immediate release if pipeline send fails because the channel is **closed**) |
-| **ContigPark** | horizon `CONTIG_DENSIFY_AHEAD` | Fallback contiguous park → prep/writer; abort via `drain_all` + Err; skip already-Class-A via `force_advance` + **Dropped** |
-| **`BodyPresence.archive_charged`** | one bit per charged fallback body | **Only** `clear_archive_charged` on pipeline result — **never** hygiene-prune |
+| **Archive queue budget** | default 512 MiB (`RBITCOIN_ARCHIVE_QUEUE_MB`) | Soft meter still used for densify far-scale hysteresis; no job dual-track charges on the primary path |
+| **`BodyPresence.archive_charged`** | residual bits for reject/release helpers | Clear on confirm reject paths when charged |
 | **CreateResidency (sole pin map)** | **Default lean:** 256k creates / 1M outs (`NO_CACHE_*`). Override with `RBITCOIN_CREATE_RESIDENCY_CAP` / `_OUT_CAP` (legacy `RBITCOIN_CONFIRM_OUT_FIFO`). **`RBITCOIN_CONFIRM_CACHE=1`** restores multi‑GiB 8M/16M caps + denserels prewarm | **Insert-order FIFO** only (no read-LRU). Lean default keeps **in-flight** res_seed/pin; cold denserels use OS page cache. Late denserels_hit% may be low while tip rate holds — do not chase hit% with multi‑GiB caps |
 | **ConfirmParentCache header plans** | tip-GC window | Always on — required for multi-block wire MTP; not controlled by `CONFIRM_CACHE` |
 | **Confirm plans / headers** | offer-ahead window | `ConfirmParentCache::advance_tip` from write `post_commit` |

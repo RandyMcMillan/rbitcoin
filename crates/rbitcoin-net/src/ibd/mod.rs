@@ -7,15 +7,14 @@
 //!   **commit** as sole Class A appender + Class C tip; dequeue body queue after tip
 //! - **Densify getdata** fills missing heights tip-first while body-queue bytes have
 //!   room (`window` = in-flight cap, not tip-distance); tip-batch multi-peer race
-//! - Optional archive-job + ContigPark remains only for **unknown-height / abort**
-//!   fallback — not a primary “Class A far ahead of tip” dual track
+//! - Peer frames land **raw** in the body queue (no peer full-block decode);
+//!   confirm pack is the sole decode site for wire
 //! - Stall: 30s with no block-download progress on a peer → disconnect + cooldown
 
 mod archive;
 mod assign;
 mod assign_plan;
 mod body;
-mod coalesce;
 mod confirm;
 mod dial;
 mod events;
@@ -28,8 +27,7 @@ mod state;
 mod status;
 
 use archive::{
-    rehydrate_block_queue_into_confirm, spawn_archive_pipeline, ArchiveJob, ArchivePipelineStats,
-    ArchiveQueueBudget, ArchiveResult,
+    rehydrate_block_queue_into_confirm, ArchivePipelineStats, ArchiveQueueBudget,
 };
 use assign_plan::{remove_from_ordered, want_headers_beyond_soft_cap};
 // compact_ordered used via IbdWorkState::hygiene
@@ -51,7 +49,7 @@ use progress::{
 use state::IbdWorkState;
 use assign::{archive_pipeline_saturated, assign_work_ordered, AssignDepth};
 use events::{
-    apply_archive_result, apply_confirm_reject, apply_peer_event, disconnect_all_peers,
+    apply_confirm_reject, apply_peer_event, disconnect_all_peers,
     drain_ready_peer_and_archive_events, update_confirm_lag,
 };
 use path::{seed_work_path_from_store, work_path_tips};
@@ -63,7 +61,7 @@ use crate::error::NetError;
 use bitcoin::p2p::Magic;
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -93,8 +91,6 @@ pub(crate) const ORDERED_HEADERS_SOFT_CAP: usize = 64_000;
 /// concurrency scales with peer count (`peers × 16`), not by piling work on few hosts.
 pub const DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 
-/// Near band: tip+1 ..= tip+N (parent cache + bulk near assign).
-pub(crate) const NEAR_DEPTH: u32 = 4096;
 /// Max contiguous tip+1.. holes to cover per assign.
 pub(crate) const TIP_HOLE_MAX: usize = 32;
 /// Max concurrent getdata peers for one tip-hole hash.
@@ -374,10 +370,7 @@ pub async fn ibd_cancellable(
     if store_class_a_bodies > 0 {
         info!("ibd: store has {store_class_a_bodies} Class A bodies (seed)");
     }
-    let (arch_job_tx, arch_job_rx) = mpsc::unbounded_channel::<ArchiveJob>();
-    let (arch_res_tx, mut arch_res_rx) = mpsc::unbounded_channel::<ArchiveResult>();
-    let archive_stop = Arc::new(AtomicBool::new(false));
-    // Contiguous Class A writer starts just past the resume archive HWM (or 0).
+    // Contiguous densify horizon / receive refuse reference (tip+1 or resume).
     let archive_write_next = Arc::new(AtomicU32::new(if hub.tip_height().is_some() {
         st.max_ready_height.saturating_add(1)
     } else {
@@ -443,25 +436,11 @@ pub async fn ibd_cancellable(
             warn!("ibd: block_queue rehydrate failed (continuing; may re-getdata): {e}");
         }
     }
-    // Fallback archive-job pipeline (unknown-height only; not primary Class A path).
-    let mut pipeline = spawn_archive_pipeline(
-        hub.clone(),
-        arch_job_rx,
-        arch_res_tx,
-        Arc::clone(&pipe_stats),
-        Arc::clone(&archive_queued),
-        Arc::clone(&confirm_lag),
-        Arc::clone(&archive_write_next),
-        Arc::clone(&archive_stop),
-    );
-
-    // Direct IBD: SH runs merge-only (no progressive head mat worker; bulk at tip).
-
     // Fresh cancel state for this IBD session (may have been set on prior stop).
     hub.query.clear_confirm_cancel();
 
     info!(
-        "ibd: confirm pipeline prep+scripts+commit (wire intake; single Class A commit)"
+        "ibd: confirm pipeline prep+scripts+commit (raw BQ wire; single Class A commit)"
     );
     // Unbounded: SyncSender(512) deadlocked the confirm OS thread when the main
     // loop lagged on header drain (send blocks → tip frozen, hole=0, confirm_blks=0).
@@ -535,15 +514,12 @@ pub async fn ibd_cancellable(
             }
         }
 
-        // Drain all ready peer/archive events **before** stall checks.
+        // Drain all ready peer events **before** stall checks.
         if !drain_ready_peer_and_archive_events(
             &mut st,
             hub.as_ref(),
             &mut body_rx,
             &mut ctrl_rx,
-            &mut arch_res_rx,
-            &arch_job_tx,
-            &archive_queued,
             &archive_write_next,
             &loop_stats,
             peer_sess.book_mut(),
@@ -654,9 +630,6 @@ pub async fn ibd_cancellable(
             hub.as_ref(),
             &mut body_rx,
             &mut ctrl_rx,
-            &mut arch_res_rx,
-            &arch_job_tx,
-            &archive_queued,
             &archive_write_next,
             &loop_stats,
             peer_sess.book_mut(),
@@ -1169,8 +1142,6 @@ pub async fn ibd_cancellable(
                     &mut st,
                     hub.as_ref(),
                     ev,
-                    &arch_job_tx,
-                    &archive_queued,
                     &archive_write_next,
                     peer_sess.book_mut(),
                     local_addr,
@@ -1187,26 +1158,11 @@ pub async fn ibd_cancellable(
                     &mut st,
                     hub.as_ref(),
                     ev,
-                    &arch_job_tx,
-                    &archive_queued,
                     &archive_write_next,
                     peer_sess.book_mut(),
                     local_addr,
                     Some(confirm_feed.as_ref()),
                 );
-            }
-            arch = arch_res_rx.recv() => {
-                if cancelled() {
-                    warn!("ibd: cancel requested — stopping IBD");
-                    break;
-                }
-                let Some(r) = arch else {
-                    if !cancelled() {
-                        warn!("ibd: archive pipeline ended");
-                    }
-                    break;
-                };
-                apply_archive_result(&mut st, r, &archive_queued, &loop_stats);
             }
             _ = &mut tick => {
                 if cancelled() {
@@ -1306,10 +1262,6 @@ pub async fn ibd_cancellable(
     //    rejects minutes after "clean exit").
     confirm_feed.request_stop();
     hub.query.request_confirm_cancel();
-    archive_stop.store(true, Ordering::Relaxed);
-
-    // 3) Stop feeding the archive queue; prep/writer exit on stop + closed channels.
-    drop(arch_job_tx);
 
     // Confirm join: wait until the OS thread exits. Cancel makes waits abort in
     // milliseconds; a mid-wave script check may still take a bit — better that
@@ -1341,60 +1293,6 @@ pub async fn ibd_cancellable(
                     t_teardown.elapsed()
                 );
             }
-        }
-    }
-
-    // Archive pipeline: stop is set so prep/writer finish the current commit
-    // (if any) and abandon the rest. Do **not** abort the join early — that
-    // leaked OS threads and hung the process for ~1min after "clean exit".
-    // Log every 2s while waiting for an in-flight Class A put to complete.
-    {
-        let mut waited_s = 0u64;
-        loop {
-            match tokio::time::timeout(Duration::from_secs(2), &mut pipeline).await {
-                Ok(Ok(())) => {
-                    info!(
-                        "ibd: archive pipeline stopped cleanly ({:?})",
-                        t_teardown.elapsed()
-                    );
-                    break;
-                }
-                Ok(Err(e)) => {
-                    warn!("ibd: archive pipeline join: {e}");
-                    break;
-                }
-                Err(_) => {
-                    waited_s = waited_s.saturating_add(2);
-                    if waited_s <= 30 || waited_s % 10 == 0 {
-                        warn!(
-                            "ibd: waiting for archive pipeline ({waited_s}s, total {:?}) — \
-                             finishing in-flight Class A commit if any…",
-                            t_teardown.elapsed()
-                        );
-                    }
-                    // Safety valve: after a very long commit, abort the tokio task
-                    // (OS threads should already have seen stop; join is inside the task).
-                    if waited_s >= 90 {
-                        warn!(
-                            "ibd: archive pipeline still running after {waited_s}s — aborting task"
-                        );
-                        pipeline.abort();
-                        let _ = tokio::time::timeout(Duration::from_secs(2), pipeline).await;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    while let Ok(r) = arch_res_rx.try_recv() {
-        match r {
-            ArchiveResult::Ok { hash, .. } => st.body.mark_archived(hash),
-            ArchiveResult::Dropped { hash, requeue, .. } => {
-                if requeue {
-                    st.body.mark_missing(hash);
-                }
-            }
-            ArchiveResult::Err { hash, .. } => st.body.mark_missing(hash),
         }
     }
 

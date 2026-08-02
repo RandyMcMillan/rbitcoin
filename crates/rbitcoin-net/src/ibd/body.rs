@@ -75,6 +75,7 @@ impl BodyPresence {
     }
 
     /// Record charge with wire byte size for later release.
+    #[cfg(test)]
     pub(crate) fn mark_archive_charged_bytes(&mut self, h: BlockHash, wire_bytes: usize) {
         if self.rejected.contains(&h) {
             return;

@@ -137,7 +137,8 @@ fn default_write() -> WriteIoBackend {
     }
 }
 
-fn resolve_read(path_env: &str) -> ReadIoBackend {
+/// Resolve read backend for a path-specific env (then global, then default).
+pub(crate) fn resolve_read(path_env: &str) -> ReadIoBackend {
     let selected = std::env::var(path_env)
         .ok()
         .and_then(|s| parse_read_token(&s))
@@ -146,7 +147,8 @@ fn resolve_read(path_env: &str) -> ReadIoBackend {
     effective_read(selected)
 }
 
-fn resolve_write(path_env: &str) -> WriteIoBackend {
+/// Resolve write backend for a path-specific env (then global, then default).
+pub(crate) fn resolve_write(path_env: &str) -> WriteIoBackend {
     let selected = std::env::var(path_env)
         .ok()
         .and_then(|s| parse_write_token(&s))
@@ -210,17 +212,6 @@ pub fn class_a_append_uses_pwrite() -> bool {
 }
 
 #[cfg(test)]
-pub fn resolve_read_for_test(path_env: &str) -> ReadIoBackend {
-    resolve_read(path_env)
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-pub fn resolve_write_for_test(path_env: &str) -> WriteIoBackend {
-    resolve_write(path_env)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
@@ -259,7 +250,7 @@ mod tests {
         std::env::set_var("RBITCOIN_IO", "uring");
         std::env::set_var("RBITCOIN_PIN_IO", "pread");
         assert_eq!(
-            resolve_read_for_test("RBITCOIN_PIN_IO"),
+            resolve_read("RBITCOIN_PIN_IO"),
             ReadIoBackend::Pread
         );
         clear_io_envs();

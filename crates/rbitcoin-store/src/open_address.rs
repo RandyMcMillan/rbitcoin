@@ -32,14 +32,6 @@ pub fn primary_slot(key: &[u8; 16], slots: u64) -> u64 {
     fnv1a_64(key) & (slots - 1)
 }
 
-/// Primary slot for a 32-byte key (FNV-1a; tests / open-address helpers).
-#[inline]
-#[cfg(test)]
-pub fn primary_slot_32(key: &[u8; 32], slots: usize) -> usize {
-    debug_assert!(slots.is_power_of_two() && slots >= 2);
-    (fnv1a_64(key) as usize) & (slots - 1)
-}
-
 /// Process-wide: at most one open-address rehash at a time (IBD materialize must
 /// not stack multi-shard resizes into one host freeze). Shared by tx/header
 /// heads and scripthash heads.
@@ -61,8 +53,8 @@ mod tests {
     }
 
     #[test]
-    fn fnv1a_and_primary_slot_32_match_stream() {
-        // Same FNV stream as other 32-byte open-address helpers.
+    fn fnv1a_32_matches_stream_and_primary_mask() {
+        // Same FNV stream as 32-byte open-address helpers (mask = primary slot).
         let k = [9u8; 32];
         let slots = 64usize;
         let mut h = FNV_OFFSET;
@@ -71,8 +63,9 @@ mod tests {
             h = h.wrapping_mul(FNV_PRIME);
         }
         assert_eq!(fnv1a_64(&k), h);
-        assert_eq!(primary_slot_32(&k, slots), (h as usize) & (slots - 1));
-        assert_eq!(primary_slot_32(&k, slots), primary_slot_32(&k, slots));
+        let slot = (fnv1a_64(&k) as usize) & (slots - 1);
+        assert_eq!(slot, (h as usize) & (slots - 1));
+        assert!(slot < slots);
     }
 
     #[test]

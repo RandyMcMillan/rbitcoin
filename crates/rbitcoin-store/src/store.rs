@@ -135,6 +135,11 @@ impl Store {
         self.headers.count()
     }
 
+    /// Occupied slots in the header hash head (load / sizes observer).
+    pub fn header_head_occupied(&self) -> u64 {
+        self.headers.head_occupied()
+    }
+
     /// Headers that currently have a Class A body association.
     pub fn archived_block_count(&self) -> Result<u64, StoreError> {
         self.header_txs.count_bodies()

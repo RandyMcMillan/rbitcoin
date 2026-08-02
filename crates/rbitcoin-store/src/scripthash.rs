@@ -165,7 +165,8 @@ impl ScriptHashTable {
     /// Test-only: set alloc `live_count = 0` without clearing head slots.
     ///
     /// Models crash mid-finish after deferred heads landed but before the
-    /// alloc header was updated (entry_count==0, head non-empty).
+    /// alloc header was updated (entry_count==0, head non-empty). Process-local
+    /// fault inject — no production caller; kept for reinit recovery regression.
     #[cfg(test)]
     pub fn test_zero_live_count_keep_head(&self) -> Result<(), StoreError> {
         let mut alloc = self.alloc.lock().unwrap();

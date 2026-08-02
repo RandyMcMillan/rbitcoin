@@ -58,6 +58,8 @@ static LOOKUP_SEALED_PROBE: AtomicU64 = AtomicU64::new(0);
 static ROLLS: AtomicU64 = AtomicU64::new(0);
 static SEALS: AtomicU64 = AtomicU64::new(0);
 
+/// Test-only soft-span override (bytes). Non-zero wins over env so parallel
+/// `RBITCOIN_TX_IDX_SOFT_SPAN` mutators in other modules cannot desync this path.
 #[cfg(test)]
 static TEST_SOFT_SPAN_OVERRIDE: AtomicU64 = AtomicU64::new(0);
 
@@ -279,7 +281,9 @@ impl SegmentedTxHead {
 
     /// Body soft-span roll threshold (bytes). Same default as `tx.idx`.
     ///
-    /// Under test, [`test_set_soft_span_bytes`] overrides env when non-zero.
+    /// Production: env `RBITCOIN_TX_IDX_SOFT_SPAN` (min 8). Under test,
+    /// [`test_set_soft_span_bytes`] overrides env when non-zero so parallel
+    /// modules that also poke the env cannot race this path.
     pub fn soft_span_bytes() -> u64 {
         #[cfg(test)]
         {
@@ -295,7 +299,8 @@ impl SegmentedTxHead {
             .unwrap_or(DEFAULT_SOFT_SPAN)
     }
 
-    /// Test-only soft-span override (`0` = use env/default).
+    /// Test-only soft-span override (`0` = use env/default). Process-local;
+    /// preferred over env for concurrent store unit tests.
     #[cfg(test)]
     pub fn test_set_soft_span_bytes(bytes: u64) {
         TEST_SOFT_SPAN_OVERRIDE.store(bytes, Ordering::Relaxed);

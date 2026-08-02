@@ -416,8 +416,7 @@ impl HashHead {
         Ok(Vec::new())
     }
 
-    /// Number of occupied hash slots (unit tests only).
-    #[cfg(test)]
+    /// Number of occupied hash slots (open-address load observer).
     pub fn occupied(&self) -> u64 {
         self.state.lock().unwrap().occupied
     }
@@ -465,8 +464,7 @@ impl HashHead {
     }
 
 
-    /// Single-key insert (unit tests; production uses [`Self::insert_many`]).
-    #[cfg(test)]
+    /// Single-key insert (convenience; batch path is [`Self::insert_many`]).
     pub fn insert(&self, key: &[u8; 32], fk: Fk) -> Result<Option<Fk>, StoreError> {
         debug_assert!(!fk.is_null());
         let mut prev = None;

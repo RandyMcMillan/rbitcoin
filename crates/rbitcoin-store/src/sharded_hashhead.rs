@@ -180,10 +180,21 @@ impl ShardedHashHead {
     }
 
     pub fn insert(&self, key: &[u8; 32], fk: Fk) -> Result<Option<Fk>, StoreError> {
+        // Single-shard path uses HashHead::insert (prev + insert_many_with).
+        // Multi-shard: get + insert_many keeps shard batching correct.
+        if self.shards.len() == 1 {
+            return self.shards[0].insert(key, fk);
+        }
         debug_assert!(!fk.is_null());
         let prev = self.get(key)?;
         self.insert_many(&[(*key, fk)])?;
         Ok(prev)
+    }
+
+    /// Sum of occupied slots across shards (load observer / sizes).
+    #[inline]
+    pub fn occupied(&self) -> u64 {
+        self.shards.iter().map(|s| s.occupied()).sum()
     }
 
     pub fn insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {

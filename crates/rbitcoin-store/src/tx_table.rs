@@ -200,34 +200,6 @@ fn encode_output_run_secret(
     }
 }
 
-#[cfg(test)]
-fn decode_output_run(buf: &[u8], count: u32) -> Result<Vec<OutputRecord>, StoreError> {
-    let (out, used) = decode_output_run_prefix(buf, count)?;
-    if used != buf.len() {
-        return Err(StoreError::Corrupt("output run trailing bytes"));
-    }
-    Ok(out)
-}
-
-/// Decode `count` outputs; returns records + bytes consumed (allows trailing data).
-///
-/// Production decode records denserels in [`decode_packed_tx_with_spender_rels`];
-/// this helper remains for unit tests of the output run format.
-#[cfg(test)]
-pub fn decode_output_run_prefix(
-    buf: &[u8],
-    count: u32,
-) -> Result<(Vec<OutputRecord>, usize), StoreError> {
-    let mut out = Vec::with_capacity(count as usize);
-    let mut off = 0;
-    for _ in 0..count {
-        let (rec, used) = OutputRecord::decode_at(&buf[off..])?;
-        off += used;
-        out.push(rec);
-    }
-    Ok((out, off))
-}
-
 /// Class A input + BIP141 witness (schema v10).
 ///
 /// On-disk prevout:
@@ -613,15 +585,6 @@ fn xor_script_region_in_output(
         return;
     }
     secret.xor_bytes(0, &mut buf[off..off + slen]);
-}
-
-#[cfg(test)]
-fn decode_input_run(buf: &[u8], count: u32) -> Result<Vec<InputRecord>, StoreError> {
-    let (out, used) = decode_input_run_prefix(buf, count)?;
-    if used != buf.len() {
-        return Err(StoreError::Corrupt("input run trailing bytes"));
-    }
-    Ok(out)
 }
 
 /// Decode `count` inputs; returns records + bytes consumed (allows trailing data).
@@ -2617,6 +2580,37 @@ mod tests {
         f()
     }
 
+    /// Offline output-run decode (production uses packed denserels path).
+    fn decode_output_run_prefix(
+        buf: &[u8],
+        count: u32,
+    ) -> Result<(Vec<OutputRecord>, usize), StoreError> {
+        let mut out = Vec::with_capacity(count as usize);
+        let mut off = 0;
+        for _ in 0..count {
+            let (rec, used) = OutputRecord::decode_at(&buf[off..])?;
+            off += used;
+            out.push(rec);
+        }
+        Ok((out, off))
+    }
+
+    fn decode_output_run(buf: &[u8], count: u32) -> Result<Vec<OutputRecord>, StoreError> {
+        let (out, used) = decode_output_run_prefix(buf, count)?;
+        if used != buf.len() {
+            return Err(StoreError::Corrupt("output run trailing bytes"));
+        }
+        Ok(out)
+    }
+
+    fn decode_input_run(buf: &[u8], count: u32) -> Result<Vec<InputRecord>, StoreError> {
+        let (out, used) = decode_input_run_prefix(buf, count)?;
+        if used != buf.len() {
+            return Err(StoreError::Corrupt("input run trailing bytes"));
+        }
+        Ok(out)
+    }
+
     #[test]
     fn decode_prevout_at_skips_script_and_witness() {
         let rec = InputRecord {
@@ -4355,7 +4349,7 @@ mod tests {
     #[test]
     fn reopen_mid_segment_then_seal_no_fuse_fn() {
         with_env_lock(|| {
-            // Only load@80% rolls — clear soft-span override from sibling tests.
+            // Only load@80% rolls — clear soft-span override/env from sibling tests.
             SegmentedTxHead::test_set_soft_span_bytes(0);
             std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
             let dir = tempfile_dir("reopen-seal-fn");
@@ -4455,7 +4449,8 @@ mod tests {
                 let outputs = vec![OutputRecord::unspent(1, vec![0x51; 32])];
                 (tx, inputs, outputs)
             };
-            // ~2 fat creates per soft window (test override, not env).
+            // ~2 fat creates per soft window (process-local override — env races
+            // with other store modules that also set RBITCOIN_TX_IDX_SOFT_SPAN).
             SegmentedTxHead::test_set_soft_span_bytes(800);
             for i in 1..=6u64 {
                 t.put_full_batch_indexed(&[mk(i)], true).unwrap();

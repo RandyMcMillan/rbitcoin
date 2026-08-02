@@ -1396,7 +1396,10 @@ pub const NOFILE_SOFT_TARGET: u64 = 16_384;
 
 /// Process-wide lock for multi-thread mmap stress tests (grow / concurrent
 /// readers / online head resize). Tests still run their own workers; this only
-/// prevents *cross-test* overlap that has shown intermittent heap corruption.
+/// Serializes mmap stress tests across the crate (process-wide).
+///
+/// Isolation only — not a production API. Prevents cross-test heap corruption
+/// from concurrent MAP_SHARED stress.
 #[cfg(test)]
 pub(crate) static TEST_MMAP_STRESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

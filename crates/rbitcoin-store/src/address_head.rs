@@ -489,15 +489,6 @@ pub fn load_needs_resize(tx_count: u64, slots: u64) -> bool {
     load_needs_roll(tx_count, slots)
 }
 
-#[inline]
-#[cfg(test)]
-pub fn load_ratio(tx_count: u64, slots: u64) -> f64 {
-    if slots == 0 {
-        return 0.0;
-    }
-    tx_count as f64 / slots as f64
-}
-
 /// Legacy sidecar path (`tx.head.meta`) — only for best-effort cleanup of old datadirs.
 fn meta_path(head_path: &Path) -> PathBuf {
     let mut p = head_path.as_os_str().to_os_string();
@@ -1480,7 +1471,14 @@ mod tests {
         // probe_index bits ≤ PAGE_SLOT_BITS branch
         let _ = probe_index(&txid, 0, MIN_BITS);
         let _ = probe_index(&txid, 3, PAGE_SLOT_BITS);
-        // load_ratio zero slots
+        // load ratio helper (local; roll uses load_needs_roll thresholds)
+        let load_ratio = |tx_count: u64, slots: u64| -> f64 {
+            if slots == 0 {
+                0.0
+            } else {
+                tx_count as f64 / slots as f64
+            }
+        };
         assert_eq!(load_ratio(10, 0), 0.0);
         assert!(!load_needs_resize(0, 100));
         // bits_for_scale env out of range falls back

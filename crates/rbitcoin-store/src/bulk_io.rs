@@ -263,8 +263,9 @@ fn pread_batch_uring(ops: &mut [ReadOp<'_>]) -> bool {
     }
 }
 
-// Test-only: force `pread_batch_uring` to take the mid-wave `Some(false)` path
-// so we prove that does not permanently disable process-wide io_uring.
+// Test-only fault inject: force mid-wave `Some(false)` from `pread_batch_uring`
+// so we prove that path does not permanently disable process-wide io_uring.
+// Kept: no production API can inject a partial-session failure without this.
 #[cfg(all(test, target_os = "linux"))]
 thread_local! {
     static TEST_FORCE_SESSION_FALSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

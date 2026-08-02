@@ -5,6 +5,8 @@
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
+#[cfg(test)]
+use crate::file::TableAccess;
 use crate::hashhead::{initial_slots_for, HeadRole, HeadScale};
 use crate::scripthash_layout::{
     head_key_from_full, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN, SH_HEAD_SLOT_SIZE,
@@ -130,15 +132,14 @@ impl ScriptHashHead {
 
     /// Zero all slots and reset occupied (cold rematerialize after partial load).
     ///
-    /// Writes zeros through the mmap path (not punch-hole alone) so the map
-    /// view matches `occupied = 0`. Punch-hole can leave stale mmap pages.
+    /// Chunked `write_at` so both MapFull and FdOnly payload views match
+    /// `occupied = 0` (not punch-hole alone).
     pub fn reinit_empty(&self) -> Result<(), StoreError> {
         let slots = {
             let state = self.state.lock().unwrap();
             state.slots
         };
         let body_bytes = SH_HEAD_SLOT_SIZE as u64 * slots;
-        // Chunked write_at so the active mmap is cleared, not only the file.
         let zero = vec![0u8; (1024 * 1024).min(body_bytes as usize).max(SH_HEAD_SLOT_SIZE)];
         let mut off = 0u64;
         while off < body_bytes {
@@ -151,12 +152,21 @@ impl ScriptHashHead {
         Ok(())
     }
 
+    /// Payload transport for this head file (unit tests).
+    #[cfg(test)]
+    #[inline]
+    fn table_access(&self) -> TableAccess {
+        self.file.access()
+    }
+
     pub fn get(&self, full: &[u8; 32]) -> Result<Option<ShHeadValue>, StoreError> {
         let key = Self::to_key(full);
         let slots = self.state.lock().unwrap().slots;
+        // 4 KiB chunk probe (128 × 32 B) — one pread per chunk under FdOnly.
+        let mut cache = SlotPageCache::new(self, slots);
         let mut slot = Self::hash_slot(&key, slots);
         for _ in 0..slots {
-            let (k, v) = self.read_slot(slot)?;
+            let (k, v) = cache.read_slot(slot)?;
             if is_empty_slot(&k, &v) {
                 return Ok(None);
             }
@@ -172,15 +182,6 @@ impl ScriptHashHead {
         Ok(None)
     }
 
-    fn read_slot(&self, slot: u64) -> Result<(ShHeadKey, [u8; SH_HEAD_VALUE_LEN]), StoreError> {
-        let mut buf = [0u8; SH_HEAD_SLOT_SIZE];
-        self.file.read_at(Self::slot_file_off(slot), &mut buf)?;
-        let k: ShHeadKey = buf[0..SH_HEAD_KEY_LEN].try_into().unwrap();
-        let v: [u8; SH_HEAD_VALUE_LEN] =
-            buf[SH_HEAD_KEY_LEN..SH_HEAD_SLOT_SIZE].try_into().unwrap();
-        Ok((k, v))
-    }
-
     pub fn insert(&self, full: &[u8; 32], value: &ShHeadValue) -> Result<(), StoreError> {
         self.insert_many(&[(*full, value.clone())])
     }
@@ -189,16 +190,17 @@ impl ScriptHashHead {
     pub fn clear_key(&self, full: &[u8; 32]) -> Result<bool, StoreError> {
         let key = Self::to_key(full);
         let slots = self.state.lock().unwrap().slots;
+        let mut cache = SlotPageCache::new(self, slots);
         let mut slot = Self::hash_slot(&key, slots);
         for _ in 0..slots {
-            let (k, v) = self.read_slot(slot)?;
+            let (k, v) = cache.read_slot(slot)?;
             if is_empty_slot(&k, &v) {
                 return Ok(false);
             }
             if k == key {
-                let mut buf = [0u8; SH_HEAD_SLOT_SIZE];
-                buf[0..SH_HEAD_KEY_LEN].copy_from_slice(&key);
-                self.file.write_at(Self::slot_file_off(slot), &buf)?;
+                // Keep key, zero value (soft clear) — one chunk write-back.
+                cache.write_slot(slot, &key, &[0u8; SH_HEAD_VALUE_LEN])?;
+                cache.flush()?;
                 return Ok(true);
             }
             slot = (slot + 1) & (slots - 1);
@@ -899,6 +901,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let h = ScriptHashHead::create_with_slots(&path, 64).unwrap();
+        assert_eq!(h.table_access(), TableAccess::FdOnly);
         let mut key = [0u8; 32];
         key[0] = 7;
         let val = ShHeadValue::inline_one(ShEntry::new(Fk(42)));

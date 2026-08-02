@@ -1390,7 +1390,7 @@ impl TxTable {
     ///
     /// Streaming resolve ([`crate::head_resolve_stream`]) with body backend from
     /// `RBITCOIN_HEAD_RESOLVE_IO` / global `RBITCOIN_IO` (`uring` \| `pread`).
-    /// Head probe + idx remain table-map today (see `docs/io-modality.md`).
+    /// Head probe + idx are FdOnly page/chunk IO (see `docs/io-modality.md`).
     /// Fallback on hard stream failure: phase barrier
     /// [`Self::get_fk_by_txid_batch_phased`].
     ///

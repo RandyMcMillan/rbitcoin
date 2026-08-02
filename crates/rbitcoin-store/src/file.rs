@@ -5,11 +5,12 @@
 //!
 //! # Access modes ([`TableAccess`])
 //!
-//! - **[`TableAccess::FdOnly`]** — Class A `tx.body` today: tiny header-only map
-//!   (not grown with payload); `read_at`/`write_at` use pread/pwrite. Capacity via
-//!   fallocate without multi‑GiB remap.
-//! - **[`TableAccess::MapFull`]** — full-file `MmapMut` map epochs; steady-state
-//!   read/write is memcpy through the map. Grow = fallocate + remap + Arc swap.
+//! - **[`TableAccess::FdOnly`]** — large tables (body, idx, heads, SH, spenders):
+//!   tiny header-only map (not grown with payload); `read_at`/`write_at` use
+//!   pread/pwrite. Capacity via fallocate without multi‑GiB remap.
+//! - **[`TableAccess::MapFull`]** — full-file `MmapMut` map epochs (Class C /
+//!   mempool today); steady-state read/write is memcpy through the map. Grow =
+//!   fallocate + remap + Arc swap.
 //!
 //! # Concurrency (brief epoch pin, no long map mutex)
 //!
@@ -51,20 +52,29 @@ pub enum TableAccess {
     /// Full-file `MmapMut` map epochs; `read_at`/`write_at` memcpy through the map.
     MapFull,
     /// Payload via pread/pwrite; map is a tiny header window only (not grown).
-    /// Used for Class A `tx.body` (leading header); more tables migrate here later.
+    /// Default for multi‑GiB tables (body, idx, heads, SH, spenders).
     FdOnly,
 }
 
 impl TableAccess {
     /// Default access for a new/open table of `kind` / trailing layout.
     ///
-    /// Only leading-header [`TableKind::Tx`] (`tx.body`) is FdOnly today.
+    /// **FdOnly** (phase 3/4 demap): leading `tx.body`, all `HashHead` (header /
+    /// SH / address trailing), `ScriptHash` body, `Spender` multi-list, and
+    /// anything else multi‑GiB random or append. **MapFull** remains for small
+    /// Class C arrays (`ArrayLink` header_txs, Confirmed, …) until phase 5 InRam.
+    ///
+    /// `tx.idx` segments force FdOnly at the call site (`ArrayLink` kind is shared
+    /// with Class C). Hash-head multi-list (`.mlt`) also forces FdOnly at the site.
     #[inline]
     pub fn for_kind(kind: TableKind, trailing_header: bool) -> Self {
-        if kind == TableKind::Tx && !trailing_header {
-            Self::FdOnly
-        } else {
-            Self::MapFull
+        match kind {
+            TableKind::Tx if !trailing_header => Self::FdOnly,
+            // Trailing tx tables are unused; trailing HashHead is address-head.
+            TableKind::HashHead => Self::FdOnly,
+            TableKind::ScriptHash => Self::FdOnly,
+            TableKind::Spender => Self::FdOnly,
+            _ => Self::MapFull,
         }
     }
 
@@ -1166,7 +1176,7 @@ mod advise_tests {
     }
 
     #[test]
-    fn table_access_tx_body_fd_only_others_map_full() {
+    fn table_access_defaults_fd_only_for_large_tables() {
         assert_eq!(
             TableAccess::for_kind(TableKind::Tx, false),
             TableAccess::FdOnly
@@ -1177,11 +1187,27 @@ mod advise_tests {
         );
         assert_eq!(
             TableAccess::for_kind(TableKind::HashHead, false),
-            TableAccess::MapFull
+            TableAccess::FdOnly
         );
-        // ArrayLink default is MapFull (header_txs, multi-list); idx overrides.
+        assert_eq!(
+            TableAccess::for_kind(TableKind::HashHead, true),
+            TableAccess::FdOnly
+        );
+        assert_eq!(
+            TableAccess::for_kind(TableKind::ScriptHash, false),
+            TableAccess::FdOnly
+        );
+        assert_eq!(
+            TableAccess::for_kind(TableKind::Spender, false),
+            TableAccess::FdOnly
+        );
+        // ArrayLink default is MapFull (header_txs Class C); idx / .mlt override.
         assert_eq!(
             TableAccess::for_kind(TableKind::ArrayLink, false),
+            TableAccess::MapFull
+        );
+        assert_eq!(
+            TableAccess::for_kind(TableKind::Confirmed, false),
             TableAccess::MapFull
         );
         static N: AtomicU64 = AtomicU64::new(0);
@@ -1194,8 +1220,13 @@ mod advise_tests {
         let path2 = std::env::temp_dir().join(format!("rbitcoin-access-h-{id}"));
         let _ = std::fs::remove_file(&path2);
         let h = TableFile::create_trailing_header(&path2, TableKind::HashHead).unwrap();
-        assert_eq!(h.access(), TableAccess::MapFull);
+        assert_eq!(h.access(), TableAccess::FdOnly);
         let _ = std::fs::remove_file(&path2);
+        let path_sh = std::env::temp_dir().join(format!("rbitcoin-access-sh-{id}"));
+        let _ = std::fs::remove_file(&path_sh);
+        let sh = TableFile::create(&path_sh, TableKind::ScriptHash).unwrap();
+        assert_eq!(sh.access(), TableAccess::FdOnly);
+        let _ = std::fs::remove_file(&path_sh);
         let path3 = std::env::temp_dir().join(format!("rbitcoin-access-idx-{id}"));
         let _ = std::fs::remove_file(&path3);
         let idx = TableFile::create_with_access(

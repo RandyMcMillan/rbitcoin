@@ -134,7 +134,7 @@ impl ScriptHashTable {
     ///
     /// Used when runs/`*.run.mat` still hold the complete create set after a
     /// partial/crashed bulk load. Does not delete files — resets in place so
-    /// open mmaps stay valid. Exclusive: no concurrent SH readers/writers.
+    /// open table handles stay valid. Exclusive: no concurrent SH readers/writers.
     ///
     /// Must run whenever claims are about to cold-load, not only when
     /// `entry_count > 0`: crash mid-finish can leave head shards occupied while

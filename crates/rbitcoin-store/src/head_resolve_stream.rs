@@ -1,4 +1,4 @@
-//! Streaming archive head-resolve: table-map head probe + FdOnly idx + body
+//! Streaming archive head-resolve: FdOnly head probe + FdOnly idx + body
 //! prefix verify via uring/pread (`RBITCOIN_HEAD_RESOLVE_IO`).
 //!
 //! See `docs/io-modality.md`.
@@ -47,7 +47,7 @@ struct KeyWork {
     pending_rank: u32,
 }
 
-/// Resolve many txids via table-map head + FdOnly idx + body prefix (backend from env).
+/// Resolve many txids via FdOnly head probe + FdOnly idx + body prefix (backend from env).
 pub fn resolve_batch_streaming(
     table: &TxTable,
     txids: &[[u8; 32]],

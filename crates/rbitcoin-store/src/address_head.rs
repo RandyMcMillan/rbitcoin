@@ -44,21 +44,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Table transport for address-head files (`tx.head` segments).
 ///
-/// - default / unset / `map` → [`TableAccess::MapFull`] (production until phase 3)
-/// - `fd` / `fdonly` → [`TableAccess::FdOnly`] (host A/B; page-coalesce insert uses pread/pwrite)
+/// - default / unset / `fd` / `fdonly` / `pread` → [`TableAccess::FdOnly`]
+///   (page-coalesced pread → mutate → one page pwrite)
+/// - `map` / `mmap` / `mapfull` → [`TableAccess::MapFull`] (rollback opt-out)
 ///
-/// Env: **`RBITCOIN_TX_HEAD_ACCESS`**. Temporary dual until host signs off FdOnly.
+/// Env: **`RBITCOIN_TX_HEAD_ACCESS`**.
 pub fn head_table_access_from_env() -> TableAccess {
     match std::env::var("RBITCOIN_TX_HEAD_ACCESS") {
         Ok(s) => {
             let t = s.trim().to_ascii_lowercase();
-            if t == "fd" || t == "fdonly" || t == "pread" {
-                TableAccess::FdOnly
-            } else {
+            if t == "map" || t == "mmap" || t == "mapfull" {
                 TableAccess::MapFull
+            } else {
+                // Unset-style tokens and any other value stay FdOnly (production).
+                TableAccess::FdOnly
             }
         }
-        Err(_) => TableAccess::MapFull,
+        Err(_) => TableAccess::FdOnly,
     }
 }
 
@@ -580,7 +582,7 @@ impl AddressHead {
     ) -> Result<Self, StoreError> {
         // Trailing footer: slots at offset 0 so each 4 KiB probe page is OS-aligned.
         // Layout (bits/entry/generation) lives in the footer extension — no sidecar.
-        // Access: MapFull default; `RBITCOIN_TX_HEAD_ACCESS=fd` for host A/B FdOnly.
+        // Access: FdOnly default; `RBITCOIN_TX_HEAD_ACCESS=map` for MapFull rollback.
         Self::create_with_table_access(path, layout, head_table_access_from_env())
     }
 
@@ -598,8 +600,8 @@ impl AddressHead {
             ));
         }
         let slots = layout.slots();
-        // Prefer default trailing APIs when access matches for_kind (keeps them on
-        // the production path); override only for A/B FdOnly.
+        // Prefer default trailing APIs when access matches for_kind (production
+        // path); override only for MapFull rollback A/B.
         let mut file = if access == TableAccess::for_kind(TableKind::HashHead, true) {
             TableFile::create_trailing_header(&path, TableKind::HashHead)?
         } else {
@@ -725,13 +727,22 @@ impl AddressHead {
     /// Read one open-address entry (0 = empty).
     ///
     /// Hot path uses [`Self::load_page_slots`] (one page `read_at`). This remains
-    /// for tests and rare single-slot diagnostics.
+    /// for tests and rare single-slot diagnostics. Uses `read_at` so FdOnly
+    /// works past the tiny header map window.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn read_entry(&self, slot: u64) -> Result<u64, StoreError> {
         let off = self.entry_off(slot);
         match self.layout.entry_bytes {
-            4 => Ok(u64::from(self.file.load_u32_le(off)?)),
-            8 => self.file.load_u64_le(off),
+            4 => {
+                let mut buf = [0u8; 4];
+                self.file.read_at(off, &mut buf)?;
+                Ok(u64::from(u32::from_le_bytes(buf)))
+            }
+            8 => {
+                let mut buf = [0u8; 8];
+                self.file.read_at(off, &mut buf)?;
+                Ok(u64::from_le_bytes(buf))
+            }
             _ => Err(StoreError::Corrupt("address head entry_bytes")),
         }
     }

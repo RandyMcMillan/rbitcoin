@@ -9,10 +9,12 @@
 //! packed value sets the high bit and points at a multi-list (`.mlt` sibling file):
 //! `create_fk:u64 | next:u64`.
 //!
-//! **IBD write path:** page-cache insert_many (write-through).
+//! **IBD write path:** chunk-coalesced insert_many (128 slots ≈ 3 KiB RMW) under
+//! [`TableAccess::FdOnly`] by default. Probe walks reuse the same chunk cache so
+//! FdOnly is not one pread per open-address hop.
 
 use crate::error::StoreError;
-use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::file::{TableAccess, TableFile, FILE_HEADER_LEN};
 use rbitcoin_primitives::{Fk, TableKind};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -182,7 +184,10 @@ impl MultiList {
 
     fn create(head_path: &Path) -> Result<Self, StoreError> {
         let path = Self::path_for(head_path);
-        let file = TableFile::create(path, TableKind::ArrayLink)?;
+        // ArrayLink kind is shared with Class C (MapFull default); multi-list is
+        // linear append like idx — always FdOnly.
+        let file =
+            TableFile::create_with_access(path, TableKind::ArrayLink, TableAccess::FdOnly)?;
         Ok(Self {
             file,
             count: Mutex::new(0),
@@ -194,7 +199,8 @@ impl MultiList {
         if !path.exists() {
             return Self::create(head_path);
         }
-        let file = TableFile::open(path, TableKind::ArrayLink)?;
+        let file =
+            TableFile::open_with_access(path, TableKind::ArrayLink, TableAccess::FdOnly)?;
         let body = file.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
         if body % MULTI_REC_LEN as u64 != 0 {
             return Err(StoreError::Corrupt("hash head multi-list size"));
@@ -377,14 +383,6 @@ impl HashHead {
         FILE_HEADER_LEN as u64 + slot * SLOT_SIZE as u64
     }
 
-    fn read_slot(&self, slot: u64) -> Result<(HeadKey, u64), StoreError> {
-        let mut buf = [0u8; SLOT_SIZE];
-        self.file.read_at(Self::slot_file_off(slot), &mut buf)?;
-        let k: HeadKey = buf[0..HEAD_KEY_LEN].try_into().unwrap();
-        let packed = u64::from_le_bytes(buf[HEAD_KEY_LEN..SLOT_SIZE].try_into().unwrap());
-        Ok((k, packed))
-    }
-
     /// All Class A fks for this full 32-byte key's 16-byte prefix (sole or multi).
     ///
     /// Newest-first; callers that need exact identity must verify the body.
@@ -395,9 +393,12 @@ impl HashHead {
 
     fn get_all_prefix(&self, key: &HeadKey) -> Result<Vec<Fk>, StoreError> {
         let slots = self.state.lock().unwrap().slots;
+        // Chunk-coalesced probe (same 128-slot windows as insert) — one pread per
+        // chunk under FdOnly, not one pread per open-address hop.
+        let mut cache = SlotPageCache::new(self, slots);
         let mut slot = Self::hash_slot(key, slots);
         for _ in 0..slots {
-            let (k, packed) = self.read_slot(slot)?;
+            let (k, packed) = cache.read_slot(slot)?;
             if is_empty_slot(&k, packed) {
                 return Ok(Vec::new());
             }
@@ -414,6 +415,13 @@ impl HashHead {
             slot = (slot + 1) & (slots - 1);
         }
         Ok(Vec::new())
+    }
+
+    /// Payload transport for this head file (unit tests).
+    #[cfg(test)]
+    #[inline]
+    fn table_access(&self) -> TableAccess {
+        self.file.access()
     }
 
     /// Number of occupied hash slots (open-address load observer).
@@ -488,7 +496,7 @@ impl HashHead {
         self.insert_many_file(entries, on_prev)
     }
 
-    /// Slot-sorted, page-buffered apply to the mmap table.
+    /// Slot-sorted, chunk-buffered apply (pread → mutate → pwrite dirty chunks).
     ///
     /// When the table is **empty** (first load / run materialize into a cold
     /// shard), builds the open-addressing table in RAM and writes it in one
@@ -913,7 +921,7 @@ impl<'a> SlotPageCache<'a> {
     }
 
     fn flush(&mut self) -> Result<(), StoreError> {
-        // BTreeMap iterates in chunk/slot order → sequential mmap writeback.
+        // BTreeMap iterates in chunk/slot order → sequential writeback (map or pwrite).
         for (_, chunk) in self.chunks.iter_mut() {
             if chunk.dirty {
                 let off = HashHead::slot_file_off(chunk.base_slot);
@@ -969,6 +977,18 @@ enum InsertResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_defaults_to_fd_only() {
+        let path = tmp_path();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(MultiList::path_for(&path));
+        let h = HashHead::create_with_slots(&path, DEFAULT_SLOTS).unwrap();
+        assert_eq!(h.table_access(), TableAccess::FdOnly);
+        drop(h);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(MultiList::path_for(&path));
+    }
 
     fn tmp_path() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(

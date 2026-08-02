@@ -84,19 +84,19 @@ to), still do the static musl install and say the tree was **not** committed.
 
 The workspace is mounted into the agent VM as **9p** (`workspace` on `/home/agent/workspace`, `trans=virtio`). On this mount:
 
-- **Writable shared `mmap` (`MAP_SHARED` + `PROT_WRITE`) fails with `EINVAL`** for store table files that still use [`TableAccess::MapFull`](docs/io-modality.md) (heads, SH body, Class C, …).
-- `pread`/`pwrite` work; Class A **`tx.body`** and **`tx.idx`** are FdOnly (payload not multi‑GiB-mapped).
-- Opening a full store under the workspace path still fails while MapFull tables remain (e.g. `scripthash.body`).
+- **Writable shared `mmap` (`MAP_SHARED` + `PROT_WRITE`) fails with `EINVAL`** for store table files that still use [`TableAccess::MapFull`](docs/io-modality.md) (Class C arrays, mempool; large tables are **FdOnly**).
+- `pread`/`pwrite` work; **`tx.body` / `tx.idx` / `tx.head` / header head / SH / spenders** are FdOnly (payload not multi‑GiB-mapped).
+- Opening a **full** store under the workspace can still fail while any MapFull table remains (e.g. Class C). Prefer `/tmp` fixtures for agent correctness.
 
 **Do not use the user’s live test datadirs in this VM** (e.g. `datadir-signet/`, `datadir-mainnet/`) to open the store, run the node against those paths, or diagnose tip stalls by loading Class A/C tables here. That includes ~27 GiB signet store under `datadir-signet/store/`.
 
-**Perf A/B for demap work** (idx/head) is **operator-host only**, with the musl static binary — never agent-VM timings. See [`docs/io-modality.md`](docs/io-modality.md).
+**Perf A/B for demap work** is **operator-host only**, with the musl static binary — never agent-VM timings. See [`docs/io-modality.md`](docs/io-modality.md).
 
 ### What works instead
 
 - Read **logs** the user leaves in-tree (`signet-ibd.log`, etc.).
 - Inspect store files with **non-mmap** tools (`pread`/Python struct parsing of HWMs, headers) when useful for offline forensics only — not as a substitute for a full node open.
-- Reproduce with **synthetic fixtures** and `rbitcoin-test` scenarios under `/tmp` or other non-9p paths where MapFull open works.
+- Reproduce with **synthetic fixtures** and `rbitcoin-test` scenarios under `/tmp` or other non-9p paths where mmap (for remaining MapFull tables) works.
 - Ask the user to run the node / confirm diagnostics / **host musl benches** on their host (normal local FS).
 
 ### Related symptoms already seen

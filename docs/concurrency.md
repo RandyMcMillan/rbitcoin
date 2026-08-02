@@ -58,7 +58,7 @@ Do not enter Tip until tip ≈ peer height. Tip entry bulk-materializes SH
 
 | Mechanism | What it replaces |
 |-----------|------------------|
-| Capacity **epochs** (`TableFile`) | No long map `Mutex` on read/write; MapFull = new map window + pointer swap; FdOnly (`tx.body`) = fallocate only |
+| Capacity **epochs** (`TableFile`) | No long map `Mutex` on read/write; MapFull = new map window + pointer swap; FdOnly (body/idx/heads/SH/spenders) = fallocate only |
 | Atomic `count` / HWM | Publish barrier (Acquire readers / Release appender) |
 | Role exclusivity | One appender, one annotator — not a global store mutex |
 | `tx.head` insert | **Sole writer**: plain Release store empty→relative + SeqCst fence per batch (no CAS). Role exclusivity — not multi-inserter safe |
@@ -84,11 +84,11 @@ There is **no** global “pause queries during confirm write.” Tip-as-commit +
 
 ## Host freezes / IO storms
 
-Single Class A writer is intentional. Multi‑GiB **MapFull grow/remap** and **hash-head
-rehash** (especially large **header** / scripthash head shards when materializing) can still stall the
-**host** (page cache / disk). See **[ibd-io-audit.md](./ibd-io-audit.md)** and
-**[io-modality.md](./io-modality.md)** for history, demap plan, and operator levers
-(`ionice`, dedicated disk, rehash log lines).
+Single Class A writer is intentional. Multi‑GiB **FdOnly grow** is fallocate-only
+(no remap), but **hash-head rehash** (header / scripthash shards when materializing)
+can still stall the **host** (page cache / disk). Remaining MapFull Class C tables
+are small. See **[ibd-io-audit.md](./ibd-io-audit.md)** and
+**[io-modality.md](./io-modality.md)** for history and operator levers.
 
 ### Confirm prep read pipeline
 

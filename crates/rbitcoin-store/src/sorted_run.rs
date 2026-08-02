@@ -915,10 +915,23 @@ pub fn merge_runs_to_file(
     })
 }
 
+/// Marker file: fan-in reduce finished; outputs under `work_dir` supersede inputs.
+///
+/// Written by the SH tip materialize path after a successful reduce so claimed
+/// `*.run.mat` inputs can be deleted immediately. Crash recovery resumes from
+/// `work_dir` when this marker is present (see [`list_fanin_reduce_outputs`]).
+pub const FANIN_READY_NAME: &str = "READY";
+
 /// Reduce `inputs` to at most `fanin` runs via multi-pass tournament merge.
 ///
-/// Intermediate files go under `work_dir`. Does **not** update MANIFEST; does not
-/// delete original `inputs` (caller deletes after successful materialize).
+/// Intermediate files go under `work_dir`. Does **not** update MANIFEST.
+///
+/// After each chunk is fully merged into a new work file, **work-dir inputs**
+/// for that chunk are deleted immediately (frees disk during multi-pass).
+/// Original `inputs` outside `work_dir` are left for the caller so crash
+/// recovery can re-run reduce until [`FANIN_READY_NAME`] is written and inputs
+/// are removed.
+///
 /// Max open cursors per pass = `fanin` (clamped to ≥1).
 pub fn reduce_runs_to_fanin(
     inputs: &[SortedRunPath],
@@ -933,10 +946,14 @@ pub fn reduce_runs_to_fanin(
         return Ok(inputs.to_vec());
     }
     fs::create_dir_all(work_dir).map_err(|e| io_err(work_dir, e))?;
-    // Clear prior incomplete intermediates.
+    // Clear prior incomplete intermediates (not READY — caller decides resume).
     if let Ok(rd) = fs::read_dir(work_dir) {
         for e in rd.flatten() {
             let p = e.path();
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name == FANIN_READY_NAME {
+                continue;
+            }
             if p.extension().and_then(|x| x.to_str()) == Some("run")
                 || p.extension().and_then(|x| x.to_str()) == Some("tmp")
             {
@@ -949,17 +966,20 @@ pub fn reduce_runs_to_fanin(
     let mut seq = 1u64;
     while level.len() > fanin {
         let mut next = Vec::new();
-        let chunks: Vec<&[SortedRunPath]> = level.chunks(fanin).collect();
+        // Own the chunk lists so we can delete after each successful merge.
+        let chunks: Vec<Vec<SortedRunPath>> = level
+            .chunks(fanin)
+            .map(|c| c.to_vec())
+            .collect();
         for chunk in chunks {
             let out = work_dir.join(format!("g{gen}_{seq:06}.run"));
             seq += 1;
-            let merged = merge_runs_to_file(chunk, &out)?;
+            let merged = merge_runs_to_file(&chunk, &out)?;
             next.push(merged);
-        }
-        // Drop previous generation intermediates (not original inputs).
-        if gen > 0 {
-            for r in &level {
-                if r.path.starts_with(work_dir) {
+            // Chunk fully folded into `out` — free intermediate work files now.
+            // Do not delete originals outside work_dir (crash recovery).
+            for r in &chunk {
+                if r.path.starts_with(work_dir) && r.path != out {
                     let _ = fs::remove_file(&r.path);
                 }
             }
@@ -972,6 +992,79 @@ pub fn reduce_runs_to_fanin(
         );
     }
     Ok(level)
+}
+
+/// List finished fan-in reduce outputs under `work_dir` when [`FANIN_READY_NAME`] is set.
+///
+/// Returns `Ok(None)` if not ready / empty. Used to resume tip materialize after
+/// claimed inputs were deleted post-reduce.
+pub fn list_fanin_reduce_outputs(work_dir: &Path) -> Result<Option<Vec<SortedRunPath>>, StoreError> {
+    let ready = work_dir.join(FANIN_READY_NAME);
+    if !ready.is_file() {
+        return Ok(None);
+    }
+    if !work_dir.is_dir() {
+        return Ok(None);
+    }
+    let mut paths: Vec<PathBuf> = fs::read_dir(work_dir)
+        .map_err(|e| io_err(work_dir, e))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("run"))
+        .collect();
+    paths.sort();
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        out.push(open_run(&p)?);
+    }
+    Ok(Some(out))
+}
+
+/// Mark fan-in reduce complete and delete `inputs` that are fully superseded by
+/// `outputs` under `work_dir` (not the same path as an output).
+///
+/// Call only after [`reduce_runs_to_fanin`] returns outputs all under `work_dir`.
+/// Writes [`FANIN_READY_NAME`] first so crash recovery can resume from outputs
+/// even if some input deletes fail mid-loop.
+pub fn commit_fanin_reduce_and_drop_inputs(
+    work_dir: &Path,
+    inputs: &[SortedRunPath],
+    outputs: &[SortedRunPath],
+) -> Result<(), StoreError> {
+    if outputs.is_empty() {
+        return Ok(());
+    }
+    // Only free originals when outputs live in the work dir (true reduce happened).
+    let all_out_in_work = outputs.iter().all(|o| o.path.starts_with(work_dir));
+    if !all_out_in_work {
+        return Ok(());
+    }
+    fs::create_dir_all(work_dir).map_err(|e| io_err(work_dir, e))?;
+    let ready = work_dir.join(FANIN_READY_NAME);
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&ready)
+            .map_err(|e| io_err(&ready, e))?;
+        f.write_all(b"1\n").map_err(|e| io_err(&ready, e))?;
+        f.sync_all().map_err(|e| io_err(&ready, e))?;
+    }
+    let out_paths: std::collections::HashSet<&Path> =
+        outputs.iter().map(|o| o.path.as_path()).collect();
+    for r in inputs {
+        if out_paths.contains(r.path.as_path()) {
+            continue;
+        }
+        if r.path.exists() {
+            let _ = fs::remove_file(&r.path);
+        }
+    }
+    Ok(())
 }
 
 /// K-way merge of sorted runs → new run at `out_path`. Deletes input files on success.
@@ -1452,6 +1545,56 @@ mod tests {
         assert_eq!(body[132], 4);
         assert!(!p1.exists());
         assert!(!p2.exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Fan-in reduce must free intermediate work files after each merge chunk,
+    /// and `commit_fanin_reduce_and_drop_inputs` must delete original inputs once
+    /// READY is set (regression: claimed .mat piled up to multi‑100 GiB).
+    #[test]
+    fn reduce_fanin_deletes_merged_inputs() {
+        let d = tmp_dir();
+        let work = d.join("merge");
+        let mut inputs = Vec::new();
+        // 8 small runs → with fanin=2 need multi-pass (8→4→2).
+        for i in 1..=8u64 {
+            let p = next_run_path(&d, i);
+            write_sorted_run(&p, 32, 44, &rec(i as u8, i as u8)).unwrap();
+            inputs.push(open_run(&p).unwrap());
+        }
+        let out = reduce_runs_to_fanin(&inputs, &work, 2).unwrap();
+        assert!(out.len() <= 2, "fanin reduce to ≤2 got {}", out.len());
+        // Intermediate gen files under work should not accumulate unbounded;
+        // only final outputs remain as .run.
+        let work_runs: Vec<_> = fs::read_dir(&work)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("run"))
+            .collect();
+        assert_eq!(
+            work_runs.len(),
+            out.len(),
+            "stale intermediate work runs left: {work_runs:?}"
+        );
+        // Originals still present until commit (crash recovery).
+        for r in &inputs {
+            assert!(r.path.exists(), "original should remain until commit");
+        }
+        commit_fanin_reduce_and_drop_inputs(&work, &inputs, &out).unwrap();
+        assert!(work.join(FANIN_READY_NAME).is_file());
+        for r in &inputs {
+            assert!(
+                !r.path.exists(),
+                "original {} should be deleted after commit",
+                r.path.display()
+            );
+        }
+        // Resume listing sees READY outputs.
+        let resumed = list_fanin_reduce_outputs(&work).unwrap().expect("ready");
+        assert_eq!(resumed.len(), out.len());
+        let total: u64 = resumed.iter().map(|r| r.count).sum();
+        assert_eq!(total, 8);
         let _ = fs::remove_dir_all(&d);
     }
 

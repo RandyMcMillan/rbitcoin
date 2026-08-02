@@ -16,8 +16,9 @@ use super::run_builder_core::{
 use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{
-    claim_run_for_materialize, for_each_merged_rec_opts, list_materialize_claims, list_runs,
-    merge_runs, next_run_path, reduce_runs_to_fanin, write_sorted_run, ScriptHashEntry,
+    claim_run_for_materialize, commit_fanin_reduce_and_drop_inputs, for_each_merged_rec_opts,
+    list_fanin_reduce_outputs, list_materialize_claims, list_runs, merge_runs, next_run_path,
+    reduce_runs_to_fanin, write_sorted_run, ScriptHashEntry,
     ScriptHashRecord, Store, StoreError, SortedRunPath,
 };
 use std::collections::HashSet;
@@ -349,31 +350,48 @@ impl ShRunBuilder {
             (g.ctrl.runs_dir.clone(), Arc::clone(&g.ctrl.runs_io))
         };
 
-        // Drop incomplete tip merge workdir from a prior crash.
         let merge_dir = runs_dir.join("merge");
-        let _ = std::fs::remove_dir_all(&merge_dir);
 
         let t_claim = Instant::now();
         let mut claimed: Vec<SortedRunPath> = Vec::new();
+        let mut stream_inputs: Vec<SortedRunPath> = Vec::new();
+        let mut resumed_from_reduce = false;
         {
             let _io = runs_io.lock().unwrap();
             let mut prior = list_materialize_claims(&runs_dir)?;
-            if !prior.is_empty() {
-                info!(
-                    "node: scripthash resuming {} incomplete materialize claim(s)",
-                    prior.len()
-                );
-            }
-            claimed.append(&mut prior);
             let mut runs = list_runs(&runs_dir)?;
             runs.sort_by_key(|r| r.seq().unwrap_or(u64::MAX));
-            for run in runs {
-                claimed.push(claim_run_for_materialize(&run)?);
+
+            // Resume: fan-in finished and claimed inputs already dropped.
+            if prior.is_empty() && runs.is_empty() {
+                if let Some(reduced) = list_fanin_reduce_outputs(&merge_dir)? {
+                    info!(
+                        "node: scripthash resuming fan-in reduce outputs ({}) under merge/",
+                        reduced.len()
+                    );
+                    stream_inputs = reduced;
+                    resumed_from_reduce = true;
+                }
+            }
+
+            if !resumed_from_reduce {
+                // Incomplete prior reduce (no READY) — discard partial work files.
+                let _ = std::fs::remove_dir_all(&merge_dir);
+                if !prior.is_empty() {
+                    info!(
+                        "node: scripthash resuming {} incomplete materialize claim(s)",
+                        prior.len()
+                    );
+                }
+                claimed.append(&mut prior);
+                for run in runs {
+                    claimed.push(claim_run_for_materialize(&run)?);
+                }
             }
         }
         let claim_ns = t_claim.elapsed().as_nanos() as u64;
 
-        if claimed.is_empty() {
+        if !resumed_from_reduce && claimed.is_empty() {
             info!("node: scripthash bulk materialize: no runs");
             clear_runs_dir(&runs_dir);
             // Keep SEAL if any; tip may still re-collect.
@@ -382,25 +400,37 @@ impl ShRunBuilder {
 
         let fanin = merge_fanin();
         let t_reduce = Instant::now();
-        let stream_inputs = {
-            let _io = runs_io.lock().unwrap();
-            reduce_runs_to_fanin(&claimed, &merge_dir, fanin)?
-        };
+        if !resumed_from_reduce {
+            stream_inputs = {
+                let _io = runs_io.lock().unwrap();
+                let out = reduce_runs_to_fanin(&claimed, &merge_dir, fanin)?;
+                // Free claimed `*.run.mat` / catalog inputs now fully folded into
+                // merge/ (READY marker enables crash resume without re-claims).
+                commit_fanin_reduce_and_drop_inputs(&merge_dir, &claimed, &out)?;
+                out
+            };
+            info!(
+                "node: scripthash tip fanin reduce claimed={} stream={} fanin={fanin} elapsed={:?}",
+                claimed.len(),
+                stream_inputs.len(),
+                t_reduce.elapsed()
+            );
+        }
         let reduce_ns = t_reduce.elapsed().as_nanos() as u64;
-        info!(
-            "node: scripthash tip fanin reduce claimed={} stream={} fanin={fanin} elapsed={:?}",
-            claimed.len(),
-            stream_inputs.len(),
-            t_reduce.elapsed()
-        );
+
+        if stream_inputs.is_empty() {
+            info!("node: scripthash bulk materialize: no stream inputs after reduce");
+            clear_runs_dir(&runs_dir);
+            return Ok(0);
+        }
 
         let total_recs: u64 = stream_inputs.iter().map(|r| r.count).sum();
         let n_existing = store.scripthash.entry_count();
         let head_empty = store.scripthash.head_is_empty();
         info!(
             "node: scripthash reinit empty for cold rematerialize \
-             claims={} entry_count={n_existing} head_empty={head_empty}",
-            claimed.len()
+             stream_runs={} entry_count={n_existing} head_empty={head_empty}",
+            stream_inputs.len()
         );
         let t_reinit = Instant::now();
         store.scripthash.reinit_empty_for_cold_materialize()?;
@@ -495,8 +525,11 @@ impl ShRunBuilder {
         store.scripthash.flush()?;
         let finish_ns = t_finish.elapsed().as_nanos() as u64;
 
-        // Success barrier: drop claims + intermediates + catalog.
+        // Success barrier: drop any leftover claims, stream inputs, merge work, catalog.
         for run in &claimed {
+            let _ = std::fs::remove_file(&run.path);
+        }
+        for run in &stream_inputs {
             let _ = std::fs::remove_file(&run.path);
         }
         let _ = std::fs::remove_dir_all(&merge_dir);

@@ -23,7 +23,7 @@
 //! 16 GiB; override with `RBITCOIN_TX_IDX_SOFT_SPAN` bytes).
 
 use crate::error::StoreError;
-use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::file::{TableAccess, TableFile, FILE_HEADER_LEN};
 use rbitcoin_primitives::{TableKind, SCHEMA_VERSION, STORE_MAGIC};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -86,7 +86,9 @@ impl TxIdx {
         let mut max_id = 0u32;
         for d in descs {
             let path = segment_path(&dir, &stem, d.file_id);
-            let file = TableFile::open(&path, TableKind::ArrayLink)?;
+            // FdOnly: multi‑GiB idx segments use pread/pwrite (no full MAP_SHARED).
+            let file =
+                TableFile::open_with_access(&path, TableKind::ArrayLink, TableAccess::FdOnly)?;
             let slot_bytes = file
                 .logical_len()
                 .saturating_sub(FILE_HEADER_LEN as u64);
@@ -311,7 +313,7 @@ impl TxIdx {
             // Re-borrow file via snapshot (tail Arc).
             let segs = self.segments_snapshot();
             let tail = segs.last().unwrap();
-            // Linear idx append: always pwrite (no mmap grow of body-adjacent paths).
+            // Linear idx append: pwrite (FdOnly segment; same as body appends).
             tail.file.write_at_pwrite(slot_off, &blob)?;
             // Update tail count in segment list.
             {
@@ -364,7 +366,9 @@ impl TxIdx {
         let path = segment_path(&self.dir, &self.stem, file_id);
         // Replace if empty leftover.
         let _ = std::fs::remove_file(&path);
-        let file = TableFile::create(&path, TableKind::ArrayLink)?;
+        let file =
+            TableFile::create_with_access(&path, TableKind::ArrayLink, TableAccess::FdOnly)?;
+        debug_assert_eq!(file.access(), TableAccess::FdOnly);
         let seg = Segment {
             first_fk,
             count: 0,

@@ -167,6 +167,15 @@ impl TableFile {
     }
 
     pub fn create(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
+        Self::create_with_access(path, kind, TableAccess::for_kind(kind, false))
+    }
+
+    /// Create with explicit [`TableAccess`] (e.g. `tx.idx` segments are FdOnly).
+    pub fn create_with_access(
+        path: impl Into<PathBuf>,
+        kind: TableKind,
+        access: TableAccess,
+    ) -> Result<Self, StoreError> {
         let path = path.into();
         let mut file = OpenOptions::new()
             .read(true)
@@ -186,9 +195,7 @@ impl TableFile {
         let initial = FILE_HEADER_LEN as u64 + 64;
         file.set_len(initial)
             .map_err(|e| StoreError::io(&path, e))?;
-        let access = TableAccess::for_kind(kind, false);
-        // FdOnly (tx.body): pin only a tiny header window forever.
-        // MapFull: full-file map.
+        // FdOnly: tiny header window forever. MapFull: full-file map.
         let map = if access.is_fd_only() {
             unsafe {
                 memmap2::MmapOptions::new()
@@ -400,6 +407,15 @@ impl TableFile {
     }
 
     pub fn open(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
+        Self::open_with_access(path, kind, TableAccess::for_kind(kind, false))
+    }
+
+    /// Open with explicit [`TableAccess`] (must match how the file is used).
+    pub fn open_with_access(
+        path: impl Into<PathBuf>,
+        kind: TableKind,
+        access: TableAccess,
+    ) -> Result<Self, StoreError> {
         let path = path.into();
         let mut file = OpenOptions::new()
             .read(true)
@@ -434,7 +450,6 @@ impl TableFile {
             logical = file_len;
         }
 
-        let access = TableAccess::for_kind(kind, false);
         let map = if access.is_fd_only() {
             let win = (FILE_HEADER_LEN as u64 + 4096).min(file_len.max(FILE_HEADER_LEN as u64));
             unsafe {
@@ -837,7 +852,9 @@ impl TableFile {
     fn write_hwm_mmap(&self, logical: u64) {
         let bytes = logical.to_le_bytes();
         // Class A body: header HWM only (offset 8) via pwrite — map may be header-only.
-        if self.is_fd_only() && !self.trailing_header {
+        if self.is_fd_only() {
+            // Leading-header FdOnly tables only (no trailing FdOnly yet).
+            debug_assert!(!self.trailing_header);
             let fd = self.read_file.as_raw_fd();
             let rc = unsafe {
                 libc::pwrite(
@@ -848,7 +865,7 @@ impl TableFile {
                 )
             };
             if rc != 8 {
-                // Best-effort HWM on map path used to silent-return; keep soft.
+                // Best-effort HWM; keep soft (map path used to silent-return).
                 let _ = rc;
             }
             return;
@@ -1072,6 +1089,11 @@ mod advise_tests {
             TableAccess::for_kind(TableKind::HashHead, false),
             TableAccess::MapFull
         );
+        // ArrayLink default is MapFull (header_txs, multi-list); idx overrides.
+        assert_eq!(
+            TableAccess::for_kind(TableKind::ArrayLink, false),
+            TableAccess::MapFull
+        );
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("rbitcoin-access-{id}"));
@@ -1084,6 +1106,33 @@ mod advise_tests {
         let h = TableFile::create_trailing_header(&path2, TableKind::HashHead).unwrap();
         assert_eq!(h.access(), TableAccess::MapFull);
         let _ = std::fs::remove_file(&path2);
+        let path3 = std::env::temp_dir().join(format!("rbitcoin-access-idx-{id}"));
+        let _ = std::fs::remove_file(&path3);
+        let idx = TableFile::create_with_access(
+            &path3,
+            TableKind::ArrayLink,
+            TableAccess::FdOnly,
+        )
+        .unwrap();
+        assert_eq!(idx.access(), TableAccess::FdOnly);
+        let payload = 42u32.to_le_bytes();
+        let off = FILE_HEADER_LEN as u64;
+        idx.write_at_pwrite(off, &payload).unwrap();
+        let mut got = [0u8; 4];
+        idx.read_at(off, &mut got).unwrap();
+        assert_eq!(got, payload);
+        drop(idx);
+        let idx2 = TableFile::open_with_access(
+            &path3,
+            TableKind::ArrayLink,
+            TableAccess::FdOnly,
+        )
+        .unwrap();
+        assert_eq!(idx2.access(), TableAccess::FdOnly);
+        let mut got2 = [0u8; 4];
+        idx2.read_at(off, &mut got2).unwrap();
+        assert_eq!(got2, payload);
+        let _ = std::fs::remove_file(&path3);
     }
 
 
@@ -1408,9 +1457,9 @@ mod advise_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// pwrite payload must be visible to mmap `read_at` (page-cache coherency).
+    /// pwrite payload must be visible to FdOnly `read_at` (page-cache coherency).
     #[test]
-    fn write_at_pwrite_visible_via_mmap_read() {
+    fn write_at_pwrite_visible_via_pread() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);

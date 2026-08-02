@@ -1720,7 +1720,8 @@ impl TxTable {
 
     /// Bulk `body_range` for many fks (archive sticky + confirm load).
     ///
-    /// **Sorted mmap** walk of `tx.idx` via [`VarTable::record_range_batch`] —
+    /// **Sorted** walk of `tx.idx` via [`VarTable::record_range_batch`] (FdOnly
+    /// pread segments) —
     /// same modality as archive head-resolve idx (not scatter io_uring/pread).
     pub fn body_range_batch(
         &self,

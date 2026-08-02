@@ -1,4 +1,4 @@
-//! Streaming archive head-resolve: table-map head probe + table-map idx + body
+//! Streaming archive head-resolve: table-map head probe + FdOnly idx + body
 //! prefix verify via uring/pread (`RBITCOIN_HEAD_RESOLVE_IO`).
 //!
 //! See `docs/io-modality.md`: bulk body backend ≠ table map mode.
@@ -7,8 +7,8 @@
 //! - **uring:** completion-driven io_uring pread (one outstanding body per key)
 //! - **pread:** sequential libc pread of ≤32 body bytes
 //!
-//! Class A body is never full-mapped ([`crate::file::TableAccess::FdOnly`]).
-//! Shared today: table-map head probe → table-map idx → body prefix (uring/pread).
+//! Class A body and `tx.idx` are [`crate::file::TableAccess::FdOnly`].
+//! Shared today: table-map head probe → FdOnly idx → body prefix (uring/pread).
 
 use crate::error::StoreError;
 use crate::io_backend::{self, ReadIoBackend};
@@ -39,7 +39,7 @@ struct KeyWork {
     pending_rank: u32,
 }
 
-/// Resolve many txids via table-map head/idx + body prefix verify (backend from env).
+/// Resolve many txids via table-map head + FdOnly idx + body prefix (backend from env).
 ///
 /// Returns one `(txid, Option<Fk>)` per input in the same order as `txids`.
 /// Records [`crate::head_resolve_stats`] probe/idx/body walls and counts.
@@ -391,7 +391,7 @@ fn arm_keys(
     Ok(())
 }
 
-/// mmap idx range for next cand, then arm body pread. Returns false when cands exhausted.
+/// Idx range (FdOnly pread) for next cand, then arm body pread. Returns false when cands exhausted.
 fn try_submit_body(
     table: &TxTable,
     work: &mut KeyWork,

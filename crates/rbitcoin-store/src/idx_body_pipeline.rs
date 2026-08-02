@@ -1,9 +1,9 @@
 //! **tx.idx → tx.body** pipeline for confirm load and archive head-resolve.
 //!
-//! Idx via sorted [`VarTable::record_range_batch`] (table-map `tx.idx` today).
-//! Body backend from [`crate::io_backend::pin_io_backend`] (`RBITCOIN_PIN_IO` /
-//! global `RBITCOIN_IO`): **uring** or **pread**. Class A body is
-//! [`crate::file::TableAccess::FdOnly`] (never full-mapped).
+//! Idx via sorted [`VarTable::record_range_batch`] (`tx.idx` segments are
+//! [`crate::file::TableAccess::FdOnly`] pread). Body backend from
+//! [`crate::io_backend::pin_io_backend`] (`RBITCOIN_PIN_IO` / global
+//! `RBITCOIN_IO`): **uring** or **pread**. Class A body is also FdOnly.
 //!
 //! **Concurrency:** read-only on published ranges; prep + confirm-load may run
 //! concurrent waves (each thread's bulk_io TL ring). Caller owns job buffers
@@ -71,7 +71,7 @@ impl IdxBodyJob {
     }
 }
 
-/// Resolve idx (mmap) then body (backend from env). Mutates `jobs` in place.
+/// Resolve idx (FdOnly pread) then body (backend from env). Mutates `jobs` in place.
 ///
 /// Jobs with invalid / OOB ids are left `ok = false` without failing the batch
 /// (caller applies confirm hard invariants vs head-resolve skip policy).
@@ -93,7 +93,7 @@ pub fn run_idx_body_pipeline_backend(
     if jobs.is_empty() {
         return Ok(());
     }
-    // Resolve missing ranges via sorted mmap batch (segmented u32 stride idx).
+    // Resolve missing ranges via sorted idx batch (segmented u32 stride; FdOnly).
     let mut need_fk: Vec<Fk> = Vec::new();
     let mut need_slot: Vec<usize> = Vec::new();
     for (i, j) in jobs.iter().enumerate() {

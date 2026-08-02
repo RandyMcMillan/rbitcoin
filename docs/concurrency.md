@@ -93,5 +93,5 @@ rehash** (especially large **header** / scripthash head shards when materializin
 ### Confirm prep read pipeline
 
 Cold parent `tx.idx` / `tx.body` on the **prep** thread uses
-**table-map idx + bulk body** (`idx_body_pipeline` → `bulk_io` uring/pread). Batch
+**FdOnly idx + bulk body** (`idx_body_pipeline` → `bulk_io` uring/pread). Batch
 creates come from **wire**, not a second Class A full-decode pass.

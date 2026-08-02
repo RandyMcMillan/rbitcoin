@@ -61,16 +61,15 @@ At **info**, progress + perf already expose load/write bottlenecks (schema 12). 
 **read** resolve (`get_fk_by_txid_batch`, with `probe` / `idx` / `body` subtimers).
 `class_a_commit … head=` is create **insert** (`head_insert_many`). `res_seed` is CreateResidency denserels seed for this batch’s creates.
 
-**Archive head resolve:** streaming — **table-map** head probe + **table-map**
-idx + body prefix via **io_uring or pread** (deepest-cand-first). **Class A
-`tx.body` payload is never full-mapped** ([`TableAccess::FdOnly`](docs/io-modality.md):
-header-only map window; pread/pwrite/uring only). Full modality matrix and demap
-plan: [`docs/io-modality.md`](docs/io-modality.md).
+**Archive head resolve:** streaming — **table-map** head probe + **FdOnly**
+`tx.idx` + body prefix via **io_uring or pread** (deepest-cand-first). **Class A
+`tx.body` and `tx.idx` are never full-mapped** ([`TableAccess::FdOnly`](docs/io-modality.md)).
+Full modality matrix and demap plan: [`docs/io-modality.md`](docs/io-modality.md).
 
 ## Bulk store IO backends
 
-**Bulk batch** only (`RBITCOIN_IO`). This does **not** unmap `tx.idx` / `tx.head`
-(those are still full table maps today — see modality doc).
+**Bulk batch** only (`RBITCOIN_IO`). This does **not** unmap `tx.head` / SH heads
+(still MapFull today — see modality doc).
 
 Hierarchy: **path env** (if set) → **global `RBITCOIN_IO`** → default (**uring** if
 the ring is available, else **pread** / **pwrite** for annotate). If `uring` is

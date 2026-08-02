@@ -457,7 +457,7 @@ impl Store {
 
     /// Bulk Class A body ranges (archive sticky + confirm load).
     ///
-    /// Sorted mmap walk of `tx.idx` (contiguous runs coalesced). Prefer
+    /// Sorted walk of `tx.idx` (FdOnly pread; contiguous runs coalesced). Prefer
     /// [`Self::idx_body_pipeline`] when the caller also needs body bytes.
     pub fn tx_body_range_batch(
         &self,

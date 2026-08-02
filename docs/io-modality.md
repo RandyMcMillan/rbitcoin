@@ -41,7 +41,7 @@ Default: uring if the ring opens, else pread/pwrite. Ring depth **128**.
 | Object | Access today | Notes |
 |--------|--------------|--------|
 | **`tx.body`** | **FdOnly** | Tiny header-only map; payload pread/pwrite/uring; grow without multi‑GiB remap (`3a0c220`) |
-| **`tx.idx` segments** | **MapFull** | Append already pwrite; **reads** still map `read_at`; grow remaps |
+| **`tx.idx` segments** | **FdOnly** | Append pwrite; **reads pread**; grow fallocate only (phase 1) |
 | **`tx.head` segments** | **MapFull** | Page-coalesced insert_many via map RMW (`788936e`) |
 | Header hash head | **MapFull** | Sharded `HashHead` |
 | **`scripthash.head` / body** | **MapFull** | |
@@ -52,8 +52,8 @@ Default: uring if the ring opens, else pread/pwrite. Ring depth **128**.
 
 | Path | Map part | Fd/uring part |
 |------|----------|----------------|
-| Head resolve stream | table-map probe + idx | uring/pread body prefix |
-| Pin denserels | table-map idx ranges | uring/pread body bytes |
+| Head resolve stream | table-map head probe + FdOnly idx | uring/pread body prefix |
+| Pin denserels | FdOnly idx ranges | uring/pread body bytes |
 
 ---
 
@@ -134,10 +134,19 @@ only ensures harness compiles and unit tests pass.
 ### Phase 0 — Truth layer (landed with `TableAccess`)
 
 - [`TableAccess::FdOnly` \| `MapFull`](../crates/rbitcoin-store/src/file.rs); only
-  leading `TableKind::Tx` (`tx.body`) is FdOnly.
+  leading `TableKind::Tx` (`tx.body`) is FdOnly by default.
 - Bulk comments/OPERATOR no longer claim bulk `mmap` as a live mode.
 - No host A/B required (behavior unchanged).
 
-### Phase 1+ — (pending)
+### Phase 1 — `tx.idx` FdOnly (landed)
 
-_Host A/B tables go here after operator runs._
+- Segment create/open via `TableFile::create_with_access` / `open_with_access`
+  with **`TableAccess::FdOnly`** (kind remains `ArrayLink` for on-disk identity;
+  HashHead multi-list still MapFull).
+- Reads: `read_at` → pread; appends: pwrite; grow: fallocate only.
+- Correctness: store unit tests (multi-segment soft-span, reopen, range batch).
+- Host A/B: **optional** for tip-rate; not a hard gate (lower risk than heads).
+
+### Phase 2+ — (pending)
+
+_Host A/B tables for head demap go here after operator runs._

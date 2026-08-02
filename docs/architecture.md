@@ -135,10 +135,11 @@ budgets: [`docs/ibd-memory.md`](./ibd-memory.md).
 5. **Bulk IO vs table transport.** `RBITCOIN_IO=uring|pread` selects **bulk
    batch** backends for body denserels, head-resolve body prefix, spend paths
    (thread-local ring depth 128). **Table files** use [`TableAccess`](./io-modality.md):
-   `tx.body` is **FdOnly**; `tx.idx` / `tx.head` / SH heads still **MapFull**
-   today. Segmented `tx.head` insert is table-map page-coalesced RMW (historical
-   host A/B: uring head insert ~5× slower). Fuse8 builds in process RAM on seal.
-   See [`docs/io-modality.md`](./io-modality.md) for demap plan and host musl benches.
+   `tx.body` and **`tx.idx` segments** are **FdOnly**; `tx.head` / SH heads still
+   **MapFull** today. Segmented `tx.head` insert is table-map page-coalesced RMW
+   (historical host A/B: uring head insert ~5× slower). Fuse8 builds in process
+   RAM on seal. See [`docs/io-modality.md`](./io-modality.md) for demap plan and
+   host musl benches.
 
 ### Map / capacity growth
 

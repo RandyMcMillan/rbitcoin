@@ -2,10 +2,9 @@
 //!
 //! Body backend from [`crate::io_backend::head_resolve_io_backend`]:
 //! - **uring:** completion-driven io_uring pread (one outstanding body per key)
-//! - **mmap:** sequential deepest-cand body peeks under one map pin
 //! - **pread:** sequential libc pread of ≤32 body bytes
 //!
-//! Shared steps: mmap probe → mmap idx range → body prefix txid match (BIP30).
+//! Class A body is never mmap'd. Shared: mmap probe → mmap idx → body prefix.
 
 use crate::error::StoreError;
 use crate::io_backend::{self, ReadIoBackend};
@@ -16,7 +15,7 @@ use std::os::fd::RawFd;
 use std::time::Instant;
 
 /// Max keys with a body pread in flight (≤ ring depth).
-const MAX_IN_FLIGHT_KEYS: usize = 512;
+const MAX_IN_FLIGHT_KEYS: usize = 128;
 
 const STAGE_BODY: u64 = 1;
 
@@ -49,22 +48,14 @@ pub fn resolve_batch_streaming(
     }
     match io_backend::head_resolve_io_backend() {
         ReadIoBackend::Uring => resolve_batch_streaming_uring(table, txids),
-        ReadIoBackend::Mmap => resolve_batch_sync(table, txids, BodyPeek::Mmap),
-        ReadIoBackend::Pread => resolve_batch_sync(table, txids, BodyPeek::Pread),
+        ReadIoBackend::Pread => resolve_batch_sync_pread(table, txids),
     }
 }
 
-#[derive(Clone, Copy)]
-enum BodyPeek {
-    Mmap,
-    Pread,
-}
-
-/// Sequential deepest-cand body peeks (mmap pin or libc pread).
-fn resolve_batch_sync(
+/// Sequential deepest-cand body peeks via libc pread (no body mmap).
+fn resolve_batch_sync_pread(
     table: &TxTable,
     txids: &[[u8; 32]],
-    peek: BodyPeek,
 ) -> Result<Vec<([u8; 32], Option<Fk>)>, StoreError> {
     crate::head_resolve_stats::add_keys(txids.len() as u64);
     let body_pub = table.body.body_published_len();
@@ -79,128 +70,66 @@ fn resolve_batch_sync(
     let mut idx_ns = 0u64;
     let mut body_ns = 0u64;
 
-    // Mmap: pin once for all peeks in this batch.
-    match peek {
-        BodyPeek::Mmap => {
-            table.body.with_body_map_pin(|map, published| {
-                let map_len = map.len() as u64;
-                let published = published.min(body_pub);
-                for (key_i, txid) in txids.iter().enumerate() {
-                    let t_probe = Instant::now();
-                    let mixed = table.secret.mix_txid(txid);
-                    let raw = table.head.probe_candidates(&mixed)?;
-                    probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
-                    cands_total = cands_total.saturating_add(raw.len() as u64);
-                    let mut matched: Option<Fk> = None;
-                    for (ci, fk) in raw.into_iter().enumerate() {
-                        let id = fk.0;
-                        if id == 0 || id > count {
-                            continue;
-                        }
-                        let t_idx = Instant::now();
-                        let range = match table.body.record_range(fk) {
-                            Ok(r) => r,
-                            Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => continue,
-                            Err(e) => return Err(e),
-                        };
-                        idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
-                        let (start, full_len) = range;
-                        let n = (full_len as usize).min(32);
-                        if n == 0 || start.saturating_add(n as u64) > published {
-                            continue;
-                        }
-                        if start.saturating_add(n as u64) > map_len {
-                            continue;
-                        }
-                        let t_body = Instant::now();
-                        let o = start as usize;
-                        let buf = &map[o..o + n];
-                        body_ns = body_ns.saturating_add(t_body.elapsed().as_nanos() as u64);
-                        body_lookups = body_lookups.saturating_add(1);
-                        match TxTable::txid_from_body_prefix(buf) {
-                            Ok(got) if got == *txid => {
-                                crate::head_resolve_stats::add_hit_rank((ci + 1) as u64);
-                                matched = Some(fk);
-                                break;
-                            }
-                            Ok(_) => {
-                                crate::head_resolve_stats::add_miss_peeks(1);
-                            }
-                            Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {
-                                crate::head_resolve_stats::add_miss_peeks(1);
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    results[key_i] = matched;
+    for (key_i, txid) in txids.iter().enumerate() {
+        let t_probe = Instant::now();
+        let mixed = table.secret.mix_txid(txid);
+        let raw = table.head.probe_candidates(&mixed)?;
+        probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
+        cands_total = cands_total.saturating_add(raw.len() as u64);
+        let mut matched: Option<Fk> = None;
+        for (ci, fk) in raw.into_iter().enumerate() {
+            let id = fk.0;
+            if id == 0 || id > count {
+                continue;
+            }
+            let t_idx = Instant::now();
+            let range = match table.body.record_range(fk) {
+                Ok(r) => r,
+                Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
+            let (start, full_len) = range;
+            let n = (full_len as usize).min(32);
+            if n == 0 || start.saturating_add(n as u64) > body_pub {
+                continue;
+            }
+            let mut buf = [0u8; 32];
+            let t_body = Instant::now();
+            let rc = unsafe {
+                libc::pread(
+                    body_fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    n,
+                    start as libc::off_t,
+                )
+            };
+            body_ns = body_ns.saturating_add(t_body.elapsed().as_nanos() as u64);
+            body_lookups = body_lookups.saturating_add(1);
+            if rc < 0 {
+                return Err(StoreError::io(
+                    &body_path,
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            if rc as usize != n {
+                crate::head_resolve_stats::add_miss_peeks(1);
+                continue;
+            }
+            match TxTable::txid_from_body_prefix(&buf[..n]) {
+                Ok(got) if got == *txid => {
+                    crate::head_resolve_stats::add_hit_rank((ci + 1) as u64);
+                    matched = Some(fk);
+                    break;
                 }
-                Ok::<(), StoreError>(())
-            })?;
-        }
-        BodyPeek::Pread => {
-            for (key_i, txid) in txids.iter().enumerate() {
-                let t_probe = Instant::now();
-                let mixed = table.secret.mix_txid(txid);
-                let raw = table.head.probe_candidates(&mixed)?;
-                probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
-                cands_total = cands_total.saturating_add(raw.len() as u64);
-                let mut matched: Option<Fk> = None;
-                for (ci, fk) in raw.into_iter().enumerate() {
-                    let id = fk.0;
-                    if id == 0 || id > count {
-                        continue;
-                    }
-                    let t_idx = Instant::now();
-                    let range = match table.body.record_range(fk) {
-                        Ok(r) => r,
-                        Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => continue,
-                        Err(e) => return Err(e),
-                    };
-                    idx_ns = idx_ns.saturating_add(t_idx.elapsed().as_nanos() as u64);
-                    let (start, full_len) = range;
-                    let n = (full_len as usize).min(32);
-                    if n == 0 || start.saturating_add(n as u64) > body_pub {
-                        continue;
-                    }
-                    let mut buf = [0u8; 32];
-                    let t_body = Instant::now();
-                    // SAFETY: sole reader of own buf; body fd is read-only clone.
-                    let rc = unsafe {
-                        libc::pread(
-                            body_fd,
-                            buf.as_mut_ptr() as *mut libc::c_void,
-                            n,
-                            start as libc::off_t,
-                        )
-                    };
-                    body_ns = body_ns.saturating_add(t_body.elapsed().as_nanos() as u64);
-                    body_lookups = body_lookups.saturating_add(1);
-                    if rc < 0 {
-                        return Err(StoreError::io(
-                            &body_path,
-                            std::io::Error::last_os_error(),
-                        ));
-                    }
-                    if rc as usize != n {
-                        crate::head_resolve_stats::add_miss_peeks(1);
-                        continue;
-                    }
-                    match TxTable::txid_from_body_prefix(&buf[..n]) {
-                        Ok(got) if got == *txid => {
-                            crate::head_resolve_stats::add_hit_rank((ci + 1) as u64);
-                            matched = Some(fk);
-                            break;
-                        }
-                        Ok(_) => crate::head_resolve_stats::add_miss_peeks(1),
-                        Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {
-                            crate::head_resolve_stats::add_miss_peeks(1);
-                        }
-                        Err(e) => return Err(e),
-                    }
+                Ok(_) => crate::head_resolve_stats::add_miss_peeks(1),
+                Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {
+                    crate::head_resolve_stats::add_miss_peeks(1);
                 }
-                results[key_i] = matched;
+                Err(e) => return Err(e),
             }
         }
+        results[key_i] = matched;
     }
 
     crate::head_resolve_stats::add_probe(probe_ns);

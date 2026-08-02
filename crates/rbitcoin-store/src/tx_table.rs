@@ -986,20 +986,18 @@ pub struct TxTable {
 /// Backend for bulk structural 9-byte spender-meta reads on `tx.body`.
 ///
 /// Selected via `RBITCOIN_SPEND_META` / global `RBITCOIN_IO` (see [`crate::io_backend`]).
+/// Body peeks are never mmap'd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpendMetaBackend {
-    /// One map pin + random peeks (`with_body_map_pin`).
-    Mmap,
     /// io_uring pread_batch 9B peeks.
     Uring,
     /// libc pread_batch (no ring).
     Pread,
 }
 
-/// Structural-meta backend from env hierarchy (no alternate).
+/// Structural-meta backend from env hierarchy.
 pub fn spend_meta_backend() -> SpendMetaBackend {
     match crate::io_backend::spend_meta_io_backend() {
-        crate::io_backend::ReadIoBackend::Mmap => SpendMetaBackend::Mmap,
         crate::io_backend::ReadIoBackend::Uring => SpendMetaBackend::Uring,
         crate::io_backend::ReadIoBackend::Pread => SpendMetaBackend::Pread,
     }
@@ -1938,7 +1936,6 @@ impl TxTable {
             return Ok(Vec::new());
         }
         match backend {
-            SpendMetaBackend::Mmap => self.get_spender_meta_at_abs_batch_mmap(abs_offs),
             SpendMetaBackend::Uring => {
                 match self.get_spender_meta_at_abs_batch_uring(abs_offs) {
                     Ok(v) => Ok(v),
@@ -1952,30 +1949,6 @@ impl TxTable {
             }
             SpendMetaBackend::Pread => self.get_spender_meta_at_abs_batch_pread(abs_offs),
         }
-    }
-
-    /// Mmap pin + random 9B peeks (one map pin for the whole batch).
-    fn get_spender_meta_at_abs_batch_mmap(
-        &self,
-        abs_offs: &[u64],
-    ) -> Result<Vec<Option<(Fk, u8)>>, StoreError> {
-        const META_LEN: usize = 9;
-        Ok(self.body.with_body_map_pin(|map, published| {
-            let mut out: Vec<Option<(Fk, u8)>> = vec![None; abs_offs.len()];
-            let map_len = map.len() as u64;
-            for (i, &off) in abs_offs.iter().enumerate() {
-                let end = off.saturating_add(META_LEN as u64);
-                if end > published || end > map_len {
-                    continue;
-                }
-                let o = off as usize;
-                let b = &map[o..o + META_LEN];
-                let field = Fk(u64::from_le_bytes(b[0..8].try_into().unwrap()));
-                let flags = b[8];
-                out[i] = Some((field, flags));
-            }
-            out
-        }))
     }
 
     /// io_uring pread_batch 9B peeks.
@@ -3527,7 +3500,7 @@ mod tests {
         assert_eq!(bulk[2].map(|(f, fl)| (f, fl & output_flags::MULTI_SPENDER != 0)), Some((Fk(20), false)));
         // Both backends must agree.
         let mmap = t
-            .get_spender_meta_at_abs_batch_backend(&abs, SpendMetaBackend::Mmap)
+            .get_spender_meta_at_abs_batch_backend(&abs, SpendMetaBackend::Pread)
             .unwrap();
         let uring = t
             .get_spender_meta_at_abs_batch_backend(&abs, SpendMetaBackend::Uring)

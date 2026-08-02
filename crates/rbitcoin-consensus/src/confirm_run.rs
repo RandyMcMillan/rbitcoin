@@ -3785,24 +3785,10 @@ fn post_commit(
                 )));
             }
             let ann_ns = t_ann.elapsed().as_nanos() as u64;
-            match backend {
-                rbitcoin_store::spend_annotate_uring::SpendAnnBackend::Mmap => {
-                    confirm_phase_stats::SPEND_ANN_MMAP_NS.fetch_add(ann_ns, Ordering::Relaxed);
-                    confirm_phase_stats::SPEND_ANN_MMAP_N
-                        .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
-                }
-                rbitcoin_store::spend_annotate_uring::SpendAnnBackend::Uring => {
-                    confirm_phase_stats::SPEND_ANN_URING_NS.fetch_add(ann_ns, Ordering::Relaxed);
-                    confirm_phase_stats::SPEND_ANN_URING_N
-                        .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
-                }
-                rbitcoin_store::spend_annotate_uring::SpendAnnBackend::Pwrite => {
-                    // Count under uring token as "fd write" for log continuity, or mmap_n=0.
-                    confirm_phase_stats::SPEND_ANN_URING_NS.fetch_add(ann_ns, Ordering::Relaxed);
-                    confirm_phase_stats::SPEND_ANN_URING_N
-                        .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
-                }
-            }
+            confirm_phase_stats::SPEND_ANN_NS.fetch_add(ann_ns, Ordering::Relaxed);
+            confirm_phase_stats::SPEND_ANN_N
+                .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
+            let _ = backend;
             confirm_phase_stats::SPEND_ANNOTATE_RANGED
                 .fetch_add(abs_edges.len() as u64, Ordering::Relaxed);
             confirm_phase_stats::SPEND_ANN_PREAD_SKIP

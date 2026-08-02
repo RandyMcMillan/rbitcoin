@@ -261,7 +261,6 @@ impl TxIdx {
             }
         }
         let soft = Self::soft_span();
-        let use_fd = crate::io_backend::class_a_append_uses_pwrite();
 
         let mut i = 0usize;
         while i < starts.len() {
@@ -312,11 +311,8 @@ impl TxIdx {
             // Re-borrow file via snapshot (tail Arc).
             let segs = self.segments_snapshot();
             let tail = segs.last().unwrap();
-            if use_fd {
-                tail.file.write_at_pwrite(slot_off, &blob)?;
-            } else {
-                tail.file.write_at(slot_off, &blob)?;
-            }
+            // Linear idx append: always pwrite (no mmap grow of body-adjacent paths).
+            tail.file.write_at_pwrite(slot_off, &blob)?;
             // Update tail count in segment list.
             {
                 let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());

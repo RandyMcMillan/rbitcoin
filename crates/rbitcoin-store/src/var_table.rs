@@ -209,12 +209,6 @@ impl VarTable {
         self.published_meta().1
     }
 
-    /// Pin body map once; `f(map_bytes, published_len)`.
-    #[inline]
-    pub(crate) fn with_body_map_pin<R>(&self, f: impl FnOnce(&[u8], u64) -> R) -> R {
-        self.body.with_map_pin(f)
-    }
-
     /// Inspect record bytes without copying into a `Vec`.
     pub fn with_raw<R>(
         &self,
@@ -235,14 +229,14 @@ impl VarTable {
         self.body.with_bytes(offset, len, f).and_then(|r| r)
     }
 
-    /// Absolute write into body file (no idx; caller has a cache-held range).
+    /// Absolute write into Class A body via **pwrite** (never mmap).
     pub fn write_body_abs(&self, abs_offset: u64, data: &[u8]) -> Result<(), StoreError> {
-        self.body.write_at(abs_offset, data)
+        self.body.write_at_pwrite(abs_offset, data)
     }
 
-    /// Absolute write via **pwrite** (page cache; no mmap dirty for the payload).
+    /// Alias of [`Self::write_body_abs`] (historical name).
     pub fn write_body_abs_pwrite(&self, abs_offset: u64, data: &[u8]) -> Result<(), StoreError> {
-        self.body.write_at_pwrite(abs_offset, data)
+        self.write_body_abs(abs_offset, data)
     }
 
     /// Pre-grow body (+ idx tail) capacity so a following mega `put_batch` does not
@@ -310,11 +304,7 @@ impl VarTable {
         if self.count.load(Ordering::Acquire) != base_count {
             return Err(StoreError::Corrupt("var put_batch_encode race"));
         }
-        if crate::io_backend::class_a_append_uses_pwrite() {
-            self.body.write_at_pwrite(start, &body_blob)?;
-        } else {
-            self.body.write_at(start, &body_blob)?;
-        }
+        self.body.write_at_pwrite(start, &body_blob)?;
         // Idx after body (publish order).
         self.idx.append_starts(base_count, &starts)?;
         let new_end = start.saturating_add(body_blob.len() as u64);

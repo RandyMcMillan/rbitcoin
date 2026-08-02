@@ -208,7 +208,7 @@ impl TxHeightTable {
     /// Returns one `Option<height>` per input fk (invalid/null fk → `None`).
     pub fn get_batch(&self, fks: &[Fk]) -> Result<Vec<Option<u32>>, StoreError> {
         use crate::bulk_io::{self, ReadOp};
-        use crate::io_backend::{self, ReadIoBackend};
+        use crate::io_backend;
         use std::sync::atomic::Ordering;
         if fks.is_empty() {
             return Ok(Vec::new());
@@ -230,52 +230,31 @@ impl TxHeightTable {
             return Ok(out);
         }
 
-        match io_backend::class_c_io_backend() {
-            ReadIoBackend::Mmap => {
-                self.file.with_map_pin(|map, published| {
-                    let map_len = map.len() as u64;
-                    for &(i, index) in &submitted {
-                        let off = Self::offset(index);
-                        let end = off.saturating_add(4);
-                        if end > published || end > map_len {
-                            continue;
-                        }
-                        let o = off as usize;
-                        let v = u32::from_le_bytes(map[o..o + 4].try_into().unwrap());
-                        if v != 0 {
-                            out[i] = Some(v - 1);
-                        }
-                    }
-                });
-                Ok(out)
+        let backend = io_backend::class_c_io_backend();
+        let fd = self.file.read_fd();
+        let mut bufs: Vec<[u8; 4]> = vec![[0u8; 4]; fks.len()];
+        let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(submitted.len());
+        for &(i, index) in &submitted {
+            let ptr = bufs[i].as_mut_ptr();
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, 4) };
+            read_ops.push(ReadOp {
+                fd,
+                offset: Self::offset(index),
+                buf: slice,
+                result: i32::MIN,
+            });
+        }
+        bulk_io::pread_batch_backend(&mut read_ops, backend);
+        for (ro, &(i, _)) in read_ops.iter().zip(submitted.iter()) {
+            if ro.result != 4 {
+                continue;
             }
-            backend @ (ReadIoBackend::Uring | ReadIoBackend::Pread) => {
-                let fd = self.file.read_fd();
-                let mut bufs: Vec<[u8; 4]> = vec![[0u8; 4]; fks.len()];
-                let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(submitted.len());
-                for &(i, index) in &submitted {
-                    let ptr = bufs[i].as_mut_ptr();
-                    let slice = unsafe { std::slice::from_raw_parts_mut(ptr, 4) };
-                    read_ops.push(ReadOp {
-                        fd,
-                        offset: Self::offset(index),
-                        buf: slice,
-                        result: i32::MIN,
-                    });
-                }
-                bulk_io::pread_batch_backend(&mut read_ops, backend);
-                for (ro, &(i, _)) in read_ops.iter().zip(submitted.iter()) {
-                    if ro.result != 4 {
-                        continue;
-                    }
-                    let v = u32::from_le_bytes(bufs[i]);
-                    if v != 0 {
-                        out[i] = Some(v - 1);
-                    }
-                }
-                Ok(out)
+            let v = u32::from_le_bytes(bufs[i]);
+            if v != 0 {
+                out[i] = Some(v - 1);
             }
         }
+        Ok(out)
     }
 
     pub fn set(&self, tx_fk: Fk, height: Height) -> Result<(), StoreError> {

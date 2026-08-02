@@ -2,7 +2,7 @@
 //!
 //! Idx via sorted mmap [`VarTable::record_range_batch`]. Body backend from
 //! [`crate::io_backend::pin_io_backend`] (`RBITCOIN_PIN_IO` / global `RBITCOIN_IO`):
-//! **mmap** (one pin + memcpy), **uring** (bulk pread ring), **pread** (libc).
+//! **uring** (bulk pread ring) or **pread** (libc). Class A body is never mmap'd.
 //!
 //! **Concurrency:** read-only on published ranges; prep + confirm-load may run
 //! concurrent waves (each thread's bulk_io TL ring). Caller owns job buffers
@@ -133,57 +133,33 @@ pub fn run_idx_body_pipeline_backend(
     // Sort by body offset for sequential page fault / pread locality.
     submitted.sort_unstable_by_key(|&i| jobs[i].range.map(|(o, _)| o).unwrap_or(0));
 
-    match backend {
-        ReadIoBackend::Mmap => {
-            // One pin for the wave; copy published ranges into job buffers.
-            table.with_body_map_pin(|map, published| {
-                let map_len = map.len() as u64;
-                for &i in &submitted {
-                    let (off, _) = jobs[i].range.unwrap();
-                    let len = jobs[i].body.len() as u64;
-                    let end = off.saturating_add(len);
-                    if end > published || end > map_len {
-                        jobs[i].ok = false;
-                        continue;
-                    }
-                    let o = off as usize;
-                    let n = len as usize;
-                    jobs[i].body.copy_from_slice(&map[o..o + n]);
-                    jobs[i].ok = true;
-                }
-            });
-            Ok(())
+    // SAFETY: each jobs[i].body is a distinct allocation; submitted unique.
+    let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(submitted.len());
+    for &i in &submitted {
+        let off = jobs[i].range.unwrap().0;
+        let len = jobs[i].body.len();
+        let ptr = jobs[i].body.as_mut_ptr();
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        read_ops.push(ReadOp {
+            fd: body_fd,
+            offset: off,
+            buf: slice,
+            result: i32::MIN,
+        });
+    }
+    bulk_io::pread_batch_backend(&mut read_ops, backend);
+    for (ro, &i) in read_ops.iter().zip(submitted.iter()) {
+        if ro.result < 0 {
+            return Err(StoreError::io(
+                body_path,
+                std::io::Error::from_raw_os_error(-ro.result),
+            ));
         }
-        ReadIoBackend::Uring | ReadIoBackend::Pread => {
-            // SAFETY: each jobs[i].body is a distinct allocation; submitted unique.
-            let mut read_ops: Vec<ReadOp<'_>> = Vec::with_capacity(submitted.len());
-            for &i in &submitted {
-                let off = jobs[i].range.unwrap().0;
-                let len = jobs[i].body.len();
-                let ptr = jobs[i].body.as_mut_ptr();
-                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-                read_ops.push(ReadOp {
-                    fd: body_fd,
-                    offset: off,
-                    buf: slice,
-                    result: i32::MIN,
-                });
-            }
-            bulk_io::pread_batch_backend(&mut read_ops, backend);
-            for (ro, &i) in read_ops.iter().zip(submitted.iter()) {
-                if ro.result < 0 {
-                    return Err(StoreError::io(
-                        body_path,
-                        std::io::Error::from_raw_os_error(-ro.result),
-                    ));
-                }
-                if ro.result as usize == jobs[i].body.len() {
-                    jobs[i].ok = true;
-                }
-            }
-            Ok(())
+        if ro.result as usize == jobs[i].body.len() {
+            jobs[i].ok = true;
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -239,18 +215,14 @@ mod tests {
         fks
     }
 
-    /// mmap / uring / pread body backends produce identical Full payloads.
+    /// uring / pread body backends produce identical Full payloads.
     #[test]
     fn pipeline_body_backends_agree() {
         use crate::io_backend::ReadIoBackend;
         let (dir, t) = temp_tx();
         let fks = put_n(&t, 8);
         let mut bodies: Vec<Vec<Vec<u8>>> = Vec::new();
-        for backend in [
-            ReadIoBackend::Mmap,
-            ReadIoBackend::Uring,
-            ReadIoBackend::Pread,
-        ] {
+        for backend in [ReadIoBackend::Uring, ReadIoBackend::Pread] {
             let mut jobs: Vec<IdxBodyJob> =
                 fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
             run_idx_body_pipeline_backend(&t.body, &mut jobs, BodyMode::Full, backend).unwrap();
@@ -262,7 +234,6 @@ mod tests {
             bodies.push(batch);
         }
         assert_eq!(bodies[0], bodies[1]);
-        assert_eq!(bodies[0], bodies[2]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

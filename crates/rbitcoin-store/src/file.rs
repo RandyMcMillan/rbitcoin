@@ -70,9 +70,14 @@ pub struct TableFile {
     read_file: File,
     /// Current map epoch. Pin clones under a short shared lock; grow replaces
     /// under a write lock. Avoids the AtomicPtr load/increment free race.
+    /// **Class A `tx.body` (`TableKind::Tx`, leading header):** map is a tiny
+    /// header-only window (not grown); payload IO uses pread/pwrite only.
     epoch: RwLock<Arc<MapEpoch>>,
     /// Logical length including header/trailer (published HWM).
     published_len: AtomicU64,
+    /// File capacity for **fd-only body** tables (`TableKind::Tx` leading). Always
+    /// ≥ published; grown via fallocate without remapping multi‑GiB body.
+    file_cap: AtomicU64,
     /// When true: [`TRAILING_FOOTER_LEN`]-byte magic+HWM+layout trailer is at
     /// **end** of published range; data starts at offset 0 (page-aligned probes).
     trailing_header: bool,
@@ -83,6 +88,12 @@ pub struct TableFile {
 }
 
 impl TableFile {
+    /// Class A `tx.body` — no multi‑GiB mmap payload access.
+    #[inline]
+    fn is_tx_body_fd(&self) -> bool {
+        self.kind == TableKind::Tx && !self.trailing_header
+    }
+
     fn install_epoch(epoch: Arc<MapEpoch>) -> RwLock<Arc<MapEpoch>> {
         RwLock::new(epoch)
     }
@@ -127,8 +138,19 @@ impl TableFile {
         let initial = FILE_HEADER_LEN as u64 + 64;
         file.set_len(initial)
             .map_err(|e| StoreError::io(&path, e))?;
-        // SAFETY: exclusive file we just created; length set above.
-        let map = unsafe { MmapMut::map_mut(&file) }.map_err(|e| StoreError::io(&path, e))?;
+        // Class A body: pin only a tiny header window forever (payload = pread/pwrite).
+        // Other tables: full-file map.
+        let map = if kind == TableKind::Tx {
+            unsafe {
+                memmap2::MmapOptions::new()
+                    .len(initial as usize)
+                    .map_mut(&file)
+            }
+            .map_err(|e| StoreError::io(&path, e))?
+        } else {
+            // SAFETY: exclusive file we just created; length set above.
+            unsafe { MmapMut::map_mut(&file) }.map_err(|e| StoreError::io(&path, e))?
+        };
         let epoch = Arc::new(MapEpoch { map });
         let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
 
@@ -138,6 +160,7 @@ impl TableFile {
             read_file,
             epoch: Self::install_epoch(epoch),
             published_len: AtomicU64::new(FILE_HEADER_LEN as u64),
+            file_cap: AtomicU64::new(initial),
             trailing_header: false,
             trailing_ext: [0u8; 16],
             kind,
@@ -173,6 +196,7 @@ impl TableFile {
             read_file,
             epoch: Self::install_epoch(epoch),
             published_len: AtomicU64::new(initial),
+            file_cap: AtomicU64::new(initial),
             trailing_header: true,
             trailing_ext: [0u8; 16],
             kind,
@@ -235,6 +259,7 @@ impl TableFile {
                 read_file,
                 epoch: Self::install_epoch(epoch),
                 published_len: AtomicU64::new(logical),
+                file_cap: AtomicU64::new(logical),
                 trailing_header: true,
                 trailing_ext,
                 kind,
@@ -355,7 +380,17 @@ impl TableFile {
             logical = file_len;
         }
 
-        let map = unsafe { MmapMut::map_mut(&file) }.map_err(|e| StoreError::io(&path, e))?;
+        let map = if kind == TableKind::Tx {
+            let win = (FILE_HEADER_LEN as u64 + 4096).min(file_len.max(FILE_HEADER_LEN as u64));
+            unsafe {
+                memmap2::MmapOptions::new()
+                    .len(win as usize)
+                    .map_mut(&file)
+            }
+            .map_err(|e| StoreError::io(&path, e))?
+        } else {
+            unsafe { MmapMut::map_mut(&file) }.map_err(|e| StoreError::io(&path, e))?
+        };
         let epoch = Arc::new(MapEpoch { map });
         let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
         Ok(Self {
@@ -364,6 +399,7 @@ impl TableFile {
             read_file,
             epoch: Self::install_epoch(epoch),
             published_len: AtomicU64::new(logical),
+            file_cap: AtomicU64::new(file_len.max(logical)),
             trailing_header: false,
             trailing_ext: [0u8; 16],
             kind,
@@ -421,7 +457,45 @@ impl TableFile {
             .saturating_sub(overhead)
     }
 
+    /// Positional pread (page cache / disk). Preferred for Class A `tx.body`.
+    pub fn pread_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let end = offset.saturating_add(buf.len() as u64);
+        let len = self.published_len.load(Ordering::Acquire);
+        if end > len {
+            return Err(StoreError::Corrupt("pread past logical end"));
+        }
+        let fd = self.read_file.as_raw_fd();
+        let mut done = 0usize;
+        while done < buf.len() {
+            let rc = unsafe {
+                libc::pread(
+                    fd,
+                    buf[done..].as_mut_ptr() as *mut libc::c_void,
+                    buf.len() - done,
+                    (offset + done as u64) as libc::off_t,
+                )
+            };
+            if rc < 0 {
+                return Err(StoreError::io(&self.path, std::io::Error::last_os_error()));
+            }
+            if rc == 0 {
+                return Err(StoreError::io(
+                    &self.path,
+                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "pread short"),
+                ));
+            }
+            done += rc as usize;
+        }
+        Ok(())
+    }
+
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
+        if self.is_tx_body_fd() {
+            return self.pread_at(offset, buf);
+        }
         let end = offset.saturating_add(buf.len() as u64);
         let len = self.published_len.load(Ordering::Acquire);
         if end > len {
@@ -441,6 +515,9 @@ impl TableFile {
     }
 
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        if self.is_tx_body_fd() {
+            return self.write_at_pwrite(offset, bytes);
+        }
         let end = offset.saturating_add(bytes.len() as u64);
         self.ensure_capacity(end)?;
         let pin = self.pin();
@@ -573,12 +650,17 @@ impl TableFile {
         Ok(v)
     }
 
-    /// Ensure the mmap covers at least `need` bytes.
+    /// Ensure the file (and map for non-body tables) covers at least `need` bytes.
     ///
-    /// Capacity growth: fallocate (or set_len) then map a **new** epoch over the
-    /// same file and publish the pointer. Readers holding the old pin keep a valid
-    /// mapping of the shared file — no catch-up, no long map lock.
+    /// Class A **tx.body**: fallocate/set_len only — never grows the multi‑GiB map.
+    /// Other tables: fallocate then map a **new** epoch (readers hold old pin).
     pub fn ensure_capacity(&self, need: u64) -> Result<(), StoreError> {
+        if self.is_tx_body_fd() {
+            if need <= self.file_cap.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            return self.ensure_capacity_fd_only(need);
+        }
         {
             let pin = self.pin();
             if need <= pin.epoch.cap() {
@@ -629,6 +711,49 @@ impl TableFile {
             unsafe { MmapMut::map_mut(&*file) }.map_err(|e| StoreError::io(&self.path, e))?;
         drop(file);
         self.publish_epoch(Arc::new(MapEpoch { map: new_map }));
+        self.file_cap.store(new_cap, Ordering::Release);
+        Ok(())
+    }
+
+    /// Grow Class A body file without remapping (payload stays pread/pwrite-only).
+    fn ensure_capacity_fd_only(&self, need: u64) -> Result<(), StoreError> {
+        const DOUBLE_UNTIL: u64 = 64 * 1024 * 1024;
+        let cur = self.file_cap.load(Ordering::Acquire);
+        if need <= cur {
+            return Ok(());
+        }
+        let (headroom, step) = if cur >= 8 * 1024 * 1024 * 1024 {
+            (1024 * 1024 * 1024u64, 512 * 1024 * 1024u64)
+        } else if cur >= 1024 * 1024 * 1024 {
+            (512 * 1024 * 1024u64, 256 * 1024 * 1024u64)
+        } else {
+            (256 * 1024 * 1024u64, 64 * 1024 * 1024u64)
+        };
+        let new_cap = if cur < DOUBLE_UNTIL {
+            let mut c = cur.max(64);
+            while c < need {
+                c = c.saturating_mul(2).max(need);
+            }
+            c
+        } else {
+            need.saturating_add(headroom)
+                .div_ceil(step)
+                .saturating_mul(step)
+                .max(need)
+        };
+        let file = self.file.lock().unwrap();
+        if need <= self.file_cap.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if try_fallocate(&file, new_cap).is_err() {
+            file.set_len(new_cap)
+                .map_err(|e| StoreError::io(&self.path, e))?;
+        } else if file.metadata().map(|m| m.len()).unwrap_or(0) < new_cap {
+            file.set_len(new_cap)
+                .map_err(|e| StoreError::io(&self.path, e))?;
+        }
+        drop(file);
+        self.file_cap.store(new_cap, Ordering::Release);
         Ok(())
     }
 
@@ -654,11 +779,28 @@ impl TableFile {
     }
 
     fn write_hwm_mmap(&self, logical: u64) {
+        let bytes = logical.to_le_bytes();
+        // Class A body: header HWM only (offset 8) via pwrite — map may be header-only.
+        if self.is_tx_body_fd() && !self.trailing_header {
+            let fd = self.read_file.as_raw_fd();
+            let rc = unsafe {
+                libc::pwrite(
+                    fd,
+                    bytes.as_ptr() as *const libc::c_void,
+                    8,
+                    8 as libc::off_t,
+                )
+            };
+            if rc != 8 {
+                // Best-effort HWM on map path used to silent-return; keep soft.
+                let _ = rc;
+            }
+            return;
+        }
         let pin = self.pin();
         if pin.epoch.cap() < logical.max(FILE_HEADER_LEN as u64) {
             return;
         }
-        let bytes = logical.to_le_bytes();
         let hwm_off = if self.trailing_header {
             logical
                 .saturating_sub(TRAILING_FOOTER_LEN as u64)
@@ -728,7 +870,8 @@ impl TableFile {
         Ok(())
     }
 
-    /// Walk a byte range without copying.
+    /// Walk a byte range. Class A body uses pread into a temporary buffer;
+    /// other tables may zero-copy from the map pin.
     pub fn with_bytes<R>(
         &self,
         offset: u64,
@@ -739,6 +882,11 @@ impl TableFile {
         let logical = self.published_len.load(Ordering::Acquire);
         if end > logical {
             return Err(StoreError::Corrupt("with_bytes past logical end"));
+        }
+        if self.is_tx_body_fd() {
+            let mut buf = vec![0u8; len as usize];
+            self.pread_at(offset, &mut buf)?;
+            return Ok(f(&buf));
         }
         let pin = self.pin();
         if end > pin.epoch.cap() {
@@ -751,20 +899,6 @@ impl TableFile {
         Ok(f(slice))
     }
 
-    /// Pin the map once and run `f(map_bytes, published_len)`.
-    ///
-    /// `map_bytes` may be longer than published; only `[0..published)` is valid
-    /// to read. Used for bulk random fixed-size peeks (e.g. 9-byte spender meta)
-    /// without a pread/io_uring op per offset.
-    #[inline]
-    pub(crate) fn with_map_pin<R>(&self, f: impl FnOnce(&[u8], u64) -> R) -> R {
-        let published = self.published_len.load(Ordering::Acquire);
-        let pin = self.pin();
-        let map_len = pin.epoch.map.len();
-        // SAFETY: pin holds the epoch Arc; map covers capacity.
-        let map = unsafe { std::slice::from_raw_parts(pin.epoch.as_ptr(), map_len) };
-        f(map, published)
-    }
 
     pub fn advise_dont_need(&self, offset: u64, len: u64) {
         if len == 0 {

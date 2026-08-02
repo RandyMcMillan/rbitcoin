@@ -15,7 +15,8 @@ use std::os::fd::RawFd;
 use std::path::Path;
 
 /// Default SQ/CQ depth (matches bulk_io).
-pub const DEFAULT_ENTRIES: u32 = 1024;
+/// SQ/CQ depth for all store io_uring sessions (body bulk + annotate + head stream).
+pub const DEFAULT_ENTRIES: u32 = 128;
 
 /// Owned io_uring for multi-stage submit/complete loops.
 pub struct UringSession {

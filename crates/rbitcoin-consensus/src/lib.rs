@@ -174,22 +174,16 @@ pub mod confirm_phase_stats {
     pub static SPEND_ANNOTATE_IDX: AtomicU64 = AtomicU64::new(0);
     /// Spends skipped (null create_fk or null spend_fk).
     pub static SPEND_ANNOTATE_SKIP: AtomicU64 = AtomicU64::new(0);
-    /// Pure-write annotate: mmap backend wall (ns) / edge count.
-    pub static SPEND_ANN_MMAP_NS: AtomicU64 = AtomicU64::new(0);
-    pub static SPEND_ANN_MMAP_N: AtomicU64 = AtomicU64::new(0);
-    /// Pure-write annotate: uring pwrite-only backend wall (ns) / edge count.
-    pub static SPEND_ANN_URING_NS: AtomicU64 = AtomicU64::new(0);
-    pub static SPEND_ANN_URING_N: AtomicU64 = AtomicU64::new(0);
+    /// Pure-write annotate wall (ns) / edge count (backend is uring or pwrite).
+    pub static SPEND_ANN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static SPEND_ANN_N: AtomicU64 = AtomicU64::new(0);
     /// Edges annotated without body pread (should equal all annotate edges).
     pub static SPEND_ANN_PREAD_SKIP: AtomicU64 = AtomicU64::new(0);
     /// Body preads on annotate (must stay 0 on pure-write write path).
     pub static SPEND_ANN_PREAD: AtomicU64 = AtomicU64::new(0);
-    /// Structural spent meta bulk read: mmap backend wall (ns) / peek count.
-    pub static SPEND_META_MMAP_NS: AtomicU64 = AtomicU64::new(0);
-    pub static SPEND_META_MMAP_N: AtomicU64 = AtomicU64::new(0);
-    /// Structural spent meta bulk read: uring/pread backend wall (ns) / peek count.
-    pub static SPEND_META_URING_NS: AtomicU64 = AtomicU64::new(0);
-    pub static SPEND_META_URING_N: AtomicU64 = AtomicU64::new(0);
+    /// Structural spent meta bulk read wall (ns) / peek count.
+    pub static SPEND_META_NS: AtomicU64 = AtomicU64::new(0);
+    pub static SPEND_META_N: AtomicU64 = AtomicU64::new(0);
     /// Header + body-fk resolve for the batch.
     pub static RESOLVE_NS: AtomicU64 = AtomicU64::new(0);
     /// Prep pre-assemble wall on the prep/load thread.
@@ -404,28 +398,38 @@ pub mod confirm_phase_stats {
         )
     }
 
-    /// Pure-write annotate A/B: (mmap_ns, mmap_n, uring_ns, uring_n, pread_skip, pread).
+    /// Pure-write annotate: (ann_ns, ann_n, pread_skip, pread).
     #[inline]
-    pub fn sample_spend_ann_ab_and_reset() -> (u64, u64, u64, u64, u64, u64) {
+    pub fn sample_spend_ann_and_reset() -> (u64, u64, u64, u64) {
         (
-            SPEND_ANN_MMAP_NS.swap(0, Ordering::Relaxed),
-            SPEND_ANN_MMAP_N.swap(0, Ordering::Relaxed),
-            SPEND_ANN_URING_NS.swap(0, Ordering::Relaxed),
-            SPEND_ANN_URING_N.swap(0, Ordering::Relaxed),
+            SPEND_ANN_NS.swap(0, Ordering::Relaxed),
+            SPEND_ANN_N.swap(0, Ordering::Relaxed),
             SPEND_ANN_PREAD_SKIP.swap(0, Ordering::Relaxed),
             SPEND_ANN_PREAD.swap(0, Ordering::Relaxed),
         )
     }
 
-    /// Structural meta A/B: (mmap_ns, mmap_n, uring_ns, uring_n).
+    /// Structural meta: (meta_ns, meta_n).
+    #[inline]
+    pub fn sample_spend_meta_and_reset() -> (u64, u64) {
+        (
+            SPEND_META_NS.swap(0, Ordering::Relaxed),
+            SPEND_META_N.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    /// Backward-compat alias — returns zeros for removed mmap half of the tuple.
+    #[inline]
+    pub fn sample_spend_ann_ab_and_reset() -> (u64, u64, u64, u64, u64, u64) {
+        let (ns, n, skip, pread) = sample_spend_ann_and_reset();
+        (0, 0, ns, n, skip, pread)
+    }
+
+    /// Backward-compat alias — mmap half is always zero.
     #[inline]
     pub fn sample_spend_meta_ab_and_reset() -> (u64, u64, u64, u64) {
-        (
-            SPEND_META_MMAP_NS.swap(0, Ordering::Relaxed),
-            SPEND_META_MMAP_N.swap(0, Ordering::Relaxed),
-            SPEND_META_URING_NS.swap(0, Ordering::Relaxed),
-            SPEND_META_URING_N.swap(0, Ordering::Relaxed),
-        )
+        let (ns, n) = sample_spend_meta_and_reset();
+        (0, 0, ns, n)
     }
 }
 

@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::fd::RawFd;
 
 const META_LEN: usize = 9;
-const MAX_SLOTS: usize = 512;
+const MAX_SLOTS: usize = 128;
 
 enum Phase {
     Reading,
@@ -299,13 +299,11 @@ fn next_ready(
 
 // ── Pure-write annotate (structural-known meta; no body pread) ─────────────
 
-/// Annotate backend for pure-write path.
+/// Annotate backend for pure-write path (Class A body never mmap'd).
 ///
 /// Selected via `RBITCOIN_SPEND_ANN` / global `RBITCOIN_IO` (see [`crate::io_backend`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpendAnnBackend {
-    /// Store 9 B via mmap epoch pin (`write_at`).
-    Mmap,
     /// Store 9 B via io_uring pwrite only (no pread).
     Uring,
     /// Store 9 B via libc `pwrite` (positional, no ring).
@@ -316,7 +314,6 @@ pub enum SpendAnnBackend {
 #[inline]
 pub fn spend_ann_backend() -> SpendAnnBackend {
     match crate::io_backend::spend_ann_io_backend() {
-        crate::io_backend::WriteIoBackend::Mmap => SpendAnnBackend::Mmap,
         crate::io_backend::WriteIoBackend::Uring => SpendAnnBackend::Uring,
         crate::io_backend::WriteIoBackend::Pwrite => SpendAnnBackend::Pwrite,
     }
@@ -412,14 +409,6 @@ pub fn put_spend_batch_by_abs_meta_known(
     }
 
     match backend {
-        SpendAnnBackend::Mmap => {
-            for &(abs, cfk, vout, sfk, meta) in &writes {
-                if let Err(_) = txs.body.write_body_abs(abs, &meta) {
-                    cold.push((cfk, vout, sfk));
-                }
-            }
-            Ok(cold)
-        }
         SpendAnnBackend::Uring => put_spend_batch_pure_write_uring(txs, &writes, cold),
         SpendAnnBackend::Pwrite => put_spend_batch_pure_write_pwrite(txs, &writes, cold),
     }
@@ -453,10 +442,10 @@ fn put_spend_batch_pure_write_uring(
         Ok(s) => s,
         Err(e) => {
             rbitcoin_log::debug!(
-                "store: spend annotate pure-write uring unavailable ({e}); mmap fallback"
+                "store: spend annotate pure-write uring unavailable ({e}); pwrite fallback"
             );
             for &(abs, cfk, vout, sfk, meta) in writes {
-                if let Err(_) = txs.body.write_body_abs(abs, &meta) {
+                if let Err(_) = txs.body.write_body_abs_pwrite(abs, &meta) {
                     cold.push((cfk, vout, sfk));
                 }
             }
@@ -601,11 +590,7 @@ mod tests {
 
     #[test]
     fn pure_write_known_null_mmap_and_uring() {
-        for backend in [
-            SpendAnnBackend::Mmap,
-            SpendAnnBackend::Uring,
-            SpendAnnBackend::Pwrite,
-        ] {
+        for backend in [SpendAnnBackend::Uring, SpendAnnBackend::Pwrite] {
             let (dir, t, spenders) = temp_table();
             let (cfk, off, len) = put_one(&t);
             let decoded = t.get_meta_and_outputs_batch_at(&[(off, len)]).unwrap();
@@ -646,7 +631,7 @@ mod tests {
             &spenders,
             &[(abs, cfk, 0, sfk)],
             &[(field, flags)],
-            SpendAnnBackend::Mmap,
+            SpendAnnBackend::Pwrite,
         )
         .unwrap();
         // Second time with known field==sfk → skip
@@ -655,7 +640,7 @@ mod tests {
             &spenders,
             &[(abs, cfk, 0, sfk)],
             &[(sfk, 0)],
-            SpendAnnBackend::Mmap,
+            SpendAnnBackend::Pwrite,
         )
         .unwrap();
         let bulk2 = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();

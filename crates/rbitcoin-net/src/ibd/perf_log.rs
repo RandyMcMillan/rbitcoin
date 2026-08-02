@@ -119,21 +119,16 @@ pub(crate) struct IbdPerfSample {
     pub spend_ranged: u64,
     pub spend_idx: u64,
     pub spend_skip: u64,
-    /// Pure-write annotate A/B: mmap backend wall ms / edge count.
-    pub ann_mmap_ms: u64,
-    pub ann_mmap_n: u64,
-    /// Pure-write annotate A/B: uring pwrite-only wall ms / edge count.
-    pub ann_uring_ms: u64,
-    pub ann_uring_n: u64,
+    /// Pure-write annotate wall ms / edge count.
+    pub ann_ms: u64,
+    pub ann_n: u64,
     /// Annotate edges without body pread (should equal annotate edges).
     pub ann_pread_skip: u64,
     /// Annotate body preads (must stay 0 on pure-write path).
     pub ann_pread: u64,
-    /// Structural meta bulk read A/B: mmap vs uring wall ms / peek count.
-    pub meta_mmap_ms: u64,
-    pub meta_mmap_n: u64,
-    pub meta_uring_ms: u64,
-    pub meta_uring_n: u64,
+    /// Structural meta bulk read wall ms / peek count.
+    pub meta_ms: u64,
+    pub meta_n: u64,
     pub resolve_ms: u64,
     pub load_ms: u64,
     /// Wire prep residual (inside load/pre_asm, outside pin): Arc clone.
@@ -393,16 +388,12 @@ impl Default for IbdPerfSample {
             spend_ranged: 0,
             spend_idx: 0,
             spend_skip: 0,
-            ann_mmap_ms: 0,
-            ann_mmap_n: 0,
-            ann_uring_ms: 0,
-            ann_uring_n: 0,
+            ann_ms: 0,
+            ann_n: 0,
             ann_pread_skip: 0,
             ann_pread: 0,
-            meta_mmap_ms: 0,
-            meta_mmap_n: 0,
-            meta_uring_ms: 0,
-            meta_uring_n: 0,
+            meta_ms: 0,
+            meta_n: 0,
             resolve_ms: 0,
             load_ms: 0,
             prep_wire_arc_ms: 0,
@@ -724,10 +715,10 @@ pub(crate) fn sample(
         rbitcoin_consensus::confirm_phase_stats::sample_class_a_ensure_and_reset();
     let (spent_abs_ns, spent_strong_ns, spent_cold_ns, spent_pending_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_spent_sub_and_reset();
-    let (ann_mmap_ns, ann_mmap_n, ann_uring_ns, ann_uring_n, ann_pread_skip, ann_pread) =
-        rbitcoin_consensus::confirm_phase_stats::sample_spend_ann_ab_and_reset();
-    let (meta_mmap_ns, meta_mmap_n, meta_uring_ns, meta_uring_n) =
-        rbitcoin_consensus::confirm_phase_stats::sample_spend_meta_ab_and_reset();
+    let (ann_ns, ann_n, ann_pread_skip, ann_pread) =
+        rbitcoin_consensus::confirm_phase_stats::sample_spend_ann_and_reset();
+    let (meta_ns, meta_n) =
+        rbitcoin_consensus::confirm_phase_stats::sample_spend_meta_and_reset();
     let (ensure_res_hit, ensure_cold_n) =
         rbitcoin_consensus::confirm_phase_stats::sample_ensure_mix_and_reset();
     let (asm_prevout_ns, asm_sigop_ns, asm_final_ns, asm_job_ns) =
@@ -804,16 +795,12 @@ pub(crate) fn sample(
         spend_ranged,
         spend_idx,
         spend_skip,
-        ann_mmap_ms: ns_ms(ann_mmap_ns),
-        ann_mmap_n,
-        ann_uring_ms: ns_ms(ann_uring_ns),
-        ann_uring_n,
+        ann_ms: ns_ms(ann_ns),
+        ann_n,
         ann_pread_skip,
         ann_pread,
-        meta_mmap_ms: ns_ms(meta_mmap_ns),
-        meta_mmap_n,
-        meta_uring_ms: ns_ms(meta_uring_ns),
-        meta_uring_n,
+        meta_ms: ns_ms(meta_ns),
+        meta_n,
         resolve_ms: ns_ms(resolve_ns),
         load_ms: ns_ms(load_ns),
         prep_wire_arc_ms: ns_ms(prep_wire_arc_ns),
@@ -1229,8 +1216,8 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         " | write class_a={}ms ensure={}ms(res={} cold={}) struct={}ms(spent={} create_h={} bip68={}) \
          spent_sub(abs={} strong={} cold={} pending={}) \
          class_c={}ms sh={}ms spend={}ms tip_gc={}ms \
-         ann_mmap={}ms/n={} ann_uring={}ms/n={} pread_skip={} pread={} \
-         meta_mmap={}ms/n={} meta_uring={}ms/n={}",
+         ann={}ms/n={} pread_skip={} pread={} \
+         meta={}ms/n={}",
         s.class_a_ms,
         s.ensure_ms,
         s.ensure_res_hit,
@@ -1247,16 +1234,12 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.sh_ms,
         s.utxo_ms,
         s.cache_tip_ms,
-        s.ann_mmap_ms,
-        s.ann_mmap_n,
-        s.ann_uring_ms,
-        s.ann_uring_n,
+        s.ann_ms,
+        s.ann_n,
         s.ann_pread_skip,
         s.ann_pread,
-        s.meta_mmap_ms,
-        s.meta_mmap_n,
-        s.meta_uring_ms,
-        s.meta_uring_n,
+        s.meta_ms,
+        s.meta_n,
     ));
     // Class A body/head/residency-seed detail when present (from archive commit).
     if s.arch_write_body_ms > 0

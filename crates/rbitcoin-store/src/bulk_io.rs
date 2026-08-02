@@ -17,7 +17,7 @@
 //! - `RBITCOIN_BULK_IO_WORKERS` — parallel pread workers when uring is off
 //!   (default `min(CPUs, 16)`; `1` = serial). Writes fall back to serial pwrite.
 //!
-//! Ring entries: [`crate::uring_session::DEFAULT_ENTRIES`] (1024). Large waves
+//! Ring entries: [`crate::uring_session::DEFAULT_ENTRIES`] (128). Large waves
 //! keep the ring full: submit up to depth outstanding ops, then refill as CQEs
 //! complete (pipelined, not stop-and-wait chunks).
 //!
@@ -141,10 +141,7 @@ pub fn pread_batch_backend(ops: &mut [ReadOp<'_>], backend: crate::io_backend::R
             }
             pread_batch_fallback(ops);
         }
-        ReadIoBackend::Pread | ReadIoBackend::Mmap => {
-            // Mmap bulk body is handled by the caller; if someone routes here, pread.
-            pread_batch_fallback(ops);
-        }
+        ReadIoBackend::Pread => pread_batch_fallback(ops),
     }
 }
 
@@ -165,7 +162,7 @@ pub fn pwrite_batch(ops: &mut [WriteOp<'_>]) {
 
 /// Pipelined page RMW on the thread-local ring:
 ///
-/// 1. Submit page preads (fill ring up to 1024).
+/// 1. Submit page preads (fill ring up to DEFAULT_ENTRIES).
 /// 2. On each read CQE: run `apply(page_index, buf)` — mutate in place; return
 ///    `true` if the page is dirty and needs write-back.
 /// 3. Immediately submit dirty pages for pwrite; keep free slots filled with
@@ -1231,11 +1228,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Forces multi-fill of the 1024-deep ring (N > RING_ENTRIES) and checks
-    /// every byte — exercises pipelined refill, not just a single wave.
+    /// Forces multi-fill of the ring (N > RING_ENTRIES) and checks every byte —
+    /// exercises pipelined refill, not just a single wave.
     #[test]
     fn pread_batch_pipeline_over_ring_depth() {
-        const N: usize = 1500;
+        const N: usize = 200;
         assert!(N > RING_ENTRIES as usize);
 
         let dir = std::env::temp_dir().join(format!(

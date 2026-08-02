@@ -1112,17 +1112,9 @@ pub(crate) fn structural_validate_spends(
             .map_err(ConsensusError::Store)?;
         let meta_ns = t_meta.elapsed().as_nanos() as u64;
         let n_meta = abs_offs.len() as u64;
-        match meta_backend {
-            rbitcoin_store::SpendMetaBackend::Mmap => {
-                confirm_phase_stats::SPEND_META_MMAP_NS.fetch_add(meta_ns, Ordering::Relaxed);
-                confirm_phase_stats::SPEND_META_MMAP_N.fetch_add(n_meta, Ordering::Relaxed);
-            }
-            rbitcoin_store::SpendMetaBackend::Uring
-            | rbitcoin_store::SpendMetaBackend::Pread => {
-                confirm_phase_stats::SPEND_META_URING_NS.fetch_add(meta_ns, Ordering::Relaxed);
-                confirm_phase_stats::SPEND_META_URING_N.fetch_add(n_meta, Ordering::Relaxed);
-            }
-        }
+        confirm_phase_stats::SPEND_META_NS.fetch_add(meta_ns, Ordering::Relaxed);
+        confirm_phase_stats::SPEND_META_N.fetch_add(n_meta, Ordering::Relaxed);
+        let _ = meta_backend;
         let t_strong = Instant::now();
         for (i, &(id, vout, abs)) in abs_jobs.iter().enumerate() {
             let Some((field, flags)) = metas[i] else {

@@ -30,13 +30,12 @@ Recent tidy pass (what was deleted vs intentional dual paths):
                  Electrum joins   ◄────┘  Class A + SH + mempool
 ```
 
-**IBD height-ordered path (current):** peer decode **offers wire into the body
-queue** and notes readiness on the confirm feed; confirm **prep** reloads wire
-by height, **scripts** are pure CPU, **commit** is the only Class A appender
-and dequeues the body-queue entry after tip advance. There is **no** primary
-“archive Class A far ahead of tip, then reload for confirm” dual track.
-Unknown-height / abort-only archive-job + ContigPark remains a **fallback**
-(see [`concurrency.md`](./concurrency.md)).
+**IBD height-ordered path (current):** peer **offers raw framed wire into the
+body queue** and notes readiness on the confirm feed; confirm **prep** reloads
+wire by height, **scripts** are pure CPU, **commit** is the only Class A
+appender and dequeues the body-queue entry after tip advance. There is **no**
+dual-track “archive Class A far ahead of tip” path and **no** ContigPark /
+archive-job fallback for unknown-height bodies (mark missing → re-getdata).
 
 - **Storage center** is a **transaction-relational mmap archive**, not a UTXO
   set + LevelDB chainstate.
@@ -130,10 +129,9 @@ budgets: [`docs/ibd-memory.md`](./ibd-memory.md).
    (CPU only) → commit** so disk work, script verify, and Class A/C publish
    overlap without pausing queries under a map lock. Confirm commit is the
    **sole Class A appender** on the unified IBD path.
-4. **Request-bounded wire memory.** Durable **body-queue byte budget** (and a
-   soft RAM overflow / archive-job budget for the fallback path) limit new
-   densify `getdata` — **not** peer TCP read/decode of already-requested
-   blocks (see ibd-memory).
+4. **Request-bounded wire memory.** Durable **body-queue soft time-depth**
+   (and optional absolute byte ceiling) limit new densify `getdata` — **not**
+   peer TCP accept of already-requested blocks (see ibd-memory).
 5. **Bulk IO.** Linux prefers **io_uring** for multi-read / RMW paths (confirm
    bodies, head resolve, spend annotate) with a **thread-local** bulk ring for
    batch pread/pwrite; `RBITCOIN_IO_URING=0` (or non-Linux) falls back to

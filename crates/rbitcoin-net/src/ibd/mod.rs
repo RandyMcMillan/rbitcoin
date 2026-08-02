@@ -26,9 +26,7 @@ mod progress;
 mod state;
 mod status;
 
-use archive::{
-    rehydrate_block_queue_into_confirm, ArchivePipelineStats, ArchiveQueueBudget,
-};
+use archive::{rehydrate_block_queue_into_confirm, ArchiveQueueBudget};
 use assign_plan::{remove_from_ordered, want_headers_beyond_soft_cap};
 // compact_ordered used via IbdWorkState::hygiene
 use confirm::{offer_confirm_ready, spawn_confirm_engine, ConfirmEvent, ConfirmFeed};
@@ -119,7 +117,7 @@ pub(crate) const FAR_SCAN_BUDGET: usize = 65_536;
 /// This height cap stops unbounded far getdata when the soft count target is
 /// still large (e.g. very high tip rate) or cold-start floors admit densify
 /// while early blocks are tiny. Also used as the hard receive refuse horizon
-/// past tip (and ContigPark).
+/// past tip.
 pub(crate) const CONTIG_DENSIFY_AHEAD: u32 = 65_536;
 
 /// Tunables for IBD (defaults lean libbitcoin/Core-ish).
@@ -352,15 +350,13 @@ pub async fn ibd_cancellable(
         }
     }
 
-    // Soft RAM budget for body-queue overflow + unknown-height archive-job fallback
-    // (not multi‑GiB disk body queue). Densify getdata scales with free headroom
-    // (90%/70% hysteresis) — never drops in-flight, only throttles new densify.
+    // Soft densify meter (far-scale / can_assign). Primary depth gate is durable
+    // BQ soft time-depth; this budget has no dual-track job charges anymore.
     let archive_queued = ArchiveQueueBudget::from_env();
     info!(
-        "ibd: soft wire budget={} MiB (RBITCOIN_ARCHIVE_QUEUE_MB; RAM overflow / fallback jobs)",
+        "ibd: soft densify budget={} MiB (RBITCOIN_ARCHIVE_QUEUE_MB)",
         archive_queued.budget_bytes() / (1024 * 1024)
     );
-    let pipe_stats = Arc::new(ArchivePipelineStats::default());
     let loop_stats = Arc::new(LoopStats::default());
     // Seed Class A body count from disk (not zero at restart).
     let store_class_a_bodies = hub.query.archived_block_count().unwrap_or(0);
@@ -484,11 +480,6 @@ pub async fn ibd_cancellable(
                     last_progress = Instant::now();
                     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
                     // Unified wire path charged archive_queued on receive; release here.
-                    if let Some(wb) = st.body.take_archive_charge_bytes(&hash) {
-                        archive_queued.release(wb);
-                    } else {
-                        st.body.clear_archive_charged(&hash);
-                    }
                     st.body.mark_archived(hash);
                     let tip = hub.tip_height().unwrap_or(0);
                     archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
@@ -507,7 +498,6 @@ pub async fn ibd_cancellable(
                         height,
                         hash,
                         &err,
-                        Some(&archive_queued),
                         Some(hub.query.as_ref()),
                     );
                 }
@@ -597,11 +587,6 @@ pub async fn ibd_cancellable(
                     last_progress = Instant::now();
                     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
                     // Unified wire path charged archive_queued on receive; release here.
-                    if let Some(wb) = st.body.take_archive_charge_bytes(&hash) {
-                        archive_queued.release(wb);
-                    } else {
-                        st.body.clear_archive_charged(&hash);
-                    }
                     st.body.mark_archived(hash);
                     let tip = hub.tip_height().unwrap_or(0);
                     archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
@@ -618,7 +603,6 @@ pub async fn ibd_cancellable(
                         height,
                         hash,
                         &err,
-                        Some(&archive_queued),
                         Some(hub.query.as_ref()),
                     );
                 }
@@ -975,7 +959,6 @@ pub async fn ibd_cancellable(
             let rss = perf_log::read_proc_rss();
             let perf = perf_log::sample(
                 &loop_stats,
-                &pipe_stats,
                 st.inflight.len(),
                 inflight_cap,
                 arch_q_now,
@@ -1184,11 +1167,6 @@ pub async fn ibd_cancellable(
                             last_progress = Instant::now();
                             remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
                             // Same release as main-loop drains (wire-path charge).
-                            if let Some(wb) = st.body.take_archive_charge_bytes(&hash) {
-                                archive_queued.release(wb);
-                            } else {
-                                st.body.clear_archive_charged(&hash);
-                            }
                             st.body.mark_archived(hash);
                             let tip = hub.tip_height().unwrap_or(0);
                             archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
@@ -1201,13 +1179,12 @@ pub async fn ibd_cancellable(
                         }
                         ConfirmEvent::Reject { height, hash, err } => {
                             apply_confirm_reject(
-                                &mut st,
-                                height,
-                                hash,
-                                &err,
-                                Some(&archive_queued),
-                                Some(hub.query.as_ref()),
-                            );
+                        &mut st,
+                        height,
+                        hash,
+                        &err,
+                        Some(hub.query.as_ref()),
+                    );
                         }
                     }
                 }
@@ -1390,66 +1367,13 @@ mod tip_hole_race_tests {
 }
 
 #[cfg(test)]
-mod park_race_assign_tests {
-    use super::assign::{archive_pipeline_saturated, park_race_need};
-    use super::state::IbdWorkState;
-
-    use bitcoin::hashes::Hash;
-    use bitcoin::BlockHash;
-    use rbitcoin_consensus::{ChainParams, Milestone};
-    use rbitcoin_query::Query;
-
-    fn h(n: u32) -> BlockHash {
-        let mut b = [0u8; 32];
-        b[0..4].copy_from_slice(&n.to_le_bytes());
-        BlockHash::from_byte_array(b)
-    }
-
-    #[test]
-    fn park_race_need_tip_batch_window() {
-        let dir = std::env::temp_dir().join(format!(
-            "rbitcoin-park-race-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let q = Query::open_or_create(dir.join("store")).unwrap();
-        let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
-
-        let mut st = IbdWorkState::new(vec![], None, None);
-        // Heights 100..=140; tip batch is write_next..+TIP_HOLE_MAX-1 (32).
-        for ht in 100u32..=140 {
-            let hash = h(ht);
-            st.record_height(hash, ht);
-            st.ordered_set.insert(hash);
-            st.ordered.push_back(hash);
-            st.max_ordered_height = ht;
-        }
-        st.body.mark_pending(h(100));
-        st.body.mark_archived(h(101));
-        st.inflight
-            .insert(h(102), super::state::InflightReq::new(0));
-
-        let need = park_race_need(&mut st, &hub, 100);
-        assert!(!need.is_empty(), "expected tip-batch need");
-        assert_eq!(need[0], h(102), "inflight kept for multi-peer race");
-        assert!(need.iter().all(|x| *x != h(100) && *x != h(101)));
-        let batch_hi = 100 + super::TIP_HOLE_MAX as u32 - 1;
-        for hash in &need {
-            let ht = st.hash_height[hash];
-            assert!((100..=batch_hi).contains(&ht), "ht={ht} outside tip batch");
-        }
-        assert!(!need.contains(&h(batch_hi + 1)));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+mod archive_sat_tests {
+    use super::assign::archive_pipeline_saturated;
 
     #[test]
     fn archive_pipeline_saturated_gates_full_assign() {
         assert!(!archive_pipeline_saturated(0, 0, false, 0.0));
-        assert!(!archive_pipeline_saturated(200, 32, true, 0.95)); // inflight still high
-        // Pending alone does **not** gate densify (body-queue model).
+        assert!(!archive_pipeline_saturated(200, 32, true, 0.95));
         assert!(!archive_pipeline_saturated(96, 0, false, 0.0));
         assert!(archive_pipeline_saturated(0, 0, false, 0.85));
         assert!(archive_pipeline_saturated(200, 15, true, 0.0));

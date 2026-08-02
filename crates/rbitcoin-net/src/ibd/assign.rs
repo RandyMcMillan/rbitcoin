@@ -71,18 +71,6 @@ pub(crate) fn inflight_add_peer(
         .add_peer(peer);
 }
 
-/// Scale densify per-peer slots by admission (`0.0`..=`1.0`).
-#[cfg(test)]
-pub(crate) fn scale_feed_cap(base: usize, scale: f64) -> usize {
-    if base == 0 || scale <= 0.0 {
-        return 0;
-    }
-    if scale >= 1.0 {
-        return base;
-    }
-    let scaled = ((base as f64) * scale).ceil() as usize;
-    scaled.max(1).min(base)
-}
 
 /// True when soft body-queue depth is latched and getdata inflight is low.
 ///
@@ -266,7 +254,6 @@ fn need_hash_at(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> Option<BlockH
     }
     if st.body.is_known_archived(&h)
         || st.body.is_pending(&h)
-        || st.body.is_archive_charged(&h)
         || st.body.is_rejected(&h)
     {
         return None;
@@ -288,7 +275,6 @@ pub(crate) fn pop_need(
 ) -> Option<BlockHash> {
     while let Some(h) = q.pop_front() {
         if st.body.skip_download(hub, &h)
-            || st.body.is_archive_charged(&h)
             || st.inflight.contains_key(&h)
         {
             continue;
@@ -434,7 +420,6 @@ pub(crate) fn cover_tip_holes(
     for &h in holes {
         if hub.has_block(&h)
             || st.body.is_pending(&h)
-            || st.body.is_archive_charged(&h)
             || st.body.ready(hub, &h)
         {
             continue;
@@ -486,37 +471,6 @@ pub(crate) fn cover_tip_holes(
     issued
 }
 
-/// Tip-batch hashes that still need getdata coverage (tests).
-#[cfg(test)]
-pub(crate) fn park_race_need(
-    st: &mut IbdWorkState,
-    hub: &ChainHub,
-    write_next: u32,
-) -> Vec<BlockHash> {
-    let mut out = Vec::new();
-    let hi = write_next.saturating_add(TIP_HOLE_MAX.saturating_sub(1) as u32);
-    for ht in write_next..=hi {
-        let Some(&h) = st.height_to_hash.get(&ht) else {
-            continue;
-        };
-        if st.body.is_known_archived(&h)
-            || st.body.is_pending(&h)
-            || st.body.is_archive_charged(&h)
-            || st.body.is_rejected(&h)
-        {
-            continue;
-        }
-        if st.inflight.contains_key(&h) {
-            out.push(h);
-            continue;
-        }
-        if st.body.skip_download(hub, &h) {
-            continue;
-        }
-        out.push(h);
-    }
-    out
-}
 
 #[cfg(test)]
 mod tests {
@@ -637,10 +591,6 @@ mod tests {
 
     #[test]
     fn scale_and_saturated_helpers() {
-        assert_eq!(scale_feed_cap(0, 1.0), 0);
-        assert_eq!(scale_feed_cap(10, 0.0), 0);
-        assert_eq!(scale_feed_cap(10, 1.0), 10);
-        assert_eq!(scale_feed_cap(10, 0.25), 3);
         assert!(!archive_pipeline_saturated(0, 20, false, 1.0));
         assert!(!archive_pipeline_saturated(96, 0, false, 0.0));
         assert!(archive_pipeline_saturated(0, 0, false, 0.85));
@@ -836,7 +786,7 @@ mod tests {
             st.body.mark_missing(hash);
         }
         st.body.mark_pending(h(5));
-        let _ = st.body.expire_stale_pending(std::time::Duration::ZERO);
+        let _ = st.body.expire_stale_pending_if(std::time::Duration::ZERO, |_| true);
         st.body.mark_pending(h(5));
         st.body.mark_pending(h(1));
         let expired = st
@@ -892,8 +842,6 @@ mod tests {
             st.slots[0].in_flight.insert(hash);
             inflight_add_peer(&mut st.inflight, hash, 0);
         }
-        let need = park_race_need(&mut st, &hub, 1);
-        assert!(!need.is_empty());
         assign_work_ordered(
             &mut st,
             &hub,

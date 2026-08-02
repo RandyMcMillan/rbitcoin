@@ -115,8 +115,8 @@ pub(crate) fn tip_fetch_hole(
         None => 0u32,
         Some(t) => t.saturating_add(1),
     };
-    let mut hole = 0usize;
     let limit = path_lo.saturating_add(TIP_HOLE_SCAN_MAX);
+    let mut flags = Vec::new();
     for ht in path_lo..=limit {
         let Some(&hash) = height_to_hash.get(&ht) else {
             break;
@@ -124,12 +124,9 @@ pub(crate) fn tip_fetch_hole(
         if body.is_rejected(&hash) {
             break;
         }
-        if claim_ready(hub, body, ht, &hash) {
-            break;
-        }
-        hole = hole.saturating_add(1);
+        flags.push(claim_ready(hub, body, ht, &hash));
     }
-    hole
+    tip_hole_from_claim_ready(&flags)
 }
 
 /// Build a status snapshot for the ~5s operator tick.
@@ -280,11 +277,10 @@ pub(crate) fn format_rate(rate: f64) -> String {
     }
 }
 
-/// Pure tip-hole count over tip+1.. using claim-ready flags
-/// (unit-test helper; production uses [`tip_fetch_hole`]).
+/// Pure tip-hole count over tip+1.. using claim-ready flags.
 ///
-/// `claim_ready[i]` corresponds to height path_lo+i.
-#[cfg(test)]
+/// `claim_ready[i]` corresponds to height path_lo+i. Production
+/// [`tip_fetch_hole`] walks heights and builds the same sequential hole count.
 pub(crate) fn tip_hole_from_claim_ready(claim_ready_flags: &[bool]) -> usize {
     let mut tip_hole = 0usize;
     for &ready in claim_ready_flags {

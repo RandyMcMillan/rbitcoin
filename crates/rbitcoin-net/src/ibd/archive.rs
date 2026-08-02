@@ -7,100 +7,13 @@ use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use rbitcoin_primitives::Fk;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// Shared archive-pipeline timers for IBD status (atomics; reset on sample).
-#[derive(Default)]
-pub(crate) struct ArchivePipelineStats {
-    pub(crate) prep_ns: AtomicU64,
-    pub(crate) prep_blocks: AtomicU64,
-    pub(crate) write_ns: AtomicU64,
-    pub(crate) write_batches: AtomicU64,
-    pub(crate) write_blocks: AtomicU64,
-    pub(crate) write_batch_blocks: AtomicU64,
-    pub(crate) write_idle_ns: AtomicU64,
-    pub(crate) write_coalesce_ns: AtomicU64,
-}
-
-impl ArchivePipelineStats {
-    pub(crate) fn sample_and_reset(&self) -> ArchivePipelineSample {
-        let prep_ns = self.prep_ns.swap(0, Ordering::Relaxed);
-        let prep_blocks = self.prep_blocks.swap(0, Ordering::Relaxed);
-        let write_ns = self.write_ns.swap(0, Ordering::Relaxed);
-        let write_batches = self.write_batches.swap(0, Ordering::Relaxed);
-        let write_blocks = self.write_blocks.swap(0, Ordering::Relaxed);
-        let write_batch_blocks = self.write_batch_blocks.swap(0, Ordering::Relaxed);
-        let write_idle_ns = self.write_idle_ns.swap(0, Ordering::Relaxed);
-        let write_coalesce_ns = self.write_coalesce_ns.swap(0, Ordering::Relaxed);
-        ArchivePipelineSample {
-            prep_ns,
-            prep_blocks,
-            write_ns,
-            write_batches,
-            write_blocks,
-            write_batch_blocks,
-            write_idle_ns,
-            write_coalesce_ns,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ArchivePipelineSample {
-    pub(crate) prep_ns: u64,
-    pub(crate) prep_blocks: u64,
-    pub(crate) write_ns: u64,
-    pub(crate) write_batches: u64,
-    pub(crate) write_blocks: u64,
-    pub(crate) write_batch_blocks: u64,
-    pub(crate) write_idle_ns: u64,
-    pub(crate) write_coalesce_ns: u64,
-}
-
-impl ArchivePipelineSample {
-    pub(crate) fn prep_us_per_block(&self) -> u64 {
-        if self.prep_blocks == 0 {
-            0
-        } else {
-            (self.prep_ns / self.prep_blocks) / 1000
-        }
-    }
-    pub(crate) fn write_us_per_block(&self) -> u64 {
-        if self.write_blocks == 0 {
-            0
-        } else {
-            (self.write_ns / self.write_blocks) / 1000
-        }
-    }
-    pub(crate) fn avg_batch(&self) -> u64 {
-        if self.write_batches == 0 {
-            0
-        } else {
-            self.write_batch_blocks / self.write_batches
-        }
-    }
-    pub(crate) fn write_busy_ms(&self) -> u64 {
-        self.write_ns / 1_000_000
-    }
-    pub(crate) fn write_idle_ms(&self) -> u64 {
-        self.write_idle_ns / 1_000_000
-    }
-    pub(crate) fn write_coalesce_ms(&self) -> u64 {
-        self.write_coalesce_ns / 1_000_000
-    }
-    pub(crate) fn prep_ms(&self) -> u64 {
-        self.prep_ns / 1_000_000
-    }
-}
-
-
-/// Default RAM budget for decoded blocks waiting in the archive pipeline (~512 MiB).
-/// Override with env `RBITCOIN_ARCHIVE_QUEUE_MB`.
+/// Default soft densify budget (~512 MiB). Override with `RBITCOIN_ARCHIVE_QUEUE_MB`.
 ///
-/// Sized so network stays busy and ContigPark can form mega-batches without a
-/// multi‑GiB junkyard. Wire-size undercounts true RSS of decoded `Block` + prep
-/// (×1.5 charge); still stacked with parent-body decode + page cache.
+/// Historically charged dual-track archive jobs; now a soft densify/far-scale
+/// meter only (no job charge/release on the unified body-queue path).
 pub const DEFAULT_ARCHIVE_QUEUE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Enter “pressure” (far_scale = 0) when fill ≥ this fraction of budget.
@@ -108,17 +21,13 @@ pub const ARCHIVE_PRESSURE_ENTER: f64 = 0.90;
 /// Leave pressure only after fill ≤ this (hysteresis vs enter).
 pub const ARCHIVE_PRESSURE_EXIT: f64 = 0.70;
 
-/// Shared counter of blocks (and approx wire bytes) in the archive pipeline.
+/// Soft densify meter for getdata admission (not a receive/decode gate).
 ///
-/// Charged when a decoded body is handed to the job channel; released when the
-/// writer (or prep error path) returns [`ArchiveResult`].
-///
-/// **Assign gate only (never a receive / decode gate):** [`Self::can_assign`] is
-/// false once charged fill ≥ budget — stop issuing new densify/cache getdata.
-/// Bodies already requested must still be read from TCP, decoded, [`charge`]d,
-/// and enqueued (may briefly overshoot). Soft [`Self::far_admission_scale`]
-/// (proportional + 90%/70% hysteresis) scales densify capacity before the hard
-/// stop. Do **not** stall peer reads or Full-drop arch_job for soft budget.
+/// [`Self::can_assign`] is false once fill ≥ budget — stop new densify getdata.
+/// Soft [`Self::far_admission_scale`] (proportional + 90%/70% hysteresis) scales
+/// densify capacity before the hard stop. Dual-track job charge/release is gone;
+/// without a charger this stays empty and always admits (durable BQ soft depth
+/// is the primary densify gate).
 pub(crate) struct ArchiveQueueBudget {
     count: AtomicUsize,
     bytes: AtomicUsize,
@@ -172,7 +81,7 @@ impl ArchiveQueueBudget {
     /// - **Proportional (B):** outside pressure, `scale = (1 - fill).clamp(0, 1)`
     ///   so half-full budget ≈ half far work (smooth BW, no cliff at budget).
     ///
-    /// ContigPark gap + tip-near are **not** gated by this (assign always covers them).
+    /// Tip-hole race is **not** gated by this (assign always covers tip holes).
     pub fn far_admission_scale(&self) -> f64 {
         let fill = self.fill_ratio();
         let was = self.pressure.load(Ordering::Relaxed);
@@ -196,37 +105,11 @@ impl ArchiveQueueBudget {
         (scale, pressure)
     }
 
-    /// Charge bytes (test / residual soft-budget helpers).
-    #[cfg(test)]
-    pub fn charge(&self, wire_bytes: usize) {
-        let charged = Self::charged_bytes(wire_bytes);
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.bytes.fetch_add(charged, Ordering::Relaxed);
-    }
 
-    /// Same overhead as [`charge`] — callers must release the charged amount.
-    pub fn charged_bytes(wire_bytes: usize) -> usize {
-        wire_bytes.saturating_mul(3).saturating_add(4096) / 2
-    }
-
-    /// True while charged fill is **strictly below** budget — issue densify /
-    /// confirm-cache getdata. Tip-hole and ContigPark race assign ignore this
-    /// so a hole at `write_next` can still be filled when the queue is full.
+    /// True while charged fill is **strictly below** budget — issue densify
+    /// getdata. Soft meter (no dual-track job charges on the unified path).
     pub fn can_assign(&self) -> bool {
         self.bytes() < self.budget
-    }
-
-    /// Release after archive Ok/Err (or failed send into a closed pipeline).
-    ///
-    /// Pass the original **wire** size; overhead is re-derived via [`charged_bytes`].
-    pub fn release(&self, wire_bytes: usize) {
-        let charged = Self::charged_bytes(wire_bytes);
-        let _ = self.count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            Some(n.saturating_sub(1))
-        });
-        let _ = self.bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            Some(n.saturating_sub(charged))
-        });
     }
 }
 
@@ -363,12 +246,10 @@ mod budget_tests {
     use super::ArchiveQueueBudget;
 
     #[test]
-    fn budget_charge_release() {
+    fn budget_empty_can_assign() {
         let b = ArchiveQueueBudget::new(1024 * 1024);
         assert!(b.can_assign());
-        b.charge(1000);
-        assert_eq!(b.count(), 1);
-        b.release(1000);
         assert_eq!(b.count(), 0);
+        assert!((b.far_admission_scale() - 1.0).abs() < 1e-9);
     }
 }

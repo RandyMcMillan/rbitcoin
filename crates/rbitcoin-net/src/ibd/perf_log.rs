@@ -8,7 +8,7 @@
 //! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, planq/prepq/writeq, txs=, horizon, tip ETA, body `bq n= disk= soft=` |
 //! | INFO  | `ibd: perf …` | Download + body-queue soft depth (`disk=` + `soft=n/stop`); **prep / script / write** stage walls + sub-phases; pin mix; queues |
 //! | INFO  | `ibd: sizes …` | RSS + work path + body soft budget + **bq disk/soft** + **residency** + conf pipe + tx.head |
-//! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; plan_mega res_txid; class_a res_seed; dual-track pipe only if active |
+//! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; plan_mega res_txid; class_a res_seed |
 //!
 //! **Create pin map:** sole hot map is **CreateResidency** (`residency creates=/outs=`).
 //!
@@ -28,10 +28,6 @@
 //! `planq_hwm=` (OS-thread occupancy + queue high-water). High prep_recv_wait
 //! + empty planq_hwm ⇒ plan is the production pole.
 //!
-//! Ghost dual-track columns (`recon`/`wire` rebuild, separate arch dual pipe)
-//! appear only when non-zero (legacy/fallback).
-
-use super::archive::{ArchivePipelineSample, ArchivePipelineStats};
 use super::confirm::ConfirmPipelineSizes;
 use super::state::WorkStructureSizes;
 use super::status::LoopStats;
@@ -44,7 +40,7 @@ pub(crate) struct IbdPerfSample {
     // Pipeline health (not from atomics).
     pub inflight: usize,
     pub inflight_cap: usize,
-    /// Soft RAM queue meter (fallback archive jobs only).
+    /// Soft densify meter (often 0 — durable BQ is primary depth gate).
     pub arch_q: usize,
     pub arch_mb: usize,
     pub arch_budget_mb: usize,
@@ -268,9 +264,6 @@ pub(crate) struct IbdPerfSample {
     pub arch_resolved_stamp: u64,
     pub arch_resolve_ns: u64,
     pub arch_resolve_blocks: u64,
-    pub arch_prep_total_ms: u64,
-    pub arch_prep_struct_ms: u64,
-    pub arch_prep_filter_ms: u64,
     pub arch_prep_assign_ms: u64,
     pub arch_prep_collect_ms: u64,
     pub arch_prep_sticky_ms: u64,
@@ -293,9 +286,6 @@ pub(crate) struct IbdPerfSample {
     pub arch_prep_body_lookups: u64,
     pub arch_prep_stamp_ms: u64,
     pub arch_prep_finish_ms: u64,
-    pub arch_prep_publish_ms: u64,
-    pub arch_prep_qwait_ms: u64,
-    pub arch_prep_blocks: u64,
     pub arch_write_total_ms: u64,
     pub arch_write_reserve_ms: u64,
     pub arch_write_body_ms: u64,
@@ -306,12 +296,6 @@ pub(crate) struct IbdPerfSample {
     pub arch_write_dontneed_ms: u64,
     pub arch_write_flush_ms: u64,
     pub arch_write_blocks: u64,
-
-    pub contig_next_h: u32,
-    pub contig_parked: usize,
-    pub contig_ready: usize,
-
-    pub pipe: ArchivePipelineSample,
 
     /// Process RSS / smaps (kB); 0 when `/proc` unavailable.
     pub rss_kb: u64,
@@ -506,9 +490,6 @@ impl Default for IbdPerfSample {
             arch_resolved_stamp: 0,
             arch_resolve_ns: 0,
             arch_resolve_blocks: 0,
-            arch_prep_total_ms: 0,
-            arch_prep_struct_ms: 0,
-            arch_prep_filter_ms: 0,
             arch_prep_assign_ms: 0,
             arch_prep_collect_ms: 0,
             arch_prep_sticky_ms: 0,
@@ -529,9 +510,6 @@ impl Default for IbdPerfSample {
             arch_prep_body_lookups: 0,
             arch_prep_stamp_ms: 0,
             arch_prep_finish_ms: 0,
-            arch_prep_publish_ms: 0,
-            arch_prep_qwait_ms: 0,
-            arch_prep_blocks: 0,
             arch_write_total_ms: 0,
             arch_write_reserve_ms: 0,
             arch_write_body_ms: 0,
@@ -542,10 +520,6 @@ impl Default for IbdPerfSample {
             arch_write_dontneed_ms: 0,
             arch_write_flush_ms: 0,
             arch_write_blocks: 0,
-            contig_next_h: 0,
-            contig_parked: 0,
-            contig_ready: 0,
-            pipe: ArchivePipelineSample::default(),
             rss_kb: 0,
             rss_anon_kb: 0,
             rss_file_kb: 0,
@@ -652,7 +626,6 @@ fn kb_mib(kb: u64) -> u64 {
 /// Sample every counter once and reset atomics.
 pub(crate) fn sample(
     loop_stats: &LoopStats,
-    pipe_stats: &ArchivePipelineStats,
     inflight: usize,
     inflight_cap: usize,
     arch_q: usize,
@@ -730,9 +703,6 @@ pub(crate) fn sample(
     let dens = rbitcoin_consensus::plan_stage_stats::sample_and_reset();
     let arch_res = rbitcoin_query::archive_phase_stats::sample_and_reset();
     let head_res = rbitcoin_store::head_resolve_stats::sample_and_reset();
-    let pipe = pipe_stats.sample_and_reset();
-    let (contig_next_h, contig_parked, contig_ready) =
-        rbitcoin_query::contig_park_stats::snapshot();
     let (load_ready_through, _cache_ahead, _cache_parents, cache_bodies, cache_plans) = load;
 
     IbdPerfSample {
@@ -915,9 +885,6 @@ pub(crate) fn sample(
         arch_resolved_stamp: arch_res.resolved_stamp,
         arch_resolve_ns: arch_res.resolve_ns,
         arch_resolve_blocks: arch_res.blocks,
-        arch_prep_total_ms: ns_ms(arch_res.prep_total_ns),
-        arch_prep_struct_ms: ns_ms(arch_res.prep_struct_ns),
-        arch_prep_filter_ms: ns_ms(arch_res.prep_filter_ns),
         arch_prep_assign_ms: ns_ms(arch_res.prep_assign_ns),
         arch_prep_collect_ms: ns_ms(arch_res.prep_collect_ns),
         arch_prep_sticky_ms: ns_ms(arch_res.prep_sticky_ns),
@@ -938,9 +905,7 @@ pub(crate) fn sample(
         arch_prep_body_lookups: head_res.body_lookups,
         arch_prep_stamp_ms: ns_ms(arch_res.prep_stamp_ns),
         arch_prep_finish_ms: ns_ms(arch_res.prep_finish_ns),
-        arch_prep_publish_ms: ns_ms(arch_res.prep_publish_ns),
-        arch_prep_qwait_ms: ns_ms(arch_res.prep_qwait_ns),
-        arch_prep_blocks: arch_res.prep_blocks,
+        // Sample write phases for class_a commit DEBUG (also drains atomics).
         arch_write_total_ms: ns_ms(arch_res.write_total_ns),
         arch_write_reserve_ms: ns_ms(arch_res.write_reserve_ns),
         arch_write_body_ms: ns_ms(arch_res.write_body_ns),
@@ -951,10 +916,6 @@ pub(crate) fn sample(
         arch_write_dontneed_ms: ns_ms(arch_res.write_dontneed_ns),
         arch_write_flush_ms: ns_ms(arch_res.write_flush_ns),
         arch_write_blocks: arch_res.write_blocks,
-        contig_next_h,
-        contig_parked,
-        contig_ready,
-        pipe,
         rss_kb: rss.rss_kb,
         rss_anon_kb: rss.anon_kb,
         rss_file_kb: rss.file_kb,
@@ -1287,7 +1248,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     out
 }
 
-/// DEBUG detail: µs/blk + pin/edge; class_a / dual-track only if active.
+/// DEBUG detail: µs/blk + pin/edge; class_a commit detail.
 pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     let denom = s.phase_blks.max(1);
     let us = |ns: u64| (ns / denom) / 1000;
@@ -1484,42 +1445,6 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             s.arch_write_blocks,
         ));
     }
-    // True dual-track archive pipe only (legacy/fallback OS threads).
-    let dual_active =
-        s.pipe.prep_blocks > 0 || s.pipe.write_blocks > 0 || s.arch_prep_blocks > 0;
-    if dual_active {
-        let busy = s.pipe.write_busy_ms();
-        let idle = s.pipe.write_idle_ms();
-        let total_w = busy.saturating_add(idle).max(1);
-        let writer_busy_pct = (100 * busy) / total_w;
-        out.push_str(&format!(
-            " | dual_pipe prep_us/blk={} prep_blks={} write_us/blk={} write_blks={} batch_avg={} writer_busy%={} idle_ms={} coalesce_ms={} prep_ms={}",
-            s.pipe.prep_us_per_block(),
-            s.pipe.prep_blocks,
-            s.pipe.write_us_per_block(),
-            s.pipe.write_blocks,
-            s.pipe.avg_batch(),
-            writer_busy_pct,
-            idle,
-            s.pipe.write_coalesce_ms(),
-            s.pipe.prep_ms(),
-        ));
-        out.push_str(&format!(
-            " | arch_prep total={} struct={} publish={} qwait={} blks={}",
-            s.arch_prep_total_ms,
-            s.arch_prep_struct_ms,
-            s.arch_prep_publish_ms,
-            s.arch_prep_qwait_ms,
-            s.arch_prep_blocks,
-        ));
-        append_nz(&mut out, "prep_filter", s.arch_prep_filter_ms);
-    }
-    if s.contig_parked > 0 || s.contig_ready > 0 {
-        out.push_str(&format!(
-            " | contig next_h={} parked={} ready={}",
-            s.contig_next_h, s.contig_parked, s.contig_ready,
-        ));
-    }
     out.push_str(&format!(
         " | loop confirm_blks={} confirm_us/blk={} events={}",
         s.confirm_blocks, s.confirm_us_per_block, s.drain_events,
@@ -1556,8 +1481,8 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     format!(
         "ibd: sizes rss={}MiB anon={}MiB file={}MiB({}%) hwm={}MiB locked={}MiB \
          | work ordered={}/set={} hash_h={} h2h={} hdr_fk={} known_hdr={} inflight={}/peer={} cooldown={} \
-         | body known={} pend={} miss={} charged={} rej={} \
-         | body_soft q={}/{}MiB budget={}MiB contig parked={} ready={} next_h={} \
+         | body known={} pend={} miss={} rej={} \
+         | body_soft q={}/{}MiB budget={}MiB \
          | bq n={} disk={}MiB soft={}/{} \
          | residency creates={}/{} outs={}/{} conf_plans={} cache={} \
          | conf planq={}/{} blks={} prepq={}/{} blks={} wire={}MiB parents={} writeq={}/{} blks={} wire={}MiB parents={} \
@@ -1582,14 +1507,10 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         b.known,
         b.pending,
         b.missing,
-        b.archive_charged,
         b.rejected,
         s.arch_q,
         s.arch_mb,
         s.arch_budget_mb,
-        s.contig_parked,
-        s.contig_ready,
-        s.contig_next_h,
         s.bq_count,
         bq_mib,
         s.bq_count,
@@ -1830,8 +1751,6 @@ mod tests {
         s.load_edge_fk = 5;
         s.load_edge_cb = 1;
         s.sh_collect_ms = 12;
-        s.pipe.write_blocks = 5;
-        s.pipe.write_ns = 5_000_000;
         s.sh_runs = 2;
         s.arch_ext_need = 100;
         s.arch_sticky_hit = 80;
@@ -1876,35 +1795,23 @@ mod tests {
         assert!(line.contains("plan_mega "), "{line}");
         assert!(line.contains("res_txid_hit=80/100"), "{line}");
         assert!(!line.contains("sticky_hit="), "{line}");
-        // Dual-track archive columns only when dual OS pipe active (write_blocks=5).
-        assert!(line.contains("dual_pipe "), "{line}");
-        assert!(line.contains("arch_prep total="), "{line}");
+        assert!(!line.contains("dual_pipe "), "{line}");
         assert!(line.contains("loop "), "{line}");
         assert!(!line.contains("runway"), "{line}");
         assert!(!line.contains("connect wave%="), "{line}");
     }
 
     #[test]
-    fn format_debug_no_dual_pipe_on_unified_class_a_only() {
+    fn format_debug_class_a_commit_without_dual_pipe() {
         let mut s = IbdPerfSample::default();
         s.phase_blks = 4;
-        // Unified path: Class A commit stats without dual-track pipe.
         s.arch_write_blocks = 4;
         s.arch_write_total_ms = 20;
         s.class_a_ns = 20_000_000;
         let line = format_debug(&s);
-        assert!(!line.contains("dual_pipe "), "unified Class A is not dual_pipe: {line}");
+        assert!(!line.contains("dual_pipe "), "{line}");
         assert!(line.contains("class_a="), "{line}");
         assert!(line.contains("class_a_commit total=20"), "{line}");
-    }
-
-    #[test]
-    fn contig_park_stats_snapshot_roundtrip() {
-        rbitcoin_query::contig_park_stats::store(42, 7, 3);
-        assert_eq!(
-            rbitcoin_query::contig_park_stats::snapshot(),
-            (42, 7, 3)
-        );
     }
 
     #[test]
@@ -1921,8 +1828,7 @@ mod tests {
         s.work.ordered = 100;
         s.work.ordered_set = 90;
         s.work.body.pending = 5;
-        s.work.body.archive_charged = 4;
-        s.owned.residency_creates = 80;
+                s.owned.residency_creates = 80;
         s.owned.residency_create_cap = 8_000_000;
         s.owned.residency_outs = 900;
         s.owned.residency_out_cap = 16_777_216;
@@ -1948,7 +1854,6 @@ mod tests {
         s.conf_pipe.feed_inflight = 32;
         s.conf_load_q_cap = 5;
         s.conf_write_q_cap = 5;
-        s.contig_parked = 3;
         let line = format_sizes(&s);
         assert!(line.starts_with("ibd: sizes "), "{line}");
         assert!(line.contains("rss=2MiB"), "{line}");
@@ -1958,7 +1863,7 @@ mod tests {
         assert!(line.contains("locked=0MiB"), "{line}");
         assert!(line.contains("ordered=100/set=90"), "{line}");
         assert!(line.contains("pend=5"), "{line}");
-        assert!(line.contains("charged=4"), "{line}");
+        assert!(line.contains("miss="), "{line}");
         assert!(line.contains("body_soft q=12/40MiB"), "{line}");
         assert!(
             line.contains("bq n=4 disk=32MiB soft=4/256"),
@@ -1978,7 +1883,7 @@ mod tests {
         assert!(line.contains("segs=3 sealed=2"), "{line}");
         assert!(line.contains("class_a=2000000"), "{line}");
         assert!(!line.contains("shadow"), "{line}");
-        assert!(line.contains("contig parked=3"), "{line}");
+        assert!(!line.contains("contig parked="), "{line}");
     }
 
     #[test]
@@ -2025,9 +1930,6 @@ mod tests {
         loop_stats.confirm_ns.store(2_000_000, Ordering::Relaxed);
         loop_stats.confirm_blocks.store(1, Ordering::Relaxed);
         loop_stats.assign_issued.store(7, Ordering::Relaxed);
-        let pipe_stats = ArchivePipelineStats::default();
-        pipe_stats.prep_ns.store(1_000_000, Ordering::Relaxed);
-        pipe_stats.prep_blocks.store(1, Ordering::Relaxed);
 
         let work = WorkStructureSizes::default();
         let owned = ProcessOwnedSizes::default();
@@ -2035,7 +1937,6 @@ mod tests {
         let rss = read_proc_rss();
         let s = sample(
             &loop_stats,
-            &pipe_stats,
             4,   // inflight
             256, // cap
             2,   // arch_q

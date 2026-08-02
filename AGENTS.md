@@ -123,49 +123,28 @@ that shows a clear change after.
 
 **Full rules:** `docs/ibd-memory.md`. Summary for agents:
 
-1. **Distinguish** process-owned heap (Rust structures, charged archive bodies)
+1. **Distinguish** process-owned heap (Rust structures, confirm pipeline wire)
    from **kernel page cache** under store mmaps (`RssFile`). Do not “fix” RSS
-   by gutting intentional caches (CreateResidency, ContigPark, archive budget).
-2. **Archive queue ownership:** `charge` on first body enqueue must pair with
-   exactly one `release` via `ArchiveResult` applied in `apply_archive_result`
-   (or immediate release if `arch_job_tx.send` fails because the pipeline is
-   **closed**). Dropping an `ArchiveJob` after charge without Ok/Err/Dropped is
-   a **leak**.
-3. **`archive_charged` is not hygiene-pruned** — only `clear_archive_charged` on
-   pipeline result (prevents double-charge if ordered hygiene runs early).
-4. **Abort paths** (WriterDead, stop, prep exit) must drain ContigPark + job
-   channels and emit results (`release_remaining_jobs`).
-5. **Soft archive budget is request-limited only.** Always read peer data and
-   decode/enqueue blocks we already requested, even if that overshoots the soft
-   queue budget. Bound memory by stopping new block **requests**
-   (`can_assign` / getdata when archive is full) — never by stalling TCP reads,
-   awaiting a decode permit on the reader before the next frame, or Full-dropping
-   decoded bodies on a bounded `arch_job` channel. (That made healthy peers look
-   stalled and was not a real leak fix.)
-6. **Tests** must tear down intentional caches with **production** APIs (table
+   by gutting intentional caches (CreateResidency, durable body queue).
+2. **Unified path only:** peer → durable **body queue** → confirm plan/prep/
+   scripts/commit (sole Class A). **No** dual-track `ArchiveJob` / ContigPark.
+   Unknown-height `BlockFramed` → `mark_missing` and re-getdata after height.
+3. **Soft budgets are request-limited only.** Always accept already-requested
+   block bytes onto the durable body queue, even if that overshoots soft depth.
+   Bound memory by stopping new densify **getdata** (`block_queue` soft
+   time-depth / `can_assign`) — never by stalling TCP reads or Full-dropping
+   bodies already on the wire.
+4. **Tests** must tear down intentional caches with **production** APIs (table
    below) — not a secret free-all that masks production leaks.
-7. **Regression filters:**
-   `force_advance_returns_parked_jobs_for_charge_release`,
-   `multi_block_park_abort_releases_all_charges`,
-   `multi_block_ibd_like_growth_then_production_abort_plateau`,
-   `drain_job_rx_as_err_releases_via_apply`,
-   `can_assign_stops_at_budget_charge_may_overshoot`,
-   `archive_budget_charge_release_symmetric`,
-   `presence_lifecycle`.
+5. **Regression filters:** body-queue soft depth / presence lifecycle / confirm
+   reject paths as listed in `docs/ibd-memory.md`.
 
 ### Production clear / evict APIs (tests must call these)
 
 | Structure | Production API |
 |-----------|----------------|
-| Archive queue charge | `ArchiveQueueBudget::charge`; release only via **`apply_archive_result`** on `ArchiveResult` **or** closed-pipeline `arch_job_tx.send` fail |
-| Soft queue size | Bound **only** via **`can_assign`** / densify stop — never receive-side Full-drop or reader decode-permit wait |
-| Arch job channel | **Unbounded** `arch_job` (always enqueue decoded first copy) |
-| Block decode | Fire-and-forget **`spawn_decode_then_with_err`** — never await permit on the peer reader before next TCP read |
-| WriterDead batch | **`emit_writer_dead_outcomes`** then apply results |
-| ContigPark abort | **`release_remaining_jobs`** (or `force_advance` → **`emit_archive_job_dropped`**) |
-| Forwarder stop | **`emit_archive_job_err`** + **`drain_job_rx_as_err`** |
-| `archive_charged` marker | **`clear_archive_charged`** only (never hygiene-prune) |
+| Soft densify depth | Bound **only** via body-queue soft pressure / densify stop — never receive-side Full-drop |
 | Confirm plans/headers | **`ConfirmParentCache::advance_tip`** (write `post_commit`) |
 | CreateResidency | FIFO on **`CreateResidency::put_*` / `insert_fk_txid_range`** (create/out caps); sole pin map |
 | Ordered maps | **`IbdWorkState::hygiene`** |
-| Body presence | **`BodyPresence::hygiene_retain`** (rejected + charged retained by design) |
+| Body presence | **`BodyPresence::hygiene_retain`** (rejected retained by design) |

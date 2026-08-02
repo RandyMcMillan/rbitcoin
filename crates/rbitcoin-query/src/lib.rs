@@ -673,33 +673,6 @@ pub mod wave_fill_stats {
     }
 }
 
-/// ContigPark live snapshot (writer thread updates; sampler reads without reset).
-pub mod contig_park_stats {
-    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-
-    /// Next height the writer may commit.
-    pub static NEXT_H: AtomicU32 = AtomicU32::new(0);
-    /// Bodies parked (height ≥ next_h).
-    pub static PARKED: AtomicUsize = AtomicUsize::new(0);
-    /// Contiguous ready prefix length at next_h.
-    pub static READY_PREFIX: AtomicUsize = AtomicUsize::new(0);
-
-    pub fn snapshot() -> (u32, usize, usize) {
-        (
-            NEXT_H.load(Ordering::Relaxed),
-            PARKED.load(Ordering::Relaxed),
-            READY_PREFIX.load(Ordering::Relaxed),
-        )
-    }
-
-    pub fn store(next_h: u32, parked: usize, ready: usize) {
-        NEXT_H.store(next_h, Ordering::Relaxed);
-        PARKED.store(parked, Ordering::Relaxed);
-        READY_PREFIX.store(ready, Ordering::Relaxed);
-    }
-}
-
-
 /// One transaction to apply when connecting a block.
 #[derive(Clone, Debug)]
 pub struct TxApply {
@@ -1656,9 +1629,6 @@ mod tests {
         wave_fill_stats::add_count(&wave_fill_stats::BODY_STORE, 2);
         wave_fill_stats::add(&wave_fill_stats::BODY_STORE_NS, 9);
         assert_eq!(wave_fill_stats::sample_store_and_reset(), (2, 9));
-
-        contig_park_stats::store(7, 3, 1);
-        assert_eq!(contig_park_stats::snapshot(), (7, 3, 1));
     }
 
     #[test]

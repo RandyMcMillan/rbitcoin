@@ -103,12 +103,6 @@ mod tests {
         assert_eq!(far_slots_per_peer(16, false), 8);
         assert_eq!(far_slots_per_peer(8, false), 4);
 
-        use super::super::assign::scale_feed_cap;
-        assert_eq!(scale_feed_cap(8, 0.0), 0);
-        assert_eq!(scale_feed_cap(8, 0.5), 4);
-        assert_eq!(scale_feed_cap(8, 1.0), 8);
-        // Tiny residual headroom still drips one densify slot.
-        assert_eq!(scale_feed_cap(8, 0.01), 1);
 
         // Sparse: 4k claim-ready of 120k live → no bypass
         assert!(!want_headers_beyond_soft_cap(120_000, 4_000, 100, 2048));

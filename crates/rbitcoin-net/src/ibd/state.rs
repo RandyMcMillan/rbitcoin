@@ -228,7 +228,7 @@ impl IbdWorkState {
             self.hash_height
                 .retain(|h, _| live.contains(h) || inflight.contains_key(h) || self.known_headers.contains(h));
         }
-        // Bound body presence cache to live work (rejected + archive_charged
+        // Bound body presence cache to live work (rejected
         // never hygiene-pruned — see BodyPresence::hygiene_retain).
         self.body
             .hygiene_retain(|h| live.contains(h) || inflight.contains_key(h));

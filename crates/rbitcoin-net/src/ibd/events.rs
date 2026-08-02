@@ -1,6 +1,5 @@
 //! Peer / archive event drain and apply (IBD main loop).
 
-use super::archive::ArchiveQueueBudget;
 use super::assign::clear_hash_inflight;
 use super::assign_plan::{remove_from_ordered, want_headers_beyond_soft_cap};
 use super::dial::{release_peer_block_work, request_headers, request_headers_from};
@@ -357,7 +356,6 @@ pub(crate) fn apply_peer_event(
             let height = st.hash_height.get(&hash).copied();
             let Some(height) = height else {
                 // Headers map not ready yet — re-get after height is known.
-                // (No dual-track archive-job fallback.)
                 st.body.mark_missing(hash);
                 return;
             };
@@ -473,32 +471,11 @@ pub(crate) fn update_confirm_lag(lag: &AtomicU32, tip: Option<u32>, max_ready: u
     lag.store(max_ready.saturating_sub(t), Ordering::Relaxed);
 }
 
-/// Drop soft `archive_queued` charge for `hash` (wire path budget on receive).
-///
-/// Called from every confirm terminal path that will not later emit Accepted
-/// for the same charge — permanent reject **and** soft prevout-spent (write
-/// still sends `Reject` when `has_block` is false; leaving the charge stuck
-/// stalls getdata / assign forever).
-fn release_confirm_archive_charge(
-    st: &mut IbdWorkState,
-    hash: &BlockHash,
-    archive_queued: Option<&ArchiveQueueBudget>,
-) {
-    if let Some(q) = archive_queued {
-        if let Some(wb) = st.body.take_archive_charge_bytes(hash) {
-            q.release(wb);
-        }
-    } else {
-        st.body.clear_archive_charged(hash);
-    }
-}
-
 pub(crate) fn apply_confirm_reject(
     st: &mut IbdWorkState,
     height: u32,
     hash: BlockHash,
     err: &str,
-    archive_queued: Option<&ArchiveQueueBudget>,
     // When set, drop bad body-queue payload so densify can re-getdata a good block.
     query: Option<&rbitcoin_query::Query>,
 ) {
@@ -521,7 +498,6 @@ pub(crate) fn apply_confirm_reject(
     let soft_reget = err.contains("unexpected previous header")
         || err.contains("unexpected previous");
     if soft_reget {
-        release_confirm_archive_charge(st, &hash, archive_queued);
         clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
         // Evict bad wire so claim_ready is false until a good body arrives.
         if let Some(q) = query {
@@ -533,8 +509,6 @@ pub(crate) fn apply_confirm_reject(
         );
         return;
     }
-    // Wire path may have charged soft budget (fallback archive job) — release.
-    release_confirm_archive_charge(st, &hash, archive_queued);
     if let Some(q) = query {
         let _ = q.block_queue_dequeue_height(height);
     }
@@ -577,7 +551,6 @@ mod confirm_reject_tests {
             zero,
             "consensus: prevout already spent on best chain",
             None,
-            None,
         );
         assert!(!st.body.is_rejected(&zero));
 
@@ -591,10 +564,7 @@ mod confirm_reject_tests {
             &mut st,
             51,
             hash,
-            "consensus: script verification failed: script false",
-            None,
-            None,
-        );
+            "consensus: script verification failed: script false", None);
         assert!(st.body.is_rejected(&hash));
         assert!(!st.ordered_set.contains(&hash));
 
@@ -608,10 +578,7 @@ mod confirm_reject_tests {
             &mut st,
             219_562,
             hash,
-            "consensus: store: corrupt record: invariant: spend annotate missing pin denserels/abs",
-            None,
-            None,
-        );
+            "consensus: store: corrupt record: invariant: spend annotate missing pin denserels/abs", None);
         assert!(
             st.body.is_rejected(&hash),
             "denserels layout miss is permanent (fix pipeline, not soft-reget)"
@@ -627,10 +594,7 @@ mod confirm_reject_tests {
             &mut st,
             269_050,
             hash,
-            "consensus: store: corrupt record: archive: parent create_fk unresolved (contiguous batch required)",
-            None,
-            None,
-        );
+            "consensus: store: corrupt record: archive: parent create_fk unresolved (contiguous batch required)", None);
         assert!(
             st.body.is_rejected(&hash),
             "parent create_fk unresolved is permanent after root fix"
@@ -646,10 +610,7 @@ mod confirm_reject_tests {
             &mut st,
             125_653,
             hash,
-            "consensus: unexpected previous header",
-            None,
-            None,
-        );
+            "consensus: unexpected previous header", None);
         assert!(
             !st.body.is_rejected(&hash),
             "bad wire must soft re-getdata, not permanent-blacklist tip+1"
@@ -670,10 +631,7 @@ mod confirm_reject_tests {
             &mut st,
             362_595,
             hash,
-            "consensus: prevout already spent on best chain",
-            None,
-            None,
-        );
+            "consensus: prevout already spent on best chain", None);
         assert!(
             st.body.is_rejected(&hash),
             "prevout-spent is permanent at reject layer (write skip-if-committed)"
@@ -755,7 +713,7 @@ mod confirm_reject_tests {
         let mut book = AddrMan::new();
         let local = addr(99);
 
-        // BlockFramed without known height → missing (no archive-job fallback).
+        // BlockFramed without known height → missing (re-getdata after height map).
         apply_peer_event(
             &mut st,
             &hub,
@@ -766,7 +724,7 @@ mod confirm_reject_tests {
             None,
         );
         assert!(st.inflight.is_empty());
-        assert_eq!(st.body.skip_download_cached(&h(9)), Some(false));
+        assert!(!st.body.is_pending(&h(9)));
 
         // Decode fail → missing so re-getdata allowed.
         st.body.mark_pending(h(9));
@@ -1017,7 +975,6 @@ mod confirm_reject_tests {
         );
         assert!(st.body.is_pending(&h1));
         assert!(hub.query.block_queue_has_height(1));
-        assert!(!st.body.is_archive_charged(&h1), "no archive-job charge");
 
         apply_peer_event(
             &mut st,
@@ -1051,7 +1008,7 @@ mod confirm_reject_tests {
             local,
             None,
         );
-        assert_eq!(st.body.skip_download_cached(&far_hash), Some(false));
+        assert!(!st.body.is_pending(&far_hash));
 
         st.max_peer_height = 0;
         st.empty_header_streak = 0;

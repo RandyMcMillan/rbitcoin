@@ -329,34 +329,11 @@ pub(crate) fn block_input_count(block: &bitcoin::Block) -> u32 {
         .fold(0u32, u32::saturating_add)
 }
 
-/// How many prefix blocks to keep given ordered per-block input counts.
-///
-/// Always takes the first block. Soft overshoot: includes the block that
-/// crosses `soft_max_inputs`, then stops. Hard stop at `hard_max_blocks`.
-/// Production pack applies the same policy online while decoding; this pure
-/// helper is for unit tests.
-#[cfg(test)]
-pub(crate) fn pack_confirm_run_len(
-    input_counts: &[u32],
-    soft_max_inputs: u32,
-    hard_max_blocks: usize,
-) -> usize {
-    if input_counts.is_empty() || hard_max_blocks == 0 {
-        return 0;
-    }
-    let mut sum = 0u32;
-    let mut n = 0usize;
-    for &c in input_counts {
-        if n >= hard_max_blocks {
-            break;
-        }
-        sum = sum.saturating_add(c);
-        n += 1;
-        if sum > soft_max_inputs {
-            break;
-        }
-    }
-    n.max(1).min(input_counts.len())
+/// Whether the packed run should stop **after** accepting a block that left
+/// `sum_inputs` / `n_blocks` in this state (soft overshoot + hard block cap).
+#[inline]
+pub(crate) fn pack_stop_after(sum_inputs: u32, n_blocks: usize, soft_max_inputs: u32, hard_max_blocks: usize) -> bool {
+    n_blocks >= hard_max_blocks || sum_inputs > soft_max_inputs
 }
 
 /// Default capacity for each of plan→prep, prep→scripts, scripts→write queues.
@@ -1274,7 +1251,12 @@ pub(crate) fn spawn_confirm_engine(
                                 run.push((h, hash, block));
                                 sum_inputs = sum_inputs.saturating_add(inputs);
                                 h = h.saturating_add(1);
-                                if sum_inputs > soft_inputs {
+                                if pack_stop_after(
+                                    sum_inputs,
+                                    run.len(),
+                                    soft_inputs,
+                                    hard_blocks,
+                                ) {
                                     break;
                                 }
                             }
@@ -1760,9 +1742,30 @@ mod tests {
         run
     }
 
+    /// Offline mirror of online pack: prefix length under soft inputs + hard blocks.
+    fn pack_confirm_run_len(
+        input_counts: &[u32],
+        soft_max_inputs: u32,
+        hard_max_blocks: usize,
+    ) -> usize {
+        if input_counts.is_empty() || hard_max_blocks == 0 {
+            return 0;
+        }
+        let mut sum = 0u32;
+        let mut n = 0usize;
+        for &c in input_counts {
+            sum = sum.saturating_add(c);
+            n += 1;
+            if super::pack_stop_after(sum, n, soft_max_inputs, hard_max_blocks) {
+                break;
+            }
+        }
+        n.max(1).min(input_counts.len())
+    }
+
     #[test]
     fn pack_confirm_run_len_policy() {
-        use super::{pack_confirm_run_len, CONFIRM_BATCH_INPUTS_DEFAULT, CONFIRM_RUN_MAX_BLOCKS};
+        use super::{CONFIRM_BATCH_INPUTS_DEFAULT, CONFIRM_RUN_MAX_BLOCKS};
         // Under budget: take all.
         assert_eq!(pack_confirm_run_len(&[10, 10, 10], 8000, 144), 3);
         // Soft overshoot: include crossing block then stop.

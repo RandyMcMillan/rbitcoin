@@ -13,7 +13,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 | Confirm **commit** | 1 OS thread | **sole Class A appender** + structural + Class C + spend annotate + tip GC; **`block_queue_dequeue_height`** |
 | IBD main loop | 1 tokio task | none (orchestration only) |
 
-**Height-ordered unified pipeline (current):** peer → **body queue** → **plan** (structure + stamp create_fk) → **prep** (pin denserels + assemble) → scripts → single commit era. **No** peer→confirm-feed wire retain. **No** hash-only / Class-A-only confirm (bq wire required). Prep must **not** re-run plan head resolve; handoff is owned `ArchiveWritePlan` (not residency FIFO seed → Forbid). Optional **archive-job + ContigPark** remains only for unknown-height bodies.
+**Height-ordered unified pipeline (current):** peer → **body queue** → **plan** (structure + stamp create_fk) → **prep** (pin denserels + assemble) → scripts → single commit era. **No** peer→confirm-feed wire retain. **No** hash-only / Class-A-only confirm (bq wire required). Prep must **not** re-run plan head resolve; handoff is owned `ArchiveWritePlan` (not residency FIFO seed → Forbid). Bodies without a known height are marked missing and re-getdata after the height map is ready — there is **no** dual-track archive-job / ContigPark fallback.
 
 **Tip follow / reorg:** peer wire via `ChainHub::accept_block` / `accept_branch` → `accept_and_connect_block` (same wire prep path with cold denserels allowed on the one-shot call). Disconnect keeps Class A archive; re-extension always supplies **wire** from the peer, not hash-only load.
 

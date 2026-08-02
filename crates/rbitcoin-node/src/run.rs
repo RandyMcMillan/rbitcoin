@@ -173,10 +173,14 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 
     let start_tip = handle.query.tip_height().map(|h| h.0).unwrap_or(0);
     let run_started = Instant::now();
+    let head_access = rbitcoin_store::head_table_access_from_env();
     info!(
-        "rbitcoin-node starting network={} datadir={} tip={start_tip}",
+        "rbitcoin-node starting version={} network={} datadir={} tip={start_tip} \
+         tx_head_access={head_access:?} io={}",
+        env!("CARGO_PKG_VERSION"),
         config.network.as_str(),
-        config.datadir.display()
+        config.datadir.display(),
+        std::env::var("RBITCOIN_IO").unwrap_or_else(|_| "default".into()),
     );
 
     let query = handle.query;

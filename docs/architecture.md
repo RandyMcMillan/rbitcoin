@@ -135,18 +135,18 @@ budgets: [`docs/ibd-memory.md`](./ibd-memory.md).
 5. **Bulk IO vs table transport.** `RBITCOIN_IO=uring|pread` selects **bulk
    batch** backends for body denserels, head-resolve body prefix, spend paths
    (thread-local ring depth 128). **Table files** use [`TableAccess`](./io-modality.md):
-   **`tx.body` / `tx.idx` / `tx.head` / header head / SH head+body / spenders**
-   are **FdOnly** (page- or chunk-coalesced pread/pwrite). Class C arrays remain
-   MapFull until phase 5 InRam. Historical host A/B: naive uring head insert ~5×
-   slower than page RMW — production uses coalesced pages, not per-slot uring.
-   Fuse8 builds in process RAM on seal. See [`docs/io-modality.md`](./io-modality.md).
+   Store tables are **FdOnly** (page-/chunk-coalesced pread/pwrite); head resolve
+   **page-batches multi-key probes**. Mempool remains MapFull until phase 5 InRam.
+   Historical host A/B: naive uring head insert ~5× slower than page RMW —
+   production uses coalesced pages, not per-slot uring. Fuse8 builds in process
+   RAM on seal. See [`docs/io-modality.md`](./io-modality.md).
 
 ### Map / capacity growth
 
-**MapFull** tables (Class C today): capacity grow = fallocate + map a **new
-epoch**, pointer swap; old maps live until pins drop. **FdOnly** large tables:
-fallocate only, no multi‑GiB remap. Long-held “pause the world” map mutexes on
-the IBD/read path are design bugs.
+**MapFull** (mempool today): capacity grow = fallocate + map a **new epoch**,
+pointer swap; old maps live until pins drop. **FdOnly** store tables: fallocate
+only, no multi‑GiB remap. Long-held “pause the world” map mutexes on the
+IBD/read path are design bugs.
 
 ---
 

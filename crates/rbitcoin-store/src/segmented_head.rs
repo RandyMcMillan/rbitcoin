@@ -389,25 +389,37 @@ impl SegmentedTxHead {
     /// the page probe list. Across segments: open first, then sealed newest first.
     /// Caller body-verifies.
     pub fn probe_candidates(&self, mixed: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
+        let mut out = self.probe_candidates_batch(std::slice::from_ref(mixed))?;
+        Ok(out.pop().unwrap_or_default())
+    }
+
+    /// Batch probe: same order/results as N× [`Self::probe_candidates`], with
+    /// **page-coalesced** loads inside each segment ([`AddressHead::probe_fks_batch`]).
+    ///
+    /// Sealed segments still fuse-gate per key; only keys that pass are batched
+    /// for that segment's page loads.
+    pub fn probe_candidates_batch(&self, mixed: &[[u8; 32]]) -> Result<Vec<Vec<Fk>>, StoreError> {
+        let n = mixed.len();
+        let mut out = vec![Vec::new(); n];
+        if n == 0 {
+            return Ok(out);
+        }
         let segs = self.segments_snapshot();
-        let mut out = Vec::new();
         if segs.is_empty() {
             return Ok(out);
         }
-        let fuse_key = fuse_key_from_mixed(mixed);
 
-        // Open tail first (may be sealed-only store if idle after seal).
         let last = segs.last().unwrap();
         if !last.sealed {
-            LOOKUP_OPEN.fetch_add(1, Ordering::Relaxed);
-            let rels = last.head.probe_fks(mixed)?;
-            for r in rels.into_iter().rev() {
-                if let Some(fk) = rel_to_abs(last.first_fk, r.0) {
-                    out.push(fk);
+            LOOKUP_OPEN.fetch_add(n as u64, Ordering::Relaxed);
+            let rel_lists = last.head.probe_fks_batch(mixed)?;
+            for (i, rels) in rel_lists.into_iter().enumerate() {
+                for r in rels.into_iter().rev() {
+                    if let Some(fk) = rel_to_abs(last.first_fk, r.0) {
+                        out[i].push(fk);
+                    }
                 }
             }
-        } else {
-            // Tail sealed: still fuse-gate it among sealed walk below.
         }
 
         // Sealed newest → oldest (skip open tail if already handled).
@@ -420,19 +432,32 @@ impl SegmentedTxHead {
             if !seg.sealed {
                 continue;
             }
-            LOOKUP_FUSE_CHK.fetch_add(1, Ordering::Relaxed);
             let Some(fuse) = seg.fuse.as_ref() else {
                 return Err(StoreError::Corrupt("sealed segment missing fuse"));
             };
-            if !fuse.contains(fuse_key) {
-                LOOKUP_FUSE_SKIP.fetch_add(1, Ordering::Relaxed);
+            // Keys that pass fuse for this segment → one page-coalesced probe batch.
+            let mut pass_i: Vec<usize> = Vec::new();
+            let mut pass_keys: Vec<[u8; 32]> = Vec::new();
+            for (i, m) in mixed.iter().enumerate() {
+                LOOKUP_FUSE_CHK.fetch_add(1, Ordering::Relaxed);
+                let fuse_key = fuse_key_from_mixed(m);
+                if !fuse.contains(fuse_key) {
+                    LOOKUP_FUSE_SKIP.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                LOOKUP_SEALED_PROBE.fetch_add(1, Ordering::Relaxed);
+                pass_i.push(i);
+                pass_keys.push(*m);
+            }
+            if pass_keys.is_empty() {
                 continue;
             }
-            LOOKUP_SEALED_PROBE.fetch_add(1, Ordering::Relaxed);
-            let rels = seg.head.probe_fks(mixed)?;
-            for r in rels.into_iter().rev() {
-                if let Some(fk) = rel_to_abs(seg.first_fk, r.0) {
-                    out.push(fk);
+            let rel_lists = seg.head.probe_fks_batch(&pass_keys)?;
+            for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
+                for r in rels.into_iter().rev() {
+                    if let Some(fk) = rel_to_abs(seg.first_fk, r.0) {
+                        out[orig_i].push(fk);
+                    }
                 }
             }
         }
@@ -477,6 +502,7 @@ impl SegmentedTxHead {
         let path = segment_head_path(&self.dir, file_id);
         let _ = std::fs::remove_file(&path);
         let head = AddressHead::create_with_layout(&path, self.layout)?;
+        let access = head.table_access();
         let seg = Arc::new(Segment {
             first_fk,
             count: AtomicU64::new(0),
@@ -503,10 +529,10 @@ impl SegmentedTxHead {
         ROLLS.fetch_add(1, Ordering::Relaxed);
         rbitcoin_log::info!(
             "store: tx.head segment open file_id={file_id} first_fk={first_fk} \
-             bits={} slots={} max_keys={}",
+             bits={} slots={} max_keys={} access={access:?}",
             self.layout.bits,
             self.layout.slots(),
-            self.max_keys
+            self.max_keys,
         );
         self.persist_meta_locked()?;
         Ok(())

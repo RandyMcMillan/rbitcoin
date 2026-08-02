@@ -681,6 +681,18 @@ impl AddressHead {
 
         let slots = layout.slots();
         let occupied = count_occupied(&file, slots, layout.entry_bytes)?;
+        if layout.bits >= 24 || access == TableAccess::FdOnly {
+            rbitcoin_log::info!(
+                "store: address-head open path={} bits={} slots={} entry={}B access={:?} gen={} occupied≈{}",
+                file.path().display(),
+                layout.bits,
+                slots,
+                layout.entry_bytes,
+                access,
+                generation,
+                occupied,
+            );
+        }
         Ok(Self {
             file,
             layout,
@@ -874,25 +886,55 @@ impl AddressHead {
     ///
     /// One page load, then hop in RAM (single IO for the full candidate set).
     pub fn probe_fks(&self, txid: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
+        let mut out = self.probe_fks_batch(std::slice::from_ref(txid))?;
+        Ok(out.pop().unwrap_or_default())
+    }
+
+    /// Batch probe: group keys by probe page, **one page `read_at` per distinct page**,
+    /// hop each key in RAM. Same results as N× [`Self::probe_fks`] (order preserved).
+    ///
+    /// Archive head-resolve uses this so multi-key waves under FdOnly share page IO.
+    pub fn probe_fks_batch(&self, txids: &[[u8; 32]]) -> Result<Vec<Vec<Fk>>, StoreError> {
+        let n_keys = txids.len();
+        if n_keys == 0 {
+            return Ok(Vec::new());
+        }
         let bits = self.layout.bits;
         let es = self.layout.entry_bytes;
         let page_slots = page_slot_count(bits);
-        let page_base = if bits <= PAGE_SLOT_BITS {
-            0
-        } else {
-            page_index(txid, bits) << PAGE_SLOT_BITS
-        };
-        let h1p = h1_in_page(txid, bits);
-        let h2p = h2_in_page(txid, bits);
-        let mut buf = [0u8; PROBE_REGION_BYTES];
-        let n = self.load_page_slots(page_base, page_slots, &mut buf)?;
         let es_u = es as usize;
-        if n < es_u {
-            return Ok(Vec::new());
+
+        // (page_base, orig_i) — stable within a page for deterministic order.
+        let mut order: Vec<(u64, usize)> = txids
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (page_base_for_txid(t, bits), i))
+            .collect();
+        order.sort_unstable_by_key(|&(p, i)| (p, i));
+
+        let mut out = vec![Vec::new(); n_keys];
+        let mut buf = [0u8; PROBE_REGION_BYTES];
+        let mut i = 0;
+        while i < order.len() {
+            let page_base = order[i].0;
+            let mut j = i + 1;
+            while j < order.len() && order[j].0 == page_base {
+                j += 1;
+            }
+            let n = self.load_page_slots(page_base, page_slots, &mut buf)?;
+            if n >= es_u {
+                let nslots = (n / es_u) as u64;
+                for &(_, orig) in &order[i..j] {
+                    let txid = &txids[orig];
+                    let h1p = h1_in_page(txid, bits);
+                    let h2p = h2_in_page(txid, bits);
+                    let scan = hop_scan_page(&buf[..n], es, h1p, h2p, nslots, MAX_PROBE);
+                    out[orig] = scan.cands.into_iter().map(|(_, e)| Fk(e)).collect();
+                }
+            }
+            i = j;
         }
-        let nslots = (n / es_u) as u64;
-        let scan = hop_scan_page(&buf[..n], es, h1p, h2p, nslots, MAX_PROBE);
-        Ok(scan.cands.into_iter().map(|(_, e)| Fk(e)).collect())
+        Ok(out)
     }
 
     pub fn get_all_candidates(&self, txid: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
@@ -1272,6 +1314,42 @@ mod tests {
             Ok(_) => panic!("expected error opening v7 directory"),
         }
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Batch page-coalesced probe must match serial `probe_fks` (multi-page wave).
+    #[test]
+    fn probe_fks_batch_matches_serial() {
+        let path = tmp("probe_batch");
+        let h = AddressHead::create_with_bits(&path, 14).unwrap();
+        let mut entries = Vec::new();
+        for i in 1..=120u64 {
+            let mut txid = [0u8; 32];
+            txid[0] = (i & 0xff) as u8;
+            txid[1] = ((i >> 8) & 0xff) as u8;
+            txid[3] = 0xab;
+            entries.push((txid, Fk(i)));
+        }
+        h.insert_many(&entries).unwrap();
+        let keys: Vec<[u8; 32]> = entries.iter().map(|(t, _)| *t).collect();
+        let batch = h.probe_fks_batch(&keys).unwrap();
+        assert_eq!(batch.len(), keys.len());
+        for (i, txid) in keys.iter().enumerate() {
+            let serial = h.probe_fks(txid).unwrap();
+            assert_eq!(batch[i], serial, "key {i}");
+        }
+        // Empty batch.
+        assert!(h.probe_fks_batch(&[]).unwrap().is_empty());
+        // Same-page multi-key still correct.
+        let mut same_page = Vec::new();
+        for i in 0..8 {
+            let mut t = [0u8; 32];
+            t[0] = 1;
+            t[1] = i;
+            same_page.push(t);
+        }
+        let _ = h.probe_fks_batch(&same_page).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(meta_path(&path));
     }
 
     /// Bulk page load must match per-slot reads (regression: load_page_slots

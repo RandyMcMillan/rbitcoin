@@ -1404,9 +1404,26 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
                 0
             };
             let hit_rank_avg = s.arch_prep_hit_rank_avg_x100 as f64 / 100.0;
+            // probe_us/key: first-class FdOnly demap metric (window probe_ms → µs/key).
+            let probe_us_key = if s.arch_prep_head_keys > 0 {
+                (s.arch_prep_probe_ms * 1000) / s.arch_prep_head_keys
+            } else {
+                0
+            };
+            let idx_us_key = if s.arch_prep_head_keys > 0 {
+                (s.arch_prep_idx_ms * 1000) / s.arch_prep_head_keys
+            } else {
+                0
+            };
+            let body_us_key = if s.arch_prep_head_keys > 0 {
+                (s.arch_prep_body_txid_ms * 1000) / s.arch_prep_head_keys
+            } else {
+                0
+            };
             out.push_str(&format!(
                 " head_rd(probe={} idx={} body={} keys={} cands={} lookups={} \
-                 avg_cands={} avg_lookups={} hit_rank_avg={hit_rank_avg:.2} hit_n={} miss_peeks={})",
+                 avg_cands={} avg_lookups={} hit_rank_avg={hit_rank_avg:.2} hit_n={} miss_peeks={} \
+                 probe_us/key={} idx_us/key={} body_us/key={})",
                 s.arch_prep_probe_ms,
                 s.arch_prep_idx_ms,
                 s.arch_prep_body_txid_ms,
@@ -1417,6 +1434,9 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
                 avg_lookups,
                 s.arch_prep_hit_rank_n,
                 s.arch_prep_miss_peeks,
+                probe_us_key,
+                idx_us_key,
+                body_us_key,
             ));
         }
         if s.arch_head_dens_fks > 0 || s.arch_prep_head_dens_ms > 0 {
@@ -1430,9 +1450,21 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
         }
     }
     // Class A commit: res_seed = CreateResidency denserels seed.
+    // ca_head_us/blk: first-class demap metric for page-RMW insert cost.
     if s.arch_write_blocks > 0 || s.arch_write_total_ms > 0 {
+        let ca_head_us_blk = if s.arch_write_blocks > 0 {
+            (s.arch_write_head_ms * 1000) / s.arch_write_blocks
+        } else {
+            0
+        };
+        let ca_body_us_blk = if s.arch_write_blocks > 0 {
+            (s.arch_write_body_ms * 1000) / s.arch_write_blocks
+        } else {
+            0
+        };
         out.push_str(&format!(
-            " | class_a_commit total={} body={} head={} res_seed={} htxs={} reserve={} spend={} dontneed={} flush={} blks={}",
+            " | class_a_commit total={} body={} head={} res_seed={} htxs={} reserve={} spend={} dontneed={} flush={} blks={} \
+             ca_head_us/blk={} ca_body_us/blk={}",
             s.arch_write_total_ms,
             s.arch_write_body_ms,
             s.arch_write_head_ms,
@@ -1443,6 +1475,8 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             s.arch_write_dontneed_ms,
             s.arch_write_flush_ms,
             s.arch_write_blocks,
+            ca_head_us_blk,
+            ca_body_us_blk,
         ));
     }
     out.push_str(&format!(
@@ -1799,6 +1833,12 @@ mod tests {
         assert!(line.contains("loop "), "{line}");
         assert!(!line.contains("runway"), "{line}");
         assert!(!line.contains("connect wave%="), "{line}");
+        // Demap first-class tokens (present when head keys / write blocks sampled).
+        if s.arch_prep_head_keys > 0 {
+            assert!(line.contains("probe_us/key="), "{line}");
+            assert!(line.contains("idx_us/key="), "{line}");
+            assert!(line.contains("body_us/key="), "{line}");
+        }
     }
 
     #[test]
@@ -1812,6 +1852,8 @@ mod tests {
         assert!(!line.contains("dual_pipe "), "{line}");
         assert!(line.contains("class_a="), "{line}");
         assert!(line.contains("class_a_commit total=20"), "{line}");
+        assert!(line.contains("ca_head_us/blk="), "{line}");
+        assert!(line.contains("ca_body_us/blk="), "{line}");
     }
 
     #[test]

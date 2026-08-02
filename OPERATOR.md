@@ -70,7 +70,7 @@ modality matrix and demap plan: [`docs/io-modality.md`](docs/io-modality.md).
 ## Bulk store IO backends
 
 **Bulk batch** only (`RBITCOIN_IO`). Table transport (mmap vs fd) is independent —
-large tables default **FdOnly** (see modality doc). Class C arrays still MapFull.
+store tables default **FdOnly** (see modality doc). Mempool still MapFull until phase 5 InRam.
 
 Hierarchy: **path env** (if set) → **global `RBITCOIN_IO`** → default (**uring** if
 the ring is available, else **pread** / **pwrite** for annotate). If `uring` is

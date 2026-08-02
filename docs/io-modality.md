@@ -47,14 +47,14 @@ Default: uring if the ring opens, else pread/pwrite. Ring depth **128**.
 | Hash multi-list (`.mlt`) | **FdOnly** | Linear append (`ArrayLink` kind forced FdOnly at site) |
 | **`scripthash.head` / body** | **FdOnly** | 4 KiB chunk cache (128×32 B) insert + probe; body pread/pwrite slabs |
 | **Spenders** | **FdOnly** | Linear append multi-spender list |
-| Class C arrays | **MapFull** | header_txs, Confirmed, … — phase 5 → InRam |
-| Mempool store | **MapFull** | Separate crate — phase 5 |
+| Class C arrays | **FdOnly** | header_txs, Confirmed, heights, … (phase 5 step; InRam later) |
+| Mempool store | **MapFull** | Separate crate — phase 5 InRam |
 
 ### Hybrid paths (easy to misread)
 
 | Path | Table part | Fd/uring bulk part |
 |------|------------|---------------------|
-| Head resolve stream | FdOnly head probe (page) + FdOnly idx | uring/pread body prefix |
+| Head resolve stream | FdOnly **page-batched** head probe + FdOnly idx | uring/pread body prefix |
 | Pin denserels | FdOnly idx ranges | uring/pread body bytes |
 
 ---
@@ -206,6 +206,17 @@ Live node rollback: set **`RBITCOIN_TX_HEAD_ACCESS=map`** before open/create
 - `Spender` multi-list body: FdOnly via `for_kind`.
 - Class C / mempool remain MapFull (phase 5 InRam).
 
-### Phase 5+ — (pending)
+### Phase 5a — Class C FdOnly + resolve page-batch (landed)
 
-Small tables InRam + mempool; then remove `memmap2` (phase 6).
+- [`TableAccess::for_kind`](../crates/rbitcoin-store/src/file.rs): Class C
+  (`ArrayLink`, Confirmed, Header, TxHeight, StrongTx, …) default **FdOnly**.
+- Head resolve: **`probe_candidates_batch` / `probe_fks_batch`** — one page
+  pread per distinct probe page across the whole key wave (uring + pread paths).
+- Logging: `access=` on address-head **open** + segment open; node start logs
+  `version=` + `tx_head_access=`; `perf_dbg` adds `probe_us/key=` `idx_us/key=`
+  `body_us/key=` and `ca_head_us/blk=` `ca_body_us/blk=`.
+
+### Phase 5b+ — (pending)
+
+Explicit **InRam** for small Class C / mempool (not leftover MapFull); then
+remove `memmap2` (phase 6).

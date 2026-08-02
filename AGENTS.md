@@ -84,9 +84,9 @@ to), still do the static musl install and say the tree was **not** committed.
 
 The workspace is mounted into the agent VM as **9p** (`workspace` on `/home/agent/workspace`, `trans=virtio`). On this mount:
 
-- **Writable shared `mmap` (`MAP_SHARED` + `PROT_WRITE`) fails with `EINVAL`** for store table files that still use [`TableAccess::MapFull`](docs/io-modality.md) (Class C arrays, mempool; large tables are **FdOnly**).
-- `pread`/`pwrite` work; **`tx.body` / `tx.idx` / `tx.head` / header head / SH / spenders** are FdOnly (payload not multi‑GiB-mapped).
-- Opening a **full** store under the workspace can still fail while any MapFull table remains (e.g. Class C). Prefer `/tmp` fixtures for agent correctness.
+- **Writable shared `mmap` (`MAP_SHARED` + `PROT_WRITE`) fails with `EINVAL`** for tables that still use [`TableAccess::MapFull`](docs/io-modality.md) (mempool; store tables are **FdOnly**).
+- `pread`/`pwrite` work; store tables default FdOnly (payload not multi‑GiB-mapped).
+- Prefer `/tmp` fixtures for agent correctness. Mempool MapFull may still fail open on 9p.
 
 **Do not use the user’s live test datadirs in this VM** (e.g. `datadir-signet/`, `datadir-mainnet/`) to open the store, run the node against those paths, or diagnose tip stalls by loading Class A/C tables here. That includes ~27 GiB signet store under `datadir-signet/store/`.
 

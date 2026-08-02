@@ -5,14 +5,16 @@
 //!
 //! ## Uring path (completion-driven)
 //!
-//! Per key, the ring owns the **idx → body** steps (head probe is CPU-side):
-//! 1. **probe** (sync) — candidate create_fks deepest-first
+//! Per key, the ring owns the **idx → body** steps; head probe is CPU-side and
+//! **page-batched across the whole key wave**:
+//! 1. **probe** (sync batch) — [`SegmentedTxHead::probe_candidates_batch`]: one
+//!    page pread per distinct probe page, hop all keys on that page in RAM
 //! 2. **STAGE_IDX** — one OS-page pread covering the candidate's idx slot
 //! 3. **STAGE_BODY** — ≤32 B body prefix pread; match → done, else next cand at STAGE_IDX
 //!
 //! Multiple keys are in flight at mixed stages (not “all idx then all body”).
 //!
-//! Pread path: sequential probe → page-aligned idx → body pread (no ring).
+//! Pread path: batch probe → sequential page-aligned idx → body pread (no ring).
 
 use crate::error::StoreError;
 use crate::io_backend::{self, ReadIoBackend};
@@ -61,7 +63,7 @@ pub fn resolve_batch_streaming(
     }
 }
 
-/// Sequential deepest-cand: page-aligned idx + body pread.
+/// Sequential deepest-cand: page-batched probe + page-aligned idx + body pread.
 fn resolve_batch_sync_pread(
     table: &TxTable,
     txids: &[[u8; 32]],
@@ -72,27 +74,28 @@ fn resolve_batch_sync_pread(
     let body_fd = table.body.body_read_fd();
     let body_path = table.body.body_file_path().to_path_buf();
 
+    let mixed: Vec<[u8; 32]> = txids.iter().map(|t| table.secret.mix_txid(t)).collect();
+    let t_probe = Instant::now();
+    let all_cands = table.head.probe_candidates_batch(&mixed)?;
+    let probe_ns = t_probe.elapsed().as_nanos() as u64;
+
     let mut results: Vec<Option<Fk>> = vec![None; txids.len()];
     let mut cands_total = 0u64;
     let mut body_lookups = 0u64;
-    let mut probe_ns = 0u64;
     let mut idx_ns = 0u64;
     let mut body_ns = 0u64;
 
     for (key_i, txid) in txids.iter().enumerate() {
-        let t_probe = Instant::now();
-        let mixed = table.secret.mix_txid(txid);
-        let raw = table.head.probe_candidates(&mixed)?;
-        probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
+        let raw = &all_cands[key_i];
         cands_total = cands_total.saturating_add(raw.len() as u64);
         let mut matched: Option<Fk> = None;
-        for (ci, fk) in raw.into_iter().enumerate() {
+        for (ci, fk) in raw.iter().enumerate() {
             let id = fk.0;
             if id == 0 || id > count {
                 continue;
             }
             let t_idx = Instant::now();
-            let range = match table.body.record_range(fk) {
+            let range = match table.body.record_range(*fk) {
                 Ok(r) => r,
                 Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => continue,
                 Err(e) => return Err(e),
@@ -128,7 +131,7 @@ fn resolve_batch_sync_pread(
             match TxTable::txid_from_body_prefix(&buf[..n]) {
                 Ok(got) if got == *txid => {
                     crate::head_resolve_stats::add_hit_rank((ci + 1) as u64);
-                    matched = Some(fk);
+                    matched = Some(*fk);
                     break;
                 }
                 Ok(_) => crate::head_resolve_stats::add_miss_peeks(1),
@@ -154,7 +157,7 @@ fn resolve_batch_sync_pread(
         .collect())
 }
 
-/// io_uring: per-key stages idx → body (many keys mixed in flight).
+/// io_uring: page-batched probe, then per-key stages idx → body (mixed in flight).
 fn resolve_batch_streaming_uring(
     table: &TxTable,
     txids: &[[u8; 32]],
@@ -167,12 +170,21 @@ fn resolve_batch_streaming_uring(
     let body_pub = table.body.body_published_len();
     let count = table.body.count();
 
+    // One page-coalesced probe wave for the whole batch (not per-key preads).
+    let mixed: Vec<[u8; 32]> = txids.iter().map(|t| table.secret.mix_txid(t)).collect();
+    let t_probe = Instant::now();
+    let all_cands = table.head.probe_candidates_batch(&mixed)?;
+    let probe_ns = t_probe.elapsed().as_nanos() as u64;
+    let cands_u64: Vec<Vec<u64>> = all_cands
+        .into_iter()
+        .map(|v| v.into_iter().map(|f| f.0).collect())
+        .collect();
+    let cands_total: u64 = cands_u64.iter().map(|v| v.len() as u64).sum();
+
     let mut results: Vec<Option<Fk>> = vec![None; txids.len()];
     let mut done = vec![false; txids.len()];
     let mut next_key = 0usize;
-    let mut cands_total = 0u64;
     let mut body_lookups = 0u64;
-    let mut probe_ns = 0u64;
     let mut idx_ns = 0u64;
     let mut body_ns = 0u64;
 
@@ -183,6 +195,7 @@ fn resolve_batch_streaming_uring(
     arm_keys(
         table,
         txids,
+        &cands_u64,
         &mut session,
         count,
         &mut free_slots,
@@ -191,8 +204,6 @@ fn resolve_batch_streaming_uring(
         &mut next_key,
         &mut done,
         &mut results,
-        &mut cands_total,
-        &mut probe_ns,
         &mut idx_ns,
     )?;
     session.sync_submission();
@@ -353,6 +364,7 @@ fn resolve_batch_streaming_uring(
         arm_keys(
             table,
             txids,
+            &cands_u64,
             &mut session,
             count,
             &mut free_slots,
@@ -361,8 +373,6 @@ fn resolve_batch_streaming_uring(
             &mut next_key,
             &mut done,
             &mut results,
-            &mut cands_total,
-            &mut probe_ns,
             &mut idx_ns,
         )?;
         session.sync_submission();
@@ -393,6 +403,7 @@ use std::path::Path;
 fn arm_keys(
     table: &TxTable,
     txids: &[[u8; 32]],
+    cands_by_key: &[Vec<u64>],
     session: &mut UringSession,
     count: u64,
     free_slots: &mut Vec<usize>,
@@ -401,8 +412,6 @@ fn arm_keys(
     next_key: &mut usize,
     done: &mut [bool],
     results: &mut [Option<Fk>],
-    cands_total: &mut u64,
-    probe_ns: &mut u64,
     idx_ns: &mut u64,
 ) -> Result<(), StoreError> {
     while *next_key < txids.len()
@@ -414,12 +423,7 @@ fn arm_keys(
         *next_key += 1;
         let slot = free_slots.pop().unwrap();
 
-        let t_probe = Instant::now();
-        let mixed = table.secret.mix_txid(&txids[key_i]);
-        let raw = table.head.probe_candidates(&mixed)?;
-        *probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
-        *cands_total = cands_total.saturating_add(raw.len() as u64);
-        let cands: Vec<u64> = raw.into_iter().map(|f| f.0).collect();
+        let cands = cands_by_key[key_i].clone();
         if cands.is_empty() {
             free_slots.push(slot);
             done[key_i] = true;

@@ -59,22 +59,29 @@ pub enum TableAccess {
 impl TableAccess {
     /// Default access for a new/open table of `kind` / trailing layout.
     ///
-    /// **FdOnly** (phase 3/4 demap): leading `tx.body`, all `HashHead` (header /
-    /// SH / address trailing), `ScriptHash` body, `Spender` multi-list, and
-    /// anything else multi‑GiB random or append. **MapFull** remains for small
-    /// Class C arrays (`ArrayLink` header_txs, Confirmed, …) until phase 5 InRam.
-    ///
-    /// `tx.idx` segments force FdOnly at the call site (`ArrayLink` kind is shared
-    /// with Class C). Hash-head multi-list (`.mlt`) also forces FdOnly at the site.
+    /// **FdOnly** (phases 1–5 demap): body, idx/ArrayLink, heads, SH, spenders,
+    /// and Class C arrays (Confirmed, header_txs, heights, …). **MapFull** only
+    /// for unused trailing layouts and exotic kinds until phase 6 removes maps.
+    /// Mempool stays MapFull in its own crate until phase 5 InRam.
     #[inline]
     pub fn for_kind(kind: TableKind, trailing_header: bool) -> Self {
         match kind {
-            TableKind::Tx if !trailing_header => Self::FdOnly,
-            // Trailing tx tables are unused; trailing HashHead is address-head.
-            TableKind::HashHead => Self::FdOnly,
-            TableKind::ScriptHash => Self::FdOnly,
-            TableKind::Spender => Self::FdOnly,
-            _ => Self::MapFull,
+            // Unused trailing Tx tables (if any) stay MapFull.
+            TableKind::Tx if trailing_header => Self::MapFull,
+            // Everything else in the store defaults to FdOnly (pread/pwrite).
+            TableKind::Tx
+            | TableKind::HashHead
+            | TableKind::ScriptHash
+            | TableKind::Spender
+            | TableKind::ArrayLink
+            | TableKind::Confirmed
+            | TableKind::Header
+            | TableKind::TxHeight
+            | TableKind::StrongTx
+            | TableKind::Meta
+            | TableKind::Point
+            | TableKind::Input
+            | TableKind::Output => Self::FdOnly,
         }
     }
 
@@ -1201,14 +1208,18 @@ mod advise_tests {
             TableAccess::for_kind(TableKind::Spender, false),
             TableAccess::FdOnly
         );
-        // ArrayLink default is MapFull (header_txs Class C); idx / .mlt override.
+        // Class C + ArrayLink (header_txs / idx kind) default FdOnly (phase 5).
         assert_eq!(
             TableAccess::for_kind(TableKind::ArrayLink, false),
-            TableAccess::MapFull
+            TableAccess::FdOnly
         );
         assert_eq!(
             TableAccess::for_kind(TableKind::Confirmed, false),
-            TableAccess::MapFull
+            TableAccess::FdOnly
+        );
+        assert_eq!(
+            TableAccess::for_kind(TableKind::Header, false),
+            TableAccess::FdOnly
         );
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);

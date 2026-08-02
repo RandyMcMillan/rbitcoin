@@ -49,7 +49,7 @@ Default: **info**. CLI wins over env.
 | Line | Level | Use |
 |------|-------|-----|
 | `ibd: progress` | INFO | Tip rate, `planq`/`prepq`/`writeq`, `txs=` (Class A / `tx.idx` count), horizon, tip ETA, `bq n=` + **`disk=`** MiB (on-disk only) + **`soft=n/stop`** (time-depth densify gate ≈5 min tip rate) |
-| `ibd: perf` | INFO | Inflight + RAM `body_soft` + **`bq n= disk= soft=`**; **load / script / write** walls; load phases (hdr/dec/put/thin/pin + pin_hit%/pin_res/body_io); write (struct/class_c/sh/spend/tip_gc) |
+| `ibd: perf` | INFO | Inflight + RAM `body_soft` + **`bq n= disk= soft=`**; **load / script / write** walls; live confirm `h= n= in=` (blocks + inputs in current pack); pin/write detail |
 | `ibd: sizes` | INFO | RSS + work path + arch RAM + **`bq disk=` / `soft=`** + **residency** + confirm pipe |
 | `ibd: perf_dbg` | DEBUG | µs/blk load/write, pin/edge detail, **plan_mega res_txid** + **class_a res_seed**, contig park |
 
@@ -100,7 +100,8 @@ selected but setup fails, demote to **pread** / **pwrite**.
 | Bulk store IO | **uring** (Linux) when available | See **Bulk store IO backends** above; ring depth **128**; `RBITCOIN_BULK_IO_WORKERS` for pread. Segmented `tx.head` **insert_many** stays mmap |
 | Archive Class A append | **pwrite** (always) | `tx.body` / `tx.idx` mega-appends use `write_at_pwrite` only |
 | `tx.head` (segmented) | fixed geometry | Default **25-bit** heads (128 MiB) with **4 B relative** fks; roll at 80% load / body soft span; **binary fuse8** on seal. `RBITCOIN_TX_HEAD_BITS` for tests only. Legacy mono-head datadirs require reindex |
-| Confirm stages | **plan · prep · scripts · write** | Pipeline queues cap **5** each (`planq=n/5 prepq=m/5 writeq=k/5`; `name<0/cap` when the next worker is waiting on an empty queue) |
+| Confirm stages | **plan · prep · scripts · write** | Pipeline queues cap **5** each (`planq=n/5 …`; `RBITCOIN_CONFIRM_QUEUE`). Plan packs tip-contiguous waves by **decoding BQ one block at a time** until soft **Σ inputs** (`RBITCOIN_CONFIRM_BATCH_INPUTS`, default **8000**, include overshoot block) or hard **144** blocks |
+| Confirm batch inputs | **8000** soft | `RBITCOIN_CONFIRM_BATCH_INPUTS` (1..=1e6). Live line: `h= n= in=` (blocks + inputs) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 | Inhibit auto-suspend | **off** | `--inhibit-suspend` (uses `systemd-inhibit` if available) |
 

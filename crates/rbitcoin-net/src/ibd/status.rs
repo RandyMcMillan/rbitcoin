@@ -41,6 +41,8 @@ pub(crate) struct LoopStats {
 struct ConfirmLive {
     first_height: u32,
     batch_n: u32,
+    /// Σ tx.input count over the packed batch (confirm-side pack).
+    batch_inputs: u32,
     started: Instant,
 }
 
@@ -62,10 +64,11 @@ impl Default for LoopStats {
 }
 
 impl LoopStats {
-    pub(crate) fn confirm_begin(&self, first_height: u32, batch_n: u32) {
+    pub(crate) fn confirm_begin(&self, first_height: u32, batch_n: u32, batch_inputs: u32) {
         *self.confirm_live.lock().unwrap() = Some(ConfirmLive {
             first_height,
             batch_n,
+            batch_inputs,
             started: Instant::now(),
         });
     }
@@ -74,12 +77,13 @@ impl LoopStats {
         *self.confirm_live.lock().unwrap() = None;
     }
 
-    /// `(first_height, batch_n, elapsed_ms)` if a confirm batch is running.
-    pub(crate) fn confirm_live_snap(&self) -> Option<(u32, u32, u64)> {
+    /// `(first_height, batch_n, batch_inputs, elapsed_ms)` if a confirm batch is running.
+    pub(crate) fn confirm_live_snap(&self) -> Option<(u32, u32, u32, u64)> {
         self.confirm_live.lock().unwrap().as_ref().map(|l| {
             (
                 l.first_height,
                 l.batch_n,
+                l.batch_inputs,
                 l.started.elapsed().as_millis() as u64,
             )
         })
@@ -109,8 +113,9 @@ pub(crate) struct LoopSample {
     pub(crate) drain_ns: u64,
     pub(crate) drain_events: u64,
     pub(crate) status_scan_ns: u64,
-    /// Live batch if confirm engine is mid-`confirm_run`.
-    pub(crate) confirm_live: Option<(u32, u32, u64)>,
+    /// Live batch if confirm engine is mid-`confirm_run`:
+    /// `(first_height, batch_n, batch_inputs, elapsed_ms)`.
+    pub(crate) confirm_live: Option<(u32, u32, u32, u64)>,
 }
 
 impl LoopSample {
@@ -171,10 +176,11 @@ mod tests {
     fn loop_stats_sample_dominant_and_live() {
         let s = LoopStats::default();
         assert!(s.confirm_live_snap().is_none());
-        s.confirm_begin(10, 4);
+        s.confirm_begin(10, 4, 100);
         let live = s.confirm_live_snap().unwrap();
         assert_eq!(live.0, 10);
         assert_eq!(live.1, 4);
+        assert_eq!(live.2, 100);
         std::thread::sleep(Duration::from_millis(2));
         let sample = s.sample_and_reset();
         assert!(sample.confirm_live.is_some());

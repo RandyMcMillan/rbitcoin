@@ -10,7 +10,7 @@ in RSS when faulted but are not Rust heap leaks).
 |-----------|-------------|---------------------------|
 | **Durable body queue** | **Soft time-depth** ~5 min of tip-rate blocks on disk (hysteresis resume &lt;4 min); optional absolute byte ceiling via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` (default unlimited) | Peer **offer** wire always to disk; confirm prep **reads** by height; confirm-write **dequeues** after tip advance. Files get `POSIX_FADV_DONTNEED` after durable write (idle on disk — not process heap). **Restart rehydrate uses index meta only** (`list_meta`) — never `load_all`. No process RAM overflow for BQ. Logs: `bq n=` + `disk=` + `soft=n/stop`. |
 | **Body densify height horizon** | `CONTIG_DENSIFY_AHEAD` (64 k past tip) | Safety max walk/receive; primary stop is **soft time-depth**. Gaps inside on-disk max height always densify even under pressure. |
-| **Confirm feed** | readiness (height/hash), no wire retain | Prep claims tip-contiguous runs; requeue / finish on outcome |
+| **Confirm feed** | readiness (height/hash), no wire retain | Plan **packs** tip-contiguous runs by decoding BQ wire one height at a time until soft **input** budget (`RBITCOIN_CONFIRM_BATCH_INPUTS`, default **8000**, overshoot block included) or hard **144** blocks; requeue / finish on outcome |
 
 ## Soft budgets / fallback archive job (not the primary Class A path)
 

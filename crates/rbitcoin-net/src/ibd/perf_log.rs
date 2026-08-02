@@ -71,8 +71,8 @@ pub(crate) struct IbdPerfSample {
     pub drain_events: u64,
     pub status_scan_ms: u64,
     pub dominant: &'static str,
-    /// `(first, batch_n, elapsed_ms)` if confirm mid-batch.
-    pub live: Option<(u32, u32, u64)>,
+    /// `(first, batch_n, batch_inputs, elapsed_ms)` if confirm mid-batch.
+    pub live: Option<(u32, u32, u32, u64)>,
 
     // Confirm phases (ns → ms at format)
     pub phase_blks: u64,
@@ -1276,8 +1276,10 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     if s.confirm_reject_stops > 0 {
         out.push_str(&format!(" reject={}", s.confirm_reject_stops));
     }
-    if let Some((first, n, elapsed_ms)) = s.live {
-        out.push_str(&format!(" | live h={first} n={n} {elapsed_ms}ms"));
+    if let Some((first, n, inputs, elapsed_ms)) = s.live {
+        out.push_str(&format!(
+            " | live h={first} n={n} in={inputs} {elapsed_ms}ms"
+        ));
     }
     if s.headers_done {
         out.push_str(" headers_done");
@@ -1701,7 +1703,7 @@ mod tests {
         s.utxo_ms = 25;
         s.cache_tip_ms = 5;
         s.dominant = "confirm";
-        s.live = Some((100, 32, 1500));
+        s.live = Some((100, 32, 8000, 1500));
         s.confirm_reject_stops = 2;
         let line = format_info(&s);
         assert!(line.starts_with("ibd: perf "), "{line}");
@@ -1732,7 +1734,7 @@ mod tests {
         assert!(!line.contains("unpin"), "{line}");
         assert!(line.contains("loop confirm"), "{line}");
         assert!(line.contains("reject=2"), "{line}");
-        assert!(line.contains("live h=100 n=32 1500ms"), "{line}");
+        assert!(line.contains("live h=100 n=32 in=8000 1500ms"), "{line}");
         s.conf_plan_q = 0;
         s.conf_load_q = 1;
         s.conf_write_q = 2;

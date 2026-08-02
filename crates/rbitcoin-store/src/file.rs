@@ -1,15 +1,24 @@
-//! Growable mmap-backed table files with a common header.
+//! Growable table files with a common header and dual **access** modes.
+//!
+//! See [`docs/io-modality.md`](../../../../docs/io-modality.md) for the full
+//! bulk-IO vs table-transport split and the plan to remove `memmap2`.
+//!
+//! # Access modes ([`TableAccess`])
+//!
+//! - **[`TableAccess::FdOnly`]** — Class A `tx.body` today: tiny header-only map
+//!   (not grown with payload); `read_at`/`write_at` use pread/pwrite. Capacity via
+//!   fallocate without multi‑GiB remap.
+//! - **[`TableAccess::MapFull`]** — full-file `MmapMut` map epochs; steady-state
+//!   read/write is memcpy through the map. Grow = fallocate + remap + Arc swap.
 //!
 //! # Concurrency (brief epoch pin, no long map mutex)
 //!
 //! - **Published logical length** is an `AtomicU64` (Acquire/Release).
-//! - **Map capacity** uses epochs: grow fallocates + maps a new window on the
-//!   same file, then swaps an `Arc` under a short write lock. Readers pin by
-//!   cloning that `Arc` under a shared read lock (no load/increment UAF window).
-//!   Old epochs live until the last pin drops (same idea as `tx.head` shadow
-//!   swap — readers never pause for capacity *mapping* work).
-//! - Steady-state **read / write** memcpy does **not** hold the epoch lock past
-//!   the pin clone.
+//! - **MapFull capacity** uses map epochs: grow fallocates + maps a new window,
+//!   then swaps an `Arc` under a short write lock. Readers pin by cloning that
+//!   `Arc` (old epochs live until pins drop).
+//! - Steady-state MapFull memcpy does **not** hold the epoch lock past the pin
+//!   clone. FdOnly payload IO never holds the map for the body.
 //! - `File` is only locked for grow (`fallocate`/`set_len`), fsync, and fadvise.
 //!
 //! Roles (see `AGENTS.md` / `docs/concurrency.md`): at most one appender and one
@@ -32,6 +41,38 @@ pub const FILE_HEADER_LEN: usize = 16;
 /// extension (bits / entry_bytes / generation). Slots still start at file offset 0
 /// so probe pages stay OS-page-aligned.
 pub const TRAILING_FOOTER_LEN: usize = 32;
+
+/// How [`TableFile`] serves payload IO (independent of `RBITCOIN_IO` bulk batch).
+///
+/// Bulk batch backends (`uring` \| `pread`) select **how** multi-op body waves
+/// run; this enum selects **whether** the table file is full-mapped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableAccess {
+    /// Full-file `MmapMut` map epochs; `read_at`/`write_at` memcpy through the map.
+    MapFull,
+    /// Payload via pread/pwrite; map is a tiny header window only (not grown).
+    /// Used for Class A `tx.body` (leading header); more tables migrate here later.
+    FdOnly,
+}
+
+impl TableAccess {
+    /// Default access for a new/open table of `kind` / trailing layout.
+    ///
+    /// Only leading-header [`TableKind::Tx`] (`tx.body`) is FdOnly today.
+    #[inline]
+    pub fn for_kind(kind: TableKind, trailing_header: bool) -> Self {
+        if kind == TableKind::Tx && !trailing_header {
+            Self::FdOnly
+        } else {
+            Self::MapFull
+        }
+    }
+
+    #[inline]
+    pub fn is_fd_only(self) -> bool {
+        matches!(self, Self::FdOnly)
+    }
+}
 
 /// One mmap window over the table file. Shared via [`Arc`]; bytes are accessed
 /// with role-disciplined pointer IO (not `DerefMut` under shared refs).
@@ -69,14 +110,13 @@ pub struct TableFile {
     /// Same inode as `file`; concurrent pread is safe with the role protocol.
     read_file: File,
     /// Current map epoch. Pin clones under a short shared lock; grow replaces
-    /// under a write lock. Avoids the AtomicPtr load/increment free race.
-    /// **Class A `tx.body` (`TableKind::Tx`, leading header):** map is a tiny
-    /// header-only window (not grown); payload IO uses pread/pwrite only.
+    /// under a write lock. For [`TableAccess::FdOnly`], the map is a tiny
+    /// header-only window (not grown with payload).
     epoch: RwLock<Arc<MapEpoch>>,
     /// Logical length including header/trailer (published HWM).
     published_len: AtomicU64,
-    /// File capacity for **fd-only body** tables (`TableKind::Tx` leading). Always
-    /// ≥ published; grown via fallocate without remapping multi‑GiB body.
+    /// File capacity for **FdOnly** tables. Always ≥ published; grown via
+    /// fallocate without remapping multi‑GiB payload.
     file_cap: AtomicU64,
     /// When true: [`TRAILING_FOOTER_LEN`]-byte magic+HWM+layout trailer is at
     /// **end** of published range; data starts at offset 0 (page-aligned probes).
@@ -85,13 +125,21 @@ pub struct TableFile {
     /// other tables; rewritten with the trailer on every `set_logical_len`.
     trailing_ext: [u8; 16],
     kind: TableKind,
+    /// Payload transport (FdOnly vs MapFull). Independent of `RBITCOIN_IO`.
+    access: TableAccess,
 }
 
 impl TableFile {
-    /// Class A `tx.body` — no multi‑GiB mmap payload access.
+    /// Payload access mode for this file.
     #[inline]
-    fn is_tx_body_fd(&self) -> bool {
-        self.kind == TableKind::Tx && !self.trailing_header
+    pub fn access(&self) -> TableAccess {
+        self.access
+    }
+
+    /// True when payload uses pread/pwrite (no multi‑GiB map).
+    #[inline]
+    fn is_fd_only(&self) -> bool {
+        self.access().is_fd_only()
     }
 
     fn install_epoch(epoch: Arc<MapEpoch>) -> RwLock<Arc<MapEpoch>> {
@@ -138,9 +186,10 @@ impl TableFile {
         let initial = FILE_HEADER_LEN as u64 + 64;
         file.set_len(initial)
             .map_err(|e| StoreError::io(&path, e))?;
-        // Class A body: pin only a tiny header window forever (payload = pread/pwrite).
-        // Other tables: full-file map.
-        let map = if kind == TableKind::Tx {
+        let access = TableAccess::for_kind(kind, false);
+        // FdOnly (tx.body): pin only a tiny header window forever.
+        // MapFull: full-file map.
+        let map = if access.is_fd_only() {
             unsafe {
                 memmap2::MmapOptions::new()
                     .len(initial as usize)
@@ -164,6 +213,7 @@ impl TableFile {
             trailing_header: false,
             trailing_ext: [0u8; 16],
             kind,
+            access,
         })
     }
 
@@ -187,6 +237,7 @@ impl TableFile {
         let initial = TRAILING_FOOTER_LEN as u64;
         file.set_len(initial)
             .map_err(|e| StoreError::io(&path, e))?;
+        let access = TableAccess::for_kind(kind, true);
         let map = unsafe { MmapMut::map_mut(&file) }.map_err(|e| StoreError::io(&path, e))?;
         let epoch = Arc::new(MapEpoch { map });
         let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
@@ -200,6 +251,7 @@ impl TableFile {
             trailing_header: true,
             trailing_ext: [0u8; 16],
             kind,
+            access,
         };
         s.write_trailer(initial)?;
         Ok(s)
@@ -249,6 +301,7 @@ impl TableFile {
         let mut trailing_ext = [0u8; 16];
         trailing_ext.copy_from_slice(&footer[16..32]);
         let logical = expect;
+        let access = TableAccess::for_kind(kind, true);
         let map = unsafe { MmapMut::map_mut(&file) }.map_err(|e| StoreError::io(&path, e))?;
         let epoch = Arc::new(MapEpoch { map });
         let read_file = file.try_clone().map_err(|e| StoreError::io(&path, e))?;
@@ -263,6 +316,7 @@ impl TableFile {
                 trailing_header: true,
                 trailing_ext,
                 kind,
+                access,
             },
             trailing_ext,
         ))
@@ -380,7 +434,8 @@ impl TableFile {
             logical = file_len;
         }
 
-        let map = if kind == TableKind::Tx {
+        let access = TableAccess::for_kind(kind, false);
+        let map = if access.is_fd_only() {
             let win = (FILE_HEADER_LEN as u64 + 4096).min(file_len.max(FILE_HEADER_LEN as u64));
             unsafe {
                 memmap2::MmapOptions::new()
@@ -403,6 +458,7 @@ impl TableFile {
             trailing_header: false,
             trailing_ext: [0u8; 16],
             kind,
+            access,
         })
     }
 
@@ -493,7 +549,7 @@ impl TableFile {
     }
 
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
-        if self.is_tx_body_fd() {
+        if self.is_fd_only() {
             return self.pread_at(offset, buf);
         }
         let end = offset.saturating_add(buf.len() as u64);
@@ -515,7 +571,7 @@ impl TableFile {
     }
 
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
-        if self.is_tx_body_fd() {
+        if self.is_fd_only() {
             return self.write_at_pwrite(offset, bytes);
         }
         let end = offset.saturating_add(bytes.len() as u64);
@@ -655,7 +711,7 @@ impl TableFile {
     /// Class A **tx.body**: fallocate/set_len only — never grows the multi‑GiB map.
     /// Other tables: fallocate then map a **new** epoch (readers hold old pin).
     pub fn ensure_capacity(&self, need: u64) -> Result<(), StoreError> {
-        if self.is_tx_body_fd() {
+        if self.is_fd_only() {
             if need <= self.file_cap.load(Ordering::Acquire) {
                 return Ok(());
             }
@@ -781,7 +837,7 @@ impl TableFile {
     fn write_hwm_mmap(&self, logical: u64) {
         let bytes = logical.to_le_bytes();
         // Class A body: header HWM only (offset 8) via pwrite — map may be header-only.
-        if self.is_tx_body_fd() && !self.trailing_header {
+        if self.is_fd_only() && !self.trailing_header {
             let fd = self.read_file.as_raw_fd();
             let rc = unsafe {
                 libc::pwrite(
@@ -883,7 +939,7 @@ impl TableFile {
         if end > logical {
             return Err(StoreError::Corrupt("with_bytes past logical end"));
         }
-        if self.is_tx_body_fd() {
+        if self.is_fd_only() {
             let mut buf = vec![0u8; len as usize];
             self.pread_at(offset, &mut buf)?;
             return Ok(f(&buf));
@@ -1000,6 +1056,34 @@ mod advise_tests {
         f.read_at(FILE_HEADER_LEN as u64, &mut buf).unwrap();
         assert_eq!(buf, payload);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn table_access_tx_body_fd_only_others_map_full() {
+        assert_eq!(
+            TableAccess::for_kind(TableKind::Tx, false),
+            TableAccess::FdOnly
+        );
+        assert_eq!(
+            TableAccess::for_kind(TableKind::Tx, true),
+            TableAccess::MapFull
+        );
+        assert_eq!(
+            TableAccess::for_kind(TableKind::HashHead, false),
+            TableAccess::MapFull
+        );
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("rbitcoin-access-{id}"));
+        let _ = std::fs::remove_file(&path);
+        let f = TableFile::create(&path, TableKind::Tx).unwrap();
+        assert_eq!(f.access(), TableAccess::FdOnly);
+        let _ = std::fs::remove_file(&path);
+        let path2 = std::env::temp_dir().join(format!("rbitcoin-access-h-{id}"));
+        let _ = std::fs::remove_file(&path2);
+        let h = TableFile::create_trailing_header(&path2, TableKind::HashHead).unwrap();
+        assert_eq!(h.access(), TableAccess::MapFull);
+        let _ = std::fs::remove_file(&path2);
     }
 
 

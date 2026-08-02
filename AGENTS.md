@@ -84,18 +84,20 @@ to), still do the static musl install and say the tree was **not** committed.
 
 The workspace is mounted into the agent VM as **9p** (`workspace` on `/home/agent/workspace`, `trans=virtio`). On this mount:
 
-- **Writable shared `mmap` (`MAP_SHARED` + `PROT_WRITE`) fails with `EINVAL`** for store table files.
-- Read-only mmap may work; `pread`/`pwrite` work.
-- `rbitcoin-store` opens tables with `MmapMut` today, so **`Query::open` / `Store::open` / `rbitcoin-node` against paths under the workspace will fail** with `io error … Invalid argument (os error 22)` (e.g. on `scripthash.body`).
+- **Writable shared `mmap` (`MAP_SHARED` + `PROT_WRITE`) fails with `EINVAL`** for store table files that still use [`TableAccess::MapFull`](docs/io-modality.md) (`tx.idx`, heads, SH, …).
+- `pread`/`pwrite` work; Class A **`tx.body`** is already FdOnly (payload not multi‑GiB-mapped).
+- Opening a full store under the workspace path still fails while MapFull tables remain (e.g. `scripthash.body`).
 
 **Do not use the user’s live test datadirs in this VM** (e.g. `datadir-signet/`, `datadir-mainnet/`) to open the store, run the node against those paths, or diagnose tip stalls by loading Class A/C tables here. That includes ~27 GiB signet store under `datadir-signet/store/`.
+
+**Perf A/B for demap work** (idx/head) is **operator-host only**, with the musl static binary — never agent-VM timings. See [`docs/io-modality.md`](docs/io-modality.md).
 
 ### What works instead
 
 - Read **logs** the user leaves in-tree (`signet-ibd.log`, etc.).
 - Inspect store files with **non-mmap** tools (`pread`/Python struct parsing of HWMs, headers) when useful for offline forensics only — not as a substitute for a full node open.
-- Reproduce with **synthetic fixtures** and `rbitcoin-test` scenarios under `/tmp` or other non-9p paths where mmap works.
-- Ask the user to run the node / confirm diagnostics on their host (where the datadir is a normal local FS).
+- Reproduce with **synthetic fixtures** and `rbitcoin-test` scenarios under `/tmp` or other non-9p paths where MapFull open works.
+- Ask the user to run the node / confirm diagnostics / **host musl benches** on their host (normal local FS).
 
 ### Related symptoms already seen
 

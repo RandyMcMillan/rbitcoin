@@ -15,7 +15,7 @@ with `Err(…Corrupt("invariant: …"))` (and `debug_assert!` where useful). Do
 | Kind | Examples | Policy |
 |------|----------|--------|
 | **Prep miss** | Spend annotate without pin denserels; body decode without `tx.idx` range; pin without outs for need_vouts; ensure without abs for a spend edge | Assert / hard Err; fix prep |
-| **Environment** | `io_uring` off → pread/mmap; `RBITCOIN_FD_APPEND=0` | Keep modality fallback |
+| **Environment** | `io_uring` off → pread/pwrite; `RBITCOIN_IO=mmap` demotes to pread; `RBITCOIN_FD_APPEND=0` | Keep modality fallback |
 | **Protocol** | BIP30 multi-spender list; same-block spends; coinbase null create | Real branches |
 | **API / product** | RPC body from store; Electrum mempool after chain; compact → getdata | Keep |
 

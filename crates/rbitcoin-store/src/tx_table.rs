@@ -1389,7 +1389,8 @@ impl TxTable {
     /// Batch head resolve (archive prep bulk path).
     ///
     /// Streaming resolve ([`crate::head_resolve_stream`]) with body backend from
-    /// `RBITCOIN_HEAD_RESOLVE_IO` / global `RBITCOIN_IO` (mmap \| uring \| pread).
+    /// `RBITCOIN_HEAD_RESOLVE_IO` / global `RBITCOIN_IO` (`uring` \| `pread`).
+    /// Head probe + idx remain table-map today (see `docs/io-modality.md`).
     /// Fallback on hard stream failure: phase barrier
     /// [`Self::get_fk_by_txid_batch_phased`].
     ///
@@ -1881,7 +1882,7 @@ impl TxTable {
     ///
     /// Returns `(spender_field, flags)` — multi = `flags & MULTI_SPENDER`.
     /// Backend from [`spend_meta_backend`] / `RBITCOIN_SPEND_META` /
-    /// global `RBITCOIN_IO` (`mmap` | `uring` | `pread`). Out-of-range / short → `None`.
+    /// global `RBITCOIN_IO` (`uring` \| `pread`). Out-of-range / short → `None`.
     pub fn get_spender_meta_at_abs_batch(
         &self,
         abs_offs: &[u64],

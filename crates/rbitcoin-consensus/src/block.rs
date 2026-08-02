@@ -1100,7 +1100,7 @@ pub(crate) fn structural_validate_spends(
     let tip = query.tip_height().map(|h| h.0);
 
     // Hot path: bulk 9-byte spender meta at pin offsets (on-disk authority).
-    // Backend: RBITCOIN_SPEND_META / RBITCOIN_IO (mmap|uring|pread).
+    // Backend: RBITCOIN_SPEND_META / RBITCOIN_IO (uring|pread).
     let mut spent_strong_ns = 0u64;
     if !abs_jobs.is_empty() {
         let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a)| *a).collect();

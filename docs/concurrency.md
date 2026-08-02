@@ -40,7 +40,7 @@ resize / overflow sidecar.
 |------|--------|
 | `peer_session` (split read/write) | Serve reconstruct + accept tip blocks via **`accept_and_connect_block`** → **`confirm_wire_run`** (same prep→scripts→commit) |
 | Electrum | Read-mostly; joins Class A + scripthash under `Query` |
-| Epoch finalize | Single-threaded control path; flushes mmap |
+| Epoch finalize | Single-threaded control path; flushes table maps / fd durability |
 
 ## Index modes (`IndexMode`)
 
@@ -58,7 +58,7 @@ Do not enter Tip until tip ≈ peer height. Tip entry bulk-materializes SH
 
 | Mechanism | What it replaces |
 |-----------|------------------|
-| Map **epochs** (`TableFile`) | No map `Mutex` on read/write; capacity = new mmap window + pointer swap |
+| Capacity **epochs** (`TableFile`) | No long map `Mutex` on read/write; MapFull = new map window + pointer swap; FdOnly (`tx.body`) = fallocate only |
 | Atomic `count` / HWM | Publish barrier (Acquire readers / Release appender) |
 | Role exclusivity | One appender, one annotator — not a global store mutex |
 | `tx.head` insert | **Sole writer**: plain Release store empty→relative + SeqCst fence per batch (no CAS). Role exclusivity — not multi-inserter safe |
@@ -84,14 +84,14 @@ There is **no** global “pause queries during confirm write.” Tip-as-commit +
 
 ## Host freezes / IO storms
 
-Single Class A writer is intentional. Multi‑GiB **mmap grow/remap** and **hash-head
+Single Class A writer is intentional. Multi‑GiB **MapFull grow/remap** and **hash-head
 rehash** (especially large **header** / scripthash head shards when materializing) can still stall the
-**host** (page cache / disk). See **[ibd-io-audit.md](./ibd-io-audit.md)** for the
-audit history, mitigations, and operator levers (`ionice`, dedicated disk, rehash
-log lines).
+**host** (page cache / disk). See **[ibd-io-audit.md](./ibd-io-audit.md)** and
+**[io-modality.md](./io-modality.md)** for history, demap plan, and operator levers
+(`ionice`, dedicated disk, rehash log lines).
 
 ### Confirm prep read pipeline
 
 Cold parent `tx.idx` / `tx.body` on the **prep** thread uses
-**mmap idx + bulk body** (`idx_body_pipeline` → `bulk_io`). Batch creates come from
-**wire**, not a second Class A full-decode pass.
+**table-map idx + bulk body** (`idx_body_pipeline` → `bulk_io` uring/pread). Batch
+creates come from **wire**, not a second Class A full-decode pass.

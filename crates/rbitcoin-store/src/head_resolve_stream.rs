@@ -1,10 +1,14 @@
-//! Streaming archive head-resolve: mmap probe + mmap idx + body prefix verify.
+//! Streaming archive head-resolve: table-map head probe + table-map idx + body
+//! prefix verify via uring/pread (`RBITCOIN_HEAD_RESOLVE_IO`).
+//!
+//! See `docs/io-modality.md`: bulk body backend ≠ table map mode.
 //!
 //! Body backend from [`crate::io_backend::head_resolve_io_backend`]:
 //! - **uring:** completion-driven io_uring pread (one outstanding body per key)
 //! - **pread:** sequential libc pread of ≤32 body bytes
 //!
-//! Class A body is never mmap'd. Shared: mmap probe → mmap idx → body prefix.
+//! Class A body is never full-mapped ([`crate::file::TableAccess::FdOnly`]).
+//! Shared today: table-map head probe → table-map idx → body prefix (uring/pread).
 
 use crate::error::StoreError;
 use crate::io_backend::{self, ReadIoBackend};
@@ -35,7 +39,7 @@ struct KeyWork {
     pending_rank: u32,
 }
 
-/// Resolve many txids via mmap head/idx + body prefix verify (backend from env).
+/// Resolve many txids via table-map head/idx + body prefix verify (backend from env).
 ///
 /// Returns one `(txid, Option<Fk>)` per input in the same order as `txids`.
 /// Records [`crate::head_resolve_stats`] probe/idx/body walls and counts.

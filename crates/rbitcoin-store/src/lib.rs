@@ -42,7 +42,7 @@ pub use epoch::ArchiveEpoch;
 pub use error::StoreError;
 pub use tx_table::HeadResizeSizeSnapshot;
 pub use file::{
-    ensure_nofile_budget, ensure_nofile_budget_at_least, NOFILE_SOFT_TARGET,
+    ensure_nofile_budget, ensure_nofile_budget_at_least, TableAccess, NOFILE_SOFT_TARGET,
 };
 pub use ibd_io_policy::{defer_durable_flush, set_defer_durable_flush};
 pub use address_head::{

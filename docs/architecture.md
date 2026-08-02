@@ -132,18 +132,20 @@ budgets: [`docs/ibd-memory.md`](./ibd-memory.md).
 4. **Request-bounded wire memory.** Durable **body-queue soft time-depth**
    (and optional absolute byte ceiling) limit new densify `getdata` — **not**
    peer TCP accept of already-requested blocks (see ibd-memory).
-5. **Bulk IO.** Linux prefers **io_uring** for multi-read / RMW paths (confirm
-   bodies, head resolve, spend annotate) with a **thread-local** bulk ring for
-   batch pread/pwrite; `RBITCOIN_IO_URING=0` (or non-Linux) falls back to
-   pread/pwrite workers. Segmented `tx.head` insert stays mmap; fuse8 is built
-   in process RAM on seal. No separate IOCP/kqueue backend — same API surface,
-   modality only.
+5. **Bulk IO vs table transport.** `RBITCOIN_IO=uring|pread` selects **bulk
+   batch** backends for body denserels, head-resolve body prefix, spend paths
+   (thread-local ring depth 128). **Table files** use [`TableAccess`](./io-modality.md):
+   `tx.body` is **FdOnly**; `tx.idx` / `tx.head` / SH heads still **MapFull**
+   today. Segmented `tx.head` insert is table-map page-coalesced RMW (historical
+   host A/B: uring head insert ~5× slower). Fuse8 builds in process RAM on seal.
+   See [`docs/io-modality.md`](./io-modality.md) for demap plan and host musl benches.
 
-### Map growth
+### Map / capacity growth
 
-Capacity grow = fallocate + map a **new epoch** on the same file, pointer swap;
-old maps live until pins drop. Long-held “pause the world” mmap mutexes on the
-IBD/read path are considered design bugs.
+**MapFull** tables: capacity grow = fallocate + map a **new epoch**, pointer
+swap; old maps live until pins drop. **FdOnly** (`tx.body`): fallocate only,
+no multi‑GiB remap. Long-held “pause the world” map mutexes on the IBD/read path
+are design bugs.
 
 ---
 

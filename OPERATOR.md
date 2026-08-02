@@ -61,11 +61,16 @@ At **info**, progress + perf already expose load/write bottlenecks (schema 12). 
 **read** resolve (`get_fk_by_txid_batch`, with `probe` / `idx` / `body` subtimers).
 `class_a_commit … head=` is create **insert** (`head_insert_many`). `res_seed` is CreateResidency denserels seed for this batch’s creates.
 
-**Archive head resolve:** streaming — **mmap** probe + **mmap** idx + body
-prefix via **io_uring or pread** (deepest-cand-first). **Class A `tx.body` is
-never mmap’d for payload** (header-only map window; pread/pwrite/uring only).
+**Archive head resolve:** streaming — **table-map** head probe + **table-map**
+idx + body prefix via **io_uring or pread** (deepest-cand-first). **Class A
+`tx.body` payload is never full-mapped** ([`TableAccess::FdOnly`](docs/io-modality.md):
+header-only map window; pread/pwrite/uring only). Full modality matrix and demap
+plan: [`docs/io-modality.md`](docs/io-modality.md).
 
 ## Bulk store IO backends
+
+**Bulk batch** only (`RBITCOIN_IO`). This does **not** unmap `tx.idx` / `tx.head`
+(those are still full table maps today — see modality doc).
 
 Hierarchy: **path env** (if set) → **global `RBITCOIN_IO`** → default (**uring** if
 the ring is available, else **pread** / **pwrite** for annotate). If `uring` is
@@ -73,7 +78,7 @@ selected but setup fails, demote to **pread** / **pwrite**.
 
 | Env | Values | Site |
 |-----|--------|------|
-| **`RBITCOIN_IO`** | `uring` \| `pread` | Global default (`mmap` demotes to pread with a warning) |
+| **`RBITCOIN_IO`** | `uring` \| `pread` | Global default (`mmap` token demotes to pread with a warning — not a live bulk mode) |
 | `RBITCOIN_PIN_IO` | uring \| pread | Class A denserels / pin body pipeline |
 | `RBITCOIN_HEAD_RESOLVE_IO` | uring \| pread | Head-resolve body prefix (≤32 B) |
 | `RBITCOIN_SPEND_META` | uring \| pread | Structural 9 B spender-meta peeks |
@@ -82,7 +87,7 @@ selected but setup fails, demote to **pread** / **pwrite**.
 
 - **uring** — io_uring bulk pread/pwrite (ring depth **128**).
 - **pread** / **pwrite** — libc positional IO; `RBITCOIN_BULK_IO_WORKERS` parallelizes pread only.
-- Class A **`tx.body` / `tx.idx` linear appends always pwrite** (no mmap append path).
+- Class A **`tx.body` / `tx.idx` linear appends always pwrite**.
 - Perf log tokens: `ann={}ms/n={}` and `meta={}ms/n={}` (no `_mmap` / `_uring` suffix).
 - Compat: `RBITCOIN_IO_URING=0` (deprecated) ≈ global `RBITCOIN_IO=pread`.
 
@@ -97,7 +102,7 @@ selected but setup fails, demote to **pread** / **pwrite**.
 | Archive queue RAM | **512 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
 | Confirm denserels **history** | **off (lean default)** | Small residency FIFO for **in-flight / just-committed** only (**256k creates / 1M outs**), skip denserels prewarm; cold pin trusts OS page cache. **Header plans always on** (multi-block MTP). `RBITCOIN_CONFIRM_CACHE=1` restores multi‑GiB history (8M/16M) + prewarm for experiments. Explicit `RBITCOIN_CREATE_RESIDENCY_CAP` / `_OUT_CAP` still override caps |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
-| Bulk store IO | **uring** (Linux) when available | See **Bulk store IO backends** above; ring depth **128**; `RBITCOIN_BULK_IO_WORKERS` for pread. Segmented `tx.head` **insert_many** stays mmap |
+| Bulk store IO | **uring** (Linux) when available | See **Bulk store IO backends** above; ring depth **128**; `RBITCOIN_BULK_IO_WORKERS` for pread. Segmented `tx.head` **insert_many** still uses **table-map** RMW (host A/B once found uring head insert ~5× slower — `docs/io-modality.md`) |
 | Archive Class A append | **pwrite** (always) | `tx.body` / `tx.idx` mega-appends use `write_at_pwrite` only |
 | `tx.head` (segmented) | fixed geometry | Default **25-bit** heads (128 MiB) with **4 B relative** fks; roll at 80% load / body soft span; **binary fuse8** on seal. `RBITCOIN_TX_HEAD_BITS` for tests only. Legacy mono-head datadirs require reindex |
 | Confirm stages | **plan · prep · scripts · write** | Pipeline queues cap **5** each (`planq=n/5 …`; `RBITCOIN_CONFIRM_QUEUE`). Plan packs tip-contiguous waves by **decoding BQ one block at a time** until soft **Σ inputs** (`RBITCOIN_CONFIRM_BATCH_INPUTS`, default **8000**, include overshoot block) or hard **144** blocks |

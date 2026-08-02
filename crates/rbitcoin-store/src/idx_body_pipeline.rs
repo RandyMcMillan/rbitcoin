@@ -1,8 +1,9 @@
 //! **tx.idx → tx.body** pipeline for confirm load and archive head-resolve.
 //!
-//! Idx via sorted mmap [`VarTable::record_range_batch`]. Body backend from
-//! [`crate::io_backend::pin_io_backend`] (`RBITCOIN_PIN_IO` / global `RBITCOIN_IO`):
-//! **uring** (bulk pread ring) or **pread** (libc). Class A body is never mmap'd.
+//! Idx via sorted [`VarTable::record_range_batch`] (table-map `tx.idx` today).
+//! Body backend from [`crate::io_backend::pin_io_backend`] (`RBITCOIN_PIN_IO` /
+//! global `RBITCOIN_IO`): **uring** or **pread**. Class A body is
+//! [`crate::file::TableAccess::FdOnly`] (never full-mapped).
 //!
 //! **Concurrency:** read-only on published ranges; prep + confirm-load may run
 //! concurrent waves (each thread's bulk_io TL ring). Caller owns job buffers

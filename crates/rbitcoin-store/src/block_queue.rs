@@ -1,4 +1,4 @@
-//! Durable multi‑GiB on-disk block payload queue for the combined archive/confirm path.
+//! Durable on-disk block payload queue for the combined archive/confirm path.
 //!
 //! Layout under `store_dir/block_queue/`:
 //! ```text
@@ -10,9 +10,13 @@
 //! **Lifecycle:** enqueue after peer decode; **dequeue only after combined
 //! confirm-write** (or permanent reject). Restart reopens without re-download.
 //!
-//! Capacity is a soft budget on **sum of payload bytes** (default 8 GiB).
-//! Override with `RBITCOIN_BLOCK_QUEUE_GB` (integer GiB) or
-//! `RBITCOIN_BLOCK_QUEUE_BYTES`.
+//! **Primary capacity is not bytes** — IBD densify uses a **time-depth soft
+//! gate** (~5 min of tip-rate blocks) in the net layer. This type accepts
+//! payloads until an optional absolute byte ceiling (env) is hit.
+//!
+//! Absolute safety ceiling (optional): `RBITCOIN_BLOCK_QUEUE_GB` (integer GiB)
+//! or `RBITCOIN_BLOCK_QUEUE_BYTES`. When unset, enqueue is unlimited
+//! (`u64::MAX`) aside from disk/IO errors.
 
 use crate::error::StoreError;
 use std::collections::BTreeMap;
@@ -25,8 +29,8 @@ const META_MAGIC: &[u8; 4] = b"BQ01";
 const META_VERSION: u32 = 1;
 const REC_MAGIC: &[u8; 4] = b"BQR1";
 
-/// Default durable queue budget: 8 GiB of payload.
-pub const DEFAULT_BLOCK_QUEUE_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Default absolute byte ceiling: unlimited (soft time-depth gates densify).
+pub const DEFAULT_BLOCK_QUEUE_BUDGET_BYTES: u64 = u64::MAX;
 
 /// One durable queued block (full payload — expensive for multi‑GiB queues).
 #[derive(Debug, Clone)]
@@ -71,6 +75,8 @@ struct IndexEntry {
 }
 
 impl BlockQueue {
+    /// Absolute byte ceiling from env, or [`DEFAULT_BLOCK_QUEUE_BUDGET_BYTES`]
+    /// (unlimited) when unset. Env values clamp to at least 64 MiB.
     pub fn budget_from_env() -> u64 {
         if let Ok(s) = std::env::var("RBITCOIN_BLOCK_QUEUE_BYTES") {
             if let Ok(n) = s.parse::<u64>() {
@@ -92,7 +98,12 @@ impl BlockQueue {
     pub fn open_or_create_with_budget(store_dir: &Path, budget: u64) -> Result<Self, StoreError> {
         let dir = store_dir.join("block_queue");
         std::fs::create_dir_all(&dir).map_err(|e| StoreError::io(&dir, e))?;
-        let budget = budget.max(64 * 1024 * 1024);
+        // Unlimited (u64::MAX) stays unlimited; finite caps keep a 64 MiB floor.
+        let budget = if budget == u64::MAX {
+            u64::MAX
+        } else {
+            budget.max(64 * 1024 * 1024)
+        };
         let meta_path = dir.join("meta.bin");
         let mut q = if meta_path.exists() {
             Self::load_existing(dir, budget)?
@@ -184,21 +195,30 @@ impl BlockQueue {
         self.index.len()
     }
 
+    /// True when an optional absolute byte ceiling still has room.
+    ///
+    /// Default budget is unlimited; densify is gated by time-depth soft stop
+    /// in the IBD assign path, not this check.
     pub fn can_enqueue(&self, payload_len: usize) -> bool {
+        if self.budget == u64::MAX {
+            return true;
+        }
         self.bytes.saturating_add(payload_len as u64) <= self.budget
     }
 
-    /// `bytes / budget` (may be 0..1 under normal load; rarely >1 if forced).
+    /// `bytes / budget` for finite caps; `0.0` when unlimited.
     pub fn fill_ratio(&self) -> f64 {
-        let b = self.budget.max(1) as f64;
-        self.bytes as f64 / b
+        if self.budget == 0 || self.budget == u64::MAX {
+            return 0.0;
+        }
+        self.bytes as f64 / self.budget as f64
     }
 
     /// Append a block payload. Returns queue id.
     ///
-    /// Refuses when `bytes + payload.len()` would exceed [`Self::budget`]
-    /// ([`Self::can_enqueue`]) with [`StoreError::BudgetFull`] — expected when
-    /// the multi‑GiB cap is hit; callers buffer in RAM and gate new getdata.
+    /// Refuses only when an optional absolute [`Self::budget`] would be
+    /// exceeded ([`StoreError::BudgetFull`]). Default budget is unlimited —
+    /// IBD soft time-depth stops **new densify getdata**, not in-flight offers.
     pub fn enqueue(
         &mut self,
         height: u32,
@@ -208,7 +228,7 @@ impl BlockQueue {
     ) -> Result<u64, StoreError> {
         if !self.can_enqueue(payload.len()) {
             return Err(StoreError::BudgetFull(
-                "block_queue (raise RBITCOIN_BLOCK_QUEUE_GB / _BYTES only if too small)",
+                "block_queue absolute ceiling (RBITCOIN_BLOCK_QUEUE_GB / _BYTES)",
             ));
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -355,6 +375,27 @@ impl BlockQueue {
     pub fn heights(&self) -> Vec<u32> {
         self.index.values().map(|e| e.height).collect()
     }
+
+    /// Highest height among durable recs (`None` if empty).
+    ///
+    /// Used by densify gap-fill: holes in `tip+1..=max_height` are always
+    /// assigned even when soft time-depth pressure is latched.
+    pub fn max_height(&self) -> Option<u32> {
+        self.index.values().map(|e| e.height).max()
+    }
+
+    /// Lowest height among durable recs (`None` if empty).
+    pub fn min_height(&self) -> Option<u32> {
+        self.index.values().map(|e| e.height).min()
+    }
+
+    /// First queue id for `height`, if any.
+    pub fn id_for_height(&self, height: u32) -> Option<u64> {
+        self.index
+            .iter()
+            .find(|(_, e)| e.height == height)
+            .map(|(&id, _)| id)
+    }
 }
 
 /// Best-effort `POSIX_FADV_DONTNEED` so durable BQ recs are idle files, not cache.
@@ -472,15 +513,28 @@ mod tests {
     }
 
     #[test]
-    fn multi_gib_budget_parse() {
+    fn default_budget_unlimited_unless_env() {
         let b = BlockQueue::budget_from_env();
-        assert!(b >= 64 * 1024 * 1024);
-        // Default is multi-GiB scale when env unset.
-        assert!(
-            b >= 1024 * 1024 * 1024 || std::env::var("RBITCOIN_BLOCK_QUEUE_BYTES").is_ok()
-                || std::env::var("RBITCOIN_BLOCK_QUEUE_GB").is_ok(),
-            "default budget should be multi-GiB unless env overrides"
-        );
+        if std::env::var("RBITCOIN_BLOCK_QUEUE_BYTES").is_ok()
+            || std::env::var("RBITCOIN_BLOCK_QUEUE_GB").is_ok()
+        {
+            assert!(b >= 64 * 1024 * 1024);
+        } else {
+            assert_eq!(b, u64::MAX, "default absolute ceiling is unlimited");
+        }
+    }
+
+    #[test]
+    fn max_height_span() {
+        let dir = temp();
+        let mut q = BlockQueue::open_or_create_with_budget(&dir, 64 * 1024 * 1024).unwrap();
+        assert_eq!(q.max_height(), None);
+        q.enqueue(10, [1u8; 32], 1, b"a").unwrap();
+        q.enqueue(15, [2u8; 32], 2, b"b").unwrap();
+        q.enqueue(12, [3u8; 32], 3, b"c").unwrap();
+        assert_eq!(q.max_height(), Some(15));
+        assert_eq!(q.min_height(), Some(10));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

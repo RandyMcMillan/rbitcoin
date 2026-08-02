@@ -283,14 +283,6 @@ pub(crate) enum ConfirmEvent {
     BodyMissing {
         hash: BlockHash,
     },
-    /// RAM overflow bodies spilled to durable disk after dequeue freed space.
-    ///
-    /// Soft `archive_queued` charges must be released for these hashes (payload
-    /// is no longer in process RAM). Without this, densify stays gated while
-    /// durable `bq` drains under budget for tens of minutes.
-    RamFlushed {
-        hashes: Vec<BlockHash>,
-    },
 }
 
 /// How many consecutive ready heights to confirm in one multi-block script wave.
@@ -773,23 +765,13 @@ pub(crate) fn spawn_confirm_engine(
                 let heights_hashes = batch.heights_hashes();
                 match hub_wb.confirm_write(batch) {
                     Ok(_outcomes) => {
-                        let mut ram_flushed: Vec<BlockHash> = Vec::new();
                         for (height, raw) in &heights_hashes {
                             let hash = BlockHash::from_byte_array(*raw);
                             // Durable queue: drop payload only after confirm-write.
-                            // Flush may spill other RAM-pending bodies to disk.
-                            match hub_wb.query.block_queue_dequeue_height(*height) {
-                                Ok((_n, flushed)) => {
-                                    for fh in flushed {
-                                        ram_flushed
-                                            .push(BlockHash::from_byte_array(fh));
-                                    }
-                                }
-                                Err(e) => {
-                                    rbitcoin_log::debug!(
-                                        "ibd: block_queue dequeue h={height}: {e}"
-                                    );
-                                }
+                            if let Err(e) = hub_wb.query.block_queue_dequeue_height(*height) {
+                                rbitcoin_log::debug!(
+                                    "ibd: block_queue dequeue h={height}: {e}"
+                                );
                             }
                             loop_stats_wb
                                 .confirm_blocks
@@ -802,16 +784,6 @@ pub(crate) fn spawn_confirm_engine(
                                 feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                                 return;
                             }
-                        }
-                        if !ram_flushed.is_empty()
-                            && event_tx_wb
-                                .send(ConfirmEvent::RamFlushed {
-                                    hashes: ram_flushed,
-                                })
-                                .is_err()
-                        {
-                            feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
-                            return;
                         }
                         feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                         let elapsed = t0.elapsed();

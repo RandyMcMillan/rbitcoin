@@ -19,7 +19,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **Wire retained on the pipeline batch only:** plan/prep pull `bitcoin::Block` from the body queue; that wire rides through scripts; **no Class-A wire rebuild**. Class A packed form is planned once and committed in the write stage.
 
-**Body queue:** `store/block_queue/` multi‑GiB payload FIFO + RAM overflow when full (`RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`, default 8 GiB). **Capacity is bytes only** — densify getdata stops when effective fill hits the budget (90%/70% hysteresis). A separate **height horizon** (`CONTIG_DENSIFY_AHEAD`, 64 k past tip) only bounds how far ahead of tip densify/receive may walk when the byte budget is still nearly empty (early small blocks). **Offer** on peer Block; prep **reads** by height; **dequeue** after confirm-commit. Restart re-notes feed readiness only (wire stays on disk until prep).
+**Body queue:** `store/block_queue/` on-disk payload FIFO (no process RAM overflow). **Primary capacity is soft time-depth**: stop frontier densify when on-disk count &gt; ~5 minutes of tip-rate blocks (same EWMA as ETA); resume when &lt; ~4 minutes. Gaps inside the on-disk height span always densify (overshoot OK). Optional absolute byte ceiling via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` (default unlimited). Height horizon (`CONTIG_DENSIFY_AHEAD`, 64 k past tip) caps densify/receive walk. **Offer** on peer Block → disk; prep **reads** by height; **dequeue** after confirm-commit. Restart re-notes feed readiness only (wire stays on disk until prep).
 
 **CreateResidency:** sole process-local create map for wire plan + pin (txid→fk,
 range, outs, denserels; raw FIFO). Class A commit seeds denserels offline so

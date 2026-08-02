@@ -2,13 +2,13 @@
 //!
 //! Policy (operator-facing):
 //! - **Tip batch** (tip+1 .. tip+[`TIP_HOLE_MAX`]=32, one confirm run): always
-//!   request missing hashes (even if durable bq is full). Multi-peer race up to
-//!   [`TIP_HOLE_MAX_PEERS`] immediately — confirm is frozen until tip+1 is
-//!   claim-ready.
-//! - **Densify** (tip+1 outward, closest first): while durable body queue has
-//!   **byte** headroom, fill missing heights up to [`CONTIG_DENSIFY_AHEAD`].
-//!   When a tip hole exists, densify is capped to
-//!   [`super::assign_plan::far_slots_per_peer`] so tip races keep peer slots.
+//!   request missing hashes (even if soft body-queue depth is over target).
+//!   Multi-peer race up to [`TIP_HOLE_MAX_PEERS`] immediately — confirm is
+//!   frozen until tip+1 is claim-ready.
+//! - **Densify** (tip+1 outward, closest first): fill missing heights up to
+//!   [`CONTIG_DENSIFY_AHEAD`]. Soft on-disk depth (~5 min tip-rate blocks)
+//!   stops **frontier** densify; **gaps inside the on-disk height span** are
+//!   always filled (overshoot past the soft target is OK while closing holes).
 //! - Never request beyond densify horizon; events refuse far bodies too.
 //! - One body-queue copy per height (receive path drops duplicates).
 
@@ -29,9 +29,9 @@ use std::time::Instant;
 /// How much assign work to do this call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AssignDepth {
-    /// Tip-batch multi-peer only (durable body queue at budget).
+    /// Tip-batch multi-peer only (archive soft saturated / no densify room).
     Critical,
-    /// Tip batch + densify toward filling the body queue.
+    /// Tip batch + densify (gap always; frontier when soft depth allows).
     Full,
 }
 
@@ -84,22 +84,25 @@ pub(crate) fn scale_feed_cap(base: usize, scale: f64) -> usize {
     scaled.max(1).min(base)
 }
 
-/// True when durable body queue is at pressure and getdata inflight is low.
+/// True when soft body-queue depth is latched and getdata inflight is low.
 ///
-/// Only restricts **densify** (tip batch always runs). High `pending` alone is
-/// **not** saturated — pending means we already hold wire.
+/// Only restricts **frontier** densify (tip batch + gap fill still run under
+/// Full). High `pending` alone is **not** saturated — pending means we already
+/// hold wire.
 pub(crate) fn archive_pipeline_saturated(
     _pending_len: usize,
     inflight_len: usize,
-    fill_ratio: f64,
+    bq_soft_pressure: bool,
+    archive_fill_ratio: f64,
 ) -> bool {
-    inflight_len < 16 && fill_ratio >= 0.85
+    inflight_len < 16 && (bq_soft_pressure || archive_fill_ratio >= 0.85)
 }
 
 /// Assign getdata for the body-queue pipeline.
 ///
-/// `can_assign_new`: durable body queue has headroom for densify. Tip-batch
-/// multi-peer always runs regardless.
+/// `archive_can_assign`: soft archive RAM headroom for densify.
+/// `bq_soft_pressure`: on-disk depth over ~5 min tip-rate target — stop frontier
+/// densify only; **gap fill** within on-disk max height still runs.
 pub(crate) fn assign_work_ordered(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -108,7 +111,8 @@ pub(crate) fn assign_work_ordered(
     _archive_feed_scale: f64,
     _archive_write_next: u32,
     depth: AssignDepth,
-    can_assign_new: bool,
+    archive_can_assign: bool,
+    bq_soft_pressure: bool,
 ) {
     let t0 = Instant::now();
     let mut issued = 0u64;
@@ -146,8 +150,8 @@ pub(crate) fn assign_work_ordered(
     let tip_holes = contiguous_tip_holes(st, hub, TIP_HOLE_MAX);
     issued += cover_tip_holes(st, hub, cfg, &alive, &tip_holes);
 
-    // 2) Densify only when body queue has room and not Critical.
-    if !can_assign_new || matches!(depth, AssignDepth::Critical) {
+    // 2) Densify only when archive soft has room and not Critical.
+    if !archive_can_assign || matches!(depth, AssignDepth::Critical) {
         finish_assign(loop_stats, t0, issued);
         return;
     }
@@ -161,9 +165,25 @@ pub(crate) fn assign_work_ordered(
     // Leave per-peer headroom for tip races while hole>0.
     let densify_per_peer = far_slots_per_peer(cfg.per_peer, !tip_holes.is_empty());
 
-    // Closest-to-tip first: tip+1 .. tip+densify_ahead.
     let densify_hi = path_lo.saturating_add(CONTIG_DENSIFY_AHEAD);
-    let densify = collect_height_band(st, hub, path_lo, densify_hi, room.max(1));
+    let max_on_disk = hub.query.block_queue_max_height();
+
+    // Under soft pressure: only fill holes inside the on-disk span.
+    // Otherwise: full densify band (gaps + frontier).
+    let band_hi = if bq_soft_pressure {
+        match max_on_disk {
+            Some(mh) if mh >= path_lo => mh.min(densify_hi),
+            // Nothing on disk yet under pressure — no gap band; frontier blocked.
+            _ => {
+                finish_assign(loop_stats, t0, issued);
+                return;
+            }
+        }
+    } else {
+        densify_hi
+    };
+
+    let densify = collect_height_band(st, hub, path_lo, band_hi, room.max(1));
     if densify.is_empty() {
         finish_assign(loop_stats, t0, issued);
         return;
@@ -211,9 +231,8 @@ pub(crate) fn finish_assign(loop_stats: &LoopStats, t0: Instant, issued: u64) {
 ///
 /// Walks closest-to-tip first. Already-pending / body-queue / archived heights
 /// are skipped without consuming [`FAR_SCAN_BUDGET`] “need” slots — only the
-/// raw walk length is capped — so a full ~2 k tip buffer no longer blocks
-/// densify from seeing the rest of the [`CONTIG_DENSIFY_AHEAD`] band when the
-/// durable queue still has byte room.
+/// raw walk length is capped — so a full tip buffer no longer blocks densify
+/// from seeing the rest of the [`CONTIG_DENSIFY_AHEAD`] band.
 fn collect_height_band(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -572,25 +591,22 @@ mod tests {
         assert!(st.slots[0].in_flight.is_empty());
         assert!(st.slots[1].in_flight.is_empty());
 
-        // pop_need skips pending / takes first ready missing.
         let mut q = VecDeque::from([h(1), h(2)]);
         st.body.mark_pending(h(1));
         st.body.mark_missing(h(2));
         assert_eq!(pop_need(&mut q, &mut st, &hub), Some(h(2)));
         assert!(pop_need(&mut q, &mut st, &hub).is_none());
 
-        // Tip holes: from tip+1 (empty hub tip → path_lo=0). Missing then pending stops.
         st.height_to_hash.clear();
         let hole = h(21);
         let ready = h(22);
         st.height_to_hash.insert(0, hole);
         st.height_to_hash.insert(1, ready);
         st.body.mark_missing(hole);
-        st.body.mark_pending(ready); // body queue owns wire → not a fetch hole
+        st.body.mark_pending(ready);
         let holes = contiguous_tip_holes(&mut st, &hub, 8);
         assert_eq!(holes, vec![hole]);
 
-        // issue_one with empty batch / dead peer.
         let mut room = 10usize;
         let mut issued = 0u64;
         assert!(!issue_one(&mut st, 99, h(30), &mut room, &mut issued));
@@ -601,7 +617,6 @@ mod tests {
         assert!(st.inflight.contains_key(&h(30)));
         assert!(st.slots[0].in_flight.contains(&h(30)));
 
-        // assign with no alive peers is a no-op.
         st.slots.iter_mut().for_each(|s| s.alive = false);
         let stats = LoopStats::default();
         let cfg = IbdConfig::for_test();
@@ -614,6 +629,7 @@ mod tests {
             1,
             AssignDepth::Full,
             true,
+            false,
         );
 
         let _ = std::fs::remove_dir_all(dir);
@@ -624,37 +640,24 @@ mod tests {
         assert_eq!(scale_feed_cap(0, 1.0), 0);
         assert_eq!(scale_feed_cap(10, 0.0), 0);
         assert_eq!(scale_feed_cap(10, 1.0), 10);
-        assert_eq!(scale_feed_cap(10, 0.25), 3); // ceil
-        // Saturated only on high bq fill + low inflight (pending alone is not).
-        assert!(!archive_pipeline_saturated(0, 20, 1.0));
-        assert!(!archive_pipeline_saturated(96, 0, 0.0));
-        assert!(archive_pipeline_saturated(0, 0, 0.85));
-        assert!(archive_pipeline_saturated(200, 15, 0.9));
+        assert_eq!(scale_feed_cap(10, 0.25), 3);
+        assert!(!archive_pipeline_saturated(0, 20, false, 1.0));
+        assert!(!archive_pipeline_saturated(96, 0, false, 0.0));
+        assert!(archive_pipeline_saturated(0, 0, false, 0.85));
+        assert!(archive_pipeline_saturated(200, 15, true, 0.0));
+        assert!(!archive_pipeline_saturated(0, 32, true, 0.9));
     }
 
-    /// When tip+1 is a hole, densify must leave per-peer headroom so tip multi-
-    /// peer race can attach (mainnet: hole=1 + conf_blks=0 while densify filled
-    /// every peer to 16 and bq grew).
     #[test]
     fn densify_yields_peer_slots_while_tip_hole_open() {
         use super::super::assign_plan::far_slots_per_peer;
-        assert_eq!(
-            far_slots_per_peer(16, true),
-            2,
-            "tip hole → densify at most 2 in-flight per peer"
-        );
-        assert!(
-            far_slots_per_peer(16, true) < 16,
-            "must leave room for tip race up to TIP_HOLE_MAX_PEERS"
-        );
-        // Without tip hole, densify may use half of per_peer (still < full).
+        assert_eq!(far_slots_per_peer(16, true), 2);
+        assert!(far_slots_per_peer(16, true) < 16);
         assert_eq!(far_slots_per_peer(16, false), 8);
     }
 
-    /// Densify must request past the legacy 2048 height cap when the body-queue
-    /// byte budget still has room (early small blocks).
     #[test]
-    fn densify_requests_beyond_legacy_2k_when_bq_has_byte_room() {
+    fn densify_requests_beyond_legacy_2k_when_soft_allows() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
         let mut st = IbdWorkState::new(vec![dummy_slot(0), dummy_slot(1)], None, Some(0));
@@ -663,8 +666,6 @@ mod tests {
         cfg.window = 128;
         cfg.per_peer = 16;
 
-        // Tip path: heights 1..4096 mapped; first 2500 already pending (in bq),
-        // further missing need densify getdata.
         const HI: u32 = 4096;
         for ht in 1u32..=HI {
             let hash = h(ht);
@@ -688,10 +689,10 @@ mod tests {
             1.0,
             1,
             AssignDepth::Full,
-            true, // can_assign_new: byte budget free
+            true,
+            false, // no soft pressure — frontier densify allowed
         );
 
-        // Must have issued getdata for something past height 2500 (beyond old 2k).
         let far: Vec<u32> = st
             .inflight
             .keys()
@@ -714,8 +715,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Critical depth / can_assign_new=false / room=0 early exits, densify + cache
-    /// issue loop, pending expire under can_assign, and park_race_need filter.
+    /// Under soft pressure, only gaps within max on-disk height are densified.
+    #[test]
+    fn densify_gaps_under_soft_pressure_not_frontier() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        // Tip already at 9 so path_lo=10; tip-batch does not consume all peer slots
+        // before densify gap-fill under soft pressure.
+        let mut st = IbdWorkState::new(vec![dummy_slot(0), dummy_slot(1)], None, Some(9));
+        // Pretend hub tip is 9 via Class A height — densify uses hub.tip_height().
+        // Without a real tip, path_lo=0; seed ordered from 10 and rely on
+        // soft-pressure band only (tip holes empty when height_to_hash starts at 10).
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 64;
+        cfg.per_peer = 16;
+
+        // Heights 10..=30; on disk at 10 and 20 (gap at 15); frontier 25.
+        for ht in 10u32..=30 {
+            let hash = h(ht);
+            st.record_height(hash, ht);
+            st.height_to_hash.insert(ht, hash);
+            st.ordered_set.insert(hash);
+            st.ordered.push_back(hash);
+            st.max_ordered_height = ht;
+            st.body.mark_missing(hash);
+        }
+        let p = b"wire";
+        hub.query
+            .block_queue_enqueue(10, h(10).to_byte_array(), 1, p)
+            .unwrap();
+        hub.query
+            .block_queue_enqueue(20, h(20).to_byte_array(), 2, p)
+            .unwrap();
+        st.body.mark_pending(h(10));
+        st.body.mark_pending(h(20));
+
+        assign_work_ordered(
+            &mut st,
+            &hub,
+            &cfg,
+            &stats,
+            1.0,
+            10,
+            AssignDepth::Full,
+            true,
+            true, // soft pressure
+        );
+
+        let issued_hts: Vec<u32> = st
+            .inflight
+            .keys()
+            .filter_map(|hash| st.hash_height.get(hash).copied())
+            .collect();
+        // Gap inside max_on_disk=20 must be requestable (e.g. 15).
+        assert!(
+            issued_hts.iter().any(|&ht| ht > 10 && ht < 20),
+            "expected gap fill under pressure; issued={issued_hts:?}"
+        );
+        // Frontier beyond max on-disk must not be densified under pressure.
+        assert!(
+            !issued_hts.iter().any(|&ht| ht > 20),
+            "frontier blocked under pressure; issued={issued_hts:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn assign_depth_densify_cache_and_early_exits() {
         let (dir, hub) = tmp_hub();
@@ -726,7 +792,6 @@ mod tests {
         cfg.window = 64;
         cfg.per_peer = 8;
 
-        // Map ordered heights 1..12 as missing bodies (tip=0).
         for ht in 1u32..=12 {
             let hash = h(ht);
             st.record_height(hash, ht);
@@ -737,7 +802,6 @@ mod tests {
             st.body.mark_missing(hash);
         }
 
-        // Critical depth: only tip-hole + park race; densify skipped.
         assign_work_ordered(
             &mut st,
             &hub,
@@ -747,11 +811,11 @@ mod tests {
             1,
             AssignDepth::Critical,
             true,
+            false,
         );
         let after_crit = st.inflight.len();
         assert!(after_crit > 0, "critical should still issue tip/race");
 
-        // can_assign_new=false early exit after race (no densify growth path).
         let n_before = st.inflight.len();
         assign_work_ordered(
             &mut st,
@@ -761,24 +825,19 @@ mod tests {
             1.0,
             1,
             AssignDepth::Full,
+            false, // archive cannot assign
             false,
         );
-        // May re-issue expired race only; must not explode densify.
         assert!(st.inflight.len() <= n_before + 8);
 
-        // Clear inflight + pending so Full densify can issue.
         let hashes: Vec<_> = st.inflight.keys().copied().collect();
         for hash in hashes {
             clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
             st.body.mark_missing(hash);
         }
-        // Stale pending expire when can_assign_new (age zero).
         st.body.mark_pending(h(5));
-        // Force age by expiring with Duration::ZERO via body API, then re-mark for assign path.
         let _ = st.body.expire_stale_pending(std::time::Duration::ZERO);
         st.body.mark_pending(h(5));
-        // Direct expire path already covered in body tests; assign uses PENDING_STALE (45s).
-        // Put a gap-expired race height into pending with age 0 via mark + expire_if.
         st.body.mark_pending(h(1));
         let expired = st
             .body
@@ -788,7 +847,6 @@ mod tests {
             st.body.mark_missing(hash);
         }
 
-        // Full assign with densify scale: write_next=1, densify starts after race.
         assign_work_ordered(
             &mut st,
             &hub,
@@ -798,14 +856,11 @@ mod tests {
             1,
             AssignDepth::Full,
             true,
+            false,
         );
-        assert!(
-            st.inflight.len() > 0,
-            "full densify/cache should issue getdata"
-        );
+        assert!(st.inflight.len() > 0);
         assert!(stats.assign_issued.load(Ordering::Relaxed) > 0);
 
-        // room=0 path: fill window with dummy inflight.
         for ht in 20u32..20 + cfg.window as u32 {
             let hash = h(ht + 100);
             inflight_add_peer(&mut st.inflight, hash, 0);
@@ -821,11 +876,10 @@ mod tests {
             5,
             AssignDepth::Full,
             true,
+            false,
         );
-        // room=0 → finish without growing densify much (may clear satisfied only).
         assert!(st.inflight.len() <= n_full + 2);
 
-        // peer_has_slot / park_race_need: fill peer0, peer1 free.
         st.inflight.clear();
         st.slots[0].in_flight.clear();
         st.slots[1].in_flight.clear();
@@ -833,7 +887,6 @@ mod tests {
             let hash = h(ht);
             st.body.mark_missing(hash);
         }
-        // Saturate peer 0.
         for i in 0..cfg.per_peer {
             let hash = h(200 + i as u32);
             st.slots[0].in_flight.insert(hash);
@@ -841,20 +894,19 @@ mod tests {
         }
         let need = park_race_need(&mut st, &hub, 1);
         assert!(!need.is_empty());
-        // Full assign should still place on peer 1 when peer 0 is full.
         assign_work_ordered(
             &mut st,
             &hub,
             &cfg,
             &stats,
-            0.5, // partial densify scale
+            0.5,
             1,
             AssignDepth::Full,
             true,
+            false,
         );
         assert!(st.slots[1].in_flight.len() > 0 || st.inflight.len() > cfg.per_peer);
 
-        // Empty densify/cache (all archived) early finish.
         for ht in 1u32..=12 {
             st.body.mark_archived(h(ht));
         }
@@ -871,6 +923,7 @@ mod tests {
             13,
             AssignDepth::Full,
             true,
+            false,
         );
         assert!(st.inflight.is_empty());
 

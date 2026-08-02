@@ -44,30 +44,22 @@ pub(crate) struct ProgressLineInput {
     pub horizon: u32,
     /// From [`TipRateTracker::eta_string`] (`eta=…` or `done`).
     pub eta: String,
-    /// Durable on-disk block queue: budget / disk used / entry count (not heap).
-    pub bq_budget: u64,
+    /// Durable on-disk block queue bytes / entry count (not process heap).
     pub bq_bytes: u64,
     pub bq_count: usize,
-    /// Process-RAM overflow while disk at budget (0 under healthy densify gate).
-    pub bq_pending_bytes: u64,
+    /// Soft densify stop target (block count at tip rate).
+    pub bq_soft_stop: u32,
 }
 
 /// Build the `ibd: progress …` message body (no log level prefix).
 ///
 /// Tip percent/rate, **fetch hole** (tip→next claim-ready body), peers, confirm
 /// queues, txs, header horizon, tip-rate ETA, durable block-queue occupancy.
-/// `bq disk=` is on-disk payload only; `pending_ram` appears only when non-zero.
+/// `bq disk=` is on-disk payload only; `soft=n/stop` is time-depth densify gate.
 pub(crate) fn format_progress_line(i: &ProgressLineInput) -> String {
     let bq_mib = i.bq_bytes / (1024 * 1024);
-    let bq_budget_mib = i.bq_budget / (1024 * 1024);
-    let pend_mib = i.bq_pending_bytes / (1024 * 1024);
-    let pend = if i.bq_pending_bytes > 0 {
-        format!(" pending_ram={pend_mib}MiB")
-    } else {
-        String::new()
-    };
     format!(
-        "ibd: progress {}% tip={} ({}/s) hole={} peers={} {} txs={} horizon={} {} bq n={} disk={}MiB/{}MiB{pend}",
+        "ibd: progress {}% tip={} ({}/s) hole={} peers={} {} txs={} horizon={} {} bq n={} disk={}MiB soft={}/{}",
         i.pct,
         i.tip,
         format_rate(i.tip_rate),
@@ -79,7 +71,8 @@ pub(crate) fn format_progress_line(i: &ProgressLineInput) -> String {
         i.eta,
         i.bq_count,
         bq_mib,
-        bq_budget_mib,
+        i.bq_count,
+        i.bq_soft_stop,
     )
 }
 
@@ -309,9 +302,10 @@ mod tests {
         format_duration_short, format_progress_line, format_rate, ibd_pct, tip_hole_from_claim_ready,
         ProgressLineInput, TipRateTracker,
     };
+    use rbitcoin_query::{soft_depth_targets, soft_pressure, BQ_SOFT_COUNT_FLOOR};
     use std::time::{Duration, Instant};
 
-    /// Shipped progress line: tip + durable bq; forbid retired dual-track tokens.
+    /// Shipped progress line: tip + durable bq soft depth; forbid retired tokens.
     #[test]
     fn format_progress_line_schema12_tokens() {
         // tip_rate 12.5 → format_rate rounds to "12" (≥10).
@@ -325,20 +319,20 @@ mod tests {
             txs: 50_000_000,
             horizon: 900_000,
             eta: "eta=18h".into(),
-            bq_budget: 4 * 1024 * 1024 * 1024,
             bq_bytes: 256 * 1024 * 1024,
             bq_count: 17,
-            bq_pending_bytes: 0,
+            bq_soft_stop: 600,
         });
         assert_eq!(
             line,
-            "ibd: progress 42% tip=100000 (12/s) hole=3 peers=8 planq=1/2 prepq=1/2 writeq=0/2 txs=50000000 horizon=900000 eta=18h bq n=17 disk=256MiB/4096MiB"
+            "ibd: progress 42% tip=100000 (12/s) hole=3 peers=8 planq=1/2 prepq=1/2 writeq=0/2 txs=50000000 horizon=900000 eta=18h bq n=17 disk=256MiB soft=17/600"
         );
         // Current schema tokens present.
         assert!(line.contains(" hole="), "{line}");
         assert!(line.contains(" bq n="), "{line}");
         assert!(line.contains(" disk="), "{line}");
-        assert!(!line.contains("pending_ram="), "omit pending when zero: {line}");
+        assert!(line.contains(" soft="), "{line}");
+        assert!(!line.contains("pending_ram="), "no RAM overflow meter: {line}");
         assert!(line.contains("planq"), "{line}");
         assert!(line.contains("prepq"), "{line}");
         // Retired dual-track progress tokens forbidden.
@@ -366,33 +360,35 @@ mod tests {
             txs: 1,
             horizon: 1000,
             eta: "eta=?".into(),
-            bq_budget: 1024 * 1024,
             bq_bytes: 0,
             bq_count: 0,
-            bq_pending_bytes: 0,
+            bq_soft_stop: 256,
         });
         assert!(slow.contains("tip=10 (2.4/s)"), "{slow}");
-        assert!(slow.contains("bq n=0 disk=0MiB/1MiB"), "{slow}");
+        assert!(slow.contains("bq n=0 disk=0MiB soft=0/256"), "{slow}");
         assert!(!slow.contains("arch_hwm") && !slow.contains("lead="), "{slow}");
-        let with_pend = format_progress_line(&ProgressLineInput {
-            pct: 1,
-            tip: 10,
-            tip_rate: 1.0,
-            tip_hole: 0,
-            peers: 1,
-            conf_q: "planq<0/2 prepq<0/2 writeq<0/2".into(),
-            txs: 1,
-            horizon: 1000,
-            eta: "eta=?".into(),
-            bq_budget: 1024 * 1024 * 1024,
-            bq_bytes: 1024 * 1024 * 1024,
-            bq_count: 2,
-            bq_pending_bytes: 64 * 1024 * 1024,
-        });
-        assert!(
-            with_pend.contains("pending_ram=64MiB"),
-            "surface RAM overflow when present: {with_pend}"
-        );
+    }
+
+    #[test]
+    fn soft_depth_targets_at_rate() {
+        let (stop, resume) = soft_depth_targets(Some(2.0));
+        assert_eq!(stop, 600, "2 blk/s × 300s");
+        assert_eq!(resume, 480, "2 blk/s × 240s");
+        let (stop0, resume0) = soft_depth_targets(None);
+        assert_eq!(stop0, BQ_SOFT_COUNT_FLOOR);
+        assert!(resume0 < stop0 && resume0 > 0);
+        let (stop_hi, resume_hi) = soft_depth_targets(Some(10.0));
+        assert_eq!(stop_hi, 3000);
+        assert_eq!(resume_hi, 2400);
+    }
+
+    #[test]
+    fn soft_hysteresis_latch() {
+        assert!(!soft_pressure(100, 600, 480, false));
+        assert!(soft_pressure(601, 600, 480, false), "enter when > stop");
+        assert!(soft_pressure(500, 600, 480, true), "stay latched mid-band");
+        assert!(!soft_pressure(479, 600, 480, true), "exit when < resume");
+        assert!(!soft_pressure(600, 600, 480, false), "exactly stop does not enter");
     }
 
     #[test]

@@ -428,24 +428,16 @@ pub(crate) fn apply_peer_event(
                         || ht <= write_next.saturating_add(CONTIG_DENSIFY_AHEAD)
                 })
                 .unwrap_or(false);
-            // Approx wire size for RAM budget (already-decoded).
-            // Always enqueue the first copy (may overshoot soft budget). Assign
-            // stops new densify getdata via `can_assign`; never dump in-flight
-            // peer bytes or refuse to decode what a peer already sent. Soft
-            // queue size is bounded only by limiting block *requests*.
+            // Approx wire size for fallback archive-job soft RAM (already-decoded).
+            // Always enqueue the first copy onto durable body queue. Assign stops
+            // new densify getdata via soft time-depth; never dump in-flight peer
+            // bytes or refuse to decode what a peer already sent.
             let wire_bytes = block.total_size();
             // Body queue is the sole wire store between peer receive and confirm
-            // prep. When at budget, payload sits in Query RAM overflow until
-            // confirm-write dequeue frees space — never spam-log that expected
-            // full state. Assign gates new getdata via hysteresis.
-            // ConfirmFeed only notes readiness (height/hash); prep reloads wire
-            // from the body queue (no peer→feed Block retain).
-            // Body queue holds wire: disk (Some(id)) or RAM overflow (None).
-            // Soft archive_queued budget is **only** for RAM overflow — charging
-            // multi‑GiB durable disk against the ~512 MiB soft budget freezes
-            // densify getdata (tip hole + inflight=0 while bq full of far heights).
+            // prep (on-disk only). ConfirmFeed notes readiness (height/hash);
+            // prep reloads wire from the body queue (no peer→feed Block retain).
+            // Soft archive_queued is **not** charged for durable BQ wire.
             let mut offered_disk = false;
-            let mut offered_ram = false;
             {
                 use bitcoin::consensus::Encodable;
                 let mut payload = Vec::with_capacity(wire_bytes);
@@ -455,23 +447,11 @@ pub(crate) fn apply_peer_event(
                         .query
                         .block_queue_offer(height, raw, header_fk.0, &payload)
                     {
-                        Ok(offer) => {
-                            // RAM→disk spill: soft budget was for process-held
-                            // wire; release as soon as durable (not only on tip).
-                            for fh in &offer.flushed_to_disk {
-                                let h = BlockHash::from_byte_array(*fh);
-                                if let Some(wb) = st.body.take_archive_charge_bytes(&h) {
-                                    archive_queued.release(wb);
-                                }
-                            }
-                            if offer.disk_id.is_some() {
-                                offered_disk = true;
-                            } else {
-                                offered_ram = true;
-                            }
+                        Ok(_offer) => {
+                            offered_disk = true;
                         }
                         Err(e) => {
-                            // Real IO/corrupt only — BudgetFull is handled as RAM buffer.
+                            // IO/corrupt or rare absolute byte ceiling.
                             rbitcoin_log::warn!(
                                 "ibd: body queue offer failed ({e}) h={height}"
                             );
@@ -479,16 +459,12 @@ pub(crate) fn apply_peer_event(
                     }
                 }
             }
-            if !offered_disk && !offered_ram {
+            if !offered_disk {
                 // Body not retained — leave missing so densify can re-get.
                 st.body.mark_missing(hash);
                 return;
             }
-            if offered_ram {
-                archive_queued.charge(wire_bytes);
-                st.body.mark_archive_charged_bytes(hash, wire_bytes);
-            }
-            // Prevent re-getdata while body queue owns this body (disk or RAM).
+            // Prevent re-getdata while body queue owns this body.
             st.body.mark_pending(hash);
             // Unified path: readiness only → confirm prep pulls wire from body queue.
             // Unified path: confirm feed present → confirm commit is sole Class A
@@ -497,7 +473,9 @@ pub(crate) fn apply_peer_event(
                 if height != u32::MAX {
                     feed.note(height, hash);
                 } else {
-                    // Unknown height: fall back to archive job (still has wire).
+                    // Unknown height: fall back to archive job (wire in pipeline RAM).
+                    archive_queued.charge(wire_bytes);
+                    st.body.mark_archive_charged_bytes(hash, wire_bytes);
                     if arch_job_tx
                         .send(ArchiveJob {
                             block,
@@ -514,20 +492,25 @@ pub(crate) fn apply_peer_event(
                         warn!("ibd: archive pipeline closed; drop {hash}");
                     }
                 }
-            } else if arch_job_tx
-                .send(ArchiveJob {
-                    block,
-                    header_fk,
-                    priority,
-                    wire_bytes,
-                    height,
-                })
-                .is_err()
-            {
-                archive_queued.release(wire_bytes);
-                st.body.clear_archive_charged(&hash);
-                st.body.mark_missing(hash);
-                warn!("ibd: archive pipeline closed; drop {hash}");
+            } else {
+                // No confirm feed: dual-track archive job holds wire in RAM.
+                archive_queued.charge(wire_bytes);
+                st.body.mark_archive_charged_bytes(hash, wire_bytes);
+                if arch_job_tx
+                    .send(ArchiveJob {
+                        block,
+                        header_fk,
+                        priority,
+                        wire_bytes,
+                        height,
+                    })
+                    .is_err()
+                {
+                    archive_queued.release(wire_bytes);
+                    st.body.clear_archive_charged(&hash);
+                    st.body.mark_missing(hash);
+                    warn!("ibd: archive pipeline closed; drop {hash}");
+                }
             }
         }
         PeerEvent::NotFound { peer, hashes } => {
@@ -677,27 +660,6 @@ fn release_confirm_archive_charge(
     }
 }
 
-/// Soft budget is for **process-held** wire only. When RAM pending spills to
-/// durable disk, drop those charges so densify can use free `bq` headroom.
-pub(crate) fn release_flushed_soft_charges(
-    st: &mut IbdWorkState,
-    archive_queued: Option<&ArchiveQueueBudget>,
-    flushed_hashes: &[[u8; 32]],
-) {
-    let Some(q) = archive_queued else {
-        for fh in flushed_hashes {
-            st.body.clear_archive_charged(&BlockHash::from_byte_array(*fh));
-        }
-        return;
-    };
-    for fh in flushed_hashes {
-        let h = BlockHash::from_byte_array(*fh);
-        if let Some(wb) = st.body.take_archive_charge_bytes(&h) {
-            q.release(wb);
-        }
-    }
-}
-
 pub(crate) fn apply_confirm_reject(
     st: &mut IbdWorkState,
     height: u32,
@@ -730,9 +692,7 @@ pub(crate) fn apply_confirm_reject(
         clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
         // Evict bad wire so claim_ready is false until a good body arrives.
         if let Some(q) = query {
-            if let Ok((_n, flushed)) = q.block_queue_dequeue_height(height) {
-                release_flushed_soft_charges(st, archive_queued, &flushed);
-            }
+            let _ = q.block_queue_dequeue_height(height);
         }
         st.body.mark_missing(hash);
         warn!(
@@ -740,12 +700,10 @@ pub(crate) fn apply_confirm_reject(
         );
         return;
     }
-    // Wire path charged soft budget on receive — release before drop marker.
+    // Wire path may have charged soft budget (fallback archive job) — release.
     release_confirm_archive_charge(st, &hash, archive_queued);
     if let Some(q) = query {
-        if let Ok((_n, flushed)) = q.block_queue_dequeue_height(height) {
-            release_flushed_soft_charges(st, archive_queued, &flushed);
-        }
+        let _ = q.block_queue_dequeue_height(height);
     }
     st.body.mark_rejected(hash);
     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
@@ -894,38 +852,6 @@ mod confirm_reject_tests {
             st.body.is_rejected(&hash),
             "prevout-spent is permanent at reject layer (write skip-if-committed)"
         );
-    }
-
-    /// RAM→disk flush must drop soft charges (densify resume while bq has room).
-    #[test]
-    fn ram_flush_releases_soft_archive_charge() {
-        let budget = ArchiveQueueBudget::new(16 * 1024 * 1024);
-        let mut st = IbdWorkState::new(Vec::new(), None, Some(50));
-        let h_ram = h(0xAA);
-        let wire = 100_000usize;
-        budget.charge(wire);
-        st.body.mark_archive_charged_bytes(h_ram, wire);
-        assert_eq!(budget.count(), 1);
-        assert!(budget.bytes() >= wire);
-        // Simulate spill: hash left process RAM for durable disk.
-        super::release_flushed_soft_charges(
-            &mut st,
-            Some(&budget),
-            &[h_ram.to_byte_array()],
-        );
-        assert_eq!(budget.count(), 0, "flush must release soft charge");
-        assert_eq!(budget.bytes(), 0);
-        assert!(
-            st.body.take_archive_charge_bytes(&h_ram).is_none(),
-            "marker consumed on flush"
-        );
-        // Idempotent: second flush of same hash is a no-op.
-        super::release_flushed_soft_charges(
-            &mut st,
-            Some(&budget),
-            &[h_ram.to_byte_array()],
-        );
-        assert_eq!(budget.count(), 0);
     }
 
     /// Wire-path soft budget charged on receive must release on script reject
@@ -1485,15 +1411,16 @@ mod confirm_reject_tests {
             local,
             None,
         );
-        // Disk body-queue path: pending, no soft charge; arch_job when no confirm feed.
-        assert_eq!(budget.count(), 0, "disk offer is not soft-charged");
-        assert!(!st.body.is_archive_charged(&h1));
+        // Disk body-queue always; no confirm feed → dual-track archive job holds
+        // a second wire copy in pipeline RAM and soft-charges for that.
+        assert_eq!(budget.count(), 1, "archive-job path soft-charges pipeline RAM");
+        assert!(st.body.is_archive_charged(&h1));
         assert!(st.body.is_pending(&h1));
         assert!(hub.query.block_queue_has_height(1));
         let job = arch_rx.try_recv().expect("ArchiveJob enqueued (no confirm feed)");
         assert_eq!(job.block.block_hash(), h1);
 
-        // Redelivery while pending / already in body queue: no second job.
+        // Redelivery while pending / already in body queue: no second job/charge.
         apply_peer_event(
             &mut st,
             &hub,
@@ -1508,7 +1435,7 @@ mod confirm_reject_tests {
             local,
             None,
         );
-        assert_eq!(budget.count(), 0);
+        assert_eq!(budget.count(), 1, "no double charge on redelivery");
         assert!(arch_rx.try_recv().is_err());
 
         // Beyond ContigPark horizon → mark_missing, no charge.

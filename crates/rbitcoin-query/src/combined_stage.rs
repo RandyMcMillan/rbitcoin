@@ -148,7 +148,6 @@ mod tests {
     }
 
     /// Serialise env budget knobs across parallel tests.
-    static BQ_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn put_tx(q: &Query, seed: u8) -> Fk {
         let mut txid = [0u8; 32];
@@ -228,7 +227,7 @@ mod tests {
         assert_eq!(all[0].height, 42);
         assert_eq!(all[0].payload, payload);
         // Confirm-write hook: dequeue by height.
-        assert_eq!(q2.block_queue_dequeue_height(42).unwrap().0, 1);
+        assert_eq!(q2.block_queue_dequeue_height(42).unwrap(), 1);
         assert_eq!(q2.block_queue_stats().2, 0);
         drop(q2);
         let q3 = Query::open_or_create(dir.join("store")).unwrap();
@@ -238,58 +237,31 @@ mod tests {
 
     /// Full durable budget → offer buffers in RAM (no error); dequeue flushes.
     ///
-    /// Production budget via `RBITCOIN_BLOCK_QUEUE_BYTES` (min 64 MiB clamp) —
-    /// no production `*_for_test` budget backdoor.
+    /// Offer always lands on durable disk (no RAM soft overflow).
     #[test]
-    fn block_queue_offer_buffers_when_full_then_flush_on_dequeue() {
-        let _env = BQ_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("RBITCOIN_BLOCK_QUEUE_BYTES");
-        std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", format!("{}", 64 * 1024 * 1024));
+    fn block_queue_offer_always_disk() {
         let (dir, q) = temp_query();
-        // Two ~40 MiB payloads with 64 MiB budget: first disk, second RAM.
-        let p1 = vec![1u8; 40 * 1024 * 1024];
-        let p2 = vec![2u8; 40 * 1024 * 1024];
+        let p1 = vec![1u8; 64 * 1024];
+        let p2 = vec![2u8; 64 * 1024];
         let o1 = q.block_queue_offer(1, [1u8; 32], 1, &p1).unwrap();
-        assert!(o1.disk_id.is_some(), "first fits on disk");
-        assert!(o1.flushed_to_disk.is_empty());
+        assert!(o1.disk_id > 0);
         assert_eq!(q.block_queue_stats().2, 1);
         let o2 = q.block_queue_offer(2, [2u8; 32], 2, &p2).unwrap();
-        assert!(o2.disk_id.is_none(), "second held in RAM, not error");
-        assert_eq!(q.block_queue_pending_len(), 1);
-        let (pend_b, pend_n) = q.block_queue_pending_stats();
-        assert_eq!(pend_n, 1);
-        assert_eq!(
-            pend_b,
-            p2.len() as u64,
-            "pending_stats meters process RAM only (not disk fill)"
-        );
-        let (_budget, disk_b, disk_n) = q.block_queue_stats();
-        assert_eq!(disk_n, 1, "disk count unchanged");
-        assert_eq!(disk_b, p1.len() as u64);
-        assert!(!q.block_queue_can_request(), "effective fill ≥ budget");
-        let (n, flushed) = q.block_queue_dequeue_height(1).unwrap();
+        assert!(o2.disk_id > 0);
+        assert_eq!(q.block_queue_stats().2, 2);
+        let n = q.block_queue_dequeue_height(1).unwrap();
         assert_eq!(n, 1);
-        assert_eq!(flushed, vec![[2u8; 32]], "RAM h2 spilled to disk");
-        assert_eq!(q.block_queue_pending_len(), 0, "flushed after dequeue");
-        assert_eq!(q.block_queue_pending_stats(), (0, 0));
-        assert_eq!(q.block_queue_stats().2, 1, "h2 now on disk");
+        assert_eq!(q.block_queue_stats().2, 1);
         let all = q.block_queue_load_all().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].height, 2);
         assert_eq!(all[0].payload, p2);
-        match prev {
-            Some(v) => std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", v),
-            None => std::env::remove_var("RBITCOIN_BLOCK_QUEUE_BYTES"),
-        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Confirm prep intake: payload by height from disk or RAM pending (no dequeue).
+    /// Confirm prep intake: payload by height from disk (no dequeue).
     #[test]
-    fn block_queue_payload_peek_disk_and_pending() {
-        let _env = BQ_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("RBITCOIN_BLOCK_QUEUE_BYTES");
-        std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", format!("{}", 64 * 1024 * 1024));
+    fn block_queue_payload_peek_disk() {
         let (dir, q) = temp_query();
         let disk = b"disk-payload".to_vec();
         q.block_queue_enqueue(10, [0xAAu8; 32], 1, &disk).unwrap();
@@ -299,40 +271,55 @@ mod tests {
         );
         assert!(q.block_queue_has_height(10));
         assert_eq!(q.block_queue_stats().2, 1, "peek does not dequeue");
-
-        let fill = vec![9u8; 60 * 1024 * 1024];
-        q.block_queue_offer(20, [0xCCu8; 32], 3, &fill).unwrap();
-        let ram = vec![7u8; 8 * 1024 * 1024];
-        let o = q.block_queue_offer(11, [0xBBu8; 32], 2, &ram).unwrap();
-        assert!(o.disk_id.is_none(), "held in RAM pending after budget full");
-        assert_eq!(
-            q.block_queue_payload(11).unwrap().as_deref(),
-            Some(ram.as_slice())
-        );
-        assert!(q.block_queue_has_height(11));
         assert!(q.block_queue_payload(999).unwrap().is_none());
-        match prev {
-            Some(v) => std::env::set_var("RBITCOIN_BLOCK_QUEUE_BYTES", v),
-            None => std::env::remove_var("RBITCOIN_BLOCK_QUEUE_BYTES"),
-        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn block_queue_hysteresis_scale() {
-        // Enter at 0.90, stay until ≤0.70.
-        let (s0, p0) = Query::block_queue_far_scale_from(0.5, false);
-        assert!((s0 - 0.5).abs() < 1e-9);
-        assert!(!p0);
-        let (s1, p1) = Query::block_queue_far_scale_from(0.91, false);
-        assert_eq!(s1, 0.0);
-        assert!(p1);
-        let (s2, p2) = Query::block_queue_far_scale_from(0.80, true);
-        assert_eq!(s2, 0.0, "still latched above exit");
-        assert!(p2);
-        let (s3, p3) = Query::block_queue_far_scale_from(0.70, true);
-        assert!(!p3);
-        assert!((s3 - 0.30).abs() < 1e-9);
+    fn block_queue_soft_time_hysteresis() {
+        use crate::{soft_depth_targets, soft_pressure, BQ_SOFT_COUNT_FLOOR};
+        let (stop, resume) = soft_depth_targets(Some(2.0));
+        assert_eq!(stop, 600);
+        assert_eq!(resume, 480);
+        let (stop0, _) = soft_depth_targets(None);
+        assert_eq!(stop0, BQ_SOFT_COUNT_FLOOR);
+
+        let (dir, q) = temp_query();
+        // Empty queue: no pressure.
+        assert!(!q.block_queue_update_soft_pressure(Some(2.0)));
+        // Enqueue past stop target.
+        for i in 0..601u32 {
+            q.block_queue_enqueue(i, {
+                let mut h = [0u8; 32];
+                h[..4].copy_from_slice(&i.to_le_bytes());
+                h
+            }, 1, b"x")
+            .unwrap();
+        }
+        assert!(
+            q.block_queue_update_soft_pressure(Some(2.0)),
+            "depth 601 > stop 600"
+        );
+        assert!(soft_pressure(500, 600, 480, true), "stay latched mid-band");
+        // Drain into mid-band (still ≥ resume 480).
+        for i in 0..50u32 {
+            q.block_queue_dequeue_height(i).unwrap();
+        }
+        assert_eq!(q.block_queue_count(), 551);
+        assert!(
+            q.block_queue_update_soft_pressure(Some(2.0)),
+            "still mid-band (551 in [480, 600])"
+        );
+        // Drain below resume.
+        for i in 50..400u32 {
+            q.block_queue_dequeue_height(i).unwrap();
+        }
+        assert_eq!(q.block_queue_count(), 201);
+        assert!(
+            !q.block_queue_update_soft_pressure(Some(2.0)),
+            "depth 201 < resume 480"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Multi-block AC1: archive h0 creates + h1 spends h0; load_confirm_parents

@@ -37,25 +37,45 @@ use rbitcoin_store::{
     script_hash, HeaderRecord, InputRecord, OutputRecord, PointRecord, ScriptHashRecord, Store,
     StoreError, TxRecord,
 };
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 
 pub type QueryError = StoreError;
 
-/// One already-received block waiting for durable `block_queue` capacity.
-#[derive(Debug, Clone)]
-struct PendingDurableBlock {
-    height: u32,
-    hash: [u8; 32],
-    header_fk: u64,
-    payload: Vec<u8>,
+/// Soft body-queue depth stop: ~5 minutes of tip-rate blocks on disk.
+pub const BQ_SOFT_STOP_SECS: f64 = 300.0;
+/// Soft body-queue depth resume: ~4 minutes (hysteresis vs stop).
+pub const BQ_SOFT_RESUME_SECS: f64 = 240.0;
+/// Minimum stop/resume counts when tip rate is cold or near zero.
+pub const BQ_SOFT_COUNT_FLOOR: u32 = 256;
+
+/// Target on-disk block counts for soft densify hysteresis from tip rate (blocks/s).
+///
+/// When `rate` is unknown or near zero, uses [`BQ_SOFT_COUNT_FLOOR`] so a stuck
+/// tip cannot clamp targets to zero and freeze densify after a small backlog.
+pub fn soft_depth_targets(rate_blocks_per_s: Option<f64>) -> (u32, u32) {
+    let rate = rate_blocks_per_s
+        .filter(|r| r.is_finite() && *r > 1e-9)
+        .unwrap_or(0.0);
+    let stop = ((rate * BQ_SOFT_STOP_SECS).ceil() as u32).max(BQ_SOFT_COUNT_FLOOR);
+    let resume_raw = ((rate * BQ_SOFT_RESUME_SECS).ceil() as u32)
+        .max(BQ_SOFT_COUNT_FLOOR.saturating_mul(4) / 5);
+    let resume = resume_raw.min(stop.saturating_sub(1).max(1));
+    (stop, resume)
 }
 
-/// Durable block_queue request-gating hysteresis (same band as archive RAM budget).
-pub const BLOCK_QUEUE_PRESSURE_ENTER: f64 = 0.90;
-pub const BLOCK_QUEUE_PRESSURE_EXIT: f64 = 0.70;
+/// Hysteresis latch: enter when `depth > stop`, exit when `depth < resume`.
+pub fn soft_pressure(depth_n: u32, stop_n: u32, resume_n: u32, was: bool) -> bool {
+    if depth_n > stop_n {
+        true
+    } else if depth_n < resume_n {
+        false
+    } else {
+        was
+    }
+}
 
 /// Cheap process-owned cache occupancy for IBD `ibd: sizes` (O(1) lens + brief locks).
 ///
@@ -714,12 +734,9 @@ pub struct Query {
     confirm_parents: confirm_parent_cache::ConfirmParentCache,
     /// Sole hot create map (fk/range/outs) for archive prep + confirm pin.
     create_residency: create_residency::CreateResidency,
-    /// Durable multi‑GiB on-disk block payload queue (IBD restart without re-download).
+    /// Durable on-disk block payload queue (IBD restart without re-download).
     block_queue: Mutex<rbitcoin_store::BlockQueue>,
-    /// RAM overflow when durable queue is at budget (already-received blocks only).
-    /// Flushed into disk as confirm-write dequeues free space.
-    block_queue_pending: Mutex<VecDeque<PendingDurableBlock>>,
-    /// Hysteresis latch for new getdata: enter ≥90% effective fill, exit ≤70%.
+    /// Soft time-depth hysteresis latch for densify frontier (updated with tip rate).
     block_queue_pressure: AtomicBool,
     /// Direct IBD SH: memtable → sorted runs (bulk materialize at tip).
     sh_run: sh_builder::ShRunBuilder,
@@ -759,7 +776,6 @@ impl Query {
             block_queue: Mutex::new(rbitcoin_store::BlockQueue::open_or_create(
                 &store_path,
             )?),
-            block_queue_pending: Mutex::new(VecDeque::new()),
             block_queue_pressure: AtomicBool::new(false),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
             // Open as Tip until IBD selects Direct.
@@ -879,16 +895,10 @@ impl Query {
 }
 
 /// Outcome of [`Query::block_queue_offer`].
-///
-/// Soft wire budget (IBD `archive_queued`) must **release** charges for
-/// [`Self::flushed_to_disk`] — those bodies are no longer in process RAM.
-/// Charge only while `disk_id` is `None` (still in RAM pending).
 #[derive(Debug, Clone)]
 pub struct BlockQueueOffer {
-    /// `Some(rec_id)` when **this** body is on durable disk; `None` = RAM pending.
-    pub disk_id: Option<u64>,
-    /// Prior RAM-pending bodies spilled to disk during this call.
-    pub flushed_to_disk: Vec<[u8; 32]>,
+    /// Durable queue record id for this body.
+    pub disk_id: u64,
 }
 
 impl Query {
@@ -935,87 +945,58 @@ impl Query {
         &self.create_residency
     }
 
-    /// Durable block queue budget/count for status: `(budget, disk_bytes, disk_count)`.
+    /// Durable block queue stats: `(absolute_budget_or_max, disk_bytes, disk_count)`.
     ///
-    /// Disk bytes are **not** process heap — see [`Self::block_queue_pending_stats`].
+    /// Disk bytes are **not** process heap. Absolute budget is `u64::MAX` when
+    /// unlimited (default); densify uses soft time-depth, not this ceiling.
     pub fn block_queue_stats(&self) -> (u64, u64, usize) {
         let g = self.block_queue.lock().unwrap();
         (g.budget(), g.bytes(), g.count())
     }
 
-    /// RAM overflow when durable queue is full: `(pending_bytes, pending_count)`.
+    /// On-disk entry count (soft time-depth meter).
+    pub fn block_queue_count(&self) -> usize {
+        self.block_queue.lock().unwrap().count()
+    }
+
+    /// Highest height on the durable body queue (`None` if empty).
+    pub fn block_queue_max_height(&self) -> Option<u32> {
+        self.block_queue.lock().unwrap().max_height()
+    }
+
+    /// Soft densify pressure from tip rate (blocks/s) and on-disk count.
     ///
-    /// This is the only BQ-owned process heap. Disk fill lives in
-    /// [`Self::block_queue_stats`] and should not be read as RSS.
-    pub fn block_queue_pending_stats(&self) -> (u64, usize) {
-        let pend = self.block_queue_pending.lock().unwrap();
-        let bytes: u64 = pend.iter().map(|p| p.payload.len() as u64).sum();
-        (bytes, pend.len())
-    }
-
-    /// `(disk_bytes + pending_ram_bytes) / budget` for admission / logs.
+    /// Stop frontier densify when depth **>** ~5 minutes of tip-rate blocks;
+    /// resume when **<** ~4 minutes. Updates the process latch. Gap fill inside
+    /// the on-disk height span is always allowed by assign even under pressure.
     ///
-    /// Lock order: `block_queue` then `block_queue_pending`.
-    pub fn block_queue_effective_fill(&self) -> f64 {
-        let g = self.block_queue.lock().unwrap();
-        let pend = self.block_queue_pending.lock().unwrap();
-        let pending_bytes: u64 = pend.iter().map(|p| p.payload.len() as u64).sum();
-        let b = g.budget().max(1) as f64;
-        (g.bytes().saturating_add(pending_bytes)) as f64 / b
-    }
-
-    /// RAM overflow depth (already-received blocks waiting for durable capacity).
-    pub fn block_queue_pending_len(&self) -> usize {
-        self.block_queue_pending.lock().unwrap().len()
-    }
-
-    /// Pure hysteresis: scale for new densify getdata from fill + latch.
-    ///
-    /// Enter pressure at ≥ [`BLOCK_QUEUE_PRESSURE_ENTER`], exit only at
-    /// ≤ [`BLOCK_QUEUE_PRESSURE_EXIT`]. Under pressure scale is 0.
-    pub fn block_queue_far_scale_from(fill: f64, mut pressure: bool) -> (f64, bool) {
-        if fill >= BLOCK_QUEUE_PRESSURE_ENTER {
-            pressure = true;
-        } else if fill <= BLOCK_QUEUE_PRESSURE_EXIT {
-            pressure = false;
-        }
-        let scale = if pressure {
-            0.0
-        } else {
-            (1.0 - fill).clamp(0.0, 1.0)
-        };
-        (scale, pressure)
-    }
-
-    /// Soft densify scale (0..=1) with 90%/70% hysteresis on effective fill.
-    pub fn block_queue_far_admission_scale(&self) -> f64 {
-        let fill = self.block_queue_effective_fill();
+    /// `rate_blocks_per_s` should match IBD `TipRateTracker::eta_rate` (ETA EWMA).
+    pub fn block_queue_update_soft_pressure(&self, rate_blocks_per_s: Option<f64>) -> bool {
+        let depth = self.block_queue_count() as u32;
+        let (stop, resume) = soft_depth_targets(rate_blocks_per_s);
         let was = self.block_queue_pressure.load(AtomicOrdering::Relaxed);
-        let (scale, pressure) = Self::block_queue_far_scale_from(fill, was);
+        let pressure = soft_pressure(depth, stop, resume, was);
         self.block_queue_pressure
             .store(pressure, AtomicOrdering::Relaxed);
-        scale
+        pressure
     }
 
-    /// True while durable+pending is **strictly below** budget — issue densify
-    /// getdata. Already-in-flight peer bodies are still accepted into RAM.
-    pub fn block_queue_can_request(&self) -> bool {
-        let g = self.block_queue.lock().unwrap();
-        let pend = self.block_queue_pending.lock().unwrap();
-        let pending_bytes: u64 = pend.iter().map(|p| p.payload.len() as u64).sum();
-        g.bytes().saturating_add(pending_bytes) < g.budget()
+    /// Current soft-pressure latch (after last [`Self::block_queue_update_soft_pressure`]).
+    pub fn block_queue_soft_pressure(&self) -> bool {
+        self.block_queue_pressure.load(AtomicOrdering::Relaxed)
     }
 
-    /// Persist a decoded block payload when capacity allows; otherwise buffer in
-    /// process RAM until a later flush (after dequeue frees space).
+    /// Soft stop/resume targets for logs: `(stop_n, resume_n)`.
+    pub fn block_queue_soft_targets(rate_blocks_per_s: Option<f64>) -> (u32, u32) {
+        soft_depth_targets(rate_blocks_per_s)
+    }
+
+    /// Persist a decoded block payload on durable disk.
     ///
-    /// Always accepts the block for the live process (returns `Ok`). Disk
-    /// capacity full is **not** an error — do not spam-log it. Real IO errors
-    /// still return `Err`.
-    ///
-    /// Soft wire budget (IBD `archive_queued`) must **release** charges for
-    /// [`BlockQueueOffer::flushed_to_disk`] — those bodies are no longer in
-    /// process RAM. Charge only while `disk_id` is `None` (still in RAM).
+    /// Always accepts for the live process when the optional absolute byte
+    /// ceiling allows. Real IO errors still return `Err`. Soft time-depth only
+    /// stops **new densify getdata** — never refuse in-flight peer wire here
+    /// (except rare absolute-ceiling `BudgetFull`).
     pub fn block_queue_offer(
         &self,
         height: u32,
@@ -1023,46 +1004,13 @@ impl Query {
         header_fk: u64,
         payload: &[u8],
     ) -> Result<BlockQueueOffer, QueryError> {
-        // Free as much disk as possible before deciding.
-        let flushed_to_disk = self.block_queue_flush_pending()?;
-        // Lock order: block_queue then pending.
         let mut g = self.block_queue.lock().unwrap();
-        if g.can_enqueue(payload.len()) {
-            let id = g.enqueue(height, hash, header_fk, payload)?;
-            let fill = {
-                let pend = self.block_queue_pending.lock().unwrap();
-                let pb: u64 = pend.iter().map(|p| p.payload.len() as u64).sum();
-                (g.bytes().saturating_add(pb)) as f64 / g.budget().max(1) as f64
-            };
-            drop(g);
-            self.store_block_queue_pressure(fill);
-            return Ok(BlockQueueOffer {
-                disk_id: Some(id),
-                flushed_to_disk,
-            });
+        // Idempotent: already on disk for this height (re-offer after race).
+        if let Some(id) = g.id_for_height(height) {
+            return Ok(BlockQueueOffer { disk_id: id });
         }
-        // Budget full: hold payload in RAM; assign stops new getdata via can_request.
-        {
-            let mut pend = self.block_queue_pending.lock().unwrap();
-            if !pend.iter().any(|p| p.height == height) {
-                pend.push_back(PendingDurableBlock {
-                    height,
-                    hash,
-                    header_fk,
-                    payload: payload.to_vec(),
-                });
-            }
-            let pb: u64 = pend.iter().map(|p| p.payload.len() as u64).sum();
-            let fill =
-                (g.bytes().saturating_add(pb)) as f64 / g.budget().max(1) as f64;
-            drop(pend);
-            drop(g);
-            self.store_block_queue_pressure(fill);
-        }
-        Ok(BlockQueueOffer {
-            disk_id: None,
-            flushed_to_disk,
-        })
+        let id = g.enqueue(height, hash, header_fk, payload)?;
+        Ok(BlockQueueOffer { disk_id: id })
     }
 
     /// Direct disk enqueue (tests / tools). Prefer [`Self::block_queue_offer`] on IBD.
@@ -1077,71 +1025,15 @@ impl Query {
         Ok(g.enqueue(height, hash, header_fk, payload)?)
     }
 
-    /// Drain RAM overflow into durable queue while capacity allows.
-    ///
-    /// Returns hashes that left RAM (caller must release soft wire charges).
-    ///
-    /// Lock order: `block_queue` then `block_queue_pending` (never reverse).
-    pub fn block_queue_flush_pending(&self) -> Result<Vec<[u8; 32]>, QueryError> {
-        let mut flushed_hashes = Vec::new();
-        let mut g = self.block_queue.lock().unwrap();
-        loop {
-            let item = {
-                let mut pend = self.block_queue_pending.lock().unwrap();
-                let Some(front) = pend.front() else {
-                    break;
-                };
-                if !g.can_enqueue(front.payload.len()) {
-                    break;
-                }
-                pend.pop_front()
-            };
-            let Some(item) = item else {
-                break;
-            };
-            g.enqueue(item.height, item.hash, item.header_fk, &item.payload)?;
-            flushed_hashes.push(item.hash);
-        }
-        if !flushed_hashes.is_empty() {
-            let fill = {
-                let pend = self.block_queue_pending.lock().unwrap();
-                let pb: u64 = pend.iter().map(|p| p.payload.len() as u64).sum();
-                (g.bytes().saturating_add(pb)) as f64 / g.budget().max(1) as f64
-            };
-            drop(g);
-            self.store_block_queue_pressure(fill);
-        }
-        Ok(flushed_hashes)
-    }
-
-    fn store_block_queue_pressure(&self, fill: f64) {
-        let was = self.block_queue_pressure.load(AtomicOrdering::Relaxed);
-        let (_scale, pressure) = Self::block_queue_far_scale_from(fill, was);
-        self.block_queue_pressure
-            .store(pressure, AtomicOrdering::Relaxed);
-    }
-
     /// Remove durable queue entry after combined confirm-write (or permanent drop).
-    /// Then flush any RAM overflow into freed capacity.
-    ///
-    /// Returns `(removed_count, hashes_flushed_from_ram)` — soft charges for
-    /// flushed hashes should be released (payload no longer in process RAM).
-    pub fn block_queue_dequeue_height(
-        &self,
-        height: u32,
-    ) -> Result<(usize, Vec<[u8; 32]>), QueryError> {
-        let n = {
-            let mut g = self.block_queue.lock().unwrap();
-            g.dequeue_height(height)?
-        };
-        let flushed = self.block_queue_flush_pending()?;
-        Ok((n, flushed))
+    pub fn block_queue_dequeue_height(&self, height: u32) -> Result<usize, QueryError> {
+        let mut g = self.block_queue.lock().unwrap();
+        Ok(g.dequeue_height(height)?)
     }
 
     /// Index-only durable queue entries (no payload IO). Prefer for IBD restart.
     ///
-    /// Disk only (not RAM pending). Production rehydrate must use this — not
-    /// [`Self::block_queue_load_all`].
+    /// Production rehydrate must use this — not [`Self::block_queue_load_all`].
     pub fn block_queue_list_meta(&self) -> Vec<rbitcoin_store::QueuedBlockMeta> {
         let g = self.block_queue.lock().unwrap();
         g.list_meta()
@@ -1149,9 +1041,9 @@ impl Query {
 
     /// Load all durable queued blocks **with full payloads** (tests / tools).
     ///
-    /// Disk only (not RAM pending). **Do not use on production multi‑GiB
-    /// queues** — peak RAM ≈ disk fill. Use [`Self::block_queue_list_meta`] for
-    /// rehydrate and [`Self::block_queue_payload`] for single-height prep.
+    /// **Do not use on production multi‑GiB queues** — peak RAM ≈ disk fill.
+    /// Use [`Self::block_queue_list_meta`] for rehydrate and
+    /// [`Self::block_queue_payload`] for single-height prep.
     pub fn block_queue_load_all(&self) -> Result<Vec<rbitcoin_store::QueuedBlock>, QueryError> {
         let g = self.block_queue.lock().unwrap();
         Ok(g.load_all()?)
@@ -1159,28 +1051,15 @@ impl Query {
 
     /// Body-queue intake for confirm prep: payload for `height` without dequeue.
     ///
-    /// Order: RAM overflow (`block_queue_pending`) first, then durable disk.
-    /// Peer → body queue is the only source of wire for the unified path;
+    /// Peer → durable body queue is the only source of wire for the unified path;
     /// ConfirmFeed carries readiness (height/hash), not retained `Block`s.
     pub fn block_queue_payload(&self, height: u32) -> Result<Option<Vec<u8>>, QueryError> {
-        {
-            let pend = self.block_queue_pending.lock().unwrap();
-            if let Some(p) = pend.iter().find(|p| p.height == height) {
-                return Ok(Some(p.payload.clone()));
-            }
-        }
         let g = self.block_queue.lock().unwrap();
         Ok(g.get_by_height(height)?.map(|q| q.payload))
     }
 
-    /// True if body queue (disk or RAM pending) holds `height`.
+    /// True if the durable body queue holds `height`.
     pub fn block_queue_has_height(&self, height: u32) -> bool {
-        {
-            let pend = self.block_queue_pending.lock().unwrap();
-            if pend.iter().any(|p| p.height == height) {
-                return true;
-            }
-        }
         let g = self.block_queue.lock().unwrap();
         g.contains_height(height)
     }

@@ -8,8 +8,8 @@ in RSS when faulted but are not Rust heap leaks).
 
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
-| **Durable body queue** | default 8 GiB **disk** payload (`RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES`) | Peer **offer** wire; confirm prep **reads** by height; confirm-write **dequeues** after tip advance. Files get `POSIX_FADV_DONTNEED` after durable write (idle on disk — not process heap / not intended page-cache pin). **Restart rehydrate uses index meta only** (`list_meta`) — never `load_all` (that was a multi‑GiB startup heap spike). RAM overflow when disk full (same soft gate for densify); sizes: `bq disk=` vs `pending_ram=`. |
-| **Body densify height horizon** | `CONTIG_DENSIFY_AHEAD` (64 k past tip) | Safety only when the byte budget is nearly empty (early small blocks); primary stop is **byte fill** (90%/70% hysteresis). |
+| **Durable body queue** | **Soft time-depth** ~5 min of tip-rate blocks on disk (hysteresis resume &lt;4 min); optional absolute byte ceiling via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` (default unlimited) | Peer **offer** wire always to disk; confirm prep **reads** by height; confirm-write **dequeues** after tip advance. Files get `POSIX_FADV_DONTNEED` after durable write (idle on disk — not process heap). **Restart rehydrate uses index meta only** (`list_meta`) — never `load_all`. No process RAM overflow for BQ. Logs: `bq n=` + `disk=` + `soft=n/stop`. |
+| **Body densify height horizon** | `CONTIG_DENSIFY_AHEAD` (64 k past tip) | Safety max walk/receive; primary stop is **soft time-depth**. Gaps inside on-disk max height always densify even under pressure. |
 | **Confirm feed** | readiness (height/hash), no wire retain | Prep claims tip-contiguous runs; requeue / finish on outcome |
 
 ## Soft budgets / fallback archive job (not the primary Class A path)
@@ -41,10 +41,10 @@ body-queue byte budget, soft archive RAM budget, or any other soft meter.
 
 | Allowed | Forbidden |
 |---------|-----------|
-| Stop **new densify getdata** when body-queue `!can_request` or soft `!can_assign` | Await a decode permit / soft gate **before** the next TCP read on a peer |
-| Scale densify via far-admission hysteresis on fill | Drop a decoded `Block` we already received solely for soft budget |
-| Overshoot budget while in-flight getdata completes | Make healthy peers look stalled by parking the reader on soft backpressure |
-| Buffer body-queue overflow in RAM (then gate requests) | Bound process RAM by refusing peer bytes already on the wire |
+| Stop **frontier densify getdata** when soft BQ depth &gt; ~5 min tip-rate blocks (or archive soft `!can_assign`) | Await a decode permit / soft gate **before** the next TCP read on a peer |
+| Always fill **gaps** within on-disk height span under pressure | Drop a decoded `Block` we already received solely for soft budget |
+| Overshoot soft depth while in-flight / gap fill completes | Make healthy peers look stalled by parking the reader on soft backpressure |
+| Accept all in-flight bodies onto durable disk | Bound process RAM by refusing peer bytes already on the wire |
 
 **Why this is safe:** when either budget stops accepting new densify work, assign
 stops issuing getdata. Outstanding requests are finite (per-peer in-flight
@@ -129,7 +129,7 @@ known retain structures:
 | `rss=` `anon=` `file=` `hwm=` | `/proc` process RSS (anon vs mmap file pages) |
 | `work` / `body` | IBD maps + body-presence sets |
 | `body_soft` / `contig` | Soft archive RAM + ContigPark |
-| `bq disk=` / `pending_ram=` | **Disk** payload fill vs **process** overflow only (do not equate disk MiB with RSS) |
+| `bq disk=` / `soft=n/stop` | **Disk** payload size + soft densify count target (do not equate disk MiB with RSS) |
 | `residency` | **Sole** pin map: creates/outs vs caps + conf_plans + `cache=on|off` |
 | `conf planq` / `prepq` / `writeq` | Confirm pipeline **queue contents** (batches, blocks, wire MiB, parents) + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |

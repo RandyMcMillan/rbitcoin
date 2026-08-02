@@ -1,18 +1,20 @@
-//! Cluster mempool with durable mmap layout under `{datadir}/mempool/`.
+//! Cluster mempool with **InRam** buffers + private sidecar durability under
+//! `{datadir}/mempool/` — **not** Class A (`{datadir}/store/tx.body`).
 //!
-//! # Layout
+//! # Layout (private namespace)
 //!
 //! | File | Role |
 //! |------|------|
 //! | `meta` | Magic, schema, commit generation **G**, slot capacity, live count |
 //! | `slots` | Fixed-size slot records (status + body range + txid) |
-//! | `tx.body` | Append-only payloads: `fee(8)‖weight(8)‖raw_tx` per LIVE slot |
+//! | `tx.body` | Unconfirmed payloads only: `fee(8)‖weight(8)‖raw_tx` per LIVE slot |
 //!
-//! **Commit model:** body complete → slot LIVE → RAM indexes → no fsync per tx.
-//! Batched msync + bump `G` on [`ActiveMempool::flush`]. Kill loses at most the
-//! last uncommitted batch; never claim incomplete bodies.
+//! **Commit model:** body complete → slot LIVE → RAM graph → no fsync per tx.
+//! [`ActiveMempool::flush`] bumps `G` and `sync_data`s sidecars. Kill loses at
+//! most the last unflushed batch; never claim incomplete bodies.
 //!
-//! **Memory rule:** indexes stay proportional to the live set; files stay mmap.
+//! **Memory rule:** graph + body buffers stay proportional to the live set.
+//! Sidecars use process `Vec` + file write (no `memmap2`).
 //!
 //! # Phases (plan.md)
 //!

@@ -47,8 +47,8 @@ Default: uring if the ring opens, else pread/pwrite. Ring depth **128**.
 | Hash multi-list (`.mlt`) | **FdOnly** | Linear append (`ArrayLink` kind forced FdOnly at site) |
 | **`scripthash.head` / body** | **FdOnly** | 4 KiB chunk cache (128×32 B) insert + probe; body pread/pwrite slabs |
 | **Spenders** | **FdOnly** | Linear append multi-spender list |
-| Class C arrays | **FdOnly** | header_txs, Confirmed, heights, … (phase 5 step; InRam later) |
-| Mempool store | **MapFull** | Separate crate — phase 5 InRam |
+| Class C arrays | **FdOnly** | header_txs, Confirmed, heights, … |
+| Mempool (`{datadir}/mempool/*`) | **InRam + file sidecar** | Private durability; **not** Class A `store/tx.body` (phase 5b M2) |
 
 ### Hybrid paths (easy to misread)
 
@@ -216,7 +216,16 @@ Live node rollback: set **`RBITCOIN_TX_HEAD_ACCESS=map`** before open/create
   `version=` + `tx_head_access=`; `perf_dbg` adds `probe_us/key=` `idx_us/key=`
   `body_us/key=` and `ca_head_us/blk=` `ca_body_us/blk=`.
 
-### Phase 5b+ — (pending)
+### Phase 5b — Mempool InRam + sidecar (landed)
 
-Explicit **InRam** for small Class C / mempool (not leftover MapFull); then
-remove `memmap2` (phase 6).
+- `rbitcoin-mempool` uses process buffers + normal file IO under
+  `{datadir}/mempool/` (`meta` / `slots` / `tx.body`).
+- **Not** Class A: confirmed archive remains `{datadir}/store/tx.body` with
+  confirm as sole writer.
+- Tip script skip for live mempool txs unchanged (`script_preverified_txids`).
+- No `memmap2` in the mempool crate.
+
+### Phase 6 — (pending)
+
+Remove residual `memmap2` from store `TableFile` (tiny header maps / MapFull
+rollback path); workspace greps empty.

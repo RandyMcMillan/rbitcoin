@@ -435,7 +435,6 @@ name = "rbitcoin-mempool"
 version = "0.1.0"
 dependencies = [
  "bitcoin",
- "memmap2",
  "rbitcoin-consensus",
  "rbitcoin-log",
 ]

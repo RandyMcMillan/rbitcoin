@@ -143,10 +143,10 @@ budgets: [`docs/ibd-memory.md`](./ibd-memory.md).
 
 ### Map / capacity growth
 
-**MapFull** (mempool today): capacity grow = fallocate + map a **new epoch**,
-pointer swap; old maps live until pins drop. **FdOnly** store tables: fallocate
-only, no multi‑GiB remap. Long-held “pause the world” map mutexes on the
-IBD/read path are design bugs.
+**FdOnly** store tables: fallocate only, no multi‑GiB remap. Mempool durability
+is **InRam + private sidecars** under `{datadir}/mempool/` (not Class A).
+Residual MapFull paths in `TableFile` exist only until `memmap2` removal.
+Long-held “pause the world” map mutexes on the IBD/read path are design bugs.
 
 ---
 

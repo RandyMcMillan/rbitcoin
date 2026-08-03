@@ -17,13 +17,14 @@
 
 use super::*;
 
-/// Cap on denserels body loads during startup prewarm (create count).
-///
-/// Completeness + 2 GiB byte FIFO also stop prewarm; this bounds startup IO.
-pub const PREWARM_DENSERELS_MAX_CREATES: usize = 262_144;
-
 /// Max tip-ahead header plans seeded at startup (MTP / header_txs cache).
 pub const PREWARM_HEADER_PLANS_MAX: usize = 4_096;
+
+/// Floor for estimating how many Class A creates to *walk* when filling to the
+/// byte budget (actual stop is still [`CreateResidency`] total_bytes).
+/// Keeps prewarm on a tip-suffix of Class A so oldest-first insert does not
+/// fill the FIFO with ancient creates before reaching tip.
+const PREWARM_MIN_ROW_BYTES: u64 = 256;
 
 /// Stats from [`Query::archive_residency_prewarm`].
 #[derive(Debug, Default, Clone, Copy)]
@@ -496,9 +497,9 @@ impl Query {
     ///
     /// Phases (all process-local; no durable writes):
     /// 1. **Header plans** — tip+1..tip+N into [`ConfirmParentCache`].
-    /// 2. **Complete denserels** — tip-window creates first, then newest Class A
-    ///    fill as **complete** residency rows only (no range-only half-rows).
-    ///    Stops at [`PREWARM_DENSERELS_MAX_CREATES`] or ~⅞ of the byte budget.
+    /// 2. **Complete denserels** — tip-window creates first, then a tip-suffix of
+    ///    Class A as **complete** residency rows. Stops only at ~⅞ of the
+    ///    residency byte budget (room for commit seed). No create-count cap.
     pub fn archive_residency_prewarm(&self) -> Result<ResidencyPrewarmStats, QueryError> {
         use std::time::Instant;
         let t0 = Instant::now();
@@ -561,9 +562,8 @@ impl Query {
         }
         st.headers_ms = t_hdr.elapsed().as_millis() as u64;
 
-        // ── 2. Complete denserels (tip-window first, then recent fill) ─────
+        // ── 2. Complete denserels until byte budget ───────────────────────
         let t_den = Instant::now();
-        let mut denserels_budget = PREWARM_DENSERELS_MAX_CREATES;
         let byte_stop = {
             let (_, _, byte_cap, _) = self.create_residency.size_stats();
             // Leave ~⅛ of byte budget for commit seed.
@@ -572,29 +572,30 @@ impl Query {
 
         tip_window_fks.sort_unstable_by_key(|f| f.0);
         tip_window_fks.dedup();
-        denserels_budget = denserels_budget.saturating_sub(self.prewarm_denserels_fks(
-            &tip_window_fks,
-            denserels_budget,
-            byte_stop,
-            &mut st,
-        )?);
+        self.prewarm_denserels_fks(&tip_window_fks, byte_stop, &mut st)?;
 
-        if denserels_budget > 0 && n > 0 {
-            let fill_n = denserels_budget.min(n as usize) as u64;
-            let start = n.saturating_sub(fill_n).saturating_add(1).max(1);
-            const CHUNK: u64 = 4096;
-            let mut cur = start;
-            while cur <= n && denserels_budget > 0 {
-                let (_, total_bytes, _, _) = self.create_residency.size_stats();
-                if total_bytes >= byte_stop {
-                    break;
+        // Tip-suffix of Class A, oldest→newest so newer rows sit at FIFO back.
+        // Window size from min-row estimate only bounds the *walk*; load stops
+        // when total_bytes hits byte_stop (often sooner for real pin sizes).
+        if n > 0 {
+            let (_, total_bytes, _, _) = self.create_residency.size_stats();
+            if total_bytes < byte_stop {
+                let max_walk = (byte_stop / PREWARM_MIN_ROW_BYTES)
+                    .max(1)
+                    .min(n);
+                let start = n.saturating_sub(max_walk).saturating_add(1).max(1);
+                const CHUNK: u64 = 4096;
+                let mut cur = start;
+                while cur <= n {
+                    let (_, total_bytes, _, _) = self.create_residency.size_stats();
+                    if total_bytes >= byte_stop {
+                        break;
+                    }
+                    let end = (cur + CHUNK - 1).min(n);
+                    let fks: Vec<Fk> = (cur..=end).map(Fk).collect();
+                    self.prewarm_denserels_fks(&fks, byte_stop, &mut st)?;
+                    cur = end + 1;
                 }
-                let end = (cur + CHUNK - 1).min(n);
-                let fks: Vec<Fk> = (cur..=end).map(Fk).collect();
-                let used =
-                    self.prewarm_denserels_fks(&fks, denserels_budget, byte_stop, &mut st)?;
-                denserels_budget = denserels_budget.saturating_sub(used);
-                cur = end + 1;
             }
         }
         st.denserels_ms = t_den.elapsed().as_millis() as u64;
@@ -605,16 +606,15 @@ impl Query {
         Ok(st)
     }
 
-    /// Load complete denserels for tip creates into residency until budgets stop.
+    /// Load complete denserels into residency until `byte_stop`.
     /// Returns how many creates successfully received denserels this call.
     fn prewarm_denserels_fks(
         &self,
         fks: &[Fk],
-        budget: usize,
         byte_stop: u64,
         st: &mut ResidencyPrewarmStats,
     ) -> Result<usize, QueryError> {
-        if fks.is_empty() || budget == 0 {
+        if fks.is_empty() {
             return Ok(0);
         }
         let (_, total_bytes, _, _) = self.create_residency.size_stats();
@@ -625,7 +625,6 @@ impl Query {
             .iter()
             .copied()
             .filter(|fk| fk.get().is_some() && !self.create_residency.has_outs(*fk))
-            .take(budget)
             .collect();
         if need.is_empty() {
             return Ok(0);

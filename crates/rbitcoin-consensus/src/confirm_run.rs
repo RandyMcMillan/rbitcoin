@@ -732,12 +732,15 @@ pub fn ensure_external_parent_denserels_from_plan(
     if !cold_fks.is_empty() {
         let t_io = Instant::now();
         // Prefer plan stamp body ranges (skip tx.idx) — uring denserels batch.
-        let mut by_range: Vec<(rbitcoin_primitives::Fk, (u64, u64))> = Vec::new();
+        // Identity is the stamp reverse map (RAM), passed into the range API.
+        let mut by_range: Vec<(rbitcoin_primitives::Fk, (u64, u64), [u8; 32])> = Vec::new();
         let mut need_idx: Vec<rbitcoin_primitives::Fk> = Vec::new();
         for fk in &cold_fks {
             let id = fk.get().unwrap_or(0);
             if let Some(&range) = plan.external_parent_ranges.get(&id) {
-                by_range.push((*fk, range));
+                let tid =
+                    known_create_txid_ram(id, Some(plan), query.create_residency());
+                by_range.push((*fk, range, tid));
             } else {
                 need_idx.push(*fk);
             }
@@ -754,18 +757,10 @@ pub fn ensure_external_parent_denserels_from_plan(
                 confirm_load_stats::COLD_RANGE_NS.fetch_add(rng_ns, Ordering::Relaxed);
             }
             confirm_load_stats::COLD_RANGE_N.fetch_add(n_range, Ordering::Relaxed);
-            for ((fk, _), row) in by_range.iter().zip(decoded.into_iter()) {
-                if let Some((mut tx, outs, dens)) = row {
-                    if let Some(id) = fk.get() {
-                        fill_create_txid_from_ram(
-                            &mut tx,
-                            id,
-                            Some(plan),
-                            query.create_residency(),
-                        );
-                        plan.external_parent_outs
-                            .insert(id, std::sync::Arc::new((tx, outs, dens)));
-                    }
+            for ((fk, _range, _tid), row) in by_range.into_iter().zip(decoded.into_iter()) {
+                if let (Some(id), Some((tx, outs, dens))) = (fk.get(), row) {
+                    plan.external_parent_outs
+                        .insert(id, std::sync::Arc::new((tx, outs, dens)));
                 }
             }
             confirm_load_stats::BODY_TX_READS.fetch_add(n_range, Ordering::Relaxed);
@@ -1333,8 +1328,25 @@ pub mod plan_stage_stats {
     }
 }
 
-/// Schema 13: denserels body decode leaves `txid` zero. Fill from **RAM only**
-/// (plan stamp reverse map, then residency). Never `txid.body` / sidefile pread.
+/// Create identity already known in RAM (plan stamp reverse map, then residency).
+/// Never reads `txid.body`.
+#[inline]
+fn known_create_txid_ram(
+    create_fk_id: u64,
+    plan: Option<&rbitcoin_query::ArchiveWritePlan>,
+    residency: &rbitcoin_query::CreateResidency,
+) -> [u8; 32] {
+    if let Some(p) = plan {
+        if let Some(tid) = p.external_parent_txid(create_fk_id) {
+            return tid;
+        }
+    }
+    residency
+        .get_txid(rbitcoin_primitives::Fk(create_fk_id))
+        .unwrap_or([0u8; 32])
+}
+
+/// Idx denserels path: body decode has no schema-13 identity — set from RAM.
 #[inline]
 fn fill_create_txid_from_ram(
     tx: &mut rbitcoin_store::TxRecord,
@@ -1345,13 +1357,8 @@ fn fill_create_txid_from_ram(
     if tx.txid != [0u8; 32] {
         return;
     }
-    if let Some(p) = plan {
-        if let Some(tid) = p.external_parent_txid(create_fk_id) {
-            tx.txid = tid;
-            return;
-        }
-    }
-    if let Some(tid) = residency.get_txid(rbitcoin_primitives::Fk(create_fk_id)) {
+    let tid = known_create_txid_ram(create_fk_id, plan, residency);
+    if tid != [0u8; 32] {
         tx.txid = tid;
     }
 }
@@ -1527,13 +1534,16 @@ fn pin_for_wire_batch(
             }
         }
         // 2b) Plan stamp body ranges → denserels by offset (skip tx.idx; uring batch).
-        let mut range_jobs: Vec<(rbitcoin_primitives::Fk, (u64, u64))> = Vec::new();
+        // known_txid from plan reverse map (RAM) — API completes TxRecord identity.
+        let mut range_jobs: Vec<(rbitcoin_primitives::Fk, (u64, u64), [u8; 32])> = Vec::new();
         for id in parent_vouts.keys() {
             if plan_by_id.contains_key(id) {
                 continue;
             }
             if let Some(&range) = plan.external_parent_ranges.get(id) {
-                range_jobs.push((rbitcoin_primitives::Fk(*id), range));
+                let tid =
+                    known_create_txid_ram(*id, Some(plan), query.create_residency());
+                range_jobs.push((rbitcoin_primitives::Fk(*id), range, tid));
             }
         }
         if !range_jobs.is_empty() {
@@ -1551,14 +1561,8 @@ fn pin_for_wire_batch(
             confirm_load_stats::COLD_RANGE_N.fetch_add(n_range, Ordering::Relaxed);
             confirm_load_stats::BODY_TX_READS.fetch_add(n_range, Ordering::Relaxed);
             confirm_load_stats::PIN_NEW.fetch_add(n_range, Ordering::Relaxed);
-            for ((fk, _), row) in range_jobs.into_iter().zip(decoded.into_iter()) {
-                if let (Some(id), Some((mut tx, outs, dens))) = (fk.get(), row) {
-                    fill_create_txid_from_ram(
-                        &mut tx,
-                        id,
-                        Some(plan),
-                        query.create_residency(),
-                    );
+            for ((fk, _range, _tid), row) in range_jobs.into_iter().zip(decoded.into_iter()) {
+                if let (Some(id), Some((tx, outs, dens))) = (fk.get(), row) {
                     plan_by_id.insert(id, std::sync::Arc::new((tx, outs, dens)));
                 }
             }

@@ -1173,17 +1173,13 @@ mod tests {
         plan.external_parent_ranges.insert(pid, range);
         plan.external_parent_txids.insert(pid, parent_txid);
 
+        let known = plan.external_parent_txid(pid).expect("reverse map");
         let rows = q
             .store
-            .get_outs_denserels_by_range_batch(&[(parent_fk, range)])
+            .get_outs_denserels_by_range_batch(&[(parent_fk, range, known)])
             .unwrap();
-        let (mut tx, outs, dens) = rows[0].clone().expect("denserels");
-        assert_eq!(tx.txid, [0u8; 32], "body decode zero identity");
-        // RAM fill (same as prep pin helper).
-        if let Some(tid) = plan.external_parent_txid(pid) {
-            tx.txid = tid;
-        }
-        assert_eq!(tx.txid, parent_txid);
+        let (tx, outs, dens) = rows[0].as_ref().expect("denserels");
+        assert_eq!(tx.txid, parent_txid, "API sets known_txid (RAM), not sidefile");
         assert!(!outs.is_empty());
         assert_eq!(dens.len(), outs.len());
         let _ = std::fs::remove_dir_all(&dir);

@@ -435,9 +435,12 @@ impl Store {
     }
 
     /// Denserels/outs by known body ranges (prep; skips `tx.idx`).
+    ///
+    /// Each item is `(create_fk, body_range, known_txid)` — `known_txid` is
+    /// RAM identity (plan/residency/wire), not a sidefile read.
     pub fn get_outs_denserels_by_range_batch(
         &self,
-        items: &[(Fk, (u64, u64))],
+        items: &[(Fk, (u64, u64), [u8; 32])],
     ) -> Result<
         Vec<Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>>,
         StoreError,

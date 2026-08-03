@@ -1388,16 +1388,16 @@ impl TxTable {
 
     /// Denserels/outs by known Class A body ranges (prep after plan stamp).
     ///
-    /// **Skips `tx.idx`** — each job must supply `(body_off, body_len)`. Uses
-    /// the pin IO uring/pread batch pipeline.
+    /// **Skips `tx.idx`** — each job is `(create_fk, body_range, known_txid)`.
+    /// Uses the pin IO uring/pread batch pipeline.
     ///
-    /// Schema 13: packed body has **no** leading txid — decoded `TxRecord.txid`
-    /// is left **zero**. Callers **must** fill identity from RAM (plan stamp
-    /// `external_parent_txids`, residency, wire) — **never** re-pread `txid.body`
-    /// on the prep pin path.
+    /// Schema 13 packed Class A body has **no** on-disk leading txid (identity
+    /// lives in `txid.body` for head resolve only). Callers pass **`known_txid`
+    /// from RAM** (plan stamp reverse map / residency / wire) — this API sets
+    /// `TxRecord.txid` from that argument. It does **not** read `txid.body`.
     pub fn get_outs_denserels_by_range_batch(
         &self,
-        items: &[(Fk, (u64, u64))],
+        items: &[(Fk, (u64, u64), [u8; 32])],
     ) -> Result<Vec<Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>>, StoreError> {
         use crate::idx_body_pipeline::{
             run_idx_body_pipeline_backend, BodyMode, IdxBodyJob,
@@ -1407,7 +1407,7 @@ impl TxTable {
         }
         let mut jobs: Vec<IdxBodyJob> = items
             .iter()
-            .map(|(fk, range)| IdxBodyJob::new(fk.get().unwrap_or(0), Some(*range)))
+            .map(|(fk, range, _txid)| IdxBodyJob::new(fk.get().unwrap_or(0), Some(*range)))
             .collect();
         run_idx_body_pipeline_backend(
             &self.body,
@@ -1417,13 +1417,17 @@ impl TxTable {
         )?;
         let secret = self.store_secret();
         let mut out = Vec::with_capacity(jobs.len());
-        for job in jobs {
+        for (job, &(_fk, _range, known_txid)) in jobs.into_iter().zip(items.iter()) {
             if !job.ok || job.body.is_empty() {
                 out.push(None);
                 continue;
             }
             match decode_packed_tx_outs_with_spender_rels_secret(&job.body, Some(secret)) {
-                Ok(dec) => out.push(Some(dec)),
+                Ok((mut tx, outs, dens)) => {
+                    // In-memory only: packed body never carried schema-13 identity.
+                    tx.txid = known_txid;
+                    out.push(Some((tx, outs, dens)));
+                }
                 Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => out.push(None),
                 Err(e) => return Err(e),
             }
@@ -3069,11 +3073,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Schema 13: range denserels decode leaves txid zero — callers fill from RAM.
-    ///
-    /// Prep must **not** re-pread `txid.body` here; plan stamp reverse map does.
+    /// Range denserels takes known_txid (RAM) and sets TxRecord.txid — no sidefile.
     #[test]
-    fn get_outs_denserels_by_range_leaves_txid_zero_schema13() {
+    fn get_outs_denserels_by_range_sets_known_txid() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-range-dens-txid-{}",
             std::time::SystemTime::now()
@@ -3112,19 +3114,15 @@ mod tests {
             .put_full_batch_indexed(&[(tx, inputs, outputs)], true)
             .unwrap()[0];
         let range = t.body.record_range(fk).unwrap();
+        // Caller supplies identity from RAM (plan stamp would), not from sidefile here.
         let rows = t
-            .get_outs_denserels_by_range_batch(&[(fk, range)])
+            .get_outs_denserels_by_range_batch(&[(fk, range, want_txid)])
             .unwrap();
         let (got, outs, dens) = rows[0].as_ref().expect("range denserels");
-        assert_eq!(
-            got.txid, [0u8; 32],
-            "API must not sidefile-fill; prep uses plan RAM map"
-        );
+        assert_eq!(got.txid, want_txid, "known_txid applied to in-memory record");
         assert_eq!(outs.len(), 1);
         assert_eq!(dens.len(), 1);
         assert_eq!(outs[0].script, vec![0x51, 0x52]);
-        // Sidefile still has identity for head resolve / get_tx — just not this API.
-        assert_eq!(t.body_txid(fk).unwrap(), want_txid);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -802,7 +802,8 @@ mod tests {
         cfg.max_run_secs = Some(0); // exit after catch-up / tip mode
         cfg.smoke = false;
         // Bound runtime so a hang fails the test suite instead of blocking.
-        let result = tokio::time::timeout(Duration::from_secs(30), run_p2p(cfg)).await;
+        // max_run_secs=0 should exit immediately after catch-up; keep bound tight.
+        let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
         assert!(result.is_ok(), "run_p2p timed out");
         result.unwrap().expect("run_p2p ok with no peers");
         let _ = std::fs::remove_dir_all(&dir);
@@ -843,7 +844,7 @@ mod tests {
         cfg.electrum_listen = Some("127.0.0.1:0".parse().unwrap());
         // max_run_secs=0 exits after catch-up/tip (tip-follow loop uses 60s poll sleeps).
         cfg.max_run_secs = Some(0);
-        let result = tokio::time::timeout(Duration::from_secs(45), run_p2p(cfg)).await;
+        let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
         assert!(result.is_ok(), "run_p2p timed out");
         result.unwrap().expect("run_p2p with electrum");
         let _ = std::fs::remove_dir_all(&dir);
@@ -865,7 +866,8 @@ mod tests {
         // Blackhole / closed port: connect fails fast under FOLLOW_CONNECT_SECS.
         cfg.connect = vec!["127.0.0.1:1".parse().unwrap()];
         cfg.max_run_secs = Some(0);
-        let result = tokio::time::timeout(Duration::from_secs(60), run_p2p(cfg)).await;
+        // Dead connect should fail fast (FOLLOW_CONNECT_SECS); 20s bound for hang detection.
+        let result = tokio::time::timeout(Duration::from_secs(20), run_p2p(cfg)).await;
         assert!(result.is_ok(), "run_p2p timed out");
         // Incomplete IBD is ok (warn path); should not hang.
         let _ = result.unwrap();
@@ -937,7 +939,7 @@ mod tests {
         cfg.max_run_secs = Some(0);
         cfg.electrum_listen = Some("127.0.0.1:0".parse().unwrap());
         cfg.milestone_height = 50;
-        let result = tokio::time::timeout(Duration::from_secs(45), run_p2p(cfg)).await;
+        let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
         assert!(result.is_ok(), "run_p2p timed out");
         result.unwrap().expect("run_p2p peers+electrum");
         let _ = std::fs::remove_dir_all(&dir);
@@ -961,7 +963,7 @@ mod tests {
         cfg.use_seeds = false;
         cfg.connect = vec!["127.0.0.1:1".parse().unwrap()];
         cfg.max_run_secs = Some(0);
-        let result = tokio::time::timeout(Duration::from_secs(60), run_p2p(cfg)).await;
+        let result = tokio::time::timeout(Duration::from_secs(20), run_p2p(cfg)).await;
         assert!(result.is_ok(), "run_p2p timed out");
         let _ = result.unwrap(); // incomplete IBD ok
         let _ = std::fs::remove_dir_all(&dir);
@@ -998,7 +1000,7 @@ mod tests {
         cfg.connect.clear();
         cfg.max_run_secs = Some(0);
         cfg.milestone_height = 1; // log milestone branch
-        let result = tokio::time::timeout(Duration::from_secs(45), run_p2p(cfg)).await;
+        let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
         assert!(result.is_ok(), "run_p2p timed out");
         result.unwrap().expect("run_p2p seeds regtest");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1023,7 +1025,7 @@ mod tests {
         cfg.connect.clear();
         cfg.electrum_listen = Some(addr); // already bound → fail
         cfg.max_run_secs = Some(0);
-        let result = tokio::time::timeout(Duration::from_secs(45), run_p2p(cfg)).await;
+        let result = tokio::time::timeout(Duration::from_secs(15), run_p2p(cfg)).await;
         assert!(result.is_ok(), "run_p2p timed out");
         // Bind fail is non-fatal warn; run should still complete.
         result.unwrap().expect("run_p2p despite electrum fail");

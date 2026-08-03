@@ -77,7 +77,8 @@ fn main() {
             for fk in fks {
                 let rec = q.get_tx(fk).unwrap();
                 let _inputs = q.tx_input_run_class_a(fk, &rec).unwrap();
-                let _outs = q.tx_output_run_class_a(fk, &rec).unwrap();
+                // Public full load (tx_output_run_class_a is crate-private).
+                let _full = q.store().get_tx_full(fk).unwrap();
             }
         }
     });

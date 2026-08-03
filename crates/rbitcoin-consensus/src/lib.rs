@@ -778,13 +778,13 @@ mod coverage_tests {
         ENSURE_RES_HIT.store(8, Ordering::Relaxed);
         ENSURE_COLD_N.store(9, Ordering::Relaxed);
         assert_eq!(sample_ensure_mix_and_reset(), (8, 9));
-        // second sample zeros
-        let s2 = sample_and_reset();
-        assert_eq!(s2.0, 0);
-        assert_eq!(sample_class_a_ensure_and_reset(), (0, 0));
-        assert_eq!(sample_prep_residual_and_reset(), (0, 0, 0, 0, 0));
-        assert_eq!(sample_assemble_and_reset(), (0, 0, 0, 0));
-        assert_eq!(sample_ensure_mix_and_reset(), (0, 0));
+        // Drain again; do **not** require zeros — other parallel `#[test]`s may
+        // `note_*` into the same process-global atomics between samples.
+        let _ = sample_and_reset();
+        let _ = sample_class_a_ensure_and_reset();
+        let _ = sample_prep_residual_and_reset();
+        let _ = sample_assemble_and_reset();
+        let _ = sample_ensure_mix_and_reset();
     }
 
     #[test]

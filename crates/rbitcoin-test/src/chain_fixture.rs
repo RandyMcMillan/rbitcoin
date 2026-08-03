@@ -83,6 +83,31 @@ pub fn build_mature_regtest_with_spend(
     }
 }
 
+/// Fast empty pad via [`accept_and_connect_block`] (not per-height wire confirm).
+///
+/// Mines heights `from_h..=last` on top of `tip` / `tip_time`. Prefer this for
+/// coinbase-maturity padding instead of looping `confirm_wire_run`.
+///
+/// Returns `(new_tip_hash, new_tip_time)`.
+pub fn pad_empty_from(
+    query: &Query,
+    params: &ChainParams,
+    mut tip: BlockHash,
+    mut tip_time: u32,
+    from_h: u32,
+    last: u32,
+) -> (BlockHash, u32) {
+    assert!(from_h <= last);
+    let ms = Milestone::NONE;
+    for h in from_h..=last {
+        let b = mine_regtest_block(tip, tip_time + 600, h, vec![]);
+        accept_and_connect_block(query, params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+    (tip, tip_time)
+}
+
 /// Assert reconstructed wire matches `original` at `height`.
 pub fn assert_reconstruct_eq(query: &Query, height: u32, original: &Block) {
     use bitcoin::consensus::Encodable;

@@ -9,10 +9,12 @@ if ! command -v cargo >/dev/null; then
   exit 1
 fi
 
-echo "== default multi-node tests =="
+echo "== multi-node (default + ignored IBD topology) =="
 cargo test -p rbitcoin-test --test integration_multinode -- --nocapture
-
-echo "== ignored / periodic mesh =="
 cargo test -p rbitcoin-test --test integration_multinode -- --ignored --nocapture
+
+echo "== IBD smoke (default error paths + ignored full IBD) =="
+cargo test -p rbitcoin-net --test ibd_smoke -- --nocapture
+cargo test -p rbitcoin-net --test ibd_smoke -- --ignored --nocapture
 
 echo "integration suite OK"

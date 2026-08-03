@@ -32,12 +32,25 @@ do not re-home those into examples.
 nix-shell
 # Warnings are errors (workspace.lints + RUSTFLAGS=-Dwarnings in shell.nix)
 cargo build --workspace --all-targets
+# Default suite: unit + scenarios + **fast** multi-node only (no --ignored)
 cargo test --workspace
 ./scripts/coverage.sh
 # Guard: no libbitcoinconsensus in the dependency graph
 cargo tree -i bitcoinconsensus 2>&1 | grep -q 'package ID specification' || \
   (echo "FAIL: bitcoinconsensus still in dependency tree" && cargo tree -i bitcoinconsensus && exit 1)
 ```
+
+**Default vs heavy tiers**
+
+| Tier | Command | Contents |
+|------|---------|----------|
+| **Default** (CI / every edit) | `cargo test --workspace` | Crate unit tests + scenarios + electrum + consensus_rules + non-IBD multinode reorg + short IBD error-path smokes. **No full multi-node IBD** (see hang note). |
+| **Heavy multi-node / IBD** | `./scripts/integration.sh` or `-- --ignored` on `integration_multinode` / `ibd_smoke` | All P2P IBD (2-node, multi-hop, tip-follow, 12-block smoke, mesh, `run_p2p`) |
+| **Ignored benches** | `cargo test -p rbitcoin-net --test freeze_benches -- --ignored` etc. | Optional perf / contention probes |
+
+Target: default suite wall **well under a few minutes** (stretch &lt;2 min on a warm tree).
+
+**Hang note:** full IBD paths (`P2PNode::sync` → confirm plan claim) can stall for many minutes under parallel `cargo test --workspace` load on this host (planq full, claim ~5 s loops). They stay `#[ignore]` until that is fixed; still covered by `scripts/integration.sh` / `--ignored`.
 
 ### Coverage notes
 
@@ -47,12 +60,14 @@ cargo tree -i bitcoinconsensus 2>&1 | grep -q 'package ID specification' || \
 
 ### Mature-chain fixtures
 
-Do **not** re-mine a 100-block maturity pad in every scenario. Use:
+Do **not** re-mine a 100-block maturity pad with per-height `confirm_wire_run`. Use:
 
 ```rust
-use rbitcoin_test::build_mature_regtest_with_spend;
+use rbitcoin_test::{build_mature_regtest_with_spend, pad_empty_from};
+// Full mature chain + one spend (accept path):
 let chain = build_mature_regtest_with_spend(&query, &params);
-// assert spend, reconstruct samples, etc. on the same chain
+// Or pad heights from_h..=last with accept_and_connect only:
+let (tip, tip_time) = pad_empty_from(&query, &params, tip, tip_time, 2, maturity);
 ```
 
 ## Scenario catalog
@@ -76,15 +91,15 @@ Prefer **one high-level scenario** per behavior cluster. Delete lower-level test
 | `wire_ring_and_archive_epoch` | Wire/epoch | Multi-tip ring + finalize soft zone |
 | `electrum_server_version_history_balance` | Electrum | Protocol fixture: version, history, balance, headers |
 | `electrum_more_methods_and_errors` | Electrum | ping/features/block headers/listunspent/tx get+merkle/fees + error paths |
-| `two_node_header_and_block_sync` | P2P | Seeder → peer |
-| `serve_after_restart_via_reconstruct` | P2P | Cold serve via reconstruct |
-| `three_node_relay_path` | P2P | Hop serve |
-| `ibd_skips_dead_peer` | P2P | IBD dial book skips dead address |
-| `ibd_two_peers` | P2P | Multi-peer windowed IBD download |
-| `tip_follow_after_ibd` | P2P | Tip announce follow |
-| `reorg_to_longer_branch` | P2P/chain | Most-work reorg |
-| `node_run_p2p_short` | Node | Long-running entry short run |
-| `multinode_mesh_periodic` | P2P (ignored) | Larger mesh; `scripts/integration.sh` |
+| `two_node_header_and_block_sync` | P2P (**ignored**) | Seeder → peer single-hop IBD |
+| `serve_after_restart_via_reconstruct` | P2P (**ignored**) | Cold serve via reconstruct |
+| `reorg_to_longer_branch` | P2P/chain (default) | Most-work reorg (hub only — no IBD hang risk) |
+| `three_node_relay_path` | P2P (**ignored**) | Hop serve — `scripts/integration.sh` |
+| `ibd_skips_dead_peer` | P2P (**ignored**) | Dial book skips dead address |
+| `ibd_two_peers` | P2P (**ignored**) | Dual-seeder 48-block IBD |
+| `tip_follow_after_ibd` / `tip_follow_getheaders_*` / `ibd_to_tip_tracking_*` | P2P (**ignored**) | Tip follow / relay |
+| `node_run_p2p_short` | Node (**ignored**) | Full `run_p2p` entry |
+| `multinode_mesh_periodic` | P2P (**ignored**) | Larger mesh |
 
 Removed (covered by the rows above): `confirm_cross_block_prevout_without_tx_head`,
 `double_archive_keeps_tx_height_for_coinbase_maturity`, `mega_batch_duplicate_header_is_idempotent`,
@@ -92,11 +107,13 @@ Removed (covered by the rows above): `confirm_cross_block_prevout_without_tx_hea
 
 ### Integration / multi-node
 
-Default CI runs `integration_multinode` without `--ignored`.
+Default CI runs only the **fast** `integration_multinode` cases (no `--ignored`).
+Heavy topology is `#[ignore]` and run periodically:
 
 ```bash
-./scripts/integration.sh
-# or: cargo test -p rbitcoin-test --test integration_multinode -- --ignored --nocapture
+./scripts/integration.sh   # default multinode + --ignored
+# or only heavy:
+cargo test -p rbitcoin-test --test integration_multinode -- --ignored --nocapture
 ```
 
 New features: add a high-level scenario; remove obsolete lower-level tests in the same PR.

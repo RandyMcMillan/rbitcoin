@@ -6,7 +6,7 @@ pub mod chain_fixture;
 pub mod mine;
 
 pub use chain_fixture::{
-    assert_reconstruct_eq, build_mature_regtest_with_spend, MatureRegtestChain,
+    assert_reconstruct_eq, build_mature_regtest_with_spend, pad_empty_from, MatureRegtestChain,
 };
 
 use std::path::{Path, PathBuf};

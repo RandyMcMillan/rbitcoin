@@ -345,51 +345,45 @@ mod tests {
         std::env::temp_dir().join(format!("rbitcoin-cli-{n}"))
     }
 
-    #[test]
-    fn help_and_version_exit_success() {
+    /// `ExitCode` is not `PartialEq`; compare via `Debug` (stable, sufficient for tests).
+    fn assert_exit(got: ExitCode, want: ExitCode) {
         assert_eq!(
-            cli_main(["rbitcoin-node", "--help"]),
-            ExitCode::SUCCESS
-        );
-        assert_eq!(
-            cli_main(["rbitcoin-node", "-V"]),
-            ExitCode::SUCCESS
+            format!("{got:?}"),
+            format!("{want:?}"),
+            "exit code mismatch"
         );
     }
 
     #[test]
+    fn help_and_version_exit_success() {
+        assert_exit(cli_main(["rbitcoin-node", "--help"]), ExitCode::SUCCESS);
+        assert_exit(cli_main(["rbitcoin-node", "-V"]), ExitCode::SUCCESS);
+    }
+
+    #[test]
     fn unknown_and_missing_value_errors() {
-        assert_eq!(
-            cli_main(["rbitcoin-node", "--nope"]),
-            ExitCode::from(2)
-        );
-        assert_eq!(
-            cli_main(["rbitcoin-node", "--network"]),
-            ExitCode::from(2)
-        );
-        assert_eq!(
+        assert_exit(cli_main(["rbitcoin-node", "--nope"]), ExitCode::from(2));
+        assert_exit(cli_main(["rbitcoin-node", "--network"]), ExitCode::from(2));
+        assert_exit(
             cli_main(["rbitcoin-node", "--network", "bogus"]),
-            ExitCode::from(2)
+            ExitCode::from(2),
         );
-        assert_eq!(
-            cli_main(["rbitcoin-node", "--datadir"]),
-            ExitCode::from(2)
-        );
-        assert_eq!(
+        assert_exit(cli_main(["rbitcoin-node", "--datadir"]), ExitCode::from(2));
+        assert_exit(
             cli_main(["rbitcoin-node", "--listen", "not-an-addr"]),
-            ExitCode::from(2)
+            ExitCode::from(2),
         );
-        assert_eq!(
+        assert_exit(
             cli_main(["rbitcoin-node", "--log-level", "wat"]),
-            ExitCode::from(2)
+            ExitCode::from(2),
         );
-        assert_eq!(
+        assert_exit(
             cli_main(["rbitcoin-node", "--max-outbound", "0"]),
-            ExitCode::from(2)
+            ExitCode::from(2),
         );
-        assert_eq!(
+        assert_exit(
             cli_main(["rbitcoin-node", "--mempool-size-mb", "0"]),
-            ExitCode::from(2)
+            ExitCode::from(2),
         );
     }
 
@@ -413,7 +407,7 @@ mod tests {
             "--mempool-size-mb",
             "10",
         ]);
-        assert_eq!(code, ExitCode::SUCCESS);
+        assert_exit(code, ExitCode::SUCCESS);
         assert!(dir.join("store").is_dir());
         let _ = std::fs::remove_dir_all(&dir);
     }

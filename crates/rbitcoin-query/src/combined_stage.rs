@@ -12,20 +12,27 @@ use rbitcoin_store::{
     decode_packed_tx_outs_with_spender_rels_secret, decode_packed_tx_with_spender_rels_secret,
     IdxBodyJob, IdxBodyMode, Store, StoreError, StoreSecret,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
 use std::sync::Arc;
 
-/// Test/prod counter of body pread jobs that completed `ok` through the pipeline.
-static BODY_OK_READS: AtomicU64 = AtomicU64::new(0);
-
-/// Reset body-read counter (tests).
-pub fn reset_body_ok_reads() {
-    BODY_OK_READS.store(0, Ordering::Relaxed);
+// Per-thread body-ok pread counter (thread-local so parallel tests do not race).
+thread_local! {
+    static BODY_OK_READS: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Snapshot body-read counter.
+/// Reset body-read counter for **this thread** (tests).
+pub fn reset_body_ok_reads() {
+    BODY_OK_READS.with(|c| c.set(0));
+}
+
+/// Snapshot body-read counter for **this thread**.
 pub fn body_ok_reads() -> u64 {
-    BODY_OK_READS.load(Ordering::Relaxed)
+    BODY_OK_READS.with(|c| c.get())
+}
+
+#[inline]
+fn note_body_ok_read() {
+    BODY_OK_READS.with(|c| c.set(c.get().saturating_add(1)));
 }
 
 /// One create loaded for the combined path.
@@ -95,7 +102,7 @@ pub fn load_creates_once_seed(
         let Some(range) = job.range else {
             continue;
         };
-        BODY_OK_READS.fetch_add(1, Ordering::Relaxed);
+        note_body_ok_read();
         let mut decoded_full = None;
         let mut decoded_outs = None;
         match mode {
@@ -214,7 +221,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(creates.len(), fks.len());
-        // body_ok_reads is process-global (parallel tests race); require progress only.
         assert!(body_ok_reads() >= 1, "combined path must body-fetch");
         // Full mode seeds complete residency rows for pipeline creates.
         for fk in &fks {

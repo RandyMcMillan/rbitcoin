@@ -1507,7 +1507,18 @@ fn resolve_prevout(
 
     // Batch pin first (no TxRecord clone — A3), then CreateResidency only on miss (A2).
     // Wire prev_txid is authoritative — reject wrong create_fk hits.
+    // N1: classify warm-path miss so cold_n is explainable on `ibd: perf`.
+    #[derive(Clone, Copy)]
+    enum ColdWhy {
+        NullFk,
+        NotPin,
+        TxidMismatch,
+        VoutMiss,
+    }
+    let mut cold_why = ColdWhy::NullFk;
+
     if let Some(prev_fk) = prev_fk_hint {
+        cold_why = ColdWhy::NotPin;
         if let Some((value, script, parent_txid)) =
             batch_parents.get_parent_txout_parts(prev_fk, op.vout)
         {
@@ -1543,6 +1554,11 @@ fn resolve_prevout(
                     create_height,
                 });
             }
+            // Batch row present for this vout but wrong create txid (fk collision).
+            cold_why = ColdWhy::TxidMismatch;
+        } else if batch_parents.contains(prev_fk) {
+            // Parent create pinned, but needed vout not in sparse outs.
+            cold_why = ColdWhy::VoutMiss;
         } else if let Some((prev_rec, out)) =
             query.create_residency().get_parent_out(prev_fk, op.vout)
         {
@@ -1574,7 +1590,9 @@ fn resolve_prevout(
                     create_height,
                 });
             }
+            cold_why = ColdWhy::TxidMismatch;
         }
+        // else: NotPin (fk known, neither batch nor residency covers this out)
     }
 
     // Cold path: create-fk candidates (thin → durable head / store).
@@ -1631,6 +1649,21 @@ fn resolve_prevout(
             &confirm_phase_stats::ASM_PREV_COLD_N,
             t0,
         );
+        match cold_why {
+            ColdWhy::NullFk => {
+                confirm_phase_stats::ASM_PREV_COLD_NULL_FK_N.fetch_add(1, Ordering::Relaxed);
+            }
+            ColdWhy::NotPin => {
+                confirm_phase_stats::ASM_PREV_COLD_NOT_PIN_N.fetch_add(1, Ordering::Relaxed);
+            }
+            ColdWhy::TxidMismatch => {
+                confirm_phase_stats::ASM_PREV_COLD_TXID_MISMATCH_N
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ColdWhy::VoutMiss => {
+                confirm_phase_stats::ASM_PREV_COLD_VOUT_MISS_N.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         return Ok(ResolvedPrevout {
             txout: TxOut {
                 value: Amount::from_sat(out.value as u64),
@@ -2563,6 +2596,235 @@ mod structure_rule_tests {
         .expect("not coinbase");
         assert_bad_block(err3, "coinbase");
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// N1: cold-path reason counters for pin→assemble leakage classes.
+    ///
+    /// Drives [`super::resolve_prevout`] (same crate) so each miss class is
+    /// forced without re-implementing path logic in the test.
+    #[test]
+    fn n1_assemble_cold_why_reasons() {
+        use super::resolve_prevout;
+        use crate::accept_and_connect_block;
+        use crate::confirm_phase_stats;
+        use rbitcoin_primitives::Fk;
+        use rbitcoin_query::{BatchParents, Query};
+        use rbitcoin_store::OutputRecord;
+        use std::collections::HashMap;
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("RBITCOIN_HEAD_SCALE").is_none() {
+                std::env::set_var("RBITCOIN_HEAD_SCALE", "tiny");
+            }
+        });
+        // Residency must be off so not_pin / null_fk exercise Class A cold, not RES hits.
+        let _res_env = rbitcoin_query::TEST_RESIDENCY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_res = std::env::var("RBITCOIN_RESIDENCY_BYTES").ok();
+        std::env::set_var("RBITCOIN_RESIDENCY_BYTES", "0");
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-n1-cold-why-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let q = Query::open_or_create(&path).unwrap();
+        assert!(
+            !q.create_residency().enabled(),
+            "test requires residency off"
+        );
+        let params = ChainParams::regtest();
+        let ms = Milestone::NONE;
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+        let mut tip = genesis.block_hash();
+        let mut tip_time = genesis.header.time;
+        let mut last_cb = genesis.txdata[0].compute_txid();
+        let mut last_cb_fk = Fk::NULL;
+        for h in 1u32..=3 {
+            let bits = CompactTarget::from_consensus(0x207f_ffff);
+            let mut block = Block {
+                header: Header {
+                    version: Version::ONE,
+                    prev_blockhash: tip,
+                    merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+                    time: tip_time + 600,
+                    bits,
+                    nonce: 0,
+                },
+                txdata: vec![coinbase(h)],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            let target = bitcoin::Target::from_compact(bits);
+            for nonce in 0..u32::MAX {
+                block.header.nonce = nonce;
+                if block.header.validate_pow(target).is_ok() {
+                    break;
+                }
+            }
+            last_cb = block.txdata[0].compute_txid();
+            accept_and_connect_block(&q, &params, Height(h), &block, ms).unwrap();
+            last_cb_fk = q
+                .tx_fk_by_txid(last_cb.as_byte_array())
+                .unwrap()
+                .expect("cb fk");
+            tip = block.block_hash();
+            tip_time = block.header.time;
+        }
+        let parent_txid = last_cb.to_byte_array();
+        let op = OutPoint {
+            txid: last_cb,
+            vout: 0,
+        };
+        let empty_block = block_with(vec![coinbase(4)]);
+        let same_block: HashMap<[u8; 32], usize> = HashMap::new();
+        let mut cb_cache: HashMap<Fk, Option<u32>> = HashMap::new();
+
+        // Drain shared counters (parallel tests may have dirtied them).
+        let _ = confirm_phase_stats::sample_assemble_prevout_detail_and_reset();
+        let _ = confirm_phase_stats::sample_assemble_cold_why_and_reset();
+
+        // ── null_fk: no hint; head still finds parent → cold ──────────
+        {
+            let parents = BatchParents::new();
+            resolve_prevout(
+                &q,
+                &empty_block,
+                op,
+                None,
+                &same_block,
+                &mut cb_cache,
+                &parents,
+                4,
+                false,
+            )
+            .expect("null_fk cold");
+            let why = confirm_phase_stats::sample_assemble_cold_why_and_reset();
+            let det = confirm_phase_stats::sample_assemble_prevout_detail_and_reset();
+            assert_eq!(why, (1, 0, 0, 0), "null_fk why={why:?}");
+            assert_eq!(det.8, 1, "cold_n={}", det.8); // cold_n
+        }
+
+        // ── not_pin: correct fk, empty BatchParents ───────────────────
+        {
+            let parents = BatchParents::new();
+            resolve_prevout(
+                &q,
+                &empty_block,
+                op,
+                Some(last_cb_fk),
+                &same_block,
+                &mut cb_cache,
+                &parents,
+                4,
+                false,
+            )
+            .expect("not_pin cold");
+            let why = confirm_phase_stats::sample_assemble_cold_why_and_reset();
+            let det = confirm_phase_stats::sample_assemble_prevout_detail_and_reset();
+            assert_eq!(why, (0, 1, 0, 0), "not_pin why={why:?}");
+            assert_eq!(det.8, 1, "cold_n");
+        }
+
+        // ── batch hit: no cold ────────────────────────────────────────
+        {
+            let mut parents = BatchParents::new();
+            let rec = q.get_tx_class_a(last_cb_fk).expect("class a");
+            let out = OutputRecord::unspent(50_0000_0000, vec![0x51]);
+            parents.put_resolved(
+                last_cb_fk,
+                rec,
+                &[(0, out)],
+                &[0],
+                Some(true),
+            );
+            // Ensure pin txid matches wire.
+            assert_eq!(
+                parents.get_parent_txout_parts(last_cb_fk, 0).unwrap().2,
+                parent_txid
+            );
+            resolve_prevout(
+                &q,
+                &empty_block,
+                op,
+                Some(last_cb_fk),
+                &same_block,
+                &mut cb_cache,
+                &parents,
+                4,
+                false,
+            )
+            .expect("batch hit");
+            let why = confirm_phase_stats::sample_assemble_cold_why_and_reset();
+            let det = confirm_phase_stats::sample_assemble_prevout_detail_and_reset();
+            assert_eq!(why, (0, 0, 0, 0), "batch hit must not cold why={why:?}");
+            assert_eq!(det.2, 1, "batch_n"); // batch_n
+            assert_eq!(det.8, 0, "cold_n");
+        }
+
+        // ── txid_mismatch: batch has vout under wrong parent txid ─────
+        {
+            let mut parents = BatchParents::new();
+            let mut rec = q.get_tx_class_a(last_cb_fk).expect("class a");
+            rec.txid = [0xee; 32]; // wrong identity
+            let out = OutputRecord::unspent(50_0000_0000, vec![0x51]);
+            parents.put_resolved(last_cb_fk, rec, &[(0, out)], &[0], Some(true));
+            resolve_prevout(
+                &q,
+                &empty_block,
+                op,
+                Some(last_cb_fk),
+                &same_block,
+                &mut cb_cache,
+                &parents,
+                4,
+                false,
+            )
+            .expect("mismatch cold");
+            let why = confirm_phase_stats::sample_assemble_cold_why_and_reset();
+            let det = confirm_phase_stats::sample_assemble_prevout_detail_and_reset();
+            assert_eq!(why, (0, 0, 1, 0), "mismatch why={why:?}");
+            assert_eq!(det.8, 1, "cold_n");
+        }
+
+        // ── vout_miss: parent in batch, needed vout not sparse-pinned ─
+        {
+            let mut parents = BatchParents::new();
+            let rec = q.get_tx_class_a(last_cb_fk).expect("class a");
+            // Pin only vout 1 (does not exist on spend of vout 0).
+            let out = OutputRecord::unspent(1, vec![0x51]);
+            parents.put_resolved(last_cb_fk, rec, &[(1, out)], &[1], Some(true));
+            assert!(parents.contains(last_cb_fk));
+            assert!(parents.get_parent_txout_parts(last_cb_fk, 0).is_none());
+            resolve_prevout(
+                &q,
+                &empty_block,
+                op,
+                Some(last_cb_fk),
+                &same_block,
+                &mut cb_cache,
+                &parents,
+                4,
+                false,
+            )
+            .expect("vout_miss cold");
+            let why = confirm_phase_stats::sample_assemble_cold_why_and_reset();
+            let det = confirm_phase_stats::sample_assemble_prevout_detail_and_reset();
+            assert_eq!(why, (0, 0, 0, 1), "vout_miss why={why:?}");
+            assert_eq!(det.8, 1, "cold_n");
+        }
+
+        let _ = std::fs::remove_dir_all(&path);
+        match prev_res {
+            Some(v) => std::env::set_var("RBITCOIN_RESIDENCY_BYTES", v),
+            None => std::env::remove_var("RBITCOIN_RESIDENCY_BYTES"),
+        }
+        drop(_res_env);
     }
 
     #[test]

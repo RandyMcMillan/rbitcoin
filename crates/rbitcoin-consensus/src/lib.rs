@@ -175,6 +175,15 @@ pub mod confirm_phase_stats {
     pub static ASM_PREV_COLD_N: AtomicU64 = AtomicU64::new(0);
     /// Time in `tx_fk_by_txid` / durable head lookup on cold prevout path.
     pub static ASM_PREV_FK_NS: AtomicU64 = AtomicU64::new(0);
+    // ── N1: why assemble took cold Class A after pin ─────────────────
+    /// Cold success with **no** `prev_fk_hint` (thin + pending + head miss at assemble).
+    pub static ASM_PREV_COLD_NULL_FK_N: AtomicU64 = AtomicU64::new(0);
+    /// Cold success: had fk, batch+residency miss (pin did not cover parent/vout).
+    pub static ASM_PREV_COLD_NOT_PIN_N: AtomicU64 = AtomicU64::new(0);
+    /// Cold success: batch/residency had a row but **parent txid ≠ wire prev_txid**.
+    pub static ASM_PREV_COLD_TXID_MISMATCH_N: AtomicU64 = AtomicU64::new(0);
+    /// Cold success: parent create is in BatchParents but **needed vout** missing.
+    pub static ASM_PREV_COLD_VOUT_MISS_N: AtomicU64 = AtomicU64::new(0);
     /// Post–Class C durable spend annotation batch.
     ///
     /// Historical name `UTXO_APPLY_NS` / log field `spend=` ms — this is **not** a
@@ -349,6 +358,20 @@ pub mod confirm_phase_stats {
             ASM_PREV_COLD_NS.swap(0, Ordering::Relaxed),
             ASM_PREV_COLD_N.swap(0, Ordering::Relaxed),
             ASM_PREV_FK_NS.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    /// N1 cold-reason counts: `(null_fk, not_pin, txid_mismatch, vout_miss)`.
+    ///
+    /// Sum should equal [`ASM_PREV_COLD_N`] for the same window (successful cold
+    /// resolves only — failures do not increment).
+    #[inline]
+    pub fn sample_assemble_cold_why_and_reset() -> (u64, u64, u64, u64) {
+        (
+            ASM_PREV_COLD_NULL_FK_N.swap(0, Ordering::Relaxed),
+            ASM_PREV_COLD_NOT_PIN_N.swap(0, Ordering::Relaxed),
+            ASM_PREV_COLD_TXID_MISMATCH_N.swap(0, Ordering::Relaxed),
+            ASM_PREV_COLD_VOUT_MISS_N.swap(0, Ordering::Relaxed),
         )
     }
 
@@ -824,6 +847,12 @@ mod coverage_tests {
             sample_assemble_prevout_detail_and_reset(),
             (100, 1000, 80, 200, 10, 50, 5, 300, 5, 40)
         );
+        let _ = sample_assemble_cold_why_and_reset();
+        ASM_PREV_COLD_NULL_FK_N.store(1, Ordering::Relaxed);
+        ASM_PREV_COLD_NOT_PIN_N.store(2, Ordering::Relaxed);
+        ASM_PREV_COLD_TXID_MISMATCH_N.store(3, Ordering::Relaxed);
+        ASM_PREV_COLD_VOUT_MISS_N.store(4, Ordering::Relaxed);
+        assert_eq!(sample_assemble_cold_why_and_reset(), (1, 2, 3, 4));
         ENSURE_RES_HIT.store(8, Ordering::Relaxed);
         ENSURE_COLD_N.store(9, Ordering::Relaxed);
         assert_eq!(sample_ensure_mix_and_reset(), (8, 9));
@@ -834,6 +863,7 @@ mod coverage_tests {
         let _ = sample_prep_residual_and_reset();
         let _ = sample_assemble_and_reset();
         let _ = sample_assemble_prevout_detail_and_reset();
+        let _ = sample_assemble_cold_why_and_reset();
         let _ = sample_ensure_mix_and_reset();
     }
 

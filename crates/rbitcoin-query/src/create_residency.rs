@@ -49,16 +49,16 @@ use rbitcoin_store::{OutputRecord, TxRecord};
 use std::collections::{HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
-#[cfg(test)]
-use std::sync::Mutex;
 
 /// Default residency heap budget for complete create pins (2 GiB).
 pub const DEFAULT_RESIDENCY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Serialize `RBITCOIN_RESIDENCY_BYTES` mutations in tests (parallel `cargo test`).
-#[cfg(test)]
+///
+/// Public so dependent crates' tests (e.g. consensus N1 cold-why) can share the
+/// same env lock without racing residency-on defaults.
 pub static TEST_RESIDENCY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Fixed overhead per resident row (map entry + Arc header + txid + range + fudge).

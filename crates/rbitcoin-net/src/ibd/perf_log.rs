@@ -103,6 +103,11 @@ pub(crate) struct IbdPerfSample {
     /// Prevout path: cold Class A ms / count.
     pub asm_prev_cold_ms: u64,
     pub asm_prev_cold_n: u64,
+    /// N1: cold success reasons (sum ≈ asm_prev_cold_n).
+    pub asm_cold_null_fk_n: u64,
+    pub asm_cold_not_pin_n: u64,
+    pub asm_cold_txid_mismatch_n: u64,
+    pub asm_cold_vout_miss_n: u64,
     /// Prevout path: durable txid→fk lookup ms.
     pub asm_prev_fk_ms: u64,
     pub strong_ms: u64,
@@ -392,6 +397,10 @@ impl Default for IbdPerfSample {
             asm_prev_same_n: 0,
             asm_prev_cold_ms: 0,
             asm_prev_cold_n: 0,
+            asm_cold_null_fk_n: 0,
+            asm_cold_not_pin_n: 0,
+            asm_cold_txid_mismatch_n: 0,
+            asm_cold_vout_miss_n: 0,
             asm_prev_fk_ms: 0,
             strong_ms: 0,
             sh_ms: 0,
@@ -753,6 +762,12 @@ pub(crate) fn sample(
         asm_prev_cold_n,
         asm_prev_fk_ns,
     ) = rbitcoin_consensus::confirm_phase_stats::sample_assemble_prevout_detail_and_reset();
+    let (
+        asm_cold_null_fk_n,
+        asm_cold_not_pin_n,
+        asm_cold_txid_mismatch_n,
+        asm_cold_vout_miss_n,
+    ) = rbitcoin_consensus::confirm_phase_stats::sample_assemble_cold_why_and_reset();
     let (prep_wire_arc_ns, prep_struct_ns, prep_header_ns, prep_prepare_ns, prep_filter_plan_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_prep_residual_and_reset();
     let (sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head) =
@@ -823,6 +838,10 @@ pub(crate) fn sample(
         asm_prev_same_n,
         asm_prev_cold_ms: ns_ms(asm_prev_cold_ns),
         asm_prev_cold_n,
+        asm_cold_null_fk_n,
+        asm_cold_not_pin_n,
+        asm_cold_txid_mismatch_n,
+        asm_cold_vout_miss_n,
         asm_prev_fk_ms: ns_ms(asm_prev_fk_ns),
         strong_ms: ns_ms(strong_ns),
         sh_ms: ns_ms(sh_ns),
@@ -1239,7 +1258,8 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     out.push_str(&format!(
         " | prep blks={} total={}ms pre_asm={}ms(wire_arc={}ms struct={}ms header={}ms prepare={}ms \
          filter_plan={}ms plan_mega={}ms pin={}ms) \
-         assemble={}ms(prevout={} us/in={} batch={}/n={} res={}/n={} same={}/n={} cold={}/n={} fk={}ms \
+         assemble={}ms(prevout={} us/in={} batch={}/n={} res={}/n={} same={}/n={} cold={}/n={} \
+         cold_why(null_fk={} not_pin={} mismatch={} vout_miss={}) fk={}ms \
          sigop={} final={} job={}) \
          pin(plan={}ms/n={} res={}ms/n={} cold_range={}ms/n={} cold_idx={}ms/n={} cold_io={}ms cold_dec={}ms us/new={}) \
          pin_hit%={} denserels_hit%={} pin_plan={} pin_res={} pin_new={} body_io={} parent_io={}",
@@ -1264,6 +1284,10 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.asm_prev_same_n,
         s.asm_prev_cold_ms,
         s.asm_prev_cold_n,
+        s.asm_cold_null_fk_n,
+        s.asm_cold_not_pin_n,
+        s.asm_cold_txid_mismatch_n,
+        s.asm_cold_vout_miss_n,
         s.asm_prev_fk_ms,
         s.asm_sigop_ms,
         s.asm_final_ms,
@@ -1962,7 +1986,18 @@ mod tests {
         assert!(line.contains("res=200/n=5000"), "{line}");
         assert!(line.contains("same=50/n=2000"), "{line}");
         assert!(line.contains("cold=250/n=3000"), "{line}");
+        assert!(line.contains("cold_why(null_fk="), "{line}");
         assert!(line.contains("fk=10ms"), "{line}");
+        // N1 reason breakdown when set.
+        s.asm_cold_null_fk_n = 10;
+        s.asm_cold_not_pin_n = 2900;
+        s.asm_cold_txid_mismatch_n = 50;
+        s.asm_cold_vout_miss_n = 40;
+        let line = format_info(&s);
+        assert!(
+            line.contains("cold_why(null_fk=10 not_pin=2900 mismatch=50 vout_miss=40)"),
+            "{line}"
+        );
         // I2: us/new = (1200+400)*1000/6000 = 266
         assert!(line.contains("cold_range=1200ms/n=4000"), "{line}");
         assert!(line.contains("cold_idx=400ms/n=2000"), "{line}");

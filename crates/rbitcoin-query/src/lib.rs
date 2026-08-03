@@ -19,7 +19,9 @@ mod wave_prevout;
 pub use combined_stage::{
     body_ok_reads, load_creates_once, load_creates_once_seed, reset_body_ok_reads, CombinedCreate,
 };
-pub use create_residency::{estimate_pin_bytes, CreateResidency, DEFAULT_RESIDENCY_BYTES};
+pub use create_residency::{
+    estimate_pin_bytes, CreateResidency, DEFAULT_RESIDENCY_BYTES, TEST_RESIDENCY_ENV_LOCK,
+};
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};

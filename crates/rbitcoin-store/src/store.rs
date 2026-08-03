@@ -818,7 +818,21 @@ impl Store {
         Ok(cleared)
     }
 
-    /// Full durable flush: `msync(MS_SYNC)` + `fdatasync` every table.
+    /// Flush compact Class C L2 images (confirmed / strong_tx / header_txs).
+    ///
+    /// Complete-or-fail body write for each dirty table, then `sync_data` unless
+    /// deferred. Call **before** body-queue dequeue so a kill mid-commit can
+    /// re-drive from BQ when L2 was not yet durable.
+    pub fn flush_class_c_tip(&self) -> Result<(), StoreError> {
+        self.confirmed.flush()?;
+        self.strong_tx.flush()?;
+        self.header_txs.flush()?;
+        // tx_height stays L0 (write-through); still fsync its HWM/payload.
+        self.tx_height.flush()?;
+        Ok(())
+    }
+
+    /// Full durable flush: HWM + `sync_data` every table.
     ///
     /// **Host-hostile on multi‑GiB Class A** — use [`Self::flush_for_shutdown`] for
     /// process exit during IBD.
@@ -827,10 +841,7 @@ impl Store {
         self.txs.flush()?;
         self.spenders.flush()?;
         self.scripthash.flush()?;
-        self.confirmed.flush()?;
-        self.strong_tx.flush()?;
-        self.tx_height.flush()?;
-        self.header_txs.flush()?;
+        self.flush_class_c_tip()?;
         Ok(())
     }
 
@@ -851,10 +862,7 @@ impl Store {
         let t0 = std::time::Instant::now();
         rbitcoin_log::info!("store: shutdown flush — fsync tip tables…");
         self.headers.flush()?;
-        self.confirmed.flush()?;
-        self.strong_tx.flush()?;
-        self.tx_height.flush()?;
-        self.header_txs.flush()?;
+        self.flush_class_c_tip()?;
         rbitcoin_log::info!(
             "store: shutdown flush — async Class A… elapsed={:?}",
             t0.elapsed()

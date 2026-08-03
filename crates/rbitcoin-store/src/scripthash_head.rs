@@ -132,7 +132,7 @@ impl ScriptHashHead {
 
     /// Zero all slots and reset occupied (cold rematerialize after partial load).
     ///
-    /// Chunked `write_at` so both MapFull and FdOnly payload views match
+    /// Chunked `write_at` so FdOnly payload views match
     /// `occupied = 0` (not punch-hole alone).
     pub fn reinit_empty(&self) -> Result<(), StoreError> {
         let slots = {

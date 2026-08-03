@@ -248,6 +248,10 @@ impl Query {
         // Tip is the commit point (after strong + SH both finished).
         let t_tip = std::time::Instant::now();
         self.store.confirmed.set_many(&confirmed_pairs)?;
+        // L2 write-behind barrier: complete-or-fail Class C image to disk **before**
+        // callers dequeue the body queue. Kill after this returns → tip durable;
+        // kill before → BQ still holds blocks for re-drive.
+        self.store.flush_class_c_tip()?;
         // Tip-mode durable SH: height watermark only after tip commit.
         // Direct runs: durability is SEAL on cataloged spills (memtable may lag).
         if !self.sh_run.is_enabled() {
@@ -453,6 +457,8 @@ impl Query {
         }
         // Class A header_txs list remains with the header; only tip Class C moves.
         self.store.confirmed.disconnect_tip(height)?;
+        // Durable disconnect: flush L2 Class C before returning (same barrier as connect).
+        self.store.flush_class_c_tip()?;
         // SH watermark tracks confirmed tip (re-confirm will re-enqueue this height).
         self.set_sh_indexed_through_height(self.tip_height().map(|h| h.0));
         Ok(())

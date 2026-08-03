@@ -9,14 +9,24 @@ Best-chain views ignore uncommitted Class C state:
 | Write order (confirm **write** thread) | Role |
 |-------------------------------------------|------|
 | 0. Structural spentness / maturity / subsidy | No durable tip write yet |
-| 1. `strong_tx` + `tx_height` | May lead tip after kill |
+| 1. `strong_tx` + `tx_height` (L2 RAM / L0 file) | May lead tip after kill **before** barrier |
 | 2. Thin scripthash **creates** (batched) | May lead tip after kill |
-| 3. `confirmed[]` tip advance | **Commit** |
-| 4. Spend annotations (Direct) | After tip; spentness filters use strong+height |
+| 3. `confirmed[]` tip advance (L2 RAM) | In-process commit |
+| 3b. **`flush_class_c_tip`** (complete-or-fail L2 images + `tx_height` sync) | **Durability barrier** |
+| 4. Body-queue dequeue for those heights | Only after confirm-write returns Ok |
+| 5. Spend annotations (Direct) | After tip; spentness filters use strong+height |
 
 `is_confirmed_strong(tx)` ⇔ strong ∧ `tx_height ≤ tip`. Queries that mean “on best chain” use this (or equivalent).
 
 On open, `repair_class_c_above_tip` clears strong/height **above** tip (tip-relative, not a full rebuild).
+
+### L2 write-behind + body queue (phase 6)
+
+- Compact Class C (`confirmed`, `header_txs_*`, `strong_tx`) mutate **RAM only** during the commit batch.
+- Disk is updated as one complete body image per dirty table on `flush_class_c_tip` (not mid-batch per-slot write-through).
+- **Kill mid-commit (before barrier):** BQ still holds block payloads → re-drive rebuilds Class C; disk L2 image stays last good flush.
+- **Kill after barrier + before dequeue:** tip durable; BQ entry may still exist (harmless re-confirm / dequeue).
+- Prefer **loss of uncommitted tip** over a **torn multi-slot Class C image**.
 
 ## Class A (archive)
 
@@ -47,7 +57,9 @@ On open, `repair_class_c_above_tip` clears strong/height **above** tip (tip-rela
 
 ## Flush
 
-Clean shutdown flushes mmap tables. Kill may lose the last unflushed pages (same as other tables).
+Clean shutdown: `flush_for_shutdown` fsyncs tip/Class C (incl. L2 dirty images) then async Class A.
+Steady path: payload pwrite + HWM publish; `sync_data` unless `defer_durable_flush`.
+Kill mid-payload before HWM publish: readers never see past previous published length.
 
 ## Operator
 

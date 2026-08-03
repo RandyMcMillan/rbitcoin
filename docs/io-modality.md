@@ -1,10 +1,10 @@
 # Store IO modality matrix
 
-**Source of truth** for what `RBITCOIN_IO=uring` does vs what is still
-`mmap`’d, host bench protocol, and the phased plan to remove `memmap2`.
+**Source of truth** for bulk `RBITCOIN_IO` vs table transport (fd + tiered RAM).
+**Phase 6 complete:** workspace has **zero `memmap2` / `MmapMut`** for store tables.
 
 Related: [`OPERATOR.md`](../OPERATOR.md) (env knobs), [`concurrency.md`](./concurrency.md),
-[`ibd-io-audit.md`](./ibd-io-audit.md), [`architecture.md`](./architecture.md).
+[`crash-recovery.md`](./crash-recovery.md), [`architecture.md`](./architecture.md).
 
 ---
 
@@ -13,11 +13,22 @@ Related: [`OPERATOR.md`](../OPERATOR.md) (env knobs), [`concurrency.md`](./concu
 | Layer | Controlled by | Values | Purpose |
 |-------|---------------|--------|---------|
 | **Bulk batch** | `RBITCOIN_IO` (+ path overrides) | `uring` \| `pread` (annotate: `pwrite`) | Multi-op waves on **file descriptors** (body denserels, head-resolve body prefix, spend meta/ann, Class C bulk) |
-| **Table transport** | [`TableAccess`](../crates/rbitcoin-store/src/file.rs) on each `TableFile` | `FdOnly` \| `MapFull` | Whether payload is pread/pwrite vs full-file `MmapMut` map epochs |
+| **Table transport** | [`TableFile`](../crates/rbitcoin-store/src/file.rs) | **FdOnly always** | All payload via pread/pwrite; fallocate grow; no process maps |
 
-**`RBITCOIN_IO=uring` does not unmap heads or idx.** It only selects the bulk
-batch backend. Legacy token `RBITCOIN_IO=mmap` demotes to **pread** with a
-one-time warning (not a live bulk mode).
+**`RBITCOIN_IO=uring` only selects the bulk batch backend.** Legacy token
+`RBITCOIN_IO=mmap` demotes to **pread** with a one-time warning.
+
+---
+
+## RAM tiers (L0 / L1 / L2)
+
+| Tier | Where hot bytes live | Sync |
+|------|----------------------|------|
+| **L0** | Kernel page cache via pread/pwrite; process holds staging only | Payload then HWM publish; `sync_data` on flush barriers |
+| **L1** | 4 KiB head pages / 3–4 KiB SH chunks (working-set caches) | Write-back dirty page/chunk with one pwrite |
+| **L2** | Compact Class C (`confirmed`, `header_txs_*`, `strong_tx`) full `Vec` in process | **Write-behind:** RAM mutate during commit; complete-or-fail body image on `flush_class_c_tip` **before** body-queue dequeue |
+
+**Never L2:** `tx.body`, full `tx.head`/`tx.idx`, default `tx_height` (~700 MiB). Cap: `RBITCOIN_CLASS_C_INRAM_MAX_MB` (default 256).
 
 ---
 
@@ -36,19 +47,20 @@ one-time warning (not a live bulk mode).
 
 Default: uring if the ring opens, else pread/pwrite. Ring depth **128**.
 
-### Table transport (`TableAccess`)
+### Table transport (all fd)
 
-| Object | Access today | Notes |
-|--------|--------------|--------|
-| **`tx.body`** | **FdOnly** | Tiny header-only map; payload pread/pwrite/uring; grow without multi‑GiB remap (`3a0c220`) |
-| **`tx.idx` segments** | **FdOnly** | Append pwrite; **reads pread**; grow fallocate only (phase 1) |
-| **`tx.head` segments** | **FdOnly** (default) | Page-coalesced insert (4 KiB probe page RMW). Opt-out: `RBITCOIN_TX_HEAD_ACCESS=map` |
-| Header hash head | **FdOnly** | Sharded `HashHead`; 128-slot (~3 KiB) chunk cache insert + probe |
-| Hash multi-list (`.mlt`) | **FdOnly** | Linear append (`ArrayLink` kind forced FdOnly at site) |
-| **`scripthash.head` / body** | **FdOnly** | 4 KiB chunk cache (128×32 B) insert + probe; body pread/pwrite slabs |
-| **Spenders** | **FdOnly** | Linear append multi-spender list |
-| Class C arrays | **FdOnly** | header_txs, Confirmed, heights, … |
-| Mempool (`{datadir}/mempool/*`) | **InRam + file sidecar** | Private durability; **not** Class A `store/tx.body` (phase 5b M2) |
+| Object | Tier | Notes |
+|--------|------|--------|
+| **`tx.body`** | L0 | pread/pwrite/uring; fallocate grow |
+| **`tx.idx` segments** | L0 | Append pwrite; reads pread |
+| **`tx.head` segments** | L0+L1 | 4 KiB page-coalesced RMW (`RBITCOIN_TX_HEAD_ACCESS=map` ignored) |
+| Header hash head | L0+L1 | 128-slot (~3 KiB) chunk cache |
+| Hash multi-list (`.mlt`) | L0 | Linear append |
+| **`scripthash.head` / body** | L0+L1 | 4 KiB chunk cache; body slabs |
+| **Spenders** | L0 | Linear append |
+| `confirmed` / `header_txs_*` / `strong_tx` | **L2** | InRam write-behind; barrier = `Store::flush_class_c_tip` |
+| `tx_height` | L0 | Stays fd (too large for default L2) |
+| Mempool (`{datadir}/mempool/*`) | L2 sidecar | Private; **not** Class A |
 
 ### Hybrid paths (easy to misread)
 
@@ -225,7 +237,9 @@ Live node rollback: set **`RBITCOIN_TX_HEAD_ACCESS=map`** before open/create
 - Tip script skip for live mempool txs unchanged (`script_preverified_txids`).
 - No `memmap2` in the mempool crate.
 
-### Phase 6 — (pending)
+### Phase 6 — map-free + Class C L2 (landed)
 
-Remove residual `memmap2` from store `TableFile` (tiny header maps / MapFull
-rollback path); workspace greps empty.
+- `TableFile`: no `memmap2` / map epochs; always pread/pwrite + fallocate.
+- `MapFull` / `RBITCOIN_TX_HEAD_ACCESS=map` removed (env ignored with warn).
+- Compact Class C L2 write-behind; `flush_class_c_tip` before BQ dequeue.
+- Workspace `memmap2` dependency removed.

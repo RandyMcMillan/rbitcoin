@@ -134,19 +134,18 @@ budgets: [`docs/ibd-memory.md`](./ibd-memory.md).
    peer TCP accept of already-requested blocks (see ibd-memory).
 5. **Bulk IO vs table transport.** `RBITCOIN_IO=uring|pread` selects **bulk
    batch** backends for body denserels, head-resolve body prefix, spend paths
-   (thread-local ring depth 128). **Table files** use [`TableAccess`](./io-modality.md):
-   Store tables are **FdOnly** (page-/chunk-coalesced pread/pwrite); head resolve
-   **page-batches multi-key probes**. Mempool remains MapFull until phase 5 InRam.
+   (thread-local ring depth 128). **Table files** are always **fd** (page-/chunk-
+   coalesced pread/pwrite); compact Class C is **L2 write-behind**; mempool is
+   private InRam+sidecar. Head resolve **page-batches multi-key probes**.
    Historical host A/B: naive uring head insert ~5× slower than page RMW —
    production uses coalesced pages, not per-slot uring. Fuse8 builds in process
    RAM on seal. See [`docs/io-modality.md`](./io-modality.md).
 
-### Map / capacity growth
+### Capacity growth / durability
 
-**FdOnly** store tables: fallocate only, no multi‑GiB remap. Mempool durability
-is **InRam + private sidecars** under `{datadir}/mempool/` (not Class A).
-Residual MapFull paths in `TableFile` exist only until `memmap2` removal.
-Long-held “pause the world” map mutexes on the IBD/read path are design bugs.
+Store tables: fallocate only (no maps). Class C tip flush
+(`flush_class_c_tip`) completes before body-queue dequeue. Mempool durability is
+**InRam + private sidecars** under `{datadir}/mempool/` (not Class A).
 
 ---
 

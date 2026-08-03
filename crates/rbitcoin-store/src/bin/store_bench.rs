@@ -1,24 +1,17 @@
-//! Host microbench: address-head insert_many MapFull vs FdOnly.
+//! Host microbench: address-head insert_many (FdOnly page-coalesced).
 //!
 //! **Operator only** (local disk). Not valid on agent 9p workspace.
 //!
-//! Build (musl static preferred for operator boxes):
+//! Build:
 //! ```text
-//! nix build .#rbitcoin-musl --out-link result
-//! # if bin is packaged: result/bin/rbitcoin-store-bench
-//! # interim:
 //! cargo build -p rbitcoin-store --release --bin rbitcoin-store-bench
 //! ```
 //!
 //! Run:
 //! ```text
 //! ./target/release/rbitcoin-store-bench --n 200000 --bits 16
-//! ./target/release/rbitcoin-store-bench --n 200000 --bits 16 --access map
 //! ./target/release/rbitcoin-store-bench --n 200000 --bits 16 --access fd
 //! ```
-//!
-//! Compares page-coalesced insert_many + probe round-trip. Prints ns/key and
-//! wall ms. Record numbers in `docs/io-modality.md` phase 2.
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{AddressHead, HeadLayout, TableAccess};
@@ -28,15 +21,15 @@ use std::time::Instant;
 
 fn usage() {
     eprintln!(
-        "usage: rbitcoin-store-bench [--n KEYS] [--bits BITS] [--access map|fd|both] [--dir DIR]\n\
-         defaults: n=100000 bits=16 access=both dir=$TMPDIR/rbitcoin-store-bench-$$"
+        "usage: rbitcoin-store-bench [--n KEYS] [--bits BITS] [--access fd] [--dir DIR]\n\
+         defaults: n=100000 bits=16 access=fd dir=$TMPDIR/rbitcoin-store-bench-$$"
     );
 }
 
 fn parse_args() -> (usize, u32, String, PathBuf) {
     let mut n = 100_000usize;
     let mut bits = 16u32;
-    let mut access = "both".to_string();
+    let mut access = "fd".to_string();
     let mut dir = env::temp_dir().join(format!(
         "rbitcoin-store-bench-{}",
         std::process::id()
@@ -61,7 +54,7 @@ fn parse_args() -> (usize, u32, String, PathBuf) {
                     .expect("--bits needs integer");
             }
             "--access" => {
-                access = args.next().expect("--access needs map|fd|both");
+                access = args.next().expect("--access needs fd");
             }
             "--dir" => {
                 dir = PathBuf::from(args.next().expect("--dir needs path"));
@@ -79,20 +72,19 @@ fn parse_args() -> (usize, u32, String, PathBuf) {
 fn mixed_key(i: u64) -> [u8; 32] {
     let mut k = [0u8; 32];
     k[0..8].copy_from_slice(&i.to_le_bytes());
-    // scatter bits so pages are not all sequential
     k[8] = (i.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as u8;
     k[16..24].copy_from_slice(&(i.wrapping_mul(0xc2b2_ae3d_27d4_eb4f)).to_le_bytes());
     k
 }
 
-fn run_mode(access: TableAccess, n: usize, bits: u32, base: &std::path::Path) -> Result<(), String> {
+fn run_mode(n: usize, bits: u32, base: &std::path::Path) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(base);
     std::fs::create_dir_all(base).map_err(|e| e.to_string())?;
     let path = base.join("head");
     let layout = HeadLayout::with_entry_bytes(bits, 4).map_err(|e| format!("{e}"))?;
-    let head = AddressHead::create_with_table_access(&path, layout, access)
+    let head = AddressHead::create_with_table_access(&path, layout, TableAccess::FdOnly)
         .map_err(|e| format!("create: {e}"))?;
-    assert_eq!(head.table_access(), access);
+    assert_eq!(head.table_access(), TableAccess::FdOnly);
 
     let mut batch: Vec<([u8; 32], Fk)> = Vec::with_capacity(n);
     for i in 0..n as u64 {
@@ -119,7 +111,7 @@ fn run_mode(access: TableAccess, n: usize, bits: u32, base: &std::path::Path) ->
     let probe_ns = t1.elapsed().as_nanos() / n.max(1) as u128;
 
     println!(
-        "access={access:?} bits={bits} n={n} occupied={} insert_ms={insert_ms:.2} insert_ns/key={insert_ns} \
+        "access=FdOnly bits={bits} n={n} occupied={} insert_ms={insert_ms:.2} insert_ns/key={insert_ns} \
          probe_ms={probe_ms:.2} probe_ns/key={probe_ns} hits={hits}/{n}",
         head.occupied()
     );
@@ -140,23 +132,21 @@ fn main() {
         eprintln!("bits should be 12..=28 for a useful microbench (got {bits})");
     }
 
-    let modes: Vec<TableAccess> = match access.to_ascii_lowercase().as_str() {
-        "map" | "mmap" | "mapfull" => vec![TableAccess::MapFull],
-        "fd" | "fdonly" | "pread" => vec![TableAccess::FdOnly],
-        "both" | "ab" | "a/b" => vec![TableAccess::MapFull, TableAccess::FdOnly],
+    match access.to_ascii_lowercase().as_str() {
+        "fd" | "fdonly" | "pread" | "both" | "ab" | "a/b" => {}
+        "map" | "mmap" | "mapfull" => {
+            eprintln!("MapFull removed (phase 6); running FdOnly only");
+        }
         other => {
             eprintln!("unknown --access {other}");
             usage();
             std::process::exit(2);
         }
-    };
-
-    for mode in modes {
-        let sub = dir.join(format!("{mode:?}"));
-        if let Err(e) = run_mode(mode, n, bits, &sub) {
-            eprintln!("FAIL access={mode:?}: {e}");
-            std::process::exit(1);
-        }
     }
-    println!("ok");
+
+    let sub = dir.join("FdOnly");
+    if let Err(e) = run_mode(n, bits, &sub) {
+        eprintln!("FAIL access=FdOnly: {e}");
+        std::process::exit(1);
+    }
 }

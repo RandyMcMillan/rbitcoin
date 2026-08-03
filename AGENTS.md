@@ -3,15 +3,16 @@
 ## Store concurrency: lock-free by default
 
 **Default: no locks on the store hot path.** Concurrency is **roles + publish
-order + map epochs**, not `Mutex` around mmap.
+order + HWM**, not map mutexes (maps removed — phase 6).
 
 | Rule | Detail |
 |------|--------|
 | Roles | At most **one Class A appender** and **one spend annotator** per process; **N readers** of published ranges always free |
 | Publish | body → idx → count/HWM (Release); then head / `header_txs` as visibility requires |
-| Capacity grow | fallocate + map a **new epoch** on the same file; swap pointer; old epoch lives until pins drop (readers never pause) |
+| Capacity grow | fallocate/`set_len` only (no map epochs); readers use published HWM |
 | Layout grow (`tx.head`) | **segment roll**: seal open head (fuse8) + create new fixed 25-bit head — no mono-file bits-widen |
-| Not OK | Long-held map mutexes, “pause all queries during confirm”, multi appenders, dual-write to head shadow on every insert |
+| Class C tip | L2 write-behind; `flush_class_c_tip` **before** body-queue dequeue |
+| Not OK | Long-held store locks on IBD/read path, “pause all queries during confirm”, multi appenders |
 
 If a change introduces a new long-held store lock on the IBD/read path, it is the
 wrong design — fix the protocol. See `docs/concurrency.md`.
@@ -84,25 +85,18 @@ to), still do the static musl install and say the tree was **not** committed.
 
 The workspace is mounted into the agent VM as **9p** (`workspace` on `/home/agent/workspace`, `trans=virtio`). On this mount:
 
-- **Writable shared `mmap` (`MAP_SHARED` + `PROT_WRITE`) fails with `EINVAL`** for tables that still use [`TableAccess::MapFull`](docs/io-modality.md) (mempool; store tables are **FdOnly**).
-- `pread`/`pwrite` work; store tables default FdOnly (payload not multi‑GiB-mapped).
-- Prefer `/tmp` fixtures for agent correctness. Mempool MapFull may still fail open on 9p.
+- Store/mempool tables are **map-free** (pread/pwrite only) — open should work without `MAP_SHARED`.
+- Prefer `/tmp` fixtures for agent correctness tests (synthetic stores).
+- **Do not use the user’s live test datadirs** (e.g. `datadir-signet/`, `datadir-mainnet/`) for full node runs in the agent VM without need — multi‑GiB live datadirs are operator-side.
 
-**Do not use the user’s live test datadirs in this VM** (e.g. `datadir-signet/`, `datadir-mainnet/`) to open the store, run the node against those paths, or diagnose tip stalls by loading Class A/C tables here. That includes ~27 GiB signet store under `datadir-signet/store/`.
-
-**Perf A/B for demap work** is **operator-host only**, with the musl static binary — never agent-VM timings. See [`docs/io-modality.md`](docs/io-modality.md).
+**Perf A/B** is **operator-host only**, with the musl static binary — never agent-VM timings. See [`docs/io-modality.md`](docs/io-modality.md).
 
 ### What works instead
 
 - Read **logs** the user leaves in-tree (`signet-ibd.log`, etc.).
-- Inspect store files with **non-mmap** tools (`pread`/Python struct parsing of HWMs, headers) when useful for offline forensics only — not as a substitute for a full node open.
-- Reproduce with **synthetic fixtures** and `rbitcoin-test` scenarios under `/tmp` or other non-9p paths where mmap (for remaining MapFull tables) works.
+- Inspect store files with **pread**/Python struct parsing of HWMs, headers when useful for offline forensics.
+- Reproduce with **synthetic fixtures** and `rbitcoin-test` scenarios under `/tmp`.
 - Ask the user to run the node / confirm diagnostics / **host musl benches** on their host (normal local FS).
-
-### Related symptoms already seen
-
-- Tip stall / confirm diagnostics against `./datadir-signet` failed at open with mmap EINVAL.
-- User-side IBD still advances; agent-side cannot drive or fully open that store.
 
 ## No dead code warnings silenced unless there is an absolutely bulletproof justification.
 

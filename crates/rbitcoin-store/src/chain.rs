@@ -342,10 +342,15 @@ impl TxHeightTable {
 ///
 /// ~64× smaller than u64-per-tx; call sites only need `is_strong`. Header fk is
 /// not stored (derived from confirmed range when needed).
+///
+/// Compact images use L2 write-behind (same cap as [`crate::array_table::class_c_inram_max_bytes`]).
 pub struct StrongTxTable {
     bits: crate::file::TableFile,
     /// Number of bits allocated (covers tx fks 1..=n_bits).
     n_bits: std::sync::atomic::AtomicU64,
+    /// L2 byte image (`None` = pure L0).
+    data: std::sync::RwLock<Option<Vec<u8>>>,
+    dirty: std::sync::atomic::AtomicBool,
 }
 
 impl StrongTxTable {
@@ -353,6 +358,8 @@ impl StrongTxTable {
         Ok(Self {
             bits: crate::file::TableFile::create(dir.join("strong_tx.body"), TableKind::StrongTx)?,
             n_bits: std::sync::atomic::AtomicU64::new(0),
+            data: std::sync::RwLock::new(Some(Vec::new())),
+            dirty: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -361,9 +368,21 @@ impl StrongTxTable {
         let body = bits
             .logical_len()
             .saturating_sub(crate::file::FILE_HEADER_LEN as u64);
+        let n_bits = body.saturating_mul(8);
+        let data = if body <= crate::array_table::class_c_inram_max_bytes() {
+            let mut v = vec![0u8; body as usize];
+            if body > 0 {
+                bits.read_at(crate::file::FILE_HEADER_LEN as u64, &mut v)?;
+            }
+            Some(v)
+        } else {
+            None
+        };
         Ok(Self {
             bits,
-            n_bits: std::sync::atomic::AtomicU64::new(body.saturating_mul(8)),
+            n_bits: std::sync::atomic::AtomicU64::new(n_bits),
+            data: std::sync::RwLock::new(data),
+            dirty: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -379,6 +398,16 @@ impl StrongTxTable {
         }
         let need_bytes = (need_bits + 7) / 8;
         let cur_bytes = (n + 7) / 8;
+        let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref mut v) = *guard {
+            if need_bytes as usize > v.len() {
+                v.resize(need_bytes as usize, 0);
+            }
+            self.n_bits.store(need_bits, Ordering::Release);
+            self.dirty.store(true, Ordering::Release);
+            return Ok(());
+        }
+        drop(guard);
         if need_bytes > cur_bytes {
             let zeros = vec![0u8; (need_bytes - cur_bytes) as usize];
             self.bits.write_at(
@@ -396,13 +425,32 @@ impl StrongTxTable {
         if bit >= n {
             return Ok(false);
         }
+        let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref v) = *guard {
+            let bi = (bit / 8) as usize;
+            return Ok((v[bi] >> (bit % 8)) & 1 != 0);
+        }
+        drop(guard);
         let mut b = [0u8; 1];
         self.bits.read_at(Self::byte_off(bit), &mut b)?;
         Ok((b[0] >> (bit % 8)) & 1 != 0)
     }
 
     fn set_bit(&self, bit: u64, on: bool) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
         self.ensure_bits(bit + 1)?;
+        let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref mut v) = *guard {
+            let bi = (bit / 8) as usize;
+            if on {
+                v[bi] |= 1 << (bit % 8);
+            } else {
+                v[bi] &= !(1 << (bit % 8));
+            }
+            self.dirty.store(true, Ordering::Release);
+            return Ok(());
+        }
+        drop(guard);
         let mut b = [0u8; 1];
         self.bits.read_at(Self::byte_off(bit), &mut b)?;
         if on {
@@ -450,19 +498,35 @@ impl StrongTxTable {
         self.set_bits_range(start, end, true)
     }
 
-    /// Set bits in half-open `[start, end)` (bit indices). Bulk-writes full bytes.
+    /// Set bits in half-open `[start, end)` (bit indices).
     fn set_bits_range(&self, start: u64, end: u64, on: bool) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
         if end <= start {
             return Ok(());
         }
         self.ensure_bits(end)?;
+        let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref mut v) = *guard {
+            let mut bit = start;
+            while bit < end {
+                let bi = (bit / 8) as usize;
+                if on {
+                    v[bi] |= 1 << (bit % 8);
+                } else {
+                    v[bi] &= !(1 << (bit % 8));
+                }
+                bit += 1;
+            }
+            self.dirty.store(true, Ordering::Release);
+            return Ok(());
+        }
+        drop(guard);
+        // L0 bulk path (same as before).
         let mut bit = start;
-        // Partial first byte.
         if bit % 8 != 0 {
             let byte_end = (bit + 8) & !7;
             let stop = end.min(byte_end);
             while bit < stop {
-                // ensure_bits already done; inline RMW without re-ensure.
                 let mut b = [0u8; 1];
                 self.bits.read_at(Self::byte_off(bit), &mut b)?;
                 if on {
@@ -474,10 +538,9 @@ impl StrongTxTable {
                 bit += 1;
             }
         }
-        // Full middle bytes.
         if bit + 8 <= end {
             let full_start = bit / 8;
-            let full_end = end / 8; // exclusive byte index
+            let full_end = end / 8;
             if full_end > full_start {
                 let n = (full_end - full_start) as usize;
                 let fill = if on { 0xffu8 } else { 0u8 };
@@ -489,7 +552,6 @@ impl StrongTxTable {
                 bit = full_end * 8;
             }
         }
-        // Partial last byte.
         while bit < end {
             let mut b = [0u8; 1];
             self.bits.read_at(Self::byte_off(bit), &mut b)?;
@@ -534,14 +596,35 @@ impl StrongTxTable {
         self.get_bit(id - 1)
     }
 
-
-
+    /// Complete-or-fail write of dirty L2 bit image.
+    pub fn flush_dirty(&self) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
+        let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
+        let Some(ref v) = *guard else {
+            return Ok(());
+        };
+        if !self.dirty.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let body = v.clone();
+        drop(guard);
+        if !body.is_empty() {
+            self.bits
+                .write_at(crate::file::FILE_HEADER_LEN as u64, &body)?;
+        }
+        let logical = crate::file::FILE_HEADER_LEN as u64 + body.len() as u64;
+        self.bits.set_logical_len(logical)?;
+        self.dirty.store(false, Ordering::Release);
+        Ok(())
+    }
 
     pub fn flush(&self) -> Result<(), StoreError> {
+        self.flush_dirty()?;
         self.bits.flush()
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {
+        self.flush_dirty()?;
         self.bits.flush_async()
     }
 }
@@ -582,6 +665,40 @@ mod strong_tests {
         let t = StrongTxTable::open(&dir).unwrap();
         assert!(t.is_strong(Fk(1)).unwrap());
         assert!(!t.is_strong(Fk(5)).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strong_write_behind_no_flush_keeps_old() {
+        let dir = tmp();
+        {
+            let t = StrongTxTable::create(&dir).unwrap();
+            t.set_strong_range(Fk(1), 8, Fk(1)).unwrap();
+            t.flush().unwrap();
+            t.set_strong(Fk(9), Fk(1)).unwrap();
+            // Drop without flush.
+        }
+        let t = StrongTxTable::open(&dir).unwrap();
+        assert!(t.is_strong(Fk(1)).unwrap());
+        assert!(!t.is_strong(Fk(9)).unwrap(), "unflushed strong must not survive");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strong_write_behind_flush_reopen() {
+        let dir = tmp();
+        {
+            let t = StrongTxTable::create(&dir).unwrap();
+            t.set_strong_range(Fk(1), 16, Fk(1)).unwrap();
+            t.flush().unwrap();
+            t.set_unstrong_range(Fk(5), 4).unwrap();
+            t.flush().unwrap();
+        }
+        let t = StrongTxTable::open(&dir).unwrap();
+        assert!(t.is_strong(Fk(1)).unwrap());
+        assert!(!t.is_strong(Fk(5)).unwrap());
+        assert!(!t.is_strong(Fk(8)).unwrap());
+        assert!(t.is_strong(Fk(9)).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

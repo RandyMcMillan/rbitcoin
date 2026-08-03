@@ -4,12 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Relational archive store (libbitcoin-class tables; bulk IO + TableAccess)"
+description = "Relational archive store (libbitcoin-class tables; fd-only bulk IO)"
 
 [dependencies]
 rbitcoin-primitives = { workspace = true }
 rbitcoin-log = { workspace = true }
-memmap2 = { workspace = true }
 # rust-bitcoin ecosystem (hashes only — not full bitcoin types in this crate)
 bitcoin_hashes = { workspace = true }
 # fallocate / punch-hole for multi‑GiB grows without zero-fill storms (Linux).

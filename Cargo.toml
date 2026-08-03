@@ -44,7 +44,6 @@ rbitcoin-test = { path = "crates/rbitcoin-test" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # mmap — no viable std alternative for the store layout.
-memmap2 = "0.9"
 # Sealed segment membership (binary fuse8 ≈9 bits/key, no FN).
 xorf = { version = "0.11", features = ["serde"] }
 bincode = "1.3"

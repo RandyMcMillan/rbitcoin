@@ -184,7 +184,7 @@ impl MultiList {
 
     fn create(head_path: &Path) -> Result<Self, StoreError> {
         let path = Self::path_for(head_path);
-        // ArrayLink kind is shared with Class C (MapFull default); multi-list is
+        // ArrayLink kind is shared with Class C; multi-list is
         // linear append like idx — always FdOnly.
         let file =
             TableFile::create_with_access(path, TableKind::ArrayLink, TableAccess::FdOnly)?;

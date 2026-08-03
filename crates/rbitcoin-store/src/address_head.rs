@@ -44,24 +44,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Table transport for address-head files (`tx.head` segments).
 ///
-/// - default / unset / `fd` / `fdonly` / `pread` → [`TableAccess::FdOnly`]
-///   (page-coalesced pread → mutate → one page pwrite)
-/// - `map` / `mmap` / `mapfull` → [`TableAccess::MapFull`] (rollback opt-out)
-///
-/// Env: **`RBITCOIN_TX_HEAD_ACCESS`**.
+/// Always [`TableAccess::FdOnly`] (phase 6 — maps removed). Env
+/// `RBITCOIN_TX_HEAD_ACCESS=map|mmap` is ignored with a one-time warn.
 pub fn head_table_access_from_env() -> TableAccess {
-    match std::env::var("RBITCOIN_TX_HEAD_ACCESS") {
-        Ok(s) => {
-            let t = s.trim().to_ascii_lowercase();
-            if t == "map" || t == "mmap" || t == "mapfull" {
-                TableAccess::MapFull
-            } else {
-                // Unset-style tokens and any other value stay FdOnly (production).
-                TableAccess::FdOnly
-            }
+    if let Ok(s) = std::env::var("RBITCOIN_TX_HEAD_ACCESS") {
+        let t = s.trim().to_ascii_lowercase();
+        if t == "map" || t == "mmap" || t == "mapfull" {
+            rbitcoin_log::warn!(
+                "store: RBITCOIN_TX_HEAD_ACCESS={t} ignored — MapFull removed (phase 6); using FdOnly"
+            );
         }
-        Err(_) => TableAccess::FdOnly,
     }
+    TableAccess::FdOnly
 }
 
 
@@ -582,17 +576,16 @@ impl AddressHead {
     ) -> Result<Self, StoreError> {
         // Trailing footer: slots at offset 0 so each 4 KiB probe page is OS-aligned.
         // Layout (bits/entry/generation) lives in the footer extension — no sidecar.
-        // Access: FdOnly default; `RBITCOIN_TX_HEAD_ACCESS=map` for MapFull rollback.
         Self::create_with_table_access(path, layout, head_table_access_from_env())
     }
 
-    /// Create with explicit table access (production uses env via [`Self::create`]).
+    /// Create with explicit table access (always FdOnly after phase 6).
     pub fn create_with_table_access(
         path: impl Into<PathBuf>,
         layout: HeadLayout,
         access: crate::file::TableAccess,
     ) -> Result<Self, StoreError> {
-        use crate::file::TableAccess;
+        let _ = access;
         let path = path.into();
         if path.is_dir() {
             return Err(StoreError::Corrupt(
@@ -600,17 +593,7 @@ impl AddressHead {
             ));
         }
         let slots = layout.slots();
-        // Prefer default trailing APIs when access matches for_kind (production
-        // path); override only for MapFull rollback A/B.
-        let mut file = if access == TableAccess::for_kind(TableKind::HashHead, true) {
-            TableFile::create_trailing_header(&path, TableKind::HashHead)?
-        } else {
-            TableFile::create_trailing_header_with_access(
-                &path,
-                TableKind::HashHead,
-                access,
-            )?
-        };
+        let mut file = TableFile::create_trailing_header(&path, TableKind::HashHead)?;
         let body_bytes = layout.body_bytes();
         let need = body_bytes + TRAILING_FOOTER_LEN as u64;
         file.ensure_capacity(need)?;
@@ -620,17 +603,14 @@ impl AddressHead {
         file.set_logical_len(need)?;
         file.zero_range(0, body_bytes)?;
         remove_legacy_meta_sidecar(&path);
-        if layout.bits >= 24 || access == TableAccess::FdOnly {
-            rbitcoin_log::info!(
-                "store: address-head create path={} bits={} slots={} entry={}B access={:?} (~{:.2} GiB sparse, footer layout)",
-                file.path().display(),
-                layout.bits,
-                slots,
-                layout.entry_bytes,
-                access,
-                body_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-            );
-        }
+        rbitcoin_log::info!(
+            "store: address-head create path={} bits={} slots={} entry={}B access=FdOnly (~{:.2} GiB sparse, footer layout)",
+            file.path().display(),
+            layout.bits,
+            slots,
+            layout.entry_bytes,
+            body_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
         Ok(Self {
             file,
             layout,
@@ -644,11 +624,12 @@ impl AddressHead {
         Self::open_with_table_access(path, head_table_access_from_env())
     }
 
-    /// Open with explicit table access (must match how the file was created for FdOnly).
+    /// Open with explicit table access (always FdOnly after phase 6).
     pub fn open_with_table_access(
         path: impl Into<PathBuf>,
         access: crate::file::TableAccess,
     ) -> Result<Self, StoreError> {
+        let _ = access;
         let path = path.into();
         if path.is_dir() {
             return Err(StoreError::Corrupt(
@@ -657,15 +638,8 @@ impl AddressHead {
         }
         // Layout is in the trailing footer (v5). Sidecar-only or older footers fail
         // here → TxTable recreates + rebuilds from Class A.
-        let (file, ext) = if access == TableAccess::for_kind(TableKind::HashHead, true) {
-            TableFile::open_trailing_header_from_end(&path, TableKind::HashHead)?
-        } else {
-            TableFile::open_trailing_header_from_end_with_access(
-                &path,
-                TableKind::HashHead,
-                access,
-            )?
-        };
+        let (file, ext) =
+            TableFile::open_trailing_header_from_end(&path, TableKind::HashHead)?;
         let (layout, generation) = decode_layout_ext(&ext)?;
         let expect_body = layout.body_bytes();
         let body = file.data_len();
@@ -681,18 +655,15 @@ impl AddressHead {
 
         let slots = layout.slots();
         let occupied = count_occupied(&file, slots, layout.entry_bytes)?;
-        if layout.bits >= 24 || access == TableAccess::FdOnly {
-            rbitcoin_log::info!(
-                "store: address-head open path={} bits={} slots={} entry={}B access={:?} gen={} occupied≈{}",
-                file.path().display(),
-                layout.bits,
-                slots,
-                layout.entry_bytes,
-                access,
-                generation,
-                occupied,
-            );
-        }
+        rbitcoin_log::info!(
+            "store: address-head open path={} bits={} slots={} entry={}B access=FdOnly gen={} occupied≈{}",
+            file.path().display(),
+            layout.bits,
+            slots,
+            layout.entry_bytes,
+            generation,
+            occupied,
+        );
         Ok(Self {
             file,
             layout,
@@ -722,7 +693,7 @@ impl AddressHead {
         self.occupied.load(Ordering::Relaxed)
     }
 
-    /// Table transport for this head file (MapFull vs FdOnly).
+    /// Table transport for this head file (always FdOnly after phase 6).
     pub fn table_access(&self) -> TableAccess {
         self.file.access()
     }

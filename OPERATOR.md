@@ -69,8 +69,8 @@ modality matrix and demap plan: [`docs/io-modality.md`](docs/io-modality.md).
 
 ## Bulk store IO backends
 
-**Bulk batch** only (`RBITCOIN_IO`). Table transport (mmap vs fd) is independent —
-store tables default **FdOnly** (see modality doc). Mempool still MapFull until phase 5 InRam.
+**Bulk batch** only (`RBITCOIN_IO`). Table transport is always **fd pread/pwrite**
+(phase 6 — no maps). Compact Class C is L2 write-behind; see `docs/io-modality.md`.
 
 Hierarchy: **path env** (if set) → **global `RBITCOIN_IO`** → default (**uring** if
 the ring is available, else **pread** / **pwrite** for annotate). If `uring` is
@@ -84,7 +84,8 @@ selected but setup fails, demote to **pread** / **pwrite**.
 | `RBITCOIN_SPEND_META` | uring \| pread | Structural 9 B spender-meta peeks |
 | `RBITCOIN_SPEND_ANN` | uring \| **pwrite** | Pure-write annotate store |
 | `RBITCOIN_CLASS_C_IO` | uring \| pread | Bulk create-height 4 B slots |
-| `RBITCOIN_TX_HEAD_ACCESS` | `fd` (default / unset) \| `map` | Address/segmented **tx.head** transport; `map` = MapFull rollback (see `docs/io-modality.md`) |
+| `RBITCOIN_CLASS_C_INRAM_MAX_MB` | integer MiB (default **256**) | Cap for L2 Class C load; over → pure fd L0 |
+| `RBITCOIN_TX_HEAD_ACCESS` | ignored if `map` | Always FdOnly after phase 6 (warn once if `map`) |
 
 - **uring** — io_uring bulk pread/pwrite (ring depth **128**).
 - **pread** / **pwrite** — libc positional IO; `RBITCOIN_BULK_IO_WORKERS` parallelizes pread only.
@@ -103,7 +104,7 @@ selected but setup fails, demote to **pread** / **pwrite**.
 | Archive queue RAM | **512 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
 | Confirm denserels **history** | **off (lean default)** | Small residency FIFO for **in-flight / just-committed** only (**256k creates / 1M outs**), skip denserels prewarm; cold pin trusts OS page cache. **Header plans always on** (multi-block MTP). `RBITCOIN_CONFIRM_CACHE=1` restores multi‑GiB history (8M/16M) + prewarm for experiments. Explicit `RBITCOIN_CREATE_RESIDENCY_CAP` / `_OUT_CAP` still override caps |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
-| Bulk store IO | **uring** (Linux) when available | See **Bulk store IO backends** above; ring depth **128**; `RBITCOIN_BULK_IO_WORKERS` for pread. Segmented `tx.head` default **FdOnly** page RMW; **`RBITCOIN_TX_HEAD_ACCESS=map`** for MapFull rollback + `rbitcoin-store-bench` (`docs/io-modality.md`) |
+| Bulk store IO | **uring** (Linux) when available | See **Bulk store IO backends** above; ring depth **128**; `RBITCOIN_BULK_IO_WORKERS` for pread. Segmented `tx.head` FdOnly page RMW; Class C L2 write-behind (`docs/io-modality.md`) |
 | Archive Class A append | **pwrite** (always) | `tx.body` / `tx.idx` mega-appends use `write_at_pwrite` only |
 | `tx.head` (segmented) | fixed geometry | Default **25-bit** heads (128 MiB) with **4 B relative** fks; roll at 80% load / body soft span; **binary fuse8** on seal. `RBITCOIN_TX_HEAD_BITS` for tests only. Legacy mono-head datadirs require reindex |
 | Confirm stages | **plan · prep · scripts · write** | Pipeline queues cap **5** each (`planq=n/5 …`; `RBITCOIN_CONFIRM_QUEUE`). Plan packs tip-contiguous waves by **decoding BQ one block at a time** until soft **Σ inputs** (`RBITCOIN_CONFIRM_BATCH_INPUTS`, default **8000**, include overshoot block) or hard **144** blocks |

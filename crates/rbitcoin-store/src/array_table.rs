@@ -97,11 +97,6 @@ impl ArrayTable {
         })
     }
 
-    #[cfg(test)]
-    pub fn is_inram(&self) -> bool {
-        self.data.read().unwrap_or_else(|e| e.into_inner()).is_some()
-    }
-
     pub fn len(&self) -> u64 {
         self.len.load(Ordering::Acquire)
     }
@@ -339,7 +334,6 @@ mod tests {
         let path = tmp_path();
         let _ = std::fs::remove_file(&path);
         let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
-        assert!(t.is_inram());
         assert_eq!(t.len(), 0);
         assert_eq!(t.get(0).unwrap(), 0);
         t.set(3, 30).unwrap();

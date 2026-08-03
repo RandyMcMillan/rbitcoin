@@ -98,6 +98,8 @@ impl UringSession {
         user_data: u64,
         rw_flags: i32,
     ) -> Result<(), StoreError> {
+        #[cfg(test)]
+        test_note_sqe_rw_flags(rw_flags);
         #[cfg(target_os = "linux")]
         {
             use io_uring::{opcode, types};
@@ -150,6 +152,8 @@ impl UringSession {
         user_data: u64,
         rw_flags: i32,
     ) -> Result<(), StoreError> {
+        #[cfg(test)]
+        test_note_sqe_rw_flags(rw_flags);
         #[cfg(target_os = "linux")]
         {
             use io_uring::{opcode, types};
@@ -255,6 +259,24 @@ impl Drop for UringSession {
     fn drop(&mut self) {
         self.drain_all();
     }
+}
+
+// Test hook: last SQE rw_flags values from push_*_flags.
+#[cfg(test)]
+thread_local! {
+    static LAST_SQE_RW_FLAGS: std::cell::RefCell<Vec<i32>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+#[cfg(test)]
+fn test_note_sqe_rw_flags(rw_flags: i32) {
+    LAST_SQE_RW_FLAGS.with(|c| c.borrow_mut().push(rw_flags));
+}
+
+/// Drain recorded SQE rw_flags (tests only).
+#[cfg(test)]
+pub fn test_take_last_sqe_rw_flags() -> Vec<i32> {
+    LAST_SQE_RW_FLAGS.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
 #[cfg(test)]

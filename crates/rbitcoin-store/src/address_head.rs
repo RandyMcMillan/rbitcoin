@@ -716,11 +716,12 @@ impl AddressHead {
 
     /// Load a full probe page starting at global `page_base` into `buf`.
     ///
-    /// **One** `read_at` of up to `n_slots × entry_bytes` (4 KiB @ 4 B / 1024 slots) —
-    /// not 1024 individual `load_u32` pins (that made resize fill CPU-bound at
-    /// ~O(page_slots) per insert). Caps to the slot data region (excludes trailing
-    /// footer). Acquire fence so concurrent probes observe prior sole-writer
-    /// Release stores after the bulk copy.
+    /// **One** bulk pread of up to `n_slots × entry_bytes` (4 KiB @ 4 B / 1024
+    /// slots). Caps to the slot data region (excludes trailing footer). Acquire
+    /// fence so concurrent probes observe prior sole-writer Release stores.
+    ///
+    /// `dontcache` sets [`crate::bulk_io::ReadOp::dontcache`] (schema 13+ head
+    /// segments older than open + past 3 sealed).
     ///
     /// Returns bytes filled (multiple of entry size). Callers must pass the
     /// corresponding slot count into [`hop_scan_page`] (`bytes / entry_bytes`).
@@ -729,6 +730,7 @@ impl AddressHead {
         page_base: u64,
         n_slots: u64,
         buf: &mut [u8],
+        dontcache: bool,
     ) -> Result<usize, StoreError> {
         let es = self.layout.entry_bytes as usize;
         if es != 4 && es != 8 {
@@ -748,7 +750,30 @@ impl AddressHead {
         if need == 0 {
             return Ok(0);
         }
-        self.file.read_at(off, &mut buf[..need])?;
+        // Production path: bulk_io so RWF_DONTCACHE can ride the SQE when set.
+        {
+            use crate::bulk_io::{self, ReadOp};
+            let fd = self.file.read_fd();
+            let slice = &mut buf[..need];
+            let mut ops = [ReadOp {
+                fd,
+                offset: off,
+                buf: slice,
+                result: i32::MIN,
+                dontcache,
+            }];
+            bulk_io::pread_batch(&mut ops);
+            if ops[0].result < 0 {
+                return Err(StoreError::io(
+                    self.file.path(),
+                    std::io::Error::from_raw_os_error(-ops[0].result),
+                ));
+            }
+            if (ops[0].result as usize) < need {
+                // Short read — fall back to TableFile complete pread.
+                self.file.read_at(off, &mut buf[..need])?;
+            }
+        }
         // Pair with sole-writer stores + SeqCst fence after insert_many.
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         Ok(need)
@@ -797,7 +822,8 @@ impl AddressHead {
                 j += 1;
             }
 
-            let n = self.load_page_slots(page_base, page_slots, &mut buf)?;
+            // Open-segment insert: never DONTCACHE (hot write path).
+            let n = self.load_page_slots(page_base, page_slots, &mut buf, false)?;
             if n < es_u {
                 note_probe_exhausted();
                 return Err(StoreError::Corrupt("address head probe page empty"));
@@ -845,11 +871,23 @@ impl AddressHead {
         Ok(out.pop().unwrap_or_default())
     }
 
-    /// Batch probe: group keys by probe page, **one page `read_at` per distinct page**,
+    /// Batch probe: group keys by probe page, **one page load per distinct page**,
     /// hop each key in RAM. Same results as N× [`Self::probe_fks`] (order preserved).
     ///
-    /// Archive head-resolve uses this so multi-key waves under FdOnly share page IO.
+    /// Standalone (non-segmented) head: tip window → no DONTCACHE. Segmented
+    /// callers use [`Self::probe_fks_batch_dontcache`].
     pub fn probe_fks_batch(&self, txids: &[[u8; 32]]) -> Result<Vec<Vec<Fk>>, StoreError> {
+        self.probe_fks_batch_dontcache(txids, false)
+    }
+
+    /// Like [`Self::probe_fks_batch`] with explicit DONTCACHE for this segment.
+    ///
+    /// Used by [`crate::segmented_head::SegmentedTxHead`] with sealed-age policy.
+    pub fn probe_fks_batch_dontcache(
+        &self,
+        txids: &[[u8; 32]],
+        dontcache: bool,
+    ) -> Result<Vec<Vec<Fk>>, StoreError> {
         let n_keys = txids.len();
         if n_keys == 0 {
             return Ok(Vec::new());
@@ -859,7 +897,6 @@ impl AddressHead {
         let page_slots = page_slot_count(bits);
         let es_u = es as usize;
 
-        // (page_base, orig_i) — stable within a page for deterministic order.
         let mut order: Vec<(u64, usize)> = txids
             .iter()
             .enumerate()
@@ -876,7 +913,7 @@ impl AddressHead {
             while j < order.len() && order[j].0 == page_base {
                 j += 1;
             }
-            let n = self.load_page_slots(page_base, page_slots, &mut buf)?;
+            let n = self.load_page_slots(page_base, page_slots, &mut buf, dontcache)?;
             if n >= es_u {
                 let nslots = (n / es_u) as u64;
                 for &(_, orig) in &order[i..j] {
@@ -1328,7 +1365,7 @@ mod tests {
         let page_base = 0u64;
         let mut bulk = [0u8; PROBE_REGION_BYTES];
         let n = h
-            .load_page_slots(page_base, page_slots, &mut bulk)
+            .load_page_slots(page_base, page_slots, &mut bulk, false)
             .unwrap();
         let nslots = (n / es as usize) as u64;
         assert!(nslots > 0);

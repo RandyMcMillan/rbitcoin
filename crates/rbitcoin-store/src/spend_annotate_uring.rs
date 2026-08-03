@@ -113,7 +113,9 @@ pub fn put_spend_batch_by_abs_meta_uring(
             });
             {
                 let s = slots[slot].as_mut().unwrap();
-                session.push_pread(body_fd, abs, &mut s.buf, slot as u64)?;
+                // Policy: all tx.body reads use RWF_DONTCACHE.
+                let flags = crate::dontcache_policy::body_sqe_rw_flags();
+                session.push_pread_flags(body_fd, abs, &mut s.buf, slot as u64, flags)?;
             }
             *in_flight += 1;
         }
@@ -216,7 +218,9 @@ pub fn put_spend_batch_by_abs_meta_uring(
                     slots[slot] = Some(st);
                     {
                         let s = slots[slot].as_mut().unwrap();
-                        session.push_pwrite(body_fd, abs, &s.buf, slot as u64)?;
+                        // Policy: all tx.body writes use RWF_DONTCACHE.
+                        let flags = crate::dontcache_policy::body_sqe_rw_flags();
+                        session.push_pwrite_flags(body_fd, abs, &s.buf, slot as u64, flags)?;
                     }
                     in_flight += 1;
                 }
@@ -478,7 +482,9 @@ fn put_spend_batch_pure_write_uring(
             let slot = free_slots.pop().unwrap();
             slots[slot] = Some(wi);
             let abs = writes[wi].0;
-            session.push_pwrite(body_fd, abs, &mut bufs[wi], slot as u64)?;
+            // Policy: all tx.body writes use RWF_DONTCACHE.
+            let flags = crate::dontcache_policy::body_sqe_rw_flags();
+            session.push_pwrite_flags(body_fd, abs, &mut bufs[wi], slot as u64, flags)?;
             *in_flight += 1;
         }
         Ok(())
@@ -615,6 +621,50 @@ mod tests {
             assert_eq!(fl2 & output_flags::MULTI_SPENDER, 0);
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// Shipped uring RMW path must push body SQEs with RWF_DONTCACHE when supported.
+    #[test]
+    fn uring_rmw_body_sqe_sets_rwf_dontcache() {
+        if !crate::bulk_io::io_uring_enabled() {
+            // No ring in this environment — policy helper still body-always.
+            assert!(crate::dontcache_policy::body_always());
+            return;
+        }
+        let (dir, t, spenders) = temp_table();
+        let (cfk, off, len) = put_one(&t);
+        let decoded = t.get_meta_and_outputs_batch_at(&[(off, len)]).unwrap();
+        let abs = off + u64::from(decoded[0].as_ref().unwrap().2[0]);
+        let bulk = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
+        let (field, flags) = bulk[0].unwrap();
+        let _ = uring_session::test_take_last_sqe_rw_flags();
+        let cold = put_spend_batch_by_abs_meta_known(
+            &t,
+            &spenders,
+            &[(abs, cfk, 0, Fk(55))],
+            &[(field, flags)],
+            SpendAnnBackend::Uring,
+        )
+        .unwrap();
+        assert!(cold.is_empty());
+        let sqe_flags = uring_session::test_take_last_sqe_rw_flags();
+        assert!(
+            !sqe_flags.is_empty(),
+            "uring spend annotate must push at least one SQE"
+        );
+        let expect = crate::dontcache_policy::body_sqe_rw_flags();
+        assert!(
+            sqe_flags.iter().any(|&f| f == expect),
+            "body SQE rw_flags must match body_sqe_rw_flags()={expect:#x}; got {sqe_flags:?}"
+        );
+        // When DONTCACHE is supported, flags must be non-zero on body ops.
+        if crate::bulk_io::rwf_dontcache_ok() {
+            assert!(
+                sqe_flags.iter().any(|&f| f == uring_session::RWF_DONTCACHE),
+                "expected RWF_DONTCACHE on body r/w SQEs; got {sqe_flags:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

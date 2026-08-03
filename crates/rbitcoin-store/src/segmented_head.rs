@@ -422,10 +422,13 @@ impl SegmentedTxHead {
             return Ok(out);
         }
 
+        let n_segs = segs.len();
         let last = segs.last().unwrap();
         if !last.sealed {
             LOOKUP_OPEN.fetch_add(n as u64, Ordering::Relaxed);
-            let rel_lists = last.head.probe_fks_batch(mixed)?;
+            // Open segment = tip (age 0) → never DONTCACHE.
+            let dc = crate::dontcache_policy::head_or_idx_segment_index(n_segs - 1, n_segs);
+            let rel_lists = last.head.probe_fks_batch_dontcache(mixed, dc)?;
             for (i, rels) in rel_lists.into_iter().enumerate() {
                 for r in rels.into_iter().rev() {
                     if let Some(fk) = rel_to_abs(last.first_fk, r.0) {
@@ -436,12 +439,14 @@ impl SegmentedTxHead {
         }
 
         // Sealed newest → oldest (skip open tail if already handled).
-        let sealed_iter: Box<dyn Iterator<Item = &Arc<Segment>>> = if last.sealed {
-            Box::new(segs.iter().rev())
+        // Index si: last = tip age 0; older segments get higher sealed_age.
+        let sealed_range: Box<dyn Iterator<Item = usize>> = if last.sealed {
+            Box::new((0..n_segs).rev())
         } else {
-            Box::new(segs.iter().rev().skip(1))
+            Box::new((0..n_segs.saturating_sub(1)).rev())
         };
-        for seg in sealed_iter {
+        for si in sealed_range {
+            let seg = &segs[si];
             if !seg.sealed {
                 continue;
             }
@@ -465,7 +470,8 @@ impl SegmentedTxHead {
             if pass_keys.is_empty() {
                 continue;
             }
-            let rel_lists = seg.head.probe_fks_batch(&pass_keys)?;
+            let dc = crate::dontcache_policy::head_or_idx_segment_index(si, n_segs);
+            let rel_lists = seg.head.probe_fks_batch_dontcache(&pass_keys, dc)?;
             for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
                 for r in rels.into_iter().rev() {
                     if let Some(fk) = rel_to_abs(seg.first_fk, r.0) {

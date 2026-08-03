@@ -424,13 +424,12 @@ impl TxIdx {
                 let len = pages[i].len();
                 let ptr = pages[i].as_mut_ptr();
                 let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-                let sealed_age = n_segs.saturating_sub(1).saturating_sub(*si) as u32;
                 ops.push(ReadOp {
                     fd,
                     offset: *page_off,
                     buf: slice,
                     result: i32::MIN,
-                    dontcache: crate::dontcache_policy::head_or_idx_segment(sealed_age),
+                    dontcache: crate::dontcache_policy::head_or_idx_segment_index(*si, n_segs),
                 });
             }
             bulk_io::pread_batch_backend(&mut ops, backend);

@@ -149,6 +149,8 @@ pub fn pread_batch(ops: &mut [ReadOp<'_>]) {
     if ops.is_empty() {
         return;
     }
+    #[cfg(test)]
+    test_note_read_dontcache(ops);
     if io_uring_enabled() && pread_batch_uring(ops) {
         return;
     }
@@ -162,6 +164,8 @@ pub fn pread_batch_backend(ops: &mut [ReadOp<'_>], backend: crate::io_backend::R
     if ops.is_empty() {
         return;
     }
+    #[cfg(test)]
+    test_note_read_dontcache(ops);
     match backend {
         ReadIoBackend::Uring => {
             if io_uring_enabled() && pread_batch_uring(ops) {
@@ -182,10 +186,47 @@ pub fn pwrite_batch(ops: &mut [WriteOp<'_>]) {
     if ops.is_empty() {
         return;
     }
+    #[cfg(test)]
+    test_note_write_dontcache(ops);
     if io_uring_enabled() && pwrite_batch_uring(ops) {
         return;
     }
     pwrite_batch_fallback(ops);
+}
+
+// Test hook: last ReadOp/WriteOp.dontcache flags seen by pread/pwrite_batch.
+#[cfg(test)]
+thread_local! {
+    static LAST_READ_DONTCACHE: std::cell::RefCell<Vec<bool>> =
+        std::cell::RefCell::new(Vec::new());
+    static LAST_WRITE_DONTCACHE: std::cell::RefCell<Vec<bool>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+#[cfg(test)]
+fn test_note_read_dontcache(ops: &[ReadOp<'_>]) {
+    LAST_READ_DONTCACHE.with(|c| {
+        c.borrow_mut().extend(ops.iter().map(|o| o.dontcache));
+    });
+}
+
+#[cfg(test)]
+fn test_note_write_dontcache(ops: &[WriteOp<'_>]) {
+    LAST_WRITE_DONTCACHE.with(|c| {
+        c.borrow_mut().extend(ops.iter().map(|o| o.dontcache));
+    });
+}
+
+/// Drain and return recorded read-op DONTCACHE flags (tests only).
+#[cfg(test)]
+pub fn test_take_last_read_dontcache() -> Vec<bool> {
+    LAST_READ_DONTCACHE.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+/// Drain and return recorded write-op DONTCACHE flags (tests only).
+#[cfg(test)]
+pub fn test_take_last_write_dontcache() -> Vec<bool> {
+    LAST_WRITE_DONTCACHE.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
 /// Pipelined page RMW on the thread-local ring:

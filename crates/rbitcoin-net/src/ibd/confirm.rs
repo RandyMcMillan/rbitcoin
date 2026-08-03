@@ -336,54 +336,107 @@ pub(crate) fn pack_stop_after(sum_inputs: u32, n_blocks: usize, soft_max_inputs:
     n_blocks >= hard_max_blocks || sum_inputs > soft_max_inputs
 }
 
-/// Default capacity for each of plan→prep, prep→scripts, scripts→write queues.
-pub(crate) const CONFIRM_QUEUE_CAP_DEFAULT: usize = 5;
-/// Hard clamp for [`confirm_queue_cap`] (env abuse / OOM guard).
-const CONFIRM_QUEUE_CAP_MAX: usize = 64;
+/// Default plan→prep depth: one batch of slack (plan is steady; scripts long-pole).
+pub(crate) const PLAN_QUEUE_CAP_DEFAULT: usize = 1;
+/// Default prep→scripts depth: one batch of slack.
+pub(crate) const LOAD_QUEUE_CAP_DEFAULT: usize = 1;
+/// Default scripts→write depth: write is bursty (class_a head / tip flush); buffer
+/// script output so script thr does not stall on a full writeq.
+pub(crate) const WRITE_QUEUE_CAP_DEFAULT: usize = 10;
+/// Hard clamp per stage (env abuse / OOM guard).
+pub(crate) const CONFIRM_QUEUE_CAP_MAX: usize = 64;
 
-/// Shared confirm pipeline queue capacity (all three stage queues).
+/// Resolved plan / prep / write queue capacities (OnceLock; process-lifetime).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConfirmQueueCaps {
+    pub plan: usize,
+    pub load: usize,
+    pub write: usize,
+}
+
+fn parse_queue_cap(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(1, CONFIRM_QUEUE_CAP_MAX)
+}
+
+/// Per-stage confirm pipeline queue capacities.
 ///
-/// Env: `RBITCOIN_CONFIRM_QUEUE` (default **5**, clamp **1..=64**). One value
-/// sizes planq, prepq, and writeq together.
-pub(crate) fn confirm_queue_cap() -> usize {
+/// | Queue | Env | Default |
+/// |-------|-----|---------|
+/// | plan→prep | `RBITCOIN_CONFIRM_PLAN_QUEUE` | **1** |
+/// | prep→scripts | `RBITCOIN_CONFIRM_PREP_QUEUE` | **1** |
+/// | scripts→write | `RBITCOIN_CONFIRM_WRITE_QUEUE` | **10** |
+///
+/// Legacy: if a per-stage env is unset, `RBITCOIN_CONFIRM_QUEUE` (when set) supplies
+/// that stage's default instead of the table above. Clamp **1..=64** each.
+pub(crate) fn confirm_queue_caps() -> ConfirmQueueCaps {
     use std::sync::OnceLock;
-    static CAP: OnceLock<usize> = OnceLock::new();
-    *CAP.get_or_init(|| {
-        let raw = std::env::var("RBITCOIN_CONFIRM_QUEUE").ok();
-        let n = raw
+    static CAPS: OnceLock<ConfirmQueueCaps> = OnceLock::new();
+    *CAPS.get_or_init(|| {
+        let legacy = std::env::var("RBITCOIN_CONFIRM_QUEUE").ok();
+        let legacy_n = legacy
             .as_deref()
             .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(CONFIRM_QUEUE_CAP_DEFAULT);
-        let n = n.clamp(1, CONFIRM_QUEUE_CAP_MAX);
-        if raw.is_some() && n != CONFIRM_QUEUE_CAP_DEFAULT {
+            .map(|n| n.clamp(1, CONFIRM_QUEUE_CAP_MAX));
+
+        let plan_raw = std::env::var("RBITCOIN_CONFIRM_PLAN_QUEUE").ok();
+        let prep_raw = std::env::var("RBITCOIN_CONFIRM_PREP_QUEUE").ok();
+        let write_raw = std::env::var("RBITCOIN_CONFIRM_WRITE_QUEUE").ok();
+
+        let plan = parse_queue_cap(
+            plan_raw.as_deref(),
+            legacy_n.unwrap_or(PLAN_QUEUE_CAP_DEFAULT),
+        );
+        let load = parse_queue_cap(
+            prep_raw.as_deref(),
+            legacy_n.unwrap_or(LOAD_QUEUE_CAP_DEFAULT),
+        );
+        let write = parse_queue_cap(
+            write_raw.as_deref(),
+            legacy_n.unwrap_or(WRITE_QUEUE_CAP_DEFAULT),
+        );
+        let caps = ConfirmQueueCaps { plan, load, write };
+        let non_default = plan != PLAN_QUEUE_CAP_DEFAULT
+            || load != LOAD_QUEUE_CAP_DEFAULT
+            || write != WRITE_QUEUE_CAP_DEFAULT
+            || legacy.is_some();
+        if non_default {
             rbitcoin_log::info!(
-                "ibd: confirm pipeline queues planq/prepq/writeq cap={n} \
-                 (RBITCOIN_CONFIRM_QUEUE)"
+                "ibd: confirm pipeline queues planq cap={plan} prepq cap={load} \
+                 writeq cap={write} (RBITCOIN_CONFIRM_PLAN_QUEUE / _PREP_QUEUE / \
+                 _WRITE_QUEUE; legacy RBITCOIN_CONFIRM_QUEUE={})",
+                legacy.as_deref().unwrap_or("unset"),
             );
         }
-        n
+        caps
     })
 }
 
-/// Plan→prep `SyncSender` capacity (same as [`confirm_queue_cap`]).
+/// Plan→prep `SyncSender` capacity.
 pub(crate) fn plan_queue_cap() -> usize {
-    confirm_queue_cap()
+    confirm_queue_caps().plan
 }
-/// Prep→scripts capacity (same as [`confirm_queue_cap`]).
+/// Prep→scripts capacity.
 pub(crate) fn load_queue_cap() -> usize {
-    confirm_queue_cap()
+    confirm_queue_caps().load
 }
-/// Scripts→write capacity (same as [`confirm_queue_cap`]).
+/// Scripts→write capacity.
 pub(crate) fn write_queue_cap() -> usize {
-    confirm_queue_cap()
+    confirm_queue_caps().write
 }
 
 /// Max heights claimable ahead of tip+1 (pipeline depth).
 ///
 /// Plan may start the next run while prep/scripts/write hold earlier ones,
 /// but must **not** skip a stuck tip+1 and claim thousands of far heights.
+/// Depth units = sum of stage caps (write is usually largest).
 fn max_claim_ahead() -> u32 {
-    let q = confirm_queue_cap();
+    let c = confirm_queue_caps();
+    let q = c
+        .plan
+        .saturating_add(c.load)
+        .saturating_add(c.write);
     (q.saturating_mul(3).saturating_add(1) as u32)
         .saturating_mul(CONFIRM_RUN_MAX_BLOCKS as u32)
 }
@@ -409,11 +462,11 @@ struct PlanDone {
 /// samples alone almost always show 0 under a plan-limited pipeline.
 #[derive(Debug, Default)]
 pub(crate) struct ConfirmQueueDepths {
-    /// plan → prep (`SyncSender` capacity [`confirm_queue_cap`]).
+    /// plan → prep (`SyncSender` capacity [`plan_queue_cap`]).
     plan_to_prep: AtomicUsize,
-    /// prep → scripts (`SyncSender` capacity [`confirm_queue_cap`]).
+    /// prep → scripts (`SyncSender` capacity [`load_queue_cap`]).
     load_to_scripts: AtomicUsize,
-    /// scripts → write (`SyncSender` capacity [`confirm_queue_cap`]).
+    /// scripts → write (`SyncSender` capacity [`write_queue_cap`]).
     scripts_to_write: AtomicUsize,
     /// Max plan→prep depth since last HWM sample.
     plan_hwm: AtomicUsize,
@@ -793,14 +846,14 @@ pub(crate) fn spawn_confirm_engine(
     loop_stats: Arc<LoopStats>,
 ) -> (std::thread::JoinHandle<()>, Arc<ConfirmQueueDepths>) {
     let queues = ConfirmQueueDepths::new();
-    let qcap = confirm_queue_cap();
-    let (plan_tx, plan_rx) = std::sync::mpsc::sync_channel::<PlanDone>(qcap);
+    let caps = confirm_queue_caps();
+    let (plan_tx, plan_rx) = std::sync::mpsc::sync_channel::<PlanDone>(caps.plan);
     let (mat_tx, mat_rx) = std::sync::mpsc::sync_channel::<(
         rbitcoin_consensus::LoadedBatch,
         u64, // load work_ns
-    )>(qcap);
+    )>(caps.load);
     let (write_tx, write_rx) =
-        std::sync::mpsc::sync_channel::<rbitcoin_consensus::ScriptOkBatch>(qcap);
+        std::sync::mpsc::sync_channel::<rbitcoin_consensus::ScriptOkBatch>(caps.write);
     // Write reject: plan drops reserved fks + last_prepped so re-plan after
     // Class A partial commit does not drift next_tx_start.
     let prep_ahead_reset = Arc::new(AtomicBool::new(false));
@@ -1180,7 +1233,7 @@ pub(crate) fn spawn_confirm_engine(
         .spawn(move || {
             info!(
                 "ibd: confirm plan on dedicated OS thread (claim → stamp create_fk → prep queue/{})",
-                confirm_queue_cap()
+                plan_queue_cap()
             );
             let mut plan_ahead = PrepAheadState::new(&hub);
             loop {
@@ -2045,7 +2098,7 @@ mod tests {
         assert!(!g.inflight.contains(&11));
     }
 
-    /// Log tokens + live caps (OPERATOR.md / experimental-mainnet prepq=*/5 writeq=*/5).
+    /// Log tokens + live caps (OPERATOR.md planq/prepq/writeq defaults 1/1/10).
     #[test]
     fn queue_depth_log_and_caps_surface() {
         assert_eq!(format_queue_depth("prep", 0, 2), "prep<0/2");
@@ -2065,23 +2118,41 @@ mod tests {
             "planq<0/2 prepq<0/2 writeq<0/2"
         );
 
-        let cap = super::confirm_queue_cap();
-        assert!(
-            (1..=super::CONFIRM_QUEUE_CAP_MAX).contains(&cap),
-            "confirm_queue_cap out of range: {cap}"
-        );
-        // Default when env unset is 5 (OnceLock: do not set RBITCOIN_CONFIRM_QUEUE in this test).
-        assert_eq!(cap, super::CONFIRM_QUEUE_CAP_DEFAULT);
-        assert_eq!(super::plan_queue_cap(), cap);
-        assert_eq!(super::load_queue_cap(), cap);
-        assert_eq!(super::write_queue_cap(), cap);
+        // Defaults when per-stage + legacy env unset (OnceLock — do not set
+        // RBITCOIN_CONFIRM_*_QUEUE in this test process).
+        let caps = super::confirm_queue_caps();
+        assert_eq!(caps.plan, super::PLAN_QUEUE_CAP_DEFAULT);
+        assert_eq!(caps.load, super::LOAD_QUEUE_CAP_DEFAULT);
+        assert_eq!(caps.write, super::WRITE_QUEUE_CAP_DEFAULT);
+        assert_eq!(super::plan_queue_cap(), caps.plan);
+        assert_eq!(super::load_queue_cap(), caps.load);
+        assert_eq!(super::write_queue_cap(), caps.write);
+        for c in [caps.plan, caps.load, caps.write] {
+            assert!(
+                (1..=super::CONFIRM_QUEUE_CAP_MAX).contains(&c),
+                "queue cap out of range: {c}"
+            );
+        }
         assert_eq!(
-            format_conf_q(0, 0, 0, cap, cap, cap),
-            format!("planq<0/{cap} prepq<0/{cap} writeq<0/{cap}")
+            format_conf_q(0, 0, 0, caps.plan, caps.load, caps.write),
+            format!(
+                "planq<0/{} prepq<0/{} writeq<0/{}",
+                caps.plan, caps.load, caps.write
+            )
         );
         assert_eq!(
-            format_conf_q(cap, cap, cap, cap, cap, cap),
-            format!("planq={cap}/{cap} prepq={cap}/{cap} writeq={cap}/{cap}")
+            format_conf_q(
+                caps.plan,
+                caps.load,
+                caps.write,
+                caps.plan,
+                caps.load,
+                caps.write
+            ),
+            format!(
+                "planq={0}/{0} prepq={1}/{1} writeq={2}/{2}",
+                caps.plan, caps.load, caps.write
+            )
         );
     }
 

@@ -124,7 +124,7 @@ fewer usable peers than a dual-stack Core node.
 | `tx.head` seal | Segment roll builds fuse8 on seal (~27 M keys); watch seal begin/done logs — not a mono-head shadow fill |
 | Peer scarcity | v2-only + experimental user-agent |
 | Mempool | Libre policy (0.1 sat/vB, full RBF, no dust ban); **scripts verified on accept** |
-| Confirm plan/prep | Dense heights are pin-bound; expect `conf blks=32` with `planq`/`prepq` low relative to cap (`planq=*/5 prepq=*/5`) |
+| Confirm plan/prep | Dense heights are pin-bound; expect `conf blks≈32` with shallow plan/prep queues (default `planq=*/1 prepq=*/1 writeq=*/10`) |
 | Not Core/Fulcrum | No production SLA; schema unstable until 1.0; reindex on incompatible layout changes |
 
 ## Related docs

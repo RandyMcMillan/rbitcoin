@@ -17,6 +17,23 @@ order + HWM**, not map mutexes (maps removed — phase 6).
 If a change introduces a new long-held store lock on the IBD/read path, it is the
 wrong design — fix the protocol. See `docs/concurrency.md`.
 
+## io_uring: do not flatten custom machines
+
+**Under no circumstances** replace a purpose-built / multi-stage **io_uring
+machine** (fused resolve, spend-annotate RMW, pipeline stages, depth-round
+machines, etc.) with “simple” batched `pread`/`pwrite` / one-shot
+`pread_batch`/`pwrite_batch` submission **without explicit permission from the
+user**.
+
+| OK | Not OK without permission |
+|----|---------------------------|
+| Fix bugs inside the existing machine | Delete/retire a custom machine and call bulk batch helpers instead |
+| Thread new flags (e.g. DONTCACHE) through the same SQE path | “Simplify” to serial pread + one big submit for a path that had a staged machine |
+| Fall back to pread when uring is unavailable (existing policy) | Rewrite a machine away “because batch is enough” |
+
+If a change seems to require collapsing a machine, **stop and ask** — do not
+land the simplification as a drive-by cleanup.
+
 ## Create caches: residency sole map, FIFO only
 
 | Rule | Detail |

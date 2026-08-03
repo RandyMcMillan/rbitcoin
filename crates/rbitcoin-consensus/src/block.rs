@@ -1010,13 +1010,15 @@ pub(crate) struct StructuralPhaseNs {
 /// Runs in height order on the write path (after scripts). `pending_spent` is
 /// write-local across a multi-height run.
 ///
-/// **BIP68** create-height / coin-MTP IO lives here (not optimistic load assemble)
-/// so confirm load does not walk `tx_height` for every parent.
+/// **BIP68** create-height lives here (not optimistic load assemble) so confirm
+/// load does not walk `tx_height` for every parent. Height slots are bulk-read
+/// with spender meta in one multi-fd wave. Coin MTP is resolved only for
+/// time-type relative locks on version ≥2 txs.
 ///
-/// **Spentness:** pin denserels → absolute 9-byte spender offsets + one bulk
-/// mmap walk. **No cold body walk** on the write path — missing abs / multi /
-/// short meta is hard `Err`. Snapshots `(field, flags)` into `meta_by_abs` for
-/// pure-write annotate (no second body pread).
+/// **Spentness:** pin denserels → abs + one bulk 9-byte meta wave (combined with
+/// `tx_height`). Sparse durable-**spent** set (not unspent). **No cold body walk**
+/// on the write path — missing abs / multi / short meta is hard `Err`. Snapshots
+/// `(field, flags)` into `meta_by_abs` for pure-write annotate.
 pub(crate) fn structural_validate_spends(
     query: &Query,
     block: &Block,
@@ -1083,26 +1085,39 @@ pub(crate) fn structural_validate_spends(
         }
     }
 
-    // Durable unspent: (create_id, vout) present ⇒ not confirmed-strong spent.
-    let mut durable_unspent: HashSet<(u64, u32)> = HashSet::with_capacity(spends.len());
-    let tip = query.tip_height().map(|h| h.0);
+    // Unique create fks for height bulk (sorted for stable IO order).
+    let unique_create_fks: Vec<rbitcoin_primitives::Fk> = {
+        let mut v: Vec<rbitcoin_primitives::Fk> = vouts_by_create
+            .keys()
+            .map(|id| rbitcoin_primitives::Fk(*id))
+            .collect();
+        v.sort_unstable_by_key(|f| f.0);
+        v
+    };
 
-    // Hot path: bulk 9-byte spender meta at pin offsets (on-disk authority).
-    // Backend: RBITCOIN_SPEND_META / RBITCOIN_IO (uring|pread).
+    // One bulk IO wave: Class A body 9B meta + tx_height 4B (independent fds).
+    // Wall ≈ max(meta, height) instead of sum. Heights decode only after wait.
+    let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a)| *a).collect();
+    let t_meta = Instant::now();
+    let (metas, durable_heights) = query
+        .store()
+        .structural_meta_and_tx_height_batch(&abs_offs, &unique_create_fks)
+        .map_err(ConsensusError::Store)?;
+    let meta_ns = t_meta.elapsed().as_nanos() as u64;
+    confirm_phase_stats::SPEND_META_NS.fetch_add(meta_ns, Ordering::Relaxed);
+    confirm_phase_stats::SPEND_META_N.fetch_add(abs_offs.len() as u64, Ordering::Relaxed);
+
+    // Sparse durable **spent** set (honest IBD: almost all outs unspent).
+    // Present ⇒ confirmed-strong spent; missing ⇒ unspent.
+    let mut durable_spent: HashSet<(u64, u32)> = HashSet::new();
+    let tip = query.tip_height().map(|h| h.0);
     let mut spent_strong_ns = 0u64;
     if !abs_jobs.is_empty() {
-        let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a)| *a).collect();
-        let meta_backend = rbitcoin_store::spend_meta_backend();
-        let t_meta = Instant::now();
-        let metas = query
-            .store()
-            .get_spender_meta_at_abs_batch_backend(&abs_offs, meta_backend)
-            .map_err(ConsensusError::Store)?;
-        let meta_ns = t_meta.elapsed().as_nanos() as u64;
-        let n_meta = abs_offs.len() as u64;
-        confirm_phase_stats::SPEND_META_NS.fetch_add(meta_ns, Ordering::Relaxed);
-        confirm_phase_stats::SPEND_META_N.fetch_add(n_meta, Ordering::Relaxed);
-        let _ = meta_backend;
+        if metas.len() != abs_jobs.len() {
+            return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                "invariant: structural meta batch length",
+            )));
+        }
         let t_strong = Instant::now();
         for (i, &(id, vout, abs)) in abs_jobs.iter().enumerate() {
             let Some((field, flags)) = metas[i] else {
@@ -1122,22 +1137,20 @@ pub(crate) fn structural_validate_spends(
                 ));
             }
             if field.is_null() {
-                durable_unspent.insert((id, vout));
-                continue;
+                continue; // unspent
             }
             let strong = query
                 .store()
                 .is_confirmed_strong_at(field, tip)
                 .map_err(ConsensusError::Store)?;
-            if !strong {
-                durable_unspent.insert((id, vout));
+            if strong {
+                durable_spent.insert((id, vout));
             }
         }
         spent_strong_ns = t_strong.elapsed().as_nanos() as u64;
     }
-    let spent_abs_ns = t_abs.elapsed().as_nanos() as u64;
-    // abs timer includes strong loop above — subtract so abs ≈ collect+mmap.
-    let spent_abs_ns = spent_abs_ns.saturating_sub(spent_strong_ns);
+    // abs ≈ collect + combined meta/height wave (not strong loop).
+    let spent_abs_ns = (t_abs.elapsed().as_nanos() as u64).saturating_sub(spent_strong_ns);
 
     // Null create_fk (rare): same-block / unset create — txid path, not Class A body cold.
     let t_cold = Instant::now();
@@ -1167,8 +1180,8 @@ pub(crate) fn structural_validate_spends(
         let spent = if create_fk.is_null() {
             durable_null_spent.contains(&key)
         } else if let Some(id) = create_fk.get() {
-            // Missing from durable_unspent ⇒ confirmed-strong spent (or OOB).
-            !durable_unspent.contains(&(id, vout))
+            // Present in durable_spent ⇒ confirmed-strong spent.
+            durable_spent.contains(&(id, vout))
         } else {
             false
         };
@@ -1181,22 +1194,14 @@ pub(crate) fn structural_validate_spends(
     let spent_ns = t_spent.elapsed().as_nanos() as u64;
 
     // ── Create height + coinbase maturity (durable Class C only) ──────────
-    // Heights: bulk `tx_height`. Coinbase: create_fk == first_tx_fk of block at
-    // that height (`confirmed` + `header_txs_first`) — **never** `tx.body`.
-    // Pin may still short-circuit with a known coinbase flag.
+    // Heights already loaded in the structural IO wave with meta. Coinbase:
+    // create_fk == first_tx_fk of block at H — **never** `tx.body`.
     let t_create = Instant::now();
-    let unique_create_fks: Vec<rbitcoin_primitives::Fk> = {
-        let mut v: Vec<rbitcoin_primitives::Fk> = vouts_by_create
-            .keys()
-            .map(|id| rbitcoin_primitives::Fk(*id))
-            .collect();
-        v.sort_unstable_by_key(|f| f.0);
-        v
-    };
-    let durable_heights = query
-        .store()
-        .tx_height_get_batch(&unique_create_fks)
-        .map_err(ConsensusError::Store)?;
+    if durable_heights.len() != unique_create_fks.len() {
+        return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+            "invariant: structural height batch length",
+        )));
+    }
     let height_by_id: HashMap<u64, u32> = unique_create_fks
         .iter()
         .zip(durable_heights.into_iter())
@@ -1248,14 +1253,21 @@ pub(crate) fn structural_validate_spends(
     let create_h_ns = t_create.elapsed().as_nanos() as u64;
 
     // ── BIP68 relative sequence locks (CSV package) ────────────────────────
+    // Skip height/MTP prep for version < 2 (sequence_locks early-out).
+    // Resolve coin MTP only for time-type relative locks (TYPE_FLAG).
     let t_bip68 = Instant::now();
     if ctx.params.csv_active_at(ctx.height.0) {
+        const DISABLE: u32 = 1 << 31;
+        const TYPE_FLAG: u32 = 1 << 22;
         let prev_mtp = if ctx.height.0 == 0 {
             0
         } else {
             mtp_at(query, Height(ctx.height.0 - 1), mtp_cache)?
         };
         let mut si = 0usize;
+        // Reuse buffers across txs (write-local).
+        let mut prev_heights: Vec<u32> = Vec::new();
+        let mut coin_mtps: Vec<u32> = Vec::new();
         for tx in block.txdata.iter().skip(1) {
             let n_in = tx.input.len();
             if si + n_in > spends.len() {
@@ -1264,9 +1276,18 @@ pub(crate) fn structural_validate_spends(
             let tx_spends = &spends[si..si + n_in];
             si += n_in;
 
-            let mut prev_heights = Vec::with_capacity(n_in);
-            let mut coin_mtps = Vec::with_capacity(n_in);
-            for &(_ptid, _vout, _sfk, create_fk) in tx_spends {
+            // v1: relative locks inactive — no height map / MTP / lock check.
+            if tx.version.0 < 2 {
+                continue;
+            }
+
+            prev_heights.clear();
+            coin_mtps.clear();
+            prev_heights.reserve(n_in);
+            coin_mtps.reserve(n_in);
+            for (inp, &(_ptid, _vout, _sfk, create_fk)) in
+                tx.input.iter().zip(tx_spends.iter())
+            {
                 let ch = if create_fk.is_null() {
                     // Same-block create (no Class A fk yet): Core uses spend height.
                     ctx.height.0
@@ -1277,7 +1298,10 @@ pub(crate) fn structural_validate_spends(
                         .unwrap_or(0)
                 };
                 prev_heights.push(ch);
-                let mtp = if ch == 0 {
+                let seq = inp.sequence.to_consensus_u32();
+                // Coin MTP only when a time-type relative lock is active.
+                let need_mtp = seq & DISABLE == 0 && seq & TYPE_FLAG != 0;
+                let mtp = if !need_mtp || ch == 0 {
                     0
                 } else {
                     mtp_at(query, Height(ch.saturating_sub(1)), mtp_cache)?
@@ -1941,6 +1965,16 @@ mod finality_tests {
             200,
             min_time as u32 + 1
         ));
+    }
+
+    /// Height-type locks ignore coin MTP (write path may leave mtps as 0).
+    #[test]
+    fn bip68_height_type_ignores_zero_mtp() {
+        let tx = bare_tx(2, LockTime::ZERO, Sequence::from_consensus(10));
+        assert!(sequence_locks_satisfied(&tx, &[100], &[0], 110, 0));
+        // bogus MTP must not affect height-type check
+        assert!(sequence_locks_satisfied(&tx, &[100], &[u32::MAX], 110, 0));
+        assert!(!sequence_locks_satisfied(&tx, &[100], &[0], 109, 0));
     }
 }
 

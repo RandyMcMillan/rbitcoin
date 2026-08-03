@@ -133,6 +133,25 @@ impl TxHeightTable {
         crate::file::FILE_HEADER_LEN as u64 + index * TX_HEIGHT_ELEM
     }
 
+    /// File offset for dense slot `index` (crate: structural multi-fd bulk IO).
+    #[inline]
+    pub(crate) fn offset_for_index(index: u64) -> u64 {
+        Self::offset(index)
+    }
+
+    /// Published slot count (crate: structural multi-fd bulk IO).
+    #[inline]
+    pub(crate) fn slot_count(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.len.load(Ordering::Acquire)
+    }
+
+    /// Read fd for bulk preads (crate: structural multi-fd bulk IO).
+    #[inline]
+    pub(crate) fn read_fd(&self) -> std::os::fd::RawFd {
+        self.file.read_fd()
+    }
+
     fn get_slot(&self, index: u64) -> Result<u32, StoreError> {
         use std::sync::atomic::Ordering;
         let len = self.len.load(Ordering::Acquire);

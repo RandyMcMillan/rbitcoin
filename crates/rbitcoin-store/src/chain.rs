@@ -351,6 +351,10 @@ pub struct StrongTxTable {
     /// L2 byte image (`None` = pure L0).
     data: std::sync::RwLock<Option<Vec<u8>>>,
     dirty: std::sync::atomic::AtomicBool,
+    /// Min bit index mutated since last flush (`u64::MAX` = none).
+    dirty_lo_bit: std::sync::atomic::AtomicU64,
+    /// Body byte length last flushed to disk (L2).
+    disk_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl StrongTxTable {
@@ -360,6 +364,8 @@ impl StrongTxTable {
             n_bits: std::sync::atomic::AtomicU64::new(0),
             data: std::sync::RwLock::new(Some(Vec::new())),
             dirty: std::sync::atomic::AtomicBool::new(false),
+            dirty_lo_bit: std::sync::atomic::AtomicU64::new(u64::MAX),
+            disk_bytes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -383,7 +389,26 @@ impl StrongTxTable {
             n_bits: std::sync::atomic::AtomicU64::new(n_bits),
             data: std::sync::RwLock::new(data),
             dirty: std::sync::atomic::AtomicBool::new(false),
+            dirty_lo_bit: std::sync::atomic::AtomicU64::new(u64::MAX),
+            disk_bytes: std::sync::atomic::AtomicU64::new(body),
         })
+    }
+
+    fn mark_dirty_bit(&self, bit: u64) {
+        use std::sync::atomic::Ordering;
+        self.dirty.store(true, Ordering::Release);
+        let mut cur = self.dirty_lo_bit.load(Ordering::Relaxed);
+        while bit < cur {
+            match self.dirty_lo_bit.compare_exchange_weak(
+                cur,
+                bit,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(c) => cur = c,
+            }
+        }
     }
 
     fn byte_off(bit: u64) -> u64 {
@@ -404,7 +429,7 @@ impl StrongTxTable {
                 v.resize(need_bytes as usize, 0);
             }
             self.n_bits.store(need_bits, Ordering::Release);
-            self.dirty.store(true, Ordering::Release);
+            // Growth alone is not a bit mutate; callers set_bit mark dirty.
             return Ok(());
         }
         drop(guard);
@@ -437,7 +462,6 @@ impl StrongTxTable {
     }
 
     fn set_bit(&self, bit: u64, on: bool) -> Result<(), StoreError> {
-        use std::sync::atomic::Ordering;
         self.ensure_bits(bit + 1)?;
         let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
         if let Some(ref mut v) = *guard {
@@ -447,7 +471,7 @@ impl StrongTxTable {
             } else {
                 v[bi] &= !(1 << (bit % 8));
             }
-            self.dirty.store(true, Ordering::Release);
+            self.mark_dirty_bit(bit);
             return Ok(());
         }
         drop(guard);
@@ -500,7 +524,6 @@ impl StrongTxTable {
 
     /// Set bits in half-open `[start, end)` (bit indices).
     fn set_bits_range(&self, start: u64, end: u64, on: bool) -> Result<(), StoreError> {
-        use std::sync::atomic::Ordering;
         if end <= start {
             return Ok(());
         }
@@ -517,7 +540,7 @@ impl StrongTxTable {
                 }
                 bit += 1;
             }
-            self.dirty.store(true, Ordering::Release);
+            self.mark_dirty_bit(start);
             return Ok(());
         }
         drop(guard);
@@ -596,7 +619,7 @@ impl StrongTxTable {
         self.get_bit(id - 1)
     }
 
-    /// Complete-or-fail write of dirty L2 bit image.
+    /// Persist dirty L2 bit image. Prefers append-only byte suffix writes.
     pub fn flush_dirty(&self) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
         let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
@@ -606,6 +629,34 @@ impl StrongTxTable {
         if !self.dirty.load(Ordering::Acquire) {
             return Ok(());
         }
+        let body_len = v.len() as u64;
+        let disk = self.disk_bytes.load(Ordering::Acquire);
+        let dirty_lo = self.dirty_lo_bit.load(Ordering::Acquire);
+        // First byte that may contain a dirty bit.
+        let dirty_byte = if dirty_lo == u64::MAX {
+            body_len
+        } else {
+            dirty_lo / 8
+        };
+
+        if body_len > disk && dirty_byte >= disk {
+            // Pure growth into new bytes: write only the new suffix.
+            let suffix = v[disk as usize..].to_vec();
+            drop(guard);
+            if !suffix.is_empty() {
+                self.bits.write_at(
+                    crate::file::FILE_HEADER_LEN as u64 + disk,
+                    &suffix,
+                )?;
+            }
+            self.disk_bytes.store(body_len, Ordering::Release);
+            self.dirty.store(false, Ordering::Release);
+            self.dirty_lo_bit.store(u64::MAX, Ordering::Release);
+            return Ok(());
+        }
+
+        // In-prefix bit mutate: full body rewrite (residual same-size tear risk;
+        // tip-last barrier keeps tip unadvanced until strong is durable).
         let body = v.clone();
         drop(guard);
         if !body.is_empty() {
@@ -614,7 +665,9 @@ impl StrongTxTable {
         }
         let logical = crate::file::FILE_HEADER_LEN as u64 + body.len() as u64;
         self.bits.set_logical_len(logical)?;
+        self.disk_bytes.store(body.len() as u64, Ordering::Release);
         self.dirty.store(false, Ordering::Release);
+        self.dirty_lo_bit.store(u64::MAX, Ordering::Release);
         Ok(())
     }
 

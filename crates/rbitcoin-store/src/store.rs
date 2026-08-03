@@ -818,17 +818,33 @@ impl Store {
         Ok(cleared)
     }
 
-    /// Flush compact Class C L2 images (confirmed / strong_tx / header_txs).
+    /// Flush Class C **except** `confirmed[]` (pre-tip half of the barrier).
     ///
-    /// Complete-or-fail body write for each dirty table, then `sync_data` unless
-    /// deferred. Call **before** body-queue dequeue so a kill mid-commit can
-    /// re-drive from BQ when L2 was not yet durable.
-    pub fn flush_class_c_tip(&self) -> Result<(), StoreError> {
-        self.confirmed.flush()?;
+    /// Order: `strong_tx` → `tx_height` → `header_txs`. Used so a mid-barrier
+    /// kill can leave strong/height durable **above** tip (repairable) without
+    /// advancing tip. Prefer [`Self::flush_class_c_tip`] for the full barrier.
+    pub fn flush_class_c_pre_tip(&self) -> Result<(), StoreError> {
+        // Tip-as-commit: never flush confirmed here.
         self.strong_tx.flush()?;
-        self.header_txs.flush()?;
-        // tx_height stays L0 (write-through); still fsync its HWM/payload.
+        // tx_height is L0 write-through; still fsync HWM/payload.
         self.tx_height.flush()?;
+        self.header_txs.flush()?;
+        Ok(())
+    }
+
+    /// Full Class C tip barrier: pre-tip tables **then** `confirmed[]` last.
+    ///
+    /// Complete-or-fail per table. Call **before** body-queue dequeue so a kill
+    /// mid-commit can re-drive from BQ when the barrier had not finished.
+    ///
+    /// **Tip last** is required: if `confirmed` were durable before `strong_tx` /
+    /// `tx_height`, a mid-barrier kill advances tip with missing strong bits;
+    /// re-confirm skips those heights and `repair_class_c_above_tip` only clears
+    /// **above** tip — permanent unstrong tip txs.
+    pub fn flush_class_c_tip(&self) -> Result<(), StoreError> {
+        self.flush_class_c_pre_tip()?;
+        // Commit point on disk: tip advance only after strong/height/header_txs.
+        self.confirmed.flush()?;
         Ok(())
     }
 
@@ -1298,6 +1314,108 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// Mid-barrier kill: pre-tip flush only must not advance durable tip.
+    ///
+    /// Simulates kill after strong/height durable but before confirmed flush.
+    /// Reopen: tip stays old; strong above tip is repaired; no permanent unstrong tip.
+    #[test]
+    fn class_c_barrier_pre_tip_only_does_not_advance_tip() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            // Genesis tip: height 0 → header fk 1, one strong tx.
+            s.confirmed.set(Height(0), Fk(1)).unwrap();
+            s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
+            s.tx_height.set(Fk(1), Height(0)).unwrap();
+            s.flush_class_c_tip().unwrap();
+            assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
+
+            // In-RAM tip extension (height 1) + strong for new txs — no full barrier.
+            s.strong_tx.set_strong_range(Fk(2), 3, Fk(2)).unwrap();
+            s.tx_height.set_range(Fk(2), 3, Height(1)).unwrap();
+            s.confirmed.set(Height(1), Fk(2)).unwrap();
+            // Mid-barrier: strong/height durable, confirmed still unflushed.
+            s.flush_class_c_pre_tip().unwrap();
+            // Process still sees tip 1 in RAM.
+            assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
+            // Drop without flushing confirmed (kill mid-barrier).
+        }
+        let s = Store::open(&dir).unwrap();
+        // Durable tip must remain 0 — confirmed was not in pre_tip flush.
+        assert_eq!(
+            s.confirmed.tip_height(),
+            Some(Height(0)),
+            "mid-barrier kill must not leave tip ahead of last full barrier"
+        );
+        assert!(s.strong_tx.is_strong(Fk(1)).unwrap());
+        // New strong may be durable above tip; repair clears them.
+        let cleared = s.repair_class_c_above_tip().unwrap();
+        assert!(
+            cleared >= 1,
+            "strong/height above tip should be repairable (got cleared={cleared})"
+        );
+        assert!(!s.is_confirmed_strong(Fk(2)).unwrap());
+        assert!(!s.is_confirmed_strong(Fk(3)).unwrap());
+        // Tip tx still strong.
+        assert!(s.is_confirmed_strong(Fk(1)).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Full barrier: tip + strong both durable; reopen matches.
+    #[test]
+    fn class_c_barrier_full_flush_reopen_tip_with_strong() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            s.confirmed.set(Height(0), Fk(1)).unwrap();
+            s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
+            s.tx_height.set(Fk(1), Height(0)).unwrap();
+            s.flush_class_c_tip().unwrap();
+
+            s.strong_tx.set_strong_range(Fk(2), 2, Fk(2)).unwrap();
+            s.tx_height.set_range(Fk(2), 2, Height(1)).unwrap();
+            s.confirmed.set(Height(1), Fk(2)).unwrap();
+            s.flush_class_c_tip().unwrap();
+        }
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
+        assert_eq!(s.confirmed.get(Height(1)).unwrap(), Some(Fk(2)));
+        assert!(s.is_confirmed_strong(Fk(1)).unwrap());
+        assert!(s.is_confirmed_strong(Fk(2)).unwrap());
+        assert!(s.is_confirmed_strong(Fk(3)).unwrap());
+        assert_eq!(s.repair_class_c_above_tip().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Documented hazard if tip flushed without strong: tip advanced, missing strong.
+    ///
+    /// Proves why order is strong→height→header_txs→confirmed: after this bad
+    /// partial sequence, reopen has tip with unstrong txs that repair cannot fix
+    /// (only clears above tip). Production never calls this sequence.
+    #[test]
+    fn class_c_tip_without_strong_is_unrepairable_hazard() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            s.confirmed.set(Height(0), Fk(1)).unwrap();
+            s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
+            s.tx_height.set(Fk(1), Height(0)).unwrap();
+            s.flush_class_c_tip().unwrap();
+
+            // New tip height only — intentionally skip strong/height (hazard).
+            s.confirmed.set(Height(1), Fk(2)).unwrap();
+            s.confirmed.flush().unwrap(); // tip durable without strong
+        }
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
+        // No strong for height-1 txs; repair only clears ABOVE tip.
+        assert_eq!(s.repair_class_c_above_tip().unwrap(), 0);
+        // is_confirmed_strong needs height ≤ tip AND strong — missing strong ⇒ false.
+        // There is no durable strong for Fk(2); tip is already 1 — permanent gap.
+        assert!(!s.strong_tx.is_strong(Fk(2)).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Upgrade open paths: missing optional tables recreated; unspent without range.

@@ -5,12 +5,17 @@
 //! # L2 write-behind (phase 6)
 //!
 //! Compact tables (body ≤ [`class_c_inram_max_bytes`]) load fully into process
-//! RAM on open. Mutates update the `Vec` only and mark dirty. Disk is updated as
-//! a **complete-or-fail** full body image on [`Self::flush`] / barrier — never
-//! mid-batch per-slot write-through. Tables over the cap stay pure fd L0.
+//! RAM on open. Mutates update the `Vec` only and mark dirty. Disk is updated on
+//! [`Self::flush`] / barrier:
 //!
-//! Length is an atomic publish barrier: slots `0..len` are complete in RAM (L2)
-//! or on the published file range (L0).
+//! - **Append-only** (dirty only at indices ≥ last flushed len): write the new
+//!   **suffix** only, then extend HWM — never overwrites published prefix bytes.
+//! - **Truncate**: shrink HWM only (complete-or-fail length publish).
+//! - **In-prefix mutate** (rare for tip Class C): full body rewrite (residual
+//!   mid-pwrite tear risk on same-size published range — mitigated by tip-last
+//!   barrier so `confirmed` is not advanced until strong/height are durable).
+//!
+//! Tables over the cap stay pure fd L0 (per-slot write-through).
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
@@ -43,17 +48,22 @@ pub struct ArrayTable {
     /// `Some` = L2 authoritative image; `None` = L0 fd-only path.
     data: RwLock<Option<Vec<u64>>>,
     dirty: AtomicBool,
+    /// Min index mutated since last flush (`u64::MAX` = none).
+    dirty_lo: AtomicU64,
+    /// Element count last successfully flushed to disk (L2).
+    disk_len: AtomicU64,
 }
 
 impl ArrayTable {
     pub fn create(path: impl AsRef<Path>, kind: TableKind) -> Result<Self, StoreError> {
         let file = TableFile::create(path.as_ref(), kind)?;
-        // Empty tables always fit L2.
         Ok(Self {
             file,
             len: AtomicU64::new(0),
             data: RwLock::new(Some(Vec::new())),
             dirty: AtomicBool::new(false),
+            dirty_lo: AtomicU64::new(u64::MAX),
+            disk_len: AtomicU64::new(0),
         })
     }
 
@@ -67,7 +77,6 @@ impl ArrayTable {
         let data = if body <= class_c_inram_max_bytes() {
             let mut v = vec![0u64; n as usize];
             if n > 0 {
-                // Sequential complete-or-fail load of the durability unit.
                 let mut bytes = vec![0u8; body as usize];
                 file.read_at(FILE_HEADER_LEN as u64, &mut bytes)?;
                 for (i, chunk) in bytes.chunks_exact(8).enumerate() {
@@ -83,10 +92,11 @@ impl ArrayTable {
             len: AtomicU64::new(n),
             data: RwLock::new(data),
             dirty: AtomicBool::new(false),
+            dirty_lo: AtomicU64::new(u64::MAX),
+            disk_len: AtomicU64::new(n),
         })
     }
 
-    /// True when this table is authoritative in process RAM (L2).
     #[cfg(test)]
     pub fn is_inram(&self) -> bool {
         self.data.read().unwrap_or_else(|e| e.into_inner()).is_some()
@@ -98,6 +108,22 @@ impl ArrayTable {
 
     fn offset(index: u64) -> u64 {
         FILE_HEADER_LEN as u64 + index * ELEM
+    }
+
+    fn mark_dirty_index(&self, index: u64) {
+        self.dirty.store(true, Ordering::Release);
+        let mut cur = self.dirty_lo.load(Ordering::Relaxed);
+        while index < cur {
+            match self.dirty_lo.compare_exchange_weak(
+                cur,
+                index,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(c) => cur = c,
+            }
+        }
     }
 
     pub fn get(&self, index: u64) -> Result<u64, StoreError> {
@@ -115,7 +141,6 @@ impl ArrayTable {
         Ok(u64::from_le_bytes(buf))
     }
 
-    /// Set value at `index`, growing with zero-fill if needed.
     pub fn set(&self, index: u64, value: u64) -> Result<(), StoreError> {
         let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
         if let Some(ref mut v) = *guard {
@@ -125,11 +150,10 @@ impl ArrayTable {
             }
             v[index as usize] = value;
             self.len.store(v.len() as u64, Ordering::Release);
-            self.dirty.store(true, Ordering::Release);
+            self.mark_dirty_index(index);
             return Ok(());
         }
         drop(guard);
-        // L0 path: write-through (large tables).
         let len = self.len.load(Ordering::Acquire);
         if index >= len {
             for i in len..index {
@@ -145,12 +169,12 @@ impl ArrayTable {
         Ok(())
     }
 
-    /// Set many (index, value) pairs. Grows once to max index.
     pub fn set_many(&self, pairs: &[(u64, u64)]) -> Result<(), StoreError> {
         if pairs.is_empty() {
             return Ok(());
         }
         let max_idx = pairs.iter().map(|(i, _)| *i).max().unwrap();
+        let min_idx = pairs.iter().map(|(i, _)| *i).min().unwrap();
         let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
         if let Some(ref mut v) = *guard {
             let need = max_idx as usize + 1;
@@ -161,11 +185,10 @@ impl ArrayTable {
                 v[index as usize] = value;
             }
             self.len.store(v.len() as u64, Ordering::Release);
-            self.dirty.store(true, Ordering::Release);
+            self.mark_dirty_index(min_idx);
             return Ok(());
         }
         drop(guard);
-        // L0
         let len = self.len.load(Ordering::Acquire);
         if max_idx >= len {
             let new_len = max_idx + 1;
@@ -189,7 +212,6 @@ impl ArrayTable {
         Ok(())
     }
 
-    /// Shrink to `new_len` slots (tip disconnect).
     pub fn truncate(&self, new_len: u64) -> Result<(), StoreError> {
         let len = self.len.load(Ordering::Acquire);
         if new_len > len {
@@ -199,7 +221,9 @@ impl ArrayTable {
         if let Some(ref mut v) = *guard {
             v.truncate(new_len as usize);
             self.len.store(new_len, Ordering::Release);
-            self.dirty.store(true, Ordering::Release);
+            // Shrink is a length-only publish; mark dirty from 0 so flush takes
+            // the truncate path (set_logical_len), not an append.
+            self.mark_dirty_index(0);
             return Ok(());
         }
         drop(guard);
@@ -209,9 +233,8 @@ impl ArrayTable {
         Ok(())
     }
 
-    /// Write dirty L2 image to disk as one complete body (or no-op if clean/L0).
-    ///
-    /// Complete-or-fail: full payload pwrite then `set_logical_len` / HWM.
+    /// Persist dirty L2 image. Prefers append-only suffix writes so published
+    /// prefix bytes are never overwritten mid-barrier.
     pub fn flush_dirty(&self) -> Result<(), StoreError> {
         let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
         let Some(ref v) = *guard else {
@@ -221,8 +244,52 @@ impl ArrayTable {
             return Ok(());
         }
         let n = v.len() as u64;
+        let disk = self.disk_len.load(Ordering::Acquire);
+        let dirty_lo = self.dirty_lo.load(Ordering::Acquire);
+
+        if n < disk {
+            // Truncate: shrink HWM only — published prefix of length n stays.
+            drop(guard);
+            let logical = FILE_HEADER_LEN as u64 + n * ELEM;
+            self.file.set_logical_len(logical)?;
+            self.disk_len.store(n, Ordering::Release);
+            self.dirty.store(false, Ordering::Release);
+            self.dirty_lo.store(u64::MAX, Ordering::Release);
+            return Ok(());
+        }
+
+        if n == disk && dirty_lo >= disk {
+            // No length change and no in-prefix dirty — nothing to write.
+            drop(guard);
+            self.dirty.store(false, Ordering::Release);
+            self.dirty_lo.store(u64::MAX, Ordering::Release);
+            return Ok(());
+        }
+
+        if dirty_lo >= disk && n > disk {
+            // Pure append: write only new slots, then extend HWM.
+            // Complete-or-fail: pwrite suffix fully before publish.
+            let start = disk as usize;
+            let mut bytes = vec![0u8; ((n - disk) as usize) * 8];
+            for (i, &val) in v[start..].iter().enumerate() {
+                bytes[i * 8..(i + 1) * 8].copy_from_slice(&val.to_le_bytes());
+            }
+            drop(guard);
+            self.file.write_at(Self::offset(disk), &bytes)?;
+            // write_at already published HWM to cover the suffix end.
+            let logical = FILE_HEADER_LEN as u64 + n * ELEM;
+            // Ensure HWM exact (write_at publishes end of write which equals this).
+            debug_assert_eq!(self.file.logical_len(), logical);
+            let _ = logical;
+            self.disk_len.store(n, Ordering::Release);
+            self.dirty.store(false, Ordering::Release);
+            self.dirty_lo.store(u64::MAX, Ordering::Release);
+            return Ok(());
+        }
+
+        // In-prefix mutate: full body rewrite (tip Class C rarely hits this;
+        // residual same-size tear risk — see docs/crash-recovery.md).
         let body_bytes = n.saturating_mul(ELEM);
-        // Encode to one contiguous buffer — single durability unit.
         let mut bytes = vec![0u8; body_bytes as usize];
         for (i, &val) in v.iter().enumerate() {
             bytes[i * 8..(i + 1) * 8].copy_from_slice(&val.to_le_bytes());
@@ -233,9 +300,10 @@ impl ArrayTable {
                 .write_at(FILE_HEADER_LEN as u64, &bytes)?;
         }
         let logical = FILE_HEADER_LEN as u64 + body_bytes;
-        // set_logical_len may shrink HWM after truncate.
         self.file.set_logical_len(logical)?;
+        self.disk_len.store(n, Ordering::Release);
         self.dirty.store(false, Ordering::Release);
+        self.dirty_lo.store(u64::MAX, Ordering::Release);
         Ok(())
     }
 
@@ -299,8 +367,6 @@ mod tests {
         ));
         t.flush().unwrap();
         {
-            // Corrupt: non-multiple-of-8 body under HWM.
-            // Write HWM to HEADER+3 via raw header poke.
             let mut raw = std::fs::read(&path).unwrap();
             let bad = (FILE_HEADER_LEN as u64 + 3).to_le_bytes();
             raw[8..16].copy_from_slice(&bad);
@@ -313,7 +379,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Write-behind: mutate without flush → reopen sees last durable image.
     #[test]
     fn write_behind_no_flush_reopen_keeps_old_image() {
         let path = tmp_path();
@@ -322,12 +387,10 @@ mod tests {
             let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
             t.set_many(&[(0, 10), (1, 20)]).unwrap();
             t.flush().unwrap();
-            // Mutate in RAM only — no flush (simulate kill mid-commit).
             t.set(0, 999).unwrap();
             t.set(2, 30).unwrap();
             assert_eq!(t.get(0).unwrap(), 999);
             assert_eq!(t.len(), 3);
-            // Drop without flush.
         }
         let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
         assert_eq!(t.len(), 2, "len must stay at last flushed image");
@@ -337,7 +400,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Barrier: mutate + flush → reopen matches.
     #[test]
     fn write_behind_flush_reopen_sees_new_image() {
         let path = tmp_path();
@@ -357,7 +419,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Truncate + flush + reopen.
     #[test]
     fn write_behind_truncate_flush_reopen() {
         let path = tmp_path();
@@ -368,7 +429,6 @@ mod tests {
             t.flush().unwrap();
             t.truncate(2).unwrap();
             assert_eq!(t.len(), 2);
-            // Without flush, disk still has 4.
             drop(t);
             let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
             assert_eq!(t.len(), 4);
@@ -379,6 +439,27 @@ mod tests {
         assert_eq!(t.len(), 2);
         assert_eq!(t.get(0).unwrap(), 1);
         assert_eq!(t.get(1).unwrap(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Tip extension is append-only: after first flush, only suffix is written.
+    #[test]
+    fn append_only_flush_extends_without_losing_prefix() {
+        let path = tmp_path();
+        let _ = std::fs::remove_file(&path);
+        {
+            let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
+            t.set_many(&[(0, 100), (1, 101)]).unwrap();
+            t.flush().unwrap();
+            // Pure tip extension (dirty_lo = 2 >= disk_len = 2).
+            t.set(2, 102).unwrap();
+            t.flush().unwrap();
+        }
+        let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.get(0).unwrap(), 100);
+        assert_eq!(t.get(1).unwrap(), 101);
+        assert_eq!(t.get(2).unwrap(), 102);
         let _ = std::fs::remove_file(&path);
     }
 }

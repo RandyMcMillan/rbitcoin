@@ -23,10 +23,13 @@ On open, `repair_class_c_above_tip` clears strong/height **above** tip (tip-rela
 ### L2 write-behind + body queue (phase 6)
 
 - Compact Class C (`confirmed`, `header_txs_*`, `strong_tx`) mutate **RAM only** during the commit batch.
-- Disk is updated as one complete body image per dirty table on `flush_class_c_tip` (not mid-batch per-slot write-through).
-- **Kill mid-commit (before barrier):** BQ still holds block payloads → re-drive rebuilds Class C; disk L2 image stays last good flush.
-- **Kill after barrier + before dequeue:** tip durable; BQ entry may still exist (harmless re-confirm / dequeue).
-- Prefer **loss of uncommitted tip** over a **torn multi-slot Class C image**.
+- Barrier order on disk (**tip last**): `strong_tx` → `tx_height` → `header_txs` → **`confirmed[]` last**.
+  - Mid-barrier kill after pre-tip tables: tip stays old; strong/height above tip repaired by `repair_class_c_above_tip`.
+  - Never flush `confirmed` before strong/height — that yields tip with permanent unstrong txs (repair only clears **above** tip).
+- Append-only tip extension writes **suffix only** (no overwrite of published prefix). In-prefix same-size full rewrites remain a residual mid-pwrite tear risk; tip-last + BQ re-drive mitigate.
+- **Kill mid-commit (before full barrier):** BQ still holds payloads → re-drive; disk tip image stays last good full barrier.
+- **Kill after full barrier + before dequeue:** tip durable; BQ entry may still exist (harmless).
+- Prefer **loss of uncommitted tip** over a **torn tip-ahead-of-strong** image.
 
 ## Class A (archive)
 

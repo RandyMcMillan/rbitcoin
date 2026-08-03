@@ -86,7 +86,7 @@ mod tests {
                 value: Amount::from_sat(10),
                 script_pubkey: ScriptBuf::from_bytes(spk),
             }],
-            tx: Transaction {
+            tx: crate::block::JobTx::owned(Transaction {
                 version: bitcoin::transaction::Version::TWO,
                 lock_time: LockTime::ZERO,
                 input: vec![TxIn {
@@ -99,17 +99,17 @@ mod tests {
                     value: Amount::from_sat(1),
                     script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
                 }],
-            },
+            }),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
         };
-        assert!(verify(&job, 0, &job.tx).is_err());
+        assert!(verify(&job, 0, &*job.tx).is_err());
 
         let mut job2 = job;
         job2.tx.input[0].witness = Witness::from_slice(&[vec![0x51]]); // OP_TRUE script
-        assert!(verify_with_scripthash(&job2, 0, &job2.tx, &[0u8; 32]).is_err());
+        assert!(verify_with_scripthash(&job2, 0, &*job2.tx, &[0u8; 32]).is_err());
     }
 }

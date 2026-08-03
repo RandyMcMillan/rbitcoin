@@ -36,7 +36,8 @@ pub(crate) use classify::is_anyone_can_spend;
 /// `vin=` so IBD logs name the failing spend (batch-first height alone is not enough).
 pub(crate) fn verify_job_all_inputs(job: &ScriptCheckJob) -> Result<(), ConsensusError> {
     use bitcoin::sighash::SighashCache;
-    let tx = &job.tx;
+    // JobTx may be shared wire Arc — always take &Transaction (not &JobTx).
+    let tx: &Transaction = &*job.tx;
     let n = job.prevouts.len();
     if n == 0 {
         return Ok(());
@@ -564,7 +565,7 @@ mod verify_routing_tests {
         let job = ScriptCheckJob {
             txid: [0u8; 32],
             prevouts: vec![],
-            tx: tx.clone(),
+            tx: crate::block::JobTx::owned(tx.clone()),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
@@ -579,20 +580,20 @@ mod verify_routing_tests {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
-            tx: Transaction {
+            tx: crate::block::JobTx::owned(Transaction {
                 version: bitcoin::transaction::Version::TWO,
                 lock_time: LockTime::ZERO,
                 input: vec![],
                 output: vec![],
-            },
+            }),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
         };
-        let mut cache = bitcoin::sighash::SighashCache::new(&job2.tx);
-        assert!(verify_input(&job2, 0, &job2.tx, &mut cache).is_err());
+        let mut cache = bitcoin::sighash::SighashCache::new(&*job2.tx);
+        assert!(verify_input(&job2, 0, &*job2.tx, &mut cache).is_err());
     }
 
     #[test]
@@ -637,7 +638,7 @@ mod verify_routing_tests {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(spk),
             }],
-            tx: Transaction {
+            tx: crate::block::JobTx::owned(Transaction {
                 version: bitcoin::transaction::Version::TWO,
                 lock_time: LockTime::ZERO,
                 input: vec![TxIn {
@@ -653,7 +654,7 @@ mod verify_routing_tests {
                     value: Amount::from_sat(1),
                     script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
                 }],
-            },
+            }),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
@@ -777,7 +778,7 @@ mod verify_routing_tests {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(p2sh),
             }],
-            tx: Transaction {
+            tx: crate::block::JobTx::owned(Transaction {
                 version: bitcoin::transaction::Version::ONE,
                 lock_time: LockTime::ZERO,
                 input: vec![TxIn {
@@ -793,7 +794,7 @@ mod verify_routing_tests {
                     value: Amount::from_sat(1),
                     script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
                 }],
-            },
+            }),
             bip65_active: false,
             bip112_active: false,
             bip66_active: false,

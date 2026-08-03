@@ -263,15 +263,15 @@ mod tests {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]), // not 23-byte P2SH
             }],
-            tx: tx.clone(),
+            tx: crate::block::JobTx::owned(tx.clone()),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
         };
-        let mut cache = SighashCache::new(&job.tx);
-        let r = try_p2sh_p2wpkh(&job, 0, &job.tx, &mut cache);
+        let mut cache = SighashCache::new(&*job.tx);
+        let r = try_p2sh_p2wpkh(&job, 0, &*job.tx, &mut cache);
         assert!(matches!(r, Some(Err(_))));
 
         // Wrong redeem hash
@@ -281,16 +281,16 @@ mod tests {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&[0xff]),
             }],
-            tx: tx.clone(),
+            tx: crate::block::JobTx::owned(tx.clone()),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
         };
-        let mut cache2 = SighashCache::new(&job2.tx);
+        let mut cache2 = SighashCache::new(&*job2.tx);
         assert!(matches!(
-            try_p2sh_p2wpkh(&job2, 0, &job2.tx, &mut cache2),
+            try_p2sh_p2wpkh(&job2, 0, &*job2.tx, &mut cache2),
             Some(Err(_))
         ));
 
@@ -310,14 +310,14 @@ mod tests {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(vec![0x00]), // short spk
             }],
-            tx: tx3.clone(),
+            tx: crate::block::JobTx::owned(tx3.clone()),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
         };
-        assert!(matches!(try_p2sh_p2wsh(&job3, 0, &job3.tx), Some(Err(_))));
+        assert!(matches!(try_p2sh_p2wsh(&job3, 0, &*job3.tx), Some(Err(_))));
         // wrong hash
         let job4 = ScriptCheckJob {
             txid: [0u8; 32],
@@ -325,14 +325,14 @@ mod tests {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&[0x01]),
             }],
-            tx: tx3.clone(),
+            tx: crate::block::JobTx::owned(tx3.clone()),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
         };
-        assert!(matches!(try_p2sh_p2wsh(&job4, 0, &job4.tx), Some(Err(_))));
+        assert!(matches!(try_p2sh_p2wsh(&job4, 0, &*job4.tx), Some(Err(_))));
 
         // Multi-push → None (fallthrough)
         let mut tx5 = dummy_tx();
@@ -343,19 +343,19 @@ mod tests {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&[0xaa]),
             }],
-            tx: tx5.clone(),
+            tx: crate::block::JobTx::owned(tx5.clone()),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
         };
-        let mut c5 = SighashCache::new(&job5.tx);
-        assert!(try_p2sh_p2wpkh(&job5, 0, &job5.tx, &mut c5).is_none());
-        assert!(try_p2sh_p2wsh(&job5, 0, &job5.tx).is_none());
+        let mut c5 = SighashCache::new(&*job5.tx);
+        assert!(try_p2sh_p2wpkh(&job5, 0, &*job5.tx, &mut c5).is_none());
+        assert!(try_p2sh_p2wsh(&job5, 0, &*job5.tx).is_none());
 
         // Legacy wrong spk / hash / empty
-        assert!(verify_p2sh_legacy(&job3, 0, &job3.tx).is_err());
+        assert!(verify_p2sh_legacy(&job3, 0, &*job3.tx).is_err());
         let mut tx_empty = dummy_tx();
         tx_empty.input[0].script_sig = ScriptBuf::new();
         let job_e = ScriptCheckJob {
@@ -364,14 +364,14 @@ mod tests {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&[0x51]),
             }],
-            tx: tx_empty.clone(),
+            tx: crate::block::JobTx::owned(tx_empty.clone()),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
         };
-        assert!(verify_p2sh_legacy(&job_e, 0, &job_e.tx).is_err());
+        assert!(verify_p2sh_legacy(&job_e, 0, &*job_e.tx).is_err());
         // Hash mismatch on legacy
         let mut tx_leg = dummy_tx();
         tx_leg.input[0].script_sig = ScriptBuf::from_bytes(vec![0x01, 0x51]);
@@ -381,14 +381,14 @@ mod tests {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&[0xff]),
             }],
-            tx: tx_leg.clone(),
+            tx: crate::block::JobTx::owned(tx_leg.clone()),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
         };
-        assert!(verify_p2sh_legacy(&job_h, 0, &job_h.tx).is_err());
+        assert!(verify_p2sh_legacy(&job_h, 0, &*job_h.tx).is_err());
     }
 
     /// Matching outer hash routes into p2wsh/p2wpkh verify (covers scripthash copy path).
@@ -409,7 +409,7 @@ mod tests {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&redeem_wsh),
             }],
-            tx: tx.clone(),
+            tx: crate::block::JobTx::owned(tx.clone()),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
@@ -417,7 +417,7 @@ mod tests {
             taproot_active: true,
         };
         // Empty witness → p2wsh fails, but try_p2sh_p2wsh reached scripthash copy + call.
-        assert!(matches!(try_p2sh_p2wsh(&job, 0, &job.tx), Some(Err(_))));
+        assert!(matches!(try_p2sh_p2wsh(&job, 0, &*job.tx), Some(Err(_))));
 
         let redeem_wpkh = {
             let mut r = vec![0x00, 0x14];
@@ -434,16 +434,16 @@ mod tests {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&redeem_wpkh),
             }],
-            tx: tx2.clone(),
+            tx: crate::block::JobTx::owned(tx2.clone()),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
         };
-        let mut cache = SighashCache::new(&job2.tx);
+        let mut cache = SighashCache::new(&*job2.tx);
         assert!(matches!(
-            try_p2sh_p2wpkh(&job2, 0, &job2.tx, &mut cache),
+            try_p2sh_p2wpkh(&job2, 0, &*job2.tx, &mut cache),
             Some(Err(_))
         ));
 
@@ -460,14 +460,14 @@ mod tests {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&redeem),
             }],
-            tx: tx3.clone(),
+            tx: crate::block::JobTx::owned(tx3.clone()),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
         };
-        assert!(verify_p2sh_legacy(&job3, 0, &job3.tx).is_ok());
+        assert!(verify_p2sh_legacy(&job3, 0, &*job3.tx).is_ok());
 
         // OP_0 as first stack item in split (covers n==0x00 branch already hit);
         // also OP_16 small-int push.

@@ -390,8 +390,9 @@ pub fn confirm_wire_prep_phase_pipelined(
                     .map_err(|_| ConsensusError::InvalidPow)?;
             }
         } else {
-            let prev = &wire_blocks[i - 1];
-            if block.header.prev_blockhash != prev.block_hash() {
+            // Prev wire hash already stored on metas[i-1] — no rehash.
+            let prev_hash = metas[i - 1].hash;
+            if block.header.prev_blockhash.to_byte_array() != prev_hash {
                 return Err(ConsensusError::BadPrev);
             }
             // PoW bits/target (no store retarget mid-batch for regtest).
@@ -422,12 +423,13 @@ pub fn confirm_wire_prep_phase_pipelined(
                 .put_header(&header_rec)
                 .map_err(ConsensusError::Store)?
         };
+        let prev_bytes = block.header.prev_blockhash.to_byte_array();
         query.confirm_parent_cache().put_header_plan(
             height.0,
             header_fk,
             header_rec.clone(),
             Vec::new(),
-            block.header.prev_blockhash.to_byte_array(),
+            prev_bytes,
         );
         ns_header = ns_header.saturating_add(t.elapsed().as_nanos() as u64);
         with_fk.push((header_fk, header_rec.clone(), txs));
@@ -447,7 +449,7 @@ pub fn confirm_wire_prep_phase_pipelined(
         .archive_filter_need_bodies(&mut with_fk)
         .map_err(ConsensusError::Store)?;
     let mut plan = if need.is_empty() {
-        for m in &mut metas {
+        for (i, m) in metas.iter_mut().enumerate() {
             if let Some(list) = query
                 .store()
                 .header_txs
@@ -456,11 +458,8 @@ pub fn confirm_wire_prep_phase_pipelined(
             {
                 m.tx_fks = list;
             }
-            let prev = wire_blocks
-                .iter()
-                .find(|b| b.block_hash().to_byte_array() == m.hash)
-                .map(|b| b.header.prev_blockhash.to_byte_array())
-                .unwrap_or([0u8; 32]);
+            // Index by batch position — never rehash wire for lookup.
+            let prev = wire_blocks[i].header.prev_blockhash.to_byte_array();
             query.confirm_parent_cache().put_header_plan(
                 m.height.0,
                 m.header_fk,
@@ -496,7 +495,7 @@ pub fn confirm_wire_prep_phase_pipelined(
                 .to_vec();
             by_header.insert(hid, slice);
         }
-        for m in &mut metas {
+        for (i, m) in metas.iter_mut().enumerate() {
             if let Some(id) = m.header_fk.get() {
                 if let Some(fks) = by_header.get(&id) {
                     m.tx_fks = fks.clone();
@@ -512,11 +511,7 @@ pub fn confirm_wire_prep_phase_pipelined(
                     m.tx_fks = list;
                 }
             }
-            let prev = wire_blocks
-                .iter()
-                .find(|b| b.block_hash().to_byte_array() == m.hash)
-                .map(|b| b.header.prev_blockhash.to_byte_array())
-                .unwrap_or([0u8; 32]);
+            let prev = wire_blocks[i].header.prev_blockhash.to_byte_array();
             query.confirm_parent_cache().put_header_plan(
                 m.height.0,
                 m.header_fk,
@@ -1107,8 +1102,9 @@ fn wire_plan_phase(
                     .map_err(|_| ConsensusError::InvalidPow)?;
             }
         } else {
-            let prev = &wire_blocks[i - 1];
-            if block.header.prev_blockhash != prev.block_hash() {
+            // Prev wire hash already on metas[i-1] — no rehash.
+            let prev_hash = metas[i - 1].hash;
+            if block.header.prev_blockhash.to_byte_array() != prev_hash {
                 return Err(ConsensusError::BadPrev);
             }
             let target = bitcoin::Target::from_compact(block.header.bits);
@@ -1137,12 +1133,13 @@ fn wire_plan_phase(
                 .put_header(&header_rec)
                 .map_err(ConsensusError::Store)?
         };
+        let prev_bytes = block.header.prev_blockhash.to_byte_array();
         query.confirm_parent_cache().put_header_plan(
             height.0,
             header_fk,
             header_rec.clone(),
             Vec::new(),
-            block.header.prev_blockhash.to_byte_array(),
+            prev_bytes,
         );
         prepare_ns = prepare_ns.saturating_add(t_prep.elapsed().as_nanos() as u64);
         with_fk.push((header_fk, header_rec.clone(), txs));
@@ -1164,7 +1161,7 @@ fn wire_plan_phase(
     let filter_ns = t_filter.elapsed().as_nanos() as u64;
     let t_mega = Instant::now();
     let plan = if need.is_empty() {
-        for m in &mut metas {
+        for (i, m) in metas.iter_mut().enumerate() {
             if let Some(list) = query
                 .store()
                 .header_txs
@@ -1173,11 +1170,8 @@ fn wire_plan_phase(
             {
                 m.tx_fks = list;
             }
-            let prev = wire_blocks
-                .iter()
-                .find(|b| b.block_hash().to_byte_array() == m.hash)
-                .map(|b| b.header.prev_blockhash.to_byte_array())
-                .unwrap_or([0u8; 32]);
+            // Index by batch position — never rehash wire for lookup.
+            let prev = wire_blocks[i].header.prev_blockhash.to_byte_array();
             query.confirm_parent_cache().put_header_plan(
                 m.height.0,
                 m.header_fk,
@@ -1213,7 +1207,7 @@ fn wire_plan_phase(
                 .to_vec();
             by_header.insert(hid, slice);
         }
-        for m in &mut metas {
+        for (i, m) in metas.iter_mut().enumerate() {
             if let Some(id) = m.header_fk.get() {
                 if let Some(fks) = by_header.get(&id) {
                     m.tx_fks = fks.clone();
@@ -1229,11 +1223,7 @@ fn wire_plan_phase(
                     m.tx_fks = list;
                 }
             }
-            let prev = wire_blocks
-                .iter()
-                .find(|b| b.block_hash().to_byte_array() == m.hash)
-                .map(|b| b.header.prev_blockhash.to_byte_array())
-                .unwrap_or([0u8; 32]);
+            let prev = wire_blocks[i].header.prev_blockhash.to_byte_array();
             query.confirm_parent_cache().put_header_plan(
                 m.height.0,
                 m.header_fk,
@@ -3735,8 +3725,12 @@ fn assemble_run(
     for (i, meta) in metas.into_iter().enumerate() {
         let block = &wire_blocks[i];
         let height = meta.height;
+        // Once-computed at plan/structure — never rehash `block_hash()` here.
         let block_hash = meta.hash;
         let ctx = ValidationContext::at(params, height, milestone);
+
+        // Prev-block MTP: resolved **once** for header rule + BIP16 + BIP113.
+        let prev_mtp: u32;
 
         if i == 0 {
             // MTP + prev link for the first height of a load batch.
@@ -3778,6 +3772,7 @@ fn assemble_run(
                 if block.header.time <= mtp {
                     return Err(ConsensusError::BadHeader("timestamp <= median-time-past"));
                 }
+                prev_mtp = mtp;
                 time_window = times;
 
                 // Bits / PoW / checkpoint: store when parent is confirmed; else plan.
@@ -3790,8 +3785,9 @@ fn assemble_run(
                 } else if let Some(prev_plan) =
                     query.confirm_parent_cache().get_header_plan(prev_h.0)
                 {
+                    // Checkpoint uses once-computed meta.hash (no header rehash).
                     if let Some(cp) = params.checkpoint_at(height) {
-                        if cp != block.header.block_hash() {
+                        if cp.to_byte_array() != block_hash {
                             return Err(ConsensusError::BadHeader("checkpoint mismatch"));
                         }
                     }
@@ -3821,6 +3817,7 @@ fn assemble_run(
                     )));
                 }
             } else {
+                prev_mtp = 0;
                 validate_header(query, params, height, &block.header)?;
             }
         } else {
@@ -3828,12 +3825,14 @@ fn assemble_run(
             if block.header.prev_blockhash.to_byte_array() != prev.hash {
                 return Err(ConsensusError::BadPrev);
             }
+            // time_window ends at previous block → median is prev-block MTP.
             let mtp = median_time_past_times(&time_window);
             if block.header.time <= mtp {
                 return Err(ConsensusError::BadHeader("timestamp <= median-time-past"));
             }
+            prev_mtp = mtp;
             if let Some(cp) = params.checkpoint_at(height) {
-                if cp != block.header.block_hash() {
+                if cp.to_byte_array() != block_hash {
                     return Err(ConsensusError::BadHeader("checkpoint mismatch"));
                 }
             }
@@ -3866,10 +3865,17 @@ fn assemble_run(
             }
         }
 
+        let bip16_active = crate::block::bip16_active_from_prev_mtp(
+            params,
+            height.0,
+            &block_hash,
+            prev_mtp,
+        );
+
         let t_connect = Instant::now();
         let (script_jobs, spends, fees) = assemble_block_prevouts(
             query,
-            block,
+            block.as_ref(),
             &ctx,
             Some(&meta.tx_fks),
             &mut pending_spent,
@@ -3877,6 +3883,10 @@ fn assemble_run(
             batch_parents,
             batch_thin,
             &meta.txids,
+            prev_mtp,
+            &block_hash,
+            bip16_active,
+            Some(block), // share wire Arc — no Transaction clone into jobs
         )?;
         confirm_phase_stats::CONNECT_NS
             .fetch_add(t_connect.elapsed().as_nanos() as u64, Ordering::Relaxed);

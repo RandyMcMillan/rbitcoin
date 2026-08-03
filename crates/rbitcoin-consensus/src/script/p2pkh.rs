@@ -110,15 +110,15 @@ mod tests {
                 value: Amount::from_sat(10),
                 script_pubkey: ScriptBuf::from_bytes(spk),
             }],
-            tx: tx.clone(),
+            tx: crate::block::JobTx::owned(tx.clone()),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
         };
-        let mut cache = SighashCache::new(&job.tx);
-        let err = verify(&job, 0, &job.tx, &mut cache).unwrap_err();
+        let mut cache = SighashCache::new(&*job.tx);
+        let err = verify(&job, 0, &*job.tx, &mut cache).unwrap_err();
         assert!(format!("{err}").contains("p2pkh"));
     }
 }

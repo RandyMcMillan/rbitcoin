@@ -8,7 +8,10 @@ use bitcoin::script::{Script, ScriptBuf};
 use bitcoin::{Amount, OutPoint, Transaction, TxOut};
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
+use std::borrow::Borrow;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 pub struct ValidationContext<'a> {
     pub params: &'a ChainParams,
@@ -527,6 +530,15 @@ pub fn validate_block_connect(
         .iter()
         .map(|t| t.compute_txid().to_byte_array())
         .collect();
+    let block_hash = block.header.block_hash().to_byte_array();
+    // Unit connect: one prev-MTP resolve here (no triple re-walk inside assemble).
+    let prev_mtp = if ctx.height.0 == 0 {
+        0
+    } else {
+        crate::header::median_time_past(query, Height(ctx.height.0 - 1)).unwrap_or(0)
+    };
+    let bip16_active =
+        bip16_active_from_prev_mtp(ctx.params, ctx.height.0, &block_hash, prev_mtp);
     let (script_jobs, spends, fees) = assemble_block_prevouts(
         query,
         block,
@@ -537,6 +549,10 @@ pub fn validate_block_connect(
         &batch_parents,
         &batch_thin,
         &create_txids,
+        prev_mtp,
+        &block_hash,
+        bip16_active,
+        None, // unit connect: owned job txs
     )?;
     if check_scripts && !script_jobs.is_empty() {
         verify_scripts_pool(&script_jobs)?;
@@ -575,45 +591,124 @@ pub(crate) enum AssembleMode {
 ///
 /// Mainnet BIP16 exception block (never enforce P2SH redeem), Core `BIP16Exception`.
 /// Height 170060 — pre-activation spends of HASH160/EQUAL as bare scripts.
-const BIP16_EXCEPTION_MAINNET: [u8; 32] = [
+pub(crate) const BIP16_EXCEPTION_MAINNET: [u8; 32] = [
     // little-endian display hash 00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22
     0x22, 0x9c, 0x4f, 0xac, 0x88, 0xba, 0xb1, 0x94, 0xeb, 0x08, 0xf1, 0xa5, 0x28, 0xcc, 0x30,
     0x8d, 0xed, 0x23, 0x97, 0xf4, 0xf4, 0xeb, 0x6e, 0x75, 0xdc, 0x02, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00,
 ];
 
-/// BIP16 P2SH flag for scripts in `block` at `ctx.height`.
-fn bip16_active_for_block(
-    query: &Query,
-    ctx: &ValidationContext<'_>,
-    block: &Block,
+/// BIP16 P2SH from **precomputed** prev MTP + block hash (no header re-walk, no rehash).
+///
+/// Callers must pass the same prev-block MTP used for BIP113 / header MTP checks
+/// and the once-computed block hash (plan `meta.hash` / structure).
+#[inline]
+pub(crate) fn bip16_active_from_prev_mtp(
+    params: &ChainParams,
+    height: u32,
+    block_hash: &[u8; 32],
+    prev_mtp: u32,
 ) -> bool {
-    use bitcoin::hashes::Hash;
     // Exception block: never SCRIPT_VERIFY_P2SH.
-    if block.block_hash().to_byte_array() == BIP16_EXCEPTION_MAINNET {
+    if *block_hash == BIP16_EXCEPTION_MAINNET {
         return false;
     }
-    if ctx.height.0 == 0 {
+    if height == 0 {
         return false;
     }
     // Core: previous block's median-time-past >= bip16_time.
-    match crate::header::median_time_past(query, Height(ctx.height.0 - 1)) {
-        Ok(mtp) => mtp >= ctx.params.btc.bip16_time,
-        // Store missing headers (tests): fall back to known mainnet height gate.
-        Err(_) => ctx.height.0 >= 173_805,
+    prev_mtp >= params.btc.bip16_time
+}
+
+/// Transaction held by a [`ScriptCheckJob`].
+///
+/// Confirm path uses [`JobTx::shared`] so jobs borrow the wire [`Arc<Block>`]
+/// (refcount only — no deep `Transaction` clone). Tests/benches use [`JobTx::owned`].
+///
+/// Deref to [`Transaction`] so script paths keep `job.tx.input` / `&job.tx` ergonomics.
+#[derive(Clone)]
+pub(crate) struct JobTx {
+    inner: JobTxInner,
+}
+
+#[derive(Clone)]
+enum JobTxInner {
+    Owned(Transaction),
+    Shared { block: Arc<Block>, index: usize },
+}
+
+impl JobTx {
+    #[inline]
+    pub(crate) fn owned(tx: Transaction) -> Self {
+        Self {
+            inner: JobTxInner::Owned(tx),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn shared(block: Arc<Block>, index: usize) -> Self {
+        debug_assert!(index < block.txdata.len());
+        Self {
+            inner: JobTxInner::Shared { block, index },
+        }
     }
 }
 
-/// Owns a [`Transaction`] clone so the reconstructed block can be dropped before the
-/// parallel script wave, without a wasteful encode→deserialize round-trip.
+impl Deref for JobTx {
+    type Target = Transaction;
+    #[inline]
+    fn deref(&self) -> &Transaction {
+        match &self.inner {
+            JobTxInner::Owned(t) => t,
+            JobTxInner::Shared { block, index } => &block.txdata[*index],
+        }
+    }
+}
+
+impl DerefMut for JobTx {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Transaction {
+        match &mut self.inner {
+            JobTxInner::Owned(t) => t,
+            JobTxInner::Shared { .. } => {
+                panic!("ScriptCheckJob shared wire tx is immutable")
+            }
+        }
+    }
+}
+
+impl From<Transaction> for JobTx {
+    #[inline]
+    fn from(tx: Transaction) -> Self {
+        Self::owned(tx)
+    }
+}
+
+impl Borrow<Transaction> for JobTx {
+    #[inline]
+    fn borrow(&self) -> &Transaction {
+        self.deref()
+    }
+}
+
+impl AsRef<Transaction> for JobTx {
+    #[inline]
+    fn as_ref(&self) -> &Transaction {
+        self.deref()
+    }
+}
+
+/// Script-verify job for one non-coinbase create.
 ///
-/// `txid` is filled at assemble (already hashed for spend edges) so scripts can
-/// probe mempool preverified without re-hashing every job.
+/// Confirm assemble attaches the wire [`Arc<Block>`] (no tx deep-clone). `txid`
+/// is the structure/plan hash so scripts can probe mempool preverified without
+/// re-hashing.
 pub struct ScriptCheckJob {
     /// Wire txid (assemble / [`Self::new`]); used for mempool preverified skip.
     pub(crate) txid: [u8; 32],
     pub(crate) prevouts: Vec<TxOut>,
-    pub(crate) tx: Transaction,
+    /// Owned (tests) or shared wire block + index (confirm path).
+    pub(crate) tx: JobTx,
     /// BIP65 CLTV active (false → OP_CLTV is a no-op, matching pre-activation).
     pub(crate) bip65_active: bool,
     /// BIP112 CSV active (false → OP_CSV is a no-op, matching pre-activation).
@@ -652,7 +747,7 @@ impl ScriptCheckJob {
         )
     }
 
-    /// Assemble path: reuse the wire txid already computed for spend edges.
+    /// Owned-tx path (tests / benches / unit connect): reuse precomputed txid.
     #[inline]
     pub(crate) fn with_txid(
         txid: [u8; 32],
@@ -667,7 +762,32 @@ impl ScriptCheckJob {
         Self {
             txid,
             prevouts,
-            tx,
+            tx: JobTx::owned(tx),
+            bip65_active,
+            bip112_active,
+            bip66_active,
+            bip16_active,
+            taproot_active,
+        }
+    }
+
+    /// Confirm assemble: share the wire [`Arc<Block>`] (no `Transaction` clone).
+    #[inline]
+    pub(crate) fn with_shared_tx(
+        txid: [u8; 32],
+        prevouts: Vec<TxOut>,
+        block: Arc<Block>,
+        tx_index: usize,
+        bip65_active: bool,
+        bip112_active: bool,
+        bip66_active: bool,
+        bip16_active: bool,
+        taproot_active: bool,
+    ) -> Self {
+        Self {
+            txid,
+            prevouts,
+            tx: JobTx::shared(block, tx_index),
             bip65_active,
             bip112_active,
             bip66_active,
@@ -693,6 +813,12 @@ impl ScriptCheckJob {
 /// [`rbitcoin_query::BatchThin`], then shared outs FIFO / durable store.
 ///
 /// Returns `(script_jobs, spends, fees)` — fees for coinbase subsidy check on structural.
+///
+/// `prev_mtp` / `block_hash` / `bip16_active` must be computed **once** by the
+/// caller (assemble_run header window) — no re-walk of headers and no rehash.
+///
+/// `wire`: when `Some`, script jobs share that Arc (no `Transaction` clone).
+/// When `None` (unit-test connect), jobs own a deep clone of each non-cb tx.
 pub(crate) fn assemble_block_prevouts(
     query: &Query,
     block: &Block,
@@ -704,6 +830,10 @@ pub(crate) fn assemble_block_prevouts(
     batch_thin: &rbitcoin_query::BatchThin,
     // Precomputed create txids (structure / plan); required, same order as txdata.
     create_txids: &[[u8; 32]],
+    prev_mtp: u32,
+    block_hash: &[u8; 32],
+    bip16_active: bool,
+    wire: Option<&Arc<Block>>,
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
@@ -729,6 +859,10 @@ pub(crate) fn assemble_block_prevouts(
         batch_parents,
         batch_thin,
         create_txids,
+        prev_mtp,
+        block_hash,
+        bip16_active,
+        wire,
     )
 }
 
@@ -743,6 +877,10 @@ fn assemble_block_prevouts_mode(
     batch_parents: &rbitcoin_query::BatchParents,
     batch_thin: &rbitcoin_query::BatchThin,
     create_txids: &[[u8; 32]],
+    prev_mtp: u32,
+    block_hash: &[u8; 32],
+    bip16_active: bool,
+    wire: Option<&Arc<Block>>,
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
@@ -772,10 +910,13 @@ fn assemble_block_prevouts_mode(
     if !block.txdata[0].is_coinbase() {
         return Err(ConsensusError::BadBlock("first tx not coinbase"));
     }
-
-    // BIP16 (P2SH): Core uses previous block's median-time-past vs bip16_time,
-    // with one mainnet exception block that never enforces P2SH redeem rules.
-    let bip16_for_jobs = bip16_active_for_block(query, ctx, block);
+    // Caller-supplied BIP16 must match hash+prev_mtp (no silent re-resolve).
+    debug_assert_eq!(
+        bip16_active,
+        bip16_active_from_prev_mtp(ctx.params, ctx.height.0, block_hash, prev_mtp)
+    );
+    let _ = block_hash; // used in debug_assert; release keeps caller contract
+    let bip16_for_jobs = bip16_active;
 
     let n_tx = block.txdata.len();
     let mut block_spends: std::collections::HashSet<OutPoint> =
@@ -784,8 +925,8 @@ fn assemble_block_prevouts_mode(
     let mut same_block: std::collections::HashMap<[u8; 32], usize> =
         std::collections::HashMap::with_capacity(n_tx);
     let mut fees = 0i64;
-    // Skip job materialization (tx clone) when scripts are skipped — pure waste
-    // below the milestone. Prevouts still resolve for fees + full sigop cost.
+    // Skip job materialization when scripts are skipped — pure waste below the
+    // milestone. Prevouts still resolve for fees + full sigop cost.
     let build_script_jobs = !ctx.milestone.skips_scripts_at(ctx.height.0);
     let mut script_jobs: Vec<ScriptCheckJob> = if build_script_jobs {
         Vec::with_capacity(n_tx.saturating_sub(1))
@@ -813,14 +954,13 @@ fn assemble_block_prevouts_mode(
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
-    // BIP113 absolute finality cutoff: **once per block**, not per tx.
-    // (Was re-resolving median_time_past for every non-coinbase tx — dominated
-    // assemble `final=` on dense mid-mainnet blocks.)
+    // BIP113 absolute finality cutoff: **once per block**, from caller prev_mtp
+    // (same value as header MTP check — no second median_time_past walk).
     let lock_time_cutoff = if ctx.params.csv_active_at(ctx.height.0) {
         if ctx.height.0 == 0 {
             block.header.time
         } else {
-            crate::header::median_time_past(query, Height(ctx.height.0 - 1))?
+            prev_mtp
         }
     } else {
         block.header.time
@@ -1008,17 +1148,32 @@ fn assemble_block_prevouts_mode(
             if build_script_jobs {
                 let t_job = Instant::now();
                 // Reuse A1 wire txid — scripts stage must not re-hash for preverified.
-                script_jobs.push(ScriptCheckJob::with_txid(
-                    txid,
-                    prevouts,
-                    // One deep clone beats encode-at-connect + deserialize-per-worker.
-                    tx.clone(),
-                    ctx.params.bip65_active_at(ctx.height.0),
-                    ctx.params.csv_active_at(ctx.height.0),
-                    ctx.params.bip66_active_at(ctx.height.0),
-                    bip16_for_jobs,
-                    ctx.params.taproot_active_at(ctx.height.0),
-                ));
+                // Confirm: share wire Arc (no Transaction clone). Unit connect: own.
+                let job = if let Some(w) = wire {
+                    ScriptCheckJob::with_shared_tx(
+                        txid,
+                        prevouts,
+                        Arc::clone(w),
+                        ti,
+                        ctx.params.bip65_active_at(ctx.height.0),
+                        ctx.params.csv_active_at(ctx.height.0),
+                        ctx.params.bip66_active_at(ctx.height.0),
+                        bip16_for_jobs,
+                        ctx.params.taproot_active_at(ctx.height.0),
+                    )
+                } else {
+                    ScriptCheckJob::with_txid(
+                        txid,
+                        prevouts,
+                        tx.clone(),
+                        ctx.params.bip65_active_at(ctx.height.0),
+                        ctx.params.csv_active_at(ctx.height.0),
+                        ctx.params.bip66_active_at(ctx.height.0),
+                        bip16_for_jobs,
+                        ctx.params.taproot_active_at(ctx.height.0),
+                    )
+                };
+                script_jobs.push(job);
                 confirm_phase_stats::ASM_JOB_NS
                     .fetch_add(t_job.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
@@ -2052,8 +2207,8 @@ mod finality_tests {
 #[cfg(test)]
 mod structure_rule_tests {
     use super::{
-        block_subsidy, merkle_root_bytes, validate_block_structure, bip34_height_script,
-        ValidationContext,
+        bip16_active_from_prev_mtp, bip34_height_script, block_subsidy, merkle_root_bytes,
+        validate_block_structure, BIP16_EXCEPTION_MAINNET, ScriptCheckJob, ValidationContext,
     };
     use crate::error::ConsensusError;
     use crate::milestone::Milestone;
@@ -2642,6 +2797,7 @@ mod structure_rule_tests {
             .iter()
             .map(|t| t.compute_txid().to_byte_array())
             .collect();
+        let bh = block.header.block_hash().to_byte_array();
         let r = assemble_block_prevouts_mode(
             &q,
             &block,
@@ -2653,6 +2809,10 @@ mod structure_rule_tests {
             &parents,
             &thin,
             &create_txids,
+            0,
+            &bh,
+            bip16_active_from_prev_mtp(ctx.params, ctx.height.0, &bh, 0),
+            None,
         );
         // Immature coinbase or spentness walk — either exercises Full arms.
         let _ = r;
@@ -2687,8 +2847,10 @@ mod structure_rule_tests {
         let thin = BatchThin::new();
         let mut spent = HashSet::new();
         let mut creates = HashMap::new();
+        let zero = [0u8; 32];
         let err = assemble_block_prevouts(
             &q, &empty, &ctx, None, &mut spent, &mut creates, &parents, &thin, &[],
+            0, &zero, false, None,
         )
         .err()
         .expect("empty");
@@ -2698,8 +2860,10 @@ mod structure_rule_tests {
         spent.clear();
         creates.clear();
         let tids: Vec<[u8; 32]> = b.txdata.iter().map(|t| t.compute_txid().to_byte_array()).collect();
+        let bh = b.header.block_hash().to_byte_array();
         let err2 = assemble_block_prevouts(
             &q, &b, &ctx, Some(&[]), &mut spent, &mut creates, &parents, &thin, &tids,
+            0, &bh, false, None,
         )
         .err()
         .expect("fk mismatch");
@@ -2709,8 +2873,10 @@ mod structure_rule_tests {
         spent.clear();
         creates.clear();
         let tids3: Vec<[u8; 32]> = bad.txdata.iter().map(|t| t.compute_txid().to_byte_array()).collect();
+        let bh3 = bad.header.block_hash().to_byte_array();
         let err3 = assemble_block_prevouts(
             &q, &bad, &ctx, None, &mut spent, &mut creates, &parents, &thin, &tids3,
+            0, &bh3, false, None,
         )
         .err()
         .expect("not coinbase");
@@ -2971,6 +3137,79 @@ mod structure_rule_tests {
             matches!(err, ConsensusError::BadBlock(s) if s.contains("witness")),
             "got {err:?}"
         );
+    }
+
+    /// BIP16 from precomputed prev MTP — no header walk, exception hash respected.
+    #[test]
+    fn bip16_from_prev_mtp_exception_and_time() {
+        let p = Box::leak(Box::new(ChainParams::mainnet()));
+        // Exception block never enables P2SH regardless of MTP.
+        assert!(!bip16_active_from_prev_mtp(
+            p,
+            170_000,
+            &BIP16_EXCEPTION_MAINNET,
+            u32::MAX,
+        ));
+        // Pre-bip16_time MTP → inactive.
+        assert!(!bip16_active_from_prev_mtp(p, 170_000, &[1u8; 32], 0));
+        // At/after bip16_time → active.
+        assert!(bip16_active_from_prev_mtp(
+            p,
+            170_000,
+            &[1u8; 32],
+            p.btc.bip16_time,
+        ));
+        // Genesis height never.
+        assert!(!bip16_active_from_prev_mtp(
+            p,
+            0,
+            &[1u8; 32],
+            p.btc.bip16_time,
+        ));
+    }
+
+    /// Confirm jobs share wire Arc — same Transaction address, no deep clone.
+    #[test]
+    fn script_job_shared_tx_is_wire_pointer() {
+        use std::sync::Arc;
+        let spend = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([7; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let block = Arc::new(block_with(vec![coinbase(1), spend]));
+        let tid = block.txdata[1].compute_txid().to_byte_array();
+        let job = ScriptCheckJob::with_shared_tx(
+            tid,
+            vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+            Arc::clone(&block),
+            1,
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
+        assert!(std::ptr::eq(
+            &*job.tx as *const Transaction,
+            &block.txdata[1] as *const Transaction
+        ));
+        assert_eq!(job.txid, tid);
     }
 }
 

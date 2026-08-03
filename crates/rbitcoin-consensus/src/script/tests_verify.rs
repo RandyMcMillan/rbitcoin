@@ -60,7 +60,7 @@ fn make_p2wpkh_spend() -> (ScriptCheckJob, bool) {
     let job = ScriptCheckJob {
         txid: [0u8; 32],
         prevouts: vec![prevout],
-        tx: tx.clone(),
+        tx: crate::block::JobTx::owned(tx.clone()),
         bip65_active: true,
         bip112_active: true,
     bip66_active: true,
@@ -138,7 +138,7 @@ fn mainnet_508011_nested_p2wpkh_raw_sighash_0x65() {
     let job = ScriptCheckJob {
         txid: [0u8; 32],
         prevouts: vec![prevout],
-        tx,
+        tx: crate::block::JobTx::owned(tx),
         bip65_active: true,
         bip112_active: true,
         bip66_active: true,
@@ -176,7 +176,7 @@ fn anyone_can_spend_accepts() {
     let job = ScriptCheckJob {
         txid: [0u8; 32],
         prevouts: vec![prevout],
-        tx: tx.clone(),
+        tx: crate::block::JobTx::owned(tx.clone()),
         bip65_active: true,
         bip112_active: true,
     bip66_active: true,
@@ -212,7 +212,7 @@ fn pretaproot_v1_witness_program_anyone_can_spend() {
     let job = ScriptCheckJob {
         txid: [0u8; 32],
         prevouts: vec![prevout],
-        tx: tx.clone(),
+        tx: crate::block::JobTx::owned(tx.clone()),
         bip65_active: true,
         bip112_active: true,
         bip66_active: true,
@@ -246,7 +246,7 @@ fn empty_script_pubkey_rejects() {
     let job = ScriptCheckJob {
         txid: [0u8; 32],
         prevouts: vec![prevout],
-        tx: tx.clone(),
+        tx: crate::block::JobTx::owned(tx.clone()),
         bip65_active: true,
         bip112_active: true,
         bip66_active: true,
@@ -314,7 +314,7 @@ fn p2pkh_valid_signature_accepts() {
     let job = ScriptCheckJob {
         txid: [0u8; 32],
         prevouts: vec![prevout],
-        tx: tx.clone(),
+        tx: crate::block::JobTx::owned(tx.clone()),
         bip65_active: true,
         bip112_active: true,
     bip66_active: true,
@@ -355,7 +355,7 @@ fn p2wsh_op_true_accepts() {
     let job = ScriptCheckJob {
         txid: [0u8; 32],
         prevouts: vec![prevout],
-        tx: tx.clone(),
+        tx: crate::block::JobTx::owned(tx.clone()),
         bip65_active: true,
         bip112_active: true,
     bip66_active: true,
@@ -391,7 +391,7 @@ fn p2wsh_wrong_script_hash_rejects() {
     let job = ScriptCheckJob {
         txid: [0u8; 32],
         prevouts: vec![prevout],
-        tx: tx.clone(),
+        tx: crate::block::JobTx::owned(tx.clone()),
         bip65_active: true,
         bip112_active: true,
     bip66_active: true,
@@ -460,7 +460,7 @@ fn p2sh_p2wpkh_nested_accepts() {
     let job = ScriptCheckJob {
         txid: [0u8; 32],
         prevouts: vec![prevout],
-        tx: tx.clone(),
+        tx: crate::block::JobTx::owned(tx.clone()),
         bip65_active: true,
         bip112_active: true,
     bip66_active: true,
@@ -509,7 +509,7 @@ fn p2sh_legacy_multi_push_op_true_accepts() {
     let job = ScriptCheckJob {
         txid: [0u8; 32],
         prevouts: vec![prevout],
-        tx: tx.clone(),
+        tx: crate::block::JobTx::owned(tx.clone()),
         bip65_active: true,
         bip112_active: true,
     bip66_active: true,
@@ -543,7 +543,7 @@ fn mainnet_block_183_high_s_p2pk_accepts() {
     let job = ScriptCheckJob {
         txid: [0u8; 32],
         prevouts: vec![prev.output[vout].clone()],
-        tx: spend,
+        tx: crate::block::JobTx::owned(spend),
         bip65_active: true,
         bip112_active: true,
     bip66_active: true,
@@ -581,7 +581,7 @@ fn mainnet_block_110300_sighash_type_zero_p2pkh() {
     let job = ScriptCheckJob {
         txid: [0u8; 32],
         prevouts: vec![prev.output[0].clone()],
-        tx: spend,
+        tx: crate::block::JobTx::owned(spend),
         bip65_active: true,
         bip112_active: true,
     bip66_active: true,
@@ -621,7 +621,7 @@ fn mainnet_block_124276_lax_der_pre_bip66() {
     let mut job = ScriptCheckJob {
         txid: [0u8; 32],
         prevouts: vec![prev.output[0].clone()],
-        tx: spend,
+        tx: crate::block::JobTx::owned(spend),
         bip65_active: true,
         bip112_active: true,
         bip66_active: false, // height 124276 << bip66 363725
@@ -773,7 +773,7 @@ fn mainnet_block_170060_pre_bip16_p2sh_as_bare() {
     let mut job = ScriptCheckJob {
         txid: [0u8; 32],
         prevouts: vec![prev.output[vout].clone()],
-        tx: spend.clone(),
+        tx: crate::block::JobTx::owned(spend.clone()),
         bip65_active: false,
         bip112_active: false,
         bip66_active: false,
@@ -823,7 +823,7 @@ fn mainnet_block_163685_scriptsig_codeseparator_checkmultisig() {
     let job = ScriptCheckJob {
         txid: [0u8; 32],
         prevouts: vec![prev.output[0].clone(), prev.output[1].clone()],
-        tx: spend,
+        tx: crate::block::JobTx::owned(spend),
         // height 163685: pre-BIP65 / pre-BIP66 / pre-CSV
         bip65_active: false,
         bip112_active: false,
@@ -867,7 +867,7 @@ fn mainnet_block_140493_high_bit_s_lax_der_p2pkh() {
     let mut job = ScriptCheckJob {
         txid: [0u8; 32],
         prevouts: vec![prev.output[vout].clone()],
-        tx: spend,
+        tx: crate::block::JobTx::owned(spend),
         bip65_active: true,
         bip112_active: true,
         bip66_active: false, // height 140493 << bip66 363725
@@ -915,7 +915,7 @@ fn mainnet_block_443992_p2sh_codeseparator_scriptcode() {
     let job = ScriptCheckJob {
         txid: [0u8; 32],
         prevouts: vec![prevout],
-        tx: spend,
+        tx: crate::block::JobTx::owned(spend),
         bip65_active: true,  // 388381
         bip112_active: true, // 419328
         bip66_active: true,  // 363725

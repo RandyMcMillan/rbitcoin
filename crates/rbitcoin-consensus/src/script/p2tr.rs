@@ -221,7 +221,7 @@ mod bip341_tests {
         let job = ScriptCheckJob {
             txid: [0u8; 32],
             prevouts: vec![prevout],
-            tx: tx.clone(),
+            tx: crate::block::JobTx::owned(tx.clone()),
             bip65_active: true,
             bip112_active: true,
         bip66_active: true,
@@ -274,7 +274,7 @@ mod bip341_tests {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(spk),
             }],
-            tx: Transaction {
+            tx: crate::block::JobTx::owned(Transaction {
                 version: bitcoin::transaction::Version::TWO,
                 lock_time: LockTime::ZERO,
                 input: vec![TxIn {
@@ -287,20 +287,20 @@ mod bip341_tests {
                     value: Amount::from_sat(1),
                     script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
                 }],
-            },
+            }),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
             bip16_active: true,
             taproot_active: true,
         };
-        let mut cache = SighashCache::new(&job.tx);
-        assert!(verify(&job, 0, &job.tx, &mut cache).is_err());
+        let mut cache = SighashCache::new(&*job.tx);
+        assert!(verify(&job, 0, &*job.tx, &mut cache).is_err());
 
         let mut job2 = job;
         job2.tx.input[0].witness = Witness::from_slice(&[vec![0u8; 10]]);
-        let mut cache2 = SighashCache::new(&job2.tx);
-        assert!(verify(&job2, 0, &job2.tx, &mut cache2).is_err());
+        let mut cache2 = SighashCache::new(&*job2.tx);
+        assert!(verify(&job2, 0, &*job2.tx, &mut cache2).is_err());
     }
 
     #[test]
@@ -345,7 +345,7 @@ mod bip341_tests {
         let job = ScriptCheckJob {
             txid: [0u8; 32],
             prevouts: vec![prevout],
-            tx: tx.clone(),
+            tx: crate::block::JobTx::owned(tx.clone()),
             bip65_active: true,
             bip112_active: true,
         bip66_active: true,
@@ -403,7 +403,7 @@ mod bip341_tests {
             let job = ScriptCheckJob {
                 txid: [0u8; 32],
                 prevouts: vec![prevout.clone()],
-                tx: tx.clone(),
+                tx: crate::block::JobTx::owned(tx.clone()),
                 bip65_active: true,
                 bip112_active: true,
                 bip66_active: true,
@@ -440,7 +440,7 @@ mod bip341_tests {
             let job = ScriptCheckJob {
                 txid: [0u8; 32],
                 prevouts: vec![prevout],
-                tx: tx.clone(),
+                tx: crate::block::JobTx::owned(tx.clone()),
                 bip65_active: true,
                 bip112_active: true,
                 bip66_active: true,
@@ -501,7 +501,7 @@ mod bip341_tests {
         let job = ScriptCheckJob {
             txid: [0u8; 32],
             prevouts: vec![prevout],
-            tx,
+            tx: crate::block::JobTx::owned(tx),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
@@ -589,7 +589,7 @@ mod bip341_tests {
         let job = ScriptCheckJob {
             txid: [0u8; 32],
             prevouts: vec![prevout],
-            tx,
+            tx: crate::block::JobTx::owned(tx),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
@@ -662,7 +662,7 @@ mod bip341_tests {
         let job = ScriptCheckJob {
             txid: [0u8; 32],
             prevouts: vec![prevout],
-            tx: tx.clone(),
+            tx: crate::block::JobTx::owned(tx.clone()),
             bip65_active: true,
             bip112_active: true,
         bip66_active: true,
@@ -771,7 +771,7 @@ mod bip341_tests {
         let job = ScriptCheckJob {
             txid: [0u8; 32],
             prevouts: vec![prevout],
-            tx: tx.clone(),
+            tx: crate::block::JobTx::owned(tx.clone()),
             bip65_active: true,
             bip112_active: true,
         bip66_active: true,
@@ -811,7 +811,7 @@ mod bip341_tests {
         let job = ScriptCheckJob {
             txid: [0u8; 32],
             prevouts: vec![prevout],
-            tx: tx.clone(),
+            tx: crate::block::JobTx::owned(tx.clone()),
             bip65_active: true,
             bip112_active: true,
         bip66_active: true,

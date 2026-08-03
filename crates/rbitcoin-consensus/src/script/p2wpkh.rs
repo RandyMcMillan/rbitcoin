@@ -124,7 +124,7 @@ mod tests {
                 value: Amount::from_sat(10),
                 script_pubkey: ScriptBuf::from_bytes(spk),
             }],
-            tx: Transaction {
+            tx: crate::block::JobTx::owned(Transaction {
                 version: bitcoin::transaction::Version::TWO,
                 lock_time: LockTime::ZERO,
                 input: vec![TxIn {
@@ -137,7 +137,7 @@ mod tests {
                     value: Amount::from_sat(1),
                     script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
                 }],
-            },
+            }),
             bip65_active: true,
             bip112_active: true,
             bip66_active: true,
@@ -149,20 +149,20 @@ mod tests {
     #[test]
     fn witness_shape_errors() {
         let job = job_with_witness(&[]);
-        let mut cache = SighashCache::new(&job.tx);
-        assert!(verify(&job, 0, &job.tx, &mut cache).is_err());
+        let mut cache = SighashCache::new(&*job.tx);
+        assert!(verify(&job, 0, &*job.tx, &mut cache).is_err());
 
         let job = job_with_witness(&[&[0x01]]);
-        let mut cache = SighashCache::new(&job.tx);
-        assert!(verify(&job, 0, &job.tx, &mut cache).is_err());
+        let mut cache = SighashCache::new(&*job.tx);
+        assert!(verify(&job, 0, &*job.tx, &mut cache).is_err());
 
         let job = job_with_witness(&[&[], &[0x02; 33]]);
-        let mut cache = SighashCache::new(&job.tx);
-        assert!(verify(&job, 0, &job.tx, &mut cache).is_err());
+        let mut cache = SighashCache::new(&*job.tx);
+        assert!(verify(&job, 0, &*job.tx, &mut cache).is_err());
 
         let job = job_with_witness(&[&[0x30, 0x01, 0x01, 0x01], &[0x02; 33]]);
-        let mut cache = SighashCache::new(&job.tx);
-        let err = verify(&job, 0, &job.tx, &mut cache).unwrap_err();
+        let mut cache = SighashCache::new(&*job.tx);
+        let err = verify(&job, 0, &*job.tx, &mut cache).unwrap_err();
         assert!(format!("{err}").contains("p2wpkh"));
 
         let redeem = {
@@ -171,7 +171,7 @@ mod tests {
             r
         };
         let job = job_with_witness(&[&[0x01]]);
-        let mut cache = SighashCache::new(&job.tx);
-        assert!(verify_with_keyhash(&job, 0, &job.tx, &[0u8; 20], &redeem, &mut cache).is_err());
+        let mut cache = SighashCache::new(&*job.tx);
+        assert!(verify_with_keyhash(&job, 0, &*job.tx, &[0u8; 20], &redeem, &mut cache).is_err());
     }
 }

@@ -19,6 +19,17 @@
 //! Default **2 GiB** of pin payload. Oldest complete rows hard-dropped (entire
 //! row). Lookups **never** reorder. Do not reintroduce touch-on-hit / LRU.
 //!
+//! **Deferred Arc drop (W2b.1):** eviction / pin replace only unlinks map
+//! bookkeeping under the write guard; `CreatePin` Arcs are collected and
+//! dropped **after** the guard is released so plan/prep are not blocked on
+//! allocator free of large outs trees.
+//!
+//! # Concurrency (W2b.2)
+//!
+//! [`std::sync::RwLock`]: plan/prep **read** (`lookup_fk_by_txid`, `get_pin`, …);
+//! sole Class A commit / prewarm **write** (`put_complete*`). Multiple readers
+//! share; write is exclusive only for the bookkeeping window (not Arc drops).
+//!
 //! # Arc share
 //!
 //! Pin material is [`crate::CreatePin`] (`Arc<(TxRecord, outs, denserels)>`).
@@ -36,7 +47,9 @@ use crate::CreatePin;
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
+#[cfg(test)]
+use std::sync::Mutex;
 
 /// Default residency heap budget for complete create pins (2 GiB).
 pub const DEFAULT_RESIDENCY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -87,9 +100,12 @@ struct Inner {
     byte_cap: u64,
 }
 
-/// Process-local unified residency (sole writer for inserts; shared Mutex).
+/// Process-local unified residency.
+///
+/// **Reads** (plan/prep) take a shared `RwLock` guard; **writes** (Class A
+/// res_seed / prewarm) take exclusive. Evicted pins drop after the write guard.
 pub struct CreateResidency {
-    inner: Mutex<Inner>,
+    inner: RwLock<Inner>,
 }
 
 impl CreateResidency {
@@ -102,7 +118,7 @@ impl CreateResidency {
             ((byte_cap / 4096) as usize).clamp(1024, 1 << 20)
         };
         Self {
-            inner: Mutex::new(Inner {
+            inner: RwLock::new(Inner {
                 by_fk: HashMap::with_capacity(init),
                 by_txid: HashMap::with_capacity(init),
                 order: VecDeque::with_capacity(init.min(1 << 18)),
@@ -122,13 +138,25 @@ impl CreateResidency {
         Self::new(byte_cap)
     }
 
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Inner> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
+        self.inner
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Whether residency inserts are enabled (`byte_cap > 0`).
     pub fn enabled(&self) -> bool {
-        self.inner.lock().unwrap().byte_cap > 0
+        self.read().byte_cap > 0
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().by_fk.len()
+        self.read().by_fk.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -136,20 +164,20 @@ impl CreateResidency {
     }
 
     pub fn total_outs(&self) -> u64 {
-        self.inner.lock().unwrap().total_outs
+        self.read().total_outs
     }
 
     pub fn total_bytes(&self) -> u64 {
-        self.inner.lock().unwrap().total_bytes
+        self.read().total_bytes
     }
 
     pub fn byte_cap(&self) -> u64 {
-        self.inner.lock().unwrap().byte_cap
+        self.read().byte_cap
     }
 
-    /// `(creates, total_bytes, byte_cap, total_outs)` under one lock (IBD sizes).
+    /// `(creates, total_bytes, byte_cap, total_outs)` under one read lock (IBD sizes).
     pub fn size_stats(&self) -> (usize, u64, u64, u64) {
-        let g = self.inner.lock().unwrap();
+        let g = self.read();
         (g.by_fk.len(), g.total_bytes, g.byte_cap, g.total_outs)
     }
 
@@ -159,7 +187,7 @@ impl CreateResidency {
         self.put_complete_batch(&[(fk, pin, body_range)]);
     }
 
-    /// Bulk insert / update complete pipeline creates under **one** lock.
+    /// Bulk insert / update complete pipeline creates under **one write guard**.
     ///
     /// Semantics match N× sequential [`put_complete`] in input order:
     /// incomplete denserels and null fks are skipped; updates refresh pin/range
@@ -167,45 +195,51 @@ impl CreateResidency {
     ///
     /// **Hot path (Class A `res_seed`):** when every entry is a **new** create_fk
     /// (no in-map update, no duplicate id in `items`), performs **one**
-    /// pre-evict for the total insert bytes then bulk insert — avoids
-    /// per-create lock + per-create evict walks on a full 2 GiB FIFO.
+    /// pre-evict for the total insert bytes then bulk insert.
+    ///
+    /// Evicted / replaced pins are dropped **after** the write guard is released
+    /// so concurrent readers are not blocked on Arc free.
     pub fn put_complete_batch(&self, items: &[(Fk, CreatePin, Option<(u64, u64)>)]) {
         if items.is_empty() {
             return;
         }
-        let mut g = self.inner.lock().unwrap();
-        if g.byte_cap == 0 {
-            return;
-        }
-
-        // Fast path: all-new unique fks (res_seed after Class A commit).
-        if let Some(rows) = prepare_all_new_inserts(&g, items) {
-            let need: u64 = rows.iter().map(|r| r.bytes).sum();
-            let cap = g.byte_cap;
-            g.evict_until_bytes(cap.saturating_sub(need.min(cap)));
-            for row in rows {
-                g.by_fk.insert(
-                    row.id,
-                    ResidentCreate {
-                        txid: row.txid,
-                        body_range: row.body_range,
-                        pin: row.pin,
-                        bytes: row.bytes,
-                    },
-                );
-                g.by_txid.insert(row.txid, row.id);
-                g.order.push_back(row.id);
-                g.total_bytes = g.total_bytes.saturating_add(row.bytes);
-                g.total_outs = g.total_outs.saturating_add(row.n_outs);
+        // Pins unlinked under the write guard; Drop runs after unlock (W2b.1).
+        let mut to_drop: Vec<CreatePin> = Vec::new();
+        {
+            let mut g = self.write();
+            if g.byte_cap == 0 {
+                return;
             }
-            g.evict_until_bytes(cap);
-            return;
-        }
 
-        // Mixed updates / duplicates / incomplete rows: ordered single applies.
-        for (fk, pin, body_range) in items {
-            g.apply_put(*fk, Arc::clone(pin), *body_range);
-        }
+            // Fast path: all-new unique fks (res_seed after Class A commit).
+            if let Some(rows) = prepare_all_new_inserts(&g, items) {
+                let need: u64 = rows.iter().map(|r| r.bytes).sum();
+                let cap = g.byte_cap;
+                g.evict_until_bytes(cap.saturating_sub(need.min(cap)), &mut to_drop);
+                for row in rows {
+                    g.by_fk.insert(
+                        row.id,
+                        ResidentCreate {
+                            txid: row.txid,
+                            body_range: row.body_range,
+                            pin: row.pin,
+                            bytes: row.bytes,
+                        },
+                    );
+                    g.by_txid.insert(row.txid, row.id);
+                    g.order.push_back(row.id);
+                    g.total_bytes = g.total_bytes.saturating_add(row.bytes);
+                    g.total_outs = g.total_outs.saturating_add(row.n_outs);
+                }
+                g.evict_until_bytes(cap, &mut to_drop);
+            } else {
+                // Mixed updates / duplicates / incomplete rows: ordered single applies.
+                for (fk, pin, body_range) in items {
+                    g.apply_put(*fk, Arc::clone(pin), *body_range, &mut to_drop);
+                }
+            }
+        } // write guard dropped — readers unblocked
+        drop(to_drop);
     }
 
     /// Convenience: build pin Arc from owned parts then [`put_complete`].
@@ -231,14 +265,14 @@ impl CreateResidency {
         let Some(id) = fk.get() else {
             return;
         };
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.write();
         if let Some(e) = g.by_fk.get_mut(&id) {
             e.body_range = Some((off, len));
         }
     }
 
     pub fn body_ranges_by_fk(&self, fks: &[Fk]) -> Vec<Option<(u64, u64)>> {
-        let g = self.inner.lock().unwrap();
+        let g = self.read();
         fks.iter()
             .map(|fk| {
                 let id = fk.get()?;
@@ -248,36 +282,31 @@ impl CreateResidency {
     }
 
     pub fn lookup_fk_by_txid(&self, txid: &[u8; 32]) -> Option<Fk> {
-        let g = self.inner.lock().unwrap();
+        let g = self.read();
         g.by_txid.get(txid).map(|&id| Fk(id))
     }
 
     pub fn get_txid(&self, fk: Fk) -> Option<[u8; 32]> {
         let id = fk.get()?;
-        self.inner.lock().unwrap().by_fk.get(&id).map(|e| e.txid)
+        self.read().by_fk.get(&id).map(|e| e.txid)
     }
 
     /// Shared pin Arc + body range. Prefer this over deep-cloning outs.
     pub fn get_pin(&self, fk: Fk) -> Option<(CreatePin, Option<(u64, u64)>)> {
         let id = fk.get()?;
-        let g = self.inner.lock().unwrap();
+        let g = self.read();
         let e = g.by_fk.get(&id)?;
         Some((Arc::clone(&e.pin), e.body_range))
     }
 
     pub fn get_tx(&self, fk: Fk) -> Option<TxRecord> {
         let id = fk.get()?;
-        self.inner
-            .lock()
-            .unwrap()
-            .by_fk
-            .get(&id)
-            .map(|e| e.pin.0.clone())
+        self.read().by_fk.get(&id).map(|e| e.pin.0.clone())
     }
 
     pub fn get_parent_out(&self, fk: Fk, vout: u32) -> Option<(TxRecord, OutputRecord)> {
         let id = fk.get()?;
-        let g = self.inner.lock().unwrap();
+        let g = self.read();
         let e = g.by_fk.get(&id)?;
         let o = e.pin.1.get(vout as usize)?;
         Some((e.pin.0.clone(), o.clone()))
@@ -287,9 +316,7 @@ impl CreateResidency {
         let Some(id) = fk.get() else {
             return false;
         };
-        self.inner
-            .lock()
-            .unwrap()
+        self.read()
             .by_fk
             .get(&id)
             .is_some_and(|e| (vout as usize) < e.pin.1.len())
@@ -310,7 +337,7 @@ impl CreateResidency {
         let Some(id) = fk.get() else {
             return false;
         };
-        self.inner.lock().unwrap().by_fk.contains_key(&id)
+        self.read().by_fk.contains_key(&id)
     }
 
     /// Sparse pin hit: clone only `need_vouts` scripts + denserel slots.
@@ -329,7 +356,7 @@ impl CreateResidency {
         use crate::batch_parents::{layout_covers_need, sparse_spender_rels, SPENDER_REL_UNKNOWN};
 
         let id = fk.get()?;
-        let g = self.inner.lock().unwrap();
+        let g = self.read();
         let e = g.by_fk.get(&id)?;
         let tx = &e.pin.0;
         let outs = &e.pin.1;
@@ -386,8 +413,7 @@ fn prepare_all_new_inserts(
         };
         let (tx, outs, denserels) = pin.as_ref();
         if outs.len() != denserels.len() {
-            // Incomplete denserels skipped by apply_put; any skip with siblings
-            // still forces slow path only if we already started… treat as slow
+            // Incomplete denserels skipped by apply_put; treat batch as slow path
             // so mixed incomplete + valid stays ordered-equivalent.
             return None;
         }
@@ -410,9 +436,15 @@ fn prepare_all_new_inserts(
 }
 
 impl Inner {
-    /// Single put/update (caller holds the mutex). Same rules as historical
-    /// `put_complete` body.
-    fn apply_put(&mut self, fk: Fk, pin: CreatePin, body_range: Option<(u64, u64)>) {
+    /// Single put/update (caller holds the write guard). Same rules as historical
+    /// `put_complete` body. Unlinked pins are pushed to `to_drop` (not Dropped).
+    fn apply_put(
+        &mut self,
+        fk: Fk,
+        pin: CreatePin,
+        body_range: Option<(u64, u64)>,
+        to_drop: &mut Vec<CreatePin>,
+    ) {
         let Some(id) = fk.get() else {
             return;
         };
@@ -430,7 +462,8 @@ impl Inner {
             let old_bytes = e.bytes;
             let old_outs = e.pin.1.len() as u64;
             e.txid = txid;
-            e.pin = pin;
+            // Defer free of previous pin Arc (may own large outs).
+            to_drop.push(std::mem::replace(&mut e.pin, pin));
             e.bytes = bytes;
             if body_range.is_some() {
                 e.body_range = body_range;
@@ -442,11 +475,11 @@ impl Inner {
                 .saturating_add(bytes);
             self.total_outs = self.total_outs.saturating_sub(old_outs).saturating_add(n_outs);
             let cap = self.byte_cap;
-            self.evict_until_bytes(cap);
+            self.evict_until_bytes(cap, to_drop);
             return;
         }
         let cap = self.byte_cap;
-        self.evict_until_bytes(cap.saturating_sub(bytes.min(cap)));
+        self.evict_until_bytes(cap.saturating_sub(bytes.min(cap)), to_drop);
         self.by_fk.insert(
             id,
             ResidentCreate {
@@ -460,24 +493,25 @@ impl Inner {
         self.order.push_back(id);
         self.total_bytes = self.total_bytes.saturating_add(bytes);
         self.total_outs = self.total_outs.saturating_add(n_outs);
-        self.evict_until_bytes(cap);
+        self.evict_until_bytes(cap, to_drop);
     }
 
-    fn evict_until_bytes(&mut self, max_bytes: u64) {
+    fn evict_until_bytes(&mut self, max_bytes: u64, to_drop: &mut Vec<CreatePin>) {
         while self.total_bytes > max_bytes {
-            if !self.hard_evict_oldest() {
+            if !self.hard_evict_oldest(to_drop) {
                 break;
             }
         }
     }
 
-    /// Drop oldest create entirely.
-    fn hard_evict_oldest(&mut self) -> bool {
+    /// Unlink oldest create; pin Arc goes to `to_drop` (Drop after write unlock).
+    fn hard_evict_oldest(&mut self, to_drop: &mut Vec<CreatePin>) -> bool {
         while let Some(id) = self.order.pop_front() {
             if let Some(e) = self.by_fk.remove(&id) {
                 self.by_txid.remove(&e.txid);
                 self.total_bytes = self.total_bytes.saturating_sub(e.bytes);
                 self.total_outs = self.total_outs.saturating_sub(e.pin.1.len() as u64);
+                to_drop.push(e.pin);
                 return true;
             }
         }
@@ -488,6 +522,9 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+    use std::thread;
+    use std::time::Duration;
 
     fn tx(id: u8) -> TxRecord {
         let mut txid = [0u8; 32];
@@ -508,6 +545,19 @@ mod tests {
         t.output_count = n_outs as u32;
         let outs: Vec<_> = (0..n_outs)
             .map(|v| OutputRecord::unspent(v as i64, vec![id; script_len.max(1)]))
+            .collect();
+        let dens: Vec<u32> = (0..n_outs as u32).map(|v| v * 8).collect();
+        Arc::new((t, outs, dens))
+    }
+
+    /// Unique txid from u64 id (batch seed stress).
+    fn pin_unique(id: u64, n_outs: usize, script_len: usize) -> CreatePin {
+        let mut t = tx((id & 0xff) as u8);
+        t.txid[..8].copy_from_slice(&id.to_le_bytes());
+        t.output_count = n_outs as u32;
+        let tag = (id & 0xff) as u8;
+        let outs: Vec<_> = (0..n_outs)
+            .map(|v| OutputRecord::unspent(v as i64, vec![tag; script_len.max(1)]))
             .collect();
         let dens: Vec<u32> = (0..n_outs as u32).map(|v| v * 8).collect();
         Arc::new((t, outs, dens))
@@ -607,7 +657,7 @@ mod tests {
     fn residency_snapshot(
         r: &CreateResidency,
     ) -> std::collections::BTreeMap<u64, (u8, Option<(u64, u64)>, usize, u64, usize)> {
-        let g = r.inner.lock().unwrap();
+        let g = r.read();
         let mut m = std::collections::BTreeMap::new();
         for (&id, e) in &g.by_fk {
             m.insert(
@@ -635,7 +685,7 @@ mod tests {
     }
 
     fn fifo_order(r: &CreateResidency) -> Vec<u64> {
-        r.inner.lock().unwrap().order.iter().copied().collect()
+        r.read().order.iter().copied().collect()
     }
 
     #[test]
@@ -726,5 +776,85 @@ mod tests {
                 "batch seed must Arc-share input pin"
             );
         }
+    }
+
+    /// W2b.1: last Arc of an evicted pin is released after the put returns
+    /// (strong_count observation via Weak).
+    #[test]
+    fn eviction_releases_evicted_pin_after_put() {
+        let one = estimate_pin_bytes(&pin_with(1, 2, 64));
+        let r = CreateResidency::new(one.saturating_mul(2) + one / 4);
+        let p1 = pin_with(1, 2, 64);
+        let weak = Arc::downgrade(&p1);
+        r.put_complete(Fk(1), p1, Some((1, 1)));
+        // Only residency holds the pin.
+        assert_eq!(weak.strong_count(), 1);
+        r.put_complete(Fk(2), pin_with(2, 2, 64), Some((2, 1)));
+        r.put_complete(Fk(3), pin_with(3, 2, 64), Some((3, 1)));
+        // fk1 evicted; after put returns, deferred drop has run.
+        assert_eq!(weak.strong_count(), 0, "evicted pin must drop after unlock");
+        assert!(weak.upgrade().is_none());
+    }
+
+    /// W2b.2: readers make progress while a writer seeds large batches (full FIFO).
+    #[test]
+    fn concurrent_readers_during_batch_seed() {
+        let one = estimate_pin_bytes(&pin_unique(1, 2, 48));
+        // ~40 pins capacity → batch seeds force eviction churn.
+        let cap = one.saturating_mul(40);
+        let r = Arc::new(CreateResidency::new(cap));
+
+        // Warm a stable window of fks 1..16 for readers.
+        for i in 1u64..=16 {
+            r.put_complete(Fk(i), pin_unique(i, 2, 48), Some((i, 1)));
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let ops = Arc::new(AtomicU64::new(0));
+        let mut readers = Vec::new();
+        for _ in 0..2 {
+            let r_r = Arc::clone(&r);
+            let stop_r = Arc::clone(&stop);
+            let ops_r = Arc::clone(&ops);
+            readers.push(thread::spawn(move || {
+                while !stop_r.load(AtomicOrdering::Relaxed) {
+                    for i in 1u64..=16 {
+                        let _ = r_r.get_pin(Fk(i));
+                        let mut tid = [0u8; 32];
+                        tid[..8].copy_from_slice(&i.to_le_bytes());
+                        let _ = r_r.lookup_fk_by_txid(&tid);
+                        ops_r.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    thread::yield_now();
+                }
+            }));
+        }
+
+        // Writer: many large all-new batches (fast path + eviction).
+        for round in 0u64..30 {
+            let items: Vec<_> = (0u64..25)
+                .map(|j| {
+                    let id = 1_000 + round * 25 + j;
+                    (
+                        Fk(id),
+                        pin_unique(id, 2, 48),
+                        Some((id, 1u64)),
+                    )
+                })
+                .collect();
+            r.put_complete_batch(&items);
+        }
+
+        // Let readers spin a bit after last write.
+        thread::sleep(Duration::from_millis(20));
+        stop.store(true, AtomicOrdering::Relaxed);
+        for t in readers {
+            t.join().expect("reader thread");
+        }
+        let n = ops.load(AtomicOrdering::Relaxed);
+        assert!(
+            n > 100,
+            "readers must make progress during concurrent seed (ops={n})"
+        );
     }
 }

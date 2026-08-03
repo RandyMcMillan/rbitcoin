@@ -8,9 +8,9 @@
 //!   into [`ArchiveWritePlan::external_parent_outs`] (pipeline-local; not FIFO).
 //! - **Commit** ([`Query::archive_commit_plan`]): store **writes** — body append,
 //!   head index, header_txs, residency denserels seed.
-//! - **Prewarm** ([`Query::archive_residency_prewarm`]): startup cache fill —
-//!   last-N `body_txid_range` ranges, bounded denserels (`OutsDenserels`), and
-//!   tip-ahead confirm header plans — before the IBD pipeline starts.
+//! - **Prewarm** ([`Query::archive_residency_prewarm`]): startup fill of complete
+//!   tip creates into CreateResidency + tip-ahead header plans (no range-only
+//!   half-rows).
 //!
 //! Overlap requires the in-flight map: a later mega-batch may spend outputs from a
 //! prior plan that is still queued/committing (not yet in residency/head).

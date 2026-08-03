@@ -81,8 +81,6 @@ pub struct ArchiveWritePlan {
     pub batch_pin: Vec<CreatePin>,
     pub index_tx: bool,
     pub body_est: u64,
-    /// Snapshot of “far ahead of confirm” at plan time.
-    pub advise_dont_need: bool,
 }
 
 impl ArchiveWritePlan {
@@ -97,7 +95,6 @@ impl ArchiveWritePlan {
             batch_pin: Vec::new(),
             index_tx: false,
             body_est: 0,
-            advise_dont_need: false,
         }
     }
 
@@ -114,11 +111,6 @@ impl ArchiveWritePlan {
         self.external_parent_outs.shrink_to_fit();
     }
 }
-
-/// When Class A high-water is this many blocks ahead of the parent cache watermark,
-/// drop just-written `tx.body` pages from the page cache so archive dirty pages
-/// do not crowd out confirm/cache. Below this, keep pages (cache may need them).
-const ARCHIVE_BODY_DONTNEED_LEAD: u32 = 1024;
 
 impl Query {
     pub fn archive_block(
@@ -459,7 +451,10 @@ impl Query {
             .map(|((pin, _), fk)| (pin.0.txid, *fk))
             .collect();
 
-        let advise_dont_need = self.archive_far_ahead_of_confirm()?;
+        // Finish is cheap: body_est + batch_creates only.
+        // No `count_bodies` / far-ahead scan — Class A never leads tip (unified
+        // confirm commit is the sole Class A appender); body DONTNEED lead
+        // heuristics were dead work that cost O(headers) RwLock gets per plan.
         let finish_ns = t_finish.elapsed().as_nanos() as u64;
 
         crate::archive_phase_stats::note_resolve_counts(
@@ -492,7 +487,6 @@ impl Query {
             batch_pin,
             index_tx,
             body_est,
-            advise_dont_need,
         })
     }
 
@@ -713,7 +707,6 @@ impl Query {
             .reserve_append(plan.body_est, plan.packed.len() as u64)?;
         let reserve_ns = t.elapsed().as_nanos() as u64;
 
-        let body_off = self.store.txs.body_logical_len();
         // Body append first (no head), then head insert — separate timers.
         // Encode from shared CreatePin + inputs (no deep outs reclone).
         let t = Instant::now();
@@ -816,14 +809,9 @@ impl Query {
         }
         let sticky_ns = t.elapsed().as_nanos() as u64;
 
-        let t = Instant::now();
-        let body_end = self.store.txs.body_logical_len();
-        let body_len = body_end.saturating_sub(body_off);
-        if body_len > 0 && plan.advise_dont_need {
-            self.store.txs.advise_body_dont_need(body_off, body_len);
-        }
-        let dontneed_ns = t.elapsed().as_nanos() as u64;
-
+        // No body DONTNEED after Class A commit: Class A never leads tip, so
+        // just-written pages may still be tip-hot for confirm/cache.
+        // write_dontneed_ns stays 0 (legacy phase-stat slot).
         let total_ns = t0.elapsed().as_nanos() as u64;
         crate::archive_phase_stats::note_write_commit(
             total_ns,
@@ -833,24 +821,10 @@ impl Query {
             spend_ns,
             htxs_ns,
             sticky_ns,
-            dontneed_ns,
+            0, // dontneed_ns — lead heuristic removed
             n_blocks.max(1),
         );
         Ok(())
-    }
-
-    /// True when Class A high-water is more than [`ARCHIVE_BODY_DONTNEED_LEAD`]
-    /// blocks ahead of the parent cache ready watermark (or tip if cache idle).
-    fn archive_far_ahead_of_confirm(&self) -> Result<bool, QueryError> {
-        let bodies = self.store.header_txs.count_bodies()?;
-        if bodies == 0 {
-            return Ok(false);
-        }
-        // Contiguous IBD: highest archived height ≈ body count − 1.
-        let arch_hi = (bodies - 1) as u32;
-        let tip = self.tip_height().map(|h| h.0).unwrap_or(0);
-        let cache = self.parent_cache_ready_through().max(tip);
-        Ok(arch_hi.saturating_sub(cache) > ARCHIVE_BODY_DONTNEED_LEAD)
     }
 
     /// Resolve prev outpoint txid for an input.

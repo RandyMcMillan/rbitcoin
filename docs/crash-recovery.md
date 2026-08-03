@@ -38,6 +38,7 @@ On open, `repair_class_c_above_tip` clears strong/height **above** tip (tip-rela
 ## Class A (archive)
 
 - Append-oriented; re-archive is **idempotent** when `header_txs` already present.
+- **Never leads tip:** Class A is published only on the confirm-write path with tip advance in the same era (no dual-track archive-ahead).
 - Kill mid-archive without a complete body association ⇒ not treated as archived; re-getdata.
 
 ## Spends (v5: annotation on create outputs)

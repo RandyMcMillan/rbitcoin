@@ -1731,8 +1731,8 @@ fn write_height_needed(tip: Option<u32>, height: u32) -> bool {
 /// COMMIT STAGE: optional Class A plan commit → structural → class_c → spend annotate → tip GC.
 ///
 /// When `batch.archive_plan` is set (wire prep path), Class A is appended in this
-/// same stage before structural/annotate — single ordered commit era, not a
-/// far-ahead archive track.
+/// same stage before structural/annotate — single ordered commit era.
+/// **Class A never leads tip** (no dual-track archive-ahead / body DONTNEED lead).
 ///
 /// Accrues window timers in [`confirm_phase_stats`] and snapshots the last batch
 /// for slow-write logs via [`confirm_phase_stats::last_write_phases`].
@@ -2773,7 +2773,6 @@ mod write_idempotent_tests {
             batch_pin: vec![],
             index_tx: false,
             body_est: 0,
-            advise_dont_need: false,
         };
 
         let err = pin_for_wire_batch(&q, Some(&plan), &[], &[], None, super::ColdPinMode::Allow)
@@ -2851,7 +2850,6 @@ mod write_idempotent_tests {
             batch_pin: vec![],
             index_tx: false,
             body_est: 0,
-            advise_dont_need: false,
         };
         // In-flight "parent" with **empty** outs → live.len() != need → cold path;
         // no Class A body either → end pin contract fails.
@@ -2969,7 +2967,6 @@ mod write_idempotent_tests {
             batch_pin: vec![Arc::clone(&spend_pin)],
             index_tx: false,
             body_est: 0,
-            advise_dont_need: false,
         };
 
         // Map holds the same Arc as our local handle (not a deep clone of outs).

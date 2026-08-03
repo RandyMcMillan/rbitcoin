@@ -1093,7 +1093,9 @@ impl HeaderTxsTable {
 
     /// Number of headers that currently have a Class A body (`count > 0`).
     ///
-    /// Scans the dense count array once (startup / resume accounting).
+    /// Full-array scan — use only for rare status/startup (`archived_block_count`).
+    /// **Not** on the plan hot path: Class A never leads tip, so plan must not
+    /// call this for “archive far ahead” heuristics.
     pub fn count_bodies(&self) -> Result<u64, StoreError> {
         let n = self.count.len();
         let mut total = 0u64;

@@ -33,9 +33,14 @@ Recent tidy pass (what was deleted vs intentional dual paths):
 **IBD height-ordered path (current):** peer **offers raw framed wire into the
 body queue** and notes readiness on the confirm feed; confirm **prep** reloads
 wire by height, **scripts** are pure CPU, **commit** is the only Class A
-appender and dequeues the body-queue entry after tip advance. There is **no**
-dual-track “archive Class A far ahead of tip” path and **no** ContigPark /
-archive-job fallback for unknown-height bodies (mark missing → re-getdata).
+appender and dequeues the body-queue entry after tip advance.
+
+**Invariant — Class A never leads tip:** there is no dual-track “archive Class A
+far ahead of confirmed tip.” Wire plan + Class A append + Class C tip advance
+are one confirm-write era. Do not reintroduce plan-time “archive lead” heuristics
+(e.g. body `posix_fadvise(DONTNEED)` when body count ≫ tip) — under this path
+just-written body pages stay tip-hot. **No** ContigPark / archive-job fallback
+for unknown-height bodies (mark missing → re-getdata).
 
 - **Storage center** is a **transaction-relational mmap archive**, not a UTXO
   set + LevelDB chainstate.

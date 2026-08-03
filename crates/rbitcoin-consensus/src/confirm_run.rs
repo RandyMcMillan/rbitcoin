@@ -755,8 +755,14 @@ pub fn ensure_external_parent_denserels_from_plan(
             }
             confirm_load_stats::COLD_RANGE_N.fetch_add(n_range, Ordering::Relaxed);
             for ((fk, _), row) in by_range.iter().zip(decoded.into_iter()) {
-                if let Some((tx, outs, dens)) = row {
+                if let Some((mut tx, outs, dens)) = row {
                     if let Some(id) = fk.get() {
+                        fill_create_txid_from_ram(
+                            &mut tx,
+                            id,
+                            Some(plan),
+                            query.create_residency(),
+                        );
                         plan.external_parent_outs
                             .insert(id, std::sync::Arc::new((tx, outs, dens)));
                     }
@@ -791,7 +797,7 @@ pub fn ensure_external_parent_denserels_from_plan(
                 let Some(id) = c.fk.get() else {
                     continue;
                 };
-                let (tx, outs, dens) = if let Some(dec) = c.decoded_outs {
+                let (mut tx, outs, dens) = if let Some(dec) = c.decoded_outs {
                     dec
                 } else {
                     rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
@@ -804,6 +810,12 @@ pub fn ensure_external_parent_denserels_from_plan(
                         ))
                     })?
                 };
+                fill_create_txid_from_ram(
+                    &mut tx,
+                    id,
+                    Some(plan),
+                    query.create_residency(),
+                );
                 plan.external_parent_outs
                     .insert(id, std::sync::Arc::new((tx, outs, dens)));
             }
@@ -1321,6 +1333,29 @@ pub mod plan_stage_stats {
     }
 }
 
+/// Schema 13: denserels body decode leaves `txid` zero. Fill from **RAM only**
+/// (plan stamp reverse map, then residency). Never `txid.body` / sidefile pread.
+#[inline]
+fn fill_create_txid_from_ram(
+    tx: &mut rbitcoin_store::TxRecord,
+    create_fk_id: u64,
+    plan: Option<&rbitcoin_query::ArchiveWritePlan>,
+    residency: &rbitcoin_query::CreateResidency,
+) {
+    if tx.txid != [0u8; 32] {
+        return;
+    }
+    if let Some(p) = plan {
+        if let Some(tid) = p.external_parent_txid(create_fk_id) {
+            tx.txid = tid;
+            return;
+        }
+    }
+    if let Some(tid) = residency.get_txid(rbitcoin_primitives::Fk(create_fk_id)) {
+        tx.txid = tid;
+    }
+}
+
 /// Pin parents for wire prep: **only spent parents** (sparse outs).
 ///
 /// Sources: plan/in-flight packed outs (+ offline denserels) → CreateResidency
@@ -1517,7 +1552,13 @@ fn pin_for_wire_batch(
             confirm_load_stats::BODY_TX_READS.fetch_add(n_range, Ordering::Relaxed);
             confirm_load_stats::PIN_NEW.fetch_add(n_range, Ordering::Relaxed);
             for ((fk, _), row) in range_jobs.into_iter().zip(decoded.into_iter()) {
-                if let (Some(id), Some((tx, outs, dens))) = (fk.get(), row) {
+                if let (Some(id), Some((mut tx, outs, dens))) = (fk.get(), row) {
+                    fill_create_txid_from_ram(
+                        &mut tx,
+                        id,
+                        Some(plan),
+                        query.create_residency(),
+                    );
                     plan_by_id.insert(id, std::sync::Arc::new((tx, outs, dens)));
                 }
             }
@@ -1663,7 +1704,7 @@ fn pin_for_wire_batch(
                 };
                 let need = cold.get(&id).cloned().unwrap_or_default();
                 // Prefer single-decode from load_creates_once; raw is second chance only.
-                let (tx, outs, dense_rels) = if let Some(dec) = c.decoded_outs {
+                let (mut tx, outs, dense_rels) = if let Some(dec) = c.decoded_outs {
                     dec
                 } else {
                     rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
@@ -1676,6 +1717,13 @@ fn pin_for_wire_batch(
                         ))
                     })?
                 };
+                // RAM identity only (plan stamp reverse map / residency) — no sidefile.
+                fill_create_txid_from_ram(
+                    &mut tx,
+                    id,
+                    plan,
+                    query.create_residency(),
+                );
                 let mut need = need;
                 need.sort_unstable();
                 need.dedup();
@@ -2234,7 +2282,7 @@ fn ensure_spend_abs_layouts(
                 )));
             };
             let need_v = still.get(&id).cloned().unwrap_or_default();
-            let (tx, outs, dense_rels) = if let Some(dec) = c.decoded_outs {
+            let (mut tx, outs, dense_rels) = if let Some(dec) = c.decoded_outs {
                 dec
             } else {
                 // load_creates_once OutsDenserels should always fill decoded_outs.
@@ -2248,6 +2296,8 @@ fn ensure_spend_abs_layouts(
                     ))
                 })?
             };
+            // Ensure path: residency may already hold identity from Class A seed.
+            fill_create_txid_from_ram(&mut tx, id, None, query.create_residency());
             if batch_parents.contains(c.fk) {
                 batch_parents.set_layout_for_need(c.fk, c.body_range, &dense_rels, &need_v);
                 continue;
@@ -2905,6 +2955,7 @@ mod write_idempotent_tests {
             batch_creates: vec![],
             external_parent_outs: Default::default(),
             external_parent_ranges: Default::default(),
+            external_parent_txids: Default::default(),
             batch_pin: vec![],
             index_tx: false,
             body_est: 0,
@@ -2983,6 +3034,7 @@ mod write_idempotent_tests {
             batch_creates: vec![],
             external_parent_outs: Default::default(),
             external_parent_ranges: Default::default(),
+            external_parent_txids: Default::default(),
             batch_pin: vec![],
             index_tx: false,
             body_est: 0,
@@ -3101,6 +3153,7 @@ mod write_idempotent_tests {
                 m
             },
             external_parent_ranges: Default::default(),
+            external_parent_txids: Default::default(),
             batch_pin: vec![Arc::clone(&spend_pin)],
             index_tx: false,
             body_est: 0,

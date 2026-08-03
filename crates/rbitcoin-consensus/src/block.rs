@@ -1519,10 +1519,10 @@ fn resolve_prevout(
 
     if let Some(prev_fk) = prev_fk_hint {
         cold_why = ColdWhy::NotPin;
-        if let Some((value, script, parent_txid)) =
-            batch_parents.get_parent_txout_parts(prev_fk, op.vout)
-        {
-            if parent_txid == prev_txid {
+        // Batch first. On txid mismatch: soft-miss (do not accept wrong out);
+        // still try residency under the same fk, then cold Class A.
+        match batch_parents.get_parent_txout_parts(prev_fk, op.vout) {
+            Some((value, script, parent_txid)) if parent_txid == prev_txid => {
                 connect_prevout_stats::WAVE_HIT.fetch_add(1, Ordering::Relaxed);
                 let (cb_h, create_height) = if resolve_create_heights {
                     // Need TxRecord only for coinbase/maturity path (Full mode).
@@ -1554,12 +1554,19 @@ fn resolve_prevout(
                     create_height,
                 });
             }
-            // Batch row present for this vout but wrong create txid (fk collision).
-            cold_why = ColdWhy::TxidMismatch;
-        } else if batch_parents.contains(prev_fk) {
-            // Parent create pinned, but needed vout not in sparse outs.
-            cold_why = ColdWhy::VoutMiss;
-        } else if let Some((prev_rec, out)) =
+            Some(_) => {
+                // Row present but pin txid ≠ wire (schema-13 zero-txid bug was
+                // the host 100% mismatch case; true fk collision also lands here).
+                cold_why = ColdWhy::TxidMismatch;
+            }
+            None if batch_parents.contains(prev_fk) => {
+                // Parent create pinned, but needed vout not in sparse outs.
+                cold_why = ColdWhy::VoutMiss;
+            }
+            None => {}
+        }
+        // Residency after batch miss / soft-miss (not gated on batch None only).
+        if let Some((prev_rec, out)) =
             query.create_residency().get_parent_out(prev_fk, op.vout)
         {
             if prev_rec.txid == prev_txid {
@@ -1592,7 +1599,7 @@ fn resolve_prevout(
             }
             cold_why = ColdWhy::TxidMismatch;
         }
-        // else: NotPin (fk known, neither batch nor residency covers this out)
+        // else: NotPin / mismatch / vout_miss → cold Class A below
     }
 
     // Cold path: create-fk candidates (thin → durable head / store).

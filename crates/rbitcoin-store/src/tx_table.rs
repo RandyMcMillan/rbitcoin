@@ -1390,6 +1390,11 @@ impl TxTable {
     ///
     /// **Skips `tx.idx`** — each job must supply `(body_off, body_len)`. Uses
     /// the pin IO uring/pread batch pipeline.
+    ///
+    /// Schema 13: packed body has **no** leading txid — decoded `TxRecord.txid`
+    /// is left **zero**. Callers **must** fill identity from RAM (plan stamp
+    /// `external_parent_txids`, residency, wire) — **never** re-pread `txid.body`
+    /// on the prep pin path.
     pub fn get_outs_denserels_by_range_batch(
         &self,
         items: &[(Fk, (u64, u64))],
@@ -3061,6 +3066,65 @@ mod tests {
         let miss = t.get_fk_by_txid_batch(&[[0xff; 32]]).unwrap();
         assert_eq!(miss[0].1, None);
         let _ = fks;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Schema 13: range denserels decode leaves txid zero — callers fill from RAM.
+    ///
+    /// Prep must **not** re-pread `txid.body` here; plan stamp reverse map does.
+    #[test]
+    fn get_outs_denserels_by_range_leaves_txid_zero_schema13() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-range-dens-txid-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = create_tiny(&dir);
+        let want_txid = {
+            let mut x = [0u8; 32];
+            x[0] = 0xab;
+            x[31] = 0xcd;
+            x
+        };
+        let tx = TxRecord {
+            txid: want_txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        };
+        let inputs = vec![InputRecord {
+            prev_txid: [0u8; 32],
+            create_fk: Fk::NULL,
+            prev_index: u32::MAX,
+            sequence: u32::MAX,
+            script_sig: vec![0x01],
+            witness: vec![],
+        }];
+        let outputs = vec![OutputRecord::unspent(50_000, vec![0x51, 0x52])];
+        let fk = t
+            .put_full_batch_indexed(&[(tx, inputs, outputs)], true)
+            .unwrap()[0];
+        let range = t.body.record_range(fk).unwrap();
+        let rows = t
+            .get_outs_denserels_by_range_batch(&[(fk, range)])
+            .unwrap();
+        let (got, outs, dens) = rows[0].as_ref().expect("range denserels");
+        assert_eq!(
+            got.txid, [0u8; 32],
+            "API must not sidefile-fill; prep uses plan RAM map"
+        );
+        assert_eq!(outs.len(), 1);
+        assert_eq!(dens.len(), 1);
+        assert_eq!(outs[0].script, vec![0x51, 0x52]);
+        // Sidefile still has identity for head resolve / get_tx — just not this API.
+        assert_eq!(t.body_txid(fk).unwrap(), want_txid);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

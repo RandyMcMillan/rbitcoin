@@ -76,9 +76,16 @@ pub struct ArchiveWritePlan {
     pub external_parent_outs: std::collections::HashMap<u64, CreatePin>,
     /// Head-resolved external parents: create_fk → Class A `(body_off, body_len)`.
     ///
-    /// Filled at plan stamp (fk-only Shape A short-circuit). Prep denserels-loads
-    /// by offset (skip `tx.idx`) into [`Self::external_parent_outs`].
+    /// Filled at plan stamp (fk+range short-circuit). Prep denserels-loads by
+    /// offset (skip `tx.idx`) into [`Self::external_parent_outs`]. Still live —
+    /// not obsolete after schema-13 `txid.body` (identity is separate from range).
     pub external_parent_ranges: std::collections::HashMap<u64, (u64, u64)>,
+    /// **RAM-only** reverse of stamp resolve: create_fk id → parent `prev_txid`.
+    ///
+    /// Built when residency / in-flight / head resolve binds `prev_txid → fk`.
+    /// Prep pin fills schema-13 zero body `TxRecord.txid` from this map — **never**
+    /// re-pread `txid.body` on the pin path.
+    pub external_parent_txids: std::collections::HashMap<u64, [u8; 32]>,
     /// Prep-ahead pin material for **this batch's creates**, parallel to
     /// [`Self::planned_fks`]: same [`CreatePin`] Arcs as [`Self::packed`] (refcount
     /// only). Confirm `note_plan_ok` only `Arc::clone`s into in-flight outs.
@@ -97,6 +104,7 @@ impl ArchiveWritePlan {
             batch_creates: Vec::new(),
             external_parent_outs: std::collections::HashMap::new(),
             external_parent_ranges: std::collections::HashMap::new(),
+            external_parent_txids: std::collections::HashMap::new(),
             batch_pin: Vec::new(),
             index_tx: false,
             body_est: 0,
@@ -107,15 +115,23 @@ impl ArchiveWritePlan {
         self.packed.is_empty()
     }
 
+    /// Wire `prev_txid` known for this create_fk at plan stamp (RAM only).
+    #[inline]
+    pub fn external_parent_txid(&self, create_fk_id: u64) -> Option<[u8; 32]> {
+        self.external_parent_txids.get(&create_fk_id).copied()
+    }
+
     /// Drop pipeline-local external full-outs after denserels pin.
     ///
     /// Sparse need-vouts already live in [`crate::BatchParents`]; commit never
-    /// reads this map. Ranges may be cleared with outs (prep already consumed).
+    /// reads this map. Ranges + txid reverse may be cleared with outs (prep done).
     pub fn clear_external_parent_outs(&mut self) {
         self.external_parent_outs.clear();
         self.external_parent_outs.shrink_to_fit();
         self.external_parent_ranges.clear();
         self.external_parent_ranges.shrink_to_fit();
+        self.external_parent_txids.clear();
+        self.external_parent_txids.shrink_to_fit();
     }
 }
 
@@ -362,12 +378,21 @@ impl Query {
         let mut head_hit_n = 0u64;
 
         // External parents that miss CreateResidency: Shape A **fk+range**
-        // short-circuit (probe + idx + Prefix33; no denserels body). Prep loads
-        // denserels by known body_range (skip tx.idx).
+        // short-circuit (probe + idx + identity; no denserels body). Prep loads
+        // denserels by known body_range (skip tx.idx). Identity for pin is the
+        // lookup key already in RAM (`resolved`) — never re-read txid.body at prep.
         let external_parent_outs: std::collections::HashMap<u64, CreatePin> =
             std::collections::HashMap::new();
         let mut external_parent_ranges: std::collections::HashMap<u64, (u64, u64)> =
             std::collections::HashMap::new();
+        let mut external_parent_txids: std::collections::HashMap<u64, [u8; 32]> =
+            std::collections::HashMap::with_capacity(resolved.len().saturating_add(need_head.len()));
+        // Reverse map for residency / in-flight binds already in `resolved`.
+        for (txid, fk) in &resolved {
+            if let Some(id) = fk.get() {
+                external_parent_txids.insert(id, *txid);
+            }
+        }
         let t_head = Instant::now();
         let head_dens_ns = 0u64;
         if !need_head.is_empty() {
@@ -379,6 +404,7 @@ impl Query {
                     head_hit_n = head_hit_n.saturating_add(1);
                     if let Some(id) = fk.get() {
                         external_parent_ranges.insert(id, range);
+                        external_parent_txids.insert(id, txid);
                     }
                 }
             }
@@ -479,6 +505,7 @@ impl Query {
             batch_creates,
             external_parent_outs,
             external_parent_ranges,
+            external_parent_txids,
             batch_pin,
             index_tx,
             body_est,
@@ -1123,6 +1150,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Prep pin identity: reverse map + range denserels (no sidefile re-read).
+    #[test]
+    fn plan_external_parent_txid_fills_range_denserels_pin() {
+        let (dir, q) = temp_query("plan-parent-txid-ram");
+        let parent = coinbase_apply(7);
+        let parent_txid = parent.tx.txid;
+        let fks = q
+            .store
+            .txs
+            .put_full_batch_indexed(
+                &[(parent.tx.clone(), parent.inputs.clone(), parent.outputs.clone())],
+                true,
+            )
+            .unwrap();
+        let parent_fk = fks[0];
+        let pid = parent_fk.get().unwrap();
+        let range = q.store.txs.body_range(parent_fk).unwrap();
+
+        // Simulate plan stamp reverse map (txid→fk invert).
+        let mut plan = super::ArchiveWritePlan::empty();
+        plan.external_parent_ranges.insert(pid, range);
+        plan.external_parent_txids.insert(pid, parent_txid);
+
+        let rows = q
+            .store
+            .get_outs_denserels_by_range_batch(&[(parent_fk, range)])
+            .unwrap();
+        let (mut tx, outs, dens) = rows[0].clone().expect("denserels");
+        assert_eq!(tx.txid, [0u8; 32], "body decode zero identity");
+        // RAM fill (same as prep pin helper).
+        if let Some(tid) = plan.external_parent_txid(pid) {
+            tx.txid = tid;
+        }
+        assert_eq!(tx.txid, parent_txid);
+        assert!(!outs.is_empty());
+        assert_eq!(dens.len(), outs.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Commit denserels seed is for this batch's creates only.
     /// Plan head path stamps create_fk only — no denserels into plan or residency.
     #[test]
@@ -1180,6 +1246,11 @@ mod tests {
         assert!(
             plan.external_parent_ranges.get(&1).is_some_and(|r| r.1 > 0),
             "plan must record Class A body range for head-resolved parent"
+        );
+        assert_eq!(
+            plan.external_parent_txid(1),
+            Some(parent_txid),
+            "plan reverse map: create_fk → prev_txid from stamp resolve (RAM)"
         );
         // Must not thrash CreateResidency with long-tail head parents.
         assert!(

@@ -110,11 +110,15 @@ pub fn load_creates_once_seed(
                 if let Ok((mut tx, ins, outs, rels)) =
                     decode_packed_tx_with_spender_rels_secret(&job.body, Some(secret))
                 {
-                    // Schema 13: body has no leading txid — fill from sidefile.
-                    if let Ok(tid) = store.txs.body_txid(*fk) {
-                        tx.txid = tid;
+                    // Schema 13: body has no leading txid. Prep pin never fills
+                    // from txid.body (use plan RAM map). Prewarm seed only may
+                    // take sidefile so residency by_txid works.
+                    if seed_residency && tx.txid == [0u8; 32] {
+                        if let Ok(tid) = store.txs.body_txid(*fk) {
+                            tx.txid = tid;
+                        }
                     }
-                    if seed_residency {
+                    if seed_residency && tx.txid != [0u8; 32] {
                         let pin: CreatePin = Arc::new((tx.clone(), outs.clone(), rels.clone()));
                         residency.put_complete(*fk, pin, Some(range));
                     }
@@ -129,10 +133,14 @@ pub fn load_creates_once_seed(
                 if let Ok((mut tx, outs, rels)) =
                     decode_packed_tx_outs_with_spender_rels_secret(&job.body, Some(secret))
                 {
-                    if let Ok(tid) = store.txs.body_txid(*fk) {
-                        tx.txid = tid;
+                    // Pin path (seed_residency=false): leave txid zero; caller fills
+                    // from plan `external_parent_txids` / residency RAM only.
+                    if seed_residency && tx.txid == [0u8; 32] {
+                        if let Ok(tid) = store.txs.body_txid(*fk) {
+                            tx.txid = tid;
+                        }
                     }
-                    if seed_residency {
+                    if seed_residency && tx.txid != [0u8; 32] {
                         let pin: CreatePin = Arc::new((tx.clone(), outs.clone(), rels.clone()));
                         residency.put_complete(*fk, pin, Some(range));
                     }

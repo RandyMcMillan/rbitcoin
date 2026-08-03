@@ -154,6 +154,19 @@ impl SegmentedTxHead {
                 None
             };
             max_id = max_id.max(d.file_id);
+            rbitcoin_log::debug!(
+                "store: tx.head segment open file_id={} first_fk={} bits={} slots={} \
+                 entry={}B gen={} count={} sealed={} occupied≈{}",
+                d.file_id,
+                d.first_fk,
+                head.bits(),
+                head.slots(),
+                head.entry_bytes(),
+                head.generation(),
+                d.count,
+                sealed,
+                head.occupied(),
+            );
             segs.push(Arc::new(Segment {
                 first_fk: d.first_fk,
                 count: AtomicU64::new(d.count),

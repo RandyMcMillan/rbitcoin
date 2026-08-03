@@ -603,14 +603,6 @@ impl AddressHead {
         file.set_logical_len(need)?;
         file.zero_range(0, body_bytes)?;
         remove_legacy_meta_sidecar(&path);
-        rbitcoin_log::debug!(
-            "store: address-head create path={} bits={} slots={} entry={}B access=FdOnly (~{:.2} GiB sparse, footer layout)",
-            file.path().display(),
-            layout.bits,
-            slots,
-            layout.entry_bytes,
-            body_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-        );
         Ok(Self {
             file,
             layout,
@@ -655,15 +647,7 @@ impl AddressHead {
 
         let slots = layout.slots();
         let occupied = count_occupied(&file, slots, layout.entry_bytes)?;
-        rbitcoin_log::debug!(
-            "store: address-head open path={} bits={} slots={} entry={}B access=FdOnly gen={} occupied≈{}",
-            file.path().display(),
-            layout.bits,
-            slots,
-            layout.entry_bytes,
-            generation,
-            occupied,
-        );
+        // Logging: callers (segmented tx.head) emit one line per segment; keep quiet here.
         Ok(Self {
             file,
             layout,
@@ -931,9 +915,7 @@ fn count_occupied(file: &TableFile, slots: u64, entry_bytes: u8) -> Result<u64, 
     let es = u64::from(entry_bytes);
     const SCAN_BYTE_CAP: u64 = 16 * 1024 * 1024; // 16 MiB
     if slots * es > SCAN_BYTE_CAP {
-        rbitcoin_log::debug!(
-            "store: address-head open slots={slots} entry={entry_bytes}B — skip full occupied scan"
-        );
+        // Large segments (e.g. 25-bit): skip full scan; occupied stays approximate 0.
         return Ok(0);
     }
     let mut occupied = 0u64;

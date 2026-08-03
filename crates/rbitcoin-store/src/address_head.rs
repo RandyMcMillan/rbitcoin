@@ -603,7 +603,7 @@ impl AddressHead {
         file.set_logical_len(need)?;
         file.zero_range(0, body_bytes)?;
         remove_legacy_meta_sidecar(&path);
-        rbitcoin_log::info!(
+        rbitcoin_log::debug!(
             "store: address-head create path={} bits={} slots={} entry={}B access=FdOnly (~{:.2} GiB sparse, footer layout)",
             file.path().display(),
             layout.bits,
@@ -655,7 +655,7 @@ impl AddressHead {
 
         let slots = layout.slots();
         let occupied = count_occupied(&file, slots, layout.entry_bytes)?;
-        rbitcoin_log::info!(
+        rbitcoin_log::debug!(
             "store: address-head open path={} bits={} slots={} entry={}B access=FdOnly gen={} occupied≈{}",
             file.path().display(),
             layout.bits,

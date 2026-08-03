@@ -527,7 +527,7 @@ impl SegmentedTxHead {
             *guard = Arc::new(new_list);
         }
         ROLLS.fetch_add(1, Ordering::Relaxed);
-        rbitcoin_log::info!(
+        rbitcoin_log::debug!(
             "store: tx.head segment open file_id={file_id} first_fk={first_fk} \
              bits={} slots={} max_keys={} access={access:?}",
             self.layout.bits,

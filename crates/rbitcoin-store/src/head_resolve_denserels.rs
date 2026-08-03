@@ -24,7 +24,7 @@ use crate::tx_table::{
     decode_packed_tx_outs_with_spender_rels_secret, OutputRecord, TxRecord, TxTable,
 };
 use crate::txid_body::{TXID_ENTRY_LEN, TxidBody};
-use crate::uring_session::{self, UringSession, RWF_DONTCACHE};
+use crate::uring_session::{self, UringSession};
 use rbitcoin_primitives::Fk;
 use std::os::fd::RawFd;
 use std::time::Instant;
@@ -307,6 +307,29 @@ fn resolve_fk_and_range_uring(
             in_flight = in_flight.saturating_sub(1);
 
             if res < 0 {
+                // ENOTSUP (-95) often means RWF_DONTCACHE unsupported (same as bulk_io).
+                // Demote permanently and retry this identity once without flags.
+                if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
+                    crate::bulk_io::note_rwf_dontcache_unsupported();
+                    if let Some(w) = slots[slot].as_mut() {
+                        let off = match TxidBody::entry_offset(w.pending_fk) {
+                            Ok(o) => o,
+                            Err(_) => {
+                                slots[slot] = None;
+                                free_slots.push(slot);
+                                return Err(StoreError::io(
+                                    &side_path,
+                                    std::io::Error::from_raw_os_error(-res),
+                                ));
+                            }
+                        };
+                        w.id_buf = [0u8; 32];
+                        let ud = uring_session::pack_ud(STAGE_ID, slot as u32);
+                        session.push_pread_flags(side_fd, off, &mut w.id_buf, ud, 0)?;
+                        in_flight += 1;
+                        continue;
+                    }
+                }
                 slots[slot] = None;
                 free_slots.push(slot);
                 return Err(StoreError::io(
@@ -536,6 +559,8 @@ fn submit_next_id_or_done(
     slot: u32,
     id_ns: &mut u64,
 ) -> Result<bool, StoreError> {
+    // Sidefile published count (matches Class A count when consistent).
+    let side_n = side.count();
     while work.cand_i < work.cands.len() {
         let rank = (work.cand_i + 1) as u32;
         let fk = work.cands[work.cand_i];
@@ -556,11 +581,8 @@ fn submit_next_id_or_done(
         work.pending_rank = rank;
         work.id_buf = [0u8; 32];
         let ud = uring_session::pack_ud(STAGE_ID, slot);
-        let rw_flags = if side.dontcache_for_fk(fk) {
-            RWF_DONTCACHE
-        } else {
-            0
-        };
+        // Schema 13: far-from-tail sidefile + rwf_dontcache_ok gate.
+        let rw_flags = crate::dontcache_policy::sidefile_sqe_rw_flags(fk, side_n);
         session.push_pread_flags(side_fd, off, &mut work.id_buf, ud, rw_flags)?;
         return Ok(true);
     }

@@ -158,6 +158,23 @@ pub fn put_spend_batch_by_abs_meta_uring(
             match st.phase {
                 Phase::Reading => {
                     if res < 0 {
+                        // ENOTSUP on RWF_DONTCACHE: demote and retry read once.
+                        if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
+                            crate::bulk_io::note_rwf_dontcache_unsupported();
+                            slots[slot] = Some(st);
+                            {
+                                let s = slots[slot].as_mut().unwrap();
+                                session.push_pread_flags(
+                                    body_fd,
+                                    abs,
+                                    &mut s.buf,
+                                    slot as u64,
+                                    0,
+                                )?;
+                            }
+                            in_flight += 1;
+                            continue;
+                        }
                         free_slots.push(slot);
                         abs_busy.remove(&abs);
                         return Err(StoreError::io(
@@ -226,6 +243,23 @@ pub fn put_spend_batch_by_abs_meta_uring(
                 }
                 Phase::Writing => {
                     if res < 0 {
+                        // ENOTSUP on RWF_DONTCACHE: demote and retry write once.
+                        if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
+                            crate::bulk_io::note_rwf_dontcache_unsupported();
+                            slots[slot] = Some(st);
+                            {
+                                let s = slots[slot].as_mut().unwrap();
+                                session.push_pwrite_flags(
+                                    body_fd,
+                                    abs,
+                                    &s.buf,
+                                    slot as u64,
+                                    0,
+                                )?;
+                            }
+                            in_flight += 1;
+                            continue;
+                        }
                         free_slots.push(slot);
                         abs_busy.remove(&abs);
                         return Err(StoreError::io(
@@ -518,13 +552,22 @@ fn put_spend_batch_pure_write_uring(
                 .take()
                 .ok_or(StoreError::Corrupt("spend pure-write empty slot"))?;
             in_flight = in_flight.saturating_sub(1);
-            free_slots.push(slot);
             if res < 0 {
+                if res == -95 && crate::bulk_io::rwf_dontcache_ok() {
+                    crate::bulk_io::note_rwf_dontcache_unsupported();
+                    slots[slot] = Some(wi);
+                    let abs = writes[wi].0;
+                    session.push_pwrite_flags(body_fd, abs, &mut bufs[wi], slot as u64, 0)?;
+                    in_flight += 1;
+                    continue;
+                }
+                free_slots.push(slot);
                 return Err(StoreError::io(
                     &body_path,
                     std::io::Error::from_raw_os_error(-res),
                 ));
             }
+            free_slots.push(slot);
             if res as usize != META_LEN {
                 let (_, cfk, vout, sfk, _) = writes[wi];
                 cold.push((cfk, vout, sfk));

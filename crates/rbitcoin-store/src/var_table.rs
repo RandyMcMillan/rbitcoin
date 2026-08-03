@@ -215,23 +215,32 @@ impl VarTable {
     }
 
     /// Inspect record bytes without copying into a `Vec`.
+    ///
+    /// Body load uses schema-13 always-DONTCACHE (same as [`Self::get_raw`]).
     pub fn with_raw<R>(
         &self,
         fk: Fk,
         f: impl FnOnce(&[u8]) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
         let (off, len) = self.record_range(fk)?;
-        self.body.with_bytes(off, len, f).and_then(|r| r)
+        self.with_bytes_at(off, len, f)
     }
 
     /// Inspect body bytes at a known absolute range (no idx read).
+    ///
+    /// Schema 13: Class A body reads always request RWF_DONTCACHE.
     pub fn with_bytes_at<R>(
         &self,
         offset: u64,
         len: u64,
         f: impl FnOnce(&[u8]) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
-        self.body.with_bytes(offset, len, f).and_then(|r| r)
+        if len == 0 {
+            return f(&[]);
+        }
+        let mut buf = vec![0u8; len as usize];
+        self.read_body_dontcache(offset, &mut buf)?;
+        f(&buf)
     }
 
     /// Absolute write into Class A body via **pwrite** (never mmap).
@@ -415,6 +424,8 @@ impl VarTable {
     }
 
     /// Raw unframed payload for `fk`.
+    ///
+    /// Body payload via bulk_io with schema-13 **always** RWF_DONTCACHE.
     pub fn get_raw(&self, fk: Fk) -> Result<Vec<u8>, StoreError> {
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
         let (count, body_end) = self.published_meta();
@@ -426,12 +437,14 @@ impl VarTable {
         let len = (end - start) as usize;
         let mut buf = vec![0u8; len];
         if len > 0 {
-            self.body.read_at(start, &mut buf)?;
+            self.read_body_dontcache(start, &mut buf)?;
         }
         Ok(buf)
     }
 
     /// Read only the first `buf.len()` bytes at absolute body `(offset, len)`.
+    ///
+    /// Schema 13: Class A body reads always request RWF_DONTCACHE.
     pub fn read_prefix_at(
         &self,
         offset: u64,
@@ -445,8 +458,31 @@ impl VarTable {
         if n == 0 {
             return Ok(0);
         }
-        self.body.read_at(offset, &mut buf[..n])?;
+        self.read_body_dontcache(offset, &mut buf[..n])?;
         Ok(n)
+    }
+
+    /// Class A body pread with [`crate::dontcache_policy::body_always`].
+    fn read_body_dontcache(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let rc = crate::bulk_io::pread_single(
+            self.body.read_fd(),
+            offset,
+            buf,
+            crate::dontcache_policy::body_always(),
+        );
+        if rc < 0 {
+            return Err(StoreError::io(
+                self.body.path(),
+                std::io::Error::from_raw_os_error(-rc),
+            ));
+        }
+        if (rc as usize) != buf.len() {
+            self.body.read_at(offset, buf)?;
+        }
+        Ok(())
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {

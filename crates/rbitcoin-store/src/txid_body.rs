@@ -125,6 +125,8 @@ impl TxidBody {
     }
 
     /// Read txid for create_fk.
+    ///
+    /// Routes through bulk_io so schema-13 far-from-tail entries set RWF_DONTCACHE.
     pub fn get(&self, fk: Fk) -> Result<[u8; 32], StoreError> {
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
         let n = self.count();
@@ -133,11 +135,29 @@ impl TxidBody {
         }
         let off = Self::entry_offset(id)?;
         let mut buf = [0u8; 32];
-        self.file.pread_at(off, &mut buf)?;
+        let rc = crate::bulk_io::pread_single(
+            self.file.read_fd(),
+            off,
+            &mut buf,
+            self.dontcache_for_fk(id),
+        );
+        if rc < 0 {
+            return Err(StoreError::io(
+                self.file.path(),
+                std::io::Error::from_raw_os_error(-rc),
+            ));
+        }
+        if (rc as usize) != 32 {
+            // Short — complete via plain pread.
+            self.file.pread_at(off, &mut buf)?;
+        }
         Ok(buf)
     }
 
     /// Bulk read txids for consecutive fks `first..=last` (1-based).
+    ///
+    /// One contiguous pread; DONTCACHE when the **entire** range is far from tail
+    /// (both endpoints past the 100M window window).
     pub fn get_range(&self, first: u64, last: u64) -> Result<Vec<[u8; 32]>, StoreError> {
         if last < first {
             return Ok(Vec::new());
@@ -149,7 +169,18 @@ impl TxidBody {
         let count = (last - first + 1) as usize;
         let off = Self::entry_offset(first)?;
         let mut blob = vec![0u8; count * 32];
-        self.file.pread_at(off, &mut blob)?;
+        // Whole range cold only if last is still far from tail.
+        let dc = self.dontcache_for_fk(first) && self.dontcache_for_fk(last);
+        let rc = crate::bulk_io::pread_single(self.file.read_fd(), off, &mut blob, dc);
+        if rc < 0 {
+            return Err(StoreError::io(
+                self.file.path(),
+                std::io::Error::from_raw_os_error(-rc),
+            ));
+        }
+        if (rc as usize) != blob.len() {
+            self.file.pread_at(off, &mut blob)?;
+        }
         let mut out = Vec::with_capacity(count);
         for i in 0..count {
             let s = i * 32;
@@ -160,8 +191,8 @@ impl TxidBody {
 
     /// Fill `out[i]` with txid for `fks[i]` (scattered fks).
     ///
-    /// Larger batches use `pread_batch` with per-fk [`RWF_DONTCACHE`] when the
-    /// entry is more than [`TXID_DONTCACHE_FROM_TAIL`] from the published tail.
+    /// Uses `pread_batch` with per-fk [`RWF_DONTCACHE`] when the entry is more
+    /// than [`TXID_DONTCACHE_FROM_TAIL`] from the published tail.
     pub fn get_many(&self, fks: &[Fk]) -> Result<Vec<Option<[u8; 32]>>, StoreError> {
         if fks.is_empty() {
             return Ok(Vec::new());
@@ -183,20 +214,12 @@ impl TxidBody {
         if jobs.is_empty() {
             return Ok(out);
         }
-        if jobs.len() < 4 {
-            for &(i, off, _) in &jobs {
-                let mut buf = [0u8; 32];
-                self.file.pread_at(off, &mut buf)?;
-                out[i] = Some(buf);
-            }
-            return Ok(out);
-        }
-        // Bulk path: one 32-byte buffer per job; DONTCACHE when far from tail.
+        // One 32-byte buffer per job; DONTCACHE when far from tail (all sizes).
         let mut bufs: Vec<[u8; 32]> = vec![[0u8; 32]; jobs.len()];
         {
             use crate::bulk_io::{self, ReadOp};
             let fd = self.file.read_fd();
-            // SAFETY: each bufs[j] is a distinct stack of the vec.
+            // SAFETY: each bufs[j] is a distinct element of the vec.
             let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(jobs.len());
             for (j, &(_i, off, dc)) in jobs.iter().enumerate() {
                 let ptr = bufs[j].as_mut_ptr();

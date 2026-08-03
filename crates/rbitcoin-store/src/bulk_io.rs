@@ -157,6 +157,26 @@ pub fn pread_batch(ops: &mut [ReadOp<'_>]) {
     pread_batch_fallback(ops);
 }
 
+/// One pread with optional schema-13 [`ReadOp::dontcache`] (uring when available).
+///
+/// Returns bytes read (≥0) or negated errno. Used by serial Class A paths that
+/// must still honor RWF_DONTCACHE policy (`tx.idx` pages, sidefile get, body get).
+#[inline]
+pub fn pread_single(fd: RawFd, offset: u64, buf: &mut [u8], dontcache: bool) -> i32 {
+    if buf.is_empty() {
+        return 0;
+    }
+    let mut ops = [ReadOp {
+        fd,
+        offset,
+        buf,
+        result: i32::MIN,
+        dontcache,
+    }];
+    pread_batch(&mut ops);
+    ops[0].result
+}
+
 /// Bulk pread with an explicit backend (`mmap` is not handled here — callers
 /// use map pins). `Uring` demotes to libc pread when the ring is unavailable.
 pub fn pread_batch_backend(ops: &mut [ReadOp<'_>], backend: crate::io_backend::ReadIoBackend) {
@@ -515,6 +535,10 @@ fn pwrite_batch_on_session(
             let i = ud as usize;
             if i < ops.len() {
                 ops[i].result = res;
+                // ENOTSUP / EOPNOTSUPP (95): RWF_DONTCACHE unsupported (writes).
+                if res == -95 || res == -95i32 {
+                    note_rwf_dontcache_unsupported();
+                }
             }
             completed += 1;
         }

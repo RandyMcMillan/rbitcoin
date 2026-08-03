@@ -668,7 +668,11 @@ impl TableFile {
         Ok(())
     }
 
-    /// Walk a byte range via pread into a temporary buffer.
+    /// Walk a byte range via pread into a temporary buffer (tests only).
+    ///
+    /// Production Class A body inspection uses [`crate::var_table::VarTable::with_bytes_at`]
+    /// so schema-13 RWF_DONTCACHE rides the bulk_io path.
+    #[cfg(test)]
     pub fn with_bytes<R>(
         &self,
         offset: u64,

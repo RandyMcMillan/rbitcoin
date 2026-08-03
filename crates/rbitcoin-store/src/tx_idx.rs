@@ -163,12 +163,14 @@ impl TxIdx {
             return Err(StoreError::NotFound);
         }
         let segs = self.segments_snapshot();
-        let seg = find_segment(&segs, id).ok_or(StoreError::NotFound)?;
+        let si = find_segment_index(&segs, id).ok_or(StoreError::NotFound)?;
+        let seg = &segs[si];
         let i = id - seg.first_fk;
         if i >= seg.count {
             return Err(StoreError::NotFound);
         }
-        read_start(seg, i)
+        let dc = crate::dontcache_policy::head_or_idx_segment_index(si, segs.len());
+        read_start(seg, i, dc)
     }
 
     /// `(offset, len)` for interior id (`id < count`); needs start(id+1).
@@ -179,7 +181,10 @@ impl TxIdx {
             return Err(StoreError::NotFound);
         }
         let segs = self.segments_snapshot();
-        let seg = find_segment(&segs, id).ok_or(StoreError::NotFound)?;
+        let si = find_segment_index(&segs, id).ok_or(StoreError::NotFound)?;
+        let seg = &segs[si];
+        let n_segs = segs.len();
+        let dc = crate::dontcache_policy::head_or_idx_segment_index(si, n_segs);
         let i = id - seg.first_fk;
         if i + 1 >= seg.count {
             // Need next segment or last-record path — fall back.
@@ -196,7 +201,7 @@ impl TxIdx {
         let page1 = align_down(off1, IDX_OS_PAGE);
         if page0 == page1 {
             let mut starts = Vec::with_capacity(2);
-            read_starts_page_aligned(seg, i, i + 1, &mut starts)?;
+            read_starts_page_aligned(seg, i, i + 1, &mut starts, dc)?;
             if starts.len() != 2 {
                 return Err(StoreError::Corrupt("tx.idx dual extract"));
             }
@@ -257,15 +262,18 @@ impl TxIdx {
             return Ok(());
         }
         let segs = self.segments_snapshot();
+        let n_segs = segs.len();
         let mut id = first;
         while id <= last {
-            let seg = find_segment(&segs, id).ok_or(StoreError::NotFound)?;
+            let si = find_segment_index(&segs, id).ok_or(StoreError::NotFound)?;
+            let seg = &segs[si];
             let seg_last_fk = seg.first_fk + seg.count - 1;
             let take_last = last.min(seg_last_fk);
             let i0 = id - seg.first_fk;
             let i1 = take_last - seg.first_fk;
+            let dc = crate::dontcache_policy::head_or_idx_segment_index(si, n_segs);
             // OS-page-aligned bulk read covering [i0..=i1], then extract slots.
-            read_starts_page_aligned(seg, i0, i1, out)?;
+            read_starts_page_aligned(seg, i0, i1, out, dc)?;
             id = take_last + 1;
         }
         Ok(())
@@ -326,7 +334,23 @@ impl TxIdx {
                 continue;
             }
             page_buf[..want].fill(0);
-            seg.file.read_at(page_off, &mut page_buf[..want])?;
+            // Schema 13: old idx segments set RWF_DONTCACHE via bulk_io.
+            let dc = crate::dontcache_policy::head_or_idx_segment_index(si, segs.len());
+            let rc = crate::bulk_io::pread_single(
+                seg.file.read_fd(),
+                page_off,
+                &mut page_buf[..want],
+                dc,
+            );
+            if rc < 0 {
+                return Err(StoreError::io(
+                    seg.file.path(),
+                    std::io::Error::from_raw_os_error(-rc),
+                ));
+            }
+            if (rc as usize) < want {
+                seg.file.read_at(page_off, &mut page_buf[..want])?;
+            }
             for &(oi, _, slot, _) in &jobs[p..q] {
                 let abs_off = slot_file_off(slot);
                 let rel_off = (abs_off - page_off) as usize;
@@ -664,22 +688,26 @@ fn decode_abs(seg: &Segment, rel: u32) -> Result<u64, StoreError> {
         .ok_or(StoreError::Corrupt("tx.idx abs overflow"))
 }
 
-fn read_start(seg: &Segment, i: u64) -> Result<u64, StoreError> {
+fn read_start(seg: &Segment, i: u64, dontcache: bool) -> Result<u64, StoreError> {
     // Single slot: still go through page-aligned read (one OS page) so cold
     // probes share the page cache with neighbors.
     let mut out = Vec::with_capacity(1);
-    read_starts_page_aligned(seg, i, i, &mut out)?;
+    read_starts_page_aligned(seg, i, i, &mut out, dontcache)?;
     out.into_iter()
         .next()
         .ok_or(StoreError::Corrupt("tx.idx empty page extract"))
 }
 
 /// Read slots `[i0..=i1]` via OS-page-aligned preads (one read per page).
+///
+/// `dontcache` follows schema-13 head/idx sealed-age policy (open + past 3 sealed
+/// stay cacheable; older set RWF_DONTCACHE on uring SQEs via bulk_io).
 fn read_starts_page_aligned(
     seg: &Segment,
     i0: u64,
     i1: u64,
     out: &mut Vec<u64>,
+    dontcache: bool,
 ) -> Result<(), StoreError> {
     if i1 < i0 {
         return Ok(());
@@ -694,7 +722,17 @@ fn read_starts_page_aligned(
             break;
         }
         let mut page = vec![0u8; want];
-        seg.file.read_at(page_off, &mut page)?;
+        let rc = crate::bulk_io::pread_single(seg.file.read_fd(), page_off, &mut page, dontcache);
+        if rc < 0 {
+            return Err(StoreError::io(
+                seg.file.path(),
+                std::io::Error::from_raw_os_error(-rc),
+            ));
+        }
+        if (rc as usize) < want {
+            // Short read — complete via plain pread (no RWF flags).
+            seg.file.read_at(page_off, &mut page)?;
+        }
         // Extract slots that fall in this page and in [slot..=i1].
         while slot <= i1 {
             let off = slot_file_off(slot);
@@ -715,10 +753,6 @@ fn read_starts_page_aligned(
         }
     }
     Ok(())
-}
-
-fn find_segment(segs: &[Segment], id: u64) -> Option<&Segment> {
-    find_segment_index(segs, id).map(|i| &segs[i])
 }
 
 fn find_segment_index(segs: &[Segment], id: u64) -> Option<usize> {
@@ -956,6 +990,59 @@ mod tests {
         // New layout lives under tx.idx/
         assert!(dir.join("tx.idx").join("meta").is_file());
         assert!(!dir.join("tx.idx.meta").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Serial `record_start` page loads set sealed-age DONTCACHE via bulk_io.
+    #[test]
+    fn serial_record_start_sets_dontcache_by_segment_age() {
+        use crate::bulk_io;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rbitcoin-txidx-dc-{id}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Tiny soft span → one segment per append (need ≥5 segs for age>3).
+        std::env::set_var("RBITCOIN_TX_IDX_SOFT_SPAN", "32");
+        let idx = TxIdx::create(&dir, "tx").unwrap();
+        // Each append jumps body base far enough to roll.
+        let mut base = 16u64;
+        let mut count = 0u64;
+        for _ in 0..6 {
+            let starts = [base, base + 8];
+            idx.append_starts(count, &starts).unwrap();
+            count += 2;
+            base += 256; // force soft-span roll
+        }
+        assert!(
+            idx.segment_count() >= 5,
+            "need ≥5 segs for age>3; got {}",
+            idx.segment_count()
+        );
+
+        // Oldest (si=0, age ≥4): DONTCACHE.
+        let _ = bulk_io::test_take_last_read_dontcache();
+        let _ = idx.record_start(1).unwrap();
+        let flags = bulk_io::test_take_last_read_dontcache();
+        assert!(!flags.is_empty(), "record_start must issue bulk page load");
+        assert!(
+            flags.iter().all(|&d| d),
+            "old idx segment must set ReadOp.dontcache; got {flags:?}"
+        );
+
+        // Tip segment: no DONTCACHE.
+        let _ = bulk_io::test_take_last_read_dontcache();
+        let _ = idx.record_start(count).unwrap();
+        let flags = bulk_io::test_take_last_read_dontcache();
+        assert!(!flags.is_empty());
+        assert!(
+            flags.iter().all(|&d| !d),
+            "tip idx segment must not DONTCACHE; got {flags:?}"
+        );
+
+        std::env::remove_var("RBITCOIN_TX_IDX_SOFT_SPAN");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

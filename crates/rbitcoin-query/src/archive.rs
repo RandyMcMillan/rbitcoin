@@ -4,8 +4,8 @@
 //! - **Plan** ([`Query::archive_plan_mega_owned`] / [`Query::archive_plan_mega_from`]):
 //!   store **reads** — assign create fks (optionally from a reserved HWM),
 //!   **CreateResidency** + in-flight planned creates + `tx.head` resolve, stamp inputs.
-//!   Head-miss parents use Shape A resolve (Prefix33 select + one denserels)
-//!   into [`ArchiveWritePlan::external_parent_outs`] (pipeline-local; not FIFO).
+//!   Head-miss parents use **fk-only** head resolve (no denserels on plan stamp);
+//!   denserels for pin load at prep/ensure into plan-local maps only.
 //! - **Commit** ([`Query::archive_commit_plan`]): store **writes** — body append,
 //!   head index, header_txs, residency denserels seed.
 //! - **Prewarm** ([`Query::archive_residency_prewarm`]): startup fill of complete
@@ -68,13 +68,12 @@ pub struct ArchiveWritePlan {
     /// Parents resolved via durable `tx.head` are **not** published (they thrash
     /// the FIFO with long-tail keys and evict recent creates).
     pub batch_creates: Vec<([u8; 32], Fk)>,
-    /// External parents that missed CreateResidency at plan (head-resolved): full
-    /// outs+denserels loaded once for prep pin. **Pipeline-local** — not written
-    /// into CreateResidency FIFO (long-tail thrash). Prep must consult this map
-    /// before cold denserels IO (a create_fk residency miss is also a denserels miss).
+    /// Pipeline-local full pins for external parents (outs+denserels).
     ///
-    /// **Dropped after pin** ([`Self::clear_external_parent_outs`]) so prep→scripts
-    /// →write only carries sparse [`crate::BatchParents`] for those parents.
+    /// Filled by ensure/prep denserels paths or optional residency Arc share —
+    /// **not** by plan head resolve (plan stamp is fk-only). Never written into
+    /// CreateResidency FIFO. **Dropped after pin**
+    /// ([`Self::clear_external_parent_outs`]).
     pub external_parent_outs: std::collections::HashMap<u64, CreatePin>,
     /// Prep-ahead pin material for **this batch's creates**, parallel to
     /// [`Self::planned_fks`]: same [`CreatePin`] Arcs as [`Self::packed`] (refcount
@@ -355,44 +354,29 @@ impl Query {
         let head_need_n = need_head.len() as u64;
         let mut head_hit_n = 0u64;
 
-        // External parents that miss CreateResidency (head path). Shape A:
-        // Prefix33 select + **one** denserels body per winner into
-        // pipeline-local `external_parent_outs` (not residency FIFO).
+        // External parents that miss CreateResidency: **fk-only** head resolve
+        // (probe + idx + Prefix33 / body_txid). Do **not** load denserels on the
+        // plan critical path — denserels for pin are residency hits, prep cold
+        // load, or `ensure_external_parent_denserels_from_plan` (plan-local only).
         //
-        // Timers: head_fk = wall − dens_ns; head_dens = denserels-wave ns from
-        // the fused resolve (single-cand denserels-only + multi-cand dens wave).
-        let mut external_parent_outs: std::collections::HashMap<u64, CreatePin> =
+        // head_dens stays 0 here (denserels wave deferred off plan stamp).
+        let external_parent_outs: std::collections::HashMap<u64, CreatePin> =
             std::collections::HashMap::new();
-        let mut dens_fks_n = 0u64;
-        let mut dens_bytes = 0u64;
         let t_head = Instant::now();
-        let mut head_dens_ns = 0u64;
+        let head_dens_ns = 0u64;
         if !need_head.is_empty() {
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
-            let (hits, dens_ns) = self.store.get_fk_and_outs_by_txid_batch(&need_head)?;
-            head_dens_ns = dens_ns;
-            for (txid, row) in hits {
-                if let Some((fk, outs_opt)) = row {
+            let hits = self.store.get_fk_by_txid_batch(&need_head)?;
+            for (txid, fk_opt) in hits {
+                if let Some(fk) = fk_opt {
                     resolved.insert(txid, fk);
                     head_hit_n = head_hit_n.saturating_add(1);
-                    if let Some((tx, outs, dens)) = outs_opt {
-                        dens_fks_n = dens_fks_n.saturating_add(1);
-                        dens_bytes = dens_bytes
-                            .saturating_add(dens.len() as u64 * 4)
-                            .saturating_add(
-                                outs.iter().map(|o| o.script.len() as u64 + 16).sum::<u64>(),
-                            );
-                        if let Some(id) = fk.get() {
-                            external_parent_outs
-                                .insert(id, std::sync::Arc::new((tx, outs, dens)));
-                        }
-                    }
                 }
             }
         }
         let head_total_ns = t_head.elapsed().as_nanos() as u64;
-        let head_fk_ns = head_total_ns.saturating_sub(head_dens_ns);
-        crate::archive_phase_stats::note_head_dens_wave(dens_fks_n, dens_bytes);
+        let head_fk_ns = head_total_ns; // denserels not on plan stamp path
+        crate::archive_phase_stats::note_head_dens_wave(0, 0);
 
         // Pass 3: stamp create_fk on inputs; tip spends list; build shared CreatePin.
         // Outs move into Arc once — packed pin half and batch_pin share that Arc.
@@ -1125,8 +1109,7 @@ mod tests {
     }
 
     /// Commit denserels seed is for this batch's creates only.
-    /// Head-resolved parents load outs+denserels into **pipeline-local**
-    /// `external_parent_outs` (not CreateResidency FIFO).
+    /// Plan head path stamps create_fk only — no denserels into plan or residency.
     #[test]
     fn residency_publish_creates_only_not_head_resolved_parents() {
         use std::collections::HashMap;
@@ -1174,15 +1157,11 @@ mod tests {
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
         assert_eq!(plan.batch_creates.len(), 1);
         assert_eq!(plan.batch_creates[0].0, child_txid);
-        // Pipeline-local denserels for head-miss parent (prep pin source).
-        let pin = plan
-            .external_parent_outs
-            .get(&1)
-            .expect("head-miss parent denserels on plan");
-        let (ptx, pouts, pdens) = pin.as_ref();
-        assert_eq!(ptx.txid, parent_txid);
-        assert!(!pouts.is_empty(), "outs loaded for pin");
-        assert!(!pdens.is_empty() || pouts.len() == 1, "denserels for outs");
+        // Plan stamp is fk-only — denserels load at prep/ensure, not head Shape A.
+        assert!(
+            plan.external_parent_outs.is_empty(),
+            "plan must not denserels-load head parents"
+        );
         // Must not thrash CreateResidency with long-tail head parents.
         assert!(
             q.create_residency().lookup_fk_by_txid(&parent_txid).is_none(),
@@ -1191,15 +1170,6 @@ mod tests {
         assert!(
             q.create_residency().get_outs(Fk(1)).is_none(),
             "head path must not denserels-seed parents into residency"
-        );
-
-        // Commit does not need external full-outs (pipeline drops them after pin).
-        let mut plan = plan;
-        assert!(!plan.external_parent_outs.is_empty());
-        plan.clear_external_parent_outs();
-        assert!(
-            plan.external_parent_outs.is_empty(),
-            "clear must drop external full-outs before write queue"
         );
 
         q.archive_commit_plan(plan).unwrap();

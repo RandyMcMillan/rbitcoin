@@ -731,37 +731,70 @@ pub fn ensure_external_parent_denserels_from_plan(
     let mut cold_io_ns = 0u64;
     if !cold_fks.is_empty() {
         let t_io = Instant::now();
-        // Prefer plan stamp body ranges (skip tx.idx) — uring denserels batch.
-        // Identity is the stamp reverse map (RAM), passed into the range API.
-        let mut by_range: Vec<(rbitcoin_primitives::Fk, (u64, u64), [u8; 32])> = Vec::new();
+        // Prefer plan stamp body ranges (skip tx.idx) — sparse need denserels.
+        let mut by_range: Vec<(
+            rbitcoin_primitives::Fk,
+            (u64, u64),
+            [u8; 32],
+            Vec<u32>,
+        )> = Vec::new();
         let mut need_idx: Vec<rbitcoin_primitives::Fk> = Vec::new();
         for fk in &cold_fks {
             let id = fk.get().unwrap_or(0);
             if let Some(&range) = plan.external_parent_ranges.get(&id) {
                 let tid =
                     known_create_txid_ram(id, Some(plan), query.create_residency());
-                by_range.push((*fk, range, tid));
+                let need = parent_vouts.get(&id).cloned().unwrap_or_default();
+                by_range.push((*fk, range, tid, need));
             } else {
                 need_idx.push(*fk);
             }
         }
         if !by_range.is_empty() {
-            let t_rng = Instant::now();
             let n_range = by_range.len() as u64;
-            let decoded = query
+            let (decoded, body_ns, dec_ns) = query
                 .store()
                 .get_outs_denserels_by_range_batch(&by_range)
                 .map_err(ConsensusError::Store)?;
-            let rng_ns = t_rng.elapsed().as_nanos() as u64;
+            let rng_ns = body_ns.saturating_add(dec_ns);
             if rng_ns > 0 {
                 confirm_load_stats::COLD_RANGE_NS.fetch_add(rng_ns, Ordering::Relaxed);
             }
+            if body_ns > 0 {
+                confirm_load_stats::COLD_RANGE_BODY_NS.fetch_add(body_ns, Ordering::Relaxed);
+            }
+            if dec_ns > 0 {
+                confirm_load_stats::COLD_RANGE_DECODE_NS.fetch_add(dec_ns, Ordering::Relaxed);
+            }
             confirm_load_stats::COLD_RANGE_N.fetch_add(n_range, Ordering::Relaxed);
-            for ((fk, _range, _tid), row) in by_range.into_iter().zip(decoded.into_iter()) {
-                if let (Some(id), Some((tx, outs, dens))) = (fk.get(), row) {
-                    plan.external_parent_outs
-                        .insert(id, std::sync::Arc::new((tx, outs, dens)));
+            // Expand sparse live into dense outs for plan.external_parent_outs CreatePin
+            // shape (ensure/in-flight still use full CreatePin). Only need vouts filled.
+            for ((_fk, _range, _tid, need), row) in by_range.into_iter().zip(decoded.into_iter()) {
+                let Some(id) = _fk.get() else {
+                    continue;
+                };
+                let Some((tx, live, sparse)) = row else {
+                    continue;
+                };
+                let n_out = tx.output_count as usize;
+                let mut outs = vec![
+                    rbitcoin_store::OutputRecord::unspent(0, Vec::new());
+                    n_out
+                ];
+                let mut dens = vec![0u32; n_out];
+                for &(v, ref o) in &live {
+                    if (v as usize) < n_out {
+                        outs[v as usize] = o.clone();
+                    }
                 }
+                for &(v, rel) in &sparse {
+                    if (v as usize) < n_out {
+                        dens[v as usize] = rel;
+                    }
+                }
+                let _ = need;
+                plan.external_parent_outs
+                    .insert(id, std::sync::Arc::new((tx, outs, dens)));
             }
             confirm_load_stats::BODY_TX_READS.fetch_add(n_range, Ordering::Relaxed);
             confirm_load_stats::PIN_NEW.fetch_add(n_range, Ordering::Relaxed);
@@ -1533,40 +1566,7 @@ fn pin_for_wire_batch(
                 plan_by_id.insert(*id, std::sync::Arc::clone(pin));
             }
         }
-        // 2b) Plan stamp body ranges → denserels by offset (skip tx.idx; uring batch).
-        // known_txid from plan reverse map (RAM) — API completes TxRecord identity.
-        let mut range_jobs: Vec<(rbitcoin_primitives::Fk, (u64, u64), [u8; 32])> = Vec::new();
-        for id in parent_vouts.keys() {
-            if plan_by_id.contains_key(id) {
-                continue;
-            }
-            if let Some(&range) = plan.external_parent_ranges.get(id) {
-                let tid =
-                    known_create_txid_ram(*id, Some(plan), query.create_residency());
-                range_jobs.push((rbitcoin_primitives::Fk(*id), range, tid));
-            }
-        }
-        if !range_jobs.is_empty() {
-            let t_rng = Instant::now();
-            let n_range = range_jobs.len() as u64;
-            let decoded = query
-                .store()
-                .get_outs_denserels_by_range_batch(&range_jobs)
-                .map_err(ConsensusError::Store)?;
-            let rng_ns = t_rng.elapsed().as_nanos() as u64;
-            if rng_ns > 0 {
-                confirm_load_stats::COLD_IO_NS.fetch_add(rng_ns, Ordering::Relaxed);
-                confirm_load_stats::COLD_RANGE_NS.fetch_add(rng_ns, Ordering::Relaxed);
-            }
-            confirm_load_stats::COLD_RANGE_N.fetch_add(n_range, Ordering::Relaxed);
-            confirm_load_stats::BODY_TX_READS.fetch_add(n_range, Ordering::Relaxed);
-            confirm_load_stats::PIN_NEW.fetch_add(n_range, Ordering::Relaxed);
-            for ((fk, _range, _tid), row) in range_jobs.into_iter().zip(decoded.into_iter()) {
-                if let (Some(id), Some((tx, outs, dens))) = (fk.get(), row) {
-                    plan_by_id.insert(id, std::sync::Arc::new((tx, outs, dens)));
-                }
-            }
-        }
+        // 2b deferred: range denserels after free pins are in batch_parents (sparse API).
     }
     // 3) Same-batch creates: shared batch_pin / packed CreatePin Arc.
     for (id, _need) in &parent_vouts {
@@ -1583,9 +1583,7 @@ fn pin_for_wire_batch(
     let mut still_need: HashMap<u64, Vec<u32>> = HashMap::new();
     let mut n_plan_pin = 0u64;
 
-    // Plan / in-flight: sparse pin only spent parents (not every batch create).
-    // Prefer residency body_range when prior batch already committed; always
-    // attach offline denserels so write ensure does not re-read Class A body.
+    // Plan / in-flight / same-batch free pins → BatchParents.
     let t_plan = Instant::now();
     for (id, need) in &parent_vouts {
         if let Some(pin) = plan_by_id.get(id) {
@@ -1595,7 +1593,7 @@ fn pin_for_wire_batch(
                 .filter_map(|&v| outs.get(v as usize).map(|o| (v, o.clone())))
                 .collect();
             if live.len() != need.len() {
-                // Incomplete plan outs — fall through to residency/cold.
+                // Incomplete plan outs — fall through to range / residency / cold.
                 still_need.insert(*id, need.clone());
                 continue;
             }
@@ -1605,10 +1603,7 @@ fn pin_for_wire_batch(
                 None
             };
             let fk = rbitcoin_primitives::Fk(*id);
-            // Body range: plan stamp head range > residency > none.
             let plan_range = plan.and_then(|p| p.external_parent_ranges.get(id).copied());
-            // If commit(N) already seeded residency, take body_range (and denserels
-            // if offline was empty).
             let (body_range, sparse) =
                 if let Some((_rtx, _live, res_sparse, range)) =
                     query.create_residency().get_parent_needed(fk, need)
@@ -1642,6 +1637,73 @@ fn pin_for_wire_batch(
         }
     }
     let plan_pin_ns = t_plan.elapsed().as_nanos() as u64;
+
+    // 2b) Cold range denserels for still_need with plan body_range (sparse need_vouts).
+    if let Some(plan) = plan {
+        let mut range_jobs: Vec<(
+            rbitcoin_primitives::Fk,
+            (u64, u64),
+            [u8; 32],
+            Vec<u32>,
+        )> = Vec::new();
+        for (id, need) in &still_need {
+            if let Some(&range) = plan.external_parent_ranges.get(id) {
+                let tid =
+                    known_create_txid_ram(*id, Some(plan), query.create_residency());
+                range_jobs.push((rbitcoin_primitives::Fk(*id), range, tid, need.clone()));
+            }
+        }
+        if !range_jobs.is_empty() {
+            let n_range = range_jobs.len() as u64;
+            let (decoded, body_ns, dec_ns) = query
+                .store()
+                .get_outs_denserels_by_range_batch(&range_jobs)
+                .map_err(ConsensusError::Store)?;
+            let rng_ns = body_ns.saturating_add(dec_ns);
+            if rng_ns > 0 {
+                confirm_load_stats::COLD_IO_NS.fetch_add(rng_ns, Ordering::Relaxed);
+                confirm_load_stats::COLD_RANGE_NS.fetch_add(rng_ns, Ordering::Relaxed);
+            }
+            if body_ns > 0 {
+                confirm_load_stats::COLD_RANGE_BODY_NS.fetch_add(body_ns, Ordering::Relaxed);
+            }
+            if dec_ns > 0 {
+                confirm_load_stats::COLD_RANGE_DECODE_NS.fetch_add(dec_ns, Ordering::Relaxed);
+            }
+            confirm_load_stats::COLD_RANGE_N.fetch_add(n_range, Ordering::Relaxed);
+            confirm_load_stats::BODY_TX_READS.fetch_add(n_range, Ordering::Relaxed);
+            confirm_load_stats::PIN_NEW.fetch_add(n_range, Ordering::Relaxed);
+            for ((fk, range, _tid, need), row) in
+                range_jobs.into_iter().zip(decoded.into_iter())
+            {
+                let Some(id) = fk.get() else {
+                    continue;
+                };
+                let Some((tx, live, sparse)) = row else {
+                    continue;
+                };
+                if live.len() != need.len() {
+                    continue; // leave in still_need for residency/idx
+                }
+                let cb = if tx.input_count != 1 {
+                    Some(false)
+                } else {
+                    None
+                };
+                batch_parents.insert_owned(
+                    fk,
+                    tx,
+                    live,
+                    need,
+                    cb,
+                    Some(range),
+                    sparse,
+                );
+                still_need.remove(&id);
+                n_plan_pin = n_plan_pin.saturating_add(1);
+            }
+        }
+    }
 
     // CreateResidency sparse denserels hit, then cold denserels once.
     let mut n_res_hit = 0u64;

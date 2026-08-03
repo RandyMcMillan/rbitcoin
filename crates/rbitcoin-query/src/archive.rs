@@ -1174,14 +1174,14 @@ mod tests {
         plan.external_parent_txids.insert(pid, parent_txid);
 
         let known = plan.external_parent_txid(pid).expect("reverse map");
-        let rows = q
+        let (rows, _body_ns, _dec_ns) = q
             .store
-            .get_outs_denserels_by_range_batch(&[(parent_fk, range, known)])
+            .get_outs_denserels_by_range_batch(&[(parent_fk, range, known, vec![0])])
             .unwrap();
-        let (tx, outs, dens) = rows[0].as_ref().expect("denserels");
+        let (tx, live, sparse) = rows[0].as_ref().expect("denserels");
         assert_eq!(tx.txid, parent_txid, "API sets known_txid (RAM), not sidefile");
-        assert!(!outs.is_empty());
-        assert_eq!(dens.len(), outs.len());
+        assert_eq!(live.len(), 1);
+        assert_eq!(sparse.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

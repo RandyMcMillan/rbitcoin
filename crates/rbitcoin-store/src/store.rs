@@ -434,15 +434,18 @@ impl Store {
         self.txs.get_fk_by_txid_batch(txids)
     }
 
-    /// Denserels/outs by known body ranges (prep; skips `tx.idx`).
+    /// Sparse denserels/outs by known body ranges (prep; skips `tx.idx`).
     ///
-    /// Each item is `(create_fk, body_range, known_txid)` — `known_txid` is
-    /// RAM identity (plan/residency/wire), not a sidefile read.
+    /// See [`TxTable::get_outs_denserels_by_range_batch`].
     pub fn get_outs_denserels_by_range_batch(
         &self,
-        items: &[(Fk, (u64, u64), [u8; 32])],
+        items: &[(Fk, (u64, u64), [u8; 32], Vec<u32>)],
     ) -> Result<
-        Vec<Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>>,
+        (
+            Vec<Option<(TxRecord, Vec<(u32, OutputRecord)>, Vec<(u32, u32)>)>>,
+            u64,
+            u64,
+        ),
         StoreError,
     > {
         self.txs.get_outs_denserels_by_range_batch(items)

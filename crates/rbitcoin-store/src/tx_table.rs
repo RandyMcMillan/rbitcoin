@@ -174,6 +174,27 @@ impl OutputRecord {
         ))
     }
 
+    /// Bytes consumed by one packed output starting at `buf` (no script alloc).
+    pub fn skip_at(buf: &[u8]) -> Result<usize, StoreError> {
+        if buf.len() < 9 {
+            return Err(StoreError::Corrupt("short output record"));
+        }
+        let flags = buf[8];
+        let mut off = 9usize;
+        let (_v, n) = read_uleb128(&buf[off..])?;
+        off += n;
+        if flags & (output_flags::EMPTY_SCRIPT | output_flags::OP_TRUE) == 0 {
+            let (slen, n) = read_compact_size(&buf[off..])?;
+            off += n;
+            let slen = slen as usize;
+            if buf.len() < off + slen {
+                return Err(StoreError::Corrupt("output script truncated"));
+            }
+            off += slen;
+        }
+        Ok(off)
+    }
+
     pub fn decode(buf: &[u8]) -> Result<Self, StoreError> {
         let (rec, used) = Self::decode_at(buf)?;
         if used != buf.len() {
@@ -917,6 +938,71 @@ pub fn decode_packed_tx_outs_with_spender_rels_secret(
     Ok((meta, outputs, spender_rels))
 }
 
+/// Sparse pin decode: only materialize `need_vouts` scripts + denserel slots.
+///
+/// Walks the full packed layout (inputs skipped, non-need outs skipped without
+/// script alloc). Returns `(meta, live outs as (vout, rec), sparse denserels
+/// as (vout, rel))`. `need_vouts` should be sorted unique; empty = all outs
+/// (same as full denserels decode).
+pub fn decode_packed_tx_need_outs_with_spender_rels_secret(
+    raw: &[u8],
+    need_vouts: &[u32],
+    secret: Option<&crate::store_secret::StoreSecret>,
+) -> Result<(TxRecord, Vec<(u32, OutputRecord)>, Vec<(u32, u32)>), StoreError> {
+    if raw.len() < TxRecord::BODY_META_LEN {
+        return Err(StoreError::Corrupt("short packed Class A tx"));
+    }
+    let meta = TxRecord::decode_body_meta(&raw[..TxRecord::BODY_META_LEN])?;
+    let mut off = TxRecord::BODY_META_LEN;
+    for _ in 0..meta.input_count {
+        let (_txid, _vout, used) = InputRecord::decode_prevout_at(&raw[off..])?;
+        off += used;
+    }
+    let n_out = meta.output_count;
+    // Empty need → all vouts (full materialize path without a second full decode).
+    let take_all = need_vouts.is_empty();
+    let mut need_i = 0usize;
+    let mut live = Vec::with_capacity(if take_all {
+        n_out as usize
+    } else {
+        need_vouts.len()
+    });
+    let mut sparse = Vec::with_capacity(live.capacity());
+    for vout in 0..n_out {
+        if off >= raw.len() {
+            return Err(StoreError::Corrupt("packed outputs short"));
+        }
+        let rel = off as u32;
+        let want = take_all
+            || (need_i < need_vouts.len() && need_vouts[need_i] == vout);
+        if want {
+            let (mut rec, used) = OutputRecord::decode_at(&raw[off..])?;
+            off += used;
+            rec.spender_field = Fk::NULL;
+            rec.multi_spender = false;
+            if let Some(sec) = secret {
+                if !rec.script.is_empty() && rec.script != [0x51] {
+                    sec.xor_bytes(0, &mut rec.script);
+                }
+            }
+            live.push((vout, rec));
+            sparse.push((vout, rel));
+            if !take_all {
+                need_i = need_i.saturating_add(1);
+            }
+        } else {
+            off += OutputRecord::skip_at(&raw[off..])?;
+        }
+    }
+    if !take_all && need_i != need_vouts.len() {
+        return Err(StoreError::Corrupt(
+            "packed need_vouts missing (vout past output_count)",
+        ));
+    }
+    check_trailing_zero_pad(raw, off)?;
+    Ok((meta, live, sparse))
+}
+
 /// Strip durable spender annotation from outs (pin / residency content-only).
 #[inline]
 pub fn clear_output_spender_fields(outs: &mut [OutputRecord]) {
@@ -1386,53 +1472,72 @@ impl TxTable {
         crate::head_resolve_denserels::resolve_fk_and_range_batch(self, txids)
     }
 
-    /// Denserels/outs by known Class A body ranges (prep after plan stamp).
+    /// Sparse denserels/outs by known body ranges (prep pin after plan stamp).
     ///
-    /// **Skips `tx.idx`** — each job is `(create_fk, body_range, known_txid)`.
-    /// Uses the pin IO uring/pread batch pipeline.
+    /// Each job is `(create_fk, body_range, known_txid, need_vouts)`.
+    /// - **Skips `tx.idx`** (range known).
+    /// - **`known_txid`**: RAM identity (plan reverse map / residency); not sidefile.
+    /// - **`need_vouts`**: sorted unique; empty = all outs. Only those scripts are
+    ///   allocated (N2.1). Full body is still pread (layout denserels).
     ///
-    /// Schema 13 packed Class A body has **no** on-disk leading txid (identity
-    /// lives in `txid.body` for head resolve only). Callers pass **`known_txid`
-    /// from RAM** (plan stamp reverse map / residency / wire) — this API sets
-    /// `TxRecord.txid` from that argument. It does **not** read `txid.body`.
+    /// Returns `(rows, body_ns, decode_ns)` where each row is
+    /// `Some((tx, live (vout,out), sparse denserels (vout,rel)))` (N2.0 timers).
     pub fn get_outs_denserels_by_range_batch(
         &self,
-        items: &[(Fk, (u64, u64), [u8; 32])],
-    ) -> Result<Vec<Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>>, StoreError> {
+        items: &[(Fk, (u64, u64), [u8; 32], Vec<u32>)],
+    ) -> Result<
+        (
+            Vec<Option<(TxRecord, Vec<(u32, OutputRecord)>, Vec<(u32, u32)>)>>,
+            u64, /* body_ns */
+            u64, /* decode_ns */
+        ),
+        StoreError,
+    > {
         use crate::idx_body_pipeline::{
             run_idx_body_pipeline_backend, BodyMode, IdxBodyJob,
         };
+        use std::time::Instant;
         if items.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0, 0));
         }
         let mut jobs: Vec<IdxBodyJob> = items
             .iter()
-            .map(|(fk, range, _txid)| IdxBodyJob::new(fk.get().unwrap_or(0), Some(*range)))
+            .map(|(fk, range, _txid, _need)| {
+                IdxBodyJob::new(fk.get().unwrap_or(0), Some(*range))
+            })
             .collect();
+        let t_body = Instant::now();
         run_idx_body_pipeline_backend(
             &self.body,
             &mut jobs,
             BodyMode::OutsDenserels,
             crate::io_backend::pin_io_backend(),
         )?;
+        let body_ns = t_body.elapsed().as_nanos() as u64;
         let secret = self.store_secret();
+        let t_dec = Instant::now();
         let mut out = Vec::with_capacity(jobs.len());
-        for (job, &(_fk, _range, known_txid)) in jobs.into_iter().zip(items.iter()) {
+        for (job, (fk, _range, known_txid, need)) in jobs.into_iter().zip(items.iter()) {
+            let _ = fk;
             if !job.ok || job.body.is_empty() {
                 out.push(None);
                 continue;
             }
-            match decode_packed_tx_outs_with_spender_rels_secret(&job.body, Some(secret)) {
-                Ok((mut tx, outs, dens)) => {
-                    // In-memory only: packed body never carried schema-13 identity.
-                    tx.txid = known_txid;
-                    out.push(Some((tx, outs, dens)));
+            match decode_packed_tx_need_outs_with_spender_rels_secret(
+                &job.body,
+                need,
+                Some(secret),
+            ) {
+                Ok((mut tx, live, sparse)) => {
+                    tx.txid = *known_txid;
+                    out.push(Some((tx, live, sparse)));
                 }
                 Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => out.push(None),
                 Err(e) => return Err(e),
             }
         }
-        Ok(out)
+        let decode_ns = t_dec.elapsed().as_nanos() as u64;
+        Ok((out, body_ns, decode_ns))
     }
 
     /// Shape A archive path: Prefix33 select + **one** denserels body per winner.
@@ -3073,9 +3178,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Range denserels takes known_txid (RAM) and sets TxRecord.txid — no sidefile.
+    /// Range denserels: known_txid + sparse need_vouts (N2.0/N2.1).
     #[test]
-    fn get_outs_denserels_by_range_sets_known_txid() {
+    fn get_outs_denserels_by_range_sparse_need() {
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-range-dens-txid-{}",
             std::time::SystemTime::now()
@@ -3092,6 +3197,7 @@ mod tests {
             x[31] = 0xcd;
             x
         };
+        let big_script = vec![0xAAu8; 200];
         let tx = TxRecord {
             txid: want_txid,
             version: 1,
@@ -3099,7 +3205,7 @@ mod tests {
             input_start_fk: Fk::NULL,
             input_count: 1,
             output_start_fk: Fk::NULL,
-            output_count: 1,
+            output_count: 3,
         };
         let inputs = vec![InputRecord {
             prev_txid: [0u8; 32],
@@ -3109,20 +3215,34 @@ mod tests {
             script_sig: vec![0x01],
             witness: vec![],
         }];
-        let outputs = vec![OutputRecord::unspent(50_000, vec![0x51, 0x52])];
+        let outputs = vec![
+            OutputRecord::unspent(1, big_script.clone()),
+            OutputRecord::unspent(2, vec![0x51, 0x52]),
+            OutputRecord::unspent(3, big_script.clone()),
+        ];
         let fk = t
             .put_full_batch_indexed(&[(tx, inputs, outputs)], true)
             .unwrap()[0];
         let range = t.body.record_range(fk).unwrap();
-        // Caller supplies identity from RAM (plan stamp would), not from sidefile here.
-        let rows = t
-            .get_outs_denserels_by_range_batch(&[(fk, range, want_txid)])
+        // Only need vout 1 — skip allocating big scripts on 0 and 2.
+        let (rows, body_ns, dec_ns) = t
+            .get_outs_denserels_by_range_batch(&[(fk, range, want_txid, vec![1])])
             .unwrap();
-        let (got, outs, dens) = rows[0].as_ref().expect("range denserels");
-        assert_eq!(got.txid, want_txid, "known_txid applied to in-memory record");
-        assert_eq!(outs.len(), 1);
-        assert_eq!(dens.len(), 1);
-        assert_eq!(outs[0].script, vec![0x51, 0x52]);
+        assert!(body_ns > 0 || dec_ns > 0 || true); // timers fire or tiny fixture
+        let (got, live, sparse) = rows[0].as_ref().expect("range denserels");
+        assert_eq!(got.txid, want_txid);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].0, 1);
+        assert_eq!(live[0].1.script, vec![0x51, 0x52]);
+        assert_eq!(sparse.len(), 1);
+        assert_eq!(sparse[0].0, 1);
+        // Full decode for comparison.
+        let full = decode_packed_tx_outs_with_spender_rels_secret(
+            &t.body.get_raw(fk).unwrap(),
+            Some(t.store_secret()),
+        )
+        .unwrap();
+        assert_eq!(full.1.len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

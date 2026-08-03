@@ -211,6 +211,9 @@ pub(crate) struct IbdPerfSample {
     /// Cold denserels by plan body range (ms / create count).
     pub load_cold_range_ms: u64,
     pub load_cold_range_n: u64,
+    /// N2.0: body pread vs sparse denserels decode (ms; sum ≈ cold_range).
+    pub load_cold_range_body_ms: u64,
+    pub load_cold_range_decode_ms: u64,
     /// Cold denserels by idx→body (ms / create count).
     pub load_cold_idx_ms: u64,
     pub load_cold_idx_n: u64,
@@ -474,6 +477,8 @@ impl Default for IbdPerfSample {
             load_cold_io_ms: 0,
             load_cold_range_ms: 0,
             load_cold_range_n: 0,
+            load_cold_range_body_ms: 0,
+            load_cold_range_decode_ms: 0,
             load_cold_idx_ms: 0,
             load_cold_idx_n: 0,
             load_cold_decode_ms: 0,
@@ -915,6 +920,8 @@ pub(crate) fn sample(
         load_cold_io_ms: ns_ms(pw.cold_io_ns),
         load_cold_range_ms: ns_ms(pw.cold_range_ns),
         load_cold_range_n: pw.cold_range_n,
+        load_cold_range_body_ms: ns_ms(pw.cold_range_body_ns),
+        load_cold_range_decode_ms: ns_ms(pw.cold_range_decode_ns),
         load_cold_idx_ms: ns_ms(pw.cold_idx_ns),
         load_cold_idx_n: pw.cold_idx_n,
         load_cold_decode_ms: ns_ms(pw.cold_decode_ns),
@@ -1261,7 +1268,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
          assemble={}ms(prevout={} us/in={} batch={}/n={} res={}/n={} same={}/n={} cold={}/n={} \
          cold_why(null_fk={} not_pin={} mismatch={} vout_miss={}) fk={}ms \
          sigop={} final={} job={}) \
-         pin(plan={}ms/n={} res={}ms/n={} cold_range={}ms/n={} cold_idx={}ms/n={} cold_io={}ms cold_dec={}ms us/new={}) \
+         pin(plan={}ms/n={} res={}ms/n={} cold_range={}ms(body={} dec={})/n={} cold_idx={}ms/n={} cold_io={}ms cold_dec={}ms us/new={}) \
          pin_hit%={} denserels_hit%={} pin_plan={} pin_res={} pin_new={} body_io={} parent_io={}",
         s.load_blocks,
         prep_ms,
@@ -1297,6 +1304,8 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         res_ms,
         s.load_pin_residency,
         cold_range_ms,
+        s.load_cold_range_body_ms,
+        s.load_cold_range_decode_ms,
         s.load_cold_range_n,
         cold_idx_ms,
         s.load_cold_idx_n,
@@ -1999,7 +2008,14 @@ mod tests {
             "{line}"
         );
         // I2: us/new = (1200+400)*1000/6000 = 266
-        assert!(line.contains("cold_range=1200ms/n=4000"), "{line}");
+        assert!(line.contains("cold_range=1200ms(body="), "{line}");
+        s.load_cold_range_body_ms = 800;
+        s.load_cold_range_decode_ms = 400;
+        let line = format_info(&s);
+        assert!(
+            line.contains("cold_range=1200ms(body=800 dec=400)/n=4000"),
+            "{line}"
+        );
         assert!(line.contains("cold_idx=400ms/n=2000"), "{line}");
         assert!(line.contains("us/new=266"), "{line}");
         // I4

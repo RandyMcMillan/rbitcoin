@@ -144,6 +144,10 @@ pub mod confirm_load_stats {
     /// Cold denserels via plan stamp body range (`get_outs_denserels_by_range_batch`).
     pub static COLD_RANGE_NS: AtomicU64 = AtomicU64::new(0);
     pub static COLD_RANGE_N: AtomicU64 = AtomicU64::new(0);
+    /// Sub-wall of cold range: body pread only (N2.0).
+    pub static COLD_RANGE_BODY_NS: AtomicU64 = AtomicU64::new(0);
+    /// Sub-wall of cold range: sparse denserels decode (N2.0).
+    pub static COLD_RANGE_DECODE_NS: AtomicU64 = AtomicU64::new(0);
     /// Cold denserels via idx→body (`load_creates_once_seed`).
     pub static COLD_IDX_NS: AtomicU64 = AtomicU64::new(0);
     pub static COLD_IDX_N: AtomicU64 = AtomicU64::new(0);
@@ -183,6 +187,8 @@ pub mod confirm_load_stats {
         pub cold_io_ns: u64,
         pub cold_range_ns: u64,
         pub cold_range_n: u64,
+        pub cold_range_body_ns: u64,
+        pub cold_range_decode_ns: u64,
         pub cold_idx_ns: u64,
         pub cold_idx_n: u64,
         pub cold_decode_ns: u64,
@@ -219,6 +225,8 @@ pub mod confirm_load_stats {
             cold_io_ns: COLD_IO_NS.swap(0, Ordering::Relaxed),
             cold_range_ns: COLD_RANGE_NS.swap(0, Ordering::Relaxed),
             cold_range_n: COLD_RANGE_N.swap(0, Ordering::Relaxed),
+            cold_range_body_ns: COLD_RANGE_BODY_NS.swap(0, Ordering::Relaxed),
+            cold_range_decode_ns: COLD_RANGE_DECODE_NS.swap(0, Ordering::Relaxed),
             cold_idx_ns: COLD_IDX_NS.swap(0, Ordering::Relaxed),
             cold_idx_n: COLD_IDX_N.swap(0, Ordering::Relaxed),
             cold_decode_ns: COLD_DECODE_NS.swap(0, Ordering::Relaxed),

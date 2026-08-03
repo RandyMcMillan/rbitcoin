@@ -743,10 +743,17 @@ pub fn ensure_external_parent_denserels_from_plan(
             }
         }
         if !by_range.is_empty() {
+            let t_rng = Instant::now();
+            let n_range = by_range.len() as u64;
             let decoded = query
                 .store()
                 .get_outs_denserels_by_range_batch(&by_range)
                 .map_err(ConsensusError::Store)?;
+            let rng_ns = t_rng.elapsed().as_nanos() as u64;
+            if rng_ns > 0 {
+                confirm_load_stats::COLD_RANGE_NS.fetch_add(rng_ns, Ordering::Relaxed);
+            }
+            confirm_load_stats::COLD_RANGE_N.fetch_add(n_range, Ordering::Relaxed);
             for ((fk, _), row) in by_range.iter().zip(decoded.into_iter()) {
                 if let Some((tx, outs, dens)) = row {
                     if let Some(id) = fk.get() {
@@ -755,13 +762,12 @@ pub fn ensure_external_parent_denserels_from_plan(
                     }
                 }
             }
-            confirm_load_stats::BODY_TX_READS
-                .fetch_add(by_range.len() as u64, Ordering::Relaxed);
-            confirm_load_stats::PIN_NEW
-                .fetch_add(by_range.len() as u64, Ordering::Relaxed);
+            confirm_load_stats::BODY_TX_READS.fetch_add(n_range, Ordering::Relaxed);
+            confirm_load_stats::PIN_NEW.fetch_add(n_range, Ordering::Relaxed);
         }
         // Fallback: idx→body denserels (no plan range).
         if !need_idx.is_empty() {
+            let t_idx = Instant::now();
             let loaded = rbitcoin_query::load_creates_once_seed(
                 query.store(),
                 query.create_residency(),
@@ -770,12 +776,17 @@ pub fn ensure_external_parent_denserels_from_plan(
                 false,
             )
             .map_err(ConsensusError::Store)?;
-            confirm_load_stats::BODY_TX_READS
-                .fetch_add(loaded.len() as u64, Ordering::Relaxed);
-            confirm_load_stats::FULL_TX_READS
-                .fetch_add(loaded.len() as u64, Ordering::Relaxed);
-            confirm_load_stats::PIN_NEW
-                .fetch_add(loaded.len() as u64, Ordering::Relaxed);
+            let idx_ns = t_idx.elapsed().as_nanos() as u64;
+            let n_idx = loaded.len() as u64;
+            if idx_ns > 0 {
+                confirm_load_stats::COLD_IDX_NS.fetch_add(idx_ns, Ordering::Relaxed);
+            }
+            if n_idx > 0 {
+                confirm_load_stats::COLD_IDX_N.fetch_add(n_idx, Ordering::Relaxed);
+            }
+            confirm_load_stats::BODY_TX_READS.fetch_add(n_idx, Ordering::Relaxed);
+            confirm_load_stats::FULL_TX_READS.fetch_add(n_idx, Ordering::Relaxed);
+            confirm_load_stats::PIN_NEW.fetch_add(n_idx, Ordering::Relaxed);
             for c in loaded {
                 let Some(id) = c.fk.get() else {
                     continue;
@@ -1492,6 +1503,7 @@ fn pin_for_wire_batch(
         }
         if !range_jobs.is_empty() {
             let t_rng = Instant::now();
+            let n_range = range_jobs.len() as u64;
             let decoded = query
                 .store()
                 .get_outs_denserels_by_range_batch(&range_jobs)
@@ -1499,11 +1511,11 @@ fn pin_for_wire_batch(
             let rng_ns = t_rng.elapsed().as_nanos() as u64;
             if rng_ns > 0 {
                 confirm_load_stats::COLD_IO_NS.fetch_add(rng_ns, Ordering::Relaxed);
+                confirm_load_stats::COLD_RANGE_NS.fetch_add(rng_ns, Ordering::Relaxed);
             }
-            confirm_load_stats::BODY_TX_READS
-                .fetch_add(range_jobs.len() as u64, Ordering::Relaxed);
-            confirm_load_stats::PIN_NEW
-                .fetch_add(range_jobs.len() as u64, Ordering::Relaxed);
+            confirm_load_stats::COLD_RANGE_N.fetch_add(n_range, Ordering::Relaxed);
+            confirm_load_stats::BODY_TX_READS.fetch_add(n_range, Ordering::Relaxed);
+            confirm_load_stats::PIN_NEW.fetch_add(n_range, Ordering::Relaxed);
             for ((fk, _), row) in range_jobs.into_iter().zip(decoded.into_iter()) {
                 if let (Some(id), Some((tx, outs, dens))) = (fk.get(), row) {
                     plan_by_id.insert(id, std::sync::Arc::new((tx, outs, dens)));
@@ -1635,6 +1647,12 @@ fn pin_for_wire_batch(
             )
             .map_err(ConsensusError::Store)?;
             cold_io_ns = t_io.elapsed().as_nanos() as u64;
+            if cold_io_ns > 0 {
+                confirm_load_stats::COLD_IDX_NS.fetch_add(cold_io_ns, Ordering::Relaxed);
+            }
+            if n_cold > 0 {
+                confirm_load_stats::COLD_IDX_N.fetch_add(n_cold, Ordering::Relaxed);
+            }
 
             let t_dec = Instant::now();
             for c in loaded {

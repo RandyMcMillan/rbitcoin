@@ -137,7 +137,14 @@ pub mod confirm_load_stats {
     /// Wire pin sub-walls (ns).
     pub static PLAN_PIN_NS: AtomicU64 = AtomicU64::new(0);
     pub static RES_HIT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Cold denserels wall (range + idx). Prefer split fields when diagnosing.
     pub static COLD_IO_NS: AtomicU64 = AtomicU64::new(0);
+    /// Cold denserels via plan stamp body range (`get_outs_denserels_by_range_batch`).
+    pub static COLD_RANGE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static COLD_RANGE_N: AtomicU64 = AtomicU64::new(0);
+    /// Cold denserels via idx→body (`load_creates_once_seed`).
+    pub static COLD_IDX_NS: AtomicU64 = AtomicU64::new(0);
+    pub static COLD_IDX_N: AtomicU64 = AtomicU64::new(0);
     pub static COLD_DECODE_NS: AtomicU64 = AtomicU64::new(0);
     pub static PARENT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
     pub static FULL_TX_READS: AtomicU64 = AtomicU64::new(0);
@@ -172,6 +179,10 @@ pub mod confirm_load_stats {
         pub plan_pin_ns: u64,
         pub res_hit_ns: u64,
         pub cold_io_ns: u64,
+        pub cold_range_ns: u64,
+        pub cold_range_n: u64,
+        pub cold_idx_ns: u64,
+        pub cold_idx_n: u64,
         pub cold_decode_ns: u64,
         pub cache_hits: u64,
         pub body_tx: u64,
@@ -204,6 +215,10 @@ pub mod confirm_load_stats {
             plan_pin_ns: PLAN_PIN_NS.swap(0, Ordering::Relaxed),
             res_hit_ns: RES_HIT_NS.swap(0, Ordering::Relaxed),
             cold_io_ns: COLD_IO_NS.swap(0, Ordering::Relaxed),
+            cold_range_ns: COLD_RANGE_NS.swap(0, Ordering::Relaxed),
+            cold_range_n: COLD_RANGE_N.swap(0, Ordering::Relaxed),
+            cold_idx_ns: COLD_IDX_NS.swap(0, Ordering::Relaxed),
+            cold_idx_n: COLD_IDX_N.swap(0, Ordering::Relaxed),
             cold_decode_ns: COLD_DECODE_NS.swap(0, Ordering::Relaxed),
             cache_hits: PARENT_CACHE_HITS.swap(0, Ordering::Relaxed),
             body_tx: BODY_TX_READS.swap(0, Ordering::Relaxed),
@@ -619,6 +634,9 @@ pub mod class_c_phase_stats {
 }
 
 /// Connect prevout resolution counters (reset by the IBD sampler).
+///
+/// Coarse hit counts only. Time splits live in consensus `confirm_phase_stats`
+/// (`ASM_PREV_*` / `asm_prev_us_per_in` on `ibd: perf`).
 pub mod connect_prevout_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -632,6 +650,39 @@ pub mod connect_prevout_stats {
             WAVE_HIT.swap(0, Ordering::Relaxed),
             CLASS_A_HIT.swap(0, Ordering::Relaxed),
             STORE_MISS.swap(0, Ordering::Relaxed),
+        )
+    }
+}
+
+/// CreateResidency `RwLock` wait/hold (IBD sampler).
+///
+/// **Not** channel wait (`thr prep=busy/wait`). `r_wait` large under seed write
+/// contention means prep is blocked on residency write; `r_wait≈0` with prep still
+/// slow means look elsewhere (cold denserels / prevout).
+pub mod residency_lock_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Time from `write()` call until exclusive lock acquired.
+    pub static W_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Exclusive write-guard hold time (bookkeeping only; Arc drop is after unlock).
+    pub static W_HOLD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static W_N: AtomicU64 = AtomicU64::new(0);
+    /// Time from `read()` call until shared lock acquired.
+    pub static R_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Shared read-guard hold time (sum across readers).
+    pub static R_HOLD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static R_N: AtomicU64 = AtomicU64::new(0);
+
+    /// `(w_wait, w_hold, w_n, r_wait, r_hold, r_n)` then reset.
+    #[inline]
+    pub fn sample_and_reset() -> (u64, u64, u64, u64, u64, u64) {
+        (
+            W_WAIT_NS.swap(0, Ordering::Relaxed),
+            W_HOLD_NS.swap(0, Ordering::Relaxed),
+            W_N.swap(0, Ordering::Relaxed),
+            R_WAIT_NS.swap(0, Ordering::Relaxed),
+            R_HOLD_NS.swap(0, Ordering::Relaxed),
+            R_N.swap(0, Ordering::Relaxed),
         )
     }
 }
@@ -1624,6 +1675,60 @@ mod tests {
         wave_fill_stats::add_count(&wave_fill_stats::BODY_STORE, 2);
         wave_fill_stats::add(&wave_fill_stats::BODY_STORE_NS, 9);
         assert_eq!(wave_fill_stats::sample_store_and_reset(), (2, 9));
+
+        // I2 cold range/idx sample.
+        let _ = confirm_load_stats::sample_and_reset();
+        confirm_load_stats::COLD_RANGE_NS.store(1_000_000, AtomicOrdering::Relaxed);
+        confirm_load_stats::COLD_RANGE_N.store(3, AtomicOrdering::Relaxed);
+        confirm_load_stats::COLD_IDX_NS.store(2_000_000, AtomicOrdering::Relaxed);
+        confirm_load_stats::COLD_IDX_N.store(5, AtomicOrdering::Relaxed);
+        let s = confirm_load_stats::sample_and_reset();
+        assert_eq!(s.cold_range_ns, 1_000_000);
+        assert_eq!(s.cold_range_n, 3);
+        assert_eq!(s.cold_idx_ns, 2_000_000);
+        assert_eq!(s.cold_idx_n, 5);
+
+        // I4 residency lock sample.
+        let _ = residency_lock_stats::sample_and_reset();
+        residency_lock_stats::W_WAIT_NS.store(10, AtomicOrdering::Relaxed);
+        residency_lock_stats::W_HOLD_NS.store(20, AtomicOrdering::Relaxed);
+        residency_lock_stats::W_N.store(2, AtomicOrdering::Relaxed);
+        residency_lock_stats::R_WAIT_NS.store(30, AtomicOrdering::Relaxed);
+        residency_lock_stats::R_HOLD_NS.store(40, AtomicOrdering::Relaxed);
+        residency_lock_stats::R_N.store(4, AtomicOrdering::Relaxed);
+        assert_eq!(
+            residency_lock_stats::sample_and_reset(),
+            (10, 20, 2, 30, 40, 4)
+        );
+    }
+
+    #[test]
+    fn residency_lock_stats_accrue_on_read_write() {
+        let _ = residency_lock_stats::sample_and_reset();
+        let r = crate::create_residency::CreateResidency::new(64 * 1024);
+        // Read path.
+        assert_eq!(r.len(), 0);
+        // Write path.
+        let pin = std::sync::Arc::new((
+            rbitcoin_store::TxRecord {
+                txid: [9u8; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: rbitcoin_primitives::Fk::NULL,
+                input_count: 1,
+                output_start_fk: rbitcoin_primitives::Fk::NULL,
+                output_count: 1,
+            },
+            vec![rbitcoin_store::OutputRecord::unspent(1, vec![0x51])],
+            vec![0u32],
+        ));
+        r.put_complete(rbitcoin_primitives::Fk(1), pin, Some((0, 8)));
+        assert!(r.has_outs(rbitcoin_primitives::Fk(1)));
+        let (w_wait, w_hold, w_n, r_wait, r_hold, r_n) = residency_lock_stats::sample_and_reset();
+        assert!(w_n >= 1, "write n={w_n}");
+        assert!(r_n >= 1, "read n={r_n}");
+        // Hold times are wall-clock; allow zero only if Instant resolution is coarse.
+        let _ = (w_wait, w_hold, r_wait, r_hold);
     }
 
     #[test]

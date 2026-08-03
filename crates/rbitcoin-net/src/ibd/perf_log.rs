@@ -6,7 +6,7 @@
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
 //! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, planq/prepq/writeq, txs=, horizon, tip ETA, body `bq n= disk= soft=` |
-//! | INFO  | `ibd: perf …` | Download + body-queue soft depth (`disk=` + `soft=n/stop`); **prep / script / write** stage walls + sub-phases; pin mix; queues |
+//! | INFO  | `ibd: perf …` | Download + body-queue soft depth; **prep_budget** + pin cold_range/idx us/new + assemble us/in path splits + **res_lk**; queues |
 //! | INFO  | `ibd: sizes …` | RSS + work path + body soft budget + **bq disk/soft** + **residency** + conf pipe + tx.head |
 //! | DEBUG | `ibd: perf_dbg …` | µs/blk, pin/edge detail; plan_mega res_txid; class_a res_seed |
 //!
@@ -89,6 +89,22 @@ pub(crate) struct IbdPerfSample {
     pub asm_sigop_ms: u64,
     pub asm_final_ms: u64,
     pub asm_job_ms: u64,
+    /// Non-coinbase inputs resolved (us/in = prevout_ns / max(1, asm_in_n)).
+    pub asm_in_n: u64,
+    /// Prevout path: batch pin hit ms / count.
+    pub asm_prev_batch_ms: u64,
+    pub asm_prev_batch_n: u64,
+    /// Prevout path: residency hit ms / count.
+    pub asm_prev_res_ms: u64,
+    pub asm_prev_res_n: u64,
+    /// Prevout path: same-block ms / count.
+    pub asm_prev_same_ms: u64,
+    pub asm_prev_same_n: u64,
+    /// Prevout path: cold Class A ms / count.
+    pub asm_prev_cold_ms: u64,
+    pub asm_prev_cold_n: u64,
+    /// Prevout path: durable txid→fk lookup ms.
+    pub asm_prev_fk_ms: u64,
     pub strong_ms: u64,
     pub sh_ms: u64,
     /// Post–Class C durable spend annotate wall (logged as `spend=` ms).
@@ -187,7 +203,21 @@ pub(crate) struct IbdPerfSample {
     pub load_plan_pin_ms: u64,
     pub load_res_hit_ms: u64,
     pub load_cold_io_ms: u64,
+    /// Cold denserels by plan body range (ms / create count).
+    pub load_cold_range_ms: u64,
+    pub load_cold_range_n: u64,
+    /// Cold denserels by idx→body (ms / create count).
+    pub load_cold_idx_ms: u64,
+    pub load_cold_idx_n: u64,
     pub load_cold_decode_ms: u64,
+    /// CreateResidency lock: write wait/hold ms, write count.
+    pub res_w_wait_ms: u64,
+    pub res_w_hold_ms: u64,
+    pub res_w_n: u64,
+    /// CreateResidency lock: read wait/hold ms, read count.
+    pub res_r_wait_ms: u64,
+    pub res_r_hold_ms: u64,
+    pub res_r_n: u64,
     pub load_body_tx_reads: u64,
     pub load_parent_tx_reads: u64,
     pub load_missing_parents: u64,
@@ -353,6 +383,16 @@ impl Default for IbdPerfSample {
             asm_sigop_ms: 0,
             asm_final_ms: 0,
             asm_job_ms: 0,
+            asm_in_n: 0,
+            asm_prev_batch_ms: 0,
+            asm_prev_batch_n: 0,
+            asm_prev_res_ms: 0,
+            asm_prev_res_n: 0,
+            asm_prev_same_ms: 0,
+            asm_prev_same_n: 0,
+            asm_prev_cold_ms: 0,
+            asm_prev_cold_n: 0,
+            asm_prev_fk_ms: 0,
             strong_ms: 0,
             sh_ms: 0,
             utxo_ms: 0,
@@ -423,7 +463,17 @@ impl Default for IbdPerfSample {
             load_plan_pin_ms: 0,
             load_res_hit_ms: 0,
             load_cold_io_ms: 0,
+            load_cold_range_ms: 0,
+            load_cold_range_n: 0,
+            load_cold_idx_ms: 0,
+            load_cold_idx_n: 0,
             load_cold_decode_ms: 0,
+            res_w_wait_ms: 0,
+            res_w_hold_ms: 0,
+            res_w_n: 0,
+            res_r_wait_ms: 0,
+            res_r_hold_ms: 0,
+            res_r_n: 0,
             load_body_tx_reads: 0,
             load_parent_tx_reads: 0,
             load_missing_parents: 0,
@@ -691,6 +741,18 @@ pub(crate) fn sample(
         rbitcoin_consensus::confirm_phase_stats::sample_ensure_mix_and_reset();
     let (asm_prevout_ns, asm_sigop_ns, asm_final_ns, asm_job_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_assemble_and_reset();
+    let (
+        asm_in_n,
+        asm_prev_batch_ns,
+        asm_prev_batch_n,
+        asm_prev_res_ns,
+        asm_prev_res_n,
+        asm_prev_same_ns,
+        asm_prev_same_n,
+        asm_prev_cold_ns,
+        asm_prev_cold_n,
+        asm_prev_fk_ns,
+    ) = rbitcoin_consensus::confirm_phase_stats::sample_assemble_prevout_detail_and_reset();
     let (prep_wire_arc_ns, prep_struct_ns, prep_header_ns, prep_prepare_ns, prep_filter_plan_ns) =
         rbitcoin_consensus::confirm_phase_stats::sample_prep_residual_and_reset();
     let (sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head) =
@@ -699,6 +761,14 @@ pub(crate) fn sample(
         rbitcoin_query::wave_fill_stats::sample_store_and_reset();
     // Drain connect prevout counters (not displayed; avoid unbounded growth).
     let _ = rbitcoin_query::connect_prevout_stats::sample_and_reset();
+    let (
+        res_w_wait_ns,
+        res_w_hold_ns,
+        res_w_n,
+        res_r_wait_ns,
+        res_r_hold_ns,
+        res_r_n,
+    ) = rbitcoin_query::residency_lock_stats::sample_and_reset();
     let pw = rbitcoin_query::confirm_load_stats::sample_and_reset();
     let dens = rbitcoin_consensus::plan_stage_stats::sample_and_reset();
     let arch_res = rbitcoin_query::archive_phase_stats::sample_and_reset();
@@ -744,6 +814,16 @@ pub(crate) fn sample(
         asm_sigop_ms: ns_ms(asm_sigop_ns),
         asm_final_ms: ns_ms(asm_final_ns),
         asm_job_ms: ns_ms(asm_job_ns),
+        asm_in_n,
+        asm_prev_batch_ms: ns_ms(asm_prev_batch_ns),
+        asm_prev_batch_n,
+        asm_prev_res_ms: ns_ms(asm_prev_res_ns),
+        asm_prev_res_n,
+        asm_prev_same_ms: ns_ms(asm_prev_same_ns),
+        asm_prev_same_n,
+        asm_prev_cold_ms: ns_ms(asm_prev_cold_ns),
+        asm_prev_cold_n,
+        asm_prev_fk_ms: ns_ms(asm_prev_fk_ns),
         strong_ms: ns_ms(strong_ns),
         sh_ms: ns_ms(sh_ns),
         utxo_ms: ns_ms(utxo_apply_ns),
@@ -814,7 +894,17 @@ pub(crate) fn sample(
         load_plan_pin_ms: ns_ms(pw.plan_pin_ns),
         load_res_hit_ms: ns_ms(pw.res_hit_ns),
         load_cold_io_ms: ns_ms(pw.cold_io_ns),
+        load_cold_range_ms: ns_ms(pw.cold_range_ns),
+        load_cold_range_n: pw.cold_range_n,
+        load_cold_idx_ms: ns_ms(pw.cold_idx_ns),
+        load_cold_idx_n: pw.cold_idx_n,
         load_cold_decode_ms: ns_ms(pw.cold_decode_ns),
+        res_w_wait_ms: ns_ms(res_w_wait_ns),
+        res_w_hold_ms: ns_ms(res_w_hold_ns),
+        res_w_n,
+        res_r_wait_ms: ns_ms(res_r_wait_ns),
+        res_r_hold_ms: ns_ms(res_r_hold_ns),
+        res_r_n,
         load_body_tx_reads: pw.body_tx,
         load_parent_tx_reads: pw.parent_tx,
         load_missing_parents: pw.missing,
@@ -1114,13 +1204,44 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.load_pin_new_meta_ms
     };
     let cold_dec_ms = s.load_cold_decode_ms;
+    let cold_range_ms = s.load_cold_range_ms;
+    let cold_idx_ms = s.load_cold_idx_ms;
+    // us/new: cold denserels wall per cold create (prefer split sum, else cold_io).
+    let cold_for_us = if cold_range_ms + cold_idx_ms > 0 {
+        cold_range_ms.saturating_add(cold_idx_ms)
+    } else {
+        cold_io_ms
+    };
+    let pin_cold_us_per = if s.load_pin_new > 0 {
+        (cold_for_us.saturating_mul(1000)) / s.load_pin_new
+    } else {
+        0
+    };
+    // us/in: prevout wall per non-coinbase input.
+    let asm_prev_us_per_in = if s.asm_in_n > 0 {
+        (s.asm_prevout_ms.saturating_mul(1000)) / s.asm_in_n
+    } else {
+        0
+    };
     let plan_mega = plan_mega_ms(s);
     // Non-pin residual inside pre-assemble: LOAD − pin (structure + plan mega + …).
     let pre_assemble = s.load_ms;
+    // I1 prep budget: total = pre_asm + assemble; pin = parent pin wall; other residual.
+    let pin_budget_ms = s.load_parent_pin_ms;
+    let asm_budget_ms = s.connect_ms;
+    let other_budget_ms = prep_ms
+        .saturating_sub(pin_budget_ms)
+        .saturating_sub(asm_budget_ms);
+    out.push_str(&format!(
+        " | prep_budget total={}ms pin={}ms asm={}ms other={}ms",
+        prep_ms, pin_budget_ms, asm_budget_ms, other_budget_ms,
+    ));
     out.push_str(&format!(
         " | prep blks={} total={}ms pre_asm={}ms(wire_arc={}ms struct={}ms header={}ms prepare={}ms \
-         filter_plan={}ms plan_mega={}ms pin={}ms) assemble={}ms(prevout={} sigop={} final={} job={}) \
-         pin(plan={}ms res={}ms cold_io={}ms cold_dec={}ms) \
+         filter_plan={}ms plan_mega={}ms pin={}ms) \
+         assemble={}ms(prevout={} us/in={} batch={}/n={} res={}/n={} same={}/n={} cold={}/n={} fk={}ms \
+         sigop={} final={} job={}) \
+         pin(plan={}ms/n={} res={}ms/n={} cold_range={}ms/n={} cold_idx={}ms/n={} cold_io={}ms cold_dec={}ms us/new={}) \
          pin_hit%={} denserels_hit%={} pin_plan={} pin_res={} pin_new={} body_io={} parent_io={}",
         s.load_blocks,
         prep_ms,
@@ -1134,13 +1255,30 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.load_parent_pin_ms,
         s.connect_ms,
         s.asm_prevout_ms,
+        asm_prev_us_per_in,
+        s.asm_prev_batch_ms,
+        s.asm_prev_batch_n,
+        s.asm_prev_res_ms,
+        s.asm_prev_res_n,
+        s.asm_prev_same_ms,
+        s.asm_prev_same_n,
+        s.asm_prev_cold_ms,
+        s.asm_prev_cold_n,
+        s.asm_prev_fk_ms,
         s.asm_sigop_ms,
         s.asm_final_ms,
         s.asm_job_ms,
         plan_pin_ms,
+        s.load_pin_plan,
         res_ms,
+        s.load_pin_residency,
+        cold_range_ms,
+        s.load_cold_range_n,
+        cold_idx_ms,
+        s.load_cold_idx_n,
         cold_io_ms,
         cold_dec_ms,
+        pin_cold_us_per,
         pin_hit_pct,
         denserels_hit_pct,
         s.load_pin_plan,
@@ -1151,6 +1289,18 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     ));
     if s.load_win_ms > 0 {
         out.push_str(&format!(" pin_win={}ms", s.load_win_ms));
+    }
+    // I4 residency lock (not thr channel wait).
+    if s.res_w_n > 0 || s.res_r_n > 0 || s.res_r_wait_ms > 0 || s.res_w_hold_ms > 0 {
+        out.push_str(&format!(
+            " res_lk w_wait={}ms w_hold={}ms/n={} r_wait={}ms r_hold={}ms/n={}",
+            s.res_w_wait_ms,
+            s.res_w_hold_ms,
+            s.res_w_n,
+            s.res_r_wait_ms,
+            s.res_r_hold_ms,
+            s.res_r_n,
+        ));
     }
     if s.load_edge_same > 0 || s.load_edge_fk > 0 || s.load_edge_cb > 0 {
         out.push_str(&format!(
@@ -1749,12 +1899,79 @@ mod tests {
         assert!(line.contains("pin_hit%=40"), "{line}");
         assert!(line.contains("denserels_hit%=20"), "{line}");
         assert!(line.contains("cold_io=14ms"), "{line}");
+        // I1–I4 fields present with zero path counts when unset.
+        assert!(line.contains("prep_budget total="), "{line}");
+        assert!(line.contains("us/in="), "{line}");
+        assert!(line.contains("us/new="), "{line}");
+        assert!(line.contains("cold_range="), "{line}");
+        assert!(line.contains("cold_idx="), "{line}");
+        assert!(line.contains("batch="), "{line}");
         assert!(!line.contains("thin[col="), "{line}");
         assert!(!line.contains("by_fk="), "{line}");
         assert!(!line.contains("pin_cached="), "{line}");
         assert!(line.contains("sh_runs=3"), "{line}");
         assert!(!line.contains("reserved"), "{line}");
         assert!(!line.contains("runway"), "{line}");
+    }
+
+    #[test]
+    fn format_info_prep_instrumentation_i1_i4() {
+        let mut s = IbdPerfSample::default();
+        s.load_ms = 2000;
+        s.connect_ms = 3000;
+        s.load_parent_pin_ms = 1800;
+        s.load_blocks = 10;
+        s.asm_prevout_ms = 2500;
+        s.asm_in_n = 50_000;
+        s.asm_prev_batch_ms = 2000;
+        s.asm_prev_batch_n = 40_000;
+        s.asm_prev_res_ms = 200;
+        s.asm_prev_res_n = 5_000;
+        s.asm_prev_same_ms = 50;
+        s.asm_prev_same_n = 2_000;
+        s.asm_prev_cold_ms = 250;
+        s.asm_prev_cold_n = 3_000;
+        s.asm_prev_fk_ms = 10;
+        s.asm_sigop_ms = 2;
+        s.asm_final_ms = 0;
+        s.asm_job_ms = 40;
+        s.load_plan_pin_ms = 100;
+        s.load_pin_plan = 20_000;
+        s.load_res_hit_ms = 50;
+        s.load_pin_residency = 10_000;
+        s.load_cold_range_ms = 1200;
+        s.load_cold_range_n = 4_000;
+        s.load_cold_idx_ms = 400;
+        s.load_cold_idx_n = 2_000;
+        s.load_cold_io_ms = 1600;
+        s.load_cold_decode_ms = 10;
+        s.load_pin_new = 6_000;
+        s.load_pin_cache_body = 30_000;
+        s.res_w_wait_ms = 1;
+        s.res_w_hold_ms = 40;
+        s.res_w_n = 12;
+        s.res_r_wait_ms = 5;
+        s.res_r_hold_ms = 80;
+        s.res_r_n = 1000;
+        let line = format_info(&s);
+        // I1: total = load+connect = 5000; pin=1800; asm=3000; other=200
+        assert!(line.contains("prep_budget total=5000ms pin=1800ms asm=3000ms other=200ms"), "{line}");
+        // I3: us/in = 2500*1000/50000 = 50
+        assert!(line.contains("us/in=50"), "{line}");
+        assert!(line.contains("batch=2000/n=40000"), "{line}");
+        assert!(line.contains("res=200/n=5000"), "{line}");
+        assert!(line.contains("same=50/n=2000"), "{line}");
+        assert!(line.contains("cold=250/n=3000"), "{line}");
+        assert!(line.contains("fk=10ms"), "{line}");
+        // I2: us/new = (1200+400)*1000/6000 = 266
+        assert!(line.contains("cold_range=1200ms/n=4000"), "{line}");
+        assert!(line.contains("cold_idx=400ms/n=2000"), "{line}");
+        assert!(line.contains("us/new=266"), "{line}");
+        // I4
+        assert!(
+            line.contains("res_lk w_wait=1ms w_hold=40ms/n=12 r_wait=5ms r_hold=80ms/n=1000"),
+            "{line}"
+        );
     }
 
     #[test]

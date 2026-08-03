@@ -1467,8 +1467,17 @@ fn resolve_prevout(
 ) -> Result<ResolvedPrevout, ConsensusError> {
     use rbitcoin_query::connect_prevout_stats;
     use std::sync::atomic::Ordering;
+    use std::time::Instant;
 
+    let t0 = Instant::now();
     let prev_txid = op.txid.to_byte_array();
+
+    #[inline]
+    fn note_path(path_ns: &std::sync::atomic::AtomicU64, path_n: &std::sync::atomic::AtomicU64, t0: Instant) {
+        path_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        path_n.fetch_add(1, Ordering::Relaxed);
+        confirm_phase_stats::ASM_IN_N.fetch_add(1, Ordering::Relaxed);
+    }
 
     // Same-block spend of an earlier output in this block.
     // Clone script only for the spent vout (not every create in the block).
@@ -1480,6 +1489,11 @@ fn resolve_prevout(
         let v = op.vout as usize;
         let o = tx.output.get(v).ok_or(ConsensusError::MissingPrevout)?;
         // Same-block: Core uses the spending block's height as the coin height.
+        note_path(
+            &confirm_phase_stats::ASM_PREV_SAME_NS,
+            &confirm_phase_stats::ASM_PREV_SAME_N,
+            t0,
+        );
         return Ok(ResolvedPrevout {
             txout: o.clone(),
             coinbase_height: None,
@@ -1515,6 +1529,11 @@ fn resolve_prevout(
                 } else {
                     (None, 0)
                 };
+                note_path(
+                    &confirm_phase_stats::ASM_PREV_BATCH_NS,
+                    &confirm_phase_stats::ASM_PREV_BATCH_N,
+                    t0,
+                );
                 return Ok(ResolvedPrevout {
                     txout: TxOut {
                         value: Amount::from_sat(value as u64),
@@ -1541,6 +1560,11 @@ fn resolve_prevout(
                 } else {
                     (None, 0)
                 };
+                note_path(
+                    &confirm_phase_stats::ASM_PREV_RES_NS,
+                    &confirm_phase_stats::ASM_PREV_RES_N,
+                    t0,
+                );
                 return Ok(ResolvedPrevout {
                     txout: TxOut {
                         value: Amount::from_sat(out.value as u64),
@@ -1554,9 +1578,12 @@ fn resolve_prevout(
     }
 
     // Cold path: create-fk candidates (thin → durable head / store).
+    let t_fk = Instant::now();
     let head_fk = query
         .tx_fk_by_txid(&prev_txid)
         .map_err(ConsensusError::Store)?;
+    confirm_phase_stats::ASM_PREV_FK_NS
+        .fetch_add(t_fk.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let candidates = [prev_fk_hint, head_fk];
     let mut seen: [u64; 3] = [0; 3];
     let mut n_seen = 0usize;
@@ -1599,6 +1626,11 @@ fn resolve_prevout(
         } else {
             (None, 0)
         };
+        note_path(
+            &confirm_phase_stats::ASM_PREV_COLD_NS,
+            &confirm_phase_stats::ASM_PREV_COLD_N,
+            t0,
+        );
         return Ok(ResolvedPrevout {
             txout: TxOut {
                 value: Amount::from_sat(out.value as u64),

@@ -162,6 +162,19 @@ pub mod confirm_phase_stats {
     pub static ASM_SIGOP_NS: AtomicU64 = AtomicU64::new(0);
     pub static ASM_FINAL_NS: AtomicU64 = AtomicU64::new(0);
     pub static ASM_JOB_NS: AtomicU64 = AtomicU64::new(0);
+    /// Non-coinbase inputs resolved in `resolve_prevout` (for us/in).
+    pub static ASM_IN_N: AtomicU64 = AtomicU64::new(0);
+    /// Prevout path splits (ns + counts; sum of path ns ≈ ASM_PREVOUT_NS).
+    pub static ASM_PREV_BATCH_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ASM_PREV_BATCH_N: AtomicU64 = AtomicU64::new(0);
+    pub static ASM_PREV_RES_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ASM_PREV_RES_N: AtomicU64 = AtomicU64::new(0);
+    pub static ASM_PREV_SAME_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ASM_PREV_SAME_N: AtomicU64 = AtomicU64::new(0);
+    pub static ASM_PREV_COLD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ASM_PREV_COLD_N: AtomicU64 = AtomicU64::new(0);
+    /// Time in `tx_fk_by_txid` / durable head lookup on cold prevout path.
+    pub static ASM_PREV_FK_NS: AtomicU64 = AtomicU64::new(0);
     /// Post–Class C durable spend annotation batch.
     ///
     /// Historical name `UTXO_APPLY_NS` / log field `spend=` ms — this is **not** a
@@ -316,6 +329,26 @@ pub mod confirm_phase_stats {
             ASM_SIGOP_NS.swap(0, Ordering::Relaxed),
             ASM_FINAL_NS.swap(0, Ordering::Relaxed),
             ASM_JOB_NS.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    /// Prevout path detail: `(in_n, batch_ns, batch_n, res_ns, res_n, same_ns, same_n,
+    /// cold_ns, cold_n, fk_ns)`.
+    #[inline]
+    #[allow(clippy::type_complexity)]
+    pub fn sample_assemble_prevout_detail_and_reset()
+    -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+        (
+            ASM_IN_N.swap(0, Ordering::Relaxed),
+            ASM_PREV_BATCH_NS.swap(0, Ordering::Relaxed),
+            ASM_PREV_BATCH_N.swap(0, Ordering::Relaxed),
+            ASM_PREV_RES_NS.swap(0, Ordering::Relaxed),
+            ASM_PREV_RES_N.swap(0, Ordering::Relaxed),
+            ASM_PREV_SAME_NS.swap(0, Ordering::Relaxed),
+            ASM_PREV_SAME_N.swap(0, Ordering::Relaxed),
+            ASM_PREV_COLD_NS.swap(0, Ordering::Relaxed),
+            ASM_PREV_COLD_N.swap(0, Ordering::Relaxed),
+            ASM_PREV_FK_NS.swap(0, Ordering::Relaxed),
         )
     }
 
@@ -775,6 +808,22 @@ mod coverage_tests {
         ASM_FINAL_NS.store(30, Ordering::Relaxed);
         ASM_JOB_NS.store(40, Ordering::Relaxed);
         assert_eq!(sample_assemble_and_reset(), (10, 20, 30, 40));
+        // I3 assemble prevout path detail.
+        let _ = sample_assemble_prevout_detail_and_reset();
+        ASM_IN_N.store(100, Ordering::Relaxed);
+        ASM_PREV_BATCH_NS.store(1000, Ordering::Relaxed);
+        ASM_PREV_BATCH_N.store(80, Ordering::Relaxed);
+        ASM_PREV_RES_NS.store(200, Ordering::Relaxed);
+        ASM_PREV_RES_N.store(10, Ordering::Relaxed);
+        ASM_PREV_SAME_NS.store(50, Ordering::Relaxed);
+        ASM_PREV_SAME_N.store(5, Ordering::Relaxed);
+        ASM_PREV_COLD_NS.store(300, Ordering::Relaxed);
+        ASM_PREV_COLD_N.store(5, Ordering::Relaxed);
+        ASM_PREV_FK_NS.store(40, Ordering::Relaxed);
+        assert_eq!(
+            sample_assemble_prevout_detail_and_reset(),
+            (100, 1000, 80, 200, 10, 50, 5, 300, 5, 40)
+        );
         ENSURE_RES_HIT.store(8, Ordering::Relaxed);
         ENSURE_COLD_N.store(9, Ordering::Relaxed);
         assert_eq!(sample_ensure_mix_and_reset(), (8, 9));
@@ -784,6 +833,7 @@ mod coverage_tests {
         let _ = sample_class_a_ensure_and_reset();
         let _ = sample_prep_residual_and_reset();
         let _ = sample_assemble_and_reset();
+        let _ = sample_assemble_prevout_detail_and_reset();
         let _ = sample_ensure_mix_and_reset();
     }
 

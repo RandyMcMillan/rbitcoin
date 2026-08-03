@@ -47,7 +47,10 @@ use crate::CreatePin;
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, RwLock};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Instant;
 #[cfg(test)]
 use std::sync::Mutex;
 
@@ -138,16 +141,34 @@ impl CreateResidency {
         Self::new(byte_cap)
     }
 
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, Inner> {
-        self.inner
+    fn read(&self) -> TimedReadGuard<'_> {
+        let t0 = Instant::now();
+        let guard = self
+            .inner
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|e| e.into_inner());
+        let wait_ns = t0.elapsed().as_nanos() as u64;
+        crate::residency_lock_stats::R_WAIT_NS.fetch_add(wait_ns, Ordering::Relaxed);
+        crate::residency_lock_stats::R_N.fetch_add(1, Ordering::Relaxed);
+        TimedReadGuard {
+            guard,
+            acquired: Instant::now(),
+        }
     }
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
-        self.inner
+    fn write(&self) -> TimedWriteGuard<'_> {
+        let t0 = Instant::now();
+        let guard = self
+            .inner
             .write()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|e| e.into_inner());
+        let wait_ns = t0.elapsed().as_nanos() as u64;
+        crate::residency_lock_stats::W_WAIT_NS.fetch_add(wait_ns, Ordering::Relaxed);
+        crate::residency_lock_stats::W_N.fetch_add(1, Ordering::Relaxed);
+        TimedWriteGuard {
+            guard,
+            acquired: Instant::now(),
+        }
     }
 
     /// Whether residency inserts are enabled (`byte_cap > 0`).
@@ -384,6 +405,56 @@ impl CreateResidency {
             live.push((v, o.clone()));
         }
         Some((tx.clone(), live, sparse, e.body_range))
+    }
+}
+
+/// Shared-lock guard that accrues hold time into [`crate::residency_lock_stats`].
+struct TimedReadGuard<'a> {
+    guard: RwLockReadGuard<'a, Inner>,
+    acquired: Instant,
+}
+
+impl Drop for TimedReadGuard<'_> {
+    fn drop(&mut self) {
+        let hold = self.acquired.elapsed().as_nanos() as u64;
+        if hold > 0 {
+            crate::residency_lock_stats::R_HOLD_NS.fetch_add(hold, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Deref for TimedReadGuard<'_> {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.guard
+    }
+}
+
+/// Exclusive-lock guard that accrues hold time into [`crate::residency_lock_stats`].
+struct TimedWriteGuard<'a> {
+    guard: RwLockWriteGuard<'a, Inner>,
+    acquired: Instant,
+}
+
+impl Drop for TimedWriteGuard<'_> {
+    fn drop(&mut self) {
+        let hold = self.acquired.elapsed().as_nanos() as u64;
+        if hold > 0 {
+            crate::residency_lock_stats::W_HOLD_NS.fetch_add(hold, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Deref for TimedWriteGuard<'_> {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.guard
+    }
+}
+
+impl DerefMut for TimedWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        &mut self.guard
     }
 }
 

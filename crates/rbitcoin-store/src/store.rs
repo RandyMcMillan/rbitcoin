@@ -832,12 +832,12 @@ impl Store {
         Ok(())
     }
 
-    /// Full Class C tip barrier: pre-tip tables **then** `confirmed[]` last.
+    /// Full Class C **connect** barrier: pre-tip tables **then** `confirmed[]` last.
     ///
     /// Complete-or-fail per table. Call **before** body-queue dequeue so a kill
     /// mid-commit can re-drive from BQ when the barrier had not finished.
     ///
-    /// **Tip last** is required: if `confirmed` were durable before `strong_tx` /
+    /// **Tip last on connect:** if `confirmed` were durable before `strong_tx` /
     /// `tx_height`, a mid-barrier kill advances tip with missing strong bits;
     /// re-confirm skips those heights and `repair_class_c_above_tip` only clears
     /// **above** tip — permanent unstrong tip txs.
@@ -845,6 +845,23 @@ impl Store {
         self.flush_class_c_pre_tip()?;
         // Commit point on disk: tip advance only after strong/height/header_txs.
         self.confirmed.flush()?;
+        Ok(())
+    }
+
+    /// Flush only `confirmed[]` (tip length / tip header map).
+    ///
+    /// Used by **disconnect** after RAM truncate so tip shrink is durable **before**
+    /// unstrong / `tx_height` clears. Do not use for connect (would tip-first).
+    pub fn flush_confirmed_only(&self) -> Result<(), StoreError> {
+        self.confirmed.flush()
+    }
+
+    /// Class C **disconnect** post-clear barrier: strong + height after tip already
+    /// shrunk and flushed via [`Self::flush_confirmed_only`].
+    pub fn flush_class_c_after_disconnect_tip(&self) -> Result<(), StoreError> {
+        self.strong_tx.flush()?;
+        self.tx_height.flush()?;
+        // header_txs unchanged on disconnect (archive association remains).
         Ok(())
     }
 
@@ -1414,6 +1431,106 @@ mod tests {
         assert_eq!(s.repair_class_c_above_tip().unwrap(), 0);
         // is_confirmed_strong needs height ≤ tip AND strong — missing strong ⇒ false.
         // There is no durable strong for Fk(2); tip is already 1 — permanent gap.
+        assert!(!s.strong_tx.is_strong(Fk(2)).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Disconnect mid-barrier after tip shrink only: leftover strong/height above
+    /// tip is repairable (not permanent unstrong-at-tip).
+    #[test]
+    fn class_c_disconnect_tip_first_mid_barrier_is_repairable() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            // Tip 0 + tip 1 fully durable.
+            s.confirmed.set(Height(0), Fk(1)).unwrap();
+            s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
+            s.tx_height.set(Fk(1), Height(0)).unwrap();
+            s.confirmed.set(Height(1), Fk(2)).unwrap();
+            s.strong_tx.set_strong_range(Fk(2), 2, Fk(2)).unwrap();
+            s.tx_height.set_range(Fk(2), 2, Height(1)).unwrap();
+            s.flush_class_c_tip().unwrap();
+            assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
+
+            // Disconnect tip-first: shrink tip + flush confirmed only (kill before unstrong).
+            s.confirmed.disconnect_tip(Height(1)).unwrap();
+            s.flush_confirmed_only().unwrap();
+            // Do not unstrong / clear height — simulate kill mid-disconnect.
+        }
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(
+            s.confirmed.tip_height(),
+            Some(Height(0)),
+            "tip shrink must be durable after flush_confirmed_only"
+        );
+        // Strong may still mark height-1 txs; they are above tip.
+        assert!(s.strong_tx.is_strong(Fk(2)).unwrap() || s.tx_height.get(Fk(2)).unwrap() == Some(1));
+        let cleared = s.repair_class_c_above_tip().unwrap();
+        assert!(
+            cleared >= 1,
+            "strong/height above new tip must be repairable (cleared={cleared})"
+        );
+        assert!(s.is_confirmed_strong(Fk(1)).unwrap());
+        assert!(!s.is_confirmed_strong(Fk(2)).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Full disconnect barrier sequence (tip shrink → unstrong/height → flush).
+    #[test]
+    fn class_c_disconnect_full_sequence_reopen_clean() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            s.confirmed.set(Height(0), Fk(1)).unwrap();
+            s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
+            s.tx_height.set(Fk(1), Height(0)).unwrap();
+            s.confirmed.set(Height(1), Fk(2)).unwrap();
+            s.strong_tx.set_strong_range(Fk(2), 2, Fk(2)).unwrap();
+            s.tx_height.set_range(Fk(2), 2, Height(1)).unwrap();
+            s.flush_class_c_tip().unwrap();
+
+            // Production disconnect order (store half).
+            s.confirmed.disconnect_tip(Height(1)).unwrap();
+            s.flush_confirmed_only().unwrap();
+            s.strong_tx.set_unstrong_range(Fk(2), 2).unwrap();
+            s.tx_height.clear_range(Fk(2), 2).unwrap();
+            s.flush_class_c_after_disconnect_tip().unwrap();
+        }
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
+        assert!(s.is_confirmed_strong(Fk(1)).unwrap());
+        assert!(!s.strong_tx.is_strong(Fk(2)).unwrap());
+        assert_eq!(s.tx_height.get(Fk(2)).unwrap(), None);
+        assert_eq!(s.repair_class_c_above_tip().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hazard: clear strong/height while tip still high, then kill (old disconnect bug).
+    #[test]
+    fn class_c_disconnect_unstrong_before_tip_is_unrepairable_hazard() {
+        let dir = tmp();
+        {
+            let s = Store::create(&dir).unwrap();
+            s.confirmed.set(Height(0), Fk(1)).unwrap();
+            s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
+            s.tx_height.set(Fk(1), Height(0)).unwrap();
+            s.confirmed.set(Height(1), Fk(2)).unwrap();
+            s.strong_tx.set_strong(Fk(2), Fk(2)).unwrap();
+            s.tx_height.set(Fk(2), Height(1)).unwrap();
+            s.flush_class_c_tip().unwrap();
+
+            // Bad order: clear height (L0 write-through) while tip still 1.
+            s.tx_height.clear(Fk(2)).unwrap();
+            s.tx_height.flush().unwrap();
+            s.strong_tx.set_unstrong(Fk(2)).unwrap();
+            s.strong_tx.flush().unwrap();
+            // Tip still 1 on disk — kill before confirmed.truncate.
+        }
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
+        // Tip-high + unstrong / no height: repair only clears ABOVE tip — no help.
+        assert_eq!(s.repair_class_c_above_tip().unwrap(), 0);
+        assert!(!s.is_confirmed_strong(Fk(2)).unwrap());
         assert!(!s.strong_tx.is_strong(Fk(2)).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }

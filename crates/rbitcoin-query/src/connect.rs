@@ -420,16 +420,27 @@ impl Query {
     /// Disconnect the current tip (Class C + scripthash create unlink; archive remains).
     ///
     /// Durable point edges remain for archive history; strong bits cleared below.
+    ///
+    /// # Crash order (**tip first** — opposite of connect)
+    ///
+    /// 1. SH unlink (index only; filtered by strong+tip at query time).
+    /// 2. `confirmed` truncate in RAM → **`flush_confirmed_only`** (durable tip shrink).
+    /// 3. Then `set_unstrong` / `tx_height.clear` for disconnected txs → flush those.
+    ///
+    /// `tx_height` is L0 write-through: clearing it **before** tip shrink would make
+    /// tip txs fail `is_confirmed_strong` while tip is still high (permanent if kill).
+    /// Unstrong-before-tip has the same hazard. Mid-kill after tip shrink leaves
+    /// strong/height **above** new tip → `repair_class_c_above_tip` heals.
     pub fn disconnect_tip(&self) -> Result<(), QueryError> {
         let height = self
             .tip_height()
             .ok_or(StoreError::Corrupt("no tip to disconnect"))?;
         let tx_fks = self.block_tx_fks(height)?;
 
+        // 1. Scripthash unlink only — do **not** clear strong / tx_height yet.
         let mut touched_sh: Vec<[u8; 32]> = Vec::new();
         for &tx_fk in &tx_fks {
             let tx = self.store.get_tx(tx_fk)?;
-            // Unlink thin scripthash creates for this block's outputs.
             if tx.output_count > 0 {
                 let outputs = self.tx_output_run_class_a(tx_fk, &tx)?;
                 for (i, o) in outputs.iter().enumerate() {
@@ -438,10 +449,7 @@ impl Query {
                     touched_sh.push(sh);
                 }
             }
-            self.store.strong_tx.set_unstrong(tx_fk)?;
-            self.store.tx_height.clear(tx_fk)?;
         }
-        // Refresh process heads for unlinked scripts.
         if !touched_sh.is_empty() {
             let mut heads = self.sh_heads.lock().unwrap();
             for sh in touched_sh {
@@ -455,10 +463,18 @@ impl Query {
                 }
             }
         }
-        // Class A header_txs list remains with the header; only tip Class C moves.
+
+        // 2. Tip shrink first (RAM then durable). Class A header_txs stay with header.
         self.store.confirmed.disconnect_tip(height)?;
-        // Durable disconnect: flush L2 Class C before returning (same barrier as connect).
-        self.store.flush_class_c_tip()?;
+        self.store.flush_confirmed_only()?;
+
+        // 3. Only after tip is durable lower: clear strong + height for disconnected txs.
+        for &tx_fk in &tx_fks {
+            self.store.strong_tx.set_unstrong(tx_fk)?;
+            self.store.tx_height.clear(tx_fk)?;
+        }
+        self.store.flush_class_c_after_disconnect_tip()?;
+
         // SH watermark tracks confirmed tip (re-confirm will re-enqueue this height).
         self.set_sh_indexed_through_height(self.tip_height().map(|h| h.0));
         Ok(())

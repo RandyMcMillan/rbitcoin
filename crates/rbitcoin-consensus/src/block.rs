@@ -757,18 +757,10 @@ fn assemble_block_prevouts_mode(
     // Spent checks: pending_spent (this run) + durable confirmed-strong annotations.
     for (ti, tx) in block.txdata.iter().enumerate() {
         let spend_fk = archived_tx_fks.map(|fks| fks[ti]);
-        // Txid only — residency or body_txid (never full Class A decode).
-        let archived_txid: Option<[u8; 32]> = if let Some(fk) = spend_fk {
-            query.create_residency().get_txid(fk).or_else(|| {
-                query
-                    .store()
-                    .txs
-                    .body_txid(fk)
-                    .ok()
-            })
-        } else {
-            None
-        };
+        // Wire intake always has the full tx — prefer compute_txid over residency
+        // / txid.body sidefile (A1). Sidefile/residency only if wire path absent
+        // (defensive; assemble always has `block` wire today).
+        let txid = tx.compute_txid().to_byte_array();
 
         if ti > 0 {
             if tx.input.is_empty() {
@@ -808,12 +800,12 @@ fn assemble_block_prevouts_mode(
                             .ok()
                             .flatten()
                     });
-                let pin_live = prev_fk
-                    .map(|fk| {
-                        batch_parents.has_parent_out(fk, op.vout)
-                            || query.create_residency().has_parent_out(fk, op.vout)
-                    })
-                    .unwrap_or(false);
+                // A2: batch pin first — do not touch residency when pin already has out.
+                let pin_live = match prev_fk {
+                    Some(fk) if batch_parents.has_parent_out(fk, op.vout) => true,
+                    Some(fk) => query.create_residency().has_parent_out(fk, op.vout),
+                    None => false,
+                };
                 // Durable spentness: Full mode only. Optimistic defers to structural
                 // after scripts (assumevalid-shaped: scripts need values, not UTXO proof).
                 if mode == AssembleMode::Full
@@ -960,11 +952,7 @@ fn assemble_block_prevouts_mode(
             }
         }
 
-        let txid = if let Some(t) = archived_txid {
-            t
-        } else {
-            tx.compute_txid().to_byte_array()
-        };
+        // `txid` computed once from wire at top of loop (A1).
         let create_fk = spend_fk.unwrap_or(rbitcoin_primitives::Fk::NULL);
         for (v, _) in tx.output.iter().enumerate() {
             if !create_fk.is_null() {
@@ -1503,13 +1491,42 @@ fn resolve_prevout(
         });
     }
 
-    // Batch pin map first, then CreateResidency. Wire prev_txid is
-    // authoritative — reject wrong create_fk hits.
+    // Batch pin first (no TxRecord clone — A3), then CreateResidency only on miss (A2).
+    // Wire prev_txid is authoritative — reject wrong create_fk hits.
     if let Some(prev_fk) = prev_fk_hint {
-        let hit = batch_parents
-            .get_parent_out(prev_fk, op.vout)
-            .or_else(|| query.create_residency().get_parent_out(prev_fk, op.vout));
-        if let Some((prev_rec, out)) = hit {
+        if let Some((value, script, parent_txid)) =
+            batch_parents.get_parent_txout_parts(prev_fk, op.vout)
+        {
+            if parent_txid == prev_txid {
+                connect_prevout_stats::WAVE_HIT.fetch_add(1, Ordering::Relaxed);
+                let (cb_h, create_height) = if resolve_create_heights {
+                    // Need TxRecord only for coinbase/maturity path (Full mode).
+                    let prev_rec = batch_parents
+                        .get_parent_tx(prev_fk)
+                        .ok_or(ConsensusError::MissingPrevout)?;
+                    let cb_h = coinbase_height_for_maturity(
+                        query,
+                        prev_fk,
+                        &prev_rec,
+                        batch_parents,
+                        coinbase_height_cache,
+                    )?;
+                    (cb_h, create_height_for_fk(query, prev_fk, cb_h)?)
+                } else {
+                    (None, 0)
+                };
+                return Ok(ResolvedPrevout {
+                    txout: TxOut {
+                        value: Amount::from_sat(value as u64),
+                        script_pubkey: ScriptBuf::from_bytes(script.to_vec()),
+                    },
+                    coinbase_height: cb_h,
+                    create_height,
+                });
+            }
+        } else if let Some((prev_rec, out)) =
+            query.create_residency().get_parent_out(prev_fk, op.vout)
+        {
             if prev_rec.txid == prev_txid {
                 connect_prevout_stats::WAVE_HIT.fetch_add(1, Ordering::Relaxed);
                 let (cb_h, create_height) = if resolve_create_heights {
@@ -1520,10 +1537,7 @@ fn resolve_prevout(
                         batch_parents,
                         coinbase_height_cache,
                     )?;
-                    (
-                        cb_h,
-                        create_height_for_fk(query, prev_fk, cb_h)?,
-                    )
+                    (cb_h, create_height_for_fk(query, prev_fk, cb_h)?)
                 } else {
                     (None, 0)
                 };

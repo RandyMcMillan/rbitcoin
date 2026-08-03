@@ -121,6 +121,16 @@ impl BatchParents {
         Some((e.tx.clone(), o.1.clone()))
     }
 
+    /// Optimistic assemble hot path: value + script + parent txid **without**
+    /// cloning the full [`TxRecord`] (only the spent out's script bytes).
+    #[inline]
+    pub fn get_parent_txout_parts(&self, fk: Fk, vout: u32) -> Option<(i64, &[u8], [u8; 32])> {
+        let id = fk.get()?;
+        let e = self.by_fk.get(&id)?;
+        let (_, o) = e.outs.iter().find(|(v, _)| *v == vout)?;
+        Some((o.value, o.script.as_slice(), e.tx.txid))
+    }
+
     pub fn get_parent_tx(&self, fk: Fk) -> Option<TxRecord> {
         let id = fk.get()?;
         self.by_fk.get(&id).map(|e| e.tx.clone())
@@ -432,6 +442,12 @@ mod tests {
         assert!(bp.has_abs_layout(Fk(9)));
         let (_, o) = bp.get_parent_out(Fk(9), 0).unwrap();
         assert_eq!(o.value, 42);
+        // A3: txout parts without TxRecord clone.
+        let (v, script, parent_txid) = bp.get_parent_txout_parts(Fk(9), 0).unwrap();
+        assert_eq!(v, 42);
+        assert_eq!(script, &[0x51]);
+        assert_eq!(parent_txid[0], 9);
+        assert!(bp.get_parent_txout_parts(Fk(9), 1).is_none());
     }
 
     #[test]

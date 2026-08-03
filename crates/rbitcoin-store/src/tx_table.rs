@@ -1386,32 +1386,63 @@ impl TxTable {
         &self.secret
     }
 
-    /// Batch head resolve (archive prep bulk path).
+    /// Batch head resolve for plan stamp: **txid → (create_fk, body_range)**.
     ///
-    /// Streaming resolve ([`crate::head_resolve_stream`]) with body backend from
-    /// `RBITCOIN_HEAD_RESOLVE_IO` / global `RBITCOIN_IO` (`uring` \| `pread`).
-    /// Head probe + idx are FdOnly page/chunk IO (see `docs/io-modality.md`).
-    /// Fallback on hard stream failure: phase barrier
-    /// [`Self::get_fk_by_txid_batch_phased`].
+    /// Short-circuit of the Shape A denserels machine
+    /// ([`crate::head_resolve_denserels::resolve_fk_and_range_batch`]): same
+    /// probe + depth-round Prefix33 pipeline, **stops before denserels body**.
+    /// Prep denserels-loads via known `body_range` (skip `tx.idx`).
     ///
     /// BIP30: deepest matching body wins.
     /// Timers: [`crate::head_resolve_stats`] probe / idx / body.
     pub fn get_fk_by_txid_batch(
         &self,
         txids: &[[u8; 32]],
-    ) -> Result<Vec<([u8; 32], Option<Fk>)>, StoreError> {
+    ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
         if txids.is_empty() {
             return Ok(Vec::new());
         }
-        match crate::head_resolve_stream::resolve_batch_streaming(self, txids) {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                rbitcoin_log::debug!(
-                    "store: streaming head resolve unavailable ({e}); using batch path"
-                );
-                self.get_fk_by_txid_batch_phased(txids)
+        crate::head_resolve_denserels::resolve_fk_and_range_batch(self, txids)
+    }
+
+    /// Denserels/outs by known Class A body ranges (prep after plan stamp).
+    ///
+    /// **Skips `tx.idx`** — each job must supply `(body_off, body_len)`. Uses
+    /// the pin IO uring/pread batch pipeline.
+    pub fn get_outs_denserels_by_range_batch(
+        &self,
+        items: &[(Fk, (u64, u64))],
+    ) -> Result<Vec<Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>>, StoreError> {
+        use crate::idx_body_pipeline::{
+            run_idx_body_pipeline_backend, BodyMode, IdxBodyJob,
+        };
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut jobs: Vec<IdxBodyJob> = items
+            .iter()
+            .map(|(fk, range)| IdxBodyJob::new(fk.get().unwrap_or(0), Some(*range)))
+            .collect();
+        run_idx_body_pipeline_backend(
+            &self.body,
+            &mut jobs,
+            BodyMode::OutsDenserels,
+            crate::io_backend::pin_io_backend(),
+        )?;
+        let secret = self.store_secret();
+        let mut out = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            if !job.ok || job.body.is_empty() {
+                out.push(None);
+                continue;
+            }
+            match decode_packed_tx_outs_with_spender_rels_secret(&job.body, Some(secret)) {
+                Ok(dec) => out.push(Some(dec)),
+                Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => out.push(None),
+                Err(e) => return Err(e),
             }
         }
+        Ok(out)
     }
 
     /// Shape A archive path: Prefix33 select + **one** denserels body per winner.
@@ -1442,96 +1473,6 @@ impl TxTable {
     > {
         // Fused machine: batch probe → idx → Prefix33 → denserels (uring when available).
         crate::head_resolve_denserels::resolve_fk_and_denserels_batch(self, txids)
-    }
-
-    /// Phase-barrier resolve: mmap probe + depth-round Prefix33 (early exit).
-    ///
-    /// Deep-first probe order: first match wins (BIP30). Body peeks track
-    /// hit_rank rather than loading every cand in one barrier.
-    pub(crate) fn get_fk_by_txid_batch_phased(
-        &self,
-        txids: &[[u8; 32]],
-    ) -> Result<Vec<([u8; 32], Option<Fk>)>, StoreError> {
-        use crate::idx_body_pipeline::{run_idx_body_pipeline, BodyMode, IdxBodyJob};
-        use std::time::Instant;
-        if txids.is_empty() {
-            return Ok(Vec::new());
-        }
-        crate::head_resolve_stats::add_keys(txids.len() as u64);
-
-        let t_probe = Instant::now();
-        let mut cands_by_key: Vec<Vec<Fk>> = Vec::with_capacity(txids.len());
-        let mut cands_total = 0u64;
-        for txid in txids.iter() {
-            let mixed = self.secret.mix_txid(txid);
-            let cands = self.head.probe_candidates(&mixed)?;
-            cands_total = cands_total.saturating_add(cands.len() as u64);
-            cands_by_key.push(cands);
-        }
-        crate::head_resolve_stats::add_probe(t_probe.elapsed().as_nanos() as u64);
-        crate::head_resolve_stats::add_cands(cands_total);
-
-        let max_depth = cands_by_key.iter().map(|c| c.len()).max().unwrap_or(0);
-        let mut best: Vec<Option<Fk>> = vec![None; txids.len()];
-        let mut unresolved: Vec<bool> = cands_by_key.iter().map(|c| !c.is_empty()).collect();
-        let mut body_lookups = 0u64;
-        let mut miss_peeks = 0u64;
-
-        for depth in 0..max_depth {
-            let mut round: Vec<(usize, Fk, u8)> = Vec::new();
-            for (ki, cands) in cands_by_key.iter().enumerate() {
-                if !unresolved[ki] {
-                    continue;
-                }
-                if let Some(&fk) = cands.get(depth) {
-                    round.push((ki, fk, (depth as u8).saturating_add(1)));
-                }
-            }
-            if round.is_empty() {
-                break;
-            }
-            let t_pipe = Instant::now();
-            let mut jobs: Vec<IdxBodyJob> = round
-                .iter()
-                .map(|(_, fk, _)| IdxBodyJob::new(fk.0, None))
-                .collect();
-            run_idx_body_pipeline(&self.body, &mut jobs, BodyMode::Prefix33)?;
-            let pipe_ns = t_pipe.elapsed().as_nanos() as u64;
-            crate::head_resolve_stats::add_idx(pipe_ns / 2);
-            crate::head_resolve_stats::add_body(pipe_ns.saturating_sub(pipe_ns / 2));
-
-            for ((ki, fk, rank), job) in round.into_iter().zip(jobs.into_iter()) {
-                if !job.ok || job.body.is_empty() {
-                    continue;
-                }
-                body_lookups = body_lookups.saturating_add(1);
-                match Self::txid_from_body_prefix(&job.body) {
-                    Ok(got) if got == txids[ki] => {
-                        crate::head_resolve_stats::add_hit_rank(rank as u64);
-                        best[ki] = Some(fk);
-                        unresolved[ki] = false;
-                    }
-                    Ok(_) => {
-                        miss_peeks = miss_peeks.saturating_add(1);
-                    }
-                    Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {
-                        miss_peeks = miss_peeks.saturating_add(1);
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            if !unresolved.iter().any(|&u| u) {
-                break;
-            }
-        }
-        crate::head_resolve_stats::add_body_lookups(body_lookups);
-        crate::head_resolve_stats::add_miss_peeks(miss_peeks);
-
-        let mut out = Vec::with_capacity(txids.len());
-        for (i, txid) in txids.iter().enumerate() {
-            out.push((*txid, best[i]));
-        }
-        Ok(out)
     }
 
     /// Bulk `body_range` for many fks (archive sticky + confirm load).
@@ -2970,7 +2911,9 @@ mod tests {
         let fk2 = t.put_full_batch_indexed(&[mk(2)], true).unwrap()[0];
         let _ = crate::head_resolve_stats::sample_and_reset();
         let batch = t.get_fk_by_txid_batch(&[txid]).unwrap();
-        assert_eq!(batch[0].1, Some(fk2));
+        assert_eq!(batch[0].1.map(|(f, _)| f), Some(fk2));
+        let range = batch[0].1.unwrap().1;
+        assert!(range.1 > 0, "body range from idx on winner");
         let s = crate::head_resolve_stats::sample_and_reset();
         // Deepest-first early exit: body_lookups ≤ cands (exact `==1` is flaky under
         // parallel tests sharing head_resolve_stats atomics).
@@ -3054,11 +2997,11 @@ mod tests {
         keys.push(txid);
         keys.push([0xff; 32]); // miss
         let batch = t.get_fk_by_txid_batch(&keys).unwrap();
-        let hit = batch.iter().find(|(t, _)| *t == txid).unwrap().1;
+        let hit = batch.iter().find(|(t, _)| *t == txid).unwrap().1.map(|(f, _)| f);
         assert_eq!(hit, Some(fk2));
         assert_ne!(hit, Some(fk1));
         for (other, fk) in &extra {
-            let h = batch.iter().find(|(t, _)| t == other).unwrap().1;
+            let h = batch.iter().find(|(t, _)| t == other).unwrap().1.map(|(f, _)| f);
             assert_eq!(h, Some(*fk));
         }
         assert!(batch.iter().any(|(t, f)| *t == [0xff; 32] && f.is_none()));
@@ -3108,10 +3051,13 @@ mod tests {
         keys.sort_unstable_by_key(|k| t.head_primary_slot(k));
         let batch = t.get_fk_by_txid_batch(&keys).unwrap();
         assert_eq!(batch.len(), 5);
-        for (txid, fk) in &batch {
+        for (txid, row) in &batch {
             let single = t.get_fk_by_txid(txid).unwrap();
-            assert_eq!(*fk, single);
-            assert!(fk.is_some());
+            assert_eq!(row.map(|(f, _)| f), single);
+            assert!(row.is_some());
+            let (fk, range) = row.unwrap();
+            let known = t.body.record_range(fk).unwrap();
+            assert_eq!(range, known, "returned range must match tx.idx");
         }
         // Miss
         let miss = t.get_fk_by_txid_batch(&[[0xff; 32]]).unwrap();

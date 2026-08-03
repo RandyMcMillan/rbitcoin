@@ -1,4 +1,4 @@
-//! Plan Shape A head resolve: **txids in → denserels out**.
+//! Plan Shape A head resolve: **txids in → denserels out** (or fk+range short-circuit).
 //!
 //! Fused FdOnly machine (no multi‑GiB map):
 //! 1. **probe** — [`SegmentedTxHead::probe_candidates_batch`] (page-coalesced)
@@ -6,13 +6,17 @@
 //! 3. **Prefix33** — ≤32 B body prefix; multi-cand miss → next cand at idx
 //! 4. **denserels** — full packed body for the winner; decode outs + denserels
 //!
-//! Single-cand keys skip Prefix33 and load denserels directly (identity via
-//! txid at body start) — same semantics as the prior Shape A path.
+//! [`resolve_fk_and_range_batch`] is the **stamp short-circuit**: same probe +
+//! depth-round Prefix33 pipeline, **stops before denserels**, returns
+//! `(fk, body_range)` so prep can denserels-load by offset without re-idx.
 //!
-//! Backend: `RBITCOIN_HEAD_RESOLVE_IO` / global `RBITCOIN_IO` (`uring` \| `pread`).
+//! Backend: `RBITCOIN_HEAD_RESOLVE_IO` / global `RBITCOIN_IO` (`uring` \| `pread`)
+//! via [`run_idx_body_pipeline`] (pin IO backend for body).
 
 use crate::error::StoreError;
-use crate::idx_body_pipeline::{run_idx_body_pipeline, BodyMode, IdxBodyJob};
+use crate::idx_body_pipeline::{
+    run_idx_body_pipeline, run_idx_body_pipeline_backend, BodyMode, IdxBodyJob,
+};
 use crate::io_backend::{self, ReadIoBackend};
 use crate::tx_idx::IDX_OS_PAGE;
 use crate::tx_table::{
@@ -46,7 +50,22 @@ struct KeyWork {
     pending_rank: u32,
 }
 
-/// Resolve many parent txids to create fk + denserels (plan Shape A).
+/// Stamp short-circuit: **txids → (fk, body_range)** via Shape A probe+Prefix33.
+///
+/// Same depth-round Prefix33 machine as denserels resolve, but **no denserels
+/// body**. `body_range` comes from idx (captured on the winning Prefix33 job)
+/// so prep can denserels-load with known offset (skip `tx.idx`).
+pub fn resolve_fk_and_range_batch(
+    table: &TxTable,
+    txids: &[[u8; 32]],
+) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
+    if txids.is_empty() {
+        return Ok(Vec::new());
+    }
+    resolve_fk_and_range_pread(table, txids)
+}
+
+/// Resolve many parent txids to create fk + denserels (plan Shape A full).
 ///
 /// Returns rows in **input order** and denserels-wave wall ns (archive `head_dens`).
 pub fn resolve_fk_and_denserels_batch(
@@ -76,6 +95,93 @@ pub fn resolve_fk_and_denserels_batch(
         },
         ReadIoBackend::Pread => resolve_pread(table, txids),
     }
+}
+
+/// Depth-round Prefix33 for **all** keys (including single-cand); stop at match.
+fn resolve_fk_and_range_pread(
+    table: &TxTable,
+    txids: &[[u8; 32]],
+) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
+    crate::head_resolve_stats::add_keys(txids.len() as u64);
+
+    let mixed: Vec<[u8; 32]> = txids.iter().map(|t| table.secret.mix_txid(t)).collect();
+    let t_probe = Instant::now();
+    let all_cands = table.head.probe_candidates_batch(&mixed)?;
+    let probe_ns = t_probe.elapsed().as_nanos() as u64;
+    let cands_total: u64 = all_cands.iter().map(|c| c.len() as u64).sum();
+    crate::head_resolve_stats::add_probe(probe_ns);
+    crate::head_resolve_stats::add_cands(cands_total);
+
+    let mut winner: Vec<Option<(Fk, (u64, u64))>> = vec![None; txids.len()];
+    let max_depth = all_cands.iter().map(|c| c.len()).max().unwrap_or(0);
+    let mut unresolved: Vec<bool> = all_cands.iter().map(|c| !c.is_empty()).collect();
+
+    for depth in 0..max_depth {
+        let mut round: Vec<(usize, Fk, u8)> = Vec::new();
+        for (ki, cands) in all_cands.iter().enumerate() {
+            if !unresolved[ki] {
+                continue;
+            }
+            if let Some(&fk) = cands.get(depth) {
+                round.push((ki, fk, (depth as u8).saturating_add(1)));
+            }
+        }
+        if round.is_empty() {
+            break;
+        }
+        let t_pipe = Instant::now();
+        let mut jobs: Vec<IdxBodyJob> = round
+            .iter()
+            .map(|(_, fk, _)| IdxBodyJob::new(fk.0, None))
+            .collect();
+        // Same idx→body pipeline as denserels Shape A multi-cand; body backend
+        // from head-resolve env (uring when available).
+        run_idx_body_pipeline_backend(
+            &table.body,
+            &mut jobs,
+            BodyMode::Prefix33,
+            io_backend::head_resolve_io_backend(),
+        )?;
+        let pipe_ns = t_pipe.elapsed().as_nanos() as u64;
+        crate::head_resolve_stats::add_idx(pipe_ns / 2);
+        crate::head_resolve_stats::add_body(pipe_ns.saturating_sub(pipe_ns / 2));
+
+        let mut body_lookups = 0u64;
+        let mut miss_peeks = 0u64;
+        for ((ki, fk, rank), job) in round.into_iter().zip(jobs.into_iter()) {
+            if !job.ok || job.body.is_empty() {
+                continue;
+            }
+            body_lookups = body_lookups.saturating_add(1);
+            match TxTable::txid_from_body_prefix(&job.body) {
+                Ok(got) if got == txids[ki] => {
+                    crate::head_resolve_stats::add_hit_rank(rank as u64);
+                    if let Some(range) = job.range {
+                        if range.1 > 0 {
+                            winner[ki] = Some((fk, range));
+                            unresolved[ki] = false;
+                        }
+                    }
+                }
+                Ok(_) => miss_peeks = miss_peeks.saturating_add(1),
+                Err(StoreError::NotFound) | Err(StoreError::Corrupt(_)) => {
+                    miss_peeks = miss_peeks.saturating_add(1);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        crate::head_resolve_stats::add_body_lookups(body_lookups);
+        crate::head_resolve_stats::add_miss_peeks(miss_peeks);
+        if !unresolved.iter().any(|&u| u) {
+            break;
+        }
+    }
+
+    Ok(txids
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (*t, winner[i]))
+        .collect())
 }
 
 // ── pread path: batch probe + idx/body pipelines ───────────────────────────

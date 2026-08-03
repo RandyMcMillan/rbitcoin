@@ -731,43 +731,76 @@ pub fn ensure_external_parent_denserels_from_plan(
     let mut cold_io_ns = 0u64;
     if !cold_fks.is_empty() {
         let t_io = Instant::now();
-        // Never seed residency from external-parent cold loads.
-        let loaded = rbitcoin_query::load_creates_once_seed(
-            query.store(),
-            query.create_residency(),
-            &cold_fks,
-            IdxBodyMode::OutsDenserels,
-            false,
-        )
-        .map_err(ConsensusError::Store)?;
+        // Prefer plan stamp body ranges (skip tx.idx) — uring denserels batch.
+        let mut by_range: Vec<(rbitcoin_primitives::Fk, (u64, u64))> = Vec::new();
+        let mut need_idx: Vec<rbitcoin_primitives::Fk> = Vec::new();
+        for fk in &cold_fks {
+            let id = fk.get().unwrap_or(0);
+            if let Some(&range) = plan.external_parent_ranges.get(&id) {
+                by_range.push((*fk, range));
+            } else {
+                need_idx.push(*fk);
+            }
+        }
+        if !by_range.is_empty() {
+            let decoded = query
+                .store()
+                .get_outs_denserels_by_range_batch(&by_range)
+                .map_err(ConsensusError::Store)?;
+            for ((fk, _), row) in by_range.iter().zip(decoded.into_iter()) {
+                if let Some((tx, outs, dens)) = row {
+                    if let Some(id) = fk.get() {
+                        plan.external_parent_outs
+                            .insert(id, std::sync::Arc::new((tx, outs, dens)));
+                    }
+                }
+            }
+            confirm_load_stats::BODY_TX_READS
+                .fetch_add(by_range.len() as u64, Ordering::Relaxed);
+            confirm_load_stats::PIN_NEW
+                .fetch_add(by_range.len() as u64, Ordering::Relaxed);
+        }
+        // Fallback: idx→body denserels (no plan range).
+        if !need_idx.is_empty() {
+            let loaded = rbitcoin_query::load_creates_once_seed(
+                query.store(),
+                query.create_residency(),
+                &need_idx,
+                IdxBodyMode::OutsDenserels,
+                false,
+            )
+            .map_err(ConsensusError::Store)?;
+            confirm_load_stats::BODY_TX_READS
+                .fetch_add(loaded.len() as u64, Ordering::Relaxed);
+            confirm_load_stats::FULL_TX_READS
+                .fetch_add(loaded.len() as u64, Ordering::Relaxed);
+            confirm_load_stats::PIN_NEW
+                .fetch_add(loaded.len() as u64, Ordering::Relaxed);
+            for c in loaded {
+                let Some(id) = c.fk.get() else {
+                    continue;
+                };
+                let (tx, outs, dens) = if let Some(dec) = c.decoded_outs {
+                    dec
+                } else {
+                    rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
+                        &c.raw,
+                        Some(query.store().txs.store_secret()),
+                    )
+                    .map_err(|_| {
+                        ConsensusError::Store(StoreError::Corrupt(
+                            "invariant: plan stage external parent denserels decode failed",
+                        ))
+                    })?
+                };
+                plan.external_parent_outs
+                    .insert(id, std::sync::Arc::new((tx, outs, dens)));
+            }
+        }
         cold_io_ns = t_io.elapsed().as_nanos() as u64;
         if cold_io_ns > 0 {
             confirm_load_stats::COLD_IO_NS.fetch_add(cold_io_ns, Ordering::Relaxed);
             confirm_load_stats::PIN_NEW_META_NS.fetch_add(cold_io_ns, Ordering::Relaxed);
-        }
-        confirm_load_stats::BODY_TX_READS.fetch_add(loaded.len() as u64, Ordering::Relaxed);
-        confirm_load_stats::FULL_TX_READS.fetch_add(loaded.len() as u64, Ordering::Relaxed);
-        confirm_load_stats::PIN_NEW.fetch_add(loaded.len() as u64, Ordering::Relaxed);
-        // Attach cold parents to plan-local map only.
-        for c in loaded {
-            let Some(id) = c.fk.get() else {
-                continue;
-            };
-            let (tx, outs, dens) = if let Some(dec) = c.decoded_outs {
-                dec
-            } else {
-                rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
-                    &c.raw,
-                    Some(query.store().txs.store_secret()),
-                )
-                .map_err(|_| {
-                    ConsensusError::Store(StoreError::Corrupt(
-                        "invariant: plan stage external parent denserels decode failed",
-                    ))
-                })?
-            };
-            plan.external_parent_outs
-                .insert(id, std::sync::Arc::new((tx, outs, dens)));
         }
         // Completeness: every cold parent must be plan-local (not residency).
         for fk in &cold_fks {
@@ -1447,6 +1480,36 @@ fn pin_for_wire_batch(
                 plan_by_id.insert(*id, std::sync::Arc::clone(pin));
             }
         }
+        // 2b) Plan stamp body ranges → denserels by offset (skip tx.idx; uring batch).
+        let mut range_jobs: Vec<(rbitcoin_primitives::Fk, (u64, u64))> = Vec::new();
+        for id in parent_vouts.keys() {
+            if plan_by_id.contains_key(id) {
+                continue;
+            }
+            if let Some(&range) = plan.external_parent_ranges.get(id) {
+                range_jobs.push((rbitcoin_primitives::Fk(*id), range));
+            }
+        }
+        if !range_jobs.is_empty() {
+            let t_rng = Instant::now();
+            let decoded = query
+                .store()
+                .get_outs_denserels_by_range_batch(&range_jobs)
+                .map_err(ConsensusError::Store)?;
+            let rng_ns = t_rng.elapsed().as_nanos() as u64;
+            if rng_ns > 0 {
+                confirm_load_stats::COLD_IO_NS.fetch_add(rng_ns, Ordering::Relaxed);
+            }
+            confirm_load_stats::BODY_TX_READS
+                .fetch_add(range_jobs.len() as u64, Ordering::Relaxed);
+            confirm_load_stats::PIN_NEW
+                .fetch_add(range_jobs.len() as u64, Ordering::Relaxed);
+            for ((fk, _), row) in range_jobs.into_iter().zip(decoded.into_iter()) {
+                if let (Some(id), Some((tx, outs, dens))) = (fk.get(), row) {
+                    plan_by_id.insert(id, std::sync::Arc::new((tx, outs, dens)));
+                }
+            }
+        }
     }
     // 3) Same-batch creates: shared batch_pin / packed CreatePin Arc.
     for (id, _need) in &parent_vouts {
@@ -1485,6 +1548,8 @@ fn pin_for_wire_batch(
                 None
             };
             let fk = rbitcoin_primitives::Fk(*id);
+            // Body range: plan stamp head range > residency > none.
+            let plan_range = plan.and_then(|p| p.external_parent_ranges.get(id).copied());
             // If commit(N) already seeded residency, take body_range (and denserels
             // if offline was empty).
             let (body_range, sparse) =
@@ -1492,18 +1557,18 @@ fn pin_for_wire_batch(
                     query.create_residency().get_parent_needed(fk, need)
                 {
                     if denserels.is_empty() {
-                        (range, res_sparse)
+                        (plan_range.or(range), res_sparse)
                     } else {
                         let sp = rbitcoin_query::sparse_spender_rels(denserels, need);
-                        (range, sp)
+                        (plan_range.or(range), sp)
                     }
                 } else if !denserels.is_empty() {
                     (
-                        None,
+                        plan_range,
                         rbitcoin_query::sparse_spender_rels(denserels, need),
                     )
                 } else {
-                    (None, Vec::new())
+                    (plan_range, Vec::new())
                 };
             batch_parents.insert_owned(
                 fk,
@@ -2821,6 +2886,7 @@ mod write_idempotent_tests {
             spends: vec![],
             batch_creates: vec![],
             external_parent_outs: Default::default(),
+            external_parent_ranges: Default::default(),
             batch_pin: vec![],
             index_tx: false,
             body_est: 0,
@@ -2898,6 +2964,7 @@ mod write_idempotent_tests {
             spends: vec![],
             batch_creates: vec![],
             external_parent_outs: Default::default(),
+            external_parent_ranges: Default::default(),
             batch_pin: vec![],
             index_tx: false,
             body_est: 0,
@@ -3015,6 +3082,7 @@ mod write_idempotent_tests {
                 m.insert(parent_id, Arc::clone(&external));
                 m
             },
+            external_parent_ranges: Default::default(),
             batch_pin: vec![Arc::clone(&spend_pin)],
             index_tx: false,
             body_est: 0,

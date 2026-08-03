@@ -425,12 +425,24 @@ impl Store {
         self.txs.get_fk_by_txid(txid)
     }
 
-    /// Batch head resolve (load thin). Prefer primary-slot-sorted `txids`.
+    /// Batch head resolve for plan stamp: txid → (fk, body_range). Prefer
+    /// primary-slot-sorted `txids`. Short-circuit of Shape A denserels machine.
     pub fn get_fk_by_txid_batch(
         &self,
         txids: &[[u8; 32]],
-    ) -> Result<Vec<([u8; 32], Option<Fk>)>, StoreError> {
+    ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
         self.txs.get_fk_by_txid_batch(txids)
+    }
+
+    /// Denserels/outs by known body ranges (prep; skips `tx.idx`).
+    pub fn get_outs_denserels_by_range_batch(
+        &self,
+        items: &[(Fk, (u64, u64))],
+    ) -> Result<
+        Vec<Option<(TxRecord, Vec<OutputRecord>, Vec<u32>)>>,
+        StoreError,
+    > {
+        self.txs.get_outs_denserels_by_range_batch(items)
     }
 
     /// Shape A archive path: Prefix33 select + one denserels per winner.

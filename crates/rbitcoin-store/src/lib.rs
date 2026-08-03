@@ -15,7 +15,6 @@ mod epoch;
 mod error;
 mod file;
 mod fuse8_filter;
-mod head_resolve_stream;
 mod head_resolve_denserels;
 pub mod head_resolve_stats;
 mod idx_body_pipeline;

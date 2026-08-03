@@ -70,11 +70,15 @@ pub struct ArchiveWritePlan {
     pub batch_creates: Vec<([u8; 32], Fk)>,
     /// Pipeline-local full pins for external parents (outs+denserels).
     ///
-    /// Filled by ensure/prep denserels paths or optional residency Arc share —
-    /// **not** by plan head resolve (plan stamp is fk-only). Never written into
-    /// CreateResidency FIFO. **Dropped after pin**
-    /// ([`Self::clear_external_parent_outs`]).
+    /// Filled by ensure/prep denserels (often from
+    /// [`Self::external_parent_ranges`]). Never written into CreateResidency.
+    /// **Dropped after pin** ([`Self::clear_external_parent_outs`]).
     pub external_parent_outs: std::collections::HashMap<u64, CreatePin>,
+    /// Head-resolved external parents: create_fk → Class A `(body_off, body_len)`.
+    ///
+    /// Filled at plan stamp (fk-only Shape A short-circuit). Prep denserels-loads
+    /// by offset (skip `tx.idx`) into [`Self::external_parent_outs`].
+    pub external_parent_ranges: std::collections::HashMap<u64, (u64, u64)>,
     /// Prep-ahead pin material for **this batch's creates**, parallel to
     /// [`Self::planned_fks`]: same [`CreatePin`] Arcs as [`Self::packed`] (refcount
     /// only). Confirm `note_plan_ok` only `Arc::clone`s into in-flight outs.
@@ -92,6 +96,7 @@ impl ArchiveWritePlan {
             spends: Vec::new(),
             batch_creates: Vec::new(),
             external_parent_outs: std::collections::HashMap::new(),
+            external_parent_ranges: std::collections::HashMap::new(),
             batch_pin: Vec::new(),
             index_tx: false,
             body_est: 0,
@@ -105,10 +110,12 @@ impl ArchiveWritePlan {
     /// Drop pipeline-local external full-outs after denserels pin.
     ///
     /// Sparse need-vouts already live in [`crate::BatchParents`]; commit never
-    /// reads this map.
+    /// reads this map. Ranges may be cleared with outs (prep already consumed).
     pub fn clear_external_parent_outs(&mut self) {
         self.external_parent_outs.clear();
         self.external_parent_outs.shrink_to_fit();
+        self.external_parent_ranges.clear();
+        self.external_parent_ranges.shrink_to_fit();
     }
 }
 
@@ -354,23 +361,25 @@ impl Query {
         let head_need_n = need_head.len() as u64;
         let mut head_hit_n = 0u64;
 
-        // External parents that miss CreateResidency: **fk-only** head resolve
-        // (probe + idx + Prefix33 / body_txid). Do **not** load denserels on the
-        // plan critical path — denserels for pin are residency hits, prep cold
-        // load, or `ensure_external_parent_denserels_from_plan` (plan-local only).
-        //
-        // head_dens stays 0 here (denserels wave deferred off plan stamp).
+        // External parents that miss CreateResidency: Shape A **fk+range**
+        // short-circuit (probe + idx + Prefix33; no denserels body). Prep loads
+        // denserels by known body_range (skip tx.idx).
         let external_parent_outs: std::collections::HashMap<u64, CreatePin> =
+            std::collections::HashMap::new();
+        let mut external_parent_ranges: std::collections::HashMap<u64, (u64, u64)> =
             std::collections::HashMap::new();
         let t_head = Instant::now();
         let head_dens_ns = 0u64;
         if !need_head.is_empty() {
             need_head.sort_unstable_by_key(|txid| self.store.txs.head_primary_slot(txid));
             let hits = self.store.get_fk_by_txid_batch(&need_head)?;
-            for (txid, fk_opt) in hits {
-                if let Some(fk) = fk_opt {
+            for (txid, row) in hits {
+                if let Some((fk, range)) = row {
                     resolved.insert(txid, fk);
                     head_hit_n = head_hit_n.saturating_add(1);
+                    if let Some(id) = fk.get() {
+                        external_parent_ranges.insert(id, range);
+                    }
                 }
             }
         }
@@ -469,6 +478,7 @@ impl Query {
             spends,
             batch_creates,
             external_parent_outs,
+            external_parent_ranges,
             batch_pin,
             index_tx,
             body_est,
@@ -1157,10 +1167,14 @@ mod tests {
         assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
         assert_eq!(plan.batch_creates.len(), 1);
         assert_eq!(plan.batch_creates[0].0, child_txid);
-        // Plan stamp is fk-only — denserels load at prep/ensure, not head Shape A.
+        // Plan stamp is fk+range only — denserels load at prep by offset.
         assert!(
             plan.external_parent_outs.is_empty(),
             "plan must not denserels-load head parents"
+        );
+        assert!(
+            plan.external_parent_ranges.get(&1).is_some_and(|r| r.1 > 0),
+            "plan must record Class A body range for head-resolved parent"
         );
         // Must not thrash CreateResidency with long-tail head parents.
         assert!(

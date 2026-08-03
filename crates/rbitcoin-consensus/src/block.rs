@@ -599,7 +599,12 @@ fn bip16_active_for_block(
 
 /// Owns a [`Transaction`] clone so the reconstructed block can be dropped before the
 /// parallel script wave, without a wasteful encode→deserialize round-trip.
+///
+/// `txid` is filled at assemble (already hashed for spend edges) so scripts can
+/// probe mempool preverified without re-hashing every job.
 pub struct ScriptCheckJob {
+    /// Wire txid (assemble / [`Self::new`]); used for mempool preverified skip.
+    pub(crate) txid: [u8; 32],
     pub(crate) prevouts: Vec<TxOut>,
     pub(crate) tx: Transaction,
     /// BIP65 CLTV active (false → OP_CLTV is a no-op, matching pre-activation).
@@ -612,6 +617,57 @@ pub struct ScriptCheckJob {
     pub(crate) bip16_active: bool,
     /// BIP341/342 taproot active (false → v1 witness program is anyone-can-spend).
     pub(crate) taproot_active: bool,
+}
+
+impl ScriptCheckJob {
+    /// Build a job hashing `tx` once for [`Self::txid`] (tests / benches).
+    #[inline]
+    pub(crate) fn new(
+        prevouts: Vec<TxOut>,
+        tx: Transaction,
+        bip65_active: bool,
+        bip112_active: bool,
+        bip66_active: bool,
+        bip16_active: bool,
+        taproot_active: bool,
+    ) -> Self {
+        use bitcoin::hashes::Hash;
+        let txid = tx.compute_txid().to_byte_array();
+        Self::with_txid(
+            txid,
+            prevouts,
+            tx,
+            bip65_active,
+            bip112_active,
+            bip66_active,
+            bip16_active,
+            taproot_active,
+        )
+    }
+
+    /// Assemble path: reuse the wire txid already computed for spend edges.
+    #[inline]
+    pub(crate) fn with_txid(
+        txid: [u8; 32],
+        prevouts: Vec<TxOut>,
+        tx: Transaction,
+        bip65_active: bool,
+        bip112_active: bool,
+        bip66_active: bool,
+        bip16_active: bool,
+        taproot_active: bool,
+    ) -> Self {
+        Self {
+            txid,
+            prevouts,
+            tx,
+            bip65_active,
+            bip112_active,
+            bip66_active,
+            bip16_active,
+            taproot_active,
+        }
+    }
 }
 
 
@@ -937,16 +993,18 @@ fn assemble_block_prevouts_mode(
 
             if build_script_jobs {
                 let t_job = Instant::now();
-                script_jobs.push(ScriptCheckJob {
+                // Reuse A1 wire txid — scripts stage must not re-hash for preverified.
+                script_jobs.push(ScriptCheckJob::with_txid(
+                    txid,
                     prevouts,
                     // One deep clone beats encode-at-connect + deserialize-per-worker.
-                    tx: tx.clone(),
-                    bip65_active: ctx.params.bip65_active_at(ctx.height.0),
-                    bip112_active: ctx.params.csv_active_at(ctx.height.0),
-                    bip66_active: ctx.params.bip66_active_at(ctx.height.0),
-                    bip16_active: bip16_for_jobs,
-                    taproot_active: ctx.params.taproot_active_at(ctx.height.0),
-                });
+                    tx.clone(),
+                    ctx.params.bip65_active_at(ctx.height.0),
+                    ctx.params.csv_active_at(ctx.height.0),
+                    ctx.params.bip66_active_at(ctx.height.0),
+                    bip16_for_jobs,
+                    ctx.params.taproot_active_at(ctx.height.0),
+                ));
                 confirm_phase_stats::ASM_JOB_NS
                     .fetch_add(t_job.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
@@ -3241,12 +3299,12 @@ mod sigop_cost_tests {
         use super::{verify_scripts_pool, verify_scripts_pool_jobs, ScriptCheckJob};
         assert!(verify_scripts_pool(&[]).is_ok());
         assert!(verify_scripts_pool_jobs(&[]).is_ok());
-        let job = ScriptCheckJob {
-            prevouts: vec![TxOut {
+        let job = ScriptCheckJob::new(
+            vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]), // OP_TRUE ACS
             }],
-            tx: Transaction {
+            Transaction {
                 version: TxVersion::TWO,
                 lock_time: LockTime::ZERO,
                 input: vec![TxIn {
@@ -3263,12 +3321,12 @@ mod sigop_cost_tests {
                     script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
                 }],
             },
-            bip65_active: true,
-            bip112_active: true,
-            bip66_active: true,
-            bip16_active: true,
-            taproot_active: true,
-        };
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
         assert!(verify_scripts_pool(&[job]).is_ok());
     }
 }

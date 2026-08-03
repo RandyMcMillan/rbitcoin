@@ -105,6 +105,7 @@ mod tests {
             }],
         };
         let job = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![TxOut {
                 value: Amount::from_sat(10),
                 script_pubkey: ScriptBuf::from_bytes(spk),

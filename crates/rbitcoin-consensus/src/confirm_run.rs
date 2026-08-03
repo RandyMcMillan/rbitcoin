@@ -2826,15 +2826,16 @@ mod write_idempotent_tests {
         let mut pre = ScriptPreverified::new();
         pre.insert(tid);
 
-        let job = ScriptCheckJob {
+        let job = ScriptCheckJob::with_txid(
+            tid,
             prevouts,
             tx,
-            bip65_active: true,
-            bip112_active: true,
-            bip66_active: true,
-            bip16_active: true,
-            taproot_active: true,
-        };
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
         let prepared = Prepared {
             height: Height(1),
             header_fk: Fk(1),
@@ -3940,7 +3941,6 @@ fn script_wave(
     prepared: &[Prepared],
     preverified: &ScriptPreverified,
 ) -> Result<(), ConsensusError> {
-    use bitcoin::hashes::Hash;
     let t_script = Instant::now();
     let mut all_jobs: Vec<&ScriptCheckJob> = Vec::new();
     let mut n_skip = 0u64;
@@ -3949,8 +3949,8 @@ fn script_wave(
             continue;
         }
         for job in &p.jobs {
-            let tid = job.tx.compute_txid().to_byte_array();
-            if preverified.contains(&tid) {
+            // txid attached at assemble — always consult mempool preverified (tip).
+            if preverified.contains(&job.txid) {
                 n_skip = n_skip.saturating_add(1);
                 continue;
             }

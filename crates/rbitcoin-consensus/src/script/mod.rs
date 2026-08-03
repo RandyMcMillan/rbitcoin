@@ -562,6 +562,7 @@ mod verify_routing_tests {
             }],
         };
         let job = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![],
             tx: tx.clone(),
             bip65_active: true,
@@ -573,6 +574,7 @@ mod verify_routing_tests {
         assert!(verify_job_all_inputs(&job).is_ok());
 
         let job2 = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
@@ -630,6 +632,7 @@ mod verify_routing_tests {
         let mut spk = vec![0x51, 0x20];
         spk.extend([0u8; 32]);
         let job = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(spk),
@@ -769,6 +772,7 @@ mod verify_routing_tests {
         let mut ss = vec![0x14];
         ss.extend([0u8; 20]);
         let job = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(p2sh),

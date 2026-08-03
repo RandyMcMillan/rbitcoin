@@ -58,6 +58,7 @@ fn make_p2wpkh_spend() -> (ScriptCheckJob, bool) {
     tx.input[0].witness = Witness::from_slice(&[sig_raw.as_slice(), pk_bytes.as_slice()]);
 
     let job = ScriptCheckJob {
+        txid: [0u8; 32],
         prevouts: vec![prevout],
         tx: tx.clone(),
         bip65_active: true,
@@ -135,6 +136,7 @@ fn mainnet_508011_nested_p2wpkh_raw_sighash_0x65() {
         )),
     };
     let job = ScriptCheckJob {
+        txid: [0u8; 32],
         prevouts: vec![prevout],
         tx,
         bip65_active: true,
@@ -172,6 +174,7 @@ fn anyone_can_spend_accepts() {
         }],
     };
     let job = ScriptCheckJob {
+        txid: [0u8; 32],
         prevouts: vec![prevout],
         tx: tx.clone(),
         bip65_active: true,
@@ -207,6 +210,7 @@ fn pretaproot_v1_witness_program_anyone_can_spend() {
         }],
     };
     let job = ScriptCheckJob {
+        txid: [0u8; 32],
         prevouts: vec![prevout],
         tx: tx.clone(),
         bip65_active: true,
@@ -240,6 +244,7 @@ fn empty_script_pubkey_rejects() {
         }],
     };
     let job = ScriptCheckJob {
+        txid: [0u8; 32],
         prevouts: vec![prevout],
         tx: tx.clone(),
         bip65_active: true,
@@ -307,6 +312,7 @@ fn p2pkh_valid_signature_accepts() {
     tx.input[0].script_sig = ScriptBuf::from_bytes(script_sig);
 
     let job = ScriptCheckJob {
+        txid: [0u8; 32],
         prevouts: vec![prevout],
         tx: tx.clone(),
         bip65_active: true,
@@ -347,6 +353,7 @@ fn p2wsh_op_true_accepts() {
         }],
     };
     let job = ScriptCheckJob {
+        txid: [0u8; 32],
         prevouts: vec![prevout],
         tx: tx.clone(),
         bip65_active: true,
@@ -382,6 +389,7 @@ fn p2wsh_wrong_script_hash_rejects() {
         }],
     };
     let job = ScriptCheckJob {
+        txid: [0u8; 32],
         prevouts: vec![prevout],
         tx: tx.clone(),
         bip65_active: true,
@@ -450,6 +458,7 @@ fn p2sh_p2wpkh_nested_accepts() {
     tx.input[0].witness = Witness::from_slice(&[sig_raw.as_slice(), pk_bytes.as_slice()]);
 
     let job = ScriptCheckJob {
+        txid: [0u8; 32],
         prevouts: vec![prevout],
         tx: tx.clone(),
         bip65_active: true,
@@ -498,6 +507,7 @@ fn p2sh_legacy_multi_push_op_true_accepts() {
         }],
     };
     let job = ScriptCheckJob {
+        txid: [0u8; 32],
         prevouts: vec![prevout],
         tx: tx.clone(),
         bip65_active: true,
@@ -531,6 +541,7 @@ fn mainnet_block_183_high_s_p2pk_accepts() {
     .unwrap();
     let vout = spend.input[0].previous_output.vout as usize;
     let job = ScriptCheckJob {
+        txid: [0u8; 32],
         prevouts: vec![prev.output[vout].clone()],
         tx: spend,
         bip65_active: true,
@@ -568,6 +579,7 @@ fn mainnet_block_110300_sighash_type_zero_p2pkh() {
     let ss = spend.input[0].script_sig.as_bytes();
     assert_eq!(ss[1 + 72], 0x00);
     let job = ScriptCheckJob {
+        txid: [0u8; 32],
         prevouts: vec![prev.output[0].clone()],
         tx: spend,
         bip65_active: true,
@@ -607,6 +619,7 @@ fn mainnet_block_124276_lax_der_pre_bip66() {
     assert!(Signature::from_der_lax(der).is_ok(), "fixture must be lax-parseable");
 
     let mut job = ScriptCheckJob {
+        txid: [0u8; 32],
         prevouts: vec![prev.output[0].clone()],
         tx: spend,
         bip65_active: true,
@@ -758,6 +771,7 @@ fn mainnet_block_170060_pre_bip16_p2sh_as_bare() {
     assert_eq!(spk[spk.len() - 1], 0x87);
 
     let mut job = ScriptCheckJob {
+        txid: [0u8; 32],
         prevouts: vec![prev.output[vout].clone()],
         tx: spend.clone(),
         bip65_active: false,
@@ -807,6 +821,7 @@ fn mainnet_block_163685_scriptsig_codeseparator_checkmultisig() {
     assert_eq!(prev.output[1].script_pubkey.as_bytes()[21], 0xb1);
 
     let job = ScriptCheckJob {
+        txid: [0u8; 32],
         prevouts: vec![prev.output[0].clone(), prev.output[1].clone()],
         tx: spend,
         // height 163685: pre-BIP65 / pre-BIP66 / pre-CSV
@@ -850,6 +865,7 @@ fn mainnet_block_140493_high_bit_s_lax_der_p2pkh() {
     assert_eq!(vout, 1);
 
     let mut job = ScriptCheckJob {
+        txid: [0u8; 32],
         prevouts: vec![prev.output[vout].clone()],
         tx: spend,
         bip65_active: true,
@@ -897,6 +913,7 @@ fn mainnet_block_443992_p2sh_codeseparator_scriptcode() {
         )),
     };
     let job = ScriptCheckJob {
+        txid: [0u8; 32],
         prevouts: vec![prevout],
         tx: spend,
         bip65_active: true,  // 388381

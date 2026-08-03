@@ -219,6 +219,7 @@ mod bip341_tests {
             }],
         };
         let job = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![prevout],
             tx: tx.clone(),
             bip65_active: true,
@@ -268,6 +269,7 @@ mod bip341_tests {
         let mut spk = vec![0x51, 0x20];
         spk.extend([0u8; 32]);
         let job = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(spk),
@@ -341,6 +343,7 @@ mod bip341_tests {
 
         let _ = internal; // used implicitly via tweak
         let job = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![prevout],
             tx: tx.clone(),
             bip65_active: true,
@@ -398,6 +401,7 @@ mod bip341_tests {
             let annex_v = annex_bytes.to_vec();
             tx.input[0].witness = Witness::from_slice(&[sig_v.as_slice(), annex_v.as_slice()]);
             let job = ScriptCheckJob {
+                txid: [0u8; 32],
                 prevouts: vec![prevout.clone()],
                 tx: tx.clone(),
                 bip65_active: true,
@@ -434,6 +438,7 @@ mod bip341_tests {
             let annex_v = annex_bytes.to_vec();
             tx.input[0].witness = Witness::from_slice(&[sig_v.as_slice(), annex_v.as_slice()]);
             let job = ScriptCheckJob {
+                txid: [0u8; 32],
                 prevouts: vec![prevout],
                 tx: tx.clone(),
                 bip65_active: true,
@@ -494,6 +499,7 @@ mod bip341_tests {
         let annex_v = annex_bytes.to_vec();
         tx.input[0].witness = Witness::from_slice(&[sig_v.as_slice(), annex_v.as_slice()]);
         let job = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![prevout],
             tx,
             bip65_active: true,
@@ -581,6 +587,7 @@ mod bip341_tests {
             annex_v.as_slice(),
         ]);
         let job = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![prevout],
             tx,
             bip65_active: true,
@@ -653,6 +660,7 @@ mod bip341_tests {
             }],
         };
         let job = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![prevout],
             tx: tx.clone(),
             bip65_active: true,
@@ -761,6 +769,7 @@ mod bip341_tests {
         ];
         tx.input[0].witness = Witness::from_slice(&wit_items);
         let job = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![prevout],
             tx: tx.clone(),
             bip65_active: true,
@@ -800,6 +809,7 @@ mod bip341_tests {
             }],
         };
         let job = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![prevout],
             tx: tx.clone(),
             bip65_active: true,

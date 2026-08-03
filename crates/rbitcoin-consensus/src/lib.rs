@@ -45,29 +45,31 @@ pub mod script_bench {
 
     pub fn verify_job(job: &JobBytes) -> Result<(), ConsensusError> {
         // Zero-copy view — mirrors production (`&ScriptCheckJob` from connect).
-        let j = ScriptCheckJob {
-            prevouts: job.prevouts.clone(),
-            tx: job.tx.clone(),
-            bip65_active: true,
-            bip112_active: true,
-            bip66_active: job.bip66_active,
-            bip16_active: job.bip16_active,
-            taproot_active: job.taproot_active,
-        };
+        let j = ScriptCheckJob::new(
+            job.prevouts.clone(),
+            job.tx.clone(),
+            true,
+            true,
+            job.bip66_active,
+            job.bip16_active,
+            job.taproot_active,
+        );
         script::verify_job_all_inputs(&j)
     }
 
     /// Build owned jobs once, then pool-verify without re-cloning each iteration.
     pub fn owned_jobs(jobs: &[JobBytes]) -> Vec<ScriptCheckJob> {
         jobs.iter()
-            .map(|j| ScriptCheckJob {
-                prevouts: j.prevouts.clone(),
-                tx: j.tx.clone(),
-                bip65_active: true,
-                bip112_active: true,
-                bip66_active: j.bip66_active,
-                bip16_active: j.bip16_active,
-                taproot_active: j.taproot_active,
+            .map(|j| {
+                ScriptCheckJob::new(
+                    j.prevouts.clone(),
+                    j.tx.clone(),
+                    true,
+                    true,
+                    j.bip66_active,
+                    j.bip16_active,
+                    j.taproot_active,
+                )
             })
             .collect()
     }

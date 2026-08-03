@@ -258,6 +258,7 @@ mod tests {
         ss.extend_from_slice(&redeem);
         tx.input[0].script_sig = ScriptBuf::from_bytes(ss);
         let job = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]), // not 23-byte P2SH
@@ -275,6 +276,7 @@ mod tests {
 
         // Wrong redeem hash
         let job2 = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&[0xff]),
@@ -303,6 +305,7 @@ mod tests {
         let mut tx3 = dummy_tx();
         tx3.input[0].script_sig = ScriptBuf::from_bytes(ss2);
         let job3 = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(vec![0x00]), // short spk
@@ -317,6 +320,7 @@ mod tests {
         assert!(matches!(try_p2sh_p2wsh(&job3, 0, &job3.tx), Some(Err(_))));
         // wrong hash
         let job4 = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&[0x01]),
@@ -334,6 +338,7 @@ mod tests {
         let mut tx5 = dummy_tx();
         tx5.input[0].script_sig = ScriptBuf::from_bytes(vec![0x01, 0xaa, 0x01, 0xbb]);
         let job5 = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&[0xaa]),
@@ -354,6 +359,7 @@ mod tests {
         let mut tx_empty = dummy_tx();
         tx_empty.input[0].script_sig = ScriptBuf::new();
         let job_e = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&[0x51]),
@@ -370,6 +376,7 @@ mod tests {
         let mut tx_leg = dummy_tx();
         tx_leg.input[0].script_sig = ScriptBuf::from_bytes(vec![0x01, 0x51]);
         let job_h = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&[0xff]),
@@ -397,6 +404,7 @@ mod tests {
         let mut tx = dummy_tx();
         tx.input[0].script_sig = ScriptBuf::from_bytes(ss);
         let job = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&redeem_wsh),
@@ -421,6 +429,7 @@ mod tests {
         let mut tx2 = dummy_tx();
         tx2.input[0].script_sig = ScriptBuf::from_bytes(ss2);
         let job2 = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&redeem_wpkh),
@@ -446,6 +455,7 @@ mod tests {
         let mut tx3 = dummy_tx();
         tx3.input[0].script_sig = ScriptBuf::from_bytes(ss3);
         let job3 = ScriptCheckJob {
+            txid: [0u8; 32],
             prevouts: vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&redeem),

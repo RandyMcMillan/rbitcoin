@@ -133,6 +133,35 @@ impl ArchiveWritePlan {
         self.external_parent_txids.clear();
         self.external_parent_txids.shrink_to_fit();
     }
+
+    /// Append another plan for write megabatch (height-ordered Class A).
+    ///
+    /// Callers must drain scripts→write in height order so `planned_fks` stay
+    /// contiguous and match the sole Class A appender sequence. External-parent
+    /// maps are usually empty by write time (cleared after prep pin).
+    pub fn append(&mut self, mut other: Self) {
+        if other.is_empty() && other.per_header_ranges.is_empty() {
+            return;
+        }
+        self.packed.append(&mut other.packed);
+        self.planned_fks.append(&mut other.planned_fks);
+        self.per_header_ranges.append(&mut other.per_header_ranges);
+        self.spends.append(&mut other.spends);
+        self.batch_creates.append(&mut other.batch_creates);
+        self.batch_pin.append(&mut other.batch_pin);
+        self.index_tx |= other.index_tx;
+        self.body_est = self.body_est.saturating_add(other.body_est);
+        // External maps: rare residual; union by create id (first wins).
+        for (k, v) in other.external_parent_outs {
+            self.external_parent_outs.entry(k).or_insert(v);
+        }
+        for (k, v) in other.external_parent_ranges {
+            self.external_parent_ranges.entry(k).or_insert(v);
+        }
+        for (k, v) in other.external_parent_txids {
+            self.external_parent_txids.entry(k).or_insert(v);
+        }
+    }
 }
 
 impl Query {

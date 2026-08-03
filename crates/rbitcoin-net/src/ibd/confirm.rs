@@ -698,6 +698,48 @@ pub(crate) fn is_confirm_load_retryable(_msg: &str) -> bool {
     false
 }
 
+/// Drain scripts→write after `first` is already dequeued (and accounted):
+/// non-blocking `try_recv` until empty, merge contiguous into one megabatch.
+///
+/// `on_extra` runs only for additionally drained parts (queue depth). Non-contig
+/// leftover is returned for the next write iteration (ordered scripts should
+/// never hit that path).
+fn drain_script_ok_write_queue(
+    first: rbitcoin_consensus::ScriptOkBatch,
+    rx: &std::sync::mpsc::Receiver<rbitcoin_consensus::ScriptOkBatch>,
+    mut on_extra: impl FnMut(&rbitcoin_consensus::ScriptOkBatch),
+) -> (
+    rbitcoin_consensus::ScriptOkBatch,
+    usize,
+    Option<rbitcoin_consensus::ScriptOkBatch>,
+) {
+    let mut mega = first;
+    let mut parts = 1usize;
+    loop {
+        match rx.try_recv() {
+            Ok(more) => {
+                on_extra(&more);
+                match mega.append_contiguous(more) {
+                    Ok(()) => {
+                        parts = parts.saturating_add(1);
+                    }
+                    Err(leftover) => {
+                        // Height gap or length invariant — write mega first.
+                        warn!(
+                            "ibd: write mega drain gap after parts={parts} leftover_blks={}",
+                            leftover.len()
+                        );
+                        return (mega, parts, Some(leftover));
+                    }
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
+    (mega, parts, None)
+}
+
 /// OS-thread occupancy for the confirm pipeline (plan / prep / scripts / write).
 ///
 /// Stage `plan_ms` / `script_ms` / … are **work** sums and mis-rank the long
@@ -870,20 +912,40 @@ pub(crate) fn spawn_confirm_engine(
         .name("ibd-confirm-write".into())
         .spawn(move || {
             info!("ibd: confirm write on dedicated OS thread");
+            // Non-contiguous drain leftover (invariant breach); write next iter.
+            // Leftover was already note_write_recv'd when first drained.
+            let mut leftover: Option<rbitcoin_consensus::ScriptOkBatch> = None;
             loop {
                 let t_recv = Instant::now();
-                let batch = match write_rx.recv() {
-                    Ok(b) => b,
-                    Err(_) => break,
+                let first = match leftover.take() {
+                    Some(b) => b,
+                    None => match write_rx.recv() {
+                        Ok(b) => {
+                            let n = b.len();
+                            let wire = b.approx_wire_bytes();
+                            let parents = b.parent_count();
+                            q_wb.note_write_recv(n, wire, parents);
+                            b
+                        }
+                        Err(_) => break,
+                    },
                 };
+                // Drain everything already in the scripts→write queue into one
+                // megabatch: larger Class A / Class C / tip advance → fewer fsyncs.
+                // Scripts send height-ordered FIFO; append_contiguous enforces that.
+                let (batch, parts, next_left) =
+                    drain_script_ok_write_queue(first, &write_rx, |b| {
+                        let n = b.len();
+                        let wire = b.approx_wire_bytes();
+                        let parents = b.parent_count();
+                        q_wb.note_write_recv(n, wire, parents);
+                    });
+                leftover = next_left;
                 confirm_thr_stats::add_write_recv_wait(t_recv.elapsed());
-                let n = batch.len();
-                let wire = batch.approx_wire_bytes();
-                let parents = batch.parent_count();
-                q_wb.note_write_recv(n, wire, parents);
                 if feed_wb.stopped() || hub_wb.query.confirm_cancelled() {
                     break;
                 }
+                let n = batch.len();
                 let first_h = batch.heights_hashes().first().map(|(h, _)| *h).unwrap_or(0);
                 let t0 = Instant::now();
                 let heights_hashes = batch.heights_hashes();
@@ -916,7 +978,7 @@ pub(crate) fn spawn_confirm_engine(
                             let p = rbitcoin_consensus::confirm_phase_stats::last_write_phases();
                             let ms = rbitcoin_consensus::confirm_phase_stats::LastWritePhases::ms;
                             info!(
-                                "ibd: confirm write slow batch={n} first={first_h} wall={:?} \
+                                "ibd: confirm write slow batch={n} parts={parts} first={first_h} wall={:?} \
                                  class_a={}ms ensure={}ms struct={}ms spent={}ms create_h={}ms \
                                  bip68={}ms class_c={}ms spend_ann={}ms tip_gc={}ms",
                                 elapsed,
@@ -974,7 +1036,9 @@ pub(crate) fn spawn_confirm_engine(
                         loop_stats_wb
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
-                        warn!("ibd: confirm write reject @ {height}: {e}");
+                        warn!(
+                            "ibd: confirm write reject @ {height} mega_parts={parts}: {e}"
+                        );
                         let _ = event_tx_wb.send(ConfirmEvent::Reject {
                             height,
                             hash,

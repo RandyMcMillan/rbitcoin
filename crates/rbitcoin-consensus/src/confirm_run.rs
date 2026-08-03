@@ -2492,11 +2492,97 @@ impl ScriptOkBatch {
     pub fn parent_count(&self) -> usize {
         self.batch_parents.len()
     }
+
+    /// Absorb another script-ok batch for write megabatch (FIFO drain).
+    ///
+    /// Scripts enqueue height-ordered tip extensions; write drains the channel
+    /// and merges so Class A + Class C + annotate run once (fewer tip fsyncs).
+    /// Returns `Err(other)` if not a contiguous height extension (caller keeps
+    /// `other` for the next megabatch).
+    pub fn append_contiguous(&mut self, mut other: Self) -> Result<(), Self> {
+        if other.is_empty() {
+            return Ok(());
+        }
+        if self.is_empty() {
+            *self = other;
+            return Ok(());
+        }
+        let Some(last) = self.prepared.last() else {
+            *self = other;
+            return Ok(());
+        };
+        let Some(first) = other.prepared.first() else {
+            return Ok(());
+        };
+        if first.height.0 != last.height.0.saturating_add(1) {
+            return Err(other);
+        }
+        if self.prepared.len() != self.wire_blocks.len()
+            || other.prepared.len() != other.wire_blocks.len()
+        {
+            return Err(other);
+        }
+        self.prepared.append(&mut other.prepared);
+        self.wire_blocks.append(&mut other.wire_blocks);
+        self.batch_parents.extend_from(other.batch_parents);
+        match (self.archive_plan.as_mut(), other.archive_plan.take()) {
+            (Some(dst), Some(src)) => dst.append(src),
+            (None, Some(src)) => self.archive_plan = Some(src),
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod write_idempotent_tests {
     use super::write_height_needed;
+
+    /// Megabatch append: contiguous heights merge; gap returns Err(other).
+    #[test]
+    fn script_ok_append_contiguous_and_gap() {
+        use super::{Prepared, ScriptOkBatch};
+        use bitcoin::CompactTarget;
+        use rbitcoin_primitives::{Fk, Height};
+        use std::sync::Arc;
+
+        fn empty_prepared(h: u32, hash_byte: u8) -> Prepared {
+            Prepared {
+                height: Height(h),
+                header_fk: Fk(h as u64),
+                tx_fks: vec![],
+                jobs: vec![],
+                spends: vec![],
+                fees: 0,
+                check_scripts: false,
+                time: 0,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                hash: [hash_byte; 32],
+            }
+        }
+        fn batch_one(h: u32) -> ScriptOkBatch {
+            ScriptOkBatch {
+                prepared: vec![empty_prepared(h, h as u8)],
+                wire_blocks: vec![Arc::new(crate::params::genesis_block(
+                    &crate::params::ChainParams::regtest(),
+                ))],
+                batch_parents: rbitcoin_query::BatchParents::new(),
+                archive_plan: None,
+            }
+        }
+        let mut a = batch_one(10);
+        let b = batch_one(11);
+        assert!(a.append_contiguous(b).is_ok());
+        assert_eq!(a.len(), 2);
+        let gap = batch_one(13);
+        let err = a.append_contiguous(gap).err().expect("gap");
+        assert_eq!(err.len(), 1);
+        assert_eq!(a.len(), 2);
+        // Contiguous continue after gap reject.
+        let c = batch_one(12);
+        assert!(a.append_contiguous(c).is_ok());
+        assert_eq!(a.len(), 3);
+    }
 
     /// Heights at or below tip must be stripped before structural write
     /// (dup pipeline race after scripts claim the same tip+1 twice).

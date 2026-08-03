@@ -316,6 +316,33 @@ impl BatchParents {
         vouts.iter().all(|v| checked_contains(&e.checked, *v))
     }
 
+    /// Absorb another batch's pin map (write megabatch drain).
+    ///
+    /// Same create_fk: merge outs / checked / denserels; prefer non-`None`
+    /// body_range and coinbase flag. Typical case is disjoint parents across
+    /// consecutive script-ok batches; overlap is same parent spent in two
+    /// heights in the mega-run.
+    pub fn extend_from(&mut self, other: Self) {
+        if other.by_fk.is_empty() {
+            return;
+        }
+        if self.by_fk.is_empty() {
+            *self = other;
+            return;
+        }
+        self.by_fk.reserve(other.by_fk.len());
+        for (id, src) in other.by_fk {
+            match self.by_fk.entry(id) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(src);
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    merge_parent_entry(o.get_mut(), src);
+                }
+            }
+        }
+    }
+
     /// Sparse outs for wave: `(tx, live outs for vouts, spent_filtered)`.
     pub fn get_parent_outs_needed(
         &self,
@@ -351,6 +378,39 @@ impl BatchParents {
 #[inline]
 fn checked_contains(checked: &[u32], v: u32) -> bool {
     checked.binary_search(&v).is_ok()
+}
+
+/// Merge `src` into `dst` for the same create_fk (megabatch pin union).
+fn merge_parent_entry(dst: &mut ParentEntry, src: ParentEntry) {
+    for (v, o) in src.outs {
+        if !dst.outs.iter().any(|(dv, _)| *dv == v) {
+            dst.outs.push((v, o));
+        }
+    }
+    dst.outs.sort_unstable_by_key(|(v, _)| *v);
+    dst.checked.extend(src.checked);
+    dst.checked.sort_unstable();
+    dst.checked.dedup();
+    if dst.coinbase.is_none() {
+        dst.coinbase = src.coinbase;
+    }
+    if dst.body_range.is_none() {
+        dst.body_range = src.body_range;
+    }
+    if src.spender_rels.is_empty() {
+        return;
+    }
+    if dst.spender_rels.is_empty() {
+        dst.spender_rels = src.spender_rels;
+        return;
+    }
+    let mut m: HashMap<u32, u32> = dst.spender_rels.iter().copied().collect();
+    for (v, r) in src.spender_rels {
+        m.insert(v, r);
+    }
+    let mut merged: Vec<(u32, u32)> = m.into_iter().collect();
+    merged.sort_unstable_by_key(|(v, _)| *v);
+    dst.spender_rels = merged;
 }
 
 /// Relative offset sentinel: layout unknown for this out (FIFO seed without denserels).
@@ -415,6 +475,49 @@ mod tests {
 
     fn out(v: i64) -> OutputRecord {
         OutputRecord::unspent(v, vec![0x51])
+    }
+
+    #[test]
+    fn extend_from_merges_disjoint_and_same_fk() {
+        let mut a = BatchParents::new();
+        a.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(0, out(1))],
+            vec![0],
+            Some(false),
+            Some((100, 50)),
+            vec![(0, 10)],
+        );
+        let mut b = BatchParents::new();
+        b.insert_owned(
+            Fk(2),
+            tx(2),
+            vec![(0, out(2))],
+            vec![0],
+            Some(true),
+            None,
+            Vec::new(),
+        );
+        // Same fk extra vout + denserels.
+        b.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(1, out(3))],
+            vec![1],
+            None,
+            None,
+            vec![(1, 20)],
+        );
+        a.extend_from(b);
+        assert_eq!(a.len(), 2);
+        assert!(a.has_parent_out(Fk(1), 0));
+        assert!(a.has_parent_out(Fk(1), 1));
+        assert!(a.has_parent_out(Fk(2), 0));
+        assert_eq!(a.get_spender_abs(Fk(1), 0), Some(110));
+        assert_eq!(a.get_spender_abs(Fk(1), 1), Some(120));
+        assert_eq!(a.get_parent_coinbase(Fk(1)), Some(false));
+        assert_eq!(a.get_parent_coinbase(Fk(2)), Some(true));
     }
 
     /// Layout + coinbase flag + pin_covered — one test for BatchParents public surface.

@@ -50,6 +50,9 @@ struct BodyMeta {
     header_fk: rbitcoin_primitives::Fk,
     header_rec: rbitcoin_store::HeaderRecord,
     tx_fks: Vec<rbitcoin_primitives::Fk>,
+    /// Create txids for this block — **exactly one** `compute_txid` per entry
+    /// at structure/entry (plan or archived load). Assemble must use these only.
+    txids: Vec<[u8; 32]>,
 }
 
 /// Assemble output for one height (held through scripts → write).
@@ -243,6 +246,16 @@ pub fn confirm_load_phase_preverified(
     let wire_blocks = wire_rebuild(query, &metas, &batch_bodies)?;
     drop(batch_bodies);
 
+    // Sole compute_txid pass for archived confirm (no plan structure stage).
+    let mut metas = metas;
+    for (m, w) in metas.iter_mut().zip(wire_blocks.iter()) {
+        m.txids = w
+            .txdata
+            .iter()
+            .map(|t| t.compute_txid().to_byte_array())
+            .collect();
+    }
+
     let prepared = assemble_run(
         query,
         params,
@@ -348,7 +361,8 @@ pub fn confirm_wire_prep_phase_pipelined(
         let hash = block.block_hash().to_byte_array();
         let ctx = ValidationContext::at(params, *height, milestone);
         let t = Instant::now();
-        let _ = crate::block::validate_block_structure_hashed(block.as_ref(), &ctx)?;
+        // Sole compute_txid pass for this block in the confirm pipeline.
+        let txids = crate::block::validate_block_structure_hashed(block.as_ref(), &ctx)?;
         ns_struct = ns_struct.saturating_add(t.elapsed().as_nanos() as u64);
         // First height must sit at pipeline path_lo (store tip+1, or last prepped+1).
         // Later heights in the same batch validate against prior wire, not store tip.
@@ -394,7 +408,7 @@ pub fn confirm_wire_prep_phase_pipelined(
 
         let t = Instant::now();
         let (header_rec, txs) =
-            crate::prepare_block_for_archive(query, params, block.as_ref())?;
+            crate::prepare_block_for_archive_with_txids(query, block.as_ref(), &txids)?;
         ns_prepare = ns_prepare.saturating_add(t.elapsed().as_nanos() as u64);
         let t = Instant::now();
         let header_fk = if let Some((fk, _)) = query
@@ -424,6 +438,7 @@ pub fn confirm_wire_prep_phase_pipelined(
             header_fk,
             header_rec,
             tx_fks: Vec::new(),
+            txids,
         });
     }
 
@@ -1069,7 +1084,8 @@ fn wire_plan_phase(
         let hash = block.block_hash().to_byte_array();
         let ctx = ValidationContext::at(params, *height, milestone);
         let t_struct = Instant::now();
-        let _ = crate::block::validate_block_structure_hashed(block.as_ref(), &ctx)?;
+        // Sole compute_txid pass for this block in the confirm pipeline.
+        let txids = crate::block::validate_block_structure_hashed(block.as_ref(), &ctx)?;
         if i == 0 {
             if height.0 != path_lo {
                 return Err(ConsensusError::BadPrev);
@@ -1107,8 +1123,9 @@ fn wire_plan_phase(
         struct_ns = struct_ns.saturating_add(t_struct.elapsed().as_nanos() as u64);
 
         let t_prep = Instant::now();
+        // Reuse structure txids — no second hash in prepare.
         let (header_rec, txs) =
-            crate::prepare_block_for_archive(query, params, block.as_ref())?;
+            crate::prepare_block_for_archive_with_txids(query, block.as_ref(), &txids)?;
         let header_fk = if let Some((fk, _)) = query
             .get_header_by_hash(&header_rec.hash)
             .map_err(ConsensusError::Store)?
@@ -1136,6 +1153,7 @@ fn wire_plan_phase(
             header_fk,
             header_rec,
             tx_fks: Vec::new(),
+            txids,
         });
     }
 
@@ -3637,6 +3655,8 @@ fn resolve_body_metas(
                     header_fk: plan.header_fk,
                     header_rec: plan.header_rec,
                     tx_fks: plan.tx_fks,
+                    // Filled after wire rebuild (sole hash for archived path).
+                    txids: Vec::new(),
                 });
                 continue;
             }
@@ -3658,6 +3678,7 @@ fn resolve_body_metas(
             header_fk,
             header_rec,
             tx_fks,
+            txids: Vec::new(),
         });
     }
     Ok(metas)
@@ -3855,6 +3876,7 @@ fn assemble_run(
             &mut pending_creates,
             batch_parents,
             batch_thin,
+            &meta.txids,
         )?;
         confirm_phase_stats::CONNECT_NS
             .fetch_add(t_connect.elapsed().as_nanos() as u64, Ordering::Relaxed);

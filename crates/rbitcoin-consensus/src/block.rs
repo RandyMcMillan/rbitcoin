@@ -521,6 +521,12 @@ pub fn validate_block_connect(
     // Unit-test path: no load pin stage (production uses confirm_archived_run).
     let batch_parents = rbitcoin_query::BatchParents::new();
     let batch_thin = rbitcoin_query::BatchThin::new();
+    // Sole hash for this unit-test connect surface.
+    let create_txids: Vec<[u8; 32]> = block
+        .txdata
+        .iter()
+        .map(|t| t.compute_txid().to_byte_array())
+        .collect();
     let (script_jobs, spends, fees) = assemble_block_prevouts(
         query,
         block,
@@ -530,6 +536,7 @@ pub fn validate_block_connect(
         &mut pending_creates,
         &batch_parents,
         &batch_thin,
+        &create_txids,
     )?;
     if check_scripts && !script_jobs.is_empty() {
         verify_scripts_pool(&script_jobs)?;
@@ -695,6 +702,8 @@ pub(crate) fn assemble_block_prevouts(
     pending_creates: &mut std::collections::HashMap<([u8; 32], u32), rbitcoin_primitives::Fk>,
     batch_parents: &rbitcoin_query::BatchParents,
     batch_thin: &rbitcoin_query::BatchThin,
+    // Precomputed create txids (structure / plan); required, same order as txdata.
+    create_txids: &[[u8; 32]],
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
@@ -719,6 +728,7 @@ pub(crate) fn assemble_block_prevouts(
         AssembleMode::Optimistic,
         batch_parents,
         batch_thin,
+        create_txids,
     )
 }
 
@@ -732,6 +742,7 @@ fn assemble_block_prevouts_mode(
     mode: AssembleMode,
     batch_parents: &rbitcoin_query::BatchParents,
     batch_thin: &rbitcoin_query::BatchThin,
+    create_txids: &[[u8; 32]],
 ) -> Result<
     (
         Vec<ScriptCheckJob>,
@@ -749,6 +760,11 @@ fn assemble_block_prevouts_mode(
         if fks.len() != block.txdata.len() {
             return Err(ConsensusError::BadBlock("archived tx fk count mismatch"));
         }
+    }
+    if create_txids.len() != block.txdata.len() {
+        return Err(ConsensusError::BadBlock(
+            "invariant: create_txids length must match block.txdata (no assemble re-hash)",
+        ));
     }
     if block.txdata.is_empty() {
         return Err(ConsensusError::BadBlock("empty block"));
@@ -813,10 +829,8 @@ fn assemble_block_prevouts_mode(
     // Spent checks: pending_spent (this run) + durable confirmed-strong annotations.
     for (ti, tx) in block.txdata.iter().enumerate() {
         let spend_fk = archived_tx_fks.map(|fks| fks[ti]);
-        // Wire intake always has the full tx — prefer compute_txid over residency
-        // / txid.body sidefile (A1). Sidefile/residency only if wire path absent
-        // (defensive; assemble always has `block` wire today).
-        let txid = tx.compute_txid().to_byte_array();
+        // Sole pipeline identity — structure/plan computed once; never re-hash here.
+        let txid = create_txids[ti];
 
         if ti > 0 {
             if tx.input.is_empty() {
@@ -2623,6 +2637,11 @@ mod structure_rule_tests {
         let thin = BatchThin::new();
         let mut spent = HashSet::new();
         let mut creates = HashMap::new();
+        let create_txids: Vec<[u8; 32]> = block
+            .txdata
+            .iter()
+            .map(|t| t.compute_txid().to_byte_array())
+            .collect();
         let r = assemble_block_prevouts_mode(
             &q,
             &block,
@@ -2633,6 +2652,7 @@ mod structure_rule_tests {
             AssembleMode::Full,
             &parents,
             &thin,
+            &create_txids,
         );
         // Immature coinbase or spentness walk — either exercises Full arms.
         let _ = r;
@@ -2668,7 +2688,7 @@ mod structure_rule_tests {
         let mut spent = HashSet::new();
         let mut creates = HashMap::new();
         let err = assemble_block_prevouts(
-            &q, &empty, &ctx, None, &mut spent, &mut creates, &parents, &thin,
+            &q, &empty, &ctx, None, &mut spent, &mut creates, &parents, &thin, &[],
         )
         .err()
         .expect("empty");
@@ -2677,8 +2697,9 @@ mod structure_rule_tests {
         let b = block_with(vec![coinbase(1)]);
         spent.clear();
         creates.clear();
+        let tids: Vec<[u8; 32]> = b.txdata.iter().map(|t| t.compute_txid().to_byte_array()).collect();
         let err2 = assemble_block_prevouts(
-            &q, &b, &ctx, Some(&[]), &mut spent, &mut creates, &parents, &thin,
+            &q, &b, &ctx, Some(&[]), &mut spent, &mut creates, &parents, &thin, &tids,
         )
         .err()
         .expect("fk mismatch");
@@ -2687,8 +2708,9 @@ mod structure_rule_tests {
         let bad = block_with(vec![non_coinbase_spend(1)]);
         spent.clear();
         creates.clear();
+        let tids3: Vec<[u8; 32]> = bad.txdata.iter().map(|t| t.compute_txid().to_byte_array()).collect();
         let err3 = assemble_block_prevouts(
-            &q, &bad, &ctx, None, &mut spent, &mut creates, &parents, &thin,
+            &q, &bad, &ctx, None, &mut spent, &mut creates, &parents, &thin, &tids3,
         )
         .err()
         .expect("not coinbase");

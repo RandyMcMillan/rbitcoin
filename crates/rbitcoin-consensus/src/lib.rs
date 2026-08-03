@@ -618,6 +618,7 @@ pub fn prepare_block_for_archive(
         .is_block_archived(&hash)
         .map_err(ConsensusError::Store)?
     {
+        // Standalone archive helper (not confirm pipeline): one hash pass here.
         return block_to_apply(query, &block.header, &block.txdata);
     }
     prepare_block_for_archive_new(query, params, block)
@@ -649,6 +650,21 @@ pub fn prepare_block_for_archive_new(
         return Err(ConsensusError::BadPrev);
     }
     block_to_apply_with_txids(query, &block.header, &block.txdata, &txids)
+}
+
+/// Confirm wire plan: encode `TxApply` from **already-computed** structure txids.
+///
+/// Callers that already ran [`validate_block_structure_hashed`] must use this so
+/// the confirm pipeline hashes each create **exactly once**.
+pub fn prepare_block_for_archive_with_txids(
+    query: &Query,
+    block: &Block,
+    txids: &[[u8; 32]],
+) -> Result<(HeaderRecord, Vec<TxApply>), ConsensusError> {
+    if block.txdata.len() != txids.len() {
+        return Err(ConsensusError::BadBlock("txid count mismatch"));
+    }
+    block_to_apply_with_txids(query, &block.header, &block.txdata, txids)
 }
 
 /// IBD multi-prep: structure + PoW + TxApply with no store access.

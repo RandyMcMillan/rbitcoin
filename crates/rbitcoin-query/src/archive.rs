@@ -715,6 +715,12 @@ impl Query {
         let ranges = self.store.tx_body_range_batch(&got_tx_fks)?;
         let use_pin = plan.batch_pin.len() == plan.packed.len()
             && plan.batch_pin.len() == got_tx_fks.len();
+        // One residency lock + single pre-evict when all creates are new (usual).
+        let mut seed: Vec<(
+            rbitcoin_primitives::Fk,
+            CreatePin,
+            Option<(u64, u64)>,
+        )> = Vec::with_capacity(got_tx_fks.len());
         if use_pin {
             for ((pin, fk), range) in plan
                 .batch_pin
@@ -726,8 +732,7 @@ impl Query {
                     Some((off, len)) if len > 0 => Some((off, len)),
                     _ => None,
                 };
-                self.create_residency
-                    .put_complete(*fk, std::sync::Arc::clone(pin), body_range);
+                seed.push((*fk, std::sync::Arc::clone(pin), body_range));
             }
         } else {
             // Fallback when batch_pin length mismatched: denserels from pin+inputs.
@@ -749,10 +754,10 @@ impl Query {
                 };
                 let complete: CreatePin =
                     std::sync::Arc::new((tx.clone(), outs.clone(), denserels));
-                self.create_residency
-                    .put_complete(*fk, complete, body_range);
+                seed.push((*fk, complete, body_range));
             }
         }
+        self.create_residency.put_complete_batch(&seed);
         let sticky_ns = t.elapsed().as_nanos() as u64;
 
         // No body DONTNEED after Class A commit: Class A never leads tip, so

@@ -153,64 +153,59 @@ impl CreateResidency {
         (g.by_fk.len(), g.total_bytes, g.byte_cap, g.total_outs)
     }
 
-    /// Insert / update a **complete** pipeline create. Stores `Arc::clone` of `pin`.
-    ///
-    /// Requires `pin.1.len() == pin.2.len()`. No-op when residency disabled or
-    /// null fk. On update of an existing fk: refresh pin/range, **leave FIFO
-    /// order** (no promote).
+    /// Insert / update a **complete** pipeline create. Stores `pin` (caller
+    /// `Arc::clone`s when sharing). See [`Self::put_complete_batch`].
     pub fn put_complete(&self, fk: Fk, pin: CreatePin, body_range: Option<(u64, u64)>) {
-        let Some(id) = fk.get() else {
-            return;
-        };
-        let (tx, outs, denserels) = pin.as_ref();
-        if outs.len() != denserels.len() {
-            // Incomplete denserels — refuse (would break pin).
+        self.put_complete_batch(&[(fk, pin, body_range)]);
+    }
+
+    /// Bulk insert / update complete pipeline creates under **one** lock.
+    ///
+    /// Semantics match N× sequential [`put_complete`] in input order:
+    /// incomplete denserels and null fks are skipped; updates refresh pin/range
+    /// without FIFO promote; inserts append FIFO and may evict oldest by bytes.
+    ///
+    /// **Hot path (Class A `res_seed`):** when every entry is a **new** create_fk
+    /// (no in-map update, no duplicate id in `items`), performs **one**
+    /// pre-evict for the total insert bytes then bulk insert — avoids
+    /// per-create lock + per-create evict walks on a full 2 GiB FIFO.
+    pub fn put_complete_batch(&self, items: &[(Fk, CreatePin, Option<(u64, u64)>)]) {
+        if items.is_empty() {
             return;
         }
-        let bytes = estimate_pin_bytes(&pin);
-        let n_outs = outs.len() as u64;
-        let txid = tx.txid;
         let mut g = self.inner.lock().unwrap();
         if g.byte_cap == 0 {
             return;
         }
-        if let Some(e) = g.by_fk.get_mut(&id) {
-            let old_bytes = e.bytes;
-            let old_outs = e.pin.1.len() as u64;
-            e.txid = txid;
-            e.pin = pin;
-            e.bytes = bytes;
-            if body_range.is_some() {
-                e.body_range = body_range;
-            }
-            g.by_txid.insert(txid, id);
-            g.total_bytes = g
-                .total_bytes
-                .saturating_sub(old_bytes)
-                .saturating_add(bytes);
-            g.total_outs = g.total_outs.saturating_sub(old_outs).saturating_add(n_outs);
+
+        // Fast path: all-new unique fks (res_seed after Class A commit).
+        if let Some(rows) = prepare_all_new_inserts(&g, items) {
+            let need: u64 = rows.iter().map(|r| r.bytes).sum();
             let cap = g.byte_cap;
+            g.evict_until_bytes(cap.saturating_sub(need.min(cap)));
+            for row in rows {
+                g.by_fk.insert(
+                    row.id,
+                    ResidentCreate {
+                        txid: row.txid,
+                        body_range: row.body_range,
+                        pin: row.pin,
+                        bytes: row.bytes,
+                    },
+                );
+                g.by_txid.insert(row.txid, row.id);
+                g.order.push_back(row.id);
+                g.total_bytes = g.total_bytes.saturating_add(row.bytes);
+                g.total_outs = g.total_outs.saturating_add(row.n_outs);
+            }
             g.evict_until_bytes(cap);
             return;
         }
-        let cap = g.byte_cap;
-        // Make room for this row.
-        g.evict_until_bytes(cap.saturating_sub(bytes.min(cap)));
-        g.by_fk.insert(
-            id,
-            ResidentCreate {
-                txid,
-                body_range,
-                pin,
-                bytes,
-            },
-        );
-        g.by_txid.insert(txid, id);
-        g.order.push_back(id);
-        g.total_bytes = g.total_bytes.saturating_add(bytes);
-        g.total_outs = g.total_outs.saturating_add(n_outs);
-        // Final clamp if estimate overflowed (single row > cap keeps newest only).
-        g.evict_until_bytes(cap);
+
+        // Mixed updates / duplicates / incomplete rows: ordered single applies.
+        for (fk, pin, body_range) in items {
+            g.apply_put(*fk, Arc::clone(pin), *body_range);
+        }
     }
 
     /// Convenience: build pin Arc from owned parts then [`put_complete`].
@@ -365,7 +360,109 @@ impl CreateResidency {
     }
 }
 
+/// One validated new-row insert for the all-new batch fast path.
+struct NewInsertRow {
+    id: u64,
+    pin: CreatePin,
+    body_range: Option<(u64, u64)>,
+    bytes: u64,
+    n_outs: u64,
+    txid: [u8; 32],
+}
+
+/// If every non-skipped item is a unique new create_fk, return prepared rows in
+/// input order. `None` → caller must use ordered [`Inner::apply_put`].
+fn prepare_all_new_inserts(
+    g: &Inner,
+    items: &[(Fk, CreatePin, Option<(u64, u64)>)],
+) -> Option<Vec<NewInsertRow>> {
+    let mut rows = Vec::with_capacity(items.len());
+    // Track ids already accepted in this batch (duplicate fk → slow path).
+    let mut seen: HashMap<u64, ()> = HashMap::with_capacity(items.len());
+    for (fk, pin, body_range) in items {
+        let Some(id) = fk.get() else {
+            // Null fk is a no-op in apply_put; ignore for fast path.
+            continue;
+        };
+        let (tx, outs, denserels) = pin.as_ref();
+        if outs.len() != denserels.len() {
+            // Incomplete denserels skipped by apply_put; any skip with siblings
+            // still forces slow path only if we already started… treat as slow
+            // so mixed incomplete + valid stays ordered-equivalent.
+            return None;
+        }
+        if g.by_fk.contains_key(&id) || seen.contains_key(&id) {
+            return None;
+        }
+        seen.insert(id, ());
+        let bytes = estimate_pin_bytes(pin);
+        rows.push(NewInsertRow {
+            id,
+            pin: Arc::clone(pin),
+            body_range: *body_range,
+            bytes,
+            n_outs: outs.len() as u64,
+            txid: tx.txid,
+        });
+    }
+    // Empty after skipping only nulls: nothing to do (treat as success via empty).
+    Some(rows)
+}
+
 impl Inner {
+    /// Single put/update (caller holds the mutex). Same rules as historical
+    /// `put_complete` body.
+    fn apply_put(&mut self, fk: Fk, pin: CreatePin, body_range: Option<(u64, u64)>) {
+        let Some(id) = fk.get() else {
+            return;
+        };
+        let (tx, outs, denserels) = pin.as_ref();
+        if outs.len() != denserels.len() {
+            return;
+        }
+        let bytes = estimate_pin_bytes(&pin);
+        let n_outs = outs.len() as u64;
+        let txid = tx.txid;
+        if self.byte_cap == 0 {
+            return;
+        }
+        if let Some(e) = self.by_fk.get_mut(&id) {
+            let old_bytes = e.bytes;
+            let old_outs = e.pin.1.len() as u64;
+            e.txid = txid;
+            e.pin = pin;
+            e.bytes = bytes;
+            if body_range.is_some() {
+                e.body_range = body_range;
+            }
+            self.by_txid.insert(txid, id);
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(old_bytes)
+                .saturating_add(bytes);
+            self.total_outs = self.total_outs.saturating_sub(old_outs).saturating_add(n_outs);
+            let cap = self.byte_cap;
+            self.evict_until_bytes(cap);
+            return;
+        }
+        let cap = self.byte_cap;
+        self.evict_until_bytes(cap.saturating_sub(bytes.min(cap)));
+        self.by_fk.insert(
+            id,
+            ResidentCreate {
+                txid,
+                body_range,
+                pin,
+                bytes,
+            },
+        );
+        self.by_txid.insert(txid, id);
+        self.order.push_back(id);
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.total_outs = self.total_outs.saturating_add(n_outs);
+        self.evict_until_bytes(cap);
+    }
+
     fn evict_until_bytes(&mut self, max_bytes: u64) {
         while self.total_bytes > max_bytes {
             if !self.hard_evict_oldest() {
@@ -504,5 +601,130 @@ mod tests {
         assert_eq!(live[0].0, 1);
         assert_eq!(sparse.len(), 1);
         assert_eq!(range, Some((10, 20)));
+    }
+
+    /// Snapshot for equivalence: fk → (txid0, range, pin Arc ptr, bytes, n_outs).
+    fn residency_snapshot(
+        r: &CreateResidency,
+    ) -> std::collections::BTreeMap<u64, (u8, Option<(u64, u64)>, usize, u64, usize)> {
+        let g = r.inner.lock().unwrap();
+        let mut m = std::collections::BTreeMap::new();
+        for (&id, e) in &g.by_fk {
+            m.insert(
+                id,
+                (
+                    e.txid[0],
+                    e.body_range,
+                    Arc::as_ptr(&e.pin) as usize,
+                    e.bytes,
+                    e.pin.1.len(),
+                ),
+            );
+        }
+        // FIFO order must match between sequential and batch.
+        let order: Vec<u64> = g.order.iter().copied().collect();
+        assert_eq!(
+            order.len(),
+            m.len(),
+            "FIFO length must match map (orphan order slots)"
+        );
+        for id in &order {
+            assert!(m.contains_key(id), "FIFO id missing from map");
+        }
+        m
+    }
+
+    fn fifo_order(r: &CreateResidency) -> Vec<u64> {
+        r.inner.lock().unwrap().order.iter().copied().collect()
+    }
+
+    #[test]
+    fn put_complete_batch_matches_sequential_inserts() {
+        let one = estimate_pin_bytes(&pin_with(1, 2, 64));
+        // Room for ~3 pins; inserts 5 → both paths evict same oldest.
+        let cap = one.saturating_mul(3) + one / 4;
+        let items: Vec<_> = (1u8..=5)
+            .map(|i| {
+                (
+                    Fk(i as u64),
+                    pin_with(i, 2, 64),
+                    Some((i as u64 * 10, 8u64)),
+                )
+            })
+            .collect();
+
+        let seq = CreateResidency::new(cap);
+        for (fk, pin, range) in &items {
+            seq.put_complete(*fk, Arc::clone(pin), *range);
+        }
+
+        let batch = CreateResidency::new(cap);
+        let batch_items: Vec<_> = items
+            .iter()
+            .map(|(fk, pin, range)| (*fk, Arc::clone(pin), *range))
+            .collect();
+        batch.put_complete_batch(&batch_items);
+
+        assert_eq!(seq.len(), batch.len());
+        assert_eq!(seq.total_bytes(), batch.total_bytes());
+        assert_eq!(fifo_order(&seq), fifo_order(&batch));
+        // Same fks / ranges / txid tags (Arc ptrs differ — separate clones).
+        let s = residency_snapshot(&seq);
+        let b = residency_snapshot(&batch);
+        assert_eq!(s.len(), b.len());
+        for (id, (txid, range, _, bytes, n_outs)) in &s {
+            let (bt, br, _, bb, bn) = b.get(id).expect("batch missing fk");
+            assert_eq!(txid, bt);
+            assert_eq!(range, br);
+            assert_eq!(bytes, bb);
+            assert_eq!(n_outs, bn);
+        }
+        // Oldest should be gone under tight cap.
+        assert!(seq.lookup_fk_by_txid(&tx(1).txid).is_none());
+        assert_eq!(seq.lookup_fk_by_txid(&tx(5).txid), Some(Fk(5)));
+    }
+
+    #[test]
+    fn put_complete_batch_update_leaves_fifo_like_sequential() {
+        let r_seq = CreateResidency::new(80_000);
+        let r_bat = CreateResidency::new(80_000);
+        let p1 = pin_with(1, 1, 16);
+        let p2 = pin_with(2, 1, 16);
+        r_seq.put_complete(Fk(1), Arc::clone(&p1), None);
+        r_seq.put_complete(Fk(2), Arc::clone(&p2), None);
+        r_bat.put_complete_batch(&[
+            (Fk(1), Arc::clone(&p1), None),
+            (Fk(2), Arc::clone(&p2), None),
+        ]);
+        // Update fk1 via batch (slow path: already resident).
+        let p1b = pin_with(1, 1, 16);
+        r_seq.put_complete(Fk(1), Arc::clone(&p1b), Some((9, 9)));
+        r_bat.put_complete_batch(&[(Fk(1), Arc::clone(&p1b), Some((9, 9)))]);
+        assert_eq!(fifo_order(&r_seq), fifo_order(&r_bat));
+        assert_eq!(
+            r_seq.body_ranges_by_fk(&[Fk(1)]),
+            r_bat.body_ranges_by_fk(&[Fk(1)])
+        );
+        assert_eq!(fifo_order(&r_seq), vec![1, 2], "update must not promote");
+    }
+
+    #[test]
+    fn put_complete_batch_arc_shares_seed_pins() {
+        // res_seed path: Arc::clone of batch_pin into residency.
+        let r = CreateResidency::new(DEFAULT_RESIDENCY_BYTES);
+        let pins: Vec<CreatePin> = (1u8..=4).map(|i| pin_with(i, 1, 8)).collect();
+        let items: Vec<_> = pins
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (Fk(i as u64 + 1), Arc::clone(p), Some((i as u64, 1))))
+            .collect();
+        r.put_complete_batch(&items);
+        for (i, p) in pins.iter().enumerate() {
+            let (got, _) = r.get_pin(Fk(i as u64 + 1)).unwrap();
+            assert!(
+                Arc::ptr_eq(&got, p),
+                "batch seed must Arc-share input pin"
+            );
+        }
     }
 }

@@ -536,7 +536,11 @@ impl ConfirmQueueDepths {
     fn note_plan_send(&self, blocks: usize) {
         let d = self.plan_to_prep.fetch_add(1, Ordering::Relaxed) + 1;
         Self::note_depth_hwm(&self.plan_hwm, d);
-        self.plan_blocks.fetch_add(blocks, Ordering::Relaxed);
+        self.plan_blocks
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(blocks))
+            })
+            .ok();
     }
     fn note_plan_recv(&self, blocks: usize) {
         self.plan_to_prep.fetch_sub(1, Ordering::Relaxed);
@@ -550,10 +554,23 @@ impl ConfirmQueueDepths {
     fn note_load_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
         let d = self.load_to_scripts.fetch_add(1, Ordering::Relaxed) + 1;
         Self::note_depth_hwm(&self.load_hwm, d);
-        self.load_blocks.fetch_add(blocks, Ordering::Relaxed);
+        // Saturating: concurrent note_load_send under parallel prep can race past
+        // usize::MAX on wire_bytes/parents counters in debug overflow checks.
+        self.load_blocks
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(blocks))
+            })
+            .ok();
         self.load_wire_bytes
-            .fetch_add(wire_bytes, Ordering::Relaxed);
-        self.load_parents.fetch_add(parents, Ordering::Relaxed);
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(wire_bytes))
+            })
+            .ok();
+        self.load_parents
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(parents))
+            })
+            .ok();
     }
     fn note_load_recv(&self, blocks: usize, wire_bytes: usize, parents: usize) {
         self.load_to_scripts.fetch_sub(1, Ordering::Relaxed);
@@ -576,10 +593,21 @@ impl ConfirmQueueDepths {
     fn note_write_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
         let d = self.scripts_to_write.fetch_add(1, Ordering::Relaxed) + 1;
         Self::note_depth_hwm(&self.write_hwm, d);
-        self.write_blocks.fetch_add(blocks, Ordering::Relaxed);
+        self.write_blocks
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(blocks))
+            })
+            .ok();
         self.write_wire_bytes
-            .fetch_add(wire_bytes, Ordering::Relaxed);
-        self.write_parents.fetch_add(parents, Ordering::Relaxed);
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(wire_bytes))
+            })
+            .ok();
+        self.write_parents
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(parents))
+            })
+            .ok();
     }
     fn note_write_recv(&self, blocks: usize, wire_bytes: usize, parents: usize) {
         self.scripts_to_write.fetch_sub(1, Ordering::Relaxed);
@@ -1907,6 +1935,26 @@ mod tests {
         assert_eq!(wh, 0);
         let (ph2, _, _) = q.sample_hwm_and_reset();
         assert_eq!(ph2, 0, "hwm resets each sample window");
+    }
+
+    /// Debug overflow on load_wire_bytes / parents used to abort IBD confirm
+    /// threads under parallel prep (seen on two_node IBD). Counters must saturate.
+    #[test]
+    fn queue_load_send_saturates_wire_and_parents() {
+        let q = ConfirmQueueDepths::new();
+        // Near-max wire_bytes so a second large add would wrap without saturating.
+        let half = usize::MAX / 2 + 1;
+        q.note_load_send(1, half, half);
+        q.note_load_send(1, half, half);
+        let c = q.content_snap();
+        assert_eq!(c.load_wire_bytes, usize::MAX);
+        assert_eq!(c.load_parents, usize::MAX);
+        assert_eq!(c.load_blocks, 2);
+        // recv must not underflow
+        q.note_load_recv(1, half, half);
+        let c2 = q.content_snap();
+        assert!(c2.load_wire_bytes <= usize::MAX);
+        assert!(c2.load_parents <= usize::MAX);
     }
 
     #[test]

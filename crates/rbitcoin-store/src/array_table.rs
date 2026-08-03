@@ -282,20 +282,22 @@ impl ArrayTable {
             return Ok(());
         }
 
-        // In-prefix mutate: full body rewrite (tip Class C rarely hits this;
-        // residual same-size tear risk — see docs/crash-recovery.md).
-        let body_bytes = n.saturating_mul(ELEM);
-        let mut bytes = vec![0u8; body_bytes as usize];
-        for (i, &val) in v.iter().enumerate() {
+        // In-prefix mutate: write from first dirty index through end only
+        // (confirmed tip extension almost always dirties only the high slots).
+        let from = dirty_lo.min(n);
+        let mut bytes = vec![0u8; ((n - from) as usize) * 8];
+        for (i, &val) in v[from as usize..].iter().enumerate() {
             bytes[i * 8..(i + 1) * 8].copy_from_slice(&val.to_le_bytes());
         }
         drop(guard);
-        if body_bytes > 0 {
+        if !bytes.is_empty() {
             self.file
-                .write_at(FILE_HEADER_LEN as u64, &bytes)?;
+                .write_at(Self::offset(from), &bytes)?;
         }
-        let logical = FILE_HEADER_LEN as u64 + body_bytes;
-        self.file.set_logical_len(logical)?;
+        if n != disk {
+            let logical = FILE_HEADER_LEN as u64 + n * ELEM;
+            self.file.set_logical_len(logical)?;
+        }
         self.disk_len.store(n, Ordering::Release);
         self.dirty.store(false, Ordering::Release);
         self.dirty_lo.store(u64::MAX, Ordering::Release);

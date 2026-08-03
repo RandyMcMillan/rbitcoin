@@ -32,8 +32,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+
+// needs_sync: set on durable-payload writes; cleared after sync_data.
 
 pub const FILE_HEADER_LEN: usize = 16;
 
@@ -79,6 +81,8 @@ pub struct TableFile {
     /// Layout extension for trailing footers (address-head bits/gen).
     trailing_ext: [u8; 16],
     kind: TableKind,
+    /// Payload/HWM written since last successful `sync_data` (Class C barrier skip).
+    needs_sync: AtomicBool,
 }
 
 impl TableFile {
@@ -130,6 +134,7 @@ impl TableFile {
             trailing_header: false,
             trailing_ext: [0u8; 16],
             kind,
+            needs_sync: AtomicBool::new(false),
         })
     }
 
@@ -159,6 +164,7 @@ impl TableFile {
             trailing_header: true,
             trailing_ext: [0u8; 16],
             kind,
+            needs_sync: AtomicBool::new(false),
         };
         s.write_trailer(initial)?;
         Ok(s)
@@ -213,6 +219,7 @@ impl TableFile {
                 trailing_header: true,
                 trailing_ext,
                 kind,
+                needs_sync: AtomicBool::new(false),
             },
             trailing_ext,
         ))
@@ -344,6 +351,7 @@ impl TableFile {
             trailing_header: false,
             trailing_ext: [0u8; 16],
             kind,
+            needs_sync: AtomicBool::new(false),
         })
     }
 
@@ -380,6 +388,7 @@ impl TableFile {
             self.published_len.store(logical, Ordering::Release);
             self.persist_hwm(logical)?;
         }
+        self.needs_sync.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -490,6 +499,7 @@ impl TableFile {
         self.ensure_capacity(end)?;
         self.pwrite_all(offset, bytes)?;
         self.publish_logical_end(end);
+        self.needs_sync.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -629,7 +639,14 @@ impl TableFile {
     }
 
     /// Persist HWM / trailer and `sync_data` (unless deferred).
+    ///
+    /// Skips entirely when no payload write has occurred since the last
+    /// successful sync (Class C tip barrier: avoid fsyncing multi‑GiB tables
+    /// that were not dirtied this batch — e.g. `tx_height` ~1.8 GiB).
     pub fn flush(&self) -> Result<(), StoreError> {
+        if !self.needs_sync.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let logical = self.published_len.load(Ordering::Acquire);
         self.persist_logical_len(logical)?;
         if crate::ibd_io_policy::defer_durable_flush() {
@@ -640,6 +657,7 @@ impl TableFile {
             .unwrap()
             .sync_data()
             .map_err(|e| StoreError::io(&self.path, e))?;
+        self.needs_sync.store(false, Ordering::Release);
         Ok(())
     }
 

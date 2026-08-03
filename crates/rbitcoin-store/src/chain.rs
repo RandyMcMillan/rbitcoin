@@ -655,17 +655,25 @@ impl StrongTxTable {
             return Ok(());
         }
 
-        // In-prefix bit mutate: full body rewrite (residual same-size tear risk;
-        // tip-last barrier keeps tip unadvanced until strong is durable).
-        let body = v.clone();
+        // In-prefix bit mutate: write from first dirty byte through end only.
+        // Tip Class C almost always dirties only the high bits (new creates);
+        // rewriting the full ~40 MiB image every batch was wasteful. Same-size
+        // mid-file tear risk is limited to the dirty suffix; tip-last barrier
+        // still keeps tip unadvanced until this flush completes.
+        let from = dirty_byte.min(body_len);
+        let suffix = v[from as usize..].to_vec();
         drop(guard);
-        if !body.is_empty() {
-            self.bits
-                .write_at(crate::file::FILE_HEADER_LEN as u64, &body)?;
+        if !suffix.is_empty() {
+            self.bits.write_at(
+                crate::file::FILE_HEADER_LEN as u64 + from,
+                &suffix,
+            )?;
         }
-        let logical = crate::file::FILE_HEADER_LEN as u64 + body.len() as u64;
-        self.bits.set_logical_len(logical)?;
-        self.disk_bytes.store(body.len() as u64, Ordering::Release);
+        if body_len != disk {
+            let logical = crate::file::FILE_HEADER_LEN as u64 + body_len;
+            self.bits.set_logical_len(logical)?;
+        }
+        self.disk_bytes.store(body_len, Ordering::Release);
         self.dirty.store(false, Ordering::Release);
         self.dirty_lo_bit.store(u64::MAX, Ordering::Release);
         Ok(())
@@ -734,6 +742,27 @@ mod strong_tests {
         let t = StrongTxTable::open(&dir).unwrap();
         assert!(t.is_strong(Fk(1)).unwrap());
         assert!(!t.is_strong(Fk(9)).unwrap(), "unflushed strong must not survive");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// In-prefix high-bit dirties must flush without losing low bits (suffix write).
+    #[test]
+    fn strong_suffix_dirty_flush_preserves_prefix() {
+        let dir = tmp();
+        {
+            let s = StrongTxTable::create(&dir).unwrap();
+            // Allocate a wide bit image then flush so disk_bytes covers it.
+            s.set_strong_range(Fk(1), 10_000, Fk(1)).unwrap();
+            s.flush().unwrap();
+            // Flip only high bits (still within disk image) — suffix dirty path.
+            s.set_strong_range(Fk(9000), 100, Fk(1)).unwrap();
+            s.flush().unwrap();
+        }
+        let s = StrongTxTable::open(&dir).unwrap();
+        assert!(s.is_strong(Fk(1)).unwrap());
+        assert!(s.is_strong(Fk(5000)).unwrap());
+        assert!(s.is_strong(Fk(9000)).unwrap());
+        assert!(s.is_strong(Fk(9099)).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -21,10 +21,11 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **Body queue:** `store/block_queue/` on-disk payload FIFO (no process RAM overflow). **Primary capacity is soft time-depth**: stop frontier densify when on-disk count &gt; ~5 minutes of tip-rate blocks (same EWMA as ETA); resume when &lt; ~4 minutes. Gaps inside the on-disk height span always densify (overshoot OK). Optional absolute byte ceiling via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` (default unlimited). Height horizon (`CONTIG_DENSIFY_AHEAD`, 64 k past tip) caps densify/receive walk. **Offer** on peer Block → disk; prep **reads** by height; **dequeue** after confirm-commit. Restart re-notes feed readiness only (wire stays on disk until prep).
 
-**CreateResidency:** sole process-local create map for wire plan + pin (txid→fk,
-range, outs, denserels; raw FIFO). Class A commit seeds denserels offline so
-prep(N+1) hits without body re-read. Sole process map is CreateResidency
-(plan resolve + pin denserels + prewarm).
+**CreateResidency:** sole process-local map of **complete pipeline creates**
+(txid→fk, optional body_range, outs+denserels as one `CreatePin` Arc; pure
+insert-order FIFO by `RBITCOIN_RESIDENCY_BYTES`, default 2 GiB). Class A commit
+seeds denserels offline so prep(N+1) can hit without body re-read. **External
+parents are not inserted** (batch-local only).
 
 **tx.head (segmented):** fixed **25-bit** open-address head per segment with
 **4 B relative** create ids; roll at `MIN(body soft span, 80% slots)`. On seal,

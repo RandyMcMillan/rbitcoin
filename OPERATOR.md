@@ -102,7 +102,7 @@ selected but setup fails, demote to **pread** / **pwrite**.
 | Live IBD peers | **16** | `--max-outbound` |
 | Milestone (skip scripts ≤ height) | mainnet **840000**, signet 2000000, … | `--milestone` (`0` = full scripts) |
 | Archive queue RAM | **512 MiB** | `RBITCOIN_ARCHIVE_QUEUE_MB` |
-| Confirm denserels **history** | **off (lean default)** | Small residency FIFO for **in-flight / just-committed** only (**256k creates / 1M outs**), skip denserels prewarm; cold pin trusts OS page cache. **Header plans always on** (multi-block MTP). `RBITCOIN_CONFIRM_CACHE=1` restores multi‑GiB history (8M/16M) + prewarm for experiments. Explicit `RBITCOIN_CREATE_RESIDENCY_CAP` / `_OUT_CAP` still override caps |
+| CreateResidency (complete pin FIFO) | **2 GiB** | `RBITCOIN_RESIDENCY_BYTES` (default 2147483648; `0` = off). Pipeline creates only (fk+outs+denserels); external parents are not cached. Startup tip prewarm when on. **Header plans always on** (multi-block MTP) |
 | Class A working-set cache | **256 MiB** | `RBITCOIN_CLASS_A_CACHE_MB` |
 | Bulk store IO | **uring** (Linux) when available | See **Bulk store IO backends** above; ring depth **128**; `RBITCOIN_BULK_IO_WORKERS` for pread. Segmented `tx.head` FdOnly page RMW; Class C L2 write-behind (`docs/io-modality.md`) |
 | Archive Class A append | **pwrite** (always) | `tx.body` / `tx.idx` mega-appends use `write_at_pwrite` only |

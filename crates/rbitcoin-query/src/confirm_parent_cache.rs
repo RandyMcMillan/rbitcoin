@@ -7,9 +7,8 @@
 //! hot pin map). Thin edges and sparse parent pins are **batch-local**
 //! ([`crate::confirm_load::BatchThin`], [`crate::BatchParents`]).
 //!
-//! Header plans stay **on** even when `RBITCOIN_CONFIRM_CACHE=0` (that flag
-//! only shrinks CreateResidency denserels history + skips prewarm). Scan
-//! watermarks (`plans`) track load readiness.
+//! Header plans stay **always on** (independent of CreateResidency byte budget).
+//! Scan watermarks (`plans`) track load readiness.
 
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::HeaderRecord;
@@ -60,9 +59,9 @@ struct Inner {
 /// Process-local confirm parent cache (headers + scan watermarks only).
 ///
 /// **Always active** — multi-block wire prep needs tip-ahead header plans for
-/// MTP / bits (not optional denserels history). `RBITCOIN_CONFIRM_CACHE=0` only
-/// shrinks CreateResidency + skips denserels prewarm; it does **not** disable
-/// this map (mainnet tip freeze: `parent header plan missing above tip`).
+/// MTP / bits. Independent of CreateResidency (`RBITCOIN_RESIDENCY_BYTES`).
+/// Disabling residency must not disable this map (mainnet tip freeze:
+/// `parent header plan missing above tip`).
 pub struct ConfirmParentCache {
     inner: Mutex<Inner>,
     /// Mirror of `Inner::ready_through` for lock-free reads.

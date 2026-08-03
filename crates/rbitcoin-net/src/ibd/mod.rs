@@ -372,37 +372,35 @@ pub async fn ibd_cancellable(
     } else {
         0
     }));
-    // Startup caches: Class A ranges + bounded denserels + tip-ahead header plans.
-    // Skipped when RBITCOIN_CONFIRM_CACHE=0 (in-flight FIFO only; trust OS pages).
-    // Lean denserels is the product default; full history only with CONFIRM_CACHE=1.
-    let (_len0, create_cap0, _outs0, out_cap0) = hub.query.create_residency().size_stats();
-    if !hub.query.create_residency().cache_enabled() {
+    // Startup: complete tip-create denserels + tip-ahead header plans into
+    // CreateResidency (default 2 GiB FIFO). Skipped when RBITCOIN_RESIDENCY_BYTES=0.
+    let (_len0, bytes0, byte_cap0, _outs0) = hub.query.create_residency().size_stats();
+    if !hub.query.create_residency().enabled() {
         info!(
-            "ibd: denserels lean default (cache=off) creates_cap={create_cap0} out_cap={out_cap0} \
-             — skip prewarm; header plans on; res_seed+pin fill window \
-             (RBITCOIN_CONFIRM_CACHE=1 for multi-GiB history)"
+            "ibd: residency off (RBITCOIN_RESIDENCY_BYTES=0) \
+             — skip prewarm; header plans on; no cross-batch create pin cache \
+             (default is 2GiB complete-row FIFO)"
         );
     } else {
         info!(
-            "ibd: denserels full history (RBITCOIN_CONFIRM_CACHE=1) creates_cap={create_cap0} \
-             out_cap={out_cap0} — running residency prewarm"
+            "ibd: residency on bytes={}/{}MiB — running complete-create prewarm",
+            bytes0 / (1024 * 1024),
+            byte_cap0 / (1024 * 1024)
         );
         match hub.query.archive_residency_prewarm() {
             Ok(st) => {
-                let (len, create_cap, outs, out_cap) = hub.query.create_residency().size_stats();
+                let (len, bytes, byte_cap, outs) = hub.query.create_residency().size_stats();
                 info!(
-                    "ibd: residency prewarm ranges={ranges} denserels={den_c} outs={outs}/{out_cap} \
-                     header_plans={hdr} creates={len}/{create_cap} in {ms}ms \
-                     (range={rms}ms denserels={dms}ms headers={hms}ms)",
-                    ranges = st.ranges,
+                    "ibd: residency prewarm denserels={den_c} outs={outs} bytes={bytes_mib}/{cap_mib}MiB \
+                     header_plans={hdr} creates={len} in {ms}ms \
+                     (denserels={dms}ms headers={hms}ms)",
                     den_c = st.denserels_creates,
                     outs = outs,
-                    out_cap = out_cap,
+                    bytes_mib = bytes / (1024 * 1024),
+                    cap_mib = byte_cap / (1024 * 1024),
                     hdr = st.header_plans,
                     len = len,
-                    create_cap = create_cap,
                     ms = st.ms,
-                    rms = st.range_ms,
                     dms = st.denserels_ms,
                     hms = st.headers_ms,
                 );

@@ -17,12 +17,9 @@ mod sh_builder;
 mod wave_prevout;
 
 pub use combined_stage::{
-    body_ok_reads, load_creates_once, reset_body_ok_reads, CombinedCreate,
+    body_ok_reads, load_creates_once, load_creates_once_seed, reset_body_ok_reads, CombinedCreate,
 };
-pub use create_residency::{
-    confirm_cache_enabled, CreateResidency, DEFAULT_CREATE_CAP, DEFAULT_OUT_CAP,
-    NO_CACHE_CREATE_CAP, NO_CACHE_OUT_CAP,
-};
+pub use create_residency::{estimate_pin_bytes, CreateResidency, DEFAULT_RESIDENCY_BYTES};
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};
@@ -84,13 +81,14 @@ pub fn soft_pressure(depth_n: u32, stop_n: u32, resume_n: u32, was: bool) -> boo
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProcessOwnedSizes {
     pub conf_plans: usize,
-    /// Sole hot create map: creates + outs vs caps (FIFO).
+    /// Sole hot create map: complete creates + byte budget (FIFO).
     pub residency_creates: usize,
-    pub residency_create_cap: usize,
+    /// Estimated residency payload bytes.
+    pub residency_bytes: u64,
+    /// Byte budget (0 = disabled).
+    pub residency_byte_cap: u64,
+    /// Total outs held (metrics).
     pub residency_outs: u64,
-    pub residency_out_cap: u64,
-    /// `RBITCOIN_CONFIRM_CACHE` effective (false = in-flight FIFO only).
-    pub confirm_cache: bool,
     pub sh_runs: usize,
     pub sh_memtable: usize,
     pub sh_heads: usize,
@@ -1042,16 +1040,14 @@ impl Query {
     /// Brief mutex locks only (residency / header plans / SH / heads). Call from
     /// the ~5s status tick — not the hot path.
     pub fn process_owned_size_snapshot(&self) -> ProcessOwnedSizes {
-        let (res_creates, res_create_cap, res_outs, res_out_cap) =
-            self.create_residency.size_stats();
+        let (res_creates, res_bytes, res_byte_cap, res_outs) = self.create_residency.size_stats();
         let conf_plans = self.confirm_parents.plan_count();
         ProcessOwnedSizes {
             conf_plans,
             residency_creates: res_creates,
-            residency_create_cap: res_create_cap,
+            residency_bytes: res_bytes,
+            residency_byte_cap: res_byte_cap,
             residency_outs: res_outs,
-            residency_out_cap: res_out_cap,
-            confirm_cache: self.create_residency.cache_enabled(),
             sh_runs: self.sh_run.on_disk_run_count(),
             sh_memtable: self.sh_run.memtable_len(),
             sh_heads: self.sh_heads.lock().unwrap().len(),
@@ -1730,7 +1726,7 @@ mod tests {
 
         // Size snapshot (residency occupancy).
         let sizes = q.process_owned_size_snapshot();
-        let _ = sizes.residency_create_cap;
+        let _ = sizes.residency_byte_cap;
         assert!(q.tx_body_count() >= 4);
         let _ = q.tx_head_occupied();
         let _ = q.scripthash_entry_count();

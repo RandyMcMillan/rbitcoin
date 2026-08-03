@@ -467,11 +467,13 @@ impl Query {
                 return Err(StoreError::Cancelled("confirm cancelled"));
             }
             let fks: Vec<Fk> = chunk.iter().map(|(pid, _)| Fk(*pid)).collect();
-            let loaded = crate::combined_stage::load_creates_once(
+            // pin_new = external parents: load denserels without residency seed.
+            let loaded = crate::combined_stage::load_creates_once_seed(
                 &self.store,
                 &self.create_residency,
                 &fks,
                 rbitcoin_store::IdxBodyMode::OutsDenserels,
+                false,
             )?;
             let mut by_id: HashMap<u64, crate::combined_stage::CombinedCreate> =
                 HashMap::with_capacity(loaded.len());

@@ -1,204 +1,222 @@
 //! Unified create residency — **sole hot create map** for wire IBD pin / plan.
 //!
-//! # Map shape
+//! # Map shape (complete rows only)
 //!
-//! `create_fk → (txid, body range, optional outs + denserels)`.
+//! `create_fk → (txid, optional body_range, CreatePin Arc)`.
 //!
-//! # Eviction: raw FIFO only (no read-LRU)
+//! A row is **always complete**: outs + denserels travel with the fk. Half-rows
+//! (fk/range only) and out-slim-keep-fk are gone.
 //!
-//! - **Create cap:** oldest inserts are **hard-dropped** (entire row) via `order`.
-//! - **Out cap:** oldest **out-bearing** rows are **slimmed** first via a separate
-//!   `outs_order` deque (strip outs/denserels/tx, **keep** fk/txid/body_range).
-//!   Range-only prewarm rows are never scanned for out pressure (O(out-bearing)
-//!   only — never O(create_cap)).
-//! Lookups **never** reorder either FIFO. Do not reintroduce touch-on-hit.
+//! # What is stored
 //!
-//! # Denserels hit rate is largely structural
+//! **Pipeline creates only** — txs that enter confirm (plan packing / res_seed /
+//! tip prewarm). **External parents must not be inserted** (batch-local
+//! `external_parent_outs` only). Later spends hit residency only if that create
+//! is still in the FIFO from **its own** pipeline insert.
 //!
-//! Mid/late mainnet IBD often sees **~35–50%** denserels pin hits. Many spends
-//! reference **old UTXOs** that left any process cache long ago — that miss rate
-//! is expected, not a residency bug. Do **not** grow multi‑GiB caps hoping for
-//! 65–70% hit rate. Optimize: (1) keep **recent** commit-seed / offline denserels
-//! working, (2) make **cold** denserels loads cheap (batch once, no double ensure).
+//! # Eviction: pure insert-order FIFO by byte budget
 //!
-//! # Denserels history: lean by default
+//! Default **2 GiB** of pin payload. Oldest complete rows hard-dropped (entire
+//! row). Lookups **never** reorder. Do not reintroduce touch-on-hit / LRU.
 //!
-//! **Default** residency is a **pipeline / just-committed window**
-//! ([`NO_CACHE_CREATE_CAP`] / [`NO_CACHE_OUT_CAP`]). Commit `res_seed` and pin
-//! still populate it; FIFO drops history quickly; cold denserels trust OS page
-//! cache. Startup denserels/range **prewarm** is skipped. Opt in to multi‑GiB
-//! history with `RBITCOIN_CONFIRM_CACHE=1`. **Header plans stay on** (MTP).
+//! # Arc share
 //!
+//! Pin material is [`crate::CreatePin`] (`Arc<(TxRecord, outs, denserels)>`).
+//! Residency stores the Arc; plan/pin take `Arc::clone` — no deep outs copy for
+//! residency hits while a batch is in flight.
+//!
+//! # Env
+//!
+//! - `RBITCOIN_RESIDENCY_BYTES` — byte budget (default **2 GiB**). `0` disables
+//!   residency (puts are no-ops; prewarm skipped).
+//!
+//! Header plans are **not** controlled here (always on for multi-block MTP).
+
+use crate::CreatePin;
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::{OutputRecord, TxRecord};
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-/// Default max creates in residency (~same planning band as prior sticky cap).
-pub const DEFAULT_CREATE_CAP: usize = 8_000_000;
-/// Default max outputs held.
-pub const DEFAULT_OUT_CAP: u64 = 1 << 24;
+/// Default residency heap budget for complete create pins (2 GiB).
+pub const DEFAULT_RESIDENCY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Create cap when [`confirm_cache_enabled`] is false (in-flight window only).
-///
-/// ~pipeline depth of mid-mainnet batches — not multi‑GiB history. Explicit
-/// `RBITCOIN_CREATE_RESIDENCY_CAP` still wins when set.
-pub const NO_CACHE_CREATE_CAP: usize = 256_000;
-/// Out cap when confirm cache is off.
-pub const NO_CACHE_OUT_CAP: u64 = 1_000_000;
+/// Serialize `RBITCOIN_RESIDENCY_BYTES` mutations in tests (parallel `cargo test`).
+#[cfg(test)]
+pub static TEST_RESIDENCY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// Whether multi‑GiB confirm denserels **history** is enabled.
-///
-/// **Default off** (lean FIFO only — see [`NO_CACHE_CREATE_CAP`]).  
-/// Env `RBITCOIN_CONFIRM_CACHE`:
-/// - unset / `0` / `false` / `off` / `no` → **false** (product default)
-/// - `1` / `true` / `on` / `yes` → **true** (legacy 8M/16M caps + prewarm)
-///
-/// Header plans are **not** controlled here (always on for multi-block MTP).
-pub fn confirm_cache_enabled() -> bool {
-    match std::env::var("RBITCOIN_CONFIRM_CACHE") {
-        Ok(s) => {
-            let t = s.trim();
-            t == "1"
-                || t.eq_ignore_ascii_case("true")
-                || t.eq_ignore_ascii_case("on")
-                || t.eq_ignore_ascii_case("yes")
-        }
-        Err(_) => false,
+/// Fixed overhead per resident row (map entry + Arc header + txid + range + fudge).
+const ROW_FIXED_BYTES: u64 = 256;
+
+/// Estimate heap bytes charged to the residency budget for one complete pin.
+pub fn estimate_pin_bytes(pin: &CreatePin) -> u64 {
+    let (tx, outs, denserels) = pin.as_ref();
+    let mut n = ROW_FIXED_BYTES;
+    n = n.saturating_add(std::mem::size_of_val(tx) as u64);
+    n = n.saturating_add((denserels.len() * 4) as u64);
+    n = n.saturating_add((denserels.capacity() * 4) as u64 / 4); // small capacity fudge
+    for o in outs {
+        n = n.saturating_add(32); // OutputRecord meta fudge
+        n = n.saturating_add(o.script.len() as u64);
+        n = n.saturating_add(o.script.capacity() as u64 / 4);
     }
+    n = n.saturating_add((outs.capacity() * 24) as u64);
+    n
 }
 
 #[derive(Debug, Clone)]
 pub struct ResidentCreate {
     pub txid: [u8; 32],
     pub body_range: Option<(u64, u64)>,
-    pub tx: Option<TxRecord>,
-    pub outs: Option<Vec<OutputRecord>>,
-    pub denserels: Option<Vec<u32>>,
+    /// Complete pin (tx + outs + denserels). Always present.
+    pub pin: CreatePin,
+    /// Bytes charged for this row (payload estimate at insert).
+    pub bytes: u64,
 }
 
 struct Inner {
     by_fk: HashMap<u64, ResidentCreate>,
     by_txid: HashMap<[u8; 32], u64>,
-    /// Insert-order of all creates (range-only + denserels).
+    /// Insert-order FIFO of complete creates.
     order: VecDeque<u64>,
-    /// Insert-order of creates that **currently hold outs** (for O(1) out slim).
-    /// Stale ids (hard-evicted or already slimmed) are skipped at pop.
-    outs_order: VecDeque<u64>,
-    create_cap: usize,
-    out_cap: u64,
+    /// Total estimated payload bytes of resident pins.
+    total_bytes: u64,
+    /// Total output count (metrics / sizes line).
     total_outs: u64,
+    /// Byte budget; 0 = residency disabled (puts are no-ops).
+    byte_cap: u64,
 }
 
 /// Process-local unified residency (sole writer for inserts; shared Mutex).
 pub struct CreateResidency {
     inner: Mutex<Inner>,
-    /// True only when `RBITCOIN_CONFIRM_CACHE=1` (multi‑GiB denserels history).
-    /// Default false: small FIFO for in-flight / just-committed window.
-    cache_enabled: bool,
 }
 
 impl CreateResidency {
-    pub fn new(create_cap: usize, out_cap: u64) -> Self {
-        Self::new_with_cache(create_cap, out_cap, true)
-    }
-
-    pub fn new_with_cache(create_cap: usize, out_cap: u64, cache_enabled: bool) -> Self {
-        let create_cap = create_cap.max(1).min(20_000_000);
-        let out_cap = out_cap.max(1);
-        let init = create_cap.min(1 << 20);
+    /// Construct with explicit byte budget. `byte_cap == 0` disables puts.
+    pub fn new(byte_cap: u64) -> Self {
+        // HashMap pre-size: rough create count at ~4 KiB/create under budget.
+        let init = if byte_cap == 0 {
+            16
+        } else {
+            ((byte_cap / 4096) as usize).clamp(1024, 1 << 20)
+        };
         Self {
             inner: Mutex::new(Inner {
                 by_fk: HashMap::with_capacity(init),
                 by_txid: HashMap::with_capacity(init),
-                order: VecDeque::with_capacity(init),
-                outs_order: VecDeque::new(),
-                create_cap,
-                out_cap,
+                order: VecDeque::with_capacity(init.min(1 << 18)),
+                total_bytes: 0,
                 total_outs: 0,
+                byte_cap,
             }),
-            cache_enabled,
         }
     }
 
+    /// From `RBITCOIN_RESIDENCY_BYTES` (default [`DEFAULT_RESIDENCY_BYTES`]; `0` = off).
     pub fn from_env() -> Self {
-        let cache = confirm_cache_enabled();
-        let create_explicit = std::env::var("RBITCOIN_CREATE_RESIDENCY_CAP")
+        let byte_cap = std::env::var("RBITCOIN_RESIDENCY_BYTES")
             .ok()
-            .and_then(|s| s.parse().ok());
-        let out_explicit = std::env::var("RBITCOIN_CREATE_RESIDENCY_OUT_CAP")
-            .ok()
-            .or_else(|| std::env::var("RBITCOIN_CONFIRM_OUT_FIFO").ok())
             .and_then(|s| s.parse().ok())
-            .filter(|&n: &u64| n > 0);
-        let create_cap = create_explicit.unwrap_or(if cache {
-            DEFAULT_CREATE_CAP
-        } else {
-            NO_CACHE_CREATE_CAP
-        });
-        let out_cap = out_explicit.unwrap_or(if cache {
-            DEFAULT_OUT_CAP
-        } else {
-            NO_CACHE_OUT_CAP
-        });
-        Self::new_with_cache(create_cap, out_cap, cache)
+            .unwrap_or(DEFAULT_RESIDENCY_BYTES);
+        Self::new(byte_cap)
     }
 
-    /// Whether long-lived confirm denserels caching is enabled (env at open).
-    pub fn cache_enabled(&self) -> bool {
-        self.cache_enabled
+    /// Whether residency inserts are enabled (`byte_cap > 0`).
+    pub fn enabled(&self) -> bool {
+        self.inner.lock().unwrap().byte_cap > 0
     }
 
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().by_fk.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn total_outs(&self) -> u64 {
         self.inner.lock().unwrap().total_outs
     }
 
-    /// `(creates, create_cap, total_outs, out_cap)` under one lock (IBD sizes).
-    pub fn size_stats(&self) -> (usize, usize, u64, u64) {
-        let g = self.inner.lock().unwrap();
-        (g.by_fk.len(), g.create_cap, g.total_outs, g.out_cap)
+    pub fn total_bytes(&self) -> u64 {
+        self.inner.lock().unwrap().total_bytes
     }
 
-    /// Insert / update fk→txid (+ optional range). Raw FIFO: new creates only at back.
-    pub fn insert_fk_txid_range(
-        &self,
-        fk: Fk,
-        txid: [u8; 32],
-        body_range: Option<(u64, u64)>,
-    ) {
+    pub fn byte_cap(&self) -> u64 {
+        self.inner.lock().unwrap().byte_cap
+    }
+
+    /// `(creates, total_bytes, byte_cap, total_outs)` under one lock (IBD sizes).
+    pub fn size_stats(&self) -> (usize, u64, u64, u64) {
+        let g = self.inner.lock().unwrap();
+        (g.by_fk.len(), g.total_bytes, g.byte_cap, g.total_outs)
+    }
+
+    /// Insert / update a **complete** pipeline create. Stores `Arc::clone` of `pin`.
+    ///
+    /// Requires `pin.1.len() == pin.2.len()`. No-op when residency disabled or
+    /// null fk. On update of an existing fk: refresh pin/range, **leave FIFO
+    /// order** (no promote).
+    pub fn put_complete(&self, fk: Fk, pin: CreatePin, body_range: Option<(u64, u64)>) {
         let Some(id) = fk.get() else {
             return;
         };
+        let (tx, outs, denserels) = pin.as_ref();
+        if outs.len() != denserels.len() {
+            // Incomplete denserels — refuse (would break pin).
+            return;
+        }
+        let bytes = estimate_pin_bytes(&pin);
+        let n_outs = outs.len() as u64;
+        let txid = tx.txid;
         let mut g = self.inner.lock().unwrap();
+        if g.byte_cap == 0 {
+            return;
+        }
         if let Some(e) = g.by_fk.get_mut(&id) {
+            let old_bytes = e.bytes;
+            let old_outs = e.pin.1.len() as u64;
             e.txid = txid;
+            e.pin = pin;
+            e.bytes = bytes;
             if body_range.is_some() {
                 e.body_range = body_range;
             }
             g.by_txid.insert(txid, id);
+            g.total_bytes = g
+                .total_bytes
+                .saturating_sub(old_bytes)
+                .saturating_add(bytes);
+            g.total_outs = g.total_outs.saturating_sub(old_outs).saturating_add(n_outs);
+            let cap = g.byte_cap;
+            g.evict_until_bytes(cap);
             return;
         }
-        let create_cap = g.create_cap;
-        g.evict_until_creates(create_cap.saturating_sub(1));
+        let cap = g.byte_cap;
+        // Make room for this row.
+        g.evict_until_bytes(cap.saturating_sub(bytes.min(cap)));
         g.by_fk.insert(
             id,
             ResidentCreate {
                 txid,
                 body_range,
-                tx: None,
-                outs: None,
-                denserels: None,
+                pin,
+                bytes,
             },
         );
         g.by_txid.insert(txid, id);
         g.order.push_back(id);
+        g.total_bytes = g.total_bytes.saturating_add(bytes);
+        g.total_outs = g.total_outs.saturating_add(n_outs);
+        // Final clamp if estimate overflowed (single row > cap keeps newest only).
+        g.evict_until_bytes(cap);
     }
 
-    /// Attach outs (pin denserels) — in-place; may slim by out budget.
+    /// Convenience: build pin Arc from owned parts then [`put_complete`].
+    ///
+    /// Prefer `put_complete` with a shared [`CreatePin`] when the caller already
+    /// has an Arc (pipeline create / plan packing).
     pub fn put_outs(
         &self,
         fk: Fk,
@@ -207,50 +225,21 @@ impl CreateResidency {
         denserels: Vec<u32>,
         body_range: Option<(u64, u64)>,
     ) {
+        if outs.len() != denserels.len() {
+            return;
+        }
+        self.put_complete(fk, Arc::new((tx, outs, denserels)), body_range);
+    }
+
+    /// Patch body range on an existing complete row. Never creates a row.
+    pub fn set_body_range(&self, fk: Fk, off: u64, len: u64) {
         let Some(id) = fk.get() else {
             return;
         };
-        let n = outs.len() as u64;
         let mut g = self.inner.lock().unwrap();
         if let Some(e) = g.by_fk.get_mut(&id) {
-            let old_n = e.outs.as_ref().map(|o| o.len() as u64).unwrap_or(0);
-            e.tx = Some(tx);
-            e.outs = Some(outs);
-            e.denserels = Some(denserels);
-            if body_range.is_some() {
-                e.body_range = body_range;
-            }
-            let new_total = g.total_outs.saturating_sub(old_n).saturating_add(n);
-            g.total_outs = new_total;
-            // First time this create gains outs → track for O(1) out slim.
-            if old_n == 0 && n > 0 {
-                g.outs_order.push_back(id);
-            }
-            let cap = g.out_cap;
-            g.evict_until_outs(cap);
-            return;
+            e.body_range = Some((off, len));
         }
-        let create_cap = g.create_cap;
-        let out_cap = g.out_cap;
-        g.evict_until_creates(create_cap.saturating_sub(1));
-        g.evict_until_outs(out_cap.saturating_sub(n));
-        let txid = tx.txid;
-        g.by_fk.insert(
-            id,
-            ResidentCreate {
-                txid,
-                body_range,
-                tx: Some(tx),
-                outs: Some(outs),
-                denserels: Some(denserels),
-            },
-        );
-        g.by_txid.insert(txid, id);
-        g.order.push_back(id);
-        if n > 0 {
-            g.outs_order.push_back(id);
-        }
-        g.total_outs = g.total_outs.saturating_add(n);
     }
 
     pub fn body_ranges_by_fk(&self, fks: &[Fk]) -> Vec<Option<(u64, u64)>> {
@@ -268,13 +257,19 @@ impl CreateResidency {
         g.by_txid.get(txid).map(|&id| Fk(id))
     }
 
-    /// Txid for a create fk (fk-only / range rows and full outs rows).
     pub fn get_txid(&self, fk: Fk) -> Option<[u8; 32]> {
         let id = fk.get()?;
         self.inner.lock().unwrap().by_fk.get(&id).map(|e| e.txid)
     }
 
-    /// Tx meta when outs have been attached (`put_outs`); `None` for fk-only rows.
+    /// Shared pin Arc + body range. Prefer this over deep-cloning outs.
+    pub fn get_pin(&self, fk: Fk) -> Option<(CreatePin, Option<(u64, u64)>)> {
+        let id = fk.get()?;
+        let g = self.inner.lock().unwrap();
+        let e = g.by_fk.get(&id)?;
+        Some((Arc::clone(&e.pin), e.body_range))
+    }
+
     pub fn get_tx(&self, fk: Fk) -> Option<TxRecord> {
         let id = fk.get()?;
         self.inner
@@ -282,21 +277,17 @@ impl CreateResidency {
             .unwrap()
             .by_fk
             .get(&id)
-            .and_then(|e| e.tx.clone())
+            .map(|e| e.pin.0.clone())
     }
 
-    /// Single out by vout when denserels/outs are resident.
     pub fn get_parent_out(&self, fk: Fk, vout: u32) -> Option<(TxRecord, OutputRecord)> {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
         let e = g.by_fk.get(&id)?;
-        let tx = e.tx.as_ref()?;
-        let outs = e.outs.as_ref()?;
-        let o = outs.get(vout as usize)?;
-        Some((tx.clone(), o.clone()))
+        let o = e.pin.1.get(vout as usize)?;
+        Some((e.pin.0.clone(), o.clone()))
     }
 
-    /// True if vout is present on a resident create with outs — no record clone.
     pub fn has_parent_out(&self, fk: Fk, vout: u32) -> bool {
         let Some(id) = fk.get() else {
             return false;
@@ -306,37 +297,30 @@ impl CreateResidency {
             .unwrap()
             .by_fk
             .get(&id)
-            .and_then(|e| e.outs.as_ref())
-            .is_some_and(|outs| (vout as usize) < outs.len())
+            .is_some_and(|e| (vout as usize) < e.pin.1.len())
     }
 
-    pub fn get_outs(&self, fk: Fk) -> Option<(TxRecord, Vec<OutputRecord>, Vec<u32>, Option<(u64, u64)>)> {
-        let id = fk.get()?;
-        let g = self.inner.lock().unwrap();
-        let e = g.by_fk.get(&id)?;
-        let tx = e.tx.clone()?;
-        let outs = e.outs.clone()?;
-        let rels = e.denserels.clone().unwrap_or_default();
-        Some((tx, outs, rels, e.body_range))
+    /// Deep clone of pin contents (tests / legacy). Prefer [`get_pin`].
+    pub fn get_outs(
+        &self,
+        fk: Fk,
+    ) -> Option<(TxRecord, Vec<OutputRecord>, Vec<u32>, Option<(u64, u64)>)> {
+        let (pin, range) = self.get_pin(fk)?;
+        let (tx, outs, rels) = pin.as_ref();
+        Some((tx.clone(), outs.clone(), rels.clone(), range))
     }
 
-    /// True if denserels/outs are resident (no clone). Used by prewarm skip.
+    /// True if a complete pin is resident (always true for any present fk).
     pub fn has_outs(&self, fk: Fk) -> bool {
         let Some(id) = fk.get() else {
             return false;
         };
-        self.inner
-            .lock()
-            .unwrap()
-            .by_fk
-            .get(&id)
-            .is_some_and(|e| e.outs.is_some())
+        self.inner.lock().unwrap().by_fk.contains_key(&id)
     }
 
-    /// Sparse pin hit: clone only `need_vouts` scripts + denserel slots (not full outs).
+    /// Sparse pin hit: clone only `need_vouts` scripts + denserel slots.
     ///
-    /// Returns `None` when row missing, denserels incomplete, or a need vout is OOB.
-    /// Holds the map lock only while copying the sparse projection.
+    /// Prefer [`get_pin`] + index by vout when the caller can hold the Arc.
     pub fn get_parent_needed(
         &self,
         fk: Fk,
@@ -352,9 +336,9 @@ impl CreateResidency {
         let id = fk.get()?;
         let g = self.inner.lock().unwrap();
         let e = g.by_fk.get(&id)?;
-        let tx = e.tx.as_ref()?;
-        let outs = e.outs.as_ref()?;
-        let denserels = e.denserels.as_ref()?;
+        let tx = &e.pin.0;
+        let outs = &e.pin.1;
+        let denserels = &e.pin.2;
         if denserels.is_empty() && !need_vouts.is_empty() {
             return None;
         }
@@ -372,8 +356,9 @@ impl CreateResidency {
         let mut live = Vec::with_capacity(need.len());
         for &v in &need {
             let o = outs.get(v as usize)?;
-            // denserels slot already validated by layout_covers_need
-            let _ = denserels.get(v as usize).filter(|&&r| r != SPENDER_REL_UNKNOWN)?;
+            let _ = denserels
+                .get(v as usize)
+                .filter(|&&r| r != SPENDER_REL_UNKNOWN)?;
             live.push((v, o.clone()));
         }
         Some((tx.clone(), live, sparse, e.body_range))
@@ -381,55 +366,21 @@ impl CreateResidency {
 }
 
 impl Inner {
-    fn evict_until_creates(&mut self, max_creates: usize) {
-        while self.by_fk.len() > max_creates {
+    fn evict_until_bytes(&mut self, max_bytes: u64) {
+        while self.total_bytes > max_bytes {
             if !self.hard_evict_oldest() {
                 break;
             }
         }
     }
 
-    /// Free out budget without discarding prewarm fk/range rows.
-    fn evict_until_outs(&mut self, max_outs: u64) {
-        while self.total_outs > max_outs {
-            if !self.slim_oldest_outs() {
-                // No out-bearing row left but total_outs > max — repair and stop.
-                self.total_outs = 0;
-                self.outs_order.clear();
-                break;
-            }
-        }
-    }
-
-    /// Slim the oldest **out-bearing** create (O(1) amortized via `outs_order`).
-    fn slim_oldest_outs(&mut self) -> bool {
-        while let Some(id) = self.outs_order.pop_front() {
-            let Some(e) = self.by_fk.get_mut(&id) else {
-                // Hard-evicted or never present — skip stale.
-                continue;
-            };
-            let n = e.outs.as_ref().map(|o| o.len() as u64).unwrap_or(0);
-            if n == 0 {
-                // Already slimmed (duplicate push or race) — skip.
-                continue;
-            }
-            e.outs = None;
-            e.denserels = None;
-            e.tx = None;
-            self.total_outs = self.total_outs.saturating_sub(n);
-            return true;
-        }
-        false
-    }
-
-    /// Drop oldest create entirely (create-cap pressure).
+    /// Drop oldest create entirely.
     fn hard_evict_oldest(&mut self) -> bool {
         while let Some(id) = self.order.pop_front() {
             if let Some(e) = self.by_fk.remove(&id) {
                 self.by_txid.remove(&e.txid);
-                let n = e.outs.as_ref().map(|o| o.len() as u64).unwrap_or(0);
-                self.total_outs = self.total_outs.saturating_sub(n);
-                // Leave id in outs_order if present — slim skips missing keys.
+                self.total_bytes = self.total_bytes.saturating_sub(e.bytes);
+                self.total_outs = self.total_outs.saturating_sub(e.pin.1.len() as u64);
                 return true;
             }
         }
@@ -440,7 +391,6 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     fn tx(id: u8) -> TxRecord {
         let mut txid = [0u8; 32];
@@ -456,198 +406,103 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fifo_evicts_oldest_create() {
-        let r = CreateResidency::new(2, 1000);
-        r.insert_fk_txid_range(Fk(1), [1u8; 32], Some((10, 20)));
-        r.insert_fk_txid_range(Fk(2), [2u8; 32], Some((30, 40)));
-        r.insert_fk_txid_range(Fk(3), [3u8; 32], Some((50, 60)));
-        assert_eq!(r.len(), 2);
-        assert!(r.lookup_fk_by_txid(&[1u8; 32]).is_none());
-        assert_eq!(r.lookup_fk_by_txid(&[3u8; 32]), Some(Fk(3)));
-    }
-
-    /// No-cache caps still accept put_outs (in-flight) and FIFO-drop history.
-    #[test]
-    fn no_cache_caps_hold_inflight_evict_history() {
-        let r = CreateResidency::new_with_cache(4, 20, false);
-        assert!(!r.cache_enabled());
-        for i in 1u8..=8 {
-            let mut t = tx(i);
-            t.output_count = 3;
-            let outs: Vec<_> = (0..3)
-                .map(|v| OutputRecord::unspent(v as i64, vec![i, v as u8]))
-                .collect();
-            r.put_outs(Fk(i as u64), t, outs, vec![0, 8, 16], Some((i as u64 * 10, 5)));
-        }
-        // create_cap=4 → only newest 4 creates
-        assert_eq!(r.len(), 4);
-        assert!(r.has_outs(Fk(8)));
-        assert!(r.has_outs(Fk(5)));
-        assert!(!r.has_outs(Fk(1)));
-        // out_cap=20 with 3 outs/create → at most ~6 out-bearing before slim;
-        // create cap already 4 so outs ≤ 12.
-        assert!(r.total_outs() <= 20);
-        assert!(r.total_outs() > 0, "in-flight outs retained under caps");
+    fn pin_with(id: u8, n_outs: usize, script_len: usize) -> CreatePin {
+        let mut t = tx(id);
+        t.output_count = n_outs as u32;
+        let outs: Vec<_> = (0..n_outs)
+            .map(|v| OutputRecord::unspent(v as i64, vec![id; script_len.max(1)]))
+            .collect();
+        let dens: Vec<u32> = (0..n_outs as u32).map(|v| v * 8).collect();
+        Arc::new((t, outs, dens))
     }
 
     #[test]
-    fn confirm_cache_default_is_lean() {
-        // Product default: multi‑GiB denserels history off unless explicitly enabled.
-        // Do not set RBITCOIN_CONFIRM_CACHE in this process for the assertion —
-        // if the agent env has CONFIRM_CACHE=1, skip.
-        if std::env::var_os("RBITCOIN_CONFIRM_CACHE").is_some() {
-            return;
-        }
-        assert!(
-            !confirm_cache_enabled(),
-            "unset RBITCOIN_CONFIRM_CACHE must default to lean denserels"
-        );
-        let r = CreateResidency::from_env();
-        assert!(!r.cache_enabled());
-        let (_n, create_cap, _o, out_cap) = r.size_stats();
-        assert_eq!(create_cap, NO_CACHE_CREATE_CAP);
-        assert_eq!(out_cap, NO_CACHE_OUT_CAP);
+    fn fifo_evicts_oldest_complete_by_bytes() {
+        // Budget holds ~2 pins of this size; third insert evicts oldest.
+        let one = estimate_pin_bytes(&pin_with(1, 2, 64));
+        let r = CreateResidency::new(one.saturating_mul(2) + one / 4);
+        r.put_complete(Fk(1), pin_with(1, 2, 64), Some((10, 20)));
+        r.put_complete(Fk(2), pin_with(2, 2, 64), Some((30, 40)));
+        r.put_complete(Fk(3), pin_with(3, 2, 64), Some((50, 60)));
+        assert!(r.len() <= 2, "len={} bytes={}", r.len(), r.total_bytes());
+        assert!(r.lookup_fk_by_txid(&tx(1).txid).is_none());
+        assert_eq!(r.lookup_fk_by_txid(&tx(3).txid), Some(Fk(3)));
+        assert!(r.has_outs(Fk(3)));
+        assert!(r.get_pin(Fk(3)).is_some());
     }
 
     #[test]
-    fn body_range_and_outs_roundtrip() {
-        let r = CreateResidency::new(100, 1000);
-        let t = tx(9);
-        r.put_outs(
-            Fk(9),
-            t.clone(),
-            vec![OutputRecord::unspent(1, vec![0x51])],
-            vec![8],
-            Some((100, 50)),
-        );
+    fn put_complete_requires_matching_denserels() {
+        let r = CreateResidency::new(DEFAULT_RESIDENCY_BYTES);
+        let t = tx(1);
+        let outs = vec![OutputRecord::unspent(1, vec![0x51])];
+        // denserels len mismatch → refuse
+        r.put_outs(Fk(1), t, outs, vec![], Some((1, 2)));
+        assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn disabled_residency_is_noop() {
+        let r = CreateResidency::new(0);
+        assert!(!r.enabled());
+        r.put_complete(Fk(1), pin_with(1, 1, 8), Some((1, 1)));
+        assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn body_range_and_pin_roundtrip_arc_share() {
+        let r = CreateResidency::new(DEFAULT_RESIDENCY_BYTES);
+        let pin = pin_with(9, 1, 1);
+        r.put_complete(Fk(9), Arc::clone(&pin), Some((100, 50)));
         assert_eq!(r.body_ranges_by_fk(&[Fk(9)]), vec![Some((100, 50))]);
-        let (tx2, outs, rels, range) = r.get_outs(Fk(9)).unwrap();
-        assert_eq!(tx2.txid, t.txid);
-        assert_eq!(outs.len(), 1);
-        assert_eq!(rels, vec![8]);
+        let (got, range) = r.get_pin(Fk(9)).unwrap();
+        assert!(Arc::ptr_eq(&got, &pin), "get_pin must Arc-share resident pin");
         assert_eq!(range, Some((100, 50)));
-    }
-
-    /// Regression: out-cap pressure must not hard-drop prewarm range-only rows.
-    #[test]
-    fn out_pressure_slims_denserels_keeps_prewarm_ranges() {
-        let r = CreateResidency::new(100, 10);
-        for i in 1u8..=20 {
-            let mut txid = [0u8; 32];
-            txid[0] = i;
-            r.insert_fk_txid_range(Fk(i as u64), txid, Some((i as u64 * 100, 50)));
-        }
-        assert_eq!(r.len(), 20);
-        assert_eq!(r.total_outs(), 0);
-
-        for i in 16u8..=20 {
-            let mut t = tx(i);
-            t.output_count = 10;
-            let outs: Vec<_> = (0..10)
-                .map(|v| OutputRecord::unspent(v as i64, vec![i, v as u8]))
-                .collect();
-            let denserels: Vec<u32> = (0..10).map(|v| v * 8).collect();
-            r.put_outs(
-                Fk(i as u64),
-                t,
-                outs,
-                denserels,
-                Some((i as u64 * 100, 50)),
-            );
-        }
-
-        let (creates, _, total_outs, out_cap) = r.size_stats();
-        assert!(
-            total_outs <= out_cap,
-            "outs must respect cap: total={total_outs} cap={out_cap}"
-        );
-        assert_eq!(
-            creates, 20,
-            "out pressure must not drop create count below prewarm fill"
-        );
-        let mut t1 = [0u8; 32];
-        t1[0] = 1;
-        assert_eq!(r.lookup_fk_by_txid(&t1), Some(Fk(1)));
-        assert_eq!(r.body_ranges_by_fk(&[Fk(1)]), vec![Some((100, 50))]);
-        for i in 1u8..=20 {
-            assert!(
-                r.get_txid(Fk(i as u64)).is_some(),
-                "fk {i} range row must survive out slim"
-            );
-            assert_eq!(
-                r.body_ranges_by_fk(&[Fk(i as u64)]),
-                vec![Some((i as u64 * 100, 50))]
-            );
-        }
-    }
-
-    /// Regression: out slim must not scan prewarm size (tip-stall peg).
-    ///
-    /// With 200k range-only + denserels flood under small out_cap, must finish
-    /// quickly. The O(creates) walk would take seconds+.
-    #[test]
-    fn out_slim_is_fast_with_large_prewarm() {
-        const PREWARM: u64 = 200_000;
-        let r = CreateResidency::new(PREWARM as usize + 1000, 100);
-        for i in 1..=PREWARM {
-            let mut txid = [0u8; 32];
-            txid[..8].copy_from_slice(&i.to_le_bytes());
-            r.insert_fk_txid_range(Fk(i), txid, Some((i * 10, 20)));
-        }
-        let t0 = Instant::now();
-        // Flood denserels: each create 50 outs → forces many slims.
-        for i in 0u64..500 {
-            let id = PREWARM + 1 + i;
-            let mut txid = [0u8; 32];
-            txid[..8].copy_from_slice(&id.to_le_bytes());
-            let mut t = tx((i & 0xff) as u8);
-            t.txid = txid;
-            t.output_count = 50;
-            let outs: Vec<_> = (0..50)
-                .map(|v| OutputRecord::unspent(v as i64, vec![v as u8]))
-                .collect();
-            let denserels: Vec<u32> = (0..50).map(|v| v * 4).collect();
-            r.put_outs(Fk(id), t, outs, denserels, Some((id * 10, 20)));
-        }
-        let ms = t0.elapsed().as_millis();
-        assert!(
-            ms < 2_000,
-            "out slim with {PREWARM} prewarm must be O(out-bearing), took {ms}ms"
-        );
-        let (creates, _, total_outs, out_cap) = r.size_stats();
-        assert!(total_outs <= out_cap);
-        // Prewarm still largely present (create_cap not exceeded by much).
-        assert!(creates >= PREWARM as usize, "creates={creates}");
-        // Oldest prewarm range still resolvable.
-        let mut t1 = [0u8; 32];
-        t1[..8].copy_from_slice(&1u64.to_le_bytes());
-        assert_eq!(r.lookup_fk_by_txid(&t1), Some(Fk(1)));
+        r.set_body_range(Fk(9), 200, 60);
+        assert_eq!(r.body_ranges_by_fk(&[Fk(9)]), vec![Some((200, 60))]);
+        // set_body_range does not create rows
+        r.set_body_range(Fk(99), 1, 1);
+        assert!(r.get_pin(Fk(99)).is_none());
     }
 
     #[test]
-    fn create_cap_still_hard_evicts_oldest() {
-        let r = CreateResidency::new(3, 10_000);
-        for i in 1u8..=3 {
-            let mut txid = [0u8; 32];
-            txid[0] = i;
-            r.insert_fk_txid_range(Fk(i as u64), txid, Some((i as u64, 1)));
+    fn update_leaves_fifo_order() {
+        let r = CreateResidency::new(50_000);
+        r.put_complete(Fk(1), pin_with(1, 1, 32), None);
+        r.put_complete(Fk(2), pin_with(2, 1, 32), None);
+        // Update fk1 — must not move to back (still oldest).
+        r.put_complete(Fk(1), pin_with(1, 1, 32), Some((9, 9)));
+        // Force eviction with many large pins.
+        for i in 3u8..=40 {
+            r.put_complete(Fk(i as u64), pin_with(i, 4, 128), None);
         }
-        r.insert_fk_txid_range(
-            Fk(4),
-            {
-                let mut t = [0u8; 32];
-                t[0] = 4;
-                t
-            },
-            Some((4, 1)),
-        );
-        assert_eq!(r.len(), 3);
-        let mut t1 = [0u8; 32];
-        t1[0] = 1;
-        assert!(r.lookup_fk_by_txid(&t1).is_none());
-        let mut t4 = [0u8; 32];
-        t4[0] = 4;
-        assert_eq!(r.lookup_fk_by_txid(&t4), Some(Fk(4)));
+        // fk1 should leave before fk2 if it stayed oldest (may both be gone).
+        // At least complete-only invariant: any present row has outs.
+        for i in 1u8..=40 {
+            if r.lookup_fk_by_txid(&tx(i).txid).is_some() {
+                assert!(r.has_outs(Fk(i as u64)));
+            }
+        }
+    }
+
+    #[test]
+    fn default_budget_is_two_gib() {
+        assert_eq!(DEFAULT_RESIDENCY_BYTES, 2 * 1024 * 1024 * 1024);
+        let r = CreateResidency::new(DEFAULT_RESIDENCY_BYTES);
+        assert!(r.enabled());
+        assert_eq!(r.byte_cap(), DEFAULT_RESIDENCY_BYTES);
+    }
+
+    #[test]
+    fn get_parent_needed_sparse() {
+        let r = CreateResidency::new(DEFAULT_RESIDENCY_BYTES);
+        let pin = pin_with(5, 3, 4);
+        r.put_complete(Fk(5), pin, Some((10, 20)));
+        let (tx, live, sparse, range) = r.get_parent_needed(Fk(5), &[1]).unwrap();
+        assert_eq!(tx.txid[0], 5);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].0, 1);
+        assert_eq!(sparse.len(), 1);
+        assert_eq!(range, Some((10, 20)));
     }
 }

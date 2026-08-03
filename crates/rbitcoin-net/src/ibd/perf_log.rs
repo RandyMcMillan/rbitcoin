@@ -1385,7 +1385,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
             s.arch_batch_stamp,
             s.arch_resolved_stamp,
             s.owned.residency_creates,
-            s.owned.residency_create_cap,
+            s.owned.residency_bytes / (1024 * 1024),
         ));
         // Head resolve probe detail when cold head lookups ran.
         if s.arch_prep_probe_ms > 0
@@ -1495,7 +1495,7 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
 /// `tx.head.*` + fuse8). `locked=` is mlock only (usually 0) — **not** a
 /// filter on what enters RSS.
 ///
-/// Create pin occupancy is **`residency creates=/outs=`** only.
+/// Create pin occupancy is **`residency creates=/bytes=`** only (complete rows).
 pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
     let w = &s.work;
     let b = &w.body;
@@ -1512,13 +1512,15 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         0
     };
     let bq_mib = s.bq_bytes / (1024 * 1024);
+    let res_mib = o.residency_bytes / (1024 * 1024);
+    let res_cap_mib = o.residency_byte_cap / (1024 * 1024);
     format!(
         "ibd: sizes rss={}MiB anon={}MiB file={}MiB({}%) hwm={}MiB locked={}MiB \
          | work ordered={}/set={} hash_h={} h2h={} hdr_fk={} known_hdr={} inflight={}/peer={} cooldown={} \
          | body known={} pend={} miss={} rej={} \
          | body_soft q={}/{}MiB budget={}MiB \
          | bq n={} disk={}MiB soft={}/{} \
-         | residency creates={}/{} outs={}/{} conf_plans={} cache={} \
+         | residency creates={} bytes={}MiB/{}MiB outs={} conf_plans={} \
          | conf planq={}/{} blks={} prepq={}/{} blks={} wire={}MiB parents={} writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
          | txhead bits={} entry={}B slots={} occ={} body={}MiB segs={} sealed={} class_a={} \
@@ -1550,11 +1552,10 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         s.bq_count,
         s.bq_soft_stop,
         o.residency_creates,
-        o.residency_create_cap,
+        res_mib,
+        res_cap_mib,
         o.residency_outs,
-        o.residency_out_cap,
         o.conf_plans,
-        if o.confirm_cache { "on" } else { "off" },
         cp.plan_batches,
         s.conf_plan_q_cap,
         cp.plan_blocks,
@@ -1870,10 +1871,10 @@ mod tests {
         s.work.ordered = 100;
         s.work.ordered_set = 90;
         s.work.body.pending = 5;
-                s.owned.residency_creates = 80;
-        s.owned.residency_create_cap = 8_000_000;
+        s.owned.residency_creates = 80;
+        s.owned.residency_bytes = 400 * 1024 * 1024;
+        s.owned.residency_byte_cap = 2 * 1024 * 1024 * 1024;
         s.owned.residency_outs = 900;
-        s.owned.residency_out_cap = 16_777_216;
         s.bq_count = 4;
         s.bq_bytes = 32 * 1024 * 1024;
         s.bq_soft_stop = 256;
@@ -1911,11 +1912,11 @@ mod tests {
             line.contains("bq n=4 disk=32MiB soft=4/256"),
             "{line}"
         );
-        assert!(line.contains("residency creates=80/8000000 outs=900/16777216"), "{line}");
         assert!(
-            line.contains("cache=off") || line.contains("cache=on"),
-            "sizes must report confirm cache: {line}"
+            line.contains("residency creates=80 bytes=400MiB/2048MiB outs=900"),
+            "{line}"
         );
+        assert!(!line.contains("cache="), "{line}");
         assert!(!line.contains("outfifo"), "{line}");
         assert!(!line.contains("sticky_fk="), "{line}");
         assert!(line.contains("prepq=2/5 blks=40 wire=12MiB parents=500"), "{line}");
@@ -1933,12 +1934,15 @@ mod tests {
         let mut s = IbdPerfSample::default();
         s.rss_kb = 1024;
         s.owned.residency_creates = 10;
-        s.owned.residency_create_cap = 100;
+        s.owned.residency_bytes = 50 * 1024 * 1024;
+        s.owned.residency_byte_cap = 2 * 1024 * 1024 * 1024;
         s.owned.residency_outs = 20;
-        s.owned.residency_out_cap = 200;
         let line = format_sizes(&s);
-        assert!(line.contains("residency creates=10/100 outs=20/200"), "{line}");
-        assert!(line.contains("cache="), "{line}");
+        assert!(
+            line.contains("residency creates=10 bytes=50MiB/2048MiB outs=20"),
+            "{line}"
+        );
+        assert!(!line.contains("cache="), "{line}");
         assert!(!line.contains("outfifo"), "{line}");
         assert!(!line.contains("sticky_fk="), "{line}");
     }

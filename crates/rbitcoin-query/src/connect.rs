@@ -64,6 +64,20 @@ impl Query {
         &self,
         items: &[ConfirmPrepared],
     ) -> Result<Vec<Fk>, QueryError> {
+        self.confirm_blocks_run_with_create_pins(items, None)
+    }
+
+    /// Like [`Self::confirm_blocks_run`], with optional write-batch create pins.
+    ///
+    /// `create_pins` is `create_fk → CreatePin` for creates committed on this write
+    /// path. SH collect prefers pin outs (no residency / Class A body re-read) —
+    /// critical for RES=0 IBD where residency is empty but pins already rode the
+    /// plan through Class A.
+    pub fn confirm_blocks_run_with_create_pins(
+        &self,
+        items: &[ConfirmPrepared],
+        create_pins: Option<&std::collections::HashMap<Fk, CreatePin>>,
+    ) -> Result<Vec<Fk>, QueryError> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
@@ -187,11 +201,12 @@ impl Query {
                 let mut sh_creates: Vec<ScriptHashRecord> = Vec::new();
                 // Rough upper bound: a few outputs per new tx (grows as needed).
                 sh_creates.reserve(sh_new_txs.len().saturating_mul(2));
-                // Use Class A by **create fk** (wave already filled outs). Never
-                // resolve via txid — catch-up has no durable head and tx_run.lookup
-                // walks sorted runs per tx (signet multi-second SH collect).
+                // Prefer write-batch CreatePin outs (same Class A commit) → residency
+                // → cold store. Never resolve via txid — catch-up has no durable head
+                // and tx_run.lookup walks sorted runs per tx.
                 for &tx_id in &sh_new_txs {
-                    self.collect_scripthash_creates(Fk(tx_id), &mut sh_creates)?;
+                    let pin = create_pins.and_then(|m| m.get(&Fk(tx_id)));
+                    self.collect_scripthash_creates(Fk(tx_id), &mut sh_creates, pin)?;
                 }
                 add_sh_part(
                     &sh_stats::SH_COLLECT_NS,
@@ -325,30 +340,47 @@ impl Query {
 
     /// Collect thin scripthash create pointers for one tx's outputs (no spend marks).
     ///
-    /// Prefer parent cache `by_body` outs (no Class A re-decode). Store
-    /// full decode is last resort — write was spending multi-second SH collect
-    /// re-reading bodies that scripts already held in RAM.
+    /// Source order (first hit wins):
+    /// 1. **Write-batch CreatePin** — outs already on the confirm write path
+    /// 2. **CreateResidency** — sole hot map (residency budget on)
+    /// 3. **Cold store** — Class A body pread/decode (last resort)
+    ///
+    /// RES=0 IBD must hit (1) for same-batch creates or SH collect re-reads every
+    /// body. `write_pin` is the pin Arc for this `tx_fk` when the write path has it.
     pub(crate) fn collect_scripthash_creates(
         &self,
         tx_fk: Fk,
         out: &mut Vec<ScriptHashRecord>,
+        write_pin: Option<&CreatePin>,
     ) -> Result<(), QueryError> {
+        use std::sync::atomic::Ordering;
+        if let Some(pin) = write_pin {
+            let (_tx, outputs, _rels) = pin.as_ref();
+            for o in outputs.iter() {
+                out.push(ScriptHashRecord::from_fk(script_hash(&o.script), tx_fk));
+            }
+            crate::class_c_phase_stats::SH_COLLECT_PIN.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
         // Prefer CreateResidency outs (sole hot map).
         if let Some((_tx, outputs, _rels, _range)) = self.create_residency.get_outs(tx_fk) {
             for o in outputs.iter() {
                 out.push(ScriptHashRecord::from_fk(script_hash(&o.script), tx_fk));
             }
+            crate::class_c_phase_stats::SH_COLLECT_RES.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         // Cold store: create_fk → tx.idx → body.
         let tx = self.get_tx_class_a(tx_fk)?;
         if tx.output_count == 0 {
+            crate::class_c_phase_stats::SH_COLLECT_COLD.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         let outputs = self.tx_output_run_class_a(tx_fk, &tx)?;
         for o in outputs.iter() {
             out.push(ScriptHashRecord::from_fk(script_hash(&o.script), tx_fk));
         }
+        crate::class_c_phase_stats::SH_COLLECT_COLD.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 

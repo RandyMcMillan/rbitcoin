@@ -153,7 +153,7 @@ impl Query {
                     continue;
                 }
                 n_txs = n_txs.saturating_add(1);
-                self.collect_scripthash_creates(Fk(fk), &mut creates)?;
+                self.collect_scripthash_creates(Fk(fk), &mut creates, None)?;
             }
         }
         if creates.is_empty() {

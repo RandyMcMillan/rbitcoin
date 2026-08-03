@@ -189,6 +189,10 @@ pub(crate) struct IbdPerfSample {
     pub sh_seed_ms: u64,
     pub sh_body_ms: u64,
     pub sh_head_ms: u64,
+    /// SH collect create sources: write-pin / residency / cold Class A body.
+    pub sh_collect_pin: u64,
+    pub sh_collect_res: u64,
+    pub sh_collect_cold: u64,
 
     // Parent cache / confirm-load
     pub load_win_ms: u64,
@@ -460,6 +464,9 @@ impl Default for IbdPerfSample {
             sh_seed_ms: 0,
             sh_body_ms: 0,
             sh_head_ms: 0,
+            sh_collect_pin: 0,
+            sh_collect_res: 0,
+            sh_collect_cold: 0,
             load_win_ms: 0,
             load_blocks: 0,
             load_utxo_parents: 0,
@@ -777,6 +784,8 @@ pub(crate) fn sample(
         rbitcoin_consensus::confirm_phase_stats::sample_prep_residual_and_reset();
     let (sh_filter, sh_collect, sh_sort, sh_seed, sh_body, sh_head) =
         rbitcoin_query::class_c_phase_stats::sample_sh_sub_and_reset();
+    let (sh_collect_pin, sh_collect_res, sh_collect_cold) =
+        rbitcoin_query::class_c_phase_stats::sample_sh_collect_src_and_reset();
     let (wf_body_store, wf_store_body_ns) =
         rbitcoin_query::wave_fill_stats::sample_store_and_reset();
     // Drain connect prevout counters (not displayed; avoid unbounded growth).
@@ -903,6 +912,9 @@ pub(crate) fn sample(
         sh_seed_ms: ns_ms(sh_seed),
         sh_body_ms: ns_ms(sh_body),
         sh_head_ms: ns_ms(sh_head),
+        sh_collect_pin,
+        sh_collect_res,
+        sh_collect_cold,
         load_win_ms: ns_ms(pw.ns),
         load_blocks: pw.blocks,
         load_utxo_parents: pw.utxo_parents,
@@ -1485,6 +1497,12 @@ pub(crate) fn format_debug(s: &IbdPerfSample) -> String {
     append_nz(&mut out, "seed", s.sh_seed_ms);
     append_nz(&mut out, "body", s.sh_body_ms);
     append_nz(&mut out, "head", s.sh_head_ms);
+    if s.sh_collect_pin > 0 || s.sh_collect_res > 0 || s.sh_collect_cold > 0 {
+        out.push_str(&format!(
+            " sh_src pin={} res={} cold={}",
+            s.sh_collect_pin, s.sh_collect_res, s.sh_collect_cold
+        ));
+    }
 
     let conf_q = super::confirm::format_conf_q(
         s.conf_plan_q,

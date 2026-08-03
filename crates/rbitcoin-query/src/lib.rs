@@ -607,6 +607,13 @@ pub mod class_c_phase_stats {
     /// SH: `scripthash.head` insert_many (tip append path).
     pub static SH_HEAD_NS: AtomicU64 = AtomicU64::new(0);
 
+    /// SH collect source: write-batch CreatePin outs (no residency / store).
+    pub static SH_COLLECT_PIN: AtomicU64 = AtomicU64::new(0);
+    /// SH collect source: CreateResidency outs.
+    pub static SH_COLLECT_RES: AtomicU64 = AtomicU64::new(0);
+    /// SH collect source: cold Class A body load.
+    pub static SH_COLLECT_COLD: AtomicU64 = AtomicU64::new(0);
+
     /// `(strong, scripthash, tip)` nanoseconds.
     ///
     /// `scripthash` is the **sum of SH substeps** (not a separate end-to-end
@@ -629,6 +636,15 @@ pub mod class_c_phase_stats {
             SH_SEED_NS.swap(0, Ordering::Relaxed),
             SH_BODY_NS.swap(0, Ordering::Relaxed),
             SH_HEAD_NS.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    /// `(pin, residency, cold)` create counts for SH collect sources, then reset.
+    pub fn sample_sh_collect_src_and_reset() -> (u64, u64, u64) {
+        (
+            SH_COLLECT_PIN.swap(0, Ordering::Relaxed),
+            SH_COLLECT_RES.swap(0, Ordering::Relaxed),
+            SH_COLLECT_COLD.swap(0, Ordering::Relaxed),
         )
     }
 
@@ -1676,6 +1692,7 @@ mod tests {
         assert!(sh >= 5);
         assert_eq!(tip, 3);
         let _ = class_c_phase_stats::sample_sh_sub_and_reset();
+        let _ = class_c_phase_stats::sample_sh_collect_src_and_reset();
 
         connect_prevout_stats::WAVE_HIT.store(1, AtomicOrdering::Relaxed);
         connect_prevout_stats::CLASS_A_HIT.store(2, AtomicOrdering::Relaxed);
@@ -2439,6 +2456,69 @@ mod tests {
         let _ = bp;
 
         let _ = parent_txid;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W-SH.A: write-batch CreatePin supplies outs for SH collect without Class A
+    /// body re-read (RES=0 / empty residency / missing store row still succeeds).
+    #[test]
+    fn sh_collect_write_pin_skips_store_and_residency() {
+        use std::sync::Arc;
+
+        let _g = TEST_RESIDENCY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("RBITCOIN_RESIDENCY_BYTES");
+        std::env::set_var("RBITCOIN_RESIDENCY_BYTES", "0");
+        let (dir, q) = temp_query("sh-collect-pin");
+        match prev {
+            Some(v) => std::env::set_var("RBITCOIN_RESIDENCY_BYTES", v),
+            None => std::env::remove_var("RBITCOIN_RESIDENCY_BYTES"),
+        }
+        assert!(
+            !q.create_residency().enabled(),
+            "RES=0 must disable residency"
+        );
+
+        let _ = class_c_phase_stats::sample_sh_collect_src_and_reset();
+
+        let script = vec![0x51, 0xaa, 0xbb];
+        let expected_sh = script_hash(&script);
+        let fk = Fk(9_876_543);
+        let pin: CreatePin = Arc::new((
+            TxRecord {
+                txid: [0xce; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![OutputRecord::unspent(42, script)],
+            vec![0],
+        ));
+
+        let mut recs = Vec::new();
+        q.collect_scripthash_creates(fk, &mut recs, Some(&pin))
+            .expect("pin path must not touch store");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].create_tx_fk, fk);
+        assert_eq!(recs[0].scripthash, expected_sh);
+
+        let (pin_n, res_n, cold_n) = class_c_phase_stats::sample_sh_collect_src_and_reset();
+        assert_eq!(pin_n, 1, "pin hit");
+        assert_eq!(res_n, 0);
+        assert_eq!(cold_n, 0);
+
+        // Without pin and without store row → cold path errors (NotFound).
+        let mut recs2 = Vec::new();
+        assert!(
+            q.collect_scripthash_creates(fk, &mut recs2, None).is_err(),
+            "no pin + no store must not invent records"
+        );
+        assert!(recs2.is_empty());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

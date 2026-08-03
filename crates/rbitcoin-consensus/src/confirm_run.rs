@@ -2006,6 +2006,10 @@ pub fn confirm_write_phase(
     let t_wall = Instant::now();
 
     // Single commit era: durable Class A for this batch before spentness RMW.
+    // Keep create pins for SH collect (Class C) — same Arcs as layout fill; avoid
+    // re-preading Class A bodies under RES=0 when residency is empty.
+    let mut write_create_pins: HashMap<rbitcoin_primitives::Fk, rbitcoin_query::CreatePin> =
+        HashMap::new();
     let mut class_a_ns = 0u64;
     let mut ensure_ns = 0u64;
     if let Some(plan) = batch.archive_plan.take() {
@@ -2023,6 +2027,10 @@ pub fn confirm_write_phase(
                     .map(|(pin, _)| std::sync::Arc::clone(pin))
                     .collect()
             };
+            write_create_pins.reserve(planned_fks.len());
+            for (fk, pin) in planned_fks.iter().zip(pins.iter()) {
+                write_create_pins.insert(*fk, std::sync::Arc::clone(pin));
+            }
             let t_ca = Instant::now();
             query
                 .archive_commit_plan(plan)
@@ -2074,7 +2082,7 @@ pub fn confirm_write_phase(
 
     let n_blocks = batch.prepared.len();
     let t_cc = Instant::now();
-    let out = class_c_commit(query, &mut batch.prepared)?;
+    let out = class_c_commit(query, &mut batch.prepared, &write_create_pins)?;
     let class_c_ns = t_cc.elapsed().as_nanos() as u64;
 
     let (spend_ann_ns, tip_gc_ns) =
@@ -3963,6 +3971,7 @@ fn script_wave(
 fn class_c_commit(
     query: &Query,
     prepared: &mut [Prepared],
+    write_create_pins: &HashMap<rbitcoin_primitives::Fk, rbitcoin_query::CreatePin>,
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConsensusError> {
     let t_class_c = Instant::now();
     let items: Vec<rbitcoin_query::ConfirmPrepared> = prepared
@@ -3973,8 +3982,13 @@ fn class_c_commit(
             tx_fks: std::mem::take(&mut p.tx_fks),
         })
         .collect();
+    let pins = if write_create_pins.is_empty() {
+        None
+    } else {
+        Some(write_create_pins)
+    };
     let out = query
-        .confirm_blocks_run(&items)
+        .confirm_blocks_run_with_create_pins(&items, pins)
         .map_err(ConsensusError::Store)?;
     confirm_phase_stats::CLASS_C_NS
         .fetch_add(t_class_c.elapsed().as_nanos() as u64, Ordering::Relaxed);

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Build portable static (musl) rbitcoin-node + rbitcoin-cli via the pinned Nix path.
+# Day-to-day / post-edit install path (single nix build). For byte-identity
+# gates use ./scripts/repro-check.sh (two forced --rebuilds; release only).
 # Usage:
 #   ./scripts/repro-build.sh                 # musl static → ./result
 #   ./scripts/repro-build.sh musl            # same

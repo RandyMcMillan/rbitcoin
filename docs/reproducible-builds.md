@@ -16,11 +16,27 @@ pinned flake (or `default.nix` + `flake.lock`) musl package.
 | Input | Mechanism |
 |-------|-----------|
 | nixpkgs (rustc, cargo, musl, linker, …) | `flake.lock` → `nixpkgs` rev + `narHash` |
+| crane (layered cargo builder) | `flake.lock` → `crane` rev + `narHash` |
 | Rust crate graph | `Cargo.lock` (crates.io checksums) |
-| Source tree | Flake `self` filtered via `lib.cleanSourceWith` in `nix/rbitcoin.nix` |
+| Source tree | Flake `self` filtered via cargo-aware `cleanSourceWith` in `nix/rbitcoin.nix` |
 
 Release builds set remapped path prefixes and strip symbols so digests do not
 depend on the builder’s checkout path or username.
+
+### Crane layers (build speed)
+
+`nix/rbitcoin.nix` uses **crane**:
+
+1. **`buildDepsOnly` → `cargoArtifacts`** — registry/git deps (and build scripts).
+   Invalidates when the **lock/graph** changes, not on every `.rs` edit.
+2. **`buildPackage`** — workspace crates (`rbitcoin-node`, `rbitcoin-cli`,
+   `rbitcoin-store`) linked against that artifact set.
+
+Day-to-day: one `nix build .#rbitcoin-musl` (or `./scripts/repro-build.sh`).
+After the deps layer is in the store, app-only changes rebuild far less.
+
+**Byte-identity gate** (`./scripts/repro-check.sh`) still forces two clean
+`--rebuild`s — use it for release verification, not every commit.
 
 ## Requirements
 
@@ -124,12 +140,12 @@ Identical store paths after two pure builds are also fine; always hash the
 
 | Path | Role |
 |------|------|
-| `flake.nix` / `flake.lock` | Pinned inputs + package outputs (`default` = musl) |
-| `nix/rbitcoin.nix` | `buildRustPackage` for node + CLI |
-| `default.nix` | Non-flake attrset using the same pin |
-| `shell.nix` | Dev shell from the same pin |
-| `scripts/repro-build.sh` | One-shot build + print digests (default: musl) |
-| `scripts/repro-check.sh` | Double clean build gate (default: musl) |
+| `flake.nix` / `flake.lock` | Pinned inputs (nixpkgs + crane) + package outputs (`default` = musl) |
+| `nix/rbitcoin.nix` | Crane `buildDepsOnly` + `buildPackage` for node + CLI (+ store utils) |
+| `default.nix` | Non-flake attrset using the same pins |
+| `shell.nix` | Dev shell from the same nixpkgs pin |
+| `scripts/repro-build.sh` | **Day-to-day** one-shot musl build + digests |
+| `scripts/repro-check.sh` | **Release-only** double clean rebuild gate |
 
 ## Non-goals
 

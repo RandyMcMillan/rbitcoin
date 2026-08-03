@@ -40,7 +40,7 @@ Whenever a turn **changes code** (or you finish a multi-step coding task in that
    `./target/release/rbitcoin-node` matches the tree. This is **mandatory every
    code-changing turn** — not optional after tests.
 
-### Required recipe (only this)
+### Required recipe (only this — single `nix build`)
 
 ```bash
 nix build .#rbitcoin-musl --out-link result
@@ -48,6 +48,21 @@ mkdir -p target/release
 install -m 755 result/bin/rbitcoin-node result/bin/rbitcoin-cli target/release/
 file target/release/rbitcoin-node   # must say "statically linked" (musl)
 ```
+
+Musl builds use **crane** (deps derivation + app derivation). After the first
+full deps build, **crate-only edits** recompile workspace crates against a
+cached `cargoArtifacts` layer — still one `nix build`, not a host `cargo
+build --release`.
+
+### Do **not** run for day-to-day agent turns
+
+| Command | When |
+|---------|------|
+| `./scripts/repro-check.sh` | **Release / digest gate only** — realize + **two** forced `--rebuild`s. Slow by design. Never as the post-edit install step. |
+| `./scripts/repro-check.sh both` | Even heavier (musl + glibc). Release only. |
+
+Day-to-day portable install = **one** `nix build .#rbitcoin-musl` (recipe above).
+Byte-identity claims for a revision = `./scripts/repro-check.sh` once at release.
 
 ### Forbidden for the operator binary
 

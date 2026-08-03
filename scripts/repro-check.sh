@@ -2,6 +2,9 @@
 # Two independent clean *rebuilds* of the same revision; fail if digests diverge
 # or if Nix does not re-execute the builder (cache-hit theater).
 #
+# **Release / digest gate only** — not the day-to-day install path. After ordinary
+# code edits use `./scripts/repro-build.sh` or `nix build .#rbitcoin-musl` once.
+#
 # Usage:
 #   ./scripts/repro-check.sh              # musl static only (primary / default)
 #   ./scripts/repro-check.sh both         # musl + optional glibc

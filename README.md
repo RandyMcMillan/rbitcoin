@@ -70,7 +70,8 @@ Not NixOS-specific — any machine with [Nix](https://nixos.org/download/) + fla
 nix build .#rbitcoin-musl          # default package; fully static
 # or: ./scripts/repro-build.sh
 install -m 755 result/bin/rbitcoin-node result/bin/rbitcoin-cli target/release/
-./scripts/repro-check.sh           # two clean rebuilds; compare SHA-256
+./scripts/repro-build.sh           # day-to-day musl install (crane-layered)
+./scripts/repro-check.sh           # release only: two clean rebuilds; compare digests
 ```
 
 Do **not** use `cargo build --release` inside `nix-shell` / `nix develop` as the

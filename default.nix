@@ -1,4 +1,4 @@
-# Non-flake entry that still uses the **pinned** nixpkgs from flake.lock.
+# Non-flake entry that still uses the **pinned** nixpkgs (+ crane) from flake.lock.
 # Requires network once to fetch the pinned tarball if not already in the store.
 #
 #   nix-build -A rbitcoin-musl   # portable static (preferred / default attr name)
@@ -9,14 +9,28 @@
 let
   lock = builtins.fromJSON (builtins.readFile ./flake.lock);
   nixpkgsEntry = lock.nodes.nixpkgs.locked;
-  nixpkgs = import (
-    fetchTarball {
-      url = "https://github.com/NixOS/nixpkgs/archive/${nixpkgsEntry.rev}.tar.gz";
-      sha256 = nixpkgsEntry.narHash;
-    }
-  ) { };
-  rbitcoin-musl = nixpkgs.pkgsStatic.callPackage ./nix/rbitcoin.nix { };
-  rbitcoin-glibc = nixpkgs.callPackage ./nix/rbitcoin.nix { };
+  craneEntry = lock.nodes.crane.locked;
+  nixpkgsSrc = fetchTarball {
+    url = "https://github.com/NixOS/nixpkgs/archive/${nixpkgsEntry.rev}.tar.gz";
+    sha256 = nixpkgsEntry.narHash;
+  };
+  craneSrc = fetchTarball {
+    url = "https://github.com/ipetkov/crane/archive/${craneEntry.rev}.tar.gz";
+    sha256 = craneEntry.narHash;
+  };
+  nixpkgs = import nixpkgsSrc { };
+
+  # Crane default.nix: `{ pkgs }: pkgs.callPackage ./lib { }` → lib with buildPackage etc.
+  craneMkLib = pkgs: import craneSrc { inherit pkgs; };
+
+  mk =
+    pkgs:
+    pkgs.callPackage ./nix/rbitcoin.nix {
+      craneLib = craneMkLib pkgs;
+    };
+
+  rbitcoin-musl = mk nixpkgs.pkgsStatic;
+  rbitcoin-glibc = mk nixpkgs;
 in
 {
   # Primary / portable static.
@@ -28,16 +42,11 @@ in
   rbitcoin-glibc = rbitcoin-glibc;
   rbitcoin-aarch64 =
     let
-      pkgsCross = import (
-        fetchTarball {
-          url = "https://github.com/NixOS/nixpkgs/archive/${nixpkgsEntry.rev}.tar.gz";
-          sha256 = nixpkgsEntry.narHash;
-        }
-      ) {
+      pkgsCross = import nixpkgsSrc {
         crossSystem = {
           config = "aarch64-unknown-linux-gnu";
         };
       };
     in
-    pkgsCross.callPackage ./nix/rbitcoin.nix { };
+    mk pkgsCross;
 }

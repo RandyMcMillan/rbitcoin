@@ -3,9 +3,13 @@
 
   # Pin advanced via flake.lock (nix flake lock). Do not use import <nixpkgs> {}.
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
+  # Layered cargo builds: deps derivation + app derivation (faster rebuilds).
+  # Pin a crane that works with nixos-24.11 rustc (1.82). Latest crane wants
+  # nixpkgs ≥26.05 and pulls edition2024 crates into crane-utils.
+  inputs.crane.url = "github:ipetkov/crane/v0.20.1";
 
   outputs =
-    { self, nixpkgs }:
+    { self, nixpkgs, crane }:
     let
       # Systems we expose packages for (native builds when host matches).
       systems = [
@@ -13,6 +17,12 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+
+      mkRbitcoin =
+        pkgs:
+        pkgs.callPackage ./nix/rbitcoin.nix {
+          craneLib = crane.mkLib pkgs;
+        };
     in
     {
       packages = forAllSystems (
@@ -25,9 +35,9 @@
             overlays = [ ];
           };
           # Optional dynamic glibc package (Nix-store linked; not portable off-store).
-          rbitcoin-glibc = pkgs.callPackage ./nix/rbitcoin.nix { };
+          rbitcoin-glibc = mkRbitcoin pkgs;
           # Primary / default: fully static musl — portable operator binary.
-          rbitcoin-musl = pkgs.pkgsStatic.callPackage ./nix/rbitcoin.nix { };
+          rbitcoin-musl = mkRbitcoin pkgs.pkgsStatic;
         in
         {
           default = rbitcoin-musl;
@@ -51,7 +61,7 @@
                 overlays = [ ];
               };
             in
-            pkgsAarch64.callPackage ./nix/rbitcoin.nix { };
+            mkRbitcoin pkgsAarch64;
         }
       );
 

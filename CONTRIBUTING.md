@@ -39,7 +39,8 @@ pinned **musl static** flake package and the double-build check:
 
 ```bash
 nix build .#rbitcoin-musl
-./scripts/repro-check.sh          # two clean musl rebuilds; compare SHA-256
+./scripts/repro-build.sh          # day-to-day one musl build (crane deps + app)
+./scripts/repro-check.sh          # release only: two clean --rebuilds; compare SHA-256
 ```
 
 See [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).

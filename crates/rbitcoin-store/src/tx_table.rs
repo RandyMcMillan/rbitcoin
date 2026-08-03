@@ -1456,11 +1456,12 @@ impl TxTable {
     /// Batch head resolve for plan stamp: **txid → (create_fk, body_range)**.
     ///
     /// Short-circuit of the Shape A denserels machine
-    /// ([`crate::head_resolve_denserels::resolve_fk_and_range_batch`]): same
-    /// probe + depth-round Prefix33 pipeline, **stops before denserels body**.
-    /// Prep denserels-loads via known `body_range` (skip `tx.idx`).
+    /// ([`crate::head_resolve_denserels::resolve_fk_and_range_batch`]): probe →
+    /// **per-key depth-first** sidefile identity (io_uring when available) → idx
+    /// range on hit. **No** cross-key depth-round batching. Prep denserels-loads
+    /// via known `body_range` (skip `tx.idx`).
     ///
-    /// BIP30: deepest matching body wins.
+    /// BIP30: deepest matching create wins (probe order deepest-first).
     /// Timers: [`crate::head_resolve_stats`] probe / idx / body.
     pub fn get_fk_by_txid_batch(
         &self,

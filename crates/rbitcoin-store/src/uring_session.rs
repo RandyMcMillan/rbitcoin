@@ -279,25 +279,27 @@ pub fn test_take_last_sqe_rw_flags() -> Vec<i32> {
     LAST_SQE_RW_FLAGS.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
+/// Pack `(kind, slot)` into `user_data` (high 2 bits = kind).
+///
+/// Used by multi-stage io_uring machines (head resolve, spend annotate).
+#[inline]
+pub fn pack_ud(kind: u64, slot: u32) -> u64 {
+    const KIND_SHIFT: u64 = 62;
+    (kind << KIND_SHIFT) | (slot as u64 & ((1u64 << KIND_SHIFT) - 1))
+}
+
+/// Unpack [`pack_ud`].
+#[inline]
+pub fn unpack_ud(ud: u64) -> (u64, u32) {
+    const KIND_SHIFT: u64 = 62;
+    let kind = ud >> KIND_SHIFT;
+    let slot = (ud & ((1u64 << KIND_SHIFT) - 1)) as u32;
+    (kind, slot)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Pack `(kind, slot)` into `user_data` (high 2 bits = kind).
-    #[inline]
-    fn pack_ud(kind: u64, slot: u32) -> u64 {
-        const KIND_SHIFT: u64 = 62;
-        (kind << KIND_SHIFT) | (slot as u64 & ((1u64 << KIND_SHIFT) - 1))
-    }
-
-    /// Unpack [`pack_ud`].
-    #[inline]
-    fn unpack_ud(ud: u64) -> (u64, u32) {
-        const KIND_SHIFT: u64 = 62;
-        let kind = ud >> KIND_SHIFT;
-        let slot = (ud & ((1u64 << KIND_SHIFT) - 1)) as u32;
-        (kind, slot)
-    }
 
     #[test]
     fn pack_unpack_roundtrip() {

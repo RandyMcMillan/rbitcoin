@@ -1142,10 +1142,9 @@ mod tests {
         assert_eq!(m2.txid, [10u8; 32]);
         assert_eq!(prevs.len(), 1);
         let (off, len) = s.tx_body_range(create_fk).unwrap();
-        assert_eq!(
-            s.get_tx_full_at(off, len).unwrap().0.txid,
-            [10u8; 32]
-        );
+        // Body alone has zero txid; identity is sidefile / get_tx_full.
+        assert_eq!(s.get_tx_full_at(off, len).unwrap().0.txid, [0u8; 32]);
+        assert_eq!(s.get_tx_full(create_fk).unwrap().0.txid, [10u8; 32]);
         assert_eq!(
             s.get_tx_meta_and_prevouts_at(off, len)
                 .unwrap()

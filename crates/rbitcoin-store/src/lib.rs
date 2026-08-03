@@ -36,11 +36,18 @@ mod sorted_run;
 mod store;
 mod tx_idx;
 mod tx_table;
+mod txid_body;
+mod dontcache_policy;
 mod var_table;
 
 pub use epoch::ArchiveEpoch;
 pub use error::StoreError;
 pub use tx_table::HeadResizeSizeSnapshot;
+pub use txid_body::{
+    TxidBody, TXID_BODY_HEADER, TXID_DONTCACHE_FROM_TAIL, TXID_ENTRY_LEN,
+};
+pub use dontcache_policy::{body_always as dontcache_body, head_or_idx_segment, txid_sidefile_entry};
+pub use uring_session::RWF_DONTCACHE;
 pub use file::{
     ensure_nofile_budget, ensure_nofile_budget_at_least, TableAccess, NOFILE_SOFT_TARGET,
 };

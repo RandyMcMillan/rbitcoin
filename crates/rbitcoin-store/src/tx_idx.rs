@@ -157,31 +157,6 @@ impl TxIdx {
             .min(HARD_SPAN)
     }
 
-    /// Plan a single OS-page pread covering the idx slot for 1-based `id`.
-    pub fn page_plan_for_id(&self, id: u64) -> Result<IdxPagePlan, StoreError> {
-        if id == 0 {
-            return Err(StoreError::NotFound);
-        }
-        let segs = self.segments_snapshot();
-        let si = find_segment_index(&segs, id).ok_or(StoreError::NotFound)?;
-        let seg = &segs[si];
-        let slot = id - seg.first_fk;
-        if slot >= seg.count {
-            return Err(StoreError::NotFound);
-        }
-        let page_off = align_down(slot_file_off(slot), IDX_OS_PAGE);
-        let file_end = seg.file.logical_len();
-        let page_len = (IDX_OS_PAGE as usize).min(file_end.saturating_sub(page_off) as usize);
-        if page_len < 4 {
-            return Err(StoreError::Corrupt("tx.idx page short"));
-        }
-        Ok(IdxPagePlan {
-            fd: seg.file.read_fd(),
-            page_off,
-            page_len,
-        })
-    }
-
     /// Absolute body start for 1-based `id` (must be ≤ published count).
     pub fn record_start(&self, id: u64) -> Result<u64, StoreError> {
         if id == 0 {
@@ -440,6 +415,8 @@ impl TxIdx {
 
         {
             use crate::bulk_io::{self, ReadOp};
+            // Sealed age from tip: last segment is open/newest (age 0).
+            let n_segs = segs.len();
             // SAFETY: each pages[i] is a distinct allocation.
             let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(pages.len());
             for (i, (si, page_off)) in page_keys.iter().enumerate() {
@@ -447,11 +424,13 @@ impl TxIdx {
                 let len = pages[i].len();
                 let ptr = pages[i].as_mut_ptr();
                 let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+                let sealed_age = n_segs.saturating_sub(1).saturating_sub(*si) as u32;
                 ops.push(ReadOp {
                     fd,
                     offset: *page_off,
                     buf: slice,
                     result: i32::MIN,
+                    dontcache: crate::dontcache_policy::head_or_idx_segment(sealed_age),
                 });
             }
             bulk_io::pread_batch_backend(&mut ops, backend);
@@ -665,14 +644,6 @@ impl TxIdx {
     pub fn segment_count(&self) -> usize {
         self.segments_snapshot().len()
     }
-}
-
-/// One OS-page pread covering an idx slot (for uring head-resolve STAGE_IDX).
-#[derive(Clone, Debug)]
-pub struct IdxPagePlan {
-    pub fd: std::os::fd::RawFd,
-    pub page_off: u64,
-    pub page_len: usize,
 }
 
 #[inline]

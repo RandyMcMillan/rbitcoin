@@ -18,6 +18,14 @@ use std::path::Path;
 /// SQ/CQ depth for all store io_uring sessions (body bulk + annotate + head stream).
 pub const DEFAULT_ENTRIES: u32 = 128;
 
+/// Linux `RWF_DONTCACHE` — drop pages after IO (kernel 6.14+; ignored if unsupported).
+///
+/// Set on SQE `rw_flags` for Class A body and cold head/idx/sidefile peeks.
+#[cfg(target_os = "linux")]
+pub const RWF_DONTCACHE: i32 = 0x0000_0080;
+#[cfg(not(target_os = "linux"))]
+pub const RWF_DONTCACHE: i32 = 0;
+
 /// Owned io_uring for multi-stage submit/complete loops.
 pub struct UringSession {
     #[cfg(target_os = "linux")]
@@ -78,6 +86,18 @@ impl UringSession {
         buf: &mut [u8],
         user_data: u64,
     ) -> Result<(), StoreError> {
+        self.push_pread_flags(fd, offset, buf, user_data, 0)
+    }
+
+    /// Like [`push_pread`] with optional `rw_flags` (e.g. [`RWF_DONTCACHE`]).
+    pub fn push_pread_flags(
+        &mut self,
+        fd: RawFd,
+        offset: u64,
+        buf: &mut [u8],
+        user_data: u64,
+        rw_flags: i32,
+    ) -> Result<(), StoreError> {
         #[cfg(target_os = "linux")]
         {
             use io_uring::{opcode, types};
@@ -87,10 +107,12 @@ impl UringSession {
             if self.in_flight >= self.entries as usize {
                 return Err(StoreError::Corrupt("io_uring SQ full (in_flight cap)"));
             }
-            let sqe = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32)
-                .offset(offset)
-                .build()
-                .user_data(user_data);
+            let mut b = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32)
+                .offset(offset);
+            if rw_flags != 0 {
+                b = b.rw_flags(rw_flags);
+            }
+            let sqe = b.build().user_data(user_data);
             // SAFETY: caller keeps `buf` alive until matching CQE is harvested.
             unsafe {
                 self.ring
@@ -103,7 +125,7 @@ impl UringSession {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (fd, offset, buf, user_data);
+            let _ = (fd, offset, buf, user_data, rw_flags);
             Err(StoreError::Corrupt("io_uring is Linux-only"))
         }
     }
@@ -116,6 +138,18 @@ impl UringSession {
         buf: &[u8],
         user_data: u64,
     ) -> Result<(), StoreError> {
+        self.push_pwrite_flags(fd, offset, buf, user_data, 0)
+    }
+
+    /// Like [`push_pwrite`] with optional `rw_flags` (e.g. [`RWF_DONTCACHE`]).
+    pub fn push_pwrite_flags(
+        &mut self,
+        fd: RawFd,
+        offset: u64,
+        buf: &[u8],
+        user_data: u64,
+        rw_flags: i32,
+    ) -> Result<(), StoreError> {
         #[cfg(target_os = "linux")]
         {
             use io_uring::{opcode, types};
@@ -125,10 +159,12 @@ impl UringSession {
             if self.in_flight >= self.entries as usize {
                 return Err(StoreError::Corrupt("io_uring SQ full (in_flight cap)"));
             }
-            let sqe = opcode::Write::new(types::Fd(fd), buf.as_ptr(), buf.len() as u32)
-                .offset(offset)
-                .build()
-                .user_data(user_data);
+            let mut b = opcode::Write::new(types::Fd(fd), buf.as_ptr(), buf.len() as u32)
+                .offset(offset);
+            if rw_flags != 0 {
+                b = b.rw_flags(rw_flags);
+            }
+            let sqe = b.build().user_data(user_data);
             // SAFETY: caller keeps `buf` alive until matching CQE is harvested.
             unsafe {
                 self.ring
@@ -141,7 +177,7 @@ impl UringSession {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (fd, offset, buf, user_data);
+            let _ = (fd, offset, buf, user_data, rw_flags);
             Err(StoreError::Corrupt("io_uring is Linux-only"))
         }
     }
@@ -221,25 +257,25 @@ impl Drop for UringSession {
     }
 }
 
-/// Pack `(kind, slot)` into `user_data` (high 2 bits = kind).
-#[inline]
-pub fn pack_ud(kind: u64, slot: u32) -> u64 {
-    const KIND_SHIFT: u64 = 62;
-    (kind << KIND_SHIFT) | (slot as u64 & ((1u64 << KIND_SHIFT) - 1))
-}
-
-/// Unpack [`pack_ud`].
-#[inline]
-pub fn unpack_ud(ud: u64) -> (u64, u32) {
-    const KIND_SHIFT: u64 = 62;
-    let kind = ud >> KIND_SHIFT;
-    let slot = (ud & ((1u64 << KIND_SHIFT) - 1)) as u32;
-    (kind, slot)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pack `(kind, slot)` into `user_data` (high 2 bits = kind).
+    #[inline]
+    fn pack_ud(kind: u64, slot: u32) -> u64 {
+        const KIND_SHIFT: u64 = 62;
+        (kind << KIND_SHIFT) | (slot as u64 & ((1u64 << KIND_SHIFT) - 1))
+    }
+
+    /// Unpack [`pack_ud`].
+    #[inline]
+    fn unpack_ud(ud: u64) -> (u64, u32) {
+        const KIND_SHIFT: u64 = 62;
+        let kind = ud >> KIND_SHIFT;
+        let slot = (ud & ((1u64 << KIND_SHIFT) - 1)) as u32;
+        (kind, slot)
+    }
 
     #[test]
     fn pack_unpack_roundtrip() {

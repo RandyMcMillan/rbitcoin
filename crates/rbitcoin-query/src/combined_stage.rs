@@ -100,9 +100,13 @@ pub fn load_creates_once_seed(
         let mut decoded_outs = None;
         match mode {
             IdxBodyMode::Full => {
-                if let Ok((tx, ins, outs, rels)) =
+                if let Ok((mut tx, ins, outs, rels)) =
                     decode_packed_tx_with_spender_rels_secret(&job.body, Some(secret))
                 {
+                    // Schema 13: body has no leading txid — fill from sidefile.
+                    if let Ok(tid) = store.txs.body_txid(*fk) {
+                        tx.txid = tid;
+                    }
                     if seed_residency {
                         let pin: CreatePin = Arc::new((tx.clone(), outs.clone(), rels.clone()));
                         residency.put_complete(*fk, pin, Some(range));
@@ -115,9 +119,12 @@ pub fn load_creates_once_seed(
                 }
             }
             IdxBodyMode::OutsDenserels | IdxBodyMode::Prefix33 => {
-                if let Ok((tx, outs, rels)) =
+                if let Ok((mut tx, outs, rels)) =
                     decode_packed_tx_outs_with_spender_rels_secret(&job.body, Some(secret))
                 {
+                    if let Ok(tid) = store.txs.body_txid(*fk) {
+                        tx.txid = tid;
+                    }
                     if seed_residency {
                         let pin: CreatePin = Arc::new((tx.clone(), outs.clone(), rels.clone()));
                         residency.put_complete(*fk, pin, Some(range));
@@ -215,13 +222,13 @@ mod tests {
         }
         let (txid, fk) = {
             let c = &creates[0];
-            let t = rbitcoin_store::decode_packed_tx_with_spender_rels_secret(
-                &c.raw,
-                Some(q.store().txs.store_secret()),
-            )
-            .unwrap()
-            .0
-            .txid;
+            // Schema 13: identity lives in txid.body / filled decoded pin, not body prefix.
+            let t = c
+                .decoded_full
+                .as_ref()
+                .map(|(tx, _, _, _)| tx.txid)
+                .unwrap_or_else(|| q.store().txs.body_txid(c.fk).unwrap());
+            assert_ne!(t, [0u8; 32], "sidefile/decoded pin must supply identity");
             (t, c.fk)
         };
         assert_eq!(q.create_residency().lookup_fk_by_txid(&txid), Some(fk));

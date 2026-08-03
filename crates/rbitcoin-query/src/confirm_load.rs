@@ -496,7 +496,7 @@ impl Query {
                     .into());
                 };
                 let range = Some(c.body_range);
-                let Ok((tx, outs, dense_rels)) =
+                let Ok((mut tx, outs, dense_rels)) =
                     rbitcoin_store::decode_packed_tx_outs_with_spender_rels_secret(
                         &c.raw,
                         Some(self.store.txs.store_secret()),
@@ -507,6 +507,9 @@ impl Query {
                     )
                     .into());
                 };
+                if let Ok(tid) = self.store.txs.body_txid(fk) {
+                    tx.txid = tid;
+                }
                 let live = slim_dense_outs_to_need(&outs, need_vouts);
                 let sparse = crate::batch_parents::sparse_spender_rels(&dense_rels, need_vouts);
                 if !crate::batch_parents::layout_covers_need(range, &sparse, need_vouts) {
@@ -682,10 +685,14 @@ mod load_confirm_invariant_tests {
         // Overwrite packed body with meta claiming input_count=1 but no input
         // bytes → Full decode fails short (safe, no OOM) while idx range stays.
         let (off, len) = q.store().tx_body_range(fks[0]).unwrap();
-        assert!(len >= 64, "need full TxRecord header room");
+        // Schema 13 body meta is 32 B (no leading txid).
+        assert!(
+            len >= rbitcoin_store::TxRecord::BODY_META_LEN as u64,
+            "need full body meta room"
+        );
         let mut trash = vec![0u8; len as usize];
-        // TxRecord layout: txid[32] version[4] locktime[4] in_start[8] in_count[4] …
-        trash[48..52].copy_from_slice(&1u32.to_le_bytes()); // input_count = 1
+        // Body meta: version[4] locktime[4] in_start[8] in_count[4] …
+        trash[16..20].copy_from_slice(&1u32.to_le_bytes()); // input_count = 1
         let body_path = q.store().path().join("tx.body");
         {
             use std::io::{Seek, SeekFrom, Write};

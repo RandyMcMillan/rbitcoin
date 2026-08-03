@@ -1,6 +1,6 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 12` (`rbitcoin_primitives`).  
+**Version:** `SCHEMA_VERSION = 13` (`rbitcoin_primitives`).  
 **Status:** unstable until 1.0 — incompatible layout changes are reindex-only (wipe store / redo IBD).  
 **Endianness:** little-endian for all multi-byte integers.
 
@@ -12,9 +12,10 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 
 | Concern | Choice | Why |
 |---------|--------|-----|
-| Class A body | **Packed** full tx in one `tx.body` record | One IO to reconstruct; no separate input/output tables |
-| Non-coinbase prevout | On-disk **`create_fk:u64` + CompactSize vout** | Smaller than `prev_txid[32]`; archive stamps fk once; wire fills soft `prev_txid` from create body |
-| Txid → create | Segmented keyless **`tx.head.*`** (25-bit + fuse8) | Fixed-bits per segment; seal-time binary fuse8; body verifies identity |
+| Class A body | **Packed** full tx in one `tx.body` record (**no** leading txid) | One IO for outs/payload; identity is not body-bound |
+| Class A identity | Dense **`txid.body`** sidefile (32 B header + 32 B/txid by create_fk) | Fixed `fk → offset`; head-resolve multi-cand without Prefix33 body peeks |
+| Non-coinbase prevout | On-disk **`create_fk:u64` + CompactSize vout** | Smaller than `prev_txid[32]`; archive stamps fk once; wire fills soft `prev_txid` from sidefile/create |
+| Txid → create | Segmented keyless **`tx.head.*`** (25-bit + fuse8) | Fixed-bits per segment; seal-time binary fuse8; **txid.body** verifies identity |
 | Spentness | Annotation on **create output** (+ rare multi-list) | No multi-GiB `point.head` open-hash |
 | Electrum index | Thin **create_tx_fk only** (inline ≤2 or geometric slab) | Small index; expand vouts/value/height at query via Class A + Class C |
 | Best-chain commit | Advance **`confirmed[]` last** | Tip is the commit point; strong/height may lead tip after kill |
@@ -29,6 +30,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
     meta                         # store magic + schema version
     header.body / header.head    # Class A headers + hash index
     tx.body / tx.idx.meta / tx.idx.NNNNNN           # Class A + segmented idx
+    txid.body                                       # dense create_fk-ordered txids (schema 13+)
     tx.head.meta / tx.head.NNNNNN [/ .fuse8]        # segmented 25-bit heads + sealed fuse8
     spenders.body                # multi-spender list nodes only
     confirmed.body               # Class C: height → header_fk
@@ -54,7 +56,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — **11** |
+| 4 | 2 | Schema version (u16) — **13** |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 
@@ -73,6 +75,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 | 9 | array_link (idx files, dense arrays) |
 | 10 | hash_head |
 | 11 | scripthash |
+| 14 | txid_body (`txid.body`) |
 
 ---
 
@@ -118,31 +121,39 @@ Open-address hash head (see [Hash heads](#hash-heads-headerhead--generic)): key 
 
 ## Class A — transactions
 
-### Packed body (schema 11+)
+### Dense identity sidefile (`txid.body`, schema 13+)
+
+```text
+offset 0..32    — 32-byte file header (standard 16-byte TableFile header + 16 pad)
+offset 32+(fk-1)*32 — txid for create_fk = fk (1-based)
+```
+
+Append-published with Class A body/idx on the sole Class A write path. Count must match `tx.body` entry count. Head-resolve multi-cand identity peeks this file (fixed offset), **not** a body prefix.
+
+**IO policy (RWF_DONTCACHE):** sidefile reads for entries more than **100_000_000** from the published tail (~3.2 GiB at 32 B) set `RWF_DONTCACHE` on uring SQEs.
+
+### Packed body (schema 13+)
 
 Each `tx.body` record starts at an absolute offset `S` with:
 
 ```text
-S (8-byte aligned; txid does not cross a 4 KiB page):
-  TxRecord (64 B fixed meta)   # txid = bytes [S, S+32)
+S (8-byte aligned only):
+  body_meta (32 B)             # version, locktime, null I/O fks, counts — NO txid
   inputs…
   outputs…
   [optional 0x00 …]            # pad to next record start (included in idx length)
 ```
 
-There is **no** leading magic byte (schema ≤10 used `PACKED_TX_V1 = 0x01`). There are **no** standalone `input.body` / `output.body` tables.
+There is **no** leading magic byte and **no** leading txid (schema 11–12 stored txid at `[S, S+32)`). There are **no** standalone `input.body` / `output.body` tables.
 
-**Alignment invariants** (fixed 4 KiB pages):
+**Alignment** (schema 13+): `S % 8 == 0` only. The schema-11/12 page non-straddle rule for a leading 32-byte txid is retired.
 
-```text
-S % 8 == 0
-(S % 4096) + 32 <= 4096   ⇔  S % 4096 <= 4064
-```
+Decode walks meta + runs to a logical end; any remaining bytes in the idx span must be **all zeros**. Non-zero trailing garbage is corrupt. Identity for a known `create_fk` is **`txid.body`**, not body bytes.
 
-Decode walks meta + runs to a logical end; any remaining bytes in the idx span must be **all zeros**. Non-zero trailing garbage is corrupt. Thin `body_txid` reads are **32 bytes at `S`**.
+**Body meta (32 B):** version, locktime, `input_start_fk`, `input_count`, `output_start_fk`, `output_count`.  
+On packed rows, `input_start_fk` / `output_start_fk` are always null (layout reserved; I/O lives in the same payload). Soft `TxRecord.txid` is filled from the sidefile on get paths.
 
-**TxRecord (64 B):** txid, version, locktime, `input_start_fk`, `input_count`, `output_start_fk`, `output_count`.  
-On packed rows, `input_start_fk` / `output_start_fk` are always null (layout reserved; I/O lives in the same payload).
+**IO policy (RWF_DONTCACHE):** **all** reads and writes to `tx.body` set `RWF_DONTCACHE` on uring SQEs. `tx.idx` / `tx.head` segment reads older than the **open segment + past 3 sealed** also set it.
 
 ### Segmented body index (`tx.idx.*`)
 

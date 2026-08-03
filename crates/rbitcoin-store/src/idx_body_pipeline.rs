@@ -145,11 +145,13 @@ pub fn run_idx_body_pipeline_backend(
         let len = jobs[i].body.len();
         let ptr = jobs[i].body.as_mut_ptr();
         let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        // Policy: all tx.body reads use RWF_DONTCACHE (schema 13+).
         read_ops.push(ReadOp {
             fd: body_fd,
             offset: off,
             buf: slice,
             result: i32::MIN,
+            dontcache: true,
         });
     }
     bulk_io::pread_batch_backend(&mut read_ops, backend);

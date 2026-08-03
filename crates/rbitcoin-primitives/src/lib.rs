@@ -17,7 +17,9 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
-pub const SCHEMA_VERSION: u16 = 12;
+///
+/// **13:** dense `txid.body` sidefile; Class A packed body meta **without** leading txid.
+pub const SCHEMA_VERSION: u16 = 13;
 
 /// 1-based foreign key into a store table body. Zero means null / absent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -149,6 +151,8 @@ pub enum TableKind {
     TxHeight = 12,
     /// Multi-spender list nodes (16 B: spending_tx_fk | next).
     Spender = 13,
+    /// Dense create_fk-ordered txid sidefile (`txid.body`).
+    TxidBody = 14,
 }
 
 impl TableKind {
@@ -167,6 +171,7 @@ impl TableKind {
             11 => Some(TableKind::ScriptHash),
             12 => Some(TableKind::TxHeight),
             13 => Some(TableKind::Spender),
+            14 => Some(TableKind::TxidBody),
             _ => None,
         }
     }
@@ -212,19 +217,20 @@ mod tests {
 
     #[test]
     fn table_kind_roundtrip() {
-        for v in 1u16..=13 {
+        for v in 1u16..=14 {
             let k = TableKind::from_u16(v).expect("kind");
             assert_eq!(k.as_u16(), v);
         }
         assert!(TableKind::from_u16(0).is_none());
         assert!(TableKind::from_u16(99).is_none());
         assert_eq!(TableKind::Spender.as_u16(), 13);
+        assert_eq!(TableKind::TxidBody.as_u16(), 14);
     }
 
     #[test]
     fn constants_stable() {
         assert_eq!(STORE_MAGIC, *b"RBT1");
-        assert_eq!(SCHEMA_VERSION, 12);
+        assert_eq!(SCHEMA_VERSION, 13);
         assert!(!VERSION.is_empty());
     }
 }

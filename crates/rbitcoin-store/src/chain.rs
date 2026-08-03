@@ -242,6 +242,7 @@ impl TxHeightTable {
                 offset: Self::offset(index),
                 buf: slice,
                 result: i32::MIN,
+                dontcache: false,
             });
         }
         bulk_io::pread_batch_backend(&mut read_ops, backend);

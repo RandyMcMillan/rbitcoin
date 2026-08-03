@@ -42,6 +42,8 @@ pub struct ReadOp<'a> {
     pub buf: &'a mut [u8],
     /// Filled: bytes read (≥0) or negated errno on failure.
     pub result: i32,
+    /// When true, SQE uses [`crate::uring_session::RWF_DONTCACHE`].
+    pub dontcache: bool,
 }
 
 /// One independent pwrite. Caller owns `buf` for the full submit/wait.
@@ -51,6 +53,8 @@ pub struct WriteOp<'a> {
     pub buf: &'a [u8],
     /// Filled: bytes written (≥0) or negated errno on failure.
     pub result: i32,
+    /// When true, SQE uses [`crate::uring_session::RWF_DONTCACHE`].
+    pub dontcache: bool,
 }
 
 /// One page RMW slot for [`page_rmw_pipelined`]: pread into `buf`, apply, pwrite.
@@ -64,6 +68,30 @@ pub struct PageRmw<'a> {
 static URING_MODE: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 on, 2 off
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
 static URING_FAIL_LOGGED: AtomicBool = AtomicBool::new(false);
+/// 0 unknown, 1 ok, 2 unsupported (ENOTSUP) — probed once on first use.
+static RWF_DONTCACHE_MODE: AtomicU8 = AtomicU8::new(0);
+
+/// Whether RWF_DONTCACHE is safe to set on SQEs (false on some FS/kernels/9p).
+pub fn rwf_dontcache_ok() -> bool {
+    match RWF_DONTCACHE_MODE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            // Default on; disable if env forces off or prior CQE saw ENOTSUP.
+            let want = std::env::var("RBITCOIN_RWF_DONTCACHE")
+                .map(|s| s != "0" && s != "false" && s != "off")
+                .unwrap_or(true);
+            let mode = if want { 1 } else { 2 };
+            RWF_DONTCACHE_MODE.store(mode, Ordering::Relaxed);
+            want
+        }
+    }
+}
+
+/// Mark RWF_DONTCACHE as unsupported after ENOTSUP / EOPNOTSUPP.
+pub fn note_rwf_dontcache_unsupported() {
+    RWF_DONTCACHE_MODE.store(2, Ordering::Relaxed);
+}
 
 /// Whether io_uring bulk reads are enabled (env + successful ring setup).
 pub fn io_uring_enabled() -> bool {
@@ -295,9 +323,15 @@ fn pread_batch_on_session(
             let fd = ops[next].fd;
             let offset = ops[next].offset;
             let ud = next as u64;
+            // Prefer DONTCACHE when requested; may be unsupported on some FS/kernels.
+            let flags = if ops[next].dontcache && rwf_dontcache_ok() {
+                crate::uring_session::RWF_DONTCACHE
+            } else {
+                0
+            };
             // SAFETY: caller owns each `buf` until `pread_batch` returns.
             if session
-                .push_pread(fd, offset, ops[next].buf, ud)
+                .push_pread_flags(fd, offset, ops[next].buf, ud, flags)
                 .is_err()
             {
                 if session.in_flight() == 0 {
@@ -334,18 +368,28 @@ fn pread_batch_on_session(
             let i = ud as usize;
             if i < ops.len() {
                 ops[i].result = res;
+                // ENOTSUP / EOPNOTSUPP (95) often means RWF_DONTCACHE unsupported.
+                if res == -95 || res == -95i32 {
+                    note_rwf_dontcache_unsupported();
+                }
             }
             completed += 1;
         }
     }
 
+    let mut any_fail = false;
     for op in ops.iter_mut() {
         if !op.buf.is_empty() && op.result == i32::MIN {
             op.result = -5; // EIO
+            any_fail = true;
+        }
+        if op.result < 0 {
+            any_fail = true;
         }
     }
     session.drain_all();
-    true
+    // Signal caller to fall back to pread if any SQE failed (e.g. DONTCACHE).
+    !any_fail
 }
 
 /// Pipelined bulk pwrite — same fill/harvest shape as [`pread_batch_uring`].
@@ -387,8 +431,13 @@ fn pwrite_batch_on_session(
             let fd = ops[next].fd;
             let offset = ops[next].offset;
             let ud = next as u64;
+            let flags = if ops[next].dontcache && rwf_dontcache_ok() {
+                crate::uring_session::RWF_DONTCACHE
+            } else {
+                0
+            };
             if session
-                .push_pwrite(fd, offset, ops[next].buf, ud)
+                .push_pwrite_flags(fd, offset, ops[next].buf, ud, flags)
                 .is_err()
             {
                 if session.in_flight() == 0 {
@@ -710,6 +759,7 @@ pub fn page_rmw_serial(
                 offset,
                 buf: page.buf,
                 result: i32::MIN,
+                dontcache: false,
             };
             pread_one(&mut ro);
             ro.result >= 0 && ro.result as usize == len
@@ -727,6 +777,7 @@ pub fn page_rmw_serial(
                 offset,
                 buf: page.buf,
                 result: i32::MIN,
+                dontcache: false,
             };
             pwrite_one(&mut wo);
             wo.result >= 0 && wo.result as usize == len
@@ -786,6 +837,7 @@ mod tests {
             offset: 0,
             buf: &mut empty[..],
             result: i32::MIN,
+            dontcache: false,
         }];
         pread_batch(&mut ops);
         assert_eq!(ops[0].result, 0);
@@ -795,6 +847,7 @@ mod tests {
             offset: 0,
             buf: &[],
             result: i32::MIN,
+            dontcache: false,
         }];
         pwrite_batch(&mut wops);
         assert_eq!(wops[0].result, 0);
@@ -808,6 +861,7 @@ mod tests {
                 offset: (i * 64) as u64,
                 buf: b.as_mut_slice(),
                 result: i32::MIN,
+                dontcache: false,
             });
         }
         pread_batch_fallback(&mut read_ops);
@@ -852,6 +906,7 @@ mod tests {
             offset: 0,
             buf: &mut check,
             result: i32::MIN,
+            dontcache: false,
         };
         pread_one(&mut ro);
         assert_eq!(check[0], data[0] ^ 0xff);
@@ -863,6 +918,7 @@ mod tests {
             offset: 10_000,
             buf: &mut past,
             result: i32::MIN,
+            dontcache: false,
         };
         pread_one(&mut ro);
         assert_eq!(ro.result, 0);
@@ -897,18 +953,21 @@ mod tests {
                 offset: 0,
                 buf: &mut b0[..],
                 result: i32::MIN,
+                dontcache: false,
             },
             ReadOp {
                 fd,
                 offset: 50,
                 buf: &mut b1[..],
                 result: i32::MIN,
+                dontcache: false,
             },
             ReadOp {
                 fd,
                 offset: 100,
                 buf: &mut b2[..],
                 result: i32::MIN,
+                dontcache: false,
             },
         ];
         pread_batch(&mut ops);
@@ -931,6 +990,7 @@ mod tests {
                 offset: i as u64,
                 buf: *sl,
                 result: i32::MIN,
+                dontcache: false,
             });
         }
         pread_batch(&mut ops);
@@ -967,6 +1027,7 @@ mod tests {
             offset: 0,
             buf: &mut b[..],
             result: i32::MIN,
+            dontcache: false,
         }];
         pread_batch_fallback(&mut ops);
         drop(ops);
@@ -1009,18 +1070,21 @@ mod tests {
                 offset: 0,
                 buf: &d0[..],
                 result: i32::MIN,
+                dontcache: false,
             },
             WriteOp {
                 fd,
                 offset: 50,
                 buf: &d1[..],
                 result: i32::MIN,
+                dontcache: false,
             },
             WriteOp {
                 fd,
                 offset: 100,
                 buf: &d2[..],
                 result: i32::MIN,
+                dontcache: false,
             },
         ];
         pwrite_batch(&mut ops);
@@ -1126,6 +1190,7 @@ mod tests {
             offset: 0,
             buf: &mut b[..],
             result: i32::MIN,
+            dontcache: false,
         }];
         pread_batch(&mut ops); // uring false → fallback still fills
         TEST_FORCE_SESSION_FALSE.with(|c| c.set(false));
@@ -1144,6 +1209,7 @@ mod tests {
             offset: 4,
             buf: &mut b2[..],
             result: i32::MIN,
+            dontcache: false,
         }];
         assert!(
             pread_batch_uring(&mut ops2),
@@ -1189,12 +1255,14 @@ mod tests {
                     offset: base as u64,
                     buf: &mut b0[..],
                     result: i32::MIN,
+                    dontcache: false,
                 },
                 ReadOp {
                     fd,
                     offset: (base + 32) as u64,
                     buf: &mut b1[..],
                     result: i32::MIN,
+                    dontcache: false,
                 },
             ];
             pread_batch(&mut ops);
@@ -1213,12 +1281,14 @@ mod tests {
                     offset: base as u64,
                     buf: &mut c0[..],
                     result: i32::MIN,
+                    dontcache: false,
                 },
                 ReadOp {
                     fd,
                     offset: (base + 32) as u64,
                     buf: &mut c1[..],
                     result: i32::MIN,
+                    dontcache: false,
                 },
             ];
             pread_batch_fallback(&mut fops);
@@ -1263,6 +1333,7 @@ mod tests {
                 offset: i as u64,
                 buf: *sl,
                 result: i32::MIN,
+                dontcache: false,
             });
         }
         pread_batch(&mut ops);
@@ -1284,18 +1355,21 @@ mod tests {
                 offset: 0,
                 buf: &mut b0[..],
                 result: i32::MIN,
+                dontcache: false,
             },
             ReadOp {
                 fd,
                 offset: 0,
                 buf: &mut empty[..],
                 result: i32::MIN,
+                dontcache: false,
             },
             ReadOp {
                 fd,
                 offset: 1,
                 buf: &mut b1[..],
                 result: i32::MIN,
+                dontcache: false,
             },
         ];
         pread_batch(&mut ops2);

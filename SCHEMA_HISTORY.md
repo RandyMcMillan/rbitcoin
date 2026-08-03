@@ -1,7 +1,7 @@
 # Schema history
 
 Historic on-disk layouts for the rbitcoin chain store.  
-**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 12`).
+**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 13`).
 
 Until 1.0 there is **no in-place migration**: a new major layout generally means wipe the store and redo IBD. This file is for archaeology, code archaeology, and understanding why the current design looks the way it does.
 
@@ -13,7 +13,8 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **12** | Datadir `store.secret`; script/witness XOR at rest; keyed `tx.head` mix; head overflow; durable `block_queue/` | **Current** |
+| **13** | Dense `txid.body` sidefile; packed body **without** leading txid; RWF_DONTCACHE policy | **Current** |
+| **12** | Datadir `store.secret`; script/witness XOR at rest; keyed `tx.head` mix; head overflow; durable `block_queue/` | Prior |
 | **11** | Txid-first packed body; 8-byte align + page rule; segmented u32 stride `tx.idx.*` | Prior |
 | **10** | Packed inputs: `create_fk:u64` + vout (not `prev_txid[32]`); online `tx.head` resize; default BITS=28 | Prior packed layout |
 | **9** | Keyless `tx.head` 4 B entries (no HAS_NEXT); `tx_height` u32 slots | `tx.head` layout family (evolved) |
@@ -26,9 +27,19 @@ Versions below are listed **newest → oldest** after the summary table.
 
 ---
 
-## v12 (current)
+## v13 (current)
 
 See [`SCHEMA.md`](./SCHEMA.md).
+
+**Relative to v12:**
+
+- Dense **`txid.body`**: 32-byte header + 32-byte txid per create_fk (append with Class A).
+- Packed **`tx.body` meta without leading txid** (32 B meta only); 8-byte align only (no page non-straddle for body txid).
+- Head-resolve identity via **sidefile**, not Prefix33 body peeks.
+- **RWF_DONTCACHE** on uring SQEs: all `tx.body` r/w; `tx.idx`/`tx.head` older than open+past 3 sealed; `txid.body` reads more than 100M entries from tail.
+- **Wipe / reindex required** from schema 12 (body layout + new sidefile incompatible).
+
+## v12
 
 **Relative to v11:**
 

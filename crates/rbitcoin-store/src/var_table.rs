@@ -22,18 +22,10 @@ use rbitcoin_primitives::{Fk, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Fixed 4 KiB page for on-disk txid non-straddle rule (must match `tx_table`).
-const TX_BODY_PAGE: u64 = 4096;
-const TXID_PAGE_MAX_OFF: u64 = TX_BODY_PAGE - 32;
-
-/// Next 8-byte-aligned body start where a 32-byte txid does not cross a page.
+/// Next 8-byte-aligned body start (schema 13+: no body-txid page rule).
 #[inline]
 fn next_aligned_tx_start(cursor: u64) -> u64 {
-    let mut s = cursor.saturating_add(7) & !7u64;
-    while s % TX_BODY_PAGE > TXID_PAGE_MAX_OFF {
-        s = s.saturating_add(8);
-    }
-    s
+    cursor.saturating_add(7) & !7u64
 }
 
 pub struct VarTable {
@@ -206,12 +198,6 @@ impl VarTable {
         Ok(out)
     }
 
-    /// OS-page pread plan for the idx slot of `fk` (uring head-resolve STAGE_IDX).
-    pub(crate) fn idx_page_plan(&self, fk: Fk) -> Result<crate::tx_idx::IdxPagePlan, StoreError> {
-        let id = fk.get().ok_or(StoreError::InvalidFk)?;
-        self.idx.page_plan_for_id(id)
-    }
-
     /// Segmented idx: resolve ranges via page-coalesced batch APIs, then body pread.
     #[inline]
     pub(crate) fn body_read_fd(&self) -> std::os::fd::RawFd {
@@ -249,13 +235,48 @@ impl VarTable {
     }
 
     /// Absolute write into Class A body via **pwrite** (never mmap).
+    ///
+    /// Prefer [`Self::write_body_blob_dontcache`] for Class A append so uring
+    /// SQEs set **RWF_DONTCACHE**.
     pub fn write_body_abs(&self, abs_offset: u64, data: &[u8]) -> Result<(), StoreError> {
-        self.body.write_at_pwrite(abs_offset, data)
+        self.write_body_blob_dontcache(abs_offset, data)
     }
 
     /// Alias of [`Self::write_body_abs`] (historical name).
     pub fn write_body_abs_pwrite(&self, abs_offset: u64, data: &[u8]) -> Result<(), StoreError> {
         self.write_body_abs(abs_offset, data)
+    }
+
+    /// Class A body payload write. Routes through bulk `WriteOp` with
+    /// [`crate::dontcache_policy::body_always`] so io_uring SQEs set
+    /// `RWF_DONTCACHE`; falls back to plain pwrite when uring is unavailable.
+    fn write_body_blob_dontcache(&self, start: u64, body_blob: &[u8]) -> Result<(), StoreError> {
+        if body_blob.is_empty() {
+            return Ok(());
+        }
+        // Fast path: single WriteOp + HWM publish matching write_at_pwrite.
+        let end = start.saturating_add(body_blob.len() as u64);
+        self.body.ensure_capacity(end)?;
+        use crate::bulk_io::{self, WriteOp};
+        let mut ops = [WriteOp {
+            fd: self.body.read_fd(),
+            offset: start,
+            buf: body_blob,
+            result: i32::MIN,
+            dontcache: crate::dontcache_policy::body_always(),
+        }];
+        bulk_io::pwrite_batch(&mut ops);
+        if ops[0].result < 0 {
+            // Fallback: full pwrite path (capacity already ensured).
+            return self.body.write_at_pwrite(start, body_blob);
+        }
+        if (ops[0].result as usize) != body_blob.len() {
+            // Short write — complete via TableFile (publishes HWM).
+            return self.body.write_at_pwrite(start, body_blob);
+        }
+        // Bytes on disk; advance HWM / dirty like write_at_pwrite.
+        self.body.set_logical_len(end.max(self.body.logical_len()))?;
+        Ok(())
     }
 
     /// Pre-grow body (+ idx tail) capacity so a following mega `put_batch` does not
@@ -323,7 +344,8 @@ impl VarTable {
         if self.count.load(Ordering::Acquire) != base_count {
             return Err(StoreError::Corrupt("var put_batch_encode race"));
         }
-        self.body.write_at_pwrite(start, &body_blob)?;
+        // Class A body writes always request RWF_DONTCACHE (uring when available).
+        self.write_body_blob_dontcache(start, &body_blob)?;
         // Idx after body (publish order).
         self.idx.append_starts(base_count, &starts)?;
         let new_end = start.saturating_add(body_blob.len() as u64);

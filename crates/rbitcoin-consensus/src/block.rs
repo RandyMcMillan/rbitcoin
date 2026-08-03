@@ -1011,14 +1011,13 @@ pub(crate) struct StructuralPhaseNs {
 /// write-local across a multi-height run.
 ///
 /// **BIP68** create-height lives here (not optimistic load assemble) so confirm
-/// load does not walk `tx_height` for every parent. Height slots are bulk-read
-/// with spender meta in one multi-fd wave. Coin MTP is resolved only for
-/// time-type relative locks on version ≥2 txs.
+/// load does not walk `tx_height` for every parent. Heights: bulk `tx_height`.
+/// Coin MTP only for time-type relative locks on version ≥2 txs (v1 skipped).
 ///
-/// **Spentness:** pin denserels → abs + one bulk 9-byte meta wave (combined with
-/// `tx_height`). Sparse durable-**spent** set (not unspent). **No cold body walk**
-/// on the write path — missing abs / multi / short meta is hard `Err`. Snapshots
-/// `(field, flags)` into `meta_by_abs` for pure-write annotate.
+/// **Spentness:** pin denserels → abs + bulk 9-byte meta. Sparse durable-**spent**
+/// set (not unspent). **No cold body walk** on the write path — missing abs /
+/// multi / short meta is hard `Err`. Snapshots `(field, flags)` into
+/// `meta_by_abs` for pure-write annotate.
 pub(crate) fn structural_validate_spends(
     query: &Query,
     block: &Block,
@@ -1085,34 +1084,27 @@ pub(crate) fn structural_validate_spends(
         }
     }
 
-    // Unique create fks for height bulk (sorted for stable IO order).
-    let unique_create_fks: Vec<rbitcoin_primitives::Fk> = {
-        let mut v: Vec<rbitcoin_primitives::Fk> = vouts_by_create
-            .keys()
-            .map(|id| rbitcoin_primitives::Fk(*id))
-            .collect();
-        v.sort_unstable_by_key(|f| f.0);
-        v
-    };
-
-    // One bulk IO wave: Class A body 9B meta + tx_height 4B (independent fds).
-    // Wall ≈ max(meta, height) instead of sum. Heights decode only after wait.
-    let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a)| *a).collect();
-    let t_meta = Instant::now();
-    let (metas, durable_heights) = query
-        .store()
-        .structural_meta_and_tx_height_batch(&abs_offs, &unique_create_fks)
-        .map_err(ConsensusError::Store)?;
-    let meta_ns = t_meta.elapsed().as_nanos() as u64;
-    confirm_phase_stats::SPEND_META_NS.fetch_add(meta_ns, Ordering::Relaxed);
-    confirm_phase_stats::SPEND_META_N.fetch_add(abs_offs.len() as u64, Ordering::Relaxed);
-
     // Sparse durable **spent** set (honest IBD: almost all outs unspent).
     // Present ⇒ confirmed-strong spent; missing ⇒ unspent.
     let mut durable_spent: HashSet<(u64, u32)> = HashSet::new();
     let tip = query.tip_height().map(|h| h.0);
+
+    // Hot path: bulk 9-byte spender meta at pin offsets (on-disk authority).
+    // Serial with create_h heights below — combined multi-fd wave was measured
+    // neutral/worse (body DONTCACHE peeks + height slots).
     let mut spent_strong_ns = 0u64;
     if !abs_jobs.is_empty() {
+        let abs_offs: Vec<u64> = abs_jobs.iter().map(|(_, _, a)| *a).collect();
+        let meta_backend = rbitcoin_store::spend_meta_backend();
+        let t_meta = Instant::now();
+        let metas = query
+            .store()
+            .get_spender_meta_at_abs_batch_backend(&abs_offs, meta_backend)
+            .map_err(ConsensusError::Store)?;
+        let meta_ns = t_meta.elapsed().as_nanos() as u64;
+        confirm_phase_stats::SPEND_META_NS.fetch_add(meta_ns, Ordering::Relaxed);
+        confirm_phase_stats::SPEND_META_N.fetch_add(abs_offs.len() as u64, Ordering::Relaxed);
+        let _ = meta_backend;
         if metas.len() != abs_jobs.len() {
             return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
                 "invariant: structural meta batch length",
@@ -1149,7 +1141,7 @@ pub(crate) fn structural_validate_spends(
         }
         spent_strong_ns = t_strong.elapsed().as_nanos() as u64;
     }
-    // abs ≈ collect + combined meta/height wave (not strong loop).
+    // abs ≈ collect + meta pread (not strong loop).
     let spent_abs_ns = (t_abs.elapsed().as_nanos() as u64).saturating_sub(spent_strong_ns);
 
     // Null create_fk (rare): same-block / unset create — txid path, not Class A body cold.
@@ -1194,14 +1186,21 @@ pub(crate) fn structural_validate_spends(
     let spent_ns = t_spent.elapsed().as_nanos() as u64;
 
     // ── Create height + coinbase maturity (durable Class C only) ──────────
-    // Heights already loaded in the structural IO wave with meta. Coinbase:
-    // create_fk == first_tx_fk of block at H — **never** `tx.body`.
+    // Heights: bulk `tx_height`. Coinbase: create_fk == first_tx_fk of block at
+    // that height — **never** `tx.body`. Pin may short-circuit non-coinbase.
     let t_create = Instant::now();
-    if durable_heights.len() != unique_create_fks.len() {
-        return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
-            "invariant: structural height batch length",
-        )));
-    }
+    let unique_create_fks: Vec<rbitcoin_primitives::Fk> = {
+        let mut v: Vec<rbitcoin_primitives::Fk> = vouts_by_create
+            .keys()
+            .map(|id| rbitcoin_primitives::Fk(*id))
+            .collect();
+        v.sort_unstable_by_key(|f| f.0);
+        v
+    };
+    let durable_heights = query
+        .store()
+        .tx_height_get_batch(&unique_create_fks)
+        .map_err(ConsensusError::Store)?;
     let height_by_id: HashMap<u64, u32> = unique_create_fks
         .iter()
         .zip(durable_heights.into_iter())

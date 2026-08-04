@@ -15,6 +15,8 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 
 **Height-ordered unified pipeline (current):** peer → **body queue** → **plan** (structure + stamp create_fk) → **prep** (pin denserels + assemble) → scripts → single commit era. **No** peer→confirm-feed wire retain. **No** hash-only / Class-A-only confirm (bq wire required). Prep must **not** re-run plan head resolve; handoff is owned `ArchiveWritePlan` (pipeline pins → Forbid cold denserels on prep). Bodies without a known height are marked missing and re-getdata after the height map is ready — there is **no** dual-track archive-job / ContigPark fallback.
 
+**Plan pack size:** soft **Σ `tx.input`** budget (default **8000**, `RBITCOIN_CONFIRM_BATCH_INPUTS`; include overshoot block) or hard **144** blocks. Dense mainnet blocks hit the input soft stop after **typically a few blocks** (often 1–3); early tiny blocks may pack many until the hard cap. Do not assume ~32-block plan waves.
+
 **Tip follow / reorg:** peer wire via `ChainHub::accept_block` / `accept_branch` → `accept_and_connect_block` (same wire prep path with cold denserels allowed on the one-shot call). Disconnect keeps Class A archive; re-extension always supplies **wire** from the peer, not hash-only load.
 
 **Wire retained on the pipeline batch only:** plan/prep pull `bitcoin::Block` from the body queue; that wire rides through scripts; **no Class-A wire rebuild**. Class A packed form is planned once and committed in the write stage.

@@ -100,7 +100,7 @@ On R7 every sampled window: **`dontneed=0`** — the flag guarded by this check 
 5. `ArrayTable::get` takes **`data.read()` RwLock every call**  
    (`crates/rbitcoin-store/src/array_table.rs` ~124–132)
 
-At tip ~400k: **~400k lock acquire/release pairs per plan batch** → ~1.5–1.7 s, matching log `finish=1500–2100ms` for ~30-block plans.
+At tip ~400k (historical, when this pathology was live): **~400k lock acquire/release pairs per plan batch** → ~1.5–1.7 s, matching log `finish=1500–2100ms`. Plan size then was often tens of blocks; **current** packing is soft **Σ inputs ≈ 8000** (typically **a few blocks** at dense heights — see `OPERATOR.md` / `RBITCOIN_CONFIRM_BATCH_INPUTS`). The far-ahead scan cost scaled with tip, not with pack length.
 
 Comment on `count_bodies` says *"startup / resume accounting"* but it runs **every mega plan**.
 

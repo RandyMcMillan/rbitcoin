@@ -90,8 +90,6 @@ pub(crate) struct IbdPerfSample {
     pub asm_prev_batch_ms: u64,
     pub asm_prev_batch_n: u64,
     /// Prevout path: residency hit ms / count.
-    pub asm_prev_res_ms: u64,
-    pub asm_prev_res_n: u64,
     /// Prevout path: same-block ms / count.
     pub asm_prev_same_ms: u64,
     pub asm_prev_same_n: u64,
@@ -215,13 +213,7 @@ pub(crate) struct IbdPerfSample {
     pub load_cold_idx_n: u64,
     pub load_cold_decode_ms: u64,
     /// pipeline pins lock: write wait/hold ms, write count.
-    pub res_w_wait_ms: u64,
-    pub res_w_hold_ms: u64,
-    pub res_w_n: u64,
     /// pipeline pins lock: read wait/hold ms, read count.
-    pub res_r_wait_ms: u64,
-    pub res_r_hold_ms: u64,
-    pub res_r_n: u64,
     pub load_body_tx_reads: u64,
     pub load_parent_tx_reads: u64,
     pub load_missing_parents: u64,
@@ -253,7 +245,6 @@ pub(crate) struct IbdPerfSample {
     /// plan_mega internals (from archive_phase_stats).
     pub stamp_mega_assign_ms: u64,
     pub stamp_mega_collect_ms: u64,
-    pub stamp_mega_res_ms: u64,
     /// head_fk + head_dens (legacy total).
     pub stamp_mega_head_ms: u64,
     /// Pure get_fk_by_txid_batch wall.
@@ -291,7 +282,6 @@ pub(crate) struct IbdPerfSample {
 
     // Archive
     pub arch_ext_need: u64,
-    pub arch_sticky_hit: u64,
     pub arch_head_need: u64,
     pub arch_head_hit: u64,
     pub arch_batch_stamp: u64,
@@ -299,7 +289,6 @@ pub(crate) struct IbdPerfSample {
     pub arch_resolve_blocks: u64,
     pub arch_prep_assign_ms: u64,
     pub arch_prep_collect_ms: u64,
-    pub arch_prep_sticky_ms: u64,
     pub arch_prep_inflight_ms: u64,
     pub arch_prep_head_ms: u64,
     pub arch_prep_head_fk_ms: u64,
@@ -384,8 +373,6 @@ impl Default for IbdPerfSample {
             asm_in_n: 0,
             asm_prev_batch_ms: 0,
             asm_prev_batch_n: 0,
-            asm_prev_res_ms: 0,
-            asm_prev_res_n: 0,
             asm_prev_same_ms: 0,
             asm_prev_same_n: 0,
             asm_prev_cold_ms: 0,
@@ -472,12 +459,6 @@ impl Default for IbdPerfSample {
             load_cold_idx_ms: 0,
             load_cold_idx_n: 0,
             load_cold_decode_ms: 0,
-            res_w_wait_ms: 0,
-            res_w_hold_ms: 0,
-            res_w_n: 0,
-            res_r_wait_ms: 0,
-            res_r_hold_ms: 0,
-            res_r_n: 0,
             load_body_tx_reads: 0,
             load_parent_tx_reads: 0,
             load_missing_parents: 0,
@@ -505,7 +486,6 @@ impl Default for IbdPerfSample {
             stamp_mega_ms: 0,
             stamp_mega_assign_ms: 0,
             stamp_mega_collect_ms: 0,
-            stamp_mega_res_ms: 0,
             stamp_mega_head_ms: 0,
             stamp_mega_head_fk_ms: 0,
             stamp_mega_head_dens_ms: 0,
@@ -537,7 +517,6 @@ impl Default for IbdPerfSample {
             load_edge_fk: 0,
             load_edge_cb: 0,
             arch_ext_need: 0,
-            arch_sticky_hit: 0,
             arch_head_need: 0,
             arch_head_hit: 0,
             arch_batch_stamp: 0,
@@ -545,7 +524,6 @@ impl Default for IbdPerfSample {
             arch_resolve_blocks: 0,
             arch_prep_assign_ms: 0,
             arch_prep_collect_ms: 0,
-            arch_prep_sticky_ms: 0,
             arch_prep_inflight_ms: 0,
             arch_prep_head_ms: 0,
             arch_prep_head_fk_ms: 0,
@@ -741,8 +719,8 @@ pub(crate) fn sample(
         asm_in_n,
         asm_prev_batch_ns,
         asm_prev_batch_n,
-        asm_prev_res_ns,
-        asm_prev_res_n,
+        _asm_prev_res_ns,
+        _asm_prev_res_n,
         asm_prev_same_ns,
         asm_prev_same_n,
         asm_prev_cold_ns,
@@ -765,8 +743,6 @@ pub(crate) fn sample(
         rbitcoin_query::wave_fill_stats::sample_store_and_reset();
     // Drain connect prevout counters (not displayed; avoid unbounded growth).
     let _ = rbitcoin_query::connect_prevout_stats::sample_and_reset();
-    let (res_w_wait_ns, res_w_hold_ns, res_w_n, res_r_wait_ns, res_r_hold_ns, res_r_n) =
-        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let pw = rbitcoin_query::confirm_load_stats::sample_and_reset();
     let dens = rbitcoin_consensus::plan_stage_stats::sample_and_reset();
     let arch_res = rbitcoin_query::archive_phase_stats::sample_and_reset();
@@ -811,8 +787,6 @@ pub(crate) fn sample(
         asm_in_n,
         asm_prev_batch_ms: ns_ms(asm_prev_batch_ns),
         asm_prev_batch_n,
-        asm_prev_res_ms: ns_ms(asm_prev_res_ns),
-        asm_prev_res_n,
         asm_prev_same_ms: ns_ms(asm_prev_same_ns),
         asm_prev_same_n,
         asm_prev_cold_ms: ns_ms(asm_prev_cold_ns),
@@ -899,12 +873,6 @@ pub(crate) fn sample(
         load_cold_idx_ms: ns_ms(pw.cold_idx_ns),
         load_cold_idx_n: pw.cold_idx_n,
         load_cold_decode_ms: ns_ms(pw.cold_decode_ns),
-        res_w_wait_ms: ns_ms(res_w_wait_ns),
-        res_w_hold_ms: ns_ms(res_w_hold_ns),
-        res_w_n,
-        res_r_wait_ms: ns_ms(res_r_wait_ns),
-        res_r_hold_ms: ns_ms(res_r_hold_ns),
-        res_r_n,
         load_body_tx_reads: pw.body_tx,
         load_parent_tx_reads: pw.parent_tx,
         load_missing_parents: pw.missing,
@@ -932,11 +900,6 @@ pub(crate) fn sample(
         stamp_mega_ms: ns_ms(stamp_sub.mega_ns),
         stamp_mega_assign_ms: ns_ms(arch_res.prep_assign_ns),
         stamp_mega_collect_ms: ns_ms(arch_res.prep_collect_ns),
-        stamp_mega_res_ms: ns_ms(
-            arch_res
-                .prep_sticky_ns
-                .saturating_add(arch_res.prep_inflight_ns),
-        ),
         stamp_mega_head_ms: ns_ms(arch_res.prep_head_ns),
         stamp_mega_head_fk_ms: ns_ms(arch_res.prep_head_fk_ns),
         stamp_mega_head_dens_ms: ns_ms(arch_res.prep_head_dens_ns),
@@ -968,7 +931,6 @@ pub(crate) fn sample(
         load_edge_fk: pw.edge_fk,
         load_edge_cb: pw.edge_coinbase,
         arch_ext_need: arch_res.ext_need,
-        arch_sticky_hit: arch_res.sticky_hit,
         arch_head_need: arch_res.head_need,
         arch_head_hit: arch_res.head_hit,
         arch_batch_stamp: arch_res.batch_stamp,
@@ -976,7 +938,6 @@ pub(crate) fn sample(
         arch_resolve_blocks: arch_res.blocks,
         arch_prep_assign_ms: ns_ms(arch_res.prep_assign_ns),
         arch_prep_collect_ms: ns_ms(arch_res.prep_collect_ns),
-        arch_prep_sticky_ms: ns_ms(arch_res.prep_sticky_ns),
         arch_prep_inflight_ms: ns_ms(arch_res.prep_inflight_ns),
         arch_prep_head_ms: ns_ms(arch_res.prep_head_ns),
         arch_prep_head_fk_ms: ns_ms(arch_res.prep_head_fk_ns),
@@ -1039,7 +1000,6 @@ fn prep_stage_ms(s: &IbdPerfSample) -> u64 {
 fn plan_mega_ms(s: &IbdPerfSample) -> u64 {
     s.arch_prep_assign_ms
         .saturating_add(s.arch_prep_collect_ms)
-        .saturating_add(s.arch_prep_sticky_ms)
         .saturating_add(s.arch_prep_inflight_ms)
         .saturating_add(s.arch_prep_head_ms)
         .saturating_add(s.arch_prep_stamp_ms)
@@ -1133,7 +1093,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     {
         out.push_str(&format!(
             " stamp_sub(struct={}ms prepare={}ms filter={}ms mega={}ms \
-             mega_assign={}ms collect={}ms res={}ms head_fk={}ms head_dens={}ms head={}ms \
+             mega_assign={}ms collect={}ms head_fk={}ms head_dens={}ms head={}ms \
              stamp={}ms finish={}ms)",
             s.stamp_struct_ms,
             s.stamp_prepare_ms,
@@ -1141,7 +1101,6 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
             s.stamp_mega_ms,
             s.stamp_mega_assign_ms,
             s.stamp_mega_collect_ms,
-            s.stamp_mega_res_ms,
             s.stamp_mega_head_fk_ms,
             s.stamp_mega_head_dens_ms,
             s.stamp_mega_head_ms,
@@ -1878,8 +1837,6 @@ mod tests {
         s.asm_in_n = 50_000;
         s.asm_prev_batch_ms = 2000;
         s.asm_prev_batch_n = 40_000;
-        s.asm_prev_res_ms = 200;
-        s.asm_prev_res_n = 5_000;
         s.asm_prev_same_ms = 50;
         s.asm_prev_same_n = 2_000;
         s.asm_prev_cold_ms = 250;
@@ -1898,12 +1855,6 @@ mod tests {
         s.load_cold_decode_ms = 10;
         s.load_pin_new = 6_000;
         s.load_pin_cache_body = 30_000;
-        s.res_w_wait_ms = 1;
-        s.res_w_hold_ms = 40;
-        s.res_w_n = 12;
-        s.res_r_wait_ms = 5;
-        s.res_r_hold_ms = 80;
-        s.res_r_n = 1000;
         let line = format_info(&s);
         // I1: total = load+connect = 5000; pin=1800; asm=3000; other=200
         assert!(line.contains("prep_budget total=5000ms pin=1800ms asm=3000ms other=200ms"), "{line}");
@@ -1971,7 +1922,6 @@ mod tests {
         s.sh_collect_ms = 12;
         s.sh_runs = 2;
         s.arch_ext_need = 100;
-        s.arch_sticky_hit = 80;
         s.bq_count = 3;
         s.bq_bytes = 64 * 1024 * 1024;
         s.bq_soft_stop = 256;

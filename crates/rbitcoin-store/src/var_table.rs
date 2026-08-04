@@ -88,6 +88,25 @@ impl VarTable {
         self.body.advise_dont_need(offset, len);
     }
 
+    /// Plan body_range idx page IO without reading (plan head-resolve STAGE_IDX).
+    ///
+    /// Caller submits page preads on an owned uring session and decodes via
+    /// [`crate::tx_idx::BodyRangeIdxPlan::decode_range`].
+    pub(crate) fn plan_body_range_idx(
+        &self,
+        fk: Fk,
+    ) -> Result<crate::tx_idx::BodyRangeIdxPlan, StoreError> {
+        let id = fk.get().ok_or(StoreError::InvalidFk)?;
+        if id == 0 {
+            return Err(StoreError::InvalidFk);
+        }
+        let (count, body_end) = self.published_meta();
+        if id > count {
+            return Err(StoreError::NotFound);
+        }
+        self.idx.plan_body_range(id, count, body_end)
+    }
+
     /// Absolute `(offset, len)` of the unframed payload for `fk`.
     ///
     /// **Interior records (`id < count`):** starts of `id` and `id+1` (may span

@@ -667,6 +667,198 @@ impl TxIdx {
     pub fn segment_count(&self) -> usize {
         self.segments_snapshot().len()
     }
+
+    /// Plan body_range idx IO without performing reads (plan head-resolve STAGE_IDX).
+    ///
+    /// `id` is 1-based Class A fk; `count`/`body_end` from [`crate::var_table::VarTable::published_meta`].
+    /// Returns 1–2 OS-page preads plus a decode recipe so the caller can push
+    /// SQEs on an owned [`crate::uring_session::UringSession`] (no nested bulk_io).
+    pub(crate) fn plan_body_range(
+        &self,
+        id: u64,
+        count: u64,
+        body_end: u64,
+    ) -> Result<BodyRangeIdxPlan, StoreError> {
+        if id == 0 || id > count {
+            return Err(StoreError::NotFound);
+        }
+        let segs = self.segments_snapshot();
+        let n_segs = segs.len();
+
+        let (si0, slot0) = locate_slot(&segs, id)?;
+        let page0 = plan_page(&segs[si0], si0, n_segs, slot0)?;
+
+        if id == count {
+            // Last published record: start(id) + body_end.
+            let start_rel = (slot_file_off(slot0) - page0.page_off) as u16;
+            return Ok(BodyRangeIdxPlan {
+                pages: vec![page0],
+                decode: BodyRangeIdxDecode::Last {
+                    start_rel,
+                    start_base: segs[si0].body_base,
+                    body_end,
+                },
+            });
+        }
+
+        let (si1, slot1) = locate_slot(&segs, id + 1)?;
+        let start_rel = (slot_file_off(slot0) - page0.page_off) as u16;
+        let base0 = segs[si0].body_base;
+        let base1 = segs[si1].body_base;
+        let same_page = si0 == si1
+            && align_down(slot_file_off(slot0), IDX_OS_PAGE)
+                == align_down(slot_file_off(slot1), IDX_OS_PAGE);
+
+        if same_page {
+            let end_rel = (slot_file_off(slot1) - page0.page_off) as u16;
+            return Ok(BodyRangeIdxPlan {
+                pages: vec![page0],
+                decode: BodyRangeIdxDecode::Interior {
+                    start_page: 0,
+                    start_rel,
+                    start_base: base0,
+                    end_page: 0,
+                    end_rel,
+                    end_base: base1,
+                },
+            });
+        }
+
+        let page1 = plan_page(&segs[si1], si1, n_segs, slot1)?;
+        let end_rel = (slot_file_off(slot1) - page1.page_off) as u16;
+        Ok(BodyRangeIdxPlan {
+            pages: vec![page0, page1],
+            decode: BodyRangeIdxDecode::Interior {
+                start_page: 0,
+                start_rel,
+                start_base: base0,
+                end_page: 1,
+                end_rel,
+                end_base: base1,
+            },
+        })
+    }
+}
+
+/// One OS-page pread for plan STAGE_IDX (no IO yet).
+#[derive(Clone, Debug)]
+pub(crate) struct IdxPagePlan {
+    pub fd: std::os::fd::RawFd,
+    pub page_off: u64,
+    pub want: usize,
+    pub rw_flags: i32,
+}
+
+/// How to decode `(body_off, body_len)` once page buffers are filled.
+#[derive(Clone, Debug)]
+pub(crate) enum BodyRangeIdxDecode {
+    /// Interior id: starts of id and id+1 (possibly two pages).
+    Interior {
+        start_page: u8,
+        start_rel: u16,
+        start_base: u64,
+        end_page: u8,
+        end_rel: u16,
+        end_base: u64,
+    },
+    /// Last published record: start(id) + published body_end.
+    Last {
+        start_rel: u16,
+        start_base: u64,
+        body_end: u64,
+    },
+}
+
+/// Planned idx IO for one body_range (1–2 page preads + decode).
+#[derive(Clone, Debug)]
+pub(crate) struct BodyRangeIdxPlan {
+    pub pages: Vec<IdxPagePlan>,
+    pub decode: BodyRangeIdxDecode,
+}
+
+impl BodyRangeIdxPlan {
+    /// Decode absolute `(offset, len)` from filled page buffers (same order as `pages`).
+    pub(crate) fn decode_range(&self, page_bufs: &[&[u8]]) -> Result<(u64, u64), StoreError> {
+        match &self.decode {
+            BodyRangeIdxDecode::Last {
+                start_rel,
+                start_base,
+                body_end,
+            } => {
+                let start = decode_slot_abs(page_bufs[0], *start_rel, *start_base)?;
+                if *body_end < start {
+                    return Err(StoreError::Corrupt("var record end < start"));
+                }
+                Ok((start, body_end - start))
+            }
+            BodyRangeIdxDecode::Interior {
+                start_page,
+                start_rel,
+                start_base,
+                end_page,
+                end_rel,
+                end_base,
+            } => {
+                let start = decode_slot_abs(
+                    page_bufs[*start_page as usize],
+                    *start_rel,
+                    *start_base,
+                )?;
+                let end =
+                    decode_slot_abs(page_bufs[*end_page as usize], *end_rel, *end_base)?;
+                if end < start {
+                    return Err(StoreError::Corrupt("var record end < start"));
+                }
+                Ok((start, end - start))
+            }
+        }
+    }
+}
+
+fn locate_slot(segs: &[Segment], id: u64) -> Result<(usize, u64), StoreError> {
+    let si = find_segment_index(segs, id).ok_or(StoreError::NotFound)?;
+    let seg = &segs[si];
+    let slot = id - seg.first_fk;
+    if slot >= seg.count {
+        return Err(StoreError::NotFound);
+    }
+    Ok((si, slot))
+}
+
+fn plan_page(
+    seg: &Segment,
+    si: usize,
+    n_segs: usize,
+    slot: u64,
+) -> Result<IdxPagePlan, StoreError> {
+    let page_off = align_down(slot_file_off(slot), IDX_OS_PAGE);
+    let file_end = seg.file.logical_len();
+    let want = (IDX_OS_PAGE as usize).min(file_end.saturating_sub(page_off) as usize);
+    if want < 4 {
+        return Err(StoreError::Corrupt("tx.idx page too short for STAGE_IDX"));
+    }
+    Ok(IdxPagePlan {
+        fd: seg.file.read_fd(),
+        page_off,
+        want,
+        rw_flags: crate::dontcache_policy::idx_sqe_rw_flags(si, n_segs),
+    })
+}
+
+#[inline]
+fn decode_slot_abs(page: &[u8], rel: u16, body_base: u64) -> Result<u64, StoreError> {
+    let rel_off = rel as usize;
+    if rel_off + 4 > page.len() {
+        return Err(StoreError::Corrupt("tx.idx STAGE_IDX slot OOB"));
+    }
+    let rel_u = u32::from_le_bytes(page[rel_off..rel_off + 4].try_into().unwrap());
+    body_base
+        .checked_add(
+            (rel_u as u64)
+                .checked_mul(IDX_STRIDE)
+                .ok_or(StoreError::Corrupt("tx.idx stride overflow"))?,
+        )
+        .ok_or(StoreError::Corrupt("tx.idx abs overflow"))
 }
 
 #[inline]

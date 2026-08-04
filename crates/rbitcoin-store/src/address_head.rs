@@ -883,10 +883,31 @@ impl AddressHead {
     /// Like [`Self::probe_fks_batch`] with explicit DONTCACHE for this segment.
     ///
     /// Used by [`crate::segmented_head::SegmentedTxHead`] with sealed-age policy.
+    /// Page loads go through TLS bulk_io (`pread_batch` → `with_thread_local`).
     pub fn probe_fks_batch_dontcache(
         &self,
         txids: &[[u8; 32]],
         dontcache: bool,
+    ) -> Result<Vec<Vec<Fk>>, StoreError> {
+        self.probe_fks_batch_dontcache_inner(txids, dontcache, None)
+    }
+
+    /// Same as [`Self::probe_fks_batch_dontcache`] but page preads use the
+    /// **already-held** plan TLS session (no nested `with_thread_local`).
+    pub fn probe_fks_batch_dontcache_on_session(
+        &self,
+        txids: &[[u8; 32]],
+        dontcache: bool,
+        session: &mut crate::uring_session::UringSession,
+    ) -> Result<Vec<Vec<Fk>>, StoreError> {
+        self.probe_fks_batch_dontcache_inner(txids, dontcache, Some(session))
+    }
+
+    fn probe_fks_batch_dontcache_inner(
+        &self,
+        txids: &[[u8; 32]],
+        dontcache: bool,
+        mut session: Option<&mut crate::uring_session::UringSession>,
     ) -> Result<Vec<Vec<Fk>>, StoreError> {
         let n_keys = txids.len();
         if n_keys == 0 {
@@ -904,8 +925,9 @@ impl AddressHead {
             .collect();
         order.sort_unstable_by_key(|&(p, i)| (p, i));
 
-        let mut out = vec![Vec::new(); n_keys];
-        let mut buf = [0u8; PROBE_REGION_BYTES];
+        // Unique pages in order, with [start,end) key ranges into `order`.
+        let mut page_bases: Vec<u64> = Vec::new();
+        let mut page_ranges: Vec<(usize, usize)> = Vec::new();
         let mut i = 0;
         while i < order.len() {
             let page_base = order[i].0;
@@ -913,20 +935,90 @@ impl AddressHead {
             while j < order.len() && order[j].0 == page_base {
                 j += 1;
             }
-            let n = self.load_page_slots(page_base, page_slots, &mut buf, dontcache)?;
-            if n >= es_u {
-                let nslots = (n / es_u) as u64;
-                for &(_, orig) in &order[i..j] {
-                    let txid = &txids[orig];
-                    let h1p = h1_in_page(txid, bits);
-                    let h2p = h2_in_page(txid, bits);
-                    let scan = hop_scan_page(&buf[..n], es, h1p, h2p, nslots, MAX_PROBE);
-                    out[orig] = scan.cands.into_iter().map(|(_, e)| Fk(e)).collect();
-                }
-            }
+            page_bases.push(page_base);
+            page_ranges.push((i, j));
             i = j;
         }
+
+        // One buffer per unique page; bulk-load on session or TLS bulk_io.
+        let mut pages: Vec<Vec<u8>> = page_bases
+            .iter()
+            .map(|&page_base| vec![0u8; self.probe_page_need(page_base, page_slots)])
+            .collect();
+        let page_lens: Vec<usize> = {
+            use crate::bulk_io::{self, ReadOp};
+            let fd = self.file.read_fd();
+            // SAFETY: each pages[i] is a distinct allocation.
+            let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(pages.len());
+            for (pi, &page_base) in page_bases.iter().enumerate() {
+                let off = self.entry_off(page_base);
+                let len = pages[pi].len();
+                let ptr = pages[pi].as_mut_ptr();
+                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+                ops.push(ReadOp {
+                    fd,
+                    offset: off,
+                    buf: slice,
+                    result: i32::MIN,
+                    dontcache,
+                });
+            }
+            if let Some(ref mut s) = session {
+                bulk_io::pread_batch_with_session(s, &mut ops);
+            } else {
+                bulk_io::pread_batch(&mut ops);
+            }
+            let mut lens = vec![0usize; pages.len()];
+            for (pi, page) in pages.iter_mut().enumerate() {
+                let need = page.len();
+                if need == 0 {
+                    continue;
+                }
+                let res = ops[pi].result;
+                if res < 0 {
+                    return Err(StoreError::io(
+                        self.file.path(),
+                        std::io::Error::from_raw_os_error(-res),
+                    ));
+                }
+                if (res as usize) < need {
+                    // Short read — complete via plain pread (no nested TLS).
+                    self.file.read_at(self.entry_off(page_bases[pi]), page)?;
+                }
+                lens[pi] = need;
+            }
+            lens
+        };
+
+        let mut out = vec![Vec::new(); n_keys];
+        for (pi, &(lo, hi)) in page_ranges.iter().enumerate() {
+            let n = page_lens[pi];
+            if n < es_u {
+                continue;
+            }
+            let nslots = (n / es_u) as u64;
+            let buf = &pages[pi][..n];
+            for &(_, orig) in &order[lo..hi] {
+                let txid = &txids[orig];
+                let h1p = h1_in_page(txid, bits);
+                let h2p = h2_in_page(txid, bits);
+                let scan = hop_scan_page(buf, es, h1p, h2p, nslots, MAX_PROBE);
+                out[orig] = scan.cands.into_iter().map(|(_, e)| Fk(e)).collect();
+            }
+        }
         Ok(out)
+    }
+
+    /// Byte length of a probe page load (slot array only, not footer).
+    fn probe_page_need(&self, page_base: u64, n_slots: u64) -> usize {
+        let es = self.layout.entry_bytes as usize;
+        let mut need = (n_slots as usize).saturating_mul(es);
+        need = need.min(PROBE_REGION_BYTES);
+        let off = self.entry_off(page_base);
+        let data_end = self.file.data_len();
+        let avail = data_end.saturating_sub(off) as usize;
+        need = need.min(avail);
+        (need / es) * es
     }
 
     pub fn get_all_candidates(&self, txid: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {

@@ -410,8 +410,26 @@ impl SegmentedTxHead {
     /// **page-coalesced** loads inside each segment ([`AddressHead::probe_fks_batch`]).
     ///
     /// Sealed segments still fuse-gate per key; only keys that pass are batched
-    /// for that segment's page loads.
+    /// for that segment's page loads. Page IO uses TLS bulk_io.
     pub fn probe_candidates_batch(&self, mixed: &[[u8; 32]]) -> Result<Vec<Vec<Fk>>, StoreError> {
+        self.probe_candidates_batch_inner(mixed, None)
+    }
+
+    /// Same as [`Self::probe_candidates_batch`] but head page preads use the
+    /// **already-held** plan TLS session (no nested `with_thread_local`).
+    pub fn probe_candidates_batch_on_session(
+        &self,
+        mixed: &[[u8; 32]],
+        session: &mut crate::uring_session::UringSession,
+    ) -> Result<Vec<Vec<Fk>>, StoreError> {
+        self.probe_candidates_batch_inner(mixed, Some(session))
+    }
+
+    fn probe_candidates_batch_inner(
+        &self,
+        mixed: &[[u8; 32]],
+        mut session: Option<&mut crate::uring_session::UringSession>,
+    ) -> Result<Vec<Vec<Fk>>, StoreError> {
         let n = mixed.len();
         let mut out = vec![Vec::new(); n];
         if n == 0 {
@@ -428,7 +446,10 @@ impl SegmentedTxHead {
             LOOKUP_OPEN.fetch_add(n as u64, Ordering::Relaxed);
             // Open segment = tip (age 0) → never DONTCACHE.
             let dc = crate::dontcache_policy::head_or_idx_segment_index(n_segs - 1, n_segs);
-            let rel_lists = last.head.probe_fks_batch_dontcache(mixed, dc)?;
+            let rel_lists = match session.as_mut() {
+                Some(s) => last.head.probe_fks_batch_dontcache_on_session(mixed, dc, s)?,
+                None => last.head.probe_fks_batch_dontcache(mixed, dc)?,
+            };
             for (i, rels) in rel_lists.into_iter().enumerate() {
                 for r in rels.into_iter().rev() {
                     if let Some(fk) = rel_to_abs(last.first_fk, r.0) {
@@ -471,7 +492,10 @@ impl SegmentedTxHead {
                 continue;
             }
             let dc = crate::dontcache_policy::head_or_idx_segment_index(si, n_segs);
-            let rel_lists = seg.head.probe_fks_batch_dontcache(&pass_keys, dc)?;
+            let rel_lists = match session.as_mut() {
+                Some(s) => seg.head.probe_fks_batch_dontcache_on_session(&pass_keys, dc, s)?,
+                None => seg.head.probe_fks_batch_dontcache(&pass_keys, dc)?,
+            };
             for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
                 for r in rels.into_iter().rev() {
                     if let Some(fk) = rel_to_abs(seg.first_fk, r.0) {

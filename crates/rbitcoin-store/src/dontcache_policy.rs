@@ -62,12 +62,19 @@ pub fn txid_sidefile_entry(fk: u64, published_count: u64) -> bool {
 }
 
 /// `rw_flags` for `txid.body` identity SQEs (0 when unsupported or near tail).
-///
-/// Head/idx direct-session SQEs are not used today — those paths go through
-/// [`crate::bulk_io::ReadOp::dontcache`] + [`head_or_idx_segment_index`].
 #[inline]
 pub fn sidefile_sqe_rw_flags(fk: u64, published_count: u64) -> i32 {
     if txid_sidefile_entry(fk, published_count) && crate::bulk_io::rwf_dontcache_ok() {
+        RWF_DONTCACHE
+    } else {
+        0
+    }
+}
+
+/// `rw_flags` for plan head-resolve `STAGE_IDX` page SQEs (direct session).
+#[inline]
+pub fn idx_sqe_rw_flags(si: usize, n_segs: usize) -> i32 {
+    if head_or_idx_segment_index(si, n_segs) && crate::bulk_io::rwf_dontcache_ok() {
         RWF_DONTCACHE
     } else {
         0

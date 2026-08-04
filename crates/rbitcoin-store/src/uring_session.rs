@@ -1,21 +1,24 @@
 //! Owned io_uring session — **the** ring abstraction for this crate.
 //!
-//! All production io_uring work goes through [`UringSession`]:
-//! - streaming archive head-resolve (one session per resolve batch)
-//! - spend annotate abs-meta RMW (one session per annotate batch)
-//! - [`crate::bulk_io`] pread/pwrite batches and page RMW (thread-local reuse)
+//! All production io_uring work goes through [`UringSession`] via
+//! [`with_thread_local`]:
+//! - plan head-resolve (confirm stamp / denserels)
+//! - spend annotate abs-meta RMW / pure pwrite
+//! - [`crate::bulk_io`] pread/pwrite batches and page RMW
 //!
-//! A session must not be shared across concurrent call stacks. `bulk_io` keeps a
-//! **thread-local** session across waves; nested bulk_io on the same thread opens
-//! a temporary session for that call. Multi-stage pipelines (head-resolve, spend
-//! annotate) own one session for the duration of the batch.
+//! **Lifetime:** one long-lived ring per OS thread (TLS). Nested uring on the
+//! same thread opens a temporary ring so re-entrancy never shares mid-wave.
+//! Do **not** call [`UringSession::new`] on hot paths — that setup/teardowns
+//! every batch.
 
 use crate::error::StoreError;
 use std::os::fd::RawFd;
 use std::path::Path;
 
-/// Default SQ/CQ depth (matches bulk_io).
-/// SQ/CQ depth for all store io_uring sessions (body bulk + annotate + head stream).
+/// Default SQ/CQ depth (bulk_io + spend annotate baseline).
+///
+/// Plan head-resolve may request a larger ring via [`with_thread_local`]; the
+/// TLS session grows in place (never shrinks) for the rest of the thread.
 pub const DEFAULT_ENTRIES: u32 = 128;
 
 /// Linux `RWF_DONTCACHE` — drop pages after IO (kernel 6.14+; ignored if unsupported).
@@ -36,6 +39,10 @@ pub struct UringSession {
 
 impl UringSession {
     /// Open a private ring. Returns `Err` if io_uring is disabled or setup fails.
+    ///
+    /// Prefer [`with_thread_local`] on production paths (avoids setup/teardown).
+    /// Kept for unit tests / one-shot probes only.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(entries: u32) -> Result<Self, StoreError> {
         if !crate::bulk_io::io_uring_enabled() {
             return Err(StoreError::Corrupt("io_uring unavailable"));
@@ -45,7 +52,7 @@ impl UringSession {
 
     /// Create a ring without consulting [`crate::bulk_io::io_uring_enabled`].
     ///
-    /// Used for capability probe and by `bulk_io` after the gate has already
+    /// Used for capability probe and by TLS open after the gate has already
     /// passed (avoids recursion through `io_uring_enabled` → probe → here).
     pub(crate) fn try_open(entries: u32) -> Result<Self, StoreError> {
         let entries = entries.max(32).min(4096);
@@ -74,9 +81,14 @@ impl UringSession {
         self.in_flight
     }
 
+    pub fn entries(&self) -> u32 {
+        self.entries
+    }
+
     pub fn free_sq(&self) -> usize {
         (self.entries as usize).saturating_sub(self.in_flight)
     }
+
 
     /// Push a pread SQE. Buffer must stay live until the CQE is harvested.
     pub fn push_pread(
@@ -260,6 +272,79 @@ impl Drop for UringSession {
         self.drain_all();
     }
 }
+/// Run `f` with this **OS thread's** long-lived io_uring session.
+///
+/// - Opens once on first use; reopens only if `min_entries` exceeds the current
+///   ring size (grows for plan head-resolve 1024, then stays large).
+/// - Nested calls open a **temporary** ring (re-entrancy safe; no mid-wave share).
+/// - Drains stray in-flight CQEs before handing the session to `f`.
+///
+/// Returns `Err` if io_uring is unavailable or setup fails. Callers that prefer
+/// a silent fallback can map `Err` themselves (bulk_io does).
+pub fn with_thread_local<R>(
+    min_entries: u32,
+    f: impl FnOnce(&mut UringSession) -> R,
+) -> Result<R, StoreError> {
+    let min_entries = min_entries.max(32).min(4096);
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = min_entries;
+        let _ = f;
+        return Err(StoreError::Corrupt("io_uring is Linux-only"));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::cell::{Cell, RefCell};
+
+        thread_local! {
+            static SESSION: RefCell<Option<UringSession>> = const { RefCell::new(None) };
+            static DEPTH: Cell<u32> = const { Cell::new(0) };
+        }
+
+        // Gate once; TLS open uses try_open to avoid recursive enabled() probe.
+        if !crate::bulk_io::io_uring_enabled() {
+            return Err(StoreError::Corrupt("io_uring unavailable"));
+        }
+
+        DEPTH.with(|depth| {
+            let d = depth.get();
+            depth.set(d.saturating_add(1));
+            let out = if d == 0 {
+                SESSION.with(|cell| -> Result<R, StoreError> {
+                    let mut slot = cell.borrow_mut();
+                    let need_open = match slot.as_ref() {
+                        None => true,
+                        Some(s) => s.entries() < min_entries,
+                    };
+                    if need_open {
+                        if let Some(mut old) = slot.take() {
+                            if old.in_flight() != 0 {
+                                old.drain_all();
+                            }
+                            drop(old);
+                        }
+                        let open_n = min_entries.max(DEFAULT_ENTRIES);
+                        *slot = Some(UringSession::try_open(open_n)?);
+                    }
+                    let session = slot.as_mut().expect("session just ensured");
+                    if session.in_flight() != 0 {
+                        session.drain_all();
+                    }
+                    Ok(f(session))
+                })
+            } else {
+                let mut s = UringSession::try_open(min_entries.max(DEFAULT_ENTRIES))?;
+                Ok(f(&mut s))
+            };
+            depth.set(d);
+            out
+        })
+    }
+}
+
+
 
 // Test hook: last SQE rw_flags values from push_*_flags.
 #[cfg(test)]

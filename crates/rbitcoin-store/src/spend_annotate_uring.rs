@@ -56,7 +56,6 @@ pub fn put_spend_batch_by_abs_meta_uring(
         }
     }
 
-    let mut session = UringSession::new(uring_session::DEFAULT_ENTRIES)?;
     let body_fd: RawFd = txs.body.body_read_fd();
     let body_path = txs.body.body_file_path().to_path_buf();
     let body_pub = txs.body.body_published_len();
@@ -75,6 +74,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
         return Ok(cold);
     }
 
+    uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
     // Pending edge indices not yet started.
     let mut pending: VecDeque<usize> = (0..work.len()).collect();
     // Abs offsets with an RMW in flight (serialize same-outpoint).
@@ -123,7 +123,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
     };
 
     arm(
-        &mut session,
+        session,
         &mut free_slots,
         &mut slots,
         &mut pending,
@@ -288,7 +288,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
         }
 
         arm(
-            &mut session,
+            session,
             &mut free_slots,
             &mut slots,
             &mut pending,
@@ -315,6 +315,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
     }
 
     Ok(cold)
+    })?
 }
 
 /// Pick next edge that can start: abs not busy, or from wait queues.
@@ -476,29 +477,18 @@ fn put_spend_batch_pure_write_uring(
     if writes.is_empty() {
         return Ok(cold);
     }
-    let mut session = match UringSession::new(uring_session::DEFAULT_ENTRIES) {
-        Ok(s) => s,
-        Err(e) => {
-            rbitcoin_log::debug!(
-                "store: spend annotate pure-write uring unavailable ({e}); pwrite fallback"
-            );
-            for &(abs, cfk, vout, sfk, meta) in writes {
-                if let Err(_) = txs.body.write_body_abs_pwrite(abs, &meta) {
-                    cold.push((cfk, vout, sfk));
-                }
-            }
-            return Ok(cold);
-        }
-    };
     let body_fd: RawFd = txs.body.body_read_fd();
     let body_path = txs.body.body_file_path().to_path_buf();
 
-    // Stable payload buffers for in-flight pwrites.
+    // Stable payload buffers for in-flight pwrites (outside TLS open so fallback
+    // can still use `writes` / `cold` if the ring is unavailable).
     let mut bufs: Vec<[u8; META_LEN]> = writes.iter().map(|w| w.4).collect();
+    let run = uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
     let mut pending: VecDeque<usize> = (0..writes.len()).collect();
     let mut free_slots: Vec<usize> = (0..MAX_SLOTS.min(writes.len().max(1))).collect();
     let mut slots: Vec<Option<usize>> = (0..free_slots.len()).map(|_| None).collect();
     let mut in_flight = 0usize;
+    let mut cold_local = cold.clone();
 
     let arm = |session: &mut UringSession,
                free_slots: &mut Vec<usize>,
@@ -525,7 +515,7 @@ fn put_spend_batch_pure_write_uring(
     };
 
     arm(
-        &mut session,
+        session,
         &mut free_slots,
         &mut slots,
         &mut pending,
@@ -570,11 +560,11 @@ fn put_spend_batch_pure_write_uring(
             free_slots.push(slot);
             if res as usize != META_LEN {
                 let (_, cfk, vout, sfk, _) = writes[wi];
-                cold.push((cfk, vout, sfk));
+                cold_local.push((cfk, vout, sfk));
             }
         }
         arm(
-            &mut session,
+            session,
             &mut free_slots,
             &mut slots,
             &mut pending,
@@ -589,10 +579,37 @@ fn put_spend_batch_pure_write_uring(
 
     while let Some(wi) = pending.pop_front() {
         let (_, cfk, vout, sfk, _) = writes[wi];
-        cold.push((cfk, vout, sfk));
+        cold_local.push((cfk, vout, sfk));
     }
-    Ok(cold)
+    Ok(cold_local)
+    });
+    match run {
+        Ok(Ok(c)) => Ok(c),
+        Ok(Err(e)) => {
+            rbitcoin_log::debug!(
+                "store: spend annotate pure-write uring error ({e}); pwrite fallback"
+            );
+            for &(abs, cfk, vout, sfk, meta) in writes {
+                if txs.body.write_body_abs_pwrite(abs, &meta).is_err() {
+                    cold.push((cfk, vout, sfk));
+                }
+            }
+            Ok(cold)
+        }
+        Err(e) => {
+            rbitcoin_log::debug!(
+                "store: spend annotate pure-write uring unavailable ({e}); pwrite fallback"
+            );
+            for &(abs, cfk, vout, sfk, meta) in writes {
+                if txs.body.write_body_abs_pwrite(abs, &meta).is_err() {
+                    cold.push((cfk, vout, sfk));
+                }
+            }
+            Ok(cold)
+        }
+    }
 }
+
 
 #[cfg(test)]
 mod tests {

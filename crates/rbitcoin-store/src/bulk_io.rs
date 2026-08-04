@@ -278,49 +278,18 @@ pub fn page_rmw_pipelined(
     page_rmw_pipelined_uring(pages, apply)
 }
 
-/// Thread-local bulk ring: one owned session per thread, reused across waves.
-/// Nested `with_bulk_session` opens a temporary ring so re-entrancy stays safe.
+/// Thread-local bulk ring via [`crate::uring_session::with_thread_local`].
+/// Nested calls get a temporary ring (re-entrancy safe).
 #[cfg(target_os = "linux")]
 fn with_bulk_session<R>(f: impl FnOnce(&mut crate::uring_session::UringSession) -> R) -> Option<R> {
-    use crate::uring_session::UringSession;
-    use std::cell::{Cell, RefCell};
-
-    thread_local! {
-        static SESSION: RefCell<Option<UringSession>> = const { RefCell::new(None) };
-        static DEPTH: Cell<u32> = const { Cell::new(0) };
+    match crate::uring_session::with_thread_local(RING_ENTRIES, f) {
+        Ok(r) => Some(r),
+        Err(_) => {
+            // Permanent disable only on setup failure (same as prior TL open path).
+            URING_MODE.store(2, Ordering::Relaxed);
+            None
+        }
     }
-
-    DEPTH.with(|depth| {
-        let d = depth.get();
-        depth.set(d + 1);
-        let out = if d == 0 {
-            SESSION.with(|cell| {
-                let mut slot = cell.borrow_mut();
-                if slot.is_none() {
-                    match UringSession::try_open(RING_ENTRIES) {
-                        Ok(s) => *slot = Some(s),
-                        Err(_) => {
-                            URING_MODE.store(2, Ordering::Relaxed);
-                            return None;
-                        }
-                    }
-                }
-                let session = slot.as_mut().expect("session just ensured");
-                if session.in_flight() != 0 {
-                    session.drain_all();
-                }
-                Some(f(session))
-            })
-        } else {
-            // Re-entrant bulk_io on this thread: do not share the TL ring mid-wave.
-            match UringSession::try_open(RING_ENTRIES) {
-                Ok(mut s) => Some(f(&mut s)),
-                Err(_) => None,
-            }
-        };
-        depth.set(d);
-        out
-    })
 }
 
 /// Pipelined bulk pread via thread-local [`crate::uring_session::UringSession`].

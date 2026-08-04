@@ -2987,6 +2987,9 @@ mod tests {
         if !crate::bulk_io::io_uring_enabled() {
             return;
         }
+        // Serialize: head_resolve_stats are process-wide atomics.
+        static STATS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = STATS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "rbitcoin-stream-early-{}",
             std::time::SystemTime::now()
@@ -3028,8 +3031,7 @@ mod tests {
         let range = batch[0].1.unwrap().1;
         assert!(range.1 > 0, "body range from idx on winner");
         let s = crate::head_resolve_stats::sample_and_reset();
-        // Deepest-first early exit: body_lookups ≤ cands (exact `==1` is flaky under
-        // parallel tests sharing head_resolve_stats atomics).
+        // Deepest-first early exit: body_lookups ≤ cands.
         assert!(
             s.body_lookups <= s.cands.max(1),
             "body_lookups {} > cands {}",

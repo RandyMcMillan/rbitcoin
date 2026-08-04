@@ -245,7 +245,18 @@ fn resolve_fk_and_range_uring(
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     crate::head_resolve_stats::add_keys(txids.len() as u64);
 
-    let mut session = UringSession::new(PLAN_URING_ENTRIES)?;
+    // Thread-local ring (grows to PLAN_URING_ENTRIES on this path).
+    uring_session::with_thread_local(PLAN_URING_ENTRIES, |session| {
+        resolve_fk_and_range_uring_on(session, table, txids)
+    })?
+}
+
+
+fn resolve_fk_and_range_uring_on(
+    session: &mut UringSession,
+    table: &TxTable,
+    txids: &[[u8; 32]],
+) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     let side = table.txid_sidefile();
     let side_fd: RawFd = side.body_read_fd();
     let side_path = side.file_path().to_path_buf();
@@ -278,7 +289,7 @@ fn resolve_fk_and_range_uring(
         txids,
         &cands_u64,
         side,
-        &mut session,
+        session,
         side_fd,
         count,
         &mut free_slots,
@@ -351,7 +362,7 @@ fn resolve_fk_and_range_uring(
                     table,
                     side,
                     slots[slot].as_mut().unwrap(),
-                    &mut session,
+                    session,
                     side_fd,
                     count,
                     slot as u32,
@@ -372,7 +383,7 @@ fn resolve_fk_and_range_uring(
                 txids,
                 &mut slots,
                 slot,
-                &mut session,
+                session,
                 side,
                 side_fd,
                 count,
@@ -398,7 +409,7 @@ fn resolve_fk_and_range_uring(
             txids,
             &cands_u64,
             side,
-            &mut session,
+            session,
             side_fd,
             count,
             &mut free_slots,

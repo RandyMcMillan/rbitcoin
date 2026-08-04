@@ -173,6 +173,14 @@ pub mod confirm_load_stats {
     pub static PIN_NEW_META_NS: AtomicU64 = AtomicU64::new(0);
     /// Wire pin sub-walls (ns).
     pub static PLAN_PIN_NS: AtomicU64 = AtomicU64::new(0);
+    /// Pipeline store adopt (bulk Weak upgrade) wall.
+    pub static PIN_ADOPT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Post cold-range denserels: insert_owned into BatchParents (not IO).
+    pub static PIN_RANGE_FILL_NS: AtomicU64 = AtomicU64::new(0);
+    /// Final pin contract (contains + pin_covered) wall.
+    pub static PIN_CONTRACT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Pipeline store publish (bulk Weak insert + conflict merge) wall.
+    pub static PIN_PUBLISH_NS: AtomicU64 = AtomicU64::new(0);
     /// Cold denserels wall (range + idx). Prefer split fields when diagnosing.
     pub static COLD_IO_NS: AtomicU64 = AtomicU64::new(0);
     /// Cold denserels via plan stamp body range (`get_outs_denserels_by_range_batch`).
@@ -216,6 +224,10 @@ pub mod confirm_load_stats {
         pub pin_body_ns: u64,
         pub pin_new_meta_ns: u64,
         pub plan_pin_ns: u64,
+        pub pin_adopt_ns: u64,
+        pub pin_range_fill_ns: u64,
+        pub pin_contract_ns: u64,
+        pub pin_publish_ns: u64,
         pub cold_io_ns: u64,
         pub cold_range_ns: u64,
         pub cold_range_n: u64,
@@ -252,6 +264,10 @@ pub mod confirm_load_stats {
             pin_body_ns: PIN_BODY_NS.swap(0, Ordering::Relaxed),
             pin_new_meta_ns: PIN_NEW_META_NS.swap(0, Ordering::Relaxed),
             plan_pin_ns: PLAN_PIN_NS.swap(0, Ordering::Relaxed),
+            pin_adopt_ns: PIN_ADOPT_NS.swap(0, Ordering::Relaxed),
+            pin_range_fill_ns: PIN_RANGE_FILL_NS.swap(0, Ordering::Relaxed),
+            pin_contract_ns: PIN_CONTRACT_NS.swap(0, Ordering::Relaxed),
+            pin_publish_ns: PIN_PUBLISH_NS.swap(0, Ordering::Relaxed),
             cold_io_ns: COLD_IO_NS.swap(0, Ordering::Relaxed),
             cold_range_ns: COLD_RANGE_NS.swap(0, Ordering::Relaxed),
             cold_range_n: COLD_RANGE_N.swap(0, Ordering::Relaxed),

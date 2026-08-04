@@ -3,6 +3,15 @@
 version = 3
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -472,6 +481,7 @@ version = "0.1.0"
 name = "rbitcoin-query"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "bitcoin",
  "rbitcoin-log",
  "rbitcoin-primitives",
@@ -521,6 +531,12 @@ version = "0.1.0"
 dependencies = [
  "rbitcoin-primitives",
 ]
+
+[[package]]
+name = "rustversion"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "secp256k1"

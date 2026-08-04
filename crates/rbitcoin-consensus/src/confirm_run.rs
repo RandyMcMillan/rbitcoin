@@ -1532,9 +1532,11 @@ fn pin_for_wire_batch(
     };
     // One store lock: adopt live shared pins (writeq / peer prep overlap) so free
     // path can skip OutputRecord clones when need is already covered.
+    let t_adopt = Instant::now();
     if pipeline_parent_store.is_some() {
         batch_parents.adopt_from_store(parent_vouts.keys().copied());
     }
+    let adopt_ns = t_adopt.elapsed().as_nanos() as u64;
     let mut still_need: HashMap<u64, Vec<u32>> = HashMap::new();
     let mut n_plan_pin = 0u64;
 
@@ -1544,6 +1546,8 @@ fn pin_for_wire_batch(
     for (id, need) in &parent_vouts {
         let fk = rbitcoin_primitives::Fk(*id);
         // Cross-batch share hit: pin already covers need after adopt.
+        // Pure hit: only refresh meta when plan/layout material is present
+        // (skip empty refresh_pin_meta and avoid redundant outs loads).
         if !need.is_empty() && batch_parents.pin_covered(fk, need) {
             if let Some(pin) = plan_by_id.get(id) {
                 let (tx, _outs, denserels) = pin.as_ref();
@@ -1558,8 +1562,9 @@ fn pin_for_wire_batch(
                 } else {
                     Vec::new()
                 };
-                // Layout / coinbase only — no outs/tx clone.
-                batch_parents.refresh_pin_meta(fk, cb, plan_range, sparse);
+                if cb.is_some() || plan_range.is_some() || !sparse.is_empty() {
+                    batch_parents.refresh_pin_meta(fk, cb, plan_range, sparse);
+                }
             } else if let Some(plan) = plan {
                 // Sparse external: layout/coinbase only from plan-local pin.
                 if let Some(ext) = plan.external_parent_outs.get(id) {
@@ -1575,7 +1580,9 @@ fn pin_for_wire_batch(
                         .copied()
                         .filter(|(v, _)| need.binary_search(v).is_ok())
                         .collect();
-                    batch_parents.refresh_pin_meta(fk, cb, plan_range, sparse);
+                    if cb.is_some() || plan_range.is_some() || !sparse.is_empty() {
+                        batch_parents.refresh_pin_meta(fk, cb, plan_range, sparse);
+                    }
                 }
             }
             n_plan_pin = n_plan_pin.saturating_add(1);
@@ -1712,6 +1719,7 @@ fn pin_for_wire_batch(
             confirm_load_stats::COLD_RANGE_N.fetch_add(n_range, Ordering::Relaxed);
             confirm_load_stats::BODY_TX_READS.fetch_add(n_range, Ordering::Relaxed);
             confirm_load_stats::PIN_NEW.fetch_add(n_range, Ordering::Relaxed);
+            let t_range_fill = Instant::now();
             for ((fk, range, _tid, need), row) in
                 range_jobs.into_iter().zip(decoded.into_iter())
             {
@@ -1740,6 +1748,11 @@ fn pin_for_wire_batch(
                 );
                 still_need.remove(&id);
                 n_plan_pin = n_plan_pin.saturating_add(1);
+            }
+            let range_fill_ns = t_range_fill.elapsed().as_nanos() as u64;
+            if range_fill_ns > 0 {
+                confirm_load_stats::PIN_RANGE_FILL_NS
+                    .fetch_add(range_fill_ns, Ordering::Relaxed);
             }
         }
     }
@@ -1853,6 +1866,7 @@ fn pin_for_wire_batch(
 
     // Pin contract: every spent parent is in BatchParents with need outs.
     // Denserels/body_range may wait for write ensure (prep-ahead plan pin).
+    let t_contract = Instant::now();
     for (id, need) in &parent_vouts {
         let fk = rbitcoin_primitives::Fk(*id);
         if !batch_parents.contains(fk) {
@@ -1866,9 +1880,12 @@ fn pin_for_wire_batch(
             )));
         }
     }
+    let contract_ns = t_contract.elapsed().as_nanos() as u64;
 
     // One store lock: publish Weaks so peer prep/writeq can adopt the same Arc.
+    let t_publish = Instant::now();
     batch_parents.publish_to_store();
+    let publish_ns = t_publish.elapsed().as_nanos() as u64;
 
     let n_unique = parent_vouts.len() as u64;
     if n_unique > 0 {
@@ -1884,6 +1901,15 @@ fn pin_for_wire_batch(
     }
     if plan_pin_ns > 0 {
         confirm_load_stats::PLAN_PIN_NS.fetch_add(plan_pin_ns, Ordering::Relaxed);
+    }
+    if adopt_ns > 0 {
+        confirm_load_stats::PIN_ADOPT_NS.fetch_add(adopt_ns, Ordering::Relaxed);
+    }
+    if contract_ns > 0 {
+        confirm_load_stats::PIN_CONTRACT_NS.fetch_add(contract_ns, Ordering::Relaxed);
+    }
+    if publish_ns > 0 {
+        confirm_load_stats::PIN_PUBLISH_NS.fetch_add(publish_ns, Ordering::Relaxed);
     }
     if cold_io_ns > 0 {
         confirm_load_stats::COLD_IO_NS.fetch_add(cold_io_ns, Ordering::Relaxed);
@@ -2595,6 +2621,7 @@ fn ensure_spend_abs_layouts(
             // Ensure path: identity from plan RAM only (no sidefile required for layout).
             fill_create_txid_from_ram(&mut tx, id, None);
             if batch_parents.contains(c.fk) {
+                // Layout-only publish with already_covers short-circuit (batched style).
                 batch_parents.set_layout_for_need(c.fk, c.body_range, &dense_rels, &need_v);
                 continue;
             }

@@ -54,6 +54,8 @@ bitcoin_hashes = "0.14.101"
 # BIP324 v2 encrypted P2P transport (tokio async ProtocolReader/Writer).
 bip324 = { version = "0.11", default-features = true, features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "rt", "signal", "fs"] }
+# Lock-free Arc publish for immutable pin outs/layout halves
+arc-swap = "1"
 
 # Fail the build on rustc warnings (unused imports, dead code, …).
 [workspace.lints.rust]

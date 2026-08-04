@@ -607,9 +607,30 @@ impl BatchParents {
     /// re-entering the pin slot.
     #[inline]
     pub fn get_parent_txout_parts(&self, fk: Fk, vout: u32) -> Option<(i64, Vec<u8>, [u8; 32])> {
+        self.parent_txout_parts_inner(fk, vout, true)
+    }
+
+    /// Same as [`get_parent_txout_parts`] but **always** `load_outs` (no sticky).
+    /// Used as the fair cold control for sticky benches / tests.
+    #[inline]
+    pub fn get_parent_txout_parts_no_sticky(
+        &self,
+        fk: Fk,
+        vout: u32,
+    ) -> Option<(i64, Vec<u8>, [u8; 32])> {
+        self.parent_txout_parts_inner(fk, vout, false)
+    }
+
+    #[inline]
+    fn parent_txout_parts_inner(
+        &self,
+        fk: Fk,
+        vout: u32,
+        use_sticky: bool,
+    ) -> Option<(i64, Vec<u8>, [u8; 32])> {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
-        let outs = {
+        let outs = if use_sticky {
             let mut st = self.sticky_outs.borrow_mut();
             match st.as_ref() {
                 Some((sid, snap)) if *sid == id => Arc::clone(snap),
@@ -619,6 +640,8 @@ impl BatchParents {
                     snap
                 }
             }
+        } else {
+            e.load_outs()
         };
         let i = outs.outs.binary_search_by_key(&vout, |(v, _)| *v).ok()?;
         let o = &outs.outs[i].1;
@@ -1298,13 +1321,10 @@ mod tests {
     /// Timed synthetic: multi-pack insert + layout compose at few-block scale.
     /// Prints ns/op so IBD regressions are visible without a criterion harness.
     ///
-    /// Phases:
-    /// - insert: vacant local puts
-    /// - covered: adopt + same-need re-insert (no-op Arc keep — free-pin share hit)
-    /// - layout: set_layout_for_need without extra outs (layout-only half)
-    /// - layout2: second ensure pass (no-op publish short-circuit)
-    /// - widen: real new vout compose
-    /// - assemble: multi-input same-parent sticky prevout lookup
+    /// **Probe shape matches pre-recovery baseline** (single need-vout insert) so
+    /// covered/layout can be compared to `bench-baseline-*.txt`. Extra phases:
+    /// - layout2: second ensure (same `set_layout_for_need` API, no-op path)
+    /// - assemble: sticky vs `get_parent_txout_parts_no_sticky` (same return path)
     #[test]
     fn pin_compose_multi_pack_timed() {
         let n_parents = 8_000usize; // ~input budget scale
@@ -1315,11 +1335,11 @@ mod tests {
             a.insert_owned(
                 Fk(i),
                 tx((i % 200) as u8),
-                vec![(0, out(i as i64)), (1, out(i as i64 + 1))],
-                vec![0, 1],
+                vec![(0, out(i as i64))],
+                vec![0],
                 Some(false),
                 None,
-                vec![(0, 10), (1, 20)],
+                vec![(0, 10)],
             );
         }
         a.publish_to_store();
@@ -1342,17 +1362,17 @@ mod tests {
         }
         let covered_ns = t_cov.elapsed().as_nanos();
 
-        // Layout-only fill (write ensure path).
+        // Layout-only fill (write ensure path) — same denserels shape as baseline.
         let t_lay = std::time::Instant::now();
         for i in 1..=n_parents as u64 {
-            cov.set_layout_for_need(Fk(i), (i * 100, 50), &[10, 20], &[]);
+            cov.set_layout_for_need(Fk(i), (i * 100, 50), &[10], &[]);
         }
         let layout_ns = t_lay.elapsed().as_nanos();
 
-        // Second ensure pass — should be near free (already_covers short-circuit).
+        // Second ensure pass — same API; already_covers short-circuit.
         let t_lay2 = std::time::Instant::now();
         for i in 1..=n_parents as u64 {
-            cov.set_layout_for_need(Fk(i), (i * 100, 50), &[10, 20], &[]);
+            cov.set_layout_for_need(Fk(i), (i * 100, 50), &[10], &[]);
         }
         let layout2_ns = t_lay2.elapsed().as_nanos();
 
@@ -1364,18 +1384,18 @@ mod tests {
             b.insert_owned(
                 Fk(i),
                 tx((i % 200) as u8),
-                vec![(2, out(i as i64 + 2))],
-                vec![2],
+                vec![(1, out(i as i64 + 1))],
+                vec![1],
                 None,
                 Some((i * 100, 50)),
-                vec![(2, 30)],
+                vec![(1, 20)],
             );
         }
         b.publish_to_store();
         let widen_ns = t1.elapsed().as_nanos();
 
-        // Multi-input same-parent assemble: for each parent, spend both vouts
-        // 10× (sticky reuses outs Arc; cold always reloads).
+        // Multi-input same-parent: vouts 0 and 1 after widen (shared Arc on `a`).
+        // Fair cold = same `parent_txout_parts` path with sticky disabled.
         let reps = 10usize;
         let n_inputs = n_parents * reps * 2;
         let t_cold = std::time::Instant::now();
@@ -1383,8 +1403,8 @@ mod tests {
         for p in 1..=n_parents as u64 {
             for _ in 0..reps {
                 for vout in 0u32..2 {
-                    if let Some((_, o)) = a.get_parent_out(Fk(p), vout) {
-                        sum_c = sum_c.wrapping_add(o.value);
+                    if let Some((v, _, _)) = a.get_parent_txout_parts_no_sticky(Fk(p), vout) {
+                        sum_c = sum_c.wrapping_add(v);
                     }
                 }
             }
@@ -1413,10 +1433,10 @@ mod tests {
         eprintln!(
             "pin_compose_multi_pack n={n_parents} \
              insert={:.1}ns/op covered={:.1}ns/op layout={:.1}ns/op layout2={:.1}ns/op \
-             widen={:.1}ns/op assemble_sticky={:.1}ns/op assemble_cold={:.1}ns/op \
+             widen={:.1}ns/op assemble_sticky={:.1}ns/op assemble_nosticky={:.1}ns/op \
              (insert_ns={insert_ns} covered_ns={covered_ns} layout_ns={layout_ns} \
              layout2_ns={layout2_ns} widen_ns={widen_ns} assemble_ns={assemble_ns} \
-             assemble_cold_ns={assemble_cold_ns} n_in={n_inputs})",
+             assemble_nosticky_ns={assemble_cold_ns} n_in={n_inputs})",
             insert_ns as f64 / n,
             covered_ns as f64 / n,
             layout_ns as f64 / n,
@@ -1425,10 +1445,15 @@ mod tests {
             assemble_ns as f64 / n_inputs as f64,
             assemble_cold_ns as f64 / n_inputs as f64,
         );
-        // Sticky same-parent path must beat always-reload get_parent_out.
+        // Sticky must beat same-API no-sticky control (not get_parent_out).
         assert!(
             assemble_ns < assemble_cold_ns,
-            "sticky assemble should beat cold reload: sticky={assemble_ns} cold={assemble_cold_ns}"
+            "sticky assemble should beat no-sticky same API: sticky={assemble_ns} nosticky={assemble_cold_ns}"
+        );
+        // Ensure no-op must beat first layout fill (same set_layout_for_need).
+        assert!(
+            layout2_ns < layout_ns,
+            "layout no-op must beat first ensure: layout={layout_ns} layout2={layout2_ns}"
         );
         // Sanity bound: free-plan insert should stay well under 50µs/op even in debug.
         assert!(
@@ -1441,11 +1466,28 @@ mod tests {
             covered_ns < widen_ns,
             "covered re-insert should beat widen: covered={covered_ns} widen={widen_ns}"
         );
-        // Second layout pass must not be slower than first (no-op path).
-        assert!(
-            layout2_ns <= layout_ns.saturating_mul(2),
-            "layout no-op should not regress badly: layout={layout_ns} layout2={layout2_ns}"
+    }
+
+    /// Sticky and no-sticky assemble APIs return identical prevout parts.
+    #[test]
+    fn sticky_and_nosticky_txout_parts_match() {
+        let mut bp = BatchParents::new();
+        bp.insert_owned(
+            Fk(3),
+            tx(3),
+            vec![(0, out(11)), (1, out(22))],
+            vec![0, 1],
+            Some(false),
+            None,
+            Vec::new(),
         );
+        for vout in [0u32, 1] {
+            let s = bp.get_parent_txout_parts(Fk(3), vout).unwrap();
+            let c = bp.get_parent_txout_parts_no_sticky(Fk(3), vout).unwrap();
+            assert_eq!(s.0, c.0);
+            assert_eq!(s.1, c.1);
+            assert_eq!(s.2, c.2);
+        }
     }
 
     /// Sticky outs: consecutive same-parent lookups share one Arc (no re-load).

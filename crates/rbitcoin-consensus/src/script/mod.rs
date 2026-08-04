@@ -15,6 +15,8 @@ mod p2wsh;
 #[cfg(test)]
 mod core_vectors;
 #[cfg(test)]
+mod core_tx_vectors;
+#[cfg(test)]
 mod tests_verify;
 
 use bitcoin::{Transaction, TxOut};

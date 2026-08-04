@@ -281,11 +281,12 @@ pub(crate) fn eval_script(
 
         match ins {
             Instruction::PushBytes(b) => {
+                // Core: MAX_SCRIPT_ELEMENT_SIZE even in unexecuted branches.
+                let data = b.as_bytes();
+                if data.len() > 520 {
+                    return Err(ConsensusError::Script("push too large".into()));
+                }
                 if executing {
-                    let data = b.as_bytes();
-                    if data.len() > 520 {
-                        return Err(ConsensusError::Script("push too large".into()));
-                    }
                     push(stack, data.to_vec())?;
                 }
             }
@@ -338,16 +339,27 @@ pub(crate) fn eval_script(
                     _ => {}
                 }
 
-                if !executing {
-                    continue;
+                // Core: OP_VERIF / OP_VERNOTIF always fail (even unexecuted).
+                if code == 0x65 || code == 0x66 {
+                    return Err(ConsensusError::Script("OP_VERIF".into()));
+                }
+                // Core: disabled opcodes fail even in unexecuted branches (legacy/v0).
+                if ctx.sig_version != SigVersion::TapScript && is_disabled_legacy(code) {
+                    return Err(ConsensusError::Script(format!(
+                        "disabled opcode 0x{code:02x}"
+                    )));
                 }
 
-                // Legacy / v0: non-push opcodes count toward 201. Tapscript: no limit.
+                // Legacy / v0: non-push opcodes count toward 201 even when skipped.
                 if enforce_op_limit && code > 0x60 {
                     op_count += 1;
                     if op_count > MAX_OPS_LEGACY {
                         return Err(ConsensusError::Script("op count".into()));
                     }
+                }
+
+                if !executing {
+                    continue;
                 }
 
                 match code {
@@ -1392,6 +1404,31 @@ mod success_and_disabled_tests {
         assert!(
             msg.contains("disabled") || msg.contains("0x7e"),
             "unexpected: {msg}"
+        );
+    }
+
+    /// Core: disabled opcodes fail even in unexecuted IF branches.
+    #[test]
+    fn unexecuted_disabled_opcode_still_rejects() {
+        // OP_0 IF OP_CAT ELSE OP_1 ENDIF → IF body not taken, but CAT still fails.
+        let script = vec![0x00, 0x63, 0x7e, 0x67, 0x51, 0x68];
+        let err = eval(&script, SigVersion::Base).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("disabled") || msg.contains("0x7e"),
+            "Core rejects unexecuted CAT: {msg}"
+        );
+    }
+
+    /// Core: OP_VERIF always fails even when not executing.
+    #[test]
+    fn unexecuted_verif_still_rejects() {
+        // OP_0 IF OP_VERIF ELSE OP_1 ENDIF
+        let script = vec![0x00, 0x63, 0x65, 0x67, 0x51, 0x68];
+        let err = eval(&script, SigVersion::Base).unwrap_err();
+        assert!(
+            format!("{err}").contains("VERIF") || format!("{err}").contains("opcode"),
+            "{err}"
         );
     }
 

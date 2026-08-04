@@ -10,9 +10,42 @@ Every consensus rule **we implement** (not delegated wholesale to rust-bitcoin) 
 nix-shell
 cargo test -p rbitcoin-consensus --lib
 cargo test -p rbitcoin-test --test consensus_rules
+# Core JSON corpora (script_tests / tx_valid / tx_invalid):
+cargo test -p rbitcoin-consensus --lib core_script_tests_all_rows -- --nocapture
+cargo test -p rbitcoin-consensus --lib core_tx_ -- --nocapture
 # broader integration still covers connect success paths:
 cargo test -p rbitcoin-test --test scenarios consensus_
 ```
+
+## Core consensus corpora (1:1 surface)
+
+Vendored from Bitcoin Core `src/test/data/` (MIT). Offline CI; refresh from
+`https://github.com/bitcoin/bitcoin` `master` (or a pinned tag) when expanding coverage.
+
+| Fixture | Path | Harness | Success criterion |
+|---------|------|---------|-------------------|
+| `script_tests.json` | `crates/rbitcoin-consensus/tests/fixtures/` | `script::core_vectors::core_script_tests_all_rows` | **every** data row run; `fail == 0` after allowlist |
+| `tx_valid.json` | same | `script::core_tx_vectors::core_tx_valid_all_rows` | every data row accept (or allowlisted) |
+| `tx_invalid.json` | same | `script::core_tx_vectors::core_tx_invalid_all_rows` | every data row reject (or allowlisted) |
+
+### How the harness works
+
+1. Load vendored JSON (not network).
+2. Parse Core script language / hex txs.
+3. Build Core-style **credit/spend** txs (script_tests) or deserialize fixture txs (tx_*).
+4. Call shipped **`verify_job_all_inputs(ScriptCheckJob)`** (or bare EvalScript+P2SH path when `WITNESS` flag is off — Core treats v0 programs as bare without that flag).
+5. Compare accept/reject to Core’s expected code. Named error codes only require **reject**, not exact code string.
+
+### Allowlist policy
+
+- Soft majority pass rates are **not** success criteria.
+- Skips must be **explicit**: `ALLOWLIST` in `core_vectors.rs` / `TX_ALLOWLIST` in `core_tx_vectors.rs` with `(index, reason)` or `(file, index, reason)`.
+- Unknown failures fail the test. Grow coverage by **removing** allowlist entries and fixing the engine.
+- Flag-category gaps (MINIMALDATA, STRICTENC soft checks, BADTX structural, CONST_SCRIPTCODE, etc.) may be allowlisted by flag with a one-line reason when the engine does not yet implement that verify flag.
+
+### Origin / update
+
+See `crates/rbitcoin-consensus/tests/fixtures/README.md`.
 
 ## A. Block structure — `validate_block_structure_hashed`
 
@@ -46,83 +79,21 @@ Location: `crates/rbitcoin-consensus/src/block.rs` (`structure_rule_tests`).
 | H7 | PoW valid for claimed bits | `InvalidPow` | **rust-bitcoin** `validate_pow` — smoke via any successful `mine_regtest_block` accept |
 | H8 | Time not > now + 2h | `timestamp too far in future` | `h8_rejects_timestamp_too_far_in_future` |
 
-Location: `crates/rbitcoin-test/tests/consensus_rules.rs`. Helpers: `median_time_past`, `expected_next_bits` exported from `rbitcoin_consensus`.
+Location: `crates/rbitcoin-test/tests/consensus_rules.rs`.
 
 ## C. Connect — `connect_block_prevouts` / `validate_block_connect`
 
 | ID | Rule | Error signal | Test |
 |----|------|--------------|------|
-| C1 | Non-coinbase has inputs/outputs | `BadTx("no … outputs")` | `c1_non_coinbase_empty_outputs_rejected` |
-| C2 | Same-block double-spend | `BadTx("double spend in block")` | `c2_same_block_double_spend_rejected` |
-| C3 | Already spent on **best chain** (strong spenders only; archive-ahead point rows ignored) | `PrevoutSpent` | `scenarios::confirm_with_spend_index_ignores_archive_only_point_edges` (signet @2148 class), mature-chain spend scenarios |
-| C4 | Missing prevout | `MissingPrevout` / prevout fail | `scenarios::consensus_reject_bad_structure_and_milestone` (milestone still checks prevouts) |
-| C5 | Coinbase maturity | `BadTx("coinbase immature")` | `c5_immature_coinbase_spend_rejected` |
-| C6 | Value in ≥ out | `BadTx("in < out")` | `c6_value_in_less_than_out_rejected` |
-| C7 | Coinbase ≤ subsidy + fees | `BadBlock("coinbase excess value")` | `c7_coinbase_excess_subsidy_rejected` |
-| C8 | Overflows on value/fee sums | `… overflow` | optional; not crafted |
-| C9 | Scripts via pure-Rust backend | `Script(…)` | `script::tests_verify` (P2WPKH/P2PKH/P2WSH/P2SH-P2WPKH) + `script::p2tr::bip341_tests` (key-path + script-path BIP341 tweak) + mature spend scenarios |
-| C10 | BIP68 relative sequence locks (CSV package) | not final / lock fail | `block::locktime_tests::bip68_height_relative_lock`, `bip68_disabled_by_version_1` |
-| C11 | BIP113 locktime cutoff (MTP) | `is_final_tx` time path | `block::locktime_tests::time_locktime_uses_cutoff` |
-| C12 | BIP147 NULLDUMMY | CHECKMULTISIG dummy | `script::interpreter::tests::nulldummy_rejects_nonempty_dummy` |
-| C13 | Pre-taproot v1 WP is ACS | anyone-can-spend | `script::tests_verify::pretaproot_v1_witness_program_anyone_can_spend` |
-| C14 | Empty scriptPubKey fails | not ACS | `script::tests_verify` empty-spk case |
-| C15 | Core tx_valid / tx_invalid fixtures | parse + smoke | `rbitcoin-consensus/tests/tx_core_vectors.rs` |
-
-## D. Params / policy we define
-
-| ID | Rule | Test |
-|----|------|------|
-| P1 | `block_subsidy` halvings | `structure_rule_tests::p1_block_subsidy_halvings` (+ C7 uses height-1 subsidy) |
-| P2 | Milestone skips **scripts only** | `scenarios::consensus_reject_bad_structure_and_milestone` |
-| P3 | `default_milestone_height` per network | `structure_rule_tests::p3_default_milestone_heights` |
-| P4 | Genesis hash check | H1 + accept genesis in scenarios |
-
-## Ownership notes
-
-| Delegated to dependency | Our responsibility still tested |
-|-------------------------|----------------------------------|
-| `block.weight()`, `compute_txid` / `compute_wtxid` | Thresholds (S4), uniqueness (S5), commitment logic (S8) |
-| `Header::validate_pow`, `CompactTarget::from_next_work_required` | Orchestration: bits match expected (H5), target ≤ limit (H6) |
-| Pure-Rust script verify (`rbitcoin-consensus::script`) | Connect calls it under `Milestone::NONE`; maturity/value rules are ours. BIP341 commitment via `ControlBlock::verify_taproot_commitment`. BIP342 **OP_SUCCESSx** (incl. 0x7e) succeeds on tapscript; legacy OP_CAT is **disabled** (consensus fail if executed). |
-| Policy (`rbitcoin-consensus::policy`) | **Never** on block connect — relay/standardness only (stub). |
-| BIP325 signet challenge | `validate_signet_block_solution` on **tip confirm/connect only** (not archive structure — IBD prep cost) |
-
-### Script backend (C9 detail)
-
-| Path | Accept | Reject |
-|------|--------|--------|
-| P2WPKH | `p2wpkh_valid_signature_accepts` | `p2wpkh_bad_signature_rejects` |
-| P2PKH | `p2pkh_valid_signature_accepts` | — |
-| P2WSH | `p2wsh_op_true_accepts` | `p2wsh_wrong_script_hash_rejects` |
-| P2SH-P2WPKH | `p2sh_p2wpkh_nested_accepts` | — |
-| P2SH legacy multi-push (true top, not cleanstack) | `p2sh_legacy_multi_push_op_true_accepts` | — |
-| P2TR key-path | `key_path_accepts_valid_schnorr` | `key_path_rejects_bad_sig` |
-| P2TR script-path + BIP341 | `script_path_accepts_with_valid_bip341_tweak`, `script_path_two_leaf_merkle_path` | `script_path_rejects_wrong_output_key`, `script_path_rejects_tampered_control_block` |
-| Anyone-can-spend | `anyone_can_spend_accepts` | — |
-| Core `script_tests.json` (non-sig rows) | `script::core_vectors::core_script_tests_nonsig_majority_pass` | — |
-
-### Signet reject-class fixtures (`tests/fixtures/signet_block_*.bin`)
-
-| Height | Failure class (historical) | Test |
-|--------|----------------------------|------|
-| 1 | BIP325 signet challenge | `signet::tests::signet_block_1_solution_valid` |
-| 200001 | BIP342 CHECKSIGADD `0xba` / OP_SUCCESS | `script_edge_fixtures::block_200001_*` |
-| 200945 | OP_1SUB `0x8c` unary arith | `script_edge_fixtures::block_200945_has_op_1sub_and_matches_hash` |
-| 201393 | Tapscript size > 10k (no legacy limit) | `script_edge_fixtures::block_201393_has_witness_script_over_10k` |
-| 204802 | P2SH multi-push must fall through nested probe | `script_edge_fixtures::block_204802_matches_reject_hash` |
-| 2148 | Archive point edges ≠ best-chain spent | `scenarios::confirm_with_spend_index_ignores_archive_only_point_edges` |
-| 90719 | BIP342 OP_CODESEPARATOR instruction index in tapscript sighash | `script_edge_fixtures::block_90719_*` + `script_path_codeseparator_checksig_chain` |
-| 219477 | BIP16 true-top (not cleanstack) | `script_edge_fixtures::block_219477_matches_reject_hash` + `p2sh_legacy_multi_push_op_true_accepts` |
-| 277442 | CODESEPARATOR + P2WSH CSV leaf | `script_edge_fixtures::block_277442_matches_reject_hash` |
-| 290329 (mainnet) | P2SH FindAndDelete embedded sig | `script_edge_fixtures::mainnet_290329_p2sh_multisig_with_embedded_sig_accepts` |
-
-Benches: `cargo bench -p rbitcoin-consensus --bench script_verify` (real P2WPKH / P2TR key-path).
-
-Dependency gate: `cargo tree -i bitcoinconsensus` must not resolve.
+| C1–C14 | (see prior matrix) | … | structure / locktime / script unit tests |
+| C15 | Core `tx_valid` / `tx_invalid` | accept / reject | `script::core_tx_vectors::*` (row-level, not parse-only) |
+| C16 | Core `script_tests.json` | accept / reject | `script::core_vectors::core_script_tests_all_rows` |
 
 ## Adding a new rule
 
 1. Add a row to the inventory above (or mark **rust-bitcoin** / **lib** if delegated).
 2. Prefer a pure unit test in `rbitcoin-consensus` when no chain state is needed; otherwise `consensus_rules` or a focused scenario.
-3. Name the test after the rule ID when practical (`s4_…`, `h3_…`, `c2_…`).
+3. For Core corpora: prefer **removing** an allowlist entry after engine fixes over adding skips.
 4. Assert on the **error signal** string/variant so removing the check fails the test.
+
+Dependency gate: `cargo tree -i bitcoinconsensus` must not resolve.

@@ -1000,6 +1000,7 @@ mod tests {
             next_tx_start: hub.query.tx_body_count().saturating_add(1).max(1),
             in_flight_creates: std::sync::Arc::new(HashMap::new()),
             in_flight_outs: std::sync::Arc::new(HashMap::new()),
+            parent_store: std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new()),
         };
         let mat1 = hub
             .confirm_wire_prep_phase_pipelined(&batch1, Some(&pipe))

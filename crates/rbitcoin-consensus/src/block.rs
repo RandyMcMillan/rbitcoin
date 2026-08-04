@@ -1797,7 +1797,7 @@ fn resolve_prevout(
                 return Ok(ResolvedPrevout {
                     txout: TxOut {
                         value: Amount::from_sat(value as u64),
-                        script_pubkey: ScriptBuf::from_bytes(script.to_vec()),
+                        script_pubkey: ScriptBuf::from_bytes(script),
                     },
                     coinbase_height: cb_h,
                     create_height,

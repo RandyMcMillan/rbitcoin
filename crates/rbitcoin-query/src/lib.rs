@@ -130,7 +130,9 @@ pub struct ProcessOwnedSizes {
 }
 
 pub use batch_full_bodies::BatchFullBodies;
-pub use batch_parents::{layout_covers_need, sparse_spender_rels, BatchParents};
+pub use batch_parents::{
+    layout_covers_need, sparse_spender_rels, BatchParents, PipelineParentStore, SharedParentPin,
+};
 pub use confirm_load::BatchThin;
 pub use catchup::IndexMode;
 pub use connect::ConfirmPrepared;

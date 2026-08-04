@@ -112,6 +112,9 @@ pub struct WirePrepPipeline {
             Vec<u32>,
         )>>,
     >,
+    /// Pipeline-wide sparse parent pin store (Weak map; prep get-or-insert only).
+    /// Batches hold `Arc` handles so concurrent stages share one payload per create.
+    pub parent_store: std::sync::Arc<rbitcoin_query::PipelineParentStore>,
 }
 
 /// Wire + assemble complete; script jobs still attached (not yet verified).
@@ -525,12 +528,14 @@ pub fn confirm_wire_prep_phase_pipelined(
     let ns_filter_plan = t_fp.elapsed().as_nanos() as u64;
 
     let inflight_outs = pipeline.map(|p| p.in_flight_outs.as_ref());
+    let parent_store = pipeline.map(|p| &p.parent_store);
     let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),
         &metas,
         &wire_blocks,
         inflight_outs,
+        parent_store,
         cold_mode,
     )?;
     // Drop pipeline-local external full-outs after pin (sparse BatchParents remains).
@@ -942,12 +947,14 @@ pub fn confirm_wire_prep_from_plan(
     } = stamped;
 
     let ifo = pipeline.map(|p| p.in_flight_outs.as_ref());
+    let parent_store = pipeline.map(|p| &p.parent_store);
     let (batch_parents, batch_thin, _warm) = pin_for_wire_batch(
         query,
         plan.as_ref(),
         &metas,
         &wire_blocks,
         ifo,
+        parent_store,
         ColdPinMode::Allow,
     )?;
     // External full-outs were only for pin; sparse BatchParents holds need-vouts.
@@ -1396,6 +1403,7 @@ fn pin_for_wire_batch(
             )>,
         >,
     >,
+    pipeline_parent_store: Option<&std::sync::Arc<rbitcoin_query::PipelineParentStore>>,
     cold_mode: ColdPinMode,
 ) -> Result<(rbitcoin_query::BatchParents, rbitcoin_query::BatchThin, DenserelsWarmStats), ConsensusError>
 {
@@ -1554,11 +1562,16 @@ fn pin_for_wire_batch(
         }
     }
 
-    let mut batch_parents = rbitcoin_query::BatchParents::with_capacity(parent_vouts.len());
+    let mut batch_parents = match pipeline_parent_store {
+        Some(store) => {
+            rbitcoin_query::BatchParents::with_store(std::sync::Arc::clone(store), parent_vouts.len())
+        }
+        None => rbitcoin_query::BatchParents::with_capacity(parent_vouts.len()),
+    };
     let mut still_need: HashMap<u64, Vec<u32>> = HashMap::new();
     let mut n_plan_pin = 0u64;
 
-    // Plan / in-flight / same-batch free pins → BatchParents.
+    // Plan / in-flight / same-batch free pins → BatchParents (shared Arc pins).
     let t_plan = Instant::now();
     for (id, need) in &parent_vouts {
         if let Some(pin) = plan_by_id.get(id) {
@@ -2596,9 +2609,14 @@ impl LoadedBatch {
         self.wire_blocks.iter().map(|b| b.total_size()).sum()
     }
 
-    /// Sparse parent pin map entries riding this batch.
+    /// Parent handles in this batch (may share payloads with other batches).
     pub fn parent_count(&self) -> usize {
         self.batch_parents.len()
+    }
+
+    /// Stable payload pointers for unique writeq occupancy metering.
+    pub fn parent_payload_ptrs(&self) -> Vec<usize> {
+        self.batch_parents.parent_payload_ptrs().collect()
     }
 }
 
@@ -2624,9 +2642,14 @@ impl ScriptOkBatch {
         self.wire_blocks.iter().map(|b| b.total_size()).sum()
     }
 
-    /// Sparse parent pin map entries riding this batch.
+    /// Parent handles in this batch (may share Arc payloads with other batches).
     pub fn parent_count(&self) -> usize {
         self.batch_parents.len()
+    }
+
+    /// Unique shared-pin payload pointers (honest writeq RAM metering).
+    pub fn parent_payload_ptrs(&self) -> Vec<usize> {
+        self.batch_parents.parent_payload_ptrs().collect()
     }
 
     /// Absorb another script-ok batch for write megabatch (FIFO drain).
@@ -3308,7 +3331,8 @@ mod write_idempotent_tests {
 
         // Pin Forbid hits plan-local (no extra cold).
         let (parents, _thin, _warm) =
-            pin_for_wire_batch(&q, Some(&plan), &[], &[], None, ColdPinMode::Forbid).unwrap();
+            pin_for_wire_batch(&q, Some(&plan), &[], &[], None, None, ColdPinMode::Forbid)
+                .unwrap();
         assert!(parents.contains(pfk));
         assert_eq!(
             rbitcoin_query::body_ok_reads(),
@@ -3383,7 +3407,15 @@ mod write_idempotent_tests {
             body_est: 0,
         };
 
-        let err = pin_for_wire_batch(&q, Some(&plan), &[], &[], None, super::ColdPinMode::Allow)
+        let err = pin_for_wire_batch(
+            &q,
+            Some(&plan),
+            &[],
+            &[],
+            None,
+            None,
+            super::ColdPinMode::Allow,
+        )
             .expect_err("missing parent must hard-fail pin");
         let msg = format!("{err}");
         assert!(
@@ -3484,6 +3516,7 @@ mod write_idempotent_tests {
             &[],
             &[],
             Some(&ifo),
+            None,
             super::ColdPinMode::Allow,
         )
             .expect_err("incomplete outs must hard-fail pin");
@@ -3591,6 +3624,7 @@ mod write_idempotent_tests {
             Some(&plan),
             &[],
             &[],
+            None,
             None,
             super::ColdPinMode::Forbid,
         )

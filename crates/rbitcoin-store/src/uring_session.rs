@@ -255,10 +255,27 @@ impl UringSession {
         }
     }
 
-    /// Drain any leftover CQEs (e.g. on error unwind).
+    /// Wait for and discard **all** in-flight CQEs.
+    ///
+    /// Callers that hold SQE buffer pointers **must** call this *before* those
+    /// buffers are dropped (error unwind, end of probe batch). A shallow
+    /// harvest of only-ready CQEs is not enough — the kernel may still write
+    /// into buffers for unfinished SQEs (use-after-free → SIGSEGV).
     pub fn drain_all(&mut self) {
         #[cfg(target_os = "linux")]
         {
+            // Bound spin: entries cap × small factor; never hang forever.
+            let mut spins = 0u32;
+            let max_spins = self.entries.saturating_mul(4).max(64);
+            while self.in_flight > 0 && spins < max_spins {
+                spins += 1;
+                let _ = self.ring.submit_and_wait(1);
+                self.ring.completion().sync();
+                for _ in self.ring.completion() {
+                    self.in_flight = self.in_flight.saturating_sub(1);
+                }
+            }
+            // Best-effort final harvest if the kernel is wedged.
             let _ = self.ring.submit();
             self.ring.completion().sync();
             for _ in self.ring.completion() {
@@ -441,5 +458,51 @@ mod tests {
         let entries2 = with_thread_local(DEFAULT_ENTRIES, |s| s.entries()).unwrap();
         assert_eq!(entries, entries2);
         assert!(entries >= DEFAULT_ENTRIES);
+    }
+
+    /// `drain_all` must wait until in-flight SQEs complete (not only harvest-ready).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn drain_all_waits_for_in_flight_preads() {
+        if !crate::bulk_io::io_uring_enabled() {
+            return;
+        }
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-uring-drain-{}",
+            std::process::id()
+        ));
+        // Need read+write: File::create is write-only and io_uring pread fails.
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("tmp");
+        let payload = vec![0xABu8; 4096];
+        f.write_all(&payload).unwrap();
+        f.sync_all().unwrap();
+        let fd = f.as_raw_fd();
+
+        let mut session = UringSession::try_open(32).expect("uring");
+        let mut bufs: Vec<Vec<u8>> = (0..8).map(|_| vec![0u8; 4096]).collect();
+        for b in bufs.iter_mut() {
+            session
+                .push_pread(fd, 0, b.as_mut_slice(), 0)
+                .expect("push");
+        }
+        session.sync_submission();
+        let _ = session.submit();
+        assert!(session.in_flight() > 0);
+        // Buffers still live — drain must complete every CQE into them.
+        session.drain_all();
+        assert_eq!(session.in_flight(), 0);
+        for b in &bufs {
+            assert_eq!(b[0], 0xAB);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

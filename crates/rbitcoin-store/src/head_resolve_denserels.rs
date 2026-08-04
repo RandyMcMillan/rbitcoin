@@ -289,15 +289,21 @@ fn resolve_fk_and_range_uring_on(
     let mut idx_ns = 0u64;
 
     let mut free_slots: Vec<usize> = (0..MAX_IN_FLIGHT).collect();
+    // SQE destinations declared *before* the drain guard: on Err/unwind the
+    // guard drops first (drains ring) while these buffers are still live.
+    // Prior bug: Err return dropped KeyWork buffers with SQEs still in flight
+    // → kernel wrote into freed memory → SIGSEGV.
     let mut slots: Vec<Option<KeyWork>> = (0..MAX_IN_FLIGHT).map(|_| None).collect();
     let mut in_flight = 0usize;
+    // Holds exclusive session access for the ID/IDX wave; drains on drop.
+    let mut ring = DrainSessionOnDrop(session);
 
     arm_keys(
         table,
         txids,
         &cands_u64,
         side,
-        session,
+        &mut ring,
         side_fd,
         count,
         &mut free_slots,
@@ -307,15 +313,15 @@ fn resolve_fk_and_range_uring_on(
         &mut done,
         &mut id_ns,
     )?;
-    session.sync_submission();
-    let _ = session.submit();
+    ring.sync_submission();
+    let _ = ring.submit();
 
     while in_flight > 0 {
         let t_wait = Instant::now();
-        let mut cqes = session.harvest_ready();
+        let mut cqes = ring.harvest_ready();
         if cqes.is_empty() {
-            session.submit_and_wait_one()?;
-            cqes = session.harvest_ready();
+            ring.submit_and_wait_one()?;
+            cqes = ring.harvest_ready();
         }
         let wait_ns = t_wait.elapsed().as_nanos() as u64;
 
@@ -336,7 +342,7 @@ fn resolve_fk_and_range_uring_on(
                         txids,
                         &mut slots,
                         slot,
-                        session,
+                        &mut ring,
                         side,
                         side_fd,
                         &side_path,
@@ -362,7 +368,7 @@ fn resolve_fk_and_range_uring_on(
                         table,
                         &mut slots,
                         slot,
-                        session,
+                        &mut ring,
                         side,
                         side_fd,
                         count,
@@ -390,7 +396,7 @@ fn resolve_fk_and_range_uring_on(
             txids,
             &cands_u64,
             side,
-            session,
+            &mut ring,
             side_fd,
             count,
             &mut free_slots,
@@ -400,9 +406,12 @@ fn resolve_fk_and_range_uring_on(
             &mut done,
             &mut id_ns,
         )?;
-        session.sync_submission();
-        let _ = session.submit();
+        ring.sync_submission();
+        let _ = ring.submit();
     }
+
+    // Drain before slots drop (also runs on Err/unwind via Drop).
+    drop(ring);
 
     crate::head_resolve_stats::add_probe(probe_ns);
     crate::head_resolve_stats::add_idx(idx_ns);
@@ -416,6 +425,26 @@ fn resolve_fk_and_range_uring_on(
         .enumerate()
         .map(|(i, t)| (*t, winner[i]))
         .collect())
+}
+
+/// Drain the session on drop while caller-held SQE buffers are still live.
+struct DrainSessionOnDrop<'a>(&'a mut UringSession);
+
+impl std::ops::Deref for DrainSessionOnDrop<'_> {
+    type Target = UringSession;
+    fn deref(&self) -> &UringSession {
+        self.0
+    }
+}
+impl std::ops::DerefMut for DrainSessionOnDrop<'_> {
+    fn deref_mut(&mut self) -> &mut UringSession {
+        self.0
+    }
+}
+impl Drop for DrainSessionOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.drain_all();
+    }
 }
 
 enum SqeOutcome {

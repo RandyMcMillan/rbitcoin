@@ -945,10 +945,13 @@ impl AddressHead {
             .iter()
             .map(|&page_base| vec![0u8; self.probe_page_need(page_base, page_slots)])
             .collect();
-        let page_lens: Vec<usize> = {
+        // Collect results first, drop ops (ends exclusive borrows into pages),
+        // then short-fill. Never re-borrow pages while ReadOp slices are live.
+        let results: Vec<i32> = {
             use crate::bulk_io::{self, ReadOp};
             let fd = self.file.read_fd();
-            // SAFETY: each pages[i] is a distinct allocation.
+            // SAFETY: each pages[i] is a distinct heap allocation; ops hold
+            // exclusive raw slices for the duration of this block only.
             let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(pages.len());
             for (pi, &page_base) in page_bases.iter().enumerate() {
                 let off = self.entry_off(page_base);
@@ -968,27 +971,28 @@ impl AddressHead {
             } else {
                 bulk_io::pread_batch(&mut ops);
             }
-            let mut lens = vec![0usize; pages.len()];
-            for (pi, page) in pages.iter_mut().enumerate() {
-                let need = page.len();
-                if need == 0 {
-                    continue;
-                }
-                let res = ops[pi].result;
-                if res < 0 {
-                    return Err(StoreError::io(
-                        self.file.path(),
-                        std::io::Error::from_raw_os_error(-res),
-                    ));
-                }
-                if (res as usize) < need {
-                    // Short read — complete via plain pread (no nested TLS).
-                    self.file.read_at(self.entry_off(page_bases[pi]), page)?;
-                }
-                lens[pi] = need;
+            ops.iter().map(|o| o.result).collect()
+        }; // ops dropped — pages exclusive again
+
+        let mut page_lens = vec![0usize; pages.len()];
+        for (pi, page) in pages.iter_mut().enumerate() {
+            let need = page.len();
+            if need == 0 {
+                continue;
             }
-            lens
-        };
+            let res = results[pi];
+            if res < 0 {
+                return Err(StoreError::io(
+                    self.file.path(),
+                    std::io::Error::from_raw_os_error(-res),
+                ));
+            }
+            if (res as usize) < need {
+                // Short read — complete via plain pread (no nested TLS).
+                self.file.read_at(self.entry_off(page_bases[pi]), page)?;
+            }
+            page_lens[pi] = need;
+        }
 
         let mut out = vec![Vec::new(); n_keys];
         for (pi, &(lo, hi)) in page_ranges.iter().enumerate() {

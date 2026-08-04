@@ -281,8 +281,8 @@ pub fn page_rmw_pipelined(
 /// Thread-local bulk ring via [`crate::uring_session::with_thread_local`].
 ///
 /// **Must not** be called while another `with_thread_local` is active on this
-/// OS thread (nested TLS uring panics). Callers that already hold the TLS ring
-/// (plan head-resolve) must use [`pread_batch_with_session`] instead.
+/// OS thread (nested TLS uring panics). Plan head-resolve streams probe/id/idx
+/// SQEs on its own held session instead.
 #[cfg(target_os = "linux")]
 fn with_bulk_session<R>(f: impl FnOnce(&mut crate::uring_session::UringSession) -> R) -> Option<R> {
     match crate::uring_session::with_thread_local(RING_ENTRIES, f) {
@@ -292,45 +292,6 @@ fn with_bulk_session<R>(f: impl FnOnce(&mut crate::uring_session::UringSession) 
             URING_MODE.store(2, Ordering::Relaxed);
             None
         }
-    }
-}
-
-/// Bulk pread on an **already-held** [`UringSession`] (same TLS ring as the caller).
-///
-/// Use this from inside [`crate::uring_session::with_thread_local`] (plan probe,
-/// etc.). Does **not** call `with_thread_local` again — nesting panics.
-///
-/// On uring failure, falls back to libc pread (still no nested TLS). Session
-/// must have no in-flight SQEs the caller still cares about (drains on exit).
-pub fn pread_batch_with_session(
-    session: &mut crate::uring_session::UringSession,
-    ops: &mut [ReadOp<'_>],
-) {
-    if ops.is_empty() {
-        return;
-    }
-    #[cfg(test)]
-    test_note_read_dontcache(ops);
-    #[cfg(target_os = "linux")]
-    {
-        for op in ops.iter_mut() {
-            op.result = if op.buf.is_empty() { 0 } else { i32::MIN };
-        }
-        let total_nonempty = ops.iter().filter(|o| !o.buf.is_empty()).count();
-        if total_nonempty == 0 {
-            return;
-        }
-        if pread_batch_on_session(session, ops, total_nonempty) {
-            return;
-        }
-        // Session path failed (e.g. DONTCACHE) — complete via libc pread.
-        pread_batch_fallback(ops);
-        return;
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = session;
-        pread_batch_fallback(ops);
     }
 }
 

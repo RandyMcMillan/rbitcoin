@@ -70,6 +70,10 @@ pub const MAX_PROBE: u32 = 1024;
 /// Max bytes of one head page load (1024 × 8 B). 4 B entries use half.
 pub const PROBE_REGION_BYTES: usize = (PAGE_SLOTS as usize) * 8;
 
+/// Concurrent probe page preads on a held plan TLS session (matches ring depth).
+/// One buffer per in-flight slot — hop keys on CQE, then reuse.
+const PROBE_PAGES_IN_FLIGHT: usize = crate::uring_session::DEFAULT_ENTRIES as usize;
+
 /// Inserts that needed probe depth **> [`PROBE_DEPTH_WARN`]** (warning band).
 /// Cumulative counter for lagging/retry logs; WARN only once at first event.
 static PROBE_INSERT_DEPTH_WARN_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -883,7 +887,7 @@ impl AddressHead {
     /// Like [`Self::probe_fks_batch`] with explicit DONTCACHE for this segment.
     ///
     /// Used by [`crate::segmented_head::SegmentedTxHead`] with sealed-age policy.
-    /// Page loads go through TLS bulk_io (`pread_batch` → `with_thread_local`).
+    /// Page loads use TLS bulk_io one page at a time (single buffer).
     pub fn probe_fks_batch_dontcache(
         &self,
         txids: &[[u8; 32]],
@@ -894,6 +898,10 @@ impl AddressHead {
 
     /// Same as [`Self::probe_fks_batch_dontcache`] but page preads use the
     /// **already-held** plan TLS session (no nested `with_thread_local`).
+    ///
+    /// Streams at most [`PROBE_PAGES_IN_FLIGHT`] OS-page SQEs (matches ring
+    /// depth): hop all keys for a page on CQE, reuse the buffer, arm the next
+    /// page. Never allocates one buffer per unique page in the stamp.
     pub fn probe_fks_batch_dontcache_on_session(
         &self,
         txids: &[[u8; 32]],
@@ -907,7 +915,7 @@ impl AddressHead {
         &self,
         txids: &[[u8; 32]],
         dontcache: bool,
-        mut session: Option<&mut crate::uring_session::UringSession>,
+        session: Option<&mut crate::uring_session::UringSession>,
     ) -> Result<Vec<Vec<Fk>>, StoreError> {
         let n_keys = txids.len();
         if n_keys == 0 {
@@ -940,77 +948,180 @@ impl AddressHead {
             i = j;
         }
 
-        // One buffer per unique page; bulk-load on session or TLS bulk_io.
-        let mut pages: Vec<Vec<u8>> = page_bases
-            .iter()
-            .map(|&page_base| vec![0u8; self.probe_page_need(page_base, page_slots)])
-            .collect();
-        // Collect results first, drop ops (ends exclusive borrows into pages),
-        // then short-fill. Never re-borrow pages while ReadOp slices are live.
-        let results: Vec<i32> = {
-            use crate::bulk_io::{self, ReadOp};
-            let fd = self.file.read_fd();
-            // SAFETY: each pages[i] is a distinct heap allocation; ops hold
-            // exclusive raw slices for the duration of this block only.
-            let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(pages.len());
-            for (pi, &page_base) in page_bases.iter().enumerate() {
-                let off = self.entry_off(page_base);
-                let len = pages[pi].len();
-                let ptr = pages[pi].as_mut_ptr();
-                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-                ops.push(ReadOp {
-                    fd,
-                    offset: off,
-                    buf: slice,
-                    result: i32::MIN,
-                    dontcache,
-                });
-            }
-            if let Some(ref mut s) = session {
-                bulk_io::pread_batch_with_session(s, &mut ops);
-            } else {
-                bulk_io::pread_batch(&mut ops);
-            }
-            ops.iter().map(|o| o.result).collect()
-        }; // ops dropped — pages exclusive again
-
-        let mut page_lens = vec![0usize; pages.len()];
-        for (pi, page) in pages.iter_mut().enumerate() {
-            let need = page.len();
-            if need == 0 {
-                continue;
-            }
-            let res = results[pi];
-            if res < 0 {
-                return Err(StoreError::io(
-                    self.file.path(),
-                    std::io::Error::from_raw_os_error(-res),
-                ));
-            }
-            if (res as usize) < need {
-                // Short read — complete via plain pread (no nested TLS).
-                self.file.read_at(self.entry_off(page_bases[pi]), page)?;
-            }
-            page_lens[pi] = need;
-        }
-
         let mut out = vec![Vec::new(); n_keys];
-        for (pi, &(lo, hi)) in page_ranges.iter().enumerate() {
-            let n = page_lens[pi];
-            if n < es_u {
-                continue;
-            }
-            let nslots = (n / es_u) as u64;
-            let buf = &pages[pi][..n];
-            for &(_, orig) in &order[lo..hi] {
-                let txid = &txids[orig];
-                let h1p = h1_in_page(txid, bits);
-                let h2p = h2_in_page(txid, bits);
-                let scan = hop_scan_page(buf, es, h1p, h2p, nslots, MAX_PROBE);
-                out[orig] = scan.cands.into_iter().map(|(_, e)| Fk(e)).collect();
+
+        match session {
+            Some(session) => self.probe_pages_streaming_on_session(
+                session,
+                txids,
+                bits,
+                es,
+                es_u,
+                page_slots,
+                dontcache,
+                &order,
+                &page_bases,
+                &page_ranges,
+                &mut out,
+            )?,
+            None => {
+                // Standalone: one reusable page buffer, serial load (cheap).
+                let mut buf = [0u8; PROBE_REGION_BYTES];
+                for (pi, &page_base) in page_bases.iter().enumerate() {
+                    let n = self.load_page_slots(page_base, page_slots, &mut buf, dontcache)?;
+                    if n < es_u {
+                        continue;
+                    }
+                    let nslots = (n / es_u) as u64;
+                    let (lo, hi) = page_ranges[pi];
+                    for &(_, orig) in &order[lo..hi] {
+                        let txid = &txids[orig];
+                        let h1p = h1_in_page(txid, bits);
+                        let h2p = h2_in_page(txid, bits);
+                        let scan = hop_scan_page(&buf[..n], es, h1p, h2p, nslots, MAX_PROBE);
+                        out[orig] = scan.cands.into_iter().map(|(_, e)| Fk(e)).collect();
+                    }
+                }
             }
         }
         Ok(out)
+    }
+
+    /// Stream unique probe pages on a held session: ≤[`PROBE_PAGES_IN_FLIGHT`]
+    /// page buffers, fill ring, hop keys on CQE, reuse slot.
+    fn probe_pages_streaming_on_session(
+        &self,
+        session: &mut crate::uring_session::UringSession,
+        txids: &[[u8; 32]],
+        bits: u32,
+        es: u8,
+        es_u: usize,
+        page_slots: u64,
+        dontcache: bool,
+        order: &[(u64, usize)],
+        page_bases: &[u64],
+        page_ranges: &[(usize, usize)],
+        out: &mut [Vec<Fk>],
+    ) -> Result<(), StoreError> {
+        let n_pages = page_bases.len();
+        if n_pages == 0 {
+            return Ok(());
+        }
+
+        let fd = self.file.read_fd();
+        let path = self.file.path();
+        let rw_flags = if dontcache && crate::bulk_io::rwf_dontcache_ok() {
+            crate::uring_session::RWF_DONTCACHE
+        } else {
+            0
+        };
+
+        // Fixed pool — never one buffer per unique page in the stamp.
+        let pool_n = PROBE_PAGES_IN_FLIGHT.min(n_pages).max(1);
+        let mut bufs: Vec<Vec<u8>> = (0..pool_n)
+            .map(|_| vec![0u8; PROBE_REGION_BYTES])
+            .collect();
+        // Which unique page index each pool slot is loading (or None if free).
+        let mut slot_page: Vec<Option<usize>> = vec![None; pool_n];
+        let mut free_slots: Vec<usize> = (0..pool_n).collect();
+        let mut next_page = 0usize;
+        let mut in_flight = 0usize;
+
+        // On error, drain while bufs still live (SQE destinations).
+        let run = (|| -> Result<(), StoreError> {
+            loop {
+                // Arm free slots up to ring free_sq.
+                while next_page < n_pages
+                    && !free_slots.is_empty()
+                    && session.free_sq() > 0
+                    && in_flight < pool_n
+                {
+                    let slot = free_slots.pop().unwrap();
+                    let pi = next_page;
+                    next_page += 1;
+                    let page_base = page_bases[pi];
+                    let need = self.probe_page_need(page_base, page_slots);
+                    if need == 0 {
+                        free_slots.push(slot);
+                        continue;
+                    }
+                    let off = self.entry_off(page_base);
+                    let buf = &mut bufs[slot][..need];
+                    buf.fill(0);
+                    session.push_pread_flags(fd, off, buf, slot as u64, rw_flags)?;
+                    slot_page[slot] = Some(pi);
+                    in_flight += 1;
+                }
+                session.sync_submission();
+                let _ = session.submit();
+
+                if in_flight == 0 {
+                    break;
+                }
+
+                let mut cqes = session.harvest_ready();
+                if cqes.is_empty() {
+                    session.submit_and_wait_one()?;
+                    cqes = session.harvest_ready();
+                }
+
+                for (ud, res) in cqes {
+                    let slot = ud as usize;
+                    if slot >= pool_n || slot_page[slot].is_none() {
+                        return Err(StoreError::Corrupt("probe page bad slot"));
+                    }
+                    in_flight = in_flight.saturating_sub(1);
+                    let pi = slot_page[slot].take().unwrap();
+                    let page_base = page_bases[pi];
+                    let need = self.probe_page_need(page_base, page_slots);
+
+                    if res < 0 {
+                        if res == -95 && rw_flags != 0 && crate::bulk_io::rwf_dontcache_ok() {
+                            crate::bulk_io::note_rwf_dontcache_unsupported();
+                            // Retry this page without DONTCACHE (re-arm same slot).
+                            let off = self.entry_off(page_base);
+                            let buf = &mut bufs[slot][..need];
+                            buf.fill(0);
+                            session.push_pread_flags(fd, off, buf, slot as u64, 0)?;
+                            slot_page[slot] = Some(pi);
+                            in_flight += 1;
+                            continue;
+                        }
+                        return Err(StoreError::io(
+                            path,
+                            std::io::Error::from_raw_os_error(-res),
+                        ));
+                    }
+
+                    let mut n = res as usize;
+                    if n < need {
+                        // Short — complete via libc pread (no nested TLS).
+                        self.file
+                            .read_at(self.entry_off(page_base), &mut bufs[slot][..need])?;
+                        n = need;
+                    }
+                    n = n.min(need);
+
+                    if n >= es_u {
+                        let nslots = (n / es_u) as u64;
+                        let (lo, hi) = page_ranges[pi];
+                        let page = &bufs[slot][..n];
+                        for &(_, orig) in &order[lo..hi] {
+                            let txid = &txids[orig];
+                            let h1p = h1_in_page(txid, bits);
+                            let h2p = h2_in_page(txid, bits);
+                            let scan = hop_scan_page(page, es, h1p, h2p, nslots, MAX_PROBE);
+                            out[orig] = scan.cands.into_iter().map(|(_, e)| Fk(e)).collect();
+                        }
+                    }
+                    free_slots.push(slot);
+                }
+            }
+            Ok(())
+        })();
+
+        session.drain_all();
+        run
     }
 
     /// Byte length of a probe page load (slot array only, not footer).

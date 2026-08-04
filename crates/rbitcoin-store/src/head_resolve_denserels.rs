@@ -276,7 +276,7 @@ fn resolve_fk_and_range_uring_on(
         .collect();
     let cands_total: u64 = cands_u64.iter().map(|v| v.len() as u64).sum();
 
-    // Ring is idle after probe batch (pread_batch_with_session drains).
+    // Ring is idle after streaming probe (probe drains before return).
     debug_assert_eq!(session.in_flight(), 0);
 
     // ── Stages STAGE_ID + STAGE_IDX: depth-first per key, many in flight ──

@@ -1,5 +1,28 @@
 # Agent notes
 
+## Prefer composition over inheritance in data models
+
+Composition (has-a) is typically more clear and less error prone than
+inheritance (is-a), although rust traits can make that blurry. Avoid tall
+inheritance trees.
+
+## Prefer immutable data structures
+
+Immutable data structures built once then composed with other immutable
+structures typically perform better than data structures mutated over time.
+
+For example, prefer an immutable map that is built from the streamed results
+of some work over a mutable hashmap. Even if the data structure itself is
+mutable, in rust not having to make it mutable makes life better.
+
+If we needed to add additional data to the members of a hashmap, we could
+create an outer map that contains the additional info and annotates the
+members of the inner map on read, converting them to the data type with the
+additional fields (which will also have the inner object).
+
+In short, prefer composition over mutation as well as composition over
+inheritance.
+
 ## Store concurrency: lock-free by default
 
 **Default: no locks on the store hot path.** Concurrency is **roles + publish
@@ -117,7 +140,6 @@ The workspace is mounted into the agent VM as **9p** (`workspace` on `/home/agen
 
 - Store/mempool tables are **map-free** (pread/pwrite only) — open should work without `MAP_SHARED`.
 - Prefer `/tmp` fixtures for agent correctness tests (synthetic stores).
-- **Do not use the user’s live test datadirs** (e.g. `datadir-signet/`, `datadir-mainnet/`) for full node runs in the agent VM without need — multi‑GiB live datadirs are operator-side.
 
 **Perf A/B** is **operator-host only**, with the musl static binary — never agent-VM timings. See [`docs/io-modality.md`](docs/io-modality.md).
 
@@ -132,6 +154,8 @@ The workspace is mounted into the agent VM as **9p** (`workspace` on `/home/agen
 
 Do not leave dead code around. Delete it. Don't silence warnings unless there
 is bulletproof justification
+
+Same goes for #[cfg(test)].
 
 ## Do test-driven development when practical
 

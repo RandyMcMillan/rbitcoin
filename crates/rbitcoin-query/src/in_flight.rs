@@ -279,6 +279,31 @@ mod tests {
     }
 
     #[test]
+    fn clear_drops_all_layers_and_entries() {
+        let mut log = InFlightLog::new();
+        for i in 1u64..=5 {
+            let p = pin(i);
+            log.note_layer(InFlightLayer::from_plan_pins([(Fk(i), &p)]));
+        }
+        assert_eq!(log.layer_count(), 5);
+        assert_eq!(log.entry_count(), 5);
+        let held = log.snapshot();
+        assert_eq!(held.layer_count(), 5);
+        log.clear();
+        assert_eq!(log.layer_count(), 0);
+        assert_eq!(log.entry_count(), 0);
+        // Prior snapshot stays valid (immutable); log is empty for new notes.
+        assert_eq!(held.layer_count(), 5);
+        assert!(held.get_out(3).is_some());
+        assert!(log.snapshot().is_empty());
+        let p = pin(99);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(99), &p)]));
+        assert_eq!(log.layer_count(), 1);
+        assert!(log.snapshot().get_out(99).is_some());
+        assert!(log.snapshot().get_out(1).is_none());
+    }
+
+    #[test]
     fn snapshot_stable_while_log_notes_more() {
         let mut log = InFlightLog::new();
         let p1 = pin(1);

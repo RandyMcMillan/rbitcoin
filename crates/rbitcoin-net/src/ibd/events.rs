@@ -487,17 +487,21 @@ pub(crate) fn apply_confirm_reject(
         warn!("ibd: confirm reject ignored zero-hash @{height}: {err}");
         return;
     }
-    // Soft re-getdata: **wire-only**. Wrong/corrupt body for this height (peer
-    // or bq mismatch) — drop payload and densify. Mainnet tip freeze at 125653
-    // was blacklisting `unexpected previous header`.
+    // Soft re-getdata / re-offer: **not permanent blacklist**.
+    //
+    // - Wire-only: wrong/corrupt body (`unexpected previous header`) — drop
+    //   payload and densify. Mainnet tip freeze at 125653 blacklisted this.
+    // - Header window: `missing retarget first header` can race when a large
+    //   pack needs a retarget base that is not yet visible to `header_at_height`
+    //   (or was briefly absent). Permanent blacklist freezes tip+1 forever
+    //   (signet partial IBD @~42k). Requeue without blacklisting; claim will
+    //   retry once headers/plans catch up.
     //
     // Internal pipeline races (prevout already spent, denserels pin, plan stage
-    // miss, parent create_fk unresolved, load incomplete) are **permanent**.
-    // Fix the root cause; write already skip-accepts when tip already has the
-    // block / prevout-spent after commit. Soft-looping hid bugs and livelocked
-    // or froze tip.
+    // miss, parent create_fk unresolved, load incomplete) stay **permanent**.
     let soft_reget = err.contains("unexpected previous header")
-        || err.contains("unexpected previous");
+        || err.contains("unexpected previous")
+        || err.contains("missing retarget first header");
     if soft_reget {
         clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
         // Evict bad wire so claim_ready is false until a good body arrives.
@@ -615,6 +619,23 @@ mod confirm_reject_tests {
         assert!(
             !st.body.is_rejected(&hash),
             "bad wire must soft re-getdata, not permanent-blacklist tip+1"
+        );
+        // Retarget window miss: soft (do not freeze tip+1 permanently).
+        let mut st = IbdWorkState::new(Vec::new(), None, Some(42_284));
+        let hash = h(0x42);
+        st.body.mark_archived(hash);
+        st.ordered.push_back(hash);
+        st.ordered_set.insert(hash);
+        apply_confirm_reject(
+            &mut st,
+            42_285,
+            hash,
+            "consensus: bad header: missing retarget first header",
+            None,
+        );
+        assert!(
+            !st.body.is_rejected(&hash),
+            "missing retarget first header must soft, not permanent-blacklist tip+1"
         );
         assert!(
             st.ordered_set.contains(&hash),

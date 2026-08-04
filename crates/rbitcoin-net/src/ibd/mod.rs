@@ -113,11 +113,11 @@ pub(crate) const PENDING_STALE: Duration = Duration::from_secs(45);
 pub(crate) const FAR_SCAN_BUDGET: usize = 65_536;
 /// Body-queue densify / receive horizon past tip+1 (height count).
 ///
-/// **Primary capacity is soft time-depth** (~1.5 min of tip-rate blocks in RAM).
-/// This height cap stops unbounded far getdata when the soft count target is
-/// still large (e.g. very high tip rate) or cold-start floors admit densify
-/// while early blocks are tiny. Also used as the hard receive refuse horizon
-/// past tip.
+/// **Primary capacity is soft depth** (max of ~1.5 min tip-rate blocks and
+/// ~150 MiB payload in RAM). This height cap stops unbounded far getdata when
+/// the soft target is still large (e.g. very high tip rate) or early tiny
+/// blocks fill the byte floor with a huge count. Also used as the hard
+/// receive refuse horizon past tip.
 pub(crate) const CONTIG_DENSIFY_AHEAD: u32 = 65_536;
 
 /// Tunables for IBD (defaults lean libbitcoin/Core-ish).
@@ -535,10 +535,10 @@ pub async fn ibd_cancellable(
         st.hygiene();
 
         // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
-        // Soft BQ depth (~1.5 min tip-rate blocks) stops frontier densify; gaps
-        // inside queued max height always fill. Archive soft RAM still gates
-        // densify. Tip-hole race always runs. In-flight bodies always accepted
-        // into the RAM queue. Saturated pipeline → Critical only.
+        // Soft BQ depth (max ~1.5 min tip-rate count / ~150 MiB) stops frontier
+        // densify; gaps inside queued max height always fill. Archive soft RAM
+        // still gates densify. Tip-hole race always runs. In-flight bodies
+        // always accepted into the RAM queue. Saturated pipeline → Critical only.
         let far_scale = archive_queued.far_admission_scale();
         let tip_rate_opt = tip_rate_tracker.eta_rate(Instant::now());
         let bq_soft_pressure = hub.query.block_queue_update_soft_pressure(tip_rate_opt);

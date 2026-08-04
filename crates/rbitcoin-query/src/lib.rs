@@ -47,29 +47,51 @@ pub type QueryError = StoreError;
 pub const BQ_SOFT_STOP_SECS: f64 = 90.0;
 /// Soft body-queue depth resume: ~1 minute (hysteresis vs stop).
 pub const BQ_SOFT_RESUME_SECS: f64 = 60.0;
-/// Minimum stop/resume counts when tip rate is cold or near zero.
-pub const BQ_SOFT_COUNT_FLOOR: u32 = 256;
+/// Soft byte stop floor (~150 MiB). Early chain can exceed the time-count
+/// target until this many payload bytes are queued (whichever is greater).
+pub const BQ_SOFT_STOP_BYTES: u64 = 150 * 1024 * 1024;
+/// Soft byte resume floor (~100 MiB). Hysteresis vs [`BQ_SOFT_STOP_BYTES`].
+pub const BQ_SOFT_RESUME_BYTES: u64 = 100 * 1024 * 1024;
 
-/// Target in-RAM block counts for soft densify hysteresis from tip rate (blocks/s).
+/// Time-depth count targets from tip rate (blocks/s): `(stop_n, resume_n)`.
 ///
-/// When `rate` is unknown or near zero, uses [`BQ_SOFT_COUNT_FLOOR`] so a stuck
-/// tip cannot clamp targets to zero and freeze densify after a small backlog.
+/// Soft densify uses **max of time-depth and byte floors** (see
+/// [`soft_pressure`]): early tiny blocks may queue far past `stop_n` until
+/// ~150 MiB; large later blocks hit the time target first. Rate unknown →
+/// `(0, 0)` so only the byte floor gates (keeps early-chain densify free
+/// under 150 MiB).
 pub fn soft_depth_targets(rate_blocks_per_s: Option<f64>) -> (u32, u32) {
     let rate = rate_blocks_per_s
         .filter(|r| r.is_finite() && *r > 1e-9)
         .unwrap_or(0.0);
-    let stop = ((rate * BQ_SOFT_STOP_SECS).ceil() as u32).max(BQ_SOFT_COUNT_FLOOR);
-    let resume_raw = ((rate * BQ_SOFT_RESUME_SECS).ceil() as u32)
-        .max(BQ_SOFT_COUNT_FLOOR.saturating_mul(4) / 5);
-    let resume = resume_raw.min(stop.saturating_sub(1).max(1));
+    let stop = (rate * BQ_SOFT_STOP_SECS).ceil() as u32;
+    if stop == 0 {
+        return (0, 0);
+    }
+    let resume_raw = (rate * BQ_SOFT_RESUME_SECS).ceil() as u32;
+    let resume = resume_raw.min(stop.saturating_sub(1));
     (stop, resume)
 }
 
-/// Hysteresis latch: enter when `depth > stop`, exit when `depth < resume`.
-pub fn soft_pressure(depth_n: u32, stop_n: u32, resume_n: u32, was: bool) -> bool {
-    if depth_n > stop_n {
+/// Soft densify hysteresis: time-depth **and** byte floors (greater of).
+///
+/// - **Enter** pressure when `depth_n > stop_n` **and** `depth_bytes >`
+///   [`BQ_SOFT_STOP_BYTES`] — both meters full (early chain may overshoot
+///   count while under 150 MiB; late chain may overshoot 150 MiB while under
+///   the time-count target).
+/// - **Exit** when `depth_n < resume_n` **or** `depth_bytes <`
+///   [`BQ_SOFT_RESUME_BYTES`].
+/// - Mid-band keeps `was`.
+pub fn soft_pressure(
+    depth_n: u32,
+    depth_bytes: u64,
+    stop_n: u32,
+    resume_n: u32,
+    was: bool,
+) -> bool {
+    if depth_n > stop_n && depth_bytes > BQ_SOFT_STOP_BYTES {
         true
-    } else if depth_n < resume_n {
+    } else if depth_n < resume_n || depth_bytes < BQ_SOFT_RESUME_BYTES {
         false
     } else {
         was
@@ -784,7 +806,7 @@ pub struct Query {
     /// In-RAM block payload queue (FIFO until confirm-write; empty after restart).
     ///
     /// RAM-only by design: avoids double-writing every block (queue + Class A).
-    /// Accepts redownload on restart and peak RAM of ~1–1.5 min of tip-rate wire.
+    /// Accepts redownload on restart and peak RAM of soft densify depth.
     block_queue: Mutex<rbitcoin_store::BlockQueue>,
     /// Soft time-depth hysteresis latch for densify frontier (updated with tip rate).
     block_queue_pressure: AtomicBool,
@@ -1014,18 +1036,23 @@ impl Query {
         self.block_queue.lock().unwrap().max_height()
     }
 
-    /// Soft densify pressure from tip rate (blocks/s) and in-RAM count.
+    /// Soft densify pressure from tip rate, in-RAM count, and payload bytes.
     ///
-    /// Stop frontier densify when depth **>** ~1.5 minutes of tip-rate blocks;
-    /// resume when **<** ~1 minute. Updates the process latch. Gap fill inside
-    /// the queued height span is always allowed by assign even under pressure.
+    /// Stop frontier densify when **both** count &gt; ~1.5 min of tip-rate
+    /// blocks **and** payload &gt; ~150 MiB; resume when count &lt; ~1 min **or**
+    /// payload &lt; ~100 MiB (see [`soft_pressure`]). Early tiny blocks can
+    /// therefore queue far past the time-count target until the byte floor.
+    /// Gap fill inside the queued height span always densifies under pressure.
     ///
     /// `rate_blocks_per_s` should match IBD `TipRateTracker::eta_rate` (ETA EWMA).
     pub fn block_queue_update_soft_pressure(&self, rate_blocks_per_s: Option<f64>) -> bool {
-        let depth = self.block_queue_count() as u32;
+        let g = self.block_queue.lock().unwrap();
+        let depth_n = g.count() as u32;
+        let depth_bytes = g.bytes();
+        drop(g);
         let (stop, resume) = soft_depth_targets(rate_blocks_per_s);
         let was = self.block_queue_pressure.load(AtomicOrdering::Relaxed);
-        let pressure = soft_pressure(depth, stop, resume, was);
+        let pressure = soft_pressure(depth_n, depth_bytes, stop, resume, was);
         self.block_queue_pressure
             .store(pressure, AtomicOrdering::Relaxed);
         pressure

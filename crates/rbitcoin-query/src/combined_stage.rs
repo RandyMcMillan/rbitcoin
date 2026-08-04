@@ -339,22 +339,52 @@ mod tests {
     }
 
     #[test]
-    fn block_queue_soft_time_hysteresis() {
-        use crate::{soft_depth_targets, soft_pressure, BQ_SOFT_COUNT_FLOOR};
-        // 5 blk/s × 90s / 60s → stop 450, resume 300 (above floor).
+    fn block_queue_soft_time_and_byte_hysteresis() {
+        use crate::{
+            soft_depth_targets, soft_pressure, BQ_SOFT_RESUME_BYTES, BQ_SOFT_STOP_BYTES,
+        };
+        // 5 blk/s × 90s / 60s → stop 450, resume 300 (no count floor).
         let (stop, resume) = soft_depth_targets(Some(5.0));
         assert_eq!(stop, 450);
         assert_eq!(resume, 300);
-        let (stop0, _) = soft_depth_targets(None);
-        assert_eq!(stop0, BQ_SOFT_COUNT_FLOOR);
-        // Low rate clamps to floor (2 blk/s × 90s = 180 < 256).
-        let (stop_lo, _) = soft_depth_targets(Some(2.0));
-        assert_eq!(stop_lo, BQ_SOFT_COUNT_FLOOR);
+        let (stop0, resume0) = soft_depth_targets(None);
+        assert_eq!((stop0, resume0), (0, 0));
+        let (stop_lo, resume_lo) = soft_depth_targets(Some(2.0));
+        assert_eq!(stop_lo, 180);
+        assert_eq!(resume_lo, 120);
+
+        // Pure latch: need both count and bytes over stop to enter.
+        let over_b = BQ_SOFT_STOP_BYTES + 1;
+        let mid_b = (BQ_SOFT_RESUME_BYTES + BQ_SOFT_STOP_BYTES) / 2;
+        let under_b = BQ_SOFT_RESUME_BYTES - 1;
+        assert!(
+            !soft_pressure(451, under_b, 450, 300, false),
+            "tiny early blocks: over count, under byte floor → free densify"
+        );
+        assert!(
+            !soft_pressure(100, over_b, 450, 300, false),
+            "large blocks under time-count → free densify"
+        );
+        assert!(
+            soft_pressure(451, over_b, 450, 300, false),
+            "both over stop → enter"
+        );
+        assert!(
+            soft_pressure(400, mid_b, 450, 300, true),
+            "mid-band stays latched"
+        );
+        assert!(
+            !soft_pressure(400, under_b, 450, 300, true),
+            "bytes under resume → exit"
+        );
+        assert!(
+            !soft_pressure(299, mid_b, 450, 300, true),
+            "count under resume → exit"
+        );
 
         let (dir, q) = temp_query();
-        // Empty queue: no pressure.
         assert!(!q.block_queue_update_soft_pressure(Some(5.0)));
-        // Enqueue past stop target.
+        // Many tiny payloads over time-count, well under 150 MiB — no pressure.
         for i in 0..451u32 {
             q.block_queue_enqueue(i, {
                 let mut h = [0u8; 32];
@@ -364,27 +394,27 @@ mod tests {
             .unwrap();
         }
         assert!(
-            q.block_queue_update_soft_pressure(Some(5.0)),
-            "depth 451 > stop 450"
-        );
-        assert!(soft_pressure(400, 450, 300, true), "stay latched mid-band");
-        // Drain into mid-band (still ≥ resume 300).
-        for i in 0..50u32 {
-            q.block_queue_dequeue_height(i).unwrap();
-        }
-        assert_eq!(q.block_queue_count(), 401);
-        assert!(
-            q.block_queue_update_soft_pressure(Some(5.0)),
-            "still mid-band (401 in [300, 450])"
-        );
-        // Drain below resume.
-        for i in 50..200u32 {
-            q.block_queue_dequeue_height(i).unwrap();
-        }
-        assert_eq!(q.block_queue_count(), 251);
-        assert!(
             !q.block_queue_update_soft_pressure(Some(5.0)),
-            "depth 251 < resume 300"
+            "early-chain style: count 451 > stop 450 but bytes tiny"
+        );
+        // Cold rate: only byte floor gates — two ~80 MiB payloads → pressure.
+        for i in 0..451u32 {
+            let _ = q.block_queue_dequeue_height(i);
+        }
+        let chunk = vec![0u8; 80 * 1024 * 1024];
+        q.block_queue_enqueue(1, [1u8; 32], 1, &chunk).unwrap();
+        q.block_queue_enqueue(2, [2u8; 32], 2, &chunk).unwrap();
+        assert!(q.block_queue_stats().1 > BQ_SOFT_STOP_BYTES);
+        assert!(
+            q.block_queue_update_soft_pressure(None),
+            "rate cold: count>0 and bytes>150MiB"
+        );
+        // Drop one chunk → under 100 MiB resume floor.
+        q.block_queue_dequeue_height(1).unwrap();
+        assert!(q.block_queue_stats().1 < BQ_SOFT_RESUME_BYTES);
+        assert!(
+            !q.block_queue_update_soft_pressure(None),
+            "bytes under resume → clear pressure"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

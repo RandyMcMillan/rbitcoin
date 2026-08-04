@@ -298,7 +298,9 @@ mod tests {
         format_duration_short, format_progress_line, format_rate, ibd_pct, tip_hole_from_claim_ready,
         ProgressLineInput, TipRateTracker,
     };
-    use rbitcoin_query::{soft_depth_targets, soft_pressure, BQ_SOFT_COUNT_FLOOR};
+    use rbitcoin_query::{
+        soft_depth_targets, soft_pressure, BQ_SOFT_RESUME_BYTES, BQ_SOFT_STOP_BYTES,
+    };
     use std::time::{Duration, Instant};
 
     /// Shipped progress line: tip + in-RAM bq soft depth; forbid retired tokens.
@@ -368,14 +370,12 @@ mod tests {
 
     #[test]
     fn soft_depth_targets_at_rate() {
-        // Below floor: 2 blk/s × 90s = 180 → clamped to BQ_SOFT_COUNT_FLOOR.
+        // No count floor — byte floors (150/100 MiB) cover early chain.
         let (stop_lo, resume_lo) = soft_depth_targets(Some(2.0));
-        assert_eq!(stop_lo, BQ_SOFT_COUNT_FLOOR, "2 blk/s × 90s under floor");
-        assert!(resume_lo < stop_lo && resume_lo > 0);
+        assert_eq!(stop_lo, 180, "2 blk/s × 90s");
+        assert_eq!(resume_lo, 120, "2 blk/s × 60s");
         let (stop0, resume0) = soft_depth_targets(None);
-        assert_eq!(stop0, BQ_SOFT_COUNT_FLOOR);
-        assert!(resume0 < stop0 && resume0 > 0);
-        // Above floor: 5 blk/s × 90s / 60s.
+        assert_eq!((stop0, resume0), (0, 0), "cold rate → byte floor only");
         let (stop, resume) = soft_depth_targets(Some(5.0));
         assert_eq!(stop, 450, "5 blk/s × 90s");
         assert_eq!(resume, 300, "5 blk/s × 60s");
@@ -385,12 +385,30 @@ mod tests {
     }
 
     #[test]
-    fn soft_hysteresis_latch() {
-        assert!(!soft_pressure(100, 450, 300, false));
-        assert!(soft_pressure(451, 450, 300, false), "enter when > stop");
-        assert!(soft_pressure(400, 450, 300, true), "stay latched mid-band");
-        assert!(!soft_pressure(299, 450, 300, true), "exit when < resume");
-        assert!(!soft_pressure(450, 450, 300, false), "exactly stop does not enter");
+    fn soft_hysteresis_latch_time_and_bytes() {
+        let over_b = BQ_SOFT_STOP_BYTES + 1;
+        let mid_b = (BQ_SOFT_RESUME_BYTES + BQ_SOFT_STOP_BYTES) / 2;
+        let under_b = BQ_SOFT_RESUME_BYTES - 1;
+        // Enter only when both count and bytes over stop.
+        assert!(!soft_pressure(100, over_b, 450, 300, false));
+        assert!(!soft_pressure(451, under_b, 450, 300, false));
+        assert!(soft_pressure(451, over_b, 450, 300, false), "both over stop");
+        assert!(
+            soft_pressure(400, mid_b, 450, 300, true),
+            "stay latched mid-band"
+        );
+        assert!(
+            !soft_pressure(299, mid_b, 450, 300, true),
+            "exit when count < resume"
+        );
+        assert!(
+            !soft_pressure(400, under_b, 450, 300, true),
+            "exit when bytes < resume floor"
+        );
+        assert!(
+            !soft_pressure(450, over_b, 450, 300, false),
+            "exactly count stop does not enter"
+        );
     }
 
     #[test]

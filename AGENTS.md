@@ -158,7 +158,8 @@ that shows a clear change after.
    scripts/commit (sole Class A). **No** dual-track `ArchiveJob` / ContigPark.
    Unknown-height `BlockFramed` → `mark_missing` and re-getdata after height.
    Body queue is **RAM-only** (redownload on restart) to avoid double disk write
-   of every block; soft depth ≈1.5 min / resume ≈1 min of tip-rate blocks.
+   of every block; soft depth = max(~1.5 min tip-rate count, ~150 MiB) with
+   resume under ~1 min **or** ~100 MiB (early tiny blocks may run far ahead).
 3. **Soft budgets are request-limited only.** Always accept already-requested
    block bytes into the body queue, even if that overshoots soft depth.
    Bound memory by stopping new densify **getdata** (`block_queue` soft

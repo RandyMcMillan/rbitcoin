@@ -6,9 +6,10 @@
 //!   Multi-peer race up to [`TIP_HOLE_MAX_PEERS`] immediately — confirm is
 //!   frozen until tip+1 is claim-ready.
 //! - **Densify** (tip+1 outward, closest first): fill missing heights up to
-//!   [`CONTIG_DENSIFY_AHEAD`]. Soft in-RAM depth (~1.5 min tip-rate blocks)
-//!   stops **frontier** densify; **gaps inside the queued height span** are
-//!   always filled (overshoot past the soft target is OK while closing holes).
+//!   [`CONTIG_DENSIFY_AHEAD`]. Soft in-RAM depth (max of ~1.5 min tip-rate
+//!   blocks and ~150 MiB payload) stops **frontier** densify; **gaps inside the
+//!   queued height span** are always filled (overshoot past the soft target is
+//!   OK while closing holes — early tiny blocks can run far ahead on the byte floor).
 //! - Never request beyond densify horizon; events refuse far bodies too.
 //! - One body-queue copy per height (receive path drops duplicates).
 
@@ -89,8 +90,8 @@ pub(crate) fn archive_pipeline_saturated(
 /// Assign getdata for the body-queue pipeline.
 ///
 /// `archive_can_assign`: soft archive RAM headroom for densify.
-/// `bq_soft_pressure`: in-RAM depth over ~1.5 min tip-rate target — stop frontier
-/// densify only; **gap fill** within queued max height still runs.
+/// `bq_soft_pressure`: in-RAM depth over max(~1.5 min tip-rate count, ~150 MiB)
+/// — stop frontier densify only; **gap fill** within queued max height still runs.
 pub(crate) fn assign_work_ordered(
     st: &mut IbdWorkState,
     hub: &ChainHub,

@@ -318,7 +318,8 @@ pub(crate) fn apply_peer_event(
             hash,
             payload,
         } => {
-            // Raw frame payload → durable body queue (no peer full Block decode).
+            // Raw frame payload → in-RAM body queue (no peer full Block decode;
+            // block hash already known from framing; parse/txids on confirm pack).
             let wire_bytes = payload.len();
             note_block_rx(&mut st.slots, peer, wire_bytes);
             clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);

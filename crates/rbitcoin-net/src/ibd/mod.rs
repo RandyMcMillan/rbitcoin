@@ -113,7 +113,7 @@ pub(crate) const PENDING_STALE: Duration = Duration::from_secs(45);
 pub(crate) const FAR_SCAN_BUDGET: usize = 65_536;
 /// Body-queue densify / receive horizon past tip+1 (height count).
 ///
-/// **Primary capacity is soft time-depth** (~5 min of tip-rate blocks on disk).
+/// **Primary capacity is soft time-depth** (~1.5 min of tip-rate blocks in RAM).
 /// This height cap stops unbounded far getdata when the soft count target is
 /// still large (e.g. very high tip rate) or cold-start floors admit densify
 /// while early blocks are tiny. Also used as the hard receive refuse horizon
@@ -412,7 +412,8 @@ pub async fn ibd_cancellable(
     }
     // Dedicated confirm path — never blocks the network/archive event loop.
     let confirm_feed = Arc::new(ConfirmFeed::new());
-    // Rehydrate durable block_queue → unified confirm wire feed (same pipeline).
+    // RAM body queue starts empty after restart (no durable rehydrate). Call is
+    // a no-op that also drops any legacy on-disk residue via Query open.
     match rehydrate_block_queue_into_confirm(
         hub.as_ref(),
         &mut st,
@@ -420,10 +421,8 @@ pub async fn ibd_cancellable(
         &archive_queued,
     ) {
         Ok(n) if n > 0 => {
-            // Summary already logged inside rehydrate (n / height range / MiB).
-            if n == 0 {
-                rbitcoin_log::debug!("ibd: rehydrate: body queue empty or fully confirmed");
-            }
+            // Live-process residual only (same run); restart cannot rehydrate wire.
+            rbitcoin_log::debug!("ibd: rehydrate: noted {n} in-RAM body queue entries");
         }
         Ok(_) => {}
         Err(e) => {
@@ -446,7 +445,7 @@ pub async fn ibd_cancellable(
         Arc::clone(&accepted),
         Arc::clone(&loop_stats),
     );
-    // Seed engine with any bodies already on disk for the work path.
+    // Seed engine with any bodies already in the RAM queue for the work path.
     offer_confirm_ready(
         &confirm_feed,
         &st.height_to_hash,
@@ -536,10 +535,10 @@ pub async fn ibd_cancellable(
         st.hygiene();
 
         // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
-        // Soft BQ depth (~5 min tip-rate blocks) stops frontier densify; gaps
-        // inside on-disk max height always fill. Archive soft RAM still gates
+        // Soft BQ depth (~1.5 min tip-rate blocks) stops frontier densify; gaps
+        // inside queued max height always fill. Archive soft RAM still gates
         // densify. Tip-hole race always runs. In-flight bodies always accepted
-        // onto durable disk. Saturated pipeline → Critical only.
+        // into the RAM queue. Saturated pipeline → Critical only.
         let far_scale = archive_queued.far_admission_scale();
         let tip_rate_opt = tip_rate_tracker.eta_rate(Instant::now());
         let bq_soft_pressure = hub.query.block_queue_update_soft_pressure(tip_rate_opt);
@@ -906,7 +905,7 @@ pub async fn ibd_cancellable(
 
             // Bold on a TTY so the 5s progress line stands out among perf/debug noise.
             // plan_q/prepq/writeq; `name<0/cap` = empty.
-            // bq disk=: durable body queue files; soft=n/stop = time-depth densify gate.
+            // bq soft=n/stop RAM=: in-RAM body queue; soft = time-depth densify gate.
             let conf_q = confirm::format_conf_q(
                 plan_q,
                 load_q,
@@ -940,10 +939,6 @@ pub async fn ibd_cancellable(
                 .ready_hwm
                 .saturating_sub(prog.tip)
                 .saturating_add(st.inflight.len() as u32);
-            let arch_mb = archive_queued.bytes() / (1024 * 1024);
-            let arch_budget_mb = archive_queued.budget_bytes() / (1024 * 1024);
-            let arch_q_now = archive_queued.count();
-
             // One sample/reset, then INFO `ibd: perf` + `ibd: sizes` (+ DEBUG `ibd: perf_dbg`).
             let parent_cache_snap = hub.query.parent_cache_perf_snapshot();
             let (plan_q, load_q, write_q) = confirm_queues.snap();
@@ -959,13 +954,7 @@ pub async fn ibd_cancellable(
                 &loop_stats,
                 st.inflight.len(),
                 inflight_cap,
-                arch_q_now,
-                arch_mb,
-                arch_budget_mb,
                 (bq_bytes, bq_count, bq_soft_stop),
-                st.body.pending_len(),
-                st.body.known_len(),
-                st.ordered.len(),
                 ahead,
                 prog.tip_hole,
                 peers_n,
@@ -999,7 +988,7 @@ pub async fn ibd_cancellable(
                 && prog.tip_hole == 0
                 && !conf_busy
                 && st.inflight.is_empty()
-                && arch_q_now == 0
+                && archive_queued.count() == 0
                 && prog.ready_hwm > prog.tip.saturating_add(1)
             {
                 let expect = prog.tip.saturating_add(1);

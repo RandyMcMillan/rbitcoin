@@ -151,14 +151,16 @@ that shows a clear change after.
 
 **Full rules:** `docs/ibd-memory.md`. Summary for agents:
 
-1. **Distinguish** process-owned heap (Rust structures, confirm pipeline wire)
-   from **kernel page cache** under store mmaps (`RssFile`). Do not “fix” RSS
-   by gutting intentional caches (CreateResidency, durable body queue).
-2. **Unified path only:** peer → durable **body queue** → confirm plan/prep/
+1. **Distinguish** process-owned heap (Rust structures, confirm pipeline wire,
+   in-RAM body queue) from **kernel page cache** under store mmaps (`RssFile`).
+   Do not “fix” RSS by gutting intentional caches (CreateResidency, body queue).
+2. **Unified path only:** peer → in-RAM **body queue** → confirm plan/prep/
    scripts/commit (sole Class A). **No** dual-track `ArchiveJob` / ContigPark.
    Unknown-height `BlockFramed` → `mark_missing` and re-getdata after height.
+   Body queue is **RAM-only** (redownload on restart) to avoid double disk write
+   of every block; soft depth ≈1.5 min / resume ≈1 min of tip-rate blocks.
 3. **Soft budgets are request-limited only.** Always accept already-requested
-   block bytes onto the durable body queue, even if that overshoots soft depth.
+   block bytes into the body queue, even if that overshoots soft depth.
    Bound memory by stopping new densify **getdata** (`block_queue` soft
    time-depth / `can_assign`) — never by stalling TCP reads or Full-dropping
    bodies already on the wire.

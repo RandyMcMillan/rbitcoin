@@ -18,7 +18,7 @@ Recent tidy pass (what was deleted vs intentional dual paths):
   Peers (BIP324 v2)
         │
         ▼
-  IBD densify getdata ──► durable body queue (store/block_queue/)
+  IBD densify getdata ──► in-RAM body queue (process-local FIFO)
         │                              │
         │                              ▼
         │                    Confirm prep → scripts → commit

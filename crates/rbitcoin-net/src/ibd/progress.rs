@@ -1,8 +1,8 @@
 //! Work-chain progress snapshot, percent helpers, and rate/ETA for IBD logs.
 //!
-//! The operator `ibd: progress` line reports tip pace and durable block-queue
-//! occupancy (schema 12). It does **not** print a retired dual-track Class A
-//! high-water or "archive lead" (`arch_hwm` / `lead=`).
+//! The operator `ibd: progress` line reports tip pace and in-RAM block-queue
+//! occupancy. It does **not** print a retired dual-track Class A high-water or
+//! "archive lead" (`arch_hwm` / `lead=`).
 
 use super::body::BodyPresence;
 use crate::chain::ChainHub;
@@ -44,7 +44,7 @@ pub(crate) struct ProgressLineInput {
     pub horizon: u32,
     /// From [`TipRateTracker::eta_string`] (`eta=…` or `done`).
     pub eta: String,
-    /// Durable on-disk block queue bytes / entry count (not process heap).
+    /// In-RAM block queue bytes / entry count (process heap wire payloads).
     pub bq_bytes: u64,
     pub bq_count: usize,
     /// Soft densify stop target (block count at tip rate).
@@ -54,12 +54,13 @@ pub(crate) struct ProgressLineInput {
 /// Build the `ibd: progress …` message body (no log level prefix).
 ///
 /// Tip percent/rate, **fetch hole** (tip→next claim-ready body), peers, confirm
-/// queues, txs, header horizon, tip-rate ETA, durable block-queue occupancy.
-/// `bq disk=` is on-disk payload only; `soft=n/stop` is time-depth densify gate.
+/// queues, txs, header horizon, tip-rate ETA, in-RAM block-queue occupancy.
+/// `bq soft=n/stop` is time-depth densify gate; `RAM=` is queue heap MiB.
+/// Count is only in `soft=` (no redundant `n=`).
 pub(crate) fn format_progress_line(i: &ProgressLineInput) -> String {
     let bq_mib = i.bq_bytes / (1024 * 1024);
     format!(
-        "ibd: progress {}% tip={} ({}/s) hole={} peers={} {} txs={} horizon={} {} bq n={} disk={}MiB soft={}/{}",
+        "ibd: progress {}% tip={} ({}/s) hole={} peers={} {} txs={} horizon={} {} bq soft={}/{} RAM={}MiB",
         i.pct,
         i.tip,
         format_rate(i.tip_rate),
@@ -70,9 +71,8 @@ pub(crate) fn format_progress_line(i: &ProgressLineInput) -> String {
         i.horizon,
         i.eta,
         i.bq_count,
-        bq_mib,
-        i.bq_count,
         i.bq_soft_stop,
+        bq_mib,
     )
 }
 
@@ -301,7 +301,7 @@ mod tests {
     use rbitcoin_query::{soft_depth_targets, soft_pressure, BQ_SOFT_COUNT_FLOOR};
     use std::time::{Duration, Instant};
 
-    /// Shipped progress line: tip + durable bq soft depth; forbid retired tokens.
+    /// Shipped progress line: tip + in-RAM bq soft depth; forbid retired tokens.
     #[test]
     fn format_progress_line_schema12_tokens() {
         // tip_rate 12.5 → format_rate rounds to "12" (≥10).
@@ -317,17 +317,18 @@ mod tests {
             eta: "eta=18h".into(),
             bq_bytes: 256 * 1024 * 1024,
             bq_count: 17,
-            bq_soft_stop: 600,
+            bq_soft_stop: 180,
         });
         assert_eq!(
             line,
-            "ibd: progress 42% tip=100000 (12/s) hole=3 peers=8 planq=1/2 prepq=1/2 writeq=0/2 txs=50000000 horizon=900000 eta=18h bq n=17 disk=256MiB soft=17/600"
+            "ibd: progress 42% tip=100000 (12/s) hole=3 peers=8 planq=1/2 prepq=1/2 writeq=0/2 txs=50000000 horizon=900000 eta=18h bq soft=17/180 RAM=256MiB"
         );
         // Current schema tokens present.
         assert!(line.contains(" hole="), "{line}");
-        assert!(line.contains(" bq n="), "{line}");
-        assert!(line.contains(" disk="), "{line}");
         assert!(line.contains(" soft="), "{line}");
+        assert!(line.contains(" RAM="), "{line}");
+        assert!(!line.contains(" bq n="), "count lives in soft= only: {line}");
+        assert!(!line.contains(" disk="), "queue is RAM not disk: {line}");
         assert!(!line.contains("pending_ram="), "no RAM overflow meter: {line}");
         assert!(line.contains("planq"), "{line}");
         assert!(line.contains("prepq"), "{line}");
@@ -361,30 +362,35 @@ mod tests {
             bq_soft_stop: 256,
         });
         assert!(slow.contains("tip=10 (2.4/s)"), "{slow}");
-        assert!(slow.contains("bq n=0 disk=0MiB soft=0/256"), "{slow}");
+        assert!(slow.contains("bq soft=0/256 RAM=0MiB"), "{slow}");
         assert!(!slow.contains("arch_hwm") && !slow.contains("lead="), "{slow}");
     }
 
     #[test]
     fn soft_depth_targets_at_rate() {
-        let (stop, resume) = soft_depth_targets(Some(2.0));
-        assert_eq!(stop, 600, "2 blk/s × 300s");
-        assert_eq!(resume, 480, "2 blk/s × 240s");
+        // Below floor: 2 blk/s × 90s = 180 → clamped to BQ_SOFT_COUNT_FLOOR.
+        let (stop_lo, resume_lo) = soft_depth_targets(Some(2.0));
+        assert_eq!(stop_lo, BQ_SOFT_COUNT_FLOOR, "2 blk/s × 90s under floor");
+        assert!(resume_lo < stop_lo && resume_lo > 0);
         let (stop0, resume0) = soft_depth_targets(None);
         assert_eq!(stop0, BQ_SOFT_COUNT_FLOOR);
         assert!(resume0 < stop0 && resume0 > 0);
+        // Above floor: 5 blk/s × 90s / 60s.
+        let (stop, resume) = soft_depth_targets(Some(5.0));
+        assert_eq!(stop, 450, "5 blk/s × 90s");
+        assert_eq!(resume, 300, "5 blk/s × 60s");
         let (stop_hi, resume_hi) = soft_depth_targets(Some(10.0));
-        assert_eq!(stop_hi, 3000);
-        assert_eq!(resume_hi, 2400);
+        assert_eq!(stop_hi, 900);
+        assert_eq!(resume_hi, 600);
     }
 
     #[test]
     fn soft_hysteresis_latch() {
-        assert!(!soft_pressure(100, 600, 480, false));
-        assert!(soft_pressure(601, 600, 480, false), "enter when > stop");
-        assert!(soft_pressure(500, 600, 480, true), "stay latched mid-band");
-        assert!(!soft_pressure(479, 600, 480, true), "exit when < resume");
-        assert!(!soft_pressure(600, 600, 480, false), "exactly stop does not enter");
+        assert!(!soft_pressure(100, 450, 300, false));
+        assert!(soft_pressure(451, 450, 300, false), "enter when > stop");
+        assert!(soft_pressure(400, 450, 300, true), "stay latched mid-band");
+        assert!(!soft_pressure(299, 450, 300, true), "exit when < resume");
+        assert!(!soft_pressure(450, 450, 300, false), "exactly stop does not enter");
     }
 
     #[test]

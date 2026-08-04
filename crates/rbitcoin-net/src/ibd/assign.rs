@@ -6,8 +6,8 @@
 //!   Multi-peer race up to [`TIP_HOLE_MAX_PEERS`] immediately — confirm is
 //!   frozen until tip+1 is claim-ready.
 //! - **Densify** (tip+1 outward, closest first): fill missing heights up to
-//!   [`CONTIG_DENSIFY_AHEAD`]. Soft on-disk depth (~5 min tip-rate blocks)
-//!   stops **frontier** densify; **gaps inside the on-disk height span** are
+//!   [`CONTIG_DENSIFY_AHEAD`]. Soft in-RAM depth (~1.5 min tip-rate blocks)
+//!   stops **frontier** densify; **gaps inside the queued height span** are
 //!   always filled (overshoot past the soft target is OK while closing holes).
 //! - Never request beyond densify horizon; events refuse far bodies too.
 //! - One body-queue copy per height (receive path drops duplicates).
@@ -89,8 +89,8 @@ pub(crate) fn archive_pipeline_saturated(
 /// Assign getdata for the body-queue pipeline.
 ///
 /// `archive_can_assign`: soft archive RAM headroom for densify.
-/// `bq_soft_pressure`: on-disk depth over ~5 min tip-rate target — stop frontier
-/// densify only; **gap fill** within on-disk max height still runs.
+/// `bq_soft_pressure`: in-RAM depth over ~1.5 min tip-rate target — stop frontier
+/// densify only; **gap fill** within queued max height still runs.
 pub(crate) fn assign_work_ordered(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -154,14 +154,14 @@ pub(crate) fn assign_work_ordered(
     let densify_per_peer = far_slots_per_peer(cfg.per_peer, !tip_holes.is_empty());
 
     let densify_hi = path_lo.saturating_add(CONTIG_DENSIFY_AHEAD);
-    let max_on_disk = hub.query.block_queue_max_height();
+    let max_queued = hub.query.block_queue_max_height();
 
-    // Under soft pressure: only fill holes inside the on-disk span.
+    // Under soft pressure: only fill holes inside the queued height span.
     // Otherwise: full densify band (gaps + frontier).
     let band_hi = if bq_soft_pressure {
-        match max_on_disk {
+        match max_queued {
             Some(mh) if mh >= path_lo => mh.min(densify_hi),
-            // Nothing on disk yet under pressure — no gap band; frontier blocked.
+            // Nothing queued yet under pressure — no gap band; frontier blocked.
             _ => {
                 finish_assign(loop_stats, t0, issued);
                 return;
@@ -665,7 +665,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Under soft pressure, only gaps within max on-disk height are densified.
+    /// Under soft pressure, only gaps within max queued height are densified.
     #[test]
     fn densify_gaps_under_soft_pressure_not_frontier() {
         let (dir, hub) = tmp_hub();
@@ -681,7 +681,7 @@ mod tests {
         cfg.window = 64;
         cfg.per_peer = 16;
 
-        // Heights 10..=30; on disk at 10 and 20 (gap at 15); frontier 25.
+        // Heights 10..=30; queued at 10 and 20 (gap at 15); frontier 25.
         for ht in 10u32..=30 {
             let hash = h(ht);
             st.record_height(hash, ht);
@@ -718,12 +718,12 @@ mod tests {
             .keys()
             .filter_map(|hash| st.hash_height.get(hash).copied())
             .collect();
-        // Gap inside max_on_disk=20 must be requestable (e.g. 15).
+        // Gap inside max_queued=20 must be requestable (e.g. 15).
         assert!(
             issued_hts.iter().any(|&ht| ht > 10 && ht < 20),
             "expected gap fill under pressure; issued={issued_hts:?}"
         );
-        // Frontier beyond max on-disk must not be densified under pressure.
+        // Frontier beyond max queued must not be densified under pressure.
         assert!(
             !issued_hts.iter().any(|&ht| ht > 20),
             "frontier blocked under pressure; issued={issued_hts:?}"

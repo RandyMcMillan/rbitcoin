@@ -43,14 +43,14 @@ use std::sync::Mutex;
 
 pub type QueryError = StoreError;
 
-/// Soft body-queue depth stop: ~5 minutes of tip-rate blocks on disk.
-pub const BQ_SOFT_STOP_SECS: f64 = 300.0;
-/// Soft body-queue depth resume: ~4 minutes (hysteresis vs stop).
-pub const BQ_SOFT_RESUME_SECS: f64 = 240.0;
+/// Soft body-queue depth stop: ~1.5 minutes of tip-rate blocks in RAM.
+pub const BQ_SOFT_STOP_SECS: f64 = 90.0;
+/// Soft body-queue depth resume: ~1 minute (hysteresis vs stop).
+pub const BQ_SOFT_RESUME_SECS: f64 = 60.0;
 /// Minimum stop/resume counts when tip rate is cold or near zero.
 pub const BQ_SOFT_COUNT_FLOOR: u32 = 256;
 
-/// Target on-disk block counts for soft densify hysteresis from tip rate (blocks/s).
+/// Target in-RAM block counts for soft densify hysteresis from tip rate (blocks/s).
 ///
 /// When `rate` is unknown or near zero, uses [`BQ_SOFT_COUNT_FLOOR`] so a stuck
 /// tip cannot clamp targets to zero and freeze densify after a small backlog.
@@ -781,7 +781,10 @@ pub struct Query {
     confirm_parents: confirm_parent_cache::ConfirmParentCache,
     /// Sole hot create map (fk/range/outs) for archive prep + confirm pin.
     create_residency: create_residency::CreateResidency,
-    /// Durable on-disk block payload queue (IBD restart without re-download).
+    /// In-RAM block payload queue (FIFO until confirm-write; empty after restart).
+    ///
+    /// RAM-only by design: avoids double-writing every block (queue + Class A).
+    /// Accepts redownload on restart and peak RAM of ~1–1.5 min of tip-rate wire.
     block_queue: Mutex<rbitcoin_store::BlockQueue>,
     /// Soft time-depth hysteresis latch for densify frontier (updated with tip rate).
     block_queue_pressure: AtomicBool,
@@ -944,8 +947,8 @@ impl Query {
 /// Outcome of [`Query::block_queue_offer`].
 #[derive(Debug, Clone)]
 pub struct BlockQueueOffer {
-    /// Durable queue record id for this body.
-    pub disk_id: u64,
+    /// In-RAM queue record id for this body.
+    pub queue_id: u64,
 }
 
 impl Query {
@@ -992,30 +995,30 @@ impl Query {
         &self.create_residency
     }
 
-    /// Durable block queue stats: `(absolute_budget_or_max, disk_bytes, disk_count)`.
+    /// In-RAM block queue stats: `(absolute_budget_or_max, bytes, count)`.
     ///
-    /// Disk bytes are **not** process heap. Absolute budget is `u64::MAX` when
-    /// unlimited (default); densify uses soft time-depth, not this ceiling.
+    /// Bytes are process heap (wire payloads). Absolute budget is `u64::MAX`
+    /// when unlimited (default); densify uses soft time-depth, not this ceiling.
     pub fn block_queue_stats(&self) -> (u64, u64, usize) {
         let g = self.block_queue.lock().unwrap();
         (g.budget(), g.bytes(), g.count())
     }
 
-    /// On-disk entry count (soft time-depth meter).
+    /// In-RAM entry count (soft time-depth meter).
     pub fn block_queue_count(&self) -> usize {
         self.block_queue.lock().unwrap().count()
     }
 
-    /// Highest height on the durable body queue (`None` if empty).
+    /// Highest height on the in-RAM body queue (`None` if empty).
     pub fn block_queue_max_height(&self) -> Option<u32> {
         self.block_queue.lock().unwrap().max_height()
     }
 
-    /// Soft densify pressure from tip rate (blocks/s) and on-disk count.
+    /// Soft densify pressure from tip rate (blocks/s) and in-RAM count.
     ///
-    /// Stop frontier densify when depth **>** ~5 minutes of tip-rate blocks;
-    /// resume when **<** ~4 minutes. Updates the process latch. Gap fill inside
-    /// the on-disk height span is always allowed by assign even under pressure.
+    /// Stop frontier densify when depth **>** ~1.5 minutes of tip-rate blocks;
+    /// resume when **<** ~1 minute. Updates the process latch. Gap fill inside
+    /// the queued height span is always allowed by assign even under pressure.
     ///
     /// `rate_blocks_per_s` should match IBD `TipRateTracker::eta_rate` (ETA EWMA).
     pub fn block_queue_update_soft_pressure(&self, rate_blocks_per_s: Option<f64>) -> bool {
@@ -1038,12 +1041,13 @@ impl Query {
         soft_depth_targets(rate_blocks_per_s)
     }
 
-    /// Persist a decoded block payload on durable disk.
+    /// Enqueue a raw block payload in the process-local RAM queue.
     ///
     /// Always accepts for the live process when the optional absolute byte
-    /// ceiling allows. Real IO errors still return `Err`. Soft time-depth only
-    /// stops **new densify getdata** — never refuse in-flight peer wire here
-    /// (except rare absolute-ceiling `BudgetFull`).
+    /// ceiling allows. Soft time-depth only stops **new densify getdata** —
+    /// never refuse in-flight peer wire here (except rare absolute-ceiling
+    /// `BudgetFull`). Restart drops the queue (redownload); sole durable write
+    /// is Class A on confirm — no double disk write of every block.
     pub fn block_queue_offer(
         &self,
         height: u32,
@@ -1052,15 +1056,15 @@ impl Query {
         payload: &[u8],
     ) -> Result<BlockQueueOffer, QueryError> {
         let mut g = self.block_queue.lock().unwrap();
-        // Idempotent: already on disk for this height (re-offer after race).
+        // Idempotent: already queued for this height (re-offer after race).
         if let Some(id) = g.id_for_height(height) {
-            return Ok(BlockQueueOffer { disk_id: id });
+            return Ok(BlockQueueOffer { queue_id: id });
         }
         let id = g.enqueue(height, hash, header_fk, payload)?;
-        Ok(BlockQueueOffer { disk_id: id })
+        Ok(BlockQueueOffer { queue_id: id })
     }
 
-    /// Direct disk enqueue (tests / tools). Prefer [`Self::block_queue_offer`] on IBD.
+    /// Direct RAM enqueue (tests / tools). Prefer [`Self::block_queue_offer`] on IBD.
     pub fn block_queue_enqueue(
         &self,
         height: u32,
@@ -1072,24 +1076,21 @@ impl Query {
         Ok(g.enqueue(height, hash, header_fk, payload)?)
     }
 
-    /// Remove durable queue entry after combined confirm-write (or permanent drop).
+    /// Remove RAM queue entry after combined confirm-write (or permanent drop).
     pub fn block_queue_dequeue_height(&self, height: u32) -> Result<usize, QueryError> {
         let mut g = self.block_queue.lock().unwrap();
         Ok(g.dequeue_height(height)?)
     }
 
-    /// Index-only durable queue entries (no payload IO). Prefer for IBD restart.
-    ///
-    /// Production rehydrate must use this — not [`Self::block_queue_load_all`].
+    /// Index-only queue entries (no payload clone). Empty after restart.
     pub fn block_queue_list_meta(&self) -> Vec<rbitcoin_store::QueuedBlockMeta> {
         let g = self.block_queue.lock().unwrap();
         g.list_meta()
     }
 
-    /// Load all durable queued blocks **with full payloads** (tests / tools).
+    /// Load all queued blocks **with full payloads** (tests / tools).
     ///
-    /// **Do not use on production multi‑GiB queues** — peak RAM ≈ disk fill.
-    /// Use [`Self::block_queue_list_meta`] for rehydrate and
+    /// Prefer [`Self::block_queue_list_meta`] for index walks and
     /// [`Self::block_queue_payload`] for single-height prep.
     pub fn block_queue_load_all(&self) -> Result<Vec<rbitcoin_store::QueuedBlock>, QueryError> {
         let g = self.block_queue.lock().unwrap();
@@ -1098,14 +1099,17 @@ impl Query {
 
     /// Body-queue intake for confirm prep: payload for `height` without dequeue.
     ///
-    /// Peer → durable body queue is the only source of wire for the unified path;
+    /// Peer → RAM body queue is the only source of wire for the unified path;
     /// ConfirmFeed carries readiness (height/hash), not retained `Block`s.
+    /// Accept stores raw wire only (block hash already known from framing;
+    /// full parse + txids stay on the confirm pack path so we do not hold both
+    /// a decoded `Block` and the wire bytes).
     pub fn block_queue_payload(&self, height: u32) -> Result<Option<Vec<u8>>, QueryError> {
         let g = self.block_queue.lock().unwrap();
         Ok(g.get_by_height(height)?.map(|q| q.payload))
     }
 
-    /// True if the durable body queue holds `height`.
+    /// True if the in-RAM body queue holds `height`.
     pub fn block_queue_has_height(&self, height: u32) -> bool {
         let g = self.block_queue.lock().unwrap();
         g.contains_height(height)

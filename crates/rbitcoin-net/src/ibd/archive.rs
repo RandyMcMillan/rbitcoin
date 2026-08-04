@@ -127,8 +127,9 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
         Some(t) => t.saturating_add(1),
     };
 
-    // Meta only — never `block_queue_load_all` (that materializes multi‑GiB of
-    // wire into heap at every restart; feed only needs height/hash readiness).
+    // Index only. After restart the RAM queue is empty (by design — sole durable
+    // write is Class A; redownload instead of double disk write). Same-process
+    // residual still notes feed readiness.
     let queued = hub.query.block_queue_list_meta();
     if queued.is_empty() {
         return Ok(0);
@@ -167,7 +168,7 @@ pub(crate) fn rehydrate_block_queue_into_confirm(
             continue;
         }
         let wire_bytes = qb.payload_len;
-        // Disk-owned: pending so densify will not re-getdata; no soft charge.
+        // Queue-owned: pending so densify will not re-getdata; no soft charge.
         st.body.mark_pending(hash);
         if qb.height != u32::MAX {
             st.record_height(hash, qb.height);

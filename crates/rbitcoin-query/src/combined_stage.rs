@@ -277,43 +277,40 @@ mod tests {
     }
 
     #[test]
-    fn block_queue_via_query_enqueue_reopen_dequeue() {
+    fn block_queue_via_query_enqueue_reopen_empty() {
         let (dir, q) = temp_query();
         let payload = b"ibd-block-payload-bytes".to_vec();
         let id = q
             .block_queue_enqueue(42, [0xCDu8; 32], 7, &payload)
             .unwrap();
         assert_eq!(q.block_queue_stats().2, 1);
-        // Simulate restart: reopen Query on same store.
-        drop(q);
-        let q2 = Query::open_or_create(dir.join("store")).unwrap();
-        let all = q2.block_queue_load_all().unwrap();
+        let all = q.block_queue_load_all().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, id);
         assert_eq!(all[0].height, 42);
         assert_eq!(all[0].payload, payload);
         // Confirm-write hook: dequeue by height.
-        assert_eq!(q2.block_queue_dequeue_height(42).unwrap(), 1);
+        assert_eq!(q.block_queue_dequeue_height(42).unwrap(), 1);
+        assert_eq!(q.block_queue_stats().2, 0);
+        // Restart: RAM queue is empty (by design — redownload, no double disk write).
+        drop(q);
+        let q2 = Query::open_or_create(dir.join("store")).unwrap();
+        assert_eq!(q2.block_queue_load_all().unwrap().len(), 0);
         assert_eq!(q2.block_queue_stats().2, 0);
-        drop(q2);
-        let q3 = Query::open_or_create(dir.join("store")).unwrap();
-        assert_eq!(q3.block_queue_load_all().unwrap().len(), 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Full durable budget → offer buffers in RAM (no error); dequeue flushes.
-    ///
-    /// Offer always lands on durable disk (no RAM soft overflow).
+    /// Offer always lands in the process-local RAM queue.
     #[test]
-    fn block_queue_offer_always_disk() {
+    fn block_queue_offer_always_ram() {
         let (dir, q) = temp_query();
         let p1 = vec![1u8; 64 * 1024];
         let p2 = vec![2u8; 64 * 1024];
         let o1 = q.block_queue_offer(1, [1u8; 32], 1, &p1).unwrap();
-        assert!(o1.disk_id > 0);
+        assert!(o1.queue_id > 0);
         assert_eq!(q.block_queue_stats().2, 1);
         let o2 = q.block_queue_offer(2, [2u8; 32], 2, &p2).unwrap();
-        assert!(o2.disk_id > 0);
+        assert!(o2.queue_id > 0);
         assert_eq!(q.block_queue_stats().2, 2);
         let n = q.block_queue_dequeue_height(1).unwrap();
         assert_eq!(n, 1);
@@ -325,15 +322,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Confirm prep intake: payload by height from disk (no dequeue).
+    /// Confirm prep intake: payload by height from RAM (no dequeue).
     #[test]
-    fn block_queue_payload_peek_disk() {
+    fn block_queue_payload_peek_ram() {
         let (dir, q) = temp_query();
-        let disk = b"disk-payload".to_vec();
-        q.block_queue_enqueue(10, [0xAAu8; 32], 1, &disk).unwrap();
+        let wire = b"ram-payload".to_vec();
+        q.block_queue_enqueue(10, [0xAAu8; 32], 1, &wire).unwrap();
         assert_eq!(
             q.block_queue_payload(10).unwrap().as_deref(),
-            Some(disk.as_slice())
+            Some(wire.as_slice())
         );
         assert!(q.block_queue_has_height(10));
         assert_eq!(q.block_queue_stats().2, 1, "peek does not dequeue");
@@ -344,17 +341,21 @@ mod tests {
     #[test]
     fn block_queue_soft_time_hysteresis() {
         use crate::{soft_depth_targets, soft_pressure, BQ_SOFT_COUNT_FLOOR};
-        let (stop, resume) = soft_depth_targets(Some(2.0));
-        assert_eq!(stop, 600);
-        assert_eq!(resume, 480);
+        // 5 blk/s × 90s / 60s → stop 450, resume 300 (above floor).
+        let (stop, resume) = soft_depth_targets(Some(5.0));
+        assert_eq!(stop, 450);
+        assert_eq!(resume, 300);
         let (stop0, _) = soft_depth_targets(None);
         assert_eq!(stop0, BQ_SOFT_COUNT_FLOOR);
+        // Low rate clamps to floor (2 blk/s × 90s = 180 < 256).
+        let (stop_lo, _) = soft_depth_targets(Some(2.0));
+        assert_eq!(stop_lo, BQ_SOFT_COUNT_FLOOR);
 
         let (dir, q) = temp_query();
         // Empty queue: no pressure.
-        assert!(!q.block_queue_update_soft_pressure(Some(2.0)));
+        assert!(!q.block_queue_update_soft_pressure(Some(5.0)));
         // Enqueue past stop target.
-        for i in 0..601u32 {
+        for i in 0..451u32 {
             q.block_queue_enqueue(i, {
                 let mut h = [0u8; 32];
                 h[..4].copy_from_slice(&i.to_le_bytes());
@@ -363,27 +364,27 @@ mod tests {
             .unwrap();
         }
         assert!(
-            q.block_queue_update_soft_pressure(Some(2.0)),
-            "depth 601 > stop 600"
+            q.block_queue_update_soft_pressure(Some(5.0)),
+            "depth 451 > stop 450"
         );
-        assert!(soft_pressure(500, 600, 480, true), "stay latched mid-band");
-        // Drain into mid-band (still ≥ resume 480).
+        assert!(soft_pressure(400, 450, 300, true), "stay latched mid-band");
+        // Drain into mid-band (still ≥ resume 300).
         for i in 0..50u32 {
             q.block_queue_dequeue_height(i).unwrap();
         }
-        assert_eq!(q.block_queue_count(), 551);
+        assert_eq!(q.block_queue_count(), 401);
         assert!(
-            q.block_queue_update_soft_pressure(Some(2.0)),
-            "still mid-band (551 in [480, 600])"
+            q.block_queue_update_soft_pressure(Some(5.0)),
+            "still mid-band (401 in [300, 450])"
         );
         // Drain below resume.
-        for i in 50..400u32 {
+        for i in 50..200u32 {
             q.block_queue_dequeue_height(i).unwrap();
         }
-        assert_eq!(q.block_queue_count(), 201);
+        assert_eq!(q.block_queue_count(), 251);
         assert!(
-            !q.block_queue_update_soft_pressure(Some(2.0)),
-            "depth 201 < resume 480"
+            !q.block_queue_update_soft_pressure(Some(5.0)),
+            "depth 251 < resume 300"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

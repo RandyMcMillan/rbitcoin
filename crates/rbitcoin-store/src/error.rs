@@ -15,7 +15,7 @@ pub enum StoreError {
     InvalidFk,
     NotDirectory(PathBuf),
     Corrupt(&'static str),
-    /// Soft capacity (e.g. durable block_queue budget) — not data corruption.
+    /// Soft capacity (e.g. block_queue absolute byte ceiling) — not data corruption.
     /// Caller should buffer in RAM and stop new requests; never spam-log.
     BudgetFull(&'static str),
     /// Cooperative abort (SIGINT / IBD stop) — not data corruption.

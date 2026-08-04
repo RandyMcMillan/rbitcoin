@@ -15,10 +15,9 @@ use crate::error::StoreError;
 use std::os::fd::RawFd;
 use std::path::Path;
 
-/// Default SQ/CQ depth (bulk_io + spend annotate baseline).
-///
-/// Plan head-resolve may request a larger ring via [`with_thread_local`]; the
-/// TLS session grows in place (never shrinks) for the rest of the thread.
+/// Default SQ/CQ depth for all store io_uring sessions (bulk, plan head-resolve,
+/// spend annotate). TLS rings open at this size; [`with_thread_local`] may grow
+/// if a caller requests more (none currently do).
 pub const DEFAULT_ENTRIES: u32 = 128;
 
 /// Linux `RWF_DONTCACHE` — drop pages after IO (kernel 6.14+; ignored if unsupported).
@@ -275,7 +274,7 @@ impl Drop for UringSession {
 /// Run `f` with this **OS thread's** long-lived io_uring session.
 ///
 /// - Opens once on first use; reopens only if `min_entries` exceeds the current
-///   ring size (grows for plan head-resolve 1024, then stays large).
+///   ring size (grows in place, never shrinks).
 /// - Nested calls open a **temporary** ring (re-entrancy safe; no mid-wave share).
 /// - Drains stray in-flight CQEs before handing the session to `f`.
 ///

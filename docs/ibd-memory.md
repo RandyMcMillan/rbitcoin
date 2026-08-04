@@ -8,8 +8,8 @@ in RSS when faulted but are not Rust heap leaks).
 
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
-| **In-RAM body queue** | Soft densify stop when payload &gt; ~150 MiB **and** count has reached ~1.5 min tip-rate stop (no further count overshoot while bytes already full); resume under ~1 min **or** ~100 MiB. Early tiny blocks may still queue past the count stop until ~150 MiB. Optional absolute ceiling via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` (default unlimited) | Peer **BlockFramed** enqueues **raw** frame payload (no full Block decode on peer); confirm pack **decodes** by height; confirm-write **dequeues** after tip advance. **RAM-only by design** — avoids double-writing every block (queue + Class A); restart empties the queue (redownload). Logs: `bq soft=n/stop RAM=`. |
-| **Body densify height horizon** | `CONTIG_DENSIFY_AHEAD` (64 k past tip) | Safety max walk/receive; primary stop is **soft depth** (time + byte floors). Gaps inside queued max height always densify even under pressure. |
+| **In-RAM body queue** | Soft densify assign (no hysteresis): under ~100 MiB free densify ahead; over ~100 MiB only heights confirm will consume in the next ~1 min at tip rate. Optional absolute ceiling via `RBITCOIN_BLOCK_QUEUE_GB` / `_BYTES` (default unlimited) | Peer **BlockFramed** enqueues **raw** frame payload (no full Block decode on peer); confirm pack **decodes** by height; confirm-write **dequeues** after tip advance. **RAM-only by design** — avoids double-writing every block (queue + Class A); restart empties the queue (redownload). Logs: `bq soft=n/win RAM=`. |
+| **Body densify height horizon** | `CONTIG_DENSIFY_AHEAD` (64 k past tip) | Safety max walk/receive; primary gate is soft assign (100 MiB free / 1 min confirm window). |
 | **Confirm feed** | readiness (height/hash), no wire retain | Plan **packs** tip-contiguous runs by decoding BQ wire one height at a time until soft **input** budget (`RBITCOIN_CONFIRM_BATCH_INPUTS`, default **8000**, overshoot block included) or hard **144** blocks; requeue / finish on outcome |
 
 ## Soft budgets (unified body-queue path)
@@ -45,16 +45,16 @@ is over target.
 
 | Allowed | Forbidden |
 |---------|-----------|
-| Stop **frontier densify getdata assign** when soft BQ payload is over ~150 MiB **and** count has reached the ~1.5 min tip-rate stop (no further count overshoot while bytes are already full) | Await a soft gate **before** the next TCP read on a peer |
-| Always fill **gaps** within queued height span under pressure | Drop a body we already received solely for soft budget |
-| Overshoot soft depth while in-flight / gap fill completes | Make healthy peers look stalled by parking the reader on soft backpressure |
-| Accept all in-flight bodies into the RAM queue via `block_queue_offer` (soft pressure is ignored on offer) | Bound process RAM by refusing peer bytes already on the wire |
+| Limit **densify getdata assign** when BQ payload is over ~100 MiB to heights confirm will consume in the next ~1 min at tip rate | Await a soft gate **before** the next TCP read on a peer |
+| Free densify ahead while BQ payload is under ~100 MiB | Drop a body we already received solely for soft budget |
+| Overshoot soft limits while in-flight requests complete | Make healthy peers look stalled by parking the reader on soft backpressure |
+| Accept all in-flight bodies into the RAM queue via `block_queue_offer` (soft assign limits are ignored on offer) | Bound process RAM by refusing peer bytes already on the wire |
 
-**Why this is safe:** when soft depth stops accepting new densify work, assign
-stops issuing getdata. Outstanding requests are finite (per-peer in-flight
-window). Enqueueing those bodies cannot create a truly unbounded leak; the
-backlog drains as confirm dequeues. Bound queue size by **not requesting**, not
-by **not reading**.
+**Why this is safe:** when soft assign restricts densify to the confirm-time
+window, outstanding requests remain finite (per-peer in-flight window).
+Enqueueing those bodies cannot create a truly unbounded leak; the backlog
+drains as confirm dequeues. Bound queue size by **not requesting**, not by
+**not reading**.
 
 Historical regression (do not reintroduce): bounded arch_job Full-drop and
 reader-side decode-permit wait before the next frame made peers look dead while
@@ -79,7 +79,7 @@ known retain structures:
 |-------------|----------------|
 | `rss=` `anon=` `file=` `hwm=` | `/proc` process RSS (anon vs mmap file pages) |
 | `work` / `body` | IBD maps + body-presence sets |
-| `bq soft=n/stop RAM=` | In-RAM body-queue count vs soft densify stop target + heap MiB |
+| `bq soft=n/win RAM=` | In-RAM body-queue count vs 1-min confirm window at tip rate + heap MiB |
 | `conf_plans` / bq / conf pipe | Header plans + body-queue + confirm pipeline sizes (no process pin FIFO) |
 | `conf planq` / `prepq` / `writeq` | Confirm pipeline **queue contents** (batches, blocks, wire MiB, parents) + feed ready/inflight |
 | `txhead` | Segmented `tx.head.*` (open head + sealed heads/fuses; logical sizes) |

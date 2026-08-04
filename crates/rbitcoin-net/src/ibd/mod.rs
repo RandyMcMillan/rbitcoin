@@ -113,11 +113,10 @@ pub(crate) const PENDING_STALE: Duration = Duration::from_secs(45);
 pub(crate) const FAR_SCAN_BUDGET: usize = 65_536;
 /// Body-queue densify / receive horizon past tip+1 (height count).
 ///
-/// **Primary capacity is soft depth** (max of ~1.5 min tip-rate blocks and
-/// ~150 MiB payload in RAM). This height cap stops unbounded far getdata when
-/// the soft target is still large (e.g. very high tip rate) or early tiny
-/// blocks fill the byte floor with a huge count. Also used as the hard
-/// receive refuse horizon past tip.
+/// **Primary capacity is soft densify assign** (under ~100 MiB free ahead; over
+/// that only ~1 min of confirm work at tip rate). This height cap stops
+/// unbounded far getdata when the soft window is large (e.g. very high tip
+/// rate). Also used as the hard receive refuse horizon past tip.
 pub(crate) const CONTIG_DENSIFY_AHEAD: u32 = 65_536;
 
 /// Tunables for IBD (defaults lean libbitcoin/Core-ish).
@@ -498,20 +497,26 @@ pub async fn ibd_cancellable(
         st.hygiene();
 
         // NETWORK FIRST: top up getdata before Class C confirm burns the turn.
-        // Soft BQ latch stops **frontier densify assign** only (bytes over ~150 MiB
-        // and count at ~1.5 min tip-rate stop). Gaps inside queued max height always
-        // fill. Peer reads / block_queue_offer never consult soft pressure. Archive
-        // soft RAM still gates densify. Tip-hole race always runs. Saturated → Critical.
+        // Soft BQ assign (no hysteresis): under ~100 MiB free densify ahead; over
+        // that only the next ~1 min of confirm work at tip rate. Peer reads /
+        // block_queue_offer never consult soft limits. Archive soft RAM still
+        // gates densify. Tip-hole race always runs. Window covered → Critical.
         let far_scale = archive_queued.far_admission_scale();
         let tip_rate_opt = tip_rate_tracker.eta_rate(Instant::now());
-        let bq_soft_pressure = hub.query.block_queue_update_soft_pressure(tip_rate_opt);
+        let _ = hub.query.block_queue_update_soft_pressure(tip_rate_opt);
+        let (_bq_budget, bq_bytes, bq_count) = hub.query.block_queue_stats();
+        let bq_window_covered = rbitcoin_query::soft_confirm_window_covered(
+            bq_count as u32,
+            bq_bytes,
+            tip_rate_opt,
+        );
         let archive_can_assign = archive_queued.can_assign();
         let write_next = archive_write_next.load(Ordering::Relaxed);
         let inflight_before = st.inflight.len();
         let depth = if archive_pipeline_saturated(
             st.body.pending_len(),
             st.inflight.len(),
-            bq_soft_pressure,
+            bq_window_covered,
             archive_queued.fill_ratio(),
         ) {
             AssignDepth::Critical
@@ -527,7 +532,7 @@ pub async fn ibd_cancellable(
             write_next,
             depth,
             archive_can_assign,
-            bq_soft_pressure,
+            tip_rate_opt,
         );
 
         // Note claim-ready heights into the confirm feed (body queue / pending wire only).
@@ -589,13 +594,19 @@ pub async fn ibd_cancellable(
         if freed >= 8 || st.inflight.is_empty() {
             let far_scale2 = archive_queued.far_admission_scale();
             let tip_rate2 = tip_rate_tracker.eta_rate(Instant::now());
-            let bq_pressure2 = hub.query.block_queue_update_soft_pressure(tip_rate2);
+            let _ = hub.query.block_queue_update_soft_pressure(tip_rate2);
+            let (_b2, bq_bytes2, bq_count2) = hub.query.block_queue_stats();
+            let covered2 = rbitcoin_query::soft_confirm_window_covered(
+                bq_count2 as u32,
+                bq_bytes2,
+                tip_rate2,
+            );
             let archive_can2 = archive_queued.can_assign();
             let write_next2 = archive_write_next.load(Ordering::Relaxed);
             let depth2 = if archive_pipeline_saturated(
                 st.body.pending_len(),
                 st.inflight.len(),
-                bq_pressure2,
+                covered2,
                 archive_queued.fill_ratio(),
             ) {
                 AssignDepth::Critical
@@ -611,7 +622,7 @@ pub async fn ibd_cancellable(
                 write_next2,
                 depth2,
                 archive_can2,
-                bq_pressure2,
+                tip_rate2,
             );
         }
 
@@ -863,12 +874,12 @@ pub async fn ibd_cancellable(
             tip_rate_tracker.push(now, prog.tip);
             let eta = tip_rate_tracker.eta_string(now, prog.tip, prog.headers);
             let eta_rate = tip_rate_tracker.eta_rate(now);
-            let (bq_soft_stop, _) = rbitcoin_query::soft_depth_targets(eta_rate);
+            let bq_soft_stop = rbitcoin_query::soft_confirm_window_n(eta_rate);
             let _ = hub.query.block_queue_update_soft_pressure(eta_rate);
 
             // Bold on a TTY so the 5s progress line stands out among perf/debug noise.
             // plan_q/prepq/writeq; `name<0/cap` = empty.
-            // bq soft=n/stop RAM=: in-RAM body queue; soft = time-depth densify gate.
+            // bq soft=n/win RAM=: in-RAM body queue; win = 1-min confirm window at rate.
             let conf_q = confirm::format_conf_q(
                 plan_q,
                 load_q,

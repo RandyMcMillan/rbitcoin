@@ -269,60 +269,43 @@ mod tests {
     }
 
     #[test]
-    fn block_queue_soft_time_and_byte_hysteresis() {
+    fn block_queue_soft_free_bytes_and_confirm_window() {
         use crate::{
-            soft_depth_targets, soft_pressure, BQ_SOFT_RESUME_BYTES, BQ_SOFT_STOP_BYTES,
+            soft_assign_restricted, soft_confirm_window_covered, soft_confirm_window_n,
+            soft_densify_band_hi, BQ_SOFT_CONFIRM_SECS, BQ_SOFT_FREE_BYTES,
         };
-        // 5 blk/s × 90s / 60s → stop 450, resume 300 (no count floor).
-        let (stop, resume) = soft_depth_targets(Some(5.0));
-        assert_eq!(stop, 450);
-        assert_eq!(resume, 300);
-        let (stop0, resume0) = soft_depth_targets(None);
-        assert_eq!((stop0, resume0), (0, 0));
-        let (stop_lo, resume_lo) = soft_depth_targets(Some(2.0));
-        assert_eq!(stop_lo, 180);
-        assert_eq!(resume_lo, 120);
+        // 5 blk/s × 60s → window 300.
+        assert_eq!(soft_confirm_window_n(Some(5.0)), 300);
+        assert_eq!(soft_confirm_window_n(None), 0);
+        assert_eq!(
+            soft_confirm_window_n(Some(2.0)),
+            (2.0 * BQ_SOFT_CONFIRM_SECS).ceil() as u32
+        );
 
-        // Latch: enter when bytes over stop and count has reached count stop.
-        let over_b = BQ_SOFT_STOP_BYTES + 1;
-        let mid_b = (BQ_SOFT_RESUME_BYTES + BQ_SOFT_STOP_BYTES) / 2;
-        let under_b = BQ_SOFT_RESUME_BYTES - 1;
-        assert!(
-            !soft_pressure(451, under_b, 450, 300, false),
-            "tiny early blocks: over count, under byte floor → free densify"
+        let free = BQ_SOFT_FREE_BYTES;
+        let over = free + 1;
+        // Under free: full densify_hi regardless of rate.
+        assert_eq!(soft_densify_band_hi(100, 1000, free, Some(0.1)), 1000);
+        assert!(!soft_assign_restricted(free));
+        // Over free: confirm window only.
+        assert_eq!(
+            soft_densify_band_hi(100, 1000, over, Some(0.1)),
+            105,
+            "0.1 blk/s × 60s = 6 heights → path_lo..path_lo+5"
         );
-        assert!(
-            !soft_pressure(100, over_b, 450, 300, false),
-            "large blocks under time-count stop → free densify until count stop"
+        assert_eq!(
+            soft_densify_band_hi(100, 1000, over, None),
+            100,
+            "rate cold → tip-adjacent only"
         );
-        assert!(
-            !soft_pressure(449, over_b, 450, 300, false),
-            "bytes over but count still below stop → free densify"
-        );
-        assert!(
-            soft_pressure(450, over_b, 450, 300, false),
-            "bytes already over stop and count at stop → enter (no count overshoot)"
-        );
-        assert!(
-            soft_pressure(451, over_b, 450, 300, false),
-            "bytes over and count past stop → enter"
-        );
-        assert!(
-            soft_pressure(400, mid_b, 450, 300, true),
-            "mid-band stays latched"
-        );
-        assert!(
-            !soft_pressure(400, under_b, 450, 300, true),
-            "bytes under resume → exit"
-        );
-        assert!(
-            !soft_pressure(299, mid_b, 450, 300, true),
-            "count under resume → exit"
-        );
+        assert!(soft_assign_restricted(over));
+        assert!(!soft_confirm_window_covered(50, over, Some(5.0))); // 50 < 300
+        assert!(soft_confirm_window_covered(300, over, Some(5.0)));
+        assert!(soft_confirm_window_covered(1, over, None)); // cold + over free
 
         let (dir, q) = temp_query();
         assert!(!q.block_queue_update_soft_pressure(Some(5.0)));
-        // Many tiny payloads over time-count, well under 150 MiB — no pressure.
+        // Many tiny payloads — under free floor, unrestricted.
         for i in 0..451u32 {
             q.block_queue_enqueue(i, {
                 let mut h = [0u8; 32];
@@ -333,40 +316,40 @@ mod tests {
         }
         assert!(
             !q.block_queue_update_soft_pressure(Some(5.0)),
-            "early-chain style: count 451 > stop 450 but bytes tiny"
+            "early-chain style: many tiny blocks under free-byte floor"
         );
-        // Cold rate: only byte floor gates — two ~80 MiB payloads → pressure.
+        // Two ~80 MiB payloads → over free floor → restricted.
         for i in 0..451u32 {
             let _ = q.block_queue_dequeue_height(i);
         }
         let chunk = vec![0u8; 80 * 1024 * 1024];
         q.block_queue_enqueue(1, [1u8; 32], 1, &chunk).unwrap();
         q.block_queue_enqueue(2, [2u8; 32], 2, &chunk).unwrap();
-        assert!(q.block_queue_stats().1 > BQ_SOFT_STOP_BYTES);
+        assert!(q.block_queue_stats().1 > BQ_SOFT_FREE_BYTES);
         assert!(
             q.block_queue_update_soft_pressure(None),
-            "rate cold: count>0 and bytes>150MiB"
+            "bytes over free floor → restricted"
         );
-        // Drop one chunk → under 100 MiB resume floor.
+        // Drop one chunk → under free floor → unrestricted.
         q.block_queue_dequeue_height(1).unwrap();
-        assert!(q.block_queue_stats().1 < BQ_SOFT_RESUME_BYTES);
+        assert!(q.block_queue_stats().1 < BQ_SOFT_FREE_BYTES);
         assert!(
             !q.block_queue_update_soft_pressure(None),
-            "bytes under resume → clear pressure"
+            "bytes under free floor → unrestricted"
         );
 
-        // Soft pressure must never block peer offer / enqueue (request-limited only).
+        // Soft restriction must never block peer offer / enqueue (request-limited only).
         let chunk2 = vec![0u8; 80 * 1024 * 1024];
         q.block_queue_enqueue(3, [3u8; 32], 3, &chunk2).unwrap();
         q.block_queue_enqueue(4, [4u8; 32], 4, &chunk2).unwrap();
         assert!(
             q.block_queue_update_soft_pressure(None),
-            "re-enter pressure for offer regression"
+            "re-enter restricted for offer regression"
         );
         assert!(q.block_queue_soft_pressure());
         let offered = q
             .block_queue_offer(5, [5u8; 32], 5, b"already-requested-body")
-            .expect("offer must succeed while soft densify pressure is latched");
+            .expect("offer must succeed while soft densify is restricted");
         assert!(offered.queue_id > 0);
         assert!(q.block_queue_has_height(5));
         let _ = std::fs::remove_dir_all(dir);

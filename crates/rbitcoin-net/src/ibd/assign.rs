@@ -2,14 +2,14 @@
 //!
 //! Policy (operator-facing):
 //! - **Tip batch** (tip+1 .. tip+[`TIP_HOLE_MAX`]=32, one confirm run): always
-//!   request missing hashes (even if soft body-queue depth is over target).
+//!   request missing hashes (even if soft body-queue depth is over free floor).
 //!   Multi-peer race up to [`TIP_HOLE_MAX_PEERS`] immediately — confirm is
 //!   frozen until tip+1 is claim-ready.
 //! - **Densify** (tip+1 outward, closest first): fill missing heights up to
-//!   [`CONTIG_DENSIFY_AHEAD`]. Soft in-RAM depth (max of ~1.5 min tip-rate
-//!   blocks and ~150 MiB payload) stops **frontier** densify; **gaps inside the
-//!   queued height span** are always filled (overshoot past the soft target is
-//!   OK while closing holes — early tiny blocks can run far ahead on the byte floor).
+//!   [`CONTIG_DENSIFY_AHEAD`]. Two soft assign limits (no hysteresis):
+//!   - BQ payload **≤ ~100 MiB** → usual densify ahead to the height horizon
+//!   - BQ payload **> ~100 MiB** → only heights confirm will consume in the
+//!     next **~1 min** at current tip rate ([`rbitcoin_query::soft_densify_band_hi`])
 //! - Never request beyond densify horizon; events refuse far bodies too.
 //! - One body-queue copy per height (receive path drops duplicates).
 
@@ -73,26 +73,24 @@ pub(crate) fn inflight_add_peer(
 }
 
 
-/// True when soft body-queue depth is latched and getdata inflight is low.
+/// True when soft BQ confirm window is already covered (or archive RAM full)
+/// and getdata inflight is low → Critical (tip race only, skip densify walk).
 ///
-/// Only restricts **frontier** densify (tip batch + gap fill still run under
-/// Full). High `pending` alone is **not** saturated — pending means we already
-/// hold wire.
+/// High `pending` alone is **not** saturated — pending means we already hold wire.
 pub(crate) fn archive_pipeline_saturated(
     _pending_len: usize,
     inflight_len: usize,
-    bq_soft_pressure: bool,
+    bq_confirm_window_covered: bool,
     archive_fill_ratio: f64,
 ) -> bool {
-    inflight_len < 16 && (bq_soft_pressure || archive_fill_ratio >= 0.85)
+    inflight_len < 16 && (bq_confirm_window_covered || archive_fill_ratio >= 0.85)
 }
 
 /// Assign getdata for the body-queue pipeline.
 ///
 /// `archive_can_assign`: soft archive RAM headroom for densify.
-/// `bq_soft_pressure`: soft BQ latch (payload &gt; ~150 MiB and count at the
-/// ~1.5 min tip-rate stop; see [`rbitcoin_query::soft_pressure`]) — stop
-/// **frontier** densify only; **gap fill** within queued max height still runs.
+/// `tip_rate_blocks_per_s`: tip confirm rate for the soft confirm-time window
+/// when BQ payload is over [`rbitcoin_query::BQ_SOFT_FREE_BYTES`].
 pub(crate) fn assign_work_ordered(
     st: &mut IbdWorkState,
     hub: &ChainHub,
@@ -102,7 +100,7 @@ pub(crate) fn assign_work_ordered(
     _archive_write_next: u32,
     depth: AssignDepth,
     archive_can_assign: bool,
-    bq_soft_pressure: bool,
+    tip_rate_blocks_per_s: Option<f64>,
 ) {
     let t0 = Instant::now();
     let mut issued = 0u64;
@@ -156,22 +154,14 @@ pub(crate) fn assign_work_ordered(
     let densify_per_peer = far_slots_per_peer(cfg.per_peer, !tip_holes.is_empty());
 
     let densify_hi = path_lo.saturating_add(CONTIG_DENSIFY_AHEAD);
-    let max_queued = hub.query.block_queue_max_height();
-
-    // Under soft pressure: only fill holes inside the queued height span.
-    // Otherwise: full densify band (gaps + frontier).
-    let band_hi = if bq_soft_pressure {
-        match max_queued {
-            Some(mh) if mh >= path_lo => mh.min(densify_hi),
-            // Nothing queued yet under pressure — no gap band; frontier blocked.
-            _ => {
-                finish_assign(loop_stats, t0, issued);
-                return;
-            }
-        }
-    } else {
-        densify_hi
-    };
+    let depth_bytes = hub.query.block_queue_stats().1;
+    // Under free-byte floor: full densify_hi. Over it: only confirm-time window.
+    let band_hi = rbitcoin_query::soft_densify_band_hi(
+        path_lo,
+        densify_hi,
+        depth_bytes,
+        tip_rate_blocks_per_s,
+    );
 
     let densify = collect_height_band(st, hub, path_lo, band_hi, room.max(1));
     if densify.is_empty() {
@@ -585,7 +575,7 @@ mod tests {
             1,
             AssignDepth::Full,
             true,
-            false,
+            None,
         );
 
         let _ = std::fs::remove_dir_all(dir);
@@ -642,7 +632,7 @@ mod tests {
             1,
             AssignDepth::Full,
             true,
-            false, // no soft pressure — frontier densify allowed
+            None, // under free (empty BQ) — full densify ahead
         );
 
         let far: Vec<u32> = st
@@ -667,24 +657,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Under soft pressure, only gaps within max queued height are densified.
+    /// Over free-byte floor: densify only the confirm-time window (rate * 60s).
     #[test]
-    fn densify_gaps_under_soft_pressure_not_frontier() {
+    fn densify_over_free_bytes_limited_to_confirm_window() {
+        use rbitcoin_query::{soft_confirm_window_n, BQ_SOFT_FREE_BYTES};
+
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
-        // Tip already at 9 so path_lo=10; tip-batch does not consume all peer slots
-        // before densify gap-fill under soft pressure.
-        let mut st = IbdWorkState::new(vec![dummy_slot(0), dummy_slot(1)], None, Some(9));
-        // Pretend hub tip is 9 via Class A height — densify uses hub.tip_height().
-        // Without a real tip, path_lo=0; seed ordered from 10 and rely on
-        // soft-pressure band only (tip holes empty when height_to_hash starts at 10).
+        // Genesis tip=0 → path_lo=1.
+        let mut st = IbdWorkState::new(vec![dummy_slot(0), dummy_slot(1)], None, Some(0));
         let stats = LoopStats::default();
         let mut cfg = IbdConfig::for_test();
         cfg.window = 64;
         cfg.per_peer = 16;
 
-        // Heights 10..=30; queued at 10 and 20 (gap at 15); frontier 25.
-        for ht in 10u32..=30 {
+        // Heights 1..=200 missing; fill BQ over free floor with fat payloads.
+        for ht in 1u32..=200 {
             let hash = h(ht);
             st.record_height(hash, ht);
             st.height_to_hash.insert(ht, hash);
@@ -693,15 +681,24 @@ mod tests {
             st.max_ordered_height = ht;
             st.body.mark_missing(hash);
         }
-        let p = b"wire";
+        // ~110 MiB in queue (two ~55 MiB chunks) → restricted.
+        let chunk = vec![0u8; 55 * 1024 * 1024];
         hub.query
-            .block_queue_enqueue(10, h(10).to_byte_array(), 1, p)
+            .block_queue_enqueue(1, h(1).to_byte_array(), 1, &chunk)
             .unwrap();
         hub.query
-            .block_queue_enqueue(20, h(20).to_byte_array(), 2, p)
+            .block_queue_enqueue(2, h(2).to_byte_array(), 2, &chunk)
             .unwrap();
-        st.body.mark_pending(h(10));
-        st.body.mark_pending(h(20));
+        st.body.mark_pending(h(1));
+        st.body.mark_pending(h(2));
+        assert!(hub.query.block_queue_stats().1 > BQ_SOFT_FREE_BYTES);
+
+        // 0.1 blk/s × 60s → window of 6 heights (path_lo=1 → band_hi=6).
+        let rate = Some(0.1);
+        let win = soft_confirm_window_n(rate);
+        assert_eq!(win, 6);
+        let path_lo = 1u32;
+        let band_hi = path_lo + win - 1;
 
         assign_work_ordered(
             &mut st,
@@ -709,10 +706,10 @@ mod tests {
             &cfg,
             &stats,
             1.0,
-            10,
+            1,
             AssignDepth::Full,
             true,
-            true, // soft pressure
+            rate,
         );
 
         let issued_hts: Vec<u32> = st
@@ -720,15 +717,70 @@ mod tests {
             .keys()
             .filter_map(|hash| st.hash_height.get(hash).copied())
             .collect();
-        // Gap inside max_queued=20 must be requestable (e.g. 15).
         assert!(
-            issued_hts.iter().any(|&ht| ht > 10 && ht < 20),
-            "expected gap fill under pressure; issued={issued_hts:?}"
+            !issued_hts.is_empty(),
+            "expected densify inside confirm window; issued={issued_hts:?}"
         );
-        // Frontier beyond max queued must not be densified under pressure.
         assert!(
-            !issued_hts.iter().any(|&ht| ht > 20),
-            "frontier blocked under pressure; issued={issued_hts:?}"
+            issued_hts.iter().all(|&ht| ht <= band_hi),
+            "no densify past confirm window {band_hi}; issued={issued_hts:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Under free-byte floor: full densify ahead even with many queued blocks.
+    #[test]
+    fn densify_under_free_bytes_uses_full_ahead() {
+        use rbitcoin_query::BQ_SOFT_FREE_BYTES;
+
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        // Genesis tip=0 → path_lo=1.
+        let mut st = IbdWorkState::new(vec![dummy_slot(0), dummy_slot(1)], None, Some(0));
+        let stats = LoopStats::default();
+        let mut cfg = IbdConfig::for_test();
+        cfg.window = 64;
+        cfg.per_peer = 16;
+
+        for ht in 1u32..=100 {
+            let hash = h(ht);
+            st.record_height(hash, ht);
+            st.height_to_hash.insert(ht, hash);
+            st.ordered_set.insert(hash);
+            st.ordered.push_back(hash);
+            st.max_ordered_height = ht;
+            st.body.mark_missing(hash);
+        }
+        // Tiny payloads well under free floor.
+        for ht in 1u32..=10 {
+            hub.query
+                .block_queue_enqueue(ht, h(ht).to_byte_array(), ht as u64, b"x")
+                .unwrap();
+            st.body.mark_pending(h(ht));
+        }
+        assert!(hub.query.block_queue_stats().1 < BQ_SOFT_FREE_BYTES);
+
+        assign_work_ordered(
+            &mut st,
+            &hub,
+            &cfg,
+            &stats,
+            1.0,
+            1,
+            AssignDepth::Full,
+            true,
+            Some(0.1), // rate would only allow 6 if restricted — must still densify past that
+        );
+
+        let issued_hts: Vec<u32> = st
+            .inflight
+            .keys()
+            .filter_map(|hash| st.hash_height.get(hash).copied())
+            .collect();
+        assert!(
+            issued_hts.iter().any(|&ht| ht > 16),
+            "under free bytes: densify past 1-min window; issued={issued_hts:?}"
         );
 
         let _ = std::fs::remove_dir_all(dir);
@@ -763,7 +815,7 @@ mod tests {
             1,
             AssignDepth::Critical,
             true,
-            false,
+            None,
         );
         let after_crit = st.inflight.len();
         assert!(after_crit > 0, "critical should still issue tip/race");
@@ -778,7 +830,7 @@ mod tests {
             1,
             AssignDepth::Full,
             false, // archive cannot assign
-            false,
+            None,
         );
         assert!(st.inflight.len() <= n_before + 8);
 
@@ -808,7 +860,7 @@ mod tests {
             1,
             AssignDepth::Full,
             true,
-            false,
+            None,
         );
         assert!(st.inflight.len() > 0);
         assert!(stats.assign_issued.load(Ordering::Relaxed) > 0);
@@ -828,7 +880,7 @@ mod tests {
             5,
             AssignDepth::Full,
             true,
-            false,
+            None,
         );
         assert!(st.inflight.len() <= n_full + 2);
 
@@ -853,7 +905,7 @@ mod tests {
             1,
             AssignDepth::Full,
             true,
-            false,
+            None,
         );
         assert!(st.slots[1].in_flight.len() > 0 || st.inflight.len() > cfg.per_peer);
 
@@ -873,7 +925,7 @@ mod tests {
             13,
             AssignDepth::Full,
             true,
-            false,
+            None,
         );
         assert!(st.inflight.is_empty());
 

@@ -39,79 +39,82 @@ use std::sync::Mutex;
 
 pub type QueryError = StoreError;
 
-/// Soft body-queue depth stop: ~1.5 minutes of tip-rate blocks in RAM.
-pub const BQ_SOFT_STOP_SECS: f64 = 90.0;
-/// Soft body-queue depth resume: ~1 minute (hysteresis vs stop).
-pub const BQ_SOFT_RESUME_SECS: f64 = 60.0;
-/// Soft byte stop floor (~150 MiB). Early chain can exceed the time-count
-/// target until this many payload bytes are queued (whichever is greater).
-pub const BQ_SOFT_STOP_BYTES: u64 = 150 * 1024 * 1024;
-/// Soft byte resume floor (~100 MiB). Hysteresis vs [`BQ_SOFT_STOP_BYTES`].
-pub const BQ_SOFT_RESUME_BYTES: u64 = 100 * 1024 * 1024;
-
-/// Time-depth count targets from tip rate (blocks/s): `(stop_n, resume_n)`.
+/// Soft assign free floor (~100 MiB). Under this payload size, densify uses the
+/// usual ahead horizon (net-side densify cap). Over it, densify is limited to
+/// the confirm-time window ([`BQ_SOFT_CONFIRM_SECS`]).
 ///
-/// Soft densify uses **max of time-depth and byte floors** (see
-/// [`soft_pressure`]): early tiny blocks may queue far past `stop_n` until
-/// ~150 MiB; large later blocks hit the time target first. Rate unknown →
-/// `(0, 0)` so only the byte floor gates (keeps early-chain densify free
-/// under 150 MiB).
-pub fn soft_depth_targets(rate_blocks_per_s: Option<f64>) -> (u32, u32) {
+/// Tunable constant — no hysteresis band (single threshold).
+pub const BQ_SOFT_FREE_BYTES: u64 = 100 * 1024 * 1024;
+
+/// When body-queue payload is over [`BQ_SOFT_FREE_BYTES`], only assign getdata
+/// for heights confirm will consume in this many seconds at the current tip
+/// rate. Tunable constant — no hysteresis band.
+pub const BQ_SOFT_CONFIRM_SECS: f64 = 60.0;
+
+/// Blocks confirm can take in one soft confirm window at `rate` (ceil).
+///
+/// Rate unknown / non-positive → `0` (no densify ahead when restricted).
+pub fn soft_confirm_window_n(rate_blocks_per_s: Option<f64>) -> u32 {
     let rate = rate_blocks_per_s
         .filter(|r| r.is_finite() && *r > 1e-9)
         .unwrap_or(0.0);
-    let stop = (rate * BQ_SOFT_STOP_SECS).ceil() as u32;
-    if stop == 0 {
-        return (0, 0);
-    }
-    let resume_raw = (rate * BQ_SOFT_RESUME_SECS).ceil() as u32;
-    let resume = resume_raw.min(stop.saturating_sub(1));
-    (stop, resume)
+    (rate * BQ_SOFT_CONFIRM_SECS).ceil() as u32
 }
 
-/// Soft densify hysteresis for **frontier getdata assign only**.
+/// True when BQ payload is over the free-byte floor (densify uses confirm window).
+#[inline]
+pub fn soft_assign_restricted(depth_bytes: u64) -> bool {
+    depth_bytes > BQ_SOFT_FREE_BYTES
+}
+
+/// Inclusive densify band high height for getdata assign.
 ///
-/// **Never** gates peer TCP reads or [`Query::block_queue_offer`]: already-
-/// requested bodies always enqueue (request-limited soft budgets). Assign
-/// uses the latch to stop **new** densify getdata; gap fill + in-flight
-/// receives continue.
+/// Two simple rules (no latch / hysteresis):
+/// - **Under** [`BQ_SOFT_FREE_BYTES`]: full `densify_hi` (usual densify ahead).
+/// - **Over** free bytes: only heights confirm will pick up within
+///   [`BQ_SOFT_CONFIRM_SECS`] at current rate — `path_lo .. path_lo+window-1`
+///   (clamped to `densify_hi`). Rate cold → only `path_lo` (tip-adjacent).
 ///
-/// - **Enter** pressure when payload is already over [`BQ_SOFT_STOP_BYTES`]
-///   **and** block count has reached the upper time-count stop:
-///   - `stop_n > 0`: `depth_n >= stop_n` (do **not** assign densify past the
-///     count stop while bytes are already over — limits overshoot of fat blocks).
-///   - `stop_n == 0` (rate cold): any `depth_n > 0` with bytes over stop.
-/// - Under the byte stop, count may still overshoot `stop_n` (early tiny
-///   blocks) without entering pressure.
-/// - **Exit** when `depth_n < resume_n` **or** `depth_bytes <`
-///   [`BQ_SOFT_RESUME_BYTES`].
-/// - Mid-band keeps `was`.
-pub fn soft_pressure(
+/// **Never** gates peer TCP reads or [`Query::block_queue_offer`].
+pub fn soft_densify_band_hi(
+    path_lo: u32,
+    densify_hi: u32,
+    depth_bytes: u64,
+    rate_blocks_per_s: Option<f64>,
+) -> u32 {
+    if densify_hi < path_lo {
+        return densify_hi;
+    }
+    if !soft_assign_restricted(depth_bytes) {
+        return densify_hi;
+    }
+    let n = soft_confirm_window_n(rate_blocks_per_s);
+    if n == 0 {
+        return path_lo.min(densify_hi);
+    }
+    path_lo
+        .saturating_add(n.saturating_sub(1))
+        .min(densify_hi)
+}
+
+/// True when over free bytes and the queue already holds at least one confirm
+/// window of blocks (assign densify has little/no room left in the window).
+///
+/// Used for Critical assign (tip race only) when inflight is low.
+pub fn soft_confirm_window_covered(
     depth_n: u32,
     depth_bytes: u64,
-    stop_n: u32,
-    resume_n: u32,
-    was: bool,
+    rate_blocks_per_s: Option<f64>,
 ) -> bool {
-    let enter = if depth_bytes > BQ_SOFT_STOP_BYTES {
-        if stop_n == 0 {
-            // Rate unknown: byte floor alone (any queued block).
-            depth_n > 0
-        } else {
-            // Bytes already at/over upper stop — stop frontier densify once
-            // count hits the upper count stop (not only after overshooting it).
-            depth_n >= stop_n
-        }
-    } else {
-        false
-    };
-    if enter {
-        true
-    } else if depth_n < resume_n || depth_bytes < BQ_SOFT_RESUME_BYTES {
-        false
-    } else {
-        was
+    if !soft_assign_restricted(depth_bytes) {
+        return false;
     }
+    let w = soft_confirm_window_n(rate_blocks_per_s);
+    if w == 0 {
+        // Over free, rate unknown: treat as covered (no densify ahead).
+        return true;
+    }
+    depth_n >= w
 }
 
 /// Cheap process-owned cache occupancy for IBD `ibd: sizes` (O(1) lens + brief locks).
@@ -771,7 +774,7 @@ pub struct Query {
     /// RAM-only by design: avoids double-writing every block (queue + Class A).
     /// Accepts redownload on restart and peak RAM of soft densify depth.
     block_queue: Mutex<rbitcoin_store::BlockQueue>,
-    /// Soft time-depth hysteresis latch for densify frontier (updated with tip rate).
+    /// Last soft-assign restricted flag (over free-byte floor; cache for meters).
     block_queue_pressure: AtomicBool,
     /// Direct IBD SH: memtable → sorted runs (bulk materialize at tip).
     sh_run: sh_builder::ShRunBuilder,
@@ -993,43 +996,42 @@ impl Query {
         self.block_queue.lock().unwrap().max_height()
     }
 
-    /// Soft densify pressure latch for **assign** (frontier getdata only).
+    /// Refresh soft-assign restricted flag from current BQ bytes (no latch).
     ///
-    /// See [`soft_pressure`]. Does **not** affect peer reads or
-    /// [`Self::block_queue_offer`]. Gap fill inside the queued height span
-    /// still densifies under pressure.
-    ///
-    /// `rate_blocks_per_s` should match IBD `TipRateTracker::eta_rate` (ETA EWMA).
-    pub fn block_queue_update_soft_pressure(&self, rate_blocks_per_s: Option<f64>) -> bool {
-        let g = self.block_queue.lock().unwrap();
-        let depth_n = g.count() as u32;
-        let depth_bytes = g.bytes();
-        drop(g);
-        let (stop, resume) = soft_depth_targets(rate_blocks_per_s);
-        let was = self.block_queue_pressure.load(AtomicOrdering::Relaxed);
-        let pressure = soft_pressure(depth_n, depth_bytes, stop, resume, was);
+    /// Returns true when payload is over [`BQ_SOFT_FREE_BYTES`] (densify limited
+    /// to the confirm-time window). Does **not** affect peer reads or
+    /// [`Self::block_queue_offer`]. `rate_blocks_per_s` is accepted for call-site
+    /// compatibility; restriction is byte-only (window size is separate).
+    pub fn block_queue_update_soft_pressure(&self, _rate_blocks_per_s: Option<f64>) -> bool {
+        let depth_bytes = self.block_queue.lock().unwrap().bytes();
+        let restricted = soft_assign_restricted(depth_bytes);
         self.block_queue_pressure
-            .store(pressure, AtomicOrdering::Relaxed);
-        pressure
+            .store(restricted, AtomicOrdering::Relaxed);
+        restricted
     }
 
-    /// Current soft-pressure latch (after last [`Self::block_queue_update_soft_pressure`]).
+    /// Current soft-assign restricted flag (over free-byte floor).
     pub fn block_queue_soft_pressure(&self) -> bool {
         self.block_queue_pressure.load(AtomicOrdering::Relaxed)
     }
 
-    /// Soft stop/resume targets for logs: `(stop_n, resume_n)`.
+    /// Soft confirm-window count for logs / assign: `(window_n, free_mib)`.
+    ///
+    /// `window_n` = blocks confirm takes in [`BQ_SOFT_CONFIRM_SECS`] at rate.
+    /// `free_mib` = free-byte floor in MiB (second log field when useful).
     pub fn block_queue_soft_targets(rate_blocks_per_s: Option<f64>) -> (u32, u32) {
-        soft_depth_targets(rate_blocks_per_s)
+        let win = soft_confirm_window_n(rate_blocks_per_s);
+        let free_mib = (BQ_SOFT_FREE_BYTES / (1024 * 1024)) as u32;
+        (win, free_mib)
     }
 
     /// Enqueue a raw block payload in the process-local RAM queue.
     ///
     /// **Always accepts** peer wire when the optional absolute byte ceiling
-    /// allows — independent of [`Self::block_queue_soft_pressure`]. Soft
-    /// densify only stops **new getdata assign**; never refuse in-flight
-    /// bodies here (except rare absolute-ceiling `BudgetFull`). Restart drops
-    /// the queue (redownload); sole durable write is Class A on confirm.
+    /// allows — independent of soft assign restriction. Soft densify only
+    /// limits **new getdata assign**; never refuse in-flight bodies here
+    /// (except rare absolute-ceiling `BudgetFull`). Restart drops the queue
+    /// (redownload); sole durable write is Class A on confirm.
     pub fn block_queue_offer(
         &self,
         height: u32,
@@ -1037,7 +1039,7 @@ impl Query {
         header_fk: u64,
         payload: &[u8],
     ) -> Result<BlockQueueOffer, QueryError> {
-        // Intentionally ignores soft_pressure — request-limited only.
+        // Intentionally ignores soft assign restriction — request-limited only.
         let mut g = self.block_queue.lock().unwrap();
         // Idempotent: already queued for this height (re-offer after race).
         if let Some(id) = g.id_for_height(height) {

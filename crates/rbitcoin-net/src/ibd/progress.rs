@@ -47,7 +47,7 @@ pub(crate) struct ProgressLineInput {
     /// In-RAM block queue bytes / entry count (process heap wire payloads).
     pub bq_bytes: u64,
     pub bq_count: usize,
-    /// Soft densify stop target (block count at tip rate).
+    /// Soft densify confirm-window target (block count for ~1 min at tip rate).
     pub bq_soft_stop: u32,
 }
 
@@ -55,7 +55,7 @@ pub(crate) struct ProgressLineInput {
 ///
 /// Tip percent/rate, **fetch hole** (tip→next claim-ready body), peers, confirm
 /// queues, txs, header horizon, tip-rate ETA, in-RAM block-queue occupancy.
-/// `bq soft=n/stop` is time-depth densify gate; `RAM=` is queue heap MiB.
+/// `bq soft=n/win` is count vs 1-min confirm window at tip rate; `RAM=` is queue heap MiB.
 /// Count is only in `soft=` (no redundant `n=`).
 pub(crate) fn format_progress_line(i: &ProgressLineInput) -> String {
     let bq_mib = i.bq_bytes / (1024 * 1024);
@@ -299,7 +299,7 @@ mod tests {
         ProgressLineInput, TipRateTracker,
     };
     use rbitcoin_query::{
-        soft_depth_targets, soft_pressure, BQ_SOFT_RESUME_BYTES, BQ_SOFT_STOP_BYTES,
+        soft_assign_restricted, soft_confirm_window_n, soft_densify_band_hi, BQ_SOFT_FREE_BYTES,
     };
     use std::time::{Duration, Instant};
 
@@ -369,47 +369,19 @@ mod tests {
     }
 
     #[test]
-    fn soft_depth_targets_at_rate() {
-        // No count floor — byte floors (150/100 MiB) cover early chain.
-        let (stop_lo, resume_lo) = soft_depth_targets(Some(2.0));
-        assert_eq!(stop_lo, 180, "2 blk/s × 90s");
-        assert_eq!(resume_lo, 120, "2 blk/s × 60s");
-        let (stop0, resume0) = soft_depth_targets(None);
-        assert_eq!((stop0, resume0), (0, 0), "cold rate → byte floor only");
-        let (stop, resume) = soft_depth_targets(Some(5.0));
-        assert_eq!(stop, 450, "5 blk/s × 90s");
-        assert_eq!(resume, 300, "5 blk/s × 60s");
-        let (stop_hi, resume_hi) = soft_depth_targets(Some(10.0));
-        assert_eq!(stop_hi, 900);
-        assert_eq!(resume_hi, 600);
-    }
+    fn soft_confirm_window_and_band_at_rate() {
+        assert_eq!(soft_confirm_window_n(Some(2.0)), 120, "2 blk/s × 60s");
+        assert_eq!(soft_confirm_window_n(None), 0, "cold rate");
+        assert_eq!(soft_confirm_window_n(Some(5.0)), 300, "5 blk/s × 60s");
+        assert_eq!(soft_confirm_window_n(Some(10.0)), 600);
 
-    #[test]
-    fn soft_hysteresis_latch_time_and_bytes() {
-        let over_b = BQ_SOFT_STOP_BYTES + 1;
-        let mid_b = (BQ_SOFT_RESUME_BYTES + BQ_SOFT_STOP_BYTES) / 2;
-        let under_b = BQ_SOFT_RESUME_BYTES - 1;
-        // Enter when bytes already over stop and count has reached count stop.
-        assert!(!soft_pressure(100, over_b, 450, 300, false));
-        assert!(!soft_pressure(451, under_b, 450, 300, false));
-        assert!(!soft_pressure(449, over_b, 450, 300, false));
-        assert!(
-            soft_pressure(450, over_b, 450, 300, false),
-            "bytes over + count at stop → enter (assign-only latch)"
-        );
-        assert!(soft_pressure(451, over_b, 450, 300, false), "past stop");
-        assert!(
-            soft_pressure(400, mid_b, 450, 300, true),
-            "stay latched mid-band"
-        );
-        assert!(
-            !soft_pressure(299, mid_b, 450, 300, true),
-            "exit when count < resume"
-        );
-        assert!(
-            !soft_pressure(400, under_b, 450, 300, true),
-            "exit when bytes < resume floor"
-        );
+        let free = BQ_SOFT_FREE_BYTES;
+        let over = free + 1;
+        assert_eq!(soft_densify_band_hi(10, 5000, free, Some(5.0)), 5000);
+        assert_eq!(soft_densify_band_hi(10, 5000, over, Some(5.0)), 309);
+        assert_eq!(soft_densify_band_hi(10, 5000, over, None), 10);
+        assert!(!soft_assign_restricted(free));
+        assert!(soft_assign_restricted(over));
     }
 
     #[test]

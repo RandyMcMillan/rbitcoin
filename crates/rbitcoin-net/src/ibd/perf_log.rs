@@ -43,7 +43,7 @@ pub(crate) struct IbdPerfSample {
     /// In-RAM block queue used bytes / count (process heap wire payloads).
     pub bq_bytes: u64,
     pub bq_count: usize,
-    /// Soft densify stop target (block count ≈ 1.5 min tip rate).
+    /// Soft densify confirm-window target (block count ≈ 1 min tip rate).
     pub bq_soft_stop: u32,
     /// Claim-ready HWM (+ inflight) ahead of tip — densify headroom (not a progress lead token).
     pub arch_ahead: u32,

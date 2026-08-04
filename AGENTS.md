@@ -180,14 +180,14 @@ that shows a clear change after.
    scripts/commit (sole Class A). **No** dual-track `ArchiveJob` / ContigPark.
    Unknown-height `BlockFramed` → `mark_missing` and re-getdata after height.
    Body queue is **RAM-only** (redownload on restart) to avoid double disk write
-   of every block; soft densify latches when payload &gt; ~150 MiB **and** count
-   is at the ~1.5 min tip-rate stop (resume under ~1 min **or** ~100 MiB; early
-   tiny blocks may still run past the count stop while under 150 MiB).
+   of every block; soft densify assign uses two limits (no hysteresis): under
+   ~100 MiB free densify ahead; over ~100 MiB only heights confirm will consume
+   in the next ~1 min at tip rate.
 3. **Soft budgets are request-limited only.** Always accept already-requested
-   block bytes into the body queue (`block_queue_offer` ignores soft pressure),
-   even if that overshoots soft depth. Bound memory by stopping new densify
-   **getdata assign** — never by stalling TCP reads or Full-dropping bodies
-   already on the wire.
+   block bytes into the body queue (`block_queue_offer` ignores soft assign
+   limits), even if that overshoots soft depth. Bound memory by limiting new
+   densify **getdata assign** — never by stalling TCP reads or Full-dropping
+   bodies already on the wire.
 4. **Tests** must tear down intentional caches with **production** APIs (table
    below) — not a secret free-all that masks production leaks.
 5. **Regression filters:** body-queue soft depth / presence lifecycle / confirm
@@ -197,7 +197,7 @@ that shows a clear change after.
 
 | Structure | Production API |
 |-----------|----------------|
-| Soft densify depth | Bound **only** via body-queue soft pressure / densify stop — never receive-side Full-drop |
+| Soft densify depth | Bound **only** via body-queue soft assign (100 MiB free / 1 min confirm window) — never receive-side Full-drop |
 | Confirm plans/headers | **`ConfirmParentCache::advance_tip`** (write `post_commit`) |
 | Pipeline pins | Drop with plan/batch; **no** process pin FIFO. Tests tear down via production plan drop / batch drop |
 | Ordered maps | **`IbdWorkState::hygiene`** |

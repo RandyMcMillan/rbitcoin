@@ -9,10 +9,10 @@
 //! parse); **dequeue only after combined confirm-write** (or permanent reject).
 //! Restart does **not** rehydrate payloads (queue starts empty).
 //!
-//! **Primary capacity** is a soft densify gate in the net layer: **max of
-//! ~1.5 min tip-rate block count and ~150 MiB payload** (hysteresis ~1 min /
-//! ~100 MiB) so early tiny blocks can run ahead. This type accepts payloads
-//! until an optional absolute byte ceiling (env) is hit.
+//! **Primary capacity** is soft densify assign in the net layer (no hysteresis):
+//! under ~100 MiB free densify ahead; over ~100 MiB only the next ~1 min of
+//! confirm work at tip rate. This type accepts payloads until an optional
+//! absolute byte ceiling (env) is hit.
 //!
 //! Absolute safety ceiling (optional): `RBITCOIN_BLOCK_QUEUE_GB` (integer GiB)
 //! or `RBITCOIN_BLOCK_QUEUE_BYTES`. When unset, enqueue is unlimited

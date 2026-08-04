@@ -16,10 +16,11 @@
 //! Assemble/write read pin data through the batch's `Arc`s — **no** global map
 //! lock on the hot path.
 //!
-//! **Immutable publish:** outs + layout live in an immutable [`PinBody`] snapshot
-//! (`Arc` under a short RwLock). Widening need-vouts or layout **composes a new
-//! body and swaps the Arc** — never `push`/mutate shared vectors in place
-//! (AGENTS: prefer immutable data + composition).
+//! **Immutable publish (P0):** outs and layout are **separate** immutable Arc
+//! snapshots under short RwLocks. Widening need-vouts composes only the outs
+//! half; layout fill composes only denserels/range — never clones script bytes
+//! for a layout-only publish. No-op compose returns without `Arc::new` (no
+//! full-body clone on share hits). Never `push`/mutate shared vectors in place.
 //!
 //! **Sparse:** only spent need-vouts + layout fields write/assemble need (not
 //! full parent output sets). Vout merge when a later batch spends more outs.
@@ -39,35 +40,18 @@ const CB_UNKNOWN: u8 = 0;
 const CB_FALSE: u8 = 1;
 const CB_TRUE: u8 = 2;
 
-/// Body range + sparse denserels for abs spender meta (write-filled).
-#[derive(Debug, Clone, Default)]
-struct ParentLayout {
-    body_range: Option<(u64, u64)>,
-    spender_rels: Vec<(u32, u32)>,
-}
-
-/// Immutable sparse outs + layout snapshot (compose → publish, never mutate).
+/// Immutable sparse need outs (compose → publish, never mutate).
 #[derive(Debug, Clone)]
-struct PinBody {
+struct PinOuts {
     outs: Vec<(u32, OutputRecord)>,
     checked: Vec<u32>,
-    layout: ParentLayout,
 }
 
-impl PinBody {
-    fn with_outs_layout(
-        live: Vec<(u32, OutputRecord)>,
-        checked: Vec<u32>,
-        body_range: Option<(u64, u64)>,
-        spender_rels: Vec<(u32, u32)>,
-    ) -> Self {
+impl PinOuts {
+    fn new(live: Vec<(u32, OutputRecord)>, checked: Vec<u32>) -> Self {
         Self {
             outs: ensure_outs_sorted(live),
             checked: ensure_checked_sorted(checked),
-            layout: ParentLayout {
-                body_range,
-                spender_rels,
-            },
         }
     }
 
@@ -83,14 +67,14 @@ impl PinBody {
 
     fn has_all_live(&self, live: &[(u32, OutputRecord)]) -> bool {
         live.iter()
-            .all(|(v, _)| self.outs.iter().any(|(dv, _)| dv == v))
+            .all(|(v, _)| self.outs.binary_search_by_key(v, |(dv, _)| *dv).is_ok())
     }
 
-    /// Compose wider need coverage (new body; does not mutate `self`).
-    fn compose_outs(&self, live: Vec<(u32, OutputRecord)>, checked: &[u32]) -> Self {
+    /// Compose wider need coverage (new half; does not mutate `self`).
+    fn compose(&self, live: Vec<(u32, OutputRecord)>, checked: &[u32]) -> Self {
         let mut outs = self.outs.clone();
         for (v, o) in live {
-            if !outs.iter().any(|(dv, _)| *dv == v) {
+            if outs.binary_search_by_key(&v, |(dv, _)| *dv).is_err() {
                 outs.push((v, o));
             }
         }
@@ -102,57 +86,83 @@ impl PinBody {
         Self {
             outs,
             checked: ch,
-            layout: self.layout.clone(),
         }
     }
+}
 
-    /// Compose layout overlay (new body; does not mutate `self`).
-    fn compose_layout(
-        &self,
-        body_range: Option<(u64, u64)>,
-        spender_rels: &[(u32, u32)],
-    ) -> Self {
-        let mut layout = self.layout.clone();
-        if layout.body_range.is_none() {
-            layout.body_range = body_range;
-        }
-        merge_spender_rels_into(&mut layout.spender_rels, spender_rels);
+/// Body range + sparse denserels for abs spender meta (write-filled).
+#[derive(Debug, Clone, Default)]
+struct ParentLayout {
+    body_range: Option<(u64, u64)>,
+    spender_rels: Vec<(u32, u32)>,
+}
+
+impl ParentLayout {
+    fn new(body_range: Option<(u64, u64)>, spender_rels: Vec<(u32, u32)>) -> Self {
         Self {
-            outs: self.outs.clone(),
-            checked: self.checked.clone(),
-            layout,
+            body_range,
+            spender_rels,
         }
     }
 
-    fn layout_already_covers(
+    fn already_covers(
         &self,
         body_range: Option<(u64, u64)>,
         spender_rels: &[(u32, u32)],
     ) -> bool {
-        let range_done = body_range.is_none() || self.layout.body_range.is_some();
+        let range_done = body_range.is_none() || self.body_range.is_some();
         let rels_done = spender_rels.is_empty()
             || spender_rels.iter().all(|(v, r)| {
-                self.layout
-                    .spender_rels
+                self.spender_rels
                     .binary_search_by_key(v, |(dv, _)| *dv)
                     .ok()
-                    .is_some_and(|i| self.layout.spender_rels[i].1 == *r)
+                    .is_some_and(|i| self.spender_rels[i].1 == *r)
             });
         range_done && rels_done
+    }
+
+    /// Compose layout overlay (new half; does not mutate `self`).
+    /// First writer wins for body_range; denserels merge by vout.
+    fn compose(
+        &self,
+        body_range: Option<(u64, u64)>,
+        spender_rels: &[(u32, u32)],
+    ) -> Self {
+        let mut layout = self.clone();
+        if layout.body_range.is_none() {
+            layout.body_range = body_range;
+        }
+        merge_spender_rels_into(&mut layout.spender_rels, spender_rels);
+        layout
+    }
+
+    /// Write-path: force body_range and merge denserels.
+    fn compose_write(
+        &self,
+        body_range: (u64, u64),
+        sparse_rels: &[(u32, u32)],
+    ) -> Self {
+        let mut layout = self.clone();
+        layout.body_range = Some(body_range);
+        merge_spender_rels_into(&mut layout.spender_rels, sparse_rels);
+        layout
     }
 }
 
 /// One create's sparse pin payload, shared across concurrent pipeline batches.
 ///
 /// Identity (`Arc` of this type) stays stable for writeq unique-parent metering.
-/// Payload fields are published as immutable [`PinBody`] snapshots.
+/// Outs and layout are independent immutable Arc halves (compose only the half
+/// that changes).
 #[derive(Debug)]
 pub struct SharedParentPin {
     tx: TxRecord,
     /// 0 unknown, 1 not coinbase, 2 coinbase.
     coinbase: AtomicU8,
-    /// Published immutable snapshot. Compose + Arc-swap under short write lock.
-    body: RwLock<Arc<PinBody>>,
+    /// Sparse need outs + checked (prep widen).
+    outs: RwLock<Arc<PinOuts>>,
+    /// Abs layout for spentness/annotate (write fill).
+    layout: RwLock<Arc<ParentLayout>>,
 }
 
 impl SharedParentPin {
@@ -172,54 +182,57 @@ impl SharedParentPin {
         Self {
             tx,
             coinbase: AtomicU8::new(cb),
-            body: RwLock::new(Arc::new(PinBody::with_outs_layout(
-                live,
-                checked,
-                body_range,
-                spender_rels,
-            ))),
+            outs: RwLock::new(Arc::new(PinOuts::new(live, checked))),
+            layout: RwLock::new(Arc::new(ParentLayout::new(body_range, spender_rels))),
         }
     }
 
-    /// Snapshot clone (cheap Arc bump under read lock).
     #[inline]
-    fn load_body(&self) -> Arc<PinBody> {
-        Arc::clone(
-            &self
-                .body
-                .read()
-                .unwrap_or_else(|e| e.into_inner()),
-        )
+    fn load_outs(&self) -> Arc<PinOuts> {
+        Arc::clone(&self.outs.read().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// Compose from current body under write lock; publish new Arc (never mutate body in place).
-    fn publish_compose(&self, f: impl FnOnce(&PinBody) -> PinBody) {
-        let mut g = self.body.write().unwrap_or_else(|e| e.into_inner());
-        let next = f(g.as_ref());
-        *g = Arc::new(next);
+    #[inline]
+    fn load_layout(&self) -> Arc<ParentLayout> {
+        Arc::clone(&self.layout.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Compose outs half: `None` = no-op (keep existing Arc, no clone).
+    fn publish_outs(&self, f: impl FnOnce(&PinOuts) -> Option<PinOuts>) {
+        let mut g = self.outs.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(next) = f(g.as_ref()) {
+            *g = Arc::new(next);
+        }
+    }
+
+    /// Compose layout half: `None` = no-op (keep existing Arc, no clone).
+    fn publish_layout(&self, f: impl FnOnce(&ParentLayout) -> Option<ParentLayout>) {
+        let mut g = self.layout.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(next) = f(g.as_ref()) {
+            *g = Arc::new(next);
+        }
     }
 
     /// True when all `need` vouts are already in checked.
     #[inline]
     fn covers_need(&self, need: &[u32]) -> bool {
-        self.load_body().covers_need(need)
+        self.load_outs().covers_need(need)
     }
 
     fn merge_outs(&self, live: Vec<(u32, OutputRecord)>, checked: &[u32]) {
         // Shared-hit fast path: peer batch already pinned these vouts — no write lock.
-        let snap = self.load_body();
+        let snap = self.load_outs();
         if snap.covers_need(checked) && (live.is_empty() || snap.has_all_live(&live)) {
             return;
         }
-        self.publish_compose(|cur| {
-            // Re-check under write lock (concurrent compose may have filled need).
+        self.publish_outs(|cur| {
             if !checked.is_empty()
                 && cur.covers_need(checked)
                 && (live.is_empty() || cur.has_all_live(&live))
             {
-                return cur.clone();
+                return None; // no-op: keep existing Arc
             }
-            cur.compose_outs(live, checked)
+            Some(cur.compose(live, checked))
         });
     }
 
@@ -248,16 +261,32 @@ impl SharedParentPin {
         if body_range.is_none() && spender_rels.is_empty() {
             return;
         }
-        let snap = self.load_body();
-        if snap.layout_already_covers(body_range, spender_rels) {
+        let snap = self.load_layout();
+        if snap.already_covers(body_range, spender_rels) {
             return;
         }
-        self.publish_compose(|cur| {
-            if cur.layout_already_covers(body_range, spender_rels) {
-                return cur.clone();
+        self.publish_layout(|cur| {
+            if cur.already_covers(body_range, spender_rels) {
+                return None;
             }
-            cur.compose_layout(body_range, spender_rels)
+            Some(cur.compose(body_range, spender_rels))
         });
+    }
+
+    /// Single-snap apply for free-pin Occupied path: outs widen and/or layout
+    /// merge from one outs load + one layout load (no double compose when no-op).
+    fn apply_pin_delta(
+        &self,
+        live: Option<(Vec<(u32, OutputRecord)>, &[u32])>,
+        coinbase: Option<bool>,
+        body_range: Option<(u64, u64)>,
+        spender_rels: &[(u32, u32)],
+    ) {
+        self.set_coinbase_if_known(coinbase);
+        if let Some((live, checked)) = live {
+            self.merge_outs(live, checked);
+        }
+        self.maybe_merge_layout(body_range, spender_rels);
     }
 }
 
@@ -319,12 +348,13 @@ impl PipelineParentStore {
                 g.retain(|_, w| w.strong_count() > 0);
             }
         }
-        // Phase 2 outside lock: compose local → existing body, swap batch handle.
+        // Phase 2 outside lock: compose local → existing halves, swap batch handle.
         for (id, existing, local) in conflicts {
-            let src = local.load_body();
-            existing.merge_outs(src.outs.clone(), &src.checked);
+            let src_outs = local.load_outs();
+            let src_lay = local.load_layout();
+            existing.merge_outs(src_outs.outs.clone(), &src_outs.checked);
             existing.set_coinbase_if_known(local.coinbase_opt());
-            existing.maybe_merge_layout(src.layout.body_range, &src.layout.spender_rels);
+            existing.maybe_merge_layout(src_lay.body_range, &src_lay.spender_rels);
             pins.insert(id, existing);
         }
     }
@@ -419,8 +449,8 @@ impl BatchParents {
         let Some(p) = self.pins.get(&id) else {
             return;
         };
-        p.set_coinbase_if_known(coinbase);
-        p.maybe_merge_layout(body_range, &spender_rels);
+        // Layout-only: never touches outs Arc.
+        p.apply_pin_delta(None, coinbase, body_range, &spender_rels);
     }
 
     /// Insert / merge one parent (prep pin hot path).
@@ -428,6 +458,7 @@ impl BatchParents {
     /// **No store mutex** — pure batch HashMap. First insert for an id is the
     /// pre-share cost class (`ParentEntry` put). Merge only if the same batch
     /// already holds a partial pin (or after adopt left an incomplete cover).
+    /// Occupied path uses one snap decision for outs+layout (P0 single-snap).
     #[inline]
     pub fn insert_owned(
         &mut self,
@@ -445,11 +476,23 @@ impl BatchParents {
         match self.pins.entry(id) {
             std::collections::hash_map::Entry::Occupied(o) => {
                 let p = o.get();
-                if !p.covers_need(&checked) {
-                    p.merge_outs(live, &checked);
+                // One outs snap: skip merge_outs entirely when need already covered.
+                let outs = p.load_outs();
+                let need_outs = !checked.is_empty()
+                    && !(outs.covers_need(&checked)
+                        && (live.is_empty() || outs.has_all_live(&live)));
+                if need_outs {
+                    p.apply_pin_delta(
+                        Some((live, checked.as_slice())),
+                        coinbase,
+                        body_range,
+                        &spender_rels,
+                    );
+                } else {
+                    // Outs already cover — layout/coinbase only (no outs Arc touch).
+                    let _ = live;
+                    p.apply_pin_delta(None, coinbase, body_range, &spender_rels);
                 }
-                p.set_coinbase_if_known(coinbase);
-                p.maybe_merge_layout(body_range, &spender_rels);
             }
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert(Arc::new(SharedParentPin::new(
@@ -487,19 +530,20 @@ impl BatchParents {
     pub fn get_parent_out(&self, fk: Fk, vout: u32) -> Option<(TxRecord, OutputRecord)> {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
-        let body = e.load_body();
-        let o = body.outs.iter().find(|(v, _)| *v == vout)?;
-        Some((e.tx.clone(), o.1.clone()))
+        let outs = e.load_outs();
+        let i = outs.outs.binary_search_by_key(&vout, |(v, _)| *v).ok()?;
+        Some((e.tx.clone(), outs.outs[i].1.clone()))
     }
 
     /// Assemble hot path: value + script bytes + parent txid (script owned from
-    /// immutable pin body snapshot).
+    /// immutable outs snapshot).
     #[inline]
     pub fn get_parent_txout_parts(&self, fk: Fk, vout: u32) -> Option<(i64, Vec<u8>, [u8; 32])> {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
-        let body = e.load_body();
-        let (_, o) = body.outs.iter().find(|(v, _)| *v == vout)?;
+        let outs = e.load_outs();
+        let i = outs.outs.binary_search_by_key(&vout, |(v, _)| *v).ok()?;
+        let o = &outs.outs[i].1;
         Some((o.value, o.script.clone(), e.tx.txid))
     }
 
@@ -516,7 +560,7 @@ impl BatchParents {
     pub fn get_body_range(&self, fk: Fk) -> Option<(u64, u64)> {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
-        e.load_body().layout.body_range
+        e.load_layout().body_range
     }
 
     pub fn set_layout(&mut self, fk: Fk, body_range: (u64, u64), dense_rels: &[u32]) {
@@ -536,22 +580,30 @@ impl BatchParents {
         let Some(e) = self.pins.get(&id) else {
             return;
         };
-        // Compose new body under publish lock: extend checked with extra_need
-        // and merge denserels (never replace with a stale full-vector snapshot —
-        // concurrent prep compose_outs can add peer need-vouts).
-        e.publish_compose(|cur| {
-            let mut next = cur.clone();
-            if next.checked.is_empty() && extra_need.is_empty() && !dense_rels.is_empty() {
-                next.checked = (0..dense_rels.len() as u32).collect();
+        // Outs half only if checked must grow; layout half always for denserels.
+        // Never clones outs when only layout changes (P0 split).
+        let need = {
+            let snap = e.load_outs();
+            let mut checked = snap.checked.clone();
+            let mut outs_changed = false;
+            if checked.is_empty() && extra_need.is_empty() && !dense_rels.is_empty() {
+                checked = (0..dense_rels.len() as u32).collect();
+                outs_changed = true;
             }
-            next.checked.extend_from_slice(extra_need);
-            next.checked.sort_unstable();
-            next.checked.dedup();
-            let sparse = sparse_spender_rels(dense_rels, &next.checked);
-            next.layout.body_range = Some(body_range);
-            merge_spender_rels_into(&mut next.layout.spender_rels, &sparse);
-            next
-        });
+            if !extra_need.is_empty() {
+                checked.extend_from_slice(extra_need);
+                checked.sort_unstable();
+                checked.dedup();
+                outs_changed = true;
+            }
+            if outs_changed {
+                let outs = snap.outs.clone();
+                e.publish_outs(|_| Some(PinOuts { outs, checked: checked.clone() }));
+            }
+            checked
+        };
+        let sparse = sparse_spender_rels(dense_rels, &need);
+        e.publish_layout(|cur| Some(cur.compose_write(body_range, &sparse)));
     }
 
     pub fn set_body_range_only(&mut self, fk: Fk, body_range: (u64, u64)) {
@@ -559,10 +611,13 @@ impl BatchParents {
             return;
         };
         if let Some(e) = self.pins.get(&id) {
-            e.publish_compose(|cur| {
+            e.publish_layout(|cur| {
+                if cur.body_range == Some(body_range) {
+                    return None;
+                }
                 let mut next = cur.clone();
-                next.layout.body_range = Some(body_range);
-                next
+                next.body_range = Some(body_range);
+                Some(next)
             });
         }
     }
@@ -580,17 +635,22 @@ impl BatchParents {
         let Some(e) = self.pins.get(&id) else {
             return;
         };
-        e.publish_compose(|cur| {
-            let mut next = cur.clone();
-            if !extra_need.is_empty() {
-                next.checked.extend_from_slice(extra_need);
-                next.checked.sort_unstable();
-                next.checked.dedup();
-            }
-            next.layout.body_range = Some(body_range);
-            merge_spender_rels_into(&mut next.layout.spender_rels, &sparse_rels);
-            next
-        });
+        if !extra_need.is_empty() {
+            e.publish_outs(|cur| {
+                let mut checked = cur.checked.clone();
+                checked.extend_from_slice(extra_need);
+                checked.sort_unstable();
+                checked.dedup();
+                if checked == cur.checked {
+                    return None;
+                }
+                Some(PinOuts {
+                    outs: cur.outs.clone(),
+                    checked,
+                })
+            });
+        }
+        e.publish_layout(|cur| Some(cur.compose_write(body_range, &sparse_rels)));
     }
 
     #[inline]
@@ -601,7 +661,7 @@ impl BatchParents {
         let Some(e) = self.pins.get(&id) else {
             return false;
         };
-        let lay = &e.load_body().layout;
+        let lay = e.load_layout();
         lay.body_range.is_some() && !lay.spender_rels.is_empty()
     }
 
@@ -613,14 +673,14 @@ impl BatchParents {
         let Some(e) = self.pins.get(&id) else {
             return false;
         };
-        !e.load_body().layout.spender_rels.is_empty()
+        !e.load_layout().spender_rels.is_empty()
     }
 
     pub fn fks_missing_layout(&self) -> Vec<Fk> {
         self.pins
             .iter()
             .filter(|(_, e)| {
-                let lay = &e.load_body().layout;
+                let lay = e.load_layout();
                 lay.body_range.is_none() || lay.spender_rels.is_empty()
             })
             .map(|(&id, _)| Fk(id))
@@ -635,7 +695,7 @@ impl BatchParents {
     pub fn get_spender_abs(&self, fk: Fk, vout: u32) -> Option<u64> {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
-        let lay = &e.load_body().layout;
+        let lay = e.load_layout();
         let (off, _) = lay.body_range?;
         let i = lay
             .spender_rels
@@ -655,7 +715,10 @@ impl BatchParents {
         let Some(e) = self.pins.get(&id) else {
             return false;
         };
-        e.load_body().outs.iter().any(|(v, _)| *v == vout)
+        e.load_outs()
+            .outs
+            .binary_search_by_key(&vout, |(v, _)| *v)
+            .is_ok()
     }
 
     pub fn pin_covered(&self, fk: Fk, vouts: &[u32]) -> bool {
@@ -690,12 +753,13 @@ impl BatchParents {
                 std::collections::hash_map::Entry::Occupied(o) => {
                     // Same Arc or two Arcs for same fk (no store) — compose into one.
                     if !Arc::ptr_eq(o.get(), &src) {
-                        let body = src.load_body();
-                        o.get().merge_outs(body.outs.clone(), &body.checked);
+                        let src_outs = src.load_outs();
+                        let src_lay = src.load_layout();
+                        o.get().merge_outs(src_outs.outs.clone(), &src_outs.checked);
                         o.get().set_coinbase_if_known(src.coinbase_opt());
                         o.get().maybe_merge_layout(
-                            body.layout.body_range,
-                            &body.layout.spender_rels,
+                            src_lay.body_range,
+                            &src_lay.spender_rels,
                         );
                     }
                 }
@@ -710,23 +774,27 @@ impl BatchParents {
     ) -> Option<(TxRecord, Vec<(u32, OutputRecord)>, bool)> {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
-        let body = e.load_body();
+        let body = e.load_outs();
         let covered =
             !body.checked.is_empty() && vouts.iter().all(|v| checked_contains(&body.checked, *v));
         if covered {
             let mut live = Vec::with_capacity(vouts.len());
             for &v in vouts {
-                if let Some((_, o)) = body.outs.iter().find(|(ov, _)| *ov == v) {
-                    live.push((v, o.clone()));
+                if let Ok(i) = body.outs.binary_search_by_key(&v, |(ov, _)| *ov) {
+                    live.push((v, body.outs[i].1.clone()));
                 }
             }
             return Some((e.tx.clone(), live, true));
         }
-        if !body.outs.is_empty() && vouts.iter().all(|v| body.outs.iter().any(|(ov, _)| ov == v)) {
+        if !body.outs.is_empty()
+            && vouts
+                .iter()
+                .all(|v| body.outs.binary_search_by_key(v, |(ov, _)| *ov).is_ok())
+        {
             let mut live = Vec::with_capacity(vouts.len());
             for &v in vouts {
-                if let Some((_, o)) = body.outs.iter().find(|(ov, _)| *ov == v) {
-                    live.push((v, o.clone()));
+                if let Ok(i) = body.outs.binary_search_by_key(&v, |(ov, _)| *ov) {
+                    live.push((v, body.outs[i].1.clone()));
                 }
             }
             return Some((e.tx.clone(), live, false));
@@ -1119,6 +1187,12 @@ mod tests {
 
     /// Timed synthetic: multi-pack insert + layout compose at few-block scale.
     /// Prints ns/op so IBD regressions are visible without a criterion harness.
+    ///
+    /// Phases:
+    /// - insert: vacant local puts
+    /// - covered: adopt + same-need re-insert (P0 no-op Arc keep — free-pin share hit)
+    /// - layout: set_layout_for_need without extra outs (P0 layout-only half)
+    /// - widen: real new vout compose
     #[test]
     fn pin_compose_multi_pack_timed() {
         let n_parents = 8_000usize; // ~input budget scale
@@ -1138,6 +1212,30 @@ mod tests {
         }
         a.publish_to_store();
         let insert_ns = t0.elapsed().as_nanos();
+
+        // Covered re-insert (production free-pin share hit after adopt).
+        let t_cov = std::time::Instant::now();
+        let mut cov = BatchParents::with_store(Arc::clone(&store), n_parents);
+        cov.adopt_from_store(1..=n_parents as u64);
+        for i in 1..=n_parents as u64 {
+            cov.insert_owned(
+                Fk(i),
+                tx((i % 200) as u8),
+                vec![(0, out(i as i64))],
+                vec![0],
+                None,
+                None,
+                vec![(0, 10)],
+            );
+        }
+        let covered_ns = t_cov.elapsed().as_nanos();
+
+        // Layout-only fill (write ensure path).
+        let t_lay = std::time::Instant::now();
+        for i in 1..=n_parents as u64 {
+            cov.set_layout_for_need(Fk(i), (i * 100, 50), &[10], &[]);
+        }
+        let layout_ns = t_lay.elapsed().as_nanos();
 
         let t1 = std::time::Instant::now();
         let mut b = BatchParents::with_store(Arc::clone(&store), n_parents);
@@ -1161,10 +1259,15 @@ mod tests {
         assert_eq!(b.len(), n_parents);
         assert!(a.pin_covered(Fk(1), &[0, 1]));
         assert_eq!(a.get_spender_abs(Fk(1), 1), Some(120));
+        let n = n_parents as f64;
         eprintln!(
-            "pin_compose_multi_pack n={n_parents} insert_ns={insert_ns} ({:.1} ns/op) widen_ns={widen_ns} ({:.1} ns/op)",
-            insert_ns as f64 / n_parents as f64,
-            widen_ns as f64 / n_parents as f64,
+            "pin_compose_multi_pack n={n_parents} \
+             insert={:.1}ns/op covered={:.1}ns/op layout={:.1}ns/op widen={:.1}ns/op \
+             (insert_ns={insert_ns} covered_ns={covered_ns} layout_ns={layout_ns} widen_ns={widen_ns})",
+            insert_ns as f64 / n,
+            covered_ns as f64 / n,
+            layout_ns as f64 / n,
+            widen_ns as f64 / n,
         );
         // Sanity bound: free-plan insert should stay well under 50µs/op even in debug.
         assert!(
@@ -1172,10 +1275,15 @@ mod tests {
             "insert ns/op too high: {}",
             insert_ns / n_parents as u128
         );
+        // P0: covered re-insert should be cheaper than real widen (no outs clone).
+        assert!(
+            covered_ns < widen_ns,
+            "covered re-insert should beat widen: covered={covered_ns} widen={widen_ns}"
+        );
     }
 
-    /// Pure compose helpers: widening need and layout builds a new body without
-    /// mutating the source snapshot (AGENTS prefer-immutable).
+    /// Pure compose helpers: widening need and layout builds new halves without
+    /// mutating the source snapshots (AGENTS prefer-immutable).
     #[test]
     fn pin_body_compose_does_not_mutate_source() {
         let pin = SharedParentPin::new(
@@ -1186,18 +1294,91 @@ mod tests {
             Some((100, 50)),
             vec![(0, 10)],
         );
-        let before = pin.load_body();
+        let before_outs = pin.load_outs();
+        let before_lay = pin.load_layout();
         pin.merge_outs(vec![(1, out(20))], &[1]);
         pin.maybe_merge_layout(None, &[(1, 20)]);
-        let after = pin.load_body();
-        // Source snapshot unchanged.
-        assert_eq!(before.outs.len(), 1);
-        assert_eq!(before.checked, vec![0]);
-        assert_eq!(before.layout.spender_rels, vec![(0, 10)]);
-        // Published body has the union.
-        assert_eq!(after.outs.len(), 2);
-        assert!(after.covers_need(&[0, 1]));
-        assert_eq!(after.layout.spender_rels, vec![(0, 10), (1, 20)]);
-        assert!(!Arc::ptr_eq(&before, &after), "compose must publish new Arc");
+        let after_outs = pin.load_outs();
+        let after_lay = pin.load_layout();
+        // Source snapshots unchanged.
+        assert_eq!(before_outs.outs.len(), 1);
+        assert_eq!(before_outs.checked, vec![0]);
+        assert_eq!(before_lay.spender_rels, vec![(0, 10)]);
+        // Published halves have the union.
+        assert_eq!(after_outs.outs.len(), 2);
+        assert!(after_outs.covers_need(&[0, 1]));
+        assert_eq!(after_lay.spender_rels, vec![(0, 10), (1, 20)]);
+        assert!(
+            !Arc::ptr_eq(&before_outs, &after_outs),
+            "outs compose must publish new Arc"
+        );
+        assert!(
+            !Arc::ptr_eq(&before_lay, &after_lay),
+            "layout compose must publish new Arc"
+        );
+    }
+
+    /// Covered share hit must not replace outs Arc (no full clone on no-op).
+    #[test]
+    fn covered_insert_keeps_outs_arc_identity() {
+        let mut bp = BatchParents::new();
+        bp.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(0, out(10))],
+            vec![0],
+            Some(false),
+            Some((100, 50)),
+            vec![(0, 10)],
+        );
+        let pin = Arc::clone(bp.pins.get(&1).unwrap());
+        let outs_before = pin.load_outs();
+        let lay_before = pin.load_layout();
+        // Same need already covered — free-pin share hit.
+        bp.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(0, out(10))],
+            vec![0],
+            None,
+            Some((100, 50)),
+            vec![(0, 10)],
+        );
+        let outs_after = pin.load_outs();
+        let lay_after = pin.load_layout();
+        assert!(
+            Arc::ptr_eq(&outs_before, &outs_after),
+            "no-op outs must keep Arc identity (no clone)"
+        );
+        assert!(
+            Arc::ptr_eq(&lay_before, &lay_after),
+            "no-op layout must keep Arc identity"
+        );
+    }
+
+    /// Layout-only write must not replace outs Arc (scripts stay shared).
+    #[test]
+    fn layout_only_write_keeps_outs_arc() {
+        let mut bp = BatchParents::new();
+        bp.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(0, out(10)), (1, out(20))],
+            vec![0, 1],
+            Some(false),
+            None,
+            vec![(0, 10)],
+        );
+        let pin = Arc::clone(bp.pins.get(&1).unwrap());
+        let outs_before = pin.load_outs();
+        bp.set_layout_for_need(Fk(1), (500, 80), &[10, 20], &[]);
+        let outs_after = pin.load_outs();
+        let lay = pin.load_layout();
+        assert!(
+            Arc::ptr_eq(&outs_before, &outs_after),
+            "layout fill must not clone outs half"
+        );
+        assert_eq!(lay.body_range, Some((500, 80)));
+        assert_eq!(bp.get_spender_abs(Fk(1), 1), Some(520));
     }
 }

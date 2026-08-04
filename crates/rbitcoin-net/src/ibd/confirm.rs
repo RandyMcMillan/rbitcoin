@@ -1788,9 +1788,10 @@ pub(crate) fn spawn_confirm_engine(
                         let send_ms = t_send.elapsed().as_millis() as u64;
                         confirm_thr_stats::add_plan_send_wait(t_send.elapsed());
                         queues_plan.note_plan_send(n);
-                        // Slow plan: stamp wall >2s gets full mega/head_fk breakdown.
-                        // Mild: >500ms still logs a one-liner (legacy).
-                        if stamp_ms > 2_000 {
+                        // Per-batch stamp is often 0.5–1.5s while 5s plan wall is multi-s
+                        // (many packs). Use the same 500ms gate as the old one-liner so
+                        // every notable pack gets mega/head_fk breakdown — not only >2s.
+                        if stamp_ms > 500 {
                             let st = rbitcoin_consensus::plan_stamp_sub_stats::last_stamp();
                             let mega = rbitcoin_query::archive_phase_stats::last_plan_mega();
                             let ms = rbitcoin_query::archive_phase_stats::LastPlanMega::ms;
@@ -1800,8 +1801,14 @@ pub(crate) fn spawn_confirm_engine(
                             } else {
                                 0
                             };
+                            // "slow" when stamp >2s; otherwise still full detail (was bare one-liner).
+                            let tag = if stamp_ms > 2_000 {
+                                "confirm plan slow"
+                            } else {
+                                "confirm plan"
+                            };
                             info!(
-                                "ibd: confirm plan slow batch={n} first={expect_h} stamp_ms={stamp_ms} \
+                                "ibd: {tag} batch={n} first={expect_h} stamp_ms={stamp_ms} \
                                  send_w={send_ms}ms \
                                  stamp_sub(struct={}ms prepare={}ms filter={}ms mega={}ms) \
                                  mega(assign={}ms collect={}ms sticky={}ms inflight={}ms \
@@ -1826,10 +1833,6 @@ pub(crate) fn spawn_confirm_engine(
                                 head_hit_pct,
                                 mega.batch_stamp,
                                 mega.resolved_stamp,
-                            );
-                        } else if stamp_ms > 500 {
-                            info!(
-                                "ibd: confirm plan first={expect_h} n={n} stamp_ms={stamp_ms}"
                             );
                         }
                     }

@@ -16,6 +16,9 @@
 //! keys at depth 0 then depth 1 — that regressed plan head_fk wall under RES=0.
 //!
 //! Backend: `RBITCOIN_HEAD_RESOLVE_IO` / global `RBITCOIN_IO` (`uring` \| `pread`).
+//!
+//! **Experiment:** ring + key in-flight depth **1024** (was 128) for confirm-plan
+//! head resolve — more concurrent sidefile/idx peeks under large `head_fk` waves.
 
 use crate::error::StoreError;
 use crate::idx_body_pipeline::{run_idx_body_pipeline, BodyMode, IdxBodyJob};
@@ -29,7 +32,12 @@ use rbitcoin_primitives::Fk;
 use std::os::fd::RawFd;
 use std::time::Instant;
 
-const MAX_IN_FLIGHT: usize = 128;
+/// Concurrent keys in the plan head-resolve uring machine (and SQ/CQ size).
+///
+/// Experiment: 1024 (was 128, matching [`uring_session::DEFAULT_ENTRIES`]).
+const MAX_IN_FLIGHT: usize = 1024;
+/// io_uring SQ/CQ entries for plan head resolve (must be ≥ [`MAX_IN_FLIGHT`]).
+const PLAN_URING_ENTRIES: u32 = 1024;
 
 /// Sidefile identity pread (32 B).
 const STAGE_ID: u64 = 1;
@@ -237,7 +245,7 @@ fn resolve_fk_and_range_uring(
 ) -> Result<Vec<([u8; 32], Option<(Fk, (u64, u64))>)>, StoreError> {
     crate::head_resolve_stats::add_keys(txids.len() as u64);
 
-    let mut session = UringSession::new(uring_session::DEFAULT_ENTRIES)?;
+    let mut session = UringSession::new(PLAN_URING_ENTRIES)?;
     let side = table.txid_sidefile();
     let side_fd: RawFd = side.body_read_fd();
     let side_path = side.file_path().to_path_buf();

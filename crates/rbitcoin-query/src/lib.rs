@@ -120,9 +120,9 @@ pub fn soft_confirm_window_covered(
 
 /// Cheap process-owned cache occupancy for IBD `ibd: sizes` (O(1) lens + brief locks).
 ///
-/// `conf_plans` is header plan occupancy in ConfirmParentCache. Pins are
-/// pipeline-local (plan `batch_pin` / `BatchParents` / plan-local external
-/// parents) — no process create FIFO.
+/// `conf_plans` is header plan occupancy in ConfirmParentCache. Pipeline pins /
+/// prep-ahead CreatePins are metered via [`process_mem_stats`] (plan thread
+/// publishes snapshots) plus SH memtable / conf_plans on Query.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProcessOwnedSizes {
     pub conf_plans: usize,
@@ -131,6 +131,67 @@ pub struct ProcessOwnedSizes {
     pub sh_heads: usize,
     /// Segmented `tx.head.*` occupancy (logical sizes; no shadow resize).
     pub head: rbitcoin_store::HeadResizeSizeSnapshot,
+    /// Prep-ahead in-flight CreatePin layers (from plan thread atomics).
+    pub inflight_layers: usize,
+    pub inflight_pins: usize,
+    pub inflight_bytes: u64,
+    /// PipelineParentStore Weak map + live strong pins.
+    pub pstore_weak: usize,
+    pub pstore_live: usize,
+    pub pstore_bytes: u64,
+}
+
+/// Plan-thread published heap meters for structures not owned by [`Query`].
+///
+/// Updated after each plan note/prune (InFlightLog + PipelineParentStore).
+/// Sampled by the ~5s IBD sizes line.
+pub mod process_mem_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static INFLIGHT_LAYERS: AtomicU64 = AtomicU64::new(0);
+    static INFLIGHT_PINS: AtomicU64 = AtomicU64::new(0);
+    static INFLIGHT_BYTES: AtomicU64 = AtomicU64::new(0);
+    static PSTORE_WEAK: AtomicU64 = AtomicU64::new(0);
+    static PSTORE_LIVE: AtomicU64 = AtomicU64::new(0);
+    static PSTORE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    /// Publish latest prep-ahead / parent-store occupancy (overwrite).
+    pub fn note(
+        inflight_layers: usize,
+        inflight_pins: usize,
+        inflight_bytes: u64,
+        pstore_weak: usize,
+        pstore_live: usize,
+        pstore_bytes: u64,
+    ) {
+        INFLIGHT_LAYERS.store(inflight_layers as u64, Ordering::Relaxed);
+        INFLIGHT_PINS.store(inflight_pins as u64, Ordering::Relaxed);
+        INFLIGHT_BYTES.store(inflight_bytes, Ordering::Relaxed);
+        PSTORE_WEAK.store(pstore_weak as u64, Ordering::Relaxed);
+        PSTORE_LIVE.store(pstore_live as u64, Ordering::Relaxed);
+        PSTORE_BYTES.store(pstore_bytes, Ordering::Relaxed);
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Snap {
+        pub inflight_layers: usize,
+        pub inflight_pins: usize,
+        pub inflight_bytes: u64,
+        pub pstore_weak: usize,
+        pub pstore_live: usize,
+        pub pstore_bytes: u64,
+    }
+
+    pub fn load() -> Snap {
+        Snap {
+            inflight_layers: INFLIGHT_LAYERS.load(Ordering::Relaxed) as usize,
+            inflight_pins: INFLIGHT_PINS.load(Ordering::Relaxed) as usize,
+            inflight_bytes: INFLIGHT_BYTES.load(Ordering::Relaxed),
+            pstore_weak: PSTORE_WEAK.load(Ordering::Relaxed) as usize,
+            pstore_live: PSTORE_LIVE.load(Ordering::Relaxed) as usize,
+            pstore_bytes: PSTORE_BYTES.load(Ordering::Relaxed),
+        }
+    }
 }
 
 pub use batch_full_bodies::BatchFullBodies;
@@ -1264,12 +1325,19 @@ impl Query {
         // Header + tx_fks plans (not the unused scan-watermark `plans` BTreeMap).
         // Wire path always put_header_plan; conf_plans=0 was a metering bug.
         let conf_plans = self.confirm_parents.header_plan_count();
+        let mem = process_mem_stats::load();
         ProcessOwnedSizes {
             conf_plans,
             sh_runs: self.sh_run.on_disk_run_count(),
             sh_memtable: self.sh_run.memtable_len(),
             sh_heads: self.sh_heads.lock().unwrap().len(),
             head: self.store.txs.head_resize_size_snapshot(),
+            inflight_layers: mem.inflight_layers,
+            inflight_pins: mem.inflight_pins,
+            inflight_bytes: mem.inflight_bytes,
+            pstore_weak: mem.pstore_weak,
+            pstore_live: mem.pstore_live,
+            pstore_bytes: mem.pstore_bytes,
         }
     }
 

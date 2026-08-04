@@ -63,6 +63,21 @@ impl PrepAheadState {
                 self.last_prepped = None;
             }
         }
+        self.publish_mem_stats();
+    }
+
+    /// Publish InFlight + PipelineParentStore occupancy for `ibd: sizes`.
+    fn publish_mem_stats(&self) {
+        let (layers, pins, if_bytes) = self.in_flight.size_snapshot();
+        let (weak, live, ps_bytes) = self.parent_store.size_snapshot();
+        // Occasional aggressive Weak GC so dead slots don't retain the map.
+        if weak > live.saturating_mul(2) && weak > 4096 {
+            self.parent_store.gc_dead_weaks();
+            let (weak, live, ps_bytes) = self.parent_store.size_snapshot();
+            rbitcoin_query::process_mem_stats::note(layers, pins, if_bytes, weak, live, ps_bytes);
+            return;
+        }
+        rbitcoin_query::process_mem_stats::note(layers, pins, if_bytes, weak, live, ps_bytes);
     }
 
     fn pipeline_for(&self, path_lo: u32, store_path_lo: u32) -> WirePrepPipeline {
@@ -111,12 +126,14 @@ impl PrepAheadState {
             self.next_tx_start = last.saturating_add(1).max(1);
         }
         self.last_prepped = Some((last_height, last_hash));
+        self.publish_mem_stats();
     }
 
     fn clear_all(&mut self, hub: &ChainHub) {
         self.in_flight.clear();
         // Arc-swap store so in-flight prep/write batches keep their Arcs.
         self.parent_store = std::sync::Arc::new(rbitcoin_query::PipelineParentStore::new());
+        self.publish_mem_stats();
         self.last_prepped = None;
         self.next_tx_start = hub.query.tx_body_count().saturating_add(1).max(1);
     }

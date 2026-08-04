@@ -125,10 +125,12 @@ impl InFlightLog {
             }));
         }
         self.layers = next;
+        self.layers.shrink_to_fit();
     }
 
     pub fn clear(&mut self) {
         self.layers.clear();
+        self.layers.shrink_to_fit();
     }
 
     /// Prep-facing snapshot: Arc bumps only (no map clone).
@@ -143,6 +145,23 @@ impl InFlightLog {
 
     pub fn entry_count(&self) -> usize {
         self.layers.iter().map(|l| l.outs.len()).sum()
+    }
+
+    /// Occupancy for IBD `sizes`: layers, create-pin entries, approx payload bytes.
+    pub fn size_snapshot(&self) -> (usize, usize, u64) {
+        let mut entries = 0usize;
+        let mut bytes = 0u64;
+        for layer in &self.layers {
+            entries = entries.saturating_add(layer.outs.len());
+            for pin in layer.outs.values() {
+                bytes = bytes.saturating_add(crate::archive::create_pin_approx_bytes(pin) as u64);
+            }
+            // HashMap overhead (rough): ~32 B / entry for creates + outs keys.
+            bytes = bytes.saturating_add(
+                (layer.outs.len().saturating_add(layer.creates.len()) as u64).saturating_mul(40),
+            );
+        }
+        (self.layers.len(), entries, bytes)
     }
 }
 
@@ -217,6 +236,27 @@ mod tests {
             vec![OutputRecord::unspent(1, vec![0x51])],
             vec![0u32],
         ))
+    }
+
+    #[test]
+    fn size_snapshot_counts_layers_and_bytes() {
+        let mut log = InFlightLog::new();
+        let p1 = pin(1);
+        let p2 = pin(2);
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(1), &p1)]));
+        log.note_layer(InFlightLayer::from_plan_pins([(Fk(2), &p2)]));
+        let (layers, entries, bytes) = log.size_snapshot();
+        assert_eq!(layers, 2);
+        assert_eq!(entries, 2);
+        assert!(bytes > 0, "expected non-zero approx bytes");
+        // Two pins with tiny scripts should stay well under 4 KiB.
+        assert!(bytes < 4096, "bytes={bytes}");
+        crate::process_mem_stats::note(layers, entries, bytes, 10, 2, 100);
+        let s = crate::process_mem_stats::load();
+        assert_eq!(s.inflight_layers, 2);
+        assert_eq!(s.inflight_pins, 2);
+        assert_eq!(s.pstore_weak, 10);
+        assert_eq!(s.pstore_live, 2);
     }
 
     #[test]

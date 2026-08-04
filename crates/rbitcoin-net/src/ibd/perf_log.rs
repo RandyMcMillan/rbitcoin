@@ -1601,6 +1601,19 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         0
     };
     let bq_mib = s.bq_bytes / (1024 * 1024);
+    // Heap meters (approx payload bytes → MiB). Residual = anon − known heap.
+    let if_mib = o.inflight_bytes / (1024 * 1024);
+    let ps_mib = o.pstore_bytes / (1024 * 1024);
+    // SH memtable: ([u8;32], Fk) ≈ 40 B/row + Vec slack.
+    let sh_mt_mib = (o.sh_memtable as u64).saturating_mul(48) / (1024 * 1024);
+    let conf_wire_mib = (load_wire_mib.saturating_add(write_wire_mib)) as u64;
+    let accounted_mib = bq_mib
+        .saturating_add(if_mib)
+        .saturating_add(ps_mib)
+        .saturating_add(sh_mt_mib)
+        .saturating_add(conf_wire_mib);
+    let anon_mib = kb_mib(s.rss_anon_kb);
+    let residual_mib = anon_mib.saturating_sub(accounted_mib);
     format!(
         "ibd: sizes rss={}MiB anon={}MiB file={}MiB({}%) hwm={}MiB locked={}MiB \
          | work ordered={}/set={} hash_h={} h2h={} hdr_fk={} known_hdr={} inflight={}/peer={} cooldown={} \
@@ -1609,10 +1622,12 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
          | conf_plans={} \
          | conf planq={}/{} blks={} prepq={}/{} blks={} wire={}MiB parents={} writeq={}/{} blks={} wire={}MiB parents={} \
            feed ready={} inflight={} \
+         | heap bq={}MiB iflight={}L/{}pin≈{}MiB pstore weak={}/live={}≈{}MiB sh_mt≈{}MiB \
+           wire={}MiB accounted≈{}MiB residual≈{}MiB \
          | txhead bits={} entry={}B slots={} occ={} body={}MiB segs={} sealed={} class_a={} \
          | sh runs={} memtable={} heads={}",
         kb_mib(s.rss_kb),
-        kb_mib(s.rss_anon_kb),
+        anon_mib,
         kb_mib(s.rss_file_kb),
         file_pct,
         kb_mib(s.vm_hwm_kb),
@@ -1649,6 +1664,17 @@ pub(crate) fn format_sizes(s: &IbdPerfSample) -> String {
         cp.write_parents,
         cp.feed_ready,
         cp.feed_inflight,
+        bq_mib,
+        o.inflight_layers,
+        o.inflight_pins,
+        if_mib,
+        o.pstore_weak,
+        o.pstore_live,
+        ps_mib,
+        sh_mt_mib,
+        conf_wire_mib,
+        accounted_mib,
+        residual_mib,
         h.primary_bits,
         h.primary_entry_b,
         h.primary_slots,
@@ -2031,6 +2057,13 @@ mod tests {
         s.work.ordered_set = 90;
         s.work.body.pending = 5;
         s.owned.conf_plans = 80;
+        s.owned.inflight_layers = 3;
+        s.owned.inflight_pins = 12_000;
+        s.owned.inflight_bytes = 48 * 1024 * 1024;
+        s.owned.pstore_weak = 20_000;
+        s.owned.pstore_live = 8_000;
+        s.owned.pstore_bytes = 16 * 1024 * 1024;
+        s.owned.sh_memtable = 500_000;
         s.bq_count = 4;
         s.bq_bytes = 32 * 1024 * 1024;
         s.bq_soft_stop = 256;
@@ -2083,6 +2116,16 @@ mod tests {
         assert!(line.contains("txhead bits=25"), "{line}");
         assert!(line.contains("segs=3 sealed=2"), "{line}");
         assert!(line.contains("class_a=2000000"), "{line}");
+        assert!(
+            line.contains("heap bq=32MiB iflight=3L/12000pin≈48MiB"),
+            "{line}"
+        );
+        assert!(
+            line.contains("pstore weak=20000/live=8000≈16MiB"),
+            "{line}"
+        );
+        assert!(line.contains("accounted≈"), "{line}");
+        assert!(line.contains("residual≈"), "{line}");
         assert!(!line.contains("shadow"), "{line}");
         assert!(!line.contains("contig parked="), "{line}");
     }

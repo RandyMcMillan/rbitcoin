@@ -343,6 +343,38 @@ impl PipelineParentStore {
         g.values().filter(|w| w.strong_count() > 0).count()
     }
 
+    /// Occupancy: weak map slots, live strong pins, approx bytes of live pin outs.
+    pub fn size_snapshot(&self) -> (usize, usize, u64) {
+        let g = self.by_fk.lock().unwrap_or_else(|e| e.into_inner());
+        let weak_slots = g.len();
+        let mut live = 0usize;
+        let mut bytes = 0u64;
+        for w in g.values() {
+            if let Some(p) = w.upgrade() {
+                live = live.saturating_add(1);
+                let outs = p.load_outs();
+                // SharedParentPin: outs half scripts + layout rels + shell.
+                bytes = bytes.saturating_add(96);
+                for (_v, o) in &outs.outs {
+                    bytes = bytes.saturating_add(24).saturating_add(o.script.len() as u64);
+                }
+                bytes = bytes.saturating_add(outs.checked.len().saturating_mul(4) as u64);
+                let lay = p.load_layout();
+                bytes = bytes.saturating_add(lay.spender_rels.len().saturating_mul(8) as u64);
+            }
+        }
+        // Weak map overhead (~24 B / slot including dead Weaks).
+        bytes = bytes.saturating_add((weak_slots as u64).saturating_mul(24));
+        (weak_slots, live, bytes)
+    }
+
+    /// Drop dead Weaks now (keeps map from retaining empty slots after pin drop).
+    pub fn gc_dead_weaks(&self) {
+        let mut g = self.by_fk.lock().unwrap_or_else(|e| e.into_inner());
+        g.retain(|_, w| w.strong_count() > 0);
+        g.shrink_to_fit();
+    }
+
     /// One lock: upgrade live pins for `ids` into a map (prep batch start).
     pub fn bulk_upgrade(&self, ids: impl IntoIterator<Item = u64>) -> HashMap<u64, Arc<SharedParentPin>> {
         let g = self.by_fk.lock().unwrap_or_else(|e| e.into_inner());
@@ -374,10 +406,10 @@ impl PipelineParentStore {
                     }
                 }
             }
-            // Soft GC: drop dead Weaks when the map grows large. Higher threshold
-            // keeps share hits across more concurrent prep/write packs (immutable
-            // Arc identity only — no denserels FIFO).
-            if g.len() > 65_536 {
+            // Soft GC: drop dead Weaks periodically so the Weak map cannot retain
+            // empty slots for the whole IBD. Threshold keeps some share hits
+            // without unbounded weak growth (was 4k→65k; 16k is a middle ground).
+            if g.len() > 16_384 {
                 g.retain(|_, w| w.strong_count() > 0);
             }
         }

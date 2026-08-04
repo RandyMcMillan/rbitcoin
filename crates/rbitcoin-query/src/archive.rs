@@ -21,6 +21,22 @@ use super::*;
 /// `in_flight_outs` all Arc-clone this (no deep outs clone between stages).
 pub type CreatePin = std::sync::Arc<(TxRecord, Vec<OutputRecord>, Vec<u32>)>;
 
+/// Approx heap bytes for one [`CreatePin`] payload (for IBD `sizes` metering).
+///
+/// Counts owned script/denserels vectors + fixed record overhead — not Arc
+/// refcount sharing (each strong Arc still "owns" the allocation once).
+#[inline]
+pub fn create_pin_approx_bytes(pin: &CreatePin) -> usize {
+    let (_tx, outs, dens) = pin.as_ref();
+    let mut n = 96usize; // TxRecord + Arc shell overhead (order-of-magnitude)
+    for o in outs {
+        n = n.saturating_add(24).saturating_add(o.script.len());
+    }
+    n = n.saturating_add(dens.len().saturating_mul(4));
+    n = n.saturating_add(outs.capacity().saturating_mul(24)); // Vec spare
+    n
+}
+
 /// Sparse external parent denserels for pin (need-vouts only).
 ///
 /// `(tx, live need outs, sparse denserels as (vout, rel))` — **not** a full
